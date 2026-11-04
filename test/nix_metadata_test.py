@@ -20,6 +20,15 @@ RELEASE_TEMPLATES = {
     "homebrew/thegn.rb.tmpl": ("packaging/homebrew/thegn.rb.tmpl", "@@VERSION@@", 'any_of: ["MIT", "Apache-2.0"]'),
     "aur/PKGBUILD.tmpl": ("packaging/aur/PKGBUILD.tmpl", "@@PKGVER@@", "('MIT' 'Apache-2.0')"),
 }
+PACKAGE_TOPOLOGY = {
+    "default": ("defaultPkg", "adjacent `thegn-musl`"),
+    "thegn": ("defaultPkg", "adjacent `thegn-musl`"),
+    "thegn-nobridge": ("thegn", "no bridge"),
+    "batteries": ("batteries", "no bridge"),
+    "dev": ("thegnDev", "THEGN_BRIDGE_BINARY"),
+    "thegn-dev": ("thegnDev", "THEGN_BRIDGE_BINARY"),
+    "thegn-musl": ("thegnMusl", "the bridge itself"),
+}
 
 
 def block_after(source: str, marker: str) -> str | None:
@@ -39,6 +48,56 @@ def block_after(source: str, marker: str) -> str | None:
             if depth == 0:
                 return source[opening + 1 : index]
     return None
+
+
+def validate_topology(flake: str, docs: str) -> list[str]:
+    problems: list[str] = []
+    package_block = block_after(flake, "packages =")
+    linux_block = block_after(flake, "optionalAttrs pkgs.stdenv.isLinux")
+    for name, (binding, _) in PACKAGE_TOPOLOGY.items():
+        block = linux_block if name == "thegn-musl" else package_block
+        clean_block = re.sub(r"(?m)#.*$", "", block or "")
+        found = re.search(
+            rf"(?m)^\s*{re.escape(name)}\s*=\s*([A-Za-z_][\w]*)\s*;",
+            clean_block,
+        )
+        if found is None:
+            problems.append(f"flake.nix packages.{name} is missing")
+        elif found.group(1) != binding:
+            problems.append(
+                f"flake.nix packages.{name} must be {binding} (found {found.group(1)})"
+            )
+
+    if not re.search(
+        r'defaultPkg\s*=\s*if\s+system\s*==\s*"x86_64-linux"\s+'
+        r'then\s+thegn\.overrideAttrs.*?install\s+-Dm755\s+'
+        r'\$\{thegnMusl\}/bin/thegn\s+\$out/bin/thegn-musl.*?else\s+thegn\s*;',
+        flake,
+        re.DOTALL,
+    ):
+        problems.append(
+            "defaultPkg must install the adjacent thegn-musl only on x86_64-linux "
+            "and fall back to thegn elsewhere"
+        )
+
+    if not docs.strip():
+        problems.append("docs/nix-packages.md is missing or empty")
+    for name, (_, phrase) in PACKAGE_TOPOLOGY.items():
+        row = next(
+            (
+                line
+                for line in docs.splitlines()
+                if line.startswith("|") and f"`.#{name}`" in line
+            ),
+            None,
+        )
+        if row is None:
+            problems.append(f"docs/nix-packages.md has no row for .#{name}")
+        elif phrase not in row:
+            problems.append(
+                f"docs/nix-packages.md row for .#{name} does not state '{phrase}'"
+            )
+    return problems
 
 
 def expected_nix_licenses(spdx: str) -> list[str] | None:
@@ -294,9 +353,10 @@ def validate_release_texts(
 
 def validate(root: Path = ROOT) -> list[str]:
     cargo_text = (root / "Cargo.toml").read_text()
+    flake = (root / "flake.nix").read_text()
     nix_problems = validate_texts(
         cargo_text,
-        (root / "flake.nix").read_text(),
+        flake,
         (root / "nix/package.nix").read_text(),
         (root / "nix/source.nix").read_text(),
         {name for name in LICENSE_FILES if (root / name).is_file()},
@@ -305,12 +365,14 @@ def validate(root: Path = ROOT) -> list[str]:
         name: (root / path).read_text()
         for name, (path, _, _) in RELEASE_TEMPLATES.items()
     }
+    docs_path = root / "docs/nix-packages.md"
+    docs = docs_path.read_text() if docs_path.is_file() else ""
     return nix_problems + validate_release_texts(
         cargo_text,
         (root / ".github/workflows/release.yml").read_text(),
         (root / "packaging/release.json").read_text(),
         templates,
-    )
+    ) + validate_topology(flake, docs)
 
 
 def main(root: Path = ROOT) -> int:
@@ -405,6 +467,31 @@ def fixture(version: str) -> tuple[str, str, str, str, set[str]]:
     return cargo, flake, package, source, set(LICENSE_FILES)
 
 
+def topology_fixture() -> tuple[str, str]:
+    flake = '''
+      packages = {
+        default = defaultPkg;
+        thegn = defaultPkg;
+        thegn-nobridge = thegn;
+        batteries = batteries;
+        dev = thegnDev;
+        thegn-dev = thegnDev;
+      } // pkgs.lib.optionalAttrs pkgs.stdenv.isLinux {
+        thegn-musl = thegnMusl;
+      };
+      defaultPkg = if system == "x86_64-linux" then thegn.overrideAttrs (old: {
+        postInstall = (old.postInstall or "") + ''
+          install -Dm755 ${thegnMusl}/bin/thegn $out/bin/thegn-musl
+        '';
+      }) else thegn;
+    '''
+    docs = "\n".join(
+        f"| `.#{name}` | Package | {phrase} |"
+        for name, (_, phrase) in PACKAGE_TOPOLOGY.items()
+    )
+    return flake, docs
+
+
 def release_fixture() -> tuple[str, str, str, dict[str, str]]:
     cargo = '[workspace.package]\nversion = "1.0.0"\nlicense = "MIT OR Apache-2.0"\n'
     release_yml = '''
@@ -441,6 +528,66 @@ def self_test() -> int:
         if problems:
             print(f"SELF-TEST FAIL: good version fixture rejected: {problems}")
             return 1
+
+    topology_good = topology_fixture()
+    topology_problems = validate_topology(*topology_good)
+    if topology_problems:
+        print(f"SELF-TEST FAIL: good topology fixture rejected: {topology_problems}")
+        return 1
+    print("SELF-TEST OK: accepted package topology fixture")
+    topology_cases = (
+        (
+            topology_good[0].replace("dev = thegnDev;", "dev = thegn;", 1),
+            topology_good[1],
+            "dev binding",
+            "flake.nix packages.dev must be thegnDev (found thegn)",
+        ),
+        (
+            topology_good[0].replace("default = defaultPkg;", "default = thegn;", 1),
+            topology_good[1],
+            "default binding",
+            "flake.nix packages.default must be defaultPkg (found thegn)",
+        ),
+        (
+            topology_good[0].replace("else thegn;", ";", 1),
+            topology_good[1],
+            "defaultPkg platform fallback",
+            "defaultPkg must install the adjacent thegn-musl only on x86_64-linux and fall back to thegn elsewhere",
+        ),
+        (
+            topology_good[0].replace("        thegn-musl = thegnMusl;\n", "", 1),
+            topology_good[1],
+            "thegn-musl binding",
+            "flake.nix packages.thegn-musl is missing",
+        ),
+        (
+            topology_good[0],
+            topology_good[1].replace(
+                "| `.#dev` | Package | THEGN_BRIDGE_BINARY |\n", "", 1
+            ),
+            "dev docs row",
+            "docs/nix-packages.md has no row for .#dev",
+        ),
+        (
+            topology_good[0],
+            topology_good[1].replace(
+                "| `.#thegn-nobridge` | Package | no bridge |",
+                "| `.#thegn-nobridge` | Package | bridge reference |",
+                1,
+            ),
+            "nobridge docs posture",
+            "docs/nix-packages.md row for .#thegn-nobridge does not state 'no bridge'",
+        ),
+    )
+    for flake, docs, label, expected_problem in topology_cases:
+        problems = validate_topology(flake, docs)
+        if expected_problem not in problems:
+            print(
+                f"SELF-TEST FAIL: {label} drift did not produce the expected problem: "
+                f"{expected_problem!r}; got {problems!r}"
+            )
+            return 1
+        print(f"SELF-TEST OK: rejected {label} drift")
 
     good = cases[0]
     bad_fixtures = (
