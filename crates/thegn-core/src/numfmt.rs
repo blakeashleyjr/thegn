@@ -5,6 +5,7 @@
 //! exact terminal-cell width.
 
 use crate::{termcaps, viz};
+use std::fmt::Write as _;
 use unicode_width::UnicodeWidthStr;
 
 /// A monitor reading's presentation unit. This is distinct from
@@ -152,7 +153,7 @@ impl NumFmt {
                 fit_mark(self.marks.unknown, width)
             }
             Reading::Value(value) => fit(
-                nonzero_or_overflow(self.format_value(value, unit, width), unit, width),
+                &nonzero_or_overflow(self.format_value(value, unit, width), unit, width),
                 width,
             ),
             Reading::Unknown => fit_mark(self.marks.unknown, width),
@@ -162,24 +163,24 @@ impl NumFmt {
         }
     }
 
-    fn zero_value(&self, unit: Unit) -> String {
+    fn zero_value(&self, unit: Unit) -> &'static str {
         match unit {
-            Unit::Percent => "0%".into(),
-            Unit::CpuCoreSum => "0.0".into(),
-            Unit::Bytes => "0B".into(),
-            Unit::BitsPerSec => "0.0b".into(),
-            Unit::Count => "0".into(),
-            Unit::Ratio => "0.00".into(),
-            Unit::Hertz => "0.0Hz".into(),
-            Unit::Watts => "0.0W".into(),
-            Unit::WattHours => "0.0Wh".into(),
-            Unit::Volts => "0.000V".into(),
-            Unit::Amps => "0.00A".into(),
-            Unit::Rpm => "0rpm".into(),
-            Unit::Temp => "0°".into(), // ° has no GlyphSet field yet.
-            Unit::Duration => "0s".into(),
-            Unit::Age => "0s".into(),
-            Unit::TimePlus => "0:00.00".into(),
+            Unit::Percent => "0%",
+            Unit::CpuCoreSum => "0.0",
+            Unit::Bytes => "0B",
+            Unit::BitsPerSec => "0.0b",
+            Unit::Count => "0",
+            Unit::Ratio => "0.00",
+            Unit::Hertz => "0.0Hz",
+            Unit::Watts => "0.0W",
+            Unit::WattHours => "0.0Wh",
+            Unit::Volts => "0.000V",
+            Unit::Amps => "0.00A",
+            Unit::Rpm => "0rpm",
+            Unit::Temp => "0°", // ° has no GlyphSet field yet.
+            Unit::Duration => "0s",
+            Unit::Age => "0s",
+            Unit::TimePlus => "0:00.00",
         }
     }
 
@@ -227,25 +228,35 @@ fn cells(s: &str) -> usize {
     UnicodeWidthStr::width(s)
 }
 
-fn fit(candidate: String, width: usize) -> String {
-    let used = cells(&candidate);
+fn fit(candidate: &str, width: usize) -> String {
+    let used = cells(candidate);
     if used > width {
         return "#".repeat(width);
     }
-    format!("{}{}", " ".repeat(width - used), candidate)
+    pad_left(candidate, width - used)
+}
+
+/// `pad` spaces followed by `text`, in one allocation.
+fn pad_left(text: &str, pad: usize) -> String {
+    let mut out = String::with_capacity(pad + text.len());
+    for _ in 0..pad {
+        out.push(' ');
+    }
+    out.push_str(text);
+    out
 }
 
 fn fit_mark(mark: &str, width: usize) -> String {
-    let mut clipped = String::new();
-    for c in mark.chars() {
-        let mut next = clipped.clone();
-        next.push(c);
-        if cells(&next) > width {
+    let mut end = 0;
+    for (index, c) in mark.char_indices() {
+        let next_end = index + c.len_utf8();
+        if cells(&mark[..next_end]) > width {
             break;
         }
-        clipped.push(c);
+        end = next_end;
     }
-    format!("{}{}", " ".repeat(width - cells(&clipped)), clipped)
+    let clipped = &mark[..end];
+    pad_left(clipped, width - cells(clipped))
 }
 
 /// A nonzero value must never read as zero. When a unit formatter could only
@@ -286,19 +297,25 @@ fn scaled(value: f64, divisor: f64, suffixes: &[&str], decimals: &[usize], width
         magnitude /= divisor;
         scale += 1;
     }
+    let mut mantissa = String::with_capacity(24);
+    let mut candidate = String::with_capacity(24);
     let mut current = scale;
     let mut did_promote = false;
     loop {
         let scaled = value.abs() / divisor.powi(current as i32);
         let mut promote = false;
         for places in decimals {
-            let mantissa = format!("{scaled:.precision$}", precision = *places);
+            mantissa.clear();
+            write!(mantissa, "{scaled:.precision$}", precision = *places)
+                .expect("writing to String cannot fail");
             let rounded = mantissa.parse::<f64>().unwrap_or(f64::INFINITY);
             if rounded >= 1000.0 {
                 promote = !did_promote && current + 1 < suffixes.len();
                 break;
             }
-            let candidate = format!("{sign}{mantissa}{}", suffixes[current]);
+            candidate.clear();
+            write!(candidate, "{sign}{mantissa}{}", suffixes[current])
+                .expect("writing to String cannot fail");
             if (value == 0.0 || rounded != 0.0) && cells(&candidate) <= width {
                 return candidate;
             }
@@ -321,6 +338,8 @@ fn bytes(value: f64, divisor: f64, width: usize) -> String {
         scale += 1;
     }
     let sign = if value.is_sign_negative() { "-" } else { "" };
+    let mut mantissa = String::with_capacity(24);
+    let mut candidate = String::with_capacity(24);
     let mut current = scale;
     let mut did_promote = false;
     loop {
@@ -334,13 +353,21 @@ fn bytes(value: f64, divisor: f64, width: usize) -> String {
         };
         let mut promote = false;
         for places in decimals {
-            let mantissa = format!("{mantissa_value:.precision$}", precision = *places);
+            mantissa.clear();
+            write!(
+                mantissa,
+                "{mantissa_value:.precision$}",
+                precision = *places
+            )
+            .expect("writing to String cannot fail");
             let rounded = mantissa.parse::<f64>().unwrap_or(f64::INFINITY);
             if rounded >= 1000.0 {
                 promote = !did_promote && current + 1 < suffixes.len();
                 break;
             }
-            let candidate = format!("{sign}{mantissa}{}", suffixes[current]);
+            candidate.clear();
+            write!(candidate, "{sign}{mantissa}{}", suffixes[current])
+                .expect("writing to String cannot fail");
             if (value == 0.0 || rounded != 0.0) && cells(&candidate) <= width {
                 return candidate;
             }
@@ -770,5 +797,220 @@ mod tests {
         assert_eq!(fmt(43_533.0, Unit::TimePlus, 8), "12h05:33");
         assert_eq!(fmt(5.12, Unit::TimePlus, 8), " 0:05.12");
         assert_eq!(fmt(360_000.0, Unit::TimePlus, 8), "   4d04h");
+    }
+
+    mod equivalence {
+        use super::super::{bytes, cells, fit, fit_mark, scaled};
+        use crate::numfmt::Marks;
+
+        fn reference_fit(candidate: String, width: usize) -> String {
+            let used = cells(&candidate);
+            if used > width {
+                return "#".repeat(width);
+            }
+            format!("{}{}", " ".repeat(width - used), candidate)
+        }
+
+        fn reference_fit_mark(mark: &str, width: usize) -> String {
+            let mut clipped = String::new();
+            for c in mark.chars() {
+                let mut next = clipped.clone();
+                next.push(c);
+                if cells(&next) > width {
+                    break;
+                }
+                clipped.push(c);
+            }
+            format!("{}{}", " ".repeat(width - cells(&clipped)), clipped)
+        }
+
+        fn reference_scaled(
+            value: f64,
+            divisor: f64,
+            suffixes: &[&str],
+            decimals: &[usize],
+            width: usize,
+        ) -> String {
+            if !value.is_finite() {
+                return "#".repeat(width);
+            }
+            let sign = if value.is_sign_negative() { "-" } else { "" };
+            let mut magnitude = value.abs();
+            let mut scale = 0;
+            while magnitude >= 1000.0 && scale + 1 < suffixes.len() {
+                magnitude /= divisor;
+                scale += 1;
+            }
+            let mut current = scale;
+            let mut did_promote = false;
+            loop {
+                let scaled = value.abs() / divisor.powi(current as i32);
+                let mut promote = false;
+                for places in decimals {
+                    let mantissa = format!("{scaled:.precision$}", precision = *places);
+                    let rounded = mantissa.parse::<f64>().unwrap_or(f64::INFINITY);
+                    if rounded >= 1000.0 {
+                        promote = !did_promote && current + 1 < suffixes.len();
+                        break;
+                    }
+                    let candidate = format!("{sign}{mantissa}{}", suffixes[current]);
+                    if (value == 0.0 || rounded != 0.0) && cells(&candidate) <= width {
+                        return candidate;
+                    }
+                }
+                if !promote {
+                    break;
+                }
+                current += 1;
+                did_promote = true;
+            }
+            "#".repeat(width)
+        }
+
+        fn reference_bytes(value: f64, divisor: f64, width: usize) -> String {
+            let suffixes = ["B", "K", "M", "G", "T", "P", "E"];
+            let mut magnitude = value.abs();
+            let mut scale = 0;
+            while magnitude >= 1000.0 && scale + 1 < suffixes.len() {
+                magnitude /= divisor;
+                scale += 1;
+            }
+            let sign = if value.is_sign_negative() { "-" } else { "" };
+            let mut current = scale;
+            let mut did_promote = false;
+            loop {
+                let mantissa_value = value.abs() / divisor.powi(current as i32);
+                let decimals: &[usize] = if mantissa_value >= 100.0 {
+                    &[0]
+                } else if mantissa_value >= 10.0 || mantissa_value.fract() == 0.0 {
+                    &[1, 0]
+                } else {
+                    &[2, 1, 0]
+                };
+                let mut promote = false;
+                for places in decimals {
+                    let mantissa = format!("{mantissa_value:.precision$}", precision = *places);
+                    let rounded = mantissa.parse::<f64>().unwrap_or(f64::INFINITY);
+                    if rounded >= 1000.0 {
+                        promote = !did_promote && current + 1 < suffixes.len();
+                        break;
+                    }
+                    let candidate = format!("{sign}{mantissa}{}", suffixes[current]);
+                    if (value == 0.0 || rounded != 0.0) && cells(&candidate) <= width {
+                        return candidate;
+                    }
+                }
+                if !promote {
+                    break;
+                }
+                current += 1;
+                did_promote = true;
+            }
+            "#".repeat(width)
+        }
+
+        fn values() -> Vec<f64> {
+            let mut values = vec![
+                0.0,
+                -0.0,
+                f64::NAN,
+                f64::INFINITY,
+                f64::NEG_INFINITY,
+                f64::MAX,
+                0.4,
+                0.04,
+                f64::from_bits(1),
+            ];
+            for exponent in -3..=15 {
+                for factor in [1.0, 0.9995, 0.95, 9.995, 99.95, 999.5, 1023.5] {
+                    values.push(10_f64.powi(exponent) * factor);
+                }
+            }
+            let negatives: Vec<f64> = values
+                .iter()
+                .copied()
+                .filter(|value| value.is_finite())
+                .map(|value| -value)
+                .collect();
+            values.extend(negatives);
+            values
+        }
+
+        #[test]
+        fn fit_matches_the_allocating_reference() {
+            for candidate in ["", "0", "12%", "1.5K", "日", "é", "ab日"] {
+                for width in 0..=8 {
+                    assert_eq!(
+                        fit(candidate, width),
+                        reference_fit(candidate.to_string(), width),
+                        "candidate {candidate:?} width {width}"
+                    );
+                }
+            }
+        }
+
+        #[test]
+        fn fit_mark_matches_the_allocating_reference() {
+            let marks = [Marks::UNICODE, Marks::ASCII];
+            let mut candidates = Vec::new();
+            for mark_set in marks {
+                candidates.extend([
+                    mark_set.unknown,
+                    mark_set.warming,
+                    mark_set.zero,
+                    mark_set.denied,
+                ]);
+            }
+            candidates.extend(["日本", "e\u{301}x", "\u{200d}", "", "abcdef"]);
+            for mark in candidates {
+                for width in 0..=7 {
+                    assert_eq!(
+                        fit_mark(mark, width),
+                        reference_fit_mark(mark, width),
+                        "mark {mark:?} width {width}"
+                    );
+                }
+            }
+        }
+
+        #[test]
+        fn scaled_matches_the_allocating_reference() {
+            let tables: &[(&[&str], &[usize])] = &[
+                (&["b", "K", "M", "G", "T"], &[1, 0]),
+                (&["", "k", "M", "G", "T"], &[2, 1, 0]),
+                (&["Hz", "k", "M", "G", "T"], &[2, 1, 0]),
+                (&["W", "kW", "MW"], &[2, 1, 0]),
+                (&["V", "kV"], &[3, 2, 1, 0]),
+                (&["%", "k"], &[0]),
+            ];
+            for value in values() {
+                for width in 1..=9 {
+                    for (suffixes, decimals) in tables {
+                        assert_eq!(
+                            scaled(value, 1000.0, suffixes, decimals, width),
+                            reference_scaled(value, 1000.0, suffixes, decimals, width),
+                            "value bits {:#018x}, width {width}, table {suffixes:?}/{decimals:?}",
+                            value.to_bits()
+                        );
+                    }
+                }
+            }
+        }
+
+        #[test]
+        fn bytes_matches_the_allocating_reference() {
+            for value in values() {
+                for width in 1..=9 {
+                    for divisor in [1000.0, 1024.0] {
+                        assert_eq!(
+                            bytes(value, divisor, width),
+                            reference_bytes(value, divisor, width),
+                            "value bits {:#018x}, width {width}, divisor {divisor}",
+                            value.to_bits()
+                        );
+                    }
+                }
+            }
+        }
     }
 }
