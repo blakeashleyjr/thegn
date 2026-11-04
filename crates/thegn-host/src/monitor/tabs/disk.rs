@@ -166,11 +166,7 @@ fn fmt_fill_eta(eta: DiskFillEta) -> String {
 fn fmt_age(age_secs: Option<u64>) -> String {
     match age_secs {
         None => "—".into(),
-        Some(s) if s < 5 => "just now".into(),
-        Some(s) if s < 60 => format!("{s}s ago"),
-        Some(s) if s < 3600 => format!("{}m ago", s / 60),
-        Some(s) if s < 86_400 => format!("{}h ago", s / 3600),
-        Some(s) => format!("{}d ago", s / 86_400),
+        Some(s) => thegn_core::util::age_ago_secs(i64::try_from(s).unwrap_or(i64::MAX), 5),
     }
 }
 
