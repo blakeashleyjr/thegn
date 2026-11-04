@@ -20,6 +20,9 @@ use thegn_core::sandbox::{
 use thegn_core::sandbox_floor::home_gate;
 use thegn_core::sandbox_mounts::{HomeView, home_view, planned_home_view, sealed_home_allowlist};
 
+#[path = "support/bounded_run.rs"]
+mod bounded_run;
+
 const CANARY: &str = "THE215-CANARY-DO-NOT-LEAK";
 
 /// A synthetic `$HOME`: credential canaries + benign dotfiles.
@@ -333,11 +336,9 @@ fn run_sealed(h: &Path, script: &str) -> Result<(bool, String), &'static str> {
     // bwrap hardcodes the system substrate (/nix/store, /usr, /etc, ...).
     let s = spec(Backend::Bwrap, h, mounts, true);
     let argv = enter_argv(&s, script).unwrap();
-    let out = Command::new(&argv[0])
-        .args(&argv[1..])
-        .env("HOME", h)
-        .output()
-        .map_err(|_| "bwrap could not be spawned")?;
+    let mut command = Command::new(&argv[0]);
+    command.args(&argv[1..]).env("HOME", h);
+    let out = bounded_run::output(&mut command).map_err(|_| "bwrap could not be spawned")?;
     let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
     // User namespaces denied by the environment are reported as unsupported.
     if !out.status.success()
@@ -769,4 +770,55 @@ fn a_legitimate_user_ro_mount_under_home_survives_the_sealed_filter() {
     m.ro = true;
     let j = bwrap_argv(h, vec![m]).unwrap();
     assert!(j.contains(data.path().to_str().unwrap()), "{j}");
+}
+
+#[test]
+fn bounded_run_kills_and_reaps_a_child_past_its_deadline() {
+    let mut command = Command::new("sh");
+    command.args(["-c", "exec sleep 30"]);
+    let started = std::time::Instant::now();
+    match bounded_run::run(
+        &mut command,
+        std::time::Duration::from_millis(300),
+        bounded_run::OUTPUT_CAP,
+    ) {
+        Ok(bounded_run::Outcome::TimedOut) => {}
+        other => panic!("expected deadline outcome, got {other:?}"),
+    }
+    assert!(started.elapsed() < std::time::Duration::from_secs(20));
+}
+
+#[test]
+fn bounded_run_stops_a_child_that_floods_stdout_past_the_cap() {
+    let mut command = Command::new("sh");
+    command.args(["-c", "while :; do echo xxxxxxxxxxxxxxxx; done"]);
+    let started = std::time::Instant::now();
+    match bounded_run::run(&mut command, std::time::Duration::from_secs(60), 65_536) {
+        Ok(bounded_run::Outcome::OverCap) => {}
+        other => panic!("expected output-cap outcome, got {other:?}"),
+    }
+    assert!(started.elapsed() < std::time::Duration::from_secs(20));
+}
+
+#[test]
+fn bounded_run_returns_status_and_both_streams_of_a_normal_child() {
+    let mut command = Command::new("sh");
+    command.args(["-c", "echo out; echo err >&2; exit 3"]);
+    match bounded_run::run(&mut command, bounded_run::DEADLINE, bounded_run::OUTPUT_CAP) {
+        Ok(bounded_run::Outcome::Exited(output)) => {
+            assert_eq!(output.status.code(), Some(3));
+            assert_eq!(output.stdout, b"out\n");
+            assert_eq!(output.stderr, b"err\n");
+        }
+        other => panic!("expected normal exit, got {other:?}"),
+    }
+}
+
+#[test]
+fn bounded_run_reports_an_unspawnable_program_as_an_io_error() {
+    let mut command = Command::new("/nonexistent/thegn-test-program");
+    match bounded_run::run(&mut command, bounded_run::DEADLINE, bounded_run::OUTPUT_CAP) {
+        Err(error) => assert_eq!(error.kind(), std::io::ErrorKind::NotFound),
+        Ok(outcome) => panic!("expected spawn error, got {outcome:?}"),
+    }
 }
