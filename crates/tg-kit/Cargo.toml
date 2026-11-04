@@ -30,7 +30,8 @@ thegn-core = { path = "../thegn-core", optional = true }
 [features]
 default = []
 # The standalone crossterm event-loop harness (each app's `main.rs`). Pulls in
-# ratatui's bundled crossterm backend; thegn-host never enables this.
+# ratatui's bundled crossterm backend; thegn-host enables it for `thegn plugin preview`;
+# embedded app tabs never run it.
 standalone = ["dep:anyhow", "ratatui/crossterm"]
 # Resolve every `[theme] preset` through `thegn_core::theme::preset` so the
 # standalone palette is byte-identical to the host's.
