@@ -357,7 +357,9 @@ fn classify(loc: &GitLoc, res: Result<String>) -> Result<RebaseOutcome> {
 }
 
 /// The base argument for rewriting history that includes `sha`: its parent,
-/// or `--root` for a root commit.
+/// or `--root` only when both the commit graph and commit object prove it is a
+/// root. Shallow boundaries look parentless to `rev-list` but retain parent
+/// headers in the commit object, so they must be refused.
 fn base_for(loc: &GitLoc, sha: &str) -> Result<String> {
     let commit_expr = format!("{sha}^{{commit}}");
     let commit = run_read(loc, &["rev-parse", "--verify", "-q", &commit_expr])
@@ -373,7 +375,20 @@ fn base_for(loc: &GitLoc, sha: &str) -> Result<String> {
         .ok_or_else(|| anyhow!("git returned no commit for {sha}"))?;
     match (ids.next(), ids.next()) {
         (Some(parent), None) => Ok(parent.to_owned()),
-        (None, None) => Ok("--root".to_string()),
+        (None, None) => {
+            let object = run_read(loc, &["cat-file", "commit", commit])
+                .with_context(|| format!("read commit object of rebase target {sha}"))?;
+            let has_parent = object
+                .lines()
+                .take_while(|line| !line.is_empty())
+                .any(|line| line.starts_with("parent "));
+            if has_parent {
+                bail!(
+                    "{sha} is a shallow-clone boundary: git has no local history behind it, so it cannot be rebased as a root commit; fetch more history first (for example `git fetch --deepen=1`); nothing was changed"
+                );
+            }
+            Ok("--root".to_string())
+        }
         _ => bail!("merge commits cannot be rebased here"),
     }
 }
@@ -1122,6 +1137,109 @@ mod tests {
             error
                 .to_string()
                 .contains("merge commits cannot be rebased here")
+        );
+    }
+
+    #[test]
+    fn shallow_boundary_is_not_treated_as_a_root_commit() {
+        let src = linear("shallow-src");
+        let dst = repo("shallow-dst");
+        let source_url = format!("file://{}", src.dir.display());
+        dst.out(&["fetch", "-q", "--depth", "2", &source_url, "main"]);
+        dst.out(&["reset", "-q", "--hard", "FETCH_HEAD"]);
+        assert_eq!(dst.out(&["rev-parse", "--is-shallow-repository"]), "true");
+
+        let boundary = dst.sha_of("c3");
+        let error = base_for(&dst.loc(), &boundary).unwrap_err();
+        assert!(
+            error.to_string().contains("shallow-clone boundary"),
+            "unexpected error: {error:#}"
+        );
+
+        let c4 = dst.sha_of("c4");
+        assert_eq!(base_for(&dst.loc(), &c4).unwrap(), boundary);
+    }
+
+    #[test]
+    fn shallow_boundary_rewrite_is_refused_without_touching_the_repo() {
+        let src = linear("shallow-rewrite-src");
+        let dst = repo("shallow-rewrite-dst");
+        let source_url = format!("file://{}", src.dir.display());
+        dst.out(&["fetch", "-q", "--depth", "2", &source_url, "main"]);
+        dst.out(&["reset", "-q", "--hard", "FETCH_HEAD"]);
+        assert_eq!(dst.out(&["rev-parse", "--is-shallow-repository"]), "true");
+
+        let boundary = dst.sha_of("c3");
+        let head = dst.head();
+        let retag_error = CliGit
+            .rebase_retag(
+                &dst.loc(),
+                &boundary,
+                &[&boundary],
+                TodoAction::Drop,
+                &opts(),
+            )
+            .unwrap_err();
+        assert!(
+            retag_error.to_string().contains("shallow-clone boundary"),
+            "unexpected error: {retag_error:#}"
+        );
+        let todo_error = CliGit.rebase_todo_for(&dst.loc(), &boundary).unwrap_err();
+        assert!(
+            todo_error.to_string().contains("shallow-clone boundary"),
+            "unexpected error: {todo_error:#}"
+        );
+
+        assert_eq!(dst.head(), head);
+        let rebase_dir = dst.out(&["rev-parse", "--git-path", "rebase-merge"]);
+        assert!(!dst.dir.join(rebase_dir).exists());
+    }
+
+    #[test]
+    fn failed_range_probe_starts_no_rebase() {
+        let r = linear("failed-range-probe");
+        let c2 = r.sha_of("c2");
+        let base = base_for(&r.loc(), &c2).unwrap();
+        let todo = CliGit.rebase_todo_for(&r.loc(), &c2).unwrap();
+        r.out(&["symbolic-ref", "HEAD", "refs/heads/missing"]);
+
+        let error = CliGit
+            .rebase_interactive(&r.loc(), &base, &todo, &opts())
+            .unwrap_err();
+        r.out(&["symbolic-ref", "HEAD", "refs/heads/main"]);
+
+        assert!(
+            format!("{error:#}").contains("verify rebase range"),
+            "unexpected error: {error:#}"
+        );
+        assert_eq!(r.out(&["rev-parse", "refs/heads/main"]), r.sha_of("c4"));
+        let rebase_dir = r.out(&["rev-parse", "--git-path", "rebase-merge"]);
+        assert!(!r.dir.join(rebase_dir).exists());
+    }
+
+    #[test]
+    fn failed_parent_probe_never_selects_root() {
+        let r = linear("failed-parent-probe");
+        let error = base_for(&r.loc(), &"0".repeat(40)).unwrap_err();
+        assert!(
+            format!("{error:#}").contains("verify rebase target"),
+            "unexpected parent-probe error: {error:#}"
+        );
+        assert!(
+            !format!("{error:#}").contains("shallow-clone boundary"),
+            "a failed parent probe must not be classified as a shallow boundary: {error:#}"
+        );
+
+        let dir = tempfile::tempdir_in("/tmp").unwrap();
+        let error =
+            base_for(&GitLoc::Local(dir.path().to_path_buf()), &"0".repeat(40)).unwrap_err();
+        assert!(
+            format!("{error:#}").contains("verify rebase target"),
+            "unexpected parent-probe error outside a repository: {error:#}"
+        );
+        assert!(
+            !format!("{error:#}").contains("shallow-clone boundary"),
+            "a failed parent probe must not be classified as a shallow boundary: {error:#}"
         );
     }
 

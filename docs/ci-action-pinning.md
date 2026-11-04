@@ -18,8 +18,9 @@ branches, so they move by design.
 
 That matters here because of what these workflows hold. `release.yml` grants
 `contents: write`, `id-token: write` and `attestations: write`, and passes
-publishing secrets; `sandbox-image.yml` holds `packages: write` and pushes
-registry images; the CI Cachix job carries `CACHIX_AUTH_TOKEN` and
+publishing secrets; the `sandbox-image.yml` publisher holds `packages: write`,
+`id-token: write` and `attestations: write` and pushes registry images built by
+credential-free builder jobs; the CI Cachix job carries `CACHIX_AUTH_TOKEN` and
 `NIX_GITHUB_TOKEN`. An action resolved through a mutable ref in any of those
 jobs is an open invitation: whoever can retarget the ref — or anyone who
 compromises that upstream repository — executes arbitrary code with those

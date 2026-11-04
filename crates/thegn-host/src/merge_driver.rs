@@ -2944,6 +2944,199 @@ mod tests {
         }
 
         #[test]
+        fn symlink_retarget_to_another_worktree_of_the_repo_holds() {
+            let (_fixture, root, feat_wt) = conflicting_repo("symlink-same-repo");
+            let main_before = out(&root, &["rev-parse", "main"]);
+            let db = Db::open_memory().unwrap();
+            db.put_worktree(
+                "feat",
+                root.to_str().unwrap(),
+                feat_wt.to_str().unwrap(),
+                "feat",
+                None,
+                None,
+            )
+            .unwrap();
+            let queued = bound_item(&db, &feat_wt);
+            let other = root.parent().unwrap().join("other");
+            git(
+                &root,
+                &[
+                    "worktree",
+                    "add",
+                    "-q",
+                    "-b",
+                    "other",
+                    other.to_str().unwrap(),
+                    "main",
+                ],
+            );
+            let target_head = out(&other, &["rev-parse", "HEAD"]);
+            let target_status = out(&other, &["status", "--porcelain"]);
+            let aside = root.parent().unwrap().join("feat-aside");
+            std::fs::rename(&feat_wt, &aside).unwrap();
+            std::os::unix::fs::symlink(&other, &feat_wt).unwrap();
+
+            let sentinel = root.join("fixer-ran");
+            let outcome = drive_queue(
+                &cfg(&format!("touch {} && {FIXER}", sentinel.display()), 2),
+                &Config::default(),
+                &root,
+                &db,
+                vec![queued],
+                |_| {},
+            );
+            assert_eq!(out(&root, &["rev-parse", "main"]), main_before);
+            assert_eq!(outcome.agent_blocked, ["feat"]);
+            assert!(outcome.landed.is_empty());
+            assert!(!sentinel.exists());
+            assert_eq!(out(&other, &["rev-parse", "HEAD"]), target_head);
+            assert_eq!(out(&other, &["status", "--porcelain"]), target_status);
+            let row = db.list_merge_queue().unwrap().remove(0);
+            assert_eq!(row.status, "agent_blocked");
+            assert_eq!(row.agent_attempts, 0);
+            let detail = row.error_detail.unwrap();
+            assert!(detail.contains("identity drift"), "{detail}");
+            assert!(detail.contains("registration changed"), "{detail}");
+        }
+
+        #[test]
+        fn symlink_retarget_to_a_clone_of_another_repository_holds() {
+            let (_fixture, root, feat_wt) = conflicting_repo("symlink-other-repo");
+            let main_before = out(&root, &["rev-parse", "main"]);
+            let db = Db::open_memory().unwrap();
+            db.put_worktree(
+                "feat",
+                root.to_str().unwrap(),
+                feat_wt.to_str().unwrap(),
+                "feat",
+                None,
+                None,
+            )
+            .unwrap();
+            let queued = bound_item(&db, &feat_wt);
+            let clone = root.parent().unwrap().join("clone");
+            git(
+                &root,
+                &[
+                    "clone",
+                    "-q",
+                    root.to_str().unwrap(),
+                    clone.to_str().unwrap(),
+                ],
+            );
+            git(&clone, &["checkout", "-q", "-b", "feat"]);
+            let target_head = out(&clone, &["rev-parse", "HEAD"]);
+            let target_status = out(&clone, &["status", "--porcelain"]);
+            let aside = root.parent().unwrap().join("feat-aside");
+            std::fs::rename(&feat_wt, &aside).unwrap();
+            std::os::unix::fs::symlink(&clone, &feat_wt).unwrap();
+
+            let sentinel = root.join("fixer-ran");
+            let outcome = drive_queue(
+                &cfg(&format!("touch {} && {FIXER}", sentinel.display()), 2),
+                &Config::default(),
+                &root,
+                &db,
+                vec![queued],
+                |_| {},
+            );
+            assert_eq!(out(&root, &["rev-parse", "main"]), main_before);
+            assert_eq!(outcome.agent_blocked, ["feat"]);
+            assert!(outcome.landed.is_empty());
+            assert!(!sentinel.exists());
+            assert_eq!(out(&clone, &["rev-parse", "HEAD"]), target_head);
+            assert_eq!(out(&clone, &["status", "--porcelain"]), target_status);
+            let row = db.list_merge_queue().unwrap().remove(0);
+            assert_eq!(row.status, "agent_blocked");
+            assert_eq!(row.agent_attempts, 0);
+            let detail = row.error_detail.unwrap();
+            assert!(detail.contains("identity drift"), "{detail}");
+            assert!(detail.contains("different repository"), "{detail}");
+        }
+
+        #[test]
+        fn symlink_retarget_to_its_own_moved_checkout_holds_before_the_fixer() {
+            let (_fixture, root, feat_wt) = conflicting_repo("symlink-moved-self");
+            let main_before = out(&root, &["rev-parse", "main"]);
+            let db = Db::open_memory().unwrap();
+            db.put_worktree(
+                "feat",
+                root.to_str().unwrap(),
+                feat_wt.to_str().unwrap(),
+                "feat",
+                None,
+                None,
+            )
+            .unwrap();
+            let queued = bound_item(&db, &feat_wt);
+            let moved = root.parent().unwrap().join("feat-moved");
+            git(
+                &root,
+                &[
+                    "worktree",
+                    "move",
+                    feat_wt.to_str().unwrap(),
+                    moved.to_str().unwrap(),
+                ],
+            );
+            let target_head = out(&moved, &["rev-parse", "HEAD"]);
+            let target_status = out(&moved, &["status", "--porcelain"]);
+            std::os::unix::fs::symlink(&moved, &feat_wt).unwrap();
+
+            let sentinel = root.join("fixer-ran");
+            let outcome = drive_queue_with(
+                &cfg(&format!("touch {} && {FIXER}", sentinel.display()), 2),
+                &Config::default(),
+                &root,
+                &db,
+                vec![queued],
+                |_| {},
+                DriveActions {
+                    attempt: |_: &str, _: &thegn_core::remote::GitLoc, _: bool| {
+                        Ok(AttemptOutcome::Conflict {
+                            paths: vec!["base.txt".into()],
+                            submodule_conflicts: Vec::new(),
+                            driver_refusal: None,
+                        })
+                    },
+                    floor: |worktree: &str| match verify_fixer_checkout_for_dispatch(
+                        &root,
+                        worktree,
+                        "feat",
+                        Some(&target_head),
+                    ) {
+                        Ok(()) => panic!("symlinked worktree passed fixer verification"),
+                        Err(reason) => crate::agent_run::AgentDispatch::InfraHold(format!(
+                            "worktree identity drift: {reason}"
+                        )),
+                    },
+                    runner:
+                        |_: &str,
+                         _: &str,
+                         _: &str,
+                         _: &str,
+                         _: &Failure,
+                         _: Option<thegn_core::sandbox::SandboxSpec>| {
+                            panic!("symlinked worktree reached the fixer")
+                        },
+                },
+            );
+            assert_eq!(out(&root, &["rev-parse", "main"]), main_before);
+            assert_eq!(outcome.agent_blocked, ["feat"]);
+            assert!(outcome.landed.is_empty());
+            assert!(!sentinel.exists());
+            assert_eq!(out(&moved, &["rev-parse", "HEAD"]), target_head);
+            assert_eq!(out(&moved, &["status", "--porcelain"]), target_status);
+            let row = db.list_merge_queue().unwrap().remove(0);
+            assert_eq!(row.status, "agent_blocked");
+            assert_eq!(row.agent_attempts, 0);
+            let detail = row.error_detail.unwrap();
+            assert!(detail.contains("identity drift"), "{detail}");
+            assert!(detail.contains("symlink"), "{detail}");
+        }
+
+        #[test]
         fn candidate_drift_fixer_commit_is_adopted_and_lands() {
             let (_fixture, root, feat_wt) = conflicting_repo("candidate-fixer-commit");
             let db = Db::open_memory().unwrap();

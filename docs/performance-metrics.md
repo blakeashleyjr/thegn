@@ -6,33 +6,40 @@ represents 0–1 µs samples. Always use the sample count. **interval_seconds**
 reports the actual interval, which can exceed configured cadence because
 diagnostics add no timer or wake.
 
-| Fields                                     | Boundary and coverage                                                                                                                                            |
-| ------------------------------------------ | ---------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| render_p\*\_us, frame_samples              | Host composition through encoding/submission; synchronous rendering includes sink I/O.                                                                           |
-| flush_p\*\_us                              | Legacy name for encoding/submission; not async flush time.                                                                                                       |
-| input_p\*\_us, input_samples               | Earliest pending host observation to next frame submission. A sample covers a coalesced cohort, not necessarily an application response.                         |
-| input_events, input_coalesced_events       | Dispatched key/mouse/paste events and those joining a pending cohort. Preemption observations are not extra dispatches.                                          |
-| writer_queue_p99_us, writer_write_p99_us   | Queue wait before a successful frame write and duration in sink write+flush.                                                                                     |
-| writer_completion_p99_us, writer_frames    | Submission to successful sink completion and its sample count.                                                                                                   |
-| writer_input_p99_us, writer_input_samples  | Submitted cohort's earliest observation to successful sink completion.                                                                                           |
-| writer_failed_frames                       | Timed writes that failed, excluded from completion histograms. OOB and frames discarded after fatal errors are not successful frames.                            |
-| writer_metrics_deferred                    | Metrics lock was contended. Samples remain for a later rollup, so writer windows can span multiple loop intervals.                                               |
-| writer_deferred_rollups                    | Successful collection retained samples through this many earlier missed rollups. Writer counts are completion-cohort samples, never rates over interval_seconds. |
-| idle_ratio                                 | Loop wall-time idle fraction; active time includes synchronous dispatch. This is not process CPU utilization.                                                    |
-| cpu_hydrate_ms, hydrate_calls              | Calling-thread CPU for complete build_model invocations, including commit-list resends.                                                                          |
-| cpu_hydrate_child_ms, hydrate_child_calls  | Separate scoped panel/Git/semantic worker CPU, including panel prefetch. Never child-process CPU.                                                                |
-| cpu_process_ms                             | Whole-process CPU across all threads.                                                                                                                            |
-| cpu_loop_ms                                | CPU used by the event-loop thread.                                                                                                                               |
-| cpu_scan_ms                                | CPU used by scan-pool jobs.                                                                                                                                      |
-| cpu_children_reaped_ms                     | Child-process CPU, counted only when each child is reaped; a long-lived child appears once, at exit.                                                             |
-| cpu_unattributed_ms                        | Process CPU outside the loop thread and measured off-loop spans, such as gix-internal and deadline threads; floored at 0.                                        |
-| malloc_arena_max, malloc_arena_cap_applied | Requested glibc arena cap from `THEGN_MALLOC_ARENA_MAX` (default 2; 0 = uncapped); applied is false off glibc Linux or if refused.                               |
-| malloc_trims_idle, malloc_trims_scan       | Trims after 10 s idle and after a scan-pool burst drains; both share one 30 s limiter.                                                                           |
-| malloc_scan_drains                         | Drained scan bursts, including ones throttled by the shared limiter.                                                                                             |
-| malloc_trims_released                      | Trims that returned memory to the operating system.                                                                                                              |
-| malloc_trim_bytes                          | Bytes released by trimming; macOS only, always 0 on Linux.                                                                                                       |
-| malloc_trim_total_us, malloc_trim_max_us   | Cumulative time spent in trim calls and the longest trim call.                                                                                                   |
-| resync_samples, resync_p99_us              | Count and cost of baseline reset/full-screen re-emission, independent of incremental/full composition classification.                                            |
+`*_p95_us` keys (render, input, writer completion, writer input) are additive in
+version 2. A window with fewer than 20 samples is sparse: its p95 is the maximum
+and its p99 describes one or two samples, so the status dashboard shows the
+count and `(sparse)` instead of a tail, and `no samples` only when the count is 0. Submitted-frame timing (render/input), successful sink completion
+(`writer_*`), and physical paint are separate boundaries; physical paint is
+never measured.
+
+| Fields                                                            | Boundary and coverage                                                                                                                                            |
+| ----------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| render_p50_us, render_p95_us, render_p99_us, frame_samples        | Host composition through encoding/submission; synchronous rendering includes sink I/O.                                                                           |
+| flush_p\*\_us                                                     | Legacy name for encoding/submission; not async flush time.                                                                                                       |
+| input_p50_us, input_p95_us, input_p99_us, input_samples           | Earliest pending host observation to next frame submission. A sample covers a coalesced cohort, not necessarily an application response.                         |
+| input_events, input_coalesced_events                              | Dispatched key/mouse/paste events and those joining a pending cohort. Preemption observations are not extra dispatches.                                          |
+| writer_queue_p99_us, writer_write_p99_us                          | Queue wait before a successful frame write and duration in sink write+flush.                                                                                     |
+| writer_completion_p95_us, writer_completion_p99_us, writer_frames | Submission to successful sink completion and its sample count.                                                                                                   |
+| writer_input_p95_us, writer_input_p99_us, writer_input_samples    | Submitted cohort's earliest observation to successful sink completion.                                                                                           |
+| writer_failed_frames                                              | Timed writes that failed, excluded from completion histograms. OOB and frames discarded after fatal errors are not successful frames.                            |
+| writer_metrics_deferred                                           | Metrics lock was contended. Samples remain for a later rollup, so writer windows can span multiple loop intervals.                                               |
+| writer_deferred_rollups                                           | Successful collection retained samples through this many earlier missed rollups. Writer counts are completion-cohort samples, never rates over interval_seconds. |
+| idle_ratio                                                        | Loop wall-time idle fraction; active time includes synchronous dispatch. This is not process CPU utilization.                                                    |
+| cpu_hydrate_ms, hydrate_calls                                     | Calling-thread CPU for complete build_model invocations, including commit-list resends.                                                                          |
+| cpu_hydrate_child_ms, hydrate_child_calls                         | Separate scoped panel/Git/semantic worker CPU, including panel prefetch. Never child-process CPU.                                                                |
+| cpu_process_ms                                                    | Whole-process CPU across all threads.                                                                                                                            |
+| cpu_loop_ms                                                       | CPU used by the event-loop thread.                                                                                                                               |
+| cpu_scan_ms                                                       | CPU used by scan-pool jobs.                                                                                                                                      |
+| cpu_children_reaped_ms                                            | Child-process CPU, counted only when each child is reaped; a long-lived child appears once, at exit.                                                             |
+| cpu_unattributed_ms                                               | Process CPU outside the loop thread and measured off-loop spans, such as gix-internal and deadline threads; floored at 0.                                        |
+| malloc_arena_max, malloc_arena_cap_applied                        | Requested glibc arena cap from `THEGN_MALLOC_ARENA_MAX` (default 2; 0 = uncapped); applied is false off glibc Linux or if refused.                               |
+| malloc_trims_idle, malloc_trims_scan                              | Trims after 10 s idle and after a scan-pool burst drains; both share one 30 s limiter.                                                                           |
+| malloc_scan_drains                                                | Drained scan bursts, including ones throttled by the shared limiter.                                                                                             |
+| malloc_trims_released                                             | Trims that returned memory to the operating system.                                                                                                              |
+| malloc_trim_bytes                                                 | Bytes released by trimming; macOS only, always 0 on Linux.                                                                                                       |
+| malloc_trim_total_us, malloc_trim_max_us                          | Cumulative time spent in trim calls and the longest trim call.                                                                                                   |
+| resync_samples, resync_p99_us                                     | Count and cost of baseline reset/full-screen re-emission, independent of incremental/full composition classification.                                            |
 
 The `malloc_*` counters are cumulative since process start, not per interval.
 Trimming is available only on glibc Linux and macOS.
@@ -74,3 +81,6 @@ establish a live regression. No cadence/cache/resync policy changes are included
 
 The benchmark protocol that defines timing boundaries, fixtures, sampling and thresholds for comparing runs is in
 [performance-benchmark-protocol.md](performance-benchmark-protocol.md).
+
+Which background workers exist, what wakes them and what bounds them is inventoried in
+[runtime-workers.md](runtime-workers.md).

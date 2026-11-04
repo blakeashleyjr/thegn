@@ -34,6 +34,13 @@ pub(crate) fn platform_set_mode_for_test(_path: &std::path::Path, _mode: u32) ->
     Ok(())
 }
 
+#[cfg(test)]
+pub(crate) fn platform_non_utf8_path_for_test(
+    _parent: &std::path::Path,
+) -> Option<std::path::PathBuf> {
+    None
+}
+
 pub(crate) fn platform_is_transient_accept_resource_error(raw_os_error: Option<i32>) -> bool {
     matches!(raw_os_error, Some(10024) | Some(10055)) // WSAEMFILE, WSAENOBUFS
 }

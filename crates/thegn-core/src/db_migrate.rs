@@ -2144,6 +2144,28 @@ pub(crate) fn verify_v98_schema(conn: &Connection) -> Result<()> {
     Ok(())
 }
 
+/// v99: provider context for cached CI logs and autofix claims (THE-550).
+pub(crate) fn migrate_v99(conn: &Connection) -> Result<()> {
+    for table in ["ci_log_cache", "ci_autofix_dedupe"] {
+        if !has_column(conn, table, "context") {
+            conn.execute(
+                &format!("ALTER TABLE {table} ADD COLUMN context TEXT NOT NULL DEFAULT ''"),
+                [],
+            )?;
+        }
+    }
+    Ok(())
+}
+
+pub(crate) fn verify_v99_schema(conn: &Connection) -> Result<()> {
+    for table in ["ci_log_cache", "ci_autofix_dedupe"] {
+        if !has_column(conn, table, "context") {
+            bail!("schema v99 migration did not add {table}.context");
+        }
+    }
+    Ok(())
+}
+
 /// Verify the v69 identity ledger before the schema version is stamped. A
 /// missing column/table must never look like a completed migration.
 pub(crate) fn verify_v69_schema(conn: &Connection) -> Result<()> {
@@ -3581,7 +3603,6 @@ mod tests {
             .pragma_query_value(None, "user_version", |row| row.get(0))
             .unwrap();
         assert_eq!(version, crate::db::SCHEMA_VERSION);
-        assert_eq!(version, 98);
         assert_eq!(
             upgraded
                 .pipeline_lease_generation("repo:linear:A-1")
@@ -3595,6 +3616,72 @@ mod tests {
             Ok(1)
         );
         super::verify_v98_schema(upgraded.conn()).unwrap();
+    }
+
+    #[test]
+    fn v99_adds_ci_cache_context_columns_idempotently_and_verifies() {
+        let fresh = Db::open_memory().unwrap();
+        super::verify_v99_schema(fresh.conn()).unwrap();
+        let conn = Connection::open_in_memory().unwrap();
+        super::migrate_v67(&conn).unwrap();
+        assert!(super::verify_v99_schema(&conn).is_err());
+        super::migrate_v99(&conn).unwrap();
+        super::migrate_v99(&conn).unwrap();
+        super::verify_v99_schema(&conn).unwrap();
+    }
+
+    #[test]
+    fn v99_upgrades_a_real_v98_database() {
+        use crate::ci_log::{CiLogCandidate, CiLogEntry};
+        use crate::store::CacheStore;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("v98.db");
+        {
+            let db = Db::open_at(&path).unwrap();
+            let mut entry = CiLogEntry::new("/wt/v98", "run", "job", "tests", "log", 10, 1024, 1);
+            entry.head_sha = "sha".into();
+            db.put_ci_log(&entry).unwrap();
+            let candidate = CiLogCandidate {
+                worktree: "/wt/v98".into(),
+                run_id: "run".into(),
+                job_id: "job".into(),
+                head_sha: "sha".into(),
+                context: String::new(),
+            };
+            assert!(db.claim_ci_autofix(&candidate).unwrap());
+            db.conn()
+                .execute_batch(
+                    "ALTER TABLE ci_log_cache DROP COLUMN context;\n\
+                 ALTER TABLE ci_autofix_dedupe DROP COLUMN context;\n\
+                 PRAGMA user_version=98;",
+                )
+                .unwrap();
+        }
+        let upgraded = Db::open_at(&path).unwrap();
+        let version: i64 = upgraded
+            .conn()
+            .pragma_query_value(None, "user_version", |row| row.get(0))
+            .unwrap();
+        assert_eq!(version, crate::db::SCHEMA_VERSION);
+        assert_eq!(version, 99);
+        assert_eq!(
+            upgraded
+                .get_ci_log("/wt/v98", "run", "job")
+                .unwrap()
+                .unwrap()
+                .context,
+            ""
+        );
+        let legacy = CiLogCandidate {
+            worktree: "/wt/v98".into(),
+            run_id: "run".into(),
+            job_id: "job".into(),
+            head_sha: "sha".into(),
+            context: "github:github.com/o/a".into(),
+        };
+        assert!(!upgraded.claim_ci_autofix(&legacy).unwrap());
+        super::verify_v99_schema(upgraded.conn()).unwrap();
     }
 
     #[test]

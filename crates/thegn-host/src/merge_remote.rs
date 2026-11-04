@@ -52,6 +52,7 @@ impl BundleLimits {
 
 #[derive(Debug)]
 enum IngestError {
+    Cancelled,
     Timeout {
         after: Duration,
     },
@@ -69,6 +70,7 @@ enum IngestError {
 impl fmt::Display for IngestError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::Cancelled => f.write_str("bundle ingestion cancelled"),
             Self::Timeout { after } => write!(
                 f,
                 "bundle ingestion timed out after {} seconds",
@@ -133,7 +135,13 @@ pub fn ingest_tip(target: &GitLoc, branch: &str, branch_loc: &GitLoc) -> Result<
             _guard: None,
         });
     }
-    ingest_tip_with_expected(target, branch, branch_loc, None)
+    ingest_tip_with_expected(
+        target,
+        branch,
+        branch_loc,
+        None,
+        &BundleLimits::production(),
+    )
 }
 
 fn ingest_tip_with_expected(
@@ -141,6 +149,7 @@ fn ingest_tip_with_expected(
     branch: &str,
     branch_loc: &GitLoc,
     injected_expected: Option<&str>,
+    limits: &BundleLimits,
 ) -> Result<IngestedTip> {
     if target.is_remote() {
         anyhow::bail!(
@@ -159,18 +168,31 @@ fn ingest_tip_with_expected(
     if let Err(error) = stream_bundle(
         branch_loc.git_command(&["bundle", "create", "-", &src]),
         &mut tmp,
-        &BundleLimits::production(),
+        limits,
     ) {
         let cleanup = tmp.finish();
+        let context = if matches!(&error, IngestError::Cancelled) {
+            format!("bundle ingestion of {branch} cancelled")
+        } else {
+            format!("branch host unreachable while bundling {branch}")
+        };
         return match cleanup {
-            Ok(()) => Err(anyhow::Error::new(error)
-                .context(format!("branch host unreachable while bundling {branch}"))),
-            Err(cleanup) => Err(anyhow::Error::new(error).context(format!(
-                "branch host unreachable while bundling {branch}; cleanup failed: {cleanup}"
+            Ok(()) => Err(anyhow::Error::new(error).context(context)),
+            Err(cleanup) => {
+                Err(anyhow::Error::new(error)
+                    .context(format!("{context}; cleanup failed: {cleanup}")))
+            }
+        };
+    }
+    if crate::fold_cancel::requested() {
+        return match tmp.finish() {
+            Ok(()) => Err(anyhow::Error::new(IngestError::Cancelled)),
+            Err(cleanup) => Err(anyhow::Error::new(IngestError::Cancelled).context(format!(
+                "bundle ingestion cancelled; cleanup failed: {cleanup}"
             ))),
         };
     }
-    fetch_from_custody(target, branch, tmp, &ref_name, &expected)
+    fetch_from_custody(target, branch, tmp, &ref_name, &expected, limits.deadline)
         .with_context(|| format!("fetching {branch} into the target store"))?;
     let guard = IngestRef {
         target: target.clone(),
@@ -548,6 +570,11 @@ fn stream_bundle(
     let mut terminal_error = None;
     let mut status = None;
     loop {
+        if crate::fold_cancel::requested() {
+            terminal_error = Some(IngestError::Cancelled);
+            kill_bundle_producer(&mut child);
+            break;
+        }
         let remaining = limits.deadline.saturating_sub(started.elapsed());
         if remaining.is_zero() {
             terminal_error = Some(IngestError::Timeout {
@@ -741,6 +768,7 @@ fn fetch_from_custody(
     tmp: BundleTemp,
     target_ref: &str,
     expected: &str,
+    deadline: Duration,
 ) -> Result<()> {
     if target.is_remote() {
         anyhow::bail!(
@@ -766,7 +794,7 @@ fn fetch_from_custody(
     let refspec = format!("refs/heads/{branch}:{staging_ref}");
     let outcome = thegn_core::git_run::run_command(
         &mut target.git_command(&["fetch", &tmp_s, &refspec]),
-        &thegn_core::git_run::GitPolicy::read(crate::integrate::DRIVER_SUBPROCESS_TIMEOUT),
+        &thegn_core::git_run::GitPolicy::read(deadline),
         &AtomicBool::new(false),
     );
     if !outcome.is_success() {
@@ -775,9 +803,7 @@ fn fetch_from_custody(
             tracing::warn!(ref_name = %staging_ref, error = %error, "failed to remove staging ref after bundle fetch failure");
         }
         let error = match outcome {
-            thegn_core::git_run::GitOutcome::Timeout => IngestError::Timeout {
-                after: crate::integrate::DRIVER_SUBPROCESS_TIMEOUT,
-            },
+            thegn_core::git_run::GitOutcome::Timeout => IngestError::Timeout { after: deadline },
             thegn_core::git_run::GitOutcome::Exit { .. } => {
                 IngestError::InvalidBundle(outcome_text)
             }
@@ -990,6 +1016,26 @@ mod tests {
             "feat",
             &GitLoc::Local(fixture.source.clone()),
             expected,
+            &BundleLimits::production(),
+        )
+    }
+
+    fn custody_for_fixture(fixture: &Stores, temp_root: &std::path::Path) -> (BundleTemp, String) {
+        let generated = generation_ref(&GitLoc::Local(fixture.source.clone()), "feat").unwrap();
+        let mut custody = BundleTemp::new_in(temp_root).unwrap();
+        let source = GitLoc::Local(fixture.source.clone());
+        let bundle_command = source.git_command(&["bundle", "create", "-", "refs/heads/feat"]);
+        stream_bundle(bundle_command, &mut custody, &BundleLimits::production()).unwrap();
+        (custody, generated)
+    }
+
+    fn install_reference_transaction_hook(fixture: &Stores, script: &[u8]) -> std::io::Result<()> {
+        let hooks = fixture.target.join(".git/hooks");
+        std::fs::create_dir_all(&hooks)?;
+        crate::platform::publish_private_executable(
+            &hooks.join("reference-transaction.staged"),
+            &hooks.join("reference-transaction"),
+            script,
         )
     }
 
@@ -1055,6 +1101,26 @@ mod tests {
             &small_limits(1 << 20, Duration::from_secs(1), 4096),
         );
         assert!(matches!(result, Err(IngestError::Timeout { .. })));
+        assert!(started.elapsed() < Duration::from_secs(10));
+        tmp.finish().unwrap();
+        assert_eq!(std::fs::read_dir(root.path()).unwrap().count(), 0);
+    }
+
+    #[test]
+    fn bundle_stream_stops_when_the_fold_is_cancelled() {
+        if thegn_core::util::which_path("sh").is_none() {
+            return;
+        }
+        let root = tempfile::tempdir().unwrap();
+        let mut tmp = BundleTemp::new_in(root.path()).unwrap();
+        let _scope = crate::fold_cancel::scope(|| true);
+        let started = Instant::now();
+        let result = stream_bundle(
+            shell("sleep 30"),
+            &mut tmp,
+            &small_limits(1 << 20, Duration::from_secs(30), 4096),
+        );
+        assert!(matches!(result, Err(IngestError::Cancelled)));
         assert!(started.elapsed() < Duration::from_secs(10));
         tmp.finish().unwrap();
         assert_eq!(std::fs::read_dir(root.path()).unwrap().count(), 0);
@@ -1130,7 +1196,8 @@ mod tests {
                 "feat",
                 garbage,
                 &generated,
-                &fixture.oid
+                &fixture.oid,
+                crate::integrate::DRIVER_SUBPROCESS_TIMEOUT,
             )
             .is_err()
         );
@@ -1150,6 +1217,7 @@ mod tests {
             custody,
             &generated,
             &fixture.oid,
+            crate::integrate::DRIVER_SUBPROCESS_TIMEOUT,
         )
         .unwrap();
         assert_eq!(std::fs::read_dir(&temp_root).unwrap().count(), 0);
@@ -1187,10 +1255,94 @@ mod tests {
             custody,
             &generated,
             &fixture.oid,
+            crate::integrate::DRIVER_SUBPROCESS_TIMEOUT,
         );
         assert!(matches!(result, Err(error) if format!("{error:#}").contains("Git exited")));
         assert_eq!(list_refs(&fixture.target), vec![generated]);
         assert_eq!(std::fs::read_dir(temp_root.path()).unwrap().count(), 0);
+    }
+
+    #[test]
+    fn cancelled_ingest_publishes_no_ref() {
+        let fixture = stores("source");
+        let _scope = crate::fold_cancel::scope(|| true);
+        let result = ingest(&fixture, None);
+        assert!(result.is_err());
+        let error = match result {
+            Err(error) => error,
+            Ok(_) => panic!("cancelled ingestion unexpectedly succeeded"),
+        };
+        assert!(format!("{error:#}").contains("cancelled"));
+        assert!(list_refs(&fixture.target).is_empty());
+    }
+
+    #[test]
+    fn fetch_consumer_hang_times_out_under_the_ingest_deadline() {
+        if thegn_core::util::which_path("sh").is_none() {
+            return;
+        }
+        let fixture = stores("source");
+        let temp_root = fixture._root.path().join("bundle-temp");
+        std::fs::create_dir(&temp_root).unwrap();
+        let (custody, generated) = custody_for_fixture(&fixture, &temp_root);
+        if let Err(error) =
+            install_reference_transaction_hook(&fixture, b"#!/bin/sh\nexec sleep 30\n")
+        {
+            if error.kind() == std::io::ErrorKind::Unsupported {
+                return;
+            }
+            panic!("install hanging reference-transaction hook: {error}");
+        }
+        let started = Instant::now();
+        let result = fetch_from_custody(
+            &GitLoc::Local(fixture.target.clone()),
+            "feat",
+            custody,
+            &generated,
+            &fixture.oid,
+            Duration::from_secs(1),
+        );
+        let error = match result {
+            Err(error) => error,
+            Ok(()) => panic!("hung consumer unexpectedly succeeded"),
+        };
+        assert!(matches!(
+            error.downcast_ref::<IngestError>(),
+            Some(IngestError::Timeout { after }) if *after == Duration::from_secs(1)
+        ));
+        assert!(started.elapsed() < Duration::from_secs(10));
+        assert!(list_refs(&fixture.target).is_empty());
+        assert_eq!(std::fs::read_dir(&temp_root).unwrap().count(), 0);
+    }
+
+    #[test]
+    fn fetch_consumer_failure_leaves_no_ref() {
+        if thegn_core::util::which_path("sh").is_none() {
+            return;
+        }
+        let fixture = stores("source");
+        let temp_root = fixture._root.path().join("bundle-temp");
+        std::fs::create_dir(&temp_root).unwrap();
+        let (custody, generated) = custody_for_fixture(&fixture, &temp_root);
+        if let Err(error) = install_reference_transaction_hook(&fixture, b"#!/bin/sh\nexit 1\n") {
+            if error.kind() == std::io::ErrorKind::Unsupported {
+                return;
+            }
+            panic!("install failing reference-transaction hook: {error}");
+        }
+        assert!(
+            fetch_from_custody(
+                &GitLoc::Local(fixture.target.clone()),
+                "feat",
+                custody,
+                &generated,
+                &fixture.oid,
+                Duration::from_secs(10),
+            )
+            .is_err()
+        );
+        assert!(list_refs(&fixture.target).is_empty());
+        assert_eq!(std::fs::read_dir(&temp_root).unwrap().count(), 0);
     }
 
     #[test]

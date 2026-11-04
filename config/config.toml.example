@@ -4563,10 +4563,10 @@ agent_on_floor_miss = "degrade"  # degrade | fail  (recommended: fail on Linux)
 #
 # Team safety. These are the rules that make an agent safe to point at a shared
 # repo, and the defaults assume you have colleagues:
-reset_attempts_on_push = true # a new head commit refills the attempt budget. A PR lives for days,
-                              #   so a one-shot budget would exhaust once and stick forever. Only a
-                              #   head thegn did NOT create refills it, so an agent can't top up its
-                              #   own budget by pushing.
+reset_attempts_on_push = true # with pause_on_foreign_push disabled, a new head commit refills the
+                              #   attempt budget. A PR lives for days, so a one-shot budget would
+                              #   exhaust once and stick forever. Only a head thegn did NOT create
+                              #   refills it, so an agent can't top up its own budget by pushing.
 pause_on_foreign_push = true  # if the head moved and thegn didn't move it, someone else pushed —
                               #   stop and ask for a human rather than racing them
 own_prs_only = true           # never let the agent write to a PR you didn't author (watching and

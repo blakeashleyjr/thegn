@@ -1,6 +1,6 @@
 # thegn
 
-> **Status: public alpha** (`0.1.0-alpha.45`). **x86_64 Linux is the supported
+> **Status: public alpha** (`0.1.0-alpha.46`). **x86_64 Linux is the supported
 > platform.** macOS on Apple silicon is best-effort: use the flake or source
 > setup until a release archive is published. CI is opt-in and the
 > interactive on-device checklist is unfinished. Windows is deferred and has no release binary.
@@ -294,6 +294,14 @@ the owl icon on Linux/BSD (Exec `tg --standalone`; searchable/pinnable in
 GNOME/KDE/rofi/wofi), or a `thegn.app` bundle on macOS (see below).
 thegn shells out to `git` (and `gh`/`ssh` as fallbacks where native support has
 gaps); `lazygit` is optional.
+
+`./install.sh --uninstall [--dry-run]` removes files recorded in
+`$XDG_DATA_HOME/thegn/install-manifest` inside the install roots only when
+their SHA-256 still matches. Changed files are kept and reported, your
+config is never removed, and a malformed or forged manifest is refused before
+removal. Dry-run prints what would be removed or kept. Pass
+the same bindir used for installation; uninstall cannot be combined with
+`--batteries`.
 
 ### macOS app launcher
 

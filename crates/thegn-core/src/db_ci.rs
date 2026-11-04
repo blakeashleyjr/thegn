@@ -9,6 +9,10 @@ use crate::ci_log::{
 use crate::db::Db;
 use crate::util;
 
+/// Claim a candidate once per known provider-context identity. Empty legacy or
+/// unknown contexts never replace or reclaim an existing dedupe row.
+pub(crate) const CLAIM_CI_AUTOFIX_SQL: &str = "INSERT INTO ci_autofix_dedupe (worktree, run_id, job_id, head_sha, claimed_at, context) VALUES (?1,?2,?3,?4,?5,?6) ON CONFLICT(worktree, run_id, job_id, head_sha) DO UPDATE SET context=excluded.context, claimed_at=excluded.claimed_at WHERE ci_autofix_dedupe.context <> '' AND excluded.context <> '' AND ci_autofix_dedupe.context <> excluded.context";
+
 impl Db {
     pub(crate) fn get_ci_log_entry(
         &self,
@@ -19,7 +23,7 @@ impl Db {
         let row = self
             .conn()
             .query_row(
-                "SELECT worktree, run_id, job_id, job_name, head_sha, text, truncated, redacted, fetched_at
+                "SELECT worktree, run_id, job_id, job_name, head_sha, text, truncated, redacted, fetched_at, context
                  FROM ci_log_cache WHERE worktree=?1 AND run_id=?2 AND job_id=?3",
                 params![worktree, run_id, job_id],
                 |r| {
@@ -35,6 +39,7 @@ impl Db {
                         redacted: version != 0,
                         policy_version: u32::try_from(version).unwrap_or(0),
                         fetched_at: r.get(8)?,
+                        context: r.get(9)?,
                     }
                     .revalidated())
                 },
@@ -45,7 +50,7 @@ impl Db {
 
     pub(crate) fn list_ci_log_entries(&self, worktree: &str) -> Result<Vec<CiLogEntry>> {
         let mut stmt = self.conn().prepare(
-            "SELECT worktree, run_id, job_id, job_name, head_sha, text, truncated, redacted, fetched_at
+            "SELECT worktree, run_id, job_id, job_name, head_sha, text, truncated, redacted, fetched_at, context
              FROM ci_log_cache WHERE worktree=?1 ORDER BY fetched_at DESC, run_id, job_id",
         )?;
         let rows = stmt.query_map(params![worktree], |r| {
@@ -61,6 +66,7 @@ impl Db {
                 redacted: version != 0,
                 policy_version: u32::try_from(version).unwrap_or(0),
                 fetched_at: r.get(8)?,
+                context: r.get(9)?,
             })
         })?;
         Ok(rows
@@ -77,10 +83,10 @@ impl Db {
             crate::ci_log::bounded_tail(&redacted, HARD_MAX_LOG_LINES, HARD_MAX_LOG_BYTES);
         self.conn().execute(
             "INSERT INTO ci_log_cache
-             (worktree, run_id, job_id, job_name, head_sha, text, truncated, redacted, fetched_at)
-             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9)
+             (worktree, run_id, job_id, job_name, head_sha, text, truncated, redacted, fetched_at, context)
+             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10)
              ON CONFLICT(worktree, run_id, job_id) DO UPDATE SET
-               job_name=?4, head_sha=?5, text=?6, truncated=?7, redacted=?8, fetched_at=?9",
+               job_name=?4, head_sha=?5, text=?6, truncated=?7, redacted=?8, fetched_at=?9, context=?10",
             params![
                 entry.worktree,
                 entry.run_id,
@@ -94,7 +100,8 @@ impl Db {
                     util::now()
                 } else {
                     entry.fetched_at
-                }
+                },
+                entry.context
             ],
         )?;
         Ok(())
@@ -123,14 +130,14 @@ impl Db {
 
     pub(crate) fn claim_ci_autofix(&self, candidate: &CiLogCandidate) -> Result<bool> {
         let inserted = self.conn().execute(
-            "INSERT OR IGNORE INTO ci_autofix_dedupe
-             (worktree, run_id, job_id, head_sha, claimed_at) VALUES (?1,?2,?3,?4,?5)",
+            CLAIM_CI_AUTOFIX_SQL,
             params![
                 candidate.worktree,
                 candidate.run_id,
                 candidate.job_id,
                 candidate.head_sha,
-                util::now()
+                util::now(),
+                candidate.context
             ],
         )?;
         Ok(inserted == 1)
@@ -288,5 +295,80 @@ mod tests {
         assert!(stored_bytes.text.len() <= HARD_MAX_LOG_BYTES);
         assert!(stored_bytes.text.lines().count() <= HARD_MAX_LOG_LINES);
         assert!(stored_bytes.text.ends_with("latest\n"));
+    }
+
+    #[test]
+    fn ci_autofix_claim_is_keyed_by_provider_context() {
+        let db = Db::open_memory().unwrap();
+        let a = CiLogCandidate {
+            worktree: "/wt/a".into(),
+            run_id: "r".into(),
+            job_id: "j".into(),
+            head_sha: "sha".into(),
+            context: "github:github.com/o/a".into(),
+        };
+        assert!(db.claim_ci_autofix(&a).unwrap());
+        assert!(!db.claim_ci_autofix(&a).unwrap());
+        let b = CiLogCandidate {
+            context: "github:github.com/o/b".into(),
+            ..a.clone()
+        };
+        assert!(db.claim_ci_autofix(&b).unwrap());
+        assert!(!db.claim_ci_autofix(&b).unwrap());
+    }
+
+    #[test]
+    fn ci_autofix_claim_never_reclaims_an_unknown_context() {
+        let db = Db::open_memory().unwrap();
+        let unknown = CiLogCandidate {
+            worktree: "/wt/a".into(),
+            run_id: "r1".into(),
+            job_id: "j".into(),
+            head_sha: "sha".into(),
+            context: String::new(),
+        };
+        assert!(db.claim_ci_autofix(&unknown).unwrap());
+        let known = CiLogCandidate {
+            context: "github:github.com/o/a".into(),
+            ..unknown.clone()
+        };
+        assert!(!db.claim_ci_autofix(&known).unwrap());
+        let known_first = CiLogCandidate {
+            run_id: "r2".into(),
+            context: "github:github.com/o/a".into(),
+            ..unknown
+        };
+        assert!(db.claim_ci_autofix(&known_first).unwrap());
+        let unknown_second = CiLogCandidate {
+            context: String::new(),
+            ..known_first
+        };
+        assert!(!db.claim_ci_autofix(&unknown_second).unwrap());
+    }
+
+    #[test]
+    fn ci_log_cache_round_trips_the_provider_context() {
+        let db = Db::open_memory().unwrap();
+        let mut entry = CiLogEntry::new("/wt/a", "run", "job", "tests", "log", 10, 1024, 1);
+        entry.head_sha = "sha".into();
+        entry.context = "github:github.com/o/a".into();
+        db.put_ci_log(&entry).unwrap();
+        assert_eq!(
+            db.get_ci_log("/wt/a", "run", "job")
+                .unwrap()
+                .unwrap()
+                .context,
+            entry.context
+        );
+        assert_eq!(db.list_ci_logs("/wt/a").unwrap()[0].context, entry.context);
+        entry.context = "github:github.com/o/b".into();
+        db.put_ci_log(&entry).unwrap();
+        assert_eq!(
+            db.get_ci_log("/wt/a", "run", "job")
+                .unwrap()
+                .unwrap()
+                .context,
+            entry.context
+        );
     }
 }

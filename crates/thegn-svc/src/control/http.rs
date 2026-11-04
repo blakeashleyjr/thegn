@@ -1243,11 +1243,15 @@ pub struct IssuesQuery {
     repo: Option<String>,
 }
 
-/// Repo context alone, for `issues.get` / `update` / `comment` — they take no
+/// Repo and account context, for `issues.get` / `update` / `comment` — they take no
 /// status/limit/project/query filters, so those must not even parse.
 #[derive(Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct IssueRepoQuery {
+    /// Configured tracker account that owns the issue (`[[issues.issue_accounts]]` `name`);
+    /// routes the call to exactly that account.
+    #[serde(default)]
+    account: Option<String>,
     /// Filesystem path on the daemon host used to apply a repo's `[issues]` overlay.
     #[serde(default)]
     repo: Option<String>,
@@ -1305,7 +1309,11 @@ pub(super) async fn issue_get(
     if let Err(error) = crate::issue::validate_control_issue_id(&id) {
         return ControlError::InvalidArgument(error.to_string()).into_response();
     }
-    match state.api.issues_get(&id, q.repo.as_deref()).await {
+    match state
+        .api
+        .issues_get(&id, q.repo.as_deref(), q.account.as_deref())
+        .await
+    {
         Ok(detail) => axum::Json(detail).into_response(),
         Err(e) => e.into_response(),
     }
@@ -1326,7 +1334,7 @@ pub(super) async fn issue_update(
     }
     match state
         .api
-        .issues_update(&id, &body.0, q.repo.as_deref())
+        .issues_update(&id, &body.0, q.repo.as_deref(), q.account.as_deref())
         .await
     {
         Ok(issue) => axum::Json(issue).into_response(),
@@ -1354,7 +1362,7 @@ pub(super) async fn issue_comment(
     }
     match state
         .api
-        .issues_comment(&id, &body.0.body, q.repo.as_deref())
+        .issues_comment(&id, &body.0.body, q.repo.as_deref(), q.account.as_deref())
         .await
     {
         Ok(()) => axum::Json(json!({ "commented": id })).into_response(),

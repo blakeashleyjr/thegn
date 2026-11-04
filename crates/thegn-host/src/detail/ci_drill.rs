@@ -518,6 +518,7 @@ mod tests {
                     policy_version: thegn_core::ci_log::REDACTION_POLICY_VERSION,
                     fetched_at: 7,
                     head_sha: "abc123".into(),
+                    context: String::new(),
                 }],
             },
         );
@@ -541,6 +542,7 @@ mod tests {
                     run_id: "42".into(),
                     job_id: "j1".into(),
                     head_sha: "abc123".into(),
+                    context: String::new(),
                 },
             })
         );
@@ -748,6 +750,7 @@ mod tests {
                     policy_version: thegn_core::ci_log::REDACTION_POLICY_VERSION,
                     fetched_at: 7,
                     head_sha: "abc123".into(),
+                    context: String::new(),
                 }],
             }
         ));
@@ -829,6 +832,7 @@ mod tests {
                     policy_version: thegn_core::ci_log::REDACTION_POLICY_VERSION,
                     fetched_at: 7,
                     head_sha: "abc123".into(),
+                    context: String::new(),
                 }],
             }
         ));
