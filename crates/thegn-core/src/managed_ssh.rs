@@ -990,19 +990,18 @@ mod tests {
     #[test]
     fn pre_generation_rows_read_as_generation_zero_and_can_be_compared_and_published() {
         let temp = tempfile::tempdir().unwrap();
+        crate::fsperm::restrict_dir_to_owner(temp.path()).unwrap();
         let input = record();
         let mut value = serde_json::to_value(&input).unwrap();
         value.as_object_mut().unwrap().remove("generation");
-        std::fs::write(
-            record_path(
-                temp.path(),
-                &input.provider,
-                &input.account,
-                &input.instance,
-            ),
-            serde_json::to_vec(&value).unwrap(),
-        )
-        .unwrap();
+        let path = record_path(
+            temp.path(),
+            &input.provider,
+            &input.account,
+            &input.instance,
+        );
+        crate::fsperm::write_owner_only_atomic(&path, &serde_json::to_vec(&value).unwrap())
+            .unwrap();
         let snapshot = read_at(
             temp.path(),
             &input.provider,
@@ -1335,6 +1334,7 @@ mod tests {
     #[test]
     fn legacy_fnv_rows_are_read_and_migrated_on_write() {
         let temp = tempfile::tempdir().unwrap();
+        crate::fsperm::restrict_dir_to_owner(temp.path()).unwrap();
         let existing = record();
         let legacy = legacy_record_path(
             temp.path(),
@@ -1348,7 +1348,8 @@ mod tests {
             &existing.account,
             &existing.instance,
         );
-        std::fs::write(&legacy, serde_json::to_vec(&existing).unwrap()).unwrap();
+        crate::fsperm::write_owner_only_atomic(&legacy, &serde_json::to_vec(&existing).unwrap())
+            .unwrap();
 
         assert_eq!(
             read_at(
@@ -2136,14 +2137,12 @@ mod tests {
     #[test]
     fn oversized_custody_row_is_refused() {
         let temp = tempfile::tempdir().unwrap();
+        crate::fsperm::restrict_dir_to_owner(temp.path()).unwrap();
         let row = record();
         let mut body = serde_json::to_vec(&row).unwrap();
         body.extend(std::iter::repeat_n(b' ', MAX_CUSTODY_ROW_BYTES as usize));
-        std::fs::write(
-            record_path(temp.path(), &row.provider, &row.account, &row.instance),
-            body,
-        )
-        .unwrap();
+        let path = record_path(temp.path(), &row.provider, &row.account, &row.instance);
+        crate::fsperm::write_owner_only_atomic(&path, &body).unwrap();
 
         let error = read_at(temp.path(), &row.provider, &row.account, &row.instance).unwrap_err();
         assert!(format!("{error:#}").contains("exceeds"));
@@ -2170,8 +2169,11 @@ mod tests {
     #[test]
     fn custody_inventory_over_the_row_cap_is_refused() {
         let temp = tempfile::tempdir().unwrap();
+        crate::fsperm::restrict_dir_to_owner(temp.path()).unwrap();
         for row in 0..=MAX_CUSTODY_ROWS {
-            std::fs::write(temp.path().join(format!("row-{row}.json")), []).unwrap();
+            let path = temp.path().join(format!("row-{row}.json"));
+            std::fs::write(&path, []).unwrap();
+            crate::fsperm::set_mode_for_test(&path, 0o600).unwrap();
         }
 
         let error = list_at(temp.path()).unwrap_err();
