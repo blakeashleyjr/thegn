@@ -244,3 +244,20 @@ fn x_still_confirms_after_unzoom() {
         Some(Confirm::Clean { path, .. }) if path == selected
     ));
 }
+
+#[test]
+fn fmt_age_buckets_are_unchanged() {
+    assert_eq!(super::fmt_age(None), "—");
+    assert_eq!(super::fmt_age(Some(0)), "just now");
+    assert_eq!(super::fmt_age(Some(4)), "just now");
+    assert_eq!(super::fmt_age(Some(5)), "5s ago");
+    assert_eq!(super::fmt_age(Some(59)), "59s ago");
+    assert_eq!(super::fmt_age(Some(60)), "1m ago");
+    assert_eq!(super::fmt_age(Some(3_599)), "59m ago");
+    assert_eq!(super::fmt_age(Some(3_600)), "1h ago");
+    assert_eq!(super::fmt_age(Some(86_399)), "23h ago");
+    assert_eq!(super::fmt_age(Some(86_400)), "1d ago");
+    let max_age = super::fmt_age(Some(u64::MAX));
+    assert!(!max_age.is_empty());
+    assert!(max_age.ends_with("d ago"));
+}

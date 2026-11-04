@@ -106,18 +106,19 @@ pub enum Action {
         force: bool,
         #[arg(long, value_name = "REASON")]
         force_reason: Option<String>,
-        /// The Lead lease this roster mutation is made under.
+        /// The Lead lease this roster mutation is made under. Requires `--owner`
+        /// and `--lease-gen`.
         #[arg(
             long,
             value_name = "NAME",
-            requires = "owner",
+            requires_all = ["owner", "lease_gen"],
             conflicts_with = "admin"
         )]
         lease: Option<String>,
         /// The owner id holding `--lease`.
         #[arg(long, value_name = "ID", requires = "lease")]
         owner: Option<String>,
-        /// The Lead lease generation printed by `dispatch lease acquire`; a stale generation is refused.
+        /// Required with `--lease`; use the generation printed by `dispatch lease acquire`.
         #[arg(long, value_name = "GEN", requires = "lease", value_parser = clap::value_parser!(i64).range(1..))]
         lease_gen: Option<i64>,
         /// Manual roster administration: skip the lease check and record `--why`.
@@ -184,18 +185,19 @@ pub enum Action {
         /// non-empty reason; session open never exposes this override.
         #[arg(long, value_name = "REASON")]
         allow_scope_overlap: Option<String>,
-        /// The Lead lease this mutation is made under.
+        /// The Lead lease this mutation is made under. Requires `--owner` and
+        /// `--lease-gen`.
         #[arg(
             long,
             value_name = "NAME",
-            requires = "owner",
+            requires_all = ["owner", "lease_gen"],
             conflicts_with = "admin"
         )]
         lease: Option<String>,
         /// The owner id holding `--lease`.
         #[arg(long, value_name = "ID", requires = "lease")]
         owner: Option<String>,
-        /// The Lead lease generation printed by `dispatch lease acquire`; a stale generation is refused.
+        /// Required with `--lease`; use the generation printed by `dispatch lease acquire`.
         #[arg(long, value_name = "GEN", requires = "lease", value_parser = clap::value_parser!(i64).range(1..))]
         lease_gen: Option<i64>,
         /// Manual roster administration: skip the lease check and record `--why` on the row.
@@ -256,18 +258,19 @@ pub enum Action {
         /// possible (see `set_status`).
         #[arg(long)]
         why: Option<String>,
-        /// The Lead lease this mutation is made under.
+        /// The Lead lease this mutation is made under. Requires `--owner` and
+        /// `--lease-gen`.
         #[arg(
             long,
             value_name = "NAME",
-            requires = "owner",
+            requires_all = ["owner", "lease_gen"],
             conflicts_with = "admin"
         )]
         lease: Option<String>,
         /// The owner id holding `--lease`.
         #[arg(long, value_name = "ID", requires = "lease")]
         owner: Option<String>,
-        /// The Lead lease generation printed by `dispatch lease acquire`; a stale generation is refused.
+        /// Required with `--lease`; use the generation printed by `dispatch lease acquire`.
         #[arg(long, value_name = "GEN", requires = "lease", value_parser = clap::value_parser!(i64).range(1..))]
         lease_gen: Option<i64>,
         /// Manual roster administration: skip the lease check and record `--why` on the row.
@@ -5785,6 +5788,8 @@ mod tests {
                 "n",
                 "--owner",
                 "o",
+                "--lease-gen",
+                "1",
             ],
             vec![
                 "thegn",
@@ -5796,6 +5801,8 @@ mod tests {
                 "n",
                 "--owner",
                 "o",
+                "--lease-gen",
+                "1",
             ],
             vec![
                 "thegn",
@@ -5821,6 +5828,8 @@ mod tests {
                 "n",
                 "--owner",
                 "o",
+                "--lease-gen",
+                "1",
             ],
         ] {
             assert!(crate::Cli::try_parse_from(args).is_ok());
@@ -5866,7 +5875,18 @@ mod tests {
         use clap::Parser as _;
         assert!(
             crate::Cli::try_parse_from([
-                "thegn", "dispatch", "put", "linear:X", "/w", "a", "--lease", "l", "--owner", "o"
+                "thegn",
+                "dispatch",
+                "put",
+                "linear:X",
+                "/w",
+                "a",
+                "--lease",
+                "l",
+                "--owner",
+                "o",
+                "--lease-gen",
+                "1"
             ])
             .is_ok()
         );
@@ -5962,6 +5982,76 @@ mod tests {
             lead_proof(Some("l"), Some("o"), true, Some("manual"), Some(7)),
             LeadProof::Admin { why: "manual" }
         );
+    }
+
+    #[test]
+    fn lease_without_gen_is_refused_at_parse() {
+        use clap::Parser as _;
+
+        let commands = [
+            vec!["thegn", "dispatch", "put", "linear:X", "/w", "a"],
+            vec![
+                "thegn", "dispatch", "claim", "linear:X", "/w", "a", "--stage", "s",
+            ],
+            vec!["thegn", "dispatch", "set-status", "1", "done"],
+            vec![
+                "thegn",
+                "session",
+                "open",
+                "--stage",
+                "code",
+                "--issue",
+                "linear:X",
+                "--worktree",
+                "/w",
+            ],
+            vec!["thegn", "session", "open", "--resume-work", "5"],
+        ];
+
+        for (index, base_argv) in commands.iter().enumerate() {
+            let mut missing_generation = (*base_argv).clone();
+            missing_generation.extend(["--lease", "l", "--owner", "o"]);
+            let error = match crate::Cli::try_parse_from(&missing_generation) {
+                Err(error) => error,
+                Ok(_) => panic!(
+                    "lease without generation was accepted: {}",
+                    missing_generation.join(" ")
+                ),
+            };
+            assert_eq!(
+                error.kind(),
+                clap::error::ErrorKind::MissingRequiredArgument,
+                "{}",
+                missing_generation.join(" ")
+            );
+            assert!(error.to_string().contains("--lease-gen"), "{}", error);
+
+            let mut complete = (*base_argv).clone();
+            complete.extend(["--lease", "l", "--owner", "o", "--lease-gen", "3"]);
+            assert!(
+                crate::Cli::try_parse_from(&complete).is_ok(),
+                "{}",
+                complete.join(" ")
+            );
+
+            let mut missing_owner = (*base_argv).clone();
+            missing_owner.extend(["--lease", "l", "--lease-gen", "3"]);
+            assert!(
+                crate::Cli::try_parse_from(&missing_owner).is_err(),
+                "{}",
+                missing_owner.join(" ")
+            );
+
+            if index < 3 {
+                let mut admin = (*base_argv).clone();
+                admin.extend(["--admin", "--why", "manual"]);
+                assert!(
+                    crate::Cli::try_parse_from(&admin).is_ok(),
+                    "{}",
+                    admin.join(" ")
+                );
+            }
+        }
     }
 
     #[test]

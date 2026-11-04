@@ -1453,6 +1453,7 @@ fn ingest_failed_logs_with(args: IngestArgs<'_>) {
                     &run.sha,
                     job.finished_at.as_deref(),
                 ) && thegn_core::ci_log::cached_log_context_matches(old, context.as_deref())
+                    && thegn_core::ci_log::cached_log_attempt_matches(old, detail.run.attempt)
             }) {
                 if let Ok(mut memo) = ingest_memo().lock() {
                     memo.touch(job_key, now, cfg.poll_interval_secs, false);
@@ -1501,6 +1502,7 @@ fn ingest_failed_logs_with(args: IngestArgs<'_>) {
             );
             entry.truncated |= log.truncated;
             entry.head_sha = run.sha.clone();
+            entry.attempt = detail.run.attempt;
             entry.context = context.clone().unwrap_or_default();
             if !crate::hydrate_schedule::generation_is_current(generation.as_ref()) {
                 run_complete = false;

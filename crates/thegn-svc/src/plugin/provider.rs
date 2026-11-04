@@ -1450,4 +1450,43 @@ done
         });
         session.kill();
     }
+
+    #[test]
+    fn oversized_request_is_refused_as_too_large_without_a_pending_entry() {
+        let (_shared, bridge) = detached_bridge(Duration::from_secs(30));
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let big = serde_json::Value::String("x".repeat(crate::plugin::proc::MAX_LINE_BYTES));
+        let result = rt.block_on(bridge.call("issues", "create_issue", big));
+        assert_eq!(
+            result,
+            Err(BridgeError::Transport(SessionFailure::TooLarge.to_string()))
+        );
+        assert!(bridge.pending.lock().unwrap().calls.is_empty());
+        assert!(
+            !bridge.writer.is_closed(),
+            "a refused request must not close the session"
+        );
+    }
+
+    #[test]
+    fn oversized_request_refusals_never_consume_the_pending_table() {
+        let (_shared, bridge) = detached_bridge(Duration::from_secs(30));
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let big = serde_json::Value::String("x".repeat(crate::plugin::proc::MAX_LINE_BYTES));
+        for _ in 0..(MAX_QUEUED_FRAMES + 8) {
+            let result = rt.block_on(bridge.call("issues", "create_issue", big.clone()));
+            assert_eq!(
+                result,
+                Err(BridgeError::Transport(SessionFailure::TooLarge.to_string())),
+                "an oversized request must be TooLarge every time, never Full"
+            );
+            assert!(bridge.pending.lock().unwrap().calls.is_empty());
+        }
+    }
 }

@@ -7,6 +7,33 @@ All notable changes to **thegn** are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.1.0-alpha.49] — 2026-11-04 (maintenance batch 87)
+
+### Changed
+
+- `thegn merge rm`, re-enqueueing with `thegn merge add`, and deleting a
+  worktree release a merge claim that expired on a row that already landed.
+- Landed-worktree cleanup keeps the entry with class `identity` when the
+  worktree was removed and re-created or now belongs to another repository
+  since the branch was queued.
+- The PR queue holds a merge as `needs_human` before requesting anything when
+  the forge cannot fence the merge to the reviewed head.
+- Configuration rejects `[ci] log_tail_lines` values above 100000; accepted
+  log tails retain invalid UTF-8 and over-long-line handling, truncation
+  marking, and CRLF preservation.
+- The Home Manager module adds typed, null-default `programs.thegn.search*` and
+  `programs.thegn.palette*` options for search and palette settings.
+
+### Fixed
+
+- Managed SSH key rotation separates a new key from an `authorized_keys` last
+  line without a trailing newline and verifies the published file after
+  authorizing or deauthorizing a key, failing instead of reporting success.
+- Sandbox TIMELINE rows in the System panel show the event's age instead of
+  `0s`.
+- The rebase status check reports an apply-backend rebase or an in-progress
+  `git am` as an error naming the marker instead of reporting no rebase.
+
 ## [0.1.0-alpha.48] — 2026-11-04 (maintenance batch 86)
 
 ### Added
@@ -2622,7 +2649,8 @@ launcher picker and the merge queue's `agent_command` hook remain — they run
 whatever commands you configure. Leftover `[llm_proxy]` config sections and
 `proxy_*` tables in existing state databases are ignored harmlessly.
 
-[Unreleased]: https://github.com/blakeashleyjr/thegn/compare/v0.1.0-alpha.48...HEAD
+[Unreleased]: https://github.com/blakeashleyjr/thegn/compare/v0.1.0-alpha.49...HEAD
+[0.1.0-alpha.49]: https://github.com/blakeashleyjr/thegn/compare/v0.1.0-alpha.48...v0.1.0-alpha.49
 [0.1.0-alpha.48]: https://github.com/blakeashleyjr/thegn/compare/v0.1.0-alpha.47...v0.1.0-alpha.48
 [0.1.0-alpha.47]: https://github.com/blakeashleyjr/thegn/compare/v0.1.0-alpha.46...v0.1.0-alpha.47
 [0.1.0-alpha.46]: https://github.com/blakeashleyjr/thegn/compare/v0.1.0-alpha.45...v0.1.0-alpha.46
