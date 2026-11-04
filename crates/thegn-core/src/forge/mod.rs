@@ -114,6 +114,9 @@ pub struct ForgeCaps {
     pub create_pr: bool,
     pub merge: bool,
     pub auto_merge: bool,
+    /// `merge_pr` honours a `Some(expected_head)` atomically at the provider (the PR queue
+    /// holds a PR for a forge without it).
+    pub merge_expected_head: bool,
     pub draft_toggle: bool,
     pub checks_rerun: bool,
     pub reviews: bool,
@@ -139,6 +142,7 @@ impl ForgeCaps {
         create_pr: true,
         merge: true,
         auto_merge: true,
+        merge_expected_head: true,
         draft_toggle: true,
         checks_rerun: true,
         reviews: true,
@@ -334,6 +338,7 @@ pub trait Forge: Probe + Send + Sync {
     /// `expected_head` is Some, implementations must refuse to merge a different
     /// head. An implementation that cannot enforce this atomically must return
     /// `ForgeError::Unsupported("merge_pr expected head")`, never merge unfenced.
+    /// A forge that honours it advertises `ForgeCaps::merge_expected_head`.
     /// `None` keeps the provider's ordinary PR selection without head fencing;
     /// interactive callers use this weaker mode for compatibility.
     fn merge_pr(
@@ -708,10 +713,19 @@ mod tests {
         );
         let all = ForgeCaps::ALL;
         let none = ForgeCaps::default();
-        assert!(all.whoami && all.line_comments && all.resolve_review_thread);
+        assert!(
+            all.whoami && all.line_comments && all.resolve_review_thread && all.merge_expected_head
+        );
         assert!(!none.pr_status);
         assert_ne!(all, none);
     }
+
+    #[test]
+    fn forge_caps_merge_expected_head_is_in_all_and_off_by_default() {
+        assert!(std::hint::black_box(ForgeCaps::ALL).merge_expected_head);
+        assert!(!ForgeCaps::default().merge_expected_head);
+    }
+
     struct IssueCountingForge {
         status_error: Option<ForgeError>,
         issue_calls: std::sync::atomic::AtomicUsize,

@@ -468,6 +468,22 @@ pub(crate) fn drive_queue(
             QueueAction::EnableAutoMerge | QueueAction::Merge => {
                 let direct = matches!(action, QueueAction::Merge);
                 let method = merge_method(cfg.merge_method);
+                if !forge.caps().merge_expected_head {
+                    let detail = "this forge cannot fence a merge to the reviewed head (`merge_expected_head`); merge it yourself or enable a forge that can".to_string();
+                    if let Err(error) = db.update_pr_status(
+                        &item.key,
+                        PrqStatus::NeedsHuman.as_str(),
+                        None,
+                        Some(&detail),
+                        None,
+                    ) {
+                        tracing::debug!(target: "thegn::prq", %error, "could not persist the head-fence capability hold");
+                    }
+                    out.warnings.push(format!("PR #{}: {detail}", item.number));
+                    out.needs_human.push(item.number);
+                    step(PrqStatus::NeedsHuman.as_str(), &detail, &mut progress);
+                    continue;
+                }
                 if let Err(reason) = reattest(db, forge, &loc, &item, &fetched) {
                     let detail = effect_detail(reason, "merge");
                     let moved = detail.contains("head moved before merge");
@@ -2142,6 +2158,7 @@ mod tests {
         merge_error: std::sync::Mutex<Option<ForgeError>>,
         merge_head_after: std::sync::Mutex<Option<String>>,
         confirm_direct: std::sync::atomic::AtomicBool,
+        expected_head_cap: std::sync::atomic::AtomicBool,
     }
     impl FakeForge {
         fn new(pr: Option<PrStatus>) -> Self {
@@ -2155,6 +2172,7 @@ mod tests {
                 merge_error: Default::default(),
                 merge_head_after: Default::default(),
                 confirm_direct: std::sync::atomic::AtomicBool::new(true),
+                expected_head_cap: std::sync::atomic::AtomicBool::new(true),
             }
         }
         fn with_conversation(self, conversation: thegn_core::forge::model::PrConversation) -> Self {
@@ -2195,6 +2213,11 @@ mod tests {
                 .store(false, std::sync::atomic::Ordering::SeqCst);
             self
         }
+        fn without_expected_head_cap(self) -> Self {
+            self.expected_head_cap
+                .store(false, std::sync::atomic::Ordering::SeqCst);
+            self
+        }
         fn record(&self, s: impl Into<String>) {
             self.calls.lock().unwrap().push(s.into());
         }
@@ -2213,7 +2236,12 @@ mod tests {
             "github"
         }
         fn caps(&self) -> thegn_core::forge::ForgeCaps {
-            thegn_core::forge::ForgeCaps::ALL
+            thegn_core::forge::ForgeCaps {
+                merge_expected_head: self
+                    .expected_head_cap
+                    .load(std::sync::atomic::Ordering::SeqCst),
+                ..thegn_core::forge::ForgeCaps::ALL
+            }
         }
         fn repo_ref(&self, _: &GitLoc) -> Option<thegn_core::forge::RepoRef> {
             None
@@ -3723,6 +3751,68 @@ mod tests {
                 .filter(|call| call.ends_with("auto=true"))
                 .count(),
             2
+        );
+    }
+
+    #[test]
+    fn merge_is_held_before_any_mutation_when_the_forge_cannot_fence_the_head() {
+        let (dir, db) = temp_db("prq-no-head-fence");
+        let row = enqueue_merge_test_row(&dir, &db);
+        let forge = FakeForge::new(Some(green_pr())).without_expected_head_cap();
+        let mut steps = Vec::new();
+        let out = drive_queue(
+            &cfg(),
+            &Config::default(),
+            &forge,
+            Path::new("/repo"),
+            &db,
+            vec![PrItem::from(&row)],
+            |step| steps.push(step.status.to_owned()),
+        );
+
+        assert_eq!(out.needs_human, vec![7]);
+        assert!(out.merged.is_empty());
+        assert!(out.auto_merge_armed.is_empty());
+        assert!(out.merge_requested.is_empty());
+        assert!(!forge.calls().iter().any(|call| call.starts_with("merge ")));
+        assert!(steps.contains(&PrqStatus::NeedsHuman.as_str().to_owned()));
+        assert!(!steps.contains(&PrqStatus::Merging.as_str().to_owned()));
+        assert!(
+            out.warnings
+                .iter()
+                .any(|warning| warning.contains("cannot fence a merge"))
+        );
+        let persisted = db.list_pr_queue().unwrap().remove(0);
+        assert_eq!(persisted.status, PrqStatus::NeedsHuman.as_str());
+        assert_eq!(
+            persisted.detail.as_deref(),
+            Some(
+                "this forge cannot fence a merge to the reviewed head (`merge_expected_head`); merge it yourself or enable a forge that can"
+            )
+        );
+    }
+
+    #[test]
+    fn merge_proceeds_when_the_forge_advertises_head_fencing() {
+        let (dir, db) = temp_db("prq-head-fence-supported");
+        let row = enqueue_merge_test_row(&dir, &db);
+        let forge = FakeForge::new(Some(green_pr()));
+        let out = drive_queue(
+            &cfg(),
+            &Config::default(),
+            &forge,
+            Path::new("/repo"),
+            &db,
+            vec![PrItem::from(&row)],
+            |_| {},
+        );
+
+        assert_eq!(out.auto_merge_armed, vec![7]);
+        assert!(
+            forge
+                .calls()
+                .iter()
+                .any(|call| call.starts_with("merge Number(7)"))
         );
     }
 
