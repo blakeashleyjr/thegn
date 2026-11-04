@@ -14,3 +14,12 @@ gtui-core = { path = "../gtui-core" }
 # Match tg-kit's pin exactly (no default features ⇒ no crossterm) so the host,
 # tg-kit, and the renderers all share one ratatui build and `Buffer` type.
 ratatui = { version = "0.30", default-features = false, features = ["std"] }
+
+[dev-dependencies]
+criterion.workspace = true
+
+# The Observe time-series reducer + renderer (THE-186): dense, spike,
+# irregular/sparse, windowed and multi-series inputs at panel width.
+[[bench]]
+name = "timeseries"
+harness = false

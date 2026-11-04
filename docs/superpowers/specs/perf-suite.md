@@ -117,8 +117,9 @@ them in sync.
   (1/4/14), **gix vs CLI** so the provider choice is measured, not folklore.
 - `crates/thegn-core/benches/core_hot.rs` — theme/palette construction (startup +
   every theme cycle).
+- `crates/gtui-render/benches/timeseries.rs` — the Observe time-series reducer and renderer (`reduce`, `render_in_window`) over dense, spike, flat, irregular, windowed and multi-series inputs at panel width 240; run `cargo bench -p gtui-render --bench timeseries` (advisory, machine-dependent, not in CI).
 
-Run: `just bench-micro` (whole workspace) or `just bench-micro-svc` (git only).
+Run: `just bench-micro` (whole workspace), `just bench-micro-svc` (git only), or `cargo bench -p gtui-render --bench timeseries` (Observe time series).
 Debug-vs-release A/B: `cargo bench` (release-grade bench profile) vs
 `cargo bench --profile dev`.
 

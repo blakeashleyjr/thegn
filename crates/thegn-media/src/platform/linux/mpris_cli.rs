@@ -668,4 +668,108 @@ mod tests {
             Err(MediaError::Unsupported(_))
         ));
     }
+
+    #[test]
+    fn decode_budget_oversized_record_admits_within_the_state_ceiling() {
+        use crate::budget::{MAX_STATE_BYTES, state_bytes};
+        use crate::model::MAX_FIELD_BYTES;
+
+        let big = "a".repeat(MAX_FIELD_BYTES * 3);
+        let art = "u".repeat(MAX_FIELD_BYTES + 1);
+        let record = escaped_record([
+            big.as_str(),
+            "Playing",
+            big.as_str(),
+            big.as_str(),
+            big.as_str(),
+            "248000000",
+            "1000000",
+            "true",
+            "Playlist",
+            "0.80",
+            art.as_str(),
+            "file:///m/clip.mp4",
+            "track-1",
+        ]);
+        let parsed = parse_line(&record).expect("an oversized record still decodes");
+        let admitted = parsed.admitted();
+
+        assert_eq!(admitted.player.len(), MAX_FIELD_BYTES);
+        assert_eq!(admitted.title.len(), MAX_FIELD_BYTES);
+        assert_eq!(admitted.artist.len(), MAX_FIELD_BYTES);
+        assert_eq!(admitted.album.len(), MAX_FIELD_BYTES);
+        assert!(admitted.art_url.is_none());
+        assert_eq!(admitted.track_id.as_deref(), Some("track-1"));
+        assert_eq!(admitted.kind, MediaKind::Video);
+        assert!(state_bytes(&admitted) <= MAX_STATE_BYTES);
+    }
+
+    #[test]
+    fn decode_budget_opaque_ids_are_dropped_never_truncated() {
+        use crate::model::MAX_ID_BYTES;
+
+        let id = "t".repeat(MAX_ID_BYTES);
+        let exact_record = escaped_record([
+            "spotify",
+            "Playing",
+            "Title",
+            "Artist",
+            "Album",
+            "1",
+            "0",
+            "false",
+            "None",
+            "0.5",
+            "",
+            "",
+            id.as_str(),
+        ]);
+        let exact = parse_line(&exact_record)
+            .expect("the exact-limit id record decodes")
+            .admitted();
+        assert_eq!(exact.track_id.as_deref(), Some(id.as_str()));
+        assert_eq!(exact.track_id.as_deref().map(str::len), Some(MAX_ID_BYTES));
+
+        let too_long_id = "t".repeat(MAX_ID_BYTES + 1);
+        let too_long_record = escaped_record([
+            "spotify",
+            "Playing",
+            "Title",
+            "Artist",
+            "Album",
+            "1",
+            "0",
+            "false",
+            "None",
+            "0.5",
+            "",
+            "",
+            too_long_id.as_str(),
+        ]);
+        let too_long = parse_line(&too_long_record)
+            .expect("the over-limit id record decodes")
+            .admitted();
+        assert!(too_long.track_id.is_none());
+
+        let control_id = format!("a{}b", '\u{7}');
+        let control_record = escaped_record([
+            "spotify",
+            "Playing",
+            "Title",
+            "Artist",
+            "Album",
+            "1",
+            "0",
+            "false",
+            "None",
+            "0.5",
+            "",
+            "",
+            control_id.as_str(),
+        ]);
+        let control = parse_line(&control_record)
+            .expect("the control-character id record decodes")
+            .admitted();
+        assert!(control.track_id.is_none());
+    }
 }

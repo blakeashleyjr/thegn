@@ -515,7 +515,10 @@ rejects. It also exposes `confirmDelete` and the scalar theme options
 `themeColor`, `themeGlyphs`, `themeAgentGlyphs`, `themeMascot` and
 `themeMascotMotion`. It also exposes 24 scalar UI options, including
 `uiLanguage`, `uiSidebar*` and `uiFullscreen*`; `ui.sidebar_width` and
-`ui.sidebar_wide_ratio` remain omitted.
+`ui.sidebar_wide_ratio` remain omitted. It also exposes
+`searchMaxResults`, `searchRespectGitignore`, `searchIncludeHidden`,
+`searchStructural`, `paletteContentMaxResults`, `paletteFileMaxResults`,
+`paletteSymbolMaxResults` and `paletteContentSearchHidden`.
 
 `keys list` covers the keymap registry **and** the zone-local tables — the
 sidebar's row keys and each panel section's row-mode keys. Those are handled

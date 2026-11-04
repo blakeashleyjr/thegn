@@ -56,7 +56,6 @@ const OMITTED: &[(&str, &str)] = &[
     ("limits", "resource limits are not exposed"),
     ("disk", "disk and cache policy is not exposed"),
     ("loc", "lines-of-code display is not exposed"),
-    ("session", "session retention is not exposed"),
     ("activity", "activity detection is not exposed"),
     ("drawer", "drawer behavior is not exposed"),
     ("notifications", "notifications are not exposed"),
@@ -74,7 +73,6 @@ const OMITTED: &[(&str, &str)] = &[
     ("skills", "skill configuration is not exposed"),
     ("replay", "pane replay is not exposed"),
     ("recording", "session recording is not exposed"),
-    ("clipboard", "clipboard policy is not exposed"),
     ("media", "media controls are not exposed"),
     ("voice", "voice input is not exposed"),
     ("usage", "usage tracking is not exposed"),
@@ -559,6 +557,8 @@ fn every_schema_key_is_rendered_or_dispositioned() {
         "ui",
         "search",
         "palette",
+        "session",
+        "clipboard",
         "monitor",
         "pr",
         "watch",
@@ -771,6 +771,29 @@ fn hm_search_structural_offers_only_implemented_spellings() {
     );
 }
 
+#[test]
+fn hm_session_and_clipboard_families_are_fully_rendered() {
+    let rendered = rendered_paths(&module_src());
+    for table in ["session", "clipboard"] {
+        let schema = schema_field(table);
+        let properties = schema["properties"]
+            .as_object()
+            .unwrap_or_else(|| panic!("{table} schema properties"));
+        let mut missing: Vec<String> = properties
+            .keys()
+            .filter_map(|key| {
+                let path = format!("{table}.{key}");
+                (!rendered.contains(&path)).then_some(path)
+            })
+            .collect();
+        missing.sort();
+        assert!(
+            missing.is_empty(),
+            "Home Manager must render every {table} scalar; missing: {missing:?}"
+        );
+    }
+}
+
 /// Every `config_enum!` in the schema: its accepted spellings (canonical +
 /// aliases), keyed by definition name.
 fn schema_enums() -> Vec<(String, BTreeSet<String>)> {
@@ -889,6 +912,11 @@ fn every_numeric_option_matches_its_destination_range() {
         ("paletteContentMaxResults", "palette.content_max_results"),
         ("paletteFileMaxResults", "palette.file_max_results"),
         ("paletteSymbolMaxResults", "palette.symbol_max_results"),
+        ("sessionScrollbackLines", "session.scrollback_lines"),
+        ("sessionRestoreGraceSecs", "session.restore_grace_secs"),
+        ("sessionResidentPoolLimit", "session.resident_pool_limit"),
+        ("clipboardMaxImageBytes", "clipboard.max_image_bytes"),
+        ("clipboardKeepHours", "clipboard.keep_hours"),
     ];
     let options = numeric_options(&module_src());
     let actual_names: BTreeSet<&str> = options.iter().map(|(name, _)| name.as_str()).collect();
@@ -919,6 +947,14 @@ fn every_numeric_option_matches_its_destination_range() {
             assert_eq!(
                 nix_type, "lib.types.ints.u16",
                 "Nix type for uint16 schema field {path}"
+            );
+            continue;
+        }
+
+        if schema.get("format").and_then(Value::as_str) == Some("uint32") {
+            assert_eq!(
+                nix_type, "lib.types.ints.u32",
+                "Nix type for uint32 schema field {path}"
             );
             continue;
         }

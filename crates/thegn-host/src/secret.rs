@@ -1465,10 +1465,28 @@ fn index_read_in(dir: &std::path::Path) -> Result<Vec<String>, String> {
     index_read_held(&private)
 }
 
-fn index_read_held(private: &thegn_core::fsperm::PrivateDir) -> Result<Vec<String>, String> {
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+struct McpIndex {
+    generation: u64,
+    names: Vec<String>,
+}
+
+#[derive(serde::Deserialize)]
+#[serde(untagged)]
+enum OnDiskMcpIndex {
+    Current { generation: u64, names: Vec<String> },
+    Legacy(Vec<String>),
+}
+
+fn index_load_held(private: &thegn_core::fsperm::PrivateDir) -> Result<McpIndex, String> {
     let file = match private.open_regular_nofollow(MCP_INDEX_FILE) {
         Ok(file) => file,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(McpIndex {
+                generation: 0,
+                names: Vec::new(),
+            });
+        }
         Err(error) => return Err(format!("read MCP secret index: {error}")),
     };
     use std::io::Read;
@@ -1482,22 +1500,44 @@ fn index_read_held(private: &thegn_core::fsperm::PrivateDir) -> Result<Vec<Strin
     if bytes.len() as u64 > MAX_INDEX_BYTES {
         return Err("MCP secret index exceeds size limit".into());
     }
-    let names: Vec<String> =
-        serde_json::from_slice(&bytes).map_err(|e| format!("corrupt MCP secret index: {e}"))?;
-    if names.len() > MAX_INDEX_ENTRIES
-        || names
+    let index = match serde_json::from_slice(&bytes)
+        .map_err(|e| format!("corrupt MCP secret index: {e}"))?
+    {
+        OnDiskMcpIndex::Current { generation, names } => McpIndex { generation, names },
+        OnDiskMcpIndex::Legacy(names) => McpIndex {
+            generation: 0,
+            names,
+        },
+    };
+    if index.names.len() > MAX_INDEX_ENTRIES
+        || index
+            .names
             .iter()
             .any(|name| name.is_empty() || name.len() > MAX_ACCOUNT_BYTES)
     {
         return Err("MCP secret index has invalid entry count or account name".into());
     }
-    Ok(names)
+    Ok(index)
 }
 
+fn index_read_held(private: &thegn_core::fsperm::PrivateDir) -> Result<Vec<String>, String> {
+    index_load_held(private).map(|index| index.names)
+}
+
+#[cfg(test)]
 fn index_write_held(
     private: &thegn_core::fsperm::PrivateDir,
     names: &[String],
 ) -> Result<(), String> {
+    let current = index_load_held(private)?;
+    index_publish_held(private, current.generation, names).map(|_| ())
+}
+
+fn index_publish_held(
+    private: &thegn_core::fsperm::PrivateDir,
+    expected: u64,
+    names: &[String],
+) -> Result<u64, String> {
     if names.len() > MAX_INDEX_ENTRIES
         || names
             .iter()
@@ -1505,14 +1545,28 @@ fn index_write_held(
     {
         return Err("MCP secret index has invalid entry count or account name".into());
     }
-    let body = serde_json::to_vec_pretty(names).map_err(|e| e.to_string())?;
+    let current = index_load_held(private)?;
+    if current.generation != expected {
+        return Err(format!(
+            "MCP secret index changed concurrently (generation {}, expected {expected})",
+            current.generation
+        ));
+    }
+    let next = expected
+        .checked_add(1)
+        .ok_or_else(|| "MCP secret index generation overflow".to_string())?;
+    let index = McpIndex {
+        generation: next,
+        names: names.to_vec(),
+    };
+    let body = serde_json::to_vec_pretty(&index).map_err(|e| e.to_string())?;
     if body.len() as u64 > MAX_INDEX_BYTES {
         return Err("MCP secret index exceeds size limit".into());
     }
     private
         .write_owner_only_atomic(MCP_INDEX_FILE, &body)
         .map_err(|error| format!("write MCP secret index: {error}"))?;
-    Ok(())
+    Ok(next)
 }
 
 #[cfg(test)]
@@ -1636,11 +1690,12 @@ fn with_index_lock_held<T>(
 }
 
 fn index_add_locked(private: &thegn_core::fsperm::PrivateDir, account: &str) -> Result<(), String> {
-    let mut names = index_read_held(private)?;
+    let current = index_load_held(private)?;
+    let mut names = current.names;
     if !names.iter().any(|name| name == account) {
         names.push(account.to_string());
         names.sort();
-        index_write_held(private, &names)?;
+        index_publish_held(private, current.generation, &names)?;
     }
     Ok(())
 }
@@ -1649,11 +1704,12 @@ fn index_remove_locked(
     private: &thegn_core::fsperm::PrivateDir,
     account: &str,
 ) -> Result<(), String> {
-    let mut names = index_read_held(private)?;
+    let current = index_load_held(private)?;
+    let mut names = current.names;
     let before = names.len();
     names.retain(|name| name != account);
     if names.len() != before {
-        index_write_held(private, &names)?;
+        index_publish_held(private, current.generation, &names)?;
     }
     Ok(())
 }
@@ -1734,6 +1790,111 @@ mod tests {
         assert_eq!(missing, Err(SecretResolveFailure::Missing));
         assert_eq!(unavailable, Err(SecretResolveFailure::Unavailable));
         assert_ne!(missing, unavailable);
+    }
+
+    /// Run `f` under a DEBUG fmt subscriber and return its result with everything it logged.
+    fn captured<T>(f: impl FnOnce() -> T) -> (T, String) {
+        let capture = AuditCapture::default();
+        let writer = capture.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .with_max_level(tracing::Level::DEBUG)
+            .without_time()
+            .with_ansi(false)
+            .with_writer(move || writer.clone())
+            .finish();
+        let result = tracing::subscriber::with_default(subscriber, f);
+        let log = String::from_utf8(capture.0.lock().unwrap().clone()).unwrap();
+        (result, log)
+    }
+
+    #[test]
+    fn typed_broker_keyring_hit_audits_a_calendar_consumer_without_the_value() {
+        let reference = SecretRef::Keyring {
+            account: "cal-alpha-account".into(),
+        };
+        let (result, log) = captured(|| {
+            resolve_ref_for_outcome_with(
+                &reference,
+                "calendar:alpha",
+                |account| {
+                    assert_eq!(account, "cal-alpha-account");
+                    Ok(Some("cal-keyring-sentinel-7d2e".to_string()))
+                },
+                || true,
+            )
+        });
+        assert_eq!(result, Ok(Some("cal-keyring-sentinel-7d2e".to_string())));
+        assert_eq!(log.matches("secret resolve").count(), 1, "{log}");
+        assert!(log.contains("consumer=calendar:alpha"), "{log}");
+        assert!(log.contains(r#"backend="keyring""#), "{log}");
+        assert!(log.contains(r#"outcome="resolved""#), "{log}");
+        assert!(log.contains("ref_name=keyring:cal-alpha-account"), "{log}");
+        assert!(!log.contains("cal-keyring-sentinel-7d2e"), "{log}");
+    }
+
+    #[test]
+    fn typed_broker_keyring_unavailable_audits_a_calendar_consumer() {
+        let reference = SecretRef::Keyring {
+            account: "cal-alpha-account".into(),
+        };
+        let (result, log) = captured(|| {
+            resolve_ref_for_outcome_with(
+                &reference,
+                "calendar:alpha",
+                |_| Err(KeyringReadError::Unavailable("no secret service".into())),
+                || false,
+            )
+        });
+        assert_eq!(result, Err(SecretResolveFailure::Unavailable));
+        assert_eq!(log.matches("secret resolve").count(), 1, "{log}");
+        assert!(log.contains("consumer=calendar:alpha"), "{log}");
+        assert!(log.contains(r#"outcome="unavailable""#), "{log}");
+        let read_failure = log
+            .lines()
+            .find(|line| line.contains("keyring read failed"))
+            .expect("unavailable keyring read should be logged");
+        assert!(
+            read_failure.contains("reason=no secret service"),
+            "{read_failure}"
+        );
+        assert!(
+            !read_failure.contains("cal-alpha-account"),
+            "{read_failure}"
+        );
+    }
+
+    #[test]
+    fn typed_broker_keyring_empty_answer_without_a_backend_is_unavailable() {
+        let reference = SecretRef::Keyring {
+            account: "cal-alpha-account".into(),
+        };
+        let (unavailable, unavailable_log) = captured(|| {
+            resolve_ref_for_outcome_with(&reference, "calendar:alpha", |_| Ok(None), || false)
+        });
+        assert_eq!(unavailable, Err(SecretResolveFailure::Unavailable));
+        assert_eq!(
+            unavailable_log.matches("secret resolve").count(),
+            1,
+            "{unavailable_log}"
+        );
+        assert!(
+            unavailable_log.contains(r#"outcome="unavailable""#),
+            "{unavailable_log}"
+        );
+
+        let (missing, missing_log) = captured(|| {
+            resolve_ref_for_outcome_with(&reference, "calendar:alpha", |_| Ok(None), || true)
+        });
+        assert_eq!(missing, Err(SecretResolveFailure::Missing));
+        assert_eq!(
+            missing_log.matches("secret resolve").count(),
+            1,
+            "{missing_log}"
+        );
+        assert!(
+            missing_log.contains(r#"outcome="missing""#),
+            "{missing_log}"
+        );
     }
 
     #[test]
@@ -2614,6 +2775,108 @@ mod tests {
         std::fs::write(&index, b"not-json").unwrap();
         assert!(index_add_in(temp.path(), "new-name").is_err());
         assert_eq!(std::fs::read(index).unwrap(), b"not-json");
+    }
+
+    #[test]
+    fn mcp_index_publish_bumps_the_generation_and_stores_the_object_shape() {
+        let temp = private_temp();
+        let private = open_secrets_in(temp.path()).unwrap();
+        let names = vec!["alpha".to_string(), "beta".to_string()];
+
+        assert_eq!(index_publish_held(&private, 0, &names).unwrap(), 1);
+        let value: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(temp.path().join(MCP_INDEX_FILE)).unwrap())
+                .unwrap();
+        assert_eq!(value["generation"], 1);
+        assert_eq!(value["names"], serde_json::json!(["alpha", "beta"]));
+        assert_eq!(
+            index_load_held(&private).unwrap(),
+            McpIndex {
+                generation: 1,
+                names,
+            }
+        );
+    }
+
+    #[test]
+    fn mcp_index_legacy_array_loads_as_generation_zero_and_migrates_on_write() {
+        let temp = private_temp();
+        let index_path = temp.path().join(MCP_INDEX_FILE);
+        std::fs::write(&index_path, br#"["a","b"]"#).unwrap();
+        let private = open_secrets_in(temp.path()).unwrap();
+        assert_eq!(
+            index_load_held(&private).unwrap(),
+            McpIndex {
+                generation: 0,
+                names: vec!["a".to_string(), "b".to_string()],
+            }
+        );
+
+        with_index_lock_held(&private, || index_add_locked(&private, "c")).unwrap();
+        let value: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(index_path).unwrap()).unwrap();
+        assert_eq!(value["generation"], 1);
+        assert_eq!(value["names"], serde_json::json!(["a", "b", "c"]));
+    }
+
+    #[test]
+    fn mcp_index_publish_refuses_a_stale_expected_generation_without_writing() {
+        let temp = private_temp();
+        let private = open_secrets_in(temp.path()).unwrap();
+        index_publish_held(&private, 0, &["first".to_string()]).unwrap();
+        let before = std::fs::read(temp.path().join(MCP_INDEX_FILE)).unwrap();
+
+        let result = index_publish_held(&private, 0, &["stale".to_string()]);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("changed concurrently"));
+        assert_eq!(
+            std::fs::read(temp.path().join(MCP_INDEX_FILE)).unwrap(),
+            before
+        );
+    }
+
+    #[test]
+    fn mcp_index_noop_add_and_remove_do_not_bump_the_generation() {
+        let temp = private_temp();
+        let private = open_secrets_in(temp.path()).unwrap();
+        with_index_lock_held(&private, || index_add_locked(&private, "acct")).unwrap();
+        with_index_lock_held(&private, || index_add_locked(&private, "acct")).unwrap();
+        with_index_lock_held(&private, || index_remove_locked(&private, "missing")).unwrap();
+
+        assert_eq!(index_load_held(&private).unwrap().generation, 1);
+    }
+
+    #[test]
+    fn mcp_index_generation_overflow_is_refused() {
+        let temp = private_temp();
+        let index_path = temp.path().join(MCP_INDEX_FILE);
+        std::fs::write(
+            &index_path,
+            format!(r#"{{"generation":{},"names":[]}}"#, u64::MAX),
+        )
+        .unwrap();
+        let private = open_secrets_in(temp.path()).unwrap();
+
+        let result = index_publish_held(&private, u64::MAX, &[]);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("overflow"));
+        assert_eq!(index_load_held(&private).unwrap().generation, u64::MAX);
+    }
+
+    #[test]
+    fn mcp_index_object_shape_still_enforces_the_name_and_count_bounds() {
+        let temp = private_temp();
+        let index_path = temp.path().join(MCP_INDEX_FILE);
+        std::fs::write(&index_path, br#"{"generation":3,"names":[""]}"#).unwrap();
+        let private = open_secrets_in(temp.path()).unwrap();
+
+        let result = index_load_held(&private);
+        assert!(result.is_err());
+        assert!(
+            result
+                .unwrap_err()
+                .contains("invalid entry count or account name")
+        );
     }
 
     #[test]

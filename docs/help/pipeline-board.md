@@ -152,8 +152,9 @@ the Lead runs
 without a satisfied attestation, normal completion is refused. If a worker is
 gone and its report claims PASS without an attestation for its HEAD, the reaper
 returns the row as `needs-decision` for the Lead. A live Lead lease binds claims
-and status changes to its owner; see [[cli]] for `--lease`, `--owner`, and the
-audited `--admin --why` override. If the stage or effective agent configuration
+and status changes to its owner; see [[cli]] for `--lease`, `--owner`,
+`--lease-gen` (all three are required together), and the audited
+`--admin --why` override. If the stage or effective agent configuration
 changes between claim and launch, launch is refused and the row is marked
 `failed` for retry. `thegn dispatch lease acquire` prints the lease generation,
 including as `generation` in `--json`. Each new acquisition gets a higher

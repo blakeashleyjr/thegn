@@ -97,6 +97,14 @@
           paletteFileMaxResults = 100;
           paletteSymbolMaxResults = 50;
           paletteContentSearchHidden = true;
+          sessionScrollbackLines = 200;
+          sessionRestoreGraceSecs = 120;
+          sessionFocusOnCreate = false;
+          sessionResidentPoolLimit = 4;
+          clipboardImagePaste = false;
+          clipboardMaxImageBytes = 1048576;
+          clipboardRemoteDir = "~/.cache/thegn/paste-hm";
+          clipboardKeepHours = 12;
           monitorSystem = "htop";
           monitorGpu = "nvtop";
           agents = [

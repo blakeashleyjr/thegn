@@ -76,6 +76,71 @@ pub(crate) enum Lookup {
 /// `spawn_blocking`).
 pub(crate) type SharedDb = Arc<Mutex<Db>>;
 
+/// (worktree cache key, run id, job id) of one `ci.logs` fetch.
+pub(crate) type CiLogFlightKey = (String, String, String);
+
+/// Single-flight admission for `ci.logs`: at most one request per key does the cache read and the provider
+/// fetch at a time; later requests for the same key wait for it and then find the cache the first one filled.
+pub(crate) struct CiLogFlights {
+    slots: std::sync::Mutex<
+        std::collections::BTreeMap<CiLogFlightKey, std::sync::Weak<tokio::sync::Mutex<()>>>,
+    >,
+}
+
+/// Held while a request owns its key; dropping it (any return path, a panic, the end of the blocking closure) admits the next waiter.
+pub(crate) struct CiLogFlight {
+    _held: tokio::sync::OwnedMutexGuard<()>,
+}
+
+/// A waiting request ran out of its deadline before the earlier fetch for the same job finished.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) struct CiLogFlightBusy;
+
+impl CiLogFlights {
+    pub(crate) const fn new() -> Self {
+        Self {
+            slots: std::sync::Mutex::new(std::collections::BTreeMap::new()),
+        }
+    }
+
+    /// Wait up to `wait` for the key. Slots whose last holder and waiter are gone are dropped on every call, so the map is bounded by the live requests.
+    pub(crate) async fn enter(
+        &self,
+        key: CiLogFlightKey,
+        wait: std::time::Duration,
+    ) -> Result<CiLogFlight, CiLogFlightBusy> {
+        let slot = {
+            let mut slots = self
+                .slots
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            slots.retain(|_, slot| slot.strong_count() > 0);
+            match slots.get(&key).and_then(std::sync::Weak::upgrade) {
+                Some(slot) => slot,
+                None => {
+                    let slot = Arc::new(tokio::sync::Mutex::new(()));
+                    slots.insert(key, Arc::downgrade(&slot));
+                    slot
+                }
+            }
+        };
+        match tokio::time::timeout(wait, slot.lock_owned()).await {
+            Ok(held) => Ok(CiLogFlight { _held: held }),
+            Err(_) => Err(CiLogFlightBusy),
+        }
+    }
+
+    #[cfg(test)]
+    fn slot_count(&self) -> usize {
+        self.slots
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .len()
+    }
+}
+
+pub(crate) static CI_LOG_FLIGHTS: CiLogFlights = CiLogFlights::new();
+
 pub(crate) struct DaemonService {
     pub daemon_id: String,
     pub sessions: Arc<tokio::sync::Mutex<HashMap<String, SessionEntry>>>,
@@ -2184,6 +2249,17 @@ impl ControlApi for DaemonService {
             let key = thegn_core::remote::GitLoc::worktree_cache_key(&path);
             let run_id_owned = run_id.to_string();
             let job_id_owned = job_id.to_string();
+            let flight = CI_LOG_FLIGHTS
+                .enter(
+                    (key.clone(), run_id_owned.clone(), job_id_owned.clone()),
+                    crate::ci_refresh::MAX_LOG_INGEST_WALL,
+                )
+                .await
+                .map_err(|CiLogFlightBusy| {
+                    ControlError::Unavailable(format!(
+                        "another ci.logs request for run {run_id_owned} job {job_id_owned} is still fetching; retry shortly"
+                    ))
+                })?;
             let cached = if self.config.ci.log_cache_runs > 0 {
                 self.with_db({
                     let key = key.clone();
@@ -2255,7 +2331,9 @@ impl ControlApi for DaemonService {
             let provider_path = path.clone();
             let run_for_provider = run_id_owned.clone();
             let job_for_provider = job_id_owned.clone();
-            let (mut entry, warnings) = tokio::task::spawn_blocking(move || {
+            let flight_for_provider = flight;
+            let (mut entry, warnings, _flight) = tokio::task::spawn_blocking(move || {
+                let flight = flight_for_provider;
                 let loc = thegn_core::remote::GitLoc::for_worktree(&provider_path);
                 let Some((client, context)) = thegn_svc::ci::provider_and_context_for(&loc, &cfg)
                 else {
@@ -2293,7 +2371,7 @@ impl ControlApi for DaemonService {
                     .iter()
                     .map(|warning| thegn_svc::lsp::sanitize_for_terminal(warning))
                     .collect();
-                Ok::<_, anyhow::Error>(Some((entry, warnings)))
+                Ok::<_, anyhow::Error>(Some((entry, warnings, flight)))
             })
             .await
             .map_err(|e| ControlError::Internal(anyhow::anyhow!("CI logs task join: {e}")))?
@@ -4354,6 +4432,170 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn ci_log_flights_second_entry_waits_for_the_first_to_finish() {
+        let flights = CiLogFlights::new();
+        let key = ("wt".to_string(), "1".to_string(), "2".to_string());
+        let first = flights
+            .enter(key.clone(), std::time::Duration::from_secs(60))
+            .await
+            .expect("first");
+        let waiter = flights.enter(key.clone(), std::time::Duration::from_secs(60));
+        tokio::pin!(waiter);
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(300), &mut waiter)
+                .await
+                .is_err(),
+            "the second entry stays parked while the first owns the key"
+        );
+        drop(first);
+        assert!(waiter.await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn ci_log_flights_busy_after_the_wait_is_typed() {
+        let flights = CiLogFlights::new();
+        let key = ("wt".to_string(), "1".to_string(), "2".to_string());
+        let first = flights
+            .enter(key.clone(), std::time::Duration::from_secs(60))
+            .await
+            .expect("first");
+        let busy = flights
+            .enter(key.clone(), std::time::Duration::from_millis(30))
+            .await;
+        assert_eq!(busy.err(), Some(CiLogFlightBusy));
+        drop(first);
+        assert!(
+            flights
+                .enter(key, std::time::Duration::from_secs(60))
+                .await
+                .is_ok()
+        );
+    }
+
+    #[tokio::test]
+    async fn ci_log_flights_distinct_jobs_do_not_wait_for_each_other() {
+        let flights = CiLogFlights::new();
+        let first = flights
+            .enter(
+                ("wt".to_string(), "1".to_string(), "2".to_string()),
+                std::time::Duration::from_secs(60),
+            )
+            .await
+            .expect("first");
+        assert!(
+            flights
+                .enter(
+                    ("wt".to_string(), "1".to_string(), "3".to_string()),
+                    std::time::Duration::from_secs(60),
+                )
+                .await
+                .is_ok()
+        );
+        assert!(
+            flights
+                .enter(
+                    ("other".to_string(), "1".to_string(), "2".to_string()),
+                    std::time::Duration::from_secs(60),
+                )
+                .await
+                .is_ok()
+        );
+        drop(first);
+    }
+
+    #[tokio::test]
+    async fn ci_log_flights_forget_released_slots() {
+        let flights = CiLogFlights::new();
+        let first = flights
+            .enter(
+                ("wt".to_string(), "1".to_string(), "2".to_string()),
+                std::time::Duration::from_secs(60),
+            )
+            .await
+            .expect("first");
+        drop(first);
+        let second = flights
+            .enter(
+                ("wt".to_string(), "1".to_string(), "3".to_string()),
+                std::time::Duration::from_secs(60),
+            )
+            .await
+            .expect("second");
+        assert_eq!(flights.slot_count(), 1);
+        drop(second);
+    }
+
+    #[tokio::test]
+    async fn ci_logs_waits_for_an_inflight_fetch_then_serves_the_cache() {
+        let worktree = tempfile::tempdir().unwrap();
+        let config = thegn_core::config::Config {
+            ci: thegn_core::config_ci::CiConfig {
+                log_tail_lines: 3,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let (service, _) = service_with_config(0, config);
+        let repo_path = worktree.path().display().to_string();
+        let worktree_path = repo_path.clone();
+        service
+            .with_db(move |db| {
+                use thegn_core::store::WorkspaceStore;
+                db.put_workspace(&repo_path, "repo", "repo")?;
+                db.put_worktree(
+                    "repo/feature",
+                    &repo_path,
+                    &worktree_path,
+                    "feature",
+                    None,
+                    None,
+                )?;
+                Ok(())
+            })
+            .await
+            .unwrap();
+
+        let cache_key = thegn_core::remote::GitLoc::worktree_cache_key(worktree.path());
+        let held = CI_LOG_FLIGHTS
+            .enter(
+                (cache_key.clone(), "1".into(), "2".into()),
+                std::time::Duration::from_secs(60),
+            )
+            .await
+            .expect("flight");
+        let text = (0..8)
+            .map(|line| format!("line {line}\n"))
+            .collect::<String>();
+        let mut entry =
+            thegn_core::ci_log::CiLogEntry::new(cache_key, "1", "2", "job", &text, 8, 4096, 10);
+        entry.head_sha = "known-head".into();
+        let call = service.ci_logs(worktree.path().to_str().unwrap(), "1", "2", Some(20));
+        tokio::pin!(call);
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(300), &mut call)
+                .await
+                .is_err(),
+            "ci.logs must remain pending while another request owns this job's flight"
+        );
+        service
+            .with_db(move |db| {
+                use thegn_core::store::CacheStore;
+                db.put_ci_log(&entry)
+            })
+            .await
+            .unwrap();
+        drop(held);
+        let reply = call.await.unwrap();
+        assert_eq!(reply.source, "cache");
+        assert_eq!(reply.logs.len(), 1);
+        let served = reply.logs[0]["text"].as_str().unwrap();
+        assert!(
+            served.lines().count() <= 3,
+            "a cache hit after waiting must honor log_tail_lines"
+        );
+    }
+
     /// Build a service with an in-memory DB and no live sessions — enough to
     /// exercise the lease bookkeeping glue (`on_session_idle` / `on_session_busy`)
     /// in isolation from the PTY actors, which is exactly the untested seam.
@@ -5663,6 +5905,113 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn dispatch_set_status_door_matches_the_transition_table_for_every_pair() {
+        use thegn_core::issue::AgentDispatchStatus as St;
+
+        let (mut svc, _rx) = service(0);
+        let db_dir = tempfile::tempdir().unwrap();
+        let db_path = db_dir.path().join("dispatch-door.sqlite");
+        svc.db = Arc::new(Mutex::new(Db::open_at(&db_path).unwrap()));
+        let stored = [
+            St::Queued,
+            St::Spawning,
+            St::Running,
+            St::WaitingHuman,
+            St::PrOpen,
+            St::Merged,
+            St::Abandoned,
+            St::Done,
+            St::Failed,
+            St::Unknown,
+        ];
+        let targets = stored;
+        let mut pair: usize = 0;
+
+        for (index, from) in stored.iter().copied().enumerate() {
+            for to in targets {
+                let pair_index = pair;
+                pair += 1;
+                let db_path = db_path.clone();
+                let id = svc
+                    .with_db(move |db| {
+                        use thegn_core::store::NotificationStore;
+
+                        let issue_id = format!("linear:DOOR-{index}-{pair_index}");
+                        let worktree_path = format!("/wt/door-{index}-{pair_index}");
+                        let id = db.put_agent_dispatch(thegn_core::issue::NewDispatch::new(
+                            &issue_id,
+                            &worktree_path,
+                            "claude",
+                        ))?;
+                        if from == St::Unknown {
+                            rusqlite::Connection::open(db_path)?.execute(
+                                "UPDATE agent_dispatches SET status='zombie' WHERE id=?1",
+                                [id],
+                            )?;
+                        } else {
+                            db.update_dispatch_status(id, from)?;
+                        }
+                        Ok(id)
+                    })
+                    .await
+                    .unwrap();
+
+                let result = svc.dispatch_set_status(id, to).await;
+                let allowed = thegn_core::db::set_status_transition_allowed(from, to);
+                let outcome_matches = if to == St::Unknown {
+                    matches!(&result, Err(ControlError::InvalidArgument(_)))
+                } else if allowed {
+                    result.is_ok()
+                } else {
+                    matches!(&result, Err(ControlError::FailedPrecondition(_)))
+                };
+                assert!(
+                    outcome_matches,
+                    "{} -> {}: {result:?}",
+                    from.as_str(),
+                    to.as_str()
+                );
+
+                let actual_status = svc
+                    .dispatches_list(None, Db::ROSTER_HISTORY_LIMIT)
+                    .await
+                    .unwrap()
+                    .dispatches
+                    .into_iter()
+                    .find(|row| row.id == id)
+                    .unwrap()
+                    .status;
+                let expected_status = if result.is_ok() { to } else { from };
+                assert_eq!(
+                    actual_status,
+                    expected_status,
+                    "{} -> {}: refusal must leave the stored row unchanged",
+                    from.as_str(),
+                    to.as_str()
+                );
+            }
+        }
+
+        assert!(matches!(
+            svc.dispatch_set_status(9_999_999, St::Running).await,
+            Err(ControlError::NotFound(_))
+        ));
+
+        let codes = [
+            ControlError::NotFound(String::new()).code(),
+            ControlError::InvalidArgument(String::new()).code(),
+            ControlError::FailedPrecondition(String::new()).code(),
+            ControlError::Conflict(String::new()).code(),
+        ];
+        assert!(
+            codes
+                .iter()
+                .enumerate()
+                .all(|(index, code)| !codes[..index].contains(code))
+        );
+    }
+
+    #[tokio::test]
     async fn dispatch_put_refuses_a_missing_parent_without_a_row() {
         let (svc, _rx) = service(0);
         let (_dir, wt) = git_worktree();
@@ -5940,6 +6289,134 @@ mod tests {
         assert_eq!(row.issue_id, "linear:A-1");
         assert_eq!(row.worktree_path, wt.to_string_lossy());
         assert_eq!(row.status, AgentDispatchStatus::Queued);
+    }
+
+    fn dispatch_put_http_state(svc: Arc<DaemonService>) -> thegn_svc::control::http::ControlState {
+        thegn_svc::control::http::ControlState {
+            api: svc.clone(),
+            store: svc.db.clone() as Arc<Mutex<dyn ControlStore + Send>>,
+            local_admin: true,
+            daemon_euid: thegn_svc::ipc::effective_uid(),
+            require_approval: false,
+            server_label: "test thegn".into(),
+            cors_origins: Vec::new(),
+            event_streams: Default::default(),
+        }
+    }
+
+    #[tokio::test]
+    async fn dispatch_put_http_route_canonicalizes_every_alias_spelling() {
+        let (svc, _rx) = service(0);
+        let svc = Arc::new(svc);
+        let (_dir, wt) = git_worktree();
+        std::fs::create_dir_all(wt.join("sub")).unwrap();
+
+        let issue_spellings = ["linear:THE-74", " LINEAR:THE-74"];
+        let worktree_spellings = [
+            wt.to_string_lossy().into_owned(),
+            wt.join("sub").join("..").to_string_lossy().into_owned(),
+            wt.join(".").to_string_lossy().into_owned(),
+        ];
+        for issue_id in issue_spellings {
+            for worktree_path in &worktree_spellings {
+                let (status, body) = thegn_svc::control::http::dispatch_local(
+                    dispatch_put_http_state(svc.clone()),
+                    "dispatches.put",
+                    "POST",
+                    "/v1/dispatches",
+                    Some(serde_json::json!({
+                        "issue_id": issue_id,
+                        "worktree_path": worktree_path,
+                        "agent_name": "claude"
+                    })),
+                )
+                .await;
+
+                assert_eq!(status, axum::http::StatusCode::OK, "{body}");
+                assert_eq!(body["issue_id"], "linear:THE-74");
+                let canonical_worktree = wt.to_string_lossy();
+                assert_eq!(body["worktree_path"].as_str(), Some(&*canonical_worktree));
+            }
+        }
+
+        let rows = svc
+            .dispatches_list(None, Db::ROSTER_HISTORY_LIMIT)
+            .await
+            .unwrap()
+            .dispatches;
+        assert_eq!(rows.len(), 6);
+        assert!(rows.iter().all(|row| {
+            row.issue_id == "linear:THE-74" && row.worktree_path == wt.to_string_lossy()
+        }));
+    }
+
+    #[tokio::test]
+    async fn dispatch_put_http_route_refuses_unusable_identities_with_a_typed_400_and_no_row() {
+        let (svc, _rx) = service(0);
+        let svc = Arc::new(svc);
+        let (_dir, wt) = git_worktree();
+        std::fs::create_dir_all(wt.join("sub")).unwrap();
+
+        for path in [
+            wt.join("missing"),
+            wt.join("sub"),
+            std::path::PathBuf::from("/wt/a"),
+        ] {
+            let path_text = path.to_string_lossy().into_owned();
+            let (status, body) = thegn_svc::control::http::dispatch_local(
+                dispatch_put_http_state(svc.clone()),
+                "dispatches.put",
+                "POST",
+                "/v1/dispatches",
+                Some(serde_json::json!({
+                    "issue_id": "linear:A-1",
+                    "worktree_path": path_text,
+                    "agent_name": "claude"
+                })),
+            )
+            .await;
+
+            assert_eq!(status, axum::http::StatusCode::BAD_REQUEST, "{body}");
+            assert_eq!(body["code"], "bad_request");
+            assert!(body["error"].as_str().unwrap().contains(&path_text));
+        }
+
+        let (status, body) = thegn_svc::control::http::dispatch_local(
+            dispatch_put_http_state(svc.clone()),
+            "dispatches.put",
+            "POST",
+            "/v1/dispatches",
+            Some(serde_json::json!({
+                "issue_id": "two words",
+                "worktree_path": wt.to_string_lossy(),
+                "agent_name": "claude"
+            })),
+        )
+        .await;
+        assert_eq!(status, axum::http::StatusCode::BAD_REQUEST, "{body}");
+        assert_eq!(body["code"], "bad_request");
+
+        let (status, _) = thegn_svc::control::http::dispatch_local(
+            dispatch_put_http_state(svc.clone()),
+            "dispatches.list",
+            "POST",
+            "/v1/dispatches",
+            Some(serde_json::json!({
+                "issue_id": "linear:A-1",
+                "worktree_path": wt.to_string_lossy(),
+                "agent_name": "claude"
+            })),
+        )
+        .await;
+        assert_ne!(status, axum::http::StatusCode::OK);
+
+        assert!(
+            svc.dispatches_list(None, Db::ROSTER_HISTORY_LIMIT)
+                .await
+                .unwrap()
+                .dispatches
+                .is_empty()
+        );
     }
 
     #[test]
