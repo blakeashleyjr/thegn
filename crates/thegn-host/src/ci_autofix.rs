@@ -86,16 +86,26 @@ fn authorize_entry(
             job = %entry.job_name,
             "holding CI autofix authorization because cached provider context differs"
         );
+        let ref_id = candidate_ref_id(&entry.candidate());
+        match db.has_notification("pr_queue_needs_human", &ref_id) {
+            Ok(true) => return,
+            Ok(false) => {}
+            Err(error) => {
+                tracing::debug!(
+                    target: "thegn::ci_autofix",
+                    %error,
+                    "could not check for an existing CI autofix notification"
+                );
+                return;
+            }
+        }
         let message = format!(
             "CI job {} failed, but its cached log belongs to another provider context than this worktree's current one; autofix is held until the log is refreshed",
             entry.job_name
         );
-        if let Err(error) = db.put_notification_once(
-            "pr_queue_needs_human",
-            &candidate_ref_id(&entry.candidate()),
-            &message,
-            &entry.worktree,
-        ) {
+        if let Err(error) =
+            db.put_notification_once("pr_queue_needs_human", &ref_id, &message, &entry.worktree)
+        {
             tracing::debug!(target: "thegn::ci_autofix", %error, "could not save CI autofix context notification");
         }
         return;
