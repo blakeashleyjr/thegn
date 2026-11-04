@@ -21,7 +21,7 @@ const MAX_LOG_INGEST_CALLS: usize = 32;
 /// Log bytes ingested by one refresh request (active worktree plus the background sweep).
 const MAX_LOG_INGEST_BYTES: usize = 8 * 1024 * 1024;
 /// One request's aggregate cap across active and background worktrees, including run lists.
-const MAX_LOG_INGEST_WALL: Duration = Duration::from_secs(120);
+pub(crate) const MAX_LOG_INGEST_WALL: Duration = Duration::from_secs(120);
 const MAX_INGEST_MEMO_ENTRIES: usize = 512;
 
 #[derive(Clone, Debug, Hash, PartialEq, Eq)]
