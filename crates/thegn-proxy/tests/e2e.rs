@@ -21,6 +21,7 @@ use tokio::task::JoinHandle;
 
 const SECRET: &[u8] = b"e2e-attribution-secret";
 const PROMPT_MARKER: &str = "e2e-secret-prompt-7f3a";
+const RESPONSE_MARKER: &str = "e2e-secret-response-4c91";
 
 struct Task(JoinHandle<()>);
 
@@ -708,4 +709,235 @@ fn completion(content: &str) -> Value {
         "choices":[{"index":0,"message":{"role":"assistant","content":content},"finish_reason":"stop"}],
         "usage":{"prompt_tokens":1,"completion_tokens":1,"total_tokens":2}
     })
+}
+
+#[tokio::test]
+async fn e2e_budget_downgrade_serves_the_cheapest_lane_first() {
+    let dir = TempDir::new().unwrap();
+    let premium = upstream(Script::Json(200, completion("from-premium"), vec![])).await;
+    let cheap = upstream(Script::Json(200, completion("from-cheap"), vec![])).await;
+    let mut cfg = base_config();
+    let mut premium_provider = provider("premium", &premium, key_file(dir.path(), "premium-key"));
+    premium_provider.input_usd_per_mtok = 100.0;
+    premium_provider.output_usd_per_mtok = 100.0;
+    let mut cheap_provider = provider("cheap", &cheap, key_file(dir.path(), "cheap-key"));
+    cheap_provider.input_usd_per_mtok = 1.0;
+    cheap_provider.output_usd_per_mtok = 1.0;
+    cfg.providers = vec![premium_provider, cheap_provider];
+    cfg.routes = vec![route(
+        "standard",
+        vec![
+            backend("premium", "premium-model"),
+            backend("cheap", "cheap-model"),
+        ],
+    )];
+
+    let (control_proxy, _, _control_task) = start_proxy(cfg.clone()).await;
+    let control =
+        content(post_openai(&control_proxy, request("standard", "hello", false)).await).await;
+    assert_eq!(
+        control.0, 200,
+        "no-budget control status/body: {} {}",
+        control.0, control.1
+    );
+    assert!(
+        control.1.contains("from-premium"),
+        "no-budget control should serve premium first: {}",
+        control.1
+    );
+    assert_eq!(premium.hits.load(Ordering::SeqCst), 1);
+    assert_eq!(cheap.hits.load(Ordering::SeqCst), 0);
+
+    let mut downgrade_cfg = cfg.clone();
+    downgrade_cfg.budget.enabled = true;
+    downgrade_cfg.budget.on_breach = BudgetBreach::Downgrade;
+    downgrade_cfg.budget.scopes.insert(
+        "workspace:/e2e".into(),
+        BudgetLimit {
+            tokens: Some(1),
+            cost_usd: None,
+        },
+    );
+    let (proxy, db, _task) = start_proxy(downgrade_cfg.clone()).await;
+    let runtime = config::build(&downgrade_cfg).unwrap();
+    budget::record_spend(
+        &db,
+        &runtime.budget,
+        &Identity {
+            scope: "worktree:/e2e/wt".into(),
+            workspace: Some("workspace:/e2e".into()),
+            ..Default::default()
+        },
+        1,
+        0.0,
+        now_ms(),
+    );
+    let result = content(post_openai(&proxy, request("standard", "hello", false)).await).await;
+    assert_eq!(
+        result.0, 200,
+        "downgrade status/body (downgrade should serve): {} {}",
+        result.0, result.1
+    );
+    assert!(
+        result.1.contains("from-cheap"),
+        "breached downgrade should serve the cheaper lane: {}",
+        result.1
+    );
+    assert_eq!(cheap.hits.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        premium.hits.load(Ordering::SeqCst),
+        1,
+        "downgraded request must not reach premium"
+    );
+}
+
+#[derive(Clone)]
+struct LogSink(Arc<Mutex<Vec<u8>>>);
+
+struct LogWriter(Arc<Mutex<Vec<u8>>>);
+
+impl std::io::Write for LogWriter {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.0.lock().unwrap().extend_from_slice(buf);
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for LogSink {
+    type Writer = LogWriter;
+
+    fn make_writer(&'a self) -> LogWriter {
+        LogWriter(self.0.clone())
+    }
+}
+
+fn captured_logs() -> &'static Arc<Mutex<Vec<u8>>> {
+    static LOGS: std::sync::OnceLock<Arc<Mutex<Vec<u8>>>> = std::sync::OnceLock::new();
+    LOGS.get_or_init(|| {
+        let buffer = Arc::new(Mutex::new(Vec::new()));
+        let subscriber = tracing_subscriber::fmt()
+            .with_max_level(tracing::Level::TRACE)
+            .with_ansi(false)
+            .with_writer(LogSink(buffer.clone()))
+            .finish();
+        tracing::subscriber::set_global_default(subscriber)
+            .expect("the e2e binary installs exactly one global subscriber");
+        buffer
+    })
+}
+
+async fn wait_for_audit_row(db: &SharedDb, response: &(u16, String, String)) {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        let rows = db
+            .lock()
+            .unwrap()
+            .model_proxy_requests_since(0, 10)
+            .unwrap();
+        if !rows.is_empty() {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "audit row missing after response; status/body: {} {}",
+            response.0,
+            response.1
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+}
+
+#[tokio::test]
+async fn e2e_logs_never_contain_prompts_responses_or_keys() {
+    let logs = captured_logs();
+    let dir = TempDir::new().unwrap();
+    let failing = upstream(Script::Json(500, json!({"error":"busy"}), vec![])).await;
+    let serving = upstream(Script::Json(200, completion(RESPONSE_MARKER), vec![])).await;
+    let mut cfg = base_config();
+    cfg.providers = vec![
+        provider("a", &failing, key_file(dir.path(), "a-key")),
+        provider("b", &serving, key_file(dir.path(), "b-key")),
+    ];
+    cfg.routes = vec![route(
+        "standard",
+        vec![backend("a", "a-model"), backend("b", "b-model")],
+    )];
+    let (proxy, db, _proxy_task) = start_proxy(cfg).await;
+    let bearer = signed_key();
+    let response = reqwest::Client::new()
+        .post(format!("{proxy}/v1/chat/completions"))
+        .bearer_auth(&bearer)
+        .json(&request("standard", PROMPT_MARKER, false))
+        .send()
+        .await
+        .unwrap();
+    let result = content(response).await;
+    assert_eq!(
+        result.0, 200,
+        "JSON failover status/body: {} {}",
+        result.0, result.1
+    );
+    assert!(
+        result.1.contains(RESPONSE_MARKER),
+        "client should receive the response marker: {}",
+        result.1
+    );
+    wait_for_audit_row(&db, &result).await;
+
+    let stream_failing = upstream(Script::Json(500, json!({"error":"busy"}), vec![])).await;
+    let stream_serving = upstream(Script::Sse(vec![
+        "data: {\"choices\":[{\"delta\":{\"content\":\"streamed\"}}]}",
+    ]))
+    .await;
+    let mut stream_cfg = base_config();
+    stream_cfg.providers = vec![
+        provider("a", &stream_failing, key_file(dir.path(), "stream-a-key")),
+        provider("b", &stream_serving, key_file(dir.path(), "stream-b-key")),
+    ];
+    stream_cfg.routes = vec![route(
+        "standard",
+        vec![backend("a", "a-model"), backend("b", "b-model")],
+    )];
+    let (stream_proxy, stream_db, _stream_proxy_task) = start_proxy(stream_cfg).await;
+    let stream_response = reqwest::Client::new()
+        .post(format!("{stream_proxy}/v1/chat/completions"))
+        .bearer_auth(&bearer)
+        .json(&request("standard", PROMPT_MARKER, true))
+        .send()
+        .await
+        .unwrap();
+    let stream_result = content(stream_response).await;
+    assert_eq!(
+        stream_result.0, 200,
+        "stream failover status/body: {} {}",
+        stream_result.0, stream_result.1
+    );
+    assert!(
+        stream_result.1.contains("streamed"),
+        "stream response body: {}",
+        stream_result.1
+    );
+    wait_for_audit_row(&stream_db, &stream_result).await;
+
+    tracing::warn!(target: "e2e", "log capture is live");
+    let captured = String::from_utf8_lossy(&logs.lock().unwrap()).into_owned();
+    assert!(
+        captured.contains("log capture is live"),
+        "positive control missing from captured logs: {captured}"
+    );
+    for marker in [
+        PROMPT_MARKER,
+        RESPONSE_MARKER,
+        "e2e-upstream-key",
+        bearer.as_str(),
+    ] {
+        assert!(
+            !captured.contains(marker),
+            "captured logs leaked marker {marker:?}: {captured}"
+        );
+    }
 }
