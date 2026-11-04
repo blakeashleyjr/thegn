@@ -289,7 +289,12 @@ the log without a job name or head, warns, and does not cache it. With `--json`,
 the warnings are in a `warnings` array (empty for a cached log); the control
 API's `ci.logs` reply carries the same field.
 The daemon/API `ci.logs` `tail_lines` argument can narrow `[ci] log_tail_lines`,
-but a larger value is clamped to that setting. A value of `0` is refused.
+but a larger value is clamped to that setting. A value of `0` is refused. The
+`[ci] log_tail_lines` setting must be between 1 and 100000; configuration
+validation reports `ci.log_tail_lines: must be greater than zero` or
+`ci.log_tail_lines: must not exceed 100000`. Invalid UTF-8 lines are dropped
+from the retained tail and mark it truncated; CRLF endings are preserved, and
+an over-long line is discarded.
 
 When a GitLab job list reaches its page, row, byte or time budget (one minute
 for the whole run detail), `thegn ci view` and `ci logs` warn that the list is
