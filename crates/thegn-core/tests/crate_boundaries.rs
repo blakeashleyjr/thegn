@@ -227,12 +227,13 @@ fn plugin_sdk_is_not_a_dependency_of_any_other_member() {
 fn plugin_sdk_keyring_features_match_the_host_so_the_lockfile_does_not_fork() {
     let root = workspace_root();
     let sdk: toml::Value = toml::from_str(
-        &fs::read_to_string(root.join("crates/thegn-plugin-sdk/Cargo.toml")).unwrap(),
+        &std::fs::read_to_string(root.join("crates/thegn-plugin-sdk/Cargo.toml")).unwrap(),
     )
     .unwrap();
-    let host: toml::Value =
-        toml::from_str(&fs::read_to_string(root.join("crates/thegn-host/Cargo.toml")).unwrap())
-            .unwrap();
+    let host: toml::Value = toml::from_str(
+        &std::fs::read_to_string(root.join("crates/thegn-host/Cargo.toml")).unwrap(),
+    )
+    .unwrap();
     let sdk_keyring = &sdk["dependencies"]["keyring"];
     let host_keyring = &host["dependencies"]["keyring"];
     assert_eq!(
@@ -258,4 +259,24 @@ fn plugin_sdk_keyring_features_match_the_host_so_the_lockfile_does_not_fork() {
     sdk_features.sort_unstable();
     host_features.sort_unstable();
     assert_eq!(sdk_features, host_features);
+}
+
+#[test]
+fn plugin_sdk_state_directory_env_matches_the_host_contract() {
+    let root = workspace_root();
+    let host_env =
+        std::fs::read_to_string(root.join("crates/thegn-svc/src/plugin/env.rs")).unwrap();
+    let sdk_local =
+        std::fs::read_to_string(root.join("crates/thegn-plugin-sdk/src/local.rs")).unwrap();
+    let host_value = host_env
+        .lines()
+        .find_map(|line| {
+            line.strip_prefix("pub const PLUGIN_STATE_DIR_ENV: &str = \"")?
+                .strip_suffix("\";")
+        })
+        .expect("host plugin state environment constant");
+    assert!(
+        sdk_local.contains(&format!("var_os(\"{host_value}\")")),
+        "SDK from_host must read the host's PLUGIN_STATE_DIR_ENV ({host_value})"
+    );
 }
