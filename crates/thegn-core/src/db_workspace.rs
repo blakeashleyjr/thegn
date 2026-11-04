@@ -600,6 +600,7 @@ impl WorkspaceStore for Db {
         // A recognized cleanup hold is independent retained branch history,
         // not a live-worktree cache. Generic hydration/reaping must not erase
         // it; explicit queue dismissal still uses remove_merge_entry.
+        crate::db_aux::reap_expired_landed_claim(self.conn(), wt)?;
         let deleted = self.conn().execute(
             "DELETE FROM merge_queue WHERE worktree=?1 AND claim_owner IS NULL \
              AND NOT(status='landed' AND error_detail IS ?2)",

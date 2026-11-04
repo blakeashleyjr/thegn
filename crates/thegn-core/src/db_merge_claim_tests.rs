@@ -770,3 +770,127 @@ fn lost_claim_land_records_no_event() {
     assert!(db.merge_queue_events(WT, 10).unwrap().is_empty());
     assert_eq!(db.list_merge_queue().unwrap()[0].status, "queued");
 }
+
+fn land_and_expire(db: &Db, expire: bool) -> MergeClaim {
+    let claim = db.admit_merge_claim(&request()).unwrap().unwrap();
+    let claim = db
+        .replace_merge_status_claimed(&claim, "folding", &MergeStatusFields::default())
+        .unwrap();
+    let claim = db
+        .land_merge_status_claimed(
+            &claim,
+            &MergeStatusFields {
+                result_oid: Some("res".into()),
+                ..Default::default()
+            },
+            "base",
+        )
+        .unwrap();
+    if expire {
+        db.conn()
+            .execute(
+                "UPDATE merge_queue SET claim_lease_until_ms=?1 WHERE worktree=?2",
+                params![util::now_ms() - 1, WT],
+            )
+            .unwrap();
+    }
+    claim
+}
+
+#[test]
+fn expired_claim_on_a_landed_row_is_reaped_by_remove() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = fixture(&dir.path().join("claims.sqlite"));
+    land_and_expire(&db, true);
+
+    db.remove_merge_entry(WT).unwrap();
+
+    assert!(db.list_merge_queue().unwrap().is_empty());
+    let events = db.merge_queue_events(WT, 10).unwrap();
+    assert_eq!(events[0].operation, "remove");
+    assert_eq!(events[0].outcome, "deleted");
+}
+
+#[test]
+fn expired_claim_on_a_landed_row_is_reaped_by_reenqueue() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = fixture(&dir.path().join("claims.sqlite"));
+    let claim = land_and_expire(&db, true);
+
+    db.enqueue_merge(WT, "feature", "main").unwrap();
+
+    assert_eq!(db.list_merge_queue().unwrap()[0].status, "queued");
+    let view = db.observe_merge_claim(WT).unwrap().unwrap();
+    assert_eq!(view.phase, "unclaimed");
+    assert_eq!(view.owner_hint, None);
+    assert_eq!(view.generation, claim.generation);
+    let release = db.release_merge_claim(&claim);
+    assert!(matches!(release, Err(error) if error.to_string().contains(MERGE_CLAIM_LOST)));
+    let fresh = db.admit_merge_claim(&request()).unwrap().unwrap();
+    assert_eq!(fresh.generation, claim.generation + 1);
+}
+
+#[test]
+fn expired_claim_on_a_landed_row_is_reaped_by_conditional_reenqueue() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = fixture(&dir.path().join("claims.sqlite"));
+    land_and_expire(&db, true);
+
+    assert!(
+        db.enqueue_merge_if_worktree_matches(WT, "feature", "/private/repo", "", "main")
+            .unwrap()
+    );
+    assert_eq!(db.list_merge_queue().unwrap()[0].status, "queued");
+}
+
+#[test]
+fn expired_claim_on_a_landed_row_does_not_survive_worktree_deletion() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = fixture(&dir.path().join("claims.sqlite"));
+    land_and_expire(&db, true);
+
+    db.del_worktree(WT).unwrap();
+
+    assert!(db.list_merge_queue().unwrap().is_empty());
+}
+
+#[test]
+fn live_claim_on_a_landed_row_is_still_refused() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = fixture(&dir.path().join("claims.sqlite"));
+    land_and_expire(&db, false);
+    let before = db.list_merge_queue().unwrap();
+
+    let remove = db.remove_merge_entry(WT);
+    assert!(
+        matches!(remove, Err(error) if error.to_string().contains(crate::store::MERGE_CLAIM_ACTIVE))
+    );
+    let enqueue = db.enqueue_merge(WT, "feature", "main");
+    assert!(
+        matches!(enqueue, Err(error) if error.to_string().contains(crate::store::MERGE_CLAIM_ACTIVE))
+    );
+    assert_eq!(db.list_merge_queue().unwrap(), before);
+}
+
+#[test]
+fn expired_claim_on_a_non_landed_row_is_still_refused_by_remove() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = fixture(&dir.path().join("claims.sqlite"));
+    let claim = db.admit_merge_claim(&request()).unwrap().unwrap();
+    db.replace_merge_status_claimed(&claim, "folding", &MergeStatusFields::default())
+        .unwrap();
+    db.conn()
+        .execute(
+            "UPDATE merge_queue SET claim_lease_until_ms=?1 WHERE worktree=?2",
+            params![util::now_ms() - 1, WT],
+        )
+        .unwrap();
+
+    let remove = db.remove_merge_entry(WT);
+    assert!(
+        matches!(remove, Err(error) if error.to_string().contains(crate::store::MERGE_CLAIM_ACTIVE))
+    );
+    assert_eq!(db.list_merge_queue().unwrap()[0].status, "folding");
+    let recovered = db.admit_merge_claim(&request()).unwrap().unwrap();
+    assert_eq!(recovered.generation, 2);
+}
