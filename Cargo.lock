@@ -3398,7 +3398,7 @@ dependencies = [
 
 [[package]]
 name = "gtui-app"
-version = "0.1.0-alpha.47"
+version = "0.1.0-alpha.48"
 dependencies = [
  "chrono",
  "gtui-core",
@@ -3407,7 +3407,7 @@ dependencies = [
 
 [[package]]
 name = "gtui-core"
-version = "0.1.0-alpha.47"
+version = "0.1.0-alpha.48"
 dependencies = [
  "chrono",
  "serde",
@@ -3417,7 +3417,7 @@ dependencies = [
 
 [[package]]
 name = "gtui-embed"
-version = "0.1.0-alpha.47"
+version = "0.1.0-alpha.48"
 dependencies = [
  "chrono",
  "gtui-app",
@@ -3432,7 +3432,7 @@ dependencies = [
 
 [[package]]
 name = "gtui-query"
-version = "0.1.0-alpha.47"
+version = "0.1.0-alpha.48"
 dependencies = [
  "chrono",
  "gtui-core",
@@ -3446,7 +3446,7 @@ dependencies = [
 
 [[package]]
 name = "gtui-render"
-version = "0.1.0-alpha.47"
+version = "0.1.0-alpha.48"
 dependencies = [
  "gtui-core",
  "ratatui",
@@ -8010,7 +8010,7 @@ dependencies = [
 
 [[package]]
 name = "thegn-core"
-version = "0.1.0-alpha.47"
+version = "0.1.0-alpha.48"
 dependencies = [
  "anyhow",
  "chrono",
@@ -8059,7 +8059,7 @@ dependencies = [
 
 [[package]]
 name = "thegn-host"
-version = "0.1.0-alpha.47"
+version = "0.1.0-alpha.48"
 dependencies = [
  "alacritty_terminal",
  "anyhow",
@@ -8121,7 +8121,7 @@ dependencies = [
 
 [[package]]
 name = "thegn-media"
-version = "0.1.0-alpha.47"
+version = "0.1.0-alpha.48"
 dependencies = [
  "futures",
  "libc",
@@ -8138,7 +8138,7 @@ dependencies = [
 
 [[package]]
 name = "thegn-metrics"
-version = "0.1.0-alpha.47"
+version = "0.1.0-alpha.48"
 dependencies = [
  "core-foundation 0.9.4",
  "libc",
@@ -8164,7 +8164,7 @@ dependencies = [
 
 [[package]]
 name = "thegn-proc"
-version = "0.1.0-alpha.47"
+version = "0.1.0-alpha.48"
 dependencies = [
  "libc",
  "nix 0.31.3",
@@ -8173,7 +8173,7 @@ dependencies = [
 
 [[package]]
 name = "thegn-proxy"
-version = "0.1.0-alpha.47"
+version = "0.1.0-alpha.48"
 dependencies = [
  "anyhow",
  "axum",
@@ -8192,7 +8192,7 @@ dependencies = [
 
 [[package]]
 name = "thegn-svc"
-version = "0.1.0-alpha.47"
+version = "0.1.0-alpha.48"
 dependencies = [
  "anyhow",
  "axum",
@@ -8236,7 +8236,7 @@ dependencies = [
 
 [[package]]
 name = "thegn-voice"
-version = "0.1.0-alpha.46"
+version = "0.1.0-alpha.48"
 dependencies = [
  "anyhow",
  "cpal",
