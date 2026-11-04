@@ -1,0 +1,8 @@
+# THE-523 path-based writer caller ledger; this allowlist is SHRINK-ONLY.
+# Enforced by crates/thegn-core/tests/fsperm_path_write_ratchet.rs.
+# Blind spot: crates outside thegn-core, thegn-host, and thegn-svc are not scanned.
+# managed_ssh.rs: custody rows and generation counter use a path-resolved parent;
+# THE-519 owns moving them onto a held handle.
+# worktree.rs: rename-intent journal carries no secret; durability claim only.
+managed_ssh.rs
+worktree.rs
