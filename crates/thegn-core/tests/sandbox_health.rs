@@ -8,6 +8,9 @@ use std::path::PathBuf;
 use thegn_core::config::{FileAccess, Network};
 use thegn_core::sandbox::{Backend, Mount, SandboxLimits, SandboxSpec, ensure, health_check};
 
+#[path = "support/bounded_run.rs"]
+mod bounded_run;
+
 fn skip() -> bool {
     !thegn_core::util::have("podman")
         || std::env::var("CI").is_ok()
@@ -17,9 +20,7 @@ fn skip() -> bool {
 
 fn force_rm(name: &str) {
     // best-effort: test scratch: best-effort by design
-    let _ = std::process::Command::new("podman")
-        .args(["rm", "-f", name])
-        .output();
+    let _ = bounded_run::output(std::process::Command::new("podman").args(["rm", "-f", name]));
 }
 
 fn base_spec(name: &str) -> SandboxSpec {
@@ -89,9 +90,7 @@ fn f2_stopped_container_is_unhealthy() {
     ensure(&spec).expect("ensure failed");
     // Stop the container.
     // best-effort: test scratch: best-effort by design
-    let _ = std::process::Command::new("podman")
-        .args(["stop", name])
-        .output();
+    let _ = bounded_run::output(std::process::Command::new("podman").args(["stop", name]));
     let healthy = health_check(&spec);
     force_rm(name);
     assert!(!healthy, "stopped container must not be healthy");

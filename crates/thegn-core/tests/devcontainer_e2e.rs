@@ -14,6 +14,9 @@ use thegn_core::devcontainer_overlay;
 use thegn_core::remote::GitLoc;
 use thegn_core::sandbox::{self, container_name};
 
+#[path = "support/bounded_run.rs"]
+mod bounded_run;
+
 fn skip() -> bool {
     !thegn_core::util::have("podman")
         || std::env::var("CI").is_ok()
@@ -22,7 +25,7 @@ fn skip() -> bool {
 }
 
 fn podman(args: &[&str]) -> (bool, String) {
-    let out = std::process::Command::new("podman").args(args).output();
+    let out = bounded_run::output(std::process::Command::new("podman").args(args));
     match out {
         Ok(o) => (
             o.status.success(),
@@ -39,9 +42,7 @@ fn exec_in(name: &str, script: &str) -> String {
 
 fn force_rm(name: &str) {
     // best-effort: test scratch: best-effort by design
-    let _ = std::process::Command::new("podman")
-        .args(["rm", "-f", name])
-        .output();
+    let _ = bounded_run::output(std::process::Command::new("podman").args(["rm", "-f", name]));
 }
 
 /// Write a temp worktree with a `.devcontainer/` holding the given files.
@@ -205,9 +206,9 @@ fn e3_compose_up_and_exec() {
     let spec = spec_for(&wt, &sb, name);
     // Tear down any prior project first, then bring it up.
     // best-effort: test scratch: best-effort by design
-    let _ = std::process::Command::new("docker")
-        .args(["compose", "-p", name, "down", "-t", "1"])
-        .output();
+    let _ = bounded_run::output(
+        std::process::Command::new("docker").args(["compose", "-p", name, "down", "-t", "1"]),
+    );
     sandbox::ensure(&spec).expect("ensure (compose up) failed");
 
     // The pane-enter argv must route through `docker compose exec app`.
@@ -219,8 +220,8 @@ fn e3_compose_up_and_exec() {
     );
 
     // Exercise the real exec into the service (non-interactive `-T`).
-    let out = std::process::Command::new("docker")
-        .args([
+    let out = bounded_run::output(
+        std::process::Command::new("docker").args([
             "compose",
             "-p",
             name,
@@ -233,15 +234,15 @@ fn e3_compose_up_and_exec() {
             "sh",
             "-c",
             "echo compose-ok",
-        ])
-        .output()
-        .expect("compose exec");
+        ]),
+    )
+    .expect("compose exec");
     assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "compose-ok");
 
     // best-effort: test scratch: best-effort by design
-    let _ = std::process::Command::new("docker")
-        .args(["compose", "-p", name, "down", "-t", "1"])
-        .output();
+    let _ = bounded_run::output(
+        std::process::Command::new("docker").args(["compose", "-p", name, "down", "-t", "1"]),
+    );
     // best-effort: test cleanup: scratch removal must never fail the test
     let _ = std::fs::remove_dir_all(&wt);
     let _ = container_name; // silence unused in the docker-only branch
