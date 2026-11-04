@@ -1411,12 +1411,13 @@ fn mcp_secret_set_in(
     value: &str,
 ) -> Result<(), String> {
     validate_mcp_account(account)?;
-    with_index_lock(dir, || {
-        let _names = index_read_in(dir)?;
+    let private = open_secrets_in(dir).map_err(|error| format!("{error:#}"))?;
+    with_index_lock_held(&private, || {
+        let _names = index_read_held(&private)?;
         store
             .set(account, value)
             .map_err(|error| error.message().to_string())?;
-        index_add_locked(dir, account)
+        index_add_locked(&private, account)
     })
 }
 
@@ -1426,12 +1427,13 @@ fn mcp_secret_rm_in(
     account: &str,
 ) -> Result<(), String> {
     validate_mcp_account(account)?;
-    with_index_lock(dir, || {
-        let _names = index_read_in(dir)?;
+    let private = open_secrets_in(dir).map_err(|error| format!("{error:#}"))?;
+    with_index_lock_held(&private, || {
+        let _names = index_read_held(&private)?;
         store
             .del(account)
             .map_err(|error| error.message().to_string())?;
-        index_remove_locked(dir, account)
+        index_remove_locked(&private, account)
     })
 }
 
@@ -1492,11 +1494,6 @@ fn index_read_held(private: &thegn_core::fsperm::PrivateDir) -> Result<Vec<Strin
     Ok(names)
 }
 
-fn index_write_in(dir: &std::path::Path, names: &[String]) -> Result<(), String> {
-    let private = open_secrets_in(dir).map_err(|error| format!("{error:#}"))?;
-    index_write_held(&private, names)
-}
-
 fn index_write_held(
     private: &thegn_core::fsperm::PrivateDir,
     names: &[String],
@@ -1518,6 +1515,7 @@ fn index_write_held(
     Ok(())
 }
 
+#[cfg(test)]
 fn open_dir_lock(
     dir: &std::path::Path,
     lock_name: &str,
@@ -1618,30 +1616,44 @@ fn lock_secrets_in(dir: &std::path::Path) -> Result<SecretsLock, SecretsLockErro
     }
 }
 
-fn with_index_lock<T>(
-    dir: &std::path::Path,
+fn with_index_lock_held<T>(
+    private: &thegn_core::fsperm::PrivateDir,
     action: impl FnOnce() -> Result<T, String>,
 ) -> Result<T, String> {
-    let _lock = open_dir_lock(dir, "mcp-index.lock", "MCP secret index")?;
+    let lock = private
+        .open_or_create_regular_nofollow("mcp-index.lock")
+        .map_err(|error| format!("open MCP secret index lock: {error}"))?;
+    if !thegn_core::fsperm::owned_by_current_user(
+        &lock
+            .metadata()
+            .map_err(|error| format!("inspect MCP secret index lock: {error}"))?,
+    ) {
+        return Err("MCP secret index lock is owned by another user".into());
+    }
+    lock.lock()
+        .map_err(|error| format!("lock MCP secret index: {error}"))?;
     action()
 }
 
-fn index_add_locked(dir: &std::path::Path, account: &str) -> Result<(), String> {
-    let mut names = index_read_in(dir)?;
+fn index_add_locked(private: &thegn_core::fsperm::PrivateDir, account: &str) -> Result<(), String> {
+    let mut names = index_read_held(private)?;
     if !names.iter().any(|name| name == account) {
         names.push(account.to_string());
         names.sort();
-        index_write_in(dir, &names)?;
+        index_write_held(private, &names)?;
     }
     Ok(())
 }
 
-fn index_remove_locked(dir: &std::path::Path, account: &str) -> Result<(), String> {
-    let mut names = index_read_in(dir)?;
+fn index_remove_locked(
+    private: &thegn_core::fsperm::PrivateDir,
+    account: &str,
+) -> Result<(), String> {
+    let mut names = index_read_held(private)?;
     let before = names.len();
     names.retain(|name| name != account);
     if names.len() != before {
-        index_write_in(dir, &names)?;
+        index_write_held(private, &names)?;
     }
     Ok(())
 }
@@ -1649,7 +1661,8 @@ fn index_remove_locked(dir: &std::path::Path, account: &str) -> Result<(), Strin
 #[cfg(test)]
 fn index_add_in(dir: &std::path::Path, account: &str) -> Result<(), String> {
     validate_mcp_account(account)?;
-    with_index_lock(dir, || index_add_locked(dir, account))
+    let private = open_secrets_in(dir).map_err(|error| format!("{error:#}"))?;
+    with_index_lock_held(&private, || index_add_locked(&private, account))
 }
 
 #[cfg(test)]
@@ -2622,6 +2635,27 @@ mod tests {
     }
 
     #[test]
+    fn mcp_index_locked_mutation_stays_beneath_the_held_directory_when_swapped() {
+        let parent = private_temp();
+        let secrets = parent.path().join("secrets");
+        let moved = parent.path().join("secrets.moved");
+        thegn_core::fsperm::ensure_private_dir(&secrets).unwrap();
+        let private = open_secrets_in(&secrets).unwrap();
+
+        with_index_lock_held(&private, || {
+            std::fs::rename(&secrets, &moved).map_err(|error| error.to_string())?;
+            thegn_core::fsperm::ensure_private_dir(&secrets).map_err(|error| error.to_string())?;
+            index_add_locked(&private, "acct")
+        })
+        .unwrap();
+
+        assert_eq!(index_read_held(&private).unwrap(), vec!["acct"]);
+        assert_eq!(std::fs::read_dir(&secrets).unwrap().count(), 0);
+        assert!(moved.join("mcp-index.lock").is_file());
+        assert!(moved.join(MCP_INDEX_FILE).is_file());
+    }
+
+    #[test]
     fn mcp_index_publish_is_owner_only_and_leaves_no_temporary() {
         let temp = private_temp();
         let private = open_secrets_in(temp.path()).unwrap();
@@ -2634,9 +2668,9 @@ mod tests {
             .collect::<Vec<_>>();
         assert_eq!(names, vec![std::ffi::OsString::from(MCP_INDEX_FILE)]);
         let index = temp.path().join(MCP_INDEX_FILE);
-        if let Ok(Some(mode)) = thegn_core::fsperm::mode_bits(&index) {
-            assert_eq!(mode & 0o077, 0);
-        }
+        let mode = thegn_core::fsperm::mode_bits(&index)
+            .expect("the published index mode must be readable");
+        assert_eq!(mode, Some(0o600), "owner-only mode must be observable");
     }
 
     type RecordingGate = Option<(std::sync::mpsc::Sender<()>, std::sync::mpsc::Receiver<()>)>;
