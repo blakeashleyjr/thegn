@@ -3831,6 +3831,46 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn merge_add_refuses_unregistered_targets_before_any_mutation() {
+        use thegn_core::store::WorktreeAuxStore;
+
+        let registered = tempfile::tempdir().unwrap();
+        let svc = service_with_registered(registered.path(), registered.path()).await;
+        // A real directory that is not registered, a path that does not exist, and a sibling-name alias of the registered path.
+        let unregistered = tempfile::tempdir().unwrap();
+        let targets = [
+            unregistered.path().display().to_string(),
+            unregistered
+                .path()
+                .join("does-not-exist")
+                .display()
+                .to_string(),
+            format!("{}-sibling", registered.path().display()),
+        ];
+        for target in &targets {
+            let error = svc.merge_add(target).await.unwrap_err();
+            assert_uniform_miss(&error, target);
+        }
+        // The same refusals hold when the calls race (no ambient/focus state is consulted).
+        let (a, b, c) = tokio::join!(
+            svc.merge_add(&targets[0]),
+            svc.merge_add(&targets[1]),
+            svc.merge_add(&targets[2])
+        );
+        for (result, target) in [a, b, c].into_iter().zip(&targets) {
+            assert_uniform_miss(&result.unwrap_err(), target);
+        }
+        assert!(
+            svc.db
+                .lock()
+                .unwrap()
+                .list_merge_queue()
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[tokio::test]
     async fn issue_repo_context_rejects_empty_and_relative_before_anything_else() {
         let (svc, _rx) = service(0);
         for bad in ["", ".", "foo"] {
