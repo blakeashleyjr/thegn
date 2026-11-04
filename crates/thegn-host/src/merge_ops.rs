@@ -303,6 +303,23 @@ impl std::fmt::Display for LandRefusal {
 
 impl std::error::Error for LandRefusal {}
 
+impl LandRefusal {
+    pub(crate) fn outcome(&self) -> &'static str {
+        match self {
+            Self::NotQueued => "not_queued",
+            Self::NotOnBranch => "not_on_branch",
+            Self::BranchUnreadable { .. } => "branch_unreadable",
+            Self::NotReady { .. } => "not_ready",
+            Self::NoResult => "no_result",
+            Self::BranchMismatch { .. } => "branch_mismatch",
+            Self::NoCandidate => "no_candidate",
+            Self::CandidateMoved { .. } => "candidate_moved",
+            Self::Remote => "remote",
+            Self::Claimed => "claimed",
+        }
+    }
+}
+
 /// Pure policy check shared by the CLI and panel land paths.
 pub(crate) fn ready_land_check(
     row: Option<&MergeQueueRow>,
@@ -366,6 +383,18 @@ pub(crate) struct ReadyLandRecord<'a> {
     pub(crate) up_to_date: bool,
 }
 
+fn note_land_refusal(db: &Db, worktree: &str, outcome: &str) {
+    if let Err(error) = db.record_merge_refusal(worktree, "land", outcome) {
+        tracing::warn!(
+            target: "thegn::merge",
+            %error,
+            worktree,
+            outcome,
+            "could not record the refused land in the merge-queue audit trail"
+        );
+    }
+}
+
 /// Verify that a worktree's local queue row is ready for queue-aware landing.
 pub(crate) fn ready_land_precheck(db: &Db, worktree: &str) -> Result<ReadyLandAdmission> {
     let canonical = canonical_worktree(Path::new(worktree));
@@ -377,11 +406,23 @@ pub(crate) fn ready_land_precheck(db: &Db, worktree: &str) -> Result<ReadyLandAd
     let claim = db.observe_merge_claim(&canonical_s)?;
     let branch = match branch_of(&canonical) {
         Ok(Some(branch)) => branch,
-        Ok(None) => return Err(anyhow::Error::new(LandRefusal::NotOnBranch)),
-        Err(reason) => return Err(anyhow::Error::new(LandRefusal::BranchUnreadable { reason })),
+        Ok(None) => {
+            let refusal = LandRefusal::NotOnBranch;
+            if row.is_some() {
+                note_land_refusal(db, &canonical_s, refusal.outcome());
+            }
+            return Err(anyhow::Error::new(refusal));
+        }
+        Err(reason) => {
+            let refusal = LandRefusal::BranchUnreadable { reason };
+            if row.is_some() {
+                note_land_refusal(db, &canonical_s, refusal.outcome());
+            }
+            return Err(anyhow::Error::new(refusal));
+        }
     };
     let candidate = db.merge_candidate(&canonical_s)?;
-    let live_tip = candidate
+    let live_tip = match candidate
         .as_ref()
         .map(|candidate| {
             CliGit
@@ -392,16 +433,37 @@ pub(crate) fn ready_land_precheck(db: &Db, worktree: &str) -> Result<ReadyLandAd
                     })
                 })
         })
-        .transpose()?;
-    ready_land_check(
+        .transpose()
+    {
+        Ok(live_tip) => live_tip,
+        Err(error) => {
+            if let Some(refusal) = error.downcast_ref::<LandRefusal>()
+                && row.is_some()
+            {
+                note_land_refusal(db, &canonical_s, refusal.outcome());
+            }
+            return Err(error);
+        }
+    };
+    if let Err(refusal) = ready_land_check(
         row.as_ref(),
         claim.as_ref(),
         &branch,
         candidate.as_ref(),
         live_tip.as_deref(),
-    )
-    .map_err(anyhow::Error::from)?;
-    let candidate = candidate.ok_or_else(|| anyhow::Error::new(LandRefusal::NoCandidate))?;
+    ) {
+        if row.is_some() {
+            note_land_refusal(db, &canonical_s, refusal.outcome());
+        }
+        return Err(anyhow::Error::from(refusal));
+    }
+    let Some(candidate) = candidate else {
+        let refusal = LandRefusal::NoCandidate;
+        if row.is_some() {
+            note_land_refusal(db, &canonical_s, refusal.outcome());
+        }
+        return Err(anyhow::Error::new(refusal));
+    };
     let observed = db.observe_merge_outcome(&canonical_s)?;
     Ok(ReadyLandAdmission {
         worktree: canonical_s,
@@ -434,12 +496,15 @@ pub(crate) fn record_ready_land(
     match db.persist_merge_outcome(&admission.observed, &outcome)? {
         MergeOutcomeWrite::Written => Ok(()),
         MergeOutcomeWrite::RegistryChanged => {
+            note_land_refusal(db, &admission.worktree, "registry_changed");
             anyhow::bail!("worktree registry changed during the land; queue row not updated")
         }
         MergeOutcomeWrite::QueueChanged => {
+            note_land_refusal(db, &admission.worktree, "queue_changed");
             anyhow::bail!("merge queue row changed during the land; queue row not updated")
         }
         MergeOutcomeWrite::Claimed => {
+            note_land_refusal(db, &admission.worktree, "claimed");
             anyhow::bail!("merge row was claimed by a drain during the land; queue row not updated")
         }
     }
@@ -1253,6 +1318,133 @@ mod tests {
             .find(|row| row.worktree == worktree_s)
             .unwrap();
         assert_ne!(row.status, "landed");
+    }
+
+    #[test]
+    fn land_refusal_outcomes_are_distinct() {
+        let refusals = [
+            LandRefusal::NotQueued,
+            LandRefusal::NotOnBranch,
+            LandRefusal::BranchUnreadable {
+                reason: "unreadable".into(),
+            },
+            LandRefusal::NotReady {
+                status: "queued".into(),
+            },
+            LandRefusal::NoResult,
+            LandRefusal::BranchMismatch {
+                queued: "queued".into(),
+                checked_out: "checked-out".into(),
+            },
+            LandRefusal::NoCandidate,
+            LandRefusal::CandidateMoved {
+                recorded: "recorded".into(),
+                current: "current".into(),
+            },
+            LandRefusal::Remote,
+            LandRefusal::Claimed,
+        ];
+        let outcomes = refusals
+            .iter()
+            .map(LandRefusal::outcome)
+            .collect::<Vec<_>>();
+        assert!(outcomes.iter().all(|outcome| !outcome.is_empty()));
+        assert_eq!(
+            outcomes
+                .iter()
+                .copied()
+                .collect::<std::collections::HashSet<_>>()
+                .len(),
+            10
+        );
+    }
+
+    #[test]
+    fn land_refusal_of_a_queued_row_is_recorded() {
+        let (_temp, _repo, worktree, db, _cfg) = local_candidate_fixture();
+        let worktree_s = std::fs::canonicalize(&worktree)
+            .unwrap()
+            .to_string_lossy()
+            .into_owned();
+        enqueue_bound_local(&db, &worktree_s, "feat", "main").unwrap();
+
+        let error = ready_land_precheck(&db, &worktree_s).unwrap_err();
+        assert!(matches!(
+            error.downcast_ref::<LandRefusal>(),
+            Some(LandRefusal::NotReady { status }) if status == "queued"
+        ));
+        let events = db.merge_queue_events(&worktree_s, 10).unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].operation, "land");
+        assert_eq!(events[0].outcome, "not_ready");
+        assert_eq!(events[0].old_status, "queued");
+        assert_eq!(db.list_merge_queue().unwrap()[0].status, "queued");
+    }
+
+    #[test]
+    fn land_refusal_without_a_row_records_nothing() {
+        let (_temp, _repo, worktree, db, _cfg) = local_candidate_fixture();
+        let worktree_s = std::fs::canonicalize(&worktree)
+            .unwrap()
+            .to_string_lossy()
+            .into_owned();
+
+        let error = ready_land_precheck(&db, &worktree_s).unwrap_err();
+        assert!(matches!(
+            error.downcast_ref::<LandRefusal>(),
+            Some(LandRefusal::NotQueued)
+        ));
+        assert!(db.merge_queue_events(&worktree_s, 10).unwrap().is_empty());
+    }
+
+    #[test]
+    fn record_ready_land_refusal_is_recorded() {
+        let (_temp, repo, worktree, db, _cfg) = local_candidate_fixture();
+        let worktree_s = std::fs::canonicalize(&worktree)
+            .unwrap()
+            .to_string_lossy()
+            .into_owned();
+        let repo_canonical = repo.canonicalize().unwrap();
+        let repo_canonical_s = repo_canonical.to_string_lossy().into_owned();
+        db.put_worktree("feat", &repo_canonical_s, &worktree_s, "feat", None, None)
+            .unwrap();
+        enqueue_bound_local(&db, &worktree_s, "feat", "main").unwrap();
+        db.update_merge_status(&worktree_s, "ready", Some("fold-oid"), None, None)
+            .unwrap();
+        let admission = ready_land_precheck(&db, &worktree_s).unwrap();
+        assert!(
+            db.admit_merge_claim(&MergeClaimRequest {
+                worktree: worktree_s.clone(),
+                branch: "feat".into(),
+                repo_root: repo_canonical_s,
+                target_branch: "main".into(),
+                location: String::new(),
+                expected_status: "ready".into(),
+                lease_until_ms: util::now_ms() + 60_000,
+                owner_hint: Some("test-drain".into()),
+            })
+            .unwrap()
+            .is_some()
+        );
+
+        let error = record_ready_land(
+            &db,
+            &admission,
+            &ReadyLandRecord {
+                branch: "feat",
+                repo_root: &repo_canonical,
+                target_branch: "main",
+                result_oid: &"a".repeat(40),
+                up_to_date: false,
+            },
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("claimed by a drain"));
+        let events = db.merge_queue_events(&worktree_s, 10).unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].operation, "land");
+        assert_eq!(events[0].outcome, "claimed");
+        assert_ne!(db.list_merge_queue().unwrap()[0].status, "landed");
     }
 
     #[test]
