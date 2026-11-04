@@ -5942,6 +5942,134 @@ mod tests {
         assert_eq!(row.status, AgentDispatchStatus::Queued);
     }
 
+    fn dispatch_put_http_state(svc: Arc<DaemonService>) -> thegn_svc::control::http::ControlState {
+        thegn_svc::control::http::ControlState {
+            api: svc.clone(),
+            store: svc.db.clone() as Arc<Mutex<dyn ControlStore + Send>>,
+            local_admin: true,
+            daemon_euid: thegn_svc::ipc::effective_uid(),
+            require_approval: false,
+            server_label: "test thegn".into(),
+            cors_origins: Vec::new(),
+            event_streams: Default::default(),
+        }
+    }
+
+    #[tokio::test]
+    async fn dispatch_put_http_route_canonicalizes_every_alias_spelling() {
+        let (svc, _rx) = service(0);
+        let svc = Arc::new(svc);
+        let (_dir, wt) = git_worktree();
+        std::fs::create_dir_all(wt.join("sub")).unwrap();
+
+        let issue_spellings = ["linear:THE-74", " LINEAR:THE-74"];
+        let worktree_spellings = [
+            wt.to_string_lossy().into_owned(),
+            wt.join("sub").join("..").to_string_lossy().into_owned(),
+            wt.join(".").to_string_lossy().into_owned(),
+        ];
+        for issue_id in issue_spellings {
+            for worktree_path in &worktree_spellings {
+                let (status, body) = thegn_svc::control::http::dispatch_local(
+                    dispatch_put_http_state(svc.clone()),
+                    "dispatches.put",
+                    "POST",
+                    "/v1/dispatches",
+                    Some(serde_json::json!({
+                        "issue_id": issue_id,
+                        "worktree_path": worktree_path,
+                        "agent_name": "claude"
+                    })),
+                )
+                .await;
+
+                assert_eq!(status, axum::http::StatusCode::OK, "{body}");
+                assert_eq!(body["issue_id"], "linear:THE-74");
+                let canonical_worktree = wt.to_string_lossy();
+                assert_eq!(body["worktree_path"].as_str(), Some(&*canonical_worktree));
+            }
+        }
+
+        let rows = svc
+            .dispatches_list(None, Db::ROSTER_HISTORY_LIMIT)
+            .await
+            .unwrap()
+            .dispatches;
+        assert_eq!(rows.len(), 6);
+        assert!(rows.iter().all(|row| {
+            row.issue_id == "linear:THE-74" && row.worktree_path == wt.to_string_lossy()
+        }));
+    }
+
+    #[tokio::test]
+    async fn dispatch_put_http_route_refuses_unusable_identities_with_a_typed_400_and_no_row() {
+        let (svc, _rx) = service(0);
+        let svc = Arc::new(svc);
+        let (_dir, wt) = git_worktree();
+        std::fs::create_dir_all(wt.join("sub")).unwrap();
+
+        for path in [
+            wt.join("missing"),
+            wt.join("sub"),
+            std::path::PathBuf::from("/wt/a"),
+        ] {
+            let path_text = path.to_string_lossy().into_owned();
+            let (status, body) = thegn_svc::control::http::dispatch_local(
+                dispatch_put_http_state(svc.clone()),
+                "dispatches.put",
+                "POST",
+                "/v1/dispatches",
+                Some(serde_json::json!({
+                    "issue_id": "linear:A-1",
+                    "worktree_path": path_text,
+                    "agent_name": "claude"
+                })),
+            )
+            .await;
+
+            assert_eq!(status, axum::http::StatusCode::BAD_REQUEST, "{body}");
+            assert_eq!(body["code"], "bad_request");
+            assert!(body["error"].as_str().unwrap().contains(&path_text));
+        }
+
+        let (status, body) = thegn_svc::control::http::dispatch_local(
+            dispatch_put_http_state(svc.clone()),
+            "dispatches.put",
+            "POST",
+            "/v1/dispatches",
+            Some(serde_json::json!({
+                "issue_id": "two words",
+                "worktree_path": wt.to_string_lossy(),
+                "agent_name": "claude"
+            })),
+        )
+        .await;
+        assert_eq!(status, axum::http::StatusCode::BAD_REQUEST, "{body}");
+        assert_eq!(body["code"], "bad_request");
+
+        let (status, _) = thegn_svc::control::http::dispatch_local(
+            dispatch_put_http_state(svc.clone()),
+            "dispatches.list",
+            "POST",
+            "/v1/dispatches",
+            Some(serde_json::json!({
+                "issue_id": "linear:A-1",
+                "worktree_path": wt.to_string_lossy(),
+                "agent_name": "claude"
+            })),
+        )
+        .await;
+        assert_ne!(status, axum::http::StatusCode::OK);
+
+        assert!(
+            svc.dispatches_list(None, Db::ROSTER_HISTORY_LIMIT)
+                .await
+                .unwrap()
+                .dispatches
+                .is_empty()
+        );
+    }
+
     #[test]
     fn dispatch_status_error_maps_checked_transition_conflicts() {
         use thegn_core::db::DispatchTransitionConflict;
