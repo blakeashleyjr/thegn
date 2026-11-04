@@ -275,6 +275,17 @@ self: {
     clipboard.max_image_bytes = cfg.clipboardMaxImageBytes;
     clipboard.remote_dir = cfg.clipboardRemoteDir;
     clipboard.keep_hours = cfg.clipboardKeepHours;
+    loc.enabled = cfg.locEnabled;
+    loc.scan_interval_secs = cfg.locScanIntervalSecs;
+    loc.max_scan_per_round = cfg.locMaxScanPerRound;
+    loc.watch_invalidate_secs = cfg.locWatchInvalidateSecs;
+    replay.enabled = cfg.replayEnabled;
+    replay.max_bytes_per_pane = cfg.replayMaxBytesPerPane;
+    replay.max_duration_secs = cfg.replayMaxDurationSecs;
+    replay.keyframe_interval_ms = cfg.replayKeyframeIntervalMs;
+    replay.keyframe_interval_bytes = cfg.replayKeyframeIntervalBytes;
+    replay.idle_threshold_ms = cfg.replayIdleThresholdMs;
+    replay.persist = cfg.replayPersist;
     monitor = {
       system = cfg.monitorSystem;
       gpu = cfg.monitorGpu;
@@ -691,6 +702,72 @@ in {
       type = lib.types.nullOr (lib.types.ints.unsigned);
       default = null;
       description = "Age in hours past which a pasted-image drop file is swept on the next paste. Unset (null) = the binary's default.";
+    };
+
+    locEnabled = lib.mkOption {
+      type = lib.types.nullOr (lib.types.bool);
+      default = null;
+      description = "Count lines of code at all; false hides the LOC chip, its detail table and the Files-footer count and runs no tokei walk. Unset (null) = the binary's default.";
+    };
+
+    locScanIntervalSecs = lib.mkOption {
+      type = lib.types.nullOr (lib.types.ints.between 0 2678400);
+      default = null;
+      description = "Per-worktree re-count TTL in seconds; 0 counts every pump. Unset (null) = the binary's default.";
+    };
+
+    locMaxScanPerRound = lib.mkOption {
+      type = lib.types.nullOr (lib.types.ints.u32);
+      default = null;
+      description = "Worktrees counted per background round; 0 = unlimited. Unset (null) = the binary's default.";
+    };
+
+    locWatchInvalidateSecs = lib.mkOption {
+      type = lib.types.nullOr (lib.types.ints.between 0 315360000);
+      default = null;
+      description = "Shortest gap in seconds between content-driven recounts of the active worktree; 0 disables them. Unset (null) = the binary's default.";
+    };
+
+    replayEnabled = lib.mkOption {
+      type = lib.types.nullOr (lib.types.bool);
+      default = null;
+      description = "Master switch for the per-pane replay ring; off allocates no ring. Unset (null) = the binary's default.";
+    };
+
+    replayMaxBytesPerPane = lib.mkOption {
+      type = lib.types.nullOr (lib.types.ints.unsigned);
+      default = null;
+      description = "Per-pane byte budget for the replay ring; oldest events are evicted past it. Unset (null) = the binary's default.";
+    };
+
+    replayMaxDurationSecs = lib.mkOption {
+      type = lib.types.nullOr (lib.types.ints.between 0 315360000);
+      default = null;
+      description = "Per-pane duration budget in seconds; older events are evicted. Unset (null) = the binary's default.";
+    };
+
+    replayKeyframeIntervalMs = lib.mkOption {
+      type = lib.types.nullOr (lib.types.ints.between 0 315360000000);
+      default = null;
+      description = "Capture a keyframe marker after this many milliseconds of activity. Unset (null) = the binary's default.";
+    };
+
+    replayKeyframeIntervalBytes = lib.mkOption {
+      type = lib.types.nullOr (lib.types.ints.unsigned);
+      default = null;
+      description = "Capture a keyframe marker after this many bytes, whichever comes first. Unset (null) = the binary's default.";
+    };
+
+    replayIdleThresholdMs = lib.mkOption {
+      type = lib.types.nullOr (lib.types.ints.between 0 315360000000);
+      default = null;
+      description = "During playback a gap larger than this many milliseconds is collapsed to a short constant. Unset (null) = the binary's default.";
+    };
+
+    replayPersist = lib.mkOption {
+      type = lib.types.nullOr (lib.types.bool);
+      default = null;
+      description = "Mirror each pane's replay ring to disk so scrubbing reaches into the previous run after a restart (the one replay feature with real disk cost). Unset (null) = the binary's default.";
     };
 
     monitorSystem = lib.mkOption {
