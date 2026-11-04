@@ -72,6 +72,9 @@ re-mark). Without a mark, `i` plans from the selected commit.
 Interactive rebase plans, reword, amend, retag and move hold the repository
 mutation lock for the whole operation, so another thegn git action on that
 repository waits or is refused while the rewrite is in progress.
+A rebase, move, retag, reword or amend whose oldest commit is the shallow-clone
+boundary is refused with a hint to fetch more history first; it is not rewritten
+as a root.
 
 ### branches
 
@@ -118,6 +121,11 @@ in bat, `O` opens your editor, `y` reveals it in yazi. An unknown binary
 previews as a hex dump of its first 4096 bytes.
 The local files list uses NUL-separated Git output, so names containing
 newlines or quotes remain intact as individual paths.
+PDF previews show the first page on a graphics-capable terminal, or extracted
+text otherwise. When `bwrap` is usable, PDF renderers run without network access
+in a read-only system view; home, `/tmp`, `/var/tmp` and `/run/user` are hidden,
+and only private scratch is writable. Without it, rendering is unsandboxed.
+Mermaid rendering is not sandboxed.
 
 Inside the git-family sections (changes/commits/branches/stash — not
 files), `?` shows that section's own key cheatsheet only after entering row
