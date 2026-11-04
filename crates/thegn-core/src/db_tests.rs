@@ -3124,6 +3124,37 @@ fn issue_link_ref_records_the_account_and_legacy_links_stay_unbound() {
 }
 
 #[test]
+fn issue_link_ref_rejects_corrupt_or_incomplete_stored_account() {
+    use crate::issue::IssueRef;
+
+    let db = db();
+    let issue_ref = IssueRef::new("linear", "work", "linear:A-1").unwrap();
+    db.link_issue_ref("/wt/invalid", &issue_ref).unwrap();
+    db.conn()
+        .execute(
+            "UPDATE issue_links SET account='' WHERE worktree_path='/wt/invalid'",
+            [],
+        )
+        .unwrap();
+    assert!(db.linked_issue_refs("/wt/invalid").is_err());
+
+    db.link_issue_ref("/wt/half", &issue_ref).unwrap();
+    db.conn()
+        .execute(
+            "UPDATE issue_links SET account=NULL WHERE worktree_path='/wt/half'",
+            [],
+        )
+        .unwrap();
+    assert!(db.linked_issue_refs("/wt/half").is_err());
+
+    db.link_issue("/wt/legacy", "linear:A-1").unwrap();
+    assert_eq!(
+        db.linked_issue_refs("/wt/legacy").unwrap(),
+        vec![("linear:A-1".to_string(), None)]
+    );
+}
+
+#[test]
 fn notifications_put_and_read_and_mark_read() {
     let db = db();
     // No notifications initially.
