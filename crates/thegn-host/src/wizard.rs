@@ -1230,12 +1230,24 @@ pub fn run_worker(
 
     // --- preflight: taken names + base, then the collision-free suggestion.
     step(CreateStep::ResolveBase, StepState::Running, None);
-    let taken = worktree::BranchSet::load(root);
+    let taken = match worktree::BranchSet::load_checked(root) {
+        Ok(taken) => taken,
+        Err(error) => {
+            fail(CreateStep::ResolveBase, error);
+            return;
+        }
+    };
     // Fork (item 52) branches from the chosen source ref; otherwise the
     // configured/auto-resolved base.
     let base = match ctx.base_override.as_deref() {
         Some(b) if !b.is_empty() => b.to_string(),
-        _ => worktree::resolve_base(root, cfg),
+        _ => match worktree::resolve_base_checked(root, cfg) {
+            Ok(base) => base,
+            Err(error) => {
+                fail(CreateStep::ResolveBase, error);
+                return;
+            }
+        },
     };
     if let Err(error) = verify_base(root, &base) {
         fail(CreateStep::ResolveBase, error);
@@ -2320,6 +2332,42 @@ mod tests {
         assert!(verify_base(&repo, "HEAD^{tree}").is_err());
         assert!(verify_base(&repo, "--help").is_err());
         std::fs::remove_dir_all(&repo).unwrap();
+    }
+
+    #[test]
+    fn worker_refuses_an_unreadable_branch_inventory_at_resolve_base() {
+        let not_a_repo = tempfile::tempdir_in("/tmp").unwrap();
+        let state = tempfile::tempdir_in("/tmp").unwrap();
+        let db = state.path().join("thegn.db");
+        let events = drive_worker_with_name(
+            test_cfg(),
+            not_a_repo.path(),
+            "tg/x",
+            false,
+            Some("main".into()),
+            vec![],
+            &db,
+        );
+
+        let error = events.iter().find_map(|event| match event {
+            CreateEvent::Failed {
+                step: CreateStep::ResolveBase,
+                error,
+                ..
+            } => Some(error),
+            _ => None,
+        });
+        assert!(error.is_some_and(|error| error.contains("could not list branches in")));
+        assert!(
+            !events
+                .iter()
+                .any(|event| matches!(event, CreateEvent::Preflight { .. }))
+        );
+        assert!(
+            !events
+                .iter()
+                .any(|event| matches!(event, CreateEvent::Done { .. }))
+        );
     }
 
     #[test]
