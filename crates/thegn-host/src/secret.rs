@@ -1524,6 +1524,7 @@ fn index_read_held(private: &thegn_core::fsperm::PrivateDir) -> Result<Vec<Strin
     index_load_held(private).map(|index| index.names)
 }
 
+#[cfg(test)]
 fn index_write_held(
     private: &thegn_core::fsperm::PrivateDir,
     names: &[String],
