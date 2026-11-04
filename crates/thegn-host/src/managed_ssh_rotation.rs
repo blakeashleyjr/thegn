@@ -953,6 +953,7 @@ fn awk_key_match(key_id: &(String, String), program: &str) -> String {
     )
 }
 
+/// Authorize a public key and verify the published `authorized_keys` post-state.
 pub(crate) fn authorize_script(public_key: &str, key_id: &(String, String)) -> Result<String> {
     let matcher = awk_key_match(
         key_id,
@@ -964,18 +965,25 @@ pub(crate) fn authorize_script(public_key: &str, key_id: &(String, String)) -> R
          mkdir -p \"$HOME/.ssh\"\n\
          chmod 700 \"$HOME/.ssh\"\n\
          f=\"$HOME/.ssh/authorized_keys\"\n\
-         if [ -L \"$f\" ] || {{ [ -e \"$f\" ] && [ ! -f \"$f\" ]; }}; then printf '%s\\n' 'TG-AUTHKEYS-ERROR:authorized_keys is not a regular file' >&2; exit 1; fi\n\
+         if [ -L \"$f\" ]; then printf '%s\\n' 'TG-AUTHKEYS-ERROR:authorized_keys is not a regular file' >&2; exit 1; fi\n\
+         if [ -e \"$f\" ] && [ ! -f \"$f\" ]; then printf '%s\\n' 'TG-AUTHKEYS-ERROR:authorized_keys is not a regular file' >&2; exit 1; fi\n\
          if [ ! -e \"$f\" ] && [ ! -L \"$f\" ]; then (umask 077; : > \"$f\"); fi\n\
-         if [ -L \"$f\" ] || [ ! -f \"$f\" ]; then printf '%s\\n' 'TG-AUTHKEYS-ERROR:authorized_keys is not a regular file' >&2; exit 1; fi\n\
+         if [ -L \"$f\" ]; then printf '%s\\n' 'TG-AUTHKEYS-ERROR:authorized_keys is not a regular file' >&2; exit 1; fi\n\
+         if [ ! -f \"$f\" ]; then printf '%s\\n' 'TG-AUTHKEYS-ERROR:authorized_keys is not a regular file' >&2; exit 1; fi\n\
          cat \"$f\" > /dev/null\n\
          chmod 600 \"$f\"\n\
+         before=$(awk 'END {{ print NR }}' \"$f\")\n\
          if {matcher} \"$f\"; then\n\
              :\n\
          else\n\
              status=$?\n\
              if [ \"$status\" -ne 1 ]; then exit \"$status\"; fi\n\
+             if [ -s \"$f\" ] && [ -n \"$(tail -c 1 \"$f\")\" ]; then printf '\\n' >> \"$f\"; fi\n\
              printf '%s\\n' {key} >> \"$f\"\n\
-         fi"
+             after=$(awk 'END {{ print NR }}' \"$f\")\n\
+             if [ \"$after\" -ne $((before + 1)) ]; then printf 'TG-AUTHKEYS-ERROR:line count mismatch before=%s after=%s\\n' \"$before\" \"$after\" >&2; exit 1; fi\n\
+         fi\n\
+         if {matcher} \"$f\"; then :; else status=$?; if [ \"$status\" -ne 1 ]; then exit \"$status\"; fi; printf '%s\\n' 'TG-AUTHKEYS-ERROR:key missing after authorization' >&2; exit 1; fi"
     ))
 }
 
@@ -995,6 +1003,7 @@ pub(crate) fn authorized_probe_script(key_id: &(String, String)) -> String {
     )
 }
 
+/// Deauthorize a key and verify the published `authorized_keys` post-state.
 fn deauthorize_script(key_id: &(String, String)) -> Result<String> {
     let filter = awk_key_match(key_id, "{ if (!key_matches()) print $0 }");
     let count_matches = awk_key_match(key_id, "{ if (key_matches()) n++ } END { print n + 0 }");
@@ -1022,6 +1031,9 @@ fn deauthorize_script(key_id: &(String, String)) -> Result<String> {
          if [ \"$removed\" -eq 0 ]; then exit 0; fi\n\
          chmod 600 \"$t\"\n\
          mv -f \"$t\" \"$f\"\n\
+         published=$(awk 'END {{ print NR }}' \"$f\")\n\
+         if [ \"$published\" -ne \"$kept\" ]; then printf 'TG-AUTHKEYS-ERROR:published line count mismatch kept=%s published=%s\\n' \"$kept\" \"$published\" >&2; exit 1; fi\n\
+         if {probe} \"$f\"; then printf '%s\\n' 'TG-AUTHKEYS-ERROR:target key remains after publication' >&2; exit 1; else status=$?; if [ \"$status\" -ne 1 ]; then exit \"$status\"; fi; fi\n\
          trap - EXIT"
     ))
 }
@@ -1668,6 +1680,76 @@ mod tests {
         assert!(restore.is_some_and(|result| result.status.success()));
         assert!(!output.status.success());
         assert_eq!(std::fs::read_to_string(path).unwrap(), contents);
+    }
+
+    #[test]
+    fn authorize_repairs_a_missing_trailing_newline_before_appending() {
+        let temp = tempfile::tempdir().unwrap();
+        let ssh = temp.path().join(".ssh");
+        std::fs::create_dir(&ssh).unwrap();
+        let path = ssh.join("authorized_keys");
+        std::fs::write(&path, "ssh-ed25519 AAAAOTHER unrelated").unwrap();
+        let public = "ssh-ed25519 AAAATARGET new-comment";
+        let id = key_id(public).unwrap();
+        let script = authorize_script(public, &id).unwrap();
+        let Some(output) = run_local_sh(temp.path(), &script) else {
+            return;
+        };
+        assert!(output.status.success());
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            "ssh-ed25519 AAAAOTHER unrelated\nssh-ed25519 AAAATARGET new-comment\n"
+        );
+        let probe = authorized_probe_script(&id);
+        let Some(probe_output) = run_local_sh(temp.path(), &probe) else {
+            return;
+        };
+        assert!(probe_output.status.success());
+    }
+
+    #[test]
+    fn authorize_fails_when_the_append_did_not_publish_the_key() {
+        let temp = tempfile::tempdir().unwrap();
+        let ssh = temp.path().join(".ssh");
+        std::fs::create_dir(&ssh).unwrap();
+        let path = ssh.join("authorized_keys");
+        let contents = "ssh-ed25519 AAAAOTHER unrelated\n";
+        std::fs::write(&path, contents).unwrap();
+        let public = "ssh-ed25519 AAAATARGET new-comment";
+        let script = authorize_script(public, &key_id(public).unwrap()).unwrap();
+        let script = format!("printf() {{ return 0; }}\n{script}");
+        let Some(output) = run_local_sh(temp.path(), &script) else {
+            return;
+        };
+        assert!(!output.status.success());
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), contents);
+    }
+
+    #[test]
+    fn deauthorize_fails_when_the_publish_did_not_remove_the_key() {
+        let temp = tempfile::tempdir().unwrap();
+        let ssh = temp.path().join(".ssh");
+        std::fs::create_dir(&ssh).unwrap();
+        let path = ssh.join("authorized_keys");
+        let contents = "ssh-ed25519 AAAAOTHER unrelated\nssh-ed25519 AAAATARGET old\n";
+        std::fs::write(&path, contents).unwrap();
+        let id = key_id("ssh-ed25519 AAAATARGET x").unwrap();
+        let script = deauthorize_script(&id).unwrap();
+        let script = format!("mv() {{ return 0; }}\n{script}");
+        let Some(output) = run_local_sh(temp.path(), &script) else {
+            return;
+        };
+        assert!(!output.status.success());
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), contents);
+        let entries = std::fs::read_dir(&ssh)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect::<Vec<_>>();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(
+            entries[0].as_os_str(),
+            std::ffi::OsStr::new("authorized_keys")
+        );
     }
 
     #[test]
