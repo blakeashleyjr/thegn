@@ -547,6 +547,13 @@ voice.command
 voice.enabled
 voice.kind
 voice.max_seconds
+voice.language
+voice.model
+voice.model_path
+voice.endpoint
+voice.credential
+voice.live_preview
+voice.timeout_seconds
 window_margin
 worktree_templates.agent
 worktree_templates.base

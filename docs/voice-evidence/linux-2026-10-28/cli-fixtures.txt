@@ -1,0 +1,3 @@
+CLI setup/status/model list/rm: passed; HTTP final-only and local embedded/command setup verified
+Atomic config preservation: passed; invalid language/missing local model leave prior config unchanged
+All CLI fixtures used isolated XDG paths; no physical microphone or personal voice config changed
