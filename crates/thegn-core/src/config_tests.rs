@@ -3350,6 +3350,38 @@ fn clamp_to_channel_neutralises_experimental_in_stable() {
 }
 
 #[test]
+fn clamp_to_channel_strips_plugin_app_tabs_in_stable() {
+    use crate::channel::{Channel, Feature};
+
+    let mut cfg = Config {
+        apps: crate::config::AppsConfig {
+            default_tab: "plugin:todoist:workspace".into(),
+            tab_order: vec!["work".into(), " plugin:todoist:workspace ".into()],
+        },
+        ..Config::default()
+    };
+
+    assert_eq!(
+        cfg.clamp_to_channel(Channel::Stable),
+        vec![Feature::PluginApps]
+    );
+    assert_eq!(cfg.apps.default_tab, "work");
+    assert_eq!(cfg.apps.tab_order, ["work"]);
+
+    let mut dev_cfg = Config {
+        apps: crate::config::AppsConfig {
+            default_tab: "plugin:todoist:workspace".into(),
+            tab_order: vec!["work".into(), "plugin:todoist:workspace".into()],
+        },
+        ..Config::default()
+    };
+    let before = dev_cfg.clone();
+    assert!(dev_cfg.clamp_to_channel(Channel::Dev).is_empty());
+    assert_eq!(dev_cfg.apps.default_tab, before.apps.default_tab);
+    assert_eq!(dev_cfg.apps.tab_order, before.apps.tab_order);
+}
+
+#[test]
 fn clamp_to_channel_drops_ssh_and_provider_envs_in_stable() {
     use crate::channel::{Channel, Feature};
     use crate::config::{EnvConfig, PlacementMode};
@@ -4261,4 +4293,30 @@ fn stats_net_icons_default_empty_and_parse() {
     assert_eq!(cfg.stats.net_icons.ethernet, "ETH");
     assert!(cfg.stats.net_icons.wifi.is_empty());
     assert!(cfg.stats.net_icons.generic.is_empty());
+}
+
+mod apps_tests {
+    use crate::config::AppsConfig;
+
+    #[test]
+    fn plugin_tab_ids_require_three_valid_namespaced_parts() {
+        for id in ["plugin:a:b", "plugin:plugin.name_1:contribution-x"] {
+            assert!(
+                AppsConfig::is_plugin_tab_id(id),
+                "expected {id:?} to be valid"
+            );
+        }
+        for id in [
+            "plugin:a",
+            "plugin::b",
+            "plugin:a:b/c",
+            "plugin:a:b:c",
+            "Plugin:a:b",
+        ] {
+            assert!(
+                !AppsConfig::is_plugin_tab_id(id),
+                "expected {id:?} to be rejected"
+            );
+        }
+    }
 }
