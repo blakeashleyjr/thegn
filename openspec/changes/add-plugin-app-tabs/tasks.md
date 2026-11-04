@@ -18,9 +18,9 @@
 
 ## 3. thegn-plugin-ui crate + tg-kit
 
-- [ ] 3.1 Crate + workspace.
-- [ ] 3.2 tg-kit `AppTile::id -> &str` and `command`.
-- [ ] 3.3 F2 recovery as a public method.
+- [x] 3.1 Crate + workspace — `crates/thegn-plugin-ui/src/lib.rs` defines `UiEngine`.
+- [x] 3.2 tg-kit `AppTile::id -> &str` and `command` — `crates/tg-kit/src/tile.rs::tests::command_defaults_to_unhandled`.
+- [x] 3.3 F2 recovery as a public method — `crates/thegn-plugin-ui/src/tests.rs::f2_is_not_interpreted_by_the_engine`.
 
 ## 4. Transport on main's runtime
 

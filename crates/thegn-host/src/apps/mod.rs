@@ -874,7 +874,7 @@ mod tests {
     struct VisTile(std::sync::Arc<std::sync::Mutex<Vec<bool>>>);
 
     impl AppTile for VisTile {
-        fn id(&self) -> &'static str {
+        fn id(&self) -> &str {
             "observe"
         }
         fn title(&self) -> String {
@@ -901,7 +901,7 @@ mod tests {
     }
 
     impl AppTile for LifecycleTile {
-        fn id(&self) -> &'static str {
+        fn id(&self) -> &str {
             "observe"
         }
         fn title(&self) -> String {
@@ -1083,7 +1083,7 @@ mod tests {
     }
 
     impl AppTile for ThemeTile {
-        fn id(&self) -> &'static str {
+        fn id(&self) -> &str {
             "observe"
         }
         fn title(&self) -> String {
@@ -1267,7 +1267,7 @@ mod tests {
     }
 
     impl AppTile for PasteTile {
-        fn id(&self) -> &'static str {
+        fn id(&self) -> &str {
             "observe"
         }
         fn title(&self) -> String {
@@ -1338,7 +1338,7 @@ mod tests {
     }
 
     impl AppTile for CacheTile {
-        fn id(&self) -> &'static str {
+        fn id(&self) -> &str {
             "observe"
         }
         fn title(&self) -> String {
