@@ -254,7 +254,7 @@ fn create_list_destroy_round_trip_with_ledger() {
     assert!(
         key_create
             .body
-            .contains("thegn-managed-ef034764f5154129dbb127b9c94ec413"),
+            .contains("thegn-managed-2e1ad7181aa2e3d23c0e200ac43abb55"),
         "vendor key name: {}",
         key_create.body
     );

@@ -365,9 +365,15 @@ impl Machine0Provider {
             return Ok(id);
         }
         // Name/fileName by the SHA-256 of the decoded key so distinct keys never collide on
-        // a fixed name (machine0 requires a `fileName` too).
-        let name = thegn_core::managed_ssh::vendor_key_name(self.spec.pubkey.trim())
-            .context("machine0: the managed public key is not a valid OpenSSH key")?;
+        // a fixed name (machine0 requires a `fileName` too). The name is also scoped by
+        // provider and account.
+        let account = thegn_core::managed_ssh::account_label(&self.spec.key_path);
+        let name = thegn_core::managed_ssh::scoped_vendor_key_name(
+            "machine0",
+            &account,
+            self.spec.pubkey.trim(),
+        )
+        .context("machine0: the managed public key is not a valid OpenSSH key")?;
         let created = self
             .call(
                 tool::SSH_KEY_CREATE_PUBLIC,
