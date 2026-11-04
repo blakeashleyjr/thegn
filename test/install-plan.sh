@@ -2,6 +2,8 @@
 set -euo pipefail
 
 repo="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+TG_REAL_PATH="$PATH"
+export TG_REAL_PATH
 tmp="$(mktemp -d)"
 trap 'rm -rf "$tmp"' EXIT
 
@@ -1109,6 +1111,187 @@ if ((freedesktop)); then
   else
     echo "desktop-file-validate not installed; real-tool check skipped"
   fi
+fi
+
+tree_snapshot() {
+  local dir path entry_value
+  for dir in "$@"; do
+    if [[ -e $dir || -L $dir ]]; then
+      find "$dir" ! -type d -print
+    fi
+  done | LC_ALL=C sort | while IFS= read -r path; do
+    if [[ -L $path ]]; then
+      entry_value="symlink:$(readlink "$path")"
+    else
+      entry_value="$(cksum <"$path" | tr ' ' ':')"
+    fi
+    printf '%s\t%s\n' "$path" "$entry_value"
+  done
+}
+
+enospc_bin="$tmp/enospc-bin"
+mkdir -p "$enospc_bin"
+cat >"$enospc_bin/install" <<'EOF'
+#!/usr/bin/env sh
+if [ "${TG_ENOSPC_INSTALL-}" != 1 ]; then
+  PATH="${TG_REAL_PATH:?}"
+  export PATH
+  exec install "$@"
+fi
+for last do :; done
+printf 'partial' >"$last"
+printf "install: error writing '%s': No space left on device\n" "$last" >&2
+exit 1
+EOF
+chmod 0755 "$enospc_bin/install"
+cat >"$enospc_bin/cp" <<'EOF'
+#!/usr/bin/env sh
+for last do :; done
+case "$last" in
+  "${TG_ENOSPC_DIR:?}"/*)
+    printf 'partial' >"$last"
+    printf "cp: error writing '%s': No space left on device\n" "$last" >&2
+    exit 1
+    ;;
+  *)
+    PATH="${TG_REAL_PATH:?}"
+    export PATH
+    exec cp "$@"
+    ;;
+esac
+EOF
+chmod 0755 "$enospc_bin/cp"
+for enospc_cache_tool in update-desktop-database gtk-update-icon-cache; do
+  cat >"$enospc_bin/$enospc_cache_tool" <<'EOF'
+#!/usr/bin/env sh
+exit 0
+EOF
+  chmod 0755 "$enospc_bin/$enospc_cache_tool"
+done
+
+# enospc-binary: a failed real-tool write during an upgrade leaves the old
+# installation complete and removes staging, backup, and lock artifacts.
+install_uninstall_fixture enospc-binary
+enospc_binary_before="$(tree_snapshot "$case_bin" "$case_config" "$case_data")"
+old_binary="$(<"$case_bin/thegn")"
+printf 'enospc upgrade bytes\n' >"$install_repo/target/release/thegn"
+enospc_binary_status=0
+enospc_binary_out="$(PATH="$enospc_bin:$fakebin:$TG_REAL_PATH" TG_ENOSPC_INSTALL=1 \
+  TG_ENOSPC_DIR="$tmp/enospc-binary-target" \
+  HOME="$case_home" XDG_CONFIG_HOME="$case_config" XDG_DATA_HOME="$case_data" \
+  "$install_repo/install.sh" "$case_bin" 2>&1)" || enospc_binary_status=$?
+[[ $enospc_binary_status -ne 0 && $enospc_binary_out == *"No space left on device"* ]] || {
+  echo "enospc-binary did not fail with the install tool's ENOSPC diagnostic" >&2
+  echo "$enospc_binary_out" >&2
+  exit 1
+}
+[[ $(tree_snapshot "$case_bin" "$case_config" "$case_data") == "$enospc_binary_before" &&
+$(<"$case_bin/thegn") == "$old_binary" ]] || {
+  echo "enospc-binary changed the previous install or left transaction artifacts" >&2
+  exit 1
+}
+
+# enospc-config: fail the config copy after platform artifacts have committed;
+# the install journal must remove every artifact from this clean install.
+if ((freedesktop)); then
+  enospc_config_home="$tmp/enospc-config-home"
+  enospc_config_config="$tmp/enospc-config-config"
+  enospc_config_data="$tmp/enospc-config-data"
+  enospc_config_bin="$tmp/enospc-config-bin"
+  mkdir -p "$enospc_config_home"
+  enospc_config_status=0
+  enospc_config_out="$(PATH="$enospc_bin:$fakebin:$TG_REAL_PATH" \
+    TG_ENOSPC_DIR="$enospc_config_config/thegn" \
+    HOME="$enospc_config_home" XDG_CONFIG_HOME="$enospc_config_config" \
+    XDG_DATA_HOME="$enospc_config_data" "$install_repo/install.sh" "$enospc_config_bin" 2>&1)" ||
+    enospc_config_status=$?
+  [[ $enospc_config_status -ne 0 && $enospc_config_out == *"restored the previous installation"* &&
+    $enospc_config_out == *"No space left on device"* ]] || {
+    echo "enospc-config did not fail and report rollback after the config copy" >&2
+    echo "$enospc_config_out" >&2
+    exit 1
+  }
+  for enospc_root in "$enospc_config_bin" "$enospc_config_config" "$enospc_config_data"; do
+    if [[ -e $enospc_root || -L $enospc_root ]]; then
+      enospc_entries="$(find "$enospc_root" ! -type d -print -quit)"
+      [[ -z $enospc_entries ]] || {
+        echo "enospc-config left an artifact under $enospc_root: $enospc_entries" >&2
+        exit 1
+      }
+    fi
+  done
+fi
+
+# downgrade: replacing a newer build with older bytes preserves the full
+# artifact set, manifest hashes, wrappers, and the user's original config.
+install_uninstall_fixture downgrade
+downgrade_paths_before="$(cut -f2 "$case_manifest" | LC_ALL=C sort)"
+printf 'build 2\n' >"$install_repo/target/release/thegn"
+PATH="$fakebin:$TG_REAL_PATH" HOME="$case_home" XDG_CONFIG_HOME="$case_config" XDG_DATA_HOME="$case_data" \
+  "$install_repo/install.sh" "$case_bin" >"$tmp/downgrade-upgrade.out"
+printf 'build 1\n' >"$install_repo/target/release/thegn"
+PATH="$fakebin:$TG_REAL_PATH" HOME="$case_home" XDG_CONFIG_HOME="$case_config" XDG_DATA_HOME="$case_data" \
+  "$install_repo/install.sh" "$case_bin" >"$tmp/downgrade-install.out"
+downgrade_manifest_hash=""
+while IFS=$'\t' read -r downgrade_hash downgrade_path; do
+  if [[ $downgrade_path == "$case_bin/thegn" ]]; then
+    downgrade_manifest_hash="$downgrade_hash"
+  fi
+done < <(tail -n +2 "$case_manifest")
+[[ $(<"$case_bin/thegn") == "$(printf 'build 1\n')" &&
+$downgrade_manifest_hash == "$(test_sha256 "$case_bin/thegn")" &&
+$(cut -f2 "$case_manifest" | LC_ALL=C sort) == "$downgrade_paths_before" ]] || {
+  echo "downgrade did not publish the older binary with a matching complete manifest" >&2
+  exit 1
+}
+[[ $(<"$case_bin/tg") == *"# generated by thegn install.sh"* &&
+$(<"$case_bin/tg-tui") == *"# generated by thegn install.sh"* ]] || {
+  echo "downgrade changed the installer-owned wrappers" >&2
+  exit 1
+}
+cmp -s -- "$tmp/downgrade-config-original" "$case_config_file" || {
+  echo "downgrade changed the user's config" >&2
+  exit 1
+}
+shopt -s nullglob
+downgrade_leftovers=("$case_bin"/.thegn-install*)
+shopt -u nullglob
+if (("${#downgrade_leftovers[@]}" > 0)); then
+  echo "downgrade left staging or backup files" >&2
+  printf '%s\n' "${downgrade_leftovers[@]}" >&2
+  exit 1
+fi
+
+# uninstall-after-downgrade: uninstall removes the downgraded owned artifacts
+# and manifest while preserving the user's config byte-for-byte.
+uninstall_after_downgrade_status=0
+HOME="$case_home" XDG_CONFIG_HOME="$case_config" XDG_DATA_HOME="$case_data" \
+  "$install_repo/install.sh" --uninstall "$case_bin" >"$tmp/uninstall-after-downgrade.out" 2>&1 ||
+  uninstall_after_downgrade_status=$?
+[[ $uninstall_after_downgrade_status == 0 && ! -e $case_bin/thegn && ! -e $case_bin/tg &&
+  ! -e $case_bin/tg-tui && ! -e $case_manifest ]] || {
+  echo "uninstall-after-downgrade did not remove the installed artifacts and manifest" >&2
+  cat "$tmp/uninstall-after-downgrade.out" >&2
+  exit 1
+}
+if ((freedesktop)); then
+  [[ ! -e $case_data/icons/hicolor/scalable/apps/thegn &&
+    ! -e $case_data/applications/thegn.desktop ]] || {
+    echo "uninstall-after-downgrade left desktop integration artifacts" >&2
+    exit 1
+  }
+fi
+cmp -s -- "$tmp/downgrade-config-original" "$case_config_file" || {
+  echo "uninstall-after-downgrade changed the user's config" >&2
+  exit 1
+}
+shopt -s nullglob
+uninstall_after_downgrade_leftovers=("$case_bin"/.thegn-install*)
+shopt -u nullglob
+if (("${#uninstall_after_downgrade_leftovers[@]}" > 0)); then
+  echo "uninstall-after-downgrade left install transaction entries" >&2
+  printf '%s\n' "${uninstall_after_downgrade_leftovers[@]}" >&2
+  exit 1
 fi
 
 echo "install plan checks passed"
