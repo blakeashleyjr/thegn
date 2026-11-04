@@ -27,7 +27,7 @@ pub type ChangeHook = std::sync::Arc<dyn Fn() + Send + Sync>;
 /// themselves `!Send`. Async work is offloaded via the `ChangeHook` instead.
 pub trait AppTile {
     /// Stable identifier — the tab id and config key.
-    fn id(&self) -> &'static str;
+    fn id(&self) -> &str;
 
     /// The chip label shown in the masthead app strip. May carry a badge
     /// (e.g. an unread count) that the host re-reads after each [`pump`].
@@ -66,6 +66,13 @@ pub trait AppTile {
         None
     }
 
+    /// Run a host-invoked tile command by stable id (for example a keymap
+    /// action the host routes to the focused tile). Returns whether the tile
+    /// handled it. Tiles that expose no commands keep the default.
+    fn command(&mut self, _command: &str) -> bool {
+        false
+    }
+
     /// A contribution to the host statusbar while this tile is focused.
     fn status_line(&self) -> Option<String> {
         None
@@ -96,4 +103,36 @@ pub trait AppTile {
     /// on disable or reload and host exit. `on_resize` is delivered before the
     /// first render at each new size; a hidden tile receives it when shown.
     fn shutdown(&mut self) {}
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    struct MinimalTile;
+
+    impl AppTile for MinimalTile {
+        fn id(&self) -> &str {
+            "minimal"
+        }
+        fn title(&self) -> String {
+            "minimal".to_owned()
+        }
+        fn pump(&mut self) -> bool {
+            false
+        }
+        fn wants_redraw(&self) -> bool {
+            false
+        }
+        fn handle_input(&mut self, _ev: InputEvent) -> InputResult {
+            InputResult::Ignored
+        }
+        fn render(&mut self, _area: Rect, _buf: &mut Buffer) {}
+    }
+
+    #[test]
+    fn command_defaults_to_unhandled() {
+        let mut tile = MinimalTile;
+        assert!(!tile.command("unknown"));
+    }
 }

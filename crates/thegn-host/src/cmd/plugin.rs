@@ -451,6 +451,7 @@ mod tests {
                 scopes: vec![thegn_core::control::Scope::Exec],
                 mode: PluginMode::Resident,
                 enabled: true,
+                background: false,
                 trusted_native: false,
             },
             dir: None,
@@ -476,7 +477,9 @@ mod tests {
         let plugin = inspected_plugin(ExtensionPoint::PaletteAction, &["surface:palette"]);
         let text = inspection_lines(&admitted_plugin(plugin)).join("\n");
         assert!(
-            text.contains("api 0.3.0 negotiated with host 0.3.0"),
+            text.contains(&format!(
+                "api {API_VERSION} negotiated with host {API_VERSION}"
+            )),
             "{text}"
         );
         assert!(text.contains("host-call scopes [exec]"), "{text}");

@@ -13214,7 +13214,7 @@ async fn event_loop<T: Terminal>(
             app_signalled = true;
         }
         if app_signalled {
-            app_host.pump_all();
+            app_host.pump_observe();
             dirty = true;
         }
 
@@ -14280,6 +14280,39 @@ async fn event_loop<T: Terminal>(
         }
         let plugin_backlog = !plugin_rx.is_empty();
         crate::handlers::plugins::flush_alerts(&mut plugins_state);
+        let modals = crate::handlers::plugin_apps::HostModals::from_flags([
+            active_menu.is_some(),
+            palette.is_some(),
+            host_input.is_some(),
+            git_input.is_some(),
+            rollback.is_some(),
+            wizard_ui.is_some(),
+            env_wizard_ui.is_some(),
+            terminal_wizard_ui.is_some(),
+            workspace_picker.is_some(),
+            help_overlay.is_some(),
+            theme_builder.is_some(),
+            monitor.is_some(),
+            diff_view.is_some(),
+            board.is_some(),
+            pr_view.is_some(),
+            bar_detail.is_some(),
+            replay.is_some(),
+            search.is_some(),
+            search_replace.is_some(),
+            onboarding.active(),
+            !which_key.is_empty(),
+            which_key_filter.is_some(),
+            hover_popup.is_some(),
+        ]);
+        dirty |= crate::handlers::plugin_apps::sync(
+            &mut app_host,
+            &mut plugins_state,
+            &mut keymap,
+            mode,
+            modals.any(),
+            &current_config,
+        );
         let applied = crate::worktree_lifecycle::apply_completions(
             &mut session,
             &mut panes,
@@ -15791,6 +15824,11 @@ async fn event_loop<T: Terminal>(
             // included) park/resume hidden tiles. Here, after every drain, so
             // the tile being rendered has been told it is visible.
             app_host.sync_visibility();
+            let app_top = chrome.divider.y + chrome.divider.rows;
+            app_host.prepare_active_size(
+                cols as u16,
+                chrome.statusbar.y.saturating_sub(app_top) as u16,
+            );
             let app_tile_active = app_host.active_tile_mut().is_some();
             // FAST PATH: a pure selection-drag move only changes the highlighted
             // cells. Reuse the last full frame already in `scratch` (skip the
@@ -16557,9 +16595,8 @@ async fn event_loop<T: Terminal>(
             // this frame actually painted — not against a list of modals, which
             // is what drifted and let the caret blink on top of the help box.
             let pane_caret = if app_tile_active {
-                // The app tile owns the band and draws its own caret if it wants
-                // one; the host never puts a hardware cursor inside it.
-                None
+                let top = chrome.divider.y + chrome.divider.rows;
+                app_host.active_cursor_in_band(top, cols, chrome.statusbar.y)
             } else {
                 // The hardware cursor sits in the focused pane's CONTENT rect
                 // (inside its frame ring). When the drawer owns focus it follows
@@ -16845,6 +16882,11 @@ async fn event_loop<T: Terminal>(
             !pending_input.is_empty(),
             budget_exhausted || log_backlog || plugin_backlog,
         );
+        let timeout = crate::idle_poll::fold_deadline(
+            timeout,
+            plugins_state.next_app_deadline(),
+            std::time::Instant::now(),
+        );
         let polled = match pending_input.pop_front() {
             Some(ev) => Ok(Some(ev)),
             None => {
@@ -16865,6 +16907,7 @@ async fn event_loop<T: Terminal>(
         };
         match polled {
             Ok(Some(InputEvent::Mouse(m))) => {
+                plugins_state.user_input();
                 crate::perf_timing::observe_input(&mut input_at, std::time::Instant::now());
                 loop_perf.input_event();
                 use termwiz::input::MouseButtons;
@@ -18433,6 +18476,7 @@ async fn event_loop<T: Terminal>(
                 mouse_left_down = left;
             }
             Ok(Some(InputEvent::Key(k))) => {
+                plugins_state.user_input();
                 // Recover xterm's split modified tilde keys before termwiz's
                 // keymap can turn their suffix into pane text; mouse residue
                 // continues to be discarded here as before.
@@ -19140,6 +19184,7 @@ async fn event_loop<T: Terminal>(
                 // summon-pin, and an ungated cycle arm ate `Alt+]`/`[`). Its
                 // unit tests are the regression gate.
                 //
+                let mut forced_palette_action: Option<crate::keymap::Action> = None;
                 // With tiles enabled, Alt+1..N still shadows `summon-worktree-N`
                 // for the first N tabs by design; the sidebar hints agree.
                 {
@@ -19166,8 +19211,23 @@ async fn event_loop<T: Terminal>(
                         }
                         continue;
                     }
-                    // A focused tile owns all remaining input.
-                    if let crate::apps::ActiveApp::Tile(_) = app_host.active {
+                    if app_host.active_is_plugin() && !modals.any() {
+                        if let crate::handlers::plugin_apps::KeyRoute::Action(action) =
+                            crate::handlers::plugin_apps::route_plugin_key(
+                                &mut app_host,
+                                &mut keymap,
+                                mode,
+                                crate::sequence::Key::modified(k.key, k.modifiers),
+                            )
+                        {
+                            forced_palette_action = Some(action);
+                        } else {
+                            dirty = true;
+                            continue;
+                        }
+                    } else if !app_host.active_is_plugin()
+                        && let crate::apps::ActiveApp::Tile(_) = app_host.active
+                    {
                         if let Some(ev) = crate::apps::input::to_kit(&k.key, k.modifiers) {
                             app_host.handle_active_input(ev);
                         }
@@ -19175,7 +19235,6 @@ async fn event_loop<T: Terminal>(
                         continue;
                     }
                 }
-                let mut forced_palette_action: Option<crate::keymap::Action> = None;
                 // Seed for the Search & Replace surface when escalated from the
                 // palette's Content (`/`) mode — the query rides across the handoff.
                 let mut search_replace_seed: Option<String> = None;
@@ -21517,7 +21576,7 @@ async fn event_loop<T: Terminal>(
                 }
                 // The Ctrl+g keybind lock: while locked, every key except
                 // Ctrl+g itself goes straight to the focused pane.
-                if focus.locked {
+                if forced_palette_action.is_none() && focus.locked {
                     if k.key == KeyCode::Char('g') && k.modifiers == Modifiers::CTRL {
                         focus.locked = false;
                         model.status = "Keybinds unlocked".into();
@@ -24688,6 +24747,14 @@ async fn event_loop<T: Terminal>(
                             continue;
                         }
                         match action {
+                            action @ (Action::PluginAppDrafts | Action::PluginAppRequests) => {
+                                if !crate::handlers::plugin_apps::command_active(
+                                    &mut app_host,
+                                    &action,
+                                ) {
+                                    model.status = "No plugin app tab is focused".into();
+                                }
+                            }
                             Action::VoiceToggle => {
                                 model.status = crate::handlers::voice::toggle(
                                     &mut voice,
@@ -28121,6 +28188,7 @@ async fn event_loop<T: Terminal>(
                 }
             }
             Ok(Some(InputEvent::Paste(s))) => {
+                plugins_state.user_input();
                 crate::perf_timing::observe_input(&mut input_at, std::time::Instant::now());
                 loop_perf.input_event();
                 if let Some(builder) = theme_builder.as_mut() {
@@ -28128,7 +28196,9 @@ async fn event_loop<T: Terminal>(
                     dirty = true;
                     continue;
                 }
-                if app_host.route_paste(&s) == crate::apps::PasteRoute::Consumed {
+                if !(app_host.active_is_plugin() && modals.any())
+                    && app_host.route_paste(&s) == crate::apps::PasteRoute::Consumed
+                {
                     dirty = true;
                     continue;
                 }
@@ -28182,7 +28252,7 @@ async fn event_loop<T: Terminal>(
                     || host_input.is_some()
                     || palette.is_some()
                     || search_replace.is_some();
-                if chrome_text_input {
+                if chrome_text_input || (app_host.active_is_plugin() && modals.any()) {
                     continue;
                 }
                 // Otherwise a paste — including a terminal file drag-and-drop,

@@ -15,6 +15,7 @@ members = [
   "crates/gtui-render",
   "crates/gtui-app",
   "crates/gtui-embed",
+  "crates/thegn-plugin-ui",
 ]
 # Belt-and-braces: nothing in-tree lives at these paths, but if a contributor
 # drops a scratch checkout at apps/ or vendor/, cargo must not absorb it into
@@ -40,6 +41,8 @@ repository = "https://github.com/blakeashleyjr/thegn"
 rust-version = "1.89"
 
 [workspace.dependencies]
+unicode-segmentation = "1"
+unicode-width = "0.2"
 # --- shared domain/runtime deps ---
 # `unstable-ext` gates `Arg::add`, which is how a value completer (an `ArgExt`)
 # attaches to an argument at `<TAB>` time. It is explicitly unstable and can
@@ -233,6 +236,8 @@ sysinfo = { version = "0.39", default-features = false, features = [
 starship-battery = "0.11"
 # --- internal crates ---
 thegn-core = { path = "crates/thegn-core" }
+thegn-plugin-ui = { path = "crates/thegn-plugin-ui" }
+tg-kit = { path = "crates/tg-kit" }
 thegn-svc = { path = "crates/thegn-svc" }
 thegn-metrics = { path = "crates/thegn-metrics" }
 thegn-media = { path = "crates/thegn-media" }

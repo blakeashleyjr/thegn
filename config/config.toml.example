@@ -757,7 +757,7 @@ token = "env:GITLAB_TOKEN"
 # both ids; omitted built-in tabs are appended. Duplicate ids are ignored.
 # Unknown ids and a disabled default are rejected by `thegn config validate`.
 [apps]
-default_tab = "work" # initial tab (THEGN_APPS_DEFAULT_TAB): "work" or enabled "observe"
+default_tab = "work" # initial tab (THEGN_APPS_DEFAULT_TAB): "work", enabled "observe", or "plugin:<plugin>:<contribution>" (dev channel)
 tab_order = ["work", "observe"]
 
 # The embedded "Observe" observability app tab: a Grafana-style in-terminal
@@ -4995,7 +4995,7 @@ heartbeat_secs = 10
 # id = "example-plugin"                # Stable plugin identifier (required).
 # name = "Example plugin"              # Human-readable plugin name (required).
 # version = "0.1.0"                     # Plugin version string (required).
-# api = "0.3.0"                         # Plugin API version (required).
+# api = "0.4.0"                         # Plugin API version (required).
 # capabilities = []                     # Requested capability grants; default is empty.
 # command = ["/path/to/reviewed-plugin"] # Executable argv (required); never a shell string.
 # cwd = ""                              # Working directory; default is empty (plugin directory or host cwd).
@@ -5007,6 +5007,7 @@ heartbeat_secs = 10
 # scopes = []                           # host.call scope ceiling; default empty (read/write/git/merge_add/exec/admin).
 # mode = "one_shot"                     # Process mode; default is one_shot (or resident).
 # enabled = true                        # Whether the plugin may run; default is true.
+# background = false                    # Allow declared background:sync work while the app tab is hidden (resident; needs trusted_native).
 # trusted_native = false                # Required (true) for non-surface capabilities or scopes: runs as native code with full user authority; capabilities are protocol checks, not a sandbox.
 # [[plugins.contributions]]
 # id = "example-status"                 # Stable contribution identifier (required).
