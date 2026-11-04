@@ -650,7 +650,7 @@ pub(crate) fn spawn_ci_detail(
                     e,
                     &detail.sha,
                     job.finished_at.as_deref(),
-                )
+                ) && crate::ci_refresh::context_row_current(&e.context, context.as_deref())
             }) {
                 cached
             } else {
