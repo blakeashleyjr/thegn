@@ -129,6 +129,27 @@ pub(crate) fn egress_admission(
     }
 }
 
+/// Admit a fresh sandbox before handoff, or verify an existing sandbox and
+/// re-apply its policy on drift. A fresh sandbox is destroyed on failure; an
+/// existing sandbox is refused without destruction because it may hold the
+/// user's work.
+pub(crate) fn gate_handed_sandbox(
+    steps: &dyn EgressSteps,
+    created: bool,
+    caps_egress: bool,
+    id: &str,
+    allow: &[String],
+    block: &[String],
+) -> Result<EgressAdmission> {
+    let admission = egress_admission(created, caps_egress, allow, block);
+    match admission {
+        EgressAdmission::Skip => {}
+        EgressAdmission::AdmitFresh => admit_egress(steps, id, allow, block)?,
+        EgressAdmission::VerifyExisting => verify_existing_egress(steps, id, allow, block)?,
+    }
+    Ok(admission)
+}
+
 pub(crate) struct BlockingProviderEgress<'a> {
     pub provider: &'a thegn_svc::provider::Provider,
 }
@@ -153,7 +174,7 @@ impl EgressSteps for BlockingProviderEgress<'_> {
 mod tests {
     use super::{
         EgressAdmission, EgressSteps, RestoredEgress, admit_egress, egress_admission,
-        reverify_restored_egress, verify_existing_egress,
+        gate_handed_sandbox, reverify_restored_egress, verify_existing_egress,
     };
     use std::cell::RefCell;
     use thegn_svc::provider::{PolicyRule, rules_from};
@@ -437,5 +458,77 @@ mod tests {
 
         assert!(admit_egress(&steps, "sandbox-1", &allow, &block).is_err());
         assert_eq!(steps.calls(), ["apply:sandbox-1", "destroy:sandbox-1"]);
+    }
+
+    #[test]
+    fn handed_existing_sandbox_with_matching_policy_is_verified_with_one_read() {
+        let (allow, block) = lists();
+        let steps = ScriptedEgress::new(vec![], vec![Ok(rules_from(&allow, &block).unwrap())]);
+
+        assert_eq!(
+            gate_handed_sandbox(&steps, false, true, "sandbox-1", &allow, &block).unwrap(),
+            EgressAdmission::VerifyExisting
+        );
+        assert_eq!(steps.calls(), ["read:sandbox-1"]);
+    }
+
+    #[test]
+    fn handed_existing_sandbox_with_drift_is_reapplied_and_verified() {
+        let (allow, block) = lists();
+        let steps = ScriptedEgress::new(
+            vec![Ok(())],
+            vec![Ok(Vec::new()), Ok(rules_from(&allow, &block).unwrap())],
+        );
+
+        assert_eq!(
+            gate_handed_sandbox(&steps, false, true, "sandbox-1", &allow, &block).unwrap(),
+            EgressAdmission::VerifyExisting
+        );
+        assert_eq!(
+            steps.calls(),
+            ["read:sandbox-1", "apply:sandbox-1", "read:sandbox-1"]
+        );
+    }
+
+    #[test]
+    fn handed_existing_sandbox_that_cannot_be_verified_is_refused_and_never_destroyed() {
+        let (allow, block) = lists();
+        let steps = ScriptedEgress::new(vec![Ok(())], vec![Ok(Vec::new()), Ok(Vec::new())]);
+
+        let result = gate_handed_sandbox(&steps, false, true, "sandbox-1", &allow, &block);
+        assert!(result.is_err());
+        assert!(format!("{:#}", result.err().unwrap()).contains("could not be verified"));
+        assert_eq!(
+            steps.calls(),
+            ["read:sandbox-1", "apply:sandbox-1", "read:sandbox-1"]
+        );
+    }
+
+    #[test]
+    fn handed_fresh_sandbox_is_admitted_and_destroyed_on_failure() {
+        let (allow, block) = lists();
+        let steps = ScriptedEgress::new(vec![Err(anyhow::anyhow!("apply failed"))], vec![]);
+
+        assert!(gate_handed_sandbox(&steps, true, true, "sandbox-1", &allow, &block).is_err());
+        assert_eq!(steps.calls(), ["apply:sandbox-1", "destroy:sandbox-1"]);
+    }
+
+    #[test]
+    fn handed_sandbox_without_declared_lists_or_egress_caps_makes_no_provider_call() {
+        let (allow, block) = lists();
+        let empty: Vec<String> = Vec::new();
+        let no_policy = ScriptedEgress::new(vec![], vec![]);
+        assert_eq!(
+            gate_handed_sandbox(&no_policy, false, true, "sandbox-1", &empty, &empty).unwrap(),
+            EgressAdmission::Skip
+        );
+        assert!(no_policy.calls().is_empty());
+
+        let no_caps = ScriptedEgress::new(vec![], vec![]);
+        assert_eq!(
+            gate_handed_sandbox(&no_caps, false, false, "sandbox-1", &allow, &block).unwrap(),
+            EgressAdmission::Skip
+        );
+        assert!(no_caps.calls().is_empty());
     }
 }
