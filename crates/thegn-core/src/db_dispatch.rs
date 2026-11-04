@@ -57,18 +57,18 @@ impl std::fmt::Display for LeadLeaseConflict {
         match self {
             Self::NotHeld { lease, holder } => write!(
                 f,
-                "Lead lease {lease:?} is not held by the presented owner{}; acquire it with `thegn dispatch lease acquire --name <lease> --owner <you>` and pass `--lease/--owner`, or use `--admin --why '<reason>'`",
+                "Lead lease {lease:?} is not held by the presented owner{}; acquire it with `thegn dispatch lease acquire --name <lease> --owner <you>` and pass `--lease/--owner/--lease-gen`, or use `--admin --why '<reason>'`",
                 holder
                     .as_ref()
                     .map_or_else(String::new, |owner| format!(" (current holder: {owner})"))
             ),
             Self::Required { lease } => write!(
                 f,
-                "Lead lease {lease:?} is required; acquire it with `thegn dispatch lease acquire --name <lease> --owner <you>` and pass `--lease/--owner`, or use `--admin --why '<reason>'`"
+                "Lead lease {lease:?} is required; acquire it with `thegn dispatch lease acquire --name <lease> --owner <you>` and pass `--lease/--owner/--lease-gen`, or use `--admin --why '<reason>'`"
             ),
             Self::Mismatch { bound, presented } => write!(
                 f,
-                "dispatch row is bound to Lead lease {bound:?}, not {presented:?}; acquire it with `thegn dispatch lease acquire --name <lease> --owner <you>` and pass `--lease/--owner`, or use `--admin --why '<reason>'`"
+                "dispatch row is bound to Lead lease {bound:?}, not {presented:?}; acquire it with `thegn dispatch lease acquire --name <lease> --owner <you>` and pass `--lease/--owner/--lease-gen`, or use `--admin --why '<reason>'`"
             ),
             Self::StaleGeneration {
                 lease,

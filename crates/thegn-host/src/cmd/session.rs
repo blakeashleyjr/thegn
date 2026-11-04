@@ -137,7 +137,7 @@ pub enum SessionAction {
         /// The owner id holding `--lease`.
         #[arg(long, value_name = "ID", requires = "lease")]
         owner: Option<String>,
-        /// The Lead lease generation printed by `dispatch lease acquire`; a stale generation is refused.
+        /// Required with `--lease`; use the generation printed by `dispatch lease acquire`.
         #[arg(long, value_name = "GEN", requires = "lease", value_parser = clap::value_parser!(i64).range(1..))]
         lease_gen: Option<i64>,
         /// Resume an eligible unfinished pipeline roster row (THE-86): an
