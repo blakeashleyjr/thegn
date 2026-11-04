@@ -166,6 +166,7 @@ fn fmt_fill_eta(eta: DiskFillEta) -> String {
 fn fmt_age(age_secs: Option<u64>) -> String {
     match age_secs {
         None => "—".into(),
+        // Values above i64::MAX saturate here; their displayed day count is therefore capped.
         Some(s) => thegn_core::util::age_ago_secs(i64::try_from(s).unwrap_or(i64::MAX), 5),
     }
 }
