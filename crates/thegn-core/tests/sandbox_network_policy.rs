@@ -12,6 +12,9 @@ use thegn_core::sandbox::{
     hostname_rules_note, resolve_placed_exact,
 };
 
+#[path = "support/bounded_run.rs"]
+mod bounded_run;
+
 fn skip() -> bool {
     !thegn_core::util::have("podman")
         || std::env::var("CI").is_ok()
@@ -66,10 +69,9 @@ fn spec_with_network_block(name: &str, block: Vec<String>) -> SandboxSpec {
 
 fn run_in(spec: &SandboxSpec, cmd: &str) -> String {
     let argv = enter_argv(spec, cmd).expect("valid volume names");
-    let out = std::process::Command::new(&argv[0])
-        .args(&argv[1..])
-        .output()
-        .unwrap_or_else(|_| panic!("exec failed: {argv:?}"));
+    let mut command = std::process::Command::new(&argv[0]);
+    command.args(&argv[1..]);
+    let out = bounded_run::output(&mut command).unwrap_or_else(|_| panic!("exec failed: {argv:?}"));
     String::from_utf8_lossy(&out.stdout).to_string() + &String::from_utf8_lossy(&out.stderr)
 }
 
@@ -139,10 +141,9 @@ fn g2_universal_block_runs_offline() {
     assert_eq!(spec.network, Network::None);
     ensure(&spec).expect("offline container ensure failed");
     let argv = enter_argv(&spec, "ip route").expect("valid volume names");
-    let out = std::process::Command::new(&argv[0])
-        .args(&argv[1..])
-        .output()
-        .expect("ip route exec failed");
+    let mut command = std::process::Command::new(&argv[0]);
+    command.args(&argv[1..]);
+    let out = bounded_run::output(&mut command).expect("ip route exec failed");
     force_rm(name);
     assert!(out.status.success(), "ip route failed: {out:?}");
     assert!(
