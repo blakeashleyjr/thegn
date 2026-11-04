@@ -58,6 +58,10 @@ mod tests {
     use crate::model::{Playlist, QueueItem};
 
     #[test]
+    #[allow(
+        clippy::disallowed_macros,
+        reason = "the measured aggregate is printed for the primary to read"
+    )]
     fn worst_case_admitted_snapshot_equals_the_derived_ceiling() {
         let state = MediaState {
             player: "a".repeat(MAX_FIELD_BYTES * 2),
@@ -107,7 +111,7 @@ mod tests {
 
     #[test]
     fn multibyte_fields_stay_within_the_ceiling() {
-        let field = "\u{e9}".repeat(MAX_FIELD_BYTES);
+        let field = "\u{20ac}".repeat(MAX_FIELD_BYTES);
         let state = MediaState {
             player: field.clone(),
             title: field.clone(),
@@ -123,6 +127,8 @@ mod tests {
         assert!(state.title.len() <= MAX_FIELD_BYTES);
         assert!(state.artist.len() <= MAX_FIELD_BYTES);
         assert!(state.album.len() <= MAX_FIELD_BYTES);
+        assert_eq!(state.title.len(), MAX_FIELD_BYTES - 1);
+        assert!(state.title.is_char_boundary(state.title.len()));
 
         let multibyte_field = "\u{e9}".repeat(MAX_FIELD_BYTES);
         let queue_page = QueuePage::from_rows(vec![
