@@ -2278,6 +2278,140 @@ Receiving objects: 100% (10/10)\rdone.\n";
     }
 
     #[test]
+    fn parse_workspace_url_rejects_windows_root_control_and_encoded_forms() {
+        let mut rejected = vec![
+            "https://github.com/acme/C:/repo.git".to_owned(),
+            "https://github.com/acme/c:/repo.git".to_owned(),
+            "git@github.com:C:/repo.git".to_owned(),
+            "ssh://host//server/share/repo.git".to_owned(),
+            "https://github.com//acme/repo.git".to_owned(),
+            "git@github.com:/abs/repo.git".to_owned(),
+            "https://github.com/acme/repo\\x.git".to_owned(),
+            "git@github.com:acme\\repo.git".to_owned(),
+            "https://github.com/acme/repo.git\n".to_owned(),
+            "https://github.com/acme/re\u{7}po.git".to_owned(),
+            "https://github.com/acme/repo%0A.git".to_owned(),
+            "https://github.com/acme/%5Cx/repo.git".to_owned(),
+            "git@github.com:acme/%5Cx/repo.git".to_owned(),
+            "https://github.com/acme/%2E%2E/repo.git".to_owned(),
+            "https://github.com/acme/%252e/repo.git".to_owned(),
+            "https://github.com/acme/repo%00.git".to_owned(),
+            "https://github.com/acme/.hidden".to_owned(),
+            "https://github.com/acme/repo.".to_owned(),
+            "https://github.com/acme/.git".to_owned(),
+            "https://github.com/acme/repo.git#frag".to_owned(),
+            "ftp://host/acme/repo.git".to_owned(),
+            "git@:acme/repo.git".to_owned(),
+            "git@host@evil:acme/repo.git".to_owned(),
+        ];
+        rejected.push(format!("https://github.com/{}", "a".repeat(2100)));
+        rejected.push(format!("https://github.com/acme/{}", "a".repeat(129)));
+
+        for input in rejected {
+            assert!(
+                parse_workspace_url(&input).is_err(),
+                "unsafe workspace URL was accepted: {input:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn parse_workspace_url_keeps_credentials_and_separators_out_of_identity() {
+        for input in [
+            "https://user:secret@github.com/acme/repo.git",
+            "https://user@github.com/acme/repo.git",
+        ] {
+            let error = match parse_workspace_url(input) {
+                Err(error) => error,
+                Ok(_) => panic!("credential-bearing URL was accepted: {input}"),
+            };
+            let error_text = format!("{error:#}");
+            assert!(
+                !error_text.contains("secret"),
+                "credential leaked: {error_text}"
+            );
+            assert!(
+                !error_text.contains("user"),
+                "username leaked: {error_text}"
+            );
+        }
+
+        let accepted = vec![
+            "https://github.com/acme/repo.git".to_owned(),
+            "git@github.com:acme/repo.git".to_owned(),
+            "ssh://deploy@host.example/acme/repo.git".to_owned(),
+            "git://example.org/a/b/c/repo".to_owned(),
+            format!("https://github.com/acme/{}", "a".repeat(128)),
+        ];
+        for input in accepted {
+            let parsed = parse_workspace_url(&input).unwrap();
+            assert!(
+                !parsed.canonical_origin.contains('@'),
+                "canonical origin retained credentials: {}",
+                parsed.canonical_origin
+            );
+            assert!(
+                parsed
+                    .destination_name
+                    .chars()
+                    .all(|c| c.is_ascii_lowercase()
+                        || c.is_ascii_digit()
+                        || matches!(c, '_' | '-')),
+                "destination name has an unsafe character: {}",
+                parsed.destination_name
+            );
+            assert!(
+                !parsed.destination_name.contains('.'),
+                "destination name contains a path separator-like dot: {}",
+                parsed.destination_name
+            );
+            let suffix = parsed
+                .destination_name
+                .rsplit_once('-')
+                .map(|(_, suffix)| suffix)
+                .unwrap_or("");
+            assert_eq!(suffix.len(), 16, "destination suffix is not 16 hex digits");
+            assert!(
+                suffix
+                    .chars()
+                    .all(|c| c.is_ascii_digit() || ('a'..='f').contains(&c)),
+                "destination suffix is not lowercase hexadecimal: {suffix}"
+            );
+            assert!(
+                parsed.destination_name.len() <= 128 + 1 + 16,
+                "destination name exceeds its bounded shape: {}",
+                parsed.destination_name
+            );
+            let destination = std::path::PathBuf::from("/ws").join(&parsed.destination_name);
+            assert_eq!(
+                destination.parent(),
+                Some(std::path::Path::new("/ws")),
+                "destination name escaped the workspace root: {}",
+                destination.display()
+            );
+            if input == "ssh://deploy@host.example/acme/repo.git" {
+                assert!(parsed.clone_url.contains("deploy@"));
+                assert!(!parsed.canonical_origin.contains("deploy"));
+                assert!(!parsed.label.contains("deploy"));
+                assert!(!parsed.destination_name.contains("deploy"));
+            }
+        }
+
+        let canonical = parse_workspace_url("https://github.com/acme/repo.git").unwrap();
+        for alias in [
+            "https://GitHub.com/acme/repo.git/",
+            "https://github.com/acme/repo",
+            "https://github.com:443/acme/repo.git",
+        ] {
+            let parsed_alias = parse_workspace_url(alias).unwrap();
+            assert_eq!(
+                parsed_alias.destination_name, canonical.destination_name,
+                "spelling alias changed the destination: {alias}"
+            );
+        }
+    }
+
+    #[test]
     fn existing_url_destination_is_reused_only_when_origin_matches() {
         let mut cfg = thegn_core::config::Config::default();
         let root = tmp("existing-url-dest");
