@@ -570,7 +570,21 @@ fn map_dispatch_status_error(error: anyhow::Error) -> ControlError {
     ControlError::Internal(error)
 }
 
+#[derive(Debug)]
+struct DispatchIdentityRefused(String);
+
+impl std::fmt::Display for DispatchIdentityRefused {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for DispatchIdentityRefused {}
+
 fn map_dispatch_put_error(error: anyhow::Error) -> ControlError {
+    if error.downcast_ref::<DispatchIdentityRefused>().is_some() {
+        return ControlError::InvalidArgument(error.to_string());
+    }
     if error
         .downcast_ref::<thegn_core::db::ParentDispatchConflict>()
         .is_some()
@@ -2680,11 +2694,41 @@ impl ControlApi for DaemonService {
         req: thegn_svc::control::DispatchPutReq,
     ) -> BoxFuture<'_, ControlResult<thegn_core::issue::AgentDispatch>> {
         Box::pin(async move {
+            if let Err(error) =
+                thegn_core::pipeline_report::dispatch_text_field("issue_id", &req.issue_id)
+            {
+                return Err(ControlError::InvalidArgument(error.to_string()));
+            }
+            if let Err(error) = thegn_core::pipeline_report::dispatch_text_field(
+                "worktree_path",
+                &req.worktree_path,
+            ) {
+                return Err(ControlError::InvalidArgument(error.to_string()));
+            }
+            let raw_issue = req.issue_id.clone();
+            let raw_worktree = req.worktree_path.clone();
+            let (issue_id, worktree_path) = match tokio::task::spawn_blocking(move || {
+                crate::cmd::dispatch::dispatch_identity(&raw_issue, &raw_worktree)
+            })
+            .await
+            {
+                Ok(Ok(identity)) => identity,
+                Ok(Err(error)) => {
+                    return Err(map_dispatch_put_error(anyhow::Error::new(
+                        DispatchIdentityRefused(format!("{error:#}")),
+                    )));
+                }
+                Err(join) => {
+                    return Err(ControlError::Internal(anyhow::anyhow!(
+                        "dispatch identity task join: {join}"
+                    )));
+                }
+            };
             self.with_db(move |db| {
                 use thegn_core::store::NotificationStore;
                 let id = db.put_dispatch_with_parent_check(thegn_core::issue::NewDispatch {
-                    issue_id: &req.issue_id,
-                    worktree_path: &req.worktree_path,
+                    issue_id: &issue_id,
+                    worktree_path: &worktree_path,
                     agent_name: &req.agent_name,
                     stage: req.stage.as_deref(),
                     parent_id: req.parent_id,
@@ -5429,6 +5473,7 @@ mod tests {
     async fn dispatch_roster_put_list_and_set_status_round_trip() {
         use thegn_core::issue::AgentDispatchStatus as St;
         let (svc, _rx) = service(0);
+        let (_dir, wt) = git_worktree();
         assert!(
             svc.dispatches_list(None, Db::ROSTER_HISTORY_LIMIT)
                 .await
@@ -5439,7 +5484,7 @@ mod tests {
         let row = svc
             .dispatch_put(thegn_svc::control::DispatchPutReq {
                 issue_id: "linear:A-1".into(),
-                worktree_path: "/wt/a".into(),
+                worktree_path: wt.to_string_lossy().into_owned(),
                 agent_name: "claude".into(),
                 ..Default::default()
             })
@@ -5457,7 +5502,7 @@ mod tests {
         let child = svc
             .dispatch_put(thegn_svc::control::DispatchPutReq {
                 issue_id: "linear:A-1".into(),
-                worktree_path: "/wt/a".into(),
+                worktree_path: wt.to_string_lossy().into_owned(),
                 agent_name: "claude".into(),
                 stage: Some("code".into()),
                 parent_id: Some(row.id),
@@ -5562,10 +5607,11 @@ mod tests {
     #[tokio::test]
     async fn dispatch_put_refuses_a_missing_parent_without_a_row() {
         let (svc, _rx) = service(0);
+        let (_dir, wt) = git_worktree();
         let result = svc
             .dispatch_put(thegn_svc::control::DispatchPutReq {
                 issue_id: "linear:A-1".into(),
-                worktree_path: "/wt/a".into(),
+                worktree_path: wt.to_string_lossy().into_owned(),
                 agent_name: "claude".into(),
                 parent_id: Some(4242),
                 ..Default::default()
@@ -5587,10 +5633,12 @@ mod tests {
     #[tokio::test]
     async fn dispatch_put_refuses_a_cross_issue_parent() {
         let (svc, _rx) = service(0);
+        let (_dir_a, wt_a) = git_worktree();
+        let (_dir_b, wt_b) = git_worktree();
         let parent = svc
             .dispatch_put(thegn_svc::control::DispatchPutReq {
                 issue_id: "linear:A-1".into(),
-                worktree_path: "/wt/a".into(),
+                worktree_path: wt_a.to_string_lossy().into_owned(),
                 agent_name: "claude".into(),
                 ..Default::default()
             })
@@ -5599,7 +5647,7 @@ mod tests {
         let result = svc
             .dispatch_put(thegn_svc::control::DispatchPutReq {
                 issue_id: "linear:B-2".into(),
-                worktree_path: "/wt/b".into(),
+                worktree_path: wt_b.to_string_lossy().into_owned(),
                 agent_name: "claude".into(),
                 parent_id: Some(parent.id),
                 ..Default::default()
@@ -5631,6 +5679,18 @@ mod tests {
             })
             .await;
         assert!(matches!(result, Err(ControlError::InvalidArgument(_))));
+        let path_result = svc
+            .dispatch_put(thegn_svc::control::DispatchPutReq {
+                issue_id: "linear:A-1".into(),
+                worktree_path: "/wt/a\x1b[2J".into(),
+                agent_name: "claude".into(),
+                ..Default::default()
+            })
+            .await;
+        assert!(matches!(
+            path_result,
+            Err(ControlError::InvalidArgument(message)) if !message.contains('\x1b')
+        ));
         assert!(
             svc.dispatches_list(None, Db::ROSTER_HISTORY_LIMIT)
                 .await
@@ -5645,12 +5705,13 @@ mod tests {
         use std::collections::HashSet;
 
         let (svc, _rx) = service(0);
+        let (_dir, wt) = git_worktree();
         let mut inserted = Vec::new();
         for index in 1..=5 {
             inserted.push(
                 svc.dispatch_put(thegn_svc::control::DispatchPutReq {
                     issue_id: format!("linear:P-{index}"),
-                    worktree_path: "/wt/p".into(),
+                    worktree_path: wt.to_string_lossy().into_owned(),
                     agent_name: "claude".into(),
                     ..Default::default()
                 })
@@ -5712,10 +5773,11 @@ mod tests {
     #[tokio::test]
     async fn dispatch_put_assigns_the_canonical_artifact_to_a_stage_row() {
         let (svc, _rx) = service(0);
+        let (_dir, wt) = git_worktree();
         let row = svc
             .dispatch_put(thegn_svc::control::DispatchPutReq {
                 issue_id: "linear:A-1".into(),
-                worktree_path: "/wt/a".into(),
+                worktree_path: wt.to_string_lossy().into_owned(),
                 agent_name: "claude".into(),
                 stage: Some("code".into()),
                 ..Default::default()
@@ -5726,6 +5788,100 @@ mod tests {
             row.artifact_path.as_deref(),
             Some(thegn_core::pipeline_run::artifact_path("linear:A-1", "code", row.id).as_str())
         );
+    }
+
+    #[tokio::test]
+    async fn dispatch_put_identity_canonicalizes_issue_and_worktree_spelling() {
+        let (svc, _rx) = service(0);
+        let (_dir, wt) = git_worktree();
+        std::fs::create_dir_all(wt.join("sub")).unwrap();
+        let row = svc
+            .dispatch_put(thegn_svc::control::DispatchPutReq {
+                issue_id: " LINEAR:THE-74".into(),
+                worktree_path: wt.join("sub").join("..").to_string_lossy().into_owned(),
+                agent_name: "claude".into(),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert_eq!(row.issue_id, "linear:THE-74");
+        assert_eq!(row.worktree_path, wt.to_string_lossy());
+    }
+
+    #[tokio::test]
+    async fn dispatch_put_identity_refuses_unusable_worktrees_without_a_row() {
+        let (svc, _rx) = service(0);
+        let (_dir, wt) = git_worktree();
+        std::fs::create_dir_all(wt.join("sub")).unwrap();
+        for path in [
+            wt.join("missing"),
+            wt.join("sub"),
+            std::path::PathBuf::from("/wt/a"),
+        ] {
+            let path_text = path.to_string_lossy().into_owned();
+            let result = svc
+                .dispatch_put(thegn_svc::control::DispatchPutReq {
+                    issue_id: "linear:A-1".into(),
+                    worktree_path: path_text.clone(),
+                    agent_name: "claude".into(),
+                    ..Default::default()
+                })
+                .await;
+            assert!(
+                matches!(result, Err(ControlError::InvalidArgument(message)) if message.contains(&path_text))
+            );
+        }
+        assert!(
+            svc.dispatches_list(None, Db::ROSTER_HISTORY_LIMIT)
+                .await
+                .unwrap()
+                .dispatches
+                .is_empty()
+        );
+    }
+
+    #[tokio::test]
+    async fn dispatch_put_identity_refuses_a_malformed_issue_id() {
+        let (svc, _rx) = service(0);
+        let (_dir, wt) = git_worktree();
+        for issue_id in ["linear:", "two words"] {
+            let result = svc
+                .dispatch_put(thegn_svc::control::DispatchPutReq {
+                    issue_id: issue_id.into(),
+                    worktree_path: wt.to_string_lossy().into_owned(),
+                    agent_name: "claude".into(),
+                    ..Default::default()
+                })
+                .await;
+            assert!(matches!(result, Err(ControlError::InvalidArgument(_))));
+        }
+        assert!(
+            svc.dispatches_list(None, Db::ROSTER_HISTORY_LIMIT)
+                .await
+                .unwrap()
+                .dispatches
+                .is_empty()
+        );
+    }
+
+    #[tokio::test]
+    async fn dispatch_put_identity_keeps_a_canonical_request_unchanged() {
+        use thegn_core::issue::AgentDispatchStatus;
+
+        let (svc, _rx) = service(0);
+        let (_dir, wt) = git_worktree();
+        let row = svc
+            .dispatch_put(thegn_svc::control::DispatchPutReq {
+                issue_id: "linear:A-1".into(),
+                worktree_path: wt.to_string_lossy().into_owned(),
+                agent_name: "claude".into(),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert_eq!(row.issue_id, "linear:A-1");
+        assert_eq!(row.worktree_path, wt.to_string_lossy());
+        assert_eq!(row.status, AgentDispatchStatus::Queued);
     }
 
     #[test]
