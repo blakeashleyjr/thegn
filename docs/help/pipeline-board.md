@@ -196,3 +196,8 @@ path of an existing local git worktree root; missing paths and worktree
 subdirectories are refused. Issue ids are stored trimmed, with a lowercased
 provider prefix. Duplicate, sibling and lease checks match ids
 case-insensitively when providers match or either id has no provider prefix.
+The control API's `dispatches.put` applies the same normalization before
+writing, storing the trimmed issue id with a lowercased provider prefix and
+the canonical worktree root. A malformed issue id or a missing path,
+subdirectory, or non-worktree root is rejected as an invalid argument naming
+the problem, and no row is written.
