@@ -21,8 +21,10 @@ thegn-host  ── compositor: tokio runtime, portable-pty, termwiz Surface, chr
    ├─► thegn-media, thegn-metrics, thegn-proc ── per-OS leaf crates (core-free)
    ├─► thegn-voice ── optional CPAL/Whisper leaf; handles owned by voice worker
    ├─► tg-kit + gtui-* ── the embedded-app contract (AppTile) and the Observe app
-   └─► thegn-plugin-ui ── pure widget engine for plugin app tabs (AppView → ratatui buffer;
-                           input → AppEvent); no I/O
+   ├─► thegn-plugin-ui ── pure widget engine for plugin app tabs (AppView → ratatui buffer;
+   │                       input → AppEvent); no I/O
+   └─► thegn-plugin-sdk ── plugin-side helper crate (NDJSON framing, session/request correlation, private state,
+                           OS credential store); linked by plugin processes ONLY, never by thegn-host
 
 thegn-proxy ── OPT-IN model-proxy daemon (binary `tgproxy`): the axum I/O shell
    └─► thegn-core   around `thegn_core::proxy`'s pure routing logic. Its own
