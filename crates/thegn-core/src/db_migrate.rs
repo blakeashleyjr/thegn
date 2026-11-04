@@ -4193,7 +4193,6 @@ mod tests {
     #[test]
     fn v105_upgrades_a_real_v104_database() {
         use crate::ci_log::CiLogCandidate;
-        use crate::store::CacheStore;
 
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("v104.db");
