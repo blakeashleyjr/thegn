@@ -150,6 +150,36 @@ fn enqueue_identity_drift(
     Ok(())
 }
 
+/// The repository common dir this process serves, as the canonical UTF-8 text a recorded identity is compared with.
+fn canonical_common_dir_text(repo_root: &Path) -> std::result::Result<String, String> {
+    let root = repo_root
+        .canonicalize()
+        .map_err(|error| error.to_string())?;
+    let common = util::git_common_dir(&root)
+        .canonicalize()
+        .map_err(|error| error.to_string())?;
+    common
+        .to_str()
+        .map(str::to_owned)
+        .ok_or_else(|| "not valid UTF-8".to_string())
+}
+
+/// Compare a row's recorded enqueue identity with the live checkout at `worktree` and the repository `repo_root`.
+/// Shared by the drain (before a fold) and landed-worktree cleanup (before any removal).
+pub(crate) fn recorded_identity_drift(
+    recorded: &MergeEnqueueIdentity,
+    worktree: &Path,
+    repo_root: &Path,
+) -> std::result::Result<(), String> {
+    let live = crate::merge_ops::local_enqueue_identity(worktree);
+    let drain_common = canonical_common_dir_text(repo_root);
+    enqueue_identity_drift(
+        recorded,
+        live.as_ref().map_err(String::as_str),
+        drain_common.as_deref().map_err(String::as_str),
+    )
+}
+
 impl std::fmt::Display for CandidateDrift {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter.write_str(&self.reason)
@@ -403,25 +433,8 @@ pub(crate) fn drive_queue(
                     let key = worktree.to_string_lossy().into_owned();
                     let candidate = db.merge_candidate(&key)?;
                     if let Some(recorded) = db.merge_enqueue_identity(&key)? {
-                        let live = crate::merge_ops::local_enqueue_identity(worktree);
-                        let drain_common = repo_root
-                            .canonicalize()
-                            .map_err(|error| error.to_string())
-                            .and_then(|root| {
-                                util::git_common_dir(&root)
-                                    .canonicalize()
-                                    .map_err(|error| error.to_string())
-                            })
-                            .and_then(|path| {
-                                path.to_str()
-                                    .map(str::to_owned)
-                                    .ok_or_else(|| "not valid UTF-8".to_string())
-                            });
-                        if let Err(reason) = enqueue_identity_drift(
-                            &recorded,
-                            live.as_ref().map_err(String::as_str),
-                            drain_common.as_deref().map_err(String::as_str),
-                        ) {
+                        if let Err(reason) = recorded_identity_drift(&recorded, worktree, repo_root)
+                        {
                             return Err(anyhow::Error::new(CandidateDrift { reason }));
                         }
                     } else if candidate.is_some() {

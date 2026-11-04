@@ -1,6 +1,6 @@
 # thegn
 
-> **Status: public alpha** (`0.1.0-alpha.47`). **x86_64 Linux is the supported
+> **Status: public alpha** (`0.1.0-alpha.48`). **x86_64 Linux is the supported
 > platform.** macOS on Apple silicon is best-effort: use the flake or source
 > setup until a release archive is published. CI is opt-in and the
 > interactive on-device checklist is unfinished. Windows is deferred and has no release binary.
@@ -302,6 +302,9 @@ config is never removed, and a malformed or forged manifest is refused before
 removal. Dry-run prints what would be removed or kept. Pass
 the same bindir used for installation; uninstall cannot be combined with
 `--batteries`.
+On Linux, the installer checks the generated desktop entry's structure and
+runs `desktop-file-validate` when available before publishing it. A rejected
+entry stops installation and restores the previous installation.
 
 ### macOS app launcher
 

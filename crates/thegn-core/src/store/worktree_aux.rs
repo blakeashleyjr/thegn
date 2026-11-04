@@ -711,6 +711,16 @@ pub trait WorktreeAuxStore {
     /// Every issue/worktree association, newest links first.
     fn issue_link_worktrees(&self) -> Result<Vec<(String, String)>>;
 
+    /// Associate an issue reference with the exact provider account that produced it.
+    fn link_issue_ref(&self, worktree_path: &str, issue_ref: &crate::issue::IssueRef)
+    -> Result<()>;
+
+    /// All issue ids and any valid stored account references, newest first.
+    fn linked_issue_refs(
+        &self,
+        worktree_path: &str,
+    ) -> Result<Vec<(String, Option<crate::issue::IssueRef>)>>;
+
     /// Record a reset target we are about to create, pruning each worktree's
     /// mark set to the freshest 100 (the undo planner only reads ~100 reflog
     /// entries anyway).

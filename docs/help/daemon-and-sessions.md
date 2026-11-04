@@ -198,6 +198,11 @@ see [[configuration]]. The roster side (verify a finished row, wait on one,
 gate `done`) is [[cli]]'s `dispatch verify` / `dispatch wait` /
 `dispatch set-status done`.
 
+Opening a configured agent through the daemon, control API, MCP or automation
+is refused before launch when its rendered command exceeds 100 KiB. The error
+names the command size and limit and asks you to shorten the task prompt; the
+prompt is never truncated.
+
 ## Serving thin clients
 
 ### Watching the event feed

@@ -59,6 +59,17 @@ of live data).
 The line reads the database read-only, including changes still in its
 write-ahead log.
 
+`thegn doctor` also prints Voice readiness and configuration, including the
+state, language, model, native build, live preview and credential status. Its
+Document preview renderers block reports containment, where `pdftoppm`,
+`pdftotext` and `mmdc` resolve, and whether each would run under `bwrap` (the
+Mermaid renderer is uncontained). Provider bridge (local artifact) reports
+whether the bridge is `none`, unreadable or present with its path, size,
+SHA-256 and content-addressed resident path. These checks only read; they do
+not start or install anything.
+In `--json`, these appear as `voice` (the same object as `thegn voice status --json`),
+`preview_renderers` and `resident_bridge`.
+
 For a support archive, run:
 
 ```sh

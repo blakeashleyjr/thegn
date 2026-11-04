@@ -93,17 +93,20 @@ pub enum Feature {
     Placement,
     /// Experimental command-backed voice mode (`[voice]`).
     Voice,
+    /// Resident plugin app tabs (`AppTab` contributions, plugin ids in `[apps]`).
+    PluginApps,
 }
 
 impl Feature {
     /// Every gated feature, for exhaustive iteration (e.g. the `doctor` table
     /// and the config clamp). Order is stable and display-friendly.
-    pub const ALL: [Feature; 5] = [
+    pub const ALL: [Feature; 6] = [
         Feature::Remote,
         Feature::Providers,
         Feature::Observe,
         Feature::Placement,
         Feature::Voice,
+        Feature::PluginApps,
     ];
 
     /// The feature's stable identifier (matches the docs / doctor output).
@@ -114,6 +117,7 @@ impl Feature {
             Feature::Observe => "observe",
             Feature::Placement => "placement",
             Feature::Voice => "voice",
+            Feature::PluginApps => "plugin_apps",
         }
     }
 
@@ -127,6 +131,7 @@ impl Feature {
             | Feature::Observe
             | Feature::Placement
             | Feature::Voice => Stability::Experimental,
+            Feature::PluginApps => Stability::Experimental,
         }
     }
 
@@ -183,7 +188,7 @@ mod tests {
         // ALL must cover every variant so the clamp/doctor never miss one.
         // (Compile-time exhaustiveness is enforced by `stability`'s match; this
         // guards ALL against drift.)
-        assert_eq!(Feature::ALL.len(), 5);
+        assert_eq!(Feature::ALL.len(), 6);
         let mut ids: Vec<&str> = Feature::ALL.iter().map(|f| f.id()).collect();
         ids.sort_unstable();
         ids.dedup();

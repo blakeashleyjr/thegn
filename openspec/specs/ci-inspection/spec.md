@@ -139,6 +139,37 @@ indication that lines were redacted and/or the tail truncated.
 - **THEN** it does so via the redaction chokepoint (pinned by a test that no
   other writer exists)
 
+### Requirement: Malformed and oversized CI log input follows one conservative policy
+
+The provider log collector SHALL apply redaction to each line before the
+tail's line and byte eviction, carrying PEM framing state across reader chunks
+and across discarded lines. A line that is not valid UTF-8 SHALL be dropped
+from the retained tail and the result SHALL be flagged truncated. A line
+longer than the per-line ceiling SHALL be discarded, the result flagged
+truncated, and the last PEM begin/end marker seen on it SHALL still update the
+framing state. CRLF line endings SHALL be preserved and only the line body
+redacted. An unterminated final line SHALL be redacted like any other line.
+When a retained tail begins after its PEM BEGIN was evicted, text before the
+first END marker SHALL be treated as key material.
+
+#### Scenario: A non-UTF-8 line is dropped
+
+- **WHEN** a provider log contains a line that is not valid UTF-8 between two
+  ordinary lines
+- **THEN** the retained tail holds only the two ordinary lines and is flagged
+  truncated
+
+#### Scenario: A CRLF-framed key block is redacted
+
+- **WHEN** a provider log frames a PEM block with CRLF line endings
+- **THEN** the block body is replaced by the redaction marker and the following
+  ordinary CRLF line is kept intact
+
+#### Scenario: An unterminated final line inside a key block
+
+- **WHEN** a provider log ends inside a PEM block without a trailing newline
+- **THEN** the unterminated final line is redacted
+
 ### Requirement: A failed run can be handed to the headless agent engine under an explicit policy
 
 thegn SHALL support handing a failed CI run to the shared agent-task engine as

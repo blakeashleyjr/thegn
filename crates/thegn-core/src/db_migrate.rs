@@ -2219,6 +2219,28 @@ pub(crate) fn verify_v101_schema(conn: &Connection) -> Result<()> {
     Ok(())
 }
 
+/// v102: bind worktree issue links to the account that produced them (THE-324).
+pub(crate) fn migrate_v102(conn: &Connection) -> Result<()> {
+    for column in ["provider", "account"] {
+        if !has_column(conn, "issue_links", column) {
+            conn.execute(
+                &format!("ALTER TABLE issue_links ADD COLUMN {column} TEXT"),
+                [],
+            )?;
+        }
+    }
+    Ok(())
+}
+
+pub(crate) fn verify_v102_schema(conn: &Connection) -> Result<()> {
+    for column in ["provider", "account"] {
+        if !has_column(conn, "issue_links", column) {
+            bail!("schema v102 migration did not add issue_links.{column}");
+        }
+    }
+    Ok(())
+}
+
 /// Verify the v69 identity ledger before the schema version is stamped. A
 /// missing column/table must never look like a completed migration.
 pub(crate) fn verify_v69_schema(conn: &Connection) -> Result<()> {
@@ -3823,7 +3845,6 @@ mod tests {
             .pragma_query_value(None, "user_version", |row| row.get(0))
             .unwrap();
         assert_eq!(version, crate::db::SCHEMA_VERSION);
-        assert_eq!(version, 101);
         let rows = upgraded.list_shares().unwrap();
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].owner, None);
@@ -3838,6 +3859,59 @@ mod tests {
         );
         assert_eq!(upgraded.list_shares().unwrap()[0].owner, Some(owner));
         super::verify_v101_schema(upgraded.conn()).unwrap();
+    }
+
+    #[test]
+    fn v102_adds_issue_link_account_columns_idempotently_and_verifies() {
+        let fresh = Db::open_memory().unwrap();
+        super::verify_v102_schema(fresh.conn()).unwrap();
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE issue_links (worktree_path TEXT NOT NULL, issue_id TEXT NOT NULL,
+             linked_at INTEGER NOT NULL, PRIMARY KEY (worktree_path, issue_id))",
+        )
+        .unwrap();
+        assert!(super::verify_v102_schema(&conn).is_err());
+        super::migrate_v102(&conn).unwrap();
+        super::migrate_v102(&conn).unwrap();
+        super::verify_v102_schema(&conn).unwrap();
+    }
+
+    #[test]
+    fn v102_upgrades_a_real_v101_database() {
+        use crate::issue::IssueRef;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("v101.db");
+        {
+            let db = Db::open_at(&path).unwrap();
+            db.link_issue("/wt/v101", "linear:ENG-1").unwrap();
+            db.conn()
+                .execute_batch(
+                    "ALTER TABLE issue_links DROP COLUMN provider;
+                     ALTER TABLE issue_links DROP COLUMN account;
+                     PRAGMA user_version=101;",
+                )
+                .unwrap();
+        }
+        let upgraded = Db::open_at(&path).unwrap();
+        let version: i64 = upgraded
+            .conn()
+            .pragma_query_value(None, "user_version", |row| row.get(0))
+            .unwrap();
+        assert_eq!(version, crate::db::SCHEMA_VERSION);
+        assert_eq!(version, 102);
+        assert_eq!(
+            upgraded.linked_issue_refs("/wt/v101").unwrap(),
+            vec![("linear:ENG-1".to_string(), None)]
+        );
+        let issue_ref = IssueRef::new("linear", "work", "linear:ENG-1").unwrap();
+        upgraded.link_issue_ref("/wt/v101", &issue_ref).unwrap();
+        assert_eq!(
+            upgraded.linked_issue_refs("/wt/v101").unwrap(),
+            vec![("linear:ENG-1".to_string(), Some(issue_ref))]
+        );
+        super::verify_v102_schema(upgraded.conn()).unwrap();
     }
 
     #[test]

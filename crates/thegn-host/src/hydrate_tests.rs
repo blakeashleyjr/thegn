@@ -1127,6 +1127,65 @@ fn glyph_persist_entry_serializes_only_the_row() {
 }
 
 #[test]
+fn glyph_retain_keeps_only_registered_paths() {
+    let now = Instant::now();
+    let row = glyph_row(false, 0, 0, Some("main"), "/repo", 0, 0, None);
+    let mut cache = std::collections::HashMap::from([
+        ("/repo/a".to_string(), (row.clone(), now)),
+        ("/repo/b".to_string(), (row.clone(), now)),
+        ("/repo/gone".to_string(), (row, now)),
+    ]);
+    let keep = ["/repo/a", "/repo/b"]
+        .iter()
+        .map(|path| path.to_string())
+        .collect::<std::collections::HashSet<String>>();
+
+    retain_registered_glyphs(&mut cache, &keep);
+
+    assert_eq!(
+        cache
+            .keys()
+            .cloned()
+            .collect::<std::collections::HashSet<_>>(),
+        keep
+    );
+}
+
+#[test]
+fn glyph_retain_empty_keep_set_clears_the_cache() {
+    let now = Instant::now();
+    let row = glyph_row(false, 0, 0, Some("main"), "/repo", 0, 0, None);
+    let mut cache = std::collections::HashMap::from([
+        ("/repo/a".to_string(), (row.clone(), now)),
+        ("/repo/b".to_string(), (row, now)),
+    ]);
+
+    retain_registered_glyphs(&mut cache, &std::collections::HashSet::new());
+
+    assert!(cache.is_empty());
+}
+
+#[test]
+fn glyph_retain_ignores_keep_entries_with_no_cache_row() {
+    let now = Instant::now();
+    let row = glyph_row(false, 0, 0, Some("main"), "/repo", 0, 0, None);
+    let mut cache = std::collections::HashMap::from([
+        ("/repo/kept-a".to_string(), (row.clone(), now)),
+        ("/repo/kept-b".to_string(), (row, now)),
+    ]);
+    let keep = (0..98)
+        .map(|index| format!("/repo/registered-{index}"))
+        .chain(["/repo/kept-a".to_string(), "/repo/kept-b".to_string()])
+        .collect::<std::collections::HashSet<String>>();
+
+    retain_registered_glyphs(&mut cache, &keep);
+
+    assert_eq!(cache.len(), 2);
+    assert!(cache.contains_key("/repo/kept-a"));
+    assert!(cache.contains_key("/repo/kept-b"));
+}
+
+#[test]
 fn needs_fallback_send_only_on_non_normal_exit() {
     // Normal exit (body ran + sent a model) must NOT re-send a fallback...
     let normal: std::thread::Result<Option<()>> = Ok(Some(()));

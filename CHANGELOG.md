@@ -7,6 +7,82 @@ All notable changes to **thegn** are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.1.0-alpha.48] — 2026-11-04 (maintenance batch 86)
+
+### Added
+
+- Plugin app tabs (dev channel): resident API 0.4 plugins can contribute an
+  `AppTab` workspace rendered by the new `thegn-plugin-ui` engine; F2/F3
+  (`plugin-app-drafts`/`plugin-app-requests`) open draft and request recovery.
+  Plugin API is now 0.4.0; 0.3 plugins load unchanged.
+
+- (dev channel) Experimental dictation adds `thegn voice setup`, which
+  configures embedded, HTTP or command transcription, and `thegn voice status`
+  reports readiness without opening the microphone. `thegn voice model list|pull|rm`
+  manages pinned, verified Whisper models in the user data
+  directory; setup and pull report download size and ask before downloading
+  unless `--yes` is used. `thegn doctor` adds a Voice block. Release builds
+  omit native capture; HTTP and command providers need an external
+  `capture_command` in those builds.
+- `thegn doctor` reports where `pdftoppm`, `pdftotext` and `mmdc` resolve and
+  whether each would run under `bwrap` (`preview_renderers` in `--json`), and
+  reports the local provider bridge artifact's path, size, SHA-256 and
+  resident path (`resident_bridge`). These checks do not start or install
+  anything.
+- `thegn share list` marks shares whose owning `thegn share start` process has
+  exited (`owner_state` in `--json`), and `thegn share stop` names an exited
+  owner.
+
+### Changed
+
+- The state database schema is now v102. Restart the host and daemon after
+  upgrading so they use the migrated database.
+- Daemon agent launches with rendered commands over 100 KiB are refused before
+  launch, with the command size and limit, instead of failing at exec.
+- The `devcontainer` CLI provider's trust digest covers Compose references
+  (`env_file`, build Dockerfiles, `extends` and `include`). Absolute, remote,
+  interpolated or repository-escaping references refuse provider use; provider
+  exec and session lookup also recheck config containment.
+- Landed-worktree cleanup skips rows held by another live drain claim; the
+  `merge sweep` marks them `merge_claimed`, reports incomplete and does not
+  start a retry delay.
+- `thegn ci logs` and the control API's `ci.logs` do not reuse cached logs
+  from another known provider context. The PR queue quotes cached logs only
+  for the current context.
+- GitHub issue listings and searches that exceed the 100-issue cap without a
+  limit are reported as partial instead of complete. A full Kaneo project page
+  is partial unless the requested limit was met.
+- The control API's `dispatches.put` normalizes issue ids and worktree paths
+  like `thegn dispatch put`, and rejects an unusable worktree before writing.
+- Worktree issue links are bound to the account that produced them.
+
+### Fixed
+
+- A share owned by a running `thegn share start` process is no longer
+  restarted when the thegn window opens.
+- Worktree creation and autopilot refuse when Git cannot read branches,
+  worktrees or the base branch, instead of assuming none exist or silently
+  choosing a default.
+- A clone holds an exclusive destination claim while it runs; a second clone
+  to the same destination is refused while the first process is alive.
+- The System > Telemetry LOOP row reports `no samples` or sample-aware render
+  tails (`sparse`, p95 and p99) instead of a bare p99 on an empty window.
+- On Linux, `./install.sh` validates the generated desktop entry before
+  publishing it and restores the previous installation if validation fails.
+- (dev channel) Cancelling a merge-queue drain also stops the consumer's
+  cross-host `git fetch` from the transferred bundle.
+- (dev channel) Opening a worktree against an existing provider sandbox
+  verifies its non-empty network policy, reapplies drift, and refuses an
+  unverifiable sandbox without destroying it.
+
+### Security
+
+- GitLab CI clients stay bound to the origin snapshot that selected them, so
+  a changed remote cannot redirect a credential-bearing API call.
+- (dev channel) Credentialed dictation HTTP endpoints require HTTPS unless
+  their host is loopback. Setup and configuration validation reject
+  credentialed plain HTTP; redirects are not followed.
+
 ## [0.1.0-alpha.47] — 2026-11-03 (maintenance batch 84)
 
 ### Added
@@ -2546,7 +2622,8 @@ launcher picker and the merge queue's `agent_command` hook remain — they run
 whatever commands you configure. Leftover `[llm_proxy]` config sections and
 `proxy_*` tables in existing state databases are ignored harmlessly.
 
-[Unreleased]: https://github.com/blakeashleyjr/thegn/compare/v0.1.0-alpha.47...HEAD
+[Unreleased]: https://github.com/blakeashleyjr/thegn/compare/v0.1.0-alpha.48...HEAD
+[0.1.0-alpha.48]: https://github.com/blakeashleyjr/thegn/compare/v0.1.0-alpha.47...v0.1.0-alpha.48
 [0.1.0-alpha.47]: https://github.com/blakeashleyjr/thegn/compare/v0.1.0-alpha.46...v0.1.0-alpha.47
 [0.1.0-alpha.46]: https://github.com/blakeashleyjr/thegn/compare/v0.1.0-alpha.45...v0.1.0-alpha.46
 [0.1.0-alpha.45]: https://github.com/blakeashleyjr/thegn/compare/v0.1.0-alpha.44...v0.1.0-alpha.45

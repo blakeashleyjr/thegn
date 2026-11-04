@@ -26,6 +26,7 @@
 
 pub mod bridge;
 pub mod input;
+pub(crate) mod plugin;
 pub mod registry;
 
 use tg_kit::ratatui::buffer::Buffer;
@@ -85,7 +86,7 @@ impl SlotState {
 /// One app tab.
 pub struct AppSlot {
     /// Stable id / config key for an embedded app tab.
-    pub id: &'static str,
+    pub id: String,
     /// Chip label fallback before the tile is running (the running tile's
     /// `title()` takes over, badges included).
     pub label: String,
@@ -98,6 +99,7 @@ pub struct AppSlot {
     focus_told: Option<bool>,
     /// The last dimensions delivered through `on_resize`.
     last_size: Option<(u16, u16)>,
+    plugin_binding: Option<PluginBinding>,
     /// Palette generation last delivered to this running tile.
     theme_told: Option<u64>,
     /// The last rendered buffer, re-blitted on frames where the tile reported
@@ -105,15 +107,21 @@ pub struct AppSlot {
     pub last_buf: Option<Buffer>,
 }
 
+type PluginBinding = (
+    std::sync::Weak<std::sync::Mutex<plugin::AppState>>,
+    plugin::Rebind,
+);
+
 impl AppSlot {
-    pub fn new(id: &'static str, label: impl Into<String>) -> AppSlot {
+    pub fn new(id: impl Into<String>, label: impl Into<String>) -> AppSlot {
         AppSlot {
-            id,
+            id: id.into(),
             label: label.into(),
             state: SlotState::Unloaded,
             visible_told: None,
             focus_told: None,
             last_size: None,
+            plugin_binding: None,
             theme_told: None,
             last_buf: None,
         }
@@ -142,7 +150,7 @@ impl Drop for AppSlot {
         {
             tracing::warn!(
                 target: "thegn::apps",
-                app = self.id,
+                app = %self.id,
                 "app shutdown panicked"
             );
         }
@@ -155,6 +163,7 @@ pub struct AppHost {
     pub active: ActiveApp,
     tab_order: Vec<ActiveApp>,
     default_tab: String,
+    plugin_default_pending: bool,
     observe_config_snapshot: thegn_core::config_observe::ObserveConfig,
 }
 
@@ -171,6 +180,7 @@ impl AppHost {
             active: ActiveApp::Work,
             tab_order,
             default_tab: "work".into(),
+            plugin_default_pending: false,
             observe_config_snapshot: thegn_core::config_observe::ObserveConfig::default(),
         }
     }
@@ -189,40 +199,59 @@ impl AppHost {
     pub fn reconcile(&mut self, cfg: &thegn_core::config::Config) {
         if self.observe_config_snapshot != cfg.observe {
             if let Some(slot) = self.slots.iter_mut().find(|slot| slot.id == "observe") {
-                *slot = AppSlot::new(slot.id, slot.label.clone());
+                *slot = AppSlot::new(slot.id.clone(), slot.label.clone());
             }
             self.observe_config_snapshot = cfg.observe.clone();
         }
         let active_id = self.active_id().map(str::to_owned);
         let previous_default = self.default_tab.clone();
-        let default_id = cfg.apps.normalized_default_tab(cfg.observe.enabled);
+        if thegn_core::config::AppsConfig::is_plugin_tab_id(&cfg.apps.default_tab)
+            && cfg.apps.default_tab != self.default_tab
+        {
+            self.plugin_default_pending = true;
+        }
+        let default_id = if thegn_core::config::AppsConfig::is_plugin_tab_id(&cfg.apps.default_tab)
+        {
+            cfg.apps.default_tab.clone()
+        } else {
+            cfg.apps.normalized_default_tab(cfg.observe.enabled)
+        };
         let enabled_ids: std::collections::HashSet<&str> =
             registry::enabled(cfg).map(|builder| builder.id).collect();
-        let tab_ids = cfg.apps.effective_tab_order(cfg.observe.enabled);
+        let plugin_ids: Vec<String> = self
+            .slots
+            .iter()
+            .filter(|slot| slot.id.starts_with("plugin:"))
+            .map(|slot| slot.id.clone())
+            .collect();
+        let mut tab_ids = Vec::new();
+        for id in cfg
+            .apps
+            .tab_order
+            .iter()
+            .cloned()
+            .chain(cfg.apps.effective_tab_order(cfg.observe.enabled))
+            .chain(plugin_ids.iter().cloned())
+        {
+            if (id == "work" || enabled_ids.contains(id.as_str()) || plugin_ids.contains(&id))
+                && !tab_ids.contains(&id)
+            {
+                tab_ids.push(id);
+            }
+        }
         let wanted_slots: Vec<&str> = tab_ids
             .iter()
-            .filter(|id| enabled_ids.contains(id.as_str()))
-            .filter_map(|id| registry::builder(id).map(|builder| builder.id))
+            .filter(|id| id.as_str() != "work")
+            .map(String::as_str)
             .collect();
-        let wanted_order: Vec<&str> = tab_ids
-            .iter()
-            .filter_map(|id| {
-                if id.as_str() == "work" {
-                    Some("work")
-                } else if enabled_ids.contains(id.as_str()) && registry::builder(id).is_some() {
-                    Some(id.as_str())
-                } else {
-                    None
-                }
-            })
-            .collect();
-        let current_slots: Vec<&str> = self.slots.iter().map(|slot| slot.id).collect();
+        let wanted_order: Vec<&str> = tab_ids.iter().map(String::as_str).collect();
+        let current_slots: Vec<&str> = self.slots.iter().map(|slot| slot.id.as_str()).collect();
         let current_order: Vec<&str> = self
             .tab_order
             .iter()
             .filter_map(|target| match target {
                 ActiveApp::Work => Some("work"),
-                ActiveApp::Tile(index) => self.slots.get(*index).map(|slot| slot.id),
+                ActiveApp::Tile(index) => self.slots.get(*index).map(|slot| slot.id.as_str()),
             })
             .collect();
         if default_id == previous_default
@@ -231,11 +260,19 @@ impl AppHost {
         {
             return;
         }
-
-        let mut old_slots: std::collections::HashMap<&'static str, AppSlot> =
-            self.slots.drain(..).map(|slot| (slot.id, slot)).collect();
+        let mut old_slots: std::collections::HashMap<String, AppSlot> = self
+            .slots
+            .drain(..)
+            .map(|slot| (slot.id.clone(), slot))
+            .collect();
         let mut slots = Vec::new();
         for id in &tab_ids {
+            if id.starts_with("plugin:") {
+                if let Some(slot) = old_slots.remove(id) {
+                    slots.push(slot);
+                }
+                continue;
+            }
             if !enabled_ids.contains(id.as_str()) {
                 continue;
             }
@@ -252,12 +289,12 @@ impl AppHost {
         self.tab_order = tab_ids
             .iter()
             .filter_map(|id| {
-                if id.as_str() == "work" {
+                if id == "work" {
                     Some(ActiveApp::Work)
                 } else {
                     self.slots
                         .iter()
-                        .position(|slot| slot.id == id.as_str())
+                        .position(|slot| slot.id == *id)
                         .map(ActiveApp::Tile)
                 }
             })
@@ -288,10 +325,140 @@ impl AppHost {
         self.default_tab = default_id;
     }
 
+    pub(crate) fn sync_plugins(
+        &mut self,
+        loading: bool,
+        descriptors: Vec<plugin::AppTabDescriptor>,
+        focus_request: Option<String>,
+        cfg: &thegn_core::config::Config,
+    ) -> bool {
+        if loading {
+            let mut changed = false;
+            for slot in &self.slots {
+                if let Some((shared, _)) = &slot.plugin_binding
+                    && let Some(shared) = shared.upgrade()
+                {
+                    let mut app = shared.lock().unwrap_or_else(|error| error.into_inner());
+                    if app.ready || app.writer.is_some() {
+                        app.writer = None;
+                        app.ready = false;
+                        app.epoch = app.epoch.wrapping_add(1);
+                        changed = true;
+                    }
+                }
+            }
+            return changed;
+        }
+        let desired: std::collections::HashSet<String> = descriptors
+            .iter()
+            .map(|descriptor| descriptor.id.clone())
+            .collect();
+        let active_id = self.active_id().unwrap_or("work").to_owned();
+        let before_ids: Vec<String> = self.slots.iter().map(|slot| slot.id.clone()).collect();
+        let mut changed = false;
+        self.slots.retain(|slot| {
+            let keep = !slot.id.starts_with("plugin:") || desired.contains(&slot.id);
+            changed |= !keep;
+            keep
+        });
+        for descriptor in descriptors {
+            if let Some(slot) = self.slots.iter_mut().find(|slot| slot.id == descriptor.id) {
+                if let Some((old, rebind)) = &mut slot.plugin_binding
+                    && !old.ptr_eq(&std::sync::Arc::downgrade(&descriptor.shared))
+                {
+                    *rebind.lock().unwrap_or_else(|error| error.into_inner()) = Some((
+                        descriptor.surface.clone(),
+                        descriptor.label.clone(),
+                        descriptor.shared.clone(),
+                    ));
+                    *old = std::sync::Arc::downgrade(&descriptor.shared);
+                    slot.label = descriptor.label;
+                    slot.last_buf = None;
+                    changed = true;
+                }
+            } else {
+                let mut slot = AppSlot::new(descriptor.id.clone(), descriptor.label.clone());
+                let theme = kit_theme(&crate::chrome::palette_snapshot());
+                let tile = plugin::PluginTile::new(
+                    descriptor.id,
+                    descriptor.surface,
+                    descriptor.label,
+                    descriptor.shared.clone(),
+                    theme,
+                );
+                slot.plugin_binding = Some((
+                    std::sync::Arc::downgrade(&descriptor.shared),
+                    tile.rebind_handle(),
+                ));
+                slot.state = SlotState::Running(Box::new(tile));
+                slot.theme_told = Some(crate::chrome::palette_generation());
+                self.slots.push(slot);
+                changed = true;
+            }
+        }
+        let after_ids: Vec<String> = self.slots.iter().map(|slot| slot.id.clone()).collect();
+        let mut order = Vec::new();
+        for id in cfg
+            .apps
+            .tab_order
+            .iter()
+            .map(String::as_str)
+            .chain(std::iter::once("work"))
+            .chain(after_ids.iter().map(String::as_str))
+        {
+            let target = if id == "work" {
+                Some(ActiveApp::Work)
+            } else {
+                self.slots
+                    .iter()
+                    .position(|slot| slot.id == id)
+                    .map(ActiveApp::Tile)
+            };
+            if let Some(target) = target
+                && !order.contains(&target)
+            {
+                order.push(target);
+            }
+        }
+        if self.tab_order != order {
+            self.tab_order = order;
+            changed = true;
+        }
+        let previous_active = self.active;
+        self.active = if active_id == "work" {
+            ActiveApp::Work
+        } else {
+            self.slots
+                .iter()
+                .position(|slot| slot.id == active_id)
+                .map(ActiveApp::Tile)
+                .unwrap_or(ActiveApp::Work)
+        };
+        if self.plugin_default_pending
+            && let Some(index) = self
+                .slots
+                .iter()
+                .position(|slot| slot.id == cfg.apps.default_tab)
+        {
+            self.active = ActiveApp::Tile(index);
+            self.plugin_default_pending = false;
+            changed = true;
+        }
+        let mut focus_applied = false;
+        if let Some(id) = focus_request
+            && let Some(index) = self.slots.iter().position(|slot| slot.id == id)
+        {
+            self.active = ActiveApp::Tile(index);
+            focus_applied = true;
+        }
+        changed |= self.active != previous_active || before_ids != after_ids || focus_applied;
+        changed
+    }
+
     pub fn active_id(&self) -> Option<&str> {
         match self.active {
             ActiveApp::Work => Some("work"),
-            ActiveApp::Tile(index) => self.slots.get(index).map(|slot| slot.id),
+            ActiveApp::Tile(index) => self.slots.get(index).map(|slot| slot.id.as_str()),
         }
     }
 
@@ -340,6 +507,42 @@ impl AppHost {
         self.tab_order[next]
     }
 
+    pub(crate) fn active_is_plugin(&self) -> bool {
+        self.active_id().is_some_and(|id| id.starts_with("plugin:"))
+    }
+
+    pub(crate) fn command_active(&mut self, command: &str) -> bool {
+        let ActiveApp::Tile(index) = self.active else {
+            return false;
+        };
+        let Some(slot) = self.slots.get_mut(index) else {
+            return false;
+        };
+        let Some(tile) = slot.state.tile_mut() else {
+            return false;
+        };
+        let handled = tile.command(command);
+        if handled {
+            slot.last_buf = None;
+        }
+        handled
+    }
+
+    /// Active app caret mapped into the compositor's vertical band.
+    pub(crate) fn active_cursor_in_band(
+        &mut self,
+        top: usize,
+        width: usize,
+        bottom: usize,
+    ) -> Option<(usize, usize)> {
+        self.active_tile_mut()
+            .and_then(|tile| tile.cursor())
+            .and_then(|(x, y)| {
+                let (x, y) = (usize::from(x), top + usize::from(y));
+                (x < width && y < bottom).then_some((x, y))
+            })
+    }
+
     /// The active tile, if an app tab (not `work`) is focused and running.
     pub fn active_tile_mut(&mut self) -> Option<&mut (dyn AppTile + 'static)> {
         match self.active {
@@ -378,7 +581,25 @@ impl AppHost {
 
     /// Render the active tile into its cached buffer, returning it for blitting.
     /// `area` is the tile-local rectangle (origin zero) in the host surface.
+    pub(crate) fn prepare_active_size(&mut self, width: u16, height: u16) {
+        let ActiveApp::Tile(index) = self.active else {
+            return;
+        };
+        let Some(slot) = self.slots.get_mut(index) else {
+            return;
+        };
+        let SlotState::Running(tile) = &mut slot.state else {
+            return;
+        };
+        if slot.last_size != Some((width, height)) {
+            tile.on_resize(width, height);
+            slot.last_size = Some((width, height));
+            slot.last_buf = None;
+        }
+    }
+
     pub fn render_active(&mut self, area: tg_kit::ratatui::layout::Rect) -> Option<&Buffer> {
+        self.prepare_active_size(area.width, area.height);
         let ActiveApp::Tile(index) = self.active else {
             return None;
         };
@@ -388,12 +609,6 @@ impl AppHost {
             slot.last_size = None;
             return None;
         };
-        let size = (area.width, area.height);
-        if slot.last_size != Some(size) {
-            tile.on_resize(size.0, size.1);
-            slot.last_size = Some(size);
-            slot.last_buf = None;
-        }
         if slot.last_buf.is_none() || tile.wants_redraw() {
             let buf = slot.last_buf.get_or_insert_with(|| Buffer::empty(area));
             if buf.area == area {
@@ -477,8 +692,57 @@ impl AppHost {
         }
     }
 
+    /// Pump only plugin slots; Observe keeps its existing app-channel path.
+    pub(crate) fn pump_plugins(&mut self) -> bool {
+        let active_idx = match self.active {
+            ActiveApp::Tile(i) => Some(i),
+            ActiveApp::Work => None,
+        };
+        let mut active_dirty = false;
+        for (i, slot) in self.slots.iter_mut().enumerate() {
+            if !slot.id.starts_with("plugin:") {
+                continue;
+            }
+            if let SlotState::Running(tile) = &mut slot.state {
+                let changed = tile.pump();
+                if changed {
+                    slot.last_buf = None;
+                }
+                if Some(i) == active_idx {
+                    active_dirty |= changed;
+                }
+            }
+        }
+        active_dirty
+    }
+
+    /// Pump the built-in Observe tile from its existing app-change channel.
+    pub(crate) fn pump_observe(&mut self) -> bool {
+        let active_idx = match self.active {
+            ActiveApp::Tile(i) => Some(i),
+            ActiveApp::Work => None,
+        };
+        let mut active_dirty = false;
+        for (i, slot) in self.slots.iter_mut().enumerate() {
+            if slot.id != "observe" {
+                continue;
+            }
+            if let SlotState::Running(tile) = &mut slot.state {
+                let changed = tile.pump();
+                if changed {
+                    slot.last_buf = None;
+                }
+                if Some(i) == active_idx {
+                    active_dirty |= changed;
+                }
+            }
+        }
+        active_dirty
+    }
+
     /// Drive every running tile's `pump` (cheap channel drain). Returns whether
     /// the active tile changed (the only one that triggers a redraw).
+    #[cfg(test)]
     pub fn pump_all(&mut self) -> bool {
         let active_idx = match self.active {
             ActiveApp::Tile(i) => Some(i),
@@ -513,7 +777,11 @@ pub fn start_slot_tile(
     waker: &termwiz::terminal::TerminalWaker,
     cfg: &thegn_core::config::Config,
 ) -> bool {
-    match registry::builder(slot.id) {
+    // Plugin ids have no registry builder; sync_plugins installs them as Running.
+    if slot.id.starts_with("plugin:") {
+        return false;
+    }
+    match registry::builder(&slot.id) {
         Some(b) => {
             let generation = crate::chrome::palette_generation();
             let hook = app_change_hook(app_tx, idx, waker);
@@ -543,7 +811,7 @@ fn record_build_result_at_generation(
             slot.theme_told = Some(generation);
         }
         Err(error) => {
-            tracing::warn!(target: "thegn::apps", app = slot.id, %error, "app construction failed");
+            tracing::warn!(target: "thegn::apps", app = %slot.id, %error, "app construction failed");
             slot.state = SlotState::Failed(error);
             slot.theme_told = None;
         }
@@ -564,10 +832,9 @@ fn notify_slot_theme(slot: &mut AppSlot, generation: u64, theme: &mut impl FnMut
 
 /// A tile's [`ChangeHook`](tg_kit::ChangeHook): fired off-thread when the tile
 /// has new data, it posts the slot index on the app channel and pulses the
-/// terminal waker so the loop drains `app_rx` → `pump_all()` → repaint. The
-/// receiver treats the index only as a wake signal and pumps the current slot
-/// set, so a late callback after reconciliation cannot address a new tile by
-/// its old vector index.
+/// terminal waker so the loop drains `app_rx` → `pump_observe()` → repaint. The
+/// receiver treats the index only as a wake signal; it never looks up the old
+/// slot index after reconciliation.
 fn app_change_hook(
     app_tx: &tokio::sync::mpsc::UnboundedSender<usize>,
     idx: usize,
@@ -756,6 +1023,7 @@ mod tests {
             active: ActiveApp::Work,
             tab_order: vec![ActiveApp::Work, ActiveApp::Tile(0), ActiveApp::Tile(1)],
             default_tab: "work".into(),
+            plugin_default_pending: false,
             observe_config_snapshot: thegn_core::config_observe::ObserveConfig::default(),
         };
         let delta = |k: char| match tab_chord(Modifiers::ALT, &KeyCode::Char(k), host.tab_count()) {
@@ -874,7 +1142,7 @@ mod tests {
     struct VisTile(std::sync::Arc<std::sync::Mutex<Vec<bool>>>);
 
     impl AppTile for VisTile {
-        fn id(&self) -> &'static str {
+        fn id(&self) -> &str {
             "observe"
         }
         fn title(&self) -> String {
@@ -901,7 +1169,7 @@ mod tests {
     }
 
     impl AppTile for LifecycleTile {
-        fn id(&self) -> &'static str {
+        fn id(&self) -> &str {
             "observe"
         }
         fn title(&self) -> String {
@@ -1083,7 +1351,7 @@ mod tests {
     }
 
     impl AppTile for ThemeTile {
-        fn id(&self) -> &'static str {
+        fn id(&self) -> &str {
             "observe"
         }
         fn title(&self) -> String {
@@ -1267,7 +1535,7 @@ mod tests {
     }
 
     impl AppTile for PasteTile {
-        fn id(&self) -> &'static str {
+        fn id(&self) -> &str {
             "observe"
         }
         fn title(&self) -> String {
@@ -1338,7 +1606,7 @@ mod tests {
     }
 
     impl AppTile for CacheTile {
-        fn id(&self) -> &'static str {
+        fn id(&self) -> &str {
             "observe"
         }
         fn title(&self) -> String {
@@ -1476,5 +1744,193 @@ mod tests {
         assert!(host.render_active(area).is_none());
         assert!(host.slots[0].last_buf.is_none());
         assert_eq!(host.slots[0].last_size, None);
+    }
+
+    fn plugin_descriptor(
+        id: &str,
+        label: &str,
+        shared: plugin::SharedApp,
+    ) -> plugin::AppTabDescriptor {
+        plugin::AppTabDescriptor {
+            id: id.into(),
+            label: label.into(),
+            surface: "surface".into(),
+            shared,
+        }
+    }
+
+    fn plugin_shared() -> plugin::SharedApp {
+        std::sync::Arc::new(std::sync::Mutex::new(plugin::AppState::new(false)))
+    }
+
+    #[test]
+    fn app_host_preserves_draft_through_empty_reload_gap_until_loaded() {
+        let cfg = thegn_core::config::Config::default();
+        let shared = plugin_shared();
+        {
+            let mut app = shared.lock().unwrap_or_else(|error| error.into_inner());
+            app.view = Some(thegn_core::plugin_app::AppView {
+                state_scope: "account".into(),
+                revision: 1,
+                root: thegn_core::plugin_app::Widget::Text {
+                    id: "draft".into(),
+                    title: "Draft".into(),
+                    text: "retained".into(),
+                },
+                status: String::new(),
+            });
+            app.requests
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .set_local_usage("surface".into(), (1, 32));
+            app.ready = true;
+        }
+        let mut host = AppHost::from_config(&cfg);
+        let descriptor = plugin_descriptor("plugin:demo:surface", "Demo", shared.clone());
+        assert!(host.sync_plugins(false, vec![descriptor.clone()], None, &cfg));
+        assert!(host.sync_plugins(true, Vec::new(), None, &cfg));
+        {
+            let app = shared.lock().unwrap_or_else(|error| error.into_inner());
+            assert!(!app.ready);
+            assert!(app.writer.is_none());
+            assert_eq!(app.view.as_ref().unwrap().revision, 1);
+            assert_eq!(
+                app.requests
+                    .lock()
+                    .unwrap_or_else(|error| error.into_inner())
+                    .local_usage("surface"),
+                Some((1, 32)),
+                "draft recovery accounting survives the empty discovery gap"
+            );
+            assert_eq!(host.slots[0].id, "plugin:demo:surface");
+        }
+        assert!(!host.sync_plugins(false, vec![descriptor], None, &cfg));
+        assert_eq!(
+            shared
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .view
+                .as_ref()
+                .unwrap()
+                .revision,
+            1
+        );
+    }
+
+    #[test]
+    fn sync_plugins_is_idempotent_and_reports_no_change() {
+        let cfg = thegn_core::config::Config::default();
+        let mut host = AppHost::from_config(&cfg);
+        let descriptor = plugin_descriptor("plugin:demo:surface", "Demo", plugin_shared());
+        assert!(host.sync_plugins(false, vec![descriptor.clone()], None, &cfg));
+        assert!(!host.sync_plugins(false, vec![descriptor], None, &cfg));
+    }
+
+    #[test]
+    fn removing_active_plugin_tab_selects_work() {
+        let cfg = thegn_core::config::Config::default();
+        let mut host = AppHost::from_config(&cfg);
+        let descriptor = plugin_descriptor("plugin:demo:surface", "Demo", plugin_shared());
+        host.sync_plugins(false, vec![descriptor], None, &cfg);
+        host.active = ActiveApp::Tile(0);
+        assert!(host.sync_plugins(false, Vec::new(), None, &cfg));
+        assert_eq!(host.active, ActiveApp::Work);
+    }
+
+    #[test]
+    fn plugin_default_tab_is_selected_once_after_discovery() {
+        let mut cfg = thegn_core::config::Config::default();
+        cfg.apps.default_tab = "plugin:demo:surface".into();
+        let mut host = AppHost::from_config(&cfg);
+        host.reconcile(&cfg);
+        let shared = plugin_shared();
+        let descriptor = plugin_descriptor("plugin:demo:surface", "Demo", shared.clone());
+        assert!(host.sync_plugins(false, vec![descriptor], None, &cfg));
+        assert_eq!(host.active_id(), Some("plugin:demo:surface"));
+        host.active = ActiveApp::Work;
+        assert!(!host.sync_plugins(
+            false,
+            vec![plugin_descriptor("plugin:demo:surface", "Demo", shared)],
+            None,
+            &cfg,
+        ));
+        assert_eq!(
+            host.active,
+            ActiveApp::Work,
+            "the configured plugin default is applied once after discovery"
+        );
+    }
+
+    #[test]
+    fn plugin_slot_receives_palette_generation_on_creation() {
+        let cfg = thegn_core::config::Config::default();
+        let mut host = AppHost::from_config(&cfg);
+        host.sync_plugins(
+            false,
+            vec![plugin_descriptor(
+                "plugin:demo:surface",
+                "Demo",
+                plugin_shared(),
+            )],
+            None,
+            &cfg,
+        );
+        assert_eq!(
+            host.slots[0].theme_told,
+            Some(crate::chrome::palette_generation())
+        );
+    }
+
+    struct CommandTile {
+        id: &'static str,
+        calls: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+    }
+
+    impl AppTile for CommandTile {
+        fn id(&self) -> &str {
+            self.id
+        }
+        fn title(&self) -> String {
+            self.id.into()
+        }
+        fn pump(&mut self) -> bool {
+            false
+        }
+        fn wants_redraw(&self) -> bool {
+            false
+        }
+        fn handle_input(&mut self, _event: tg_kit::InputEvent) -> tg_kit::InputResult {
+            tg_kit::InputResult::Ignored
+        }
+        fn command(&mut self, command: &str) -> bool {
+            self.calls
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .push(command.into());
+            true
+        }
+        fn render(&mut self, _area: tg_kit::ratatui::layout::Rect, _buffer: &mut Buffer) {}
+    }
+
+    #[test]
+    fn command_active_reaches_only_the_active_tile() {
+        let calls = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let mut first = AppSlot::new("observe", "Observe");
+        first.state = SlotState::Running(Box::new(CommandTile {
+            id: "observe",
+            calls: calls.clone(),
+        }));
+        let mut second = AppSlot::new("plugin:demo:surface", "Demo");
+        second.state = SlotState::Running(Box::new(CommandTile {
+            id: "plugin:demo:surface",
+            calls: calls.clone(),
+        }));
+        let mut host = AppHost::new(vec![first, second]);
+        host.active = ActiveApp::Tile(1);
+        assert!(host.command_active("plugin-app-requests"));
+        assert_eq!(
+            *calls.lock().unwrap_or_else(|error| error.into_inner()),
+            vec!["plugin-app-requests"]
+        );
     }
 }
