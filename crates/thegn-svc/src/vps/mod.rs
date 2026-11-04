@@ -749,10 +749,18 @@ impl VpsProvider {
         // would 409 the moment the managed key material differs from an
         // already-registered same-named key (key rotation, or a stale key from a
         // reinstall). Keyed by SHA-256 of the decoded key, distinct material ⇒
-        // distinct name. `matching_ssh_key` reuses identical material under any
-        // name, including keys registered with the earlier FNV naming scheme.
-        let name = thegn_core::managed_ssh::vendor_key_name(self.spec.pubkey.trim())
-            .context("vps: the managed public key is not a valid OpenSSH key")?;
+        // distinct name. The name is also scoped by provider and account;
+        // `matching_ssh_key` reuses identical material under any older name,
+        // including keys registered with the earlier FNV naming scheme.
+        let account = self
+            .account()
+            .context("vps: could not derive the provider account for the vendor key name")?;
+        let name = thegn_core::managed_ssh::scoped_vendor_key_name(
+            self.spec.kind.as_str(),
+            &account,
+            self.spec.pubkey.trim(),
+        )
+        .context("vps: the managed public key is not a valid OpenSSH key")?;
         let created = self
             .post_json(
                 &shaper.ssh_keys_url(base),

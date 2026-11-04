@@ -545,6 +545,7 @@ mod tests {
                     job_id: "j1".into(),
                     head_sha: "abc123".into(),
                     context: String::new(),
+                    attempt: None,
                 },
             })
         );

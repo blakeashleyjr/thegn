@@ -220,9 +220,10 @@ evidence.
 Calendar account tokens joined the credential broker after the THE-122
 completion above (THE-486): `ics_url` and `caldav` tokens resolve through the
 typed broker with value-free audit events, and `thegn secret list`, `audit` and
-`migrate` cover them. A `keyring:` calendar token resolves through the host
-broker like every other consumer; its dedicated host-level test seam is the one
-open item.
+`migrate` cover them. `keyring:`, `env:`, `file:` and literal tokens are each
+exercised through the host broker by tests in `crates/thegn-host/src/secret.rs`
+and `crates/thegn-host/src/hydrate_calendar_tests.rs`; a configured token that
+cannot be resolved sends no request.
 
 The reconciliation archived 62 delivered OpenSpec changes. The initial
 issue-linked set was:

@@ -453,6 +453,16 @@ shared resource ceiling; and `host-trust` means host execution on user trust.
 `thegn doctor --json` includes the table as `sandbox.admission_routes`, with
 `id`, `route`, `status`, and `path` fields.
 
+When `[[pipeline.stages]]` are configured, the text sandbox report ends with
+a `worker` row for the current worktree (or says there is nothing to probe
+outside a Git worktree). `ready` means the resolved sandbox lets stage workers
+write the worktree and Git metadata and reach the current `thegn` binary.
+`NOT READY` names the first failed prerequisite, such as a missing backend,
+unwritable mount or replaced binary. `NOT PROVEN` means the platform or
+backend is unsupported by this check; it is not a pass. The row is absent
+from `--json` and describes the current worktree's sandbox composition, not
+a live agent run. The check supports bwrap, podman, docker and smol.
+
 The honest **isolation class**, weakest to strongest:
 
 | Class              | Escape needs…                               | Backends                                             |

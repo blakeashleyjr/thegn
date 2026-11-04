@@ -154,9 +154,25 @@ pub(super) fn claim_or_verify(spec: &ProjectionSpec) -> Result<(), ProjectionOwn
         "thegn-projection v1\nidentity={}\ngeneration={generation}\n",
         spec.identity_digest()
     );
-    fsperm::write_owner_only_atomic(&manifest, contents.as_bytes()).map_err(|error| {
-        ProjectionOwnershipError::Unsafe(format!("{}: {error}", manifest.display()))
-    })
+    let manifest_parent = manifest.parent().ok_or_else(|| {
+        ProjectionOwnershipError::Unsafe(format!("{} has no parent directory", manifest.display()))
+    })?;
+    let manifest_name = manifest
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| {
+            ProjectionOwnershipError::Unsafe(format!(
+                "{} has no UTF-8 file name",
+                manifest.display()
+            ))
+        })?;
+    fsperm::ensure_private_dir(manifest_parent)
+        .and_then(|()| fsperm::open_private_dir(manifest_parent))
+        .and_then(|dir| dir.write_owner_only_atomic(manifest_name, contents.as_bytes()))
+        .map(|_| ())
+        .map_err(|error| {
+            ProjectionOwnershipError::Unsafe(format!("{}: {error}", manifest.display()))
+        })
 }
 
 pub(super) fn verify(spec: &ProjectionSpec) -> Result<(), ProjectionOwnershipError> {
@@ -349,6 +365,28 @@ mod tests {
 
         claim_or_verify(&spec).expect("recreate owned mountpoint");
         assert!(Path::new(&spec.mountpoint).is_dir());
+    }
+
+    #[test]
+    fn claim_publishes_the_manifest_owner_only_and_leaves_no_temporary() {
+        // Positive control: the base path writer also publishes a private manifest.
+        let (_root, spec) = fixture(DataMode::Sync);
+        claim_or_verify(&spec).expect("claim fresh projection");
+
+        let manifest = manifest_path(&spec);
+        let mode = fsperm::mode_bits(&manifest).expect("read manifest mode");
+        assert!(mode.is_none_or(|bits| bits == 0o600));
+        let parent = manifest.parent().expect("manifest parent");
+        let parent_mode = fsperm::mode_bits(parent).expect("read manifest parent mode");
+        assert!(parent_mode.is_none_or(|bits| bits == 0o700));
+        let entries = std::fs::read_dir(parent)
+            .expect("read manifest parent")
+            .map(|entry| entry.unwrap().file_name())
+            .collect::<Vec<_>>();
+        assert!(entries.iter().all(|name| {
+            let name = name.to_string_lossy();
+            !name.starts_with('.') && !name.contains(".tmp-")
+        }));
     }
 
     #[test]

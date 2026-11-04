@@ -5,13 +5,11 @@ use crate::msg;
 use crate::sandbox_backend::{HostOs, host_os};
 use std::collections::HashMap;
 use std::ffi::OsString;
-use std::io::Read;
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Stdio};
+use std::process::{Command, Stdio};
 use std::sync::{
     Arc, Condvar, Mutex, OnceLock,
     atomic::{AtomicBool, Ordering},
-    mpsc,
 };
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -229,15 +227,11 @@ pub(crate) fn git_stdout_bounded(
     bounded_stdout(command, max_bytes)
 }
 
-/// Capture a subprocess stdout pipe with one owner for the child and one owner
-/// for the reader. There is no named temporary file to replace or reopen, and
-/// the reader stops at `max_bytes + 1` instead of polling an unbounded spool.
-/// Unix probes are put in their own process group so descendants holding the
-/// pipe are torn down with the probe.
-/// Concurrent identity probes allowed per process. Each slot is one short
-/// `git rev-parse`-class child plus its reader, so the lane exists to bound a
-/// pathological repository, not to serialize ordinary work: a fleet creating
-/// several worktrees at once must not be refused. Acquisition WAITS for a slot
+/// Identity probes run under `thegn_proc::run`, in their own process group,
+/// with a byte cap and a hard deadline.
+/// Concurrent identity probes allowed per process. Each slot bounds one short
+/// `git rev-parse`-class child and its captured output, so a pathological
+/// repository cannot serialize ordinary work. Acquisition waits for a slot
 /// (see [`IDENTITY_CAPTURE_WAIT`]) instead of failing instantly.
 const IDENTITY_CAPTURE_SLOTS: usize = 16;
 
@@ -362,169 +356,71 @@ impl Drop for IdentityCaptureBudget {
     }
 }
 
-type IdentityReapJob = (Child, Arc<IdentityCaptureBudget>);
-
-fn identity_reaper() -> Result<&'static mpsc::SyncSender<IdentityReapJob>, String> {
-    static REAPER: OnceLock<Result<mpsc::SyncSender<IdentityReapJob>, String>> = OnceLock::new();
-    REAPER
-        .get_or_init(|| {
-            let (sender, receiver) = mpsc::sync_channel::<IdentityReapJob>(IDENTITY_CAPTURE_SLOTS);
-            std::thread::Builder::new()
-                .name("thegn-gitid-rp".into())
-                .spawn(move || {
-                    while let Ok((mut child, budget)) = receiver.recv() {
-                        // This is the one shared reaper for the capture lane.
-                        // Its queue is bounded, so a stuck child cannot create
-                        // one new waiter per timed-out probe.
-                        match child.wait() {
-                            Ok(_) => drop(budget),
-                            Err(_) => withhold_unknown_ownership(child, budget),
-                        }
-                    }
-                })
-                .map(|_| sender)
-                .map_err(|error| error.to_string())
-        })
-        .as_ref()
-        .map_err(|error| error.clone())
-}
-
-/// The child could not be reaped (or queued for reaping), so nothing here may
-/// signal its PID again and its pipe may still be held. Forget the handle —
-/// on Unix the unreaped zombie keeps the PID from being reused — and withhold
-/// the slot for a bounded interval instead of forever.
-fn withhold_unknown_ownership(child: Child, budget: Arc<IdentityCaptureBudget>) {
-    budget.withhold_slot();
-    drop(budget);
-    std::mem::forget(child);
-}
-
-fn reap_identity_later(child: Child, budget: Arc<IdentityCaptureBudget>) {
-    let sender = identity_reaper().expect("identity reaper initialized before child spawn");
-    match sender.try_send((child, budget)) {
-        Ok(()) => {}
-        Err(mpsc::TrySendError::Full(job) | mpsc::TrySendError::Disconnected(job)) => {
-            let (child, budget) = job;
-            withhold_unknown_ownership(child, budget);
-        }
-    }
-}
-
-fn kill_identity_process_tree(child: &mut Child) {
-    #[cfg(unix)]
-    {
-        use nix::sys::signal::{Signal, killpg};
-        use nix::unistd::Pid;
-        if let Ok(pid) = i32::try_from(child.id()) {
-            // The direct child remains owned and unreaped while this runs, so
-            // the process-group identity cannot have been reused.
-            let _ = killpg(Pid::from_raw(pid), Signal::SIGKILL);
-        }
-    }
-    // Windows has no process-group operation in this core seam. The direct
-    // child is killed, while the reader/reaper budget remains held if a
-    // descendant retains stdout; callers therefore fail closed instead of
-    // claiming descendant containment parity.
-    let _ = child.kill();
-}
-
-type IdentityReaderSpawner = fn(Box<dyn FnOnce() + Send>) -> std::io::Result<()>;
-
-fn spawn_identity_reader(task: Box<dyn FnOnce() + Send>) -> std::io::Result<()> {
-    std::thread::Builder::new()
-        .name("thegn-gitid-rd".into())
-        .spawn(task)
-        .map(drop)
-}
+/// Hard wall-clock bound of one identity probe.
+const IDENTITY_PROBE_DEADLINE: Duration = Duration::from_secs(2);
 
 fn bounded_stdout(command: Command, max_bytes: usize) -> Result<Vec<u8>, String> {
-    bounded_stdout_with(command, max_bytes, spawn_identity_reader, identity_lane())
+    bounded_stdout_with(command, max_bytes, identity_lane())
 }
 
 fn bounded_stdout_with(
     mut command: Command,
     max_bytes: usize,
-    spawn_reader: IdentityReaderSpawner,
     lane: &'static IdentityCaptureLane,
 ) -> Result<Vec<u8>, String> {
-    command.stdout(Stdio::piped()).stderr(Stdio::null());
-    let read_limit = u64::try_from(max_bytes)
-        .ok()
-        .and_then(|limit| limit.checked_add(1))
-        .ok_or_else(|| "git identity probe has an invalid output bound".to_string())?;
-    identity_reaper()?;
     let budget = lane.acquire(IDENTITY_CAPTURE_WAIT)?;
-    #[cfg(unix)]
-    command.process_group(0);
-    let mut child = match command.spawn() {
-        Ok(child) => child,
-        Err(error) => return Err(error.to_string()),
+    let limits = thegn_proc::Limits {
+        stdout: thegn_proc::Stream::HeadOrFail { cap: max_bytes },
+        stderr: thegn_proc::Stream::Null,
+        ..thegn_proc::Limits::silent(IDENTITY_PROBE_DEADLINE)
     };
-    let stdout = match child.stdout.take() {
-        Some(stdout) => stdout,
-        None => {
-            kill_identity_process_tree(&mut child);
-            reap_identity_later(child, budget.clone());
-            return Err("git identity probe stdout pipe was not created".into());
-        }
-    };
-    let (sender, receiver) = mpsc::sync_channel(1);
-    let reader_budget = Arc::clone(&budget);
-    let reader_task = Box::new(move || {
-        let mut bytes = Vec::with_capacity(max_bytes.min(4096));
-        let result = stdout
-            .take(read_limit)
-            .read_to_end(&mut bytes)
-            .map(|_| bytes);
-        drop(reader_budget);
-        let _ = sender.send(result);
-    });
-    if let Err(error) = spawn_reader(reader_task) {
-        kill_identity_process_tree(&mut child);
-        reap_identity_later(child, budget.clone());
-        return Err(error.to_string());
+    let cancel = AtomicBool::new(false);
+    let run = thegn_proc::run(&mut command, &limits, &cancel);
+    let (result, withhold) = identity_outcome(run);
+    if withhold {
+        budget.withhold_slot();
     }
-    let deadline = std::time::Instant::now() + Duration::from_secs(2);
-    // Do not reap the leader while its stdout is still held. try_wait(Some)
-    // reaps on Unix: signaling its numeric process group after that could kill
-    // an unrelated reused PID. Waiting for bounded pipe completion first keeps
-    // the leader (including a zombie) owned until every possible group signal.
-    let captured =
-        receiver.recv_timeout(deadline.saturating_duration_since(std::time::Instant::now()));
-    let bytes = match captured {
-        Ok(Ok(bytes)) if bytes.len() <= max_bytes => bytes,
-        other => {
-            kill_identity_process_tree(&mut child);
-            reap_identity_later(child, budget.clone());
-            return Err(match other {
-                Ok(Ok(_)) => "git identity probe output exceeded its bound".into(),
-                Ok(Err(error)) => error.to_string(),
-                Err(_) => "git identity probe stdout reader exceeded its time bound".into(),
-            });
-        }
+    result
+}
+
+/// Map a finished run to the probe result and whether its lane slot must be
+/// withheld. FAIL CLOSED: only a drained group, EOF'd stdout and a reaped zero
+/// exit is `Ok`.
+fn identity_outcome(run: thegn_proc::Run) -> (Result<Vec<u8>, String>, bool) {
+    use thegn_proc::{End, GroupState, Leader};
+    let thegn_proc::Run {
+        end,
+        group,
+        leader,
+        stdout,
+        ..
+    } = run;
+    let spawned = !matches!(&end, End::Spawn(_));
+    let withhold = spawned
+        && (matches!(group, GroupState::Survivors | GroupState::Unknown)
+            || matches!(&leader, Leader::Detached | Leader::ReapFailed(_)));
+    let result = match end {
+        End::Spawn(error) => Err(error.to_string()),
+        End::OutputLimit(_) => Err("git identity probe output exceeded its bound".to_string()),
+        End::TimedOut => Err("git identity probe exceeded its time bound".to_string()),
+        End::Cancelled => Err("git identity probe was cancelled".to_string()),
+        End::Supervise(error) => Err(format!(
+            "git identity probe could not be supervised: {error}"
+        )),
+        End::LeaderExited => match leader {
+            Leader::Reaped(status) if !status.success() => Err(format!("git exited with {status}")),
+            Leader::Reaped(_) if group == GroupState::Drained && stdout.eof => Ok(stdout.bytes),
+            Leader::Reaped(_) if group == GroupState::Drained && !stdout.eof => {
+                Err("git identity probe left an open pipe behind".to_string())
+            }
+            Leader::Reaped(_) => Err(
+                "git identity probe stdout reader exceeded its time bound; descendants remained"
+                    .to_string(),
+            ),
+            _ => Err("git identity probe leader was not reaped".to_string()),
+        },
     };
-    let status = loop {
-        match child.try_wait() {
-            Ok(Some(status)) => break status,
-            Ok(None) if std::time::Instant::now() < deadline => {
-                std::thread::sleep(Duration::from_millis(10));
-            }
-            Ok(None) => {
-                kill_identity_process_tree(&mut child);
-                reap_identity_later(child, budget.clone());
-                return Err("git identity probe exceeded its time bound".into());
-            }
-            Err(error) => {
-                // Ownership is uncertain: never signal a numeric PID here.
-                reap_identity_later(child, budget.clone());
-                return Err(error.to_string());
-            }
-        }
-    };
-    if !status.success() {
-        return Err(format!("git exited with {status}"));
-    }
-    Ok(bytes)
+    (result, withhold)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2347,6 +2243,222 @@ mod tests {
             lane.acquire(Duration::from_secs(5)).is_ok(),
             "a withheld slot must be reclaimed after its retention"
         );
+    }
+
+    #[cfg(unix)]
+    fn identity_run(
+        end: thegn_proc::End,
+        group: thegn_proc::GroupState,
+        leader: thegn_proc::Leader,
+        stdout_eof: bool,
+    ) -> thegn_proc::Run {
+        thegn_proc::Run {
+            end,
+            group,
+            leader,
+            leader_exited_first: true,
+            stdout: thegn_proc::Capture {
+                bytes: b"abc".to_vec(),
+                total: 3,
+                eof: stdout_eof,
+                ..Default::default()
+            },
+            stderr: thegn_proc::Capture::default(),
+            containment: thegn_proc::Containment::ProcessGroup,
+        }
+    }
+
+    #[cfg(unix)]
+    fn identity_ok_status() -> std::process::ExitStatus {
+        std::os::unix::process::ExitStatusExt::from_raw(0)
+    }
+
+    #[cfg(unix)]
+    fn identity_failed_status() -> std::process::ExitStatus {
+        std::os::unix::process::ExitStatusExt::from_raw(3 << 8)
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn identity_outcome_accepts_only_a_drained_eof_success() {
+        let clean = identity_run(
+            thegn_proc::End::LeaderExited,
+            thegn_proc::GroupState::Drained,
+            thegn_proc::Leader::Reaped(identity_ok_status()),
+            true,
+        );
+        assert_eq!(identity_outcome(clean), (Ok(b"abc".to_vec()), false));
+
+        let open_pipe = identity_run(
+            thegn_proc::End::LeaderExited,
+            thegn_proc::GroupState::Drained,
+            thegn_proc::Leader::Reaped(identity_ok_status()),
+            false,
+        );
+        let (result, withhold) = identity_outcome(open_pipe);
+        assert!(result.unwrap_err().contains("open pipe"));
+        assert!(!withhold);
+
+        let descendants = identity_run(
+            thegn_proc::End::LeaderExited,
+            thegn_proc::GroupState::Terminated,
+            thegn_proc::Leader::Reaped(identity_ok_status()),
+            true,
+        );
+        let (result, withhold) = identity_outcome(descendants);
+        assert!(result.unwrap_err().contains("descendants"));
+        assert!(!withhold);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn identity_outcome_fails_closed_and_withholds_unsettled_runs() {
+        let survivors = identity_run(
+            thegn_proc::End::TimedOut,
+            thegn_proc::GroupState::Survivors,
+            thegn_proc::Leader::Reaped(identity_failed_status()),
+            false,
+        );
+        let (result, withhold) = identity_outcome(survivors);
+        assert!(result.is_err());
+        assert!(withhold);
+
+        let detached = identity_run(
+            thegn_proc::End::LeaderExited,
+            thegn_proc::GroupState::Drained,
+            thegn_proc::Leader::Detached,
+            true,
+        );
+        let (result, withhold) = identity_outcome(detached);
+        assert!(result.unwrap_err().contains("not reaped"));
+        assert!(withhold);
+
+        let reap_failed = identity_run(
+            thegn_proc::End::LeaderExited,
+            thegn_proc::GroupState::Drained,
+            thegn_proc::Leader::ReapFailed(std::io::Error::other("x")),
+            true,
+        );
+        let (result, withhold) = identity_outcome(reap_failed);
+        assert!(result.is_err());
+        assert!(withhold);
+
+        let supervise = identity_run(
+            thegn_proc::End::Supervise(std::io::Error::other("x")),
+            thegn_proc::GroupState::Unknown,
+            thegn_proc::Leader::Reaped(identity_failed_status()),
+            false,
+        );
+        let (result, withhold) = identity_outcome(supervise);
+        assert!(result.unwrap_err().contains("could not be supervised"));
+        assert!(withhold);
+
+        let terminated = identity_run(
+            thegn_proc::End::TimedOut,
+            thegn_proc::GroupState::Terminated,
+            thegn_proc::Leader::Reaped(identity_failed_status()),
+            false,
+        );
+        let (result, withhold) = identity_outcome(terminated);
+        assert!(result.is_err());
+        assert!(!withhold);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn identity_outcome_keeps_the_legacy_messages() {
+        let cancelled = identity_run(
+            thegn_proc::End::Cancelled,
+            thegn_proc::GroupState::Terminated,
+            thegn_proc::Leader::Reaped(identity_failed_status()),
+            false,
+        );
+        assert!(
+            identity_outcome(cancelled)
+                .0
+                .unwrap_err()
+                .contains("cancelled")
+        );
+
+        let output_limit = identity_run(
+            thegn_proc::End::OutputLimit(thegn_proc::Which::Stdout),
+            thegn_proc::GroupState::Terminated,
+            thegn_proc::Leader::Reaped(identity_failed_status()),
+            false,
+        );
+        assert!(
+            identity_outcome(output_limit)
+                .0
+                .unwrap_err()
+                .contains("exceeded its bound")
+        );
+
+        let timeout = identity_run(
+            thegn_proc::End::TimedOut,
+            thegn_proc::GroupState::Terminated,
+            thegn_proc::Leader::Reaped(identity_failed_status()),
+            false,
+        );
+        assert!(
+            identity_outcome(timeout)
+                .0
+                .unwrap_err()
+                .contains("time bound")
+        );
+
+        let nonzero = identity_run(
+            thegn_proc::End::LeaderExited,
+            thegn_proc::GroupState::Drained,
+            thegn_proc::Leader::Reaped(identity_failed_status()),
+            true,
+        );
+        assert!(
+            identity_outcome(nonzero)
+                .0
+                .unwrap_err()
+                .starts_with("git exited with")
+        );
+
+        let spawn = identity_run(
+            thegn_proc::End::Spawn(std::io::Error::from(std::io::ErrorKind::NotFound)),
+            thegn_proc::GroupState::Unknown,
+            thegn_proc::Leader::NotSpawned,
+            false,
+        );
+        let (result, withhold) = identity_outcome(spawn);
+        assert!(result.is_err());
+        assert!(!withhold);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn identity_probe_clean_run_returns_stdout_and_releases_the_slot() {
+        let lane = test_lane(1);
+        let mut command = Command::new("/bin/sh");
+        command.args(["-c", "printf ok"]);
+        assert_eq!(bounded_stdout_with(command, 32, lane).unwrap(), b"ok");
+        assert!(lane.acquire(Duration::ZERO).is_ok());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn identity_probe_deadline_ends_a_hung_child() {
+        let lane = test_lane(1);
+        let mut command = Command::new("/bin/sh");
+        command.args(["-c", "sleep 30"]);
+        let started = Instant::now();
+        let error = bounded_stdout_with(command, 32, lane).unwrap_err();
+        assert!(error.contains("time bound"));
+        assert!(started.elapsed() < Duration::from_secs(10));
+        assert!(lane.acquire(Duration::ZERO).is_ok());
+    }
+
+    #[test]
+    fn identity_probe_spawn_failure_releases_the_slot() {
+        let lane = test_lane(1);
+        let command = Command::new("thegn-no-such-binary-729c");
+        assert!(bounded_stdout_with(command, 32, lane).is_err());
+        assert!(lane.acquire(Duration::ZERO).is_ok());
     }
 
     #[test]
