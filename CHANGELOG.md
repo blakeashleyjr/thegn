@@ -44,8 +44,8 @@ All notable changes to **thegn** are documented here. The format follows
 - Worktree creation is refused without changes when Git cannot verify whether
   the branch already exists; failed branch renames and worktree moves include
   Git's reason.
-- Quitting during a calendar refresh starts no further account fetches; fetches
-  already in flight may finish.
+- Quitting during a scheduled calendar refresh starts no further account
+  fetches; fetches already in flight may finish.
 - Orphan detection keeps a live worktree's main container when its slug ends in
   `-tgvpn` or `-tgagent`.
 - (dev channel) The x86_64 Linux `.#dev` package sets `THEGN_BRIDGE_BINARY` to
@@ -53,10 +53,10 @@ All notable changes to **thegn** are documented here. The format follows
 
 ### Security
 
-- (dev channel) SSH sync projections with different SSH extra arguments have
-  different identities; a mismatch is refused before any mount, pull or push.
-  Existing SSH projections with non-empty extra arguments may need to be
-  recreated after upgrading.
+- (dev channel) SSH data projections (sshfs or sync) with different SSH extra
+  arguments have different identities; a mismatch is refused before any mount,
+  pull or push. Existing SSH projections with non-empty extra arguments may
+  need to be recreated after upgrading.
 - (dev channel) Managed SSH custody records use a monotonic generation, so a
   revoked and republished key cannot match a stale rotation snapshot.
 

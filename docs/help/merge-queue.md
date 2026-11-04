@@ -118,7 +118,7 @@ verifies the new commits. Otherwise they refuse with the reason; use
   landing. Up to 200 events, including drain transitions, are kept per
   worktree; a removed worktree's history is dropped with it. When a matching
   queue row exists, a refused `thegn merge land` (or the panel's land key) is
-  recorded as operation `land` with its outcome (`not_ready`,
+  recorded as operation `land` with its outcome (for example `not_ready`,
   `candidate_moved` or `claimed`); the row stays unchanged, and an audit-write
   failure does not hide the refusal.
 
