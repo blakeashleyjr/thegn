@@ -827,6 +827,32 @@ fn member_branch_states(members: &[(String, String)], branch: &str) -> MemberPro
     probes
 }
 
+fn plan_member_probes(
+    branch: &str,
+    probes: &MemberProbes,
+    repos_filter: Option<&[String]>,
+) -> (
+    thegn_core::project::BatchedCreatePlan,
+    Vec<(String, String)>,
+) {
+    let unreadable: Vec<(String, String)> = probes
+        .unreadable
+        .iter()
+        .filter(|(repo, _)| {
+            repos_filter.is_none_or(|filter| filter.iter().any(|name| name == repo))
+        })
+        .cloned()
+        .collect();
+    let mut plan = thegn_core::project::plan_batched_create(branch, &probes.states, repos_filter);
+    plan.unknown_repos.retain(|name| {
+        !probes
+            .unreadable
+            .iter()
+            .any(|(unreadable_repo, _)| unreadable_repo == name)
+    });
+    (plan, unreadable)
+}
+
 /// `wt new --program <p>` — batched cross-repo feature creation. Resolves ONE
 /// linked branch name (prefix + slug, applied once — per-repo prefix overrides
 /// are NOT re-applied, so identity is literal) and creates that exact branch +
@@ -902,7 +928,7 @@ fn new_batched(
             .filter(|r| !r.is_empty())
             .collect()
     });
-    let plan = project::plan_batched_create(&branch, &probes.states, repos_filter.as_deref());
+    let (plan, unreadable) = plan_member_probes(&branch, &probes, repos_filter.as_deref());
 
     if let Some(name) = folder.as_deref() {
         preflight_new_folder_name(
@@ -926,8 +952,8 @@ fn new_batched(
         error: Option<String>,
     }
     let mut outcomes: Vec<MemberOutcome> =
-        Vec::with_capacity(plan.members.len() + probes.unreadable.len());
-    for (repo, error) in probes.unreadable {
+        Vec::with_capacity(plan.members.len() + unreadable.len());
+    for (repo, error) in unreadable {
         outcomes.push(MemberOutcome {
             repo,
             status: "failed",
@@ -2229,7 +2255,7 @@ mod folder_tests {
 
 #[cfg(test)]
 mod member_probe_tests {
-    use super::member_branch_states;
+    use super::{member_branch_states, plan_member_probes};
 
     fn temp_repo(parent: &std::path::Path, name: &str) -> std::path::PathBuf {
         let repo = parent.join(name);
@@ -2300,5 +2326,43 @@ mod member_probe_tests {
         assert_eq!(probes.states[0].repo_name, "api");
         assert_eq!(probes.unreadable.len(), 1);
         assert_eq!(probes.unreadable[0].0, "broken");
+    }
+
+    #[test]
+    fn plan_member_probes_keeps_selected_unreadable_member_without_calling_it_unknown() {
+        let parent = tempfile::tempdir_in("/tmp").unwrap();
+        let broken = parent.path().join("broken");
+        std::fs::create_dir(&broken).unwrap();
+        let members = vec![(broken.to_string_lossy().into_owned(), "broken".to_string())];
+        let probes = member_branch_states(&members, "feat/x");
+        let filter = vec!["broken".to_string()];
+
+        let (plan, unreadable) = plan_member_probes("feat/x", &probes, Some(&filter));
+
+        assert!(plan.members.is_empty());
+        assert!(plan.unknown_repos.is_empty());
+        assert_eq!(unreadable.len(), 1);
+        assert_eq!(unreadable[0].0, "broken");
+    }
+
+    #[test]
+    fn plan_member_probes_excludes_unreadable_members_outside_filter() {
+        let parent = tempfile::tempdir_in("/tmp").unwrap();
+        let repo = temp_repo(parent.path(), "api");
+        let broken = parent.path().join("broken");
+        std::fs::create_dir(&broken).unwrap();
+        let members = vec![
+            (repo.to_string_lossy().into_owned(), "api".to_string()),
+            (broken.to_string_lossy().into_owned(), "broken".to_string()),
+        ];
+        let probes = member_branch_states(&members, "feat/x");
+        let filter = vec!["api".to_string()];
+
+        let (plan, unreadable) = plan_member_probes("feat/x", &probes, Some(&filter));
+
+        assert_eq!(plan.members.len(), 1);
+        assert_eq!(plan.members[0].repo_name, "api");
+        assert!(plan.unknown_repos.is_empty());
+        assert!(unreadable.is_empty());
     }
 }
