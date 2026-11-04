@@ -35,6 +35,10 @@ fn cell_grid_example_manifest_negotiates_one_app_tab() {
 }
 
 #[test]
+#[allow(
+    clippy::disallowed_macros,
+    reason = "report when the optional Python runtime is unavailable"
+)]
 fn cell_grid_example_answers_activate_key_resize_and_stale_session_over_the_real_wire() {
     if std::process::Command::new("python3")
         .arg("--version")
