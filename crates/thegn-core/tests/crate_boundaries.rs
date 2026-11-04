@@ -201,3 +201,82 @@ fn every_member_is_covered() {
     }
     assert!(names.len() >= 11, "{names:?}");
 }
+
+#[test]
+fn plugin_sdk_is_not_a_dependency_of_any_other_member() {
+    const SDK_DEPENDENTS: &[&str] = &[]; // The Todoist example adds itself here deliberately.
+    let members = members();
+    assert!(members.contains_key("thegn-plugin-sdk"));
+    let mut problems = Vec::new();
+    for (krate, deps) in &members {
+        if deps
+            .iter()
+            .any(|dependency| dependency == "thegn-plugin-sdk")
+            && !SDK_DEPENDENTS.contains(&krate.as_str())
+        {
+            problems.push(krate);
+        }
+    }
+    assert!(
+        problems.is_empty(),
+        "the plugin SDK is plugin-side only and must stay off the host link graph: {problems:?}"
+    );
+}
+
+#[test]
+fn plugin_sdk_keyring_features_match_the_host_so_the_lockfile_does_not_fork() {
+    let root = workspace_root();
+    let sdk: toml::Value = toml::from_str(
+        &std::fs::read_to_string(root.join("crates/thegn-plugin-sdk/Cargo.toml")).unwrap(),
+    )
+    .unwrap();
+    let host: toml::Value = toml::from_str(
+        &std::fs::read_to_string(root.join("crates/thegn-host/Cargo.toml")).unwrap(),
+    )
+    .unwrap();
+    let sdk_keyring = &sdk["dependencies"]["keyring"];
+    let host_keyring = &host["dependencies"]["keyring"];
+    assert_eq!(
+        sdk_keyring["version"].as_str(),
+        host_keyring["version"].as_str()
+    );
+    assert_eq!(
+        sdk_keyring["default-features"].as_bool(),
+        host_keyring["default-features"].as_bool()
+    );
+    let mut sdk_features: Vec<&str> = sdk_keyring["features"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|feature| feature.as_str().unwrap())
+        .collect();
+    let mut host_features: Vec<&str> = host_keyring["features"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|feature| feature.as_str().unwrap())
+        .collect();
+    sdk_features.sort_unstable();
+    host_features.sort_unstable();
+    assert_eq!(sdk_features, host_features);
+}
+
+#[test]
+fn plugin_sdk_state_directory_env_matches_the_host_contract() {
+    let root = workspace_root();
+    let host_env =
+        std::fs::read_to_string(root.join("crates/thegn-svc/src/plugin/env.rs")).unwrap();
+    let sdk_local =
+        std::fs::read_to_string(root.join("crates/thegn-plugin-sdk/src/local.rs")).unwrap();
+    let host_value = host_env
+        .lines()
+        .find_map(|line| {
+            line.strip_prefix("pub const PLUGIN_STATE_DIR_ENV: &str = \"")?
+                .strip_suffix("\";")
+        })
+        .expect("host plugin state environment constant");
+    assert!(
+        sdk_local.contains(&format!("var_os(\"{host_value}\")")),
+        "SDK from_host must read the host's PLUGIN_STATE_DIR_ENV ({host_value})"
+    );
+}
