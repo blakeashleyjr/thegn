@@ -99,7 +99,7 @@ pub struct CiConfig {
     pub poll_interval_secs: u64,
     /// How many recent runs to fetch and display.
     pub max_runs: usize,
-    /// Cap on fetched log lines (the tail is kept) — bounds memory on huge jobs.
+    /// Cap on fetched log lines (the tail is kept); at most `ci_log::HARD_MAX_LOG_LINES`.
     pub log_tail_lines: usize,
     /// Number of recent terminal runs whose failed-job logs are persisted.
     /// `0` disables log persistence and background log fetching.
@@ -146,6 +146,11 @@ impl CiConfig {
         }
         if self.log_tail_lines == 0 {
             errors.push("ci.log_tail_lines: must be greater than zero".into());
+        } else if self.log_tail_lines > crate::ci_log::HARD_MAX_LOG_LINES {
+            errors.push(format!(
+                "ci.log_tail_lines: must not exceed {}",
+                crate::ci_log::HARD_MAX_LOG_LINES
+            ));
         }
         if self.log_max_bytes == 0 {
             errors.push("ci.log_max_bytes: must be greater than zero".into());
@@ -181,6 +186,7 @@ impl Default for GitLabCiConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ci_log::HARD_MAX_LOG_LINES;
 
     #[test]
     fn ci_run_and_log_cache_bounds_validate() {
@@ -217,5 +223,39 @@ mod tests {
                 error == &format!("ci.log_cache_runs: must not exceed {MAX_CI_LOG_CACHE_RUNS}")
             })
         );
+    }
+
+    #[test]
+    fn ci_log_tail_lines_bound_validates() {
+        assert!(
+            CiConfig {
+                log_tail_lines: HARD_MAX_LOG_LINES,
+                ..CiConfig::default()
+            }
+            .validate()
+            .is_empty()
+        );
+
+        let expected = format!("ci.log_tail_lines: must not exceed {HARD_MAX_LOG_LINES}");
+        for log_tail_lines in [HARD_MAX_LOG_LINES + 1, usize::MAX] {
+            let errors = CiConfig {
+                log_tail_lines,
+                ..CiConfig::default()
+            }
+            .validate();
+            assert_eq!(errors, vec![expected.clone()]);
+        }
+
+        let errors = CiConfig {
+            log_tail_lines: 0,
+            ..CiConfig::default()
+        }
+        .validate();
+        assert!(
+            errors
+                .iter()
+                .any(|error| error == "ci.log_tail_lines: must be greater than zero")
+        );
+        assert!(!errors.iter().any(|error| error == &expected));
     }
 }
