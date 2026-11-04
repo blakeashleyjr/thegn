@@ -18,11 +18,58 @@ const REVIEW_TASK_COLS: &str = "id, issue_id, worktree_path, agent_name, dispatc
      forge_action_attempts, next_forge_action_at_ms";
 
 impl Db {
-    /// Insert or revise exactly one durable task. The partial unique index is
-    /// the concurrency guard; a second reconciler updates the same row rather
-    /// than creating a concurrent duplicate.
+    /// Insert or revise one durable task, admitting new active rows only below
+    /// [`Db::ROSTER_ACTIVE_LIMIT`]; revising an active row is always allowed.
     pub fn upsert_review_task(&self, task: &ReviewTaskUpsert) -> Result<i64> {
-        let id = self.conn().query_row(
+        let base = self.conn();
+        let tx = if base.is_autocommit() {
+            Some(rusqlite::Transaction::new_unchecked(
+                base,
+                rusqlite::TransactionBehavior::Immediate,
+            )?)
+        } else {
+            None
+        };
+        let conn: &rusqlite::Connection = tx.as_deref().unwrap_or(base);
+        let active_statuses = [
+            AgentDispatchStatus::Queued,
+            AgentDispatchStatus::Spawning,
+            AgentDispatchStatus::Running,
+            AgentDispatchStatus::WaitingHuman,
+            AgentDispatchStatus::PrOpen,
+        ];
+        let existing_status: Option<String> = conn
+            .query_row(
+                "SELECT status FROM agent_dispatches WHERE task_kind=?1 AND source_key=?2",
+                params![REVIEW_TASK_KIND, task.source_key],
+                |row| row.get(0),
+            )
+            .optional()?;
+        let existing_is_active = existing_status
+            .as_ref()
+            .is_some_and(|stored| active_statuses.contains(&AgentDispatchStatus::parse(stored)));
+        let task_is_active = active_statuses.contains(&task.status);
+        if task_is_active && !existing_is_active {
+            let active: i64 = conn.query_row(
+                "SELECT COUNT(*) FROM agent_dispatches WHERE status IN (?1, ?2, ?3, ?4, ?5)",
+                params![
+                    AgentDispatchStatus::Queued.as_str(),
+                    AgentDispatchStatus::Spawning.as_str(),
+                    AgentDispatchStatus::Running.as_str(),
+                    AgentDispatchStatus::WaitingHuman.as_str(),
+                    AgentDispatchStatus::PrOpen.as_str(),
+                ],
+                |row| row.get(0),
+            )?;
+            let active = usize::try_from(active)?;
+            if active >= Db::ROSTER_ACTIVE_LIMIT {
+                return Err(anyhow::Error::new(crate::db::RosterActiveCeiling {
+                    active,
+                    limit: Db::ROSTER_ACTIVE_LIMIT,
+                }));
+            }
+        }
+        let id = conn.query_row(
             r#"INSERT INTO agent_dispatches
                  (issue_id, worktree_path, agent_name, dispatched_at_ms, status,
                  task_kind, source_key, source_revision, content_revision, prompt,
@@ -81,6 +128,9 @@ impl Db {
             ],
             |row| row.get(0),
         )?;
+        if let Some(tx) = tx {
+            tx.commit()?;
+        }
         Ok(id)
     }
 
@@ -482,5 +532,76 @@ mod tests {
             row.message.chars().count() <= crate::notification::MAX_REVIEW_NOTIFICATION_CHARS
                 && !row.message.chars().any(char::is_control)
         }));
+    }
+
+    fn seed_active(db: &Db, count: usize) {
+        db.conn()
+            .execute(
+                "WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n WHERE i < ?1) \
+                 INSERT INTO agent_dispatches \
+                 (issue_id, worktree_path, agent_name, dispatched_at_ms, status) \
+                 SELECT 'linear:CAP', '/wt/cap', 'a', i, 'queued' FROM n",
+                params![count as i64],
+            )
+            .unwrap();
+    }
+
+    #[test]
+    fn review_task_roster_ceiling_refuses_a_new_task() {
+        let db = Db::open_memory().unwrap();
+        seed_active(&db, Db::ROSTER_ACTIVE_LIMIT);
+
+        let error = db.upsert_review_task(&task("r1", "p")).unwrap_err();
+        assert_eq!(
+            error.downcast_ref::<crate::db::RosterActiveCeiling>(),
+            Some(&crate::db::RosterActiveCeiling {
+                active: Db::ROSTER_ACTIVE_LIMIT,
+                limit: Db::ROSTER_ACTIVE_LIMIT,
+            })
+        );
+        assert!(db.list_review_tasks().unwrap().is_empty());
+    }
+
+    #[test]
+    fn review_task_roster_ceiling_refuses_reviving_a_terminal_task() {
+        let db = Db::open_memory().unwrap();
+        let id = db.upsert_review_task(&task("r1", "first")).unwrap();
+        db.update_review_task_status(id, AgentDispatchStatus::Done)
+            .unwrap();
+        seed_active(&db, Db::ROSTER_ACTIVE_LIMIT);
+
+        let error = db.upsert_review_task(&task("r2", "second")).unwrap_err();
+        assert_eq!(
+            error.downcast_ref::<crate::db::RosterActiveCeiling>(),
+            Some(&crate::db::RosterActiveCeiling {
+                active: Db::ROSTER_ACTIVE_LIMIT,
+                limit: Db::ROSTER_ACTIVE_LIMIT,
+            })
+        );
+        let row = db.get_review_task(id).unwrap().unwrap();
+        assert_eq!(row.status, AgentDispatchStatus::Done);
+        assert_eq!(row.source_revision, "r1");
+    }
+
+    #[test]
+    fn review_task_roster_ceiling_still_revises_an_active_task() {
+        let db = Db::open_memory().unwrap();
+        let id = db.upsert_review_task(&task("r1", "first")).unwrap();
+        seed_active(&db, Db::ROSTER_ACTIVE_LIMIT - 1);
+
+        let revised = db.upsert_review_task(&task("r2", "second")).unwrap();
+        assert_eq!(revised, id);
+        assert_eq!(
+            db.get_review_task(id).unwrap().unwrap().source_revision,
+            "r2"
+        );
+    }
+
+    #[test]
+    fn review_task_roster_ceiling_admits_below_the_limit() {
+        let db = Db::open_memory().unwrap();
+        seed_active(&db, Db::ROSTER_ACTIVE_LIMIT - 1);
+
+        assert!(db.upsert_review_task(&task("r1", "p")).is_ok());
     }
 }
