@@ -694,9 +694,10 @@ pub fn now_ms() -> i64 {
         .unwrap_or(0)
 }
 
-/// Human-friendly age from an epoch-seconds value (e.g. 2h, 3d, 10m, 5s).
-pub fn age(then: i64) -> String {
-    let diff = (now() - then).max(0);
+/// Compact age of a span in SECONDS: `45s` / `3m` / `2h` / `5d` (floor division at 60 / 3600 / 86400). A negative span (clock
+/// skew, a stamp from the future) reads `0s`. Pure: the caller supplies the span, so tests can use fixed times.
+pub fn age_secs(diff: i64) -> String {
+    let diff = diff.max(0);
     if diff < 60 {
         format!("{diff}s")
     } else if diff < 3600 {
@@ -705,6 +706,27 @@ pub fn age(then: i64) -> String {
         format!("{}h", diff / 3600)
     } else {
         format!("{}d", diff / 86400)
+    }
+}
+
+/// [`age_secs`] of the span between two epoch-seconds values. Saturating, so extreme inputs cannot overflow.
+pub fn age_since(now: i64, then: i64) -> String {
+    age_secs(now.saturating_sub(then))
+}
+
+/// Human-friendly age from an epoch-seconds value (e.g. 2h, 3d, 10m, 5s).
+pub fn age(then: i64) -> String {
+    age_since(now(), then)
+}
+
+/// `just now` below `just_now_below` seconds, else `<age_secs> ago` (`5m ago`). The floor is the only thing the
+/// "ago" call sites disagree on (weather uses 60, the disk tab 5).
+pub fn age_ago_secs(diff: i64, just_now_below: i64) -> String {
+    let diff = diff.max(0);
+    if diff < just_now_below {
+        "just now".to_string()
+    } else {
+        format!("{} ago", age_secs(diff))
     }
 }
 
@@ -2683,6 +2705,58 @@ mod tests {
         assert_eq!(age(n), "0s");
         assert_eq!(age(n - 120), "2m");
         assert_eq!(age(n - 7200), "2h");
+    }
+
+    #[test]
+    fn age_secs_buckets_at_every_boundary() {
+        assert_eq!(age_secs(0), "0s");
+        assert_eq!(age_secs(59), "59s");
+        assert_eq!(age_secs(60), "1m");
+        assert_eq!(age_secs(3_599), "59m");
+        assert_eq!(age_secs(3_600), "1h");
+        assert_eq!(age_secs(86_399), "23h");
+        assert_eq!(age_secs(86_400), "1d");
+        assert_eq!(age_secs(172_800), "2d");
+        assert_eq!(age_secs(86_400 * 400), "400d");
+        assert_eq!(age_secs(-1), "0s");
+        assert_eq!(age_secs(i64::MIN), "0s");
+    }
+
+    #[test]
+    fn age_since_is_clock_free_and_saturating() {
+        assert_eq!(age_since(1_000, 400), "10m");
+        assert_eq!(age_since(100, 200), "0s");
+        assert_eq!(age_since(i64::MIN, i64::MAX), "0s");
+    }
+
+    #[test]
+    fn age_ago_secs_applies_the_just_now_floor() {
+        assert_eq!(age_ago_secs(4, 5), "just now");
+        assert_eq!(age_ago_secs(5, 5), "5s ago");
+        assert_eq!(age_ago_secs(59, 60), "just now");
+        assert_eq!(age_ago_secs(60, 60), "1m ago");
+        assert_eq!(age_ago_secs(-3, 5), "just now");
+        assert_eq!(age_ago_secs(86_400, 5), "1d ago");
+        assert_eq!(age_ago_secs(0, 0), "0s ago");
+    }
+
+    #[test]
+    fn age_ago_secs_matches_the_weather_and_disk_floors() {
+        for diff in [0, 4, 5, 59, 60, 3_599, 3_600, 86_399, 86_400] {
+            let weather = if diff < 60 {
+                "just now".to_string()
+            } else {
+                format!("{} ago", age_secs(diff))
+            };
+            assert_eq!(age_ago_secs(diff, 60), weather);
+
+            let disk = if diff < 5 {
+                "just now".to_string()
+            } else {
+                format!("{} ago", age_secs(diff))
+            };
+            assert_eq!(age_ago_secs(diff, 5), disk);
+        }
     }
 
     #[test]
