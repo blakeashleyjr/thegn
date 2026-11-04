@@ -6394,6 +6394,222 @@ mod tests {
         // Queue enrollment (`merge add`) remains outside this lease decision chain.
     }
 
+    // Each round races two fresh connections to one file DB; no process,
+    // lease, or clock participates, and the barrier is the only start signal.
+    #[test]
+    fn interleave_set_status_vs_run_fenced_exit_has_exactly_one_winner() {
+        let (seed_db, dir) = temp_db();
+        drop(seed_db);
+        let path = dir.path().join("thegn.db");
+        let mut a_wins = Vec::with_capacity(20);
+
+        for round in 0..20_u32 {
+            let a_db = Db::open_at(&path).unwrap();
+            let b_db = Db::open_at(&path).unwrap();
+            let id = put_row(
+                &a_db,
+                &format!("linear:INTERLEAVE-{round}"),
+                &format!("/wt/interleave-{round}"),
+            );
+            a_db.update_dispatch_status(id, AgentDispatchStatus::Running)
+                .unwrap();
+            let run = a_db.dispatch_run_ref(id).unwrap().unwrap();
+            let barrier = std::sync::Barrier::new(2);
+
+            // Both writers start together. SQLite serializes their writes;
+            // the losing checked transition must observe the winning status.
+            let (a, b) = std::thread::scope(|scope| {
+                let a_barrier = &barrier;
+                let b_barrier = &barrier;
+                let a_thread = scope.spawn(move || {
+                    a_barrier.wait();
+                    a_db.set_dispatch_status_checked(
+                        id,
+                        AgentDispatchStatus::Running,
+                        AgentDispatchStatus::Abandoned,
+                        None,
+                    )
+                });
+                let b_thread = scope.spawn(move || {
+                    b_barrier.wait();
+                    b_db.compare_and_set_dispatch_status_run(
+                        &run,
+                        AgentDispatchStatus::Running,
+                        AgentDispatchStatus::Done,
+                        None,
+                    )
+                });
+                (a_thread.join().unwrap(), b_thread.join().unwrap())
+            });
+            let b_won = b.unwrap();
+            let a_won = a.is_ok();
+            assert_ne!(a_won, b_won, "exactly one status writer wins");
+            if !a_won {
+                assert!(matches!(
+                    a.unwrap_err().downcast_ref::<DispatchTransitionConflict>(),
+                    Some(DispatchTransitionConflict::Stale {
+                        id: stale_id,
+                        expected: AgentDispatchStatus::Running,
+                        actual: AgentDispatchStatus::Done,
+                    }) if *stale_id == id
+                ));
+            }
+            let check_db = Db::open_at(&path).unwrap();
+            let final_row = check_db.get_dispatch(id).unwrap().unwrap();
+            assert_eq!(
+                final_row.status,
+                if a_won {
+                    AgentDispatchStatus::Abandoned
+                } else {
+                    AgentDispatchStatus::Done
+                }
+            );
+            a_wins.push(a_won);
+        }
+    }
+
+    // Each round races two fresh connections to one file DB; no process,
+    // lease, or clock participates, and the barrier is the only start signal.
+    #[test]
+    fn interleave_relaunch_bind_vs_auto_exit_never_writes_through_the_new_run() {
+        let (seed_db, dir) = temp_db();
+        drop(seed_db);
+        let path = dir.path().join("thegn.db");
+        let mut bind_wins = Vec::with_capacity(20);
+
+        for round in 0..20_u32 {
+            let a_db = Db::open_at(&path).unwrap();
+            let b_db = Db::open_at(&path).unwrap();
+            let id = put_row(
+                &a_db,
+                &format!("linear:INTERLEAVE-{round}"),
+                &format!("/wt/interleave-{round}"),
+            );
+            a_db.update_dispatch_status(id, AgentDispatchStatus::Running)
+                .unwrap();
+            let old_run = a_db.dispatch_run_ref(id).unwrap().unwrap();
+            let old_run_for_exit = old_run.clone();
+            let barrier = std::sync::Barrier::new(2);
+
+            // The bind increments run_gen; an exit based on old_run must then
+            // lose, while an exit that wins first prevents the bind.
+            let (bound, exited) = std::thread::scope(|scope| {
+                let bind_barrier = &barrier;
+                let exit_barrier = &barrier;
+                let bind_thread = scope.spawn(move || {
+                    bind_barrier.wait();
+                    a_db.bind_dispatch_session(id, "new-session")
+                });
+                let exit_thread = scope.spawn(move || {
+                    exit_barrier.wait();
+                    b_db.compare_and_set_dispatch_status_run(
+                        &old_run_for_exit,
+                        AgentDispatchStatus::Running,
+                        AgentDispatchStatus::Done,
+                        None,
+                    )
+                });
+                (bind_thread.join().unwrap(), exit_thread.join().unwrap())
+            });
+            let bound = bound.unwrap();
+            let exited = exited.unwrap();
+            assert_ne!(bound, exited, "exactly one run writer wins");
+
+            let check_db = Db::open_at(&path).unwrap();
+            let final_row = check_db.get_dispatch(id).unwrap().unwrap();
+            let final_run = check_db.dispatch_run_ref(id).unwrap().unwrap();
+            if bound {
+                assert_eq!(final_row.status, AgentDispatchStatus::Running);
+                assert_eq!(final_row.session_id.as_deref(), Some("new-session"));
+                assert_eq!(final_run.run_gen, old_run.run_gen + 1);
+            } else {
+                assert_eq!(final_row.status, AgentDispatchStatus::Done);
+                assert_eq!(final_row.session_id, None);
+                assert_eq!(final_run.run_gen, old_run.run_gen);
+            }
+            bind_wins.push(bound);
+        }
+    }
+
+    // Each round races two fresh connections to one file DB; no process,
+    // lease, or clock participates, and the barrier is the only start signal.
+    #[test]
+    fn interleave_publish_vs_abandon_preserves_exactly_one_verdict() {
+        let (seed_db, dir) = temp_db();
+        drop(seed_db);
+        let path = dir.path().join("thegn.db");
+        let mut publishes_win = Vec::with_capacity(20);
+
+        for round in 0..20_u32 {
+            let a_db = Db::open_at(&path).unwrap();
+            let b_db = Db::open_at(&path).unwrap();
+            let id = put_row(
+                &a_db,
+                &format!("linear:INTERLEAVE-{round}"),
+                &format!("/wt/interleave-{round}"),
+            );
+            let barrier = std::sync::Barrier::new(2);
+
+            // Publishing may advance Queued to Running, or abandonment may
+            // retire the reservation first; neither outcome may be reversed.
+            let (published, abandoned) = std::thread::scope(|scope| {
+                let publish_barrier = &barrier;
+                let abandon_barrier = &barrier;
+                let publish_thread = scope.spawn(move || {
+                    publish_barrier.wait();
+                    a_db.publish_dispatch_run(id, "s1", "/art")
+                });
+                let abandon_thread = scope.spawn(move || {
+                    abandon_barrier.wait();
+                    b_db.set_dispatch_status_checked(
+                        id,
+                        AgentDispatchStatus::Queued,
+                        AgentDispatchStatus::Abandoned,
+                        None,
+                    )
+                });
+                (
+                    publish_thread.join().unwrap(),
+                    abandon_thread.join().unwrap(),
+                )
+            });
+            let published = published.unwrap();
+            let check_db = Db::open_at(&path).unwrap();
+            let final_row = check_db.get_dispatch(id).unwrap().unwrap();
+            match (published, abandoned) {
+                (crate::issue::DispatchRunPublishOutcome::Published, Ok(())) => {
+                    panic!("publish and abandon both reported success");
+                }
+                (crate::issue::DispatchRunPublishOutcome::Published, Err(error)) => {
+                    assert!(matches!(
+                        error.downcast_ref::<DispatchTransitionConflict>(),
+                        Some(DispatchTransitionConflict::Stale {
+                            id: stale_id,
+                            expected: AgentDispatchStatus::Queued,
+                            actual: AgentDispatchStatus::Running,
+                        }) if *stale_id == id
+                    ));
+                    assert_eq!(final_row.status, AgentDispatchStatus::Running);
+                    assert_eq!(final_row.session_id.as_deref(), Some("s1"));
+                    publishes_win.push(true);
+                }
+                (
+                    crate::issue::DispatchRunPublishOutcome::StateChanged {
+                        status: AgentDispatchStatus::Abandoned,
+                    },
+                    Ok(()),
+                ) => {
+                    assert_eq!(final_row.status, AgentDispatchStatus::Abandoned);
+                    assert_eq!(final_row.session_id, None);
+                    publishes_win.push(false);
+                }
+                (other, result) => {
+                    panic!("unexpected publish/abandon outcomes: {other:?}, {result:?}")
+                }
+            }
+        }
+    }
+
     fn rows_in_every_status(db: &Db) -> Vec<(i64, &'static str)> {
         let statuses = [
             AgentDispatchStatus::Queued,
