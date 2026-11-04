@@ -67,6 +67,7 @@ impl Forge for Ladder<dyn Forge> {
             c.create_pr |= lc.create_pr;
             c.merge |= lc.merge;
             c.auto_merge |= lc.auto_merge;
+            c.merge_expected_head |= lc.merge_expected_head;
             c.draft_toggle |= lc.draft_toggle;
             c.checks_rerun |= lc.checks_rerun;
             c.reviews |= lc.reviews;
@@ -514,6 +515,7 @@ mod tests {
             ForgeCaps {
                 pr_status: true,
                 merge: self.id == "cli",
+                merge_expected_head: self.id == "cli",
                 resolve_review_thread: self.id == "cli",
                 pr_authorship: self.id == "cli",
                 ..ForgeCaps::default()
@@ -667,6 +669,24 @@ mod tests {
         let p = l.probe();
         assert_eq!(p.notes.len(), 2);
         assert!(matches!(p.availability, Availability::Ready));
+    }
+
+    #[test]
+    fn ladder_caps_union_includes_merge_expected_head() {
+        assert!(
+            ladder(Ok(7)).caps().merge_expected_head,
+            "the cli layer has it"
+        );
+
+        let native_only = Ladder::new(
+            "t",
+            vec![Box::new(Layer {
+                id: "native",
+                status: Ok(1),
+                calls: Default::default(),
+            }) as Box<dyn Forge>],
+        );
+        assert!(!native_only.caps().merge_expected_head);
     }
 
     #[test]
