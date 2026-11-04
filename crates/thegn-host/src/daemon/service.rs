@@ -76,6 +76,71 @@ pub(crate) enum Lookup {
 /// `spawn_blocking`).
 pub(crate) type SharedDb = Arc<Mutex<Db>>;
 
+/// (worktree cache key, run id, job id) of one `ci.logs` fetch.
+pub(crate) type CiLogFlightKey = (String, String, String);
+
+/// Single-flight admission for `ci.logs`: at most one request per key does the cache read and the provider
+/// fetch at a time; later requests for the same key wait for it and then find the cache the first one filled.
+pub(crate) struct CiLogFlights {
+    slots: std::sync::Mutex<
+        std::collections::BTreeMap<CiLogFlightKey, std::sync::Weak<tokio::sync::Mutex<()>>>,
+    >,
+}
+
+/// Held while a request owns its key; dropping it (any return path, a panic, the end of the blocking closure) admits the next waiter.
+pub(crate) struct CiLogFlight {
+    _held: tokio::sync::OwnedMutexGuard<()>,
+}
+
+/// A waiting request ran out of its deadline before the earlier fetch for the same job finished.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) struct CiLogFlightBusy;
+
+impl CiLogFlights {
+    pub(crate) const fn new() -> Self {
+        Self {
+            slots: std::sync::Mutex::new(std::collections::BTreeMap::new()),
+        }
+    }
+
+    /// Wait up to `wait` for the key. Slots whose last holder and waiter are gone are dropped on every call, so the map is bounded by the live requests.
+    pub(crate) async fn enter(
+        &self,
+        key: CiLogFlightKey,
+        wait: std::time::Duration,
+    ) -> Result<CiLogFlight, CiLogFlightBusy> {
+        let slot = {
+            let mut slots = self
+                .slots
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            slots.retain(|_, slot| slot.strong_count() > 0);
+            match slots.get(&key).and_then(std::sync::Weak::upgrade) {
+                Some(slot) => slot,
+                None => {
+                    let slot = Arc::new(tokio::sync::Mutex::new(()));
+                    slots.insert(key, Arc::downgrade(&slot));
+                    slot
+                }
+            }
+        };
+        match tokio::time::timeout(wait, slot.lock_owned()).await {
+            Ok(held) => Ok(CiLogFlight { _held: held }),
+            Err(_) => Err(CiLogFlightBusy),
+        }
+    }
+
+    #[cfg(test)]
+    fn slot_count(&self) -> usize {
+        self.slots
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .len()
+    }
+}
+
+pub(crate) static CI_LOG_FLIGHTS: CiLogFlights = CiLogFlights::new();
+
 pub(crate) struct DaemonService {
     pub daemon_id: String,
     pub sessions: Arc<tokio::sync::Mutex<HashMap<String, SessionEntry>>>,
@@ -2184,6 +2249,17 @@ impl ControlApi for DaemonService {
             let key = thegn_core::remote::GitLoc::worktree_cache_key(&path);
             let run_id_owned = run_id.to_string();
             let job_id_owned = job_id.to_string();
+            let flight = CI_LOG_FLIGHTS
+                .enter(
+                    (key.clone(), run_id_owned.clone(), job_id_owned.clone()),
+                    crate::ci_refresh::MAX_LOG_INGEST_WALL,
+                )
+                .await
+                .map_err(|CiLogFlightBusy| {
+                    ControlError::Unavailable(format!(
+                        "another ci.logs request for run {run_id_owned} job {job_id_owned} is still fetching; retry shortly"
+                    ))
+                })?;
             let cached = if self.config.ci.log_cache_runs > 0 {
                 self.with_db({
                     let key = key.clone();
@@ -2255,7 +2331,9 @@ impl ControlApi for DaemonService {
             let provider_path = path.clone();
             let run_for_provider = run_id_owned.clone();
             let job_for_provider = job_id_owned.clone();
-            let (mut entry, warnings) = tokio::task::spawn_blocking(move || {
+            let flight_for_provider = flight;
+            let (mut entry, warnings, _flight) = tokio::task::spawn_blocking(move || {
+                let flight = flight_for_provider;
                 let loc = thegn_core::remote::GitLoc::for_worktree(&provider_path);
                 let Some((client, context)) = thegn_svc::ci::provider_and_context_for(&loc, &cfg)
                 else {
@@ -2293,7 +2371,7 @@ impl ControlApi for DaemonService {
                     .iter()
                     .map(|warning| thegn_svc::lsp::sanitize_for_terminal(warning))
                     .collect();
-                Ok::<_, anyhow::Error>(Some((entry, warnings)))
+                Ok::<_, anyhow::Error>(Some((entry, warnings, flight)))
             })
             .await
             .map_err(|e| ControlError::Internal(anyhow::anyhow!("CI logs task join: {e}")))?
@@ -4351,6 +4429,172 @@ mod tests {
         assert!(
             served.lines().count() <= 3,
             "a cache hit must honor log_tail_lines even when tail_lines requests more"
+        );
+    }
+
+    #[tokio::test]
+    async fn ci_log_flights_second_entry_waits_for_the_first_to_finish() {
+        let flights = CiLogFlights::new();
+        let key = ("wt".to_string(), "1".to_string(), "2".to_string());
+        let first = flights
+            .enter(key.clone(), std::time::Duration::from_secs(60))
+            .await
+            .ok()
+            .expect("first");
+        let waiter = flights.enter(key.clone(), std::time::Duration::from_secs(60));
+        tokio::pin!(waiter);
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(50), &mut waiter)
+                .await
+                .is_err(),
+            "the second entry stays parked while the first owns the key"
+        );
+        drop(first);
+        assert!(waiter.await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn ci_log_flights_busy_after_the_wait_is_typed() {
+        let flights = CiLogFlights::new();
+        let key = ("wt".to_string(), "1".to_string(), "2".to_string());
+        let first = flights
+            .enter(key.clone(), std::time::Duration::from_secs(60))
+            .await
+            .ok()
+            .expect("first");
+        let busy = flights
+            .enter(key.clone(), std::time::Duration::from_millis(30))
+            .await;
+        assert_eq!(busy.err(), Some(CiLogFlightBusy));
+        drop(first);
+        assert!(
+            flights
+                .enter(key, std::time::Duration::from_secs(60))
+                .await
+                .is_ok()
+        );
+    }
+
+    #[tokio::test]
+    async fn ci_log_flights_distinct_jobs_do_not_wait_for_each_other() {
+        let flights = CiLogFlights::new();
+        let first = flights
+            .enter(
+                ("wt".to_string(), "1".to_string(), "2".to_string()),
+                std::time::Duration::from_secs(60),
+            )
+            .await
+            .ok()
+            .expect("first");
+        assert!(
+            flights
+                .enter(
+                    ("wt".to_string(), "1".to_string(), "3".to_string()),
+                    std::time::Duration::from_secs(60),
+                )
+                .await
+                .is_ok()
+        );
+        assert!(
+            flights
+                .enter(
+                    ("other".to_string(), "1".to_string(), "2".to_string()),
+                    std::time::Duration::from_secs(60),
+                )
+                .await
+                .is_ok()
+        );
+        drop(first);
+    }
+
+    #[tokio::test]
+    async fn ci_log_flights_forget_released_slots() {
+        let flights = CiLogFlights::new();
+        let first = flights
+            .enter(
+                ("wt".to_string(), "1".to_string(), "2".to_string()),
+                std::time::Duration::from_secs(60),
+            )
+            .await
+            .ok()
+            .expect("first");
+        drop(first);
+        let second = flights
+            .enter(
+                ("wt".to_string(), "1".to_string(), "3".to_string()),
+                std::time::Duration::from_secs(60),
+            )
+            .await
+            .ok()
+            .expect("second");
+        assert_eq!(flights.slot_count(), 1);
+        drop(second);
+    }
+
+    #[tokio::test]
+    async fn ci_logs_waits_for_an_inflight_fetch_then_serves_the_cache() {
+        let worktree = tempfile::tempdir().unwrap();
+        let config = thegn_core::config::Config {
+            ci: thegn_core::config_ci::CiConfig {
+                log_tail_lines: 3,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let (service, _) = service_with_config(0, config);
+        let repo_path = worktree.path().display().to_string();
+        let worktree_path = repo_path.clone();
+        service
+            .with_db(move |db| {
+                use thegn_core::store::WorkspaceStore;
+                db.put_workspace(&repo_path, "repo", "repo")?;
+                db.put_worktree(
+                    "repo/feature",
+                    &repo_path,
+                    &worktree_path,
+                    "feature",
+                    None,
+                    None,
+                )?;
+                Ok(())
+            })
+            .await
+            .unwrap();
+
+        let cache_key = thegn_core::remote::GitLoc::worktree_cache_key(worktree.path());
+        let held = CI_LOG_FLIGHTS
+            .enter(
+                (cache_key.clone(), "1".into(), "2".into()),
+                std::time::Duration::from_secs(60),
+            )
+            .await
+            .ok()
+            .expect("flight");
+        let text = (0..8)
+            .map(|line| format!("line {line}\n"))
+            .collect::<String>();
+        let mut entry =
+            thegn_core::ci_log::CiLogEntry::new(cache_key, "1", "2", "job", &text, 8, 4096, 10);
+        entry.head_sha = "known-head".into();
+        let call = service.ci_logs(worktree.path().to_str().unwrap(), "1", "2", Some(20));
+        let fill = async {
+            service
+                .with_db(move |db| {
+                    use thegn_core::store::CacheStore;
+                    db.put_ci_log(&entry)
+                })
+                .await
+                .unwrap();
+            drop(held);
+        };
+        let (reply, ()) = tokio::join!(call, fill);
+        let reply = reply.unwrap();
+        assert_eq!(reply.source, "cache");
+        assert_eq!(reply.logs.len(), 1);
+        let served = reply.logs[0]["text"].as_str().unwrap();
+        assert!(
+            served.lines().count() <= 3,
+            "a cache hit after waiting must honor log_tail_lines"
         );
     }
 
