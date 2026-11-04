@@ -1700,6 +1700,121 @@ mod tests {
         assert!(!path.exists());
     }
 
+    // Regression pins: they pass while staging keeps its guards.
+    fn stage_has_no_input(stage: &RenderStage) -> bool {
+        std::fs::read_dir(stage.path()).unwrap().all(|entry| {
+            !entry
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .starts_with("input.")
+        })
+    }
+
+    #[test]
+    fn renderer_stage_input_refuses_a_fifo_without_blocking() {
+        if !crate::platform::test_fifo_supported() {
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let fifo = dir.path().join("p.pdf");
+        crate::platform::test_fifo(&fifo).unwrap();
+        let stage = RenderStage::new().unwrap();
+
+        assert!(stage_input(&stage, &fifo, "input.pdf", 64).is_err());
+        assert!(stage_has_no_input(&stage));
+    }
+
+    #[test]
+    fn renderer_stage_input_refuses_a_symlink_to_a_fifo() {
+        if !crate::platform::test_fifo_supported() || !crate::platform::test_symlink_supported() {
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let fifo = dir.path().join("p.fifo");
+        let link = dir.path().join("doc.pdf");
+        crate::platform::test_fifo(&fifo).unwrap();
+        crate::platform::test_symlink(&fifo, &link).unwrap();
+        let stage = RenderStage::new().unwrap();
+
+        assert!(stage_input(&stage, &link, "input.pdf", 64).is_err());
+        assert!(stage_has_no_input(&stage));
+    }
+
+    #[test]
+    fn renderer_stage_input_refuses_a_directory_and_a_missing_source() {
+        let dir = tempfile::tempdir().unwrap();
+        let stage = RenderStage::new().unwrap();
+        let absent = dir.path().join("absent.pdf");
+
+        assert!(stage_input(&stage, dir.path(), "input.pdf", 64).is_err());
+        assert!(stage_has_no_input(&stage));
+        assert!(stage_input(&stage, &absent, "input.pdf", 64).is_err());
+        assert!(stage_has_no_input(&stage));
+    }
+
+    #[test]
+    fn renderer_stage_input_never_writes_through_a_preexisting_staged_name() {
+        let dir = tempfile::tempdir().unwrap();
+        let host = dir.path().join("host.txt");
+        let source = dir.path().join("doc.pdf");
+        std::fs::write(&host, b"host file").unwrap();
+        std::fs::write(&source, b"document").unwrap();
+        let stage = RenderStage::new().unwrap();
+        let staged_name = stage.path().join("input.pdf");
+        if crate::platform::test_symlink_supported() {
+            crate::platform::test_symlink(&host, &staged_name).unwrap();
+        } else {
+            std::fs::write(&staged_name, b"planted").unwrap();
+        }
+
+        assert!(stage_input(&stage, &source, "input.pdf", 64).is_err());
+        assert_eq!(std::fs::read(&host).unwrap(), b"host file");
+    }
+
+    #[test]
+    fn renderer_entry_points_refuse_a_fifo_input_before_any_renderer() {
+        if !crate::platform::test_fifo_supported() {
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let fifo = dir.path().join("p.fifo");
+        crate::platform::test_fifo(&fifo).unwrap();
+        let cancel = AtomicBool::new(false);
+
+        for error in [
+            pdf_page1(&fifo, &cancel).err(),
+            pdf_text(&fifo, &cancel).err(),
+            mermaid(&fifo, &cancel).err(),
+        ] {
+            assert!(error.is_some_and(|error| error.contains("preview staging failed")));
+        }
+    }
+
+    // Positive control: a regular-file symlink is copied into the stage.
+    #[test]
+    fn renderer_stage_input_stages_a_symlinked_regular_source_as_a_plain_copy() {
+        if !crate::platform::test_symlink_supported() {
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("real.pdf");
+        let link = dir.path().join("link.pdf");
+        std::fs::write(&source, b"real bytes").unwrap();
+        crate::platform::test_symlink(&source, &link).unwrap();
+        let stage = RenderStage::new().unwrap();
+
+        let staged = stage_input(&stage, &link, "input.pdf", 64).unwrap();
+        assert_eq!(std::fs::read(&staged).unwrap(), b"real bytes");
+        assert!(staged.starts_with(stage.path()));
+        assert!(
+            !std::fs::symlink_metadata(&staged)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+    }
+
     #[test]
     fn decodes_a_generated_png_to_rgba() {
         // Encode a 2x3 red PNG in-memory, then round-trip through decode_and_fit.
