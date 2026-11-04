@@ -181,6 +181,10 @@ mod pr_agent_reap_tests;
 #[path = "db_pr_lease_fence_tests.rs"]
 mod pr_lease_fence_tests;
 
+#[cfg(test)]
+#[path = "db_merge_refusal_tests.rs"]
+mod merge_refusal_tests;
+
 static MERGE_CLAIM_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 /// The token is a row ownership identity, not a secret: any database writer can rewrite the row.
@@ -1373,6 +1377,64 @@ impl WorktreeAuxStore for Db {
             })?
             .collect::<rusqlite::Result<Vec<_>>>()?;
         Ok(events)
+    }
+
+    fn record_merge_refusal(&self, worktree: &str, operation: &str, outcome: &str) -> Result<bool> {
+        let base = self.conn();
+        let tx = if base.is_autocommit() {
+            Some(Transaction::new_unchecked(
+                base,
+                TransactionBehavior::Immediate,
+            )?)
+        } else {
+            None
+        };
+        let conn: &Connection = tx.as_deref().unwrap_or(base);
+        let has_current_events: bool = conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM pragma_table_info('merge_queue_events') WHERE name = 'target_base_oid')",
+            [],
+            |row| row.get(0),
+        )?;
+        if !has_current_events {
+            if let Some(tx) = tx {
+                tx.commit()?;
+            }
+            return Ok(false);
+        }
+        let row: Option<(String, i64, Option<String>, Option<String>)> = conn
+            .query_row(
+                "SELECT status, updated_at, candidate_oid, result_oid \
+                 FROM merge_queue WHERE worktree=?1",
+                [worktree],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .optional()?;
+        let Some((status, updated_at, candidate_oid, result_oid)) = row else {
+            if let Some(tx) = tx {
+                tx.commit()?;
+            }
+            return Ok(false);
+        };
+        record_merge_event(
+            conn,
+            &MergeQueueEvent {
+                worktree: worktree.to_owned(),
+                operation: operation.to_owned(),
+                outcome: outcome.to_owned(),
+                old_status: status,
+                new_status: None,
+                row_updated_at: updated_at,
+                candidate_oid,
+                result_oid,
+                target_base_oid: None,
+                actor: format!("thegn pid {}", std::process::id()),
+                at_ms: util::now_ms(),
+            },
+        )?;
+        if let Some(tx) = tx {
+            tx.commit()?;
+        }
+        Ok(true)
     }
 
     fn hold_merge_cleanup(&self, row: &MergeQueueRow) -> Result<bool> {
