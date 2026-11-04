@@ -41,6 +41,11 @@
   # installs as `thegn-dev`/`tg-dev` so it can sit beside a stable install.
   # `THEGN_CHANNEL` overrides the default at runtime for either binary.
   channel ? "stable",
+  # Optional static musl bridge (the flake's `thegnMusl`). When set, the
+  # wrapper exports THEGN_BRIDGE_BINARY (unless the user already set it) so
+  # `bridge_sup::bridge_binary_path` finds the resident provider bridge without
+  # an adjacent `thegn-musl`, which would collide with `.#default` in one profile.
+  bridge ? null,
   # Defaults to the same allowlisted source the flake passes in, so a bare
   # `callPackage ./nix/package.nix {}` cannot drift from `nix build`.
   src ? import ./source.nix {inherit lib;} ../.,
@@ -50,6 +55,9 @@
 }: let
   runtimeDeps = [git fzf gum lazygit yazi delta gh gdu coreutils] ++ yaziDeps;
   isDev = channel == "dev";
+  bridgeArgs =
+    lib.optionalString (bridge != null)
+    " --set-default THEGN_BRIDGE_BINARY ${bridge}/bin/thegn";
   # The dev build coexists with a stable install under distinct names.
   binName =
     if isDev
@@ -153,7 +161,7 @@ in
       # (git/lazygit/delta/gh/gdu) regardless of the user's PATH.
       wrapProgram $out/bin/${binName} \
         --set THEGN_YAZI_BIN ${yazi}/bin/yazi \
-        --prefix PATH : ${lib.makeBinPath runtimeDeps}
+        --prefix PATH : ${lib.makeBinPath runtimeDeps}${bridgeArgs}
     '';
 
     meta = {
