@@ -314,6 +314,7 @@ pub mod sandbox_runtime;
 pub mod sandbox_support;
 pub mod sandbox_truth;
 pub mod sandbox_volume_owner;
+pub mod sandbox_worker_ready;
 pub mod scan_sched;
 pub mod scheduler;
 pub mod seam;
