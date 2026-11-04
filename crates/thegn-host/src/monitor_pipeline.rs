@@ -416,16 +416,7 @@ fn is_format_control(c: char) -> bool {
 /// `4s` / `3m` / `2h` / `5d`. A negative span (clock skew, a stamp from the
 /// future) reads as `0s` rather than as a nonsense age.
 pub(crate) fn fmt_age_ms(delta_ms: i64) -> String {
-    let s = delta_ms.max(0) / 1000;
-    if s < 60 {
-        format!("{s}s")
-    } else if s < 3600 {
-        format!("{}m", s / 60)
-    } else if s < 86_400 {
-        format!("{}h", s / 3600)
-    } else {
-        format!("{}d", s / 86_400)
-    }
+    thegn_core::util::age_secs(delta_ms / 1000)
 }
 
 #[derive(Default)]

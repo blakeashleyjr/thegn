@@ -381,16 +381,7 @@ pub fn fmt_wind(w: f32, units: Units) -> String {
 /// `"just now"` / `"5m ago"` / `"3h ago"` / `"2d ago"` — the staleness note the
 /// popup row shows. Never negative: a future `fetched_at` reads as `"just now"`.
 pub fn fmt_age(fetched_at: i64, now: i64) -> String {
-    let age = now.saturating_sub(fetched_at).max(0);
-    if age < 60 {
-        "just now".to_string()
-    } else if age < 3600 {
-        format!("{}m ago", age / 60)
-    } else if age < 86_400 {
-        format!("{}h ago", age / 3600)
-    } else {
-        format!("{}d ago", age / 86_400)
-    }
+    crate::util::age_ago_secs(now.saturating_sub(fetched_at), 60)
 }
 
 /// The condition glyph for the ACTIVE glyph set. Takes the set rather than
