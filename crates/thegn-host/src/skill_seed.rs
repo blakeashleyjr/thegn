@@ -1471,7 +1471,15 @@ mod tests {
             for mut argv in commands {
                 checked += 1;
                 for arg in &mut argv {
-                    if matches!(arg.as_str(), "{row}" | "row" | "<row-id>" | "<dispatch-id>") {
+                    if matches!(
+                        arg.as_str(),
+                        "{row}"
+                            | "row"
+                            | "<row-id>"
+                            | "<dispatch-id>"
+                            | "<recorded lease generation>"
+                            | "$lease_gen"
+                    ) {
                         *arg = "1".to_string();
                     }
                 }
