@@ -1204,7 +1204,6 @@ impl WorktreeAuxStore for Db {
             None
         };
         let conn: &Connection = tx.as_deref().unwrap_or(base);
-        reap_expired_landed_claim(conn, worktree)?;
         let row: Option<MergeRowSnapshot> = conn
             .query_row(
                 "SELECT status, claim_owner, updated_at, candidate_oid, result_oid \
@@ -1336,6 +1335,7 @@ impl WorktreeAuxStore for Db {
             None
         };
         let conn: &Connection = tx.as_deref().unwrap_or(base);
+        reap_expired_landed_claim(conn, worktree)?;
         let row: Option<MergeRowSnapshot> = conn
             .query_row(
                 "SELECT status, claim_owner, updated_at, candidate_oid, result_oid \
