@@ -33,6 +33,29 @@ type Term = Terminal<CrosstermBackend<Stdout>>;
 enum Wake {
     Event(Event),
     Pump,
+    Deadline,
+}
+
+/// At most one change-hook pulse is queued even when a producer floods updates.
+/// Deadlines have their own wake kind and never acknowledge a queued pulse.
+struct PumpSignal {
+    queued: AtomicBool,
+    sink: mpsc::Sender<Wake>,
+}
+
+impl PumpSignal {
+    fn post(&self) {
+        if !self.queued.swap(true, Ordering::AcqRel) && self.sink.send(Wake::Pump).is_err() {
+            self.queued.store(false, Ordering::Release);
+        }
+    }
+
+    fn received(&self) {
+        // Coalesced producers do not send a channel message. Acquire their
+        // release publications before reading the tile's shared state.
+        let was_queued = self.queued.swap(false, Ordering::AcqRel);
+        debug_assert!(was_queued);
+    }
 }
 
 const PENDING_EVENT_CAPACITY: usize = 16;
@@ -158,13 +181,12 @@ pub fn run(
 
     install_panic_hook_once();
 
-    let hook_tx = tx.clone();
-    let hook: ChangeHook = std::sync::Arc::new(move || {
-        // A closed channel just means we're shutting down; ignore.
-        if let Err(_error) = hook_tx.send(Wake::Pump) {
-            // best-effort: a closed channel means the harness is shutting down.
-        }
+    let pump = std::sync::Arc::new(PumpSignal {
+        queued: AtomicBool::new(false),
+        sink: tx.clone(),
     });
+    let hook_pump = pump.clone();
+    let hook: ChangeHook = std::sync::Arc::new(move || hook_pump.post());
 
     let mut spawned = false;
     let result = (|| {
@@ -180,7 +202,7 @@ pub fn run(
                     .spawn(input_reader)?;
                 spawned = true;
             }
-            event_loop(tile, &mut term, &rx)
+            event_loop(tile, &mut term, &rx, &pump)
         })
     })();
 
@@ -235,16 +257,43 @@ fn install_panic_hook_once() {
     });
 }
 
+/// Sleep until input or the nearest actual outstanding-operation deadline.
+fn receive_wake(
+    rx: &mpsc::Receiver<Wake>,
+    deadline: Option<std::time::Instant>,
+) -> Result<Wake, mpsc::RecvError> {
+    match deadline {
+        None => rx.recv(),
+        Some(deadline) => {
+            match rx.recv_timeout(deadline.saturating_duration_since(std::time::Instant::now())) {
+                Ok(wake) => Ok(wake),
+                Err(mpsc::RecvTimeoutError::Timeout) => Ok(Wake::Deadline),
+                Err(mpsc::RecvTimeoutError::Disconnected) => Err(mpsc::RecvError),
+            }
+        }
+    }
+}
+
 fn event_loop(
     tile: &mut dyn AppTile,
     term: &mut Term,
     rx: &mpsc::Receiver<Wake>,
+    pump: &PumpSignal,
 ) -> anyhow::Result<()> {
+    // A tile may prepare geometry outside render; initial size is a real
+    // lifecycle event even when the terminal never emits a Resize event.
+    let area = term.get_frame().area();
+    tile.on_resize(area.width, area.height);
+    tile.pump();
     draw(tile, term)?;
-    while let Ok(wake) = rx.recv() {
+    while let Ok(wake) = receive_wake(rx, tile.next_deadline()) {
         let mut dirty = false;
         match wake {
             Wake::Pump => {
+                pump.received();
+                dirty |= tile.pump();
+            }
+            Wake::Deadline => {
                 dirty |= tile.pump();
             }
             Wake::Event(ev) => match from_crossterm_event(ev) {
@@ -721,5 +770,128 @@ mod tests {
         let (tx, _rx) = mpsc::channel();
         let second = input.attach(tx).unwrap();
         assert!(second.spawn_reader);
+    }
+}
+
+#[cfg(test)]
+mod deadline_tests {
+    use super::*;
+
+    #[test]
+    fn outstanding_deadline_wakes_without_input_and_idle_uses_messages() {
+        let (tx, rx) = mpsc::channel();
+        assert!(matches!(
+            receive_wake(&rx, Some(std::time::Instant::now())),
+            Ok(Wake::Deadline)
+        ));
+        tx.send(Wake::Pump).unwrap();
+        assert!(matches!(receive_wake(&rx, None), Ok(Wake::Pump)));
+        drop(tx);
+        assert!(receive_wake(&rx, None).is_err());
+    }
+}
+
+#[cfg(test)]
+mod pump_signal_tests {
+    use super::*;
+
+    #[test]
+    fn consuming_a_pulse_acquires_coalesced_publications() {
+        let (tx, rx) = mpsc::channel();
+        let signal = std::sync::Arc::new(PumpSignal {
+            queued: AtomicBool::new(false),
+            sink: tx,
+        });
+        signal.post();
+        let payload = std::sync::atomic::AtomicUsize::new(0);
+        let posted = std::sync::atomic::AtomicUsize::new(0);
+        std::thread::scope(|scope| {
+            for bit in 0..8 {
+                let signal = signal.clone();
+                let payload = &payload;
+                let posted = &posted;
+                scope.spawn(move || {
+                    payload.fetch_or(1 << bit, Ordering::Relaxed);
+                    signal.post();
+                    posted.fetch_add(1, Ordering::Relaxed);
+                });
+            }
+            // This counter only arranges the interleaving. The queued pulse
+            // exchange supplies the publication ordering for the payload.
+            while posted.load(Ordering::Relaxed) != 8 {
+                std::thread::yield_now();
+            }
+            assert!(matches!(rx.try_recv(), Ok(Wake::Pump)));
+            signal.received();
+            assert_eq!(payload.load(Ordering::Relaxed), 0xff);
+            assert!(rx.try_recv().is_err());
+        });
+    }
+
+    #[test]
+    fn concurrent_producers_share_one_queued_pulse() {
+        let (tx, rx) = mpsc::channel();
+        let signal = std::sync::Arc::new(PumpSignal {
+            queued: AtomicBool::new(false),
+            sink: tx,
+        });
+        std::thread::scope(|scope| {
+            for _ in 0..8 {
+                let signal = signal.clone();
+                scope.spawn(move || {
+                    for _ in 0..12_500 {
+                        signal.post();
+                    }
+                });
+            }
+        });
+        assert!(matches!(rx.try_recv(), Ok(Wake::Pump)));
+        assert!(rx.try_recv().is_err());
+        signal.received();
+        signal.post();
+        assert!(matches!(receive_wake(&rx, None), Ok(Wake::Pump)));
+    }
+
+    #[test]
+    fn deadline_does_not_acknowledge_a_pulse_still_being_published() {
+        let (tx, rx) = mpsc::channel();
+        let signal = PumpSignal {
+            // A producer has claimed the pulse but not sent it yet.
+            queued: AtomicBool::new(true),
+            sink: tx,
+        };
+        assert!(matches!(
+            receive_wake(&rx, Some(std::time::Instant::now())),
+            Ok(Wake::Deadline)
+        ));
+        for _ in 0..100 {
+            signal.post();
+        }
+        assert!(signal.queued.load(Ordering::Acquire));
+        assert!(rx.try_recv().is_err());
+        signal.sink.send(Wake::Pump).unwrap();
+        assert!(matches!(receive_wake(&rx, None), Ok(Wake::Pump)));
+        signal.received();
+        signal.post();
+        assert!(matches!(receive_wake(&rx, None), Ok(Wake::Pump)));
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn flooded_change_hook_retains_one_pulse_and_admits_a_new_pulse_after_pump() {
+        let (tx, rx) = mpsc::channel();
+        let signal = PumpSignal {
+            queued: AtomicBool::new(false),
+            sink: tx,
+        };
+        for _ in 0..100_000 {
+            signal.post();
+        }
+        assert!(matches!(rx.try_recv(), Ok(Wake::Pump)));
+        assert!(rx.try_recv().is_err());
+        signal.received();
+        signal.post();
+        assert!(matches!(rx.try_recv(), Ok(Wake::Pump)));
+        assert!(rx.try_recv().is_err());
     }
 }
