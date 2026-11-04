@@ -246,11 +246,13 @@ fn new(
 
     let branch = match issue_branch {
         Some(b) => b,
-        None => worktree::branch_name(&root, name.as_deref(), cfg),
+        None => worktree::branch_name_checked(&root, name.as_deref(), cfg)
+            .map_err(anyhow::Error::msg)?,
     };
-    let base = base
-        .filter(|b| !b.trim().is_empty())
-        .unwrap_or_else(|| worktree::resolve_base(&root, cfg));
+    let base = match base.filter(|b| !b.trim().is_empty()) {
+        Some(base) => base,
+        None => worktree::resolve_base_checked(&root, cfg).map_err(anyhow::Error::msg)?,
+    };
     if util::git_out(&root, &["rev-parse", "--verify", "--quiet", &base]).is_none() {
         anyhow::bail!("'{base}' has no commits yet — make an initial commit first");
     }
@@ -915,11 +917,21 @@ fn new_batched(
             }),
             MemberPlan::Create => {
                 let root = std::path::PathBuf::from(&m.repo_root);
-                let resolved_base = base
-                    .as_ref()
-                    .filter(|b| !b.trim().is_empty())
-                    .cloned()
-                    .unwrap_or_else(|| worktree::resolve_base(&root, cfg));
+                let resolved_base = match base.as_ref().filter(|b| !b.trim().is_empty()).cloned() {
+                    Some(base) => base,
+                    None => match worktree::resolve_base_checked(&root, cfg) {
+                        Ok(base) => base,
+                        Err(error) => {
+                            outcomes.push(MemberOutcome {
+                                repo: m.repo_name.clone(),
+                                status: "failed",
+                                path: None,
+                                error: Some(error),
+                            });
+                            continue;
+                        }
+                    },
+                };
                 if util::git_out(&root, &["rev-parse", "--verify", "--quiet", &resolved_base])
                     .is_none()
                 {
@@ -1059,7 +1071,7 @@ fn resolve_issue_branch_lazy(
         detail.issue.branch_hint.as_deref(),
         &detail.issue.number,
     );
-    let taken = worktree::BranchSet::load(root);
+    let taken = worktree::BranchSet::load_checked(root).map_err(anyhow::Error::msg)?;
     Ok(worktree::dedupe(&seed, &taken))
 }
 

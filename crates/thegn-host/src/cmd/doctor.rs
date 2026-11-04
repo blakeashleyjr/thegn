@@ -508,6 +508,61 @@ fn devcontainer_report(cfg: &Config) {
     }
 }
 
+fn preview_renderers_json() -> serde_json::Value {
+    let previewed = current_worktree_root()
+        .map(|root| root.join(".git"))
+        .filter(|path| path.exists())
+        .or_else(|| std::env::current_dir().ok());
+    let Some(previewed) = previewed else {
+        return serde_json::json!({"error": "could not resolve a path for preview renderer checks"});
+    };
+    let report = crate::rasterize::renderer_doctor_report(&previewed);
+    serde_json::json!({
+        "bwrap": report.bwrap.map(|path| path.display().to_string()),
+        "bwrap_usable": report.bwrap_usable,
+        "renderers": report.rows.into_iter().map(|row| serde_json::json!({
+            "program": row.program,
+            "state": row.state,
+            "path": row.path.map(|path| path.display().to_string()),
+            "detail": row.detail,
+            "contained": row.contained,
+            "containment": row.containment,
+        })).collect::<Vec<_>>(),
+    })
+}
+
+fn preview_renderers_report() {
+    let report = preview_renderers_json();
+    outln!("Document preview renderers");
+    if let Some(error) = report["error"].as_str() {
+        outln!("  containment   unavailable: {error}");
+        return;
+    }
+    let bwrap_usable = report["bwrap_usable"].as_bool().unwrap_or(false);
+    if bwrap_usable {
+        outln!(
+            "  containment   bwrap at {}",
+            report["bwrap"].as_str().unwrap_or("(unresolved)")
+        );
+    } else {
+        outln!("  containment   unavailable: no usable bwrap; ready PDF previews run uncontained");
+    }
+    for row in report["renderers"].as_array().into_iter().flatten() {
+        let program = row["program"].as_str().unwrap_or("unknown");
+        let state = row["state"].as_str().unwrap_or("unverifiable");
+        let location = row["path"]
+            .as_str()
+            .or_else(|| row["detail"].as_str())
+            .unwrap_or("");
+        let containment = if row["contained"].as_bool() == Some(true) {
+            "contained: bwrap"
+        } else {
+            row["containment"].as_str().unwrap_or("not run")
+        };
+        outln!("  {program:<13} {state} {location} ({containment})");
+    }
+}
+
 /// The derived enforcement matrix for the running host, as JSON — one object per
 /// reachable backend with its honest cells. Aggregation-only (see
 /// [`enforcement_matrix_report`]).
@@ -2488,6 +2543,7 @@ fn doctor_json_with_health_and_overrides_and_legacy(
         ),
         "toolchain": toolchain_json(cfg),
         "devcontainer": devcontainer_json(cfg),
+        "preview_renderers": preview_renderers_json(),
         "remote_sandbox": remote_sandbox_json(cfg),
         "provider_cache": provider_cache_json(cfg),
         "warm_pool": warm_pool_json(cfg),
@@ -2496,6 +2552,7 @@ fn doctor_json_with_health_and_overrides_and_legacy(
             "reason": reason,
         })).collect::<Vec<_>>(),
         "host_execution": thegn_core::gate::host_execution_json(),
+        "resident_bridge": crate::bridge_sup::LocalBridgeReport::probe().json(),
         "managed_tools": managed_tools_json(cfg),
         "mcp_servers": mcp_servers_json(cfg),
         "network": network_json(cfg),
@@ -2520,6 +2577,7 @@ fn doctor_json_with_health_and_overrides_and_legacy(
         "remote_control": remote_control_transport_json(cfg),
         "lifecycle_hooks": lifecycle_hooks_json(cfg),
         "worktree_identity": worktree_identity_json(),
+        "calendar_diagnostics": calendar_diagnostics_json(cfg),
         "control_surface_coverage": crate::cmd::api::coverage_json(
             &crate::cmd::api::coverage_report(),
         ),
@@ -2639,6 +2697,84 @@ fn worktree_identity_report() {
         "  resolve       rename one branch from the sidebar (or `git -C <repo> branch -m`) \
          or remove one checkout with `thegn wt rm`; the tab is re-keyed on the next launch"
     );
+}
+
+/// Last persisted calendar parser diagnostics per configured account (THE-468). Read-only: never creates or migrates the state DB.
+fn calendar_diagnostics_json(cfg: &Config) -> serde_json::Value {
+    use thegn_core::store::CalendarStore as _;
+
+    match doctor_db() {
+        DoctorDb::Ready(db) => match db.calendar_diagnostics() {
+            Ok(rows) => serde_json::json!({
+                "state_db": "ok",
+                "accounts": rows
+                    .into_iter()
+                    .filter(|row| cfg.calendar.accounts.iter().any(|account| account.name == row.account))
+                    .map(|row| serde_json::json!({
+                        "account": row.account,
+                        "quarantined_events": row.counts.quarantined_events,
+                        "unresolved_zones": row.counts.unresolved_zones,
+                        "other": row.counts.other,
+                        "overflow": row.counts.overflow,
+                        "recorded_at": row.recorded_at,
+                    }))
+                    .collect::<Vec<_>>(),
+            }),
+            Err(error) => serde_json::json!({
+                "state_db": format!("unavailable: {error}"),
+                "accounts": Vec::<serde_json::Value>::new(),
+            }),
+        },
+        other => serde_json::json!({
+            "state_db": other.describe(),
+            "accounts": Vec::<serde_json::Value>::new(),
+        }),
+    }
+}
+
+fn calendar_diagnostics_report(cfg: &Config) {
+    let report = calendar_diagnostics_json(cfg);
+    outln!("Calendar diagnostics");
+    let Some(state) = report["state_db"].as_str() else {
+        outln!("  state DB      unavailable");
+        return;
+    };
+    if state != "ok" {
+        outln!("  state DB      {state}");
+        return;
+    }
+    let Some(rows) = report["accounts"].as_array() else {
+        outln!("  last pages    no diagnostics recorded");
+        return;
+    };
+    if rows.is_empty() {
+        outln!("  last pages    no diagnostics recorded");
+        return;
+    }
+    for row in rows {
+        let account = row["account"].as_str().unwrap_or("");
+        let name = thegn_core::calendar::display::DisplayText::new(
+            account,
+            thegn_core::calendar::display::Field::Calendar,
+        );
+        let quarantined = row["quarantined_events"].as_i64().unwrap_or(0);
+        let zones = row["unresolved_zones"].as_i64().unwrap_or(0);
+        let other = row["other"].as_i64().unwrap_or(0);
+        let overflow = row["overflow"].as_i64().unwrap_or(0);
+        let total = quarantined
+            .saturating_add(zones)
+            .saturating_add(other)
+            .saturating_add(overflow);
+        outln!(
+            "  {}  {} problem(s) on the last page (quarantined {}, unknown time zone {}, other {}, overflow {})",
+            name.as_str(),
+            total,
+            quarantined,
+            zones,
+            other,
+            overflow
+        );
+    }
 }
 
 fn lifecycle_hooks_report(cfg: &Config) {
@@ -2816,6 +2952,7 @@ pub fn run(
     if json {
         let mut report = doctor_json_with_health_and_overrides(cfg, &health, cli_overrides);
         report["plugins"] = plugins_trust_json(cfg, &config_path);
+        report["voice"] = super::voice::status(&cfg.voice);
         report["batteries"] =
             super::batteries_doctor::json(&super::batteries_doctor::inspect_env());
         outln!("{}", serde_json::to_string_pretty(&report)?);
@@ -2835,6 +2972,22 @@ pub fn run(
         outln!("  {k:<13} {}", v.as_deref().unwrap_or("(unset)"));
     };
     identification_report(cfg);
+    let voice = super::voice::status(&cfg.voice);
+    outln!("Voice");
+    outln!(
+        "  state         {} ({})",
+        if cfg.voice.enabled {
+            "enabled"
+        } else {
+            "disabled"
+        },
+        cfg.voice.kind.as_str()
+    );
+    outln!("  language      {}", cfg.voice.language);
+    outln!("  model         {}", cfg.voice.model);
+    outln!("  native build  {}", voice["native_compiled"]);
+    outln!("  live preview  {}", voice["live_preview"]);
+    outln!("  credential    {}", voice["credential_configured"]);
     let gate_quarantines = crate::integrate::gate_quarantines();
     if gate_quarantines.is_empty() {
         outln!("Merge gate workspaces: none quarantined");
@@ -2986,6 +3139,9 @@ pub fn run(
     worktree_identity_report();
 
     outln!("");
+    calendar_diagnostics_report(cfg);
+
+    outln!("");
     lifecycle_hooks_report(cfg);
 
     outln!("");
@@ -3001,6 +3157,9 @@ pub fn run(
     devcontainer_report(cfg);
 
     outln!("");
+    preview_renderers_report();
+
+    outln!("");
     hosts_report(cfg);
 
     outln!("");
@@ -3011,6 +3170,11 @@ pub fn run(
 
     outln!("");
     warm_pool_report(cfg);
+
+    outln!("");
+    for line in crate::bridge_sup::LocalBridgeReport::probe().lines() {
+        outln!("{line}");
+    }
 
     outln!("");
     home_layer_report(cfg);
@@ -5479,6 +5643,23 @@ mod tests {
     }
 
     #[test]
+    fn doctor_json_reports_preview_renderer_containment() {
+        let report = doctor_json(&Config::default());
+        let renderers = report["preview_renderers"]["renderers"]
+            .as_array()
+            .expect("preview renderer rows missing");
+        assert_eq!(
+            renderers
+                .iter()
+                .map(|row| row["program"].as_str().unwrap())
+                .collect::<Vec<_>>(),
+            ["pdftoppm", "pdftotext", "mmdc"]
+        );
+        assert!(renderers.iter().all(|row| row["contained"].is_boolean()));
+        assert!(!renderers[2]["contained"].as_bool().unwrap());
+    }
+
+    #[test]
     fn doctor_json_reports_quarantined_merge_gate_workspaces() {
         let report = doctor_json(&Config::default());
         assert!(report["merge_gate_quarantines"].is_array());
@@ -5534,6 +5715,17 @@ mod tests {
         assert!(report.is_object());
         assert_eq!(report["state_db"], "no database yet");
         assert!(report["spares"].is_array());
+    }
+
+    #[test]
+    fn resident_bridge_json_is_always_present_with_a_state() {
+        let _state = thegn_core::testenv::IsolatedState::new();
+        let report = doctor_json(&Config::default())["resident_bridge"].clone();
+        assert!(report.is_object());
+        assert!(matches!(
+            report["state"].as_str(),
+            Some("absent" | "unreadable" | "present")
+        ));
     }
 
     #[test]
@@ -6636,6 +6828,58 @@ args = ["--verbose"]
                 && state_db.contains("migrates on the next thegn start"),
             "older schema must be reported as not read until the next thegn start: {state_db}"
         );
+    }
+
+    #[test]
+    fn calendar_diagnostics_json_never_creates_the_state_db() {
+        let state = thegn_core::testenv::IsolatedState::new();
+
+        let report = calendar_diagnostics_json(&Config::default());
+
+        assert_eq!(report["state_db"], "no database yet");
+        assert_eq!(report["accounts"].as_array().unwrap().len(), 0);
+        assert!(!state.state_home().join("thegn/thegn.db").exists());
+        assert!(!state.state_home().join("thegn").exists());
+    }
+
+    #[test]
+    fn calendar_diagnostics_json_reports_configured_accounts_only() {
+        use thegn_core::store::{CalendarDiagnosticCounts, CalendarStore as _};
+
+        let _state = thegn_core::testenv::IsolatedState::new();
+        let db = Db::open().expect("create isolated db");
+        db.put_calendar_diagnostics(
+            "work",
+            &CalendarDiagnosticCounts {
+                quarantined_events: 2,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        db.put_calendar_diagnostics(
+            "gone",
+            &CalendarDiagnosticCounts {
+                other: 1,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        drop(db);
+        let mut cfg = Config::default();
+        cfg.calendar
+            .accounts
+            .push(thegn_core::config_calendar::CalendarAccount {
+                name: "work".into(),
+                ..Default::default()
+            });
+
+        let report = calendar_diagnostics_json(&cfg);
+
+        assert_eq!(report["state_db"], "ok");
+        let accounts = report["accounts"].as_array().unwrap();
+        assert_eq!(accounts.len(), 1);
+        assert_eq!(accounts[0]["account"], "work");
+        assert_eq!(accounts[0]["quarantined_events"], 2);
     }
 
     // Keep the writer connection open so its committed row remains represented

@@ -27,6 +27,13 @@ thread_local! {
 
 #[cfg(test)]
 thread_local! {
+    static WORKTREE_NEXT_BRANCH_PROBE_FAILURE: std::cell::Cell<bool> = const {
+        std::cell::Cell::new(false)
+    };
+}
+
+#[cfg(test)]
+thread_local! {
     static WORKTREE_MUTATION_LOCK_WAIT_OVERRIDE: std::cell::Cell<Option<Duration>> = const {
         std::cell::Cell::new(None)
     };
@@ -379,6 +386,13 @@ pub fn branch_exists(root: &Path, branch: &str) -> bool {
 /// Lifecycle code must use this checked form so an unverifiable ref is never
 /// mistaken for an absent branch.
 pub fn branch_exists_checked(root: &Path, branch: &str) -> Result<bool, String> {
+    #[cfg(test)]
+    if WORKTREE_NEXT_BRANCH_PROBE_FAILURE.replace(false) {
+        return Err(format!(
+            "could not check branch {branch}: Git command timed out"
+        ));
+    }
+
     let cancel = std::sync::atomic::AtomicBool::new(false);
     match crate::git_run::git_run(
         root,
@@ -416,6 +430,8 @@ pub struct BranchSet {
 }
 
 impl BranchSet {
+    /// Best effort (a failed read yields fewer names); creation paths use
+    /// [`BranchSet::load_checked`].
     pub fn load(root: &Path) -> Self {
         let mut taken = std::collections::HashSet::new();
         if let Some(out) = util::git_out(
@@ -428,6 +444,47 @@ impl BranchSet {
             taken.extend(worktrees.into_iter().filter_map(|(_, branch)| branch));
         }
         Self { taken }
+    }
+
+    /// Read local branches and checked-out worktree branches without losing
+    /// Git failures. Creation paths must refuse when either inventory is
+    /// unavailable so they cannot choose a branch that is already taken.
+    pub fn load_checked(root: &Path) -> Result<Self, String> {
+        let cancel = std::sync::atomic::AtomicBool::new(false);
+        let refs = crate::git_run::git_run(
+            root,
+            &["for-each-ref", "refs/heads", "--format=%(refname:short)"],
+            &crate::git_run::GitPolicy::read(worktree_git_deadline()),
+            &cancel,
+        );
+        let refs = refs
+            .into_text()
+            .map_err(|error| format!("could not list branches in {}: {error}", root.display()))?;
+
+        let worktrees = crate::git_run::git_run(
+            root,
+            &util::WORKTREE_LIST_Z,
+            &crate::git_run::GitPolicy::read(worktree_git_deadline()),
+            &cancel,
+        );
+        let worktrees = worktrees
+            .into_text()
+            .map_err(|error| format!("could not list branches in {}: {error}", root.display()))?;
+        let worktrees = util::parse_worktree_branches(&worktrees).ok_or_else(|| {
+            format!(
+                "could not list branches in {}: malformed worktree listing",
+                root.display()
+            )
+        })?;
+
+        let mut taken = std::collections::HashSet::new();
+        taken.extend(
+            refs.lines()
+                .map(str::to_string)
+                .filter(|line| !line.is_empty()),
+        );
+        taken.extend(worktrees.into_iter().filter_map(|(_, branch)| branch));
+        Ok(Self { taken })
     }
 
     pub fn from_names<I: IntoIterator<Item = String>>(names: I) -> Self {
@@ -499,6 +556,20 @@ pub fn branch_name(root: &Path, human: Option<&str>, cfg: &Config) -> String {
     dedupe(&base, &BranchSet::load(root))
 }
 
+/// Generate a collision-free branch name, refusing if Git cannot provide the
+/// branch inventory needed to prove that the name is free.
+pub fn branch_name_checked(
+    root: &Path,
+    human: Option<&str>,
+    cfg: &Config,
+) -> Result<String, String> {
+    let base = match human {
+        Some(name) => human_base(name, cfg),
+        None => candidate_name(cfg),
+    };
+    Ok(dedupe(&base, &BranchSet::load_checked(root)?))
+}
+
 /// Best-effort default branch: origin/HEAD, else main, else master, else HEAD.
 pub fn default_branch(root: &Path) -> String {
     if let Some(r) = util::git_out(
@@ -520,6 +591,51 @@ pub fn default_branch(root: &Path) -> String {
     "HEAD".to_string()
 }
 
+/// Read the default branch while preserving failures from Git probes.
+pub fn default_branch_checked(root: &Path) -> Result<String, String> {
+    let cancel = std::sync::atomic::AtomicBool::new(false);
+    let origin_head = crate::git_run::git_run(
+        root,
+        &[
+            "for-each-ref",
+            "--format=%(symref)",
+            "refs/remotes/origin/HEAD",
+        ],
+        &crate::git_run::GitPolicy::read(worktree_git_deadline()),
+        &cancel,
+    );
+    let origin_head = match origin_head {
+        outcome if outcome.is_success() => outcome.into_text().map_err(|error| {
+            format!("could not read origin HEAD in {}: {error}", root.display())
+        })?,
+        outcome => {
+            return Err(format!(
+                "could not read origin HEAD in {}: {outcome}",
+                root.display()
+            ));
+        }
+    };
+    let origin_head = origin_head.trim();
+    if let Some(branch) = origin_head.strip_prefix("refs/remotes/origin/")
+        && !branch.is_empty()
+    {
+        return Ok(branch.to_string());
+    }
+    if !origin_head.is_empty() {
+        return Err(format!(
+            "could not read origin HEAD in {}: unexpected symref {origin_head}",
+            root.display()
+        ));
+    }
+
+    for branch in ["main", "master"] {
+        if branch_exists_checked(root, branch)? {
+            return Ok(branch.to_string());
+        }
+    }
+    Ok("HEAD".to_string())
+}
+
 /// Resolve the base ref to branch a new worktree off (honours `base_branch`).
 pub fn resolve_base(root: &Path, cfg: &Config) -> String {
     if cfg.base_branch != "auto" {
@@ -536,6 +652,69 @@ pub fn resolve_base(root: &Path, cfg: &Config) -> String {
         "main worktree is on a detached HEAD; basing new worktree off '{def}'"
     ));
     def
+}
+
+/// Resolve the base ref for a new worktree, distinguishing detached HEAD from
+/// a failed HEAD probe.
+pub fn resolve_base_checked(root: &Path, cfg: &Config) -> Result<String, String> {
+    if cfg.base_branch != "auto" {
+        return Ok(cfg.base_branch.clone());
+    }
+    let cancel = std::sync::atomic::AtomicBool::new(false);
+    let bare = crate::git_run::git_run(
+        root,
+        &["rev-parse", "--is-bare-repository"],
+        &crate::git_run::GitPolicy::read(worktree_git_deadline()),
+        &cancel,
+    );
+    let bare = match bare {
+        outcome if outcome.is_success() => outcome.into_text().map_err(|error| {
+            format!(
+                "could not check repository type in {}: {error}",
+                root.display()
+            )
+        })?,
+        outcome => {
+            return Err(format!(
+                "could not read HEAD in {}: {outcome}",
+                root.display()
+            ));
+        }
+    };
+    if bare.trim() == "true" {
+        return default_branch_checked(root);
+    }
+    if bare.trim() != "false" {
+        return Err(format!(
+            "could not check repository type in {}: unexpected response {bare:?}",
+            root.display()
+        ));
+    }
+
+    match crate::git_run::git_run(
+        root,
+        &["symbolic-ref", "--quiet", "--short", "HEAD"],
+        &crate::git_run::GitPolicy::read(worktree_git_deadline()),
+        &cancel,
+    ) {
+        outcome if outcome.is_success() => {
+            let head = outcome
+                .into_text()
+                .map_err(|error| format!("could not read HEAD in {}: {error}", root.display()))?;
+            Ok(head.trim().to_string())
+        }
+        crate::git_run::GitOutcome::Exit { code: Some(1), .. } => {
+            let def = default_branch_checked(root)?;
+            msg::warn(&format!(
+                "main worktree is on a detached HEAD; basing new worktree off '{def}'"
+            ));
+            Ok(def)
+        }
+        outcome => Err(format!(
+            "could not read HEAD in {}: {outcome}",
+            root.display()
+        )),
+    }
 }
 
 /// Readable prefix for a checkout directory name. Display-only: two branches
@@ -679,6 +858,9 @@ pub struct AddError {
     /// A leftover rename intent journal could not be reconciled; the add was
     /// refused before Git ran and no rollback may run.
     pub rename_journal_pending: bool,
+    /// The branch pre-existence probe could not be verified, so the add was
+    /// refused before Git ran. Nothing was mutated and no rollback may run.
+    pub branch_probe_failed: bool,
 }
 
 /// [`add`] with the failure reason returned instead of warned, for callers
@@ -736,6 +918,7 @@ pub fn add_checked_with_state(
                 destination_preexisted: false,
                 lock_unavailable: true,
                 rename_journal_pending: false,
+                branch_probe_failed: false,
             });
         }
     };
@@ -753,6 +936,7 @@ pub fn add_checked_with_state(
                 destination_preexisted: false,
                 lock_unavailable: false,
                 rename_journal_pending: true,
+                branch_probe_failed: false,
             });
         }
     }
@@ -774,9 +958,22 @@ pub fn add_checked_with_state(
             destination_preexisted: true,
             lock_unavailable: false,
             rename_journal_pending: false,
+            branch_probe_failed: false,
         });
     }
-    let branch_preexisted = branch_exists(root, branch);
+    let branch_preexisted = match branch_exists_checked(root, branch) {
+        Ok(exists) => exists,
+        Err(reason) => {
+            return Err(AddError {
+                message: format!("refusing to create worktree for {branch}: {reason}"),
+                branch_created: false,
+                destination_preexisted: false,
+                lock_unavailable: false,
+                rename_journal_pending: false,
+                branch_probe_failed: true,
+            });
+        }
+    };
     let out = util::git_cmd(root)
         // Worktree creation runs on a worker, but Git must still fail fast if
         // a remote credential helper would otherwise prompt for input.
@@ -795,18 +992,21 @@ pub fn add_checked_with_state(
                     "git worktree add failed (branch={branch} base={base}): {}",
                     stderr.trim()
                 ),
-                branch_created: !branch_preexisted && branch_exists(root, branch),
+                branch_created: !branch_preexisted
+                    && branch_exists_checked(root, branch) == Ok(true),
                 destination_preexisted: false,
                 lock_unavailable: false,
                 rename_journal_pending: false,
+                branch_probe_failed: false,
             })
         }
         Err(e) => Err(AddError {
             message: format!("could not run git worktree add: {e}"),
-            branch_created: !branch_preexisted && branch_exists(root, branch),
+            branch_created: !branch_preexisted && branch_exists_checked(root, branch) == Ok(true),
             destination_preexisted: false,
             lock_unavailable: false,
             rename_journal_pending: false,
+            branch_probe_failed: false,
         }),
     }
 }
@@ -1237,10 +1437,12 @@ pub(crate) fn reconcile_rename_intent_locked(
         return Ok(Some(RenameRecovery::Completed));
     }
     if old_at_new && new_absent && !old_branch_exists {
-        if util::git_ok(
+        if git_destructive(
             root,
             &["branch", "-m", &intent.new_branch, &intent.old_branch],
-        ) {
+        )
+        .is_ok()
+        {
             clear_rename_intent(root)?;
             return Ok(Some(RenameRecovery::RolledBack));
         }
@@ -1344,36 +1546,35 @@ pub fn rename(
         new_path: new_path_exact.to_owned(),
     };
     write_rename_intent(root, &intent)?;
-    if !util::git_ok(root, &["branch", "-m", old_branch, new_branch]) {
+    if let Err(why) = git_destructive(root, &["branch", "-m", old_branch, new_branch]) {
         if let Err(error) = clear_rename_intent(root) {
             return Err(format!(
-                "could not rename branch {old_branch} → {new_branch}; {error}"
+                "could not rename branch {old_branch} → {new_branch}: {why}; {error}"
             ));
         }
         return Err(format!(
-            "could not rename branch {old_branch} → {new_branch}"
+            "could not rename branch {old_branch} → {new_branch}: {why}"
         ));
     }
-    let moved = util::git_cmd(root)
-        .args(["worktree", "move"])
-        .arg(&registered_old_path)
-        .arg(&new_path)
-        .output()
-        .map(|o| o.status.success())
-        .unwrap_or(false);
-    if moved {
-        if let Err(error) = clear_rename_intent(root) {
-            tracing::warn!(target: "thegn::worktree", %error, path = %rename_intent_path(root).display(), "could not clear completed rename intent");
+    let move_error = match git_destructive(
+        root,
+        &["worktree", "move", old_path_exact, new_path_exact],
+    ) {
+        Ok(()) => {
+            if let Err(error) = clear_rename_intent(root) {
+                tracing::warn!(target: "thegn::worktree", %error, path = %rename_intent_path(root).display(), "could not clear completed rename intent");
+            }
+            return Ok(new_path);
         }
-        return Ok(new_path);
-    }
-    if util::git_ok(root, &["branch", "-m", new_branch, old_branch]) {
+        Err(why) => why,
+    };
+    if git_destructive(root, &["branch", "-m", new_branch, old_branch]).is_ok() {
         if let Err(error) = clear_rename_intent(root) {
             tracing::warn!(target: "thegn::worktree", %error, path = %rename_intent_path(root).display(), "could not clear rolled-back rename intent");
         }
         return Err(format!(
-            "moving the worktree to {} failed; the branch rename was rolled back to {old_branch}",
-            new_path.display()
+            "moving the worktree to {} failed ({move_error}); the branch rename was rolled back to {old_branch}",
+            new_path.display(),
         ));
     }
     Err(format!(
@@ -1493,6 +1694,155 @@ mod tests {
         let not_repo = tempfile::tempdir().unwrap();
         let result = branch_exists_checked(not_repo.path(), "main");
         assert!(matches!(result, Err(error) if error.contains("not a git repository")));
+    }
+
+    #[test]
+    fn checked_branch_set_refuses_a_non_repository() {
+        let scratch = tempfile::tempdir().unwrap();
+        let checked = BranchSet::load_checked(scratch.path());
+        assert!(matches!(checked, Err(error) if error.contains("not a git repository")));
+        assert!(branch_name_checked(scratch.path(), Some("feature"), &Config::default()).is_err());
+
+        let best_effort = BranchSet::load(scratch.path());
+        assert!(!best_effort.taken("main"));
+    }
+
+    #[test]
+    fn checked_branch_set_matches_the_best_effort_set() {
+        let scratch = tempfile::tempdir().unwrap();
+        let repo = scratch.path().join("repo");
+        std::fs::create_dir(&repo).unwrap();
+        temp_repo_in(&repo);
+        assert!(
+            util::git_cmd(&repo)
+                .args(["branch", "feature"])
+                .status()
+                .unwrap()
+                .success()
+        );
+        let other_worktree = scratch.path().join("other");
+        let other_worktree = other_worktree.to_string_lossy().into_owned();
+        assert!(
+            util::git_cmd(&repo)
+                .args(["worktree", "add", "-q", "-b", "other", &other_worktree])
+                .status()
+                .unwrap()
+                .success()
+        );
+
+        let checked = BranchSet::load_checked(&repo).unwrap();
+        let best_effort = BranchSet::load(&repo);
+        for branch in ["main", "feature", "other"] {
+            assert!(checked.taken(branch), "checked inventory omitted {branch}");
+            assert!(
+                best_effort.taken(branch),
+                "best-effort inventory omitted {branch}"
+            );
+        }
+        assert!(!checked.taken("free"));
+        assert!(!best_effort.taken("free"));
+    }
+
+    #[test]
+    fn checked_resolve_base_tells_detached_head_from_a_failed_probe() {
+        let scratch = tempfile::tempdir().unwrap();
+        let repo = scratch.path().join("repo");
+        std::fs::create_dir(&repo).unwrap();
+        temp_repo_in(&repo);
+        let cfg = Config::default();
+        assert_eq!(cfg.base_branch, "auto");
+        assert_eq!(resolve_base_checked(&repo, &cfg).unwrap(), "main");
+
+        assert!(
+            util::git_cmd(&repo)
+                .args(["checkout", "-q", "--detach"])
+                .status()
+                .unwrap()
+                .success()
+        );
+        assert_eq!(resolve_base_checked(&repo, &cfg).unwrap(), "main");
+
+        let not_repo = scratch.path().join("not-repo");
+        std::fs::create_dir(&not_repo).unwrap();
+        let result = resolve_base_checked(&not_repo, &cfg);
+        assert!(matches!(result, Err(error) if error.contains("could not read HEAD")));
+    }
+
+    #[test]
+    fn checked_default_branch_reads_origin_head_then_main() {
+        let scratch = tempfile::tempdir().unwrap();
+        let repo = scratch.path().join("repo");
+        std::fs::create_dir(&repo).unwrap();
+        temp_repo_in(&repo);
+        assert_eq!(default_branch_checked(&repo).unwrap(), "main");
+
+        assert!(
+            util::git_cmd(&repo)
+                .args([
+                    "symbolic-ref",
+                    "refs/remotes/origin/HEAD",
+                    "refs/remotes/origin/trunk",
+                ])
+                .status()
+                .unwrap()
+                .success()
+        );
+        assert_eq!(default_branch_checked(&repo).unwrap(), "main");
+
+        assert!(
+            util::git_cmd(&repo)
+                .args(["update-ref", "refs/remotes/origin/trunk", "HEAD"])
+                .status()
+                .unwrap()
+                .success()
+        );
+        assert!(
+            util::git_cmd(&repo)
+                .args([
+                    "symbolic-ref",
+                    "refs/remotes/origin/HEAD",
+                    "refs/remotes/origin/trunk",
+                ])
+                .status()
+                .unwrap()
+                .success()
+        );
+        assert_eq!(default_branch_checked(&repo).unwrap(), "trunk");
+
+        let not_repo = scratch.path().join("not-repo");
+        std::fs::create_dir(&not_repo).unwrap();
+        assert!(default_branch_checked(&not_repo).is_err());
+    }
+
+    #[test]
+    fn checked_resolve_base_uses_default_branch_for_bare_repository() {
+        let scratch = tempfile::tempdir().unwrap();
+        let source = scratch.path().join("source");
+        std::fs::create_dir(&source).unwrap();
+        temp_repo_in(&source);
+
+        let bare = scratch.path().join("bare");
+        std::fs::create_dir(&bare).unwrap();
+        assert!(
+            util::git_cmd(&bare)
+                .args(["init", "--bare", "-q", "-b", "main"])
+                .status()
+                .unwrap()
+                .success()
+        );
+        let bare_remote = bare.to_string_lossy().into_owned();
+        assert!(
+            util::git_cmd(&source)
+                .args(["push", &bare_remote, "main"])
+                .status()
+                .unwrap()
+                .success()
+        );
+
+        assert_eq!(
+            resolve_base_checked(&bare, &Config::default()).unwrap(),
+            "main"
+        );
     }
 
     #[test]
@@ -2367,6 +2717,86 @@ mod tests {
             .arg(&path)
             .status();
         let _ = std::fs::remove_dir_all(&repo);
+    }
+
+    #[test]
+    fn add_refuses_when_the_branch_probe_cannot_be_verified() {
+        let repo = temp_repo("probe-refuse");
+        let cfg = scratch_cfg(&repo);
+        let path = allocate_worktree_path(&repo, "probe", &cfg).unwrap();
+        WORKTREE_NEXT_BRANCH_PROBE_FAILURE.with(|failure| failure.set(true));
+
+        let Err(error) = add_checked_with_state(&repo, "probe", "main", &path, &cfg) else {
+            panic!("an unverifiable branch probe must refuse the add");
+        };
+
+        assert!(error.branch_probe_failed);
+        assert!(!error.branch_created);
+        assert!(error.message.contains("could not check branch probe"));
+        assert!(!path.exists());
+        assert_eq!(branch_exists_checked(&repo, "probe"), Ok(false));
+        std::fs::remove_dir_all(&repo).unwrap();
+    }
+
+    #[test]
+    fn rename_reports_why_git_refused_the_branch_rename() {
+        let repo = temp_repo("rename-branch-exists");
+        let cfg = scratch_cfg(&repo);
+        let path = allocate_worktree_path(&repo, "old", &cfg).unwrap();
+        add_checked(&repo, "old", "main", &path, &cfg).unwrap();
+        assert!(util::git_ok(&repo, &["branch", "taken"]));
+
+        let error = rename(&repo, &path, "old", "taken", &cfg).unwrap_err();
+
+        assert!(
+            error.contains("could not rename branch old → taken"),
+            "{error}"
+        );
+        assert!(error.contains("already exists"), "{error}");
+        assert!(branch_exists(&repo, "old"));
+        assert!(path.is_dir());
+        assert!(!rename_intent_path(&repo).exists());
+        std::fs::remove_dir_all(&repo).unwrap();
+    }
+
+    #[test]
+    fn rename_move_failure_reports_gits_reason() {
+        let repo = temp_repo("rename-move-reason");
+        let cfg = scratch_cfg(&repo);
+        let path = allocate_worktree_path(&repo, "old", &cfg).unwrap();
+        add_checked(&repo, "old", "main", &path, &cfg).unwrap();
+        assert!(
+            util::git_cmd(&repo)
+                .args(["worktree", "lock"])
+                .arg(&path)
+                .status()
+                .unwrap()
+                .success()
+        );
+
+        let error = rename(&repo, &path, "old", "new", &cfg).unwrap_err();
+
+        assert!(error.contains("rolled back"), "{error}");
+        assert!(error.contains("locked working tree"), "{error}");
+        assert!(branch_exists(&repo, "old"));
+        assert!(!branch_exists(&repo, "new"));
+        assert_eq!(
+            inspect_registered(&repo, &path)
+                .unwrap()
+                .branch()
+                .unwrap()
+                .raw(),
+            b"old"
+        );
+        assert!(
+            util::git_cmd(&repo)
+                .args(["worktree", "unlock"])
+                .arg(&path)
+                .status()
+                .unwrap()
+                .success()
+        );
+        std::fs::remove_dir_all(&repo).unwrap();
     }
 
     fn rename_intent_for(repo: &Path, old_path: &Path, cfg: &Config) -> RenameIntent {

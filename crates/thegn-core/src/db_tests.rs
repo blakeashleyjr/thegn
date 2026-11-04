@@ -1075,6 +1075,39 @@ fn share_delete_is_fenced_on_generation() {
 }
 
 #[test]
+fn share_owner_is_fenced_on_generation_and_cleared_on_takeover() {
+    let db = db();
+    let owner = crate::models::ShareOwner {
+        pid: 4242,
+        start_ticks: 99,
+    };
+    db.upsert_share("/wt/owner", 3000, 7, "bore", None, "starting")
+        .unwrap();
+    assert!(!db.set_share_owner("/wt/owner", 3000, 6, owner).unwrap());
+    assert_eq!(db.list_shares().unwrap()[0].owner, None);
+    assert!(db.set_share_owner("/wt/owner", 3000, 7, owner).unwrap());
+    db.upsert_share("/wt/owner", 3000, 7, "bore", Some("https://x.test"), "up")
+        .unwrap();
+    assert_eq!(db.list_shares().unwrap()[0].owner, Some(owner));
+    assert!(
+        db.rebind_share_generation("/wt/owner", 3000, 7, 11)
+            .unwrap()
+    );
+    assert_eq!(db.list_shares().unwrap()[0].owner, None);
+    assert!(db.set_share_owner("/wt/owner", 3000, 11, owner).unwrap());
+    db.upsert_share("/wt/owner", 3000, 12, "frp", None, "starting")
+        .unwrap();
+    assert_eq!(db.list_shares().unwrap()[0].owner, None);
+    db.conn()
+        .execute(
+            "UPDATE shares SET owner_pid=0, owner_start_ticks=99 WHERE worktree='/wt/owner'",
+            [],
+        )
+        .unwrap();
+    assert_eq!(db.list_shares().unwrap()[0].owner, None);
+}
+
+#[test]
 fn forwards_upsert_list_and_delete() {
     let db = db();
     assert!(db.list_forwards().unwrap().is_empty());

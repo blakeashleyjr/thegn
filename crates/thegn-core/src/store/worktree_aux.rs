@@ -4,6 +4,7 @@
 
 use crate::db::{ForwardRow, MergeQueueRow, PrQueueRow, ShareRow};
 use crate::models::ContainerEvent;
+use crate::models::ShareOwner;
 use anyhow::Result;
 
 pub const MERGE_CLAIM_MAX_LEASE_MS: i64 = 5 * 60 * 1000;
@@ -328,6 +329,15 @@ pub trait WorktreeAuxStore {
 
     /// Unconditionally remove a share record. Reserved for explicit CLI `share stop`.
     fn delete_share(&self, worktree: &str, local_port: u16) -> Result<()>;
+    /// Record the owning CLI process only while `(worktree, local_port, generation)` still matches.
+    /// `Ok(false)` means the row changed or was taken over before the owner could be recorded.
+    fn set_share_owner(
+        &self,
+        worktree: &str,
+        local_port: u16,
+        generation: u64,
+        owner: ShareOwner,
+    ) -> Result<bool>;
 
     /// Insert or update the forward record for `(worktree, container_port)`.
     fn upsert_forward(
@@ -469,6 +479,14 @@ pub trait WorktreeAuxStore {
 
     /// Read an operator-event history newest first, limited to at most `limit` rows.
     fn merge_queue_events(&self, worktree: &str, limit: usize) -> Result<Vec<MergeQueueEvent>>;
+
+    /// Record a refused operation against an existing merge-queue row without changing the row.
+    /// The event carries the row's status, version and OIDs, with `new_status` set to `None`.
+    /// Returns false and writes nothing when no row exists or the events table predates the
+    /// current shape. Land refusal outcomes include `not_on_branch`, `branch_unreadable`,
+    /// `not_ready`, `no_result`, `branch_mismatch`, `no_candidate`, `candidate_moved`, `remote`,
+    /// `claimed`, `registry_changed`, and `queue_changed`.
+    fn record_merge_refusal(&self, worktree: &str, operation: &str, outcome: &str) -> Result<bool>;
 
     /// Install only the fixed branch-retained cleanup marker if every decoded
     /// field still matches this landed observation. Preserve timestamps and

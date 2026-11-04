@@ -161,12 +161,19 @@
       # observe, placement, non-GitHub trackers) are enabled instead of clamped
       # off. Installs as `thegn-dev`/`tg-dev`, so it coexists with a stable
       # install. `THEGN_CHANNEL=stable` still forces either binary to stable.
+      # On x86_64-linux the wrapper points THEGN_BRIDGE_BINARY at the musl
+      # bridge (`thegnMusl`), the provider bridge this channel enables;
+      # elsewhere there is no bridge build.
       thegnDev = pkgs.callPackage ./nix/package.nix {
         src = thegnSrc;
         yazi = yaziPinned;
         inherit yaziDeps craneLib cargoArtifacts;
         version = cargoVersion;
         channel = "dev";
+        bridge =
+          if system == "x86_64-linux"
+          then thegnMusl
+          else null;
       };
 
       # The OpenSpec CLI thegn uses for spec-driven development of itself.
@@ -208,6 +215,12 @@
       msrvCargo = pkgs.writeShellScriptBin "cargo-1.89" ''
         exec ${msrvRustToolchain}/bin/cargo "$@"
       '';
+      # Optional native dictation is exercised by the all-features gate. Keep
+      # its build tools in the development/CI shells without enabling it in
+      # release packages or the static remote bridge.
+      voiceNativeInputs =
+        [pkgs.cmake pkgs.pkg-config]
+        ++ pkgs.lib.optionals pkgs.stdenv.isLinux [pkgs.alsa-lib];
       spriteRustToolchain = pkgs.rust-bin.stable.latest.minimal.override {
         extensions = ["clippy" "rustfmt" "llvm-tools-preview"];
       };
@@ -623,7 +636,8 @@
           # is verified on demand (`just nix-build-full`, and before a release).
           thegn-nobridge = thegn;
           # The dev release channel (`nix build .#dev` / `nix run .#dev`): the
-          # same host with experimental subsystems enabled, as `thegn-dev`.
+          # same host with experimental subsystems enabled, as `thegn-dev`;
+          # on x86_64-linux its wrapper points THEGN_BRIDGE_BINARY at the musl bridge.
           dev = thegnDev;
           thegn-dev = thegnDev;
           # The pinned yazi thegn drives for the file-manager drawer.
@@ -723,6 +737,8 @@
               test "$(${thegnMusl}/bin/thegn --version)" = "thegn ${cargoVersion}"
               test -f ${thegnMusl}/share/licenses/thegn-musl/LICENSE-MIT
               test -f ${thegnMusl}/share/licenses/thegn-musl/LICENSE-APACHE
+              grep -q 'THEGN_BRIDGE_BINARY' ${thegnDev}/bin/thegn-dev
+              grep -q '${thegnMusl}/bin/thegn' ${thegnDev}/bin/thegn-dev
             ''}
             for package_names in "${thegn}:thegn:tg" "${thegnDev}:thegn-dev:tg-dev"; do
               IFS=: read -r package primary_name alias_name <<< "$package_names"
@@ -812,18 +828,22 @@
       # carries only what `just build` and `just test` actually use, so the job
       # both passes and gets cheaper. Keep it in sync with those two recipes.
       devShells.ci = pkgs.mkShell {
-        packages = [
-          rustToolchain
-          pkgs.just
-          # `just test` runs `cargo nextest run --workspace`.
-          pkgs.cargo-nextest
-          # libgit2-sys → libz-sys wants pkg-config + zlib; sqlite is vendored.
-          pkgs.pkg-config
-          pkgs.zlib
-        ];
+        LIBCLANG_PATH = "${pkgs.llvmPackages.libclang.lib}/lib";
+        packages =
+          [
+            rustToolchain
+            pkgs.just
+            # `just test` runs `cargo nextest run --workspace`.
+            pkgs.cargo-nextest
+            # libgit2-sys → libz-sys wants pkg-config + zlib; sqlite is vendored.
+            pkgs.pkg-config
+            pkgs.zlib
+          ]
+          ++ voiceNativeInputs;
       };
 
       devShells.default = pkgs.mkShell {
+        LIBCLANG_PATH = "${pkgs.llvmPackages.libclang.lib}/lib";
         packages = with pkgs;
           [
             # rust toolchain (clippy/rustfmt/rust-analyzer + wasm32-wasip1 target)
@@ -876,6 +896,7 @@
           ]
           # The same pinned yazi as the package, so the drawer's preview tools
           # resolve on PATH and `just host` runs the version thegn ships.
+          ++ voiceNativeInputs
           ++ [yaziPinned]
           ++ yaziDeps
           # Faster linker, wired via CARGO_TARGET_*_RUSTFLAGS in shellHook
@@ -907,6 +928,7 @@
       # tool is one `nix shell nixpkgs#<tool>` away in-pane. Reuses `devShellHook`
       # (sccache/mold/yazi/openspec) so it never drifts from `default`.
       devShells.sprite-full = pkgs.mkShell {
+        LIBCLANG_PATH = "${pkgs.llvmPackages.libclang.lib}/lib";
         packages = with pkgs;
           [
             spriteRustToolchain
@@ -930,6 +952,7 @@
             gdu
             openspec
           ]
+          ++ voiceNativeInputs
           ++ [yaziPinned]
           ++ yaziDeps
           ++ pkgs.lib.optionals pkgs.stdenv.isLinux [pkgs.mold];

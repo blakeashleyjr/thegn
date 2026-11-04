@@ -241,7 +241,7 @@ impl ProcSignal {
 }
 
 mod signal_identity;
-pub use signal_identity::{ProcStart, SignalError, signal_identity};
+pub use signal_identity::{ProcStart, SignalError, process_start_ticks, signal_identity};
 mod priority;
 pub(crate) use priority::{
     IONICE_SUPPORTED, IoClass, PriorityError, get_ioprio, get_nice, set_ioprio, set_nice,

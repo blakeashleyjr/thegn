@@ -1131,4 +1131,238 @@ done
         assert_eq!(bridge.writer.next_request_peek(), u64::MAX);
         assert!(bridge.pending.lock().unwrap().calls.is_empty());
     }
+
+    fn detached_bridge(
+        timeout: Duration,
+    ) -> (
+        Arc<super::super::session::admission::Shared>,
+        Arc<ProviderBridge>,
+    ) {
+        let shared = super::super::session::admission::Shared::new();
+        let bridge = ProviderBridge::new(SessionWriter(shared.clone()), timeout);
+        (shared, bridge)
+    }
+
+    async fn wait_for_pending(bridge: &ProviderBridge, count: usize) {
+        for _ in 0..10_000 {
+            if bridge.pending.lock().unwrap().calls.len() >= count {
+                return;
+            }
+            tokio::task::yield_now().await;
+        }
+        panic!("bridge never reached {count} pending calls");
+    }
+
+    fn close_now(shared: &super::super::session::admission::Shared) {
+        shared.close(
+            crate::plugin::session::CloseReason::Requested,
+            tokio::time::Instant::now(),
+        );
+    }
+
+    #[test]
+    fn saturated_bridge_refuses_the_extra_call_without_growing_pending() {
+        let (shared, bridge) = detached_bridge(Duration::from_secs(30));
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+
+        let (results, extra, after_close) = rt.block_on(async {
+            let calls = futures_util::future::join_all(
+                (0..MAX_QUEUED_FRAMES)
+                    .map(|_| bridge.call("issues", "stall", serde_json::Value::Null)),
+            );
+            let probe = async {
+                wait_for_pending(&bridge, MAX_QUEUED_FRAMES).await;
+                let extra = bridge
+                    .call("issues", "overflow", serde_json::Value::Null)
+                    .await;
+                assert_eq!(
+                    bridge.pending.lock().unwrap().calls.len(),
+                    MAX_QUEUED_FRAMES
+                );
+                close_now(&shared);
+                let after_close = tokio::time::timeout(
+                    Duration::from_secs(5),
+                    bridge.call("issues", "closed", serde_json::Value::Null),
+                )
+                .await;
+                (extra, after_close)
+            };
+            let (results, (extra, after_close)) = tokio::join!(calls, probe);
+            (results, extra, after_close)
+        });
+
+        assert!(
+            matches!(
+                &extra,
+                Err(BridgeError::Transport(message)) if message == &SessionFailure::Full.to_string()
+            ),
+            "unexpected overflow result: {extra:?}"
+        );
+        assert_eq!(results.len(), MAX_QUEUED_FRAMES);
+        assert!(results.iter().all(|result| matches!(
+            result,
+            Err(BridgeError::Transport(message)) if message == &SessionFailure::Closed.to_string()
+        )), "pending calls did not all fail as closed: {results:?}");
+        assert!(bridge.pending.lock().unwrap().calls.is_empty());
+        assert!(
+            matches!(
+                &after_close,
+                Ok(Err(BridgeError::Transport(message))) if message == &SessionFailure::Closed.to_string()
+            ),
+            "unexpected post-close result: {after_close:?}"
+        );
+    }
+
+    #[test]
+    fn close_wakes_every_pending_call_across_repeated_generations() {
+        const GENERATIONS: usize = 64;
+        const CALLS: usize = 8;
+
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let started = std::time::Instant::now();
+        rt.block_on(async {
+            for _generation in 0..GENERATIONS {
+                let (shared, bridge) = detached_bridge(Duration::from_secs(30));
+                let calls = futures_util::future::join_all((0..CALLS).map(|_| {
+                    bridge.call("issues", "stall", serde_json::Value::Null)
+                }));
+                let closer = async {
+                    wait_for_pending(&bridge, CALLS).await;
+                    close_now(&shared);
+                };
+                let (results, ()) = tokio::join!(calls, closer);
+
+                assert_eq!(results.len(), CALLS);
+                assert!(results.iter().all(|result| matches!(
+                    result,
+                    Err(BridgeError::Transport(message)) if message == &SessionFailure::Closed.to_string()
+                )));
+                assert!(bridge.pending.lock().unwrap().calls.is_empty());
+                assert_eq!(Arc::strong_count(&bridge), 1);
+                assert!(!shared.route_response(&RpcResponse::ok(
+                    1_000_000,
+                    serde_json::json!("late"),
+                )));
+                drop(bridge);
+                assert!(!shared.route_response(&RpcResponse::ok(
+                    1_000_001,
+                    serde_json::json!("late"),
+                )));
+            }
+        });
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "64 close generations took {:?}; pending calls should wake before their 30 s deadlines",
+            started.elapsed()
+        );
+    }
+
+    #[test]
+    fn independent_provider_bridges_have_independent_pending_capacity() {
+        let (shared_a, bridge_a) = detached_bridge(Duration::from_secs(30));
+        let (shared_b, bridge_b) = detached_bridge(Duration::from_secs(30));
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+
+        let (results_a, extra_a, result_b) = rt.block_on(async {
+            let calls_a = futures_util::future::join_all(
+                (0..MAX_QUEUED_FRAMES)
+                    .map(|_| bridge_a.call("issues", "stall", serde_json::Value::Null)),
+            );
+            let probe_a = async {
+                wait_for_pending(&bridge_a, MAX_QUEUED_FRAMES).await;
+                let extra_a = bridge_a
+                    .call("issues", "overflow", serde_json::Value::Null)
+                    .await;
+                assert_eq!(
+                    bridge_a.pending.lock().unwrap().calls.len(),
+                    MAX_QUEUED_FRAMES
+                );
+
+                let calls_b = futures_util::future::join_all(std::iter::once(bridge_b.call(
+                    "issues",
+                    "admitted",
+                    serde_json::Value::Null,
+                )));
+                let closer_b = async {
+                    wait_for_pending(&bridge_b, 1).await;
+                    assert_eq!(
+                        bridge_a.pending.lock().unwrap().calls.len(),
+                        MAX_QUEUED_FRAMES
+                    );
+                    close_now(&shared_b);
+                };
+                let (mut results_b, ()) = tokio::join!(calls_b, closer_b);
+                close_now(&shared_a);
+                (extra_a, results_b.pop().unwrap())
+            };
+            let (results_a, (extra_a, result_b)) = tokio::join!(calls_a, probe_a);
+            (results_a, extra_a, result_b)
+        });
+
+        assert!(
+            matches!(
+                &extra_a,
+                Err(BridgeError::Transport(message)) if message == &SessionFailure::Full.to_string()
+            ),
+            "unexpected saturated bridge result: {extra_a:?}"
+        );
+        assert!(
+            matches!(
+                &result_b,
+                Err(BridgeError::Transport(message)) if message == &SessionFailure::Closed.to_string()
+            ),
+            "independent bridge did not admit its call: {result_b:?}"
+        );
+        assert_eq!(results_a.len(), MAX_QUEUED_FRAMES);
+        assert!(results_a.iter().all(|result| matches!(
+            result,
+            Err(BridgeError::Transport(message)) if message == &SessionFailure::Closed.to_string()
+        )), "saturated bridge calls did not all fail as closed: {results_a:?}");
+        assert!(bridge_a.pending.lock().unwrap().calls.is_empty());
+        assert!(bridge_b.pending.lock().unwrap().calls.is_empty());
+    }
+
+    #[test]
+    fn concurrent_mixed_ops_keep_replies_with_their_callers() {
+        let (_fixture, session, bridge) = live_bridge();
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+
+        rt.block_on(async {
+            for _round in 0..3 {
+                let results = futures_util::future::join_all((0_usize..24).map(|call| {
+                    let op = if call.is_multiple_of(2) {
+                        "list_issues"
+                    } else {
+                        "update_issue"
+                    };
+                    bridge.call("issues", op, serde_json::json!({}))
+                }))
+                .await;
+                assert_eq!(results.len(), 24);
+                for (call, result) in results.into_iter().enumerate() {
+                    let result = result.unwrap();
+                    if call.is_multiple_of(2) {
+                        assert!(result.is_array());
+                        assert_eq!(result.as_array().unwrap().len(), 1);
+                    } else {
+                        assert_eq!(result["title"], "updated by plugin");
+                    }
+                }
+                assert!(bridge.pending.lock().unwrap().calls.is_empty());
+            }
+        });
+        session.kill();
+    }
 }

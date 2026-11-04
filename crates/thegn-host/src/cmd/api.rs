@@ -24,7 +24,7 @@ use thegn_svc::control::routes::api_call_for;
 
 /// The machine-readable coverage document is a local diagnostic contract,
 /// separate from the control wire schema. Increment it when its JSON shape
-/// changes incompatibly.
+/// changes incompatibly; additive keys do not bump it.
 pub(crate) const COVERAGE_SCHEMA_VERSION: u32 = 1;
 
 /// The committed wire schema — embedded so `schema` needs no checkout.
@@ -114,15 +114,31 @@ pub(crate) fn coverage_report() -> CoverageReport {
 }
 
 fn surface_json(ledger: &thegn_core::capability::SurfaceLedger) -> serde_json::Value {
+    let mut excused_by_disposition = std::collections::BTreeMap::<&str, usize>::new();
+    let gaps = ledger
+        .gaps
+        .iter()
+        .map(|(id, why)| {
+            let disposition = thegn_core::capability::gap_disposition(id, ledger.surface);
+            let code = disposition.map_or("unclassified", |value| value.code());
+            let review = disposition.and_then(|value| value.review());
+            *excused_by_disposition.entry(code).or_default() += 1;
+            serde_json::json!({
+                "capability": id,
+                "reason": why,
+                "disposition": code,
+                "review": review,
+            })
+        })
+        .collect::<Vec<_>>();
     serde_json::json!({
         "surface": ledger.surface.as_str(),
         "implemented": ledger.implemented,
         "stub": ledger.stub,
         "excused": ledger.excused,
         "declared": ledger.declared,
-        "gaps": ledger.gaps.iter().map(|(id, why)| {
-            serde_json::json!({ "capability": id, "reason": why })
-        }).collect::<Vec<_>>(),
+        "gaps": gaps,
+        "excused_by_disposition": excused_by_disposition,
     })
 }
 
@@ -164,11 +180,22 @@ pub(crate) fn coverage_text(report: &CoverageReport) -> String {
     for ledger in &report.surfaces {
         for (id, why) in &ledger.gaps {
             if !any {
-                text.push_str("\nexcused gaps (temporary debt):\n");
+                text.push_str("\nexcused gaps (disposition, review):\n");
                 any = true;
             }
-            writeln!(text, "  {:<8} {:<18} {}", ledger.surface.as_str(), id, why)
-                .expect("writing a String cannot fail");
+            let disposition = thegn_core::capability::gap_disposition(id, ledger.surface);
+            let code = disposition.map_or("unclassified", |value| value.code());
+            let review = disposition.and_then(|value| value.review()).unwrap_or("-");
+            writeln!(
+                text,
+                "  {:<8} {:<18} {:<10} {:<8} {}",
+                ledger.surface.as_str(),
+                id,
+                code,
+                review,
+                why
+            )
+            .expect("writing a String cannot fail");
         }
     }
     if !any {
@@ -343,5 +370,50 @@ mod tests {
             !thegn_core::plugin_api::plugin_host_call_caps().contains(&"launch.preset"),
             "CLI-first launch.preset stays excluded until its control route lands"
         );
+    }
+
+    #[test]
+    fn coverage_json_reports_each_gaps_disposition() {
+        let json = coverage_json(&coverage_report());
+        let surfaces = json["surfaces"].as_array().expect("surface list");
+        for surface in surfaces {
+            let dispositions = surface["excused_by_disposition"]
+                .as_object()
+                .expect("disposition counts");
+            let count: usize = dispositions
+                .values()
+                .map(|value| value.as_u64().expect("count") as usize)
+                .sum();
+            assert_eq!(
+                count,
+                surface["excused"].as_u64().expect("excused") as usize
+            );
+        }
+        let http = surfaces
+            .iter()
+            .find(|surface| surface["surface"] == "http")
+            .expect("HTTP ledger");
+        let gap = |id: &str| {
+            http["gaps"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|gap| gap["capability"] == id)
+                .expect("gap present")
+        };
+        assert_eq!(gap("doctor.bundle")["disposition"], "local-only");
+        assert!(gap("doctor.bundle")["review"].is_null());
+        assert_eq!(gap("secret.set")["disposition"], "deferred");
+        assert_eq!(gap("secret.set")["review"], "THE-201");
+    }
+
+    #[test]
+    fn coverage_text_lists_the_disposition_column() {
+        let text = coverage_text(&coverage_report());
+        assert!(text.lines().any(|line| {
+            line.split_whitespace()
+                .take(4)
+                .eq(["http", "doctor.bundle", "local-only", "-"])
+        }));
     }
 }

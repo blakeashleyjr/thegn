@@ -2663,6 +2663,145 @@ mod tests {
         );
     }
 
+    fn wait_finished(handle: &Arc<std::thread::JoinHandle<()>>) -> bool {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while !handle.is_finished() && std::time::Instant::now() < deadline {
+            std::thread::yield_now();
+        }
+        handle.is_finished()
+    }
+
+    #[test]
+    fn feed_bridge_cycles_never_leave_a_worker_running() {
+        let mut state = state_with(vec![seg_spec("p")]);
+        let mut model = FrameModel::default();
+        let mut handles = Vec::new();
+
+        for cycle in 0..48u64 {
+            let session = cycle + 1;
+            let path = cycle % 3;
+            let path_name = match path {
+                0 => "crash",
+                1 => "reload",
+                2 => "feed close",
+                _ => unreachable!("cycle path is modulo three"),
+            };
+            let entry = state.plugins.get_mut("p").unwrap();
+            entry.session = Some(session);
+            entry.restarts = 0;
+            entry.disabled = false;
+
+            assert!(
+                matches!(feed_bridge_admission(&state, "p"), Ok(true)),
+                "cycle {cycle} path {path_name}: fresh subscription was not admitted"
+            );
+            assert!(
+                claim_feed_bridge(state.plugins.get_mut("p").unwrap()),
+                "cycle {cycle} path {path_name}: bridge slot was not claimable"
+            );
+
+            let mut close_sender = None;
+            let bridge = if path == 2 {
+                let (close_tx, close_rx) = tokio::sync::oneshot::channel();
+                close_sender = Some(close_tx);
+                spawn_cancellable_bridge("thegn-feedcycle", async move {
+                    match close_rx.await {
+                        Ok(()) | Err(_) => {}
+                    }
+                })
+            } else {
+                spawn_cancellable_bridge("thegn-feedcycle", async {
+                    std::future::pending::<()>().await;
+                })
+            }
+            .expect("feed-cycle worker thread starts");
+            handles.push(Arc::clone(&bridge.handle));
+            state.plugins.get_mut("p").unwrap().feed_bridge = Some(bridge);
+
+            assert!(
+                matches!(feed_bridge_admission(&state, "p"), Ok(false)),
+                "cycle {cycle} path {path_name}: duplicate subscription was not idempotently acknowledged"
+            );
+
+            match path {
+                0 => {
+                    drain_one(
+                        &mut state,
+                        &mut model,
+                        event("p", session, SessionEvent::Exit { code: Some(1) }),
+                    );
+                    assert!(
+                        state.plugins["p"].feed_bridge.is_none(),
+                        "cycle {cycle} path {path_name}: drain retained the bridge"
+                    );
+                }
+                1 => {
+                    let old = state
+                        .plugins
+                        .insert("p".into(), build_entry(loaded_state(seg_spec("p"))));
+                    drop(old);
+                }
+                2 => {
+                    drop(close_sender.take().expect("feed-close sender exists"));
+                    assert!(
+                        wait_finished(handles.last().unwrap()),
+                        "cycle {cycle} path {path_name}: worker did not finish before reclaim"
+                    );
+                    assert!(
+                        claim_feed_bridge(state.plugins.get_mut("p").unwrap()),
+                        "cycle {cycle} path {path_name}: finished bridge was not reclaimed"
+                    );
+                }
+                _ => unreachable!("cycle path is modulo three"),
+            }
+
+            assert!(
+                wait_finished(handles.last().unwrap()),
+                "cycle {cycle} path {path_name}: feed bridge worker still running"
+            );
+            assert!(
+                state.plugins["p"].feed_bridge.is_none(),
+                "cycle {cycle} path {path_name}: teardown retained a bridge entry"
+            );
+            assert!(
+                matches!(feed_bridge_admission(&state, "p"), Ok(true)),
+                "cycle {cycle} path {path_name}: fresh subscription was not admitted after teardown"
+            );
+        }
+
+        assert_eq!(
+            handles.len(),
+            48,
+            "all 48 crash/reload/feed-close cycles recorded one worker each"
+        );
+        for (cycle, handle) in handles.iter().enumerate() {
+            let path_name = match cycle % 3 {
+                0 => "crash",
+                1 => "reload",
+                2 => "feed close",
+                _ => unreachable!("cycle path is modulo three"),
+            };
+            assert!(
+                wait_finished(handle),
+                "cycle {cycle} path {path_name}: recorded worker handle is still running"
+            );
+        }
+        let live = state
+            .plugins
+            .values()
+            .filter(|entry| {
+                entry
+                    .feed_bridge
+                    .as_ref()
+                    .is_some_and(|bridge| !bridge.handle.is_finished())
+            })
+            .count();
+        assert_eq!(
+            live, 0,
+            "no crash/reload/feed-close cycle left a live feed bridge"
+        );
+    }
+
     #[test]
     fn subscribe_verb_caps_custom_kinds_per_plugin() {
         let mut state = state_with(vec![seg_spec("p")]);

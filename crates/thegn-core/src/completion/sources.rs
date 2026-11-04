@@ -422,6 +422,10 @@ pub fn in_process_candidates(kind: SourceKind) -> Vec<Candidate> {
         SourceKind::Capability => capability_candidates(),
         SourceKind::Action => action_candidates(),
         SourceKind::Skill => skill_candidates(),
+        SourceKind::VoiceModel => ["tiny", "tiny.en", "base", "base.en", "small", "small.en"]
+            .into_iter()
+            .map(Candidate::new)
+            .collect(),
         _ => Vec::new(),
     }
 }

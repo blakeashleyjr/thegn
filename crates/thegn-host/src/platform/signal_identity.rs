@@ -21,6 +21,21 @@ pub fn signal_identity(pid: u32, start: ProcStart, sig: ProcSignal) -> Result<()
     signal_identity_inner(pid, start, sig)
 }
 
+/// Kernel start time (clock ticks since boot) of `pid`; `None` when it cannot be read, or not Linux.
+pub fn process_start_ticks(pid: u32) -> Option<u64> {
+    process_start_ticks_inner(pid)
+}
+
+#[cfg(target_os = "linux")]
+fn process_start_ticks_inner(pid: u32) -> Option<u64> {
+    read_start_ticks(pid)
+}
+
+#[cfg(not(target_os = "linux"))]
+fn process_start_ticks_inner(_pid: u32) -> Option<u64> {
+    None
+}
+
 #[cfg(target_os = "linux")]
 fn signal_identity_inner(pid: u32, start: ProcStart, sig: ProcSignal) -> Result<(), SignalError> {
     use std::os::fd::FromRawFd;

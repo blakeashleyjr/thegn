@@ -6,16 +6,23 @@
 
 use crate::seam::{ErrorClass, Probe, ProbeReport, SeamError};
 use serde::{Deserialize, Serialize};
+use std::sync::atomic::{AtomicBool, Ordering};
 
 /// Optional operations exposed by a voice provider.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct VoiceCaps {
     pub transcribe: bool,
+    pub partials: bool,
+    pub cancellation: bool,
 }
 
 impl Default for VoiceCaps {
     fn default() -> Self {
-        Self { transcribe: true }
+        Self {
+            transcribe: true,
+            partials: false,
+            cancellation: false,
+        }
     }
 }
 
@@ -26,6 +33,9 @@ pub enum VoiceError {
     NotInstalled(String),
     InvalidInput(String),
     Failed(String),
+    HttpStatus(u16),
+    Timeout,
+    Connection,
     UnresolvedProcess(String),
     Unsupported(&'static str),
 }
@@ -37,6 +47,16 @@ impl std::fmt::Display for VoiceError {
             Self::NotInstalled(program) => write!(f, "voice command is not installed: {program}"),
             Self::InvalidInput(reason) => write!(f, "invalid voice input: {reason}"),
             Self::Failed(reason) => write!(f, "voice transcription failed: {reason}"),
+            Self::HttpStatus(status) => {
+                let reason = match status {
+                    401 | 403 => "authentication failed",
+                    429 => "rate limit exceeded",
+                    _ => "transcription rejected",
+                };
+                write!(f, "HTTP {reason} ({status})")
+            }
+            Self::Timeout => f.write_str("HTTP transcription timed out"),
+            Self::Connection => f.write_str("HTTP connection failed"),
             Self::UnresolvedProcess(reason) => {
                 write!(f, "voice process shutdown could not be proven: {reason}")
             }
@@ -53,6 +73,10 @@ impl SeamError for VoiceError {
             Self::NotConfigured => ErrorClass::NotConfigured,
             Self::NotInstalled(_) => ErrorClass::NotInstalled,
             Self::Unsupported(_) => ErrorClass::Unsupported,
+            Self::HttpStatus(401 | 403) => ErrorClass::Auth,
+            Self::HttpStatus(429) => ErrorClass::RateLimited,
+            Self::HttpStatus(500..=599) | Self::Timeout | Self::Connection => ErrorClass::Transient,
+            Self::HttpStatus(_) => ErrorClass::Other,
             Self::InvalidInput(_) | Self::Failed(_) | Self::UnresolvedProcess(_) => {
                 ErrorClass::Other
             }
@@ -70,6 +94,18 @@ impl SeamError for VoiceError {
 pub trait VoiceProvider: Probe + Send + Sync {
     fn caps(&self) -> VoiceCaps;
     fn transcribe_push_to_talk(&self, wav: &[u8]) -> Result<String, VoiceError>;
+    /// The same operation for a bounded window or a final recording. Providers
+    /// advertising cancellation override this and observe the flag in flight.
+    fn transcribe_cancellable(
+        &self,
+        wav: &[u8],
+        cancelled: &AtomicBool,
+    ) -> Result<String, VoiceError> {
+        if cancelled.load(Ordering::Acquire) {
+            return Err(VoiceError::Failed("transcription cancelled".into()));
+        }
+        self.transcribe_push_to_talk(wav)
+    }
 }
 
 /// The pane that owns the current utterance and the state of voice capture.
@@ -80,6 +116,7 @@ pub enum VoiceState {
     Recording {
         pane_id: u32,
         started_at: u64,
+        request_id: u64,
     },
     Transcribing {
         pane_id: u32,
@@ -97,6 +134,15 @@ impl VoiceState {
 /// module remains deterministic and testable.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum VoiceEvent {
+    CaptureStopped {
+        pane_id: u32,
+        request_id: u64,
+    },
+    Partial {
+        pane_id: u32,
+        request_id: u64,
+        transcript: String,
+    },
     Start {
         pane_id: u32,
         now_ms: u64,
@@ -131,6 +177,7 @@ pub enum VoiceEvent {
 /// Side effects for the host to execute after a state transition.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum VoiceEffect {
+    Preview(String),
     StartCapture {
         pane_id: u32,
     },
@@ -186,16 +233,52 @@ pub fn normalize_transcript(raw: &str) -> String {
 
 /// Reduce one voice event.  Legal transitions are `Idle → Recording →
 /// Transcribing → Idle`; stale, duplicate, and mismatched-pane events are
-/// ignored.  A request id is allocated only when capture completes, which
-/// makes cancellation invalidate every result that was already in flight.
+/// ignored. Utterance identity is allocated before capture starts, so previews
+/// and final results from a cancelled recording cannot reach a newer session.
 pub fn reduce(state: &VoiceState, next_request_id: &mut u64, event: VoiceEvent) -> VoiceTransition {
     match (state, event) {
-        (VoiceState::Idle, VoiceEvent::Start { pane_id, now_ms }) => VoiceTransition::new(
+        (
             VoiceState::Recording {
                 pane_id,
-                started_at: now_ms,
+                request_id,
+                ..
             },
-            vec![VoiceEffect::StartCapture { pane_id }],
+            VoiceEvent::CaptureStopped {
+                pane_id: owner,
+                request_id: utterance,
+            },
+        ) if *pane_id == owner && *request_id == utterance => VoiceTransition::new(
+            VoiceState::Transcribing {
+                pane_id: *pane_id,
+                request_id: *request_id,
+            },
+            Vec::new(),
+        ),
+        (VoiceState::Idle, VoiceEvent::Start { pane_id, now_ms }) => {
+            *next_request_id = next_request_id.saturating_add(1);
+            VoiceTransition::new(
+                VoiceState::Recording {
+                    pane_id,
+                    started_at: now_ms,
+                    request_id: *next_request_id,
+                },
+                vec![VoiceEffect::StartCapture { pane_id }],
+            )
+        }
+        (
+            VoiceState::Recording {
+                pane_id,
+                request_id,
+                ..
+            },
+            VoiceEvent::Partial {
+                pane_id: owner,
+                request_id: utterance,
+                transcript,
+            },
+        ) if *pane_id == owner && *request_id == utterance => VoiceTransition::new(
+            state.clone(),
+            vec![VoiceEffect::Preview(normalize_transcript(&transcript))],
         ),
         (
             VoiceState::Recording { pane_id, .. },
@@ -219,14 +302,17 @@ pub fn reduce(state: &VoiceState, next_request_id: &mut u64, event: VoiceEvent) 
             ],
         ),
         (
-            VoiceState::Recording { pane_id, .. },
+            VoiceState::Recording {
+                pane_id,
+                request_id,
+                ..
+            },
             VoiceEvent::CaptureComplete {
                 pane_id: event_pane,
                 wav,
             },
         ) if *pane_id == event_pane => {
-            *next_request_id = next_request_id.saturating_add(1);
-            let request_id = *next_request_id;
+            let request_id = *request_id;
             VoiceTransition::new(
                 VoiceState::Transcribing {
                     pane_id: *pane_id,
@@ -255,6 +341,11 @@ pub fn reduce(state: &VoiceState, next_request_id: &mut u64, event: VoiceEvent) 
             VoiceState::Transcribing {
                 pane_id,
                 request_id,
+            }
+            | VoiceState::Recording {
+                pane_id,
+                request_id,
+                ..
             },
             VoiceEvent::TranscriptSucceeded {
                 pane_id: event_pane,
@@ -277,6 +368,11 @@ pub fn reduce(state: &VoiceState, next_request_id: &mut u64, event: VoiceEvent) 
             VoiceState::Transcribing {
                 pane_id,
                 request_id,
+            }
+            | VoiceState::Recording {
+                pane_id,
+                request_id,
+                ..
             },
             VoiceEvent::TranscriptFailed {
                 pane_id: event_pane,
@@ -318,12 +414,93 @@ pub fn unavailable_probe(reason: impl Into<String>) -> ProbeReport {
 mod tests {
     use super::*;
 
+    #[test]
+    fn previews_are_scoped_to_start_and_never_inject() {
+        let mut id = 0;
+        let first = reduce(
+            &VoiceState::Idle,
+            &mut id,
+            VoiceEvent::Start {
+                pane_id: 7,
+                now_ms: 0,
+            },
+        )
+        .state;
+        assert_eq!(id, 1);
+        let event = |request_id, transcript: &str| VoiceEvent::Partial {
+            pane_id: 7,
+            request_id,
+            transcript: transcript.into(),
+        };
+        assert_eq!(
+            reduce(&first, &mut id, event(1, "hello\nthere")).effects,
+            vec![VoiceEffect::Preview("hello there".into())]
+        );
+        let cancelled = reduce(&first, &mut id, VoiceEvent::Cancel).state;
+        let second = reduce(
+            &cancelled,
+            &mut id,
+            VoiceEvent::Start {
+                pane_id: 7,
+                now_ms: 1,
+            },
+        )
+        .state;
+        assert_eq!(id, 2);
+        for stale in [
+            event(1, "stale"),
+            VoiceEvent::TranscriptSucceeded {
+                pane_id: 7,
+                request_id: 1,
+                transcript: "stale".into(),
+            },
+        ] {
+            assert!(reduce(&second, &mut id, stale).effects.is_empty());
+        }
+        let stopped = reduce(
+            &second,
+            &mut id,
+            VoiceEvent::CaptureStopped {
+                pane_id: 7,
+                request_id: 2,
+            },
+        )
+        .state;
+        assert!(
+            reduce(&stopped, &mut id, event(2, "late preview"))
+                .effects
+                .is_empty()
+        );
+        let final_result = reduce(
+            &stopped,
+            &mut id,
+            VoiceEvent::TranscriptSucceeded {
+                pane_id: 7,
+                request_id: 2,
+                transcript: "authoritative final".into(),
+            },
+        );
+        assert_eq!(final_result.state, VoiceState::Idle);
+        assert_eq!(
+            final_result.effects,
+            vec![VoiceEffect::Inject {
+                pane_id: 7,
+                transcript: "authoritative final".into()
+            }]
+        );
+    }
+
     fn reduce_from(state: &VoiceState, id: &mut u64, event: VoiceEvent) -> VoiceTransition {
         reduce(state, id, event)
     }
 
     #[test]
     fn provider_error_classes_are_useful_to_callers() {
+        assert_eq!(VoiceError::HttpStatus(401).class(), ErrorClass::Auth);
+        assert_eq!(VoiceError::HttpStatus(429).class(), ErrorClass::RateLimited);
+        assert_eq!(VoiceError::HttpStatus(503).class(), ErrorClass::Transient);
+        assert_eq!(VoiceError::Timeout.class(), ErrorClass::Transient);
+        assert_eq!(VoiceError::Connection.class(), ErrorClass::Transient);
         assert_eq!(VoiceError::NotConfigured.class(), ErrorClass::NotConfigured);
         assert_eq!(
             VoiceError::NotInstalled("mic".into()).class(),
@@ -334,6 +511,165 @@ mod tests {
             ErrorClass::Other
         );
         assert!(VoiceError::unsupported("transcribe").falls_through());
+    }
+
+    #[test]
+    fn every_voice_error_display_and_classification_arm_is_covered() {
+        for (error, class, display) in [
+            (
+                VoiceError::NotConfigured,
+                ErrorClass::NotConfigured,
+                "voice is not configured",
+            ),
+            (
+                VoiceError::NotInstalled("mic".into()),
+                ErrorClass::NotInstalled,
+                "mic",
+            ),
+            (
+                VoiceError::InvalidInput("wav".into()),
+                ErrorClass::Other,
+                "invalid voice input",
+            ),
+            (
+                VoiceError::Failed("decode".into()),
+                ErrorClass::Other,
+                "voice transcription failed",
+            ),
+            (
+                VoiceError::HttpStatus(400),
+                ErrorClass::Other,
+                "HTTP transcription rejected",
+            ),
+            (
+                VoiceError::UnresolvedProcess("pid".into()),
+                ErrorClass::Other,
+                "shutdown could not be proven",
+            ),
+            (
+                VoiceError::Unsupported("preview"),
+                ErrorClass::Unsupported,
+                "not supported",
+            ),
+        ] {
+            assert_eq!(error.class(), class);
+            assert!(error.to_string().contains(display), "{error}");
+        }
+        assert!(
+            VoiceError::HttpStatus(401)
+                .to_string()
+                .contains("authentication")
+        );
+        assert!(
+            VoiceError::HttpStatus(429)
+                .to_string()
+                .contains("rate limit")
+        );
+        assert!(VoiceError::Timeout.to_string().contains("timed out"));
+        assert!(
+            VoiceError::Connection
+                .to_string()
+                .contains("connection failed")
+        );
+    }
+
+    #[test]
+    fn partial_stopped_and_stale_request_events_follow_reducer_contract() {
+        let mut id = 0;
+        let recording = reduce(
+            &VoiceState::Idle,
+            &mut id,
+            VoiceEvent::Start {
+                pane_id: 3,
+                now_ms: 10,
+            },
+        )
+        .state;
+        assert_eq!(
+            reduce(
+                &recording,
+                &mut id,
+                VoiceEvent::Partial {
+                    pane_id: 3,
+                    request_id: 1,
+                    transcript: "one\ntwo".into()
+                }
+            )
+            .effects,
+            vec![VoiceEffect::Preview("one two".into())]
+        );
+        assert!(
+            reduce(
+                &recording,
+                &mut id,
+                VoiceEvent::Partial {
+                    pane_id: 3,
+                    request_id: 0,
+                    transcript: "stale".into()
+                }
+            )
+            .effects
+            .is_empty()
+        );
+        assert_eq!(
+            reduce(
+                &recording,
+                &mut id,
+                VoiceEvent::CaptureStopped {
+                    pane_id: 3,
+                    request_id: 0
+                }
+            )
+            .state,
+            recording
+        );
+        let stopped = reduce(
+            &recording,
+            &mut id,
+            VoiceEvent::CaptureStopped {
+                pane_id: 3,
+                request_id: 1,
+            },
+        )
+        .state;
+        assert!(matches!(
+            &stopped,
+            VoiceState::Transcribing { request_id: 1, .. }
+        ));
+        assert_eq!(
+            reduce(
+                &stopped,
+                &mut id,
+                VoiceEvent::TranscriptSucceeded {
+                    pane_id: 3,
+                    request_id: 0,
+                    transcript: "stale final".into()
+                }
+            )
+            .state,
+            stopped
+        );
+    }
+
+    #[test]
+    fn empty_success_is_the_no_speech_transition() {
+        let recording = VoiceState::Recording {
+            pane_id: 5,
+            started_at: 0,
+            request_id: 1,
+        };
+        let mut id = 1;
+        let transition = reduce(
+            &recording,
+            &mut id,
+            VoiceEvent::TranscriptSucceeded {
+                pane_id: 5,
+                request_id: 1,
+                transcript: " \n ".into(),
+            },
+        );
+        assert_eq!(transition.state, VoiceState::Idle);
+        assert!(transition.effects.is_empty());
     }
 
     #[test]
@@ -352,7 +688,8 @@ mod tests {
             started.state,
             VoiceState::Recording {
                 pane_id: 7,
-                started_at: 11
+                started_at: 11,
+                request_id: 1,
             }
         );
         assert_eq!(
@@ -513,6 +850,7 @@ mod tests {
             &VoiceState::Recording {
                 pane_id: 1,
                 started_at: 0,
+                request_id: 1,
             },
             &mut id,
             VoiceEvent::CaptureComplete {

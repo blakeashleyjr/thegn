@@ -255,14 +255,13 @@ pub fn persist(db: &Db, ev: &RawEvent) -> usize {
     1
 }
 
-/// Map a container name back to a worktree path.
+/// Map a container name back to a worktree path, preferring exact names before
+/// interpreting companion suffixes.
 ///
 /// Container names are `thegn-{slug}` where the slug is built by
 /// `util::slugify`. We can't reverse the slug deterministically, so we look it
 /// up in the DB — the worktree path was stored when the container was created.
 pub fn worktree_from_container_name(db: &Db, name: &str) -> Option<String> {
-    // Map the agent's `-tgagent` container and the VPN `-tgvpn` sidecar back to
-    // their worktree too (strip whichever suffix applies).
     let lookup = crate::sandbox::strip_vpn_suffix(crate::sandbox::strip_agent_suffix(name));
     // Linear scan of the worktree list. Fine: there are at most a few dozen.
     // Match BOTH name forms: plain `thegn-{slug}` and the profile form
@@ -271,15 +270,15 @@ pub fn worktree_from_container_name(db: &Db, name: &str) -> Option<String> {
     // event (the TIMELINE stayed permanently empty).
     let profile = crate::profile::name();
     let rows = db.worktrees().ok()?;
-    rows.into_iter().find_map(|r| {
-        let plain = crate::sandbox::container_name(&r.worktree);
-        let profiled = crate::sandbox::container_name_with_profile(&r.worktree, Some(&profile));
-        if plain == lookup || profiled == lookup {
-            Some(r.worktree)
-        } else {
-            None
-        }
-    })
+    let owns = |worktree: &str, candidate: &str| {
+        let plain = crate::sandbox::container_name(worktree);
+        let profiled = crate::sandbox::container_name_with_profile(worktree, Some(&profile));
+        plain == candidate || profiled == candidate
+    };
+    rows.iter()
+        .find(|row| owns(&row.worktree, name))
+        .or_else(|| rows.iter().find(|row| owns(&row.worktree, lookup)))
+        .map(|row| row.worktree.clone())
 }
 
 impl Backend {
@@ -528,6 +527,28 @@ mod tests {
         );
         assert_eq!(
             worktree_from_container_name(&db, &format!("{plain}-tgvpn")),
+            Some("/wt/feat".to_string())
+        );
+    }
+
+    #[test]
+    fn worktree_lookup_prefers_the_worktree_whose_slug_ends_in_a_companion_suffix() {
+        let db = db();
+        db.set_worktree_env("/wt/feat-tgvpn", "x").unwrap();
+        let name = crate::sandbox::container_name("/wt/feat-tgvpn");
+        assert_eq!(
+            worktree_from_container_name(&db, &name),
+            Some("/wt/feat-tgvpn".to_string())
+        );
+
+        db.set_worktree_env("/wt/feat", "x").unwrap();
+        assert_eq!(
+            worktree_from_container_name(&db, &name),
+            Some("/wt/feat-tgvpn".to_string())
+        );
+        let agent = format!("{}-tgagent", crate::sandbox::container_name("/wt/feat"));
+        assert_eq!(
+            worktree_from_container_name(&db, &agent),
             Some("/wt/feat".to_string())
         );
     }

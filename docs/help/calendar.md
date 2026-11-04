@@ -217,7 +217,10 @@ calendar how many problems it found; the notice returns only when the count chan
 Refused events are also counted by reason, without event details, such as
 `rejected: end precedes start (2)`. Reasons include empty UID, mixed all-day
 and timed endpoints, end before start, incompatible recurrence values and an
-unknown time zone.
+unknown time zone. The last applied page's problem counts for each configured
+account are kept and listed by `thegn doctor` under `Calendar diagnostics`;
+`--json` includes them in `calendar_diagnostics`. Doctor only reads the state
+database and does not create it.
 
 Accounts sync independently: up to four network accounts (subscribed links and
 CalDAV) are fetched at once, while command plugins run one at a time. Each

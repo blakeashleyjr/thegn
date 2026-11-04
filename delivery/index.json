@@ -393,15 +393,39 @@
     },
     {
       "change": "add-voice-mode",
-      "lifecycle": "proposed",
-      "disposition": "superseded-retire",
+      "lifecycle": "active",
+      "disposition": "verification-gated",
       "owners": [
         {
           "issue": "THE-148",
           "project": "Workspace Product & Observability"
+        },
+        {
+          "issue": "THE-1510",
+          "project": "Workspace Product & Observability"
+        },
+        {
+          "issue": "THE-1511",
+          "project": "Workspace Product & Observability"
+        },
+        {
+          "issue": "THE-1512",
+          "project": "Workspace Product & Observability"
+        },
+        {
+          "issue": "THE-1513",
+          "project": "Workspace Product & Observability"
+        },
+        {
+          "issue": "THE-1514",
+          "project": "Workspace Product & Observability"
+        },
+        {
+          "issue": "THE-1515",
+          "project": "Workspace Product & Observability"
         }
       ],
-      "summary": "The stale cpal and whisper draft must be rewritten around the accepted command-backed provider."
+      "summary": "First-party worker dictation adds embedded Whisper, rolling previews, pinned models and HTTP. THE-1510 parents THE-1511–THE-1515; THE-148 owns reconciliation. Locked Linux native build, HTTP and synthetic worker evidence is in docs/voice-verification.md; real-platform latency, routing, permissions and release gates remain open."
     },
     {
       "change": "add-vps-providers",
@@ -877,15 +901,16 @@
     },
     {
       "change": "monitor-framework",
-      "lifecycle": "active",
-      "disposition": "strategic-unstarted",
+      "archive_path": "openspec/changes/archive/2026-11-03-monitor-framework/",
+      "lifecycle": "archived",
+      "disposition": "alpha-delivery",
       "owners": [
         {
           "issue": "THE-1362",
           "project": "Workspace Product & Observability"
         }
       ],
-      "summary": "Framework layers shipped in batches 42-49; the task ledger is re-owned to THE-1362 for evidence ticks and the X-2/X-3/SPEC-1 cleanup."
+      "summary": "Framework layers shipped in batches 42-49; ledger ticked with evidence in batches 83 and 85 and archived in batch 85."
     },
     {
       "change": "monitor-overview",

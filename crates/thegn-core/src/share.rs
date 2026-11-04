@@ -122,6 +122,35 @@ fn reconcile_visibility(requested: ShareVisibility, params: &ShareParams) -> Sha
     }
 }
 
+/// Liveness of a share row's recorded owner, from its recorded identity and the live start time of that pid.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ShareOwnerState {
+    Unrecorded,
+    Alive,
+    Exited,
+}
+
+impl ShareOwnerState {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Unrecorded => "unrecorded",
+            Self::Alive => "alive",
+            Self::Exited => "exited",
+        }
+    }
+}
+
+pub fn share_owner_state(
+    owner: Option<crate::models::ShareOwner>,
+    live_start_ticks: Option<u64>,
+) -> ShareOwnerState {
+    match owner {
+        None => ShareOwnerState::Unrecorded,
+        Some(owner) if live_start_ticks == Some(owner.start_ticks) => ShareOwnerState::Alive,
+        Some(_) => ShareOwnerState::Exited,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -131,6 +160,30 @@ mod tests {
             provider: ShareProviderKind::Bore,
             ..ShareConfig::default()
         }
+    }
+
+    #[test]
+    fn share_owner_state_is_alive_only_on_an_exact_start_match() {
+        let owner = crate::models::ShareOwner {
+            pid: 42,
+            start_ticks: 99,
+        };
+        assert_eq!(share_owner_state(None, None), ShareOwnerState::Unrecorded);
+        assert_eq!(
+            share_owner_state(Some(owner), Some(99)),
+            ShareOwnerState::Alive
+        );
+        assert_eq!(
+            share_owner_state(Some(owner), Some(100)),
+            ShareOwnerState::Exited
+        );
+        assert_eq!(
+            share_owner_state(Some(owner), None),
+            ShareOwnerState::Exited
+        );
+        assert_eq!(ShareOwnerState::Unrecorded.as_str(), "unrecorded");
+        assert_eq!(ShareOwnerState::Alive.as_str(), "alive");
+        assert_eq!(ShareOwnerState::Exited.as_str(), "exited");
     }
 
     #[test]

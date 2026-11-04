@@ -15,8 +15,10 @@ use thegn_core::issue::{
 use super::{IssueBackend, IssueError};
 use futures_util::future::BoxFuture;
 
+const GH_LIST_CAP: usize = 100;
+
 fn effective_issue_limit(limit: usize) -> usize {
-    if limit == 0 { 100 } else { limit }
+    if limit == 0 { GH_LIST_CAP + 1 } else { limit }
 }
 
 pub struct GitHubIssuesBackend {
@@ -413,12 +415,23 @@ impl IssueBackend for GitHubIssuesBackend {
             args.extend(extra);
 
             let json = self.gh(&args).await?;
-            let issues: Vec<GhIssue> =
+            let mut issues: Vec<GhIssue> =
                 serde_json::from_str(&json).map_err(|e| IssueError::Parse(e.to_string()))?;
-            issues
+            let capped = filter.limit == 0 && issues.len() > GH_LIST_CAP;
+            if capped {
+                issues.truncate(GH_LIST_CAP);
+            }
+            let mapped = issues
                 .into_iter()
                 .map(|issue| gh_issue_to_domain_with_host(issue, expected_host.as_deref()))
-                .collect()
+                .collect::<Result<Vec<_>, _>>()?;
+            if capped {
+                return Err(IssueError::PartialList {
+                    issues: mapped,
+                    reason: "GitHub issue listing reached the 100-issue cap",
+                });
+            }
+            Ok(mapped)
         })
     }
 
@@ -669,12 +682,23 @@ impl IssueBackend for GitHubIssuesBackend {
             let extra: Vec<&str> = self.extra_flags.iter().map(|s| s.as_str()).collect();
             args.extend(extra);
             let json = self.gh(&args).await?;
-            let issues: Vec<GhIssue> =
+            let mut issues: Vec<GhIssue> =
                 serde_json::from_str(&json).map_err(|e| IssueError::Parse(e.to_string()))?;
-            issues
+            let capped = limit == 0 && issues.len() > GH_LIST_CAP;
+            if capped {
+                issues.truncate(GH_LIST_CAP);
+            }
+            let mapped = issues
                 .into_iter()
                 .map(|issue| gh_issue_to_domain_with_host(issue, expected_host.as_deref()))
-                .collect()
+                .collect::<Result<Vec<_>, _>>()?;
+            if capped {
+                return Err(IssueError::PartialList {
+                    issues: mapped,
+                    reason: "GitHub issue search reached the 100-issue cap",
+                });
+            }
+            Ok(mapped)
         })
     }
 }

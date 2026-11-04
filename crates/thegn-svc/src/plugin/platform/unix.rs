@@ -136,6 +136,19 @@ pub(crate) fn platform_executable_identity_metadata(
     (Some(metadata.uid()), Some(metadata.mode() & 0o7777))
 }
 
+pub(crate) fn platform_voice_model_identity_metadata(
+    metadata: &std::fs::Metadata,
+) -> (Option<u64>, Option<u64>, Option<i64>, Option<i64>) {
+    use std::os::unix::fs::MetadataExt;
+
+    (
+        Some(metadata.dev()),
+        Some(metadata.ino()),
+        Some(metadata.ctime()),
+        Some(metadata.ctime_nsec()),
+    )
+}
+
 #[cfg(test)]
 pub(crate) fn platform_set_mode_for_test(path: &std::path::Path, mode: u32) -> io::Result<()> {
     use std::os::unix::fs::PermissionsExt;

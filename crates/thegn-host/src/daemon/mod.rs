@@ -1172,7 +1172,11 @@ async fn run(
     let legacy_scope = state_dir.to_str();
     {
         let db = db.lock().expect("daemon db lock");
-        if live_legacy_scope_daemon(&db.daemons()?, legacy_scope, pid_alive) {
+        if live_legacy_scope_daemon(
+            &scoped_registry_rows(&*db, &scope, legacy_scope)?,
+            legacy_scope,
+            pid_alive,
+        ) {
             anyhow::bail!(
                 "a pre-upgrade daemon is still registered for this state directory (pid alive); stop it with `thegn daemon stop` before starting a new daemon"
             );
@@ -1332,7 +1336,7 @@ async fn run(
     {
         let db = db.lock().expect("daemon db lock");
         for stale in boot_sweep_targets(
-            &db.daemons().unwrap_or_default(),
+            &scoped_registry_rows(&*db, &scope, legacy_scope).unwrap_or_default(),
             &scope,
             legacy_scope,
             pid_alive,
@@ -1604,6 +1608,19 @@ fn boot_sweep_targets(
         })
         .map(|r| r.daemon_id.clone())
         .collect()
+}
+
+/// The registry rows a starting daemon decides on: its own scope plus the legacy path scope (THE-295 slice d).
+fn scoped_registry_rows(
+    store: &dyn ControlStore,
+    scope: &str,
+    legacy_scope: Option<&str>,
+) -> anyhow::Result<Vec<DaemonRow>> {
+    let mut rows = store.daemons_in_scope(scope)?;
+    if let Some(legacy) = legacy_scope.filter(|legacy| *legacy != scope) {
+        rows.extend(store.daemons_in_scope(legacy)?);
+    }
+    Ok(rows)
 }
 
 fn live_legacy_scope_daemon(
@@ -2355,6 +2372,59 @@ mod tests {
         assert!(live_legacy_scope_daemon(&rows, Some("/state/a"), alive));
         assert!(!live_legacy_scope_daemon(&rows, Some("/state/b"), alive));
         assert!(!live_legacy_scope_daemon(&rows, None, alive));
+    }
+
+    fn scoped_registry_fixture() -> Db {
+        let db = Db::open_memory().unwrap();
+        for n in 0..3_000 {
+            db.put_daemon(&row(
+                &format!("other{n}"),
+                &format!("/other/{n}"),
+                30_000 + n,
+            ))
+            .unwrap();
+        }
+        db.put_daemon(&row("cur", "v1-scope-a", 11)).unwrap();
+        db.put_daemon(&row("leg", "/scope/a", 22)).unwrap();
+        db
+    }
+
+    #[test]
+    fn scoped_registry_rows_reads_only_current_and_legacy_scopes() {
+        let db = scoped_registry_fixture();
+        let ids = |rows: Vec<DaemonRow>| {
+            let mut ids = rows
+                .into_iter()
+                .map(|row| row.daemon_id)
+                .collect::<Vec<_>>();
+            ids.sort();
+            ids
+        };
+
+        assert_eq!(
+            ids(scoped_registry_rows(&db, "v1-scope-a", Some("/scope/a")).unwrap()),
+            vec!["cur".to_string(), "leg".to_string()]
+        );
+        assert_eq!(
+            ids(scoped_registry_rows(&db, "v1-scope-a", None).unwrap()),
+            vec!["cur".to_string()]
+        );
+        assert_eq!(
+            ids(scoped_registry_rows(&db, "v1-scope-a", Some("v1-scope-a")).unwrap()),
+            vec!["cur".to_string()]
+        );
+    }
+
+    #[test]
+    fn scoped_registry_rows_feed_the_same_boot_decisions() {
+        let db = scoped_registry_fixture();
+        let rows = scoped_registry_rows(&db, "v1-scope-a", Some("/scope/a")).unwrap();
+
+        assert_eq!(
+            boot_sweep_targets(&rows, "v1-scope-a", Some("/scope/a"), |pid| pid == 22),
+            vec!["cur".to_string()]
+        );
+        assert!(live_legacy_scope_daemon(&rows, Some("/scope/a"), |pid| pid == 22));
     }
 
     #[test]

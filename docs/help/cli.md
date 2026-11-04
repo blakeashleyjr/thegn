@@ -57,6 +57,11 @@ The `issues.list` capability (`thegn api call issues.list` or HTTP `GET
 account is listed with its account, provider, kind and reason; validated rows
 from a partial account are kept. `complete` is true only when all accounts
 answer fully, and the call fails only if every configured account fails.
+The `issues.get`, `issues.update` and `issues.comment` control API operations
+also accept `account` (HTTP `?account=<name>`) to route an issue to the named
+`[[issues.issue_accounts]]` entry. With `account`, the id must be
+`<provider>:<key>`; without it, existing prefix routing applies. An unknown or
+invalid account is rejected before any tracker call.
 
 The multi-repo group commands use the canonical `thegn program` namespace.
 `thegn project` remains a deprecated, behavior-identical alias for three
@@ -458,6 +463,10 @@ With `--json`, a classified refusal prints `{"error": ..., "id": ..., "message":
 `session open --resume-work` also checks any resumed row's parent other than the
 resume source in the same transaction. A missing parent, one from another issue,
 or one that is failed, abandoned or unknown is refused.
+`dispatch claim`, `dispatch put`, `dispatch set-status` and `session open` also
+take `--lease-gen <GEN>` with `--lease` and `--owner`; pass the generation
+printed by `thegn dispatch lease acquire`. It must be positive; a stale
+generation is refused before anything is written.
 
 The `[pipeline.transport_retry]` budget is stored on each dispatch row and
 counted once per run. It survives daemon restarts without exceeding the
