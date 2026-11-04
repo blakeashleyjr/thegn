@@ -2797,7 +2797,12 @@ mod retry_tests {
                 },
                 &commit,
             )
-            .unwrap()
+            .unwrap();
+        // Re-admitting the test claim transitions the queue row through
+        // `queued` and back to `landed`, which refreshes `updated_at`.
+        // Keep the fixture past its cleanup TTL so sweep reaches the claim fence.
+        age_landed_row(&fixture.db_path, &worktree);
+        claim
     }
 
     #[test]
