@@ -3413,6 +3413,201 @@ mod tests {
     }
 
     #[test]
+    fn set_status_door_matches_the_transition_table_for_every_pair() {
+        use AgentDispatchStatus as St;
+        use thegn_core::db::DispatchTransitionConflict as Conflict;
+
+        let (dir, db) = db("set-status-door-matrix");
+        let stored = [
+            St::Queued,
+            St::Spawning,
+            St::Running,
+            St::WaitingHuman,
+            St::PrOpen,
+            St::Merged,
+            St::Abandoned,
+            St::Done,
+            St::Failed,
+            St::Unknown,
+        ];
+        let mut allowed_count: usize = 0;
+        let mut refused_count: usize = 0;
+
+        for (index, from) in stored.iter().copied().enumerate() {
+            for (pair, to) in stored.iter().copied().enumerate() {
+                let label = format!("{from:?} -> {to:?}");
+                let id = db
+                    .put_agent_dispatch(NewDispatch::new(
+                        &format!("linear:CLIDOOR-{index}-{pair}"),
+                        &format!("/wt/clidoor-{index}-{pair}"),
+                        "claude",
+                    ))
+                    .unwrap();
+                if from == St::Unknown {
+                    rusqlite::Connection::open(dir.path().join("set-status-door-matrix.db"))
+                        .unwrap()
+                        .execute(
+                            "UPDATE agent_dispatches SET status='zombie' WHERE id=?1",
+                            rusqlite::params![id],
+                        )
+                        .unwrap();
+                } else {
+                    db.update_dispatch_status(id, from).unwrap();
+                }
+                assert_eq!(
+                    db.get_dispatch(id).unwrap().unwrap().status,
+                    from,
+                    "{label}: fixture must store the requested source status"
+                );
+
+                let result = set_status_on_led(&db, id, to, false, None, LeadProof::Unbound, true);
+                let allowed = thegn_core::db::set_status_transition_allowed(from, to);
+                if allowed {
+                    allowed_count += 1;
+                    assert!(result.is_ok(), "{label}: allowed transition was refused");
+                    assert_eq!(
+                        db.get_dispatch(id).unwrap().unwrap().status,
+                        to,
+                        "{label}: allowed transition must update the row"
+                    );
+                } else {
+                    refused_count += 1;
+                    assert!(result.is_err(), "{label}: refused transition was accepted");
+                    let error = result.unwrap_err();
+                    assert_eq!(
+                        set_status_error_kind(&error),
+                        Some("illegal_transition"),
+                        "{label}: refused transition must classify as illegal"
+                    );
+                    let conflict = error.downcast_ref::<Conflict>().unwrap_or_else(|| {
+                        panic!("{label}: refusal did not retain its typed transition conflict")
+                    });
+                    match conflict {
+                        Conflict::Illegal {
+                            id: got_id,
+                            from: got_from,
+                            to: got_to,
+                        } => {
+                            assert_eq!(*got_id, id, "{label}: conflict row id differs");
+                            assert_eq!(*got_from, from, "{label}: conflict source differs");
+                            assert_eq!(*got_to, to, "{label}: conflict target differs");
+                        }
+                        Conflict::Stale { .. } => {
+                            panic!("{label}: expected Illegal conflict, got Stale")
+                        }
+                    }
+                    assert_eq!(
+                        db.get_dispatch(id).unwrap().unwrap().status,
+                        from,
+                        "{label}: refused transition must leave the row unchanged"
+                    );
+                    if from == St::Unknown {
+                        let raw_status = rusqlite::Connection::open(
+                            dir.path().join("set-status-door-matrix.db"),
+                        )
+                        .unwrap()
+                        .query_row(
+                            "SELECT status FROM agent_dispatches WHERE id=?1",
+                            [id],
+                            |row| row.get::<_, String>(0),
+                        )
+                        .unwrap();
+                        assert_eq!(
+                            raw_status, "zombie",
+                            "{label}: refused transition must preserve the legacy value"
+                        );
+                    }
+                }
+            }
+        }
+
+        assert_eq!(
+            allowed_count + refused_count,
+            100,
+            "matrix must cover 10 x 10 pairs"
+        );
+        assert!(allowed_count > 0, "matrix must include allowed transitions");
+        assert!(
+            allowed_count < 100,
+            "matrix must include refused transitions"
+        );
+
+        let exercise = |from: St, to: St, key: &str| {
+            let id = db
+                .put_agent_dispatch(NewDispatch::new(
+                    &format!("linear:CLIDOOR-PIN-{key}"),
+                    &format!("/wt/clidoor-pin-{key}"),
+                    "claude",
+                ))
+                .unwrap();
+            if from == St::Unknown {
+                rusqlite::Connection::open(dir.path().join("set-status-door-matrix.db"))
+                    .unwrap()
+                    .execute(
+                        "UPDATE agent_dispatches SET status='zombie' WHERE id=?1",
+                        rusqlite::params![id],
+                    )
+                    .unwrap();
+            } else {
+                db.update_dispatch_status(id, from).unwrap();
+            }
+            let result = set_status_on_led(&db, id, to, false, None, LeadProof::Unbound, true);
+            (id, result)
+        };
+
+        let (id, result) = exercise(St::Done, St::Running, "done-running");
+        let error = result.unwrap_err();
+        assert_eq!(
+            set_status_error_kind(&error),
+            Some("illegal_transition"),
+            "Done -> Running must refuse resurrection"
+        );
+        assert_eq!(
+            db.get_dispatch(id).unwrap().unwrap().status,
+            St::Done,
+            "Done -> Running must preserve the row"
+        );
+
+        let (_id, result) = exercise(St::Merged, St::Done, "merged-done");
+        assert_eq!(
+            set_status_error_kind(&result.unwrap_err()),
+            Some("illegal_transition"),
+            "Merged -> Done must be refused"
+        );
+
+        let (id, result) = exercise(St::Failed, St::Done, "failed-done");
+        assert!(
+            result.is_ok(),
+            "Failed -> Done must be accepted for a plain row"
+        );
+        assert_eq!(
+            db.get_dispatch(id).unwrap().unwrap().status,
+            St::Done,
+            "Failed -> Done must update the row"
+        );
+
+        let (id, result) = exercise(St::Unknown, St::Failed, "unknown-failed");
+        assert!(result.is_ok(), "Unknown -> Failed must be accepted");
+        assert_eq!(
+            db.get_dispatch(id).unwrap().unwrap().status,
+            St::Failed,
+            "Unknown -> Failed must update the row"
+        );
+
+        let (id, result) = exercise(St::Running, St::Unknown, "running-unknown");
+        assert_eq!(
+            set_status_error_kind(&result.unwrap_err()),
+            Some("illegal_transition"),
+            "Running -> Unknown must be refused"
+        );
+        assert_eq!(
+            db.get_dispatch(id).unwrap().unwrap().status,
+            St::Running,
+            "Running -> Unknown must preserve the row"
+        );
+    }
+
+    #[test]
     fn forced_status_requires_done_and_a_nonblank_reason_before_writing() {
         let (_dir, db) = db("set-status-force-reason-required");
         let id = db
