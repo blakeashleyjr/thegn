@@ -509,6 +509,7 @@ fn suggest_ci_notification_exposes_the_same_candidate_action() {
                             job_id: "job-3".into(),
                             head_sha: "abc123".into(),
                             context: String::new(),
+                            attempt: None,
                         },
                     }
         })
@@ -522,6 +523,7 @@ fn suggest_ci_notification_exposes_the_same_candidate_action() {
                 job_id: "job-3".into(),
                 head_sha: "abc123".into(),
                 context: String::new(),
+                attempt: None,
             },
         })
     );
