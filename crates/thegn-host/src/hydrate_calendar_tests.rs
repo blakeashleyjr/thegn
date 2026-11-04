@@ -1841,3 +1841,115 @@ fn calendar_token_reload_rebinds_audit_events_to_their_own_accounts() {
         assert!(!log.contains(sentinel), "{evidence}");
     }
 }
+
+#[test]
+fn zoned_weekly_occurrence_is_one_materialization_for_cache_month_and_reminders() {
+    let t = TmpDb::new("zoned-weekly-occurrence");
+    let zone = TzRef::new("America/New_York");
+    let mut event = CalEvent::new(
+        "dst-weekly",
+        "DST weekly",
+        EventTime::Zoned {
+            local: d(2026, 2, 28).and_hms_opt(23, 0, 0).unwrap(),
+            zone: zone.clone(),
+        },
+        EventTime::Zoned {
+            local: d(2026, 3, 1).and_hms_opt(3, 30, 0).unwrap(),
+            zone,
+        },
+    );
+    event.recurrence = Some(thegn_core::calendar::Recurrence {
+        rules: vec![thegn_core::calendar::RRule::parse("FREQ=WEEKLY;COUNT=3").unwrap()],
+        ..Default::default()
+    });
+    event.reminders = vec![thegn_core::calendar::Reminder { minutes_before: 10 }];
+
+    assert!(apply_page(
+        &t.db,
+        "work",
+        "ics",
+        &page(vec![event], vec![], ""),
+        d(2026, 2, 20),
+        d(2026, 3, 31),
+    ));
+
+    let cached = load_cached(&t.db, d(2026, 3, 7), d(2026, 3, 8))
+        .unwrap()
+        .events;
+    assert_eq!(cached.len(), 1);
+    assert_eq!(cached[0].uid, "dst-weekly");
+
+    let ny = chrono_tz::Tz::America__New_York;
+    let month = expand_month(&t.db, d(2026, 3, 1), d(2026, 3, 31), ny);
+    assert_eq!(month.error, None);
+    let month_days = month.events.expect("the month loaded");
+    let a = month_days
+        .iter()
+        .find(|(day, _)| *day == d(2026, 3, 7))
+        .and_then(|(_, events)| events.iter().find(|event| event.uid == "dst-weekly"))
+        .expect("the occurrence occupies March 7");
+    let b = month_days
+        .iter()
+        .find(|(day, _)| *day == d(2026, 3, 8))
+        .and_then(|(_, events)| events.iter().find(|event| event.uid == "dst-weekly"))
+        .expect("the occurrence occupies March 8");
+    assert!(
+        std::sync::Arc::ptr_eq(a, b),
+        "March 7 and March 8 should share one occurrence Arc; March 7: {a:?}, March 8: {b:?}"
+    );
+    assert_eq!(
+        a.start,
+        EventTime::Zoned {
+            local: d(2026, 3, 7).and_hms_opt(23, 0, 0).unwrap(),
+            zone: TzRef::new("America/New_York"),
+        }
+    );
+    assert_eq!(
+        a.end,
+        EventTime::Zoned {
+            local: d(2026, 3, 8).and_hms_opt(3, 30, 0).unwrap(),
+            zone: TzRef::new("America/New_York"),
+        }
+    );
+
+    for (from, to, display_zone) in [
+        (d(2026, 3, 7), d(2026, 3, 8), ny),
+        (d(2026, 3, 7), d(2026, 3, 8), chrono_tz::Tz::UTC),
+    ] {
+        let view = expand_month(&t.db, from, to, display_zone);
+        assert_eq!(view.error, None);
+        let occurrence = view
+            .events
+            .expect("the requested window loaded")
+            .into_iter()
+            .flat_map(|(_, events)| events)
+            .find(|event| event.uid == "dst-weekly")
+            .expect("the window contains the occurrence");
+        assert_eq!(occurrence.start, a.start);
+        assert_eq!(occurrence.end, a.end);
+    }
+
+    let start_ms = a
+        .start
+        .instant_in(ny, thegn_core::calendar::GapPolicy::ShiftForward)
+        .unwrap()
+        .timestamp_millis();
+    let trigger = start_ms - 600_000;
+    let cfg = CalendarConfig {
+        home_zone: "America/New_York".into(),
+        ..reminder_cfg()
+    };
+    let due = due_reminders(
+        &t.db,
+        &cfg,
+        reminder_window(1, trigger - 60_000, trigger + 60_000),
+    )
+    .unwrap();
+    assert_eq!(due.reminders.len(), 1, "{:?}", due.reminders);
+    assert!(
+        due.reminders[0].event_id.ends_with("/dst-weekly"),
+        "unexpected event id in due reminders: {:?}",
+        due.reminders[0].event_id
+    );
+    assert_eq!(due.reminders[0].occurrence_start_ms, start_ms);
+}
