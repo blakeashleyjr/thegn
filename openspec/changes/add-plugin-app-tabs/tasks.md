@@ -31,8 +31,8 @@
 
 ## 5. App tile + app host
 
-- [ ] 5.1 `apps/plugin.rs`.
-- [ ] 5.2 `apps/mod.rs` dynamic ids + `sync_plugins` + `theme_told`.
+- [x] 5.1 `apps/plugin.rs`. Evidence: `apps::plugin::tests::push_response_rejects_unknown_session_or_id`.
+- [x] 5.2 `apps/mod.rs` dynamic ids + `sync_plugins` + `theme_told`. Evidence: `apps::tests::sync_plugins_is_idempotent_and_reports_no_change`.
 
 ## 6. Plugin handler routing
 
