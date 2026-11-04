@@ -116,7 +116,11 @@ verifies the new commits. Otherwise they refuse with the reason; use
   also names the target base: the commit the target branch pointed at before
   the land, so history shows candidate, base and result for every drain
   landing. Up to 200 events, including drain transitions, are kept per
-  worktree; a removed worktree's history is dropped with it.
+  worktree; a removed worktree's history is dropped with it. When a matching
+  queue row exists, a refused `thegn merge land` (or the panel's land key) is
+  recorded as operation `land` with its outcome (`not_ready`,
+  `candidate_moved` or `claimed`); the row stays unchanged, and an audit-write
+  failure does not hide the refusal.
 
 ## Land strategy, signing, drivers
 
@@ -355,6 +359,10 @@ putting the prompt on the command line or in `$THEGN_TASK_PROMPT`. thegn deletes
 the file when the run ends; a remote sandbox placement refuses the run. A
 prompt file left by an interrupted run is removed when a later local agent run
 prepares that directory, if the regular `prompt-*` file is over 30 days old.
+Without `{prompt_file}`, an oversized prompt is shortened to fit (about
+100 KiB) with a `... task data omitted ...` marker. The
+`$THEGN_TASK_PROMPT` and `$THEGN_MERGE_PROMPT` copies have the same limit,
+so a large prompt does not prevent the agent from starting.
 
 If a queue agent is refused at sandbox entry, it is not started and its row
 records the refusal class and fix; merge-queue rows stay

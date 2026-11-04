@@ -463,6 +463,9 @@ With `--json`, a classified refusal prints `{"error": ..., "id": ..., "message":
 `session open --resume-work` also checks any resumed row's parent other than the
 resume source in the same transaction. A missing parent, one from another issue,
 or one that is failed, abandoned or unknown is refused.
+The same commands take `--lease-gen <N>` with `--lease` and `--owner`; pass
+the generation printed by `thegn dispatch lease acquire`. It must be positive;
+a stale generation is refused before anything is written.
 
 The `[pipeline.transport_retry]` budget is stored on each dispatch row and
 counted once per run. It survives daemon restarts without exceeding the
