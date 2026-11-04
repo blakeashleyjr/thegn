@@ -8151,6 +8151,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "thegn-plugin-sdk"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "keyring",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thegn-core",
+ "url",
+]
+
+[[package]]
 name = "thegn-plugin-ui"
 version = "0.1.0"
 dependencies = [

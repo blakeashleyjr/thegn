@@ -1,0 +1,28 @@
+[package]
+name = "thegn-plugin-sdk"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false
+
+[lints]
+workspace = true
+
+[dependencies]
+thegn-core.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+anyhow.workspace = true
+url.workspace = true
+# Same version and feature set as thegn-host's keyring so Cargo does not fork keyring/zbus.
+keyring = { version = "3", default-features = false, features = [
+  "async-secret-service",
+  "async-io",
+  "crypto-rust",
+  "apple-native",
+  "windows-native",
+] }
+
+[dev-dependencies]
+tempfile.workspace = true
