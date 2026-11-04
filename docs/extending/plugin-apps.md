@@ -116,3 +116,11 @@ the SDK; the thegn host does not.
 
 Run `just plugin-conformance` (with a built `target/debug/thegn`) to check
 `thegn plugin preview` offline. This recipe is not part of `ci`.
+
+## Example
+
+`examples/plugins/cell-grid/` is a resident app plugin with a `plugin.toml`
+manifest and `grid.py`, run with `python3`. Its “Cell grid” tab draws the
+last typed key or pasted text in one `grid` widget sized to the region the
+host reports. Copy the directory into `<config_dir>/plugins/`; it then
+appears in `thegn plugin list`. Plugin app tabs are a dev-channel feature.

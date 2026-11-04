@@ -92,6 +92,10 @@ If a later poll confirms a requested merge at the same head, the row records
 at a different head, or one not requested by thegn, is recorded as merged on
 the forge but is not counted as a thegn merge.
 
+`thegn doctor` notes this in the Providers list when a forge can merge but
+cannot fence that merge to the reviewed head: the PR queue holds merges for
+that forge, which you must merge yourself.
+
 ## The agent
 
 Point it at an agent the same way the [[merge-queue]] does — an

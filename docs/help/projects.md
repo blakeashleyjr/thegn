@@ -68,6 +68,11 @@ thegn wt new payments-retry --program shop
   the failed member is attempted again. Add `--json` for one machine-readable
   object covering every member.
 
+- If Git cannot read a member's branch (for example, the repository is
+  unreadable or the Git call times out), that member is `failed` with the
+  reason instead of being treated as branch-absent and created. With
+  `--repos`, only selected members count.
+
 The cross-repo link is **branch-name equality** — there is no super-repo, no
 manifest, no stored link. A same-named branch you create by hand (`git
 worktree add`) in a member repo simply belongs to the same feature.

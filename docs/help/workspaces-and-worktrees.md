@@ -169,5 +169,8 @@ The same fail-closed rule covers branch, worktree and base-branch reads:
 refuse when Git cannot be read instead of assuming no branches exist or
 silently choosing a default. A detached HEAD remains valid and uses the
 default branch as its base.
+The new-worktree wizard follows the same fail-closed rule in its resolve-base
+step: if Git cannot list branches or resolve the base, the step fails with
+Git's reason before anything is created.
 Worktree tabs are named `<repo>/<exact branch>`. See the [[config-reference]]
 for every knob.

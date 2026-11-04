@@ -9,6 +9,49 @@ All notable changes to **thegn** are documented here. The format follows
 
 ## [0.1.0-alpha.51] — 2026-11-04 (maintenance batch 89)
 
+### Added
+
+- `thegn doctor` prints a `worker` row for the current worktree when
+  `[[pipeline.stages]]` are configured: `ready`, `NOT READY` with the first
+  missing prerequisite, or `NOT PROVEN` where the platform or backend is
+  unsupported.
+- The Home Manager module adds null-default `programs.thegn.session*` and
+  `programs.thegn.clipboard*` options for the `[session]` and `[clipboard]`
+  scalar settings.
+- (Dev channel) The `examples/plugins/cell-grid` plugin draws typed input
+  into a `grid` app widget.
+
+### Changed
+
+- When a pane cannot be daemon-backed and runs in-process, or a saved pane
+  session cannot be reattached, thegn posts one notice per kind per run with
+  the redacted reason; the reattach log line is redacted too.
+- Daemon `ci.logs` requests for the same run and job share one provider fetch;
+  a request that waits 120 seconds is refused as unavailable.
+- A starting pane daemon reads at most the 256 newest registry rows per state
+  directory and sweeps a larger pre-upgrade registry in steps, refusing to
+  start with a retry message until it can check all of it.
+- `thegn doctor` notes when a forge can merge but cannot fence the merge to
+  the reviewed head, and that the PR queue holds its merges.
+- The state database schema is now v105. Restart the host and daemon after
+  upgrading so they use the migrated database.
+
+### Fixed
+
+- Interactive rebase, reword, amend, retag and move pin the HEAD commit they
+  verify. If HEAD moves before Git starts, the operation is refused with
+  nothing changed.
+- `wt new --program` reports a member repository whose branch Git cannot
+  read as failed instead of creating it, and the new-worktree wizard stops
+  with Git's reason when it cannot list branches or resolve the base.
+
+### Security
+
+- The MCP secret-name index carries a generation checked at publish, so a
+  concurrent update is refused instead of overwritten.
+- Hook run logs and managed-tool installer provenance records are written
+  through held, owner-only directory handles.
+
 ## [0.1.0-alpha.50] — 2026-11-04 (maintenance batch 88)
 
 ### Added
