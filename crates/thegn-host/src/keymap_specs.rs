@@ -1602,6 +1602,24 @@ pub const ACTION_SPECS: &[ActionSpec] = &[
         ],
     },
     ActionSpec {
+        id: "plugin-app-drafts",
+        label: "Plugin app: draft recovery",
+        message_key: "action-plugin-app-drafts",
+        hint: "drafts",
+        default_chords: &["F2"],
+        palette: true,
+        keywords: &["plugin", "app", "draft", "recover", "unsaved"],
+    },
+    ActionSpec {
+        id: "plugin-app-requests",
+        label: "Plugin app: request recovery",
+        message_key: "action-plugin-app-requests",
+        hint: "requests",
+        default_chords: &["F3"],
+        palette: true,
+        keywords: &["plugin", "app", "request", "unknown outcome", "recover"],
+    },
+    ActionSpec {
         id: "help",
         label: "Help — built-in docs",
         message_key: "action-help",
@@ -2346,8 +2364,14 @@ mod tests {
             // Feed the chord through a fresh default map and see what it fires.
             let mut map = crate::keymap::default_keymap();
             let mut got: Option<Action> = None;
+            let app_scoped = Action::from_key(spec.id).is_some_and(|action| action.is_app_scoped());
             for k in keys {
-                match map.dispatch(Mode::Normal, k) {
+                let result = if app_scoped {
+                    map.dispatch_app(Mode::Normal, k)
+                } else {
+                    map.dispatch(Mode::Normal, k)
+                };
+                match result {
                     MatchResult::Matched(a) => {
                         got = Some(a);
                         break;

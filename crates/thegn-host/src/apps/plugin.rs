@@ -204,6 +204,15 @@ impl AppState {
         self.pending.insert((session, id));
         Ok(id)
     }
+
+    #[cfg(test)]
+    pub(crate) fn test_pending_request_count(&self) -> usize {
+        self.requests
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .pending
+            .len()
+    }
 }
 pub(crate) type SharedApp = Arc<Mutex<AppState>>;
 pub(crate) type Rebind = Arc<Mutex<Option<(String, String, SharedApp)>>>;

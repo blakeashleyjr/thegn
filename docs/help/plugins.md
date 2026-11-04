@@ -2,7 +2,7 @@
 id: plugins
 title: Plugins
 order: 32
-actions: []
+actions: [plugin-app-drafts, plugin-app-requests]
 ---
 
 # Plugins
@@ -161,6 +161,24 @@ or resident plugins. `IssueProvider` is resident-only because provider calls
 need a reply channel. Palette actions and providers are on-demand; status and
 notification contributions may also use an interval. Other cadence/mode
 combinations fail `plugin check` with an actionable reason.
+
+## App tabs
+
+A resident API 0.4 plugin can contribute an `AppTab` with a `surface` and the
+`surface:app` capability. The tab id is `plugin:<plugin>:<contribution>` and
+can be selected with `[apps] default_tab` or ordered with `tab_order`. App tabs
+are available on the dev channel only (`THEGN_CHANNEL=dev`; see
+[[release-channels]]).
+
+Inside a plugin app, your configured quit, detach, palette, and help chords
+remain available, as do the Alt tab-switch chords. Other input goes to the app.
+F2 (`plugin-app-drafts`) opens draft recovery and F3
+(`plugin-app-requests`) opens request recovery for submissions whose outcome is
+unknown. Both actions are rebindable. F2 and F3 pass through to terminal
+programs in the Work tab.
+
+Set `background = true` together with the `background:sync` capability to let
+a hidden app keep syncing. This requires `trusted_native = true`.
 
 ## Provider plugins
 

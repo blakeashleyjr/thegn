@@ -7,6 +7,13 @@ All notable changes to **thegn** are documented here. The format follows
 
 ## [Unreleased]
 
+### Added
+
+- Plugin app tabs (dev channel): resident API 0.4 plugins can contribute an
+  `AppTab` workspace rendered by the new `thegn-plugin-ui` engine; F2/F3
+  (`plugin-app-drafts`/`plugin-app-requests`) open draft and request recovery.
+  Plugin API is now 0.4.0; 0.3 plugins load unchanged.
+
 ## [0.1.0-alpha.46] — 2026-11-03 (maintenance batch 83)
 
 ## [0.1.0-alpha.45] — 2026-11-03 (maintenance batch 82)

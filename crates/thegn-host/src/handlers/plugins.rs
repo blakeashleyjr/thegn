@@ -90,7 +90,6 @@ struct FocusTicket {
 /// order) plus the outboxes the loop flushes off-thread after each drain.
 pub(crate) struct PluginsState {
     pub plugins: BTreeMap<String, PluginEntry>,
-    #[cfg_attr(not(test), expect(dead_code, reason = "read in L7"))]
     pub(crate) loading: bool,
     /// Notifications raised via the `notify` verb this drain, recorded to the
     /// inbox off-loop by [`flush_alerts`]. `(plugin id, alert)`.
@@ -124,12 +123,10 @@ impl PluginsState {
         }
     }
 
-    #[cfg_attr(not(test), expect(dead_code, reason = "called in L7"))]
     pub(crate) fn user_input(&mut self) {
         self.navigation_epoch = self.navigation_epoch.wrapping_add(1);
     }
 
-    #[cfg_attr(not(test), expect(dead_code, reason = "called in L7"))]
     pub(crate) fn update_app_context(&mut self, active_app: &str, modal_owns_input: bool) {
         if self.active_app != active_app {
             self.navigation_epoch = self.navigation_epoch.wrapping_add(1);
@@ -138,7 +135,6 @@ impl PluginsState {
         self.modal_owns_input = modal_owns_input;
     }
 
-    #[cfg_attr(not(test), expect(dead_code, reason = "called in L7"))]
     pub(crate) fn next_app_deadline(&self) -> Option<std::time::Instant> {
         self.plugins
             .values()
@@ -151,7 +147,6 @@ impl PluginsState {
             .min()
     }
 
-    #[cfg_attr(not(test), expect(dead_code, reason = "called in L7"))]
     pub(crate) fn app_tabs(&self) -> Vec<crate::apps::plugin::AppTabDescriptor> {
         let mut tabs = Vec::new();
         for (plugin, entry) in &self.plugins {
@@ -176,7 +171,6 @@ impl PluginsState {
         tabs
     }
 
-    #[cfg_attr(not(test), expect(dead_code, reason = "called in L7"))]
     pub(crate) fn take_focus_request(&mut self) -> Option<String> {
         for (plugin, entry) in &self.plugins {
             for contribution in &entry.contributions {
@@ -4114,7 +4108,7 @@ mod tests {
 }
 
 #[cfg(test)]
-mod app_tests {
+pub(crate) mod app_tests {
     use super::tests::{contribution, drain_one, event, loaded_state, spec, state_with};
     use super::*;
     use std::sync::MutexGuard;
@@ -4188,6 +4182,26 @@ mod app_tests {
             },
             status: status.into(),
         }
+    }
+
+    pub(crate) fn test_state_with_app(
+        plugin: &str,
+        contribution_id: &str,
+        surface: &str,
+    ) -> PluginsState {
+        let _guard = channel_guard(Channel::Dev);
+        let mut plugin_spec = app_spec(plugin);
+        let app_contribution = plugin_spec
+            .manifest
+            .contributions
+            .iter_mut()
+            .find(|row| row.extension_point == ExtensionPoint::AppTab)
+            .expect("app contribution fixture");
+        app_contribution.id = thegn_core::plugin_api::ContributionId::new(contribution_id);
+        app_contribution.surface = Some(thegn_core::plugin_api::SurfaceId::new(surface));
+        let mut state = state_with(vec![plugin_spec]);
+        state.loading = false;
+        state
     }
 
     #[test]
@@ -4637,7 +4651,7 @@ mod app_tests {
         clippy::disallowed_methods,
         reason = "the resident fixture child is the test executable"
     )]
-    fn test_session() -> (tokio::runtime::Runtime, thegn_svc::plugin::ResidentSession) {
+    pub(crate) fn test_session() -> (tokio::runtime::Runtime, thegn_svc::plugin::ResidentSession) {
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
@@ -4665,7 +4679,7 @@ mod app_tests {
         (runtime, session)
     }
 
-    fn stop_test_session(
+    pub(crate) fn stop_test_session(
         runtime: &tokio::runtime::Runtime,
         session: thegn_svc::plugin::ResidentSession,
     ) {

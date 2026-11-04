@@ -325,7 +325,6 @@ impl AppHost {
         self.default_tab = default_id;
     }
 
-    #[cfg_attr(not(test), expect(dead_code, reason = "wired in L6"))]
     pub(crate) fn sync_plugins(
         &mut self,
         loading: bool,
@@ -508,12 +507,10 @@ impl AppHost {
         self.tab_order[next]
     }
 
-    #[cfg_attr(not(test), expect(dead_code, reason = "wired in L7"))]
     pub(crate) fn active_is_plugin(&self) -> bool {
         self.active_id().is_some_and(|id| id.starts_with("plugin:"))
     }
 
-    #[cfg_attr(not(test), expect(dead_code, reason = "wired in L7"))]
     pub(crate) fn command_active(&mut self, command: &str) -> bool {
         let ActiveApp::Tile(index) = self.active else {
             return false;
@@ -531,19 +528,19 @@ impl AppHost {
         handled
     }
 
-    #[cfg_attr(not(test), expect(dead_code, reason = "wired in L6/L7"))]
-    pub(crate) fn next_plugin_deadline(&self) -> Option<std::time::Instant> {
-        self.slots
-            .iter()
-            .filter_map(|slot| slot.plugin_binding.as_ref())
-            .filter_map(|(shared, _)| shared.upgrade())
-            .filter_map(|shared| {
-                shared
-                    .lock()
-                    .unwrap_or_else(|error| error.into_inner())
-                    .next_deadline()
+    /// Active app caret mapped into the compositor's vertical band.
+    pub(crate) fn active_cursor_in_band(
+        &mut self,
+        top: usize,
+        width: usize,
+        bottom: usize,
+    ) -> Option<(usize, usize)> {
+        self.active_tile_mut()
+            .and_then(|tile| tile.cursor())
+            .and_then(|(x, y)| {
+                let (x, y) = (usize::from(x), top + usize::from(y));
+                (x < width && y < bottom).then_some((x, y))
             })
-            .min()
     }
 
     /// The active tile, if an app tab (not `work`) is focused and running.
@@ -695,8 +692,57 @@ impl AppHost {
         }
     }
 
+    /// Pump only plugin slots; Observe keeps its existing app-channel path.
+    pub(crate) fn pump_plugins(&mut self) -> bool {
+        let active_idx = match self.active {
+            ActiveApp::Tile(i) => Some(i),
+            ActiveApp::Work => None,
+        };
+        let mut active_dirty = false;
+        for (i, slot) in self.slots.iter_mut().enumerate() {
+            if !slot.id.starts_with("plugin:") {
+                continue;
+            }
+            if let SlotState::Running(tile) = &mut slot.state {
+                let changed = tile.pump();
+                if changed {
+                    slot.last_buf = None;
+                }
+                if Some(i) == active_idx {
+                    active_dirty |= changed;
+                }
+            }
+        }
+        active_dirty
+    }
+
+    /// Pump the built-in Observe tile from its existing app-change channel.
+    pub(crate) fn pump_observe(&mut self) -> bool {
+        let active_idx = match self.active {
+            ActiveApp::Tile(i) => Some(i),
+            ActiveApp::Work => None,
+        };
+        let mut active_dirty = false;
+        for (i, slot) in self.slots.iter_mut().enumerate() {
+            if slot.id != "observe" {
+                continue;
+            }
+            if let SlotState::Running(tile) = &mut slot.state {
+                let changed = tile.pump();
+                if changed {
+                    slot.last_buf = None;
+                }
+                if Some(i) == active_idx {
+                    active_dirty |= changed;
+                }
+            }
+        }
+        active_dirty
+    }
+
     /// Drive every running tile's `pump` (cheap channel drain). Returns whether
     /// the active tile changed (the only one that triggers a redraw).
+    #[cfg(test)]
     pub fn pump_all(&mut self) -> bool {
         let active_idx = match self.active {
             ActiveApp::Tile(i) => Some(i),
@@ -786,10 +832,9 @@ fn notify_slot_theme(slot: &mut AppSlot, generation: u64, theme: &mut impl FnMut
 
 /// A tile's [`ChangeHook`](tg_kit::ChangeHook): fired off-thread when the tile
 /// has new data, it posts the slot index on the app channel and pulses the
-/// terminal waker so the loop drains `app_rx` → `pump_all()` → repaint. The
-/// receiver treats the index only as a wake signal and pumps the current slot
-/// set, so a late callback after reconciliation cannot address a new tile by
-/// its old vector index.
+/// terminal waker so the loop drains `app_rx` → `pump_observe()` → repaint. The
+/// receiver treats the index only as a wake signal; it never looks up the old
+/// slot index after reconciliation.
 fn app_change_hook(
     app_tx: &tokio::sync::mpsc::UnboundedSender<usize>,
     idx: usize,
