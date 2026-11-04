@@ -1131,6 +1131,17 @@ impl Config {
                     self.voice.enabled = false;
                     was
                 }
+                Feature::PluginApps => {
+                    let default_was_plugin = self.apps.default_tab.trim().starts_with("plugin:");
+                    if default_was_plugin {
+                        self.apps.default_tab = "work".into();
+                    }
+                    let order_len = self.apps.tab_order.len();
+                    self.apps
+                        .tab_order
+                        .retain(|id| !id.trim().starts_with("plugin:"));
+                    default_was_plugin || self.apps.tab_order.len() != order_len
+                }
             };
             if changed {
                 clamped.push(feat);

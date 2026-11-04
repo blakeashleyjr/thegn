@@ -757,7 +757,7 @@ token = "env:GITLAB_TOKEN"
 # both ids; omitted built-in tabs are appended. Duplicate ids are ignored.
 # Unknown ids and a disabled default are rejected by `thegn config validate`.
 [apps]
-default_tab = "work" # initial tab (THEGN_APPS_DEFAULT_TAB): "work" or enabled "observe"
+default_tab = "work" # initial tab (THEGN_APPS_DEFAULT_TAB): "work", enabled "observe", or "plugin:<plugin>:<contribution>" (dev channel)
 tab_order = ["work", "observe"]
 
 # The embedded "Observe" observability app tab: a Grafana-style in-terminal
