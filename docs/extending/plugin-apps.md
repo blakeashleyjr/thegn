@@ -105,4 +105,14 @@ current directory. `--record <file>` creates a new owner-only trace and refuses 
 `--replay <file>` accepts only an unredacted synthetic trace recorded with `--include-content`; redacted traces cannot be
 replayed.
 
-The plugin SDK crate and example plugins are tracked under THE-1675 and THE-1676.
+## SDK
+
+The source tree's `thegn-plugin-sdk` crate (see
+[`crates/thegn-plugin-sdk/README.md`](../../crates/thegn-plugin-sdk/README.md))
+provides native plugin processes with NDJSON framing, session and request
+correlation, private state with a process lease, an OS credential store with no
+plaintext fallback, and an HTTPS-only browser opener. Plugin processes link
+the SDK; the thegn host does not.
+
+Run `just plugin-conformance` (with a built `target/debug/thegn`) to check
+`thegn plugin preview` offline. This recipe is not part of `ci`.

@@ -9,6 +9,57 @@ All notable changes to **thegn** are documented here. The format follows
 
 ## [0.1.0-alpha.50] — 2026-11-04 (maintenance batch 88)
 
+### Added
+
+- `thegn plugin preview` renders an app-tab fixture (`--fixture <file>` or
+  the bundled `gallery`) or a recorded trace (`--replay`) with the shared app
+  renderer, without starting a plugin process. `--headless` prints a JSON
+  screen snapshot, `--size COLSxROWS` sets the geometry, and `--record` writes
+  a new owner-only trace.
+- The source tree adds `thegn-plugin-sdk` for native plugin processes, with
+  NDJSON framing, session and request correlation, private state, an OS
+  credential store and an HTTPS-only browser opener.
+- The Problems list shows a warning row for a language server that failed to
+  start and is backing off, with its failure count and retry time.
+
+### Changed
+
+- The state database schema is now v104. Restart the host and daemon after
+  upgrading so they use the migrated database.
+- Lead lease proofs for `dispatch put`, `dispatch claim`, `dispatch set-status`
+  and `session open` now require `--lease`, `--owner` and `--lease-gen`; the
+  audited `--admin --why` override is unchanged.
+- Cached CI logs record their provider run attempt (GitHub) and whether
+  redaction changed the text. The CI panel drill and background ingestion
+  fetch a new log when the same run id has a new attempt, and
+  `thegn ci logs --json` adds `redaction_changed` metadata.
+- A `[model_proxy]` reload that moves `listen` to an address held by a foreign
+  or incompatible listener keeps the running proxy instead of stopping it
+  first.
+- Cross-host merge-queue ingest refs carry the creating drain's claim
+  generation, and a pre-ingest prune keeps refs from a newer generation.
+- CI autofix authorization holds with a `needs_human` notification when the
+  cached log belongs to a different provider context from the worktree's
+  current context.
+- `thegn wt rm --delete-branch` refuses failed or detached branch reads, and
+  `wt new` reports that an empty base has no commits yet and distinguishes it
+  from a Git read failure.
+  Git safety reads use bounded typed operations.
+
+### Fixed
+
+- Linear and Jira issue listings and searches no longer show or count an issue
+  repeated on a later page.
+- Switching worktrees cancels an in-flight submodule scan between its Git
+  reads and drops its result.
+
+### Security
+
+- The managed-SSH custody ledger and MCP secret-name index use held,
+  owner-only directory handles. Custody rows that are symlinks, hard-linked
+  or over 64 KiB, inventories over 1024 rows, and non-owner-only directories
+  are refused.
+
 ## [0.1.0-alpha.49] — 2026-11-04 (maintenance batch 87)
 
 ### Changed
@@ -20,9 +71,9 @@ All notable changes to **thegn** are documented here. The format follows
   since the branch was queued.
 - The PR queue holds a merge as `needs_human` before requesting anything when
   the forge cannot fence the merge to the reviewed head.
-- Configuration rejects `[ci] log_tail_lines` values above 100000; accepted
-  log tails retain invalid UTF-8 and over-long-line handling, truncation
-  marking, and CRLF preservation.
+- Configuration rejects `[ci] log_tail_lines` values above 100000. Log tails
+  drop invalid UTF-8 lines and mark the tail truncated, keep CRLF line endings
+  and discard an over-long line.
 - The Home Manager module adds typed, null-default `programs.thegn.search*` and
   `programs.thegn.palette*` options for search and palette settings.
 
