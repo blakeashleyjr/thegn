@@ -166,6 +166,17 @@ pub struct FailedServer {
     pub retry_in_secs: u64,
 }
 
+/// How the slots of one root are doing, counted from the client map. `Unavailable` ("no server installed") and expired backoff slots are not counted.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct LspSlotCounts {
+    /// Started clients (`ClientSlot::Live`).
+    pub live: u32,
+    /// Starts in flight (`ClientSlot::Starting`).
+    pub starting: u32,
+    /// Failed starts still inside their backoff window (`ClientSlot::Failed` with `now < until`).
+    pub backing_off: u32,
+}
+
 /// The client map plus the worktree-root set it was last reconciled against.
 /// Both live under one lock so a request for a root that was just closed can
 /// never respawn a server behind a reconcile.
@@ -699,6 +710,28 @@ impl LspInner {
         Some(out)
     }
 
+    /// Read-only, NON-BLOCKING per-root slot counts. `None` when the map lock is busy or poisoned (the caller keeps what it last showed).
+    /// Bounded by the map itself: every count is at most `limits::MAX_SERVERS_PER_ROOT`.
+    pub fn slot_counts(&self, root: &Path) -> Option<LspSlotCounts> {
+        let state = self.clients.try_lock().ok()?;
+        let now = Instant::now();
+        let mut counts = LspSlotCounts::default();
+        for ((slot_root, _), slot) in &state.map {
+            if slot_root != root {
+                continue;
+            }
+            match slot {
+                ClientSlot::Live { .. } => counts.live = counts.live.saturating_add(1),
+                ClientSlot::Starting { .. } => counts.starting = counts.starting.saturating_add(1),
+                ClientSlot::Failed { until, .. } if now < *until => {
+                    counts.backing_off = counts.backing_off.saturating_add(1)
+                }
+                ClientSlot::Failed { .. } | ClientSlot::Unavailable => {}
+            }
+        }
+        Some(counts)
+    }
+
     /// Retire every server (and negative-cache slot) whose worktree is no
     /// longer in `live_roots`, releasing registry capacity; subprocess
     /// teardown happens on a worker thread. This only briefly takes the map
@@ -1121,6 +1154,8 @@ pub struct LspDiagnostics {
     loss_overflow: bool,
     /// Backing-off servers per root, refreshed by the loop at hydration apply; empty entries are never stored.
     servers: HashMap<PathBuf, Vec<FailedServer>>,
+    /// Slot counts per root while something is starting or backing off, refreshed with `servers`; roots without pressure are never stored.
+    slot_counts: HashMap<PathBuf, LspSlotCounts>,
 }
 
 #[derive(Debug, Default)]
@@ -1191,6 +1226,8 @@ const MAX_LOSS_ROWS: usize = 64;
 const SERVER_CODE: &str = "thegn-lsp-server";
 /// Maximum backing-off server warning rows shown for one root.
 const MAX_SERVER_ROWS: usize = limits::MAX_SERVERS_PER_ROOT;
+/// Diagnostic code identifying the per-root LSP slot-count health row.
+const SERVER_COUNT_CODE: &str = "thegn-lsp-counts";
 
 /// Owned bytes of one loss entry (its stream key plus the empty set).
 fn loss_entry_bytes(stream: &StoreStreamKey) -> usize {
@@ -1211,7 +1248,10 @@ fn loss_document_bytes(path: &str) -> usize {
 
 fn is_health_row(item: &DiagnosticItem) -> bool {
     item.source == HEALTH_SOURCE
-        && matches!(item.code.as_deref(), Some(HEALTH_CODE) | Some(SERVER_CODE))
+        && matches!(
+            item.code.as_deref(),
+            Some(HEALTH_CODE) | Some(SERVER_CODE) | Some(SERVER_COUNT_CODE)
+        )
 }
 
 fn severity_rank(item: &DiagnosticItem) -> u8 {
@@ -1423,17 +1463,18 @@ impl LspDiagnostics {
         }
     }
 
-    /// Every health row for `root`: the loss rows, then one warning per backing-off server.
+    /// Every health row for `root`: loss rows, one warning per backing-off server, and a slot-count info row under pressure.
     fn health_rows(&self, root: &Path) -> Vec<DiagnosticItem> {
         let mut rows = self.loss_rows(root);
         rows.extend(self.server_rows(root));
         rows
     }
 
-    /// One bounded warning per server backing off after a failed start (see [`LspInner::failed_servers`]).
-    /// The retry countdown is a snapshot refreshed at hydration apply, so it may be stale between hydrations.
+    /// One bounded warning per server backing off after a failed start, plus the root's slot-count info row under pressure.
+    /// The snapshots are refreshed at hydration apply, so they may be stale between hydrations.
     fn server_rows(&self, root: &Path) -> Vec<DiagnosticItem> {
-        self.servers
+        let mut rows: Vec<DiagnosticItem> = self
+            .servers
             .get(root)
             .into_iter()
             .flatten()
@@ -1452,7 +1493,22 @@ impl LspDiagnostics {
                 source: HEALTH_SOURCE.to_string(),
                 code: Some(SERVER_CODE.to_string()),
             })
-            .collect()
+            .collect();
+        if let Some(counts) = self.slot_counts.get(root) {
+            rows.push(DiagnosticItem {
+                file: String::new(),
+                line: 0,
+                col: None,
+                severity: Severity::Info,
+                message: format!(
+                    "LSP servers: {} running, {} starting, {} backing off",
+                    counts.live, counts.starting, counts.backing_off
+                ),
+                source: HEALTH_SOURCE.to_string(),
+                code: Some(SERVER_COUNT_CODE.to_string()),
+            });
+        }
+        rows
     }
 
     /// The loss rows for `root`: nothing while the root has no active loss;
@@ -1552,6 +1608,7 @@ impl LspDiagnostics {
         self.retained_bytes = self.retained_bytes.saturating_sub(removed);
         self.loss.retain(|key, _| keep(&key.root));
         self.servers.retain(|root, _| keep(root));
+        self.slot_counts.retain(|root, _| keep(root));
         self.settle_loss();
     }
 
@@ -1602,6 +1659,7 @@ impl LspDiagnostics {
             && self.loss.is_empty()
             && !self.loss_overflow
             && self.servers.is_empty()
+            && self.slot_counts.is_empty()
     }
 
     pub fn record_health(&mut self, health: LspHealth) {
@@ -1613,6 +1671,15 @@ impl LspDiagnostics {
             self.servers.remove(root);
         } else {
             self.servers.insert(root.to_path_buf(), servers);
+        }
+    }
+
+    /// Record the slot counts of `root`. Only counts with something starting or backing off are kept (a healthy root shows no row and holds no entry).
+    pub fn set_slot_counts(&mut self, root: &Path, counts: LspSlotCounts) {
+        if counts.starting == 0 && counts.backing_off == 0 {
+            self.slot_counts.remove(root);
+        } else {
+            self.slot_counts.insert(root.to_path_buf(), counts);
         }
     }
 
@@ -3935,5 +4002,174 @@ mod tests {
             .unwrap();
         assert!(!row.message.contains('\u{1b}'));
         assert!(!row.message.contains('\u{7}'));
+    }
+
+    #[test]
+    fn slot_counts_tally_live_starting_and_in_window_failed_slots_of_the_root() {
+        let (inner, _rx) = enabled_inner();
+        let _live = inner
+            .client_with(Path::new("/r"), "rust", live_fake_client)
+            .unwrap();
+        let now = Instant::now();
+        {
+            let mut state = inner.clients.lock().unwrap();
+            state.map.insert(
+                (PathBuf::from("/r"), "py".into()),
+                ClientSlot::Starting {
+                    cell: Arc::new(StartCell::new()),
+                    generation: 1,
+                },
+            );
+            state.map.insert(
+                (PathBuf::from("/r"), "go".into()),
+                ClientSlot::Failed {
+                    until: now + Duration::from_secs(30),
+                    failures: 2,
+                },
+            );
+            state.map.insert(
+                (PathBuf::from("/r"), "zig".into()),
+                ClientSlot::Failed {
+                    until: now - Duration::from_secs(1),
+                    failures: 1,
+                },
+            );
+            state
+                .map
+                .insert((PathBuf::from("/r"), "lua".into()), ClientSlot::Unavailable);
+            state.map.insert(
+                (PathBuf::from("/other"), "rust".into()),
+                ClientSlot::Failed {
+                    until: now + Duration::from_secs(30),
+                    failures: 5,
+                },
+            );
+        }
+
+        assert_eq!(
+            inner.slot_counts(Path::new("/r")),
+            Some(LspSlotCounts {
+                live: 1,
+                starting: 1,
+                backing_off: 1,
+            })
+        );
+        assert_eq!(
+            inner.slot_counts(Path::new("/nowhere")),
+            Some(LspSlotCounts::default())
+        );
+    }
+
+    #[test]
+    fn slot_counts_snapshot_never_blocks_on_a_held_map_lock() {
+        let (inner, _rx) = enabled_inner();
+        let guard = inner.clients.lock().unwrap();
+        assert!(inner.slot_counts(Path::new("/r")).is_none());
+        drop(guard);
+        assert_eq!(
+            inner.slot_counts(Path::new("/r")),
+            Some(LspSlotCounts::default())
+        );
+    }
+
+    #[test]
+    fn slot_counts_row_is_an_info_health_row_replaced_not_duplicated() {
+        let root = Path::new("/r");
+        let mut store = LspDiagnostics::new();
+        store.set_slot_counts(
+            root,
+            LspSlotCounts {
+                live: 2,
+                starting: 1,
+                backing_off: 1,
+            },
+        );
+        let mut dst = Vec::new();
+        store.merge_into(root, &mut dst);
+        let count_row = |items: &[DiagnosticItem]| {
+            items
+                .iter()
+                .filter(|item| item.code.as_deref() == Some(SERVER_COUNT_CODE))
+                .count()
+        };
+        assert_eq!(count_row(&dst), 1);
+        let row = dst
+            .iter()
+            .find(|item| item.code.as_deref() == Some(SERVER_COUNT_CODE))
+            .unwrap();
+        assert_eq!(row.severity, Severity::Info);
+        assert_eq!(row.source, "lsp:health");
+        assert_eq!(
+            row.message,
+            "LSP servers: 2 running, 1 starting, 1 backing off"
+        );
+
+        store.patch_into(root, &mut dst, &HashSet::new());
+        store.patch_into(root, &mut dst, &HashSet::new());
+        assert_eq!(count_row(&dst), 1);
+        assert_eq!(dst.iter().filter(|item| is_health_row(item)).count(), 1);
+
+        store.set_failed_servers(
+            root,
+            vec![FailedServer {
+                key: "rust".into(),
+                failures: 2,
+                retry_in_secs: 12,
+            }],
+        );
+        store.patch_into(root, &mut dst, &HashSet::new());
+        assert_eq!(count_row(&dst), 1);
+        let warning_index = dst
+            .iter()
+            .position(|item| item.code.as_deref() == Some(SERVER_CODE))
+            .unwrap();
+        let info_index = dst
+            .iter()
+            .position(|item| item.code.as_deref() == Some(SERVER_COUNT_CODE))
+            .unwrap();
+        assert_eq!(dst[warning_index].severity, Severity::Warning);
+        assert_eq!(dst[info_index].severity, Severity::Info);
+        assert!(warning_index < info_index);
+    }
+
+    #[test]
+    fn slot_counts_without_pressure_are_not_stored_and_follow_retain_roots() {
+        let root = Path::new("/r");
+        let mut store = LspDiagnostics::new();
+        store.set_slot_counts(
+            root,
+            LspSlotCounts {
+                live: 3,
+                starting: 0,
+                backing_off: 0,
+            },
+        );
+        assert!(store.is_empty());
+        let mut dst = Vec::new();
+        store.merge_into(root, &mut dst);
+        assert!(!dst.iter().any(is_health_row));
+
+        store.set_slot_counts(
+            root,
+            LspSlotCounts {
+                live: 0,
+                starting: 1,
+                backing_off: 0,
+            },
+        );
+        assert!(!store.is_empty());
+        store.retain_roots(|candidate| candidate != root);
+        assert!(store.is_empty());
+
+        store.set_slot_counts(
+            root,
+            LspSlotCounts {
+                live: 0,
+                starting: 1,
+                backing_off: 0,
+            },
+        );
+        store.set_slot_counts(root, LspSlotCounts::default());
+        assert!(store.is_empty());
     }
 }
