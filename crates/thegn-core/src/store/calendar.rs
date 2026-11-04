@@ -48,6 +48,30 @@ pub struct CalendarSyncRow {
     pub horizon_to_ms: i64,
 }
 
+/// Value-free parser diagnostic counts of the last calendar page applied for one account (schema v100, THE-468).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct CalendarDiagnosticCounts {
+    /// Events quarantined because they could not be safely parsed.
+    pub quarantined_events: i64,
+    /// Events with a time zone that could not be resolved.
+    pub unresolved_zones: i64,
+    /// Other parser diagnostics.
+    pub other: i64,
+    /// Diagnostics omitted after the parser's bounded report filled.
+    pub overflow: i64,
+}
+
+/// Last recorded diagnostics for one calendar account.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CalendarDiagnosticsRow {
+    /// Configured calendar account name.
+    pub account: String,
+    /// Parser diagnostic counts recorded for the last applied page.
+    pub counts: CalendarDiagnosticCounts,
+    /// When the page was applied (`util::now()`).
+    pub recorded_at: i64,
+}
+
 /// Cursor and fetched horizon committed with a calendar page.
 pub struct CalendarCursor<'a> {
     /// Provider identifier for the cached account.
@@ -185,4 +209,14 @@ pub trait CalendarStore {
 
     /// Drop non-recurring events that ended before `before_ms`. Growth bound.
     fn prune_calendar_events(&self, before_ms: i64) -> Result<usize>;
+
+    /// Record the last applied page's diagnostic counts for an account, replacing the previous record.
+    fn put_calendar_diagnostics(
+        &self,
+        account: &str,
+        counts: &CalendarDiagnosticCounts,
+    ) -> Result<()>;
+
+    /// Every recorded account, ordered by account name.
+    fn calendar_diagnostics(&self) -> Result<Vec<CalendarDiagnosticsRow>>;
 }

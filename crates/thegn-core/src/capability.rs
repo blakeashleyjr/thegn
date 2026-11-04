@@ -837,9 +837,13 @@ pub const CATALOG: &[HostCapability] = &[
 /// implemented nor listed here — and when an entry here names something the
 /// surface now implements (stale excuses are removed, never accumulated).
 ///
-/// This table holds ONLY temporary debt. A surface a capability is deliberately
-/// never exposed on (pairing management + shutdown are HTTP + CLI only) is
-/// expressed by narrowing the row's `surfaces` set, not by an excuse here.
+/// Every row also has a typed [`GapDisposition`] in [`GAP_DISPOSITIONS`] (THE-201):
+/// `deferred` debt names the issue that owns it; a `local-only` or `unsafe` row
+/// is a recorded exclusion awaiting the owner's review, after which the row's
+/// surface set is narrowed and the gap deleted. The generated table is
+/// `docs/api/surface-gaps.md`. A surface a capability is deliberately never
+/// exposed on (pairing management + shutdown are HTTP + CLI only) is expressed
+/// by narrowing the row's `surfaces` set, not by an excuse here.
 ///
 /// The table is pinned shrink-only by `test/surface-gaps-ratchet.txt`
 /// (`ratchet_pins_surface_gaps`): adding an excuse fails the build until the
@@ -1375,6 +1379,566 @@ pub const SURFACE_GAPS: &[(&str, Surface, &str)] = &[
     ),
 ];
 
+/// Why a SURFACE_GAPS row is excused (THE-201). Every row has exactly one, in [`GAP_DISPOSITIONS`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GapDisposition {
+    /// Owed: the surface should implement it; `review` is the issue that owns the decision.
+    Deferred { review: &'static str },
+    /// Waiting on another issue.
+    Blocked { on: &'static str },
+    /// Replaced by another capability id on this surface.
+    Superseded { by: &'static str },
+    /// Operates on caller-local files or custody; transport-inappropriate on this surface.
+    LocalOnly,
+    /// Exposing it on this surface would widen trust; not planned.
+    Unsafe,
+}
+
+impl GapDisposition {
+    /// Stable machine code: "deferred", "blocked", "superseded", "local-only", "unsafe".
+    pub fn code(self) -> &'static str {
+        match self {
+            Self::Deferred { .. } => "deferred",
+            Self::Blocked { .. } => "blocked",
+            Self::Superseded { .. } => "superseded",
+            Self::LocalOnly => "local-only",
+            Self::Unsafe => "unsafe",
+        }
+    }
+
+    /// The issue / capability the disposition points at; `None` otherwise.
+    pub fn review(self) -> Option<&'static str> {
+        match self {
+            Self::Deferred { review } => Some(review),
+            Self::Blocked { on } => Some(on),
+            Self::Superseded { by } => Some(by),
+            Self::LocalOnly | Self::Unsafe => None,
+        }
+    }
+}
+
+/// `(capability id, surface, disposition)` for EVERY SURFACE_GAPS row; the set
+/// of `(id, surface)` keys must equal SURFACE_GAPS's
+/// (`gap_dispositions_cover_every_gap_exactly`).
+pub const GAP_DISPOSITIONS: &[(&str, Surface, GapDisposition)] = &[
+    // -- http: dispositions follow the corresponding SURFACE_GAPS rows --
+    (
+        "launch.preset",
+        Surface::Http,
+        GapDisposition::Deferred { review: "THE-201" },
+    ),
+    ("doctor.bundle", Surface::Http, GapDisposition::LocalOnly),
+    (
+        "secret.set",
+        Surface::Http,
+        GapDisposition::Deferred { review: "THE-201" },
+    ),
+    (
+        "secret.rm",
+        Surface::Http,
+        GapDisposition::Deferred { review: "THE-201" },
+    ),
+    (
+        "secret.list",
+        Surface::Http,
+        GapDisposition::Deferred { review: "THE-201" },
+    ),
+    (
+        "secret.migrate",
+        Surface::Http,
+        GapDisposition::Deferred { review: "THE-201" },
+    ),
+    (
+        "secret.audit",
+        Surface::Http,
+        GapDisposition::Deferred { review: "THE-201" },
+    ),
+    (
+        "secret.ssh.rotate",
+        Surface::Http,
+        GapDisposition::Deferred { review: "THE-201" },
+    ),
+    (
+        "program.list",
+        Surface::Http,
+        GapDisposition::Deferred { review: "THE-201" },
+    ),
+    (
+        "project.list",
+        Surface::Http,
+        GapDisposition::Deferred { review: "THE-201" },
+    ),
+    (
+        "program.create",
+        Surface::Http,
+        GapDisposition::Deferred { review: "THE-201" },
+    ),
+    (
+        "project.create",
+        Surface::Http,
+        GapDisposition::Deferred { review: "THE-201" },
+    ),
+    (
+        "program.rename",
+        Surface::Http,
+        GapDisposition::Deferred { review: "THE-201" },
+    ),
+    (
+        "project.rename",
+        Surface::Http,
+        GapDisposition::Deferred { review: "THE-201" },
+    ),
+    (
+        "program.rm",
+        Surface::Http,
+        GapDisposition::Deferred { review: "THE-201" },
+    ),
+    (
+        "project.rm",
+        Surface::Http,
+        GapDisposition::Deferred { review: "THE-201" },
+    ),
+    (
+        "program.assign",
+        Surface::Http,
+        GapDisposition::Deferred { review: "THE-201" },
+    ),
+    (
+        "project.assign",
+        Surface::Http,
+        GapDisposition::Deferred { review: "THE-201" },
+    ),
+    (
+        "program.new_feature",
+        Surface::Http,
+        GapDisposition::Deferred { review: "THE-201" },
+    ),
+    (
+        "project.new_feature",
+        Surface::Http,
+        GapDisposition::Deferred { review: "THE-201" },
+    ),
+    (
+        "containers.list",
+        Surface::Http,
+        GapDisposition::Deferred { review: "THE-201" },
+    ),
+    (
+        "containers.control",
+        Surface::Http,
+        GapDisposition::Deferred { review: "THE-201" },
+    ),
+    (
+        "containers.prune",
+        Surface::Http,
+        GapDisposition::Deferred { review: "THE-201" },
+    ),
+    (
+        "model_proxy.status",
+        Surface::Http,
+        GapDisposition::Deferred { review: "THE-201" },
+    ),
+    (
+        "model_proxy.stats",
+        Surface::Http,
+        GapDisposition::Deferred { review: "THE-201" },
+    ),
+    (
+        "model_proxy.start",
+        Surface::Http,
+        GapDisposition::Deferred { review: "THE-201" },
+    ),
+    (
+        "model_proxy.stop",
+        Surface::Http,
+        GapDisposition::Deferred { review: "THE-201" },
+    ),
+    // -- grpc: dispositions follow the corresponding SURFACE_GAPS rows --
+    (
+        "launch.preset",
+        Surface::Grpc,
+        GapDisposition::Deferred { review: "THE-204" },
+    ),
+    (
+        "mcp_proxy.status",
+        Surface::Grpc,
+        GapDisposition::Deferred { review: "THE-204" },
+    ),
+    (
+        "mcp_proxy.reload",
+        Surface::Grpc,
+        GapDisposition::Deferred { review: "THE-204" },
+    ),
+    ("doctor.bundle", Surface::Grpc, GapDisposition::LocalOnly),
+    (
+        "secret.set",
+        Surface::Grpc,
+        GapDisposition::Deferred { review: "THE-204" },
+    ),
+    (
+        "secret.rm",
+        Surface::Grpc,
+        GapDisposition::Deferred { review: "THE-204" },
+    ),
+    (
+        "secret.list",
+        Surface::Grpc,
+        GapDisposition::Deferred { review: "THE-204" },
+    ),
+    (
+        "secret.migrate",
+        Surface::Grpc,
+        GapDisposition::Deferred { review: "THE-204" },
+    ),
+    (
+        "secret.audit",
+        Surface::Grpc,
+        GapDisposition::Deferred { review: "THE-204" },
+    ),
+    (
+        "secret.ssh.rotate",
+        Surface::Grpc,
+        GapDisposition::Deferred { review: "THE-204" },
+    ),
+    (
+        "program.list",
+        Surface::Grpc,
+        GapDisposition::Deferred { review: "THE-204" },
+    ),
+    (
+        "project.list",
+        Surface::Grpc,
+        GapDisposition::Deferred { review: "THE-204" },
+    ),
+    (
+        "program.create",
+        Surface::Grpc,
+        GapDisposition::Deferred { review: "THE-204" },
+    ),
+    (
+        "project.create",
+        Surface::Grpc,
+        GapDisposition::Deferred { review: "THE-204" },
+    ),
+    (
+        "program.rename",
+        Surface::Grpc,
+        GapDisposition::Deferred { review: "THE-204" },
+    ),
+    (
+        "project.rename",
+        Surface::Grpc,
+        GapDisposition::Deferred { review: "THE-204" },
+    ),
+    (
+        "program.rm",
+        Surface::Grpc,
+        GapDisposition::Deferred { review: "THE-204" },
+    ),
+    (
+        "project.rm",
+        Surface::Grpc,
+        GapDisposition::Deferred { review: "THE-204" },
+    ),
+    (
+        "program.assign",
+        Surface::Grpc,
+        GapDisposition::Deferred { review: "THE-204" },
+    ),
+    (
+        "project.assign",
+        Surface::Grpc,
+        GapDisposition::Deferred { review: "THE-204" },
+    ),
+    (
+        "program.new_feature",
+        Surface::Grpc,
+        GapDisposition::Deferred { review: "THE-204" },
+    ),
+    (
+        "project.new_feature",
+        Surface::Grpc,
+        GapDisposition::Deferred { review: "THE-204" },
+    ),
+    (
+        "issues.list",
+        Surface::Grpc,
+        GapDisposition::Deferred { review: "THE-204" },
+    ),
+    (
+        "issues.get",
+        Surface::Grpc,
+        GapDisposition::Deferred { review: "THE-204" },
+    ),
+    (
+        "issues.update",
+        Surface::Grpc,
+        GapDisposition::Deferred { review: "THE-204" },
+    ),
+    (
+        "issues.comment",
+        Surface::Grpc,
+        GapDisposition::Deferred { review: "THE-204" },
+    ),
+    (
+        "dispatches.list",
+        Surface::Grpc,
+        GapDisposition::Deferred { review: "THE-204" },
+    ),
+    (
+        "dispatches.put",
+        Surface::Grpc,
+        GapDisposition::Deferred { review: "THE-204" },
+    ),
+    (
+        "dispatches.set_status",
+        Surface::Grpc,
+        GapDisposition::Deferred { review: "THE-204" },
+    ),
+    (
+        "worktrees.create",
+        Surface::Grpc,
+        GapDisposition::Deferred { review: "THE-204" },
+    ),
+    (
+        "containers.list",
+        Surface::Grpc,
+        GapDisposition::Deferred { review: "THE-204" },
+    ),
+    (
+        "containers.control",
+        Surface::Grpc,
+        GapDisposition::Deferred { review: "THE-204" },
+    ),
+    (
+        "containers.prune",
+        Surface::Grpc,
+        GapDisposition::Deferred { review: "THE-204" },
+    ),
+    (
+        "sessions.record",
+        Surface::Grpc,
+        GapDisposition::Deferred { review: "THE-204" },
+    ),
+    (
+        "agent.sessions",
+        Surface::Grpc,
+        GapDisposition::Deferred { review: "THE-204" },
+    ),
+    (
+        "model_proxy.status",
+        Surface::Grpc,
+        GapDisposition::Deferred { review: "THE-204" },
+    ),
+    (
+        "model_proxy.stats",
+        Surface::Grpc,
+        GapDisposition::Deferred { review: "THE-204" },
+    ),
+    (
+        "model_proxy.start",
+        Surface::Grpc,
+        GapDisposition::Deferred { review: "THE-204" },
+    ),
+    (
+        "model_proxy.stop",
+        Surface::Grpc,
+        GapDisposition::Deferred { review: "THE-204" },
+    ),
+    // -- mcp: dispositions follow the corresponding SURFACE_GAPS rows --
+    (
+        "sessions.detach",
+        Surface::Mcp,
+        GapDisposition::Deferred { review: "THE-203" },
+    ),
+    (
+        "sessions.resize",
+        Surface::Mcp,
+        GapDisposition::Deferred { review: "THE-203" },
+    ),
+    (
+        "sessions.snapshot",
+        Surface::Mcp,
+        GapDisposition::Deferred { review: "THE-203" },
+    ),
+    (
+        "sessions.split",
+        Surface::Mcp,
+        GapDisposition::Deferred { review: "THE-203" },
+    ),
+    (
+        "worktrees.open",
+        Surface::Mcp,
+        GapDisposition::Deferred { review: "THE-203" },
+    ),
+    (
+        "launch.preset",
+        Surface::Mcp,
+        GapDisposition::Deferred { review: "THE-203" },
+    ),
+    (
+        "git.status",
+        Surface::Mcp,
+        GapDisposition::Deferred { review: "THE-203" },
+    ),
+    (
+        "git.stage",
+        Surface::Mcp,
+        GapDisposition::Deferred { review: "THE-203" },
+    ),
+    (
+        "git.commit",
+        Surface::Mcp,
+        GapDisposition::Deferred { review: "THE-203" },
+    ),
+    (
+        "merge.list",
+        Surface::Mcp,
+        GapDisposition::Deferred { review: "THE-203" },
+    ),
+    (
+        "merge.add",
+        Surface::Mcp,
+        GapDisposition::Deferred { review: "THE-203" },
+    ),
+    (
+        "merge.clear",
+        Surface::Mcp,
+        GapDisposition::Deferred { review: "THE-203" },
+    ),
+    (
+        "pr.status",
+        Surface::Mcp,
+        GapDisposition::Deferred { review: "THE-203" },
+    ),
+    (
+        "calendar.events",
+        Surface::Mcp,
+        GapDisposition::Deferred { review: "THE-203" },
+    ),
+    (
+        "calendar.clocks",
+        Surface::Mcp,
+        GapDisposition::Deferred { review: "THE-203" },
+    ),
+    (
+        "calendar.ingest",
+        Surface::Mcp,
+        GapDisposition::Deferred { review: "THE-203" },
+    ),
+    (
+        "notify.push",
+        Surface::Mcp,
+        GapDisposition::Deferred { review: "THE-203" },
+    ),
+    (
+        "issues.list",
+        Surface::Mcp,
+        GapDisposition::Deferred { review: "THE-203" },
+    ),
+    (
+        "issues.get",
+        Surface::Mcp,
+        GapDisposition::Deferred { review: "THE-203" },
+    ),
+    (
+        "issues.update",
+        Surface::Mcp,
+        GapDisposition::Deferred { review: "THE-203" },
+    ),
+    (
+        "issues.comment",
+        Surface::Mcp,
+        GapDisposition::Deferred { review: "THE-203" },
+    ),
+    (
+        "dispatches.list",
+        Surface::Mcp,
+        GapDisposition::Deferred { review: "THE-203" },
+    ),
+    (
+        "dispatches.put",
+        Surface::Mcp,
+        GapDisposition::Deferred { review: "THE-203" },
+    ),
+    (
+        "dispatches.set_status",
+        Surface::Mcp,
+        GapDisposition::Deferred { review: "THE-203" },
+    ),
+    (
+        "worktrees.create",
+        Surface::Mcp,
+        GapDisposition::Deferred { review: "THE-203" },
+    ),
+    (
+        "containers.list",
+        Surface::Mcp,
+        GapDisposition::Deferred { review: "THE-203" },
+    ),
+    (
+        "containers.control",
+        Surface::Mcp,
+        GapDisposition::Deferred { review: "THE-203" },
+    ),
+    // -- cli: dispositions follow the corresponding SURFACE_GAPS rows --
+    ("search.query", Surface::Cli, GapDisposition::LocalOnly),
+    ("search.replace", Surface::Cli, GapDisposition::LocalOnly),
+    (
+        "containers.list",
+        Surface::Cli,
+        GapDisposition::Deferred { review: "THE-150" },
+    ),
+    (
+        "containers.control",
+        Surface::Cli,
+        GapDisposition::Deferred { review: "THE-150" },
+    ),
+];
+
+/// The disposition of an excused gap; `None` when `(id, s)` is not a gap.
+pub fn gap_disposition(id: &str, s: Surface) -> Option<GapDisposition> {
+    GAP_DISPOSITIONS
+        .iter()
+        .find(|(gap_id, gap_surface, _)| *gap_id == id && *gap_surface == s)
+        .map(|(_, _, disposition)| *disposition)
+}
+
+fn write_surface_gap_doc_row(
+    doc: &mut String,
+    id: &str,
+    surface: &str,
+    disposition: Option<GapDisposition>,
+    reason: &str,
+) {
+    use std::fmt::Write as _;
+
+    let code = disposition.map_or("unclassified", GapDisposition::code);
+    let review = disposition.and_then(GapDisposition::review).unwrap_or("-");
+    writeln!(doc, "| {id} | {surface} | {code} | {review} | {reason} |")
+        .expect("writing a String cannot fail");
+}
+
+/// The generated exclusion document (`docs/api/surface-gaps.md`).
+pub fn render_surface_gaps_doc() -> String {
+    let mut rows: Vec<_> = SURFACE_GAPS
+        .iter()
+        .map(|(id, surface, reason)| {
+            let disposition = gap_disposition(id, *surface);
+            (*id, surface.as_str(), disposition, *reason)
+        })
+        .collect();
+    rows.sort_by_key(|(id, surface, _, _)| (*surface, *id));
+
+    let mut doc = String::from(
+        "# Control-surface gaps\n\nGenerated from `thegn_core::capability::SURFACE_GAPS` and `GAP_DISPOSITIONS` by\n`just ratchet-update`; do not edit by hand. `thegn api coverage` reports the same\ndispositions.\n\nDisposition codes: `deferred` (owed; the review issue owns the decision), `blocked`\n(waiting on the named issue), `superseded` (replaced by the named capability),\n`local-only` (operates on caller-local files or custody), `unsafe` (would widen\ntrust on this surface; not planned).\n\n| Capability | Surface | Disposition | Review | Reason |\n| --- | --- | --- | --- | --- |\n",
+    );
+    for (id, surface, disposition, reason) in rows {
+        write_surface_gap_doc_row(&mut doc, id, surface, disposition, reason);
+    }
+    doc
+}
+
 /// Look a capability up by id.
 pub fn lookup(id: &str) -> Option<&'static HostCapability> {
     CATALOG.iter().find(|c| c.id.0 == id)
@@ -1805,11 +2369,11 @@ mod tests {
         }
     }
 
-    /// Regenerate `test/surface-gaps-ratchet.txt` from `SURFACE_GAPS`, keeping
-    /// the leading comment/blank header. Ignored (run via `just ratchet-update`
-    /// with `THEGN_RATCHET_UPDATE=1`); never adds debt — the pin is the guard.
+    /// Regenerate `test/surface-gaps-ratchet.txt` and `docs/api/surface-gaps.md`.
+    /// Ignored (run via `just ratchet-update` with `THEGN_RATCHET_UPDATE=1`);
+    /// never adds debt — the pin is the guard.
     #[test]
-    #[ignore = "regenerates test/surface-gaps-ratchet.txt; run via `just ratchet-update`"]
+    #[ignore = "regenerates test/surface-gaps-ratchet.txt and docs/api/surface-gaps.md; run via `just ratchet-update`"]
     fn surface_gaps_ratchet_update() {
         if std::env::var_os("THEGN_RATCHET_UPDATE").is_none() {
             return;
@@ -1839,5 +2403,147 @@ mod tests {
             out.push_str(&format!("{id}\t{s}\t{why}\n"));
         }
         std::fs::write(path, out).expect("write surface-gaps-ratchet.txt");
+        let doc_path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../docs/api/surface-gaps.md"
+        );
+        std::fs::write(doc_path, render_surface_gaps_doc())
+            .expect("write docs/api/surface-gaps.md");
+    }
+
+    #[test]
+    fn gap_dispositions_cover_every_gap_exactly() {
+        let gap_keys: BTreeSet<(&str, Surface)> = SURFACE_GAPS
+            .iter()
+            .map(|(id, surface, _)| (*id, *surface))
+            .collect();
+        let disposition_keys: BTreeSet<(&str, Surface)> = GAP_DISPOSITIONS
+            .iter()
+            .map(|(id, surface, _)| (*id, *surface))
+            .collect();
+        let duplicates = GAP_DISPOSITIONS.len() - disposition_keys.len();
+        let missing: Vec<_> = gap_keys.difference(&disposition_keys).collect();
+        let extra: Vec<_> = disposition_keys.difference(&gap_keys).collect();
+        assert_eq!(duplicates, 0, "GAP_DISPOSITIONS has duplicate keys");
+        assert!(missing.is_empty(), "gaps without dispositions: {missing:?}");
+        assert!(extra.is_empty(), "dispositions without gaps: {extra:?}");
+    }
+
+    #[test]
+    fn every_http_gap_has_a_typed_status() {
+        for (id, _, _) in SURFACE_GAPS
+            .iter()
+            .filter(|(_, surface, _)| *surface == Surface::Http)
+        {
+            assert!(
+                gap_disposition(id, Surface::Http).is_some(),
+                "{id} is unclassified"
+            );
+        }
+        assert_eq!(gap_disposition("sessions.list", Surface::Http), None);
+    }
+
+    #[test]
+    fn deferred_and_blocked_dispositions_name_an_issue() {
+        for (_, _, disposition) in GAP_DISPOSITIONS {
+            match disposition {
+                GapDisposition::Deferred { review } | GapDisposition::Blocked { on: review } => {
+                    let digits = review.strip_prefix("THE-").unwrap_or("");
+                    assert!(
+                        !digits.is_empty() && digits.bytes().all(|byte| byte.is_ascii_digit()),
+                        "invalid issue: {review}"
+                    );
+                }
+                GapDisposition::Superseded { by } => {
+                    assert!(lookup(by).is_some(), "unknown superseding capability: {by}");
+                }
+                GapDisposition::LocalOnly | GapDisposition::Unsafe => {}
+            }
+        }
+    }
+
+    #[test]
+    fn disposition_codes_are_stable() {
+        let cases = [
+            (
+                GapDisposition::Deferred { review: "THE-201" },
+                "deferred",
+                Some("THE-201"),
+            ),
+            (
+                GapDisposition::Blocked { on: "THE-204" },
+                "blocked",
+                Some("THE-204"),
+            ),
+            (
+                GapDisposition::Superseded {
+                    by: "sessions.list",
+                },
+                "superseded",
+                Some("sessions.list"),
+            ),
+            (GapDisposition::LocalOnly, "local-only", None),
+            (GapDisposition::Unsafe, "unsafe", None),
+        ];
+        for (disposition, code, review) in cases {
+            assert_eq!(disposition.code(), code);
+            assert_eq!(disposition.review(), review);
+        }
+    }
+
+    #[test]
+    fn surface_gaps_doc_matches_the_table() {
+        type DocRow = (String, String, String, String, String);
+        fn table_rows(doc: &str) -> BTreeSet<DocRow> {
+            doc.lines()
+                .filter(|line| line.starts_with('|'))
+                .skip(1)
+                .filter_map(|line| {
+                    let cells: Vec<_> = line.split('|').skip(1).take(5).map(str::trim).collect();
+                    if cells.len() != 5
+                        || cells
+                            .iter()
+                            .all(|cell| cell.chars().all(|c| c == '-' || c == ' '))
+                    {
+                        return None;
+                    }
+                    Some((
+                        cells[0].to_string(),
+                        cells[1].to_string(),
+                        cells[2].to_string(),
+                        cells[3].to_string(),
+                        cells[4].to_string(),
+                    ))
+                })
+                .collect()
+        }
+
+        const DOC: &str = include_str!("../../../docs/api/surface-gaps.md");
+        assert!(
+            SURFACE_GAPS
+                .iter()
+                .all(|(_, _, reason)| !reason.contains('|'))
+        );
+        assert_eq!(
+            table_rows(DOC),
+            table_rows(&render_surface_gaps_doc()),
+            "regenerate with `just ratchet-update`",
+        );
+    }
+
+    #[test]
+    fn surface_gaps_doc_marks_missing_dispositions_unclassified() {
+        let mut doc = String::new();
+        write_surface_gap_doc_row(
+            &mut doc,
+            "test.capability",
+            "http",
+            None,
+            "missing classification",
+        );
+        assert_eq!(
+            doc, "| test.capability | http | unclassified | - | missing classification |\n",
+            "a gap without a disposition renders as unclassified instead of panicking",
+        );
     }
 }

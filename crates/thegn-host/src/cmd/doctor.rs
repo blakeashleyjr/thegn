@@ -2520,6 +2520,7 @@ fn doctor_json_with_health_and_overrides_and_legacy(
         "remote_control": remote_control_transport_json(cfg),
         "lifecycle_hooks": lifecycle_hooks_json(cfg),
         "worktree_identity": worktree_identity_json(),
+        "calendar_diagnostics": calendar_diagnostics_json(cfg),
         "control_surface_coverage": crate::cmd::api::coverage_json(
             &crate::cmd::api::coverage_report(),
         ),
@@ -2639,6 +2640,84 @@ fn worktree_identity_report() {
         "  resolve       rename one branch from the sidebar (or `git -C <repo> branch -m`) \
          or remove one checkout with `thegn wt rm`; the tab is re-keyed on the next launch"
     );
+}
+
+/// Last persisted calendar parser diagnostics per configured account (THE-468). Read-only: never creates or migrates the state DB.
+fn calendar_diagnostics_json(cfg: &Config) -> serde_json::Value {
+    use thegn_core::store::CalendarStore as _;
+
+    match doctor_db() {
+        DoctorDb::Ready(db) => match db.calendar_diagnostics() {
+            Ok(rows) => serde_json::json!({
+                "state_db": "ok",
+                "accounts": rows
+                    .into_iter()
+                    .filter(|row| cfg.calendar.accounts.iter().any(|account| account.name == row.account))
+                    .map(|row| serde_json::json!({
+                        "account": row.account,
+                        "quarantined_events": row.counts.quarantined_events,
+                        "unresolved_zones": row.counts.unresolved_zones,
+                        "other": row.counts.other,
+                        "overflow": row.counts.overflow,
+                        "recorded_at": row.recorded_at,
+                    }))
+                    .collect::<Vec<_>>(),
+            }),
+            Err(error) => serde_json::json!({
+                "state_db": format!("unavailable: {error}"),
+                "accounts": Vec::<serde_json::Value>::new(),
+            }),
+        },
+        other => serde_json::json!({
+            "state_db": other.describe(),
+            "accounts": Vec::<serde_json::Value>::new(),
+        }),
+    }
+}
+
+fn calendar_diagnostics_report(cfg: &Config) {
+    let report = calendar_diagnostics_json(cfg);
+    outln!("Calendar diagnostics");
+    let Some(state) = report["state_db"].as_str() else {
+        outln!("  state DB      unavailable");
+        return;
+    };
+    if state != "ok" {
+        outln!("  state DB      {state}");
+        return;
+    }
+    let Some(rows) = report["accounts"].as_array() else {
+        outln!("  last pages    no diagnostics recorded");
+        return;
+    };
+    if rows.is_empty() {
+        outln!("  last pages    no diagnostics recorded");
+        return;
+    }
+    for row in rows {
+        let account = row["account"].as_str().unwrap_or("");
+        let name = thegn_core::calendar::display::DisplayText::new(
+            account,
+            thegn_core::calendar::display::Field::Calendar,
+        );
+        let quarantined = row["quarantined_events"].as_i64().unwrap_or(0);
+        let zones = row["unresolved_zones"].as_i64().unwrap_or(0);
+        let other = row["other"].as_i64().unwrap_or(0);
+        let overflow = row["overflow"].as_i64().unwrap_or(0);
+        let total = quarantined
+            .saturating_add(zones)
+            .saturating_add(other)
+            .saturating_add(overflow);
+        outln!(
+            "  {}  {} problem(s) on the last page (quarantined {}, unknown time zone {}, other {}, overflow {})",
+            name.as_str(),
+            total,
+            quarantined,
+            zones,
+            other,
+            overflow
+        );
+    }
 }
 
 fn lifecycle_hooks_report(cfg: &Config) {
@@ -3001,6 +3080,9 @@ pub fn run(
 
     outln!("");
     worktree_identity_report();
+
+    outln!("");
+    calendar_diagnostics_report(cfg);
 
     outln!("");
     lifecycle_hooks_report(cfg);
@@ -6653,6 +6735,58 @@ args = ["--verbose"]
                 && state_db.contains("migrates on the next thegn start"),
             "older schema must be reported as not read until the next thegn start: {state_db}"
         );
+    }
+
+    #[test]
+    fn calendar_diagnostics_json_never_creates_the_state_db() {
+        let state = thegn_core::testenv::IsolatedState::new();
+
+        let report = calendar_diagnostics_json(&Config::default());
+
+        assert_eq!(report["state_db"], "no database yet");
+        assert_eq!(report["accounts"].as_array().unwrap().len(), 0);
+        assert!(!state.state_home().join("thegn/thegn.db").exists());
+        assert!(!state.state_home().join("thegn").exists());
+    }
+
+    #[test]
+    fn calendar_diagnostics_json_reports_configured_accounts_only() {
+        use thegn_core::store::{CalendarDiagnosticCounts, CalendarStore as _};
+
+        let _state = thegn_core::testenv::IsolatedState::new();
+        let db = Db::open().expect("create isolated db");
+        db.put_calendar_diagnostics(
+            "work",
+            &CalendarDiagnosticCounts {
+                quarantined_events: 2,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        db.put_calendar_diagnostics(
+            "gone",
+            &CalendarDiagnosticCounts {
+                other: 1,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        drop(db);
+        let mut cfg = Config::default();
+        cfg.calendar
+            .accounts
+            .push(thegn_core::config_calendar::CalendarAccount {
+                name: "work".into(),
+                ..Default::default()
+            });
+
+        let report = calendar_diagnostics_json(&cfg);
+
+        assert_eq!(report["state_db"], "ok");
+        let accounts = report["accounts"].as_array().unwrap();
+        assert_eq!(accounts.len(), 1);
+        assert_eq!(accounts[0]["account"], "work");
+        assert_eq!(accounts[0]["quarantined_events"], 2);
     }
 
     // Keep the writer connection open so its committed row remains represented

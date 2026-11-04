@@ -28,7 +28,6 @@ use std::collections::BTreeSet;
 const OMITTED: &[(&str, &str)] = &[
     ("window_margin", "terminal geometry is host-specific"),
     ("default_folder", "worktree filing policy is not exposed"),
-    ("confirm_delete", "destructive-action policy is not exposed"),
     ("profile", "profile selection is host-specific"),
     ("keymap_preset", "keymap presets are host-specific"),
     ("accounts", "coding-agent accounts are not exposed"),
@@ -113,15 +112,6 @@ const OMITTED: &[(&str, &str)] = &[
         "program_remap",
         "program-specific key remaps are not exposed",
     ),
-    ("theme.preset", "theme preset selection is not exposed"),
-    ("theme.focus_border", "focus border color is not exposed"),
-    ("theme.pane_padding", "pane padding is not exposed"),
-    ("theme.undercurl", "undercurl policy is not exposed"),
-    ("theme.color", "color fidelity is not exposed"),
-    ("theme.glyphs", "glyph fidelity is not exposed"),
-    ("theme.agent_glyphs", "agent glyph style is not exposed"),
-    ("theme.mascot", "splash mascot is not exposed"),
-    ("theme.mascot_motion", "splash mascot motion is not exposed"),
     ("theme.colors", "surface palette overrides are not exposed"),
     ("theme.hues", "semantic hue overrides are not exposed"),
     (
@@ -605,6 +595,62 @@ fn every_schema_key_is_rendered_or_dispositioned() {
     );
 }
 
+#[test]
+fn hm_theme_family_is_fully_rendered() {
+    let theme = schema_field("theme");
+    let properties = theme["properties"]
+        .as_object()
+        .expect("theme schema properties");
+    let rendered = rendered_paths(&module_src());
+    let mut missing: Vec<String> = properties
+        .keys()
+        .filter(|key| !matches!(key.as_str(), "colors" | "hues"))
+        .filter_map(|key| {
+            let path = format!("theme.{key}");
+            (!rendered.contains(&path)).then_some(path)
+        })
+        .collect();
+    if !rendered.contains("confirm_delete") {
+        missing.push("confirm_delete".to_string());
+    }
+    assert!(
+        missing.is_empty(),
+        "Home Manager must render every scalar theme field and confirm_delete; missing: {missing:?}"
+    );
+}
+
+#[test]
+fn hm_theme_enum_options_offer_only_canonical_spellings() {
+    let expected = [
+        ("themeUndercurl", "theme.undercurl"),
+        ("themeColor", "theme.color"),
+        ("themeGlyphs", "theme.glyphs"),
+        ("themeAgentGlyphs", "theme.agent_glyphs"),
+        ("themeMascot", "theme.mascot"),
+        ("themeMascotMotion", "theme.mascot_motion"),
+    ];
+    let enums = enum_lists(&module_src());
+    for (option, path) in expected {
+        let values = enums
+            .iter()
+            .find(|(name, _)| name == option)
+            .map(|(_, values)| values)
+            .unwrap_or_else(|| panic!("Home Manager enum option `{option}` is missing"));
+        let actual: BTreeSet<&str> = values.iter().map(String::as_str).collect();
+        let schema = schema_field(path);
+        let canonical: BTreeSet<&str> = schema["enum"]
+            .as_array()
+            .unwrap_or_else(|| panic!("destination `{path}` has no enum"))
+            .iter()
+            .filter_map(Value::as_str)
+            .collect();
+        assert_eq!(
+            actual, canonical,
+            "Home Manager enum option `{option}` must expose exactly canonical values for `{path}`"
+        );
+    }
+}
+
 /// Every `config_enum!` in the schema: its accepted spellings (canonical +
 /// aliases), keyed by definition name.
 fn schema_enums() -> Vec<(String, BTreeSet<String>)> {
@@ -718,6 +764,7 @@ fn every_numeric_option_matches_its_destination_range() {
         ("prTtlSecs", "pr.ttl_secs"),
         ("watchPrIntervalSecs", "watch.pr_interval_secs"),
         ("port", "sandbox.remote.port"),
+        ("themePanePadding", "theme.pane_padding"),
     ];
     let options = numeric_options(&module_src());
     let actual_names: BTreeSet<&str> = options.iter().map(|(name, _)| name.as_str()).collect();
@@ -741,6 +788,14 @@ fn every_numeric_option_matches_its_destination_range() {
         if name == "port" {
             assert_eq!(schema.get("format").and_then(Value::as_str), Some("uint16"));
             assert_eq!(nix_type, "lib.types.port", "Nix type for {path}");
+            continue;
+        }
+
+        if schema.get("format").and_then(Value::as_str) == Some("uint16") {
+            assert_eq!(
+                nix_type, "lib.types.ints.u16",
+                "Nix type for uint16 schema field {path}"
+            );
             continue;
         }
 
@@ -785,6 +840,12 @@ fn every_nix_enum_matches_its_destination_enum() {
         ("picker", "picker"),
         ("worktreeMode", "worktree_mode"),
         ("nameScheme", "name_scheme"),
+        ("themeUndercurl", "theme.undercurl"),
+        ("themeColor", "theme.color"),
+        ("themeGlyphs", "theme.glyphs"),
+        ("themeAgentGlyphs", "theme.agent_glyphs"),
+        ("themeMascot", "theme.mascot"),
+        ("themeMascotMotion", "theme.mascot_motion"),
     ];
     let enums = enum_lists(&module_src());
     let actual_names: BTreeSet<&str> = enums.iter().map(|(name, _)| name.as_str()).collect();

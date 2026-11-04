@@ -105,3 +105,83 @@ fn note_page_diagnostics_rearms_after_a_clean_page() {
     );
     assert!(note_page_diagnostics(account, diagnostics).is_some());
 }
+
+#[test]
+fn local_ics_page_diagnostics_are_persisted_for_doctor() {
+    use thegn_core::store::CalendarStore as _;
+
+    let dir = tempfile::tempdir().unwrap();
+    let db = thegn_core::db::Db::open_at(&dir.path().join("thegn.db")).unwrap();
+    let file = dir.path().join("feed.ics");
+    std::fs::write(
+        &file,
+        "BEGIN:VCALENDAR\r\nBEGIN:VEVENT\r\nUID:good\r\nDTSTART:20260821T090000Z\r\nDTEND:20260821T100000Z\r\nEND:VEVENT\r\nBEGIN:VEVENT\r\nUID:nostart\r\nSUMMARY:x\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n",
+    )
+    .unwrap();
+    let cfg = CalendarConfig {
+        accounts: vec![CalendarAccount {
+            name: "diag-persist-local".into(),
+            provider: thegn_core::config_calendar::CalendarProviderKind::Ics,
+            path: file.display().to_string(),
+            ..Default::default()
+        }],
+        ..CalendarConfig::default()
+    };
+    let from = NaiveDate::from_ymd_opt(2026, 8, 1).unwrap();
+    let to = NaiveDate::from_ymd_opt(2026, 8, 31).unwrap();
+    assert!(sync_accounts(&db, &cfg, from, to, true, &mut |_| {}));
+    let rows = db.calendar_diagnostics().unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].account, "diag-persist-local");
+    assert_eq!(rows[0].counts.quarantined_events, 1);
+
+    std::fs::write(
+        &file,
+        "BEGIN:VCALENDAR\r\nBEGIN:VEVENT\r\nUID:good\r\nDTSTART:20260821T090000Z\r\nDTEND:20260821T100000Z\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n",
+    )
+    .unwrap();
+    assert!(sync_accounts(&db, &cfg, from, to, true, &mut |_| {}));
+    assert_eq!(
+        db.calendar_diagnostics().unwrap()[0]
+            .counts
+            .quarantined_events,
+        0
+    );
+}
+
+#[test]
+fn an_unchanged_page_keeps_the_last_persisted_diagnostics() {
+    use thegn_core::store::{CalendarDiagnosticCounts, CalendarStore as _};
+
+    let db = thegn_core::db::Db::open_memory().unwrap();
+    db.put_calendar_diagnostics(
+        "diag-unchanged",
+        &CalendarDiagnosticCounts {
+            quarantined_events: 2,
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    let page = EventPage::unchanged("tok");
+    let window = CalendarWindow::new(
+        NaiveDate::from_ymd_opt(2026, 8, 1).unwrap(),
+        NaiveDate::from_ymd_opt(2026, 8, 31).unwrap(),
+        chrono_tz::Tz::UTC,
+    )
+    .unwrap();
+
+    assert!(!apply_page_with_generation(
+        &db,
+        "diag-unchanged",
+        "ics",
+        &page,
+        window,
+        None,
+    ));
+    assert_eq!(
+        db.calendar_diagnostics().unwrap()[0]
+            .counts
+            .quarantined_events,
+        2
+    );
+}

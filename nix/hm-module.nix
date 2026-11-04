@@ -211,6 +211,7 @@ self: {
     worktree_mode = cfg.worktreeMode;
     name_scheme = cfg.nameScheme;
     auto_remove_worktree = cfg.autoRemoveWorktree;
+    confirm_delete = cfg.confirmDelete;
     agents =
       if cfg.agents == null
       then null
@@ -225,6 +226,15 @@ self: {
       then null
       else map (a: lib.filterAttrs (_: v: v != null) {inherit (a) name key run menu hint;}) cfg.actions;
     theme.accent = cfg.themeAccent;
+    theme.preset = cfg.themePreset;
+    theme.focus_border = cfg.themeFocusBorder;
+    theme.pane_padding = cfg.themePanePadding;
+    theme.undercurl = cfg.themeUndercurl;
+    theme.color = cfg.themeColor;
+    theme.glyphs = cfg.themeGlyphs;
+    theme.agent_glyphs = cfg.themeAgentGlyphs;
+    theme.mascot = cfg.themeMascot;
+    theme.mascot_motion = cfg.themeMascotMotion;
     monitor = {
       system = cfg.monitorSystem;
       gpu = cfg.monitorGpu;
@@ -332,11 +342,73 @@ in {
       description = "Remove the worktree automatically when its pane is closed. Unset (null) = the binary's default.";
     };
 
+    confirmDelete = lib.mkOption {
+      type = lib.types.nullOr (lib.types.bool);
+      default = null;
+      description = "Ask before destructive worktree actions (deleting a worktree from disk via the sidebar). Unset (null) = the binary's default.";
+    };
+
     themeAccent = lib.mkOption {
       type = lib.types.nullOr (lib.types.str);
       default = null;
       example = "#f083ba";
       description = "Focus accent color (#rrggbb) for every thegn surface. Unset (null) = the binary's default.";
+    };
+
+    themePreset = lib.mkOption {
+      type = lib.types.nullOr (lib.types.str);
+      default = null;
+      example = "storm";
+      description = "Built-in palette preset name (for example, prism, storm or nord) or a local theme name from $XDG_CONFIG_HOME/thegn/themes. Unset (null) = the binary's default.";
+    };
+
+    themeFocusBorder = lib.mkOption {
+      type = lib.types.nullOr (lib.types.str);
+      default = null;
+      example = "#6ee7d8";
+      description = "Frame color (#rrggbb) of the focused pane, tab and chrome edge. Unset (null) = the binary's default.";
+    };
+
+    themePanePadding = lib.mkOption {
+      type = lib.types.nullOr (lib.types.ints.u16);
+      default = null;
+      description = "Horizontal cells between a pane's frame and its content, each side. Unset (null) = the binary's default.";
+    };
+
+    themeUndercurl = lib.mkOption {
+      type = lib.types.nullOr (lib.types.enum ["auto" "on" "off"]);
+      default = null;
+      description = "Curly-underline support mode. Unset (null) = the binary's default.";
+    };
+
+    themeColor = lib.mkOption {
+      type = lib.types.nullOr (lib.types.enum ["auto" "truecolor" "256" "16" "none"]);
+      default = null;
+      description = "Color fidelity mode. Unset (null) = the binary's default.";
+    };
+
+    themeGlyphs = lib.mkOption {
+      type = lib.types.nullOr (lib.types.enum ["auto" "unicode" "ascii"]);
+      default = null;
+      description = "Glyph fidelity mode. Unset (null) = the binary's default.";
+    };
+
+    themeAgentGlyphs = lib.mkOption {
+      type = lib.types.nullOr (lib.types.enum ["letter" "symbol" "auto"]);
+      default = null;
+      description = "Sidebar agent marker style. Unset (null) = the binary's default.";
+    };
+
+    themeMascot = lib.mkOption {
+      type = lib.types.nullOr (lib.types.enum ["owl" "knight" "off"]);
+      default = null;
+      description = "Loading-splash mascot. Unset (null) = the binary's default.";
+    };
+
+    themeMascotMotion = lib.mkOption {
+      type = lib.types.nullOr (lib.types.enum ["blink" "still"]);
+      default = null;
+      description = "Splash-mascot motion. Unset (null) = the binary's default.";
     };
 
     monitorSystem = lib.mkOption {

@@ -38,7 +38,8 @@ pub struct ProjectionSpec {
 impl ProjectionSpec {
     /// Stable, domain-separated identity for ownership of this projection.
     /// This is distinct from the mountpoint component: the manifest binds the
-    /// complete operation identity, including mode and the final local path.
+    /// complete operation identity, including mode, non-empty SSH extra args,
+    /// and the final local path. See [`mountpoint`] for the coalescing contract.
     pub fn identity_digest(&self) -> String {
         let mut hasher = Sha256::new();
         hasher.update(b"thegn/projection-identity/v1");
@@ -55,6 +56,16 @@ impl ProjectionSpec {
             hash_projection_option(&mut hasher, b"ssh_config", ssh.ssh_config.as_deref());
             hash_projection_option(&mut hasher, b"jump_host", ssh.jump_host.as_deref());
             hash_projection_option(&mut hasher, b"identity", ssh.identity.as_deref());
+            if !ssh.extra_args.is_empty() {
+                hash_projection_field(
+                    &mut hasher,
+                    b"extra_args_len",
+                    &(ssh.extra_args.len() as u64).to_be_bytes(),
+                );
+                for arg in &ssh.extra_args {
+                    hash_projection_field(&mut hasher, b"extra_arg", arg.as_bytes());
+                }
+            }
         } else {
             hash_projection_field(&mut hasher, b"placement", b"other");
         }
@@ -95,10 +106,16 @@ impl ProjectionSpec {
 /// A stable local mountpoint under `<thegn_dir>/mounts/<readable-prefix>--<digest>`.
 /// The default SSH placement (`port == 22`, no jump host, identity, or ssh
 /// config) retains the v1 host/path hash. Otherwise the digest also includes
-/// those four tagged placement values. Values compare as exact UTF-8 bytes:
-/// DNS aliases, path normalization, and equivalent SSH config semantics do not
-/// coalesce. Transport kind, agent forwarding, and extra SSH args are not part
-/// of this bounded placement identity.
+/// those four tagged placement values. Its coalescing contract is shared with
+/// [`ProjectionSpec::identity_digest`]: transport kind (`ssh` vs `mosh`) and
+/// agent forwarding coalesce in both mountpoint and identity because sshfs and
+/// rsync use plain batch SSH and never forward the agent. Data mode and SSH
+/// extra args coalesce in the mountpoint but differ in identity, so the owner
+/// manifest refuses a second projection with `Mismatch` before any mount,
+/// pull, or push. Host, remote path, and the `ssh_config`/`identity` paths
+/// compare as exact bytes; DNS aliases, path normalization, and config-file
+/// contents do not coalesce. Worktree, profile, and generation are not yet
+/// part of the identity (THE-508).
 pub fn mountpoint(placement: &SshPlacement, remote_path: &str) -> String {
     let component = projection_component(placement, remote_path);
     crate::util::thegn_dir()
@@ -615,5 +632,65 @@ mod tests {
                 .iter()
                 .all(|variant| variant.identity_digest() != digest)
         );
+    }
+
+    #[test]
+    fn projection_identity_digest_covers_extra_args() {
+        let base = ProjectionSpec {
+            mode: DataMode::Sync,
+            placement: Placement::Ssh(ssh_placement()),
+            remote_dir: "/srv/work".into(),
+            mountpoint: "/tmp/mounts/work".into(),
+        };
+        let base_digest = base.identity_digest();
+        let variants = [&["-l", "bob"][..], &["-lbob"][..], &["-l", "alice"][..]].map(|args| {
+            let mut variant = base.clone();
+            let Placement::Ssh(ssh) = &mut variant.placement else {
+                unreachable!()
+            };
+            ssh.extra_args = args.iter().map(|arg| (*arg).to_owned()).collect();
+            variant.identity_digest()
+        });
+
+        assert!(variants.iter().all(|digest| digest != &base_digest));
+        assert_ne!(variants[0], variants[1]);
+        assert_ne!(variants[0], variants[2]);
+        assert_ne!(variants[1], variants[2]);
+    }
+
+    #[test]
+    fn projection_identity_digest_coalesces_pane_transport_and_agent_forwarding() {
+        // Positive control: these pane-only settings already coalesce at base.
+        let base = ProjectionSpec {
+            mode: DataMode::Sync,
+            placement: Placement::Ssh(ssh_placement()),
+            remote_dir: "/srv/work".into(),
+            mountpoint: "/tmp/mounts/work".into(),
+        };
+        let mut mosh = base.clone();
+        let Placement::Ssh(ssh) = &mut mosh.placement else {
+            unreachable!()
+        };
+        ssh.kind = TransportKind::Mosh;
+        assert_eq!(mosh.identity_digest(), base.identity_digest());
+
+        let mut forwarded = base.clone();
+        let Placement::Ssh(ssh) = &mut forwarded.placement else {
+            unreachable!()
+        };
+        ssh.forward_agent = true;
+        assert_eq!(forwarded.identity_digest(), base.identity_digest());
+    }
+
+    #[test]
+    fn projection_mountpoint_coalesces_data_mode_but_not_identity() {
+        // Positive control: the mountpoint formula is intentionally mode-blind.
+        let sshfs =
+            for_environment(&ssh_env(DataMode::Sshfs, "/srv/work")).expect("sshfs projection spec");
+        let sync =
+            for_environment(&ssh_env(DataMode::Sync, "/srv/work")).expect("sync projection spec");
+
+        assert_eq!(sshfs.mountpoint, sync.mountpoint);
+        assert_ne!(sshfs.identity_digest(), sync.identity_digest());
     }
 }

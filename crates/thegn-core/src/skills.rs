@@ -1023,6 +1023,37 @@ mod tests {
     }
 
     #[test]
+    fn pipeline_skill_passes_the_lease_generation_to_lead_mutations() {
+        let pipeline = EMBEDDED_MANIFEST
+            .iter()
+            .find(|entry| entry.name == "pipeline")
+            .expect("pipeline skill is embedded")
+            .document;
+        let collapsed = pipeline.split_whitespace().collect::<Vec<_>>().join(" ");
+        let monitor = pipeline
+            .split("## 4. The monitor owns the watch loop")
+            .nth(1)
+            .and_then(|section| section.split("## 5.").next())
+            .expect("monitor section exists")
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ");
+        let lease_section = pipeline
+            .split("## 1a. Hold the Lead lease")
+            .nth(1)
+            .and_then(|section| section.split("## 1.").next())
+            .expect("lease section exists");
+
+        assert!(collapsed.contains(
+            "--owner \"<recorded lease owner>\" --lease-gen \"<recorded lease generation>\""
+        ));
+        assert!(monitor.contains("--owner \"$lease_owner\" --lease-gen \"$lease_gen\""));
+        assert!(lease_section.contains("generation"));
+        assert!(lease_section.contains("5..86400"));
+        assert!(lease_section.contains("\"acquired\": false"));
+    }
+
+    #[test]
     fn pipeline_skill_states_the_recovery_trust_model() {
         let pipeline = EMBEDDED_MANIFEST
             .iter()

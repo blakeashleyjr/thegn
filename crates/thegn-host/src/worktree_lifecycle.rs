@@ -1332,9 +1332,9 @@ pub fn create_failure_after_add(
     if add.destination_preexisted {
         return format!("{primary}; the existing destination was left untouched");
     }
-    if add.lock_unavailable || add.rename_journal_pending {
-        // Nothing was mutated, and a concurrent create or unreconciled rename
-        // may own repository state: rollback could destroy another checkout.
+    if add.lock_unavailable || add.rename_journal_pending || add.branch_probe_failed {
+        // Nothing was mutated, or the branch's prior existence is unknown:
+        // rollback could destroy another checkout or a pre-existing branch.
         return format!("{primary}; nothing was created, so nothing was rolled back");
     }
     create_failure_with_add_state(
@@ -2762,6 +2762,34 @@ mod tests {
             destination_preexisted: false,
             lock_unavailable: false,
             rename_journal_pending: true,
+            branch_probe_failed: false,
+        };
+
+        let result = create_failure_after_add(
+            "create failed",
+            &Config::default(),
+            Path::new("/not-a-git-repository"),
+            worktree.path(),
+            "feat",
+            &add,
+        );
+
+        assert!(result.ends_with("nothing was created, so nothing was rolled back"));
+        assert_eq!(std::fs::read(&sentinel).unwrap(), b"preserve");
+    }
+
+    #[test]
+    fn add_failure_branch_probe_refusal_runs_no_rollback() {
+        let worktree = tempfile::tempdir().unwrap();
+        let sentinel = worktree.path().join("sentinel");
+        std::fs::write(&sentinel, b"preserve").unwrap();
+        let add = thegn_core::worktree::AddError {
+            message: "branch probe failed".into(),
+            branch_created: false,
+            destination_preexisted: false,
+            lock_unavailable: false,
+            rename_journal_pending: false,
+            branch_probe_failed: true,
         };
 
         let result = create_failure_after_add(

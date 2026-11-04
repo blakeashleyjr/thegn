@@ -5166,6 +5166,11 @@ pub fn identify_orphans(active_worktrees: &[String], containers: &[String]) -> V
     // Reconcile by reverse-mapping each candidate back to a worktree slug rather
     // than allow-listing exact names: profile, sidecar, and service containers
     // must not be misread as orphans and force-removed while their worktree lives.
+    // Try the unstripped name first because a real worktree slug may end in a
+    // companion suffix. This check can only add keeps; names without a companion
+    // suffix keep the existing behavior. If that aliases one worktree's main
+    // container and another's companion, keep it (fail-closed over-keep),
+    // never remove it.
     // Reaping is fail-closed: any container that maps to an active worktree by any
     // of these forms is kept.
     let active_bases: Vec<Vec<String>> = active_worktrees
@@ -5177,10 +5182,44 @@ pub fn identify_orphans(active_worktrees: &[String], containers: &[String]) -> V
         })
         .collect();
 
+    let maps_to_active = |rest: &str| -> bool {
+        active_bases.iter().any(|bases| {
+            bases.iter().any(|base| {
+                if rest == base || rest.ends_with(&format!("-{base}")) {
+                    return true;
+                }
+                let suffix = rest.strip_prefix(base).or_else(|| {
+                    rest.find(&format!("-{base}"))
+                        .map(|index| &rest[index + base.len() + 1..])
+                });
+                let Some(suffix) = suffix else {
+                    return false;
+                };
+                let Some(separator) = suffix.chars().next().filter(|ch| *ch == '-' || *ch == '_')
+                else {
+                    return false;
+                };
+                let service_and_replica = &suffix[separator.len_utf8()..];
+                let Some((service, replica)) = service_and_replica.rsplit_once(separator) else {
+                    return false;
+                };
+                // Known fail-closed over-keep: dead `wt-feat-fix-2` can look
+                // like service `fix` replica 2 while live `wt-feat` exists.
+                !service.is_empty()
+                    && !replica.is_empty()
+                    && replica.bytes().all(|byte| byte.is_ascii_digit())
+            })
+        })
+    };
+
     containers
         .iter()
         .filter(|c| c.starts_with(CONTAINER_PREFIX))
         .filter(|c| {
+            let raw = c.strip_prefix(CONTAINER_PREFIX).unwrap_or(c.as_str());
+            if maps_to_active(raw) {
+                return false;
+            }
             // Strip the companion suffixes to get the worktree/profile container
             // base (`thegn-{slug}` or `thegn-{profile}-{slug}`).
             let base = strip_vpn_suffix(strip_agent_suffix(c));
@@ -5189,35 +5228,7 @@ pub fn identify_orphans(active_worktrees: &[String], containers: &[String]) -> V
             };
             // Keep plain/profile bases and service-replica suffixes for every
             // active slug; unknown forms remain eligible for orphan cleanup.
-            !active_bases.iter().any(|bases| {
-                bases.iter().any(|base| {
-                    if rest == base || rest.ends_with(&format!("-{base}")) {
-                        return true;
-                    }
-                    let suffix = rest.strip_prefix(base).or_else(|| {
-                        rest.find(&format!("-{base}"))
-                            .map(|index| &rest[index + base.len() + 1..])
-                    });
-                    let Some(suffix) = suffix else {
-                        return false;
-                    };
-                    let Some(separator) =
-                        suffix.chars().next().filter(|ch| *ch == '-' || *ch == '_')
-                    else {
-                        return false;
-                    };
-                    let service_and_replica = &suffix[separator.len_utf8()..];
-                    let Some((service, replica)) = service_and_replica.rsplit_once(separator)
-                    else {
-                        return false;
-                    };
-                    // Known fail-closed over-keep: dead `wt-feat-fix-2` can look
-                    // like service `fix` replica 2 while live `wt-feat` exists.
-                    !service.is_empty()
-                        && !replica.is_empty()
-                        && replica.bytes().all(|byte| byte.is_ascii_digit())
-                })
-            })
+            !maps_to_active(rest)
         })
         .cloned()
         .collect()
