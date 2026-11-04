@@ -1,0 +1,42 @@
+{
+  "view": {
+    "state_scope": "synthetic-gallery",
+    "revision": 1,
+    "status": "Synthetic fixture · no accounts or network",
+    "root": {
+      "kind": "weighted_split", "id": "root", "vertical": false,
+      "children": [
+        {"weight": 1, "min_size": 22, "widget": {
+          "kind": "tree", "id": "navigation", "title": "Locations", "multiple": true,
+          "items": [
+            {"id": "group", "label": "Saved locations", "parent": null, "expanded": true},
+            {"id": "berlin", "label": "Berlin", "parent": "group"},
+            {"id": "tokyo", "label": "Tokyo", "parent": "group"}
+          ], "actions": [{"id": "compare", "label": "Compare selection"}]
+        }},
+        {"weight": 2, "min_size": 32, "widget": {
+          "kind": "form", "id": "editor", "instance": "editor-1", "title": "Grapheme editor",
+          "fields": [
+            {"id": "name", "label": "Name", "value": "Café 👩‍💻", "required": true},
+            {"id": "notes", "label": "Notes", "value": "First line\nSecond line", "multiline": true},
+            {"id": "units", "label": "Units", "kind": "choice", "value": "metric", "choices": [
+              {"id": "metric", "label": "Metric", "value": "metric"},
+              {"id": "imperial", "label": "Imperial", "value": "imperial"}
+            ]},
+            {"id": "enabled", "label": "Enabled", "kind": "toggle", "value": "true"}
+          ], "submit": "Save locally"
+        }},
+        {"weight": 2, "min_size": 26, "widget": {
+          "kind": "table", "id": "forecast", "title": "Forecast", "multiple": true,
+          "columns": [
+            {"id": "day", "label": "Local day", "width": 12, "sortable": true},
+            {"id": "temperature", "label": "High °C", "width": null, "sortable": true}
+          ],
+          "rows": [{"id": "day-1", "cells": ["Monday", "21"]}, {"id": "day-2", "cells": ["Tuesday", "23"]}],
+          "actions": [{"id": "inspect", "label": "Inspect"}, {"id": "disabled", "label": "Unavailable", "disabled": true, "disabled_reason": "Fixture only"}]
+        }}
+      ]
+    }
+  },
+  "inputs": []
+}
