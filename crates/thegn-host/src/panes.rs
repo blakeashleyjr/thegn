@@ -86,6 +86,10 @@ enum DaemonFallback {
     Spawn,
     /// A saved daemon session could not be reattached; the pane is a fresh shell.
     Reattach,
+    /// SSH-over-WebSocket attach failed; the pane took the next launch path.
+    SshOverWss,
+    /// Native provider-exec attach failed; the pane took the standard launch path.
+    NativeExec,
 }
 
 impl DaemonFallback {
@@ -93,19 +97,25 @@ impl DaemonFallback {
         match self {
             DaemonFallback::Spawn => 0,
             DaemonFallback::Reattach => 1,
+            DaemonFallback::SshOverWss => 2,
+            DaemonFallback::NativeExec => 3,
         }
     }
 }
 
 /// At most one notice per fallback kind per process: a burst of N panes must not raise N notifications.
-static DAEMON_FALLBACK_NOTED: [std::sync::atomic::AtomicBool; 2] = [
+const DAEMON_FALLBACK_KINDS: usize = 4;
+
+static DAEMON_FALLBACK_NOTED: [std::sync::atomic::AtomicBool; DAEMON_FALLBACK_KINDS] = [
+    std::sync::atomic::AtomicBool::new(false),
+    std::sync::atomic::AtomicBool::new(false),
     std::sync::atomic::AtomicBool::new(false),
     std::sync::atomic::AtomicBool::new(false),
 ];
 
 /// True the first time `kind` is claimed on `flags`.
 fn claim_daemon_fallback_notice(
-    flags: &[std::sync::atomic::AtomicBool; 2],
+    flags: &[std::sync::atomic::AtomicBool; DAEMON_FALLBACK_KINDS],
     kind: DaemonFallback,
 ) -> bool {
     !flags[kind.slot()].swap(true, std::sync::atomic::Ordering::Relaxed)
@@ -119,6 +129,12 @@ fn daemon_fallback_notice(kind: DaemonFallback, line: &str) -> String {
         ),
         DaemonFallback::Reattach => format!(
             "could not reattach a saved pane session: {line}; opened a fresh pane instead (its previous process and scrollback are not restored)"
+        ),
+        DaemonFallback::SshOverWss => format!(
+            "SSH-over-WebSocket attach failed: {line}; this pane fell back to the next launch path and may not be connected to the remote environment"
+        ),
+        DaemonFallback::NativeExec => format!(
+            "provider exec attach failed: {line}; this pane fell back to the standard launch path and may not be connected to the remote session"
         ),
     }
 }
@@ -1241,7 +1257,8 @@ impl Panes {
                         continue;
                     }
                     Err(e) => {
-                        tracing::warn!(target: "thegn::startup", "ssh-over-wss spawn failed, falling back: {e}");
+                        tracing::warn!(target: "thegn::startup", "ssh-over-wss spawn failed, falling back: {}", spawn_failure_line(&e));
+                        note_daemon_fallback(DaemonFallback::SshOverWss, worktree, &e);
                     }
                 }
             }
@@ -1327,6 +1344,7 @@ impl Panes {
                     Err(e) => {
                         let line = spawn_failure_line(&e);
                         tracing::warn!(target: "thegn::startup", "native exec spawn failed, falling back: {line}");
+                        note_daemon_fallback(DaemonFallback::NativeExec, worktree, &e);
                     }
                 }
             }
@@ -2184,13 +2202,28 @@ mod tests {
         let reattach = daemon_fallback_notice(DaemonFallback::Reattach, &line);
         assert!(reattach.contains("fresh pane"));
         assert!(!reattach.contains("ghp_secret"));
+
+        let ssh_over_wss = daemon_fallback_notice(DaemonFallback::SshOverWss, &line);
+        assert!(ssh_over_wss.contains("SSH-over-WebSocket"));
+        assert!(ssh_over_wss.contains("connect refused"));
+        assert!(!ssh_over_wss.contains("ghp_secret"));
+
+        let native_exec = daemon_fallback_notice(DaemonFallback::NativeExec, &line);
+        assert!(native_exec.contains("provider exec"));
+        assert!(native_exec.contains("connect refused"));
+        assert!(!native_exec.contains("ghp_secret"));
     }
 
     #[test]
     fn daemon_fallback_notice_is_claimed_once_per_kind() {
         use std::sync::atomic::AtomicBool;
 
-        let flags = [AtomicBool::new(false), AtomicBool::new(false)];
+        let flags = [
+            AtomicBool::new(false),
+            AtomicBool::new(false),
+            AtomicBool::new(false),
+            AtomicBool::new(false),
+        ];
         assert!(claim_daemon_fallback_notice(&flags, DaemonFallback::Spawn));
         assert!(!claim_daemon_fallback_notice(&flags, DaemonFallback::Spawn));
         assert!(claim_daemon_fallback_notice(
@@ -2201,6 +2234,37 @@ mod tests {
             &flags,
             DaemonFallback::Reattach
         ));
+        assert!(claim_daemon_fallback_notice(
+            &flags,
+            DaemonFallback::SshOverWss
+        ));
+        assert!(!claim_daemon_fallback_notice(
+            &flags,
+            DaemonFallback::SshOverWss
+        ));
+        assert!(claim_daemon_fallback_notice(
+            &flags,
+            DaemonFallback::NativeExec
+        ));
+        assert!(!claim_daemon_fallback_notice(
+            &flags,
+            DaemonFallback::NativeExec
+        ));
+    }
+
+    #[test]
+    fn daemon_fallback_notice_kinds_use_distinct_latch_slots() {
+        let kinds = [
+            DaemonFallback::Spawn,
+            DaemonFallback::Reattach,
+            DaemonFallback::SshOverWss,
+            DaemonFallback::NativeExec,
+        ];
+
+        for (expected, kind) in kinds.into_iter().enumerate() {
+            assert_eq!(kind.slot(), expected);
+            assert!(kind.slot() < DAEMON_FALLBACK_KINDS);
+        }
     }
 
     #[test]
