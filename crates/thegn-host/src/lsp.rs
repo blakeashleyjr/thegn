@@ -155,6 +155,17 @@ fn start_backoff(failures: u32) -> Instant {
 /// a per-worktree instance.
 type ClientMap = HashMap<(PathBuf, String), ClientSlot>;
 
+/// One language server whose start failed and is inside its backoff window.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FailedServer {
+    /// Registry key (for example `rust`), untrusted text: sanitize before display.
+    pub key: String,
+    /// Consecutive failed starts recorded on the slot.
+    pub failures: u32,
+    /// Whole seconds until the next start attempt is allowed (at least 1).
+    pub retry_in_secs: u64,
+}
+
 /// The client map plus the worktree-root set it was last reconciled against.
 /// Both live under one lock so a request for a root that was just closed can
 /// never respawn a server behind a reconcile.
@@ -660,6 +671,34 @@ impl LspInner {
         removed_count
     }
 
+    /// Read-only, NON-BLOCKING snapshot of `root`'s servers that are backing off after a failed start. `None` when the map lock is
+    /// busy (a spawn bookkeeping step or reconcile holds it) or poisoned: the caller keeps what it last showed. Only `Failed` slots whose
+    /// deadline is still in the future are reported; `Live`, `Starting` and `Unavailable` ("no server installed") slots are not.
+    /// Sorted by key and bounded by `limits::MAX_SERVERS_PER_ROOT`.
+    pub fn failed_servers(&self, root: &Path) -> Option<Vec<FailedServer>> {
+        let state = self.clients.try_lock().ok()?;
+        let now = Instant::now();
+        let mut out: Vec<FailedServer> = state
+            .map
+            .iter()
+            .filter(|((slot_root, _), _)| slot_root == root)
+            .filter_map(|((_, key), slot)| match slot {
+                ClientSlot::Failed { until, failures } if now < *until => Some(FailedServer {
+                    key: key.clone(),
+                    failures: *failures,
+                    retry_in_secs: until
+                        .saturating_duration_since(now)
+                        .as_secs()
+                        .saturating_add(1),
+                }),
+                _ => None,
+            })
+            .collect();
+        out.sort_by(|a, b| a.key.cmp(&b.key));
+        out.truncate(limits::MAX_SERVERS_PER_ROOT);
+        Some(out)
+    }
+
     /// Retire every server (and negative-cache slot) whose worktree is no
     /// longer in `live_roots`, releasing registry capacity; subprocess
     /// teardown happens on a worker thread. This only briefly takes the map
@@ -1080,6 +1119,8 @@ pub struct LspDiagnostics {
     /// A stream's loss could not even be recorded (stream table full). Ends
     /// when no loss remains anywhere.
     loss_overflow: bool,
+    /// Backing-off servers per root, refreshed by the loop at hydration apply; empty entries are never stored.
+    servers: HashMap<PathBuf, Vec<FailedServer>>,
 }
 
 #[derive(Debug, Default)]
@@ -1146,6 +1187,10 @@ const MAX_LOSS_MARK_BYTES: usize = 1024 * 1024;
 const MAX_LOSS_STREAMS: usize = 2 * limits::MAX_ROOTS * limits::MAX_SERVERS_PER_ROOT;
 /// Per-document loss rows shown for one root (the summary counts them all).
 const MAX_LOSS_ROWS: usize = 64;
+/// Diagnostic code identifying warnings for servers backing off after failed starts.
+const SERVER_CODE: &str = "thegn-lsp-server";
+/// Maximum backing-off server warning rows shown for one root.
+const MAX_SERVER_ROWS: usize = limits::MAX_SERVERS_PER_ROOT;
 
 /// Owned bytes of one loss entry (its stream key plus the empty set).
 fn loss_entry_bytes(stream: &StoreStreamKey) -> usize {
@@ -1165,7 +1210,8 @@ fn loss_document_bytes(path: &str) -> usize {
 }
 
 fn is_health_row(item: &DiagnosticItem) -> bool {
-    item.source == HEALTH_SOURCE && item.code.as_deref() == Some(HEALTH_CODE)
+    item.source == HEALTH_SOURCE
+        && matches!(item.code.as_deref(), Some(HEALTH_CODE) | Some(SERVER_CODE))
 }
 
 fn severity_rank(item: &DiagnosticItem) -> u8 {
@@ -1377,10 +1423,42 @@ impl LspDiagnostics {
         }
     }
 
+    /// Every health row for `root`: the loss rows, then one warning per backing-off server.
+    fn health_rows(&self, root: &Path) -> Vec<DiagnosticItem> {
+        let mut rows = self.loss_rows(root);
+        rows.extend(self.server_rows(root));
+        rows
+    }
+
+    /// One bounded warning per server backing off after a failed start (see [`LspInner::failed_servers`]).
+    /// The retry countdown is a snapshot refreshed at hydration apply, so it may be stale between hydrations.
+    fn server_rows(&self, root: &Path) -> Vec<DiagnosticItem> {
+        self.servers
+            .get(root)
+            .into_iter()
+            .flatten()
+            .take(MAX_SERVER_ROWS)
+            .map(|server| DiagnosticItem {
+                file: String::new(),
+                line: 0,
+                col: None,
+                severity: Severity::Warning,
+                message: format!(
+                    "LSP server {} failed to start ({} failure(s)); retrying in {}s",
+                    thegn_svc::lsp::sanitize_for_terminal(&server.key),
+                    server.failures,
+                    server.retry_in_secs
+                ),
+                source: HEALTH_SOURCE.to_string(),
+                code: Some(SERVER_CODE.to_string()),
+            })
+            .collect()
+    }
+
     /// The loss rows for `root`: nothing while the root has no active loss;
     /// otherwise a bounded summary plus up to `MAX_LOSS_ROWS` per-document
     /// rows naming the files whose shown diagnostics are out of date.
-    fn health_rows(&self, root: &Path) -> Vec<DiagnosticItem> {
+    fn loss_rows(&self, root: &Path) -> Vec<DiagnosticItem> {
         if self.active_loss(root) == 0 {
             return Vec::new();
         }
@@ -1473,6 +1551,7 @@ impl LspDiagnostics {
         self.by_root.retain(|root, _| keep(root));
         self.retained_bytes = self.retained_bytes.saturating_sub(removed);
         self.loss.retain(|key, _| keep(&key.root));
+        self.servers.retain(|root, _| keep(root));
         self.settle_loss();
     }
 
@@ -1519,11 +1598,22 @@ impl LspDiagnostics {
 
     #[allow(dead_code)] // exercised by tests; the loop-side caller was removed
     pub fn is_empty(&self) -> bool {
-        self.by_root.is_empty() && self.loss.is_empty() && !self.loss_overflow
+        self.by_root.is_empty()
+            && self.loss.is_empty()
+            && !self.loss_overflow
+            && self.servers.is_empty()
     }
 
     pub fn record_health(&mut self, health: LspHealth) {
         self.health.saturating_add(health);
+    }
+
+    pub fn set_failed_servers(&mut self, root: &Path, servers: Vec<FailedServer>) {
+        if servers.is_empty() {
+            self.servers.remove(root);
+        } else {
+            self.servers.insert(root.to_path_buf(), servers);
+        }
     }
 
     /// Documents whose latest publication the bus had to drop (health was
@@ -3690,5 +3780,160 @@ mod tests {
         }]);
         let removed = changed_registry_keys(&old_with_zig, &old);
         assert_eq!(removed, HashSet::from(["zig".into()]));
+    }
+
+    #[test]
+    fn slot_health_lists_only_in_window_failed_slots_of_the_root() {
+        let (inner, _rx) = enabled_inner();
+        let now = Instant::now();
+        {
+            let mut state = inner.clients.lock().unwrap();
+            state.map.insert(
+                (PathBuf::from("/r"), "rust".into()),
+                ClientSlot::Failed {
+                    until: now + Duration::from_secs(30),
+                    failures: 2,
+                },
+            );
+            state.map.insert(
+                (PathBuf::from("/r"), "go".into()),
+                ClientSlot::Failed {
+                    until: now - Duration::from_secs(1),
+                    failures: 1,
+                },
+            );
+            state
+                .map
+                .insert((PathBuf::from("/r"), "zig".into()), ClientSlot::Unavailable);
+            state.map.insert(
+                (PathBuf::from("/r"), "py".into()),
+                ClientSlot::Starting {
+                    cell: Arc::new(StartCell::new()),
+                    generation: 1,
+                },
+            );
+            state.map.insert(
+                (PathBuf::from("/other"), "rust".into()),
+                ClientSlot::Failed {
+                    until: now + Duration::from_secs(30),
+                    failures: 5,
+                },
+            );
+        }
+
+        let servers = inner.failed_servers(Path::new("/r")).unwrap();
+        assert_eq!(servers.len(), 1);
+        assert_eq!(servers[0].key, "rust");
+        assert_eq!(servers[0].failures, 2);
+        assert!((1..=31).contains(&servers[0].retry_in_secs));
+        assert_eq!(inner.failed_servers(Path::new("/nowhere")), Some(vec![]));
+    }
+
+    #[test]
+    fn slot_health_snapshot_never_blocks_on_a_held_map_lock() {
+        let (inner, _rx) = enabled_inner();
+        let guard = inner.clients.lock().unwrap();
+        assert!(inner.failed_servers(Path::new("/r")).is_none());
+        drop(guard);
+        assert_eq!(inner.failed_servers(Path::new("/r")), Some(vec![]));
+    }
+
+    #[test]
+    fn slot_health_rows_survive_merge_and_patch_without_duplication() {
+        let root = Path::new("/r");
+        let mut store = LspDiagnostics::new();
+        store.set_failed_servers(
+            root,
+            vec![FailedServer {
+                key: "rust".into(),
+                failures: 2,
+                retry_in_secs: 12,
+            }],
+        );
+        let mut dst = Vec::new();
+        store.merge_into(root, &mut dst);
+        let server_row_count = |items: &[DiagnosticItem]| {
+            items
+                .iter()
+                .filter(|item| {
+                    item.source == "lsp:health" && item.code.as_deref() == Some("thegn-lsp-server")
+                })
+                .count()
+        };
+        assert_eq!(server_row_count(&dst), 1);
+        let row = dst
+            .iter()
+            .find(|item| item.code.as_deref() == Some(SERVER_CODE))
+            .unwrap();
+        assert_eq!(row.severity, Severity::Warning);
+        assert!(row.message.contains("rust"));
+        assert!(row.message.contains("retrying in 12s"));
+
+        store.patch_into(root, &mut dst, &HashSet::new());
+        store.patch_into(root, &mut dst, &HashSet::new());
+        assert_eq!(server_row_count(&dst), 1);
+
+        let mut other = Vec::new();
+        store.merge_into(Path::new("/other"), &mut other);
+        assert_eq!(server_row_count(&other), 0);
+
+        assert!(
+            store
+                .apply(pd(
+                    "/r",
+                    "/r/src/lib.rs",
+                    vec![diag(5, LspSeverity::Error, "boom")],
+                ))
+                .is_some()
+        );
+        store.merge_into(root, &mut dst);
+        assert_eq!(server_row_count(&dst), 1);
+        assert!(dst.iter().any(|item| item.file == "src/lib.rs"));
+    }
+
+    #[test]
+    fn slot_health_rows_clear_and_follow_retain_roots() {
+        let root = Path::new("/r");
+        let server = FailedServer {
+            key: "rust".into(),
+            failures: 1,
+            retry_in_secs: 5,
+        };
+        let mut store = LspDiagnostics::new();
+        store.set_failed_servers(root, vec![server.clone()]);
+        assert!(!store.is_empty());
+        store.set_failed_servers(root, vec![]);
+        assert!(store.is_empty());
+        let mut dst = Vec::new();
+        store.merge_into(root, &mut dst);
+        assert!(!dst.iter().any(is_health_row));
+
+        store.set_failed_servers(root, vec![server]);
+        assert!(!store.is_empty());
+        store.retain_roots(|candidate| candidate != root);
+        assert!(store.is_empty());
+        store.merge_into(root, &mut dst);
+        assert!(!dst.iter().any(is_health_row));
+    }
+
+    #[test]
+    fn slot_health_row_sanitizes_the_server_key() {
+        let mut store = LspDiagnostics::new();
+        store.set_failed_servers(
+            Path::new("/r"),
+            vec![FailedServer {
+                key: "ru\u{1b}]0;evil\u{7}st".into(),
+                failures: 1,
+                retry_in_secs: 5,
+            }],
+        );
+        let mut dst = Vec::new();
+        store.merge_into(Path::new("/r"), &mut dst);
+        let row = dst
+            .iter()
+            .find(|item| item.code.as_deref() == Some(SERVER_CODE))
+            .unwrap();
+        assert!(!row.message.contains('\u{1b}'));
+        assert!(!row.message.contains('\u{7}'));
     }
 }
