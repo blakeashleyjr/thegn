@@ -4439,12 +4439,11 @@ mod tests {
         let first = flights
             .enter(key.clone(), std::time::Duration::from_secs(60))
             .await
-            .ok()
             .expect("first");
         let waiter = flights.enter(key.clone(), std::time::Duration::from_secs(60));
         tokio::pin!(waiter);
         assert!(
-            tokio::time::timeout(std::time::Duration::from_millis(50), &mut waiter)
+            tokio::time::timeout(std::time::Duration::from_millis(300), &mut waiter)
                 .await
                 .is_err(),
             "the second entry stays parked while the first owns the key"
@@ -4460,7 +4459,6 @@ mod tests {
         let first = flights
             .enter(key.clone(), std::time::Duration::from_secs(60))
             .await
-            .ok()
             .expect("first");
         let busy = flights
             .enter(key.clone(), std::time::Duration::from_millis(30))
@@ -4484,7 +4482,6 @@ mod tests {
                 std::time::Duration::from_secs(60),
             )
             .await
-            .ok()
             .expect("first");
         assert!(
             flights
@@ -4516,7 +4513,6 @@ mod tests {
                 std::time::Duration::from_secs(60),
             )
             .await
-            .ok()
             .expect("first");
         drop(first);
         let second = flights
@@ -4525,7 +4521,6 @@ mod tests {
                 std::time::Duration::from_secs(60),
             )
             .await
-            .ok()
             .expect("second");
         assert_eq!(flights.slot_count(), 1);
         drop(second);
@@ -4568,7 +4563,6 @@ mod tests {
                 std::time::Duration::from_secs(60),
             )
             .await
-            .ok()
             .expect("flight");
         let text = (0..8)
             .map(|line| format!("line {line}\n"))
@@ -4577,18 +4571,22 @@ mod tests {
             thegn_core::ci_log::CiLogEntry::new(cache_key, "1", "2", "job", &text, 8, 4096, 10);
         entry.head_sha = "known-head".into();
         let call = service.ci_logs(worktree.path().to_str().unwrap(), "1", "2", Some(20));
-        let fill = async {
-            service
-                .with_db(move |db| {
-                    use thegn_core::store::CacheStore;
-                    db.put_ci_log(&entry)
-                })
+        tokio::pin!(call);
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(300), &mut call)
                 .await
-                .unwrap();
-            drop(held);
-        };
-        let (reply, ()) = tokio::join!(call, fill);
-        let reply = reply.unwrap();
+                .is_err(),
+            "ci.logs must remain pending while another request owns this job's flight"
+        );
+        service
+            .with_db(move |db| {
+                use thegn_core::store::CacheStore;
+                db.put_ci_log(&entry)
+            })
+            .await
+            .unwrap();
+        drop(held);
+        let reply = call.await.unwrap();
         assert_eq!(reply.source, "cache");
         assert_eq!(reply.logs.len(), 1);
         let served = reply.logs[0]["text"].as_str().unwrap();
