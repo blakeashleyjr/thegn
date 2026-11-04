@@ -4,7 +4,7 @@
 //! user action. The workers communicate through a bounded-output channel and
 //! pulse the terminal waker; no process or blocking operation runs on the loop.
 
-use std::io::Read;
+use std::io::{Read, Write};
 use std::process::{Command, Stdio};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};

@@ -83,7 +83,10 @@ impl Engine {
         }
         // Declare the callback context before `state`: ggml stores this
         // pointer in the state backend, so the context must outlive the state.
-        let abort;
+        let abort = Abort {
+            cancelled: cancelled.clone(),
+            deadline: Instant::now() + timeout,
+        };
         let mut state = self.context.create_state()?;
         let mut params = FullParams::new(SamplingStrategy::Greedy { best_of: 1 });
         params.set_n_threads(
@@ -100,11 +103,6 @@ impl Engine {
         params.set_print_realtime(false);
         params.set_print_special(false);
         params.set_print_timestamps(false);
-        let deadline = Instant::now() + timeout;
-        abort = Abort {
-            cancelled: cancelled.clone(),
-            deadline,
-        };
         // whisper-rs 0.16.0's safe helper double-boxes a trait object, then
         // casts that allocation to the original closure type in its trampoline.
         // Use a concrete, owned callback context instead (and avoid its leak).
@@ -117,7 +115,7 @@ impl Engine {
             params.set_abort_callback_user_data(std::ptr::from_ref(&abort).cast_mut().cast());
         }
         let result = state.full(params, samples);
-        if cancelled.load(Ordering::Acquire) || Instant::now() >= deadline {
+        if cancelled.load(Ordering::Acquire) || Instant::now() >= abort.deadline {
             bail!("Whisper transcription cancelled or timed out");
         }
         result?;
