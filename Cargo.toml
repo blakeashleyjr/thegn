@@ -14,6 +14,7 @@ members = [
   "crates/gtui-render",
   "crates/gtui-app",
   "crates/gtui-embed",
+  "crates/thegn-plugin-ui",
 ]
 # Belt-and-braces: nothing in-tree lives at these paths, but if a contributor
 # drops a scratch checkout at apps/ or vendor/, cargo must not absorb it into
@@ -232,6 +233,8 @@ sysinfo = { version = "0.39", default-features = false, features = [
 starship-battery = "0.11"
 # --- internal crates ---
 thegn-core = { path = "crates/thegn-core" }
+thegn-plugin-ui = { path = "crates/thegn-plugin-ui" }
+tg-kit = { path = "crates/tg-kit" }
 thegn-svc = { path = "crates/thegn-svc" }
 thegn-metrics = { path = "crates/thegn-metrics" }
 thegn-media = { path = "crates/thegn-media" }
