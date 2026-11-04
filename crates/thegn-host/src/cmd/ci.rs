@@ -473,16 +473,20 @@ fn log(
     let entry = match entry {
         Some(entry) => entry,
         None => {
-            let (loc, provider) = match client(cfg, Some(wt.to_string_lossy().into_owned())) {
-                Ok(value) => value,
-                Err(error) if json_out => {
-                    msg::warn(&format!(
-                        "ci: {}",
-                        thegn_svc::lsp::sanitize_for_terminal(&error.to_string())
-                    ));
-                    return super::emit_json(&serde_json::json!({ "error": error.to_string() }));
-                }
-                Err(error) => {
+            let loc = GitLoc::for_worktree(&wt);
+            let (provider, context) = match thegn_svc::ci::provider_and_context_for(&loc, &cfg.ci) {
+                Some(value) => value,
+                None => {
+                    let error = anyhow::anyhow!(NO_CI_PROVIDER_MESSAGE);
+                    if json_out {
+                        msg::warn(&format!(
+                            "ci: {}",
+                            thegn_svc::lsp::sanitize_for_terminal(&error.to_string())
+                        ));
+                        return super::emit_json(
+                            &serde_json::json!({ "error": error.to_string() }),
+                        );
+                    }
                     return Err(anyhow::anyhow!(thegn_svc::lsp::sanitize_for_terminal(
                         &error.to_string()
                     )));
@@ -527,6 +531,7 @@ fn log(
             );
             entry.truncated |= raw.truncated;
             entry.head_sha = identity.head_sha;
+            entry.context = context.unwrap_or_default();
             if cfg.ci.log_cache_runs > 0
                 && thegn_core::ci_log::cacheable_log_entry(&entry)
                 && let Ok(db) = Db::open()

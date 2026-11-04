@@ -581,7 +581,9 @@ pub(crate) fn spawn_ci_detail(
         let loc = thegn_core::remote::GitLoc::for_worktree(&wt);
         let key = thegn_core::remote::GitLoc::worktree_cache_key(&wt);
         let db = thegn_core::db::Db::open().ok();
-        let client = thegn_svc::ci::provider_for(&loc, &cfg);
+        let (client, context) = thegn_svc::ci::provider_and_context_for(&loc, &cfg)
+            .map(|(client, context)| (Some(client), context))
+            .unwrap_or((None, None));
         // Full run (jobs/steps); on error keep the cached run so the header stays.
         let (detail, discarded_jobs, incomplete, detail_error) = match client.as_ref() {
             Some(c) => match c.run_detail(&loc, &run.id) {
@@ -668,6 +670,7 @@ pub(crate) fn spawn_ci_detail(
                     );
                     entry.truncated |= log.truncated;
                     entry.head_sha = detail.sha.clone();
+                    entry.context = context.clone().unwrap_or_default();
                     if cfg.log_cache_runs > 0
                         && thegn_core::ci_log::cacheable_log_entry(&entry)
                         && let Some(db) = db.as_ref()

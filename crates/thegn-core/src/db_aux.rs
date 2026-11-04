@@ -1862,14 +1862,14 @@ impl WorktreeAuxStore for Db {
         }
         if let Some(candidate) = request.ci_candidate {
             let inserted = tx.execute(
-                "INSERT OR IGNORE INTO ci_autofix_dedupe
-                 (worktree,run_id,job_id,head_sha,claimed_at) VALUES (?1,?2,?3,?4,?5)",
+                crate::db_ci::CLAIM_CI_AUTOFIX_SQL,
                 params![
                     candidate.worktree,
                     candidate.run_id,
                     candidate.job_id,
                     candidate.head_sha,
-                    util::now()
+                    util::now(),
+                    candidate.context
                 ],
             )?;
             if inserted == 0 {

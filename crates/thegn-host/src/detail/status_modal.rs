@@ -116,6 +116,35 @@ fn pair(p50: u64, p99: u64) -> String {
     }
 }
 
+/// Uses the sample count, never a zero percentile, to decide whether the window
+/// has samples; zero is also the histogram's 0–1 µs bucket.
+fn tail_cell(samples: u64, p50: u64, p95: u64, p99: u64) -> String {
+    if samples == 0 {
+        "no samples".into()
+    } else if samples < crate::perf::TAIL_MIN_SAMPLES {
+        format!("p50 {} · n={samples} (sparse)", fmt_us(p50))
+    } else {
+        format!(
+            "p50 {} · p95 {} · p99 {}",
+            fmt_us(p50),
+            fmt_us(p95),
+            fmt_us(p99)
+        )
+    }
+}
+
+/// Uses the sample count, never a zero percentile, to decide whether the window
+/// has samples; zero is also the histogram's 0–1 µs bucket.
+fn tail_only(samples: u64, p95: u64, p99: u64) -> String {
+    if samples == 0 {
+        "no samples".into()
+    } else if samples < crate::perf::TAIL_MIN_SAMPLES {
+        format!("p99 {} · n={samples} (sparse)", fmt_us(p99))
+    } else {
+        format!("p95 {} · p99 {}", fmt_us(p95), fmt_us(p99))
+    }
+}
+
 /// One-word summary of the chip state for the modal's role line.
 pub(crate) fn role_word(state: crate::chrome::DaemonChipState) -> &'static str {
     use crate::chrome::DaemonChipState::*;
@@ -485,16 +514,26 @@ fn loop_cells(p: &crate::perf::PerfSnapshot) -> Vec<(String, String, Tok)> {
         Tok::Hue(Hue::Red)
     };
     let budget_us = crate::perf::frame_budget_us();
-    let over = p.render_p50_us > budget_us;
+    let over = p.frame_samples > 0 && p.render_p50_us > budget_us;
     vec![
         (
             "render".into(),
-            pair(p.render_p50_us, p.render_p99_us),
+            tail_cell(
+                p.frame_samples,
+                p.render_p50_us,
+                p.render_p95_us,
+                p.render_p99_us,
+            ),
             if over { Tok::Hue(Hue::Red) } else { dim },
         ),
         (
             "input→submit".into(),
-            pair(p.input_p50_us, p.input_p99_us),
+            tail_cell(
+                p.input_samples,
+                p.input_p50_us,
+                p.input_p95_us,
+                p.input_p99_us,
+            ),
             dim,
         ),
         (
@@ -512,12 +551,21 @@ fn loop_cells(p: &crate::perf::PerfSnapshot) -> Vec<(String, String, Tok)> {
             dim,
         ),
         (
-            "input→sink p99".into(),
-            if p.writer_input_samples == 0 {
-                "no samples".into()
-            } else {
-                fmt_us(p.writer_input_p99_us)
-            },
+            "input→sink".into(),
+            tail_only(
+                p.writer_input_samples,
+                p.writer_input_p95_us,
+                p.writer_input_p99_us,
+            ),
+            dim,
+        ),
+        (
+            "submit→sink".into(),
+            tail_only(
+                p.writer_frames,
+                p.writer_completion_p95_us,
+                p.writer_completion_p99_us,
+            ),
             dim,
         ),
         ("drain".into(), pair(p.drain_p50_us, p.drain_p99_us), dim),
@@ -772,4 +820,58 @@ fn build_sections(model: &FrameModel, ctx: &super::StatusCtx) -> Vec<Section> {
         });
     }
     secs
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{loop_cells, tail_cell, tail_only};
+    use crate::perf::PerfSnapshot;
+
+    #[test]
+    fn tail_cell_uses_the_count_not_a_zero_percentile() {
+        assert_eq!(tail_cell(0, 0, 0, 0), "no samples");
+        assert_eq!(tail_cell(5, 0, 0, 0), "p50 0µs · n=5 (sparse)");
+    }
+
+    #[test]
+    fn tail_cell_marks_sparse_and_full_windows() {
+        let sparse = tail_cell(1, 512, 512, 512);
+        assert!(sparse.contains("(sparse)"));
+        assert!(!sparse.contains("p99"));
+        assert_eq!(
+            tail_cell(20, 512, 1024, 8192),
+            "p50 512µs · p95 1.0ms · p99 8.2ms"
+        );
+        assert_eq!(tail_only(0, 0, 0), "no samples");
+        assert!(tail_only(3, 0, 8192).contains("n=3 (sparse)"));
+        assert_eq!(tail_only(40, 1024, 8192), "p95 1.0ms · p99 8.2ms");
+    }
+
+    #[test]
+    fn loop_cells_report_counts_for_empty_and_sparse_windows() {
+        let cells = loop_cells(&PerfSnapshot::default());
+        let render = cells
+            .iter()
+            .find(|(label, _, _)| label == "render")
+            .unwrap();
+        let input = cells
+            .iter()
+            .find(|(label, _, _)| label == "input→submit")
+            .unwrap();
+        assert_eq!(render.1, "no samples");
+        assert_eq!(input.1, "no samples");
+
+        let sparse = PerfSnapshot {
+            frame_samples: 3,
+            render_p50_us: 900,
+            ..Default::default()
+        };
+        let cells = loop_cells(&sparse);
+        let render = cells
+            .iter()
+            .find(|(label, _, _)| label == "render")
+            .unwrap();
+        assert!(render.1.contains("n=3 (sparse)"));
+        assert!(cells.iter().any(|(label, _, _)| label == "submit→sink"));
+    }
 }

@@ -171,6 +171,14 @@ where
 /// Commands containing a path separator must be absolute. Bare names resolve
 /// only through absolute PATH entries.
 pub fn resolve_server_command(cmd: &str, path: Option<&OsStr>) -> Result<PathBuf, LspError> {
+    resolve_server_executable(cmd, path).map(|(path, _)| path)
+}
+
+/// Resolve a server command and return the identity attested for the selected executable.
+pub fn resolve_server_executable(
+    cmd: &str,
+    path: Option<&OsStr>,
+) -> Result<(PathBuf, ExecutableIdentity), LspError> {
     let configured = Path::new(cmd);
     if cmd.contains('/') || cmd.contains('\\') {
         if !configured.is_absolute() {
@@ -189,7 +197,7 @@ pub fn resolve_server_command(cmd: &str, path: Option<&OsStr>) -> Result<PathBuf
             mtime_unix_s = ?identity.mtime_unix_s,
             "resolved language server executable"
         );
-        return Ok(configured.to_path_buf());
+        return Ok((configured.to_path_buf(), identity));
     }
     let Some(path) = path else {
         return Err(LspError::Spawn(format!(
@@ -220,12 +228,28 @@ pub fn resolve_server_command(cmd: &str, path: Option<&OsStr>) -> Result<PathBuf
             );
             // Preserve the candidate's final path component for argv[0]-based
             // shims such as mise, rustup, volta, and busybox.
-            return Ok(candidate);
+            return Ok((candidate, identity));
         }
     }
     Err(LspError::Spawn(format!(
         "{cmd} not found on absolute PATH entries"
     )))
+}
+
+/// Re-check, immediately before spawn, that `path` still resolves to the executable recorded at resolve time.
+/// A replaced, retargeted or re-moded binary is refused rather than started.
+pub fn reattest_server_executable(
+    path: &Path,
+    expected: &ExecutableIdentity,
+) -> Result<(), LspError> {
+    let current = server_executable_identity(path)?;
+    if &current != expected {
+        return Err(LspError::Spawn(format!(
+            "{} changed after it was resolved; not starting it",
+            path.display()
+        )));
+    }
+    Ok(())
 }
 
 /// The LSP resource contract.  These are protocol safety limits, not user
@@ -1025,6 +1049,13 @@ pub fn path_to_uri(path: &str) -> String {
         return String::new();
     }
     format!("file://{}", percent_encode_path(path))
+}
+
+/// [`path_to_uri`] for an OS path. A path that is not valid UTF-8 is refused
+/// (empty string, like any other unsupported path) instead of being encoded as
+/// its lossy text, which names a different file.
+pub fn path_to_uri_os(path: &Path) -> String {
+    path.to_str().map(path_to_uri).unwrap_or_default()
 }
 
 /// Decode a canonical local `file:` URI. Remote authorities and ambiguous URI
@@ -2088,7 +2119,7 @@ impl LspClient {
     /// Run the `initialize`/`initialized` handshake, capturing the server's
     /// declared `capabilities` for the request gate.
     pub fn initialize(&self, root: &Path) -> Result<(), LspError> {
-        let uri = path_to_uri(&root.to_string_lossy());
+        let uri = path_to_uri_os(root);
         if uri.is_empty() {
             return Err(LspError::Bounded("workspace identity path limit".into()));
         }
@@ -3113,6 +3144,97 @@ mod tests {
     }
 
     #[test]
+    fn resolve_server_executable_returns_the_identity_it_attested() {
+        if !cfg!(unix) {
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let executable = dir.path().join("srv");
+        std::fs::write(&executable, "#!/bin/sh\nexit 0\n").unwrap();
+        crate::plugin::platform::set_mode_for_test(&executable, 0o755).unwrap();
+
+        let (resolved, identity) =
+            resolve_server_executable(executable.to_str().unwrap(), None).unwrap();
+
+        assert_eq!(resolved, executable);
+        assert_eq!(identity, server_executable_identity(&executable).unwrap());
+    }
+
+    #[test]
+    fn reattest_accepts_an_unchanged_server() {
+        if !cfg!(unix) {
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let executable = dir.path().join("srv");
+        std::fs::write(&executable, "#!/bin/sh\nexit 0\n").unwrap();
+        crate::plugin::platform::set_mode_for_test(&executable, 0o755).unwrap();
+        let (path, identity) =
+            resolve_server_executable(executable.to_str().unwrap(), None).unwrap();
+
+        assert!(reattest_server_executable(&path, &identity).is_ok());
+    }
+
+    #[test]
+    fn reattest_refuses_a_server_replaced_after_resolve() {
+        if !cfg!(unix) {
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let executable = dir.path().join("srv");
+        std::fs::write(&executable, "#!/bin/sh\nexit 0\n").unwrap();
+        crate::plugin::platform::set_mode_for_test(&executable, 0o755).unwrap();
+        let (path, identity) =
+            resolve_server_executable(executable.to_str().unwrap(), None).unwrap();
+        std::fs::write(&executable, "#!/bin/sh\necho replaced; exit 0\n").unwrap();
+
+        assert!(matches!(
+            reattest_server_executable(&path, &identity),
+            Err(LspError::Spawn(message)) if message.contains("changed after it was resolved")
+        ));
+    }
+
+    #[test]
+    fn reattest_refuses_a_mode_change_after_resolve() {
+        if !cfg!(unix) {
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let executable = dir.path().join("srv");
+        std::fs::write(&executable, "#!/bin/sh\nexit 0\n").unwrap();
+        crate::plugin::platform::set_mode_for_test(&executable, 0o755).unwrap();
+        let (path, identity) =
+            resolve_server_executable(executable.to_str().unwrap(), None).unwrap();
+        crate::plugin::platform::set_mode_for_test(&executable, 0o750).unwrap();
+
+        assert!(matches!(
+            reattest_server_executable(&path, &identity),
+            Err(LspError::Spawn(message)) if message.contains("changed after it was resolved")
+        ));
+    }
+
+    #[test]
+    fn reattest_refuses_a_bare_name_candidate_replaced_after_resolve() {
+        if !cfg!(unix) {
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let executable = dir.path().join("srv");
+        std::fs::write(&executable, "#!/bin/sh\nexit 0\n").unwrap();
+        crate::plugin::platform::set_mode_for_test(&executable, 0o755).unwrap();
+        let path = std::env::join_paths([dir.path().as_os_str()]).unwrap();
+        let (candidate, identity) = resolve_server_executable("srv", Some(&path)).unwrap();
+        assert_eq!(candidate, executable);
+        assert!(reattest_server_executable(&candidate, &identity).is_ok());
+        std::fs::write(&executable, "#!/bin/sh\necho replaced; exit 0\n").unwrap();
+
+        assert!(matches!(
+            reattest_server_executable(&candidate, &identity),
+            Err(LspError::Spawn(message)) if message.contains("changed after it was resolved")
+        ));
+    }
+
+    #[test]
     fn shutdown_is_bounded_and_writes_shutdown_before_exit() {
         let (client, captured, _server_writer) = capturing_client();
         let started = std::time::Instant::now();
@@ -4079,6 +4201,47 @@ mod tests {
         let uri = path_to_uri(p);
         assert!(uri.contains("%20"), "space should be encoded: {uri}");
         assert_eq!(uri_to_path(&uri), p);
+    }
+
+    #[test]
+    fn path_to_uri_os_refuses_a_non_utf8_path_instead_of_a_lossy_one() {
+        let Some(path) = crate::plugin::platform::non_utf8_path_for_test(Path::new("/tmp/proj"))
+        else {
+            return;
+        };
+
+        assert_eq!(path_to_uri_os(&path), "");
+        assert_eq!(
+            path_to_uri(&path.to_string_lossy()),
+            "file:///tmp/proj/src-%EF%BF%BD.rs"
+        );
+    }
+
+    #[test]
+    fn path_to_uri_os_matches_path_to_uri_for_utf8_paths() {
+        for path in [
+            "/home/u/proj/src/lib.rs",
+            "/home/u/my proj/a b.rs",
+            "/x/€.rs",
+        ] {
+            assert_eq!(path_to_uri_os(Path::new(path)), path_to_uri(path));
+        }
+        assert_eq!(path_to_uri_os(Path::new("rel/a.rs")), "");
+    }
+
+    #[test]
+    fn initialize_refuses_a_non_utf8_root_before_writing() {
+        let (client, captured, _server_writer) = capturing_client();
+        let Some(root) = crate::plugin::platform::non_utf8_path_for_test(Path::new("/tmp")) else {
+            return;
+        };
+
+        assert!(matches!(
+            client.initialize(&root),
+            Err(LspError::Bounded(message)) if message == "workspace identity path limit"
+        ));
+        assert!(!String::from_utf8_lossy(&captured.lock().unwrap()).contains("initialize"));
+        client.shutdown(Duration::from_millis(100));
     }
 
     #[test]

@@ -2934,6 +2934,138 @@ mod tests {
         std::fs::remove_file(writable).unwrap();
     }
 
+    /// Automates THE-91's manual proof that a contained worker can commit without reaching a sibling host path.
+    #[test]
+    fn autonomous_agent_bwrap_sandbox_commits_in_its_worktree_and_cannot_write_outside() {
+        let _state = crate::testenv::IsolatedState::new();
+        let fixture = git_control_fixture();
+        let Some(path) = std::env::var_os("PATH") else {
+            assert!(!thegn_core::testenv::require_or_skip(
+                "bwrap on PATH",
+                false
+            ));
+            return;
+        };
+        let Some(bwrap) = std::env::split_paths(&path)
+            .map(|dir| dir.join("bwrap"))
+            .find(|candidate| candidate.is_file())
+        else {
+            assert!(!thegn_core::testenv::require_or_skip(
+                "bwrap on PATH",
+                false
+            ));
+            return;
+        };
+        let mut probe = std::process::Command::new(&bwrap);
+        probe
+            .args(["--unshare-user", "--ro-bind", "/", "/", "true"])
+            .current_dir(&fixture.worktree);
+        if !run_git_control_command(&mut probe).status.success() {
+            assert!(!thegn_core::testenv::require_or_skip(
+                "bwrap with user namespaces",
+                false
+            ));
+            return;
+        }
+
+        let config = thegn_core::config::SandboxConfig {
+            enabled: true,
+            backend: thegn_core::config::SandboxBackend::Bwrap,
+            backend_chain: vec!["bwrap".into()],
+            profile: thegn_core::config::SandboxProfile::Hardened,
+            ..Default::default()
+        };
+        let location = thegn_core::remote::GitLoc::from_db(
+            fixture.worktree.to_str().expect("worktree path is UTF-8"),
+            None,
+        );
+        let Some(spec) = thegn_core::sandbox::resolve_placed_exact(
+            &config,
+            &location,
+            "agent-commit-containment-test",
+            thegn_core::config::SandboxProfile::Hardened,
+            thegn_core::placement::Placement::Local,
+        ) else {
+            assert!(!thegn_core::testenv::require_or_skip(
+                "hardened bwrap spec resolution",
+                false
+            ));
+            return;
+        };
+        if spec.backend != thegn_core::sandbox::Backend::Bwrap {
+            assert!(!thegn_core::testenv::require_or_skip(
+                "hardened bwrap backend",
+                false
+            ));
+            return;
+        }
+        let spec = credential_free_spec_at(spec, None);
+        let outside = fixture._root.path().join("outside-write");
+        let script = format!(
+            "cd {} && printf probe > probe.txt && git add probe.txt && git -c commit.gpgsign=false -c user.name=t -c user.email=t@e commit -qm worker-probe && echo committed && {{ if printf pwned > {} 2>/dev/null; then echo outside-write-attempt:succeeded-inside-sandbox; else echo outside-write-attempt:denied; fi; }}",
+            thegn_core::util::sh_quote(&fixture.worktree.to_string_lossy()),
+            thegn_core::util::sh_quote(&outside.to_string_lossy())
+        );
+        let argv = thegn_core::sandbox::enter_argv(
+            &spec,
+            &format!("sh -c {}", thegn_core::util::sh_quote(&script)),
+        )
+        .expect("bwrap enter argv");
+        let mut child = std::process::Command::new(&argv[0]);
+        child.args(&argv[1..]).current_dir(&fixture.worktree);
+        let output = run_git_control_command(&mut child);
+        assert!(
+            output.status.success(),
+            "sandbox commit command failed: {output:?}"
+        );
+        assert!(
+            String::from_utf8_lossy(&output.stdout).contains("committed"),
+            "sandbox did not report the worker commit: {output:?}"
+        );
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            stdout.contains("outside-write-attempt:succeeded-inside-sandbox")
+                || stdout.contains("outside-write-attempt:denied"),
+            "sandbox did not report the outside-write attempt outcome: {output:?}"
+        );
+
+        let mut subject = thegn_core::util::git_cmd(&fixture.worktree);
+        subject.args(["log", "-1", "--format=%s"]);
+        let subject = run_git_control_command(&mut subject);
+        assert!(subject.status.success(), "git log failed: {subject:?}");
+        assert_eq!(
+            String::from_utf8_lossy(&subject.stdout).trim(),
+            "worker-probe"
+        );
+
+        let mut tracked = thegn_core::util::git_cmd(&fixture.worktree);
+        tracked.args(["ls-files", "probe.txt"]);
+        let tracked = run_git_control_command(&mut tracked);
+        assert!(tracked.status.success(), "git ls-files failed: {tracked:?}");
+        assert_eq!(String::from_utf8_lossy(&tracked.stdout).trim(), "probe.txt");
+
+        let mut branch = thegn_core::util::git_cmd(fixture.common.parent().unwrap());
+        branch.args(["rev-parse", "feat"]);
+        let branch = run_git_control_command(&mut branch);
+        assert!(
+            branch.status.success(),
+            "git rev-parse feat failed: {branch:?}"
+        );
+        let mut head = thegn_core::util::git_cmd(&fixture.worktree);
+        head.args(["rev-parse", "HEAD"]);
+        let head = run_git_control_command(&mut head);
+        assert!(head.status.success(), "git rev-parse HEAD failed: {head:?}");
+        assert_eq!(
+            String::from_utf8_lossy(&branch.stdout).trim(),
+            String::from_utf8_lossy(&head.stdout).trim(),
+            "worker commit was not published to the shared branch ref"
+        );
+        assert!(
+            !outside.exists(),
+            "a write outside the worktree and git dir reached the host"
+        );
+    }
+
     #[test]
     fn queue_agent_spec_is_credential_free() {
         let state = crate::testenv::IsolatedState::new();

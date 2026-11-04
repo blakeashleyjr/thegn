@@ -47,4 +47,9 @@ pub(crate) fn set_mode_for_test(path: &std::path::Path, mode: u32) -> std::io::R
 }
 
 #[cfg(test)]
+pub(crate) fn non_utf8_path_for_test(parent: &std::path::Path) -> Option<std::path::PathBuf> {
+    platform_non_utf8_path_for_test(parent)
+}
+
+#[cfg(test)]
 mod native_tests;

@@ -52,6 +52,12 @@ folder (`folder` name, or `clear: true`) through `api call` (Git scope), HTTP,
 gRPC, MCP (`folders_assign`, needs `--scopes git`), or plugin `host.call`.
 `thegn plugin list|check` inspects the configured [[plugins]].
 
+The `issues.list` capability (`thegn api call issues.list` or HTTP `GET
+/v1/issues`) returns `issues`, `complete` and `incomplete`. A partial or failed
+account is listed with its account, provider, kind and reason; validated rows
+from a partial account are kept. `complete` is true only when all accounts
+answer fully, and the call fails only if every configured account fails.
+
 The multi-repo group commands use the canonical `thegn program` namespace.
 `thegn project` remains a deprecated, behavior-identical alias for three
 stable releases and warns with the replacement. Likewise, `wt new --program`

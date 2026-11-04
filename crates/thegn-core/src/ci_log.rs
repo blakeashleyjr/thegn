@@ -42,6 +42,10 @@ pub struct CiLogEntry {
     pub fetched_at: i64,
     #[serde(default)]
     pub head_sha: String,
+    /// Provider context that produced the log (`<system>:<host>/<project>`);
+    /// empty when unknown or written before schema v99.
+    #[serde(default)]
+    pub context: String,
 }
 
 /// The identity used to deduplicate an autofix handoff.
@@ -51,6 +55,8 @@ pub struct CiLogCandidate {
     pub run_id: String,
     pub job_id: String,
     pub head_sha: String,
+    #[serde(default)]
+    pub context: String,
 }
 
 impl CiLogEntry {
@@ -79,6 +85,7 @@ impl CiLogEntry {
             policy_version: REDACTION_POLICY_VERSION,
             fetched_at,
             head_sha: String::new(),
+            context: String::new(),
         }
     }
 
@@ -102,6 +109,7 @@ impl CiLogEntry {
             run_id: self.run_id.clone(),
             job_id: self.job_id.clone(),
             head_sha: self.head_sha.clone(),
+            context: self.context.clone(),
         }
     }
 }
@@ -292,6 +300,12 @@ pub fn cached_log_is_evidence_for(
         return false;
     }
     true
+}
+
+/// Cached logs match only the exact provider context; unknown context matches
+/// only another unknown (empty) context.
+pub fn cached_log_context_matches(entry: &CiLogEntry, current: Option<&str>) -> bool {
+    entry.context == current.unwrap_or("")
 }
 
 /// Unknown-head log entries may be shown from a provider fetch, but never
@@ -1137,6 +1151,7 @@ mod tests {
             run_id: "r".into(),
             job_id: "j".into(),
             head_sha: "a".into(),
+            context: String::new(),
         };
         let mut b = a.clone();
         b.head_sha = "b".into();
@@ -1162,6 +1177,30 @@ mod tests {
             None
         ));
         assert!(!cached_log_is_evidence_for(&entry, "other", None));
+    }
+
+    #[test]
+    fn cached_log_context_matches_requires_the_exact_context() {
+        let entry = CiLogEntry {
+            context: "github:github.com/o/a".into(),
+            ..Default::default()
+        };
+        assert!(cached_log_context_matches(
+            &entry,
+            Some("github:github.com/o/a")
+        ));
+        assert!(!cached_log_context_matches(
+            &entry,
+            Some("github:github.com/o/b")
+        ));
+        assert!(!cached_log_context_matches(&entry, None));
+        let unknown = CiLogEntry::default();
+        assert!(cached_log_context_matches(&unknown, None));
+        assert!(cached_log_context_matches(&unknown, Some("")));
+        assert!(!cached_log_context_matches(
+            &unknown,
+            Some("github:github.com/o/a")
+        ));
     }
 
     #[test]

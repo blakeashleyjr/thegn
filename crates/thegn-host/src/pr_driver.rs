@@ -351,13 +351,16 @@ pub(crate) fn drive_queue(
         let review_refresh =
             refresh_review_tasks(cfg, forge, repo_root, db, &item, &fetched, &mut out);
 
-        // A head thegn didn't produce means a teammate pushed. Two consequences,
-        // both deliberate: the attempt budget refills (a long-lived PR must not
-        // stay stuck), and — under `pause_on_foreign_push` — we stop rather than
-        // race whoever is working in there.
+        // A head thegn didn't produce means a teammate pushed. When
+        // `pause_on_foreign_push` is off, the attempt budget can refill so a
+        // long-lived PR does not stay stuck. With the pause enabled, preserve
+        // the budget while we stop rather than race whoever is working in there.
         let moved = pr_queue::foreign_push(item.last_head_oid.as_deref(), &head);
         let mut attempts = item.agent_attempts;
-        if moved && pr_queue::attempts_reset(item.last_head_oid.as_deref(), &head, cfg) {
+        if moved
+            && !cfg.pause_on_foreign_push
+            && pr_queue::attempts_reset(item.last_head_oid.as_deref(), &head, cfg)
+        {
             attempts = 0;
             if let Err(error) = db.set_pr_agent_attempts(&item.key, 0) {
                 tracing::debug!(target: "thegn::prq", %error, "could not persist PR agent budget reset after head change");
@@ -366,7 +369,14 @@ pub(crate) fn drive_queue(
 
         let facts = PrQueueFacts {
             worktree: item.worktree.clone(),
-            agent_attempts: attempts,
+            // Let a pause-enabled foreign head reach the foreign-push hold
+            // even when its preserved budget is exhausted; no dispatch can
+            // pass the hold, and the persisted attempt count stays unchanged.
+            agent_attempts: if moved && cfg.pause_on_foreign_push {
+                0
+            } else {
+                attempts
+            },
             last_head_oid: item.last_head_oid.clone(),
             is_own: true, // fresh shared admission runs before any dispatch side effect
             agent_available: agent_cmd.is_some(),
@@ -3280,6 +3290,103 @@ mod tests {
             1,
             "the later CI failure dispatches the rerun using the refilled budget"
         );
+    }
+
+    #[test]
+    fn push_budget_matrix_never_refills_an_own_head_and_holds_only_on_a_foreign_push() {
+        for (pause_on_foreign_push, reset_attempts_on_push, own_head) in [
+            (true, true, true),
+            (true, true, false),
+            (true, false, true),
+            (true, false, false),
+            (false, true, true),
+            (false, true, false),
+            (false, false, true),
+            (false, false, false),
+        ] {
+            let cell = format!(
+                "pause={pause_on_foreign_push}, reset={reset_attempts_on_push}, head={}",
+                if own_head { "own" } else { "foreign" }
+            );
+            let (dir, db) = temp_db("prq-push-budget-matrix");
+            let (checkout, initial_row) =
+                enqueue_pr_with_checkout(&dir, &db, 7, "feat", "https://github.com/me/repo/pull/7");
+            let key = initial_row.key;
+            db.set_pr_agent_attempts(&key, 2).unwrap();
+            let previous_head = if own_head { "head-b" } else { "head-a" };
+            db.update_pr_status(&key, "blocked_ci", Some("ci"), None, Some(previous_head))
+                .unwrap();
+
+            let mut config = cfg();
+            config.watch = vec![PrWatchKind::Ci];
+            config.own_prs_only = false;
+            config.agent_command = "true {prompt}".into();
+            config.agent_max_attempts = 5;
+            config.pause_on_foreign_push = pause_on_foreign_push;
+            config.reset_attempts_on_push = reset_attempts_on_push;
+            let forge = FakeForge::new(Some(failing_ci_pr("head-b"))).with_rerun_count(1);
+            let row = db.list_pr_queue().unwrap().remove(0);
+            // The default isolation floor holds the dispatch before an agent can run;
+            // these non-held cells prove the queue's resulting status under that floor.
+            drive_queue(
+                &config,
+                &Config::default(),
+                &forge,
+                &checkout,
+                &db,
+                vec![PrItem::from(&row)],
+                |_| {},
+            );
+
+            let current = db.list_pr_queue().unwrap().remove(0);
+            let detail = current.detail.as_deref().unwrap_or("");
+            if own_head || !pause_on_foreign_push {
+                assert_eq!(
+                    current.status,
+                    PrqStatus::BlockedCi.as_str(),
+                    "{cell}: the default isolation floor holds the CI dispatch"
+                );
+            }
+            if own_head {
+                assert!(
+                    current.agent_attempts >= 2,
+                    "{cell}: an already-recorded own head must not refill the attempt budget"
+                );
+                assert!(
+                    current.status != PrqStatus::NeedsHuman.as_str()
+                        || !detail.contains("someone else pushed"),
+                    "{cell}: an own head must not trigger the foreign-push hold"
+                );
+            } else if pause_on_foreign_push {
+                assert_eq!(
+                    current.status,
+                    PrqStatus::NeedsHuman.as_str(),
+                    "{cell}: a foreign head with pause enabled must be held"
+                );
+                assert!(
+                    detail.contains("someone else pushed"),
+                    "{cell}: the hold must explain the foreign push"
+                );
+                assert_eq!(
+                    current.agent_attempts, 2,
+                    "{cell}: pausing on a foreign push must preserve the attempt budget"
+                );
+                assert!(
+                    !forge.calls().iter().any(|call| call.starts_with("rerun")),
+                    "{cell}: a held foreign head must not spend a CI rerun"
+                );
+            } else if reset_attempts_on_push {
+                assert_eq!(
+                    current.agent_attempts, 0,
+                    "{cell}: a foreign head with pause disabled and reset enabled must refill the budget"
+                );
+            } else {
+                assert_eq!(
+                    current.agent_attempts, 2,
+                    "{cell}: reset disabled must keep the persisted attempt budget"
+                );
+            }
+        }
     }
 
     #[test]
