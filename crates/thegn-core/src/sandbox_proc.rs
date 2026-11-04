@@ -1,15 +1,13 @@
-//! Bounded subprocess capture for sandbox control probes.
+//! Bounded subprocess capture adapter for sandbox control probes.
 //!
-//! Captured pipes are drained while the process runs. On Unix each command has
-//! its own process group, so a deadline also closes inherited pipes held by
-//! descendants.
+//! The shared `thegn_proc` runner owns the process group and deadline; the
+//! deadline also closes inherited pipes held by descendants.
 
-use std::io::{self, Read, Write};
-use std::process::{Child, ChildStdin, Command, ExitStatus, Stdio};
+use std::process::{Child, Command, ExitStatus};
 use std::sync::OnceLock;
-use std::sync::mpsc::{self, Receiver, Sender};
-use std::thread;
-use std::time::{Duration, Instant};
+use std::sync::atomic::AtomicBool;
+use std::sync::mpsc::{self, Sender};
+use std::time::Duration;
 
 const KILL_REAP_BUDGET: Duration = Duration::from_millis(250);
 const READER_REAP_BUDGET: Duration = Duration::from_millis(250);
@@ -25,12 +23,6 @@ pub(crate) struct Capture {
 pub(crate) struct Captured {
     bytes: Vec<u8>,
     truncated: bool,
-}
-
-#[derive(Debug)]
-enum ReadOutcome {
-    Captured(Captured),
-    Failed,
 }
 
 /// The complete set of outcomes from a bounded command.
@@ -103,6 +95,46 @@ pub(crate) fn run_bounded_with_input(
     run_inner(argv, timeout, capture, Some(input))
 }
 
+fn stream_for(cap: Option<usize>) -> thegn_proc::Stream {
+    match cap {
+        Some(cap) => thegn_proc::Stream::Head { cap },
+        None => thegn_proc::Stream::Null,
+    }
+}
+
+fn captured(capture: thegn_proc::Capture) -> Captured {
+    Captured {
+        bytes: capture.bytes,
+        truncated: capture.truncated,
+    }
+}
+
+/// The complete mapping from a shared-runner `Run` to sandbox probe outcomes.
+fn map_run(run: thegn_proc::Run) -> ProcOutcome {
+    let thegn_proc::Run {
+        end,
+        leader,
+        stdout,
+        stderr,
+        ..
+    } = run;
+    match (end, leader) {
+        (thegn_proc::End::Spawn(_), _) => ProcOutcome::Spawn,
+        (thegn_proc::End::TimedOut, _) => ProcOutcome::Timeout,
+        (thegn_proc::End::LeaderExited, thegn_proc::Leader::Reaped(status)) => {
+            ProcOutcome::Exited {
+                status,
+                stdout: captured(stdout),
+                stderr: captured(stderr),
+            }
+        }
+        (thegn_proc::End::LeaderExited, _)
+        | (thegn_proc::End::Supervise(_), _)
+        | (thegn_proc::End::Cancelled, _)
+        | (thegn_proc::End::OutputLimit(_), _) => ProcOutcome::Wait,
+    }
+}
+
 fn run_inner(
     argv: &[String],
     timeout: Duration,
@@ -113,206 +145,29 @@ fn run_inner(
         return (ProcOutcome::Spawn, InputDelivery::Failed);
     };
     let mut command = Command::new(program);
-    command
-        .args(&argv[1..])
-        .stdin(if input.is_some() {
-            Stdio::piped()
-        } else {
-            Stdio::null()
-        })
-        .stdout(if capture.stdout.is_some() {
-            Stdio::piped()
-        } else {
-            Stdio::null()
-        })
-        .stderr(if capture.stderr.is_some() {
-            Stdio::piped()
-        } else {
-            Stdio::null()
-        });
-    #[cfg(unix)]
-    std::os::unix::process::CommandExt::process_group(&mut command, 0);
-    let mut child = match command.spawn() {
-        Ok(child) => child,
-        Err(_) => return (ProcOutcome::Spawn, InputDelivery::Failed),
+    command.args(&argv[1..]);
+    let limits = thegn_proc::Limits {
+        kill_settle: KILL_REAP_BUDGET,
+        reader_grace: READER_REAP_BUDGET,
+        stdout: stream_for(capture.stdout),
+        stderr: stream_for(capture.stderr),
+        ..thegn_proc::Limits::silent(timeout)
     };
-
-    let feeder = input.and_then(|input| child.stdin.take().map(|stdin| spawn_feeder(stdin, input)));
-
-    let stdout = match child.stdout.take() {
-        Some(pipe) if capture.stdout.is_some() => {
-            Some(spawn_reader(pipe, capture.stdout.unwrap_or(0)))
+    let cancel = AtomicBool::new(false);
+    let (run, feed) = match input.as_deref() {
+        Some(bytes) => {
+            let (run, feed) = thegn_proc::run_with_input(&mut command, &limits, bytes, &cancel);
+            (run, Some(feed))
         }
-        _ => None,
+        None => (thegn_proc::run(&mut command, &limits, &cancel), None),
     };
-    let stderr = match child.stderr.take() {
-        Some(pipe) if capture.stderr.is_some() => {
-            Some(spawn_reader(pipe, capture.stderr.unwrap_or(0)))
-        }
-        _ => None,
+    let outcome = map_run(run);
+    let delivery = match (&outcome, feed) {
+        (ProcOutcome::Exited { .. }, Some(feed)) if !feed.complete => InputDelivery::Failed,
+        (ProcOutcome::Exited { .. }, _) => InputDelivery::Complete,
+        _ => InputDelivery::Failed,
     };
-    let deadline = Instant::now() + timeout;
-    let status = loop {
-        match child.try_wait() {
-            Ok(Some(status)) => break status,
-            Ok(None) if Instant::now() >= deadline => {
-                terminate_tree(&mut child);
-                reap_bounded(child);
-                return (ProcOutcome::Timeout, InputDelivery::Failed);
-            }
-            Ok(None) => thread::sleep(
-                Duration::from_millis(10).min(deadline.saturating_duration_since(Instant::now())),
-            ),
-            Err(_) => {
-                terminate_tree(&mut child);
-                reap_bounded(child);
-                return (ProcOutcome::Wait, InputDelivery::Failed);
-            }
-        }
-    };
-
-    // Do not join the feeder: a descendant can retain stdin forever. Its result
-    // is observed only until this invocation's original deadline.
-    let input_delivery = match &feeder {
-        Some(receiver) => {
-            match receiver.recv_timeout(deadline.saturating_duration_since(Instant::now())) {
-                Ok(Ok(())) => InputDelivery::Complete,
-                Ok(Err(_)) | Err(mpsc::RecvTimeoutError::Disconnected) => InputDelivery::Failed,
-                Err(mpsc::RecvTimeoutError::Timeout) => {
-                    terminate_group_after_exit(&child);
-                    InputDelivery::Failed
-                }
-            }
-        }
-        None => InputDelivery::Complete,
-    };
-
-    // Keep the deadline active after the leader exits: an inherited pipe may
-    // still be open in a descendant, so EOF is not evidence of leader exit.
-    let stdout_result = receive_reader(&stdout, deadline);
-    if stdout_result.is_err() {
-        terminate_group_after_exit(&child);
-        let stdout = receive_reader(&stdout, Instant::now() + READER_REAP_BUDGET);
-        let stderr = receive_reader(&stderr, Instant::now() + READER_REAP_BUDGET);
-        return (
-            match (stdout, stderr) {
-                (Ok(stdout), Ok(stderr)) => ProcOutcome::Exited {
-                    status,
-                    stdout,
-                    stderr,
-                },
-                (Err(error), _) | (_, Err(error)) => error,
-            },
-            input_delivery,
-        );
-    }
-    let stdout = match stdout_result {
-        Ok(result) => result,
-        Err(error) => return (error, input_delivery),
-    };
-    let stderr_result = receive_reader(&stderr, deadline);
-    if stderr_result.is_err() {
-        terminate_group_after_exit(&child);
-        let stderr = receive_reader(&stderr, Instant::now() + READER_REAP_BUDGET);
-        return (
-            match stderr {
-                Ok(stderr) => ProcOutcome::Exited {
-                    status,
-                    stdout,
-                    stderr,
-                },
-                Err(error) => error,
-            },
-            input_delivery,
-        );
-    }
-    let stderr = match stderr_result {
-        Ok(result) => result,
-        Err(error) => return (error, input_delivery),
-    };
-    (
-        ProcOutcome::Exited {
-            status,
-            stdout,
-            stderr,
-        },
-        input_delivery,
-    )
-}
-
-fn spawn_feeder(mut stdin: ChildStdin, input: Vec<u8>) -> Receiver<io::Result<()>> {
-    let (sender, receiver) = mpsc::sync_channel(1);
-    crate::thread_name::spawn_named("thegn-sbx-feed", move || {
-        let result = stdin.write_all(&input);
-        if let Err(error) = sender.send(result) {
-            tracing::debug!(target: "thegn::sandbox", %error, "stdin feeder result receiver closed");
-        }
-    });
-    receiver
-}
-
-fn spawn_reader<R: Read + Send + 'static>(mut reader: R, cap: usize) -> Receiver<ReadOutcome> {
-    let (sender, receiver) = mpsc::sync_channel(1);
-    crate::thread_name::spawn_named("thegn-sbx-read", move || {
-        let mut captured = Captured {
-            bytes: Vec::with_capacity(cap.min(4096)),
-            truncated: false,
-        };
-        let mut buffer = [0u8; 8192];
-        loop {
-            match reader.read(&mut buffer) {
-                Ok(0) => break,
-                Ok(count) => {
-                    let room = cap.saturating_sub(captured.bytes.len());
-                    let keep = room.min(count);
-                    captured.bytes.extend_from_slice(&buffer[..keep]);
-                    captured.truncated |= keep < count;
-                }
-                Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
-                Err(_) => {
-                    Result::ok(sender.send(ReadOutcome::Failed));
-                    return;
-                }
-            }
-        }
-        Result::ok(sender.send(ReadOutcome::Captured(captured)));
-    });
-    receiver
-}
-
-fn receive_reader(
-    receiver: &Option<Receiver<ReadOutcome>>,
-    deadline: Instant,
-) -> Result<Captured, ProcOutcome> {
-    let Some(receiver) = receiver else {
-        return Ok(Captured::default());
-    };
-    match receiver.recv_timeout(deadline.saturating_duration_since(Instant::now())) {
-        Ok(ReadOutcome::Captured(captured)) => Ok(captured),
-        Ok(ReadOutcome::Failed) => Err(ProcOutcome::Read),
-        Err(mpsc::RecvTimeoutError::Timeout) => Err(ProcOutcome::Timeout),
-        Err(mpsc::RecvTimeoutError::Disconnected) => Err(ProcOutcome::Read),
-    }
-}
-
-fn terminate_tree(child: &mut Child) {
-    #[cfg(unix)]
-    {
-        use nix::sys::signal::{Signal, killpg};
-        use nix::unistd::Pid;
-        Result::ok(killpg(Pid::from_raw(child.id() as i32), Signal::SIGKILL));
-    }
-    #[cfg(windows)]
-    Result::ok(child.kill());
-}
-
-pub(crate) fn terminate_group_after_exit(_child: &Child) {
-    #[cfg(unix)]
-    {
-        use nix::sys::signal::{Signal, killpg};
-        use nix::unistd::Pid;
-        Result::ok(killpg(Pid::from_raw(_child.id() as i32), Signal::SIGKILL));
-    }
+    (outcome, delivery)
 }
 
 /// Put a long-lived sandbox helper in its own process group where the
@@ -384,31 +239,6 @@ fn reap_event_child_with(child: Child, reaper: Option<&Sender<Child>>) {
     }
 }
 
-fn reap_bounded(mut child: Child) {
-    let deadline = Instant::now() + KILL_REAP_BUDGET;
-    loop {
-        match child.try_wait() {
-            Ok(Some(_)) => return,
-            Err(_) => break,
-            Ok(None) if Instant::now() < deadline => thread::sleep(Duration::from_millis(10)),
-            Ok(None) => break,
-        }
-    }
-    match reaper_sender() {
-        Some(sender) => match sender.send(child) {
-            Ok(()) => {}
-            Err(mpsc::SendError(mut child)) => {
-                // An unavailable reaper is exceptional. Preserve ownership
-                // and wait here rather than dropping a live Child handle.
-                Result::ok(child.wait());
-            }
-        },
-        None => {
-            Result::ok(child.wait());
-        }
-    }
-}
-
 fn reaper_sender() -> Option<&'static Sender<Child>> {
     static REAPER: OnceLock<Option<Sender<Child>>> = OnceLock::new();
     REAPER
@@ -428,6 +258,9 @@ fn reaper_sender() -> Option<&'static Sender<Child>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io;
+    use std::thread;
+    use std::time::Instant;
 
     fn sh(script: &str) -> Vec<String> {
         vec!["sh".into(), "-c".into(), script.into()]
@@ -473,6 +306,103 @@ mod tests {
         let (child, pid) = killed_event_child();
         reap_event_child_with(child, Some(&sender));
         assert_pid_is_reaped(pid);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn map_run_maps_every_end_and_a_missing_leader() {
+        let run = |end, leader| thegn_proc::Run {
+            end,
+            group: thegn_proc::GroupState::Unknown,
+            leader,
+            leader_exited_first: false,
+            stdout: thegn_proc::Capture::default(),
+            stderr: thegn_proc::Capture::default(),
+            containment: thegn_proc::Containment::ProcessGroup,
+        };
+
+        assert!(matches!(
+            map_run(run(thegn_proc::End::TimedOut, thegn_proc::Leader::Detached)),
+            ProcOutcome::Timeout
+        ));
+        assert!(matches!(
+            map_run(run(
+                thegn_proc::End::Cancelled,
+                thegn_proc::Leader::Detached
+            )),
+            ProcOutcome::Wait
+        ));
+        assert!(matches!(
+            map_run(run(
+                thegn_proc::End::Supervise(io::Error::other("wait failed")),
+                thegn_proc::Leader::ReapFailed(io::Error::other("wait failed")),
+            )),
+            ProcOutcome::Wait
+        ));
+        assert!(matches!(
+            map_run(run(
+                thegn_proc::End::OutputLimit(thegn_proc::Which::Stdout),
+                thegn_proc::Leader::Detached,
+            )),
+            ProcOutcome::Wait
+        ));
+        assert!(matches!(
+            map_run(run(
+                thegn_proc::End::LeaderExited,
+                thegn_proc::Leader::Detached
+            )),
+            ProcOutcome::Wait
+        ));
+        assert!(matches!(
+            map_run(run(
+                thegn_proc::End::Spawn(io::Error::from(io::ErrorKind::NotFound)),
+                thegn_proc::Leader::NotSpawned
+            )),
+            ProcOutcome::Spawn
+        ));
+
+        let status = std::process::Command::new("true").status().unwrap();
+        match map_run(run(
+            thegn_proc::End::LeaderExited,
+            thegn_proc::Leader::Reaped(status),
+        )) {
+            ProcOutcome::Exited { stdout, stderr, .. } => {
+                assert!(!stdout.truncated);
+                assert!(!stderr.truncated);
+            }
+            other => panic!("reaped leader should map to exit, got {other:?}"),
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn bounded_runs_start_no_helper_threads() {
+        let runner = thread::spawn(|| {
+            run_bounded_with_input(
+                &sh("sleep 1"),
+                Duration::from_secs(5),
+                Capture {
+                    stdout: Some(64),
+                    stderr: Some(64),
+                },
+                b"x".to_vec(),
+            )
+        });
+        thread::sleep(Duration::from_millis(300));
+        let names: Vec<String> = std::fs::read_dir("/proc/self/task")
+            .unwrap()
+            .filter_map(|entry| std::fs::read_to_string(entry.unwrap().path().join("comm")).ok())
+            .map(|name| name.trim().to_string())
+            .collect();
+        let (outcome, delivery) = runner.join().unwrap();
+        assert!(
+            !names
+                .iter()
+                .any(|name| name == "thegn-sbx-read" || name == "thegn-sbx-feed"),
+            "a bounded run must not spawn reader/feeder threads: {names:?}"
+        );
+        assert!(matches!(outcome, ProcOutcome::Exited { .. }));
+        assert_eq!(delivery, InputDelivery::Complete);
     }
 
     #[test]
