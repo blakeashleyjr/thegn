@@ -570,10 +570,30 @@ done
             },
             comments: vec![],
             comments_complete: false,
+            labels_complete: true,
         };
 
         let validated = backend.validate_detail(detail).unwrap();
         assert!(!validated.comments_complete);
+    }
+
+    #[test]
+    fn plugin_detail_keeps_incomplete_labels_marker() {
+        let (_fixture, _session, bridge) = live_bridge();
+        let backend = PluginIssueBackend::new(bridge, "demo", IssueCaps::default()).unwrap();
+        let detail = IssueDetail {
+            issue: Issue {
+                id: "plugin:demo:7".into(),
+                number: "7".into(),
+                provider: "plugin:demo".into(),
+                ..Default::default()
+            },
+            labels_complete: false,
+            ..Default::default()
+        };
+
+        let validated = backend.validate_detail(detail).unwrap();
+        assert!(!validated.labels_complete);
     }
 
     #[test]
