@@ -5,6 +5,7 @@ use std::io::Read;
 use std::path::Path;
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError};
 use std::time::{Duration, Instant};
+use tg_kit::{AppTile, ChangeHook};
 use thegn_core::plugin_api::{
     API_VERSION, ExtensionPoint, PluginCallback, PluginMode, RpcError, RpcErrorCode, RpcResponse,
 };
@@ -218,6 +219,16 @@ fn preview_value(dir: &Path, size: (u16, u16), wait: Duration) -> Result<Value> 
         Ok(value)
     })();
 
+    let close = close_session(runtime, supervisor, session, &writer);
+    result.and(close.map(|()| ()))
+}
+
+pub(super) fn close_session(
+    runtime: tokio::runtime::Runtime,
+    supervisor: ResidentSupervisor,
+    session: ResidentSession,
+    writer: &SessionWriter,
+) -> Result<()> {
     if let Err(error) = writer.notify_control(PluginCallback::Deactivate, json!({})) {
         tracing::debug!(target: "thegn::plugin::preview", %error, "deactivate not delivered");
     }
@@ -229,10 +240,94 @@ fn preview_value(dir: &Path, size: (u16, u16), wait: Duration) -> Result<Value> 
         tracing::warn!(target: "thegn::plugin::preview", unresolved = ?report.unresolved, "plugin preview left an unsettled resident session");
     }
     runtime.shutdown_timeout(Duration::from_secs(2));
-    match (result, clean) {
-        (Ok(_), false) => bail!("plugin did not shut down cleanly within 5 s"),
-        (Ok(value), true) => Ok(value),
-        (Err(error), _) => Err(error),
+    if clean {
+        Ok(())
+    } else {
+        bail!("plugin did not shut down cleanly within 5 s")
+    }
+}
+
+struct LiveParts {
+    runtime: tokio::runtime::Runtime,
+    supervisor: ResidentSupervisor,
+    session: ResidentSession,
+    writer: SessionWriter,
+}
+
+pub(super) fn run_interactive(dir: &Path, _size: (u16, u16)) -> Result<()> {
+    let (plugin, surface) = load_plugin(dir)?;
+    let mut parts = None;
+    let result = tg_kit::standalone::run(|hook| {
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .thread_name("thegn-plugpre")
+            .enable_all()
+            .build()?;
+        let supervisor = ResidentSupervisor::new(runtime.handle().clone());
+        let inbox = std::sync::Arc::new(std::sync::Mutex::new(super::live_tile::Inbox::default()));
+        let inbox_callback = inbox.clone();
+        let callback_surface = surface.clone();
+        let callback_hook: ChangeHook = hook.clone();
+        let session = ResidentSession::spawn(
+            &supervisor,
+            "preview",
+            &plugin.spec.command,
+            &BTreeMap::new(),
+            plugin.effective_cwd().as_deref(),
+            move |event| {
+                super::live_tile::on_session_event(
+                    &inbox_callback,
+                    &callback_surface,
+                    &callback_hook,
+                    event,
+                );
+            },
+        )?;
+        let writer = session.writer();
+        parts = Some(LiveParts {
+            runtime,
+            supervisor,
+            session,
+            writer: writer.clone(),
+        });
+        let granted = if plugin
+            .spec
+            .manifest
+            .capabilities
+            .iter()
+            .any(|capability| capability.as_str() == "surface:app")
+        {
+            vec!["surface:app"]
+        } else {
+            Vec::new()
+        };
+        writer.notify_control(
+            PluginCallback::Activate,
+            json!({
+                "api": API_VERSION,
+                "session": writer.session_token(),
+                "granted": granted,
+                "background": false
+            }),
+        )?;
+        Ok(Box::new(super::live_tile::LiveTile::new(
+            surface,
+            writer,
+            inbox,
+            hook,
+            super::live_tile::REQUEST_ACK_TIMEOUT,
+        )) as Box<dyn AppTile>)
+    });
+    if let Some(parts) = parts {
+        let close = close_session(
+            parts.runtime,
+            parts.supervisor,
+            parts.session,
+            &parts.writer,
+        );
+        result.and(close)
+    } else {
+        result
     }
 }
 
