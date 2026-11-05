@@ -159,7 +159,12 @@ dashboard (`j`/`k` or the arrow keys, `esc` to close):
   `refused` (dispatcher full or the plugin's in-flight cap), `timeout`, `lost`
   (session closed or dispatcher down before the call ran, or the reply could
   not be written) and `drops` (plugin events thegn dropped or refused because
-  the plugin's queue was full). Amber means nonzero; the section is absent
+  the plugin's queue was full). A `bridge` column shows
+  `timeout/cancel/late/malformed/closed` for a provider plugin's `provider.call`
+  bridge: calls that hit the reply deadline, calls the caller dropped, replies
+  that matched no waiter, replies with neither or both of result and error, and
+  calls woken by a session close; it restarts at zero when the plugin restarts.
+  Amber means nonzero; the section is absent
   while every counter is zero. Refreshed when the modal refreshes, not live.
 - **loop** — the event-loop rollup: wakes/s, render / input / flush / drain /
   switch latency, the frame mix, PTY throughput, and the idle and render-busy
