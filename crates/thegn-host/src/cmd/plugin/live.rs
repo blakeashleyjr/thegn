@@ -19,6 +19,72 @@ const MIN_WAIT_MS: u64 = 100;
 const MAX_WAIT_MS: u64 = 30_000;
 const CLOSE_WAIT: Duration = Duration::from_secs(5);
 
+use super::trace::Trace;
+use std::sync::{Arc, Mutex};
+
+/// The session label every live record carries. The real session token is never written to a trace.
+const LIVE_TRACE_SESSION: &str = "live";
+type SharedTrace = Arc<Mutex<Trace>>;
+
+/// Metadata for one plugin event, excluding params, results and junk text.
+fn event_frame(event: &SessionEvent) -> Value {
+    match event {
+        SessionEvent::Message(message) => json!({"method": message.method, "id": message.id}),
+        SessionEvent::Response(response) => {
+            let mut frame = json!({"method": "response", "id": response.id});
+            if response.error.is_some() {
+                frame["error"] = json!(true);
+            }
+            frame
+        }
+        SessionEvent::Junk(_) => json!({"method": "junk"}),
+        SessionEvent::Exit { .. } => json!({"method": "exit"}),
+    }
+}
+
+fn capture_event(trace: &SharedTrace, started: Instant, event: &SessionEvent) {
+    super::preview::record(
+        trace,
+        "incoming",
+        LIVE_TRACE_SESSION,
+        started,
+        &event_frame(event),
+    );
+}
+
+fn capture_outgoing(
+    trace: &SharedTrace,
+    started: Instant,
+    method: &str,
+    id: Option<u64>,
+    error: bool,
+) {
+    let mut frame = json!({"method": method, "id": id});
+    if error {
+        frame["error"] = json!(true);
+    }
+    super::preview::record(trace, "outgoing", LIVE_TRACE_SESSION, started, &frame);
+}
+
+fn precheck_record(record: Option<&Path>) -> Result<()> {
+    if let Some(path) = record
+        && std::fs::symlink_metadata(path).is_ok()
+    {
+        bail!(
+            "trace destination {} already exists; a trace is never overwritten",
+            path.display()
+        );
+    }
+    Ok(())
+}
+
+fn save_trace(trace: &SharedTrace, record: Option<&Path>) -> Result<()> {
+    match record {
+        Some(path) => trace.lock().unwrap_or_else(|e| e.into_inner()).save(path),
+        None => Ok(()),
+    }
+}
+
 pub(super) fn wait_ms(value: &str) -> std::result::Result<u64, String> {
     let wait = value
         .parse::<u64>()
@@ -102,6 +168,8 @@ fn collect_first_view(
     surface: &str,
     deadline: Instant,
     wait_ms: u64,
+    trace: &SharedTrace,
+    started: Instant,
 ) -> Result<Collected> {
     let mut rejected_views = 0_u64;
     let mut junk_lines = 0_u64;
@@ -136,8 +204,11 @@ fn collect_first_view(
                         id,
                         RpcError::new(RpcErrorCode::Denied, "plugin preview grants no host calls"),
                     );
-                    if let Err(error) = writer.respond(&response) {
-                        tracing::debug!(target: "thegn::plugin::preview", %error, "denial not delivered");
+                    match writer.respond(&response) {
+                        Ok(()) => capture_outgoing(trace, started, "response", Some(id), true),
+                        Err(error) => {
+                            tracing::debug!(target: "thegn::plugin::preview", %error, "denial not delivered");
+                        }
                     }
                 }
             }
@@ -161,7 +232,13 @@ fn collect_first_view(
     }
 }
 
-fn preview_value(dir: &Path, size: (u16, u16), wait: Duration) -> Result<Value> {
+fn preview_value_traced(
+    dir: &Path,
+    size: (u16, u16),
+    wait: Duration,
+    trace: &SharedTrace,
+    started: Instant,
+) -> Result<Value> {
     let (plugin, surface) = load_plugin(dir)?;
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(1)
@@ -170,6 +247,7 @@ fn preview_value(dir: &Path, size: (u16, u16), wait: Duration) -> Result<Value> 
         .build()?;
     let supervisor = ResidentSupervisor::new(runtime.handle().clone());
     let (tx, rx) = mpsc::channel::<SessionEvent>();
+    let callback_trace = trace.clone();
     let session = ResidentSession::spawn(
         &supervisor,
         "preview",
@@ -177,6 +255,7 @@ fn preview_value(dir: &Path, size: (u16, u16), wait: Duration) -> Result<Value> 
         &BTreeMap::new(),
         plugin.effective_cwd().as_deref(),
         move |event| {
+            capture_event(&callback_trace, started, &event);
             if tx.send(event).is_err() {
                 // The preview has finished receiving events.
             }
@@ -205,8 +284,17 @@ fn preview_value(dir: &Path, size: (u16, u16), wait: Duration) -> Result<Value> 
                 "background": false
             }),
         )?;
+        capture_outgoing(trace, started, "activate", None, false);
         let wait_ms = u64::try_from(wait.as_millis()).unwrap_or(u64::MAX);
-        let collected = collect_first_view(&rx, &writer, &surface, Instant::now() + wait, wait_ms)?;
+        let collected = collect_first_view(
+            &rx,
+            &writer,
+            &surface,
+            Instant::now() + wait,
+            wait_ms,
+            trace,
+            started,
+        )?;
         let mut tile = super::preview::tile_for_view(collected.view.clone(), size)?;
         let mut value = super::preview::snapshot_value(tile.as_mut(), size);
         value["live"] = json!({
@@ -219,8 +307,20 @@ fn preview_value(dir: &Path, size: (u16, u16), wait: Duration) -> Result<Value> 
         Ok(value)
     })();
 
+    capture_outgoing(trace, started, "deactivate", None, false);
     let close = close_session(runtime, supervisor, session, &writer);
     result.and_then(|value| close.map(|()| value))
+}
+
+#[cfg(test)]
+fn preview_value(dir: &Path, size: (u16, u16), wait: Duration) -> Result<Value> {
+    preview_value_traced(
+        dir,
+        size,
+        wait,
+        &Arc::new(Mutex::new(Trace::default())),
+        Instant::now(),
+    )
 }
 
 pub(super) fn close_session(
@@ -254,7 +354,14 @@ struct LiveParts {
     writer: SessionWriter,
 }
 
-pub(super) fn run_interactive(dir: &Path, _size: (u16, u16)) -> Result<()> {
+pub(super) fn run_interactive(dir: &Path, _size: (u16, u16), record: Option<&Path>) -> Result<()> {
+    precheck_record(record)?;
+    let trace = Arc::new(Mutex::new(if record.is_some() {
+        Trace::new(false)
+    } else {
+        Trace::default()
+    }));
+    let started = Instant::now();
     let (plugin, surface) = load_plugin(dir)?;
     let mut parts = None;
     let result = tg_kit::standalone::run(|hook| {
@@ -268,6 +375,7 @@ pub(super) fn run_interactive(dir: &Path, _size: (u16, u16)) -> Result<()> {
         let inbox_callback = inbox.clone();
         let callback_surface = surface.clone();
         let callback_hook: ChangeHook = hook.clone();
+        let callback_trace = trace.clone();
         let session = ResidentSession::spawn(
             &supervisor,
             "preview",
@@ -275,6 +383,7 @@ pub(super) fn run_interactive(dir: &Path, _size: (u16, u16)) -> Result<()> {
             &BTreeMap::new(),
             plugin.effective_cwd().as_deref(),
             move |event| {
+                capture_event(&callback_trace, started, &event);
                 super::live_tile::on_session_event(
                     &inbox_callback,
                     &callback_surface,
@@ -311,6 +420,7 @@ pub(super) fn run_interactive(dir: &Path, _size: (u16, u16)) -> Result<()> {
                 "background": false
             }),
         )?;
+        capture_outgoing(&trace, started, "activate", None, false);
         Ok(Box::new(super::live_tile::LiveTile::new(
             surface,
             writer,
@@ -318,7 +428,8 @@ pub(super) fn run_interactive(dir: &Path, _size: (u16, u16)) -> Result<()> {
             super::live_tile::REQUEST_ACK_TIMEOUT,
         )) as Box<dyn AppTile>)
     });
-    if let Some(parts) = parts {
+    let result = if let Some(parts) = parts {
+        capture_outgoing(&trace, started, "deactivate", None, false);
         let close = close_session(
             parts.runtime,
             parts.supervisor,
@@ -328,12 +439,43 @@ pub(super) fn run_interactive(dir: &Path, _size: (u16, u16)) -> Result<()> {
         result.and(close)
     } else {
         result
+    };
+    let saved = save_trace(&trace, record);
+    match (result, saved) {
+        (Ok(()), Ok(())) => Ok(()),
+        (Ok(()), Err(error)) => Err(error),
+        (Err(error), Ok(())) => Err(error),
+        (Err(error), Err(save_error)) => {
+            tracing::warn!(target: "thegn::plugin::preview", error = %save_error, "trace not written");
+            Err(error)
+        }
     }
 }
 
-pub(super) fn run_headless(dir: &Path, size: (u16, u16), wait: Duration) -> Result<()> {
-    let value = preview_value(dir, size, wait)?;
-    crate::cmd::emit_json(&value)
+pub(super) fn run_headless(
+    dir: &Path,
+    size: (u16, u16),
+    wait: Duration,
+    record: Option<&Path>,
+) -> Result<()> {
+    precheck_record(record)?;
+    let trace = Arc::new(Mutex::new(if record.is_some() {
+        Trace::new(false)
+    } else {
+        Trace::default()
+    }));
+    let started = Instant::now();
+    let value = preview_value_traced(dir, size, wait, &trace, started);
+    let saved = save_trace(&trace, record);
+    match (value, saved) {
+        (Ok(value), Ok(())) => crate::cmd::emit_json(&value),
+        (Ok(_), Err(error)) => Err(error),
+        (Err(error), Ok(())) => Err(error),
+        (Err(error), Err(save_error)) => {
+            tracing::warn!(target: "thegn::plugin::preview", error = %save_error, "trace not written");
+            Err(error)
+        }
+    }
 }
 
 #[cfg(test)]
@@ -640,5 +782,182 @@ for line in sys.stdin:
         assert!(wait_ms("99").is_err());
         assert!(wait_ms("30001").is_err());
         assert!(wait_ms("abc").is_err());
+    }
+
+    #[test]
+    fn live_trace_headless_records_metadata_only_in_a_private_file() {
+        if !python_available() {
+            return;
+        }
+        let temp = tempfile::tempdir().unwrap();
+        let script = temp.path().join("calls.py");
+        let token_path = temp.path().join("session-token");
+        std::fs::write(
+            &script,
+            r#"import json, sys
+for line in sys.stdin:
+    message = json.loads(line)
+    if message.get("method") == "activate":
+        with open(sys.argv[1], "w") as token_file:
+            token_file.write(message["params"]["session"])
+    if message.get("id") == 7:
+        denied = message.get("error", {}).get("code") == "denied"
+        text = "denied" if denied else "allowed"
+        print(json.dumps({"method":"update","params":{"surface":"livetest.workspace","app":{"state_scope":"fixture","revision":1,"status":"Live","root":{"kind":"text","id":"text","title":"Live","text":text}}}}), flush=True)
+    if message.get("method") == "deactivate":
+        break
+"#,
+        )
+        .unwrap();
+        let token_path_arg = token_path.display().to_string();
+        let plugin = staged_plugin(
+            "resident",
+            &script,
+            &[token_path_arg.as_str()],
+            "livetest.workspace",
+            "AppTab",
+        );
+        let trace = Arc::new(Mutex::new(Trace::new(false)));
+        let value = preview_value_traced(
+            plugin.path(),
+            (60, 8),
+            Duration::from_secs(10),
+            &trace,
+            Instant::now(),
+        )
+        .unwrap();
+        assert_line(&value, "denied");
+
+        let path = temp.path().join("live.jsonl");
+        save_trace(&trace, Some(&path)).unwrap();
+        let text = std::fs::read_to_string(&path).unwrap();
+        let token = std::fs::read_to_string(&token_path).unwrap();
+        assert!(!token.is_empty());
+        assert!(!text.contains("denied"));
+        assert!(!text.contains("sessions.list"));
+        assert!(!text.contains("capability"));
+        assert!(!text.contains("Live"));
+        assert!(!text.contains(&token));
+
+        let rows = text
+            .lines()
+            .map(|line| serde_json::from_str::<Value>(line).unwrap())
+            .collect::<Vec<_>>();
+        assert!(rows.iter().all(|row| {
+            row["direction"].is_string()
+                && row["frame"]["method"].is_string()
+                && row["frame"].get("id").is_some()
+                && row["frame"]["error"].is_boolean()
+                && row["redacted"].as_bool().unwrap_or(false)
+                && row["frame"]["payload"] == "redacted"
+        }));
+        let observed = rows
+            .iter()
+            .map(|row| {
+                (
+                    row["direction"].as_str().unwrap(),
+                    row["frame"]["method"].as_str().unwrap(),
+                    row["frame"]["id"].clone(),
+                    row["frame"]["error"].as_bool().unwrap_or(false),
+                )
+            })
+            .collect::<Vec<_>>();
+        assert!(observed.contains(&("incoming", "host.call", json!(7), false)));
+        assert!(observed.contains(&("incoming", "update", Value::Null, false)));
+        assert!(observed.contains(&("outgoing", "activate", Value::Null, false)));
+        assert!(observed.contains(&("outgoing", "response", json!(7), true)));
+        assert!(observed.contains(&("outgoing", "deactivate", Value::Null, false)));
+        assert!(save_trace(&trace, Some(&path)).is_err());
+    }
+
+    #[test]
+    fn live_trace_refuses_an_existing_destination_before_any_spawn() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("existing.jsonl");
+        let contents = b"keep this trace";
+        std::fs::write(&path, contents).unwrap();
+
+        let error = run_headless(
+            Path::new("/nonexistent-plugin-dir"),
+            (60, 8),
+            Duration::from_millis(100),
+            Some(&path),
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("already exists"));
+        assert_eq!(std::fs::read(path).unwrap(), contents);
+    }
+
+    #[test]
+    fn live_trace_headless_saves_a_trace_when_the_plugin_crashes() {
+        if !python_available() {
+            return;
+        }
+        let plugin = fault_plugin("crash", "fixture.workspace");
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("crash.jsonl");
+        let error =
+            run_headless(plugin.path(), (60, 8), Duration::from_secs(10), Some(&path)).unwrap_err();
+
+        assert!(
+            error
+                .to_string()
+                .contains("exited before its first app view")
+        );
+        let text = std::fs::read_to_string(path).unwrap();
+        assert!(text.lines().any(|line| {
+            serde_json::from_str::<Value>(line)
+                .is_ok_and(|record| record["frame"]["method"] == "exit")
+        }));
+    }
+
+    #[test]
+    fn live_trace_event_frame_drops_params_junk_text_and_results() {
+        let message = event_frame(&SessionEvent::Message(thegn_core::plugin_api::RpcMessage {
+            id: Some(9),
+            method: "host.call".into(),
+            params: json!({"secret":"params-value"}),
+        }));
+        let success = event_frame(&SessionEvent::Response(RpcResponse::ok(
+            10,
+            json!({"secret":"result-value"}),
+        )));
+        let failure = event_frame(&SessionEvent::Response(RpcResponse::err(
+            11,
+            RpcError::new(RpcErrorCode::Denied, "private error text"),
+        )));
+        let junk = event_frame(&SessionEvent::Junk("token-value".into()));
+        let exit = event_frame(&SessionEvent::Exit { code: None });
+        let encoded = format!("{message} {success} {failure} {junk} {exit}");
+
+        assert!(!encoded.contains("params"));
+        assert!(!encoded.contains("result"));
+        assert!(!encoded.contains("token-value"));
+        assert!(!encoded.contains("private error text"));
+        assert_eq!(message["method"], "host.call");
+        assert_eq!(success.get("error"), None);
+        assert!(failure["error"].as_bool().unwrap_or(false));
+        assert_eq!(message.get("error"), None);
+        assert_eq!(junk.get("error"), None);
+        assert_eq!(exit.get("error"), None);
+        assert_eq!(junk, json!({"method":"junk"}));
+        assert_eq!(exit, json!({"method":"exit"}));
+    }
+
+    #[test]
+    fn live_trace_capture_stops_at_the_record_bound_and_keeps_the_prefix() {
+        let trace = Arc::new(Mutex::new(Trace::new(false)));
+        let started = Instant::now();
+        let event = SessionEvent::Exit { code: None };
+        for _ in 0..20_100 {
+            capture_event(&trace, started, &event);
+        }
+        assert_eq!(
+            trace
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .record_count(),
+            20_000
+        );
     }
 }
