@@ -171,6 +171,14 @@ struct LinearUser {
 #[derive(Deserialize, Default)]
 struct LinearLabelList {
     nodes: Vec<LinearLabel>,
+    #[serde(default, rename = "pageInfo")]
+    page_info: Option<LinearPageInfo>,
+}
+
+fn linear_labels_complete(labels: Option<&LinearLabelList>) -> bool {
+    labels
+        .and_then(|list| list.page_info.as_ref())
+        .is_none_or(|info| !info.has_next_page)
 }
 
 #[derive(Deserialize)]
@@ -588,6 +596,7 @@ fn build_get_query(identifier: &str) -> String {
     format!(
         r#"query {{ issue(id: "{identifier}") {{
                 {ISSUE_FIELDS}
+                labels {{ pageInfo {{ hasNextPage }} }}
                 comments(first: {MAX_PAGE_SIZE}) {{
                     nodes {{ id body user {{ name }} createdAt }}
                     pageInfo {{ hasNextPage endCursor }}
@@ -796,11 +805,14 @@ impl IssueBackend for LinearBackend {
                     created_at_ms: parse_updated_at(&c.created_at),
                 })
                 .collect();
+            let labels_complete = linear_labels_complete(li.issue.labels.as_ref());
             Ok(IssueDetail {
                 issue: linear_issue_to_domain(li.issue)?,
                 comments,
                 // Incomplete comment paging returns an error before reaching this result.
                 comments_complete: true,
+                // Label paging is reported, not followed: a truncated label page sets this false.
+                labels_complete,
             })
         })
     }
@@ -987,6 +999,53 @@ mod tests {
 
     fn state(ty: &str) -> Option<LinearState> {
         serde_json::from_value(json!({ "type": ty })).unwrap()
+    }
+
+    #[test]
+    fn labels_complete_reads_the_label_page_info() {
+        let issue = |labels| {
+            serde_json::from_value::<LinearIssue>(json!({
+                "id": "u",
+                "identifier": "ABC-1",
+                "title": "t",
+                "url": "https://linear.app/x/issue/ABC-1",
+                "updatedAt": "1970-01-01T00:00:04Z",
+                "labels": labels
+            }))
+            .unwrap()
+        };
+
+        let partial = issue(json!({
+            "nodes": [{"name": "a"}],
+            "pageInfo": {"hasNextPage": true, "endCursor": "c"}
+        }));
+        assert!(!linear_labels_complete(partial.labels.as_ref()));
+
+        let complete = issue(json!({
+            "nodes": [{"name": "a"}],
+            "pageInfo": {"hasNextPage": false, "endCursor": null}
+        }));
+        assert!(linear_labels_complete(complete.labels.as_ref()));
+
+        let absent_metadata = issue(json!({"nodes": [{"name": "a"}]}));
+        assert!(linear_labels_complete(absent_metadata.labels.as_ref()));
+
+        let absent_labels = serde_json::from_value::<LinearIssue>(json!({
+            "id": "u",
+            "identifier": "ABC-1",
+            "title": "t",
+            "url": "https://linear.app/x/issue/ABC-1",
+            "updatedAt": "1970-01-01T00:00:04Z"
+        }))
+        .unwrap();
+        assert!(linear_labels_complete(absent_labels.labels.as_ref()));
+    }
+
+    #[test]
+    fn get_query_asks_for_label_page_info() {
+        let query = build_get_query("ABC-1");
+        assert!(query.contains("labels { pageInfo { hasNextPage } }"));
+        assert!(query.contains("comments(first: 250)"));
     }
 
     fn list_item(n: usize) -> serde_json::Value {

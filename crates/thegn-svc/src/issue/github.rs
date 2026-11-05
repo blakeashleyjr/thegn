@@ -479,6 +479,8 @@ impl IssueBackend for GitHubIssuesBackend {
                 comments,
                 // gh preloads every comment page when the comments field is requested.
                 comments_complete: true,
+                // gh returns every label.
+                labels_complete: true,
             })
         })
     }
