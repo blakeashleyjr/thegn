@@ -1128,7 +1128,7 @@ impl Db {
 /// `status` is one of queued/folding/verifying/landed/deferred/gate_failed/
 /// agent_running/ready/needs_human.
 /// `conflict_paths` is newline-joined when present.
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MergeQueueRow {
     pub worktree: String,
     pub branch: String,
@@ -1144,13 +1144,47 @@ pub struct MergeQueueRow {
     /// ssh/provider blob. Lets the queue attribute a row to a host without a
     /// live git shell — the cross-host drain reads it to decide whether the
     /// branch tip must be fetched into the target store. See [`crate::remote`].
-    #[serde(default)]
     pub location: String,
     /// How many agent-dispatch → re-fold cycles have been spent on this row.
     /// Persisted (v49) so `agent_max_attempts` is a budget for the branch, not
     /// for one invocation of the drain.
-    #[serde(default)]
     pub agent_attempts: u32,
+}
+
+impl MergeQueueRow {
+    /// The identity-drift reason encoded in this row's hold detail, if any.
+    pub fn identity_drift(&self) -> Option<&str> {
+        self.error_detail
+            .as_deref()
+            .and_then(crate::merge_identity_drift::drift_reason)
+    }
+}
+
+impl serde::Serialize for MergeQueueRow {
+    fn serialize<S: serde::Serializer>(
+        &self,
+        serializer: S,
+    ) -> std::result::Result<S::Ok, S::Error> {
+        use serde::ser::SerializeStruct;
+
+        let mut state = serializer.serialize_struct("MergeQueueRow", 12)?;
+        state.serialize_field("worktree", &self.worktree)?;
+        state.serialize_field("branch", &self.branch)?;
+        state.serialize_field("target_branch", &self.target_branch)?;
+        state.serialize_field("status", &self.status)?;
+        state.serialize_field("queued_at", &self.queued_at)?;
+        state.serialize_field("updated_at", &self.updated_at)?;
+        state.serialize_field("result_oid", &self.result_oid)?;
+        state.serialize_field("conflict_paths", &self.conflict_paths)?;
+        state.serialize_field("error_detail", &self.error_detail)?;
+        state.serialize_field("location", &self.location)?;
+        state.serialize_field("agent_attempts", &self.agent_attempts)?;
+        let drift = self
+            .identity_drift()
+            .map(|reason| crate::merge_identity_drift::IdentityDrift { reason });
+        state.serialize_field("identity_drift", &drift)?;
+        state.end()
+    }
 }
 
 /// One `pr_queue` row — a pull request thegn is shepherding on a forge.
