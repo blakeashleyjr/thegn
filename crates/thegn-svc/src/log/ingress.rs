@@ -39,6 +39,9 @@ struct State {
     bytes: usize,
     gap: u64,
     dropped_total: u64,
+    pushed_total: u64,
+    taken_total: u64,
+    gap_markers_total: u64,
 }
 
 /// Snapshot of bounded queue health for diagnostics.
@@ -47,6 +50,9 @@ pub struct IngressStats {
     pub pending: usize,
     pub pending_bytes: usize,
     pub dropped_total: u64,
+    pub pushed_total: u64,
+    pub taken_total: u64,
+    pub gap_markers_total: u64,
     pub oldest_age: Option<Duration>,
 }
 
@@ -96,6 +102,7 @@ impl LogIngress {
         let now = Instant::now();
         let mut state = self.lock();
         let was_empty = state.queue.is_empty();
+        let batch_len = batch.len();
         for log in batch {
             let cost = parsed_cost(&log);
             state.bytes = state.bytes.saturating_add(cost);
@@ -109,6 +116,9 @@ impl LogIngress {
                 state.dropped_total = state.dropped_total.saturating_add(1);
             }
         }
+        state.pushed_total = state
+            .pushed_total
+            .saturating_add(u64::try_from(batch_len).unwrap_or(u64::MAX));
         was_empty
     }
 
@@ -120,12 +130,14 @@ impl LogIngress {
         if state.gap > 0 {
             out.push(gap_marker(state.gap));
             state.gap = 0;
+            state.gap_markers_total = state.gap_markers_total.saturating_add(1);
         }
         for _ in 0..max_records {
             let Some(entry) = state.queue.pop_front() else {
                 break;
             };
             state.bytes -= entry.cost;
+            state.taken_total = state.taken_total.saturating_add(1);
             out.push(entry.log);
         }
         out
@@ -143,6 +155,9 @@ impl LogIngress {
             pending: state.queue.len(),
             pending_bytes: state.bytes,
             dropped_total: state.dropped_total,
+            pushed_total: state.pushed_total,
+            taken_total: state.taken_total,
+            gap_markers_total: state.gap_markers_total,
             oldest_age: state.queue.front().map(|entry| entry.at.elapsed()),
         }
     }
@@ -237,5 +252,76 @@ mod tests {
         assert!(!queue.is_orphaned());
         drop(consumer);
         assert!(queue.is_orphaned());
+    }
+
+    #[test]
+    fn counters_track_push_take_and_drop() {
+        let queue = LogIngress::new();
+        queue.push((0..3).map(|index| rec(&format!("line-{index}"))).collect());
+        queue.take(2);
+
+        let stats = queue.stats();
+        assert_eq!(stats.pushed_total, 3);
+        assert_eq!(stats.taken_total, 2);
+        assert_eq!(stats.dropped_total, 0);
+        assert_eq!(stats.pending, 1);
+        assert_eq!(stats.gap_markers_total, 0);
+        assert_eq!(
+            stats.pushed_total,
+            stats.taken_total + stats.dropped_total + stats.pending as u64
+        );
+    }
+
+    #[test]
+    fn counters_conserve_under_saturation() {
+        let queue = LogIngress::new();
+        let count = MAX_PENDING_RECORDS + 50;
+        for index in 0..count {
+            queue.push(vec![rec(&format!("line-{index}"))]);
+        }
+
+        let saturated = queue.stats();
+        assert_eq!(saturated.pushed_total, count as u64);
+        assert_eq!(saturated.dropped_total, 50);
+        assert_eq!(
+            saturated.pushed_total,
+            saturated.taken_total + saturated.dropped_total + saturated.pending as u64
+        );
+
+        queue.take(usize::MAX);
+        let drained = queue.stats();
+        assert_eq!(drained.gap_markers_total, 1);
+        assert_eq!(drained.taken_total, MAX_PENDING_RECORDS as u64);
+        assert_eq!(drained.pending, 0);
+        assert_eq!(
+            drained.pushed_total,
+            drained.taken_total + drained.dropped_total + drained.pending as u64
+        );
+    }
+
+    #[test]
+    fn gap_marker_counts_once_per_gap() {
+        let queue = LogIngress::new();
+        for index in 0..=MAX_PENDING_RECORDS {
+            queue.push(vec![rec(&format!("first-{index}"))]);
+        }
+        queue.take(usize::MAX);
+        assert_eq!(queue.stats().gap_markers_total, 1);
+
+        for index in 0..=MAX_PENDING_RECORDS {
+            queue.push(vec![rec(&format!("second-{index}"))]);
+        }
+        queue.take(usize::MAX);
+        assert_eq!(queue.stats().gap_markers_total, 2);
+    }
+
+    #[test]
+    fn empty_queue_has_no_oldest_age() {
+        let stats = LogIngress::new().stats();
+
+        assert!(stats.oldest_age.is_none());
+        assert_eq!(stats.pushed_total, 0);
+        assert_eq!(stats.taken_total, 0);
+        assert_eq!(stats.gap_markers_total, 0);
     }
 }
