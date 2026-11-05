@@ -152,9 +152,8 @@ mod tests {
     #[test]
     fn non_landed_claimed_write_clears_the_columns() {
         let db = seeded(Some(SRC));
-        seed_landed_columns(&db, "folding");
-        let mut request = request();
-        request.expected_status = "folding".into();
+        seed_landed_columns(&db, "queued");
+        let request = request();
         let claim = db.admit_merge_claim(&request).unwrap().unwrap();
         db.replace_merge_status_claimed(&claim, "deferred", &MergeStatusFields::default())
             .unwrap();
