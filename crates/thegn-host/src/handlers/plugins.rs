@@ -31,20 +31,12 @@ const MAX_PENDING_ALERTS_PER_PLUGIN: usize = 16;
 // The inbox/toast row is display text, so keep its stricter host-side cap.
 const MAX_ALERT_MESSAGE_BYTES: usize = 1024;
 const _: () = assert!(MAX_ALERT_MESSAGE_BYTES <= thegn_core::plugin_api::MAX_ALERT_MESSAGE_BYTES);
-const MAX_FEED_BRIDGES: usize = 8;
+const MAX_FEED_BRIDGES: usize = crate::plugins::feed_hub::MAX_FEED_SUBSCRIBERS;
 const MAX_SUBSCRIPTIONS_PER_PLUGIN: usize = thegn_core::plugin_api::MAX_PLUGIN_SUBSCRIPTIONS;
-const FEED_BRIDGE_THREAD: &str = "thegn-plugfeed";
 const MAX_PLUGIN_MESSAGES_PER_DRAIN: usize = 256;
 const DISPATCH_QUEUE_CAPACITY: usize = 64;
 const MAX_DISPATCH_IN_FLIGHT_PER_PLUGIN: usize = 8;
 const DISPATCH_DEADLINE: std::time::Duration = std::time::Duration::from_secs(30);
-
-/// Owns a feed worker and its cancellation signal. Dropping the owner cancels
-/// the worker even if the feed is idle and the plugin never reads another frame.
-pub(crate) struct FeedBridge {
-    handle: Arc<std::thread::JoinHandle<()>>,
-    _cancel: tokio::sync::oneshot::Sender<()>,
-}
 
 /// One live (or dead-but-remembered) plugin on the loop side.
 pub(crate) struct PluginEntry {
@@ -61,8 +53,8 @@ pub(crate) struct PluginEntry {
     /// `Some` while a resident session is alive; `None` for one-shot plugins
     /// and dead residents.
     pub writer: Option<SessionWriter>,
-    /// A live feed bridge, if one was started for this resident generation.
-    pub feed_bridge: Option<FeedBridge>,
+    /// A live event-feed subscription for this resident generation.
+    pub feed_sub: Option<crate::plugins::feed_hub::FeedSubscription>,
     /// Contributions currently in effect, selected during manifest negotiation.
     /// Runtime `register` messages confirm these declarations but cannot add to them.
     pub contributions: Vec<Contribution>,
@@ -101,8 +93,9 @@ pub(crate) struct PluginsState {
     /// plugin actually calls).
     dispatcher: Option<Dispatcher>,
     counters: crate::plugin_stats::Totals,
-    /// Shared config for the dispatcher's daemon discovery and feed bridges.
+    /// Shared config for dispatcher daemon discovery and the event-feed hub.
     cfg: Arc<thegn_core::config::Config>,
+    feed_hub: crate::plugins::feed_hub::FeedHub,
     navigation_epoch: u64,
     active_app: String,
     modal_owns_input: bool,
@@ -110,6 +103,7 @@ pub(crate) struct PluginsState {
 
 impl PluginsState {
     pub(crate) fn new(cfg: thegn_core::config::Config) -> Self {
+        let cfg = Arc::new(cfg);
         Self {
             plugins: BTreeMap::new(),
             loading: true,
@@ -118,7 +112,10 @@ impl PluginsState {
             inbox: None,
             dispatcher: None,
             counters: crate::plugin_stats::Totals::default(),
-            cfg: Arc::new(cfg),
+            cfg: Arc::clone(&cfg),
+            feed_hub: crate::plugins::feed_hub::FeedHub::new(
+                crate::plugins::feed_hub::daemon_source(cfg),
+            ),
             navigation_epoch: 0,
             active_app: String::new(),
             modal_owns_input: false,
@@ -429,7 +426,7 @@ fn build_entry(st: LoadedState) -> (PluginEntry, Vec<Contribution>) {
             retired: None,
             pending_exit: None,
             writer: st.writer,
-            feed_bridge: None,
+            feed_sub: None,
             contributions,
             restarts: 0,
             disabled: false,
@@ -977,7 +974,7 @@ fn drain_with_responder(
                             );
                         }
                         entry.runtime.begin_generation();
-                        entry.feed_bridge = None;
+                        entry.feed_sub = None;
                         if entry
                             .contributions
                             .iter()
@@ -1115,7 +1112,7 @@ fn handle_exit(
             view.status = "Plugin unavailable; waiting for restart".into();
         }
     }
-    entry.feed_bridge = None;
+    entry.feed_sub = None;
     entry.bridge = None;
     sync_provider_registry(state);
     let entry = state.plugins.get_mut(plugin).expect("looked up above");
@@ -1516,7 +1513,7 @@ fn subscribe_kinds(
 /// answer directly through the plugin's writer.
 fn apply_host_call(state: &mut PluginsState, plugin: &str, msg: RpcMessage) -> PluginDamage {
     let feed_admission = (param_str(&msg.params, "cap").as_deref() == Some("events.subscribe"))
-        .then(|| feed_bridge_admission(state, plugin));
+        .then(|| feed_subscription_admission(state, plugin));
     let Some(entry) = state.plugins.get_mut(plugin) else {
         return PluginDamage::None;
     };
@@ -1548,7 +1545,7 @@ fn apply_host_call(state: &mut PluginsState, plugin: &str, msg: RpcMessage) -> P
     }
     let audit = (entry.runtime.generation(), entry.runtime.last_audit_seq());
     // The event feed is a stream, not a request/response: `events.subscribe`
-    // starts an off-loop bridge that forwards feed frames as `on_event`
+    // registers a sink that forwards feed frames as `on_event`
     // notifications, and the host.call itself is acknowledged immediately.
     if cap == "events.subscribe" {
         match feed_admission.expect("events.subscribe admission was computed") {
@@ -1558,26 +1555,57 @@ fn apply_host_call(state: &mut PluginsState, plugin: &str, msg: RpcMessage) -> P
             ),
             Err(error) => respond(entry, RpcResponse::err(id, error)),
             Ok(true) => {
-                let bridge = if claim_feed_bridge(entry) {
-                    spawn_feed_bridge(Arc::clone(&state.cfg), writer.clone())
+                let subscription = if claim_feed_subscription(entry) {
+                    let sink = Box::new(move |payload: &serde_json::Value| {
+                        writer
+                            .notify(
+                                thegn_core::plugin_api::PluginCallback::OnEvent,
+                                serde_json::json!({
+                                    "kind": EventKind::Custom("control.feed".into()),
+                                    "payload": payload,
+                                }),
+                            )
+                            .is_ok()
+                    });
+                    state.feed_hub.subscribe(sink)
                 } else {
-                    None
+                    respond(
+                        entry,
+                        RpcResponse::ok(id, serde_json::json!({ "subscribed": true })),
+                    );
+                    return PluginDamage::None;
                 };
-                match bridge {
-                    Some(bridge) => {
-                        entry.feed_bridge = Some(bridge);
+                match subscription {
+                    Ok(subscription) => {
+                        entry.feed_sub = Some(subscription);
                         respond(
                             entry,
                             RpcResponse::ok(id, serde_json::json!({ "subscribed": true })),
                         );
                     }
-                    None => respond(
+                    Err(crate::plugins::feed_hub::SubscribeError::Full) => respond(
                         entry,
                         RpcResponse::err(
                             id,
-                            RpcError::new(RpcErrorCode::Other, "feed bridge could not be started"),
+                            RpcError::new(
+                                RpcErrorCode::RateLimited,
+                                format!("feed bridge limit is {MAX_FEED_BRIDGES}"),
+                            ),
                         ),
                     ),
+                    Err(crate::plugins::feed_hub::SubscribeError::Spawn(error)) => {
+                        tracing::warn!(target: "thegn::plugin", plugin = %plugin, %error, "feed hub could not start");
+                        respond(
+                            entry,
+                            RpcResponse::err(
+                                id,
+                                RpcError::new(
+                                    RpcErrorCode::Other,
+                                    "feed bridge could not be started",
+                                ),
+                            ),
+                        );
+                    }
                 }
             }
         }
@@ -1588,38 +1616,31 @@ fn apply_host_call(state: &mut PluginsState, plugin: &str, msg: RpcMessage) -> P
     PluginDamage::None
 }
 
-/// Claim the per-session feed bridge slot, reclaiming a completed bridge.
-fn claim_feed_bridge(entry: &mut PluginEntry) -> bool {
-    if let Some(bridge) = &entry.feed_bridge
-        && !bridge.handle.is_finished()
+/// Claim the per-session feed subscription slot, reclaiming a completed one.
+fn claim_feed_subscription(entry: &mut PluginEntry) -> bool {
+    if entry
+        .feed_sub
+        .as_ref()
+        .is_some_and(|subscription| subscription.is_active())
     {
         return false;
     }
-    entry.feed_bridge = None;
+    entry.feed_sub = None;
     true
 }
 
-/// Count live bridges before taking a mutable plugin-entry borrow. A second
+/// Count live subscriptions before taking a mutable plugin-entry borrow. A second
 /// request for the same live entry is an idempotent acknowledgment.
-fn feed_bridge_admission(state: &PluginsState, plugin: &str) -> Result<bool, RpcError> {
+fn feed_subscription_admission(state: &PluginsState, plugin: &str) -> Result<bool, RpcError> {
+    let live = state.feed_hub.subscribers();
     if state.plugins.get(plugin).is_some_and(|entry| {
         entry
-            .feed_bridge
+            .feed_sub
             .as_ref()
-            .is_some_and(|bridge| !bridge.handle.is_finished())
+            .is_some_and(crate::plugins::feed_hub::FeedSubscription::is_active)
     }) {
         return Ok(false);
     }
-    let live = state
-        .plugins
-        .values()
-        .filter(|entry| {
-            entry
-                .feed_bridge
-                .as_ref()
-                .is_some_and(|bridge| !bridge.handle.is_finished())
-        })
-        .count();
     if live >= MAX_FEED_BRIDGES {
         return Err(RpcError::new(
             RpcErrorCode::RateLimited,
@@ -1627,109 +1648,6 @@ fn feed_bridge_admission(state: &PluginsState, plugin: &str) -> Result<bool, Rpc
         ));
     }
     Ok(true)
-}
-
-/// Start an off-loop bridge that forwards the daemon control event feed to a
-/// resident plugin as `on_event` notifications (the plugin declared a feed
-/// subscription via `host.call events.subscribe`, read-scoped). A dedicated
-/// thread owns a current-thread runtime + the feed subscription and writes
-/// straight to the plugin's [`SessionWriter`] — it never re-enters the
-/// compositor loop, so a subscribing plugin costs the idle render loop nothing.
-/// The bridge ends when the feed closes or the plugin's session goes away.
-fn spawn_cancellable_bridge(
-    name: &'static str,
-    fut: impl std::future::Future<Output = ()> + Send + 'static,
-) -> Option<FeedBridge> {
-    debug_assert!(name.len() <= 15);
-    let (cancel_tx, cancel_rx) = tokio::sync::oneshot::channel();
-    let spawn = std::thread::Builder::new()
-        .name(name.into())
-        .spawn(move || {
-            crate::platform::qos::set_self(crate::platform::qos::Qos::Utility);
-            let rt = match tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()
-            {
-                Ok(rt) => rt,
-                Err(e) => {
-                    tracing::warn!(target: "thegn::plugin", error = %e, "feed-bridge runtime failed");
-                    return;
-                }
-            };
-            rt.block_on(async move {
-                tokio::select! {
-                    _ = cancel_rx => {},
-                    _ = fut => {},
-                }
-            });
-        });
-    match spawn {
-        Ok(handle) => Some(FeedBridge {
-            handle: Arc::new(handle),
-            _cancel: cancel_tx,
-        }),
-        Err(e) => {
-            tracing::warn!(target: "thegn::plugin", error = %e, "feed-bridge thread failed to start");
-            None
-        }
-    }
-}
-
-fn spawn_feed_bridge(
-    cfg: Arc<thegn_core::config::Config>,
-    writer: SessionWriter,
-) -> Option<FeedBridge> {
-    spawn_feed_bridge_worker(async move {
-        let client = match crate::cmd::session::connect(&cfg).await {
-            Ok(c) => c,
-            Err(e) => {
-                tracing::debug!(target: "thegn::plugin", error = %e, "feed-bridge: no daemon");
-                return;
-            }
-        };
-        let mut stream = match client.subscribe_events().await {
-            Ok(s) => s,
-            Err(e) => {
-                tracing::debug!(target: "thegn::plugin", error = %e, "feed-bridge subscribe failed");
-                return;
-            }
-        };
-        while let Some(frame) = stream.frames.recv().await {
-            use thegn_core::control_wire::EventFrame;
-            // Pane byte streams never reach a plugin this way; and the
-            // greeting frame is not a feed event.
-            if matches!(
-                frame,
-                EventFrame::Hello(_)
-                    | EventFrame::PaneSnapshot { .. }
-                    | EventFrame::PaneDelta { .. }
-            ) {
-                continue;
-            }
-            let payload = thegn_svc::control::http::frame_json(&frame);
-            if writer
-                .notify(
-                    thegn_core::plugin_api::PluginCallback::OnEvent,
-                    serde_json::json!({
-                        "kind": thegn_core::plugin_api::EventKind::Custom(
-                            "control.feed".into()
-                        ),
-                        "payload": payload,
-                    }),
-                )
-                .is_err()
-            {
-                // The plugin's session is gone — stop forwarding.
-                return;
-            }
-        }
-    })
-}
-
-fn spawn_feed_bridge_worker(
-    fut: impl std::future::Future<Output = ()> + Send + 'static,
-) -> Option<FeedBridge> {
-    spawn_cancellable_bridge(FEED_BRIDGE_THREAD, fut)
 }
 
 // ---------------------------------------------------------------------------
@@ -2405,25 +2323,6 @@ mod tests {
                 .expect("thread name"),
             "thegn-plugdisp"
         );
-    }
-
-    #[test]
-    fn production_feed_bridge_thread_has_a_bounded_attribution_name() {
-        let (name_tx, name_rx) = std::sync::mpsc::channel();
-        let bridge = spawn_feed_bridge_worker(async move {
-            let name = std::thread::current()
-                .name()
-                .map(str::to_owned)
-                .expect("feed bridge thread has a name");
-            name_tx.send(name).expect("test is listening");
-        })
-        .expect("feed bridge thread starts");
-        let name = name_rx
-            .recv_timeout(std::time::Duration::from_secs(2))
-            .expect("feed bridge thread name");
-        assert_eq!(name, FEED_BRIDGE_THREAD);
-        assert!(name.len() <= 15);
-        drop(bridge);
     }
 
     fn dispatch_request(
@@ -3163,84 +3062,103 @@ mod tests {
         )
     }
 
+    type TestFeedSenders =
+        Arc<Mutex<Vec<tokio::sync::mpsc::Sender<thegn_core::control_wire::EventFrame>>>>;
+
+    fn feed_test_source() -> (crate::plugins::feed_hub::FeedSource, TestFeedSenders) {
+        let senders = Arc::new(Mutex::new(Vec::new()));
+        let source_senders = Arc::clone(&senders);
+        let source: crate::plugins::feed_hub::FeedSource = Arc::new(move || {
+            let (tx, frames) = tokio::sync::mpsc::channel(16);
+            source_senders
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .push(tx);
+            Box::pin(async move { Some(crate::plugins::feed_hub::Feed::new(frames, ())) })
+        });
+        (source, senders)
+    }
+
+    fn wait_for_feed_unsubscribe(state: &PluginsState) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while state.feed_hub.subscribers() != 0 && std::time::Instant::now() < deadline {
+            std::thread::yield_now();
+        }
+        assert_eq!(
+            state.feed_hub.subscribers(),
+            0,
+            "feed sink removed within five seconds"
+        );
+    }
+
     #[test]
-    fn feed_bridge_claim_is_limited_to_one_per_entry() {
+    fn feed_sub_claim_is_limited_to_one_per_entry() {
         let (mut entry, _) = build_entry(loaded_state(seg_spec("p")));
-        entry.feed_bridge = spawn_cancellable_bridge("thegn-feedclaim", async {
-            std::future::pending::<()>().await;
-        });
-        assert!(!claim_feed_bridge(&mut entry));
-        let handle = Arc::clone(&entry.feed_bridge.as_ref().unwrap().handle);
-        drop(entry.feed_bridge.take());
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-        while !handle.is_finished() && std::time::Instant::now() < deadline {
-            std::thread::yield_now();
-        }
-        assert!(
-            handle.is_finished(),
-            "dropping entry bridge must cancel its worker"
-        );
-        let (cancel, _receiver) = tokio::sync::oneshot::channel();
-        entry.feed_bridge = Some(FeedBridge {
-            handle,
-            _cancel: cancel,
-        });
-        assert!(claim_feed_bridge(&mut entry));
+        let (source, _senders) = feed_test_source();
+        let mut hub = crate::plugins::feed_hub::FeedHub::new(source);
+        entry.feed_sub = Some(hub.subscribe(Box::new(|_| true)).unwrap());
+        assert!(!claim_feed_subscription(&mut entry));
+        drop(entry.feed_sub.take());
+        assert!(claim_feed_subscription(&mut entry));
     }
 
     #[test]
-    fn dropping_feed_bridge_cancels_idle_worker() {
-        let bridge = spawn_cancellable_bridge("thegn-feedcancl", async {
-            std::future::pending::<()>().await;
-        })
-        .expect("worker thread starts");
-        let handle = Arc::clone(&bridge.handle);
-        drop(bridge);
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-        while !handle.is_finished() && std::time::Instant::now() < deadline {
-            std::thread::yield_now();
-        }
-        assert!(
-            handle.is_finished(),
-            "dropping bridge must cancel its idle worker"
+    fn feed_sub_drop_deactivates_and_unsubscribes() {
+        let mut state = state_with(vec![seg_spec("p")]);
+        let (source, _senders) = feed_test_source();
+        state.feed_hub = crate::plugins::feed_hub::FeedHub::new(source);
+        let subscription = state.feed_hub.subscribe(Box::new(|_| true)).unwrap();
+        assert!(subscription.is_active());
+        let active = subscription.active_handle();
+        state.plugins.get_mut("p").unwrap().feed_sub = Some(subscription);
+        let subscription = state.plugins.get_mut("p").unwrap().feed_sub.take().unwrap();
+        drop(subscription);
+        assert!(!active.load(std::sync::atomic::Ordering::Acquire));
+        assert_eq!(
+            state.feed_hub.subscribers(),
+            0,
+            "drop removes admission immediately"
         );
+        wait_for_feed_unsubscribe(&state);
+    }
+
+    fn subscription_active_from_state(state: &PluginsState) -> bool {
+        state.plugins["p"]
+            .feed_sub
+            .as_ref()
+            .is_some_and(crate::plugins::feed_hub::FeedSubscription::is_active)
     }
 
     #[test]
-    fn feed_bridge_admission_enforces_global_cap_and_same_plugin_idempotence() {
+    fn feed_sub_admission_enforces_global_cap_and_same_plugin_idempotence() {
         let mut state = state_with(
             (0..=MAX_FEED_BRIDGES)
                 .map(|i| seg_spec(&format!("p{i}")))
                 .collect(),
         );
+        let (source, _senders) = feed_test_source();
+        state.feed_hub = crate::plugins::feed_hub::FeedHub::new(source);
         for i in 0..MAX_FEED_BRIDGES {
-            state.plugins.get_mut(&format!("p{i}")).unwrap().feed_bridge =
-                spawn_cancellable_bridge("thegn-feedcap", async {
-                    std::future::pending::<()>().await;
-                });
+            let subscription = state.feed_hub.subscribe(Box::new(|_| true)).unwrap();
+            state.plugins.get_mut(&format!("p{i}")).unwrap().feed_sub = Some(subscription);
         }
-        assert!(!feed_bridge_admission(&state, "p0").unwrap());
+        assert!(!feed_subscription_admission(&state, "p0").unwrap());
         assert_eq!(
-            feed_bridge_admission(&state, &format!("p{MAX_FEED_BRIDGES}"))
+            feed_subscription_admission(&state, &format!("p{MAX_FEED_BRIDGES}"))
                 .unwrap_err()
                 .code,
             RpcErrorCode::RateLimited
         );
     }
 
-    fn wait_finished(handle: &Arc<std::thread::JoinHandle<()>>) -> bool {
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-        while !handle.is_finished() && std::time::Instant::now() < deadline {
-            std::thread::yield_now();
-        }
-        handle.is_finished()
-    }
-
     #[test]
-    fn feed_bridge_cycles_never_leave_a_worker_running() {
+    fn feed_sub_cycles_never_leave_an_active_subscription() {
+        // Each cycle owns one subscription and one source sender; feed-close
+        // drops that sender, while crash/reload drop the RAII subscription.
         let mut state = state_with(vec![seg_spec("p")]);
+        let (source, senders) = feed_test_source();
+        state.feed_hub = crate::plugins::feed_hub::FeedHub::new(source);
         let mut model = FrameModel::default();
-        let mut handles = Vec::new();
 
         for cycle in 0..48u64 {
             let session = cycle + 1;
@@ -3257,34 +3175,14 @@ mod tests {
             entry.disabled = false;
 
             assert!(
-                matches!(feed_bridge_admission(&state, "p"), Ok(true)),
+                matches!(feed_subscription_admission(&state, "p"), Ok(true)),
                 "cycle {cycle} path {path_name}: fresh subscription was not admitted"
             );
+            assert!(claim_feed_subscription(state.plugins.get_mut("p").unwrap()));
+            let subscription = state.feed_hub.subscribe(Box::new(|_| true)).unwrap();
+            state.plugins.get_mut("p").unwrap().feed_sub = Some(subscription);
             assert!(
-                claim_feed_bridge(state.plugins.get_mut("p").unwrap()),
-                "cycle {cycle} path {path_name}: bridge slot was not claimable"
-            );
-
-            let mut close_sender = None;
-            let bridge = if path == 2 {
-                let (close_tx, close_rx) = tokio::sync::oneshot::channel();
-                close_sender = Some(close_tx);
-                spawn_cancellable_bridge("thegn-feedcycle", async move {
-                    match close_rx.await {
-                        Ok(()) | Err(_) => {}
-                    }
-                })
-            } else {
-                spawn_cancellable_bridge("thegn-feedcycle", async {
-                    std::future::pending::<()>().await;
-                })
-            }
-            .expect("feed-cycle worker thread starts");
-            handles.push(Arc::clone(&bridge.handle));
-            state.plugins.get_mut("p").unwrap().feed_bridge = Some(bridge);
-
-            assert!(
-                matches!(feed_bridge_admission(&state, "p"), Ok(false)),
+                matches!(feed_subscription_admission(&state, "p"), Ok(false)),
                 "cycle {cycle} path {path_name}: duplicate subscription was not idempotently acknowledged"
             );
 
@@ -3296,8 +3194,8 @@ mod tests {
                         event("p", session, SessionEvent::Exit { code: Some(1) }),
                     );
                     assert!(
-                        state.plugins["p"].feed_bridge.is_none(),
-                        "cycle {cycle} path {path_name}: drain retained the bridge"
+                        state.plugins["p"].feed_sub.is_none(),
+                        "cycle {cycle}: crash retained subscription"
                     );
                 }
                 1 => {
@@ -3306,63 +3204,54 @@ mod tests {
                     drop(old);
                 }
                 2 => {
-                    drop(close_sender.take().expect("feed-close sender exists"));
+                    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+                    let sender = loop {
+                        let mut senders = senders.lock().unwrap_or_else(|error| error.into_inner());
+                        let open = senders.iter().filter(|sender| !sender.is_closed()).count();
+                        if open == 1 {
+                            let index = senders
+                                .iter()
+                                .position(|sender| !sender.is_closed())
+                                .expect("one open sender was counted");
+                            break senders.remove(index);
+                        }
+                        drop(senders);
+                        assert!(
+                            std::time::Instant::now() < deadline,
+                            "one active feed sender appears"
+                        );
+                        std::thread::yield_now();
+                    };
+                    drop(sender);
+                    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+                    while subscription_active_from_state(&state)
+                        && std::time::Instant::now() < deadline
+                    {
+                        std::thread::yield_now();
+                    }
                     assert!(
-                        wait_finished(handles.last().unwrap()),
-                        "cycle {cycle} path {path_name}: worker did not finish before reclaim"
+                        !subscription_active_from_state(&state),
+                        "cycle {cycle}: feed close deactivates sink"
                     );
-                    assert!(
-                        claim_feed_bridge(state.plugins.get_mut("p").unwrap()),
-                        "cycle {cycle} path {path_name}: finished bridge was not reclaimed"
-                    );
+                    assert!(claim_feed_subscription(state.plugins.get_mut("p").unwrap()));
                 }
                 _ => unreachable!("cycle path is modulo three"),
             }
 
+            wait_for_feed_unsubscribe(&state);
             assert!(
-                wait_finished(handles.last().unwrap()),
-                "cycle {cycle} path {path_name}: feed bridge worker still running"
+                state.plugins["p"].feed_sub.is_none(),
+                "cycle {cycle} path {path_name}: teardown retained a subscription"
             );
             assert!(
-                state.plugins["p"].feed_bridge.is_none(),
-                "cycle {cycle} path {path_name}: teardown retained a bridge entry"
-            );
-            assert!(
-                matches!(feed_bridge_admission(&state, "p"), Ok(true)),
+                matches!(feed_subscription_admission(&state, "p"), Ok(true)),
                 "cycle {cycle} path {path_name}: fresh subscription was not admitted after teardown"
             );
         }
-
         assert_eq!(
-            handles.len(),
-            48,
-            "all 48 crash/reload/feed-close cycles recorded one worker each"
-        );
-        for (cycle, handle) in handles.iter().enumerate() {
-            let path_name = match cycle % 3 {
-                0 => "crash",
-                1 => "reload",
-                2 => "feed close",
-                _ => unreachable!("cycle path is modulo three"),
-            };
-            assert!(
-                wait_finished(handle),
-                "cycle {cycle} path {path_name}: recorded worker handle is still running"
-            );
-        }
-        let live = state
-            .plugins
-            .values()
-            .filter(|entry| {
-                entry
-                    .feed_bridge
-                    .as_ref()
-                    .is_some_and(|bridge| !bridge.handle.is_finished())
-            })
-            .count();
-        assert_eq!(
-            live, 0,
-            "no crash/reload/feed-close cycle left a live feed bridge"
+            state.feed_hub.subscribers(),
+            0,
+            "all 48 crash/reload/feed-close cycles leave no active hub subscriber"
         );
     }
 

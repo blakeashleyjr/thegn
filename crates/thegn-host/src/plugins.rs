@@ -24,6 +24,7 @@ use thegn_svc::plugin::{
 };
 use tokio::sync::mpsc as tokio_mpsc;
 
+pub(crate) mod feed_hub;
 pub(crate) mod inbox;
 pub(crate) mod respawn;
 use inbox::PluginInbox;
