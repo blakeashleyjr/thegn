@@ -330,8 +330,6 @@ mod tests {
 
     #[test]
     fn teammate_push_warning_agrees_with_the_budget_functions() {
-        let previous = "a".repeat(40);
-        let current = "b".repeat(40);
         for pause_on_foreign_push in [false, true] {
             for reset_attempts_on_push in [false, true] {
                 let cfg = PrQueueConfig {
@@ -342,9 +340,14 @@ mod tests {
                 let warning = outcome_warning(1, AgentHeadOutcome::TeammatePush, &cfg).unwrap();
                 let effect = pr_queue::head_budget_effect(AgentHeadOutcome::TeammatePush, &cfg);
                 assert_eq!(effect.hold, pause_on_foreign_push);
+                assert_eq!(effect.refill, reset_attempts_on_push);
                 assert_eq!(
                     warning.ends_with("; the row is held for a human"),
-                    pr_queue::foreign_push(Some(&previous), &current) && cfg.pause_on_foreign_push
+                    effect.hold
+                );
+                assert_eq!(
+                    warning.ends_with("; the attempt budget is refilled"),
+                    effect.refill && !effect.hold
                 );
             }
         }
