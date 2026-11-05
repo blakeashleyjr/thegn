@@ -49,7 +49,8 @@ unconditionally stable and never channel-gated.
 Enforcement happens at the edges, never by compiling code out:
 
 - Config toggles for a disallowed feature are **neutralised at load**, so
-  a stray `[observe]` block in a stable run is inert rather than an error.
+  a stray `[placement]` or `[voice]` block in a stable run is inert rather
+  than an error.
 - Dev-only verbs and UI surfaces are hidden. Tracker commands remain available
   in both channels when an issue provider is configured.
 

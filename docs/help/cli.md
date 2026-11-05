@@ -308,6 +308,8 @@ With `--json`, stdout is one valid JSON value with explicit `fetched_at`,
 when redaction changed the text, false when no change was found in the text,
 and null for logs cached before schema v103; it does not prove every secret
 shape was recognized.
+The control API and daemon `ci.logs` reply also carry `redaction_changed` at
+the top level, beside `redacted`, with the same true, false and null meanings.
 `ci logs` reuses a cached log only when it has a recorded head commit; a log
 with an unknown head is printed but not cached. The CI panel's failed-job log
 windows and background log ingestion apply a stricter check: they reuse a
