@@ -208,6 +208,7 @@ mod tests {
             )
         );
         let too_many = PluginStatusSnapshot {
+            schema: STATUS_SCHEMA,
             rows: (0..=MAX_STATUS_ROWS)
                 .map(|index| PluginStatusRow {
                     plugin: format!("p{index}"),
@@ -224,6 +225,7 @@ mod tests {
             )
         );
         let long_id = PluginStatusSnapshot {
+            schema: STATUS_SCHEMA,
             rows: vec![PluginStatusRow {
                 plugin: "x".repeat(MAX_PLUGIN_ID_BYTES + 1),
                 ..Default::default()
@@ -268,7 +270,6 @@ mod tests {
                         malformed: u64::MAX,
                         closed_wakeups: u64::MAX,
                     },
-                    ..Default::default()
                 })
                 .collect(),
             ..Default::default()
