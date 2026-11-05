@@ -340,4 +340,160 @@ mod tests {
             stage_launch_digest(&second, "worker", "review").expect("second digest")
         );
     }
+
+    fn claim_then_launch(
+        claimed: &Config,
+        launched: &Config,
+        agent: &str,
+        stage: &str,
+    ) -> Result<(), StageConfigDrift> {
+        let digest = stage_launch_digest(claimed, agent, stage).expect("claim digest");
+        check_stage_launch_required(launched, agent, stage, Some(&digest))
+    }
+
+    fn assert_race_refused(result: Result<(), StageConfigDrift>) -> StageConfigDrift {
+        let error = result.expect_err("configuration drift refuses launch");
+        assert_eq!(error.stage, "review");
+        assert_eq!(error.agent, "worker");
+        error
+    }
+
+    #[test]
+    fn race_unchanged_config_launches() {
+        let cfg = config("review", "worker");
+        assert!(claim_then_launch(&cfg, &cfg, "worker", "review").is_ok());
+    }
+
+    #[test]
+    fn race_stage_rename_between_claim_and_launch_is_refused() {
+        let claimed = config("review", "worker");
+        let mut launched = claimed.clone();
+        launched.pipeline.stages[0].name = "renamed".into();
+
+        let error = assert_race_refused(claim_then_launch(&claimed, &launched, "worker", "review"));
+        let display = error.to_string();
+        assert!(
+            display.contains("unknown pipeline stage `review`"),
+            "{display}"
+        );
+        assert!(
+            display.contains("changed between claim and launch"),
+            "{display}"
+        );
+    }
+
+    #[test]
+    fn race_stage_delete_is_refused() {
+        let claimed = config("review", "worker");
+        let mut launched = claimed.clone();
+        launched.pipeline.stages.clear();
+
+        let error = assert_race_refused(claim_then_launch(&claimed, &launched, "worker", "review"));
+        assert!(
+            error
+                .detail
+                .as_deref()
+                .is_some_and(|detail| { detail.contains("unknown pipeline stage") })
+        );
+    }
+
+    #[test]
+    fn race_agent_swap_is_refused() {
+        let claimed = config("review", "worker");
+        let mut launched = claimed.clone();
+        launched.pipeline.stages[0].agent = "another-worker".into();
+
+        let error = assert_race_refused(claim_then_launch(&claimed, &launched, "worker", "review"));
+        assert_eq!(error.detail, None);
+    }
+
+    #[test]
+    fn race_agent_removed_is_refused() {
+        let claimed = config("review", "worker");
+        let mut launched = claimed.clone();
+        launched.agents.clear();
+
+        let error = assert_race_refused(claim_then_launch(&claimed, &launched, "worker", "review"));
+        assert!(
+            error
+                .detail
+                .as_deref()
+                .is_some_and(|detail| { detail.contains("unknown agent") })
+        );
+    }
+
+    #[test]
+    fn race_permission_revocation_is_refused() {
+        let mut claimed_with_permission = config("review", "worker");
+        claimed_with_permission.pipeline.stages[0]
+            .permissions
+            .push("Read".into());
+        let mut launched_without_permission = claimed_with_permission.clone();
+        launched_without_permission.pipeline.stages[0]
+            .permissions
+            .clear();
+        assert_race_refused(claim_then_launch(
+            &claimed_with_permission,
+            &launched_without_permission,
+            "worker",
+            "review",
+        ));
+
+        let claimed_without_permission = config("review", "worker");
+        let mut launched_with_permission = claimed_without_permission.clone();
+        launched_with_permission.pipeline.stages[0]
+            .permissions
+            .push("Read".into());
+        assert_race_refused(claim_then_launch(
+            &claimed_without_permission,
+            &launched_with_permission,
+            "worker",
+            "review",
+        ));
+    }
+
+    #[test]
+    fn race_concurrency_lowered_is_refused() {
+        let mut claimed = config("review", "worker");
+        claimed.pipeline.stages[0].concurrency = 3;
+        let mut launched = claimed.clone();
+        launched.pipeline.stages[0].concurrency = 1;
+
+        assert_race_refused(claim_then_launch(&claimed, &launched, "worker", "review"));
+    }
+
+    #[test]
+    fn race_malformed_config_fallback_is_refused() {
+        let claimed = config("review", "worker");
+        let launched = Config::default();
+
+        assert_race_refused(claim_then_launch(&claimed, &launched, "worker", "review"));
+    }
+
+    #[test]
+    fn race_env_and_provider_changes_are_refused() {
+        let claimed = config("review", "worker");
+        let mut launched_with_env = claimed.clone();
+        launched_with_env.pipeline.stages[0]
+            .env
+            .insert("TOKEN".into(), "file:secret".into());
+        assert_race_refused(claim_then_launch(
+            &claimed,
+            &launched_with_env,
+            "worker",
+            "review",
+        ));
+
+        let mut claimed_with_provider = config("review", "worker");
+        claimed_with_provider.agents[0].harness = Some("claude".into());
+        claimed_with_provider.agents[0].provider = Some("account-one".into());
+        let mut launched_with_provider = claimed_with_provider.clone();
+        launched_with_provider.agents[0].provider = Some("account-two".into());
+        assert_race_refused(claim_then_launch(
+            &claimed_with_provider,
+            &launched_with_provider,
+            "worker",
+            "review",
+        ));
+    }
 }
