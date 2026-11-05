@@ -504,8 +504,13 @@ pub(crate) fn control_stage(worktree: &std::path::Path, paths: &[String]) -> any
 pub(crate) fn control_commit(worktree: &std::path::Path, message: &str) -> anyhow::Result<String> {
     let loc = GitLoc::for_worktree_op(worktree, "git commit").map_err(anyhow::Error::msg)?;
     CliGit.commit(&loc, message, false, None)?;
-    loc.git_out(&["rev-parse", "HEAD"])
-        .ok_or_else(|| anyhow::anyhow!("rev-parse HEAD failed after the commit"))
+    let head = loc
+        .git_text(&["rev-parse", "HEAD"])
+        .map_err(|error| anyhow::anyhow!("rev-parse HEAD failed after the commit: {error}"))?;
+    if head.is_empty() {
+        anyhow::bail!("rev-parse HEAD returned nothing after the commit");
+    }
+    Ok(head)
 }
 
 fn execute_at_with_db(
