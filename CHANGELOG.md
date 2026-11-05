@@ -9,6 +9,37 @@ All notable changes to **thegn** are documented here. The format follows
 
 ## [0.1.0-alpha.53] — 2026-11-05 (maintenance batch 91)
 
+### Added
+
+- The Problems list shows an Info row with running, starting and backing-off
+  language server counts while a server is starting or backing off.
+- The Home Manager module adds null-default `programs.thegn.loc*` and
+  `programs.thegn.replay*` options for the `[loc]` and `[replay]` scalar
+  settings.
+
+### Changed
+
+- CI autofix claims a failing job once per provider run attempt (GitHub), so a
+  re-run attempt of the same job at the same commit is a new candidate. A
+  suggested fix's `needs_human` notification carries the attempt.
+- The control API and daemon `ci.logs` reply include top-level
+  `redaction_changed` metadata, matching `thegn ci logs --json`.
+- `thegn host list` and `thegn host status` show ages in seconds below a
+  minute, minutes below an hour, hours below a day, then days (for example,
+  `1m ago`, `1h ago` and `1d ago`).
+- The GitLab CI doctor note for a CLI-managed credential says remote and
+  provider worktrees use the remote host's own `glab` login.
+- (Dev channel) Managed SSH key names at VPS providers and Machine0 are scoped
+  by provider and account; an identical registered key under an older name is
+  reused. A restored remote pane whose SSH-over-WebSocket or provider exec
+  attach fails gets one notice per kind per run as it takes another launch
+  path.
+
+### Security
+
+- Machine0 provisioning attestation records and projection ownership manifests
+  are written through held, owner-only directory handles.
+
 ## [0.1.0-alpha.52] — 2026-11-04 (maintenance batch 90)
 
 - Observe and plugin app tabs are now available on the stable channel.
