@@ -33,10 +33,10 @@ pub struct Options {
     /// Terminal size as COLSxROWS.
     #[arg(long, default_value = "120x36", value_parser = dimensions)]
     size: (u16, u16),
-    /// Start the resident app plugin whose plugin.toml is in this directory and preview its first app view (needs --headless in this release).
-    #[arg(long, value_name = "DIR", conflicts_with_all = ["fixture", "replay", "record", "include_content"], requires = "headless")]
+    /// Start the resident app plugin whose plugin.toml is in this directory; without --headless, run an interactive live preview.
+    #[arg(long, value_name = "DIR", conflicts_with_all = ["fixture", "replay", "record", "include_content"])]
     plugin_dir: Option<PathBuf>,
-    /// With --plugin-dir: how long to wait for the plugin's first valid app view, in milliseconds (100..=30000).
+    /// With --plugin-dir --headless: how long to wait for the plugin's first valid app view, in milliseconds (100..=30000).
     #[arg(long, default_value_t = super::live::DEFAULT_WAIT_MS, value_parser = super::live::wait_ms, requires = "plugin_dir")]
     wait_ms: u64,
 }
@@ -412,11 +412,15 @@ fn snapshot(tile: &mut dyn AppTile, size: (u16, u16)) -> Result<()> {
 
 pub(super) fn run(options: Options) -> Result<()> {
     if let Some(dir) = &options.plugin_dir {
-        return super::live::run_headless(
-            dir,
-            options.size,
-            std::time::Duration::from_millis(options.wait_ms),
-        );
+        return if options.headless {
+            super::live::run_headless(
+                dir,
+                options.size,
+                std::time::Duration::from_millis(options.wait_ms),
+            )
+        } else {
+            super::live::run_interactive(dir, options.size)
+        };
     }
     let trace = Arc::new(Mutex::new(if options.record.is_some() {
         Trace::new(options.include_content)
@@ -448,9 +452,9 @@ mod tests {
     }
 
     #[test]
-    fn live_options_conflict_with_fixture_replay_and_record_and_require_headless() {
+    fn live_options_conflict_with_fixture_replay_and_record() {
         assert!(PreviewArgs::try_parse_from(["p", "--plugin-dir", "d", "--headless"]).is_ok());
-        assert!(PreviewArgs::try_parse_from(["p", "--plugin-dir", "d"]).is_err());
+        assert!(PreviewArgs::try_parse_from(["p", "--plugin-dir", "d"]).is_ok());
         assert!(
             PreviewArgs::try_parse_from([
                 "p",
