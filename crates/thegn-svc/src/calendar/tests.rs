@@ -2259,6 +2259,153 @@ async fn an_unsuperseded_pass_matches_list_events_each() {
     assert_eq!(active.max.load(std::sync::atomic::Ordering::SeqCst), 4);
 }
 
+#[tokio::test(start_paused = true)]
+async fn pass_deadline_abandons_a_hung_account_and_still_applies_its_fast_sibling() {
+    let active = std::sync::Arc::new(ActiveFetches::default());
+    let router = timed_router(vec![
+        (
+            "hung".into(),
+            FetchClass::Network,
+            "ics-url",
+            std::time::Duration::from_secs(100_000),
+            false,
+            active.clone(),
+        ),
+        (
+            "fast".into(),
+            FetchClass::Network,
+            "ics-url",
+            std::time::Duration::ZERO,
+            false,
+            active,
+        ),
+    ]);
+    let start = tokio::time::Instant::now();
+    let mut got = Vec::new();
+    let skipped = router
+        .list_events_each_while_bounded(
+            calendar_window(),
+            &BTreeMap::new(),
+            || true,
+            std::time::Duration::from_secs(30),
+            |result| {
+                let pass_timeout = matches!(
+                    &result.result,
+                    Err(CalendarError::Timeout("calendar pass deadline"))
+                );
+                got.push((
+                    result.account,
+                    result.result.is_ok(),
+                    pass_timeout,
+                    tokio::time::Instant::now(),
+                ));
+            },
+        )
+        .await;
+
+    assert_eq!(skipped, 0);
+    assert_eq!(got.len(), 2);
+    assert_eq!(got[0].0, "fast");
+    assert!(got[0].1);
+    assert!(!got[0].2);
+    assert_eq!(got[0].3, start);
+    assert_eq!(got[1].0, "hung");
+    assert!(!got[1].1);
+    assert!(got[1].2);
+    assert_eq!(
+        got[1].3.duration_since(start),
+        std::time::Duration::from_secs(30)
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn pass_deadline_leaves_queued_accounts_unstarted() {
+    let active = std::sync::Arc::new(ActiveFetches::default());
+    let router = timed_router(
+        (0..3)
+            .map(|index| {
+                (
+                    format!("command-{index}"),
+                    FetchClass::Command,
+                    "command",
+                    std::time::Duration::from_secs(100_000),
+                    false,
+                    active.clone(),
+                )
+            })
+            .collect(),
+    );
+    let mut got = Vec::new();
+    let skipped = router
+        .list_events_each_while_bounded(
+            calendar_window(),
+            &BTreeMap::new(),
+            || true,
+            std::time::Duration::from_secs(30),
+            |result| {
+                got.push((
+                    result.account,
+                    matches!(
+                        &result.result,
+                        Err(CalendarError::Timeout("calendar pass deadline"))
+                    ),
+                ));
+            },
+        )
+        .await;
+
+    assert_eq!(skipped, 2);
+    assert_eq!(got.len(), 1);
+    assert!(got[0].1);
+    assert_eq!(active.max.load(std::sync::atomic::Ordering::SeqCst), 1);
+}
+
+#[tokio::test(start_paused = true)]
+async fn pass_deadline_does_not_change_a_pass_that_finishes_in_time() {
+    let active = std::sync::Arc::new(ActiveFetches::default());
+    let router = timed_router(
+        (0..8)
+            .map(|index| {
+                (
+                    format!("network-{index}"),
+                    FetchClass::Network,
+                    "ics-url",
+                    std::time::Duration::from_secs(1),
+                    false,
+                    active.clone(),
+                )
+            })
+            .collect(),
+    );
+    let start = tokio::time::Instant::now();
+    let mut got = Vec::new();
+    let skipped = router
+        .list_events_each_while_bounded(
+            calendar_window(),
+            &BTreeMap::new(),
+            || true,
+            super::CALENDAR_PASS_DEADLINE,
+            |result| got.push(result.result.is_ok()),
+        )
+        .await;
+
+    assert_eq!(skipped, 0);
+    assert_eq!(got.len(), 8);
+    assert!(got.iter().all(|result| *result));
+    assert_eq!(
+        tokio::time::Instant::now().duration_since(start),
+        std::time::Duration::from_secs(2)
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn pass_deadline_is_the_documented_bound() {
+    assert!(
+        super::CALENDAR_PASS_DEADLINE > std::time::Duration::from_secs(300),
+        "must exceed the longest single-account clamp (command 300 s)"
+    );
+}
+
 #[test]
 fn an_empty_config_builds_an_unconfigured_router() {
     let r = router(&CalendarConfig::default());

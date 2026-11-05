@@ -811,6 +811,14 @@ const COMMAND_FETCH_CONCURRENCY: usize = 1;
 // Local ICS reads and parsing can hold file handles and page memory; serialize.
 const LOCAL_FETCH_CONCURRENCY: usize = 1;
 
+/// Longest one scheduler pass may run before it abandons what is still in flight.
+/// PROVISIONAL: 600 s is above every single account's own clamp (network 120 s, command 300 s) and
+/// above the usual serialized-command chain, so an ordinary pass never reaches it. It exists so a
+/// chain of hung accounts cannot hold the pass (and its background permit) for the sum of their
+/// timeouts.
+// TODO(pin): primary sets this from a measurement (typical and worst pass durations)
+const CALENDAR_PASS_DEADLINE: std::time::Duration = std::time::Duration::from_secs(600);
+
 impl FetchClass {
     fn of(kind: CalendarProviderKind) -> Self {
         match kind {
@@ -1006,27 +1014,72 @@ impl CalendarRouter {
     /// Like [`Self::list_events_each`], but stops starting queued accounts once
     /// `keep_starting` returns false (a superseded pass). Fetches already in
     /// flight still finish and reach `sink`; skipped accounts are simply not
-    /// fetched this pass.
+    /// fetched this pass. A pass also ends at `CALENDAR_PASS_DEADLINE`: see
+    /// [`Self::list_events_each_while_bounded`].
     pub async fn list_events_each_while(
         &self,
         window: CalendarWindow,
         tokens: &BTreeMap<String, String>,
         keep_starting: impl Fn() -> bool,
+        sink: impl FnMut(AccountResult),
+    ) -> usize {
+        self.list_events_each_while_bounded(
+            window,
+            tokens,
+            keep_starting,
+            CALENDAR_PASS_DEADLINE,
+            sink,
+        )
+        .await
+    }
+
+    /// Like [`Self::list_events_each_while`], with a caller-supplied deadline
+    /// measured from the start of the pass.
+    ///
+    /// Once the deadline elapses, in-flight futures are dropped and each
+    /// account is reported as timed out. Accounts still queued are left for a
+    /// later pass and included in the returned skipped count.
+    pub(crate) async fn list_events_each_while_bounded(
+        &self,
+        window: CalendarWindow,
+        tokens: &BTreeMap<String, String>,
+        keep_starting: impl Fn() -> bool,
+        pass_deadline: std::time::Duration,
         mut sink: impl FnMut(AccountResult),
     ) -> usize {
         let mut queues: [VecDeque<&AccountBackend>; 3] = std::array::from_fn(|_| VecDeque::new());
         for account in &self.accounts {
             queues[account.class.index()].push_back(account);
         }
+        let deadline = tokio::time::Instant::now() + pass_deadline;
         let mut running = [0_usize; 3];
         let mut in_flight = FuturesUnordered::new();
+        let mut pending: Vec<&AccountBackend> = Vec::new();
         let mut stopped_starting = false;
         loop {
+            if tokio::time::Instant::now() >= deadline
+                && (!pending.is_empty() || queues.iter().any(|queue| !queue.is_empty()))
+            {
+                let skipped = queues.iter().map(VecDeque::len).sum::<usize>();
+                let abandoned = pending.len();
+                tracing::warn!(
+                    target: "thegn::calendar",
+                    abandoned,
+                    skipped,
+                    "calendar pass deadline reached"
+                );
+                drop(in_flight);
+                report_pass_deadline(&mut pending, &mut sink);
+                break;
+            }
             if !stopped_starting {
                 'launch: for class in [FetchClass::Network, FetchClass::Command, FetchClass::Local]
                 {
                     let class_index = class.index();
                     while running[class_index] < class.limit() && !queues[class_index].is_empty() {
+                        if tokio::time::Instant::now() >= deadline {
+                            break 'launch;
+                        }
                         if !keep_starting() {
                             stopped_starting = true;
                             break 'launch;
@@ -1037,13 +1090,37 @@ impl CalendarRouter {
                         running[class_index] += 1;
                         let token = tokens.get(&account.name).map(String::as_str).unwrap_or("");
                         in_flight.push(fetch_account(account, &window, token));
+                        pending.push(account);
                     }
                 }
             }
-            let Some((class, result)) = in_flight.next().await else {
+            let next = match tokio::time::timeout_at(deadline, in_flight.next()).await {
+                Ok(next) => next,
+                Err(_elapsed) => {
+                    let skipped = queues.iter().map(VecDeque::len).sum::<usize>();
+                    let abandoned = pending.len();
+                    tracing::warn!(
+                        target: "thegn::calendar",
+                        abandoned,
+                        skipped,
+                        "calendar pass deadline reached"
+                    );
+                    // Dropping the stream cancels every fetch future still in flight.
+                    drop(in_flight);
+                    report_pass_deadline(&mut pending, &mut sink);
+                    break;
+                }
+            };
+            let Some((class, result)) = next else {
                 break;
             };
             running[class.index()] -= 1;
+            if let Some(index) = pending
+                .iter()
+                .position(|account| account.name == result.account)
+            {
+                pending.remove(index);
+            }
             sink(result);
         }
         queues.iter().map(VecDeque::len).sum()
@@ -1067,6 +1144,19 @@ impl CalendarRouter {
         };
         self.list_events_each(window, tokens, |r| out.push(r)).await;
         out
+    }
+}
+
+fn report_pass_deadline<'a>(
+    pending: &mut Vec<&'a AccountBackend>,
+    sink: &mut impl FnMut(AccountResult),
+) {
+    for account in pending.drain(..) {
+        sink(AccountResult {
+            account: account.name.clone(),
+            provider: account.inner.provider_id(),
+            result: Err(CalendarError::Timeout("calendar pass deadline")),
+        });
     }
 }
 
