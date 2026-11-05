@@ -957,6 +957,7 @@ mod tests {
             operation.get::<serde_json::Value>("/ok").await,
             Err(IssueError::BodyLimit(why)) if why == OPERATION_BYTES_REASON
         ));
+        drop(operation);
 
         let mut fresh_operation = client.operation();
         let value: serde_json::Value = fresh_operation.get("/ok").await.unwrap();
