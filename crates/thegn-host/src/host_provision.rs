@@ -150,7 +150,8 @@ pub(crate) fn provision_worktree_on_host(
         Ok(o) => o,
         Err(e) => {
             thegn_core::msg::warn(&format!(
-                "host worktree pipeline: sandbox prepare failed for {worktree}: {e}"
+                "host worktree pipeline: sandbox prepare failed for {worktree}: {}",
+                crate::sandbox_failure::failure_detail(&e)
             ));
             return None;
         }
