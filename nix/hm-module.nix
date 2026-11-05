@@ -319,6 +319,14 @@ self: {
     stats.battery_charging_icon = cfg.statsBatteryChargingIcon;
     stats.disk_icon = cfg.statsDiskIcon;
     stats.disk_path = cfg.statsDiskPath;
+    notifications.desktop = cfg.notificationsDesktop;
+    notifications.surface_self_log_errors = cfg.notificationsSurfaceSelfLogErrors;
+    notifications.github_mentions = cfg.notificationsGithubMentions;
+    notifications.agent_attention_inbox = cfg.notificationsAgentAttentionInbox;
+    notifications.merge_queue_hold_desktop = cfg.notificationsMergeQueueHoldDesktop;
+    activity.enabled = cfg.activityEnabled;
+    activity.red_requires_agent = cfg.activityRedRequiresAgent;
+    activity.agent_programs = cfg.activityAgentPrograms;
     monitor = {
       system = cfg.monitorSystem;
       gpu = cfg.monitorGpu;
@@ -1001,6 +1009,54 @@ in {
       type = lib.types.nullOr (lib.types.str);
       default = null;
       description = "Filesystem the disk masthead widget measures; empty = the filesystem holding the worktrees directory. Unset (null) = the binary's default.";
+    };
+
+    notificationsDesktop = lib.mkOption {
+      type = lib.types.nullOr (lib.types.bool);
+      default = null;
+      description = "Enable desktop notifications. Unset (null) = the binary's default.";
+    };
+
+    notificationsSurfaceSelfLogErrors = lib.mkOption {
+      type = lib.types.nullOr (lib.types.bool);
+      default = null;
+      description = "Surface thegn's own log errors as notifications. Unset (null) = the binary's default.";
+    };
+
+    notificationsGithubMentions = lib.mkOption {
+      type = lib.types.nullOr (lib.types.bool);
+      default = null;
+      description = "Enable notifications for GitHub mentions. Unset (null) = the binary's default.";
+    };
+
+    notificationsAgentAttentionInbox = lib.mkOption {
+      type = lib.types.nullOr (lib.types.bool);
+      default = null;
+      description = "Route agent-attention events to the inbox. Unset (null) = the binary's default.";
+    };
+
+    notificationsMergeQueueHoldDesktop = lib.mkOption {
+      type = lib.types.nullOr (lib.types.bool);
+      default = null;
+      description = "Show merge-queue hold notifications on desktop sinks. Unset (null) = the binary's default.";
+    };
+
+    activityEnabled = lib.mkOption {
+      type = lib.types.nullOr (lib.types.bool);
+      default = null;
+      description = "Track activity dots. Unset (null) = the binary's default.";
+    };
+
+    activityRedRequiresAgent = lib.mkOption {
+      type = lib.types.nullOr (lib.types.bool);
+      default = null;
+      description = "Require a real agent before a worktree can show a needs-you dot. Unset (null) = the binary's default.";
+    };
+
+    activityAgentPrograms = lib.mkOption {
+      type = lib.types.nullOr (lib.types.listOf lib.types.str);
+      default = null;
+      description = "Additional agent CLI program names. Unset (null) = the binary's default.";
     };
 
     monitorSystem = lib.mkOption {
