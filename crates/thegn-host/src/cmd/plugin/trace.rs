@@ -35,6 +35,9 @@ impl Trace {
     pub fn enabled(&self) -> bool {
         self.enabled
     }
+    pub fn has_records(&self) -> bool {
+        !self.records.is_empty()
+    }
     #[cfg(test)]
     pub fn record_count(&self) -> usize {
         self.records.len()

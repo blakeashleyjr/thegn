@@ -80,7 +80,14 @@ fn precheck_record(record: Option<&Path>) -> Result<()> {
 
 fn save_trace(trace: &SharedTrace, record: Option<&Path>) -> Result<()> {
     match record {
-        Some(path) => trace.lock().unwrap_or_else(|e| e.into_inner()).save(path),
+        Some(path) => {
+            let trace = trace.lock().unwrap_or_else(|e| e.into_inner());
+            if trace.has_records() {
+                trace.save(path)
+            } else {
+                Ok(())
+            }
+        }
         None => Ok(()),
     }
 }
@@ -671,7 +678,6 @@ for line in sys.stdin:
         std::fs::write(
             &script,
             r#"import json, sys
-print(json.dumps({"id":7,"method":"host.call","params":{"capability":"sessions.list","params":{}}}), flush=True)
 for line in sys.stdin:
     message = json.loads(line)
     if message.get("id") == 7:
@@ -698,6 +704,7 @@ for line in sys.stdin:
         std::fs::write(
             &script,
             r#"import json, sys
+print(json.dumps({"id":7,"method":"host.call","params":{"capability":"sessions.list","params":{}}}), flush=True)
 for line in sys.stdin:
     message = json.loads(line)
     if message.get("method") == "activate":
@@ -795,6 +802,7 @@ for line in sys.stdin:
         std::fs::write(
             &script,
             r#"import json, sys
+print(json.dumps({"id":7,"method":"host.call","params":{"capability":"sessions.list","params":{}}}), flush=True)
 for line in sys.stdin:
     message = json.loads(line)
     if message.get("method") == "activate":
@@ -886,6 +894,23 @@ for line in sys.stdin:
         .unwrap_err();
         assert!(error.to_string().contains("already exists"));
         assert_eq!(std::fs::read(path).unwrap(), contents);
+    }
+
+    #[test]
+    fn live_trace_headless_does_not_create_a_file_when_plugin_loading_fails() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("failed.jsonl");
+
+        assert!(
+            run_headless(
+                Path::new("/nonexistent-plugin-dir"),
+                (60, 8),
+                Duration::from_millis(100),
+                Some(&path),
+            )
+            .is_err()
+        );
+        assert!(!path.exists());
     }
 
     #[test]
