@@ -35,6 +35,10 @@ impl Trace {
     pub fn enabled(&self) -> bool {
         self.enabled
     }
+    #[cfg(test)]
+    pub fn record_count(&self) -> usize {
+        self.records.len()
+    }
     pub fn push(
         &mut self,
         direction: &str,
