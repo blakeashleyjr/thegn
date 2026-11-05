@@ -760,6 +760,33 @@ impl FolderAssignReq {
     }
 }
 
+/// A Lead-lease proof presented with a pipeline mutation (THE-208). Optional
+/// on the wire; absent means no proof, so a lease-bound row is refused.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct DispatchLeadReq {
+    pub lease: String,
+    pub owner: String,
+    /// The generation returned by `thegn dispatch lease acquire`; when present the proof is fenced.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lease_gen: Option<i64>,
+}
+
+impl DispatchLeadReq {
+    pub fn proof(&self) -> thegn_core::db::LeadProof<'_> {
+        match self.lease_gen {
+            Some(generation) => thegn_core::db::LeadProof::Fenced {
+                name: &self.lease,
+                owner: &self.owner,
+                generation,
+            },
+            None => thegn_core::db::LeadProof::Lease {
+                name: &self.lease,
+                owner: &self.owner,
+            },
+        }
+    }
+}
+
 /// The `dispatches.put` verb payload (THE-57): one row appended to the roster.
 ///
 /// The four pipeline fields (v56) are optional and default-absent, so a caller
@@ -787,6 +814,8 @@ pub struct DispatchPutReq {
     /// the payload.
     #[serde(default)]
     pub artifact_path: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lead: Option<DispatchLeadReq>,
 }
 
 /// One newest-first page of the dispatch roster (`dispatches.list`).
@@ -1268,6 +1297,16 @@ pub trait ControlApi: Send + Sync + 'static {
         &self,
         _id: i64,
         _status: thegn_core::issue::AgentDispatchStatus,
+    ) -> BoxFuture<'_, ControlResult<()>> {
+        Box::pin(async { Err(ControlError::Unimplemented("dispatch roster unavailable")) })
+    }
+
+    /// Advance a dispatch's status with an explicit Lead-lease proof.
+    fn dispatch_set_status_led(
+        &self,
+        _id: i64,
+        _status: thegn_core::issue::AgentDispatchStatus,
+        _lead: DispatchLeadReq,
     ) -> BoxFuture<'_, ControlResult<()>> {
         Box::pin(async { Err(ControlError::Unimplemented("dispatch roster unavailable")) })
     }
