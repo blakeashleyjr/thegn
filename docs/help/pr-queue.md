@@ -92,6 +92,17 @@ If a later poll confirms a requested merge at the same head, the row records
 at a different head, or one not requested by thegn, is recorded as merged on
 the forge but is not counted as a thegn merge.
 
+Before a merge, CI rerun or agent dispatch, the PR queue re-attests a bound
+checkout and distinguishes a missing checkout from one Git could not read. A
+missing or non-worktree checkout refuses the effect with
+`queued checkout is missing or no longer a Git worktree` (this includes a Git
+read that exits non-zero); a timed-out or otherwise unreadable read says
+`queued checkout could not be read (<reason>)` (or `queued checkout branch could
+not be read (<reason>)`). Both
+messages include `thegn pr queue rebind --pr N`. An unreadable branch on agent
+dispatch is held for human review and shown as
+`unknown (could not be read: <reason>)`.
+
 `thegn doctor` notes this in the Providers list when a forge can merge but
 cannot fence that merge to the reviewed head: the PR queue holds merges for
 that forge, which you must merge yourself.

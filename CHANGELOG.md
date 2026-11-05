@@ -9,6 +9,41 @@ All notable changes to **thegn** are documented here. The format follows
 
 ## [0.1.0-alpha.54] — 2026-11-05 (maintenance batch 92)
 
+### Added
+
+- `thegn issue tracker get|update|comment <provider>:<key> --account <name>`
+  routes an issue through that named account; `--account` is required.
+- URL clones record their credential-free canonical origin, thegn version,
+  start time and validation time. `thegn repo provenance [PATH] [--json]` lists
+  recorded clones with their current status: `verified`, `origin-changed`,
+  `missing`, `unverifiable`, `cloning`, `interrupted` or `abandoned`.
+- `thegn plugin preview --plugin-dir <DIR>` previews a resident app plugin.
+  `--headless` prints a JSON snapshot of its first valid view, with `--wait-ms`
+  bounding the wait; without it, views render live in the terminal.
+- The Telemetry status modal adds a `plugins` section with current in-flight
+  host calls and cumulative per-plugin counts for refused calls, timeouts, lost
+  replies and event-queue drops. The section is absent while all displayed
+  counts are zero.
+- `thegn doctor`'s worker row checks a stage agent's relocated credential home
+  (for example, `CODEX_HOME`) and reports `provider-home-unavailable` if it is
+  missing or not a directory.
+- The Home Manager module adds null-default `programs.thegn.drawer*` options
+  for `[drawer]` scalar settings and `programs.thegn.stripVisible` for
+  `[strip]` `visible`.
+
+### Changed
+
+- `thegn share stop` records a Tailscale share as `stopping` before teardown,
+  so a later stop retries an interrupted teardown. `thegn share list` marks
+  rows needing recovery, and `--json` includes a `recovery` field.
+- The PR queue distinguishes a checkout Git could not read from one that is
+  missing in its refusal and agent-dispatch hold messages.
+- Shell completion's default time budget is 300 ms, up from 100 ms.
+  `THEGN_COMPLETE_BUDGET_MS` still overrides the default.
+- The state database schema is now v107. The v106 migration added clone
+  provenance; v107 records merge landing OIDs. Restart the host and daemon
+  after upgrading so they use the migrated database.
+
 ## [0.1.0-alpha.53] — 2026-11-05 (maintenance batch 91)
 
 ### Added
