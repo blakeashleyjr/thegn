@@ -8,6 +8,9 @@ use std::path::PathBuf;
 use thegn_core::config::Config;
 use thegn_core::config_resolve::{Approvals, GatedRequest};
 use thegn_core::db::Db;
+use thegn_core::db_clone_provenance::{
+    CloneProvenance, ProvenanceStatus, classify_clone_provenance,
+};
 use thegn_core::remote::GitLoc;
 use thegn_core::store::{RepoTrustStore, WorkspaceStore};
 use thegn_core::{outln, repo, repo_trust, util};
@@ -39,6 +42,15 @@ pub enum Action {
         #[arg(long)]
         revoke: Option<String>,
     },
+    /// Show where cloned workspaces came from and whether each clone finished
+    /// (add PATH for one repo).
+    Provenance {
+        /// Destination path (default: list recorded clones).
+        path: Option<String>,
+        /// Emit one JSON array instead of plain lines.
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 pub fn run(cfg: &Config, action: Action) -> Result<()> {
@@ -50,6 +62,7 @@ pub fn run(cfg: &Config, action: Action) -> Result<()> {
             approve,
             revoke,
         } => trust(cfg, path, approve, revoke),
+        Action::Provenance { path, json } => provenance(path, json),
     }
 }
 
@@ -76,6 +89,78 @@ pub fn recent(count: Option<i64>, json: bool) -> Result<()> {
         outln!("{path}");
     }
     Ok(())
+}
+
+const PROVENANCE_LIST_LIMIT: i64 = 50;
+
+#[derive(serde::Serialize)]
+struct ProvenanceReport {
+    #[serde(flatten)]
+    row: CloneProvenance,
+    status: ProvenanceStatus,
+}
+
+/// Report recorded clone origins with their current on-disk verification status.
+pub fn provenance(path: Option<String>, json: bool) -> Result<()> {
+    let db = Db::open()?;
+    let reports = provenance_reports(&db, path.as_deref())?;
+    if json {
+        return super::emit_json(&reports);
+    }
+    if reports.is_empty() {
+        outln!("no cloned workspaces recorded");
+        return Ok(());
+    }
+    for report in reports {
+        outln!(
+            "{}\t{}\t{}",
+            report.status.as_str(),
+            report.row.dest,
+            report.row.canonical_origin
+        );
+    }
+    Ok(())
+}
+
+fn provenance_reports(db: &Db, path: Option<&str>) -> Result<Vec<ProvenanceReport>> {
+    let rows = if let Some(path) = path {
+        let root = repo_root_arg(Some(path.to_owned()));
+        let canonical = std::fs::canonicalize(&root)
+            .ok()
+            .map(|path| path.to_string_lossy().into_owned());
+        let raw = root.to_string_lossy().into_owned();
+        let mut found = None;
+        if let Some(canonical) = canonical {
+            found = db.clone_provenance(&canonical)?;
+        }
+        if found.is_none() {
+            found = db.clone_provenance(&raw)?;
+        }
+        vec![found.ok_or_else(|| {
+            anyhow::anyhow!("no clone provenance recorded for {}", root.display())
+        })?]
+    } else {
+        db.recent_clone_provenance(PROVENANCE_LIST_LIMIT)?
+    };
+    Ok(rows.into_iter().map(observe).collect())
+}
+
+fn observe(row: CloneProvenance) -> ProvenanceReport {
+    let dest = std::path::Path::new(&row.dest);
+    let dest_present = dest.join(".git").exists();
+    let observed_origin = if dest_present {
+        crate::workspace_create::configured_origin(dest, "origin")
+            .ok()
+            .flatten()
+    } else {
+        None
+    };
+    let owner_alive = row
+        .clone_pid
+        .is_some_and(|pid| crate::platform::pid_alive(i64::from(pid)));
+    let status =
+        classify_clone_provenance(&row, dest_present, observed_origin.as_deref(), owner_alive);
+    ProvenanceReport { row, status }
 }
 
 /// Resolve a repo-path argument (default: cwd) to a repo root.
@@ -251,6 +336,7 @@ pub fn trust(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use thegn_core::db_clone_provenance::{CloneProvenanceState, NewCloneProvenance};
     use thegn_core::hooks::{HookContext, HookEvent, HookExecutionMode};
     use thegn_core::store::RepoTrustStore;
 
@@ -357,5 +443,151 @@ mod tests {
         let result = trust_target(dir.path(), dir.path(), &db).unwrap();
         assert_eq!(result.0, dir.path());
         assert!(matches!(result.1, GitLoc::Local(_)));
+    }
+
+    fn record_clone(db: &Db, dest: &str, origin: &str, pid: u32) {
+        assert!(
+            db.begin_clone_provenance(
+                &NewCloneProvenance {
+                    dest,
+                    canonical_origin: origin,
+                    label: "example",
+                    clone_pid: pid,
+                    thegn_version: "0.1.0-alpha.52",
+                },
+                &|_| false,
+            )
+            .unwrap()
+        );
+    }
+
+    fn write_origin(dest: &std::path::Path, origin_url: &str) {
+        std::fs::create_dir_all(dest.join(".git")).unwrap();
+        std::fs::write(
+            dest.join(".git/config"),
+            format!("[remote \"origin\"]\n\turl = {origin_url}\n"),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn provenance_reports_classify_verified_origin_changed_missing_and_interrupted() {
+        let _state = crate::testenv::IsolatedState::new();
+        let db = Db::open().unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let origin = "https://example.com/o/r";
+        let verified_dest = tmp.path().join("ok");
+        let changed_dest = tmp.path().join("moved");
+        let missing_dest = tmp.path().join("gone");
+        let interrupted_dest = tmp.path().join("crashed");
+        write_origin(&verified_dest, "https://example.com/o/r.git");
+        write_origin(&changed_dest, "https://example.com/o/other.git");
+
+        let verified = verified_dest.to_string_lossy().into_owned();
+        record_clone(&db, &verified, origin, 5);
+        assert!(
+            db.finish_clone_provenance(&verified, 5, CloneProvenanceState::Complete)
+                .unwrap()
+        );
+
+        let changed = changed_dest.to_string_lossy().into_owned();
+        record_clone(&db, &changed, origin, 6);
+        assert!(
+            db.finish_clone_provenance(&changed, 6, CloneProvenanceState::Complete)
+                .unwrap()
+        );
+
+        let missing = missing_dest.to_string_lossy().into_owned();
+        record_clone(&db, &missing, origin, 7);
+        assert!(
+            db.finish_clone_provenance(&missing, 7, CloneProvenanceState::Complete)
+                .unwrap()
+        );
+
+        let interrupted = interrupted_dest.to_string_lossy().into_owned();
+        let dead_pid = u32::try_from(i32::MAX).unwrap();
+        record_clone(&db, &interrupted, origin, dead_pid);
+
+        let reports = provenance_reports(&db, None).unwrap();
+        assert_eq!(reports.len(), 4);
+        let status_for = |dest: &str| {
+            reports
+                .iter()
+                .find(|report| report.row.dest == dest)
+                .map(|report| report.status)
+        };
+        assert_eq!(status_for(&verified), Some(ProvenanceStatus::Verified));
+        assert_eq!(status_for(&changed), Some(ProvenanceStatus::OriginChanged));
+        assert_eq!(status_for(&missing), Some(ProvenanceStatus::Missing));
+        assert_eq!(
+            status_for(&interrupted),
+            Some(ProvenanceStatus::Interrupted)
+        );
+    }
+
+    #[test]
+    fn provenance_for_a_path_without_a_row_fails() {
+        let _state = crate::testenv::IsolatedState::new();
+        let db = Db::open().unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().to_string_lossy().into_owned();
+
+        let error = match provenance_reports(&db, Some(&path)) {
+            Ok(_) => panic!("unrecorded path must fail"),
+            Err(error) => error,
+        };
+        assert!(format!("{error:#}").contains("no clone provenance recorded"));
+
+        let dest = std::fs::canonicalize(tmp.path()).unwrap();
+        let dest = dest.to_str().unwrap();
+        record_clone(&db, dest, "https://example.com/o/r", 8);
+        assert!(
+            db.finish_clone_provenance(dest, 8, CloneProvenanceState::Complete)
+                .unwrap()
+        );
+        let reports = provenance_reports(&db, Some(&path)).unwrap();
+        assert_eq!(reports.len(), 1);
+        assert_eq!(reports[0].row.dest, dest);
+    }
+
+    #[test]
+    fn provenance_json_carries_the_kebab_status_and_no_clone_url() {
+        let _state = crate::testenv::IsolatedState::new();
+        let db = Db::open().unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let dest_path = tmp.path().join("changed");
+        write_origin(&dest_path, "https://example.com/o/other.git");
+        let dest = dest_path.to_string_lossy().into_owned();
+        record_clone(&db, &dest, "https://example.com/o/r", 9);
+        assert!(
+            db.finish_clone_provenance(&dest, 9, CloneProvenanceState::Complete)
+                .unwrap()
+        );
+
+        let reports = provenance_reports(&db, None).unwrap();
+        let value = serde_json::to_value(reports).unwrap();
+        let row = &value[0];
+        assert_eq!(row["status"], "origin-changed");
+        assert_eq!(row["state"], "complete");
+        assert_eq!(row["canonical_origin"], "https://example.com/o/r");
+        assert!(row.get("clone_url").is_none());
+    }
+
+    #[test]
+    fn provenance_lists_every_recorded_row_when_no_path_is_given() {
+        let _state = crate::testenv::IsolatedState::new();
+        let db = Db::open().unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let destinations = ["one", "two", "three"]
+            .map(|name| tmp.path().join(name).to_string_lossy().into_owned());
+        for (index, dest) in destinations.iter().enumerate() {
+            record_clone(&db, dest, "https://example.com/o/r", 10 + index as u32);
+        }
+
+        let reports = provenance_reports(&db, None).unwrap();
+        assert_eq!(reports.len(), 3);
+        for dest in destinations {
+            assert!(reports.iter().any(|report| report.row.dest == dest));
+        }
     }
 }

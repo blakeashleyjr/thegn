@@ -428,6 +428,7 @@ pub const CATALOG: &[Slot] = &[
     // resolves to the same command tree, so one canonical path covers both.
     slot("program assign", "repo", SourceKind::Repo),
     slot("repo trust", "path", SourceKind::Repo),
+    slot("repo provenance", "path", SourceKind::Repo),
     // The hidden legacy top-level alias of `repo trust`.
     slot("repo-trust", "path", SourceKind::Repo),
     slot("wt new", "repo", SourceKind::Repo),
