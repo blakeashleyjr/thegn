@@ -187,7 +187,7 @@ mod tests {
 
         let error = rename_theme(dir, "Old Name", "Taken", None).unwrap_err();
 
-        assert!(error.contains("already claimed"));
+        assert!(error.contains("already exists on disk"), "{error}");
         assert!(error.ends_with("(nothing was written)"));
         assert_eq!(std::fs::read(dir.join("old-name.toml")).unwrap(), old_bytes);
         assert_eq!(std::fs::read(dir.join("taken.toml")).unwrap(), taken_bytes);
