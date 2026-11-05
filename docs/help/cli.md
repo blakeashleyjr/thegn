@@ -280,6 +280,7 @@ a running instance. See [[merge-queue]] for the whole flow.
 
 Most list-shaped reads accept `--json` and emit exactly one compact JSON
 document on stdout with no ANSI: `wt list`, `repo list`, `repo recent`,
+`repo provenance`,
 `env list`, `host list`, `host discover`, `ci runs`, `share list`,
 `forward list`, `merge list`, `session list`, `pair list`, `map`, and
 `wt new --json`, and `autopilot status`. Treat those shapes as a stable API.
