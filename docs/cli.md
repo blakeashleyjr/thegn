@@ -178,6 +178,11 @@ API. (Two pre-existing surfaces keep their historical shapes: `notify list
 --json` is NDJSON, `doctor --json` is one object.) A few list surfaces are
 text-only today — `zone list`, `mcp list`, and `theme list` have no `--json`.
 
+`merge list --json` rows add a `claim` object (`null` when unclaimed) and a
+`landed` object for landed rows, with `source_oid`, `target_base_oid` and
+`result_oid` (`null` when not landed). Older landings carry only recorded
+values; existing fields keep their shapes.
+
 ## Exit codes
 
 | Code | Meaning                                                             |
