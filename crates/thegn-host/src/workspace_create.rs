@@ -1522,6 +1522,7 @@ pub(crate) fn reconcile_clone_provenance_at_startup() -> usize {
     match thegn_core::db::Db::open() {
         Ok(db) => reconcile_clone_provenance(&db, std::process::id(), crate::platform::pid_alive),
         Err(error) => {
+            // Best-effort: git is authoritative and the state DB is only a cache.
             tracing::warn!(%error, "could not open the state db to reconcile workspace clone provenance");
             0
         }
