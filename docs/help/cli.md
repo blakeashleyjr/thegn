@@ -70,6 +70,14 @@ also accept `account` (HTTP `?account=<name>`) to route an issue to the named
 `<provider>:<key>`; without it, existing prefix routing applies. An unknown or
 invalid account is rejected before any tracker call.
 
+The CLI reaches the same exact-account routing with `thegn issue tracker
+get|update|comment <id> --account <name>` for tracker issues (the id is the
+`<provider>:<key>` that `issue list --status --json` prints; `--account` is
+required). `update` takes `--status`, `--title`, `--priority` and
+`--assign-me`/`--unassign-me`; `comment` takes the body. Plugin issue providers
+are served only by the running UI. The forge verbs `issue view` and
+`issue comment <number>` are unchanged.
+
 The multi-repo group commands use the canonical `thegn program` namespace.
 `thegn project` remains a deprecated, behavior-identical alias for three
 stable releases and warns with the replacement. Likewise, `wt new --program`
@@ -280,6 +288,7 @@ a running instance. See [[merge-queue]] for the whole flow.
 
 Most list-shaped reads accept `--json` and emit exactly one compact JSON
 document on stdout with no ANSI: `wt list`, `repo list`, `repo recent`,
+`repo provenance`,
 `env list`, `host list`, `host discover`, `ci runs`, `share list`,
 `forward list`, `merge list`, `session list`, `pair list`, `map`, and
 `wt new --json`, and `autopilot status`. Treat those shapes as a stable API.
@@ -299,6 +308,8 @@ With `--json`, stdout is one valid JSON value with explicit `fetched_at`,
 when redaction changed the text, false when no change was found in the text,
 and null for logs cached before schema v103; it does not prove every secret
 shape was recognized.
+The control API and daemon `ci.logs` reply also carry `redaction_changed` at
+the top level, beside `redacted`, with the same true, false and null meanings.
 `ci logs` reuses a cached log only when it has a recorded head commit; a log
 with an unknown head is printed but not cached. The CI panel's failed-job log
 windows and background log ingestion apply a stricter check: they reuse a

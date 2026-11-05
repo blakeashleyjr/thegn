@@ -364,14 +364,19 @@ pub const CATALOG: &[Slot] = &[
     slot("placement explain", "worktree_pos", SourceKind::Worktree),
     slot("placement plan", "worktree", SourceKind::Worktree),
     slot("placement plan", "worktree_pos", SourceKind::Worktree),
-    // `plugin preview` takes no plugin id and never starts a plugin to complete a value. Paths are clap's own
-    // filesystem completion; the size is a COLSxROWS scalar with no enumerable source.
+    // `plugin preview` value sources are structural or freeform scalars; paths use clap's filesystem completion.
     slot("plugin preview", "fixture", SourceKind::Structural),
     slot("plugin preview", "replay", SourceKind::Structural),
     slot("plugin preview", "record", SourceKind::Structural),
+    slot("plugin preview", "plugin_dir", SourceKind::Structural),
     slot(
         "plugin preview",
         "size",
+        SourceKind::Reserved(Reserved::Freeform),
+    ),
+    slot(
+        "plugin preview",
+        "wait_ms",
         SourceKind::Reserved(Reserved::Freeform),
     ),
     slot("pr approve", "worktree", SourceKind::Worktree),
@@ -428,6 +433,7 @@ pub const CATALOG: &[Slot] = &[
     // resolves to the same command tree, so one canonical path covers both.
     slot("program assign", "repo", SourceKind::Repo),
     slot("repo trust", "path", SourceKind::Repo),
+    slot("repo provenance", "path", SourceKind::Repo),
     // The hidden legacy top-level alias of `repo trust`.
     slot("repo-trust", "path", SourceKind::Repo),
     slot("wt new", "repo", SourceKind::Repo),
@@ -813,6 +819,36 @@ pub const CATALOG: &[Slot] = &[
         "issue view",
         "number",
         SourceKind::Reserved(Reserved::Issue),
+    ),
+    slot(
+        "issue tracker get",
+        "id",
+        SourceKind::Reserved(Reserved::Issue),
+    ),
+    slot("issue tracker get", "account", SourceKind::Structural),
+    slot(
+        "issue tracker update",
+        "id",
+        SourceKind::Reserved(Reserved::Issue),
+    ),
+    slot("issue tracker update", "account", SourceKind::Structural),
+    slot("issue tracker update", "status", SourceKind::Structural),
+    slot("issue tracker update", "priority", SourceKind::Structural),
+    slot(
+        "issue tracker update",
+        "title",
+        SourceKind::Reserved(Reserved::Freeform),
+    ),
+    slot(
+        "issue tracker comment",
+        "id",
+        SourceKind::Reserved(Reserved::Issue),
+    ),
+    slot("issue tracker comment", "account", SourceKind::Structural),
+    slot(
+        "issue tracker comment",
+        "body",
+        SourceKind::Reserved(Reserved::Freeform),
     ),
     slot(
         "wt new",
