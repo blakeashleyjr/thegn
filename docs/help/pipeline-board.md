@@ -204,3 +204,12 @@ writing, storing the trimmed issue id with a lowercased provider prefix and
 the canonical worktree root. A malformed issue id or a missing path,
 subdirectory, or non-worktree root is rejected as an invalid argument naming
 the problem, and no row is written.
+
+The control API's `dispatches.put` and `dispatches.set_status` accept an
+optional `lead` object with `lease`, `owner`, and optional `lease_gen`. Omitting
+`lease_gen` gives the unfenced lease check; supplying it adds generation fencing,
+as with the CLI's `--lease`, `--owner`, and `--lease-gen` proof. A row or issue
+bound to a live Lead lease is refused as a failed precondition without a proof,
+or with a stale generation or a proof from another holder. An empty or
+over-long lease or owner is an invalid argument. There is no admin override
+over the control API.

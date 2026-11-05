@@ -605,6 +605,23 @@ impl std::fmt::Display for DispatchStatusError {
 
 impl std::error::Error for DispatchStatusError {}
 
+fn dispatch_set_status_with_proof(
+    db: &Db,
+    id: i64,
+    status: thegn_core::issue::AgentDispatchStatus,
+    proof: thegn_core::db::LeadProof<'_>,
+) -> anyhow::Result<()> {
+    use thegn_core::store::NotificationStore;
+
+    let row = db
+        .get_dispatch(id)?
+        .ok_or_else(|| anyhow::Error::new(DispatchStatusError::NotFound(id)))?;
+    if status == thegn_core::issue::AgentDispatchStatus::Unknown {
+        return Err(anyhow::Error::new(DispatchStatusError::UnknownStatus));
+    }
+    db.set_dispatch_status_led(id, row.status, status, None, proof)
+}
+
 fn map_dispatch_status_error(error: anyhow::Error) -> ControlError {
     if let Some(status_error) = error.downcast_ref::<DispatchStatusError>() {
         return match status_error {
@@ -621,6 +638,12 @@ fn map_dispatch_status_error(error: anyhow::Error) -> ControlError {
         .is_some()
     {
         return ControlError::FailedPrecondition(error.to_string());
+    }
+    if error
+        .downcast_ref::<thegn_core::db::LeaseInputError>()
+        .is_some()
+    {
+        return ControlError::InvalidArgument(error.to_string());
     }
     if let Some(conflict) = error.downcast_ref::<thegn_core::db::DispatchTransitionConflict>() {
         return match conflict {
@@ -658,6 +681,18 @@ fn map_dispatch_put_error(error: anyhow::Error) -> ControlError {
     }
     if error
         .downcast_ref::<thegn_core::pipeline_report::DispatchTextRejected>()
+        .is_some()
+    {
+        return ControlError::InvalidArgument(error.to_string());
+    }
+    if error
+        .downcast_ref::<thegn_core::db::LeadLeaseConflict>()
+        .is_some()
+    {
+        return ControlError::FailedPrecondition(error.to_string());
+    }
+    if error
+        .downcast_ref::<thegn_core::db::LeaseInputError>()
         .is_some()
     {
         return ControlError::InvalidArgument(error.to_string());
@@ -2826,16 +2861,21 @@ impl ControlApi for DaemonService {
             };
             self.with_db(move |db| {
                 use thegn_core::store::NotificationStore;
-                let id = db.put_dispatch_with_parent_check(thegn_core::issue::NewDispatch {
-                    issue_id: &issue_id,
-                    worktree_path: &worktree_path,
-                    agent_name: &req.agent_name,
-                    stage: req.stage.as_deref(),
-                    parent_id: req.parent_id,
-                    session_id: req.session_id.as_deref(),
-                    artifact_path: req.artifact_path.as_deref(),
-                    chunk_path: None,
-                })?;
+                let id = db.put_dispatch_with_parent_check_led(
+                    thegn_core::issue::NewDispatch {
+                        issue_id: &issue_id,
+                        worktree_path: &worktree_path,
+                        agent_name: &req.agent_name,
+                        stage: req.stage.as_deref(),
+                        parent_id: req.parent_id,
+                        session_id: req.session_id.as_deref(),
+                        artifact_path: req.artifact_path.as_deref(),
+                        chunk_path: None,
+                    },
+                    req.lead
+                        .as_ref()
+                        .map_or(thegn_core::db::LeadProof::Unbound, |lead| lead.proof()),
+                )?;
                 db.get_dispatch(id)?
                     .ok_or_else(|| anyhow::anyhow!("dispatch {id} vanished after insert"))
             })
@@ -2854,20 +2894,29 @@ impl ControlApi for DaemonService {
     ) -> BoxFuture<'_, ControlResult<()>> {
         Box::pin(async move {
             self.with_db(move |db| {
-                use thegn_core::store::NotificationStore;
-                let row = db
-                    .get_dispatch(id)?
-                    .ok_or_else(|| anyhow::Error::new(DispatchStatusError::NotFound(id)))?;
-                if status == thegn_core::issue::AgentDispatchStatus::Unknown {
-                    return Err(anyhow::Error::new(DispatchStatusError::UnknownStatus));
-                }
-                db.set_dispatch_status_checked(id, row.status, status, None)
+                dispatch_set_status_with_proof(db, id, status, thegn_core::db::LeadProof::Unbound)
             })
             .await
             .map_err(|error| match error {
                 ControlError::Internal(error) => map_dispatch_status_error(error),
                 other => other,
             })
+        })
+    }
+
+    fn dispatch_set_status_led(
+        &self,
+        id: i64,
+        status: thegn_core::issue::AgentDispatchStatus,
+        lead: thegn_svc::control::DispatchLeadReq,
+    ) -> BoxFuture<'_, ControlResult<()>> {
+        Box::pin(async move {
+            self.with_db(move |db| dispatch_set_status_with_proof(db, id, status, lead.proof()))
+                .await
+                .map_err(|error| match error {
+                    ControlError::Internal(error) => map_dispatch_status_error(error),
+                    other => other,
+                })
         })
     }
 
@@ -6037,6 +6086,7 @@ mod tests {
                 parent_id: Some(row.id),
                 session_id: Some("sess-code-1".into()),
                 artifact_path: Some(".thegn/pipeline/architect/1.md".into()),
+                lead: None,
             })
             .await
             .unwrap();
@@ -6130,6 +6180,277 @@ mod tests {
         assert!(matches!(
             svc.dispatch_set_status(row_id, St::Running).await,
             Err(ControlError::FailedPrecondition(_))
+        ));
+    }
+
+    async fn leased_issue(svc: &DaemonService) -> thegn_svc::control::DispatchLeadReq {
+        let generation = svc
+            .with_db(|db| {
+                db.acquire_pipeline_lease_fenced("repo:linear:A-1", "lead-a", 300)?
+                    .map_err(anyhow::Error::msg)
+            })
+            .await
+            .unwrap();
+        thegn_svc::control::DispatchLeadReq {
+            lease: "repo:linear:A-1".into(),
+            owner: "lead-a".into(),
+            lease_gen: Some(generation),
+        }
+    }
+
+    #[tokio::test]
+    async fn dispatch_control_lead_put_binds_the_row_to_the_held_lease() {
+        let (svc, _rx) = service(0);
+        let (_dir, wt) = git_worktree();
+        let lead = leased_issue(&svc).await;
+        let row = svc
+            .dispatch_put(thegn_svc::control::DispatchPutReq {
+                issue_id: "linear:A-1".into(),
+                worktree_path: wt.to_string_lossy().into_owned(),
+                agent_name: "claude".into(),
+                lead: Some(lead),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert_eq!(row.status, thegn_core::issue::AgentDispatchStatus::Queued);
+        assert!(matches!(
+            svc.dispatch_put(thegn_svc::control::DispatchPutReq {
+                issue_id: "linear:A-1".into(),
+                worktree_path: wt.to_string_lossy().into_owned(),
+                agent_name: "claude".into(),
+                ..Default::default()
+            })
+            .await,
+            Err(ControlError::FailedPrecondition(_))
+        ));
+        assert_eq!(
+            svc.dispatches_list(None, Db::ROSTER_HISTORY_LIMIT)
+                .await
+                .unwrap()
+                .dispatches
+                .len(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn dispatch_control_lead_put_stale_generation_is_failed_precondition() {
+        let (svc, _rx) = service(0);
+        let (_dir, wt) = git_worktree();
+        let mut lead = leased_issue(&svc).await;
+        lead.lease_gen = lead.lease_gen.map(|generation| generation + 1000);
+        let result = svc
+            .dispatch_put(thegn_svc::control::DispatchPutReq {
+                issue_id: "linear:A-1".into(),
+                worktree_path: wt.to_string_lossy().into_owned(),
+                agent_name: "claude".into(),
+                lead: Some(lead),
+                ..Default::default()
+            })
+            .await;
+        assert!(matches!(
+            result,
+            Err(ControlError::FailedPrecondition(message)) if message.contains("stale")
+        ));
+        assert!(
+            svc.dispatches_list(None, Db::ROSTER_HISTORY_LIMIT)
+                .await
+                .unwrap()
+                .dispatches
+                .is_empty()
+        );
+    }
+
+    #[tokio::test]
+    async fn dispatch_control_lead_put_by_a_non_holder_is_failed_precondition() {
+        let (svc, _rx) = service(0);
+        let (_dir, wt) = git_worktree();
+        let mut lead = leased_issue(&svc).await;
+        lead.owner = "lead-b".into();
+        let result = svc
+            .dispatch_put(thegn_svc::control::DispatchPutReq {
+                issue_id: "linear:A-1".into(),
+                worktree_path: wt.to_string_lossy().into_owned(),
+                agent_name: "claude".into(),
+                lead: Some(lead),
+                ..Default::default()
+            })
+            .await;
+        assert!(matches!(result, Err(ControlError::FailedPrecondition(_))));
+        assert!(
+            svc.dispatches_list(None, Db::ROSTER_HISTORY_LIMIT)
+                .await
+                .unwrap()
+                .dispatches
+                .is_empty()
+        );
+    }
+
+    #[tokio::test]
+    async fn dispatch_control_lead_put_with_an_empty_lease_is_invalid_argument() {
+        let (svc, _rx) = service(0);
+        let (_dir, wt) = git_worktree();
+        let mut lead = leased_issue(&svc).await;
+        lead.lease.clear();
+        let result = svc
+            .dispatch_put(thegn_svc::control::DispatchPutReq {
+                issue_id: "linear:A-1".into(),
+                worktree_path: wt.to_string_lossy().into_owned(),
+                agent_name: "claude".into(),
+                lead: Some(lead),
+                ..Default::default()
+            })
+            .await;
+        assert!(matches!(result, Err(ControlError::InvalidArgument(_))));
+        assert!(
+            svc.dispatches_list(None, Db::ROSTER_HISTORY_LIMIT)
+                .await
+                .unwrap()
+                .dispatches
+                .is_empty()
+        );
+    }
+
+    #[tokio::test]
+    async fn dispatch_control_lead_set_status_presents_the_proof() {
+        use thegn_core::issue::AgentDispatchStatus as St;
+
+        let (svc, _rx) = service(0);
+        let (_dir, wt) = git_worktree();
+        let lead = leased_issue(&svc).await;
+        let row = svc
+            .dispatch_put(thegn_svc::control::DispatchPutReq {
+                issue_id: "linear:A-1".into(),
+                worktree_path: wt.to_string_lossy().into_owned(),
+                agent_name: "claude".into(),
+                lead: Some(lead.clone()),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert!(matches!(
+            svc.dispatch_set_status(row.id, St::Running).await,
+            Err(ControlError::FailedPrecondition(_))
+        ));
+        let mut stale = lead.clone();
+        stale.lease_gen = stale.lease_gen.map(|generation| generation + 1000);
+        assert!(matches!(
+            svc.dispatch_set_status_led(row.id, St::Running, stale)
+                .await,
+            Err(ControlError::FailedPrecondition(_))
+        ));
+        let mut other_holder = lead.clone();
+        other_holder.owner = "lead-b".into();
+        assert!(matches!(
+            svc.dispatch_set_status_led(row.id, St::Running, other_holder)
+                .await,
+            Err(ControlError::FailedPrecondition(_))
+        ));
+        svc.dispatch_set_status_led(row.id, St::Running, lead)
+            .await
+            .unwrap();
+        let row_id = row.id;
+        let updated = svc
+            .with_db(move |db| {
+                use thegn_core::store::NotificationStore;
+                db.get_dispatch(row_id)?
+                    .ok_or_else(|| anyhow::anyhow!("dispatch vanished"))
+            })
+            .await
+            .unwrap();
+        assert_eq!(updated.status, St::Running);
+    }
+
+    #[tokio::test]
+    async fn dispatch_control_lead_http_status_body_accepts_the_lead_object() {
+        let (svc, _rx) = service(0);
+        let svc = Arc::new(svc);
+        let (_dir, wt) = git_worktree();
+        let lead = leased_issue(&svc).await;
+        let (put_status, put_body) = thegn_svc::control::http::dispatch_local(
+            dispatch_put_http_state(svc.clone()),
+            "dispatches.put",
+            "POST",
+            "/v1/dispatches",
+            Some(serde_json::json!({
+                "issue_id": "linear:A-1",
+                "worktree_path": wt.to_string_lossy(),
+                "agent_name": "claude",
+                "lead": {
+                    "lease": lead.lease,
+                    "owner": lead.owner,
+                    "lease_gen": lead.lease_gen
+                }
+            })),
+        )
+        .await;
+        assert_eq!(put_status, axum::http::StatusCode::OK, "{put_body}");
+        let id = put_body["id"].as_i64().unwrap();
+        let (without_proof, _) = thegn_svc::control::http::dispatch_local(
+            dispatch_put_http_state(svc.clone()),
+            "dispatches.set_status",
+            "POST",
+            &format!("/v1/dispatches/{id}/status"),
+            Some(serde_json::json!({"status": "running"})),
+        )
+        .await;
+        assert_eq!(without_proof, axum::http::StatusCode::PRECONDITION_FAILED);
+        let (with_proof, body) = thegn_svc::control::http::dispatch_local(
+            dispatch_put_http_state(svc),
+            "dispatches.set_status",
+            "POST",
+            &format!("/v1/dispatches/{id}/status"),
+            Some(serde_json::json!({
+                "status": "running",
+                "lead": {
+                    "lease": lead.lease,
+                    "owner": lead.owner,
+                    "lease_gen": lead.lease_gen
+                }
+            })),
+        )
+        .await;
+        assert_eq!(with_proof, axum::http::StatusCode::OK, "{body}");
+    }
+
+    #[test]
+    fn dispatch_control_lead_wire_shape_is_additive() {
+        use thegn_core::db::LeadProof;
+        use thegn_svc::control::{DispatchLeadReq, DispatchPutReq};
+
+        let legacy: DispatchPutReq = serde_json::from_value(serde_json::json!({
+            "issue_id": "i",
+            "worktree_path": "w",
+            "agent_name": "a"
+        }))
+        .unwrap();
+        assert!(legacy.lead.is_none());
+        assert!(
+            serde_json::to_value(DispatchPutReq::default())
+                .unwrap()
+                .get("lead")
+                .is_none()
+        );
+        let unfenced = DispatchLeadReq {
+            lease: "repo:issue".into(),
+            owner: "lead".into(),
+            lease_gen: None,
+        };
+        assert!(
+            serde_json::to_value(&unfenced)
+                .unwrap()
+                .get("lease_gen")
+                .is_none()
+        );
+        assert!(matches!(unfenced.proof(), LeadProof::Lease { .. }));
+        let fenced = DispatchLeadReq {
+            lease_gen: Some(3),
+            ..unfenced
+        };
+        assert!(matches!(
+            fenced.proof(),
+            LeadProof::Fenced { generation: 3, .. }
         ));
     }
 

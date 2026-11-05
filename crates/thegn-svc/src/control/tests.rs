@@ -410,6 +410,31 @@ impl ControlApi for FakeApi {
         self.record(&format!("dispatches_list:before={before:?}:limit={limit}"));
         Box::pin(async { Ok(super::DispatchPage::default()) })
     }
+
+    fn dispatch_set_status(
+        &self,
+        id: i64,
+        status: thegn_core::issue::AgentDispatchStatus,
+    ) -> BoxFuture<'_, ControlResult<()>> {
+        self.record(&format!("dispatch_set_status:{id}:{}", status.as_str()));
+        Box::pin(async { Ok(()) })
+    }
+
+    fn dispatch_set_status_led(
+        &self,
+        id: i64,
+        status: thegn_core::issue::AgentDispatchStatus,
+        lead: super::DispatchLeadReq,
+    ) -> BoxFuture<'_, ControlResult<()>> {
+        self.record(&format!(
+            "dispatch_set_status_led:{id}:{}:{}:{}:{:?}",
+            status.as_str(),
+            lead.lease,
+            lead.owner,
+            lead.lease_gen
+        ));
+        Box::pin(async { Ok(()) })
+    }
 }
 
 struct Rig {
@@ -1505,6 +1530,48 @@ async fn in_process_dispatch_rechecks_the_admitted_capability_after_routing() {
     assert_eq!(
         encoded.api.calls(),
         vec!["issues_update:plugin:demo:ABC/comment".to_string()]
+    );
+}
+
+#[tokio::test]
+async fn dispatch_status_http_routes_to_proof_or_legacy_api_method() {
+    let r = rig(true);
+    let (without_lead, _) = dispatch_local(
+        r.state.clone(),
+        "dispatches.set_status",
+        "POST",
+        "/v1/dispatches/42/status",
+        Some(serde_json::json!({"status": "running"})),
+    )
+    .await;
+    assert_eq!(without_lead, StatusCode::OK);
+    assert_eq!(
+        r.api.calls(),
+        vec!["dispatch_set_status:42:running".to_string()]
+    );
+
+    let (with_lead, _) = dispatch_local(
+        r.state.clone(),
+        "dispatches.set_status",
+        "POST",
+        "/v1/dispatches/43/status",
+        Some(serde_json::json!({
+            "status": "done",
+            "lead": {
+                "lease": "repo:linear:A-1",
+                "owner": "lead-a",
+                "lease_gen": 7
+            }
+        })),
+    )
+    .await;
+    assert_eq!(with_lead, StatusCode::OK);
+    assert_eq!(
+        r.api.calls(),
+        vec![
+            "dispatch_set_status:42:running".to_string(),
+            "dispatch_set_status_led:43:done:repo:linear:A-1:lead-a:Some(7)".to_string()
+        ]
     );
 }
 
