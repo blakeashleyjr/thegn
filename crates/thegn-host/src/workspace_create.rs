@@ -1434,6 +1434,73 @@ fn catch_clone_job(run: impl FnOnce()) -> std::thread::Result<()> {
     std::panic::catch_unwind(std::panic::AssertUnwindSafe(run))
 }
 
+fn open_provenance_db() -> Option<thegn_core::db::Db> {
+    match thegn_core::db::Db::open() {
+        Ok(db) => Some(db),
+        Err(error) => {
+            tracing::warn!(%error, "workspace clone provenance unavailable");
+            None
+        }
+    }
+}
+
+fn provenance_dest_key(dest: &std::path::Path) -> Option<String> {
+    let file_name = dest.file_name()?.to_str()?;
+    let parent = dest.parent()?;
+    if let Err(error) = std::fs::create_dir_all(parent) {
+        tracing::warn!(%error, path = %parent.display(), "could not create workspace clone parent for provenance key");
+    }
+    match std::fs::canonicalize(parent) {
+        Ok(parent) => parent.join(file_name).to_str().map(str::to_owned),
+        Err(error) => {
+            tracing::warn!(%error, path = %parent.display(), "could not canonicalize workspace clone parent for provenance key");
+            dest.to_str().map(str::to_owned)
+        }
+    }
+}
+
+fn record_clone_started(
+    db: &thegn_core::db::Db,
+    parsed: &ParsedWorkspaceUrl,
+    dest_key: &str,
+    pid: u32,
+    owner_alive: &dyn Fn(u32) -> bool,
+) -> bool {
+    let new = thegn_core::db_clone_provenance::NewCloneProvenance {
+        dest: dest_key,
+        canonical_origin: &parsed.canonical_origin,
+        label: &parsed.label,
+        clone_pid: pid,
+        thegn_version: env!("CARGO_PKG_VERSION"),
+    };
+    match db.begin_clone_provenance(&new, owner_alive) {
+        Ok(true) => true,
+        Ok(false) => {
+            tracing::debug!(
+                dest = dest_key,
+                "another live clone owns the workspace provenance row"
+            );
+            false
+        }
+        Err(error) => {
+            tracing::warn!(%error, "could not record workspace clone provenance");
+            false
+        }
+    }
+}
+
+fn record_clone_finished(db: &thegn_core::db::Db, dest_key: &str, pid: u32, succeeded: bool) {
+    let state = if succeeded {
+        thegn_core::db_clone_provenance::CloneProvenanceState::Complete
+    } else {
+        thegn_core::db_clone_provenance::CloneProvenanceState::Abandoned
+    };
+    match db.finish_clone_provenance(dest_key, pid, state) {
+        Ok(_) => {}
+        Err(error) => tracing::warn!(%error, "could not finish workspace clone provenance"),
+    }
+}
+
 fn run_clone_job(job: CloneJob) {
     let CloneJob {
         generation,
@@ -1454,7 +1521,15 @@ fn run_clone_job(job: CloneJob) {
     let reader_tx = progress_tx.clone();
     let reader_waker = progress_waker.clone();
     let result = parse_workspace_url(&url).and_then(|parsed| {
-        clone_workspace_repo_with_deadline(
+        let pid = std::process::id();
+        let provenance =
+            provenance_dest_key(&dest).and_then(|key| open_provenance_db().map(|db| (key, db)));
+        let owns_row = provenance.as_ref().is_some_and(|(key, db)| {
+            record_clone_started(db, &parsed, key, pid, &|owner| {
+                crate::platform::pid_alive(i64::from(owner))
+            })
+        });
+        let cloned = clone_workspace_repo_with_deadline(
             &url,
             &dest,
             generation,
@@ -1482,7 +1557,11 @@ fn run_clone_job(job: CloneJob) {
                     wake_clone_loop_best_effort(&reader_waker);
                 }
             },
-        )
+        );
+        if owns_row && let Some((key, db)) = &provenance {
+            record_clone_finished(db, key, pid, cloned.is_ok());
+        }
+        cloned
     });
     let pending = throttle
         .lock()
@@ -3142,5 +3221,114 @@ Receiving objects: 100% (10/10)\rdone.\n";
             vec![std::ffi::OsString::from(".workspace.clone-claim")]
         );
         assert_eq!(std::fs::read_to_string(claim_path).unwrap(), original);
+    }
+
+    #[test]
+    fn record_clone_started_writes_a_cloning_row_with_the_canonical_origin_only() {
+        let db = thegn_core::db::Db::open_memory().unwrap();
+        let parsed = parse_workspace_url("https://example.com/o/r.git").unwrap();
+
+        assert!(record_clone_started(
+            &db,
+            &parsed,
+            "/ws/r-abc",
+            4242,
+            &|_| false
+        ));
+        let row = db.clone_provenance("/ws/r-abc").unwrap().unwrap();
+        assert_eq!(
+            row.state,
+            thegn_core::db_clone_provenance::CloneProvenanceState::Cloning
+        );
+        assert_eq!(row.canonical_origin, "https://example.com/o/r");
+        assert_eq!(row.label, "r");
+        assert_eq!(row.clone_pid, Some(4242));
+        assert_eq!(row.thegn_version, env!("CARGO_PKG_VERSION"));
+
+        let ssh_db = thegn_core::db::Db::open_memory().unwrap();
+        let ssh = parse_workspace_url("ssh://git@example.com/o/r.git").unwrap();
+        assert!(record_clone_started(
+            &ssh_db,
+            &ssh,
+            "/ws/ssh-r",
+            4243,
+            &|_| false
+        ));
+        let ssh_row = ssh_db.clone_provenance("/ws/ssh-r").unwrap().unwrap();
+        assert_eq!(ssh_row.canonical_origin, "ssh://example.com/o/r");
+        assert!(!ssh_row.canonical_origin.contains("git@"));
+    }
+
+    #[test]
+    fn record_clone_started_skips_a_live_foreign_cloner() {
+        let db = thegn_core::db::Db::open_memory().unwrap();
+        let parsed = parse_workspace_url("https://example.com/o/r.git").unwrap();
+        assert!(record_clone_started(&db, &parsed, "/ws/r", 11, &|_| false));
+
+        // The simulated owner callback reports pid 11 alive; pid 22 must not replace its row.
+        assert!(!record_clone_started(&db, &parsed, "/ws/r", 22, &|pid| pid == 11));
+        record_clone_finished(&db, "/ws/r", 22, false);
+
+        let row = db.clone_provenance("/ws/r").unwrap().unwrap();
+        assert_eq!(
+            row.state,
+            thegn_core::db_clone_provenance::CloneProvenanceState::Cloning
+        );
+        assert_eq!(row.clone_pid, Some(11));
+    }
+
+    #[test]
+    fn record_clone_finished_marks_complete_or_abandoned_for_the_owner_only() {
+        let db = thegn_core::db::Db::open_memory().unwrap();
+        let parsed = parse_workspace_url("https://example.com/o/r.git").unwrap();
+        assert!(record_clone_started(
+            &db,
+            &parsed,
+            "/ws/complete",
+            5,
+            &|_| false
+        ));
+        record_clone_finished(&db, "/ws/complete", 5, true);
+        let complete = db.clone_provenance("/ws/complete").unwrap().unwrap();
+        assert_eq!(
+            complete.state,
+            thegn_core::db_clone_provenance::CloneProvenanceState::Complete
+        );
+        assert!(complete.validated_at.is_some());
+
+        assert!(record_clone_started(
+            &db,
+            &parsed,
+            "/ws/abandoned",
+            5,
+            &|_| false
+        ));
+        record_clone_finished(&db, "/ws/abandoned", 5, false);
+        let abandoned = db.clone_provenance("/ws/abandoned").unwrap().unwrap();
+        assert_eq!(
+            abandoned.state,
+            thegn_core::db_clone_provenance::CloneProvenanceState::Abandoned
+        );
+        assert_eq!(abandoned.validated_at, None);
+
+        assert!(record_clone_started(&db, &parsed, "/ws/owned", 5, &|_| {
+            false
+        }));
+        record_clone_finished(&db, "/ws/owned", 6, false);
+        let owned = db.clone_provenance("/ws/owned").unwrap().unwrap();
+        assert_eq!(
+            owned.state,
+            thegn_core::db_clone_provenance::CloneProvenanceState::Cloning
+        );
+        assert_eq!(owned.clone_pid, Some(5));
+    }
+
+    #[test]
+    fn provenance_dest_key_canonicalizes_the_parent() {
+        let temp = tempfile::tempdir().unwrap();
+        let dest = temp.path().join("nested/deeper/ws");
+        let key = provenance_dest_key(&dest).unwrap();
+        let canonical = std::fs::canonicalize(temp.path().join("nested/deeper")).unwrap();
+        assert_eq!(key, canonical.join("ws").to_str().unwrap());
     }
 }
