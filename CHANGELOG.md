@@ -7,6 +7,8 @@ All notable changes to **thegn** are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.1.0-alpha.53] — 2026-11-05 (maintenance batch 91)
+
 ## [0.1.0-alpha.52] — 2026-11-04 (maintenance batch 90)
 
 - Observe and plugin app tabs are now available on the stable channel.
@@ -2748,7 +2750,8 @@ launcher picker and the merge queue's `agent_command` hook remain — they run
 whatever commands you configure. Leftover `[llm_proxy]` config sections and
 `proxy_*` tables in existing state databases are ignored harmlessly.
 
-[Unreleased]: https://github.com/blakeashleyjr/thegn/compare/v0.1.0-alpha.52...HEAD
+[Unreleased]: https://github.com/blakeashleyjr/thegn/compare/v0.1.0-alpha.53...HEAD
+[0.1.0-alpha.53]: https://github.com/blakeashleyjr/thegn/compare/v0.1.0-alpha.52...v0.1.0-alpha.53
 [0.1.0-alpha.52]: https://github.com/blakeashleyjr/thegn/compare/v0.1.0-alpha.51...v0.1.0-alpha.52
 [0.1.0-alpha.51]: https://github.com/blakeashleyjr/thegn/compare/v0.1.0-alpha.50...v0.1.0-alpha.51
 [0.1.0-alpha.50]: https://github.com/blakeashleyjr/thegn/compare/v0.1.0-alpha.49...v0.1.0-alpha.50
