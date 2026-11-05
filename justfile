@@ -1353,10 +1353,10 @@ clean-aux:
     after=$(du -sb "$target" | cut -f1)
     echo "clean-aux: reclaimed $(( (before - after) / 1024 / 1024 )) MiB from $target/"
 
-# THE-609: read-only report of the Cargo provenance of the current target dir
+# THE-1837: read-only report of the Cargo provenance of the current target dir
 # (toolchain, wrapper, sccache stats, newest thegn-core artifact hash, and whether its
-# dep-info names this checkout). Opt-in; not part of `just ci`. Pass --strict to fail
-# on a dep-info that points at another checkout.
+# dep-info names this checkout, including omitted current core sources). Opt-in; not
+# part of `just ci`. Pass --strict to fail on foreign or incomplete dep-info.
 cargo-provenance *args:
     bash test/cargo-provenance.sh {{args}}
 

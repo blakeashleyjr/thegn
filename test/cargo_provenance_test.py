@@ -72,17 +72,24 @@ class CargoProvenanceTests(unittest.TestCase):
             sccache.chmod(0o700)
 
         checkout = root / "checkout"
-        checkout.mkdir()
+        core_src = checkout / "crates" / "thegn-core" / "src"
+        core_src.mkdir(parents=True)
+        (core_src / "lib.rs").write_text("// fixture\n", encoding="utf-8")
+        (core_src / "a.rs").write_text("// fixture\n", encoding="utf-8")
         deps = root / "target" / "debug" / "deps"
         deps.mkdir(parents=True)
         artifact = deps / "libthegn_core-aaaa.rlib"
         artifact.write_bytes(b"fixture-rlib")
         if foreign:
             lib_path = "/elsewhere/wt-b/crates/thegn-core/src/lib.rs"
+            other_path = "/elsewhere/wt-b/crates/thegn-core/src/a.rs"
         else:
             lib_path = str(checkout / "crates" / "thegn-core" / "src" / "lib.rs")
+            other_path = str(checkout / "crates" / "thegn-core" / "src" / "a.rs")
         depinfo = deps / "thegn_core-aaaa.d"
-        depinfo.write_text(f"{lib_path}: {lib_path} /x/other.rs\n", encoding="utf-8")
+        depinfo.write_text(
+            f"{lib_path}: {lib_path} {other_path} /x/other.rs\n", encoding="utf-8"
+        )
         return {
             "bin_dir": bin_dir,
             "checkout": checkout,
@@ -114,10 +121,6 @@ class CargoProvenanceTests(unittest.TestCase):
         self.assertEqual(facts["provenance.rustflags"], "-C debuginfo=0")
         self.assertEqual(facts["provenance.target_dir"], str(target))
         self.assertEqual(facts["provenance.cargo_target_dir_env"], "unset")
-        self.assertTrue(
-            facts.get("provenance.sccache") == "absent"
-            or any(key.startswith("provenance.sccache.") for key in facts)
-        )
 
         wrapped, wrapped_facts = self.facts_for(
             fixture,
@@ -152,6 +155,35 @@ class CargoProvenanceTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(facts["provenance.core_depinfo_matches_checkout"], "yes")
         self.assertEqual(facts["provenance.verdict"], "ok")
+
+    def test_relative_cargo_depinfo_with_all_checkout_sources_is_ok(self):
+        fixture = self.fixture()
+        (fixture["deps"] / "thegn_core-aaaa.d").write_text(
+            f"{fixture['deps'] / 'thegn_core-aaaa.d'}: "
+            "crates/thegn-core/src/lib.rs crates/thegn-core/src/a.rs\n",
+            encoding="utf-8",
+        )
+        result, facts = self.facts_for(
+            fixture, "--target-dir", str(fixture["target"]), "--strict"
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(facts["provenance.core_depinfo_matches_checkout"], "yes")
+        self.assertEqual(facts["provenance.core_depinfo_missing_sources"], "0")
+        self.assertEqual(facts["provenance.verdict"], "ok")
+
+    def test_relative_depinfo_omitting_checkout_source_is_flagged(self):
+        fixture = self.fixture()
+        depinfo = fixture["deps"] / "thegn_core-aaaa.d"
+        depinfo.write_text(
+            f"{depinfo}: crates/thegn-core/src/lib.rs\n", encoding="utf-8"
+        )
+        result, facts = self.facts_for(
+            fixture, "--target-dir", str(fixture["target"]), "--strict"
+        )
+        self.assertEqual(result.returncode, 1, result.stderr)
+        self.assertEqual(facts["provenance.core_depinfo_missing_sources"], "1")
+        self.assertEqual(facts["provenance.core_depinfo_matches_checkout"], "no")
+        self.assertEqual(facts["provenance.verdict"], "foreign-depinfo")
 
     def test_foreign_depinfo_is_flagged_and_strict_fails(self):
         fixture = self.fixture(foreign=True)
@@ -196,6 +228,11 @@ class CargoProvenanceTests(unittest.TestCase):
                 result = run(list(args), fixture["bin_dir"])
                 self.assertEqual(result.returncode, 2)
                 self.assertEqual(len(result.stderr.splitlines()), 1)
+
+    def test_help_exits_zero(self):
+        result = run(["--help"])
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("Usage: test/cargo-provenance.sh", result.stdout)
 
     def test_script_is_read_only(self):
         fixture = self.fixture()

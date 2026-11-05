@@ -58,6 +58,7 @@ else
   fi
 fi
 
+checkout_given=$checkout
 if [[ $checkout == /* ]]; then
   checkout_abs=$(cd "$checkout" 2>/dev/null && pwd -P)
 else
@@ -90,7 +91,7 @@ fi
 if [[ ${CARGO_TARGET_DIR+x} ]]; then
   cargo_target_dir_env=$CARGO_TARGET_DIR
 else
-  cargo_target_dir_env=unset
+  cargo_target_dir_env='unset'
 fi
 
 rustc_wrapper=${RUSTC_WRAPPER:-${CARGO_BUILD_RUSTC_WRAPPER:-none}}
@@ -133,6 +134,7 @@ printf 'provenance.deps_dir: %s\n' "$deps_dir"
 if [[ ! -d $deps_dir ]]; then
   printf '%s\n' 'provenance.core_artifact: none'
   printf '%s\n' 'provenance.core_depinfo: none'
+  printf '%s\n' 'provenance.core_depinfo_missing_sources: 0'
   printf '%s\n' 'provenance.core_depinfo_matches_checkout: unknown'
   verdict=unknown
 else
@@ -166,11 +168,59 @@ else
   core_depinfo=$(find "$deps_dir" -maxdepth 1 -type f -name 'thegn_core-*.d' -exec ls -t {} + 2>/dev/null | head -n 1)
   if [[ -n $core_depinfo ]]; then
     printf 'provenance.core_depinfo: %s\n' "$core_depinfo"
-    depinfo_lib=$(tr ' ' '\n' <"$core_depinfo" | grep -m1 'crates/thegn-core/src/lib.rs$')
-    depinfo_lib=${depinfo_lib%:}
+    depinfo_lib=
+    foreign_source=0
+    listed_source_count=0
+    depinfo_tokens=$(tr ' ' '\n' <"$core_depinfo")
+    for depinfo_token in $depinfo_tokens; do
+      depinfo_token=${depinfo_token%:}
+      case "$depinfo_token" in
+      */crates/thegn-core/src/*.rs | crates/thegn-core/src/*.rs)
+        listed_source_count=$((listed_source_count + 1))
+        if [[ $depinfo_token == /* ]]; then
+          token_dir=$(dirname "$depinfo_token")
+          token_base=$(basename "$depinfo_token")
+          if token_dir_abs=$(cd "$token_dir" 2>/dev/null && pwd -P); then
+            token_abs=$token_dir_abs/$token_base
+          else
+            token_abs=$depinfo_token
+          fi
+          case "$token_abs" in
+          "$checkout"/crates/thegn-core/src/*.rs | "$checkout_given"/crates/thegn-core/src/*.rs) ;;
+          *) foreign_source=1 ;;
+          esac
+          [[ -f $token_abs ]] || foreign_source=1
+        else
+          [[ -f $checkout/$depinfo_token ]] || foreign_source=1
+        fi
+        if [[ $depinfo_token == */crates/thegn-core/src/lib.rs || $depinfo_token == crates/thegn-core/src/lib.rs ]]; then
+          depinfo_lib=$depinfo_token
+        fi
+        ;;
+      esac
+    done
+
+    missing_sources=0
+    core_src_dir=$checkout/crates/thegn-core/src
+    if [[ -d $core_src_dir ]]; then
+      while IFS= read -r source_file; do
+        source_listed=0
+        for depinfo_token in $depinfo_tokens; do
+          depinfo_token=${depinfo_token%:}
+          if [[ $depinfo_token == "$source_file" || $depinfo_token == "${source_file#"$checkout"/}" ]]; then
+            source_listed=1
+            break
+          fi
+        done
+        if ((source_listed == 0)); then
+          missing_sources=$((missing_sources + 1))
+        fi
+      done < <(find "$core_src_dir" -type f -name '*.rs' 2>/dev/null)
+    fi
+    printf 'provenance.core_depinfo_missing_sources: %s\n' "$missing_sources"
     if [[ -n $depinfo_lib ]]; then
       printf 'provenance.core_depinfo_lib: %s\n' "$depinfo_lib"
-      if [[ $depinfo_lib == "$checkout/crates/thegn-core/src/lib.rs" ]]; then
+      if ((foreign_source == 0 && missing_sources == 0 && listed_source_count > 0)); then
         match=yes
       else
         match=no
@@ -182,6 +232,7 @@ else
   else
     printf '%s\n' 'provenance.core_depinfo: none'
     printf '%s\n' 'provenance.core_depinfo_lib: none'
+    printf '%s\n' 'provenance.core_depinfo_missing_sources: 0'
     match=unknown
   fi
 
