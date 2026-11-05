@@ -1522,8 +1522,7 @@ fn run_clone_job(job: CloneJob) {
     let reader_waker = progress_waker.clone();
     let result = parse_workspace_url(&url).and_then(|parsed| {
         let pid = std::process::id();
-        let provenance =
-            provenance_dest_key(&dest).and_then(|key| open_provenance_db().map(|db| (key, db)));
+        let provenance = provenance_dest_key(&dest).zip(open_provenance_db());
         let owns_row = provenance.as_ref().is_some_and(|(key, db)| {
             record_clone_started(db, &parsed, key, pid, &|owner| {
                 crate::platform::pid_alive(i64::from(owner))
