@@ -472,6 +472,8 @@ held rather than counted as a failed attempt, and the hold reason names the
 readiness class (`cannot-write-worktree` or `cannot-write-git-metadata`) and
 the backend.
 
+Pipeline stage launches run the same check once the stage's sandbox is composed: when it cannot write the worktree, the Git common directory or the agent's relocated credential home, or the `thegn` binary was replaced since launch, the stage worker is not started and the launch is refused with the readiness class (`cannot-write-worktree`, `cannot-write-git-metadata`, `provider-home-unavailable` or `callback-unavailable`) and the backend. The `worker` row in `thegn doctor` is the same check.
+
 The honest **isolation class**, weakest to strongest:
 
 | Class              | Escape needs…                               | Backends                                             |
