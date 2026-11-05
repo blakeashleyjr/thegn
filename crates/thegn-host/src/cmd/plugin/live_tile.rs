@@ -469,7 +469,7 @@ raise SystemExit(3)
             };
             let manifest = format!(
                 "id = \"live_tile_test\"\nname = \"Live tile test\"\nversion = \"0.1.0\"\napi = \"0.4.0\"\nmode = \"resident\"\ncapabilities = [\"surface:app\"]\ncommand = {}\n\n[[contributions]]\nid = \"workspace\"\nextension_point = \"AppTab\"\nlabel = \"Live\"\nsurface = \"fixture.workspace\"\n",
-                serde_json::to_string(&command).unwrap(),
+                serde_json::to_value(&command).unwrap().to_string(),
             );
             std::fs::write(temp.path().join("plugin.toml"), manifest).unwrap();
             let (plugin, surface) = super::super::live::load_plugin(temp.path()).unwrap();
