@@ -107,6 +107,19 @@ install github:blakeashleyjr/thegn` gives users `.#default`, bridge included,
    and `.rpm` are **standalone release assets**; there is no hosted apt or rpm update
    repository.
 
+   The package job also publishes `SHA256SUMS`, containing the sorted SHA-256
+   digests of the four tarballs, the `.deb`, the `.rpm`, and the third-party
+   notices file. Download the assets into one directory and run
+   `sha256sum -c SHA256SUMS` to check them together; the per-archive `.sha256`
+   sidecars remain available. It also publishes
+   `thegn-<tag>-THIRD_PARTY_NOTICES.md`, copied from `THIRD_PARTY_NOTICES.md`
+   at the admitted commit. Both files are bound by `verify-manifest` like every
+   other release asset. `SHA256SUMS` is an integrity convenience; provenance
+   comes from the attestation of each archive and of the manifest, not from the
+   sums file by itself. The tarballs already contain `LICENSE-MIT`,
+   `LICENSE-APACHE`, and `README.md`. Third-party notices travel as a separate
+   asset until the archive layout contract is extended.
+
    windows-msvc is still out: that CI job has never executed. Add a target only
    once its CI job is green. Check the package job's
    summary for its exact outputs and target/checksum mapping. The
@@ -192,6 +205,73 @@ install github:blakeashleyjr/thegn` gives users `.#default`, bridge included,
    brew uninstall thegn && brew untap blakeashleyjr/tap   # when done
    ```
 
+## Release notes template
+
+Write each public release's notes from this template. Fill in the outcomes and
+the schema versions for that release; write highlights from the user-facing
+CHANGELOG entries rather than copying them.
+
+```markdown
+## Highlights
+
+- [User outcome]
+- [User outcome]
+- [User outcome]
+
+## Channel
+
+| Channel statement | Details                                                                                                                                                                                         |
+| ----------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| This build        | **stable** channel                                                                                                                                                                              |
+| Experimental      | Remote worktrees, cloud providers, placement, and voice are compiled in but off unless you opt into the dev channel via `.#dev` or `THEGN_CHANNEL=dev`. Observe and plugin app tabs are stable. |
+
+## Platforms
+
+| Platform or package                           | Support                                                            |
+| --------------------------------------------- | ------------------------------------------------------------------ |
+| Linux x86_64 GNU and musl tarballs; Nix flake | Supported                                                          |
+| aarch64-apple-darwin tarball                  | Best-effort and unsigned; see the macOS first-launch command below |
+| Windows                                       | Deferred; no binary is provided                                    |
+
+## Install
+
+- Tarball: download the archive for your platform plus `SHA256SUMS`; run `sha256sum -c --ignore-missing SHA256SUMS`; verify provenance with `gh attestation verify thegn-<tag>-<target>.tar.gz --repo blakeashleyjr/thegn`.
+- Nix: `nix profile install github:blakeashleyjr/thegn`.
+
+## Upgrading and your data
+
+thegn keeps its state in a local SQLite database and migrates it forward automatically on first launch of a newer build. An older binary refuses to run against a database written by a newer thegn; the message begins `database schema v<N> was written by a newer thegn than this build`. Downgrading requires the pre-upgrade backup. Back up the state directory before upgrading; `thegn doctor` prints its location. Git remains the source of truth for worktrees and branches, but sessions, layout, and caches are not all reconstructible from git. Restart the host and daemon after upgrading. Schema change: `schema vOLD -> vNEW` (fill in the versions for this release; write “no schema change” when applicable).
+
+## macOS first launch
+
+For a browser-downloaded tarball, run `xattr -dr com.apple.quarantine ./thegn` before first launch. The archive is unsigned and macOS quarantines browser downloads.
+
+## Known issues
+
+See [KNOWN_ISSUES.md](KNOWN_ISSUES.md).
+
+## Full changelog
+
+See [CHANGELOG.md](CHANGELOG.md).
+```
+
+## Public-alpha release rehearsal checklist
+
+- [ ] Version bumped and `CHANGELOG.md` has a dated release heading.
+- [ ] `just third-party-notices` regenerated the notices and `just test-third-party-notices` is green.
+- [ ] `just nix-build-full`, `just release-artifacts v<version>`, and `just release-verify v<version>` are green.
+- [ ] The `release` workflow run is green end to end, including `verify-manifest`.
+- [ ] The draft has the exact asset set, including `SHA256SUMS` and `thegn-<tag>-THIRD_PARTY_NOTICES.md`.
+- [ ] `sha256sum -c SHA256SUMS` passes in a clean download directory.
+- [ ] `gh attestation verify` passes for one archive and for the manifest.
+- [ ] Clean-host rehearsals are recorded for the GNU tarball, musl tarball, and Nix flake, covering install, first launch, upgrade over the previous alpha, and uninstall.
+- [ ] `bash scripts/first-run-net-trace.sh` (or `just net-trace`) ran on the release binary and its summary is attached.
+- [ ] Release notes are written from the template above.
+- [ ] The `release-admission` environment and the `v*` tag ruleset are confirmed.
+- [ ] Publish the draft only after every item above is complete.
+
+A published tag is never moved or deleted: a mistake gets a new tag.
+
 ## Install paths this enables
 
 On the supported x86_64 Linux platform, the advertised install paths are Nix,
@@ -213,7 +293,8 @@ automatic consequence of producing another archive.
 
 - **Release tarball** — the supported Linux x86_64 install path. Download the
   linux-gnu or linux-musl archive and its `.sha256` sidecar from the release
-  page, verify the checksum and build-provenance attestation, then extract
+  page, or use `SHA256SUMS` as a one-file alternative, verify the checksum and
+  build-provenance attestation, then extract
   `thegn` onto `PATH`. The aarch64-apple-darwin archive is best-effort; on macOS
   see the Gatekeeper note below. Runtime requires `git`; `gh` and `ssh` are used
   as needed for integrations, and `lazygit` is optional. Diff highlighting is
