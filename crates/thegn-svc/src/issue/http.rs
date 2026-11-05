@@ -23,6 +23,9 @@ pub(crate) const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 pub(crate) const READ_IDLE_TIMEOUT: Duration = Duration::from_secs(5);
 const POOL_IDLE_TIMEOUT: Duration = Duration::from_secs(50);
 pub(crate) const MAX_BODY_BYTES: usize = 1024 * 1024;
+// TODO(pin): primary sets this from a measurement
+pub(crate) const MAX_OPERATION_RESPONSE_BYTES: usize = 8 * 1024 * 1024;
+pub(crate) const OPERATION_BYTES_REASON: &str = "tracker operation response bytes exceed limit";
 pub(crate) const MAX_REQUEST_BYTES: usize = 512 * 1024;
 pub(crate) const MAX_DYNAMIC_INPUT_BYTES: usize = 64 * 1024;
 
@@ -49,6 +52,8 @@ pub(crate) struct TrackerHttpBudget {
     semaphore: Arc<Semaphore>,
     #[cfg(test)]
     expire_after_responses: Arc<AtomicUsize>,
+    #[cfg(test)]
+    response_byte_cap: Arc<AtomicUsize>,
 }
 
 impl TrackerHttpBudget {
@@ -64,6 +69,8 @@ impl TrackerHttpBudget {
             semaphore: Arc::new(Semaphore::new(permits)),
             #[cfg(test)]
             expire_after_responses: Arc::new(AtomicUsize::new(usize::MAX)),
+            #[cfg(test)]
+            response_byte_cap: Arc::new(AtomicUsize::new(0)),
         }
     }
 
@@ -71,6 +78,11 @@ impl TrackerHttpBudget {
     pub(crate) fn expire_after_responses_for_test(&self, requests: usize) {
         self.expire_after_responses
             .store(requests, Ordering::Release);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn response_byte_cap_for_test(&self, cap: usize) {
+        self.response_byte_cap.store(cap, Ordering::Release);
     }
 }
 
@@ -155,6 +167,7 @@ impl TrackerHttpClient {
             client: self,
             deadline: Instant::now() + self.operation_timeout,
             permit: None,
+            response_bytes: 0,
         }
     }
 
@@ -164,6 +177,7 @@ impl TrackerHttpClient {
             client: self,
             deadline: Instant::now() + timeout,
             permit: None,
+            response_bytes: 0,
         }
     }
 
@@ -227,9 +241,30 @@ pub(crate) struct TrackerHttpOperation<'a> {
     client: &'a TrackerHttpClient,
     deadline: Instant,
     permit: Option<OwnedSemaphorePermit>,
+    response_bytes: usize,
 }
 
 impl TrackerHttpOperation<'_> {
+    fn byte_cap(&self) -> usize {
+        #[cfg(test)]
+        {
+            let override_cap = self.client.budget.response_byte_cap.load(Ordering::Acquire);
+            if override_cap != 0 {
+                return override_cap;
+            }
+        }
+        MAX_OPERATION_RESPONSE_BYTES
+    }
+
+    fn charge_response(&mut self, n: usize) -> Result<(), IssueError> {
+        self.response_bytes = self.response_bytes.saturating_add(n);
+        if self.response_bytes > self.byte_cap() {
+            Err(IssueError::BodyLimit(OPERATION_BYTES_REASON))
+        } else {
+            Ok(())
+        }
+    }
+
     #[cfg(test)]
     fn expire_for_test(&mut self) {
         self.deadline = Instant::now() - Duration::from_nanos(1);
@@ -343,6 +378,7 @@ impl TrackerHttpOperation<'_> {
         let status = response.status();
         let headers = response.headers().clone();
         let body = read_bounded(self.deadline, response).await?;
+        self.charge_response(body.len())?;
         self.remaining()?;
         #[cfg(test)]
         self.response_consumed_for_test();
@@ -424,7 +460,8 @@ impl TrackerHttpOperation<'_> {
             .body(bytes);
         let response = self.send(request).await?;
         self.check_response(&response, false)?;
-        read_bounded(self.deadline, response).await?;
+        let bytes = read_bounded(self.deadline, response).await?;
+        self.charge_response(bytes.len())?;
         self.remaining()?;
         #[cfg(test)]
         self.response_consumed_for_test();
@@ -442,7 +479,8 @@ impl TrackerHttpOperation<'_> {
             .header("Accept", "application/json");
         let response = self.send(request).await?;
         self.check_response(&response, false)?;
-        read_bounded(self.deadline, response).await?;
+        let bytes = read_bounded(self.deadline, response).await?;
+        self.charge_response(bytes.len())?;
         self.remaining()?;
         #[cfg(test)]
         self.response_consumed_for_test();
@@ -455,6 +493,7 @@ impl TrackerHttpOperation<'_> {
     ) -> Result<R, IssueError> {
         self.check_response(&response, true)?;
         let bytes = read_bounded(self.deadline, response).await?;
+        self.charge_response(bytes.len())?;
         self.remaining()?;
         let value = serde_json::from_slice(&bytes)
             .map_err(|_| IssueError::Parse("tracker JSON decode failed".into()))?;
@@ -889,6 +928,54 @@ mod tests {
         assert!(server.await.unwrap_err().is_cancelled());
         drop(chunked);
     }
+
+    #[tokio::test]
+    async fn operation_response_bytes_accumulate_across_requests_and_refuse_past_the_cap() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            axum::serve(listener, Router::new().fallback(any(fixture)))
+                .await
+                .unwrap();
+        });
+        let budget = Arc::new(TrackerHttpBudget::with_permits(1));
+        budget.response_byte_cap_for_test(25);
+        let client = TrackerHttpClient::new(
+            "fixture",
+            &format!("http://{address}"),
+            "Bearer fixture-secret".into(),
+            budget,
+        )
+        .unwrap();
+
+        let mut operation = client.operation();
+        for _ in 0..2 {
+            let value: serde_json::Value = operation.get("/ok").await.unwrap();
+            assert!(value["ok"].as_bool().unwrap());
+        }
+        assert!(matches!(
+            operation.get::<serde_json::Value>("/ok").await,
+            Err(IssueError::BodyLimit(why)) if why == OPERATION_BYTES_REASON
+        ));
+        drop(operation);
+
+        let mut fresh_operation = client.operation();
+        let value: serde_json::Value = fresh_operation.get("/ok").await.unwrap();
+        assert!(value["ok"].as_bool().unwrap());
+
+        server.abort();
+        assert!(server.await.unwrap_err().is_cancelled());
+    }
+
+    // Compile-time bounds on the provisional cap: at least one full page, at most the 20-page body ceiling.
+    const _: () = assert!(
+        MAX_OPERATION_RESPONSE_BYTES >= MAX_BODY_BYTES,
+        "MAX_OPERATION_RESPONSE_BYTES must hold at least one full page"
+    );
+    const _: () = assert!(
+        MAX_OPERATION_RESPONSE_BYTES <= 20 * MAX_BODY_BYTES,
+        "MAX_OPERATION_RESPONSE_BYTES must stay below the 20-page body ceiling"
+    );
 
     #[tokio::test]
     async fn redirect_target_receives_no_request_or_credentials() {
