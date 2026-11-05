@@ -95,6 +95,7 @@ mod db_aux;
 mod db_cache;
 mod db_calendar;
 mod db_ci;
+pub mod db_clone_provenance;
 pub mod db_compute;
 mod db_control;
 mod db_dispatch;
