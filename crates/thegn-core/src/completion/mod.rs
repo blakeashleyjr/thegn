@@ -80,10 +80,10 @@ pub fn profile_from_argv(args: &[String]) -> Option<&str> {
 /// Environment override for the per-request budget, in milliseconds.
 pub const BUDGET_ENV: &str = "THEGN_COMPLETE_BUDGET_MS";
 
-/// Default per-request budget. 100 ms is comfortably under the ~150 ms at which
-/// a keypress stops feeling instant, and well above what any implemented source
-/// costs in practice.
-pub const DEFAULT_BUDGET_MS: u64 = 100;
+/// Default per-request budget. Config-derived completion loads the layered
+/// config before it can enumerate keys, so leave enough headroom for that
+/// bounded local I/O and parsing on a cold process.
+pub const DEFAULT_BUDGET_MS: u64 = 300;
 
 /// Parse a budget from its raw environment value. Anything unparseable, zero,
 /// or absent falls back to [`DEFAULT_BUDGET_MS`] — a `<TAB>` never fails
