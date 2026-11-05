@@ -967,17 +967,15 @@ mod tests {
         assert!(server.await.unwrap_err().is_cancelled());
     }
 
-    #[test]
-    fn operation_response_byte_cap_covers_a_full_page_and_stays_provisional() {
-        assert!(
-            MAX_OPERATION_RESPONSE_BYTES >= MAX_BODY_BYTES,
-            "MAX_OPERATION_RESPONSE_BYTES must hold at least one full page"
-        );
-        assert!(
-            MAX_OPERATION_RESPONSE_BYTES <= 20 * MAX_BODY_BYTES,
-            "MAX_OPERATION_RESPONSE_BYTES must stay below the 20-page body ceiling"
-        );
-    }
+    // Compile-time bounds on the provisional cap: at least one full page, at most the 20-page body ceiling.
+    const _: () = assert!(
+        MAX_OPERATION_RESPONSE_BYTES >= MAX_BODY_BYTES,
+        "MAX_OPERATION_RESPONSE_BYTES must hold at least one full page"
+    );
+    const _: () = assert!(
+        MAX_OPERATION_RESPONSE_BYTES <= 20 * MAX_BODY_BYTES,
+        "MAX_OPERATION_RESPONSE_BYTES must stay below the 20-page body ceiling"
+    );
 
     #[tokio::test]
     async fn redirect_target_receives_no_request_or_credentials() {
