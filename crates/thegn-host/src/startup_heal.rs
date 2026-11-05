@@ -106,14 +106,14 @@ pub(crate) fn spawn(
                     "reclaimed stale workspace clone staging"
                 );
             }
-            let reconciled = crate::workspace_create::reconcile_clone_provenance_at_startup();
-            if reconciled > 0 {
-                tracing::info!(
-                    target: "thegn::startup",
-                    reconciled,
-                    "abandoned stale workspace clone provenance"
-                );
-            }
+        }
+        let reconciled = crate::workspace_create::reconcile_clone_provenance_at_startup();
+        if reconciled > 0 {
+            tracing::info!(
+                target: "thegn::startup",
+                reconciled,
+                "abandoned stale workspace clone provenance"
+            );
         }
     });
     if let Err(e) = spawned {
