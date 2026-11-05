@@ -457,6 +457,7 @@ struct PageReasons {
     no_cursor: &'static str,
     repeated_cursor: &'static str,
     page_cap: &'static str,
+    byte_cap: &'static str,
 }
 
 const LIST_REASONS: PageReasons = PageReasons {
@@ -465,6 +466,7 @@ const LIST_REASONS: PageReasons = PageReasons {
     no_cursor: "Linear marked another page but returned no end cursor",
     repeated_cursor: "Linear repeated a page cursor",
     page_cap: "Linear listing page cap reached",
+    byte_cap: "Linear listing response byte cap reached",
 };
 
 const SEARCH_REASONS: PageReasons = PageReasons {
@@ -473,6 +475,7 @@ const SEARCH_REASONS: PageReasons = PageReasons {
     no_cursor: "Linear search marked another page but returned no end cursor",
     repeated_cursor: "Linear search repeated a page cursor",
     page_cap: "Linear search page cap reached",
+    byte_cap: "Linear search response byte cap reached",
 };
 
 /// `limit == 0` means "no cap" to our callers (`cmd/issue.rs` only truncates
@@ -659,6 +662,14 @@ where
                 return Err(IssueError::PartialList {
                     issues: all,
                     reason: reasons.deadline,
+                });
+            }
+            Err(IssueError::BodyLimit(why))
+                if why == super::http::OPERATION_BYTES_REASON && !all.is_empty() =>
+            {
+                return Err(IssueError::PartialList {
+                    issues: all,
+                    reason: reasons.byte_cap,
                 });
             }
             Err(error) => return Err(error),
@@ -1361,6 +1372,36 @@ mod tests {
             }
             other => panic!("expected deadline partial search, got {other:?}"),
         }
+        assert_eq!(queries.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn search_response_byte_cap_after_first_page_returns_partial_rows() {
+        let responses = vec![
+            json!({"data":{"issues":{"nodes":[list_item(1)],"pageInfo":{"hasNextPage":true,"endCursor":"cursor-1"}}}}),
+            json!({"data":{"issues":{"nodes":[list_item(2)],"pageInfo":{"hasNextPage":false,"endCursor":null}}}}),
+        ];
+        let first_page_bytes = responses[0].to_string().len();
+        let budget = Arc::new(TrackerHttpBudget::with_permits(1));
+        budget.response_byte_cap_for_test(first_page_bytes + 1);
+        let (result, queries) = run_search(0, responses, budget).await;
+        match result {
+            Err(IssueError::PartialList { issues, reason }) => {
+                assert_eq!(issues.len(), 1);
+                assert_eq!(reason, "Linear search response byte cap reached");
+            }
+            other => panic!("expected byte-capped partial search, got {other:?}"),
+        }
+        assert_eq!(queries.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn search_response_byte_cap_on_the_first_page_is_a_typed_error_not_a_partial() {
+        let budget = Arc::new(TrackerHttpBudget::with_permits(1));
+        budget.response_byte_cap_for_test(1);
+        let response = json!({"data":{"issues":{"nodes":[list_item(1)],"pageInfo":{"hasNextPage":false,"endCursor":null}}}});
+        let (result, queries) = run_search(0, vec![response], budget).await;
+        assert!(matches!(result, Err(IssueError::BodyLimit(_))));
         assert_eq!(queries.len(), 1);
     }
 

@@ -421,18 +421,21 @@ struct PageReasons {
     deadline: &'static str,
     empty_before_total: &'static str,
     page_cap: &'static str,
+    byte_cap: &'static str,
 }
 
 const LIST_REASONS: PageReasons = PageReasons {
     deadline: "Jira listing deadline exceeded",
     empty_before_total: "Jira returned an empty page before total",
     page_cap: "Jira listing page cap reached",
+    byte_cap: "Jira listing response byte cap reached",
 };
 
 const SEARCH_REASONS: PageReasons = PageReasons {
     deadline: "Jira search deadline exceeded",
     empty_before_total: "Jira search returned an empty page before total",
     page_cap: "Jira search page cap reached",
+    byte_cap: "Jira search response byte cap reached",
 };
 
 async fn collect_jira_pages(
@@ -465,6 +468,14 @@ async fn collect_jira_pages(
                 return Err(IssueError::PartialList {
                     issues,
                     reason: reasons.deadline,
+                });
+            }
+            Err(IssueError::BodyLimit(why))
+                if why == super::http::OPERATION_BYTES_REASON && !issues.is_empty() =>
+            {
+                return Err(IssueError::PartialList {
+                    issues,
+                    reason: reasons.byte_cap,
                 });
             }
             Err(error) => return Err(error),
@@ -1868,6 +1879,29 @@ mod tests {
             other => panic!("expected deadline partial listing, got {other:?}"),
         }
         assert_eq!(requests.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn list_response_byte_cap_after_first_page_returns_partial_rows() {
+        let first_page = jira_search_page(0, 250, 100);
+        let second_page = jira_search_page(100, 250, 100);
+        let cap = first_page.body.len() + 1;
+        let budget = Arc::new(TrackerHttpBudget::with_permits(1));
+        budget.response_byte_cap_for_test(cap);
+        let (result, requests) = run_list(
+            IssueFilter::default(),
+            vec![first_page, second_page],
+            budget,
+        )
+        .await;
+        match result {
+            Err(IssueError::PartialList { issues, reason }) => {
+                assert_eq!(issues.len(), 100);
+                assert_eq!(reason, "Jira listing response byte cap reached");
+            }
+            other => panic!("expected byte-capped partial listing, got {other:?}"),
+        }
+        assert_eq!(requests.len(), 2);
     }
 
     #[test]
