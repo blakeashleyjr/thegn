@@ -29,6 +29,7 @@ pub const SOURCES: &[&str] = &[
     include_str!("../../../../docs/help/media.md"),
     include_str!("../../../../docs/help/voice.md"),
     include_str!("../../../../docs/help/daemon-and-sessions.md"),
+    include_str!("../../../../docs/help/privacy.md"),
     include_str!("../../../../docs/help/mobile-access.md"),
     include_str!("../../../../docs/help/release-channels.md"),
     include_str!("../../../../docs/help/debugging.md"),
