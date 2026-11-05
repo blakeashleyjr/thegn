@@ -8,7 +8,6 @@ devcontainer_startup.rs
 diff_watch.rs
 frame_writer.rs
 gate_capture.rs
-handlers/plugins.rs
 handlers/startup.rs
 hydrate_refresh_ticker.rs
 lsp.rs

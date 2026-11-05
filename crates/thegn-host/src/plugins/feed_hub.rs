@@ -33,12 +33,8 @@ pub(crate) type FeedFuture = Pin<Box<dyn Future<Output = Option<Feed>> + Send>>;
 pub(crate) type FeedSource = Arc<dyn Fn() -> FeedFuture + Send + Sync>;
 
 pub(crate) fn daemon_source(cfg: Arc<Config>) -> FeedSource {
-    let cfg = Arc::downgrade(&cfg);
     Arc::new(move || {
-        let Some(cfg) = cfg.upgrade() else {
-            let future: FeedFuture = Box::pin(async { None });
-            return future;
-        };
+        let cfg = Arc::clone(&cfg);
         let future: FeedFuture = Box::pin(async move {
             let client = match crate::cmd::session::connect(&cfg).await {
                 Ok(client) => client,
@@ -238,6 +234,7 @@ async fn run(source: FeedSource, mut rx: mpsc::UnboundedReceiver<Cmd>, shared: A
     let mut sinks = BTreeMap::<u64, (FeedSink, Arc<AtomicBool>)>::new();
     let mut feed = loop {
         tokio::select! {
+            biased;
             command = rx.recv() => {
                 if !apply_command(command, &mut sinks) {
                     finish_hub(&shared);
@@ -275,6 +272,7 @@ async fn run(source: FeedSource, mut rx: mpsc::UnboundedReceiver<Cmd>, shared: A
             }
         }
         tokio::select! {
+            biased;
             command = rx.recv() => {
                 if !apply_command(command, &mut sinks) {
                     finish_hub(&shared);
@@ -643,6 +641,10 @@ mod tests {
         live_rx.recv_timeout(Duration::from_secs(5)).unwrap();
         wait_inactive(&failed);
         assert!(live.is_active());
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while hub.subscribers() != 1 && Instant::now() < deadline {
+            std::thread::yield_now();
+        }
         assert_eq!(hub.subscribers(), 1);
     }
 
