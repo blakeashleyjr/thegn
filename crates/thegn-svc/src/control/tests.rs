@@ -2373,6 +2373,26 @@ impl ControlApi for PluginsStatusApi {
     ) -> BoxFuture<'a, ControlResult<Vec<thegn_core::db::MergeQueueRow>>> {
         panic!("unexpected merge_list")
     }
+    fn git_status<'a>(
+        &'a self,
+        _worktree: &'a str,
+    ) -> BoxFuture<'a, ControlResult<Vec<GitFileStatus>>> {
+        panic!("unexpected git_status")
+    }
+    fn git_stage<'a>(
+        &'a self,
+        _worktree: &'a str,
+        _paths: &'a [String],
+    ) -> BoxFuture<'a, ControlResult<()>> {
+        panic!("unexpected git_stage")
+    }
+    fn git_commit<'a>(
+        &'a self,
+        _worktree: &'a str,
+        _message: &'a str,
+    ) -> BoxFuture<'a, ControlResult<String>> {
+        panic!("unexpected git_commit")
+    }
     fn pr_status(&self) -> BoxFuture<'_, ControlResult<Vec<super::PrStatusRow>>> {
         panic!("unexpected pr_status")
     }

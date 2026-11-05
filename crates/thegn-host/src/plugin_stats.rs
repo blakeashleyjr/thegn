@@ -193,7 +193,7 @@ pub(crate) fn install_status_writer(state_dir: PathBuf) -> bool {
 }
 
 fn spawn_status_writer(state_dir: PathBuf) -> (Sender<Arc<Vec<PluginCounters>>>, JoinHandle<()>) {
-    let (tx, rx) = mpsc::channel();
+    let (tx, rx) = mpsc::channel::<Arc<Vec<PluginCounters>>>();
     let handle = thegn_core::thread_name::spawn_named("thegn-plugstat", move || {
         crate::platform::qos::set_self(crate::platform::qos::Qos::Background);
         while let Ok(mut rows) = rx.recv() {

@@ -268,7 +268,6 @@ mod tests {
                         malformed: u64::MAX,
                         closed_wakeups: u64::MAX,
                     },
-                    ..Default::default()
                 })
                 .collect(),
             ..Default::default()
