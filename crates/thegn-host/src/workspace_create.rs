@@ -380,7 +380,10 @@ fn parse_workspace_url(input: &str) -> Result<ParsedWorkspaceUrl> {
     })
 }
 
-fn configured_origin(dest: &std::path::Path, remote_name: &str) -> Result<Option<String>> {
+pub(crate) fn configured_origin(
+    dest: &std::path::Path,
+    remote_name: &str,
+) -> Result<Option<String>> {
     let config = std::fs::read_to_string(dest.join(".git/config"))?;
     let remote_section = format!("remote \"{remote_name}\"");
     let mut in_remote = false;

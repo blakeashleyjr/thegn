@@ -79,6 +79,15 @@ is refused and the staging directory is left for the startup sweep. A
 configured workspace directory that is itself a symlink still works; thegn
 resolves it first. The parent directory must be owned by you.
 
+A URL clone records where it came from: the credential-free canonical origin, the thegn version and when
+the clone started and was validated. `thegn repo provenance` lists the recorded clones newest first,
+`thegn repo provenance <path>` shows one, and `--json` emits one JSON array. Each row carries a status
+read at that moment: `verified` (the directory exists and its `origin` still matches),
+`origin-changed`, `missing` (the directory is gone), `unverifiable` (the origin could not be read),
+`cloning`, `interrupted` (the clone's process is gone before it finished) and `abandoned` (the clone
+failed or was cancelled). The record never contains the clone URL's credentials and is advisory: the
+repository on disk stays authoritative.
+
 Lifecycle hooks apply to every creation door, including the wizard, `wt new`,
 issue dispatch, and the daemon's `worktrees.create` request. A blocking
 `pre_create` leaves both git and the database unchanged. The wizard schedules
