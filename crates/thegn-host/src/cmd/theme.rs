@@ -26,6 +26,13 @@ pub enum Action {
         #[arg(long)]
         name: Option<String>,
     },
+    /// Rename a local theme (its storage identity is its name); the active theme cannot be renamed.
+    Rename {
+        /// Current local theme name.
+        old: String,
+        /// New theme name.
+        new: String,
+    },
 }
 
 pub fn run(cfg: &Config, action: Action, config_path: PathBuf) -> Result<()> {
@@ -33,6 +40,7 @@ pub fn run(cfg: &Config, action: Action, config_path: PathBuf) -> Result<()> {
         Action::List => list(&cfg.theme.preset),
         Action::Set { name } => set(&name, &config_path),
         Action::Import { file, name } => import(&file, name.as_deref()),
+        Action::Rename { old, new } => rename(&cfg.theme.preset, &old, &new),
     }
 }
 
@@ -91,6 +99,23 @@ fn import(path: &Path, name: Option<&str>) -> Result<()> {
     crate::theme_store::write_theme(&dir, &theme).map_err(anyhow::Error::msg)?;
     report_contrast_warnings(&theme);
     msg::info(&format!("theme imported as `{}`", theme.meta.name));
+    Ok(())
+}
+
+fn rename(active: &str, old: &str, new: &str) -> Result<()> {
+    let dir = util::xdg_config_home().join("thegn/themes");
+    let outcome = crate::theme_rename::rename_theme(&dir, old, new, Some(active))
+        .map_err(anyhow::Error::msg)?;
+    msg::info(&format!(
+        "theme `{}` renamed to `{}`",
+        outcome.old_name, outcome.new_name
+    ));
+    if !outcome.old_removed {
+        msg::warn(&format!(
+            "the old theme file for `{}` changed while renaming and was left in place; remove it yourself if it is no longer needed",
+            outcome.old_name
+        ));
+    }
     Ok(())
 }
 
