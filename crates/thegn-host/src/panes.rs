@@ -121,10 +121,11 @@ fn claim_daemon_fallback_notice(
     !flags[kind.slot()].swap(true, std::sync::atomic::Ordering::Relaxed)
 }
 
-/// The user-facing text; `line` is ALREADY redacted (`spawn_failure_line`).
+/// Fixed support-bundle pointer appended to pane fallback notices.
 const FALLBACK_BUNDLE_HINT: &str =
     "Run `thegn doctor bundle` to collect the retained crash reports and logs.";
 
+/// The user-facing text; `line` is ALREADY redacted (`spawn_failure_line`).
 fn daemon_fallback_notice(kind: DaemonFallback, line: &str) -> String {
     let text = match kind {
         DaemonFallback::Spawn => format!(
