@@ -1004,24 +1004,33 @@ pub(crate) fn drive_queue(
                             .is_ok()
                         })
                 });
-                let own = crate::pr_agent_lease::observe_own_head(&loc, &head, || {
-                    if authorship.is_some() {
-                        fresh.as_ref().map(|pr| pr.head_ref_oid.clone())
-                    } else {
-                        forge
-                            .pr_status(&loc, PrRef::Number(item.number))
-                            .ok()
-                            .filter(|pr| {
-                                pr_queue::attest_pr_identity(
-                                    item.pr_url.as_deref(),
-                                    item.number,
-                                    &pr.url,
-                                    pr.number,
-                                )
-                                .is_ok()
-                            })
-                            .map(|pr| pr.head_ref_oid)
-                    }
+                let remote_after: Option<String> = if authorship.is_some() {
+                    fresh.as_ref().map(|pr| pr.head_ref_oid.clone())
+                } else {
+                    forge
+                        .pr_status(&loc, PrRef::Number(item.number))
+                        .ok()
+                        .filter(|pr| {
+                            pr_queue::attest_pr_identity(
+                                item.pr_url.as_deref(),
+                                item.number,
+                                &pr.url,
+                                pr.number,
+                            )
+                            .is_ok()
+                        })
+                        .map(|pr| pr.head_ref_oid)
+                };
+                let own =
+                    crate::pr_agent_lease::observe_own_head(&loc, &head, || remote_after.clone());
+                let head_warning = crate::pr_head_outcome::observe_outcome(
+                    &loc,
+                    &head,
+                    remote_after.as_deref(),
+                    !guard.lease_lost(),
+                )
+                .and_then(|outcome| {
+                    crate::pr_head_outcome::outcome_warning(item.number, outcome, cfg)
                 });
                 match crate::pr_authorship::revalidate_after_agent(
                     authorship.as_ref(),
@@ -1038,6 +1047,9 @@ pub(crate) fn drive_queue(
                                 guard.record_own_head(db, &head, &own),
                             )
                         {
+                            out.warnings.push(warning);
+                        }
+                        if let Some(warning) = head_warning {
                             out.warnings.push(warning);
                         }
                         match guard.finish(db, None) {
