@@ -33,8 +33,12 @@ pub(crate) type FeedFuture = Pin<Box<dyn Future<Output = Option<Feed>> + Send>>;
 pub(crate) type FeedSource = Arc<dyn Fn() -> FeedFuture + Send + Sync>;
 
 pub(crate) fn daemon_source(cfg: Arc<Config>) -> FeedSource {
+    let cfg = Arc::downgrade(&cfg);
     Arc::new(move || {
-        let cfg = Arc::clone(&cfg);
+        let Some(cfg) = cfg.upgrade() else {
+            let future: FeedFuture = Box::pin(async { None });
+            return future;
+        };
         let future: FeedFuture = Box::pin(async move {
             let client = match crate::cmd::session::connect(&cfg).await {
                 Ok(client) => client,
