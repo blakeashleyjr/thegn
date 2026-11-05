@@ -361,6 +361,16 @@ declaration and Dockerfile contents, so changing the Dockerfile rebuilds it on
 the next launch. If the Dockerfile cannot be read for hashing, thegn warns and
 uses the declaration alone for the tag.
 
+The image tag also covers files in the build `context`: their relative paths,
+contents and symlink targets, but not file permission bits. A top-level `.git`
+directory is skipped. Editing a context file rebuilds the image on the next
+launch, and the first launch after upgrading rebuilds once because the tag
+format changed. If the context cannot be digested (more than 2048 entries, more
+than 16 MiB of file content, a path deeper than 32 levels, or an unreadable
+file), thegn warns `devcontainer: could not digest build context <path>
+(<reason>); the image tag covers the Dockerfile (when readable) and build
+declaration only` and keeps the build.
+
 ### Lifecycle and provider fallback
 
 After lifecycle approval, `initializeCommand` uses the host-side one-time
