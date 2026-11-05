@@ -117,6 +117,7 @@ the SDK; the thegn host does not.
 
 Run `just plugin-conformance` (with a built `target/debug/thegn`) to check
 `thegn plugin preview` offline. This recipe is not part of `ci`.
+The recipe also drives the built host in a PTY through a synthetic resident app plugin (`test/plugin-apps.py`; exit 77 means the environment has no usable PTY and the step is skipped).
 
 ## Example
 
