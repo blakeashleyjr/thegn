@@ -11,6 +11,7 @@ use anyhow::{Context, Result};
 use std::path::{Path, PathBuf};
 use thegn_core::config::Config;
 use thegn_core::db::{Db, PrQueueRow, PrRebind};
+use thegn_core::db_pr_agent_outcome::PrAgentOutcomeRecord;
 use thegn_core::outln;
 use thegn_core::store::{PrRemoval, WorktreeAuxStore};
 
@@ -125,22 +126,25 @@ fn rows(root: &Path) -> Result<Vec<PrQueueRow>> {
 
 fn list(json: bool) -> Result<()> {
     let root = repo_root()?;
-    let rows = rows(&root)?;
+    let db = Db::open()?;
+    let rows = pr_driver::rows_for_repo(&db, &root);
+    let listed = listed_rows(&db, &rows)?;
     if json {
-        return super::emit_json(&rows);
+        return super::emit_json(&listed);
     }
-    if rows.is_empty() {
+    if listed.is_empty() {
         outln!("PR queue is empty.");
         return Ok(());
     }
-    for r in &rows {
+    for entry in &listed {
+        let r = entry.row;
         let detail = r.detail.as_deref().unwrap_or("");
         let wt = match r.worktree.as_deref() {
             Some(w) if !w.is_empty() => format!(" ({w})"),
             _ => " (no worktree)".to_string(),
         };
         outln!(
-            "#{:<6} {:<18} {}{}{}",
+            "#{:<6} {:<18} {}{}{}{}",
             r.number,
             r.status,
             r.branch,
@@ -149,10 +153,38 @@ fn list(json: bool) -> Result<()> {
                 String::new()
             } else {
                 format!(" — {detail}")
-            }
+            },
+            outcome_suffix(entry.agent_outcome.as_ref())
         );
     }
     Ok(())
+}
+
+/// One `list --json` element: the queue row plus what the last agent run did to the PR head.
+#[derive(serde::Serialize)]
+struct ListedRow<'a> {
+    #[serde(flatten)]
+    row: &'a PrQueueRow,
+    agent_outcome: Option<PrAgentOutcomeRecord>,
+}
+
+/// `  [last agent run: <label>]`, or empty when nothing is recorded.
+fn outcome_suffix(record: Option<&PrAgentOutcomeRecord>) -> String {
+    record.map_or_else(String::new, |record| {
+        format!("  [last agent run: {}]", record.label)
+    })
+}
+
+/// Read each row's latest-generation outcome.
+fn listed_rows<'a>(db: &Db, rows: &'a [PrQueueRow]) -> Result<Vec<ListedRow<'a>>> {
+    rows.iter()
+        .map(|row| {
+            let agent_outcome = db
+                .pr_agent_outcome(&row.key)
+                .context("read the PR agent outcome")?;
+            Ok(ListedRow { row, agent_outcome })
+        })
+        .collect()
 }
 
 fn add(cfg: &Config, pr: Option<u64>, worktree: Option<String>) -> Result<()> {
@@ -802,5 +834,149 @@ mod drain_json_tests {
         let json = drain_json(&out);
         assert_eq!(json["merge_requested"], serde_json::json!([42]));
         assert_eq!(json["merged"], serde_json::json!([]));
+    }
+}
+
+#[cfg(test)]
+mod list_outcome_tests {
+    use super::{ListedRow, listed_rows, outcome_suffix};
+    use thegn_core::ci_log::CiLogCandidate;
+    use thegn_core::db::Db;
+    use thegn_core::pr_queue::{AgentHeadOutcome, PrAgentAdmission, PrAgentAdmit};
+    use thegn_core::store::WorktreeAuxStore;
+
+    fn queued_row(db: &Db, number: u64) -> thegn_core::db::PrQueueRow {
+        db.enqueue_bound_pr(
+            "/repo",
+            number,
+            Some("/repo/wt"),
+            "feature",
+            "main",
+            "github",
+            &format!("https://github.com/me/repo/pull/{number}"),
+        )
+        .unwrap();
+        db.list_pr_queue()
+            .unwrap()
+            .into_iter()
+            .find(|row| row.number == number)
+            .unwrap()
+    }
+
+    fn admitted(
+        db: &Db,
+        row: &thegn_core::db::PrQueueRow,
+        expected_attempts: u32,
+    ) -> thegn_core::pr_queue::PrAgentLease {
+        match db
+            .admit_pr_agent(&PrAgentAdmit {
+                key: &row.key,
+                expected_attempts,
+                expected_checkout_gen: row.checkout_gen,
+                max_attempts: 3,
+                head: "head-a",
+                blocker: "ci",
+                detail: "dispatch",
+                lease_until_ms: thegn_core::util::now_ms() + 60_000,
+                owner_hint: Some("test"),
+                ci_candidate: None::<&CiLogCandidate>,
+            })
+            .unwrap()
+        {
+            PrAgentAdmission::Admitted(lease) => lease,
+            other => panic!("expected admission, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn outcome_suffix_names_the_label() {
+        let db = Db::open_memory().unwrap();
+        let row = queued_row(&db, 1);
+        let lease = admitted(&db, &row, 0);
+        assert!(
+            db.record_pr_agent_outcome(&lease, AgentHeadOutcome::LocalOnly)
+                .unwrap()
+        );
+        let record = db.pr_agent_outcome(&row.key).unwrap().unwrap();
+
+        assert_eq!(
+            outcome_suffix(Some(&record)),
+            "  [last agent run: committed locally, nothing pushed]"
+        );
+    }
+
+    #[test]
+    fn outcome_suffix_is_empty_without_a_record() {
+        assert_eq!(outcome_suffix(None), "");
+    }
+
+    #[test]
+    fn listed_rows_attach_the_recorded_outcome_of_the_latest_generation() {
+        let db = Db::open_memory().unwrap();
+        let first = queued_row(&db, 1);
+        let second = queued_row(&db, 2);
+        let lease = admitted(&db, &first, 0);
+        assert!(
+            db.record_pr_agent_outcome(&lease, AgentHeadOutcome::LocalOnly)
+                .unwrap()
+        );
+
+        let rows = [first.clone(), second];
+        let listed = listed_rows(&db, &rows).unwrap();
+        let first_listed = listed.iter().find(|entry| entry.row.number == 1).unwrap();
+        assert_eq!(
+            first_listed
+                .agent_outcome
+                .as_ref()
+                .map(|record| record.outcome),
+            Some("local_only")
+        );
+        let second_listed = listed.iter().find(|entry| entry.row.number == 2).unwrap();
+        assert!(second_listed.agent_outcome.is_none());
+
+        assert!(
+            db.release_pr_agent(&lease, Some(("queued", "again")))
+                .unwrap()
+        );
+        let next_lease = admitted(&db, &first, 1);
+        let latest = listed_rows(&db, &rows).unwrap();
+        let first_latest = latest.iter().find(|entry| entry.row.number == 1).unwrap();
+        assert!(first_latest.agent_outcome.is_none());
+        assert!(
+            db.release_pr_agent(&next_lease, Some(("queued", "finished")))
+                .unwrap()
+        );
+    }
+
+    #[test]
+    fn listed_row_json_flattens_the_row_and_adds_agent_outcome() {
+        let db = Db::open_memory().unwrap();
+        let row = queued_row(&db, 1);
+        let lease = admitted(&db, &row, 0);
+        assert!(
+            db.record_pr_agent_outcome(&lease, AgentHeadOutcome::LocalOnly)
+                .unwrap()
+        );
+        let listed = listed_rows(&db, std::slice::from_ref(&row)).unwrap();
+        let value = serde_json::to_value(&listed[0]).unwrap();
+
+        assert_eq!(value["number"], 1);
+        assert_eq!(value["agent_outcome"]["outcome"], "local_only");
+        assert_eq!(
+            value["agent_outcome"]["label"],
+            "committed locally, nothing pushed"
+        );
+        assert!(value["agent_outcome"]["recorded_at"].as_i64().unwrap() > 0);
+    }
+
+    #[test]
+    fn listed_row_json_has_a_null_agent_outcome_when_none_is_recorded() {
+        let db = Db::open_memory().unwrap();
+        let row = queued_row(&db, 1);
+        let listed: Vec<ListedRow<'_>> = listed_rows(&db, std::slice::from_ref(&row)).unwrap();
+        let value = serde_json::to_value(&listed[0]).unwrap();
+
+        assert!(value["agent_outcome"].is_null());
+        assert!(value["status"].is_string());
     }
 }

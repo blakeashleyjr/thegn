@@ -226,6 +226,13 @@ while it ran (and whether that holds the row or refills the budget under your
 the attempt budget is still decided by the rules above. It applies to local
 checkouts.
 
+`thegn pr queue list` also remembers the last agent run: a row shows
+`[last agent run: ...]` (pushed progress, changed nothing, committed locally
+with nothing pushed, someone else pushed, head provenance unproven, could not
+run, or lease lost before completion) for the most recent run only, and
+`--json` adds an `agent_outcome` object, or null. Like the pass warnings above,
+it is recorded for local checkouts only.
+
 ## Watching
 
 The status bar shows a `PR` chip: red when a pull request needs you, amber
