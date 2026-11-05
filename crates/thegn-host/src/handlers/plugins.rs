@@ -2582,11 +2582,14 @@ mod tests {
 
     #[test]
     fn plugin_counters_flush_publishes_cumulative_dispatch_totals() {
+        let _guard = crate::plugin_stats::TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let mut state = state_with(vec![seg_spec("cnt-a")]);
         state.dispatcher = Some(Dispatcher::disconnected());
 
-        for expected in [1, 1, 2] {
-            dispatch_request(state.dispatcher.as_ref().unwrap(), "cnt-a", expected as u64)
+        for (id, expected) in [(1_u64, 1_u64), (2, 2), (3, 3)] {
+            dispatch_request(state.dispatcher.as_ref().unwrap(), "cnt-a", id)
                 .recv_timeout(std::time::Duration::from_secs(2))
                 .expect("disconnected dispatcher response");
             flush_alerts_with(&mut state, |_| {});
@@ -2595,7 +2598,7 @@ mod tests {
                 rows.iter()
                     .find(|row| row.plugin == "cnt-a")
                     .map(|row| row.lost),
-                Some(expected as u64)
+                Some(expected)
             );
         }
 
@@ -2604,6 +2607,9 @@ mod tests {
 
     #[test]
     fn plugin_counters_flush_publishes_inbox_pressure() {
+        let _guard = crate::plugin_stats::TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let mut state = state_with(vec![seg_spec("cnt-b")]);
         let inbox = Arc::new(PluginInbox::default());
         state.inbox = Some(Arc::clone(&inbox));
@@ -2639,6 +2645,9 @@ mod tests {
 
     #[test]
     fn plugin_counters_drop_a_plugin_that_left_the_set() {
+        let _guard = crate::plugin_stats::TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let mut state = state_with(vec![seg_spec("cnt-c")]);
         state.dispatcher = Some(Dispatcher::disconnected());
         dispatch_request(state.dispatcher.as_ref().unwrap(), "cnt-c", 1)

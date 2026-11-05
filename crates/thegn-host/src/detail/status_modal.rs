@@ -545,6 +545,21 @@ fn count_cell(count: u64) -> String {
     }
 }
 
+fn plugin_sections(rows: &[crate::plugin_stats::PluginCounters]) -> Vec<Section> {
+    if rows.is_empty() {
+        Vec::new()
+    } else {
+        vec![
+            spacer(),
+            Section::Heading {
+                label: "plugins".into(),
+                note: Some(format!("{} with host.call activity", rows.len())),
+            },
+            Section::Table(plugin_rows_table(rows)),
+        ]
+    }
+}
+
 /// The event-loop rollup, as grid cells. Every one of these is already measured
 /// by `crate::perf` each interval and was previously discarded.
 fn loop_cells(p: &crate::perf::PerfSnapshot) -> Vec<(String, String, Tok)> {
@@ -836,14 +851,7 @@ fn build_sections(model: &FrameModel, ctx: &super::StatusCtx) -> Vec<Section> {
 
     // --- Plugin host.call pressure (cumulative since start) -------------------
     let plugin_rows = crate::plugin_stats::snapshot();
-    if !plugin_rows.is_empty() {
-        secs.push(spacer());
-        secs.push(Section::Heading {
-            label: "plugins".into(),
-            note: Some(format!("{} with host.call activity", plugin_rows.len())),
-        });
-        secs.push(Section::Table(plugin_rows_table(&plugin_rows)));
-    }
+    secs.extend(plugin_sections(&plugin_rows));
 
     // --- Event-loop rollup (the same data `thegn::perf` logs) --------------
     secs.push(spacer());
@@ -878,11 +886,11 @@ fn build_sections(model: &FrameModel, ctx: &super::StatusCtx) -> Vec<Section> {
 
 #[cfg(test)]
 mod tests {
-    use super::{loop_cells, plugin_rows_table, tail_cell, tail_only};
+    use super::{loop_cells, plugin_rows_table, plugin_sections, tail_cell, tail_only};
     use crate::chrome::S;
     use crate::perf::PerfSnapshot;
     use crate::plugin_stats::{PluginCounters, Totals};
-    use crate::sections::Cell;
+    use crate::sections::{Cell, Section};
     use crate::seg::Tok;
     use std::collections::BTreeMap;
     use thegn_core::theme::Hue;
@@ -966,6 +974,25 @@ mod tests {
     #[test]
     fn plugin_rows_are_absent_when_no_plugin_has_counters() {
         assert!(Totals::default().rows(&BTreeMap::new()).is_empty());
+        assert!(plugin_sections(&[]).is_empty());
+
+        let sections = plugin_sections(&[PluginCounters {
+            plugin: "active-plugin".into(),
+            rejected: 1,
+            ..Default::default()
+        }]);
+        assert_eq!(sections.len(), 3);
+        assert!(matches!(
+            &sections[0],
+            Section::Heading { label, note: None } if label.is_empty()
+        ));
+        assert!(matches!(
+            &sections[1],
+            Section::Heading { label, note: Some(note) }
+                if label == "plugins" && note == "1 with host.call activity"
+        ));
+        assert!(matches!(&sections[2], Section::Table(_)));
+
         let table = plugin_rows_table(&[]);
         assert!(table.rows.is_empty());
         assert_eq!(table.header.len(), 6);
