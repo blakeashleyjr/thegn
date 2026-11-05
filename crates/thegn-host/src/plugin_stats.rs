@@ -1,5 +1,8 @@
 use std::collections::BTreeMap;
-use std::sync::{Arc, LazyLock, Mutex};
+use std::path::{Path, PathBuf};
+use std::sync::mpsc::{self, Sender};
+use std::sync::{Arc, LazyLock, Mutex, OnceLock};
+use std::thread::JoinHandle;
 
 pub(crate) const MAX_ROWS: usize = 64;
 
@@ -13,6 +16,28 @@ pub(crate) struct PluginCounters {
     pub lost: u64,
     pub queue_drops: u64,
     pub coalesced: u64,
+}
+
+impl From<&PluginCounters> for thegn_core::plugin_status::PluginStatusRow {
+    fn from(row: &PluginCounters) -> Self {
+        Self {
+            plugin: row.plugin.clone(),
+            in_flight: row.in_flight as u64,
+            rejected: row.rejected,
+            timed_out: row.timed_out,
+            lost: row.lost,
+            queue_drops: row.queue_drops,
+            coalesced: row.coalesced,
+            bridge: thegn_core::plugin_status::BridgeCounts {
+                calls: row.bridge.calls,
+                timed_out: row.bridge.timed_out,
+                cancelled: row.bridge.cancelled,
+                late_replies: row.bridge.late_replies,
+                malformed: row.bridge.malformed,
+                closed_wakeups: row.bridge.closed_wakeups,
+            },
+        }
+    }
 }
 
 /// Overlay each live bridge's counters onto the published rows (one bridge
@@ -129,6 +154,7 @@ impl Totals {
 
 static ROWS: LazyLock<Mutex<Arc<Vec<PluginCounters>>>> =
     LazyLock::new(|| Mutex::new(Arc::new(Vec::new())));
+static WRITER: OnceLock<Sender<Arc<Vec<PluginCounters>>>> = OnceLock::new();
 
 #[cfg(test)]
 pub(crate) static TEST_LOCK: Mutex<()> = Mutex::new(());
@@ -139,6 +165,11 @@ pub(crate) fn publish(rows: Vec<PluginCounters>) -> bool {
         false
     } else {
         *published = Arc::new(rows);
+        if let Some(tx) = WRITER.get()
+            && let Err(error) = tx.send(Arc::clone(&published))
+        {
+            tracing::debug!(target: "thegn::plugin", %error, "plugin status snapshot send failed");
+        }
         true
     }
 }
@@ -147,10 +178,72 @@ pub(crate) fn snapshot() -> Arc<Vec<PluginCounters>> {
     Arc::clone(&ROWS.lock().unwrap_or_else(|error| error.into_inner()))
 }
 
+pub(crate) fn install_status_writer(state_dir: PathBuf) -> bool {
+    let mut installed = false;
+    let tx = WRITER.get_or_init(|| {
+        let (tx, handle) = spawn_status_writer(state_dir);
+        drop(handle);
+        installed = true;
+        tx
+    });
+    if installed && let Err(error) = tx.send(snapshot()) {
+        tracing::debug!(target: "thegn::plugin", %error, "plugin status snapshot send failed");
+    }
+    installed
+}
+
+fn spawn_status_writer(state_dir: PathBuf) -> (Sender<Arc<Vec<PluginCounters>>>, JoinHandle<()>) {
+    let (tx, rx) = mpsc::channel();
+    let handle = thegn_core::thread_name::spawn_named("thegn-plugstat", move || {
+        crate::platform::qos::set_self(crate::platform::qos::Qos::Background);
+        while let Ok(mut rows) = rx.recv() {
+            while let Ok(newer) = rx.try_recv() {
+                rows = newer;
+            }
+            if let Err(error) = write_status_file(
+                &state_dir,
+                &rows,
+                std::process::id(),
+                thegn_core::util::now_ms(),
+            ) {
+                tracing::debug!(target: "thegn::plugin", %error, "plugin status snapshot not written");
+            }
+        }
+    });
+    (tx, handle)
+}
+
+fn write_status_file(
+    state_dir: &Path,
+    rows: &[PluginCounters],
+    pid: u32,
+    now_ms: i64,
+) -> std::io::Result<()> {
+    let snapshot = thegn_core::plugin_status::PluginStatusSnapshot {
+        schema: thegn_core::plugin_status::STATUS_SCHEMA,
+        pid,
+        published_at_ms: now_ms,
+        rows: rows.iter().map(Into::into).collect(),
+    };
+    let bytes = thegn_core::plugin_status::encode(&snapshot)
+        .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
+    crate::daemon::control_publish::prepare_run_dir(state_dir)?;
+    thegn_core::fsperm::write_owner_only_atomic(
+        &crate::daemon::control_publish::run_dir(state_dir)
+            .join(thegn_core::plugin_status::STATUS_FILE),
+        &bytes,
+    )
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{MAX_ROWS, PluginCounters, Totals, merge_bridge, publish, snapshot};
+    use super::{
+        MAX_ROWS, PluginCounters, Totals, merge_bridge, publish, snapshot, spawn_status_writer,
+        write_status_file,
+    };
     use std::collections::BTreeMap;
+    use std::sync::Arc;
+    use thegn_core::plugin_status::{BridgeCounts, PluginStatusRow, STATUS_FILE, decode};
     use thegn_svc::plugin::BridgeStats;
 
     #[test]
@@ -299,5 +392,127 @@ mod tests {
         assert_eq!(merged.len(), MAX_ROWS);
         assert_eq!(merged[0].plugin, "plugin-000");
         assert_eq!(merged[MAX_ROWS - 1].plugin, "plugin-063");
+    }
+
+    #[test]
+    fn status_row_conversion_copies_every_counter() {
+        let counters = PluginCounters {
+            plugin: "counter-test".to_owned(),
+            in_flight: 1,
+            rejected: 2,
+            timed_out: 3,
+            lost: 4,
+            queue_drops: 5,
+            coalesced: 6,
+            bridge: BridgeStats {
+                calls: 7,
+                timed_out: 8,
+                cancelled: 9,
+                late_replies: 10,
+                malformed: 11,
+                closed_wakeups: 12,
+            },
+        };
+        let status = PluginStatusRow::from(&counters);
+        assert_eq!(status.plugin, "counter-test");
+        assert_eq!(status.in_flight, 1);
+        assert_eq!(status.rejected, 2);
+        assert_eq!(status.timed_out, 3);
+        assert_eq!(status.lost, 4);
+        assert_eq!(status.queue_drops, 5);
+        assert_eq!(status.coalesced, 6);
+        assert_eq!(
+            status.bridge,
+            BridgeCounts {
+                calls: 7,
+                timed_out: 8,
+                cancelled: 9,
+                late_replies: 10,
+                malformed: 11,
+                closed_wakeups: 12,
+            }
+        );
+    }
+
+    #[test]
+    fn status_writer_writes_the_newest_rows_and_exits_when_the_sender_drops() {
+        let dir = tempfile::tempdir_in("/tmp").expect("private status tempdir");
+        let (tx, handle) = spawn_status_writer(dir.path().to_path_buf());
+        for rejected in [1, 4, 9] {
+            tx.send(Arc::new(vec![PluginCounters {
+                plugin: "newest".to_owned(),
+                rejected,
+                ..Default::default()
+            }]))
+            .expect("send status rows");
+        }
+        drop(tx);
+        handle.join().expect("writer thread");
+
+        let bytes =
+            std::fs::read(dir.path().join("run").join(STATUS_FILE)).expect("status snapshot file");
+        let decoded = decode(&bytes).expect("decode status snapshot");
+        assert_eq!(decoded.pid, std::process::id());
+        assert_eq!(
+            decoded.rows,
+            vec![PluginStatusRow {
+                plugin: "newest".to_owned(),
+                rejected: 9,
+                ..Default::default()
+            }]
+        );
+    }
+
+    #[test]
+    fn status_file_is_replaced_not_appended() {
+        let dir = tempfile::tempdir_in("/tmp").expect("private status tempdir");
+        let first = PluginCounters {
+            plugin: "first".to_owned(),
+            rejected: 1,
+            ..Default::default()
+        };
+        let second = PluginCounters {
+            plugin: "second".to_owned(),
+            rejected: 2,
+            ..Default::default()
+        };
+        write_status_file(dir.path(), std::slice::from_ref(&first), 7, 10)
+            .expect("write initial snapshot");
+        write_status_file(dir.path(), std::slice::from_ref(&second), 8, 20)
+            .expect("replace snapshot");
+        let bytes =
+            std::fs::read(dir.path().join("run").join(STATUS_FILE)).expect("status snapshot file");
+        let decoded = decode(&bytes).expect("decode status snapshot");
+        assert_eq!(decoded.pid, 8);
+        assert_eq!(decoded.published_at_ms, 20);
+        assert_eq!(decoded.rows, vec![PluginStatusRow::from(&second)]);
+    }
+
+    #[test]
+    fn publish_without_an_installed_writer_still_only_updates_memory() {
+        let _guard = super::TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let dir = tempfile::tempdir_in("/tmp").expect("private status tempdir");
+        let file = dir.path().join("run").join(STATUS_FILE);
+        let row = PluginCounters {
+            plugin: format!("status-memory-{}", std::process::id()),
+            rejected: 1,
+            ..Default::default()
+        };
+        assert!(publish(vec![row.clone()]));
+        assert!(!publish(vec![row.clone()]));
+        assert!(snapshot().iter().any(|published| published == &row));
+        assert!(!file.exists());
+        publish(Vec::new());
+    }
+
+    #[test]
+    fn status_writer_failure_is_an_error_not_a_panic() {
+        let dir = tempfile::tempdir_in("/tmp").expect("private status tempdir");
+        let state_file = dir.path().join("state-file");
+        std::fs::write(&state_file, b"not a directory").expect("create file state path");
+        let result = write_status_file(&state_file, &[], 1, 2);
+        assert!(result.is_err());
     }
 }
