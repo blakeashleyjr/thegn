@@ -967,6 +967,9 @@ pub struct AuditLogEntry {
     pub target: Option<String>,
     /// Dispatch outcome of a granted `host.call`; `None` for every other entry and until the outcome is reported.
     pub outcome: Option<AuditOutcome>,
+    /// Resident session generation (the host's `SessionGen`) that made a `host.call`.
+    /// `None` for every other entry and for calls made without a live session.
+    pub session: Option<u64>,
 }
 
 fn bound_audit_string(value: &str) -> String {
@@ -1615,6 +1618,7 @@ impl PluginRuntime {
             generation: self.generation,
             target: target.map(bound_audit_string),
             outcome: None,
+            session: None,
         });
     }
 
@@ -1637,6 +1641,21 @@ impl PluginRuntime {
             decision,
             target,
         );
+    }
+
+    /// [`Self::record_host_call_decision`] plus the resident session generation that issued the call.
+    pub fn record_host_call_decision_in_session(
+        &mut self,
+        plugin: PluginId,
+        capability_id: &str,
+        decision: AuditDecision,
+        target: Option<&str>,
+        session: Option<u64>,
+    ) {
+        self.record_host_call_decision(plugin, capability_id, decision, target);
+        if let Some(entry) = self.audit.last_mut() {
+            entry.session = session;
+        }
     }
 
     /// Sequence number of the most recently pushed audit entry (0 before any). Read it right after `record_host_call_decision`
@@ -3868,6 +3887,81 @@ timeout_secs = 5
         assert!(bounded.len() <= MAX_AUDIT_STRING_BYTES);
         assert!(bounded.ends_with('…'));
         assert!(!bounded.ends_with("é…"));
+    }
+
+    #[test]
+    fn audit_session_is_recorded_for_granted_and_denied_host_calls() {
+        let mut runtime = PluginRuntime::new(NegotiatedManifest::default());
+        runtime.record_host_call_decision_in_session(
+            PluginId::new("p"),
+            "sessions.list",
+            AuditDecision::Granted,
+            None,
+            Some(7),
+        );
+        runtime.record_host_call_decision_in_session(
+            PluginId::new("p"),
+            "sessions.kill",
+            AuditDecision::Denied,
+            None,
+            Some(9),
+        );
+
+        assert_eq!(runtime.audit_log()[0].session, Some(7));
+        assert_eq!(runtime.audit_log()[1].session, Some(9));
+    }
+
+    #[test]
+    fn audit_session_defaults_to_none_for_the_legacy_and_capability_paths() {
+        let mut runtime = PluginRuntime::new(NegotiatedManifest::default());
+        runtime.record_host_call_decision(
+            PluginId::new("p"),
+            "sessions.list",
+            AuditDecision::Granted,
+            None,
+        );
+        let request = IoRequest {
+            scheme: "x".to_owned(),
+            target: "y".to_owned(),
+            payload: serde_json::Value::Null,
+        };
+        assert!(runtime.io(PluginId::new("p"), request).is_err());
+        runtime.record_host_call_decision_in_session(
+            PluginId::new("p"),
+            "sessions.kill",
+            AuditDecision::Denied,
+            None,
+            None,
+        );
+
+        assert_eq!(runtime.audit_log()[0].session, None);
+        assert_eq!(runtime.audit_log()[1].session, None);
+        assert_eq!(runtime.audit_log()[2].session, None);
+    }
+
+    #[test]
+    fn audit_session_stays_with_its_own_entry_and_outcome_still_attaches() {
+        let mut runtime = PluginRuntime::new(NegotiatedManifest::default());
+        runtime.record_host_call_decision_in_session(
+            PluginId::new("p"),
+            "sessions.list",
+            AuditDecision::Granted,
+            None,
+            Some(1),
+        );
+        let (generation, first_seq) = (runtime.generation(), runtime.last_audit_seq());
+        runtime.record_host_call_decision_in_session(
+            PluginId::new("p"),
+            "sessions.list",
+            AuditDecision::Granted,
+            None,
+            Some(2),
+        );
+
+        assert!(runtime.record_host_call_outcome(generation, first_seq, AuditOutcome::Succeeded));
+        assert_eq!(runtime.audit_log()[0].session, Some(1));
+        assert!(runtime.audit_log()[0].outcome.is_some());
+        assert_eq!(runtime.audit_log()[1].session, Some(2));
     }
 
     #[test]
