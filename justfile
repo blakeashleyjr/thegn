@@ -395,6 +395,15 @@ bench-soak *args: release _perf-guard
 bench-soak-daemon *args: release _perf-guard
     bash test/perf/cpu-sample.sh --scenario soak-daemon {{args}}
 
+# Opt-in, Linux only: strace the first frame of the release binary under full isolation and list
+# every connect() target; exits 1 on any non-AF_UNIX connect. Report format: scripts/first-run-net-trace.sh.
+net-trace *args: release _perf-guard
+    bash scripts/first-run-net-trace.sh {{args}}
+
+# Hermetic test for the net-trace summariser: canned strace text, no strace, no thegn.
+test-net-trace:
+    python3 -B scripts/first_run_net_trace_test.py
+
 # Switch/input latency under a multi-pane output flood (A/B only — advisory,
 # machine-dependent). Reads switch_p99/input_p99 from the perf rollup while
 # several worktree shells scroll at full speed and Alt+Down fires mid-flood.
