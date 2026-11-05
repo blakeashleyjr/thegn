@@ -209,6 +209,7 @@ mod pool_lease;
 mod pr_agent_lease;
 mod pr_authorship;
 mod pr_driver;
+mod pr_head_outcome;
 mod pr_view;
 mod predict;
 mod preview;
