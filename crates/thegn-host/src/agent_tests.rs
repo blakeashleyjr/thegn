@@ -184,6 +184,138 @@ fn compose_policy_miss_halts_before_auto_chain_host_entry() {
     );
 }
 
+/// Put a fake `ssh` first on PATH. It appends its full argument list (one line per call) to the returned log file, answers a
+/// `command -v` runtime probe with the "present" sentinel, and exits 0 silently for anything else.
+#[cfg(unix)]
+fn fake_ssh_recorder(scratch: &Path) -> (String, std::path::PathBuf) {
+    use std::os::unix::fs::PermissionsExt as _;
+    let bin = scratch.join("bin");
+    std::fs::create_dir_all(&bin).unwrap();
+    let log = scratch.join("ssh-calls.log");
+    let ssh = bin.join("ssh");
+    std::fs::write(
+        &ssh,
+        format!(
+            "#!/bin/sh\nprintf '%s\\n' \"$*\" >> '{}'\ncase \"$*\" in *'command -v'*) printf %s __TG_HAVE__ ;; esac\nexit 0\n",
+            log.display()
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(&ssh, std::fs::Permissions::from_mode(0o755)).unwrap();
+    (format!("{}:/usr/bin:/bin", bin.display()), log)
+}
+
+#[cfg(unix)]
+fn remote_compose_cfg(host: &str) -> Config {
+    let mut cfg: Config = toml::from_str(&format!(
+        r#"
+[sandbox]
+backend = "podman"
+
+[env.zerospawn]
+placement = "ssh"
+[env.zerospawn.ssh]
+host = "{host}"
+transport = "ssh"
+"#
+    ))
+    .unwrap();
+    cfg.sandbox.profile = thegn_core::config::SandboxProfile::Hardened;
+    cfg.sandbox.isolation_floor = Some(thegn_core::config::IsolationFloor::Off);
+    cfg.sandbox.compose = Some(
+        thegn_core::sandbox_compose::ComposeSpec {
+            files: vec!["compose.yml".into()],
+            service: Some("worker".into()),
+            run_services: Vec::new(),
+        }
+        .encode(),
+    );
+    cfg
+}
+
+// Positive control: this locks the real prepare loop's plan/admit/apply order.
+#[test]
+#[cfg(unix)]
+fn remote_compose_refusal_runs_only_runtime_probes_on_the_remote() {
+    let scratch = tempfile::tempdir().unwrap();
+    let (path, log) = fake_ssh_recorder(scratch.path());
+    let _state = crate::testenv::IsolatedState::with_env(&[("PATH", &path)]);
+    let cfg = remote_compose_cfg("zerospawn-a.test");
+    let loc = GitLoc::from_db("/wt/zerospawn-a", None);
+    let error = prepare_sandbox_env(
+        &cfg,
+        Path::new("/repo"),
+        "/wt/zerospawn-a",
+        &loc,
+        None,
+        false,
+        Some("zerospawn"),
+    )
+    .expect_err("a Compose-refused remote plan must not launch");
+    assert!(
+        format!("{error:#}").contains("Compose cannot enforce"),
+        "the refusal must come from the Compose policy gate: {error:#}"
+    );
+    let calls = std::fs::read_to_string(&log).unwrap();
+    assert!(
+        calls.lines().count() > 0,
+        "the runtime probe must have used the fake ssh"
+    );
+    assert!(
+        calls.lines().all(|line| line.contains("command -v")),
+        "only runtime probes may reach the remote, got: {calls}"
+    );
+    assert!(!calls.contains("thegn-worktrees"));
+}
+
+// Positive control: this locks the real prepare loop's plan/admit/apply order.
+#[test]
+#[cfg(unix)]
+fn remote_compose_refusal_never_creates_or_execs_a_container() {
+    let scratch = tempfile::tempdir().unwrap();
+    let (path, log) = fake_ssh_recorder(scratch.path());
+    let _state = crate::testenv::IsolatedState::with_env(&[("PATH", &path)]);
+    let mut cfg = remote_compose_cfg("zerospawn-b.test");
+    cfg.sandbox.backend = thegn_core::config::SandboxBackend::Auto;
+    cfg.sandbox.backend_chain = vec!["podman".into()];
+    let loc = GitLoc::from_db("/wt/zerospawn-b", None);
+    let error = prepare_sandbox_env(
+        &cfg,
+        Path::new("/repo"),
+        "/wt/zerospawn-b",
+        &loc,
+        None,
+        false,
+        Some("zerospawn"),
+    )
+    .expect_err("a Compose-refused remote plan must halt");
+    let halt = error
+        .downcast_ref::<crate::agent::SandboxHalt>()
+        .expect("the chain refusal must surface as SandboxHalt");
+    assert!(
+        halt.reason.contains("Compose cannot enforce"),
+        "{}",
+        halt.reason
+    );
+    let calls = std::fs::read_to_string(&log).unwrap();
+    assert!(
+        calls.lines().count() > 0,
+        "the runtime probe must have used the fake ssh"
+    );
+    for effect in [
+        " run ",
+        " create ",
+        " exec ",
+        "thegn-worktrees",
+        "git bundle",
+    ] {
+        assert!(
+            !calls.contains(effect),
+            "refused placement must not issue {effect:?}: {calls}"
+        );
+    }
+}
+
 #[test]
 #[cfg(unix)]
 fn prepare_sandbox_env_reuses_failed_podman_probe_and_keeps_warnings() {
