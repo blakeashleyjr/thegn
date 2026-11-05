@@ -266,6 +266,7 @@ pub mod placement;
 mod platform_ratchet_tests;
 pub mod plugin_api;
 pub mod plugin_app;
+pub mod plugin_status;
 pub mod pr_merge_outcome;
 pub mod pr_queue;
 pub mod pr_review_tasks;
