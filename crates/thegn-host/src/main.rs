@@ -255,6 +255,7 @@ mod revtunnel;
 mod run;
 mod sandbox_admission;
 mod sandbox_events;
+mod sandbox_failure;
 mod sandbox_fallback_memo;
 mod sandbox_gc_gate;
 mod sandbox_start;
