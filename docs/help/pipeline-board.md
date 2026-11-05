@@ -156,7 +156,9 @@ and status changes to its owner; see [[cli]] for `--lease`, `--owner`,
 `--lease-gen` (all three are required together), and the audited
 `--admin --why` override. If the stage or effective agent configuration
 changes between claim and launch, launch is refused and the row is marked
-`failed` for retry. `thegn dispatch lease acquire` prints the lease generation,
+`failed` for retry. Changes to the `[sandbox]` policy in that window do not
+refuse launch; the daemon applies the policy it resolves at launch.
+`thegn dispatch lease acquire` prints the lease generation,
 including as `generation` in `--json`. Each new acquisition gets a higher
 generation; a live same-owner reacquire returns the current generation.
 
