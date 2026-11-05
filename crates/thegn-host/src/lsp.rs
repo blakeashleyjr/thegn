@@ -142,6 +142,11 @@ impl Drop for StartGuard<'_> {
 
 const LSP_RESTART_STABILITY: Duration = Duration::from_secs(10);
 
+/// Most simultaneously live-or-starting servers of ONE registry key across every root.
+// TODO(pin): primary sets this from a measurement
+const MAX_INSTANCES_PER_LANGUAGE: usize = 16;
+const _: () = assert!(MAX_INSTANCES_PER_LANGUAGE < limits::MAX_ROOTS);
+
 fn start_backoff(failures: u32) -> Instant {
     let shift = failures.saturating_sub(1).min(6);
     let seconds = limits::START_BACKOFF_INITIAL_SECS
@@ -500,6 +505,20 @@ impl LspInner {
             {
                 return Err(LspError::Bounded(
                     "LSP servers-per-root limit reached".into(),
+                ));
+            }
+            if state
+                .map
+                .iter()
+                .filter(|((_, existing_key), slot)| {
+                    existing_key == key
+                        && matches!(slot, ClientSlot::Live { .. } | ClientSlot::Starting { .. })
+                })
+                .count()
+                >= MAX_INSTANCES_PER_LANGUAGE
+            {
+                return Err(LspError::Bounded(
+                    "LSP per-language instance limit reached".into(),
                 ));
             }
             let generation = self.diag_tx.register(root, key)?;
@@ -2572,20 +2591,191 @@ mod tests {
     #[test]
     fn supervisor_bounds_roots_and_servers_per_root() {
         let (inner, _rx) = enabled_inner();
+        let languages = limits::MAX_ROOTS.div_ceil(MAX_INSTANCES_PER_LANGUAGE);
         for index in 0..limits::MAX_ROOTS {
+            let key = format!("lang{}", index % languages);
             inner
-                .client_with(Path::new(&format!("/r/{index}")), "rust", fake_client)
+                .client_with(Path::new(&format!("/r/{index}")), &key, fake_client)
                 .unwrap();
         }
         assert!(matches!(
-            inner.client_with(Path::new("/r/extra"), "rust", fake_client),
-            Err(LspError::Bounded(_))
+            inner.client_with(Path::new("/r/extra"), "lang0", fake_client),
+            Err(LspError::Bounded(message)) if message.contains("root limit")
         ));
         let long = "k".repeat(limits::MAX_IDENTITY_BYTES + 1);
         assert!(matches!(
             inner.client_with(Path::new("/r/0"), &long, fake_client),
             Err(LspError::Bounded(_))
         ));
+    }
+
+    #[test]
+    fn per_language_cap_refuses_the_next_live_server_of_the_same_key() {
+        let (inner, _rx) = enabled_inner();
+        let mut clients = Vec::new();
+        for index in 0..MAX_INSTANCES_PER_LANGUAGE {
+            clients.push(
+                inner
+                    .client_with(Path::new(&format!("/p/{index}")), "k0", fake_client)
+                    .unwrap(),
+            );
+        }
+
+        let result = inner.client_with(Path::new("/p/extra"), "k0", |_, _, _, _| {
+            panic!("a refused start must not run")
+        });
+        assert!(matches!(
+            result,
+            Err(LspError::Bounded(message)) if message == "LSP per-language instance limit reached"
+        ));
+        assert_eq!(clients.len(), MAX_INSTANCES_PER_LANGUAGE);
+    }
+
+    #[test]
+    fn per_language_cap_is_independent_per_key_and_freed_by_close() {
+        let (inner, _rx) = enabled_inner();
+        let mut clients = Vec::new();
+        for index in 0..MAX_INSTANCES_PER_LANGUAGE {
+            clients.push(
+                inner
+                    .client_with(Path::new(&format!("/p/{index}")), "k0", fake_client)
+                    .unwrap(),
+            );
+        }
+
+        assert!(
+            inner
+                .client_with(Path::new("/p/extra"), "k1", fake_client)
+                .is_ok()
+        );
+        inner.close(Path::new("/p/0"), "k0");
+        assert!(
+            inner
+                .client_with(Path::new("/p/extra"), "k0", fake_client)
+                .is_ok()
+        );
+        assert_eq!(clients.len(), MAX_INSTANCES_PER_LANGUAGE);
+    }
+
+    #[test]
+    fn per_language_cap_ignores_unavailable_and_failed_slots() {
+        let (inner, _rx) = enabled_inner();
+        for index in 0..MAX_INSTANCES_PER_LANGUAGE {
+            assert_eq!(
+                inner
+                    .client_with(
+                        Path::new(&format!("/p/unavailable-{index}")),
+                        "k0",
+                        |_, _, _, _| { Err(LspError::NotAvailable) }
+                    )
+                    .err(),
+                Some(LspError::NotAvailable)
+            );
+        }
+        assert!(matches!(
+            inner.client_with(Path::new("/p/failed"), "k0", |_, _, _, _| {
+                Err(LspError::Spawn("boom".into()))
+            }),
+            Err(LspError::Spawn(message)) if message == "boom"
+        ));
+        assert!(
+            inner
+                .client_with(Path::new("/p/live"), "k0", fake_client)
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn hung_start_counts_toward_the_per_language_cap_without_blocking_the_refusal() {
+        let (inner, _rx) = enabled_inner();
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+        let mut releases = Vec::new();
+        let mut starters = Vec::new();
+        for index in 0..MAX_INSTANCES_PER_LANGUAGE {
+            let (release_tx, release_rx) = std::sync::mpsc::channel();
+            releases.push(release_tx);
+            let starter_inner = inner.clone();
+            let starter_entered = entered_tx.clone();
+            starters.push(std::thread::spawn(move || {
+                starter_inner.client_with(
+                    Path::new(&format!("/h/{index}")),
+                    "k0",
+                    move |root, key, diagnostics, generation| {
+                        starter_entered.send(index).expect("entered receiver");
+                        release_rx.recv().expect("starter release");
+                        live_fake_client(root, key, diagnostics, generation)
+                    },
+                )
+            }));
+        }
+        for _ in 0..MAX_INSTANCES_PER_LANGUAGE {
+            entered_rx
+                .recv_timeout(Duration::from_secs(5))
+                .expect("each starter enters its initializer");
+        }
+
+        let (result_tx, result_rx) = std::sync::mpsc::channel();
+        let refusal_inner = inner.clone();
+        let refusal = std::thread::spawn(move || {
+            let result = refusal_inner.client_with(Path::new("/h/extra"), "k0", |_, _, _, _| {
+                panic!("a refused start must not run")
+            });
+            result_tx.send(result).expect("refusal result receiver");
+        });
+        let result = result_rx.recv_timeout(Duration::from_secs(5));
+        for release in releases {
+            release.send(()).expect("starter is waiting for release");
+        }
+        for starter in starters {
+            assert!(starter.join().expect("starter thread").is_ok());
+        }
+        refusal.join().expect("refusal thread");
+        assert!(matches!(
+            result.expect("refusal does not wait for hung starters"),
+            Err(LspError::Bounded(message)) if message == "LSP per-language instance limit reached"
+        ));
+    }
+
+    #[test]
+    fn hung_start_of_one_language_does_not_block_another_language_on_the_same_root() {
+        let (inner, _rx) = enabled_inner();
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let starter_inner = inner.clone();
+        let starter = std::thread::spawn(move || {
+            starter_inner.client_with(
+                Path::new("/same"),
+                "k0",
+                move |root, key, diagnostics, generation| {
+                    entered_tx.send(()).expect("entered receiver");
+                    release_rx.recv().expect("starter release");
+                    live_fake_client(root, key, diagnostics, generation)
+                },
+            )
+        });
+        entered_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("first language entered its initializer");
+
+        let (result_tx, result_rx) = std::sync::mpsc::channel();
+        let other_inner = inner.clone();
+        let other = std::thread::spawn(move || {
+            result_tx
+                .send(other_inner.client_with(Path::new("/same"), "k1", fake_client))
+                .expect("other-language result receiver");
+        });
+        let other_result = result_rx.recv_timeout(Duration::from_secs(5));
+        release_tx
+            .send(())
+            .expect("first-language starter is waiting");
+        let starter_result = starter.join().expect("starter thread");
+        other.join().expect("other-language thread");
+        assert!(starter_result.is_ok());
+        assert!(
+            other_result
+                .expect("another language starts independently")
+                .is_ok()
+        );
     }
 
     #[test]
