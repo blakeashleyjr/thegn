@@ -1580,13 +1580,19 @@ fn apply_host_call(state: &mut PluginsState, plugin: &str, msg: RpcMessage) -> P
                             ),
                         ),
                     ),
-                    Err(crate::plugins::feed_hub::SubscribeError::Spawn(_error)) => respond(
-                        entry,
-                        RpcResponse::err(
-                            id,
-                            RpcError::new(RpcErrorCode::Other, "feed bridge could not be started"),
-                        ),
-                    ),
+                    Err(crate::plugins::feed_hub::SubscribeError::Spawn(error)) => {
+                        tracing::warn!(target: "thegn::plugin", plugin = %plugin, %error, "feed hub could not start");
+                        respond(
+                            entry,
+                            RpcResponse::err(
+                                id,
+                                RpcError::new(
+                                    RpcErrorCode::Other,
+                                    "feed bridge could not be started",
+                                ),
+                            ),
+                        );
+                    }
                 }
             }
         }
@@ -3000,13 +3006,13 @@ mod tests {
     }
 
     type TestFeedSenders =
-        Arc<Mutex<Vec<tokio::sync::mpsc::UnboundedSender<thegn_core::control_wire::EventFrame>>>>;
+        Arc<Mutex<Vec<tokio::sync::mpsc::Sender<thegn_core::control_wire::EventFrame>>>>;
 
     fn feed_test_source() -> (crate::plugins::feed_hub::FeedSource, TestFeedSenders) {
         let senders = Arc::new(Mutex::new(Vec::new()));
         let source_senders = Arc::clone(&senders);
         let source: crate::plugins::feed_hub::FeedSource = Arc::new(move || {
-            let (tx, frames) = tokio::sync::mpsc::unbounded_channel();
+            let (tx, frames) = tokio::sync::mpsc::channel(16);
             source_senders
                 .lock()
                 .unwrap_or_else(|error| error.into_inner())
@@ -3142,19 +3148,23 @@ mod tests {
                 }
                 2 => {
                     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-                    while senders
-                        .lock()
-                        .unwrap_or_else(|error| error.into_inner())
-                        .is_empty()
-                        && std::time::Instant::now() < deadline
-                    {
+                    let sender = loop {
+                        let mut senders = senders.lock().unwrap_or_else(|error| error.into_inner());
+                        let open = senders.iter().filter(|sender| !sender.is_closed()).count();
+                        if open == 1 {
+                            let index = senders
+                                .iter()
+                                .position(|sender| !sender.is_closed())
+                                .expect("one open sender was counted");
+                            break senders.remove(index);
+                        }
+                        drop(senders);
+                        assert!(
+                            std::time::Instant::now() < deadline,
+                            "one active feed sender appears"
+                        );
                         std::thread::yield_now();
-                    }
-                    let sender = senders
-                        .lock()
-                        .unwrap_or_else(|error| error.into_inner())
-                        .pop()
-                        .expect("source created one sender for the active hub");
+                    };
                     drop(sender);
                     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
                     while subscription_active_from_state(&state)
