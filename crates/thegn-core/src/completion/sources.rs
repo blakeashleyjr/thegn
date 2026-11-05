@@ -482,6 +482,15 @@ mod tests {
         )
     }
 
+    #[test]
+    fn config_keys_complete_with_the_default_budget() {
+        let cfg = crate::config::Config::default();
+        let deadline = Deadline::new(crate::completion::DEFAULT_BUDGET_MS);
+        let keys =
+            ConfigSource::new(SourceKind::ConfigKey, &cfg).candidates("theme.acc", &deadline);
+        assert!(keys.iter().any(|key| key.value == "theme.accent"));
+    }
+
     /// A seeded temp DB, built through the real `Db::open_at` path (the
     /// `db_tests.rs` fixture shape) so the schema is genuinely the current one.
     fn seeded() -> (tempfile::TempDir, PathBuf) {
