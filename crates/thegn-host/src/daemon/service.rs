@@ -3952,6 +3952,131 @@ mod tests {
         );
     }
 
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "deterministic real-Git fixture, test only"
+    )]
+    fn claimed_queue_repo(claim: bool) -> (tempfile::TempDir, std::path::PathBuf) {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let git_steps: [&[&str]; 3] = [
+            &["init", "-q", "-b", "main"],
+            &[
+                "-c",
+                "user.name=t",
+                "-c",
+                "user.email=t@example.test",
+                "-c",
+                "commit.gpgsign=false",
+                "commit",
+                "-q",
+                "--allow-empty",
+                "-m",
+                "init",
+            ],
+            &["checkout", "-q", "-b", "feature"],
+        ];
+        for args in git_steps {
+            let output = thegn_core::util::git_cmd(&root)
+                .args(args)
+                .env("GIT_CONFIG_GLOBAL", "/dev/null")
+                .env("GIT_CONFIG_NOSYSTEM", "1")
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "git {args:?} failed: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+
+        use thegn_core::store::{MergeClaimRequest, WorkspaceStore, WorktreeAuxStore};
+        let db = thegn_core::db::Db::open().unwrap();
+        let root_s = root.to_string_lossy().to_string();
+        db.put_worktree("feature", &root_s, &root_s, "feature", None, None)
+            .unwrap();
+        db.enqueue_merge(&root_s, "feature", "main").unwrap();
+        if claim {
+            db.admit_merge_claim(&MergeClaimRequest {
+                worktree: root_s.clone(),
+                branch: "feature".into(),
+                repo_root: root_s.clone(),
+                target_branch: "main".into(),
+                location: String::new(),
+                expected_status: "queued".into(),
+                lease_until_ms: thegn_core::util::now_ms() + 60_000,
+                owner_hint: Some("worker-a".into()),
+            })
+            .unwrap()
+            .unwrap();
+        }
+        (dir, root)
+    }
+
+    #[tokio::test]
+    async fn merge_control_door_clear_answers_conflict_for_a_live_claim() {
+        use thegn_core::store::WorktreeAuxStore;
+        use thegn_svc::control::ControlErrorCode;
+
+        let _state = crate::testenv::IsolatedState::new();
+        let (_dir, root) = claimed_queue_repo(true);
+        let (svc, _rx) = service(0);
+        let root_s = root.to_string_lossy().to_string();
+        let error = svc.merge_clear(&root_s).await.unwrap_err();
+        assert!(matches!(&error, ControlError::Conflict(_)));
+        assert_eq!(error.code(), ControlErrorCode::Conflict);
+        assert!(error.to_string().contains("claimed by an active drain"));
+        assert!(error.to_string().contains(&root_s));
+
+        let db = thegn_core::db::Db::open().unwrap();
+        let rows = db.list_merge_queue().unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].worktree, root_s);
+        assert_eq!(rows[0].status, "queued");
+        assert_ne!(
+            db.observe_merge_claim(&root_s).unwrap().unwrap().phase,
+            "unclaimed"
+        );
+    }
+
+    #[tokio::test]
+    async fn merge_control_door_add_answers_conflict_for_a_live_claim() {
+        use thegn_core::store::WorktreeAuxStore;
+        use thegn_svc::control::ControlErrorCode;
+
+        let _state = crate::testenv::IsolatedState::new();
+        let (_dir, root) = claimed_queue_repo(true);
+        let svc = service_with_registered(&root, &root).await;
+        let root_s = root.to_string_lossy().to_string();
+        let error = svc.merge_add(&root_s).await.unwrap_err();
+        assert!(matches!(&error, ControlError::Conflict(_)));
+        assert_eq!(error.code(), ControlErrorCode::Conflict);
+
+        let db = thegn_core::db::Db::open().unwrap();
+        let rows = db.list_merge_queue().unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].worktree, root_s);
+        assert_eq!(rows[0].branch, "feature");
+        assert_eq!(rows[0].status, "queued");
+        assert_ne!(
+            db.observe_merge_claim(&root_s).unwrap().unwrap().phase,
+            "unclaimed"
+        );
+    }
+
+    #[tokio::test]
+    async fn merge_control_door_clear_removes_an_unclaimed_row() {
+        use thegn_core::store::WorktreeAuxStore;
+
+        let _state = crate::testenv::IsolatedState::new();
+        let (_dir, root) = claimed_queue_repo(false);
+        let (svc, _rx) = service(0);
+
+        assert_eq!(svc.merge_clear(&root.to_string_lossy()).await.unwrap(), 1);
+        let db = thegn_core::db::Db::open().unwrap();
+        assert!(db.list_merge_queue().unwrap().is_empty());
+    }
+
     #[tokio::test]
     async fn issue_repo_context_rejects_empty_and_relative_before_anything_else() {
         let (svc, _rx) = service(0);
