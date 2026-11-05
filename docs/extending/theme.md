@@ -25,6 +25,11 @@ A selected user theme is persisted through the existing `[theme].preset` key
 and `[theme.colors]` / `[theme.hues]` overrides. There is no separate user-theme
 config key and no export or network-import command.
 
+`thegn theme rename OLD NEW` renames a local user theme, and its file moves
+with it: the new file is written before the old one is removed. It refuses a
+built-in preset, the currently selected theme (`[theme].preset`), a name
+another theme already uses, or a name that maps to the same file.
+
 1. Add the name to `PRESETS` and a `match` arm in `preset()` in
    `crates/thegn-core/src/theme.rs`, returning a `Palette` of `"R;G;B"`
    fragments; legacy 12-slot presets are extended by `extend_palette`.
