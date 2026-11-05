@@ -142,6 +142,9 @@ pub static ROUTES: &[Route] = &[
     route("/v1/mcp_proxy/reload", &["mcp_proxy.reload"], || {
         post(http::mcp_proxy_reload)
     }),
+    route("/v1/plugins/status", &["plugins.status"], || {
+        get(http::plugins_status)
+    }),
     route("/v1/calendar/events", &["calendar.events"], || {
         get(http::calendar_events)
     }),
@@ -225,6 +228,7 @@ pub static API_CALLS: &[(&str, &str, &str)] = &[
     ("tools.run", "POST", "/v1/tools/run"),
     ("mcp_proxy.status", "GET", "/v1/mcp_proxy/status"),
     ("mcp_proxy.reload", "POST", "/v1/mcp_proxy/reload"),
+    ("plugins.status", "GET", "/v1/plugins/status"),
     ("calendar.events", "GET", "/v1/calendar/events"),
     ("calendar.clocks", "GET", "/v1/calendar/clocks"),
     (

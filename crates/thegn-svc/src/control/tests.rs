@@ -2279,3 +2279,178 @@ fn issue_listing_serializes_issues_complete_and_incomplete() {
     );
     assert_eq!(encoded["incomplete"][0]["kind"], "partial");
 }
+
+#[test]
+fn plugins_status_reply_defaults_decode_and_round_trip() {
+    let minimal: super::PluginsStatusReply =
+        serde_json::from_str(r#"{"published":false,"live":false}"#).unwrap();
+    assert_eq!(minimal, super::PluginsStatusReply::default());
+    let full = super::PluginsStatusReply {
+        published: true,
+        live: true,
+        pid: Some(17),
+        published_at_ms: Some(123),
+        rows: vec![thegn_core::plugin_status::PluginStatusRow {
+            plugin: "sample".into(),
+            rejected: 2,
+            ..Default::default()
+        }],
+    };
+    let encoded = serde_json::to_vec(&full).unwrap();
+    assert_eq!(
+        serde_json::from_slice::<super::PluginsStatusReply>(&encoded).unwrap(),
+        full
+    );
+}
+
+struct PluginsStatusApi {
+    reply: super::PluginsStatusReply,
+    calls: std::sync::atomic::AtomicUsize,
+}
+
+impl ControlApi for PluginsStatusApi {
+    fn list_sessions(&self) -> BoxFuture<'_, ControlResult<Vec<SessionInfo>>> {
+        panic!("unexpected list_sessions")
+    }
+    fn open(&self, _spec: OpenSpec) -> BoxFuture<'_, ControlResult<SessionInfo>> {
+        panic!("unexpected open")
+    }
+    fn attach<'a>(
+        &'a self,
+        _client_id: &'a str,
+        _session: &'a str,
+        _kind: AttachKind,
+        _rows: u16,
+        _cols: u16,
+        _history: bool,
+    ) -> BoxFuture<'a, ControlResult<AttachReply>> {
+        panic!("unexpected attach")
+    }
+    fn detach<'a>(
+        &'a self,
+        _client_id: &'a str,
+        _session: &'a str,
+    ) -> BoxFuture<'a, ControlResult<()>> {
+        panic!("unexpected detach")
+    }
+    fn send_input<'a>(
+        &'a self,
+        _session: &'a str,
+        _bytes: Vec<u8>,
+    ) -> BoxFuture<'a, ControlResult<()>> {
+        panic!("unexpected send_input")
+    }
+    fn resize<'a>(
+        &'a self,
+        _session: &'a str,
+        _rows: u16,
+        _cols: u16,
+    ) -> BoxFuture<'a, ControlResult<()>> {
+        panic!("unexpected resize")
+    }
+    fn snapshot<'a>(&'a self, _session: &'a str) -> BoxFuture<'a, ControlResult<EventFrame>> {
+        panic!("unexpected snapshot")
+    }
+    fn kill<'a>(&'a self, _session: &'a str) -> BoxFuture<'a, ControlResult<()>> {
+        panic!("unexpected kill")
+    }
+    fn open_worktree<'a>(
+        &'a self,
+        _repo: &'a str,
+        _branch: Option<&'a str>,
+    ) -> BoxFuture<'a, ControlResult<()>> {
+        panic!("unexpected open_worktree")
+    }
+    fn merge_add<'a>(&'a self, _worktree: &'a str) -> BoxFuture<'a, ControlResult<String>> {
+        panic!("unexpected merge_add")
+    }
+    fn merge_clear<'a>(&'a self, _worktree: &'a str) -> BoxFuture<'a, ControlResult<usize>> {
+        panic!("unexpected merge_clear")
+    }
+    fn merge_list<'a>(
+        &'a self,
+        _worktree: &'a str,
+    ) -> BoxFuture<'a, ControlResult<Vec<thegn_core::db::MergeQueueRow>>> {
+        panic!("unexpected merge_list")
+    }
+    fn pr_status(&self) -> BoxFuture<'_, ControlResult<Vec<super::PrStatusRow>>> {
+        panic!("unexpected pr_status")
+    }
+    fn notify_push(&self, _note: super::PushedNote) -> BoxFuture<'_, ControlResult<i64>> {
+        panic!("unexpected notify_push")
+    }
+    fn lease_status(&self) -> BoxFuture<'_, ControlResult<Vec<LeaseRow>>> {
+        panic!("unexpected lease_status")
+    }
+    fn plugins_status(&self) -> BoxFuture<'_, ControlResult<super::PluginsStatusReply>> {
+        self.calls
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let reply = self.reply.clone();
+        Box::pin(async move { Ok(reply) })
+    }
+    fn subscribe(&self) -> tokio::sync::broadcast::Receiver<Arc<EventFrame>> {
+        panic!("unexpected subscribe")
+    }
+    fn shutdown(&self) -> BoxFuture<'_, ()> {
+        panic!("unexpected shutdown")
+    }
+}
+
+#[tokio::test]
+async fn plugins_status_route_requires_read_scope_and_serves_the_api_result() {
+    let rig = rig(false);
+    let reply = super::PluginsStatusReply {
+        published: true,
+        live: false,
+        pid: Some(42),
+        published_at_ms: Some(456),
+        rows: vec![thegn_core::plugin_status::PluginStatusRow {
+            plugin: "route-test".into(),
+            ..Default::default()
+        }],
+    };
+    let api = Arc::new(PluginsStatusApi {
+        reply: reply.clone(),
+        calls: std::sync::atomic::AtomicUsize::new(0),
+    });
+    let mut state = rig.state.clone();
+    state.api = api.clone();
+    let no_scope = token(&rig, "");
+    let denied = Request::builder()
+        .method("GET")
+        .uri("/v1/plugins/status")
+        .header("authorization", format!("Bearer {no_scope}"))
+        .body(Body::empty())
+        .unwrap();
+    assert_eq!(
+        router(state.clone())
+            .oneshot(denied)
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::FORBIDDEN
+    );
+    assert_eq!(api.calls.load(std::sync::atomic::Ordering::Relaxed), 0);
+
+    let read = token(&rig, "read");
+    let response = router(state)
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/v1/plugins/status")
+                .header("authorization", format!("Bearer {read}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = axum::body::to_bytes(response.into_body(), 64 * 1024)
+        .await
+        .unwrap();
+    assert_eq!(
+        serde_json::from_slice::<super::PluginsStatusReply>(&body).unwrap(),
+        reply
+    );
+    assert_eq!(api.calls.load(std::sync::atomic::Ordering::Relaxed), 1);
+}

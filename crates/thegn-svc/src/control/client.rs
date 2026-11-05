@@ -1045,6 +1045,12 @@ impl ControlClient {
         Ok(serde_json::from_value(v)?)
     }
 
+    /// `GET /v1/plugins/status` — the UI's published per-plugin counters.
+    pub async fn plugins_status(&self) -> Result<super::PluginsStatusReply> {
+        let value = self.request("GET", "/v1/plugins/status", None).await?;
+        Ok(serde_json::from_value(value)?)
+    }
+
     pub async fn open_worktree(&self, repo: &str, branch: Option<&str>) -> Result<()> {
         self.request_long(
             "POST",
