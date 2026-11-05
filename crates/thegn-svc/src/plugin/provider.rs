@@ -14,6 +14,7 @@
 
 use std::collections::HashMap;
 use std::collections::hash_map::Entry;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::sync::oneshot;
@@ -29,6 +30,35 @@ pub struct ProviderBridge {
     writer: SessionWriter,
     timeout: Duration,
     pending: Mutex<Pending>,
+    counters: Counters,
+}
+
+/// Cumulative counters for one bridge (one plugin generation; a restart builds
+/// a new bridge, so they restart at zero).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct BridgeStats {
+    /// Calls admitted into the pending table.
+    pub calls: u64,
+    /// Calls that hit the plugin's reply deadline.
+    pub timed_out: u64,
+    /// Calls whose future was dropped before a terminal outcome (caller cancellation).
+    pub cancelled: u64,
+    /// Replies that matched no waiter (late after timeout or cancellation, duplicate, or unknown id).
+    pub late_replies: u64,
+    /// Replies carrying neither or both of `result` and `error`.
+    pub malformed: u64,
+    /// Pending calls woken with a closed-session failure.
+    pub closed_wakeups: u64,
+}
+
+#[derive(Default)]
+struct Counters {
+    calls: AtomicU64,
+    timed_out: AtomicU64,
+    cancelled: AtomicU64,
+    late_replies: AtomicU64,
+    malformed: AtomicU64,
+    closed_wakeups: AtomicU64,
 }
 
 struct Pending {
@@ -39,10 +69,17 @@ struct Pending {
 struct PendingGuard<'a> {
     bridge: &'a ProviderBridge,
     id: u64,
+    finished: bool,
 }
 
 impl Drop for PendingGuard<'_> {
     fn drop(&mut self) {
+        if !self.finished {
+            self.bridge
+                .counters
+                .cancelled
+                .fetch_add(1, Ordering::Relaxed);
+        }
         drop(
             self.bridge
                 .pending
@@ -89,6 +126,7 @@ impl ProviderBridge {
                 closed: None,
                 calls: HashMap::new(),
             }),
+            counters: Counters::default(),
         });
         let closing = Arc::downgrade(&bridge);
         let routing = Arc::downgrade(&bridge);
@@ -115,8 +153,27 @@ impl ProviderBridge {
             pending.closed = Some(error);
             std::mem::take(&mut pending.calls)
         };
+        let woken = pending.len();
+        if woken > 0 {
+            self.counters
+                .closed_wakeups
+                .fetch_add(woken as u64, Ordering::Relaxed);
+        }
         for (_, sender) in pending {
             drop(sender.send(Err(error)));
+        }
+    }
+
+    /// Read the cumulative counters for this bridge generation without locking
+    /// the pending table or doing I/O.
+    pub fn stats(&self) -> BridgeStats {
+        BridgeStats {
+            calls: self.counters.calls.load(Ordering::Relaxed),
+            timed_out: self.counters.timed_out.load(Ordering::Relaxed),
+            cancelled: self.counters.cancelled.load(Ordering::Relaxed),
+            late_replies: self.counters.late_replies.load(Ordering::Relaxed),
+            malformed: self.counters.malformed.load(Ordering::Relaxed),
+            closed_wakeups: self.counters.closed_wakeups.load(Ordering::Relaxed),
         }
     }
 
@@ -129,9 +186,18 @@ impl ProviderBridge {
             pending.calls.remove(&resp.id)
         };
         match tx {
-            // best-effort: the caller may have timed out and gone.
-            Some(tx) => tx.send(Ok(resp)).is_ok(),
-            None => false,
+            Some(tx) => {
+                if tx.send(Ok(resp)).is_err() {
+                    self.counters.late_replies.fetch_add(1, Ordering::Relaxed);
+                    false
+                } else {
+                    true
+                }
+            }
+            None => {
+                self.counters.late_replies.fetch_add(1, Ordering::Relaxed);
+                false
+            }
         }
     }
 
@@ -170,10 +236,15 @@ impl ProviderBridge {
                 }
                 Entry::Vacant(slot) => {
                     slot.insert(tx);
+                    self.counters.calls.fetch_add(1, Ordering::Relaxed);
                 }
             }
         }
-        let _pending_guard = PendingGuard { bridge: self, id };
+        let mut pending_guard = PendingGuard {
+            bridge: self,
+            id,
+            finished: false,
+        };
         let msg = RpcMessage {
             id: Some(id),
             method: PROVIDER_CALL_METHOD.to_string(),
@@ -181,16 +252,27 @@ impl ProviderBridge {
         };
         let sent = self.writer.send_json(&msg);
         if let Err(e) = sent {
+            pending_guard.finished = true;
             return Err(BridgeError::Transport(e.to_string()));
         }
-        match tokio::time::timeout_at(deadline, rx).await {
-            Ok(Ok(Ok(resp))) => classify(resp, seam, op),
+        let outcome = tokio::time::timeout_at(deadline, rx).await;
+        pending_guard.finished = true;
+        match outcome {
+            Ok(Ok(Ok(resp))) => {
+                if resp.result.is_some() == resp.error.is_some() {
+                    self.counters.malformed.fetch_add(1, Ordering::Relaxed);
+                }
+                classify(resp, seam, op)
+            }
             Ok(Ok(Err(error))) => Err(BridgeError::Transport(error.to_string())),
             Ok(Err(_)) => Err(BridgeError::Transport("bridge dropped".into())),
-            Err(_) => Err(BridgeError::Transport(format!(
-                "no reply to {seam}.{op} within {:?}",
-                self.timeout
-            ))),
+            Err(_) => {
+                self.counters.timed_out.fetch_add(1, Ordering::Relaxed);
+                Err(BridgeError::Transport(format!(
+                    "no reply to {seam}.{op} within {:?}",
+                    self.timeout
+                )))
+            }
         }
     }
 }
@@ -1487,6 +1569,162 @@ done
                 "an oversized request must be TooLarge every time, never Full"
             );
             assert!(bridge.pending.lock().unwrap().calls.is_empty());
+        }
+    }
+
+    mod bridge_stats {
+        use super::*;
+
+        fn routed_bridge(
+            script: &str,
+            timeout: Duration,
+        ) -> (FixtureSupervisor, ResidentSession, Arc<ProviderBridge>) {
+            let bridge_slot: Arc<Mutex<Option<Arc<ProviderBridge>>>> = Arc::new(Mutex::new(None));
+            let route = Arc::clone(&bridge_slot);
+            let fixture = FixtureSupervisor::new();
+            let session = fixture
+                .spawn(&sh(script), &BTreeMap::new(), None, move |event| {
+                    if let SessionEvent::Response(response) = event
+                        && let Some(bridge) = route.lock().unwrap().as_ref()
+                    {
+                        bridge.resolve(response);
+                    }
+                })
+                .unwrap();
+            let bridge = ProviderBridge::new(session.writer(), timeout);
+            *bridge_slot.lock().unwrap() = Some(Arc::clone(&bridge));
+            (fixture, session, bridge)
+        }
+
+        #[test]
+        fn bridge_stats_count_calls_and_timeouts() {
+            let fixture = FixtureSupervisor::new();
+            let session = fixture
+                .spawn(
+                    &sh("while read -r _; do :; done"),
+                    &BTreeMap::new(),
+                    None,
+                    |_| {},
+                )
+                .unwrap();
+            let bridge = ProviderBridge::new(session.writer(), Duration::from_millis(200));
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+
+            assert!(
+                rt.block_on(bridge.call("issues", "list_issues", serde_json::json!({})))
+                    .is_err()
+            );
+            assert_eq!(
+                bridge.stats(),
+                BridgeStats {
+                    calls: 1,
+                    timed_out: 1,
+                    ..Default::default()
+                }
+            );
+            session.kill();
+        }
+
+        #[test]
+        fn bridge_stats_count_cancelled_call_futures() {
+            let fixture = FixtureSupervisor::new();
+            let session = fixture
+                .spawn(
+                    &sh("while read -r _; do :; done"),
+                    &BTreeMap::new(),
+                    None,
+                    |_| {},
+                )
+                .unwrap();
+            let bridge = ProviderBridge::new(session.writer(), Duration::from_secs(30));
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+
+            assert!(
+                rt.block_on(tokio::time::timeout(
+                    Duration::from_millis(300),
+                    bridge.call("issues", "list_issues", serde_json::json!({})),
+                ))
+                .is_err()
+            );
+            assert_eq!(bridge.stats().calls, 1);
+            assert_eq!(bridge.stats().cancelled, 1);
+            assert_eq!(bridge.stats().timed_out, 0);
+            session.kill();
+        }
+
+        #[test]
+        fn bridge_stats_count_malformed_replies() {
+            let script = r#"read -r a; id=${a#*'"id":'}; id=${id%%,*}; printf '{"id":%s}\n' "$id"; read -r b; id=${b#*'"id":'}; id=${id%%,*}; printf '{"id":%s,"result":1,"error":{"code":"other","message":"x"}}\n' "$id"; while read -r _; do :; done"#;
+            let (_fixture, _session, bridge) = routed_bridge(script, Duration::from_secs(5));
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+
+            for _ in 0..2 {
+                assert!(matches!(
+                    rt.block_on(bridge.call("issues", "list_issues", serde_json::json!({}))),
+                    Err(BridgeError::Transport(_))
+                ));
+            }
+            assert_eq!(bridge.stats().calls, 2);
+            assert_eq!(bridge.stats().malformed, 2);
+        }
+
+        #[test]
+        fn bridge_stats_count_late_and_unknown_replies() {
+            let (_fixture, _session, bridge) = live_bridge();
+            assert!(!bridge.resolve(RpcResponse::ok(424242, serde_json::Value::Null)));
+            assert_eq!(bridge.stats().late_replies, 1);
+
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            assert!(
+                rt.block_on(bridge.call("issues", "list_issues", serde_json::json!({})))
+                    .is_ok()
+            );
+            assert_eq!(bridge.stats().late_replies, 1);
+            assert_eq!(bridge.stats().calls, 1);
+            assert_eq!(bridge.stats().malformed, 0);
+
+            let (sender, receiver) = oneshot::channel();
+            drop(receiver);
+            assert!(
+                bridge
+                    .pending
+                    .lock()
+                    .unwrap()
+                    .calls
+                    .insert(424243, sender)
+                    .is_none()
+            );
+            assert!(!bridge.resolve(RpcResponse::ok(424243, serde_json::Value::Null)));
+            assert_eq!(bridge.stats().late_replies, 2);
+        }
+
+        #[test]
+        fn bridge_stats_count_closed_wakeups() {
+            let (_fixture, _session, bridge) =
+                routed_bridge("read -r _; exec 1>&-; sleep 30", Duration::from_secs(30));
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+
+            assert!(
+                rt.block_on(bridge.call("fixture", "eof", serde_json::Value::Null))
+                    .is_err()
+            );
+            assert_eq!(bridge.stats().closed_wakeups, 1);
+            assert_eq!(bridge.stats().timed_out, 0);
         }
     }
 }

@@ -747,7 +747,20 @@ fn flush_alerts_with(state: &mut PluginsState, submit: impl FnOnce(Vec<(String, 
         .dispatcher
         .as_ref()
         .map_or_else(BTreeMap::new, Dispatcher::in_flight);
-    crate::plugin_stats::publish(state.counters.rows(&in_flight));
+    let bridge: BTreeMap<String, thegn_svc::plugin::BridgeStats> = state
+        .plugins
+        .iter()
+        .filter_map(|(id, entry)| {
+            entry
+                .bridge
+                .as_ref()
+                .map(|bridge| (id.clone(), bridge.stats()))
+        })
+        .collect();
+    crate::plugin_stats::publish(crate::plugin_stats::merge_bridge(
+        state.counters.rows(&in_flight),
+        &bridge,
+    ));
     let alerts = std::mem::take(&mut state.pending_alerts);
     for (plugin, dropped) in std::mem::take(&mut state.pending_alert_drops) {
         tracing::warn!(target: "thegn::plugin", plugin = %plugin, dropped, cap = MAX_PENDING_ALERTS_PER_PLUGIN, "plugin alerts dropped: per-drain outbox cap reached");
@@ -2666,6 +2679,50 @@ mod tests {
             !crate::plugin_stats::snapshot()
                 .iter()
                 .any(|row| row.plugin == "cnt-c")
+        );
+        crate::plugin_stats::publish(Vec::new());
+    }
+
+    #[test]
+    fn plugin_counters_flush_publishes_bridge_stats() {
+        let _guard = crate::plugin_stats::TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut state = state_with(vec![seg_spec("cnt-d")]);
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .unwrap();
+        let supervisor = thegn_svc::plugin::ResidentSupervisor::new(runtime.handle().clone());
+        let session = thegn_svc::plugin::ResidentSession::spawn(
+            &supervisor,
+            "fixture",
+            &["sh".into(), "-c".into(), "cat >/dev/null".into()],
+            &Default::default(),
+            None,
+            |_| {},
+        )
+        .unwrap();
+        let writer = session.writer();
+        session.kill();
+        assert!(
+            runtime
+                .block_on(supervisor.shutdown_until(
+                    tokio::time::Instant::now() + std::time::Duration::from_secs(3)
+                ))
+                .is_settled()
+        );
+        let bridge =
+            thegn_svc::plugin::ProviderBridge::new(writer, std::time::Duration::from_millis(50));
+        assert!(!bridge.resolve(RpcResponse::ok(424242, serde_json::Value::Null)));
+        state.plugins.get_mut("cnt-d").unwrap().bridge = Some(bridge);
+
+        flush_alerts_with(&mut state, |_| {});
+        assert!(
+            crate::plugin_stats::snapshot()
+                .iter()
+                .any(|row| row.plugin == "cnt-d" && row.bridge.late_replies == 1)
         );
         crate::plugin_stats::publish(Vec::new());
     }
