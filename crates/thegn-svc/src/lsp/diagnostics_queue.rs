@@ -84,6 +84,39 @@ pub struct QueueFootprint {
     pub active_streams: usize,
 }
 
+/// Cumulative queue outcomes. Shutdown resets these with the queue state.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct QueueCounters {
+    pub admitted: u64,
+    pub replaced: u64,
+    pub evicted: u64,
+    pub rejected_capacity: u64,
+    pub stale_rejected: u64,
+    pub purged_on_retire: u64,
+    pub delivered: u64,
+}
+
+/// Age observation for queued diagnostics. `Unobserved` means timing is off,
+/// or pending entries were admitted before timing began; it is never an empty
+/// queue report.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BacklogAge {
+    Unobserved,
+    Empty,
+    Oldest(std::time::Duration),
+}
+
+/// A bounded-cardinality snapshot of the diagnostics bus queue.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct QueueStats {
+    pub counters: QueueCounters,
+    pub pending_documents: usize,
+    pub pending_bytes: usize,
+    pub ready_roots: usize,
+    pub active_streams: usize,
+    pub backlog_age: BacklogAge,
+}
+
 #[derive(Debug)]
 struct StreamState {
     generation: u64,
@@ -96,8 +129,10 @@ struct StreamState {
 struct Entry {
     publication: PublishedDiagnostics,
     cost: usize,
+    admitted_at: Option<std::time::Instant>,
 }
 
+/// Queue counters and timing are reset with the rest of the state on shutdown.
 #[derive(Debug)]
 struct QueueState {
     /// root → server identity → current stream.
@@ -116,6 +151,8 @@ struct QueueState {
     retired_dirty: bool,
     wake_pending: bool,
     closed: bool,
+    counters: QueueCounters,
+    timing: bool,
 }
 
 impl Default for QueueState {
@@ -133,6 +170,8 @@ impl Default for QueueState {
             retired_dirty: false,
             wake_pending: false,
             closed: false,
+            counters: QueueCounters::default(),
+            timing: false,
         }
     }
 }
@@ -301,6 +340,7 @@ impl QueueState {
             return false;
         };
         self.remove_pending(&victim); // the loss is recorded below
+        self.counters.evicted = self.counters.evicted.saturating_add(1);
         self.health.dropped = self.health.dropped.saturating_add(1);
         self.mark_loss(victim);
         true
@@ -474,6 +514,7 @@ impl DiagnosticsSender {
         let notify = &self.shared.notify;
         if !state.is_current(root, identity, generation) {
             state.health.stale = state.health.stale.saturating_add(1);
+            state.counters.stale_rejected = state.counters.stale_rejected.saturating_add(1);
             state.signal(notify);
             return;
         }
@@ -522,11 +563,13 @@ impl DiagnosticsSender {
             .filter(|stream| stream.generation == pd.generation)
         else {
             state.health.stale = state.health.stale.saturating_add(1);
+            state.counters.stale_rejected = state.counters.stale_rejected.saturating_add(1);
             state.signal(notify);
             return;
         };
         if pd.sequence <= stream.last_sequence {
             state.health.stale = state.health.stale.saturating_add(1);
+            state.counters.stale_rejected = state.counters.stale_rejected.saturating_add(1);
             state.signal(notify);
             return;
         }
@@ -546,17 +589,22 @@ impl DiagnosticsSender {
                 // Delivering the superseded value would show stale data as
                 // current; drop it too and mark the document lost.
                 state.remove_pending(&key); // superseded; loss recorded below
+                state.counters.rejected_capacity =
+                    state.counters.rejected_capacity.saturating_add(1);
                 state.health.dropped = state.health.dropped.saturating_add(1);
                 state.mark_loss(key);
             } else {
                 state.bytes = state.bytes.saturating_sub(old_cost).saturating_add(cost);
                 state.clear_loss(&key);
+                let kept = state.pending.get(&key).and_then(|entry| entry.admitted_at);
                 if let Some(entry) = state.pending.get_mut(&key) {
                     *entry = Entry {
                         publication: pd,
                         cost,
+                        admitted_at: kept,
                     };
                 }
+                state.counters.replaced = state.counters.replaced.saturating_add(1);
             }
             state.signal(notify);
             return;
@@ -570,6 +618,7 @@ impl DiagnosticsSender {
         };
         let needed = cost.saturating_add(root_cost);
         if needed > limits::MAX_QUEUE_BYTES {
+            state.counters.rejected_capacity = state.counters.rejected_capacity.saturating_add(1);
             state.health.dropped = state.health.dropped.saturating_add(1);
             state.mark_loss(key);
             state.signal(notify);
@@ -596,6 +645,7 @@ impl DiagnosticsSender {
         if state.pending.len() >= limits::MAX_QUEUE_DOCUMENTS
             || state.bytes.saturating_add(cost).saturating_add(root_cost) > limits::MAX_QUEUE_BYTES
         {
+            state.counters.rejected_capacity = state.counters.rejected_capacity.saturating_add(1);
             state.health.dropped = state.health.dropped.saturating_add(1);
             state.mark_loss(key);
             state.signal(notify);
@@ -610,13 +660,20 @@ impl DiagnosticsSender {
         if let Some(queue) = state.per_root.get_mut(&key.root) {
             queue.push_back(key.clone());
         }
+        let stamp = if state.timing {
+            Some(std::time::Instant::now())
+        } else {
+            None
+        };
         state.pending.insert(
             key,
             Entry {
                 publication: pd,
                 cost,
+                admitted_at: stamp,
             },
         );
+        state.counters.admitted = state.counters.admitted.saturating_add(1);
         state.signal(notify);
     }
 }
@@ -650,6 +707,10 @@ fn retire_locked(state: &mut QueueState, root: &Path, identity: &str, generation
                 .collect()
         })
         .unwrap_or_default();
+    state.counters.purged_on_retire = state
+        .counters
+        .purged_on_retire
+        .saturating_add(doomed.len() as u64);
     for key in doomed {
         state.remove_pending(&key); // retired stream: nothing to deliver
     }
@@ -669,6 +730,43 @@ fn retire_locked(state: &mut QueueState, root: &Path, identity: &str, generation
 }
 
 impl DiagnosticsReceiver {
+    /// Enable or disable admission timestamps used for backlog-age reporting.
+    /// This only updates queue state; it does not signal or wake the consumer.
+    pub fn set_timing(&self, on: bool) {
+        if let Some(mut state) = self.shared.lock() {
+            state.timing = on;
+        }
+    }
+
+    /// Snapshot queue counts, retained bytes, and optional oldest pending age.
+    /// `None` means the mutex was poisoned, a missing observation rather than
+    /// an empty queue.
+    pub fn queue_stats(&self) -> Option<QueueStats> {
+        let state = self.shared.lock()?;
+        let backlog_age = if !state.timing {
+            BacklogAge::Unobserved
+        } else if state.pending.is_empty() {
+            BacklogAge::Empty
+        } else {
+            let oldest = state
+                .pending
+                .values()
+                .filter_map(|entry| entry.admitted_at)
+                .min();
+            oldest.map_or(BacklogAge::Unobserved, |instant| {
+                BacklogAge::Oldest(std::time::Instant::now().saturating_duration_since(instant))
+            })
+        };
+        Some(QueueStats {
+            counters: state.counters,
+            pending_documents: state.pending.len(),
+            pending_bytes: state.bytes,
+            ready_roots: state.per_root.len(),
+            active_streams: state.active.values().map(HashMap::len).sum(),
+            backlog_age,
+        })
+    }
+
     /// Block until the host must look at the queue, then consume the wake
     /// obligation. Returns `false` once the bus is shut down.
     pub fn wait(&self) -> bool {
@@ -727,8 +825,10 @@ impl DiagnosticsReceiver {
             // nothing that is no longer current is ever handed out.
             if !state.is_current(&pd.root, &pd.server_identity, pd.generation) {
                 state.health.stale = state.health.stale.saturating_add(1);
+                state.counters.stale_rejected = state.counters.stale_rejected.saturating_add(1);
                 continue;
             }
+            state.counters.delivered = state.counters.delivered.saturating_add(1);
             return Ok(pd);
         }
         if state.closed {
@@ -1355,5 +1455,242 @@ mod tests {
         assert!(delivered > 0);
         // One bounded obligation: never more wakes than admissions + re-arms.
         assert!(wakes <= 4 * 500 + delivered / 8 + 1, "wakes={wakes}");
+    }
+
+    mod queue_stats {
+        use super::*;
+
+        #[test]
+        fn counts_admission_replacement_and_delivery_exactly() {
+            let (tx, rx) = diagnostics_channel();
+            let generation = tx.register(Path::new("/r"), "rust").unwrap();
+            assert_conserved(&rx);
+            tx.publish(pd(
+                "/r",
+                "rust",
+                generation,
+                1,
+                "/r/a.rs",
+                vec![diag("one")],
+            ));
+            assert_conserved(&rx);
+            tx.publish(pd(
+                "/r",
+                "rust",
+                generation,
+                2,
+                "/r/a.rs",
+                vec![diag("two")],
+            ));
+            assert_conserved(&rx);
+            tx.publish(pd(
+                "/r",
+                "rust",
+                generation,
+                3,
+                "/r/b.rs",
+                vec![diag("three")],
+            ));
+            assert_conserved(&rx);
+
+            let stats = rx.queue_stats().unwrap();
+            assert_eq!(stats.counters.admitted, 2);
+            assert_eq!(stats.counters.replaced, 1);
+            assert_eq!(stats.counters.delivered, 0);
+            assert_eq!(stats.pending_documents, 2);
+            assert_eq!(stats.pending_bytes, assert_conserved(&rx).bytes);
+            assert_eq!(stats.ready_roots, 1);
+            assert_eq!(stats.active_streams, 1);
+
+            rx.try_recv().unwrap();
+            assert_conserved(&rx);
+            rx.try_recv().unwrap();
+            assert_conserved(&rx);
+            let stats = rx.queue_stats().unwrap();
+            assert_eq!(stats.counters.delivered, 2);
+            assert_eq!(stats.pending_documents, 0);
+            assert_eq!(stats.pending_bytes, 0);
+            assert_eq!(stats.ready_roots, 0);
+        }
+
+        #[test]
+        fn counts_stale_and_retire_purges() {
+            let (tx, rx) = diagnostics_channel();
+            let generation = tx.register(Path::new("/r"), "rust").unwrap();
+            tx.publish(pd("/r", "rust", generation + 99, 1, "/r/wrong.rs", vec![]));
+            tx.publish(pd("/r", "rust", generation, 1, "/r/a.rs", vec![]));
+            tx.publish(pd("/r", "rust", generation, 1, "/r/a.rs", vec![]));
+            let stats = rx.queue_stats().unwrap();
+            assert_eq!(stats.counters.stale_rejected, 2);
+            assert_eq!(stats.counters.admitted, 1);
+
+            tx.publish(pd("/r", "rust", generation, 2, "/r/b.rs", vec![]));
+            assert_conserved(&rx);
+            assert!(tx.retire(Path::new("/r"), "rust", generation));
+            assert_conserved(&rx);
+            let stats = rx.queue_stats().unwrap();
+            assert_eq!(stats.counters.purged_on_retire, 2);
+            assert_eq!(stats.pending_documents, 0);
+        }
+
+        #[test]
+        fn counts_stale_lost_publications_and_defensive_delivery_rejection() {
+            let (tx, rx) = diagnostics_channel();
+            let generation = tx.register(Path::new("/r"), "rust").unwrap();
+            tx.mark_lost(Path::new("/r"), "rust", generation + 1, Some("/r/a.rs"));
+            assert_eq!(rx.queue_stats().unwrap().counters.stale_rejected, 1);
+
+            tx.publish(pd("/r", "rust", generation, 1, "/r/a.rs", vec![]));
+            rx.shared.lock().unwrap().active.clear();
+            assert!(matches!(rx.try_recv(), Err(TryRecvError::Empty)));
+            assert_eq!(rx.queue_stats().unwrap().counters.stale_rejected, 2);
+        }
+
+        #[test]
+        fn counts_capacity_rejections_for_new_and_replaced_documents() {
+            let (tx, rx) = diagnostics_channel();
+            let generation = tx.register(Path::new("/r"), "rust").unwrap();
+            tx.publish(pd(
+                "/r",
+                "rust",
+                generation,
+                1,
+                "/r/too-large.rs",
+                vec![diag(&"x".repeat(limits::MAX_QUEUE_BYTES))],
+            ));
+            assert_eq!(rx.queue_stats().unwrap().counters.rejected_capacity, 1);
+            tx.publish(pd("/r", "rust", generation, 2, "/r/a.rs", vec![]));
+            tx.publish(pd(
+                "/r",
+                "rust",
+                generation,
+                3,
+                "/r/a.rs",
+                vec![diag(&"y".repeat(limits::MAX_QUEUE_BYTES))],
+            ));
+            let stats = rx.queue_stats().unwrap();
+            assert_eq!(stats.counters.admitted, 1);
+            assert_eq!(stats.counters.rejected_capacity, 2);
+            assert_eq!(stats.pending_documents, 0);
+            assert_conserved(&rx);
+        }
+
+        #[test]
+        fn counts_capacity_eviction_at_256_documents() {
+            let (tx, rx) = diagnostics_channel();
+            let generation = tx.register(Path::new("/r"), "rust").unwrap();
+            for sequence in 1..=limits::MAX_QUEUE_DOCUMENTS + 1 {
+                tx.publish(pd(
+                    "/r",
+                    "rust",
+                    generation,
+                    sequence as u64,
+                    &format!("/r/f{sequence}.rs"),
+                    vec![],
+                ));
+            }
+            let stats = rx.queue_stats().unwrap();
+            assert_eq!(stats.counters.admitted, 257);
+            assert_eq!(stats.counters.evicted, 1);
+            assert_eq!(stats.pending_documents, 256);
+            assert_conserved(&rx);
+        }
+
+        #[test]
+        fn backlog_age_is_unobserved_empty_then_oldest() {
+            let (tx, rx) = diagnostics_channel();
+            let generation = tx.register(Path::new("/r"), "rust").unwrap();
+            tx.publish(pd("/r", "rust", generation, 1, "/r/unstamped.rs", vec![]));
+            assert_eq!(
+                rx.queue_stats().unwrap().backlog_age,
+                BacklogAge::Unobserved
+            );
+
+            rx.try_recv().unwrap();
+            rx.set_timing(true);
+            assert_eq!(rx.queue_stats().unwrap().backlog_age, BacklogAge::Empty);
+            tx.publish(pd("/r", "rust", generation, 2, "/r/a.rs", vec![]));
+            std::thread::sleep(std::time::Duration::from_millis(5));
+            let age = rx.queue_stats().unwrap().backlog_age;
+            assert!(
+                matches!(age, BacklogAge::Oldest(duration) if duration >= std::time::Duration::from_millis(5))
+            );
+
+            rx.try_recv().unwrap();
+            rx.set_timing(false);
+            tx.publish(pd("/r", "rust", generation, 3, "/r/before.rs", vec![]));
+            rx.set_timing(true);
+            assert_eq!(
+                rx.queue_stats().unwrap().backlog_age,
+                BacklogAge::Unobserved
+            );
+            tx.publish(pd("/r", "rust", generation, 4, "/r/after.rs", vec![]));
+            assert!(matches!(
+                rx.queue_stats().unwrap().backlog_age,
+                BacklogAge::Oldest(_)
+            ));
+        }
+
+        #[test]
+        fn replacement_keeps_the_oldest_stamp() {
+            let (tx, rx) = diagnostics_channel();
+            let generation = tx.register(Path::new("/r"), "rust").unwrap();
+            rx.set_timing(true);
+            tx.publish(pd("/r", "rust", generation, 1, "/r/a.rs", vec![]));
+            std::thread::sleep(std::time::Duration::from_millis(5));
+            tx.publish(pd("/r", "rust", generation, 2, "/r/a.rs", vec![]));
+            assert!(matches!(
+                rx.queue_stats().unwrap().backlog_age,
+                BacklogAge::Oldest(duration) if duration >= std::time::Duration::from_millis(5)
+            ));
+        }
+
+        #[test]
+        fn shutdown_zeroes_counters_and_stats_stay_available() {
+            let (tx, rx) = diagnostics_channel();
+            let generation = tx.register(Path::new("/r"), "rust").unwrap();
+            rx.set_timing(true);
+            tx.publish(pd("/r", "rust", generation, 1, "/r/a.rs", vec![]));
+            rx.try_recv().unwrap();
+            assert_eq!(rx.queue_stats().unwrap().counters.delivered, 1);
+            rx.shutdown();
+            assert_eq!(
+                rx.queue_stats(),
+                Some(QueueStats {
+                    counters: QueueCounters::default(),
+                    pending_documents: 0,
+                    pending_bytes: 0,
+                    ready_roots: 0,
+                    active_streams: 0,
+                    backlog_age: BacklogAge::Unobserved,
+                })
+            );
+        }
+
+        #[test]
+        fn footprint_stays_exact_with_timing_on_and_off() {
+            for timing in [false, true] {
+                let (tx, rx) = diagnostics_channel();
+                let generation = tx.register(Path::new("/r"), "rust").unwrap();
+                rx.set_timing(timing);
+                assert_conserved(&rx);
+                for sequence in 1..=limits::MAX_QUEUE_DOCUMENTS + 2 {
+                    let path = if sequence == 2 {
+                        "/r/f1.rs".to_string()
+                    } else {
+                        format!("/r/f{sequence}.rs")
+                    };
+                    tx.publish(pd(
+                        "/r",
+                        "rust",
+                        generation,
+                        sequence as u64,
+                        &path,
+                        vec![diag("payload")],
+                    ));
+                    assert_conserved(&rx);
+                }
+            }
+        }
     }
 }
