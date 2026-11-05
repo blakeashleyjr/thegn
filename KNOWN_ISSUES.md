@@ -53,7 +53,7 @@ reproducible problems that are not listed here.
   automatic draining.** If the host cannot verify the provider source, it holds
   the row for review rather than folding it. See
   [`docs/help/merge-queue.md`](docs/help/merge-queue.md#across-hosts).
-- Remote and provider surfaces remain under the deferred THE-41 audit; do not
+- Remote and provider surfaces have a deferred security audit; do not
   treat RDP, VNC, Telnet, SFTP, serial, public sharing, or multi-user parity as
   product promises.
 
@@ -75,8 +75,10 @@ reproducible problems that are not listed here.
   and WSL/WSL2 sandbox binds are best-effort and unverified.
 - Provider placements without an enforceable isolation request are reported as
   `provider-managed (unverified)`; their isolation is not verified by thegn.
-- The `remote`, `providers`, `observe`, `placement`, and `voice` subsystems are
-  dev-channel only. Their hardening and behavior are not public-alpha promises.
+- The `remote`, `providers`, `placement`, and `voice` subsystems are
+  dev-channel only (experimental). Their hardening and behavior are not
+  public-alpha promises. Observe dashboards and plugin app tabs are available
+  on the stable channel; plugin processes are native and unsandboxed.
 
 ## Distribution
 
