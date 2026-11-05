@@ -7428,16 +7428,15 @@ async fn event_loop<T: Terminal>(
         && let Some(db) = startup_db.as_ref()
     {
         for row in db.list_shares().unwrap_or_default() {
-            if crate::share::restore_skips_live_foreign_owner(
+            match crate::share::restore_plan(
                 &row,
                 std::process::id(),
                 crate::platform::process_start_ticks,
             ) {
-                tracing::debug!(target: "thegn::share", worktree = %row.worktree, port = row.local_port, "share restore skipped: a live share start process owns it");
-                continue;
-            }
-            if row.state == "up" {
-                match share_supervisor.start(
+                crate::share::RestorePlan::Skip => {
+                    tracing::debug!(target: "thegn::share", worktree = %row.worktree, port = row.local_port, "share restore skipped: a live share start process owns it");
+                }
+                crate::share::RestorePlan::Start => match share_supervisor.start(
                     // best-effort: restore: a failed share restart is re-attempted on the next launch
                     &keymap.config().share,
                     &row.worktree,
@@ -7472,9 +7471,35 @@ async fn event_loop<T: Terminal>(
                         }
                     }
                     Err(error) => {
-                        tracing::debug!(target: "thegn::share", %error, worktree = %row.worktree, port = row.local_port, "share resurrection start failed")
+                        tracing::debug!(target: "thegn::share", %error, worktree = %row.worktree, port = row.local_port, "share resurrection start failed");
+                        // best-effort: restore bookkeeping; git/provider is the truth
+                        let failed_row = row.clone();
+                        crate::db_task::persist(move |db| {
+                            if let Err(error) = crate::share::mark_restored_row(
+                                db,
+                                &failed_row,
+                                thegn_core::share::ShareState::Unknown,
+                            ) {
+                                tracing::debug!(target: "thegn::share", %error, "share restore could not record the unknown state")
+                            }
+                        });
                     }
+                },
+                crate::share::RestorePlan::MarkFailed => {
+                    // best-effort: restore bookkeeping; git/provider is the truth
+                    let failed_row = row.clone();
+                    crate::db_task::persist(move |db| {
+                        if let Err(error) = crate::share::mark_restored_row(
+                            db,
+                            &failed_row,
+                            thegn_core::share::ShareState::Failed,
+                        ) {
+                            tracing::debug!(target: "thegn::share", %error, "share restore could not record the failed state")
+                        }
+                    });
+                    tracing::debug!(target: "thegn::share", worktree = %row.worktree, port = row.local_port, "share restore: the owner of a starting share exited; recorded as failed");
                 }
+                crate::share::RestorePlan::Leave => {}
             }
         }
     }
