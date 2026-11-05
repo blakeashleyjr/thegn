@@ -48,6 +48,10 @@ is not shown in rail mode. The bottom-bar summary is opt-in: set
   source tip, the target base and the result OID of the landing (`--json` adds
   a `landed` object, `null` when the row is not landed); rows landed by
   `thegn land` or before schema v107 show only what was recorded.
+- `thegn merge list --json` and control `merges.list` rows carry
+  `identity_drift`: `null`, or `{"reason": ...}` when the row is held because
+  its branch or worktree identity changed since it was queued. Re-enqueue with
+  `thegn merge add` to adopt the new identity.
 - The Merge queue panel shows the same claim: a held row is marked `claimed`,
   and Full view names the owner, claim phase and lease (or says an expired
   claim is recoverable).

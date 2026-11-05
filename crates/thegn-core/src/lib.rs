@@ -222,6 +222,7 @@ pub mod media;
 pub mod mem_health;
 pub mod merge_classify;
 pub mod merge_guard;
+pub mod merge_identity_drift;
 pub mod merge_lifecycle;
 pub mod merge_queue_view;
 pub mod merge_sweep;
