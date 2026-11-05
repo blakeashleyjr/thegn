@@ -462,6 +462,8 @@ unwritable mount or replaced binary. `NOT PROVEN` means the platform or
 backend is unsupported by this check; it is not a pass. The row is absent
 from `--json` and describes the current worktree's sandbox composition, not
 a live agent run. The check supports bwrap, podman, docker and smol.
+A stage whose agent relocates its credential home (for example `CODEX_HOME`) is also checked: a missing home directory reports
+`provider-home-unavailable`.
 
 The honest **isolation class**, weakest to strongest:
 
