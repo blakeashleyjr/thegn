@@ -200,6 +200,9 @@ pub(crate) fn render_text(outcome: &Outcome) -> Vec<String> {
             if !detail.comments_complete {
                 lines.push("(comments incomplete: the provider returned a partial page)".into());
             }
+            if !detail.labels_complete {
+                lines.push("(labels incomplete: the provider returned a partial page)".into());
+            }
             lines
         }
         Outcome::Updated(issue) => vec![format!(
@@ -608,6 +611,7 @@ mod tests {
                 created_at_ms: 7,
             }],
             comments_complete: false,
+            labels_complete: true,
         };
         let lines = render_text(&Outcome::Detail(detail));
         assert!(
@@ -625,5 +629,33 @@ mod tests {
             render_text(&Outcome::Commented(issue_ref("home"))),
             vec!["Comment added to plugin:demo:1 (home)".to_owned()]
         );
+    }
+
+    #[test]
+    fn render_text_flags_incomplete_labels() {
+        let detail = IssueDetail {
+            issue: Issue {
+                id: "linear:THE-2".into(),
+                number: "THE-2".into(),
+                provider: "linear".into(),
+                title: "t".into(),
+                ..Default::default()
+            },
+            labels_complete: false,
+            ..Default::default()
+        };
+        let lines = render_text(&Outcome::Detail(detail.clone()));
+        assert!(
+            lines
+                .last()
+                .is_some_and(|line| line.contains("labels incomplete"))
+        );
+
+        let complete = IssueDetail {
+            labels_complete: true,
+            ..detail
+        };
+        let lines = render_text(&Outcome::Detail(complete));
+        assert!(lines.iter().all(|line| !line.contains("labels incomplete")));
     }
 }

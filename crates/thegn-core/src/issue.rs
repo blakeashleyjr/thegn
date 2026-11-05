@@ -309,9 +309,17 @@ pub struct IssueDetail {
     /// (for example one page); an absent field reads as complete.
     #[serde(default = "default_comments_complete")]
     pub comments_complete: bool,
+    /// False when the provider returned only part of the issue's labels
+    /// (for example one page); an absent field reads as complete.
+    #[serde(default = "default_labels_complete")]
+    pub labels_complete: bool,
 }
 
 fn default_comments_complete() -> bool {
+    true
+}
+
+fn default_labels_complete() -> bool {
     true
 }
 
@@ -321,6 +329,7 @@ impl Default for IssueDetail {
             issue: Issue::default(),
             comments: Vec::new(),
             comments_complete: true,
+            labels_complete: true,
         }
     }
 }
@@ -1009,6 +1018,7 @@ mod spec {
                 created_at_ms: 1_000,
             }],
             comments_complete: true,
+            labels_complete: true,
         };
         let json = serde_json::to_string(&d).unwrap();
         let back: IssueDetail = serde_json::from_str(&json).unwrap();
@@ -1051,6 +1061,31 @@ mod spec {
     #[test]
     fn issue_detail_default_is_complete() {
         assert!(IssueDetail::default().comments_complete);
+    }
+
+    #[test]
+    fn issue_detail_labels_default_complete_and_round_trip() {
+        assert!(IssueDetail::default().labels_complete);
+
+        let detail = IssueDetail {
+            labels_complete: false,
+            ..Default::default()
+        };
+        let json = serde_json::to_value(&detail).unwrap();
+        assert_eq!(json["labels_complete"], false);
+        let decoded: IssueDetail = serde_json::from_value(json.clone()).unwrap();
+        assert_eq!(decoded, detail);
+
+        let mut without_marker = json;
+        assert!(
+            without_marker
+                .as_object_mut()
+                .unwrap()
+                .remove("labels_complete")
+                .is_some()
+        );
+        let decoded: IssueDetail = serde_json::from_value(without_marker).unwrap();
+        assert!(decoded.labels_complete);
     }
 
     #[test]
