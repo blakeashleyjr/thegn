@@ -42,6 +42,12 @@ is running. A listener whose health check fails without proving the socket is
 gone is reported as unverified, makes `thegn daemon stop` exit non-zero naming
 it, and is not reported as stopped.
 
+thegn only talks to a registered daemon endpoint that is an absolute unix
+socket path owned by you. Any other registry entry, including a relative path,
+URL, regular file, symlink, or another user's socket, is ignored. The daemon
+behind an accepted socket is still confirmed by its health check before thegn
+trusts it.
+
 When starting a pane daemon, thegn checks a configured socket first, then
 checks registered daemon endpoints, skipping any duplicate address. Registered
 endpoints share a 5-second check budget; if an endpoint is still unchecked when
