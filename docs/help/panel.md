@@ -311,6 +311,13 @@ the worktree's current provider context is checked again before any claim or
 agent start. A mismatch starts nothing and records one `needs_human`
 notification per candidate; autofix mode `off` stays silent. An unknown
 current context matches only a cached log whose context is also unknown.
+CI autofix also keys its once-only claim by the provider's run attempt when one
+is reported (GitHub). A re-run attempt of the same job at the same commit is a
+new candidate, while an attempt is never claimed twice. An unknown attempt is
+separate from every known attempt, and the `needs_human` notification for a
+suggested fix carries the attempt used when authorizing it. A prior claim made
+while the attempt was unknown does not block its later known attempt. The PR
+queue's agent-attempt cap still bounds the spend.
 
 #### CI log retention and privacy
 
@@ -386,7 +393,10 @@ The Problems list also shows a warning for each active-worktree language server
 backing off after a failed start: `LSP server <name> failed to start (N
 failure(s)); retrying in Ns` (`lsp:health`). Rows are bounded by the per-root
 server cap and refresh with the model swap; they clear when backoff ends and
-the server starts.
+the server starts. While a server is starting or backing off, one Info row
+also reports `LSP servers: N running, M starting, K backing off` for the active
+worktree root. It is absent when none are starting or backing off; expired
+backoffs and servers without an installed binary are not counted.
 
 {{keys:problems}}
 
