@@ -184,8 +184,8 @@ fn compose_policy_miss_halts_before_auto_chain_host_entry() {
     );
 }
 
-/// Put a fake `ssh` first on PATH. It appends its full argument list (one line per call) to the returned log file, answers a
-/// `command -v` runtime probe with the "present" sentinel, and exits 0 silently for anything else.
+/// Put a fake `ssh` first on PATH. It appends its full argument list (one line per call) to the returned log file and answers
+/// with the runtime-present sentinel. The tests inspect the log to prove only probes reached it.
 #[cfg(unix)]
 fn fake_ssh_recorder(scratch: &Path) -> (String, std::path::PathBuf) {
     use std::os::unix::fs::PermissionsExt as _;
@@ -196,7 +196,7 @@ fn fake_ssh_recorder(scratch: &Path) -> (String, std::path::PathBuf) {
     std::fs::write(
         &ssh,
         format!(
-            "#!/bin/sh\nprintf '%s\\n' \"$*\" >> '{}'\ncase \"$*\" in *'command -v'*) printf %s __TG_HAVE__ ;; esac\nexit 0\n",
+            "#!/bin/sh\nprintf '%s\\n' \"$*\" >> '{}'\nprintf %s __TG_HAVE__\nexit 0\n",
             log.display()
         ),
     )
@@ -292,8 +292,11 @@ fn remote_compose_refusal_never_creates_or_execs_a_container() {
     let halt = error
         .downcast_ref::<crate::agent::SandboxHalt>()
         .expect("the chain refusal must surface as SandboxHalt");
+    // Auto-chain records the Compose policy refusal, then its remote-none guard
+    // supplies the returned halt reason after there are no more candidates.
     assert!(
-        halt.reason.contains("Compose cannot enforce"),
+        halt.reason
+            .contains("no container runtime found on the remote host"),
         "{}",
         halt.reason
     );
@@ -301,6 +304,10 @@ fn remote_compose_refusal_never_creates_or_execs_a_container() {
     assert!(
         calls.lines().count() > 0,
         "the runtime probe must have used the fake ssh"
+    );
+    assert!(
+        calls.lines().all(|line| line.contains("command -v")),
+        "only runtime probes may reach the remote, got: {calls}"
     );
     for effect in [
         " run ",
