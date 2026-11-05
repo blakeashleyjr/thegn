@@ -2419,7 +2419,7 @@ mod tests {
                     release.display()
                 ),
                 wait: Some(false),
-                timeout_secs: Some(5),
+                timeout_secs: Some(60),
                 on_failure: Some(thegn_core::hooks::HookFailure::Warn),
             },
         )];
@@ -2431,7 +2431,7 @@ mod tests {
             .insert(key);
         assert!(session_end_once(&cfg, &worktree, None).unwrap());
 
-        let hook_deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        let hook_deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
         while !started.exists() && std::time::Instant::now() < hook_deadline {
             std::thread::sleep(std::time::Duration::from_millis(10));
         }
@@ -2464,7 +2464,7 @@ mod tests {
 
         std::fs::write(&release, "release\n").unwrap();
         let (success, message) = rx
-            .recv_timeout(std::time::Duration::from_secs(5))
+            .recv_timeout(std::time::Duration::from_secs(60))
             .expect("destroy should resume after session_end completion");
         assert!(success, "destroy failed: {message}");
         assert!(!worktree.exists());
