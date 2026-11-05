@@ -452,8 +452,11 @@ mod tests {
                 .unwrap_err()
                 .contains("only by the running thegn UI")
         );
-        let long_id = "x".repeat(300);
-        assert!(tracker_ref(&long_id, "work").unwrap_err().len() < 400);
+        let long_id = format!("linear:{}", "x".repeat(600));
+        let error = tracker_ref(&long_id, "work").unwrap_err();
+        assert!(error.contains("invalid issue ref id for linear:"));
+        assert!(error.matches('x').count() <= 256);
+        assert!(error.len() < 400);
     }
 
     #[test]
