@@ -149,6 +149,14 @@
           statsBatteryChargingIcon = "BC";
           statsDiskIcon = "D";
           statsDiskPath = "~";
+          notificationsDesktop = false;
+          notificationsSurfaceSelfLogErrors = true;
+          notificationsGithubMentions = false;
+          notificationsAgentAttentionInbox = true;
+          notificationsMergeQueueHoldDesktop = true;
+          activityEnabled = false;
+          activityRedRequiresAgent = false;
+          activityAgentPrograms = ["claude" "my-agent"];
           monitorSystem = "htop";
           monitorGpu = "nvtop";
           agents = [
