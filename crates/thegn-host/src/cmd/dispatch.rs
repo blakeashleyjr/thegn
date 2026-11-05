@@ -1948,6 +1948,20 @@ fn done_gate(row: &AgentDispatch) -> Result<()> {
 }
 
 fn done_gate_bound(db: &Db, row: &AgentDispatch) -> Result<()> {
+    if row.status == AgentDispatchStatus::Spawning
+        && row
+            .session_id
+            .as_deref()
+            .is_none_or(|session| session.trim().is_empty())
+    {
+        return Err(DoneGateRefused {
+            id: row.id,
+            reasons: vec![
+                "unpublished reservation: the row is still spawning and no session is published for it; wait for the session to publish (or open one), or record it with `--force --why '<reason>'`".into(),
+            ],
+        }
+        .into());
+    }
     let report_head = db.dispatch_report_head(row.id)?;
     let facts = verify_facts_with_report_head(row, report_head.as_deref());
     require_done_report(row.id, pipeline_run::verify_report(&facts))?;
@@ -3501,6 +3515,9 @@ mod tests {
                         .unwrap();
                 } else {
                     db.update_dispatch_status(id, from).unwrap();
+                    if from == St::Spawning {
+                        assert!(db.bind_dispatch_session(id, "matrix-session").unwrap());
+                    }
                 }
                 assert_eq!(
                     db.get_dispatch(id).unwrap().unwrap().status,
@@ -5894,6 +5911,133 @@ mod tests {
         let status = git_out_allow_empty(&root, &["status", "--porcelain"]).unwrap();
         assert!(status.is_empty(), "fixture worktree is dirty: {status}");
         done_gate_bound(&db, &row).unwrap();
+    }
+
+    #[test]
+    fn unpublished_reservation_done_is_refused_and_the_row_stays_spawning() {
+        let (_dir, db) = db("unpublished-reservation-done-refused");
+        let id = db
+            .put_agent_dispatch(NewDispatch::new("linear:THE-1841", "/wt/x", "claude"))
+            .unwrap();
+        db.update_dispatch_status(id, AgentDispatchStatus::Spawning)
+            .unwrap();
+
+        let error = set_status_on_led(
+            &db,
+            id,
+            AgentDispatchStatus::Done,
+            false,
+            None,
+            LeadProof::Unbound,
+            true,
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("unpublished reservation"));
+        assert_eq!(set_status_error_kind(&error), Some("missing_evidence"));
+        assert_eq!(
+            db.get_dispatch(id).unwrap().unwrap().status,
+            AgentDispatchStatus::Spawning
+        );
+    }
+
+    #[test]
+    fn unpublished_reservation_refusal_applies_to_a_blank_session() {
+        let (_dir, db) = db("unpublished-reservation-blank-session");
+        let id = db
+            .put_agent_dispatch(NewDispatch::new("linear:THE-1841-BLANK", "/wt/x", "claude"))
+            .unwrap();
+        db.update_dispatch_status(id, AgentDispatchStatus::Spawning)
+            .unwrap();
+        let mut row = db.get_dispatch(id).unwrap().unwrap();
+        row.session_id = Some("  ".into());
+
+        let error = done_gate_bound(&db, &row).unwrap_err();
+        assert!(error.to_string().contains("unpublished reservation"));
+    }
+
+    #[test]
+    fn published_spawning_reservation_may_be_marked_done() {
+        let (_dir, db) = db("published-spawning-reservation-done");
+        let id = db
+            .put_agent_dispatch(NewDispatch::new(
+                "linear:THE-1841-PUBLISHED",
+                "/wt/x",
+                "claude",
+            ))
+            .unwrap();
+        db.update_dispatch_status(id, AgentDispatchStatus::Spawning)
+            .unwrap();
+        assert!(db.bind_dispatch_session(id, "s-1").unwrap());
+
+        set_status_on_led(
+            &db,
+            id,
+            AgentDispatchStatus::Done,
+            false,
+            None,
+            LeadProof::Unbound,
+            true,
+        )
+        .unwrap();
+        assert_eq!(
+            db.get_dispatch(id).unwrap().unwrap().status,
+            AgentDispatchStatus::Done
+        );
+    }
+
+    #[test]
+    fn forced_done_overrides_the_unpublished_reservation_refusal() {
+        let (_dir, db) = db("forced-done-unpublished-reservation");
+        let id = db
+            .put_agent_dispatch(NewDispatch::new("linear:THE-1841-FORCE", "/wt/x", "claude"))
+            .unwrap();
+        db.update_dispatch_status(id, AgentDispatchStatus::Spawning)
+            .unwrap();
+
+        set_status_on_led(
+            &db,
+            id,
+            AgentDispatchStatus::Done,
+            true,
+            Some("operator confirmed"),
+            LeadProof::Unbound,
+            true,
+        )
+        .unwrap();
+        assert!(db.dispatch_override(id).unwrap().is_some());
+        assert_eq!(
+            db.get_dispatch(id).unwrap().unwrap().status,
+            AgentDispatchStatus::Done
+        );
+    }
+
+    #[test]
+    fn running_row_done_is_not_affected_by_the_reservation_check() {
+        let (_dir, db) = db("running-row-done-without-session");
+        let id = db
+            .put_agent_dispatch(NewDispatch::new(
+                "linear:THE-1841-RUNNING",
+                "/wt/x",
+                "claude",
+            ))
+            .unwrap();
+        db.update_dispatch_status(id, AgentDispatchStatus::Running)
+            .unwrap();
+
+        set_status_on_led(
+            &db,
+            id,
+            AgentDispatchStatus::Done,
+            false,
+            None,
+            LeadProof::Unbound,
+            true,
+        )
+        .unwrap();
+        assert_eq!(
+            db.get_dispatch(id).unwrap().unwrap().status,
+            AgentDispatchStatus::Done
+        );
     }
 
     #[test]
