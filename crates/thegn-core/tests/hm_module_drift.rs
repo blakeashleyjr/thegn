@@ -38,9 +38,47 @@ const OMITTED: &[(&str, &str)] = &[
     ("git_commands", "custom git commands are not exposed"),
     ("plugins", "plugin configuration is not exposed"),
     ("forges", "forge connections are not exposed"),
-    ("git", "Git behavior is not exposed"),
+    (
+        "git.backend",
+        "the git read-engine enum needs destination pinning and is not exposed",
+    ),
+    (
+        "git.structural_diff",
+        "the structural-diff enum needs destination pinning and is not exposed",
+    ),
+    (
+        "git.submodules",
+        "the submodule-mode enum needs destination pinning and is not exposed",
+    ),
     ("editor", "editor integration is not exposed"),
-    ("stats", "resource sampling is not exposed"),
+    (
+        "stats.refresh_secs",
+        "refresh interval is an f64 range that needs float pinning and is not exposed",
+    ),
+    (
+        "stats.refresh_rates",
+        "refresh-rate list needs float list pinning and is not exposed",
+    ),
+    (
+        "stats.battery_warn",
+        "u8 threshold needs byte-range pinning and is not exposed",
+    ),
+    (
+        "stats.disk_free_warn",
+        "u8 threshold needs byte-range pinning and is not exposed",
+    ),
+    (
+        "stats.disk_free_critical",
+        "u8 threshold needs byte-range pinning and is not exposed",
+    ),
+    (
+        "stats.alerts",
+        "threshold alerts are a nested table and are not exposed",
+    ),
+    (
+        "stats.net_icons",
+        "per-medium network glyph table is not exposed",
+    ),
     ("metrics", "metrics export is not exposed"),
     ("apps", "app ordering is not exposed"),
     ("observe", "Observe configuration is not exposed"),
@@ -567,6 +605,8 @@ fn every_schema_key_is_rendered_or_dispositioned() {
         "replay",
         "drawer",
         "strip",
+        "git",
+        "stats",
         "monitor",
         "pr",
         "watch",
@@ -831,6 +871,43 @@ fn hm_drawer_and_strip_families_are_fully_rendered() {
 }
 
 #[test]
+fn hm_git_and_stats_families_are_rendered() {
+    let rendered = rendered_paths(&module_src());
+    let omissions: BTreeSet<&str> = OMITTED.iter().map(|(path, _)| *path).collect();
+    for table in ["git", "stats"] {
+        let schema = schema_field(table);
+        let properties = schema["properties"]
+            .as_object()
+            .unwrap_or_else(|| panic!("{table} schema properties"));
+        for key in properties.keys() {
+            let path = format!("{table}.{key}");
+            if omissions.contains(path.as_str()) {
+                assert!(
+                    schema_has_path(&path),
+                    "omitted schema key must exist: {path}"
+                );
+            } else {
+                assert!(rendered.contains(&path), "Home Manager must render {path}");
+            }
+        }
+    }
+    for path in [
+        "git.backend",
+        "git.structural_diff",
+        "git.submodules",
+        "stats.refresh_secs",
+        "stats.refresh_rates",
+        "stats.battery_warn",
+        "stats.disk_free_warn",
+        "stats.disk_free_critical",
+        "stats.alerts",
+        "stats.net_icons",
+    ] {
+        assert!(schema_has_path(path), "omission must stay pinned: {path}");
+    }
+}
+
+#[test]
 fn hm_loc_and_replay_families_are_fully_rendered() {
     let rendered = rendered_paths(&module_src());
     for table in ["loc", "replay"] {
@@ -988,6 +1065,11 @@ fn every_numeric_option_matches_its_destination_range() {
         ),
         ("replayIdleThresholdMs", "replay.idle_threshold_ms"),
         ("drawerPoolLimit", "drawer.pool_limit"),
+        ("gitAutoFetchIntervalSecs", "git.auto_fetch_interval_secs"),
+        (
+            "gitAutoFetchMinIntervalSecs",
+            "git.auto_fetch_min_interval_secs",
+        ),
     ];
     let options = numeric_options(&module_src());
     let actual_names: BTreeSet<&str> = options.iter().map(|(name, _)| name.as_str()).collect();
