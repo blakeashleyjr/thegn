@@ -845,7 +845,7 @@ mod list_outcome_tests {
     use thegn_core::pr_queue::{AgentHeadOutcome, PrAgentAdmission, PrAgentAdmit};
     use thegn_core::store::WorktreeAuxStore;
 
-    fn queued_row(db: &Db, number: u64) -> thegn_core::db::PrQueueRow {
+    fn watching_row(db: &Db, number: u64) -> thegn_core::db::PrQueueRow {
         db.enqueue_bound_pr(
             "/repo",
             number,
@@ -856,6 +856,14 @@ mod list_outcome_tests {
             &format!("https://github.com/me/repo/pull/{number}"),
         )
         .unwrap();
+        let row = db
+            .list_pr_queue()
+            .unwrap()
+            .into_iter()
+            .find(|row| row.number == number)
+            .unwrap();
+        db.update_pr_status(&row.key, "watching", None, None, None)
+            .unwrap();
         db.list_pr_queue()
             .unwrap()
             .into_iter()
@@ -891,7 +899,7 @@ mod list_outcome_tests {
     #[test]
     fn outcome_suffix_names_the_label() {
         let db = Db::open_memory().unwrap();
-        let row = queued_row(&db, 1);
+        let row = watching_row(&db, 1);
         let lease = admitted(&db, &row, 0);
         assert!(
             db.record_pr_agent_outcome(&lease, AgentHeadOutcome::LocalOnly)
@@ -913,8 +921,8 @@ mod list_outcome_tests {
     #[test]
     fn listed_rows_attach_the_recorded_outcome_of_the_latest_generation() {
         let db = Db::open_memory().unwrap();
-        let first = queued_row(&db, 1);
-        let second = queued_row(&db, 2);
+        let first = watching_row(&db, 1);
+        let second = watching_row(&db, 2);
         let lease = admitted(&db, &first, 0);
         assert!(
             db.record_pr_agent_outcome(&lease, AgentHeadOutcome::LocalOnly)
@@ -938,6 +946,8 @@ mod list_outcome_tests {
             db.release_pr_agent(&lease, Some(("queued", "again")))
                 .unwrap()
         );
+        db.update_pr_status(&first.key, "watching", None, None, None)
+            .unwrap();
         let next_lease = admitted(&db, &first, 1);
         let latest = listed_rows(&db, &rows).unwrap();
         let first_latest = latest.iter().find(|entry| entry.row.number == 1).unwrap();
@@ -951,7 +961,7 @@ mod list_outcome_tests {
     #[test]
     fn listed_row_json_flattens_the_row_and_adds_agent_outcome() {
         let db = Db::open_memory().unwrap();
-        let row = queued_row(&db, 1);
+        let row = watching_row(&db, 1);
         let lease = admitted(&db, &row, 0);
         assert!(
             db.record_pr_agent_outcome(&lease, AgentHeadOutcome::LocalOnly)
@@ -972,7 +982,7 @@ mod list_outcome_tests {
     #[test]
     fn listed_row_json_has_a_null_agent_outcome_when_none_is_recorded() {
         let db = Db::open_memory().unwrap();
-        let row = queued_row(&db, 1);
+        let row = watching_row(&db, 1);
         let listed: Vec<ListedRow<'_>> = listed_rows(&db, std::slice::from_ref(&row)).unwrap();
         let value = serde_json::to_value(&listed[0]).unwrap();
 
