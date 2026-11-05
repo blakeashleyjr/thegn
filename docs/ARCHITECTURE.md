@@ -62,12 +62,16 @@ sessions survive UI detach; the **model proxy** (`crates/thegn-proxy`, binary
 — tier routing, ordered failover, cost/budget accounting. The proxy is a
 separate process precisely so the AI-free shell never compile- or run-depends on
 it: with `[model_proxy]` absent nothing launches, spawns, writes, or renders.
+It is live but not part of the stable shell, and the alpha tarball and flake
+ship only `thegn` (build `tgproxy` from source; see
+`docs/help/ai-usage.md`).
 The host supervises it off the UI loop (`model_proxy_daemon.rs`, `core::backoff`
 restarts) and projects control through four OPERATOR-only capability rows
 (`model_proxy.status/stats/start/stop`). The pure routing logic lives in
 `thegn_core::proxy` (95%-gated); the resurrection boundary is firm —
 ACP/bouncer/tool-interception, token compression, remote-sandbox tunnels, and
-the managed-agent dialer stay excised.
+the managed-agent dialer stay excised (removed before the alpha, not reopened by
+the proxy).
 
 ## 2. The event loop (0% idle)
 

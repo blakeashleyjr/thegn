@@ -16,16 +16,21 @@ socket, plus TCP for `thegn serve` thin clients), so sessions survive UI detach
 and warm-reattach — `[daemon] enabled = false` restores fully in-process panes.
 See `crates/thegn-host/src/daemon/`.
 
-The **AI/agent layer was removed before the public alpha** (the old two-track
-plan's LLM proxy, ACP/bouncer, and managed agent are gone; see `tasks.md`). The
-product is the AI-free workspace shell. What remains agent-adjacent is strictly
-generic: the `[[agents]]`/`[[tools]]` picker launches any configured CLI as a
+The stable shell is **AI-free**: nothing in `thegn-host` depends on a model, an
+agent protocol or a proxy. What is agent-adjacent is either generic or opt-in.
+Generic: the `[[agents]]`/`[[tools]]` picker launches any configured CLI as a
 plain command, and the two queues' agent handoff (`[merge_queue]` /
 `[pr_queue]`) is an arbitrary subprocess hook — one shared, data-driven engine
 (`thegn_core::agent_task` renders the prompt template and resolves the command;
 `thegn-host/src/agent_run.rs` runs it). Both queues work with no agent
-configured at all. If the AI track reopens, it must be additive — the shell
-never hard-depends on it.
+configured at all. Opt-in: the **model proxy** (`crates/thegn-proxy`, binary
+`tgproxy`) is LIVE (owner decision 2026-10-19) but separate — its own process,
+enabled only by a `[model_proxy]` section, not a dependency of `thegn-host`,
+and not shipped in the alpha tarball or flake (build it from source; see
+`docs/help/ai-usage.md`). What the pre-alpha excision removed stays removed:
+ACP/bouncer/tool-interception, token compression, remote-sandbox tunnels and
+the managed-agent dialer (`docs/ARCHITECTURE.md`; history in `tasks.md`). Any
+new AI work must be additive — the shell never hard-depends on it.
 
 ## Architecture
 
