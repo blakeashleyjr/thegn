@@ -301,7 +301,7 @@ fn authorize_host_call(
     let target = (cap == "merge.add")
         .then(|| params.get("worktree").and_then(serde_json::Value::as_str))
         .flatten();
-    entry.runtime.record_host_call_decision(
+    entry.runtime.record_host_call_decision_in_session(
         entry.plugin.spec.manifest.id.clone(),
         cap,
         if result.is_ok() {
@@ -310,6 +310,7 @@ fn authorize_host_call(
             AuditDecision::Denied
         },
         target,
+        entry.session,
     );
     result
 }
@@ -4323,6 +4324,44 @@ mod tests {
         assert_eq!(log[n - 2].target.as_deref(), Some("wt-a"));
         assert_eq!(log[n - 1].target.as_deref(), Some("wt-b"));
         assert!(log[n - 2].seq < log[n - 1].seq);
+    }
+
+    #[test]
+    fn audit_session_records_the_resident_generation_for_granted_and_denied_calls() {
+        let git = spec("p", Vec::new(), vec![Scope::Git]);
+        let (mut entry, _) = build_entry(loaded_state(git));
+        entry.session = Some(7);
+
+        authorize_host_call(
+            &mut entry,
+            "merge.add",
+            &serde_json::json!({ "worktree": "wt-a" }),
+        )
+        .unwrap();
+        assert_eq!(entry.runtime.audit_log().last().unwrap().session, Some(7));
+
+        entry.session = Some(8);
+        assert!(
+            authorize_host_call(&mut entry, "sessions.kill", &serde_json::Value::Null).is_err()
+        );
+        let denied = entry.runtime.audit_log().last().unwrap();
+        assert_eq!(denied.session, Some(8));
+        assert_eq!(denied.decision, AuditDecision::Denied);
+    }
+
+    #[test]
+    fn audit_session_is_none_without_a_live_resident_session() {
+        let git = spec("p", Vec::new(), vec![Scope::Git]);
+        let (mut entry, _) = build_entry(loaded_state(git));
+
+        authorize_host_call(
+            &mut entry,
+            "merge.add",
+            &serde_json::json!({ "worktree": "wt-a" }),
+        )
+        .unwrap();
+
+        assert_eq!(entry.runtime.audit_log().last().unwrap().session, None);
     }
 
     #[test]
