@@ -28,5 +28,5 @@ pub use loader::{
     LoadedPlugin, SpecProblem, check_spec, check_specs, discover, host_contract, negotiate,
 };
 pub use proc::{PluginError, PluginRun, spawn_ndjson, spawn_ndjson_cancellable};
-pub use provider::{BridgeError, PluginIssueBackend, ProviderBridge};
+pub use provider::{BridgeError, BridgeStats, PluginIssueBackend, ProviderBridge};
 pub use session::{ResidentSession, ResidentSupervisor, SessionEvent, SessionWriter};
