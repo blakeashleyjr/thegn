@@ -201,6 +201,7 @@ mod platform;
 mod platform_ratchet_tests;
 mod plugin_damage;
 mod plugin_providers;
+mod plugin_stats;
 mod plugins;
 mod pool_lease;
 mod pr_agent_lease;

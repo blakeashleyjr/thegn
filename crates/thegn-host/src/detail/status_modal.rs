@@ -502,6 +502,64 @@ fn session_rows(v: &[SessionInfo], now_ms: i64, wide: bool) -> TableSection {
     }
 }
 
+fn plugin_rows_table(rows: &[crate::plugin_stats::PluginCounters]) -> TableSection {
+    let header = ["plugin", "busy", "refused", "timeout", "lost", "drops"]
+        .into_iter()
+        .map(str::to_owned)
+        .collect();
+    let rows = rows
+        .iter()
+        .map(|row| {
+            let count = |value: u64| {
+                Cell::Text(
+                    count_cell(value),
+                    if value > 0 {
+                        Tok::Hue(Hue::Amber)
+                    } else {
+                        Tok::Slot(S::Dim)
+                    },
+                )
+            };
+            vec![
+                Cell::Text(row.plugin.clone(), Tok::Slot(S::Text)),
+                Cell::Text(row.in_flight.to_string(), Tok::Slot(S::Dim)),
+                count(row.rejected),
+                count(row.timed_out),
+                count(row.lost),
+                count(row.queue_drops),
+            ]
+        })
+        .collect();
+    TableSection {
+        header,
+        rows,
+        sel: None,
+    }
+}
+
+fn count_cell(count: u64) -> String {
+    if count > 9999 {
+        "9999+".into()
+    } else {
+        count.to_string()
+    }
+}
+
+fn plugin_sections(rows: &[crate::plugin_stats::PluginCounters]) -> Vec<Section> {
+    if rows.is_empty() {
+        Vec::new()
+    } else {
+        vec![
+            spacer(),
+            Section::Heading {
+                label: "plugins".into(),
+                note: Some(format!("{} with host.call activity", rows.len())),
+            },
+            Section::Table(plugin_rows_table(rows)),
+        ]
+    }
+}
+
 /// The event-loop rollup, as grid cells. Every one of these is already measured
 /// by `crate::perf` each interval and was previously discarded.
 fn loop_cells(p: &crate::perf::PerfSnapshot) -> Vec<(String, String, Tok)> {
@@ -791,6 +849,10 @@ fn build_sections(model: &FrameModel, ctx: &super::StatusCtx) -> Vec<Section> {
         });
     }
 
+    // --- Plugin host.call pressure (cumulative since start) -------------------
+    let plugin_rows = crate::plugin_stats::snapshot();
+    secs.extend(plugin_sections(&plugin_rows));
+
     // --- Event-loop rollup (the same data `thegn::perf` logs) --------------
     secs.push(spacer());
     if ctx.loop_perf.has_data() {
@@ -824,8 +886,14 @@ fn build_sections(model: &FrameModel, ctx: &super::StatusCtx) -> Vec<Section> {
 
 #[cfg(test)]
 mod tests {
-    use super::{loop_cells, tail_cell, tail_only};
+    use super::{loop_cells, plugin_rows_table, plugin_sections, tail_cell, tail_only};
+    use crate::chrome::S;
     use crate::perf::PerfSnapshot;
+    use crate::plugin_stats::{PluginCounters, Totals};
+    use crate::sections::{Cell, Section};
+    use crate::seg::Tok;
+    use std::collections::BTreeMap;
+    use thegn_core::theme::Hue;
 
     #[test]
     fn tail_cell_uses_the_count_not_a_zero_percentile() {
@@ -873,5 +941,60 @@ mod tests {
             .unwrap();
         assert!(render.1.contains("n=3 (sparse)"));
         assert!(cells.iter().any(|(label, _, _)| label == "submit→sink"));
+    }
+
+    #[test]
+    fn plugin_rows_render_one_row_per_plugin_and_tone_losses() {
+        let rows = [
+            PluginCounters {
+                plugin: "busy-plugin".into(),
+                in_flight: 1,
+                ..Default::default()
+            },
+            PluginCounters {
+                plugin: "loss-plugin".into(),
+                timed_out: 3,
+                lost: 10_000,
+                ..Default::default()
+            },
+        ];
+        let table = plugin_rows_table(&rows);
+        assert_eq!(
+            table.header.iter().map(String::as_str).collect::<Vec<_>>(),
+            ["plugin", "busy", "refused", "timeout", "lost", "drops"]
+        );
+        assert_eq!(table.rows.len(), 2);
+        assert!(matches!(&table.rows[1][3], Cell::Text(text, Tok::Hue(Hue::Amber)) if text == "3"));
+        assert!(
+            matches!(&table.rows[1][4], Cell::Text(text, Tok::Hue(Hue::Amber)) if text == "9999+")
+        );
+        assert!(matches!(&table.rows[0][2], Cell::Text(text, Tok::Slot(S::Dim)) if text == "0"));
+    }
+
+    #[test]
+    fn plugin_rows_are_absent_when_no_plugin_has_counters() {
+        assert!(Totals::default().rows(&BTreeMap::new()).is_empty());
+        assert!(plugin_sections(&[]).is_empty());
+
+        let sections = plugin_sections(&[PluginCounters {
+            plugin: "active-plugin".into(),
+            rejected: 1,
+            ..Default::default()
+        }]);
+        assert_eq!(sections.len(), 3);
+        assert!(matches!(
+            &sections[0],
+            Section::Heading { label, note: None } if label.is_empty()
+        ));
+        assert!(matches!(
+            &sections[1],
+            Section::Heading { label, note: Some(note) }
+                if label == "plugins" && note == "1 with host.call activity"
+        ));
+        assert!(matches!(&sections[2], Section::Table(_)));
+
+        let table = plugin_rows_table(&[]);
+        assert!(table.rows.is_empty());
+        assert_eq!(table.header.len(), 6);
     }
 }

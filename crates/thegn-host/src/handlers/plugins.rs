@@ -100,6 +100,7 @@ pub(crate) struct PluginsState {
     /// Lazily started `host.call` dispatcher (a thread is only spawned once a
     /// plugin actually calls).
     dispatcher: Option<Dispatcher>,
+    counters: crate::plugin_stats::Totals,
     /// Shared config for the dispatcher's daemon discovery and feed bridges.
     cfg: Arc<thegn_core::config::Config>,
     navigation_epoch: u64,
@@ -116,6 +117,7 @@ impl PluginsState {
             pending_alert_drops: BTreeMap::new(),
             inbox: None,
             dispatcher: None,
+            counters: crate::plugin_stats::Totals::default(),
             cfg: Arc::new(cfg),
             navigation_epoch: 0,
             active_app: String::new(),
@@ -709,6 +711,14 @@ fn flush_alerts_with(state: &mut PluginsState, submit: impl FnOnce(Vec<(String, 
     }
     if let Some(dispatcher) = &state.dispatcher {
         for (plugin, counts) in dispatcher.take_diagnostics() {
+            state.counters.add_dispatch(
+                &plugin,
+                counts.rejected,
+                counts.timed_out,
+                counts.unavailable,
+                counts.abandoned,
+                counts.undelivered,
+            );
             if counts.rejected > 0
                 || counts.timed_out > 0
                 || counts.unavailable > 0
@@ -721,6 +731,9 @@ fn flush_alerts_with(state: &mut PluginsState, submit: impl FnOnce(Vec<(String, 
     }
     if let Some(inbox) = &state.inbox {
         for (plugin, counts) in inbox.take_diagnostics() {
+            state
+                .counters
+                .add_inbox(&plugin, counts.coalesced, counts.dropped, counts.rejected);
             if counts.dropped > 0 || counts.rejected > 0 {
                 tracing::warn!(target: "thegn::plugin", plugin = %plugin, coalesced = counts.coalesced, dropped = counts.dropped, rejected = counts.rejected, cap = crate::plugins::inbox::MAX_QUEUED_EVENTS_PER_PLUGIN, "plugin event queue saturated");
             } else if counts.coalesced > 0 {
@@ -728,6 +741,13 @@ fn flush_alerts_with(state: &mut PluginsState, submit: impl FnOnce(Vec<(String, 
             }
         }
     }
+    let live: std::collections::BTreeSet<&str> = state.plugins.keys().map(String::as_str).collect();
+    state.counters.retain(|plugin| live.contains(plugin));
+    let in_flight = state
+        .dispatcher
+        .as_ref()
+        .map_or_else(BTreeMap::new, Dispatcher::in_flight);
+    crate::plugin_stats::publish(state.counters.rows(&in_flight));
     let alerts = std::mem::take(&mut state.pending_alerts);
     for (plugin, dropped) in std::mem::take(&mut state.pending_alert_drops) {
         tracing::warn!(target: "thegn::plugin", plugin = %plugin, dropped, cap = MAX_PENDING_ALERTS_PER_PLUGIN, "plugin alerts dropped: per-drain outbox cap reached");
@@ -2100,6 +2120,14 @@ impl Dispatcher {
         }
     }
 
+    fn in_flight(&self) -> BTreeMap<String, usize> {
+        self.load
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .per_plugin
+            .clone()
+    }
+
     fn take_diagnostics(&self) -> BTreeMap<String, DispatchDiagnostics> {
         self.diagnostics
             .lock()
@@ -2550,6 +2578,96 @@ mod tests {
             response.error.expect("error response").code,
             RpcErrorCode::Other
         );
+    }
+
+    #[test]
+    fn plugin_counters_flush_publishes_cumulative_dispatch_totals() {
+        let _guard = crate::plugin_stats::TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut state = state_with(vec![seg_spec("cnt-a")]);
+        state.dispatcher = Some(Dispatcher::disconnected());
+
+        for (id, expected) in [(1_u64, 1_u64), (2, 2), (3, 3)] {
+            dispatch_request(state.dispatcher.as_ref().unwrap(), "cnt-a", id)
+                .recv_timeout(std::time::Duration::from_secs(2))
+                .expect("disconnected dispatcher response");
+            flush_alerts_with(&mut state, |_| {});
+            let rows = crate::plugin_stats::snapshot();
+            assert_eq!(
+                rows.iter()
+                    .find(|row| row.plugin == "cnt-a")
+                    .map(|row| row.lost),
+                Some(expected)
+            );
+        }
+
+        crate::plugin_stats::publish(Vec::new());
+    }
+
+    #[test]
+    fn plugin_counters_flush_publishes_inbox_pressure() {
+        let _guard = crate::plugin_stats::TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut state = state_with(vec![seg_spec("cnt-b")]);
+        let inbox = Arc::new(PluginInbox::default());
+        state.inbox = Some(Arc::clone(&inbox));
+        for _ in 0..crate::plugins::inbox::MAX_QUEUED_EVENTS_PER_PLUGIN {
+            inbox.push(
+                "cnt-b".into(),
+                1,
+                SessionEvent::Message(msg("emit", serde_json::json!({}))),
+            );
+        }
+        assert_eq!(
+            inbox.push(
+                "cnt-b".into(),
+                1,
+                SessionEvent::Message(RpcMessage {
+                    id: Some(1),
+                    method: "io".into(),
+                    params: serde_json::json!({}),
+                }),
+            ),
+            crate::plugins::inbox::PushOutcome::Rejected
+        );
+
+        flush_alerts_with(&mut state, |_| {});
+        let rows = crate::plugin_stats::snapshot();
+        assert!(
+            rows.iter()
+                .find(|row| row.plugin == "cnt-b")
+                .is_some_and(|row| row.queue_drops >= 1)
+        );
+        crate::plugin_stats::publish(Vec::new());
+    }
+
+    #[test]
+    fn plugin_counters_drop_a_plugin_that_left_the_set() {
+        let _guard = crate::plugin_stats::TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut state = state_with(vec![seg_spec("cnt-c")]);
+        state.dispatcher = Some(Dispatcher::disconnected());
+        dispatch_request(state.dispatcher.as_ref().unwrap(), "cnt-c", 1)
+            .recv_timeout(std::time::Duration::from_secs(2))
+            .expect("disconnected dispatcher response");
+        flush_alerts_with(&mut state, |_| {});
+        assert!(
+            crate::plugin_stats::snapshot()
+                .iter()
+                .any(|row| row.plugin == "cnt-c")
+        );
+
+        state.plugins.remove("cnt-c");
+        flush_alerts_with(&mut state, |_| {});
+        assert!(
+            !crate::plugin_stats::snapshot()
+                .iter()
+                .any(|row| row.plugin == "cnt-c")
+        );
+        crate::plugin_stats::publish(Vec::new());
     }
 
     #[test]
