@@ -85,6 +85,8 @@ pub struct QueueFootprint {
 }
 
 /// Cumulative queue outcomes. Shutdown resets these with the queue state.
+/// Pending entries removed because a publication was marked lost are excluded
+/// from these counters; there is no dedicated lost-superseded outcome bucket.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct QueueCounters {
     pub admitted: u64,
@@ -1544,6 +1546,19 @@ mod tests {
             rx.shared.lock().unwrap().active.clear();
             assert!(matches!(rx.try_recv(), Err(TryRecvError::Empty)));
             assert_eq!(rx.queue_stats().unwrap().counters.stale_rejected, 2);
+        }
+
+        #[test]
+        fn lost_publication_supersession_is_not_a_capacity_rejection() {
+            let (tx, rx) = diagnostics_channel();
+            let generation = tx.register(Path::new("/r"), "rust").unwrap();
+            tx.publish(pd("/r", "rust", generation, 1, "/r/a.rs", vec![]));
+            tx.mark_lost(Path::new("/r"), "rust", generation, Some("/r/a.rs"));
+
+            let stats = rx.queue_stats().unwrap();
+            assert_eq!(stats.pending_documents, 0);
+            assert_eq!(stats.counters.admitted, 1);
+            assert_eq!(stats.counters.rejected_capacity, 0);
         }
 
         #[test]
