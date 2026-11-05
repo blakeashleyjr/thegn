@@ -523,4 +523,158 @@ mod tests {
         assert_eq!(stored.redaction_changed, Some(true));
         assert!(!stored.text.contains("SYNTHETIC"));
     }
+
+    #[test]
+    fn ci_log_retention_keeps_listed_runs_and_only_for_its_worktree() {
+        let db = Db::open_memory().unwrap();
+        for (worktree, run_id) in [
+            ("/wt/a", "run-1"),
+            ("/wt/a", "run-2"),
+            ("/wt/a", "run-3"),
+            ("/wt/b", "run-1"),
+        ] {
+            let entry = CiLogEntry::new(worktree, run_id, "job-1", "tests", "log\n", 10, 1024, 1);
+            db.put_ci_log(&entry).unwrap();
+        }
+
+        let retained_runs = ["run-2".to_string()];
+        assert_eq!(db.retain_ci_logs("/wt/a", &retained_runs).unwrap(), 2);
+        let retained = db.list_ci_logs("/wt/a").unwrap();
+        assert_eq!(retained.len(), 1);
+        assert_eq!(retained[0].run_id, "run-2");
+        assert_eq!(db.list_ci_logs("/wt/b").unwrap().len(), 1);
+        assert_eq!(db.retain_ci_logs("/wt/a", &retained_runs).unwrap(), 0);
+
+        assert_eq!(db.retain_ci_logs("/wt/a", &[]).unwrap(), 1);
+        assert!(db.list_ci_logs("/wt/a").unwrap().is_empty());
+        assert_eq!(db.list_ci_logs("/wt/b").unwrap().len(), 1);
+    }
+
+    #[test]
+    fn ci_log_retention_drops_runs_of_an_obsolete_context_when_the_run_list_changes() {
+        let db = Db::open_memory().unwrap();
+        for (run_id, context) in [
+            ("run-old", "github:github.com/o/a"),
+            ("run-new", "github:github.com/o/b"),
+        ] {
+            let mut entry =
+                CiLogEntry::new("/wt/a", run_id, "job-1", "tests", "log\n", 10, 1024, 1);
+            entry.context = context.into();
+            db.put_ci_log(&entry).unwrap();
+        }
+
+        let current_runs = ["run-new".to_string()];
+        assert_eq!(db.retain_ci_logs("/wt/a", &current_runs).unwrap(), 1);
+        let retained = db.list_ci_logs("/wt/a").unwrap();
+        assert_eq!(retained.len(), 1);
+        assert_eq!(retained[0].run_id, "run-new");
+        assert_eq!(retained[0].context, "github:github.com/o/b");
+    }
+
+    #[test]
+    fn ci_log_cache_repeated_context_switches_keep_one_row_and_the_last_context() {
+        let db = Db::open_memory().unwrap();
+        for n in 1..=6_u64 {
+            let mut entry = CiLogEntry::new("/wt/a", "run", "job", "tests", "log\n", 10, 1024, 1);
+            entry.head_sha = "sha".into();
+            entry.context = if n % 2 == 1 {
+                "github:github.com/o/a".into()
+            } else {
+                "github:github.com/o/b".into()
+            };
+            entry.attempt = Some(n);
+            db.put_ci_log(&entry).unwrap();
+        }
+        let logs = db.list_ci_logs("/wt/a").unwrap();
+        assert_eq!(logs.len(), 1);
+        assert_eq!(logs[0].context, "github:github.com/o/b");
+        assert_eq!(logs[0].attempt, Some(6));
+
+        for n in 1..=6 {
+            let branch = if n % 2 == 1 { "feature" } else { "main" };
+            let json = format!("[{n}]");
+            db.put_ci_cache("/wt/a", branch, &json).unwrap();
+        }
+        let cached = db.get_ci_cache_entry("/wt/a").unwrap().unwrap();
+        assert_eq!(cached.0, "[6]");
+        assert_eq!(cached.1, "main");
+        let run_cache_count = db
+            .conn()
+            .query_row(
+                "SELECT COUNT(*) FROM ci_runs_cache WHERE worktree='/wt/a'",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap();
+        assert_eq!(run_cache_count, 1);
+
+        let candidate_a = CiLogCandidate {
+            worktree: "/wt/a".into(),
+            run_id: "run".into(),
+            job_id: "job".into(),
+            head_sha: "sha".into(),
+            context: "github:github.com/o/a".into(),
+            attempt: None,
+        };
+        let candidate_b = CiLogCandidate {
+            context: "github:github.com/o/b".into(),
+            ..candidate_a.clone()
+        };
+        assert!(db.claim_ci_autofix(&candidate_a).unwrap());
+        assert!(db.claim_ci_autofix(&candidate_b).unwrap());
+        assert!(!db.claim_ci_autofix(&candidate_b).unwrap());
+        assert!(db.claim_ci_autofix(&candidate_a).unwrap());
+        let dedupe_count = db
+            .conn()
+            .query_row(
+                "SELECT COUNT(*) FROM ci_autofix_dedupe WHERE worktree='/wt/a'",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap();
+        assert_eq!(dedupe_count, 1);
+    }
+
+    #[test]
+    fn legacy_ci_log_row_without_context_or_attempt_reads_as_unknown_and_is_replaced_by_a_context_put()
+     {
+        let db = Db::open_memory().unwrap();
+        insert_policy_row(
+            &db,
+            "legacy-run",
+            i64::from(REDACTION_POLICY_VERSION),
+            "ordinary\n",
+        );
+
+        let legacy = db
+            .get_ci_log("/wt/ci", "legacy-run", "job")
+            .unwrap()
+            .unwrap();
+        assert_eq!(legacy.context, "");
+        assert_eq!(legacy.attempt, None);
+
+        let mut replacement = CiLogEntry::new(
+            "/wt/ci",
+            "legacy-run",
+            "job",
+            "tests",
+            "ordinary\n",
+            10,
+            1024,
+            1,
+        );
+        replacement.context = "github:github.com/o/a".into();
+        replacement.attempt = Some(2);
+        db.put_ci_log(&replacement).unwrap();
+
+        let replaced = db
+            .get_ci_log("/wt/ci", "legacy-run", "job")
+            .unwrap()
+            .unwrap();
+        assert_eq!(replaced.context, "github:github.com/o/a");
+        assert_eq!(replaced.attempt, Some(2));
+        let listed = db.list_ci_logs("/wt/ci").unwrap();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].run_id, "legacy-run");
+    }
 }
