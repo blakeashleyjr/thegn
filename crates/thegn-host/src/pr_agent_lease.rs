@@ -5,8 +5,8 @@ use std::time::Duration;
 
 use thegn_core::db::Db;
 use thegn_core::pr_queue::{
-    PR_AGENT_MAX_LEASE_MS, PrAgentAdmit, PrAgentLease, PrAgentLeaseView, PrAgentRefusal, PrqStatus,
-    expired_pr_agent_detail, pr_agent_lease_live,
+    AgentHeadOutcome, PR_AGENT_MAX_LEASE_MS, PrAgentAdmit, PrAgentLease, PrAgentLeaseView,
+    PrAgentRefusal, PrqStatus, expired_pr_agent_detail, pr_agent_lease_live,
 };
 use thegn_core::store::WorktreeAuxStore;
 
@@ -136,6 +136,21 @@ impl PrAgentGuard {
         db.record_pr_agent_head(&lease, admitted, own)
     }
 
+    pub(crate) fn record_outcome(
+        &self,
+        db: &Db,
+        outcome: AgentHeadOutcome,
+    ) -> anyhow::Result<bool> {
+        if self.lost.load(Ordering::Acquire) {
+            return Ok(false);
+        }
+        let lease = self
+            .lease
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        db.record_pr_agent_outcome(&lease, outcome)
+    }
+
     pub(crate) fn attempt(&self) -> u32 {
         self.lease
             .lock()
@@ -230,6 +245,18 @@ pub(crate) fn own_head_record_warning(number: u64, result: anyhow::Result<bool>)
         )),
         Err(error) => Some(format!(
             "PR #{number}: the agent's push could not be recorded under its lease; the next refresh treats it as a foreign push ({error})"
+        )),
+    }
+}
+
+pub(crate) fn outcome_record_warning(number: u64, result: anyhow::Result<bool>) -> Option<String> {
+    match result {
+        Ok(true) => None,
+        Ok(false) => Some(format!(
+            "PR #{number}: the agent run's outcome could not be recorded under its lease; `thegn pr queue list` will not show it"
+        )),
+        Err(error) => Some(format!(
+            "PR #{number}: the agent run's outcome could not be recorded under its lease; `thegn pr queue list` will not show it ({error})"
         )),
     }
 }
@@ -576,6 +603,116 @@ mod tests {
             own_head_record_warning(7, Err(anyhow::anyhow!("injected database failure"))).unwrap();
         assert!(warning.contains("could not be recorded under its lease"));
         assert!(warning.contains("injected database failure"));
+    }
+
+    #[test]
+    fn record_outcome_is_fenced_to_the_live_generation() {
+        use thegn_core::pr_queue::AgentHeadOutcome;
+
+        let dir = tempfile::tempdir().unwrap();
+        let db = Db::open_at(&dir.path().join("lease.db")).unwrap();
+        db.enqueue_bound_pr(
+            "/repo",
+            1,
+            Some("/repo/wt"),
+            "feature",
+            "main",
+            "github",
+            "https://github.com/me/repo/pull/1",
+        )
+        .unwrap();
+        let row = db.list_pr_queue().unwrap().remove(0);
+        let request = PrAgentAdmit {
+            key: &row.key,
+            expected_attempts: 0,
+            expected_checkout_gen: row.checkout_gen,
+            max_attempts: 3,
+            head: "head-a",
+            blocker: "ci",
+            detail: "dispatch",
+            lease_until_ms: lease_until_ms(),
+            owner_hint: Some("test"),
+            ci_candidate: None,
+        };
+        let guard = PrAgentGuard::admit(&db, &request).unwrap().unwrap();
+        assert!(
+            guard
+                .record_outcome(&db, AgentHeadOutcome::Unchanged)
+                .unwrap()
+        );
+        assert_eq!(
+            db.pr_agent_outcome(&row.key).unwrap().unwrap().outcome,
+            "unchanged"
+        );
+        let lease = guard
+            .lease
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        assert!(guard.finish(&db, None).unwrap());
+        assert!(
+            !db.record_pr_agent_outcome(&lease, AgentHeadOutcome::TeammatePush)
+                .unwrap()
+        );
+        assert_eq!(
+            db.pr_agent_outcome(&row.key).unwrap().unwrap().outcome,
+            "unchanged"
+        );
+    }
+
+    #[test]
+    fn record_outcome_after_lease_loss_writes_nothing() {
+        use thegn_core::pr_queue::AgentHeadOutcome;
+
+        let dir = tempfile::tempdir().unwrap();
+        let db = Db::open_at(&dir.path().join("lease.db")).unwrap();
+        db.enqueue_bound_pr(
+            "/repo",
+            1,
+            Some("/repo/wt"),
+            "feature",
+            "main",
+            "github",
+            "https://github.com/me/repo/pull/1",
+        )
+        .unwrap();
+        let row = db.list_pr_queue().unwrap().remove(0);
+        let request = PrAgentAdmit {
+            key: &row.key,
+            expected_attempts: 0,
+            expected_checkout_gen: row.checkout_gen,
+            max_attempts: 3,
+            head: "head-a",
+            blocker: "ci",
+            detail: "dispatch",
+            lease_until_ms: lease_until_ms(),
+            owner_hint: Some("test"),
+            ci_candidate: None,
+        };
+        let guard = PrAgentGuard::admit(&db, &request).unwrap().unwrap();
+        guard.lost.store(true, Ordering::Release);
+        assert!(
+            !guard
+                .record_outcome(&db, AgentHeadOutcome::AgentProgress)
+                .unwrap()
+        );
+        assert!(db.pr_agent_outcome(&row.key).unwrap().is_none());
+    }
+
+    #[test]
+    fn outcome_record_warning_texts() {
+        assert!(outcome_record_warning(7, Ok(true)).is_none());
+        let warning = "PR #7: the agent run's outcome could not be recorded under its lease; `thegn pr queue list` will not show it";
+        assert_eq!(
+            outcome_record_warning(7, Ok(false)).as_deref(),
+            Some(warning)
+        );
+        assert_eq!(
+            outcome_record_warning(7, Err(anyhow::anyhow!("injected database failure"))).as_deref(),
+            Some(
+                "PR #7: the agent run's outcome could not be recorded under its lease; `thegn pr queue list` will not show it (injected database failure)"
+            ),
+        );
     }
 
     #[test]

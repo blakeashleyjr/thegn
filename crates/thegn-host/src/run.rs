@@ -2846,12 +2846,13 @@ pub(crate) fn spawn_hunk_fetch(
     if panel_ui.hunks_banked(path) {
         return;
     }
-    let Some(token) = hunk_inflight.begin(path) else {
+    let wt = active_tab_path(session);
+    let Some(token) = hunk_inflight.begin(&crate::handlers::panel_changes::preview_key(&wt, path))
+    else {
         return;
     };
     let tx = hunk_tx.clone();
     let waker = waker.clone();
-    let wt = active_tab_path(session);
     let path = path.to_string();
     tokio::task::spawn_blocking(move || {
         use thegn_svc::git::GitBackend;
@@ -2863,13 +2864,19 @@ pub(crate) fn spawn_hunk_fetch(
                 Err(())
             }
         };
-        if tx.send((generation, token, path, hunks)).is_ok() {
+        if tx.send((generation, token, wt, path, hunks)).is_ok() {
             let _ = waker.wake(); // best-effort: waker pulse: an input nudge must never fail the calling path
         }
     });
 }
 
-pub(crate) type HunkMsg = (u64, u64, String, Result<Vec<thegn_svc::git::Hunk>, ()>);
+pub(crate) type HunkMsg = (
+    u64,
+    u64,
+    PathBuf,
+    String,
+    Result<Vec<thegn_svc::git::Hunk>, ()>,
+);
 
 type SubmoduleScanMsg = (
     u64,
@@ -8081,6 +8088,11 @@ async fn event_loop<T: Terminal>(
     // exit best-effort-deactivates and kills every resident session.
     let (plugin_tx, mut plugin_rx) = crate::plugins::plugin_channel();
     let mut plugins_state = crate::handlers::plugins::PluginsState::new(current_config.clone());
+    if current_config.daemon.enabled {
+        crate::plugin_stats::install_status_writer(
+            thegn_core::util::xdg_state_home().join("thegn"),
+        );
+    }
     let mut plugins_host: Option<crate::plugins::PluginsHost> = None;
     // The embedded help registry (authored pages + the generated keybindings
     // and config-reference pages); rebuilt on config reload so rebinds show.
@@ -9345,6 +9357,7 @@ async fn event_loop<T: Terminal>(
                 panel_ui.docs.loop_perf.push(&snap);
                 lsp_diag_rx.set_timing(true);
                 crate::perf_lsp::emit(&lsp_diag_rx);
+                crate::perf_log::emit(log_stats);
             }
         }
         if session.worktrees.is_empty() {
@@ -11661,11 +11674,17 @@ async fn event_loop<T: Terminal>(
         // path and its generation passes the acceptance cutoff. Completions
         // from before a refresh or worktree switch are dropped.
         let mut preview_slot_freed = false;
-        while let Ok((generation, token, path, hunks)) = hunk_rx.try_recv() {
+        while let Ok((generation, token, worktree, path, hunks)) = hunk_rx.try_recv() {
             preview_slot_freed = true;
             loop_perf.tick(crate::perf::WakeSource::Hunk);
-            let owns_path = hunk_inflight.finish(&path, token);
-            if owns_path && generation >= panel_ui.hunks_gen {
+            let owns_path = hunk_inflight.finish(
+                &crate::handlers::panel_changes::preview_key(&worktree, &path),
+                token,
+            );
+            if owns_path
+                && generation >= panel_ui.hunks_gen
+                && worktree == active_tab_path(&session)
+            {
                 panel_ui.bank_hunks(path, hunks);
                 dirty = true;
             }
@@ -11723,12 +11742,17 @@ async fn event_loop<T: Terminal>(
                 }
             }
         }
-        while let Ok((generation, token, path, summary)) = submodule_preview_rx.try_recv() {
+        while let Ok((generation, token, worktree, path, summary)) = submodule_preview_rx.try_recv()
+        {
             preview_slot_freed = true;
             loop_perf.tick(crate::perf::WakeSource::Hunk);
-            let owns_path = submodule_preview_inflight.finish(&path, token);
+            let owns_path = submodule_preview_inflight.finish(
+                &crate::handlers::panel_changes::preview_key(&worktree, &path),
+                token,
+            );
             if owns_path
                 && generation >= panel_ui.hunks_gen
+                && worktree == active_tab_path(&session)
                 && let Some(submodule) = model
                     .panel
                     .changes

@@ -1023,13 +1023,13 @@ pub(crate) fn drive_queue(
                 };
                 let own =
                     crate::pr_agent_lease::observe_own_head(&loc, &head, || remote_after.clone());
-                let head_warning = crate::pr_head_outcome::observe_outcome(
+                let head_outcome = crate::pr_head_outcome::observe_outcome(
                     &loc,
                     &head,
                     remote_after.as_deref(),
                     !guard.lease_lost(),
-                )
-                .and_then(|outcome| {
+                );
+                let head_warning = head_outcome.and_then(|outcome| {
                     crate::pr_head_outcome::outcome_warning(item.number, outcome, cfg)
                 });
                 match crate::pr_authorship::revalidate_after_agent(
@@ -1045,6 +1045,14 @@ pub(crate) fn drive_queue(
                             && let Some(warning) = crate::pr_agent_lease::own_head_record_warning(
                                 item.number,
                                 guard.record_own_head(db, &head, &own),
+                            )
+                        {
+                            out.warnings.push(warning);
+                        }
+                        if let Some(outcome) = head_outcome
+                            && let Some(warning) = crate::pr_agent_lease::outcome_record_warning(
+                                item.number,
+                                guard.record_outcome(db, outcome),
                             )
                         {
                             out.warnings.push(warning);

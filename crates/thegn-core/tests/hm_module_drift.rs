@@ -93,8 +93,66 @@ const OMITTED: &[(&str, &str)] = &[
     ("toolchain", "toolchain policy is not exposed"),
     ("limits", "resource limits are not exposed"),
     ("disk", "disk and cache policy is not exposed"),
-    ("activity", "activity detection is not exposed"),
-    ("notifications", "notifications are not exposed"),
+    (
+        "notifications.desktop_min_urgency",
+        "string-typed urgency has no destination enum to pin and is not exposed",
+    ),
+    (
+        "notifications.process_exit",
+        "string-typed exit policy has no destination enum to pin and is not exposed",
+    ),
+    (
+        "notifications.agent_error_signatures",
+        "bounded validated signature list is not exposed",
+    ),
+    (
+        "notifications.priority",
+        "per-kind priority map is not exposed",
+    ),
+    ("notifications.rules", "routing rules are not exposed"),
+    ("notifications.dnd", "do-not-disturb table is not exposed"),
+    ("notifications.sound", "sound table is not exposed"),
+    ("notifications.modes", "notification modes are not exposed"),
+    (
+        "notifications.active_mode",
+        "active mode selection is not exposed",
+    ),
+    (
+        "notifications.push",
+        "push sinks carry credentials and are not exposed",
+    ),
+    (
+        "activity.cpu_percent",
+        "f64 threshold needs float pinning and is not exposed",
+    ),
+    (
+        "activity.runaway_core_fraction",
+        "f64 threshold needs float pinning and is not exposed",
+    ),
+    (
+        "activity.runaway_secs",
+        "f64 threshold needs float pinning and is not exposed",
+    ),
+    (
+        "activity.quiet_grace_secs",
+        "f64 threshold needs float pinning and is not exposed",
+    ),
+    (
+        "activity.resume_grace_secs",
+        "f64 threshold needs float pinning and is not exposed",
+    ),
+    (
+        "activity.spawn_grace_secs",
+        "f64 threshold needs float pinning and is not exposed",
+    ),
+    (
+        "activity.unsolicited_gap_secs",
+        "f64 threshold needs float pinning and is not exposed",
+    ),
+    (
+        "activity.output_hint_ttl_secs",
+        "f64 threshold needs float pinning and is not exposed",
+    ),
     ("automations", "automation rules are not exposed"),
     (
         "drawer.kind",
@@ -607,6 +665,8 @@ fn every_schema_key_is_rendered_or_dispositioned() {
         "strip",
         "git",
         "stats",
+        "notifications",
+        "activity",
         "monitor",
         "pr",
         "watch",
@@ -902,6 +962,51 @@ fn hm_git_and_stats_families_are_rendered() {
         "stats.disk_free_critical",
         "stats.alerts",
         "stats.net_icons",
+    ] {
+        assert!(schema_has_path(path), "omission must stay pinned: {path}");
+    }
+}
+
+#[test]
+fn hm_notifications_and_activity_families_are_rendered() {
+    let rendered = rendered_paths(&module_src());
+    let omissions: BTreeSet<&str> = OMITTED.iter().map(|(path, _)| *path).collect();
+    for table in ["notifications", "activity"] {
+        let schema = schema_field(table);
+        let properties = schema["properties"]
+            .as_object()
+            .unwrap_or_else(|| panic!("{table} schema properties"));
+        for key in properties.keys() {
+            let path = format!("{table}.{key}");
+            if omissions.contains(path.as_str()) {
+                assert!(
+                    schema_has_path(&path),
+                    "omitted schema key must exist: {path}"
+                );
+            } else {
+                assert!(rendered.contains(&path), "Home Manager must render {path}");
+            }
+        }
+    }
+    for path in [
+        "notifications.desktop_min_urgency",
+        "notifications.process_exit",
+        "notifications.agent_error_signatures",
+        "notifications.priority",
+        "notifications.rules",
+        "notifications.dnd",
+        "notifications.sound",
+        "notifications.modes",
+        "notifications.active_mode",
+        "notifications.push",
+        "activity.cpu_percent",
+        "activity.runaway_core_fraction",
+        "activity.runaway_secs",
+        "activity.quiet_grace_secs",
+        "activity.resume_grace_secs",
+        "activity.spawn_grace_secs",
+        "activity.unsolicited_gap_secs",
+        "activity.output_hint_ttl_secs",
     ] {
         assert!(schema_has_path(path), "omission must stay pinned: {path}");
     }

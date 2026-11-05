@@ -94,6 +94,8 @@ fn wire_schema() -> serde_json::Value {
         AgentSessionsQuery,
         EventsQuery,
         AttachQuery,
+        PluginsStatusReply,
+        PluginStatusRow,
     );
     let routes: Vec<serde_json::Value> = routes::API_CALLS
         .iter()

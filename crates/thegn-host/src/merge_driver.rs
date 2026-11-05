@@ -538,7 +538,9 @@ pub(crate) fn drive_queue(
                 }
                 let Some(branch) = worktree_branches.get(worktree) else {
                     return crate::agent_run::AgentDispatch::InfraHold(
-                        "worktree identity drift: queue item identity is unavailable".into(),
+                        thegn_core::merge_identity_drift::worktree_drift_detail(
+                            "queue item identity is unavailable",
+                        ),
                     );
                 };
                 let expected = expected_oids.borrow().get(worktree).cloned();
@@ -548,9 +550,9 @@ pub(crate) fn drive_queue(
                     branch,
                     expected.as_deref(),
                 ) {
-                    return crate::agent_run::AgentDispatch::InfraHold(format!(
-                        "worktree identity drift: {reason}"
-                    ));
+                    return crate::agent_run::AgentDispatch::InfraHold(
+                        thegn_core::merge_identity_drift::worktree_drift_detail(&reason),
+                    );
                 }
                 crate::agent_run::agent_floor_gate(
                     full,
@@ -1132,10 +1134,8 @@ fn drive_queue_with(
                 Ok(a) => a,
                 Err(e) => {
                     if let Some(drift) = e.downcast_ref::<CandidateDrift>() {
-                        let detail = format!(
-                            "identity drift: {}; re-enqueue with `thegn merge add` to adopt the new tip",
-                            drift.reason
-                        );
+                        let detail =
+                            thegn_core::merge_identity_drift::candidate_drift_detail(&drift.reason);
                         let fields = set(db, MqStatus::AgentBlocked, None, Some(&detail));
                         stop_on_write_error!('attempt);
                         progress(&DriveStep {
