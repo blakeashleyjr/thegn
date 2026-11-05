@@ -367,9 +367,9 @@ directory is skipped. Editing a context file rebuilds the image on the next
 launch, and the first launch after upgrading rebuilds once because the tag
 format changed. If the context cannot be digested (more than 2048 entries, more
 than 16 MiB of file content, a path deeper than 32 levels, or an unreadable
-file), thegn warns `devcontainer: could not digest build context <path>
-(<reason>); the image tag covers the Dockerfile (when readable) and build
-declaration only` and keeps the build.
+file), thegn warns that it could not digest the build context, names the path
+and the reason, and says the image tag covers only the Dockerfile (when
+readable) and the build declaration. The build still runs.
 
 ### Lifecycle and provider fallback
 

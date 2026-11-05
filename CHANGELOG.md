@@ -27,8 +27,6 @@ All notable changes to **thegn** are documented here. The format follows
   committed locally without pushing, or another person pushed meanwhile.
 - The status modal's plugins section adds a `bridge` column for provider-bridge
   timeout, cancel, late, malformed and closed counters.
-- `THEGN_PERF` rollups report an `lsp queue` event with diagnostics-queue
-  counters.
 - The Home Manager module adds null-default `programs.thegn.git*` options for
   `[git]` scalars and `programs.thegn.stats*` options for `[stats]` icons and
   the disk path: `gitOverrideGpg`, `gitMergeGuard`, `gitAutoFetch`,
@@ -46,8 +44,6 @@ All notable changes to **thegn** are documented here. The format follows
 - A queue agent whose sandbox cannot write the worktree or Git metadata is held
   with `cannot-write-worktree` or `cannot-write-git-metadata` instead of being
   started and failing.
-- The stage launch digest no longer includes the `[sandbox]` policy; the daemon
-  resolves that policy at launch.
 - On startup, a saved `starting` share whose process exited becomes `failed`,
   and an `up` share that could not restart becomes `unknown`; `thegn share list`
   shows `(needs reconcile)` for the latter.
