@@ -8081,6 +8081,11 @@ async fn event_loop<T: Terminal>(
     // exit best-effort-deactivates and kills every resident session.
     let (plugin_tx, mut plugin_rx) = crate::plugins::plugin_channel();
     let mut plugins_state = crate::handlers::plugins::PluginsState::new(current_config.clone());
+    if current_config.daemon.enabled {
+        crate::plugin_stats::install_status_writer(
+            thegn_core::util::xdg_state_home().join("thegn"),
+        );
+    }
     let mut plugins_host: Option<crate::plugins::PluginsHost> = None;
     // The embedded help registry (authored pages + the generated keybindings
     // and config-reference pages); rebuilt on config reload so rebinds show.
