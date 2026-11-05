@@ -489,6 +489,10 @@ for line in sys.stdin:
         reason = "use Python to create a portable symlink fixture when available"
     )]
     fn load_plugin_refuses_non_resident_missing_app_tab_oversized_and_symlinked_manifests() {
+        if !python_available() {
+            return;
+        }
+
         let non_resident = staged_plugin(
             "one_shot",
             &fault_script(),
