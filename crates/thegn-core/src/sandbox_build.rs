@@ -6,7 +6,8 @@
 //!
 //! The tag binds the build declaration, safely-read Dockerfile bytes, and a
 //! bounded digest of the build context. `.dockerignore` is not interpreted, so
-//! ignored files can cause an extra rebuild. The argv + tag
+//! ignored files can cause an extra rebuild. File mode bits are not included,
+//! so a chmod-only change does not change the tag. The argv + tag
 //! construction are unit-tested here; only [`build_image`] touches a
 //! subprocess (a `cov_ignore` seam exercised by `test/smoke.sh`).
 
@@ -52,6 +53,7 @@ pub const CONTEXT_DIGEST_MAX_BYTES: u64 = 16 * 1024 * 1024;
 pub enum ContextDigestError {
     TooManyEntries { limit: usize },
     TooManyBytes { limit: u64 },
+    TooDeep { limit: usize },
     Io { path: PathBuf, error: io::Error },
 }
 
@@ -60,6 +62,9 @@ impl std::fmt::Display for ContextDigestError {
         match self {
             Self::TooManyEntries { limit } => write!(f, "more than {limit} entries"),
             Self::TooManyBytes { limit } => write!(f, "more than {limit} bytes of files"),
+            Self::TooDeep { limit } => {
+                write!(f, "build context is deeper than {limit} directories")
+            }
             Self::Io { path, error } => write!(f, "{}: {error}", path.display()),
         }
     }
@@ -92,8 +97,9 @@ fn check_context_file_size(
     Ok(())
 }
 
-/// Hash a bounded build context without following symlinks. `.dockerignore` is
-/// not interpreted, so an ignored file may cause an extra rebuild.
+/// Hash a bounded build context without following entry symlinks. `.dockerignore` is
+/// not interpreted, so an ignored file may cause an extra rebuild. File mode bits
+/// are not included, so a chmod-only change does not change the digest.
 pub fn context_sha256(root: &Path) -> Result<String, ContextDigestError> {
     context_sha256_bounded(root, CONTEXT_DIGEST_MAX_ENTRIES, CONTEXT_DIGEST_MAX_BYTES)
 }
@@ -111,9 +117,7 @@ pub(crate) fn context_sha256_bounded(
         state: &mut ContextDigestState,
     ) -> Result<(), ContextDigestError> {
         if depth > MAX_DEPTH {
-            return Err(ContextDigestError::TooManyEntries {
-                limit: state.max_entries,
-            });
+            return Err(ContextDigestError::TooDeep { limit: MAX_DEPTH });
         }
         let entries = std::fs::read_dir(dir).map_err(|error| ContextDigestError::Io {
             path: dir.to_path_buf(),
@@ -149,11 +153,11 @@ pub(crate) fn context_sha256_bounded(
                 })?;
             let relative_bytes = relative_path.as_os_str().as_encoded_bytes();
             if metadata.file_type().is_dir() {
-                state.hasher.update([b'd']);
+                state.hasher.update(*b"d");
                 hash_field(&mut state.hasher, relative_bytes);
                 walk(&path, &relative_path, depth + 1, state)?;
             } else if metadata.file_type().is_file() {
-                state.hasher.update([b'f']);
+                state.hasher.update(*b"f");
                 hash_field(&mut state.hasher, relative_bytes);
                 let remaining = state.max_bytes.saturating_sub(state.bytes);
                 let mut file =
@@ -191,7 +195,7 @@ pub(crate) fn context_sha256_bounded(
                     format!("{:x}", file_hasher.finalize()).as_bytes(),
                 );
             } else if metadata.file_type().is_symlink() {
-                state.hasher.update([b'l']);
+                state.hasher.update(*b"l");
                 hash_field(&mut state.hasher, relative_bytes);
                 let target = std::fs::read_link(&path).map_err(|error| ContextDigestError::Io {
                     path: path.clone(),
@@ -199,7 +203,7 @@ pub(crate) fn context_sha256_bounded(
                 })?;
                 hash_field(&mut state.hasher, target.as_os_str().as_encoded_bytes());
             } else {
-                state.hasher.update([b'o']);
+                state.hasher.update(*b"o");
                 hash_field(&mut state.hasher, relative_bytes);
             }
         }
@@ -214,21 +218,30 @@ pub(crate) fn context_sha256_bounded(
         max_bytes,
     };
     state.hasher.update(b"thegn.dc-build-context.v1\0");
-    let root_metadata =
-        std::fs::symlink_metadata(root).map_err(|error| ContextDigestError::Io {
+    // The context path comes from trusted devcontainer configuration. Resolve
+    // the root once so a configured symlink-to-directory is accepted, while
+    // all entries below it remain no-follow.
+    let canonical_root = root
+        .canonicalize()
+        .map_err(|error| ContextDigestError::Io {
             path: root.to_path_buf(),
+            error,
+        })?;
+    let root_metadata =
+        std::fs::symlink_metadata(&canonical_root).map_err(|error| ContextDigestError::Io {
+            path: canonical_root.clone(),
             error,
         })?;
     if !root_metadata.file_type().is_dir() {
         return Err(ContextDigestError::Io {
-            path: root.to_path_buf(),
+            path: canonical_root.clone(),
             error: io::Error::new(
                 io::ErrorKind::InvalidInput,
                 "build context is not a directory",
             ),
         });
     }
-    walk(root, Path::new(""), 0, &mut state)?;
+    walk(&canonical_root, Path::new(""), 0, &mut state)?;
     Ok(format!("{:x}", state.hasher.finalize()))
 }
 
@@ -611,6 +624,43 @@ mod tests {
             context_sha256(&dir.path().join("missing")),
             Err(ContextDigestError::Io { .. })
         ));
+    }
+
+    #[test]
+    fn context_digest_reports_excessive_depth() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut nested = dir.path().to_path_buf();
+        for _ in 0..34 {
+            nested.push("d");
+            std::fs::create_dir(&nested).unwrap();
+        }
+
+        assert!(matches!(
+            context_sha256(dir.path()),
+            Err(ContextDigestError::TooDeep { limit: 32 })
+        ));
+        assert_eq!(
+            ContextDigestError::TooDeep { limit: 32 }.to_string(),
+            "build context is deeper than 32 directories"
+        );
+    }
+
+    #[test]
+    fn context_digest_accepts_a_symlinked_root_directory() {
+        if !cfg!(unix) {
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let context = dir.path().join("context");
+        std::fs::create_dir(&context).unwrap();
+        std::fs::write(context.join("file"), "contents").unwrap();
+        let context_link = dir.path().join("context-link");
+        crate::fsperm::create_symlink(&context, &context_link, true).unwrap();
+
+        assert_eq!(
+            context_sha256(&context).unwrap(),
+            context_sha256(&context_link).unwrap()
+        );
     }
 
     #[test]
