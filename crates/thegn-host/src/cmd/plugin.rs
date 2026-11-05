@@ -7,12 +7,14 @@
 //! - `check` — full validation (api compatibility, command presence,
 //!   contribution acceptance, id clashes, unparseable manifests); exits
 //!   non-zero when any *enabled* plugin fails, so it fits a hook.
-//! - `preview` — render a synthetic fixture or trace through the shared app
-//!   renderer without starting a plugin process.
+//! - `preview` — render a synthetic fixture or trace, or (with
+//!   `--plugin-dir --headless`) a real resident plugin's first view, through
+//!   the shared app renderer.
 //!
 //! There is no `restart` verb: crashed resident plugins restart themselves
 //! with backoff, and deliberate restarts ride config hot-reload.
 
+mod live;
 mod preview;
 mod trace;
 
@@ -235,7 +237,7 @@ pub enum Action {
     },
     /// Validate every enabled plugin; exits non-zero on any problem.
     Check,
-    /// Preview a synthetic fixture or a recorded trace with the shared app renderer (no plugin process is started).
+    /// Preview a fixture or trace without starting a plugin, or start `--plugin-dir` with no host grants.
     Preview(preview::Options),
 }
 
