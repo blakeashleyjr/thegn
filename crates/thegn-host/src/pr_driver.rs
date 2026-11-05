@@ -869,10 +869,16 @@ pub(crate) fn drive_queue(
                     out.needs_human.push(item.number);
                     continue;
                 }
-                let actual_branch =
-                    GitLoc::from_db(wt, None).git_out(&["rev-parse", "--abbrev-ref", "HEAD"]);
-                if !checkout_matches(actual_branch.as_deref(), &fetched.pr.head_ref_name) {
-                    let actual = actual_branch.as_deref().unwrap_or("unknown");
+                let actual_branch = read_checkout(
+                    &GitLoc::from_db(wt, None),
+                    &["rev-parse", "--abbrev-ref", "HEAD"],
+                );
+                let branch_text = match &actual_branch {
+                    CheckoutRead::Value(branch) => Some(branch.as_str()),
+                    CheckoutRead::Missing | CheckoutRead::Unreadable(_) => None,
+                };
+                if !checkout_matches(branch_text, &fetched.pr.head_ref_name) {
+                    let actual = branch_hold_actual(&actual_branch);
                     let reason = format!(
                         "worktree {wt} is on branch {actual}, but PR #{} head is {}; agent dispatch held",
                         item.number, fetched.pr.head_ref_name
@@ -1068,6 +1074,69 @@ fn checkout_matches(actual: Option<&str>, expected: &str) -> bool {
     actual.is_some_and(|branch| branch == expected)
 }
 
+/// What a checkout identity read established. `Missing` is Git (or the OS) answering "no such
+/// worktree"; `Unreadable` is Git not being askable or not answering (spawn failure, timeout,
+/// output limit, invalid UTF-8, an unreachable ssh host, empty success): the caller must not
+/// claim the checkout is gone.
+#[derive(Debug, PartialEq, Eq)]
+enum CheckoutRead {
+    Value(String),
+    Missing,
+    Unreadable(String),
+}
+
+/// Pure classification of one `GitLoc::git_text` result. `remote` is true for every loc but
+/// `GitLoc::Local` (exit status 255 is ssh's own connection failure there, not Git's answer).
+fn classify_checkout_read(
+    result: Result<String, thegn_core::git_run::GitTextError>,
+    remote: bool,
+) -> CheckoutRead {
+    use thegn_core::git_run::{GitOutcome, GitTextError};
+    match result {
+        Ok(text) if !text.is_empty() => CheckoutRead::Value(text),
+        Ok(_) => CheckoutRead::Unreadable("Git printed nothing".to_owned()),
+        Err(GitTextError::Failed(GitOutcome::Exit {
+            code: Some(255),
+            stderr_tail,
+        })) => {
+            if remote {
+                CheckoutRead::Unreadable(one_line(&stderr_tail))
+            } else {
+                CheckoutRead::Missing
+            }
+        }
+        Err(GitTextError::Failed(GitOutcome::Exit { .. })) => CheckoutRead::Missing,
+        Err(GitTextError::Failed(GitOutcome::Spawn(error))) => {
+            CheckoutRead::Unreadable(one_line(&error.to_string()))
+        }
+        Err(error) => CheckoutRead::Unreadable(one_line(&error.to_string())),
+    }
+}
+
+/// One line, at most 200 characters (a Git stderr tail can be long and multi-line; this text lands
+/// in a status reason and a warning).
+fn one_line(text: &str) -> String {
+    text.split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .chars()
+        .take(200)
+        .collect()
+}
+
+fn read_checkout(loc: &GitLoc, args: &[&str]) -> CheckoutRead {
+    classify_checkout_read(loc.git_text(args), !matches!(loc, GitLoc::Local(_)))
+}
+
+/// The branch text of an agent-dispatch hold reason.
+fn branch_hold_actual(read: &CheckoutRead) -> String {
+    match read {
+        CheckoutRead::Value(branch) => branch.clone(),
+        CheckoutRead::Missing => "unknown".to_owned(),
+        CheckoutRead::Unreadable(why) => format!("unknown (could not be read: {why})"),
+    }
+}
+
 /// Re-read both durable queue authorization and forge identity immediately
 /// before a mutation. A stale read cannot authorize an effect after a rebind.
 pub(crate) fn reattest(
@@ -1093,11 +1162,17 @@ pub(crate) fn reattest(
     }
     if let Some(worktree) = item.worktree.as_deref() {
         let hint = format!("run `thegn pr queue rebind --pr {}`", item.number);
-        let actual_root = loc
-            .git_out(&["rev-parse", "--show-toplevel"])
-            .ok_or_else(|| {
-                format!("queued checkout is missing or no longer a Git worktree; {hint}")
-            })?;
+        let actual_root = match read_checkout(loc, &["rev-parse", "--show-toplevel"]) {
+            CheckoutRead::Value(root) => root,
+            CheckoutRead::Missing => {
+                return Err(format!(
+                    "queued checkout is missing or no longer a Git worktree; {hint}"
+                ));
+            }
+            CheckoutRead::Unreadable(why) => {
+                return Err(format!("queued checkout could not be read ({why}); {hint}"));
+            }
+        };
         if !checkout_root_matches(loc, &actual_root, worktree)
             .ok_or_else(|| format!("queued checkout identity could not be verified; {hint}"))?
         {
@@ -1105,9 +1180,19 @@ pub(crate) fn reattest(
                 "queued checkout now resolves to another repository; {hint}"
             ));
         }
-        let branch = loc
-            .git_out(&["rev-parse", "--abbrev-ref", "HEAD"])
-            .ok_or_else(|| format!("queued checkout branch could not be verified; {hint}"))?;
+        let branch = match read_checkout(loc, &["rev-parse", "--abbrev-ref", "HEAD"]) {
+            CheckoutRead::Value(branch) => branch,
+            CheckoutRead::Missing => {
+                return Err(format!(
+                    "queued checkout branch could not be verified; {hint}"
+                ));
+            }
+            CheckoutRead::Unreadable(why) => {
+                return Err(format!(
+                    "queued checkout branch could not be read ({why}); {hint}"
+                ));
+            }
+        };
         if !checkout_matches(Some(&branch), &expected.pr.head_ref_name) {
             return Err(format!("queued checkout branch changed; {hint}"));
         }
@@ -1144,8 +1229,13 @@ pub(crate) fn reattest(
 fn checkout_root_matches(loc: &GitLoc, actual_root: &str, worktree: &str) -> Option<bool> {
     if matches!(loc, GitLoc::Local(_)) {
         // The stored binding can be a subdirectory; resolve both paths through Git.
-        let expected_root =
-            GitLoc::from_db(worktree, None).git_out(&["rev-parse", "--show-toplevel"])?;
+        let expected_root = match read_checkout(
+            &GitLoc::from_db(worktree, None),
+            &["rev-parse", "--show-toplevel"],
+        ) {
+            CheckoutRead::Value(root) => root,
+            CheckoutRead::Missing | CheckoutRead::Unreadable(_) => return None,
+        };
         return Some(
             Path::new(actual_root.trim()).canonicalize().ok()?
                 == Path::new(expected_root.trim()).canonicalize().ok()?,
@@ -3569,6 +3659,154 @@ mod tests {
         assert_eq!(
             checkout_root_matches(&remote, "/workspace/other", "/workspace/project"),
             Some(false)
+        );
+    }
+
+    #[test]
+    fn classify_checkout_read_separates_git_refusal_from_unreadable() {
+        use thegn_core::git_run::{GitOutcome, GitTextError};
+
+        assert_eq!(
+            classify_checkout_read(Ok("main".into()), false),
+            CheckoutRead::Value("main".into())
+        );
+        assert!(matches!(
+            classify_checkout_read(Ok(String::new()), false),
+            CheckoutRead::Unreadable(_)
+        ));
+        assert_eq!(
+            classify_checkout_read(
+                Err(GitTextError::Failed(GitOutcome::Exit {
+                    code: Some(128),
+                    stderr_tail: "fatal: not a git repository".into(),
+                })),
+                false,
+            ),
+            CheckoutRead::Missing
+        );
+        assert!(matches!(
+            classify_checkout_read(
+                Err(GitTextError::Failed(GitOutcome::Spawn(
+                    std::io::Error::from(std::io::ErrorKind::NotFound,)
+                ))),
+                false,
+            ),
+            CheckoutRead::Unreadable(_)
+        ));
+        assert!(matches!(
+            classify_checkout_read(
+                Err(GitTextError::Failed(GitOutcome::Spawn(
+                    std::io::Error::from(std::io::ErrorKind::PermissionDenied,)
+                ))),
+                false,
+            ),
+            CheckoutRead::Unreadable(_)
+        ));
+        assert!(matches!(
+            classify_checkout_read(Err(GitTextError::Failed(GitOutcome::Timeout)), false,),
+            CheckoutRead::Unreadable(_)
+        ));
+        assert!(matches!(
+            classify_checkout_read(Err(GitTextError::InvalidUtf8), false),
+            CheckoutRead::Unreadable(_)
+        ));
+    }
+
+    #[test]
+    fn classify_checkout_read_treats_remote_255_as_unreadable() {
+        use thegn_core::git_run::{GitOutcome, GitTextError};
+
+        let remote_255 = || -> Result<String, GitTextError> {
+            Err(GitTextError::Failed(GitOutcome::Exit {
+                code: Some(255),
+                stderr_tail: "ssh: connect to host x port 22: No route".into(),
+            }))
+        };
+        assert!(matches!(
+            classify_checkout_read(remote_255(), true),
+            CheckoutRead::Unreadable(_)
+        ));
+        assert_eq!(
+            classify_checkout_read(remote_255(), false),
+            CheckoutRead::Missing
+        );
+
+        for remote in [false, true] {
+            assert_eq!(
+                classify_checkout_read(
+                    Err(GitTextError::Failed(GitOutcome::Exit {
+                        code: Some(128),
+                        stderr_tail: "fatal: not a git repository".into(),
+                    })),
+                    remote,
+                ),
+                CheckoutRead::Missing
+            );
+        }
+    }
+
+    #[test]
+    fn classify_checkout_read_flattens_and_bounds_the_reason() {
+        use thegn_core::git_run::{GitOutcome, GitTextError};
+
+        let stderr_tail = "a\nb\n".to_owned() + &"x".repeat(500);
+        let read = classify_checkout_read(
+            Err(GitTextError::Failed(GitOutcome::Exit {
+                code: Some(255),
+                stderr_tail,
+            })),
+            true,
+        );
+        assert!(matches!(
+            read,
+            CheckoutRead::Unreadable(why) if !why.contains('\n') && why.chars().count() <= 200
+        ));
+    }
+
+    #[test]
+    fn read_checkout_reads_a_real_repository_and_reports_a_plain_directory_as_missing() {
+        let dir = tempfile::tempdir().unwrap();
+        git_repo_on_branch(dir.path(), "feat");
+        let checkout = GitLoc::from_db(dir.path().to_str().unwrap(), None);
+        assert_eq!(
+            read_checkout(&checkout, &["rev-parse", "--abbrev-ref", "HEAD"]),
+            CheckoutRead::Value("feat".into())
+        );
+
+        let not_a_directory = dir.path().join("tracked");
+        let file_checkout = GitLoc::from_db(not_a_directory.to_str().unwrap(), None);
+        // `git -C <file>` refuses the path with exit 128; Git runs from the caller's cwd,
+        // so the OS does not report a spawn failure for this path.
+        assert!(matches!(
+            read_checkout(&file_checkout, &["rev-parse", "--abbrev-ref", "HEAD"]),
+            CheckoutRead::Missing
+        ));
+
+        let plain_dir = tempfile::tempdir().unwrap();
+        let plain_checkout = GitLoc::from_db(plain_dir.path().to_str().unwrap(), None);
+        assert_eq!(
+            read_checkout(&plain_checkout, &["rev-parse", "--abbrev-ref", "HEAD"]),
+            CheckoutRead::Missing
+        );
+
+        let gone = dir.path().join("gone");
+        let missing_checkout = GitLoc::from_db(gone.to_str().unwrap(), None);
+        assert_eq!(
+            read_checkout(&missing_checkout, &["rev-parse", "--abbrev-ref", "HEAD"]),
+            CheckoutRead::Missing
+        );
+    }
+
+    #[test]
+    fn branch_hold_actual_names_an_unreadable_branch() {
+        assert_eq!(
+            branch_hold_actual(&CheckoutRead::Value("feat".into())),
+            "feat"
+        );
+        assert_eq!(branch_hold_actual(&CheckoutRead::Missing), "unknown");
+        assert_eq!(
+            branch_hold_actual(&CheckoutRead::Unreadable("timed out".into())),
+            "unknown (could not be read: timed out)"
         );
     }
 
