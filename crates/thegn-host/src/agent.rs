@@ -941,7 +941,8 @@ pub fn prepare_sandbox_env(
                         compose_miss = Some(message);
                         continue;
                     }
-                    let m = format!("sandbox {} failed: {e}", spec.backend.label());
+                    let m =
+                        crate::sandbox_failure::sandbox_failed_message(spec.backend.label(), &e);
                     if explicit_choice {
                         anyhow::bail!("{m} for {worktree}")
                     }
