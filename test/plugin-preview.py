@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
-"""Offline synthetic preview conformance; live fault fixtures arrive with the live-preview slice."""
+"""Offline preview conformance; live preview covers the normal-mode fixture and fault modes are unit-tested."""
 import argparse
 import json
 import os
 from pathlib import Path
+import shutil
 import subprocess
 import tempfile
 
@@ -65,6 +66,15 @@ def main():
         fixture_path.write_text(json.dumps(fixture))
         run("--fixture", fixture_path, "--headless", success=False)
         steps.append("ambiguous scripted input refusal")
+        if shutil.which("python3") is None:
+            steps.append("live preview skipped: python3 missing")
+        else:
+            value = json.loads(run("--plugin-dir", repo / "examples/plugins/fixtures", "--headless",
+                                   "--size", "80x10").stdout)
+            assert value["live"]["surface"] == "fixture.workspace"
+            assert value["live"]["revision"] == 1
+            assert any("Ready" in line for line in value["lines"])
+            steps.append("live headless preview of the fault fixture")
         report["status"] = "passed"
     except (AssertionError, OSError, ValueError, subprocess.SubprocessError) as error:
         report["reason"] = str(error)

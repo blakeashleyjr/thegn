@@ -187,7 +187,12 @@ account, network or plugin process. Add `--headless` for a one-line JSON screen 
 geometry), or pass `--fixture <file>` with your own `{"view": ..., "inputs": [...]}` document. `--record <file>` writes a
 new owner-only trace (an existing file is never overwritten); only synthetic fixtures recorded with `--include-content`
 can be replayed with `--replay <file>`. If a fixture file in the current directory is named `gallery`, pass it as
-`--fixture ./gallery` to distinguish it from the bundled fixture. Previewing a running plugin is not available yet.
+`--fixture ./gallery` to distinguish it from the bundled fixture. Use `--plugin-dir <DIR> --headless [--wait-ms N]` to
+preview the first valid view from the resident plugin in DIR; its manifest must declare mode `resident` and an `AppTab`
+contribution. The preview grants `surface:app` only, answers plugin requests with `denied`, and reads no secrets, manifest
+environment or plugin state. The JSON snapshot includes a `live` object with `plugin`, `surface`, `revision`,
+`rejected_views` and `junk_lines`. A crash, timeout or unclean shutdown exits non-zero; the plugin is stopped and reaped
+before the command exits.
 
 ## Provider plugins
 
