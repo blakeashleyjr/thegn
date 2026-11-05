@@ -277,7 +277,7 @@ fn remote_compose_refusal_never_creates_or_execs_a_container() {
     let _state = crate::testenv::IsolatedState::with_env(&[("PATH", &path)]);
     let mut cfg = remote_compose_cfg("zerospawn-b.test");
     cfg.sandbox.backend = thegn_core::config::SandboxBackend::Auto;
-    cfg.sandbox.backend_chain = vec!["podman".into()];
+    cfg.sandbox.backend_chain = vec![String::from("podman")];
     let loc = GitLoc::from_db("/wt/zerospawn-b", None);
     let error = prepare_sandbox_env(
         &cfg,
