@@ -211,15 +211,14 @@ pub(super) fn claim_or_verify(spec: &ProjectionSpec) -> Result<(), ProjectionOwn
                 manifest.display()
             ))
         })?;
-    let written = fsperm::ensure_private_dir(manifest_parent)
+    fsperm::ensure_private_dir(manifest_parent)
         .and_then(|()| fsperm::open_private_dir(manifest_parent))
         .and_then(|dir| dir.write_owner_only_atomic(manifest_name, contents.as_bytes()))
-        .map(|_| ())
         .map_err(|error| {
             ProjectionOwnershipError::Unsafe(format!("{}: {error}", manifest.display()))
         })?;
     record_generation(spec, &generation);
-    Ok(written)
+    Ok(())
 }
 
 pub(super) fn verify(spec: &ProjectionSpec) -> Result<(), ProjectionOwnershipError> {
