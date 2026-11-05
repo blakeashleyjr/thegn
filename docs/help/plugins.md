@@ -191,8 +191,10 @@ can be replayed with `--replay <file>`. If a fixture file in the current directo
 preview the first valid view from the resident plugin in DIR; its manifest must declare mode `resident` and an `AppTab`
 contribution. The preview grants `surface:app` only, answers plugin requests with `denied`, and reads no secrets, manifest
 environment or plugin state. The JSON snapshot includes a `live` object with `plugin`, `surface`, `revision`,
-`rejected_views` and `junk_lines`. A crash, timeout or unclean shutdown exits non-zero; the plugin is stopped and reaped
-before the command exits.
+`rejected_views` and `junk_lines`. Without `--headless`, the plugin's views render live in the terminal; keyboard,
+paste and resize input is forwarded as `on_event`, and Ctrl+Q closes the preview. A crash keeps the last view visible
+with a status note. `--wait-ms` applies only to headless previews. A headless crash, timeout or unclean shutdown exits
+non-zero; the plugin is stopped and reaped before the command exits.
 
 ## Provider plugins
 
