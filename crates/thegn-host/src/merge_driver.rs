@@ -2400,6 +2400,95 @@ mod tests {
         }
 
         #[test]
+        fn drift_tail_detached_head_on_the_queued_tip_holds_without_dispatch() {
+            let (_fixture, root, feat_wt) = conflicting_repo("detached-identity-hold");
+            let sentinel = root.join("detached-checkout-was-written");
+            let db = Db::open_memory().unwrap();
+            db.put_worktree(
+                "feat",
+                root.to_str().unwrap(),
+                feat_wt.to_str().unwrap(),
+                "feat",
+                None,
+                None,
+            )
+            .unwrap();
+            let queued = bound_item(&db, &feat_wt);
+            let before_main = out(&root, &["rev-parse", "main"]);
+            git(&feat_wt, &["checkout", "-q", "--detach"]);
+
+            let outcome = drive_queue(
+                &cfg(&format!("touch {} && {FIXER}", sentinel.display()), 2),
+                &Config::default(),
+                &root,
+                &db,
+                vec![queued],
+                |_| {},
+            );
+
+            assert_eq!(outcome.agent_blocked, ["feat"]);
+            assert!(
+                !sentinel.exists(),
+                "detached HEAD must not launch the fixer"
+            );
+            let row = db.list_merge_queue().unwrap().remove(0);
+            assert_eq!(row.agent_attempts, 0);
+            assert!(row.error_detail.is_some_and(|detail| !detail.is_empty()));
+            assert_eq!(out(&root, &["rev-parse", "main"]), before_main);
+        }
+
+        #[test]
+        fn drift_tail_recreated_worktree_on_another_branch_holds_without_dispatch() {
+            let (_fixture, root, feat_wt) = conflicting_repo("recreated-identity-hold");
+            let sentinel = root.join("recreated-checkout-was-written");
+            let db = Db::open_memory().unwrap();
+            db.put_worktree(
+                "feat",
+                root.to_str().unwrap(),
+                feat_wt.to_str().unwrap(),
+                "feat",
+                None,
+                None,
+            )
+            .unwrap();
+            let queued = bound_item(&db, &feat_wt);
+            let before_main = out(&root, &["rev-parse", "main"]);
+            git(
+                &root,
+                &["worktree", "remove", "--force", feat_wt.to_str().unwrap()],
+            );
+            git(
+                &root,
+                &[
+                    "worktree",
+                    "add",
+                    "-q",
+                    "-b",
+                    "other",
+                    feat_wt.to_str().unwrap(),
+                    "main",
+                ],
+            );
+
+            let outcome = drive_queue(
+                &cfg(&format!("touch {} && {FIXER}", sentinel.display()), 2),
+                &Config::default(),
+                &root,
+                &db,
+                vec![queued],
+                |_| {},
+            );
+
+            assert_eq!(outcome.agent_blocked, ["feat"]);
+            assert!(
+                !sentinel.exists(),
+                "recreated worktree must not launch the fixer"
+            );
+            assert_eq!(db.list_merge_queue().unwrap()[0].agent_attempts, 0);
+            assert_eq!(out(&root, &["rev-parse", "main"]), before_main);
+        }
+
+        #[test]
         fn unsupported_platform_holds_before_merge_agent_attempt_or_spawn() {
             let (_fixture, root, feat_wt) = conflicting_repo("unsupported-agent");
             let sentinel = root.join("unsupported-agent-was-run");
