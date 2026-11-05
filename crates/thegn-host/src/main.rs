@@ -189,6 +189,7 @@ mod panel_util;
 mod panes;
 mod parity;
 mod perf;
+mod perf_lsp;
 mod perf_rt;
 mod perf_timing;
 #[cfg(test)]

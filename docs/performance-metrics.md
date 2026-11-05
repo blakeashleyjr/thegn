@@ -67,6 +67,22 @@ up to two `Instant`s across queued and running work. `sched_in_flight` is
 admitted minus finished, and `sched_queued` is admitted minus started.
 Finished includes panicked work.
 
+**LSP diagnostics queue.** The separate `lsp queue` event reports
+`lsp_queue_observed`, `lsp_queue_admitted`, `lsp_queue_replaced`,
+`lsp_queue_evicted`, `lsp_queue_rejected_capacity`,
+`lsp_queue_stale_rejected`, `lsp_queue_purged_on_retire`,
+`lsp_queue_delivered`, `lsp_queue_pending_documents`,
+`lsp_queue_pending_bytes`, `lsp_queue_ready_roots`,
+`lsp_queue_active_streams`, `lsp_queue_backlog`, and
+`lsp_queue_oldest_ms`. Counters are cumulative since process start and reset
+only when the diagnostics bus is shut down; the gauges are instantaneous
+values at the rollup. `lsp_queue_backlog` is `unobserved` when the bus reports
+age as unavailable, including when timing was off or pending entries were
+admitted before timing began; an unknown age is never presented as an empty
+queue. `lsp_queue_observed=false` means the bus could not be read. This
+observation runs only during an existing perf rollup; it adds no timer,
+thread, or wake source.
+
 Version 2 fixes idle dispatch omission and preserves earliest pending input
 instead of overwriting it. Those corrections and expanded model-call coverage
 must not be compared to old rollups as if instrumentation were unchanged.
