@@ -193,6 +193,8 @@ mod perf_rt;
 mod perf_timing;
 #[cfg(test)]
 mod perf_workloads;
+#[cfg(test)]
+mod perf_workloads_pty;
 mod pins;
 mod pipeline_board;
 mod placement_flow;
