@@ -28,6 +28,7 @@ pub fn drift_reason(detail: &str) -> Option<&str> {
     Some(rest.strip_suffix(REENQUEUE_SUFFIX).unwrap_or(rest))
 }
 
+/// Typed projection of a drift hold on a row (`{"reason": ...}`).
 #[derive(serde::Serialize)]
 pub struct IdentityDrift<'a> {
     pub reason: &'a str,
@@ -89,7 +90,6 @@ mod tests {
         assert_eq!(value["worktree"], "/repo/worktree");
         assert_eq!(value["location"], "local");
         assert_eq!(value["agent_attempts"], 0);
-        assert!(value["agent_attempts"].is_number());
 
         let plain = row(None);
         let value = serde_json::to_value(&plain).unwrap();
@@ -117,10 +117,7 @@ mod tests {
         for field in fields {
             let needle = format!("\"{field}\":");
             let position = encoded.find(&needle).unwrap();
-            assert!(
-                position >= previous_position,
-                "field order changed: {field}"
-            );
+            assert!(position > previous_position, "field order changed: {field}");
             previous_position = position;
         }
     }
