@@ -15,7 +15,7 @@ use thegn_core::config::{Config, ShareProviderKind};
 use thegn_core::db::{Db, ShareRow};
 use thegn_core::models::ShareOwner;
 use thegn_core::outln;
-use thegn_core::share::{ShareOwnerState, ShareState, build_share_spec};
+use thegn_core::share::{ShareOwnerState, ShareRecovery, ShareState, build_share_spec};
 use thegn_core::store::WorktreeAuxStore;
 use thegn_svc::share::{self, ShareLaunch, ShareProvider};
 
@@ -458,6 +458,7 @@ fn stop_with_store(
         ),
         _ => bail!("share: invalid tailscale stop plan"),
     }
+    begin_stop(store, &row)?;
     let sidecar = thegn_core::sandbox::vpn_sidecar_name(
         &thegn_core::sandbox::container_name_with_profile(wt, Some(&thegn_core::profile::name())),
     );
@@ -471,6 +472,21 @@ struct ListedShare<'a> {
     #[serde(flatten)]
     row: &'a ShareRow,
     owner_state: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    recovery: Option<&'static str>,
+}
+
+fn begin_stop(store: &dyn WorktreeAuxStore, row: &ShareRow) -> Result<()> {
+    store
+        .upsert_share(
+            &row.worktree,
+            row.local_port,
+            row.generation,
+            &row.provider,
+            row.public_url.as_deref(),
+            ShareState::Stopping.as_str(),
+        )
+        .context("share: could not record the stopping state; nothing was torn down")
 }
 
 fn list_lines(
@@ -484,8 +500,15 @@ fn list_lines(
             } else {
                 row.state.clone()
             };
+            let hint = ShareState::parse(&row.state)
+                .map(|state| state.recovery(owner_state(row)))
+                .and_then(ShareRecovery::hint);
+            let hint = match hint {
+                Some(hint) => format!("  ({hint})"),
+                None => String::new(),
+            };
             format!(
-                "{:<6} {:<6} {:<17} {}",
+                "{:<6} {:<6} {:<17} {}{}",
                 row.local_port,
                 row.provider,
                 state,
@@ -494,6 +517,7 @@ fn list_lines(
                     .map(thegn_svc::lsp::sanitize_for_terminal)
                     .as_deref()
                     .unwrap_or("—"),
+                hint,
             )
         })
         .collect()
@@ -507,6 +531,8 @@ fn listed_shares<'a>(
         .map(|row| ListedShare {
             row,
             owner_state: owner_state(row).as_str(),
+            recovery: ShareState::parse(&row.state)
+                .map(|state| state.recovery(owner_state(row)).as_str()),
         })
         .collect()
 }
@@ -540,7 +566,7 @@ fn stop_plan(
     if row.public_url.is_none()
         && matches!(
             ShareState::parse(&row.state),
-            Some(ShareState::Starting | ShareState::Failed)
+            Some(ShareState::Starting | ShareState::Failed | ShareState::Stopping)
         )
     {
         return StopPlan::TeardownTailscale;
@@ -671,7 +697,8 @@ mod tests {
             }
         });
         assert!(lines[0].contains("up (owner exited)"));
-        assert_eq!(&lines[0][32..], "https://demo.test");
+        assert!(lines[0][32..].starts_with("https://demo.test"));
+        assert!(lines[0].contains("(needs reconcile)"));
         assert!(!lines[1].contains("owner exited"));
         let json = serde_json::to_value(listed_shares(&rows, |row| {
             if row.owner.is_some() {
@@ -686,6 +713,138 @@ mod tests {
         assert_eq!(entries[0]["owner"]["pid"], 4242);
         assert_eq!(entries[1]["owner_state"], "unrecorded");
         assert!(entries[1].get("owner").is_none());
+    }
+
+    #[test]
+    fn list_rows_name_the_recovery_action() {
+        let owner = ShareOwner {
+            pid: 4242,
+            start_ticks: 99,
+        };
+        let rows = [
+            ShareRow {
+                worktree: "/worktree/demo".into(),
+                local_port: 3000,
+                provider: "tailscale".into(),
+                public_url: None,
+                state: "stopping".into(),
+                created_at: 0,
+                generation: 41,
+                owner: None,
+            },
+            ShareRow {
+                worktree: "/worktree/demo".into(),
+                local_port: 3001,
+                provider: "tailscale".into(),
+                public_url: None,
+                state: "unknown".into(),
+                created_at: 0,
+                generation: 42,
+                owner: None,
+            },
+            ShareRow {
+                worktree: "/worktree/demo".into(),
+                local_port: 3002,
+                provider: "tailscale".into(),
+                public_url: Some("https://demo.test".into()),
+                state: "up".into(),
+                created_at: 0,
+                generation: 43,
+                owner: Some(owner),
+            },
+            ShareRow {
+                worktree: "/worktree/demo".into(),
+                local_port: 3003,
+                provider: "tailscale".into(),
+                public_url: Some("https://alive.test".into()),
+                state: "up".into(),
+                created_at: 0,
+                generation: 44,
+                owner: Some(owner),
+            },
+            ShareRow {
+                worktree: "/worktree/demo".into(),
+                local_port: 3004,
+                provider: "tailscale".into(),
+                public_url: None,
+                state: "failed".into(),
+                created_at: 0,
+                generation: 45,
+                owner: None,
+            },
+            ShareRow {
+                worktree: "/worktree/demo".into(),
+                local_port: 3005,
+                provider: "tailscale".into(),
+                public_url: None,
+                state: "weird".into(),
+                created_at: 0,
+                generation: 46,
+                owner: None,
+            },
+        ];
+        let owner_state = |row: &ShareRow| match row.local_port {
+            3002 => ShareOwnerState::Exited,
+            3003 => ShareOwnerState::Alive,
+            _ => ShareOwnerState::Unrecorded,
+        };
+        let lines = list_lines(&rows, owner_state);
+        assert!(lines[0].contains("(retry: thegn share stop)"));
+        assert!(lines[1].contains("(needs reconcile)"));
+        assert!(lines[2].contains("(needs reconcile)"));
+        assert!(!lines[3].contains("("));
+        assert!(!lines[4].contains("("));
+        assert!(!lines[5].contains("("));
+
+        let json = serde_json::to_value(listed_shares(&rows, owner_state)).unwrap();
+        let entries = json.as_array().expect("share list is an array");
+        assert_eq!(entries[0]["recovery"], "retry_teardown");
+        assert_eq!(entries[1]["recovery"], "reconcile");
+        assert_eq!(entries[2]["recovery"], "reconcile");
+        assert_eq!(entries[3]["recovery"], "keep");
+        assert_eq!(entries[4]["recovery"], "keep");
+        assert!(entries[5].get("recovery").is_none());
+    }
+
+    #[test]
+    fn begin_stop_records_stopping_and_keeps_the_row_identity() {
+        let state = IsolatedState::new();
+        let db = isolated_db(&state);
+        let row = stored_row(&db, "tailscale", Some("https://demo.ts.net:8443"));
+        let owner = ShareOwner {
+            pid: 4242,
+            start_ticks: 99,
+        };
+        assert!(
+            db.set_share_owner("/worktree/demo", 3000, row.generation, owner)
+                .unwrap()
+        );
+        let row = db.list_shares().unwrap().remove(0);
+
+        begin_stop(&db, &row).unwrap();
+
+        let stopping = db.list_shares().unwrap().remove(0);
+        assert_eq!(stopping.state, "stopping");
+        assert_eq!(stopping.generation, row.generation);
+        assert_eq!(stopping.provider, row.provider);
+        assert_eq!(stopping.public_url, row.public_url);
+        assert_eq!(stopping.owner, row.owner);
+    }
+
+    #[test]
+    fn failed_teardown_leaves_a_stopping_row_and_a_verified_one_deletes_it() {
+        let state = IsolatedState::new();
+        let db = isolated_db(&state);
+        let row = stored_row(&db, "tailscale", Some("https://demo.ts.net:8443"));
+        begin_stop(&db, &row).unwrap();
+        let result = finish_stop(&db, &row, || Err(anyhow::anyhow!("unverified")));
+        assert!(result.is_err());
+        let stopping = db.list_shares().unwrap().remove(0);
+        assert_eq!(stopping.state, "stopping");
+
+        begin_stop(&db, &stopping).unwrap();
+        finish_stop(&db, &stopping, || Ok(())).unwrap();
+        assert!(db.list_shares().unwrap().is_empty());
     }
 
     #[test]
@@ -860,6 +1019,21 @@ mod tests {
             .expect("failed share row");
         assert_eq!(
             stop_plan(&row, false, Some(443), None),
+            StopPlan::TeardownTailscale
+        );
+
+        let stopping_row = ShareRow {
+            worktree: "/worktree/demo".to_string(),
+            local_port: 3000,
+            provider: "tailscale".to_string(),
+            public_url: None,
+            state: "stopping".to_string(),
+            created_at: 0,
+            generation: 41,
+            owner: None,
+        };
+        assert_eq!(
+            stop_plan(&stopping_row, false, Some(443), None),
             StopPlan::TeardownTailscale
         );
 

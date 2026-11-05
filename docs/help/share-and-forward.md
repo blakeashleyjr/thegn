@@ -47,6 +47,11 @@ has exited (`up (owner exited)`; `"owner_state": "exited"` with `--json`).
 `thegn share stop` names that process and still asks you to check the client
 and use `--forget`; a share owned by a running `thegn share start` is never
 restarted by the thegn window when it opens.
+A Tailscale `thegn share stop` records the share as `stopping` before teardown,
+so an interrupted stop stays `stopping` and stopping it again retries. The
+`thegn share list` command appends `(retry: thegn share stop)`, `(needs
+reconcile)` or `(needs teardown)` when a row needs recovery; `--json` carries a
+`recovery` field.
 `thegn share start` refuses a port that already has a saved share; stop it
 first, or use `--forget` for a stale record. It records the share as `starting`
 before the tunnel comes up. `thegn share stop <port>` also tears down a

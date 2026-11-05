@@ -616,7 +616,9 @@ impl WorktreeAuxStore for Db {
     }
 
     // --- ingress shares (`[share]`; resurrection layer for tunnels) --------
-    /// Insert or update the share record for `(worktree, local_port)`.
+    /// Insert or update the share record for `(worktree, local_port)`. Known lifecycle states
+    /// may only follow `ShareState::may_become` within the same generation; restarts and
+    /// unknown legacy/new state text remain unrestricted.
     fn upsert_share(
         &self,
         worktree: &str,
@@ -626,7 +628,26 @@ impl WorktreeAuxStore for Db {
         public_url: Option<&str>,
         state: &str,
     ) -> Result<()> {
-        self.conn().execute(
+        let guard = match crate::share::ShareState::parse(state) {
+            Some(to) => {
+                let all = crate::share::ShareState::ALL
+                    .into_iter()
+                    .map(|state| format!("'{}'", state.as_str()))
+                    .collect::<Vec<_>>()
+                    .join(",");
+                let allowed = crate::share::ShareState::ALL
+                    .into_iter()
+                    .filter(|from| from.may_become(to))
+                    .map(|state| format!("'{}'", state.as_str()))
+                    .collect::<Vec<_>>()
+                    .join(",");
+                format!(
+                    " WHERE shares.generation != excluded.generation OR shares.state NOT IN ({all}) OR shares.state IN ({allowed})"
+                )
+            }
+            None => String::new(),
+        };
+        let sql = format!(
             "INSERT INTO shares(worktree,local_port,provider,public_url,state,created_at,generation)
              VALUES(?1,?2,?3,?4,?5,?6,?7)
              ON CONFLICT(worktree,local_port) DO UPDATE SET
@@ -635,7 +656,11 @@ impl WorktreeAuxStore for Db {
                state=excluded.state,
                generation=excluded.generation,
                owner_pid=CASE WHEN shares.generation=excluded.generation THEN shares.owner_pid ELSE NULL END,
-               owner_start_ticks=CASE WHEN shares.generation=excluded.generation THEN shares.owner_start_ticks ELSE NULL END",
+               owner_start_ticks=CASE WHEN shares.generation=excluded.generation THEN shares.owner_start_ticks ELSE NULL END{}",
+            guard
+        );
+        let changed = self.conn().execute(
+            &sql,
             params![
                 worktree,
                 local_port as i64,
@@ -646,6 +671,13 @@ impl WorktreeAuxStore for Db {
                 encode_share_generation(generation)
             ],
         )?;
+        if changed == 0 {
+            return Err(anyhow::Error::new(crate::share::ShareTransitionRefused {
+                worktree: worktree.to_string(),
+                local_port,
+                to: state.to_string(),
+            }));
+        }
         Ok(())
     }
 
