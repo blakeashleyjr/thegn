@@ -106,6 +106,12 @@ current directory. `--record <file>` creates a new owner-only trace and refuses 
 `--replay <file>` accepts only an unredacted synthetic trace recorded with `--include-content`; redacted traces cannot be
 replayed.
 
+`thegn plugin preview --plugin-dir <DIR>` starts the resident plugin in DIR (its manifest must declare an `AppTab`
+contribution) and previews its first valid view. The preview grants `surface:app` only; plugin requests are answered
+`denied`, and no secrets, manifest environment or plugin state are given. With `--headless [--wait-ms N]`, it prints a
+JSON snapshot with a `live` object containing `plugin`, `surface`, `revision`, `rejected_views` and `junk_lines`. Without
+`--headless`, views render live in the terminal, input is forwarded, and Ctrl+Q closes the preview.
+
 ## SDK
 
 The source tree's `thegn-plugin-sdk` crate (see
