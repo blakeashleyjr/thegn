@@ -286,6 +286,19 @@ self: {
     replay.keyframe_interval_bytes = cfg.replayKeyframeIntervalBytes;
     replay.idle_threshold_ms = cfg.replayIdleThresholdMs;
     replay.persist = cfg.replayPersist;
+    drawer.command = cfg.drawerCommand;
+    drawer.config_home = cfg.drawerConfigHome;
+    drawer.height = cfg.drawerHeight;
+    drawer.width = cfg.drawerWidth;
+    drawer.image_previews = cfg.drawerImagePreviews;
+    drawer.git_status = cfg.drawerGitStatus;
+    drawer.contain = cfg.drawerContain;
+    drawer.memory_max = cfg.drawerMemoryMax;
+    drawer.memory_swap_max = cfg.drawerMemorySwapMax;
+    drawer.cpu_quota = cfg.drawerCpuQuota;
+    drawer.pool_limit = cfg.drawerPoolLimit;
+    drawer.prewarm = cfg.drawerPrewarm;
+    strip.visible = cfg.stripVisible;
     monitor = {
       system = cfg.monitorSystem;
       gpu = cfg.monitorGpu;
@@ -768,6 +781,86 @@ in {
       type = lib.types.nullOr (lib.types.bool);
       default = null;
       description = "Mirror each pane's replay ring to disk so scrubbing reaches into the previous run after a restart (the one replay feature with real disk cost). Unset (null) = the binary's default.";
+    };
+
+    drawerCommand = lib.mkOption {
+      type = lib.types.nullOr (lib.types.str);
+      default = null;
+      description = "File manager to run; empty runs the bundled pinned yazi; a non-empty value with no explicit kind selects the custom provider. Unset (null) = the binary's default.";
+    };
+
+    drawerConfigHome = lib.mkOption {
+      type = lib.types.nullOr (lib.types.str);
+      default = null;
+      description = "yazi config dir (YAZI_CONFIG_HOME); empty = private thegn config home, \"system\" = your own yazi config. Unset (null) = the binary's default.";
+    };
+
+    drawerHeight = lib.mkOption {
+      type = lib.types.nullOr (lib.types.str);
+      default = null;
+      example = "35%";
+      description = "Drawer height as a percentage or a row count. Unset (null) = the binary's default.";
+    };
+
+    drawerWidth = lib.mkOption {
+      type = lib.types.nullOr (lib.types.str);
+      default = null;
+      example = "full";
+      description = "Drawer width: full or center. Unset (null) = the binary's default.";
+    };
+
+    drawerImagePreviews = lib.mkOption {
+      type = lib.types.nullOr (lib.types.bool);
+      default = null;
+      description = "Whether drawer image previews are enabled. Unset (null) = the binary's default.";
+    };
+
+    drawerGitStatus = lib.mkOption {
+      type = lib.types.nullOr (lib.types.bool);
+      default = null;
+      description = "Whether the drawer shows git status. Unset (null) = the binary's default.";
+    };
+
+    drawerContain = lib.mkOption {
+      type = lib.types.nullOr (lib.types.bool);
+      default = null;
+      description = "Whether drawer launches use a systemd scope. Unset (null) = the binary's default.";
+    };
+
+    drawerMemoryMax = lib.mkOption {
+      type = lib.types.nullOr (lib.types.str);
+      default = null;
+      description = "MemoryMax for the drawer scope; empty omits the property. Unset (null) = the binary's default.";
+    };
+
+    drawerMemorySwapMax = lib.mkOption {
+      type = lib.types.nullOr (lib.types.str);
+      default = null;
+      description = "MemorySwapMax for the drawer scope; empty omits the property. Unset (null) = the binary's default.";
+    };
+
+    drawerCpuQuota = lib.mkOption {
+      type = lib.types.nullOr (lib.types.str);
+      default = null;
+      description = "CPUQuota for the drawer scope. Unset (null) = the binary's default.";
+    };
+
+    drawerPoolLimit = lib.mkOption {
+      type = lib.types.nullOr (lib.types.ints.unsigned);
+      default = null;
+      description = "Maximum hidden drawers kept alive; 0 disables pooling. Unset (null) = the binary's default.";
+    };
+
+    drawerPrewarm = lib.mkOption {
+      type = lib.types.nullOr (lib.types.bool);
+      default = null;
+      description = "Whether the active worktree's drawer is prewarmed. Unset (null) = the binary's default.";
+    };
+
+    stripVisible = lib.mkOption {
+      type = lib.types.nullOr (lib.types.bool);
+      default = null;
+      description = "Whether the pinned-program strip is shown when it has at least one pin. Unset (null) = the binary's default.";
     };
 
     monitorSystem = lib.mkOption {
