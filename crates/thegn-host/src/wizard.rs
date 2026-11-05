@@ -1387,7 +1387,7 @@ pub fn run_worker(
                         // and fails fatally there if it's still unavailable.
                         step(
                             CreateStep::SandboxPrep,
-                            StepState::Failed(e.to_string()),
+                            StepState::Failed(crate::sandbox_failure::failure_detail(&e)),
                             None,
                         );
                         prepped = None;
@@ -1435,11 +1435,14 @@ pub fn run_worker(
                                     *outcome = redo;
                                 }
                                 Err(e) => {
+                                    let detail = crate::sandbox_failure::failure_detail(&e);
                                     let error = match crate::worktree_lifecycle::rollback_remove(
                                         cfg, root, &path, &branch,
                                     ) {
-                                        Ok(()) => e.to_string(),
-                                        Err(cleanup) => format!("{e}; rollback failed: {cleanup}"),
+                                        Ok(()) => detail,
+                                        Err(cleanup) => {
+                                            format!("{detail}; rollback failed: {cleanup}")
+                                        }
                                     };
                                     fail(CreateStep::SandboxPrep, error);
                                     return;
@@ -1556,7 +1559,7 @@ pub fn run_worker(
                     halted(halt);
                     return;
                 }
-                let primary = e.to_string();
+                let primary = crate::sandbox_failure::failure_detail(&e);
                 let cleanup = crate::worktree_lifecycle::rollback_remove(cfg, root, &path, &branch);
                 if let Ok(db) = open_db() {
                     let _ = db.del_worktree(&path_s); // best-effort: cache write: the DB is a cache; git/forge stays the source of truth

@@ -52,6 +52,8 @@
 //! ```
 
 use std::collections::BTreeMap;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use chrono::NaiveDate;
@@ -485,6 +487,16 @@ pub struct CommandBackend {
     admission: AccountAdmission,
 }
 
+/// Raises the flag when dropped: a dropped `run_once` future (pass deadline,
+/// reload, shutdown) is how an account fetch is abandoned.
+struct AbandonOnDrop(Arc<AtomicBool>);
+
+impl Drop for AbandonOnDrop {
+    fn drop(&mut self) {
+        self.0.store(true, Ordering::Release);
+    }
+}
+
 impl CommandBackend {
     pub(crate) fn new(a: &CalendarAccount, admission: AccountAdmission) -> Self {
         CommandBackend {
@@ -652,9 +664,18 @@ impl CommandBackend {
         };
         // The runner blocks (it polls for exit to enforce the timeout), so it
         // must not sit on an async worker.
+        let abandoned = Arc::new(AtomicBool::new(false));
+        let _abandon = AbandonOnDrop(Arc::clone(&abandoned));
         let run = tokio::task::spawn_blocking(move || {
             let dir = (!cwd.trim().is_empty()).then(|| std::path::PathBuf::from(&cwd));
-            proc::spawn_ndjson_stream(&argv, &env, dir.as_deref(), timeout, sink)
+            proc::spawn_ndjson_stream_cancellable(
+                &argv,
+                &env,
+                dir.as_deref(),
+                timeout,
+                sink,
+                &|| abandoned.load(Ordering::Acquire),
+            )
         })
         .await
         .map_err(|e| CalendarError::Subprocess(e.to_string()))?;

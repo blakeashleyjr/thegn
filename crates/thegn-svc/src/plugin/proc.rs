@@ -496,7 +496,21 @@ pub fn spawn_ndjson_stream<S: NdjsonSink>(
     timeout: Duration,
     sink: S,
 ) -> Result<StreamRun<S>, PluginError> {
-    spawn_ndjson_stream_inner(argv, env, cwd, timeout, sink, &|| false)
+    spawn_ndjson_stream_cancellable(argv, env, cwd, timeout, sink, &|| false)
+}
+
+/// [`spawn_ndjson_stream`] that also stops when `cancel` returns true (polled
+/// every wait tick): the process group is killed and the result is
+/// [`PluginError::Cancelled`].
+pub fn spawn_ndjson_stream_cancellable<S: NdjsonSink>(
+    argv: &[String],
+    env: &BTreeMap<String, String>,
+    cwd: Option<&Path>,
+    timeout: Duration,
+    sink: S,
+    cancel: &dyn Fn() -> bool,
+) -> Result<StreamRun<S>, PluginError> {
+    spawn_ndjson_stream_inner(argv, env, cwd, timeout, sink, cancel)
 }
 
 fn spawn_ndjson_stream_inner<S: NdjsonSink>(

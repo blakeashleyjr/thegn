@@ -189,6 +189,7 @@ mod panel_util;
 mod panes;
 mod parity;
 mod perf;
+mod perf_log;
 mod perf_lsp;
 mod perf_rt;
 mod perf_timing;
@@ -255,6 +256,7 @@ mod revtunnel;
 mod run;
 mod sandbox_admission;
 mod sandbox_events;
+mod sandbox_failure;
 mod sandbox_fallback_memo;
 mod sandbox_gc_gate;
 mod sandbox_start;
@@ -288,6 +290,7 @@ mod spawn_ratchet_tests;
 mod sprite_bridge;
 mod ssh_shim;
 mod stage_prompt;
+mod stage_worker_hold;
 mod startup_heal;
 // THE-603 is an unwired capture primitive; THE-592 owns future startup admission.
 #[allow(dead_code)]

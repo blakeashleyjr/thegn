@@ -171,10 +171,15 @@ removed; reports keep line breaks, while notes replace line breaks with spaces.
 A pipeline row uses its own handoff file,
 `.thegn/pipeline/<issue>/<stage>/<row>.md`. `thegn dispatch verify`,
 `set-status done` and the wake handoff refuse a different artifact or an
-empty committed handoff. Plain dispatch rows keep their existing behavior. A
-handoff must be valid text no larger than 1 MiB or 8,192 lines; binary data,
-invalid UTF-8, terminal controls and bidi overrides are refused with a reason.
+empty committed handoff. Plain dispatch rows keep their existing behavior except
+that a `spawning` reservation needs a published session before `set-status done`
+succeeds. A handoff must be valid text no larger than 1 MiB or 8,192 lines;
+binary data, invalid UTF-8, terminal controls and bidi overrides are refused with
+a reason.
 Symlinked handoff files are not followed.
+
+Wait for the session to publish or open one; `--force --why '<reason>'` records
+an explicit override.
 
 A chunk's `after:` names resolve only to rows in the same stage. The newest
 attempt of each chunk name governs, and a done or merged row satisfies the

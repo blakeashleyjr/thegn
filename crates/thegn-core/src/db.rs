@@ -231,7 +231,8 @@ mod db_open_memo;
 /// v105: ci_autofix_dedupe.attempt joins the primary key, the provider run attempt a CI autofix claim belongs to (THE-543).
 /// v106: workspace_clone_provenance, the credential-free origin, state and owner of each URL clone destination (THE-366).
 /// v107: merge_queue.landed_source_oid + landed_target_base_oid, the source tip and target base a drain landing folded and replaced (THE-401).
-pub const SCHEMA_VERSION: i64 = 107;
+/// v108: pr_queue.agent_outcome + agent_outcome_gen + agent_outcome_at, what the last PR-agent run did to the PR head, scoped to its lease generation (THE-549).
+pub const SCHEMA_VERSION: i64 = 108;
 
 /// Escape hatch for [`schema_refusal`] — set to `1`/`true` to run a build older
 /// than the on-disk schema anyway (read-only, as before). Deliberately awkward:
@@ -1128,7 +1129,7 @@ impl Db {
 /// `status` is one of queued/folding/verifying/landed/deferred/gate_failed/
 /// agent_running/ready/needs_human.
 /// `conflict_paths` is newline-joined when present.
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MergeQueueRow {
     pub worktree: String,
     pub branch: String,
@@ -1144,13 +1145,47 @@ pub struct MergeQueueRow {
     /// ssh/provider blob. Lets the queue attribute a row to a host without a
     /// live git shell — the cross-host drain reads it to decide whether the
     /// branch tip must be fetched into the target store. See [`crate::remote`].
-    #[serde(default)]
     pub location: String,
     /// How many agent-dispatch → re-fold cycles have been spent on this row.
     /// Persisted (v49) so `agent_max_attempts` is a budget for the branch, not
     /// for one invocation of the drain.
-    #[serde(default)]
     pub agent_attempts: u32,
+}
+
+impl MergeQueueRow {
+    /// The identity-drift reason encoded in this row's hold detail, if any.
+    pub fn identity_drift(&self) -> Option<&str> {
+        self.error_detail
+            .as_deref()
+            .and_then(crate::merge_identity_drift::drift_reason)
+    }
+}
+
+impl serde::Serialize for MergeQueueRow {
+    fn serialize<S: serde::Serializer>(
+        &self,
+        serializer: S,
+    ) -> std::result::Result<S::Ok, S::Error> {
+        use serde::ser::SerializeStruct;
+
+        let mut state = serializer.serialize_struct("MergeQueueRow", 12)?;
+        state.serialize_field("worktree", &self.worktree)?;
+        state.serialize_field("branch", &self.branch)?;
+        state.serialize_field("target_branch", &self.target_branch)?;
+        state.serialize_field("status", &self.status)?;
+        state.serialize_field("queued_at", &self.queued_at)?;
+        state.serialize_field("updated_at", &self.updated_at)?;
+        state.serialize_field("result_oid", &self.result_oid)?;
+        state.serialize_field("conflict_paths", &self.conflict_paths)?;
+        state.serialize_field("error_detail", &self.error_detail)?;
+        state.serialize_field("location", &self.location)?;
+        state.serialize_field("agent_attempts", &self.agent_attempts)?;
+        let drift = self
+            .identity_drift()
+            .map(|reason| crate::merge_identity_drift::IdentityDrift { reason });
+        state.serialize_field("identity_drift", &drift)?;
+        state.end()
+    }
 }
 
 /// One `pr_queue` row — a pull request thegn is shepherding on a forge.
@@ -1831,6 +1866,7 @@ impl Db {
                     crate::db_migrate::verify_v105_schema(&conn)?;
                     crate::db_migrate::verify_v106_schema(&conn)?;
                     crate::db_migrate::verify_v107_schema(&conn)?;
+                    crate::db_migrate::verify_v108_schema(&conn)?;
                     Ok(())
                 };
                 if let Some(key) = verification_key {
@@ -2522,6 +2558,7 @@ impl Db {
         crate::db_migrate::migrate_v105(&conn)?;
         crate::db_migrate::migrate_v106(&conn)?;
         crate::db_migrate::migrate_v107(&conn)?;
+        crate::db_migrate::migrate_v108(&conn)?;
         if ver < SCHEMA_VERSION {
             crate::db_migrate::verify_v62_schema(&conn)?;
             crate::db_migrate::verify_v63_schema(&conn)?;
@@ -2567,6 +2604,7 @@ impl Db {
             crate::db_migrate::verify_v105_schema(&conn)?;
             crate::db_migrate::verify_v106_schema(&conn)?;
             crate::db_migrate::verify_v107_schema(&conn)?;
+            crate::db_migrate::verify_v108_schema(&conn)?;
         }
         // v69 is an authority ledger, not an optional cache. Verify its full
         // shape even on the fast/current-version path so a malformed table can

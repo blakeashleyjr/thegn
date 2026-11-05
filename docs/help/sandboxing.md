@@ -361,6 +361,16 @@ declaration and Dockerfile contents, so changing the Dockerfile rebuilds it on
 the next launch. If the Dockerfile cannot be read for hashing, thegn warns and
 uses the declaration alone for the tag.
 
+The image tag also covers files in the build `context`: their relative paths,
+contents and symlink targets, but not file permission bits. A top-level `.git`
+directory is skipped. Editing a context file rebuilds the image on the next
+launch, and the first launch after upgrading rebuilds once because the tag
+format changed. If the context cannot be digested (more than 2048 entries, more
+than 16 MiB of file content, a path deeper than 32 levels, or an unreadable
+file), thegn warns that it could not digest the build context, names the path
+and the reason, and says the image tag covers only the Dockerfile (when
+readable) and the build declaration. The build still runs.
+
 ### Lifecycle and provider fallback
 
 After lifecycle approval, `initializeCommand` uses the host-side one-time
@@ -471,6 +481,8 @@ worktree or Git common directory, the agent is not started, the queue entry is
 held rather than counted as a failed attempt, and the hold reason names the
 readiness class (`cannot-write-worktree` or `cannot-write-git-metadata`) and
 the backend.
+
+Pipeline stage launches run the same check once the stage's sandbox is composed: when it cannot write the worktree, the Git common directory or the agent's relocated credential home, or the `thegn` binary was replaced since launch, the stage worker is not started and the launch is refused with the readiness class (`cannot-write-worktree`, `cannot-write-git-metadata`, `provider-home-unavailable` or `callback-unavailable`) and the backend. The `worker` row in `thegn doctor` is the same check.
 
 The honest **isolation class**, weakest to strongest:
 

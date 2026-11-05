@@ -457,6 +457,12 @@ pub const CATALOG: &[HostCapability] = &[
         SurfaceSet::of(&[Surface::Http, Surface::Grpc, Surface::Cli]),
         "Re-read config and reconcile the mcp-proxy hub's upstreams (start/stop/restart/refilter)",
     ),
+    cap(
+        "plugins.status",
+        Verb::PluginsStatus,
+        SurfaceSet::of(&[Surface::Http, Surface::Cli]),
+        "Per-plugin dispatcher, event-queue and provider-bridge counters published by the UI process",
+    ),
     // --- hosts ---------------------------------------------------------------
     cap(
         "host.discover",

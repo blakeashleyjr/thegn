@@ -1774,6 +1774,19 @@ pub(super) async fn mcp_proxy_reload(
     }
 }
 
+pub(super) async fn plugins_status(
+    State(state): State<ControlState>,
+    headers: HeaderMap,
+) -> Response {
+    if let Err(r) = authed(&state, &headers, Verb::PluginsStatus) {
+        return r;
+    }
+    match state.api.plugins_status().await {
+        Ok(status) => axum::Json(status).into_response(),
+        Err(error) => error.into_response(),
+    }
+}
+
 // ── daemon lifecycle ─────────────────────────────────────────────────────────
 
 /// `POST /v1/daemon/shutdown` — gracefully stop the daemon (admin scope). Local

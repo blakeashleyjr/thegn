@@ -941,7 +941,8 @@ pub fn prepare_sandbox_env(
                         compose_miss = Some(message);
                         continue;
                     }
-                    let m = format!("sandbox {} failed: {e}", spec.backend.label());
+                    let m =
+                        crate::sandbox_failure::sandbox_failed_message(spec.backend.label(), &e);
                     if explicit_choice {
                         anyhow::bail!("{m} for {worktree}")
                     }
@@ -4818,6 +4819,31 @@ pub fn launch_spec_full(
     }
 
     let mut spec = compose_spec(cfg, worktree, branch, choice, &loc, &outcome, extras)?;
+    if let Some(stage) = extras.stage
+        && let Some(sandbox_spec) = outcome.spec.as_ref()
+    {
+        let homes: Vec<PathBuf> = provider_home_mounts(eff_agent.as_ref())
+            .into_iter()
+            .map(|(_, dest)| PathBuf::from(dest))
+            .collect();
+        let common = crate::stage_worker_hold::stage_git_common_dir(&sandbox_spec.worktree);
+        let callback_ok =
+            thegn_core::util::self_exe_path().is_some() && !thegn_core::util::self_exe_is_stale();
+        if let Some(hold) = crate::stage_worker_hold::stage_worker_hold(
+            stage,
+            &crate::stage_worker_hold::StageHoldFacts {
+                backend: sandbox_spec.backend,
+                local: sandbox_spec.placement.is_local(),
+                worktree: &sandbox_spec.worktree,
+                mounts: &sandbox_spec.mounts,
+                git_common_dir: common.as_deref(),
+                provider_homes: &homes,
+                callback_ok,
+            },
+        ) {
+            return Err(anyhow::Error::new(hold));
+        }
+    }
     // On the bare-host path (no sandbox spec and no provider session) the bundle
     // identity + build env ride the pane env (layered on the curated base in
     // `spawn_with_env`). A provider CLI is also host-side, but its environment

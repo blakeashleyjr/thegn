@@ -88,6 +88,10 @@ read at that moment: `verified` (the directory exists and its `origin` still mat
 failed or was cancelled). The record never contains the clone URL's credentials and is advisory: the
 repository on disk stays authoritative.
 
+At startup, a `cloning` record whose process is gone or was never recorded is
+marked `abandoned`, so `repo provenance` no longer reports it as `interrupted`;
+a live foreign clone is left alone.
+
 Lifecycle hooks apply to every creation door, including the wizard, `wt new`,
 issue dispatch, and the daemon's `worktrees.create` request. A blocking
 `pre_create` leaves both git and the database unchanged. The wizard schedules

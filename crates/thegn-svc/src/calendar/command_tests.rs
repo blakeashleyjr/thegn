@@ -56,6 +56,87 @@ fn block_on<F: std::future::Future>(future: F) -> F::Output {
         .block_on(future)
 }
 
+async fn wait_for_file(path: &std::path::Path) -> u32 {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+    loop {
+        if path.exists()
+            && let Ok(contents) = std::fs::read_to_string(path)
+            && let Ok(pid) = contents.trim().parse::<u32>()
+        {
+            return pid;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "plugin child pid file did not appear with a numeric pid"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+}
+
+#[test]
+fn an_abandoned_command_fetch_kills_the_plugin_process_group() {
+    let dir = tempfile::tempdir().unwrap();
+    let pid_file = dir.path().join("child.pid");
+    let backend = plugin(
+        vec![
+            "sh".into(),
+            "-c".into(),
+            "sleep 120 & echo $! > \"$1\"; wait".into(),
+            "sh".into(),
+            pid_file.to_string_lossy().into_owned(),
+        ],
+        &[],
+    );
+    let from = chrono::NaiveDate::from_ymd_opt(2026, 8, 1).unwrap();
+    let to = chrono::NaiveDate::from_ymd_opt(2026, 8, 31).unwrap();
+
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let child_pid = runtime.block_on(async {
+        let fetch = backend.list_events(from, to, "");
+        tokio::select! {
+            _ = fetch => panic!("the sleeping plugin must not finish"),
+            pid = wait_for_file(&pid_file) => pid,
+        }
+    });
+
+    runtime.block_on(async {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            // SAFETY: signal 0 only checks whether this pid still exists.
+            if unsafe { libc::kill(child_pid as i32, 0) } == -1
+                && std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH)
+            {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "abandoned calendar plugin left child {child_pid} alive"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+    });
+}
+
+#[test]
+fn a_completed_command_fetch_is_unaffected_by_the_abandon_guard() {
+    let backend = plugin(
+        vec![
+            "sh".into(),
+            "-c".into(),
+            r#"echo '{"method":"events","params":{"events":[{"uid":"u","title":"T","start":{"kind":"date","date":"2026-08-21"},"end":{"kind":"date","date":"2026-08-22"}}]}}'"#.into(),
+        ],
+        &[],
+    );
+    let from = chrono::NaiveDate::from_ymd_opt(2026, 8, 1).unwrap();
+    let to = chrono::NaiveDate::from_ymd_opt(2026, 8, 31).unwrap();
+
+    let page = block_on(backend.list_events(from, to, "")).unwrap();
+    assert_eq!(page.events().len(), 1);
+}
+
 #[test]
 #[allow(
     clippy::disallowed_macros,
