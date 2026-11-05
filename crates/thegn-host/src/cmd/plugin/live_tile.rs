@@ -483,7 +483,7 @@ raise SystemExit(3)
             let callback_inbox = inbox.clone();
             let (update_tx, updates) = mpsc::channel();
             let hook: ChangeHook = Arc::new(move || {
-                let _ = update_tx.send(());
+                update_tx.send(()).unwrap_or_default(); // best-effort: the preview loop is gone once the tile closes
             });
             let callback_hook = hook.clone();
             let callback_surface = surface.clone();
@@ -616,7 +616,10 @@ raise SystemExit(3)
             {
                 break;
             }
-            let _ = harness.updates.recv_timeout(Duration::from_millis(20));
+            harness
+                .updates
+                .recv_timeout(Duration::from_millis(20))
+                .unwrap_or_default();
         }
         assert_eq!(harness.tile.ui.view().unwrap().revision, 2_000);
         harness.close();
@@ -640,7 +643,10 @@ raise SystemExit(3)
             {
                 break;
             }
-            let _ = harness.updates.recv_timeout(Duration::from_millis(20));
+            harness
+                .updates
+                .recv_timeout(Duration::from_millis(20))
+                .unwrap_or_default();
         }
         assert!(matches!(
             &harness.tile.ui.view().unwrap().root,
@@ -666,7 +672,10 @@ raise SystemExit(3)
             {
                 break;
             }
-            let _ = harness.updates.recv_timeout(Duration::from_millis(20));
+            harness
+                .updates
+                .recv_timeout(Duration::from_millis(20))
+                .unwrap_or_default();
         }
         assert_eq!(harness.tile.ui.view().unwrap().revision, 1);
         assert!(
