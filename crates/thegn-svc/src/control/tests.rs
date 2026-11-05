@@ -1535,7 +1535,7 @@ async fn in_process_dispatch_rechecks_the_admitted_capability_after_routing() {
 
 #[tokio::test]
 async fn dispatch_status_http_routes_to_proof_or_legacy_api_method() {
-    let r = rig(false);
+    let r = rig(true);
     let (without_lead, _) = dispatch_local(
         r.state.clone(),
         "dispatches.set_status",
