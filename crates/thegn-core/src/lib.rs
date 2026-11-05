@@ -96,8 +96,6 @@ mod db_cache;
 mod db_calendar;
 mod db_ci;
 pub mod db_clone_provenance;
-#[rustfmt::skip]
-pub mod db_merge_landed;
 pub mod db_compute;
 mod db_control;
 mod db_dispatch;
@@ -112,6 +110,7 @@ mod db_glyph;
 mod db_hibernate;
 mod db_intent;
 mod db_iroh;
+pub mod db_merge_landed;
 pub mod db_migrate;
 mod db_model_proxy;
 mod db_notification;
