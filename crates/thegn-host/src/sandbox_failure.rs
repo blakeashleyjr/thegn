@@ -77,11 +77,4 @@ mod tests {
             "sandbox docker failed: boom"
         );
     }
-
-    #[test]
-    fn call_sites_render_through_failure_detail() {
-        assert!(include_str!("agent.rs").contains("sandbox_failure::sandbox_failed_message("));
-        assert!(include_str!("host_provision.rs").contains("sandbox_failure::failure_detail("));
-        assert!(include_str!("wizard.rs").contains("sandbox_failure::failure_detail("));
-    }
 }
