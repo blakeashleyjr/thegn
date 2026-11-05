@@ -1122,4 +1122,138 @@ END:VCALENDAR</c:calendar-data></x:prop><x:status>HTTP/1.1 200 OK</x:status></x:
             page.diagnostics()
         );
     }
+
+    #[test]
+    fn a_document_failed_resource_fails_the_whole_page_wherever_it_sits() {
+        let good = |uid: &str| {
+            resource(
+                &format!("/cal/{uid}.ics"),
+                &format!(
+                    "BEGIN:VCALENDAR\nBEGIN:VEVENT\nUID:{uid}\nDTSTART:20300101T100000Z\nEND:VEVENT\nEND:VCALENDAR"
+                ),
+            )
+        };
+        let bad = resource(
+            "/cal/bad.ics",
+            "BEGIN:VCALENDAR\nBEGIN:VEVENT\nUID:bad\nDTSTART:20300101T100000Z\nEND:VTODO\nEND:VCALENDAR",
+        );
+        let good_one = good("one");
+        let good_two = good("two");
+        let placements = [
+            vec![bad.clone(), good_one.clone(), good_two.clone()],
+            vec![good_one.clone(), bad.clone(), good_two.clone()],
+            vec![good_one, good_two, bad],
+        ];
+
+        for resources in placements {
+            for mode in [PageMode::Snapshot, PageMode::Delta] {
+                let token = if mode == PageMode::Delta {
+                    "<d:sync-token>t1</d:sync-token>"
+                } else {
+                    ""
+                };
+                let xml = format!(
+                    "<d:multistatus xmlns:d=\"DAV:\" xmlns:c=\"urn:ietf:params:xml:ns:caldav\">{}{token}</d:multistatus>",
+                    resources.join("")
+                );
+
+                assert!(matches!(
+                    page_from_multistatus(&xml, "UTC", &[], mode, test_meter()),
+                    Err(CalendarError::Parse(_))
+                ));
+            }
+        }
+    }
+
+    #[test]
+    fn a_document_failed_resource_beside_a_deletion_yields_no_tombstones() {
+        let good = |uid: &str| {
+            resource(
+                &format!("/cal/{uid}.ics"),
+                &format!(
+                    "BEGIN:VCALENDAR\nBEGIN:VEVENT\nUID:{uid}\nDTSTART:20300101T100000Z\nEND:VEVENT\nEND:VCALENDAR"
+                ),
+            )
+        };
+        let bad = resource(
+            "/cal/bad.ics",
+            "BEGIN:VCALENDAR\nBEGIN:VEVENT\nUID:bad\nDTSTART:20300101T100000Z\nEND:VTODO\nEND:VCALENDAR",
+        );
+        let deletion = "<d:response><d:href>/cal/gone.ics</d:href><d:status>HTTP/1.1 404 Not Found</d:status></d:response>";
+        let failed_xml = format!(
+            "<d:multistatus xmlns:d=\"DAV:\" xmlns:c=\"urn:ietf:params:xml:ns:caldav\">{}{bad}{deletion}<d:sync-token>t1</d:sync-token></d:multistatus>",
+            good("one")
+        );
+
+        assert!(matches!(
+            page_from_multistatus(&failed_xml, "UTC", &[], PageMode::Delta, test_meter()),
+            Err(CalendarError::Parse(_))
+        ));
+
+        let valid_xml = format!(
+            "<d:multistatus xmlns:d=\"DAV:\" xmlns:c=\"urn:ietf:params:xml:ns:caldav\">{}{}{deletion}<d:sync-token>t1</d:sync-token></d:multistatus>",
+            good("one"),
+            good("two")
+        );
+        let page =
+            page_from_multistatus(&valid_xml, "UTC", &[], PageMode::Delta, test_meter()).unwrap();
+        assert_eq!(page.deleted().len(), 1);
+        assert_eq!(page.events().len(), 2);
+    }
+
+    #[test]
+    fn a_quarantined_event_keeps_the_page_and_its_neighbours() {
+        let first = resource(
+            "/cal/one.ics",
+            "BEGIN:VCALENDAR\nBEGIN:VEVENT\nUID:one\nDTSTART:20300101T100000Z\nEND:VEVENT\nEND:VCALENDAR",
+        );
+        let second = resource(
+            "/cal/two.ics",
+            "BEGIN:VCALENDAR\nBEGIN:VEVENT\nUID:two\nDTSTART:20300102T100000Z\nEND:VEVENT\nBEGIN:VEVENT\nUID:startless\nEND:VEVENT\nEND:VCALENDAR",
+        );
+        let xml = format!(
+            "<d:multistatus xmlns:d=\"DAV:\" xmlns:c=\"urn:ietf:params:xml:ns:caldav\">{first}{second}</d:multistatus>"
+        );
+
+        let page =
+            page_from_multistatus(&xml, "UTC", &[], PageMode::Snapshot, test_meter()).unwrap();
+
+        assert_eq!(page.events().len(), 2);
+        assert!(page.diagnostics().quarantined_events >= 1);
+    }
+
+    #[test]
+    fn the_whole_page_failure_names_a_structural_parse_error() {
+        let good = |uid: &str| {
+            resource(
+                &format!("/cal/{uid}.ics"),
+                &format!(
+                    "BEGIN:VCALENDAR\nBEGIN:VEVENT\nUID:{uid}\nDTSTART:20300101T100000Z\nEND:VEVENT\nEND:VCALENDAR"
+                ),
+            )
+        };
+        let bad = resource(
+            "/cal/bad.ics",
+            "BEGIN:VCALENDAR\nBEGIN:VEVENT\nUID:bad\nDTSTART:20300101T100000Z\nEND:VTODO\nEND:VCALENDAR",
+        );
+        let xml = format!(
+            "<d:multistatus xmlns:d=\"DAV:\" xmlns:c=\"urn:ietf:params:xml:ns:caldav\">{}{bad}{}</d:multistatus>",
+            good("one"),
+            good("two")
+        );
+
+        let error = match page_from_multistatus(&xml, "UTC", &[], PageMode::Snapshot, test_meter())
+        {
+            Err(CalendarError::Parse(text)) => text,
+            _ => panic!("expected structural parse error"),
+        };
+
+        assert_eq!(
+            error,
+            "calendar resource is incomplete or structurally malformed"
+        );
+        assert!(!error.is_empty());
+        assert!(!error.contains("calendar-data"));
+        assert!(!error.contains("UID:bad"));
+    }
 }
