@@ -534,6 +534,30 @@
       ],
       "type": "object"
     },
+    "DispatchLeadReq": {
+      "description": "A Lead-lease proof presented with a pipeline mutation (THE-208). Optional on the wire; absent means no proof, so a lease-bound row is refused.",
+      "properties": {
+        "lease": {
+          "type": "string"
+        },
+        "lease_gen": {
+          "description": "The generation returned by `thegn dispatch lease acquire`; when present the proof is fenced.",
+          "format": "int64",
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "owner": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "lease",
+        "owner"
+      ],
+      "type": "object"
+    },
     "DispatchPutReq": {
       "description": "The `dispatches.put` verb payload (THE-57): one row appended to the roster.\n\nThe four pipeline fields (v56) are optional and default-absent, so a caller written against the three-string version keeps working unchanged. `put` carries them all: the roster gains columns, not verbs — there is deliberately no `dispatches.update`, because a mutable stage field invites thegn to become the thing that advances it.",
       "properties": {
@@ -550,6 +574,16 @@
         },
         "issue_id": {
           "type": "string"
+        },
+        "lead": {
+          "anyOf": [
+            {
+              "$ref": "#/definitions/DispatchLeadReq"
+            },
+            {
+              "type": "null"
+            }
+          ]
         },
         "parent_id": {
           "default": null,
@@ -589,6 +623,17 @@
     },
     "DispatchStatusBody": {
       "properties": {
+        "lead": {
+          "anyOf": [
+            {
+              "$ref": "#/definitions/DispatchLeadReq"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        },
         "status": {
           "description": "A member of the closed dispatch-status set (snake_case).",
           "type": "string"
