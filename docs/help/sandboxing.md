@@ -465,6 +465,13 @@ a live agent run. The check supports bwrap, podman, docker and smol.
 A stage whose agent relocates its credential home (for example `CODEX_HOME`) is also checked: a missing home directory reports
 `provider-home-unavailable`.
 
+Queue agents (merge-conflict, gate-failure and PR-queue handoffs) run through
+the same check at dispatch time: when the composed sandbox cannot write the
+worktree or Git common directory, the agent is not started, the queue entry is
+held rather than counted as a failed attempt, and the hold reason names the
+readiness class (`cannot-write-worktree` or `cannot-write-git-metadata`) and
+the backend.
+
 The honest **isolation class**, weakest to strongest:
 
 | Class              | Escape needs…                               | Backends                                             |
