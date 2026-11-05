@@ -605,6 +605,23 @@ impl std::fmt::Display for DispatchStatusError {
 
 impl std::error::Error for DispatchStatusError {}
 
+fn dispatch_set_status_with_proof(
+    db: &Db,
+    id: i64,
+    status: thegn_core::issue::AgentDispatchStatus,
+    proof: thegn_core::db::LeadProof<'_>,
+) -> anyhow::Result<()> {
+    use thegn_core::store::NotificationStore;
+
+    let row = db
+        .get_dispatch(id)?
+        .ok_or_else(|| anyhow::Error::new(DispatchStatusError::NotFound(id)))?;
+    if status == thegn_core::issue::AgentDispatchStatus::Unknown {
+        return Err(anyhow::Error::new(DispatchStatusError::UnknownStatus));
+    }
+    db.set_dispatch_status_led(id, row.status, status, None, proof)
+}
+
 fn map_dispatch_status_error(error: anyhow::Error) -> ControlError {
     if let Some(status_error) = error.downcast_ref::<DispatchStatusError>() {
         return match status_error {
@@ -2877,14 +2894,7 @@ impl ControlApi for DaemonService {
     ) -> BoxFuture<'_, ControlResult<()>> {
         Box::pin(async move {
             self.with_db(move |db| {
-                use thegn_core::store::NotificationStore;
-                let row = db
-                    .get_dispatch(id)?
-                    .ok_or_else(|| anyhow::Error::new(DispatchStatusError::NotFound(id)))?;
-                if status == thegn_core::issue::AgentDispatchStatus::Unknown {
-                    return Err(anyhow::Error::new(DispatchStatusError::UnknownStatus));
-                }
-                db.set_dispatch_status_checked(id, row.status, status, None)
+                dispatch_set_status_with_proof(db, id, status, thegn_core::db::LeadProof::Unbound)
             })
             .await
             .map_err(|error| match error {
@@ -2901,21 +2911,12 @@ impl ControlApi for DaemonService {
         lead: thegn_svc::control::DispatchLeadReq,
     ) -> BoxFuture<'_, ControlResult<()>> {
         Box::pin(async move {
-            self.with_db(move |db| {
-                use thegn_core::store::NotificationStore;
-                let row = db
-                    .get_dispatch(id)?
-                    .ok_or_else(|| anyhow::Error::new(DispatchStatusError::NotFound(id)))?;
-                if status == thegn_core::issue::AgentDispatchStatus::Unknown {
-                    return Err(anyhow::Error::new(DispatchStatusError::UnknownStatus));
-                }
-                db.set_dispatch_status_led(id, row.status, status, None, lead.proof())
-            })
-            .await
-            .map_err(|error| match error {
-                ControlError::Internal(error) => map_dispatch_status_error(error),
-                other => other,
-            })
+            self.with_db(move |db| dispatch_set_status_with_proof(db, id, status, lead.proof()))
+                .await
+                .map_err(|error| match error {
+                    ControlError::Internal(error) => map_dispatch_status_error(error),
+                    other => other,
+                })
         })
     }
 
@@ -6085,6 +6086,7 @@ mod tests {
                 parent_id: Some(row.id),
                 session_id: Some("sess-code-1".into()),
                 artifact_path: Some(".thegn/pipeline/architect/1.md".into()),
+                lead: None,
             })
             .await
             .unwrap();
@@ -6348,10 +6350,11 @@ mod tests {
         svc.dispatch_set_status_led(row.id, St::Running, lead)
             .await
             .unwrap();
+        let row_id = row.id;
         let updated = svc
-            .with_db(|db| {
+            .with_db(move |db| {
                 use thegn_core::store::NotificationStore;
-                db.get_dispatch(row.id)?
+                db.get_dispatch(row_id)?
                     .ok_or_else(|| anyhow::anyhow!("dispatch vanished"))
             })
             .await
@@ -6392,7 +6395,7 @@ mod tests {
             Some(serde_json::json!({"status": "running"})),
         )
         .await;
-        assert_ne!(without_proof, axum::http::StatusCode::OK);
+        assert_eq!(without_proof, axum::http::StatusCode::PRECONDITION_FAILED);
         let (with_proof, body) = thegn_svc::control::http::dispatch_local(
             dispatch_put_http_state(svc),
             "dispatches.set_status",
