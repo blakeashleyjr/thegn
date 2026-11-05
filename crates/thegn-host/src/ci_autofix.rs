@@ -598,25 +598,33 @@ fn consider_candidate_with_forge(
                 .is_ok()
             })
     });
-    let own = crate::pr_agent_lease::observe_own_head(&loc, &entry.head_sha, || {
-        if authorship.is_some() {
-            fresh.as_ref().map(|pr| pr.head_ref_oid.clone())
-        } else {
-            provider
-                .pr_status(&loc, PrRef::Number(item.number))
-                .ok()
-                .filter(|pr| {
-                    thegn_core::pr_queue::attest_pr_identity(
-                        item.pr_url.as_deref(),
-                        item.number,
-                        &pr.url,
-                        pr.number,
-                    )
-                    .is_ok()
-                })
-                .map(|pr| pr.head_ref_oid)
-        }
-    });
+    let remote_after: Option<String> = if authorship.is_some() {
+        fresh.as_ref().map(|pr| pr.head_ref_oid.clone())
+    } else {
+        provider
+            .pr_status(&loc, PrRef::Number(item.number))
+            .ok()
+            .filter(|pr| {
+                thegn_core::pr_queue::attest_pr_identity(
+                    item.pr_url.as_deref(),
+                    item.number,
+                    &pr.url,
+                    pr.number,
+                )
+                .is_ok()
+            })
+            .map(|pr| pr.head_ref_oid)
+    };
+    let own =
+        crate::pr_agent_lease::observe_own_head(&loc, &entry.head_sha, || remote_after.clone());
+    let head_note = crate::pr_head_outcome::run_warning(
+        &loc,
+        item.number,
+        &entry.head_sha,
+        remote_after.as_deref(),
+        !guard.lease_lost(),
+        &pq,
+    );
     let validation = crate::pr_authorship::revalidate_after_agent(
         authorship.as_ref(),
         db,
@@ -648,7 +656,7 @@ fn consider_candidate_with_forge(
                 }
             }
         }
-        let finished = autofix_finish_detail(&verdict);
+        let finished = autofix_finish_detail(&verdict, head_note.as_deref());
         match guard.finish(db, Some((PrqStatus::BlockedCi.as_str(), &finished))) {
             Ok(true) => {}
             Ok(false) => {
@@ -740,14 +748,23 @@ fn admitted_head_still_checked_out(
 }
 
 /// The PR-queue detail recorded when a CI autofix run ends. A not-started run is held earlier
-/// through `finish_not_started` and never reaches this function.
-fn autofix_finish_detail(verdict: &crate::agent_run::AgentRunVerdict) -> String {
+/// through `finish_not_started` and never reaches this function. A verified PR-head observation
+/// is appended when it has an operator sentence.
+fn autofix_finish_detail(
+    verdict: &crate::agent_run::AgentRunVerdict,
+    head_note: Option<&str>,
+) -> String {
     let outcome = if verdict.exited_zero() {
         "exit ok".to_string()
     } else {
         "exit failed".to_string()
     };
-    format!("CI autofix finished ({outcome}); awaiting the next PR refresh")
+    match head_note {
+        Some(note) => {
+            format!("CI autofix finished ({outcome}); {note}; awaiting the next PR refresh")
+        }
+        None => format!("CI autofix finished ({outcome}); awaiting the next PR refresh"),
+    }
 }
 
 /// Which PR queue row owns a worktree's CI evidence.
@@ -1080,6 +1097,22 @@ mod tests {
                 .as_deref()
                 .is_some_and(|detail| detail.starts_with("CI autofix finished"))
         );
+    }
+
+    #[test]
+    fn unchanged_head_is_noted_in_the_finished_row() {
+        let fixture = Fixture::new();
+        let handoff = handoff(&fixture, CiAutofixMode::Auto, &fixture.pr.head_ref_oid);
+
+        consider(&handoff, false);
+
+        let row = handoff.db.list_pr_queue().unwrap().remove(0);
+        assert_eq!(row.status, PrqStatus::BlockedCi.as_str());
+        let detail = row.detail.as_deref().unwrap();
+        assert!(detail.starts_with("CI autofix finished"));
+        assert!(detail.contains(
+            "PR #7: the agent finished without changing the PR head; the next refresh re-evaluates the row"
+        ));
     }
 
     #[test]
@@ -2391,14 +2424,14 @@ mod tests {
             crate::agent_run::AgentRunVerdict::Exited(None),
             crate::agent_run::AgentRunVerdict::Interrupted("timed out".into()),
         ] {
-            assert!(!autofix_finish_detail(&verdict).contains("did not start"));
+            assert!(!autofix_finish_detail(&verdict, None).contains("did not start"));
         }
     }
 
     #[test]
     fn finish_detail_keeps_exit_wording_for_runs_that_started() {
         assert_eq!(
-            autofix_finish_detail(&crate::agent_run::AgentRunVerdict::Exited(Some(0))),
+            autofix_finish_detail(&crate::agent_run::AgentRunVerdict::Exited(Some(0)), None),
             "CI autofix finished (exit ok); awaiting the next PR refresh"
         );
         for verdict in [
@@ -2407,10 +2440,26 @@ mod tests {
             crate::agent_run::AgentRunVerdict::Interrupted("timed out".into()),
         ] {
             assert_eq!(
-                autofix_finish_detail(&verdict),
+                autofix_finish_detail(&verdict, None),
                 "CI autofix finished (exit failed); awaiting the next PR refresh"
             );
         }
+    }
+
+    #[test]
+    fn finish_detail_carries_the_head_note() {
+        let note = "PR #7: the agent finished without changing the PR head; the next refresh re-evaluates the row";
+        assert_eq!(
+            autofix_finish_detail(
+                &crate::agent_run::AgentRunVerdict::Exited(Some(0)),
+                Some(note)
+            ),
+            "CI autofix finished (exit ok); PR #7: the agent finished without changing the PR head; the next refresh re-evaluates the row; awaiting the next PR refresh"
+        );
+        assert_eq!(
+            autofix_finish_detail(&crate::agent_run::AgentRunVerdict::Exited(Some(0)), None),
+            "CI autofix finished (exit ok); awaiting the next PR refresh"
+        );
     }
 
     #[test]
