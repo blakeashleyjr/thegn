@@ -103,11 +103,25 @@ pub(crate) fn registry_endpoint_fits(endpoint: &str, max: usize, windows: bool) 
         .is_ok()
 }
 
+/// Whether a registry endpoint may be connected to: an absolute path (never a relative path or URL-shaped
+/// string) that is missing or a socket owned by the current user. THE-246 default (A).
+pub(crate) fn registry_endpoint_trusted(endpoint: &str) -> bool {
+    let path = std::path::Path::new(endpoint);
+    if endpoint.is_empty() || endpoint.contains('\0') || !path.has_root() {
+        return false;
+    }
+    matches!(
+        thegn_core::fsperm::classify_endpoint_socket(path),
+        thegn_core::fsperm::EndpointSocket::Missing | thegn_core::fsperm::EndpointSocket::Trusted
+    )
+}
+
 /// Discover a live local daemon for `scope` (the canonical state dir) from the
 /// registry: the freshest heartbeat wins. Endpoints exceeding the platform's
 /// socket-path byte cap are ignored; an over-long freshest row does not fall
-/// back to an older row. Returns its unix-socket address; `None` means no
-/// usable daemon was found (callers degrade gracefully).
+/// back to an older row. Relative, URL-shaped, or untrusted existing paths are
+/// also ignored without falling back. Returns its unix-socket address; `None`
+/// means no usable daemon was found (callers degrade gracefully).
 pub fn discover(store: &dyn ControlStore, scope: &str, now_ms: i64) -> Option<ControlAddr> {
     let daemon = store
         .freshest_live_daemon(scope, now_ms, DAEMON_HEARTBEAT_TTL_MS)
@@ -118,6 +132,14 @@ pub fn discover(store: &dyn ControlStore, scope: &str, now_ms: i64) -> Option<Co
             target: "thegn::control",
             bytes = daemon.endpoint.len(),
             "daemon registry endpoint is longer than a socket path; ignoring it"
+        );
+        return None;
+    }
+    if !registry_endpoint_trusted(&daemon.endpoint) {
+        tracing::debug!(
+            target: "thegn::control",
+            bytes = daemon.endpoint.len(),
+            "daemon registry endpoint is not a socket path owned by this user; ignoring it"
         );
         return None;
     }
@@ -3907,6 +3929,103 @@ mod tests {
             .unwrap();
         let endpoint = format!("/run/{}", "x".repeat(4096));
         db.put_daemon(&daemon_row("new", "/scope/a", &endpoint, now - 1))
+            .unwrap();
+
+        assert!(discover(&db, "/scope/a", now).is_none());
+    }
+
+    #[test]
+    fn discover_ignores_a_relative_registry_endpoint() {
+        let db = Db::open_memory().unwrap();
+        let now = 1_000_000;
+        db.put_daemon(&daemon_row(
+            "relative",
+            "/scope/a",
+            "relative.sock",
+            now - 1,
+        ))
+        .unwrap();
+
+        assert!(discover(&db, "/scope/a", now).is_none());
+    }
+
+    #[test]
+    fn discover_ignores_a_url_shaped_registry_endpoint() {
+        let db = Db::open_memory().unwrap();
+        let now = 1_000_000;
+        db.put_daemon(&daemon_row("url", "/scope/a", "tcp://127.0.0.1:1", now - 1))
+            .unwrap();
+
+        assert!(discover(&db, "/scope/a", now).is_none());
+    }
+
+    #[test]
+    fn discover_ignores_a_regular_file_registry_endpoint() {
+        if !cfg!(unix) {
+            return;
+        }
+        let temp = tempfile::tempdir_in("/tmp").unwrap();
+        let endpoint = temp.path().join("regular");
+        std::fs::File::create(&endpoint).unwrap();
+        let db = Db::open_memory().unwrap();
+        let now = 1_000_000;
+        db.put_daemon(&daemon_row(
+            "regular",
+            "/scope/a",
+            endpoint.to_str().unwrap(),
+            now - 1,
+        ))
+        .unwrap();
+
+        assert!(discover(&db, "/scope/a", now).is_none());
+    }
+
+    #[test]
+    fn discover_ignores_a_symlinked_registry_endpoint() {
+        if !cfg!(unix) {
+            return;
+        }
+        let link = thegn_core::testenv::symlinked_tempdir();
+        let db = Db::open_memory().unwrap();
+        let now = 1_000_000;
+        db.put_daemon(&daemon_row(
+            "symlink",
+            "/scope/a",
+            link.path().to_str().unwrap(),
+            now - 1,
+        ))
+        .unwrap();
+
+        assert!(discover(&db, "/scope/a", now).is_none());
+    }
+
+    #[test]
+    fn discover_accepts_a_missing_absolute_socket_path() {
+        let temp = tempfile::tempdir_in("/tmp").unwrap();
+        let endpoint = temp.path().join("never-created.sock");
+        let db = Db::open_memory().unwrap();
+        let now = 1_000_000;
+        db.put_daemon(&daemon_row(
+            "missing",
+            "/scope/a",
+            endpoint.to_str().unwrap(),
+            now - 1,
+        ))
+        .unwrap();
+
+        assert!(matches!(
+            discover(&db, "/scope/a", now),
+            Some(ControlAddr::Unix(path)) if path == endpoint
+        ));
+    }
+
+    #[test]
+    fn discover_does_not_fall_back_past_an_untrusted_freshest_row() {
+        let db = Db::open_memory().unwrap();
+        let now = 1_000_000;
+        db.put_daemon(&daemon_row("old", "/scope/a", "/run/old.sock", now - 100))
+            .unwrap();
+        db.put_daemon(&daemon_row("new", "/scope/a", "relative.sock", now - 1))
             .unwrap();
 
         assert!(discover(&db, "/scope/a", now).is_none());

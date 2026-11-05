@@ -588,6 +588,58 @@ pub fn owned_by_current_user(meta: &std::fs::Metadata) -> bool {
     }
 }
 
+/// How a daemon-registry endpoint path relates to the current user (THE-246).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EndpointSocket {
+    /// Nothing at the path: a stale registry row; connecting proves nobody listens.
+    Missing,
+    /// A unix socket owned by the effective user.
+    Trusted,
+    /// Exists but is not a socket (regular file, directory, symlink, fifo).
+    NotSocket,
+    /// A socket owned by another user.
+    ForeignOwner,
+    /// The path could not be inspected (permission denied, I/O error).
+    Unverifiable,
+}
+
+/// Pure decision for an existing path (`symlink_metadata`, so a symlink is `NotSocket`).
+pub fn classify_endpoint_socket_kind(
+    is_socket: bool,
+    owner_uid: u32,
+    effective_uid: u32,
+) -> EndpointSocket {
+    if !is_socket {
+        EndpointSocket::NotSocket
+    } else if owner_uid != effective_uid {
+        EndpointSocket::ForeignOwner
+    } else {
+        EndpointSocket::Trusted
+    }
+}
+
+/// Inspect `path` WITHOUT following symlinks. Platforms without a numeric owner return `Trusted` (the ACL seam applies).
+pub fn classify_endpoint_socket(path: &std::path::Path) -> EndpointSocket {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{FileTypeExt, MetadataExt};
+        match std::fs::symlink_metadata(path) {
+            Ok(meta) => classify_endpoint_socket_kind(
+                meta.file_type().is_socket(),
+                meta.uid(),
+                nix::unistd::geteuid().as_raw(),
+            ),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => EndpointSocket::Missing,
+            Err(_) => EndpointSocket::Unverifiable,
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _unused = path;
+        EndpointSocket::Trusted
+    }
+}
+
 /// Refuse a regular file that has another hardlink name. Security-sensitive
 /// destinations that will be atomically replaced use this as a tamper signal:
 /// replacement would not update the contents visible through the other name.
@@ -3321,6 +3373,51 @@ mod tests {
         ));
         assert!(owner_uid_allowed(5678, 5678));
         assert!(owner_uid_allowed(0, 5678));
+    }
+
+    #[test]
+    fn endpoint_socket_kind_table() {
+        assert_eq!(
+            classify_endpoint_socket_kind(true, 5, 5),
+            EndpointSocket::Trusted
+        );
+        assert_eq!(
+            classify_endpoint_socket_kind(true, 6, 5),
+            EndpointSocket::ForeignOwner
+        );
+        assert_eq!(
+            classify_endpoint_socket_kind(false, 5, 5),
+            EndpointSocket::NotSocket
+        );
+        assert_eq!(
+            classify_endpoint_socket_kind(false, 6, 5),
+            EndpointSocket::NotSocket
+        );
+    }
+
+    #[test]
+    fn endpoint_socket_classifies_missing_regular_symlink_and_socket_paths() {
+        use std::os::unix::fs::symlink;
+        use std::os::unix::net::UnixListener;
+
+        let temp = tempfile::tempdir_in("/tmp").unwrap();
+        let missing = temp.path().join("missing.sock");
+        assert_eq!(classify_endpoint_socket(&missing), EndpointSocket::Missing);
+
+        let regular = temp.path().join("regular");
+        std::fs::File::create(&regular).unwrap();
+        assert_eq!(
+            classify_endpoint_socket(&regular),
+            EndpointSocket::NotSocket
+        );
+
+        let socket = temp.path().join("s.sock");
+        let _listener = UnixListener::bind(&socket).unwrap();
+        assert_eq!(classify_endpoint_socket(&socket), EndpointSocket::Trusted);
+
+        let link = temp.path().join("link");
+        symlink(&socket, &link).unwrap();
+        assert_eq!(classify_endpoint_socket(&link), EndpointSocket::NotSocket);
     }
 
     #[test]
