@@ -265,6 +265,8 @@ pub fn schema_refusal(on_disk: i64, build: i64, allow_override: bool) -> Option<
          (`just build` in a checkout, `nix profile upgrade` for an installed copy), and make \
          sure the daemon is restarted from the same build as the CLI \
          (`thegn doctor` prints both).\n\
+         Upgrade, rollback and backup steps: the `upgrading-and-uninstalling` help page \
+         (F1 in thegn, or docs/help/upgrading-and-uninstalling.md in the source tree).\n\
          Override (read-only, for debugging only): {ALLOW_OLD_BUILD_ENV}=1"
     ))
 }
