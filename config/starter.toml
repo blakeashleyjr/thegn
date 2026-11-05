@@ -1,0 +1,53 @@
+# thegn starter config: the handful of settings that matter on day one.
+# Copy this file to your config path (`thegn config path` prints it; default:
+# ~/.config/thegn/config.toml), then check it with `thegn config validate`.
+# Find every key in the generated config-reference help page or in
+# config/config.toml.example.
+# Every key is optional; deleting this file changes nothing but the choices below.
+# Full annotated reference: config/config.toml.example in the source tree;
+# `thegn config edit` seeds a missing config from it.
+
+# Worktrees are stored here by default.
+worktrees_dir = "~/.thegn/worktrees"
+# New project repositories are cloned under this directory by default.
+projects_dir = "~/code"
+# The project picker scans these roots for repositories.
+repo_roots = ["~/code", "~/src"]
+
+[theme]
+# Palette preset. Default: prism.
+preset = "prism"
+# Color fidelity is detected from the terminal. Default: auto.
+color = "auto"
+# Unicode or ASCII chrome glyphs are selected for the terminal. Default: auto.
+glyphs = "auto"
+
+[git]
+# Fetch and prune in the background; set false to stop automatic fetching. Default: true.
+auto_fetch = true
+
+[sandbox]
+# Standard protects worktree integrity, not credentials; sealed hides home. Default: standard.
+profile = "standard"
+# Select an available containment backend automatically. Default: auto.
+backend = "auto"
+
+[daemon]
+# Keep panes alive after quitting; false runs panes in-process. Default: true.
+enabled = true
+
+[editor]
+# Detect an installed editor automatically. Default: auto.
+provider = "auto"
+
+[usage]
+# The AI-account usage gauge may call its provider with a token already on disk; false is offline. Default: true.
+allow_network = true
+
+[weather]
+# Weather is disabled until you opt in. Default: false.
+enabled = false
+
+[diagnostics]
+# Write local crash reports after a panic. Default: true.
+crash_reports = true
