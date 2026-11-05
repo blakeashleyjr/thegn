@@ -220,7 +220,7 @@ fn preview_value(dir: &Path, size: (u16, u16), wait: Duration) -> Result<Value> 
     })();
 
     let close = close_session(runtime, supervisor, session, &writer);
-    result.and(close.map(|()| ()))
+    result.and_then(|value| close.map(|()| value))
 }
 
 pub(super) fn close_session(
@@ -282,7 +282,8 @@ pub(super) fn run_interactive(dir: &Path, _size: (u16, u16)) -> Result<()> {
                     event,
                 );
             },
-        )?;
+        )
+        .map_err(anyhow::Error::msg)?;
         let writer = session.writer();
         parts = Some(LiveParts {
             runtime,
@@ -314,7 +315,6 @@ pub(super) fn run_interactive(dir: &Path, _size: (u16, u16)) -> Result<()> {
             surface,
             writer,
             inbox,
-            hook,
             super::live_tile::REQUEST_ACK_TIMEOUT,
         )) as Box<dyn AppTile>)
     });
