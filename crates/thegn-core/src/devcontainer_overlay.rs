@@ -396,19 +396,35 @@ fn fold_build(
         target: b.target.clone(),
     };
     let dockerfile_sha256 = sandbox_build::dockerfile_sha256(Path::new(&build.dockerfile));
-    let (digest, warning) = match dockerfile_sha256 {
-        Ok(digest) => (Some(digest), None),
-        Err(error) => (
-            None,
-            Some(format!(
-                "devcontainer: could not hash Dockerfile {} ({error}); the image tag covers the build declaration only",
+    let mut warnings = Vec::new();
+    let digest = match dockerfile_sha256 {
+        Ok(digest) => Some(digest),
+        Err(error) => {
+            warnings.push(format!(
+                "devcontainer: could not hash Dockerfile {} ({error}); its bytes are omitted from the image tag",
                 build.dockerfile
-            )),
-        ),
+            ));
+            None
+        }
     };
-    sb.image = sandbox_build::content_tag(&tag_basename(dir), &build, digest.as_deref());
+    let context_digest = match sandbox_build::context_sha256(Path::new(&build.context)) {
+        Ok(digest) => Some(digest),
+        Err(error) => {
+            warnings.push(format!(
+                "devcontainer: could not digest build context {} ({error}); the image tag covers the Dockerfile (when readable) and build declaration only",
+                build.context
+            ));
+            None
+        }
+    };
+    sb.image = sandbox_build::content_tag(
+        &tag_basename(dir),
+        &build,
+        digest.as_deref(),
+        context_digest.as_deref(),
+    );
     sb.build = Some(build);
-    warning.into_iter().collect()
+    warnings
 }
 
 /// Resolve a repo-authored path under its worktree. Parent traversal is
@@ -1771,6 +1787,54 @@ mod tests {
         assert_eq!(warns.len(), 1, "{warns:?}");
         assert!(warns[0].contains("could not hash Dockerfile"), "{warns:?}");
         assert!(warns[0].contains("Dockerfile"), "{warns:?}");
+    }
+
+    #[test]
+    fn build_context_edit_changes_image_tag() {
+        let temp = tempfile::tempdir().unwrap();
+        let config_dir = temp.path().join("proj").join(".devcontainer");
+        std::fs::create_dir_all(&config_dir).unwrap();
+        std::fs::write(config_dir.join("Dockerfile"), "FROM scratch\n").unwrap();
+        let context_file = config_dir.join("ctx-file");
+        std::fs::write(&context_file, "a").unwrap();
+        let dc = parse_with_dir(
+            r#"{ "build": { "dockerfile": "Dockerfile", "context": "." } }"#,
+            config_dir.to_str().unwrap(),
+        );
+
+        let mut first = SandboxConfig::default();
+        let first_warnings = apply_to_sandbox(&dc, &mut first, &ctx());
+        assert!(first_warnings.is_empty(), "{first_warnings:?}");
+        std::fs::write(&context_file, "b").unwrap();
+        let mut second = SandboxConfig::default();
+        let second_warnings = apply_to_sandbox(&dc, &mut second, &ctx());
+        assert!(second_warnings.is_empty(), "{second_warnings:?}");
+        assert_ne!(first.image, second.image);
+    }
+
+    #[test]
+    fn build_context_over_budget_warns_and_keeps_build() {
+        let temp = tempfile::tempdir().unwrap();
+        let config_dir = temp.path().join("proj").join(".devcontainer");
+        std::fs::create_dir_all(&config_dir).unwrap();
+        std::fs::write(config_dir.join("Dockerfile"), "FROM scratch\n").unwrap();
+        for index in 0..(sandbox_build::CONTEXT_DIGEST_MAX_ENTRIES + 52) {
+            std::fs::write(config_dir.join(format!("file-{index}")), "").unwrap();
+        }
+        let dc = parse_with_dir(
+            r#"{ "build": { "dockerfile": "Dockerfile", "context": "." } }"#,
+            config_dir.to_str().unwrap(),
+        );
+        let mut sb = SandboxConfig::default();
+        let warns = apply_to_sandbox(&dc, &mut sb, &ctx());
+
+        assert!(sb.build.is_some());
+        assert!(sb.image.starts_with("thegn-dc-"));
+        assert_eq!(warns.len(), 1, "{warns:?}");
+        assert!(
+            warns[0].contains("could not digest build context"),
+            "{warns:?}"
+        );
     }
 
     #[test]
