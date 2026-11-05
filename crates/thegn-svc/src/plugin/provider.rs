@@ -45,7 +45,9 @@ pub struct BridgeStats {
     pub cancelled: u64,
     /// Replies that matched no waiter (late after timeout or cancellation, duplicate, or unknown id).
     pub late_replies: u64,
-    /// Replies carrying neither or both of `result` and `error`.
+    /// Hand-built responses passed to `resolve` that carry neither or both
+    /// of `result` and `error`. The live session decoder rejects these frames,
+    /// so a plugin sending one normally causes the call to time out instead.
     pub malformed: u64,
     /// Pending calls woken with a closed-session failure.
     pub closed_wakeups: u64,
@@ -1660,21 +1662,83 @@ done
 
         #[test]
         fn bridge_stats_count_malformed_replies() {
-            let script = r#"read -r a; id=${a#*'"id":'}; id=${id%%,*}; printf '{"id":%s}\n' "$id"; read -r b; id=${b#*'"id":'}; id=${id%%,*}; printf '{"id":%s,"result":1,"error":{"code":"other","message":"x"}}\n' "$id"; while read -r _; do :; done"#;
-            let (_fixture, _session, bridge) = routed_bridge(script, Duration::from_secs(5));
+            let fixture = FixtureSupervisor::new();
+            let session = fixture
+                .spawn(
+                    &sh("while read -r _; do :; done"),
+                    &BTreeMap::new(),
+                    None,
+                    |_| {},
+                )
+                .unwrap();
+            let bridge = ProviderBridge::new(session.writer(), Duration::from_secs(5));
             let rt = tokio::runtime::Builder::new_current_thread()
                 .enable_all()
                 .build()
                 .unwrap();
 
-            for _ in 0..2 {
-                assert!(matches!(
-                    rt.block_on(bridge.call("issues", "list_issues", serde_json::json!({}))),
-                    Err(BridgeError::Transport(_))
-                ));
-            }
+            let (neither, both) = rt.block_on(async {
+                let first_bridge = Arc::clone(&bridge);
+                let first = async {
+                    loop {
+                        let id = {
+                            first_bridge
+                                .pending
+                                .lock()
+                                .unwrap()
+                                .calls
+                                .keys()
+                                .next()
+                                .copied()
+                        };
+                        if let Some(id) = id {
+                            assert!(first_bridge.resolve(RpcResponse {
+                                id,
+                                result: None,
+                                error: None,
+                            }));
+                            break;
+                        }
+                        tokio::task::yield_now().await;
+                    }
+                };
+                let first_call = bridge.call("issues", "list_issues", serde_json::json!({}));
+                let (first_result, ()) = tokio::join!(first_call, first);
+
+                let second_bridge = Arc::clone(&bridge);
+                let second = async {
+                    loop {
+                        let id = {
+                            second_bridge
+                                .pending
+                                .lock()
+                                .unwrap()
+                                .calls
+                                .keys()
+                                .next()
+                                .copied()
+                        };
+                        if let Some(id) = id {
+                            assert!(second_bridge.resolve(RpcResponse {
+                                id,
+                                result: Some(serde_json::json!(1)),
+                                error: Some(RpcError::new(RpcErrorCode::Other, "x")),
+                            }));
+                            break;
+                        }
+                        tokio::task::yield_now().await;
+                    }
+                };
+                let second_call = bridge.call("issues", "list_issues", serde_json::json!({}));
+                let (second_result, ()) = tokio::join!(second_call, second);
+                (first_result, second_result)
+            });
+            assert!(matches!(neither, Err(BridgeError::Transport(_))));
+            assert!(matches!(both, Err(BridgeError::Transport(_))));
             assert_eq!(bridge.stats().calls, 2);
             assert_eq!(bridge.stats().malformed, 2);
+            assert_eq!(bridge.stats().timed_out, 0);
+            session.kill();
         }
 
         #[test]

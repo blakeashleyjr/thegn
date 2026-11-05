@@ -27,7 +27,12 @@ pub(crate) fn merge_bridge(
         .map(|row| (row.plugin.clone(), row))
         .collect();
     for (plugin, stats) in bridge {
-        if *stats != thegn_svc::plugin::BridgeStats::default() {
+        let has_displayed_counts = stats.timed_out > 0
+            || stats.cancelled > 0
+            || stats.late_replies > 0
+            || stats.malformed > 0
+            || stats.closed_wakeups > 0;
+        if has_displayed_counts {
             rows.entry(plugin.clone())
                 .or_insert_with(|| PluginCounters {
                     plugin: plugin.clone(),
@@ -248,6 +253,13 @@ mod tests {
                 },
             ),
             (
+                "c".into(),
+                BridgeStats {
+                    timed_out: 1,
+                    ..Default::default()
+                },
+            ),
+            (
                 "z".into(),
                 BridgeStats {
                     calls: 1,
@@ -262,10 +274,11 @@ mod tests {
                 .iter()
                 .map(|row| row.plugin.as_str())
                 .collect::<Vec<_>>(),
-            ["b", "m", "z"]
+            ["b", "c", "m"]
         );
         assert_eq!(merged[0].bridge.timed_out, 2);
         assert!(!merged.iter().any(|row| row.plugin == "a"));
+        assert!(!merged.iter().any(|row| row.plugin == "z"));
     }
 
     #[test]
@@ -275,7 +288,7 @@ mod tests {
                 (
                     format!("plugin-{index:03}"),
                     BridgeStats {
-                        calls: 1,
+                        timed_out: 1,
                         ..Default::default()
                     },
                 )
