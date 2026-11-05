@@ -21,7 +21,7 @@ pub struct Options {
     /// Replay a full synthetic trace recorded with `--fixture ... --record ... --include-content`. Redacted traces cannot be replayed.
     #[arg(long)]
     replay: Option<PathBuf>,
-    /// Write a NEW private (0600, create-new) trace after preview exits; an existing file is never modified.
+    /// Write a NEW private (0600, create-new) trace after preview exits; an existing file is never modified. With `--plugin-dir` the trace is metadata only (method, id, error flag) and cannot be replayed.
     #[arg(long, conflicts_with = "replay")]
     record: Option<PathBuf>,
     /// Include frame payloads in the recorded trace (synthetic fixtures only).
@@ -34,7 +34,7 @@ pub struct Options {
     #[arg(long, default_value = "120x36", value_parser = dimensions)]
     size: (u16, u16),
     /// Start the resident app plugin whose plugin.toml is in this directory; without --headless, run an interactive live preview.
-    #[arg(long, value_name = "DIR", conflicts_with_all = ["fixture", "replay", "record", "include_content"])]
+    #[arg(long, value_name = "DIR", conflicts_with_all = ["fixture", "replay", "include_content"])]
     plugin_dir: Option<PathBuf>,
     /// With --plugin-dir --headless: how long to wait for the plugin's first valid app view, in milliseconds (100..=30000).
     #[arg(long, default_value_t = super::live::DEFAULT_WAIT_MS, value_parser = super::live::wait_ms, requires = "plugin_dir")]
@@ -211,7 +211,7 @@ fn read_json(path: &Path) -> Result<Value> {
     }
     serde_json::from_slice(&bytes).context("invalid preview JSON")
 }
-fn record(
+pub(super) fn record(
     trace: &Arc<Mutex<Trace>>,
     direction: &str,
     session: &str,
@@ -417,9 +417,10 @@ pub(super) fn run(options: Options) -> Result<()> {
                 dir,
                 options.size,
                 std::time::Duration::from_millis(options.wait_ms),
+                options.record.as_deref(),
             )
         } else {
-            super::live::run_interactive(dir, options.size)
+            super::live::run_interactive(dir, options.size, options.record.as_deref())
         };
     }
     let trace = Arc::new(Mutex::new(if options.record.is_some() {
@@ -452,7 +453,7 @@ mod tests {
     }
 
     #[test]
-    fn live_options_conflict_with_fixture_replay_and_record() {
+    fn live_options_conflict_with_fixture_and_replay() {
         assert!(PreviewArgs::try_parse_from(["p", "--plugin-dir", "d", "--headless"]).is_ok());
         assert!(PreviewArgs::try_parse_from(["p", "--plugin-dir", "d"]).is_ok());
         assert!(
@@ -472,9 +473,29 @@ mod tests {
         );
         assert!(
             PreviewArgs::try_parse_from(["p", "--plugin-dir", "d", "--headless", "--record", "r"])
-                .is_err()
+                .is_ok()
         );
         assert!(PreviewArgs::try_parse_from(["p", "--wait-ms", "500"]).is_err());
+    }
+
+    #[test]
+    fn live_options_accept_record_but_refuse_include_content() {
+        assert!(
+            PreviewArgs::try_parse_from(["p", "--plugin-dir", "d", "--headless", "--record", "r"])
+                .is_ok()
+        );
+        assert!(
+            PreviewArgs::try_parse_from([
+                "p",
+                "--plugin-dir",
+                "d",
+                "--headless",
+                "--record",
+                "r",
+                "--include-content"
+            ])
+            .is_err()
+        );
     }
 
     #[test]

@@ -195,6 +195,11 @@ environment or plugin state. The JSON snapshot includes a `live` object with `pl
 paste and resize input is forwarded as `on_event`, and Ctrl+Q closes the preview. A crash keeps the last view visible
 with a status note. `--wait-ms` applies only to headless previews. A headless crash, timeout or unclean shutdown exits
 non-zero; the plugin is stopped and reaped before the command exits.
+`--record <file>` also works with `--plugin-dir`: it writes a new owner-only trace of what the plugin and thegn exchanged,
+as metadata only (method name, request id and an error flag per frame, never a payload, and the real session token is not
+recorded). A live trace is capped at 8 MiB and 20,000 records, is written even when the preview fails (a crash trace),
+cannot be replayed, and is refused up front if the file already exists. Input forwarded from the keyboard is not part of
+the trace.
 
 ## Provider plugins
 
