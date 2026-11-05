@@ -364,14 +364,19 @@ pub const CATALOG: &[Slot] = &[
     slot("placement explain", "worktree_pos", SourceKind::Worktree),
     slot("placement plan", "worktree", SourceKind::Worktree),
     slot("placement plan", "worktree_pos", SourceKind::Worktree),
-    // `plugin preview` takes no plugin id and never starts a plugin to complete a value. Paths are clap's own
-    // filesystem completion; the size is a COLSxROWS scalar with no enumerable source.
+    // `plugin preview` value sources are structural or freeform scalars; paths use clap's filesystem completion.
     slot("plugin preview", "fixture", SourceKind::Structural),
     slot("plugin preview", "replay", SourceKind::Structural),
     slot("plugin preview", "record", SourceKind::Structural),
+    slot("plugin preview", "plugin_dir", SourceKind::Structural),
     slot(
         "plugin preview",
         "size",
+        SourceKind::Reserved(Reserved::Freeform),
+    ),
+    slot(
+        "plugin preview",
+        "wait_ms",
         SourceKind::Reserved(Reserved::Freeform),
     ),
     slot("pr approve", "worktree", SourceKind::Worktree),
