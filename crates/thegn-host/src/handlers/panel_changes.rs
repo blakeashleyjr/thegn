@@ -343,6 +343,18 @@ pub(crate) fn start_selected_preview(
     }
 }
 
+/// Monotonic counters for one [`PreviewOwners`] table (THE-390 item 8).
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct PreviewStats {
+    pub started: u64,
+    pub refused_duplicate: u64,
+    pub refused_cap: u64,
+    pub completed: u64,
+    pub stale_drops: u64,
+    pub cleared_owners: u64,
+    pub high_water: usize,
+}
+
 /// Monotonic ownership tokens prevent late workers from clearing a replacement
 /// job for the same path after a refresh or worktree switch.
 #[derive(Debug, Default)]
@@ -350,6 +362,7 @@ pub(crate) struct PreviewOwners {
     next: u64,
     owners: std::collections::HashMap<String, u64>,
     running: usize,
+    stats: PreviewStats,
 }
 
 /// Maximum blocking Git preview jobs allowed per kind at once.
@@ -358,28 +371,60 @@ pub(crate) const MAX_ACTIVE_PREVIEW_JOBS: usize = 4;
 impl PreviewOwners {
     pub(crate) fn begin(&mut self, key: &str) -> Option<u64> {
         if self.owners.contains_key(key) {
+            self.stats.refused_duplicate = self.stats.refused_duplicate.saturating_add(1);
+            tracing::debug!(
+                target: "thegn::preview",
+                key,
+                "preview job coalesced into the running one"
+            );
             return None;
         }
         if self.running >= MAX_ACTIVE_PREVIEW_JOBS {
+            self.stats.refused_cap = self.stats.refused_cap.saturating_add(1);
+            tracing::debug!(
+                target: "thegn::preview",
+                running = self.running,
+                "preview job refused at the active job cap"
+            );
             return None;
         }
         self.next = self.next.checked_add(1)?;
         self.owners.insert(key.to_owned(), self.next);
         self.running = self.running.saturating_add(1);
+        self.stats.started = self.stats.started.saturating_add(1);
+        self.stats.high_water = self.stats.high_water.max(self.running);
         Some(self.next)
     }
 
     pub(crate) fn finish(&mut self, key: &str, token: u64) -> bool {
         self.running = self.running.saturating_sub(1);
         if self.owners.get(key) != Some(&token) {
+            self.stats.stale_drops = self.stats.stale_drops.saturating_add(1);
+            tracing::debug!(
+                target: "thegn::preview",
+                key,
+                token,
+                stats = ?self.stats,
+                "stale preview completion dropped"
+            );
             return false;
         }
         self.owners.remove(key);
+        self.stats.completed = self.stats.completed.saturating_add(1);
         true
     }
 
     pub(crate) fn clear(&mut self) {
+        self.stats.cleared_owners = self
+            .stats
+            .cleared_owners
+            .saturating_add(u64::try_from(self.owners.len()).unwrap_or(u64::MAX));
         self.owners.clear();
+    }
+
+    #[cfg(test)]
+    pub(crate) fn stats(&self) -> PreviewStats {
+        self.stats
     }
 }
 
@@ -459,7 +504,7 @@ fn submodule_loc(
 #[cfg(test)]
 mod tests {
     use super::{
-        FrameModel, MAX_ACTIVE_PREVIEW_JOBS, PreviewOwners, PreviewTarget,
+        FrameModel, MAX_ACTIVE_PREVIEW_JOBS, PreviewOwners, PreviewStats, PreviewTarget,
         follow_change_cursor_target, selected_preview_target,
     };
 
@@ -561,6 +606,61 @@ mod tests {
         assert!(!owners.finish("src/lib.rs", stale));
         assert_eq!(owners.begin("src/lib.rs"), None);
         assert!(owners.finish("src/lib.rs", current));
+    }
+
+    #[test]
+    fn preview_stats_count_starts_refusals_and_completions() {
+        let mut owners = PreviewOwners::default();
+        let tokens: Vec<_> = (0..MAX_ACTIVE_PREVIEW_JOBS)
+            .map(|index| owners.begin(&format!("path-{index}")).unwrap())
+            .collect();
+
+        assert_eq!(owners.begin("path-0"), None);
+        assert_eq!(owners.begin("fifth"), None);
+        assert!(owners.finish("path-0", tokens[0]));
+
+        assert_eq!(
+            owners.stats(),
+            PreviewStats {
+                started: 4,
+                refused_duplicate: 1,
+                refused_cap: 1,
+                completed: 1,
+                stale_drops: 0,
+                cleared_owners: 0,
+                high_water: 4,
+            }
+        );
+    }
+
+    #[test]
+    fn preview_stats_count_stale_drops_and_cleared_owners() {
+        let mut owners = PreviewOwners::default();
+        let stale = owners.begin("a.rs").unwrap();
+        owners.clear();
+        let current = owners.begin("a.rs").unwrap();
+
+        assert!(!owners.finish("a.rs", stale));
+        assert_eq!(owners.stats().stale_drops, 1);
+        assert_eq!(owners.stats().completed, 0);
+        assert_eq!(owners.stats().cleared_owners, 1);
+        assert!(owners.finish("a.rs", current));
+        assert_eq!(owners.stats().completed, 1);
+    }
+
+    #[test]
+    fn preview_high_water_keeps_the_maximum_after_completions() {
+        let mut owners = PreviewOwners::default();
+        let tokens: Vec<_> = (0..3)
+            .map(|index| owners.begin(&format!("path-{index}")).unwrap())
+            .collect();
+        for (index, token) in tokens.into_iter().enumerate() {
+            assert!(owners.finish(&format!("path-{index}"), token));
+        }
+        assert!(owners.begin("later").is_some());
+
+        assert_eq!(owners.stats().high_water, 3);
+        assert_eq!(owners.stats().started, 4);
     }
 
     #[test]
