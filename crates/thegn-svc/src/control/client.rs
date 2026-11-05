@@ -3981,22 +3981,51 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn discover_ignores_a_symlinked_registry_endpoint() {
-        if !cfg!(unix) {
-            return;
-        }
-        let link = thegn_core::testenv::symlinked_tempdir();
+        use std::os::unix::fs::symlink;
+        use std::os::unix::net::UnixListener;
+
+        let temp = tempfile::tempdir_in("/tmp").unwrap();
+        let socket = temp.path().join("s.sock");
+        let _listener = UnixListener::bind(&socket).unwrap();
+        let link = temp.path().join("link");
+        symlink(&socket, &link).unwrap();
         let db = Db::open_memory().unwrap();
         let now = 1_000_000;
         db.put_daemon(&daemon_row(
             "symlink",
             "/scope/a",
-            link.path().to_str().unwrap(),
+            link.to_str().unwrap(),
             now - 1,
         ))
         .unwrap();
 
         assert!(discover(&db, "/scope/a", now).is_none());
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn discover_accepts_a_live_same_user_socket_endpoint() {
+        use std::os::unix::net::UnixListener;
+
+        let temp = tempfile::tempdir_in("/tmp").unwrap();
+        let endpoint = temp.path().join("s.sock");
+        let _listener = UnixListener::bind(&endpoint).unwrap();
+        let db = Db::open_memory().unwrap();
+        let now = 1_000_000;
+        db.put_daemon(&daemon_row(
+            "live",
+            "/scope/a",
+            endpoint.to_str().unwrap(),
+            now - 1,
+        ))
+        .unwrap();
+
+        assert!(matches!(
+            discover(&db, "/scope/a", now),
+            Some(ControlAddr::Unix(path)) if path == endpoint
+        ));
     }
 
     #[test]

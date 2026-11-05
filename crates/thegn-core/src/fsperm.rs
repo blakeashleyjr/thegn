@@ -3411,6 +3411,17 @@ mod tests {
             EndpointSocket::NotSocket
         );
 
+        assert_eq!(
+            classify_endpoint_socket(temp.path()),
+            EndpointSocket::NotSocket
+        );
+
+        let uninspectable = regular.join("child.sock");
+        assert_eq!(
+            classify_endpoint_socket(&uninspectable),
+            EndpointSocket::Unverifiable
+        );
+
         let socket = temp.path().join("s.sock");
         let _listener = UnixListener::bind(&socket).unwrap();
         assert_eq!(classify_endpoint_socket(&socket), EndpointSocket::Trusted);
