@@ -193,7 +193,7 @@ pub(crate) fn install_status_writer(state_dir: PathBuf) -> bool {
 }
 
 fn spawn_status_writer(state_dir: PathBuf) -> (Sender<Arc<Vec<PluginCounters>>>, JoinHandle<()>) {
-    let (tx, rx) = mpsc::channel();
+    let (tx, rx) = mpsc::channel::<Arc<Vec<PluginCounters>>>();
     let handle = thegn_core::thread_name::spawn_named("thegn-plugstat", move || {
         crate::platform::qos::set_self(crate::platform::qos::Qos::Background);
         while let Ok(mut rows) = rx.recv() {
@@ -228,11 +228,9 @@ fn write_status_file(
     let bytes = thegn_core::plugin_status::encode(&snapshot)
         .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
     crate::daemon::control_publish::prepare_run_dir(state_dir)?;
-    thegn_core::fsperm::write_owner_only_atomic(
-        &crate::daemon::control_publish::run_dir(state_dir)
-            .join(thegn_core::plugin_status::STATUS_FILE),
-        &bytes,
-    )
+    thegn_core::fsperm::open_private_dir(&crate::daemon::control_publish::run_dir(state_dir))?
+        .write_owner_only_atomic(thegn_core::plugin_status::STATUS_FILE, &bytes)?;
+    Ok(())
 }
 
 #[cfg(test)]
@@ -493,8 +491,7 @@ mod tests {
         let _guard = super::TEST_LOCK
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let dir = tempfile::tempdir_in("/tmp").expect("private status tempdir");
-        let file = dir.path().join("run").join(STATUS_FILE);
+        assert!(super::WRITER.get().is_none());
         let row = PluginCounters {
             plugin: format!("status-memory-{}", std::process::id()),
             rejected: 1,
@@ -503,7 +500,6 @@ mod tests {
         assert!(publish(vec![row.clone()]));
         assert!(!publish(vec![row.clone()]));
         assert!(snapshot().iter().any(|published| published == &row));
-        assert!(!file.exists());
         publish(Vec::new());
     }
 
