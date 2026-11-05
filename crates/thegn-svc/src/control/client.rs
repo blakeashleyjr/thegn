@@ -97,14 +97,31 @@ impl std::fmt::Debug for ControlAddr {
     }
 }
 
+/// Whether a registry endpoint can be a bound unix socket path on this platform.
+pub(crate) fn registry_endpoint_fits(endpoint: &str, max: usize, windows: bool) -> bool {
+    thegn_core::config_daemon::check_socket_path_len(std::path::Path::new(endpoint), max, windows)
+        .is_ok()
+}
+
 /// Discover a live local daemon for `scope` (the canonical state dir) from the
-/// registry: freshest heartbeat wins. Returns its unix-socket address; `None`
-/// means "no daemon running" (callers degrade gracefully).
+/// registry: the freshest heartbeat wins. Endpoints exceeding the platform's
+/// socket-path byte cap are ignored; an over-long freshest row does not fall
+/// back to an older row. Returns its unix-socket address; `None` means no
+/// usable daemon was found (callers degrade gracefully).
 pub fn discover(store: &dyn ControlStore, scope: &str, now_ms: i64) -> Option<ControlAddr> {
-    store
+    let daemon = store
         .freshest_live_daemon(scope, now_ms, DAEMON_HEARTBEAT_TTL_MS)
-        .ok()?
-        .map(|d| ControlAddr::Unix(PathBuf::from(d.endpoint)))
+        .ok()??;
+    let max = thegn_core::config_daemon::max_socket_path_len(cfg!(target_os = "linux"));
+    if !registry_endpoint_fits(&daemon.endpoint, max, cfg!(windows)) {
+        tracing::debug!(
+            target: "thegn::control",
+            bytes = daemon.endpoint.len(),
+            "daemon registry endpoint is longer than a socket path; ignoring it"
+        );
+        return None;
+    }
+    Some(ControlAddr::Unix(PathBuf::from(daemon.endpoint)))
 }
 
 #[derive(Clone)]
@@ -3834,6 +3851,65 @@ mod tests {
             ControlAddr::Unix(path) => assert_eq!(path, PathBuf::from("/run/fresh.sock")),
             other => panic!("expected a unix addr, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn registry_endpoint_fits_checks_bytes_not_chars() {
+        assert!(registry_endpoint_fits(&"a".repeat(107), 107, false));
+        assert!(!registry_endpoint_fits(&"a".repeat(108), 107, false));
+        assert!(registry_endpoint_fits(&"a".repeat(103), 103, false));
+        assert!(!registry_endpoint_fits(&"a".repeat(104), 103, false));
+        assert!(!registry_endpoint_fits(&"\u{1F600}".repeat(40), 107, false));
+        assert!(registry_endpoint_fits(&"a".repeat(4096), 107, true));
+    }
+
+    #[test]
+    fn discover_ignores_a_registry_endpoint_longer_than_a_socket_path() {
+        if cfg!(windows) {
+            return;
+        }
+        let db = Db::open_memory().unwrap();
+        let now = 1_000_000;
+        let endpoint = format!("/run/{}", "x".repeat(4096));
+        db.put_daemon(&daemon_row("long", "/scope/a", &endpoint, now - 1))
+            .unwrap();
+
+        assert!(discover(&db, "/scope/a", now).is_none());
+    }
+
+    #[test]
+    fn discover_still_returns_a_normal_endpoint_beside_the_cap() {
+        let db = Db::open_memory().unwrap();
+        let now = 1_000_000;
+        db.put_daemon(&daemon_row(
+            "normal",
+            "/scope/a",
+            "/run/fresh.sock",
+            now - 1,
+        ))
+        .unwrap();
+
+        let got = discover(&db, "/scope/a", now).expect("a live same-scope daemon exists");
+        match got {
+            ControlAddr::Unix(p) => assert_eq!(p, PathBuf::from("/run/fresh.sock")),
+            other => panic!("expected a unix addr, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn discover_does_not_fall_back_past_an_overlong_freshest_row() {
+        if cfg!(windows) {
+            return;
+        }
+        let db = Db::open_memory().unwrap();
+        let now = 1_000_000;
+        db.put_daemon(&daemon_row("old", "/scope/a", "/run/old.sock", now - 100))
+            .unwrap();
+        let endpoint = format!("/run/{}", "x".repeat(4096));
+        db.put_daemon(&daemon_row("new", "/scope/a", &endpoint, now - 1))
+            .unwrap();
+
+        assert!(discover(&db, "/scope/a", now).is_none());
     }
 
     async fn reject_first_frame(payload: Vec<u8>, events: bool) -> anyhow::Error {
