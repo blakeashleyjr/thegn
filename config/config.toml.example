@@ -11,8 +11,9 @@
 # sessions, sandboxing, and the CLI merge/land/integrate queue. Several
 # subsystems are still experimental and are DISABLED in the stable build even if
 # the keys below are set: remotes ([sandbox.remote]), cloud execution providers
-# ([host.*]), the Observe dashboards ([observe]), the placement engine
-# ([placement]), and voice mode ([voice]). Issue trackers ([issues]) are stable.
+# ([host.*]), the placement engine ([placement]), and voice mode ([voice]).
+# Observe dashboards ([observe]) and plugin app tabs are available in stable.
+# Issue trackers ([issues]) are stable.
 # To enable the experimental subsystems, run the dev build (`nix run .#dev`,
 # installed as `thegn-dev`) or set THEGN_CHANNEL=dev for one run. `thegn doctor`
 # prints the resolved channel and which features it allows. There is no config
@@ -757,7 +758,7 @@ token = "env:GITLAB_TOKEN"
 # both ids; omitted built-in tabs are appended. Duplicate ids are ignored.
 # Unknown ids and a disabled default are rejected by `thegn config validate`.
 [apps]
-default_tab = "work" # initial tab (THEGN_APPS_DEFAULT_TAB): "work", enabled "observe", or "plugin:<plugin>:<contribution>" (dev channel)
+default_tab = "work" # initial tab (THEGN_APPS_DEFAULT_TAB): "work", enabled "observe", or "plugin:<plugin>:<contribution>"
 tab_order = ["work", "observe"]
 
 # The embedded "Observe" observability app tab: a Grafana-style in-terminal

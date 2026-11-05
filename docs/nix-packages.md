@@ -38,8 +38,8 @@ build-cost descriptions; no timing or closure-size measurements are claimed.
 The Home Manager and nix-darwin modules default `programs.thegn.package` to
 `.#default`. Stable-channel builds clamp provider and remote features off by
 default, so the bridge included beside the stable default package is inert for
-stable users. Provider and remote features are experimental and dev-channel
-only.
+stable users. Observe and plugin app tabs are available in stable; provider and
+remote features remain experimental and dev-channel only.
 
 ## Platform limits
 

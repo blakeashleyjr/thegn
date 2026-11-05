@@ -7,6 +7,8 @@ All notable changes to **thegn** are documented here. The format follows
 
 ## [Unreleased]
 
+- Observe and plugin app tabs are now available on the stable channel.
+
 ## [0.1.0-alpha.51] — 2026-11-04 (maintenance batch 89)
 
 ### Added
