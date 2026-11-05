@@ -1303,6 +1303,20 @@ test-packaging:
 test-the429:
     binary="${THEGN_TEST_BINARY:-}"; if [ -z "$binary" ] && [ -x "${CARGO_TARGET_DIR:-target}/release/thegn" ]; then binary="${CARGO_TARGET_DIR:-target}/release/thegn"; fi; if [ -z "$binary" ]; then echo "THE-429 native fixture: missing compiled binary; set THEGN_TEST_BINARY for the final native gate" >&2; else binary="$(realpath -- "$binary")"; echo "THE-429 native fixture: selected $binary"; fi; THEGN_TEST_BINARY="$binary" python3 -B test/the429_checkout_hooks.py
 
+# Regenerate THIRD_PARTY_NOTICES.md from `cargo metadata --locked --offline`
+# (commit the result; the release workflow copies it into the release assets).
+third-party-notices:
+    python3 -B scripts/third_party_notices.py
+
+# Fail when THIRD_PARTY_NOTICES.md is stale against Cargo.lock (needs cargo and a warm
+# registry cache; not part of `just test`).
+third-party-notices-check:
+    python3 -B scripts/third_party_notices.py --check
+
+# Hermetic test for the notices generator; pure Python, no Cargo.
+test-third-party-notices:
+    python3 -B test/third_party_notices_test.py
+
 # Install/update the native thegn host onto your PATH (standalone, non-Nix):
 # builds release artifacts, installs `tg` as the dedicated alacritty launcher,
 # `tg-tui` for the current terminal window, and the direct `thegn`
