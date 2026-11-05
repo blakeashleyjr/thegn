@@ -71,6 +71,7 @@ struct Observation {
     sink_writes: usize,
     sink_bytes: usize,
     ordered: bool,
+    admitted_order: Vec<(u8, u32)>,
     quiet_progress: Option<bool>,
     writer_status: String,
     elapsed_ms: u128,
@@ -268,7 +269,9 @@ fn run_case(kind: ProducerKind, seed: u64, mode: SinkMode, total_bytes: usize) -
                     let _submission = submission.lock().unwrap_or_else(|error| error.into_inner());
                     let mut bytes = chunk.bytes.clone();
                     let mut submitted = false;
-                    for attempt in 0..=2000 {
+                    let retry_deadline = Instant::now() + Duration::from_secs(10);
+                    let mut attempts = 0;
+                    loop {
                         match writer.try_submit_oob(bytes) {
                             Ok(()) => {
                                 admitted
@@ -281,9 +284,19 @@ fn run_case(kind: ProducerKind, seed: u64, mode: SinkMode, total_bytes: usize) -
                             }
                             Err(returned) => {
                                 bytes = returned;
-                                if attempt < 2000 {
-                                    std::thread::yield_now();
+                                if matches!(
+                                    writer.take_status(),
+                                    crate::frame_writer::WriterStatus::Fatal(_)
+                                ) || Instant::now() >= retry_deadline
+                                {
+                                    break;
                                 }
+                                if attempts < 8 {
+                                    std::thread::yield_now();
+                                } else {
+                                    std::thread::sleep(Duration::from_micros(50));
+                                }
+                                attempts += 1;
                             }
                         }
                     }
@@ -321,6 +334,14 @@ fn run_case(kind: ProducerKind, seed: u64, mode: SinkMode, total_bytes: usize) -
         .copied()
         .collect::<Vec<_>>();
     let status = format!("{:?}", writer.take_status());
+    if !matches!(mode, SinkMode::FailAfter { .. }) {
+        let drain_deadline = Instant::now() + Duration::from_secs(10);
+        while seen.lock().unwrap_or_else(|error| error.into_inner()).len() < expected.len()
+            && Instant::now() < drain_deadline
+        {
+            std::thread::sleep(Duration::from_millis(1));
+        }
+    }
     drop(writer);
     let seen = seen
         .lock()
@@ -345,6 +366,7 @@ fn run_case(kind: ProducerKind, seed: u64, mode: SinkMode, total_bytes: usize) -
             accepted_chunks + refused_chunks == produced_chunks
         }
     });
+    let admitted_order = admitted;
     Observation {
         kind: kind.label(),
         seed,
@@ -356,6 +378,7 @@ fn run_case(kind: ProducerKind, seed: u64, mode: SinkMode, total_bytes: usize) -
         sink_writes: writes.load(Ordering::SeqCst),
         sink_bytes: seen.len(),
         ordered,
+        admitted_order,
         quiet_progress,
         writer_status: status,
         elapsed_ms: started.elapsed().as_millis(),
@@ -398,11 +421,12 @@ mod tests {
             let Some(last_escape) = chunk.bytes.iter().rposition(|byte| *byte == 0x1b) else {
                 continue;
             };
-            assert!(
-                chunk.bytes[last_escape + 1..]
-                    .iter()
+            assert_eq!(chunk.bytes.get(last_escape + 1), Some(&b'['));
+            assert!(chunk.bytes.get(last_escape + 2..).is_some_and(|tail| {
+                tail.iter()
+                    .take_while(|byte| **byte != 0x1b)
                     .any(|byte| (0x40..=0x7e).contains(byte))
-            );
+            }));
         }
     }
 
@@ -509,6 +533,23 @@ mod tests {
                 generate(kind, 11, total).len()
             );
         }
+    }
+
+    #[test]
+    fn flooder_plus_quiet_fast_sink_admits_quiet_output() {
+        let observation = run_case(
+            ProducerKind::FlooderPlusQuiet,
+            11,
+            SinkMode::Fast,
+            128 * 1024,
+        );
+        assert_eq!(observation.quiet_progress, Some(true));
+        assert!(
+            observation
+                .admitted_order
+                .iter()
+                .any(|(producer, _)| *producer == 1)
+        );
     }
 
     /// Run with `cargo test -p thegn-host --release perf_workloads_pty --
