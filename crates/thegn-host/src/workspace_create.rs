@@ -2181,13 +2181,14 @@ Receiving objects: 100% (10/10)\rdone.\n";
         let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
         let address = listener.local_addr().unwrap();
         listener.set_nonblocking(true).unwrap();
+        let stop_accept = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let accept_stop = stop_accept.clone();
         let accept_thread = std::thread::spawn(move || {
-            let deadline = Instant::now() + Duration::from_secs(4);
             loop {
                 match listener.accept() {
                     Ok((stream, _)) => return Some(stream),
                     Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
-                        if Instant::now() >= deadline {
+                        if accept_stop.load(Ordering::Acquire) {
                             return None;
                         }
                         std::thread::sleep(Duration::from_millis(10));
@@ -2217,6 +2218,7 @@ Receiving objects: 100% (10/10)\rdone.\n";
             tx.send(result.map_err(|error| error.to_string())).unwrap();
         });
         let result = rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        stop_accept.store(true, Ordering::Release);
         let elapsed = started.elapsed();
         worker.join().unwrap();
         let error = result.expect_err("a nonresponsive HTTP peer must time out");
@@ -2243,13 +2245,14 @@ Receiving objects: 100% (10/10)\rdone.\n";
         let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
         let address = listener.local_addr().unwrap();
         listener.set_nonblocking(true).unwrap();
+        let stop_accept = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let accept_stop = stop_accept.clone();
         let accept_thread = std::thread::spawn(move || {
-            let deadline = Instant::now() + Duration::from_secs(4);
             loop {
                 match listener.accept() {
                     Ok((stream, _)) => return Some(stream),
                     Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
-                        if Instant::now() >= deadline {
+                        if accept_stop.load(Ordering::Acquire) {
                             return None;
                         }
                         std::thread::sleep(Duration::from_millis(10));
@@ -2279,6 +2282,7 @@ Receiving objects: 100% (10/10)\rdone.\n";
             tx.send(result.map_err(|error| error.to_string())).unwrap();
         });
         let result = rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        stop_accept.store(true, Ordering::Release);
         let elapsed = started.elapsed();
         worker.join().unwrap();
         let error = result.expect_err("a nonresponsive HTTP peer must time out");
