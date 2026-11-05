@@ -305,6 +305,7 @@ mod terminal_wizard;
 mod testenv;
 mod testkit;
 mod theme_builder;
+mod theme_rename;
 mod theme_store;
 mod toast;
 mod toolchain_ui;

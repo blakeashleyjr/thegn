@@ -40,6 +40,7 @@ thegn theme list
 thegn theme set prism
 thegn theme set my-theme
 thegn theme import ~/Downloads/theme.yml --name my-theme
+thegn theme rename my-theme my-new-theme
 ```
 
 `theme set` accepts a built-in or valid local name and writes the existing
@@ -48,6 +49,13 @@ applies any existing `[theme.colors]` and `[theme.hues]` overrides on top.
 `theme import` reads only a bounded local file, validates the Gogh scheme, and
 saves a versioned TOML user theme. It reports any contrast warnings and
 performs no network access.
+
+`theme rename OLD NEW` moves a local theme to a new name: the theme's file is
+renamed with it, because the file name is the theme's identity. The new file is
+written first and the old one removed afterwards, so an interruption never
+loses a theme. It refuses to rename a built-in, the theme you currently have
+selected (select another with `theme set` first), a name another theme already
+uses, or a name that maps to the same file as the old one.
 
 User themes live under `$XDG_CONFIG_HOME/thegn/themes` (normally
 `~/.config/thegn/themes`). Files with invalid content are ignored by the
