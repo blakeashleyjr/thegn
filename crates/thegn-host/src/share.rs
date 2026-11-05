@@ -190,6 +190,68 @@ pub(crate) fn restore_skips_live_foreign_owner(
     }
 }
 
+/// What startup restore does with one saved share row (THE-341 f).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RestorePlan {
+    /// A live foreign `thegn share start` owns the row: do nothing.
+    Skip,
+    /// Restart the share through the supervisor (an `up` row).
+    Start,
+    /// A `starting` row whose recorded owner exited: record it as a visible `failed` tombstone.
+    MarkFailed,
+    /// Nothing to do (stopping, unknown, failed, a live owner, an unrecorded owner, legacy state text).
+    Leave,
+}
+
+pub(crate) fn restore_plan(
+    row: &thegn_core::db::ShareRow,
+    own_pid: u32,
+    live_start_ticks: impl Fn(u32) -> Option<u64>,
+) -> RestorePlan {
+    if restore_skips_live_foreign_owner(row, own_pid, &live_start_ticks) {
+        return RestorePlan::Skip;
+    }
+
+    let Some(state) = thegn_core::share::ShareState::parse(&row.state) else {
+        return RestorePlan::Leave;
+    };
+    match state {
+        thegn_core::share::ShareState::Up => RestorePlan::Start,
+        thegn_core::share::ShareState::Starting => {
+            let owner = thegn_core::share::share_owner_state(
+                row.owner,
+                row.owner.and_then(|owner| live_start_ticks(owner.pid)),
+            );
+            if owner == thegn_core::share::ShareOwnerState::Exited
+                && state.recovery(owner) == thegn_core::share::ShareRecovery::TearDownThenFail
+            {
+                RestorePlan::MarkFailed
+            } else {
+                RestorePlan::Leave
+            }
+        }
+        thegn_core::share::ShareState::Stopping
+        | thegn_core::share::ShareState::Unknown
+        | thegn_core::share::ShareState::Failed => RestorePlan::Leave,
+    }
+}
+
+/// Record a restore outcome through the guarded `upsert_share` for this row's identity.
+pub(crate) fn mark_restored_row(
+    store: &dyn WorktreeAuxStore,
+    row: &thegn_core::db::ShareRow,
+    to: thegn_core::share::ShareState,
+) -> anyhow::Result<()> {
+    store.upsert_share(
+        &row.worktree,
+        row.local_port,
+        row.generation,
+        &row.provider,
+        row.public_url.as_deref(),
+        to.as_str(),
+    )
+}
+
 /// Durable operation for an event the supervisor accepted. `other_generation_live` is whether
 /// another generation still occupies the same (worktree, port). Only an unconditional upsert is
 /// suppressed then (it would overwrite the newer generation's row); a fenced delete always runs
@@ -2382,5 +2444,151 @@ mod tests {
             11,
             |_| Some(99)
         ));
+    }
+
+    fn saved_row(state: &str, owner: Option<(u32, u64)>) -> thegn_core::db::ShareRow {
+        thegn_core::db::ShareRow {
+            worktree: "/wt".into(),
+            local_port: 3000,
+            provider: "bore".into(),
+            public_url: None,
+            state: state.into(),
+            created_at: 0,
+            generation: 41,
+            owner: owner
+                .map(|(pid, start_ticks)| thegn_core::models::ShareOwner { pid, start_ticks }),
+        }
+    }
+
+    #[test]
+    fn restore_plan_restarts_only_up_rows() {
+        assert_eq!(
+            restore_plan(&saved_row("up", None), 11, |_| None),
+            RestorePlan::Start
+        );
+        assert_eq!(
+            restore_plan(&saved_row("up", Some((22, 99))), 11, |_| None),
+            RestorePlan::Start
+        );
+        for state in ["stopping", "unknown", "failed"] {
+            assert_eq!(
+                restore_plan(&saved_row(state, None), 11, |_| None),
+                RestorePlan::Leave
+            );
+        }
+        assert_eq!(
+            restore_plan(&saved_row("weird", None), 11, |_| None),
+            RestorePlan::Leave
+        );
+    }
+
+    #[test]
+    fn restore_plan_marks_a_starting_row_with_an_exited_owner_failed() {
+        let row = saved_row("starting", Some((22, 99)));
+        assert_eq!(restore_plan(&row, 11, |_| None), RestorePlan::MarkFailed);
+        assert_eq!(
+            restore_plan(&row, 11, |_| Some(100)),
+            RestorePlan::MarkFailed
+        );
+    }
+
+    #[test]
+    fn restore_plan_leaves_a_starting_row_it_cannot_prove_dead() {
+        assert_eq!(
+            restore_plan(&saved_row("starting", None), 11, |_| None),
+            RestorePlan::Leave
+        );
+        assert_eq!(
+            restore_plan(&saved_row("starting", Some((22, 99))), 22, |_| Some(99)),
+            RestorePlan::Leave
+        );
+    }
+
+    #[test]
+    fn restore_plan_skips_a_live_foreign_owner() {
+        for state in ["up", "starting"] {
+            assert_eq!(
+                restore_plan(&saved_row(state, Some((22, 99))), 11, |_| Some(99)),
+                RestorePlan::Skip
+            );
+        }
+    }
+
+    #[test]
+    fn mark_restored_row_follows_the_state_table() {
+        let db = thegn_core::db::Db::open_memory().expect("in-memory database");
+        let starting = saved_row("starting", None);
+        db.upsert_share(
+            &starting.worktree,
+            starting.local_port,
+            starting.generation,
+            &starting.provider,
+            starting.public_url.as_deref(),
+            &starting.state,
+        )
+        .expect("insert starting share");
+        mark_restored_row(&db, &starting, thegn_core::share::ShareState::Failed)
+            .expect("starting may become failed");
+        let failed = db.list_shares().expect("list shares").remove(0);
+        assert_eq!(failed.state, "failed");
+        assert_eq!(failed.generation, starting.generation);
+        assert_eq!(failed.provider, starting.provider);
+        assert_eq!(failed.public_url, starting.public_url);
+
+        let up = thegn_core::db::ShareRow {
+            local_port: 3001,
+            ..saved_row("up", None)
+        };
+        db.upsert_share(
+            &up.worktree,
+            up.local_port,
+            up.generation,
+            &up.provider,
+            up.public_url.as_deref(),
+            &up.state,
+        )
+        .expect("insert up share");
+        mark_restored_row(&db, &up, thegn_core::share::ShareState::Unknown)
+            .expect("up may become unknown");
+        let rows = db.list_shares().expect("list shares");
+        assert_eq!(
+            rows.iter()
+                .find(|row| row.local_port == up.local_port)
+                .map(|row| row.state.as_str()),
+            Some("unknown")
+        );
+        assert_eq!(
+            rows.iter()
+                .find(|row| row.local_port == up.local_port)
+                .map(|row| row.generation),
+            Some(up.generation)
+        );
+
+        let failed_row = thegn_core::db::ShareRow {
+            local_port: 3002,
+            ..saved_row("failed", None)
+        };
+        db.upsert_share(
+            &failed_row.worktree,
+            failed_row.local_port,
+            failed_row.generation,
+            &failed_row.provider,
+            failed_row.public_url.as_deref(),
+            &failed_row.state,
+        )
+        .expect("insert failed share");
+        let result = mark_restored_row(&db, &failed_row, thegn_core::share::ShareState::Unknown);
+        assert!(result.as_ref().is_err_and(|error| {
+            error
+                .downcast_ref::<thegn_core::share::ShareTransitionRefused>()
+                .is_some()
+        }));
+        let unchanged = db
+            .list_shares()
+            .expect("list shares")
+            .into_iter()
+            .find(|row| row.local_port == failed_row.local_port)
+            .expect("failed row remains");
+        assert_eq!(unchanged.state, "failed");
     }
 }

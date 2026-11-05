@@ -53,6 +53,10 @@ so an interrupted stop stays `stopping` and stopping it again retries. The
 or `(needs teardown)` when a row needs recovery; `--json` carries a `recovery`
 field. A missing owner is treated as unverified, so a healthy host-supervised
 share or a pre-v101 row can also receive a recovery hint.
+When thegn opens, a saved `starting` share whose `thegn share start` process has
+exited is recorded as `failed` (stop it to retry the teardown), and an `up`
+share thegn could not restart is recorded as `unknown`, which `thegn share list`
+shows as `(needs reconcile)`.
 `thegn share start` refuses a port that already has a saved share; stop it
 first, or use `--forget` for a stale record. It records the share as `starting`
 before the tunnel comes up. `thegn share stop <port>` also tears down a
