@@ -366,6 +366,93 @@ exec_command = ["fixture-exec", "{id}", "--"]
 }
 
 #[test]
+fn provider_sync_upload_is_not_attempted_for_a_refused_launch() {
+    with_temp_state("provider-sync-refused", || {
+        let cfg: Config = toml::from_str(
+            r#"
+[sandbox]
+backend = "none"
+enabled = false
+
+[env.provider]
+placement = "provider"
+data = "sync"
+[env.provider.provider]
+provider = "custom"
+id = "fixture"
+exec_command = ["fixture-exec", "{id}", "--"]
+"#,
+        )
+        .unwrap();
+        let worktree = "/wt/provider-sync-refused";
+        let loc = GitLoc::from_db(worktree, None);
+        let result = prepare_sandbox_env(
+            &cfg,
+            Path::new("/repo"),
+            worktree,
+            &loc,
+            None,
+            false,
+            Some("provider"),
+        );
+
+        assert!(result.is_err(), "disabled provider sandbox refuses");
+        assert!(
+            !super::provider_sync_attempts_for_test()
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .contains(&worktree.to_string()),
+            "refused provider launch must not attempt the worktree upload"
+        );
+    });
+}
+
+#[test]
+fn provider_sync_upload_is_attempted_once_for_an_admitted_launch() {
+    with_temp_state("provider-sync-admitted", || {
+        let cfg: Config = toml::from_str(
+            r#"
+[sandbox]
+backend = "none"
+
+[env.provider]
+placement = "provider"
+data = "sync"
+[env.provider.provider]
+provider = "custom"
+id = "fixture"
+exec_command = ["fixture-exec", "{id}", "--"]
+"#,
+        )
+        .unwrap();
+        let worktree = "/wt/provider-sync-admitted";
+        let loc = GitLoc::from_db(worktree, None);
+        let result = prepare_sandbox_env(
+            &cfg,
+            Path::new("/repo"),
+            worktree,
+            &loc,
+            None,
+            false,
+            Some("provider"),
+        );
+
+        assert!(result.is_ok(), "native provider launch should be admitted");
+        let attempts = super::provider_sync_attempts_for_test()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        assert_eq!(
+            attempts
+                .iter()
+                .filter(|attempt| attempt.as_str() == worktree)
+                .count(),
+            1,
+            "admitted provider launch should attempt exactly one upload"
+        );
+    });
+}
+
+#[test]
 fn automatic_prewarm_rejects_host_specs_but_keeps_contained_specs() {
     let mut host = Ok(vec![(
         7,
