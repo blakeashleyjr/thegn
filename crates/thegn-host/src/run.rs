@@ -9345,6 +9345,7 @@ async fn event_loop<T: Terminal>(
                 panel_ui.docs.loop_perf.push(&snap);
                 lsp_diag_rx.set_timing(true);
                 crate::perf_lsp::emit(&lsp_diag_rx);
+                crate::perf_log::emit(log_stats);
             }
         }
         if session.worktrees.is_empty() {

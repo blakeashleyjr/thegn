@@ -83,6 +83,18 @@ queue. `lsp_queue_observed=false` means the bus could not be read. This
 observation runs only during an existing perf rollup; it adds no timer,
 thread, or wake source.
 
+**Log ingress.** The separate `log ingress` event reports
+`log_ingress_pending`, `log_ingress_pending_bytes`, `log_ingress_pushed`,
+`log_ingress_taken`, `log_ingress_dropped`, `log_ingress_gap_markers`,
+`log_ingress_oldest_known`, and `log_ingress_oldest_ms`. Pushed, taken,
+dropped, and gap-marker counts are cumulative since process start; pending
+records, pending bytes, and the two oldest-age fields are instantaneous gauges
+at the rollup.
+`log_ingress_oldest_known=false` means the queue was empty and has no oldest
+age. The counters conserve records as `pushed = taken + dropped + pending`.
+This observation runs only during an existing perf rollup; it adds no timer,
+thread, or wake source.
+
 Version 2 fixes idle dispatch omission and preserves earliest pending input
 instead of overwriting it. Those corrections and expanded model-call coverage
 must not be compared to old rollups as if instrumentation were unchanged.
