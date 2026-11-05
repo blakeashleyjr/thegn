@@ -1106,10 +1106,8 @@ fn classify_checkout_read(
             }
         }
         Err(GitTextError::Failed(GitOutcome::Exit { .. })) => CheckoutRead::Missing,
-        Err(GitTextError::Failed(GitOutcome::Spawn(error)))
-            if error.kind() == std::io::ErrorKind::NotFound =>
-        {
-            CheckoutRead::Missing
+        Err(GitTextError::Failed(GitOutcome::Spawn(error))) => {
+            CheckoutRead::Unreadable(one_line(&error.to_string()))
         }
         Err(error) => CheckoutRead::Unreadable(one_line(&error.to_string())),
     }
@@ -3686,15 +3684,15 @@ mod tests {
             ),
             CheckoutRead::Missing
         );
-        assert_eq!(
+        assert!(matches!(
             classify_checkout_read(
                 Err(GitTextError::Failed(GitOutcome::Spawn(
                     std::io::Error::from(std::io::ErrorKind::NotFound,)
                 ))),
                 false,
             ),
-            CheckoutRead::Missing
-        );
+            CheckoutRead::Unreadable(_)
+        ));
         assert!(matches!(
             classify_checkout_read(
                 Err(GitTextError::Failed(GitOutcome::Spawn(
@@ -3777,9 +3775,11 @@ mod tests {
 
         let not_a_directory = dir.path().join("tracked");
         let file_checkout = GitLoc::from_db(not_a_directory.to_str().unwrap(), None);
+        // `git -C <file>` refuses the path with exit 128; Git runs from the caller's cwd,
+        // so the OS does not report a spawn failure for this path.
         assert!(matches!(
             read_checkout(&file_checkout, &["rev-parse", "--abbrev-ref", "HEAD"]),
-            CheckoutRead::Unreadable(_)
+            CheckoutRead::Missing
         ));
 
         let plain_dir = tempfile::tempdir().unwrap();
