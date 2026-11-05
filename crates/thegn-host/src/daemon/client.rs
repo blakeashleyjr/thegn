@@ -1867,6 +1867,51 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn probe_stop_target_reports_a_non_http_listener_as_unverified() {
+        if !crate::platform::sound_process::test_support::UNIX {
+            return;
+        }
+        let dir = tempfile::tempdir_in("/tmp").unwrap();
+        let socket = dir.path().join("d.sock");
+        let endpoint = thegn_svc::ipc::IpcEndpoint::for_socket_path(&socket);
+        let listener = match thegn_svc::ipc::IpcListener::bind_exclusive(&endpoint)
+            .await
+            .unwrap()
+        {
+            thegn_svc::ipc::BindOutcome::Bound(listener) => listener,
+            thegn_svc::ipc::BindOutcome::AlreadyRunning => panic!("fresh socket must bind"),
+        };
+        let accept_task = tokio::spawn(async move {
+            let mut listener = listener;
+            while let Ok(mut stream) = listener.accept_stream().await {
+                use tokio::io::AsyncWriteExt;
+                if stream
+                    .write_all(b"SSH-2.0-OpenSSH_9.9\r\n\r\n")
+                    .await
+                    .is_err()
+                {
+                    continue;
+                }
+                drop(stream);
+            }
+        });
+        let client = ControlClient::new(ControlAddr::Unix(socket)).with_limits(
+            thegn_svc::control::client::ControlLimits {
+                request_timeout: Duration::from_secs(2),
+                long_request_timeout: Duration::from_secs(2),
+                ..Default::default()
+            },
+        );
+
+        assert!(matches!(
+            probe_stop_target(&client, &["scope".into()]).await,
+            StopProbe::Unverified(_)
+        ));
+        accept_task.abort();
+        assert!(accept_task.await.is_err());
+    }
+
+    #[tokio::test]
     async fn attach_close_is_forwarded_when_pane_output_queue_is_full() {
         let (frame_tx, frame_rx) = tokio_mpsc::channel(257);
         let (attach_control_tx, mut attach_control_rx) = tokio_mpsc::channel(1);
