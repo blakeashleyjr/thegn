@@ -195,11 +195,11 @@ pub(crate) fn restore_skips_live_foreign_owner(
 pub(crate) enum RestorePlan {
     /// A live foreign `thegn share start` owns the row: do nothing.
     Skip,
-    /// Restart the share through the supervisor (an `up` row).
+    /// Restart the share through the supervisor (an `up` row or a prior failed-restore `unknown`).
     Start,
     /// A `starting` row whose recorded owner exited: record it as a visible `failed` tombstone.
     MarkFailed,
-    /// Nothing to do (stopping, unknown, failed, a live owner, an unrecorded owner, legacy state text).
+    /// Nothing to do (stopping, failed, a live owner, an unrecorded owner, legacy state text).
     Leave,
 }
 
@@ -216,7 +216,9 @@ pub(crate) fn restore_plan(
         return RestorePlan::Leave;
     };
     match state {
-        thegn_core::share::ShareState::Up => RestorePlan::Start,
+        thegn_core::share::ShareState::Up | thegn_core::share::ShareState::Unknown => {
+            RestorePlan::Start
+        }
         thegn_core::share::ShareState::Starting => {
             let owner = thegn_core::share::share_owner_state(
                 row.owner,
@@ -230,9 +232,9 @@ pub(crate) fn restore_plan(
                 RestorePlan::Leave
             }
         }
-        thegn_core::share::ShareState::Stopping
-        | thegn_core::share::ShareState::Unknown
-        | thegn_core::share::ShareState::Failed => RestorePlan::Leave,
+        thegn_core::share::ShareState::Stopping | thegn_core::share::ShareState::Failed => {
+            RestorePlan::Leave
+        }
     }
 }
 
@@ -2461,7 +2463,7 @@ mod tests {
     }
 
     #[test]
-    fn restore_plan_restarts_only_up_rows() {
+    fn restore_plan_retries_up_and_unknown_rows() {
         assert_eq!(
             restore_plan(&saved_row("up", None), 11, |_| None),
             RestorePlan::Start
@@ -2470,7 +2472,12 @@ mod tests {
             restore_plan(&saved_row("up", Some((22, 99))), 11, |_| None),
             RestorePlan::Start
         );
-        for state in ["stopping", "unknown", "failed"] {
+        // A failed launch is recorded as unknown; it must be attempted again next launch.
+        assert_eq!(
+            restore_plan(&saved_row("unknown", None), 11, |_| None),
+            RestorePlan::Start
+        );
+        for state in ["stopping", "failed"] {
             assert_eq!(
                 restore_plan(&saved_row(state, None), 11, |_| None),
                 RestorePlan::Leave
