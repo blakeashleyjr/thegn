@@ -868,7 +868,7 @@ fmt-check:
 # `cargo test`. This recipe is the single source of truth shared by the CI
 # `test` job and the pre-push hook. Doctests are `test-doc` (CI-only) — see
 # the note there.
-test: contract-ratchets test-live test-heredoc-guard test-build-metadata test-the429 test-action-pins test-apply-backend test-nix-metadata test-nextest-setup test-packaging
+test: contract-ratchets test-live test-heredoc-guard test-build-metadata test-the429 test-action-pins test-apply-backend test-nix-metadata test-nextest-setup test-packaging test-cargo-provenance
     cargo nextest run --workspace
 
 # Doctest pass. Split out of `test` (and therefore off pre-push) because it is
@@ -1352,6 +1352,17 @@ clean-aux:
     done
     after=$(du -sb "$target" | cut -f1)
     echo "clean-aux: reclaimed $(( (before - after) / 1024 / 1024 )) MiB from $target/"
+
+# THE-1837: read-only report of the Cargo provenance of the current target dir
+# (toolchain, wrapper, sccache stats, newest thegn-core artifact hash, and whether its
+# dep-info names this checkout, including omitted current core sources). Opt-in; not
+# part of `just ci`. Pass --strict to fail on foreign or incomplete dep-info.
+cargo-provenance *args:
+    bash test/cargo-provenance.sh {{args}}
+
+# Hermetic fixture test for the provenance script; pure Python + bash, no Cargo.
+test-cargo-provenance:
+    python3 -B test/cargo_provenance_test.py
 
 # --- release artifacts -------------------------------------------------------
 
