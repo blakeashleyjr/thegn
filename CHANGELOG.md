@@ -55,7 +55,7 @@ All notable changes to **thegn** are documented here. The format follows
 - The Home Manager module adds null-default `programs.thegn.session*` and
   `programs.thegn.clipboard*` options for the `[session]` and `[clipboard]`
   scalar settings.
-- (Dev channel) The `examples/plugins/cell-grid` plugin draws typed input
+- The `examples/plugins/cell-grid` plugin draws typed input
   into a `grid` app widget.
 
 ### Changed
