@@ -543,6 +543,11 @@ It also exposes `locEnabled`, `locScanIntervalSecs`, `locMaxScanPerRound` and
 `replayMaxBytesPerPane`, `replayMaxDurationSecs`, `replayKeyframeIntervalMs`,
 `replayKeyframeIntervalBytes`, `replayIdleThresholdMs` and `replayPersist` for
 `[replay]`.
+It also exposes `drawerCommand`, `drawerConfigHome`, `drawerHeight`,
+`drawerWidth`, `drawerImagePreviews`, `drawerGitStatus`, `drawerContain`,
+`drawerMemoryMax`, `drawerMemorySwapMax`, `drawerCpuQuota`, `drawerPoolLimit`
+and `drawerPrewarm` for `[drawer]`, and `stripVisible` for `[strip]` `visible`.
+These options default to `null`, which uses the binary's default.
 
 `keys list` covers the keymap registry **and** the zone-local tables — the
 sidebar's row keys and each panel section's row-mode keys. Those are handled
