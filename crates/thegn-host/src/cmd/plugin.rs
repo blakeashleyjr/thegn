@@ -15,6 +15,7 @@
 //! with backoff, and deliberate restarts ride config hot-reload.
 
 mod live;
+mod live_tile;
 mod preview;
 mod trace;
 
