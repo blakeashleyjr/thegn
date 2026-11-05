@@ -21,8 +21,8 @@ pub mod framing;
 pub mod registry;
 
 pub use diagnostics_queue::{
-    DiagnosticKey, DiagnosticsReceiver, DiagnosticsSender, LossMarks, StreamKey,
-    diagnostics_channel, published_diagnostics_bytes,
+    BacklogAge, DiagnosticKey, DiagnosticsReceiver, DiagnosticsSender, LossMarks, QueueCounters,
+    QueueStats, StreamKey, diagnostics_channel, published_diagnostics_bytes,
 };
 pub use registry::{Registry, RegistryEntry, Resolution, binary_on_path};
 
