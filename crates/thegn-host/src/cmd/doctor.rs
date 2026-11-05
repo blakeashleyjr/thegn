@@ -6331,7 +6331,7 @@ agent = "plain-agent"
     }
 
     #[test]
-    fn provider_home_line_names_the_stage_and_the_home_and_is_not_a_pass() {
+    fn stage_provider_home_line_names_the_stage_and_the_home_and_is_not_a_pass() {
         let line = provider_home_line("coder", std::path::Path::new("/provider/home"));
 
         assert!(line.starts_with("  NOT READY"), "{line}");
