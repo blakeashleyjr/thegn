@@ -14,6 +14,11 @@ pub enum ProjectionOwnershipError {
     Malformed(String),
     Unsafe(String),
     Mismatch(PathBuf),
+    StaleGeneration {
+        manifest: PathBuf,
+        expected: String,
+        found: String,
+    },
     Occupied(PathBuf),
 }
 
@@ -45,6 +50,15 @@ impl std::fmt::Display for ProjectionOwnershipError {
                 "projection manifest {} belongs to another projection; move it aside",
                 path.display()
             ),
+            Self::StaleGeneration {
+                manifest,
+                expected,
+                found,
+            } => write!(
+                f,
+                "projection manifest {} changed owner generation since this process mounted it ({expected} -> {found}); another thegn replaced the ownership record. Inspect the mountpoint and mount again",
+                manifest.display()
+            ),
             Self::Occupied(path) => write!(
                 f,
                 "unowned projection mountpoint {} is occupied; move {} aside",
@@ -59,6 +73,36 @@ impl std::error::Error for ProjectionOwnershipError {}
 
 pub(super) fn manifest_path(spec: &ProjectionSpec) -> PathBuf {
     PathBuf::from(format!("{}.thegn-projection", spec.mountpoint))
+}
+
+fn generation_memo() -> &'static std::sync::Mutex<std::collections::HashMap<String, String>> {
+    static MEMO: std::sync::OnceLock<std::sync::Mutex<std::collections::HashMap<String, String>>> =
+        std::sync::OnceLock::new();
+    MEMO.get_or_init(Default::default)
+}
+
+fn record_generation(spec: &ProjectionSpec, generation: &str) {
+    generation_memo()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .insert(spec.mountpoint.clone(), generation.to_owned());
+}
+
+fn check_recorded_generation(
+    spec: &ProjectionSpec,
+    found: &str,
+) -> Result<(), ProjectionOwnershipError> {
+    let memo = generation_memo()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    match memo.get(&spec.mountpoint) {
+        Some(expected) if expected != found => Err(ProjectionOwnershipError::StaleGeneration {
+            manifest: manifest_path(spec),
+            expected: expected.clone(),
+            found: found.to_owned(),
+        }),
+        _ => Ok(()),
+    }
 }
 
 pub(super) fn claim_or_verify(spec: &ProjectionSpec) -> Result<(), ProjectionOwnershipError> {
@@ -76,7 +120,7 @@ pub(super) fn claim_or_verify(spec: &ProjectionSpec) -> Result<(), ProjectionOwn
     let manifest = manifest_path(spec);
     match std::fs::symlink_metadata(&manifest) {
         Ok(_) => {
-            verify(spec)?;
+            let generation = verify_identity(spec)?;
             match std::fs::symlink_metadata(mountpoint) {
                 Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_dir() => {
                     return Err(ProjectionOwnershipError::Unsafe(format!(
@@ -101,6 +145,7 @@ pub(super) fn claim_or_verify(spec: &ProjectionSpec) -> Result<(), ProjectionOwn
                     )));
                 }
             }
+            record_generation(spec, &generation);
             return Ok(());
         }
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
@@ -166,16 +211,23 @@ pub(super) fn claim_or_verify(spec: &ProjectionSpec) -> Result<(), ProjectionOwn
                 manifest.display()
             ))
         })?;
-    fsperm::ensure_private_dir(manifest_parent)
+    let written = fsperm::ensure_private_dir(manifest_parent)
         .and_then(|()| fsperm::open_private_dir(manifest_parent))
         .and_then(|dir| dir.write_owner_only_atomic(manifest_name, contents.as_bytes()))
         .map(|_| ())
         .map_err(|error| {
             ProjectionOwnershipError::Unsafe(format!("{}: {error}", manifest.display()))
-        })
+        })?;
+    record_generation(spec, &generation);
+    Ok(written)
 }
 
 pub(super) fn verify(spec: &ProjectionSpec) -> Result<(), ProjectionOwnershipError> {
+    let found = verify_identity(spec)?;
+    check_recorded_generation(spec, &found)
+}
+
+fn verify_identity(spec: &ProjectionSpec) -> Result<String, ProjectionOwnershipError> {
     let manifest = manifest_path(spec);
     let metadata = match std::fs::symlink_metadata(&manifest) {
         Ok(metadata) => metadata,
@@ -269,7 +321,7 @@ pub(super) fn verify(spec: &ProjectionSpec) -> Result<(), ProjectionOwnershipErr
     if identity != Some(spec.identity_digest().as_str()) {
         return Err(ProjectionOwnershipError::Mismatch(manifest));
     }
-    Ok(())
+    Ok(generation.unwrap_or("").to_owned())
 }
 
 fn is_digest(value: &str) -> bool {
@@ -293,6 +345,31 @@ mod tests {
     use thegn_core::config::DataMode;
     use thegn_core::placement::{Placement, SshPlacement, TransportKind};
 
+    fn forget_generation(spec: &ProjectionSpec) {
+        let removed = generation_memo()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(&spec.mountpoint);
+        assert!(removed.is_some(), "fixture claim recorded a generation");
+    }
+
+    fn replace_generation(spec: &ProjectionSpec, nonce: &str) {
+        let manifest = manifest_path(spec);
+        let parent = manifest.parent().expect("manifest parent");
+        let name = manifest
+            .file_name()
+            .and_then(|name| name.to_str())
+            .expect("manifest filename");
+        let contents = format!(
+            "thegn-projection v1\nidentity={}\ngeneration={nonce}\n",
+            spec.identity_digest()
+        );
+        fsperm::open_private_dir(parent)
+            .expect("open private manifest directory")
+            .write_owner_only_atomic(name, contents.as_bytes())
+            .expect("replace manifest generation");
+    }
+
     fn fixture(mode: DataMode) -> (tempfile::TempDir, ProjectionSpec) {
         let root = tempfile::tempdir().expect("private fixture directory");
         fsperm::ensure_private_dir(root.path()).expect("restrict fixture directory");
@@ -309,6 +386,86 @@ mod tests {
             mountpoint: mountpoint.to_string_lossy().into_owned(),
         };
         (root, spec)
+    }
+
+    #[test]
+    fn generation_replaced_manifest_is_refused_by_verify() {
+        let (_root, spec) = fixture(DataMode::Sync);
+        claim_or_verify(&spec).expect("claim projection");
+        replace_generation(&spec, "ffffffffffffffffffffffffffffffff");
+
+        let error = verify(&spec).expect_err("changed generation is stale");
+        assert!(matches!(
+            &error,
+            ProjectionOwnershipError::StaleGeneration { .. }
+        ));
+        assert!(error.to_string().contains("changed owner generation"));
+    }
+
+    #[test]
+    fn generation_unchanged_manifest_still_verifies() {
+        // Positive control: an unchanged generation remains valid at the base.
+        let (_root, spec) = fixture(DataMode::Sync);
+        claim_or_verify(&spec).expect("claim projection");
+
+        verify(&spec).expect("verify first time");
+        verify(&spec).expect("verify second time");
+    }
+
+    #[test]
+    fn generation_new_claim_starts_a_new_epoch() {
+        // Positive control: a deliberate claim accepts and records the new epoch.
+        let (_root, spec) = fixture(DataMode::Sync);
+        claim_or_verify(&spec).expect("claim projection");
+        replace_generation(&spec, "ffffffffffffffffffffffffffffffff");
+
+        claim_or_verify(&spec).expect("claim starts a new generation epoch");
+        verify(&spec).expect("verify the newly recorded generation");
+    }
+
+    #[test]
+    fn generation_unrecorded_mountpoint_verifies_by_identity_only() {
+        // Positive control: a fresh process with no memo keeps identity-only verification.
+        let (_root, spec) = fixture(DataMode::Sync);
+        claim_or_verify(&spec).expect("claim projection");
+        forget_generation(&spec);
+        replace_generation(&spec, "ffffffffffffffffffffffffffffffff");
+
+        verify(&spec).expect("unrecorded mountpoint verifies by identity");
+    }
+
+    #[test]
+    fn generation_identity_mismatch_wins_over_generation() {
+        // Positive control: identity mismatch remains the first refusal.
+        let (_root, mut spec) = fixture(DataMode::Sync);
+        claim_or_verify(&spec).expect("claim projection");
+        replace_generation(&spec, "ffffffffffffffffffffffffffffffff");
+        spec.remote_dir.push_str("-other");
+
+        assert!(matches!(
+            verify(&spec),
+            Err(ProjectionOwnershipError::Mismatch(_))
+        ));
+    }
+
+    #[test]
+    fn generation_replaced_manifest_refuses_sync_refresh_and_unmount() {
+        let (_root, spec) = fixture(DataMode::Sync);
+        claim_or_verify(&spec).expect("claim projection");
+        replace_generation(&spec, "ffffffffffffffffffffffffffffffff");
+
+        let refresh_error = for_data_mode(&spec).refresh(&spec).unwrap_err();
+        assert!(
+            refresh_error
+                .to_string()
+                .contains("changed owner generation")
+        );
+        let unmount_error = for_data_mode(&spec).unmount(&spec).unwrap_err();
+        assert!(
+            unmount_error
+                .to_string()
+                .contains("changed owner generation")
+        );
     }
 
     #[test]
