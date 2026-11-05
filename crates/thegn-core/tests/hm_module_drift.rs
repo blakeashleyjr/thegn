@@ -56,10 +56,16 @@ const OMITTED: &[(&str, &str)] = &[
     ("limits", "resource limits are not exposed"),
     ("disk", "disk and cache policy is not exposed"),
     ("activity", "activity detection is not exposed"),
-    ("drawer", "drawer behavior is not exposed"),
     ("notifications", "notifications are not exposed"),
     ("automations", "automation rules are not exposed"),
-    ("strip", "strip behavior is not exposed"),
+    (
+        "drawer.kind",
+        "reserved file-manager kinds need enum pinning and are not exposed",
+    ),
+    (
+        "strip.ratio",
+        "strip ratio is an f32 range that needs float pinning and is not exposed",
+    ),
     ("panel", "panel layout is not exposed"),
     ("lsp", "language-server configuration is not exposed"),
     ("semantic", "semantic indexing is not exposed"),
@@ -559,6 +565,8 @@ fn every_schema_key_is_rendered_or_dispositioned() {
         "clipboard",
         "loc",
         "replay",
+        "drawer",
+        "strip",
         "monitor",
         "pr",
         "watch",
@@ -795,6 +803,34 @@ fn hm_session_and_clipboard_families_are_fully_rendered() {
 }
 
 #[test]
+fn hm_drawer_and_strip_families_are_fully_rendered() {
+    let rendered = rendered_paths(&module_src());
+    for (table, omitted_key) in [("drawer", "kind"), ("strip", "ratio")] {
+        let schema = schema_field(table);
+        let properties = schema["properties"]
+            .as_object()
+            .unwrap_or_else(|| panic!("{table} schema properties"));
+        let mut missing: Vec<String> = properties
+            .keys()
+            .filter_map(|key| {
+                if key == omitted_key {
+                    return None;
+                }
+                let path = format!("{table}.{key}");
+                (!rendered.contains(&path)).then_some(path)
+            })
+            .collect();
+        missing.sort();
+        assert!(
+            missing.is_empty(),
+            "Home Manager must render every {table} scalar except {omitted_key}; missing: {missing:?}"
+        );
+    }
+    assert!(schema_has_path("drawer.kind"));
+    assert!(schema_has_path("strip.ratio"));
+}
+
+#[test]
 fn hm_loc_and_replay_families_are_fully_rendered() {
     let rendered = rendered_paths(&module_src());
     for table in ["loc", "replay"] {
@@ -951,6 +987,7 @@ fn every_numeric_option_matches_its_destination_range() {
             "replay.keyframe_interval_bytes",
         ),
         ("replayIdleThresholdMs", "replay.idle_threshold_ms"),
+        ("drawerPoolLimit", "drawer.pool_limit"),
     ];
     let options = numeric_options(&module_src());
     let actual_names: BTreeSet<&str> = options.iter().map(|(name, _)| name.as_str()).collect();
