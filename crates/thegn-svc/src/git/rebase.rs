@@ -2100,4 +2100,126 @@ mod tests {
         assert!(error.to_string().contains("not valid UTF-8"), "{error}");
         assert_eq!(std::fs::read(&todo_path).unwrap(), bytes);
     }
+
+    #[test]
+    fn todo_roundtrip_keeps_custom_commands_verbatim() {
+        let r = linear("todo-roundtrip-custom");
+        let c2 = r.sha_of("c2");
+        assert_eq!(
+            CliGit
+                .rebase_retag(&r.loc(), &c2, &[&c2], TodoAction::Edit, &opts())
+                .unwrap(),
+            RebaseOutcome::Paused
+        );
+        let todo_path = r.dir.join(".git/rebase-merge/git-rebase-todo");
+        let original = std::fs::read(&todo_path).unwrap();
+        let extra =
+            b"exec echo hi\nupdate-ref refs/heads/side\nlabel keep-me\nfrobnicate c3 --now\n";
+        let bytes = [original.clone(), extra.to_vec()].concat();
+        std::fs::write(&todo_path, &bytes).unwrap();
+        let baseline = parse_todo(std::str::from_utf8(&bytes).unwrap());
+
+        assert!(
+            baseline
+                .iter()
+                .any(|entry| entry.action == TodoAction::Exec("echo hi".into()))
+        );
+        assert!(
+            baseline
+                .iter()
+                .any(|entry| entry.action == TodoAction::UpdateRef("refs/heads/side".into()))
+        );
+        assert!(
+            baseline
+                .iter()
+                .any(|entry| entry.action == TodoAction::Label("keep-me".into()))
+        );
+        assert!(
+            baseline
+                .iter()
+                .any(|entry| entry.action == TodoAction::Unknown("frobnicate c3 --now".into()))
+        );
+
+        let edited: Vec<TodoEntry> = baseline
+            .iter()
+            .filter(|entry| entry.subject != "c3")
+            .cloned()
+            .collect();
+        CliGit
+            .rewrite_pending_todo_checked(&r.loc(), &edited, &baseline)
+            .unwrap();
+
+        let text = String::from_utf8(std::fs::read(&todo_path).unwrap()).unwrap();
+        let custom_lines = [
+            "exec echo hi",
+            "update-ref refs/heads/side",
+            "label keep-me",
+            "frobnicate c3 --now",
+        ];
+        let positions: Vec<usize> = custom_lines
+            .iter()
+            .map(|custom| {
+                text.lines()
+                    .position(|line| line == *custom)
+                    .expect("custom todo line is preserved")
+            })
+            .collect();
+        assert!(positions.windows(2).all(|pair| pair[0] < pair[1]));
+        assert!(
+            !text
+                .lines()
+                .any(|line| line.starts_with("pick") && line.ends_with(" c3"))
+        );
+    }
+
+    #[test]
+    fn todo_roundtrip_crlf_todo_is_accepted_and_normalised_to_lf() {
+        let r = linear("todo-roundtrip-crlf");
+        let c2 = r.sha_of("c2");
+        assert_eq!(
+            CliGit
+                .rebase_retag(&r.loc(), &c2, &[&c2], TodoAction::Edit, &opts())
+                .unwrap(),
+            RebaseOutcome::Paused
+        );
+        let todo_path = r.dir.join(".git/rebase-merge/git-rebase-todo");
+        let original = std::fs::read(&todo_path).unwrap();
+        let crlf_text = String::from_utf8(original).unwrap().replace('\n', "\r\n");
+        std::fs::write(&todo_path, &crlf_text).unwrap();
+        let baseline = parse_todo(&crlf_text);
+        assert!(!baseline.is_empty());
+        assert!(baseline.iter().all(|entry| !entry.subject.ends_with('\r')));
+
+        CliGit
+            .rewrite_pending_todo_checked(&r.loc(), &baseline, &baseline)
+            .unwrap();
+        let bytes = std::fs::read(&todo_path).unwrap();
+        assert!(!bytes.contains(&b'\r'));
+        assert_eq!(parse_todo(&String::from_utf8(bytes).unwrap()), baseline);
+    }
+
+    #[test]
+    fn todo_roundtrip_baseline_that_differs_only_in_a_custom_command_is_stale() {
+        let r = linear("todo-roundtrip-stale-custom");
+        let c2 = r.sha_of("c2");
+        assert_eq!(
+            CliGit
+                .rebase_retag(&r.loc(), &c2, &[&c2], TodoAction::Edit, &opts())
+                .unwrap(),
+            RebaseOutcome::Paused
+        );
+        let todo_path = r.dir.join(".git/rebase-merge/git-rebase-todo");
+        let original = std::fs::read(&todo_path).unwrap();
+        let baseline_bytes = [original.clone(), b"exec echo one\n".to_vec()].concat();
+        std::fs::write(&todo_path, &baseline_bytes).unwrap();
+        let baseline = parse_todo(std::str::from_utf8(&baseline_bytes).unwrap());
+        let changed_bytes = [original, b"exec echo two\n".to_vec()].concat();
+        std::fs::write(&todo_path, &changed_bytes).unwrap();
+
+        let error = CliGit
+            .rewrite_pending_todo_checked(&r.loc(), &baseline, &baseline)
+            .unwrap_err();
+        assert!(error.to_string().contains("changed on disk"), "{error}");
+        assert_eq!(std::fs::read(&todo_path).unwrap(), changed_bytes);
+    }
 }
