@@ -1061,15 +1061,8 @@ impl CalendarRouter {
                 && (!pending.is_empty() || queues.iter().any(|queue| !queue.is_empty()))
             {
                 let skipped = queues.iter().map(VecDeque::len).sum::<usize>();
-                let abandoned = pending.len();
-                tracing::warn!(
-                    target: "thegn::calendar",
-                    abandoned,
-                    skipped,
-                    "calendar pass deadline reached"
-                );
                 drop(in_flight);
-                report_pass_deadline(&mut pending, &mut sink);
+                report_pass_deadline(&mut pending, skipped, &mut sink);
                 break;
             }
             if !stopped_starting {
@@ -1098,16 +1091,9 @@ impl CalendarRouter {
                 Ok(next) => next,
                 Err(_elapsed) => {
                     let skipped = queues.iter().map(VecDeque::len).sum::<usize>();
-                    let abandoned = pending.len();
-                    tracing::warn!(
-                        target: "thegn::calendar",
-                        abandoned,
-                        skipped,
-                        "calendar pass deadline reached"
-                    );
                     // Dropping the stream cancels every fetch future still in flight.
                     drop(in_flight);
-                    report_pass_deadline(&mut pending, &mut sink);
+                    report_pass_deadline(&mut pending, skipped, &mut sink);
                     break;
                 }
             };
@@ -1115,6 +1101,7 @@ impl CalendarRouter {
                 break;
             };
             running[class.index()] -= 1;
+            // Account names are unique in CalendarRouter's configured account list.
             if let Some(index) = pending
                 .iter()
                 .position(|account| account.name == result.account)
@@ -1147,10 +1134,18 @@ impl CalendarRouter {
     }
 }
 
-fn report_pass_deadline<'a>(
-    pending: &mut Vec<&'a AccountBackend>,
+fn report_pass_deadline(
+    pending: &mut Vec<&AccountBackend>,
+    skipped: usize,
     sink: &mut impl FnMut(AccountResult),
 ) {
+    let abandoned = pending.len();
+    tracing::warn!(
+        target: "thegn::calendar",
+        abandoned,
+        skipped,
+        "calendar pass deadline reached"
+    );
     for account in pending.drain(..) {
         sink(AccountResult {
             account: account.name.clone(),

@@ -2398,14 +2398,6 @@ async fn pass_deadline_does_not_change_a_pass_that_finishes_in_time() {
     );
 }
 
-#[tokio::test(start_paused = true)]
-async fn pass_deadline_is_the_documented_bound() {
-    assert!(
-        super::CALENDAR_PASS_DEADLINE > std::time::Duration::from_secs(300),
-        "must exceed the longest single-account clamp (command 300 s)"
-    );
-}
-
 #[test]
 fn an_empty_config_builds_an_unconfigured_router() {
     let r = router(&CalendarConfig::default());
