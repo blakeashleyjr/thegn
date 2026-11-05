@@ -2391,6 +2391,28 @@ pub(crate) fn verify_v106_schema(conn: &Connection) -> Result<()> {
     Ok(())
 }
 
+/// v107: merge_queue.landed_source_oid + landed_target_base_oid (THE-401).
+pub(crate) fn migrate_v107(conn: &Connection) -> Result<()> {
+    for column in ["landed_source_oid", "landed_target_base_oid"] {
+        if !has_column(conn, "merge_queue", column) {
+            conn.execute(
+                &format!("ALTER TABLE merge_queue ADD COLUMN {column} TEXT"),
+                [],
+            )?;
+        }
+    }
+    Ok(())
+}
+
+pub(crate) fn verify_v107_schema(conn: &Connection) -> Result<()> {
+    for column in ["landed_source_oid", "landed_target_base_oid"] {
+        if !has_column(conn, "merge_queue", column) {
+            bail!("schema v107 migration did not add merge_queue.{column}");
+        }
+    }
+    Ok(())
+}
+
 /// Verify the v69 identity ledger before the schema version is stamped. A
 /// missing column/table must never look like a completed migration.
 pub(crate) fn verify_v69_schema(conn: &Connection) -> Result<()> {
@@ -4352,7 +4374,6 @@ mod tests {
             .pragma_query_value(None, "user_version", |row| row.get(0))
             .unwrap();
         assert_eq!(version, crate::db::SCHEMA_VERSION);
-        assert_eq!(version, 106);
         super::verify_v106_schema(upgraded.conn()).unwrap();
         assert!(
             upgraded
@@ -4367,6 +4388,64 @@ mod tests {
                     &|_| false,
                 )
                 .unwrap()
+        );
+    }
+
+    #[test]
+    fn v107_adds_merge_queue_landed_oids_idempotently_and_verifies() {
+        let fresh = Db::open_memory().unwrap();
+        super::verify_v107_schema(fresh.conn()).unwrap();
+
+        let conn = Connection::open_in_memory().unwrap();
+        assert!(super::verify_v107_schema(&conn).is_err());
+        conn.execute_batch(
+            "CREATE TABLE merge_queue (worktree TEXT PRIMARY KEY, branch TEXT NOT NULL);",
+        )
+        .unwrap();
+        super::migrate_v107(&conn).unwrap();
+        super::migrate_v107(&conn).unwrap();
+        super::verify_v107_schema(&conn).unwrap();
+        conn.execute_batch("ALTER TABLE merge_queue DROP COLUMN landed_target_base_oid;")
+            .unwrap();
+        assert!(super::verify_v107_schema(&conn).is_err());
+        super::migrate_v107(&conn).unwrap();
+        super::verify_v107_schema(&conn).unwrap();
+    }
+
+    #[test]
+    fn v107_upgrades_a_real_v106_database() {
+        use crate::db_merge_landed::MergeLandedProvenance;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("v106.db");
+        {
+            let db = Db::open_at(&path).unwrap();
+            db.conn()
+                .execute_batch(
+                    "INSERT INTO merge_queue
+                       (worktree, branch, target_branch, status, queued_at, updated_at, result_oid)
+                     VALUES ('/wt','b','main','landed',1,1,'abc');
+                     ALTER TABLE merge_queue DROP COLUMN landed_source_oid;
+                     ALTER TABLE merge_queue DROP COLUMN landed_target_base_oid;
+                     PRAGMA user_version=106;",
+                )
+                .unwrap();
+        }
+        let upgraded = Db::open_at(&path).unwrap();
+        let version: i64 = upgraded
+            .conn()
+            .pragma_query_value(None, "user_version", |row| row.get(0))
+            .unwrap();
+        assert_eq!(version, crate::db::SCHEMA_VERSION);
+        assert_eq!(version, 107);
+        super::verify_v107_schema(upgraded.conn()).unwrap();
+        assert_eq!(
+            upgraded.merge_landed_provenance("/wt").unwrap(),
+            Some(MergeLandedProvenance {
+                source_oid: None,
+                target_base_oid: None,
+                result_oid: "abc".into(),
+            })
         );
     }
 
