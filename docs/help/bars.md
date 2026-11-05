@@ -162,8 +162,10 @@ dashboard (`j`/`k` or the arrow keys, `esc` to close):
   the plugin's queue was full). A `bridge` column shows
   `timeout/cancel/late/malformed/closed` for a provider plugin's `provider.call`
   bridge: calls that hit the reply deadline, calls the caller dropped, replies
-  that matched no waiter, replies with neither or both of result and error, and
-  calls woken by a session close; it restarts at zero when the plugin restarts.
+  that matched no waiter, replies the bridge could not classify, and calls woken
+  by a session close; it restarts at zero when the plugin restarts. The session
+  decoder rejects live replies with neither or both of result and error, so
+  those calls time out instead.
   Amber means nonzero; the section is absent
   while every counter is zero. Refreshed when the modal refreshes, not live.
 - **loop** — the event-loop rollup: wakes/s, render / input / flush / drain /
