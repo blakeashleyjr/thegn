@@ -151,8 +151,7 @@ pub fn share_owner_state(
     }
 }
 
-/// Lifecycle state of a share row. `as_str` is the exact text stored in `shares.state` today
-/// (`starting`, `up`, `failed`); `Stopping` and `Unknown` are modelled here ahead of their persistence.
+/// Lifecycle state of a share row. `as_str` is the exact text stored in `shares.state`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum ShareState {
     /// A row recorded before exposure; the tunnel may or may not be public yet.
@@ -179,6 +178,45 @@ pub enum ShareRecovery {
     /// Re-read provider/process truth before trusting the row.
     Reconcile,
 }
+
+impl ShareRecovery {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Keep => "keep",
+            Self::TearDownThenFail => "tear_down_then_fail",
+            Self::RetryTeardown => "retry_teardown",
+            Self::Reconcile => "reconcile",
+        }
+    }
+
+    pub fn hint(self) -> Option<&'static str> {
+        match self {
+            Self::Keep => None,
+            Self::TearDownThenFail => Some("needs teardown"),
+            Self::RetryTeardown => Some("retry: thegn share stop"),
+            Self::Reconcile => Some("needs reconcile"),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ShareTransitionRefused {
+    pub worktree: String,
+    pub local_port: u16,
+    pub to: String,
+}
+
+impl std::fmt::Display for ShareTransitionRefused {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "share on port {} cannot move to `{}` from its recorded state",
+            self.local_port, self.to
+        )
+    }
+}
+
+impl std::error::Error for ShareTransitionRefused {}
 
 impl ShareState {
     pub const ALL: [ShareState; 5] = [
@@ -244,6 +282,7 @@ impl ShareState {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::store::WorktreeAuxStore;
 
     fn enabled_cfg() -> ShareConfig {
         ShareConfig {
@@ -286,6 +325,137 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn share_recovery_text_and_hints_are_total() {
+        let entries = [
+            (ShareRecovery::Keep, "keep", None),
+            (
+                ShareRecovery::TearDownThenFail,
+                "tear_down_then_fail",
+                Some("needs teardown"),
+            ),
+            (
+                ShareRecovery::RetryTeardown,
+                "retry_teardown",
+                Some("retry: thegn share stop"),
+            ),
+            (
+                ShareRecovery::Reconcile,
+                "reconcile",
+                Some("needs reconcile"),
+            ),
+        ];
+        for (recovery, name, hint) in entries {
+            assert_eq!(recovery.as_str(), name);
+            assert_eq!(recovery.hint(), hint);
+        }
+        let hints = [
+            ShareRecovery::TearDownThenFail.hint().unwrap(),
+            ShareRecovery::RetryTeardown.hint().unwrap(),
+            ShareRecovery::Reconcile.hint().unwrap(),
+        ];
+        for (index, hint) in hints.iter().enumerate() {
+            assert!(!hints[index + 1..].contains(hint));
+        }
+    }
+
+    #[test]
+    fn share_transition_refused_message_names_the_port_and_target() {
+        let refusal = ShareTransitionRefused {
+            worktree: "/wt/a".to_string(),
+            local_port: 3000,
+            to: "up".to_string(),
+        };
+        let message = refusal.to_string();
+        assert!(message.contains("3000"));
+        assert!(message.contains("up"));
+    }
+
+    #[test]
+    fn upsert_share_refuses_every_illegal_same_generation_transition() {
+        for from in ShareState::ALL {
+            for to in ShareState::ALL {
+                let db = crate::db::Db::open_memory().unwrap();
+                db.upsert_share("/wt/a", 3000, 7, "bore", None, from.as_str())
+                    .unwrap();
+
+                let result = db.upsert_share("/wt/a", 3000, 7, "bore", None, to.as_str());
+                assert_eq!(result.is_ok(), from.may_become(to), "{from:?} -> {to:?}");
+                let rows = db.list_shares().unwrap();
+                assert_eq!(rows.len(), 1);
+                if from.may_become(to) {
+                    assert_eq!(rows[0].state, to.as_str());
+                } else {
+                    let error = result.unwrap_err();
+                    let refusal = error
+                        .downcast_ref::<ShareTransitionRefused>()
+                        .expect("illegal transition has typed refusal");
+                    assert_eq!(refusal.worktree, "/wt/a");
+                    assert_eq!(refusal.local_port, 3000);
+                    assert_eq!(refusal.to, to.as_str());
+                    assert_eq!(rows[0].state, from.as_str());
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn upsert_share_allows_restarts_idempotent_writes_and_legacy_text() {
+        let db = crate::db::Db::open_memory().unwrap();
+        db.upsert_share("/wt/a", 3000, 7, "bore", None, "up")
+            .unwrap();
+        db.upsert_share("/wt/a", 3000, 8, "bore", None, "starting")
+            .unwrap();
+        let rows = db.list_shares().unwrap();
+        assert_eq!(rows[0].state, "starting");
+        assert_eq!(rows[0].generation, 8);
+
+        db.upsert_share(
+            "/wt/idempotent",
+            3000,
+            7,
+            "bore",
+            Some("https://old.test"),
+            "up",
+        )
+        .unwrap();
+        db.upsert_share(
+            "/wt/idempotent",
+            3000,
+            7,
+            "bore",
+            Some("https://new.test"),
+            "up",
+        )
+        .unwrap();
+        db.upsert_share("/wt/b", 3000, 7, "bore", None, "running")
+            .unwrap();
+        db.upsert_share("/wt/b", 3000, 7, "bore", None, "up")
+            .unwrap();
+        db.upsert_share("/wt/c", 3000, 7, "bore", None, "up")
+            .unwrap();
+        db.upsert_share("/wt/c", 3000, 7, "bore", None, "weird")
+            .unwrap();
+
+        let rows = db.list_shares().unwrap();
+        assert!(rows.iter().any(|row| {
+            row.worktree == "/wt/a" && row.generation == 8 && row.state == "starting"
+        }));
+        assert!(rows.iter().any(|row| {
+            row.worktree == "/wt/idempotent"
+                && row.state == "up"
+                && row.public_url.as_deref() == Some("https://new.test")
+        }));
+        assert!(
+            rows.iter()
+                .any(|row| row.worktree == "/wt/b" && row.state == "up")
+        );
+        assert!(
+            rows.iter()
+                .any(|row| row.worktree == "/wt/c" && row.state == "weird")
+        );
     }
 
     #[test]
