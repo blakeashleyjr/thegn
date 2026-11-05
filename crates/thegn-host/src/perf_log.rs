@@ -138,15 +138,14 @@ mod tests {
         };
         let v = view(stats);
 
-        assert_eq!(v.pending, u64::try_from(usize::MAX).unwrap_or(u64::MAX));
-        assert_eq!(
-            v.pending_bytes,
-            u64::try_from(usize::MAX).unwrap_or(u64::MAX)
-        );
+        // On 64-bit targets usize::MAX already fits in u64, so the defensive
+        // saturating conversion branch is unreachable here.
+        assert_eq!(v.pending, u64::MAX);
+        assert_eq!(v.pending_bytes, u64::MAX);
     }
 
     #[test]
-    fn emit_does_not_panic_without_a_subscriber() {
+    fn emit_smoke_test_does_not_panic_without_a_subscriber() {
         emit(IngressStats {
             pending: 0,
             pending_bytes: 0,
