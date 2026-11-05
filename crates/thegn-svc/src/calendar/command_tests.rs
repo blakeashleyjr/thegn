@@ -90,36 +90,34 @@ fn an_abandoned_command_fetch_kills_the_plugin_process_group() {
     let from = chrono::NaiveDate::from_ymd_opt(2026, 8, 1).unwrap();
     let to = chrono::NaiveDate::from_ymd_opt(2026, 8, 31).unwrap();
 
-    block_on(async {
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let child_pid = runtime.block_on(async {
         let fetch = backend.list_events(from, to, "");
         tokio::select! {
             _ = fetch => panic!("the sleeping plugin must not finish"),
-            _ = wait_for_file(&pid_file) => {},
+            pid = wait_for_file(&pid_file) => pid,
         }
     });
 
-    let child_pid = std::fs::read_to_string(&pid_file)
-        .unwrap()
-        .trim()
-        .parse::<u32>()
-        .unwrap();
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
-    loop {
-        let pid_arg = child_pid.to_string();
-        let alive = std::process::Command::new("kill")
-            .args(["-0", &pid_arg])
-            .status()
-            .expect("kill is available")
-            .success();
-        if !alive {
-            break;
+    runtime.block_on(async {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            // SAFETY: signal 0 only checks whether this pid still exists.
+            if unsafe { libc::kill(child_pid as i32, 0) } == -1
+                && std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH)
+            {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "abandoned calendar plugin left child {child_pid} alive"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
         }
-        assert!(
-            std::time::Instant::now() < deadline,
-            "abandoned calendar plugin left child {child_pid} alive"
-        );
-        std::thread::sleep(std::time::Duration::from_millis(20));
-    }
+    });
 }
 
 #[test]
