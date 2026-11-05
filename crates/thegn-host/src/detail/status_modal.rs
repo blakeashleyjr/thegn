@@ -503,10 +503,12 @@ fn session_rows(v: &[SessionInfo], now_ms: i64, wide: bool) -> TableSection {
 }
 
 fn plugin_rows_table(rows: &[crate::plugin_stats::PluginCounters]) -> TableSection {
-    let header = ["plugin", "busy", "refused", "timeout", "lost", "drops"]
-        .into_iter()
-        .map(str::to_owned)
-        .collect();
+    let header = [
+        "plugin", "busy", "refused", "timeout", "lost", "drops", "bridge",
+    ]
+    .into_iter()
+    .map(str::to_owned)
+    .collect();
     let rows = rows
         .iter()
         .map(|row| {
@@ -520,6 +522,20 @@ fn plugin_rows_table(rows: &[crate::plugin_stats::PluginCounters]) -> TableSecti
                     },
                 )
             };
+            let bridge = row.bridge;
+            let bridge_has_counts = bridge.timed_out > 0
+                || bridge.cancelled > 0
+                || bridge.late_replies > 0
+                || bridge.malformed > 0
+                || bridge.closed_wakeups > 0;
+            let bridge_text = format!(
+                "{}/{}/{}/{}/{}",
+                count_cell(bridge.timed_out),
+                count_cell(bridge.cancelled),
+                count_cell(bridge.late_replies),
+                count_cell(bridge.malformed),
+                count_cell(bridge.closed_wakeups),
+            );
             vec![
                 Cell::Text(row.plugin.clone(), Tok::Slot(S::Text)),
                 Cell::Text(row.in_flight.to_string(), Tok::Slot(S::Dim)),
@@ -527,6 +543,14 @@ fn plugin_rows_table(rows: &[crate::plugin_stats::PluginCounters]) -> TableSecti
                 count(row.timed_out),
                 count(row.lost),
                 count(row.queue_drops),
+                Cell::Text(
+                    bridge_text,
+                    if bridge_has_counts {
+                        Tok::Hue(Hue::Amber)
+                    } else {
+                        Tok::Slot(S::Dim)
+                    },
+                ),
             ]
         })
         .collect();
@@ -961,7 +985,9 @@ mod tests {
         let table = plugin_rows_table(&rows);
         assert_eq!(
             table.header.iter().map(String::as_str).collect::<Vec<_>>(),
-            ["plugin", "busy", "refused", "timeout", "lost", "drops"]
+            [
+                "plugin", "busy", "refused", "timeout", "lost", "drops", "bridge"
+            ]
         );
         assert_eq!(table.rows.len(), 2);
         assert!(matches!(&table.rows[1][3], Cell::Text(text, Tok::Hue(Hue::Amber)) if text == "3"));
@@ -995,6 +1021,35 @@ mod tests {
 
         let table = plugin_rows_table(&[]);
         assert!(table.rows.is_empty());
-        assert_eq!(table.header.len(), 6);
+        assert_eq!(table.header.len(), 7);
+    }
+
+    #[test]
+    fn plugin_rows_show_bridge_counters_and_tone_them() {
+        let rows = [
+            PluginCounters {
+                plugin: "provider-plugin".into(),
+                bridge: thegn_svc::plugin::BridgeStats {
+                    timed_out: 2,
+                    late_replies: 1,
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+            PluginCounters {
+                plugin: "other-plugin".into(),
+                rejected: 1,
+                ..Default::default()
+            },
+        ];
+        let table = plugin_rows_table(&rows);
+        assert!(matches!(
+            &table.rows[0][6],
+            Cell::Text(text, Tok::Hue(Hue::Amber)) if text == "2/0/1/0/0"
+        ));
+        assert!(matches!(
+            &table.rows[1][6],
+            Cell::Text(text, Tok::Slot(S::Dim)) if text == "0/0/0/0/0"
+        ));
     }
 }
