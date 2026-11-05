@@ -6,12 +6,42 @@ pub(crate) const MAX_ROWS: usize = 64;
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub(crate) struct PluginCounters {
     pub plugin: String,
+    pub bridge: thegn_svc::plugin::BridgeStats,
     pub in_flight: usize,
     pub rejected: u64,
     pub timed_out: u64,
     pub lost: u64,
     pub queue_drops: u64,
     pub coalesced: u64,
+}
+
+/// Overlay each live bridge's counters onto the published rows (one bridge
+/// per provider plugin, keyed by plugin id). A plugin whose bridge counters are
+/// all zero adds no row; rows stay sorted by id and capped at [`MAX_ROWS`].
+pub(crate) fn merge_bridge(
+    rows: Vec<PluginCounters>,
+    bridge: &BTreeMap<String, thegn_svc::plugin::BridgeStats>,
+) -> Vec<PluginCounters> {
+    let mut rows: BTreeMap<String, PluginCounters> = rows
+        .into_iter()
+        .map(|row| (row.plugin.clone(), row))
+        .collect();
+    for (plugin, stats) in bridge {
+        let has_displayed_counts = stats.timed_out > 0
+            || stats.cancelled > 0
+            || stats.late_replies > 0
+            || stats.malformed > 0
+            || stats.closed_wakeups > 0;
+        if has_displayed_counts {
+            rows.entry(plugin.clone())
+                .or_insert_with(|| PluginCounters {
+                    plugin: plugin.clone(),
+                    ..Default::default()
+                })
+                .bridge = *stats;
+        }
+    }
+    rows.into_values().take(MAX_ROWS).collect()
 }
 
 #[derive(Debug, Default)]
@@ -119,8 +149,9 @@ pub(crate) fn snapshot() -> Arc<Vec<PluginCounters>> {
 
 #[cfg(test)]
 mod tests {
-    use super::{MAX_ROWS, PluginCounters, Totals, publish, snapshot};
+    use super::{MAX_ROWS, PluginCounters, Totals, merge_bridge, publish, snapshot};
     use std::collections::BTreeMap;
+    use thegn_svc::plugin::BridgeStats;
 
     #[test]
     fn totals_accumulate_across_flushes_and_never_drain() {
@@ -203,5 +234,70 @@ mod tests {
         assert!(publish(vec![changed.clone()]));
         assert!(snapshot().iter().any(|published| published == &changed));
         publish(Vec::new());
+    }
+
+    #[test]
+    fn merge_bridge_overlays_counters_and_skips_all_zero_bridges() {
+        let rows = vec![PluginCounters {
+            plugin: "m".into(),
+            rejected: 1,
+            ..Default::default()
+        }];
+        let bridge = BTreeMap::from([
+            ("a".into(), BridgeStats::default()),
+            (
+                "b".into(),
+                BridgeStats {
+                    timed_out: 2,
+                    ..Default::default()
+                },
+            ),
+            (
+                "c".into(),
+                BridgeStats {
+                    timed_out: 1,
+                    ..Default::default()
+                },
+            ),
+            (
+                "z".into(),
+                BridgeStats {
+                    calls: 1,
+                    ..Default::default()
+                },
+            ),
+        ]);
+
+        let merged = merge_bridge(rows, &bridge);
+        assert_eq!(
+            merged
+                .iter()
+                .map(|row| row.plugin.as_str())
+                .collect::<Vec<_>>(),
+            ["b", "c", "m"]
+        );
+        assert_eq!(merged[0].bridge.timed_out, 2);
+        assert!(!merged.iter().any(|row| row.plugin == "a"));
+        assert!(!merged.iter().any(|row| row.plugin == "z"));
+    }
+
+    #[test]
+    fn merge_bridge_caps_at_max_rows() {
+        let bridge = (0..(MAX_ROWS + 5))
+            .map(|index| {
+                (
+                    format!("plugin-{index:03}"),
+                    BridgeStats {
+                        timed_out: 1,
+                        ..Default::default()
+                    },
+                )
+            })
+            .collect();
+
+        let merged = merge_bridge(Vec::new(), &bridge);
+        assert_eq!(merged.len(), MAX_ROWS);
+        assert_eq!(merged[0].plugin, "plugin-000");
+        assert_eq!(merged[MAX_ROWS - 1].plugin, "plugin-063");
     }
 }

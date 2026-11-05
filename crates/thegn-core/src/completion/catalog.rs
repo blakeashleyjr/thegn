@@ -748,6 +748,7 @@ pub const CATALOG: &[Slot] = &[
     // filesystem value and keeps clap's structural completion behavior.
     slot("theme set", "name", SourceKind::Theme),
     slot("theme import", "name", SourceKind::Theme),
+    slot("theme rename", "old", SourceKind::Theme),
     // --- structural (clap completes these from the tree) -------------------
     // `--config <PATH>`: a path, which the engine completes from the filesystem.
     // A `global = true` arg, so it is classified once at the root.
@@ -760,6 +761,7 @@ pub const CATALOG: &[Slot] = &[
     slot("voice setup", "kind", SourceKind::Structural),
     slot("skills seed", "worktree", SourceKind::Structural),
     slot("theme import", "file", SourceKind::Structural),
+    slot("theme rename", "new", SourceKind::Structural),
     slot("voice setup", "model_path", SourceKind::Structural),
     slot("pr merge", "method", SourceKind::Structural),
     slot("pr review", "state", SourceKind::Structural),

@@ -3,6 +3,12 @@
 //! THE-268: the prompt template is deliberately not included. The CLI sends
 //! the already-rendered prompt, while this digest covers launch authority and
 //! stage capacity as resolved from configuration.
+//!
+//! The sandbox policy (`[sandbox]`, `THEGN_SANDBOX_*` overlays, and the
+//! container backend) is deliberately not part of this digest (THE-268, owner
+//! decision a). The CLI and daemon resolve those overlays from different
+//! environments, so hashing them would refuse unchanged launches. The daemon
+//! resolves the sandbox from its own fresh configuration at launch.
 
 use std::fmt::Write as _;
 
@@ -141,7 +147,7 @@ pub fn check_stage_launch_required(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::NamedCommand;
+    use crate::config::{NamedCommand, Network, SandboxBackend};
     use crate::config_pipeline::PipelineStage;
 
     fn config(stage_name: &str, stage_agent: &str) -> Config {
@@ -495,5 +501,68 @@ mod tests {
             "worker",
             "review",
         ));
+    }
+
+    #[test]
+    fn sandbox_policy_changes_do_not_change_the_digest() {
+        let a = config("review", "worker");
+
+        let mut enabled_changed = a.clone();
+        enabled_changed.sandbox.enabled = !a.sandbox.enabled;
+        assert_eq!(
+            stage_launch_digest(&a, "worker", "review").expect("original digest"),
+            stage_launch_digest(&enabled_changed, "worker", "review")
+                .expect("digest with changed sandbox enabled"),
+            "sandbox.enabled is excluded from the stage launch digest"
+        );
+
+        let mut backend_changed = a.clone();
+        backend_changed.sandbox.backend = SandboxBackend::Docker;
+        assert_eq!(
+            stage_launch_digest(&a, "worker", "review").expect("original digest"),
+            stage_launch_digest(&backend_changed, "worker", "review")
+                .expect("digest with changed sandbox backend"),
+            "sandbox.backend is excluded from the stage launch digest"
+        );
+
+        let mut network_changed = a.clone();
+        network_changed.sandbox.network = Network::None;
+        assert_eq!(
+            stage_launch_digest(&a, "worker", "review").expect("original digest"),
+            stage_launch_digest(&network_changed, "worker", "review")
+                .expect("digest with changed sandbox network"),
+            "sandbox.network is excluded from the stage launch digest"
+        );
+
+        let mut image_changed = a.clone();
+        image_changed.sandbox.image = "ghcr.io/example/other:1".into();
+        assert_eq!(
+            stage_launch_digest(&a, "worker", "review").expect("original digest"),
+            stage_launch_digest(&image_changed, "worker", "review")
+                .expect("digest with changed sandbox image"),
+            "sandbox.image is excluded from the stage launch digest"
+        );
+    }
+
+    #[test]
+    fn sandbox_policy_changes_between_claim_and_launch_still_launch() {
+        let a = config("review", "worker");
+        let mut b = a.clone();
+        b.sandbox.enabled = !a.sandbox.enabled;
+        b.sandbox.backend = SandboxBackend::Docker;
+        b.sandbox.network = Network::None;
+        b.sandbox.image = "ghcr.io/example/other:1".into();
+
+        assert!(claim_then_launch(&a, &b, "worker", "review").is_ok());
+    }
+
+    #[test]
+    fn sandbox_exclusion_does_not_mask_the_fields_the_digest_does_cover() {
+        let a = config("review", "worker");
+        let mut b = a.clone();
+        b.sandbox.enabled = !a.sandbox.enabled;
+        b.pipeline.stages[0].permissions.push("Read".into());
+
+        assert_race_refused(claim_then_launch(&a, &b, "worker", "review"));
     }
 }

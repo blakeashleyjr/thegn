@@ -363,13 +363,25 @@ fn write_merge_status_claimed(
             |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
         )
         .optional()?;
+    let (landed_source, landed_base): (Option<String>, Option<&str>) =
+        if status == "landed" && target_base_oid.is_some() {
+            (
+                prior
+                    .as_ref()
+                    .and_then(|(_, _, candidate)| candidate.clone()),
+                target_base_oid,
+            )
+        } else {
+            (None, None)
+        };
     let changed = tx.execute(
-        "UPDATE merge_queue SET status=?1,updated_at=?2,result_oid=?3,conflict_paths=?4,error_detail=?5 \
+        "UPDATE merge_queue SET status=?1,updated_at=?2,result_oid=?3,conflict_paths=?4,error_detail=?5, \
+         landed_source_oid=?10,landed_target_base_oid=?11 \
          WHERE worktree=?6 AND claim_owner=?7 AND claim_generation=?8 \
          AND (claim_phase='settled' OR \
               (claim_phase='claimed_no_child' AND claim_lease_until_ms>=?9))",
         params![status, util::now(), fields.result_oid, fields.conflict_paths, fields.error_detail,
-            claim.worktree, claim.owner_token, claim.generation, now],
+            claim.worktree, claim.owner_token, claim.generation, now, landed_source, landed_base],
     )?;
     anyhow::ensure!(changed == 1, MERGE_CLAIM_LOST);
     if let Some((old_status, old_updated_at, candidate_oid)) = prior
@@ -502,6 +514,7 @@ impl Db {
                      branch=?2, target_branch=?3, status='queued',
                      queued_at=?4, updated_at=?4,
                      result_oid=NULL, conflict_paths=NULL, error_detail=NULL,
+                     landed_source_oid=NULL, landed_target_base_oid=NULL,
                      agent_attempts=CASE WHEN merge_queue.status IN
                        ('queued','folding','verifying','agent_running')
                      THEN merge_queue.agent_attempts ELSE 0 END,
@@ -560,6 +573,7 @@ fn enqueue_merge_row(
              branch=?2, target_branch=?3, status='queued',
              queued_at=?4, updated_at=?4,
              result_oid=NULL, conflict_paths=NULL, error_detail=NULL,
+             landed_source_oid=NULL, landed_target_base_oid=NULL,
              agent_attempts=CASE WHEN merge_queue.status IN
                    ('queued','folding','verifying','agent_running')
                  THEN merge_queue.agent_attempts ELSE 0 END,
@@ -1003,6 +1017,7 @@ impl WorktreeAuxStore for Db {
                 branch=excluded.branch,target_branch=excluded.target_branch,\
                 status=excluded.status,updated_at=excluded.updated_at,\
                 result_oid=excluded.result_oid,conflict_paths=excluded.conflict_paths,\
+                landed_source_oid=NULL,landed_target_base_oid=NULL,\
                 error_detail=excluded.error_detail,location=excluded.location \
              WHERE merge_queue.claim_owner IS NULL"
         } else {
@@ -1014,6 +1029,7 @@ impl WorktreeAuxStore for Db {
                 branch=excluded.branch,target_branch=excluded.target_branch,\
                 status=excluded.status,updated_at=excluded.updated_at,\
                 result_oid=excluded.result_oid,conflict_paths=excluded.conflict_paths,\
+                landed_source_oid=NULL,landed_target_base_oid=NULL,\
                 error_detail=excluded.error_detail,location=excluded.location"
         };
         let changed = tx.execute(
@@ -1081,7 +1097,8 @@ impl WorktreeAuxStore for Db {
         let tx = Transaction::new_unchecked(self.conn(), TransactionBehavior::Immediate)?;
         let changed = tx.execute(
             "UPDATE merge_queue SET status=?2, updated_at=?3, result_oid=?4, \
-             conflict_paths=?5, error_detail=?6 WHERE worktree=?1 AND claim_owner IS NULL",
+             conflict_paths=?5, error_detail=?6, landed_source_oid=NULL, \
+             landed_target_base_oid=NULL WHERE worktree=?1 AND claim_owner IS NULL",
             params![
                 worktree,
                 status,
@@ -1144,6 +1161,8 @@ impl WorktreeAuxStore for Db {
             r#"UPDATE merge_queue SET
                  status=?2, updated_at=?3,
                  result_oid=COALESCE(?4, result_oid),
+                 landed_source_oid=CASE WHEN ?2='landed' THEN landed_source_oid ELSE NULL END,
+                 landed_target_base_oid=CASE WHEN ?2='landed' THEN landed_target_base_oid ELSE NULL END,
                  conflict_paths=COALESCE(?5, conflict_paths),
                  error_detail=COALESCE(?6, error_detail)
                WHERE worktree=?1 AND claim_owner IS NULL"#,
@@ -1218,7 +1237,8 @@ impl WorktreeAuxStore for Db {
         let n = self.conn().execute(
             r#"UPDATE merge_queue SET
                  status='queued', agent_attempts=0, updated_at=?2,
-                 result_oid=NULL, conflict_paths=NULL, error_detail=NULL
+                 result_oid=NULL, conflict_paths=NULL, error_detail=NULL,
+                 landed_source_oid=NULL, landed_target_base_oid=NULL
                WHERE worktree=?1 AND claim_owner IS NULL"#,
             params![worktree, util::now()],
         )?;
@@ -1311,7 +1331,8 @@ impl WorktreeAuxStore for Db {
             .join(", ");
         let sql = format!(
             "UPDATE merge_queue SET status='queued', agent_attempts=0, updated_at=?2, \
-             result_oid=NULL, conflict_paths=NULL, error_detail=NULL \
+             result_oid=NULL, conflict_paths=NULL, error_detail=NULL, \
+             landed_source_oid=NULL, landed_target_base_oid=NULL \
              WHERE worktree=?1 AND claim_owner IS NULL AND status IN ({held})"
         );
         let changed = conn.execute(&sql, params![worktree, util::now()])?;

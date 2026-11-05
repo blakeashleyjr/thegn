@@ -166,6 +166,8 @@ Each reply must carry exactly one of `result` or `error`; `add_comment`,
 `true` (`null` or a missing result is an error).
 A `get_issue` result may set `"comments_complete": false` when it contains only
 part of the comments; omitting the field means the comments are complete.
+Likewise `"labels_complete": false` marks a partial label list; omitting it
+means the labels are complete.
 
 Check the manifest and negotiated extension point with:
 

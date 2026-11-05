@@ -703,6 +703,8 @@ impl IssueBackend for KaneoBackend {
                 comments,
                 // The unpaged comment endpoint must succeed before reaching this result.
                 comments_complete: true,
+                // Kaneo returns the task's labels in one response.
+                labels_complete: true,
             })
         })
     }

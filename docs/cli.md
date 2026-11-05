@@ -10,7 +10,7 @@ Noun-verb namespaces mirror the domain model (repo → workspace → worktree):
 
 | Group         | Commands                                                                                                                           |
 | ------------- | ---------------------------------------------------------------------------------------------------------------------------------- |
-| Workspace     | `wt list\|new\|rm\|diff\|disk\|clean` · `repo list\|recent` · `open <repo>` · `map` · `land` · `integrate` · `merge`               |
+| Workspace     | `wt list\|new\|rm\|diff\|disk\|clean` · `repo list\|recent\|provenance` · `open <repo>` · `map` · `land` · `integrate` · `merge`   |
 | Forge         | `pr` · `issue` · `dispatch` · `kaneo` · `ci`                                                                                       |
 | Search        | `search <pattern> [--regex\|--structural] [--replace <tpl> [--apply]]` — workspace find & replace (read/write scoped)              |
 | Environments  | `env` · `zone` · `host` · `placement` · `sandbox` · `debug` · `mcp` · `plugin`                                                     |
@@ -165,8 +165,9 @@ for the package format.
 
 Most list-shaped read surfaces accept `--json` and emit exactly **one
 compact JSON document** on stdout with no ANSI sequences: `wt list` / `list`,
-`repo list`, `repo recent`, `env list`, `host list`, `ci runs`, `share list`,
-`forward list`, `merge list`, `session list`, `pair list`, `disk`, `map`,
+`repo list`, `repo recent`, `repo provenance`, `env list`, `host list`,
+`ci runs`, `share list`, `forward list`, `merge list`, `session list`,
+`pair list`, `disk`, `map`,
 `dispatch list` (the agent-dispatch roster; `--active` keeps only rows that
 occupy a slot; rows carry the daemon-written retry `note` — headless workers
 that died of a transport failure are relaunched by the daemon per
@@ -353,7 +354,7 @@ values — worktrees (`wt rm`, `--worktree`, `land`, `merge add`), repos
 hosts, config keys (`config get|set`, `--set`), capability ids (`api call`),
 and names from your config (`--profile`, `[env.<name>]`, `[[agents]]`,
 `[mcp_servers.<name>]`). Values come from the state DB read-only, under a
-budget (`THEGN_COMPLETE_BUDGET_MS`, default 100), and any failure completes
+budget (`THEGN_COMPLETE_BUDGET_MS`, default 300), and any failure completes
 nothing rather than printing an error. Branch, PR and issue completion are
 deliberately **not** offered: a `<TAB>` does not run git and does not call the
 forge.
