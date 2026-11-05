@@ -802,9 +802,7 @@ fn drain_with_responder(
                     }
                     state.plugins.insert(id.clone(), entry);
                     if !removed_apps.is_empty() {
-                        model.status = format!(
-                            "Plugin {id}: app tabs are dev-channel only; set THEGN_CHANNEL=dev"
-                        );
+                        model.status = format!("Plugin {id}: unsupported app tabs were removed");
                     }
                     if failed_resident_start {
                         damage.merge(handle_exit(state, model, host, &id, None, false));
@@ -4967,10 +4965,8 @@ pub(crate) mod app_tests {
     }
 
     #[test]
-    fn stable_channel_strips_app_tabs_with_a_status_line() {
+    fn stable_channel_loads_app_tabs() {
         let _guard = channel_guard(Channel::Stable);
-        let mut contributions = vec![contribution("app", ExtensionPoint::AppTab, "p/app", "App")];
-        assert_eq!(gate_app_tabs(&mut contributions, false).len(), 1);
         let mut state = PluginsState::new(thegn_core::config::Config::default());
         let mut model = FrameModel::default();
         drain_one(
@@ -4982,11 +4978,8 @@ pub(crate) mod app_tests {
             !state.loading,
             "the first Loaded message ends the discovery loading state"
         );
-        assert_eq!(state.plugins["p"].apps.len(), 0);
-        assert_eq!(
-            model.status,
-            "Plugin p: app tabs are dev-channel only; set THEGN_CHANNEL=dev"
-        );
+        assert_eq!(state.plugins["p"].apps.len(), 1);
+        assert!(model.status.is_empty());
         drop(_guard);
     }
 

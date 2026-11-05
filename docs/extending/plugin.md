@@ -46,26 +46,26 @@ The checked-in JSON schema carries this same table as
 `x-thegn-extension-support`; `thegn plugin check` applies it without launching
 the plugin.
 
-| Extension point      | State            | Required capability    | Modes              | Cadence             | Owner                            |
-| -------------------- | ---------------- | ---------------------- | ------------------ | ------------------- | -------------------------------- |
-| `AppTab`             | wired            | `surface:app`          | resident           | on-demand           | plugin app runtime (dev channel) |
-| `StatusBarSegment`   | wired            | `surface:statusbar`    | one-shot, resident | on-demand, interval | general compositor               |
-| `PanelSection`       | reserved         | `surface:panel`        | —                  | —                   | THE-108                          |
-| `SidebarTab`         | reserved         | `surface:sidebar`      | —                  | —                   | THE-107                          |
-| `PaletteAction`      | wired            | `surface:palette`      | one-shot, resident | on-demand           | general compositor               |
-| `NotificationSource` | wired            | `surface:notification` | one-shot, resident | on-demand, interval | general compositor               |
-| `HarnessAdapter`     | reserved         | `surface:harness`      | —                  | —                   | `add-agent-harness-seam`         |
-| `ProgramAdapter`     | reserved         | `surface:program`      | —                  | —                   | no accepted runtime owner        |
-| `Theme`              | reserved         | `surface:theme`        | —                  | —                   | THE-107                          |
-| `Automation`         | reserved         | `surface:automation`   | —                  | —                   | native engine only               |
-| `DataSource`         | separate adapter | `surface:data`         | —                  | —                   | calendar command accounts        |
-| `IssueProvider`      | wired            | `surface:provider`     | resident           | on-demand           | issue provider bridge            |
-| `CiProvider`         | reserved         | `surface:provider`     | —                  | —                   | no dynamic selector              |
-| `ForgeProvider`      | reserved         | `surface:provider`     | —                  | —                   | no dynamic selector              |
-| `DebugAdapter`       | reserved         | `surface:debug`        | —                  | —                   | THE-102                          |
+| Extension point      | State            | Required capability    | Modes              | Cadence             | Owner                     |
+| -------------------- | ---------------- | ---------------------- | ------------------ | ------------------- | ------------------------- |
+| `AppTab`             | wired            | `surface:app`          | resident           | on-demand           | plugin app runtime        |
+| `StatusBarSegment`   | wired            | `surface:statusbar`    | one-shot, resident | on-demand, interval | general compositor        |
+| `PanelSection`       | reserved         | `surface:panel`        | —                  | —                   | THE-108                   |
+| `SidebarTab`         | reserved         | `surface:sidebar`      | —                  | —                   | THE-107                   |
+| `PaletteAction`      | wired            | `surface:palette`      | one-shot, resident | on-demand           | general compositor        |
+| `NotificationSource` | wired            | `surface:notification` | one-shot, resident | on-demand, interval | general compositor        |
+| `HarnessAdapter`     | reserved         | `surface:harness`      | —                  | —                   | `add-agent-harness-seam`  |
+| `ProgramAdapter`     | reserved         | `surface:program`      | —                  | —                   | no accepted runtime owner |
+| `Theme`              | reserved         | `surface:theme`        | —                  | —                   | THE-107                   |
+| `Automation`         | reserved         | `surface:automation`   | —                  | —                   | native engine only        |
+| `DataSource`         | separate adapter | `surface:data`         | —                  | —                   | calendar command accounts |
+| `IssueProvider`      | wired            | `surface:provider`     | resident           | on-demand           | issue provider bridge     |
+| `CiProvider`         | reserved         | `surface:provider`     | —                  | —                   | no dynamic selector       |
+| `ForgeProvider`      | reserved         | `surface:provider`     | —                  | —                   | no dynamic selector       |
+| `DebugAdapter`       | reserved         | `surface:debug`        | —                  | —                   | THE-102                   |
 
-AppTab requires API 0.4.0 and a `surface`; app tabs are dev-channel only
-(see the release-channels help page).
+AppTab requires API 0.4.0 and a `surface`. An app-tab plugin is resident
+third-party code; granting `background:sync` requires `trusted_native = true`.
 
 The host verb matrix is also embedded as `x-thegn-host-verb-support`, and the
 exact currently dispatchable catalog ids are in

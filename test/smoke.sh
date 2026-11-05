@@ -2484,8 +2484,8 @@ check "plugin list is empty-clean and check passes with no plugins" \
   "'$SZ' plugin list | grep -q 'no plugins configured' && '$SZ' plugin check | grep -q 'plugins: ok'"
 CHCFG="$TMP/channel.toml"
 printf '[observe]\nenabled = true\n' >"$CHCFG"
-check "stable clamps experimental toggles off" \
-  "env THEGN_CHANNEL=stable '$SZ' --config '$CHCFG' config show | grep -A1 '^\[observe\]' | grep -q 'enabled = false'"
+check "stable honours observe toggles" \
+  "env THEGN_CHANNEL=stable '$SZ' --config '$CHCFG' config show | grep -A1 '^\[observe\]' | grep -q 'enabled = true'"
 check "dev honours the same toggles" \
   "env THEGN_CHANNEL=dev '$SZ' --config '$CHCFG' config show | grep -A1 '^\[observe\]' | grep -q 'enabled = true'"
 

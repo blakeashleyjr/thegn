@@ -126,12 +126,10 @@ impl Feature {
     pub const fn stability(self) -> Stability {
         match self {
             // The confirmed experimental set for the pre-alpha.
-            Feature::Remote
-            | Feature::Providers
-            | Feature::Observe
-            | Feature::Placement
-            | Feature::Voice => Stability::Experimental,
-            Feature::PluginApps => Stability::Experimental,
+            Feature::Remote | Feature::Providers | Feature::Placement | Feature::Voice => {
+                Stability::Experimental
+            }
+            Feature::Observe | Feature::PluginApps => Stability::Stable,
         }
     }
 
@@ -169,12 +167,10 @@ mod tests {
 
     #[test]
     fn experimental_features_are_dev_only() {
-        for f in Feature::ALL {
-            assert_eq!(
-                f.stability(),
-                Stability::Experimental,
-                "{f} should be experimental in the pre-alpha set"
-            );
+        for f in Feature::ALL
+            .into_iter()
+            .filter(|f| f.stability() == Stability::Experimental)
+        {
             assert!(
                 !f.allowed_in(Channel::Stable),
                 "{f} must be denied in stable"
@@ -196,13 +192,23 @@ mod tests {
     }
 
     #[test]
-    fn stable_channel_denies_all_gated_features() {
-        // A stable build allows nothing in the gated set; a dev build allows all.
+    fn channel_availability_follows_feature_stability() {
         let denied = Feature::ALL
             .iter()
             .filter(|f| !f.allowed_in(Channel::Stable))
             .count();
-        assert_eq!(denied, Feature::ALL.len());
+        let experimental = Feature::ALL
+            .iter()
+            .filter(|f| f.stability() == Stability::Experimental)
+            .count();
+        assert_eq!(denied, experimental);
+        for f in Feature::ALL {
+            assert_eq!(
+                f.allowed_in(Channel::Stable),
+                f.stability() == Stability::Stable,
+                "stable availability should follow {f}'s stability"
+            );
+        }
         let allowed = Feature::ALL
             .iter()
             .filter(|f| f.allowed_in(Channel::Dev))

@@ -3,8 +3,9 @@
 A resident plugin can contribute an `AppTab` with a declared `surface` and the
 `surface:app` capability. The host creates a top-level tab named
 `plugin:<plugin-id>:<contribution-id>`. Configure that id in `[apps]
-default_tab` or `tab_order`. App tabs are experimental and available on the dev
-channel only (`THEGN_CHANNEL=dev`; see [release channels](../help/release-channels.md)).
+default_tab` or `tab_order`. Plugin app tabs are available on the stable and
+dev channels. An app-tab plugin is resident third-party code; `background:sync`
+requires `trusted_native = true`.
 
 The host owns widgets, layout, rendering, keyboard routing, and recovery UI.
 Plugins own domain logic, network access, credentials, durable storage, and
@@ -123,4 +124,4 @@ Run `just plugin-conformance` (with a built `target/debug/thegn`) to check
 manifest and `grid.py`, run with `python3`. Its “Cell grid” tab draws the
 last typed key or pasted text in one `grid` widget sized to the region the
 host reports. Copy the directory into `<config_dir>/plugins/`; it then
-appears in `thegn plugin list`. Plugin app tabs are a dev-channel feature.
+appears in `thegn plugin list`.
