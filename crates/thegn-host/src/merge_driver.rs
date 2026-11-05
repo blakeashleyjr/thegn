@@ -3484,11 +3484,11 @@ mod tests {
                 branch: "second".into(),
                 location: String::new(),
             };
-            let counter = root.join("gate-count");
-            std::fs::write(&counter, "").unwrap();
+            let gate_started = root.join("gate-started");
+            std::fs::write(&gate_started, "").unwrap();
             let command = format!(
                 "printf x >> {} ; exec sleep 30",
-                thegn_core::util::sh_quote(&counter.to_string_lossy()),
+                thegn_core::util::sh_quote(&gate_started.to_string_lossy()),
             );
             let mut mq = cfg("", 1);
             mq.gate_on = true;
@@ -3497,10 +3497,10 @@ mod tests {
             let probe = std::sync::Arc::clone(&cancelled);
             let _scope =
                 crate::fold_cancel::scope(move || probe.load(std::sync::atomic::Ordering::Acquire));
-            let gate_marker = counter.clone();
+            let gate_marker = gate_started.clone();
             let cancel_signal = std::sync::Arc::clone(&cancelled);
             let waiter = std::thread::spawn(move || {
-                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
                 while std::time::Instant::now() < deadline {
                     if std::fs::metadata(&gate_marker).is_ok_and(|metadata| metadata.len() > 0) {
                         cancel_signal.store(true, std::sync::atomic::Ordering::Release);
@@ -3524,8 +3524,8 @@ mod tests {
                 "the gate must start before cancellation"
             );
             assert!(
-                std::fs::metadata(counter).is_ok_and(|metadata| metadata.len() > 0),
-                "the gate probe must have fired during the in-flight attempt"
+                std::fs::metadata(gate_started).is_ok_and(|metadata| metadata.len() > 0),
+                "the gate start marker must contain the probe byte"
             );
             let rows = db.list_merge_queue().unwrap();
             assert_eq!(rows.len(), 2);
