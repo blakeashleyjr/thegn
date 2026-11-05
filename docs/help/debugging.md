@@ -91,6 +91,11 @@ live daemon diagnostic query; retained crash reports and the available log
 tails are the cross-process evidence it can include. Review the manifest and
 the extracted bundle before sharing it.
 
+When thegn falls back from the pane daemon, an SSH-over-WebSocket attach or a
+provider exec attach, the one-time launch notice ends with a pointer to
+`thegn doctor bundle`; the pointer is fixed text and names no file, so no path
+or secret enters the notice.
+
 ## Logs and raw stderr
 
 `THEGN_LOG` uses tracing-style filters and can select a module or target, for
