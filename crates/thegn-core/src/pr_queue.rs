@@ -683,6 +683,92 @@ pub fn own_agent_head(
     .then(|| remote.to_owned())
 }
 
+/// What one finished agent run did to the PR head, as far as it can be proven (THE-549).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AgentHeadOutcome {
+    AgentProgress,
+    Unchanged,
+    LocalOnly,
+    TeammatePush,
+    Unverified,
+    InfraFailure,
+    StaleCompletion,
+}
+
+/// Facts observed after the agent returned.
+#[derive(Debug, Clone, Copy)]
+pub struct AgentRunObservation<'a> {
+    pub admitted: &'a str,
+    pub local_head: Option<&'a str>,
+    pub remote_head: Option<&'a str>,
+    pub local_descends: Option<bool>,
+    pub infra_failure: bool,
+    pub lease_current: bool,
+}
+
+/// Classify one completed agent run, preferring stale and infrastructure outcomes.
+pub fn classify_agent_head(obs: &AgentRunObservation<'_>) -> AgentHeadOutcome {
+    if !obs.lease_current {
+        return AgentHeadOutcome::StaleCompletion;
+    }
+    if obs.infra_failure {
+        return AgentHeadOutcome::InfraFailure;
+    }
+    if own_agent_head(
+        obs.admitted,
+        obs.local_head,
+        obs.remote_head,
+        obs.local_descends,
+    )
+    .is_some()
+    {
+        return AgentHeadOutcome::AgentProgress;
+    }
+    if obs.remote_head.is_none_or(str::is_empty) {
+        return AgentHeadOutcome::Unverified;
+    }
+    if obs.remote_head == Some(obs.admitted) {
+        return if obs.local_head.is_none() || obs.local_head == Some(obs.admitted) {
+            AgentHeadOutcome::Unchanged
+        } else {
+            AgentHeadOutcome::LocalOnly
+        };
+    }
+    if obs.local_head == obs.remote_head {
+        AgentHeadOutcome::Unverified
+    } else {
+        AgentHeadOutcome::TeammatePush
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct HeadBudgetEffect {
+    pub refill: bool,
+    pub hold: bool,
+}
+
+/// Compute the attempt-budget and foreign-push effects of a completed agent run.
+pub fn head_budget_effect(outcome: AgentHeadOutcome, cfg: &PrQueueConfig) -> HeadBudgetEffect {
+    match outcome {
+        AgentHeadOutcome::TeammatePush => HeadBudgetEffect {
+            refill: cfg.reset_attempts_on_push,
+            hold: cfg.pause_on_foreign_push,
+        },
+        AgentHeadOutcome::Unverified => HeadBudgetEffect {
+            refill: false,
+            hold: cfg.pause_on_foreign_push,
+        },
+        AgentHeadOutcome::AgentProgress
+        | AgentHeadOutcome::Unchanged
+        | AgentHeadOutcome::LocalOnly
+        | AgentHeadOutcome::InfraFailure
+        | AgentHeadOutcome::StaleCompletion => HeadBudgetEffect {
+            refill: false,
+            hold: false,
+        },
+    }
+}
+
 impl fmt::Display for AgentAdmissionRefusal {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
@@ -1737,6 +1823,205 @@ mod tests {
             own_agent_head("", Some(&b), Some(&b), Some(true)),
         ] {
             assert_eq!(candidate, None);
+        }
+    }
+
+    #[test]
+    fn head_outcome_classifies_every_scenario() {
+        let a = "a".repeat(40);
+        let b = "b".repeat(40);
+        let c = "c".repeat(64);
+        let base = |local_head, remote_head, local_descends| AgentRunObservation {
+            admitted: &a,
+            local_head,
+            remote_head,
+            local_descends,
+            infra_failure: false,
+            lease_current: true,
+        };
+        let own_push = base(Some(&b), Some(&b), Some(true));
+        let scenarios = [
+            ("own push", own_push, AgentHeadOutcome::AgentProgress),
+            (
+                "no push",
+                base(Some(&a), Some(&a), Some(true)),
+                AgentHeadOutcome::Unchanged,
+            ),
+            (
+                "remote unchanged, local missing",
+                base(None, Some(&a), None),
+                AgentHeadOutcome::Unchanged,
+            ),
+            (
+                "local-only commit",
+                base(Some(&b), Some(&a), Some(true)),
+                AgentHeadOutcome::LocalOnly,
+            ),
+            (
+                "teammate before agent push",
+                base(Some(&a), Some(&b), None),
+                AgentHeadOutcome::TeammatePush,
+            ),
+            (
+                "teammate during agent push",
+                base(Some(&b), Some(&c), None),
+                AgentHeadOutcome::TeammatePush,
+            ),
+            (
+                "teammate after agent push",
+                base(Some(&b), Some(&c), Some(true)),
+                AgentHeadOutcome::TeammatePush,
+            ),
+            (
+                "force push",
+                base(Some(&b), Some(&b), Some(false)),
+                AgentHeadOutcome::Unverified,
+            ),
+            (
+                "unknown ancestry",
+                base(Some(&b), Some(&b), None),
+                AgentHeadOutcome::Unverified,
+            ),
+            (
+                "short equal local and remote head",
+                base(Some("beef"), Some("beef"), Some(true)),
+                AgentHeadOutcome::Unverified,
+            ),
+            (
+                "missing remote head",
+                base(Some(&a), None, None),
+                AgentHeadOutcome::Unverified,
+            ),
+            (
+                "empty remote head",
+                base(Some(&a), Some(""), None),
+                AgentHeadOutcome::Unverified,
+            ),
+            (
+                "infrastructure failure",
+                AgentRunObservation {
+                    infra_failure: true,
+                    ..own_push
+                },
+                AgentHeadOutcome::InfraFailure,
+            ),
+            (
+                "stale completion",
+                AgentRunObservation {
+                    lease_current: false,
+                    ..own_push
+                },
+                AgentHeadOutcome::StaleCompletion,
+            ),
+            (
+                "stale infrastructure failure",
+                AgentRunObservation {
+                    lease_current: false,
+                    infra_failure: true,
+                    ..own_push
+                },
+                AgentHeadOutcome::StaleCompletion,
+            ),
+        ];
+
+        for (scenario, observation, expected) in scenarios {
+            assert_eq!(
+                classify_agent_head(&observation),
+                expected,
+                "classification for {scenario}"
+            );
+        }
+    }
+
+    #[test]
+    fn head_outcome_budget_effect_matrix_covers_pause_and_reset() {
+        let outcomes = [
+            AgentHeadOutcome::AgentProgress,
+            AgentHeadOutcome::Unchanged,
+            AgentHeadOutcome::LocalOnly,
+            AgentHeadOutcome::TeammatePush,
+            AgentHeadOutcome::Unverified,
+            AgentHeadOutcome::InfraFailure,
+            AgentHeadOutcome::StaleCompletion,
+        ];
+        for outcome in outcomes {
+            for pause in [true, false] {
+                for reset in [true, false] {
+                    let config = PrQueueConfig {
+                        enabled: true,
+                        pause_on_foreign_push: pause,
+                        reset_attempts_on_push: reset,
+                        ..PrQueueConfig::default()
+                    };
+                    let expected = match outcome {
+                        AgentHeadOutcome::TeammatePush => HeadBudgetEffect {
+                            refill: reset,
+                            hold: pause,
+                        },
+                        AgentHeadOutcome::Unverified => HeadBudgetEffect {
+                            refill: false,
+                            hold: pause,
+                        },
+                        AgentHeadOutcome::AgentProgress
+                        | AgentHeadOutcome::Unchanged
+                        | AgentHeadOutcome::LocalOnly
+                        | AgentHeadOutcome::InfraFailure
+                        | AgentHeadOutcome::StaleCompletion => HeadBudgetEffect {
+                            refill: false,
+                            hold: false,
+                        },
+                    };
+                    assert_eq!(
+                        head_budget_effect(outcome, &config),
+                        expected,
+                        "effect for {outcome:?}, pause={pause}, reset={reset}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn head_outcome_teammate_effect_agrees_with_attempts_reset_and_foreign_push() {
+        let a = "a".repeat(40);
+        let b = "b".repeat(40);
+        for pause in [true, false] {
+            for reset in [true, false] {
+                let config = PrQueueConfig {
+                    enabled: true,
+                    pause_on_foreign_push: pause,
+                    reset_attempts_on_push: reset,
+                    ..PrQueueConfig::default()
+                };
+                assert_eq!(
+                    head_budget_effect(AgentHeadOutcome::TeammatePush, &config),
+                    HeadBudgetEffect {
+                        refill: attempts_reset(Some(&a), &b, &config),
+                        hold: foreign_push(Some(&a), &b) && config.pause_on_foreign_push,
+                    }
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn head_outcome_agent_progress_never_refills_or_holds() {
+        for pause in [true, false] {
+            for reset in [true, false] {
+                let config = PrQueueConfig {
+                    enabled: true,
+                    pause_on_foreign_push: pause,
+                    reset_attempts_on_push: reset,
+                    ..PrQueueConfig::default()
+                };
+                assert_eq!(
+                    head_budget_effect(AgentHeadOutcome::AgentProgress, &config),
+                    HeadBudgetEffect {
+                        refill: false,
+                        hold: false,
+                    }
+                );
+            }
         }
     }
 
