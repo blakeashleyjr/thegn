@@ -202,6 +202,11 @@ repo other people push to:
   `pause_on_foreign_push`. Anything it cannot verify (a remote worktree, a
   teammate's push) still counts as someone else's.
 
+- **An agent that never starts** (sandbox entry refused, a broken command
+  template, an unwritable prompt) does not spend an attempt: the row is held
+  `needs_human` with the reason, for the PR queue and CI autofix alike, like the
+  merge queue.
+
 After each agent run thegn also compares the PR head with the head the agent
 started on and says what happened in the pass warnings: the agent changed
 nothing, the agent committed locally but did not push, or someone else pushed
@@ -209,11 +214,6 @@ while it ran (and whether that holds the row or refills the budget under your
 `pause_on_foreign_push` / `reset_attempts_on_push` settings). This only reports;
 the attempt budget is still decided by the rules above. It applies to local
 checkouts.
-
-- **An agent that never starts** (sandbox entry refused, a broken command
-  template, an unwritable prompt) does not spend an attempt: the row is held
-  `needs_human` with the reason, for the PR queue and CI autofix alike, like the
-  merge queue.
 
 ## Watching
 
