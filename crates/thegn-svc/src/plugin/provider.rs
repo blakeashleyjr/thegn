@@ -1648,10 +1648,13 @@ done
                 .unwrap();
 
             assert!(
-                rt.block_on(tokio::time::timeout(
-                    Duration::from_millis(300),
-                    bridge.call("issues", "list_issues", serde_json::json!({})),
-                ))
+                rt.block_on(async {
+                    tokio::time::timeout(
+                        Duration::from_millis(300),
+                        bridge.call("issues", "list_issues", serde_json::json!({})),
+                    )
+                    .await
+                })
                 .is_err()
             );
             assert_eq!(bridge.stats().calls, 1);
