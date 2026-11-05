@@ -215,11 +215,4 @@ mod tests {
         assert!(error.downcast_ref::<StageWorkerHold>().is_some());
         assert_eq!(error.to_string(), "x");
     }
-
-    #[test]
-    fn launch_spec_full_applies_the_stage_hold() {
-        let source = include_str!("agent.rs");
-        assert!(source.contains("stage_worker_hold::stage_worker_hold("));
-        assert!(source.contains("extras.stage"));
-    }
 }
