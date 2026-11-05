@@ -2598,10 +2598,10 @@ mod tests {
                 .client_with(Path::new(&format!("/r/{index}")), &key, fake_client)
                 .unwrap();
         }
-        match inner.client_with(Path::new("/r/extra"), "lang0", fake_client) {
-            Err(LspError::Bounded(message)) => assert!(message.contains("root limit"), "{message}"),
-            other => panic!("expected the root limit, got {other:?}"),
-        }
+        assert!(matches!(
+            inner.client_with(Path::new("/r/extra"), "lang0", fake_client),
+            Err(LspError::Bounded(message)) if message.contains("root limit")
+        ));
         let long = "k".repeat(limits::MAX_IDENTITY_BYTES + 1);
         assert!(matches!(
             inner.client_with(Path::new("/r/0"), &long, fake_client),
@@ -2624,12 +2624,10 @@ mod tests {
         let result = inner.client_with(Path::new("/p/extra"), "k0", |_, _, _, _| {
             panic!("a refused start must not run")
         });
-        match result {
-            Err(LspError::Bounded(message)) => {
-                assert_eq!(message, "LSP per-language instance limit reached");
-            }
-            other => panic!("expected a per-language bound, got {other:?}"),
-        }
+        assert!(matches!(
+            result,
+            Err(LspError::Bounded(message)) if message == "LSP per-language instance limit reached"
+        ));
         assert_eq!(clients.len(), MAX_INSTANCES_PER_LANGUAGE);
     }
 
@@ -2732,12 +2730,10 @@ mod tests {
             assert!(starter.join().expect("starter thread").is_ok());
         }
         refusal.join().expect("refusal thread");
-        match result.expect("refusal does not wait for hung starters") {
-            Err(LspError::Bounded(message)) => {
-                assert_eq!(message, "LSP per-language instance limit reached");
-            }
-            other => panic!("expected a per-language bound, got {other:?}"),
-        }
+        assert!(matches!(
+            result.expect("refusal does not wait for hung starters"),
+            Err(LspError::Bounded(message)) if message == "LSP per-language instance limit reached"
+        ));
     }
 
     #[test]
