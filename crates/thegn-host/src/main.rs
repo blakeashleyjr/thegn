@@ -193,6 +193,8 @@ mod perf_rt;
 mod perf_timing;
 #[cfg(test)]
 mod perf_workloads;
+#[cfg(test)]
+mod perf_workloads_pty;
 mod pins;
 mod pipeline_board;
 mod placement_flow;
@@ -201,6 +203,7 @@ mod platform;
 mod platform_ratchet_tests;
 mod plugin_damage;
 mod plugin_providers;
+mod plugin_stats;
 mod plugins;
 mod pool_lease;
 mod pr_agent_lease;

@@ -33,6 +33,7 @@ pub mod forward;
 pub mod host;
 pub mod integrate;
 pub mod issue;
+pub mod issue_tracker;
 pub mod kaneo;
 pub mod keys;
 pub mod land;

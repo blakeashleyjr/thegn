@@ -26,6 +26,10 @@ names the redacted reason and says it will not survive closing thegn. If a
 saved pane session cannot be reattached, a fresh pane opens and the notice
 says its previous process and scrollback were not restored. Each kind of
 notice is posted once per run, while the compositor is active.
+On the dev channel, a restored remote pane whose SSH-over-WebSocket or
+provider exec attach fails and takes another launch path also gets a notice
+once per kind per run. It says the pane may not be connected to the remote
+environment or session; the notice and log include the redacted reason.
 
 `thegn daemon stop` stops every pane daemon this state directory knows about
 (registered current and pre-upgrade daemons, the configured socket, and a live

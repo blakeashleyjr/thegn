@@ -154,6 +154,13 @@ dashboard (`j`/`k` or the arrow keys, `esc` to close):
   back to `○` straight away.
 - **thegn process** — resident memory (RSS), this process's over the pane
   daemon's in one stacked plot, plus the daemon's CPU and memory trends.
+- **plugins** — one row per plugin that has called a host verb or filled its
+  queues, cumulative since thegn started: `busy` (host calls in flight now),
+  `refused` (dispatcher full or the plugin's in-flight cap), `timeout`, `lost`
+  (session closed or dispatcher down before the call ran, or the reply could
+  not be written) and `drops` (plugin events thegn dropped or refused because
+  the plugin's queue was full). Amber means nonzero; the section is absent
+  while every counter is zero. Refreshed when the modal refreshes, not live.
 - **loop** — the event-loop rollup: wakes/s, render / input / flush / drain /
   switch latency, the frame mix, PTY throughput, and the idle and render-busy
   ratios. Populated only with `THEGN_PERF=1` (or while the Telemetry panel

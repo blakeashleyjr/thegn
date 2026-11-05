@@ -88,6 +88,41 @@ pub fn classify_worker(facts: &WorkerFacts<'_>) -> WorkerReadiness {
     WorkerReadiness::Ready
 }
 
+/// Absolute credential-home directories an agent's expanded env relocates.
+/// Values are `~`-expanded, kept in env order, and deduplicated. Relative or
+/// unset values do not relocate a home. This mirrors the host launch's
+/// `provider_home_mounts` selection rule.
+pub fn relocated_provider_homes(
+    expanded_env: &[(String, String)],
+    home_vars: &[&str],
+) -> Vec<std::path::PathBuf> {
+    let mut homes = Vec::new();
+    for (key, value) in expanded_env {
+        if home_vars.contains(&key.as_str()) && Path::new(value).is_absolute() {
+            let home = std::path::PathBuf::from(crate::util::expand_tilde(value));
+            if !homes.contains(&home) {
+                homes.push(home);
+            }
+        }
+    }
+    homes
+}
+
+/// Add the path-preserving read-write mount used by a launch for a relocated
+/// credential home. Doctor's remaining check is whether the home exists as a
+/// directory; this mount mirrors the launch carve and makes the path writable.
+pub fn with_provider_home_mount(mounts: &[Mount], home: &Path) -> Vec<Mount> {
+    let text = home.to_string_lossy().into_owned();
+    let mut all = mounts.to_vec();
+    all.push(Mount {
+        host: text.clone(),
+        dest: text,
+        ro: false,
+        cache: false,
+    });
+    all
+}
+
 fn writable(mounts: &[Mount], path: &Path) -> bool {
     if path
         .components()
@@ -115,7 +150,10 @@ mod tests {
 
     use crate::sandbox::{Backend, Mount};
 
-    use super::{CallbackBinary, WorkerFacts, WorkerReadiness, classify_worker, writable};
+    use super::{
+        CallbackBinary, WorkerFacts, WorkerReadiness, classify_worker, relocated_provider_homes,
+        with_provider_home_mount, writable,
+    };
 
     fn m(dest: &str, ro: bool) -> Mount {
         Mount {
@@ -326,6 +364,69 @@ mod tests {
         );
         assert_eq!(
             classify_worker(&unwritable),
+            WorkerReadiness::ProviderHomeUnavailable
+        );
+    }
+
+    #[test]
+    fn relocated_provider_homes_keeps_absolute_home_vars_in_order_without_duplicates() {
+        let env = vec![
+            ("CODEX_HOME".to_owned(), "/h/codex".to_owned()),
+            ("OTHER".to_owned(), "/x".to_owned()),
+            ("CLAUDE_CONFIG_DIR".to_owned(), "/h/claude".to_owned()),
+            ("CODEX_HOME".to_owned(), "/h/codex".to_owned()),
+        ];
+
+        assert_eq!(
+            relocated_provider_homes(&env, &["CODEX_HOME", "CLAUDE_CONFIG_DIR"]),
+            vec![
+                std::path::PathBuf::from("/h/codex"),
+                std::path::PathBuf::from("/h/claude"),
+            ]
+        );
+    }
+
+    #[test]
+    fn relocated_provider_homes_ignores_relative_unset_and_non_home_keys() {
+        let env = vec![
+            ("CODEX_HOME".to_owned(), ".codex".to_owned()),
+            ("PATH".to_owned(), "/usr/bin".to_owned()),
+        ];
+
+        assert!(relocated_provider_homes(&env, &["CODEX_HOME"]).is_empty());
+        assert!(relocated_provider_homes(&[], &["CODEX_HOME"]).is_empty());
+    }
+
+    #[test]
+    fn with_provider_home_mount_appends_a_path_preserving_rw_mount_and_makes_the_home_writable() {
+        let mounts = [m("/work/tree", false)];
+        let home = Path::new("/provider/home");
+        let carved = with_provider_home_mount(&mounts, home);
+
+        assert_eq!(carved.len(), 2);
+        assert_eq!(carved[1].host, "/provider/home");
+        assert_eq!(carved[1].dest, "/provider/home");
+        assert!(!carved[1].ro);
+
+        let provider_home = WorkerFacts {
+            provider_home: Some(home),
+            provider_home_exists: true,
+            ..facts(&mounts, Path::new("/work/tree"))
+        };
+        let carved_provider_home = WorkerFacts {
+            mounts: &carved,
+            ..provider_home
+        };
+        assert_eq!(
+            classify_worker(&carved_provider_home),
+            WorkerReadiness::Ready
+        );
+        assert_eq!(
+            classify_worker(&WorkerFacts {
+                provider_home: Some(home),
+                provider_home_exists: true,
+                ..facts(&mounts, Path::new("/work/tree"))
+            }),
             WorkerReadiness::ProviderHomeUnavailable
         );
     }

@@ -16,7 +16,7 @@ use unicode_width::UnicodeWidthStr;
 #[derive(Debug, Clone, Args)]
 pub struct Options {
     /// Synthetic fixture JSON (a `{"view": AppView, "inputs": [...]}` document); "gallery" selects the bundled widget gallery.
-    #[arg(long, required_unless_present = "replay", conflicts_with = "replay")]
+    #[arg(long, required_unless_present_any = ["replay", "plugin_dir"], conflicts_with = "replay")]
     fixture: Option<PathBuf>,
     /// Replay a full synthetic trace recorded with `--fixture ... --record ... --include-content`. Redacted traces cannot be replayed.
     #[arg(long)]
@@ -33,6 +33,12 @@ pub struct Options {
     /// Terminal size as COLSxROWS.
     #[arg(long, default_value = "120x36", value_parser = dimensions)]
     size: (u16, u16),
+    /// Start the resident app plugin whose plugin.toml is in this directory; without --headless, run an interactive live preview.
+    #[arg(long, value_name = "DIR", conflicts_with_all = ["fixture", "replay", "record", "include_content"])]
+    plugin_dir: Option<PathBuf>,
+    /// With --plugin-dir --headless: how long to wait for the plugin's first valid app view, in milliseconds (100..=30000).
+    #[arg(long, default_value_t = super::live::DEFAULT_WAIT_MS, value_parser = super::live::wait_ms, requires = "plugin_dir")]
+    wait_ms: u64,
 }
 fn dimensions(value: &str) -> std::result::Result<(u16, u16), String> {
     let (w, h) = value.split_once('x').ok_or("size must be COLSxROWS")?;
@@ -341,7 +347,7 @@ fn synthetic(options: &Options, trace: Arc<Mutex<Trace>>) -> Result<Box<dyn AppT
     }))
 }
 
-fn snapshot_value(tile: &mut dyn AppTile, size: (u16, u16)) -> Value {
+pub(super) fn snapshot_value(tile: &mut dyn AppTile, size: (u16, u16)) -> Value {
     tile.on_resize(size.0, size.1);
     tile.pump();
     let area = Rect::new(0, 0, size.0, size.1);
@@ -359,6 +365,19 @@ fn snapshot_value(tile: &mut dyn AppTile, size: (u16, u16)) -> Value {
         "cursor": tile.cursor(),
         "status": tile.status_line(),
     })
+}
+
+pub(super) fn tile_for_view(view: AppView, size: (u16, u16)) -> Result<Box<dyn AppTile>> {
+    view.validate().map_err(anyhow::Error::msg)?;
+    let mut ui = UiEngine::new(Theme::prism());
+    ui.replace_view(view).map_err(anyhow::Error::msg)?;
+    ui.prepare(Rect::new(0, 0, size.0, size.1));
+    Ok(Box::new(FixtureTile {
+        ui,
+        dirty: true,
+        trace: Arc::new(Mutex::new(Trace::default())),
+        started: Instant::now(),
+    }))
 }
 
 fn is_gallery_selector(path: &Path) -> bool {
@@ -392,6 +411,17 @@ fn snapshot(tile: &mut dyn AppTile, size: (u16, u16)) -> Result<()> {
 }
 
 pub(super) fn run(options: Options) -> Result<()> {
+    if let Some(dir) = &options.plugin_dir {
+        return if options.headless {
+            super::live::run_headless(
+                dir,
+                options.size,
+                std::time::Duration::from_millis(options.wait_ms),
+            )
+        } else {
+            super::live::run_interactive(dir, options.size)
+        };
+    }
     let trace = Arc::new(Mutex::new(if options.record.is_some() {
         Trace::new(options.include_content)
     } else {
@@ -412,7 +442,47 @@ pub(super) fn run(options: Options) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use clap::Parser;
     use serde_json::json;
+
+    #[derive(clap::Parser)]
+    struct PreviewArgs {
+        #[command(flatten)]
+        options: Options,
+    }
+
+    #[test]
+    fn live_options_conflict_with_fixture_replay_and_record() {
+        assert!(PreviewArgs::try_parse_from(["p", "--plugin-dir", "d", "--headless"]).is_ok());
+        assert!(PreviewArgs::try_parse_from(["p", "--plugin-dir", "d"]).is_ok());
+        assert!(
+            PreviewArgs::try_parse_from([
+                "p",
+                "--plugin-dir",
+                "d",
+                "--headless",
+                "--fixture",
+                "gallery"
+            ])
+            .is_err()
+        );
+        assert!(
+            PreviewArgs::try_parse_from(["p", "--plugin-dir", "d", "--headless", "--replay", "t"])
+                .is_err()
+        );
+        assert!(
+            PreviewArgs::try_parse_from(["p", "--plugin-dir", "d", "--headless", "--record", "r"])
+                .is_err()
+        );
+        assert!(PreviewArgs::try_parse_from(["p", "--wait-ms", "500"]).is_err());
+    }
+
+    #[test]
+    fn live_options_are_required_when_no_fixture_or_replay_is_given() {
+        assert!(PreviewArgs::try_parse_from(["p", "--headless"]).is_err());
+        assert!(PreviewArgs::try_parse_from(["p", "--fixture", "gallery"]).is_ok());
+        assert!(PreviewArgs::try_parse_from(["p", "--replay", "t"]).is_ok());
+    }
 
     fn options_for_fixture(path: PathBuf) -> Options {
         Options {
@@ -422,6 +492,8 @@ mod tests {
             include_content: false,
             headless: true,
             size: (120, 36),
+            plugin_dir: None,
+            wait_ms: super::super::live::DEFAULT_WAIT_MS,
         }
     }
 
@@ -436,6 +508,8 @@ mod tests {
             include_content: true,
             headless: true,
             size: (120, 36),
+            plugin_dir: None,
+            wait_ms: super::super::live::DEFAULT_WAIT_MS,
         };
         let trace = Arc::new(Mutex::new(Trace::new(true)));
         let mut original = synthetic(&options, trace.clone()).unwrap();
@@ -553,6 +627,8 @@ mod tests {
                 include_content: false,
                 headless: true,
                 size: (120, 36),
+                plugin_dir: None,
+                wait_ms: super::super::live::DEFAULT_WAIT_MS,
             },
             Arc::new(Mutex::new(Trace::default())),
         )
@@ -611,6 +687,8 @@ mod tests {
             include_content: false,
             headless: true,
             size: (40, 10),
+            plugin_dir: None,
+            wait_ms: super::super::live::DEFAULT_WAIT_MS,
         };
         let error = match synthetic(&options, Arc::new(Mutex::new(Trace::default()))) {
             Ok(_) => panic!("viewless replay should fail"),
@@ -632,6 +710,8 @@ mod tests {
             include_content: true,
             headless: true,
             size: (40, 10),
+            plugin_dir: None,
+            wait_ms: super::super::live::DEFAULT_WAIT_MS,
         });
         assert!(result.is_err());
         assert_eq!(std::fs::read(existing).unwrap(), bytes);

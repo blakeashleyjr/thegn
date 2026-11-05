@@ -640,29 +640,7 @@ pub fn prepare_sandbox_env(
     }
     // Acquire the projection only after admission.
     let mut projection_lease: Option<ProjectionLease> = None;
-    // Provider file-sync (`data = "sync"` on a managed provider): push the local
-    // worktree into the sandbox fs before the pane execs (the pane runs IN the
-    // sandbox, so there's no local cwd override). Best-effort: a failure warns,
-    // never blocks the pane. Runs on a scoped thread with its own runtime so it
-    // is safe regardless of the caller's async context.
-    if env_data == thegn_core::config::DataMode::Sync
-        && matches!(placement, thegn_core::placement::Placement::Provider(_))
-        && let Some((provider, id, workdir)) = provider_sync_target(cfg, &env_name)
-    {
-        match block_on_provider(|| async {
-            provider
-                .upload_dir_with_baseline(&id, std::path::Path::new(worktree), &workdir)
-                .await
-        }) {
-            Ok(baseline) => {
-                register_provider_sync(worktree, &env_name, Some(std::sync::Arc::new(baseline)))
-            }
-            Err(e) => {
-                warnings.push(format!("provider sync upload failed: {e}"));
-                thegn_core::msg::warn(&format!("provider sync upload failed for {worktree}: {e}"));
-            }
-        }
-    }
+    let mut provider_sync_done = false;
     // Scope one probe pass over the whole backend-resolution walk (every
     // candidate's `resolve_placed` + the halt-path `placement_reachable` below).
     // Within it an unreachable placement is probed once per backend, not
@@ -711,6 +689,15 @@ pub fn prepare_sandbox_env(
                     &env_name,
                     &placement_label,
                 )?;
+                upload_provider_sync_once(
+                    cfg,
+                    env_data,
+                    &placement,
+                    &env_name,
+                    worktree,
+                    &mut provider_sync_done,
+                    &mut warnings,
+                );
                 if let Some(guard) = provisioned.take() {
                     guard.commit();
                 }
@@ -866,6 +853,15 @@ pub fn prepare_sandbox_env(
                     continue;
                 }
             }
+            upload_provider_sync_once(
+                cfg,
+                env_data,
+                &placement,
+                &env_name,
+                worktree,
+                &mut provider_sync_done,
+                &mut warnings,
+            );
             // Keep the final validation adjacent to the effects it protects:
             // VPN attachment and container ensure/exec are reached only after
             // the fully composed spec has passed the admission gate.
@@ -3902,6 +3898,54 @@ fn provider_sync_registry()
         std::sync::Mutex<std::collections::HashMap<String, ProviderSyncRecord>>,
     > = std::sync::OnceLock::new();
     REG.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+}
+
+/// Upload the local worktree into a provider sandbox for `data = "sync"`. Called
+/// only AFTER the launch is admitted, and at most once per resolution (`done`),
+/// so a refused or failed candidate never transmits the worktree.
+fn upload_provider_sync_once(
+    cfg: &Config,
+    env_data: thegn_core::config::DataMode,
+    placement: &thegn_core::placement::Placement,
+    env_name: &str,
+    worktree: &str,
+    done: &mut bool,
+    warnings: &mut Vec<String>,
+) {
+    if *done
+        || env_data != thegn_core::config::DataMode::Sync
+        || !matches!(placement, thegn_core::placement::Placement::Provider(_))
+    {
+        return;
+    }
+    *done = true;
+    #[cfg(test)]
+    provider_sync_attempts_for_test()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .push(worktree.to_string());
+    let Some((provider, id, workdir)) = provider_sync_target(cfg, env_name) else {
+        return;
+    };
+    match block_on_provider(|| async {
+        provider
+            .upload_dir_with_baseline(&id, std::path::Path::new(worktree), &workdir)
+            .await
+    }) {
+        Ok(baseline) => {
+            register_provider_sync(worktree, env_name, Some(std::sync::Arc::new(baseline)))
+        }
+        Err(e) => {
+            warnings.push(format!("provider sync upload failed: {e}"));
+            thegn_core::msg::warn(&format!("provider sync upload failed for {worktree}: {e}"));
+        }
+    }
+}
+
+#[cfg(test)]
+fn provider_sync_attempts_for_test() -> &'static std::sync::Mutex<Vec<String>> {
+    static LOG: std::sync::OnceLock<std::sync::Mutex<Vec<String>>> = std::sync::OnceLock::new();
+    LOG.get_or_init(Default::default)
 }
 
 fn register_provider_sync(
