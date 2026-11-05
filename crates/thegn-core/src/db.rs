@@ -231,7 +231,8 @@ mod db_open_memo;
 /// v105: ci_autofix_dedupe.attempt joins the primary key, the provider run attempt a CI autofix claim belongs to (THE-543).
 /// v106: workspace_clone_provenance, the credential-free origin, state and owner of each URL clone destination (THE-366).
 /// v107: merge_queue.landed_source_oid + landed_target_base_oid, the source tip and target base a drain landing folded and replaced (THE-401).
-pub const SCHEMA_VERSION: i64 = 107;
+/// v108: pr_queue.agent_outcome + agent_outcome_gen + agent_outcome_at, what the last PR-agent run did to the PR head, scoped to its lease generation (THE-549).
+pub const SCHEMA_VERSION: i64 = 108;
 
 /// Escape hatch for [`schema_refusal`] — set to `1`/`true` to run a build older
 /// than the on-disk schema anyway (read-only, as before). Deliberately awkward:
@@ -1831,6 +1832,7 @@ impl Db {
                     crate::db_migrate::verify_v105_schema(&conn)?;
                     crate::db_migrate::verify_v106_schema(&conn)?;
                     crate::db_migrate::verify_v107_schema(&conn)?;
+                    crate::db_migrate::verify_v108_schema(&conn)?;
                     Ok(())
                 };
                 if let Some(key) = verification_key {
@@ -2522,6 +2524,7 @@ impl Db {
         crate::db_migrate::migrate_v105(&conn)?;
         crate::db_migrate::migrate_v106(&conn)?;
         crate::db_migrate::migrate_v107(&conn)?;
+        crate::db_migrate::migrate_v108(&conn)?;
         if ver < SCHEMA_VERSION {
             crate::db_migrate::verify_v62_schema(&conn)?;
             crate::db_migrate::verify_v63_schema(&conn)?;
@@ -2567,6 +2570,7 @@ impl Db {
             crate::db_migrate::verify_v105_schema(&conn)?;
             crate::db_migrate::verify_v106_schema(&conn)?;
             crate::db_migrate::verify_v107_schema(&conn)?;
+            crate::db_migrate::verify_v108_schema(&conn)?;
         }
         // v69 is an authority ledger, not an optional cache. Verify its full
         // shape even on the fast/current-version path so a malformed table can
