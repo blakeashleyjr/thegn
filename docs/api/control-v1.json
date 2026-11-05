@@ -225,6 +225,49 @@
       ],
       "type": "object"
     },
+    "BridgeCounts": {
+      "properties": {
+        "calls": {
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "cancelled": {
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "closed_wakeups": {
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "late_replies": {
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "malformed": {
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "timed_out": {
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "calls",
+        "cancelled",
+        "closed_wakeups",
+        "late_replies",
+        "malformed",
+        "timed_out"
+      ],
+      "type": "object"
+    },
     "Busy": {
       "description": "Free/busy transparency.",
       "enum": [
@@ -1208,6 +1251,99 @@
       },
       "required": [
         "code"
+      ],
+      "type": "object"
+    },
+    "PluginStatusRow": {
+      "properties": {
+        "bridge": {
+          "$ref": "#/definitions/BridgeCounts"
+        },
+        "coalesced": {
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "in_flight": {
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "lost": {
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "plugin": {
+          "type": "string"
+        },
+        "queue_drops": {
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "rejected": {
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "timed_out": {
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "bridge",
+        "coalesced",
+        "in_flight",
+        "lost",
+        "plugin",
+        "queue_drops",
+        "rejected",
+        "timed_out"
+      ],
+      "type": "object"
+    },
+    "PluginsStatusReply": {
+      "description": "The `plugins.status` payload.",
+      "properties": {
+        "live": {
+          "description": "The process that wrote it (`pid`) is still running.",
+          "type": "boolean"
+        },
+        "pid": {
+          "default": null,
+          "format": "uint32",
+          "minimum": 0.0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "published": {
+          "description": "A valid snapshot file was found.",
+          "type": "boolean"
+        },
+        "published_at_ms": {
+          "default": null,
+          "format": "int64",
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "rows": {
+          "default": [],
+          "items": {
+            "$ref": "#/definitions/PluginStatusRow"
+          },
+          "type": "array"
+        }
+      },
+      "required": [
+        "live",
+        "published"
       ],
       "type": "object"
     },
@@ -2340,6 +2476,11 @@
       "path": "/v1/mcp_proxy/reload"
     },
     {
+      "cap": "plugins.status",
+      "method": "GET",
+      "path": "/v1/plugins/status"
+    },
+    {
       "cap": "calendar.events",
       "method": "GET",
       "path": "/v1/calendar/events"
@@ -2476,6 +2617,12 @@
     },
     "PairBody": {
       "$ref": "#/definitions/PairBody"
+    },
+    "PluginStatusRow": {
+      "$ref": "#/definitions/PluginStatusRow"
+    },
+    "PluginsStatusReply": {
+      "$ref": "#/definitions/PluginsStatusReply"
     },
     "PrStatusRow": {
       "$ref": "#/definitions/PrStatusRow"
