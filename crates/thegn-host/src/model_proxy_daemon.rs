@@ -1674,6 +1674,17 @@ mod tests {
         let mut stdout = child.stdout.take().expect("capture fixture stdout");
         std::io::Read::read_to_end(&mut stdout, &mut Vec::new())
             .expect("wait for fixture child stdout to close");
+        let exit_deadline = std::time::Instant::now() + Duration::from_secs(30);
+        loop {
+            if child.try_wait().expect("poll fixture child exit").is_some() {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < exit_deadline,
+                "fixture child did not exit before reap deadline"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
         *SPAWNED
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(child);

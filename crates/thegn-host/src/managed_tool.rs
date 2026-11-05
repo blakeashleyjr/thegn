@@ -2886,11 +2886,16 @@ mod tests {
 
     #[test]
     fn flood_is_bounded_and_child_completes() {
+        let limits = Limits {
+            timeout: Duration::from_secs(60),
+            term_grace: fast().term_grace,
+            read_grace: Duration::from_secs(60),
+        };
         let r = run_bounded(
             &mut sh(
                 "head -c 6000000 /dev/zero | tr '\\0' x; head -c 3000000 /dev/zero | tr '\\0' y >&2",
             ),
-            fast(),
+            limits,
             false,
         )
         .expect("flooding child still succeeds");
