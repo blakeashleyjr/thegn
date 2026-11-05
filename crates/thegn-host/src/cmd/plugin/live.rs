@@ -180,7 +180,8 @@ fn preview_value(dir: &Path, size: (u16, u16), wait: Duration) -> Result<Value> 
                 // The preview has finished receiving events.
             }
         },
-    )?;
+    )
+    .map_err(anyhow::Error::msg)?;
     let writer = session.writer();
     let result = (|| {
         let granted = if plugin
