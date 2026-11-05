@@ -816,6 +816,36 @@ pub const CATALOG: &[Slot] = &[
         SourceKind::Reserved(Reserved::Issue),
     ),
     slot(
+        "issue tracker get",
+        "id",
+        SourceKind::Reserved(Reserved::Issue),
+    ),
+    slot("issue tracker get", "account", SourceKind::Structural),
+    slot(
+        "issue tracker update",
+        "id",
+        SourceKind::Reserved(Reserved::Issue),
+    ),
+    slot("issue tracker update", "account", SourceKind::Structural),
+    slot("issue tracker update", "status", SourceKind::Structural),
+    slot("issue tracker update", "priority", SourceKind::Structural),
+    slot(
+        "issue tracker update",
+        "title",
+        SourceKind::Reserved(Reserved::Freeform),
+    ),
+    slot(
+        "issue tracker comment",
+        "id",
+        SourceKind::Reserved(Reserved::Issue),
+    ),
+    slot("issue tracker comment", "account", SourceKind::Structural),
+    slot(
+        "issue tracker comment",
+        "body",
+        SourceKind::Reserved(Reserved::Freeform),
+    ),
+    slot(
         "wt new",
         "from_issue",
         SourceKind::Reserved(Reserved::Issue),

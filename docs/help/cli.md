@@ -70,6 +70,14 @@ also accept `account` (HTTP `?account=<name>`) to route an issue to the named
 `<provider>:<key>`; without it, existing prefix routing applies. An unknown or
 invalid account is rejected before any tracker call.
 
+The CLI reaches the same exact-account routing with `thegn issue tracker
+get|update|comment <id> --account <name>` for tracker issues (the id is the
+`<provider>:<key>` that `issue list --status --json` prints; `--account` is
+required). `update` takes `--status`, `--title`, `--priority` and
+`--assign-me`/`--unassign-me`; `comment` takes the body. Plugin issue providers
+are served only by the running UI. The forge verbs `issue view` and
+`issue comment <number>` are unchanged.
+
 The multi-repo group commands use the canonical `thegn program` namespace.
 `thegn project` remains a deprecated, behavior-identical alias for three
 stable releases and warns with the replacement. Likewise, `wt new --program`
