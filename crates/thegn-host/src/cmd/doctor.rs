@@ -292,8 +292,8 @@ fn stage_worker_readiness(
     mounts: &[thegn_core::sandbox::Mount],
     worktree: &std::path::Path,
     git_common_dir: Option<&std::path::Path>,
-    callback_ok: bool,
-    linux_host: bool,
+    callback: (bool, bool),
+    provider_home: (Option<&std::path::Path>, bool),
 ) -> thegn_core::sandbox_worker_ready::WorkerReadiness {
     use thegn_core::sandbox_worker_ready::{CallbackBinary, WorkerFacts, classify_worker};
 
@@ -303,18 +303,18 @@ fn stage_worker_readiness(
         (Backend::None, &[][..])
     };
     let facts = WorkerFacts {
-        linux_host,
+        linux_host: callback.1,
         backend,
         mounts,
         worktree,
         git_common_dir,
-        callback: if callback_ok {
+        callback: if callback.0 {
             CallbackBinary::Present
         } else {
             CallbackBinary::Missing
         },
-        provider_home: None,
-        provider_home_exists: true,
+        provider_home: provider_home.0,
+        provider_home_exists: provider_home.1,
     };
     classify_worker(&facts)
 }
@@ -357,6 +357,38 @@ fn worker_readiness_line(
     }
 }
 
+fn stage_provider_homes(cfg: &Config) -> Vec<(String, std::path::PathBuf)> {
+    let home_vars = thegn_core::account::providers()
+        .iter()
+        .map(|provider| provider.home_env)
+        .filter(|env| !env.is_empty())
+        .collect::<Vec<&str>>();
+    let mut homes = Vec::new();
+
+    for stage in &cfg.pipeline.stages {
+        let Ok(effective) =
+            thegn_core::agent_task::effective_agent(cfg, &stage.agent, Some(&stage.name))
+        else {
+            continue;
+        };
+        for home in thegn_core::sandbox_worker_ready::relocated_provider_homes(
+            &effective.expanded_env(),
+            &home_vars,
+        ) {
+            homes.push((stage.name.clone(), home));
+        }
+    }
+
+    homes
+}
+
+fn provider_home_line(stage: &str, home: &std::path::Path) -> String {
+    format!(
+        "  NOT READY     stage worker: provider-home-unavailable — stage `{stage}` relocates its credential home to `{}`, which is missing or not a directory",
+        home.display()
+    )
+}
+
 fn stage_worker_readiness_report(cfg: &Config) {
     if cfg.pipeline.stages.is_empty() {
         return;
@@ -388,9 +420,29 @@ fn stage_worker_readiness_report(cfg: &Config) {
         mounts,
         &worktree,
         git_common_dir.as_deref(),
-        callback_ok,
-        linux_host,
+        (callback_ok, linux_host),
+        (None, true),
     );
+    if !readiness.is_ready() {
+        outln!("{}", worker_readiness_line(readiness, backend));
+        return;
+    }
+    for (stage, home) in stage_provider_homes(cfg) {
+        let carved = thegn_core::sandbox_worker_ready::with_provider_home_mount(mounts, &home);
+        let readiness = stage_worker_readiness(
+            cfg.sandbox.enabled,
+            backend,
+            &carved,
+            &worktree,
+            git_common_dir.as_deref(),
+            (callback_ok, linux_host),
+            (Some(&home), home.is_dir()),
+        );
+        if !readiness.is_ready() {
+            outln!("{}", provider_home_line(&stage, &home));
+            return;
+        }
+    }
     outln!("{}", worker_readiness_line(readiness, backend));
 }
 
@@ -6076,8 +6128,8 @@ agent = "unsafe"
                 &[],
                 std::path::Path::new("/w/t"),
                 None,
-                true,
-                true,
+                (true, true),
+                (None, true),
             ),
             thegn_core::sandbox_worker_ready::WorkerReadiness::ContainmentAbsent
         );
@@ -6092,8 +6144,8 @@ agent = "unsafe"
                 &[],
                 std::path::Path::new("/w/t"),
                 None,
-                true,
-                false,
+                (true, false),
+                (None, true),
             ),
             thegn_core::sandbox_worker_ready::WorkerReadiness::UnsupportedPlatform
         );
@@ -6122,8 +6174,8 @@ agent = "unsafe"
                 &mounts,
                 std::path::Path::new("/w/t"),
                 Some(std::path::Path::new("/g/c")),
-                true,
-                true,
+                (true, true),
+                (None, true),
             ),
             thegn_core::sandbox_worker_ready::WorkerReadiness::Ready
         );
@@ -6153,8 +6205,8 @@ agent = "unsafe"
                 &mounts,
                 std::path::Path::new("/w/t"),
                 git_dir,
-                false,
-                true,
+                (false, true),
+                (None, true),
             ),
             thegn_core::sandbox_worker_ready::WorkerReadiness::CannotWriteGitMetadata
         );
@@ -6173,8 +6225,8 @@ agent = "unsafe"
                 &writable_mounts,
                 std::path::Path::new("/w/t"),
                 git_dir,
-                false,
-                true,
+                (false, true),
+                (None, true),
             ),
             thegn_core::sandbox_worker_ready::WorkerReadiness::CallbackUnavailable
         );
@@ -6189,11 +6241,103 @@ agent = "unsafe"
                 &[],
                 std::path::Path::new("/w/t"),
                 None,
-                true,
-                true,
+                (true, true),
+                (None, true),
             ),
             thegn_core::sandbox_worker_ready::WorkerReadiness::UnsupportedBackend
         );
+    }
+
+    #[test]
+    fn stage_provider_homes_follow_each_stages_effective_agent_env() {
+        let cfg: Config = toml::from_str(
+            r#"
+[[agents]]
+name = "codex-agent"
+command = "codex"
+env = { CODEX_HOME = "/pipeline/codex-home" }
+
+[[agents]]
+name = "plain-agent"
+command = "claude"
+
+[[pipeline.stages]]
+name = "coder"
+agent = "codex-agent"
+
+[[pipeline.stages]]
+name = "reviewer"
+agent = "plain-agent"
+"#,
+        )
+        .unwrap();
+
+        assert_eq!(
+            stage_provider_homes(&cfg),
+            vec![(
+                "coder".to_owned(),
+                std::path::PathBuf::from("/pipeline/codex-home"),
+            )]
+        );
+    }
+
+    #[test]
+    fn stage_worker_readiness_reports_a_missing_provider_home_and_accepts_an_existing_one() {
+        let mounts = [
+            thegn_core::sandbox::Mount {
+                host: "/w/t".into(),
+                dest: "/w/t".into(),
+                ro: false,
+                cache: false,
+            },
+            thegn_core::sandbox::Mount {
+                host: "/g/c".into(),
+                dest: "/g/c".into(),
+                ro: false,
+                cache: false,
+            },
+        ];
+        let worktree = std::path::Path::new("/w/t");
+        let git_common_dir = Some(std::path::Path::new("/g/c"));
+        let home = std::path::Path::new("/provider/home");
+        let missing = stage_worker_readiness(
+            true,
+            Backend::Bwrap,
+            &mounts,
+            worktree,
+            git_common_dir,
+            (true, true),
+            (Some(home), false),
+        );
+        let carved = thegn_core::sandbox_worker_ready::with_provider_home_mount(&mounts, home);
+        let existing = stage_worker_readiness(
+            true,
+            Backend::Bwrap,
+            &carved,
+            worktree,
+            git_common_dir,
+            (true, true),
+            (Some(home), true),
+        );
+
+        assert_eq!(
+            missing,
+            thegn_core::sandbox_worker_ready::WorkerReadiness::ProviderHomeUnavailable
+        );
+        assert_eq!(
+            existing,
+            thegn_core::sandbox_worker_ready::WorkerReadiness::Ready
+        );
+    }
+
+    #[test]
+    fn provider_home_line_names_the_stage_and_the_home_and_is_not_a_pass() {
+        let line = provider_home_line("coder", std::path::Path::new("/provider/home"));
+
+        assert!(line.starts_with("  NOT READY"), "{line}");
+        assert!(line.contains("coder"), "{line}");
+        assert!(line.contains("/provider/home"), "{line}");
+        assert!(line.contains("provider-home-unavailable"), "{line}");
     }
 
     #[test]
