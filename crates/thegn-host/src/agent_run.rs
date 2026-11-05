@@ -599,6 +599,64 @@ fn provision_dispatch(
     }
 }
 
+/// The git common dir to require writable for a queue agent, or `None` when a
+/// main checkout's worktree mount already covers it.
+fn queue_git_common_dir(worktree: &std::path::Path) -> Option<std::path::PathBuf> {
+    let common = thegn_core::util::git_common_dir(worktree);
+    (!common.starts_with(worktree)).then_some(common)
+}
+
+/// Why a queue agent must be held because its composed sandbox cannot write
+/// the worktree or Git metadata, if so.
+fn queue_worker_hold(
+    spec: &thegn_core::sandbox::SandboxSpec,
+    git_common_dir: Option<&std::path::Path>,
+) -> Option<String> {
+    use thegn_core::sandbox_worker_ready::{
+        CallbackBinary, WorkerFacts, classify_worker, launch_hold_reason,
+    };
+
+    if !spec.placement.is_local() {
+        return None;
+    }
+    let readiness = classify_worker(&WorkerFacts {
+        linux_host: cfg!(target_os = "linux"),
+        backend: spec.backend,
+        mounts: &spec.mounts,
+        worktree: &spec.worktree,
+        git_common_dir,
+        callback: CallbackBinary::Present,
+        provider_home: None,
+        provider_home_exists: true,
+    });
+    launch_hold_reason(readiness).map(|reason| {
+        format!(
+            "queue agent held: stage-worker readiness `{}` for {} (backend `{}`): {reason}; fix the sandbox mounts (see `thegn doctor`); the branch was not marked failed",
+            readiness.as_str(),
+            spec.worktree.display(),
+            spec.backend.label()
+        )
+    })
+}
+
+/// Turn a runnable sandboxed dispatch into an infrastructure hold when its
+/// composed sandbox cannot write. Host dispatches and existing holds pass through.
+fn hold_unready_worker(dispatch: AgentDispatch) -> AgentDispatch {
+    let hold = match &dispatch {
+        AgentDispatch::Run(Some(spec)) | AgentDispatch::RunDegraded(Some(spec), _) => {
+            let common = queue_git_common_dir(&spec.worktree);
+            queue_worker_hold(spec, common.as_deref())
+        }
+        AgentDispatch::Run(None)
+        | AgentDispatch::RunDegraded(None, _)
+        | AgentDispatch::InfraHold(_) => None,
+    };
+    match hold {
+        Some(reason) => AgentDispatch::InfraHold(reason),
+        None => dispatch,
+    }
+}
+
 fn compose_unverified_warning(
     spec: &thegn_core::sandbox::SandboxSpec,
     report: &thegn_core::sandbox_compose::EnsureReport,
@@ -754,14 +812,14 @@ fn agent_floor_gate_with_effective(
         AgentGate::RunDegraded(w) => AgentDispatch::RunDegraded(Some(spec), w),
         AgentGate::InfraHold(r) => AgentDispatch::InfraHold(r),
     };
-    provision_dispatch(dispatch, &|spec| {
+    hold_unready_worker(provision_dispatch(dispatch, &|spec| {
         let report =
             thegn_core::sandbox::ensure_attested(spec, &crate::daemon::compose_guard(&full.daemon))
                 .map_err(|error| thegn_core::sandbox::refusal_context(&error))?;
         let warning = compose_unverified_warning(spec, &report);
         thegn_core::sandbox_preflight::preflight_exec(spec)?;
         Ok(warning)
-    })
+    }))
 }
 
 fn stricter_agent_gate(
@@ -2125,6 +2183,105 @@ mod tests {
         });
         assert!(matches!(dispatch, AgentDispatch::InfraHold(reason) if reason.contains("VPN")));
         assert_eq!(calls.get(), 0);
+    }
+
+    fn worker_spec(mounts: Vec<thegn_core::sandbox::Mount>) -> thegn_core::sandbox::SandboxSpec {
+        let mut spec = sandbox_spec();
+        spec.worktree = std::path::PathBuf::from("/work/tree");
+        spec.mounts = mounts;
+        spec
+    }
+
+    fn rw(dest: &str, ro: bool) -> thegn_core::sandbox::Mount {
+        thegn_core::sandbox::Mount {
+            host: dest.into(),
+            dest: dest.into(),
+            ro,
+            cache: false,
+        }
+    }
+
+    #[test]
+    fn queue_worker_hold_passes_a_writable_worktree_and_git_dir() {
+        let spec = worker_spec(vec![rw("/work/tree", false), rw("/git/common", false)]);
+        assert_eq!(
+            queue_worker_hold(&spec, Some(std::path::Path::new("/git/common"))),
+            None
+        );
+    }
+
+    #[test]
+    fn queue_worker_hold_reports_a_read_only_git_dir() {
+        if !cfg!(target_os = "linux") {
+            return;
+        }
+        let spec = worker_spec(vec![rw("/work/tree", false), rw("/git/common", true)]);
+        let reason = queue_worker_hold(&spec, Some(std::path::Path::new("/git/common"))).unwrap();
+        assert!(reason.contains("cannot-write-git-metadata"));
+        assert!(reason.contains("bwrap"));
+    }
+
+    #[test]
+    fn queue_worker_hold_reports_a_read_only_worktree() {
+        if !cfg!(target_os = "linux") {
+            return;
+        }
+        let spec = worker_spec(vec![rw("/work/tree", true)]);
+        let reason = queue_worker_hold(&spec, None).unwrap();
+        assert!(reason.contains("cannot-write-worktree"));
+    }
+
+    #[test]
+    fn queue_worker_hold_ignores_a_main_checkout_git_dir() {
+        let spec = worker_spec(vec![rw("/work/tree", false)]);
+        assert_eq!(queue_worker_hold(&spec, None), None);
+    }
+
+    #[test]
+    fn queue_worker_hold_never_holds_an_unsupported_backend() {
+        let spec = thegn_core::sandbox::SandboxSpec {
+            backend: thegn_core::sandbox::Backend::Systemd,
+            ..worker_spec(vec![rw("/work/tree", true)])
+        };
+        assert_eq!(queue_worker_hold(&spec, None), None);
+    }
+
+    #[test]
+    fn queue_worker_hold_converts_runnable_dispatches_to_infra_holds() {
+        if !cfg!(target_os = "linux") {
+            return;
+        }
+        let plain = hold_unready_worker(AgentDispatch::Run(Some(worker_spec(vec![rw(
+            "/work/tree",
+            true,
+        )]))));
+        assert!(
+            matches!(plain, AgentDispatch::InfraHold(reason) if reason.contains("queue agent held"))
+        );
+
+        let degraded = hold_unready_worker(AgentDispatch::RunDegraded(
+            Some(worker_spec(vec![rw("/work/tree", true)])),
+            "warning".into(),
+        ));
+        assert!(
+            matches!(degraded, AgentDispatch::InfraHold(reason) if reason.contains("queue agent held"))
+        );
+    }
+
+    #[test]
+    fn queue_worker_hold_passes_host_dispatch_and_existing_holds_through() {
+        assert!(matches!(
+            hold_unready_worker(AgentDispatch::Run(None)),
+            AgentDispatch::Run(None)
+        ));
+        assert!(matches!(
+            hold_unready_worker(AgentDispatch::RunDegraded(None, "warning".into())),
+            AgentDispatch::RunDegraded(None, warning) if warning == "warning"
+        ));
+        assert!(matches!(
+            hold_unready_worker(AgentDispatch::InfraHold("existing".into())),
+            AgentDispatch::InfraHold(reason) if reason == "existing"
+        ));
     }
 
     #[test]
