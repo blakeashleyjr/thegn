@@ -88,6 +88,31 @@ pub fn classify_worker(facts: &WorkerFacts<'_>) -> WorkerReadiness {
     WorkerReadiness::Ready
 }
 
+/// Why a queued launch must be held for this readiness, or `None` to run it.
+/// Only prerequisites the launch itself controls hold. Containment and
+/// unsupported platform/backend outcomes are decided by the isolation-floor
+/// gate (or are not proven), so they do not hold here.
+pub fn launch_hold_reason(readiness: WorkerReadiness) -> Option<&'static str> {
+    match readiness {
+        WorkerReadiness::Ready
+        | WorkerReadiness::ContainmentAbsent
+        | WorkerReadiness::UnsupportedPlatform
+        | WorkerReadiness::UnsupportedBackend => None,
+        WorkerReadiness::CannotWriteWorktree => {
+            Some("the worktree is not a writable mount in the composed sandbox")
+        }
+        WorkerReadiness::CannotWriteGitMetadata => Some(
+            "the git common dir is not a writable mount in the composed sandbox, so the agent could not commit",
+        ),
+        WorkerReadiness::CallbackUnavailable => {
+            Some("the thegn binary was replaced or removed since launch")
+        }
+        WorkerReadiness::ProviderHomeUnavailable => {
+            Some("the provider home is missing or not writable")
+        }
+    }
+}
+
 /// Absolute credential-home directories an agent's expanded env relocates.
 /// Values are `~`-expanded, kept in env order, and deduplicated. Relative or
 /// unset values do not relocate a home. This mirrors the host launch's
@@ -151,8 +176,8 @@ mod tests {
     use crate::sandbox::{Backend, Mount};
 
     use super::{
-        CallbackBinary, WorkerFacts, WorkerReadiness, classify_worker, relocated_provider_homes,
-        with_provider_home_mount, writable,
+        CallbackBinary, WorkerFacts, WorkerReadiness, classify_worker, launch_hold_reason,
+        relocated_provider_homes, with_provider_home_mount, writable,
     };
 
     fn m(dest: &str, ro: bool) -> Mount {
@@ -512,5 +537,40 @@ mod tests {
             assert_eq!(state.as_str(), *expected_label);
             assert_eq!(state.is_ready(), *state == WorkerReadiness::Ready);
         }
+    }
+
+    #[test]
+    fn launch_hold_holds_only_launch_controlled_failures() {
+        for readiness in [
+            WorkerReadiness::Ready,
+            WorkerReadiness::ContainmentAbsent,
+            WorkerReadiness::UnsupportedPlatform,
+            WorkerReadiness::UnsupportedBackend,
+        ] {
+            assert_eq!(launch_hold_reason(readiness), None);
+        }
+        for readiness in [
+            WorkerReadiness::CannotWriteWorktree,
+            WorkerReadiness::CannotWriteGitMetadata,
+            WorkerReadiness::CallbackUnavailable,
+            WorkerReadiness::ProviderHomeUnavailable,
+        ] {
+            assert!(launch_hold_reason(readiness).is_some_and(|reason| !reason.is_empty()));
+        }
+    }
+
+    #[test]
+    fn launch_hold_texts_are_distinct() {
+        let reasons = [
+            launch_hold_reason(WorkerReadiness::CannotWriteWorktree).unwrap(),
+            launch_hold_reason(WorkerReadiness::CannotWriteGitMetadata).unwrap(),
+            launch_hold_reason(WorkerReadiness::CallbackUnavailable).unwrap(),
+            launch_hold_reason(WorkerReadiness::ProviderHomeUnavailable).unwrap(),
+        ];
+
+        for (index, reason) in reasons.iter().enumerate() {
+            assert!(!reasons[..index].contains(reason));
+        }
+        assert!(reasons[1].contains("commit"));
     }
 }
