@@ -9,6 +9,65 @@ All notable changes to **thegn** are documented here. The format follows
 
 ## [0.1.0-alpha.55] — 2026-11-05
 
+### Added
+
+- `thegn merge list` shows a landed row's source tip, target base and result
+  OID; `--json` adds a `landed` object. Rows landed by `thegn land` or before
+  this release show only what was recorded.
+- `thegn theme rename OLD NEW` moves a local theme to a new name. It refuses
+  built-ins, the selected theme, a name already in use, or one that maps to
+  the same file.
+- `thegn plugin preview --plugin-dir <DIR> --record <FILE>` writes a
+  metadata-only trace of the live session to a new owner-only file, capped at
+  8 MiB. Headless and interactive previews both support it.
+- The control API's `dispatches.put` and `dispatches.set_status` accept an
+  optional `lead` proof (`lease`, `owner`, and optional `lease_gen`) for rows
+  bound to a live Lead lease; requests without it keep their previous behavior.
+- After each PR agent run, pass warnings say whether the agent changed nothing,
+  committed locally without pushing, or another person pushed meanwhile.
+- The status modal's plugins section adds a `bridge` column for provider-bridge
+  timeout, cancel, late, malformed and closed counters.
+- The Home Manager module adds null-default `programs.thegn.git*` options for
+  `[git]` scalars and `programs.thegn.stats*` options for `[stats]` icons and
+  the disk path: `gitOverrideGpg`, `gitMergeGuard`, `gitAutoFetch`,
+  `gitAutoFetchIntervalSecs`, `gitAutoFetchMinIntervalSecs`,
+  `gitAutoFetchNotify`, `gitAutoFetchColocated`, `statsCpuIcon`,
+  `statsMemIcon`, `statsNetIcon`, `statsGpuIcon`, `statsTempIcon`,
+  `statsSwapIcon`, `statsFreqIcon`, `statsLoadIcon`, `statsUptimeIcon`,
+  `statsBatteryIcon`, `statsBatteryChargingIcon`, `statsDiskIcon` and
+  `statsDiskPath`.
+- Tracker issue detail JSON includes `labels_complete`: it is `false` when a
+  label list is truncated and `true` when the list is complete.
+
+### Changed
+
+- A queue agent whose sandbox cannot write the worktree or Git metadata is held
+  with `cannot-write-worktree` or `cannot-write-git-metadata` instead of being
+  started and failing.
+- On startup, a saved `starting` share whose process exited becomes `failed`,
+  and an `up` share that could not restart becomes `unknown`; `thegn share list`
+  shows `(needs reconcile)` for the latter.
+- A damaged CalDAV resource fails the whole sync page, leaving existing events
+  and the sync position untouched. A sync pass is bounded at ten minutes, and
+  accounts still fetching are reported as timed out.
+- The state database schema is now v108. The migration adds PR-queue agent
+  outcome, generation and timestamp columns. Restart the host and daemon after
+  upgrading so they use the migrated database.
+
+### Fixed
+
+- The devcontainer image tag covers build-context files, so editing one rebuilds
+  the image; the first launch after upgrading rebuilds once. If the bounded
+  context digest fails, the warning explains that the tag falls back to the
+  Dockerfile (when readable) and build declaration.
+- A clone still recorded as `cloning` after its process exits is marked
+  `abandoned` at the next start.
+
+### Security
+
+- A projection mount refuses refresh and unmount if another thegn replaced its
+  ownership record after this process mounted it.
+
 ## [0.1.0-alpha.54] — 2026-11-05 (maintenance batch 92)
 
 ### Added
