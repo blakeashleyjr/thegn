@@ -2346,6 +2346,51 @@ pub(crate) fn verify_v105_schema(conn: &Connection) -> Result<()> {
     Ok(())
 }
 
+/// v106: workspace_clone_provenance (THE-366).
+pub(crate) fn migrate_v106(conn: &Connection) -> Result<()> {
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS workspace_clone_provenance (
+             dest TEXT PRIMARY KEY,
+             canonical_origin TEXT NOT NULL,
+             label TEXT NOT NULL,
+             state TEXT NOT NULL CHECK (state IN ('cloning','complete','abandoned')),
+             clone_pid INTEGER,
+             thegn_version TEXT NOT NULL,
+             started_at INTEGER NOT NULL,
+             validated_at INTEGER
+         );
+         CREATE INDEX IF NOT EXISTS idx_workspace_clone_provenance_started
+             ON workspace_clone_provenance(started_at);",
+    )?;
+    Ok(())
+}
+
+pub(crate) fn verify_v106_schema(conn: &Connection) -> Result<()> {
+    for column in [
+        "dest",
+        "canonical_origin",
+        "label",
+        "state",
+        "clone_pid",
+        "thegn_version",
+        "started_at",
+        "validated_at",
+    ] {
+        if !has_column(conn, "workspace_clone_provenance", column) {
+            bail!("schema v106 migration did not add workspace_clone_provenance.{column}");
+        }
+    }
+    let index_exists: i64 = conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='index' AND name=?1)",
+        ["idx_workspace_clone_provenance_started"],
+        |row| row.get(0),
+    )?;
+    if index_exists == 0 {
+        bail!("schema v106 migration did not add idx_workspace_clone_provenance_started");
+    }
+    Ok(())
+}
+
 /// Verify the v69 identity ledger before the schema version is stamped. A
 /// missing column/table must never look like a completed migration.
 pub(crate) fn verify_v69_schema(conn: &Connection) -> Result<()> {
@@ -4236,7 +4281,6 @@ mod tests {
             .pragma_query_value(None, "user_version", |row| row.get(0))
             .unwrap();
         assert_eq!(version, crate::db::SCHEMA_VERSION);
-        assert_eq!(version, 105);
         let legacy: (i64, String, i64) = upgraded
             .conn()
             .query_row(
@@ -4262,6 +4306,68 @@ mod tests {
         assert!(upgraded.claim_ci_autofix(&known).unwrap());
         assert!(!upgraded.claim_ci_autofix(&known).unwrap());
         super::verify_v105_schema(upgraded.conn()).unwrap();
+    }
+
+    #[test]
+    fn v106_creates_workspace_clone_provenance_idempotently_and_verifies() {
+        let fresh = Db::open_memory().unwrap();
+        super::verify_v106_schema(fresh.conn()).unwrap();
+
+        let conn = Connection::open_in_memory().unwrap();
+        assert!(super::verify_v106_schema(&conn).is_err());
+        super::migrate_v106(&conn).unwrap();
+        super::migrate_v106(&conn).unwrap();
+        super::verify_v106_schema(&conn).unwrap();
+        conn.execute_batch("DROP INDEX idx_workspace_clone_provenance_started;")
+            .unwrap();
+        assert!(super::verify_v106_schema(&conn).is_err());
+        super::migrate_v106(&conn).unwrap();
+        super::verify_v106_schema(&conn).unwrap();
+        assert!(
+            conn.execute(
+                "INSERT INTO workspace_clone_provenance
+                (dest, canonical_origin, label, state, thegn_version, started_at)
+             VALUES ('/a','ssh://h/o/r','r','bogus','0',1)",
+                [],
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn v106_upgrades_a_real_v105_database() {
+        use crate::db_clone_provenance::NewCloneProvenance;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("v105.db");
+        {
+            let db = Db::open_at(&path).unwrap();
+            db.conn()
+                .execute_batch("DROP TABLE workspace_clone_provenance; PRAGMA user_version=105;")
+                .unwrap();
+        }
+        let upgraded = Db::open_at(&path).unwrap();
+        let version: i64 = upgraded
+            .conn()
+            .pragma_query_value(None, "user_version", |row| row.get(0))
+            .unwrap();
+        assert_eq!(version, crate::db::SCHEMA_VERSION);
+        assert_eq!(version, 106);
+        super::verify_v106_schema(upgraded.conn()).unwrap();
+        assert!(
+            upgraded
+                .begin_clone_provenance(
+                    &NewCloneProvenance {
+                        dest: "/ws/r",
+                        canonical_origin: "https://example.com/o/r",
+                        label: "r",
+                        clone_pid: 7,
+                        thegn_version: "0",
+                    },
+                    &|_| false,
+                )
+                .unwrap()
+        );
     }
 
     #[test]
