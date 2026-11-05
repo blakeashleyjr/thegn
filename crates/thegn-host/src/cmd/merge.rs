@@ -1907,6 +1907,24 @@ mod list_claim_tests {
     }
 
     #[test]
+    fn listed_row_json_carries_identity_drift() {
+        let mut fixture_row = row();
+        fixture_row.error_detail = Some(thegn_core::merge_identity_drift::candidate_drift_detail(
+            "r",
+        ));
+        let view = claim_view("claimed_no_child", Some(101));
+        let listed = ListedRow {
+            row: &fixture_row,
+            claim: claim_json(Some(&view), 100),
+            landed: None,
+        };
+
+        let value = serde_json::to_value(listed).unwrap();
+        assert_eq!(value["identity_drift"]["reason"], "r");
+        assert_eq!(value["claim"]["phase"], "claimed_no_child");
+    }
+
+    #[test]
     fn claim_suffix_names_owner_phase_and_lease() {
         assert_eq!(claim_suffix(None, 1_000), "");
         let live = ClaimJson {
