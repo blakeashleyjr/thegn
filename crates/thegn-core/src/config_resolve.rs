@@ -1074,6 +1074,7 @@ pub fn summarize_events(events: &[ClampEvent]) -> Vec<String> {
 
 use crate::config::Config;
 use crate::env::Environment;
+use crate::git_run::{GitOutcome, GitTextError};
 use crate::remote::GitLoc;
 use std::path::Path;
 
@@ -1270,12 +1271,50 @@ fn worktree_on_primary_branch(repo_root: &Path, worktree: &Path, loc: &GitLoc) -
     if !matches!(loc, GitLoc::Local(_)) {
         return false;
     }
-    let Some(branch) =
-        crate::util::git_out(worktree, &["symbolic-ref", "--quiet", "--short", "HEAD"])
-    else {
-        return false; // detached HEAD / not a checkout ⇒ not primary
+    let head = GitLoc::Local(worktree.to_path_buf()).git_text(&[
+        "symbolic-ref",
+        "--quiet",
+        "--short",
+        "HEAD",
+    ]);
+    let default_branch = if head.as_ref().is_ok_and(|branch| !branch.is_empty()) {
+        crate::worktree::default_branch_checked(repo_root)
+    } else {
+        Ok(String::new())
     };
-    branch.trim() == crate::worktree::default_branch(repo_root).trim()
+    match primary_branch_verdict(head, default_branch) {
+        Ok(verdict) => verdict,
+        Err(why) => {
+            tracing::warn!(target: "thegn::config", "primary-branch check failed, treating the worktree as a feature branch: {why}");
+            false
+        }
+    }
+}
+
+fn head_is_detached(error: &GitTextError) -> bool {
+    matches!(
+        error,
+        GitTextError::Failed(GitOutcome::Exit {
+            code: Some(1),
+            stderr_tail,
+        }) if stderr_tail.is_empty()
+    )
+}
+
+fn primary_branch_verdict(
+    head: Result<String, GitTextError>,
+    default_branch: Result<String, String>,
+) -> Result<bool, String> {
+    let branch = match head {
+        Ok(branch) => branch,
+        Err(error) if head_is_detached(&error) => return Ok(false),
+        Err(error) => return Err(format!("could not read HEAD of the worktree: {error}")),
+    };
+    if branch.is_empty() {
+        return Ok(false);
+    }
+    let default_branch = default_branch?;
+    Ok(branch.trim() == default_branch.trim())
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1812,6 +1851,70 @@ mod tests {
 
     fn overlay() -> SandboxOverlay {
         SandboxOverlay::default()
+    }
+
+    #[test]
+    fn primary_branch_verdict_matches_head_against_the_default_branch() {
+        assert_eq!(
+            primary_branch_verdict(Ok("main".into()), Ok("main".into())),
+            Ok(true)
+        );
+        assert_eq!(
+            primary_branch_verdict(Ok(" main ".into()), Ok("main".into())),
+            Ok(true)
+        );
+        assert_eq!(
+            primary_branch_verdict(Ok("feature".into()), Ok("main".into())),
+            Ok(false)
+        );
+    }
+
+    #[test]
+    fn primary_branch_verdict_treats_a_detached_head_as_not_primary_without_needing_a_default() {
+        let head = Err(GitTextError::Failed(GitOutcome::Exit {
+            code: Some(1),
+            stderr_tail: String::new(),
+        }));
+        assert_eq!(primary_branch_verdict(head, Err("boom".into())), Ok(false));
+    }
+
+    #[test]
+    fn primary_branch_verdict_refuses_an_unreadable_head() {
+        let timeout = primary_branch_verdict(
+            Err(GitTextError::Failed(GitOutcome::Timeout)),
+            Ok("main".into()),
+        );
+        assert!(timeout.is_err_and(|why| why.contains("could not read HEAD")));
+
+        assert!(
+            primary_branch_verdict(Err(GitTextError::InvalidUtf8), Ok("main".into()),).is_err()
+        );
+        assert!(
+            primary_branch_verdict(
+                Err(GitTextError::Failed(GitOutcome::Exit {
+                    code: Some(128),
+                    stderr_tail: "fatal: not a git repository".into(),
+                })),
+                Ok("main".into()),
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn primary_branch_verdict_surfaces_an_unreadable_default_branch() {
+        assert_eq!(
+            primary_branch_verdict(Ok("main".into()), Err("could not read origin HEAD".into())),
+            Err("could not read origin HEAD".into())
+        );
+    }
+
+    #[test]
+    fn primary_branch_verdict_empty_head_is_not_primary() {
+        assert_eq!(
+            primary_branch_verdict(Ok(String::new()), Ok("main".into())),
+            Ok(false)
+        );
     }
 
     #[test]
