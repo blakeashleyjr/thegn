@@ -92,9 +92,24 @@ pub(crate) fn outcome_warning(
     Some(warning)
 }
 
+/// Classify one finished run against the admitted head and render its operator
+/// sentence in one step (None when nothing needs saying, or for a non-local
+/// checkout). Shared by the PR driver's sibling call sites.
+pub(crate) fn run_warning(
+    loc: &GitLoc,
+    number: u64,
+    admitted: &str,
+    remote_head: Option<&str>,
+    lease_current: bool,
+    cfg: &PrQueueConfig,
+) -> Option<String> {
+    observe_outcome(loc, admitted, remote_head, lease_current)
+        .and_then(|outcome| outcome_warning(number, outcome, cfg))
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{classify_run, observe_outcome, outcome_warning};
+    use super::{classify_run, observe_outcome, outcome_warning, run_warning};
     use thegn_core::config_pr_queue::PrQueueConfig;
     use thegn_core::pr_queue::{self, AgentHeadOutcome, AgentRunObservation};
     use thegn_core::remote::GitLoc;
@@ -325,6 +340,79 @@ mod tests {
         assert_eq!(
             observe_outcome(&loc, &admitted, Some(&local), true),
             Some(AgentHeadOutcome::AgentProgress)
+        );
+    }
+
+    #[test]
+    fn run_warning_renders_the_local_observation() {
+        let dir = tempfile::tempdir().unwrap();
+        thegn_core::fsperm::restrict_dir_to_owner(dir.path()).unwrap();
+        git_fixture_command(
+            dir.path(),
+            &["-c", "commit.gpgsign=false", "init", "--quiet"],
+        );
+        git_fixture_command(
+            dir.path(),
+            &["config", "user.email", "test@example.invalid"],
+        );
+        git_fixture_command(dir.path(), &["config", "user.name", "Test"]);
+        std::fs::write(dir.path().join("tracked"), "base\n").unwrap();
+        git_fixture_command(dir.path(), &["add", "tracked"]);
+        git_fixture_command(
+            dir.path(),
+            &["-c", "commit.gpgsign=false", "commit", "-m", "base"],
+        );
+        let admitted = git_fixture_command(dir.path(), &["rev-parse", "HEAD"]);
+        let loc = GitLoc::Local(dir.path().to_path_buf());
+        let cfg = PrQueueConfig::default();
+
+        assert_eq!(
+            run_warning(&loc, 7, &admitted, Some(&admitted), true, &cfg).as_deref(),
+            Some(
+                "PR #7: the agent finished without changing the PR head; the next refresh re-evaluates the row"
+            )
+        );
+
+        std::fs::write(dir.path().join("tracked"), "local agent commit\n").unwrap();
+        git_fixture_command(dir.path(), &["add", "tracked"]);
+        git_fixture_command(
+            dir.path(),
+            &["-c", "commit.gpgsign=false", "commit", "-m", "agent"],
+        );
+        let local = git_fixture_command(dir.path(), &["rev-parse", "HEAD"]);
+        assert_eq!(
+            run_warning(&loc, 7, &admitted, Some(&admitted), true, &cfg).as_deref(),
+            Some(
+                "PR #7: the agent committed locally but the PR head did not move; nothing was pushed"
+            )
+        );
+        assert_eq!(
+            run_warning(&loc, 7, &admitted, Some(&local), true, &cfg),
+            None
+        );
+        assert_eq!(
+            run_warning(&loc, 7, &admitted, Some(&admitted), false, &cfg),
+            None
+        );
+    }
+
+    #[test]
+    fn run_warning_is_none_for_a_remote_checkout() {
+        let admitted = "a".repeat(40);
+        let remote = GitLoc::from_db(
+            "/repo",
+            Some(r#"{"host":"example.invalid","port":22,"path":"/repo"}"#),
+        );
+        assert_eq!(
+            run_warning(
+                &remote,
+                7,
+                &admitted,
+                Some(&admitted),
+                true,
+                &PrQueueConfig::default()
+            ),
+            None
         );
     }
 
