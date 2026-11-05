@@ -227,10 +227,10 @@ CalDAV) are fetched at once, while command plugins run one at a time. Each
 account's events appear as soon as it finishes, so one slow or unreachable
 server does not hold up the others.
 
-A whole sync pass is also bounded: if accounts are still fetching after ten
-minutes, thegn stops waiting for them, reports each as timed out and keeps the
-events it already has for them. Accounts that had not started yet wait for the
-next sync.
+A whole sync pass is also bounded: if accounts are still fetching after a fixed
+limit, currently ten minutes, thegn stops waiting for them, reports each as
+timed out and keeps the events it already has for them. Accounts that had not
+started yet wait for the next sync.
 
 For a recurring event, an override with its `RECURRENCE-ID` replaces the
 generated occurrence, even if it moves to another day; a cancelled override
