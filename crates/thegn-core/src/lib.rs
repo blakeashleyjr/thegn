@@ -118,6 +118,7 @@ pub mod db_open_stats;
 pub mod db_pipeline_supervise;
 pub mod db_placement;
 mod db_pool;
+pub mod db_pr_agent_outcome;
 mod db_projects;
 mod db_review_tasks;
 mod db_semantic;

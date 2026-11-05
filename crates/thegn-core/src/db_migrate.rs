@@ -2413,6 +2413,32 @@ pub(crate) fn verify_v107_schema(conn: &Connection) -> Result<()> {
     Ok(())
 }
 
+/// v108: pr_queue.agent_outcome + agent_outcome_gen + agent_outcome_at (THE-549).
+pub(crate) fn migrate_v108(conn: &Connection) -> Result<()> {
+    for (column, definition) in [
+        ("agent_outcome", "TEXT"),
+        ("agent_outcome_gen", "INTEGER"),
+        ("agent_outcome_at", "INTEGER"),
+    ] {
+        if !has_column(conn, "pr_queue", column) {
+            conn.execute(
+                &format!("ALTER TABLE pr_queue ADD COLUMN {column} {definition}"),
+                [],
+            )?;
+        }
+    }
+    Ok(())
+}
+
+pub(crate) fn verify_v108_schema(conn: &Connection) -> Result<()> {
+    for column in ["agent_outcome", "agent_outcome_gen", "agent_outcome_at"] {
+        if !has_column(conn, "pr_queue", column) {
+            bail!("schema v108 migration did not add pr_queue.{column}");
+        }
+    }
+    Ok(())
+}
+
 /// Verify the v69 identity ledger before the schema version is stamped. A
 /// missing column/table must never look like a completed migration.
 pub(crate) fn verify_v69_schema(conn: &Connection) -> Result<()> {
@@ -4437,7 +4463,6 @@ mod tests {
             .pragma_query_value(None, "user_version", |row| row.get(0))
             .unwrap();
         assert_eq!(version, crate::db::SCHEMA_VERSION);
-        assert_eq!(version, 107);
         super::verify_v107_schema(upgraded.conn()).unwrap();
         assert_eq!(
             upgraded.merge_landed_provenance("/wt").unwrap(),
@@ -4447,6 +4472,51 @@ mod tests {
                 result_oid: "abc".into(),
             })
         );
+    }
+
+    #[test]
+    fn v108_adds_pr_queue_agent_outcome_idempotently_and_verifies() {
+        let fresh = Db::open_memory().unwrap();
+        super::verify_v108_schema(fresh.conn()).unwrap();
+
+        let conn = Connection::open_in_memory().unwrap();
+        assert!(super::verify_v108_schema(&conn).is_err());
+        conn.execute_batch("CREATE TABLE pr_queue (key TEXT PRIMARY KEY, status TEXT NOT NULL);")
+            .unwrap();
+        super::migrate_v108(&conn).unwrap();
+        super::migrate_v108(&conn).unwrap();
+        super::verify_v108_schema(&conn).unwrap();
+        conn.execute_batch("ALTER TABLE pr_queue DROP COLUMN agent_outcome_at;")
+            .unwrap();
+        assert!(super::verify_v108_schema(&conn).is_err());
+        super::migrate_v108(&conn).unwrap();
+        super::verify_v108_schema(&conn).unwrap();
+    }
+
+    #[test]
+    fn v108_upgrades_a_real_v107_database() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("v107.db");
+        {
+            let db = Db::open_at(&path).unwrap();
+            db.conn()
+                .execute_batch(
+                    "ALTER TABLE pr_queue DROP COLUMN agent_outcome;
+                     ALTER TABLE pr_queue DROP COLUMN agent_outcome_gen;
+                     ALTER TABLE pr_queue DROP COLUMN agent_outcome_at;
+                     PRAGMA user_version=107;",
+                )
+                .unwrap();
+        }
+        let upgraded = Db::open_at(&path).unwrap();
+        let version: i64 = upgraded
+            .conn()
+            .pragma_query_value(None, "user_version", |row| row.get(0))
+            .unwrap();
+        assert_eq!(version, crate::db::SCHEMA_VERSION);
+        assert_eq!(version, 108);
+        super::verify_v108_schema(upgraded.conn()).unwrap();
+        assert_eq!(upgraded.pr_agent_outcome("missing").unwrap(), None);
     }
 
     #[test]
