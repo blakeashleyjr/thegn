@@ -538,6 +538,11 @@ It also exposes `sessionScrollbackLines`, `sessionRestoreGraceSecs`,
 `sessionFocusOnCreate` and `sessionResidentPoolLimit` for `[session]`, and
 `clipboardImagePaste`, `clipboardMaxImageBytes`, `clipboardRemoteDir` and
 `clipboardKeepHours` for `[clipboard]`.
+It also exposes `locEnabled`, `locScanIntervalSecs`, `locMaxScanPerRound` and
+`locWatchInvalidateSecs` for `[loc]`, and `replayEnabled`,
+`replayMaxBytesPerPane`, `replayMaxDurationSecs`, `replayKeyframeIntervalMs`,
+`replayKeyframeIntervalBytes`, `replayIdleThresholdMs` and `replayPersist` for
+`[replay]`.
 
 `keys list` covers the keymap registry **and** the zone-local tables — the
 sidebar's row keys and each panel section's row-mode keys. Those are handled
