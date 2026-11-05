@@ -544,9 +544,11 @@ check-features:
     cargo nextest run -p thegn-svc --features iroh -E 'test(iroh_reach::)'
     cargo check -p tg-kit --features standalone
 
-# Offline conformance for `thegn plugin preview` (build the host first: `cargo build -p thegn-host`). Not part of `ci`.
+# Offline conformance for `thegn plugin preview` and the embedded app-tab PTY conformance (build the host first: `cargo build -p thegn-host`). Not part of `ci`.
 plugin-conformance:
     python3 test/plugin-preview.py --binary target/debug/thegn
+    python3 test/plugin-apps.py --selftest
+    python3 test/plugin-apps.py --binary target/debug/thegn || test $? -eq 77
 
 # The declared MSRV (`rust-version` in Cargo.toml) actually builds. `cargo-1.89`
 # is the flake's pinned MSRV toolchain (msrvRustToolchain) — bump both together.
