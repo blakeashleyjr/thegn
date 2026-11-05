@@ -170,7 +170,7 @@ impl FrameWriter {
         )
     }
 
-    fn spawn_with(
+    pub(crate) fn spawn_with(
         sync: bool,
         worker_frames: bool,
         wake: impl Fn(&'static str) + Send + Sync + 'static,
