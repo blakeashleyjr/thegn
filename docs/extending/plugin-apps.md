@@ -114,8 +114,8 @@ JSON snapshot with a `live` object containing `plugin`, `surface`, `revision`, `
 
 `--record <file>` also works with `--plugin-dir`, headless or interactive. It writes a new owner-only trace of each frame's
 method name, request id and error flag, never a payload or session token. The trace is capped at 8 MiB and 20,000 records;
-captured frames are saved even when the preview fails (for example, on a crash). It is refused if the file exists and
-cannot be replayed. Keyboard input is not recorded.
+captured frames are saved even when the preview fails (for example, on a crash). It is refused up front if the file
+already exists, and a live trace cannot be replayed. Keyboard input is not recorded.
 
 ## SDK
 
