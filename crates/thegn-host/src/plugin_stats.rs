@@ -91,7 +91,6 @@ impl Totals {
                     || row.timed_out > 0
                     || row.lost > 0
                     || row.queue_drops > 0
-                    || row.coalesced > 0
             })
             .take(MAX_ROWS)
             .collect()
@@ -100,6 +99,9 @@ impl Totals {
 
 static ROWS: LazyLock<Mutex<Arc<Vec<PluginCounters>>>> =
     LazyLock::new(|| Mutex::new(Arc::new(Vec::new())));
+
+#[cfg(test)]
+pub(crate) static TEST_LOCK: Mutex<()> = Mutex::new(());
 
 pub(crate) fn publish(rows: Vec<PluginCounters>) -> bool {
     let mut published = ROWS.lock().unwrap_or_else(|error| error.into_inner());
@@ -139,6 +141,7 @@ mod tests {
     fn rows_omit_all_zero_plugins_sort_by_id_and_cap_at_max_rows() {
         let mut totals = Totals::default();
         totals.add_dispatch("z", 0, 0, 0, 0, 0);
+        totals.add_inbox("coalesced-only", 1, 0, 0);
         assert!(totals.rows(&BTreeMap::new()).is_empty());
         totals.add_dispatch("b", 1, 0, 0, 0, 0);
         totals.add_dispatch("a", 1, 0, 0, 0, 0);
@@ -182,6 +185,9 @@ mod tests {
 
     #[test]
     fn publish_reports_change_only_when_rows_differ() {
+        let _guard = super::TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let plugin = format!("pub-test-{}", std::process::id());
         let row = PluginCounters {
             plugin: plugin.clone(),
