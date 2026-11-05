@@ -1022,6 +1022,8 @@ def expected_release_assets(manifest: Mapping[str, Any], tag: str) -> list[str]:
             f"thegn-{tag}-PKGBUILD",
             f"thegn-{tag}-deb.nfpm.yaml",
             f"thegn-{tag}-rpm.nfpm.yaml",
+            "SHA256SUMS",
+            f"thegn-{tag}-THIRD_PARTY_NOTICES.md",
         )
     )
     version = tag[1:]
