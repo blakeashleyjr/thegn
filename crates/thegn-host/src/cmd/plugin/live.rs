@@ -678,6 +678,7 @@ for line in sys.stdin:
         std::fs::write(
             &script,
             r#"import json, sys
+print(json.dumps({"id":7,"method":"host.call","params":{"capability":"sessions.list","params":{}}}), flush=True)
 for line in sys.stdin:
     message = json.loads(line)
     if message.get("id") == 7:
