@@ -1116,11 +1116,6 @@ impl Config {
                     });
                     was || self.env.len() != env_count
                 }
-                Feature::Observe => {
-                    let was = self.observe.enabled;
-                    self.observe.enabled = false;
-                    was
-                }
                 Feature::Placement => {
                     let was = self.placement.enabled;
                     self.placement.enabled = false;
@@ -1129,6 +1124,11 @@ impl Config {
                 Feature::Voice => {
                     let was = self.voice.enabled;
                     self.voice.enabled = false;
+                    was
+                }
+                Feature::Observe => {
+                    let was = self.observe.enabled;
+                    self.observe.enabled = false;
                     was
                 }
                 Feature::PluginApps => {

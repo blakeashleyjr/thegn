@@ -3331,32 +3331,42 @@ fn clamp_to_channel_neutralises_experimental_in_stable() {
 
     let mut cfg = Config::default();
     // Turn on every experimental toggle the way a user's config might.
-    cfg.observe.enabled = true;
     cfg.placement.enabled = true;
     cfg.sandbox.remote.host = "box.example".into();
     cfg.host.insert("gpu".into(), Default::default());
     cfg.voice.enabled = true;
-    cfg.apps.default_tab = "plugin:todoist:workspace".into();
-    cfg.apps.tab_order.push("plugin:todoist:workspace".into());
 
     let clamped = cfg.clamp_to_channel(Channel::Stable);
 
     // Every gated master toggle is forced off.
-    assert!(!cfg.observe.enabled);
     assert!(!cfg.placement.enabled);
     assert!(cfg.sandbox.remote.host.is_empty());
     assert!(cfg.host.is_empty());
     assert!(!cfg.voice.enabled);
-    assert_eq!(cfg.apps.default_tab, "work");
-    assert_eq!(cfg.apps.tab_order, ["work"]);
     // Every gated feature reports as clamped.
-    assert_eq!(clamped.len(), 6);
-    assert!(clamped.contains(&Feature::PluginApps));
+    assert_eq!(clamped.len(), 4);
+    assert!(!clamped.contains(&Feature::Observe));
+    assert!(!clamped.contains(&Feature::PluginApps));
+
+    let mut graduated = Config::default();
+    graduated.observe.enabled = true;
+    graduated.apps.default_tab = "plugin:todoist:workspace".into();
+    graduated
+        .apps
+        .tab_order
+        .push("plugin:todoist:workspace".into());
+    assert!(graduated.clamp_to_channel(Channel::Stable).is_empty());
+    assert!(graduated.observe.enabled);
+    assert_eq!(graduated.apps.default_tab, "plugin:todoist:workspace");
+    assert_eq!(
+        graduated.apps.tab_order,
+        ["work", "plugin:todoist:workspace"]
+    );
 }
 
 #[test]
-fn clamp_to_channel_strips_plugin_app_tabs_in_stable() {
-    use crate::channel::{Channel, Feature};
+fn clamp_to_channel_keeps_plugin_app_tabs_in_stable() {
+    use crate::channel::Channel;
 
     let mut cfg = Config {
         apps: crate::config::AppsConfig {
@@ -3366,12 +3376,9 @@ fn clamp_to_channel_strips_plugin_app_tabs_in_stable() {
         ..Config::default()
     };
 
-    assert_eq!(
-        cfg.clamp_to_channel(Channel::Stable),
-        vec![Feature::PluginApps]
-    );
-    assert_eq!(cfg.apps.default_tab, "work");
-    assert_eq!(cfg.apps.tab_order, ["work"]);
+    assert!(cfg.clamp_to_channel(Channel::Stable).is_empty());
+    assert_eq!(cfg.apps.default_tab, "plugin:todoist:workspace");
+    assert_eq!(cfg.apps.tab_order, ["work", " plugin:todoist:workspace "]);
 
     let mut dev_cfg = Config {
         apps: crate::config::AppsConfig {
