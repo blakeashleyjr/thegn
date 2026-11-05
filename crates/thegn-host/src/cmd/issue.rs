@@ -60,6 +60,11 @@ pub enum Action {
         number: u64,
         body: String,
     },
+    /// Act on a TRACKER issue (Linear/Jira/Kaneo/GitHub-tracker) by exact account.
+    Tracker {
+        #[command(subcommand)]
+        action: super::issue_tracker::TrackerAction,
+    },
 }
 
 pub fn run(
@@ -106,6 +111,7 @@ pub fn run(
             number,
             body,
         } => comment_issue(target.worktree, number, body),
+        Action::Tracker { action } => super::issue_tracker::run(cfg, action, config_path),
     }
 }
 
@@ -209,7 +215,7 @@ fn list_tracker_issues(
 
 /// The router `issue list` queries: built from the `[issues]` config as
 /// narrowed by the repo containing `dir` (global when `dir` is not in a repo).
-fn tracker_router(
+pub(crate) fn tracker_router(
     cfg: &thegn_core::config::Config,
     dir: Option<&std::path::Path>,
 ) -> thegn_svc::issue::IssueRouter {
