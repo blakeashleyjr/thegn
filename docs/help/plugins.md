@@ -50,6 +50,9 @@ keep state, not a sandbox: every plugin runs as your user.
 Check what thegn sees with `thegn plugin list`; validate everything (api
 compatibility, command presence, contribution acceptance) with
 `thegn plugin check` — it exits non-zero on problems, so it fits a hook.
+Inspect live dispatcher, queue and provider-bridge counters with
+`thegn plugin status [--json]`. This reads `GET /v1/plugins/status` from the daemon; counters
+are available while the UI is running with `[daemon] enabled`.
 For each enabled plugin, `check` prints the negotiated plugin/host API versions,
 host-call scopes, granted and missing capabilities, and every accepted or
 rejected contribution with its rejection reason. Inspection never starts the

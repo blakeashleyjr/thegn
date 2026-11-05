@@ -22,6 +22,7 @@ pub(crate) mod fork;
 pub(crate) mod inbox;
 pub(crate) mod pipeline_reaper;
 pub(crate) mod pipeline_retry;
+pub(crate) mod plugins_status;
 mod pty_diagnostics;
 pub(crate) mod record;
 pub(crate) mod service;
