@@ -92,6 +92,17 @@ If a later poll confirms a requested merge at the same head, the row records
 at a different head, or one not requested by thegn, is recorded as merged on
 the forge but is not counted as a thegn merge.
 
+Before a merge, CI rerun or agent dispatch, the PR queue re-attests a bound
+checkout and distinguishes a missing checkout from one Git could not read. A
+missing or non-worktree checkout refuses the effect with
+`queued checkout is missing or no longer a Git worktree` (this includes a Git
+read that exits non-zero); a timed-out or otherwise unreadable read says
+`queued checkout could not be read (<reason>)` (or `queued checkout branch could
+not be read (<reason>)`). Both
+messages include `thegn pr queue rebind --pr N`. An unreadable branch on agent
+dispatch is held for human review and shown as
+`unknown (could not be read: <reason>)`.
+
 `thegn doctor` notes this in the Providers list when a forge can merge but
 cannot fence that merge to the reviewed head: the PR queue holds merges for
 that forge, which you must merge yourself.
@@ -201,10 +212,19 @@ repo other people push to:
   head on the forge, so an agent cannot top up its own budget or trip
   `pause_on_foreign_push`. Anything it cannot verify (a remote worktree, a
   teammate's push) still counts as someone else's.
+
 - **An agent that never starts** (sandbox entry refused, a broken command
   template, an unwritable prompt) does not spend an attempt: the row is held
   `needs_human` with the reason, for the PR queue and CI autofix alike, like the
   merge queue.
+
+After each agent run thegn also compares the PR head with the head the agent
+started on and says what happened in the pass warnings: the agent changed
+nothing, the agent committed locally but did not push, or someone else pushed
+while it ran (and whether that holds the row or refills the budget under your
+`pause_on_foreign_push` / `reset_attempts_on_push` settings). This only reports;
+the attempt budget is still decided by the rules above. It applies to local
+checkouts.
 
 ## Watching
 

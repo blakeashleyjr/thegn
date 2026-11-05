@@ -638,6 +638,8 @@ impl IssueBackend for JiraBackend {
                 comments,
                 // Incomplete comment paging returns an error before reaching this result.
                 comments_complete: true,
+                // Jira returns every label in the issue fields.
+                labels_complete: true,
             })
         })
     }

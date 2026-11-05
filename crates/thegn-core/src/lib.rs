@@ -110,6 +110,7 @@ mod db_glyph;
 mod db_hibernate;
 mod db_intent;
 mod db_iroh;
+pub mod db_merge_landed;
 pub mod db_migrate;
 mod db_model_proxy;
 mod db_notification;

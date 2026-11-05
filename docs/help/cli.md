@@ -539,6 +539,10 @@ stage configuration digest as a fresh stage dispatch. If the stage or agent was
 edited after the prompt was rendered, the launch is refused as changed between
 claim and launch. A launch-id-bound pipeline stage launch without a digest is
 refused. Restart the daemon after upgrading; the digest format changed.
+The digest covers the stage and its effective agent, but not the `[sandbox]`
+policy. The daemon resolves that policy at launch from its own configuration,
+because the CLI and daemon read `THEGN_SANDBOX_*` overlays from different
+environments.
 
 Finished rows (not review tasks) older than 90 days are pruned during
 background maintenance unless their worktree is still registered, an active

@@ -199,6 +199,13 @@ Only a response-level 404 removes an event; a failed property does not. A
 CalDAV changes-only reply without a sync token is not applied; that sync falls
 back to one full fetch, as it does when the server rejects the token.
 
+One damaged CalDAV resource fails the whole sync, not just itself: if any resource
+in a reply is truncated or has mismatched BEGIN/END lines, thegn applies none of
+that reply, keeps the events and sync position it already has, and tries again
+next time. Only a single bad event inside an otherwise sound resource (for
+example one with no start time) is set aside, counted in the diagnostics and left
+out while its neighbours are kept.
+
 Each background sync also refreshes the month on screen as well as the current
 month. If you page through months quickly, only the last month you land on is
 fetched and drawn.
@@ -226,6 +233,11 @@ Accounts sync independently: up to four network accounts (subscribed links and
 CalDAV) are fetched at once, while command plugins run one at a time. Each
 account's events appear as soon as it finishes, so one slow or unreachable
 server does not hold up the others.
+
+A whole sync pass is also bounded: if accounts are still fetching after a fixed
+limit, currently ten minutes, thegn stops waiting for them, reports each as
+timed out and keeps the events it already has for them. Accounts that had not
+started yet wait for the next sync.
 
 For a recurring event, an override with its `RECURRENCE-ID` replaces the
 generated occurrence, even if it moves to another day; a cancelled override

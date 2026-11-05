@@ -1427,6 +1427,8 @@ pub(super) async fn dispatch_put(
 pub struct DispatchStatusBody {
     /// A member of the closed dispatch-status set (snake_case).
     status: String,
+    #[serde(default)]
+    lead: Option<super::DispatchLeadReq>,
 }
 
 pub(super) async fn dispatch_set_status(
@@ -1439,7 +1441,11 @@ pub(super) async fn dispatch_set_status(
         return r;
     }
     let status = thegn_core::issue::AgentDispatchStatus::parse(&body.0.status);
-    match state.api.dispatch_set_status(id, status).await {
+    let result = match body.0.lead {
+        Some(lead) => state.api.dispatch_set_status_led(id, status, lead).await,
+        None => state.api.dispatch_set_status(id, status).await,
+    };
+    match result {
         Ok(()) => axum::Json(json!({ "id": id, "status": status.as_str() })).into_response(),
         Err(e) => e.into_response(),
     }

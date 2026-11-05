@@ -1504,6 +1504,31 @@ fn record_clone_finished(db: &thegn_core::db::Db, dest_key: &str, pid: u32, succ
     }
 }
 
+fn reconcile_clone_provenance(
+    db: &thegn_core::db::Db,
+    own_pid: u32,
+    pid_alive: impl Fn(i64) -> bool,
+) -> usize {
+    match db.abandon_dead_clone_provenance(own_pid, &|pid| pid_alive(i64::from(pid))) {
+        Ok(reconciled) => reconciled,
+        Err(error) => {
+            tracing::warn!(%error, "could not reconcile workspace clone provenance");
+            0
+        }
+    }
+}
+
+pub(crate) fn reconcile_clone_provenance_at_startup() -> usize {
+    match thegn_core::db::Db::open() {
+        Ok(db) => reconcile_clone_provenance(&db, std::process::id(), crate::platform::pid_alive),
+        Err(error) => {
+            // Best-effort: git is authoritative and the state DB is only a cache.
+            tracing::warn!(%error, "could not open the state db to reconcile workspace clone provenance");
+            0
+        }
+    }
+}
+
 fn run_clone_job(job: CloneJob) {
     let CloneJob {
         generation,
@@ -3336,5 +3361,48 @@ Receiving objects: 100% (10/10)\rdone.\n";
         let key = provenance_dest_key(&dest).unwrap();
         let canonical = std::fs::canonicalize(temp.path().join("nested/deeper")).unwrap();
         assert_eq!(key, canonical.join("ws").to_str().unwrap());
+    }
+
+    #[test]
+    fn reconcile_clone_provenance_abandons_dead_rows_and_reports_the_count() {
+        let db = thegn_core::db::Db::open_memory().unwrap();
+        let parsed = parse_workspace_url("https://example.com/o/r.git").unwrap();
+        assert!(record_clone_started(&db, &parsed, "/ws/a", 4001, &|_| {
+            false
+        }));
+        assert!(record_clone_started(&db, &parsed, "/ws/b", 4002, &|_| {
+            false
+        }));
+
+        assert_eq!(reconcile_clone_provenance(&db, 1, |_| false), 2);
+        for dest in ["/ws/a", "/ws/b"] {
+            assert_eq!(
+                db.clone_provenance(dest).unwrap().unwrap().state,
+                thegn_core::db_clone_provenance::CloneProvenanceState::Abandoned
+            );
+        }
+        assert_eq!(reconcile_clone_provenance(&db, 1, |_| false), 0);
+    }
+
+    #[test]
+    fn reconcile_clone_provenance_keeps_a_live_foreign_cloner() {
+        let db = thegn_core::db::Db::open_memory().unwrap();
+        let parsed = parse_workspace_url("https://example.com/o/r.git").unwrap();
+        assert!(record_clone_started(&db, &parsed, "/ws/a", 4001, &|_| {
+            false
+        }));
+        assert!(record_clone_started(&db, &parsed, "/ws/b", 4002, &|_| {
+            false
+        }));
+
+        assert_eq!(reconcile_clone_provenance(&db, 1, |pid| pid == 4001), 1);
+        assert_eq!(
+            db.clone_provenance("/ws/a").unwrap().unwrap().state,
+            thegn_core::db_clone_provenance::CloneProvenanceState::Cloning
+        );
+        assert_eq!(
+            db.clone_provenance("/ws/b").unwrap().unwrap().state,
+            thegn_core::db_clone_provenance::CloneProvenanceState::Abandoned
+        );
     }
 }
