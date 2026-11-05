@@ -549,6 +549,16 @@ It also exposes `drawerCommand`, `drawerConfigHome`, `drawerHeight`,
 and `drawerPrewarm` for `[drawer]`, and `stripVisible` for `[strip]` `visible`.
 These options default to `null`, which uses the binary's default.
 
+The `[git]` scalars are `gitOverrideGpg`, `gitMergeGuard`, `gitAutoFetch`,
+`gitAutoFetchIntervalSecs`, `gitAutoFetchMinIntervalSecs`,
+`gitAutoFetchNotify` and `gitAutoFetchColocated`; an interval of `0` disables
+the periodic auto-fetch poll. The `[stats]` masthead widgets take
+`statsCpuIcon`, `statsMemIcon`, `statsNetIcon`, `statsGpuIcon`, `statsTempIcon`,
+`statsSwapIcon`, `statsFreqIcon`, `statsLoadIcon`, `statsUptimeIcon`,
+`statsBatteryIcon`, `statsBatteryChargingIcon` and `statsDiskIcon` (text or a
+symbol), plus `statsDiskPath` (the filesystem the disk widget measures; empty
+means the filesystem holding the worktrees directory).
+
 `keys list` covers the keymap registry **and** the zone-local tables — the
 sidebar's row keys and each panel section's row-mode keys. Those are handled
 by the focused zone rather than the registry, so they are not rebindable, but
