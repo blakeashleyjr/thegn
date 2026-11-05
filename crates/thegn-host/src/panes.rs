@@ -122,8 +122,11 @@ fn claim_daemon_fallback_notice(
 }
 
 /// The user-facing text; `line` is ALREADY redacted (`spawn_failure_line`).
+const FALLBACK_BUNDLE_HINT: &str =
+    "Run `thegn doctor bundle` to collect the retained crash reports and logs.";
+
 fn daemon_fallback_notice(kind: DaemonFallback, line: &str) -> String {
-    match kind {
+    let text = match kind {
         DaemonFallback::Spawn => format!(
             "pane daemon unavailable: {line}; this pane runs in-process and will not survive closing thegn"
         ),
@@ -136,7 +139,8 @@ fn daemon_fallback_notice(kind: DaemonFallback, line: &str) -> String {
         DaemonFallback::NativeExec => format!(
             "provider exec attach failed: {line}; this pane fell back to the standard launch path and may not be connected to the remote session"
         ),
-    }
+    };
+    format!("{text} {FALLBACK_BUNDLE_HINT}")
 }
 
 /// Post the notice once per kind. A no-op without the compositor (CLI paths) and non-blocking (launch_notice::post hands the DB write to a Background thread).
@@ -2212,6 +2216,42 @@ mod tests {
         assert!(native_exec.contains("provider exec"));
         assert!(native_exec.contains("connect refused"));
         assert!(!native_exec.contains("ghp_secret"));
+    }
+
+    #[test]
+    fn daemon_fallback_notice_points_every_kind_at_the_support_bundle() {
+        let err = anyhow::anyhow!("connect refused").context("GH_TOKEN=ghp_secret exec failed");
+        let line = spawn_failure_line(&err);
+        let kinds = [
+            DaemonFallback::Spawn,
+            DaemonFallback::Reattach,
+            DaemonFallback::SshOverWss,
+            DaemonFallback::NativeExec,
+        ];
+
+        for kind in kinds {
+            let notice = daemon_fallback_notice(kind, &line);
+            assert!(notice.ends_with(FALLBACK_BUNDLE_HINT), "{notice}");
+            assert!(notice.contains("thegn doctor bundle"), "{notice}");
+            assert!(!notice.contains("ghp_secret"), "{notice}");
+        }
+    }
+
+    #[test]
+    fn daemon_fallback_notice_hint_is_a_single_trailing_sentence() {
+        let line = spawn_failure_line(&anyhow::anyhow!("connect refused"));
+        let kinds = [
+            DaemonFallback::Spawn,
+            DaemonFallback::Reattach,
+            DaemonFallback::SshOverWss,
+            DaemonFallback::NativeExec,
+        ];
+
+        for kind in kinds {
+            let notice = daemon_fallback_notice(kind, &line);
+            assert_eq!(notice.matches("thegn doctor bundle").count(), 1);
+            assert!(notice.ends_with(FALLBACK_BUNDLE_HINT));
+        }
     }
 
     #[test]
