@@ -2692,6 +2692,18 @@ impl ControlApi for DaemonService {
         })
     }
 
+    fn plugins_status(
+        &self,
+    ) -> BoxFuture<'_, ControlResult<thegn_svc::control::PluginsStatusReply>> {
+        Box::pin(async move {
+            tokio::task::spawn_blocking(|| {
+                super::plugins_status::read_status(&super::plugins_status::production_state_dir())
+            })
+            .await
+            .map_err(|error| ControlError::Internal(anyhow::anyhow!(error)))
+        })
+    }
+
     // --- agent orchestration (THE-57) ---------------------------------------
     // Issue verbs route through `IssueRouter` (the same provider seam the panel
     // hydrates from), built per-call from `[issues]` config — the reqwest calls
