@@ -580,6 +580,7 @@ struct ListedRow<'a> {
     #[serde(flatten)]
     row: &'a thegn_core::db::MergeQueueRow,
     claim: Option<ClaimJson>,
+    landed: Option<thegn_core::db_merge_landed::MergeLandedProvenance>,
 }
 
 #[derive(serde::Serialize, Debug, Clone, PartialEq, Eq)]
@@ -602,6 +603,31 @@ fn claim_json(view: Option<&thegn_core::store::MergeClaimView>, now_ms: i64) -> 
             .lease_until_ms
             .is_some_and(|lease_until_ms| lease_until_ms > now_ms),
     })
+}
+
+fn short_oid(oid: &str) -> String {
+    crate::merge_sweep::safe_display(oid)
+        .chars()
+        .take(12)
+        .collect()
+}
+
+fn landed_suffix(landed: Option<&thegn_core::db_merge_landed::MergeLandedProvenance>) -> String {
+    let Some(landed) = landed else {
+        return String::new();
+    };
+    if landed.source_oid.is_none() && landed.target_base_oid.is_none() {
+        return String::new();
+    }
+    let mut parts = Vec::with_capacity(3);
+    if let Some(source) = landed.source_oid.as_deref() {
+        parts.push(format!("source {}", short_oid(source)));
+    }
+    if let Some(base) = landed.target_base_oid.as_deref() {
+        parts.push(format!("base {}", short_oid(base)));
+    }
+    parts.push(format!("result {}", short_oid(&landed.result_oid)));
+    format!("  [{}]", parts.join(", "))
 }
 
 fn claim_suffix(claim: Option<&ClaimJson>, now_ms: i64) -> String {
@@ -658,9 +684,22 @@ fn list(json: bool) -> Result<()> {
             }
             Err(error) => return Err(queue_error_context(error)),
         };
+        let landed = if row.status == "landed" {
+            match db.merge_landed_provenance(&row.worktree) {
+                Ok(landed) => landed,
+                Err(error) if json => {
+                    super::emit_json(&queue_error_json(&error))?;
+                    return Err(error.context("merge queue unreadable"));
+                }
+                Err(error) => return Err(queue_error_context(error)),
+            }
+        } else {
+            None
+        };
         listed.push(ListedRow {
             row,
             claim: claim_json(view.as_ref(), now_ms),
+            landed,
         });
     }
     if json {
@@ -683,8 +722,9 @@ fn list(json: bool) -> Result<()> {
             .map(|d| format!("  — {}", d.replace('\n', ", ")))
             .unwrap_or_default();
         let claim = claim_suffix(listed_row.claim.as_ref(), now_ms);
+        let landed = landed_suffix(listed_row.landed.as_ref());
         outln!(
-            "  {} {} → {}{detail}{claim}",
+            "  {} {} → {}{detail}{claim}{landed}",
             r.status,
             r.branch,
             r.target_branch
@@ -1769,10 +1809,14 @@ mod retry_tests {
 
 #[cfg(test)]
 mod list_claim_tests {
-    use super::{ClaimJson, ListedRow, claim_json, claim_suffix};
+    use super::{ClaimJson, ListedRow, claim_json, claim_suffix, landed_suffix};
     use std::path::Path;
     use thegn_core::db::{Db, MergeQueueRow};
-    use thegn_core::store::{MergeClaimRequest, MergeClaimView, WorkspaceStore, WorktreeAuxStore};
+    use thegn_core::db_merge_landed::MergeLandedProvenance;
+    use thegn_core::store::{
+        MergeCandidate, MergeClaimRequest, MergeClaimView, MergeStatusFields, WorkspaceStore,
+        WorktreeAuxStore,
+    };
     use thegn_core::util;
 
     fn claim_view(phase: &str, lease_until_ms: Option<i64>) -> MergeClaimView {
@@ -1841,6 +1885,7 @@ mod list_claim_tests {
         let listed = ListedRow {
             row: &fixture_row,
             claim: claim_json(Some(&view), 100),
+            landed: None,
         };
         let value = serde_json::to_value(listed).unwrap();
         assert_eq!(value["worktree"], "/repo/worktree");
@@ -1855,6 +1900,7 @@ mod list_claim_tests {
         let unclaimed = ListedRow {
             row: &fixture_row,
             claim: claim_json(None, 100),
+            landed: None,
         };
         let unclaimed_value = serde_json::to_value(unclaimed).unwrap();
         assert!(unclaimed_value["claim"].is_null());
@@ -1969,6 +2015,159 @@ mod list_claim_tests {
         let claim = claim_json(observed.as_ref(), util::now_ms()).unwrap();
         assert!(claim.live);
         assert_eq!(claim.owner_hint.as_deref(), Some("test-drain"));
+    }
+
+    #[test]
+    fn landed_suffix_names_the_present_parts_with_short_oids() {
+        let source = "a".repeat(40);
+        let base = "b".repeat(40);
+        let result = "c".repeat(40);
+        let landed = MergeLandedProvenance {
+            source_oid: Some(source.clone()),
+            target_base_oid: Some(base.clone()),
+            result_oid: result.clone(),
+        };
+        assert_eq!(
+            landed_suffix(Some(&landed)),
+            format!(
+                "  [source {}, base {}, result {}]",
+                &source[..12],
+                &base[..12],
+                &result[..12]
+            )
+        );
+
+        let source_only = MergeLandedProvenance {
+            source_oid: Some(source.clone()),
+            target_base_oid: None,
+            result_oid: result.clone(),
+        };
+        assert_eq!(
+            landed_suffix(Some(&source_only)),
+            format!("  [source {}, result {}]", &source[..12], &result[..12])
+        );
+        let base_only = MergeLandedProvenance {
+            source_oid: None,
+            target_base_oid: Some(base.clone()),
+            result_oid: result.clone(),
+        };
+        assert_eq!(
+            landed_suffix(Some(&base_only)),
+            format!("  [base {}, result {}]", &base[..12], &result[..12])
+        );
+    }
+
+    #[test]
+    fn landed_suffix_is_empty_for_a_result_only_triple() {
+        assert_eq!(landed_suffix(None), "");
+        assert_eq!(
+            landed_suffix(Some(&MergeLandedProvenance {
+                source_oid: None,
+                target_base_oid: None,
+                result_oid: "c".repeat(40),
+            })),
+            ""
+        );
+    }
+
+    #[test]
+    fn landed_suffix_neutralises_control_characters() {
+        let landed = MergeLandedProvenance {
+            source_oid: Some("abc\u{1b}[31m\n12345678901234567890".to_owned()),
+            target_base_oid: Some("b".repeat(40)),
+            result_oid: "c".repeat(40),
+        };
+        let suffix = landed_suffix(Some(&landed));
+        assert!(!suffix.contains('\u{1b}'));
+        assert!(!suffix.contains('\n'));
+    }
+
+    #[test]
+    fn listed_row_json_carries_landed_provenance_or_null() {
+        let fixture_row = row();
+        let unlanded = ListedRow {
+            row: &fixture_row,
+            claim: None,
+            landed: None,
+        };
+        let unlanded_value = serde_json::to_value(unlanded).unwrap();
+        assert!(unlanded_value["landed"].is_null());
+
+        let source = "a".repeat(40);
+        let base = "b".repeat(40);
+        let result = "c".repeat(40);
+        let landed = ListedRow {
+            row: &fixture_row,
+            claim: None,
+            landed: Some(MergeLandedProvenance {
+                source_oid: Some(source.clone()),
+                target_base_oid: Some(base.clone()),
+                result_oid: result.clone(),
+            }),
+        };
+        let landed_value = serde_json::to_value(landed).unwrap();
+        assert_eq!(landed_value["landed"]["source_oid"], source);
+        assert_eq!(landed_value["landed"]["target_base_oid"], base);
+        assert_eq!(landed_value["landed"]["result_oid"], result);
+
+        let source_missing = ListedRow {
+            row: &fixture_row,
+            claim: None,
+            landed: Some(MergeLandedProvenance {
+                source_oid: None,
+                target_base_oid: Some("b".repeat(40)),
+                result_oid: "c".repeat(40),
+            }),
+        };
+        let source_missing_value = serde_json::to_value(source_missing).unwrap();
+        assert!(source_missing_value["landed"]["source_oid"].is_null());
+    }
+
+    #[test]
+    fn landed_provenance_reads_back_through_the_store_for_a_landed_row() {
+        let db = Db::open_memory().unwrap();
+        db.put_worktree("main", "/r", "/r/wt", "main", None, None)
+            .unwrap();
+        db.enqueue_merge_candidate(
+            "/r/wt",
+            "main",
+            "main",
+            &MergeCandidate {
+                branch_ref: "refs/heads/main".into(),
+                candidate_oid: "a".repeat(40),
+            },
+        )
+        .unwrap();
+        let claim = db
+            .admit_merge_claim(&MergeClaimRequest {
+                worktree: "/r/wt".into(),
+                branch: "main".into(),
+                repo_root: "/r".into(),
+                target_branch: "main".into(),
+                location: String::new(),
+                expected_status: "queued".into(),
+                lease_until_ms: util::now_ms() + 60_000,
+                owner_hint: None,
+            })
+            .unwrap()
+            .unwrap();
+        let claim = db
+            .replace_merge_status_claimed(&claim, "folding", &MergeStatusFields::default())
+            .unwrap();
+        db.land_merge_status_claimed(
+            &claim,
+            &MergeStatusFields {
+                result_oid: Some("c".repeat(40)),
+                ..Default::default()
+            },
+            &"b".repeat(40),
+        )
+        .unwrap();
+        let landed = db.merge_landed_provenance("/r/wt").unwrap();
+        let suffix = landed_suffix(landed.as_ref());
+        assert!(suffix.contains("source aaaaaaaaaaaa"));
+        assert!(suffix.contains("base bbbbbbbbbbbb"));
+        assert!(suffix.contains("result cccccccccccc"));
     }
 }
 
