@@ -18,6 +18,7 @@ use std::sync::Arc;
 use thegn_core::control::Scope;
 pub use thegn_core::control_error::ControlErrorCode;
 use thegn_core::control_wire::{EventFrame, PairingState};
+pub use thegn_core::plugin_status::PluginStatusRow;
 use thegn_core::store::LeaseRow;
 
 /// The `agent.sessions` response row — re-exported from the harness seam so the
@@ -677,6 +678,21 @@ pub struct McpProxyStatus {
     /// in-process fallback).
     pub daemon_owned: bool,
     pub upstreams: Vec<McpProxyUpstreamStatus>,
+}
+
+/// The `plugins.status` payload.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct PluginsStatusReply {
+    /// A valid snapshot file was found.
+    pub published: bool,
+    /// The process that wrote it (`pid`) is still running.
+    pub live: bool,
+    #[serde(default)]
+    pub pid: Option<u32>,
+    #[serde(default)]
+    pub published_at_ms: Option<i64>,
+    #[serde(default)]
+    pub rows: Vec<PluginStatusRow>,
 }
 
 /// One reconcile action taken by `mcp_proxy.reload`.
@@ -1385,6 +1401,15 @@ pub trait ControlApi: Send + Sync + 'static {
         Box::pin(async {
             Err(ControlError::Unimplemented(
                 "mcp proxy is not configured on this instance",
+            ))
+        })
+    }
+
+    /// Read the UI's published plugin counters (`plugins.status`).
+    fn plugins_status(&self) -> BoxFuture<'_, ControlResult<PluginsStatusReply>> {
+        Box::pin(async {
+            Err(ControlError::Unimplemented(
+                "plugin status is not available on this instance",
             ))
         })
     }

@@ -394,6 +394,9 @@ pub enum Verb {
     /// (`thegn mcp reload`). Write-scoped: a read-only client must not be able
     /// to flip which upstream tools an agent can reach.
     McpProxyReload,
+    /// Read the UI process's per-plugin dispatcher, queue and provider-bridge
+    /// counters (`plugins.status`).
+    PluginsStatus,
     /// List projects (grouping of workspaces) with member counts.
     ProjectList,
     /// Create a project.
@@ -546,6 +549,7 @@ impl Verb {
         Verb::SecretSshRotate,
         Verb::McpProxyStatus,
         Verb::McpProxyReload,
+        Verb::PluginsStatus,
         Verb::ProjectList,
         Verb::ProjectCreate,
         Verb::ProjectRename,
@@ -615,6 +619,7 @@ pub fn required_scope(verb: Verb) -> Scope {
         | Verb::CiRuns
         | Verb::CiLogs
         | Verb::McpProxyStatus
+        | Verb::PluginsStatus
         | Verb::ProjectList
         | Verb::IssuesList
         | Verb::IssuesGet
@@ -1085,6 +1090,7 @@ mod tests {
             CiRuns,
             CiLogs,
             McpProxyStatus,
+            PluginsStatus,
             ProjectList,
             IssuesList,
             IssuesGet,

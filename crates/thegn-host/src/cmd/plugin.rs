@@ -238,6 +238,13 @@ pub enum Action {
     },
     /// Validate every enabled plugin; exits non-zero on any problem.
     Check,
+    /// Show the running UI's per-plugin dispatcher, queue and provider-bridge
+    /// counters (read through the daemon control route).
+    Status {
+        /// Emit machine-readable JSON instead of the text table.
+        #[arg(long)]
+        json: bool,
+    },
     /// Preview a fixture or trace without starting a plugin, or start `--plugin-dir` with no host grants.
     Preview(preview::Options),
 }
@@ -413,7 +420,68 @@ pub fn run(cfg: &Config, action: Action, config_path: &Path) -> Result<()> {
             }
             anyhow::bail!("{} plugin problem(s)", problems.len());
         }
+        Action::Status { json } => {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()?;
+            rt.block_on(async {
+                let client = match super::session::connect(cfg).await {
+                    Ok(client) => client,
+                    Err(_) => {
+                        outln!(concat!(
+                            "no thegn daemon is running; plugin counters are published only ",
+                            "while the UI runs with the daemon enabled"
+                        ));
+                        return Ok(());
+                    }
+                };
+                let reply = client.plugins_status().await?;
+                if json {
+                    super::emit_json(&reply)?;
+                } else {
+                    for line in status_lines(&reply) {
+                        outln!("{line}");
+                    }
+                }
+                Ok(())
+            })
+        }
     }
+}
+
+fn status_lines(reply: &thegn_svc::control::PluginsStatusReply) -> Vec<String> {
+    if !reply.published {
+        return vec![
+            "no plugin status published yet (is the thegn UI running with [daemon] enabled?)"
+                .into(),
+        ];
+    }
+    let mut lines = vec![
+        "plugin  busy  refused  timeout  lost  drops  bridge(timeout/cancel/late/malformed/closed)"
+            .into(),
+    ];
+    for row in &reply.rows {
+        lines.push(format!(
+            "{}  {}  {}  {}  {}  {}  {}/{}/{}/{}/{}",
+            row.plugin,
+            row.in_flight,
+            row.rejected,
+            row.timed_out,
+            row.lost,
+            row.queue_drops,
+            row.bridge.timed_out,
+            row.bridge.cancelled,
+            row.bridge.late_replies,
+            row.bridge.malformed,
+            row.bridge.closed_wakeups,
+        ));
+    }
+    lines.push(format!(
+        "live: {} (pid {})",
+        if reply.live { "yes" } else { "no" },
+        reply.pid.unwrap_or_default()
+    ));
+    lines
 }
 
 #[cfg(test)]
@@ -423,6 +491,64 @@ mod tests {
         API_VERSION, ApiVersion, CadenceHint, Contribution, ContributionId, ExtensionPoint,
         PluginId, PluginManifest, PluginMode, PluginSpec,
     };
+
+    #[test]
+    fn status_lines_render_header_rows_and_liveness() {
+        let reply = thegn_svc::control::PluginsStatusReply {
+            published: true,
+            live: false,
+            pid: Some(42),
+            published_at_ms: Some(123),
+            rows: vec![thegn_core::plugin_status::PluginStatusRow {
+                plugin: "sample".into(),
+                in_flight: 1,
+                rejected: 2,
+                timed_out: 3,
+                lost: 4,
+                queue_drops: 5,
+                bridge: thegn_core::plugin_status::BridgeCounts {
+                    timed_out: 6,
+                    cancelled: 7,
+                    late_replies: 8,
+                    malformed: 9,
+                    closed_wakeups: 10,
+                    ..Default::default()
+                },
+                ..Default::default()
+            }],
+        };
+        let lines = status_lines(&reply);
+        assert_eq!(
+            lines[0],
+            "plugin  busy  refused  timeout  lost  drops  bridge(timeout/cancel/late/malformed/closed)"
+        );
+        assert_eq!(lines[1], "sample  1  2  3  4  5  6/7/8/9/10");
+        assert_eq!(lines[2], "live: no (pid 42)");
+    }
+
+    #[test]
+    fn status_lines_for_an_unpublished_reply_say_so() {
+        assert_eq!(
+            status_lines(&thegn_svc::control::PluginsStatusReply::default()),
+            vec![
+                "no plugin status published yet (is the thegn UI running with [daemon] enabled?)"
+                    .to_owned()
+            ]
+        );
+    }
+
+    #[test]
+    fn status_json_flag_parses() {
+        use clap::Parser as _;
+        let cli = crate::Cli::try_parse_from(["thegn", "plugin", "status", "--json"])
+            .expect("plugin status json arguments parse");
+        assert!(matches!(
+            cli.command,
+            Some(crate::Command::Plugin {
+                action: Action::Status { json: true }
+            })
+        ));
+    }
 
     #[test]
     fn config_dir_is_the_config_files_parent() {
