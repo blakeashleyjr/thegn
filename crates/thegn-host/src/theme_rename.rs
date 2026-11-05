@@ -49,13 +49,7 @@ pub(crate) fn rename_theme(
 
     let mut renamed = found.clone();
     renamed.meta.name = new.to_owned();
-    crate::theme_store::write_theme(dir, &renamed).map_err(|error| {
-        if error.ends_with("(nothing was written)") {
-            error
-        } else {
-            format!("{error} (nothing was written)")
-        }
-    })?;
+    crate::theme_store::write_theme(dir, &renamed).map_err(with_nothing_written_note)?;
 
     let expected = hashes.get(&old_slug).copied();
     let old_path = dir.join(format!("{old_slug}.toml"));
@@ -75,6 +69,14 @@ pub(crate) fn rename_theme(
     })
 }
 
+fn with_nothing_written_note(error: String) -> String {
+    if error.contains("nothing was written") {
+        error
+    } else {
+        format!("{error} (nothing was written)")
+    }
+}
+
 fn remove_if_unchanged(path: &Path, expected: [u8; 32]) -> bool {
     let Ok(bytes) = crate::theme_store::read_bounded(path) else {
         return false;
@@ -91,7 +93,7 @@ mod tests {
     use sha2::{Digest, Sha256};
     use thegn_core::theme_user::UserTheme;
 
-    use super::{remove_if_unchanged, rename_theme};
+    use super::{remove_if_unchanged, rename_theme, with_nothing_written_note};
 
     fn private_temp_dir() -> tempfile::TempDir {
         let temp = tempfile::tempdir().unwrap();
@@ -224,6 +226,16 @@ mod tests {
             );
             assert_eq!(std::fs::read_dir(temp.path()).unwrap().count(), 1);
         }
+    }
+
+    #[test]
+    fn write_error_with_existing_nothing_written_note_is_not_duplicated() {
+        let error = "cannot verify theme identities in /themes: theme directory could not be read: denied; nothing was written".to_owned();
+
+        let wrapped = with_nothing_written_note(error.clone());
+
+        assert_eq!(wrapped, error);
+        assert_eq!(wrapped.matches("nothing was written").count(), 1);
     }
 
     #[test]
