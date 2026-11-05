@@ -272,6 +272,43 @@ impl Db {
         })?;
         rows.map(|row| decode_row(row?)).collect()
     }
+
+    /// Mark `cloning` rows whose owner process is gone as `abandoned` (THE-366). A row is stale when its `clone_pid` is NULL, or is not
+    /// `own_pid` and `owner_alive(pid)` is false. Returns the number of rows changed. Rows in any other state are never touched.
+    pub fn abandon_dead_clone_provenance(
+        &self,
+        own_pid: u32,
+        owner_alive: &dyn Fn(u32) -> bool,
+    ) -> Result<usize> {
+        let tx = self.conn().unchecked_transaction()?;
+        let rows = {
+            let mut statement = tx.prepare(
+                "SELECT dest, clone_pid FROM workspace_clone_provenance
+                 WHERE state='cloning' ORDER BY started_at ASC, dest ASC LIMIT ?1",
+            )?;
+            let rows = statement.query_map([MAX_CLONE_PROVENANCE_ROWS], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, Option<i64>>(1)?))
+            })?;
+            rows.collect::<rusqlite::Result<Vec<_>>>()?
+        };
+
+        let mut total = 0;
+        for (dest, pid) in rows {
+            let stale = match pid.and_then(|pid| u32::try_from(pid).ok()) {
+                None => true,
+                Some(pid) => pid != own_pid && !owner_alive(pid),
+            };
+            if stale {
+                total += tx.execute(
+                    "UPDATE workspace_clone_provenance SET state='abandoned', validated_at=NULL
+                     WHERE dest=?1 AND state='cloning' AND clone_pid IS ?2",
+                    params![dest, pid],
+                )?;
+            }
+        }
+        tx.commit()?;
+        Ok(total)
+    }
 }
 
 type RawCloneProvenance = (
@@ -696,5 +733,104 @@ mod tests {
             .unwrap();
         let error = db.clone_provenance("/ws/bad").unwrap_err();
         assert!(error.to_string().contains("/ws/bad"));
+    }
+
+    #[test]
+    fn abandon_dead_marks_only_dead_or_pidless_cloning_rows() {
+        let db = Db::open_memory().unwrap();
+        assert!(
+            db.begin_clone_provenance(&new("/ws/dead", 11), &|_| false)
+                .unwrap()
+        );
+        assert!(
+            db.begin_clone_provenance(&new("/ws/alive", 22), &|_| false)
+                .unwrap()
+        );
+        db.conn()
+            .execute(
+                "INSERT INTO workspace_clone_provenance
+                    (dest, canonical_origin, label, state, thegn_version, started_at)
+                 VALUES ('/ws/nopid','https://example.com/o/r','r','cloning','0',1)",
+                [],
+            )
+            .unwrap();
+
+        assert_eq!(
+            db.abandon_dead_clone_provenance(999, &|pid| pid == 22)
+                .unwrap(),
+            2
+        );
+        for dest in ["/ws/dead", "/ws/nopid"] {
+            let row = db.clone_provenance(dest).unwrap().unwrap();
+            assert_eq!(row.state, CloneProvenanceState::Abandoned);
+            assert_eq!(row.validated_at, None);
+        }
+        let alive = db.clone_provenance("/ws/alive").unwrap().unwrap();
+        assert_eq!(alive.state, CloneProvenanceState::Cloning);
+        assert_eq!(alive.clone_pid, Some(22));
+    }
+
+    #[test]
+    fn abandon_dead_never_touches_own_live_or_terminal_rows() {
+        let db = Db::open_memory().unwrap();
+        assert!(
+            db.begin_clone_provenance(&new("/ws/own", 5), &|_| false)
+                .unwrap()
+        );
+        assert!(
+            db.begin_clone_provenance(&new("/ws/complete", 8), &|_| false)
+                .unwrap()
+        );
+        db.finish_clone_provenance("/ws/complete", 8, CloneProvenanceState::Complete)
+            .unwrap();
+        assert!(
+            db.begin_clone_provenance(&new("/ws/abandoned", 9), &|_| false)
+                .unwrap()
+        );
+        db.finish_clone_provenance("/ws/abandoned", 9, CloneProvenanceState::Abandoned)
+            .unwrap();
+        let before = ["/ws/own", "/ws/complete", "/ws/abandoned"]
+            .map(|dest| db.clone_provenance(dest).unwrap().unwrap());
+
+        assert_eq!(db.abandon_dead_clone_provenance(5, &|_| false).unwrap(), 0);
+        for (dest, before) in ["/ws/own", "/ws/complete", "/ws/abandoned"]
+            .into_iter()
+            .zip(before)
+        {
+            let after = db.clone_provenance(dest).unwrap().unwrap();
+            assert_eq!(after.state, before.state);
+            assert_eq!(after.validated_at, before.validated_at);
+        }
+        assert!(
+            db.clone_provenance("/ws/complete")
+                .unwrap()
+                .unwrap()
+                .validated_at
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn abandon_dead_is_idempotent_and_a_later_begin_still_works() {
+        let db = Db::open_memory().unwrap();
+        assert!(
+            db.begin_clone_provenance(&new("/ws/dead", 11), &|_| false)
+                .unwrap()
+        );
+        assert_eq!(
+            db.abandon_dead_clone_provenance(999, &|_| false).unwrap(),
+            1
+        );
+        assert_eq!(
+            db.abandon_dead_clone_provenance(999, &|_| false).unwrap(),
+            0
+        );
+        assert!(
+            db.begin_clone_provenance(&new("/ws/dead", 33), &|_| false)
+                .unwrap()
+        );
+        let row = db.clone_provenance("/ws/dead").unwrap().unwrap();
+        assert_eq!(row.state, CloneProvenanceState::Cloning);
+        assert_eq!(row.clone_pid, Some(33));
     }
 }
