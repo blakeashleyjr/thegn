@@ -7569,6 +7569,8 @@ async fn event_loop<T: Terminal>(
     // Every exit path of the loop frees the bus (queued publications, marks,
     // registrations) and releases the bridge thread.
     let _lsp_bus_shutdown = crate::lsp::BusShutdown::new(lsp_diag_rx.clone());
+    // Queue timestamps are collected only while perf diagnostics are enabled.
+    lsp_diag_rx.set_timing(crate::perf::enabled());
     // The worktree-root set the supervisor was last reconciled against.
     let mut lsp_reconciled_roots: std::collections::HashSet<std::path::PathBuf> =
         std::collections::HashSet::new();
@@ -9341,6 +9343,8 @@ async fn event_loop<T: Terminal>(
                     log_oldest_ms,
                 );
                 panel_ui.docs.loop_perf.push(&snap);
+                lsp_diag_rx.set_timing(true);
+                crate::perf_lsp::emit(&lsp_diag_rx);
             }
         }
         if session.worktrees.is_empty() {
