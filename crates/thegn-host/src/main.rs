@@ -288,6 +288,7 @@ mod spawn_ratchet_tests;
 mod sprite_bridge;
 mod ssh_shim;
 mod stage_prompt;
+mod stage_worker_hold;
 mod startup_heal;
 // THE-603 is an unwired capture primitive; THE-592 owns future startup admission.
 #[allow(dead_code)]
