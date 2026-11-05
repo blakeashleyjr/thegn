@@ -3889,10 +3889,11 @@ mod tests {
         ))
         .unwrap();
 
-        assert_eq!(
-            discover(&db, "/scope/a", now),
-            Some(ControlAddr::Unix(PathBuf::from("/run/fresh.sock")))
-        );
+        let got = discover(&db, "/scope/a", now).expect("a live same-scope daemon exists");
+        match got {
+            ControlAddr::Unix(p) => assert_eq!(p, PathBuf::from("/run/fresh.sock")),
+            other => panic!("expected a unix addr, got {other:?}"),
+        }
     }
 
     #[test]
