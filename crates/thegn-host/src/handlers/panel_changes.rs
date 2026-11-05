@@ -428,7 +428,21 @@ impl PreviewOwners {
     }
 }
 
-pub(crate) type SubmodulePreviewMsg = (u64, u64, String, thegn_core::submodule::SubmoduleSummary);
+/// The ownership key of one preview job: its worktree and repository-relative path.
+/// NUL separates the parts because neither path component may contain it.
+/// Lossy conversion preserves the existing string-key model; invalid UTF-8 paths can
+/// share a key when their worktree spellings collapse to the same replacement text.
+pub(crate) fn preview_key(worktree: &std::path::Path, path: &str) -> String {
+    format!("{}\0{}", worktree.to_string_lossy(), path)
+}
+
+pub(crate) type SubmodulePreviewMsg = (
+    u64,
+    u64,
+    std::path::PathBuf,
+    String,
+    thegn_core::submodule::SubmoduleSummary,
+);
 
 /// Fetch a bounded, local-object-only gitlink summary off the event loop.
 /// Failures become an explicit unavailable summary so the preview keeps the
@@ -449,10 +463,10 @@ fn spawn_submodule_preview(
     else {
         return;
     };
-    let Some(token) = inflight.begin(&row.path) else {
+    let wt = crate::hydrate::active_tab_path(session);
+    let Some(token) = inflight.begin(&preview_key(&wt, &row.path)) else {
         return;
     };
-    let wt = crate::hydrate::active_tab_path(session);
     let path = row.path.clone();
     let old = submodule.diff.old_sha.clone();
     let new = submodule.diff.new_sha.clone();
@@ -471,7 +485,7 @@ fn spawn_submodule_preview(
                     true,
                 )
             });
-        if tx.send((generation, token, path, summary)).is_ok() && waker.wake().is_err() {
+        if tx.send((generation, token, wt, path, summary)).is_ok() && waker.wake().is_err() {
             tracing::debug!("submodule preview wake dropped during shutdown");
         }
     });
@@ -505,7 +519,7 @@ fn submodule_loc(
 mod tests {
     use super::{
         FrameModel, MAX_ACTIVE_PREVIEW_JOBS, PreviewOwners, PreviewStats, PreviewTarget,
-        follow_change_cursor_target, selected_preview_target,
+        follow_change_cursor_target, preview_key, selected_preview_target,
     };
 
     #[test]
@@ -661,6 +675,84 @@ mod tests {
 
         assert_eq!(owners.stats().high_water, 3);
         assert_eq!(owners.stats().started, 4);
+    }
+
+    #[test]
+    fn preview_key_separates_worktree_and_path() {
+        use std::path::Path;
+
+        assert_ne!(
+            preview_key(Path::new("/w/a"), "x.rs"),
+            preview_key(Path::new("/w/b"), "x.rs")
+        );
+        assert_ne!(
+            preview_key(Path::new("/w/a"), "x.rs"),
+            preview_key(Path::new("/w/a"), "y.rs")
+        );
+        assert_eq!(
+            preview_key(Path::new("/w/a"), "x.rs"),
+            preview_key(Path::new("/w/a"), "x.rs")
+        );
+    }
+
+    #[test]
+    fn preview_keys_of_distinct_pairs_are_distinct() {
+        use std::path::Path;
+
+        let worktrees = ["/w/a", "/w/a/b", "/w"];
+        let paths = ["b/x.rs", "x.rs", "a/b/x.rs"];
+        let keys: std::collections::HashSet<String> = worktrees
+            .iter()
+            .flat_map(|worktree| {
+                paths
+                    .iter()
+                    .map(move |path| preview_key(Path::new(worktree), path))
+            })
+            .collect();
+        assert_eq!(keys.len(), 9);
+    }
+
+    #[test]
+    fn same_path_in_two_worktrees_starts_two_jobs() {
+        use std::path::Path;
+
+        let mut owners = PreviewOwners::default();
+        let key_a = preview_key(Path::new("/w/a"), "x.rs");
+        let key_b = preview_key(Path::new("/w/b"), "x.rs");
+        assert!(owners.begin(&key_a).is_some());
+        assert!(owners.begin(&key_b).is_some());
+        assert_eq!(owners.begin(&key_a), None);
+        assert_eq!(owners.stats().refused_duplicate, 1);
+        assert_eq!(owners.stats().started, 2);
+    }
+
+    #[test]
+    fn a_completion_from_the_old_worktree_cannot_clear_the_new_owner() {
+        use std::path::Path;
+
+        let mut owners = PreviewOwners::default();
+        let key_a = preview_key(Path::new("/w/a"), "x.rs");
+        let token_a = owners.begin(&key_a).unwrap();
+        owners.clear();
+        let key_b = preview_key(Path::new("/w/b"), "x.rs");
+        let token_b = owners.begin(&key_b).unwrap();
+        assert!(!owners.finish(&key_a, token_a));
+        assert_eq!(owners.begin(&key_b), None);
+        assert!(owners.finish(&key_b, token_b));
+    }
+
+    #[test]
+    fn a_completion_under_the_other_worktrees_key_is_stale() {
+        use std::path::Path;
+
+        let mut owners = PreviewOwners::default();
+        let key_a = preview_key(Path::new("/w/a"), "x.rs");
+        let token_a = owners.begin(&key_a).unwrap();
+        let key_b = preview_key(Path::new("/w/b"), "x.rs");
+        assert!(!owners.finish(&key_b, token_a));
+        assert_eq!(owners.stats().stale_drops, 1);
+        assert_eq!(owners.begin(&key_a), None);
+        assert!(owners.finish(&key_a, token_a));
     }
 
     #[test]
