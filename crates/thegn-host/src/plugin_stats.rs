@@ -228,11 +228,9 @@ fn write_status_file(
     let bytes = thegn_core::plugin_status::encode(&snapshot)
         .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
     crate::daemon::control_publish::prepare_run_dir(state_dir)?;
-    thegn_core::fsperm::write_owner_only_atomic(
-        &crate::daemon::control_publish::run_dir(state_dir)
-            .join(thegn_core::plugin_status::STATUS_FILE),
-        &bytes,
-    )
+    thegn_core::fsperm::open_private_dir(&crate::daemon::control_publish::run_dir(state_dir))?
+        .write_owner_only_atomic(thegn_core::plugin_status::STATUS_FILE, &bytes)?;
+    Ok(())
 }
 
 #[cfg(test)]

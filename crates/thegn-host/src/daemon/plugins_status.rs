@@ -50,8 +50,11 @@ mod tests {
 
     fn publish(state_dir: &Path, bytes: &[u8]) {
         let run_dir = super::super::control_publish::run_dir(state_dir);
-        std::fs::create_dir_all(&run_dir).unwrap();
-        thegn_core::fsperm::write_owner_only_atomic(&run_dir.join(STATUS_FILE), bytes).unwrap();
+        thegn_core::fsperm::ensure_private_dir(&run_dir).unwrap();
+        thegn_core::fsperm::open_private_dir(&run_dir)
+            .unwrap()
+            .write_owner_only_atomic(STATUS_FILE, bytes)
+            .unwrap();
     }
 
     fn snapshot(pid: u32) -> PluginStatusSnapshot {
