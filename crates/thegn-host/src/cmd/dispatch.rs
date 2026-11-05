@@ -31,7 +31,6 @@ use thegn_core::pipeline_reap;
 use thegn_core::pipeline_report;
 use thegn_core::pipeline_run::{self, WaitTarget};
 use thegn_core::store::NotificationStore;
-use thegn_core::util::{git_ok, git_out_allow_empty};
 #[path = "dispatch_gate.rs"]
 pub(crate) mod gate;
 
@@ -2079,12 +2078,18 @@ fn verify_facts_with_report_head(
             }
         }
     };
-    let tracked_in_index = git_ok(
+    let tracked_in_index = git_exit_0_or_1(
         wt,
         &["ls-files", "--error-unmatch", "--", artifact.as_str()],
-    );
-    let worktree_binding_valid = git_out_allow_empty(wt, &["rev-parse", "--show-toplevel"])
-        .and_then(|root| std::path::PathBuf::from(root).canonicalize().ok())
+    ) == Some(true);
+    let git_root = match git_text_local(wt, &["rev-parse", "--show-toplevel"]) {
+        Ok(root) => std::path::PathBuf::from(root).canonicalize().ok(),
+        Err(error) => {
+            note_git_read_failure("rev-parse --show-toplevel", wt, &error);
+            None
+        }
+    };
+    let worktree_binding_valid = git_root
         .zip(wt.canonicalize().ok())
         .is_some_and(|(git_root, row_root)| git_root == row_root);
     // The artifact must be present in HEAD and byte-for-byte clean relative to
@@ -2092,8 +2097,14 @@ fn verify_facts_with_report_head(
     // handoff and disappears if the worktree is cleaned.
     let tracked = worktree_binding_valid
         && tracked_in_index
-        && git_ok(wt, &["diff", "--quiet", "HEAD", "--", artifact.as_str()]);
-    let status = git_out_allow_empty(wt, &["status", "--porcelain"]);
+        && git_exit_0_or_1(wt, &["diff", "--quiet", "HEAD", "--", artifact.as_str()]) == Some(true);
+    let status = match git_text_local(wt, &["status", "--porcelain"]) {
+        Ok(status) => Some(status),
+        Err(error) => {
+            note_git_read_failure("status --porcelain", wt, &error);
+            None
+        }
+    };
     let worktree_state = worktree_state_from_status(status.as_deref());
     let dirty = worktree_state == pipeline_run::WorktreeState::Dirty;
     // THE-88: a row carrying an artifact must also file a report —
@@ -2124,9 +2135,14 @@ fn verify_facts_with_report_head(
                 pipeline_run::report_commit_binding(Some(report_head), None, None, None);
             return facts;
         }
-        let head = git_out_allow_empty(wt, &["rev-parse", "--verify", "HEAD"])
-            .map(|value| value.trim().to_string())
-            .filter(|value| !value.is_empty());
+        let head = match git_text_local(wt, &["rev-parse", "--verify", "HEAD"]) {
+            Ok(head) if !head.is_empty() => Some(head),
+            Ok(_) => None,
+            Err(error) => {
+                note_git_read_failure("rev-parse --verify HEAD", wt, &error);
+                None
+            }
+        };
         let (is_ancestor, artifact_unchanged) = match (head.as_deref(), facts.artifact.as_deref()) {
             (Some(head), Some(artifact)) => (
                 git_exit_0_or_1(wt, &["merge-base", "--is-ancestor", report_head, head]),
@@ -2162,21 +2178,51 @@ fn read_artifact_content(path: &std::path::Path) -> pipeline_run::ArtifactConten
     pipeline_run::classify_artifact_bytes(&bytes, over_limit)
 }
 
-/// Return Some(true/false) for git exit 0/1; any spawn or other exit failure is unknown.
-#[expect(
-    clippy::disallowed_methods,
-    reason = "dispatch verify, set-status, and wait are CLI paths off the compositor loop"
-)]
+/// Return Some(true/false) for Git exit 0/1, bounded by GITLOC_READ_DEADLINE;
+/// other failures are unknown.
 fn git_exit_0_or_1(worktree: &std::path::Path, args: &[&str]) -> Option<bool> {
-    let output = thegn_core::util::git_cmd(worktree)
-        .args(args)
-        .output()
-        .ok()?;
-    match output.status.code() {
-        Some(0) => Some(true),
-        Some(1) => Some(false),
-        _ => None,
+    let outcome = thegn_core::git_run::git_run(
+        worktree,
+        args,
+        &thegn_core::git_run::GitPolicy::read(thegn_core::remote::GITLOC_READ_DEADLINE),
+        &NO_CANCEL,
+    );
+    if outcome.is_success() {
+        return Some(true);
     }
+    match outcome {
+        thegn_core::git_run::GitOutcome::Exit { code: Some(1), .. } => Some(false),
+        other => {
+            note_git_read_failure(args.first().copied().unwrap_or("git"), worktree, &other);
+            None
+        }
+    }
+}
+
+/// The bounded read policy for the dispatch artifact gate (CLI path, off the compositor loop).
+static NO_CANCEL: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Run Git in `worktree` under `GitPolicy::read(GITLOC_READ_DEADLINE)`; trimmed UTF-8 text.
+/// Empty success is `Ok("")`; every other outcome is a typed error (never `None`).
+fn git_text_local(
+    worktree: &std::path::Path,
+    args: &[&str],
+) -> std::result::Result<String, thegn_core::git_run::GitTextError> {
+    thegn_core::git_run::git_run(
+        worktree,
+        args,
+        &thegn_core::git_run::GitPolicy::read(thegn_core::remote::GITLOC_READ_DEADLINE),
+        &NO_CANCEL,
+    )
+    .into_text()
+    .map(|text| text.trim().to_string())
+}
+
+/// Log why a verify-time Git read could not be trusted; the fact then keeps
+/// its fail-closed value.
+fn note_git_read_failure(what: &str, worktree: &std::path::Path, error: &dyn std::fmt::Display) {
+    tracing::warn!(target: "thegn::pipeline", read = what, worktree = %worktree.display(), error = %error,
+        "dispatch verify could not read Git; treating the fact as unverified");
 }
 
 fn is_hex_oid(value: &str) -> bool {
@@ -2660,14 +2706,15 @@ pub(crate) fn record_report(db: &Db, id: i64, text: &str) -> Result<RecordedRepo
     let row = db
         .get_dispatch(id)?
         .ok_or_else(|| anyhow::anyhow!("roster row {id} does not exist"))?;
-    let head_oid = git_out_allow_empty(
-        std::path::Path::new(&row.worktree_path),
-        &["rev-parse", "--verify", "HEAD"],
-    )
-    .filter(|oid| !oid.is_empty());
-    if head_oid.is_none() {
-        tracing::warn!(target: "thegn::pipeline", dispatch_id = id, "could not record HEAD for dispatch report");
-    }
+    let worktree = std::path::Path::new(&row.worktree_path);
+    let head_oid = match git_text_local(worktree, &["rev-parse", "--verify", "HEAD"]) {
+        Ok(oid) if !oid.is_empty() => Some(oid),
+        Ok(_) => None,
+        Err(error) => {
+            note_git_read_failure("rev-parse --verify HEAD", worktree, &error);
+            None
+        }
+    };
     db.set_dispatch_report_bound(id, &validated, head_oid.as_deref())?;
     let ungated = pipeline_report::pass_without_gate_evidence(&validated);
     Ok(RecordedReport { validated, ungated })
@@ -3265,6 +3312,7 @@ fn handoff_message(outcome: pipeline_run::HandoffOutcome) -> &'static str {
 mod tests {
     use super::*;
     use thegn_core::store::NotificationStore;
+    use thegn_core::util::{git_ok, git_out_allow_empty};
 
     #[test]
     fn report_head_revision_must_be_a_hex_oid() {
@@ -4726,6 +4774,61 @@ mod tests {
         commit_artifact(&root);
         let f = verify_facts(&row_in(&root, Some(ARTIFACT)));
         assert!(f.exists && f.tracked && !f.dirty);
+    }
+
+    #[test]
+    fn git_text_local_returns_trimmed_output_and_empty_success() {
+        let (_d, root) = git_repo("typed-read");
+        assert!(
+            git_text_local(&root, &["status", "--porcelain"])
+                .unwrap()
+                .is_empty()
+        );
+        let oid = git_text_local(&root, &["rev-parse", "--verify", "HEAD"]).unwrap();
+        assert!(is_hex_oid(&oid));
+    }
+
+    #[test]
+    fn git_text_local_reports_a_failing_git_as_an_error() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(git_text_local(dir.path(), &["rev-parse", "--show-toplevel"]).is_err());
+    }
+
+    #[test]
+    fn git_exit_0_or_1_separates_exit_one_from_failure() {
+        let (_d, root) = git_repo("exit01");
+        commit_artifact(&root);
+        assert_eq!(
+            git_exit_0_or_1(&root, &["diff", "--quiet", "HEAD", "--", ARTIFACT]),
+            Some(true)
+        );
+        std::fs::write(root.join(ARTIFACT), "changed").unwrap();
+        assert_eq!(
+            git_exit_0_or_1(&root, &["diff", "--quiet", "HEAD", "--", ARTIFACT]),
+            Some(false)
+        );
+        let dir = tempfile::tempdir().unwrap();
+        assert_eq!(
+            git_exit_0_or_1(dir.path(), &["merge-base", "--is-ancestor", "HEAD", "HEAD"]),
+            None
+        );
+    }
+
+    #[test]
+    fn facts_for_an_unreadable_repository_are_untracked_with_unknown_state() {
+        let dir = tempfile::tempdir().unwrap();
+        let artifact = dir.path().join(ARTIFACT);
+        std::fs::create_dir_all(artifact.parent().unwrap()).unwrap();
+        std::fs::write(&artifact, "x").unwrap();
+
+        let facts = verify_facts(&row_in(dir.path(), Some(ARTIFACT)));
+        assert!(facts.exists);
+        assert!(!facts.tracked);
+        assert!(!facts.dirty);
+        assert_eq!(
+            facts.worktree_state,
+            Some(pipeline_run::WorktreeState::Unknown)
+        );
     }
 
     #[test]
