@@ -299,6 +299,26 @@ self: {
     drawer.pool_limit = cfg.drawerPoolLimit;
     drawer.prewarm = cfg.drawerPrewarm;
     strip.visible = cfg.stripVisible;
+    git.override_gpg = cfg.gitOverrideGpg;
+    git.merge_guard = cfg.gitMergeGuard;
+    git.auto_fetch = cfg.gitAutoFetch;
+    git.auto_fetch_interval_secs = cfg.gitAutoFetchIntervalSecs;
+    git.auto_fetch_min_interval_secs = cfg.gitAutoFetchMinIntervalSecs;
+    git.auto_fetch_notify = cfg.gitAutoFetchNotify;
+    git.auto_fetch_colocated = cfg.gitAutoFetchColocated;
+    stats.cpu_icon = cfg.statsCpuIcon;
+    stats.mem_icon = cfg.statsMemIcon;
+    stats.net_icon = cfg.statsNetIcon;
+    stats.gpu_icon = cfg.statsGpuIcon;
+    stats.temp_icon = cfg.statsTempIcon;
+    stats.swap_icon = cfg.statsSwapIcon;
+    stats.freq_icon = cfg.statsFreqIcon;
+    stats.load_icon = cfg.statsLoadIcon;
+    stats.uptime_icon = cfg.statsUptimeIcon;
+    stats.battery_icon = cfg.statsBatteryIcon;
+    stats.battery_charging_icon = cfg.statsBatteryChargingIcon;
+    stats.disk_icon = cfg.statsDiskIcon;
+    stats.disk_path = cfg.statsDiskPath;
     monitor = {
       system = cfg.monitorSystem;
       gpu = cfg.monitorGpu;
@@ -861,6 +881,126 @@ in {
       type = lib.types.nullOr (lib.types.bool);
       default = null;
       description = "Whether the pinned-program strip is shown when it has at least one pin. Unset (null) = the binary's default.";
+    };
+
+    gitOverrideGpg = lib.mkOption {
+      type = lib.types.nullOr (lib.types.bool);
+      default = null;
+      description = "Pass `-c commit.gpgSign=false -c tag.gpgSign=false` to history-rewriting operations so a gpg prompt cannot hang a background op. Unset (null) = the binary's default.";
+    };
+
+    gitMergeGuard = lib.mkOption {
+      type = lib.types.nullOr (lib.types.bool);
+      default = null;
+      description = "Install the pre-merge-commit hook that refuses a merge into the canonical checkout from inside a thegn sandbox. Unset (null) = the binary's default.";
+    };
+
+    gitAutoFetch = lib.mkOption {
+      type = lib.types.nullOr (lib.types.bool);
+      default = null;
+      description = "Poll the remote in the background with `git fetch --prune` (never a merge). Unset (null) = the binary's default.";
+    };
+
+    gitAutoFetchIntervalSecs = lib.mkOption {
+      type = lib.types.nullOr (lib.types.ints.between 0 2678400);
+      default = null;
+      description = "Background-fetch cadence in seconds; 0 disables the periodic poll. Unset (null) = the binary's default.";
+    };
+
+    gitAutoFetchMinIntervalSecs = lib.mkOption {
+      type = lib.types.nullOr (lib.types.ints.between 0 2678400);
+      default = null;
+      description = "Floor between two background fetches of the same repo. Unset (null) = the binary's default.";
+    };
+
+    gitAutoFetchNotify = lib.mkOption {
+      type = lib.types.nullOr (lib.types.bool);
+      default = null;
+      description = "Also raise an inbox notification when a background fetch finds new upstream commits. Unset (null) = the binary's default.";
+    };
+
+    gitAutoFetchColocated = lib.mkOption {
+      type = lib.types.nullOr (lib.types.bool);
+      default = null;
+      description = "Also run background auto-fetch in repos colocated with jujutsu. Unset (null) = the binary's default.";
+    };
+
+    statsCpuIcon = lib.mkOption {
+      type = lib.types.nullOr (lib.types.str);
+      default = null;
+      description = "CPU masthead stats-widget icon; text or a symbol. Unset (null) = the binary's default.";
+    };
+
+    statsMemIcon = lib.mkOption {
+      type = lib.types.nullOr (lib.types.str);
+      default = null;
+      description = "Memory masthead stats-widget icon; text or a symbol. Unset (null) = the binary's default.";
+    };
+
+    statsNetIcon = lib.mkOption {
+      type = lib.types.nullOr (lib.types.str);
+      default = null;
+      description = "Network masthead stats-widget icon; text or a symbol. Unset (null) = the binary's default.";
+    };
+
+    statsGpuIcon = lib.mkOption {
+      type = lib.types.nullOr (lib.types.str);
+      default = null;
+      description = "GPU masthead stats-widget icon; text or a symbol. Unset (null) = the binary's default.";
+    };
+
+    statsTempIcon = lib.mkOption {
+      type = lib.types.nullOr (lib.types.str);
+      default = null;
+      description = "Temperature masthead stats-widget icon; text or a symbol. Unset (null) = the binary's default.";
+    };
+
+    statsSwapIcon = lib.mkOption {
+      type = lib.types.nullOr (lib.types.str);
+      default = null;
+      description = "Swap masthead stats-widget icon; text or a symbol. Unset (null) = the binary's default.";
+    };
+
+    statsFreqIcon = lib.mkOption {
+      type = lib.types.nullOr (lib.types.str);
+      default = null;
+      description = "Frequency masthead stats-widget icon; text or a symbol. Unset (null) = the binary's default.";
+    };
+
+    statsLoadIcon = lib.mkOption {
+      type = lib.types.nullOr (lib.types.str);
+      default = null;
+      description = "Load masthead stats-widget icon; text or a symbol. Unset (null) = the binary's default.";
+    };
+
+    statsUptimeIcon = lib.mkOption {
+      type = lib.types.nullOr (lib.types.str);
+      default = null;
+      description = "Uptime masthead stats-widget icon; text or a symbol. Unset (null) = the binary's default.";
+    };
+
+    statsBatteryIcon = lib.mkOption {
+      type = lib.types.nullOr (lib.types.str);
+      default = null;
+      description = "Battery masthead stats-widget icon; text or a symbol. Unset (null) = the binary's default.";
+    };
+
+    statsBatteryChargingIcon = lib.mkOption {
+      type = lib.types.nullOr (lib.types.str);
+      default = null;
+      description = "Battery-charging masthead stats-widget icon; text or a symbol. Unset (null) = the binary's default.";
+    };
+
+    statsDiskIcon = lib.mkOption {
+      type = lib.types.nullOr (lib.types.str);
+      default = null;
+      description = "Disk masthead stats-widget icon; text or a symbol. Unset (null) = the binary's default.";
+    };
+
+    statsDiskPath = lib.mkOption {
+      type = lib.types.nullOr (lib.types.str);
+      default = null;
+      description = "Filesystem the disk masthead widget measures; empty = the filesystem holding the worktrees directory. Unset (null) = the binary's default.";
     };
 
     monitorSystem = lib.mkOption {
