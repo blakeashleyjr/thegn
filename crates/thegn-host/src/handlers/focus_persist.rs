@@ -2,28 +2,23 @@
 
 use anyhow::Result;
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{LazyLock, Mutex};
 
 #[derive(Default)]
 pub(crate) struct FocusLedger {
-    next: u64,
     admitted: HashMap<String, u64>,
 }
 
-impl FocusLedger {
-    pub(crate) fn ticket(&mut self) -> u64 {
-        self.next += 1;
-        self.next
-    }
+static LEDGER: LazyLock<Mutex<FocusLedger>> = LazyLock::new(|| Mutex::new(FocusLedger::default()));
+static NEXT_TICKET: AtomicU64 = AtomicU64::new(0);
+
+fn take_ticket(counter: &AtomicU64) -> u64 {
+    counter.fetch_add(1, Ordering::Relaxed) + 1
 }
 
-static LEDGER: LazyLock<Mutex<FocusLedger>> = LazyLock::new(|| Mutex::new(FocusLedger::default()));
-
 pub(crate) fn next_ticket() -> u64 {
-    LEDGER
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .ticket()
+    take_ticket(&NEXT_TICKET)
 }
 
 pub(crate) fn write_in_order<F>(
@@ -58,17 +53,22 @@ where
 
 #[cfg(test)]
 mod tests {
-    use super::{FocusLedger, write_in_order};
+    use super::{FocusLedger, take_ticket, write_in_order};
     use std::cell::RefCell;
     use std::sync::Mutex;
+    use std::sync::atomic::AtomicU64;
+
+    #[test]
+    fn ticket_counter_advances_without_the_ledger() {
+        let counter = AtomicU64::new(0);
+        assert_eq!(take_ticket(&counter), 1);
+        assert_eq!(take_ticket(&counter), 2);
+    }
 
     #[test]
     fn older_ticket_arriving_last_is_skipped() {
         let ledger = Mutex::new(FocusLedger::default());
-        let (older, newer) = {
-            let mut ledger = ledger.lock().unwrap();
-            (ledger.ticket(), ledger.ticket())
-        };
+        let (older, newer) = (1, 2);
         assert_eq!(older, 1);
         let writes = RefCell::new(Vec::new());
 
@@ -89,10 +89,7 @@ mod tests {
     #[test]
     fn in_order_tickets_both_write() {
         let ledger = Mutex::new(FocusLedger::default());
-        let (older, newer) = {
-            let mut ledger = ledger.lock().unwrap();
-            (ledger.ticket(), ledger.ticket())
-        };
+        let (older, newer) = (1, 2);
         let writes = RefCell::new(Vec::new());
 
         let first = write_in_order(&ledger, "s", older, || {
@@ -112,10 +109,7 @@ mod tests {
     #[test]
     fn sessions_are_independent() {
         let ledger = Mutex::new(FocusLedger::default());
-        let (older, newer) = {
-            let mut ledger = ledger.lock().unwrap();
-            (ledger.ticket(), ledger.ticket())
-        };
+        let (older, newer) = (1, 2);
         let writes = RefCell::new(Vec::new());
 
         let x = write_in_order(&ledger, "x", newer, || {
@@ -135,10 +129,7 @@ mod tests {
     #[test]
     fn a_failed_write_still_orders_later_stale_tickets() {
         let ledger = Mutex::new(FocusLedger::default());
-        let (older, newer) = {
-            let mut ledger = ledger.lock().unwrap();
-            (ledger.ticket(), ledger.ticket())
-        };
+        let (older, newer) = (1, 2);
         let writes = RefCell::new(Vec::new());
 
         let failed = write_in_order(&ledger, "s", newer, || {
