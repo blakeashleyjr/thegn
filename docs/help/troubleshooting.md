@@ -97,15 +97,15 @@ page.
 causes include no backend meeting the default isolation floor, `bwrap` or
 `systemd-run` missing from thegn's own `PATH`, a configured VPN with
 `sealed-tunnel`, or a `sealed` launch that cannot hide `$HOME`. The default
-`standard` profile protects integrity, not credentials: `$HOME` remains
-readable. `sealed` hides it.
+`sealed` profile hides `$HOME`; the opt-in `standard` profile protects
+integrity, not credentials, so `$HOME` stays readable.
 
 **Do this:** Inspect `thegn doctor` and the refusal remediation. On NixOS, the
 sandboxing page recommends pinning `backend = "bwrap"`. See [[sandboxing]].
 
 ## A worktree or repository operation is refused by the merge queue
 
-**Why:** The queue refuses a branch that moved after verification.
+**Why:** A branch that moved after verification is refused.
 
 **Do this:** Run `thegn merge add` to re-enqueue it so the queue verifies the
 new commits. See [[merge-queue]].
