@@ -8,9 +8,9 @@ context: |
   thegn (binary `thegn`, alias `tg`) is a terminal-native git-worktree IDE
   that is its own terminal multiplexer: one process, one session; each repo
   is a workspace, each git worktree a tab; the chrome is rendered in-process.
-  The AI layer was removed before the public alpha — the shell never
-  hard-depends on an agent; anything agent-adjacent is a plain configured
-  command or a subprocess hook.
+  The shell is AI-free — it never hard-depends on an agent or a model; anything
+  agent-adjacent is a plain configured command, a subprocess hook, or the
+  separate opt-in model proxy (crates/thegn-proxy, binary tgproxy).
 
   ARCHITECTURE: docs/ARCHITECTURE.md is the single source (crates, event
   loop, rendering, platform code, provider seams, the capability catalog,
