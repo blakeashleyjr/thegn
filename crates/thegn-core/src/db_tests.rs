@@ -5413,6 +5413,24 @@ fn schema_refusal_blocks_an_older_build_against_a_newer_database() {
 }
 
 #[test]
+fn schema_refusal_points_at_the_upgrade_help_page() {
+    let msg = crate::db::schema_refusal(62, 57, false).expect("a newer database must be refused");
+    assert!(
+        msg.contains("the `upgrading-and-uninstalling` help page"),
+        "{msg}"
+    );
+    assert!(
+        msg.contains("docs/help/upgrading-and-uninstalling.md"),
+        "{msg}"
+    );
+    assert!(
+        msg.contains("Upgrade, rollback and backup steps: the `upgrading-and-uninstalling` help page (F1 in thegn, or docs/help/upgrading-and-uninstalling.md in the source tree)."),
+        "{msg}"
+    );
+    assert!(crate::db::schema_refusal(62, 57, true).is_none());
+}
+
+#[test]
 fn opening_a_newer_database_fails_with_the_actionable_error() {
     // End-to-end over a real file: stamp a user_version past this build and
     // prove `Db::open_at` refuses rather than returning a tolerant handle.
