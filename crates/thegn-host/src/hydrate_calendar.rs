@@ -505,6 +505,54 @@ fn contention_backoff(account: &str, now: i64) -> bool {
     }
 }
 
+type PassKey = (String, NaiveDate, NaiveDate);
+
+fn pass_claims() -> &'static Mutex<BTreeMap<PassKey, usize>> {
+    static CLAIMS: OnceLock<Mutex<BTreeMap<PassKey, usize>>> = OnceLock::new();
+    CLAIMS.get_or_init(Default::default)
+}
+
+/// Accounts this pass is fetching; released on drop (also on unwind).
+struct PassClaim(Vec<PassKey>);
+
+impl Drop for PassClaim {
+    fn drop(&mut self) {
+        let mut claims = pass_claims().lock().unwrap_or_else(|e| e.into_inner());
+        for key in self.0.drain(..) {
+            if let Some(holders) = claims.get_mut(&key) {
+                *holders -= 1;
+                if *holders == 0 {
+                    claims.remove(&key);
+                }
+            }
+        }
+    }
+}
+
+/// Claim `names` for the window. A non-forced pass skips an account another pass already
+/// holds for the same window (that pass applies and delivers its result); a forced pass is
+/// never skipped. Returns the guard and the names this pass must fetch.
+fn claim_accounts(
+    names: Vec<String>,
+    from: NaiveDate,
+    to: NaiveDate,
+    force: bool,
+) -> (PassClaim, Vec<String>) {
+    let mut claims = pass_claims().lock().unwrap_or_else(|e| e.into_inner());
+    let mut held = Vec::new();
+    let mut wanted = Vec::new();
+    for name in names {
+        let key = (name.clone(), from, to);
+        if !force && claims.contains_key(&key) {
+            continue;
+        }
+        *claims.entry(key.clone()).or_insert(0) += 1;
+        held.push(key);
+        wanted.push(name);
+    }
+    (PassClaim(held), wanted)
+}
+
 type CalendarDiagnosticsMap = Mutex<BTreeMap<String, thegn_svc::calendar::PageDiagnostics>>;
 
 fn diagnostics_seen() -> &'static CalendarDiagnosticsMap {
@@ -661,6 +709,12 @@ fn sync_accounts_with_generation(
         wanted.push(a.name.clone());
     }
     if wanted.is_empty() {
+        return false;
+    }
+
+    let (_claim, wanted) = claim_accounts(wanted, from, to, force);
+    if wanted.is_empty() {
+        tracing::debug!(target: "thegn::calendar", "calendar pass coalesced into one already fetching these accounts");
         return false;
     }
 
