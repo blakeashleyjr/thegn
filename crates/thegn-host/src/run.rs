@@ -2087,13 +2087,17 @@ fn connect_worktree_bridge(
         }
         let repo_root = thegn_core::repo::main_worktree(&wt).unwrap_or_else(|| wt.clone());
         let selection = thegn_core::db::Db::open().and_then(|db| {
-            crate::bridge_sup::bridge_env_selection(
+            let env_name = crate::bridge_sup::bridge_env_selection(
                 &db,
                 &wt.to_string_lossy(),
                 &repo_root.to_string_lossy(),
-            )
+            )?;
+            let mut selection =
+                db.effective_env_selection(&wt.to_string_lossy(), &repo_root.to_string_lossy())?;
+            selection.name = env_name;
+            Ok(selection)
         });
-        let env_name = match selection {
+        let selection = match selection {
             Ok(selected) => selected,
             Err(error) => {
                 tracing::warn!(
@@ -2105,15 +2109,7 @@ fn connect_worktree_bridge(
                 return;
             }
         };
-        let env = cfg.resolve_env(
-            &repo_root,
-            &loc,
-            &wt,
-            &thegn_core::sandbox_pin::EnvSelection {
-                name: env_name.clone(),
-                profile: None,
-            },
-        );
+        let env = cfg.resolve_env(&repo_root, &loc, &wt, &selection);
         // For a managed provider, install and verify the resident bridge before
         // tunneling or connecting; a failed or unverified install skips both.
         let bridge = if matches!(env.placement, thegn_core::placement::Placement::Provider(_)) {
@@ -3738,6 +3734,7 @@ pub(crate) fn begin_worktree_preset(
         env,
         sandbox,
         agent,
+        profile: None,
     }));
     // No interactive overlay (`wizard_ui` stays None); the worker's `TabOpened`
     // event opens the tab + loading splash, same as the wizard's submit path.
@@ -19495,9 +19492,17 @@ async fn event_loop<T: Terminal>(
                             }
                             model.status = "worktree creation cancelled".into();
                         }
-                        wizard::WizardOutcome::PrepChosen { env, sandbox } => {
+                        wizard::WizardOutcome::PrepChosen {
+                            env,
+                            sandbox,
+                            profile,
+                        } => {
                             if let Some(tx) = wizard_cmd_tx.as_ref() {
-                                let _ = tx.send(wizard::WizardCmd::PrepChosen { env, sandbox }); // best-effort: send: the consumer may be gone; a closed channel is the consumer going away
+                                let _ = tx.send(wizard::WizardCmd::PrepChosen {
+                                    env,
+                                    sandbox,
+                                    profile,
+                                }); // best-effort: send: the consumer may be gone; a closed channel is the consumer going away
                             }
                         }
                         outcome @ (wizard::WizardOutcome::AddHost
@@ -19996,6 +20001,51 @@ async fn event_loop<T: Terminal>(
                             // dismissal below must be gated on this being one.
                             let was_halt = m.tag == menu::MenuKindTag::SandboxHalt;
                             active_menu = None;
+                            if let menu::MenuChoice::Confirm {
+                                tag: "sandbox-profile",
+                                arg,
+                            } = &choice
+                            {
+                                let worktree =
+                                    active_tab_path(&session).to_string_lossy().into_owned();
+                                let parsed = if arg == "clear" {
+                                    Ok(None)
+                                } else {
+                                    thegn_core::sandbox_pin::parse_pin(arg).map(Some)
+                                };
+                                match parsed {
+                                    Ok(profile) => {
+                                        let path = worktree.clone();
+                                        crate::db_task::persist(move |db| {
+                                            if let Err(error) =
+                                                db.set_worktree_sandbox_profile(&path, profile)
+                                            {
+                                                tracing::warn!(target: "thegn::sandbox", worktree = %path, %error, "could not persist worktree isolation profile");
+                                                crate::db_task::alert(&format!(
+                                                    "Could not save isolation profile for {path}: {error}"
+                                                ));
+                                            }
+                                        });
+                                        let value = profile.map_or_else(
+                                            || "inherit".to_string(),
+                                            |p| p.as_str().to_string(),
+                                        );
+                                        let branch = session
+                                            .active_group()
+                                            .map(|g| g.name.clone())
+                                            .unwrap_or_else(|| worktree.clone());
+                                        model.status = format!(
+                                            "Saving isolation profile for {branch}: {value}. Applies to new panes; restart open panes."
+                                        );
+                                        if let Err(error) = refresh_tx.send(RefreshKind::Model) {
+                                            tracing::debug!(target: "thegn::hydrate", %error, "model refresh request failed");
+                                        }
+                                    }
+                                    Err(error) => model.status = error.to_string(),
+                                }
+                                dirty = true;
+                                continue;
+                            }
                             if matches!(
                                 &choice,
                                 menu::MenuChoice::Confirm {
@@ -25395,6 +25445,18 @@ async fn event_loop<T: Terminal>(
                                 // the move-item chord while the switcher is open.
                                 ps.profile_reorder = true;
                                 palette = Some(ps);
+                            }
+                            Action::SandboxProfile => {
+                                let profile = model
+                                    .active_sandbox_profile_pin
+                                    .as_deref()
+                                    .and_then(|name| thegn_core::sandbox_pin::parse_pin(name).ok())
+                                    .unwrap_or(current_config.sandbox.profile);
+                                active_menu = Some(crate::menu::sandbox_profile_menu(
+                                    profile,
+                                    model.active_sandbox_profile_pin.is_some(),
+                                    current_config.sandbox.profile,
+                                ));
                             }
                             // Both `Ctrl+Alt+f` and `Alt+y` are the same
                             // worktree-scoped toggle. The handler remembers the

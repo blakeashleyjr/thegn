@@ -136,13 +136,9 @@ pub(crate) fn resolve_env_trusted(
                 "could not read the worktree sandbox selection; refusing launch: {error:#}"
             )
         })?;
-    let worktree_selection = if selected_env.name.is_some() {
-        EnvSelection {
-            name: selected_env.name.clone(),
-            profile: worktree_selection.profile,
-        }
-    } else {
-        worktree_selection
+    let worktree_selection = EnvSelection {
+        name: selected_env.name.clone().or(worktree_selection.name),
+        profile: selected_env.profile.or(worktree_selection.profile),
     };
     let approved_canonical = db.repo_trust_approved(&root_s).unwrap_or_default();
     let approvals = Approvals::from_canonical(approved_canonical.clone());

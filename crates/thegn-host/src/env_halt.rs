@@ -81,8 +81,8 @@ pub fn env_halt_reason(cfg: &Config, worktree: &str) -> Option<SandboxHalt> {
             dormant: None,
         });
     }
-    let selected_env = match Db::open()
-        .and_then(|db| db.effective_env_checked(worktree, &repo_root.to_string_lossy()))
+    let selection = match Db::open()
+        .and_then(|db| db.effective_env_selection(worktree, &repo_root.to_string_lossy()))
     {
         Ok(selection) => selection,
         Err(error) => {
@@ -101,18 +101,11 @@ pub fn env_halt_reason(cfg: &Config, worktree: &str) -> Option<SandboxHalt> {
                 error = %format!("{error:#}"),
                 "environment selection unreadable; continuing with local resolution"
             );
-            None
+            thegn_core::sandbox_pin::EnvSelection::none()
         }
     };
-    let environment = cfg.resolve_env(
-        &repo_root,
-        &loc,
-        Path::new(worktree),
-        &thegn_core::sandbox_pin::EnvSelection {
-            name: selected_env.clone(),
-            profile: None,
-        },
-    );
+    let selected_env = selection.name.clone();
+    let environment = cfg.resolve_env(&repo_root, &loc, Path::new(worktree), &selection);
     // A non-default env was SELECTED (per-worktree pin, repo `.thegn.*` overlay, or
     // `default_env`) but didn't resolve to an `[env.<name>]` table, so resolution
     // fell back to Local carrying the requested name (`unresolved_selection`). That

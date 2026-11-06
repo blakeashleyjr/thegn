@@ -1526,6 +1526,13 @@ fn db_worktree_list_with_snapshot(
                         None => true,
                     }
             });
+        let sandbox_profile = match db.worktree_sandbox_profile(&w.worktree) {
+            Ok(profile) => profile.map(|profile| profile.as_str().to_string()),
+            Err(error) => {
+                tracing::debug!(target: "thegn::hydrate", worktree = %w.worktree, %error, "worktree profile pin could not be read for the sidebar");
+                None
+            }
+        };
         out.push(crate::sidebar::DbWorktree {
             slug,
             branch,
@@ -1538,6 +1545,7 @@ fn db_worktree_list_with_snapshot(
             // that is what let a host pane display as a container.
             sandbox_backend: w.observed_backend.clone(),
             env_name: w.env_name.clone(),
+            sandbox_profile,
             env_degraded,
         });
     }
@@ -2867,18 +2875,15 @@ pub(crate) fn build_model(
     // resolved it as Local — no `[sprites]` chip and a bogus `(bwrap)` chip —
     // while the splash correctly showed the provider placement. An unreadable
     // selection shows the `env?` chip, see `unreadable_env_chips`.
-    let selection = db.effective_env_checked(&active_path, &active_repo);
+    let selection = db.effective_env_selection(&active_path, &active_repo);
     let selection_error: Option<String> =
         selection.as_ref().err().map(|error| format!("{error:#}"));
-    let selected: Option<String> = selection.unwrap_or_default();
+    let selected = selection.unwrap_or_default();
     let active_env = app_cfg.resolve_env(
         std::path::Path::new(&active_repo),
         &loc,
         std::path::Path::new(&active_path),
-        &thegn_core::sandbox_pin::EnvSelection {
-            name: selected.clone(),
-            profile: None,
-        },
+        &selected,
     );
     // A provider env whose CONTENT resolved local has degraded to the host
     // (provider unavailable + `failover`, or a stale remote location healed back
@@ -3001,6 +3006,7 @@ pub(crate) fn build_model(
             &hints.profile,
         ),
         active_sandbox_backend,
+        active_sandbox_profile_pin: selected.profile.map(|profile| profile.as_str().to_string()),
         active_placement_kind,
         active_placement_label,
         // containers is populated by the dedicated container refresh ticker

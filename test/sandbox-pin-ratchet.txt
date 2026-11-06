@@ -1,0 +1,23 @@
+# Existing call sites are pinned while they are migrated to the worktree's
+# effective_env_selection. This list may only shrink; do not add new source
+# files that create a name-only profile selection.
+agent.rs
+agent_configs.rs
+close_teardown.rs
+cmd/env.rs
+cmd/sandbox_profile.rs
+cmd/wt.rs
+config_capture_tests.rs
+config_startup.rs
+config_startup_tests.rs
+handlers/repo_trust.rs
+lifecycle.rs
+loading/track.rs
+merge_cleanup.rs
+placement_flow.rs
+provider_factory.rs
+pty_drain.rs
+run.rs
+sidebar.rs
+wizard.rs
+worktree_lifecycle.rs

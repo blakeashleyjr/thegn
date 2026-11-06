@@ -221,15 +221,9 @@ fn resolve_binding(
         Db::open().and_then(|db| db.effective_env_checked(worktree, &repo_root.to_string_lossy())),
         cfg,
     )?;
-    let environment = cfg.resolve_env(
-        &repo_root,
-        &loc,
-        std::path::Path::new(worktree),
-        &thegn_core::sandbox_pin::EnvSelection {
-            name: selected.clone(),
-            profile: None,
-        },
-    );
+    let mut selection = crate::sandbox_profile_ui::selection_for(worktree, &repo_root)?;
+    selection.name = Some(selected.clone());
+    let environment = cfg.resolve_env(&repo_root, &loc, std::path::Path::new(worktree), &selection);
     let envc = cfg.env.get(&environment.name);
     if let Some(e) = envc.filter(|e| !e.host.trim().is_empty()) {
         let Some(binding) = cfg.resolve_host_binding(&environment.name, e) else {

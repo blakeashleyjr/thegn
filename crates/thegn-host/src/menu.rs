@@ -814,6 +814,46 @@ pub fn sandbox_dormant_menu(
     MenuOverlay::new(MenuKindTag::SandboxHalt, title, items).with_body(body)
 }
 
+pub fn sandbox_profile_menu(
+    current: thegn_core::config::SandboxProfile,
+    pinned: bool,
+    default: thegn_core::config::SandboxProfile,
+) -> MenuOverlay {
+    let options = [
+        ("standard", thegn_core::config::SandboxProfile::Hardened),
+        ("sealed", thegn_core::config::SandboxProfile::Sealed),
+    ];
+    let items = options
+        .into_iter()
+        .enumerate()
+        .map(|(index, (arg, profile))| {
+            let key = if index == 0 { 's' } else { 'e' };
+            let suffix = if profile == default { " (default)" } else { "" };
+            item(
+                Some(key),
+                format!("{arg}{suffix}"),
+                MenuChoice::Confirm {
+                    tag: "sandbox-profile",
+                    arg: arg.to_string(),
+                },
+            )
+            .note(thegn_core::sandbox_pin::explain(profile).one_liner)
+        })
+        .chain(pinned.then(|| {
+            item(
+                Some('c'),
+                "clear override",
+                MenuChoice::Confirm {
+                    tag: "sandbox-profile",
+                    arg: "clear".to_string(),
+                },
+            )
+        }))
+        .collect();
+    let body = thegn_core::sandbox_pin::explain(current).one_liner;
+    MenuOverlay::new(MenuKindTag::Confirm, "Isolation profile", items).with_body(body)
+}
+
 pub fn keymap_preset_menu() -> MenuOverlay {
     MenuOverlay::new(
         MenuKindTag::KeymapPicker,
