@@ -119,6 +119,12 @@ service, one with no running container, and a scaled service whose replica 1 is
 not running. For a scaled service whose replica 1 is not running, bring it back,
 for example with `docker compose up -d <service>`.
 
+When sandbox preparation fails with a typed refusal, its message leads with
+the refusal class and remediation, for example `sandbox bwrap failed: sandbox
+entry refused [<class>]: <remediation>`. This detail is used in launch
+warnings, the new-worktree wizard and host worktree pipeline preparation.
+Failures without a typed class keep their plain text.
+
 Before launch, every local mount source is resolved to a real path. If a
 required source cannot be resolved, the launch is refused with its source and
 destination; an unresolvable cache mount is dropped with a warning. A source
