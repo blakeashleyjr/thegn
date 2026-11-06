@@ -6686,6 +6686,7 @@ fn injected_command_status(queued: bool, ok: String) -> String {
 /// even that off the event loop on `spawn_blocking` so rapid Alt+↑/↓ never
 /// stalls a frame. Best-effort: the DB is a cache and shutdown re-persists the
 /// full layout, so a dropped write only means a slightly stale restore point.
+/// Writes are ordered by a ticket assigned on the loop before they are spawned.
 pub(crate) fn persist_active_focus(session: &crate::session::Session) {
     let sid = session.id.clone();
     let Some(name) = session
@@ -6695,10 +6696,16 @@ pub(crate) fn persist_active_focus(session: &crate::session::Session) {
     else {
         return;
     };
+    let ticket = crate::handlers::focus_persist::next_ticket();
     tokio::task::spawn_blocking(move || {
         // off-loop: inside spawn_blocking
-        if let Ok(db) = thegn_core::db::Db::open() {
-            let _ = crate::session::Session::persist_active_tab(&db, &sid, &name, now_secs()); // best-effort: cache write: the DB is a cache; the active-tab row is resurrection state
+        if let Some(Err(error)) =
+            crate::handlers::focus_persist::write_in_order_global(&sid, ticket, || {
+                let db = thegn_core::db::Db::open()?;
+                crate::session::Session::persist_active_tab(&db, &sid, &name, now_secs())
+            })
+        {
+            tracing::debug!(target: "thegn::session", error = %error, "active-tab pointer write failed");
         }
     });
 }
