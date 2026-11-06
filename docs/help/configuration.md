@@ -559,6 +559,12 @@ the periodic auto-fetch poll. The `[stats]` masthead widgets take
 symbol), plus `statsDiskPath` (the filesystem the disk widget measures; empty
 means the filesystem holding the worktrees directory).
 
+The `[notifications]` booleans are `notificationsDesktop`,
+`notificationsSurfaceSelfLogErrors`, `notificationsGithubMentions`,
+`notificationsAgentAttentionInbox` and `notificationsMergeQueueHoldDesktop`.
+`[activity]` takes `activityEnabled`, `activityRedRequiresAgent` and
+`activityAgentPrograms` (a list of extra agent CLI program names).
+
 `keys list` covers the keymap registry **and** the zone-local tables — the
 sidebar's row keys and each panel section's row-mode keys. Those are handled
 by the focused zone rather than the registry, so they are not rebindable, but
