@@ -661,7 +661,7 @@ The menu and the keyboard MUST dispatch through the same outcome path.
 
 - **WHEN** the user opens a worktree row's menu
 - **THEN** entries like "Rename…" and "Move to folder…" display their key
-  chips (`r`, `f`) and "Delete branch + files…" renders as danger
+  chips (`r`, `f`) and "Delete worktree files… (branch kept)" renders as danger
 
 #### Scenario: Folder rows have folder actions
 
