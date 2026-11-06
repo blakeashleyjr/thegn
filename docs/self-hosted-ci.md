@@ -8,11 +8,12 @@ uses GitHub-hosted `macos-15`; Windows jobs use `windows-latest`.
 ## Security prerequisites
 
 Assume the repository is public and all repository content, build scripts, and
-dependencies are hostile. The workflow is currently dispatch-only, but a
-future pull request trigger could execute fork code. A dispatch run can also
-execute the selected branch's code. A persistent self-hosted runner gives that
-code access to its host account and may let it poison `/nix/store`, sccache,
-`CARGO_HOME`, and the runner's `_work` directory for later jobs.
+dependencies are hostile. Fork pull requests run the lean CI jobs on
+GitHub-hosted runners with a read-only token and no secrets; heavy jobs run on
+nightly or dispatch. A dispatch run can execute the selected branch's code. A
+persistent self-hosted runner gives that code access to its host account and
+may let it poison `/nix/store`, sccache, `CARGO_HOME`, and the runner's `_work`
+directory for later jobs.
 
 Keep Linux jobs on GitHub-hosted runners unless the self-hosted host is isolated
 from administrator credentials and unrelated workloads, and its credentials
@@ -96,8 +97,8 @@ systemctl list-units 'thegn-ci-runner@*.service' --no-pager
 journalctl -u 'thegn-ci-runner@*.service' -f
 ```
 
-The `workflow_dispatch` trigger is the only enabled trigger: CI does not run on
-push or pull request events. Start a run explicitly with
+Pull requests run the lean CI jobs; heavy jobs also run nightly and by manual
+dispatch. CI does not run on push events. Start a manual run explicitly with
 `gh workflow run ci.yml --ref <branch>`. The optional
 `e2e`, `macos`, `windows`, and `windows-artifact-smoke` jobs require
 `-f extras=true`; they are disabled by default. Check `.github/workflows/ci.yml`
