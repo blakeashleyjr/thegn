@@ -200,3 +200,90 @@ mod tests {
         }
     }
 }
+
+#[cfg(test)]
+mod doc_drift {
+    use clap::CommandFactory;
+
+    /// docs/cli.md is the public CLI contract (also compiled into the MCP resource).
+    const CLI_DOC: &str = include_str!("../../../docs/cli.md");
+
+    /// True when `doc` names `verb` as a command token: the verb is immediately
+    /// preceded by a backtick or by `thegn ` and is not followed by an
+    /// identifier character, `-` or `_` (so `sandbox` is not satisfied by
+    /// `sandbox-argv`, nor `host` by `hosts`).
+    fn documented(doc: &str, verb: &str) -> bool {
+        doc.match_indices(verb).any(|(start, _)| {
+            let bytes = doc.as_bytes();
+            let backticked = start > 0 && bytes[start - 1] == b'`';
+            let thegn_prefixed = start >= 6 && bytes.get(start - 6..start) == Some(&b"thegn "[..]);
+            let end = start + verb.len();
+            let followed_by_identifier = doc[end..]
+                .chars()
+                .next()
+                .is_some_and(|ch| ch.is_alphanumeric() || matches!(ch, '-' | '_'));
+            (backticked || thegn_prefixed) && !followed_by_identifier
+        })
+    }
+
+    fn visible_top_level_verbs() -> Vec<String> {
+        let mut cmd = crate::Cli::command();
+        cmd.build();
+        cmd.get_subcommands()
+            .filter(|subcommand| !subcommand.is_hide_set() && subcommand.get_name() != "help")
+            .map(|subcommand| subcommand.get_name().to_string())
+            .collect()
+    }
+
+    #[test]
+    fn documented_matches_backticked_and_thegn_prefixed_tokens() {
+        assert!(documented("| `wt list` |", "wt"));
+        assert!(documented("thegn host list", "host"));
+        assert!(!documented("`sandbox-argv`", "sandbox"));
+        assert!(!documented("hosts", "host"));
+        assert!(!documented("`dbx`", "db"));
+    }
+
+    #[test]
+    fn every_visible_top_level_verb_is_documented_in_cli_md() {
+        let missing: Vec<String> = visible_top_level_verbs()
+            .into_iter()
+            .filter(|verb| !documented(CLI_DOC, verb))
+            .collect();
+        assert!(
+            missing.is_empty(),
+            "docs/cli.md does not mention these top-level verbs: {missing:?}; add them to the Grammar table"
+        );
+    }
+
+    #[test]
+    fn hidden_legacy_verbs_are_not_required_in_cli_md() {
+        let mut cmd = crate::Cli::command();
+        cmd.build();
+        let hidden: Vec<String> = cmd
+            .get_subcommands()
+            .filter(|subcommand| subcommand.is_hide_set())
+            .map(|subcommand| subcommand.get_name().to_string())
+            .collect();
+        let visible = visible_top_level_verbs();
+        assert!(!hidden.is_empty());
+        assert!(hidden.iter().any(|name| name == "daemon"));
+        assert!(hidden.iter().any(|name| name == "repos"));
+        assert!(hidden.iter().all(|name| !visible.contains(name)));
+    }
+
+    #[test]
+    fn dev_channel_verbs_are_tagged_in_cli_md() {
+        for verb in ["host", "placement"] {
+            let token = format!("`{verb}`");
+            let row = CLI_DOC
+                .lines()
+                .find(|line| line.contains(token.as_str()))
+                .unwrap_or_else(|| panic!("Grammar table has no row for `{verb}`"));
+            assert!(
+                row.contains("dev"),
+                "Grammar table row for `{verb}` must identify its dev channel: {row}"
+            );
+        }
+    }
+}
