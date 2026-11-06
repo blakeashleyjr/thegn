@@ -210,10 +210,17 @@ pub(crate) fn note_provider_degraded(
 }
 
 fn sealed_halt_body(halt: &crate::agent::SandboxHalt) -> String {
+    let fix = if halt.reason.contains("thegn sandbox profile set standard") {
+        String::new()
+    } else {
+        format!(
+            " Fix: {}",
+            thegn_core::sandbox_floor::standard_switch_hint(None)
+        )
+    };
     format!(
-        "{} — a sealed profile cannot fall back to a host shell. Fix: {}",
-        halt.reason,
-        thegn_core::sandbox_floor::standard_switch_hint(None)
+        "{} — a sealed profile cannot fall back to a host shell.{}",
+        halt.reason, fix
     )
 }
 
@@ -1871,7 +1878,10 @@ mod tests {
         let halt = crate::agent::SandboxHalt {
             env_name: "dev".into(),
             placement: "provider:sprites".into(),
-            reason: "profile `sealed` requires a sandbox that hides $HOME".into(),
+            reason: format!(
+                "profile `sealed` requires a sandbox that hides $HOME. {}",
+                thegn_core::sandbox_floor::standard_switch_hint(None)
+            ),
             ask: true,
             dormant: None,
             sealed_home: true,
@@ -1900,6 +1910,11 @@ mod tests {
             body.contains("thegn sandbox profile set standard"),
             "{body}"
         );
+        assert_eq!(
+            body.matches("thegn sandbox profile set standard").count(),
+            1,
+            "the sealed hint appears once"
+        );
     }
 
     #[test]
@@ -1907,7 +1922,10 @@ mod tests {
         let sealed = crate::agent::SandboxHalt {
             env_name: "dev".into(),
             placement: "provider:sprites".into(),
-            reason: "profile `sealed` requires a sandbox that hides $HOME".into(),
+            reason: format!(
+                "profile `sealed` requires a sandbox that hides $HOME. {}",
+                thegn_core::sandbox_floor::standard_switch_hint(None)
+            ),
             ask: true,
             dormant: None,
             sealed_home: true,
@@ -1916,6 +1934,13 @@ mod tests {
         assert!(
             message.contains("thegn sandbox profile set standard"),
             "{message}"
+        );
+        assert_eq!(
+            message
+                .matches("thegn sandbox profile set standard")
+                .count(),
+            1,
+            "the sealed hint appears once"
         );
         for forbidden in ["backend = \"none\"", "isolation_floor", "run on host"] {
             assert!(!message.contains(forbidden), "{message}");
