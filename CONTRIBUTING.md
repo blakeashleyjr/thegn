@@ -4,6 +4,25 @@ Welcome! This gets you from clone to a running dev build in a few minutes.
 For the product tour see [`README.md`](README.md); for architecture and
 invariants see [`CLAUDE.md`](CLAUDE.md).
 
+## Start here
+
+- Linux x86_64 is supported; macOS is best-effort; Windows is deferred (see the
+  contributor notes below).
+- Questions and bug reports go through [SUPPORT.md](SUPPORT.md) and the issue
+  templates. Security reports go through [SECURITY.md](SECURITY.md), never a
+  public issue.
+- For a first change, read [CLAUDE.md](CLAUDE.md), enter the dev shell with
+  `nix develop`, and iterate with `just quick <crate>` and targeted tests such
+  as `cargo nextest run -p <crate> <filter>`. The [Dev loop](#dev-loop)
+  explains when to leave the heavy gates until later: `just test` and
+  `just smoke` are pre-push; `just ci` (including lint) is run before opening
+  a PR.
+- Use conventional-commit titles (`feat(scope):`, `fix(scope):`). The
+  [PR template](.github/pull_request_template.md) has the checklist: new
+  behavior needs tests, and changes to actions, keybinds, zones, or panel
+  sections need the relevant `docs/help/` page updated in the same change.
+- Contributions are dual-licensed MIT OR Apache-2.0 (see [License](#license)).
+
 ## Prerequisites
 
 **The recommended path on every platform is [Nix](https://nixos.org/download/)
