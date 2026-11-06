@@ -23,6 +23,10 @@ use thegn_core::config::Config;
 /// Default lines of each log sink to include.
 const TAIL_LINES: usize = 500;
 
+/// Largest retained crash report the bundle will read; a bigger one is omitted
+/// (never truncated, so redaction patterns are not cut).
+const MAX_RETAINED_REPORT_BYTES: u64 = 1024 * 1024;
+
 /// `thegn doctor bundle` arguments.
 #[derive(clap::Args, Clone)]
 pub struct BundleArgs {
@@ -199,7 +203,7 @@ fn redacted_report_text(bytes: &[u8]) -> String {
 /// Read a retained report only while it is still a regular file. The metadata
 /// check closes the symlink inclusion boundary at the bundle read site too,
 /// covering a report replaced between enumeration and reading.
-fn read_retained_report(path: &std::path::Path) -> std::io::Result<Vec<u8>> {
+fn read_retained_report_capped(path: &std::path::Path, limit: u64) -> std::io::Result<Vec<u8>> {
     // Bind the read to a non-following open. A metadata check followed by
     // `read(path)` still has a replacement race when the crash directory is
     // writable by another user after permission hardening failed.
@@ -211,9 +215,25 @@ fn read_retained_report(path: &std::path::Path) -> std::io::Result<Vec<u8>> {
             "retained report is not a regular file",
         ));
     }
+    if metadata.len() > limit {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("retained report is larger than {limit} bytes"),
+        ));
+    }
     let mut body = Vec::new();
-    file.read_to_end(&mut body)?;
+    file.take(limit + 1).read_to_end(&mut body)?;
+    if body.len() as u64 > limit {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("retained report is larger than {limit} bytes"),
+        ));
+    }
     Ok(body)
+}
+
+fn read_retained_report(path: &std::path::Path) -> std::io::Result<Vec<u8>> {
+    read_retained_report_capped(path, MAX_RETAINED_REPORT_BYTES)
 }
 
 fn append_retained_report(
@@ -387,6 +407,77 @@ mod tests {
         assert!(!sanitized.contains("old-secret"));
         assert!(!sanitized.contains("older-secret"));
         assert!(sanitized.contains("safe"));
+    }
+
+    #[test]
+    fn retained_report_reader_refuses_a_report_over_the_cap() {
+        let dir = std::env::temp_dir().join(format!(
+            "tg-bundle-report-over-cap-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = std::fs::remove_dir_all(&dir); // best-effort: test cleanup: scratch removal must never fail the test
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("report.txt");
+        std::fs::write(&path, b"123456789").unwrap();
+
+        let error = read_retained_report_capped(&path, 8).expect_err("oversize report is refused");
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+        assert!(error.to_string().contains("larger than 8 bytes"));
+
+        let _ = std::fs::remove_dir_all(&dir); // best-effort: test cleanup: scratch removal must never fail the test
+    }
+
+    #[test]
+    fn retained_report_reader_accepts_a_report_at_the_cap() {
+        let dir = std::env::temp_dir().join(format!(
+            "tg-bundle-report-at-cap-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = std::fs::remove_dir_all(&dir); // best-effort: test cleanup: scratch removal must never fail the test
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("report.txt");
+        std::fs::write(&path, b"12345678").unwrap();
+
+        assert_eq!(read_retained_report_capped(&path, 8).unwrap(), b"12345678");
+
+        let _ = std::fs::remove_dir_all(&dir); // best-effort: test cleanup: scratch removal must never fail the test
+    }
+
+    #[test]
+    fn retained_report_over_the_cap_is_omitted_from_the_archive() {
+        let dir = std::env::temp_dir().join(format!(
+            "tg-bundle-report-archive-over-cap-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = std::fs::remove_dir_all(&dir); // best-effort: test cleanup: scratch removal must never fail the test
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("crash-1.txt");
+        std::fs::write(&path, vec![0; MAX_RETAINED_REPORT_BYTES as usize + 1]).unwrap();
+        let mut tar = TarBuilder::new();
+        let mut manifest = String::new();
+        let add = |tar: &mut TarBuilder, manifest: &mut String, name: &str, data: Vec<u8>| {
+            manifest.push_str(&format!("  {name} {} bytes\n", data.len()));
+            tar.append(name, &data);
+        };
+
+        append_retained_report(&mut tar, &mut manifest, &path, &add);
+
+        assert!(manifest.contains("omitted: "));
+        assert!(manifest.contains("larger than"));
+        assert_eq!(tar.finish().len(), 1024);
+        let _ = std::fs::remove_dir_all(&dir); // best-effort: test cleanup: scratch removal must never fail the test
     }
 
     #[test]
