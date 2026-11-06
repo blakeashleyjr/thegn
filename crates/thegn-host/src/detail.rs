@@ -2442,12 +2442,20 @@ fn mq_row(r: &thegn_core::db::MergeQueueRow, gl: &thegn_core::termcaps::GlyphSet
         .unwrap_or((gl.dot_hollow, Hue::Blue));
     // Blocked rows show their reason; the rest show the status word.
     let note = match status {
-        Some(MqStatus::AgentBlocked) => Some(format!(
-            "environment/policy blocked — {}",
+        Some(MqStatus::AgentBlocked) => Some(
             r.error_detail
                 .as_deref()
-                .unwrap_or("agent isolation floor not met")
-        )),
+                .and_then(thegn_core::merge_identity_drift::hold_headline)
+                .map(|headline| crate::merge_sweep::safe_display(&headline))
+                .unwrap_or_else(|| {
+                    format!(
+                        "environment/policy blocked — {}",
+                        r.error_detail
+                            .as_deref()
+                            .unwrap_or("agent isolation floor not met")
+                    )
+                }),
+        ),
         Some(s) if s.is_held() => r
             .error_detail
             .as_deref()
