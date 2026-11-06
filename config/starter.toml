@@ -29,8 +29,7 @@ glyphs = "auto"
 auto_fetch = true
 
 [sandbox]
-# Default: sealed ($HOME hidden, network off). Set profile = "standard" to
-# opt into the previous behaviour.
+# Default: standard (read-only $HOME, network on). Set profile = "sealed" to hide $HOME and cut the network.
 # Select an available containment backend automatically. Default: auto.
 backend = "auto"
 
