@@ -16,8 +16,9 @@ socket, plus TCP for `thegn serve` thin clients), so sessions survive UI detach
 and warm-reattach — `[daemon] enabled = false` restores fully in-process panes.
 See `crates/thegn-host/src/daemon/`.
 
-The stable shell is **AI-free**: nothing in `thegn-host` depends on a model, an
-agent protocol or a proxy. What is agent-adjacent is either generic or opt-in.
+The stable shell is **AI-free**: nothing in `thegn-host` compile-depends on a
+model, an agent protocol or the proxy, and with no `[model_proxy]` section
+nothing runs. What is agent-adjacent is either generic or opt-in.
 Generic: the `[[agents]]`/`[[tools]]` picker launches any configured CLI as a
 plain command, and the two queues' agent handoff (`[merge_queue]` /
 `[pr_queue]`) is an arbitrary subprocess hook — one shared, data-driven engine
