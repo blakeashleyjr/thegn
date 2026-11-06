@@ -34,6 +34,7 @@ pub const SOURCES: &[&str] = &[
     include_str!("../../../../docs/help/mobile-access.md"),
     include_str!("../../../../docs/help/release-channels.md"),
     include_str!("../../../../docs/help/debugging.md"),
+    include_str!("../../../../docs/help/upgrading-and-uninstalling.md"),
     include_str!("../../../../docs/help/cli.md"),
     include_str!("../../../../docs/help/theming.md"),
     include_str!("../../../../docs/help/workflows.md"),
@@ -105,6 +106,18 @@ mod tests {
         assert!(
             reg.page("config-reference").is_some(),
             "generated page registered"
+        );
+    }
+
+    #[test]
+    fn the_schema_refusal_help_page_exists() {
+        let (reg, errors) = build_registry(&thegn_core::config::Config::default());
+        assert!(errors.is_empty(), "{errors:?}");
+        let msg = thegn_core::db::schema_refusal(62, 57, false).expect("refusal");
+        assert!(msg.contains("upgrading-and-uninstalling"), "{msg}");
+        assert!(
+            reg.page("upgrading-and-uninstalling").is_some(),
+            "the refusal message names a help page that is not registered"
         );
     }
 
