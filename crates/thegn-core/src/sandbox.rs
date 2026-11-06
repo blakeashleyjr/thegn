@@ -3305,12 +3305,17 @@ fn wrap_script(spec: &SandboxSpec, inner: &str) -> String {
         s.push_str(init);
         s.push('\n');
     }
+    // The inner command may already carry `exec` (for example shell_inner_override).
+    let bare = inner
+        .strip_prefix("exec ")
+        .map(str::trim_start)
+        .unwrap_or(inner);
     if spec.devenv {
         // Prefer the absolute path resolved at spec-build time so OCI containers
         // (which don't inherit the host PATH) can exec devenv without it being on
         // their default PATH.
         let devenv = spec.devenv_path.as_deref().unwrap_or("devenv");
-        s.push_str(&format!("exec {devenv} shell -- {inner}"));
+        s.push_str(&format!("exec {devenv} shell -- {bare}"));
     } else if inner.contains("&&")
         || inner.contains("||")
         || inner.contains('|')
@@ -3327,7 +3332,7 @@ fn wrap_script(spec: &SandboxSpec, inner: &str) -> String {
         // `|` check, but either substring is enough to skip the prefix.)
         s.push_str(inner);
     } else {
-        s.push_str(&format!("exec {inner}"));
+        s.push_str(&format!("exec {bare}"));
     }
     s
 }

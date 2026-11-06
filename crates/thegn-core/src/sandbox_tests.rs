@@ -2708,6 +2708,31 @@ fn wrap_script_skips_exec_for_or_and_pipe_fallbacks() {
 }
 
 #[test]
+fn wrap_script_does_not_double_exec_a_pre_execd_simple_inner() {
+    let mut s = spec(Backend::Bwrap);
+    s.image = None;
+
+    let out = wrap_script(&s, "exec zsh -l");
+    let last_line = out.lines().last().unwrap();
+    assert!(last_line.ends_with("exec zsh -l"), "{last_line}");
+    assert!(!last_line.contains("exec exec"), "{last_line}");
+    assert_eq!(last_line.matches("exec ").count(), 1, "{last_line}");
+
+    let compound = wrap_script(&s, "exec zsh -l; true");
+    assert!(compound.ends_with("exec zsh -l; true"), "{compound}");
+
+    s.devenv = true;
+    s.devenv_path = Some("/nix/store/devenv/bin/devenv".into());
+    let devenv = wrap_script(&s, "exec zsh -l");
+    let devenv_line = devenv.lines().last().unwrap();
+    assert_eq!(
+        devenv_line,
+        "exec /nix/store/devenv/bin/devenv shell -- zsh -l"
+    );
+    assert!(!devenv_line.contains("-- exec "), "{devenv_line}");
+}
+
+#[test]
 fn ensure_stale_and_keepid_rm_go_through_oci_prefix() {
     // Regression: the stale-mount rm and the keep-id-retry rm must target the
     // SAME daemon as `run -d` (via oci_prefix), not a bare `binary()`. For
