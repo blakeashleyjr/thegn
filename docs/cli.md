@@ -119,6 +119,11 @@ thegn wt rm fix-parser --force                    # teardown + git + DB
 `wt new` reuses the TUI wizard's pipeline (branch naming templates, base
 resolution, the serial git-mutation lock, DB registration) but never
 provisions a sandbox — the compositor prepares lazily on first open.
+Use `--profile standard` or `--profile sealed` to override the worktree's
+inherited sandbox profile. The pin is stored only when it differs from the
+effective default. Inspect it with `thegn sandbox profile show`; change it with
+`thegn sandbox profile set <standard|sealed>` or remove the override with
+`thegn sandbox profile clear`. Each profile command accepts `--worktree <path>`.
 `wt rm` runs provider/sandbox teardown synchronously, then
 `git worktree remove`, then cleans every DB row (including tab groups, so a
 removed worktree is never resurrected at the next launch).

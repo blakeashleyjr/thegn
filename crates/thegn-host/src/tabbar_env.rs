@@ -23,6 +23,15 @@ pub(crate) fn env_chips(model: &FrameModel) -> Vec<String> {
         .find(|row| row.active && matches!(row.kind, crate::sidebar::RowKind::Worktree))
         .and_then(|row| row.devcontainer_status.as_deref());
     let mut chips = runtime_sandbox_chips(backend, devcontainer_status);
+    if let Some(profile) = model.active_sandbox_profile_pin.as_deref() {
+        if let Some(chip) = chips.first_mut() {
+            if let Some(name) = chip.strip_prefix('(').and_then(|s| s.strip_suffix(')')) {
+                *chip = format!("({name}:{profile})");
+            }
+        } else {
+            chips.push(format!("({backend}:{profile})"));
+        }
+    }
     // Remote placement kind (ssh/mosh/k8s/<provider>); `None` when local. The
     // full detail (ssh:host, sprite:<id>, …) lives in the System → Sandbox panel.
     if let Some(kind) = &model.active_placement_kind {
@@ -103,7 +112,8 @@ pub(crate) fn draw_env_chips(
 
 #[cfg(test)]
 mod tests {
-    use super::runtime_sandbox_chips;
+    use super::{env_chips, runtime_sandbox_chips};
+    use crate::chrome::FrameModel;
 
     #[test]
     fn repo_devcontainer_status_never_labels_a_host_pane_as_contained() {
@@ -118,5 +128,16 @@ mod tests {
             runtime_sandbox_chips("devcontainer", Some(pending)),
             vec![pending]
         );
+    }
+
+    #[test]
+    fn pinned_profile_is_appended_to_the_backend_chip_only_when_set() {
+        let mut model = FrameModel {
+            active_sandbox_backend: "bwrap".into(),
+            ..FrameModel::default()
+        };
+        assert_eq!(env_chips(&model), vec!["(bwrap)"]);
+        model.active_sandbox_profile_pin = Some("sealed".into());
+        assert_eq!(env_chips(&model), vec!["(bwrap:sealed)"]);
     }
 }

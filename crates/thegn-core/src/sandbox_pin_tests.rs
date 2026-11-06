@@ -50,3 +50,187 @@ fn sandbox_pin_explanations_match_profile_facts() {
             && SandboxProfile::Hardened.drop_capabilities().is_empty()
     );
 }
+
+#[test]
+fn sandbox_pin_explanations_cover_profile_capability_and_network_facts() {
+    let standard = explain(SandboxProfile::Hardened);
+    let sealed = explain(SandboxProfile::Sealed);
+    let standard_text = format!(
+        "{} {} {} {} {}",
+        standard.one_liner,
+        standard.hides.join(" "),
+        standard.network,
+        standard.credentials,
+        standard.agents
+    );
+    let sealed_text = format!(
+        "{} {} {} {} {}",
+        sealed.one_liner,
+        sealed.hides.join(" "),
+        sealed.network,
+        sealed.credentials,
+        sealed.agents
+    );
+    assert_eq!(
+        standard_text.contains("network"),
+        !SandboxProfile::Hardened.forces_no_network()
+    );
+    assert_eq!(
+        sealed_text.contains("network"),
+        SandboxProfile::Sealed.forces_no_network()
+    );
+    assert!(standard_text.contains("readable"));
+    assert!(standard_text.contains("~/.ssh"));
+    assert!(standard_text.contains("default capabilities"));
+    assert!(standard_text.contains("SSH") && standard_text.contains("provider"));
+    assert!(standard_text.contains("VPN attachments work"));
+    assert!(standard_text.contains("process limit is 512"));
+    assert!(standard_text.contains("root is read-only"));
+    assert!(standard_text.contains("new privileges are blocked"));
+    assert!(sealed_text.contains("private") && sealed_text.contains("empty"));
+    assert!(sealed_text.contains("~/.ssh") && sealed_text.contains("credentials"));
+    assert!(sealed_text.contains("SSH agent socket"));
+    assert!(sealed_text.contains("API-backed agent CLIs"));
+    assert!(sealed_text.contains("git fetch/push"));
+    assert!(sealed_text.contains("offline builds"));
+    assert!(sealed_text.contains("no network"));
+    assert!(sealed_text.contains("VPN attachment"));
+    assert!(sealed_text.contains("process limit is 256"));
+    assert!(sealed_text.contains("root is read-only"));
+    assert!(sealed_text.contains("new privileges are blocked"));
+    assert_eq!(
+        sealed_text.contains("capability"),
+        !SandboxProfile::Sealed.drop_capabilities().is_empty()
+    );
+    assert!(
+        standard
+            .how_to_change
+            .contains("palette > Isolation profile")
+    );
+    assert!(standard.how_to_change.contains("thegn sandbox profile set"));
+    assert_eq!(standard.how_to_change, sealed.how_to_change);
+}
+
+#[test]
+fn sandbox_pin_absent_is_equivalent_across_precedence_inputs() {
+    let cases = [
+        ("", "", "", "", SandboxProfile::Hardened),
+        (
+            "[sandbox]\nprofile='sealed'",
+            "",
+            "",
+            "",
+            SandboxProfile::Sealed,
+        ),
+        (
+            "[sandbox]\nprofile='standard'",
+            "[env.dev.sandbox]\nprofile='sealed'",
+            "",
+            "dev",
+            SandboxProfile::Sealed,
+        ),
+        (
+            "[sandbox]\nprofile='standard'",
+            "[env.dev.sandbox]\nprofile='standard'",
+            "[sandbox]\nprofile='sealed'",
+            "dev",
+            SandboxProfile::Sealed,
+        ),
+        (
+            "[sandbox]\nprofile='sealed'",
+            "[env.dev.sandbox]\nprofile='standard'",
+            "",
+            "dev",
+            SandboxProfile::Hardened,
+        ),
+    ];
+    for (global, env_overlay, repo_overlay, selected, expected_profile) in cases {
+        let mut source = String::new();
+        if !global.is_empty() {
+            source.push_str(global);
+            source.push('\n');
+        }
+        if !env_overlay.is_empty() {
+            source.push_str(env_overlay);
+            source.push('\n');
+        }
+        let cfg: Config = toml::from_str(&source).unwrap();
+        let repo = tempfile::tempdir().unwrap();
+        if !repo_overlay.is_empty() {
+            std::fs::write(repo.path().join(".thegn.toml"), repo_overlay).unwrap();
+        }
+        let loc = GitLoc::Local(repo.path().to_path_buf());
+        let name_only = if selected.is_empty() {
+            EnvSelection::none()
+        } else {
+            EnvSelection::named(selected)
+        };
+        let (baseline, baseline_resolved) = crate::config_resolve::resolve_environment(
+            &cfg,
+            repo.path(),
+            &loc,
+            repo.path(),
+            &name_only,
+            &crate::config_resolve::Approvals::deny_all(),
+        );
+        let wrapped = cfg.resolve_env(repo.path(), &loc, repo.path(), &name_only);
+        assert_eq!(
+            baseline, wrapped,
+            "an absent profile pin preserves resolution"
+        );
+        assert_eq!(baseline.sandbox.profile, expected_profile);
+        assert_eq!(baseline.sandbox.profile, baseline_resolved.sandbox.profile);
+    }
+}
+
+#[test]
+fn sandbox_pin_overrides_global_env_and_repo_profiles_without_changing_placement() {
+    let cfg: Config = toml::from_str(
+        "[sandbox]\nprofile='standard'\n[env.dev]\nplacement='local'\n[env.dev.sandbox]\nprofile='sealed'\n",
+    )
+    .unwrap();
+    let repo = tempfile::tempdir().unwrap();
+    std::fs::write(
+        repo.path().join(".thegn.toml"),
+        "[sandbox]\nprofile='sealed'\n",
+    )
+    .unwrap();
+    let loc = GitLoc::Local(repo.path().to_path_buf());
+    let selection = EnvSelection::named("dev").with_profile(SandboxProfile::Hardened);
+    let (resolved, _) = crate::config_resolve::resolve_environment(
+        &cfg,
+        repo.path(),
+        &loc,
+        repo.path(),
+        &selection,
+        &crate::config_resolve::Approvals::deny_all(),
+    );
+    assert_eq!(resolved.sandbox.profile, SandboxProfile::Hardened);
+    assert_eq!(resolved.name, "dev");
+    assert!(resolved.placement.is_local());
+}
+
+#[test]
+fn sandbox_pin_does_not_lower_a_zone_profile_floor() {
+    let cfg = Config::default();
+    let repo = tempfile::tempdir().unwrap();
+    let loc = GitLoc::Local(repo.path().to_path_buf());
+    let selection = EnvSelection::none().with_profile(SandboxProfile::Hardened);
+    let (mut resolved, _) = crate::config_resolve::resolve_environment(
+        &cfg,
+        repo.path(),
+        &loc,
+        repo.path(),
+        &selection,
+        &crate::config_resolve::Approvals::deny_all(),
+    );
+    crate::zone::apply_zone_ceilings(
+        &mut resolved.sandbox,
+        "restricted",
+        &crate::zone::ZoneConfig {
+            sandbox_floor: Some(SandboxProfile::Sealed),
+            ..Default::default()
+        },
+    );
+    assert_eq!(resolved.sandbox.profile, SandboxProfile::Sealed);
+}

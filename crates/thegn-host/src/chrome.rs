@@ -741,6 +741,8 @@ pub struct FrameModel {
     /// "podman-rootless", "host"). Used to show non-OCI sandboxes (bwrap,
     /// systemd) as green even though they have no container entry.
     pub active_sandbox_backend: String,
+    /// Explicit worktree isolation override; absent pins add no chrome.
+    pub active_sandbox_profile_pin: Option<String>,
     /// Terse placement kind for the active worktree (`ssh`, `mosh`, `k8s`, or the
     /// provider id like `sprite`); `None` when it runs locally. Shown as a chip in
     /// the center tab bar's right-aligned env cluster.

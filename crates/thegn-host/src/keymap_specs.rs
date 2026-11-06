@@ -115,6 +115,15 @@ pub const ACTION_SPECS: &[ActionSpec] = &[
         ],
     },
     ActionSpec {
+        id: "sandbox-profile",
+        label: "Isolation profile for this worktree…",
+        message_key: "action-sandbox-profile",
+        hint: "isolation profile",
+        default_chords: &[],
+        palette: true,
+        keywords: &["sandbox", "isolation", "sealed", "standard", "profile"],
+    },
+    ActionSpec {
         id: "toolchain-install",
         label: "Install worktree toolchain",
         message_key: "action-toolchain-install",

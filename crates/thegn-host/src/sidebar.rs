@@ -233,6 +233,8 @@ pub struct SidebarRow {
     /// Selected execution environment (`[env.<name>]`); `None`/`"default"` ⇒
     /// the implicit default (no badge shown).
     pub env_name: Option<String>,
+    /// Explicit worktree profile pin, shown only when present.
+    pub sandbox_profile: Option<String>,
     /// The env is a managed provider but content resolved local (degraded to the
     /// host) — renders the `«env»` badge as `«env ✗»`.
     pub env_degraded: bool,
@@ -323,6 +325,7 @@ impl SidebarRow {
             git: None,
             sandbox_backend: None,
             env_name: None,
+            sandbox_profile: None,
             env_degraded: false,
             devcontainer_status: None,
             activity: ActivityState::None,
@@ -543,6 +546,8 @@ pub struct DbWorktree {
     /// Selected execution environment (`[env.<name>]`); `None`/`"default"` ⇒
     /// the implicit default (no badge shown).
     pub env_name: Option<String>,
+    /// Explicit worktree profile pin, if one is stored.
+    pub sandbox_profile: Option<String>,
     /// The env is a managed PROVIDER but the worktree's content resolved local
     /// (degraded to the host / never provisioned) — renders the `«env»` badge as
     /// `«env ✗»`. Computed in `hydrate::db_worktree_list_with_snapshot`.
@@ -667,6 +672,7 @@ struct Group {
     activity: ActivityState,
     sandbox_backend: Option<String>,
     env_name: Option<String>,
+    sandbox_profile: Option<String>,
     /// The env is a provider but content is local (degraded) — drives the `✗` on
     /// the env badge. See [`DbWorktree::env_degraded`].
     env_degraded: bool,
@@ -800,6 +806,9 @@ pub(crate) fn compose_detail_line(
                 format!("{}{env}{} ", gl.quote_open, gl.quote_close),
             ));
         }
+    }
+    if let Some(profile) = &row.sandbox_profile {
+        segs.push(seg(Tok::Slot(S::Faint), format!("[{profile}] ")));
     }
     if let Some(backend) = &row.sandbox_backend
         && !backend.is_empty()
@@ -1526,6 +1535,7 @@ fn gather_groups(
             path: g.path.clone(),
             sandbox_backend: dbw.and_then(|w| w.sandbox_backend.clone()),
             env_name: dbw.and_then(|w| w.env_name.clone()),
+            sandbox_profile: dbw.and_then(|w| w.sandbox_profile.clone()),
             env_degraded: dbw.is_some_and(|w| w.env_degraded),
             activity: activity.get(&g.name).copied().unwrap_or_default(),
             folder_id: dbw.and_then(|w| w.folder_id),
@@ -1565,6 +1575,7 @@ fn gather_groups(
                 path: repo_path.to_string(),
                 sandbox_backend: db_home.and_then(|w| w.sandbox_backend.clone()),
                 env_name: db_home.and_then(|w| w.env_name.clone()),
+                sandbox_profile: db_home.and_then(|w| w.sandbox_profile.clone()),
                 env_degraded: db_home.is_some_and(|w| w.env_degraded),
                 // Keyed by tab name, same source the live rows use — so a
                 // workspace you switched away from keeps its activity dot.
@@ -1598,6 +1609,7 @@ fn gather_groups(
                 path: w.path.clone(),
                 sandbox_backend: w.sandbox_backend.clone(),
                 env_name: w.env_name.clone(),
+                sandbox_profile: w.sandbox_profile.clone(),
                 env_degraded: w.env_degraded,
                 activity: activity
                     .get(w.tab_name.as_str())
@@ -1680,6 +1692,7 @@ fn worktree_row(
         git,
         sandbox_backend: gr.sandbox_backend.clone(),
         env_name: gr.env_name.clone(),
+        sandbox_profile: gr.sandbox_profile.clone(),
         env_degraded: gr.env_degraded,
         devcontainer_status,
         activity: gr.activity,
@@ -2508,6 +2521,7 @@ mod tests {
             folder_id: None,
             sandbox_backend: None,
             env_name: Some("company-k8s".into()),
+            sandbox_profile: None,
             env_degraded: false,
         }];
         let rows = build_rows(
@@ -3435,6 +3449,7 @@ mod tests {
                 folder_id: None,
                 sandbox_backend: None,
                 env_name: None,
+                sandbox_profile: None,
                 env_degraded: false,
             },
             DbWorktree {
@@ -3446,6 +3461,7 @@ mod tests {
                 folder_id: None,
                 sandbox_backend: None,
                 env_name: None,
+                sandbox_profile: None,
                 env_degraded: false,
             },
         ];
@@ -3705,6 +3721,7 @@ mod tests {
             folder_id: Some(1),
             sandbox_backend: None,
             env_name: None,
+            sandbox_profile: None,
             env_degraded: false,
         }];
         let folders = vec![thegn_core::models::FolderRow {
@@ -3950,6 +3967,7 @@ mod tests {
             folder_id: None,
             sandbox_backend: None,
             env_name: None,
+            sandbox_profile: None,
             env_degraded: false,
         }];
         (ws, dbw, FOREIGN)
@@ -4217,6 +4235,7 @@ mod tests {
             folder_id: Some(3),
             sandbox_backend: None,
             env_name: None,
+            sandbox_profile: None,
             env_degraded: false,
         }];
         // Filed worktree → both its workspace and its folder key.

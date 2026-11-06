@@ -3234,6 +3234,18 @@ mod tests {
     }
 
     #[test]
+    fn sandbox_profile_pin_is_removed_with_its_worktree_row() {
+        use crate::store::WorkspaceStore;
+        let db = Db::open_memory().unwrap();
+        db.put_worktree("tab", "/repo", "/repo/wt", "branch", None, None)
+            .unwrap();
+        db.set_worktree_sandbox_profile("/repo/wt", Some(crate::config::SandboxProfile::Sealed))
+            .unwrap();
+        db.del_worktree("/repo/wt").unwrap();
+        assert_eq!(db.worktree_sandbox_profile("/repo/wt").unwrap(), None);
+    }
+
+    #[test]
     fn slug_for_repo_waits_for_a_held_writer_instead_of_busy() {
         use crate::store::WorkspaceStore;
         use std::sync::mpsc;

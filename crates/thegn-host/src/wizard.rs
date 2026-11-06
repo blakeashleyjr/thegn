@@ -47,6 +47,7 @@ pub enum Field {
     Name,
     Host,
     Sandbox,
+    Isolation,
     Program,
 }
 
@@ -68,6 +69,7 @@ pub enum WizardOutcome {
     PrepChosen {
         env: String,
         sandbox: String,
+        profile: Option<thegn_core::config::SandboxProfile>,
     },
     Submit(WizardChoices),
 }
@@ -79,6 +81,8 @@ pub struct WizardChoices {
     /// [`thegn_core::config::Config::resolve_env`]). `"default"` = implicit.
     pub env: String,
     pub sandbox: String,
+    /// Worktree profile override; `None` means inherit the selected env/config.
+    pub profile: Option<thegn_core::config::SandboxProfile>,
     pub agent: String,
 }
 
@@ -191,6 +195,7 @@ fn register_worktree_row(
         if choices.env != ambient {
             db.set_worktree_env(path_s, &choices.env)?;
         }
+        db.set_worktree_sandbox_profile(path_s, choices.profile)?;
         Ok(())
     })
     .map_err(|e| anyhow::anyhow!("persist worktree launch intent: {e}"))
@@ -228,8 +233,11 @@ pub struct NewWorktreeWizard {
     /// A named local env's explicit `[env.<name>.sandbox] backend` wins; envs
     /// without one use the global new-worktree `default_backend`.
     host_sandbox_defaults: std::collections::HashMap<String, String>,
+    profile_defaults: std::collections::HashMap<String, thegn_core::config::SandboxProfile>,
     sandbox_rows: Vec<(String, String)>,
     sandbox_sel: usize,
+    profile_sel: usize,
+    profile_default: thegn_core::config::SandboxProfile,
     agent_rows: Vec<(String, String)>,
     agent_sel: usize,
     /// A speculative worker can fail before the user has submitted. Keep its
@@ -302,6 +310,24 @@ impl NewWorktreeWizard {
             .and_then(|(key, _, _)| host_sandbox_defaults.get(key))
             .and_then(|want| sandbox_rows.iter().position(|(key, _)| key == want))
             .unwrap_or(0);
+        let profile_default = cfg
+            .env
+            .get(&default_env)
+            .and_then(|env| env.sandbox.profile)
+            .unwrap_or(cfg.sandbox.profile);
+        let profile_defaults = host_rows
+            .iter()
+            .map(|(key, _, _)| {
+                let profile = cfg
+                    .env
+                    .get(key)
+                    .and_then(|env| env.sandbox.profile)
+                    .unwrap_or(cfg.sandbox.profile);
+                (key.clone(), profile)
+            })
+            .collect();
+        let profile_sel =
+            usize::from(profile_default == thegn_core::config::SandboxProfile::Sealed);
         let agent_rows = crate::palette::build_agent_palette(cfg)
             .into_iter()
             .map(|i| (i.key, i.label))
@@ -318,8 +344,11 @@ impl NewWorktreeWizard {
             host_sel,
             host_badges: std::collections::HashMap::new(),
             host_sandbox_defaults,
+            profile_defaults,
             sandbox_rows,
             sandbox_sel,
+            profile_sel,
+            profile_default,
             agent_rows,
             agent_sel: 0,
             failure: None,
@@ -371,6 +400,10 @@ impl NewWorktreeWizard {
     /// before later launches reverted to the env's `none` backend.
     fn select_host_sandbox_default(&mut self) {
         let host = self.host_key();
+        if let Some(profile) = self.profile_defaults.get(&host) {
+            self.profile_default = *profile;
+            self.profile_sel = usize::from(*profile == thegn_core::config::SandboxProfile::Sealed);
+        }
         let Some(want) = self.host_sandbox_defaults.get(&host) else {
             return;
         };
@@ -409,14 +442,27 @@ impl NewWorktreeWizard {
             .unwrap_or_else(|| "auto".into())
     }
 
+    fn profile_value(&self) -> thegn_core::config::SandboxProfile {
+        if self.profile_sel == 1 {
+            thegn_core::config::SandboxProfile::Sealed
+        } else {
+            thegn_core::config::SandboxProfile::Hardened
+        }
+    }
+
+    fn profile_pin(&self) -> Option<thegn_core::config::SandboxProfile> {
+        (self.profile_value() != self.profile_default).then_some(self.profile_value())
+    }
+
     /// Focus one field up (Name is the top). Skips Sandbox for a non-local host.
     fn focus_up(&mut self) {
         self.focus = match self.focus {
             Field::Name => Field::Name,
             Field::Host => Field::Name,
             Field::Sandbox => Field::Host,
-            Field::Program if self.host_is_local() => Field::Sandbox,
+            Field::Program if self.host_is_local() => Field::Isolation,
             Field::Program => Field::Host,
+            Field::Isolation => Field::Sandbox,
         };
     }
 
@@ -427,7 +473,8 @@ impl NewWorktreeWizard {
             Field::Name => Field::Host,
             Field::Host if self.host_is_local() => Field::Sandbox,
             Field::Host => Field::Program,
-            Field::Sandbox => Field::Program,
+            Field::Sandbox => Field::Isolation,
+            Field::Isolation => Field::Program,
             Field::Program => Field::Program,
         };
     }
@@ -441,6 +488,7 @@ impl NewWorktreeWizard {
         WizardOutcome::PrepChosen {
             env: self.host_key(),
             sandbox: self.sandbox_key(),
+            profile: self.profile_pin(),
         }
     }
 
@@ -473,6 +521,7 @@ impl NewWorktreeWizard {
             name,
             env: self.host_key(),
             sandbox: self.sandbox_key(),
+            profile: self.profile_pin(),
             agent: self
                 .agent_rows
                 .get(self.agent_sel)
@@ -630,6 +679,24 @@ impl NewWorktreeWizard {
                 }
                 _ => WizardOutcome::Pending,
             },
+            Field::Isolation => match key {
+                KeyCode::LeftArrow
+                | KeyCode::Char('h')
+                | KeyCode::RightArrow
+                | KeyCode::Char('l') => {
+                    self.profile_sel = 1 - self.profile_sel;
+                    self.prep_outcome()
+                }
+                KeyCode::UpArrow | KeyCode::Char('k') => {
+                    self.focus_up();
+                    WizardOutcome::Pending
+                }
+                KeyCode::Enter | KeyCode::DownArrow | KeyCode::Char('j') => {
+                    self.focus_down();
+                    WizardOutcome::Pending
+                }
+                _ => WizardOutcome::Pending,
+            },
             // Full list: ↑/↓ (or k/j) move within it; ↑ at the top moves focus
             // up to the choice rows; Enter creates (this is the only field that
             // submits).
@@ -661,9 +728,10 @@ impl NewWorktreeWizard {
             return;
         }
         let show_collision = self.focus == Field::Name && !self.name_checked && !self.name_edited;
-        // name + host + sandbox + program header + the program list, plus the
-        // transient collision line and a footer/gap.
-        let body_rows = 4 + usize::from(show_collision) + self.agent_rows.len();
+        // name + host + sandbox + isolation + program header + list, with a
+        // compact explanation block and the optional collision line.
+        let explain_rows = if self.host_is_local() { 4 } else { 0 };
+        let body_rows = 5 + explain_rows + usize::from(show_collision) + self.agent_rows.len();
         let spec = LayerSpec {
             title: format!("new worktree — {}", self.repo_slug),
             badge: Some(" Alt+w ".into()),
@@ -774,6 +842,39 @@ impl NewWorktreeWizard {
             );
         }
         y += 1;
+
+        // --- per-worktree isolation profile (local worktrees only) --------
+        if self.host_is_local() {
+            let focused = self.focus == Field::Isolation;
+            let profile = self.profile_value();
+            let label = if profile == self.profile_default {
+                format!("{} (default)", profile.as_str())
+            } else {
+                profile.as_str().to_string()
+            };
+            seg::draw_line(
+                surface,
+                inner.x,
+                y,
+                inner.cols,
+                &Line::segs(self.cycle_row("isolation", focused, &label)),
+                panel,
+            );
+            y += 1;
+            let explanation = thegn_core::sandbox_pin::explain(profile);
+            for text in [
+                explanation.one_liner,
+                explanation.hides[0],
+                explanation.network,
+                explanation.agents,
+            ] {
+                let wrapped = seg::wrap(&[seg(Tok::Slot(S::Dim), text)], inner.cols, 0);
+                for line in wrapped {
+                    seg::draw_line(surface, inner.x, y, inner.cols, &line, panel);
+                    y += 1;
+                }
+            }
+        }
 
         // --- program (full list, the primary selection) -------------------
         let prog_focused = self.focus == Field::Program;
@@ -1325,16 +1426,34 @@ pub fn run_worker(
     // Keyed on (env, backend): both the host env and the sandbox backend feed
     // the placement/isolation bring-up, so a change to either invalidates a
     // prior prep.
-    let mut prepped: Option<(String, String, crate::agent::SandboxOutcome)> = None;
+    let mut prepped: Option<(
+        String,
+        String,
+        Option<thegn_core::config::SandboxProfile>,
+        crate::agent::SandboxOutcome,
+    )> = None;
     let prep = |env: &str,
                 backend: &str,
+                profile: Option<thegn_core::config::SandboxProfile>,
                 wt: &Path|
      -> anyhow::Result<crate::agent::SandboxOutcome> {
         let wt_s = wt.to_string_lossy();
         let loc = GitLoc::from_db(&wt_s, None);
+        let selection = profile.map_or_else(
+            || thegn_core::sandbox_pin::EnvSelection::named(env),
+            |profile| thegn_core::sandbox_pin::EnvSelection::named(env).with_profile(profile),
+        );
         // A wizard pick is a fresh, explicit user choice — it wins over config
         // (even a non-"auto" `[sandbox] backend`), so `choice_is_explicit = true`.
-        crate::agent::prepare_sandbox_env(cfg, root, &wt_s, &loc, Some(backend), true, Some(env))
+        crate::agent::prepare_sandbox_env_with_selection(
+            cfg,
+            root,
+            &wt_s,
+            &loc,
+            Some(backend),
+            true,
+            &selection,
+        )
     };
     // The auto chain's host fallback is visible in the step detail; an
     // explicit choice that can't be honored errors instead (no silent host
@@ -1364,21 +1483,27 @@ pub fn run_worker(
                 );
                 return;
             }
-            Ok(WizardCmd::PrepChosen { env, sandbox }) => {
-                if prepped.as_ref().map(|(e, b, _)| (e.as_str(), b.as_str()))
-                    == Some((env.as_str(), sandbox.as_str()))
+            Ok(WizardCmd::PrepChosen {
+                env,
+                sandbox,
+                profile,
+            }) => {
+                if prepped
+                    .as_ref()
+                    .map(|(e, b, p, _)| (e.as_str(), b.as_str(), *p))
+                    == Some((env.as_str(), sandbox.as_str(), profile))
                 {
                     continue; // re-fired with the same (env, backend)
                 }
                 step(CreateStep::SandboxPrep, StepState::Running, None);
-                match prep(&env, &sandbox, &path) {
+                match prep(&env, &sandbox, profile, &path) {
                     Ok(outcome) => {
                         step(
                             CreateStep::SandboxPrep,
                             StepState::Done,
                             Some(sandbox_detail(&outcome)),
                         );
-                        prepped = Some((env, sandbox, outcome));
+                        prepped = Some((env, sandbox, profile, outcome));
                     }
                     Err(e) => {
                         // Non-fatal: user is still browsing — show the backend
@@ -1419,13 +1544,14 @@ pub fn run_worker(
                         path = new_path;
                         // A sandbox container is keyed by the worktree path —
                         // re-ensure for the moved path (cheap next to a checkout).
-                        if let Some((env, backend, outcome)) = prepped.as_mut()
+                        if let Some((env, backend, profile, outcome)) = prepped.as_mut()
                             && outcome.spec.is_some()
                         {
                             let env = env.clone();
                             let backend = backend.clone();
                             step(CreateStep::SandboxPrep, StepState::Running, None);
-                            match prep(&env, &backend, &path) {
+                            let profile = *profile;
+                            match prep(&env, &backend, profile, &path) {
                                 Ok(redo) => {
                                     step(
                                         CreateStep::SandboxPrep,
@@ -1533,15 +1659,21 @@ pub fn run_worker(
     // Reuse the speculative prep only when it matches the submitted (env,
     // backend); otherwise (no prep, or the user changed host/sandbox after the
     // last PrepChosen) prepare now with the submitted choice.
-    let reuse = prepped
-        .as_ref()
-        .map(|(e, b, _)| *e == choices.env && *b == choices.sandbox)
-        .unwrap_or(false);
+    let reuse = choices.profile.is_none()
+        && prepped
+            .as_ref()
+            .map(|(e, b, profile, _)| {
+                *e == choices.env && *b == choices.sandbox && *profile == choices.profile
+            })
+            .unwrap_or(false);
     let (_env_used, _backend_label, sandbox) = if reuse {
-        prepped.expect("reuse implies prepped is Some")
+        {
+            let (env, backend, _profile, outcome) = prepped.expect("reuse implies prepped is Some");
+            (env, backend, outcome)
+        }
     } else {
         step(CreateStep::SandboxPrep, StepState::Running, None);
-        match prep(&choices.env, &choices.sandbox, &path) {
+        match prep(&choices.env, &choices.sandbox, choices.profile, &path) {
             Ok(outcome) => {
                 step(
                     CreateStep::SandboxPrep,
@@ -1968,6 +2100,7 @@ mod tests {
         assert_eq!(choices.name, NameChoice::Generated);
         assert!(!choices.env.is_empty());
         assert!(!choices.sandbox.is_empty());
+        assert_eq!(choices.profile, None);
         assert!(!choices.agent.is_empty());
     }
 
@@ -2028,6 +2161,7 @@ mod tests {
                 env: "default".into(),
                 sandbox: "host".into(),
                 agent: "shell".into(),
+                profile: None,
             })],
             &state.path().join("state.sqlite"),
         );
@@ -2055,7 +2189,8 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         let mut w = NewWorktreeWizard::new_isolated_for_test(root.path().to_path_buf(), &cfg);
 
-        // Walk up to the Name field (Program → Sandbox → Host → Name).
+        // Walk up to the Name field (Program → Isolation → Sandbox → Host → Name).
+        key(&mut w, KeyCode::UpArrow);
         key(&mut w, KeyCode::UpArrow);
         key(&mut w, KeyCode::UpArrow);
         key(&mut w, KeyCode::UpArrow);
@@ -2069,7 +2204,9 @@ mod tests {
         assert_eq!(key(&mut w, KeyCode::Enter), WizardOutcome::Pending);
         assert_eq!(w.focus, Field::Sandbox);
 
-        // Enter on Sandbox advances to Program.
+        // Enter on Sandbox advances through Isolation to Program.
+        assert_eq!(key(&mut w, KeyCode::Enter), WizardOutcome::Pending);
+        assert_eq!(w.focus, Field::Isolation);
         assert_eq!(key(&mut w, KeyCode::Enter), WizardOutcome::Pending);
         assert_eq!(w.focus, Field::Program);
 
@@ -2251,6 +2388,66 @@ mod tests {
         };
         assert_eq!(choices.env, "remote");
         assert_eq!(choices.sandbox, "auto");
+        assert_eq!(choices.profile, None);
+    }
+
+    #[test]
+    fn sandbox_profile_wizard_row_cycles_and_records_only_an_override() {
+        let cfg = test_cfg();
+        let root = tempfile::tempdir().unwrap();
+        let mut wizard = NewWorktreeWizard::new_isolated_for_test(root.path().to_path_buf(), &cfg);
+        wizard.focus = Field::Isolation;
+        assert_eq!(wizard.profile_pin(), None);
+        assert!(matches!(
+            key(&mut wizard, KeyCode::RightArrow),
+            WizardOutcome::PrepChosen {
+                profile: Some(thegn_core::config::SandboxProfile::Sealed),
+                ..
+            }
+        ));
+        assert_eq!(
+            wizard.profile_pin(),
+            Some(thegn_core::config::SandboxProfile::Sealed)
+        );
+        key(&mut wizard, KeyCode::RightArrow);
+        assert_eq!(wizard.profile_pin(), None);
+    }
+
+    #[test]
+    fn sandbox_profile_registered_in_the_same_transaction() {
+        let _state = crate::testenv::IsolatedState::new();
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("worktree");
+        std::fs::create_dir(&path).unwrap();
+        let path_s = path.to_string_lossy().into_owned();
+        let db = thegn_core::db::Db::open().unwrap();
+        let choices = WizardChoices {
+            name: NameChoice::Generated,
+            env: "default".into(),
+            sandbox: "auto".into(),
+            profile: Some(thegn_core::config::SandboxProfile::Sealed),
+            agent: "shell".into(),
+        };
+        register_worktree_row(
+            &db,
+            &Config::default(),
+            root.path(),
+            "main",
+            "topic",
+            &path_s,
+            &choices,
+            None,
+        )
+        .unwrap();
+        assert_eq!(
+            db.worktree_sandbox_profile(&path_s).unwrap(),
+            choices.profile
+        );
+        assert_eq!(
+            db.worktree_env(&path_s).unwrap(),
+            None,
+            "the default environment is inherited while the profile override persists"
+        );
     }
 
     #[test]
@@ -2384,12 +2581,14 @@ mod tests {
                 WizardCmd::PrepChosen {
                     env: "default".into(),
                     sandbox: "host".into(),
+                    profile: None,
                 },
                 WizardCmd::Submit(WizardChoices {
                     name: NameChoice::Generated,
                     env: "default".into(),
                     sandbox: "host".into(),
                     agent: "shell".into(),
+                    profile: None,
                 }),
             ],
             &db,
@@ -2470,12 +2669,14 @@ mod tests {
                 WizardCmd::PrepChosen {
                     env: "default".into(),
                     sandbox: "host".into(),
+                    profile: None,
                 },
                 WizardCmd::Submit(WizardChoices {
                     name: NameChoice::Generated,
                     env: "default".into(),
                     sandbox: "host".into(),
                     agent: "shell".into(),
+                    profile: None,
                 }),
             ],
             &db_path,
@@ -2514,12 +2715,14 @@ mod tests {
                 WizardCmd::PrepChosen {
                     env: "myenv".into(),
                     sandbox: "host".into(),
+                    profile: None,
                 },
                 WizardCmd::Submit(WizardChoices {
                     name: NameChoice::Generated,
                     env: "myenv".into(),
                     sandbox: "host".into(),
                     agent: "shell".into(),
+                    profile: None,
                 }),
             ],
             &db,
@@ -2559,12 +2762,14 @@ mod tests {
                 WizardCmd::PrepChosen {
                     env: "default".into(),
                     sandbox: "host".into(),
+                    profile: None,
                 },
                 WizardCmd::Submit(WizardChoices {
                     name: NameChoice::Generated,
                     env: "default".into(),
                     sandbox: "host".into(),
                     agent: "shell".into(),
+                    profile: None,
                 }),
             ],
             &db,
@@ -2590,12 +2795,14 @@ mod tests {
                 WizardCmd::PrepChosen {
                     env: "default".into(),
                     sandbox: "host".into(),
+                    profile: None,
                 },
                 WizardCmd::Submit(WizardChoices {
                     name: NameChoice::Human("My Fix".into()),
                     env: "default".into(),
                     sandbox: "host".into(),
                     agent: "shell".into(),
+                    profile: None,
                 }),
             ],
             &db,

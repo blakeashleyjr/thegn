@@ -316,14 +316,36 @@ pub fn prepare_sandbox_env(
     choice_is_explicit: bool,
     selected_env: Option<&str>,
 ) -> anyhow::Result<SandboxOutcome> {
+    let mut selection =
+        Db::open()?.effective_env_selection(worktree, &repo_root.to_string_lossy())?;
+    if let Some(name) = selected_env {
+        selection.name = Some(name.to_string());
+    }
+    prepare_sandbox_env_with_selection(
+        cfg,
+        repo_root,
+        worktree,
+        loc,
+        backend_choice,
+        choice_is_explicit,
+        &selection,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn prepare_sandbox_env_with_selection(
+    cfg: &Config,
+    repo_root: &Path,
+    worktree: &str,
+    loc: &GitLoc,
+    backend_choice: Option<&str>,
+    choice_is_explicit: bool,
+    selection: &thegn_core::sandbox_pin::EnvSelection,
+) -> anyhow::Result<SandboxOutcome> {
     use crate::handlers::repo_trust::resolve_env_trusted;
     let generation =
         crate::config_startup::display().map_or(0, |admitted| admitted.revision().generation);
-    let selection = selected_env.map_or_else(
-        thegn_core::sandbox_pin::EnvSelection::none,
-        thegn_core::sandbox_pin::EnvSelection::named,
-    );
-    let trusted = resolve_env_trusted(cfg, repo_root, loc, worktree, &selection)?;
+    let trusted = resolve_env_trusted(cfg, repo_root, loc, worktree, selection)?;
     let environment = trusted.environment;
     let devcontainer = trusted.devcontainer;
     let mut placement = environment.placement.clone();
@@ -1738,15 +1760,8 @@ pub fn provider_proxy_target(
     let read =
         Db::open().and_then(|db| db.effective_env_checked(worktree, &repo_root.to_string_lossy()));
     let selected_env = env_selection_or_refuse(worktree, "provider proxy target", read)?;
-    let environment = cfg.resolve_env(
-        &repo_root,
-        &loc,
-        Path::new(worktree),
-        &thegn_core::sandbox_pin::EnvSelection {
-            name: selected_env.clone(),
-            profile: None,
-        },
-    );
+    let selection = selection_with_profile(worktree, &repo_root, selected_env.clone())?;
+    let environment = cfg.resolve_env(&repo_root, &loc, Path::new(worktree), &selection);
     let thegn_core::placement::Placement::Provider(p) = &environment.placement else {
         return None;
     };
@@ -1957,15 +1972,10 @@ fn native_exec_for(cfg: &Config, worktree: &str, agent_cmd: Option<String>) -> P
         Some(selected_env) => selected_env,
         None => return PaneNativeExec::Unavailable,
     };
-    let environment = cfg.resolve_env(
-        &repo_root,
-        &loc,
-        Path::new(worktree),
-        &thegn_core::sandbox_pin::EnvSelection {
-            name: selected_env.clone(),
-            profile: None,
-        },
-    );
+    let Some(selection) = selection_with_profile(worktree, &repo_root, selected_env.clone()) else {
+        return PaneNativeExec::Unavailable;
+    };
+    let environment = cfg.resolve_env(&repo_root, &loc, Path::new(worktree), &selection);
     let thegn_core::placement::Placement::Provider(p) = &environment.placement else {
         return PaneNativeExec::Unavailable;
     };
@@ -2090,15 +2100,10 @@ pub fn provision_pending(cfg: &Config, worktree: &str) -> bool {
     let Some(selected_env) = env_selection_or_refuse(worktree, "provision check", read) else {
         return false;
     };
-    let environment = cfg.resolve_env(
-        &repo_root,
-        &loc,
-        Path::new(worktree),
-        &thegn_core::sandbox_pin::EnvSelection {
-            name: selected_env.clone(),
-            profile: None,
-        },
-    );
+    let Some(selection) = selection_with_profile(worktree, &repo_root, selected_env.clone()) else {
+        return false;
+    };
+    let environment = cfg.resolve_env(&repo_root, &loc, Path::new(worktree), &selection);
     if !matches!(
         environment.placement,
         thegn_core::placement::Placement::Provider(_)
@@ -2234,15 +2239,11 @@ pub fn clear_native_exec_cooldown(cfg: &Config, worktree: &str) {
         clear_configured_provider_cooldowns(cfg);
         return;
     };
-    let environment = cfg.resolve_env(
-        &repo_root,
-        &loc,
-        Path::new(worktree),
-        &thegn_core::sandbox_pin::EnvSelection {
-            name: selected_env.clone(),
-            profile: None,
-        },
-    );
+    let Some(selection) = selection_with_profile(worktree, &repo_root, selected_env.clone()) else {
+        clear_configured_provider_cooldowns(cfg);
+        return;
+    };
+    let environment = cfg.resolve_env(&repo_root, &loc, Path::new(worktree), &selection);
     if let thegn_core::placement::Placement::Provider(_) = &environment.placement
         && let Some(envc) = cfg.env.get(&environment.name)
     {
@@ -2312,15 +2313,12 @@ pub fn provision_worktree(
         ProvisionSelection::Resolve(selected_env) => selected_env,
         ProvisionSelection::Skip => return Ok(false),
     };
-    let environment = cfg.resolve_env(
-        &repo_root,
-        &loc,
-        Path::new(worktree),
-        &thegn_core::sandbox_pin::EnvSelection {
-            name: selected_env.clone(),
-            profile: None,
-        },
-    );
+    let mut selection =
+        Db::open()?.effective_env_selection(worktree, &repo_root.to_string_lossy())?;
+    if selected_env.is_some() {
+        selection.name = selected_env;
+    }
+    let environment = cfg.resolve_env(&repo_root, &loc, Path::new(worktree), &selection);
     if !matches!(
         environment.placement,
         thegn_core::placement::Placement::Provider(_)
@@ -2352,6 +2350,31 @@ fn env_selection_or_refuse(
             None
         }
     }
+}
+
+fn selection_with_profile(
+    worktree: &str,
+    repo_root: &Path,
+    selected_name: Option<String>,
+) -> Option<thegn_core::sandbox_pin::EnvSelection> {
+    let db = match Db::open() {
+        Ok(db) => db,
+        Err(error) => {
+            tracing::warn!(target: "thegn::provider", worktree, error = %format!("{error:#}"), "provider path refused: worktree sandbox selection unreadable");
+            return None;
+        }
+    };
+    let mut selection = match db.effective_env_selection(worktree, &repo_root.to_string_lossy()) {
+        Ok(selection) => selection,
+        Err(error) => {
+            tracing::warn!(target: "thegn::provider", worktree, error = %format!("{error:#}"), "provider path refused: worktree sandbox selection unreadable");
+            return None;
+        }
+    };
+    if selected_name.is_some() {
+        selection.name = selected_name;
+    }
+    Some(selection)
 }
 
 /// The env selection for provisioning: a failed read is an error naming the cause.
@@ -2690,12 +2713,9 @@ pub fn provision_provider_env_named(
         .map(PathBuf::from)
         .or_else(|| repo::main_worktree(Path::new(worktree)))
         .unwrap_or_else(|| PathBuf::from(worktree));
-    let resolved = cfg.resolve_env(
-        &repo_root,
-        &loc,
-        Path::new(worktree),
-        &thegn_core::sandbox_pin::EnvSelection::named(env_name),
-    );
+    let selection = selection_with_profile(worktree, &repo_root, Some(env_name.to_string()))
+        .ok_or_else(|| anyhow::anyhow!("the worktree's sandbox profile could not be read"))?;
+    let resolved = cfg.resolve_env(&repo_root, &loc, Path::new(worktree), &selection);
     let allow = &resolved.sandbox.network_allow;
     let block = &resolved.sandbox.network_block;
     let admission =
@@ -3751,12 +3771,12 @@ fn auto_provision_sandbox(
                 .map(PathBuf::from)
                 .or_else(|| repo::main_worktree(Path::new(worktree)))
                 .unwrap_or_else(|| PathBuf::from(worktree));
-            let resolved = cfg.resolve_env(
-                &repo_root,
-                &loc,
-                Path::new(worktree),
-                &thegn_core::sandbox_pin::EnvSelection::named(env_name),
-            );
+            let selection =
+                selection_with_profile(worktree, &repo_root, Some(env_name.to_string()))
+                    .ok_or_else(|| {
+                        anyhow::anyhow!("the worktree's sandbox profile could not be read")
+                    })?;
+            let resolved = cfg.resolve_env(&repo_root, &loc, Path::new(worktree), &selection);
             let allow = &resolved.sandbox.network_allow;
             let block = &resolved.sandbox.network_block;
             crate::egress_admit::gate_handed_sandbox(

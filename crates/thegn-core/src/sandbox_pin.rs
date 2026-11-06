@@ -66,14 +66,14 @@ pub const fn explain(profile: SandboxProfile) -> ProfileExplain {
     match profile {
         SandboxProfile::Sealed => ProfileExplain {
             title: "Sealed",
-            one_liner: "Private home, no network, and every capability dropped.",
+            one_liner: "Private home, no network, and every Linux capability dropped.",
             hides: &[
-                "Home is a private empty directory with a small shell/git allowlist.",
+                "Home is private and empty except for a small shell/git allowlist.",
                 "Credentials, ~/.ssh, agent logins, and thegn state are hidden.",
             ],
-            network: "No network. git fetch/push and API-backed agents will not work.",
-            credentials: "Host credentials and the SSH agent socket are hidden.",
-            agents: "Local tools and offline builds work; remote environments and host runs are refused.",
+            network: "No network or VPN attachment; git fetch/push will not work inside.",
+            credentials: "Credentials and the SSH agent socket are hidden.",
+            agents: "API-backed agent CLIs fail; local tools and offline builds work. Root is read-only, new privileges are blocked, and the process limit is 256.",
             how_to_change: "Change later: palette > Isolation profile, or thegn sandbox profile set <standard|sealed>.",
         },
         _ => ProfileExplain {
@@ -81,11 +81,11 @@ pub const fn explain(profile: SandboxProfile) -> ProfileExplain {
             one_liner: "A read-only view of files outside this worktree.",
             hides: &[
                 "Files outside the worktree are read-only.",
-                "Your home remains readable, including credentials, ~/.ssh, cloud tokens, and agent CLI logins.",
+                "Home stays readable, including ~/.ssh, cloud tokens, and agent CLI logins.",
             ],
-            network: "Network works for fetch, clone, installs, and API-backed agents.",
+            network: "Network and VPN attachments work for fetch, clone, installs, and API-backed agents.",
             credentials: "Credentials in your read-only home remain visible.",
-            agents: "Works with local, SSH, and provider environments; default capabilities remain.",
+            agents: "Local, SSH, and provider environments work; default capabilities remain. Root is read-only, new privileges are blocked, and the process limit is 512.",
             how_to_change: "Change later: palette > Isolation profile, or thegn sandbox profile set <standard|sealed>.",
         },
     }
