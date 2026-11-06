@@ -6068,12 +6068,18 @@ mod tests {
         let id = db
             .put_agent_dispatch(NewDispatch::new("linear:THE-1881-PLAIN", "/wt/x", "claude"))
             .unwrap();
-        db.update_dispatch_status(id, AgentDispatchStatus::Running)
-            .unwrap();
-        let mut row = db.get_dispatch(id).unwrap().unwrap();
-        row.artifact_path = Some("  ".into());
-
-        assert!(done_gate_bound(&db, &row).is_ok());
+        assert_eq!(
+            db.publish_dispatch_run(id, "plain-session", "  ").unwrap(),
+            thegn_core::issue::DispatchRunPublishOutcome::Published
+        );
+        assert_eq!(
+            db.get_dispatch(id)
+                .unwrap()
+                .unwrap()
+                .artifact_path
+                .as_deref(),
+            Some("  ")
+        );
         set_status_on_led(
             &db,
             id,
