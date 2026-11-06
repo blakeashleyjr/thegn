@@ -2451,6 +2451,38 @@ fn selected_env_with_no_table_halts_or_degrades_loudly() {
     });
 }
 
+#[test]
+fn sealed_hint_unresolved_env_uses_sealed_refusal_route() {
+    with_temp_state("sealed-unresolved-env", || {
+        let mut cfg = Config::default();
+        cfg.sandbox.profile = thegn_core::config::SandboxProfile::Sealed;
+        let loc = GitLoc::from_db("/wt/x", None);
+        let err = prepare_sandbox_env(
+            &cfg,
+            Path::new("/repo"),
+            "/wt/x",
+            &loc,
+            None,
+            false,
+            Some("ghost"),
+        )
+        .expect_err("a phantom env selection under sealed halts without host escape");
+        let halt = err
+            .downcast_ref::<crate::agent::SandboxHalt>()
+            .expect("the error is a SandboxHalt");
+        assert!(
+            halt.sealed_home,
+            "sealed profile refusals use the sealed route"
+        );
+        let message = halt.to_string();
+        assert!(
+            message.contains("thegn sandbox profile set standard"),
+            "{message}"
+        );
+        assert!(!message.contains("run on host"), "{message}");
+    });
+}
+
 // H1: E2E launch_spec test — backend="none" → host fallback path.
 #[test]
 fn launch_spec_none_backend_produces_valid_spec() {

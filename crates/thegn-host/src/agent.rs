@@ -202,15 +202,20 @@ impl std::error::Error for DevcontainerLaunchRefused {}
 impl std::fmt::Display for SandboxHalt {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         if self.sealed_home {
+            let fix = if self.reason.contains("thegn sandbox profile set standard") {
+                String::new()
+            } else {
+                format!(
+                    " Fix: {}",
+                    thegn_core::sandbox_floor::standard_switch_hint(None)
+                )
+            };
             return write!(
                 f,
                 "environment '{}' ({}) could not be brought up: {} — thegn will not \
-                 silently fall back to the host. Fix: {}, or install/start a container \
-                 runtime (`thegn doctor` shows which).",
-                self.env_name,
-                self.placement,
-                self.reason,
-                thegn_core::sandbox_floor::standard_switch_hint(None)
+                 silently fall back to the host.{} If the required runtime is unavailable, \
+                 install/start it (`thegn doctor` shows which).",
+                self.env_name, self.placement, self.reason, fix
             );
         }
         let allow = if self.ask {
@@ -538,7 +543,7 @@ pub fn prepare_sandbox_env(
                 ),
                 ask,
                 dormant: None,
-                sealed_home: false,
+                sealed_home: sb.profile.hides_home(),
             }
             .into());
         }
@@ -1014,7 +1019,7 @@ pub fn prepare_sandbox_env(
             reason: m,
             ask,
             dormant: None,
-            sealed_home: false,
+            sealed_home: sb.profile.hides_home(),
         }
         .into());
     }
@@ -1025,7 +1030,7 @@ pub fn prepare_sandbox_env(
             reason: m.refusal(),
             ask,
             dormant: None,
-            sealed_home: false,
+            sealed_home: sb.profile.hides_home(),
         }
         .into());
     }
@@ -1037,12 +1042,20 @@ pub fn prepare_sandbox_env(
         return Err(SandboxHalt {
             env_name: env_name.clone(),
             placement: placement_label.clone(),
-            reason: format!(
-                "profile `{}` requires a sandbox that hides $HOME, but no backend produced one \
-                 for {worktree}; refusing to open a host shell (see `thegn doctor`). {}",
-                hardening.as_str(),
-                thegn_core::sandbox_floor::standard_switch_hint(Some(worktree))
-            ),
+            reason: if env_is_remote {
+                format!(
+                    "profile `{}` is a local-sandbox feature; this is a remote placement, so \
+                     thegn cannot enforce hiding $HOME or removing the network for {worktree}; \
+                     refusing the launch (see `thegn doctor`)",
+                    hardening.as_str()
+                )
+            } else {
+                format!(
+                    "profile `{}` requires a sandbox that hides $HOME, but no backend produced \
+                     one for {worktree}; refusing to open a host shell (see `thegn doctor`)",
+                    hardening.as_str()
+                )
+            },
             ask,
             dormant: None,
             sealed_home: true,

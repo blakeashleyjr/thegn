@@ -357,7 +357,10 @@ pub const PROVIDER_UNVERIFIED: &str = "provider-managed (unverified)";
 /// A user-facing route back to the default `standard` sandbox profile.
 pub fn standard_switch_hint(worktree: Option<&str>) -> String {
     let target = match worktree {
-        Some(path) => format!(" --worktree `{path}`"),
+        Some(path) => {
+            let quoted = path.replace('\'', "'\\''");
+            format!(" --worktree '{quoted}'")
+        }
         None => String::new(),
     };
     format!(
@@ -375,12 +378,13 @@ pub struct ProviderRefusal {
 impl std::fmt::Display for ProviderRefusal {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let request = self.request.describe();
-        if matches!(self.request, ExplicitIsolation::SealedProfile(_)) {
+        if let ExplicitIsolation::SealedProfile(profile) = &self.request {
             write!(
                 formatter,
-                "env `{}` runs on a {} placement: profile `sealed` is a local-sandbox feature; this is a remote placement, so thegn cannot enforce hiding $HOME or removing the network there. The launch is refused before any provisioning, credential or upload. {} Or use a local sandbox env for this worktree.",
+                "env `{}` runs on a {} placement: profile `{}` is a local-sandbox feature; this is a remote placement, so thegn cannot enforce hiding $HOME or removing the network there. The launch is refused before any provisioning, credential or upload. {} Or use a local sandbox env for this worktree.",
                 self.env,
                 PROVIDER_UNVERIFIED,
+                profile.as_str(),
                 standard_switch_hint(None)
             )
         } else {
@@ -1408,11 +1412,14 @@ mod tests {
 
     #[test]
     fn sealed_hint_refusal_classes_name_the_switch() {
-        let targeted = standard_switch_hint(Some("/work/tree"));
+        let targeted = standard_switch_hint(Some("/work/a tree/$(touch nope)'s"));
         assert!(
-            targeted.contains("thegn sandbox profile set standard --worktree `/work/tree`"),
+            targeted.contains(
+                "thegn sandbox profile set standard --worktree '/work/a tree/$(touch nope)'\\''s'"
+            ),
             "{targeted}"
         );
+        assert!(!targeted.contains("--worktree `/work"), "{targeted}");
         assert!(standard_switch_hint(None).contains("thegn sandbox profile set standard"));
 
         for class in [
@@ -1444,6 +1451,18 @@ mod tests {
         );
         assert!(message.contains("remote placement"), "{message}");
         assert!(!message.contains("remove profile"), "{message}");
+
+        let tunnel = SandboxConfig {
+            profile: SandboxProfile::SealedTunnel,
+            ..SandboxConfig::default()
+        };
+        let tunnel_message = provider_refusal(true, &tunnel, "e")
+            .expect("sealed-tunnel provider request refuses")
+            .to_string();
+        assert!(
+            tunnel_message.contains("profile `sealed-tunnel` is a local-sandbox feature"),
+            "{tunnel_message}"
+        );
     }
 
     #[test]

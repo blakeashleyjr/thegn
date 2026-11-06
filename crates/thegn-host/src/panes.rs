@@ -343,10 +343,9 @@ pub(crate) fn terminal_launch_spec(
         if cfg.sandbox.profile.hides_home() {
             anyhow::bail!(
                 "profile `{}` requires a sandbox that hides $HOME, but the launch degraded to \
-                 the host; refusing. {} (standalone terminal tabs follow the global [sandbox] \
-                 profile: set `profile = \"standard\"` in your config)",
-                cfg.sandbox.profile.as_str(),
-                thegn_core::sandbox_floor::standard_switch_hint(None)
+                 the host; refusing. Standalone terminal tabs follow the global [sandbox] \
+                 profile: set `profile = \"standard\"` in your config.",
+                cfg.sandbox.profile.as_str()
             );
         }
         if let Some(w) = truth.warning.as_deref() {
@@ -490,9 +489,8 @@ fn sandbox_wrap_shell(
     let sealed = cfg.sandbox.profile.hides_home();
     let refuse = |why: &str| -> anyhow::Result<Option<WrappedShell>> {
         anyhow::bail!(
-            "profile `{}` requires a sandbox that hides $HOME, but {why}; refusing a host shell. {} (standalone terminal tabs follow the global [sandbox] profile: set `profile = \"standard\"` in your config)",
-            cfg.sandbox.profile.as_str(),
-            thegn_core::sandbox_floor::standard_switch_hint(None)
+            "profile `{}` requires a sandbox that hides $HOME, but {why}; refusing a host shell. Standalone terminal tabs follow the global [sandbox] profile: set `profile = \"standard\"` in your config.",
+            cfg.sandbox.profile.as_str()
         )
     };
     let Ok(be) = thegn_core::config::SandboxBackend::from_str_validated(backend) else {
@@ -1624,13 +1622,14 @@ mod tests {
             Ok(_) => panic!("unknown backend cannot create a sealed terminal shell"),
         };
         let message = format!("{error:#}");
+        let global_route = message
+            .find("set `profile = \"standard\"` in your config")
+            .expect("terminal refusal gives the global config route");
         assert!(
-            message.contains("thegn sandbox profile set standard"),
-            "{message}"
-        );
-        assert!(
-            message.contains("standalone terminal tabs follow the global [sandbox] profile"),
-            "{message}"
+            message
+                .find("thegn sandbox profile set standard")
+                .is_none_or(|command| global_route < command),
+            "the global config route comes before any per-worktree command: {message}"
         );
     }
 
