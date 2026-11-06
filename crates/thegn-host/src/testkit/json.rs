@@ -226,11 +226,13 @@ fn parse_rspec(text: &str) -> Vec<TestNode> {
             };
             let loc = match (
                 ex.get("file_path").and_then(Value::as_str),
-                ex.get("line_number").and_then(Value::as_i64),
+                ex.get("line_number")
+                    .and_then(Value::as_i64)
+                    .and_then(checked_line),
             ) {
-                (Some(p), Some(l)) => Some(TestLocation {
+                (Some(p), Some(line)) => Some(TestLocation {
                     path: p.trim_start_matches("./").to_string(),
-                    line: l as usize,
+                    line,
                     column: None,
                 }),
                 _ => None,
@@ -252,10 +254,33 @@ fn parse_rspec(text: &str) -> Vec<TestNode> {
 
 fn dart_location(t: &Value) -> Option<TestLocation> {
     let url = t.get("url").and_then(Value::as_str)?;
-    let path = url.strip_prefix("file://").unwrap_or(url).to_string();
-    let line = t.get("line").and_then(Value::as_i64)? as usize;
-    let column = t.get("column").and_then(Value::as_i64).map(|c| c as usize);
+    let path = dart_path(url)?;
+    let line = checked_line(t.get("line").and_then(Value::as_i64)?)?;
+    let column = t
+        .get("column")
+        .and_then(Value::as_i64)
+        .and_then(checked_line);
     Some(TestLocation { path, line, column })
+}
+
+fn checked_line(n: i64) -> Option<usize> {
+    usize::try_from(n).ok()
+}
+
+fn dart_path(url: &str) -> Option<String> {
+    if url
+        .get(..5)
+        .is_some_and(|prefix| prefix.eq_ignore_ascii_case("file:"))
+    {
+        let parsed = reqwest::Url::parse(url).ok()?;
+        match parsed.host_str() {
+            None | Some("") | Some("localhost") => {}
+            Some(_) => return None,
+        }
+        parsed.to_file_path().ok()?.to_str().map(str::to_owned)
+    } else {
+        Some(url.to_string())
+    }
 }
 
 #[cfg(test)]
@@ -300,6 +325,67 @@ mod tests {
         let fail = nodes.iter().find(|n| n.id == "is broken").unwrap();
         assert_eq!(fail.state, TestState::Fail);
         assert!(fail.message.as_deref().unwrap().contains("Expected"));
+    }
+
+    #[test]
+    fn dart_json_decodes_percent_encoded_file_urls() {
+        let text = r#"
+{"type":"testStart","test":{"id":1,"name":"adds numbers","url":"file:///x/my%20proj/test/foo_test.dart","line":3,"column":5}}
+{"type":"testDone","testID":1,"result":"success","skipped":false,"hidden":false}
+"#;
+        let nodes = parse("dart", text);
+        let pass = nodes.iter().find(|n| n.id == "adds numbers").unwrap();
+        assert_eq!(
+            pass.location.as_ref().unwrap().path,
+            "/x/my proj/test/foo_test.dart"
+        );
+    }
+
+    #[test]
+    fn dart_json_refuses_a_file_url_naming_another_host() {
+        let text = r#"
+{"type":"testStart","test":{"id":1,"name":"adds numbers","url":"file://other.example/x/foo_test.dart","line":3}}
+{"type":"testDone","testID":1,"result":"success","skipped":false,"hidden":false}
+"#;
+        let nodes = parse("dart", text);
+        let pass = nodes.iter().find(|n| n.id == "adds numbers").unwrap();
+        assert!(pass.location.is_none());
+    }
+
+    #[test]
+    fn dart_json_keeps_a_non_file_url_verbatim() {
+        let text = r#"
+{"type":"testStart","test":{"id":1,"name":"adds numbers","url":"test/foo_test.dart","line":3}}
+{"type":"testDone","testID":1,"result":"success","skipped":false,"hidden":false}
+"#;
+        let nodes = parse("dart", text);
+        let pass = nodes.iter().find(|n| n.id == "adds numbers").unwrap();
+        assert_eq!(pass.location.as_ref().unwrap().path, "test/foo_test.dart");
+    }
+
+    #[test]
+    fn dart_json_drops_negative_lines_and_columns() {
+        let text = r#"
+{"type":"testStart","test":{"id":1,"name":"negative line","url":"file:///x/foo_test.dart","line":-1,"column":5}}
+{"type":"testDone","testID":1,"result":"success","skipped":false,"hidden":false}
+{"type":"testStart","test":{"id":2,"name":"negative column","url":"file:///x/foo_test.dart","line":4,"column":-2}}
+{"type":"testDone","testID":2,"result":"success","skipped":false,"hidden":false}
+"#;
+        let nodes = parse("dart", text);
+        let no_line = nodes.iter().find(|n| n.id == "negative line").unwrap();
+        assert!(no_line.location.is_none());
+        let no_column = nodes.iter().find(|n| n.id == "negative column").unwrap();
+        let location = no_column.location.as_ref().unwrap();
+        assert_eq!(location.line, 4);
+        assert_eq!(location.column, None);
+    }
+
+    #[test]
+    fn rspec_json_drops_a_negative_line_number() {
+        let text = r#"{"examples":[{"description":"breaks","status":"failed","file_path":"./spec/calc_spec.rb","line_number":-3}]}"#;
+        let nodes = parse("rspec", text);
+        let fail = nodes.iter().find(|n| n.id == "breaks").unwrap();
+        assert!(fail.location.is_none());
     }
 
     #[test]
