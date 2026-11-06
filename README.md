@@ -50,6 +50,10 @@ mkdir -p "$HOME/.local/bin"
 install -m 755 thegn "$HOME/.local/bin/thegn"
 ```
 
+The tarball commands need the GitHub CLI (`gh auth login`); alternatively
+download the archive and `.sha256` in a browser (see
+[Prebuilt binary](#prebuilt-binary-no-nix)).
+
 ### 2. Prerequisites
 
 | Tool                                              | Needed                         | What for                                                                                                     |
@@ -83,7 +87,7 @@ to use on `PATH`. The Nix package wraps `git`, `fzf`, `gum`, `lazygit`, `yazi`,
 `Alt-X` (Shift) removes the whole worktree after a confirm prompt; the branch
 is kept.
 
-More: press `F1`, or see docs/help/getting-started.md.
+More: press `F1`, or see [getting started](docs/help/getting-started.md).
 
 > **Sandbox and credentials.** Worktree panes run in a sandbox by default. The
 > default `sealed` profile hides `$HOME`, including credentials such as
@@ -436,7 +440,7 @@ no benchmark is published. Contributors can measure with `just bench` and
   of truth** for worktrees; the DB is a cache + resurrection layer. Restarting
   restores your workspace, worktree and pane layout (after a crash the active
   tab can be one switch stale; see [`KNOWN_ISSUES.md`](KNOWN_ISSUES.md)).
-- **Worktrees** default to `~/.thegn/worktrees/<repo>/<branch-slug>`;
+- **Worktrees** default to `~/.thegn/worktrees/<repo>/<label>--<digest>`;
   `worktree_mode = "in_repo"` uses `<repo>/.worktrees`.
 - thegn has no built-in model or managed agent. `[[agents]]` and `[[tools]]`
   launch any CLI as an ordinary command. An opt-in local model proxy
@@ -599,8 +603,8 @@ feature).
 
 ## Privacy
 
-What thegn stores, logs and sends is described in the in-app help page `privacy`
-(press `F1`, or see docs/help/privacy.md). In short: no vendor telemetry was
+What thegn stores, logs and sends is described in the in-app [privacy help
+page](docs/help/privacy.md) (press `F1`). In short: no vendor telemetry was
 found; crash reports and logs stay on your machine and are never uploaded
 automatically; GitHub and other forge, update and provider calls happen only
 when you use or enable those features. A first-run network trace has not been
