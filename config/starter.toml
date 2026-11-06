@@ -3,7 +3,8 @@
 # ~/.config/thegn/config.toml), then check it with `thegn config validate`.
 # Find every key in the generated config-reference help page or in
 # config/config.toml.example.
-# Every key is optional; deleting this file changes nothing but the choices below.
+# Every key is optional; deleting this file changes nothing but the choices
+# below.
 # Full annotated reference: config/config.toml.example in the source tree;
 # `thegn config edit` seeds a missing config from it.
 
@@ -23,12 +24,13 @@ color = "auto"
 glyphs = "auto"
 
 [git]
-# Fetch and prune in the background; set false to stop automatic fetching. Default: true.
+# Fetch and prune in the background; set false to stop automatic fetching.
+# Default: true.
 auto_fetch = true
 
 [sandbox]
-# Standard protects worktree integrity, not credentials; sealed hides home. Default: standard.
-profile = "standard"
+# Default: sealed ($HOME hidden, network off). Set profile = "standard" to
+# opt into the previous behaviour.
 # Select an available containment backend automatically. Default: auto.
 backend = "auto"
 
@@ -41,7 +43,8 @@ enabled = true
 provider = "auto"
 
 [usage]
-# The AI-account usage gauge may call its provider with a token already on disk; false is offline. Default: true.
+# The AI-account usage gauge may call its provider with a token already on
+# disk; false is offline. Default: true.
 allow_network = true
 
 [weather]
