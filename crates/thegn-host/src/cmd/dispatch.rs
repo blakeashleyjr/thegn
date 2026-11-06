@@ -6041,6 +6041,122 @@ mod tests {
     }
 
     #[test]
+    fn done_gate_cli_refuses_a_stage_row_with_a_blank_artifact_path() {
+        let (_db_dir, db) = db("done-gate-cli-blank-artifact");
+        let (_repo_dir, root) = git_repo("done-gate-cli-blank-artifact");
+        let row = row_in(&root, Some("   "));
+
+        let err = done_gate_bound(&db, &row).unwrap_err();
+        assert_eq!(set_status_error_kind(&err), Some("missing_evidence"));
+        assert!(err.to_string().contains("no artifact path"));
+    }
+
+    #[test]
+    fn done_gate_cli_refuses_an_artifact_row_with_a_blank_report() {
+        let (_repo_dir, _db_dir, db, mut row, _root) =
+            trusted_done_fixture("done-gate-cli-blank-report");
+        row.report = Some("   ".into());
+
+        let err = done_gate_bound(&db, &row).unwrap_err();
+        assert_eq!(set_status_error_kind(&err), Some("missing_evidence"));
+        assert!(err.to_string().contains("but no report"));
+    }
+
+    #[test]
+    fn done_gate_cli_plain_row_with_blank_artifact_still_completes() {
+        let (_db_dir, db) = db("done-gate-cli-plain-blank-artifact");
+        let id = db
+            .put_agent_dispatch(NewDispatch::new("linear:THE-1881-PLAIN", "/wt/x", "claude"))
+            .unwrap();
+        db.update_dispatch_status(id, AgentDispatchStatus::Running)
+            .unwrap();
+        let mut row = db.get_dispatch(id).unwrap().unwrap();
+        row.artifact_path = Some("  ".into());
+
+        assert!(done_gate_bound(&db, &row).is_ok());
+        set_status_on_led(
+            &db,
+            id,
+            AgentDispatchStatus::Done,
+            false,
+            None,
+            LeadProof::Unbound,
+            true,
+        )
+        .unwrap();
+        assert_eq!(
+            db.get_dispatch(id).unwrap().unwrap().status,
+            AgentDispatchStatus::Done
+        );
+    }
+
+    #[test]
+    fn done_gate_cli_stage_reservation_stays_refused_through_the_publish_window() {
+        let (_repo_dir, root) = git_repo("done-gate-cli-publish-window");
+        let (_db_dir, db) = db("done-gate-cli-publish-window");
+        let id = db
+            .put_agent_dispatch(NewDispatch {
+                stage: Some("code"),
+                artifact_path: None,
+                ..NewDispatch::new("linear:THE-1881-RACE", root.to_str().unwrap(), "coder")
+            })
+            .unwrap();
+        db.update_dispatch_status(id, AgentDispatchStatus::Spawning)
+            .unwrap();
+
+        let before_publish = set_status_on_led(
+            &db,
+            id,
+            AgentDispatchStatus::Done,
+            false,
+            None,
+            LeadProof::Unbound,
+            true,
+        )
+        .unwrap_err();
+        assert_eq!(
+            set_status_error_kind(&before_publish),
+            Some("missing_evidence")
+        );
+        assert!(
+            before_publish
+                .to_string()
+                .contains("unpublished reservation")
+        );
+        assert_eq!(
+            db.get_dispatch(id).unwrap().unwrap().status,
+            AgentDispatchStatus::Spawning
+        );
+
+        // Pause at the claim -> publish boundary, then attempt completion before
+        // the worker has created and committed its artifact.
+        let artifact = pipeline_run::artifact_path("linear:THE-1881-RACE", "code", id);
+        assert_eq!(
+            db.publish_dispatch_run(id, "race-session", &artifact)
+                .unwrap(),
+            thegn_core::issue::DispatchRunPublishOutcome::Published
+        );
+        let after_publish = set_status_on_led(
+            &db,
+            id,
+            AgentDispatchStatus::Done,
+            false,
+            None,
+            LeadProof::Unbound,
+            true,
+        )
+        .unwrap_err();
+        assert_eq!(
+            set_status_error_kind(&after_publish),
+            Some("missing_evidence")
+        );
+        assert_ne!(
+            db.get_dispatch(id).unwrap().unwrap().status,
+            AgentDispatchStatus::Done
+        );
+    }
+
+    #[test]
     fn trusted_reap_needs_decision_without_attestation() {
         let (_repo_dir, _db_dir, _db, mut row, _root) =
             trusted_done_fixture("trusted-reap-missing");
