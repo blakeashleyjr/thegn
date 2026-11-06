@@ -118,6 +118,7 @@ mod tests {
             sandbox_backend: None,
             env_name: None,
             env_degraded: false,
+            sandbox_profile: None,
         };
         assert_eq!(
             active_repo_path("/repo/.worktrees/feature", std::slice::from_ref(&worktree),),

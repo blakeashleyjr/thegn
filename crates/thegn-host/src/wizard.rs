@@ -310,19 +310,28 @@ impl NewWorktreeWizard {
             .and_then(|(key, _, _)| host_sandbox_defaults.get(key))
             .and_then(|want| sandbox_rows.iter().position(|(key, _)| key == want))
             .unwrap_or(0);
+        let repo_location = GitLoc::Local(repo_root.clone());
         let profile_default = cfg
-            .env
-            .get(&default_env)
-            .and_then(|env| env.sandbox.profile)
-            .unwrap_or(cfg.sandbox.profile);
+            .resolve_env(
+                &repo_root,
+                &repo_location,
+                &repo_root,
+                &thegn_core::sandbox_pin::EnvSelection::named(&default_env),
+            )
+            .sandbox
+            .profile;
         let profile_defaults = host_rows
             .iter()
             .map(|(key, _, _)| {
                 let profile = cfg
-                    .env
-                    .get(key)
-                    .and_then(|env| env.sandbox.profile)
-                    .unwrap_or(cfg.sandbox.profile);
+                    .resolve_env(
+                        &repo_root,
+                        &repo_location,
+                        &repo_root,
+                        &thegn_core::sandbox_pin::EnvSelection::named(key),
+                    )
+                    .sandbox
+                    .profile;
                 (key.clone(), profile)
             })
             .collect();
@@ -730,7 +739,35 @@ impl NewWorktreeWizard {
         let show_collision = self.focus == Field::Name && !self.name_checked && !self.name_edited;
         // name + host + sandbox + isolation + program header + list, with a
         // compact explanation block and the optional collision line.
-        let explain_rows = if self.host_is_local() { 4 } else { 0 };
+        let explanation_text = if self.host_is_local() {
+            let explanation = thegn_core::sandbox_pin::explain(self.profile_value());
+            if self.profile_value() == thegn_core::config::SandboxProfile::Sealed {
+                vec![
+                    explanation.one_liner,
+                    "Home is private and empty; credentials, SSH and thegn state are hidden.",
+                    "No network or VPN attachments; all Linux capabilities are dropped.",
+                    "SSH/provider envs and run-on-host are refused.",
+                    "Unsealable launch requests are refused, never downgraded.",
+                ]
+            } else {
+                vec![
+                    explanation.one_liner,
+                    "Home stays readable, including credentials, ~/.ssh and cloud tokens.",
+                    explanation.network,
+                    "SSH/provider envs and run-on-host work.",
+                ]
+            }
+        } else {
+            Vec::new()
+        };
+        let mut explanation_lines = explanation_text
+            .iter()
+            .flat_map(|text| seg::wrap(&[seg(Tok::Slot(S::Dim), *text)], 52, 0))
+            .collect::<Vec<_>>();
+        let fixed_rows = 5 + usize::from(show_collision) + self.agent_rows.len();
+        let explanation_budget = screen.rows.saturating_sub(fixed_rows + 4);
+        explanation_lines.truncate(explanation_budget);
+        let explain_rows = explanation_lines.len();
         let body_rows = 5 + explain_rows + usize::from(show_collision) + self.agent_rows.len();
         let spec = LayerSpec {
             title: format!("new worktree — {}", self.repo_slug),
@@ -861,18 +898,9 @@ impl NewWorktreeWizard {
                 panel,
             );
             y += 1;
-            let explanation = thegn_core::sandbox_pin::explain(profile);
-            for text in [
-                explanation.one_liner,
-                explanation.hides[0],
-                explanation.network,
-                explanation.agents,
-            ] {
-                let wrapped = seg::wrap(&[seg(Tok::Slot(S::Dim), text)], inner.cols, 0);
-                for line in wrapped {
-                    seg::draw_line(surface, inner.x, y, inner.cols, &line, panel);
-                    y += 1;
-                }
+            for line in explanation_lines {
+                seg::draw_line(surface, inner.x, y, inner.cols, &Line::segs(line), panel);
+                y += 1;
             }
         }
 
@@ -1136,6 +1164,7 @@ pub enum WizardCmd {
     PrepChosen {
         env: String,
         sandbox: String,
+        profile: Option<thegn_core::config::SandboxProfile>,
     },
     Submit(WizardChoices),
     Cancel,
@@ -2222,8 +2251,9 @@ mod tests {
         let cfg = test_cfg();
         let root = tempfile::tempdir().unwrap();
         let mut w = NewWorktreeWizard::new_isolated_for_test(root.path().to_path_buf(), &cfg);
-        // Focus starts on Program; walk up to the Name field (Sandbox, Host,
+        // Focus starts on Program; walk up to the Name field (Isolation, Sandbox, Host,
         // Name — a local default host keeps the Sandbox row in the ring).
+        key(&mut w, KeyCode::UpArrow);
         key(&mut w, KeyCode::UpArrow);
         key(&mut w, KeyCode::UpArrow);
         key(&mut w, KeyCode::UpArrow);
@@ -2238,6 +2268,7 @@ mod tests {
 
         // Enter on the Name field advances rather than creating; walk down to
         // the Program list, where Enter submits the typed (Human) name.
+        key(&mut w, KeyCode::DownArrow);
         key(&mut w, KeyCode::DownArrow);
         key(&mut w, KeyCode::DownArrow);
         key(&mut w, KeyCode::DownArrow);
@@ -2262,7 +2293,8 @@ mod tests {
         let cfg = test_cfg();
         let root = tempfile::tempdir().unwrap();
         let mut w = NewWorktreeWizard::new_isolated_for_test(root.path().to_path_buf(), &cfg);
-        // Walk up to the Name field.
+        // Walk up to the Name field (Program → Isolation → Sandbox → Host → Name).
+        key(&mut w, KeyCode::UpArrow);
         key(&mut w, KeyCode::UpArrow);
         key(&mut w, KeyCode::UpArrow);
         key(&mut w, KeyCode::UpArrow);
@@ -2275,6 +2307,7 @@ mod tests {
         key(&mut w, KeyCode::DownArrow);
         key(&mut w, KeyCode::DownArrow);
         key(&mut w, KeyCode::DownArrow);
+        key(&mut w, KeyCode::DownArrow);
         assert_eq!(w.focus, Field::Program);
         assert_eq!(key(&mut w, KeyCode::Enter), WizardOutcome::Pending);
         assert_eq!(key(&mut w, KeyCode::Escape), WizardOutcome::Cancel);
@@ -2284,7 +2317,7 @@ mod tests {
     fn esc_cancels_from_any_field_and_ctrl_c_cancels_anywhere() {
         let cfg = test_cfg();
         // Escape cancels from every field along the focus ring.
-        for ups in 0..=3 {
+        for ups in 0..=4 {
             let root = tempfile::tempdir().unwrap();
             let mut w = NewWorktreeWizard::new_isolated_for_test(root.path().to_path_buf(), &cfg);
             for _ in 0..ups {
@@ -2312,7 +2345,8 @@ mod tests {
         assert!(w.host_is_local());
         // Focus the Host row and cycle: with only one host, → is a no-op; with
         // named envs it would return PrepChosen. Assert the local-only case.
-        key(&mut w, KeyCode::UpArrow); // Program -> Sandbox
+        key(&mut w, KeyCode::UpArrow); // Program -> Isolation
+        key(&mut w, KeyCode::UpArrow); // Isolation -> Sandbox
         key(&mut w, KeyCode::UpArrow); // Sandbox -> Host
         assert_eq!(key(&mut w, KeyCode::RightArrow), WizardOutcome::Pending);
     }
@@ -2411,6 +2445,90 @@ mod tests {
         );
         key(&mut wizard, KeyCode::RightArrow);
         assert_eq!(wizard.profile_pin(), None);
+    }
+
+    #[test]
+    fn sandbox_profile_choice_none_when_equal_to_default() {
+        let cfg = test_cfg();
+        let root = tempfile::tempdir().unwrap();
+        std::fs::write(
+            root.path().join(".thegn.toml"),
+            "[sandbox]\nprofile = 'sealed'\n",
+        )
+        .unwrap();
+        let wizard = NewWorktreeWizard::new_isolated_for_test(root.path().to_path_buf(), &cfg);
+        assert_eq!(
+            wizard.profile_default,
+            thegn_core::config::SandboxProfile::Sealed
+        );
+        assert_eq!(wizard.profile_value(), wizard.profile_default);
+        assert_eq!(wizard.profile_pin(), None);
+    }
+
+    #[test]
+    fn sandbox_profile_wizard_row_skips_on_remote_host() {
+        let mut cfg = test_cfg();
+        cfg.env.insert(
+            "remote".into(),
+            thegn_core::config::EnvConfig {
+                placement: thegn_core::config::PlacementMode::Ssh,
+                ssh: thegn_core::config::EnvSshConfig {
+                    host: "build-box".into(),
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+        );
+        let root = tempfile::tempdir().unwrap();
+        let mut wizard = NewWorktreeWizard::new_isolated_for_test(root.path().to_path_buf(), &cfg);
+        wizard.preselect_host("remote");
+        assert!(!wizard.host_is_local());
+        wizard.focus = Field::Sandbox;
+        key(&mut wizard, KeyCode::DownArrow);
+        assert_ne!(wizard.focus, Field::Isolation);
+        assert_eq!(wizard.profile_pin(), None);
+    }
+
+    #[test]
+    fn sandbox_profile_wizard_explanations_fit_and_keep_program_visible() {
+        let cfg = test_cfg();
+        for (profile_sel, cols, rows) in [(0, 80, 24), (1, 80, 24), (0, 120, 40), (1, 120, 40)] {
+            let root = tempfile::tempdir().unwrap();
+            let mut wizard =
+                NewWorktreeWizard::new_isolated_for_test(root.path().to_path_buf(), &cfg);
+            wizard.profile_sel = profile_sel;
+            let mut surface = Surface::new(cols, rows);
+            wizard.render(
+                &mut surface,
+                Rect {
+                    x: 0,
+                    y: 0,
+                    cols,
+                    rows,
+                },
+            );
+            let frame = surface
+                .screen_cells()
+                .iter()
+                .map(|row| row.iter().map(|cell| cell.str()).collect::<String>())
+                .collect::<Vec<_>>()
+                .join("\n");
+            assert!(
+                frame.contains("program"),
+                "Program remains visible at {cols}x{rows}: {frame}"
+            );
+            if profile_sel == 0 {
+                assert!(
+                    frame.contains("credentials"),
+                    "standard explains readable credentials: {frame}"
+                );
+            } else {
+                assert!(
+                    frame.contains("SSH/provider envs") && frame.contains("refused"),
+                    "sealed refusal is explained: {frame}"
+                );
+            }
+        }
     }
 
     #[test]

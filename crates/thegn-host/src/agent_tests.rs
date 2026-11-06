@@ -3357,6 +3357,53 @@ fn provision_worktree_keeps_a_local_worktree_local_without_provider_envs() {
 }
 
 #[test]
+#[expect(
+    clippy::disallowed_methods,
+    reason = "test initializes an isolated temporary git repository"
+)]
+fn provision_worktree_refuses_a_sealed_provider_pin_before_provider_side_effects() {
+    use thegn_core::config::{Config, EnvConfig, PlacementMode, SandboxProfile};
+    use thegn_core::store::WorkspaceStore;
+
+    let _state = crate::testenv::IsolatedState::new();
+    let dir = tempfile::tempdir().unwrap();
+    let init = thegn_core::util::git_cmd(dir.path())
+        .args(["init", "-q"])
+        .output()
+        .unwrap();
+    assert!(init.status.success(), "temporary git init: {init:?}");
+    let wt = dir.path().to_string_lossy().into_owned();
+    let db = Db::open().unwrap();
+    db.put_worktree("app/wt", &wt, &wt, "main", None, None)
+        .unwrap();
+    db.set_worktree_env(&wt, "cloud").unwrap();
+    db.set_worktree_sandbox_profile(&wt, Some(SandboxProfile::Sealed))
+        .unwrap();
+    drop(db);
+    let cfg = Config {
+        env: [(
+            "cloud".into(),
+            EnvConfig {
+                placement: PlacementMode::Provider,
+                ..Default::default()
+            },
+        )]
+        .into(),
+        ..Config::default()
+    };
+    let mut progress_calls = 0;
+    let result = provision_worktree(&cfg, &wt, |_| progress_calls += 1);
+    assert!(matches!(
+        result,
+        Err(ref error) if error.downcast_ref::<thegn_core::sandbox_floor::ProviderRefusal>().is_some()
+    ));
+    assert_eq!(
+        progress_calls, 0,
+        "provider work must stop before side effects"
+    );
+}
+
+#[test]
 fn remote_placement_configured_matches_the_remote_placement_gates() {
     use thegn_core::config::{Config, EnvConfig, PlacementMode, RemoteConfig, SandboxConfig};
 

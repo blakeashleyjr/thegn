@@ -20,6 +20,7 @@
 //! quoting contract and re-stubbing the Windows path.
 
 use thegn_core::agent_task::{TaskKind, TaskVars};
+use thegn_core::store::WorkspaceStore;
 
 #[cfg(test)]
 thread_local! {
@@ -693,23 +694,78 @@ pub(crate) fn agent_floor_gate(
     on_miss: thegn_core::config::OnFloorMiss,
 ) -> AgentDispatch {
     if !sandbox_on {
-        let effective = match effective_agent_sandbox(full, worktree) {
+        let effective = match effective_uncontained_agent_sandbox(full, worktree) {
             Ok(effective) => effective,
             Err(reason) => return AgentDispatch::InfraHold(reason),
         };
-        return uncontained_agent_gate(&effective);
+        return uncontained_agent_gate(&effective, Some(worktree));
     }
     let effective = effective_agent_sandbox(full, worktree);
     agent_floor_gate_with_effective(full, worktree, floor, on_miss, effective)
 }
 
-fn uncontained_agent_gate(sb: &thegn_core::config::SandboxConfig) -> AgentDispatch {
+fn effective_uncontained_agent_sandbox(
+    full: &thegn_core::config::Config,
+    worktree: &str,
+) -> Result<thegn_core::config::SandboxConfig, String> {
+    let db = thegn_core::db::Db::open()
+        .map_err(|error| format!("could not read the worktree isolation pin: {error:#}"))?;
+    let pin = db
+        .worktree_sandbox_profile(worktree)
+        .map_err(|error| format!("could not read the worktree isolation pin: {error:#}"))?;
+    let mut sandbox = full.sandbox.clone();
+    let mut pin_applied_before_zone = false;
+    if let Some(worktree_path) = std::path::Path::new(worktree).canonicalize().ok()
+        && let Some(repo_root) = crate::merge_ops::repo_root_of(&worktree_path)
+        && let Ok(selected) = db.effective_env_checked(
+            &worktree_path.to_string_lossy(),
+            &repo_root.to_string_lossy(),
+        )
+    {
+        let location = thegn_core::remote::GitLoc::Local(worktree_path.clone());
+        let mut environment = full.resolve_env(
+            &repo_root,
+            &location,
+            &worktree_path,
+            &thegn_core::sandbox_pin::EnvSelection {
+                name: selected,
+                profile: None,
+            },
+        );
+        if !environment.unresolved_selection
+            && !environment.is_remote()
+            && let Some(profile) = pin
+        {
+            environment.sandbox.profile = profile;
+            pin_applied_before_zone = true;
+        }
+        if !environment.unresolved_selection && !environment.is_remote() {
+            crate::handlers::repo_trust::apply_zone(
+                &db,
+                full,
+                &worktree_path.to_string_lossy(),
+                &mut environment,
+            );
+            sandbox = environment.sandbox;
+        }
+    }
+    if !pin_applied_before_zone && let Some(profile) = pin {
+        sandbox.profile = profile;
+    }
+    Ok(sandbox)
+}
+
+fn uncontained_agent_gate(
+    sb: &thegn_core::config::SandboxConfig,
+    worktree: Option<&str>,
+) -> AgentDispatch {
     use thegn_core::config::OnFloorMiss;
 
     let floor = thegn_core::sandbox_floor::floor_in_force(sb, false);
     if sb.profile.hides_home() {
         return AgentDispatch::InfraHold(format!(
-            "sealed worktree cannot run its queue agent on the host; switch this worktree to the standard profile with `thegn sandbox profile set standard --worktree <path>` (or the palette action Isolation profile)"
+            "sealed worktree cannot run its queue agent on the host; {}",
+            thegn_core::sandbox_floor::standard_switch_hint(worktree)
         ));
     }
     if floor.required_rank().is_none() {
@@ -755,22 +811,24 @@ fn effective_agent_sandbox_at(
         ));
     }
     let loc = thegn_core::remote::GitLoc::Local(worktree.to_path_buf());
-    let selected = thegn_core::db::Db::open()
-        .and_then(|db| {
-            db.effective_env_selection(&worktree.to_string_lossy(), &repo_root.to_string_lossy())
-        })
+    let db = thegn_core::db::Db::open().map_err(|error| {
+        format!("could not read the worktree sandbox selection; refusing queued agent: {error:#}")
+    })?;
+    let selected = db
+        .effective_env_selection(&worktree.to_string_lossy(), &repo_root.to_string_lossy())
         .map_err(|error| {
             format!(
                 "could not read the worktree sandbox selection; refusing queued agent: {error:#}"
             )
         })?;
-    let env = full.resolve_env(repo_root, &loc, worktree, &selected);
+    let mut env = full.resolve_env(repo_root, &loc, worktree, &selected);
     if env.unresolved_selection || env.is_remote() {
         return Err(format!(
             "queued agents run only on the local host; the effective env `{}` is remote/unresolved",
             env.name
         ));
     }
+    crate::handlers::repo_trust::apply_zone(&db, full, &worktree.to_string_lossy(), &mut env);
     Ok(env.sandbox)
 }
 
@@ -802,8 +860,9 @@ fn agent_floor_gate_with_effective(
         let profile = effective.profile;
         return AgentDispatch::InfraHold(format!(
             "profile `{}` requires a sandbox that hides $HOME, but none could be established \
-             for {worktree}; switch this worktree to the standard profile with `thegn sandbox profile set standard --worktree <path>` (or the palette action Isolation profile)",
-            profile.as_str()
+             for {worktree}; {}",
+            profile.as_str(),
+            thegn_core::sandbox_floor::standard_switch_hint(Some(worktree))
         ));
     }
     let Some(spec) = spec else {
@@ -2021,8 +2080,11 @@ mod tests {
 
     #[test]
     fn uncontained_queue_agent_is_held_under_the_default_floor() {
+        let _state = crate::testenv::IsolatedState::new();
+        let fixture = git_control_fixture();
+        let worktree = fixture.worktree.to_string_lossy().into_owned();
         assert!(matches!(
-            uncontained_agent_gate(&thegn_core::config::SandboxConfig::default()),
+            uncontained_agent_gate(&thegn_core::config::SandboxConfig::default(), None),
             AgentDispatch::InfraHold(reason)
                 if reason.contains("shared-kernel")
                     && reason.contains("isolation_floor = \"off\"")
@@ -2030,7 +2092,7 @@ mod tests {
         assert!(matches!(
             agent_floor_gate(
                 &thegn_core::config::Config::default(),
-                "/w/fix",
+                &worktree,
                 false,
                 thegn_core::config::IsolationFloor::Off,
                 thegn_core::config::OnFloorMiss::Degrade,
@@ -2075,21 +2137,24 @@ mod tests {
             ..thegn_core::config::SandboxConfig::default()
         };
         assert!(matches!(
-            uncontained_agent_gate(&sealed),
+            uncontained_agent_gate(&sealed, None),
             AgentDispatch::InfraHold(reason)
-                if reason == "sealed worktree cannot run its queue agent on the host; switch this worktree to the standard profile with `thegn sandbox profile set standard --worktree <path>` (or the palette action Isolation profile)"
+                if reason.contains("sealed worktree cannot run its queue agent on the host") && reason.contains("thegn sandbox profile set standard")
         ));
     }
 
     #[test]
     fn uncontained_queue_agent_degrades_under_an_explicit_degrade_floor() {
+        let _state = crate::testenv::IsolatedState::new();
+        let fixture = git_control_fixture();
+        let worktree = fixture.worktree.to_string_lossy().into_owned();
         let sandbox = thegn_core::config::SandboxConfig {
             isolation_floor: Some(thegn_core::config::IsolationFloor::SharedKernel),
             on_floor_miss: thegn_core::config::OnFloorMiss::Degrade,
             ..thegn_core::config::SandboxConfig::default()
         };
         assert!(matches!(
-            uncontained_agent_gate(&sandbox),
+            uncontained_agent_gate(&sandbox, None),
             AgentDispatch::RunDegraded(None, warning) if warning.contains("uncontained")
         ));
         let full = thegn_core::config::Config {
@@ -2099,7 +2164,7 @@ mod tests {
         assert!(matches!(
             agent_floor_gate(
                 &full,
-                "/w/fix",
+                &worktree,
                 false,
                 thegn_core::config::IsolationFloor::Off,
                 thegn_core::config::OnFloorMiss::Fail,
@@ -2110,12 +2175,15 @@ mod tests {
 
     #[test]
     fn uncontained_queue_agent_runs_when_the_floor_is_off() {
+        let _state = crate::testenv::IsolatedState::new();
+        let fixture = git_control_fixture();
+        let worktree = fixture.worktree.to_string_lossy().into_owned();
         let explicit_off = thegn_core::config::SandboxConfig {
             isolation_floor: Some(thegn_core::config::IsolationFloor::Off),
             ..thegn_core::config::SandboxConfig::default()
         };
         assert!(matches!(
-            uncontained_agent_gate(&explicit_off),
+            uncontained_agent_gate(&explicit_off, None),
             AgentDispatch::Run(None)
         ));
         let full = thegn_core::config::Config {
@@ -2125,7 +2193,7 @@ mod tests {
         assert!(matches!(
             agent_floor_gate(
                 &full,
-                "/w/fix",
+                &worktree,
                 false,
                 thegn_core::config::IsolationFloor::SharedKernel,
                 thegn_core::config::OnFloorMiss::Fail,
@@ -2137,7 +2205,7 @@ mod tests {
             ..thegn_core::config::SandboxConfig::default()
         };
         assert!(matches!(
-            uncontained_agent_gate(&disabled),
+            uncontained_agent_gate(&disabled, None),
             AgentDispatch::Run(None)
         ));
         let full = thegn_core::config::Config {
@@ -2147,7 +2215,7 @@ mod tests {
         assert!(matches!(
             agent_floor_gate(
                 &full,
-                "/w/fix",
+                &worktree,
                 false,
                 thegn_core::config::IsolationFloor::SharedKernel,
                 thegn_core::config::OnFloorMiss::Fail,
@@ -2159,7 +2227,7 @@ mod tests {
             ..thegn_core::config::SandboxConfig::default()
         };
         assert!(matches!(
-            uncontained_agent_gate(&host_backend),
+            uncontained_agent_gate(&host_backend, None),
             AgentDispatch::Run(None)
         ));
     }

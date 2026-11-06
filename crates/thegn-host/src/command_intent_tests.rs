@@ -8,6 +8,16 @@ fn parse(args: &[&str]) -> crate::Cli {
 }
 
 #[test]
+fn worktree_isolation_args_do_not_consume_the_global_config_profile() {
+    let cli = parse(&["sandbox", "profile", "set", "sealed"]);
+    assert_eq!(cli.profile, None);
+    let cli = parse(&["wt", "new", "x", "--isolation", "sealed"]);
+    assert_eq!(cli.profile, None);
+    let cli = parse(&["--profile", "work", "wt", "new", "x"]);
+    assert_eq!(cli.profile.as_deref(), Some("work"));
+}
+
+#[test]
 fn every_configured_top_level_variant_parses_without_static_authority() {
     macro_rules! case {
         ($pattern:pat, [$($arg:literal),*]) => {{

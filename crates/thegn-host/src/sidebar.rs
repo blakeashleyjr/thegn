@@ -2840,6 +2840,7 @@ mod tests {
             sandbox_backend: None,
             env_name: None,
             env_degraded: false,
+            sandbox_profile: None,
         }
     }
 
@@ -3902,6 +3903,7 @@ mod tests {
             sandbox_backend: None,
             env_name: None,
             env_degraded: false,
+            sandbox_profile: None,
         };
         let live = session(
             vec![
@@ -4201,6 +4203,7 @@ mod tests {
             sandbox_backend: None,
             env_name: None,
             env_degraded: false,
+            sandbox_profile: None,
         };
         let dbw = vec![mk("zebra", "/wt/zebra"), mk("alpha", "/wt/alpha")];
         let view = ViewState {

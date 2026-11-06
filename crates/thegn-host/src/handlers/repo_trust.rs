@@ -105,7 +105,10 @@ fn environment_from_reads(
     let selected = match selected {
         Ok(selected) => selected,
         Err(error) => {
-            return Err(error).context("the worktree's environment selection could not be read");
+            return Err(unreadable_worktree_isolation(
+                &worktree.to_string_lossy(),
+                &error,
+            ));
         }
     };
     let loc = GitLoc::from_db(&worktree.to_string_lossy(), location.as_deref());
@@ -116,8 +119,8 @@ fn environment_from_reads(
 
 /// Resolve the effective [`Environment`] for a worktree honouring persisted
 /// trust-on-first-use approvals, and surface anything the clamp denied or gated.
-/// Never fails resolution — on a DB-open error it falls back to the fail-closed
-/// [`Config::resolve_env`].
+/// A DB or selection read failure is a typed halt: the isolation pin cannot be
+/// safely inferred when its storage is unreadable.
 pub(crate) fn resolve_env_trusted(
     cfg: &Config,
     repo_root: &Path,
@@ -125,17 +128,11 @@ pub(crate) fn resolve_env_trusted(
     worktree: &str,
     selected_env: &EnvSelection,
 ) -> anyhow::Result<TrustedEnvironment> {
-    let db = Db::open().map_err(|error| {
-        anyhow::anyhow!("could not read the worktree sandbox selection; refusing launch: {error:#}")
-    })?;
+    let db = Db::open().map_err(|error| unreadable_worktree_isolation(worktree, &error))?;
     let root_s = repo_root.to_string_lossy().to_string();
     let worktree_selection = db
         .effective_env_selection(worktree, &root_s)
-        .map_err(|error| {
-            anyhow::anyhow!(
-                "could not read the worktree sandbox selection; refusing launch: {error:#}"
-            )
-        })?;
+        .map_err(|error| unreadable_worktree_isolation(worktree, &error))?;
     let worktree_selection = EnvSelection {
         name: selected_env.name.clone().or(worktree_selection.name),
         profile: selected_env.profile.or(worktree_selection.profile),
@@ -174,6 +171,18 @@ pub(crate) fn resolve_env_trusted(
     Ok(TrustedEnvironment {
         environment: env,
         devcontainer,
+    })
+}
+
+fn unreadable_worktree_isolation(worktree: &str, error: &anyhow::Error) -> anyhow::Error {
+    anyhow::Error::new(crate::agent::SandboxHalt {
+        env_name: "worktree isolation".into(),
+        placement: worktree.to_string(),
+        reason: format!(
+            "thegn cannot read this worktree's isolation setting ({error:#}); refusing launch. Run `thegn doctor`, or once the database opens run `thegn sandbox profile clear --worktree {worktree}`."
+        ),
+        ask: false,
+        dormant: None,
     })
 }
 
@@ -401,7 +410,7 @@ pub(crate) fn devcontainer_feature_steps(
 /// floor) to the resolved sandbox, and surface any egress entries the zone
 /// dropped. No-op for an unzoned worktree or a zone with no `[zone.<name>]`
 /// policy. Membership is DB-tracked (never path-inferred). See [`thegn_core::zone`].
-fn apply_zone(db: &Db, cfg: &Config, worktree: &str, env: &mut Environment) {
+pub(crate) fn apply_zone(db: &Db, cfg: &Config, worktree: &str, env: &mut Environment) {
     let Ok(Some(zrow)) = db.zone_of_worktree(worktree) else {
         return;
     };
@@ -516,8 +525,12 @@ mod tests {
         )
         .unwrap_err();
 
-        let message = format!("{error:#}");
-        assert!(message.contains("environment selection could not be read"));
+        let halt = error
+            .downcast_ref::<crate::agent::SandboxHalt>()
+            .expect("unreadable selection is a typed launch halt");
+        let message = halt.to_string();
+        assert!(message.contains("thegn cannot read this worktree's isolation setting"));
+        assert!(message.contains("thegn doctor"));
         assert!(message.contains("database is locked"));
     }
 
@@ -533,7 +546,13 @@ mod tests {
             &thegn_core::config_resolve::Approvals::deny_all(),
         )
         .unwrap_err();
-        assert!(format!("{error:#}").contains("environment selection could not be read"));
+        let halt = error
+            .downcast_ref::<crate::agent::SandboxHalt>()
+            .expect("unreadable isolation pin is a typed launch halt");
+        assert!(
+            halt.reason
+                .contains("thegn cannot read this worktree's isolation setting")
+        );
     }
 
     #[test]

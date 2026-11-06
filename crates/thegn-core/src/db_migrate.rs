@@ -4529,7 +4529,6 @@ mod tests {
             .pragma_query_value(None, "user_version", |row| row.get(0))
             .unwrap();
         assert_eq!(version, crate::db::SCHEMA_VERSION);
-        assert_eq!(version, crate::db::SCHEMA_VERSION);
         super::verify_v108_schema(upgraded.conn()).unwrap();
         assert_eq!(upgraded.pr_agent_outcome("missing").unwrap(), None);
     }
@@ -4538,6 +4537,14 @@ mod tests {
     fn v109_adds_worktrees_sandbox_profile_idempotently_and_verifies() {
         let fresh = Db::open_memory().unwrap();
         super::verify_v109_schema(fresh.conn()).unwrap();
+        let version: i64 = fresh
+            .conn()
+            .pragma_query_value(None, "user_version", |row| row.get(0))
+            .unwrap();
+        assert_eq!(
+            version, 109,
+            "v109 pins the additive worktree column migration"
+        );
         let conn = Connection::open_in_memory().unwrap();
         assert!(super::verify_v109_schema(&conn).is_err());
         conn.execute_batch("CREATE TABLE worktrees (worktree TEXT PRIMARY KEY);")

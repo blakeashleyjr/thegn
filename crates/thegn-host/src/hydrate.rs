@@ -1526,13 +1526,15 @@ fn db_worktree_list_with_snapshot(
                         None => true,
                     }
             });
-        let sandbox_profile = match db.worktree_sandbox_profile(&w.worktree) {
-            Ok(profile) => profile.map(|profile| profile.as_str().to_string()),
-            Err(error) => {
-                tracing::debug!(target: "thegn::hydrate", worktree = %w.worktree, %error, "worktree profile pin could not be read for the sidebar");
-                None
+        let sandbox_profile = w.sandbox_profile.as_deref().and_then(|value| {
+            match thegn_core::sandbox_pin::parse_pin(value) {
+                Ok(profile) => Some(profile.as_str().to_string()),
+                Err(error) => {
+                    tracing::debug!(target: "thegn::hydrate", worktree = %w.worktree, %error, "worktree profile pin could not be parsed for the sidebar");
+                    None
+                }
             }
-        };
+        });
         out.push(crate::sidebar::DbWorktree {
             slug,
             branch,

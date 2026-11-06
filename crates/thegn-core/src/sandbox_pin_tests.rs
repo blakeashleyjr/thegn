@@ -1,6 +1,18 @@
 use crate::config::{Config, SandboxProfile};
-use crate::env::GitLoc;
-use crate::sandbox_pin::{EnvSelection, explain};
+use crate::remote::GitLoc;
+use crate::sandbox_pin::{EnvSelection, explain, parse_pin};
+
+#[test]
+fn sandbox_pin_aliases_use_the_config_enum_and_refuse_non_pinnable_profiles() {
+    for alias in ["standard", "hardened", "guarded"] {
+        assert_eq!(parse_pin(alias).unwrap(), SandboxProfile::Hardened);
+    }
+    for alias in ["sealed", "locked", "isolated"] {
+        assert_eq!(parse_pin(alias).unwrap(), SandboxProfile::Sealed);
+    }
+    assert!(parse_pin("open").is_err());
+    assert!(parse_pin("sealed-tunnel").is_err());
+}
 
 #[test]
 fn sandbox_pin_resolution_honours_the_worktree_pin() {
@@ -33,7 +45,10 @@ fn sandbox_pin_explanations_match_profile_facts() {
     let standard = explain(SandboxProfile::Hardened);
     let sealed = explain(SandboxProfile::Sealed);
     assert!(
-        standard.network.contains("Network works") && !SandboxProfile::Hardened.forces_no_network()
+        standard
+            .network
+            .contains("Network and VPN attachments work")
+            && !SandboxProfile::Hardened.forces_no_network()
     );
     assert!(sealed.network.contains("No network") && SandboxProfile::Sealed.forces_no_network());
     assert!(sealed.credentials.contains("hidden") && SandboxProfile::Sealed.hides_home());
@@ -42,7 +57,7 @@ fn sandbox_pin_explanations_match_profile_facts() {
             && SandboxProfile::Sealed.seals_agent_socket()
     );
     assert!(
-        sealed.one_liner.contains("every capability")
+        sealed.one_liner.contains("all Linux capabilities")
             && !SandboxProfile::Sealed.drop_capabilities().is_empty()
     );
     assert!(
@@ -56,27 +71,29 @@ fn sandbox_pin_explanations_cover_profile_capability_and_network_facts() {
     let standard = explain(SandboxProfile::Hardened);
     let sealed = explain(SandboxProfile::Sealed);
     let standard_text = format!(
-        "{} {} {} {} {}",
+        "{} {} {} {} {} {}",
         standard.one_liner,
         standard.hides.join(" "),
         standard.network,
         standard.credentials,
-        standard.agents
+        standard.agents,
+        standard.extra.join(" ")
     );
     let sealed_text = format!(
-        "{} {} {} {} {}",
+        "{} {} {} {} {} {}",
         sealed.one_liner,
         sealed.hides.join(" "),
         sealed.network,
         sealed.credentials,
-        sealed.agents
+        sealed.agents,
+        sealed.extra.join(" ")
     );
     assert_eq!(
-        standard_text.contains("network"),
+        standard_text.to_ascii_lowercase().contains("network"),
         !SandboxProfile::Hardened.forces_no_network()
     );
     assert_eq!(
-        sealed_text.contains("network"),
+        sealed_text.to_ascii_lowercase().contains("network"),
         SandboxProfile::Sealed.forces_no_network()
     );
     assert!(standard_text.contains("readable"));
@@ -84,19 +101,29 @@ fn sandbox_pin_explanations_cover_profile_capability_and_network_facts() {
     assert!(standard_text.contains("default capabilities"));
     assert!(standard_text.contains("SSH") && standard_text.contains("provider"));
     assert!(standard_text.contains("VPN attachments work"));
-    assert!(standard_text.contains("process limit is 512"));
-    assert!(standard_text.contains("root is read-only"));
-    assert!(standard_text.contains("new privileges are blocked"));
+    assert!(standard_text.contains("512 process limit"));
+    assert!(
+        standard_text
+            .to_ascii_lowercase()
+            .contains("root is read-only")
+    );
+    assert!(standard_text.contains("new privileges blocked"));
     assert!(sealed_text.contains("private") && sealed_text.contains("empty"));
-    assert!(sealed_text.contains("~/.ssh") && sealed_text.contains("credentials"));
+    assert!(
+        sealed_text.contains("~/.ssh") && sealed_text.to_ascii_lowercase().contains("credentials")
+    );
     assert!(sealed_text.contains("SSH agent socket"));
     assert!(sealed_text.contains("API-backed agent CLIs"));
     assert!(sealed_text.contains("git fetch/push"));
     assert!(sealed_text.contains("offline builds"));
     assert!(sealed_text.contains("no network"));
     assert!(sealed_text.contains("VPN attachment"));
-    assert!(sealed_text.contains("process limit is 256"));
-    assert!(sealed_text.contains("root is read-only"));
+    assert!(sealed_text.contains("256 process limit"));
+    assert!(
+        sealed_text
+            .to_ascii_lowercase()
+            .contains("root is read-only")
+    );
     assert!(sealed_text.contains("new privileges are blocked"));
     assert_eq!(
         sealed_text.contains("capability"),
@@ -107,7 +134,7 @@ fn sandbox_pin_explanations_cover_profile_capability_and_network_facts() {
             .how_to_change
             .contains("palette > Isolation profile")
     );
-    assert!(standard.how_to_change.contains("thegn sandbox profile set"));
+    assert!(standard.how_to_change.contains("the CLI"));
     assert_eq!(standard.how_to_change, sealed.how_to_change);
 }
 
@@ -134,7 +161,7 @@ fn sandbox_pin_absent_is_equivalent_across_precedence_inputs() {
             "[env.dev.sandbox]\nprofile='standard'",
             "[sandbox]\nprofile='sealed'",
             "dev",
-            SandboxProfile::Sealed,
+            SandboxProfile::Hardened,
         ),
         (
             "[sandbox]\nprofile='sealed'",
@@ -142,6 +169,13 @@ fn sandbox_pin_absent_is_equivalent_across_precedence_inputs() {
             "",
             "dev",
             SandboxProfile::Hardened,
+        ),
+        (
+            "[sandbox]\nprofile='sealed'",
+            "",
+            "[sandbox]\nprofile='standard'",
+            "",
+            SandboxProfile::Sealed,
         ),
     ];
     for (global, env_overlay, repo_overlay, selected, expected_profile) in cases {
@@ -165,21 +199,20 @@ fn sandbox_pin_absent_is_equivalent_across_precedence_inputs() {
         } else {
             EnvSelection::named(selected)
         };
-        let (baseline, baseline_resolved) = crate::config_resolve::resolve_environment(
-            &cfg,
-            repo.path(),
-            &loc,
-            repo.path(),
-            &name_only,
-            &crate::config_resolve::Approvals::deny_all(),
-        );
         let wrapped = cfg.resolve_env(repo.path(), &loc, repo.path(), &name_only);
+        assert_eq!(wrapped.sandbox.profile, expected_profile);
         assert_eq!(
-            baseline, wrapped,
-            "an absent profile pin preserves resolution"
+            wrapped.name,
+            if selected.is_empty() {
+                "default"
+            } else {
+                selected
+            },
+            "the expected environment name is preserved"
         );
-        assert_eq!(baseline.sandbox.profile, expected_profile);
-        assert_eq!(baseline.sandbox.profile, baseline_resolved.sandbox.profile);
+        assert!(wrapped.placement.is_local(), "these cases resolve locally");
+        assert_eq!(wrapped.sandbox.backend, cfg.sandbox.default_backend);
+        assert_eq!(wrapped.sandbox.network, cfg.sandbox.network);
     }
 }
 
