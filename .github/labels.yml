@@ -1,0 +1,32 @@
+# Label manifest for the repository. Apply it with a label-sync tool or create
+# the labels by hand; nothing in this repository applies it automatically.
+- name: bug
+  color: d73a4a
+  description: Something is broken
+- name: compat
+  color: fbca04
+  description: Terminal, OS or tool compatibility
+- name: confirmed
+  color: 0e8a16
+  description: Reproduced by a maintainer
+- name: docs
+  color: 0075ca
+  description: Documentation
+- name: duplicate
+  color: cfd3d7
+  description: Already reported
+- name: enhancement
+  color: a2eeef
+  description: New feature or request
+- name: install
+  color: 5319e7
+  description: Install, download or upgrade problem
+- name: known-issue
+  color: e99695
+  description: Listed in KNOWN_ISSUES.md
+- name: launch-blocker
+  color: b60205
+  description: Must be fixed before wider announcement
+- name: needs-repro
+  color: d4c5f9
+  description: Waiting for steps to reproduce
