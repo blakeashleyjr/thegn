@@ -434,7 +434,7 @@ pub fn close_or_delete_menu(targets: usize, names_csv: &str) -> MenuOverlay {
             ),
             item(
                 Some('y'),
-                "delete branch + files from disk",
+                "delete worktree files from disk (branch kept)",
                 MenuChoice::ConfirmDeleteWorktrees {
                     keep_files: false,
                     force: false,
@@ -1692,6 +1692,22 @@ mod tests {
         assert!(m.items()[1].danger, "delete-from-disk row is danger-marked");
         assert_eq!(m.items()[2].choice, MenuChoice::Dismiss);
         assert_eq!(hotkeys(&m), vec!['f', 'y', 'n']);
+    }
+
+    #[test]
+    fn close_or_delete_menu_labels_say_branch_is_kept() {
+        let menu = close_or_delete_menu(1, "x");
+        let delete = &menu.items()[1];
+
+        assert!(delete.label.contains("branch kept"));
+        assert!(!delete.label.contains("delete branch"));
+        assert_eq!(
+            delete.choice,
+            MenuChoice::ConfirmDeleteWorktrees {
+                keep_files: false,
+                force: false,
+            }
+        );
     }
 
     #[test]
