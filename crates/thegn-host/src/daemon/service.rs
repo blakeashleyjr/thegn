@@ -619,6 +619,12 @@ fn dispatch_set_status_with_proof(
     if status == thegn_core::issue::AgentDispatchStatus::Unknown {
         return Err(anyhow::Error::new(DispatchStatusError::UnknownStatus));
     }
+    if status == thegn_core::issue::AgentDispatchStatus::Done
+        && row.status != thegn_core::issue::AgentDispatchStatus::Done
+        && thegn_core::db::set_status_transition_allowed(row.status, status)
+    {
+        crate::cmd::dispatch::done_gate_bound(db, &row)?;
+    }
     db.set_dispatch_status_led(id, row.status, status, None, proof)
 }
 
@@ -654,6 +660,12 @@ fn map_dispatch_status_error(error: anyhow::Error) -> ControlError {
                 ControlError::Conflict(error.to_string())
             }
         };
+    }
+    if error
+        .downcast_ref::<crate::cmd::dispatch::DoneGateRefused>()
+        .is_some()
+    {
+        return ControlError::FailedPrecondition(format!("missing_evidence: {error}"));
     }
     ControlError::Internal(error)
 }
@@ -6112,7 +6124,7 @@ mod tests {
         svc.dispatch_set_status(child.id, St::Running)
             .await
             .unwrap();
-        svc.dispatch_set_status(child.id, St::Done).await.unwrap();
+        svc.dispatch_set_status(child.id, St::Failed).await.unwrap();
         assert!(matches!(
             svc.dispatch_set_status(child.id, St::Running).await,
             Err(ControlError::FailedPrecondition(_))
@@ -6126,7 +6138,7 @@ mod tests {
                 .find(|dispatch| dispatch.id == child.id)
                 .unwrap()
                 .status,
-            St::Done,
+            St::Failed,
             "a rejected terminal resurrection leaves the row unchanged"
         );
         assert!(matches!(
@@ -6154,7 +6166,7 @@ mod tests {
         assert_eq!(rows.len(), 2);
         // Newest first (id DESC breaks the same-millisecond tie).
         assert_eq!(rows[0].id, child.id);
-        assert_eq!(rows[0].status, St::Done);
+        assert_eq!(rows[0].status, St::Failed);
         assert_eq!(rows[1].status, St::Running);
         // Advancing a non-existent row is a clean error, not a silent no-op.
         assert!(matches!(
@@ -6522,7 +6534,7 @@ mod tests {
                 let allowed = thegn_core::db::set_status_transition_allowed(from, to);
                 let outcome_matches = if to == St::Unknown {
                     matches!(&result, Err(ControlError::InvalidArgument(_)))
-                } else if allowed {
+                } else if allowed && !(from == St::Spawning && to == St::Done) {
                     result.is_ok()
                 } else {
                     matches!(&result, Err(ControlError::FailedPrecondition(_)))
@@ -6757,6 +6769,132 @@ mod tests {
             row.artifact_path.as_deref(),
             Some(thegn_core::pipeline_run::artifact_path("linear:A-1", "code", row.id).as_str())
         );
+    }
+
+    #[tokio::test]
+    async fn dispatch_set_status_done_refuses_a_stage_row_without_a_published_artifact() {
+        use thegn_core::issue::AgentDispatchStatus as St;
+
+        let _state = isolated_state();
+        let (svc, _rx) = service(0);
+        let (_dir, wt) = git_worktree();
+        let row = svc
+            .dispatch_put(thegn_svc::control::DispatchPutReq {
+                issue_id: "linear:A-1".into(),
+                worktree_path: wt.to_string_lossy().into_owned(),
+                agent_name: "claude".into(),
+                stage: Some("code".into()),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        svc.with_db(|db| {
+            use thegn_core::store::NotificationStore;
+            db.update_dispatch_status(row.id, St::Spawning)
+        })
+        .await
+        .unwrap();
+
+        let result = svc.dispatch_set_status(row.id, St::Done).await;
+        assert!(matches!(
+            result,
+            Err(ControlError::FailedPrecondition(message))
+                if message.contains("missing_evidence")
+                    && message.contains("unpublished reservation")
+        ));
+        let stored = svc
+            .dispatches_list(None, Db::ROSTER_HISTORY_LIMIT)
+            .await
+            .unwrap()
+            .dispatches
+            .into_iter()
+            .find(|dispatch| dispatch.id == row.id)
+            .unwrap();
+        assert_eq!(stored.status, St::Spawning);
+    }
+
+    #[tokio::test]
+    async fn dispatch_set_status_done_refuses_a_bound_stage_row_with_no_report_or_attestation() {
+        use thegn_core::issue::AgentDispatchStatus as St;
+
+        let _state = isolated_state();
+        let (svc, _rx) = service(0);
+        let (_dir, wt) = git_worktree();
+        let row = svc
+            .dispatch_put(thegn_svc::control::DispatchPutReq {
+                issue_id: "linear:A-1".into(),
+                worktree_path: wt.to_string_lossy().into_owned(),
+                agent_name: "claude".into(),
+                stage: Some("code".into()),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        svc.with_db(|db| {
+            use thegn_core::store::NotificationStore;
+            assert!(db.bind_dispatch_session(row.id, "sess-x")?);
+            db.update_dispatch_status(row.id, St::Running)
+        })
+        .await
+        .unwrap();
+
+        let result = svc.dispatch_set_status(row.id, St::Done).await;
+        assert!(matches!(
+            result,
+            Err(ControlError::FailedPrecondition(message))
+                if message.contains("missing_evidence")
+        ));
+        let stored = svc
+            .dispatches_list(None, Db::ROSTER_HISTORY_LIMIT)
+            .await
+            .unwrap()
+            .dispatches
+            .into_iter()
+            .find(|dispatch| dispatch.id == row.id)
+            .unwrap();
+        assert_eq!(stored.status, St::Running);
+    }
+
+    #[tokio::test]
+    async fn dispatch_set_status_done_still_completes_a_plain_dispatch() {
+        use thegn_core::issue::AgentDispatchStatus as St;
+
+        let _state = isolated_state();
+        let (svc, _rx) = service(0);
+        let (_dir, wt) = git_worktree();
+        let row = svc
+            .dispatch_put(thegn_svc::control::DispatchPutReq {
+                issue_id: "linear:A-1".into(),
+                worktree_path: wt.to_string_lossy().into_owned(),
+                agent_name: "claude".into(),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        svc.dispatch_set_status(row.id, St::Running).await.unwrap();
+        svc.dispatch_set_status(row.id, St::Done).await.unwrap();
+        let stored = svc
+            .dispatches_list(None, Db::ROSTER_HISTORY_LIMIT)
+            .await
+            .unwrap()
+            .dispatches
+            .into_iter()
+            .find(|dispatch| dispatch.id == row.id)
+            .unwrap();
+        assert_eq!(stored.status, St::Done);
+    }
+
+    #[test]
+    fn dispatch_status_error_maps_done_gate_refusal_to_failed_precondition() {
+        let error = anyhow::Error::new(crate::cmd::dispatch::DoneGateRefused {
+            id: 7,
+            reasons: vec!["x".into()],
+        });
+        assert!(matches!(
+            map_dispatch_status_error(error),
+            ControlError::FailedPrecondition(message)
+                if message.starts_with("missing_evidence:")
+        ));
     }
 
     #[tokio::test]
