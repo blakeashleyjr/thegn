@@ -865,6 +865,14 @@ doctor:
 doc-check:
     RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --workspace --document-private-items
 
+# Lint CHANGELOG.md headings: no internal process labels in sections newer than the pinned baseline.
+changelog-lint:
+    python3 -B test/changelog_lint.py
+
+# Hermetic self-test of the changelog heading lint.
+test-changelog-lint:
+    python3 -B test/changelog_lint.py --selftest
+
 # Format everything via treefmt (rust, nix, bash, toml, yaml, markdown).
 fmt:
     nix fmt
