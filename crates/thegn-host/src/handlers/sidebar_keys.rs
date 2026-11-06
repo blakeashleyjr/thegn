@@ -433,7 +433,7 @@ impl SidebarState {
                     entries.push(
                         e(
                             "delete",
-                            "Delete branch + files…",
+                            "Delete worktree files… (branch kept)",
                             Some(chord_of(Id::Delete)),
                         )
                         .danger(),
