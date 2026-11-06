@@ -26,7 +26,7 @@ Windows is deferred. See [[getting-started]], [[daemon-and-sessions]], and
 - **When not to use thegn:** Choose tmux when you are on a remote server where
   only tmux is installed, or you want a minimal, long-established multiplexer.
 
-Thegn can also run inside tmux. Enable `extended-keys on` in tmux; see
+thegn can also run inside tmux. Enable `extended-keys on` in tmux; see
 [[terminal-compatibility]].
 
 ## Zellij
@@ -34,14 +34,14 @@ Thegn can also run inside tmux. Enable `extended-keys on` in tmux; see
 - **What thegn adds:** thegn is written in Rust and draws its own application
   chrome in-process around worktree tabs and panes.
 - **What it costs or lacks:** It does not use Zellij, support Zellij layout
-  files, or load WASM plugins. Thegn plugins are out-of-process programs that
+  files, or load WASM plugins. thegn plugins are out-of-process programs that
   speak JSON; see [[plugins]].
 - **When not to use thegn:** Choose Zellij if you rely on Zellij layouts or
   WASM plugins.
 
 ## lazygit
 
-- **What thegn adds:** It provides its own git tab and diffs, alongside a
+- **What thegn adds:** thegn provides its own git tab and diffs, alongside a
   workspace and session layer. You can also run optional `lazygit` in a pane;
   see [[git-and-diffs]].
 - **What it costs or lacks:** lazygit alone is smaller and offers a deeper
