@@ -65,6 +65,8 @@ All notable changes to **thegn** are documented here. The format follows
 - A registered daemon endpoint is trusted only when it is an absolute Unix
   socket path owned by the current user.
 
+## [0.1.0-alpha.56] — 2026-11-05
+
 ## [0.1.0-alpha.55] — 2026-11-05
 
 ### Added
