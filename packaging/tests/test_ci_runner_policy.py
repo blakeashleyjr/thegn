@@ -140,3 +140,64 @@ class CiRunnerPolicyTests(unittest.TestCase):
         for event, repository, configured_runners, expected in cases:
             with self.subTest(event=event, repository=repository, runners=configured_runners):
                 self.assertEqual(expected, select(event, repository, configured_runners))
+
+    def test_pull_request_trigger_is_lean_and_unprivileged(self) -> None:
+        workflow = read_workflow()
+        triggers = workflow.get("on", workflow.get(True, {}))
+        self.assertIn("pull_request", triggers)
+        self.assertEqual(["main"], triggers["pull_request"]["branches"])
+        self.assertIn("schedule", triggers)
+        self.assertIn("workflow_dispatch", triggers)
+        self.assertNotIn("pull_request_target", triggers)
+
+    def test_workflow_token_is_read_only(self) -> None:
+        self.assertEqual({"contents": "read"}, read_workflow()["permissions"])
+
+    def test_pull_request_runs_exactly_the_lean_jobs(self) -> None:
+        jobs = read_workflow()["jobs"]
+        ran = {
+            name
+            for name, job in jobs.items()
+            if "inputs.extras" not in str(job.get("if", ""))
+            and "github.event_name != 'pull_request'" not in str(job.get("if", ""))
+        }
+        self.assertEqual({"fmt", "lint", "test", "smoke"}, ran)
+
+    def test_heavy_jobs_never_run_on_pull_requests(self) -> None:
+        jobs = read_workflow()["jobs"]
+        heavy_jobs = {
+            "deps-audit",
+            "doc",
+            "check-features",
+            "check-msrv",
+            "term-check",
+            "check-cross",
+            "openspec",
+            "coverage",
+            "sandbox-e2e",
+            "security-e2e",
+            "nix-build",
+        }
+        for name in heavy_jobs:
+            with self.subTest(job=name):
+                self.assertIn("github.event_name != 'pull_request'", jobs[name]["if"])
+
+    def test_extras_jobs_stay_opt_in(self) -> None:
+        jobs = read_workflow()["jobs"]
+        for name in ("e2e", "macos", "windows", "windows-artifact-smoke"):
+            with self.subTest(job=name):
+                self.assertEqual("${{ inputs.extras }}", jobs[name]["if"])
+
+    def test_header_requires_owner_approval_of_the_spend(self) -> None:
+        workflow_text = (ROOT / ".github" / "workflows" / "ci.yml").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn("OWNER MUST APPROVE THE CI SPEND BEFORE THIS MERGES.", workflow_text)
+        self.assertNotIn("TEMPORARILY DISABLED", workflow_text)
+
+    def test_pull_request_jobs_use_github_hosted_runners_only(self) -> None:
+        for name, job in read_workflow()["jobs"].items():
+            runner = job.get("runs-on", "")
+            if isinstance(runner, str) and "CI_RUNS_ON" in runner:
+                with self.subTest(job=name):
+                    self.assertIn("github.event_name == 'workflow_dispatch'", runner)
