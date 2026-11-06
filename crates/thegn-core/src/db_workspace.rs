@@ -14,7 +14,7 @@ use rusqlite::{OptionalExtension, params};
 
 pub(crate) const ORPHAN_CACHE_SWEEP_MAX_KEYS: usize = 1024;
 
-const WORKTREE_RECORD_COLUMNS: &str = "worktree, COALESCE(branch,''), COALESCE(agent,''), COALESCE(created_at,0), COALESCE(repo_path,''), COALESCE(tab_name,''), session_name, location, position, sandbox_backend, observed_backend, folder_id, env_name";
+const WORKTREE_RECORD_COLUMNS: &str = "worktree, COALESCE(branch,''), COALESCE(agent,''), COALESCE(created_at,0), COALESCE(repo_path,''), COALESCE(tab_name,''), session_name, location, position, sandbox_backend, observed_backend, folder_id, env_name, sandbox_profile";
 
 fn decode_worktree_record(r: &rusqlite::Row<'_>) -> rusqlite::Result<WorktreeRow> {
     Ok(WorktreeRow {
@@ -33,6 +33,7 @@ fn decode_worktree_record(r: &rusqlite::Row<'_>) -> rusqlite::Result<WorktreeRow
         env_name: r
             .get::<_, Option<String>>(12)?
             .filter(|s| !s.trim().is_empty()),
+        sandbox_profile: r.get(13)?,
     })
 }
 
@@ -3200,14 +3201,19 @@ mod tests {
     }
 
     #[test]
-    fn sandbox_profile_pin_roundtrips_and_rejects_open_and_sealed_tunnel() {
+    fn sandbox_pin_profile_roundtrips_and_rejects_open_and_sealed_tunnel() {
         use crate::config::SandboxProfile;
+        use crate::store::WorkspaceStore;
         let db = Db::open_memory().unwrap();
         db.set_worktree_sandbox_profile("/wt/pin", Some(SandboxProfile::Sealed))
             .unwrap();
         assert_eq!(
             db.worktree_sandbox_profile("/wt/pin").unwrap(),
             Some(SandboxProfile::Sealed)
+        );
+        assert_eq!(
+            db.worktrees().unwrap()[0].sandbox_profile.as_deref(),
+            Some("sealed")
         );
         db.set_worktree_sandbox_profile("/wt/pin", None).unwrap();
         assert_eq!(db.worktree_sandbox_profile("/wt/pin").unwrap(), None);
@@ -3222,7 +3228,7 @@ mod tests {
     }
 
     #[test]
-    fn sandbox_profile_unparseable_stored_value_is_a_read_error() {
+    fn sandbox_pin_profile_unparseable_stored_value_is_a_read_error() {
         let db = Db::open_memory().unwrap();
         db.conn()
             .execute(
@@ -3234,7 +3240,7 @@ mod tests {
     }
 
     #[test]
-    fn sandbox_profile_pin_is_removed_with_its_worktree_row() {
+    fn sandbox_pin_profile_is_removed_with_its_worktree_row() {
         use crate::store::WorkspaceStore;
         let db = Db::open_memory().unwrap();
         db.put_worktree("tab", "/repo", "/repo/wt", "branch", None, None)

@@ -20006,42 +20006,28 @@ async fn event_loop<T: Terminal>(
                                 arg,
                             } = &choice
                             {
-                                let worktree =
-                                    active_tab_path(&session).to_string_lossy().into_owned();
-                                let parsed = if arg == "clear" {
-                                    Ok(None)
+                                let path = active_tab_path(&session).to_string_lossy().into_owned();
+                                let registered = model
+                                    .sidebar_db_worktrees
+                                    .iter()
+                                    .any(|worktree| worktree.path == path);
+                                if !registered {
+                                    model.status =
+                                        "Isolation profiles apply to registered worktrees.".into();
                                 } else {
-                                    thegn_core::sandbox_pin::parse_pin(arg).map(Some)
-                                };
-                                match parsed {
-                                    Ok(profile) => {
-                                        let path = worktree.clone();
-                                        crate::db_task::persist(move |db| {
-                                            if let Err(error) =
-                                                db.set_worktree_sandbox_profile(&path, profile)
-                                            {
-                                                tracing::warn!(target: "thegn::sandbox", worktree = %path, %error, "could not persist worktree isolation profile");
-                                                crate::db_task::alert(&format!(
-                                                    "Could not save isolation profile for {path}: {error}"
-                                                ));
-                                            }
-                                        });
-                                        let value = profile.map_or_else(
-                                            || "inherit".to_string(),
-                                            |p| p.as_str().to_string(),
-                                        );
-                                        let branch = session
-                                            .active_group()
-                                            .map(|g| g.name.clone())
-                                            .unwrap_or_else(|| worktree.clone());
-                                        model.status = format!(
-                                            "Saving isolation profile for {branch}: {value}. Applies to new panes; restart open panes."
-                                        );
-                                        if let Err(error) = refresh_tx.send(RefreshKind::Model) {
-                                            tracing::debug!(target: "thegn::hydrate", %error, "model refresh request failed");
-                                        }
+                                    let branch = session
+                                        .active_group()
+                                        .map(|group| group.name.clone())
+                                        .unwrap_or_else(|| path.clone());
+                                    match crate::sandbox_profile_ui::apply_menu_choice(
+                                        arg,
+                                        path,
+                                        branch,
+                                        refresh_tx.clone(),
+                                    ) {
+                                        Ok(status) => model.status = status,
+                                        Err(error) => model.status = error.to_string(),
                                     }
-                                    Err(error) => model.status = error.to_string(),
                                 }
                                 dirty = true;
                                 continue;
@@ -25455,7 +25441,6 @@ async fn event_loop<T: Terminal>(
                                 active_menu = Some(crate::menu::sandbox_profile_menu(
                                     profile,
                                     model.active_sandbox_profile_pin.is_some(),
-                                    current_config.sandbox.profile,
                                 ));
                             }
                             // Both `Ctrl+Alt+f` and `Alt+y` are the same

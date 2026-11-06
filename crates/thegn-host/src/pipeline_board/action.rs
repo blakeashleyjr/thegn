@@ -145,6 +145,7 @@ mod tests {
             sandbox_backend: None,
             env_name: None,
             env_degraded: false,
+            sandbox_profile: None,
         }
     }
 

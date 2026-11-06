@@ -1059,6 +1059,7 @@ pub fn persisted_worktree(row: &MigrationWorktree) -> WorktreeRow {
         observed_backend: row.observed_backend.clone(),
         folder_id: row.folder_id,
         env_name: row.env_name.clone(),
+        sandbox_profile: None,
     }
 }
 

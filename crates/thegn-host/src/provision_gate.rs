@@ -244,9 +244,20 @@ pub(crate) fn try_claim_spare(cfg: &thegn_core::config::Config, worktree: &str) 
         return false;
     };
     selection.name = selected;
-    let env_name = cfg
-        .resolve_env(&repo_root, &loc, std::path::Path::new(worktree), &selection)
-        .name;
+    let environment = cfg.resolve_env(&repo_root, &loc, std::path::Path::new(worktree), &selection);
+    if matches!(
+        environment.placement,
+        thegn_core::placement::Placement::Provider(_)
+    ) && thegn_core::sandbox_floor::provider_refusal(
+        true,
+        &environment.sandbox,
+        &environment.name,
+    )
+    .is_some()
+    {
+        return false;
+    }
+    let env_name = environment.name;
     // Never claim for an env that can't hand a spare over (no configured
     // provider) — the bind would "succeed" while skipping branch settle, parity,
     // and the worktree's real provisioning.

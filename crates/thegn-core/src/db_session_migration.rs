@@ -370,6 +370,7 @@ fn map_worktree(row: &Row<'_>) -> rusqlite::Result<crate::models::WorktreeRow> {
         observed_backend: row.get(10)?,
         folder_id: row.get(11)?,
         env_name: row.get(12)?,
+        sandbox_profile: None,
     })
 }
 

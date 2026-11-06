@@ -572,7 +572,9 @@ pub fn prepare_sandbox_env_with_selection(
     let is_provider = matches!(placement, thegn_core::placement::Placement::Provider(_));
     if let Some(refusal) = thegn_core::sandbox_floor::provider_refusal(is_provider, &sb, &env_name)
     {
-        return Err(anyhow::Error::new(refusal));
+        return Err(anyhow::Error::new(refusal).context(
+            thegn_core::sandbox_floor::standard_switch_hint(Some(worktree)),
+        ));
     }
     if is_provider {
         let floor = thegn_core::sandbox_floor::floor_in_force(&sb, false);
@@ -2325,6 +2327,13 @@ pub fn provision_worktree(
     ) {
         return Ok(false);
     }
+    if let Some(refusal) =
+        thegn_core::sandbox_floor::provider_refusal(true, &environment.sandbox, &environment.name)
+    {
+        return Err(anyhow::Error::new(refusal).context(
+            thegn_core::sandbox_floor::standard_switch_hint(Some(worktree)),
+        ));
+    }
     // Flag the in-flight provision so the warm-claim fast path won't bind a
     // spare (and clear the splash) under this run — see `provision_gate`.
     let _live = crate::provision_gate::worktree_live_guard(worktree);
@@ -2400,8 +2409,9 @@ fn provision_selection(
 
 /// Whether any remote placement may apply to a worktree under `cfg`: a non-local or host-pinned `[env.<name>]`, the
 /// placement engine, or a `[sandbox.remote]` host. The union of the batch-78 gates in `provision_worktree`,
-/// `host_flow::resolve_binding` and `placement_flow::plan_selection`. When none applies, a worktree can only be local,
-/// so a failed location read is resolved as local and a plain local shell is never refused (THE-1474).
+/// `host_flow::resolve_binding` and `placement_flow::plan_selection`. The set
+/// is used by those placement decisions; unreadable worktree isolation is
+/// independently a typed launch halt.
 pub(crate) fn remote_placement_configured(cfg: &Config) -> bool {
     cfg.placement.enabled
         || cfg.sandbox.remote.is_remote()
@@ -4560,7 +4570,7 @@ pub fn launch_spec_full(
         .as_deref()
         .map(str::trim)
         .is_some_and(|s| !s.is_empty() && s != "auto");
-    let mut outcome = prepare_sandbox_env(
+    let mut outcome = prepare_sandbox_env_with_selection(
         cfg,
         &repo_root,
         worktree,
@@ -5164,6 +5174,13 @@ pub(crate) fn launch_state_gate_with_notice(
     error: &anyhow::Error,
     notify: impl FnOnce(&str, &str),
 ) -> anyhow::Result<()> {
+    if let Some(halt) = error.chain().find_map(|source| {
+        source
+            .downcast_ref::<SandboxHalt>()
+            .filter(|halt| halt.env_name == "worktree isolation")
+    }) {
+        return Err(anyhow::Error::new(halt.clone()));
+    }
     if is_configured_entry(cfg, choice) {
         anyhow::bail!("refusing to launch `{choice}`: {what}: {error:#}");
     }

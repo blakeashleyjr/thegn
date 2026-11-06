@@ -1,23 +1,15 @@
-# Existing call sites are pinned while they are migrated to the worktree's
-# effective_env_selection. This list may only shrink; do not add new source
-# files that create a name-only profile selection.
-agent.rs
-agent_configs.rs
-close_teardown.rs
-cmd/env.rs
-cmd/sandbox_profile.rs
-cmd/wt.rs
-config_capture_tests.rs
-config_startup.rs
-config_startup_tests.rs
-handlers/repo_trust.rs
-lifecycle.rs
-loading/track.rs
-merge_cleanup.rs
-placement_flow.rs
-provider_factory.rs
-pty_drain.rs
-run.rs
-sidebar.rs
-wizard.rs
-worktree_lifecycle.rs
+# Deliberate name-only/config-only resolution call sites, pinned per call line.
+agent_configs.rs:376  Reads profile-independent credential transfer policy only.
+agent_run.rs:726  Resolves locally when possible, then overlays the separately read pin.
+close_teardown.rs:130  Teardown cleanup does not launch a process.
+cmd/env.rs:779  Env display and image-bake use the selected env name only.
+lifecycle.rs:204  Park and teardown bookkeeping does not launch a process.
+lifecycle.rs:334  Selects the warm-pool env name; it does not launch a worktree.
+lifecycle.rs:840  Recycles a worktree-less spare using its configured env name.
+loading/track.rs:270  Splash text reports the selected env while preparation resolves the pin later.
+merge_cleanup.rs:32  Merge cleanup only tears down the old launch context.
+provider_factory.rs:516  Resolves provider ownership and sandbox naming, not a worktree launch.
+pty_drain.rs:85  Reports provider health after a pane connection failure.
+wizard.rs:315  Computes the effective profile default shown in the creation form.
+wizard.rs:327  Computes each host's effective profile default for the creation form.
+worktree_lifecycle.rs:1079  Teardown identifies the provider runtime and never starts a process.

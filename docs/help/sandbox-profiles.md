@@ -18,7 +18,7 @@ for that worktree. Open panes keep their current profile until restarted.
 
 In the Alt+w new-worktree wizard, focus **Isolation** and cycle between
 standard and sealed. The wizard explains the selected profile. Headless
-creation can use `thegn wt new --profile standard` or `--profile sealed`.
+creation can use `thegn wt new --isolation standard` or `--isolation sealed`.
 
 Use `thegn sandbox profile show`, `set <standard|sealed>`, or `clear` to inspect,
 change, or remove a worktree override. The command defaults to the current
@@ -30,7 +30,7 @@ Profile precedence is worktree pin, `[env.<name>]` sandbox profile, repository
 and workspace configuration, global `[sandbox] profile`, then the built-in
 standard default. A repository `.thegn.toml` can only tighten its profile; a
 worktree pin is user-owned and takes precedence. Zone floors can still raise the
-effective profile.
+effective profile, including for queue agents.
 
 Standalone terminal tabs and the global `[sandbox] profile` setting are not
 worktree-scoped. The pin is stored in local thegn state, so it is not a security

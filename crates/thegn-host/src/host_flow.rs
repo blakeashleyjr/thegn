@@ -221,8 +221,15 @@ fn resolve_binding(
         Db::open().and_then(|db| db.effective_env_checked(worktree, &repo_root.to_string_lossy())),
         cfg,
     )?;
-    let mut selection = crate::sandbox_profile_ui::selection_for(worktree, &repo_root)?;
-    selection.name = Some(selected.clone());
+    let mut selection =
+        crate::sandbox_profile_ui::selection_for(worktree, &repo_root).map_err(|error| {
+            HostFailure {
+                step: HostStep::Connect,
+                retryable: true,
+                error: format!("could not read worktree isolation selection: {error:#}"),
+            }
+        })?;
+    selection.name = selected;
     let environment = cfg.resolve_env(&repo_root, &loc, std::path::Path::new(worktree), &selection);
     let envc = cfg.env.get(&environment.name);
     if let Some(e) = envc.filter(|e| !e.host.trim().is_empty()) {

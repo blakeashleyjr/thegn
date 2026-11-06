@@ -92,7 +92,7 @@ pub enum Action {
         #[arg(long)]
         env: Option<String>,
         /// Pin the per-worktree sandbox profile (`standard` or `sealed`).
-        #[arg(long)]
+        #[arg(long = "isolation", id = "isolation")]
         profile: Option<String>,
         /// Create the feature across a program's member repos: one resolved
         /// branch name + a worktree in each member (see `thegn program`).
@@ -168,21 +168,28 @@ pub fn run_with_config(cfg: &Config, action: Action, config_path: &std::path::Pa
             from_issue,
             json,
             folder,
-        } => match program {
-            Some(p) => new_batched(cfg, name, &p, repos, base, env, profile, folder, json),
-            None => new(
-                cfg,
-                name,
-                repo,
-                base,
-                env,
-                profile,
-                from_issue,
-                folder,
-                json,
-                config_path.parent().unwrap_or(std::path::Path::new("")),
-            ),
-        },
+        } => {
+            if profile.is_some() && std::env::var_os("THEGN_SANDBOX").is_some() {
+                anyhow::bail!(
+                    "worktree isolation profiles are host-owned; wt new cannot set one from inside a sandbox"
+                );
+            }
+            match program {
+                Some(p) => new_batched(cfg, name, &p, repos, base, env, profile, folder, json),
+                None => new(
+                    cfg,
+                    name,
+                    repo,
+                    base,
+                    env,
+                    profile,
+                    from_issue,
+                    folder,
+                    json,
+                    config_path.parent().unwrap_or(std::path::Path::new("")),
+                ),
+            }
+        }
         Action::Folder {
             worktree,
             name,
@@ -314,6 +321,12 @@ fn new(
     }
 }
 
+struct WorktreeCreateOptions<'a> {
+    env: Option<&'a str>,
+    profile: Option<thegn_core::config::SandboxProfile>,
+    folder: Option<&'a str>,
+}
+
 /// Create + register one worktree for an ALREADY-resolved branch name and a
 /// verified base. Shared by the single-repo `wt new` and the batched `--project`
 /// path so both run the identical pipeline (`git worktree add` → seed mq assets
@@ -324,12 +337,6 @@ fn new(
 /// skip any setup, so the caller reports the path and then surfaces the error.
 /// Everything about filing that can be known up front is checked before the
 /// worktree is created (`check_folder_fileable`).
-struct WorktreeCreateOptions<'a> {
-    env: Option<&'a str>,
-    profile: Option<thegn_core::config::SandboxProfile>,
-    folder: Option<&'a str>,
-}
-
 fn create_and_register(
     cfg: &Config,
     root: &std::path::Path,
@@ -420,27 +427,27 @@ fn create_and_register(
         // best-effort: the worktree exists; a missed pin re-resolves ambient.
         let _ = db.set_worktree_env(&path_s, e);
     }
-    let ambient_env = options
-        .env
-        .map(str::to_string)
-        .unwrap_or_else(|| crate::wizard::ambient_env_name(Some(db), cfg, root));
-    let ambient_selection = thegn_core::sandbox_pin::EnvSelection::named(&ambient_env);
-    let location = thegn_core::remote::GitLoc::Local(root.to_path_buf());
-    let ambient_profile = cfg
-        .resolve_env(root, &location, root, &ambient_selection)
-        .sandbox
-        .profile;
-    if let Err(error) = db.set_worktree_sandbox_profile(
-        &path_s,
-        options
-            .profile
-            .filter(|selected| *selected != ambient_profile),
-    ) {
-        let message = match crate::worktree_lifecycle::rollback_remove(cfg, root, &path, branch) {
-            Ok(()) => format!("db: {error}"),
-            Err(cleanup) => format!("db: {error}; rollback failed: {cleanup}"),
-        };
-        return Err(anyhow::anyhow!(message));
+    if let Some(profile) = options.profile {
+        let ambient_env = options
+            .env
+            .map(str::to_string)
+            .unwrap_or_else(|| crate::wizard::ambient_env_name(Some(db), cfg, root));
+        let ambient_selection = thegn_core::sandbox_pin::EnvSelection::named(&ambient_env);
+        let location = thegn_core::remote::GitLoc::Local(root.to_path_buf());
+        let ambient_profile = cfg
+            .resolve_env(root, &location, root, &ambient_selection)
+            .sandbox
+            .profile;
+        if (profile != ambient_profile || profile == thegn_core::config::SandboxProfile::Sealed)
+            && let Err(error) = db.set_worktree_sandbox_profile(&path_s, Some(profile))
+        {
+            let message = match crate::worktree_lifecycle::rollback_remove(cfg, root, &path, branch)
+            {
+                Ok(()) => format!("db: {error}"),
+                Err(cleanup) => format!("db: {error}; rollback failed: {cleanup}"),
+            };
+            return Err(anyhow::anyhow!(message));
+        }
     }
     // A CLI has no compositor to keep alive, so it waits for post-create
     // completion before printing success and exiting. Warn-only failures are

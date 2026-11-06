@@ -555,7 +555,13 @@ pub(crate) fn place(
         req: resolved.req,
         mode: resolved.mode,
         zone: zone.clone(),
-        required_trust: required_class(profile_of(cfg, envc)),
+        required_trust: required_class(effective_profile_of(&db, cfg, worktree).map_err(
+            |error| HostFailure {
+                step: HostStep::Connect,
+                error: format!("could not read worktree isolation profile: {error:#}"),
+                retryable: true,
+            },
+        )?),
         arch: None,
     };
 
@@ -756,11 +762,26 @@ fn mode_tag(mode: TenancyMode) -> &'static str {
     }
 }
 
-/// The env's resolved hardening profile (base `[sandbox]` + env overlay) —
-/// the input to the pack gate's required trust class.
-fn profile_of(cfg: &Config, envc: Option<&EnvConfig>) -> thegn_core::config::SandboxProfile {
-    envc.and_then(|e| e.sandbox.profile)
-        .unwrap_or(cfg.sandbox.profile)
+/// The effective worktree hardening profile, including the repo/env layers,
+/// persisted worktree pin, and zone floor, for the pack gate's trust class.
+fn effective_profile_of(
+    db: &Db,
+    cfg: &Config,
+    worktree: &str,
+) -> anyhow::Result<thegn_core::config::SandboxProfile> {
+    let repo_root = db
+        .repo_root_for(worktree)?
+        .filter(|root| !root.is_empty())
+        .map(std::path::PathBuf::from)
+        .or_else(|| thegn_core::repo::main_worktree(std::path::Path::new(worktree)))
+        .unwrap_or_else(|| std::path::PathBuf::from(worktree));
+    let location = db.location_for(worktree)?;
+    let loc = thegn_core::remote::GitLoc::from_db(worktree, location.as_deref());
+    let selection = db.effective_env_selection(worktree, &repo_root.to_string_lossy())?;
+    let mut environment =
+        cfg.resolve_env(&repo_root, &loc, std::path::Path::new(worktree), &selection);
+    crate::handlers::repo_trust::apply_zone(db, cfg, worktree, &mut environment);
+    Ok(environment.sandbox.profile)
 }
 
 /// One candidate row of a dry-run plan (JSON-shaped for the CLI/smoke).
@@ -822,19 +843,13 @@ pub(crate) fn plan(cfg: &Config, worktree: &str) -> anyhow::Result<Option<PlanOu
     };
     let repo_root = thegn_core::repo::main_worktree(std::path::Path::new(worktree))
         .unwrap_or_else(|| std::path::PathBuf::from(worktree));
-    let selected = plan_selection(
-        db.effective_env_checked(worktree, &repo_root.to_string_lossy()),
-        cfg,
-    )?;
-    let environment = cfg.resolve_env(
-        &repo_root,
-        &loc,
-        std::path::Path::new(worktree),
-        &thegn_core::sandbox_pin::EnvSelection {
-            name: selected.clone(),
-            profile: None,
-        },
-    );
+    let selection = db.effective_env_selection(worktree, &repo_root.to_string_lossy())?;
+    let selected = plan_selection(Ok(selection.name.clone()), cfg)?;
+    let selection = thegn_core::sandbox_pin::EnvSelection {
+        name: selected,
+        profile: selection.profile,
+    };
+    let environment = cfg.resolve_env(&repo_root, &loc, std::path::Path::new(worktree), &selection);
     let envc = cfg.env.get(&environment.name);
     if let Some(e) = envc.filter(|e| !e.host.trim().is_empty()) {
         let chosen = cfg
@@ -861,7 +876,7 @@ pub(crate) fn plan(cfg: &Config, worktree: &str) -> anyhow::Result<Option<PlanOu
         req: resolved.req,
         mode: resolved.mode,
         zone,
-        required_trust: required_class(profile_of(cfg, envc)),
+        required_trust: required_class(effective_profile_of(&db, cfg, worktree)?),
         arch: None,
     };
     let hosts = build_snapshot(cfg, &db, &resolved, true);

@@ -28,8 +28,6 @@ pub(crate) fn env_chips(model: &FrameModel) -> Vec<String> {
             if let Some(name) = chip.strip_prefix('(').and_then(|s| s.strip_suffix(')')) {
                 *chip = format!("({name}:{profile})");
             }
-        } else {
-            chips.push(format!("({backend}:{profile})"));
         }
     }
     // Remote placement kind (ssh/mosh/k8s/<provider>); `None` when local. The
@@ -131,7 +129,7 @@ mod tests {
     }
 
     #[test]
-    fn pinned_profile_is_appended_to_the_backend_chip_only_when_set() {
+    fn sandbox_profile_pin_is_appended_to_a_real_backend_chip_only_when_set() {
         let mut model = FrameModel {
             active_sandbox_backend: "bwrap".into(),
             ..FrameModel::default()
@@ -139,5 +137,10 @@ mod tests {
         assert_eq!(env_chips(&model), vec!["(bwrap)"]);
         model.active_sandbox_profile_pin = Some("sealed".into());
         assert_eq!(env_chips(&model), vec!["(bwrap:sealed)"]);
+        model.active_sandbox_backend = "host".into();
+        assert!(
+            env_chips(&model).is_empty(),
+            "a pin does not create a backend chip"
+        );
     }
 }

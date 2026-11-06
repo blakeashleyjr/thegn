@@ -258,10 +258,12 @@ impl MenuOverlay {
             KeyCode::Char('q') => MenuOutcome::Cancel,
             KeyCode::DownArrow | KeyCode::Char('j') => {
                 self.selected = (self.selected + 1).min(self.items.len().saturating_sub(1));
+                self.sync_sandbox_profile_body();
                 MenuOutcome::Pending
             }
             KeyCode::UpArrow | KeyCode::Char('k') => {
                 self.selected = self.selected.saturating_sub(1);
+                self.sync_sandbox_profile_body();
                 MenuOutcome::Pending
             }
             KeyCode::Enter => match self.items.get(self.selected) {
@@ -281,6 +283,23 @@ impl MenuOverlay {
             }
             _ => MenuOutcome::Pending,
         }
+    }
+
+    fn sync_sandbox_profile_body(&mut self) {
+        let Some(MenuChoice::Confirm {
+            tag: "sandbox-profile",
+            arg,
+        }) = self.items.get(self.selected).map(|item| &item.choice)
+        else {
+            return;
+        };
+        self.body = Some(if arg == "clear" {
+            "Remove the worktree override and inherit the configured profile.".into()
+        } else if let Ok(profile) = thegn_core::sandbox_pin::parse_pin(arg) {
+            thegn_core::sandbox_pin::explain(profile).one_liner.into()
+        } else {
+            String::new()
+        });
     }
 
     /// Content width: the widest `❯ [k] label … note` row (or the body),
@@ -817,7 +836,6 @@ pub fn sandbox_dormant_menu(
 pub fn sandbox_profile_menu(
     current: thegn_core::config::SandboxProfile,
     pinned: bool,
-    default: thegn_core::config::SandboxProfile,
 ) -> MenuOverlay {
     let options = [
         ("standard", thegn_core::config::SandboxProfile::Hardened),
@@ -828,16 +846,19 @@ pub fn sandbox_profile_menu(
         .enumerate()
         .map(|(index, (arg, profile))| {
             let key = if index == 0 { 's' } else { 'e' };
-            let suffix = if profile == default { " (default)" } else { "" };
             item(
                 Some(key),
-                format!("{arg}{suffix}"),
+                arg.to_string(),
                 MenuChoice::Confirm {
                     tag: "sandbox-profile",
                     arg: arg.to_string(),
                 },
             )
-            .note(thegn_core::sandbox_pin::explain(profile).one_liner)
+            .note(if profile == thegn_core::config::SandboxProfile::Sealed {
+                "SSH/provider environments and run-on-host are refused."
+            } else {
+                thegn_core::sandbox_pin::explain(profile).one_liner
+            })
         })
         .chain(pinned.then(|| {
             item(
@@ -850,8 +871,13 @@ pub fn sandbox_profile_menu(
             )
         }))
         .collect();
+    let selected = usize::from(current == thegn_core::config::SandboxProfile::Sealed);
     let body = thegn_core::sandbox_pin::explain(current).one_liner;
-    MenuOverlay::new(MenuKindTag::Confirm, "Isolation profile", items).with_body(body)
+    let mut menu =
+        MenuOverlay::new_with_default(MenuKindTag::Confirm, "Isolation profile", items, selected)
+            .with_body(body);
+    menu.sync_sandbox_profile_body();
+    menu
 }
 
 pub fn keymap_preset_menu() -> MenuOverlay {
@@ -1462,6 +1488,26 @@ mod tests {
             .filter_map(|i| i.key)
             .map(|c| c.to_ascii_lowercase())
             .collect()
+    }
+
+    #[test]
+    fn sandbox_profile_menu_body_tracks_the_highlighted_choice() {
+        let mut menu = sandbox_profile_menu(thegn_core::config::SandboxProfile::Hardened, false);
+        assert_eq!(
+            menu.body.as_deref(),
+            Some(
+                thegn_core::sandbox_pin::explain(thegn_core::config::SandboxProfile::Hardened)
+                    .one_liner
+            )
+        );
+        menu.handle_key(&KeyCode::DownArrow, NONE);
+        assert_eq!(
+            menu.body.as_deref(),
+            Some(
+                thegn_core::sandbox_pin::explain(thegn_core::config::SandboxProfile::Sealed)
+                    .one_liner
+            )
+        );
     }
 
     #[test]

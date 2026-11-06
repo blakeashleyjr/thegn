@@ -2138,6 +2138,7 @@ fn db_wt(slug: &str, repo_path: &str) -> crate::sidebar::DbWorktree {
         sandbox_backend: None,
         env_name: None,
         env_degraded: false,
+        sandbox_profile: None,
     }
 }
 

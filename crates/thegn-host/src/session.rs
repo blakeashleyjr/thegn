@@ -1832,6 +1832,7 @@ mod tests {
             observed_backend: None,
             folder_id: None,
             env_name: None,
+            sandbox_profile: None,
         };
 
         let paths = registered_group_paths(&[row], "/r/WASHU");
