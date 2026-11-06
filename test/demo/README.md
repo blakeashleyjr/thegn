@@ -78,6 +78,9 @@ while the session is available. The driver prints the isolated
 `XDG_RUNTIME_DIR`; use that same directory when
 running `thegn daemon stop` to clear a stale daemon.
 
+A private muse daemon may remain running after a run; identify it by its
+private socket path and terminate that process if needed.
+
 ## Hermetic check
 
 Run `just demo-script-check` to validate the steps, documented key chords, the
