@@ -278,6 +278,13 @@ fn reconcile_candidates(
     Ok((candidates, truncated))
 }
 
+fn publication_pending(rows: &[AgentDispatch], truncated: bool) -> bool {
+    truncated
+        || rows.iter().any(|row| {
+            row.exited_at_ms.is_none() && row.session_id.as_deref().is_none_or(str::is_empty)
+        })
+}
+
 /// Associate and persist a daemon session exit on its dispatch row. The
 /// returned run reference is the fence used by classification, so the stamp
 /// and retry decision cannot resolve different rows or generations. The
@@ -293,6 +300,7 @@ pub(crate) async fn stamp_dispatch_exit(
     const LOOKUP_DEADLINE: Duration = Duration::from_millis(500);
     enum Association {
         Miss,
+        NoCandidate,
         Terminal,
         Stamped(
             thegn_core::issue::DispatchRunRef,
@@ -313,7 +321,19 @@ pub(crate) async fn stamp_dispatch_exit(
 
                 let attribution = db.dispatch_for_exit("", Some(&sid))?;
                 let ExitAttribution::Exact(run) = attribution else {
-                    return Ok(Association::Miss);
+                    let (rows, truncated) = db.list_dispatches_with_status(
+                        &[
+                            AgentDispatchStatus::Queued,
+                            AgentDispatchStatus::Spawning,
+                            AgentDispatchStatus::Running,
+                        ],
+                        64,
+                    )?;
+                    return Ok(if publication_pending(&rows, truncated) {
+                        Association::Miss
+                    } else {
+                        Association::NoCandidate
+                    });
                 };
                 let row = db.get_dispatch(run.id)?;
                 if row.as_ref().is_some_and(|row| row.status.is_terminal()) {
@@ -346,6 +366,14 @@ pub(crate) async fn stamp_dispatch_exit(
                 return Ok(None);
             }
             Association::Terminal => return Ok(None),
+            Association::NoCandidate => {
+                tracing::debug!(
+                    target: "thegn::daemon",
+                    session = %session,
+                    "session exit has no dispatch row (non-dispatch session); nothing to stamp"
+                );
+                return Ok(None);
+            }
             Association::Miss if attempt + 1 < LOOKUP_ATTEMPTS => {
                 tokio::time::sleep_until(
                     (tokio::time::Instant::now() + LOOKUP_RETRY).min(deadline),
@@ -980,6 +1008,26 @@ mod tests {
         db.get_dispatch(id).expect("get").expect("row")
     }
 
+    #[test]
+    fn publication_pending_detects_unpublished_in_flight_rows() {
+        assert!(!publication_pending(&[], false));
+
+        let unpublished = claude_row();
+        assert!(publication_pending(&[unpublished], false));
+
+        let db = thegn_core::db::Db::open_memory().expect("db");
+        let id = db
+            .put_agent_dispatch(NewDispatch {
+                session_id: Some("published-session"),
+                ..NewDispatch::new("linear:THE-1876", "/wt/1876", "claude")
+            })
+            .expect("row");
+        let published = db.get_dispatch(id).expect("get row").expect("row");
+        assert!(!publication_pending(&[published], false));
+
+        assert!(publication_pending(&[], true));
+    }
+
     /// THE-265: with no proven native id the retry is a cold start; it never
     /// selects "latest" native history.
     #[test]
@@ -1495,13 +1543,6 @@ mod tests {
     async fn exit_without_a_published_row_gives_up_cleanly() {
         let (svc, _profile) = test_service(thegn_core::config::Config::default());
         let row_id = running_row(&svc, "linear:THE-257", "aider");
-        {
-            let db = svc.db.lock().unwrap();
-            assert!(
-                db.bind_dispatch_session(row_id, "s-still-published")
-                    .unwrap()
-            );
-        }
         svc.native_ids
             .lock()
             .unwrap()
@@ -1523,7 +1564,7 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(row.status, St::Running, "unrelated row remains unchanged");
-        assert_eq!(row.session_id.as_deref(), Some("s-still-published"));
+        assert_eq!(row.session_id, None, "publication never completed");
         assert_eq!(row.exit_code, None);
         assert!(
             !svc.native_ids
@@ -1531,6 +1572,19 @@ mod tests {
                 .unwrap()
                 .contains_key("s-never-published"),
             "native id is consumed when association gives up"
+        );
+    }
+
+    #[tokio::test]
+    async fn exit_with_no_dispatch_rows_returns_immediately() {
+        let (svc, _profile) = test_service(Default::default());
+        let started = std::time::Instant::now();
+
+        handle_exit(&svc, "plain-pane", 1, None).await.unwrap();
+
+        assert!(
+            started.elapsed() < Duration::from_millis(100),
+            "an exit with no dispatch candidates should not retry"
         );
     }
 }
