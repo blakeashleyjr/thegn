@@ -9,6 +9,62 @@ All notable changes to **thegn** are documented here. The format follows
 
 ## [0.1.0-alpha.56] — 2026-11-06
 
+### Added
+
+- `thegn pr queue list` shows the last agent run for local checkouts; `--json`
+  adds an `agent_outcome` object or null.
+- `thegn plugin status [--json]` shows per-plugin activity counters while the
+  UI runs with `[daemon] enabled`.
+- `thegn merge list --json` and control `merges.list` rows include
+  a notice when the queued branch or worktree has changed.
+- The Home Manager module adds null-default options for the `[notifications]`
+  booleans and `[activity]` settings.
+- `THEGN_PERF` rollups report cumulative pushed, taken, dropped and gap-marker
+  counts in a `log ingress` event.
+- Pane-fallback launch notices point to `thegn doctor bundle`.
+- A README quickstart, a minimal starter configuration and a generated list of
+  third-party crate licenses are available.
+- Pull requests now run lean checks for formatting, linting, tests and smoke;
+  the full gate runs nightly and on demand.
+- A script traces the network connections made during a first run so you can
+  check what thegn contacts; see [Privacy and network use](docs/help/privacy.md).
+- A [step-by-step guide](docs/extending/plugin-hello-world.md) shows how to
+  write a first plugin.
+- A demo script drives a repeatable live walkthrough (`test/demo/demo.sh`).
+- In-app help covers privacy, upgrading and uninstalling, troubleshooting,
+  known limitations, comparisons with tmux, Zellij and lazygit, and a quick
+  reference.
+
+### Changed
+
+- Agent pipeline runs are refused before they start if the sandbox cannot
+  write the worktree, Git common directory or relocated credential home, or
+  if the `thegn` binary was replaced since launch.
+- `thegn dispatch set-status <id> done` refuses a `spawning` row without a
+  published session; `--force --why '<reason>'` records an override.
+- Typed sandbox preparation failures lead with the refusal class and
+  remediation in launch warnings, the new-worktree wizard and while preparing
+  a worktree's pipeline. Untyped failures keep their plain text.
+- Linear and Jira listings or searches that cross an aggregate response-size
+  cap after reading rows return those rows as a partial account.
+- After a CI autofix run, the PR-queue row detail says what the run did to the
+  PR head and awaits the next PR refresh.
+- The bug report template asks for `thegn doctor bundle`; the CLI contract
+  documents top-level verbs; and the stable/dev channel help reflects the
+  shipped feature set.
+
+### Fixed
+
+- Hunk and submodule previews are scoped to their worktree and path, so a
+  preview that finishes after a worktree switch does not clear or render into
+  the active worktree's preview.
+- Abandoning a calendar command fetch kills the plugin process group.
+
+### Security
+
+- A registered daemon endpoint is trusted only when it is an absolute Unix
+  socket path owned by the current user.
+
 ## [0.1.0-alpha.55] — 2026-11-05
 
 ### Added
