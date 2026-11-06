@@ -41,6 +41,23 @@ fn starter_config_enables_no_experimental_keys() {
 }
 
 #[test]
+fn starter_config_uses_the_shipped_sealed_sandbox_default() {
+    let body = starter_body();
+    let parsed = toml::from_str::<toml::Table>(&body).expect("parse starter config as TOML table");
+    let sandbox = parsed
+        .get("sandbox")
+        .and_then(toml::Value::as_table)
+        .expect("starter config has a sandbox section");
+    assert!(
+        !sandbox.contains_key("profile"),
+        "starter config must inherit the shipped sandbox profile"
+    );
+    assert!(body.contains("Default: sealed ($HOME hidden, network off)."));
+    assert!(body.contains("Set profile = \"standard\" to"));
+    assert!(body.contains("opt into the previous behaviour."));
+}
+
+#[test]
 fn starter_config_header_points_at_the_reference() {
     let body = starter_body();
     assert!(
