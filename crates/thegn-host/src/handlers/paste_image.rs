@@ -32,6 +32,9 @@ use thegn_core::config::ClipboardConfig;
 use thegn_core::paste_drop;
 use thegn_core::remote::GitLoc;
 
+const REMOTE_DROP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
+const REMOTE_DROP_OUTPUT_CAP: u64 = 4096;
+
 /// The result of one paste-image worker run, applied on the event loop.
 #[derive(Debug)]
 pub(crate) enum PasteImageOutcome {
@@ -217,13 +220,145 @@ fn write_drop_file(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     thegn_core::fsperm::restrict_to_owner(path)
 }
 
+/// Captured output and process result from one remote drop command.
+struct DriveOutcome {
+    success: bool,
+    timed_out: bool,
+    stdout: String,
+    stderr: String,
+}
+
+fn read_capped(mut r: impl Read, cap: u64) -> String {
+    let mut buf = Vec::new();
+    if let Err(error) = (&mut r).take(cap).read_to_end(&mut buf) {
+        tracing::debug!(target: "thegn::paste", error = %error, "remote drop output read failed");
+    }
+    if let Err(error) = std::io::copy(&mut r, &mut std::io::sink()) {
+        tracing::debug!(target: "thegn::paste", error = %error, "remote drop output drain failed");
+    }
+    String::from_utf8_lossy(&buf).into_owned()
+}
+
+// off-loop: this driver runs inside the paste worker; process waits are bounded
+// and stay off the event loop.
+#[expect(clippy::disallowed_methods)]
+fn drive_child(
+    mut cmd: std::process::Command,
+    payload: &[u8],
+    timeout: std::time::Duration,
+    cap: u64,
+) -> Result<DriveOutcome, String> {
+    cmd.stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let mut child = cmd.spawn().map_err(|error| format!("ssh spawn: {error}"))?;
+    let deadline = std::time::Instant::now() + timeout;
+
+    let Some(mut stdin) = child.stdin.take() else {
+        if let Err(error) = child.kill() {
+            tracing::debug!(target: "thegn::paste", %error, "remote drop child kill failed");
+        }
+        if let Err(error) = child.wait() {
+            tracing::debug!(target: "thegn::paste", %error, "remote drop child wait failed");
+        }
+        return Err("no stdin pipe".to_string());
+    };
+    let Some(stdout) = child.stdout.take() else {
+        if let Err(error) = child.kill() {
+            tracing::debug!(target: "thegn::paste", %error, "remote drop child kill failed");
+        }
+        if let Err(error) = child.wait() {
+            tracing::debug!(target: "thegn::paste", %error, "remote drop child wait failed");
+        }
+        return Err("no stdout pipe".to_string());
+    };
+    let Some(stderr) = child.stderr.take() else {
+        if let Err(error) = child.kill() {
+            tracing::debug!(target: "thegn::paste", %error, "remote drop child kill failed");
+        }
+        if let Err(error) = child.wait() {
+            tracing::debug!(target: "thegn::paste", %error, "remote drop child wait failed");
+        }
+        return Err("no stderr pipe".to_string());
+    };
+
+    // The independent workers let a full input pipe and either full output pipe
+    // make progress at the same time.
+    let payload = payload.to_vec();
+    let writer = thegn_core::thread_name::spawn_named("thegn-paste-in", move || {
+        crate::platform::qos::set_self(crate::platform::qos::Qos::Utility);
+        // best-effort: a short write here is EPIPE — the remote died mid-stream
+        // — and that already surfaces as a non-zero child status below.
+        if let Err(error) = stdin.write_all(&payload) {
+            tracing::debug!(target: "thegn::paste", %error, "remote drop input write failed");
+        }
+        // Drop closes the pipe → the remote `cat` sees EOF and finishes.
+    });
+    let stdout_reader = thegn_core::thread_name::spawn_named("thegn-paste-out", move || {
+        crate::platform::qos::set_self(crate::platform::qos::Qos::Utility);
+        read_capped(stdout, cap)
+    });
+    let stderr_reader = thegn_core::thread_name::spawn_named("thegn-paste-err", move || {
+        crate::platform::qos::set_self(crate::platform::qos::Qos::Utility);
+        read_capped(stderr, cap)
+    });
+
+    let mut timed_out = false;
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break Ok(status),
+            Ok(None) if std::time::Instant::now() < deadline => {
+                std::thread::sleep(std::time::Duration::from_millis(25));
+            }
+            Ok(None) => {
+                timed_out = true;
+                if let Err(error) = child.kill() {
+                    tracing::debug!(target: "thegn::paste", %error, "remote drop timeout kill failed");
+                }
+                break child.wait().map_err(|error| format!("ssh wait: {error}"));
+            }
+            Err(error) => {
+                if let Err(kill_error) = child.kill() {
+                    tracing::debug!(target: "thegn::paste", %kill_error, "remote drop child kill after wait error failed");
+                }
+                if let Err(wait_error) = child.wait() {
+                    tracing::debug!(target: "thegn::paste", %wait_error, "remote drop child wait after wait error failed");
+                }
+                break Err(format!("ssh wait: {error}"));
+            }
+        }
+    };
+
+    if writer.join().is_err() {
+        tracing::debug!(target: "thegn::paste", "remote drop input worker panicked");
+    }
+    let stdout = match stdout_reader.join() {
+        Ok(output) => output,
+        Err(_) => {
+            tracing::debug!(target: "thegn::paste", "remote drop stdout worker panicked");
+            String::new()
+        }
+    };
+    let stderr = match stderr_reader.join() {
+        Ok(output) => output,
+        Err(_) => {
+            tracing::debug!(target: "thegn::paste", "remote drop stderr worker panicked");
+            String::new()
+        }
+    };
+
+    let status = status?;
+    Ok(DriveOutcome {
+        success: status.success(),
+        timed_out,
+        stdout,
+        stderr,
+    })
+}
+
 /// Stream the image over the worktree's existing control channel into the
 /// confined remote drop dir, and return the **remote** absolute path (printed by
 /// the remote script so `$HOME` is resolved without a second round-trip).
-// off-loop: the whole worker runs in spawn_blocking, so the blocking
-// `Child::wait` here is off the event loop (the disallowed-methods rule targets
-// on-loop waits).
-#[expect(clippy::disallowed_methods)]
 fn remote_drop(
     loc: &GitLoc,
     cfg: &ClipboardConfig,
@@ -231,39 +366,16 @@ fn remote_drop(
     bytes: &[u8],
 ) -> Result<String, String> {
     let script = paste_drop::remote_drop_script(&cfg.remote_dir, name, cfg.keep_hours);
-    let mut cmd = loc.sh_command(&script);
-    cmd.stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
-    let mut child = cmd.spawn().map_err(|e| format!("ssh spawn: {e}"))?;
-
-    // Write the PNG on a scoped thread so a full pipe buffer (bytes > ~64 KiB)
-    // can't deadlock against reading the remote's stdout.
-    let mut stdin = child.stdin.take().ok_or("no stdin pipe")?;
-    let payload = bytes.to_vec();
-    let writer = thegn_core::thread_name::spawn_named("thegn-paste-in", move || {
-        crate::platform::qos::set_self(crate::platform::qos::Qos::Utility);
-        // best-effort: a short write here is EPIPE — the remote died mid-stream
-        // — and that already surfaces as a non-zero `child.wait()` status
-        // below, which is what the caller reports. Failing here too would only
-        // race the two error paths for a worse message.
-        let _ = stdin.write_all(&payload); // best-effort: stdout write: EPIPE on a closed |head pipe is normal
-        // Drop closes the pipe → the remote `cat` sees EOF and finishes.
-    });
-
-    let mut out = String::new();
-    let mut stdout = child.stdout.take().ok_or("no stdout pipe")?;
-    let read_res = stdout.read_to_string(&mut out);
-    let mut err = String::new();
-    if let Some(mut se) = child.stderr.take() {
-        let _ = se.read_to_string(&mut err); // best-effort: drain: bounded read of auxiliary output; failure loses the buffer, not the outcome
+    let cmd = loc.sh_command(&script);
+    let outcome = drive_child(cmd, bytes, REMOTE_DROP_TIMEOUT, REMOTE_DROP_OUTPUT_CAP)?;
+    if outcome.timed_out {
+        return Err(format!(
+            "remote drop timed out after {}s; the image was not delivered",
+            REMOTE_DROP_TIMEOUT.as_secs()
+        ));
     }
-    let _ = writer.join(); // best-effort: thread join: a panicked helper loses its output, not the caller
-    let status = child.wait().map_err(|e| format!("ssh wait: {e}"))?;
-
-    read_res.map_err(|e| format!("read remote path: {e}"))?;
-    if !status.success() {
-        let detail = err.trim();
+    if !outcome.success {
+        let detail = outcome.stderr.trim();
         let detail = if detail.is_empty() {
             "remote command failed"
         } else {
@@ -271,7 +383,7 @@ fn remote_drop(
         };
         return Err(detail.to_string());
     }
-    let path = out.trim();
+    let path = outcome.stdout.trim();
     if path.is_empty() {
         return Err("remote drop produced no path".to_string());
     }
@@ -349,6 +461,67 @@ pub(crate) fn resolve(outcome: PasteImageOutcome) -> (Option<(u32, String)>, Str
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn drive_child_returns_stdout_and_status_with_a_payload_larger_than_the_pipe() {
+        let mut cmd = std::process::Command::new("sh");
+        cmd.args(["-c", "cat >/dev/null; echo /remote/img.png"]);
+
+        let payload = vec![7_u8; 300_000];
+        let outcome = drive_child(cmd, &payload, std::time::Duration::from_secs(20), 4096)
+            .expect("child completes");
+
+        assert!(outcome.success);
+        assert!(!outcome.timed_out);
+        assert_eq!(outcome.stdout.trim(), "/remote/img.png");
+    }
+
+    #[test]
+    fn drive_child_caps_a_chatty_child_without_blocking_it() {
+        let mut cmd = std::process::Command::new("sh");
+        cmd.args(["-c", r#"head -c 200000 /dev/zero | tr "\0" a"#]);
+
+        let outcome = drive_child(cmd, &[], std::time::Duration::from_secs(20), 16)
+            .expect("chatty child completes");
+
+        assert!(
+            outcome.success,
+            "the capped reader must drain excess output"
+        );
+        assert!(!outcome.timed_out);
+        assert_eq!(outcome.stdout.len(), 16);
+    }
+
+    #[test]
+    fn drive_child_kills_a_hung_child_at_the_deadline() {
+        let mut cmd = std::process::Command::new("sh");
+        cmd.args(["-c", "exec sleep 30"]);
+        let started = std::time::Instant::now();
+
+        let outcome = drive_child(cmd, &[], std::time::Duration::from_millis(300), 4096)
+            .expect("timed-out child is reaped");
+        let elapsed = started.elapsed();
+
+        assert!(outcome.timed_out);
+        assert!(!outcome.success);
+        assert!(
+            elapsed < std::time::Duration::from_secs(10),
+            "deadline should stop the child promptly, elapsed: {elapsed:?}"
+        );
+    }
+
+    #[test]
+    fn drive_child_reports_a_failing_exit_and_its_stderr() {
+        let mut cmd = std::process::Command::new("sh");
+        cmd.args(["-c", "echo boom >&2; exit 3"]);
+
+        let outcome = drive_child(cmd, &[], std::time::Duration::from_secs(20), 4096)
+            .expect("child status is returned");
+
+        assert!(!outcome.success);
+        assert!(!outcome.timed_out);
+        assert_eq!(outcome.stderr.trim(), "boom");
+    }
 
     #[test]
     fn drop_refuses_when_the_location_is_unreadable() {
