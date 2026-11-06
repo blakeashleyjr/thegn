@@ -40,11 +40,13 @@ thegn makes no network calls.
   stores tokens in the operating system keyring; config can also refer to
   secrets through `keyring:`, `env:` and `file:` references. See
   [[configuration]].
-- **Sandboxed panes:** The default profile is `sealed`, which hides host
-  `$HOME`, including its credentials, from sandboxed panes. The opt-in
-  `standard` profile leaves `$HOME` readable, including credentials. Native
-  plugins run as you without sandboxing and may do what your account can do;
-  thegn cannot tell you what they send. See [[sandboxing]] and [[plugins]].
+- **Sandboxed panes:** The default profile is `standard`: sandboxed panes have a
+  read-only root and `$HOME`, can read credentials there, and have network
+  access. `sealed` is opt-in through `profile = "sealed"` in user config or an
+  `[env.<name>.sandbox]` table, or `THEGN_SANDBOX_PROFILE=sealed`; it hides
+  `$HOME`, disables networking, and drops all capabilities. Native plugins run
+  as you without sandboxing and may do what your account can do; thegn cannot
+  tell you what they send. See [[sandboxing]] and [[plugins]].
 
 ## What can leave the machine, and when
 
