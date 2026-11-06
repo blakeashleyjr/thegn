@@ -90,9 +90,10 @@ is kept.
 More: press `F1`, or see [getting started](docs/help/getting-started.md).
 
 > **Sandbox and credentials.** Worktree panes run in a sandbox by default. The
-> default `sealed` profile hides `$HOME`, including credentials such as
-> `~/.ssh`, `~/.aws` and `~/.config/gh`. `standard` is an opt-in profile that
-> keeps everything outside the worktree read-only but leaves `$HOME` readable.
+> default `standard` profile keeps files outside the worktree read-only, apart
+> from carved-back state directories, and leaves `$HOME` readable, including
+> credentials such as `~/.ssh`, `~/.aws` and `~/.config/gh`. The opt-in `sealed`
+> profile hides `$HOME` and disables network access.
 > `[[plugins]]` extensions are native, unsandboxed processes. See the
 > [sandboxing help page](docs/help/sandboxing.md).
 
@@ -516,21 +517,24 @@ environment and exactly which features are enabled vs degraded.
 ## Sandboxing worktrees
 
 By default each worktree's interactive process (agent / shell / tools) runs
-inside a container or sandbox using the `sealed` profile, which hides `$HOME`
-and disables network access. The opt-in `standard` profile keeps files outside
-the worktree read-only apart from a few carved-back state directories (see the
-[sandboxing help page](docs/help/sandboxing.md)); `$HOME` remains readable,
-credentials included. The worktree stays on the host and is **bind-mounted at
-its real path**, so host-side git reads (sidebar, panel, PR) keep working.
+inside a container or sandbox using the `standard` profile. Files outside the
+worktree are read-only apart from a few carved-back state directories, and
+`$HOME` remains readable, credentials included. The opt-in `sealed` profile
+hides `$HOME` and disables network access (see the
+[sandboxing help page](docs/help/sandboxing.md)). The worktree stays on the
+host and is **bind-mounted at its real path**, so host-side git reads (sidebar,
+panel, PR) keep working.
 
 - **Backends** (`[sandbox] backend`): `auto` walks `backend_chain` —
   `podman-rootless` → `podman-rootful` → `docker` → `apple` (macOS `container`)
   → `bwrap` → `jobobject` (Windows Job Objects). `apple` and `jobobject` probe
   absent off their respective OSes. There is no host fallback; a launch with
   no usable backend refuses. `systemd` and `wsl` are also selectable
-  explicitly. Hardening presets: `open`, `standard` (read-only root, credentials
-  readable), and `sealed` (the default: no network, read-only root, all caps
-  dropped).
+  explicitly. Hardening presets: `open`, `standard` (the default: read-only
+  root, credentials readable), and `sealed` (opt-in: no network, read-only
+  root, all caps dropped). Set `[sandbox] profile = "sealed"`,
+  `[env.<name>.sandbox] profile = "sealed"`, or
+  `THEGN_SANDBOX_PROFILE=sealed` to opt in.
 - **Named environments** (`[env.<name>]`) place a worktree locally, over
   `ssh`, on Kubernetes, or on a managed provider; `thegn env` inspects and
   selects them. _(SSH and managed-provider placement are **dev channel only** —
