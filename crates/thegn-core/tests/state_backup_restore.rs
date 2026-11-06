@@ -159,4 +159,15 @@ fn an_older_backup_migrates_forward_on_open() {
         upgraded.get_my_work_cache("/repo/a").unwrap().unwrap().0,
         r#"[{"n":1}]"#
     );
+    drop(upgraded);
+
+    {
+        let connection = Connection::open(&copy).unwrap();
+        assert_eq!(
+            connection
+                .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
+                .unwrap(),
+            SCHEMA_VERSION
+        );
+    }
 }
