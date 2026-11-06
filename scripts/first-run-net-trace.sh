@@ -18,7 +18,9 @@ set -euo pipefail
 # Known limitation: ptrace neutralises setuid, so setuid helper network use is
 # invisible and rootful-podman probes are skipped. The result is a floor, not
 # proof that no network is ever used. A first-frame window also says nothing
-# about network use after that first frame.
+# about network use after that first frame. With --daemon, strace may keep
+# tracing the pane daemon until the 120-second timeout; that timeout is accepted
+# when a non-empty trace was produced, after which the isolated daemon is stopped.
 #
 # Report format ($OUT/net-trace.txt), UTF-8 with a final newline, in this order:
 # net-trace.version: 1
@@ -211,7 +213,10 @@ if ((DAEMON)); then
   fi
 fi
 
-if ((run_status != 0)); then
+if ((summary_status == 1)); then
+  exit 1
+fi
+if ((run_status != 0 && !(DAEMON && run_status == 124))); then
   printf 'net-trace: traced run failed to start or exit cleanly (status %s)\n' "$run_status" >&2
   exit 2
 fi

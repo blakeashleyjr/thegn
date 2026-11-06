@@ -158,9 +158,21 @@ class NetTraceTests(unittest.TestCase):
             "net-trace.verdict",
             "setuid",
             "first frame",
+            "With --daemon, strace may keep",
+            "that timeout is accepted",
         ):
             with self.subTest(required=required):
                 self.assertIn(required, script)
+
+    def test_script_prioritizes_network_findings_and_accepts_daemon_timeout(self) -> None:
+        script = (Path(__file__).resolve().parent / "first-run-net-trace.sh").read_text(encoding="utf-8")
+        network_exit = script.index("if ((summary_status == 1)); then")
+        run_failure_check = script.index("if ((run_status != 0 && !(DAEMON && run_status == 124))); then")
+        self.assertLess(
+            network_exit,
+            run_failure_check,
+            "a network finding must remain exit 1 even if the traced process times out",
+        )
 
     def test_script_is_opt_in_and_linux_only(self) -> None:
         script = (Path(__file__).resolve().parent / "first-run-net-trace.sh").read_text(encoding="utf-8")
