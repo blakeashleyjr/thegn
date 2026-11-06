@@ -679,6 +679,29 @@ jobs:
             "$PACKAGE_ROOT/release-assets/thegn-$TAG-deb.nfpm.yaml"
           cp "$PACKAGE_ROOT/rendered/nfpm/thegn-rpm.yaml" \
             "$PACKAGE_ROOT/release-assets/thegn-$TAG-rpm.nfpm.yaml"
+      - name: Write aggregate SHA256SUMS and the third-party notices asset
+        run: |
+          set -euo pipefail
+          [ -f THIRD_PARTY_NOTICES.md ] || {
+            echo "::error::THIRD_PARTY_NOTICES.md is missing from the admitted revision (run: just third-party-notices)"
+            exit 1
+          }
+          cp THIRD_PARTY_NOTICES.md "$PACKAGE_ROOT/release-assets/thegn-$TAG-THIRD_PARTY_NOTICES.md"
+          shopt -s nullglob
+          sums="$PACKAGE_ROOT/release-assets/SHA256SUMS"
+          : > "$sums"
+          for file in "$PACKAGE_ROOT/assets"/thegn-"$TAG"-*.tar.gz \
+            "$PACKAGE_ROOT/release-assets"/thegn_*_amd64.deb \
+            "$PACKAGE_ROOT/release-assets"/thegn-*-1.x86_64.rpm \
+            "$PACKAGE_ROOT/release-assets/thegn-$TAG-THIRD_PARTY_NOTICES.md"; do
+            [ -f "$file" ] || continue
+            printf '%s  %s\n' "$(sha256sum "$file" | awk '{print $1}')" "${file##*/}" >> "$sums"
+          done
+          LC_ALL=C sort -k2 -o "$sums" "$sums"
+          [ "$(wc -l < "$sums")" -ge 7 ] || {
+            echo "::error::SHA256SUMS lists fewer than the expected seven files"
+            exit 1
+          }
       - name: Upload packages and rendered metadata
         id: packages
         env:
