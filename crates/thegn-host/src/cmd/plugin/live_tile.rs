@@ -603,6 +603,8 @@ raise SystemExit(3)
         if !python_available() {
             return;
         }
+        // fault.py's flood mode emits revision 1, then 2..=2001: the newest revision is 2001. Waiting for 2000
+        // only passed when a pump happened to land between the last two lines; coalescing past it failed the push.
         let mut harness = Harness::new("flood");
         harness.wait_for_change();
         let deadline = Instant::now() + Duration::from_secs(3);
@@ -612,7 +614,7 @@ raise SystemExit(3)
                 .tile
                 .ui
                 .view()
-                .is_some_and(|view| view.revision == 2_000)
+                .is_some_and(|view| view.revision == 2_001)
             {
                 break;
             }
@@ -621,7 +623,7 @@ raise SystemExit(3)
                 .recv_timeout(Duration::from_millis(20))
                 .unwrap_or_default();
         }
-        assert_eq!(harness.tile.ui.view().unwrap().revision, 2_000);
+        assert_eq!(harness.tile.ui.view().unwrap().revision, 2_001);
         harness.close();
     }
 
