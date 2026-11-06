@@ -662,11 +662,11 @@ fn map_dispatch_status_error(error: anyhow::Error) -> ControlError {
             }
         };
     }
-    if error
-        .downcast_ref::<crate::cmd::dispatch::DoneGateRefused>()
-        .is_some()
-    {
-        return ControlError::FailedPrecondition(format!("missing_evidence: {error}"));
+    if let Some(refused) = error.downcast_ref::<crate::cmd::dispatch::DoneGateRefused>() {
+        let id = refused.id;
+        return ControlError::FailedPrecondition(format!(
+            "missing_evidence: {error}\n(the control API has no force option; the override is CLI-only: `thegn dispatch set-status {id} done --force --why '<reason>'`)"
+        ));
     }
     ControlError::Internal(error)
 }
@@ -6943,6 +6943,7 @@ mod tests {
             map_dispatch_status_error(error),
             ControlError::FailedPrecondition(message)
                 if message.starts_with("missing_evidence:")
+                    && message.contains("no force option")
         ));
     }
 
