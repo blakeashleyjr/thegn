@@ -2213,37 +2213,43 @@ fn cache_contents_do_not_depend_on_account_completion_order() {
 fn coalescing_claims_skip_non_forced_overlap_and_release_on_drop() {
     let from = d(2026, 10, 1);
     let to = d(2026, 10, 31);
-    let (a, a_names) = claim_accounts(
+    let (a, a_names, a_coalesced) = claim_accounts(
         vec!["coalesce-u-x".into(), "coalesce-u-y".into()],
         from,
         to,
         false,
     );
     assert_eq!(a_names, vec!["coalesce-u-x", "coalesce-u-y"]);
+    assert!(a_coalesced.is_empty());
 
-    let (b, b_names) = claim_accounts(
+    let (b, b_names, b_coalesced) = claim_accounts(
         vec!["coalesce-u-x".into(), "coalesce-u-z".into()],
         from,
         to,
         false,
     );
     assert_eq!(b_names, vec!["coalesce-u-z"]);
+    assert_eq!(b_coalesced, vec!["coalesce-u-x"]);
 
-    let (_different_window, different_names) = claim_accounts(
+    let (_different_window, different_names, different_coalesced) = claim_accounts(
         vec!["coalesce-u-x".into()],
         d(2026, 11, 1),
         d(2026, 11, 30),
         false,
     );
     assert_eq!(different_names, vec!["coalesce-u-x"]);
+    assert!(different_coalesced.is_empty());
 
-    let (_forced, forced_names) = claim_accounts(vec!["coalesce-u-x".into()], from, to, true);
+    let (_forced, forced_names, forced_coalesced) =
+        claim_accounts(vec!["coalesce-u-x".into()], from, to, true);
     assert_eq!(forced_names, vec!["coalesce-u-x"]);
+    assert!(forced_coalesced.is_empty());
 
     drop(a);
-    let (_after_drop, after_drop_names) =
+    let (_after_drop, after_drop_names, after_drop_coalesced) =
         claim_accounts(vec!["coalesce-u-y".into()], from, to, false);
     assert_eq!(after_drop_names, vec!["coalesce-u-y"]);
+    assert!(after_drop_coalesced.is_empty());
     drop(b);
 }
 
@@ -2252,14 +2258,17 @@ fn coalescing_claim_is_released_when_the_holder_panics() {
     let from = d(2026, 10, 1);
     let to = d(2026, 10, 31);
     let holder = std::thread::spawn(move || {
-        let (_claim, names) = claim_accounts(vec!["coalesce-p-x".into()], from, to, false);
+        let (_claim, names, coalesced) =
+            claim_accounts(vec!["coalesce-p-x".into()], from, to, false);
         assert_eq!(names, vec!["coalesce-p-x"]);
+        assert!(coalesced.is_empty());
         panic!("exercise RAII cleanup during unwind");
     });
     assert!(holder.join().is_err());
 
-    let (_claim, names) = claim_accounts(vec!["coalesce-p-x".into()], from, to, false);
+    let (_claim, names, coalesced) = claim_accounts(vec!["coalesce-p-x".into()], from, to, false);
     assert_eq!(names, vec!["coalesce-p-x"]);
+    assert!(coalesced.is_empty());
 }
 
 fn coalescing_ics_fixture(account_name: &str) -> (TmpDb, CalendarConfig, tempfile::TempDir) {
@@ -2291,14 +2300,20 @@ fn coalescing_non_forced_sync_skips_an_account_being_fetched() {
     let (t, cfg, _fixture) = coalescing_ics_fixture(account);
     let from = d(2026, 10, 1);
     let to = d(2026, 10, 31);
-    let (claim, names) = claim_accounts(vec![account.into()], from, to, false);
+    let (claim, names, coalesced) = claim_accounts(vec![account.into()], from, to, false);
     assert_eq!(names, vec![account]);
+    assert!(coalesced.is_empty());
 
-    assert!(!sync_accounts(&t.db, &cfg, from, to, false, &mut |_| {},));
+    let outcome = sync_accounts_with_generation(&t.db, &cfg, from, to, false, None, &mut |_| {});
+    assert!(matches!(
+        outcome,
+        SyncOutcome::Coalesced { accounts } if accounts == vec![account.to_owned()]
+    ));
     assert!(t.db.get_calendar_sync(account).unwrap().is_none());
     assert!(!t.db.has_calendar_events(account).unwrap());
 
     drop(claim);
+    wait_for_accounts(&[account.into()], from, to);
     assert!(sync_accounts(&t.db, &cfg, from, to, false, &mut |_| {},));
     assert!(t.db.get_calendar_sync(account).unwrap().is_some());
     assert!(t.db.has_calendar_events(account).unwrap());
@@ -2313,8 +2328,9 @@ fn coalescing_forced_sync_runs_even_while_another_pass_holds_the_account() {
     let (t, cfg, _fixture) = coalescing_ics_fixture(account);
     let from = d(2026, 10, 1);
     let to = d(2026, 10, 31);
-    let (_claim, names) = claim_accounts(vec![account.into()], from, to, false);
+    let (_claim, names, coalesced) = claim_accounts(vec![account.into()], from, to, false);
     assert_eq!(names, vec![account]);
+    assert!(coalesced.is_empty());
 
     assert!(sync_accounts(&t.db, &cfg, from, to, true, &mut |_| {},));
     assert!(t.db.get_calendar_sync(account).unwrap().is_some());
