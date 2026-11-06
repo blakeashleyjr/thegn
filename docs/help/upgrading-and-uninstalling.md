@@ -111,6 +111,10 @@ not opened. Before upgrading, back up the state database using the procedure
 below. To roll back, quit thegn, run `thegn daemon stop`, reinstall the older
 binary, and restore that backup.
 
+If you kept `thegn.prev` (see the release archive steps), restore it with
+`install -m 755 "$HOME/.local/bin/thegn.prev" "$HOME/.local/bin/thegn"` before
+restoring the database backup.
+
 If the newer build has already migrated the database, the older binary refuses
 to open it. In that case, continue forward with a compatible build or restore
 a backup made before the upgrade. Never edit SQLite's `user_version` by hand.
@@ -159,11 +163,12 @@ if it was not the default `~/.local/bin`:
 ./install.sh --uninstall --dry-run "$HOME/.local/bin"
 ```
 
-The installer removes only manifest-recorded files whose SHA-256 still
-matches. It keeps and reports changed files, never removes your config, and
-refuses a malformed or forged manifest. Uninstall cannot be combined with
-`--batteries`. If any file is kept, it reports `uninstall incomplete` and exits
-non-zero. Review that report and remove any files you want gone yourself.
+The installer removes only manifest-recorded files (the `thegn`, `tg` and
+`tg-tui` binaries and the desktop entry) whose SHA-256 still matches. It keeps
+and reports changed files, never removes your config, and refuses a malformed
+or forged manifest. Uninstall cannot be combined with `--batteries`. If any
+file is kept, it reports `uninstall incomplete` and exits non-zero. Review that
+report and remove any files you want gone yourself.
 
 ### Release archive
 
