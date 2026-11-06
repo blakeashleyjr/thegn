@@ -770,11 +770,37 @@ fn bounded_message(raw: Option<&str>) -> String {
     let Some(raw) = raw else {
         return String::new();
     };
-    let redacted = thegn_core::log_redact::redact_text_line(raw);
+
+    // Keep the delimiter-heavy redactor's input bounded. If the limit lands
+    // inside a token, drop back to the last whitespace so no secret is split.
+    const REDACTION_INPUT_CHARS: usize = 8192;
+    let bounded_raw = match raw.char_indices().nth(REDACTION_INPUT_CHARS) {
+        Some((boundary, _)) => {
+            let prefix = &raw[..boundary];
+            match prefix
+                .char_indices()
+                .rev()
+                .find(|(_, character)| character.is_whitespace())
+            {
+                Some((last_whitespace, character)) => {
+                    &raw[..last_whitespace + character.len_utf8()]
+                }
+                None => "",
+            }
+        }
+        None => raw,
+    };
+    let redacted =
+        thegn_core::log_redact::redact_text_line(&thegn_core::ci_log::redact(bounded_raw));
     let flattened: String = redacted
         .chars()
         .map(|character| {
-            if character.is_control() {
+            if character.is_control()
+                || matches!(
+                    character,
+                    '\u{200E}' | '\u{200F}' | '\u{202A}'..='\u{202E}' | '\u{2066}'..='\u{2069}'
+                )
+            {
                 ' '
             } else {
                 character
@@ -860,13 +886,18 @@ async fn graphql_request(
                         .headers
                         .get("x-ratelimit-remaining")
                         .is_some_and(|value| value.as_bytes() == b"0")));
+        let shown = bounded_message(body_message.as_deref());
         let error = match code {
             401 => ForgeError::NotAuthenticated,
             403 if rate_limited => ForgeError::RateLimited,
             403 => ForgeError::NotAuthenticated,
             429 => ForgeError::RateLimited,
             _ => {
-                let message = body_message.as_deref().unwrap_or("unknown error");
+                let message = if shown.is_empty() {
+                    "unknown error"
+                } else {
+                    shown.as_str()
+                };
                 ForgeError::Other(format!("GitHub API HTTP {code}: {message}"))
             }
         };
@@ -881,7 +912,7 @@ async fn graphql_request(
         }
         tracing::warn!(target: "thegn::forge", op = what, error = %error,
             status = code, class = status_class(code, rate_limited), repo = %request_repo(body),
-            message = %bounded_message(body_message.as_deref()),
+            response_message = ?shown,
             "GitHub API returned an error status");
         return Err(error);
     }

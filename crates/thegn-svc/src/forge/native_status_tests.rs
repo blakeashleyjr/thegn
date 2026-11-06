@@ -1,3 +1,4 @@
+use super::regression_tests::{client, runtime};
 use super::*;
 
 #[test]
@@ -21,11 +22,45 @@ fn bounded_message_redacts_truncates_and_flattens() {
     assert!(message.contains("***redacted***"));
     assert!(!message.contains("Bearer abc"));
 
+    let bare_token = format!("Bad credentials ghp_{}", "a".repeat(36));
+    let bare_token_message = bounded_message(Some(&bare_token));
+    assert!(!bare_token_message.contains("ghp_"));
+    assert!(bare_token_message.contains("***redacted***"));
+
+    let userinfo = format!("see https://x:ghp_{}@github.com", "b".repeat(36));
+    let userinfo_message = bounded_message(Some(&userinfo));
+    assert!(!userinfo_message.contains("ghp_"));
+    assert!(userinfo_message.contains("***redacted***"));
+
+    let with_bidi = bounded_message(Some("before\u{202E}after"));
+    assert!(!with_bidi.contains('\u{202E}'));
+    assert!(with_bidi.contains("before after"));
+
     let long_message = "x".repeat(500);
     let bounded = bounded_message(Some(&long_message));
     assert!(bounded.chars().count() <= 203);
     assert!(bounded.ends_with("..."));
+
+    let multibyte = "é".repeat(500);
+    let bounded_multibyte = bounded_message(Some(&multibyte));
+    assert_eq!(bounded_multibyte, format!("{}...", "é".repeat(200)));
+    assert!(bounded_multibyte.is_char_boundary(bounded_multibyte.len()));
     assert_eq!(bounded_message(None), "");
+}
+
+#[test]
+fn graphql_status_other_error_redacts_bare_provider_tokens() {
+    let token_body = format!("{{\"message\":\"Bad credentials ghp_{}\"}}", "c".repeat(36));
+    let rt = runtime();
+    rt.block_on(async {
+        let body = serde_json::json!({"query": "fixture"});
+        let health = GhCircuit::new();
+        let error = graphql_request(&client(502, &token_body), &body, "fixture", &health).await;
+        let Err(ForgeError::Other(message)) = error else {
+            panic!("expected an HTTP status error");
+        };
+        assert!(!message.contains("ghp_"));
+    });
 }
 
 #[test]
