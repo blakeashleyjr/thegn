@@ -63,7 +63,7 @@ body:
     id: terminal
     attributes:
       label: Outer terminal
-      description: e.g. Ghostty, iTerm2, WezTerm, Windows Terminal, Alacritty, tmux, ...; include tmux/ssh if involved.
+      description: e.g. Ghostty, iTerm2, WezTerm, Windows Terminal, Alacritty. Mention tmux or ssh if you use them.
     validations:
       required: false
   - type: textarea
