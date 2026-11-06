@@ -67,8 +67,8 @@ thegn makes no network calls.
   API key for this feature.
 - **Cover art — `[media] show_art = true`:** when the Now-Playing panel receives
   an HTTP(S) artwork URL from a media player, thegn fetches the image off the UI
-  loop with bounded size and address and redirect checks. `[media] enabled =
-false` turns media off.
+  loop with bounded size and address and redirect checks.
+  `[media] enabled = false` turns media off.
 
 ### Only if you enable or run it
 
