@@ -105,7 +105,7 @@ All notable changes to **thegn** are documented here. The format follows
   provenance; v107 records merge landing OIDs. Restart the host and daemon
   after upgrading so they use the migrated database.
 
-## [0.1.0-alpha.53] — 2026-11-05 (maintenance batch 91)
+## [0.1.0-alpha.53] — 2026-11-05
 
 ### Added
 
@@ -138,11 +138,11 @@ All notable changes to **thegn** are documented here. The format follows
 - Machine0 provisioning attestation records and projection ownership manifests
   are written through held, owner-only directory handles.
 
-## [0.1.0-alpha.52] — 2026-11-04 (maintenance batch 90)
+## [0.1.0-alpha.52] — 2026-11-04
 
 - Observe and plugin app tabs are now available on the stable channel.
 
-## [0.1.0-alpha.51] — 2026-11-04 (maintenance batch 89)
+## [0.1.0-alpha.51] — 2026-11-04
 
 ### Added
 
@@ -187,7 +187,7 @@ All notable changes to **thegn** are documented here. The format follows
 - The MCP secret-name index carries a generation checked at publish, so a
   concurrent update is refused instead of overwritten.
 
-## [0.1.0-alpha.50] — 2026-11-04 (maintenance batch 88)
+## [0.1.0-alpha.50] — 2026-11-04
 
 ### Added
 
@@ -237,7 +237,7 @@ All notable changes to **thegn** are documented here. The format follows
   or over 64 KiB, inventories over 1024 rows, and non-owner-only directories
   are refused.
 
-## [0.1.0-alpha.49] — 2026-11-04 (maintenance batch 87)
+## [0.1.0-alpha.49] — 2026-11-04
 
 ### Changed
 
@@ -264,7 +264,7 @@ All notable changes to **thegn** are documented here. The format follows
 - The rebase status check reports an apply-backend rebase or an in-progress
   `git am` as an error naming the marker instead of reporting no rebase.
 
-## [0.1.0-alpha.48] — 2026-11-04 (maintenance batch 86)
+## [0.1.0-alpha.48] — 2026-11-04
 
 ### Added
 
@@ -340,7 +340,7 @@ All notable changes to **thegn** are documented here. The format follows
   their host is loopback. Setup and configuration validation reject
   credentialed plain HTTP; redirects are not followed.
 
-## [0.1.0-alpha.47] — 2026-11-03 (maintenance batch 84)
+## [0.1.0-alpha.47] — 2026-11-03
 
 ### Added
 
@@ -393,7 +393,7 @@ All notable changes to **thegn** are documented here. The format follows
 - (dev channel) Managed SSH custody records use a monotonic generation, so a
   revoked and republished key cannot match a stale rotation snapshot.
 
-## [0.1.0-alpha.46] — 2026-11-03 (maintenance batch 83)
+## [0.1.0-alpha.46] — 2026-11-03
 
 ### Added
 
@@ -436,7 +436,7 @@ All notable changes to **thegn** are documented here. The format follows
 - Sandbox image builds no longer use registry credentials; each architecture's
   image and the manifest list carry build-provenance attestations.
 
-## [0.1.0-alpha.45] — 2026-11-03 (maintenance batch 82)
+## [0.1.0-alpha.45] — 2026-11-03
 
 ### Added
 
@@ -497,7 +497,7 @@ All notable changes to **thegn** are documented here. The format follows
   recycle verify the environment's network egress policy, re-applying it if
   needed. An unverifiable restore fails the command or destroys the spare.
 
-## [0.1.0-alpha.44] — 2026-11-03 (maintenance batch 81)
+## [0.1.0-alpha.44] — 2026-11-03
 
 ### Added
 
@@ -546,7 +546,7 @@ All notable changes to **thegn** are documented here. The format follows
   moved or unreadable HEAD prevents the start and holds the row as
   `needs_human`. A successful attempt refund is reported as no attempt spent.
 
-## [0.1.0-alpha.43] — 2026-11-02 (maintenance batch 80)
+## [0.1.0-alpha.43] — 2026-11-02
 
 ### Added
 
@@ -596,7 +596,7 @@ All notable changes to **thegn** are documented here. The format follows
   remote placement is configured instead of using the default environment;
   the resident bridge also scrubs secret-shaped text from command error output.
 
-## [0.1.0-alpha.42] — 2026-10-28 (maintenance batch 79)
+## [0.1.0-alpha.42] — 2026-10-28
 
 ### Added
 
@@ -637,7 +637,7 @@ All notable changes to **thegn** are documented here. The format follows
   provider connections are refused when a remote placement is configured;
   without one, panes use the local path.
 
-## [0.1.0-alpha.41] — 2026-10-23 (maintenance batch 78)
+## [0.1.0-alpha.41] — 2026-10-23
 
 ### Changed
 
@@ -688,7 +688,7 @@ All notable changes to **thegn** are documented here. The format follows
 - On Linux, stopping a resident plugin also kills descendant processes it
   started in a new session, such as with `setsid`.
 
-## [0.1.0-alpha.40] — 2026-10-23 (maintenance batch 77)
+## [0.1.0-alpha.40] — 2026-10-23
 
 ### Changed
 
@@ -729,7 +729,7 @@ All notable changes to **thegn** are documented here. The format follows
 - (dev channel) Reopening a hibernated worktree refuses to provision a fresh
   sandbox when its hibernation record cannot be read while hibernation is on.
 
-## [0.1.0-alpha.39] — 2026-10-23 (maintenance batch 76)
+## [0.1.0-alpha.39] — 2026-10-23
 
 ### Changed
 
@@ -775,7 +775,7 @@ All notable changes to **thegn** are documented here. The format follows
   the first 32 hexadecimal characters of the SHA-256 of the decoded public
   key, and an invalid OpenSSH public key is refused (dev channel).
 
-## [0.1.0-alpha.38] — 2026-10-23 (maintenance batch 75)
+## [0.1.0-alpha.38] — 2026-10-23
 
 ### Fixed
 
@@ -813,7 +813,7 @@ All notable changes to **thegn** are documented here. The format follows
   inside the container and marks provisioning complete only for the applied
   plan (dev channel).
 
-## [0.1.0-alpha.37] — 2026-10-23 (maintenance batch 74)
+## [0.1.0-alpha.37] — 2026-10-23
 
 ### Changed
 
@@ -859,7 +859,7 @@ session move` drops pane working directories outside the moved worktree, so
   copies of the key, and refuses an unparsable managed key before custody
   (dev channel).
 
-## [0.1.0-alpha.36] — 2026-10-23 (maintenance batch 73)
+## [0.1.0-alpha.36] — 2026-10-23
 
 ### Changed
 
@@ -904,7 +904,7 @@ session move` drops pane working directories outside the moved worktree, so
   replaces control and invisible formatting characters so hostile names or
   messages cannot inject terminal escape sequences.
 
-## [0.1.0-alpha.35] — 2026-10-23 (maintenance batch 72)
+## [0.1.0-alpha.35] — 2026-10-23
 
 ### Added
 
@@ -960,7 +960,7 @@ session move` drops pane working directories outside the moved worktree, so
   sessions. Non-loopback `[forward] bind` values are refused unless
   `allow_external_bind = true`.
 
-## [0.1.0-alpha.34] — 2026-10-22 (maintenance batch 71)
+## [0.1.0-alpha.34] — 2026-10-22
 
 ### Added
 
@@ -1001,7 +1001,7 @@ session move` drops pane working directories outside the moved worktree, so
 - Invalid VPS names are refused instead of sharing a fallback `known_hosts`
   pin (dev channel).
 
-## [0.1.0-alpha.33] — 2026-10-22 (maintenance batch 70)
+## [0.1.0-alpha.33] — 2026-10-22
 
 ### Added
 
@@ -1035,7 +1035,7 @@ session move` drops pane working directories outside the moved worktree, so
   launch fields are validated and bounded, and bore secrets in
   `[share.bore] extra_args` are refused without echoing the value.
 
-## [0.1.0-alpha.32] — 2026-10-22 (maintenance batch 69)
+## [0.1.0-alpha.32] — 2026-10-22
 
 ### Added
 
@@ -1068,7 +1068,7 @@ session move` drops pane working directories outside the moved worktree, so
 - Release archives require matching attestation identity. Managed tool
   provenance reasons remain visible in doctor output.
 
-## [0.1.0-alpha.31] — 2026-10-22 (maintenance batch 68)
+## [0.1.0-alpha.31] — 2026-10-22
 
 ### Added
 
@@ -1090,7 +1090,7 @@ session move` drops pane working directories outside the moved worktree, so
   archives with sparse members or truncated data are refused. Lost PR-agent
   leases cancel the run; pool reconciliation stops on database read errors.
 
-## [0.1.0-alpha.30] — 2026-10-22 (maintenance batch 67)
+## [0.1.0-alpha.30] — 2026-10-22
 
 ### Added
 
@@ -1111,7 +1111,7 @@ session move` drops pane working directories outside the moved worktree, so
   only records for the same provider account, and unsafe execution or socket
   probes fail closed.
 
-## [0.1.0-alpha.29] — 2026-10-22 (maintenance batch 66)
+## [0.1.0-alpha.29] — 2026-10-22
 
 ### Added
 
@@ -1132,7 +1132,7 @@ session move` drops pane working directories outside the moved worktree, so
   operations refuse account mismatches or unreadable ledger data (dev channel);
   share backends are limited to supported built-ins.
 
-## [0.1.0-alpha.28] — 2026-10-21 (maintenance batch 65)
+## [0.1.0-alpha.28] — 2026-10-21
 
 ### Added
 
@@ -1152,7 +1152,7 @@ session move` drops pane working directories outside the moved worktree, so
   managed VPS/Fly records are checked against recorded identity before use
   (dev channel).
 
-## [0.1.0-alpha.27] — 2026-10-21 (maintenance batch 64)
+## [0.1.0-alpha.27] — 2026-10-21
 
 ### Added
 
@@ -1171,7 +1171,7 @@ session move` drops pane working directories outside the moved worktree, so
   bounded operations (dev channel). Unsafe plugin surfaces and storage are
   refused or reported explicitly.
 
-## [0.1.0-alpha.26] — 2026-10-21 (maintenance batch 63)
+## [0.1.0-alpha.26] — 2026-10-21
 
 ### Added
 
@@ -1190,7 +1190,7 @@ session move` drops pane working directories outside the moved worktree, so
 - Font replacement refuses foreign-owned or hard-linked files. Daemon stop
   reports listeners it could not verify and exits non-zero.
 
-## [0.1.0-alpha.25] — 2026-10-21 (maintenance batch 62)
+## [0.1.0-alpha.25] — 2026-10-21
 
 ### Added
 
@@ -1214,7 +1214,7 @@ session move` drops pane working directories outside the moved worktree, so
 - Bundle ingestion, Mermaid output, SSH control sockets and plugin startup
   validate private paths and bounded inputs before use.
 
-## [0.1.0-alpha.24] — 2026-10-21 (maintenance batch 61)
+## [0.1.0-alpha.24] — 2026-10-21
 
 ### Added
 
@@ -1237,7 +1237,7 @@ session move` drops pane working directories outside the moved worktree, so
   state directories, signed Nix cache paths and validated sandbox settings are
   enforced.
 
-## [0.1.0-alpha.23] — 2026-10-21 (maintenance batch 60)
+## [0.1.0-alpha.23] — 2026-10-21
 
 ### Added
 
@@ -1258,7 +1258,7 @@ session move` drops pane working directories outside the moved worktree, so
   secret type, and the VPS SSH control socket uses a private identity-based
   path.
 
-## [0.1.0-alpha.22] — 2026-10-20 (maintenance batch 59)
+## [0.1.0-alpha.22] — 2026-10-20
 
 ### Added
 
@@ -1280,7 +1280,7 @@ session move` drops pane working directories outside the moved worktree, so
   enforce (dev channel). Containers and snapshots are verified by identity
   before reuse or cleanup.
 
-## [0.1.0-alpha.21] — 2026-10-20 (maintenance batch 58)
+## [0.1.0-alpha.21] — 2026-10-20
 
 ### Added
 
@@ -1302,7 +1302,7 @@ session move` drops pane working directories outside the moved worktree, so
   environments and secret files enforce bounds; provider connections enforce
   identity checks (dev channel).
 
-## [0.1.0-alpha.20] — 2026-10-20 (maintenance batch 57)
+## [0.1.0-alpha.20] — 2026-10-20
 
 ### Added
 
@@ -1322,7 +1322,7 @@ session move` drops pane working directories outside the moved worktree, so
   identities (dev channel); secrets and sandbox launches use pinned tools and
   bounded output.
 
-## [0.1.0-alpha.19] — 2026-10-20 (maintenance batch 56)
+## [0.1.0-alpha.19] — 2026-10-20
 
 ### Added
 
@@ -1342,7 +1342,7 @@ session move` drops pane working directories outside the moved worktree, so
   provisioning checks egress before execution (dev channel). Remote account
   homes, secrets and resources use private ownership records (dev channel).
 
-## [0.1.0-alpha.18] — 2026-10-20 (maintenance batch 55)
+## [0.1.0-alpha.18] — 2026-10-20
 
 ### Added
 
@@ -1362,7 +1362,7 @@ session move` drops pane working directories outside the moved worktree, so
 - Sealed tunnels with VPN requests are refused until enforceable. Compose
   containers are inspected and torn down if they escape isolation.
 
-## [0.1.0-alpha.17] — 2026-10-19 (maintenance batch 54)
+## [0.1.0-alpha.17] — 2026-10-19
 
 ### Added
 
@@ -1382,7 +1382,7 @@ session move` drops pane working directories outside the moved worktree, so
   handle, and provider credentials and SSH key rotation use checked,
   serialized updates (dev channel).
 
-## [0.1.0-alpha.16] — 2026-10-19 (maintenance batch 53)
+## [0.1.0-alpha.16] — 2026-10-19
 
 ### Added
 
@@ -1399,7 +1399,7 @@ session move` drops pane working directories outside the moved worktree, so
 - Remote SSH keys, parity manifests and callback origins are validated before
   use. Failed machine inventory reads no longer permit resource creation.
 
-## [0.1.0-alpha.15] — 2026-10-19 (maintenance batch 52)
+## [0.1.0-alpha.15] — 2026-10-19
 
 ### Added
 
@@ -1417,7 +1417,7 @@ session move` drops pane working directories outside the moved worktree, so
   cancels in-app merge work, and cleanup refuses to act on hidden monitor
   rows.
 
-## [0.1.0-alpha.14] — 2026-10-18 (maintenance batch 51)
+## [0.1.0-alpha.14] — 2026-10-18
 
 ### Added
 
@@ -1434,7 +1434,7 @@ session move` drops pane working directories outside the moved worktree, so
 - Share shutdown uses bounded, verified state (dev channel). Container cleanup
   and network-owner attribution use bounded, verified state.
 
-## [0.1.0-alpha.13] — 2026-10-18 (maintenance batch 50)
+## [0.1.0-alpha.13] — 2026-10-18
 
 ### Added
 
@@ -1454,7 +1454,7 @@ session move` drops pane working directories outside the moved worktree, so
 - Plugin contributions and retained data are bounded. One-shot plugin
   processes stop when their deadline expires.
 
-## [0.1.0-alpha.12] — 2026-10-18 (maintenance batch 49)
+## [0.1.0-alpha.12] — 2026-10-18
 
 ### Added
 
@@ -1473,7 +1473,7 @@ session move` drops pane working directories outside the moved worktree, so
   Network-tunnel admission enforces resource limits (dev channel); container
   scans enforce resource limits.
 
-## [0.1.0-alpha.11] — 2026-10-18 (maintenance batch 48)
+## [0.1.0-alpha.11] — 2026-10-18
 
 ### Added
 
@@ -1490,7 +1490,7 @@ session move` drops pane working directories outside the moved worktree, so
 - Plugin stderr is bounded, and daemon shutdown waits for session actors to
   stop within a deadline.
 
-## [0.1.0-alpha.10] — 2026-10-18 (maintenance batch 47)
+## [0.1.0-alpha.10] — 2026-10-18
 
 ### Added
 
@@ -1507,7 +1507,7 @@ session move` drops pane working directories outside the moved worktree, so
 
 - Resident plugin stderr is bounded.
 
-## [0.1.0-alpha.9] — 2026-10-18 (maintenance batch 46)
+## [0.1.0-alpha.9] — 2026-10-18
 
 ### Added
 
@@ -1525,7 +1525,7 @@ session move` drops pane working directories outside the moved worktree, so
 
 - Process priority changes are identity-bound and never escalate privileges.
 
-## [0.1.0-alpha.8] — 2026-10-17 (maintenance batch 45)
+## [0.1.0-alpha.8] — 2026-10-17
 
 ### Added
 
@@ -1542,7 +1542,7 @@ session move` drops pane working directories outside the moved worktree, so
 
 - The sidebar retains its last known change counts when refresh fails.
 
-## [0.1.0-alpha.7] — 2026-10-17 (maintenance batch 44)
+## [0.1.0-alpha.7] — 2026-10-17
 
 ### Added
 
@@ -1554,7 +1554,7 @@ session move` drops pane working directories outside the moved worktree, so
 - Process signals are tied to process start identity. Preview
   graphics and log drains use bounded background work.
 
-## [0.1.0-alpha.6] — 2026-10-17 (maintenance batch 43)
+## [0.1.0-alpha.6] — 2026-10-17
 
 ### Added
 
@@ -1567,7 +1567,7 @@ session move` drops pane working directories outside the moved worktree, so
   off after server errors, and worktree operations refuse to reopen a row
   while deletion is pending.
 
-## [0.1.0-alpha.5] — 2026-10-16 (maintenance batch 42)
+## [0.1.0-alpha.5] — 2026-10-16
 
 ### Added
 
@@ -1579,7 +1579,7 @@ session move` drops pane working directories outside the moved worktree, so
   prunes its read notifications and issue links. Diff watching excludes
   pipeline metadata while keeping those files tracked.
 
-## [0.1.0-alpha.4] — 2026-10-16 (maintenance batch 41)
+## [0.1.0-alpha.4] — 2026-10-16
 
 ### Added
 
@@ -1602,9 +1602,9 @@ session move` drops pane working directories outside the moved worktree, so
 - Process signals are checked against process identity before delivery, so a
   stale process listing cannot signal a different process that reused its ID.
 
-## [0.1.0-alpha.3] — 2026-10-16 (maintenance batch 40)
+## [0.1.0-alpha.3] — 2026-10-16
 
-### Changed — issue trackers are stable-channel; config output redacts secrets (THE-695)
+### Changed — issue trackers are stable-channel; config output redacts secrets
 
 - **Linear, Jira and Kaneo issue trackers are now available on the stable
   release channel.** Their configuration is no longer stripped by the channel
@@ -1616,7 +1616,7 @@ session move` drops pane working directories outside the moved worktree, so
   `api_keys`) print as `***redacted***` in text and `--json`; `*_env` names,
   `project_key`, `binary_cache_key` and numeric/bool values are left intact.
 
-### Changed — ambiguous `[project.<key>]` blocks are refused, not first-matched (THE-515)
+### Changed — ambiguous `[project.<key>]` blocks are refused, not first-matched
 
 - **A trusted per-project block now applies only when it is unambiguous.** The
   key must be the normalized slug of the repo's directory name (`My_Repo` →
@@ -1674,9 +1674,9 @@ config validate` and `thegn doctor` report such entries.
   repository-authored allow-list is layered under thegn's grant and reaches a
   headless worker. Command-scoping removes thegn's write primitive; it does not
   contain what a candidate branch's own harness settings claim (that is the
-  mutable-project-harness work, THE-434) — relevant to THE-233.
+  mutable-project-harness work).
 
-### Changed — worktree paths, tabs and program features are collision-proof (THE-516)
+### Changed — worktree paths, tabs and program features are collision-proof
 
 - **New worktrees get a collision-resistant directory.** A checkout is now
   `<worktrees_dir>/<repo>/<label>--<digest>` (or `<repo>/.worktrees/…` under
@@ -1845,7 +1845,7 @@ sidebar_dividers` still gates the separation (off = one uniform tint), but it
 
 - **A project header now looks like a project header.** Every structural
   row in the sidebar used to get the identical bold-text-on-a-band treatment,
-  so several open repos stacked into one undifferentiated column (THE-64).
+  so several open repos stacked into one undifferentiated column.
   Project and terminal-host headers are now the loudest tier — bold, in the
   accent color, marked `◆` (or `⌂` / the host glyph) and the only rows on a
   recessed band. Folder headers drop the bold and the band, and their filed
