@@ -156,8 +156,8 @@ Roadmap and specs: `tasks.md` is the roadmap index; behavior specs live in
   minutes at 10x. It runs only on a manual dispatch with `extras`:
   `gh workflow run ci.yml --ref <branch> -f extras=true`. (There is **no**
   `[ci-macos]` commit-message trigger — nor `[ci-windows]` or `[ci-e2e]`; the
-  jobs are gated purely on `if: ${{ inputs.extras }}`, and remote CI is paused
-  besides, so nothing runs on push at all.)
+  extras jobs are gated on `if: ${{ inputs.extras }}`. Pull requests run the
+  lean CI set; pushes do not trigger remote CI.)
 - **State paths** follow XDG conventions (`~/.config/thegn`,
   `~/.local/state/thegn`) on macOS too; set `XDG_CONFIG_HOME`/
   `XDG_STATE_HOME` if you prefer `~/Library`. Keep `XDG_STATE_HOME` shortish:
@@ -254,10 +254,11 @@ don't apply:
   kill-on-close Job Objects), the SIGUSR2 flamegraph profiler, and the
   merge-queue headless agent (POSIX quoting).
 - **CI:** `just check-cross` includes the Linux-side
-  `x86_64-pc-windows-gnu` workspace check. Remote CI is currently dispatch-only;
-  the full `windows-latest` MSVC job (check + IPC/Job-Object kernel tests,
-  release build, and downloaded-artifact smoke) runs only when `ci.yml` is
-  dispatched with `extras: true`.
+  `x86_64-pc-windows-gnu` workspace check. Pull requests run the lean CI set
+  (fmt, clippy, nextest and smoke); heavy jobs run nightly or on dispatch. The
+  full `windows-latest` MSVC job (check + IPC/Job-Object kernel tests, release
+  build, and downloaded-artifact smoke) runs only when `ci.yml` is dispatched
+  with `extras: true`.
 
 ### Running the tests under Wine (from Linux)
 
