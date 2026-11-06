@@ -5,7 +5,7 @@ body:
   - type: markdown
     attributes:
       value: |
-        Thanks for reporting a bug. Please search existing issues first.
+        Thanks for reporting a bug. Please search existing issues and KNOWN_ISSUES.md first.
         For security-sensitive reports, do **not** file here — see SECURITY.md.
   - type: textarea
     id: what-happened
@@ -18,8 +18,12 @@ body:
   - type: textarea
     id: doctor
     attributes:
-      label: Environment (`thegn doctor`)
-      description: Paste the output of `thegn doctor` (resolved capabilities, backends).
+      label: Diagnostics (`thegn doctor`)
+      description: |
+        Paste the output of `thegn doctor`. For crashes, hangs or anything hard to describe also run
+        `thegn doctor bundle --out thegn-bundle.tar.gz`, open the archive and read its manifest,
+        then attach it only if nothing sensitive is in it (redaction is best-effort). Do not paste
+        tokens or private repository data.
       render: text
     validations:
       required: false
@@ -35,10 +39,23 @@ body:
     attributes:
       label: Platform
       options:
-        - Linux
+        - Linux (x86_64)
+        - Linux (other)
         - macOS (Apple silicon)
         - macOS (Intel)
         - Windows (native)
+        - Other
+    validations:
+      required: true
+  - type: dropdown
+    id: install
+    attributes:
+      label: How did you install thegn?
+      options:
+        - Release tarball (GNU)
+        - Release tarball (musl)
+        - Nix flake
+        - Source build (./install.sh or cargo)
         - Other
     validations:
       required: true
@@ -46,7 +63,7 @@ body:
     id: terminal
     attributes:
       label: Outer terminal
-      description: e.g. Ghostty, iTerm2, WezTerm, Windows Terminal, Alacritty, tmux, ...
+      description: e.g. Ghostty, iTerm2, WezTerm, Windows Terminal, Alacritty. Mention tmux or ssh if you use them.
     validations:
       required: false
   - type: textarea
