@@ -1085,6 +1085,54 @@ impl WorkspaceStore for Db {
         self.workspace_env(repo_path)
     }
 
+    fn set_worktree_sandbox_profile(
+        &self,
+        wt: &str,
+        profile: Option<crate::config::SandboxProfile>,
+    ) -> Result<()> {
+        use crate::config::SandboxProfile;
+        if profile.is_some_and(|p| matches!(p, SandboxProfile::Open | SandboxProfile::SealedTunnel))
+        {
+            anyhow::bail!("only standard and sealed can be pinned for a worktree");
+        }
+        let value = profile.map(SandboxProfile::as_str);
+        self.conn().execute(
+            "INSERT INTO worktrees(worktree, sandbox_profile) VALUES(?1, ?2) \
+             ON CONFLICT(worktree) DO UPDATE SET sandbox_profile=?2",
+            params![wt, value],
+        )?;
+        Ok(())
+    }
+
+    fn worktree_sandbox_profile(&self, wt: &str) -> Result<Option<crate::config::SandboxProfile>> {
+        let raw = self
+            .conn()
+            .query_row(
+                "SELECT sandbox_profile FROM worktrees WHERE worktree=?1",
+                params![wt],
+                |row| row.get::<_, Option<String>>(0),
+            )
+            .optional()?
+            .flatten();
+        raw.map(|value| {
+            crate::sandbox_pin::parse_pin(&value).map_err(|error| {
+                anyhow::anyhow!("invalid stored sandbox profile for worktree {wt:?}: {error}")
+            })
+        })
+        .transpose()
+    }
+
+    fn effective_env_selection(
+        &self,
+        wt: &str,
+        repo_path: &str,
+    ) -> Result<crate::sandbox_pin::EnvSelection> {
+        Ok(crate::sandbox_pin::EnvSelection {
+            name: self.effective_env_checked(wt, repo_path)?,
+            profile: self.worktree_sandbox_profile(wt)?,
+        })
+    }
+
     /// Save (or replace) a named layout snapshot. `spec` is a serialized
     /// `LayoutSpec` JSON string.
     fn put_layout(&self, name: &str, spec: &str) -> Result<()> {
@@ -3149,6 +3197,40 @@ mod tests {
         let db = Db::open_memory().unwrap();
 
         assert_eq!(db.effective_env_checked("/wt/a", "/repo").unwrap(), None);
+    }
+
+    #[test]
+    fn sandbox_profile_pin_roundtrips_and_rejects_open_and_sealed_tunnel() {
+        use crate::config::SandboxProfile;
+        let db = Db::open_memory().unwrap();
+        db.set_worktree_sandbox_profile("/wt/pin", Some(SandboxProfile::Sealed))
+            .unwrap();
+        assert_eq!(
+            db.worktree_sandbox_profile("/wt/pin").unwrap(),
+            Some(SandboxProfile::Sealed)
+        );
+        db.set_worktree_sandbox_profile("/wt/pin", None).unwrap();
+        assert_eq!(db.worktree_sandbox_profile("/wt/pin").unwrap(), None);
+        assert!(
+            db.set_worktree_sandbox_profile("/wt/pin", Some(SandboxProfile::Open))
+                .is_err()
+        );
+        assert!(
+            db.set_worktree_sandbox_profile("/wt/pin", Some(SandboxProfile::SealedTunnel))
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn sandbox_profile_unparseable_stored_value_is_a_read_error() {
+        let db = Db::open_memory().unwrap();
+        db.conn()
+            .execute(
+                "INSERT INTO worktrees(worktree, sandbox_profile) VALUES('/wt/bad', 'unexpected')",
+                [],
+            )
+            .unwrap();
+        assert!(db.worktree_sandbox_profile("/wt/bad").is_err());
     }
 
     #[test]

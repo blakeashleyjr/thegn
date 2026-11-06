@@ -2439,6 +2439,21 @@ pub(crate) fn verify_v108_schema(conn: &Connection) -> Result<()> {
     Ok(())
 }
 
+/// v109: worktrees.sandbox_profile, an optional per-worktree profile pin.
+pub(crate) fn migrate_v109(conn: &Connection) -> Result<()> {
+    if !has_column(conn, "worktrees", "sandbox_profile") {
+        conn.execute("ALTER TABLE worktrees ADD COLUMN sandbox_profile TEXT", [])?;
+    }
+    Ok(())
+}
+
+pub(crate) fn verify_v109_schema(conn: &Connection) -> Result<()> {
+    if !has_column(conn, "worktrees", "sandbox_profile") {
+        bail!("schema v109 migration did not add worktrees.sandbox_profile");
+    }
+    Ok(())
+}
+
 /// Verify the v69 identity ledger before the schema version is stamped. A
 /// missing column/table must never look like a completed migration.
 pub(crate) fn verify_v69_schema(conn: &Connection) -> Result<()> {
@@ -4514,9 +4529,71 @@ mod tests {
             .pragma_query_value(None, "user_version", |row| row.get(0))
             .unwrap();
         assert_eq!(version, crate::db::SCHEMA_VERSION);
-        assert_eq!(version, 108);
+        assert_eq!(version, crate::db::SCHEMA_VERSION);
         super::verify_v108_schema(upgraded.conn()).unwrap();
         assert_eq!(upgraded.pr_agent_outcome("missing").unwrap(), None);
+    }
+
+    #[test]
+    fn v109_adds_worktrees_sandbox_profile_idempotently_and_verifies() {
+        let fresh = Db::open_memory().unwrap();
+        super::verify_v109_schema(fresh.conn()).unwrap();
+        let conn = Connection::open_in_memory().unwrap();
+        assert!(super::verify_v109_schema(&conn).is_err());
+        conn.execute_batch("CREATE TABLE worktrees (worktree TEXT PRIMARY KEY);")
+            .unwrap();
+        super::migrate_v109(&conn).unwrap();
+        super::migrate_v109(&conn).unwrap();
+        super::verify_v109_schema(&conn).unwrap();
+        conn.execute_batch("ALTER TABLE worktrees DROP COLUMN sandbox_profile;")
+            .unwrap();
+        assert!(super::verify_v109_schema(&conn).is_err());
+        super::migrate_v109(&conn).unwrap();
+        super::verify_v109_schema(&conn).unwrap();
+    }
+
+    #[test]
+    fn v109_upgrades_a_real_v108_database() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("v108.db");
+        {
+            let db = Db::open_at(&path).unwrap();
+            db.put_worktree("repo/wt", "/repo", "/wt", "topic", None, None)
+                .unwrap();
+            db.set_worktree_sandbox_profile("/wt", Some(crate::config::SandboxProfile::Sealed))
+                .unwrap();
+            db.conn()
+                .execute_batch(
+                    "ALTER TABLE worktrees DROP COLUMN sandbox_profile;
+                 PRAGMA user_version=108;",
+                )
+                .unwrap();
+        }
+        let upgraded = Db::open_at(&path).unwrap();
+        let version: i64 = upgraded
+            .conn()
+            .pragma_query_value(None, "user_version", |row| row.get(0))
+            .unwrap();
+        assert_eq!(version, crate::db::SCHEMA_VERSION);
+        super::verify_v109_schema(upgraded.conn()).unwrap();
+        let rows: i64 = upgraded
+            .conn()
+            .query_row(
+                "SELECT COUNT(*) FROM worktrees WHERE worktree='/wt'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(rows, 1, "v109 keeps the existing v108 worktree row");
+        let stored: Option<String> = upgraded
+            .conn()
+            .query_row(
+                "SELECT sandbox_profile FROM worktrees WHERE worktree='/wt'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(stored, None);
     }
 
     #[test]

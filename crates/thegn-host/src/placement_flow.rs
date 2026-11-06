@@ -830,7 +830,10 @@ pub(crate) fn plan(cfg: &Config, worktree: &str) -> anyhow::Result<Option<PlanOu
         &repo_root,
         &loc,
         std::path::Path::new(worktree),
-        selected.as_deref(),
+        &thegn_core::sandbox_pin::EnvSelection {
+            name: selected.clone(),
+            profile: None,
+        },
     );
     let envc = cfg.env.get(&environment.name);
     if let Some(e) = envc.filter(|e| !e.host.trim().is_empty()) {

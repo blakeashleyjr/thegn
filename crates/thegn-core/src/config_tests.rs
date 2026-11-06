@@ -2455,7 +2455,7 @@ fn default_env_reproduces_legacy_behavior() {
     let cfg = Config::default();
     let dir = tmpdir("env-default");
     let loc = GitLoc::Local(dir.clone());
-    let env = cfg.resolve_env(&dir, &loc, &dir, None);
+    let env = cfg.resolve_env(&dir, &loc, &dir, &crate::sandbox_pin::EnvSelection::none());
     assert_eq!(env.name, "default");
     assert!(env.placement.is_local());
     assert!(!env.is_remote());
@@ -2480,7 +2480,12 @@ profile = \"sealed\"
     .unwrap();
     let dir = tmpdir("env-local");
     let loc = GitLoc::Local(dir.clone());
-    let env = cfg.resolve_env(&dir, &loc, &dir, Some("local-containers"));
+    let env = cfg.resolve_env(
+        &dir,
+        &loc,
+        &dir,
+        &crate::sandbox_pin::EnvSelection::named("local-containers"),
+    );
     assert_eq!(env.name, "local-containers");
     assert!(env.placement.is_local());
     assert_eq!(env.sandbox.backend, SandboxBackend::Podman);
@@ -2543,9 +2548,24 @@ strategy = \"clean\"
     .unwrap();
     let dir = tmpdir("env-home");
     let loc = GitLoc::Local(dir.clone());
-    let big = cfg.resolve_env(&dir, &loc, &dir, Some("bigbox"));
-    let sprite = cfg.resolve_env(&dir, &loc, &dir, Some("sprite"));
-    let dflt = cfg.resolve_env(&dir, &loc, &dir, Some("nope-default"));
+    let big = cfg.resolve_env(
+        &dir,
+        &loc,
+        &dir,
+        &crate::sandbox_pin::EnvSelection::named("bigbox"),
+    );
+    let sprite = cfg.resolve_env(
+        &dir,
+        &loc,
+        &dir,
+        &crate::sandbox_pin::EnvSelection::named("sprite"),
+    );
+    let dflt = cfg.resolve_env(
+        &dir,
+        &loc,
+        &dir,
+        &crate::sandbox_pin::EnvSelection::named("nope-default"),
+    );
     assert_eq!(big.sandbox.home.strategy, ShellStrategy::HostParity);
     assert_eq!(sprite.sandbox.home.strategy, ShellStrategy::Clean);
     assert_eq!(dflt.sandbox.home.strategy, ShellStrategy::Portable);
@@ -2638,7 +2658,12 @@ pod = \"tg-dev\"
     .unwrap();
     let dir = tmpdir("env-k8s");
     let loc = GitLoc::Local(dir.clone());
-    let env = cfg.resolve_env(&dir, &loc, &dir, Some("company-k8s"));
+    let env = cfg.resolve_env(
+        &dir,
+        &loc,
+        &dir,
+        &crate::sandbox_pin::EnvSelection::named("company-k8s"),
+    );
     assert!(env.is_remote());
     assert_eq!(env.placement.label(), "k8s:dev-blake/tg-dev");
     // The kubectl exec argv carries the configured context/namespace/pod.
@@ -2666,7 +2691,12 @@ exec_command = [\"daytona\", \"ssh\", \"{id}\", \"--\"]
     .unwrap();
     let dir = tmpdir("env-prov");
     let loc = GitLoc::Local(dir.clone());
-    let env = cfg.resolve_env(&dir, &loc, &dir, Some("daytona"));
+    let env = cfg.resolve_env(
+        &dir,
+        &loc,
+        &dir,
+        &crate::sandbox_pin::EnvSelection::named("daytona"),
+    );
     assert!(env.is_remote());
     let argv = env.placement.interactive_argv(&["ls".into()]);
     assert_eq!(&argv[..4], &["daytona", "ssh", "sb-42", "--"]);
@@ -2691,7 +2721,12 @@ down_command = [\"daytona\", \"delete\", \"{id}\"]
     .unwrap();
     let dir = tmpdir("env-prov-life");
     let loc = GitLoc::Local(dir.clone());
-    let env = cfg.resolve_env(&dir, &loc, &dir, Some("daytona"));
+    let env = cfg.resolve_env(
+        &dir,
+        &loc,
+        &dir,
+        &crate::sandbox_pin::EnvSelection::named("daytona"),
+    );
     match env.placement {
         crate::placement::Placement::Provider(p) => {
             assert_eq!(p.up_command, vec!["daytona", "create", "--id", "sb-7"]);
@@ -2731,7 +2766,7 @@ backend = \"podman\"
         &dir,
         &loc,
         &dir,
-        None,
+        &crate::sandbox_pin::EnvSelection::none(),
         &crate::config_resolve::Approvals::deny_all(),
     );
     assert_eq!(env.name, "g");
@@ -2745,10 +2780,28 @@ backend = \"podman\"
     assert!(event.reason.contains("r"));
     assert!(event.reason.contains("sandbox.backend"));
     // Explicit selection beats the repo overlay.
-    assert_eq!(cfg.resolve_env(&dir, &loc, &dir, Some("x")).name, "x");
+    assert_eq!(
+        cfg.resolve_env(
+            &dir,
+            &loc,
+            &dir,
+            &crate::sandbox_pin::EnvSelection::named("x")
+        )
+        .name,
+        "x"
+    );
     // Empty/whitespace selection is ignored (falls through to the repo hint,
     // which is then rejected for the same backend change).
-    assert_eq!(cfg.resolve_env(&dir, &loc, &dir, Some("  ")).name, "g");
+    assert_eq!(
+        cfg.resolve_env(
+            &dir,
+            &loc,
+            &dir,
+            &crate::sandbox_pin::EnvSelection::named("  ")
+        )
+        .name,
+        "g"
+    );
     // best-effort: test cleanup: scratch removal must never fail the test
     let _ = std::fs::remove_dir_all(&dir);
 }
@@ -2773,7 +2826,7 @@ network = \"none\"
         repo.path(),
         &loc,
         repo.path(),
-        None,
+        &crate::sandbox_pin::EnvSelection::none(),
         &crate::config_resolve::Approvals::deny_all(),
     );
     assert_eq!(env.name, "r");
@@ -2790,7 +2843,12 @@ fn unknown_env_name_falls_back_to_local_but_is_flagged() {
     let cfg = Config::default();
     let dir = tmpdir("env-unknown");
     let loc = GitLoc::Local(dir.clone());
-    let env = cfg.resolve_env(&dir, &loc, &dir, Some("does-not-exist"));
+    let env = cfg.resolve_env(
+        &dir,
+        &loc,
+        &dir,
+        &crate::sandbox_pin::EnvSelection::named("does-not-exist"),
+    );
     assert_eq!(env.name, "does-not-exist", "requested name is preserved");
     assert!(env.placement.is_local());
     assert!(env.unresolved_selection, "the dropped selection is flagged");
@@ -2815,7 +2873,12 @@ transport = \"ssh\"
     .unwrap();
     let dir = tmpdir("env-ssh");
     let loc = GitLoc::Local(dir.clone());
-    let env = cfg.resolve_env(&dir, &loc, &dir, Some("remote-dev"));
+    let env = cfg.resolve_env(
+        &dir,
+        &loc,
+        &dir,
+        &crate::sandbox_pin::EnvSelection::named("remote-dev"),
+    );
     assert!(env.is_remote());
     assert_eq!(env.placement.label(), "ssh:u@devbox");
     // best-effort: test cleanup: scratch removal must never fail the test

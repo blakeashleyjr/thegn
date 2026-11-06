@@ -108,7 +108,10 @@ pub fn env_halt_reason(cfg: &Config, worktree: &str) -> Option<SandboxHalt> {
         &repo_root,
         &loc,
         Path::new(worktree),
-        selected_env.as_deref(),
+        &thegn_core::sandbox_pin::EnvSelection {
+            name: selected_env.clone(),
+            profile: None,
+        },
     );
     // A non-default env was SELECTED (per-worktree pin, repo `.thegn.*` overlay, or
     // `default_env`) but didn't resolve to an `[env.<name>]` table, so resolution

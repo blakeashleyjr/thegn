@@ -169,7 +169,10 @@ pub fn sprite_ssh_connect(cfg: &Config, worktree: &str) -> Option<(PathBuf, Stri
         &repo_root,
         &loc,
         Path::new(worktree),
-        selected_env.as_deref(),
+        &thegn_core::sandbox_pin::EnvSelection {
+            name: selected_env.clone(),
+            profile: None,
+        },
     );
     let thegn_core::placement::Placement::Provider(_) = &environment.placement else {
         return None;

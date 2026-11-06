@@ -23,6 +23,11 @@ const HOST_TIMEOUT: Duration = Duration::from_secs(30);
 
 #[derive(clap::Subcommand, Clone)]
 pub enum Action {
+    /// Inspect or change a worktree's sandbox isolation profile.
+    Profile {
+        #[command(subcommand)]
+        action: super::sandbox_profile::Action,
+    },
     /// Remove thegn containers whose worktree no longer exists in the registry
     /// (the startup orphan sweep, on demand). Reports what it removed per
     /// backend; exit 0 even when there is nothing to do.
@@ -56,6 +61,7 @@ pub enum Action {
 
 pub fn run(cfg: &Config, action: Action) -> Result<()> {
     match action {
+        Action::Profile { action } => super::sandbox_profile::run(cfg, action),
         Action::Gc => gc(),
         Action::Prune {
             host,
