@@ -174,6 +174,9 @@ pub struct SandboxHalt {
     /// is a fix the user can take without leaving thegn. `None` for every other
     /// halt (a missing token, an unreachable host — nothing to start).
     pub dormant: Option<thegn_core::sandbox_dormant::DormantRuntime>,
+    /// This halt is a hides-home profile refusal that failover, backend `none`,
+    /// disabled sandboxing, or an isolation-floor change cannot bypass.
+    pub sealed_home: bool,
 }
 
 /// A provider session was selected, but its trusted launch command could no
@@ -198,6 +201,18 @@ impl std::error::Error for DevcontainerLaunchRefused {}
 
 impl std::fmt::Display for SandboxHalt {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        if self.sealed_home {
+            return write!(
+                f,
+                "environment '{}' ({}) could not be brought up: {} — thegn will not \
+                 silently fall back to the host. Fix: {}, or install/start a container \
+                 runtime (`thegn doctor` shows which).",
+                self.env_name,
+                self.placement,
+                self.reason,
+                thegn_core::sandbox_floor::standard_switch_hint(None)
+            );
+        }
         let allow = if self.ask {
             "choose \"run on host\", set `backend = \"none\"`, disable sandboxing, or set `isolation_floor = \"off\"`; otherwise install/start a container runtime (`thegn doctor` shows which)"
         } else {
@@ -523,6 +538,7 @@ pub fn prepare_sandbox_env(
                 ),
                 ask,
                 dormant: None,
+                sealed_home: false,
             }
             .into());
         }
@@ -576,6 +592,7 @@ pub fn prepare_sandbox_env(
                         reason: format!("{e:#}"),
                         ask,
                         dormant: None,
+                        sealed_home: false,
                     }
                     .into());
                 }
@@ -617,6 +634,7 @@ pub fn prepare_sandbox_env(
                 reason: format!("{e:#}"),
                 ask,
                 dormant: None,
+                sealed_home: false,
             }
             .into());
         }
@@ -985,6 +1003,7 @@ pub fn prepare_sandbox_env(
             reason: m,
             ask,
             dormant: None,
+            sealed_home: true,
         }
         .into());
     }
@@ -995,6 +1014,7 @@ pub fn prepare_sandbox_env(
             reason: m,
             ask,
             dormant: None,
+            sealed_home: false,
         }
         .into());
     }
@@ -1005,6 +1025,7 @@ pub fn prepare_sandbox_env(
             reason: m.refusal(),
             ask,
             dormant: None,
+            sealed_home: false,
         }
         .into());
     }
@@ -1018,11 +1039,13 @@ pub fn prepare_sandbox_env(
             placement: placement_label.clone(),
             reason: format!(
                 "profile `{}` requires a sandbox that hides $HOME, but no backend produced one \
-                 for {worktree}; refusing to open a host shell (see `thegn doctor`)",
-                hardening.as_str()
+                 for {worktree}; refusing to open a host shell (see `thegn doctor`). {}",
+                hardening.as_str(),
+                thegn_core::sandbox_floor::standard_switch_hint(Some(worktree))
             ),
             ask,
             dormant: None,
+            sealed_home: true,
         }
         .into());
     }
@@ -1038,6 +1061,7 @@ pub fn prepare_sandbox_env(
             reason: crate::remote_sync::no_backend_reason(reachable, &warnings),
             ask,
             dormant: None,
+            sealed_home: false,
         }
         .into());
     }
@@ -1084,6 +1108,7 @@ pub fn prepare_sandbox_env(
                         },
                         ask: true,
                         dormant: Some(rt),
+                        sealed_home: false,
                     }
                     .into());
                 }
@@ -1097,6 +1122,7 @@ pub fn prepare_sandbox_env(
                     reason: format!("{} is installed but unavailable — inspect runtime health and access with `thegn doctor`", rt.name),
                     ask,
                     dormant: Some(rt),
+                    sealed_home: false,
                 }
                 .into());
             }
@@ -1132,6 +1158,7 @@ pub fn prepare_sandbox_env(
                     .to_string(),
                 ask: false,
                 dormant: None,
+                sealed_home: false,
             }
             .into());
         }

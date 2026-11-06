@@ -209,7 +209,19 @@ pub(crate) fn note_provider_degraded(
     }
 }
 
+fn sealed_halt_body(halt: &crate::agent::SandboxHalt) -> String {
+    format!(
+        "{} — a sealed profile cannot fall back to a host shell. Fix: {}",
+        halt.reason,
+        thegn_core::sandbox_floor::standard_switch_hint(None)
+    )
+}
+
 pub(crate) fn sandbox_halt_overlay(halt: &crate::agent::SandboxHalt) -> MenuOverlay {
+    if halt.sealed_home {
+        let title = format!("⚠ {} unavailable", halt.placement);
+        return menu::sandbox_halt_menu(title, sealed_halt_body(halt));
+    }
     // A runtime that is installed but stopped gets its own modal: the fix is a
     // command we can run, not an env to repair, so "retry" is the wrong verb.
     if let Some(rt) = &halt.dormant {
@@ -1812,5 +1824,114 @@ mod tests {
             rx.try_recv(),
             Err(tokio_mpsc::error::TryRecvError::Empty)
         ));
+    }
+
+    #[test]
+    fn sealed_hint_doctor_home_lines_name_the_switch() {
+        use thegn_core::sandbox_mounts::HomeView;
+
+        let not_enforced = crate::cmd::doctor::home_report_lines(
+            thegn_core::config::SandboxProfile::Sealed,
+            HomeView::Hidden,
+            false,
+        );
+        assert_eq!(not_enforced.len(), 1);
+        assert!(not_enforced[0].starts_with("NOT ENFORCED:"));
+        assert!(not_enforced[0].contains("thegn sandbox profile set standard"));
+
+        let missed = crate::cmd::doctor::home_report_lines(
+            thegn_core::config::SandboxProfile::Sealed,
+            HomeView::ReadOnly,
+            true,
+        );
+        assert_eq!(missed.len(), 1);
+        assert!(missed[0].starts_with("MISSED:"));
+        assert!(missed[0].contains("thegn sandbox profile set standard"));
+
+        assert!(
+            crate::cmd::doctor::home_report_lines(
+                thegn_core::config::SandboxProfile::Sealed,
+                HomeView::Hidden,
+                true,
+            )
+            .is_empty()
+        );
+        assert!(
+            crate::cmd::doctor::home_report_lines(
+                thegn_core::config::SandboxProfile::Hardened,
+                HomeView::ReadOnly,
+                true,
+            )
+            .is_empty()
+        );
+    }
+
+    #[test]
+    fn sealed_hint_overlay_for_sealed_halt_has_no_run_on_host_item() {
+        let halt = crate::agent::SandboxHalt {
+            env_name: "dev".into(),
+            placement: "provider:sprites".into(),
+            reason: "profile `sealed` requires a sandbox that hides $HOME".into(),
+            ask: true,
+            dormant: None,
+            sealed_home: true,
+        };
+        let overlay = sandbox_halt_overlay(&halt);
+        let labels = overlay
+            .items()
+            .iter()
+            .map(|item| item.label.as_str())
+            .collect::<Vec<_>>();
+        assert!(
+            labels.iter().any(|label| label.contains("retry")),
+            "{labels:?}"
+        );
+        assert!(
+            labels.iter().any(|label| label.contains("dismiss")),
+            "{labels:?}"
+        );
+        assert!(
+            !labels.iter().any(|label| label.contains("run on host")),
+            "{labels:?}"
+        );
+        let body = sealed_halt_body(&halt);
+        assert!(body.contains("profile `sealed` requires a sandbox that hides $HOME"));
+        assert!(
+            body.contains("thegn sandbox profile set standard"),
+            "{body}"
+        );
+    }
+
+    #[test]
+    fn sealed_hint_sealed_halt_offers_no_host_remedy() {
+        let sealed = crate::agent::SandboxHalt {
+            env_name: "dev".into(),
+            placement: "provider:sprites".into(),
+            reason: "profile `sealed` requires a sandbox that hides $HOME".into(),
+            ask: true,
+            dormant: None,
+            sealed_home: true,
+        };
+        let message = sealed.to_string();
+        assert!(
+            message.contains("thegn sandbox profile set standard"),
+            "{message}"
+        );
+        for forbidden in ["backend = \"none\"", "isolation_floor", "run on host"] {
+            assert!(!message.contains(forbidden), "{message}");
+        }
+
+        let ordinary = crate::agent::SandboxHalt {
+            env_name: "dev".into(),
+            placement: "provider:sprites".into(),
+            reason: "token missing".into(),
+            ask: true,
+            dormant: None,
+            sealed_home: false,
+        };
+        assert_eq!(
+            ordinary.to_string(),
+            "environment 'dev' (provider:sprites) could not be brought up: token missing — thegn will not silently fall back to the host. Fix the env, retry, choose \"run on host\", set `backend = \"none\"`, disable sandboxing, or set `isolation_floor = \"off\"`; otherwise install/start a container runtime (`thegn doctor` shows which) ([sandbox] or [env.dev]) to allow it."
+        );
     }
 }

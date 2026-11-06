@@ -343,8 +343,10 @@ pub(crate) fn terminal_launch_spec(
         if cfg.sandbox.profile.hides_home() {
             anyhow::bail!(
                 "profile `{}` requires a sandbox that hides $HOME, but the launch degraded to \
-                 the host; refusing",
-                cfg.sandbox.profile.as_str()
+                 the host; refusing. {} (standalone terminal tabs follow the global [sandbox] \
+                 profile: set `profile = \"standard\"` in your config)",
+                cfg.sandbox.profile.as_str(),
+                thegn_core::sandbox_floor::standard_switch_hint(None)
             );
         }
         if let Some(w) = truth.warning.as_deref() {
@@ -483,12 +485,14 @@ fn sandbox_wrap_shell(
     // requested backend is unavailable; neither may produce a host fallback.
     thegn_core::sandbox::admit_volume_sources(cfg.sandbox.volumes.keys().map(String::as_str))?;
     // THE-215: a sealed profile never degrades to a host shell. Every
-    // "no sandbox" outcome below becomes a visible refusal instead.
+    // "no sandbox" outcome below becomes a visible refusal instead. The per-worktree
+    // profile verb does not affect these standalone terminal tabs; they use global config.
     let sealed = cfg.sandbox.profile.hides_home();
     let refuse = |why: &str| -> anyhow::Result<Option<WrappedShell>> {
         anyhow::bail!(
-            "profile `{}` requires a sandbox that hides $HOME, but {why}; refusing a host shell",
-            cfg.sandbox.profile.as_str()
+            "profile `{}` requires a sandbox that hides $HOME, but {why}; refusing a host shell. {} (standalone terminal tabs follow the global [sandbox] profile: set `profile = \"standard\"` in your config)",
+            cfg.sandbox.profile.as_str(),
+            thegn_core::sandbox_floor::standard_switch_hint(None)
         )
     };
     let Ok(be) = thegn_core::config::SandboxBackend::from_str_validated(backend) else {
@@ -1605,6 +1609,30 @@ mod tests {
     use super::*;
     use crate::layout;
     use crate::session::{GroupKind, Session, WorktreeGroup};
+
+    #[test]
+    fn sealed_hint_terminal_refusals_name_standard() {
+        let cfg = thegn_core::config::Config {
+            sandbox: thegn_core::config::SandboxConfig {
+                profile: thegn_core::config::SandboxProfile::Sealed,
+                ..thegn_core::config::SandboxConfig::default()
+            },
+            ..thegn_core::config::Config::default()
+        };
+        let error = match sandbox_wrap_shell(&cfg, "unknown-backend", &["sh".into()]) {
+            Err(error) => error,
+            Ok(_) => panic!("unknown backend cannot create a sealed terminal shell"),
+        };
+        let message = format!("{error:#}");
+        assert!(
+            message.contains("thegn sandbox profile set standard"),
+            "{message}"
+        );
+        assert!(
+            message.contains("standalone terminal tabs follow the global [sandbox] profile"),
+            "{message}"
+        );
+    }
 
     #[test]
     fn account_read_refusal_opens_plain_shell_instead_of_provider_fallback() {

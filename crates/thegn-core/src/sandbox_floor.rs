@@ -354,6 +354,17 @@ pub fn provider_explicit_request(sb: &SandboxConfig) -> Option<ExplicitIsolation
 /// Stable label for provider placement whose isolation is outside thegn's control.
 pub const PROVIDER_UNVERIFIED: &str = "provider-managed (unverified)";
 
+/// A user-facing route back to the default `standard` sandbox profile.
+pub fn standard_switch_hint(worktree: Option<&str>) -> String {
+    let target = match worktree {
+        Some(path) => format!(" --worktree `{path}`"),
+        None => String::new(),
+    };
+    format!(
+        "To run this worktree with the `standard` profile instead (network and your credentials available): `thegn sandbox profile set standard{target}`, or the palette action Isolation profile; for every worktree set `profile = \"standard\"` under [sandbox] in your own config."
+    )
+}
+
 /// Typed refusal for an explicit isolation promise on an unattested provider.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProviderRefusal {
@@ -364,11 +375,21 @@ pub struct ProviderRefusal {
 impl std::fmt::Display for ProviderRefusal {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let request = self.request.describe();
-        write!(
-            formatter,
-            "env `{}` runs on a {} placement: thegn cannot enforce {} there, so the launch is refused before any provisioning, credential or upload; use a local sandbox env for this worktree, or remove {} from this env",
-            self.env, PROVIDER_UNVERIFIED, request, request
-        )
+        if matches!(self.request, ExplicitIsolation::SealedProfile(_)) {
+            write!(
+                formatter,
+                "env `{}` runs on a {} placement: profile `sealed` is a local-sandbox feature; this is a remote placement, so thegn cannot enforce hiding $HOME or removing the network there. The launch is refused before any provisioning, credential or upload. {} Or use a local sandbox env for this worktree.",
+                self.env,
+                PROVIDER_UNVERIFIED,
+                standard_switch_hint(None)
+            )
+        } else {
+            write!(
+                formatter,
+                "env `{}` runs on a {} placement: thegn cannot enforce {} there, so the launch is refused before any provisioning, credential or upload; use a local sandbox env for this worktree, or remove {} from this env",
+                self.env, PROVIDER_UNVERIFIED, request, request
+            )
+        }
     }
 }
 
@@ -403,11 +424,11 @@ pub fn home_gate(spec: &crate::sandbox::SandboxSpec) -> Option<String> {
     // refuse rather than silently disable sealing.
     let home_path = std::path::Path::new(home);
     if home.is_empty() || !home_path.is_absolute() || home_path.canonicalize().is_err() {
-        return Some(
+        return Some(format!(
             "sealed profile requires a resolvable absolute $HOME to hide, but $HOME is \
-             unset, empty, relative or does not exist"
-                .to_string(),
-        );
+                 unset, empty, relative or does not exist. {}",
+            standard_switch_hint(None)
+        ));
     }
     // systemd takes mounts as `BindPaths=host:dest` property strings with no
     // quoting: a path containing whitespace or `:` would be parsed as extra
@@ -421,8 +442,9 @@ pub fn home_gate(spec: &crate::sandbox::SandboxSpec) -> Option<String> {
         {
             return Some(format!(
                 "sealed systemd launch refused: mount `{}` contains whitespace, a quote, a \
-                 backslash or ':' which systemd BindPaths cannot express safely",
-                m.dest
+                 backslash or ':' which systemd BindPaths cannot express safely. {}",
+                m.dest,
+                standard_switch_hint(None)
             ));
         }
     }
@@ -435,8 +457,9 @@ pub fn home_gate(spec: &crate::sandbox::SandboxSpec) -> Option<String> {
     {
         return Some(format!(
             "sealed profile refused: mount `{}` contains protected $HOME paths (credentials, \
-             keys, thegn state); mount something narrower or use a non-sealed profile",
-            m.host
+             keys, thegn state); mount something narrower or use a non-sealed profile. {}",
+            m.host,
+            standard_switch_hint(None)
         ));
     }
     let view = home_view(spec, home_path);
@@ -444,9 +467,10 @@ pub fn home_gate(spec: &crate::sandbox::SandboxSpec) -> Option<String> {
         format!(
             "sealed profile requires a hidden $HOME, but the `{}` launch would leave it {} — \
              use a bwrap/systemd/OCI backend, `file_access = \"worktree\"`, and no `[sandbox] \
-             mounts` entry covering $HOME (see `thegn doctor`)",
+             mounts` entry covering $HOME (see `thegn doctor`). {}",
             spec.backend.label(),
             view.as_str(),
+            standard_switch_hint(None),
         )
     })
 }
@@ -479,9 +503,10 @@ pub fn strict_gate(spec: &crate::sandbox::SandboxSpec) -> Option<String> {
     }
     (!unsupported.is_empty()).then(|| {
         format!(
-            "sealed profiles are strict: the `{}` backend cannot enforce {} — use a backend that can (bwrap or an OCI runtime), or a non-sealed profile",
+            "sealed profiles are strict: the `{}` backend cannot enforce {} — use a backend that can (bwrap or an OCI runtime), or a non-sealed profile. {}",
             spec.backend.label(),
-            unsupported.join(", ")
+            unsupported.join(", "),
+            standard_switch_hint(None)
         )
     })
 }
@@ -1327,5 +1352,132 @@ mod tests {
     #[test]
     fn provider_default_config_is_not_refused() {
         assert_eq!(provider_refusal(true, &SandboxConfig::default(), "e"), None);
+    }
+
+    #[test]
+    fn sealed_hint_home_gate_messages_name_standard() {
+        let temp = tempfile::tempdir().expect("temporary HOME");
+        let missing_home = temp.path().join("missing-home");
+        let mut invalid_home = strict_spec(Backend::None, FileAccess::Worktree);
+        invalid_home.seal_home = Some(missing_home.display().to_string());
+        let invalid = home_gate(&invalid_home).expect("invalid HOME refuses");
+        assert!(
+            invalid.contains("thegn sandbox profile set standard"),
+            "{invalid}"
+        );
+
+        let home = temp.path().to_string_lossy().into_owned();
+
+        let mut mount = strict_spec(Backend::Bwrap, FileAccess::Worktree);
+        mount.seal_home = Some(home.clone());
+        mount.mounts[0].host = home.clone();
+        mount.mounts[0].dest = home.clone();
+        let mounted = home_gate(&mount).expect("protected HOME mount refuses");
+        assert!(
+            mounted.contains("thegn sandbox profile set standard"),
+            "{mounted}"
+        );
+
+        let mut unsafe_systemd_mount = strict_spec(Backend::Systemd, FileAccess::Worktree);
+        unsafe_systemd_mount.seal_home = Some(home.clone());
+        unsafe_systemd_mount.mounts[0].host = format!("{home}/unsafe path");
+        unsafe_systemd_mount.mounts[0].dest = home.clone();
+        let unsafe_mount =
+            home_gate(&unsafe_systemd_mount).expect("unsafe systemd mount under HOME refuses");
+        assert!(
+            unsafe_mount.contains("thegn sandbox profile set standard"),
+            "{unsafe_mount}"
+        );
+
+        let mut visible = strict_spec(Backend::None, FileAccess::Worktree);
+        visible.seal_home = Some(home);
+        let visible = home_gate(&visible).expect("host backend leaves HOME visible");
+        assert!(
+            visible.contains("thegn sandbox profile set standard"),
+            "{visible}"
+        );
+
+        let mut strict = strict_spec(Backend::Systemd, FileAccess::Worktree);
+        strict.seal_home = Some(temp.path().to_string_lossy().into_owned());
+        let strict = strict_gate(&strict).expect("systemd strict gate refuses");
+        assert!(
+            strict.contains("thegn sandbox profile set standard"),
+            "{strict}"
+        );
+    }
+
+    #[test]
+    fn sealed_hint_refusal_classes_name_the_switch() {
+        let targeted = standard_switch_hint(Some("/work/tree"));
+        assert!(
+            targeted.contains("thegn sandbox profile set standard --worktree `/work/tree`"),
+            "{targeted}"
+        );
+        assert!(standard_switch_hint(None).contains("thegn sandbox profile set standard"));
+
+        for class in [
+            crate::sandbox::RefusalClass::SealedHome,
+            crate::sandbox::RefusalClass::StrictUnsupported,
+        ] {
+            assert!(
+                class
+                    .remediation()
+                    .contains("thegn sandbox profile set standard"),
+                "{}",
+                class.remediation()
+            );
+        }
+    }
+
+    #[test]
+    fn sealed_hint_provider_refusal_for_sealed_names_the_switch() {
+        let sealed = SandboxConfig {
+            profile: SandboxProfile::Sealed,
+            ..SandboxConfig::default()
+        };
+        let message = provider_refusal(true, &sealed, "e")
+            .expect("sealed provider request refuses")
+            .to_string();
+        assert!(
+            message.contains("thegn sandbox profile set standard"),
+            "{message}"
+        );
+        assert!(message.contains("remote placement"), "{message}");
+        assert!(!message.contains("remove profile"), "{message}");
+    }
+
+    #[test]
+    fn sealed_hint_provider_refusal_other_requests_unchanged() {
+        let network_none = SandboxConfig {
+            network: Network::None,
+            ..SandboxConfig::default()
+        };
+        let network_message = provider_refusal(true, &network_none, "e")
+            .expect("network none refuses")
+            .to_string();
+        assert_eq!(
+            network_message,
+            format!(
+                "env `e` runs on a provider-managed (unverified) placement: thegn cannot enforce {} there, so the launch is refused before any provisioning, credential or upload; use a local sandbox env for this worktree, or remove {} from this env",
+                ExplicitIsolation::NetworkNone.describe(),
+                ExplicitIsolation::NetworkNone.describe()
+            )
+        );
+
+        let floor = SandboxConfig {
+            isolation_floor: Some(IsolationFloor::SharedKernel),
+            on_floor_miss: OnFloorMiss::Fail,
+            ..SandboxConfig::default()
+        };
+        let floor_message = provider_refusal(true, &floor, "e")
+            .expect("fail-closed floor refuses")
+            .to_string();
+        let request = ExplicitIsolation::FailClosedFloor(IsolationFloor::SharedKernel).describe();
+        assert_eq!(
+            floor_message,
+            format!(
+                "env `e` runs on a provider-managed (unverified) placement: thegn cannot enforce {request} there, so the launch is refused before any provisioning, credential or upload; use a local sandbox env for this worktree, or remove {request} from this env"
+            )
+        );
     }
 }

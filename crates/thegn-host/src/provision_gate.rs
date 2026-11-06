@@ -336,6 +336,7 @@ pub(crate) fn guard_unprovisioned_attach(
         reason: "sandbox is still provisioning — retry once setup finishes".into(),
         ask: false,
         dormant: None,
+        sealed_home: false,
     }
     .into())
 }
@@ -367,6 +368,7 @@ fn attach_selection(
             ),
             ask: false,
             dormant: None,
+            sealed_home: false,
         }),
     }
 }
