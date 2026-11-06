@@ -362,24 +362,20 @@ part of the shipped `thegn` binary.
   reason in the file. This includes unnamed production threads and tests
   writing HOME/XDG state directly (use `testenv::IsolatedState`).
   `just ratchet-update` regenerates after a burn-down.)
-- **Remote CI is TEMPORARILY OFF — the pre-push hook is the only gate.**
-  `.github/workflows/ci.yml` is dispatch-only (its `push`/`pull_request`
-  triggers are commented out, with the reasoning above the `on:` key) because a
-  push to main cost ~101 billable minutes and a PR cost that again before its
-  merge. So `cargo test` + `clippy` + `smoke` on pre-push is what protects main
-  right now — do not disable it, and do not assume a green push means coverage,
-  cross-compilation, docs, deps-audit, nix-build, sandbox-e2e or openspec were
-  checked. Run the suite on demand with `gh workflow run ci.yml --ref <branch>`
-  (add `-f extras=true` for the macos/windows/e2e opt-ins). The macOS job is on
-  the same `extras` gate as those two, not disabled outright — the OOM that
-  hard-disabled it (pnpm building `openspec`, a tool that job never invokes) is
-  fixed by `devShells.ci` plus the memory caps in `nix/openspec.nix`. It is
-  still opt-in at 10x cost, and **has never completed a run**; even green it
-  only proves `just build && just test`. Make it unconditional only once darwin
-  is supported rather than best-effort. The other cheap wins still stand —
-  self-hosted runners (note the fork-PR security caveat documented in the
-  workflow), lean dev shells for the cheap jobs, and tiering
-  coverage/nix-build/check-cross off every PR.
+- **Remote CI is LEAN on pull requests; the heavy gates are dispatch/nightly.**
+  `.github/workflows/ci.yml` runs `fmt`, `lint` (clippy), `test` (nextest) and
+  `smoke` on `pull_request` to `main`; the remaining jobs run on the nightly
+  schedule and with `gh workflow run ci.yml --ref <branch>`. Add
+  `-f extras=true` to opt into macOS, Windows, e2e and windows-artifact-smoke.
+  The pre-push hook (`cargo test` + `clippy` + `smoke`) remains the gate before
+  code leaves the machine and must stay enabled. A push to `main` does not run
+  CI; the nightly schedule covers it. The original spend reasoning (~101
+  billable minutes per push, ~55 fixed overhead) is why the PR set is lean.
+  Pull request CI runs the lean jobs (fmt, clippy, nextest, smoke); the heavy
+  jobs stay dispatch/nightly (see the ci.yml header).
+  The macOS job remains opt-in at 10x cost and has never completed a run. The
+  other cheap wins still stand: self-hosted runners with the fork-PR caveat in
+  the workflow, lean dev shells, and tiering.
 - **e2e (`just e2e`) is a local gate; in CI it is temporarily opt-in.** The CI
   job kept hitting its 30-minute timeout, and the committed baselines are stale
   (last recorded in `0f9c5a9a`; `1726a8e1` changed the UI without re-recording,
