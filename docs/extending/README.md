@@ -20,3 +20,7 @@ answer. Architecture context: [`../ARCHITECTURE.md`](../ARCHITECTURE.md).
 | a host capability (API / MCP / plugin verb)            | [capability.md](capability.md)               |
 | a coding-agent harness (Claude Code / Codex / …)       | [harness.md](harness.md)                     |
 | an IDE integration (the inbound boundary)              | [ide-integration.md](ide-integration.md)     |
+
+New to plugins? Start with [plugin-hello-world.md](plugin-hello-world.md), a
+step-by-step first plugin, then [plugin.md](plugin.md) and
+[plugin-apps.md](plugin-apps.md).
