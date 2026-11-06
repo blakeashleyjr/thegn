@@ -755,6 +755,55 @@ impl GithubNative {
     }
 }
 
+fn status_class(code: u16, rate_limited: bool) -> &'static str {
+    match code {
+        401 => "unauthorized",
+        429 => "rate_limited",
+        403 if rate_limited => "rate_limited",
+        403 => "forbidden",
+        500..=599 => "server",
+        _ => "http",
+    }
+}
+
+fn bounded_message(raw: Option<&str>) -> String {
+    let Some(raw) = raw else {
+        return String::new();
+    };
+    let redacted = thegn_core::log_redact::redact_text_line(raw);
+    let flattened: String = redacted
+        .chars()
+        .map(|character| {
+            if character.is_control() {
+                ' '
+            } else {
+                character
+            }
+        })
+        .collect();
+    let mut chars = flattened.chars();
+    let message: String = chars.by_ref().take(200).collect();
+    if chars.next().is_some() {
+        format!("{message}...")
+    } else {
+        message
+    }
+}
+
+fn request_repo(body: &Value) -> String {
+    let variables = body.get("variables");
+    let owner = variables
+        .and_then(|variables| variables.get("owner"))
+        .and_then(Value::as_str);
+    let repo = variables
+        .and_then(|variables| variables.get("repo").or_else(|| variables.get("name")))
+        .and_then(Value::as_str);
+    match (owner, repo) {
+        (Some(owner), Some(repo)) => format!("{owner}/{repo}").chars().take(100).collect(),
+        _ => "-".to_string(),
+    }
+}
+
 async fn graphql_request(
     client: &TrackerHttpClient,
     body: &Value,
@@ -831,6 +880,8 @@ async fn graphql_request(
             }
         }
         tracing::warn!(target: "thegn::forge", op = what, error = %error,
+            status = code, class = status_class(code, rate_limited), repo = %request_repo(body),
+            message = %bounded_message(body_message.as_deref()),
             "GitHub API returned an error status");
         return Err(error);
     }
@@ -1531,3 +1582,7 @@ mod regression_tests;
 #[cfg(test)]
 #[path = "native_global_connectivity_tests.rs"]
 mod global_connectivity_tests;
+
+#[cfg(test)]
+#[path = "native_status_tests.rs"]
+mod status_tests;
