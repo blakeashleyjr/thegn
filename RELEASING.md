@@ -258,7 +258,7 @@ See [CHANGELOG.md](CHANGELOG.md).
 ## Public-alpha release rehearsal checklist
 
 - [ ] Version bumped and `CHANGELOG.md` has a dated release heading.
-- [ ] `just third-party-notices` regenerated the notices and `just test-third-party-notices` is green.
+- [ ] `just third-party-notices` regenerated the notices, `just third-party-notices-check` reports them up to date, and `just test-third-party-notices` is green.
 - [ ] `just nix-build-full`, `just release-artifacts v<version>`, and `just release-verify v<version>` are green.
 - [ ] The `release` workflow run is green end to end, including `verify-manifest`.
 - [ ] The draft has the exact asset set, including `SHA256SUMS` and `thegn-<tag>-THIRD_PARTY_NOTICES.md`.
@@ -293,7 +293,9 @@ automatic consequence of producing another archive.
 
 - **Release tarball** — the supported Linux x86_64 install path. Download the
   linux-gnu or linux-musl archive and its `.sha256` sidecar from the release
-  page, or use `SHA256SUMS` as a one-file alternative, verify the checksum and
+  page, or use `SHA256SUMS` as a one-file alternative (with
+  `sha256sum -c --ignore-missing SHA256SUMS` when you downloaded only some of
+  the files), verify the checksum and
   build-provenance attestation, then extract
   `thegn` onto `PATH`. The aarch64-apple-darwin archive is best-effort; on macOS
   see the Gatekeeper note below. Runtime requires `git`; `gh` and `ssh` are used
