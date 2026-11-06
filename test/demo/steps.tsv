@@ -1,0 +1,51 @@
+# kind<TAB>arg<TAB>note (wait note is timeout milliseconds)
+wait	NORMAL	20000
+wait	working tree clean	20000
+pause	1500	-
+snap	01-start	-
+key	alt+w	-
+pause	1500	-
+snap	02-new-worktree-picker	-
+manual	Choose the plain shell entry in the picker (Enter on the first row is fine) and name the worktree 'demo-feature' if asked	-
+pause	2000	-
+snap	03-worktree-tab	-
+key	ctrl+space	-
+pause	1000	-
+key	s	-
+pause	120	-
+key	p	-
+pause	120	-
+key	l	-
+pause	120	-
+key	i	-
+pause	120	-
+key	t	-
+pause	120	-
+snap	04-palette	-
+key	escape	-
+pause	600	-
+key	alt+p	-
+pause	1200	-
+key	alt+n	-
+pause	1200	-
+snap	05-splits	-
+text	echo split panes are real terminals	-
+pause	1500	-
+key	alt+x	-
+pause	1200	-
+snap	06-alt-x-closes-one-pane	-
+key	alt+x	-
+pause	1200	-
+manual	Narrate: lowercase Alt-x only closes; capital Alt-X (next step) removes the worktree and keeps the branch	-
+key	alt+shift+x	-
+pause	2000	-
+snap	07-alt-shift-x-removes-worktree	-
+manual	If a confirmation prompt appears, accept it; the branch 'demo-feature' remains (git branch --list in the fixture repo)	-
+text	echo before detach	-
+pause	800	-
+detach	-	-
+pause	1500	-
+reattach	-	-
+wait	before detach	20000
+snap	08-reattached	-
+cleanup	-	-

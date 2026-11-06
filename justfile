@@ -1145,6 +1145,15 @@ term-check: build
 _apply-backend backend="":
     if [ -n "{{backend}}" ]; then python3 -B "{{justfile_directory()}}/scripts/apply_backend.py" "{{backend}}"; fi
 
+# Opt-in: run the scripted demo (needs muse, git and a built release binary; see test/demo/README.md).
+demo-script *args:
+    bash test/demo/demo.sh {{args}}
+
+# Hermetic: validate the demo steps file and driver WITHOUT launching thegn or muse.
+demo-script-check:
+    python3 -B test/demo/check_demo.py --selftest
+    python3 -B test/demo/check_demo.py
+
 # Dogfood the local merge queue (the fold-actor): same isolated state root as
 # `start`, but with `[merge_queue]` switched on via --set overrides (no daily
 # config edit needed). Folds eligible worktree branches into the target branch
