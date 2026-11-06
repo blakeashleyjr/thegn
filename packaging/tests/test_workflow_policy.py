@@ -1594,6 +1594,120 @@ class WorkflowPolicyTests(unittest.TestCase):
             with self.subTest(command=command):
                 self.assertIn(command, verify)
 
+    def test_package_writes_sha256sums_and_notices_before_upload(self) -> None:
+        steps = read_workflow("release.yml")["jobs"]["package"]["steps"]
+        names = [step.get("name") for step in steps]
+        name = "Write aggregate SHA256SUMS and the third-party notices asset"
+        self.assertIn(name, names)
+        self.assertGreater(names.index(name), names.index("Stage rendered metadata"))
+        self.assertLess(names.index(name), names.index("Upload packages and rendered metadata"))
+        script = steps[names.index(name)]["run"]
+        for content in ("SHA256SUMS", "THIRD_PARTY_NOTICES.md", "LC_ALL=C sort"):
+            with self.subTest(content=content):
+                self.assertIn(content, script)
+        self.assertNotIn("${{", script)
+
+    def test_sha256sums_step_rehearsal(self) -> None:
+        if shutil.which("bash") is None or shutil.which("sha256sum") is None:
+            self.skipTest("bash and sha256sum are required for the SHA256SUMS rehearsal")
+        steps = read_workflow("release.yml")["jobs"]["package"]["steps"]
+        step = next(
+            candidate
+            for candidate in steps
+            if candidate.get("name")
+            == "Write aggregate SHA256SUMS and the third-party notices asset"
+        )
+        script = step["run"]
+        tag = "v1.2.3"
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            package_root = root / "package"
+            assets = package_root / "assets"
+            release_assets = package_root / "release-assets"
+            assets.mkdir(parents=True)
+            release_assets.mkdir(parents=True)
+            cwd = root / "cwd"
+            cwd.mkdir()
+            (cwd / "THIRD_PARTY_NOTICES.md").write_bytes(b"notices fixture\n")
+            filenames = [
+                f"thegn-{tag}-x86_64-unknown-linux-gnu.tar.gz",
+                f"thegn-{tag}-x86_64-unknown-linux-musl.tar.gz",
+                f"thegn-{tag}-aarch64-apple-darwin.tar.gz",
+                f"thegn-{tag}-completions.tar.gz",
+                "thegn_1.2.3_amd64.deb",
+                "thegn-1.2.3-1.x86_64.rpm",
+            ]
+            for filename in filenames[:4]:
+                (assets / filename).write_bytes(f"fixture:{filename}".encode())
+            for filename in filenames[4:]:
+                (release_assets / filename).write_bytes(f"fixture:{filename}".encode())
+            env = os.environ.copy()
+            env.update({"PACKAGE_ROOT": str(package_root), "TAG": tag})
+            result = subprocess.run(
+                ["bash", "-c", script],
+                cwd=cwd,
+                env=env,
+                check=False,
+                capture_output=True,
+                text=True,
+            )
+            self.assertEqual(0, result.returncode, result.stderr)
+            sums_path = release_assets / "SHA256SUMS"
+            self.assertTrue(sums_path.is_file())
+            lines = sums_path.read_text(encoding="utf-8").splitlines()
+            names = [line.split("  ", 1)[1] for line in lines]
+            self.assertEqual(sorted(names), names)
+            self.assertEqual(7, len(lines))
+            for line in lines:
+                self.assertRegex(line, r"^[0-9a-f]{64}  [^/ ]+$")
+            notices_name = f"thegn-{tag}-THIRD_PARTY_NOTICES.md"
+            self.assertTrue((release_assets / notices_name).is_file())
+            for line in lines:
+                digest, filename = line.split("  ", 1)
+                if filename.endswith(".tar.gz"):
+                    content = (assets / filename).read_bytes()
+                else:
+                    content = (release_assets / filename).read_bytes()
+                self.assertEqual(hashlib.sha256(content).hexdigest(), digest)
+            download_dir = root / "download"
+            download_dir.mkdir()
+            for filename in names:
+                source = assets / filename if filename.endswith(".tar.gz") else release_assets / filename
+                shutil.copy2(source, download_dir / filename)
+            shutil.copy2(sums_path, download_dir / "SHA256SUMS")
+            check = subprocess.run(
+                ["sha256sum", "-c", "SHA256SUMS"],
+                cwd=download_dir,
+                check=False,
+                capture_output=True,
+                text=True,
+            )
+            self.assertEqual(0, check.returncode, check.stderr)
+
+            (cwd / "THIRD_PARTY_NOTICES.md").unlink()
+            missing = subprocess.run(
+                ["bash", "-c", script],
+                cwd=cwd,
+                env=env,
+                check=False,
+                capture_output=True,
+                text=True,
+            )
+            self.assertNotEqual(0, missing.returncode)
+            self.assertIn("THIRD_PARTY_NOTICES.md is missing", missing.stdout + missing.stderr)
+
+    def test_release_workflow_leaves_the_archive_include_list_alone(self) -> None:
+        steps = read_workflow("release.yml")["jobs"]["build"]["steps"]
+        upload = next(
+            step
+            for step in steps
+            if step.get("uses", "").startswith("taiki-e/upload-rust-binary-action@")
+        )
+        self.assertEqual(
+            "LICENSE-MIT,LICENSE-APACHE,README.md",
+            upload.get("with", {}).get("include"),
+        )
+
     def test_verify_manifest_provenance_rehearsal(self) -> None:
         if shutil.which("bash") is None:
             self.skipTest("bash is required for the verify-manifest provenance rehearsal")
