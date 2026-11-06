@@ -623,6 +623,7 @@ fn dispatch_set_status_with_proof(
         && row.status != thegn_core::issue::AgentDispatchStatus::Done
         && thegn_core::db::set_status_transition_allowed(row.status, status)
     {
+        db.check_dispatch_lead(id, proof)?;
         crate::cmd::dispatch::done_gate_bound(db, &row)?;
     }
     db.set_dispatch_status_led(id, row.status, status, None, proof)
@@ -6207,6 +6208,54 @@ mod tests {
         ));
     }
 
+    #[tokio::test]
+    async fn dispatch_set_status_done_checks_the_lease_before_the_gate() {
+        use thegn_core::db::LeadProof;
+        use thegn_core::issue::{AgentDispatchStatus as St, NewDispatch};
+        use thegn_core::store::NotificationStore;
+
+        let (svc, _rx) = service(0);
+        let row_id = svc
+            .with_db(|db| {
+                db.acquire_pipeline_lease("repo:linear:A-1", "lead-a", 300)?
+                    .map_err(anyhow::Error::msg)?;
+                let row_id = db
+                    .claim_dispatch_admitted_led(
+                        NewDispatch::new("linear:A-1", "/wt/a", "coder"),
+                        20,
+                        None,
+                        None,
+                        None,
+                        LeadProof::Lease {
+                            name: "repo:linear:A-1",
+                            owner: "lead-a",
+                        },
+                    )?
+                    .map_err(|decision| {
+                        anyhow::anyhow!("unexpected admission refusal: {decision:?}")
+                    })?;
+                db.update_dispatch_status(row_id, St::Spawning)?;
+                Ok(row_id)
+            })
+            .await
+            .unwrap();
+
+        assert!(matches!(
+            svc.dispatch_set_status(row_id, St::Done).await,
+            Err(ControlError::FailedPrecondition(message))
+                if !message.starts_with("missing_evidence")
+        ));
+        let stored = svc
+            .dispatches_list(None, Db::ROSTER_HISTORY_LIMIT)
+            .await
+            .unwrap()
+            .dispatches
+            .into_iter()
+            .find(|dispatch| dispatch.id == row_id)
+            .unwrap();
+        assert_eq!(stored.status, St::Spawning);
+    }
+
     async fn leased_issue(svc: &DaemonService) -> thegn_svc::control::DispatchLeadReq {
         let generation = svc
             .with_db(|db| {
@@ -6788,7 +6837,7 @@ mod tests {
             })
             .await
             .unwrap();
-        svc.with_db(|db| {
+        svc.with_db(move |db| {
             use thegn_core::store::NotificationStore;
             db.update_dispatch_status(row.id, St::Spawning)
         })
@@ -6830,7 +6879,7 @@ mod tests {
             })
             .await
             .unwrap();
-        svc.with_db(|db| {
+        svc.with_db(move |db| {
             use thegn_core::store::NotificationStore;
             assert!(db.bind_dispatch_session(row.id, "sess-x")?);
             db.update_dispatch_status(row.id, St::Running)
