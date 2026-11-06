@@ -97,8 +97,8 @@ page.
 causes include no backend meeting the default isolation floor, `bwrap` or
 `systemd-run` missing from thegn's own `PATH`, a configured VPN with
 `sealed-tunnel`, or a `sealed` launch that cannot hide `$HOME`. The default
-`sealed` profile hides `$HOME`; the opt-in `standard` profile protects
-integrity, not credentials, so `$HOME` stays readable.
+`standard` profile protects integrity, not credentials: `$HOME` stays
+readable. The opt-in `sealed` profile hides it.
 
 **Do this:** Inspect `thegn doctor` and the refusal remediation. On NixOS, the
 sandboxing page recommends pinning `backend = "bwrap"`. See [[sandboxing]].
@@ -107,8 +107,8 @@ sandboxing page recommends pinning `backend = "bwrap"`. See [[sandboxing]].
 
 **Why:** A branch that moved after verification is refused.
 
-**Do this:** Run `thegn merge add` to re-enqueue it so the queue verifies the
-new commits. See [[merge-queue]].
+**Do this:** Re-enqueue the branch with `thegn merge add` so the queue verifies
+the new commits. See [[merge-queue]].
 
 ## thegn is slow or the fans spin
 
