@@ -513,7 +513,12 @@ fn resolve_provider_env(
         None => thegn_core::repo::main_worktree(Path::new(worktree))
             .unwrap_or_else(|| PathBuf::from(worktree)),
     };
-    let env = cfg.resolve_env(&repo_root, &loc, Path::new(worktree), Some(env_name));
+    let env = cfg.resolve_env(
+        &repo_root,
+        &loc,
+        Path::new(worktree),
+        &thegn_core::sandbox_pin::EnvSelection::named(env_name),
+    );
     if !matches!(
         &env.placement,
         thegn_core::placement::Placement::Provider(_)

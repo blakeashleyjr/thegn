@@ -319,7 +319,11 @@ pub fn prepare_sandbox_env(
     use crate::handlers::repo_trust::resolve_env_trusted;
     let generation =
         crate::config_startup::display().map_or(0, |admitted| admitted.revision().generation);
-    let trusted = resolve_env_trusted(cfg, repo_root, loc, worktree, selected_env);
+    let selection = selected_env.map_or_else(
+        thegn_core::sandbox_pin::EnvSelection::none,
+        thegn_core::sandbox_pin::EnvSelection::named,
+    );
+    let trusted = resolve_env_trusted(cfg, repo_root, loc, worktree, &selection)?;
     let environment = trusted.environment;
     let devcontainer = trusted.devcontainer;
     let mut placement = environment.placement.clone();
@@ -1738,7 +1742,10 @@ pub fn provider_proxy_target(
         &repo_root,
         &loc,
         Path::new(worktree),
-        selected_env.as_deref(),
+        &thegn_core::sandbox_pin::EnvSelection {
+            name: selected_env.clone(),
+            profile: None,
+        },
     );
     let thegn_core::placement::Placement::Provider(p) = &environment.placement else {
         return None;
@@ -1954,7 +1961,10 @@ fn native_exec_for(cfg: &Config, worktree: &str, agent_cmd: Option<String>) -> P
         &repo_root,
         &loc,
         Path::new(worktree),
-        selected_env.as_deref(),
+        &thegn_core::sandbox_pin::EnvSelection {
+            name: selected_env.clone(),
+            profile: None,
+        },
     );
     let thegn_core::placement::Placement::Provider(p) = &environment.placement else {
         return PaneNativeExec::Unavailable;
@@ -2084,7 +2094,10 @@ pub fn provision_pending(cfg: &Config, worktree: &str) -> bool {
         &repo_root,
         &loc,
         Path::new(worktree),
-        selected_env.as_deref(),
+        &thegn_core::sandbox_pin::EnvSelection {
+            name: selected_env.clone(),
+            profile: None,
+        },
     );
     if !matches!(
         environment.placement,
@@ -2225,7 +2238,10 @@ pub fn clear_native_exec_cooldown(cfg: &Config, worktree: &str) {
         &repo_root,
         &loc,
         Path::new(worktree),
-        selected_env.as_deref(),
+        &thegn_core::sandbox_pin::EnvSelection {
+            name: selected_env.clone(),
+            profile: None,
+        },
     );
     if let thegn_core::placement::Placement::Provider(_) = &environment.placement
         && let Some(envc) = cfg.env.get(&environment.name)
@@ -2300,7 +2316,10 @@ pub fn provision_worktree(
         &repo_root,
         &loc,
         Path::new(worktree),
-        selected_env.as_deref(),
+        &thegn_core::sandbox_pin::EnvSelection {
+            name: selected_env.clone(),
+            profile: None,
+        },
     );
     if !matches!(
         environment.placement,
@@ -2671,7 +2690,12 @@ pub fn provision_provider_env_named(
         .map(PathBuf::from)
         .or_else(|| repo::main_worktree(Path::new(worktree)))
         .unwrap_or_else(|| PathBuf::from(worktree));
-    let resolved = cfg.resolve_env(&repo_root, &loc, Path::new(worktree), Some(env_name));
+    let resolved = cfg.resolve_env(
+        &repo_root,
+        &loc,
+        Path::new(worktree),
+        &thegn_core::sandbox_pin::EnvSelection::named(env_name),
+    );
     let allow = &resolved.sandbox.network_allow;
     let block = &resolved.sandbox.network_block;
     let admission =
@@ -3727,7 +3751,12 @@ fn auto_provision_sandbox(
                 .map(PathBuf::from)
                 .or_else(|| repo::main_worktree(Path::new(worktree)))
                 .unwrap_or_else(|| PathBuf::from(worktree));
-            let resolved = cfg.resolve_env(&repo_root, &loc, Path::new(worktree), Some(env_name));
+            let resolved = cfg.resolve_env(
+                &repo_root,
+                &loc,
+                Path::new(worktree),
+                &thegn_core::sandbox_pin::EnvSelection::named(env_name),
+            );
             let allow = &resolved.sandbox.network_allow;
             let block = &resolved.sandbox.network_block;
             crate::egress_admit::gate_handed_sandbox(
@@ -4518,7 +4547,10 @@ pub fn launch_spec_full(
         &loc,
         saved_backend.as_deref(),
         saved_is_override,
-        selected_env.as_deref(),
+        &thegn_core::sandbox_pin::EnvSelection {
+            name: selected_env.clone(),
+            profile: None,
+        },
     )?;
     if let Some(target) = outcome.route_ssh_target.as_ref() {
         crate::remote_enqueue_auth::reconcile_ssh_credential(cfg, target, &repo_root, worktree)?;

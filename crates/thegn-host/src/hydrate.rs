@@ -2875,7 +2875,10 @@ pub(crate) fn build_model(
         std::path::Path::new(&active_repo),
         &loc,
         std::path::Path::new(&active_path),
-        selected.as_deref(),
+        &thegn_core::sandbox_pin::EnvSelection {
+            name: selected.clone(),
+            profile: None,
+        },
     );
     // A provider env whose CONTENT resolved local has degraded to the host
     // (provider unavailable + `failover`, or a stale remote location healed back

@@ -7398,7 +7398,7 @@ impl Config {
         repo_root: &Path,
         loc: &GitLoc,
         worktree: &Path,
-        selected: Option<&str>,
+        selected: &crate::sandbox_pin::EnvSelection,
     ) -> Environment {
         crate::config_resolve::resolve_environment(
             self,
@@ -7419,7 +7419,7 @@ impl Config {
         repo_root: &Path,
         loc: &GitLoc,
         worktree: &Path,
-        selected: Option<&str>,
+        selected: &crate::sandbox_pin::EnvSelection,
         approvals: &crate::config_resolve::Approvals,
     ) -> (Environment, crate::config_resolve::ResolvedRepoSandbox) {
         crate::config_resolve::resolve_environment(

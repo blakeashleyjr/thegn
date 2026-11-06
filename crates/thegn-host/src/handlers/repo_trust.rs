@@ -19,6 +19,7 @@ use thegn_core::devcontainer_overlay;
 use thegn_core::devcontainer_select;
 use thegn_core::env::Environment;
 use thegn_core::remote::GitLoc;
+use thegn_core::sandbox_pin::EnvSelection;
 use thegn_core::store::{NotificationStore, RepoTrustStore, WorkspaceStore, ZoneStore};
 
 /// Notification kind for a clamped/pending repo overlay request.
@@ -77,8 +78,8 @@ pub(crate) fn effective_environment_for_worktree(
         (None, None) => Ok(None),
     };
     let selection_read = match db {
-        Some(db) => db.effective_env_checked(&worktree_s, &repo_s),
-        None => Ok(None),
+        Some(db) => db.effective_env_selection(&worktree_s, &repo_s),
+        None => Ok(EnvSelection::none()),
     };
     environment_from_reads(
         cfg,
@@ -96,21 +97,20 @@ fn environment_from_reads(
     repo_root: &Path,
     worktree: &Path,
     location: anyhow::Result<Option<String>>,
-    selected: anyhow::Result<Option<String>>,
+    selected: anyhow::Result<EnvSelection>,
     approvals: &Approvals,
 ) -> anyhow::Result<Environment> {
     use anyhow::Context;
     let location = location.context("the worktree's recorded location could not be read")?;
     let selected = match selected {
         Ok(selected) => selected,
-        Err(_) if cfg.env.is_empty() => None,
         Err(error) => {
             return Err(error).context("the worktree's environment selection could not be read");
         }
     };
     let loc = GitLoc::from_db(&worktree.to_string_lossy(), location.as_deref());
     Ok(cfg
-        .resolve_env_with(repo_root, &loc, worktree, selected.as_deref(), approvals)
+        .resolve_env_with(repo_root, &loc, worktree, &selected, approvals)
         .0)
 }
 
@@ -123,22 +123,34 @@ pub(crate) fn resolve_env_trusted(
     repo_root: &Path,
     loc: &GitLoc,
     worktree: &str,
-    selected_env: Option<&str>,
-) -> TrustedEnvironment {
-    let Ok(db) = Db::open() else {
-        return TrustedEnvironment {
-            environment: cfg.resolve_env(repo_root, loc, Path::new(worktree), selected_env),
-            devcontainer: None,
-        };
-    };
+    selected_env: &EnvSelection,
+) -> anyhow::Result<TrustedEnvironment> {
+    let db = Db::open().map_err(|error| {
+        anyhow::anyhow!("could not read the worktree sandbox selection; refusing launch: {error:#}")
+    })?;
     let root_s = repo_root.to_string_lossy().to_string();
+    let worktree_selection = db
+        .effective_env_selection(worktree, &root_s)
+        .map_err(|error| {
+            anyhow::anyhow!(
+                "could not read the worktree sandbox selection; refusing launch: {error:#}"
+            )
+        })?;
+    let worktree_selection = if selected_env.name.is_some() {
+        EnvSelection {
+            name: selected_env.name.clone(),
+            profile: worktree_selection.profile,
+        }
+    } else {
+        worktree_selection
+    };
     let approved_canonical = db.repo_trust_approved(&root_s).unwrap_or_default();
     let approvals = Approvals::from_canonical(approved_canonical.clone());
     let (mut env, resolved) = cfg.resolve_env_with(
         repo_root,
         loc,
         Path::new(worktree),
-        selected_env,
+        &worktree_selection,
         &approvals,
     );
     let mut pending = resolved.pending.clone();
@@ -163,10 +175,10 @@ pub(crate) fn resolve_env_trusted(
         None
     };
     apply_zone(&db, cfg, worktree, &mut env);
-    TrustedEnvironment {
+    Ok(TrustedEnvironment {
         environment: env,
         devcontainer,
-    }
+    })
 }
 
 /// A [`SubstCtx`] for a worktree that thegn bind-mounts at its **real path**
@@ -483,6 +495,7 @@ fn local_env_admitted(
 #[cfg(test)]
 mod tests {
     use super::{environment_from_reads, local_env_admitted};
+    use thegn_core::sandbox_pin::EnvSelection;
 
     #[test]
     fn environment_from_reads_refuses_an_unreadable_selection() {
@@ -513,19 +526,18 @@ mod tests {
     }
 
     #[test]
-    fn environment_from_reads_uses_default_when_unconfigured_selection_is_unreadable() {
+    fn environment_from_reads_refuses_an_unreadable_pin_even_without_named_envs() {
         let root = tempfile::tempdir().unwrap();
-        let environment = environment_from_reads(
+        let error = environment_from_reads(
             &thegn_core::config::Config::default(),
             root.path(),
             root.path(),
-            Ok(None),
+            Ok(EnvSelection::none()),
             Err(anyhow::anyhow!("database is locked")),
             &thegn_core::config_resolve::Approvals::deny_all(),
         )
-        .unwrap();
-
-        assert_eq!(environment.name, "default");
+        .unwrap_err();
+        assert!(format!("{error:#}").contains("environment selection could not be read"));
     }
 
     #[test]
@@ -536,7 +548,7 @@ mod tests {
             root.path(),
             root.path(),
             Err(anyhow::anyhow!("disk I/O error")),
-            Ok(None),
+            Ok(EnvSelection::none()),
             &thegn_core::config_resolve::Approvals::deny_all(),
         )
         .unwrap_err();
@@ -564,7 +576,7 @@ mod tests {
             root.path(),
             root.path(),
             Ok(None),
-            Ok(Some("box".into())),
+            Ok(EnvSelection::named("box")),
             &thegn_core::config_resolve::Approvals::deny_all(),
         )
         .unwrap();

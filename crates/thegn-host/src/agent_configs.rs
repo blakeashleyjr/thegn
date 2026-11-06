@@ -373,7 +373,12 @@ pub(crate) fn resync_agent_auth(
         .or_else(|| thegn_core::repo::main_worktree(Path::new(worktree)))
         .unwrap_or_else(|| std::path::PathBuf::from(worktree));
     let home = cfg
-        .resolve_env(&repo_root, loc, Path::new(worktree), Some(env_name))
+        .resolve_env(
+            &repo_root,
+            loc,
+            Path::new(worktree),
+            &thegn_core::sandbox_pin::EnvSelection::named(env_name),
+        )
         .sandbox
         .home;
     let agents = if !home.agents.is_empty() {

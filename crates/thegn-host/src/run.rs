@@ -2105,7 +2105,15 @@ fn connect_worktree_bridge(
                 return;
             }
         };
-        let env = cfg.resolve_env(&repo_root, &loc, &wt, env_name.as_deref());
+        let env = cfg.resolve_env(
+            &repo_root,
+            &loc,
+            &wt,
+            &thegn_core::sandbox_pin::EnvSelection {
+                name: env_name.clone(),
+                profile: None,
+            },
+        );
         // For a managed provider, install and verify the resident bridge before
         // tunneling or connecting; a failed or unverified install skips both.
         let bridge = if matches!(env.placement, thegn_core::placement::Placement::Provider(_)) {

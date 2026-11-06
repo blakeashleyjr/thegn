@@ -241,7 +241,10 @@ pub(crate) fn try_claim_spare(cfg: &thegn_core::config::Config, worktree: &str) 
             &repo_root,
             &loc,
             std::path::Path::new(worktree),
-            selected.as_deref(),
+            &thegn_core::sandbox_pin::EnvSelection {
+                name: selected.clone(),
+                profile: None,
+            },
         )
         .name;
     // Never claim for an env that can't hand a spare over (no configured
@@ -321,7 +324,10 @@ pub(crate) fn guard_unprovisioned_attach(
             &repo_root,
             &loc,
             std::path::Path::new(worktree),
-            selected_env.as_deref(),
+            &thegn_core::sandbox_pin::EnvSelection {
+                name: selected_env.clone(),
+                profile: None,
+            },
         )
         .name;
     let Some(id) = crate::agent::provider_sandbox_name(cfg, worktree, &env_name) else {
@@ -554,7 +560,7 @@ pub fn claim_spare(
         repo_root,
         &egress_loc,
         std::path::Path::new(worktree),
-        Some(env_name),
+        &thegn_core::sandbox_pin::EnvSelection::named(env_name),
     );
     let egress_provider = crate::agent::provider_for_named(&env.provider, &name);
     let egress = match egress_provider.as_ref() {

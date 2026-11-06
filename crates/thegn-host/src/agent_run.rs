@@ -693,7 +693,11 @@ pub(crate) fn agent_floor_gate(
     on_miss: thegn_core::config::OnFloorMiss,
 ) -> AgentDispatch {
     if !sandbox_on {
-        return uncontained_agent_gate(&full.sandbox);
+        let effective = match effective_agent_sandbox(full, worktree) {
+            Ok(effective) => effective,
+            Err(reason) => return AgentDispatch::InfraHold(reason),
+        };
+        return uncontained_agent_gate(&effective);
     }
     let effective = effective_agent_sandbox(full, worktree);
     agent_floor_gate_with_effective(full, worktree, floor, on_miss, effective)
@@ -703,6 +707,11 @@ fn uncontained_agent_gate(sb: &thegn_core::config::SandboxConfig) -> AgentDispat
     use thegn_core::config::OnFloorMiss;
 
     let floor = thegn_core::sandbox_floor::floor_in_force(sb, false);
+    if sb.profile.hides_home() {
+        return AgentDispatch::InfraHold(format!(
+            "sealed worktree cannot run its queue agent on the host; switch this worktree to the standard profile with `thegn sandbox profile set standard --worktree <path>` (or the palette action Isolation profile)"
+        ));
+    }
     if floor.required_rank().is_none() {
         return AgentDispatch::Run(None);
     }
@@ -746,7 +755,16 @@ fn effective_agent_sandbox_at(
         ));
     }
     let loc = thegn_core::remote::GitLoc::Local(worktree.to_path_buf());
-    let env = full.resolve_env(repo_root, &loc, worktree, None);
+    let selected = thegn_core::db::Db::open()
+        .and_then(|db| {
+            db.effective_env_selection(&worktree.to_string_lossy(), &repo_root.to_string_lossy())
+        })
+        .map_err(|error| {
+            format!(
+                "could not read the worktree sandbox selection; refusing queued agent: {error:#}"
+            )
+        })?;
+    let env = full.resolve_env(repo_root, &loc, worktree, &selected);
     if env.unresolved_selection || env.is_remote() {
         return Err(format!(
             "queued agents run only on the local host; the effective env `{}` is remote/unresolved",
@@ -780,15 +798,11 @@ fn agent_floor_gate_with_effective(
         .map(|spec| scope_agent_spec(spec, worktree));
     // THE-215: a sealed profile whose sandbox could not be established must not
     // run the agent on the host — no spec skips the home gate below, so refuse.
-    if spec.is_none() && (full.sandbox.profile.hides_home() || effective.profile.hides_home()) {
-        let profile = if full.sandbox.profile.hides_home() {
-            full.sandbox.profile
-        } else {
-            effective.profile
-        };
+    if spec.is_none() && effective.profile.hides_home() {
+        let profile = effective.profile;
         return AgentDispatch::InfraHold(format!(
             "profile `{}` requires a sandbox that hides $HOME, but none could be established \
-             for {worktree}",
+             for {worktree}; switch this worktree to the standard profile with `thegn sandbox profile set standard --worktree <path>` (or the palette action Isolation profile)",
             profile.as_str()
         ));
     }
@@ -805,7 +819,11 @@ fn agent_floor_gate_with_effective(
     }
     let best = spec.capabilities().isolation;
     let resolved = Some(best);
-    let global_gate = queue_agent_gate(&full.sandbox, floor, on_miss, resolved, best);
+    let global = thegn_core::config::SandboxConfig {
+        profile: effective.profile,
+        ..full.sandbox.clone()
+    };
+    let global_gate = queue_agent_gate(&global, floor, on_miss, resolved, best);
     let effective_gate = queue_agent_gate(&effective, floor, on_miss, resolved, best);
     let dispatch = match stricter_agent_gate(global_gate, effective_gate) {
         AgentGate::Run => AgentDispatch::Run(Some(spec)),
@@ -1766,6 +1784,7 @@ pub(crate) fn run_outcome_cancellable(
 mod tests {
     use super::*;
     use std::cell::Cell;
+    use thegn_core::store::WorkspaceStore;
 
     fn vars() -> TaskVars {
         TaskVars::new()
@@ -2017,6 +2036,48 @@ mod tests {
                 thegn_core::config::OnFloorMiss::Degrade,
             ),
             AgentDispatch::InfraHold(_)
+        ));
+    }
+
+    #[test]
+    fn sandbox_profile_queue_agent_resolves_the_worktree_pin() {
+        let _state = crate::testenv::IsolatedState::new();
+        let repo = tempfile::tempdir().unwrap();
+        let db = thegn_core::db::Db::open().unwrap();
+        db.put_worktree(
+            "repo/wt",
+            &repo.path().to_string_lossy(),
+            &repo.path().to_string_lossy(),
+            "topic",
+            None,
+            None,
+        )
+        .unwrap();
+        db.set_worktree_sandbox_profile(
+            &repo.path().to_string_lossy(),
+            Some(thegn_core::config::SandboxProfile::Sealed),
+        )
+        .unwrap();
+        let sandbox = effective_agent_sandbox_at(
+            &thegn_core::config::Config::default(),
+            repo.path(),
+            repo.path(),
+        )
+        .unwrap();
+        assert_eq!(sandbox.profile, thegn_core::config::SandboxProfile::Sealed);
+    }
+
+    #[test]
+    fn sandbox_profile_sealed_worktree_holds_an_uncontained_queue_agent() {
+        let sealed = thegn_core::config::SandboxConfig {
+            profile: thegn_core::config::SandboxProfile::Sealed,
+            isolation_floor: Some(thegn_core::config::IsolationFloor::Off),
+            ..thegn_core::config::SandboxConfig::default()
+        };
+        assert!(matches!(
+            uncontained_agent_gate(&sealed),
+            AgentDispatch::InfraHold(reason)
+                if reason == "sealed worktree cannot run its queue agent on the host; switch this worktree to the standard profile with `thegn sandbox profile set standard --worktree <path>` (or the palette action Isolation profile)"
         ));
     }
 
