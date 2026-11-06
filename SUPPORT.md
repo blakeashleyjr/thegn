@@ -15,7 +15,7 @@ thegn is a small, fast-moving alpha project. Here is where to go:
 ## Before you file
 
 - Run `thegn doctor` and include its output.
-- For anything beyond a typo, run `thegn doctor bundle --out thegn-bundle.tar.gz`.
+- For crashes, hangs or anything hard to describe, run `thegn doctor bundle --out thegn-bundle.tar.gz`.
   It writes a redacted archive locally and prints a manifest of what it contains.
 - Open the archive and read the manifest before you attach it. Redaction is
   best-effort; remove anything you do not want public (private repository names,
