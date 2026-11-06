@@ -46,8 +46,8 @@ detail; if the two differ, `KNOWN_ISSUES.md` is newer.
   override; use a same-host TLS terminator or encrypted tunnel for remote
   access, and see [[mobile-access]].
 - **`route_to_host` can hold off-host provider worktrees from automatic
-  draining.** Run the drain on the target host and review held rows; see
-  [[merge-queue]].
+  draining.** If the host cannot verify the provider source it holds the row
+  for review rather than folding it; see [[merge-queue]].
 
 ## Security model
 
@@ -59,12 +59,11 @@ detail; if the two differ, `KNOWN_ISSUES.md` is newer.
 - **Provider placements without an enforceable isolation request are reported
   as `provider-managed (unverified)`.** Review the provider's isolation
   guarantees before using that placement; see [[sandboxing]].
-- **The default `standard` profile protects integrity, not credentials.** Use
-  `sealed` when a launch must hide `$HOME`; see [[sandboxing]].
+- **The default `sealed` profile hides `$HOME`.** The opt-in `standard` profile
+  protects integrity, not credentials, so `$HOME` stays readable; see
+  [[sandboxing]].
 - **Native plugins run unsandboxed as your user.** Enable only plugins you
   trust; see [[plugins]].
-- **`just security-e2e` is not part of the default gate.** For that source
-  checkout suite, use Linux with `bwrap` and working user namespaces.
 
 ## Experimental subsystems
 
