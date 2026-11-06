@@ -492,6 +492,16 @@ class ReleaseManifestTests(unittest.TestCase):
         with self.assertRaisesRegex(release.ReleaseError, "unexpected:.*stale"):
             self.build()
 
+    def test_expected_release_assets_include_sums_and_notices(self) -> None:
+        names = release.expected_release_assets(self.manifest, self.tag)
+        self.assertIn("SHA256SUMS", names)
+        self.assertIn(f"thegn-{self.tag}-THIRD_PARTY_NOTICES.md", names)
+        self.assertEqual(sorted(names), names)
+
+        (self.assets / "SHA256SUMS").unlink()
+        with self.assertRaisesRegex(release.ReleaseError, "SHA256SUMS"):
+            self.build()
+
     def test_manifest_ignores_a_previous_manifest_asset(self) -> None:
         (self.assets / f"thegn-{self.tag}-manifest.json").write_text("{}", encoding="utf-8")
         self.assertEqual(self.expected, [asset["name"] for asset in self.build()["assets"]])
