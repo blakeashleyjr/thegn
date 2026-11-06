@@ -122,7 +122,7 @@ for example with `docker compose up -d <service>`.
 When sandbox preparation fails with a typed refusal, its message leads with
 the refusal class and remediation, for example `sandbox bwrap failed: sandbox
 entry refused [<class>]: <remediation>`. This detail is used in launch
-warnings, the new-worktree wizard and host worktree pipeline preparation.
+warnings, the new-worktree wizard and while preparing a worktree's pipeline.
 Failures without a typed class keep their plain text.
 
 Before launch, every local mount source is resolved to a real path. If a
@@ -488,7 +488,13 @@ held rather than counted as a failed attempt, and the hold reason names the
 readiness class (`cannot-write-worktree` or `cannot-write-git-metadata`) and
 the backend.
 
-Pipeline stage launches run the same check once the stage's sandbox is composed: when it cannot write the worktree, the Git common directory or the agent's relocated credential home, or the `thegn` binary was replaced since launch, the stage worker is not started and the launch is refused with the readiness class (`cannot-write-worktree`, `cannot-write-git-metadata`, `provider-home-unavailable` or `callback-unavailable`) and the backend. The `worker` row in `thegn doctor` is the same check.
+Agent pipeline runs make the same check after composing the sandbox. If it
+cannot write the worktree, the Git common directory or the agent's relocated
+credential home, or if the `thegn` binary was replaced since launch, the stage
+does not start and the run is refused with the readiness class
+(`cannot-write-worktree`, `cannot-write-git-metadata`, `provider-home-unavailable`
+or `callback-unavailable`) and backend. The `worker` row in `thegn doctor` is
+the same check.
 
 The honest **isolation class**, weakest to strongest:
 

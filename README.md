@@ -4,8 +4,10 @@
 
 > **Status: public alpha** (`0.1.0-alpha.56`). **x86_64 Linux is the supported
 > platform.** macOS on Apple silicon is best-effort: use the flake or source
-> setup until a release archive is published. CI is opt-in and the
-> interactive on-device checklist is unfinished. Windows is deferred and has no release binary.
+> setup until a release archive is published. Pull requests run lean CI checks
+> (format, lint, test, smoke); the full gate runs nightly and on demand, and
+> the interactive on-device checklist is unfinished. Windows is deferred and
+> has no release binary.
 > Expect rough edges; see [`CHANGELOG.md`](CHANGELOG.md) and
 > [`KNOWN_ISSUES.md`](KNOWN_ISSUES.md), and please file issues.
 
@@ -400,7 +402,8 @@ the usual prefixes, but the baked path is what it prefers).
 
 **macOS is best-effort; Windows is deferred.** Until a macOS release archive
 is published, use the flake or source setup;
-CI is opt-in and the interactive on-device checklist is unfinished (see
+pull requests run lean CI checks, the full gate runs nightly and on demand,
+and the interactive on-device checklist is unfinished (see
 [`KNOWN_ISSUES.md`](KNOWN_ISSUES.md)). Windows has no release binary; source
 build notes below are for contributors, not a supported install path:
 
