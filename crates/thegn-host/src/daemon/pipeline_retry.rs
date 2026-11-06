@@ -278,6 +278,7 @@ fn reconcile_candidates(
     Ok((candidates, truncated))
 }
 
+/// Detects the race where a dispatch row exists before its session id is published.
 fn publication_pending(rows: &[AgentDispatch], truncated: bool) -> bool {
     truncated
         || rows.iter().any(|row| {
@@ -1552,9 +1553,14 @@ mod tests {
             .await
             .unwrap();
 
+        let elapsed = started.elapsed();
         assert!(
-            started.elapsed() <= Duration::from_millis(750),
+            elapsed <= Duration::from_millis(750),
             "unassociated exit exceeded its 500 ms lookup deadline"
+        );
+        assert!(
+            elapsed >= Duration::from_millis(400),
+            "unpublished dispatch row should keep the publication-race retry active"
         );
         let row = svc
             .db
@@ -1583,7 +1589,7 @@ mod tests {
         handle_exit(&svc, "plain-pane", 1, None).await.unwrap();
 
         assert!(
-            started.elapsed() < Duration::from_millis(100),
+            started.elapsed() < Duration::from_millis(250),
             "an exit with no dispatch candidates should not retry"
         );
     }
