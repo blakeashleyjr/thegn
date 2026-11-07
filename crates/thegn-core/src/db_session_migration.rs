@@ -31,7 +31,7 @@ impl SessionMigrationStore for Db {
                 "SELECT worktree, COALESCE(session_name,''), COALESCE(tab_name,''),
                         COALESCE(repo_path,''), COALESCE(branch,''), COALESCE(agent,''),
                         COALESCE(created_at,0), COALESCE(location,''), COALESCE(position,0),
-                        sandbox_backend, observed_backend, folder_id, env_name
+                        sandbox_backend, observed_backend, folder_id, env_name, sandbox_profile
                    FROM worktrees WHERE worktree=?1",
                 params![worktree_path],
                 map_worktree,
@@ -76,7 +76,7 @@ impl SessionMigrationStore for Db {
                 "SELECT worktree, COALESCE(session_name,''), COALESCE(tab_name,''),
                         COALESCE(repo_path,''), COALESCE(branch,''), COALESCE(agent,''),
                         COALESCE(created_at,0), COALESCE(location,''), COALESCE(position,0),
-                        sandbox_backend, observed_backend, folder_id, env_name
+                        sandbox_backend, observed_backend, folder_id, env_name, sandbox_profile
                    FROM worktrees WHERE worktree=?1",
                 params![worktree_path],
                 map_worktree,
@@ -370,7 +370,7 @@ fn map_worktree(row: &Row<'_>) -> rusqlite::Result<crate::models::WorktreeRow> {
         observed_backend: row.get(10)?,
         folder_id: row.get(11)?,
         env_name: row.get(12)?,
-        sandbox_profile: None,
+        sandbox_profile: row.get(13)?,
     })
 }
 
@@ -463,8 +463,8 @@ fn insert_worktree(db: &Db, worktree: &MigrationWorktree) -> Result<usize> {
         "INSERT OR IGNORE INTO worktrees
            (worktree, session_name, tab_name, repo_path, branch, agent,
             created_at, location, position, sandbox_backend, observed_backend,
-            folder_id, env_name)
-         VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13)",
+            folder_id, env_name, sandbox_profile)
+         VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14)",
         params![
             worktree.worktree,
             worktree.session_name,
@@ -479,6 +479,7 @@ fn insert_worktree(db: &Db, worktree: &MigrationWorktree) -> Result<usize> {
             worktree.observed_backend,
             worktree.folder_id,
             worktree.env_name,
+            worktree.sandbox_profile,
         ],
     )?)
 }
@@ -833,6 +834,40 @@ mod tests {
                 .worktree
                 .is_some()
         );
+    }
+
+    #[test]
+    fn session_move_carries_the_worktree_sandbox_profile_pin() {
+        let source = Db::open_memory().unwrap();
+        let target = Db::open_memory().unwrap();
+        source
+            .conn()
+            .execute(
+                "INSERT INTO worktrees(worktree,session_name,tab_name,repo_path,branch,agent,created_at,location,position,sandbox_profile)
+                 VALUES('/sealed','source','tab','/repo','feature','agent',1,'',3,'sealed')",
+                [],
+            )
+            .unwrap();
+
+        let bundle = source
+            .migration_snapshot("default", "target", "source", "/sealed")
+            .unwrap();
+        let plan = plan_migration(
+            bundle,
+            target
+                .migration_target_snapshot("source", "/sealed")
+                .unwrap(),
+            HistoryPolicy::Include,
+        )
+        .unwrap();
+        target.import_migration(&plan).unwrap();
+
+        let moved = target
+            .migration_target_snapshot("source", "/sealed")
+            .unwrap()
+            .worktree
+            .unwrap();
+        assert_eq!(moved.sandbox_profile.as_deref(), Some("sealed"));
     }
 
     #[test]

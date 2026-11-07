@@ -128,6 +128,24 @@ pub fn env_halt_reason(cfg: &Config, worktree: &str) -> Option<SandboxHalt> {
             });
         }
     }
+    if matches!(
+        &environment.placement,
+        thegn_core::placement::Placement::Provider(_)
+    ) && let Some(refusal) = thegn_core::sandbox_floor::provider_refusal_for(
+        true,
+        &environment.sandbox,
+        &environment.name,
+        Some(worktree),
+    ) {
+        return Some(SandboxHalt {
+            env_name: environment.name.clone(),
+            placement: environment.placement.label(),
+            reason: refusal.to_string(),
+            ask: false,
+            dormant: None,
+            sealed_home: environment.sandbox.profile.hides_home(),
+        });
+    }
     // Local envs never halt; `auto` degrades silently (no block); a worktree the
     // user pinned to the host ("run on host") must not re-block. Only `halt`/`ask`
     // surface a modal.
@@ -194,7 +212,7 @@ pub fn env_halt_reason(cfg: &Config, worktree: &str) -> Option<SandboxHalt> {
 /// An unreadable worktree selection is a typed halt: the sandbox pin cannot be
 /// inferred safely, even for a local shell.
 fn unreadable_selection_halt(worktree: &str, error: &anyhow::Error) -> SandboxHalt {
-    let recovery = thegn_core::sandbox_floor::standard_switch_hint(Some(worktree));
+    let recovery = thegn_core::sandbox_floor::clear_profile_hint(worktree);
     SandboxHalt {
         env_name: "worktree isolation".into(),
         placement: worktree.to_string(),

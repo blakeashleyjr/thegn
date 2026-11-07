@@ -2110,6 +2110,23 @@ fn connect_worktree_bridge(
             }
         };
         let env = cfg.resolve_env(&repo_root, &loc, &wt, &selection);
+        if let Some(refusal) = thegn_core::sandbox_floor::provider_refusal_for(
+            matches!(
+                &env.placement,
+                thegn_core::placement::Placement::Provider(_)
+            ),
+            &env.sandbox,
+            &env.name,
+            Some(&wt.to_string_lossy()),
+        ) {
+            tracing::warn!(
+                target: "thegn::bridge",
+                worktree = %wt.display(),
+                reason = %refusal,
+                "resident bridge connect refused by the worktree isolation profile"
+            );
+            return;
+        }
         // For a managed provider, install and verify the resident bridge before
         // tunneling or connecting; a failed or unverified install skips both.
         let bridge = if matches!(env.placement, thegn_core::placement::Placement::Provider(_)) {
@@ -25434,9 +25451,7 @@ async fn event_loop<T: Terminal>(
                             }
                             Action::SandboxProfile => {
                                 let profile = model
-                                    .active_sandbox_profile_pin
-                                    .as_deref()
-                                    .and_then(|name| thegn_core::sandbox_pin::parse_pin(name).ok())
+                                    .active_sandbox_profile
                                     .unwrap_or(current_config.sandbox.profile);
                                 active_menu = Some(crate::menu::sandbox_profile_menu(
                                     profile,

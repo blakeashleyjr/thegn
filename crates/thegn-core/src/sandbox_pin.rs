@@ -71,7 +71,7 @@ pub const fn explain(profile: SandboxProfile) -> ProfileExplain {
             ],
             network: "No network or VPN attachment; git fetch/push will not work.",
             credentials: "Credentials and the SSH agent socket are hidden.",
-            agents: "SSH/provider envs and run-on-host are refused.",
+            agents: "SSH needs a remote runtime; providers and bare host shells are refused.",
             extra: &[
                 "An unsealable launch is refused, never downgraded.",
                 "API-backed agent CLIs fail; local tools and offline builds work.",
@@ -88,7 +88,7 @@ pub const fn explain(profile: SandboxProfile) -> ProfileExplain {
             ],
             network: "Network and VPN attachments work.",
             credentials: "Credentials in your read-only home remain visible.",
-            agents: "SSH/provider environments work; default capabilities remain.",
+            agents: "Local, SSH and provider work; default capabilities remain.",
             extra: &["Root is read-only; new privileges blocked; 512 process limit."],
             how_to_change: "Change via palette > Isolation profile or the CLI.",
         },

@@ -438,7 +438,7 @@ fn create_and_register(
             .resolve_env(root, &location, root, &ambient_selection)
             .sandbox
             .profile;
-        if (profile != ambient_profile || profile == thegn_core::config::SandboxProfile::Sealed)
+        if profile != ambient_profile
             && let Err(error) = db.set_worktree_sandbox_profile(&path_s, Some(profile))
         {
             let message = match crate::worktree_lifecycle::rollback_remove(cfg, root, &path, branch)

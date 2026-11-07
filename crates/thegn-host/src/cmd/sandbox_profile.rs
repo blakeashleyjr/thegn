@@ -170,13 +170,24 @@ fn profile_source(
 
 fn target_path(target: Option<String>) -> Result<PathBuf> {
     let requested = super::resolve_worktree(target);
-    let worktree = std::fs::canonicalize(&requested).map_err(|error| {
-        anyhow::anyhow!(
-            "cannot resolve worktree path {}: {error}",
-            requested.display()
-        )
-    })?;
     let db = Db::open()?;
+    let worktree = match std::fs::canonicalize(&requested) {
+        Ok(worktree) => worktree,
+        Err(error) => {
+            let requested_key = requested.to_string_lossy();
+            if db
+                .repo_root_for(&requested_key)?
+                .is_some_and(|root| !root.is_empty())
+            {
+                PathBuf::from(requested_key.as_ref())
+            } else {
+                return Err(anyhow::anyhow!(
+                    "cannot resolve worktree path {}: {error}",
+                    requested.display()
+                ));
+            }
+        }
+    };
     let registered = db
         .repo_root_for(&worktree.to_string_lossy())?
         .is_some_and(|root| !root.is_empty());
@@ -237,6 +248,24 @@ mod tests {
         )
         .unwrap_err();
         assert!(format!("{error:#}").contains("is not a registered worktree"));
+    }
+
+    #[test]
+    fn sandbox_profile_cli_accepts_an_exact_registered_remote_path() {
+        let _state = crate::testenv::IsolatedState::new();
+        let db = Db::open().unwrap();
+        db.put_worktree(
+            "repo/remote",
+            "/repo",
+            "/remote-only/wt",
+            "remote",
+            None,
+            None,
+        )
+        .unwrap();
+
+        let resolved = super::target_path(Some("/remote-only/wt".into())).unwrap();
+        assert_eq!(resolved, std::path::PathBuf::from("/remote-only/wt"));
     }
 
     #[test]

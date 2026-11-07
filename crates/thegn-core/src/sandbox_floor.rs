@@ -368,11 +368,20 @@ pub fn standard_switch_hint(worktree: Option<&str>) -> String {
     )
 }
 
+/// Recovery route for an unreadable worktree profile pin.
+pub fn clear_profile_hint(worktree: &str) -> String {
+    let quoted = worktree.replace('\'', "'\\''");
+    format!(
+        "Run `thegn sandbox profile clear --worktree '{quoted}'` to inherit the configured profile"
+    )
+}
+
 /// Typed refusal for an explicit isolation promise on an unattested provider.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProviderRefusal {
     pub env: String,
     pub request: ExplicitIsolation,
+    pub worktree: Option<String>,
 }
 
 impl std::fmt::Display for ProviderRefusal {
@@ -385,7 +394,7 @@ impl std::fmt::Display for ProviderRefusal {
                 self.env,
                 PROVIDER_UNVERIFIED,
                 profile.as_str(),
-                standard_switch_hint(None)
+                standard_switch_hint(self.worktree.as_deref())
             )
         } else {
             write!(
@@ -405,12 +414,23 @@ pub fn provider_refusal(
     sb: &SandboxConfig,
     env: &str,
 ) -> Option<ProviderRefusal> {
+    provider_refusal_for(is_provider, sb, env, None)
+}
+
+/// Refuse provider-managed execution and include a worktree-specific recovery route when known.
+pub fn provider_refusal_for(
+    is_provider: bool,
+    sb: &SandboxConfig,
+    env: &str,
+    worktree: Option<&str>,
+) -> Option<ProviderRefusal> {
     if !is_provider {
         return None;
     }
     provider_explicit_request(sb).map(|request| ProviderRefusal {
         env: env.to_string(),
         request,
+        worktree: worktree.map(str::to_string),
     })
 }
 
@@ -1434,6 +1454,15 @@ mod tests {
                 class.remediation()
             );
         }
+    }
+
+    #[test]
+    fn clear_profile_hint_quotes_registered_worktree_paths() {
+        let hint = clear_profile_hint("/work/a tree/$(touch nope)'s");
+        assert_eq!(
+            hint,
+            "Run `thegn sandbox profile clear --worktree '/work/a tree/$(touch nope)'\\''s'` to inherit the configured profile"
+        );
     }
 
     #[test]

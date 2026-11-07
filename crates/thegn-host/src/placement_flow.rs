@@ -1086,6 +1086,36 @@ pub(crate) fn maintain_tick(cfg: &Config) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn placement_trust_class_uses_the_sealed_worktree_pin() {
+        use thegn_core::config::SandboxProfile;
+        use thegn_core::store::WorkspaceStore;
+
+        let _state = crate::testenv::IsolatedState::new();
+        let db = Db::open().unwrap();
+        let root = tempfile::tempdir().unwrap();
+        let worktree = root.path().join("worktree");
+        std::fs::create_dir(&worktree).unwrap();
+        let root_path = root.path().to_string_lossy().into_owned();
+        let worktree_path = worktree.to_string_lossy().into_owned();
+        db.put_worktree(
+            "repo/worktree",
+            &root_path,
+            &worktree_path,
+            "sealed",
+            None,
+            None,
+        )
+        .unwrap();
+        db.set_worktree_sandbox_profile(&worktree_path, Some(SandboxProfile::Sealed))
+            .unwrap();
+
+        assert_eq!(
+            effective_profile_of(&db, &Config::default(), &worktree_path).unwrap(),
+            SandboxProfile::Sealed
+        );
+    }
     use thegn_core::capacity::ReservedTotals;
     use thegn_core::host::HostStep;
     use thegn_core::host_machine::HostState;

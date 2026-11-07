@@ -22,6 +22,27 @@ fn sandbox_resolution_does_not_authorize_implicit_host_fallback() {
 }
 
 #[test]
+fn sandbox_profile_pin_requires_enforcement_while_global_disabled_profile_does_not() {
+    use thegn_core::config::SandboxProfile;
+
+    assert!(!sealed_pin_requires_sandbox(
+        false,
+        None,
+        SandboxProfile::Sealed
+    ));
+    assert!(sealed_pin_requires_sandbox(
+        false,
+        Some(SandboxProfile::Sealed),
+        SandboxProfile::Sealed
+    ));
+    assert!(!sealed_pin_requires_sandbox(
+        false,
+        Some(SandboxProfile::Hardened),
+        SandboxProfile::Hardened
+    ));
+}
+
+#[test]
 fn pinned_worktree_candidate_check_uses_off_floor_by_default() {
     let sandbox = thegn_core::config::SandboxConfig::default();
     let worktree = "candidate-floor-host-pin-regression";
@@ -1280,6 +1301,49 @@ fn env_halt_reason_names_the_providers_own_token_var() {
             !halt.reason.contains("SPRITES_TOKEN"),
             "no nonsensical sprites var: {}",
             halt.reason
+        );
+    });
+}
+
+#[test]
+fn sandbox_profile_env_halt_marks_a_sealed_provider_refusal_as_sealed_home() {
+    with_temp_state("halt-sealed-provider", || {
+        let cfg: Config = toml::from_str(
+            "[env.sealed_provider]\nplacement = \"provider\"\n[env.sealed_provider.provider]\nprovider = \"machine0\"\n",
+        )
+        .unwrap();
+        let worktree = std::env::temp_dir()
+            .join(format!("tg-halt-sealed-provider-{}", std::process::id()))
+            .to_string_lossy()
+            .into_owned();
+        let db = thegn_core::db::Db::open().unwrap();
+        db.put_worktree(
+            "app/sealed-provider",
+            "/x/app",
+            &worktree,
+            "tg/sealed-provider",
+            None,
+            None,
+        )
+        .unwrap();
+        db.set_worktree_env(&worktree, "sealed_provider").unwrap();
+        db.set_worktree_sandbox_profile(
+            &worktree,
+            Some(thegn_core::config::SandboxProfile::Sealed),
+        )
+        .unwrap();
+
+        let halt = env_halt_reason(&cfg, &worktree).expect("a sealed provider is refused");
+        assert!(halt.sealed_home);
+        assert!(
+            halt.reason
+                .contains("profile `sealed` is a local-sandbox feature")
+        );
+        assert_eq!(
+            halt.reason
+                .matches("thegn sandbox profile set standard --worktree")
+                .count(),
+            1
         );
     });
 }
@@ -3149,6 +3213,29 @@ fn launch_state_gate_lets_a_shell_launch_with_a_warning() {
     let cfg = cfg_with(&[("codex", "codex")], &[]);
     let error = anyhow::anyhow!("disk I/O error");
     assert!(launch_state_gate(&cfg, "/wt/a", "shell", "saved override unreadable", &error).is_ok());
+}
+
+#[test]
+fn launch_state_gate_preserves_the_typed_worktree_isolation_refusal() {
+    let cfg = cfg_with(&[("codex", "codex")], &[]);
+    let unreadable = anyhow::anyhow!("database locked");
+    let typed = worktree_isolation_read_failure("/tmp/work tree", &unreadable);
+    let result = launch_state_gate(
+        &cfg,
+        "/tmp/work tree",
+        "codex",
+        "selection unreadable",
+        &typed,
+    );
+    let Err(error) = result else {
+        panic!("unreadable isolation selection must refuse a configured agent");
+    };
+    let halt = error.downcast_ref::<SandboxHalt>().unwrap();
+    assert!(
+        halt.reason
+            .contains("sandbox profile clear --worktree '/tmp/work tree'")
+    );
+    assert!(!halt.reason.contains("the shell launches without it"));
 }
 
 #[test]

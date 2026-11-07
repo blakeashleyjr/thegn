@@ -710,48 +710,38 @@ fn effective_uncontained_agent_sandbox(
 ) -> Result<thegn_core::config::SandboxConfig, String> {
     let db = thegn_core::db::Db::open()
         .map_err(|error| format!("could not read the worktree isolation pin: {error:#}"))?;
-    let pin = db
+    let selection = db
         .worktree_sandbox_profile(worktree)
         .map_err(|error| format!("could not read the worktree isolation pin: {error:#}"))?;
     let mut sandbox = full.sandbox.clone();
-    let mut pin_applied_before_zone = false;
-    if let Some(worktree_path) = std::path::Path::new(worktree).canonicalize().ok()
-        && let Some(repo_root) = crate::merge_ops::repo_root_of(&worktree_path)
-        && let Ok(selected) = db.effective_env_checked(
+    if let Some(profile) = selection {
+        sandbox.profile = profile;
+    }
+    let Some(worktree_path) = std::path::Path::new(worktree).canonicalize().ok() else {
+        return Ok(sandbox);
+    };
+    let Some(repo_root) = crate::merge_ops::repo_root_of(&worktree_path) else {
+        return Ok(sandbox);
+    };
+    let location = thegn_core::remote::GitLoc::Local(worktree_path.clone());
+    let selected = db
+        .effective_env_selection(
             &worktree_path.to_string_lossy(),
             &repo_root.to_string_lossy(),
         )
-    {
-        let location = thegn_core::remote::GitLoc::Local(worktree_path.clone());
-        let mut environment = full.resolve_env(
-            &repo_root,
-            &location,
-            &worktree_path,
-            &thegn_core::sandbox_pin::EnvSelection {
-                name: selected,
-                profile: None,
-            },
-        );
-        if !environment.unresolved_selection
-            && !environment.is_remote()
-            && let Some(profile) = pin
-        {
-            environment.sandbox.profile = profile;
-            pin_applied_before_zone = true;
-        }
-        if !environment.unresolved_selection && !environment.is_remote() {
-            crate::handlers::repo_trust::apply_zone(
-                &db,
-                full,
-                &worktree_path.to_string_lossy(),
-                &mut environment,
-            );
-            sandbox = environment.sandbox;
-        }
+        .map_err(|error| format!("could not read the worktree environment selection: {error:#}"))?;
+    let environment = full.resolve_env(&repo_root, &location, &worktree_path, &selected);
+    if environment.unresolved_selection || environment.is_remote() {
+        return Ok(sandbox);
     }
-    if !pin_applied_before_zone && let Some(profile) = pin {
-        sandbox.profile = profile;
-    }
+    let mut environment = environment;
+    crate::handlers::repo_trust::apply_zone(
+        &db,
+        full,
+        &worktree_path.to_string_lossy(),
+        &mut environment,
+    );
+    sandbox.profile = environment.sandbox.profile;
     Ok(sandbox)
 }
 

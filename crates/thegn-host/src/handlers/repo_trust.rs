@@ -60,8 +60,8 @@ pub(crate) fn approvals_for(db: &Db, repo_root: &str) -> Approvals {
 /// worktree. Read-only status/provisioning callers must not stop at the base
 /// repo sandbox: doing so drops the workspace/worktree env selection and its
 /// `[env.<name>.sandbox]` overlay. A failed location or selection read is an
-/// error, except that a failed selection read can use the implicit default
-/// when no named environments are configured. `db: None` performs no reads.
+/// error; isolation and environment selections both fail closed. `db: None`
+/// performs no reads.
 pub(crate) fn effective_environment_for_worktree(
     cfg: &Config,
     db: Option<&Db>,
@@ -175,16 +175,7 @@ pub(crate) fn resolve_env_trusted(
 }
 
 fn unreadable_worktree_isolation(worktree: &str, error: &anyhow::Error) -> anyhow::Error {
-    anyhow::Error::new(crate::agent::SandboxHalt {
-        env_name: "worktree isolation".into(),
-        placement: worktree.to_string(),
-        reason: format!(
-            "thegn cannot read this worktree's isolation setting ({error:#}); refusing launch. Run `thegn doctor`, or once the database opens run `thegn sandbox profile clear --worktree {worktree}`."
-        ),
-        ask: false,
-        dormant: None,
-        sealed_home: false,
-    })
+    crate::agent::worktree_isolation_read_failure(worktree, error)
 }
 
 /// A [`SubstCtx`] for a worktree that thegn bind-mounts at its **real path**

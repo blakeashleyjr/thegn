@@ -2881,12 +2881,15 @@ pub(crate) fn build_model(
     let selection_error: Option<String> =
         selection.as_ref().err().map(|error| format!("{error:#}"));
     let selected = selection.unwrap_or_default();
-    let active_env = app_cfg.resolve_env(
+    let mut active_env = app_cfg.resolve_env(
         std::path::Path::new(&active_repo),
         &loc,
         std::path::Path::new(&active_path),
         &selected,
     );
+    if selection_error.is_none() {
+        crate::handlers::repo_trust::apply_zone(db, &app_cfg, &active_path, &mut active_env);
+    }
     // A provider env whose CONTENT resolved local has degraded to the host
     // (provider unavailable + `failover`, or a stale remote location healed back
     // to local — see the `should_heal_degraded_location` heal on open). A healthy
@@ -3009,6 +3012,10 @@ pub(crate) fn build_model(
         ),
         active_sandbox_backend,
         active_sandbox_profile_pin: selected.profile.map(|profile| profile.as_str().to_string()),
+        active_sandbox_profile: session
+            .active_group()
+            .filter(|group| group.kind != crate::session::GroupKind::Terminal)
+            .map(|_| active_env.sandbox.profile),
         active_placement_kind,
         active_placement_label,
         // containers is populated by the dedicated container refresh ticker
