@@ -63,7 +63,14 @@ A GitHub listing or search that exceeds the 100-issue cap with no `limit` is
 reported as a partial account. A full Kaneo project page is also partial unless
 the requested limit was met; rows already seen are kept and `complete` is false.
 Linear and Jira listings and searches show an issue repeated on a later page
-once; repeats do not count toward the requested limit.
+once; repeats do not count toward the requested limit. A Linear or Jira
+list or search that crosses an aggregate response-size cap after rows have been
+read is also reported as a partial account and keeps those rows (reason
+`Linear listing response byte cap reached`,
+`Linear search response byte cap reached`,
+`Jira listing response byte cap reached` or
+`Jira search response byte cap reached`); if the cap is crossed before any
+rows have been read, the operation returns an error.
 The `issues.get`, `issues.update` and `issues.comment` control API operations
 also accept `account` (HTTP `?account=<name>`) to route an issue to the named
 `[[issues.issue_accounts]]` entry. With `account`, the id must be

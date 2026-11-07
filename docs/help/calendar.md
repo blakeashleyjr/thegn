@@ -390,6 +390,10 @@ is kept and surfaced. Kept stderr, junk lines and `log` messages have every
 account `env` value and every command argument after the program replaced by
 `<redacted>`.
 
+If thegn stops waiting for a command-plugin fetch before it finishes,
+including when the pass deadline expires or a reload or shutdown abandons it,
+the plugin process group is killed too.
+
 ## Related
 
 - [Masthead & status bar](bars.md) — the `date`, `clock` and `weather` widgets

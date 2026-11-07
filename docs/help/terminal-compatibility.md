@@ -30,10 +30,30 @@ It prints three things worth reading together:
 The resolved row is the truth. If it says `ascii` and you expected
 Unicode, the detection or your locale is the thing to fix.
 
-The degradation ladder is a CI gate, not a promise: `just term-check` runs
-`thegn doctor` under six environments (kitty, bare xterm, `NO_COLOR`,
-256-color, and the glyph/color overrides) and fails the build if any resolves
-differently from the table above.
+`just term-check` (a contributor recipe in a source checkout) runs `thegn doctor`
+under six simulated environments — a kitty-style TERM, a bare xterm with
+`LANG=C`, `NO_COLOR`, a 256-color TERM, and the glyph and color overrides — and
+fails if the resolved color depth or glyph level is not the one the recipe
+expects. These are simulated environment variables, not real terminal emulators.
+
+## Terminals the project exercises
+
+The project does not run a compatibility matrix. This is what it actually
+exercises, and nothing more.
+
+| Terminal  | Evidence                                                                                                                                                                                                      |
+| --------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Ghostty   | shipped profile (`config/ghostty.config`) and the contributor dev window (`just start-term`)                                                                                                                  |
+| Alacritty | shipped profile (`config/alacritty.toml`), the Nix batteries launcher and `tg --standalone`; the batteries derivation is build-tested on x86_64 Linux and a clean-host interactive rehearsal is still pending |
+
+Other emulators (WezTerm, kitty, foot, iTerm2, Terminal.app, Windows
+Terminal), tmux and the Linux console are not tested by the project. thegn is
+built to degrade to what a terminal reports, so they are expected to work, but
+treat that as unverified; `thegn doctor` shows what thegn detected. If something
+renders wrongly, report it with the "Outer terminal" field filled in.
+
+macOS is best-effort; the Option-as-Alt table below is configuration
+guidance, not a test result.
 
 ## Nix batteries terminal
 
@@ -159,9 +179,10 @@ program in that pane requests an extended keyboard mode (`modifyOtherKeys`,
 
 ### When the terminal ignores the request
 
-Alacritty, tmux without `extended-keys on`, the Linux console, older VTE,
-Terminal.app and kitty-protocol-only emulators all leave level 2 off. The
-chords are then not merely inert — they arrive as something else:
+Some terminals do not implement level 2, or ignore the request; tmux without
+`extended-keys on` is the most common cause (see below), and support varies by
+terminal and version. `thegn doctor` reports what yours did. When level 2 is
+off, the chords are not merely inert — they arrive as something else:
 
 | chord       | what thegn actually sees         |
 | ----------- | -------------------------------- |

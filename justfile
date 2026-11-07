@@ -395,6 +395,15 @@ bench-soak *args: release _perf-guard
 bench-soak-daemon *args: release _perf-guard
     bash test/perf/cpu-sample.sh --scenario soak-daemon {{args}}
 
+# Opt-in, Linux only: strace the first frame of the release binary under full isolation and list
+# every connect() target; exits 1 on any non-AF_UNIX connect. Report format: scripts/first-run-net-trace.sh.
+net-trace *args: release _perf-guard
+    bash scripts/first-run-net-trace.sh {{args}}
+
+# Hermetic test for the net-trace summariser: canned strace text, no strace, no thegn.
+test-net-trace:
+    python3 -B scripts/first_run_net_trace_test.py
+
 # Switch/input latency under a multi-pane output flood (A/B only — advisory,
 # machine-dependent). Reads switch_p99/input_p99 from the perf rollup while
 # several worktree shells scroll at full speed and Alt+Down fires mid-flood.
@@ -856,6 +865,14 @@ doctor:
 doc-check:
     RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --workspace --document-private-items
 
+# Lint CHANGELOG.md headings: no internal process labels in sections newer than the pinned baseline.
+changelog-lint:
+    python3 -B test/changelog_lint.py
+
+# Hermetic self-test of the changelog heading lint.
+test-changelog-lint:
+    python3 -B test/changelog_lint.py --selftest
+
 # Format everything via treefmt (rust, nix, bash, toml, yaml, markdown).
 fmt:
     nix fmt
@@ -868,7 +885,7 @@ fmt-check:
 # `cargo test`. This recipe is the single source of truth shared by the CI
 # `test` job and the pre-push hook. Doctests are `test-doc` (CI-only) — see
 # the note there.
-test: contract-ratchets test-live test-heredoc-guard test-build-metadata test-the429 test-action-pins test-apply-backend test-nix-metadata test-nextest-setup test-packaging test-cargo-provenance
+test: contract-ratchets test-live test-heredoc-guard test-build-metadata test-the429 test-action-pins test-apply-backend test-nix-metadata test-nextest-setup test-packaging test-cargo-provenance test-third-party-notices test-changelog-lint demo-script-check test-net-trace
     cargo nextest run --workspace
 
 # Doctest pass. Split out of `test` (and therefore off pre-push) because it is
@@ -1128,6 +1145,15 @@ term-check: build
 _apply-backend backend="":
     if [ -n "{{backend}}" ]; then python3 -B "{{justfile_directory()}}/scripts/apply_backend.py" "{{backend}}"; fi
 
+# Opt-in: run the scripted demo (needs muse, git and a built release binary; see test/demo/README.md).
+demo-script *args:
+    bash test/demo/demo.sh {{args}}
+
+# Hermetic: validate the demo steps file and driver WITHOUT launching thegn or muse.
+demo-script-check:
+    python3 -B test/demo/check_demo.py --selftest
+    python3 -B test/demo/check_demo.py
+
 # Dogfood the local merge queue (the fold-actor): same isolated state root as
 # `start`, but with `[merge_queue]` switched on via --set overrides (no daily
 # config edit needed). Folds eligible worktree branches into the target branch
@@ -1302,6 +1328,20 @@ test-packaging:
 # and uses only throwaway repositories, isolated Git config, and XDG state.
 test-the429:
     binary="${THEGN_TEST_BINARY:-}"; if [ -z "$binary" ] && [ -x "${CARGO_TARGET_DIR:-target}/release/thegn" ]; then binary="${CARGO_TARGET_DIR:-target}/release/thegn"; fi; if [ -z "$binary" ]; then echo "THE-429 native fixture: missing compiled binary; set THEGN_TEST_BINARY for the final native gate" >&2; else binary="$(realpath -- "$binary")"; echo "THE-429 native fixture: selected $binary"; fi; THEGN_TEST_BINARY="$binary" python3 -B test/the429_checkout_hooks.py
+
+# Regenerate THIRD_PARTY_NOTICES.md from `cargo metadata --locked --offline`
+# (commit the result; the release workflow copies it into the release assets).
+third-party-notices:
+    python3 -B scripts/third_party_notices.py
+
+# Fail when THIRD_PARTY_NOTICES.md is stale against Cargo.lock (needs cargo and a warm
+# registry cache; not part of `just test`).
+third-party-notices-check:
+    python3 -B scripts/third_party_notices.py --check
+
+# Hermetic test for the notices generator; pure Python, no Cargo.
+test-third-party-notices:
+    python3 -B test/third_party_notices_test.py
 
 # Install/update the native thegn host onto your PATH (standalone, non-Nix):
 # builds release artifacts, installs `tg` as the dedicated alacritty launcher,
