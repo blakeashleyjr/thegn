@@ -365,6 +365,7 @@ pub(crate) fn provision_worktree(
                 // halt; the "run on host" escape is provider-env-scoped.
                 ask: false,
                 dormant: None,
+                sealed_home: false,
             }))
         }
     }
