@@ -113,6 +113,7 @@ pub(crate) fn ssh_none_guard(
                 .to_string(),
             ask,
             dormant: None,
+            sealed_home: false,
         }
         .into());
     }

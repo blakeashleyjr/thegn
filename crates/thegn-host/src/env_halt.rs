@@ -80,6 +80,7 @@ pub fn env_halt_reason(cfg: &Config, worktree: &str) -> Option<SandboxHalt> {
                 thegn_core::config::FailoverMode::Ask
             ),
             dormant: None,
+            sealed_home: false,
         });
     }
     let selection = match Db::open()
@@ -124,6 +125,7 @@ pub fn env_halt_reason(cfg: &Config, worktree: &str) -> Option<SandboxHalt> {
                 ),
                 ask: matches!(mode, thegn_core::config::FailoverMode::Ask),
                 dormant: None,
+                sealed_home: false,
             });
         }
     }
@@ -160,6 +162,7 @@ pub fn env_halt_reason(cfg: &Config, worktree: &str) -> Option<SandboxHalt> {
                 reason: format!("API token {var} could not be resolved"),
                 ask,
                 dormant: None,
+                sealed_home: false,
             });
         }
         // Connect-failure cooldown: a recent connect/auth failure (401, or an ssh
@@ -181,6 +184,7 @@ pub fn env_halt_reason(cfg: &Config, worktree: &str) -> Option<SandboxHalt> {
                 ),
                 ask,
                 dormant: None,
+                sealed_home: false,
             });
         }
         tracing::debug!(target: "thegn::sandbox", env = %environment.name, "env_halt_reason: provider OK, no halt");
@@ -199,6 +203,7 @@ fn unreadable_selection_halt(worktree: &str, error: &anyhow::Error) -> SandboxHa
         ),
         ask: false,
         dormant: None,
+        sealed_home: false,
     }
 }
 
