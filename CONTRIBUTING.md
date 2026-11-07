@@ -4,6 +4,25 @@ Welcome! This gets you from clone to a running dev build in a few minutes.
 For the product tour see [`README.md`](README.md); for architecture and
 invariants see [`CLAUDE.md`](CLAUDE.md).
 
+## Start here
+
+- Linux x86_64 is supported; macOS is best-effort; Windows is deferred (see the
+  contributor notes below).
+- Questions and bug reports go through [SUPPORT.md](SUPPORT.md) and the issue
+  templates. Security reports go through [SECURITY.md](SECURITY.md), never a
+  public issue.
+- For a first change, read [CLAUDE.md](CLAUDE.md), enter the dev shell with
+  `nix develop`, and iterate with `just quick <crate>` and targeted tests such
+  as `cargo nextest run -p <crate> <filter>`. The [Dev loop](#dev-loop)
+  explains when to leave the heavy gates until later: `just test` and
+  `just smoke` are pre-push; `just ci` (including lint) is run before opening
+  a PR.
+- Use conventional-commit titles (`feat(scope):`, `fix(scope):`). The
+  [PR template](.github/pull_request_template.md) has the checklist: new
+  behavior needs tests, and changes to actions, keybinds, zones, or panel
+  sections need the relevant `docs/help/` page updated in the same change.
+- Contributions are dual-licensed MIT OR Apache-2.0 (see [License](#license)).
+
 ## Prerequisites
 
 **The recommended path on every platform is [Nix](https://nixos.org/download/)
@@ -156,8 +175,8 @@ Roadmap and specs: `tasks.md` is the roadmap index; behavior specs live in
   minutes at 10x. It runs only on a manual dispatch with `extras`:
   `gh workflow run ci.yml --ref <branch> -f extras=true`. (There is **no**
   `[ci-macos]` commit-message trigger — nor `[ci-windows]` or `[ci-e2e]`; the
-  jobs are gated purely on `if: ${{ inputs.extras }}`, and remote CI is paused
-  besides, so nothing runs on push at all.)
+  extras jobs are gated on `if: ${{ inputs.extras }}`. Pull requests run the
+  lean CI set; pushes do not trigger remote CI.)
 - **State paths** follow XDG conventions (`~/.config/thegn`,
   `~/.local/state/thegn`) on macOS too; set `XDG_CONFIG_HOME`/
   `XDG_STATE_HOME` if you prefer `~/Library`. Keep `XDG_STATE_HOME` shortish:
@@ -254,10 +273,11 @@ don't apply:
   kill-on-close Job Objects), the SIGUSR2 flamegraph profiler, and the
   merge-queue headless agent (POSIX quoting).
 - **CI:** `just check-cross` includes the Linux-side
-  `x86_64-pc-windows-gnu` workspace check. Remote CI is currently dispatch-only;
-  the full `windows-latest` MSVC job (check + IPC/Job-Object kernel tests,
-  release build, and downloaded-artifact smoke) runs only when `ci.yml` is
-  dispatched with `extras: true`.
+  `x86_64-pc-windows-gnu` workspace check. Pull requests run the lean CI set
+  (fmt, clippy, nextest and smoke); heavy jobs run nightly or on dispatch. The
+  full `windows-latest` MSVC job (check + IPC/Job-Object kernel tests, release
+  build, and downloaded-artifact smoke) runs only when `ci.yml` is dispatched
+  with `extras: true`.
 
 ### Running the tests under Wine (from Linux)
 

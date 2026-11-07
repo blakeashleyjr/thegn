@@ -1,8 +1,11 @@
 blank_issues_enabled: false
 contact_links:
+  - name: Read the known issues
+    url: https://github.com/blakeashleyjr/thegn/blob/main/KNOWN_ISSUES.md
+    about: Check whether your problem is already listed.
   - name: Questions & ideas (Discussions)
     url: https://github.com/blakeashleyjr/thegn/discussions
-    about: Ask questions, share setups, and discuss ideas here.
+    about: Ask questions, share setups, and discuss ideas here (if Discussions is enabled for the repository).
   - name: Security vulnerability
     url: https://github.com/blakeashleyjr/thegn/security/advisories/new
     about: Report security issues privately. Do not open a public issue.

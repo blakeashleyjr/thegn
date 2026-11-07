@@ -22,6 +22,7 @@ pub const SOURCES: &[&str] = &[
     include_str!("../../../../docs/help/ai-usage.md"),
     include_str!("../../../../docs/help/calendar.md"),
     include_str!("../../../../docs/help/command-palette.md"),
+    include_str!("../../../../docs/help/quick-reference.md"),
     include_str!("../../../../docs/help/search.md"),
     include_str!("../../../../docs/help/search-replace.md"),
     include_str!("../../../../docs/help/git-and-diffs.md"),
@@ -29,22 +30,27 @@ pub const SOURCES: &[&str] = &[
     include_str!("../../../../docs/help/media.md"),
     include_str!("../../../../docs/help/voice.md"),
     include_str!("../../../../docs/help/daemon-and-sessions.md"),
+    include_str!("../../../../docs/help/privacy.md"),
     include_str!("../../../../docs/help/mobile-access.md"),
     include_str!("../../../../docs/help/release-channels.md"),
     include_str!("../../../../docs/help/debugging.md"),
+    include_str!("../../../../docs/help/upgrading-and-uninstalling.md"),
     include_str!("../../../../docs/help/cli.md"),
     include_str!("../../../../docs/help/theming.md"),
     include_str!("../../../../docs/help/workflows.md"),
+    include_str!("../../../../docs/help/troubleshooting.md"),
     include_str!("../../../../docs/help/review-a-pr.md"),
     include_str!("../../../../docs/help/merge-queue.md"),
     include_str!("../../../../docs/help/pipeline-board.md"),
     include_str!("../../../../docs/help/pr-queue.md"),
     include_str!("../../../../docs/help/projects.md"),
+    include_str!("../../../../docs/help/comparison.md"),
     include_str!("../../../../docs/help/sandboxing.md"),
     include_str!("../../../../docs/help/plugins.md"),
     include_str!("../../../../docs/help/configuration.md"),
     include_str!("../../../../docs/help/skills.md"),
     include_str!("../../../../docs/help/notifications.md"),
+    include_str!("../../../../docs/help/known-limitations.md"),
     include_str!("../../../../docs/help/automations.md"),
     include_str!("../../../../docs/help/terminal-compatibility.md"),
     include_str!("../../../../docs/help/best-practices.md"),
@@ -103,6 +109,18 @@ mod tests {
         assert!(
             reg.page("config-reference").is_some(),
             "generated page registered"
+        );
+    }
+
+    #[test]
+    fn the_schema_refusal_help_page_exists() {
+        let (reg, errors) = build_registry(&thegn_core::config::Config::default());
+        assert!(errors.is_empty(), "{errors:?}");
+        let msg = thegn_core::db::schema_refusal(62, 57, false).expect("refusal");
+        assert!(msg.contains("upgrading-and-uninstalling"), "{msg}");
+        assert!(
+            reg.page("upgrading-and-uninstalling").is_some(),
+            "the refusal message names a help page that is not registered"
         );
     }
 

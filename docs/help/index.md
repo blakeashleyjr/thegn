@@ -26,7 +26,9 @@ the page for whatever has focus.
 - [[getting-started]] — the mental model in two minutes
 - [[workspaces-and-worktrees]] — the core objects and their lifecycle
 - [[keybindings]] — every key, with _your_ rebinds applied
+- [[quick-reference]] — the core keys on one page, and the actions that delete things
 - [[best-practices]] — how thegn wants to be used
+- [[comparison]] — thegn next to tmux, Zellij, lazygit and VS Code worktrees
 
 ## The screen, by region
 
@@ -51,6 +53,7 @@ the page for whatever has focus.
 - [[daemon-and-sessions]] — detach, reattach, and serve thin clients
 - [[share-and-forward]] — expose a port, forward a service
 - [[cli]] — every command, for scripts and agents
+- [[upgrading-and-uninstalling]] — upgrade, roll back, back up your state, uninstall
 
 ## Everything else
 
@@ -58,5 +61,8 @@ the page for whatever has focus.
 - [[terminal-compatibility]] — colors, glyphs, and `thegn doctor`
 - [[release-channels]] — stable vs dev, and what's gated
 - [[debugging]] — diagnose thegn and inspect its debugger limits
+- [[troubleshooting]] — symptom first: what you see and what to do
+- [[known-limitations]] — what does not work yet
+- [[privacy]] — what stays on your machine and what can leave it
 - [[media]] — the now-playing controls
 - [[help]] — how this help system itself works

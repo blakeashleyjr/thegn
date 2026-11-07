@@ -8,15 +8,24 @@ rely on.
 
 Noun-verb namespaces mirror the domain model (repo → workspace → worktree):
 
-| Group         | Commands                                                                                                                           |
-| ------------- | ---------------------------------------------------------------------------------------------------------------------------------- |
-| Workspace     | `wt list\|new\|rm\|diff\|disk\|clean` · `repo list\|recent\|provenance` · `open <repo>` · `map` · `land` · `integrate` · `merge`   |
-| Forge         | `pr` · `issue` · `dispatch` · `kaneo` · `ci`                                                                                       |
-| Search        | `search <pattern> [--regex\|--structural] [--replace <tpl> [--apply]]` — workspace find & replace (read/write scoped)              |
-| Environments  | `env` · `zone` · `host` · `placement` · `sandbox` · `debug` · `mcp` · `plugin`                                                     |
-| Session       | `session list\|open\|fork\|close\|send\|snapshot\|attach\|wait\|record` · `notify` · `logs` · `share` · `forward` · `sandbox-argv` |
-| Control plane | `serve` · `session` · `attach` · `pair`                                                                                            |
-| Meta          | `config` · `theme` · `skills` · `doctor` · `setup` · `voice` · `completions`                                                       |
+| Group         | Commands                                                                                                                                                                                                                                                                                                                                                                                                     | Channel                                                                |
+| ------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ | ---------------------------------------------------------------------- |
+| Workspace     | `wt list\|new\|rm\|diff\|disk\|clean` · `repo list\|recent\|provenance` · `program` — Manage programs (multi-repo groups — grouping only, no policy; alias: `project`; `list\|create\|rename\|rm\|assign`) · `open <repo>` · `map` · `land` · `integrate` · `merge` · `search <pattern> [--regex\|--structural] [--replace <tpl> [--apply]]` — workspace find & replace (read/write scoped)                  | stable                                                                 |
+| Forge         | `pr` · `issue` · `dispatch` · `supervise` · `kaneo` · `ci` · `autopilot` — Opt-in issue-to-PR supervisor; `status` is read-only and never starts work                                                                                                                                                                                                                                                        | stable                                                                 |
+| Environments  | `env` · `zone` · `host` (dev) · `placement` (dev) · `sandbox` · `debug` · `mcp` · `plugin`                                                                                                                                                                                                                                                                                                                   | stable; `host` and `placement` are dev; `sandbox` remote parts are dev |
+| Session       | `session list\|open\|fork\|close\|send\|snapshot\|attach\|wait\|record` · `notify` · `automations` — Inspect trusted automation rules or dry-run an event fixture (`list\|test`) · `logs` · `share` · `forward` · `sandbox-argv` · `events` — Stream the daemon's filtered live event feed (`events tail`)                                                                                                   | stable                                                                 |
+| Control plane | `serve` · `session` · `attach` · `pair` · `api` · `proxy` — Model proxy: status/stats (read), start/stop (admin) (`status\|stats\|start\|stop`) · `agent`                                                                                                                                                                                                                                                    | stable                                                                 |
+| Meta          | `voice setup\|status\|model list\|model pull\|model rm` · `config` · `secret` — Credential broker: store/remove/list/migrate/audit secrets, rotate SSH keys (`set\|rm\|list\|migrate\|audit\|ssh rotate`) · `keys` — Inspect and check keybindings: `list`, `validate`, `hints` · `theme` · `skills` · `doctor` · `db` — Inspect or reclaim unused state database space (`vacuum`) · `setup` · `completions` | stable; `voice` is dev                                                 |
+
+### Channels
+
+Stable verbs are available in every build. Dev verbs are available in the dev
+channel (`.#dev` flake output or `THEGN_CHANNEL=dev`); a stable build refuses
+`host` and `placement` with a message identifying each as a dev-channel feature
+and directing you to the dev build or `THEGN_CHANNEL=dev`. Experimental remote
+worktrees, cloud providers, placement, and voice stay off in stable even when
+configured. Observe dashboards and plugin app tabs are stable. The stable/dev
+matrix is shown by `thegn doctor` and [release channels](help/release-channels.md).
 
 `voice setup [--language en|auto] [--model NAME] [--kind embedded|http|command]`
 configures experimental dictation. Setup confirms model size before download;
@@ -30,7 +39,7 @@ experimental channel. See [voice help](help/voice.md) and
 [release verification](voice-verification.md).
 
 `session open --resume-work <row>` resumes an eligible unfinished pipeline row
-through the roster (THE-86): it refuses an unstamped spawning/running source
+through the roster: it refuses an unstamped spawning/running source
 whose worker may still be live, reconciles eligible parked or exited work, and
 atomically admits the finisher against the stage's duplicate/capacity gate
 (refusal leaves the source unchanged). It renders the new row's exact id and

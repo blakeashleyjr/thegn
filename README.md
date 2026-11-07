@@ -1,11 +1,17 @@
 # thegn
 
-> **Status: public alpha** (`0.1.0-alpha.55`). **x86_64 Linux is the supported
+**A terminal-native Git worktree IDE that is its own multiplexer.**
+
+> **Status: public alpha** (`0.1.0-alpha.56`). **x86_64 Linux is the supported
 > platform.** macOS on Apple silicon is best-effort: use the flake or source
-> setup until a release archive is published. CI is opt-in and the
-> interactive on-device checklist is unfinished. Windows is deferred and has no release binary.
+> setup until a release archive is published. Pull requests run lean CI checks
+> (format, lint, test, smoke); the full gate runs nightly and on demand, and
+> the interactive on-device checklist is unfinished. Windows is deferred and
+> has no release binary.
 > Expect rough edges; see [`CHANGELOG.md`](CHANGELOG.md) and
 > [`KNOWN_ISSUES.md`](KNOWN_ISSUES.md), and please file issues.
+
+<!-- DEMO: place the 45-60 second demo GIF here (for example docs/assets/demo.gif) once it is recorded. No asset exists yet; do not add an image link that would 404. -->
 
 A terminal-native git-worktree IDE that is **its own terminal multiplexer**.
 One session: each git repo is a **project**, and each git **worktree** gets
@@ -16,15 +22,82 @@ native, unsandboxed processes (see the [plugins help page](docs/help/plugins.md)
 (thegn was originally built on zellij; that architecture was fully stripped
 and it is now a from-scratch native compositor.)
 
-A single **Rust** binary (`thegn`, with a short `tg` alias) drives
-portable-pty panes, composites them with the chrome into a termwiz surface,
-and diff-flushes to your terminal. Panes are owned by a background **pane
-daemon**, so quitting the UI detaches your sessions and the next launch
-reattaches them, scrollback intact (tmux semantics — disable with `[daemon]
-enabled = false`). A bundled SQLite store keeps repo history, worktree state,
-session layout, and a PR cache. Design targets are sub-300ms launch,
-<16ms renders, and near-zero idle CPU; measure with `just bench` and
-`just bench-idle`.
+## Quickstart (Linux x86_64)
+
+Linux x86_64 is the supported platform; macOS on Apple silicon is best-effort
+and Windows is deferred. See [Install](#install) for platform details.
+
+### 1. Install
+
+With Nix:
+
+```sh
+nix profile install github:blakeashleyjr/thegn
+```
+
+Or install a published Linux x86_64 release tarball with the same commands as
+[Prebuilt binary](#prebuilt-binary-no-nix) below. Use the musl archive on older
+distributions, and put `$HOME/.local/bin` on `PATH`:
+
+```sh
+TAG="$(gh release list --repo blakeashleyjr/thegn --exclude-drafts --limit 100 --json tagName --jq '.[0].tagName')"
+TARGET=x86_64-unknown-linux-gnu
+ARCHIVE="thegn-${TAG}-${TARGET}.tar.gz"
+CHECKSUM="thegn-${TAG}-${TARGET}.sha256"
+gh release download "$TAG" --repo blakeashleyjr/thegn --pattern "$ARCHIVE" --pattern "$CHECKSUM"
+sha256sum -c "$CHECKSUM"
+gh attestation verify "$ARCHIVE" --repo blakeashleyjr/thegn
+tar -xzf "$ARCHIVE" thegn
+mkdir -p "$HOME/.local/bin"
+install -m 755 thegn "$HOME/.local/bin/thegn"
+```
+
+The tarball commands need the GitHub CLI (`gh auth login`); alternatively
+download the archive and `.sha256` in a browser (see
+[Prebuilt binary](#prebuilt-binary-no-nix)).
+
+### 2. Prerequisites
+
+| Tool                                              | Needed                         | What for                                                                                                     |
+| ------------------------------------------------- | ------------------------------ | ------------------------------------------------------------------------------------------------------------ |
+| `git`                                             | required                       | worktrees and git operations                                                                                 |
+| a sandbox backend (`bwrap`, `podman` or `docker`) | needed for the default sandbox | panes launch inside it; without one a sandboxed launch is refused unless you set `[sandbox] enabled = false` |
+| `fzf` or `gum`                                    | optional                       | interactive pickers (a numbered prompt is used without them)                                                 |
+| `lazygit`                                         | optional                       | `Alt-g`                                                                                                      |
+| `yazi`                                            | optional                       | files drawer (`Alt-y`)                                                                                       |
+| `gdu`                                             | optional                       | worktree-size inspector                                                                                      |
+| `gh`                                              | optional                       | GitHub fallback for PR/CI views                                                                              |
+| `delta`                                           | not needed                     | diff highlighting is built in                                                                                |
+
+Only `git` is required. For a tarball install, put any optional tools you want
+to use on `PATH`. The Nix package wraps `git`, `fzf`, `gum`, `lazygit`, `yazi`,
+`gh` and `gdu` onto `PATH` for you.
+
+### 3. First run
+
+1. Run `thegn` (or `tg` from the flake or `./install.sh`) in a terminal where
+   Alt reaches the application. On macOS, set Option as Meta; see the
+   [terminal compatibility help page](docs/help/terminal-compatibility.md).
+2. Run `thegn doctor` to see the resolved terminal capabilities and sandbox
+   backend.
+3. Press `Alt-W` to open or clone a repo as a project.
+4. Press `Alt-w` to create a worktree and pick what to run in it.
+5. Use `Alt-1..9` to jump to a worktree, `Ctrl-Space` for the command palette,
+   `F1` for help, `Alt-x` to close a pane or tab, and `Ctrl-q` to quit. Panes
+   keep running; relaunch to reattach.
+
+`Alt-X` (Shift) removes the whole worktree after a confirm prompt; the branch
+is kept.
+
+More: press `F1`, or see [getting started](docs/help/getting-started.md).
+
+> **Sandbox and credentials.** Worktree panes run in a sandbox by default. The
+> default `standard` profile keeps files outside the worktree read-only, apart
+> from carved-back state directories, and leaves `$HOME` readable, including
+> credentials such as `~/.ssh`, `~/.aws` and `~/.config/gh`. The opt-in `sealed`
+> profile hides `$HOME` and disables network access.
+> `[[plugins]]` extensions are native, unsandboxed processes. See the
+> [sandboxing help page](docs/help/sandboxing.md).
 
 ## Mental model
 
@@ -72,31 +145,31 @@ a git URL; it clones off-loop and opens as a project). Existing
 tmuxinator/sesh project files show up automatically as new-worktree templates.
 Defaults (override via `[keybinds]`):
 
-| Key                     | Action                                                   |
-| ----------------------- | -------------------------------------------------------- |
-| Ctrl-Space              | command palette (fuzzy menu of all actions)              |
-| Alt-←/→                 | previous / next tab (within the worktree)                |
-| Alt-↑/↓                 | previous / next worktree (within the project)            |
-| Shift-Alt-↑/↓           | previous / next project                                  |
-| Ctrl-←/↓/↑/→ (h/j/k/l)  | move focus: sidebar ↔ panes ↔ panel (↑/↓ reach the bars) |
-| Alt-\`                  | bounce between projects region and terminals region      |
-| Alt-w / Alt-W           | new worktree ("what to run" picker) / new project        |
-| Alt-t / Alt-T           | new tab on the _same_ worktree / new terminal tab        |
-| Alt-p / Alt-n / Alt-N   | new pane: smart split / split down / split right         |
-| Alt-o                   | switch project                                           |
-| Alt-s / Alt-.           | focus sidebar / focus panel                              |
-| Ctrl-Alt-s / Ctrl-Alt-p | hide/show sidebar / diff-PR panel                        |
-| Ctrl-Alt-f · Alt-y      | toggle files drawer (bundled yazi, bottom)               |
-| Alt-g · Alt-e · Alt-/   | lazygit · `$EDITOR` · git diff                           |
-| Alt-1..9 / Ctrl-1..9    | jump to worktree N / project N (sidebar order)           |
-| Ctrl-Alt-1..9           | launch / focus pinned programs (`[[pins]]`)              |
-| Ctrl-Alt-↑/↓            | reorder the selected project / worktree                  |
-| Ctrl-Alt-/ · Ctrl-/     | search pane history · search across panes                |
-| Ctrl-Alt-z              | zoom the focused pane / zone                             |
-| Alt-r                   | time-travel replay of the focused pane (`[replay]`)      |
-| Ctrl-g                  | keybind lock (pass every chord through to the pane)      |
-| Alt-x / Alt-X           | close (pane if split, else tab) / remove worktree        |
-| Ctrl-q                  | quit                                                     |
+| Key                     | Action                                                                                  |
+| ----------------------- | --------------------------------------------------------------------------------------- |
+| Ctrl-Space              | command palette (fuzzy menu of all actions)                                             |
+| Alt-←/→                 | focus the neighbouring pane (then sidebar / panel); at the edge, previous / next tab    |
+| Alt-↑/↓                 | focus the neighbouring pane; at the edge, previous / next worktree (within the project) |
+| Shift-Alt-↑/↓           | previous / next project                                                                 |
+| Ctrl-←/↓/↑/→ (h/j/k/l)  | move focus: sidebar ↔ panes ↔ panel (↑/↓ reach the bars)                                |
+| Alt-\`                  | bounce between projects region and terminals region                                     |
+| Alt-w / Alt-W           | new worktree ("what to run" picker) / new project                                       |
+| Alt-t / Alt-T           | new tab on the _same_ worktree / new terminal tab                                       |
+| Alt-p / Alt-n / Alt-N   | new pane: smart split / split down / split right                                        |
+| Alt-o                   | switch project                                                                          |
+| Alt-s / Alt-.           | focus sidebar / focus panel                                                             |
+| Ctrl-Alt-s / Ctrl-Alt-p | hide/show sidebar / diff-PR panel                                                       |
+| Ctrl-Alt-f · Alt-y      | toggle files drawer (bundled yazi, bottom)                                              |
+| Alt-g · Alt-e · Alt-/   | lazygit · `$EDITOR` · git diff                                                          |
+| Alt-1..9 / Ctrl-1..9    | jump to worktree N / project N (sidebar order)                                          |
+| Ctrl-Alt-1..9           | launch / focus pinned programs (`[[pins]]`)                                             |
+| Ctrl-Alt-↑/↓            | reorder the selected project / worktree                                                 |
+| Ctrl-Alt-/ · Ctrl-/     | search pane history · search across panes                                               |
+| Ctrl-Alt-z              | zoom the focused pane / zone                                                            |
+| Alt-r                   | time-travel replay of the focused pane (`[replay]`)                                     |
+| Ctrl-g                  | keybind lock (pass every chord through to the pane)                                     |
+| Alt-x / Alt-X           | close (pane if split, else tab) / remove worktree                                       |
+| Ctrl-q                  | quit                                                                                    |
 
 The defaults follow one modifier grammar, so a chord is predictable from its
 modifiers: **Ctrl** moves focus only (and never creates/destroys, so `Ctrl-w`
@@ -189,13 +262,13 @@ rehearsal before it becomes an install instruction.
 state; “host” remains the user's responsibility. A buildable path is not called
 supported until its clean-host rehearsal is recorded.
 
-| Path                        | Terminal                                                                                      | Font                                                                      | Config                                                                          | Binary                                | Status and fallback                                                                                                                                                                                   |
-| --------------------------- | --------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------- | ------------------------------------------------------------------------------- | ------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| Linux, Nix batteries        | bundled Alacritty                                                                             | bundled FiraCode Nerd Font                                                | generated user-local copy                                                       | flake-built Thegn                     | shipped x86_64 Linux path; run `nix run github:blakeashleyjr/thegn#batteries`                                                                                                                         |
-| Linux, standalone installer | host terminal; host Alacritty reused or pinned user-local Alacritty 0.17.0 with `--batteries` | host, or verified FiraCode Nerd Font v3.5.0 user-local with `--batteries` | generated Thegn config; writable user-local Alacritty config with `--batteries` | installed source build                | partial; no clean-host rehearsal; use the ordinary current-terminal path or the Nix batteries path                                                                                                    |
-| macOS, Nix batteries        | bundled Alacritty                                                                             | bundled FiraCode Nerd Font                                                | generated user-local copy                                                       | flake-built Thegn                     | composition exists, but remains best-effort until the macOS clean-host checklist passes                                                                                                               |
-| macOS app launcher          | selected host terminal                                                                        | host                                                                      | generated Thegn config and local `.app` launcher                                | installed source build or PATH binary | partial; use Nix or the source install while signing and full bundle rehearsal remain open                                                                                                            |
-| Windows native              | host Windows Terminal                                                                         | host                                                                      | host                                                                            | source build only                     | deferred to [THE-140](https://linear.app/blakeashley/issue/THE-140) and [THE-145](https://linear.app/blakeashley/issue/THE-145); use a supported x86_64 Linux host when verified behavior is required |
+| Path                        | Terminal                                                                                      | Font                                                                      | Config                                                                          | Binary                                | Status and fallback                                                                                |
+| --------------------------- | --------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------- | ------------------------------------------------------------------------------- | ------------------------------------- | -------------------------------------------------------------------------------------------------- |
+| Linux, Nix batteries        | bundled Alacritty                                                                             | bundled FiraCode Nerd Font                                                | generated user-local copy                                                       | flake-built Thegn                     | shipped x86_64 Linux path; run `nix run github:blakeashleyjr/thegn#batteries`                      |
+| Linux, standalone installer | host terminal; host Alacritty reused or pinned user-local Alacritty 0.17.0 with `--batteries` | host, or verified FiraCode Nerd Font v3.5.0 user-local with `--batteries` | generated Thegn config; writable user-local Alacritty config with `--batteries` | installed source build                | partial; no clean-host rehearsal; use the ordinary current-terminal path or the Nix batteries path |
+| macOS, Nix batteries        | bundled Alacritty                                                                             | bundled FiraCode Nerd Font                                                | generated user-local copy                                                       | flake-built Thegn                     | composition exists, but remains best-effort until the macOS clean-host checklist passes            |
+| macOS app launcher          | selected host terminal                                                                        | host                                                                      | generated Thegn config and local `.app` launcher                                | installed source build or PATH binary | partial; use Nix or the source install while signing and full bundle rehearsal remain open         |
+| Windows native              | host Windows Terminal                                                                         | host                                                                      | host                                                                            | source build only                     | deferred; use a supported x86_64 Linux host when verified behavior is required                     |
 
 ### nix-darwin (macOS)
 
@@ -255,12 +328,10 @@ Put `$HOME/.local/bin` on `PATH` if it is not already there. The `.sha256`
 sidecar checks the archive digest, and
 `gh attestation verify` checks its build provenance. You can also download the
 archive and sidecar in a browser and run the verification commands locally.
-Tarball users must also put `fzf`, `gum`, `yazi`, `delta`, and `gdu` on `PATH`
-for the panes that use them; the flake wraps these tools.
-
-`git` is required at runtime. `gh` and `ssh` are used as needed for GitHub and
-SSH integration where native support has gaps. Diff highlighting is built in;
-`lazygit` (the embedded Git UI) is optional.
+`git` is required at runtime. `fzf` or `gum`, `yazi`, `gdu`, `lazygit` and
+`gh` are optional for their related pickers, files drawer, worktree-size
+inspector, Git UI and GitHub PR/CI fallback; `delta` is not needed because diff
+highlighting is built in. The flake wraps these optional tools onto `PATH`.
 
 **On macOS, prefer Nix or a local source build.** Homebrew and AUR publication
 are pending owner setup and a clean-host rehearsal. If a macOS archive is
@@ -331,7 +402,8 @@ the usual prefixes, but the baked path is what it prefers).
 
 **macOS is best-effort; Windows is deferred.** Until a macOS release archive
 is published, use the flake or source setup;
-CI is opt-in and the interactive on-device checklist is unfinished (see
+pull requests run lean CI checks, the full gate runs nightly and on demand,
+and the interactive on-device checklist is unfinished (see
 [`KNOWN_ISSUES.md`](KNOWN_ISSUES.md)). Windows has no release binary; source
 build notes below are for contributors, not a supported install path:
 
@@ -346,6 +418,16 @@ Reports from either platform are welcome.
 
 ## How it works
 
+A single **Rust** binary (`thegn`, with a short `tg` alias) drives
+portable-pty panes, composites them with the chrome into a termwiz surface,
+and diff-flushes to your terminal. Panes are owned by a background **pane
+daemon**, so quitting the UI detaches your sessions and the next launch
+reattaches them, scrollback intact (tmux semantics — disable with `[daemon]
+enabled = false`). A bundled SQLite store keeps repo history, worktree state,
+session layout, and a PR cache. These are design targets, not measured results;
+no benchmark is published. Contributors can measure with `just bench` and
+`just bench-idle`.
+
 - **A small Rust workspace.** `thegn-core` (substrate-agnostic domain logic:
   layered config, SQLite, keymap registry, theme, sandbox backends),
   `thegn-svc` (service seams with graceful degradation: gix-native git reads
@@ -356,14 +438,19 @@ Reports from either platform are welcome.
   timeout; PTY readers, hydration, and fs-watchers wake it over channels. A
   damage-region render planner repaints only what changed — pane output costs
   a bounded diff, not a chrome recompose. Idle cost is therefore near zero
-  (measured with `just bench-idle`, not guaranteed).
+  (a design goal checked with `just bench-idle`; not a published measurement).
 - **State.** SQLite at `$XDG_STATE_HOME/thegn/thegn.db` (WAL): repos,
   workspaces, worktrees, PR cache, layouts, session state. **git is the source
   of truth** for worktrees; the DB is a cache + resurrection layer. Restarting
   restores your workspace, worktree and pane layout (after a crash the active
   tab can be one switch stale; see [`KNOWN_ISSUES.md`](KNOWN_ISSUES.md)).
-- **Worktrees** default to `~/.thegn/worktrees/<repo>/<branch-slug>`;
+- **Worktrees** default to `~/.thegn/worktrees/<repo>/<label>--<digest>`;
   `worktree_mode = "in_repo"` uses `<repo>/.worktrees`.
+- thegn has no built-in model or managed agent. `[[agents]]` and `[[tools]]`
+  launch any CLI as an ordinary command. An opt-in local model proxy
+  (`tgproxy`, enabled only by `[model_proxy]`) exists in the source tree; it is
+  not part of the stable shell, is not in the release tarball, and does nothing
+  unless you configure it.
 
 ### CLI
 
@@ -413,8 +500,9 @@ repo-root `.thegn.{toml,yaml,yml,json}` overlays per-repo settings
 
 thegn renders to whatever terminal it runs in and **degrades gracefully** —
 from bare shells (Linux console, plain `xterm`, `screen`/`tmux`, CI capture,
-anything honoring `NO_COLOR`) up to fully-featured emulators (ghostty,
-wezterm, kitty, foot, …). Color quantizes truecolor → 256 → 16 → mono;
+anything honoring `NO_COLOR`) to fully-featured emulators. The project
+exercises Ghostty and Alacritty; other emulators are expected to work but are
+untested. Color quantizes truecolor → 256 → 16 → mono;
 Unicode box-drawing, dots, and the wordmark fall back to ASCII; undercurl and
 mouse are enabled per terminal. A bounded startup probe (Device Attributes +
 XTVERSION) catches modern emulators behind `ssh`/`tmux` that report a generic
@@ -432,20 +520,24 @@ environment and exactly which features are enabled vs degraded.
 ## Sandboxing worktrees
 
 By default each worktree's interactive process (agent / shell / tools) runs
-inside a container or sandbox. With the default `standard` profile, files
-outside the worktree are read-only apart from a few carved-back state
-directories (see the [sandboxing help page](docs/help/sandboxing.md)); `$HOME`
-remains readable, credentials included. Use `sealed` for confidentiality. The
-worktree stays on the host and is **bind-mounted at its real path**, so host-side
-git reads (sidebar, panel, PR) keep working.
+inside a container or sandbox using the `standard` profile. Files outside the
+worktree are read-only apart from a few carved-back state directories, and
+`$HOME` remains readable, credentials included. The opt-in `sealed` profile
+hides `$HOME` and disables network access (see the
+[sandboxing help page](docs/help/sandboxing.md)). The worktree stays on the
+host and is **bind-mounted at its real path**, so host-side git reads (sidebar,
+panel, PR) keep working.
 
 - **Backends** (`[sandbox] backend`): `auto` walks `backend_chain` —
   `podman-rootless` → `podman-rootful` → `docker` → `apple` (macOS `container`)
   → `bwrap` → `jobobject` (Windows Job Objects). `apple` and `jobobject` probe
   absent off their respective OSes. There is no host fallback; a launch with
   no usable backend refuses. `systemd` and `wsl` are also selectable
-  explicitly. Hardening presets: `open` / `standard` (default)
-  / `sealed` (no network, read-only root, all caps dropped).
+  explicitly. Hardening presets: `open`, `standard` (the default: read-only
+  root, credentials readable), and `sealed` (opt-in: no network, read-only
+  root, all caps dropped). Set `[sandbox] profile = "sealed"`,
+  `[env.<name>.sandbox] profile = "sealed"`, or
+  `THEGN_SANDBOX_PROFILE=sealed` to opt in.
 - **Named environments** (`[env.<name>]`) place a worktree locally, over
   `ssh`, on Kubernetes, or on a managed provider; `thegn env` inspects and
   selects them. _(SSH and managed-provider placement are **dev channel only** —
@@ -469,6 +561,9 @@ subsystems is compiled in but **clamped off** outside the dev channel:
 - cloud execution providers and the managed pool,
 - the placement engine,
 - voice mode.
+
+Observe dashboards (off until you set `[observe] enabled = true`) and plugin
+app tabs are part of the stable channel.
 
 Enable them with `THEGN_CHANNEL=dev`, or install the dev build
 (`nix run github:blakeashleyjr/thegn#dev` / `nix profile install
@@ -512,6 +607,15 @@ Contributor docs: [`CLAUDE.md`](CLAUDE.md) (architecture + invariants),
 links), [`tasks.md`](tasks.md) (long-horizon roadmap), `openspec/specs/`
 (accepted behavior), and `docs/superpowers/{plans,specs}/` (design docs per
 feature).
+
+## Privacy
+
+What thegn stores, logs and sends is described in the in-app [privacy help
+page](docs/help/privacy.md) (press `F1`). In short: no vendor telemetry was
+found; crash reports and logs stay on your machine and are never uploaded
+automatically; GitHub and other forge, update and provider calls happen only
+when you use or enable those features. A first-run network trace has not been
+recorded yet.
 
 ## Security
 

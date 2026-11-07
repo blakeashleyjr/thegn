@@ -37,12 +37,26 @@ back to the host.
 Issue trackers including Linear, Jira, Kaneo, and GitHub are available in both
 channels. GitHub PR viewing is also stable. See [[review-a-pr]].
 
+## Stable features that start off or are easy to miss
+
+These two are part of the stable channel; they are listed here because they
+look like the dev-only features above.
+
+| Feature       | Covers                                                        | Config                                                |
+| ------------- | ------------------------------------------------------------- | ----------------------------------------------------- |
+| `observe`     | the Observe dashboard and fleet-view app tab (off by default) | `[observe] enabled = true`; switch with `Alt-2`       |
+| `plugin_apps` | resident plugin app tabs                                      | `[apps]` (`default_tab`, `tab_order`), plugin app ids |
+
+Plugin processes are native and unsandboxed; see [[plugins]] and [[sandboxing]].
+
 ## What stable guarantees
 
-Everything else. The AI-free terminal shell — git, panes, the
-[[sidebar]], the [[panel]], [[daemon-and-sessions]], the merge queue and
-`land`/`integrate`, the [[sandboxing]] backends, the whole [[cli]] — is
-unconditionally stable and never channel-gated.
+Everything else. The AI-free terminal shell — git, panes, the [[sidebar]], the
+[[panel]], [[daemon-and-sessions]], the merge queue and `land`/`integrate`, the
+[[sandboxing]] backends, issue trackers, Observe and plugin app tabs, and every
+[[cli]] verb except `thegn host` and `thegn placement` — is stable and is never
+channel-gated. Those two verbs refuse on the stable channel with a pointer to
+the dev channel.
 
 ## How the gate behaves
 
