@@ -179,6 +179,42 @@ pub struct SandboxHalt {
     pub sealed_home: bool,
 }
 
+#[derive(Debug)]
+pub(crate) struct WorktreeIsolationReadFailure {
+    halt: SandboxHalt,
+}
+
+impl std::fmt::Display for WorktreeIsolationReadFailure {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        std::fmt::Display::fmt(&self.halt, formatter)
+    }
+}
+
+impl std::error::Error for WorktreeIsolationReadFailure {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&self.halt)
+    }
+}
+
+pub(crate) fn worktree_isolation_read_failure(
+    worktree: &str,
+    error: &anyhow::Error,
+) -> anyhow::Error {
+    anyhow::Error::new(WorktreeIsolationReadFailure {
+        halt: SandboxHalt {
+            env_name: "worktree isolation".into(),
+            placement: worktree.to_string(),
+            reason: format!(
+                "thegn cannot read this worktree's isolation setting ({error:#}); refusing launch. Run `thegn doctor`, or once the database opens: {}",
+                thegn_core::sandbox_floor::clear_profile_hint(worktree)
+            ),
+            ask: false,
+            dormant: None,
+            sealed_home: false,
+        },
+    })
+}
+
 /// A provider session was selected, but its trusted launch command could no
 /// longer be constructed. This is a refusal, not a permission to reinterpret
 /// the request as a host shell: the caller must prepare the provider again.
@@ -591,11 +627,10 @@ pub fn prepare_sandbox_env_with_selection(
         return Err(anyhow::Error::new(refusal));
     }
     let is_provider = matches!(placement, thegn_core::placement::Placement::Provider(_));
-    if let Some(refusal) = thegn_core::sandbox_floor::provider_refusal(is_provider, &sb, &env_name)
+    if let Some(refusal) =
+        thegn_core::sandbox_floor::provider_refusal_for(is_provider, &sb, &env_name, Some(worktree))
     {
-        return Err(anyhow::Error::new(refusal).context(
-            thegn_core::sandbox_floor::standard_switch_hint(Some(worktree)),
-        ));
+        return Err(anyhow::Error::new(refusal));
     }
     if is_provider {
         let floor = thegn_core::sandbox_floor::floor_in_force(&sb, false);
@@ -725,13 +760,22 @@ pub fn prepare_sandbox_env_with_selection(
                 if spec.placement.is_local() {
                     break;
                 }
-                let admission = crate::sandbox_admission::admit(
-                    &sb,
-                    spec.capabilities().isolation,
-                    worktree,
-                    force_host_requested(worktree),
-                    &mut warnings,
-                )?;
+                if hardening.hides_home()
+                    && !matches!(&spec.placement, thegn_core::placement::Placement::Ssh(_))
+                {
+                    return Err(SandboxHalt {
+                        env_name: env_name.clone(),
+                        placement: placement_label.clone(),
+                        reason: format!(
+                            "sealed profile `{}` needs a container runtime on this remote placement; refusing a bare shell for {worktree}",
+                            hardening.as_str()
+                        ),
+                        ask,
+                        dormant: None,
+                        sealed_home: true,
+                    }
+                    .into());
+                }
                 ssh_none_guard(
                     &spec,
                     sb.backend,
@@ -739,6 +783,14 @@ pub fn prepare_sandbox_env_with_selection(
                     ask,
                     &env_name,
                     &placement_label,
+                    hardening,
+                )?;
+                let admission = crate::sandbox_admission::admit(
+                    &sb,
+                    spec.capabilities().isolation,
+                    worktree,
+                    force_host_requested(worktree),
+                    &mut warnings,
                 )?;
                 upload_provider_sync_once(
                     cfg,
@@ -1063,10 +1115,10 @@ pub fn prepare_sandbox_env_with_selection(
         .into());
     }
     // THE-215: a sealed profile never lands on the host. No spec, a `none`
-    // backend, or an unreachable runtime all end here — refuse, regardless of
-    // failover mode. (`sandbox.enabled = false` is the user's explicit choice and
-    // never enters the candidate walk; doctor says the profile is not enforced.)
-    if sb.enabled && hardening.hides_home() {
+    // backend or unreachable runtime all end here — refuse, regardless of
+    // failover mode. A sealed worktree pin also refuses when global/env sandboxing
+    // is disabled; an unpinned global sealed profile keeps its existing opt-out.
+    if sealed_pin_requires_sandbox(sb.enabled, selection.profile, hardening) {
         return Err(SandboxHalt {
             env_name: env_name.clone(),
             placement: placement_label.clone(),
@@ -1233,6 +1285,14 @@ pub fn prepare_sandbox_env_with_selection(
         route_ssh_target,
         admission,
     })
+}
+
+fn sealed_pin_requires_sandbox(
+    sandbox_enabled: bool,
+    pin: Option<thegn_core::config::SandboxProfile>,
+    effective: thegn_core::config::SandboxProfile,
+) -> bool {
+    effective.hides_home() && (sandbox_enabled || pin.is_some())
 }
 
 /// Validate the effective configured sources before backend resolution. The
@@ -2367,12 +2427,13 @@ pub fn provision_worktree(
     ) {
         return Ok(false);
     }
-    if let Some(refusal) =
-        thegn_core::sandbox_floor::provider_refusal(true, &environment.sandbox, &environment.name)
-    {
-        return Err(anyhow::Error::new(refusal).context(
-            thegn_core::sandbox_floor::standard_switch_hint(Some(worktree)),
-        ));
+    if let Some(refusal) = thegn_core::sandbox_floor::provider_refusal_for(
+        true,
+        &environment.sandbox,
+        &environment.name,
+        Some(worktree),
+    ) {
+        return Err(anyhow::Error::new(refusal));
     }
     // Flag the in-flight provision so the warm-claim fast path won't bind a
     // spare (and clear the splash) under this run — see `provision_gate`.
@@ -4520,7 +4581,7 @@ pub fn launch_spec_full(
                 worktree,
                 choice,
                 "the state database could not be opened, so this worktree's saved sandbox override, selected environment and credential-overlay gate cannot be checked",
-                &error,
+                &worktree_isolation_read_failure(worktree, &error),
             )?;
             None
         }
@@ -4595,7 +4656,7 @@ pub fn launch_spec_full(
                     worktree,
                     choice,
                     "this worktree's selected execution environment could not be read",
-                    &error,
+                    &worktree_isolation_read_failure(worktree, &error),
                 )?;
                 None
             }
@@ -5214,12 +5275,11 @@ pub(crate) fn launch_state_gate_with_notice(
     error: &anyhow::Error,
     notify: impl FnOnce(&str, &str),
 ) -> anyhow::Result<()> {
-    if let Some(halt) = error.chain().find_map(|source| {
-        source
-            .downcast_ref::<SandboxHalt>()
-            .filter(|halt| halt.env_name == "worktree isolation")
-    }) {
-        return Err(anyhow::Error::new(halt.clone()));
+    if let Some(failure) = error
+        .chain()
+        .find_map(|source| source.downcast_ref::<WorktreeIsolationReadFailure>())
+    {
+        return Err(anyhow::Error::new(failure.halt.clone()));
     }
     if is_configured_entry(cfg, choice) {
         anyhow::bail!("refusing to launch `{choice}`: {what}: {error:#}");

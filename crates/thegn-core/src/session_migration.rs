@@ -29,6 +29,8 @@ pub struct MigrationWorktree {
     pub observed_backend: Option<String>,
     pub folder_id: Option<i64>,
     pub env_name: Option<String>,
+    #[serde(default)]
+    pub sandbox_profile: Option<String>,
 }
 
 impl From<WorktreeRow> for MigrationWorktree {
@@ -47,6 +49,7 @@ impl From<WorktreeRow> for MigrationWorktree {
             observed_backend: row.observed_backend,
             folder_id: row.folder_id,
             env_name: row.env_name,
+            sandbox_profile: row.sandbox_profile,
         }
     }
 }
@@ -874,8 +877,9 @@ fn is_migration_prefix(note: &str) -> bool {
 }
 
 /// A stable SHA-256 over sanitized rows. A migration plan computes this over
-/// the imported dispatch form. Database ids, daemon ids, profile names, and
-/// target-owned worktree metadata are intentionally not included.
+/// the imported dispatch form. Database ids, daemon ids, and target-owned
+/// worktree metadata are intentionally not included; the user-owned sandbox
+/// profile pin is included so resume checks cannot silently discard it.
 pub fn fingerprint(bundle: &MigrationBundle) -> String {
     let material = FingerprintMaterial::from_bundle(bundle);
     let bytes = serde_json::to_vec(&material).expect("fingerprint carriers serialize");
@@ -893,6 +897,7 @@ impl MigrationBundle {
 struct FingerprintMaterial {
     session_name: String,
     worktree_path: String,
+    worktree_sandbox_profile: Option<String>,
     groups: Vec<MigrationGroupFingerprint>,
     ui_state: Vec<MigrationUiState>,
     dispatches: Vec<MigrationDispatchFingerprint>,
@@ -949,6 +954,10 @@ impl FingerprintMaterial {
         Self {
             session_name: bundle.session_name.clone(),
             worktree_path: bundle.worktree_path.clone(),
+            worktree_sandbox_profile: bundle
+                .worktree
+                .as_ref()
+                .and_then(|worktree| worktree.sandbox_profile.clone()),
             groups: bundle
                 .groups
                 .iter()
@@ -1059,7 +1068,7 @@ pub fn persisted_worktree(row: &MigrationWorktree) -> WorktreeRow {
         observed_backend: row.observed_backend.clone(),
         folder_id: row.folder_id,
         env_name: row.env_name.clone(),
-        sandbox_profile: None,
+        sandbox_profile: row.sandbox_profile.clone(),
     }
 }
 

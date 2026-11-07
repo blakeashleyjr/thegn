@@ -76,7 +76,245 @@ mod tests {
             }
         }
 
-        fn matching_close(source: &str, open: usize) -> Option<usize> {
+        fn matching_brace(source: &str, open: usize) -> Option<usize> {
+            let bytes = source.as_bytes();
+            let mut depth = 1_usize;
+            let mut i = open + 1;
+            let mut raw_end: Option<Vec<u8>> = None;
+            let mut string = false;
+            let mut escaped = false;
+            let mut line_comment = false;
+            let mut block_depth = 0_usize;
+            while i < bytes.len() {
+                if let Some(end) = &raw_end {
+                    if bytes[i..].starts_with(end) {
+                        i += end.len();
+                        raw_end = None;
+                    } else {
+                        i += 1;
+                    }
+                    continue;
+                }
+                if line_comment {
+                    if bytes[i] == b'\n' {
+                        line_comment = false;
+                    }
+                    i += 1;
+                    continue;
+                }
+                if block_depth > 0 {
+                    if bytes[i..].starts_with(b"/*") {
+                        block_depth += 1;
+                        i += 2;
+                    } else if bytes[i..].starts_with(b"*/") {
+                        block_depth -= 1;
+                        i += 2;
+                    } else {
+                        i += 1;
+                    }
+                    continue;
+                }
+                if string {
+                    if escaped {
+                        escaped = false;
+                    } else if bytes[i] == b'\\' {
+                        escaped = true;
+                    } else if bytes[i] == b'"' {
+                        string = false;
+                    }
+                    i += 1;
+                    continue;
+                }
+                if bytes[i..].starts_with(b"//") {
+                    line_comment = true;
+                    i += 2;
+                } else if bytes[i..].starts_with(b"/*") {
+                    block_depth = 1;
+                    i += 2;
+                } else if bytes[i] == b'r' {
+                    let mut quote = i + 1;
+                    while quote < bytes.len() && bytes[quote] == b'#' {
+                        quote += 1;
+                    }
+                    if quote < bytes.len() && bytes[quote] == b'"' {
+                        let mut end = vec![b'"'];
+                        end.extend(std::iter::repeat_n(b'#', quote - i - 1));
+                        raw_end = Some(end);
+                        i = quote + 1;
+                    } else {
+                        i += 1;
+                    }
+                } else if bytes[i] == b'"' {
+                    string = true;
+                    i += 1;
+                } else if bytes[i] == b'{' {
+                    depth += 1;
+                    i += 1;
+                } else if bytes[i] == b'}' {
+                    depth -= 1;
+                    if depth == 0 {
+                        return Some(i);
+                    }
+                    i += 1;
+                } else {
+                    i += 1;
+                }
+            }
+            None
+        }
+
+        fn test_module_ranges(source: &str) -> Vec<(usize, usize)> {
+            let module = regex::Regex::new(r"#\[cfg\(test\)\]\s*mod\s+\w+\s*\{").unwrap();
+            module
+                .find_iter(source)
+                .filter_map(|found| {
+                    let open = found.end() - 1;
+                    matching_brace(source, open).map(|close| (found.start(), close + 1))
+                })
+                .collect()
+        }
+
+        fn enclosing_function(source: &str, at: usize) -> Option<(String, usize)> {
+            let function = regex::Regex::new(r"\bfn\s+(\w+)\s*(?:<[^>]*>)?\s*\(").unwrap();
+            let found = function.find_iter(&source[..at]).last()?;
+            let captures = function.captures(found.as_str())?;
+            Some((captures[1].to_string(), found.start()))
+        }
+
+        fn selection_argument(arguments: &str, with_approvals: bool) -> &str {
+            let arguments = arguments.trim().trim_end_matches(',').trim_end();
+            let mut depth = 0_i32;
+            let mut quoted = false;
+            let mut escaped = false;
+            let mut commas = Vec::new();
+            for (offset, ch) in arguments.char_indices() {
+                if quoted {
+                    if escaped {
+                        escaped = false;
+                    } else if ch == '\\' {
+                        escaped = true;
+                    } else if ch == '"' {
+                        quoted = false;
+                    }
+                    continue;
+                }
+                match ch {
+                    '"' => quoted = true,
+                    '(' | '[' | '{' => depth += 1,
+                    ')' | ']' | '}' => depth -= 1,
+                    ',' if depth == 0 => commas.push(offset),
+                    _ => {}
+                }
+            }
+            let mut starts = vec![0];
+            starts.extend(commas.iter().map(|comma| comma + 1));
+            let ends = commas
+                .iter()
+                .copied()
+                .chain(std::iter::once(arguments.len()))
+                .collect::<Vec<_>>();
+            let selected_index = starts
+                .len()
+                .saturating_sub(if with_approvals { 2 } else { 1 });
+            let selected_index = selected_index.min(starts.len().saturating_sub(1));
+            arguments[starts[selected_index]..ends[selected_index]].trim()
+        }
+
+        let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        let mut files = Vec::new();
+        source_files(&manifest.join("src"), &mut files);
+        let mut allowed = std::collections::HashMap::new();
+        for line in std::fs::read_to_string(manifest.join("../../test/sandbox-pin-ratchet.txt"))
+            .unwrap()
+            .lines()
+            .filter(|line| !line.trim().is_empty() && !line.trim_start().starts_with('#'))
+        {
+            let (site, reason) = line.split_once("  ").expect("site and reason separated");
+            assert!(
+                site.contains(':'),
+                "allowlist entry needs file:function: {site}"
+            );
+            assert!(
+                !reason.trim().is_empty(),
+                "every entry needs a reason: {line}"
+            );
+            assert!(
+                allowed.insert(site.to_string(), false).is_none(),
+                "duplicate {site}"
+            );
+        }
+
+        let resolve = regex::Regex::new(r"resolve_env(?:_with)?\s*\(").unwrap();
+        let construction = regex::Regex::new(
+            r"EnvSelection::(?:none|named)\s*\(|EnvSelection\s*\{[^}]*profile\s*:\s*None",
+        )
+        .unwrap();
+        let selection_binding = regex::Regex::new(r"let\s+(?:mut\s+)?(\w+)\s*=\s*[^;]*$").unwrap();
+        let mut violations = Vec::new();
+        for path in files {
+            let source = std::fs::read_to_string(&path).unwrap();
+            let test_ranges = test_module_ranges(&source);
+            let relative = path
+                .strip_prefix(manifest.join("src"))
+                .unwrap()
+                .to_string_lossy()
+                .replace('\\', "/");
+            for call in resolve.find_iter(&source) {
+                if test_ranges
+                    .iter()
+                    .any(|(start, end)| *start <= call.start() && call.start() < *end)
+                {
+                    continue;
+                }
+                let Some((function, function_start)) = enclosing_function(&source, call.start())
+                else {
+                    continue;
+                };
+                let open = call.end() - 1;
+                let Some(close) = matching_brace_like_paren(&source, open + 1) else {
+                    continue;
+                };
+                let call_args = &source[open + 1..close];
+                let selection_arg =
+                    selection_argument(call_args, call.as_str().contains("resolve_env_with"));
+                let prefix = &source[function_start..call.start()];
+                let has_unpinned_selection = construction.is_match(selection_arg)
+                    || selection_arg == "None"
+                    || selection_arg.starts_with("Some(")
+                    || construction.find_iter(prefix).any(|construction| {
+                        let before = &prefix[..construction.start()];
+                        let name = selection_binding
+                            .captures(before)
+                            .map(|capture| capture[1].to_string());
+                        name.is_some_and(|name| {
+                            selection_arg
+                                .split(|ch: char| !ch.is_ascii_alphanumeric() && ch != '_')
+                                .any(|part| part == name)
+                        })
+                    });
+                if !has_unpinned_selection {
+                    continue;
+                }
+                let site = format!("{relative}:{function}");
+                if let Some(used) = allowed.get_mut(&site) {
+                    *used = true;
+                } else {
+                    violations.push(site);
+                }
+            }
+        }
+        let unused = allowed
+            .iter()
+            .filter(|(_, used)| !**used)
+            .map(|(site, _)| site.clone())
+            .collect::<Vec<_>>();
+        assert!(
+            violations.is_empty(),
+            "unclassified pinless worktree resolvers: {violations:#?}"
+        );
+        assert!(unused.is_empty(), "stale resolver reasons: {unused:#?}");
+
+        fn matching_brace_like_paren(source: &str, open: usize) -> Option<usize> {
             let mut depth = 1_usize;
             let mut quoted = false;
             let mut escaped = false;
@@ -105,86 +343,6 @@ mod tests {
             }
             None
         }
-
-        let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-        let mut files = Vec::new();
-        source_files(&manifest.join("src"), &mut files);
-        let mut allowed = std::collections::HashMap::new();
-        for line in std::fs::read_to_string(manifest.join("../../test/sandbox-pin-ratchet.txt"))
-            .unwrap()
-            .lines()
-            .filter(|line| !line.trim().is_empty() && !line.trim_start().starts_with('#'))
-        {
-            let (site, reason) = line
-                .split_once("  ")
-                .expect("call site and reason are separated");
-            assert!(
-                site.rsplit_once(':')
-                    .and_then(|(_, line)| line.parse::<usize>().ok())
-                    .is_some(),
-                "allowlist entries must identify an exact source line: {site}"
-            );
-            assert!(
-                !reason.trim().is_empty(),
-                "every allowlist entry needs a reason: {line}"
-            );
-            assert!(
-                allowed.insert(site.to_string(), false).is_none(),
-                "duplicate site: {site}"
-            );
-        }
-
-        let resolve = regex::Regex::new(r"resolve_env(?:_with)?\s*\(").unwrap();
-        let test_module = regex::Regex::new(r"#\[cfg\(test\)\]\s*mod\s+[\w]*tests?\s*\{").unwrap();
-        let dropped =
-            regex::Regex::new(r"EnvSelection::(?:none|named)\s*\(|profile\s*:\s*None").unwrap();
-        let mut violations = Vec::new();
-        for path in files {
-            let source = std::fs::read_to_string(&path).unwrap();
-            let text = path
-                .strip_prefix(manifest.join("src"))
-                .unwrap()
-                .to_string_lossy()
-                .replace('\\', "/");
-            for call in resolve.find_iter(&source) {
-                let open = call.end() - 1;
-                let Some(close) = matching_close(&source, open + 1) else {
-                    continue;
-                };
-                let call_source = &source[open + 1..close];
-                if !dropped.is_match(call_source) {
-                    continue;
-                }
-                if test_module
-                    .find_iter(&source[..call.start()])
-                    .last()
-                    .is_some()
-                {
-                    continue;
-                }
-                let line = source[..call.start()]
-                    .bytes()
-                    .filter(|byte| *byte == b'\n')
-                    .count()
-                    + 1;
-                let site = format!("{text}:{line}");
-                if let Some(used) = allowed.get_mut(&site) {
-                    *used = true;
-                } else {
-                    violations.push(site);
-                }
-            }
-        }
-        let unused = allowed
-            .iter()
-            .filter(|(_, used)| !**used)
-            .map(|(site, _)| site.clone())
-            .collect::<Vec<_>>();
-        assert!(
-            violations.is_empty(),
-            "unclassified pin-dropping resolver calls: {violations:#?}"
-        );
-        assert!(unused.is_empty(), "stale call-site reasons: {unused:#?}");
     }
 
     #[test]
