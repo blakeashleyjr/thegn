@@ -207,7 +207,7 @@ fn read_retained_report_capped(path: &std::path::Path, limit: u64) -> std::io::R
     // Bind the read to a non-following open. A metadata check followed by
     // `read(path)` still has a replacement race when the crash directory is
     // writable by another user after permission hardening failed.
-    let mut file = crate::platform::open_read_nofollow(path)?;
+    let file = crate::platform::open_read_nofollow(path)?;
     let metadata = file.metadata()?;
     if !metadata.file_type().is_file() {
         return Err(std::io::Error::new(
