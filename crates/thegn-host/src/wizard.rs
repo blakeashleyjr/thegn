@@ -482,7 +482,8 @@ impl NewWorktreeWizard {
             Field::Name => Field::Host,
             Field::Host if self.host_is_local() => Field::Sandbox,
             Field::Host => Field::Program,
-            Field::Sandbox => Field::Isolation,
+            Field::Sandbox if self.host_is_local() => Field::Isolation,
+            Field::Sandbox => Field::Program,
             Field::Isolation => Field::Program,
             Field::Program => Field::Program,
         };
@@ -2485,7 +2486,7 @@ mod tests {
         assert!(!wizard.host_is_local());
         wizard.focus = Field::Sandbox;
         key(&mut wizard, KeyCode::DownArrow);
-        assert_ne!(wizard.focus, Field::Isolation);
+        assert_eq!(wizard.focus, Field::Program);
         assert_eq!(wizard.profile_pin(), None);
     }
 

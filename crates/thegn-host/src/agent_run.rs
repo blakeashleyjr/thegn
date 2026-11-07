@@ -850,14 +850,31 @@ fn agent_floor_gate_with_effective(
         .file_name()
         .and_then(|s| s.to_str())
         .unwrap_or("agent-task");
+    let pinned_profile =
+        match thegn_core::db::Db::open().and_then(|db| db.worktree_sandbox_profile(worktree)) {
+            Ok(profile) => profile,
+            Err(error) => {
+                return AgentDispatch::InfraHold(format!(
+                    "could not read the worktree isolation pin; refusing queued agent: {error:#}"
+                ));
+            }
+        };
+    let global = thegn_core::config::SandboxConfig {
+        profile: pinned_profile.unwrap_or(full.sandbox.profile),
+        ..full.sandbox.clone()
+    };
     // `None` ⇒ the sandbox couldn't be established (disabled, or the chain
     // resolved to the host) — a broken boundary under a demanded floor.
     let spec = thegn_core::sandbox::resolve(&effective, &loc, name)
         .map(|spec| scope_agent_spec(spec, worktree));
     // THE-215: a sealed profile whose sandbox could not be established must not
     // run the agent on the host — no spec skips the home gate below, so refuse.
-    if spec.is_none() && effective.profile.hides_home() {
-        let profile = effective.profile;
+    if spec.is_none() && (effective.profile.hides_home() || global.profile.hides_home()) {
+        let profile = if global.profile.hides_home() {
+            global.profile
+        } else {
+            effective.profile
+        };
         return AgentDispatch::InfraHold(format!(
             "profile `{}` requires a sandbox that hides $HOME, but none could be established \
              for {worktree}; {}",
@@ -878,10 +895,6 @@ fn agent_floor_gate_with_effective(
     }
     let best = spec.capabilities().isolation;
     let resolved = Some(best);
-    let global = thegn_core::config::SandboxConfig {
-        profile: effective.profile,
-        ..full.sandbox.clone()
-    };
     let global_gate = queue_agent_gate(&global, floor, on_miss, resolved, best);
     let effective_gate = queue_agent_gate(&effective, floor, on_miss, resolved, best);
     let dispatch = match stricter_agent_gate(global_gate, effective_gate) {

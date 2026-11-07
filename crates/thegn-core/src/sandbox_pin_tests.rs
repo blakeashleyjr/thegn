@@ -126,7 +126,7 @@ fn sandbox_pin_explanations_cover_profile_capability_and_network_facts() {
     );
     assert!(sealed_text.contains("new privileges are blocked"));
     assert_eq!(
-        sealed_text.contains("capability"),
+        sealed_text.contains("capabilit"),
         !SandboxProfile::Sealed.drop_capabilities().is_empty()
     );
     assert!(

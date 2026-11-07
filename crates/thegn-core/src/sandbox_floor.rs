@@ -414,16 +414,6 @@ pub fn provider_refusal(
     })
 }
 
-/// The shared recovery action for a worktree refused because it is sealed.
-pub fn standard_switch_hint(worktree: Option<&str>) -> String {
-    match worktree {
-        Some(path) => format!(
-            "switch it to standard with `thegn sandbox profile set standard --worktree {path}` (or use Isolation profile in the palette)"
-        ),
-        None => "switch it to standard with `thegn sandbox profile set standard` (or use Isolation profile in the palette)".into(),
-    }
-}
-
 /// The `$HOME` confidentiality gate (THE-215). A sealed profile promises the host
 /// `$HOME` is not readable; a launch whose resolved spec would expose it — a
 /// backend with no filesystem boundary (host process, Windows), `file_access =

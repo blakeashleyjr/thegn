@@ -183,6 +183,7 @@ fn unreadable_worktree_isolation(worktree: &str, error: &anyhow::Error) -> anyho
         ),
         ask: false,
         dormant: None,
+        sealed_home: false,
     })
 }
 
@@ -541,7 +542,7 @@ mod tests {
             &thegn_core::config::Config::default(),
             root.path(),
             root.path(),
-            Ok(EnvSelection::none()),
+            Ok(None),
             Err(anyhow::anyhow!("database is locked")),
             &thegn_core::config_resolve::Approvals::deny_all(),
         )

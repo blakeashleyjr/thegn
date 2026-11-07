@@ -533,6 +533,15 @@ pub fn claim_spare(
             return None;
         }
     };
+    let selection = match db.effective_env_selection(worktree, &repo) {
+        Ok(selection) => selection,
+        Err(error) => {
+            crate::close_teardown::warn_visible(&format!(
+                "warm pool: cannot read worktree isolation selection for {worktree}: {error:#}"
+            ));
+            return None;
+        }
+    };
     let (name, checkpoint) = claim_ledger_pick(
         db.begin_pool_spare_claim(&repo, env_name),
         env_name,
