@@ -98,7 +98,6 @@ pub fn env_halt_reason(cfg: &Config, worktree: &str) -> Option<SandboxHalt> {
             return Some(halt);
         }
     };
-    let selected_env = selection.name.clone();
     let environment = cfg.resolve_env(&repo_root, &loc, Path::new(worktree), &selection);
     // A non-default env was SELECTED (per-worktree pin, repo `.thegn.*` overlay, or
     // `default_env`) but didn't resolve to an `[env.<name>]` table, so resolution
@@ -195,11 +194,12 @@ pub fn env_halt_reason(cfg: &Config, worktree: &str) -> Option<SandboxHalt> {
 /// An unreadable worktree selection is a typed halt: the sandbox pin cannot be
 /// inferred safely, even for a local shell.
 fn unreadable_selection_halt(worktree: &str, error: &anyhow::Error) -> SandboxHalt {
+    let recovery = thegn_core::sandbox_floor::standard_switch_hint(Some(worktree));
     SandboxHalt {
         env_name: "worktree isolation".into(),
         placement: worktree.to_string(),
         reason: format!(
-            "thegn cannot read this worktree's isolation setting ({error:#}); refusing launch. Run `thegn doctor`, or once the database opens run `thegn sandbox profile clear --worktree {worktree}`."
+            "thegn cannot read this worktree's isolation setting ({error:#}); refusing launch. Run `thegn doctor`, or once the database opens: {recovery}."
         ),
         ask: false,
         dormant: None,
@@ -234,12 +234,12 @@ mod tests {
 
     #[test]
     fn unreadable_selection_halt_names_the_read_error() {
-        let halt = unreadable_selection_halt("/wt/a", &anyhow::anyhow!("database is locked"));
+        let halt = unreadable_selection_halt("/wt/a tree", &anyhow::anyhow!("database is locked"));
 
         assert!(halt.reason.contains("database is locked"));
         assert!(
             halt.reason
-                .contains("sandbox profile clear --worktree /wt/a")
+                .contains("thegn sandbox profile set standard --worktree '/wt/a tree'")
         );
         assert!(!halt.ask);
     }

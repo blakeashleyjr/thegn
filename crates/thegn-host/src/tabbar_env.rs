@@ -23,12 +23,11 @@ pub(crate) fn env_chips(model: &FrameModel) -> Vec<String> {
         .find(|row| row.active && matches!(row.kind, crate::sidebar::RowKind::Worktree))
         .and_then(|row| row.devcontainer_status.as_deref());
     let mut chips = runtime_sandbox_chips(backend, devcontainer_status);
-    if let Some(profile) = model.active_sandbox_profile_pin.as_deref() {
-        if let Some(chip) = chips.first_mut() {
-            if let Some(name) = chip.strip_prefix('(').and_then(|s| s.strip_suffix(')')) {
-                *chip = format!("({name}:{profile})");
-            }
-        }
+    if let Some(profile) = model.active_sandbox_profile_pin.as_deref()
+        && let Some(chip) = chips.first_mut()
+        && let Some(name) = chip.strip_prefix('(').and_then(|s| s.strip_suffix(')'))
+    {
+        *chip = format!("({name}:{profile})");
     }
     // Remote placement kind (ssh/mosh/k8s/<provider>); `None` when local. The
     // full detail (ssh:host, sprite:<id>, …) lives in the System → Sandbox panel.

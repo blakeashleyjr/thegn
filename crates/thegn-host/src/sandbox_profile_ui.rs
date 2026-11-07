@@ -52,6 +52,7 @@ pub(crate) fn apply_menu_choice(
 mod tests {
     use super::selection_for;
     use thegn_core::config::SandboxProfile;
+    use thegn_core::sandbox_pin::EnvSelection;
     use thegn_core::store::WorkspaceStore;
 
     #[test]
@@ -134,6 +135,7 @@ mod tests {
         }
 
         let resolve = regex::Regex::new(r"resolve_env(?:_with)?\s*\(").unwrap();
+        let test_module = regex::Regex::new(r"#\[cfg\(test\)\]\s*mod\s+[\w]*tests?\s*\{").unwrap();
         let dropped =
             regex::Regex::new(r"EnvSelection::(?:none|named)\s*\(|profile\s*:\s*None").unwrap();
         let mut violations = Vec::new();
@@ -153,11 +155,10 @@ mod tests {
                 if !dropped.is_match(call_source) {
                     continue;
                 }
-                let test_module = source[..call.start()].rfind("mod tests");
-                let test_attr = source[..call.start()].rfind("#[cfg(test)]");
                 if test_module
-                    .zip(test_attr)
-                    .is_some_and(|(module, attr)| attr < module)
+                    .find_iter(&source[..call.start()])
+                    .last()
+                    .is_some()
                 {
                     continue;
                 }

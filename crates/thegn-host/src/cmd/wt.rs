@@ -1740,9 +1740,9 @@ mod from_issue_tests {
 #[cfg(test)]
 mod folder_tests {
     use super::{
-        FolderSource, check_folder_fileable, clear_folder_if_registered, create_and_register,
-        effective_folder, file_registered_worktree, register_and_file_worktree,
-        validate_folder_name,
+        FolderSource, WorktreeCreateOptions, check_folder_fileable, clear_folder_if_registered,
+        create_and_register, effective_folder, file_registered_worktree,
+        register_and_file_worktree, validate_folder_name,
     };
     use thegn_core::config::Config;
     use thegn_core::db::Db;
