@@ -121,11 +121,12 @@ resolution, the serial git-mutation lock, DB registration) but never
 provisions a sandbox — the compositor prepares lazily on first open.
 Use `--isolation standard` or `--isolation sealed` to override the worktree's
 inherited sandbox profile. The worktree stores a pin only when the choice
-differs from its effective default; choose `inherit` in the wizard or clear the
-pin later to use the effective default. Inspect it with
-`thegn sandbox profile show`; change it with
+differs from its effective default — the wizard's **Isolation** row cycles
+`standard` and `sealed`, so choosing the effective default stores no pin.
+Inspect it with `thegn sandbox profile show`; change it with
 `thegn sandbox profile set <standard|sealed>` or remove the override with
-`thegn sandbox profile clear`. Each profile command accepts `--worktree <path>`.
+`thegn sandbox profile clear` to inherit again. Each profile command accepts
+`--worktree <path>`.
 `wt rm` runs provider/sandbox teardown synchronously, then
 `git worktree remove`, then cleans every DB row (including tab groups, so a
 removed worktree is never resurrected at the next launch).

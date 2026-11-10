@@ -186,7 +186,12 @@ pub(crate) struct WorktreeIsolationReadFailure {
 
 impl std::fmt::Display for WorktreeIsolationReadFailure {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        std::fmt::Display::fmt(&self.halt, formatter)
+        // Short label only: the full halt (with its recovery hint) rides in
+        // `source()`, which the halt-aware call sites (`sandbox_halt_in`,
+        // `launch_state_gate_with_notice`) unpack. Printing the halt here too
+        // would make every `{e:#}` on the CLI/daemon/pipeline paths show the
+        // entire halt text, hint included, twice.
+        formatter.write_str("worktree isolation setting unreadable")
     }
 }
 
@@ -404,6 +409,11 @@ pub fn prepare_sandbox_env_with_selection(
     let trusted = resolve_env_trusted(cfg, repo_root, loc, worktree, selection)?;
     let environment = trusted.environment;
     let devcontainer = trusted.devcontainer;
+    // The MERGED pin (DB pin or an explicit caller profile): the sealed gate
+    // below must refuse a disabled sandbox for THIS worktree's pin, which the
+    // caller's `selection` argument alone does not carry (the launch path
+    // passes `profile: None`).
+    let pin = trusted.pin;
     let mut placement = environment.placement.clone();
     let env_shell = environment.sandbox.shell.clone();
     // The worktree-projection plan (sshfs/sync) for this env's `data` mode, or
@@ -1118,7 +1128,7 @@ pub fn prepare_sandbox_env_with_selection(
     // backend or unreachable runtime all end here — refuse, regardless of
     // failover mode. A sealed worktree pin also refuses when global/env sandboxing
     // is disabled; an unpinned global sealed profile keeps its existing opt-out.
-    if sealed_pin_requires_sandbox(sb.enabled, selection.profile, hardening) {
+    if sealed_pin_requires_sandbox(sb.enabled, pin, hardening) {
         return Err(SandboxHalt {
             env_name: env_name.clone(),
             placement: placement_label.clone(),
@@ -1292,7 +1302,10 @@ fn sealed_pin_requires_sandbox(
     pin: Option<thegn_core::config::SandboxProfile>,
     effective: thegn_core::config::SandboxProfile,
 ) -> bool {
-    effective.hides_home() && (sandbox_enabled || pin.is_some())
+    // Only a pin that itself hides $HOME refuses a disabled sandbox: the
+    // effective profile may come from a repo overlay or zone default rather
+    // than this worktree's choice, and a `standard` pin is not a sealed ask.
+    effective.hides_home() && (sandbox_enabled || pin.is_some_and(|p| p.hides_home()))
 }
 
 /// Validate the effective configured sources before backend resolution. The

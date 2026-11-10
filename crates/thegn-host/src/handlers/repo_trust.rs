@@ -11,7 +11,7 @@
 
 use std::path::Path;
 
-use thegn_core::config::{Config, SandboxConfig};
+use thegn_core::config::{Config, SandboxConfig, SandboxProfile};
 use thegn_core::config_resolve::{Approvals, ClampEvent, GatedRequest, summarize_events};
 use thegn_core::db::Db;
 use thegn_core::devcontainer::{self, ImageSource, SubstCtx};
@@ -29,6 +29,12 @@ pub(crate) const CLAMP_KIND: &str = "repo_config_trust";
 pub(crate) struct TrustedEnvironment {
     pub environment: Environment,
     pub devcontainer: Option<TrustedDevcontainer>,
+    /// The per-worktree isolation pin this resolution honoured: the DB pin,
+    /// or an explicit caller-supplied profile. `None` when the worktree
+    /// inherits its profile. The launch path refuses a disabled sandbox for
+    /// a sealed pin, so it needs the MERGED pin — the caller's argument alone
+    /// (usually `profile: None`) cannot answer that.
+    pub pin: Option<SandboxProfile>,
 }
 
 #[derive(Debug, Clone)]
@@ -137,6 +143,7 @@ pub(crate) fn resolve_env_trusted(
         name: selected_env.name.clone().or(worktree_selection.name),
         profile: selected_env.profile.or(worktree_selection.profile),
     };
+    let pin = worktree_selection.profile;
     let approved_canonical = db.repo_trust_approved(&root_s).unwrap_or_default();
     let approvals = Approvals::from_canonical(approved_canonical.clone());
     let (mut env, resolved) = cfg.resolve_env_with(
@@ -171,6 +178,7 @@ pub(crate) fn resolve_env_trusted(
     Ok(TrustedEnvironment {
         environment: env,
         devcontainer,
+        pin,
     })
 }
 
@@ -517,8 +525,9 @@ mod tests {
         )
         .unwrap_err();
 
-        let halt = error
-            .downcast_ref::<crate::agent::SandboxHalt>()
+        // The error is `WorktreeIsolationReadFailure` wrapping the halt;
+        // `downcast_ref` does not follow `source()`, so walk the chain.
+        let halt = crate::handlers::provision::sandbox_halt_in(&error)
             .expect("unreadable selection is a typed launch halt");
         let message = halt.to_string();
         assert!(message.contains("thegn cannot read this worktree's isolation setting"));
@@ -538,8 +547,7 @@ mod tests {
             &thegn_core::config_resolve::Approvals::deny_all(),
         )
         .unwrap_err();
-        let halt = error
-            .downcast_ref::<crate::agent::SandboxHalt>()
+        let halt = crate::handlers::provision::sandbox_halt_in(&error)
             .expect("unreadable isolation pin is a typed launch halt");
         assert!(
             halt.reason
