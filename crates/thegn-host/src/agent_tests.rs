@@ -40,6 +40,95 @@ fn sandbox_profile_pin_requires_enforcement_while_global_disabled_profile_does_n
         Some(SandboxProfile::Hardened),
         SandboxProfile::Hardened
     ));
+    // Only a pin that itself hides $HOME refuses: a `standard` pin under a
+    // repo-overlay or zone-sealed effective profile keeps the opt-out.
+    assert!(!sealed_pin_requires_sandbox(
+        false,
+        Some(SandboxProfile::Hardened),
+        SandboxProfile::Sealed
+    ));
+    assert!(sealed_pin_requires_sandbox(
+        false,
+        Some(SandboxProfile::SealedTunnel),
+        SandboxProfile::Sealed
+    ));
+}
+
+#[test]
+fn sealed_worktree_pin_refuses_a_disabled_sandbox_on_the_launch_path() {
+    use thegn_core::config::SandboxProfile;
+    use thegn_core::sandbox_pin::EnvSelection;
+    use thegn_core::store::WorkspaceStore;
+
+    with_temp_state("launch-sealed-pin-disabled", || {
+        let worktree = std::env::temp_dir()
+            .join(format!("tg-launch-sealed-pin-{}", std::process::id()))
+            .to_string_lossy()
+            .into_owned();
+        let db = thegn_core::db::Db::open().unwrap();
+        db.put_worktree("app/wt", "/x/app", &worktree, "tg/wt", None, None)
+            .unwrap();
+        db.set_worktree_sandbox_profile(&worktree, Some(SandboxProfile::Sealed))
+            .unwrap();
+        drop(db);
+
+        let mut cfg = Config::default();
+        cfg.sandbox.enabled = false;
+        let loc = GitLoc::from_db(&worktree, None);
+        let error = prepare_sandbox_env_with_selection(
+            &cfg,
+            Path::new("/repo"),
+            &worktree,
+            &loc,
+            None,
+            false,
+            &EnvSelection::none(),
+        )
+        .expect_err("a sealed worktree pin must refuse a disabled sandbox");
+        let halt = error
+            .downcast_ref::<SandboxHalt>()
+            .expect("the refusal is a typed launch halt");
+        assert!(halt.sealed_home);
+        assert!(halt.reason.contains("sealed"), "{}", halt.reason);
+    });
+}
+
+#[test]
+fn unpinned_global_sealed_profile_opens_under_a_disabled_sandbox() {
+    use thegn_core::config::SandboxProfile;
+    use thegn_core::sandbox_pin::EnvSelection;
+    use thegn_core::store::WorkspaceStore;
+
+    with_temp_state("launch-global-sealed-disabled", || {
+        let worktree = std::env::temp_dir()
+            .join(format!("tg-launch-global-sealed-{}", std::process::id()))
+            .to_string_lossy()
+            .into_owned();
+        let db = thegn_core::db::Db::open().unwrap();
+        db.put_worktree("app/wt", "/x/app", &worktree, "tg/wt", None, None)
+            .unwrap();
+        // No pin: the worktree inherits the global sealed profile.
+        drop(db);
+
+        let mut cfg = Config::default();
+        cfg.sandbox.enabled = false;
+        cfg.sandbox.profile = SandboxProfile::Sealed;
+        let loc = GitLoc::from_db(&worktree, None);
+        let outcome = prepare_sandbox_env_with_selection(
+            &cfg,
+            Path::new("/repo"),
+            &worktree,
+            &loc,
+            None,
+            false,
+            &EnvSelection::none(),
+        )
+        .expect("an unpinned global sealed profile keeps its opt-out");
+        assert!(
+            outcome.spec.is_none(),
+            "the disabled sandbox opens on the host"
+        );
+    });
 }
 
 #[test]

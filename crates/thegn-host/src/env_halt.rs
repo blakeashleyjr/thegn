@@ -255,9 +255,11 @@ mod tests {
         let halt = unreadable_selection_halt("/wt/a tree", &anyhow::anyhow!("database is locked"));
 
         assert!(halt.reason.contains("database is locked"));
+        // The recovery route is the pin-clear command (the `set standard`
+        // downgrade is the sealed-refusal hint, not this one).
         assert!(
             halt.reason
-                .contains("thegn sandbox profile set standard --worktree '/wt/a tree'")
+                .contains("thegn sandbox profile clear --worktree '/wt/a tree'")
         );
         assert!(!halt.ask);
     }

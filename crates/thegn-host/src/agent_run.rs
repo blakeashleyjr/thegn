@@ -694,20 +694,27 @@ pub(crate) fn agent_floor_gate(
     on_miss: thegn_core::config::OnFloorMiss,
 ) -> AgentDispatch {
     if !sandbox_on {
-        let effective = match effective_uncontained_agent_sandbox(full, worktree) {
+        let (effective, profile_known) = match effective_uncontained_agent_sandbox(full, worktree) {
             Ok(effective) => effective,
             Err(reason) => return AgentDispatch::InfraHold(reason),
         };
-        return uncontained_agent_gate(&effective, Some(worktree));
+        return uncontained_agent_gate(&effective, Some(worktree), profile_known);
     }
     let effective = effective_agent_sandbox(full, worktree);
     agent_floor_gate_with_effective(full, worktree, floor, on_miss, effective)
 }
 
+/// Resolve the sandbox an uncontained (`agent_sandbox = false`) queue agent
+/// would run under. Returns the effective [`SandboxConfig`] plus whether its
+/// profile is KNOWN for this worktree: `true` after a full local resolve
+/// (env overlay + zone), and `true` when the pin itself was readable — but
+/// `false` on the early returns (worktree path unresolved, repo root missing,
+/// remote or unresolved env), where the profile is only the global default
+/// under an applied pin. A sealed hold must not fire on that guess.
 fn effective_uncontained_agent_sandbox(
     full: &thegn_core::config::Config,
     worktree: &str,
-) -> Result<thegn_core::config::SandboxConfig, String> {
+) -> Result<(thegn_core::config::SandboxConfig, bool), String> {
     let db = thegn_core::db::Db::open()
         .map_err(|error| format!("could not read the worktree isolation pin: {error:#}"))?;
     let selection = db
@@ -717,11 +724,14 @@ fn effective_uncontained_agent_sandbox(
     if let Some(profile) = selection {
         sandbox.profile = profile;
     }
+    // Past this point the profile is this worktree's pin (or the global
+    // default when unpinned) — nothing local has been resolved for it.
+    let pin_known = selection.as_ref().is_some();
     let Some(worktree_path) = std::path::Path::new(worktree).canonicalize().ok() else {
-        return Ok(sandbox);
+        return Ok((sandbox, pin_known));
     };
     let Some(repo_root) = crate::merge_ops::repo_root_of(&worktree_path) else {
-        return Ok(sandbox);
+        return Ok((sandbox, pin_known));
     };
     let location = thegn_core::remote::GitLoc::Local(worktree_path.clone());
     let selected = db
@@ -732,7 +742,7 @@ fn effective_uncontained_agent_sandbox(
         .map_err(|error| format!("could not read the worktree environment selection: {error:#}"))?;
     let environment = full.resolve_env(&repo_root, &location, &worktree_path, &selected);
     if environment.unresolved_selection || environment.is_remote() {
-        return Ok(sandbox);
+        return Ok((sandbox, pin_known));
     }
     let mut environment = environment;
     crate::handlers::repo_trust::apply_zone(
@@ -742,17 +752,25 @@ fn effective_uncontained_agent_sandbox(
         &mut environment,
     );
     sandbox.profile = environment.sandbox.profile;
-    Ok(sandbox)
+    Ok((sandbox, true))
 }
 
+/// The uncontained dispatch decision. `profile_known` is whether the
+/// effective profile was resolved for THIS worktree (its pin, or a full local
+/// resolve) rather than falling back to the global default because the
+/// worktree path, repo root or env could not be resolved. The sealed hold
+/// fires only for a known profile: an unpinned global sealed profile with an
+/// unresolvable worktree follows main's floor behaviour (off/degrade runs) —
+/// only a PINNED sealed worktree refuses.
 fn uncontained_agent_gate(
     sb: &thegn_core::config::SandboxConfig,
     worktree: Option<&str>,
+    profile_known: bool,
 ) -> AgentDispatch {
     use thegn_core::config::OnFloorMiss;
 
     let floor = thegn_core::sandbox_floor::floor_in_force(sb, false);
-    if sb.profile.hides_home() {
+    if profile_known && sb.profile.hides_home() {
         return AgentDispatch::InfraHold(format!(
             "sealed worktree cannot run its queue agent on the host; {}",
             thegn_core::sandbox_floor::standard_switch_hint(worktree)
@@ -2087,7 +2105,11 @@ mod tests {
         let fixture = git_control_fixture();
         let worktree = fixture.worktree.to_string_lossy().into_owned();
         assert!(matches!(
-            uncontained_agent_gate(&thegn_core::config::SandboxConfig::default(), None),
+            uncontained_agent_gate(
+                &thegn_core::config::SandboxConfig::default(),
+                None,
+                true,
+            ),
             AgentDispatch::InfraHold(reason)
                 if reason.contains("shared-kernel")
                     && reason.contains("isolation_floor = \"off\"")
@@ -2101,6 +2123,70 @@ mod tests {
                 thegn_core::config::OnFloorMiss::Degrade,
             ),
             AgentDispatch::InfraHold(_)
+        ));
+    }
+
+    #[test]
+    fn uncontained_queue_agent_runs_a_global_sealed_remote_env_unless_the_pin_is_sealed() {
+        use thegn_core::config::{EnvConfig, EnvSshConfig, PlacementMode, RemoteTransport};
+
+        let _state = crate::testenv::IsolatedState::new();
+        let fixture = git_control_fixture();
+        let worktree = fixture.worktree.to_string_lossy().into_owned();
+        let db = thegn_core::db::Db::open().unwrap();
+        db.put_worktree("repo/wt", &worktree, &worktree, "feat", None, None)
+            .unwrap();
+        db.set_worktree_env(&worktree, "queuebox").unwrap();
+        drop(db);
+
+        let mut full = thegn_core::config::Config::default();
+        full.sandbox.profile = thegn_core::config::SandboxProfile::Sealed;
+        full.sandbox.isolation_floor = Some(thegn_core::config::IsolationFloor::Off);
+        full.env = std::collections::BTreeMap::from([(
+            "queuebox".into(),
+            EnvConfig {
+                placement: PlacementMode::Ssh,
+                ssh: EnvSshConfig {
+                    host: "queue-remote.test".into(),
+                    transport: RemoteTransport::Ssh,
+                    ..EnvSshConfig::default()
+                },
+                ..EnvConfig::default()
+            },
+        )]);
+
+        // No pin: the env is remote, so the global sealed profile cannot be
+        // attributed to this worktree — the off floor runs the agent, exactly
+        // like a pane launch would.
+        assert!(matches!(
+            agent_floor_gate(
+                &full,
+                &worktree,
+                false,
+                thegn_core::config::IsolationFloor::Off,
+                thegn_core::config::OnFloorMiss::Fail,
+            ),
+            AgentDispatch::Run(None)
+        ));
+
+        // A sealed PIN refuses the uncontained dispatch, regardless of floor.
+        thegn_core::db::Db::open()
+            .unwrap()
+            .set_worktree_sandbox_profile(
+                &worktree,
+                Some(thegn_core::config::SandboxProfile::Sealed),
+            )
+            .unwrap();
+        assert!(matches!(
+            agent_floor_gate(
+                &full,
+                &worktree,
+                false,
+                thegn_core::config::IsolationFloor::Off,
+                thegn_core::config::OnFloorMiss::Fail,
+            ),
+            AgentDispatch::InfraHold(reason)
+                if reason.contains("sealed worktree cannot run its queue agent on the host")
         ));
     }
 
@@ -2140,7 +2226,7 @@ mod tests {
             ..thegn_core::config::SandboxConfig::default()
         };
         assert!(matches!(
-            uncontained_agent_gate(&sealed, None),
+            uncontained_agent_gate(&sealed, None, true),
             AgentDispatch::InfraHold(reason)
                 if reason.contains("sealed worktree cannot run its queue agent on the host") && reason.contains("thegn sandbox profile set standard")
         ));
@@ -2157,7 +2243,7 @@ mod tests {
             ..thegn_core::config::SandboxConfig::default()
         };
         assert!(matches!(
-            uncontained_agent_gate(&sandbox, None),
+            uncontained_agent_gate(&sandbox, None, true),
             AgentDispatch::RunDegraded(None, warning) if warning.contains("uncontained")
         ));
         let full = thegn_core::config::Config {
@@ -2186,7 +2272,7 @@ mod tests {
             ..thegn_core::config::SandboxConfig::default()
         };
         assert!(matches!(
-            uncontained_agent_gate(&explicit_off, None),
+            uncontained_agent_gate(&explicit_off, None, true),
             AgentDispatch::Run(None)
         ));
         let full = thegn_core::config::Config {
@@ -2208,7 +2294,7 @@ mod tests {
             ..thegn_core::config::SandboxConfig::default()
         };
         assert!(matches!(
-            uncontained_agent_gate(&disabled, None),
+            uncontained_agent_gate(&disabled, None, true),
             AgentDispatch::Run(None)
         ));
         let full = thegn_core::config::Config {
@@ -2230,7 +2316,7 @@ mod tests {
             ..thegn_core::config::SandboxConfig::default()
         };
         assert!(matches!(
-            uncontained_agent_gate(&host_backend, None),
+            uncontained_agent_gate(&host_backend, None, true),
             AgentDispatch::Run(None)
         ));
     }
