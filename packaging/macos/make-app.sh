@@ -171,6 +171,58 @@ mkdir -p "$dest"
 dest="$(cd -P -- "$dest" && pwd -P)"
 app="$dest/$name.app"
 
+staging=""
+old=""
+lock=""
+lock_held=0
+cleanup() {
+  if ((lock_held)); then
+    rm -f -- "$lock/pid"
+    rmdir -- "$lock" 2>/dev/null || true
+  fi
+  if [[ -n $staging && -e $staging ]]; then
+    rm -rf -- "$staging"
+  fi
+  if [[ -n $old && -d $old && ! -e $old/app ]]; then
+    rmdir "$old" 2>/dev/null || true
+  elif [[ -n $old && -e $old/app ]]; then
+    echo "make-app.sh: previous bundle remains at $old/app after rollback failure" >&2
+  fi
+}
+trap cleanup EXIT
+
+lock="$dest/.$name.app.lock"
+acquire_lock() {
+  if mkdir -- "$lock" 2>/dev/null; then
+    printf '%s\n' "$$" >"$lock/pid"
+    lock_held=1
+    return 0
+  fi
+  local holder=""
+  if [[ -f $lock/pid && ! -L $lock/pid ]]; then
+    holder="$(head -c 32 -- "$lock/pid" 2>/dev/null | tr -d '[:space:]')" || holder=""
+  fi
+  if [[ $holder =~ ^[0-9]+$ ]]; then
+    if kill -0 "$holder" 2>/dev/null; then
+      echo "make-app.sh: another make-app.sh (pid $holder) is generating $app (lock $lock)" >&2
+      return 1
+    fi
+    # The holder is gone: reclaim, then retry the atomic mkdir exactly once.
+    rm -f -- "$lock/pid"
+    rmdir -- "$lock" 2>/dev/null || true
+    if mkdir -- "$lock" 2>/dev/null; then
+      printf '%s\n' "$$" >"$lock/pid"
+      lock_held=1
+      return 0
+    fi
+    echo "make-app.sh: lost the race to reclaim a stale lock: $lock" >&2
+    return 1
+  fi
+  echo "make-app.sh: lock $lock exists without a valid pid; if no make-app.sh is running, remove it and retry" >&2
+  return 1
+}
+acquire_lock || exit 1
+
 if [[ -L $app ]]; then
   echo "make-app.sh: app bundle is a symlink: $app" >&2
   exit 1
@@ -191,20 +243,6 @@ if [[ -e $app ]]; then
     fi
   fi
 fi
-
-staging=""
-old=""
-cleanup() {
-  if [[ -n $staging && -e $staging ]]; then
-    rm -rf -- "$staging"
-  fi
-  if [[ -n $old && -d $old && ! -e $old/app ]]; then
-    rmdir "$old" 2>/dev/null || true
-  elif [[ -n $old && -e $old/app ]]; then
-    echo "make-app.sh: previous bundle remains at $old/app after rollback failure" >&2
-  fi
-}
-trap cleanup EXIT
 
 staging="$(mktemp -d "$dest/.$name.app.staging.XXXXXXXX")"
 mkdir -p "$staging/Contents/MacOS" "$staging/Contents/Resources"
