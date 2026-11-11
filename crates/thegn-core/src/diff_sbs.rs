@@ -57,11 +57,13 @@ fn parse_hunk_header(line: &str) -> Option<(u32, u32, String)> {
     let mut old_start = None;
     let mut new_start = None;
     for part in range.split_whitespace() {
-        let (sign, nums) = part.split_at(1);
+        let mut chars = part.chars();
+        let sign = chars.next()?;
+        let nums = chars.as_str();
         let start = nums.split(',').next()?.parse::<u32>().ok()?;
         match sign {
-            "-" => old_start = Some(start),
-            "+" => new_start = Some(start),
+            '-' => old_start = Some(start),
+            '+' => new_start = Some(start),
             _ => return None,
         }
     }
@@ -139,8 +141,8 @@ pub fn parse_unified(diff: &str) -> SbsFile {
                         kind: CellKind::Context,
                     }),
                 });
-                old_no += 1;
-                new_no += 1;
+                old_no = old_no.saturating_add(1);
+                new_no = new_no.saturating_add(1);
             }
             Some('-') => {
                 removed.push(SbsCell {
@@ -148,8 +150,8 @@ pub fn parse_unified(diff: &str) -> SbsFile {
                     text: chars.collect(),
                     kind: CellKind::Removed,
                 });
-                old_no += 1;
-                file.deleted += 1;
+                old_no = old_no.saturating_add(1);
+                file.deleted = file.deleted.saturating_add(1);
             }
             Some('+') => {
                 added.push(SbsCell {
@@ -157,8 +159,8 @@ pub fn parse_unified(diff: &str) -> SbsFile {
                     text: chars.collect(),
                     kind: CellKind::Added,
                 });
-                new_no += 1;
-                file.added += 1;
+                new_no = new_no.saturating_add(1);
+                file.added = file.added.saturating_add(1);
             }
             // "\ No newline at end of file", file headers inside a hunk
             // region (can't happen in well-formed output), blank lines.
@@ -304,5 +306,41 @@ mod tests {
         let f = parse_unified("@@ -1,1 +1,1 @@\r\n-a\r\n+b\r\n");
         assert_eq!(f.hunks.len(), 1);
         assert_eq!((f.added, f.deleted), (1, 1));
+    }
+
+    #[test]
+    fn multibyte_range_token_is_a_malformed_header_not_a_panic() {
+        let file = parse_unified(&diff(&["@@ \u{e9}1 +2 @@", " ctx", "+x"]));
+
+        assert!(file.hunks.is_empty());
+        assert_eq!(file.added, 0);
+    }
+
+    #[test]
+    fn a_multibyte_sign_after_a_valid_one_is_rejected() {
+        let file = parse_unified(&diff(&["@@ -1 \u{e9}2 @@", " ctx"]));
+
+        assert!(file.hunks.is_empty());
+    }
+
+    #[test]
+    fn maximal_hunk_start_saturates_instead_of_overflowing() {
+        let file = parse_unified(&diff(&[
+            "@@ -4294967295 +4294967295 @@",
+            " a",
+            "-b",
+            "+c",
+            " d",
+        ]));
+
+        assert_eq!(file.hunks.len(), 1);
+        let hunk = &file.hunks[0];
+        assert_eq!(
+            hunk.rows
+                .last()
+                .and_then(|row| row.old.as_ref())
+                .map(|cell| cell.line_no),
+            Some(u32::MAX)
+        );
     }
 }
