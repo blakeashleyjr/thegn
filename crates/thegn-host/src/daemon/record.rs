@@ -1787,16 +1787,20 @@ mod tests {
         }
     }
 
-    fn gated_recorder(
-        budget: &Arc<AtomicUsize>,
-        limit: usize,
-        fail_after_release: bool,
-    ) -> (
+    /// The recorder, the writer's "started" signal, its release handle, and
+    /// the bytes it has written.
+    type GatedRecorder = (
         Recorder,
         mpsc::Receiver<()>,
         mpsc::Sender<()>,
         Arc<Mutex<Vec<u8>>>,
-    ) {
+    );
+
+    fn gated_recorder(
+        budget: &Arc<AtomicUsize>,
+        limit: usize,
+        fail_after_release: bool,
+    ) -> GatedRecorder {
         let (started_tx, started_rx) = mpsc::channel();
         let (release_tx, release_rx) = mpsc::channel();
         let captured = Arc::new(Mutex::new(Vec::new()));
