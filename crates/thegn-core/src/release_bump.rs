@@ -671,7 +671,7 @@ mod tests {
             bump_changelog("# Changelog\n", &p.old, &p.new, &p.today),
             Err(ReleaseError::MissingMarker { .. })
         ));
-        let two = CL.replace("## [0.1.0-alpha.62]", "## [Unreleased]");
+        let two = CL.replace("## [0.1.0-alpha.62] — 2026-11-11", "## [Unreleased]");
         assert_eq!(
             bump_changelog(&two, &p.old, &p.new, &p.today),
             Err(ReleaseError::AmbiguousUnreleased { count: 2 })
