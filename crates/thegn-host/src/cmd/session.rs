@@ -102,7 +102,7 @@ pub enum SessionAction {
         #[arg(
             long,
             requires = "worktree",
-            conflicts_with_all = ["issue", "stage", "resume_work"]
+            conflicts_with_all = ["issue", "resume_work"]
         )]
         track: Option<String>,
         /// A `[[pipeline.stages]]` name, with two behaviors. With `--issue`,
@@ -981,14 +981,13 @@ fn open_preflight(
     headless: bool,
 ) -> Result<()> {
     if let Some(track_issue) = track {
-        if stage.is_some() || issue.is_some() {
-            anyhow::bail!("--track is only available on a plain session open");
+        if issue.is_some() {
+            anyhow::bail!("--track is only available without --issue");
         }
-        if worktree.is_none() {
+        let Some(worktree) = worktree else {
             anyhow::bail!("--track requires --worktree");
-        }
-        thegn_core::pipeline_identity::canonical_issue_id(track_issue)
-            .map_err(anyhow::Error::new)?;
+        };
+        super::dispatch::dispatch_identity(track_issue, worktree)?;
     }
     if let Some(name) = stage {
         stage_or_bail(cfg, name)?;
@@ -2218,7 +2217,37 @@ mod open_stage_tests {
             false,
         )
         .expect_err("tracked stage dispatch must be refused");
-        assert!(err.to_string().contains("plain session open"));
+        assert!(err.to_string().contains("without --issue"));
+    }
+
+    #[test]
+    fn track_allows_a_stage_overlay_but_refuses_a_non_root_worktree_offline() {
+        let dir = tempfile::tempdir().expect("temporary repository");
+        assert!(thegn_core::util::git_ok(dir.path(), &["init", "-q"]));
+        open_preflight(
+            &cfg_with_stage(),
+            Some("code"),
+            None,
+            Some("linear:THE-1976"),
+            dir.path().to_str(),
+            "",
+            false,
+        )
+        .expect("track may layer a stage over a plain open");
+
+        let nested = dir.path().join("nested");
+        std::fs::create_dir(&nested).expect("nested path");
+        let err = open_preflight(
+            &cfg_with_stage(),
+            Some("code"),
+            None,
+            Some("linear:THE-1976"),
+            nested.to_str(),
+            "",
+            false,
+        )
+        .expect_err("track must refuse a non-root worktree before connect");
+        assert!(err.to_string().contains("needs the root"), "got {err}");
     }
 
     #[test]
