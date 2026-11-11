@@ -904,9 +904,7 @@ pub fn spawn_supervisor(cfg: &Config) {
     {
         return;
     }
-    std::thread::Builder::new()
-        .name("thegn-proxy-sup".into())
-        .spawn(move || {
+    thegn_core::thread_name::try_spawn_named("thegn-proxy-sup", move || {
             crate::platform::qos::set_self(crate::platform::qos::Qos::Background);
             let mut applied: Option<ModelProxyConfig> = None;
             let mut failures: u32 = 0;

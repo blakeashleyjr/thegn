@@ -1093,36 +1093,34 @@ pub fn spawn_clean(
     waker: termwiz::terminal::TerminalWaker,
 ) -> std::io::Result<()> {
     let shown = path.display().to_string();
-    std::thread::Builder::new()
-        .name("thegn-mon-clean".into())
-        .spawn(move || {
-            crate::platform::qos::set_self(crate::platform::qos::Qos::Background);
-            match thegn_core::worktree::clean_target(&path) {
-                Ok(reclaimed) => {
-                    // Drop the stale badge immediately; the next disk scan
-                    // remeasures. best-effort: the DB is a cache.
-                    if let Ok(db) = thegn_core::db::Db::open() {
-                        use thegn_core::store::WorktreeAuxStore;
-                        let _ = db.delete_worktree_disk(&path.to_string_lossy()); // best-effort: cache write: the DB is a cache; git/forge stays the source of truth
-                    }
-                    tracing::info!(
-                        target: "thegn::disk", path = %path.display(), reclaimed,
-                        "monitor cleaned worktree target/"
-                    );
+    thegn_core::thread_name::try_spawn_named("thegn-mon-clean", move || {
+        crate::platform::qos::set_self(crate::platform::qos::Qos::Background);
+        match thegn_core::worktree::clean_target(&path) {
+            Ok(reclaimed) => {
+                // Drop the stale badge immediately; the next disk scan
+                // remeasures. best-effort: the DB is a cache.
+                if let Ok(db) = thegn_core::db::Db::open() {
+                    use thegn_core::store::WorktreeAuxStore;
+                    let _ = db.delete_worktree_disk(&path.to_string_lossy()); // best-effort: cache write: the DB is a cache; git/forge stays the source of truth
                 }
-                Err(e) => tracing::warn!(
-                    target: "thegn::disk", path = %path.display(), "monitor clean failed: {e}"
-                ),
+                tracing::info!(
+                    target: "thegn::disk", path = %path.display(), reclaimed,
+                    "monitor cleaned worktree target/"
+                );
             }
-            let _ = waker.wake(); // best-effort: waker pulse: an input nudge must never fail the calling path
-        })
-        .map(|_| ())
-        .inspect_err(|e| {
-            tracing::warn!(
-                target: "thegn::disk", path = %shown,
-                "monitor clean thread could not be spawned: {e}"
-            );
-        })
+            Err(e) => tracing::warn!(
+                target: "thegn::disk", path = %path.display(), "monitor clean failed: {e}"
+            ),
+        }
+        let _ = waker.wake(); // best-effort: waker pulse: an input nudge must never fail the calling path
+    })
+    .map(|_| ())
+    .inspect_err(|e| {
+        tracing::warn!(
+            target: "thegn::disk", path = %shown,
+            "monitor clean thread could not be spawned: {e}"
+        );
+    })
 }
 
 /// Whether a per-container-stats surface is visible, so the ambient container
