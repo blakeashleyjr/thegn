@@ -330,9 +330,21 @@ self: {
     activity.enabled = cfg.activityEnabled;
     activity.red_requires_agent = cfg.activityRedRequiresAgent;
     activity.agent_programs = cfg.activityAgentPrograms;
+    recording.dir = cfg.recordingDir;
+    recording.max_bytes = cfg.recordingMaxBytes;
+    media.enabled = cfg.mediaEnabled;
+    media.show_art = cfg.mediaShowArt;
+    media.overlay_on_badge_click = cfg.mediaOverlayOnBadgeClick;
+    media.seek_step_secs = cfg.mediaSeekStepSecs;
+    media.seek_step_video_secs = cfg.mediaSeekStepVideoSecs;
+    media.poll_interval_secs = cfg.mediaPollIntervalSecs;
+    media.players_priority = cfg.mediaPlayersPriority;
     monitor = {
       system = cfg.monitorSystem;
       gpu = cfg.monitorGpu;
+      proc_rows = cfg.monitorProcRows;
+      processes = cfg.monitorProcesses;
+      process_io = cfg.monitorProcessIo;
     };
     pr.ttl_secs = cfg.prTtlSecs;
     watch.pr_interval_secs = cfg.watchPrIntervalSecs;
@@ -1099,6 +1111,78 @@ in {
         GPU resource monitor opened from the top-bar stats widget (highlight
         GPU with Super+Alt+Up, then Enter). Run in an embedded tiled pane. Unset (null) = the binary's default.
       '';
+    };
+
+    recordingDir = lib.mkOption {
+      type = lib.types.nullOr (lib.types.str);
+      default = null;
+      description = "Directory for session recordings (empty = the per-profile default). Unset (null) = the binary's default.";
+    };
+
+    recordingMaxBytes = lib.mkOption {
+      type = lib.types.nullOr (lib.types.ints.unsigned);
+      default = null;
+      description = "Cap on a recording file in bytes (0 = no cap). Unset (null) = the binary's default.";
+    };
+
+    mediaEnabled = lib.mkOption {
+      type = lib.types.nullOr (lib.types.bool);
+      default = null;
+      description = "Enable the media controls. Unset (null) = the binary's default.";
+    };
+
+    mediaShowArt = lib.mkOption {
+      type = lib.types.nullOr (lib.types.bool);
+      default = null;
+      description = "Show album art in the media overlay. Unset (null) = the binary's default.";
+    };
+
+    mediaOverlayOnBadgeClick = lib.mkOption {
+      type = lib.types.nullOr (lib.types.bool);
+      default = null;
+      description = "Open the media overlay when the badge is clicked. Unset (null) = the binary's default.";
+    };
+
+    mediaSeekStepSecs = lib.mkOption {
+      type = lib.types.nullOr (lib.types.ints.between 0 315360000);
+      default = null;
+      description = "Seek step in seconds for audio. Unset (null) = the binary's default.";
+    };
+
+    mediaSeekStepVideoSecs = lib.mkOption {
+      type = lib.types.nullOr (lib.types.ints.between 0 315360000);
+      default = null;
+      description = "Seek step in seconds for video. Unset (null) = the binary's default.";
+    };
+
+    mediaPollIntervalSecs = lib.mkOption {
+      type = lib.types.nullOr (lib.types.ints.between 0 2678400);
+      default = null;
+      description = "Media player poll interval in seconds. Unset (null) = the binary's default.";
+    };
+
+    mediaPlayersPriority = lib.mkOption {
+      type = lib.types.nullOr (lib.types.listOf lib.types.str);
+      default = null;
+      description = "Preferred media players, highest priority first. Unset (null) = the binary's default.";
+    };
+
+    monitorProcRows = lib.mkOption {
+      type = lib.types.nullOr (lib.types.ints.unsigned);
+      default = null;
+      description = "Rows shown in the monitor process table. Unset (null) = the binary's default.";
+    };
+
+    monitorProcesses = lib.mkOption {
+      type = lib.types.nullOr (lib.types.bool);
+      default = null;
+      description = "Sample processes in the monitor. Unset (null) = the binary's default.";
+    };
+
+    monitorProcessIo = lib.mkOption {
+      type = lib.types.nullOr (lib.types.bool);
+      default = null;
+      description = "Sample per-process I/O in the monitor. Unset (null) = the binary's default.";
     };
 
     agents = lib.mkOption {
