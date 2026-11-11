@@ -629,20 +629,24 @@ fn is_control_key_dir_name(name: &str) -> bool {
 }
 
 /// Prune abandoned `<runtime_root>/<key>/` control directories: owner-only,
-/// idle for `min_idle`, holding nothing but an unheld `daemon.sock.lock`. The
-/// lock is unlinked and the empty directory is left for a later pass.
+/// idle for `min_idle`, holding nothing but an unheld `daemon.sock.lock`, or
+/// that lock plus a stale `daemon.sock` (a dead daemon's leftover). `probe` is
+/// the liveness check of a leftover socket: only a refused connection proves a
+/// socket stale. The socket (if any) then the lock are unlinked and the empty
+/// directory is left for a later pass.
 /// Best effort (every failure is logged and skipped), never follows a symlink,
 /// and unlinks a lock only while holding its flock and after re-verifying the
 /// path still names the locked inode (binders re-check the same way). Returns
-/// how many entries (locks, or empty directories) were removed.
+/// how many entries (locks, stale sockets, or empty directories) were removed.
 #[cfg(unix)]
 fn prune_idle_control_dirs(
     runtime_root: &Path,
     own_dir: &Path,
     min_idle: std::time::Duration,
     max_examined: usize,
+    probe: &dyn Fn(&Path) -> io::Result<()>,
 ) -> usize {
-    use std::os::unix::fs::{MetadataExt as _, OpenOptionsExt as _};
+    use std::os::unix::fs::{FileTypeExt as _, MetadataExt as _, OpenOptionsExt as _};
 
     // Every per-candidate operation below is path-based, so the root itself
     // must be a real, owner-owned, non-group/world-writable directory: nobody
@@ -716,6 +720,7 @@ fn prune_idle_control_dirs(
                 }
             }
         }
+        let mut sock_candidate = false;
         match names.as_slice() {
             [] => {
                 match std::fs::remove_dir(&dir) {
@@ -727,6 +732,13 @@ fn prune_idle_control_dirs(
                 continue;
             }
             [only] if only == "daemon.sock.lock" => {}
+            names
+                if names.len() == 2
+                    && names.iter().any(|n| n == "daemon.sock")
+                    && names.iter().any(|n| n == "daemon.sock.lock") =>
+            {
+                sock_candidate = true;
+            }
             _ => continue,
         }
         let lock = dir.join("daemon.sock.lock");
@@ -759,6 +771,36 @@ fn prune_idle_control_dirs(
             .is_ok_and(|now| now.dev() == held.dev() && now.ino() == held.ino());
         if !still_named {
             continue;
+        }
+        if sock_candidate {
+            // Lock held: nobody can bind here meanwhile. Only a socket that is
+            // ours, singly linked and refusing connections is a dead daemon's.
+            let sock = dir.join("daemon.sock");
+            let Ok(sock_named) = std::fs::symlink_metadata(&sock) else {
+                continue;
+            };
+            if !sock_named.file_type().is_socket()
+                || sock_named.uid() != uid
+                || sock_named.nlink() != 1
+            {
+                continue;
+            }
+            match classify_unix_probe(probe(&sock), &sock) {
+                Ok(UnixProbe::Stale) => {}
+                Ok(UnixProbe::Live | UnixProbe::Gone) | Err(_) => continue,
+            }
+            let same_socket = std::fs::symlink_metadata(&sock)
+                .is_ok_and(|now| now.dev() == sock_named.dev() && now.ino() == sock_named.ino());
+            if !same_socket {
+                continue;
+            }
+            match std::fs::remove_file(&sock) {
+                Ok(()) => removed += 1,
+                Err(error) => {
+                    tracing::debug!(target: "thegn::daemon", %error, sock = %sock.display(), "control prune: cannot remove stale socket");
+                    continue;
+                }
+            }
         }
         match std::fs::remove_file(&lock) {
             // The now-empty directory is deliberately left in place: a binder
@@ -921,6 +963,7 @@ impl IpcListener {
                                 own_dir,
                                 CONTROL_DIR_PRUNE_MIN_IDLE,
                                 CONTROL_DIR_PRUNE_MAX_EXAMINED,
+                                &probe_unix_listener,
                             );
                             if removed > 0 {
                                 tracing::debug!(target: "thegn::daemon", removed, root = %root.display(), "pruned abandoned control directories");
@@ -2418,14 +2461,15 @@ mod tests {
         let (_td, root) = prune_fixture();
         let own = prune_key_dir(&root, &"a".repeat(32), true);
         let dir = prune_key_dir(&root, &"b".repeat(32), true);
-        let removed = prune_idle_control_dirs(&root, &own, std::time::Duration::ZERO, 64);
+        let removed =
+            prune_idle_control_dirs(&root, &own, std::time::Duration::ZERO, 64, &|_| Ok(()));
         assert_eq!(removed, 1);
         // The lock goes first; the empty directory stays for a later pass.
         assert!(dir.exists());
         assert!(!dir.join("daemon.sock.lock").exists());
         assert!(own.join("daemon.sock.lock").exists());
         assert_eq!(
-            prune_idle_control_dirs(&root, &own, std::time::Duration::ZERO, 64),
+            prune_idle_control_dirs(&root, &own, std::time::Duration::ZERO, 64, &|_| Ok(())),
             1
         );
         assert!(!dir.exists());
@@ -2438,7 +2482,7 @@ mod tests {
         let own = prune_key_dir(&root, &"a".repeat(32), true);
         let dir = prune_key_dir(&root, &"b".repeat(32), false);
         assert_eq!(
-            prune_idle_control_dirs(&root, &own, std::time::Duration::ZERO, 64),
+            prune_idle_control_dirs(&root, &own, std::time::Duration::ZERO, 64, &|_| Ok(())),
             1
         );
         assert!(!dir.exists());
@@ -2454,13 +2498,13 @@ mod tests {
         let holder = open_lock_holder(&lock);
         holder.lock().unwrap();
         assert_eq!(
-            prune_idle_control_dirs(&root, &own, std::time::Duration::ZERO, 64),
+            prune_idle_control_dirs(&root, &own, std::time::Duration::ZERO, 64, &|_| Ok(())),
             0
         );
         assert!(lock.exists());
         drop(holder);
         assert_eq!(
-            prune_idle_control_dirs(&root, &own, std::time::Duration::ZERO, 64),
+            prune_idle_control_dirs(&root, &own, std::time::Duration::ZERO, 64, &|_| Ok(())),
             1
         );
         assert!(!lock.exists());
@@ -2476,7 +2520,7 @@ mod tests {
         let with_locator = prune_key_dir(&root, &"c".repeat(32), true);
         std::fs::write(with_locator.join("tg-locator"), b"").unwrap();
         assert_eq!(
-            prune_idle_control_dirs(&root, &own, std::time::Duration::ZERO, 64),
+            prune_idle_control_dirs(&root, &own, std::time::Duration::ZERO, 64, &|_| Ok(())),
             0
         );
         assert!(with_sock.join("daemon.sock.lock").exists());
@@ -2498,7 +2542,7 @@ mod tests {
         let link = root.join("f".repeat(32));
         std::os::unix::fs::symlink(&target, &link).unwrap();
         assert_eq!(
-            prune_idle_control_dirs(&root, &own, std::time::Duration::ZERO, 64),
+            prune_idle_control_dirs(&root, &own, std::time::Duration::ZERO, 64, &|_| Ok(())),
             0
         );
         assert!(not_key.exists());
@@ -2529,7 +2573,7 @@ mod tests {
         std::fs::write(&victim, b"keep").unwrap();
         std::os::unix::fs::symlink(&victim, symlinked.join("daemon.sock.lock")).unwrap();
         assert_eq!(
-            prune_idle_control_dirs(&root, &own, std::time::Duration::ZERO, 64),
+            prune_idle_control_dirs(&root, &own, std::time::Duration::ZERO, 64, &|_| Ok(())),
             0
         );
         assert!(broad.join("daemon.sock.lock").exists());
@@ -2550,7 +2594,13 @@ mod tests {
         let own = prune_key_dir(&root, &"a".repeat(32), true);
         let fresh = prune_key_dir(&root, &"b".repeat(32), true);
         assert_eq!(
-            prune_idle_control_dirs(&root, &own, std::time::Duration::from_secs(3600), 64),
+            prune_idle_control_dirs(
+                &root,
+                &own,
+                std::time::Duration::from_secs(3600),
+                64,
+                &|_| Ok(())
+            ),
             0
         );
         assert!(fresh.exists());
@@ -2561,7 +2611,7 @@ mod tests {
             prune_key_dir(&root, &"d".repeat(32), true),
             prune_key_dir(&root, &"e".repeat(32), true),
         ];
-        let count = prune_idle_control_dirs(&root, &own, std::time::Duration::ZERO, 2);
+        let count = prune_idle_control_dirs(&root, &own, std::time::Duration::ZERO, 2, &|_| Ok(()));
         assert!(count <= 2);
         let remaining = dirs
             .iter()
@@ -2570,8 +2620,12 @@ mod tests {
         assert_eq!(remaining, 3 - count);
         assert!(remaining >= 1);
         // Locks first, then the emptied directories.
-        prune_idle_control_dirs(&root, &own, std::time::Duration::ZERO, usize::MAX);
-        prune_idle_control_dirs(&root, &own, std::time::Duration::ZERO, usize::MAX);
+        prune_idle_control_dirs(&root, &own, std::time::Duration::ZERO, usize::MAX, &|_| {
+            Ok(())
+        });
+        prune_idle_control_dirs(&root, &own, std::time::Duration::ZERO, usize::MAX, &|_| {
+            Ok(())
+        });
         assert!(dirs.iter().all(|dir| !dir.exists()));
     }
 
@@ -2586,7 +2640,7 @@ mod tests {
         let eligible = prune_key_dir(&root, &"b".repeat(32), true);
         std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o777)).unwrap();
         assert_eq!(
-            prune_idle_control_dirs(&root, &own, std::time::Duration::ZERO, 64),
+            prune_idle_control_dirs(&root, &own, std::time::Duration::ZERO, 64, &|_| Ok(())),
             0
         );
         assert!(eligible.join("daemon.sock.lock").exists());
@@ -2596,15 +2650,134 @@ mod tests {
         let link = root.parent().unwrap().join("thegn-link");
         std::os::unix::fs::symlink(&root, &link).unwrap();
         assert_eq!(
-            prune_idle_control_dirs(&link, &own, std::time::Duration::ZERO, 64),
+            prune_idle_control_dirs(&link, &own, std::time::Duration::ZERO, 64, &|_| Ok(())),
             0
         );
         assert!(eligible.join("daemon.sock.lock").exists());
         // Control: the verified root does prune.
         assert_eq!(
-            prune_idle_control_dirs(&root, &own, std::time::Duration::ZERO, 64),
+            prune_idle_control_dirs(&root, &own, std::time::Duration::ZERO, 64, &|_| Ok(())),
             1
         );
+    }
+
+    #[cfg(unix)]
+    fn std_probe(path: &Path) -> io::Result<()> {
+        std::os::unix::net::UnixStream::connect(path).map(|_| ())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn control_dir_prune_removes_a_stale_socket_then_its_lock() {
+        let (_td, root) = prune_fixture();
+        let own = prune_key_dir(&root, &"a".repeat(32), true);
+        let dir = prune_key_dir(&root, &"b".repeat(32), true);
+        drop(std::os::unix::net::UnixListener::bind(dir.join("daemon.sock")).unwrap());
+        assert_eq!(
+            prune_idle_control_dirs(&root, &own, std::time::Duration::ZERO, 64, &std_probe),
+            2
+        );
+        assert!(!dir.join("daemon.sock").exists());
+        assert!(!dir.join("daemon.sock.lock").exists());
+        assert!(dir.exists());
+        assert!(own.join("daemon.sock.lock").exists());
+        assert_eq!(
+            prune_idle_control_dirs(&root, &own, std::time::Duration::ZERO, 64, &std_probe),
+            1
+        );
+        assert!(!dir.exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn control_dir_prune_keeps_a_live_socket_and_its_lock() {
+        let (_td, root) = prune_fixture();
+        let own = prune_key_dir(&root, &"a".repeat(32), true);
+        let dir = prune_key_dir(&root, &"b".repeat(32), true);
+        let listener = std::os::unix::net::UnixListener::bind(dir.join("daemon.sock")).unwrap();
+        assert_eq!(
+            prune_idle_control_dirs(&root, &own, std::time::Duration::ZERO, 64, &std_probe),
+            0
+        );
+        assert!(dir.join("daemon.sock").exists());
+        assert!(dir.join("daemon.sock.lock").exists());
+        assert!(std::os::unix::net::UnixStream::connect(dir.join("daemon.sock")).is_ok());
+        drop(listener);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn control_dir_prune_keeps_a_stale_socket_when_the_lock_is_held() {
+        let (_td, root) = prune_fixture();
+        let own = prune_key_dir(&root, &"a".repeat(32), true);
+        let dir = prune_key_dir(&root, &"b".repeat(32), true);
+        drop(std::os::unix::net::UnixListener::bind(dir.join("daemon.sock")).unwrap());
+        let holder = open_lock_holder(&dir.join("daemon.sock.lock"));
+        holder.lock().unwrap();
+        assert_eq!(
+            prune_idle_control_dirs(&root, &own, std::time::Duration::ZERO, 64, &std_probe),
+            0
+        );
+        assert!(dir.join("daemon.sock").exists());
+        assert!(dir.join("daemon.sock.lock").exists());
+        drop(holder);
+        assert_eq!(
+            prune_idle_control_dirs(&root, &own, std::time::Duration::ZERO, 64, &std_probe),
+            2
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn control_dir_prune_keeps_a_socket_that_is_not_ours_to_remove() {
+        let (_td, root) = prune_fixture();
+        let own = prune_key_dir(&root, &"a".repeat(32), true);
+        // (a) a symlink named daemon.sock pointing at a victim file.
+        let linked = prune_key_dir(&root, &"b".repeat(32), true);
+        let victim = root.join("victim");
+        std::fs::write(&victim, b"precious").unwrap();
+        std::os::unix::fs::symlink(&victim, linked.join("daemon.sock")).unwrap();
+        assert_eq!(
+            prune_idle_control_dirs(&root, &own, std::time::Duration::ZERO, 64, &std_probe),
+            0
+        );
+        assert_eq!(std::fs::read(&victim).unwrap(), b"precious");
+        assert!(
+            std::fs::symlink_metadata(linked.join("daemon.sock")).is_ok()
+                && linked.join("daemon.sock.lock").exists()
+        );
+        // (b) a hard-linked (nlink 2) stale socket.
+        let hard = prune_key_dir(&root, &"c".repeat(32), true);
+        let outside = root.join("outside-sock");
+        drop(std::os::unix::net::UnixListener::bind(&outside).unwrap());
+        std::fs::hard_link(&outside, hard.join("daemon.sock")).unwrap();
+        assert_eq!(
+            prune_idle_control_dirs(&root, &own, std::time::Duration::ZERO, 64, &std_probe),
+            0
+        );
+        assert!(outside.exists());
+        assert!(hard.join("daemon.sock").exists());
+        assert!(hard.join("daemon.sock.lock").exists());
+        assert!(linked.join("daemon.sock.lock").exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn control_dir_prune_keeps_a_socket_when_the_probe_is_inconclusive() {
+        let (_td, root) = prune_fixture();
+        let own = prune_key_dir(&root, &"a".repeat(32), true);
+        let dir = prune_key_dir(&root, &"b".repeat(32), true);
+        drop(std::os::unix::net::UnixListener::bind(dir.join("daemon.sock")).unwrap());
+        for kind in [io::ErrorKind::PermissionDenied, io::ErrorKind::TimedOut] {
+            assert_eq!(
+                prune_idle_control_dirs(&root, &own, std::time::Duration::ZERO, 64, &|_| Err(
+                    io::Error::new(kind, "x")
+                )),
+                0
+            );
+            assert!(dir.join("daemon.sock").exists());
+            assert!(dir.join("daemon.sock.lock").exists());
+        }
     }
 
     #[cfg(unix)]
