@@ -79,8 +79,9 @@ pub enum Action {
     /// path as its only plain output, so `cd $(thegn wt new x)` works.
     New {
         /// Branch-name tail (the configured prefix + numbering scheme are
-        /// applied); omitted = a generated candidate name. Required with
-        /// `--program` (the feature's linked branch name).
+        /// applied, unless `--exact-branch` uses it verbatim and requires it);
+        /// omitted = a generated candidate name. Required with `--program`
+        /// (the feature's linked branch name).
         name: Option<String>,
         /// Repo to create in (default: resolved from cwd / $THEGN_WORKTREE).
         #[arg(long)]
@@ -346,7 +347,9 @@ fn exact_branch_name(name: Option<&str>, taken: impl Fn(&str) -> bool) -> Result
         .ok_or_else(|| anyhow::anyhow!("--exact-branch requires a branch name"))?;
     thegn_core::git_operand::branch_name(name)?;
     if taken(name) {
-        anyhow::bail!("branch '{name}' already exists; --exact-branch will not attach to it");
+        anyhow::bail!(
+            "branch '{name}' conflicts with an existing branch; --exact-branch will not attach to it"
+        );
     }
     Ok(name.to_string())
 }
@@ -1785,7 +1788,7 @@ mod from_issue_tests {
 mod folder_tests {
     use super::{
         FolderSource, WorktreeCreateOptions, check_folder_fileable, clear_folder_if_registered,
-        create_and_register, effective_folder, file_registered_worktree,
+        create_and_register, effective_folder, exact_branch_name, file_registered_worktree,
         register_and_file_worktree, validate_folder_name,
     };
     use thegn_core::config::Config;
@@ -1895,7 +1898,7 @@ mod folder_tests {
         assert!(exact_branch_name(Some("bad..name"), |_| false).is_err());
         assert!(exact_branch_name(Some("-x"), |_| false).is_err());
         let e = exact_branch_name(Some("tg/x"), |b| b == "tg/x").unwrap_err();
-        assert!(e.to_string().contains("already exists"));
+        assert!(e.to_string().contains("conflicts with an existing branch"));
     }
 
     #[test]
