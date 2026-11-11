@@ -6,6 +6,7 @@ use thegn_core::config::{Config, SandboxProfile};
 use thegn_core::models::WorktreeRow;
 use thegn_core::outln;
 use thegn_core::sandbox_pin::{EnvSelection, explain, parse_pin};
+use thegn_core::store::WorkspaceStore;
 
 /// One pinned worktree. `invalid` marks a stored pin that no longer parses.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
@@ -52,16 +53,22 @@ pub(super) fn rows(
     out
 }
 
-/// Read the pins from the DB. Never fails doctor: an unreadable DB yields none.
-pub(super) fn collect(cfg: &Config) -> Vec<PinRow> {
-    let records = match thegn_core::db::Db::open().and_then(|db| db.worktrees()) {
+/// Read the pins from the read-only, schema-checked doctor DB handle. Never
+/// fails doctor and never creates, migrates or prunes the DB. The second value
+/// is why nothing could be read, when that is the case.
+pub(super) fn collect(cfg: &Config) -> (Vec<PinRow>, Option<String>) {
+    let db = match super::doctor_db() {
+        super::DoctorDb::Ready(db) => db,
+        other => return (Vec::new(), Some(other.describe())),
+    };
+    let records = match db.worktrees() {
         Ok(records) => records,
         Err(e) => {
             tracing::debug!(error = %e, "doctor: worktree pins unavailable");
-            return Vec::new();
+            return (Vec::new(), Some(format!("unavailable: {e:#}")));
         }
     };
-    rows(&records, |row| {
+    let out = rows(&records, |row| {
         let location = (!row.location.is_empty()).then_some(row.location.as_str());
         let loc = thegn_core::remote::GitLoc::from_db(&row.worktree, location);
         let selection = EnvSelection {
@@ -76,7 +83,8 @@ pub(super) fn collect(cfg: &Config) -> Vec<PinRow> {
         )
         .sandbox
         .profile
-    })
+    });
+    (out, None)
 }
 
 pub(super) fn json(rows: &[PinRow]) -> serde_json::Value {
@@ -90,8 +98,12 @@ fn title(value: &str) -> String {
     }
 }
 
-pub(super) fn lines(rows: &[PinRow]) -> Vec<String> {
+pub(super) fn lines(rows: &[PinRow], unread: Option<&str>) -> Vec<String> {
     let mut out = vec!["Worktree sandbox pins".to_string()];
+    if let Some(reason) = unread {
+        out.push(format!("  not read: {reason}"));
+        return out;
+    }
     if rows.is_empty() {
         out.push("  none (worktrees inherit the configured profile)".to_string());
         return out;
@@ -108,8 +120,8 @@ pub(super) fn lines(rows: &[PinRow]) -> Vec<String> {
     out
 }
 
-pub(super) fn print(rows: &[PinRow]) {
-    for line in lines(rows) {
+pub(super) fn print(rows: &[PinRow], unread: Option<&str>) {
+    for line in lines(rows, unread) {
         outln!("{line}");
     }
 }
@@ -194,16 +206,32 @@ mod tests {
 
     #[test]
     fn lines_say_none_when_there_are_no_pins_and_name_each_pin() {
-        let none = lines(&[]);
+        let none = lines(&[], None);
         assert_eq!(none[0], "Worktree sandbox pins");
         assert!(none[1].contains("none ("));
         let out = rows(&[record("/wt/a", Some("sealed"))], |_| {
             SandboxProfile::Hardened
         });
-        let text = lines(&out).join("\n");
+        let text = lines(&out, None).join("\n");
         assert!(
             text.contains("Sealed (default Standard; differs)"),
             "{text}"
         );
+    }
+
+    #[test]
+    fn lines_print_the_reason_when_the_db_could_not_be_read() {
+        let text = lines(&[], Some("no database yet")).join("\n");
+        assert!(text.contains("not read: no database yet"), "{text}");
+        assert!(!text.contains("none ("), "{text}");
+    }
+
+    #[test]
+    fn collect_never_creates_the_state_db() {
+        let state = thegn_core::testenv::IsolatedState::new();
+        let (rows, why) = collect(&Config::default());
+        assert!(rows.is_empty());
+        assert!(why.is_some());
+        assert!(!state.state_home().join("thegn").exists());
     }
 }
