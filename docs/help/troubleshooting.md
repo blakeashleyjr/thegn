@@ -98,7 +98,8 @@ causes include no backend meeting the default isolation floor, `bwrap` or
 `systemd-run` missing from thegn's own `PATH`, a configured VPN with
 `sealed-tunnel`, or a `sealed` launch that cannot hide `$HOME`. The default
 `standard` profile protects integrity, not credentials: `$HOME` stays
-readable. The opt-in `sealed` profile hides it.
+readable. The opt-in `sealed` profile hides it; [[sandbox-profiles]] explains how to
+choose one per worktree.
 
 **Do this:** Inspect `thegn doctor` and the refusal remediation. On NixOS, the
 sandboxing page recommends pinning `backend = "bwrap"`. See [[sandboxing]].
