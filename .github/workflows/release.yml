@@ -560,6 +560,11 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -euo pipefail
+          gh release view "$TAG" --json assets > "$RUNNER_TEMP/release-assets.json"
+          python3 packaging/release.py check-asset-sizes \
+            --assets-json "$RUNNER_TEMP/release-assets.json" \
+            --pattern "thegn-$TAG-*.tar.gz" \
+            --pattern "thegn-$TAG-*.sha256"
           gh release download "$TAG" --dir "$PACKAGE_ROOT/assets" \
             --pattern "thegn-$TAG-*.tar.gz" \
             --pattern "thegn-$TAG-*.sha256"
@@ -787,6 +792,9 @@ jobs:
           root="$(mktemp -d "$RUNNER_TEMP/verify.XXXXXX")"
           echo "VERIFY_ROOT=$root" >> "$GITHUB_ENV"
           mkdir -p "$root/assets" "$RUNNER_TEMP/manifest"
+          gh release view "$TAG" --json assets > "$RUNNER_TEMP/release-assets.json"
+          python3 packaging/release.py check-asset-sizes \
+            --assets-json "$RUNNER_TEMP/release-assets.json"
           gh release download "$TAG" --dir "$root/assets"
       - name: Verify archive provenance
         env:
