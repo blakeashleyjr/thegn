@@ -572,6 +572,13 @@ Recording, media and the monitor process table are also exposed:
 `monitorProcesses` and `monitorProcessIo`. The media backend, default-action
 and volume-step keys and the `mpv`/`mpd` tables are not exposed.
 
+The `[limits]` and `[diagnostics]` tables are exposed as `limitsTestCpuQuota`,
+`limitsTestMemMax`, `limitsTestMaxParallel`, `limitsTestTimeoutSecs`,
+`limitsDiscoverTimeoutSecs`, `limitsIsolatedTargetDir`,
+`diagnosticsCrashReports`, `diagnosticsCrashRetention` and
+`diagnosticsRingSize`. The signed `test_nice` and the reserved `crash_sink`
+are not exposed.
+
 `keys list` covers the keymap registry **and** the zone-local tables — the
 sidebar's row keys and each panel section's row-mode keys. Those are handled
 by the focused zone rather than the registry, so they are not rebindable, but
