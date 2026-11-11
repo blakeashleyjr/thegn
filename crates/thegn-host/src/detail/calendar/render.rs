@@ -352,14 +352,30 @@ fn agenda_note(st: &CalState, n: usize) -> String {
     }
 }
 
+/// Half-open range of the selected day's events the agenda table draws: a
+/// window of `agenda_rows` rows that always contains the selected row.
+pub(crate) fn agenda_window(st: &CalState) -> std::ops::Range<usize> {
+    let len = st.selected_events().len();
+    let rows = st.ui.agenda_rows.max(1);
+    let sel = if st.pane == CalPane::Agenda {
+        st.agenda_sel.min(len.saturating_sub(1))
+    } else {
+        0
+    };
+    let start = (sel + 1).saturating_sub(rows);
+    start..(start + rows).min(len)
+}
+
 /// The per-day event list.
 fn agenda_table(st: &CalState) -> super::super::Section {
     use super::super::{Cell, Section, TableSection};
     let evs = st.selected_events();
+    let window = agenda_window(st);
     let rows: Vec<Vec<Cell>> = evs
         .iter()
-        .take(st.ui.agenda_rows)
         .enumerate()
+        .skip(window.start)
+        .take(window.len())
         .map(|(i, e)| {
             let focused = st.pane == CalPane::Agenda && i == st.agenda_sel;
             let title_tone = if focused {
