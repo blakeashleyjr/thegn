@@ -5911,7 +5911,7 @@ mod tests {
         };
         let report = pipeline_run::verify_report(&facts);
         let error = require_done_report(1, report).unwrap_err().to_string();
-        assert!(error.contains("worktree status"), "{error}");
+        assert!(error.contains("stable worktree snapshot"), "{error}");
     }
 
     #[test]

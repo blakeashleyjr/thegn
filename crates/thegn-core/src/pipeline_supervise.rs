@@ -116,6 +116,10 @@ pub struct LaneFacts {
     pub enqueued: bool,
     /// The row's handoff artifact is committed in `HEAD` and unchanged there.
     pub artifact_tracked: bool,
+    /// Verification of the handoff could not settle on one snapshot (HEAD, the
+    /// artifact or git status moved or was unreadable): `artifact_tracked` is
+    /// not trustworthy and the ParentArtifact requirement is unmet.
+    pub worktree_unknown: bool,
     /// The row carries a worker report.
     pub report_present: bool,
     /// Validation runs recorded for this row, at any commit.
@@ -625,7 +629,7 @@ fn check(
             continue;
         }
         let ok = match req {
-            Requirement::ParentArtifact => lane.artifact_tracked,
+            Requirement::ParentArtifact => lane.artifact_tracked && !lane.worktree_unknown,
             Requirement::ParentReport => lane.report_present,
             // EVERY declared task, not any of them, and only `green`.
             //
@@ -759,6 +763,7 @@ mod tests {
             merged_into_target: false,
             enqueued: false,
             artifact_tracked: true,
+            worktree_unknown: false,
             report_present: true,
             validations: vec![],
             approval: None,
@@ -1102,6 +1107,24 @@ mod tests {
             }
             other => panic!("expected Escalate, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn unknown_worktree_snapshot_is_not_a_parent_artifact() {
+        let mut l = lane("code");
+        l.validations = vec![green("nextest", HEAD)];
+        l.approval = Some(approval(HEAD));
+        l.artifact_tracked = true;
+        let mut l2 = l.clone();
+        l.worktree_unknown = true;
+        match one(l) {
+            SuperviseAction::Escalate { why, .. } => {
+                assert_eq!(why.token(), "handoff-incomplete");
+            }
+            other => panic!("expected Escalate, got {other:?}"),
+        }
+        l2.worktree_unknown = false;
+        assert!(!matches!(one(l2), SuperviseAction::Escalate { .. }));
     }
 
     // --- transitions ---------------------------------------------------------

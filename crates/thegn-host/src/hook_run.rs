@@ -619,6 +619,7 @@ fn log_path_with(
 ) -> std::io::Result<PathBuf> {
     let slug = log_dir_name(worktree)?;
     let dir = log_root.join(slug);
+    thegn_core::fsperm::ensure_private_dir(log_root)?;
     thegn_core::fsperm::ensure_private_dir(&dir)?;
 
     let event_name = event.as_str().to_string();
@@ -654,11 +655,7 @@ fn log_path_with(
 
     for _ in 0..HOOK_LOG_ALLOCATION_ATTEMPTS {
         let path = dir.join(format!("{event_name}-{index}.log"));
-        match std::fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&path)
-        {
+        match thegn_core::fsperm::create_owner_only_exclusive(&path) {
             Ok(file) => {
                 // Keep this reservation even if finalization later fails: reusing a path
                 // already returned in a HookRunResult could identify a different run.
@@ -1025,6 +1022,41 @@ mod tests {
 
         let overlong_worktree = "w".repeat(thegn_core::identity::MAX_IDENTITY_COMPONENT_BYTES + 1);
         assert!(log_path(dir.path(), &overlong_worktree, HookEvent::PostCreate).is_err());
+    }
+
+    #[test]
+    fn hook_log_reservation_and_directories_are_owner_only() {
+        let base = tempfile::tempdir().unwrap();
+        let root = base.path().join("hooks");
+        std::fs::create_dir(&root).unwrap();
+        // Loosen it explicitly so the assertion fails on main under any umask.
+        thegn_core::fsperm::set_mode_for_test(&root, 0o755).unwrap();
+        let worktree = format!("/isolated-hook-private-{}", std::process::id());
+        let path = log_path(&root, &worktree, HookEvent::PostCreate).unwrap();
+        // `None` on platforms without mode bits (Windows uses a DACL).
+        let private = |path: &Path, want: u32| {
+            thegn_core::fsperm::mode_bits(path)
+                .unwrap()
+                .is_none_or(|mode| mode == want)
+        };
+        assert!(private(&path, 0o600));
+        assert!(private(path.parent().unwrap(), 0o700));
+        assert!(private(&root, 0o700));
+    }
+
+    // Positive control: passes at base; an owner-only file made by another
+    // allocator is skipped, never replaced.
+    #[test]
+    fn hook_log_reservation_is_not_replaced_when_another_allocator_created_it_private() {
+        let dir = tempfile::tempdir().unwrap();
+        let worktree = format!("/isolated-hook-private-race-{}", std::process::id());
+        let first = log_path(dir.path(), &worktree, HookEvent::PostCreate).unwrap();
+        let other = first.with_file_name("post_create-2.log");
+        drop(thegn_core::fsperm::create_owner_only_exclusive(&other).unwrap());
+        let next = log_path(dir.path(), &worktree, HookEvent::PostCreate).unwrap();
+        assert_ne!(next, other);
+        assert_ne!(next, first);
+        assert!(next.to_string_lossy().ends_with(".log"));
     }
 
     #[test]

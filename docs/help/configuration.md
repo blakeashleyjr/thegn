@@ -585,6 +585,11 @@ The `[disk]` scalar keys are exposed as `diskShowSizes`, `diskWarnThresholdGb`,
 `diskReclaimOnLowDisk` and `diskSccache`. The `sccache_dir` and
 `shared_target_dir` paths are not exposed.
 
+The `[daemon]` and `[network]` scalar keys are exposed as `daemonEnabled`,
+`daemonIdleExitSecs`, `daemonLeaseGraceSecs`, `daemonStreamGapWindowSecs`,
+`networkOfflineAfterFailures` and `networkRecoveryProbeSecs`. The
+`daemon.socket` path and the `network.mode` enum are not exposed.
+
 `keys list` covers the keymap registry **and** the zone-local tables — the
 sidebar's row keys and each panel section's row-mode keys. Those are handled
 by the focused zone rather than the registry, so they are not rebindable, but

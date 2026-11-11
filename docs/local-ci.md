@@ -102,32 +102,33 @@ just act -- --reuse     # explicitly retain the act job container
 just act-clean          # remove act containers if one wedges
 ```
 
-Defaults live in `.actrc`: the `catthehacker/ubuntu:act-latest` runner image
-is pinned by its index digest, and `linux/amd64` keeps runs identical on Apple
+Defaults live in `.actrc`: the `catthehacker/ubuntu:act-latest` runner image is
+pinned by its index digest, and `linux/amd64` keeps runs identical on Apple
 silicon. To update the image, resolve and review the tag's new digest, then
-replace the pin in `.actrc` in one commit. `just act` and `just act-job`
-refuse any run whose runner image (from `.actrc` or a `-P`/`--platform` flag)
-is not pinned by digest, and refuse a flag that swaps the image `.actrc` pins
-for the same platform label. Without `.secrets` or explicit secret
-flags, the run is anonymous and does not reuse its job container. Act loads
-`.secrets` automatically when that file exists; it gives the checked-out
-workflow and composite-action code access to the token, so use it only on code
-you trust. A credentialed run refuses unless `.github/` and the repository's
-`.actrc` match HEAD, and prints the HEAD it is bound to. Those are the only paths
-the guard checks; other uncommitted working-tree files still run, so use
-credentials only on commits you trust. The guard sees flags passed to `just` and
-the repository's `.secrets`, but does not inspect `~/.actrc` or
+replace the pin in `.actrc` in one commit. `just act` and `just act-job` refuse
+any run whose runner image (from `.actrc` or a `-P`/`--platform` flag) is not
+pinned by digest, and refuse a flag that swaps the image `.actrc` pins for the
+same platform label. Without `.secrets` or explicit secret flags, the run is
+anonymous and does not reuse its job container. Act loads `.secrets`
+automatically when that file exists; it gives the checked-out workflow and
+composite-action code access to the token, so use it only on code you trust. A
+credentialed run refuses unless `.github/` and the repository's `.actrc` match
+HEAD, and prints the HEAD it is bound to. Those are the only paths the guard
+checks; other uncommitted working-tree files still run, so use credentials only
+on commits you trust. The guard sees flags passed to `just` and the
+repository's `.secrets`, but does not inspect `~/.actrc` or
 `$XDG_CONFIG_HOME/act/actrc`, where act can also read secret or reuse flags.
-Credentials cannot be combined with `--reuse`. A credentialed run also
-refuses `-W`/`--workflows`, `-C`/`--directory` and `--local-repository`,
-because the guard only checks this checkout's `.github/` and `.actrc`. The
-guard reads clustered short flags such as `-vsNAME=x` the way act does, counts
-the repository `.actrc` flags as if passed on the command line, and refuses an
-unrecognised short letter on a credentialed run. Every run passes `--rm`
-unless `--reuse` is given, so act removes its containers after a failed run.
-The token is unnecessary for anonymous access to current public flake inputs.
-`--reuse` explicitly retains the container and its mutable `/nix` state; avoid
-carrying it across revisions or trust domains.
+Credentials cannot be combined with `--reuse`. A credentialed run also refuses
+`-W`/`--workflows`, `-C`/`--directory`, `--local-repository`,
+`--action-cache-path` and `--action-offline-mode`, and a value-taking flag left
+without its value, because the guard only checks this checkout's `.github/` and
+`.actrc`. The guard reads clustered short flags such as `-vsNAME=x` the way act
+does, counts the repository `.actrc` flags as if passed on the command line,
+and refuses an unrecognised short letter on a credentialed run. Every run
+passes `--rm` unless `--reuse` is given, so act removes its containers after a
+failed run. The token is unnecessary for anonymous access to current public
+flake inputs. `--reuse` explicitly retains the container and its mutable `/nix`
+state; avoid carrying it across revisions or trust domains.
 
 ### Caveats
 

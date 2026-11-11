@@ -265,6 +265,8 @@ fn gather(
             merged_into_target: git.merged_into_target,
             enqueued: queued.iter().any(|w| w == &row.worktree_path),
             artifact_tracked: verify.tracked,
+            worktree_unknown: verify.worktree_state
+                == Some(thegn_core::pipeline_run::WorktreeState::Unknown),
             // Both halves, matching the done-gate this requirement's
             // documentation claims to mirror: a report that is merely PRESENT
             // but carries an unsupported PASS claim does not satisfy the gate,
@@ -694,6 +696,7 @@ mod tests {
             merged_into_target: false,
             enqueued: false,
             artifact_tracked: true,
+            worktree_unknown: false,
             report_present: true,
             validations: vec![],
             approval: None,
