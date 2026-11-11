@@ -1665,6 +1665,67 @@
       ],
       "type": "object"
     },
+    "SandboxProfileQuery": {
+      "additionalProperties": false,
+      "description": "Query for `worktrees.sandbox_profile`: which worktree's pin to read. The path is matched exactly as registered (no canonicalization).",
+      "properties": {
+        "worktree": {
+          "description": "Absolute path of a registered worktree, exactly as registered.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "worktree"
+      ],
+      "type": "object"
+    },
+    "SandboxProfileReply": {
+      "description": "A worktree's pinned sandbox profile; `profile` is null when nothing is pinned (the configured policy applies).",
+      "properties": {
+        "profile": {
+          "description": "The pinned profile's wire name, or null when inheriting.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "worktree": {
+          "description": "The worktree path the pin belongs to.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "worktree"
+      ],
+      "type": "object"
+    },
+    "SandboxProfileSetReq": {
+      "additionalProperties": false,
+      "description": "Pin or clear a worktree's sandbox profile (`worktrees.sandbox_profile_set`). Clearing is always explicit (`clear: true`), and unknown keys are refused, so a misspelled `profile` can never silently clear a pin. The path is matched exactly as registered (no canonicalization).",
+      "properties": {
+        "clear": {
+          "default": false,
+          "description": "`true` to clear the pin (the configured policy applies again). Mutually exclusive with `profile`.",
+          "type": "boolean"
+        },
+        "profile": {
+          "default": null,
+          "description": "`standard` or `sealed`. Mutually exclusive with `clear`.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "worktree": {
+          "description": "Absolute path of a registered worktree, exactly as registered.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "worktree"
+      ],
+      "type": "object"
+    },
     "SessionInfo": {
       "description": "One daemon-owned session (= one PTY + emulator). The compositor's tab/pane layout stays client-side; the daemon's registry is flat.\n\n`Default` is for construction sites (mostly tests) that care about a few fields — see the note on [`OpenSpec`].",
       "properties": {
@@ -2331,6 +2392,16 @@
       "path": "/v1/worktrees/folder"
     },
     {
+      "cap": "worktrees.sandbox_profile",
+      "method": "GET",
+      "path": "/v1/worktrees/sandbox-profile"
+    },
+    {
+      "cap": "worktrees.sandbox_profile_set",
+      "method": "POST",
+      "path": "/v1/worktrees/sandbox-profile/set"
+    },
+    {
       "cap": "worktrees.open",
       "method": "POST",
       "path": "/v1/worktrees/open"
@@ -2644,6 +2715,15 @@
     },
     "ResizeBody": {
       "$ref": "#/definitions/ResizeBody"
+    },
+    "SandboxProfileQuery": {
+      "$ref": "#/definitions/SandboxProfileQuery"
+    },
+    "SandboxProfileReply": {
+      "$ref": "#/definitions/SandboxProfileReply"
+    },
+    "SandboxProfileSetReq": {
+      "$ref": "#/definitions/SandboxProfileSetReq"
     },
     "SessionInfo": {
       "$ref": "#/definitions/SessionInfo"

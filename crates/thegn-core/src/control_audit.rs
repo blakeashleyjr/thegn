@@ -92,6 +92,8 @@ mod tests {
     fn mutating_and_network_fetch_verbs_are_audited() {
         assert!(is_audited(Verb::GitCommit));
         assert!(is_audited(Verb::FolderAssign));
+        assert!(is_audited(Verb::WorktreeSandboxProfileSet));
+        assert!(!is_audited(Verb::WorktreeSandboxProfile));
         assert!(is_audited(Verb::SendInput));
         assert!(is_audited(Verb::Shutdown));
         assert!(is_audited(Verb::PreviewFetch));

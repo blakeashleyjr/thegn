@@ -84,6 +84,16 @@ pub static ROUTES: &[Route] = &[
     route("/v1/worktrees/folder", &["folders.assign"], || {
         post(http::assign_worktree_folder)
     }),
+    route(
+        "/v1/worktrees/sandbox-profile",
+        &["worktrees.sandbox_profile"],
+        || get(http::worktree_sandbox_profile),
+    ),
+    route(
+        "/v1/worktrees/sandbox-profile/set",
+        &["worktrees.sandbox_profile_set"],
+        || post(http::set_worktree_sandbox_profile),
+    ),
     route("/v1/editor/open", &["editor.open"], || {
         post(http::open_editor)
     }),
@@ -195,6 +205,16 @@ pub static API_CALLS: &[(&str, &str, &str)] = &[
     ("worktrees.list", "GET", "/v1/worktrees"),
     ("worktrees.create", "POST", "/v1/worktrees"),
     ("folders.assign", "POST", "/v1/worktrees/folder"),
+    (
+        "worktrees.sandbox_profile",
+        "GET",
+        "/v1/worktrees/sandbox-profile",
+    ),
+    (
+        "worktrees.sandbox_profile_set",
+        "POST",
+        "/v1/worktrees/sandbox-profile/set",
+    ),
     ("worktrees.open", "POST", "/v1/worktrees/open"),
     ("skills.list", "GET", "/v1/skills"),
     ("editor.open", "POST", "/v1/editor/open"),
