@@ -391,4 +391,5 @@ pub mod work;
 pub mod workspace_overlay;
 pub mod worktree;
 pub mod worktree_suppress;
+pub mod wt_prune;
 pub mod zone;
