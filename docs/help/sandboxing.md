@@ -31,6 +31,12 @@ per repo via a `.thegn.toml` overlay, or per run with
 
 `hardened` is accepted as an alias for `standard` in existing configuration.
 
+When a session prompt names an absolute path under `/tmp`, thegn warns before
+launching if the effective bwrap or read-only container sandbox gives that
+worker a private `/tmp`. The warning does not block the launch; write reports
+and other artifacts under the worktree instead, for example `.thegn/`, because
+files written to the sandbox's `/tmp` disappear when the session ends.
+
 Under `standard`, **everything outside the worktree is read-only —
 including your `$HOME`**, so a sandboxed agent cannot `cd` out and modify
 host files. That is _integrity_ isolation only: the whole `$HOME` stays
