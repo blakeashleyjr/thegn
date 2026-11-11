@@ -20,6 +20,11 @@ thread_local! {
 
 #[cfg(test)]
 thread_local! {
+    static WORKTREE_DESTRUCTIVE_ATTEMPTS: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+thread_local! {
     static WORKTREE_NEXT_DESTRUCTIVE_TIMEOUT: std::cell::Cell<bool> = const {
         std::cell::Cell::new(false)
     };
@@ -1080,6 +1085,8 @@ fn git_destructive(root: &Path, args: &[&str]) -> Result<(), DestructiveError> {
     let mut delay = std::time::Duration::from_millis(40);
     let mut attempt = 1;
     loop {
+        #[cfg(test)]
+        WORKTREE_DESTRUCTIVE_ATTEMPTS.set(attempt);
         let cancel = std::sync::atomic::AtomicBool::new(false);
         let outcome = crate::git_run::git_run(root, args, &destructive_policy(), &cancel);
         match outcome {
@@ -2141,13 +2148,17 @@ mod tests {
     #[test]
     fn non_contention_failure_is_not_retried_and_carries_git_reason() {
         let repo = temp_repo("no-retry");
-        let started = std::time::Instant::now();
+        WORKTREE_DESTRUCTIVE_ATTEMPTS.set(0);
         let err = git_destructive(&repo, &["branch", "-D", "nope"]).unwrap_err();
         assert!(
             err.to_string().contains("nope"),
             "git's own reason is kept: {err}"
         );
-        assert!(started.elapsed() < std::time::Duration::from_millis(300));
+        assert_eq!(
+            WORKTREE_DESTRUCTIVE_ATTEMPTS.get(),
+            1,
+            "a non-contention failure must not be retried"
+        );
         let _ = std::fs::remove_dir_all(&repo);
     }
 
