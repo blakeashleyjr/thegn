@@ -6,6 +6,13 @@ use std::path::Path;
 
 const MAX_BRIEF_FILE_BYTES: usize = 256 * 1024;
 
+fn truncation_warning(path: &str, rendered_bytes: usize) -> String {
+    format!(
+        "warning: brief file `{path}` rendered to {rendered_bytes} bytes and was truncated to the {}-byte cap",
+        thegn_core::agent_task::MAX_RENDERED_PROMPT_BYTES
+    )
+}
+
 pub(crate) fn resolve_brief(
     prompt: &str,
     brief_file: Option<&str>,
@@ -42,8 +49,15 @@ pub(crate) fn resolve_brief(
                 .map_err(|error| anyhow::anyhow!("invalid --vars `{binding}`: {error}"))
         })
         .collect::<Result<Vec<_>>>()?;
-    thegn_core::brief_render::render_brief(&template, &vars)
-        .map_err(|error| anyhow::anyhow!("brief file `{display_path}`: {error}"))
+    let rendered = thegn_core::brief_render::render_brief(&template, &vars)
+        .map_err(|error| anyhow::anyhow!("brief file `{display_path}`: {error}"))?;
+    if rendered.truncated {
+        eprintln!(
+            "{}",
+            truncation_warning(&display_path, rendered.rendered_bytes)
+        );
+    }
+    Ok(rendered.text)
 }
 
 #[cfg(test)]
@@ -154,5 +168,13 @@ mod tests {
             ])
             .is_err()
         );
+    }
+
+    #[test]
+    fn truncation_warning_names_path_rendered_size_and_cap() {
+        let warning = super::truncation_warning("brief.md", 70_000);
+        assert!(warning.contains("brief.md"));
+        assert!(warning.contains("70,000") || warning.contains("70000"));
+        assert!(warning.contains("65536"));
     }
 }

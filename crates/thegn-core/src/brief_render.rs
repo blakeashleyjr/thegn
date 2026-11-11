@@ -1,8 +1,15 @@
 //! Rendering for templated session briefs.
 
-use crate::agent_task::{TaskVars, bound_text, render_task_prompt};
+use crate::agent_task::{TaskVars, bound_text, render_prompt};
 
 const MAX_VAR_BYTES: usize = 16 * 1024;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RenderedBrief {
+    pub text: String,
+    pub rendered_bytes: usize,
+    pub truncated: bool,
+}
 
 /// Parse one `key=value` binding, preserving every `=` after the first one in
 /// the value.
@@ -30,9 +37,14 @@ pub fn parse_var(binding: &str) -> Result<(String, String), String> {
 /// use that mode for prose that may contain arbitrary literal braces. Once a
 /// binding is present, the shared task renderer handles `{{`/`}}`, unknown
 /// placeholders, and the aggregate output cap.
-pub fn render_brief(template: &str, vars: &[(String, String)]) -> Result<String, String> {
+pub fn render_brief(template: &str, vars: &[(String, String)]) -> Result<RenderedBrief, String> {
     if vars.is_empty() {
-        return non_empty(template.to_string());
+        let text = non_empty(template.to_string())?;
+        return Ok(RenderedBrief {
+            rendered_bytes: text.len(),
+            text,
+            truncated: false,
+        });
     }
 
     let mut task_vars = TaskVars::new();
@@ -42,8 +54,18 @@ pub fn render_brief(template: &str, vars: &[(String, String)]) -> Result<String,
         }
         task_vars = task_vars.set(key, bound_text(value, MAX_VAR_BYTES));
     }
-    let rendered = render_task_prompt(template, &task_vars).map_err(|error| error.to_string())?;
-    non_empty(rendered)
+    let rendered = render_prompt(template, &task_vars).map_err(|error| error.to_string())?;
+    let rendered_bytes = rendered.len();
+    let truncated = rendered_bytes > crate::agent_task::MAX_RENDERED_PROMPT_BYTES;
+    let text = non_empty(bound_text(
+        &rendered,
+        crate::agent_task::MAX_RENDERED_PROMPT_BYTES,
+    ))?;
+    Ok(RenderedBrief {
+        text,
+        rendered_bytes,
+        truncated,
+    })
 }
 
 fn non_empty(text: String) -> Result<String, String> {
@@ -60,20 +82,26 @@ mod tests {
 
     #[test]
     fn no_vars_keeps_braces_verbatim() {
-        assert_eq!(render_brief("Rust {code}", &[]).unwrap(), "Rust {code}");
+        assert_eq!(
+            render_brief("Rust {code}", &[]).unwrap().text,
+            "Rust {code}"
+        );
     }
 
     #[test]
     fn substitutes_vars_and_preserves_equals_in_values() {
         let vars = vec![("name".into(), "a=b".into())];
-        assert_eq!(render_brief("hello {name}", &vars).unwrap(), "hello a=b");
+        assert_eq!(
+            render_brief("hello {name}", &vars).unwrap().text,
+            "hello a=b"
+        );
     }
 
     #[test]
     fn double_braces_escape_literal_braces() {
         let vars = vec![("name".into(), "world".into())];
         assert_eq!(
-            render_brief("{{name}} {name}", &vars).unwrap(),
+            render_brief("{{name}} {name}", &vars).unwrap().text,
             "{name} world"
         );
     }
@@ -113,15 +141,18 @@ mod tests {
     fn values_are_bounded_before_rendering() {
         let vars = vec![("value".into(), "x".repeat(32 * 1024))];
         let rendered = render_brief("{value}", &vars).unwrap();
-        assert!(rendered.len() <= 16 * 1024);
-        assert!(rendered.contains("omitted"));
+        assert!(rendered.text.len() <= 16 * 1024);
+        assert!(rendered.text.contains("omitted"));
     }
 
     #[test]
     fn rendered_brief_has_the_aggregate_prompt_cap() {
         let vars = vec![("value".into(), "x".repeat(16 * 1024))];
-        let rendered = render_brief("{value}{value}{value}{value}", &vars).unwrap();
-        assert!(rendered.len() <= crate::agent_task::MAX_RENDERED_PROMPT_BYTES);
+        let rendered = render_brief("{value}{value}{value}{value}{value}", &vars).unwrap();
+        assert!(rendered.truncated);
+        assert_eq!(rendered.rendered_bytes, 5 * 16 * 1024);
+        assert!(rendered.text.len() <= crate::agent_task::MAX_RENDERED_PROMPT_BYTES);
+        assert!(rendered.text.contains("omitted"));
     }
 
     #[test]
