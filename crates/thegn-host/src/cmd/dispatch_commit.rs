@@ -163,11 +163,8 @@ pub(crate) fn commit_in(
 mod tests {
     use super::*;
 
-    #[expect(clippy::disallowed_methods, reason = "test fixture runs real git")]
     fn sh_git(dir: &Path, args: &[&str]) -> String {
-        let out = std::process::Command::new("git")
-            .arg("-C")
-            .arg(dir)
+        let out = thegn_core::util::git_cmd(dir)
             .args(["-c", "commit.gpgsign=false"])
             .args(args)
             .output()
@@ -252,11 +249,7 @@ mod tests {
             "#!/bin/sh\nif [ ! -f .git/hook-ran ]; then\n  touch .git/hook-ran\n  echo formatted >> a.txt\n  exit 1\nfi\nexit 0\n",
         )
         .unwrap();
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(&hook, std::fs::Permissions::from_mode(0o755)).unwrap();
-        }
+        crate::managed_tool::make_executable(&hook).unwrap();
         std::fs::write(root.join("a.txt"), "changed\n").unwrap();
         let m = msg(dir.path(), "feat: y\n");
         let out = commit_in(&root, &m, &["Claude-Session: s2".into()]).unwrap();
@@ -272,11 +265,7 @@ mod tests {
         let (dir, root) = repo();
         let hook = root.join(".git/hooks/pre-commit");
         std::fs::write(&hook, "#!/bin/sh\necho x >> a.txt\nexit 1\n").unwrap();
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(&hook, std::fs::Permissions::from_mode(0o755)).unwrap();
-        }
+        crate::managed_tool::make_executable(&hook).unwrap();
         std::fs::write(root.join("a.txt"), "changed\n").unwrap();
         let m = msg(dir.path(), "feat: z\n");
         assert!(commit_in(&root, &m, &[]).is_err());
