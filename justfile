@@ -1277,12 +1277,12 @@ start-term-release name="dev" backend="": release-profiling (_apply-backend back
 # thegn blocks with its pid. Never overrides migration authority. See
 # docs/live-upgrades.md.
 [positional-arguments]
-live level="debug" size_mb="20" files="5":
+live level="info" size_mb="20" files="5":
     python3 -B scripts/live.py --level "$1" --size-mb "$2" --files "$3"
 
 # Read-only upgrade paths, source selection and constraints (no build/launch).
 [positional-arguments]
-live-plan level="debug" size_mb="20" files="5":
+live-plan level="info" size_mb="20" files="5":
     python3 -B scripts/live.py --plan --level "$1" --size-mb "$2" --files "$3"
 
 # Private launcher regression tests; no Cargo or live-state mutation.

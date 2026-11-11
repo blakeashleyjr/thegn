@@ -308,6 +308,7 @@ mod tests {
             observed_backend: None,
             folder_id: None,
             env_name: None,
+            sandbox_profile: None,
         }
     }
 

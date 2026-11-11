@@ -258,10 +258,12 @@ impl MenuOverlay {
             KeyCode::Char('q') => MenuOutcome::Cancel,
             KeyCode::DownArrow | KeyCode::Char('j') => {
                 self.selected = (self.selected + 1).min(self.items.len().saturating_sub(1));
+                self.sync_sandbox_profile_body();
                 MenuOutcome::Pending
             }
             KeyCode::UpArrow | KeyCode::Char('k') => {
                 self.selected = self.selected.saturating_sub(1);
+                self.sync_sandbox_profile_body();
                 MenuOutcome::Pending
             }
             KeyCode::Enter => match self.items.get(self.selected) {
@@ -281,6 +283,23 @@ impl MenuOverlay {
             }
             _ => MenuOutcome::Pending,
         }
+    }
+
+    fn sync_sandbox_profile_body(&mut self) {
+        let Some(MenuChoice::Confirm {
+            tag: "sandbox-profile",
+            arg,
+        }) = self.items.get(self.selected).map(|item| &item.choice)
+        else {
+            return;
+        };
+        self.body = Some(if arg == "clear" {
+            "Remove the worktree override and inherit the configured profile.".into()
+        } else if let Ok(profile) = thegn_core::sandbox_pin::parse_pin(arg) {
+            thegn_core::sandbox_pin::explain(profile).one_liner.into()
+        } else {
+            String::new()
+        });
     }
 
     /// Content width: the widest `❯ [k] label … note` row (or the body),
@@ -434,7 +453,7 @@ pub fn close_or_delete_menu(targets: usize, names_csv: &str) -> MenuOverlay {
             ),
             item(
                 Some('y'),
-                "delete branch + files from disk",
+                "delete worktree files from disk (branch kept)",
                 MenuChoice::ConfirmDeleteWorktrees {
                     keep_files: false,
                     force: false,
@@ -812,6 +831,53 @@ pub fn sandbox_dormant_menu(
     items.push(item(Some('h'), "run on host", MenuChoice::SandboxRunOnHost));
     items.push(item(Some('n'), "cancel", MenuChoice::Dismiss));
     MenuOverlay::new(MenuKindTag::SandboxHalt, title, items).with_body(body)
+}
+
+pub fn sandbox_profile_menu(
+    current: thegn_core::config::SandboxProfile,
+    pinned: bool,
+) -> MenuOverlay {
+    let options = [
+        ("standard", thegn_core::config::SandboxProfile::Hardened),
+        ("sealed", thegn_core::config::SandboxProfile::Sealed),
+    ];
+    let items = options
+        .into_iter()
+        .enumerate()
+        .map(|(index, (arg, profile))| {
+            let key = if index == 0 { 's' } else { 'e' };
+            item(
+                Some(key),
+                arg.to_string(),
+                MenuChoice::Confirm {
+                    tag: "sandbox-profile",
+                    arg: arg.to_string(),
+                },
+            )
+            .note(if profile == thegn_core::config::SandboxProfile::Sealed {
+                "SSH/provider environments and run-on-host are refused."
+            } else {
+                thegn_core::sandbox_pin::explain(profile).one_liner
+            })
+        })
+        .chain(pinned.then(|| {
+            item(
+                Some('c'),
+                "clear override",
+                MenuChoice::Confirm {
+                    tag: "sandbox-profile",
+                    arg: "clear".to_string(),
+                },
+            )
+        }))
+        .collect();
+    let selected = usize::from(current == thegn_core::config::SandboxProfile::Sealed);
+    let body = thegn_core::sandbox_pin::explain(current).one_liner;
+    let mut menu =
+        MenuOverlay::new_with_default(MenuKindTag::Confirm, "Isolation profile", items, selected)
+            .with_body(body);
+    menu.sync_sandbox_profile_body();
+    menu
 }
 
 pub fn keymap_preset_menu() -> MenuOverlay {
@@ -1425,6 +1491,26 @@ mod tests {
     }
 
     #[test]
+    fn sandbox_profile_menu_body_tracks_the_highlighted_choice() {
+        let mut menu = sandbox_profile_menu(thegn_core::config::SandboxProfile::Hardened, false);
+        assert_eq!(
+            menu.body.as_deref(),
+            Some(
+                thegn_core::sandbox_pin::explain(thegn_core::config::SandboxProfile::Hardened)
+                    .one_liner
+            )
+        );
+        menu.handle_key(&KeyCode::DownArrow, NONE);
+        assert_eq!(
+            menu.body.as_deref(),
+            Some(
+                thegn_core::sandbox_pin::explain(thegn_core::config::SandboxProfile::Sealed)
+                    .one_liner
+            )
+        );
+    }
+
+    #[test]
     fn reach_picker_lists_configured_reaches_and_picks() {
         use thegn_core::config::{ShareConfig, ShareProviderKind, ShareReach};
         let cfg = ShareConfig {
@@ -1692,6 +1778,22 @@ mod tests {
         assert!(m.items()[1].danger, "delete-from-disk row is danger-marked");
         assert_eq!(m.items()[2].choice, MenuChoice::Dismiss);
         assert_eq!(hotkeys(&m), vec!['f', 'y', 'n']);
+    }
+
+    #[test]
+    fn close_or_delete_menu_labels_say_branch_is_kept() {
+        let menu = close_or_delete_menu(1, "x");
+        let delete = &menu.items()[1];
+
+        assert!(delete.label.contains("branch kept"));
+        assert!(!delete.label.contains("delete branch"));
+        assert_eq!(
+            delete.choice,
+            MenuChoice::ConfirmDeleteWorktrees {
+                keep_files: false,
+                force: false,
+            }
+        );
     }
 
     #[test]

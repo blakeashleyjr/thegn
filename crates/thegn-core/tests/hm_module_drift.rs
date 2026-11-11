@@ -110,8 +110,47 @@ const OMITTED: &[(&str, &str)] = &[
         "per-kind priority map is not exposed",
     ),
     ("notifications.rules", "routing rules are not exposed"),
-    ("notifications.dnd", "do-not-disturb table is not exposed"),
-    ("notifications.sound", "sound table is not exposed"),
+    ("notifications.dnd.windows", "window list is not exposed"),
+    (
+        "notifications.dnd.allow_priority",
+        "priority string has no pinned destination enum here",
+    ),
+    (
+        "notifications.sound.mode",
+        "sound mode enum is not exposed yet",
+    ),
+    (
+        "notifications.sound.min_priority",
+        "sound priority string has no pinned destination enum here",
+    ),
+    (
+        "notifications.sound.always_kinds",
+        "sound kind list is not exposed yet",
+    ),
+    (
+        "notifications.sound.pack",
+        "sound pack path is not exposed yet",
+    ),
+    (
+        "notifications.sound.volume",
+        "sound volume float is not exposed yet",
+    ),
+    (
+        "notifications.sound.chime_file",
+        "sound chime path is not exposed yet",
+    ),
+    (
+        "notifications.sound.command",
+        "sound command is executable-bearing and is not exposed yet",
+    ),
+    (
+        "notifications.sound.per_priority",
+        "per-priority sound map is not exposed yet",
+    ),
+    (
+        "notifications.sound.per_kind",
+        "per-kind sound map is not exposed yet",
+    ),
     ("notifications.modes", "notification modes are not exposed"),
     (
         "notifications.active_mode",
@@ -984,7 +1023,10 @@ fn hm_notifications_and_activity_families_are_rendered() {
                     "omitted schema key must exist: {path}"
                 );
             } else {
-                assert!(rendered.contains(&path), "Home Manager must render {path}");
+                assert!(
+                    rendered.contains(&path) || path_is_rendered(&path, &rendered),
+                    "Home Manager must render {path} or its children"
+                );
             }
         }
     }
@@ -994,8 +1036,17 @@ fn hm_notifications_and_activity_families_are_rendered() {
         "notifications.agent_error_signatures",
         "notifications.priority",
         "notifications.rules",
-        "notifications.dnd",
-        "notifications.sound",
+        "notifications.dnd.windows",
+        "notifications.dnd.allow_priority",
+        "notifications.sound.mode",
+        "notifications.sound.min_priority",
+        "notifications.sound.always_kinds",
+        "notifications.sound.pack",
+        "notifications.sound.volume",
+        "notifications.sound.chime_file",
+        "notifications.sound.command",
+        "notifications.sound.per_priority",
+        "notifications.sound.per_kind",
         "notifications.modes",
         "notifications.active_mode",
         "notifications.push",
@@ -1009,6 +1060,33 @@ fn hm_notifications_and_activity_families_are_rendered() {
         "activity.output_hint_ttl_secs",
     ] {
         assert!(schema_has_path(path), "omission must stay pinned: {path}");
+    }
+}
+
+#[test]
+fn hm_notifications_dnd_and_sound_bools_are_rendered_and_rest_dispositioned() {
+    let rendered = rendered_paths(&module_src());
+    for path in [
+        "notifications.dnd.enabled",
+        "notifications.sound.mute",
+        "notifications.sound.suppress_focused",
+    ] {
+        assert!(rendered.contains(path), "Home Manager must render {path}");
+    }
+
+    let omissions: BTreeSet<&str> = OMITTED.iter().map(|(path, _)| *path).collect();
+    for table in ["notifications.dnd", "notifications.sound"] {
+        let schema = schema_field(table);
+        let properties = schema["properties"]
+            .as_object()
+            .unwrap_or_else(|| panic!("{table} schema properties"));
+        for key in properties.keys() {
+            let path = format!("{table}.{key}");
+            assert!(
+                rendered.contains(&path) || omissions.contains(path.as_str()),
+                "{path} must be rendered or dispositioned by an exact ledger row"
+            );
+        }
     }
 }
 

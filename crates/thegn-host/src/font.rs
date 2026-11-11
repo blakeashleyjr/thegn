@@ -954,7 +954,9 @@ fn config_read_error(path: &Path, error: std::io::Error) -> String {
 /// Existing destinations must be owned by this user and have one link; refuse
 /// ambiguity instead of breaking a hard link. Staging names are unpredictable
 /// and exclusively created, and destination permissions are applied to the
-/// staged file before the atomic rename.
+/// staged file before the atomic rename. The generation is re-verified after
+/// staging, immediately before the rename; a lock-free window of microseconds
+/// remains.
 fn replace_config(
     path: &Path,
     observed: &[u8],
@@ -978,6 +980,34 @@ fn replace_config_with(
     new: &[u8],
     suffix: &mut dyn FnMut() -> Result<String, String>,
     sync_parent: &mut dyn FnMut(&Path) -> std::io::Result<()>,
+) -> Result<Replaced, String> {
+    replace_config_checked(
+        path,
+        observed,
+        observed_exists,
+        new,
+        suffix,
+        sync_parent,
+        &mut || {},
+    )
+}
+
+fn destination_unchanged(path: &Path, observed: &[u8], observed_exists: bool) -> bool {
+    match read_config(path) {
+        Ok(current) => observed_exists && current == observed,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => !observed_exists,
+        Err(_) => false,
+    }
+}
+
+fn replace_config_checked(
+    path: &Path,
+    observed: &[u8],
+    observed_exists: bool,
+    new: &[u8],
+    suffix: &mut dyn FnMut() -> Result<String, String>,
+    sync_parent: &mut dyn FnMut(&Path) -> std::io::Result<()>,
+    before_rename: &mut dyn FnMut(),
 ) -> Result<Replaced, String> {
     let (current, metadata) = match thegn_core::fsperm::open_regular_file_nofollow(path) {
         Ok(mut file) => {
@@ -1029,6 +1059,17 @@ fn replace_config_with(
         metadata.as_ref().map(|metadata| metadata.permissions()),
         suffix,
     )?;
+    before_rename();
+    if !destination_unchanged(path, observed, observed_exists) {
+        let message = format!("{} changed while editing; retry", path.display());
+        return match std::fs::remove_file(&temporary) {
+            Ok(()) => Err(message),
+            Err(cleanup_error) => Err(format!(
+                "{message}; remove staging file {} failed: {cleanup_error}",
+                temporary.display()
+            )),
+        };
+    }
     if let Err(error) = thegn_core::fsperm::rename_replace(&temporary, path) {
         let cleanup = std::fs::remove_file(&temporary);
         return match cleanup {
@@ -1423,6 +1464,85 @@ mod tests {
         let error = replace_config(&config, observed, true, b"font_family Hack\n").unwrap_err();
         assert!(error.contains("changed while editing; retry"), "{error}");
         assert_eq!(std::fs::read(&config).unwrap(), newer);
+    }
+
+    #[test]
+    fn config_replacement_rechecks_the_generation_after_staging() {
+        let tmp = tempfile::tempdir().unwrap();
+        let config = tmp.path().join("kitty.conf");
+        let observed = b"font_family Menlo\n";
+        let newer = b"font_family Iosevka\n";
+        std::fs::write(&config, observed).unwrap();
+
+        let result = replace_config_checked(
+            &config,
+            observed,
+            true,
+            b"font_family Hack\n",
+            &mut || Ok("ffff".to_string()),
+            &mut |_| Ok(()),
+            &mut || std::fs::write(&config, newer).unwrap(),
+        );
+
+        assert!(matches!(result, Err(ref error) if error.contains("changed while editing; retry")));
+        assert_eq!(std::fs::read(&config).unwrap(), newer);
+        assert!(std::fs::read_dir(tmp.path()).unwrap().all(|entry| {
+            !entry
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .contains(".tmp-")
+        }));
+    }
+
+    #[test]
+    fn config_replacement_rechecks_an_absent_destination_after_staging() {
+        let tmp = tempfile::tempdir().unwrap();
+        let config = tmp.path().join("kitty.conf");
+        let newer = b"font_family Iosevka\n";
+
+        let result = replace_config_checked(
+            &config,
+            b"",
+            false,
+            b"font_family Hack\n",
+            &mut || Ok("ffff".to_string()),
+            &mut |_| Ok(()),
+            &mut || std::fs::write(&config, newer).unwrap(),
+        );
+
+        assert!(matches!(result, Err(ref error) if error.contains("changed while editing; retry")));
+        assert_eq!(std::fs::read(&config).unwrap(), newer);
+        assert!(std::fs::read_dir(tmp.path()).unwrap().all(|entry| {
+            !entry
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .contains(".tmp-")
+        }));
+    }
+
+    #[test]
+    fn config_replacement_publishes_when_the_hook_leaves_the_generation_alone() {
+        let tmp = tempfile::tempdir().unwrap();
+        let config = tmp.path().join("kitty.conf");
+        let observed = b"font_family Menlo\n";
+        std::fs::write(&config, observed).unwrap();
+        let mut calls = 0;
+
+        let result = replace_config_checked(
+            &config,
+            observed,
+            true,
+            b"font_family Hack\n",
+            &mut || Ok("ffff".to_string()),
+            &mut |_| Ok(()),
+            &mut || calls += 1,
+        );
+
+        assert_eq!(result, Ok(Replaced::Durable));
+        assert_eq!(calls, 1);
+        assert_eq!(std::fs::read(&config).unwrap(), b"font_family Hack\n");
     }
 
     #[test]

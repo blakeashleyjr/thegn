@@ -4,7 +4,9 @@
 //! sidebar UI state, pins, palette frecency, and named terminals. git is the
 //! source of truth for worktrees on disk; this is the cache + resurrection layer.
 
+use crate::config::SandboxProfile;
 use crate::models::{WorkspaceRow, WorktreeRow};
+use crate::sandbox_pin::EnvSelection;
 use anyhow::Result;
 
 /// Typed refusal returned when folder bookkeeping targets a removed workspace.
@@ -303,6 +305,11 @@ pub trait WorkspaceStore {
 
     /// Like [`Self::effective_env`], but a read failure is an error, never a silent fall-through to the default env.
     fn effective_env_checked(&self, wt: &str, repo_path: &str) -> Result<Option<String>>;
+
+    fn set_worktree_sandbox_profile(&self, wt: &str, profile: Option<SandboxProfile>)
+    -> Result<()>;
+    fn worktree_sandbox_profile(&self, wt: &str) -> Result<Option<SandboxProfile>>;
+    fn effective_env_selection(&self, wt: &str, repo_path: &str) -> Result<EnvSelection>;
 
     /// Save (or replace) a named layout snapshot. `spec` is a serialized
     /// `LayoutSpec` JSON string.

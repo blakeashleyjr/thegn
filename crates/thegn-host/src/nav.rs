@@ -123,6 +123,7 @@ mod tests {
             sandbox_backend: None,
             env_name: None,
             env_degraded: false,
+            sandbox_profile: None,
         };
         assert_eq!(
             worktree_row_target("/wt/open", &groups, std::slice::from_ref(&wt)),

@@ -267,7 +267,15 @@ pub(crate) fn loading_context(
             Err(error) => return unreadable_selection_context(cfg, &error),
         },
     };
-    let env = cfg.resolve_env(&repo_root, &loc, Path::new(worktree), selected.as_deref());
+    let env = cfg.resolve_env(
+        &repo_root,
+        &loc,
+        Path::new(worktree),
+        &thegn_core::sandbox_pin::EnvSelection {
+            name: selected.clone(),
+            profile: None,
+        },
+    );
     if env.placement.is_local() {
         return Vec::new();
     }

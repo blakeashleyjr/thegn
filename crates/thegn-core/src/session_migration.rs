@@ -29,6 +29,8 @@ pub struct MigrationWorktree {
     pub observed_backend: Option<String>,
     pub folder_id: Option<i64>,
     pub env_name: Option<String>,
+    #[serde(default)]
+    pub sandbox_profile: Option<String>,
 }
 
 impl From<WorktreeRow> for MigrationWorktree {
@@ -47,6 +49,7 @@ impl From<WorktreeRow> for MigrationWorktree {
             observed_backend: row.observed_backend,
             folder_id: row.folder_id,
             env_name: row.env_name,
+            sandbox_profile: row.sandbox_profile,
         }
     }
 }
@@ -451,13 +454,18 @@ pub struct MigrationPlan {
 }
 
 /// A strict target conflict. Worktree registration is intentionally absent:
-/// target metadata always wins for that row.
+/// target metadata always wins for that row — except the isolation pin, which
+/// is user-owned and must match exactly ([`MigrationConflict::SandboxProfile`]).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum MigrationConflict {
     Group(String),
     UiState(String),
     PinState,
     PriorImport,
+    /// The target already registers this worktree with a different isolation
+    /// pin. Raised in planning, before any write, so the move cannot commit
+    /// tabs that then run under the target's pin.
+    SandboxProfile,
 }
 
 impl std::fmt::Display for MigrationConflict {
@@ -467,6 +475,9 @@ impl std::fmt::Display for MigrationConflict {
             Self::UiState(key) => write!(f, "target sidebar state conflicts: {key}"),
             Self::PinState => f.write_str("target running-pin state conflicts"),
             Self::PriorImport => f.write_str("target contains a different prior migration"),
+            Self::SandboxProfile => {
+                f.write_str("target already registers this worktree with a different isolation pin")
+            }
         }
     }
 }
@@ -666,6 +677,16 @@ pub fn plan_migration(
         && source != existing
     {
         return Err(MigrationConflict::PinState);
+    }
+    // The worktree row's metadata is target-owned, but the isolation pin is
+    // user-owned: a different pin on the target's registration is a conflict
+    // BEFORE any write — otherwise `INSERT OR IGNORE` would silently keep the
+    // target's pin under imported tabs and the read-back would fail with a
+    // generic fingerprint mismatch.
+    if let (Some(source), Some(target_registration)) = (&bundle.worktree, &target.worktree)
+        && source.sandbox_profile != target_registration.sandbox_profile
+    {
+        return Err(MigrationConflict::SandboxProfile);
     }
 
     let target_subset = target_subset(&bundle, &target);
@@ -874,8 +895,12 @@ fn is_migration_prefix(note: &str) -> bool {
 }
 
 /// A stable SHA-256 over sanitized rows. A migration plan computes this over
-/// the imported dispatch form. Database ids, daemon ids, profile names, and
-/// target-owned worktree metadata are intentionally not included.
+/// the imported dispatch form. Database ids, daemon ids, and worktree
+/// registration metadata — including the sandbox profile pin — are
+/// intentionally not included: the pin is compared exactly in
+/// [`plan_migration`] (a conflicting target registration, before any write)
+/// and in the store's read-back, so a target-owned or missing registration
+/// cannot break a resume.
 pub fn fingerprint(bundle: &MigrationBundle) -> String {
     let material = FingerprintMaterial::from_bundle(bundle);
     let bytes = serde_json::to_vec(&material).expect("fingerprint carriers serialize");
@@ -1059,6 +1084,7 @@ pub fn persisted_worktree(row: &MigrationWorktree) -> WorktreeRow {
         observed_backend: row.observed_backend.clone(),
         folder_id: row.folder_id,
         env_name: row.env_name.clone(),
+        sandbox_profile: row.sandbox_profile.clone(),
     }
 }
 

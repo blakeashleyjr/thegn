@@ -877,7 +877,7 @@ def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--plan", action="store_true")
     parser.add_argument("--repo", help="Absolute Git root: source and installation are always selected together")
-    parser.add_argument("--level", default="debug", choices=("trace", "debug", "info", "warn", "error"))
+    parser.add_argument("--level", default="info", choices=("trace", "debug", "info", "warn", "error"))
     parser.add_argument("--size-mb", type=int, default=20)
     parser.add_argument("--files", type=int, default=5)
     parser.add_argument("--yes", action="store_true", help="Skip the Ctrl-C window before thegn is stopped")
@@ -931,7 +931,7 @@ def main(argv=None):
         doctor_report = recovery / "doctor.txt"
         print(f"  `thegn doctor` will be captured to {doctor_report} about {DOCTOR_DELAY}s after launch")
         doctor_later(paths["target"], env, doctor_report)
-        child_env = dict(env, THEGN_NO_MIGRATE="1", RUST_BACKTRACE="full", THEGN_LOG=f"{args.level},log=error",
+        child_env = dict(env, THEGN_NO_MIGRATE="1", RUST_BACKTRACE="full", THEGN_LOG=f"{args.level},log=error,tokei=error",
                          THEGN_LOG_ROTATION_SIZE_MB=str(args.size_mb), THEGN_LOG_MAX_FILES=str(args.files), THEGN_PERF="1")
         # Retain the launcher lock in this supervisor for the entire foreground
         # lifetime; schema lock is released so normal startup can migrate.
