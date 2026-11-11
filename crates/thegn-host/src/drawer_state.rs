@@ -107,6 +107,31 @@ fn flags() -> &'static Mutex<FlagCache> {
     FLAGS.get_or_init(|| Mutex::new(FlagCache::load_from(&store_dir())))
 }
 
+static GENERATIONS: OnceLock<Mutex<HashMap<String, u64>>> = OnceLock::new();
+
+/// Lifecycle generation of a drawer scope key. A scope starts at 0 and is bumped
+/// each time its worktree is forgotten, so work requested under an older
+/// generation can be recognised and dropped. Bounded by the number of
+/// worktrees ever closed in this process. The global scope is never bumped.
+fn scope_generation(scope_key: &str) -> u64 {
+    GENERATIONS
+        .get_or_init(|| Mutex::new(HashMap::new()))
+        .lock()
+        .ok()
+        .and_then(|map| map.get(scope_key).copied())
+        .unwrap_or(0)
+}
+
+fn bump_scope_generation(scope_key: &str) {
+    if let Ok(mut map) = GENERATIONS
+        .get_or_init(|| Mutex::new(HashMap::new()))
+        .lock()
+    {
+        let slot = map.entry(scope_key.to_string()).or_insert(0);
+        *slot = slot.saturating_add(1);
+    }
+}
+
 #[derive(Default)]
 struct PersistOrder {
     /// Latest requested sequence per scope key. The event loop only bumps this
@@ -341,6 +366,22 @@ pub(crate) struct DrawerRequest {
     pub scope_key: String,
     pub occupant_id: String,
     pub worktree: PathBuf,
+    /// The scope's lifecycle generation when the launch was requested.
+    pub generation: u64,
+}
+
+impl DrawerRequest {
+    /// Build a request stamped with the scope's current generation.
+    fn new(scope: DrawerScope, scope_key: String, occupant_id: &str, dir: &Path) -> Self {
+        let generation = scope_generation(&scope_key);
+        DrawerRequest {
+            scope,
+            scope_key,
+            occupant_id: occupant_id.to_string(),
+            worktree: dir.to_path_buf(),
+            generation,
+        }
+    }
 }
 
 pub(crate) type DrawerRegistryMsg = (DrawerRequest, Result<DrawerLaunch, String>);
@@ -395,7 +436,7 @@ fn manager_available(program: &str) -> bool {
 struct RegistrySpawner {
     tx: tokio_mpsc::UnboundedSender<DrawerRegistryMsg>,
     waker: TerminalWaker,
-    pending: Mutex<HashSet<(String, String)>>,
+    pending: Mutex<HashSet<(String, String, u64)>>,
 }
 
 static REGISTRY_SPAWNER: OnceLock<RegistrySpawner> = OnceLock::new();
@@ -423,8 +464,12 @@ pub(crate) fn request_occupant_spawn(
     let Some(spawner) = REGISTRY_SPAWNER.get() else {
         return;
     };
-    let scope_key = drawer_scope_key(scope, dir);
-    let pending_key = (scope_key.clone(), occupant_id.to_string());
+    let request = DrawerRequest::new(scope, drawer_scope_key(scope, dir), occupant_id, dir);
+    let pending_key = (
+        request.scope_key.clone(),
+        request.occupant_id.clone(),
+        request.generation,
+    );
     {
         let Ok(mut pending) = spawner.pending.lock() else {
             return;
@@ -433,12 +478,6 @@ pub(crate) fn request_occupant_spawn(
             return;
         }
     }
-    let request = DrawerRequest {
-        scope,
-        scope_key,
-        occupant_id: occupant_id.to_string(),
-        worktree: dir.to_path_buf(),
-    };
     let tx = spawner.tx.clone();
     let waker = spawner.waker.clone();
     let cfg = cfg.clone();
@@ -454,7 +493,11 @@ pub(crate) fn request_done_occupant(request: &DrawerRequest) {
     if let Some(spawner) = REGISTRY_SPAWNER.get()
         && let Ok(mut pending) = spawner.pending.lock()
     {
-        pending.remove(&(request.scope_key.clone(), request.occupant_id.clone()));
+        pending.remove(&(
+            request.scope_key.clone(),
+            request.occupant_id.clone(),
+            request.generation,
+        ));
     }
 }
 
@@ -868,6 +911,15 @@ impl DrawerRuntime {
         rect: Rect,
     ) {
         request_done_occupant(&request);
+        if request.generation != scope_generation(&request.scope_key) {
+            tracing::debug!(
+                target: "thegn::drawer",
+                occupant = %request.occupant_id,
+                requested = request.generation,
+                "dropped a drawer launch result from before its worktree was forgotten"
+            );
+            return;
+        }
         let key = DrawerPoolKey {
             scope_key: request.scope_key.clone(),
             occupant_id: request.occupant_id.clone(),
@@ -939,9 +991,12 @@ impl DrawerRuntime {
     /// Evict every in-memory trace of a closed worktree's drawer: the visible
     /// pane, hidden pool entries, prewarm markers and the remembered occupant.
     /// A worktree re-created at the same path must not inherit any of it.
+    /// Also bumps the scope's lifecycle generation, so a cold launch still in
+    /// flight for the old worktree is dropped by `apply_result`.
     /// Pure in-memory (no flags, no I/O); returns whether anything was removed.
     pub(crate) fn forget_worktree_panes(&mut self, dir: &Path, panes: &mut Panes) -> bool {
         let scope_key = drawer_scope_key(DrawerScope::Worktree, dir);
+        bump_scope_generation(&scope_key);
         let mut removed = false;
         if self
             .visible
@@ -1389,6 +1444,83 @@ mod tests {
         runtime.pool.stash_key(key.clone(), 31, 8, &mut panes);
         assert!(runtime.forget_worktree_panes(Path::new("/tmp/drawer-forget-c/"), &mut panes));
         assert!(!runtime.pool.contains_key(&key));
+    }
+
+    #[test]
+    fn generation_bumps_only_the_forgotten_worktrees_scope() {
+        let a = Path::new("/tmp/drawer-gen-bump-a");
+        let b = Path::new("/tmp/drawer-gen-bump-b");
+        let a_key = drawer_scope_key(DrawerScope::Worktree, a);
+        let b_key = drawer_scope_key(DrawerScope::Worktree, b);
+        let (a_before, b_before, global_before) = (
+            scope_generation(&a_key),
+            scope_generation(&b_key),
+            scope_generation(GLOBAL_SCOPE_KEY),
+        );
+        let (mut panes, mut runtime) = forget_fixture();
+        runtime.forget_worktree_panes(a, &mut panes);
+        runtime.forget_worktree_panes(a, &mut panes);
+        assert_eq!(scope_generation(&a_key), a_before + 2);
+        assert_eq!(scope_generation(&b_key), b_before);
+        assert_eq!(scope_generation(GLOBAL_SCOPE_KEY), global_before);
+    }
+
+    #[test]
+    fn generation_stamps_new_requests_and_alias_spellings_share_it() {
+        let a = Path::new("/tmp/drawer-gen-stamp");
+        let key = drawer_scope_key(DrawerScope::Worktree, a);
+        let first = DrawerRequest::new(DrawerScope::Worktree, key.clone(), FILES_OCCUPANT_ID, a);
+        assert_eq!(first.generation, scope_generation(&key));
+        let (mut panes, mut runtime) = forget_fixture();
+        runtime.forget_worktree_panes(Path::new("/tmp/drawer-gen-stamp/"), &mut panes);
+        let second = DrawerRequest::new(DrawerScope::Worktree, key, FILES_OCCUPANT_ID, a);
+        assert!(second.generation > first.generation);
+    }
+
+    #[test]
+    fn generation_stale_launch_result_is_dropped_and_keeps_the_new_prewarm_marker() {
+        let p = Path::new("/tmp/drawer-gen-stale");
+        let key = DrawerPoolKey::worktree(p, FILES_OCCUPANT_ID);
+        let (mut panes, mut runtime) = forget_fixture();
+        let old = DrawerRequest::new(
+            DrawerScope::Worktree,
+            drawer_scope_key(DrawerScope::Worktree, p),
+            FILES_OCCUPANT_ID,
+            p,
+        );
+        runtime.forget_worktree_panes(p, &mut panes);
+        runtime.prewarming.insert(key.clone());
+        runtime.apply_result(
+            &thegn_core::config::Config::default(),
+            old,
+            Err("boom".into()),
+            p,
+            &mut panes,
+            Rect {
+                x: 0,
+                y: 0,
+                cols: 80,
+                rows: 24,
+            },
+        );
+        assert!(runtime.prewarming.contains(&key));
+        assert!(runtime.visible.is_none());
+        assert!(!runtime.pool.contains_key(&key));
+    }
+
+    #[test]
+    fn generation_current_request_is_not_dropped_by_the_check() {
+        let p = Path::new("/tmp/drawer-gen-current");
+        let r = DrawerRequest::new(
+            DrawerScope::Worktree,
+            drawer_scope_key(DrawerScope::Worktree, p),
+            FILES_OCCUPANT_ID,
+            p,
+        );
+        assert_eq!(r.generation, scope_generation(&r.scope_key));
+        let (mut panes, mut runtime) = forget_fixture();
+        runtime.forget_worktree_panes(p, &mut panes);
+        assert_ne!(r.generation, scope_generation(&r.scope_key));
     }
 
     #[test]
