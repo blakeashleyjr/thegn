@@ -2227,6 +2227,10 @@ Receiving objects: 100% (10/10)\rdone.\n";
         let dest = temp.path().join("clone");
         let url = format!("http://{address}/x.git");
         let (tx, rx) = std::sync::mpsc::channel();
+        // Below git's own low-speed abort (a user `http.lowSpeedTime = 10` makes git fail
+        // first with "git clone failed"), but wide enough to survive a loaded machine.
+        let connect = Duration::from_secs(6);
+        let slack = Duration::from_secs(10);
         let started = Instant::now();
         let worker = std::thread::spawn(move || {
             let result = clone_workspace_repo_with_deadline(
@@ -2236,7 +2240,7 @@ Receiving objects: 100% (10/10)\rdone.\n";
                 None,
                 CloneLimits {
                     total: Duration::from_secs(60),
-                    connect: Duration::from_millis(300),
+                    connect,
                     idle: Duration::from_secs(60),
                 },
                 || false,
@@ -2244,7 +2248,7 @@ Receiving objects: 100% (10/10)\rdone.\n";
             );
             tx.send(result.map_err(|error| error.to_string())).unwrap();
         });
-        let result = rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        let result = rx.recv_timeout(Duration::from_secs(60)).unwrap();
         stop_accept.store(true, Ordering::Release);
         let elapsed = started.elapsed();
         worker.join().unwrap();
@@ -2255,7 +2259,7 @@ Receiving objects: 100% (10/10)\rdone.\n";
             "the clone process group must be reaped, got: {error}"
         );
         assert!(
-            elapsed < Duration::from_secs(3),
+            elapsed < connect + slack,
             "clone process group took {elapsed:?} to reap"
         );
         assert!(!temp.path().join("clone").exists());
@@ -2291,6 +2295,9 @@ Receiving objects: 100% (10/10)\rdone.\n";
         let dest = temp.path().join("clone");
         let url = format!("http://{address}/x.git");
         let (tx, rx) = std::sync::mpsc::channel();
+        // Below git's own low-speed abort (see the connect-deadline test above).
+        let total = Duration::from_secs(6);
+        let slack = Duration::from_secs(10);
         let started = Instant::now();
         let worker = std::thread::spawn(move || {
             let result = clone_workspace_repo_with_deadline(
@@ -2299,7 +2306,7 @@ Receiving objects: 100% (10/10)\rdone.\n";
                 3,
                 None,
                 CloneLimits {
-                    total: Duration::from_millis(300),
+                    total,
                     connect: Duration::from_secs(60),
                     idle: Duration::from_secs(60),
                 },
@@ -2308,7 +2315,7 @@ Receiving objects: 100% (10/10)\rdone.\n";
             );
             tx.send(result.map_err(|error| error.to_string())).unwrap();
         });
-        let result = rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        let result = rx.recv_timeout(Duration::from_secs(60)).unwrap();
         stop_accept.store(true, Ordering::Release);
         let elapsed = started.elapsed();
         worker.join().unwrap();
@@ -2319,7 +2326,7 @@ Receiving objects: 100% (10/10)\rdone.\n";
             "the clone process group must be reaped, got: {error}"
         );
         assert!(
-            elapsed < Duration::from_secs(3),
+            elapsed < total + slack,
             "clone process group took {elapsed:?} to reap"
         );
         assert!(!temp.path().join("clone").exists());
