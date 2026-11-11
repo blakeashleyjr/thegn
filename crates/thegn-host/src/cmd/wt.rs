@@ -1369,7 +1369,7 @@ fn delete_branch_guard_inputs(root: &std::path::Path) -> Result<(String, Option<
 
 /// Whether `base` names a commit in `root`. `git rev-parse --verify --quiet` exits 1 (empty stderr) when it
 /// does not; any other failure is an error, not "no commits".
-fn base_has_commits(root: &std::path::Path, base: &str) -> Result<bool> {
+pub(crate) fn base_has_commits(root: &std::path::Path, base: &str) -> Result<bool> {
     let loc = thegn_core::remote::GitLoc::Local(root.to_path_buf());
     match loc.git_text(&["rev-parse", "--verify", "--quiet", base]) {
         Ok(_) => Ok(true),
