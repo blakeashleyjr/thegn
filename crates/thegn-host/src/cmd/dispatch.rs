@@ -1831,7 +1831,31 @@ fn set_status_error_kind(err: &anyhow::Error) -> Option<&'static str> {
     {
         return Some("missing_row");
     }
+    if err
+        .downcast_ref::<thegn_core::db::DoneEvidenceChanged>()
+        .is_some()
+    {
+        return Some("stale");
+    }
     None
+}
+
+/// Write a non-forced status transition. With a [`thegn_core::db::DoneFence`]
+/// (captured before the done gate ran) the write re-checks the gate's evidence
+/// inside its transaction and refuses a row that changed since. `transition`
+/// is `(expected, to)`; a fence only ever applies to `to == Done`.
+pub(crate) fn write_status(
+    db: &Db,
+    id: i64,
+    transition: (AgentDispatchStatus, AgentDispatchStatus),
+    fence: Option<&thegn_core::db::DoneFence>,
+    note: Option<&str>,
+    proof: LeadProof<'_>,
+) -> Result<()> {
+    match fence {
+        Some(fence) => db.set_dispatch_done_fenced(id, transition.0, fence, note, proof),
+        None => db.set_dispatch_status_led(id, transition.0, transition.1, note, proof),
+    }
 }
 
 fn set_status_on_led(
@@ -1843,6 +1867,18 @@ fn set_status_on_led(
     proof: LeadProof<'_>,
     json: bool,
 ) -> Result<()> {
+    // Snapshot the gate's evidence BEFORE reading the row or running the gate,
+    // so any change after this point is caught inside the write transaction.
+    // A missing row refuses here: a non-forced done never reaches
+    // `write_status` without a fence.
+    let fence = if parsed == AgentDispatchStatus::Done && !force {
+        Some(
+            db.done_fence(id)?
+                .ok_or_else(|| anyhow::Error::new(thegn_core::db::MissingDispatch { id }))?,
+        )
+    } else {
+        None
+    };
     let row = db
         .get_dispatch(id)?
         .ok_or_else(|| anyhow::anyhow!("no dispatch with id {id}"))?;
@@ -1889,16 +1925,17 @@ fn set_status_on_led(
                 .reason,
         )
     } else if let Some(w) = why.map(str::trim).filter(|w| !w.is_empty()) {
-        db.set_dispatch_status_led(
+        write_status(
+            db,
             id,
-            row.status,
-            parsed,
+            (row.status, parsed),
+            fence.as_ref(),
             Some(&format!("set-status {}: {w}", parsed.as_str())),
             proof,
         )?;
         None
     } else {
-        db.set_dispatch_status_led(id, row.status, parsed, None, proof)?;
+        write_status(db, id, (row.status, parsed), fence.as_ref(), None, proof)?;
         None
     };
     let unexplained = wants_a_reason(
@@ -6031,6 +6068,77 @@ mod tests {
             .unwrap();
         let row = db.get_dispatch(id).unwrap().unwrap();
         done_gate_bound(&db, &row).unwrap();
+    }
+
+    #[test]
+    fn done_fence_write_status_refuses_a_report_filed_after_the_gate() {
+        let (_dir, db) = db("done-fence-late-report");
+        let id = db
+            .put_agent_dispatch(NewDispatch::new("linear:THE-1939-LATE", "/wt/x", "claude"))
+            .unwrap();
+        db.update_dispatch_status(id, AgentDispatchStatus::Running)
+            .unwrap();
+        let fence = db.done_fence(id).unwrap();
+        let row = db.get_dispatch(id).unwrap().unwrap();
+        done_gate_bound(&db, &row).unwrap();
+        db.set_dispatch_report(id, "late report").unwrap();
+
+        let err = write_status(
+            &db,
+            id,
+            (AgentDispatchStatus::Running, AgentDispatchStatus::Done),
+            fence.as_ref(),
+            None,
+            LeadProof::Unbound,
+        )
+        .unwrap_err();
+        assert_eq!(set_status_error_kind(&err), Some("stale"));
+        assert_eq!(
+            db.get_dispatch(id).unwrap().unwrap().status,
+            AgentDispatchStatus::Running
+        );
+    }
+
+    #[test]
+    fn done_fence_missing_row_refuses_instead_of_writing_unfenced() {
+        let (_dir, db) = db("done-fence-missing");
+        let err = set_status_on_led(
+            &db,
+            9_999,
+            AgentDispatchStatus::Done,
+            false,
+            None,
+            LeadProof::Unbound,
+            true,
+        )
+        .unwrap_err();
+        assert!(
+            err.downcast_ref::<thegn_core::db::MissingDispatch>()
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn done_fence_write_status_without_a_fence_is_unchanged() {
+        let (_dir, db) = db("done-fence-none");
+        let id = db
+            .put_agent_dispatch(NewDispatch::new("linear:THE-1939-NONE", "/wt/x", "claude"))
+            .unwrap();
+        db.update_dispatch_status(id, AgentDispatchStatus::Running)
+            .unwrap();
+        write_status(
+            &db,
+            id,
+            (AgentDispatchStatus::Running, AgentDispatchStatus::Done),
+            None,
+            None,
+            LeadProof::Unbound,
+        )
+        .unwrap();
+        assert_eq!(
+            db.get_dispatch(id).unwrap().unwrap().status,
+            AgentDispatchStatus::Done
+        );
     }
 
     #[test]

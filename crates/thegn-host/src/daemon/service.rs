@@ -613,6 +613,20 @@ fn dispatch_set_status_with_proof(
 ) -> anyhow::Result<()> {
     use thegn_core::store::NotificationStore;
 
+    // Snapshot the done gate's evidence before the row read and the gate, so
+    // the final write can refuse a row that changed in between. A fence is
+    // taken for every Done, even a row already Done or an illegal transition
+    // where the gate never runs: the transition check still fires first and the
+    // idempotent Done->Done write only gains a column compare. A missing row
+    // refuses rather than falling through to an unfenced write.
+    let fence = if status == thegn_core::issue::AgentDispatchStatus::Done {
+        Some(
+            db.done_fence(id)?
+                .ok_or_else(|| anyhow::Error::new(DispatchStatusError::NotFound(id)))?,
+        )
+    } else {
+        None
+    };
     let row = db
         .get_dispatch(id)?
         .ok_or_else(|| anyhow::Error::new(DispatchStatusError::NotFound(id)))?;
@@ -626,7 +640,7 @@ fn dispatch_set_status_with_proof(
         db.check_dispatch_lead(id, proof)?;
         crate::cmd::dispatch::done_gate_bound(db, &row)?;
     }
-    db.set_dispatch_status_led(id, row.status, status, None, proof)
+    crate::cmd::dispatch::write_status(db, id, (row.status, status), fence.as_ref(), None, proof)
 }
 
 fn map_dispatch_status_error(error: anyhow::Error) -> ControlError {
@@ -661,6 +675,12 @@ fn map_dispatch_status_error(error: anyhow::Error) -> ControlError {
                 ControlError::Conflict(error.to_string())
             }
         };
+    }
+    if error
+        .downcast_ref::<thegn_core::db::DoneEvidenceChanged>()
+        .is_some()
+    {
+        return ControlError::Conflict(error.to_string());
     }
     if let Some(refused) = error.downcast_ref::<crate::cmd::dispatch::DoneGateRefused>() {
         let id = refused.id;
@@ -7301,6 +7321,33 @@ mod tests {
                 to: St::Running,
             })),
             ControlError::FailedPrecondition(_)
+        ));
+    }
+
+    #[test]
+    fn done_fence_missing_row_is_not_found_not_an_unfenced_write() {
+        let db = Db::open_memory().unwrap();
+        let err = dispatch_set_status_with_proof(
+            &db,
+            9_999,
+            thegn_core::issue::AgentDispatchStatus::Done,
+            thegn_core::db::LeadProof::Unbound,
+        )
+        .unwrap_err();
+        assert!(matches!(
+            err.downcast_ref::<DispatchStatusError>(),
+            Some(DispatchStatusError::NotFound(9_999))
+        ));
+    }
+
+    #[test]
+    fn done_fence_evidence_change_maps_to_conflict() {
+        assert!(matches!(
+            map_dispatch_status_error(anyhow::Error::new(thegn_core::db::DoneEvidenceChanged {
+                id: 7,
+                field: "report",
+            })),
+            ControlError::Conflict(_)
         ));
     }
 
