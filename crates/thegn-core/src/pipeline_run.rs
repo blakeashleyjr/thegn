@@ -225,6 +225,8 @@ pub struct VerifyReport {
     /// Only the things that make `ok` false — a caller prints this verbatim
     /// on refusal. `dirty` is deliberately *not* here: it never blocks.
     pub reasons: Vec<String>,
+    /// Typed twin of `reasons`: same length, same order, one kind per reason.
+    pub refusals: Vec<VerifyRefusal>,
     /// Non-blocking diagnostics about facts that could not be observed.
     pub warnings: Vec<String>,
 }
@@ -237,6 +239,31 @@ pub enum ReportCommitBinding {
     Bound,
     Stale,
     Unknown,
+}
+
+/// Stable snake_case kind of one verification refusal, parallel to the prose
+/// in [`VerifyReport::reasons`] so supervisors need not string-match.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum VerifyRefusal {
+    UnpublishedReservation,
+    WrongIdentity,
+    Empty,
+    TooLarge,
+    TooManyLines,
+    Binary,
+    InvalidUtf8,
+    ControlChars,
+    Sensitive,
+    Unreadable,
+    WorktreeUnknown,
+    Absent,
+    Uncommitted,
+    ReportMissing,
+    GateUnproven,
+    VerdictNotPass,
+    ReportStale,
+    ReportBindingUnknown,
 }
 
 /// Classify whether a report filed at `report_head` still describes `head`.
@@ -289,6 +316,11 @@ pub fn verify_report(f: &VerifyFacts) -> VerifyReport {
         } else {
             Vec::new()
         };
+        let refusals = if reasons.is_empty() {
+            Vec::new()
+        } else {
+            vec![VerifyRefusal::UnpublishedReservation]
+        };
         return VerifyReport {
             ok: reasons.is_empty(),
             artifact: None,
@@ -300,82 +332,139 @@ pub fn verify_report(f: &VerifyFacts) -> VerifyReport {
             report_gate_valid: f.report_gate_valid,
             report_commit_binding: f.report_commit_binding,
             reasons,
+            refusals,
             warnings: Vec::new(),
         };
     };
     let mut reasons = Vec::new();
+    let mut kinds = Vec::new();
     let mut warnings = Vec::new();
     if f.stage.is_some()
         && let ArtifactIdentity::Mismatch { expected } = &f.artifact_identity
     {
-        reasons.push(format!(
-            "artifact {a:?} is not this row's handoff; a pipeline row's handoff is {expected:?}"
-        ));
+        refuse(
+            &mut reasons,
+            &mut kinds,
+            VerifyRefusal::WrongIdentity,
+            format!(
+                "artifact {a:?} is not this row's handoff; a pipeline row's handoff is {expected:?}"
+            ),
+        );
     }
     if f.stage.is_some() && f.artifact_empty && f.exists {
-        reasons.push(format!("artifact {a:?} is empty"));
+        refuse(
+            &mut reasons,
+            &mut kinds,
+            VerifyRefusal::Empty,
+            format!("artifact {a:?} is empty"),
+        );
     }
     if f.stage.is_some() && f.exists {
         let content_reason = match f.artifact_content {
             ArtifactContent::NotRead | ArtifactContent::Valid => None,
-            ArtifactContent::TooLarge => Some(format!(
-                "artifact {a:?} is larger than {ARTIFACT_MAX_BYTES} bytes"
+            ArtifactContent::TooLarge => Some((
+                VerifyRefusal::TooLarge,
+                format!("artifact {a:?} is larger than {ARTIFACT_MAX_BYTES} bytes"),
             )),
-            ArtifactContent::TooManyLines => Some(format!(
-                "artifact {a:?} has more than {ARTIFACT_MAX_LINES} lines"
+            ArtifactContent::TooManyLines => Some((
+                VerifyRefusal::TooManyLines,
+                format!("artifact {a:?} has more than {ARTIFACT_MAX_LINES} lines"),
             )),
-            ArtifactContent::Binary => Some(format!("artifact {a:?} is binary (contains NUL)")),
-            ArtifactContent::InvalidUtf8 => Some(format!("artifact {a:?} is not valid UTF-8")),
-            ArtifactContent::Control { at } => Some(format!(
-                "artifact {a:?} contains a terminal control or bidi override at character {at}"
+            ArtifactContent::Binary => Some((
+                VerifyRefusal::Binary,
+                format!("artifact {a:?} is binary (contains NUL)"),
             )),
-            ArtifactContent::Unreadable => {
-                Some(format!("could not read artifact {a:?}; retry verification"))
-            }
-            ArtifactContent::Sensitive { kind } => Some(format!(
-                "artifact {a:?} appears to contain a credential ({kind}); remove it, commit, and re-file the handoff"
+            ArtifactContent::InvalidUtf8 => Some((
+                VerifyRefusal::InvalidUtf8,
+                format!("artifact {a:?} is not valid UTF-8"),
+            )),
+            ArtifactContent::Control { at } => Some((
+                VerifyRefusal::ControlChars,
+                format!(
+                    "artifact {a:?} contains a terminal control or bidi override at character {at}"
+                ),
+            )),
+            ArtifactContent::Unreadable => Some((
+                VerifyRefusal::Unreadable,
+                format!("could not read artifact {a:?}; retry verification"),
+            )),
+            ArtifactContent::Sensitive { kind } => Some((
+                VerifyRefusal::Sensitive,
+                format!(
+                    "artifact {a:?} appears to contain a credential ({kind}); remove it, commit, and re-file the handoff"
+                ),
             )),
         };
-        if let Some(reason) = content_reason {
-            reasons.push(reason);
+        if let Some((kind, reason)) = content_reason {
+            refuse(&mut reasons, &mut kinds, kind, reason);
         }
     }
     if f.worktree_state == Some(WorktreeState::Unknown) {
-        reasons.push(
+        refuse(
+            &mut reasons,
+            &mut kinds,
+            VerifyRefusal::WorktreeUnknown,
             "could not observe worktree status (`git status --porcelain` failed); retry verification"
                 .into(),
         );
     }
     if !f.exists {
-        reasons.push(format!("artifact {a:?} does not exist under the worktree"));
+        refuse(
+            &mut reasons,
+            &mut kinds,
+            VerifyRefusal::Absent,
+            format!("artifact {a:?} does not exist under the worktree"),
+        );
     } else if !f.tracked {
-        reasons.push(format!(
-            "artifact {a:?} exists but is not committed and clean in HEAD — commit it"
-        ));
+        refuse(
+            &mut reasons,
+            &mut kinds,
+            VerifyRefusal::Uncommitted,
+            format!("artifact {a:?} exists but is not committed and clean in HEAD — commit it"),
+        );
     }
     if !f.report_present {
-        reasons.push(format!(
-            "row has artifact {a:?} but no report — file one with `thegn dispatch report <id>`"
-        ));
+        refuse(
+            &mut reasons,
+            &mut kinds,
+            VerifyRefusal::ReportMissing,
+            format!(
+                "row has artifact {a:?} but no report — file one with `thegn dispatch report <id>`"
+            ),
+        );
     }
     if f.report_present && !f.report_gate_valid {
-        reasons.push(
+        refuse(
+            &mut reasons,
+            &mut kinds,
+            VerifyRefusal::GateUnproven,
             "row claims PASS but cites no successful gate result — update it with `thegn dispatch report <id>`"
                 .into(),
         );
     }
     if f.report_present && f.report_verdict != crate::pipeline_report::Verdict::Pass {
-        reasons.push(format!(
-            "report verdict is {} — a Lead must review the committed artifact and decide whether to close it",
-            f.report_verdict
-        ));
+        refuse(
+            &mut reasons,
+            &mut kinds,
+            VerifyRefusal::VerdictNotPass,
+            format!(
+                "report verdict is {} — a Lead must review the committed artifact and decide whether to close it",
+                f.report_verdict
+            ),
+        );
     }
     if f.report_present {
         match f.report_commit_binding {
-            ReportCommitBinding::Stale => reasons.push(
+            ReportCommitBinding::Stale => refuse(
+                &mut reasons,
+                &mut kinds,
+                VerifyRefusal::ReportStale,
                 "report is bound to an older or changed artifact commit — file a fresh report at the current HEAD".into(),
             ),
-            ReportCommitBinding::Unknown => reasons.push(
+            ReportCommitBinding::Unknown => refuse(
+                &mut reasons,
+                &mut kinds,
+                VerifyRefusal::ReportBindingUnknown,
                 "could not verify the report's commit binding — retry verification before completion".into(),
             ),
             ReportCommitBinding::Unbound => warnings.push(
@@ -395,8 +484,21 @@ pub fn verify_report(f: &VerifyFacts) -> VerifyReport {
         report_gate_valid: f.report_gate_valid,
         report_commit_binding: f.report_commit_binding,
         reasons,
+        refusals: kinds,
         warnings,
     }
+}
+
+/// Record one refusal as its prose reason and its typed kind, keeping
+/// `reasons` and `refusals` parallel.
+fn refuse(
+    reasons: &mut Vec<String>,
+    kinds: &mut Vec<VerifyRefusal>,
+    kind: VerifyRefusal,
+    text: String,
+) {
+    reasons.push(text);
+    kinds.push(kind);
 }
 
 /// A row typed `stage` or `legacy_held` must keep its pipeline identity: a stage
@@ -878,6 +980,139 @@ mod tests {
             report.ok,
             "positive control: plain dispatch content is unchanged"
         );
+    }
+
+    /// Facts for a pipeline row that passes every gate.
+    fn good_stage_facts() -> VerifyFacts {
+        let mut f = facts_report(Some("canonical.md"), true, true, false, true);
+        f.stage = Some("code".into());
+        f.artifact_identity = ArtifactIdentity::Canonical;
+        f.artifact_content = ArtifactContent::Valid;
+        f.report_commit_binding = ReportCommitBinding::Bound;
+        f
+    }
+
+    #[test]
+    fn typed_refusals_name_each_failed_gate() {
+        let mut cases: Vec<(VerifyRefusal, VerifyFacts)> = Vec::new();
+        let mut reserved = facts(None, false, false, false);
+        reserved.stage = Some("code".into());
+        cases.push((VerifyRefusal::UnpublishedReservation, reserved));
+        let mut f = good_stage_facts();
+        f.artifact_identity = ArtifactIdentity::Mismatch {
+            expected: "x".into(),
+        };
+        cases.push((VerifyRefusal::WrongIdentity, f));
+        let mut f = good_stage_facts();
+        f.artifact_empty = true;
+        cases.push((VerifyRefusal::Empty, f));
+        for (kind, content) in [
+            (VerifyRefusal::TooLarge, ArtifactContent::TooLarge),
+            (VerifyRefusal::TooManyLines, ArtifactContent::TooManyLines),
+            (VerifyRefusal::Binary, ArtifactContent::Binary),
+            (VerifyRefusal::InvalidUtf8, ArtifactContent::InvalidUtf8),
+            (
+                VerifyRefusal::ControlChars,
+                ArtifactContent::Control { at: 3 },
+            ),
+            (VerifyRefusal::Unreadable, ArtifactContent::Unreadable),
+            (
+                VerifyRefusal::Sensitive,
+                ArtifactContent::Sensitive { kind: "jwt" },
+            ),
+        ] {
+            let mut f = good_stage_facts();
+            f.artifact_content = content;
+            cases.push((kind, f));
+        }
+        let mut f = good_stage_facts();
+        f.worktree_state = Some(WorktreeState::Unknown);
+        cases.push((VerifyRefusal::WorktreeUnknown, f));
+        let mut f = good_stage_facts();
+        f.exists = false;
+        f.tracked = false;
+        cases.push((VerifyRefusal::Absent, f));
+        let mut f = good_stage_facts();
+        f.tracked = false;
+        cases.push((VerifyRefusal::Uncommitted, f));
+        let mut f = good_stage_facts();
+        f.report_present = false;
+        cases.push((VerifyRefusal::ReportMissing, f));
+        let mut f = good_stage_facts();
+        f.report_gate_valid = false;
+        cases.push((VerifyRefusal::GateUnproven, f));
+        let mut f = good_stage_facts();
+        f.report_verdict = crate::pipeline_report::Verdict::Fail;
+        cases.push((VerifyRefusal::VerdictNotPass, f));
+        let mut f = good_stage_facts();
+        f.report_commit_binding = ReportCommitBinding::Stale;
+        cases.push((VerifyRefusal::ReportStale, f));
+        let mut f = good_stage_facts();
+        f.report_commit_binding = ReportCommitBinding::Unknown;
+        cases.push((VerifyRefusal::ReportBindingUnknown, f));
+        for (kind, f) in &cases {
+            let report = verify_report(f);
+            assert!(!report.ok, "{kind:?}: {report:?}");
+            assert!(report.refusals.contains(kind), "{kind:?}: {report:?}");
+        }
+    }
+
+    #[test]
+    fn typed_refusals_are_parallel_to_reasons() {
+        let mut corpus = vec![
+            facts(Some("a.md"), false, false, false),
+            facts(Some("a.md"), true, false, false),
+        ];
+        let mut f = good_stage_facts();
+        f.artifact_empty = true;
+        corpus.push(f);
+        let mut f = good_stage_facts();
+        f.artifact_identity = ArtifactIdentity::Mismatch {
+            expected: "x".into(),
+        };
+        corpus.push(f);
+        for content in [
+            ArtifactContent::TooLarge,
+            ArtifactContent::TooManyLines,
+            ArtifactContent::Binary,
+            ArtifactContent::InvalidUtf8,
+            ArtifactContent::Control { at: 1 },
+            ArtifactContent::Unreadable,
+            ArtifactContent::Sensitive { kind: "jwt" },
+        ] {
+            let mut f = good_stage_facts();
+            f.artifact_content = content;
+            corpus.push(f);
+        }
+        let mut f = good_stage_facts();
+        f.report_present = false;
+        corpus.push(f);
+        let mut f = good_stage_facts();
+        f.report_commit_binding = ReportCommitBinding::Stale;
+        corpus.push(f);
+        // Several failures at once keep the two lists aligned.
+        let mut f = good_stage_facts();
+        f.tracked = false;
+        f.report_gate_valid = false;
+        f.report_commit_binding = ReportCommitBinding::Unknown;
+        corpus.push(f);
+        assert!(corpus.len() >= 8);
+        for f in &corpus {
+            let report = verify_report(f);
+            assert_eq!(report.refusals.len(), report.reasons.len(), "{report:?}");
+            assert!(!report.ok && !report.refusals.is_empty(), "{report:?}");
+        }
+        let good = verify_report(&good_stage_facts());
+        assert!(good.ok && good.refusals.is_empty(), "{good:?}");
+    }
+
+    #[test]
+    fn typed_refusals_serialize_as_snake_case_in_json() {
+        let mut f = good_stage_facts();
+        f.exists = false;
+        f.tracked = false;
+        let value = serde_json::to_value(verify_report(&f)).unwrap();
+        assert_eq!(value["refusals"][0], "absent");
     }
 
     #[test]
