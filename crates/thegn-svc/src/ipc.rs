@@ -506,12 +506,13 @@ fn is_control_key_dir_name(name: &str) -> bool {
     name.len() == 32 && name.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
 }
 
-/// Remove abandoned `<runtime_root>/<key>/` control directories: owner-only,
-/// idle for `min_idle`, holding nothing but an unheld `daemon.sock.lock`.
+/// Prune abandoned `<runtime_root>/<key>/` control directories: owner-only,
+/// idle for `min_idle`, holding nothing but an unheld `daemon.sock.lock`. The
+/// lock is unlinked and the empty directory is left for a later pass.
 /// Best effort (every failure is logged and skipped), never follows a symlink,
 /// and unlinks a lock only while holding its flock and after re-verifying the
 /// path still names the locked inode (binders re-check the same way). Returns
-/// how many directories were removed.
+/// how many entries (locks, or empty directories) were removed.
 #[cfg(unix)]
 fn prune_idle_control_dirs(
     runtime_root: &Path,
@@ -521,6 +522,26 @@ fn prune_idle_control_dirs(
 ) -> usize {
     use std::os::unix::fs::{MetadataExt as _, OpenOptionsExt as _};
 
+    // Every per-candidate operation below is path-based, so the root itself
+    // must be a real, owner-owned, non-group/world-writable directory: nobody
+    // else can then swap a vetted key directory for a symlink under us.
+    let Some(uid) = effective_uid() else {
+        return 0;
+    };
+    match std::fs::symlink_metadata(runtime_root) {
+        Ok(root_meta)
+            if root_meta.file_type().is_dir()
+                && root_meta.uid() == uid
+                && root_meta.mode() & 0o022 == 0 => {}
+        Ok(_) => {
+            tracing::debug!(target: "thegn::daemon", root = %runtime_root.display(), "control prune: runtime root is not a private real directory");
+            return 0;
+        }
+        Err(error) => {
+            tracing::debug!(target: "thegn::daemon", %error, "control prune: cannot inspect runtime root");
+            return 0;
+        }
+    }
     let entries = match std::fs::read_dir(runtime_root) {
         Ok(entries) => entries,
         Err(error) => {
@@ -529,7 +550,6 @@ fn prune_idle_control_dirs(
         }
     };
     let own_name = own_dir.file_name();
-    let uid = effective_uid().unwrap_or_default();
     let mut examined = 0_usize;
     let mut removed = 0_usize;
     for entry in entries {
@@ -618,15 +638,15 @@ fn prune_idle_control_dirs(
         if !still_named {
             continue;
         }
-        if let Err(error) = std::fs::remove_file(&lock) {
-            tracing::debug!(target: "thegn::daemon", %error, lock = %lock.display(), "control prune: cannot remove lock");
-            continue;
-        }
-        match std::fs::remove_dir(&dir) {
+        match std::fs::remove_file(&lock) {
+            // The now-empty directory is deliberately left in place: a binder
+            // that opened this lock before we unlinked it re-opens it after its
+            // inode recheck fails, and must not find its parent gone. The
+            // unlink refreshes the directory mtime, so a later pass removes the
+            // empty directory only after another full idle period.
             Ok(()) => removed += 1,
             Err(error) => {
-                // ENOTEMPTY: a racing binder created content; leave it.
-                tracing::debug!(target: "thegn::daemon", %error, dir = %dir.display(), "control prune: directory not removed");
+                tracing::debug!(target: "thegn::daemon", %error, lock = %lock.display(), "control prune: cannot remove lock");
             }
         }
     }
@@ -2068,8 +2088,15 @@ mod tests {
         let dir = prune_key_dir(&root, &"b".repeat(32), true);
         let removed = prune_idle_control_dirs(&root, &own, std::time::Duration::ZERO, 64);
         assert_eq!(removed, 1);
-        assert!(!dir.exists());
+        // The lock goes first; the empty directory stays for a later pass.
+        assert!(dir.exists());
+        assert!(!dir.join("daemon.sock.lock").exists());
         assert!(own.join("daemon.sock.lock").exists());
+        assert_eq!(
+            prune_idle_control_dirs(&root, &own, std::time::Duration::ZERO, 64),
+            1
+        );
+        assert!(!dir.exists());
     }
 
     #[cfg(unix)]
@@ -2104,7 +2131,7 @@ mod tests {
             prune_idle_control_dirs(&root, &own, std::time::Duration::ZERO, 64),
             1
         );
-        assert!(!dir.exists());
+        assert!(!lock.exists());
     }
 
     #[cfg(unix)]
@@ -2204,11 +2231,76 @@ mod tests {
         ];
         let count = prune_idle_control_dirs(&root, &own, std::time::Duration::ZERO, 2);
         assert!(count <= 2);
-        let remaining = dirs.iter().filter(|dir| dir.exists()).count();
+        let remaining = dirs
+            .iter()
+            .filter(|dir| dir.join("daemon.sock.lock").exists())
+            .count();
         assert_eq!(remaining, 3 - count);
         assert!(remaining >= 1);
+        // Locks first, then the emptied directories.
+        prune_idle_control_dirs(&root, &own, std::time::Duration::ZERO, usize::MAX);
         prune_idle_control_dirs(&root, &own, std::time::Duration::ZERO, usize::MAX);
         assert!(dirs.iter().all(|dir| !dir.exists()));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn control_dir_prune_refuses_an_unverified_root() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        // (a) a group/world-writable root prunes nothing.
+        let (_td, root) = prune_fixture();
+        let own = prune_key_dir(&root, &"a".repeat(32), true);
+        let eligible = prune_key_dir(&root, &"b".repeat(32), true);
+        std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o777)).unwrap();
+        assert_eq!(
+            prune_idle_control_dirs(&root, &own, std::time::Duration::ZERO, 64),
+            0
+        );
+        assert!(eligible.join("daemon.sock.lock").exists());
+        std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o700)).unwrap();
+
+        // (b) a symlinked root prunes nothing, and its target is untouched.
+        let link = root.parent().unwrap().join("thegn-link");
+        std::os::unix::fs::symlink(&root, &link).unwrap();
+        assert_eq!(
+            prune_idle_control_dirs(&link, &own, std::time::Duration::ZERO, 64),
+            0
+        );
+        assert!(eligible.join("daemon.sock.lock").exists());
+        // Control: the verified root does prune.
+        assert_eq!(
+            prune_idle_control_dirs(&root, &own, std::time::Duration::ZERO, 64),
+            1
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn control_dir_prune_wiring_fires_in_a_real_thegn_key_layout() {
+        let (_td, root) = prune_fixture();
+        let own = root.join("a".repeat(32));
+        std::fs::create_dir(&own).unwrap();
+        prepare_control_directory(&own, false).unwrap();
+        let sibling = prune_key_dir(&root, &"b".repeat(32), true);
+        // Backdate the sibling past the 24 h floor (futimens on a directory
+        // fd works for the owner with std alone).
+        let old = std::time::SystemTime::now() - std::time::Duration::from_secs(48 * 60 * 60);
+        std::fs::File::open(&sibling)
+            .unwrap()
+            .set_modified(old)
+            .unwrap();
+        let sock = own.join("d.sock");
+        assert_socket_path_fits(&sock);
+        let listener = match IpcListener::bind_exclusive(&IpcEndpoint::for_socket_path(&sock))
+            .await
+            .unwrap()
+        {
+            BindOutcome::Bound(listener) => listener,
+            BindOutcome::AlreadyRunning => panic!("fresh path must bind"),
+        };
+        assert!(!sibling.join("daemon.sock.lock").exists());
+        drop(listener);
     }
 
     #[cfg(unix)]
