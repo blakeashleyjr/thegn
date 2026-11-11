@@ -957,7 +957,8 @@ mod tests {
             };
             run(&mut command(&script), &config, &child_cancel)
         });
-        let ready_deadline = std::time::Instant::now() + Duration::from_secs(30);
+        let cancel_started = std::time::Instant::now();
+        let ready_deadline = cancel_started + Duration::from_secs(30);
         while !marker.exists() {
             assert!(
                 std::time::Instant::now() < ready_deadline,
@@ -968,9 +969,17 @@ mod tests {
         thread::sleep(Duration::from_millis(500));
         cancel.store(true, Ordering::Release);
         let result = runner.join().unwrap();
-        assert!(matches!(&result.end, End::Cancelled));
-        assert!(result.leader_exited_first);
-        assert_eq!(result.group, GroupState::Terminated);
+        let elapsed = cancel_started.elapsed();
+        assert!(
+            matches!(&result.end, End::Cancelled),
+            "end {:?} after {elapsed:?}",
+            result.end
+        );
+        assert!(
+            result.leader_exited_first,
+            "leader did not exit first (waited {elapsed:?})"
+        );
+        assert_eq!(result.group, GroupState::Terminated, "after {elapsed:?}");
     }
 
     #[test]

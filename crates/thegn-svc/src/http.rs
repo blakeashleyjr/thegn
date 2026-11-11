@@ -982,11 +982,16 @@ mod tests {
             )
             .await
             .unwrap();
-        assert!(matches!(
+        let started = Instant::now();
+        let idle_result =
             read_bounded_response(idle_response, Instant::now() + Duration::from_secs(30), 128)
-                .await,
-            Err(BodyReadError::Timeout)
-        ));
+                .await;
+        let elapsed = started.elapsed();
+        assert!(matches!(idle_result, Err(BodyReadError::Timeout)));
+        assert!(
+            elapsed < Duration::from_secs(10),
+            "idle read timeout took {elapsed:?}"
+        );
 
         // A body that keeps dripping is governed by the operation deadline,
         // independently of the injected idle/read timeout above.

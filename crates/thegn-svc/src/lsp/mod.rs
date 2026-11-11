@@ -3385,7 +3385,8 @@ mod tests {
     }
 
     fn wait_for_heartbeat(path: &Path) {
-        let deadline = std::time::Instant::now() + Duration::from_secs(30);
+        let started = std::time::Instant::now();
+        let deadline = started + Duration::from_secs(30);
         loop {
             if let Ok(bytes) = std::fs::read(path)
                 && !bytes.is_empty()
@@ -3397,14 +3398,16 @@ mod tests {
                     }
                     assert!(
                         std::time::Instant::now() < deadline,
-                        "heartbeat descendant did not continue writing"
+                        "heartbeat descendant did not continue writing after {:?}",
+                        started.elapsed()
                     );
                     thread::sleep(Duration::from_millis(10));
                 }
             }
             assert!(
                 std::time::Instant::now() < deadline,
-                "heartbeat descendant did not start"
+                "heartbeat descendant did not start after {:?}",
+                started.elapsed()
             );
             thread::sleep(Duration::from_millis(10));
         }
