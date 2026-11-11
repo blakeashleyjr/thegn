@@ -22,6 +22,120 @@ fn sandbox_resolution_does_not_authorize_implicit_host_fallback() {
 }
 
 #[test]
+fn sandbox_profile_pin_requires_enforcement_while_global_disabled_profile_does_not() {
+    use thegn_core::config::SandboxProfile;
+
+    assert!(!sealed_pin_requires_sandbox(
+        false,
+        None,
+        SandboxProfile::Sealed
+    ));
+    assert!(sealed_pin_requires_sandbox(
+        false,
+        Some(SandboxProfile::Sealed),
+        SandboxProfile::Sealed
+    ));
+    assert!(!sealed_pin_requires_sandbox(
+        false,
+        Some(SandboxProfile::Hardened),
+        SandboxProfile::Hardened
+    ));
+    // Only a pin that itself hides $HOME refuses: a `standard` pin under a
+    // repo-overlay or zone-sealed effective profile keeps the opt-out.
+    assert!(!sealed_pin_requires_sandbox(
+        false,
+        Some(SandboxProfile::Hardened),
+        SandboxProfile::Sealed
+    ));
+    assert!(sealed_pin_requires_sandbox(
+        false,
+        Some(SandboxProfile::SealedTunnel),
+        SandboxProfile::Sealed
+    ));
+}
+
+#[test]
+fn sealed_worktree_pin_refuses_a_disabled_sandbox_on_the_launch_path() {
+    use thegn_core::config::SandboxProfile;
+    use thegn_core::sandbox_pin::EnvSelection;
+    use thegn_core::store::WorkspaceStore;
+
+    with_temp_state("launch-sealed-pin-disabled", || {
+        let worktree = std::env::temp_dir()
+            .join(format!("tg-launch-sealed-pin-{}", std::process::id()))
+            .to_string_lossy()
+            .into_owned();
+        let db = thegn_core::db::Db::open().unwrap();
+        db.put_worktree("app/wt", "/x/app", &worktree, "tg/wt", None, None)
+            .unwrap();
+        db.set_worktree_sandbox_profile(&worktree, Some(SandboxProfile::Sealed))
+            .unwrap();
+        drop(db);
+
+        let mut cfg = Config::default();
+        cfg.sandbox.enabled = false;
+        let loc = GitLoc::from_db(&worktree, None);
+        let error = prepare_sandbox_env_with_selection(
+            &cfg,
+            Path::new("/repo"),
+            &worktree,
+            &loc,
+            None,
+            false,
+            &EnvSelection::none(),
+        )
+        .expect_err("a sealed worktree pin must refuse a disabled sandbox");
+        let halt = error
+            .downcast_ref::<SandboxHalt>()
+            .expect("the refusal is a typed launch halt");
+        assert!(halt.sealed_home);
+        assert!(
+            halt.reason.contains("requires a sandbox that hides $HOME"),
+            "{}",
+            halt.reason
+        );
+    });
+}
+
+#[test]
+fn unpinned_global_sealed_profile_opens_under_a_disabled_sandbox() {
+    use thegn_core::config::SandboxProfile;
+    use thegn_core::sandbox_pin::EnvSelection;
+    use thegn_core::store::WorkspaceStore;
+
+    with_temp_state("launch-global-sealed-disabled", || {
+        let worktree = std::env::temp_dir()
+            .join(format!("tg-launch-global-sealed-{}", std::process::id()))
+            .to_string_lossy()
+            .into_owned();
+        let db = thegn_core::db::Db::open().unwrap();
+        db.put_worktree("app/wt", "/x/app", &worktree, "tg/wt", None, None)
+            .unwrap();
+        // No pin: the worktree inherits the global sealed profile.
+        drop(db);
+
+        let mut cfg = Config::default();
+        cfg.sandbox.enabled = false;
+        cfg.sandbox.profile = SandboxProfile::Sealed;
+        let loc = GitLoc::from_db(&worktree, None);
+        let outcome = prepare_sandbox_env_with_selection(
+            &cfg,
+            Path::new("/repo"),
+            &worktree,
+            &loc,
+            None,
+            false,
+            &EnvSelection::none(),
+        )
+        .expect("an unpinned global sealed profile keeps its opt-out");
+        assert!(
+            outcome.spec.is_none(),
+            "the disabled sandbox opens on the host"
+        );
+    });
+}
+
+#[test]
 fn pinned_worktree_candidate_check_uses_off_floor_by_default() {
     let sandbox = thegn_core::config::SandboxConfig::default();
     let worktree = "candidate-floor-host-pin-regression";
@@ -1285,6 +1399,49 @@ fn env_halt_reason_names_the_providers_own_token_var() {
 }
 
 #[test]
+fn sandbox_profile_env_halt_marks_a_sealed_provider_refusal_as_sealed_home() {
+    with_temp_state("halt-sealed-provider", || {
+        let cfg: Config = toml::from_str(
+            "[env.sealed_provider]\nplacement = \"provider\"\n[env.sealed_provider.provider]\nprovider = \"machine0\"\n",
+        )
+        .unwrap();
+        let worktree = std::env::temp_dir()
+            .join(format!("tg-halt-sealed-provider-{}", std::process::id()))
+            .to_string_lossy()
+            .into_owned();
+        let db = thegn_core::db::Db::open().unwrap();
+        db.put_worktree(
+            "app/sealed-provider",
+            "/x/app",
+            &worktree,
+            "tg/sealed-provider",
+            None,
+            None,
+        )
+        .unwrap();
+        db.set_worktree_env(&worktree, "sealed_provider").unwrap();
+        db.set_worktree_sandbox_profile(
+            &worktree,
+            Some(thegn_core::config::SandboxProfile::Sealed),
+        )
+        .unwrap();
+
+        let halt = env_halt_reason(&cfg, &worktree).expect("a sealed provider is refused");
+        assert!(halt.sealed_home);
+        assert!(
+            halt.reason
+                .contains("profile `sealed` is a local-sandbox feature")
+        );
+        assert_eq!(
+            halt.reason
+                .matches("thegn sandbox profile set standard --worktree")
+                .count(),
+            1
+        );
+    });
+}
+
+#[test]
 fn env_halt_reason_resolves_a_file_secret_ref() {
     // A `file:` (or keyring:) SecretRef must resolve like the provider does — NOT
     // be treated as a literal env-var name. Regression: a machine0 env whose token
@@ -2451,6 +2608,38 @@ fn selected_env_with_no_table_halts_or_degrades_loudly() {
     });
 }
 
+#[test]
+fn sealed_hint_unresolved_env_uses_sealed_refusal_route() {
+    with_temp_state("sealed-unresolved-env", || {
+        let mut cfg = Config::default();
+        cfg.sandbox.profile = thegn_core::config::SandboxProfile::Sealed;
+        let loc = GitLoc::from_db("/wt/x", None);
+        let err = prepare_sandbox_env(
+            &cfg,
+            Path::new("/repo"),
+            "/wt/x",
+            &loc,
+            None,
+            false,
+            Some("ghost"),
+        )
+        .expect_err("a phantom env selection under sealed halts without host escape");
+        let halt = err
+            .downcast_ref::<crate::agent::SandboxHalt>()
+            .expect("the error is a SandboxHalt");
+        assert!(
+            halt.sealed_home,
+            "sealed profile refusals use the sealed route"
+        );
+        let message = halt.to_string();
+        assert!(
+            message.contains("thegn sandbox profile set standard"),
+            "{message}"
+        );
+        assert!(!message.contains("run on host"), "{message}");
+    });
+}
+
 // H1: E2E launch_spec test — backend="none" → host fallback path.
 #[test]
 fn launch_spec_none_backend_produces_valid_spec() {
@@ -3120,6 +3309,29 @@ fn launch_state_gate_lets_a_shell_launch_with_a_warning() {
 }
 
 #[test]
+fn launch_state_gate_preserves_the_typed_worktree_isolation_refusal() {
+    let cfg = cfg_with(&[("codex", "codex")], &[]);
+    let unreadable = anyhow::anyhow!("database locked");
+    let typed = worktree_isolation_read_failure("/tmp/work tree", &unreadable);
+    let result = launch_state_gate(
+        &cfg,
+        "/tmp/work tree",
+        "codex",
+        "selection unreadable",
+        &typed,
+    );
+    let Err(error) = result else {
+        panic!("unreadable isolation selection must refuse a configured agent");
+    };
+    let halt = error.downcast_ref::<SandboxHalt>().unwrap();
+    assert!(
+        halt.reason
+            .contains("sandbox profile clear --worktree '/tmp/work tree'")
+    );
+    assert!(!halt.reason.contains("the shell launches without it"));
+}
+
+#[test]
 fn bundle_read_gate_refuses_a_configured_agent() {
     let cfg = cfg_with(&[("codex", "codex")], &[]);
     let unreadable = vec!["read the global env-bundle binding: disk I/O error".to_string()];
@@ -3354,6 +3566,53 @@ fn provision_worktree_keeps_a_local_worktree_local_without_provider_envs() {
         provision_worktree(&Config::default(), &wt, |_| {}),
         Ok(false)
     ));
+}
+
+#[test]
+#[expect(
+    clippy::disallowed_methods,
+    reason = "test initializes an isolated temporary git repository"
+)]
+fn provision_worktree_refuses_a_sealed_provider_pin_before_provider_side_effects() {
+    use thegn_core::config::{Config, EnvConfig, PlacementMode, SandboxProfile};
+    use thegn_core::store::WorkspaceStore;
+
+    let _state = crate::testenv::IsolatedState::new();
+    let dir = tempfile::tempdir().unwrap();
+    let init = thegn_core::util::git_cmd(dir.path())
+        .args(["init", "-q"])
+        .output()
+        .unwrap();
+    assert!(init.status.success(), "temporary git init: {init:?}");
+    let wt = dir.path().to_string_lossy().into_owned();
+    let db = Db::open().unwrap();
+    db.put_worktree("app/wt", &wt, &wt, "main", None, None)
+        .unwrap();
+    db.set_worktree_env(&wt, "cloud").unwrap();
+    db.set_worktree_sandbox_profile(&wt, Some(SandboxProfile::Sealed))
+        .unwrap();
+    drop(db);
+    let cfg = Config {
+        env: [(
+            "cloud".into(),
+            EnvConfig {
+                placement: PlacementMode::Provider,
+                ..Default::default()
+            },
+        )]
+        .into(),
+        ..Config::default()
+    };
+    let mut progress_calls = 0;
+    let result = provision_worktree(&cfg, &wt, |_| progress_calls += 1);
+    assert!(matches!(
+        result,
+        Err(ref error) if error.downcast_ref::<thegn_core::sandbox_floor::ProviderRefusal>().is_some()
+    ));
+    assert_eq!(
+        progress_calls, 0,
+        "provider work must stop before side effects"
+    );
 }
 
 #[test]

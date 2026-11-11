@@ -1526,6 +1526,15 @@ fn db_worktree_list_with_snapshot(
                         None => true,
                     }
             });
+        let sandbox_profile = w.sandbox_profile.as_deref().and_then(|value| {
+            match thegn_core::sandbox_pin::parse_pin(value) {
+                Ok(profile) => Some(profile.as_str().to_string()),
+                Err(error) => {
+                    tracing::debug!(target: "thegn::hydrate", worktree = %w.worktree, %error, "worktree profile pin could not be parsed for the sidebar");
+                    None
+                }
+            }
+        });
         out.push(crate::sidebar::DbWorktree {
             slug,
             branch,
@@ -1538,6 +1547,7 @@ fn db_worktree_list_with_snapshot(
             // that is what let a host pane display as a container.
             sandbox_backend: w.observed_backend.clone(),
             env_name: w.env_name.clone(),
+            sandbox_profile,
             env_degraded,
         });
     }
@@ -2867,16 +2877,19 @@ pub(crate) fn build_model(
     // resolved it as Local — no `[sprites]` chip and a bogus `(bwrap)` chip —
     // while the splash correctly showed the provider placement. An unreadable
     // selection shows the `env?` chip, see `unreadable_env_chips`.
-    let selection = db.effective_env_checked(&active_path, &active_repo);
+    let selection = db.effective_env_selection(&active_path, &active_repo);
     let selection_error: Option<String> =
         selection.as_ref().err().map(|error| format!("{error:#}"));
-    let selected: Option<String> = selection.unwrap_or_default();
-    let active_env = app_cfg.resolve_env(
+    let selected = selection.unwrap_or_default();
+    let mut active_env = app_cfg.resolve_env(
         std::path::Path::new(&active_repo),
         &loc,
         std::path::Path::new(&active_path),
-        selected.as_deref(),
+        &selected,
     );
+    if selection_error.is_none() {
+        crate::handlers::repo_trust::apply_zone(db, &app_cfg, &active_path, &mut active_env);
+    }
     // A provider env whose CONTENT resolved local has degraded to the host
     // (provider unavailable + `failover`, or a stale remote location healed back
     // to local — see the `should_heal_degraded_location` heal on open). A healthy
@@ -2998,6 +3011,11 @@ pub(crate) fn build_model(
             &hints.profile,
         ),
         active_sandbox_backend,
+        active_sandbox_profile_pin: selected.profile.map(|profile| profile.as_str().to_string()),
+        active_sandbox_profile: session
+            .active_group()
+            .filter(|group| group.kind != crate::session::GroupKind::Terminal)
+            .map(|_| active_env.sandbox.profile),
         active_placement_kind,
         active_placement_label,
         // containers is populated by the dedicated container refresh ticker

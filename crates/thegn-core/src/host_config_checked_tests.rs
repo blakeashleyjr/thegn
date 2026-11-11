@@ -50,8 +50,14 @@ fn resolve(cfg: &Config) -> crate::env::Environment {
     let root = directory.path();
     assert_eq!(std::fs::read_dir(root).unwrap().count(), 0);
     let loc = GitLoc::Local(root.to_path_buf());
-    let (environment, state) =
-        resolve_environment(cfg, root, &loc, root, Some(NAME), &Approvals::deny_all());
+    let (environment, state) = resolve_environment(
+        cfg,
+        root,
+        &loc,
+        root,
+        &crate::sandbox_pin::EnvSelection::named(NAME),
+        &Approvals::deny_all(),
+    );
     assert!(state.events.is_empty());
     assert!(state.pending.is_empty());
     assert_eq!(std::fs::read_dir(root).unwrap().count(), 0);

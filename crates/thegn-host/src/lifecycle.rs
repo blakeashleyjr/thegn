@@ -201,7 +201,15 @@ fn explicit_park(app_cfg: &thegn_core::config::Config, worktree: &str, loc: &Git
     let Some(selected) = selected else {
         return;
     };
-    let env = app_cfg.resolve_env(&repo_root, loc, Path::new(worktree), selected.as_deref());
+    let env = app_cfg.resolve_env(
+        &repo_root,
+        loc,
+        Path::new(worktree),
+        &thegn_core::sandbox_pin::EnvSelection {
+            name: selected.clone(),
+            profile: None,
+        },
+    );
     let Some(envc) = app_cfg.env.get(&env.name) else {
         return;
     };
@@ -323,7 +331,15 @@ fn pool_env(
         format!("warm pool: cannot read the environment selection for {wt}; no pool changes made")
     })?;
     Ok(cfg
-        .resolve_env(repo_root, loc, Path::new(wt), selected.as_deref())
+        .resolve_env(
+            repo_root,
+            loc,
+            Path::new(wt),
+            &thegn_core::sandbox_pin::EnvSelection {
+                name: selected.clone(),
+                profile: None,
+            },
+        )
         .name)
 }
 
@@ -821,7 +837,12 @@ fn recycle_spare(cfg: &Config, env_name: &str, spare: &PoolSpare, current_lock: 
             return false;
         }
     };
-    let resolved = cfg.resolve_env(repo_root, &loc, &ctx, Some(env_name));
+    let resolved = cfg.resolve_env(
+        repo_root,
+        &loc,
+        &ctx,
+        &thegn_core::sandbox_pin::EnvSelection::named(env_name),
+    );
     let restored = crate::agent::block_on_provider(|| async {
         tokio::time::timeout(RESTORE_TIMEOUT, provider.restore(name, cp))
             .await
@@ -1541,7 +1562,12 @@ mod tests {
         let cfg = Config::default();
         let loc = GitLoc::Local(dir.path().into());
         let expected = cfg
-            .resolve_env(dir.path(), &loc, Path::new("/wt"), None)
+            .resolve_env(
+                dir.path(),
+                &loc,
+                Path::new("/wt"),
+                &thegn_core::sandbox_pin::EnvSelection::none(),
+            )
             .name;
         assert_eq!(
             pool_env(&cfg, dir.path(), &loc, "/wt", Ok(None)).unwrap(),
