@@ -49,6 +49,10 @@ const PROVIDER_JSON_MAX_NODES: usize = 262_144;
 const PROVIDER_JSON_MAX_CONTAINER_ITEMS: usize = 10_000;
 const PROVIDER_JSON_MAX_STRING_BYTES: usize = 1024 * 1024;
 pub(crate) const MAX_PROVIDER_FIELD_BYTES: usize = 4096;
+/// Most workflow inputs one trigger may carry (GitHub's own workflow_dispatch
+/// ceiling is lower; this bounds the argv a caller can build). A chosen policy
+/// ceiling, not a measured value.
+pub(crate) const MAX_TRIGGER_INPUTS: usize = 64;
 const FALLBACK_READER_GRACE: Duration = Duration::from_millis(500);
 
 /// A CI/CD backend for one provider. Read methods first; mutations are
@@ -1101,9 +1105,21 @@ pub fn validate_workflow_selector(value: &str) -> Result<&str, CiError> {
     }
 }
 
+/// Refuse a trigger carrying more than [`MAX_TRIGGER_INPUTS`] inputs. The
+/// message names the count and the limit only, never a key or value.
+fn check_trigger_input_count(count: usize) -> Result<(), CiError> {
+    if count > MAX_TRIGGER_INPUTS {
+        return Err(CiError::Other(format!(
+            "too many workflow inputs: {count} exceeds the limit of {MAX_TRIGGER_INPUTS}"
+        )));
+    }
+    Ok(())
+}
+
 /// Validate the inputs passed to a manually triggered workflow.
 /// Error messages identify keys only and never include input values.
 pub fn validate_trigger_inputs(inputs: &[(String, String)]) -> Result<(), CiError> {
+    check_trigger_input_count(inputs.len())?;
     let mut seen = std::collections::HashSet::with_capacity(inputs.len());
     for (key, value) in inputs {
         let mut chars = key.chars();
@@ -1138,6 +1154,7 @@ pub fn validate_trigger_inputs(inputs: &[(String, String)]) -> Result<(), CiErro
 /// Parse `KEY=VALUE` workflow inputs, rejecting malformed entries instead of
 /// silently dropping them. Values may contain further `=` characters.
 pub fn parse_trigger_inputs(raw: &[String]) -> Result<Vec<(String, String)>, CiError> {
+    check_trigger_input_count(raw.len())?;
     let mut inputs = Vec::with_capacity(raw.len());
     for entry in raw {
         let Some((key, value)) = entry.split_once('=') else {
@@ -4939,6 +4956,43 @@ esac
         .unwrap_err()
         .to_string();
         assert!(github_error.contains("invalid workflow input"));
+    }
+
+    #[test]
+    fn trigger_inputs_count_cap_refuses_one_over_the_limit() {
+        let raw: Vec<String> = (0..=MAX_TRIGGER_INPUTS)
+            .map(|n| format!("k{n}=v"))
+            .collect();
+        let error = parse_trigger_inputs(&raw).unwrap_err().to_string();
+        assert!(error.contains("too many workflow inputs"), "{error}");
+        assert!(error.contains(&MAX_TRIGGER_INPUTS.to_string()), "{error}");
+        assert!(!error.contains("k0=v"), "{error}");
+
+        let pairs: Vec<(String, String)> = (0..=MAX_TRIGGER_INPUTS)
+            .map(|n| (format!("k{n}"), "v".to_string()))
+            .collect();
+        assert!(validate_trigger_inputs(&pairs).is_err());
+    }
+
+    #[test]
+    fn trigger_inputs_count_cap_accepts_exactly_the_limit() {
+        let raw: Vec<String> = (0..MAX_TRIGGER_INPUTS).map(|n| format!("k{n}=v")).collect();
+        let parsed = parse_trigger_inputs(&raw).unwrap();
+        assert_eq!(parsed.len(), MAX_TRIGGER_INPUTS);
+    }
+
+    #[test]
+    fn trigger_inputs_count_cap_applies_before_any_provider_lookup() {
+        let temp = tempfile::tempdir().unwrap();
+        let loc = GitLoc::Local(temp.path().to_path_buf());
+        let too_many: Vec<(String, String)> = (0..=MAX_TRIGGER_INPUTS)
+            .map(|n| (format!("k{n}"), "v".to_string()))
+            .collect();
+        let error = GitlabCi::default()
+            .trigger(&loc, "ci", &too_many)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("too many workflow inputs"), "{error}");
     }
 
     #[test]
