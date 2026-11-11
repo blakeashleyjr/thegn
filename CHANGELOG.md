@@ -9,6 +9,27 @@ All notable changes to **thegn** are documented here. The format follows
 
 ## [0.1.0-alpha.63] — 2026-11-11
 
+### Added
+
+- `thegn wt prune --merged [--target <branch>] [--apply] [--json]` removes lane
+  worktrees and branches already merged into the target; it is a dry run
+  unless `--apply` is given.
+- `thegn dispatch commit <row> --msg-file F [--trailer "Key: value"]` commits a
+  finished worker's worktree in one step, retrying once after a formatter hook
+  rewrites files.
+- `thegn release prepare --bump <alpha|beta|rc|patch>` bumps the version in
+  `Cargo.toml`, `Cargo.lock`, `README.md` and `CHANGELOG.md` without
+  committing, tagging or pushing.
+- `thegn wt new <name> --exact-branch` uses the name verbatim as the branch,
+  skipping the configured prefix and numbering.
+
+### Fixed
+
+- `thegn session open --stage --issue` now writes
+  `.thegn/maintenance/issue.json` into the worktree.
+- Live and parked workspaces in the sidebar now come from one registry row
+  source, so their rows no longer disagree.
+
 ## [0.1.0-alpha.62] — 2026-11-11
 
 ### Added
