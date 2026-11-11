@@ -1962,11 +1962,13 @@ v1_ok=1
 [[ $v1_rc -eq 0 ]] && grep -q 'ok=yes' <<<"$v1_out" || v1_ok=0
 check "dispatch verify on a row with no artifact reports ok and exits 0" \
   "[[ $v1_ok -eq 1 ]]"
-artifact_row_json="$("$SZ" dispatch put linear:SMOKE-3 "$R" claude --stage code --artifact .thegn/pipeline/SMOKE-7/missing/2.md --json)"
+artifact_row_json="$("$SZ" dispatch put linear:SMOKE-3 "$R" claude --artifact .thegn/pipeline/SMOKE-7/missing/2.md --json)"
 artifact_row="$(printf '%s' "$artifact_row_json" | sed -n 's/.*"id":\([0-9]*\).*/\1/p')"
 "$SZ" dispatch set-status "$artifact_row" running >/dev/null
 check "dispatch put records an artifact pointer" \
   "[[ -n '$artifact_row' ]] && printf '%s' '$artifact_row_json' | grep -q '\"artifact_path\":\".thegn/pipeline/SMOKE-7/missing/2.md\"'"
+check "dispatch put --stage refuses a caller-chosen --artifact" \
+  "! '$SZ' dispatch put linear:SMOKE-3B '$R' claude --stage code --artifact README.md >/dev/null 2>&1"
 # A missing artifact is a retryable not-yet (exit 2, the `session wait`
 # convention) naming the artifact; `set-status done` is refused for the same
 # reason unless `--force` records it as forced — never invisibly.
