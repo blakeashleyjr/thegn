@@ -367,6 +367,12 @@ self: {
     disk.generation_min_age_days = cfg.diskGenerationMinAgeDays;
     disk.reclaim_on_low_disk = cfg.diskReclaimOnLowDisk;
     disk.sccache = cfg.diskSccache;
+    daemon.enabled = cfg.daemonEnabled;
+    daemon.idle_exit_secs = cfg.daemonIdleExitSecs;
+    daemon.lease_grace_secs = cfg.daemonLeaseGraceSecs;
+    daemon.stream_gap_window_secs = cfg.daemonStreamGapWindowSecs;
+    network.offline_after_failures = cfg.networkOfflineAfterFailures;
+    network.recovery_probe_secs = cfg.networkRecoveryProbeSecs;
     log = {
       inherit (cfg.log) level file dir format;
       rotation_size_mb = cfg.log.rotationSizeMb;
@@ -1316,6 +1322,42 @@ in {
       type = lib.types.nullOr (lib.types.bool);
       default = null;
       description = "Wire sccache into the dev shell. Unset (null) = the binary's default.";
+    };
+
+    daemonEnabled = lib.mkOption {
+      type = lib.types.nullOr (lib.types.bool);
+      default = null;
+      description = "Route new panes through the pane daemon so they survive quitting the UI; false restores in-process panes that die with the compositor. Unset (null) = the binary's default.";
+    };
+
+    daemonIdleExitSecs = lib.mkOption {
+      type = lib.types.nullOr (lib.types.ints.between 0 315360000);
+      default = null;
+      description = "Seconds with no live sessions before the pane daemon exits; 0 never exits. Unset (null) = the binary's default.";
+    };
+
+    daemonLeaseGraceSecs = lib.mkOption {
+      type = lib.types.nullOr (lib.types.ints.between 0 315360000);
+      default = null;
+      description = "Seconds a detached session's PTY stays warm; 0 never reaps. Unset (null) = the binary's default.";
+    };
+
+    daemonStreamGapWindowSecs = lib.mkOption {
+      type = lib.types.nullOr (lib.types.ints.between 0 315360000);
+      default = null;
+      description = "Seconds of repeated attach-stream sequence gaps before a pane is ended; 0 never ends it. Unset (null) = the binary's default.";
+    };
+
+    networkOfflineAfterFailures = lib.mkOption {
+      type = lib.types.nullOr (lib.types.ints.u32);
+      default = null;
+      description = "Consecutive transient network failures before the app concludes it is offline (auto mode). Unset (null) = the binary's default.";
+    };
+
+    networkRecoveryProbeSecs = lib.mkOption {
+      type = lib.types.nullOr (lib.types.ints.between 0 2678400);
+      default = null;
+      description = "While offline, re-probe for connectivity at most this often (seconds). Unset (null) = the binary's default.";
     };
 
     agents = lib.mkOption {
