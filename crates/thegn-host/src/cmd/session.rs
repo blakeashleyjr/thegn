@@ -2989,7 +2989,9 @@ mod issue_snapshot_tests {
 
     #[test]
     fn lookup_failure_with_issue_fields_refuses() {
-        let err = resolve_lookup("linear:THE-1", true, true, Err("boom".into())).unwrap_err();
+        let Err(err) = resolve_lookup("linear:THE-1", true, true, Err("boom".into())) else {
+            panic!("expected a refusal")
+        };
         assert!(err.to_string().contains("cannot fetch linear:THE-1"));
     }
 
