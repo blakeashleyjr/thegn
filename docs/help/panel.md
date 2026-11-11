@@ -104,6 +104,12 @@ off banner when its feature is unavailable.
 | `media`         | now-playing and transport — see [[media]]                                 |
 | `usage`         | AI-account rate-limit usage — see [[ai-usage]]                            |
 
+The `logs` section shows its stream scoped to "this worktree + global" by
+default, and to "all worktrees" when widened. Global (untagged) entries always
+show; entries with a legacy or unbound worktree tag appear only when widened,
+and the detail view labels them (legacy tag, not tied to any worktree; unbound,
+path too long to identify).
+
 On the stable channel, `hosts` and `environments` are hidden unless named in
 `[panel] sections`; when named, each shows a one-line off banner and has no
 live keys. They are available on the dev channel; see [[release-channels]].

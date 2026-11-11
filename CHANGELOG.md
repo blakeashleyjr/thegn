@@ -9,6 +9,40 @@ All notable changes to **thegn** are documented here. The format follows
 
 ## [0.1.0-alpha.59] — 2026-11-11
 
+### Added
+
+- The Home Manager module exposes recording (`recordingDir`,
+  `recordingMaxBytes`), media (`mediaEnabled`, `mediaShowArt`,
+  `mediaOverlayOnBadgeClick`, `mediaSeekStepSecs`, `mediaSeekStepVideoSecs`,
+  `mediaPollIntervalSecs`, `mediaPlayersPriority`) and monitor process table
+  (`monitorProcRows`, `monitorProcesses`, `monitorProcessIo`) options.
+- `thegn doctor --json` carries a `stage_worker` key with the stage worker
+  readiness class that the text report already showed.
+- The control API reference now has a generated routes table with request and
+  response types, a transports and access-modes section, and a page of worked
+  request and error examples that are checked against the route registry.
+
+### Changed
+
+- A pipeline stage row now records its kind (plain, stage or held). Completion
+  refuses a stage row that has lost its stage or artifact path. The local
+  database migrates forward to schema version 110.
+- `thegn dispatch` refuses `--artifact` together with `--stage` before doing
+  any work, because a staged row's artifact path is always assigned for you.
+  Plain rows still accept `--artifact`.
+
+### Fixed
+
+- The calendar agenda scrolls to follow the selected event. Before, moving
+  past the visible rows left the selection on an event you could not see, and
+  Enter could open the link of that hidden event.
+- The Logs section counts only lines for the current worktree, so errors that
+  belong to another worktree no longer show in its header.
+- Closing a worktree forgets its drawer panes and remembered drawer state, so
+  a worktree later created at the same path starts clean.
+- The daemon cleans up dead private control directories left under `/tmp` by
+  other state locations, without touching live ones.
+
 ## [0.1.0-alpha.58] — 2026-11-10
 
 ### Added

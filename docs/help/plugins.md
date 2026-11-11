@@ -79,8 +79,10 @@ admitted with.
   contribution declares (`interval` milliseconds). It reads output until the
   plugin exits, then gives the pipes about half a second to drain; a background
   child cannot keep the run open by holding them. If it has not exited by its
-  timeout, the run times out. Output still unread at the reader deadline is
-  discarded; messages already read are kept. Each run accepts at most 20,000
+  timeout, the run times out. On timeout or cancel, thegn also stops
+  descendants that detached into their own session; on Linux this uses the
+  process tree under `/proc`, and other platforms stop the process group only.
+  Output still unread at the reader deadline is discarded; messages already read are kept. Each run accepts at most 20,000
   lines, 1 MiB per line, 8 MiB of retained stdout, and keeps up to 8 KiB of
   stderr.
   At most four one-shot runs, scheduled or started from the palette,
