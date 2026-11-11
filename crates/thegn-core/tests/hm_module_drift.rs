@@ -98,7 +98,14 @@ const OMITTED: &[(&str, &str)] = &[
         "limits.test_nice",
         "signed i32: the numeric gate models only unsigned ranges",
     ),
-    ("disk", "disk and cache policy is not exposed"),
+    (
+        "disk.sccache_dir",
+        "path-valued shared-cache directory is not exposed",
+    ),
+    (
+        "disk.shared_target_dir",
+        "path-valued shared target directory is deliberately opt-in and is not exposed",
+    ),
     (
         "notifications.desktop_min_urgency",
         "string-typed urgency has no destination enum to pin and is not exposed",
@@ -726,6 +733,7 @@ fn every_schema_key_is_rendered_or_dispositioned() {
         "log",
         "limits",
         "diagnostics",
+        "disk",
         "sandbox.remote",
     ] {
         for (schema_section, key) in &required.keys {
@@ -1176,6 +1184,38 @@ fn hm_limits_and_diagnostics_keys_are_rendered_and_rest_dispositioned() {
 }
 
 #[test]
+fn hm_disk_scalar_keys_are_rendered_and_rest_dispositioned() {
+    let rendered = rendered_paths(&module_src());
+    for path in [
+        "disk.show_sizes",
+        "disk.warn_threshold_gb",
+        "disk.scan_interval_secs",
+        "disk.max_scan_per_round",
+        "disk.auto_clean_on_merge",
+        "disk.clean_on_pr_closed",
+        "disk.idle_clean_days",
+        "disk.generation_min_age_days",
+        "disk.reclaim_on_low_disk",
+        "disk.sccache",
+    ] {
+        assert!(rendered.contains(path), "Home Manager must render {path}");
+    }
+
+    let omissions: BTreeSet<&str> = OMITTED.iter().map(|(path, _)| *path).collect();
+    let schema = schema_field("disk");
+    let properties = schema["properties"]
+        .as_object()
+        .expect("disk schema properties");
+    for key in properties.keys() {
+        let path = format!("disk.{key}");
+        assert!(
+            rendered.contains(&path) || omissions.contains(path.as_str()),
+            "{path} must be rendered or dispositioned by an exact ledger row"
+        );
+    }
+}
+
+#[test]
 fn hm_loc_and_replay_families_are_fully_rendered() {
     let rendered = rendered_paths(&module_src());
     for table in ["loc", "replay"] {
@@ -1348,6 +1388,11 @@ fn every_numeric_option_matches_its_destination_range() {
         ("limitsDiscoverTimeoutSecs", "limits.discover_timeout_secs"),
         ("diagnosticsCrashRetention", "diagnostics.crash_retention"),
         ("diagnosticsRingSize", "diagnostics.ring_size"),
+        ("diskWarnThresholdGb", "disk.warn_threshold_gb"),
+        ("diskScanIntervalSecs", "disk.scan_interval_secs"),
+        ("diskMaxScanPerRound", "disk.max_scan_per_round"),
+        ("diskIdleCleanDays", "disk.idle_clean_days"),
+        ("diskGenerationMinAgeDays", "disk.generation_min_age_days"),
     ];
     let options = numeric_options(&module_src());
     let actual_names: BTreeSet<&str> = options.iter().map(|(name, _)| name.as_str()).collect();
