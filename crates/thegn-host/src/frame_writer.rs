@@ -209,10 +209,10 @@ impl FrameWriter {
         let wake: Arc<dyn Fn(&'static str) + Send + Sync> = Arc::new(wake);
         let worker_wake = Arc::clone(&wake);
         let handle = Some(
-            std::thread::Builder::new()
-                .name("thegn-writer".into())
-                .spawn(move || writer_main(&worker_inner, worker_wake, sink))
-                .expect("spawn writer thread"),
+            thegn_core::thread_name::try_spawn_named("thegn-writer", move || {
+                writer_main(&worker_inner, worker_wake, sink)
+            })
+            .expect("spawn writer thread"),
         );
         FrameWriter {
             inner,
