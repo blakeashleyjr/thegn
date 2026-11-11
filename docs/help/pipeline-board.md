@@ -178,6 +178,10 @@ that a `spawning` reservation needs a published session before `set-status done`
 succeeds. A handoff must be valid text no larger than 1 MiB or 8,192 lines;
 binary data, invalid UTF-8, terminal controls and bidi overrides are refused with
 a reason.
+A pipeline row's handoff that contains a well-known credential format (a private
+key block, a URL with a password, a JWT, an AWS access key id or a provider
+token) is also refused; the reason names the kind and never echoes the value.
+The check does not prove a handoff is free of secrets.
 Symlinked handoff files are not followed.
 
 Wait for the session to publish or open one; `--force --why '<reason>'` records
