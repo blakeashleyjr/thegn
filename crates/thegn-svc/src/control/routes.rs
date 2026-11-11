@@ -442,7 +442,7 @@ mod tests {
             .filter(|line| line.trim_start().starts_with('|'))
         {
             let cells: Vec<_> = line.split('|').map(str::trim).collect();
-            if cells.len() < 8 || !cells[1].starts_with('`') {
+            if cells.len() < 10 || !cells[1].starts_with('`') {
                 continue;
             }
             let route = cells[1].trim_matches('`');
@@ -458,7 +458,7 @@ mod tests {
                 "duplicate route row: {route} ({cap})"
             );
 
-            if cells[6..].join("|").contains("**reserved**") {
+            if cells[8..].join("|").contains("**reserved**") {
                 assert!(
                     ROUTES.iter().all(|registered| registered.path != path),
                     "reserved route {path} is present in ROUTES"
@@ -488,7 +488,7 @@ mod tests {
                 );
                 if let Some(replacement) = capability.deprecated {
                     assert!(
-                        cells[6..].join("|").contains(&format!("use {replacement}")),
+                        cells[8..].join("|").contains(&format!("use {replacement}")),
                         "deprecated capability {cap} must name its replacement in Notes"
                     );
                 }
