@@ -198,6 +198,16 @@ about two different states; run it again once the worktree is quiet.
 Wait for the session to publish or open one; `--force --why '<reason>'` records
 an explicit override.
 
+`thegn dispatch commit <row> --msg-file F [--trailer "Key: value"]... [--json]`
+commits a finished worker's changes in one step: it stages everything in the
+row's worktree and commits with the message in `F` plus the trailers (a trailer
+already in the message is not repeated). If a formatter pre-commit hook rewrites
+files and fails the first attempt, the verb re-stages and retries exactly once;
+a second failure shows the hook output and exits non-zero. It never skips hooks.
+It refuses a row with no worktree, a missing worktree, or a worker that is still
+`spawning` or `running`. With nothing to commit it prints `nothing to commit` and
+exits 0. `--json` prints `{committed, sha, retried}`.
+
 A parent row must belong to the same issue as its child. Issue ids are compared
 case-insensitively and a missing provider prefix matches any provider, so
 `ABC-74`, `linear:abc-74` and `LINEAR:ABC-74` are one issue; the same key under
