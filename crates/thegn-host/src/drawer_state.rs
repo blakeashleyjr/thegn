@@ -132,6 +132,32 @@ fn bump_scope_generation(scope_key: &str) {
     }
 }
 
+/// Worktree dirs whose drawer state must be evicted by the loop (THE-1947).
+/// Workspace removal closes groups from code with no `DrawerRuntime` in reach,
+/// so it queues here and the loop drains once per iteration.
+static PENDING_EVICTIONS: Mutex<Vec<PathBuf>> = Mutex::new(Vec::new());
+static EVICTION_QUEUED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+const PENDING_EVICTIONS_CAP: usize = 4096;
+
+/// Request eviction of a closed worktree's drawer state. The scope generation
+/// is bumped immediately, so a cold launch still in flight is fenced even
+/// before the loop drains the queue. Deduplicated and capped; never does I/O
+/// under the lock.
+pub(crate) fn request_worktree_eviction(dir: &Path) {
+    bump_scope_generation(&drawer_scope_key(DrawerScope::Worktree, dir));
+    if let Ok(mut queue) = PENDING_EVICTIONS.lock() {
+        if queue.iter().any(|queued| queued == dir) {
+            return;
+        }
+        if queue.len() >= PENDING_EVICTIONS_CAP {
+            tracing::debug!(target: "thegn::drawer", "eviction queue full");
+            return;
+        }
+        queue.push(dir.to_path_buf());
+        EVICTION_QUEUED.store(true, std::sync::atomic::Ordering::Release);
+    }
+}
+
 #[derive(Default)]
 struct PersistOrder {
     /// Latest requested sequence per scope key. The event loop only bumps this
@@ -1031,6 +1057,22 @@ impl DrawerRuntime {
         self.forget_worktree_panes(dir, panes);
         set_desired_occupant(DrawerScope::Worktree, dir, None);
     }
+
+    /// Drain the pending workspace-removal evictions (one atomic swap when
+    /// idle; no wake source). Returns whether any worktree was evicted.
+    pub(crate) fn drain_evictions(&mut self, panes: &mut Panes) -> bool {
+        if !EVICTION_QUEUED.swap(false, std::sync::atomic::Ordering::Acquire) {
+            return false;
+        }
+        let dirs = match PENDING_EVICTIONS.lock() {
+            Ok(mut queue) => std::mem::take(&mut *queue),
+            Err(_) => return false,
+        };
+        for dir in &dirs {
+            self.forget_worktree(dir, panes);
+        }
+        !dirs.is_empty()
+    }
 }
 
 #[cfg(test)]
@@ -1374,6 +1416,36 @@ mod tests {
     fn forget_fixture() -> (Panes, DrawerRuntime) {
         let (tx, _rx) = tokio_mpsc::channel(TEST_PANE_EVENT_CHANNEL_CAPACITY);
         (Panes::new(tx), DrawerRuntime::default())
+    }
+
+    #[test]
+    fn workspace_removal_queue_evicts_only_the_requested_worktrees_on_drain() {
+        let a = Path::new("/tmp/drawer-wsrm-a");
+        let b = Path::new("/tmp/drawer-wsrm-b");
+        let (mut panes, mut runtime) = forget_fixture();
+        let a_files = DrawerPoolKey::worktree(a, FILES_OCCUPANT_ID);
+        let b_files = DrawerPoolKey::worktree(b, FILES_OCCUPANT_ID);
+        let global = DrawerPoolKey::global("tool:db");
+        runtime.pool.stash_key(a_files.clone(), 11, 8, &mut panes);
+        runtime.pool.stash_key(b_files.clone(), 13, 8, &mut panes);
+        runtime.pool.stash_key(global.clone(), 14, 8, &mut panes);
+        let a_scope = drawer_scope_key(DrawerScope::Worktree, a);
+        runtime.last.insert(a_scope.clone(), "tool:db".into());
+
+        let before = scope_generation(&a_scope);
+        request_worktree_eviction(a);
+        assert!(
+            scope_generation(&a_scope) > before,
+            "generation is bumped before any drain"
+        );
+        assert!(runtime.pool.contains_key(&a_files), "not evicted yet");
+
+        assert!(runtime.drain_evictions(&mut panes));
+        assert!(!runtime.pool.contains_key(&a_files));
+        assert!(runtime.pool.contains_key(&b_files));
+        assert!(runtime.pool.contains_key(&global));
+        assert!(!runtime.last.contains_key(&a_scope));
+        assert!(!runtime.drain_evictions(&mut panes), "queue is empty again");
     }
 
     #[test]

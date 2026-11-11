@@ -318,8 +318,12 @@ pub(crate) fn remove_workspace_in_memory(
                 panes.table.remove(&id);
             }
         }
+        let dir = session.worktrees[gi].path.clone();
         session.switch_to(gi);
         session.close_active_group();
+        if !dir.is_empty() {
+            crate::drawer_state::request_worktree_eviction(Path::new(&dir));
+        }
     }
 }
 
@@ -595,6 +599,40 @@ mod tests {
             live_workspace_worktree_dirs(&session, "/tmp/repo-lib", "lib"),
             vec!["/tmp/lib-live"]
         );
+    }
+
+    #[test]
+    fn workspace_removal_in_memory_queues_drawer_eviction_for_every_closed_group() {
+        use crate::drawer_state::{DrawerPoolKey, DrawerRuntime};
+        let mut session = Session {
+            id: "wsrm".into(),
+            worktrees: vec![
+                WorktreeGroup::new("app/home", GroupKind::Home, "/tmp/wsrm-app"),
+                WorktreeGroup::new("lib/home", GroupKind::Home, "/tmp/wsrm-lib"),
+                WorktreeGroup::new("lib/feat", GroupKind::Branch, "/tmp/wsrm-lib-feat"),
+            ],
+            active: 0,
+        };
+        let (tx, _rx) = tokio::sync::mpsc::channel::<PaneEvent>(PANE_EVENT_CHANNEL_CAPACITY);
+        let mut panes = Panes::new(tx);
+        let mut runtime = DrawerRuntime::default();
+        let files = thegn_core::config_drawer::FILES_OCCUPANT_ID;
+        let keys: Vec<DrawerPoolKey> = ["/tmp/wsrm-app", "/tmp/wsrm-lib", "/tmp/wsrm-lib-feat"]
+            .iter()
+            .map(|dir| DrawerPoolKey::worktree(Path::new(dir), files))
+            .collect();
+        for (i, key) in keys.iter().enumerate() {
+            runtime
+                .pool
+                .stash_key(key.clone(), 100 + i as u32, 8, &mut panes);
+        }
+
+        remove_workspace_in_memory(&mut session, &mut panes, "lib");
+        assert!(runtime.drain_evictions(&mut panes));
+
+        assert!(runtime.pool.contains_key(&keys[0]), "app drawer survives");
+        assert!(!runtime.pool.contains_key(&keys[1]), "lib/home evicted");
+        assert!(!runtime.pool.contains_key(&keys[2]), "lib/feat evicted");
     }
 
     #[test]
