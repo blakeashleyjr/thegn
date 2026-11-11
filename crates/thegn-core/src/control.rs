@@ -28,7 +28,8 @@ use crate::store::LeaseRow;
 pub enum Scope {
     /// List sessions/worktrees/leases, snapshots, the event feed.
     Read,
-    /// Send terminal input, open worktrees, drive the preview browser.
+    /// Send terminal input, resize/split/record/kill sessions, open worktrees, and
+    /// mutate issues, dispatches and notifications. (There is no browser surface in v1.)
     Write,
     /// Stage/commit through the GitBackend seam.
     Git,
