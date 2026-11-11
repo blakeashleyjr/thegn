@@ -289,6 +289,7 @@ mod spawn_ratchet_tests;
 pub mod redact;
 pub mod reflog;
 pub mod registers;
+pub mod release_bump;
 pub mod remote;
 pub mod remote_tune;
 pub mod repo;

@@ -24,6 +24,7 @@ pub const GROUPS: &[(&str, &[&str])] = &[
             "land",
             "integrate",
             "merge",
+            "release",
             "search",
         ],
     ),
