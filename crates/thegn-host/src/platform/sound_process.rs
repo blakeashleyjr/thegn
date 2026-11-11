@@ -155,6 +155,7 @@ mod tests {
         let program = helper_path.to_str().unwrap().to_owned();
         let cancellation = std::sync::Arc::new(AtomicBool::new(false));
         let signal = std::sync::Arc::clone(&cancellation);
+        let started = std::time::Instant::now();
         let canceller = std::thread::spawn(move || {
             let ready_deadline = std::time::Instant::now() + Duration::from_secs(30);
             while !marker.exists() {
@@ -171,7 +172,8 @@ mod tests {
         canceller.join().unwrap();
         assert!(
             matches!(result, SoundProcessOutcome::Exited(status) if status.code() == Some(3)),
-            "{result:?}"
+            "{result:?} after {:?}",
+            started.elapsed()
         );
     }
 

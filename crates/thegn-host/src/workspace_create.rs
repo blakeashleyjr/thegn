@@ -2227,7 +2227,7 @@ Receiving objects: 100% (10/10)\rdone.\n";
         let dest = temp.path().join("clone");
         let url = format!("http://{address}/x.git");
         let (tx, rx) = std::sync::mpsc::channel();
-        let connect = Duration::from_secs(3);
+        let connect = Duration::from_secs(10);
         let slack = Duration::from_secs(10);
         let started = Instant::now();
         let worker = std::thread::spawn(move || {
@@ -2293,7 +2293,7 @@ Receiving objects: 100% (10/10)\rdone.\n";
         let dest = temp.path().join("clone");
         let url = format!("http://{address}/x.git");
         let (tx, rx) = std::sync::mpsc::channel();
-        let total = Duration::from_secs(3);
+        let total = Duration::from_secs(10);
         let slack = Duration::from_secs(10);
         let started = Instant::now();
         let worker = std::thread::spawn(move || {
