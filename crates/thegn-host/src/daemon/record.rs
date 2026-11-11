@@ -1962,4 +1962,153 @@ mod tests {
             "queued permits are returned when the worker exits"
         );
     }
+
+    fn output_of(captured: &Arc<Mutex<Vec<u8>>>) -> (String, Vec<serde_json::Value>) {
+        let events = captured_events(captured);
+        let output: String = events
+            .iter()
+            .filter(|event| event[1] == "o")
+            .map(|event| event[2].as_str().unwrap())
+            .collect();
+        (output, events)
+    }
+
+    #[test]
+    fn aggregate_admission_across_two_blocked_recorders_is_exact() {
+        let limit = 2 * MAX_CHUNK_BYTES;
+        let budget = Arc::new(AtomicUsize::new(0));
+        let (mut a, a_started, a_release, a_captured) = gated_recorder(&budget, limit, false);
+        let (mut b, b_started, b_release, b_captured) = gated_recorder(&budget, limit, false);
+
+        a.feed(&vec![b'a'; MAX_CHUNK_BYTES]);
+        a_started
+            .recv_timeout(Duration::from_secs(5))
+            .expect("sink A entered");
+        b.feed(&vec![b'b'; MAX_CHUNK_BYTES]);
+        b_started
+            .recv_timeout(Duration::from_secs(5))
+            .expect("sink B entered");
+        assert_eq!(
+            budget.load(Ordering::Acquire),
+            limit,
+            "two recorders fill the shared budget to exactly its limit"
+        );
+
+        a.feed(b"x");
+        b.feed(b"yy");
+        assert_eq!(a.dropped_bytes(), 1);
+        assert_eq!(b.dropped_bytes(), 2);
+        assert!(!a.done());
+        assert!(!b.done());
+        assert!(a.failure().is_none());
+        assert!(b.failure().is_none());
+        assert_eq!(
+            budget.load(Ordering::Acquire),
+            limit,
+            "the shared budget never exceeds its limit"
+        );
+
+        a_release.send(()).unwrap();
+        b_release.send(()).unwrap();
+        let a_finished = a.finish();
+        let b_finished = b.finish();
+        assert!(a_finished.truncated.is_none());
+        assert!(b_finished.truncated.is_none());
+        assert_eq!(budget.load(Ordering::Acquire), 0);
+
+        let (a_output, a_events) = output_of(&a_captured);
+        let (b_output, b_events) = output_of(&b_captured);
+        assert!(a_output == "a".repeat(MAX_CHUNK_BYTES), "recorder A output");
+        assert!(b_output == "b".repeat(MAX_CHUNK_BYTES), "recorder B output");
+        assert_eq!(a_events.last().unwrap()[1], "m");
+        assert_eq!(b_events.last().unwrap()[1], "m");
+    }
+
+    #[test]
+    fn tiny_chunks_splitting_every_multibyte_char_reassemble_exactly() {
+        let (mut rec, captured) = captured_recorder();
+        let text = "a\u{e9}\u{20ac}\u{1f600}z";
+        for byte in text.as_bytes() {
+            rec.feed(std::slice::from_ref(byte));
+        }
+        assert_eq!(rec.dropped_bytes(), 0);
+        let fin = rec.finish();
+        assert!(fin.truncated.is_none());
+        assert_eq!(fin.dropped_bytes, 0);
+
+        let (output, events) = output_of(&captured);
+        assert_eq!(output, text);
+        assert!(events.iter().all(|event| event[1] != "m"));
+        assert!(!output.contains('\u{fffd}'));
+    }
+
+    fn straddling_payload() -> Vec<u8> {
+        let mut payload = vec![b'a'; MAX_CHUNK_BYTES - 1];
+        payload.extend_from_slice("\u{20ac}".as_bytes());
+        payload
+    }
+
+    #[test]
+    fn near_cap_utf8_split_at_the_chunk_boundary_reassembles() {
+        let captured = Arc::new(Mutex::new(Vec::new()));
+        let mut header = Header::new(80, 24);
+        header.timestamp = Some(0);
+        let writer = CastWriter::new(BufWriter::new(Capture(Arc::clone(&captured))), &header)
+            .expect("capture header");
+        let budget = Arc::new(AtomicUsize::new(0));
+        let mut rec = start_with_writer_budget(
+            writer,
+            Arc::clone(&budget),
+            MAX_CHUNK_BYTES + 2,
+            &Arc::new(AtomicUsize::new(0)),
+            MAX_RECORDING_WORKERS,
+        )
+        .expect("test recording worker slot");
+
+        rec.feed(&straddling_payload());
+        let fin = rec.finish();
+        assert!(fin.truncated.is_none());
+        assert_eq!(fin.dropped_bytes, 0);
+
+        let (output, events) = output_of(&captured);
+        let expected = "a".repeat(MAX_CHUNK_BYTES - 1) + "\u{20ac}";
+        assert!(output == expected, "the straddling char did not rejoin");
+        assert!(events.iter().all(|event| event[1] != "m"));
+        assert_eq!(budget.load(Ordering::Acquire), 0);
+    }
+
+    #[test]
+    fn near_cap_budget_refusal_never_emits_a_partial_char() {
+        let limit = MAX_CHUNK_BYTES + 1;
+        let budget = Arc::new(AtomicUsize::new(0));
+        let (mut rec, started_rx, release_tx, captured) = gated_recorder(&budget, limit, false);
+
+        rec.feed(&straddling_payload());
+        started_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("sink entered");
+        assert_eq!(
+            rec.dropped_bytes(),
+            2,
+            "the second chunk is refused as a budget gap"
+        );
+
+        release_tx.send(()).unwrap();
+        let fin = rec.finish();
+        assert!(fin.truncated.is_none());
+        assert_eq!(
+            fin.dropped_bytes, 3,
+            "2 refused bytes plus the 1 carried partial byte"
+        );
+        assert_eq!(budget.load(Ordering::Acquire), 0);
+
+        let (output, events) = output_of(&captured);
+        assert!(
+            output == "a".repeat(MAX_CHUNK_BYTES - 1),
+            "a partial char leaked into the output"
+        );
+        assert!(!output.contains('\u{20ac}'));
+        assert!(!output.contains('\u{fffd}'));
+        assert_eq!(events.last().unwrap()[1], "m");
+    }
 }
