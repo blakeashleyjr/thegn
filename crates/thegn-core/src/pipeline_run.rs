@@ -285,7 +285,7 @@ pub fn report_commit_binding(
 pub fn verify_report(f: &VerifyFacts) -> VerifyReport {
     let Some(a) = &f.artifact else {
         let reasons = if f.stage.is_some() {
-            vec!["pipeline row has no artifact path; its handoff is not published (claim with `--artifact` or publish the session artifact)".into()]
+            vec!["pipeline row has no artifact path; its handoff is not published (publish the session artifact; its path is assigned)".into()]
         } else {
             Vec::new()
         };

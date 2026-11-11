@@ -1968,7 +1968,10 @@ artifact_row="$(printf '%s' "$artifact_row_json" | sed -n 's/.*"id":\([0-9]*\).*
 check "dispatch put records an artifact pointer" \
   "[[ -n '$artifact_row' ]] && printf '%s' '$artifact_row_json' | grep -q '\"artifact_path\":\".thegn/pipeline/SMOKE-7/missing/2.md\"'"
 check "dispatch put --stage refuses a caller-chosen --artifact" \
-  "! '$SZ' dispatch put linear:SMOKE-3B '$R' claude --stage code --artifact README.md >/dev/null 2>&1"
+  "'$SZ' dispatch put linear:SMOKE-3B '$R' claude --stage code --artifact README.md 2>&1 >/dev/null | grep -q -- '--artifact is not accepted'"
+stage_refusal_roster="$("$SZ" dispatch list --json 2>/dev/null || true)"
+check "the refused --stage --artifact put created no roster row" \
+  "! grep -q SMOKE-3B <<<'$stage_refusal_roster'"
 # A missing artifact is a retryable not-yet (exit 2, the `session wait`
 # convention) naming the artifact; `set-status done` is refused for the same
 # reason unless `--force` records it as forced — never invisibly.
