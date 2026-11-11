@@ -691,6 +691,18 @@ fn map_dispatch_status_error(error: anyhow::Error) -> ControlError {
     ControlError::Internal(error)
 }
 
+/// `with_db` error mapping: a report refused because its run was republished
+/// is a precondition failure the worker can act on, not an internal error.
+fn map_with_db_error(error: anyhow::Error) -> ControlError {
+    if error
+        .downcast_ref::<thegn_core::db::ReportRunChanged>()
+        .is_some()
+    {
+        return ControlError::FailedPrecondition(error.to_string());
+    }
+    ControlError::Internal(error)
+}
+
 #[derive(Debug)]
 struct DispatchIdentityRefused(String);
 
@@ -796,7 +808,7 @@ impl DaemonService {
         })
         .await
         .map_err(|e| ControlError::Internal(anyhow::anyhow!("db task join: {e}")))?
-        .map_err(ControlError::Internal)
+        .map_err(map_with_db_error)
     }
 
     async fn entry_tx(&self, session: &str) -> ControlResult<mpsc::Sender<SessionMsg>> {
@@ -2994,11 +3006,23 @@ impl ControlApi for DaemonService {
                         thegn_core::CapabilityVerb::Report,
                         thegn_core::util::now_ms(),
                     )?;
-                    match verified {
-                        Ok(_grant) => {}
+                    let grant = match verified {
+                        Ok(grant) => grant,
                         Err(refusal) => return Ok(Err(refusal)),
-                    }
-                    let recorded = crate::cmd::dispatch::record_report(db, id, &req.text)?;
+                    };
+                    // Fence to the run the token was minted for, not whatever
+                    // run is current when the write happens.
+                    let Some(current) = db.dispatch_run_ref(id)? else {
+                        return Ok(Err(thegn_core::CapabilityRefusal::RowMissing));
+                    };
+                    let run = thegn_core::issue::DispatchRunRef {
+                        id,
+                        issue_id: current.issue_id,
+                        session_id: grant.session_id,
+                        run_gen: grant.run_gen,
+                    };
+                    let recorded =
+                        crate::cmd::dispatch::record_report_for_run(db, &run, &req.text)?;
                     Ok(Ok(thegn_svc::control::DispatchReportReply {
                         id,
                         bytes: recorded.validated.len(),
@@ -7348,6 +7372,20 @@ mod tests {
                 field: "report",
             })),
             ControlError::Conflict(_)
+        ));
+    }
+
+    #[test]
+    fn report_fence_run_change_maps_to_failed_precondition() {
+        assert!(matches!(
+            map_with_db_error(anyhow::Error::new(thegn_core::db::ReportRunChanged {
+                id: 7
+            })),
+            ControlError::FailedPrecondition(_)
+        ));
+        assert!(matches!(
+            map_with_db_error(anyhow::anyhow!("boom")),
+            ControlError::Internal(_)
         ));
     }
 
