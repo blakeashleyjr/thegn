@@ -107,6 +107,9 @@ if [[ $name == *..* || $name == *. ]]; then
   echo "make-app.sh: --name must not contain '..' or end with '.' (it becomes part of the bundle identifier)" >&2
   exit 2
 fi
+# CFBundleIdentifier forbids '_', so it maps to '-'. No injective mapping exists
+# within the legal alphabet, hence --name my_app and --name my-app deliberately
+# share one identifier (their bundles still differ by filename and CFBundleName).
 bundle_id_suffix="${name//_/-}"
 bundle_id="com.github.blakeashleyjr.$bundle_id_suffix"
 for kv in ${envs+"${envs[@]}"}; do
