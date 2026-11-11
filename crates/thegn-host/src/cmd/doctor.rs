@@ -3116,7 +3116,7 @@ pub fn run(
         report["voice"] = super::voice::status(&cfg.voice);
         report["batteries"] =
             super::batteries_doctor::json(&super::batteries_doctor::inspect_env());
-        report["worktree_sandbox_pins"] = pins::json(&pins::collect(cfg));
+        report["worktree_sandbox_pins"] = pins::json(&pins::collect(cfg).0);
         outln!("{}", serde_json::to_string_pretty(&report)?);
         return Ok(());
     }
@@ -3288,7 +3288,8 @@ pub fn run(
     outln!("");
     super::batteries_doctor::print(&super::batteries_doctor::inspect_env());
     outln!("");
-    pins::print(&pins::collect(cfg));
+    let (pin_rows, pin_unread) = pins::collect(cfg);
+    pins::print(&pin_rows, pin_unread.as_deref());
 
     outln!("");
     pane_daemon_report(cfg);
