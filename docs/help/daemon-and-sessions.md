@@ -220,6 +220,13 @@ see [[configuration]]. The roster side (verify a finished row, wait on one,
 gate `done`) is [[cli]]'s `dispatch verify` / `dispatch wait` /
 `dispatch set-status done`.
 
+For an ad-hoc plain worker, add `--track <issue-id>` to `session open`.
+This requires `--worktree` and records a plain, running dispatch row bound to
+the opened session, so `dispatch list`, `dispatch wait`, `dispatch verify`,
+and the sidebar can see it. The session is opened before the row is inserted;
+if tracking fails, the new session is killed. `--track` cannot be combined
+with `--stage`, `--issue`, or `--resume-work`.
+
 Before launching, `session open --stage --issue` fetches the issue once and
 writes it to `<worktree>/.thegn/maintenance/issue.json` (atomic, always
 overwritten) so the worker and its reviewers read the captured task, never

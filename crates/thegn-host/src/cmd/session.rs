@@ -96,6 +96,15 @@ pub enum SessionAction {
         /// that worktree is opened. The session opens either way.
         #[arg(long)]
         adopt: bool,
+        /// Track this plain session in the dispatch roster using the supplied
+        /// issue id (`linear:THE-1976`). Requires `--worktree`; unlike
+        /// `--stage --issue`, this opens the session before creating the row.
+        #[arg(
+            long,
+            requires = "worktree",
+            conflicts_with_all = ["issue", "stage", "resume_work"]
+        )]
+        track: Option<String>,
         /// A `[[pipeline.stages]]` name, with two behaviors. With `--issue`,
         /// the full dispatch: render the stage's prompt template, open the
         /// session headless and write the roster row, in one call — an
@@ -429,10 +438,20 @@ async fn run_async(cfg: &Config, action: SessionAction) -> Result<()> {
             issue,
             prompt,
             headless,
+            track,
+            worktree,
             resume_work: None,
             ..
         } => {
-            open_preflight(cfg, stage.as_deref(), issue.as_deref(), prompt, *headless)?;
+            open_preflight(
+                cfg,
+                stage.as_deref(),
+                issue.as_deref(),
+                track.as_deref(),
+                worktree.as_deref(),
+                prompt,
+                *headless,
+            )?;
         }
         SessionAction::Open {
             resume_work: Some(row_id),
@@ -487,6 +506,7 @@ async fn run_async(cfg: &Config, action: SessionAction) -> Result<()> {
             lease,
             owner,
             lease_gen,
+            track,
             resume_work: resume_row,
             json,
         } => {
@@ -573,9 +593,9 @@ async fn run_async(cfg: &Config, action: SessionAction) -> Result<()> {
                     env: Vec::new(),
                     rows: 24,
                     cols: 80,
-                    worktree: Some(wt),
+                    worktree: Some(wt.clone()),
                     agent: Some(AgentLaunch {
-                        agent,
+                        agent: agent.clone(),
                         prompt,
                         // A plain `--headless` forces headless; absent leaves the
                         // default (headless exactly when a prompt was given).
@@ -599,10 +619,35 @@ async fn run_async(cfg: &Config, action: SessionAction) -> Result<()> {
                     already_capped: false,
                 };
                 let info = client.open(&spec).await?;
+                let tracked_row = match track.as_deref() {
+                    Some(track_issue) => Some(
+                        crate::cmd::session_track::track_opened(
+                            &client,
+                            track_issue,
+                            &wt,
+                            &agent,
+                            &info.id,
+                        )
+                        .await?,
+                    ),
+                    None => None,
+                };
                 if json {
-                    outln!("{}", terminal_safe_pretty_json(&info)?);
+                    if let Some(row) = tracked_row {
+                        let mut value = serde_json::to_value(&info)?;
+                        value
+                            .as_object_mut()
+                            .expect("SessionInfo serializes as a JSON object")
+                            .insert("row".into(), serde_json::json!(row));
+                        outln!("{}", terminal_safe_pretty_json(&value)?);
+                    } else {
+                        outln!("{}", terminal_safe_pretty_json(&info)?);
+                    }
                 } else {
                     outln!("{}", display_cell(&info.id));
+                    if let Some(row) = tracked_row {
+                        outln!("dispatch {row} tracked");
+                    }
                 }
             }
         }
@@ -930,9 +975,21 @@ fn open_preflight(
     cfg: &Config,
     stage: Option<&str>,
     issue: Option<&str>,
+    track: Option<&str>,
+    worktree: Option<&str>,
     prompt: &str,
     headless: bool,
 ) -> Result<()> {
+    if let Some(track_issue) = track {
+        if stage.is_some() || issue.is_some() {
+            anyhow::bail!("--track is only available on a plain session open");
+        }
+        if worktree.is_none() {
+            anyhow::bail!("--track requires --worktree");
+        }
+        thegn_core::pipeline_identity::canonical_issue_id(track_issue)
+            .map_err(anyhow::Error::new)?;
+    }
     if let Some(name) = stage {
         stage_or_bail(cfg, name)?;
     }
@@ -2071,22 +2128,31 @@ mod open_stage_tests {
     fn the_stage_lookup_is_answerable_before_connect() {
         // The offline-refusal contract: a config typo is not a daemon problem,
         // so the preflight must refuse without reaching `connect`.
-        let err = open_preflight(&cfg_with_stage(), Some("nosuchstage"), None, "", false)
-            .expect_err("must refuse");
+        let err = open_preflight(
+            &cfg_with_stage(),
+            Some("nosuchstage"),
+            None,
+            None,
+            None,
+            "",
+            false,
+        )
+        .expect_err("must refuse");
         assert!(err.to_string().contains("nosuchstage"), "got {err}");
     }
 
     #[test]
     fn headless_with_a_blank_prompt_is_refused() {
-        let err =
-            open_preflight(&cfg_with_stage(), None, None, "   ", true).expect_err("must refuse");
+        let err = open_preflight(&cfg_with_stage(), None, None, None, None, "   ", true)
+            .expect_err("must refuse");
         assert!(err.to_string().contains("empty prompt"), "got {err}");
     }
 
     #[test]
     fn a_promptless_open_stays_a_legal_interactive_launch() {
         // The real and correct use `--headless` must not break.
-        open_preflight(&cfg_with_stage(), None, None, "", false).expect("interactive launch");
+        open_preflight(&cfg_with_stage(), None, None, None, None, "", false)
+            .expect("interactive launch");
     }
 
     #[test]
@@ -2094,8 +2160,16 @@ mod open_stage_tests {
         // A stage's *rendered* prompt is checked in `open_stage`, where the
         // row can be marked `failed` — not here. (`--stage` WITHOUT `--issue`
         // is a plain overlay open and still gets the check above.)
-        open_preflight(&cfg_with_stage(), Some("code"), Some("linear:X"), "", true)
-            .expect("stage dispatch is headless by construction");
+        open_preflight(
+            &cfg_with_stage(),
+            Some("code"),
+            Some("linear:X"),
+            None,
+            None,
+            "",
+            true,
+        )
+        .expect("stage dispatch is headless by construction");
     }
 
     #[test]
@@ -2105,6 +2179,8 @@ mod open_stage_tests {
             &cfg_with_stage(),
             Some("code"),
             Some("linear:X"),
+            None,
+            None,
             "hand-written task",
             false,
         )
@@ -2113,6 +2189,36 @@ mod open_stage_tests {
             err.to_string().contains("template owns the task"),
             "got {err}"
         );
+    }
+
+    #[test]
+    fn track_refuses_an_invalid_issue_before_connect() {
+        let err = open_preflight(
+            &cfg_with_stage(),
+            None,
+            None,
+            Some("linear:THE 1976"),
+            Some("/tmp/worktree"),
+            "",
+            false,
+        )
+        .expect_err("invalid tracked issue must be refused");
+        assert!(err.to_string().contains("invalid pipeline issue id"));
+    }
+
+    #[test]
+    fn track_refuses_stage_and_issue_combinations_offline() {
+        let err = open_preflight(
+            &cfg_with_stage(),
+            Some("code"),
+            Some("linear:THE-1976"),
+            Some("linear:THE-1976"),
+            Some("/tmp/worktree"),
+            "",
+            false,
+        )
+        .expect_err("tracked stage dispatch must be refused");
+        assert!(err.to_string().contains("plain session open"));
     }
 
     #[test]
