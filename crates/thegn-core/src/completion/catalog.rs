@@ -869,6 +869,23 @@ pub const CATALOG: &[Slot] = &[
         "from_issue",
         SourceKind::Reserved(Reserved::Issue),
     ),
+    slot("release prepare", "bump", SourceKind::Structural),
+    slot(
+        "release prepare",
+        "from",
+        SourceKind::Reserved(Reserved::Branch),
+    ),
+    slot(
+        "release prepare",
+        "branch",
+        SourceKind::Reserved(Reserved::Branch),
+    ),
+    slot(
+        "release prepare",
+        "date",
+        SourceKind::Reserved(Reserved::Freeform),
+    ),
+    slot("release prepare", "lock_from", SourceKind::Structural),
 ];
 
 /// The row for `(command_path, arg_id)`, if any.
