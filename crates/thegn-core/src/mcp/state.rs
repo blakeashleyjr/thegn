@@ -109,6 +109,19 @@ pub const STATE_TOOLS: &[StateToolSpec] = &[
         args: &[],
     },
     StateToolSpec {
+        cap: "worktrees.sandbox_profile",
+        description: "Read a worktree's pinned sandbox profile (`standard` or `sealed`), or \
+                      null when nothing is pinned and the configured policy applies. \
+                      Read-only: pinning and clearing are host-owned and not available \
+                      over MCP. Requires a running daemon.",
+        args: &[ArgSpec {
+            name: "worktree",
+            kind: ArgKind::String,
+            required: true,
+            description: "Absolute path of a registered worktree, exactly as registered",
+        }],
+    },
+    StateToolSpec {
         cap: "folders.assign",
         description: "Assign a repo-local sidebar folder to a Git worktree, or clear its folder. \
                       Folder names are trimmed and matched case-insensitively within that \
@@ -595,6 +608,7 @@ pub const STATE_TOOLS: &[StateToolSpec] = &[
 pub const MCP_STATE_CAPS: &[&str] = &[
     "sessions.list",
     "worktrees.list",
+    "worktrees.sandbox_profile",
     "folders.assign",
     "editor.open",
     "preview.fetch",
@@ -908,6 +922,19 @@ mod tests {
     }
 
     #[test]
+    fn sandbox_profile_is_a_read_only_mcp_tool() {
+        let r = StateRouter::new(vec!["worktrees.sandbox_profile"], |cap, args| {
+            Ok(json!({ "cap": cap, "args": args }))
+        });
+        let entries = r.tool_entries();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0]["name"], "worktrees_sandbox_profile");
+        assert_eq!(entries[0]["inputSchema"]["required"], json!(["worktree"]));
+        assert_eq!(entries[0]["annotations"]["readOnlyHint"], json!(true));
+        assert_eq!(entries[0]["annotations"]["destructiveHint"], json!(false));
+    }
+
+    #[test]
     fn folder_assignment_exposes_optional_folder_and_routes_the_mutation() {
         let r = StateRouter::new(vec!["folders.assign"], |cap, args| {
             Ok(json!({ "cap": cap, "args": args }))
@@ -1059,6 +1086,7 @@ mod tests {
         let read = [
             "sessions.list",
             "worktrees.list",
+            "worktrees.sandbox_profile",
             "preview.fetch",
             "leases.list",
             "me",
