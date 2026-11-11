@@ -76,8 +76,8 @@ impl Db {
                   expected_head_oid, pending_source_revision, pending_content_revision,
                   pending_prompt, pending_expected_head_oid, pending_role,
                   pending_worktree_path, forge_action_attempts,
-                  next_forge_action_at_ms)
-               VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,NULL,NULL,NULL,NULL,NULL,NULL,0,NULL)
+                  next_forge_action_at_ms, dispatch_kind)
+               VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,NULL,NULL,NULL,NULL,NULL,NULL,0,NULL,'plain')
                ON CONFLICT(task_kind, source_key)
                  WHERE task_kind IS NOT NULL AND source_key IS NOT NULL
                DO UPDATE SET
@@ -603,5 +603,15 @@ mod tests {
         seed_active(&db, Db::ROSTER_ACTIVE_LIMIT - 1);
 
         assert!(db.upsert_review_task(&task("r1", "p")).is_ok());
+    }
+
+    #[test]
+    fn review_task_upsert_is_a_plain_dispatch_kind() {
+        let db = Db::open_memory().unwrap();
+        let id = db.upsert_review_task(&task("r1", "p")).unwrap();
+        assert_eq!(db.dispatch_kind(id).unwrap().as_deref(), Some("plain"));
+        let again = db.upsert_review_task(&task("r2", "p2")).unwrap();
+        assert_eq!(again, id);
+        assert_eq!(db.dispatch_kind(id).unwrap().as_deref(), Some("plain"));
     }
 }
