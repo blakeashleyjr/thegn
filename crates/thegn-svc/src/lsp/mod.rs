@@ -2005,7 +2005,7 @@ impl LspClient {
         let writer_pending = pending.clone();
         let writer_tx = Arc::new(writer_tx);
         let writer_spawn = spawn(
-            "thegn-lsp-writer",
+            "thegn-lsp-wr",
             Box::new({
                 let writer_queued_bytes = queued_bytes.clone();
                 let writer_closed = closed.clone();
@@ -2044,10 +2044,7 @@ impl LspClient {
                 generation,
                 sequence: AtomicU64::new(0),
             };
-            spawn(
-                "thegn-lsp-reader",
-                Box::new(move || reader_loop(reader, ctx)),
-            )
+            spawn("thegn-lsp-rd", Box::new(move || reader_loop(reader, ctx)))
         };
         let reader_thread = match reader_spawn {
             Ok(thread) => thread,
@@ -2622,7 +2619,7 @@ fn spawn_lsp_thread(
     name: &'static str,
     task: Box<dyn FnOnce() + Send>,
 ) -> std::io::Result<thread::JoinHandle<()>> {
-    thread::Builder::new().name(name.into()).spawn(task)
+    thegn_core::thread_name::try_spawn_named(name, task)
 }
 
 fn terminate_tree(child: &mut Child, deadline: Option<std::time::Instant>) {
@@ -3436,7 +3433,7 @@ mod tests {
         name: &'static str,
         task: Box<dyn FnOnce() + Send>,
     ) -> std::io::Result<thread::JoinHandle<()>> {
-        if name == "thegn-lsp-reader" {
+        if name == "thegn-lsp-rd" {
             thread::sleep(Duration::from_millis(200));
             Err(std::io::Error::other("injected LSP reader spawn failure"))
         } else {

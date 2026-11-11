@@ -88,63 +88,61 @@ fn thread_finished(thread: &JoinHandle<()>) -> io::Result<bool> {
 }
 
 impl Worker {
-    fn new(name: &str) -> io::Result<Self> {
+    fn new(name: &'static str) -> io::Result<Self> {
         let (tx, rx) = mpsc::channel();
         let stop = Arc::new(AtomicBool::new(false));
         let worker_stop = stop.clone();
-        let thread = std::thread::Builder::new()
-            .name(name.into())
-            .spawn(move || {
-                let mut file: Option<File> = None;
-                while let Ok(operation) = rx.recv() {
-                    if worker_stop.load(Ordering::Acquire) {
-                        break;
+        let thread = thegn_core::thread_name::try_spawn_named(name, move || {
+            let mut file: Option<File> = None;
+            while let Ok(operation) = rx.recv() {
+                if worker_stop.load(Ordering::Acquire) {
+                    break;
+                }
+                match operation {
+                    Operation::Attach(pipe) => file = Some(pipe),
+                    Operation::Read(reply) => {
+                        let result = file
+                            .as_mut()
+                            .ok_or_else(|| io::Error::other("pipe unavailable"))
+                            .and_then(|pipe| {
+                                let mut bytes = vec![0; 8192];
+                                pipe.read(&mut bytes).map(|len| {
+                                    bytes.truncate(len);
+                                    bytes
+                                })
+                            });
+                        // A cancelled owner still retains and joins this worker.
+                        drop(reply.send(result));
                     }
-                    match operation {
-                        Operation::Attach(pipe) => file = Some(pipe),
-                        Operation::Read(reply) => {
-                            let result = file
-                                .as_mut()
-                                .ok_or_else(|| io::Error::other("pipe unavailable"))
-                                .and_then(|pipe| {
-                                    let mut bytes = vec![0; 8192];
-                                    pipe.read(&mut bytes).map(|len| {
-                                        bytes.truncate(len);
-                                        bytes
-                                    })
+                    #[cfg(test)]
+                    Operation::ReadPaused {
+                        entered,
+                        resume,
+                        reply,
+                    } => {
+                        entered.send(()).expect("fixture barrier receiver");
+                        resume.recv().expect("fixture barrier release");
+                        let mut bytes = vec![0; 8192];
+                        let result =
+                            file.as_mut()
+                                .expect("fixture pipe")
+                                .read(&mut bytes)
+                                .map(|len| {
+                                    bytes.truncate(len);
+                                    bytes
                                 });
-                            // A cancelled owner still retains and joins this worker.
-                            drop(reply.send(result));
-                        }
-                        #[cfg(test)]
-                        Operation::ReadPaused {
-                            entered,
-                            resume,
-                            reply,
-                        } => {
-                            entered.send(()).expect("fixture barrier receiver");
-                            resume.recv().expect("fixture barrier release");
-                            let mut bytes = vec![0; 8192];
-                            let result =
-                                file.as_mut()
-                                    .expect("fixture pipe")
-                                    .read(&mut bytes)
-                                    .map(|len| {
-                                        bytes.truncate(len);
-                                        bytes
-                                    });
-                            drop(reply.send(result));
-                        }
-                        Operation::Write(bytes, reply) => {
-                            let result = file
-                                .as_mut()
-                                .ok_or_else(|| io::Error::other("pipe unavailable"))
-                                .and_then(|pipe| pipe.write(&bytes));
-                            drop(reply.send(result));
-                        }
+                        drop(reply.send(result));
+                    }
+                    Operation::Write(bytes, reply) => {
+                        let result = file
+                            .as_mut()
+                            .ok_or_else(|| io::Error::other("pipe unavailable"))
+                            .and_then(|pipe| pipe.write(&bytes));
+                        drop(reply.send(result));
                     }
                 }
-            })?;
+            }
+        })?;
         Ok(Self {
             tx: Some(tx),
             stop,
@@ -204,9 +202,9 @@ pub(crate) struct Prepared {
 impl Prepared {
     pub fn new() -> io::Result<Self> {
         // All fallible thread admission occurs BEFORE any child is created.
-        let input = Worker::new("thegn-plugin-stdin")?;
-        let output = Worker::new("thegn-plugin-stdout")?;
-        let error = Worker::new("thegn-plugin-stderr")?;
+        let input = Worker::new("thegn-plg-in")?;
+        let output = Worker::new("thegn-plg-out")?;
+        let error = Worker::new("thegn-plg-err")?;
         Ok(Self {
             input,
             output,
