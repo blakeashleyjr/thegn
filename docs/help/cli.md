@@ -19,16 +19,16 @@ works everywhere.
 Noun-verb namespaces mirror the domain model (repo → project →
 worktree):
 
-| Group         | Commands                                                                                                       |
-| ------------- | -------------------------------------------------------------------------------------------------------------- |
-| Project       | `wt list/new/rm/diff/disk/clean` · `repo list/recent` · `open <repo>` · `map` · `land` · `integrate` · `merge` |
-| Program       | `program list/create/rename/rm/assign` · `wt new --program`                                                    |
-| Forge         | `pr` · `issue` · `ci` · `kaneo`                                                                                |
-| Automation    | `autopilot status [--repo PATH] [--json]`                                                                      |
-| Environments  | `env` · `zone` · `host` · `placement` · `debug` · `mcp` · `plugin`                                             |
-| Session       | `notify` · `logs` · `share` · `forward`                                                                        |
-| Control plane | `serve` · `session` · `events` · `attach` · `pair` · `api`                                                     |
-| Meta          | `config` · `keys` · `theme` · `doctor` · `db` · `setup` · `completions`                                        |
+| Group         | Commands                                                                                                                                      |
+| ------------- | --------------------------------------------------------------------------------------------------------------------------------------------- |
+| Project       | `wt list/new/rm/prune/diff/disk/clean` · `repo list/recent` · `open <repo>` · `map` · `land` · `integrate` · `merge` · `dispatch` · `release` |
+| Program       | `program list/create/rename/rm/assign` · `wt new --program`                                                                                   |
+| Forge         | `pr` · `issue` · `ci` · `kaneo`                                                                                                               |
+| Automation    | `autopilot status [--repo PATH] [--json]`                                                                                                     |
+| Environments  | `env` · `zone` · `host` · `placement` · `debug` · `mcp` · `plugin`                                                                            |
+| Session       | `notify` · `logs` · `share` · `forward`                                                                                                       |
+| Control plane | `serve` · `session` · `events` · `attach` · `pair` · `api`                                                                                    |
+| Meta          | `config` · `keys` · `theme` · `doctor` · `db` · `setup` · `completions`                                                                       |
 
 Global flags everywhere: `--config`, `--log-level`, `--set key=value`
 (repeatable), and `--profile <name>`.
@@ -216,6 +216,12 @@ the reason if that branch differs from the one recorded at creation, is the
 default branch or is checked out in the main worktree, or Git cannot verify
 those facts or read the live branch; a detached HEAD also refuses.
 
+`thegn wt new <name> --exact-branch` uses `<name>` verbatim as the branch (no
+configured prefix or numbering); it conflicts with `--from-issue` and
+`--program`. `thegn wt prune --merged [--target <branch>] [--apply] [--json]`
+removes lane worktrees and branches already merged into the target; without
+`--apply` it is a dry run. See [[workspaces-and-worktrees]].
+
 `wt new` reports an empty base as having no commits yet and reports Git read
 failures as failures to verify the base.
 
@@ -294,6 +300,12 @@ best effort and a warning cannot undo a confirmed move.
   pass `--yes` (`-y`) without a TTY. It merges only that reviewed head, prints
   “PR merged” only when the forge confirms the merge, and exits non-zero if
   the head moves, the forge refuses, or the result is unknown.
+
+- `thegn dispatch commit <row> --msg-file F [--trailer "Key: value"]... [--json]`
+  commits a finished worker's worktree (see [[pipeline-board]]).
+- `thegn release prepare --bump <alpha|beta|rc|patch> [--from REF] [--branch B]
+[--date YYYY-MM-DD] [--lock-from PATH] [--dry-run] [--json]` bumps the version
+  files without committing (see [[release-channels]]).
 
 None of these check the target out, which is what makes them safe against
 a running instance. See [[merge-queue]] for the whole flow.
