@@ -80,6 +80,18 @@ pub enum SessionAction {
         /// The task to seed the first turn with. Empty ⇒ launch interactively.
         #[arg(long, default_value = "")]
         prompt: String,
+        /// Read the plain-open prompt from this file. The file is a template
+        /// only when at least one `--vars` binding is supplied.
+        #[arg(long, conflicts_with_all = ["prompt", "issue", "resume_work"])]
+        brief_file: Option<String>,
+        /// Bind `KEY=VALUE` in `--brief-file` (repeatable).
+        #[arg(
+            long,
+            value_name = "KEY=VALUE",
+            requires = "brief_file",
+            conflicts_with_all = ["prompt", "issue", "resume_work"]
+        )]
+        vars: Vec<String>,
         /// Run headlessly (`claude -p …`). Defaults to headless exactly when a
         /// prompt is given.
         #[arg(long)]
@@ -418,6 +430,19 @@ async fn run_async(cfg: &Config, action: SessionAction) -> Result<()> {
     // daemon-free) — see `open_preflight`. `--resume-work` carries its own
     // offline row checks (unknown row, non-pipeline row, unknown stage) in
     // `resume_preflight`, the same pre-`connect` slot.
+    let resolved_open_prompt = match &action {
+        SessionAction::Open {
+            prompt,
+            brief_file,
+            vars,
+            ..
+        } => Some(crate::cmd::session_brief::resolve_brief(
+            prompt,
+            brief_file.as_deref(),
+            vars,
+        )?),
+        _ => None,
+    };
     match &action {
         SessionAction::Move { .. } => {
             // Migration is dispatched before `connect`: a cold source daemon
@@ -432,7 +457,13 @@ async fn run_async(cfg: &Config, action: SessionAction) -> Result<()> {
             resume_work: None,
             ..
         } => {
-            open_preflight(cfg, stage.as_deref(), issue.as_deref(), prompt, *headless)?;
+            open_preflight(
+                cfg,
+                stage.as_deref(),
+                issue.as_deref(),
+                resolved_open_prompt.as_deref().unwrap_or(prompt),
+                *headless,
+            )?;
         }
         SessionAction::Open {
             resume_work: Some(row_id),
@@ -475,7 +506,9 @@ async fn run_async(cfg: &Config, action: SessionAction) -> Result<()> {
         SessionAction::Open {
             agent,
             worktree,
-            prompt,
+            prompt: _,
+            brief_file: _,
+            vars: _,
             headless,
             bind,
             adopt,
@@ -576,7 +609,8 @@ async fn run_async(cfg: &Config, action: SessionAction) -> Result<()> {
                     worktree: Some(wt),
                     agent: Some(AgentLaunch {
                         agent,
-                        prompt,
+                        prompt: resolved_open_prompt
+                            .expect("plain open prompt was resolved before connect"),
                         // A plain `--headless` forces headless; absent leaves the
                         // default (headless exactly when a prompt was given).
                         headless: headless.then_some(true),

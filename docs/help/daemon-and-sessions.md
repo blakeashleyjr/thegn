@@ -220,6 +220,11 @@ see [[configuration]]. The roster side (verify a finished row, wait on one,
 gate `done`) is [[cli]]'s `dispatch verify` / `dispatch wait` /
 `dispatch set-status done`.
 
+A plain `session open` can read its prompt from `--brief-file <path>`; repeat
+`--vars key=value` to render bindings (without bindings, braces in the file
+remain literal). These options are for issue-free opens and are checked before
+connecting to the daemon.
+
 Before launching, `session open --stage --issue` fetches the issue once and
 writes it to `<worktree>/.thegn/maintenance/issue.json` (atomic, always
 overwritten) so the worker and its reviewers read the captured task, never
