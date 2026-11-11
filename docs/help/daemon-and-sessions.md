@@ -222,8 +222,9 @@ gate `done`) is [[cli]]'s `dispatch verify` / `dispatch wait` /
 
 Before launching, `session open --stage --issue` fetches the issue once and
 writes it to `<worktree>/.thegn/maintenance/issue.json` (atomic, always
-overwritten, git-ignored) so the worker and its reviewers read the captured
-task, never a stale file. If the tracker is unavailable, offline, or
+overwritten) so the worker and its reviewers read the captured task, never
+a stale file. The file is git-ignored only in thegn's own repo; elsewhere it
+is untracked unless you ignore it, and a worker's `git add -A` would commit it. If the tracker is unavailable, offline, or
 provider `none`, or the file cannot be written (including a symlinked
 `.thegn` or `.thegn/maintenance`), the dispatch is refused before any roster
 row is claimed.
