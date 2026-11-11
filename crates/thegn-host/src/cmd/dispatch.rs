@@ -1962,6 +1962,18 @@ pub(crate) fn done_gate_bound(db: &Db, row: &AgentDispatch) -> Result<()> {
         }
         .into());
     }
+    let kind = db.dispatch_kind(row.id)?;
+    if let Some(reason) = pipeline_run::typed_kind_refusal(
+        kind.as_deref(),
+        row.stage.as_deref(),
+        row.artifact_path.as_deref(),
+    ) {
+        return Err(DoneGateRefused {
+            id: row.id,
+            reasons: vec![reason],
+        }
+        .into());
+    }
     let report_head = db.dispatch_report_head(row.id)?;
     let facts = verify_facts_with_report_head(row, report_head.as_deref());
     require_done_report(row.id, pipeline_run::verify_report(&facts))?;
@@ -5953,6 +5965,38 @@ mod tests {
 
         let error = done_gate_bound(&db, &row).unwrap_err();
         assert!(error.to_string().contains("unpublished reservation"));
+    }
+
+    #[test]
+    fn dispatch_kind_stage_row_without_identity_is_refused_by_the_done_gate() {
+        let (_dir, db) = db("dispatch-kind-stage-identity");
+        let id = db
+            .put_agent_dispatch(NewDispatch {
+                stage: Some("code"),
+                artifact_path: Some("a.md"),
+                ..NewDispatch::new("linear:THE-241-KIND", "/wt/x", "claude")
+            })
+            .unwrap();
+        db.update_dispatch_status(id, AgentDispatchStatus::Running)
+            .unwrap();
+        let mut row = db.get_dispatch(id).unwrap().unwrap();
+        row.stage = None;
+        row.artifact_path = None;
+
+        let error = done_gate_bound(&db, &row).unwrap_err();
+        assert!(error.to_string().contains("typed pipeline row"));
+    }
+
+    #[test]
+    fn dispatch_kind_plain_row_completes_through_the_done_gate() {
+        let (_dir, db) = db("dispatch-kind-plain-done");
+        let id = db
+            .put_agent_dispatch(NewDispatch::new("linear:THE-241-PLAIN", "/wt/x", "claude"))
+            .unwrap();
+        db.update_dispatch_status(id, AgentDispatchStatus::Running)
+            .unwrap();
+        let row = db.get_dispatch(id).unwrap().unwrap();
+        done_gate_bound(&db, &row).unwrap();
     }
 
     #[test]

@@ -1181,6 +1181,21 @@ impl Db {
         Ok(())
     }
 
+    /// Read the typed trust class (`plain` / `stage` / `legacy_held`) of a row.
+    /// NULL (a pre-v110 or unclassified row) is "unknown": callers must treat
+    /// it as today's behaviour, never as `plain`.
+    pub fn dispatch_kind(&self, id: i64) -> Result<Option<String>> {
+        Ok(self
+            .conn()
+            .query_row(
+                "SELECT dispatch_kind FROM agent_dispatches WHERE id=?1",
+                [id],
+                |row| row.get(0),
+            )
+            .optional()?
+            .flatten())
+    }
+
     /// Read the HEAD binding for the currently filed report.
     pub fn dispatch_report_head(&self, id: i64) -> Result<Option<String>> {
         Ok(self
@@ -3879,6 +3894,27 @@ mod tests {
             ))
             .unwrap();
         assert_eq!(db.get_dispatch(plain).unwrap().unwrap().artifact_path, None);
+    }
+
+    #[test]
+    fn dispatch_kind_is_written_by_put_for_stage_and_plain_rows() {
+        let (db, _dir) = temp_db();
+        let stage = db
+            .put_agent_dispatch(crate::issue::NewDispatch {
+                stage: Some("code"),
+                ..crate::issue::NewDispatch::new("linear:KIND-S", "/wt/s", "coder")
+            })
+            .unwrap();
+        let plain = db
+            .put_agent_dispatch(crate::issue::NewDispatch::new(
+                "linear:KIND-P",
+                "/wt/p",
+                "coder",
+            ))
+            .unwrap();
+        assert_eq!(db.dispatch_kind(stage).unwrap().as_deref(), Some("stage"));
+        assert_eq!(db.dispatch_kind(plain).unwrap().as_deref(), Some("plain"));
+        assert_eq!(db.dispatch_kind(i64::MAX).unwrap(), None);
     }
 
     #[test]
