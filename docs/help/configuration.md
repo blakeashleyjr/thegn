@@ -565,6 +565,13 @@ The `[notifications]` booleans are `notificationsDesktop`,
 `[activity]` takes `activityEnabled`, `activityRedRequiresAgent` and
 `activityAgentPrograms` (a list of extra agent CLI program names).
 
+Recording, media and the monitor process table are also exposed:
+`recordingDir`, `recordingMaxBytes`, `mediaEnabled`, `mediaShowArt`,
+`mediaOverlayOnBadgeClick`, `mediaSeekStepSecs`, `mediaSeekStepVideoSecs`,
+`mediaPollIntervalSecs`, `mediaPlayersPriority`, `monitorProcRows`,
+`monitorProcesses` and `monitorProcessIo`. The media backend, default-action
+and volume-step keys and the `mpv`/`mpd` tables are not exposed.
+
 `keys list` covers the keymap registry **and** the zone-local tables — the
 sidebar's row keys and each panel section's row-mode keys. Those are handled
 by the focused zone rather than the registry, so they are not rebindable, but
