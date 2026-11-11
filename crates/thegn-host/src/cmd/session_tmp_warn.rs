@@ -10,6 +10,10 @@ use thegn_core::store::WorkspaceStore;
 /// Print a non-blocking warning for prompt paths that will disappear with the
 /// worker's private `/tmp`. All resolution is local and best-effort: a failure
 /// to determine the effective sandbox leaves the launch unchanged and quiet.
+#[expect(
+    clippy::disallowed_macros,
+    reason = "user-visible launch warning on stderr"
+)]
 pub(crate) fn warn_if_private_tmp(cfg: &Config, worktree: &str, prompt: &str) {
     let paths = thegn_core::sandbox_tmp_hint::tmp_paths_in(prompt);
     if paths.is_empty() {
