@@ -100,6 +100,8 @@ the default asynchronous `post_create` work before its completion event; a
 post-create job before returning, while daemon creation reports the existing
 worktree response and completes post-create asynchronously.
 
+`thegn wt new <name> --exact-branch` uses `<name>` verbatim as the branch (no configured prefix or numbering) and refuses an existing branch.
+
 ## Lifecycle and sessions
 
 `pre_destroy` runs before provider teardown and git removal, and `post_destroy`
