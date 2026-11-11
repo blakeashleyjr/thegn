@@ -154,6 +154,9 @@
           notificationsGithubMentions = false;
           notificationsAgentAttentionInbox = true;
           notificationsMergeQueueHoldDesktop = true;
+          notificationsDndEnabled = true;
+          notificationsSoundMute = true;
+          notificationsSoundSuppressFocused = false;
           activityEnabled = false;
           activityRedRequiresAgent = false;
           activityAgentPrograms = ["claude" "my-agent"];
