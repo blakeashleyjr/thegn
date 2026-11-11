@@ -421,6 +421,21 @@ pub fn typed_kind_refusal(
     }
 }
 
+/// The typed trust class a row with this stage/artifact pair belongs to (mirrors
+/// the v110 migration CASE): a non-blank stage with a non-blank artifact is
+/// "stage"; a non-blank stage with a blank artifact is "legacy_held" (never
+/// plain); no stage is "plain".
+pub fn classify_dispatch_kind(stage: Option<&str>, artifact: Option<&str>) -> &'static str {
+    let blank = |v: Option<&str>| v.is_none_or(|s| s.trim().is_empty());
+    if blank(stage) {
+        "plain"
+    } else if blank(artifact) {
+        "legacy_held"
+    } else {
+        "stage"
+    }
+}
+
 /// One row a wake step can wait on: its roster id, the daemon session whose
 /// exit is the thing waited for, and the stage/issue context a wake message
 /// needs to say what woke and why.
@@ -888,6 +903,19 @@ mod tests {
             typed_kind_refusal(Some("stage"), Some("code"), Some("a.md")),
             None
         );
+    }
+
+    #[test]
+    fn classify_kind_matches_the_migration_rules() {
+        assert_eq!(classify_dispatch_kind(None, None), "plain");
+        assert_eq!(classify_dispatch_kind(None, Some("a.md")), "plain");
+        assert_eq!(classify_dispatch_kind(Some("code"), Some("a.md")), "stage");
+        assert_eq!(classify_dispatch_kind(Some("code"), None), "legacy_held");
+        assert_eq!(
+            classify_dispatch_kind(Some("code"), Some("  ")),
+            "legacy_held"
+        );
+        assert_eq!(classify_dispatch_kind(Some("  "), Some("a.md")), "plain");
     }
 
     #[test]
