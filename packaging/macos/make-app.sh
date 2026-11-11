@@ -171,6 +171,93 @@ mkdir -p "$dest"
 dest="$(cd -P -- "$dest" && pwd -P)"
 app="$dest/$name.app"
 
+staging=""
+old=""
+lock=""
+lock_held=0
+cleanup() {
+  if ((lock_held)); then
+    rm -f -- "$lock/pid"
+    rmdir -- "$lock" 2>/dev/null || true
+  fi
+  if [[ -n $staging && -e $staging ]]; then
+    rm -rf -- "$staging"
+  fi
+  if [[ -n $old && -d $old && ! -e $old/app ]]; then
+    rmdir "$old" 2>/dev/null || true
+  elif [[ -n $old && -e $old/app ]]; then
+    echo "make-app.sh: previous bundle remains at $old/app after rollback failure" >&2
+  fi
+}
+trap cleanup EXIT
+
+lock="$dest/.$name.app.lock"
+# Record our pid in a freshly created lock dir; fail closed (and drop the dir)
+# when the write fails, so a pid-less lock is never left behind by us.
+claim_lock() {
+  if ! printf '%s\n' "$$" >"$lock/pid"; then
+    echo "make-app.sh: cannot record pid in lock $lock" >&2
+    rm -f -- "$lock/pid"
+    rmdir -- "$lock" 2>/dev/null || true
+    return 1
+  fi
+  lock_held=1
+  return 0
+}
+# True when pid $1 exists: kill -0 succeeds, or fails with EPERM (another
+# user's process is still a live holder).
+pid_is_alive() {
+  local err
+  if err="$(kill -0 "$1" 2>&1)"; then
+    return 0
+  fi
+  [[ $err == *[Nn]ot\ permitted* || $err == *EPERM* ]]
+}
+acquire_lock() {
+  if mkdir -- "$lock" 2>/dev/null; then
+    claim_lock
+    return
+  fi
+  local holder=""
+  if [[ -f $lock/pid && ! -L $lock/pid ]]; then
+    holder="$(head -c 32 -- "$lock/pid" 2>/dev/null | tr -d '[:space:]')" || holder=""
+  fi
+  if [[ $holder =~ ^[0-9]+$ ]]; then
+    if pid_is_alive "$holder"; then
+      echo "make-app.sh: another make-app.sh (pid $holder) is generating $app (lock $lock)" >&2
+      return 1
+    fi
+    # The holder is gone: reclaim atomically. Renaming the stale lock dir to a
+    # name unique to this run means exactly one reclaimer wins the rename; the
+    # losers see ENOENT and give up, so two runs can never both take the lock.
+    local stale="$lock.stale.$$"
+    if ! mv -- "$lock" "$stale" 2>/dev/null; then
+      echo "make-app.sh: lost the race to reclaim a stale lock: $lock" >&2
+      return 1
+    fi
+    # We must have renamed the dead holder's lock, not a live run's fresh one.
+    local renamed=""
+    if [[ -f $stale/pid && ! -L $stale/pid ]]; then
+      renamed="$(head -c 32 -- "$stale/pid" 2>/dev/null | tr -d '[:space:]')" || renamed=""
+    fi
+    if [[ $renamed != "$holder" ]]; then
+      mv -n -- "$stale" "$lock" 2>/dev/null || true
+      echo "make-app.sh: lock $lock changed hands while reclaiming; retry" >&2
+      return 1
+    fi
+    rm -rf -- "$stale"
+    if mkdir -- "$lock" 2>/dev/null; then
+      claim_lock
+      return
+    fi
+    echo "make-app.sh: lost the race to reclaim a stale lock: $lock" >&2
+    return 1
+  fi
+  echo "make-app.sh: lock $lock exists without a valid pid; if no make-app.sh is running, remove it and retry" >&2
+  return 1
+}
+acquire_lock || exit 1
+
 if [[ -L $app ]]; then
   echo "make-app.sh: app bundle is a symlink: $app" >&2
   exit 1
@@ -191,20 +278,6 @@ if [[ -e $app ]]; then
     fi
   fi
 fi
-
-staging=""
-old=""
-cleanup() {
-  if [[ -n $staging && -e $staging ]]; then
-    rm -rf -- "$staging"
-  fi
-  if [[ -n $old && -d $old && ! -e $old/app ]]; then
-    rmdir "$old" 2>/dev/null || true
-  elif [[ -n $old && -e $old/app ]]; then
-    echo "make-app.sh: previous bundle remains at $old/app after rollback failure" >&2
-  fi
-}
-trap cleanup EXIT
 
 staging="$(mktemp -d "$dest/.$name.app.staging.XXXXXXXX")"
 mkdir -p "$staging/Contents/MacOS" "$staging/Contents/Resources"
