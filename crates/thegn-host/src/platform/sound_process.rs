@@ -148,18 +148,31 @@ mod tests {
 
     #[test]
     fn cancel_after_leader_exit_maps_to_exited() {
-        let dir = helper("sleep 30 & exit 3");
+        let marker_dir = tempfile::tempdir().unwrap();
+        let marker = marker_dir.path().join("ready");
+        let dir = helper(&format!("sleep 30 & : > '{}'; exit 3", marker.display()));
         let helper_path = dir.path().join("helper.sh");
         let program = helper_path.to_str().unwrap().to_owned();
         let cancellation = std::sync::Arc::new(AtomicBool::new(false));
         let signal = std::sync::Arc::clone(&cancellation);
         let canceller = std::thread::spawn(move || {
-            std::thread::sleep(Duration::from_millis(300));
+            let ready_deadline = std::time::Instant::now() + Duration::from_secs(30);
+            while !marker.exists() {
+                assert!(
+                    std::time::Instant::now() < ready_deadline,
+                    "helper never wrote its ready marker"
+                );
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            std::thread::sleep(Duration::from_millis(500));
             signal.store(true, std::sync::atomic::Ordering::Release);
         });
-        let result = run_bounded(&program, &[], &cancellation, Duration::from_secs(5));
+        let result = run_bounded(&program, &[], &cancellation, Duration::from_secs(30));
         canceller.join().unwrap();
-        assert!(matches!(result, SoundProcessOutcome::Exited(status) if status.code() == Some(3)));
+        assert!(
+            matches!(result, SoundProcessOutcome::Exited(status) if status.code() == Some(3)),
+            "{result:?}"
+        );
     }
 
     #[test]
