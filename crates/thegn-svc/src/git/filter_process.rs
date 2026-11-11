@@ -97,9 +97,10 @@ impl FilterProcess {
         };
         let (job_tx, job_rx) = mpsc::sync_channel(1);
         let (ready_tx, ready_rx) = mpsc::sync_channel(1);
-        let thread_result = thread::Builder::new()
-            .name("thegn-filter-io".into())
-            .spawn(move || serve_filter(stdin, stdout, job_rx, ready_tx, want));
+        let thread_result =
+            thegn_core::thread_name::try_spawn_named("thegn-filter-io", move || {
+                serve_filter(stdin, stdout, job_rx, ready_tx, want)
+            });
         if let Err(error) = thread_result {
             let reap = terminate_child(&mut child);
             return Err(FilterProcessError::Handshake {
