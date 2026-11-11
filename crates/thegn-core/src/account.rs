@@ -156,7 +156,9 @@ pub fn ensure_managed_home(provider_id: &str, name: &str) -> Result<PathBuf, Acc
 
 /// Establish the credential home for a NEW managed account. Unlike
 /// [`ensure_managed_home`], an existing entry at the canonical path is never
-/// adopted: it may hold a removed account's login.
+/// adopted: it may hold a removed account's login. Creation is a single
+/// exclusive mkdir, so exactly one of any number of concurrent creators of a
+/// name succeeds; the rest get [`AccountHomeError::HomeExists`].
 pub fn create_managed_home(provider_id: &str, name: &str) -> Result<PathBuf, AccountHomeError> {
     if provider(provider_id).is_none() {
         return Err(AccountHomeError::UnknownProvider {
@@ -164,18 +166,26 @@ pub fn create_managed_home(provider_id: &str, name: &str) -> Result<PathBuf, Acc
         });
     }
     let path = managed_dir(provider_id, name);
-    match std::fs::symlink_metadata(&path) {
-        Ok(_) => return Err(AccountHomeError::HomeExists { path }),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-        Err(error) => {
-            return Err(AccountHomeError::UnsafePath {
-                path,
-                error: error.to_string(),
-            });
+    let unsafe_path = |path: &Path, error: std::io::Error| AccountHomeError::UnsafePath {
+        path: path.to_path_buf(),
+        error: error.to_string(),
+    };
+    let anchor = util::xdg_state_home().join("thegn");
+    std::fs::create_dir_all(&anchor).map_err(|error| unsafe_path(&path, error))?;
+    let parent = crate::fsperm::ensure_private_dir_beneath(
+        &anchor,
+        &Path::new("accounts").join(provider_id),
+    )
+    .map_err(|error| unsafe_path(&path, error))?;
+    // The exclusive mkdir is the claim: it fails with AlreadyExists for a
+    // directory, file or (dangling) symlink, so only the creator proceeds.
+    match std::fs::create_dir(parent.path().join(home_component(name))) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+            return Err(AccountHomeError::HomeExists { path });
         }
+        Err(error) => return Err(unsafe_path(&path, error)),
     }
-    // The existence check and creation are separate operations; the rooted
-    // private-directory helper still refuses unsafe path components.
     ensure_managed_home_claiming(provider_id, name, &[])
 }
 
@@ -1884,5 +1894,55 @@ mod tests {
             create_managed_home("unknown", "acct1"),
             Err(AccountHomeError::UnknownProvider { provider }) if provider == "unknown"
         ));
+    }
+
+    #[test]
+    fn create_managed_home_exactly_one_concurrent_creator_wins() {
+        use std::sync::{Arc, Barrier};
+
+        let _state = crate::testenv::IsolatedState::new();
+        for round in 0..20 {
+            let name = format!("race{round}");
+            let barrier = Arc::new(Barrier::new(8));
+            let handles: Vec<_> = (0..8)
+                .map(|_| {
+                    let barrier = Arc::clone(&barrier);
+                    let name = name.clone();
+                    std::thread::spawn(move || {
+                        barrier.wait();
+                        create_managed_home("codex", &name)
+                    })
+                })
+                .collect();
+            let results: Vec<_> = handles.into_iter().map(|h| h.join().unwrap()).collect();
+            let wins: Vec<_> = results.iter().filter_map(|r| r.as_ref().ok()).collect();
+            assert_eq!(wins.len(), 1, "round {round}: {results:?}");
+            for result in &results {
+                assert!(
+                    matches!(result, Ok(_) | Err(AccountHomeError::HomeExists { .. })),
+                    "round {round}: {result:?}"
+                );
+            }
+            assert_eq!(
+                std::fs::read(wins[0].join(OWNER_MANIFEST)).unwrap(),
+                owner_manifest("codex", &name)
+            );
+        }
+    }
+
+    #[test]
+    fn create_managed_home_refuses_a_dangling_symlink_leaf() {
+        let _state = crate::testenv::IsolatedState::new();
+        std::fs::create_dir_all(managed_root().join("codex")).unwrap();
+        let target = Path::new("/nonexistent-thegn-target");
+        if crate::fsperm::create_symlink(target, &managed_dir("codex", "acct8"), false).is_err() {
+            return;
+        }
+
+        assert!(matches!(
+            create_managed_home("codex", "acct8"),
+            Err(AccountHomeError::HomeExists { .. })
+        ));
+        assert!(!target.exists());
     }
 }
