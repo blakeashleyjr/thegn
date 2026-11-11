@@ -9,6 +9,7 @@ const MAX_LANES: usize = 64;
 pub struct BatchLane {
     pub name: String,
     pub base: Option<String>,
+    pub line: usize,
 }
 
 /// A malformed batch file, retaining the source line where possible.
@@ -84,6 +85,7 @@ pub fn parse_batch(text: &str) -> Result<Vec<BatchLane>, BatchError> {
         lanes.push(BatchLane {
             name: name.to_string(),
             base,
+            line: line_number,
         });
     }
 
@@ -105,10 +107,12 @@ mod tests {
                 super::BatchLane {
                     name: "alpha".into(),
                     base: None,
+                    line: 3,
                 },
                 super::BatchLane {
                     name: "beta".into(),
                     base: Some("release/1".into()),
+                    line: 4,
                 },
             ]
         );
@@ -137,5 +141,30 @@ mod tests {
             parse_batch(&many),
             Err(BatchError::TooMany { line: 65, max: 64 })
         ));
+    }
+
+    #[test]
+    fn displays_every_batch_error_variant() {
+        assert_eq!(
+            BatchError::Empty.to_string(),
+            "batch file contains no lanes"
+        );
+        assert_eq!(
+            BatchError::TooMany { line: 65, max: 64 }.to_string(),
+            "line 65: batch file has more than 64 lanes"
+        );
+        assert_eq!(
+            BatchError::Duplicate {
+                line: 4,
+                first: 2,
+                name: "lane".into(),
+            }
+            .to_string(),
+            "line 4: duplicate lane name \"lane\" (first used on line 2)"
+        );
+        assert_eq!(
+            BatchError::ExtraToken { line: 7 }.to_string(),
+            "line 7: expected a lane name and optional base"
+        );
     }
 }

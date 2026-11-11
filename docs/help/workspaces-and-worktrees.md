@@ -105,7 +105,9 @@ worktree response and completes post-create asynchronously.
 `thegn wt new --batch lanes.txt` creates several worktrees sequentially. Each
 non-blank, non-comment line contains `<name>` or `<name> <base>`; a per-line
 base overrides `--base`. Batch files accept at most 64 lanes, and
-`--exact-branch` makes each name a verbatim branch name.
+`--exact-branch` makes each name a verbatim branch name. In JSON output, a
+lane whose worktree was created but whose folder filing failed appears in both
+`created` and `failed`.
 
 ## Lifecycle and sessions
 

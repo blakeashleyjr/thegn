@@ -32,7 +32,7 @@ pub(crate) struct BatchOptions {
     pub(crate) json: bool,
 }
 
-/// Run one batch, validating all lane names before the first checkout.
+/// Run one batch, validating all lanes before the first checkout.
 pub(crate) fn run(
     cfg: &Config,
     file: &str,
@@ -53,8 +53,17 @@ pub(crate) fn run(
     let lanes = thegn_core::wt_batch::parse_batch(&text)
         .with_context(|| format!("parsing batch file {}", path.display()))?;
     let root = resolve_root(repo.as_deref())?;
-    validate_names(&root, cfg, &lanes, exact_branch)
-        .with_context(|| format!("validating batch file {}", path.display()))?;
+    validate_names(
+        &root,
+        cfg,
+        &lanes,
+        exact_branch,
+        base.as_deref(),
+        env.as_deref(),
+        profile.as_deref(),
+        folder.as_deref(),
+    )
+    .with_context(|| format!("validating batch file {}", path.display()))?;
 
     let mut output = BatchOutput {
         created: Vec::with_capacity(lanes.len()),
@@ -146,14 +155,63 @@ fn validate_names(
     cfg: &Config,
     lanes: &[thegn_core::wt_batch::BatchLane],
     exact_branch: bool,
+    base: Option<&str>,
+    env: Option<&str>,
+    profile: Option<&str>,
+    folder: Option<&str>,
 ) -> Result<()> {
-    let taken = BranchSet::load_checked(root).map_err(anyhow::Error::msg)?;
+    let first_lane = &lanes[0];
+    if let Some(profile) = profile {
+        thegn_core::sandbox_pin::parse_pin(profile)
+            .map_err(|error| lane_error(first_lane, error))?;
+    }
+    if let Some(folder) = folder {
+        wt::validate_folder_name(folder).map_err(|error| lane_error(first_lane, error))?;
+    }
+    if let Some(env) = env
+        && env != "default"
+        && !cfg.env.contains_key(env)
+    {
+        let mut known: Vec<&str> = cfg.env.keys().map(String::as_str).collect();
+        known.sort_unstable();
+        return Err(lane_error(
+            first_lane,
+            format!(
+                "no [env.{env}] defined (known: default{}{})",
+                if known.is_empty() { "" } else { ", " },
+                known.join(", ")
+            ),
+        ));
+    }
+
+    let default_base = match base.filter(|base| !base.trim().is_empty()) {
+        Some(base) => base.to_string(),
+        None => thegn_core::worktree::resolve_base_checked(root, cfg)
+            .map_err(|error| lane_error(first_lane, error))?,
+    };
+    let mut checked_bases = std::collections::HashSet::new();
+    for lane in lanes {
+        let effective_base = lane.base.as_deref().unwrap_or(&default_base);
+        if checked_bases.insert(effective_base) {
+            if !wt::base_has_commits(root, effective_base)
+                .map_err(|error| lane_error(lane, error))?
+            {
+                return Err(lane_error(
+                    lane,
+                    format!("'{effective_base}' has no commits yet — make an initial commit first"),
+                ));
+            }
+        }
+    }
+
+    let taken = BranchSet::load_checked(root).map_err(|error| lane_error(first_lane, error))?;
     let mut planned = Vec::with_capacity(lanes.len());
-    for (index, lane) in lanes.iter().enumerate() {
+    for lane in lanes {
         let branch = if exact_branch {
             wt::exact_branch_name(Some(&lane.name), |candidate| {
                 branch_taken(candidate, &taken, &planned)
-            })?
+            })
+            .map_err(|error| lane_error(lane, error))?
         } else {
             let base = worktree::human_base(&lane.name, cfg);
             let mut candidate = base.clone();
@@ -162,15 +220,23 @@ fn validate_names(
                 suffix += 1;
                 candidate = format!("{base}-{suffix}");
             }
-            thegn_core::git_operand::branch_name(&candidate)?;
+            thegn_core::git_operand::branch_name(&candidate)
+                .map_err(|error| lane_error(lane, error))?;
             candidate
         };
         if planned.iter().any(|candidate| candidate == &branch) {
-            anyhow::bail!("line {}: branch '{branch}' is duplicated", index + 1);
+            return Err(lane_error(lane, format!("branch '{branch}' is duplicated")));
         }
         planned.push(branch);
     }
     Ok(())
+}
+
+fn lane_error(
+    lane: &thegn_core::wt_batch::BatchLane,
+    error: impl std::fmt::Display,
+) -> anyhow::Error {
+    anyhow::anyhow!("line {}: {}: {error}", lane.line, lane.name)
 }
 
 fn branch_taken(candidate: &str, taken: &BranchSet, planned: &[String]) -> bool {
@@ -212,13 +278,27 @@ mod tests {
             thegn_core::wt_batch::BatchLane {
                 name: "good".into(),
                 base: None,
+                line: 1,
             },
             thegn_core::wt_batch::BatchLane {
                 name: "bad..name".into(),
                 base: None,
+                line: 2,
             },
         ];
-        assert!(validate_names(repo.path(), &Config::default(), &lanes, true).is_err());
+        assert!(
+            validate_names(
+                repo.path(),
+                &Config::default(),
+                &lanes,
+                true,
+                None,
+                None,
+                None,
+                None
+            )
+            .is_err()
+        );
         drop(state);
     }
 
@@ -282,6 +362,183 @@ mod tests {
             thegn_core::util::git_out(repo.path(), &["worktree", "list"]).unwrap_or_default();
         assert_eq!(worktrees.lines().count(), 1, "{worktrees}");
         assert!(!repo.path().join("checkouts").exists());
+        drop(state);
+    }
+
+    #[test]
+    fn invalid_batch_base_creates_no_worktree() {
+        let state = crate::testenv::IsolatedState::new();
+        let repo = tempfile::tempdir().unwrap();
+        for args in [
+            &[
+                "-c",
+                "commit.gpgsign=false",
+                "-c",
+                "user.name=test",
+                "-c",
+                "user.email=test@example.invalid",
+                "init",
+                "-q",
+                "-b",
+                "main",
+            ][..],
+            &[
+                "-c",
+                "commit.gpgsign=false",
+                "-c",
+                "user.name=test",
+                "-c",
+                "user.email=test@example.invalid",
+                "commit",
+                "--allow-empty",
+                "-q",
+                "-m",
+                "init",
+            ],
+        ] {
+            assert!(thegn_core::util::git_ok(repo.path(), args));
+        }
+        let lanes = repo.path().join("lanes.txt");
+        std::fs::write(&lanes, "good\nlast no-such-base\n").unwrap();
+        let cfg = Config {
+            worktrees_dir: repo.path().join("checkouts").display().to_string(),
+            ..Config::default()
+        };
+        let before = thegn_core::util::git_out(repo.path(), &["worktree", "list"]).unwrap();
+        assert!(
+            run(
+                &cfg,
+                &lanes.display().to_string(),
+                BatchOptions {
+                    repo: Some(repo.path().display().to_string()),
+                    base: None,
+                    env: None,
+                    profile: None,
+                    exact_branch: true,
+                    folder: None,
+                    json: false,
+                },
+                Path::new("."),
+            )
+            .is_err()
+        );
+        let after = thegn_core::util::git_out(repo.path(), &["worktree", "list"]).unwrap();
+        assert_eq!(before, after);
+        assert!(!repo.path().join("checkouts").exists());
+        drop(state);
+    }
+
+    #[test]
+    fn validation_errors_use_batch_source_lines() {
+        let state = crate::testenv::IsolatedState::new();
+        let repo = tempfile::tempdir().unwrap();
+        for args in [
+            &[
+                "-c",
+                "commit.gpgsign=false",
+                "-c",
+                "user.name=test",
+                "-c",
+                "user.email=test@example.invalid",
+                "init",
+                "-q",
+                "-b",
+                "main",
+            ][..],
+            &[
+                "-c",
+                "commit.gpgsign=false",
+                "-c",
+                "user.name=test",
+                "-c",
+                "user.email=test@example.invalid",
+                "commit",
+                "--allow-empty",
+                "-q",
+                "-m",
+                "init",
+            ],
+        ] {
+            assert!(thegn_core::util::git_ok(repo.path(), args));
+        }
+        let lanes =
+            thegn_core::wt_batch::parse_batch("# comment\n\nvalid\ninvalid..name\n").unwrap();
+        let error = validate_names(
+            repo.path(),
+            &Config::default(),
+            &lanes,
+            true,
+            None,
+            None,
+            None,
+            None,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("line 4: invalid..name:"), "{error}");
+        drop(state);
+    }
+
+    #[test]
+    fn batch_options_are_validated_before_branch_planning() {
+        let state = crate::testenv::IsolatedState::new();
+        let repo = tempfile::tempdir().unwrap();
+        for args in [
+            &[
+                "-c",
+                "commit.gpgsign=false",
+                "-c",
+                "user.name=test",
+                "-c",
+                "user.email=test@example.invalid",
+                "init",
+                "-q",
+                "-b",
+                "main",
+            ][..],
+            &[
+                "-c",
+                "commit.gpgsign=false",
+                "-c",
+                "user.name=test",
+                "-c",
+                "user.email=test@example.invalid",
+                "commit",
+                "--allow-empty",
+                "-q",
+                "-m",
+                "init",
+            ],
+        ] {
+            assert!(thegn_core::util::git_ok(repo.path(), args));
+        }
+        let lanes = thegn_core::wt_batch::parse_batch("lane\n").unwrap();
+
+        for (env, profile, folder, expected) in [
+            (Some("missing"), None, None, "no [env.missing] defined"),
+            (
+                None,
+                Some("open"),
+                None,
+                "open is a config-only escape hatch",
+            ),
+            (None, None, Some("   "), "folder name cannot be empty"),
+        ] {
+            let error = validate_names(
+                repo.path(),
+                &Config::default(),
+                &lanes,
+                true,
+                None,
+                env,
+                profile,
+                folder,
+            )
+            .unwrap_err()
+            .to_string();
+            assert!(error.contains(expected), "{error}");
+            assert!(error.starts_with("line 1: lane:"), "{error}");
+        }
         drop(state);
     }
 
