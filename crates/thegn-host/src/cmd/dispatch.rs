@@ -2093,17 +2093,21 @@ fn verify_facts_with_report_head(
     // Lead's artifact read at whatever the worker pointed it at — the gate
     // must not bless that as a handoff. (It reads as `exists=false`, the same
     // refusal as a missing file; `--force` remains the deliberate override.
-    // A symlink on an *intermediate* component is held by `tracked`: `git
-    // ls-files` matches index paths, and paths under a linked directory are
-    // not in the index.)
-    let exists = wt
-        .join(&artifact)
-        .symlink_metadata()
-        .is_ok_and(|m| m.is_file());
-    let artifact_empty = wt
-        .join(&artifact)
-        .symlink_metadata()
-        .is_ok_and(|m| m.is_file() && m.len() == 0);
+    // A symlink on an *intermediate* component is refused directly by
+    // `artifact_chain_is_plain`; `tracked` is the second line of defence:
+    // `git ls-files` matches index paths, and paths under a linked directory
+    // are not in the index.)
+    let chain_ok = artifact_chain_is_plain(wt, &artifact);
+    let exists = chain_ok
+        && wt
+            .join(&artifact)
+            .symlink_metadata()
+            .is_ok_and(|m| m.is_file());
+    let artifact_empty = chain_ok
+        && wt
+            .join(&artifact)
+            .symlink_metadata()
+            .is_ok_and(|m| m.is_file() && m.len() == 0);
     let artifact_content = if row.stage.is_some() && exists {
         read_artifact_content(&wt.join(&artifact))
     } else {
@@ -2218,6 +2222,33 @@ fn read_artifact_content(path: &std::path::Path) -> pipeline_run::ArtifactConten
     }
     let over_limit = bytes.len() as u64 > pipeline_run::ARTIFACT_MAX_BYTES;
     pipeline_run::classify_artifact_bytes(&bytes, over_limit)
+}
+
+/// True when every directory component between the worktree and the artifact's
+/// final component is a real directory (no symlink) and the artifact path is
+/// relative without `..`; the final component is judged separately by the
+/// callers.
+fn artifact_chain_is_plain(wt: &std::path::Path, artifact: &str) -> bool {
+    use std::path::Component;
+
+    let components: Vec<Component<'_>> = std::path::Path::new(artifact).components().collect();
+    if components.is_empty()
+        || components
+            .iter()
+            .any(|c| !matches!(c, Component::Normal(_)))
+    {
+        return false;
+    }
+    let mut cur = wt.to_path_buf();
+    for component in &components[..components.len() - 1] {
+        cur.push(component.as_os_str());
+        // A symlink reports `is_symlink`, not `is_dir`, so this refuses links
+        // and missing directories alike.
+        if !cur.symlink_metadata().is_ok_and(|m| m.file_type().is_dir()) {
+            return false;
+        }
+    }
+    true
 }
 
 /// Return Some(true/false) for Git exit 0/1, bounded by GITLOC_READ_DEADLINE;
@@ -4934,6 +4965,80 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(err.contains("does not exist"), "{err}");
+    }
+
+    #[test]
+    fn artifact_chain_accepts_plain_directories() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join(".thegn/pipeline/linear-X/code")).unwrap();
+        assert!(artifact_chain_is_plain(
+            dir.path(),
+            ".thegn/pipeline/linear-X/code/1.md"
+        ));
+        assert!(artifact_chain_is_plain(dir.path(), "handoff.md"));
+    }
+
+    #[test]
+    fn artifact_chain_refuses_a_symlinked_parent() {
+        if !crate::platform::test_symlink_supported() {
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let elsewhere = dir.path().join("elsewhere");
+        std::fs::create_dir_all(elsewhere.join("pipeline/linear-X")).unwrap();
+        std::fs::write(elsewhere.join("x.md"), "x").unwrap();
+        let root = dir.path().join("wt");
+        std::fs::create_dir_all(&root).unwrap();
+        crate::platform::test_symlink(&elsewhere, &root.join(".thegn")).unwrap();
+        assert!(!artifact_chain_is_plain(&root, ".thegn/x.md"));
+
+        // A link at an inner level is refused too.
+        let root2 = dir.path().join("wt2");
+        std::fs::create_dir_all(root2.join(".thegn/pipeline")).unwrap();
+        crate::platform::test_symlink(&elsewhere, &root2.join(".thegn/pipeline/linear-X")).unwrap();
+        assert!(!artifact_chain_is_plain(
+            &root2,
+            ".thegn/pipeline/linear-X/code/1.md"
+        ));
+    }
+
+    #[test]
+    fn artifact_chain_refuses_traversal_and_absolute_paths() {
+        let dir = tempfile::tempdir().unwrap();
+        for bad in ["../x.md", "/etc/passwd", "a/../b.md", "./a.md", ""] {
+            assert!(!artifact_chain_is_plain(dir.path(), bad), "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn artifact_chain_verify_facts_reports_absent_through_a_symlinked_parent() {
+        // Real directories: the file is seen (runs everywhere).
+        let dir = tempfile::tempdir().unwrap();
+        let real = dir.path().join("real");
+        let file = real.join(ARTIFACT);
+        std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+        std::fs::write(&file, "# handoff").unwrap();
+        assert!(verify_facts(&row_in(&real, Some(ARTIFACT))).exists);
+
+        if !crate::platform::test_symlink_supported() {
+            return;
+        }
+        let elsewhere = dir.path().join("elsewhere");
+        let moved = elsewhere.join("pipeline/THE-76/code/7.md");
+        std::fs::create_dir_all(moved.parent().unwrap()).unwrap();
+        std::fs::write(&moved, "# handoff").unwrap();
+        let root = dir.path().join("wt");
+        std::fs::create_dir_all(&root).unwrap();
+        crate::platform::test_symlink(&elsewhere, &root.join(".thegn")).unwrap();
+        let facts = verify_facts(&row_in(&root, Some(ARTIFACT)));
+        assert!(
+            !facts.exists,
+            "an artifact behind a symlinked parent is absent"
+        );
+        assert_eq!(
+            facts.artifact_content,
+            pipeline_run::ArtifactContent::NotRead
+        );
     }
 
     #[test]
