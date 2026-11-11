@@ -753,21 +753,50 @@ pub struct FolderAssignReq {
     pub clear: bool,
 }
 
-/// Query for `worktrees.sandbox_profile`: which worktree's pin to read.
+/// Query for `worktrees.sandbox_profile`: which worktree's pin to read. The
+/// path is matched exactly as registered (no canonicalization).
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct SandboxProfileQuery {
-    /// Absolute path of a registered worktree.
+    /// Absolute path of a registered worktree, exactly as registered.
     pub worktree: String,
 }
 
 /// Pin or clear a worktree's sandbox profile (`worktrees.sandbox_profile_set`).
+/// Clearing is always explicit (`clear: true`), and unknown keys are refused, so
+/// a misspelled `profile` can never silently clear a pin. The path is matched
+/// exactly as registered (no canonicalization).
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct SandboxProfileSetReq {
-    /// Absolute path of a registered worktree.
+    /// Absolute path of a registered worktree, exactly as registered.
     pub worktree: String,
-    /// `standard` or `sealed`; absent or null clears the pin.
+    /// `standard` or `sealed`. Mutually exclusive with `clear`.
     #[serde(default)]
     pub profile: Option<String>,
+    /// `true` to clear the pin (the configured policy applies again). Mutually
+    /// exclusive with `profile`.
+    #[serde(default)]
+    pub clear: bool,
+}
+
+impl SandboxProfileSetReq {
+    /// Exactly one of `{profile: Some, clear: true}` is valid. `Ok(Some(p))`
+    /// pins `p`, `Ok(None)` clears.
+    pub fn action(&self) -> ControlResult<Option<&str>> {
+        match (self.profile.as_deref(), self.clear) {
+            (Some(profile), false) => Ok(Some(profile)),
+            (None, true) => Ok(None),
+            (Some(_), true) => Err(ControlError::InvalidArgument(
+                "worktrees.sandbox_profile_set takes either `profile` or `clear: true`, not both"
+                    .into(),
+            )),
+            (None, false) => Err(ControlError::InvalidArgument(
+                "worktrees.sandbox_profile_set needs `profile` (pin) or `clear: true` (clear)"
+                    .into(),
+            )),
+        }
+    }
 }
 
 /// A worktree's pinned sandbox profile; `profile` is null when nothing is

@@ -2553,3 +2553,37 @@ async fn plugins_status_route_requires_read_scope_and_serves_the_api_result() {
     );
     assert_eq!(api.calls.load(std::sync::atomic::Ordering::Relaxed), 1);
 }
+
+async fn post_sandbox_profile_set(r: &Rig, bearer: &str, body: &'static str) -> StatusCode {
+    let req = Request::builder()
+        .method("POST")
+        .uri("/v1/worktrees/sandbox-profile/set")
+        .header("authorization", format!("Bearer {bearer}"))
+        .header("content-type", "application/json")
+        .body(Body::from(body))
+        .unwrap();
+    router(r.state.clone()).oneshot(req).await.unwrap().status()
+}
+
+#[tokio::test]
+async fn sandbox_profile_set_shape_is_strict_and_clearing_is_explicit() {
+    let r = rig(false);
+    let admin = token(&r, "admin");
+    for body in [
+        // A misspelled key must never clear the pin.
+        r#"{"worktree":"/w","profle":"sealed"}"#,
+        // Neither `profile` nor `clear: true`.
+        r#"{"worktree":"/w"}"#,
+        // Both.
+        r#"{"worktree":"/w","profile":"sealed","clear":true}"#,
+    ] {
+        let status = post_sandbox_profile_set(&r, &admin, body).await;
+        assert!(status.is_client_error(), "{body} -> {status}");
+    }
+    assert!(r.api.calls().is_empty());
+    assert_eq!(
+        post_sandbox_profile_set(&r, &admin, r#"{"worktree":"/w","clear":true}"#).await,
+        StatusCode::OK
+    );
+    assert_eq!(r.api.calls(), ["sandbox_profile_set:/w:None"]);
+}

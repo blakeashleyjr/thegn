@@ -1244,8 +1244,16 @@ pub(super) async fn set_worktree_sandbox_profile(
     headers: HeaderMap,
     body: axum::Json<super::SandboxProfileSetReq>,
 ) -> Response {
-    if let Err(r) = authed(&state, &headers, Verb::WorktreeSandboxProfileSet) {
+    if let Err(r) = authed_target(
+        &state,
+        &headers,
+        Verb::WorktreeSandboxProfileSet,
+        &body.0.worktree,
+    ) {
         return r;
+    }
+    if let Err(e) = body.0.action() {
+        return e.into_response();
     }
     match state.api.set_worktree_sandbox_profile(body.0).await {
         Ok(reply) => axum::Json(reply).into_response(),

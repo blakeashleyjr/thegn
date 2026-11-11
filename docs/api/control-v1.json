@@ -1666,10 +1666,11 @@
       "type": "object"
     },
     "SandboxProfileQuery": {
-      "description": "Query for `worktrees.sandbox_profile`: which worktree's pin to read.",
+      "additionalProperties": false,
+      "description": "Query for `worktrees.sandbox_profile`: which worktree's pin to read. The path is matched exactly as registered (no canonicalization).",
       "properties": {
         "worktree": {
-          "description": "Absolute path of a registered worktree.",
+          "description": "Absolute path of a registered worktree, exactly as registered.",
           "type": "string"
         }
       },
@@ -1699,18 +1700,24 @@
       "type": "object"
     },
     "SandboxProfileSetReq": {
-      "description": "Pin or clear a worktree's sandbox profile (`worktrees.sandbox_profile_set`).",
+      "additionalProperties": false,
+      "description": "Pin or clear a worktree's sandbox profile (`worktrees.sandbox_profile_set`). Clearing is always explicit (`clear: true`), and unknown keys are refused, so a misspelled `profile` can never silently clear a pin. The path is matched exactly as registered (no canonicalization).",
       "properties": {
+        "clear": {
+          "default": false,
+          "description": "`true` to clear the pin (the configured policy applies again). Mutually exclusive with `profile`.",
+          "type": "boolean"
+        },
         "profile": {
           "default": null,
-          "description": "`standard` or `sealed`; absent or null clears the pin.",
+          "description": "`standard` or `sealed`. Mutually exclusive with `clear`.",
           "type": [
             "string",
             "null"
           ]
         },
         "worktree": {
-          "description": "Absolute path of a registered worktree.",
+          "description": "Absolute path of a registered worktree, exactly as registered.",
           "type": "string"
         }
       },
