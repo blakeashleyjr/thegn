@@ -1518,9 +1518,25 @@ mod tests {
             p,
         );
         assert_eq!(r.generation, scope_generation(&r.scope_key));
+        let key = DrawerPoolKey::worktree(p, FILES_OCCUPANT_ID);
         let (mut panes, mut runtime) = forget_fixture();
-        runtime.forget_worktree_panes(p, &mut panes);
-        assert_ne!(r.generation, scope_generation(&r.scope_key));
+        runtime.prewarming.insert(key.clone());
+        runtime.apply_result(
+            &thegn_core::config::Config::default(),
+            r,
+            Err("boom".into()),
+            p,
+            &mut panes,
+            Rect {
+                x: 0,
+                y: 0,
+                cols: 80,
+                rows: 24,
+            },
+        );
+        // A current request is processed, not dropped: its prewarm marker is
+        // consumed (the stale-result test above shows a dropped one keeps it).
+        assert!(!runtime.prewarming.contains(&key));
     }
 
     #[test]
