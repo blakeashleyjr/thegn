@@ -868,9 +868,7 @@ impl Db {
                 reason: ParentEdgeReason::Missing,
             }));
         };
-        if crate::pipeline_run::issue_key(&parent_issue)
-            != crate::pipeline_run::issue_key(child_issue)
-        {
+        if !crate::pipeline_identity::same_issue(&parent_issue, child_issue) {
             return Err(anyhow::Error::new(ParentDispatchConflict {
                 parent_id,
                 reason: ParentEdgeReason::CrossIssue,
@@ -3544,6 +3542,72 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn parent_edge_issue_providers_stay_distinct() {
+        let (db, _dir) = temp_db();
+        let parent = put_row(&db, "jira:X-1", "/wt/x");
+        let reason = |error: &anyhow::Error| {
+            error
+                .downcast_ref::<ParentDispatchConflict>()
+                .map(|conflict| conflict.reason)
+        };
+
+        let mut child = crate::issue::NewDispatch::new("linear:X-1", "/wt/y", "coder");
+        child.parent_id = Some(parent);
+        let error = db.put_dispatch_with_parent_check(child).unwrap_err();
+        assert_eq!(
+            reason(&error),
+            Some(ParentEdgeReason::CrossIssue),
+            "{error}"
+        );
+
+        let mut child = crate::issue::NewDispatch::new("linear:X-1", "/wt/y", "coder");
+        child.stage = Some("code");
+        child.parent_id = Some(parent);
+        let error = db
+            .claim_dispatch_admitted(child, 10, None, None, None)
+            .unwrap_err();
+        assert_eq!(
+            reason(&error),
+            Some(ParentEdgeReason::CrossIssue),
+            "{error}"
+        );
+
+        assert_eq!(db.list_dispatches().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn parent_edge_issue_case_and_prefix_aliases_are_one_issue() {
+        let (db, _dir) = temp_db();
+        let parent = put_row(&db, "linear:the-74", "/wt/a");
+        for (issue, wt) in [
+            ("THE-74", "/wt/c1"),
+            ("LINEAR:THE-74", "/wt/c2"),
+            ("linear:The-74", "/wt/c3"),
+        ] {
+            let mut child = crate::issue::NewDispatch::new(issue, wt, "coder");
+            child.parent_id = Some(parent);
+            let result = db.put_dispatch_with_parent_check(child);
+            assert!(result.is_ok(), "{issue}: {:?}", result.err());
+        }
+    }
+
+    #[test]
+    fn parent_edge_issue_different_key_still_cross_issue() {
+        let (db, _dir) = temp_db();
+        let parent = put_row(&db, "linear:A-1", "/wt/a");
+        let mut child = crate::issue::NewDispatch::new("linear:A-2", "/wt/b", "coder");
+        child.parent_id = Some(parent);
+        let error = db.put_dispatch_with_parent_check(child).unwrap_err();
+        assert_eq!(
+            error
+                .downcast_ref::<ParentDispatchConflict>()
+                .map(|conflict| conflict.reason),
+            Some(ParentEdgeReason::CrossIssue),
+            "{error}"
+        );
     }
 
     #[test]
