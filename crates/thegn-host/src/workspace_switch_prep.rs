@@ -1,6 +1,7 @@
 //! DB-writer preparation and loop-side fencing for workspace switches.
 
 use crate::session::{PreparedWorkspaceSwitch, Session};
+use thegn_core::store::WorkspaceStore;
 
 type WorktreeRegistryRow = (String, String, String);
 type ConnectRegistry = (Vec<WorktreeRegistryRow>, Vec<String>);
