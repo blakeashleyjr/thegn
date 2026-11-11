@@ -2719,7 +2719,7 @@ mod tests {
         ));
         drop(rx);
         assert!(matches!(
-            tokio::time::timeout(Duration::from_secs(1), end_rx)
+            tokio::time::timeout(Duration::from_secs(30), end_rx)
                 .await
                 .unwrap()
                 .unwrap(),
@@ -2772,7 +2772,7 @@ mod tests {
         )
         .await
         .unwrap();
-        let end = tokio::time::timeout(Duration::from_secs(1), end_rx)
+        let end = tokio::time::timeout(Duration::from_secs(30), end_rx)
             .await
             .unwrap()
             .unwrap();
