@@ -25,11 +25,16 @@ pub struct Commit {
 
 /// Parse the eight NUL-delimited fields emitted by
 /// `git log -z --format=%H%x00%h%x00%an%x00%ae%x00%ct%x00%P%x00%D%x00%s`.
-/// Exactly one final empty chunk is accepted as the record terminator.
+/// Every record, including the last, must end with NUL; output that does not
+/// is truncated and is rejected as a whole.
 pub fn parse_commits(out: &str) -> anyhow::Result<Vec<Commit>> {
     if out.is_empty() {
         return Ok(Vec::new());
     }
+    anyhow::ensure!(
+        out.ends_with('\0'),
+        "malformed commit record: missing final NUL terminator"
+    );
     let mut fields: Vec<&str> = out.split('\0').collect();
     if fields.last() == Some(&"") {
         fields.pop();
@@ -211,12 +216,17 @@ pub struct StashEntry {
 
 /// Parse the four NUL-delimited fields emitted by
 /// `git stash list -z --format=%gd%x00%H%x00%ct%x00%gs`. `%gd` is the
-/// selector "stash@{N}"; exactly one final empty chunk is accepted as the
-/// record terminator. Any malformed row makes the complete parse fail.
+/// selector "stash@{N}"; every record, including the last, must end with NUL;
+/// output that does not is truncated and is rejected as a whole. Any
+/// malformed row makes the complete parse fail.
 pub fn parse_stashes(out: &str) -> anyhow::Result<Vec<StashEntry>> {
     if out.is_empty() {
         return Ok(Vec::new());
     }
+    anyhow::ensure!(
+        out.ends_with('\0'),
+        "malformed stash record: missing final NUL terminator"
+    );
     let mut fields: Vec<&str> = out.split('\0').collect();
     if fields.last() == Some(&"") {
         fields.pop();
@@ -502,7 +512,8 @@ mod tests {
                 "octopus",
             ]),
         ]
-        .join("\0");
+        .join("\0")
+            + "\0";
         let v = parse_commits(&out).unwrap();
         assert_eq!(v.len(), 3);
         assert!(v[0].parents.is_empty());
@@ -519,16 +530,19 @@ mod tests {
 
     #[test]
     fn commits_subject_keeps_unicode_and_edge_whitespace() {
-        let out = rec(&[
-            &"a".repeat(40),
-            "a",
-            "Ann",
-            "a@e",
-            "1",
-            "",
-            "",
-            "  héllo → wörld  ",
-        ]);
+        let out = format!(
+            "{}\0",
+            rec(&[
+                &"a".repeat(40),
+                "a",
+                "Ann",
+                "a@e",
+                "1",
+                "",
+                "",
+                "  héllo → wörld  ",
+            ])
+        );
         let v = parse_commits(&out).unwrap();
         assert_eq!(v[0].subject, "  héllo → wörld  ");
     }
@@ -665,7 +679,8 @@ mod tests {
             ),
             stash_row("stash@{2}", &"c".repeat(40), "30", "plain"),
         ]
-        .join("\0");
+        .join("\0")
+            + "\0";
         let v = parse_stashes(&out).unwrap();
         assert_eq!(v.len(), 3);
         assert_eq!(v[0].index, 0);
@@ -945,5 +960,43 @@ mod tests {
         assert!(supports_stash_staged((2, 35, 0)));
         assert!(supports_stash_staged((2, 36, 1)));
         assert!(supports_stash_staged((3, 0, 0)));
+    }
+
+    #[test]
+    fn commits_missing_final_terminator_is_rejected_not_truncated() {
+        let record =
+            |sha: &str, subject: &str| rec(&[sha, "aaaaaaa", "Ann", "a@e", "1", "", "", subject]);
+        let first = record(&"a".repeat(40), "a complete subject");
+        let parsed = parse_commits(&format!("{first}\0")).unwrap();
+        assert_eq!(parsed.len(), 1);
+        assert_eq!(parsed[0].subject, "a complete subject");
+
+        let error = parse_commits(&first).unwrap_err();
+        assert!(error.to_string().contains("terminator"), "{error}");
+
+        let second_cut = record(&"b".repeat(40), "a cut sub");
+        assert!(parse_commits(&format!("{first}\0{second_cut}")).is_err());
+    }
+
+    #[test]
+    fn stashes_missing_final_terminator_is_rejected_not_truncated() {
+        let row = stash_row(
+            "stash@{0}",
+            &"a".repeat(40),
+            "10",
+            "WIP on main: complete message",
+        );
+        let parsed = parse_stashes(&format!("{row}\0")).unwrap();
+        assert_eq!(parsed.len(), 1);
+        assert_eq!(parsed[0].message, "WIP on main: complete message");
+
+        let error = parse_stashes(&row).unwrap_err();
+        assert!(error.to_string().contains("terminator"), "{error}");
+    }
+
+    #[test]
+    fn terminated_empty_chunk_only_input_still_reports_empty_record() {
+        assert!(parse_commits("\0").is_err());
+        assert!(parse_stashes("\0").is_err());
     }
 }
