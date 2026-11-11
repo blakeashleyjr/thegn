@@ -350,6 +350,26 @@ fn fallback_name_ok(name: &str, euid: u32, state_key: &str) -> bool {
             .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(byte))
 }
 
+/// True for a private control-runtime dir name of ANOTHER state key of this
+/// user: `thegn-<euid>-<32 hex key>-<32 hex suffix>`, key != `own_key`.
+#[cfg(unix)]
+fn fallback_name_other_key(name: &str, euid: u32, own_key: &str) -> bool {
+    let prefix = format!("thegn-{euid}-");
+    let Some(rest) = name.strip_prefix(prefix.as_str()) else {
+        return false;
+    };
+    let bytes = rest.as_bytes();
+    let is_hex = |part: &[u8]| {
+        part.iter()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(byte))
+    };
+    bytes.len() == 32 + 1 + 32
+        && bytes[32] == b'-'
+        && is_hex(&bytes[..32])
+        && is_hex(&bytes[33..])
+        && &rest[..32] != own_key
+}
+
 #[cfg(unix)]
 fn read_tmp_fallback_locator_at(path: &std::path::Path) -> Option<String> {
     use std::io::Read as _;
@@ -492,12 +512,51 @@ fn tmp_fallback_socket_live(socket: &std::path::Path) -> bool {
     }
 }
 
+/// Idle floor before a dir of another state key may be reclaimed: protects a
+/// state that is mid-allocation or mid-start under ITS OWN allocation lock,
+/// which this process does not hold.
+#[cfg(unix)]
+const FOREIGN_RECLAIM_MIN_IDLE: std::time::Duration = std::time::Duration::from_secs(24 * 60 * 60);
+/// Cap on foreign dirs examined per start: bounds how long this process holds
+/// its own allocation lock probing sockets.
+#[cfg(unix)]
+const FOREIGN_RECLAIM_MAX_EXAMINED: usize = 64;
+
+/// Which private control-runtime dirs a reclaim pass may consider.
+#[cfg(unix)]
+enum ReclaimScope<'a> {
+    OwnKey {
+        state_key: &'a str,
+        keep: Option<&'a str>,
+    },
+    OtherKeys {
+        own_key: &'a str,
+        min_idle: std::time::Duration,
+        max_examined: usize,
+    },
+}
+
 #[cfg(unix)]
 fn reclaim_stale_tmp_fallback_siblings(
     tmp_root: &std::path::Path,
     euid: u32,
     state_key: &str,
     keep: Option<&str>,
+    socket_live: &dyn Fn(&std::path::Path) -> bool,
+) -> usize {
+    reclaim_stale_tmp_fallback_dirs(
+        tmp_root,
+        euid,
+        &ReclaimScope::OwnKey { state_key, keep },
+        socket_live,
+    )
+}
+
+#[cfg(unix)]
+fn reclaim_stale_tmp_fallback_dirs(
+    tmp_root: &std::path::Path,
+    euid: u32,
+    scope: &ReclaimScope<'_>,
     socket_live: &dyn Fn(&std::path::Path) -> bool,
 ) -> usize {
     use std::os::unix::fs::{FileTypeExt as _, MetadataExt as _};
@@ -510,6 +569,7 @@ fn reclaim_stale_tmp_fallback_siblings(
         }
     };
     let mut removed = 0;
+    let mut examined = 0_usize;
     for entry in entries {
         let entry = match entry {
             Ok(entry) => entry,
@@ -521,8 +581,22 @@ fn reclaim_stale_tmp_fallback_siblings(
         let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
             continue;
         };
-        if !fallback_name_ok(&name, euid, state_key) || Some(name.as_str()) == keep {
+        let candidate = match scope {
+            ReclaimScope::OwnKey { state_key, keep } => {
+                fallback_name_ok(&name, euid, state_key) && Some(name.as_str()) != *keep
+            }
+            ReclaimScope::OtherKeys { own_key, .. } => {
+                fallback_name_other_key(&name, euid, own_key)
+            }
+        };
+        if !candidate {
             continue;
+        }
+        if let ReclaimScope::OtherKeys { max_examined, .. } = scope {
+            if examined >= *max_examined {
+                break;
+            }
+            examined += 1;
         }
         let dir = entry.path();
         if !live_dir_meta(&dir).is_some_and(|meta| {
@@ -530,6 +604,34 @@ fn reclaim_stale_tmp_fallback_siblings(
         }) {
             tracing::debug!(target: "thegn::daemon", path = %dir.display(), "keeping unverified private control-runtime sibling");
             continue;
+        }
+        if let ReclaimScope::OtherKeys { min_idle, .. } = scope {
+            // Newest of the dir and its socket mtime; any error keeps the dir.
+            let mtime = |path: &std::path::Path| {
+                std::fs::symlink_metadata(path).and_then(|meta| meta.modified())
+            };
+            let newest = match mtime(&dir) {
+                Ok(dir_time) => match mtime(&dir.join("daemon.sock")) {
+                    Ok(sock_time) => Ok(dir_time.max(sock_time)),
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(dir_time),
+                    Err(error) => Err(error),
+                },
+                Err(error) => Err(error),
+            };
+            let newest = match newest {
+                Ok(time) => time,
+                Err(error) => {
+                    tracing::debug!(target: "thegn::daemon", path = %dir.display(), %error, "could not age private control-runtime dir of another state");
+                    continue;
+                }
+            };
+            let idle = std::time::SystemTime::now()
+                .duration_since(newest)
+                .unwrap_or(std::time::Duration::ZERO);
+            if idle < *min_idle {
+                tracing::debug!(target: "thegn::daemon", path = %dir.display(), "keeping recently active private control-runtime dir of another state");
+                continue;
+            }
         }
 
         let contents = match std::fs::read_dir(&dir) {
@@ -739,6 +841,16 @@ fn allocate_private_tmp_fallback_within(
         euid,
         &state_key,
         keep,
+        &tmp_fallback_socket_live,
+    );
+    reclaim_stale_tmp_fallback_dirs(
+        tmp_root,
+        euid,
+        &ReclaimScope::OtherKeys {
+            own_key: &state_key,
+            min_idle: FOREIGN_RECLAIM_MIN_IDLE,
+            max_examined: FOREIGN_RECLAIM_MAX_EXAMINED,
+        },
         &tmp_fallback_socket_live,
     );
     if let Some(name) = current {
@@ -3311,5 +3423,240 @@ mod tests {
             first.parent().unwrap().exists(),
             "locator directory must remain"
         );
+    }
+
+    #[cfg(unix)]
+    const TMP_FALLBACK_OTHER_KEY: &str = "fedcba9876543210fedcba9876543210";
+
+    #[cfg(unix)]
+    #[test]
+    fn tmp_fallback_other_key_name_parser_is_strict() {
+        let uid = effective_uid();
+        let own = "0123456789abcdef0123456789abcdef";
+        let other = TMP_FALLBACK_OTHER_KEY;
+        let suffix = "a".repeat(32);
+        assert!(fallback_name_other_key(
+            &format!("thegn-{uid}-{other}-{suffix}"),
+            uid,
+            own
+        ));
+        assert!(!fallback_name_other_key(
+            &format!("thegn-{uid}-{own}-{suffix}"),
+            uid,
+            own
+        ));
+        assert!(!fallback_name_other_key(
+            &format!("thegn-{}-{other}-{suffix}", uid + 1),
+            uid,
+            own
+        ));
+        assert!(!fallback_name_other_key(
+            &format!("thegn-{uid}-{other}-{}", "a".repeat(31)),
+            uid,
+            own
+        ));
+        assert!(!fallback_name_other_key(
+            &format!("thegn-{uid}-{other}-{}", "a".repeat(33)),
+            uid,
+            own
+        ));
+        assert!(!fallback_name_other_key(
+            &format!("thegn-{uid}-{other}-{}", "A".repeat(32)),
+            uid,
+            own
+        ));
+        assert!(!fallback_name_other_key(
+            &format!("thegn-{uid}-{other}"),
+            uid,
+            own
+        ));
+        assert!(!fallback_name_other_key(
+            &format!("thegn-{uid}-{other}-{suffix}x"),
+            uid,
+            own
+        ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn tmp_fallback_reclaim_other_keys_removes_a_dead_foreign_dir() {
+        let tmp = tempfile::Builder::new()
+            .prefix("tg")
+            .tempdir_in("/tmp")
+            .unwrap();
+        let own = "0123456789abcdef0123456789abcdef";
+        let name = format!(
+            "thegn-{}-{TMP_FALLBACK_OTHER_KEY}-{}",
+            effective_uid(),
+            "a".repeat(32)
+        );
+        let dir = tmp_fallback_test_sibling(tmp.path(), &name);
+        tmp_fallback_test_dead_socket(&dir);
+
+        let scope = ReclaimScope::OtherKeys {
+            own_key: own,
+            min_idle: std::time::Duration::ZERO,
+            max_examined: 8,
+        };
+        assert_eq!(
+            reclaim_stale_tmp_fallback_dirs(
+                tmp.path(),
+                effective_uid(),
+                &scope,
+                &tmp_fallback_socket_live
+            ),
+            1
+        );
+        assert!(!dir.exists(), "dead foreign dir should be removed");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn tmp_fallback_reclaim_other_keys_keeps_recent_live_and_unproven() {
+        use std::os::unix::fs::{PermissionsExt as _, symlink};
+        use std::os::unix::net::UnixListener;
+
+        let tmp = tempfile::Builder::new()
+            .prefix("tg")
+            .tempdir_in("/tmp")
+            .unwrap();
+        let uid = effective_uid();
+        let own = "0123456789abcdef0123456789abcdef";
+        let name_for =
+            |key: &str, fill: char| format!("thegn-{uid}-{key}-{}", fill.to_string().repeat(32));
+        let reclaim = |min_idle: std::time::Duration| {
+            reclaim_stale_tmp_fallback_dirs(
+                tmp.path(),
+                uid,
+                &ReclaimScope::OtherKeys {
+                    own_key: own,
+                    min_idle,
+                    max_examined: 64,
+                },
+                &tmp_fallback_socket_live,
+            )
+        };
+
+        // (a) a fresh dead foreign dir is kept under a one-hour idle floor.
+        let fresh = tmp_fallback_test_sibling(tmp.path(), &name_for(TMP_FALLBACK_OTHER_KEY, 'a'));
+        tmp_fallback_test_dead_socket(&fresh);
+        assert_eq!(reclaim(std::time::Duration::from_secs(3600)), 0);
+        assert!(fresh.exists());
+        // Remove it so it cannot be reclaimed below and mask a bug elsewhere.
+        std::fs::remove_file(fresh.join("daemon.sock")).unwrap();
+        std::fs::remove_file(fresh.join("daemon.sock.lock")).unwrap();
+        std::fs::remove_dir(&fresh).unwrap();
+
+        // (b) with no idle floor, every unproven dir is still kept.
+        let live = tmp_fallback_test_sibling(tmp.path(), &name_for(TMP_FALLBACK_OTHER_KEY, 'b'));
+        let live_listener = UnixListener::bind(live.join("daemon.sock")).unwrap();
+
+        let extra = tmp_fallback_test_sibling(tmp.path(), &name_for(TMP_FALLBACK_OTHER_KEY, 'c'));
+        tmp_fallback_test_dead_socket(&extra);
+        std::fs::write(extra.join("stray.txt"), b"x").unwrap();
+
+        let held = tmp_fallback_test_sibling(tmp.path(), &name_for(TMP_FALLBACK_OTHER_KEY, 'd'));
+        tmp_fallback_test_dead_socket(&held);
+        let held_lock = std::fs::File::options()
+            .read(true)
+            .write(true)
+            .open(held.join("daemon.sock.lock"))
+            .unwrap();
+        held_lock.lock().unwrap();
+
+        let own_dir = tmp_fallback_test_sibling(tmp.path(), &name_for(own, 'e'));
+        tmp_fallback_test_dead_socket(&own_dir);
+
+        let loose = tmp_fallback_test_sibling(tmp.path(), &name_for(TMP_FALLBACK_OTHER_KEY, 'f'));
+        tmp_fallback_test_dead_socket(&loose);
+        std::fs::set_permissions(&loose, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let target = tmp_fallback_test_sibling(tmp.path(), "target-dir");
+        tmp_fallback_test_dead_socket(&target);
+        let link = tmp.path().join(name_for(TMP_FALLBACK_OTHER_KEY, '1'));
+        symlink(&target, &link).unwrap();
+
+        assert_eq!(reclaim(std::time::Duration::ZERO), 0);
+        for kept in [&live, &extra, &held, &own_dir, &loose, &target] {
+            assert!(kept.exists(), "{} should be kept", kept.display());
+        }
+        assert!(
+            std::fs::symlink_metadata(&link)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+        assert!(target.join("daemon.sock").exists());
+        assert!(target.join("daemon.sock.lock").exists());
+
+        drop(live_listener);
+        drop(held_lock);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn tmp_fallback_reclaim_other_keys_respects_the_examined_cap() {
+        let tmp = tempfile::Builder::new()
+            .prefix("tg")
+            .tempdir_in("/tmp")
+            .unwrap();
+        let uid = effective_uid();
+        let own = "0123456789abcdef0123456789abcdef";
+        let dirs: Vec<PathBuf> = ['a', 'b']
+            .iter()
+            .map(|fill| {
+                let name = format!(
+                    "thegn-{uid}-{TMP_FALLBACK_OTHER_KEY}-{}",
+                    fill.to_string().repeat(32)
+                );
+                let dir = tmp_fallback_test_sibling(tmp.path(), &name);
+                tmp_fallback_test_dead_socket(&dir);
+                dir
+            })
+            .collect();
+        let scope = ReclaimScope::OtherKeys {
+            own_key: own,
+            min_idle: std::time::Duration::ZERO,
+            max_examined: 1,
+        };
+        assert_eq!(
+            reclaim_stale_tmp_fallback_dirs(tmp.path(), uid, &scope, &tmp_fallback_socket_live),
+            1
+        );
+        assert_eq!(dirs.iter().filter(|dir| dir.exists()).count(), 1);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn tmp_fallback_allocator_keeps_fresh_foreign_dirs_but_still_reclaims_own_siblings() {
+        let tmp = tempfile::Builder::new()
+            .prefix("tg")
+            .tempdir_in("/tmp")
+            .unwrap();
+        let state = tempfile::Builder::new()
+            .prefix("tg")
+            .tempdir_in("/tmp")
+            .unwrap();
+        let euid = effective_uid();
+        let key = thegn_core::config_daemon::state_endpoint_key(state.path());
+        allocate_private_tmp_fallback_in(tmp.path(), state.path(), euid).unwrap();
+
+        let foreign = tmp_fallback_test_sibling(
+            tmp.path(),
+            &format!("thegn-{euid}-{TMP_FALLBACK_OTHER_KEY}-{}", "a".repeat(32)),
+        );
+        tmp_fallback_test_dead_socket(&foreign);
+        let own_stale = tmp_fallback_test_sibling(
+            tmp.path(),
+            &format!("thegn-{euid}-{key}-{}", "d".repeat(32)),
+        );
+        tmp_fallback_test_dead_socket(&own_stale);
+
+        allocate_private_tmp_fallback_in(tmp.path(), state.path(), euid).unwrap();
+        assert!(
+            foreign.exists(),
+            "fresh foreign dir is inside the idle floor"
+        );
+        assert!(!own_stale.exists(), "own-key dead sibling is reclaimed");
     }
 }
