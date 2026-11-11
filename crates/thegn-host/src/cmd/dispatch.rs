@@ -2093,6 +2093,23 @@ fn verify_facts_with_report_head(
     row: &AgentDispatch,
     report_head: Option<&str>,
 ) -> pipeline_run::VerifyFacts {
+    verify_facts_observed(row, report_head, &mut || {})
+}
+
+/// Collects the verification facts one at a time and refuses a mixed
+/// snapshot (THE-1945): HEAD is observed before and after the collection and
+/// the artifact content is re-read at the end; any difference forces the
+/// worktree state to `Unknown`, which `verify_report` turns into the typed
+/// `WorktreeUnknown` refusal. `between` runs after the last fact is read and
+/// before the closing observation (a test seam for mid-verification races).
+///
+/// Cost: two extra bounded `git rev-parse` calls and one extra bounded file
+/// read per verification, on the same blocking paths as the existing git reads.
+fn verify_facts_observed(
+    row: &AgentDispatch,
+    report_head: Option<&str>,
+    between: &mut dyn FnMut(),
+) -> pipeline_run::VerifyFacts {
     // THE-88: report presence is a row fact even for plain dispatches. It is
     // only a completion gate when an artifact is present, but `dispatch
     // verify` should faithfully report the column in either case.
@@ -2124,6 +2141,7 @@ fn verify_facts_with_report_head(
         };
     };
     let wt = std::path::Path::new(&row.worktree_path);
+    let head_before = observe_head(wt);
     // `symlink_metadata`, not `is_file`/`exists`: the final component must be
     // a regular file, not a symlink to one. A committed symlink at the artifact
     // path is `tracked` (the link itself is in the index) but redirects the
@@ -2189,6 +2207,24 @@ fn verify_facts_with_report_head(
         }
     };
     let worktree_state = worktree_state_from_status(status.as_deref());
+    between();
+    let head_after = observe_head(wt);
+    let content_after = if row.stage.is_some() && exists {
+        read_artifact_content(&wt.join(&artifact))
+    } else {
+        pipeline_run::ArtifactContent::NotRead
+    };
+    let snapshot_moved = head_before != head_after || content_after != artifact_content;
+    let worktree_state = if snapshot_moved {
+        tracing::debug!(
+            target: "thegn::dispatch",
+            worktree = %wt.display(),
+            "verification snapshot moved (HEAD or artifact changed while facts were collected)"
+        );
+        pipeline_run::WorktreeState::Unknown
+    } else {
+        worktree_state
+    };
     let dirty = worktree_state == pipeline_run::WorktreeState::Dirty;
     // THE-88: a row carrying an artifact must also file a report —
     // `verify_report` turns the missing case into an `ok=false` reason that
@@ -2241,6 +2277,17 @@ fn verify_facts_with_report_head(
         );
     }
     facts
+}
+
+fn observe_head(wt: &std::path::Path) -> Option<String> {
+    match git_text_local(wt, &["rev-parse", "--verify", "HEAD"]) {
+        Ok(head) if !head.is_empty() => Some(head),
+        Ok(_) => None,
+        Err(error) => {
+            note_git_read_failure("rev-parse --verify HEAD", wt, &error);
+            None
+        }
+    }
 }
 
 fn read_artifact_content(path: &std::path::Path) -> pipeline_run::ArtifactContent {
@@ -5321,6 +5368,67 @@ mod tests {
         row.report = Some("   \n  ".into());
         let f = verify_facts(&row);
         assert!(!f.report_present, "whitespace-only is not present");
+    }
+
+    // --- verification snapshot consistency (THE-1945) -----------------------
+
+    #[test]
+    fn verify_snapshot_stable_worktree_keeps_its_facts() {
+        let (_d, root) = git_repo("snap-stable");
+        commit_artifact(&root);
+        let f = verify_facts_observed(&row_in(&root, Some(ARTIFACT)), None, &mut || {});
+        assert!(f.exists);
+        assert!(f.tracked);
+        assert_eq!(f.worktree_state, Some(pipeline_run::WorktreeState::Clean));
+        assert_eq!(f.artifact_content, pipeline_run::ArtifactContent::Valid);
+    }
+
+    #[test]
+    fn verify_snapshot_head_moving_mid_verification_is_unknown() {
+        let (_d, root) = git_repo("snap-head");
+        commit_artifact(&root);
+        let f = verify_facts_observed(&row_in(&root, Some(ARTIFACT)), None, &mut || {
+            std::fs::write(root.join("other.txt"), "x").unwrap();
+            assert!(git_ok(&root, &["add", "other.txt"]));
+            assert!(git_ok(&root, &["commit", "-q", "-m", "moved"]));
+        });
+        assert_eq!(f.worktree_state, Some(pipeline_run::WorktreeState::Unknown));
+        assert!(!f.dirty);
+    }
+
+    #[test]
+    fn verify_snapshot_artifact_rewritten_mid_verification_is_unknown() {
+        let (_d, root) = git_repo("snap-artifact");
+        commit_artifact(&root);
+        let f = verify_facts_observed(&row_in(&root, Some(ARTIFACT)), None, &mut || {
+            std::fs::write(root.join(ARTIFACT), "# rewritten after the content read\n").unwrap();
+        });
+        assert_eq!(f.worktree_state, Some(pipeline_run::WorktreeState::Unknown));
+    }
+
+    #[test]
+    fn verify_snapshot_unknown_state_is_a_typed_refusal() {
+        let (_d, root) = git_repo("snap-refusal");
+        commit_artifact(&root);
+        let f = verify_facts_observed(&row_in(&root, Some(ARTIFACT)), None, &mut || {
+            std::fs::write(root.join(ARTIFACT), "# rewritten after the content read\n").unwrap();
+        });
+        let report = pipeline_run::verify_report(&f);
+        assert!(!report.ok);
+        assert!(
+            report
+                .refusals
+                .contains(&pipeline_run::VerifyRefusal::WorktreeUnknown)
+        );
+    }
+
+    #[test]
+    fn verify_snapshot_plain_row_without_artifact_skips_the_hook() {
+        let (_d, root) = git_repo("snap-plain");
+        let ran = std::cell::Cell::new(false);
+        let f = verify_facts_observed(&row_in(&root, None), None, &mut || ran.set(true));
+        assert_eq!(f.artifact, None);
+        assert!(!ran.get());
     }
 
     /// THE-88: `row_report_artifact_db` returns the row's `report` and
