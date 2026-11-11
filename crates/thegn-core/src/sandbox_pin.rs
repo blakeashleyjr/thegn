@@ -115,6 +115,20 @@ pub const fn explain(profile: SandboxProfile) -> ProfileExplain {
     }
 }
 
+/// Why a pin change is refused from inside a sandbox: pins are host-owned.
+pub const HOST_OWNED_REFUSAL: &str =
+    "sandbox profile pins are host-owned; this command cannot change them from inside a sandbox";
+
+/// Refuse a host-owned pin operation when running inside a sandbox. Shared by
+/// the `thegn sandbox profile` CLI and the generic `thegn api call` door so both
+/// answer with the same message.
+pub fn refuse_inside_sandbox(inside_sandbox: bool) -> Result<()> {
+    if inside_sandbox {
+        bail!(HOST_OWNED_REFUSAL)
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 #[path = "sandbox_pin_tests.rs"]
 mod sandbox_pin_tests;

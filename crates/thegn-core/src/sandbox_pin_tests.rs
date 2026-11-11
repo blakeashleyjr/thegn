@@ -1,6 +1,8 @@
 use crate::config::{Config, SandboxProfile};
 use crate::remote::GitLoc;
-use crate::sandbox_pin::{EnvSelection, explain, parse_pin};
+use crate::sandbox_pin::{
+    EnvSelection, HOST_OWNED_REFUSAL, explain, parse_pin, refuse_inside_sandbox,
+};
 
 #[test]
 fn sandbox_pin_aliases_use_the_config_enum_and_refuse_non_pinnable_profiles() {
@@ -266,4 +268,11 @@ fn sandbox_pin_does_not_lower_a_zone_profile_floor() {
         },
     );
     assert_eq!(resolved.sandbox.profile, SandboxProfile::Sealed);
+}
+
+#[test]
+fn sandbox_pin_host_owned_refusal_only_inside_a_sandbox() {
+    assert!(refuse_inside_sandbox(false).is_ok());
+    let error = refuse_inside_sandbox(true).unwrap_err();
+    assert_eq!(error.to_string(), HOST_OWNED_REFUSAL);
 }

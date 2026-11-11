@@ -11,7 +11,7 @@
 //! it exposes the in-app help corpus, the generated keybindings/config-reference
 //! pages, and the user's current secret-redacted config so a coding agent can
 //! learn how thegn works — plus, gated by `--scopes`, live *state* tools
-//! (`sessions_list`, `worktrees_list`, `leases_list`, `me`) answered by the
+//! (`sessions_list`, `worktrees_list`, `worktrees_sandbox_profile`, `leases_list`, `me`) answered by the
 //! pane daemon over the control client, and daemon-free semantic read tools
 //! (`semantic_map`, `semantic_blast_radius`) answered from the state DB + git.
 //! The JSON-RPC handling is the pure
@@ -119,7 +119,7 @@ pub enum Action {
         /// profile overlay — defaulting to `read` when nothing is configured;
         /// when given, it intersects that ceiling (clamp-only, never widening).
         /// The default `read` enables only the listing/observing tools
-        /// (`sessions_list`, `worktrees_list`, `leases_list`, `me`,
+        /// (`sessions_list`, `worktrees_list`, `worktrees_sandbox_profile`, `leases_list`, `me`,
         /// `agent_sessions`, `sessions_wait`, `semantic_map`,
         /// `semantic_blast_radius`); the mutating tools (`sessions_open`,
         /// `sessions_input`, `sessions_kill`) additionally need `write`, and `folders_assign` needs `git`. Pass
@@ -481,6 +481,15 @@ async fn fetch_state(
                 .map(|wts| json!({ "source": "db-cache", "worktrees": wts }))
                 .map_err(|db_err| format!("{NO_DAEMON}; DB cache also failed: {db_err}")),
         },
+        "worktrees.sandbox_profile" => {
+            let c = client.map_err(|_| NO_DAEMON.to_string())?;
+            let worktree = str_arg(args, "worktree").ok_or("missing `worktree`")?;
+            let reply = c
+                .worktree_sandbox_profile(worktree)
+                .await
+                .map_err(|e| e.to_string())?;
+            serde_json::to_value(reply).map_err(|e| e.to_string())
+        }
         "folders.assign" => {
             let c = client.map_err(|_| NO_DAEMON.to_string())?;
             let request = thegn_svc::control::FolderAssignReq {
@@ -968,6 +977,7 @@ mod tests {
     const READ_CAPS: &[&str] = &[
         "sessions.list",
         "worktrees.list",
+        "worktrees.sandbox_profile",
         "preview.fetch",
         "leases.list",
         "me",
@@ -1042,6 +1052,21 @@ mod tests {
             sorted(expected),
             "--scopes read,git"
         );
+    }
+
+    #[test]
+    fn sandbox_profile_set_is_never_an_mcp_tool() {
+        for flag in [false, true] {
+            let allowed = allowed_state_caps(ScopeSet::parse("read,write,git,exec,admin"), flag);
+            assert!(
+                allowed.contains(&"worktrees.sandbox_profile"),
+                "{allowed:?}"
+            );
+            assert!(
+                !allowed.contains(&"worktrees.sandbox_profile_set"),
+                "{allowed:?}"
+            );
+        }
     }
 
     #[test]
