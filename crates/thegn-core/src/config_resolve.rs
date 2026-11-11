@@ -1576,7 +1576,7 @@ pub fn resolve_environment(
     repo_root: &Path,
     loc: &GitLoc,
     worktree: &Path,
-    selected: Option<&str>,
+    selected: &crate::sandbox_pin::EnvSelection,
     approvals: &Approvals,
 ) -> (Environment, ResolvedRepoSandbox) {
     let mut resolved = resolve_repo_sandbox(cfg, repo_root, approvals);
@@ -1600,7 +1600,7 @@ pub fn resolve_environment(
         && worktree_on_primary_branch(repo_root, worktree, loc);
     let on_primary = worktree_uses_main_env(&base.main_env, is_root_checkout, on_primary_branch);
     let default_env = pick_default_env(&base.main_env, &base.default_env, on_primary);
-    let (name, source) = if let Some(name) = selected.and_then(pick) {
+    let (name, source) = if let Some(name) = selected.name.as_deref().and_then(pick) {
         (name, EnvPick::Selected)
     } else if let Some(name) = pick(&cfg.repo_env_name(repo_root)) {
         (name, EnvPick::RepoHint)
@@ -1690,6 +1690,10 @@ pub fn resolve_environment(
     } else {
         env
     };
+    let mut env = env;
+    if let Some(profile) = selected.profile {
+        env.sandbox.profile = profile;
+    }
     (env, resolved)
 }
 
@@ -2487,7 +2491,7 @@ mod tests {
             std::path::Path::new("/repo"),
             &loc,
             std::path::Path::new("/wt/x"),
-            Some("ageless"),
+            &crate::sandbox_pin::EnvSelection::named("ageless"),
             &Approvals::deny_all(),
         );
         match env.placement {
@@ -2524,7 +2528,7 @@ mod tests {
             std::path::Path::new("/repo"),
             &loc,
             std::path::Path::new("/wt/x"),
-            Some("machine0"),
+            &crate::sandbox_pin::EnvSelection::named("machine0"),
             &Approvals::deny_all(),
         );
         assert_eq!(env.name, "machine0", "requested name is preserved");
@@ -2537,7 +2541,7 @@ mod tests {
             std::path::Path::new("/repo"),
             &loc,
             std::path::Path::new("/wt/x"),
-            None,
+            &crate::sandbox_pin::EnvSelection::none(),
             &Approvals::deny_all(),
         );
         assert_eq!(env.name, "default");
@@ -2559,7 +2563,7 @@ mod tests {
             std::path::Path::new("/repo"),
             &loc,
             std::path::Path::new("/wt/x"),
-            None,
+            &crate::sandbox_pin::EnvSelection::none(),
             &Approvals::deny_all(),
         );
         assert_eq!(env.name, "box");
@@ -2573,7 +2577,7 @@ mod tests {
             std::path::Path::new("/repo"),
             &loc,
             std::path::Path::new("/wt/x"),
-            None,
+            &crate::sandbox_pin::EnvSelection::none(),
             &Approvals::deny_all(),
         );
         assert!(matches!(env.placement, Placement::Ssh(_)));
@@ -2878,7 +2882,11 @@ mod tests {
         selected: Option<&str>,
     ) -> (Environment, ResolvedRepoSandbox) {
         let loc = GitLoc::Local(repo.to_path_buf());
-        resolve_environment(cfg, repo, &loc, repo, selected, &Approvals::deny_all())
+        let selection = selected.map_or_else(
+            crate::sandbox_pin::EnvSelection::none,
+            crate::sandbox_pin::EnvSelection::named,
+        );
+        resolve_environment(cfg, repo, &loc, repo, &selection, &Approvals::deny_all())
     }
 
     #[test]

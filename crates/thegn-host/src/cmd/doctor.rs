@@ -4836,16 +4836,8 @@ fn home_report(cfg: &Config) {
     for line in format_xdg_omissions(&current_xdg_omissions(cfg)) {
         outln!("                XDG carve-out omitted: {line}");
     }
-    if profile.hides_home() && !cfg.sandbox.enabled {
-        outln!(
-            "                NOT ENFORCED: [sandbox] enabled = false — profile `{}` is not applied, panes run on the host with the whole $HOME",
-            profile.as_str()
-        );
-    } else if profile.hides_home() && view != HomeView::Hidden {
-        outln!(
-            "                MISSED: profile `{}` demands a hidden $HOME; this host would refuse to launch it",
-            profile.as_str()
-        );
+    for line in home_report_lines(profile, view, cfg.sandbox.enabled) {
+        outln!("                {line}");
     }
     // Sealed tiers drop any `[sandbox] mounts` entry reaching the credential deny
     // list. Say which, by path only.
@@ -4859,6 +4851,28 @@ fn home_report(cfg: &Config) {
         ) {
             outln!("                dropped mount {p} (reaches a protected $HOME path)");
         }
+    }
+}
+
+pub(crate) fn home_report_lines(
+    profile: SandboxProfile,
+    view: thegn_core::sandbox_mounts::HomeView,
+    enabled: bool,
+) -> Vec<String> {
+    if profile.hides_home() && !enabled {
+        vec![format!(
+            "NOT ENFORCED: [sandbox] enabled = false — profile `{}` is not applied, panes run on the host with the whole $HOME. {}",
+            profile.as_str(),
+            thegn_core::sandbox_floor::standard_switch_hint(None)
+        )]
+    } else if profile.hides_home() && view != thegn_core::sandbox_mounts::HomeView::Hidden {
+        vec![format!(
+            "MISSED: profile `{}` demands a hidden $HOME; this host would refuse to launch it. {}",
+            profile.as_str(),
+            thegn_core::sandbox_floor::standard_switch_hint(None)
+        )]
+    } else {
+        Vec::new()
     }
 }
 

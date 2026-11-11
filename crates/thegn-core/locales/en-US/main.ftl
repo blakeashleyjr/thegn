@@ -76,6 +76,7 @@ action-switch-project = Switch project
 action-switch-account = Switch agent account
 action-switch-bundle = Switch env bundle
 action-switch-profile = Switch profile
+action-sandbox-profile = Isolation profile for this worktree
 action-switch-identity = Switch identity
 action-prev-tab = Previous tab
 action-next-tab = Next tab

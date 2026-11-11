@@ -85,6 +85,8 @@ pub enum Action {
     SwitchBundle,
     /// Open the profile switcher — launch/focus a whole-process profile (H).
     SwitchProfile,
+    /// Change the persisted isolation profile for the active worktree.
+    SandboxProfile,
     /// Open the identity switcher — pin a named per-tool identity (git/gh/gpg/ssh)
     /// at the focused scope (H/AU). See [`thegn_core::identity`].
     SwitchIdentity,
@@ -581,6 +583,7 @@ impl Action {
             Action::SwitchAccount => "switch-account",
             Action::SwitchBundle => "switch-bundle",
             Action::SwitchProfile => "switch-profile",
+            Action::SandboxProfile => "sandbox-profile",
             Action::SwitchIdentity => "switch-identity",
             Action::NextTab => "next-tab",
             Action::PrevTab => "prev-tab",
@@ -738,6 +741,7 @@ impl Action {
             "switch-account" => Action::SwitchAccount,
             "switch-bundle" => Action::SwitchBundle,
             "switch-profile" => Action::SwitchProfile,
+            "sandbox-profile" => Action::SandboxProfile,
             "switch-identity" => Action::SwitchIdentity,
             "next-tab" => Action::NextTab,
             "prev-tab" => Action::PrevTab,
