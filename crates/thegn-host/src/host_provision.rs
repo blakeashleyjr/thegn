@@ -479,6 +479,10 @@ fn sh_single(value: &str) -> String {
 /// is left out: nothing can be proven to match it, so it is never removed.
 fn host_dotfile_digests(host_home: &std::path::Path, names: &[String]) -> Vec<(String, String)> {
     let mut out = Vec::new();
+    if host_home.as_os_str().is_empty() {
+        // Unknown host home: a relative join would hash files under the cwd.
+        return out;
+    }
     for name in names {
         let digest = safe_relative_path(name)
             .and_then(|rel| {
@@ -515,9 +519,15 @@ fn host_dotfile_digests(host_home: &std::path::Path, names: &[String]) -> Vec<(S
 ///   `/proc/self/mountinfo`): a bind-mounted provider home is the host's own
 ///   file. If mount status cannot be read, the atuin paths are still scrubbed
 ///   and every dotfile is skipped.
-/// * A dotfile is removed only when its sha256 equals the host file's digest
-///   (computed host-side), so an image's own `.bashrc` is never deleted. With
-///   no `sha256sum` in the container the file is removed as before.
+/// * The home is resolved physically (`pwd -P`) and every mount check uses
+///   that path; a target or ancestor on a different device than the home is
+///   skipped too. Mount status is unknown (dotfiles skipped, atuin still
+///   scrubbed) if the home cannot be resolved or `sed` is missing.
+/// * A dotfile is removed only when it is a regular, non-symlink file whose
+///   sha256 equals the host file's digest (computed host-side), so an image's
+///   own `.bashrc` is never deleted. A host dotfile changed or deleted after
+///   it was carried no longer matches, so the stale copy is kept. With no
+///   `sha256sum` in the container the file is removed as before.
 /// * Each removal is verified; any survivor makes the script exit non-zero so
 ///   the provision marker is withheld and the step retries.
 /// * Runs once per container: the done marker is written only after success.
@@ -540,7 +550,9 @@ fn sealed_scrub_script_with(home: &str, dotfiles: &[(String, String)], mountinfo
         format!("DONE=\"$H/{SEALED_SCRUB_DONE}\""),
         "[ -e \"$DONE\" ] && exit 0".into(),
         format!("MI={}", sh_single(mountinfo)),
-        "MOK=0; [ -r \"$MI\" ] && MOK=1".into(),
+        "MOK=0; [ -r \"$MI\" ] && command -v sed >/dev/null 2>&1 && MOK=1".into(),
+        "HP=$(cd -- \"$H\" 2>/dev/null && pwd -P); if [ -z \"$HP\" ]; then HP=\"$H\"; MOK=0; fi".into(),
+        "HD=$(stat -c %d \"$HP\" 2>/dev/null)".into(),
         "HAS=0; command -v sha256sum >/dev/null 2>&1 && HAS=1".into(),
         "rc=0".into(),
         "mounted() {".into(),
@@ -550,23 +562,25 @@ fn sealed_scrub_script_with(home: &str, dotfiles: &[(String, String)], mountinfo
         "  done < \"$MI\"".into(),
         "  return 1".into(),
         "}".into(),
+        "other_dev() {".into(),
+        "  [ -n \"$HD\" ] || return 1".into(),
+        "  x=$(stat -c %d \"$1\" 2>/dev/null) || return 1".into(),
+        "  [ -n \"$x\" ] && [ \"$x\" != \"$HD\" ]".into(),
+        "}".into(),
         "scrub() {".into(),
-        "  p=\"$H/$1\"; d=\"$H\"; rest=\"$1\"".into(),
+        "  p=\"$HP/$1\"; d=\"$HP\"; rest=\"$1\"".into(),
         "  while :; do".into(),
         "    case \"$rest\" in */*) ;; *) break;; esac".into(),
         "    d=\"$d/${rest%%/*}\"; rest=\"${rest#*/}\"".into(),
         "    if [ -L \"$d\" ]; then echo \"sealed scrub: skip $1 (symlinked ancestor)\" >&2; return 0; fi".into(),
         "    if [ \"$MOK\" = 1 ] && mounted \"$d\"; then echo \"sealed scrub: skip $1 (under a mount)\" >&2; return 0; fi".into(),
+        "    if other_dev \"$d\"; then echo \"sealed scrub: skip $1 (other device)\" >&2; return 0; fi".into(),
         "  done".into(),
         "  if [ \"$MOK\" = 1 ] && mounted \"$p\"; then echo \"sealed scrub: skip $1 (mount point)\" >&2; return 0; fi".into(),
+        "  if other_dev \"$p\"; then echo \"sealed scrub: skip $1 (other device)\" >&2; return 0; fi".into(),
         "  if [ -d \"$p\" ] && [ ! -L \"$p\" ]; then echo \"sealed scrub: skip $1 (directory)\" >&2; return 0; fi".into(),
-        "  rm -f -- \"$p\"".into(),
-        "  if [ -L \"$p\" ] || [ -e \"$p\" ]; then echo \"sealed scrub: could not remove $1\" >&2; rc=1; fi".into(),
-        "}".into(),
-        "scrub_dot() {".into(),
-        "  if [ \"$MOK\" != 1 ]; then echo \"sealed scrub: skip $1 (mount status unknown)\" >&2; return 0; fi".into(),
-        "  p=\"$H/$1\"".into(),
-        "  if [ -e \"$p\" ] || [ -L \"$p\" ]; then".into(),
+        "  if [ -n \"$2\" ] && { [ -e \"$p\" ] || [ -L \"$p\" ]; }; then".into(),
+        "    if [ ! -f \"$p\" ] || [ -L \"$p\" ]; then echo \"sealed scrub: keep $1 (not a regular file)\" >&2; return 0; fi".into(),
         "    if [ \"$HAS\" = 1 ]; then".into(),
         "      got=$(sha256sum \"$p\" 2>/dev/null); got=\"${got%% *}\"".into(),
         "      if [ \"$got\" != \"$2\" ]; then echo \"sealed scrub: keep $1 (content differs from the host file)\" >&2; return 0; fi".into(),
@@ -574,7 +588,12 @@ fn sealed_scrub_script_with(home: &str, dotfiles: &[(String, String)], mountinfo
         "      echo \"sealed scrub: no sha256sum; removing $1 unverified\" >&2".into(),
         "    fi".into(),
         "  fi".into(),
-        "  scrub \"$1\"".into(),
+        "  rm -f -- \"$p\"".into(),
+        "  if [ -L \"$p\" ] || [ -e \"$p\" ]; then echo \"sealed scrub: could not remove $1\" >&2; rc=1; fi".into(),
+        "}".into(),
+        "scrub_dot() {".into(),
+        "  if [ \"$MOK\" != 1 ]; then echo \"sealed scrub: skip $1 (mount status unknown)\" >&2; return 0; fi".into(),
+        "  scrub \"$1\" \"$2\"".into(),
         "}".into(),
     ];
     for rel in [".local/share/atuin/key", ".local/share/atuin/session"] {
@@ -1147,18 +1166,46 @@ mod tests {
         assert_eq!(got, vec![(".zshrc".to_string(), hex_of("host-zsh"))]);
     }
 
+    fn run_scrub(script: &str, state: &std::path::Path) -> std::process::ExitStatus {
+        run_scrub_with_path(script, state, &std::env::var_os("PATH").unwrap_or_default())
+    }
+
     #[expect(
         clippy::disallowed_methods,
         reason = "test drives the scrub script in a real shell, off any UI loop"
     )]
-    fn run_scrub(script: &str, state: &std::path::Path) -> std::process::ExitStatus {
+    fn run_scrub_with_path(
+        script: &str,
+        state: &std::path::Path,
+        path: &std::ffi::OsStr,
+    ) -> std::process::ExitStatus {
         std::process::Command::new("sh")
             .arg("-c")
             .arg(script)
             .envs(thegn_core::testenv::state_env_all(state))
-            .env("PATH", std::env::var_os("PATH").unwrap_or_default())
+            .env("PATH", path)
             .status()
             .unwrap()
+    }
+
+    /// The physical form of a tempdir, as the scrub script's `pwd -P` sees it.
+    fn physical(path: &std::path::Path) -> String {
+        std::fs::canonicalize(path)
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .to_string()
+    }
+
+    /// Escape a path the way the kernel does in `/proc/self/mountinfo`.
+    fn mi_escape(path: &str) -> String {
+        path.replace('\\', "\\134").replace(' ', "\\040")
+    }
+
+    fn find_in_path(name: &str) -> Option<std::path::PathBuf> {
+        std::env::split_paths(&std::env::var_os("PATH")?)
+            .map(|d| d.join(name))
+            .find(|p| p.exists())
     }
 
     fn write_file(root: &std::path::Path, rel: &str, content: &str) {
@@ -1248,7 +1295,8 @@ mod tests {
             return;
         }
         let dir = tempfile::tempdir().unwrap();
-        let root = dir.path().to_str().unwrap();
+        let root = &physical(dir.path());
+        let esc = mi_escape(root);
         write_file(dir.path(), ".codex/AGENTS.md", "x");
         write_file(dir.path(), ".single", "x");
         write_file(dir.path(), ".local/share/atuin/key", "x");
@@ -1256,9 +1304,9 @@ mod tests {
         // A directory bind mount, a single-file mount, a mount under the atuin
         // dir, and one with a space (escaped as \040 in mountinfo).
         let body = format!(
-            "36 25 0:30 / {root}/.codex rw - tmpfs tmpfs rw\n\
-             37 25 0:31 / {root}/.single rw - tmpfs tmpfs rw\n\
-             38 25 0:32 / {root}/.local/share/atuin rw - tmpfs tmpfs rw\n"
+            "36 25 0:30 / {esc}/.codex rw - tmpfs tmpfs rw\n\
+             37 25 0:31 / {esc}/.single rw - tmpfs tmpfs rw\n\
+             38 25 0:32 / {esc}/.local/share/atuin rw - tmpfs tmpfs rw\n"
         );
         let (_mi, mountinfo) = mountinfo_fixture(&body);
         let script = sealed_scrub_script_with(
@@ -1292,9 +1340,10 @@ mod tests {
             return;
         }
         let dir = tempfile::tempdir().unwrap();
-        let root = dir.path().to_str().unwrap();
+        let root = &physical(dir.path());
+        let esc = mi_escape(root);
         write_file(dir.path(), ".my dir/rc", "x");
-        let body = format!("36 25 0:30 / {root}/.my\\040dir rw - tmpfs tmpfs rw\n");
+        let body = format!("36 25 0:30 / {esc}/.my\\040dir rw - tmpfs tmpfs rw\n");
         let (_mi, mountinfo) = mountinfo_fixture(&body);
         let script = sealed_scrub_script_with(root, &[entry(".my dir/rc", "x")], &mountinfo);
         assert!(run_scrub(&script, dir.path()).success());
@@ -1363,6 +1412,124 @@ mod tests {
         );
         assert!(run_scrub(&script, dir.path()).success());
         assert!(sibling.path().join("git/config").exists());
+    }
+
+    #[test]
+    fn sealed_scrub_resolves_a_symlinked_home_before_checking_mounts() {
+        if !std::path::Path::new("/bin/sh").exists() {
+            return;
+        }
+        let real = tempfile::tempdir().unwrap();
+        let links = tempfile::tempdir().unwrap();
+        write_file(real.path(), ".codex/AGENTS.md", "x");
+        write_file(real.path(), ".plain", "x");
+        let link_home = links.path().join("home");
+        let link = format!(
+            "ln -s {} {}",
+            sh_single(real.path().to_str().unwrap()),
+            sh_single(link_home.to_str().unwrap())
+        );
+        assert!(run_scrub(&link, links.path()).success());
+        // mountinfo lists the physical path; the script is given the symlink.
+        let body = format!(
+            "36 25 0:30 / {}/.codex rw - tmpfs tmpfs rw\n",
+            mi_escape(&physical(real.path()))
+        );
+        let (_mi, mountinfo) = mountinfo_fixture(&body);
+        let script = sealed_scrub_script_with(
+            link_home.to_str().unwrap(),
+            &[entry(".codex/AGENTS.md", "x"), entry(".plain", "x")],
+            &mountinfo,
+        );
+        assert!(run_scrub(&script, links.path()).success());
+        assert!(
+            real.path().join(".codex/AGENTS.md").exists(),
+            "bind-mounted file kept"
+        );
+        assert!(!real.path().join(".plain").exists());
+    }
+
+    #[test]
+    fn sealed_scrub_without_sed_skips_dotfiles_but_scrubs_atuin() {
+        if !std::path::Path::new("/bin/sh").exists() {
+            return;
+        }
+        let Some(bin) = limited_bin(&["sh", "rm", "touch", "stat"]) else {
+            return;
+        };
+        let dir = tempfile::tempdir().unwrap();
+        touch_file(dir.path(), ".zshrc");
+        touch_file(dir.path(), ".local/share/atuin/key");
+        let (_mi, mountinfo) = mountinfo_fixture("");
+        let script = sealed_scrub_script_with(
+            dir.path().to_str().unwrap(),
+            &[entry(".zshrc", "x")],
+            &mountinfo,
+        );
+        assert!(run_scrub_with_path(&script, dir.path(), bin.path().as_os_str()).success());
+        assert!(dir.path().join(".zshrc").exists(), "mount status unknown");
+        assert!(!dir.path().join(".local/share/atuin/key").exists());
+    }
+
+    #[test]
+    fn sealed_scrub_without_a_hasher_removes_listed_dotfiles_unverified() {
+        if !std::path::Path::new("/bin/sh").exists() {
+            return;
+        }
+        // No sha256sum on PATH: sh, rm, touch, sed and stat only.
+        let Some(bin) = limited_bin(&["sh", "rm", "touch", "sed", "stat"]) else {
+            return;
+        };
+        let dir = tempfile::tempdir().unwrap();
+        touch_file(dir.path(), ".zshrc");
+        let (_mi, mountinfo) = mountinfo_fixture("");
+        let script = sealed_scrub_script_with(
+            dir.path().to_str().unwrap(),
+            &[entry(".zshrc", "different-host-content")],
+            &mountinfo,
+        );
+        assert!(run_scrub_with_path(&script, dir.path(), bin.path().as_os_str()).success());
+        assert!(!dir.path().join(".zshrc").exists());
+    }
+
+    #[test]
+    fn sealed_scrub_keeps_a_dotfile_that_is_a_symlink() {
+        if !std::path::Path::new("/bin/sh").exists() {
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        touch_file(dir.path(), "target");
+        let link = format!(
+            "ln -s target {}",
+            sh_single(dir.path().join(".zshrc").to_str().unwrap())
+        );
+        assert!(run_scrub(&link, dir.path()).success());
+        let (_mi, mountinfo) = mountinfo_fixture("");
+        let script =
+            sealed_scrub_script_with(&physical(dir.path()), &[entry(".zshrc", "x")], &mountinfo);
+        assert!(run_scrub(&script, dir.path()).success());
+        assert!(
+            std::fs::symlink_metadata(dir.path().join(".zshrc")).is_ok(),
+            "symlinked dotfile is never hashed or removed"
+        );
+    }
+
+    /// A temp dir holding links to just the named tools, for a restricted PATH;
+    /// `None` when a tool is not on the test machine's PATH.
+    fn limited_bin(tools: &[&str]) -> Option<tempfile::TempDir> {
+        let dir = tempfile::tempdir().unwrap();
+        for tool in tools {
+            let src = find_in_path(tool)?;
+            let link = format!(
+                "ln -s {} {}",
+                sh_single(src.to_str()?),
+                sh_single(dir.path().join(tool).to_str()?)
+            );
+            if !run_scrub(&link, dir.path()).success() {
+                return None;
+            }
+        }
+        Some(dir)
     }
 
     #[test]
