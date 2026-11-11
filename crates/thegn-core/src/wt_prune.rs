@@ -184,9 +184,12 @@ mod tests {
         );
     }
 
+    /// Test-only closure that mutates a baseline fact set to trigger one reason.
+    type FactMutator = Box<dyn Fn(&mut PruneFacts)>;
+
     #[test]
     fn each_reason_fires_alone() {
-        let cases: Vec<(Box<dyn Fn(&mut PruneFacts)>, KeepReason)> = vec![
+        let cases: Vec<(FactMutator, KeepReason)> = vec![
             (
                 Box::new(|f| f.is_primary = true),
                 KeepReason::PrimaryCheckout,
