@@ -61,6 +61,18 @@ fn row_in_scope(worktree: Option<&str>, all: bool, active: &str) -> bool {
     }
 }
 
+/// Chip counts `(total, errors)` over the rows in worktree scope. Level and
+/// text filters are deliberately not applied; the predicate is `row_in_scope`,
+/// the same one the list, copy and export use.
+pub(crate) fn scoped_counts(rows: &[ParsedLog], all: bool, active: &str) -> (usize, usize) {
+    rows.iter()
+        .filter(|r| row_in_scope(r.worktree.as_deref(), all, active))
+        .fold((0, 0), |(total, errors), r| {
+            let is_err = matches!(r.level, ParserLogLevel::Error | ParserLogLevel::Fatal);
+            (total + 1, errors + usize::from(is_err))
+        })
+}
+
 fn scope_label(all: bool) -> &'static str {
     if all {
         " · all worktrees"
@@ -363,6 +375,53 @@ fn level_tok(l: &ParserLogLevel) -> crate::seg::Tok {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn tagged_rows() -> (String, Vec<ParsedLog>) {
+        use std::path::Path;
+        use thegn_core::log::parser::parse_log;
+        use thegn_core::log_trace::wt_slug;
+        let active = wt_slug(Path::new("/repos/a/feat_x"));
+        let other = wt_slug(Path::new("/repos/b/feat-x"));
+        let unbound = wt_slug(Path::new(&format!("/{}", "x".repeat(20_000))));
+        let mk = |line: &str, tag: Option<String>| {
+            let mut row = parse_log(line);
+            row.worktree = tag;
+            row
+        };
+        let err = "2026-06-05T12:00:00 ERROR thegn::db failure";
+        let info = "2026-06-05T12:00:00 INFO thegn::db fine";
+        let rows = vec![
+            mk(err, Some(active.clone())),
+            mk(err, Some(other)),
+            mk(err, Some("feat-x".to_string())),
+            mk(err, Some(unbound)),
+            mk(err, None),
+            mk(info, Some(active.clone())),
+        ];
+        (active, rows)
+    }
+
+    #[test]
+    fn scoped_counts_exclude_other_worktree_legacy_and_unbound_errors() {
+        let (active, rows) = tagged_rows();
+        assert_eq!(scoped_counts(&rows, false, &active), (3, 2));
+    }
+
+    #[test]
+    fn scoped_counts_all_scope_counts_every_row() {
+        let (active, rows) = tagged_rows();
+        assert_eq!(scoped_counts(&rows, true, &active), (6, 5));
+    }
+
+    #[test]
+    fn scoped_counts_agree_with_visible_scope() {
+        let (active, rows) = tagged_rows();
+        for row in &rows {
+            let in_scope = row_in_scope(row.worktree.as_deref(), false, &active);
+            let (total, _) = scoped_counts(std::slice::from_ref(row), false, &active);
+            assert_eq!(total == 1, in_scope);
+        }
+    }
 
     #[test]
     fn scope_excludes_other_worktrees_legacy_and_unbound_rows() {
