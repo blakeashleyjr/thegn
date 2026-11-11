@@ -19,7 +19,7 @@
 
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, Condvar, Mutex, OnceLock};
 
 use chrono::{Datelike, NaiveDate};
 use termwiz::terminal::TerminalWaker;
@@ -267,11 +267,15 @@ fn run_month_fetch(
         let today = chrono::Utc::now().with_timezone(&home).date_naive();
         match horizon(&cfg, today) {
             Ok((h_from, h_to)) => {
-                sync_accounts(db, &cfg, h_from, h_to, false, &mut |m| {
-                    if let Some(waker) = waker.as_ref() {
-                        toast(&tx, waker, m, None);
-                    }
-                });
+                let outcome =
+                    sync_accounts_with_generation(db, &cfg, h_from, h_to, false, None, &mut |m| {
+                        if let Some(waker) = waker.as_ref() {
+                            toast(&tx, waker, m, None);
+                        }
+                    });
+                if let Some(accounts) = outcome.coalesced_accounts() {
+                    wait_for_accounts(accounts, h_from, h_to);
+                }
             }
             Err(problem) => {
                 refuse_horizon(&problem, &mut |m| {
@@ -423,7 +427,7 @@ pub(crate) fn spawn_periodic_sync_with_generation(
                 return;
             }
         };
-        let changed = sync_accounts_with_generation(
+        let outcome = sync_accounts_with_generation(
             &db,
             &cfg,
             from,
@@ -432,7 +436,7 @@ pub(crate) fn spawn_periodic_sync_with_generation(
             generation.as_ref(),
             &mut |m| toast(&tx, &waker, m, generation.clone()),
         );
-        if !changed {
+        if !outcome.changed() {
             return;
         }
         for (year, month) in periodic_months(today, visible_month()) {
@@ -502,6 +506,110 @@ fn contention_backoff(account: &str, now: i64) -> bool {
             false
         }
         None => false,
+    }
+}
+
+type PassKey = (String, NaiveDate, NaiveDate);
+
+struct PassClaims {
+    active: Mutex<BTreeMap<PassKey, usize>>,
+    released: Condvar,
+}
+
+fn pass_claims() -> &'static PassClaims {
+    static CLAIMS: OnceLock<PassClaims> = OnceLock::new();
+    CLAIMS.get_or_init(|| PassClaims {
+        active: Mutex::default(),
+        released: Condvar::new(),
+    })
+}
+
+/// Accounts this pass is fetching; released on drop (also on unwind).
+struct PassClaim(Vec<PassKey>);
+
+impl Drop for PassClaim {
+    fn drop(&mut self) {
+        let mut claims = pass_claims()
+            .active
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        for key in self.0.drain(..) {
+            if let Some(holders) = claims.get_mut(&key) {
+                *holders -= 1;
+                if *holders == 0 {
+                    claims.remove(&key);
+                }
+            }
+        }
+        pass_claims().released.notify_all();
+    }
+}
+
+/// Claim `names` for the window. A non-forced pass skips an account another pass already
+/// holds for the same window; a forced pass is never skipped. Returns the guard, names this
+/// pass must fetch, and names whose cache writes this pass must wait for before reading.
+fn claim_accounts(
+    names: Vec<String>,
+    from: NaiveDate,
+    to: NaiveDate,
+    force: bool,
+) -> (PassClaim, Vec<String>, Vec<String>) {
+    let mut claims = pass_claims()
+        .active
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let mut held = Vec::new();
+    let mut wanted = Vec::new();
+    let mut coalesced = Vec::new();
+    for name in names {
+        let key = (name.clone(), from, to);
+        if !force && claims.contains_key(&key) {
+            coalesced.push(name);
+            continue;
+        }
+        *claims.entry(key.clone()).or_insert(0) += 1;
+        held.push(key);
+        wanted.push(name);
+    }
+    (PassClaim(held), wanted, coalesced)
+}
+
+fn wait_for_accounts(accounts: &[String], from: NaiveDate, to: NaiveDate) {
+    let claims = pass_claims();
+    let mut active = claims.active.lock().unwrap_or_else(|e| e.into_inner());
+    while accounts
+        .iter()
+        .any(|name| active.contains_key(&(name.clone(), from, to)))
+    {
+        active = claims
+            .released
+            .wait(active)
+            .unwrap_or_else(|e| e.into_inner());
+    }
+}
+
+enum SyncOutcome {
+    Noop,
+    Completed {
+        changed: bool,
+        coalesced: Vec<String>,
+    },
+    Coalesced {
+        accounts: Vec<String>,
+    },
+}
+
+impl SyncOutcome {
+    fn changed(&self) -> bool {
+        matches!(self, Self::Completed { changed: true, .. })
+    }
+
+    fn coalesced_accounts(&self) -> Option<&[String]> {
+        match self {
+            Self::Completed { coalesced, .. } if !coalesced.is_empty() => Some(coalesced),
+            Self::Coalesced { accounts } => Some(accounts),
+            Self::Noop | Self::Completed { .. } => None,
+        }
     }
 }
 
@@ -593,6 +701,7 @@ fn toast(
 
 /// `notify` receives a user-facing message when an account is refused by its
 /// admission budget — once per new condition, not on every retry.
+#[cfg(test)]
 fn sync_accounts(
     db: &Db,
     cfg: &CalendarConfig,
@@ -601,7 +710,7 @@ fn sync_accounts(
     force: bool,
     notify: &mut dyn FnMut(String),
 ) -> bool {
-    sync_accounts_with_generation(db, cfg, from, to, force, None, notify)
+    sync_accounts_with_generation(db, cfg, from, to, force, None, notify).changed()
 }
 
 fn sync_accounts_with_generation(
@@ -612,15 +721,15 @@ fn sync_accounts_with_generation(
     force: bool,
     generation: Option<&crate::hydrate_schedule::ScheduleFence>,
     notify: &mut dyn FnMut(String),
-) -> bool {
+) -> SyncOutcome {
     let home = cfg.effective_home_zone();
     let Some(window) = CalendarWindow::new(from, to, home) else {
         tracing::warn!(target: "thegn::calendar", "invalid home-zone calendar window; skipping sync");
-        return false;
+        return SyncOutcome::Noop;
     };
     let accounts = cfg.active_accounts();
     if accounts.is_empty() {
-        return false;
+        return SyncOutcome::Noop;
     }
     let offline =
         thegn_core::connectivity::current() == thegn_core::connectivity::Connectivity::Offline;
@@ -661,7 +770,15 @@ fn sync_accounts_with_generation(
         wanted.push(a.name.clone());
     }
     if wanted.is_empty() {
-        return false;
+        return SyncOutcome::Noop;
+    }
+
+    let (_claim, wanted, coalesced) = claim_accounts(wanted, from, to, force);
+    if wanted.is_empty() {
+        tracing::debug!(target: "thegn::calendar", "calendar pass coalesced into one already fetching these accounts");
+        return SyncOutcome::Coalesced {
+            accounts: coalesced,
+        };
     }
 
     // Build a router over only the accounts we intend to fetch, so a fresh one
@@ -670,7 +787,7 @@ fn sync_accounts_with_generation(
     scoped.accounts.retain(|a| wanted.contains(&a.name));
     let router = CalendarRouter::from_config_with_zone(&scoped, home);
     if !router.is_configured() {
-        return false;
+        return SyncOutcome::Noop;
     }
     // Results arrive in completion order under per-class caps. Each page is
     // still applied and dropped inside the sink, releasing its admission share.
@@ -742,7 +859,7 @@ fn sync_accounts_with_generation(
             }
         },
     )) else {
-        return false;
+        return SyncOutcome::Noop;
     };
     if skipped > 0 {
         tracing::debug!(
@@ -762,7 +879,7 @@ fn sync_accounts_with_generation(
             None => {}
         }
     }
-    changed
+    SyncOutcome::Completed { changed, coalesced }
 }
 
 /// Rule 3: a failed account keeps its events and cursor; only the failure is

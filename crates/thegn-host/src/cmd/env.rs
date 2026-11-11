@@ -776,7 +776,15 @@ fn resolve_with_selection(
             wt = wt
         )
     })?;
-    Ok(cfg.resolve_env(repo_root, loc, Path::new(wt), selected.as_deref()))
+    Ok(cfg.resolve_env(
+        repo_root,
+        loc,
+        Path::new(wt),
+        &thegn_core::sandbox_pin::EnvSelection {
+            name: selected.clone(),
+            profile: None,
+        },
+    ))
 }
 
 fn list(cfg: &Config, json: bool) -> Result<()> {
@@ -1176,7 +1184,12 @@ mod selection_tests {
         let repo_root = dir.path();
         let loc = GitLoc::Local(dir.path().to_path_buf());
         let cfg = Config::default();
-        let expected = cfg.resolve_env(repo_root, &loc, dir.path(), None);
+        let expected = cfg.resolve_env(
+            repo_root,
+            &loc,
+            dir.path(),
+            &thegn_core::sandbox_pin::EnvSelection::none(),
+        );
 
         let actual = resolve_with_selection(&cfg, &wt, repo_root, &loc, Ok(None))
             .expect("no selection keeps default resolution");

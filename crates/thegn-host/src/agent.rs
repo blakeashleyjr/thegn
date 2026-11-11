@@ -174,6 +174,50 @@ pub struct SandboxHalt {
     /// is a fix the user can take without leaving thegn. `None` for every other
     /// halt (a missing token, an unreachable host — nothing to start).
     pub dormant: Option<thegn_core::sandbox_dormant::DormantRuntime>,
+    /// This halt is a hides-home profile refusal that failover, backend `none`,
+    /// disabled sandboxing, or an isolation-floor change cannot bypass.
+    pub sealed_home: bool,
+}
+
+#[derive(Debug)]
+pub(crate) struct WorktreeIsolationReadFailure {
+    halt: SandboxHalt,
+}
+
+impl std::fmt::Display for WorktreeIsolationReadFailure {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // Short label only: the full halt (with its recovery hint) rides in
+        // `source()`, which the halt-aware call sites (`sandbox_halt_in`,
+        // `launch_state_gate_with_notice`) unpack. Printing the halt here too
+        // would make every `{e:#}` on the CLI/daemon/pipeline paths show the
+        // entire halt text, hint included, twice.
+        formatter.write_str("worktree isolation setting unreadable")
+    }
+}
+
+impl std::error::Error for WorktreeIsolationReadFailure {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&self.halt)
+    }
+}
+
+pub(crate) fn worktree_isolation_read_failure(
+    worktree: &str,
+    error: &anyhow::Error,
+) -> anyhow::Error {
+    anyhow::Error::new(WorktreeIsolationReadFailure {
+        halt: SandboxHalt {
+            env_name: "worktree isolation".into(),
+            placement: worktree.to_string(),
+            reason: format!(
+                "thegn cannot read this worktree's isolation setting ({error:#}); refusing launch. Run `thegn doctor`, or once the database opens: {}",
+                thegn_core::sandbox_floor::clear_profile_hint(worktree)
+            ),
+            ask: false,
+            dormant: None,
+            sealed_home: false,
+        },
+    })
 }
 
 /// A provider session was selected, but its trusted launch command could no
@@ -198,6 +242,23 @@ impl std::error::Error for DevcontainerLaunchRefused {}
 
 impl std::fmt::Display for SandboxHalt {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        if self.sealed_home {
+            let fix = if self.reason.contains("thegn sandbox profile set standard") {
+                String::new()
+            } else {
+                format!(
+                    " Fix: {}",
+                    thegn_core::sandbox_floor::standard_switch_hint(None)
+                )
+            };
+            return write!(
+                f,
+                "environment '{}' ({}) could not be brought up: {} — thegn will not \
+                 silently fall back to the host.{} If the required runtime is unavailable, \
+                 install/start it (`thegn doctor` shows which).",
+                self.env_name, self.placement, self.reason, fix
+            );
+        }
         let allow = if self.ask {
             "choose \"run on host\", set `backend = \"none\"`, disable sandboxing, or set `isolation_floor = \"off\"`; otherwise install/start a container runtime (`thegn doctor` shows which)"
         } else {
@@ -316,12 +377,43 @@ pub fn prepare_sandbox_env(
     choice_is_explicit: bool,
     selected_env: Option<&str>,
 ) -> anyhow::Result<SandboxOutcome> {
+    let mut selection =
+        Db::open()?.effective_env_selection(worktree, &repo_root.to_string_lossy())?;
+    if let Some(name) = selected_env {
+        selection.name = Some(name.to_string());
+    }
+    prepare_sandbox_env_with_selection(
+        cfg,
+        repo_root,
+        worktree,
+        loc,
+        backend_choice,
+        choice_is_explicit,
+        &selection,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn prepare_sandbox_env_with_selection(
+    cfg: &Config,
+    repo_root: &Path,
+    worktree: &str,
+    loc: &GitLoc,
+    backend_choice: Option<&str>,
+    choice_is_explicit: bool,
+    selection: &thegn_core::sandbox_pin::EnvSelection,
+) -> anyhow::Result<SandboxOutcome> {
     use crate::handlers::repo_trust::resolve_env_trusted;
     let generation =
         crate::config_startup::display().map_or(0, |admitted| admitted.revision().generation);
-    let trusted = resolve_env_trusted(cfg, repo_root, loc, worktree, selected_env);
+    let trusted = resolve_env_trusted(cfg, repo_root, loc, worktree, selection)?;
     let environment = trusted.environment;
     let devcontainer = trusted.devcontainer;
+    // The MERGED pin (DB pin or an explicit caller profile): the sealed gate
+    // below must refuse a disabled sandbox for THIS worktree's pin, which the
+    // caller's `selection` argument alone does not carry (the launch path
+    // passes `profile: None`).
+    let pin = trusted.pin;
     let mut placement = environment.placement.clone();
     let env_shell = environment.sandbox.shell.clone();
     // The worktree-projection plan (sshfs/sync) for this env's `data` mode, or
@@ -523,6 +615,7 @@ pub fn prepare_sandbox_env(
                 ),
                 ask,
                 dormant: None,
+                sealed_home: sb.profile.hides_home(),
             }
             .into());
         }
@@ -544,7 +637,8 @@ pub fn prepare_sandbox_env(
         return Err(anyhow::Error::new(refusal));
     }
     let is_provider = matches!(placement, thegn_core::placement::Placement::Provider(_));
-    if let Some(refusal) = thegn_core::sandbox_floor::provider_refusal(is_provider, &sb, &env_name)
+    if let Some(refusal) =
+        thegn_core::sandbox_floor::provider_refusal_for(is_provider, &sb, &env_name, Some(worktree))
     {
         return Err(anyhow::Error::new(refusal));
     }
@@ -576,6 +670,7 @@ pub fn prepare_sandbox_env(
                         reason: format!("{e:#}"),
                         ask,
                         dormant: None,
+                        sealed_home: false,
                     }
                     .into());
                 }
@@ -617,6 +712,7 @@ pub fn prepare_sandbox_env(
                 reason: format!("{e:#}"),
                 ask,
                 dormant: None,
+                sealed_home: false,
             }
             .into());
         }
@@ -674,13 +770,22 @@ pub fn prepare_sandbox_env(
                 if spec.placement.is_local() {
                     break;
                 }
-                let admission = crate::sandbox_admission::admit(
-                    &sb,
-                    spec.capabilities().isolation,
-                    worktree,
-                    force_host_requested(worktree),
-                    &mut warnings,
-                )?;
+                if hardening.hides_home()
+                    && !matches!(&spec.placement, thegn_core::placement::Placement::Ssh(_))
+                {
+                    return Err(SandboxHalt {
+                        env_name: env_name.clone(),
+                        placement: placement_label.clone(),
+                        reason: format!(
+                            "sealed profile `{}` needs a container runtime on this remote placement; refusing a bare shell for {worktree}",
+                            hardening.as_str()
+                        ),
+                        ask,
+                        dormant: None,
+                        sealed_home: true,
+                    }
+                    .into());
+                }
                 ssh_none_guard(
                     &spec,
                     sb.backend,
@@ -688,6 +793,14 @@ pub fn prepare_sandbox_env(
                     ask,
                     &env_name,
                     &placement_label,
+                    hardening,
+                )?;
+                let admission = crate::sandbox_admission::admit(
+                    &sb,
+                    spec.capabilities().isolation,
+                    worktree,
+                    force_host_requested(worktree),
+                    &mut warnings,
                 )?;
                 upload_provider_sync_once(
                     cfg,
@@ -985,6 +1098,7 @@ pub fn prepare_sandbox_env(
             reason: m,
             ask,
             dormant: None,
+            sealed_home: true,
         }
         .into());
     }
@@ -995,6 +1109,7 @@ pub fn prepare_sandbox_env(
             reason: m,
             ask,
             dormant: None,
+            sealed_home: sb.profile.hides_home(),
         }
         .into());
     }
@@ -1005,24 +1120,35 @@ pub fn prepare_sandbox_env(
             reason: m.refusal(),
             ask,
             dormant: None,
+            sealed_home: sb.profile.hides_home(),
         }
         .into());
     }
     // THE-215: a sealed profile never lands on the host. No spec, a `none`
-    // backend, or an unreachable runtime all end here — refuse, regardless of
-    // failover mode. (`sandbox.enabled = false` is the user's explicit choice and
-    // never enters the candidate walk; doctor says the profile is not enforced.)
-    if sb.enabled && hardening.hides_home() {
+    // backend or unreachable runtime all end here — refuse, regardless of
+    // failover mode. A sealed worktree pin also refuses when global/env sandboxing
+    // is disabled; an unpinned global sealed profile keeps its existing opt-out.
+    if sealed_pin_requires_sandbox(sb.enabled, pin, hardening) {
         return Err(SandboxHalt {
             env_name: env_name.clone(),
             placement: placement_label.clone(),
-            reason: format!(
-                "profile `{}` requires a sandbox that hides $HOME, but no backend produced one \
-                 for {worktree}; refusing to open a host shell (see `thegn doctor`)",
-                hardening.as_str()
-            ),
+            reason: if env_is_remote {
+                format!(
+                    "profile `{}` is a local-sandbox feature; this is a remote placement, so \
+                     thegn cannot enforce hiding $HOME or removing the network for {worktree}; \
+                     refusing the launch (see `thegn doctor`)",
+                    hardening.as_str()
+                )
+            } else {
+                format!(
+                    "profile `{}` requires a sandbox that hides $HOME, but no backend produced \
+                     one for {worktree}; refusing to open a host shell (see `thegn doctor`)",
+                    hardening.as_str()
+                )
+            },
             ask,
             dormant: None,
+            sealed_home: true,
         }
         .into());
     }
@@ -1038,6 +1164,7 @@ pub fn prepare_sandbox_env(
             reason: crate::remote_sync::no_backend_reason(reachable, &warnings),
             ask,
             dormant: None,
+            sealed_home: false,
         }
         .into());
     }
@@ -1084,6 +1211,7 @@ pub fn prepare_sandbox_env(
                         },
                         ask: true,
                         dormant: Some(rt),
+                        sealed_home: false,
                     }
                     .into());
                 }
@@ -1097,6 +1225,7 @@ pub fn prepare_sandbox_env(
                     reason: format!("{} is installed but unavailable — inspect runtime health and access with `thegn doctor`", rt.name),
                     ask,
                     dormant: Some(rt),
+                    sealed_home: false,
                 }
                 .into());
             }
@@ -1132,6 +1261,7 @@ pub fn prepare_sandbox_env(
                     .to_string(),
                 ask: false,
                 dormant: None,
+                sealed_home: false,
             }
             .into());
         }
@@ -1165,6 +1295,17 @@ pub fn prepare_sandbox_env(
         route_ssh_target,
         admission,
     })
+}
+
+fn sealed_pin_requires_sandbox(
+    sandbox_enabled: bool,
+    pin: Option<thegn_core::config::SandboxProfile>,
+    effective: thegn_core::config::SandboxProfile,
+) -> bool {
+    // Only a pin that itself hides $HOME refuses a disabled sandbox: the
+    // effective profile may come from a repo overlay or zone default rather
+    // than this worktree's choice, and a `standard` pin is not a sealed ask.
+    effective.hides_home() && (sandbox_enabled || pin.is_some_and(|p| p.hides_home()))
 }
 
 /// Validate the effective configured sources before backend resolution. The
@@ -1734,12 +1875,8 @@ pub fn provider_proxy_target(
     let read =
         Db::open().and_then(|db| db.effective_env_checked(worktree, &repo_root.to_string_lossy()));
     let selected_env = env_selection_or_refuse(worktree, "provider proxy target", read)?;
-    let environment = cfg.resolve_env(
-        &repo_root,
-        &loc,
-        Path::new(worktree),
-        selected_env.as_deref(),
-    );
+    let selection = selection_with_profile(worktree, &repo_root, selected_env.clone())?;
+    let environment = cfg.resolve_env(&repo_root, &loc, Path::new(worktree), &selection);
     let thegn_core::placement::Placement::Provider(p) = &environment.placement else {
         return None;
     };
@@ -1950,12 +2087,10 @@ fn native_exec_for(cfg: &Config, worktree: &str, agent_cmd: Option<String>) -> P
         Some(selected_env) => selected_env,
         None => return PaneNativeExec::Unavailable,
     };
-    let environment = cfg.resolve_env(
-        &repo_root,
-        &loc,
-        Path::new(worktree),
-        selected_env.as_deref(),
-    );
+    let Some(selection) = selection_with_profile(worktree, &repo_root, selected_env.clone()) else {
+        return PaneNativeExec::Unavailable;
+    };
+    let environment = cfg.resolve_env(&repo_root, &loc, Path::new(worktree), &selection);
     let thegn_core::placement::Placement::Provider(p) = &environment.placement else {
         return PaneNativeExec::Unavailable;
     };
@@ -2080,12 +2215,10 @@ pub fn provision_pending(cfg: &Config, worktree: &str) -> bool {
     let Some(selected_env) = env_selection_or_refuse(worktree, "provision check", read) else {
         return false;
     };
-    let environment = cfg.resolve_env(
-        &repo_root,
-        &loc,
-        Path::new(worktree),
-        selected_env.as_deref(),
-    );
+    let Some(selection) = selection_with_profile(worktree, &repo_root, selected_env.clone()) else {
+        return false;
+    };
+    let environment = cfg.resolve_env(&repo_root, &loc, Path::new(worktree), &selection);
     if !matches!(
         environment.placement,
         thegn_core::placement::Placement::Provider(_)
@@ -2221,12 +2354,11 @@ pub fn clear_native_exec_cooldown(cfg: &Config, worktree: &str) {
         clear_configured_provider_cooldowns(cfg);
         return;
     };
-    let environment = cfg.resolve_env(
-        &repo_root,
-        &loc,
-        Path::new(worktree),
-        selected_env.as_deref(),
-    );
+    let Some(selection) = selection_with_profile(worktree, &repo_root, selected_env.clone()) else {
+        clear_configured_provider_cooldowns(cfg);
+        return;
+    };
+    let environment = cfg.resolve_env(&repo_root, &loc, Path::new(worktree), &selection);
     if let thegn_core::placement::Placement::Provider(_) = &environment.placement
         && let Some(envc) = cfg.env.get(&environment.name)
     {
@@ -2296,17 +2428,25 @@ pub fn provision_worktree(
         ProvisionSelection::Resolve(selected_env) => selected_env,
         ProvisionSelection::Skip => return Ok(false),
     };
-    let environment = cfg.resolve_env(
-        &repo_root,
-        &loc,
-        Path::new(worktree),
-        selected_env.as_deref(),
-    );
+    let mut selection =
+        Db::open()?.effective_env_selection(worktree, &repo_root.to_string_lossy())?;
+    if selected_env.is_some() {
+        selection.name = selected_env;
+    }
+    let environment = cfg.resolve_env(&repo_root, &loc, Path::new(worktree), &selection);
     if !matches!(
         environment.placement,
         thegn_core::placement::Placement::Provider(_)
     ) {
         return Ok(false);
+    }
+    if let Some(refusal) = thegn_core::sandbox_floor::provider_refusal_for(
+        true,
+        &environment.sandbox,
+        &environment.name,
+        Some(worktree),
+    ) {
+        return Err(anyhow::Error::new(refusal));
     }
     // Flag the in-flight provision so the warm-claim fast path won't bind a
     // spare (and clear the splash) under this run — see `provision_gate`.
@@ -2335,6 +2475,31 @@ fn env_selection_or_refuse(
     }
 }
 
+fn selection_with_profile(
+    worktree: &str,
+    repo_root: &Path,
+    selected_name: Option<String>,
+) -> Option<thegn_core::sandbox_pin::EnvSelection> {
+    let db = match Db::open() {
+        Ok(db) => db,
+        Err(error) => {
+            tracing::warn!(target: "thegn::provider", worktree, error = %format!("{error:#}"), "provider path refused: worktree sandbox selection unreadable");
+            return None;
+        }
+    };
+    let mut selection = match db.effective_env_selection(worktree, &repo_root.to_string_lossy()) {
+        Ok(selection) => selection,
+        Err(error) => {
+            tracing::warn!(target: "thegn::provider", worktree, error = %format!("{error:#}"), "provider path refused: worktree sandbox selection unreadable");
+            return None;
+        }
+    };
+    if selected_name.is_some() {
+        selection.name = selected_name;
+    }
+    Some(selection)
+}
+
 /// The env selection for provisioning: a failed read is an error naming the cause.
 enum ProvisionSelection {
     Resolve(Option<String>),
@@ -2358,8 +2523,9 @@ fn provision_selection(
 
 /// Whether any remote placement may apply to a worktree under `cfg`: a non-local or host-pinned `[env.<name>]`, the
 /// placement engine, or a `[sandbox.remote]` host. The union of the batch-78 gates in `provision_worktree`,
-/// `host_flow::resolve_binding` and `placement_flow::plan_selection`. When none applies, a worktree can only be local,
-/// so a failed location read is resolved as local and a plain local shell is never refused (THE-1474).
+/// `host_flow::resolve_binding` and `placement_flow::plan_selection`. The set
+/// is used by those placement decisions; unreadable worktree isolation is
+/// independently a typed launch halt.
 pub(crate) fn remote_placement_configured(cfg: &Config) -> bool {
     cfg.placement.enabled
         || cfg.sandbox.remote.is_remote()
@@ -2671,7 +2837,9 @@ pub fn provision_provider_env_named(
         .map(PathBuf::from)
         .or_else(|| repo::main_worktree(Path::new(worktree)))
         .unwrap_or_else(|| PathBuf::from(worktree));
-    let resolved = cfg.resolve_env(&repo_root, &loc, Path::new(worktree), Some(env_name));
+    let selection = selection_with_profile(worktree, &repo_root, Some(env_name.to_string()))
+        .ok_or_else(|| anyhow::anyhow!("the worktree's sandbox profile could not be read"))?;
+    let resolved = cfg.resolve_env(&repo_root, &loc, Path::new(worktree), &selection);
     let allow = &resolved.sandbox.network_allow;
     let block = &resolved.sandbox.network_block;
     let admission =
@@ -3727,7 +3895,12 @@ fn auto_provision_sandbox(
                 .map(PathBuf::from)
                 .or_else(|| repo::main_worktree(Path::new(worktree)))
                 .unwrap_or_else(|| PathBuf::from(worktree));
-            let resolved = cfg.resolve_env(&repo_root, &loc, Path::new(worktree), Some(env_name));
+            let selection =
+                selection_with_profile(worktree, &repo_root, Some(env_name.to_string()))
+                    .ok_or_else(|| {
+                        anyhow::anyhow!("the worktree's sandbox profile could not be read")
+                    })?;
+            let resolved = cfg.resolve_env(&repo_root, &loc, Path::new(worktree), &selection);
             let allow = &resolved.sandbox.network_allow;
             let block = &resolved.sandbox.network_block;
             crate::egress_admit::gate_handed_sandbox(
@@ -4421,7 +4594,7 @@ pub fn launch_spec_full(
                 worktree,
                 choice,
                 "the state database could not be opened, so this worktree's saved sandbox override, selected environment and credential-overlay gate cannot be checked",
-                &error,
+                &worktree_isolation_read_failure(worktree, &error),
             )?;
             None
         }
@@ -4496,7 +4669,7 @@ pub fn launch_spec_full(
                     worktree,
                     choice,
                     "this worktree's selected execution environment could not be read",
-                    &error,
+                    &worktree_isolation_read_failure(worktree, &error),
                 )?;
                 None
             }
@@ -4511,14 +4684,17 @@ pub fn launch_spec_full(
         .as_deref()
         .map(str::trim)
         .is_some_and(|s| !s.is_empty() && s != "auto");
-    let mut outcome = prepare_sandbox_env(
+    let mut outcome = prepare_sandbox_env_with_selection(
         cfg,
         &repo_root,
         worktree,
         &loc,
         saved_backend.as_deref(),
         saved_is_override,
-        selected_env.as_deref(),
+        &thegn_core::sandbox_pin::EnvSelection {
+            name: selected_env.clone(),
+            profile: None,
+        },
     )?;
     if let Some(target) = outcome.route_ssh_target.as_ref() {
         crate::remote_enqueue_auth::reconcile_ssh_credential(cfg, target, &repo_root, worktree)?;
@@ -5112,6 +5288,12 @@ pub(crate) fn launch_state_gate_with_notice(
     error: &anyhow::Error,
     notify: impl FnOnce(&str, &str),
 ) -> anyhow::Result<()> {
+    if let Some(failure) = error
+        .chain()
+        .find_map(|source| source.downcast_ref::<WorktreeIsolationReadFailure>())
+    {
+        return Err(anyhow::Error::new(failure.halt.clone()));
+    }
     if is_configured_entry(cfg, choice) {
         anyhow::bail!("refusing to launch `{choice}`: {what}: {error:#}");
     }

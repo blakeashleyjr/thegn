@@ -3,7 +3,7 @@
 //! player exposes, plus a push [`MprisWatch`] built from D-Bus signals so the
 //! host updates on change without polling.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::future::Future;
 use std::time::Duration;
 
@@ -29,6 +29,16 @@ const TRACKLIST_IFACE: &str = "org.mpris.MediaPlayer2.TrackList";
 
 type PlayerPropertyRead = (String, Result<HashMap<String, OwnedValue>, MediaError>);
 
+fn first_playlist_failure(seen: &std::sync::Mutex<HashSet<String>>, bus: &str) -> bool {
+    let Ok(mut set) = seen.lock() else {
+        return false;
+    };
+    if set.len() >= 64 {
+        set.clear();
+    }
+    set.insert(bus.to_string())
+}
+
 /// A connected MPRIS controller. Holds one session-bus connection; the active
 /// player is re-resolved per call so launching/quitting a player is picked up.
 pub struct MprisZbus {
@@ -40,6 +50,7 @@ pub struct MprisZbus {
     /// playing/paused so the badge doesn't flicker between them on every D-Bus
     /// signal. Interior-mutable because `snapshot`/controls take `&self`.
     last: std::sync::Mutex<Option<String>>,
+    playlist_warned: std::sync::Mutex<HashSet<String>>,
 }
 
 impl MprisZbus {
@@ -53,6 +64,7 @@ impl MprisZbus {
             conn,
             priority,
             last: std::sync::Mutex::new(None),
+            playlist_warned: std::sync::Mutex::new(HashSet::new()),
         })
     }
 
@@ -289,7 +301,9 @@ impl MediaBackend for MprisZbus {
             let playlists = match playlists {
                 Ok(available) => available,
                 Err(error) => {
-                    tracing::debug!(target: "thegn::media", bus = %bus, %error, "MPRIS playlist capability unavailable");
+                    if first_playlist_failure(&self.playlist_warned, &bus) {
+                        tracing::debug!(target: "thegn::media", bus = %bus, %error, "MPRIS playlist capability unavailable");
+                    }
                     false
                 }
             };
@@ -1070,6 +1084,42 @@ fn caps_from_props(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn playlist_unavailable_logs_once_per_bus() {
+        let seen = std::sync::Mutex::new(HashSet::new());
+
+        assert!(first_playlist_failure(&seen, "org.mpris.MediaPlayer2.mpd"));
+        assert!(!first_playlist_failure(&seen, "org.mpris.MediaPlayer2.mpd"));
+        assert!(first_playlist_failure(
+            &seen,
+            "org.mpris.MediaPlayer2.other"
+        ));
+        assert!(!first_playlist_failure(&seen, "org.mpris.MediaPlayer2.mpd"));
+    }
+
+    #[test]
+    fn playlist_unavailable_set_is_bounded() {
+        let seen = std::sync::Mutex::new(HashSet::new());
+
+        for index in 0..70 {
+            assert!(first_playlist_failure(
+                &seen,
+                &format!("org.mpris.MediaPlayer2.player{index}")
+            ));
+            assert!(seen.lock().unwrap().len() <= 64);
+        }
+
+        assert!(first_playlist_failure(
+            &seen,
+            "org.mpris.MediaPlayer2.player0"
+        ));
+        assert!(first_playlist_failure(
+            &seen,
+            "org.mpris.MediaPlayer2.after-clear"
+        ));
+        assert!(seen.lock().unwrap().len() <= 64);
+    }
 
     #[test]
     fn playlist_page_counts_reported_and_extra_rows() {

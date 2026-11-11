@@ -16,7 +16,8 @@ use crate::agent::{SandboxHalt, force_host_requested, native_exec_healthy};
 
 /// Cheap, **loop-safe** (no network/subprocess) check made right before a
 /// worktree pane spawns: should this worktree HALT with a warning instead of
-/// opening a (host-degraded) pane? Returns `Some` only for a NON-LOCAL env whose
+/// opening a (host-degraded) pane? Returns `Some` for unreadable worktree
+/// isolation, or for a NON-LOCAL env whose
 /// failover mode blocks (`halt`/`ask`) and whose bring-up is already known to be
 /// impossible — its API token is unset, or its native exec is in the
 /// post-failure cooldown (the live signal a recent connect/auth attempt failed,
@@ -24,8 +25,8 @@ use crate::agent::{SandboxHalt, force_host_requested, native_exec_healthy};
 /// is `auto` (or the worktree was pinned to the host), or when there's no cheap
 /// evidence of failure yet — in which case a later bring-up failure is caught in
 /// `prepare_sandbox_env` / the native relay, which flip the health flag so the
-/// next spawn halts here. An unreadable selection also halts when remote placement
-/// is configured, rather than resolving to the default environment.
+/// next spawn halts here. An unreadable selection always halts rather than
+/// resolving a default environment.
 pub fn env_halt_reason(cfg: &Config, worktree: &str) -> Option<SandboxHalt> {
     use thegn_core::config::ProviderExecMode;
     let loc = GitLoc::for_worktree(Path::new(worktree));
@@ -79,37 +80,25 @@ pub fn env_halt_reason(cfg: &Config, worktree: &str) -> Option<SandboxHalt> {
                 thegn_core::config::FailoverMode::Ask
             ),
             dormant: None,
+            sealed_home: false,
         });
     }
-    let selected_env = match Db::open()
-        .and_then(|db| db.effective_env_checked(worktree, &repo_root.to_string_lossy()))
+    let selection = match Db::open()
+        .and_then(|db| db.effective_env_selection(worktree, &repo_root.to_string_lossy()))
     {
         Ok(selection) => selection,
         Err(error) => {
-            if let Some(halt) = unreadable_selection_halt(cfg, &error) {
-                tracing::warn!(
-                    target: "thegn::sandbox",
-                    worktree,
-                    error = %format!("{error:#}"),
-                    "HALT: environment selection unreadable"
-                );
-                return Some(halt);
-            }
-            tracing::debug!(
+            let halt = unreadable_selection_halt(worktree, &error);
+            tracing::warn!(
                 target: "thegn::sandbox",
                 worktree,
                 error = %format!("{error:#}"),
-                "environment selection unreadable; continuing with local resolution"
+                "HALT: worktree isolation selection unreadable"
             );
-            None
+            return Some(halt);
         }
     };
-    let environment = cfg.resolve_env(
-        &repo_root,
-        &loc,
-        Path::new(worktree),
-        selected_env.as_deref(),
-    );
+    let environment = cfg.resolve_env(&repo_root, &loc, Path::new(worktree), &selection);
     // A non-default env was SELECTED (per-worktree pin, repo `.thegn.*` overlay, or
     // `default_env`) but didn't resolve to an `[env.<name>]` table, so resolution
     // fell back to Local carrying the requested name (`unresolved_selection`). That
@@ -135,8 +124,27 @@ pub fn env_halt_reason(cfg: &Config, worktree: &str) -> Option<SandboxHalt> {
                 ),
                 ask: matches!(mode, thegn_core::config::FailoverMode::Ask),
                 dormant: None,
+                sealed_home: false,
             });
         }
+    }
+    if matches!(
+        &environment.placement,
+        thegn_core::placement::Placement::Provider(_)
+    ) && let Some(refusal) = thegn_core::sandbox_floor::provider_refusal_for(
+        true,
+        &environment.sandbox,
+        &environment.name,
+        Some(worktree),
+    ) {
+        return Some(SandboxHalt {
+            env_name: environment.name.clone(),
+            placement: environment.placement.label(),
+            reason: refusal.to_string(),
+            ask: false,
+            dormant: None,
+            sealed_home: environment.sandbox.profile.hides_home(),
+        });
     }
     // Local envs never halt; `auto` degrades silently (no block); a worktree the
     // user pinned to the host ("run on host") must not re-block. Only `halt`/`ask`
@@ -171,6 +179,7 @@ pub fn env_halt_reason(cfg: &Config, worktree: &str) -> Option<SandboxHalt> {
                 reason: format!("API token {var} could not be resolved"),
                 ask,
                 dormant: None,
+                sealed_home: false,
             });
         }
         // Connect-failure cooldown: a recent connect/auth failure (401, or an ssh
@@ -192,6 +201,7 @@ pub fn env_halt_reason(cfg: &Config, worktree: &str) -> Option<SandboxHalt> {
                 ),
                 ask,
                 dormant: None,
+                sealed_home: false,
             });
         }
         tracing::debug!(target: "thegn::sandbox", env = %environment.name, "env_halt_reason: provider OK, no halt");
@@ -199,19 +209,20 @@ pub fn env_halt_reason(cfg: &Config, worktree: &str) -> Option<SandboxHalt> {
     None
 }
 
-/// An unreadable environment selection where a remote placement could apply: halt instead of resolving the default
-/// environment (THE-419). `None` when no remote placement is configured: the worktree can only be local, and a plain
-/// local shell is never refused (THE-1474).
-fn unreadable_selection_halt(cfg: &Config, error: &anyhow::Error) -> Option<SandboxHalt> {
-    crate::agent::remote_placement_configured(cfg).then(|| SandboxHalt {
-        env_name: "unknown".into(),
-        placement: "unknown".into(),
+/// An unreadable worktree selection is a typed halt: the sandbox pin cannot be
+/// inferred safely, even for a local shell.
+fn unreadable_selection_halt(worktree: &str, error: &anyhow::Error) -> SandboxHalt {
+    let recovery = thegn_core::sandbox_floor::clear_profile_hint(worktree);
+    SandboxHalt {
+        env_name: "worktree isolation".into(),
+        placement: worktree.to_string(),
         reason: format!(
-            "the environment selection could not be read ({error:#}); the default environment is never used instead"
+            "thegn cannot read this worktree's isolation setting ({error:#}); refusing launch. Run `thegn doctor`, or once the database opens: {recovery}."
         ),
         ask: false,
         dormant: None,
-    })
+        sealed_home: false,
+    }
 }
 
 fn unresolved_env_reason(name: &str, channel_clamped: bool) -> String {
@@ -227,45 +238,29 @@ fn unresolved_env_reason(name: &str, channel_clamped: bool) -> String {
 #[cfg(test)]
 mod tests {
     use super::{unreadable_selection_halt, unresolved_env_reason};
-    use thegn_core::config::{Config, EnvConfig, PlacementMode};
 
     #[test]
-    fn unreadable_selection_halts_only_where_a_remote_placement_is_configured() {
+    fn unreadable_selection_is_a_typed_halt_even_for_local_worktrees() {
         let error = anyhow::anyhow!("database is locked");
-        assert!(unreadable_selection_halt(&Config::default(), &error).is_none());
-
-        let cfg = Config {
-            env: [(
-                "remote".into(),
-                EnvConfig {
-                    placement: PlacementMode::Provider,
-                    ..Default::default()
-                },
-            )]
-            .into(),
-            ..Config::default()
-        };
-        assert!(unreadable_selection_halt(&cfg, &error).is_some());
+        let halt = unreadable_selection_halt("/wt/a", &error);
+        assert!(
+            halt.reason
+                .contains("thegn cannot read this worktree's isolation setting")
+        );
+        assert!(halt.reason.contains("thegn doctor"));
     }
 
     #[test]
     fn unreadable_selection_halt_names_the_read_error() {
-        let cfg = Config {
-            env: [(
-                "remote".into(),
-                EnvConfig {
-                    placement: PlacementMode::Provider,
-                    ..Default::default()
-                },
-            )]
-            .into(),
-            ..Config::default()
-        };
-        let halt = unreadable_selection_halt(&cfg, &anyhow::anyhow!("database is locked"))
-            .expect("remote placement halts on an unreadable selection");
+        let halt = unreadable_selection_halt("/wt/a tree", &anyhow::anyhow!("database is locked"));
 
         assert!(halt.reason.contains("database is locked"));
-        assert!(halt.reason.contains("never used instead"));
+        // The recovery route is the pin-clear command (the `set standard`
+        // downgrade is the sealed-refusal hint, not this one).
+        assert!(
+            halt.reason
+                .contains("thegn sandbox profile clear --worktree '/wt/a tree'")
+        );
         assert!(!halt.ask);
     }
 

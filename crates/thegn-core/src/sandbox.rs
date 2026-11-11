@@ -670,7 +670,7 @@ impl RefusalClass {
                 "remove the protected host path from the Compose file's binds, or choose a less restrictive [sandbox] profile"
             }
             Self::SealedHome => {
-                "sealed profiles hide $HOME: move the mount or worktree out of $HOME, or use profile 'standard'"
+                "sealed profiles hide $HOME: move the mount or worktree out of $HOME, or use profile 'standard' (`thegn sandbox profile set standard`)"
             }
             Self::UnsafeMountPath => {
                 "rename the mount path so it has no whitespace, quote, backslash or ':', or use the bwrap backend"
@@ -704,7 +704,7 @@ impl RefusalClass {
                 "move [daemon] socket and $XDG_RUNTIME_DIR out of $HOME, the worktree and every sandbox mount (the default /run/user/<uid> is never mounted)"
             }
             Self::StrictUnsupported => {
-                "use a backend that enforces every sealed control (bwrap or an OCI runtime), or choose a non-sealed profile"
+                "use a backend that enforces every sealed control (bwrap or an OCI runtime), or choose a non-sealed profile with `thegn sandbox profile set standard`"
             }
             Self::ContainerOwner => {
                 "another worktree's sandbox container has this container's name (worktree paths that differ only in punctuation or case share one): close that worktree's sandbox first, or rename one worktree directory"
@@ -3305,12 +3305,17 @@ fn wrap_script(spec: &SandboxSpec, inner: &str) -> String {
         s.push_str(init);
         s.push('\n');
     }
+    // The inner command may already carry `exec` (for example shell_inner_override).
+    let bare = inner
+        .strip_prefix("exec ")
+        .map(str::trim_start)
+        .unwrap_or(inner);
     if spec.devenv {
         // Prefer the absolute path resolved at spec-build time so OCI containers
         // (which don't inherit the host PATH) can exec devenv without it being on
         // their default PATH.
         let devenv = spec.devenv_path.as_deref().unwrap_or("devenv");
-        s.push_str(&format!("exec {devenv} shell -- {inner}"));
+        s.push_str(&format!("exec {devenv} shell -- {bare}"));
     } else if inner.contains("&&")
         || inner.contains("||")
         || inner.contains('|')
@@ -3327,7 +3332,7 @@ fn wrap_script(spec: &SandboxSpec, inner: &str) -> String {
         // `|` check, but either substring is enough to skip the prefix.)
         s.push_str(inner);
     } else {
-        s.push_str(&format!("exec {inner}"));
+        s.push_str(&format!("exec {bare}"));
     }
     s
 }

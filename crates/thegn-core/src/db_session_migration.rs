@@ -31,7 +31,7 @@ impl SessionMigrationStore for Db {
                 "SELECT worktree, COALESCE(session_name,''), COALESCE(tab_name,''),
                         COALESCE(repo_path,''), COALESCE(branch,''), COALESCE(agent,''),
                         COALESCE(created_at,0), COALESCE(location,''), COALESCE(position,0),
-                        sandbox_backend, observed_backend, folder_id, env_name
+                        sandbox_backend, observed_backend, folder_id, env_name, sandbox_profile
                    FROM worktrees WHERE worktree=?1",
                 params![worktree_path],
                 map_worktree,
@@ -76,7 +76,7 @@ impl SessionMigrationStore for Db {
                 "SELECT worktree, COALESCE(session_name,''), COALESCE(tab_name,''),
                         COALESCE(repo_path,''), COALESCE(branch,''), COALESCE(agent,''),
                         COALESCE(created_at,0), COALESCE(location,''), COALESCE(position,0),
-                        sandbox_backend, observed_backend, folder_id, env_name
+                        sandbox_backend, observed_backend, folder_id, env_name, sandbox_profile
                    FROM worktrees WHERE worktree=?1",
                 params![worktree_path],
                 map_worktree,
@@ -286,7 +286,22 @@ impl SessionMigrationStore for Db {
         let target =
             self.migration_target_snapshot(&plan.bundle.session_name, &plan.bundle.worktree_path)?;
         let actual = crate::session_migration::target_subset(&plan.bundle, &target);
-        Ok(actual.fingerprint() == plan.fingerprint)
+        if actual.fingerprint() != plan.fingerprint {
+            return Ok(false);
+        }
+        // The fingerprint excludes registration metadata (a target-owned or
+        // missing registration must not break the read-back), so compare the
+        // user-owned pin exactly -- but only when the source has a
+        // registration: `plan_migration` only conflicts when both sides are
+        // registered, so an unregistered source leaves the target's row (and
+        // its pin) target-owned.
+        Ok(match plan.bundle.worktree.as_ref() {
+            None => true,
+            Some(source) => target
+                .worktree
+                .as_ref()
+                .is_some_and(|registered| registered.sandbox_profile == source.sandbox_profile),
+        })
     }
 
     fn cleanup_migration(&self, bundle: &MigrationBundle) -> Result<MigrationCleanupResult> {
@@ -370,6 +385,7 @@ fn map_worktree(row: &Row<'_>) -> rusqlite::Result<crate::models::WorktreeRow> {
         observed_backend: row.get(10)?,
         folder_id: row.get(11)?,
         env_name: row.get(12)?,
+        sandbox_profile: row.get(13)?,
     })
 }
 
@@ -462,8 +478,8 @@ fn insert_worktree(db: &Db, worktree: &MigrationWorktree) -> Result<usize> {
         "INSERT OR IGNORE INTO worktrees
            (worktree, session_name, tab_name, repo_path, branch, agent,
             created_at, location, position, sandbox_backend, observed_backend,
-            folder_id, env_name)
-         VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13)",
+            folder_id, env_name, sandbox_profile)
+         VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14)",
         params![
             worktree.worktree,
             worktree.session_name,
@@ -478,6 +494,7 @@ fn insert_worktree(db: &Db, worktree: &MigrationWorktree) -> Result<usize> {
             worktree.observed_backend,
             worktree.folder_id,
             worktree.env_name,
+            worktree.sandbox_profile,
         ],
     )?)
 }
@@ -832,6 +849,219 @@ mod tests {
                 .worktree
                 .is_some()
         );
+    }
+
+    #[test]
+    fn session_move_carries_the_worktree_sandbox_profile_pin() {
+        let source = Db::open_memory().unwrap();
+        let target = Db::open_memory().unwrap();
+        source
+            .conn()
+            .execute(
+                "INSERT INTO worktrees(worktree,session_name,tab_name,repo_path,branch,agent,created_at,location,position,sandbox_profile)
+                 VALUES('/sealed','source','tab','/repo','feature','agent',1,'',3,'sealed')",
+                [],
+            )
+            .unwrap();
+
+        let bundle = source
+            .migration_snapshot("default", "target", "source", "/sealed")
+            .unwrap();
+        let plan = plan_migration(
+            bundle,
+            target
+                .migration_target_snapshot("source", "/sealed")
+                .unwrap(),
+            HistoryPolicy::Include,
+        )
+        .unwrap();
+        target.import_migration(&plan).unwrap();
+
+        let moved = target
+            .migration_target_snapshot("source", "/sealed")
+            .unwrap()
+            .worktree
+            .unwrap();
+        assert_eq!(moved.sandbox_profile.as_deref(), Some("sealed"));
+    }
+
+    #[test]
+    fn plan_refuses_a_target_registration_with_a_different_worktree_pin() {
+        let source = Db::open_memory().unwrap();
+        let target = Db::open_memory().unwrap();
+        source
+            .conn()
+            .execute(
+                "INSERT INTO worktrees(worktree,session_name,tab_name,repo_path,branch,agent,created_at,location,position,sandbox_profile)\n                 VALUES('/sealed','default','tab','/repo','feature','agent',1,'',3,'sealed')",
+                [],
+            )
+            .unwrap();
+        // The target already registers the same worktree under a different
+        // (here: unpinned) profile — the silent `INSERT OR IGNORE` case.
+        target
+            .conn()
+            .execute(
+                "INSERT INTO worktrees(worktree,session_name,tab_name,repo_path,branch,agent,created_at,location,position)\n                 VALUES('/sealed','default','tab','/repo','feature','agent',1,'',3)",
+                [],
+            )
+            .unwrap();
+
+        let bundle = source
+            .migration_snapshot("default", "target", "default", "/sealed")
+            .unwrap();
+        let conflict = plan_migration(
+            bundle,
+            target
+                .migration_target_snapshot("default", "/sealed")
+                .unwrap(),
+            HistoryPolicy::Include,
+        )
+        .unwrap_err();
+        assert_eq!(conflict, MigrationConflict::SandboxProfile);
+        // Planning refused before any write: the target keeps exactly its own
+        // registration and gains no imported presentation rows.
+        let target_state = target
+            .migration_target_snapshot("default", "/sealed")
+            .unwrap();
+        assert!(target_state.worktree.is_some());
+        assert_eq!(target_state.worktree.unwrap().sandbox_profile, None);
+        assert!(target_state.groups.is_empty());
+    }
+
+    #[test]
+    fn unregistered_source_move_confirms_against_a_pinned_target_registration() {
+        let source = Db::open_memory().unwrap();
+        let target = Db::open_memory().unwrap();
+        source
+            .conn()
+            .execute(
+                "INSERT INTO tab_groups(session_name,name,kind,worktree,ordinal,active_tab)
+                 VALUES('default','x','worktree','/x',0,0)",
+                [],
+            )
+            .unwrap();
+        target
+            .conn()
+            .execute(
+                "INSERT INTO worktrees(worktree,session_name,tab_name,repo_path,branch,agent,created_at,location,position,sandbox_profile)
+                 VALUES('/x','default','tab','/repo','feature','agent',1,'',3,'sealed')",
+                [],
+            )
+            .unwrap();
+
+        let bundle = source
+            .migration_snapshot("default", "target", "default", "/x")
+            .unwrap();
+        assert!(bundle.worktree.is_none());
+        let plan = plan_migration(
+            bundle,
+            target.migration_target_snapshot("default", "/x").unwrap(),
+            HistoryPolicy::Include,
+        )
+        .unwrap();
+        target.import_migration(&plan).unwrap();
+        assert!(target.confirm_migration(&plan).unwrap());
+        let moved = target
+            .migration_target_snapshot("default", "/x")
+            .unwrap()
+            .worktree
+            .unwrap();
+        assert_eq!(moved.sandbox_profile.as_deref(), Some("sealed"));
+    }
+
+    #[test]
+    fn import_aborts_when_a_conflicting_pin_registration_appears_after_planning() {
+        let source = Db::open_memory().unwrap();
+        let target = Db::open_memory().unwrap();
+        source
+            .conn()
+            .execute_batch(
+                "INSERT INTO worktrees
+                   (worktree,session_name,tab_name,repo_path,branch,agent,created_at,location,position,sandbox_profile)
+                 VALUES('/race','default','tab','/repo','feature','agent',1,'',3,'sealed');
+                 INSERT INTO tab_groups(session_name,name,kind,worktree,ordinal,active_tab)
+                 VALUES('default','race','worktree','/race',0,0);",
+            )
+            .unwrap();
+        let bundle = source
+            .migration_snapshot("default", "target", "default", "/race")
+            .unwrap();
+        // Plan against an empty target: no conflict yet.
+        let plan = plan_migration(
+            bundle,
+            target
+                .migration_target_snapshot("default", "/race")
+                .unwrap(),
+            HistoryPolicy::Include,
+        )
+        .unwrap();
+        // A registration with a different pin lands before the import runs.
+        target
+            .conn()
+            .execute(
+                "INSERT INTO worktrees(worktree,session_name,tab_name,repo_path,branch,agent,created_at,location,position)
+                 VALUES('/race','default','tab','/repo','feature','agent',1,'',3)",
+                [],
+            )
+            .unwrap();
+
+        assert!(target.import_migration(&plan).is_err());
+        let state = target
+            .migration_target_snapshot("default", "/race")
+            .unwrap();
+        assert!(state.groups.is_empty(), "a refused import writes nothing");
+        assert_eq!(state.worktree.unwrap().sandbox_profile, None);
+    }
+
+    #[test]
+    fn resumed_import_restores_a_missing_worktree_registration_with_its_pin() {
+        let source = Db::open_memory().unwrap();
+        let target = Db::open_memory().unwrap();
+        source
+            .conn()
+            .execute_batch(
+                "INSERT INTO worktrees\n                   (worktree,session_name,tab_name,repo_path,branch,agent,created_at,location,position,sandbox_profile)\n                 VALUES('/resume','default','tab','/repo','feature','agent',1,'',3,'sealed');\n                 INSERT INTO tab_groups(session_name,name,kind,worktree,ordinal,active_tab)\n                 VALUES('default','resume','worktree','/resume',0,0);",
+            )
+            .unwrap();
+        // A prior import committed the presentation rows but not the
+        // registration (e.g. it was interrupted before the worktree insert).
+        target
+            .conn()
+            .execute(
+                "INSERT INTO tab_groups(session_name,name,kind,worktree,ordinal,active_tab)\n                 VALUES('default','resume','worktree','/resume',0,0)",
+                [],
+            )
+            .unwrap();
+
+        let bundle = source
+            .migration_snapshot("default", "target", "default", "/resume")
+            .unwrap();
+        let plan = plan_migration(
+            bundle,
+            target
+                .migration_target_snapshot("default", "/resume")
+                .unwrap(),
+            HistoryPolicy::Include,
+        )
+        .unwrap();
+        assert!(
+            plan.resumed,
+            "a missing target registration must not break the resume"
+        );
+
+        let imported = target.import_migration(&plan).unwrap();
+        assert_eq!(imported.counts.worktrees, 1);
+        let target_state = target
+            .migration_target_snapshot("default", "/resume")
+            .unwrap();
+        let moved = target_state.worktree.expect("registration restored");
+        assert_eq!(moved.sandbox_profile.as_deref(), Some("sealed"));
+        assert_eq!(
+            target_state.groups.len(),
+            1,
+            "resume must not duplicate groups"
+        );
+        assert!(target.confirm_migration(&plan).unwrap());
     }
 
     #[test]

@@ -324,6 +324,9 @@ self: {
     notifications.github_mentions = cfg.notificationsGithubMentions;
     notifications.agent_attention_inbox = cfg.notificationsAgentAttentionInbox;
     notifications.merge_queue_hold_desktop = cfg.notificationsMergeQueueHoldDesktop;
+    notifications.dnd.enabled = cfg.notificationsDndEnabled;
+    notifications.sound.mute = cfg.notificationsSoundMute;
+    notifications.sound.suppress_focused = cfg.notificationsSoundSuppressFocused;
     activity.enabled = cfg.activityEnabled;
     activity.red_requires_agent = cfg.activityRedRequiresAgent;
     activity.agent_programs = cfg.activityAgentPrograms;
@@ -1039,6 +1042,24 @@ in {
       type = lib.types.nullOr (lib.types.bool);
       default = null;
       description = "Show merge-queue hold notifications on desktop sinks. Unset (null) = the binary's default.";
+    };
+
+    notificationsDndEnabled = lib.mkOption {
+      type = lib.types.nullOr (lib.types.bool);
+      default = null;
+      description = "Enable do-not-disturb notification handling. Unset (null) = the binary's default.";
+    };
+
+    notificationsSoundMute = lib.mkOption {
+      type = lib.types.nullOr (lib.types.bool);
+      default = null;
+      description = "Mute notification sounds. Unset (null) = the binary's default.";
+    };
+
+    notificationsSoundSuppressFocused = lib.mkOption {
+      type = lib.types.nullOr (lib.types.bool);
+      default = null;
+      description = "Suppress sounds for focused notifications. Unset (null) = the binary's default.";
     };
 
     activityEnabled = lib.mkOption {

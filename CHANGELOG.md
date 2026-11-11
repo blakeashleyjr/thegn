@@ -7,6 +7,39 @@ All notable changes to **thegn** are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.1.0-alpha.57] — 2026-11-10
+
+### Added
+
+- Each worktree can pin its own sandbox profile, `standard` or `sealed`. Pick
+  it in the new-worktree wizard's Isolation row, with the palette action
+  "Isolation profile for this worktree", with `thegn wt new --isolation`, or
+  with `thegn sandbox profile show|set|clear [--worktree <path>]`. The default
+  stays `standard`; see [Worktree isolation profiles](docs/help/sandbox-profiles.md).
+- The Home Manager module adds null-default options for the notification
+  do-not-disturb and sound settings (`notificationsDndEnabled`,
+  `notificationsSoundMute`, `notificationsSoundSuppressFocused`).
+
+### Changed
+
+- A refused `sealed` launch now says how to switch the worktree back to the
+  `standard` profile.
+- The control API's dispatch status change to `done` applies the same
+  missing-evidence check as `thegn dispatch set-status done` and refuses with
+  a `missing_evidence` message. The override stays CLI-only (`--force --why`).
+- Forge HTTP failures are logged with the status, a failure class, the
+  repository and a short redacted message, never a token.
+
+### Fixed
+
+- A sandbox shell whose command already starts with `exec` no longer launches
+  as `exec exec <shell>`, which exited every pane.
+- Editing the font configuration re-checks the file just before replacing it
+  and refuses with "<path> changed while editing; retry" if it changed.
+- The worktree delete menu says the branch is kept.
+- Dropping an image into a remote pane has a 60-second deadline and bounded
+  captured output.
+
 ## [0.1.0-alpha.56] — 2026-11-06
 
 ### Added
@@ -2939,7 +2972,8 @@ launcher picker and the merge queue's `agent_command` hook remain — they run
 whatever commands you configure. Leftover `[llm_proxy]` config sections and
 `proxy_*` tables in existing state databases are ignored harmlessly.
 
-[Unreleased]: https://github.com/blakeashleyjr/thegn/compare/v0.1.0-alpha.56...HEAD
+[Unreleased]: https://github.com/blakeashleyjr/thegn/compare/v0.1.0-alpha.57...HEAD
+[0.1.0-alpha.57]: https://github.com/blakeashleyjr/thegn/compare/v0.1.0-alpha.56...v0.1.0-alpha.57
 [0.1.0-alpha.56]: https://github.com/blakeashleyjr/thegn/compare/v0.1.0-alpha.55...v0.1.0-alpha.56
 [0.1.0-alpha.55]: https://github.com/blakeashleyjr/thegn/compare/v0.1.0-alpha.54...v0.1.0-alpha.55
 [0.1.0-alpha.54]: https://github.com/blakeashleyjr/thegn/compare/v0.1.0-alpha.53...v0.1.0-alpha.54

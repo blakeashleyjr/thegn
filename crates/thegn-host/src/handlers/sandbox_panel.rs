@@ -286,6 +286,7 @@ mod tests {
             sandbox_backend: Some("podman".into()),
             env_name: None,
             env_degraded: false,
+            sandbox_profile: None,
         };
         let config_profile = "vim";
         let own =

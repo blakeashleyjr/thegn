@@ -165,12 +165,9 @@ pub fn sprite_ssh_connect(cfg: &Config, worktree: &str) -> Option<(PathBuf, Stri
         worktree,
         Db::open().and_then(|db| db.effective_env_checked(worktree, &repo_root.to_string_lossy())),
     )?;
-    let environment = cfg.resolve_env(
-        &repo_root,
-        &loc,
-        Path::new(worktree),
-        selected_env.as_deref(),
-    );
+    let mut selection = crate::sandbox_profile_ui::selection_for(worktree, &repo_root).ok()?;
+    selection.name = selected_env;
+    let environment = cfg.resolve_env(&repo_root, &loc, Path::new(worktree), &selection);
     let thegn_core::placement::Placement::Provider(_) = &environment.placement else {
         return None;
     };

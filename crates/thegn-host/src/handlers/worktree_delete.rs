@@ -910,6 +910,7 @@ mod tests {
             sandbox_backend: None,
             env_name: None,
             env_degraded: false,
+            sandbox_profile: None,
         };
         assert_eq!(
             pending_delete_refusal("app/active", &session, &[], &pending),

@@ -232,6 +232,8 @@ pub struct WorktreeRow {
     /// Selected execution environment (`[env.<name>]`); `None` = inherit the
     /// workspace/repo/global layer. See [`crate::config::Config::resolve_env`].
     pub env_name: Option<String>,
+    /// Per-worktree sandbox profile pin; `None` inherits configured policy.
+    pub sandbox_profile: Option<String>,
 }
 
 /// Exact identity ledger row for a Git worktree instance. This is a bounded
@@ -397,6 +399,7 @@ mod tests {
             observed_backend: None,
             folder_id: None,
             env_name: None,
+            sandbox_profile: None,
         };
         let _ = format!("{:?}", row.clone()); // best-effort: test smoke: this path must not panic
     }

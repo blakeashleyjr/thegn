@@ -36,7 +36,12 @@ fn canary_env_selection_repo_hint_cannot_select_a_weaker_named_env() {
     .unwrap();
     let loc = GitLoc::Local(repo.path().to_path_buf());
 
-    let resolved = config.resolve_env(repo.path(), &loc, repo.path(), None);
+    let resolved = config.resolve_env(
+        repo.path(),
+        &loc,
+        repo.path(),
+        &crate::sandbox_pin::EnvSelection::none(),
+    );
     assert_eq!(resolved.name, "default");
     assert_eq!(resolved.sandbox.profile, SandboxProfile::Sealed);
     assert_eq!(resolved.sandbox.network, Network::None);
@@ -46,7 +51,12 @@ fn canary_env_selection_repo_hint_cannot_select_a_weaker_named_env() {
     );
     assert_eq!(resolved.sandbox.on_floor_miss, OnFloorMiss::Fail);
 
-    let explicitly_selected = config.resolve_env(repo.path(), &loc, repo.path(), Some("hostdev"));
+    let explicitly_selected = config.resolve_env(
+        repo.path(),
+        &loc,
+        repo.path(),
+        &crate::sandbox_pin::EnvSelection::named("hostdev"),
+    );
     assert_eq!(explicitly_selected.name, "hostdev");
     assert_eq!(explicitly_selected.sandbox.profile, SandboxProfile::Open);
     assert_eq!(explicitly_selected.sandbox.network, Network::Host);

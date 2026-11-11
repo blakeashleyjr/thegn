@@ -82,7 +82,15 @@ fn report_pane_connect_failure(cfg: &thegn_core::config::Config, wt: &str, known
     let Some(selected) = connect_failure_selection(wt, read) else {
         return;
     };
-    let env = cfg.resolve_env(&repo_root, &loc, Path::new(wt), selected.as_deref());
+    let env = cfg.resolve_env(
+        &repo_root,
+        &loc,
+        Path::new(wt),
+        &thegn_core::sandbox_pin::EnvSelection {
+            name: selected.clone(),
+            profile: None,
+        },
+    );
     if env.placement.is_local() {
         return;
     }

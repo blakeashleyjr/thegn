@@ -1076,7 +1076,15 @@ fn teardown_runtime(
             db.effective_env_checked(&worktree.to_string_lossy(), &repo_root.to_string_lossy())
         }),
     })?;
-    let env = cfg.resolve_env(repo_root, loc, worktree, selected.as_deref());
+    let env = cfg.resolve_env(
+        repo_root,
+        loc,
+        worktree,
+        &thegn_core::sandbox_pin::EnvSelection {
+            name: selected.clone(),
+            profile: None,
+        },
+    );
     let path = worktree.to_string_lossy().into_owned();
     let mut failures = Vec::new();
 
