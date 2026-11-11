@@ -1633,7 +1633,9 @@ mod process_tree_deadline_tests {
             Err(PluginError::Timeout(_)) => {
                 let outcome = super::last_timeout_outcome().expect("timeout outcome recorded");
                 assert!(outcome.killed);
-                assert!(!outcome.drained);
+                // THE-1889: the tracked setsid holder is now killed with the group, so the
+                // pipes reach EOF inside the bound instead of staying held open.
+                assert!(outcome.drained);
                 assert!(outcome.reaped);
             }
             other => panic!("expected timeout, got {other:?}"),
