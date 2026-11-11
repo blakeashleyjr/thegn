@@ -408,7 +408,14 @@ pub fn verify_report(f: &VerifyFacts) -> VerifyReport {
                 .into(),
         );
     }
-    if !f.exists {
+    if !f.exists && std::path::Path::new(a).is_absolute() {
+        refuse(
+            &mut reasons,
+            &mut kinds,
+            VerifyRefusal::Absent,
+            format!("artifact path must be relative to the worktree (got {a:?})"),
+        );
+    } else if !f.exists {
         refuse(
             &mut reasons,
             &mut kinds,
@@ -1208,6 +1215,25 @@ mod tests {
         assert!(
             r.reasons[0].contains("does not exist under the worktree")
                 && r.reasons[0].contains(".thegn/pipeline/THE-76/code/5.md"),
+            "{r:?}"
+        );
+    }
+
+    #[test]
+    fn an_absolute_artifact_path_is_refused_as_not_relative() {
+        let abs = std::env::temp_dir().join("handoff.md");
+        let r = verify_report(&facts(abs.to_str(), false, false, false));
+        assert!(!r.ok);
+        assert!(
+            r.reasons
+                .iter()
+                .any(|m| m.contains("artifact path must be relative to the worktree")),
+            "{r:?}"
+        );
+        assert!(
+            !r.reasons
+                .iter()
+                .any(|m| m.contains("does not exist under the worktree")),
             "{r:?}"
         );
     }
