@@ -637,7 +637,7 @@ fn is_control_key_dir_name(name: &str) -> bool {
 /// Best effort (every failure is logged and skipped), never follows a symlink,
 /// and unlinks a lock only while holding its flock and after re-verifying the
 /// path still names the locked inode (binders re-check the same way). Returns
-/// how many entries (locks, or empty directories) were removed.
+/// how many entries (locks, stale sockets, or empty directories) were removed.
 #[cfg(unix)]
 fn prune_idle_control_dirs(
     runtime_root: &Path,
@@ -963,7 +963,7 @@ impl IpcListener {
                                 own_dir,
                                 CONTROL_DIR_PRUNE_MIN_IDLE,
                                 CONTROL_DIR_PRUNE_MAX_EXAMINED,
-                                &|sock| probe_unix_listener(sock),
+                                &probe_unix_listener,
                             );
                             if removed > 0 {
                                 tracing::debug!(target: "thegn::daemon", removed, root = %root.display(), "pruned abandoned control directories");
