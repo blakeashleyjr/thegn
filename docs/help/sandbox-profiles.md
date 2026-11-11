@@ -1,7 +1,7 @@
 ---
 id: sandbox-profiles
 title: Worktree isolation profiles
-summary: Choose the standard or sealed sandbox profile for a worktree.
+parent: sandboxing
 actions: [sandbox-profile]
 ---
 
