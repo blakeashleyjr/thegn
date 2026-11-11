@@ -17,15 +17,69 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent.parent
 
 
+# act 0.2.89 `act --help`: bool shorthands pflag skips inside a cluster (-h is help),
+# and the value-taking shorthands that swallow the rest of the arg.
+_SHORT_BOOL = set("bghlnpqrvw")
+_SHORT_VALUE = set("aCejPsW")
+_REUSE_TRUE = {"1", "t", "T", "true", "TRUE", "True"}
+
+
+def _short_cluster(arg: str) -> tuple[bool, str | None, bool]:
+    """Scan one single-dash arg the way pflag does: (reuse, value flag letter, ambiguous).
+
+    Bool shorthands are skipped (`r` records reuse), the first value shorthand takes the
+    rest of the arg, and an unknown letter makes the arg ambiguous (callers fail closed).
+    """
+    if len(arg) < 2 or arg[0] != "-" or arg[1] == "-":
+        return False, None, False
+    reuse = False
+    for i in range(1, len(arg)):
+        c = arg[i]
+        if c in _SHORT_BOOL:
+            glued = arg[i + 1 : i + 2] == "="
+            if c == "r":
+                reuse = reuse or not glued or arg[i + 2 :] in _REUSE_TRUE
+            if glued:
+                return reuse, None, False
+            continue
+        if c in _SHORT_VALUE:
+            return reuse, c, False
+        return reuse, None, True
+    return reuse, None, False
+
+
 def has_credentials(args: list[str]) -> bool:
+    return any(arg.startswith("--secret") or _short_cluster(arg)[1] == "s" for arg in args)
+
+
+def has_reuse(args: list[str]) -> bool:
     return any(
-        arg.startswith("--secret") or arg == "-s" or arg.startswith("-s=")
+        arg == "--reuse"
+        or (arg.startswith("--reuse=") and arg.partition("=")[2] in _REUSE_TRUE)
+        or _short_cluster(arg)[0]
         for arg in args
     )
 
 
-def has_reuse(args: list[str]) -> bool:
-    return any(arg in {"--reuse", "-r", "--reuse=true"} for arg in args)
+def ambiguous_short_args(args: list[str]) -> list[str]:
+    """Single-dash args with a letter outside act's known short flags."""
+    return [arg for arg in args if _short_cluster(arg)[2]]
+
+
+_REDIRECT_LONG = ("--workflows", "--directory", "--local-repository")
+
+
+def redirect_flags(args: list[str]) -> list[str]:
+    """Flags that point act at workflow/action code outside the checked `.github/` tree (in args order)."""
+    found: list[str] = []
+    for arg in args:
+        for flag in _REDIRECT_LONG:
+            if arg == flag or arg.startswith(flag + "="):
+                found.append(flag)
+        letter = _short_cluster(arg)[1]
+        if letter in {"W", "C"}:
+            found.append("-" + letter)
+    return found
 
 
 _DIGEST = re.compile(r"@sha256:[0-9a-f]{64}$")
@@ -89,16 +143,35 @@ def plan(
     dirty: list[str] | None,
     head: str | None,
     implicit_secrets: bool = False,
+    actrc_args: list[str] | None = None,
 ) -> tuple[list[str] | None, str]:
-    """Build guarded act argv, or return a refusal message."""
-    credentialed = has_credentials(args) or implicit_secrets
+    """Build guarded act argv, or return a refusal message.
+
+    act prepends `.actrc` tokens to argv, so `actrc_args` count for the credential,
+    reuse and redirect checks but are not added to the built command.
+    """
+    effective = [*(actrc_args or []), *args]
+    credentialed = has_credentials(effective) or implicit_secrets
     credential_source = " (including default .secrets)" if implicit_secrets else ""
-    reuse = has_reuse(args)
+    reuse = has_reuse(effective)
 
     if credentialed and reuse:
         return None, (
             f"act: --reuse cannot be combined with credentials{credential_source} "
             "(the retained container would carry them into later runs)"
+        )
+    ambiguous = ambiguous_short_args(effective)
+    if credentialed and ambiguous:
+        return None, (
+            f"act: credentialed runs cannot use unrecognised short flags "
+            f"{', '.join(ambiguous)}{credential_source}: cannot tell what they enable"
+        )
+    redirects = redirect_flags(effective)
+    if credentialed and redirects:
+        flags = ", ".join(sorted(set(redirects)))
+        return None, (
+            f"act: credentialed runs cannot use {flags}{credential_source}: "
+            "the clean-HEAD check only covers .github/ and .actrc of this checkout"
         )
     if credentialed and (dirty is None or head is None):
         return None, (
@@ -326,6 +399,123 @@ def self_test() -> int:
         )
     )
 
+    argv, message = plan("push", ["-sGITHUB_TOKEN=x"], [], "abc123")
+    cases.append(
+        (
+            "credential-glued-short-flag",
+            argv is not None and "abc123" in message,
+        )
+    )
+
+    argv, message = plan(
+        "push", ["-sGITHUB_TOKEN=x"], [" M .github/workflows/ci.yml"], "abc123"
+    )
+    cases.append(
+        (
+            "credential-glued-short-flag-dirty-refused",
+            argv is None and ".github/workflows/ci.yml" in message,
+        )
+    )
+
+    redirect_forms = [
+        (["-W", "/tmp/w"], "-W"),
+        (["-W/tmp/w"], "-W"),
+        (["--workflows", "/tmp/w"], "--workflows"),
+        (["--workflows=/tmp/w"], "--workflows"),
+        (["-C", "/tmp/c"], "-C"),
+        (["-C/tmp/c"], "-C"),
+        (["--directory=/tmp/c"], "--directory"),
+        (["--local-repository", "o/r@main=/tmp/r"], "--local-repository"),
+    ]
+    redirect_ok = True
+    for form, flag in redirect_forms:
+        argv, message = plan("push", ["--secret", "T=x", *form], [], "abc123")
+        redirect_ok = redirect_ok and argv is None and flag in message
+    cases.append(("credential-redirect-refused-in-all-forms", redirect_ok))
+
+    argv, message = plan("push", ["-W", "/tmp/w"], [], "abc123", True)
+    cases.append(
+        (
+            "implicit-secrets-redirect-refused",
+            argv is None and ".secrets" in message,
+        )
+    )
+
+    # positive control: also passes before this lane's fix
+    cases.append(
+        (
+            "anonymous-redirect-allowed",
+            plan("push", ["-W", "/tmp/w"], None, None)
+            == (["act", "push", "-W", "/tmp/w", "--rm"], ""),
+        )
+    )
+
+    reuse_ok = True
+    for form in (["--reuse=1"], ["--reuse=TRUE"], ["-r=true"], ["-r=t"]):
+        argv, _ = plan("push", form, None, None)
+        reuse_ok = reuse_ok and argv is not None and "--rm" not in argv
+        reuse_ok = reuse_ok and form[0] in argv
+        argv, message = plan("push", ["--secret", "T=x", form[0]], [], "abc123")
+        reuse_ok = reuse_ok and argv is None and "--reuse cannot" in message
+    cases.append(("reuse-truthy-equals-forms", reuse_ok))
+
+    # positive control: also passes before this lane's fix
+    argv, _ = plan("push", ["--reuse=false"], None, None)
+    cases.append(
+        (
+            "reuse-false-equals-keeps-rm",
+            argv is not None and argv[-1] == "--rm",
+        )
+    )
+
+    cases.append(
+        (
+            "credential-clustered-short-flag",
+            all(has_credentials([f]) for f in ("-vsT=x", "-bsX=y", "-qsX"))
+            and not has_credentials(["-vq", "-vr"]),
+        )
+    )
+
+    argv, _ = plan("push", ["-vr"], None, None)
+    argv2, message = plan("push", ["--secret", "T=x", "-vr"], [], "abc123")
+    cases.append(
+        (
+            "reuse-clustered-short-flag",
+            argv is not None and "--rm" not in argv
+            and argv2 is None and "--reuse cannot" in message,
+        )
+    )
+
+    clustered_ok = True
+    for form, flag in ((["-vW/tmp/w"], "-W"), (["-bC/tmp/c"], "-C")):
+        argv, message = plan("push", ["--secret", "T=x", *form], [], "abc123")
+        clustered_ok = clustered_ok and argv is None and flag in message
+    cases.append(("redirect-clustered-short-flag", clustered_ok))
+
+    argv, message = plan("push", ["--secret", "T=x", "-vZ"], [], "abc123")
+    argv2, _ = plan("push", ["-vZ"], None, None)
+    cases.append(
+        (
+            "credentialed-unknown-cluster-letter-refused",
+            argv is None and "unrecognised" in message and argv2 is not None,
+        )
+    )
+
+    actrc_ok = True
+    for tokens, needle in (
+        (["-s", "GITHUB_TOKEN"], ""),
+        (["--secret-file", "x"], ""),
+    ):
+        argv, message = plan("push", [], ["?? .actrc"], "abc123", False, tokens)
+        actrc_ok = actrc_ok and argv is None and "uncommitted" in message
+    argv, message = plan("push", [], [], "abc123", False, ["--reuse", "-s", "T=x"])
+    actrc_ok = actrc_ok and argv is None and "--reuse cannot" in message
+    argv, message = plan("push", ["-W", "/tmp/w"], [], "abc123", False, ["-s", "T=x"])
+    actrc_ok = actrc_ok and argv is None and "-W" in message
+    argv, _ = plan("push", [], None, None, False, ["-P", "ubuntu-latest=img@sha256:" + "0" * 64])
+    actrc_ok = actrc_ok and argv == ["act", "push", "--rm"]
+    cases.append(("actrc-tokens-feed-guard-checks", actrc_ok))
+
     for label, passed in cases:
         if not check(label, passed):
             return 1
@@ -350,13 +540,14 @@ def main(argv: list[str]) -> int:
         print(refusal, file=sys.stderr)
         return 1
     implicit_secrets = (ROOT / ".secrets").exists()
-    if has_credentials(args) or implicit_secrets:
+    actrc_args = actrc_tokens(actrc_text) if actrc_text else []
+    if has_credentials([*actrc_args, *args]) or implicit_secrets:
         dirty = dirty_paths()
         head = head_sha()
     else:
         dirty = None
         head = None
-    command, message = plan(event, args, dirty, head, implicit_secrets)
+    command, message = plan(event, args, dirty, head, implicit_secrets, actrc_args)
     if message:
         print(message, file=sys.stderr)
     if command is None:

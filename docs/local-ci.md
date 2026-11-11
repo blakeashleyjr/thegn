@@ -118,11 +118,16 @@ the guard checks; other uncommitted working-tree files still run, so use
 credentials only on commits you trust. The guard sees flags passed to `just` and
 the repository's `.secrets`, but does not inspect `~/.actrc` or
 `$XDG_CONFIG_HOME/act/actrc`, where act can also read secret or reuse flags.
-Credentials cannot be combined with `--reuse`. Every run passes `--rm` unless
-`--reuse` is given, so act removes its containers after a failed run. The token
-is unnecessary for anonymous access to current public flake inputs. `--reuse`
-explicitly retains the container and its mutable `/nix` state; avoid carrying
-it across revisions or trust domains.
+Credentials cannot be combined with `--reuse`. A credentialed run also
+refuses `-W`/`--workflows`, `-C`/`--directory` and `--local-repository`,
+because the guard only checks this checkout's `.github/` and `.actrc`. The
+guard reads clustered short flags such as `-vsNAME=x` the way act does, counts
+the repository `.actrc` flags as if passed on the command line, and refuses an
+unrecognised short letter on a credentialed run. Every run passes `--rm`
+unless `--reuse` is given, so act removes its containers after a failed run.
+The token is unnecessary for anonymous access to current public flake inputs.
+`--reuse` explicitly retains the container and its mutable `/nix` state; avoid
+carrying it across revisions or trust domains.
 
 ### Caveats
 
