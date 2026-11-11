@@ -1029,6 +1029,8 @@ mod tests {
         let base = tempfile::tempdir().unwrap();
         let root = base.path().join("hooks");
         std::fs::create_dir(&root).unwrap();
+        // Loosen it explicitly so the assertion fails on main under any umask.
+        thegn_core::fsperm::set_mode_for_test(&root, 0o755).unwrap();
         let worktree = format!("/isolated-hook-private-{}", std::process::id());
         let path = log_path(&root, &worktree, HookEvent::PostCreate).unwrap();
         // `None` on platforms without mode bits (Windows uses a DACL).
