@@ -102,6 +102,11 @@ worktree response and completes post-create asynchronously.
 
 `thegn wt new <name> --exact-branch` uses `<name>` verbatim as the branch (no configured prefix or numbering) and refuses an existing branch.
 
+`thegn wt new --batch lanes.txt` creates several worktrees sequentially. Each
+non-blank, non-comment line contains `<name>` or `<name> <base>`; a per-line
+base overrides `--base`. Batch files accept at most 64 lanes, and
+`--exact-branch` makes each name a verbatim branch name.
+
 ## Lifecycle and sessions
 
 `pre_destroy` runs before provider teardown and git removal, and `post_destroy`
