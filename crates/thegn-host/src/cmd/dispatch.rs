@@ -85,7 +85,7 @@ pub enum Action {
         session: Option<String>,
         /// Path to the handoff artifact. A pipeline row's handoff is
         /// `.thegn/pipeline/<ISSUE>/<stage>/<row>.md`; it is assigned
-        /// automatically when omitted, and any other path never verifies.
+        /// automatically; `--artifact` is refused together with `--stage`.
         #[arg(long)]
         artifact: Option<String>,
         /// The chunk file this row dispatches under (`.thegn/pipeline/<ISSUE>/
@@ -166,8 +166,8 @@ pub enum Action {
         stage: String,
         /// Path to the handoff artifact this row will produce. A pipeline
         /// row's handoff is `.thegn/pipeline/<ISSUE>/<stage>/<row>.md`; it is
-        /// assigned automatically when omitted, and any other path never
-        /// verifies.
+        /// assigned automatically; `--artifact` is refused together with
+        /// `--stage`.
         #[arg(long)]
         artifact: Option<String>,
         /// The roster row this one was chunked out of.
@@ -521,6 +521,7 @@ pub fn run(cfg: &Config, action: Action) -> Result<()> {
             why,
             json,
         } => {
+            refuse_stage_artifact_override(Some(&stage), artifact.as_deref())?;
             let (issue_id, worktree_path) = dispatch_identity(&issue_id, &worktree_path)?;
             claim(
                 cfg,
@@ -568,6 +569,7 @@ pub fn run(cfg: &Config, action: Action) -> Result<()> {
             why,
             json,
         } => {
+            refuse_stage_artifact_override(stage.as_deref(), artifact.as_deref())?;
             let (issue_id, worktree_path) = dispatch_identity(&issue_id, &worktree_path)?;
             let db = Db::open()?;
             let proof = lead_proof(
@@ -1011,6 +1013,20 @@ fn lead_proof<'a>(
     } else {
         LeadProof::Unbound
     }
+}
+
+/// A staged row's handoff is always `.thegn/pipeline/<issue>/<stage>/<row>.md`;
+/// a caller-chosen `--artifact` there is refused up front.
+pub(crate) fn refuse_stage_artifact_override(
+    stage: Option<&str>,
+    artifact: Option<&str>,
+) -> Result<()> {
+    if let (Some(stage), Some(_)) = (stage, artifact) {
+        anyhow::bail!(
+            "--artifact is not accepted on a pipeline row (--stage {stage}): its handoff is assigned as .thegn/pipeline/<issue>/<stage>/<row>.md; drop --artifact"
+        );
+    }
+    Ok(())
 }
 
 pub(crate) fn dispatch_identity(issue_id: &str, worktree: &str) -> Result<(String, String)> {
@@ -3335,6 +3351,24 @@ mod tests {
         assert!(!is_hex_oid("HEAD"));
         assert!(!is_hex_oid(&format!("{}g", "a".repeat(39))));
         assert!(!is_hex_oid(&format!("-{}", "a".repeat(40))));
+    }
+
+    #[test]
+    fn stage_artifact_override_is_refused_for_staged_rows() {
+        for artifact in ["README.md", ""] {
+            let err = refuse_stage_artifact_override(Some("code"), Some(artifact))
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains("--artifact is not accepted"), "{err}");
+            assert!(err.contains("code"), "{err}");
+        }
+    }
+
+    #[test]
+    fn stage_artifact_override_allows_plain_rows_and_omitted_artifact() {
+        assert!(refuse_stage_artifact_override(None, Some("notes.md")).is_ok());
+        assert!(refuse_stage_artifact_override(Some("code"), None).is_ok());
+        assert!(refuse_stage_artifact_override(None, None).is_ok());
     }
 
     fn db(name: &str) -> (tempfile::TempDir, Db) {
