@@ -166,9 +166,9 @@ pub enum Action {
         stage: String,
         /// Path to the handoff artifact this row will produce. A pipeline
         /// row's handoff is `.thegn/pipeline/<ISSUE>/<stage>/<row>.md`; it is
-        /// assigned automatically; `--artifact` is refused together with
-        /// `--stage`.
-        #[arg(long)]
+        /// assigned automatically; `--artifact` is always refused here (a
+        /// claim is a pipeline row).
+        #[arg(long, hide = true)]
         artifact: Option<String>,
         /// The roster row this one was chunked out of.
         #[arg(long)]
