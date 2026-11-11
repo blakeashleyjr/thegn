@@ -2812,9 +2812,24 @@ pub(crate) struct RecordedReport {
 }
 
 pub(crate) fn record_report(db: &Db, id: i64, text: &str) -> Result<RecordedReport> {
+    record_report_with(db, id, text, &mut || {})
+}
+
+/// `record_report` with a seam between the HEAD read and the fenced write, so
+/// tests can republish the run inside that window.
+fn record_report_with(
+    db: &Db,
+    id: i64,
+    text: &str,
+    between: &mut dyn FnMut(),
+) -> Result<RecordedReport> {
     let validated = pipeline_report::report_text(text).map_err(|e| anyhow::anyhow!("{e}"))?;
     let row = db
         .get_dispatch(id)?
+        .ok_or_else(|| anyhow::anyhow!("roster row {id} does not exist"))?;
+    // Capture the run identity BEFORE the HEAD read: the write is fenced to it.
+    let run = db
+        .dispatch_run_ref(id)?
         .ok_or_else(|| anyhow::anyhow!("roster row {id} does not exist"))?;
     let worktree = std::path::Path::new(&row.worktree_path);
     let head_oid = match git_text_local(worktree, &["rev-parse", "--verify", "HEAD"]) {
@@ -2825,7 +2840,8 @@ pub(crate) fn record_report(db: &Db, id: i64, text: &str) -> Result<RecordedRepo
             None
         }
     };
-    db.set_dispatch_report_bound(id, &validated, head_oid.as_deref())?;
+    between();
+    db.set_dispatch_report_for_run(&run, &validated, head_oid.as_deref())?;
     let ungated = pipeline_report::pass_without_gate_evidence(&validated);
     Ok(RecordedReport { validated, ungated })
 }
@@ -4018,6 +4034,53 @@ mod tests {
             &target,
         );
         assert_eq!(stale, pipeline_run::HandoffOutcome::InfrastructureUnknown);
+    }
+
+    fn report_fence_fixture(name: &str) -> (tempfile::TempDir, Db, tempfile::TempDir, i64) {
+        let (dir, db) = db(name);
+        let (worktree_dir, worktree) = git_repo(&format!("{name}-wt"));
+        let id = db
+            .put_dispatch_with_parent_check(thegn_core::issue::NewDispatch {
+                stage: Some("code"),
+                artifact_path: None,
+                ..thegn_core::issue::NewDispatch::new(
+                    "linear:THE-253",
+                    worktree.to_str().unwrap(),
+                    "coder",
+                )
+            })
+            .unwrap();
+        (dir, db, worktree_dir, id)
+    }
+
+    #[test]
+    fn report_fence_record_report_loses_to_a_republish() {
+        let (_dir, db, _worktree_dir, id) = report_fence_fixture("report-fence");
+        let error = record_report_with(
+            &db,
+            id,
+            "PASS\ngate: cargo nextest run --workspace -- 1 passed, 0 skipped",
+            &mut || {
+                assert!(db.bind_dispatch_session(id, "sess-republished").unwrap());
+            },
+        )
+        .err()
+        .expect("the republished run must refuse the old run's report");
+        assert!(
+            error
+                .downcast_ref::<thegn_core::db::ReportRunChanged>()
+                .is_some(),
+            "{error}"
+        );
+        assert_eq!(db.get_dispatch(id).unwrap().unwrap().report, None);
+    }
+
+    #[test]
+    fn report_fence_record_report_without_a_race_still_files() {
+        let (_dir, db, _worktree_dir, id) = report_fence_fixture("report-fence-ok");
+        let text = "PASS\ngate: cargo nextest run --workspace -- 1 passed, 0 skipped";
+        record_report(&db, id, text).unwrap();
+        assert!(db.get_dispatch(id).unwrap().unwrap().report.is_some());
     }
 
     #[test]
