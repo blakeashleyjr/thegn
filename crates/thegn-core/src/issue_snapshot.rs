@@ -37,6 +37,29 @@ pub fn render(issue: &Issue) -> String {
     out
 }
 
+/// Coarse, body-free classification of a tracker fetch failure.
+pub fn error_kind(message: &str) -> &'static str {
+    let m = message.to_ascii_lowercase();
+    if m.contains("no issue provider") || m.contains("provider none") {
+        "provider_none"
+    } else {
+        "unavailable"
+    }
+}
+
+/// Snapshot for a stage whose tracker fetch failed but whose prompt needs no
+/// issue fields: only the reference, `"fetched": false` and the error kind.
+pub fn render_unfetched(issue_ref: &str, error_kind: &str) -> String {
+    let value = serde_json::json!({
+        "id": issue_ref,
+        "fetched": false,
+        "error_kind": error_kind,
+    });
+    let mut out = serde_json::to_string_pretty(&value).unwrap_or_else(|_| "{}".to_string());
+    out.push('\n');
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -93,5 +116,24 @@ mod tests {
     fn render_missing_body_is_empty_description() {
         let v: serde_json::Value = serde_json::from_str(&render(&issue(None))).unwrap();
         assert_eq!(v["description"], "");
+    }
+
+    #[test]
+    fn unfetched_has_ref_flag_and_kind_only() {
+        let v: serde_json::Value =
+            serde_json::from_str(&render_unfetched("linear:THE-1", "provider_none")).unwrap();
+        assert_eq!(v["id"], "linear:THE-1");
+        assert_eq!(v["fetched"], false);
+        assert_eq!(v["error_kind"], "provider_none");
+        assert_eq!(v.as_object().unwrap().len(), 3);
+    }
+
+    #[test]
+    fn error_kind_classifies() {
+        assert_eq!(
+            error_kind("issues.get x: no issue provider configured"),
+            "provider_none"
+        );
+        assert_eq!(error_kind("connection refused"), "unavailable");
     }
 }

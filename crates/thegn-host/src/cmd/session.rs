@@ -967,45 +967,71 @@ async fn gather_issue_facts(
     stage: &thegn_core::config_pipeline::PipelineStage,
     issue_id: &str,
     repo: Option<&str>,
-    force_fetch: bool,
-) -> Result<(IssueFacts, Option<thegn_core::issue::Issue>)> {
+    want_snapshot: bool,
+) -> Result<(IssueFacts, Option<String>)> {
     let referenced = template_vars(&stage.prompt)
         .map_err(|e| anyhow::anyhow!("stage '{}' prompt template is invalid: {e}", stage.name))?;
     let needs_tracker = ["issue_title", "issue_body", "issue_url"]
         .iter()
         .any(|v| referenced.iter().any(|r| r == v));
-    Ok(if needs_tracker || force_fetch {
-        let detail = client.issue_get(issue_id, repo).await.map_err(|e| {
-            anyhow::anyhow!(
-                "cannot fetch {issue_id} from the tracker (unavailable, offline, or \
-                 provider none): {e}"
-            )
-        })?;
-        let issue = detail.issue;
-        let facts = IssueFacts {
-            number: pipeline_run::issue_key(issue_id),
-            title: issue.title.clone(),
-            body: issue.body.clone().unwrap_or_default(),
-            url: issue.url.clone(),
-        };
-        (facts, Some(issue))
-    } else {
-        (
-            IssueFacts {
-                number: pipeline_run::issue_key(issue_id),
+    if !needs_tracker && !want_snapshot {
+        return resolve_lookup(issue_id, false, false, Err(String::new()));
+    }
+    let res = client
+        .issue_get(issue_id, repo)
+        .await
+        .map(|d| d.issue)
+        .map_err(|e| e.to_string());
+    resolve_lookup(issue_id, needs_tracker, want_snapshot, res)
+}
+
+/// Pure decision over a tracker lookup. A failed fetch refuses only when the
+/// stage prompt reads issue fields; otherwise the snapshot degrades to the
+/// reference plus `"fetched": false` and an error kind.
+fn resolve_lookup(
+    issue_id: &str,
+    needs_tracker: bool,
+    want_snapshot: bool,
+    res: std::result::Result<thegn_core::issue::Issue, String>,
+) -> Result<(IssueFacts, Option<String>)> {
+    let number = pipeline_run::issue_key(issue_id);
+    match res {
+        Ok(issue) => {
+            let snap = want_snapshot.then(|| thegn_core::issue_snapshot::render(&issue));
+            let facts = IssueFacts {
+                number,
+                title: issue.title.clone(),
+                body: issue.body.clone().unwrap_or_default(),
+                url: issue.url.clone(),
+            };
+            Ok((facts, snap))
+        }
+        Err(e) if needs_tracker => Err(anyhow::anyhow!(
+            "cannot fetch {issue_id} from the tracker (unavailable, offline, or \
+             provider none): {e}"
+        )),
+        Err(e) => {
+            let snap = want_snapshot.then(|| {
+                thegn_core::issue_snapshot::render_unfetched(
+                    issue_id,
+                    thegn_core::issue_snapshot::error_kind(&e),
+                )
+            });
+            let facts = IssueFacts {
+                number,
                 title: String::new(),
                 body: String::new(),
                 url: String::new(),
-            },
-            None,
-        )
-    })
+            };
+            Ok((facts, snap))
+        }
+    }
 }
 
 /// Write the fetched issue to `<worktree>/.thegn/maintenance/issue.json`
 /// (always overwriting, atomically) so a worker can never read a stale
 /// snapshot. Refuses a symlinked `.thegn` or `.thegn/maintenance`.
-fn write_issue_snapshot(worktree: &Path, issue: &thegn_core::issue::Issue) -> Result<()> {
+fn write_issue_snapshot(worktree: &Path, text: &str) -> Result<()> {
     let path = thegn_core::issue_snapshot::path_for(worktree);
     let dir = path
         .parent()
@@ -1074,7 +1100,7 @@ fn write_issue_snapshot(worktree: &Path, issue: &thegn_core::issue::Issue) -> Re
     }
     {
         use std::io::Write as _;
-        tmp.write_all(thegn_core::issue_snapshot::render(issue).as_bytes())
+        tmp.write_all(text.as_bytes())
             .and_then(|()| tmp.flush())
             .map_err(|e| anyhow::anyhow!("cannot write issue snapshot {}: {e}", path.display()))?;
     }
@@ -1143,16 +1169,16 @@ async fn open_stage(cfg: &Config, client: &ControlClient, d: StageDispatch<'_>) 
     // 3. Branch from live Git HEAD. Empty is acceptable for detached,
     //    unborn, or unavailable HEAD.
     let branch = resolve_branch(&wt);
-    // 4. Issue facts. The tracker is always consulted here (`force_fetch`):
+    // 4. Issue facts. The tracker is always consulted here (`want_snapshot`):
     //    the fetched issue is also snapshotted to
     //    `.thegn/maintenance/issue.json` before launch. `{issue_number}` is
     //    local (the id with its provider prefix stripped); a failed lookup
-    //    propagates — a prompt with a silently empty issue body, or a worker
-    //    reading a stale snapshot, is how a worker ends up implementing
-    //    nothing.
-    let (facts, fetched) = gather_issue_facts(client, stage, d.issue, Some(&wt), true).await?;
-    let fetched = fetched.ok_or_else(|| anyhow::anyhow!("issue fetch returned nothing"))?;
-    write_issue_snapshot(Path::new(&wt), &fetched)?;
+    //    propagates only when the stage prompt reads issue fields (a silently
+    //    empty body is how a worker implements nothing); otherwise the
+    //    snapshot records `"fetched": false` so no stale file survives.
+    let (facts, snap) = gather_issue_facts(client, stage, d.issue, Some(&wt), true).await?;
+    let snap = snap.ok_or_else(|| anyhow::anyhow!("issue snapshot was not produced"))?;
+    write_issue_snapshot(Path::new(&wt), &snap)?;
     // 5. Chunk scope is prepared before the DB lock by shared admission.
     // Session open deliberately has no scope override.
     // 6b. Insert the roster row BEFORE opening the session (D5).
@@ -2843,7 +2869,7 @@ mod terminal_safe_output_tests {
 
 #[cfg(test)]
 mod issue_snapshot_tests {
-    use super::write_issue_snapshot;
+    use super::{resolve_lookup, write_issue_snapshot};
     use thegn_core::issue::{Issue, IssuePriority, IssueStatus};
 
     fn issue(title: &str) -> Issue {
@@ -2873,7 +2899,11 @@ mod issue_snapshot_tests {
         let p = thegn_core::issue_snapshot::path_for(dir.path());
         std::fs::create_dir_all(p.parent().unwrap()).unwrap();
         std::fs::write(&p, "stale").unwrap();
-        write_issue_snapshot(dir.path(), &issue("fresh")).unwrap();
+        write_issue_snapshot(
+            dir.path(),
+            &thegn_core::issue_snapshot::render(&issue("fresh")),
+        )
+        .unwrap();
         let text = std::fs::read_to_string(&p).unwrap();
         assert!(text.contains("fresh") && !text.contains("stale"));
     }
@@ -2891,7 +2921,11 @@ mod issue_snapshot_tests {
             .unwrap()
             .join(format!(".issue.json.tmp{}", std::process::id()));
         crate::platform::symlink_file(&victim, &planted).unwrap();
-        write_issue_snapshot(dir.path(), &issue("fresh")).unwrap();
+        write_issue_snapshot(
+            dir.path(),
+            &thegn_core::issue_snapshot::render(&issue("fresh")),
+        )
+        .unwrap();
         assert_eq!(std::fs::read_to_string(&victim).unwrap(), "keep");
         assert!(std::fs::read_to_string(&p).unwrap().contains("fresh"));
     }
@@ -2899,7 +2933,7 @@ mod issue_snapshot_tests {
     #[test]
     fn snapshot_creates_missing_dirs() {
         let dir = tempfile::tempdir().unwrap();
-        write_issue_snapshot(dir.path(), &issue("t")).unwrap();
+        write_issue_snapshot(dir.path(), &thegn_core::issue_snapshot::render(&issue("t"))).unwrap();
         assert!(thegn_core::issue_snapshot::path_for(dir.path()).is_file());
     }
 
@@ -2908,7 +2942,9 @@ mod issue_snapshot_tests {
         let dir = tempfile::tempdir().unwrap();
         let elsewhere = tempfile::tempdir().unwrap();
         crate::platform::symlink_file(elsewhere.path(), &dir.path().join(".thegn")).unwrap();
-        let err = write_issue_snapshot(dir.path(), &issue("t")).unwrap_err();
+        let err =
+            write_issue_snapshot(dir.path(), &thegn_core::issue_snapshot::render(&issue("t")))
+                .unwrap_err();
         assert!(err.to_string().contains("symlink"));
         assert!(
             std::fs::read_dir(elsewhere.path())
@@ -2921,7 +2957,11 @@ mod issue_snapshot_tests {
         std::fs::create_dir(dir2.path().join(".thegn")).unwrap();
         crate::platform::symlink_file(elsewhere.path(), &dir2.path().join(".thegn/maintenance"))
             .unwrap();
-        let err = write_issue_snapshot(dir2.path(), &issue("t")).unwrap_err();
+        let err = write_issue_snapshot(
+            dir2.path(),
+            &thegn_core::issue_snapshot::render(&issue("t")),
+        )
+        .unwrap_err();
         assert!(err.to_string().contains("symlink"));
         assert!(
             std::fs::read_dir(elsewhere.path())
@@ -2929,5 +2969,36 @@ mod issue_snapshot_tests {
                 .next()
                 .is_none()
         );
+    }
+
+    #[test]
+    fn lookup_failure_without_issue_fields_degrades() {
+        let (facts, snap) = resolve_lookup(
+            "linear:THE-1",
+            false,
+            true,
+            Err("no issue provider configured".into()),
+        )
+        .unwrap();
+        assert!(facts.title.is_empty() && facts.body.is_empty());
+        let v: serde_json::Value = serde_json::from_str(&snap.unwrap()).unwrap();
+        assert_eq!(v["fetched"], false);
+        assert_eq!(v["error_kind"], "provider_none");
+        assert!(v.get("title").is_none());
+    }
+
+    #[test]
+    fn lookup_failure_with_issue_fields_refuses() {
+        let err = resolve_lookup("linear:THE-1", true, true, Err("boom".into())).unwrap_err();
+        assert!(err.to_string().contains("cannot fetch linear:THE-1"));
+    }
+
+    #[test]
+    fn lookup_success_renders_issue() {
+        let (facts, snap) = resolve_lookup("linear:THE-1", false, true, Ok(issue("hi"))).unwrap();
+        assert_eq!(facts.title, "hi");
+        assert!(snap.unwrap().contains("\"title\": \"hi\""));
+        let (_, none) = resolve_lookup("linear:THE-1", false, false, Ok(issue("hi"))).unwrap();
+        assert!(none.is_none());
     }
 }
