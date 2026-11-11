@@ -52,6 +52,7 @@ pub mod pr;
 pub mod pr_queue;
 pub mod project;
 pub mod proxy;
+pub mod release;
 pub mod repos;
 pub mod sandbox;
 pub mod sandbox_profile;
