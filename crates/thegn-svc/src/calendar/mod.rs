@@ -865,6 +865,25 @@ pub struct AccountResult {
     pub result: Result<EventPage, CalendarError>,
 }
 
+/// Value-free counts for one scheduler pass: no account names, URLs or error text.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct PassStats {
+    /// Configured accounts in the router.
+    pub accounts: usize,
+    /// Fetches launched.
+    pub started: usize,
+    /// Results delivered with `Ok`.
+    pub completed: usize,
+    /// Results delivered with `Err` from the fetch itself.
+    pub failed: usize,
+    /// In flight at the pass deadline, reported as `Timeout`.
+    pub abandoned: usize,
+    /// Never started (superseded or deadline).
+    pub skipped: usize,
+    /// Most fetches in flight at once.
+    pub peak_active: usize,
+}
+
 impl CalendarRouter {
     /// Every active account, metered against the process-wide pool.
     pub fn from_config(cfg: &CalendarConfig) -> Self {
@@ -1045,8 +1064,39 @@ impl CalendarRouter {
         tokens: &BTreeMap<String, String>,
         keep_starting: impl Fn() -> bool,
         pass_deadline: std::time::Duration,
-        mut sink: impl FnMut(AccountResult),
+        sink: impl FnMut(AccountResult),
     ) -> usize {
+        self.list_events_pass_bounded(window, tokens, keep_starting, pass_deadline, sink)
+            .await
+            .skipped
+    }
+
+    /// Like [`Self::list_events_each_while`], but reports value-free
+    /// [`PassStats`] for the pass instead of only the skipped count.
+    pub async fn list_events_pass(
+        &self,
+        window: CalendarWindow,
+        tokens: &BTreeMap<String, String>,
+        keep_starting: impl Fn() -> bool,
+        sink: impl FnMut(AccountResult),
+    ) -> PassStats {
+        self.list_events_pass_bounded(window, tokens, keep_starting, CALENDAR_PASS_DEADLINE, sink)
+            .await
+    }
+
+    /// The scheduler loop behind every pass entry point.
+    pub(crate) async fn list_events_pass_bounded(
+        &self,
+        window: CalendarWindow,
+        tokens: &BTreeMap<String, String>,
+        keep_starting: impl Fn() -> bool,
+        pass_deadline: std::time::Duration,
+        mut sink: impl FnMut(AccountResult),
+    ) -> PassStats {
+        let mut stats = PassStats {
+            accounts: self.accounts.len(),
+            ..PassStats::default()
+        };
         let mut queues: [VecDeque<&AccountBackend>; 3] = std::array::from_fn(|_| VecDeque::new());
         for account in &self.accounts {
             queues[account.class.index()].push_back(account);
@@ -1062,6 +1112,7 @@ impl CalendarRouter {
             {
                 let skipped = queues.iter().map(VecDeque::len).sum::<usize>();
                 drop(in_flight);
+                stats.abandoned = pending.len();
                 report_pass_deadline(&mut pending, skipped, &mut sink);
                 break;
             }
@@ -1084,6 +1135,8 @@ impl CalendarRouter {
                         let token = tokens.get(&account.name).map(String::as_str).unwrap_or("");
                         in_flight.push(fetch_account(account, &window, token));
                         pending.push(account);
+                        stats.started += 1;
+                        stats.peak_active = stats.peak_active.max(pending.len());
                     }
                 }
             }
@@ -1093,6 +1146,7 @@ impl CalendarRouter {
                     let skipped = queues.iter().map(VecDeque::len).sum::<usize>();
                     // Dropping the stream cancels every fetch future still in flight.
                     drop(in_flight);
+                    stats.abandoned = pending.len();
                     report_pass_deadline(&mut pending, skipped, &mut sink);
                     break;
                 }
@@ -1108,9 +1162,26 @@ impl CalendarRouter {
             {
                 pending.remove(index);
             }
+            if result.result.is_ok() {
+                stats.completed += 1;
+            } else {
+                stats.failed += 1;
+            }
             sink(result);
         }
-        queues.iter().map(VecDeque::len).sum()
+        stats.skipped = queues.iter().map(VecDeque::len).sum();
+        tracing::debug!(
+            target: "thegn::calendar",
+            accounts = stats.accounts,
+            started = stats.started,
+            completed = stats.completed,
+            failed = stats.failed,
+            abandoned = stats.abandoned,
+            skipped = stats.skipped,
+            peak_active = stats.peak_active,
+            "calendar pass finished"
+        );
+        stats
     }
 
     /// Fetch every account, returning results **per account**.
