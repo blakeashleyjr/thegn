@@ -100,23 +100,21 @@ impl ThemeStore {
         let worker_active = Arc::clone(&active);
         let watcher_tx = request.clone();
         let worker_shutdown = Arc::clone(&shutdown);
-        let worker = std::thread::Builder::new()
-            .name("thegn-themes".into())
-            .spawn(move || {
-                crate::platform::qos::set_self(crate::platform::qos::Qos::Background);
-                worker(
-                    request_rx,
-                    result_tx,
-                    waker,
-                    themes_dir,
-                    config_path,
-                    watcher_tx,
-                    WorkerState {
-                        shutdown: worker_shutdown,
-                        active: worker_active,
-                    },
-                )
-            });
+        let worker = thegn_core::thread_name::try_spawn_named("thegn-themes", move || {
+            crate::platform::qos::set_self(crate::platform::qos::Qos::Background);
+            worker(
+                request_rx,
+                result_tx,
+                waker,
+                themes_dir,
+                config_path,
+                watcher_tx,
+                WorkerState {
+                    shutdown: worker_shutdown,
+                    active: worker_active,
+                },
+            )
+        });
         Self::from_worker_spawn(worker, request, results, shutdown, active)
     }
 
