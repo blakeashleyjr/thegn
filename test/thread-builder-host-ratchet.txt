@@ -5,14 +5,16 @@
 automation_runtime.rs
 devcontainer_startup.rs
 diff_watch.rs
+db_task.rs
 frame_writer.rs
 gate_capture.rs
 handlers/startup.rs
-hydrate_refresh_ticker.rs
 lsp.rs
 managed_tool.rs
 measure/mod.rs
 mise_provider.rs
+model_proxy_daemon.rs
+monitor.rs
 pane_pty.rs
 platform/mod.rs
 plugins.rs
