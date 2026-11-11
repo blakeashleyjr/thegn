@@ -7,7 +7,11 @@ use thegn_core::config_daemon::ServeExposure;
 use thegn_core::control_error::ControlErrorCode;
 use thegn_svc::control::ErrorBody;
 use thegn_svc::control::http::{CommitBody, InputBody, PairBody, ResizeBody, StageBody};
-use thegn_svc::control::routes::API_CALLS;
+use thegn_svc::control::routes::{API_CALLS, ROUTES};
+
+/// The unauthenticated routes serve no capability, so they are not in
+/// `API_CALLS`; their methods are pinned here and their rows asserted in ROUTES.
+const OPEN_ROUTES: &[(&str, &str)] = &[("GET", "/health"), ("GET", "/pair"), ("POST", "/v1/pair")];
 
 fn spec(name: &str) -> String {
     let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -97,11 +101,22 @@ fn examples_deserialize_into_their_wire_types() {
 #[test]
 fn example_routes_are_registered_with_the_documented_method() {
     for (method, path, _, _) in route_examples() {
-        let registered: Vec<&str> = API_CALLS
+        let mut registered: Vec<&str> = API_CALLS
             .iter()
             .filter(|(_, _, call_path)| *call_path == path)
             .map(|(_, call_method, _)| *call_method)
             .collect();
+        for (open_method, open_path) in OPEN_ROUTES {
+            if *open_path == path {
+                assert!(
+                    ROUTES
+                        .iter()
+                        .any(|route| route.path == path && route.caps.is_empty()),
+                    "open route {path} has no capability-free ROUTES row"
+                );
+                registered.push(open_method);
+            }
+        }
         assert!(
             registered.contains(&method.as_str()),
             "example {method} {path} is not registered (methods for that path: {registered:?})"
