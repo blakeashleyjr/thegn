@@ -100,6 +100,40 @@ impl CalState {
     }
 }
 
+/// Stable identity of an agenda row across hydration: provider uid, source and
+/// the overridden occurrence (a recurring series shares one uid).
+pub(crate) type AgendaKey = (
+    String,
+    thegn_core::calendar::SourceId,
+    Option<thegn_core::calendar::EventTime>,
+);
+
+/// The identity of the focused agenda row, if the agenda pane is focused and the row exists.
+pub(crate) fn agenda_key(st: &CalState) -> Option<AgendaKey> {
+    if st.pane != CalPane::Agenda {
+        return None;
+    }
+    st.selected_events()
+        .get(st.agenda_sel)
+        .map(|e| (e.uid.clone(), e.source.clone(), e.recurrence_id.clone()))
+}
+
+/// Re-point `agenda_sel` at the event `key` named before the day's list changed;
+/// when it is gone, clamp into the new list (never past the end).
+pub(crate) fn reselect_agenda(st: &mut CalState, key: Option<&AgendaKey>) {
+    let len = st.selected_events().len();
+    if let Some(key) = key
+        && let Some(i) = st
+            .selected_events()
+            .iter()
+            .position(|e| (&e.uid, &e.source, &e.recurrence_id) == (&key.0, &key.1, &key.2))
+    {
+        st.agenda_sel = i;
+        return;
+    }
+    st.agenda_sel = st.agenda_sel.min(len.saturating_sub(1));
+}
+
 /// The calendar popup's content.
 #[derive(Debug, Clone)]
 pub(crate) struct CalendarDetail {
@@ -374,12 +408,14 @@ pub fn apply_calendar(slot: &mut Option<super::DetailOverlay>, payload: Calendar
     if c.st.pending != Some(payload.month) && !periodic_refresh {
         return false;
     }
+    let key = agenda_key(&c.st);
     crate::calendar_docs::fold_month(
         &mut c.st.events,
         &mut c.st.loaded,
         &mut c.st.errors,
         &payload,
     );
+    reselect_agenda(&mut c.st, key.as_ref());
     if !is_periodic {
         c.st.pending = None;
     }
