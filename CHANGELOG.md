@@ -9,6 +9,36 @@ All notable changes to **thegn** are documented here. The format follows
 
 ## [0.1.0-alpha.62] — 2026-11-11
 
+### Added
+
+- The Home Manager module exposes the `[daemon]` and `[network]` scalar
+  options (`daemonEnabled`, `daemonIdleExitSecs`, `daemonLeaseGraceSecs`,
+  `daemonStreamGapWindowSecs`, `networkOfflineAfterFailures` and
+  `networkRecoveryProbeSecs`). `daemon.socket` and `network.mode` stay
+  unexposed.
+
+### Fixed
+
+- Drawer state files are now written owner-only: the parent directory is
+  private (0700) and the file is 0600, a symlinked final entry is replaced and
+  a symlinked parent is refused.
+- The hook log directory and the reserved per-run log files are now
+  owner-only, so a failed finalization no longer leaves a world-readable
+  reservation.
+- Credentialed `just act` runs refuse a trailing value flag with no value, and
+  the guard scans arguments the way `act` parses them across `.actrc`, so a
+  credentialed run can no longer pass as anonymous.
+- Adding an account claims its managed home with one exclusive directory
+  create, so concurrent Add-account calls can no longer share one credential
+  directory.
+- Workflow triggers refuse more than 64 inputs before any provider request.
+- The daemon's idle control-directory prune also reclaims a dead daemon's stale
+  socket and lock after confirming the socket refuses connections.
+- Branch, tag and bisect ref output must end with a newline, so output
+  truncated inside the final record is no longer parsed as complete.
+- Pipeline supervision no longer treats an unstable verification snapshot as a
+  parent artifact.
+
 ## [0.1.0-alpha.61] — 2026-11-11
 
 ### Added
