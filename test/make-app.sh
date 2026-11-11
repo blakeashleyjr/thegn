@@ -179,6 +179,33 @@ if run_make_app --dest "$tmp/symlink-dest" >"$tmp/symlink-dest.out" 2>"$tmp/syml
 fi
 [[ -z "$(find "$tmp/target-dest" -mindepth 1 -print -quit)" ]] || fail "symlink destination target received files"
 
+# bundle identifier grammar
+run_make_app --dest "$tmp/id-ok" --name my_app >/dev/null || fail "underscore name was refused"
+grep -Fq '<key>CFBundleIdentifier</key><string>com.github.blakeashleyjr.my-app</string>' "$tmp/id-ok/my_app.app/Contents/Info.plist" ||
+  fail "underscore name did not derive a valid bundle identifier"
+grep -Fq '<key>CFBundleName</key><string>my_app</string>' "$tmp/id-ok/my_app.app/Contents/Info.plist" ||
+  fail "underscore name changed the display name"
+assert_no_workdirs "$tmp/id-ok" || fail "underscore name left temporary directories"
+
+grep -Fq '<key>CFBundleIdentifier</key><string>com.github.blakeashleyjr.thegn</string>' "$apps/thegn.app/Contents/Info.plist" ||
+  fail "default name lost its bundle identifier"
+
+for bad in a..b thegn. x..; do
+  if run_make_app --dest "$tmp/id-bad" --name "$bad" >/dev/null 2>"$tmp/id-bad.err"; then
+    fail "name $bad was accepted"
+  fi
+  grep -Fq "must not contain '..'" "$tmp/id-bad.err" || fail "name $bad was not refused for its identifier"
+  [[ ! -e "$tmp/id-bad" ]] || fail "refused name $bad created the destination"
+done
+
+leg="$tmp/id-legacy/my_app.app"
+mkdir -p "$leg/Contents/Resources"
+printf legacy >"$leg/Contents/Resources/common.sh"
+printf '<string>com.github.blakeashleyjr.my_app</string>\n' >"$leg/Contents/Info.plist"
+run_make_app --dest "$tmp/id-legacy" --name my_app >/dev/null || fail "legacy underscore bundle was not adopted"
+grep -Fq 'com.github.blakeashleyjr.my-app' "$leg/Contents/Info.plist" || fail "adopted bundle kept the invalid identifier"
+assert_no_workdirs "$tmp/id-legacy" || fail "legacy underscore adoption left temporary directories"
+
 # dry-run writes nothing
 dry_dest="$tmp/dry-run-apps"
 run_make_app --dest "$dry_dest" --dry-run >"$tmp/dry-run.out" || fail "dry-run failed"
