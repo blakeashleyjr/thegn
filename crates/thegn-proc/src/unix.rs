@@ -943,17 +943,29 @@ mod tests {
     #[test]
     fn cancel_during_quiesce_is_cancelled_with_leader_exited_first() {
         let dir = Scripts::new();
-        let script = dir.write("cancel-quiesce.sh", "sleep 30 & exit 0\n");
+        let marker = dir.path().join("ready");
+        let script = dir.write(
+            "cancel-quiesce.sh",
+            &format!("sleep 30 & : > '{}'; exit 0\n", marker.display()),
+        );
         let cancel = Arc::new(AtomicBool::new(false));
         let child_cancel = Arc::clone(&cancel);
         let runner = thread::spawn(move || {
-            run(
-                &mut command(&script),
-                &limits(Duration::from_secs(10)),
-                &child_cancel,
-            )
+            let config = Limits {
+                quiesce_after_leader: Some(Duration::from_secs(20)),
+                ..limits(Duration::from_secs(60))
+            };
+            run(&mut command(&script), &config, &child_cancel)
         });
-        thread::sleep(Duration::from_millis(150));
+        let ready_deadline = std::time::Instant::now() + Duration::from_secs(30);
+        while !marker.exists() {
+            assert!(
+                std::time::Instant::now() < ready_deadline,
+                "leader never wrote its ready marker"
+            );
+            thread::sleep(Duration::from_millis(10));
+        }
+        thread::sleep(Duration::from_millis(500));
         cancel.store(true, Ordering::Release);
         let result = runner.join().unwrap();
         assert!(matches!(&result.end, End::Cancelled));
