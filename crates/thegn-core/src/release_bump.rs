@@ -294,7 +294,13 @@ pub fn bump_cargo_lock(text: &str, plan: &BumpPlan) -> Result<String> {
                 .trim_end_matches('"');
             out.push_str(lines[i]);
             out.push_str(lines[i + 1]);
-            if is_workspace_version(ver, &plan.old) {
+            // Workspace path crates carry no `source = ` line; a registry or
+            // git dependency at the same version must stay untouched.
+            let has_source = lines[i + 3..]
+                .iter()
+                .take_while(|l| !l.trim().is_empty())
+                .any(|l| l.starts_with("source = "));
+            if !has_source && is_workspace_version(ver, &plan.old) {
                 let nl = &vline[vline.trim_end().len()..];
                 out.push_str(&format!("version = \"{new}\"{nl}"));
                 bumped += 1;
@@ -357,6 +363,7 @@ pub fn bump_changelog(text: &str, old: &Version, new: &Version, today: &str) -> 
         });
     }
     let old_link = format!("[Unreleased]: {COMPARE_BASE}/v{old_s}...HEAD");
+    let eol = if text.contains("\r\n") { "\r\n" } else { "\n" };
     let mut out = String::with_capacity(text.len() + 256);
     let mut footer_done = false;
     for line in text.split_inclusive('\n') {
@@ -364,12 +371,12 @@ pub fn bump_changelog(text: &str, old: &Version, new: &Version, today: &str) -> 
         let nl = &line[body.len()..];
         if body == "## [Unreleased]" {
             out.push_str(line);
-            let sep = if nl.is_empty() { "\n" } else { "" };
-            out.push_str(&format!("{sep}\n## [{new_s}] — {today}\n"));
+            let sep = if nl.is_empty() { eol } else { "" };
+            out.push_str(&format!("{sep}{eol}## [{new_s}] — {today}{eol}"));
         } else if body == old_link {
             footer_done = true;
             out.push_str(&format!(
-                "[Unreleased]: {COMPARE_BASE}/v{new_s}...HEAD\n[{new_s}]: {COMPARE_BASE}/v{old_s}...v{new_s}{nl}"
+                "[Unreleased]: {COMPARE_BASE}/v{new_s}...HEAD{eol}[{new_s}]: {COMPARE_BASE}/v{old_s}...v{new_s}{nl}"
             ));
         } else {
             out.push_str(line);
@@ -674,6 +681,50 @@ mod tests {
             bump_changelog(&no_footer, &p.old, &p.new, &p.today),
             Err(ReleaseError::MissingMarker { .. })
         ));
+    }
+
+    #[test]
+    fn cargo_lock_leaves_sourced_entries_at_stable_old_version() {
+        let p = BumpPlan {
+            old: v("1.2.3"),
+            new: v("1.2.4"),
+            today: "2026-11-12".into(),
+        };
+        let mut input = lock(&["1.2.3"; 5]);
+        input.push_str(
+            "\n[[package]]\nname = \"thirdparty\"\nversion = \"1.2.3\"\nsource = \"registry+https://github.com/rust-lang/crates.io-index\"\nchecksum = \"abc\"\n",
+        );
+        let out = bump_cargo_lock(&input, &p).unwrap();
+        assert_eq!(out.matches("version = \"1.2.4\"").count(), 5);
+        assert!(out.contains("name = \"thirdparty\"\nversion = \"1.2.3\"\nsource ="));
+    }
+
+    #[test]
+    fn changelog_crlf_and_no_trailing_newline_succeed() {
+        let p = plan();
+        let text = format!(
+            "# Changelog\r\n## [Unreleased]\r\nbody\r\n[Unreleased]: {COMPARE_BASE}/v{}...HEAD",
+            p.old
+        );
+        let out = bump_changelog(&text, &p.old, &p.new, &p.today).unwrap();
+        let want = format!(
+            "# Changelog\r\n## [Unreleased]\r\n\r\n## [{n}] — {d}\r\nbody\r\n[Unreleased]: {COMPARE_BASE}/v{n}...HEAD\r\n[{n}]: {COMPARE_BASE}/v{o}...v{n}",
+            n = p.new,
+            o = p.old,
+            d = p.today
+        );
+        assert_eq!(out, want);
+        assert!(!out.replace("\r\n", "").contains('\n'));
+        // LF file without a trailing newline on the heading-only path
+        let lf = format!(
+            "## [Unreleased]\n[Unreleased]: {COMPARE_BASE}/v{}...HEAD",
+            p.old
+        );
+        assert!(
+            bump_changelog(&lf, &p.old, &p.new, &p.today)
+                .unwrap()
+                .contains("\n## [")
+        );
     }
 
     #[test]

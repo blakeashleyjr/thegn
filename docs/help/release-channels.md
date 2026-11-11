@@ -93,7 +93,10 @@ commit, tag or push; review the diff and commit it yourself.
 - `--date YYYY-MM-DD` overrides today's date in the changelog heading.
 - `--lock-from <path>` takes `Cargo.lock` from another worktree (a directory or
   a lock file) before bumping.
-- `--dry-run` shows the files that would change and writes nothing; `--json`
+- `--dry-run` shows the files that would change and writes nothing (it also
+  works with `--from <ref>`: the files are read from that ref). `--json`
   prints the result as one JSON object.
+- Every rewrite is computed before anything changes, so a refusal (already
+  bumped, a missing marker) leaves your branch and files untouched.
 
 Running it twice refuses: the changelog already has the new version's heading.
