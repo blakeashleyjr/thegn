@@ -87,11 +87,17 @@ const OMITTED: &[(&str, &str)] = &[
     ("weather", "weather configuration is not exposed"),
     ("issues", "issue providers are not exposed"),
     ("ci", "CI providers are not exposed"),
-    ("diagnostics", "diagnostics policy is not exposed"),
+    (
+        "diagnostics.crash_sink",
+        "reserved: any non-empty value is rejected at load",
+    ),
     ("database", "database migration policy is not exposed"),
     ("hooks", "lifecycle hooks are not exposed"),
     ("toolchain", "toolchain policy is not exposed"),
-    ("limits", "resource limits are not exposed"),
+    (
+        "limits.test_nice",
+        "signed i32: the numeric gate models only unsigned ranges",
+    ),
     ("disk", "disk and cache policy is not exposed"),
     (
         "notifications.desktop_min_urgency",
@@ -718,6 +724,8 @@ fn every_schema_key_is_rendered_or_dispositioned() {
         "pr",
         "watch",
         "log",
+        "limits",
+        "diagnostics",
         "sandbox.remote",
     ] {
         for (schema_section, key) in &required.keys {
@@ -1135,6 +1143,39 @@ fn hm_recording_media_and_monitor_process_keys_are_rendered_and_rest_disposition
 }
 
 #[test]
+fn hm_limits_and_diagnostics_keys_are_rendered_and_rest_dispositioned() {
+    let rendered = rendered_paths(&module_src());
+    for path in [
+        "limits.test_cpu_quota",
+        "limits.test_mem_max",
+        "limits.test_max_parallel",
+        "limits.test_timeout_secs",
+        "limits.discover_timeout_secs",
+        "limits.isolated_target_dir",
+        "diagnostics.crash_reports",
+        "diagnostics.crash_retention",
+        "diagnostics.ring_size",
+    ] {
+        assert!(rendered.contains(path), "Home Manager must render {path}");
+    }
+
+    let omissions: BTreeSet<&str> = OMITTED.iter().map(|(path, _)| *path).collect();
+    for table in ["limits", "diagnostics"] {
+        let schema = schema_field(table);
+        let properties = schema["properties"]
+            .as_object()
+            .unwrap_or_else(|| panic!("{table} schema properties"));
+        for key in properties.keys() {
+            let path = format!("{table}.{key}");
+            assert!(
+                rendered.contains(&path) || omissions.contains(path.as_str()),
+                "{path} must be rendered or dispositioned by an exact ledger row"
+            );
+        }
+    }
+}
+
+#[test]
 fn hm_loc_and_replay_families_are_fully_rendered() {
     let rendered = rendered_paths(&module_src());
     for table in ["loc", "replay"] {
@@ -1302,6 +1343,11 @@ fn every_numeric_option_matches_its_destination_range() {
         ("mediaSeekStepVideoSecs", "media.seek_step_video_secs"),
         ("mediaPollIntervalSecs", "media.poll_interval_secs"),
         ("monitorProcRows", "monitor.proc_rows"),
+        ("limitsTestMaxParallel", "limits.test_max_parallel"),
+        ("limitsTestTimeoutSecs", "limits.test_timeout_secs"),
+        ("limitsDiscoverTimeoutSecs", "limits.discover_timeout_secs"),
+        ("diagnosticsCrashRetention", "diagnostics.crash_retention"),
+        ("diagnosticsRingSize", "diagnostics.ring_size"),
     ];
     let options = numeric_options(&module_src());
     let actual_names: BTreeSet<&str> = options.iter().map(|(name, _)| name.as_str()).collect();
