@@ -2454,6 +2454,33 @@ pub(crate) fn verify_v109_schema(conn: &Connection) -> Result<()> {
     Ok(())
 }
 
+/// v110: agent_dispatches.dispatch_kind, the typed trust class of a roster row (THE-241).
+pub(crate) fn migrate_v110(conn: &Connection) -> Result<()> {
+    if !has_column(conn, "agent_dispatches", "dispatch_kind") {
+        conn.execute(
+            "ALTER TABLE agent_dispatches ADD COLUMN dispatch_kind TEXT",
+            [],
+        )?;
+    }
+    // Conservative, idempotent backfill: only rows never classified.
+    conn.execute(
+        "UPDATE agent_dispatches SET dispatch_kind = CASE
+           WHEN stage IS NULL OR TRIM(stage) = '' THEN 'plain'
+           WHEN artifact_path IS NULL OR TRIM(artifact_path) = '' THEN 'legacy_held'
+           ELSE 'stage' END
+         WHERE dispatch_kind IS NULL",
+        [],
+    )?;
+    Ok(())
+}
+
+pub(crate) fn verify_v110_schema(conn: &Connection) -> Result<()> {
+    if !has_column(conn, "agent_dispatches", "dispatch_kind") {
+        bail!("schema v110 migration did not add agent_dispatches.dispatch_kind");
+    }
+    Ok(())
+}
+
 /// Verify the v69 identity ledger before the schema version is stamped. A
 /// missing column/table must never look like a completed migration.
 pub(crate) fn verify_v69_schema(conn: &Connection) -> Result<()> {
@@ -4542,7 +4569,8 @@ mod tests {
             .pragma_query_value(None, "user_version", |row| row.get(0))
             .unwrap();
         assert_eq!(
-            version, 109,
+            version,
+            crate::db::SCHEMA_VERSION,
             "v109 pins the additive worktree column migration"
         );
         let conn = Connection::open_in_memory().unwrap();
@@ -4601,6 +4629,80 @@ mod tests {
             )
             .unwrap();
         assert_eq!(stored, None);
+    }
+
+    #[test]
+    fn v110_adds_dispatch_kind_idempotently_and_verifies() {
+        let fresh = Db::open_memory().unwrap();
+        super::verify_v110_schema(fresh.conn()).unwrap();
+        let version: i64 = fresh
+            .conn()
+            .pragma_query_value(None, "user_version", |row| row.get(0))
+            .unwrap();
+        assert_eq!(version, crate::db::SCHEMA_VERSION);
+        assert_eq!(version, 110);
+        let conn = Connection::open_in_memory().unwrap();
+        assert!(super::verify_v110_schema(&conn).is_err());
+        conn.execute_batch(
+            "CREATE TABLE agent_dispatches (id INTEGER PRIMARY KEY, stage TEXT, artifact_path TEXT);",
+        )
+        .unwrap();
+        super::migrate_v110(&conn).unwrap();
+        super::migrate_v110(&conn).unwrap();
+        super::verify_v110_schema(&conn).unwrap();
+        conn.execute_batch("ALTER TABLE agent_dispatches DROP COLUMN dispatch_kind;")
+            .unwrap();
+        assert!(super::verify_v110_schema(&conn).is_err());
+        super::migrate_v110(&conn).unwrap();
+        super::verify_v110_schema(&conn).unwrap();
+    }
+
+    #[test]
+    fn v110_upgrades_a_real_v109_database_and_classifies_legacy_rows_conservatively() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("v109.db");
+        {
+            let db = Db::open_at(&path).unwrap();
+            db.conn()
+                .execute_batch(
+                    "ALTER TABLE agent_dispatches DROP COLUMN dispatch_kind;
+                 PRAGMA user_version=109;
+                 INSERT INTO agent_dispatches (issue_id,worktree_path,agent_name,dispatched_at_ms,status,stage,artifact_path)
+                   VALUES ('k-a','/wt','claude',1,'running','code','a.md');
+                 INSERT INTO agent_dispatches (issue_id,worktree_path,agent_name,dispatched_at_ms,status,stage,artifact_path)
+                   VALUES ('k-b','/wt','claude',1,'running','code',NULL);
+                 INSERT INTO agent_dispatches (issue_id,worktree_path,agent_name,dispatched_at_ms,status,stage,artifact_path)
+                   VALUES ('k-c','/wt','claude',1,'running',NULL,NULL);
+                 INSERT INTO agent_dispatches (issue_id,worktree_path,agent_name,dispatched_at_ms,status,stage,artifact_path)
+                   VALUES ('k-d','/wt','claude',1,'running','code','  ');",
+                )
+                .unwrap();
+        }
+        let upgraded = Db::open_at(&path).unwrap();
+        let version: i64 = upgraded
+            .conn()
+            .pragma_query_value(None, "user_version", |row| row.get(0))
+            .unwrap();
+        assert_eq!(version, crate::db::SCHEMA_VERSION);
+        super::verify_v110_schema(upgraded.conn()).unwrap();
+        let kinds = |db: &Db| -> Vec<(Option<String>, String)> {
+            let mut stmt = db
+                .conn()
+                .prepare("SELECT dispatch_kind, status FROM agent_dispatches ORDER BY issue_id")
+                .unwrap();
+            stmt.query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+                .unwrap()
+                .map(Result::unwrap)
+                .collect()
+        };
+        let expect: Vec<(Option<String>, String)> =
+            ["stage", "legacy_held", "plain", "legacy_held"]
+                .iter()
+                .map(|k| (Some((*k).to_string()), "running".to_string()))
+                .collect();
+        assert_eq!(kinds(&upgraded), expect);
+        super::migrate_v110(upgraded.conn()).unwrap();
+        assert_eq!(kinds(&upgraded), expect, "the backfill is idempotent");
     }
 
     #[test]
