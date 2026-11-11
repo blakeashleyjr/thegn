@@ -551,7 +551,9 @@ fn sealed_scrub_script_with(home: &str, dotfiles: &[(String, String)], mountinfo
         "[ -e \"$DONE\" ] && exit 0".into(),
         format!("MI={}", sh_single(mountinfo)),
         "MOK=0; [ -r \"$MI\" ] && command -v sed >/dev/null 2>&1 && MOK=1".into(),
-        "HP=$(cd -- \"$H\" 2>/dev/null && pwd -P); if [ -z \"$HP\" ]; then HP=\"$H\"; MOK=0; fi".into(),
+        // A home that resolves to `/` would give `//name` mount paths that never match: treat it as unknown.
+        "HP=$(cd -- \"$H\" 2>/dev/null && pwd -P); if [ -z \"$HP\" ] || [ \"$HP\" = / ]; then HP=\"$H\"; MOK=0; fi"
+            .into(),
         "HD=$(stat -c %d \"$HP\" 2>/dev/null)".into(),
         "HAS=0; command -v sha256sum >/dev/null 2>&1 && HAS=1".into(),
         "rc=0".into(),
@@ -593,6 +595,7 @@ fn sealed_scrub_script_with(home: &str, dotfiles: &[(String, String)], mountinfo
         "}".into(),
         "scrub_dot() {".into(),
         "  if [ \"$MOK\" != 1 ]; then echo \"sealed scrub: skip $1 (mount status unknown)\" >&2; return 0; fi".into(),
+        "  [ -n \"$2\" ] || return 0".into(),
         "  scrub \"$1\" \"$2\"".into(),
         "}".into(),
     ];
@@ -1112,7 +1115,10 @@ mod tests {
         // The atuin config is not a credential and is never removed.
         assert!(!script.contains("config.toml"));
         assert!(!script.contains("evil") && !script.contains("/etc/passwd"));
-        assert!(!script.contains(" -r") && !script.contains("-rf"));
+        // Never a recursive removal (the script legitimately uses `[ -r ...]` and `read -r`).
+        assert!(
+            !script.contains("rm -r") && !script.contains("rm -rf") && !script.contains("rm -fr")
+        );
         assert!(!script.contains("thegn-host-provisioned"));
         assert!(!script.contains("\"$HOME\"") && !script.trim_end().ends_with("true"));
         assert!(script.ends_with("exit 0"));
@@ -1164,6 +1170,12 @@ mod tests {
             &[".zshrc".into(), ".missing".into(), "../evil".into()],
         );
         assert_eq!(got, vec![(".zshrc".to_string(), hex_of("host-zsh"))]);
+    }
+
+    #[test]
+    fn sealed_scrub_computes_no_digests_for_an_unknown_host_home() {
+        // An empty host home must never hash relative names against the current directory.
+        assert!(host_dotfile_digests(std::path::Path::new(""), &["Cargo.toml".into()]).is_empty());
     }
 
     fn run_scrub(script: &str, state: &std::path::Path) -> std::process::ExitStatus {
