@@ -501,11 +501,18 @@ impl NotificationStore for Db {
                 limit: Db::ROSTER_ACTIVE_LIMIT,
             }));
         }
+        // The typed trust class (v110): a stage row can never be mistaken for
+        // a plain dispatch by a later NULL-inferring reader.
+        let kind = if new.stage.is_some_and(|s| !s.trim().is_empty()) {
+            "stage"
+        } else {
+            "plain"
+        };
         self.conn().execute(
             r#"INSERT INTO agent_dispatches
                  (issue_id,worktree_path,agent_name,dispatched_at_ms,status,
-                  stage,parent_id,session_id,artifact_path,chunk_path)
-               VALUES(?1,?2,?3,?4,'queued',?5,?6,?7,?8,?9)"#,
+                  stage,parent_id,session_id,artifact_path,chunk_path,dispatch_kind)
+               VALUES(?1,?2,?3,?4,'queued',?5,?6,?7,?8,?9,?10)"#,
             params![
                 new.issue_id,
                 new.worktree_path,
@@ -520,6 +527,7 @@ impl NotificationStore for Db {
                 new.session_id,
                 new.artifact_path,
                 new.chunk_path,
+                kind,
             ],
         )?;
         Ok(self.conn().last_insert_rowid())

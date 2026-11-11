@@ -983,13 +983,11 @@ fn prewarm(worktree: &Path, identity: &ConfigSetIdentity) {
     let worktree = worktree.to_path_buf();
     let identity = identity.clone();
     let key = identity.hash.clone();
-    if std::thread::Builder::new()
-        .name("thegn-toolchain".into())
-        .spawn(move || {
-            crate::platform::qos::set_self(crate::platform::qos::Qos::Utility);
-            resolve_cached(&worktree, &identity);
-        })
-        .is_err()
+    if thegn_core::thread_name::try_spawn_named("thegn-toolchain", move || {
+        crate::platform::qos::set_self(crate::platform::qos::Qos::Utility);
+        resolve_cached(&worktree, &identity);
+    })
+    .is_err()
     {
         // A failed worker spawn must not permanently suppress retries for this
         // identity. Resource exhaustion is transient and the next launch can
@@ -1098,13 +1096,11 @@ fn prewarm_remote(
     let approved = db
         .map(|db| approvals_for(Some(db), repo_root.as_path()))
         .unwrap_or_default();
-    if std::thread::Builder::new()
-        .name("thegn-tc-remote".into())
-        .spawn(move || {
-            crate::platform::qos::set_self(crate::platform::qos::Qos::Utility);
-            resolve_remote_cache(&cfg, &worktree, &loc, approved);
-        })
-        .is_err()
+    if thegn_core::thread_name::try_spawn_named("thegn-tc-remote", move || {
+        crate::platform::qos::set_self(crate::platform::qos::Qos::Utility);
+        resolve_remote_cache(&cfg, &worktree, &loc, approved);
+    })
+    .is_err()
     {
         // Keep the remote resolver retryable when the OS refuses a new worker.
         if let Ok(mut keys) = in_flight().lock() {

@@ -256,43 +256,40 @@ fn start_server(
     sock.set_read_timeout(Some(Duration::from_millis(500))).ok(); // best-effort: timeout hint: the default blocking read is fine if the hint fails
     // best-effort: if the listener thread cannot spawn, the sandbox's DNS
     // queries fail fast (the socket drops with us) — surfaced, not silent.
-    if let Err(e) = std::thread::Builder::new()
-        .name("thegn-dnsfilter".into())
-        .spawn(move || {
-            let resolver = policy.upstream.unwrap_or_else(find_system_resolver);
-            let mut buf = [0u8; 512];
-            loop {
-                let Ok((n, src)) = sock.recv_from(&mut buf) else {
-                    continue;
-                };
-                let packet = buf[..n].to_vec();
-                let name = extract_query_name(&packet).unwrap_or_default();
-                let allowed = policy.allows(&name);
+    if let Err(e) = crate::thread_name::try_spawn_named("thegn-dnsfilter", move || {
+        let resolver = policy.upstream.unwrap_or_else(find_system_resolver);
+        let mut buf = [0u8; 512];
+        loop {
+            let Ok((n, src)) = sock.recv_from(&mut buf) else {
+                continue;
+            };
+            let packet = buf[..n].to_vec();
+            let name = extract_query_name(&packet).unwrap_or_default();
+            let allowed = policy.allows(&name);
 
-                // Append to ring-buffer, evict oldest if full.
-                if let Ok(mut ring) = events.lock() {
-                    if ring.len() >= MAX_RING {
-                        ring.remove(0);
-                    }
-                    ring.push(DnsEvent {
-                        name: name.clone(),
-                        allowed,
-                        policy: policy_id,
-                    });
+            // Append to ring-buffer, evict oldest if full.
+            if let Ok(mut ring) = events.lock() {
+                if ring.len() >= MAX_RING {
+                    ring.remove(0);
                 }
-
-                if allowed {
-                    if let Some(response) = forward_query(&packet, &resolver) {
-                        let _ = sock.send_to(&response, src); // best-effort: a dropped UDP reply is a client retry
-                    } else {
-                        let _ = sock.send_to(&servfail(&packet), src); // best-effort: a dropped UDP reply is a client retry
-                    }
-                } else {
-                    let _ = sock.send_to(&nxdomain(&packet), src); // best-effort: a dropped UDP reply is a client retry
-                }
+                ring.push(DnsEvent {
+                    name: name.clone(),
+                    allowed,
+                    policy: policy_id,
+                });
             }
-        })
-    {
+
+            if allowed {
+                if let Some(response) = forward_query(&packet, &resolver) {
+                    let _ = sock.send_to(&response, src); // best-effort: a dropped UDP reply is a client retry
+                } else {
+                    let _ = sock.send_to(&servfail(&packet), src); // best-effort: a dropped UDP reply is a client retry
+                }
+            } else {
+                let _ = sock.send_to(&nxdomain(&packet), src); // best-effort: a dropped UDP reply is a client retry
+            }
+        }
+    }) {
         tracing::warn!(target: "thegn::dns", error = %e, "dns-filter listener failed to start");
     }
 }

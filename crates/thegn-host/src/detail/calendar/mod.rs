@@ -340,13 +340,16 @@ pub(crate) fn hit(
         }
         row += h;
     }
+    let window = render::agenda_window(st);
     if let Some((y0, rows)) = agenda_at
         && (y as i64) >= y0
         && (y as i64) < y0 + rows as i64
         && y >= inner.y
         && y < inner.y + inner.rows
     {
-        return Some(layout::CalHit::AgendaRow((y as i64 - y0) as usize));
+        return Some(layout::CalHit::AgendaRow(
+            window.start + (y as i64 - y0) as usize,
+        ));
     }
     None
 }

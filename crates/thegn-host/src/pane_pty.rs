@@ -129,10 +129,7 @@ impl PtyProcessOwner {
     /// until its inline reap has completed.
     pub(crate) fn terminate_and_reap_detached_with(&self, parcel: Box<dyn Send>) {
         self.terminate_and_reap_detached_with_spawner(parcel, |worker| {
-            std::thread::Builder::new()
-                .name("thegn-pty-reap".into())
-                .spawn(worker)
-                .map(|_| ())
+            thegn_core::thread_name::try_spawn_named("thegn-pty-reap", worker).map(|_| ())
         });
     }
 
@@ -220,18 +217,16 @@ impl Drop for PtyProcessState {
         let group = self.group.take();
         let teardown = Arc::new(Mutex::new(Some((child, group))));
         let worker_teardown = Arc::clone(&teardown);
-        let spawn = std::thread::Builder::new()
-            .name("thegn-pty-reap".into())
-            .spawn(move || {
-                crate::platform::qos::set_self(crate::platform::qos::Qos::Background);
-                let parts = worker_teardown
-                    .lock()
-                    .unwrap_or_else(|poison| poison.into_inner())
-                    .take();
-                if let Some((mut child, group)) = parts {
-                    terminate_and_reap_parts(child.as_mut(), group.as_ref());
-                }
-            });
+        let spawn = thegn_core::thread_name::try_spawn_named("thegn-pty-reap", move || {
+            crate::platform::qos::set_self(crate::platform::qos::Qos::Background);
+            let parts = worker_teardown
+                .lock()
+                .unwrap_or_else(|poison| poison.into_inner())
+                .take();
+            if let Some((mut child, group)) = parts {
+                terminate_and_reap_parts(child.as_mut(), group.as_ref());
+            }
+        });
         if let Err(error) = spawn {
             tracing::debug!(target: "thegn::pty", %error, "unable to spawn PTY reaper; reaping inline");
             let parts = teardown

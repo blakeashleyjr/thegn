@@ -85,7 +85,7 @@ pub enum Action {
         session: Option<String>,
         /// Path to the handoff artifact. A pipeline row's handoff is
         /// `.thegn/pipeline/<ISSUE>/<stage>/<row>.md`; it is assigned
-        /// automatically when omitted, and any other path never verifies.
+        /// automatically; `--artifact` is refused together with `--stage`.
         #[arg(long)]
         artifact: Option<String>,
         /// The chunk file this row dispatches under (`.thegn/pipeline/<ISSUE>/
@@ -166,9 +166,9 @@ pub enum Action {
         stage: String,
         /// Path to the handoff artifact this row will produce. A pipeline
         /// row's handoff is `.thegn/pipeline/<ISSUE>/<stage>/<row>.md`; it is
-        /// assigned automatically when omitted, and any other path never
-        /// verifies.
-        #[arg(long)]
+        /// assigned automatically; `--artifact` is always refused here (a
+        /// claim is a pipeline row).
+        #[arg(long, hide = true)]
         artifact: Option<String>,
         /// The roster row this one was chunked out of.
         #[arg(long)]
@@ -521,6 +521,7 @@ pub fn run(cfg: &Config, action: Action) -> Result<()> {
             why,
             json,
         } => {
+            refuse_stage_artifact_override(Some(&stage), artifact.as_deref())?;
             let (issue_id, worktree_path) = dispatch_identity(&issue_id, &worktree_path)?;
             claim(
                 cfg,
@@ -568,6 +569,7 @@ pub fn run(cfg: &Config, action: Action) -> Result<()> {
             why,
             json,
         } => {
+            refuse_stage_artifact_override(stage.as_deref(), artifact.as_deref())?;
             let (issue_id, worktree_path) = dispatch_identity(&issue_id, &worktree_path)?;
             let db = Db::open()?;
             let proof = lead_proof(
@@ -1011,6 +1013,20 @@ fn lead_proof<'a>(
     } else {
         LeadProof::Unbound
     }
+}
+
+/// A staged row's handoff is always `.thegn/pipeline/<issue>/<stage>/<row>.md`;
+/// a caller-chosen `--artifact` there is refused up front.
+pub(crate) fn refuse_stage_artifact_override(
+    stage: Option<&str>,
+    artifact: Option<&str>,
+) -> Result<()> {
+    if let (Some(stage), Some(_)) = (stage, artifact) {
+        anyhow::bail!(
+            "--artifact is not accepted on a pipeline row (--stage {stage}): its handoff is assigned as .thegn/pipeline/<issue>/<stage>/<row>.md; drop --artifact"
+        );
+    }
+    Ok(())
 }
 
 pub(crate) fn dispatch_identity(issue_id: &str, worktree: &str) -> Result<(String, String)> {
@@ -1959,6 +1975,18 @@ pub(crate) fn done_gate_bound(db: &Db, row: &AgentDispatch) -> Result<()> {
             reasons: vec![
                 "unpublished reservation: the row is still spawning and no session is published for it; wait for the session to publish (or open one), or record it with `--force --why '<reason>'`".into(),
             ],
+        }
+        .into());
+    }
+    let kind = db.dispatch_kind(row.id)?;
+    if let Some(reason) = pipeline_run::typed_kind_refusal(
+        kind.as_deref(),
+        row.stage.as_deref(),
+        row.artifact_path.as_deref(),
+    ) {
+        return Err(DoneGateRefused {
+            id: row.id,
+            reasons: vec![reason],
         }
         .into());
     }
@@ -3335,6 +3363,24 @@ mod tests {
         assert!(!is_hex_oid("HEAD"));
         assert!(!is_hex_oid(&format!("{}g", "a".repeat(39))));
         assert!(!is_hex_oid(&format!("-{}", "a".repeat(40))));
+    }
+
+    #[test]
+    fn stage_artifact_override_is_refused_for_staged_rows() {
+        for artifact in ["README.md", ""] {
+            let err = refuse_stage_artifact_override(Some("code"), Some(artifact))
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains("--artifact is not accepted"), "{err}");
+            assert!(err.contains("code"), "{err}");
+        }
+    }
+
+    #[test]
+    fn stage_artifact_override_allows_plain_rows_and_omitted_artifact() {
+        assert!(refuse_stage_artifact_override(None, Some("notes.md")).is_ok());
+        assert!(refuse_stage_artifact_override(Some("code"), None).is_ok());
+        assert!(refuse_stage_artifact_override(None, None).is_ok());
     }
 
     fn db(name: &str) -> (tempfile::TempDir, Db) {
@@ -5953,6 +5999,38 @@ mod tests {
 
         let error = done_gate_bound(&db, &row).unwrap_err();
         assert!(error.to_string().contains("unpublished reservation"));
+    }
+
+    #[test]
+    fn dispatch_kind_stage_row_without_identity_is_refused_by_the_done_gate() {
+        let (_dir, db) = db("dispatch-kind-stage-identity");
+        let id = db
+            .put_agent_dispatch(NewDispatch {
+                stage: Some("code"),
+                artifact_path: Some("a.md"),
+                ..NewDispatch::new("linear:THE-241-KIND", "/wt/x", "claude")
+            })
+            .unwrap();
+        db.update_dispatch_status(id, AgentDispatchStatus::Running)
+            .unwrap();
+        let mut row = db.get_dispatch(id).unwrap().unwrap();
+        row.stage = None;
+        row.artifact_path = None;
+
+        let error = done_gate_bound(&db, &row).unwrap_err();
+        assert!(error.to_string().contains("typed pipeline row"));
+    }
+
+    #[test]
+    fn dispatch_kind_plain_row_completes_through_the_done_gate() {
+        let (_dir, db) = db("dispatch-kind-plain-done");
+        let id = db
+            .put_agent_dispatch(NewDispatch::new("linear:THE-241-PLAIN", "/wt/x", "claude"))
+            .unwrap();
+        db.update_dispatch_status(id, AgentDispatchStatus::Running)
+            .unwrap();
+        let row = db.get_dispatch(id).unwrap().unwrap();
+        done_gate_bound(&db, &row).unwrap();
     }
 
     #[test]

@@ -269,15 +269,21 @@ fn unsafe_full_access_stages(cfg: &Config, backend: Backend) -> Vec<(String, Str
         .collect()
 }
 
-fn stage_worker_access_report(cfg: &Config) {
+/// The backend the stage-worker rows judge containment against: the first
+/// ready backend of the local shell chain, else [`Backend::None`].
+fn stage_worker_backend(cfg: &Config) -> Backend {
     let report = thegn_core::sandbox_support::support_report(
         &shell_chain(cfg),
         &Placement::Local,
         cfg_oci_runtime(cfg),
     );
-    let backend = thegn_core::sandbox_support::first_ready(&report)
+    thegn_core::sandbox_support::first_ready(&report)
         .map(|row| row.backend)
-        .unwrap_or(Backend::None);
+        .unwrap_or(Backend::None)
+}
+
+fn stage_worker_access_report(cfg: &Config) {
+    let backend = stage_worker_backend(cfg);
     for (stage, agent) in unsafe_full_access_stages(cfg, backend) {
         outln!(
             "  UNSAFE        pipeline stage `{stage}` agent `{agent}` has a full-access command token while no containment is resolved (heuristic)"
@@ -389,13 +395,29 @@ fn provider_home_line(stage: &str, home: &std::path::Path) -> String {
     )
 }
 
-fn stage_worker_readiness_report(cfg: &Config) {
+/// The decision behind the stage-worker readiness row, shared by the text
+/// printer and the `--json` report so both state the same thing.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum StageWorkerStatus {
+    NoStages,
+    NotInWorktree,
+    Readiness {
+        readiness: thegn_core::sandbox_worker_ready::WorkerReadiness,
+        backend: Backend,
+    },
+    ProviderHome {
+        stage: String,
+        home: std::path::PathBuf,
+        backend: Backend,
+    },
+}
+
+fn stage_worker_status(cfg: &Config) -> StageWorkerStatus {
     if cfg.pipeline.stages.is_empty() {
-        return;
+        return StageWorkerStatus::NoStages;
     }
     let Some(worktree) = current_worktree_root() else {
-        outln!("  worker        (not inside a git worktree; nothing to probe)");
-        return;
+        return StageWorkerStatus::NotInWorktree;
     };
     let loc = thegn_core::remote::GitLoc::Local(worktree.clone());
     let name = worktree
@@ -424,8 +446,7 @@ fn stage_worker_readiness_report(cfg: &Config) {
         (None, true),
     );
     if !readiness.is_ready() {
-        outln!("{}", worker_readiness_line(readiness, backend));
-        return;
+        return StageWorkerStatus::Readiness { readiness, backend };
     }
     for (stage, home) in stage_provider_homes(cfg) {
         let carved = thegn_core::sandbox_worker_ready::with_provider_home_mount(mounts, &home);
@@ -439,11 +460,83 @@ fn stage_worker_readiness_report(cfg: &Config) {
             (Some(&home), home.is_dir()),
         );
         if !readiness.is_ready() {
-            outln!("{}", provider_home_line(&stage, &home));
-            return;
+            return StageWorkerStatus::ProviderHome {
+                stage,
+                home,
+                backend,
+            };
         }
     }
-    outln!("{}", worker_readiness_line(readiness, backend));
+    StageWorkerStatus::Readiness { readiness, backend }
+}
+
+fn stage_worker_readiness_report(cfg: &Config) {
+    match stage_worker_status(cfg) {
+        StageWorkerStatus::NoStages => {}
+        StageWorkerStatus::NotInWorktree => {
+            outln!("  worker        (not inside a git worktree; nothing to probe)");
+        }
+        StageWorkerStatus::Readiness { readiness, backend } => {
+            outln!("{}", worker_readiness_line(readiness, backend));
+        }
+        StageWorkerStatus::ProviderHome { stage, home, .. } => {
+            outln!("{}", provider_home_line(&stage, &home));
+        }
+    }
+}
+
+/// Pure JSON form of a [`StageWorkerStatus`]. `ready` is true only for a ready
+/// worker; `proven` is false whenever containment could not be judged at all
+/// (no stages, no worktree, unsupported platform or backend).
+fn stage_worker_json_from(
+    status: &StageWorkerStatus,
+    unsafe_stages: &[(String, String)],
+) -> serde_json::Value {
+    use thegn_core::sandbox_worker_ready::WorkerReadiness;
+    let (state, ready, proven, backend, provider_home) = match status {
+        StageWorkerStatus::NoStages => ("no-stages", false, false, None, None),
+        StageWorkerStatus::NotInWorktree => ("not-in-worktree", false, false, None, None),
+        StageWorkerStatus::Readiness { readiness, backend } => (
+            readiness.as_str(),
+            *readiness == WorkerReadiness::Ready,
+            !matches!(
+                readiness,
+                WorkerReadiness::UnsupportedPlatform | WorkerReadiness::UnsupportedBackend
+            ),
+            Some(backend.label()),
+            None,
+        ),
+        StageWorkerStatus::ProviderHome {
+            stage,
+            home,
+            backend,
+        } => (
+            WorkerReadiness::ProviderHomeUnavailable.as_str(),
+            false,
+            true,
+            Some(backend.label()),
+            Some(serde_json::json!({ "stage": stage, "path": home.display().to_string() })),
+        ),
+    };
+    serde_json::json!({
+        "state": state,
+        "ready": ready,
+        "proven": proven,
+        "backend": backend,
+        "provider_home": provider_home,
+        "unsafe_full_access": unsafe_stages
+            .iter()
+            .map(|(stage, agent)| serde_json::json!({ "stage": stage, "agent": agent }))
+            .collect::<Vec<_>>(),
+    })
+}
+
+fn stage_worker_json(cfg: &Config) -> serde_json::Value {
+    let backend = stage_worker_backend(cfg);
+    stage_worker_json_from(
+        &stage_worker_status(cfg),
+        &unsafe_full_access_stages(cfg, backend),
+    )
 }
 
 fn devcontainer_json(cfg: &Config) -> serde_json::Value {
@@ -3117,6 +3210,7 @@ pub fn run(
         report["batteries"] =
             super::batteries_doctor::json(&super::batteries_doctor::inspect_env());
         report["worktree_sandbox_pins"] = pins::json(&pins::collect(cfg).0);
+        report["stage_worker"] = stage_worker_json(cfg);
         outln!("{}", serde_json::to_string_pretty(&report)?);
         return Ok(());
     }
@@ -6663,6 +6757,107 @@ args = ["--verbose"]
         );
         // The human report also runs without panicking.
         core_deps_report();
+    }
+
+    const ALL_WORKER_READINESS: [thegn_core::sandbox_worker_ready::WorkerReadiness; 8] = {
+        use thegn_core::sandbox_worker_ready::WorkerReadiness::*;
+        [
+            Ready,
+            ContainmentAbsent,
+            UnsupportedPlatform,
+            UnsupportedBackend,
+            CannotWriteWorktree,
+            CannotWriteGitMetadata,
+            CallbackUnavailable,
+            ProviderHomeUnavailable,
+        ]
+    };
+
+    fn readiness_status(
+        readiness: thegn_core::sandbox_worker_ready::WorkerReadiness,
+    ) -> StageWorkerStatus {
+        StageWorkerStatus::Readiness {
+            readiness,
+            backend: Backend::None,
+        }
+    }
+
+    #[test]
+    fn stage_worker_json_ready_is_the_only_ready_state() {
+        use thegn_core::sandbox_worker_ready::WorkerReadiness;
+        for variant in ALL_WORKER_READINESS {
+            let v = stage_worker_json_from(&readiness_status(variant), &[]);
+            assert_eq!(v["ready"], variant == WorkerReadiness::Ready);
+            assert_eq!(v["state"], variant.as_str());
+        }
+    }
+
+    #[test]
+    fn stage_worker_json_unsupported_and_empty_states_are_not_proven() {
+        use thegn_core::sandbox_worker_ready::WorkerReadiness;
+        for status in [
+            StageWorkerStatus::NoStages,
+            StageWorkerStatus::NotInWorktree,
+            readiness_status(WorkerReadiness::UnsupportedPlatform),
+            readiness_status(WorkerReadiness::UnsupportedBackend),
+        ] {
+            let v = stage_worker_json_from(&status, &[]);
+            assert_eq!(v["proven"], false, "{status:?}");
+            assert_eq!(v["ready"], false, "{status:?}");
+        }
+        for readiness in [
+            WorkerReadiness::ContainmentAbsent,
+            WorkerReadiness::CannotWriteWorktree,
+        ] {
+            let v = stage_worker_json_from(&readiness_status(readiness), &[]);
+            assert_eq!(v["proven"], true);
+            assert_eq!(v["ready"], false);
+        }
+    }
+
+    #[test]
+    fn stage_worker_json_lists_unsafe_stages_and_provider_home() {
+        let status = StageWorkerStatus::ProviderHome {
+            stage: "s".into(),
+            home: std::path::PathBuf::from("/x/home"),
+            backend: Backend::None,
+        };
+        let v = stage_worker_json_from(&status, &[("s".into(), "a".into())]);
+        assert_eq!(
+            v["provider_home"],
+            serde_json::json!({ "stage": "s", "path": "/x/home" })
+        );
+        assert_eq!(
+            v["unsafe_full_access"],
+            serde_json::json!([{ "stage": "s", "agent": "a" }])
+        );
+        assert_eq!(v["state"], "provider-home-unavailable");
+        assert_eq!(v["ready"], false);
+    }
+
+    #[test]
+    fn stage_worker_json_has_the_documented_key_set() {
+        let v = stage_worker_json_from(&StageWorkerStatus::NoStages, &[]);
+        let mut keys: Vec<&str> = v.as_object().unwrap().keys().map(String::as_str).collect();
+        keys.sort_unstable();
+        assert_eq!(
+            keys,
+            [
+                "backend",
+                "proven",
+                "provider_home",
+                "ready",
+                "state",
+                "unsafe_full_access"
+            ]
+        );
+    }
+
+    #[test]
+    fn stage_worker_status_is_no_stages_for_the_default_config() {
+        let cfg = Config::default();
+        assert!(cfg.pipeline.stages.is_empty());
+        assert_eq!(stage_worker_status(&cfg), StageWorkerStatus::NoStages);
     }
 
     #[test]

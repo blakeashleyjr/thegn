@@ -285,7 +285,7 @@ pub fn report_commit_binding(
 pub fn verify_report(f: &VerifyFacts) -> VerifyReport {
     let Some(a) = &f.artifact else {
         let reasons = if f.stage.is_some() {
-            vec!["pipeline row has no artifact path; its handoff is not published (claim with `--artifact` or publish the session artifact)".into()]
+            vec!["pipeline row has no artifact path; its handoff is not published (publish the session artifact; its path is assigned)".into()]
         } else {
             Vec::new()
         };
@@ -396,6 +396,28 @@ pub fn verify_report(f: &VerifyFacts) -> VerifyReport {
         report_commit_binding: f.report_commit_binding,
         reasons,
         warnings,
+    }
+}
+
+/// A row typed `stage` or `legacy_held` must keep its pipeline identity: a stage
+/// row that lost its stage name or artifact path can never fall back to the
+/// plain-dispatch (ungated) class. `None` kind (pre-v110 or unclassified) and
+/// `plain` never refuse here; an unrecognised kind fails closed. Returns the refusal reason.
+pub fn typed_kind_refusal(
+    kind: Option<&str>,
+    stage: Option<&str>,
+    artifact: Option<&str>,
+) -> Option<String> {
+    let blank = |v: Option<&str>| v.is_none_or(|s| s.trim().is_empty());
+    match kind {
+        None | Some("plain") => None,
+        Some(k @ ("stage" | "legacy_held")) if blank(stage) || blank(artifact) => Some(format!(
+            "typed pipeline row ({k}) has no stage or artifact path; it cannot be completed as a plain dispatch (record it with `--force --why '<reason>'`)"
+        )),
+        Some("stage" | "legacy_held") => None,
+        Some(other) => Some(format!(
+            "unknown dispatch kind {other:?}; it cannot be completed as a plain dispatch (record it with `--force --why '<reason>'`)"
+        )),
     }
 }
 
@@ -840,6 +862,31 @@ mod tests {
         assert!(
             report.ok,
             "positive control: plain dispatch content is unchanged"
+        );
+    }
+
+    #[test]
+    fn typed_kind_refuses_a_stage_row_that_lost_its_identity() {
+        for kind in ["stage", "legacy_held"] {
+            assert!(typed_kind_refusal(Some(kind), None, Some("a.md")).is_some());
+            assert!(typed_kind_refusal(Some(kind), Some("code"), None).is_some());
+            assert!(typed_kind_refusal(Some(kind), Some("code"), Some("  ")).is_some());
+            assert!(typed_kind_refusal(Some(kind), Some(" "), Some("a.md")).is_some());
+        }
+        let reason = typed_kind_refusal(Some("stage"), None, None).unwrap();
+        assert!(reason.contains("typed pipeline row"));
+        // Fail closed: an unrecognised non-NULL kind is refused even when complete.
+        let unknown = typed_kind_refusal(Some("bogus"), Some("code"), Some("a.md")).unwrap();
+        assert!(unknown.contains("unknown dispatch kind"));
+    }
+
+    #[test]
+    fn typed_kind_tolerates_null_plain_and_complete_rows() {
+        assert_eq!(typed_kind_refusal(None, None, None), None);
+        assert_eq!(typed_kind_refusal(Some("plain"), None, None), None);
+        assert_eq!(
+            typed_kind_refusal(Some("stage"), Some("code"), Some("a.md")),
+            None
         );
     }
 

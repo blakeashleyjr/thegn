@@ -179,18 +179,16 @@ pub fn request_stop_after(
         .and_then(|s| s.parse::<u64>().ok())
         .filter(|&v| v > 0)?;
     STOP_REQUESTED.store(true, Ordering::Relaxed);
-    std::thread::Builder::new()
-        .name("thegn-bench-win".into())
-        .spawn(move || {
-            // Background: bench-only one-shot timer; the idle harness measures against
-            // its own sampler clock, so wake lateness only lands in the generous tail.
-            crate::platform::qos::set_self(crate::platform::qos::Qos::Background);
-            std::thread::sleep(Duration::from_millis(ms));
-            shutdown.store(true, Ordering::Relaxed);
-            let _ = waker.wake(); // best-effort: waker pulse: an input nudge must never fail the calling path
-            // best-effort: deadline timer: a failed spawn just means no auto-shutdown of the perf run
-        })
-        .ok();
+    thegn_core::thread_name::try_spawn_named("thegn-bench-win", move || {
+        // Background: bench-only one-shot timer; the idle harness measures against
+        // its own sampler clock, so wake lateness only lands in the generous tail.
+        crate::platform::qos::set_self(crate::platform::qos::Qos::Background);
+        std::thread::sleep(Duration::from_millis(ms));
+        shutdown.store(true, Ordering::Relaxed);
+        let _ = waker.wake(); // best-effort: waker pulse: an input nudge must never fail the calling path
+        // best-effort: deadline timer: a failed spawn just means no auto-shutdown of the perf run
+    })
+    .ok();
     Some(ms)
 }
 
