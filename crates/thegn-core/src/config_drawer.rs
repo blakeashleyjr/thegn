@@ -331,14 +331,16 @@ pub fn validate_drawer_cwd(scope: DrawerScope, cwd: &str) -> Result<(), String> 
 
 /// Return the memory/state key for a drawer scope. Worktree callers provide
 /// the already-resolved absolute directory; this function does not canonicalize
-/// or otherwise inspect it.
+/// or otherwise inspect it. The path is lexically normalised (`.`, duplicate
+/// and trailing separators removed); symlinks and `..` are not resolved.
 pub fn drawer_scope_key(scope: DrawerScope, worktree: &Path) -> String {
     match scope {
         DrawerScope::Worktree => {
             const PREFIX_LIMIT: usize = 40;
             const DIGEST_CHUNK_BYTES: usize = 8 * 1024;
 
-            let raw_path = worktree.as_os_str().as_encoded_bytes();
+            let normalized: PathBuf = worktree.components().collect();
+            let raw_path = normalized.as_os_str().as_encoded_bytes();
             let digest = match digest_parts(b"thegn/drawer-scope", &[BytePart::new(raw_path)]) {
                 Ok(digest) => digest,
                 Err(_) => {
@@ -361,7 +363,7 @@ pub fn drawer_scope_key(scope: DrawerScope, worktree: &Path) -> String {
                     .expect("the fixed drawer digest domain fits")
                 }
             };
-            let prefix = worktree
+            let prefix = normalized
                 .file_name()
                 .map(|name| crate::util::slugify(&name.to_string_lossy()))
                 .filter(|name| !name.is_empty())
@@ -450,6 +452,26 @@ mod tests {
         )
         .unwrap();
         assert_eq!(cwd, PathBuf::from("/home/user/.db"));
+    }
+
+    #[test]
+    fn worktree_scope_key_ignores_trailing_and_dot_separators() {
+        let key = |p: &str| drawer_scope_key(DrawerScope::Worktree, Path::new(p));
+        let base = key("/r/a");
+        for spelling in ["/r/a/", "/r/./a", "//r/a"] {
+            assert_eq!(base, key(spelling), "{spelling}");
+        }
+        assert_ne!(base, key("/r/a/b/.."), "normalisation is lexical only");
+        assert_ne!(base, key("/r/b"));
+        assert!(base.starts_with("a--"));
+        assert!(base.len() <= 40 + 2 + 64);
+    }
+
+    #[test]
+    fn worktree_scope_key_for_root_and_relative_stay_valid() {
+        let key = |p: &str| drawer_scope_key(DrawerScope::Worktree, Path::new(p));
+        assert!(key("/").starts_with("worktree--"));
+        assert_eq!(key("a/b"), key("./a/b"));
     }
 
     #[test]
