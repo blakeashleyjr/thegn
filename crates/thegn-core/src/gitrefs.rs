@@ -150,8 +150,17 @@ fn parse_track(track: &str) -> anyhow::Result<(usize, usize, bool)> {
 /// Parse `git for-each-ref refs/heads --sort=-committerdate --format=
 /// %(HEAD)%x1f%(refname:short)%x1f%(upstream:short)%x1f%(upstream:track)%x1f%(objectname)%x1f%(committerdate:unix)%x1f%(contents:subject)`
 /// output. `%(HEAD)` is "*" on the current branch (detached HEAD simply emits
-/// no starred row). An empty `%(upstream:short)` means no upstream.
+/// no starred row). An empty `%(upstream:short)` means no upstream. Non-empty
+/// output must end with `\n` (git terminates every record); otherwise it is
+/// rejected as truncated.
 pub fn parse_branches(out: &str) -> anyhow::Result<Vec<BranchInfo>> {
+    if out.is_empty() {
+        return Ok(Vec::new());
+    }
+    anyhow::ensure!(
+        out.ends_with('\n'),
+        "malformed branch record: missing final newline terminator"
+    );
     let mut names = std::collections::HashSet::new();
     out.split_terminator('\n')
         .enumerate()
@@ -285,8 +294,16 @@ pub struct TagInfo {
 /// Parse `git for-each-ref refs/tags
 /// --format=%(refname:short)%x1f%(objectname)%x1f%(objecttype)` output.
 /// Object type "tag" means annotated; "commit" (or anything else a tag can
-/// point at) means lightweight.
+/// point at) means lightweight. Non-empty output must end with `\n`;
+/// otherwise it is rejected as truncated.
 pub fn parse_tags(out: &str) -> anyhow::Result<Vec<TagInfo>> {
+    if out.is_empty() {
+        return Ok(Vec::new());
+    }
+    anyhow::ensure!(
+        out.ends_with('\n'),
+        "malformed tag record: missing final newline terminator"
+    );
     let mut names = std::collections::HashSet::new();
     out.split_terminator('\n')
         .enumerate()
@@ -354,7 +371,8 @@ pub struct BisectState {
 /// --format=%(refname:short)%x1f%(objectname)` output, the BISECT_TERMS file
 /// content (`None` → default terms "bad"/"good"), and the current HEAD sha.
 /// Malformed terms, object ids, or ref rows are errors; no partial state is
-/// returned.
+/// returned. Non-empty `refs_out` must end with `\n`; otherwise it is
+/// rejected as truncated.
 ///
 /// Under refs/bisect the ref names are `<bad-term>`, `<good-term>-<sha>` and
 /// `skip-<sha>` (skip is always "skip", even with custom terms). Depending on
@@ -378,6 +396,10 @@ pub fn parse_bisect(
         ("bad".to_owned(), "good".to_owned())
     };
     anyhow::ensure!(valid_oid(head), "malformed bisect HEAD");
+    anyhow::ensure!(
+        refs_out.is_empty() || refs_out.ends_with('\n'),
+        "malformed bisect ref record: missing final newline terminator"
+    );
 
     let mut state = BisectState {
         bad_term: bad_term.clone(),
@@ -608,7 +630,8 @@ mod tests {
             branch_row(" ", "both", "origin/both", "[ahead 1, behind 2]"),
             branch_row(" ", "old", "origin/old", "[gone]"),
         ]
-        .join("\n");
+        .join("\n")
+            + "\n";
         let v = parse_branches(&out).unwrap();
         assert_eq!(v.len(), 5);
         assert!(v[0].is_head);
@@ -632,7 +655,8 @@ mod tests {
             branch_row(" ", "feature/deep/dotted.name", "", ""),
             branch_row("*", "release-1.2.x", "origin/release-1.2.x", "[ahead 3]"),
         ]
-        .join("\n");
+        .join("\n")
+            + "\n";
         let v = parse_branches(&out).unwrap();
         assert_eq!(v[0].name, "feature/deep/dotted.name");
         assert_eq!(v[0].upstream, None);
@@ -646,13 +670,21 @@ mod tests {
     fn branches_empty_and_malformed() {
         assert_eq!(parse_branches("").unwrap(), Vec::<BranchInfo>::new());
         // Too few fields / bad date fail the entire parse.
-        let out = format!("*{US}only-two\n{}", branch_row(" ", "x", "", "")).replace("42", "NaN");
+        let out = format!("*{US}only-two\n{}\n", branch_row(" ", "x", "", "")).replace("42", "NaN");
         assert!(parse_branches(&out).is_err());
-        assert!(parse_branches(&branch_row(" ", "x", "", "").replace("42", "NaN")).is_err());
-        assert!(parse_branches(&branch_row(" ", "x", "", "[ahead many]")).is_err());
         assert!(
             parse_branches(&format!(
-                "{}\n{}",
+                "{}\n",
+                branch_row(" ", "x", "", "").replace("42", "NaN")
+            ))
+            .is_err()
+        );
+        assert!(
+            parse_branches(&format!("{}\n", branch_row(" ", "x", "", "[ahead many]"))).is_err()
+        );
+        assert!(
+            parse_branches(&format!(
+                "{}\n{}\n",
                 branch_row(" ", "same", "", ""),
                 branch_row(" ", "same", "", "")
             ))
@@ -749,11 +781,11 @@ mod tests {
             ("track empty field", parse_track("[]").map(|_| ())),
             (
                 "tag unknown object type",
-                parse_tags(&format!("v1{US}{sha}{US}unknown")).map(|_| ()),
+                parse_tags(&format!("v1{US}{sha}{US}unknown\n")).map(|_| ()),
             ),
             (
                 "tag empty name",
-                parse_tags(&format!("{US}{sha}{US}commit")).map(|_| ()),
+                parse_tags(&format!("{US}{sha}{US}commit\n")).map(|_| ()),
             ),
             (
                 "stash extra field",
@@ -770,7 +802,7 @@ mod tests {
     #[test]
     fn tags_annotated_vs_lightweight() {
         let out = format!(
-            "v1.0{US}{}{US}tag\nv1.1{US}{}{US}commit",
+            "v1.0{US}{}{US}tag\nv1.1{US}{}{US}commit\n",
             "a".repeat(40),
             "b".repeat(40)
         );
@@ -784,16 +816,16 @@ mod tests {
         assert!(!v[1].annotated);
         assert_eq!(v[1].name, "v1.1");
         assert_eq!(parse_tags("").unwrap(), Vec::<TagInfo>::new());
-        assert!(parse_tags(&format!("{out}\nbad-line")).is_err());
+        assert!(parse_tags(&format!("{out}bad-line\n")).is_err());
         assert!(
             parse_tags(&format!(
-                "v1{US}{}{US}commit\nv1{US}{}{US}commit",
+                "v1{US}{}{US}commit\nv1{US}{}{US}commit\n",
                 "a".repeat(40),
                 "b".repeat(40)
             ))
             .is_err()
         );
-        assert!(parse_tags(&format!("v1{US}a{US}commit\nv1{US}b{US}commit")).is_err());
+        assert!(parse_tags(&format!("v1{US}a{US}commit\nv1{US}b{US}commit\n")).is_err());
     }
 
     // --- parse_bisect / find_culprit ---
@@ -806,7 +838,7 @@ mod tests {
         let skipped = "3".repeat(40);
         let head = "f".repeat(40);
         let refs = format!(
-            "bad{US}{bad}\ngood-{good_one}{US}{good_one}\ngood-{good_two}{US}{good_two}\nskip-{skipped}{US}{skipped}",
+            "bad{US}{bad}\ngood-{good_one}{US}{good_one}\ngood-{good_two}{US}{good_two}\nskip-{skipped}{US}{skipped}\n",
         );
         let st = parse_bisect(&refs, None, &head).unwrap();
         assert_eq!(st.bad_term, "bad");
@@ -825,7 +857,8 @@ mod tests {
         let good = "1".repeat(40);
         let skipped = "2".repeat(40);
         let head = "f".repeat(40);
-        let refs = format!("broken{US}{bad}\nfixed-{good}{US}{good}\nskip-{skipped}{US}{skipped}");
+        let refs =
+            format!("broken{US}{bad}\nfixed-{good}{US}{good}\nskip-{skipped}{US}{skipped}\n");
         let st = parse_bisect(&refs, Some("broken\nfixed\n"), &head).unwrap();
         assert_eq!(
             (st.bad_term.as_str(), st.good_term.as_str()),
@@ -845,7 +878,7 @@ mod tests {
         assert_eq!(st.bad, None);
         assert!(st.good.is_empty() && st.skipped.is_empty());
         // refname:short may keep a bisect/ or refs/bisect/ prefix.
-        let refs = format!("bisect/bad{US}{bad}\nrefs/bisect/good-{good}{US}{good}");
+        let refs = format!("bisect/bad{US}{bad}\nrefs/bisect/good-{good}{US}{good}\n");
         let st = parse_bisect(&refs, None, &head).unwrap();
         assert_eq!(st.bad.as_deref(), Some(bad.as_str()));
         assert_eq!(st.good, vec![good]);
@@ -868,7 +901,10 @@ mod tests {
             ),
         ];
         for (case, refs) in cases {
-            assert!(parse_bisect(&refs, None, &head).is_err(), "{case}");
+            assert!(
+                parse_bisect(&format!("{refs}\n"), None, &head).is_err(),
+                "{case}"
+            );
         }
     }
 
@@ -889,6 +925,42 @@ mod tests {
         let st = parse_bisect("", Some("broken\nfixed\n"), &head).unwrap();
         assert_eq!(st.bad_term, "broken");
         assert_eq!(st.good_term, "fixed");
+    }
+
+    #[test]
+    fn ref_rows_without_the_final_newline_are_rejected() {
+        let head = "f".repeat(40);
+        let branch = branch_row(" ", "main", "", "");
+        let tag = format!("v1{US}{}{US}commit", "a".repeat(40));
+        let bisect = format!("bad{US}{}", "b".repeat(40));
+
+        let err = parse_branches(&branch).unwrap_err().to_string();
+        assert!(err.contains("final newline"), "{err}");
+        assert_eq!(parse_branches(&format!("{branch}\n")).unwrap().len(), 1);
+
+        let err = parse_tags(&tag).unwrap_err().to_string();
+        assert!(err.contains("final newline"), "{err}");
+        assert_eq!(parse_tags(&format!("{tag}\n")).unwrap().len(), 1);
+
+        let err = parse_bisect(&bisect, None, &head).unwrap_err().to_string();
+        assert!(err.contains("final newline"), "{err}");
+        assert!(parse_bisect(&format!("{bisect}\n"), None, &head).is_ok());
+    }
+
+    #[test]
+    fn ref_parsers_accept_empty_output_and_truncated_last_field_is_not_silently_kept() {
+        let head = "f".repeat(40);
+        assert!(parse_branches("").unwrap().is_empty());
+        assert!(parse_tags("").unwrap().is_empty());
+        assert_eq!(parse_bisect("", None, &head).unwrap().bad, None);
+
+        // Output cut off inside the free-text subject of the last record.
+        let sha = "d".repeat(40);
+        let truncated = format!(
+            "{}\n*{US}b{US}{US}{US}{sha}{US}1{US}trunc",
+            branch_row(" ", "a", "", "")
+        );
+        assert!(parse_branches(&truncated).is_err());
     }
 
     #[test]
