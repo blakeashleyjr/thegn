@@ -32,7 +32,15 @@ pub(crate) struct BatchOptions {
     pub(crate) json: bool,
 }
 
+struct ValidationOptions<'a> {
+    base: Option<&'a str>,
+    env: Option<&'a str>,
+    profile: Option<&'a str>,
+    folder: Option<&'a str>,
+}
+
 /// Run one batch, validating all lanes before the first checkout.
+#[expect(clippy::disallowed_macros, reason = "per-lane batch errors on stderr")]
 pub(crate) fn run(
     cfg: &Config,
     file: &str,
@@ -53,17 +61,14 @@ pub(crate) fn run(
     let lanes = thegn_core::wt_batch::parse_batch(&text)
         .with_context(|| format!("parsing batch file {}", path.display()))?;
     let root = resolve_root(repo.as_deref())?;
-    validate_names(
-        &root,
-        cfg,
-        &lanes,
-        exact_branch,
-        base.as_deref(),
-        env.as_deref(),
-        profile.as_deref(),
-        folder.as_deref(),
-    )
-    .with_context(|| format!("validating batch file {}", path.display()))?;
+    let validation_options = ValidationOptions {
+        base: base.as_deref(),
+        env: env.as_deref(),
+        profile: profile.as_deref(),
+        folder: folder.as_deref(),
+    };
+    validate_names(&root, cfg, &lanes, exact_branch, &validation_options)
+        .with_context(|| format!("validating batch file {}", path.display()))?;
 
     let mut output = BatchOutput {
         created: Vec::with_capacity(lanes.len()),
@@ -155,20 +160,17 @@ fn validate_names(
     cfg: &Config,
     lanes: &[thegn_core::wt_batch::BatchLane],
     exact_branch: bool,
-    base: Option<&str>,
-    env: Option<&str>,
-    profile: Option<&str>,
-    folder: Option<&str>,
+    options: &ValidationOptions<'_>,
 ) -> Result<()> {
     let first_lane = &lanes[0];
-    if let Some(profile) = profile {
+    if let Some(profile) = options.profile {
         thegn_core::sandbox_pin::parse_pin(profile)
             .map_err(|error| lane_error(first_lane, error))?;
     }
-    if let Some(folder) = folder {
+    if let Some(folder) = options.folder {
         wt::validate_folder_name(folder).map_err(|error| lane_error(first_lane, error))?;
     }
-    if let Some(env) = env
+    if let Some(env) = options.env
         && env != "default"
         && !cfg.env.contains_key(env)
     {
@@ -184,7 +186,7 @@ fn validate_names(
         ));
     }
 
-    let default_base = match base.filter(|base| !base.trim().is_empty()) {
+    let default_base = match options.base.filter(|base| !base.trim().is_empty()) {
         Some(base) => base.to_string(),
         None => thegn_core::worktree::resolve_base_checked(root, cfg)
             .map_err(|error| lane_error(first_lane, error))?,
@@ -192,15 +194,14 @@ fn validate_names(
     let mut checked_bases = std::collections::HashSet::new();
     for lane in lanes {
         let effective_base = lane.base.as_deref().unwrap_or(&default_base);
-        if checked_bases.insert(effective_base) {
-            if !wt::base_has_commits(root, effective_base)
+        if checked_bases.insert(effective_base)
+            && !wt::base_has_commits(root, effective_base)
                 .map_err(|error| lane_error(lane, error))?
-            {
-                return Err(lane_error(
-                    lane,
-                    format!("'{effective_base}' has no commits yet — make an initial commit first"),
-                ));
-            }
+        {
+            return Err(lane_error(
+                lane,
+                format!("'{effective_base}' has no commits yet — make an initial commit first"),
+            ));
         }
     }
 
@@ -292,10 +293,12 @@ mod tests {
                 &Config::default(),
                 &lanes,
                 true,
-                None,
-                None,
-                None,
-                None
+                &ValidationOptions {
+                    base: None,
+                    env: None,
+                    profile: None,
+                    folder: None,
+                },
             )
             .is_err()
         );
@@ -468,10 +471,12 @@ mod tests {
             &Config::default(),
             &lanes,
             true,
-            None,
-            None,
-            None,
-            None,
+            &ValidationOptions {
+                base: None,
+                env: None,
+                profile: None,
+                folder: None,
+            },
         )
         .unwrap_err()
         .to_string();
@@ -529,10 +534,12 @@ mod tests {
                 &Config::default(),
                 &lanes,
                 true,
-                None,
-                env,
-                profile,
-                folder,
+                &ValidationOptions {
+                    base: None,
+                    env,
+                    profile,
+                    folder,
+                },
             )
             .unwrap_err()
             .to_string();
