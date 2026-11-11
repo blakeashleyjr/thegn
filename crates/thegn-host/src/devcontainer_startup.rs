@@ -365,15 +365,13 @@ fn spawn_owner(
     if operation.hooks.owner_failure.load(Ordering::Acquire) {
         return Err(std::io::Error::other("owned fixture owner launch failure"));
     }
-    std::thread::Builder::new()
-        .name("thegn-dc-start".into())
-        .spawn(move || {
-            if gate.recv().is_err() {
-                operation.not_started(StartReason::Abandoned);
-                return;
-            }
-            own_startup(operation, accepted);
-        })
+    thegn_core::thread_name::try_spawn_named("thegn-dc-start", move || {
+        if gate.recv().is_err() {
+            operation.not_started(StartReason::Abandoned);
+            return;
+        }
+        own_startup(operation, accepted);
+    })
 }
 
 struct OwnerInstall<'a> {
@@ -623,9 +621,9 @@ fn spawn_reader(
     if operation.hooks.reader_failure.load(Ordering::Acquire) {
         return Err(std::io::Error::other("owned fixture reader launch failure"));
     }
-    std::thread::Builder::new()
-        .name("thegn-dc-stderr".into())
-        .spawn(move || read_stderr(operation, pipe, bytes, session))
+    thegn_core::thread_name::try_spawn_named("thegn-dc-stderr", move || {
+        read_stderr(operation, pipe, bytes, session)
+    })
 }
 
 fn wait_child(

@@ -86,28 +86,26 @@ impl Upstream {
 
         // Reader thread: one parsed JSON message per line onto the channel.
         let (tx, rx) = channel::<Value>();
-        std::thread::Builder::new()
-            .name("thegn-mcp-up".into())
-            .spawn(move || {
-                // Utility: this pump's lag lands on deadline-enforced MCP tool calls (a
-                // miss is a breaker-feeding transport failure), not on background scrapes.
-                crate::platform::qos::set_self(crate::platform::qos::Qos::Utility);
-                let reader = BufReader::new(stdout);
-                for line in reader.lines() {
-                    let Ok(line) = line else { break };
-                    let t = line.trim();
-                    if t.is_empty() {
-                        continue;
-                    }
-                    if let Ok(v) = serde_json::from_str::<Value>(t) {
-                        // best-effort: the receiver is gone once the upstream is dropped.
-                        if tx.send(v).is_err() {
-                            break;
-                        }
+        thegn_core::thread_name::try_spawn_named("thegn-mcp-up", move || {
+            // Utility: this pump's lag lands on deadline-enforced MCP tool calls (a
+            // miss is a breaker-feeding transport failure), not on background scrapes.
+            crate::platform::qos::set_self(crate::platform::qos::Qos::Utility);
+            let reader = BufReader::new(stdout);
+            for line in reader.lines() {
+                let Ok(line) = line else { break };
+                let t = line.trim();
+                if t.is_empty() {
+                    continue;
+                }
+                if let Ok(v) = serde_json::from_str::<Value>(t) {
+                    // best-effort: the receiver is gone once the upstream is dropped.
+                    if tx.send(v).is_err() {
+                        break;
                     }
                 }
-            })
-            .map_err(|e| e.to_string())?;
+            }
+        })
+        .map_err(|e| e.to_string())?;
 
         let mut up = Upstream {
             name: name.to_string(),

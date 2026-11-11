@@ -449,9 +449,7 @@ fn run_capped_argv(
         let state = state.clone();
         let label = run.label.clone();
         let generation = run.generation;
-        match std::thread::Builder::new()
-            .name("thegn-job-live".into())
-            .spawn(move || {
+        match thegn_core::thread_name::try_spawn_named("thegn-job-live", move || {
                 crate::platform::qos::set_self(crate::platform::qos::Qos::Background);
                 let mut last_emit = Instant::now();
                 while signal_rx.recv().is_ok() {

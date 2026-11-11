@@ -29,6 +29,15 @@ means this build is too old), or `unavailable` with an error. Host sections
 below may be incomplete when the database cannot be read. `doctor --json`
 reports this as `worktree_identity.state_db` (`ok` when read).
 
+`thegn doctor` also lists a "Worktree sandbox pins" section: one line per
+pinned worktree as `<path>: <pinned profile> (default <profile>; same|differs)`,
+or "none (worktrees inherit the configured profile)" when nothing is pinned. If
+the database cannot be read the section says `not read` and why. `doctor --json`
+carries the rows as `worktree_sandbox_pins`, an array of `{worktree, pinned,
+default, differs, invalid}`; `invalid` marks a stored pin that no longer parses,
+and the array is empty when the database cannot be read. See
+[[sandbox-profiles]].
+
 The **Monitor collectors** block lists each system monitor collector and its
 discovered health. Collectors that are checked only while their panel is
 visible are marked `visible-only (not probed)`. A `denied` row includes a hint:

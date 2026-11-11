@@ -26,6 +26,11 @@ worktree; use `--worktree <path>` for another one. The command palette action
 **Isolation profile for this worktree…** (`sandbox-profile`) opens the same
 choice menu.
 
+A `sealed` worktree on a host-backed container does not receive host `$HOME`
+personal layers. The `[sandbox.home]` atuin key and session and the dotfiles are
+not copied into the container, and thegn logs one warning per provisioning run
+when it drops them.
+
 Profile precedence is worktree pin, `[env.<name>]` sandbox profile, repository
 and workspace configuration, global `[sandbox] profile`, then the built-in
 standard default. A repository `.thegn.toml` can only tighten its profile; a
