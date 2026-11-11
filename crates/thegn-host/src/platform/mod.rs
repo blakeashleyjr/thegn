@@ -594,16 +594,14 @@ pub(crate) fn test_spawn_silent_socket(path: &std::path::Path) -> std::io::Resul
     #[cfg(unix)]
     {
         let listener = std::os::unix::net::UnixListener::bind(path)?;
-        let handle = std::thread::Builder::new()
-            .name("thegn-test-sock".to_owned())
-            .spawn(move || {
-                crate::platform::qos::set_self(crate::platform::qos::Qos::Background);
-                for stream in listener.incoming() {
-                    // Hold each connection open without replying to the probe.
-                    let _held = stream;
-                    std::thread::sleep(std::time::Duration::from_secs(30));
-                }
-            })?;
+        let handle = thegn_core::thread_name::try_spawn_named("thegn-test-sock", move || {
+            crate::platform::qos::set_self(crate::platform::qos::Qos::Background);
+            for stream in listener.incoming() {
+                // Hold each connection open without replying to the probe.
+                let _held = stream;
+                std::thread::sleep(std::time::Duration::from_secs(30));
+            }
+        })?;
         drop(handle);
         Ok(())
     }

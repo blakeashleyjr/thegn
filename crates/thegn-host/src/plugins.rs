@@ -580,24 +580,22 @@ pub(crate) fn spawn_plugins_host(
         respawns,
         retry_runtime: tokio::runtime::Handle::current(),
     };
-    let spawn = std::thread::Builder::new()
-        .name("thegn-plugins".into())
-        .spawn(move || {
-            // Utility: resident plugin contributions render as visible UI content.
-            crate::platform::qos::set_self(crate::platform::qos::Qos::Utility);
-            setup_and_schedule(
-                supervisor,
-                specs,
-                config_dir,
-                sessions,
-                disabled,
-                stop,
-                tx,
-                waker,
-                one_shot_gate.clone(),
-                state_anchor,
-            )
-        });
+    let spawn = thegn_core::thread_name::try_spawn_named("thegn-plugins", move || {
+        // Utility: resident plugin contributions render as visible UI content.
+        crate::platform::qos::set_self(crate::platform::qos::Qos::Utility);
+        setup_and_schedule(
+            supervisor,
+            specs,
+            config_dir,
+            sessions,
+            disabled,
+            stop,
+            tx,
+            waker,
+            one_shot_gate.clone(),
+            state_anchor,
+        )
+    });
     if let Err(e) = spawn {
         tracing::warn!(target: "thegn::plugin", error = %e, "plugin host thread failed to start");
         report_host_start_failure(&host.tx, &host.waker, &e);
