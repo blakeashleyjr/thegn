@@ -261,18 +261,19 @@ default `read`) gates a set of **state tools** that talk to a running pane
 daemon — default-deny: a tool neither appears in `tools/list` nor is callable
 until its scope is granted.
 
-| Tool                    | Scope         | What it does                                                           |
-| ----------------------- | ------------- | ---------------------------------------------------------------------- |
-| `sessions_list`         | `read`        | list the daemon's live sessions                                        |
-| `worktrees_list`        | `read`        | list registered worktrees (daemon, else DB cache)                      |
-| `leases_list`           | `read`        | relay lease state per session                                          |
-| `me`                    | `read`        | the caller's pairing id, label, granted scopes                         |
-| `sessions_wait`         | `read`        | block until a session reaches a state (exited/idle/blocked/done/regex) |
-| `semantic_map`          | `read`        | ranked, budgeted repo map of a worktree's indexed entities             |
-| `semantic_blast_radius` | `read`        | a worktree's blast-radius: changed entities, callers, untested, risk   |
-| `sessions_open`         | `write`       | open a session — raw `argv`, or a configured agent by name             |
-| `sessions_kill`         | `write`       | kill a session's process (idempotent)                                  |
-| `sessions_input`        | `write` **+** | send raw terminal input/control characters to a live session           |
+| Tool                        | Scope         | What it does                                                           |
+| --------------------------- | ------------- | ---------------------------------------------------------------------- |
+| `sessions_list`             | `read`        | list the daemon's live sessions                                        |
+| `worktrees_list`            | `read`        | list registered worktrees (daemon, else DB cache)                      |
+| `worktrees_sandbox_profile` | `read`        | a worktree's pinned sandbox profile (null = inherit configured policy) |
+| `leases_list`               | `read`        | relay lease state per session                                          |
+| `me`                        | `read`        | the caller's pairing id, label, granted scopes                         |
+| `sessions_wait`             | `read`        | block until a session reaches a state (exited/idle/blocked/done/regex) |
+| `semantic_map`              | `read`        | ranked, budgeted repo map of a worktree's indexed entities             |
+| `semantic_blast_radius`     | `read`        | a worktree's blast-radius: changed entities, callers, untested, risk   |
+| `sessions_open`             | `write`       | open a session — raw `argv`, or a configured agent by name             |
+| `sessions_kill`             | `write`       | kill a session's process (idempotent)                                  |
+| `sessions_input`            | `write` **+** | send raw terminal input/control characters to a live session           |
 
 The two `semantic_*` read tools (default `--scopes read`) answer from the
 state DB + git listing directly — **no running daemon required** — and take a

@@ -1221,6 +1221,46 @@ pub(super) async fn assign_worktree_folder(
     }
 }
 
+/// `worktrees.sandbox_profile` (read scope): a worktree's pinned sandbox
+/// profile, null when nothing is pinned.
+pub(super) async fn worktree_sandbox_profile(
+    State(state): State<ControlState>,
+    headers: HeaderMap,
+    Query(q): Query<super::SandboxProfileQuery>,
+) -> Response {
+    if let Err(r) = authed(&state, &headers, Verb::WorktreeSandboxProfile) {
+        return r;
+    }
+    match state.api.worktree_sandbox_profile(q).await {
+        Ok(reply) => axum::Json(reply).into_response(),
+        Err(e) => e.into_response(),
+    }
+}
+
+/// `worktrees.sandbox_profile_set` (admin scope): pin or clear a worktree's
+/// sandbox profile.
+pub(super) async fn set_worktree_sandbox_profile(
+    State(state): State<ControlState>,
+    headers: HeaderMap,
+    body: axum::Json<super::SandboxProfileSetReq>,
+) -> Response {
+    if let Err(r) = authed_target(
+        &state,
+        &headers,
+        Verb::WorktreeSandboxProfileSet,
+        &body.0.worktree,
+    ) {
+        return r;
+    }
+    if let Err(e) = body.0.action() {
+        return e.into_response();
+    }
+    match state.api.set_worktree_sandbox_profile(body.0).await {
+        Ok(reply) => axum::Json(reply).into_response(),
+        Err(e) => e.into_response(),
+    }
+}
+
 // ── agent orchestration: issues (THE-57) ─────────────────────────────────────
 
 /// Query params for `issues.list` — a subset of `IssueFilter` a supervisor
