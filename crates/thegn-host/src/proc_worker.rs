@@ -318,11 +318,7 @@ impl ProcessWorker {
             Arc::new(LiveClock),
             metrics::factory(pane_pids, daemon_pid, rows),
             Box::new(move || waker.wake().map_err(|_| ())),
-            |task| {
-                std::thread::Builder::new()
-                    .name("thegn-procs".into())
-                    .spawn(task)
-            },
+            |task| thegn_core::thread_name::try_spawn_named("thegn-procs", task),
         )
     }
     #[cfg(test)]
@@ -345,11 +341,7 @@ impl ProcessWorker {
                 crate::proc_workload::event(crate::proc_workload::Event::Wake);
                 Ok(())
             }),
-            |task| {
-                std::thread::Builder::new()
-                    .name("thegn-procaudit".into())
-                    .spawn(task)
-            },
+            |task| thegn_core::thread_name::try_spawn_named("thegn-procaudit", task),
         )
     }
 
@@ -357,7 +349,7 @@ impl ProcessWorker {
     fn spawn_fixture_task(
         task: Box<dyn FnOnce() + Send>,
     ) -> std::io::Result<std::thread::JoinHandle<()>> {
-        std::thread::Builder::new().spawn(task)
+        thegn_core::thread_name::try_spawn_named("thegn-procfix", task)
     }
 
     fn spawn_with(
