@@ -1541,7 +1541,7 @@
           "type": "string"
         },
         {
-          "description": "Send terminal input, open worktrees, drive the preview browser.",
+          "description": "Send terminal input, resize/split/record/kill sessions, open worktrees, and mutate issues, dispatches and notifications. (There is no browser surface in v1.)",
           "enum": [
             "write"
           ],
