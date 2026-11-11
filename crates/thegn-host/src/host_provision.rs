@@ -213,7 +213,8 @@ pub(crate) fn provision_worktree_on_host(
     let (dotfiles, _roots) =
         crate::agent_home::resolve_personal_dotfiles(&host_home, home_cfg, env_name);
     // Warned below, only once provisioning actually runs (not on every open).
-    let dropped_dotfiles = if sealed { dotfiles.len() } else { 0 };
+    let host_dotfiles = if sealed { dotfiles.clone() } else { Vec::new() };
+    let dropped_dotfiles = host_dotfiles.len();
     let (dotfiles, atuin) = personal_host_layer(sealed, dotfiles, home_cfg.atuin);
     let opts = envplan::PlanOpts {
         workdir: worktree.to_string(),
@@ -262,6 +263,8 @@ pub(crate) fn provision_worktree_on_host(
         .extend(crate::handlers::repo_trust::devcontainer_lifecycle_steps(
             &repo_root, worktree, worktree,
         ));
+
+    with_sealed_scrub(&mut plan, sealed, &host_dotfiles);
 
     let marker_generation = provision_generation(&plan, toolchain_digest.as_deref());
     let marker_value = thegn_core::util::sh_quote(&marker_generation);
@@ -444,6 +447,50 @@ fn personal_host_layer(sealed: bool, dotfiles: Vec<String>, atuin: bool) -> (Vec
         (Vec::new(), false)
     } else {
         (dotfiles, atuin)
+    }
+}
+
+const SEALED_SCRUB_STEP: &str = "sealed_scrub";
+
+/// Shell script removing host-`$HOME`-derived credential files that an older
+/// provision may have carried into a sealed container. `rm -f` only: a
+/// dotfile name that is a directory is left alone. Invalid names are skipped.
+fn sealed_scrub_script(dotfiles: &[String]) -> String {
+    let mut rels: Vec<String> = vec![
+        ".config/atuin/config.toml".into(),
+        ".local/share/atuin/key".into(),
+        ".local/share/atuin/session".into(),
+    ];
+    rels.extend(
+        dotfiles
+            .iter()
+            .filter(|name| safe_relative_path(name).is_ok())
+            .cloned(),
+    );
+    let mut lines: Vec<String> = rels
+        .iter()
+        .map(|rel| format!("rm -f -- \"$HOME\"/{}", thegn_core::util::sh_quote(rel)))
+        .collect();
+    lines.push("true".into());
+    lines.join("\n")
+}
+
+/// For a sealed profile, prepend a step that removes stale host credentials
+/// (atuin key/session/config, carried dotfiles) from containers provisioned
+/// before they were refused. Removal is by NAME, so a container dotfile the
+/// user later created under the same name is also removed on the single
+/// re-run; accepted, since a sealed profile promises no host-`$HOME`-derived
+/// files. The plan change alters the provision generation, forcing one re-run.
+fn with_sealed_scrub(plan: &mut EnvPlan, sealed: bool, dotfiles: &[String]) {
+    if sealed {
+        plan.steps.insert(
+            0,
+            envplan::ProvisionStep {
+                id: SEALED_SCRUB_STEP.into(),
+                label: "Remove stale host credentials".into(),
+                kind: StepKind::Exec(sealed_scrub_script(dotfiles)),
+            },
+        );
     }
 }
 
@@ -854,6 +901,89 @@ mod tests {
         let plan = personal_plan(d, a);
         assert!(plan.steps.iter().any(|s| s.id == "atuin_sync"));
         assert!(plan.steps.iter().any(|s| s.id == "dotfiles"));
+    }
+
+    #[test]
+    fn sealed_scrub_script_removes_atuin_credentials_and_listed_dotfiles() {
+        let script = sealed_scrub_script(&[
+            ".zshrc".into(),
+            ".config/git/config".into(),
+            "../evil".into(),
+            "/etc/passwd".into(),
+        ]);
+        for want in [
+            "rm -f -- \"$HOME\"/'.local/share/atuin/key'",
+            "rm -f -- \"$HOME\"/'.local/share/atuin/session'",
+            "rm -f -- \"$HOME\"/'.config/atuin/config.toml'",
+            "\"$HOME\"/'.zshrc'",
+            "\"$HOME\"/'.config/git/config'",
+        ] {
+            assert!(script.contains(want), "missing {want}: {script}");
+        }
+        assert!(!script.contains("evil") && !script.contains("/etc/passwd"));
+        assert!(!script.contains(" -r") && !script.contains("-rf"));
+        assert!(script.ends_with("true"));
+    }
+
+    #[test]
+    fn sealed_scrub_step_is_first_only_when_sealed() {
+        let base = personal_plan(vec![], false);
+        let mut p = base.clone();
+        with_sealed_scrub(&mut p, true, &[".zshrc".into()]);
+        assert_eq!(p.steps[0].id, "sealed_scrub");
+        assert!(matches!(p.steps[0].kind, StepKind::Exec(ref s) if s.contains(".zshrc")));
+        assert_eq!(p.steps.len(), base.steps.len() + 1);
+        let mut q = base.clone();
+        with_sealed_scrub(&mut q, false, &[".zshrc".into()]);
+        let ids = |plan: &EnvPlan| plan.steps.iter().map(|s| s.id.clone()).collect::<Vec<_>>();
+        assert_eq!(ids(&q), ids(&base));
+    }
+
+    #[test]
+    fn sealed_scrub_changes_the_provision_generation() {
+        let without = personal_plan(vec![], false);
+        let mut with = without.clone();
+        with_sealed_scrub(&mut with, true, &[]);
+        assert_ne!(
+            provision_generation(&with, None),
+            provision_generation(&without, None)
+        );
+    }
+
+    #[test]
+    fn sealed_scrub_script_actually_deletes_files() {
+        let dir = tempfile::tempdir().unwrap();
+        for rel in [
+            ".local/share/atuin/key",
+            ".local/share/atuin/session",
+            ".config/atuin/config.toml",
+            ".zshrc",
+            "keep.txt",
+        ] {
+            let path = dir.path().join(rel);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(&path, "x").unwrap();
+        }
+        let script = sealed_scrub_script(&[".zshrc".into()]);
+        for _ in 0..2 {
+            let status = std::process::Command::new("sh")
+                .arg("-c")
+                .arg(&script)
+                .env("HOME", dir.path())
+                .env("PATH", std::env::var_os("PATH").unwrap_or_default())
+                .status()
+                .unwrap();
+            assert!(status.success());
+        }
+        for rel in [
+            ".local/share/atuin/key",
+            ".local/share/atuin/session",
+            ".config/atuin/config.toml",
+            ".zshrc",
+        ] {
+            assert!(!dir.path().join(rel).exists(), "{rel} remains");
+        }
+        assert!(dir.path().join("keep.txt").exists());
     }
 
     #[test]
