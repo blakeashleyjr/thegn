@@ -143,6 +143,9 @@ pub enum Action {
     Disk(DiskArgs),
     /// Reclaim a worktree's `target/` build artifacts (keeps the checkout).
     Clean(CleanArgs),
+    /// Remove merged, clean, idle lane worktrees and their branches. Dry run
+    /// unless `--apply`; requires `--merged`.
+    Prune(super::wt_prune::PruneArgs),
     /// Re-register a worktree you closed: clears its close record and adds it back to the sidebar without starting a pane.
     Reopen {
         /// Worktree path (a linked worktree of a registered repo).
@@ -205,6 +208,7 @@ pub fn run_with_config(cfg: &Config, action: Action, config_path: &std::path::Pa
         }
         Action::Disk(a) => super::disk::disk(cfg, a.worktree, a.all, a.json),
         Action::Clean(a) => super::disk::clean(cfg, a.worktree, a.all, a.force),
+        Action::Prune(a) => super::wt_prune::run(cfg, a),
         Action::Reopen { path } => reopen(&path),
     }
 }
@@ -1319,7 +1323,7 @@ fn unregistered_live_branch(worktree: &std::path::Path, delete_branch: bool) -> 
 
 /// `wt rm` — the TUI's `delete_groups` pipeline, synchronous: resolve →
 /// confirm → provider/sandbox teardown → `git worktree remove` → DB cleanup.
-fn rm(cfg: &Config, target: &str, delete_branch: bool, force: bool) -> Result<()> {
+pub(super) fn rm(cfg: &Config, target: &str, delete_branch: bool, force: bool) -> Result<()> {
     let db = Db::open()?;
     let rows = db.worktrees()?;
 

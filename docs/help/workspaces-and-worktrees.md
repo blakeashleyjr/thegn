@@ -185,5 +185,20 @@ default branch as its base.
 The new-worktree wizard follows the same fail-closed rule in its resolve-base
 step: if Git cannot list branches or resolve the base, the step fails with
 Git's reason before anything is created.
+
+### Pruning merged worktrees
+
+`thegn wt prune --merged` removes lane worktrees whose branch is already merged
+into the target, together with those branches. It is a dry run by default: it
+lists what would be removed and why every other worktree is kept; add `--apply`
+to remove. `--target <branch>` overrides the target (default: the repo's merge
+target). `--json` emits one JSON object. A bare `wt prune` is refused.
+
+A worktree is kept when it is the primary checkout, holds the target branch,
+has a detached HEAD, is not merged (or Git cannot say), has uncommitted or
+untracked files, has a process running inside it (Linux only), or is held by a
+live session. A removal that fails is reported and the rest continue; the exit
+status is non-zero if any failed.
+
 Worktree tabs are named `<repo>/<exact branch>`. See the [[config-reference]]
 for every knob.
