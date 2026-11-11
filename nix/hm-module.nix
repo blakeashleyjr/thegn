@@ -348,6 +348,15 @@ self: {
     };
     pr.ttl_secs = cfg.prTtlSecs;
     watch.pr_interval_secs = cfg.watchPrIntervalSecs;
+    limits.test_cpu_quota = cfg.limitsTestCpuQuota;
+    limits.test_mem_max = cfg.limitsTestMemMax;
+    limits.test_max_parallel = cfg.limitsTestMaxParallel;
+    limits.test_timeout_secs = cfg.limitsTestTimeoutSecs;
+    limits.discover_timeout_secs = cfg.limitsDiscoverTimeoutSecs;
+    limits.isolated_target_dir = cfg.limitsIsolatedTargetDir;
+    diagnostics.crash_reports = cfg.diagnosticsCrashReports;
+    diagnostics.crash_retention = cfg.diagnosticsCrashRetention;
+    diagnostics.ring_size = cfg.diagnosticsRingSize;
     log = {
       inherit (cfg.log) level file dir format;
       rotation_size_mb = cfg.log.rotationSizeMb;
@@ -1183,6 +1192,60 @@ in {
       type = lib.types.nullOr (lib.types.bool);
       default = null;
       description = "Sample per-process I/O in the monitor. Unset (null) = the binary's default.";
+    };
+
+    limitsTestCpuQuota = lib.mkOption {
+      type = lib.types.nullOr (lib.types.str);
+      default = null;
+      description = "CPU quota (systemd CPUQuota, such as 150%) for test runs. Unset (null) = the binary's default.";
+    };
+
+    limitsTestMemMax = lib.mkOption {
+      type = lib.types.nullOr (lib.types.str);
+      default = null;
+      description = "Memory ceiling (systemd MemoryMax, such as 4G) for test runs. Unset (null) = the binary's default.";
+    };
+
+    limitsTestMaxParallel = lib.mkOption {
+      type = lib.types.nullOr (lib.types.ints.unsigned);
+      default = null;
+      description = "Maximum parallel test jobs. Unset (null) = the binary's default.";
+    };
+
+    limitsTestTimeoutSecs = lib.mkOption {
+      type = lib.types.nullOr (lib.types.ints.between 0 315360000);
+      default = null;
+      description = "Test run timeout in seconds. Unset (null) = the binary's default.";
+    };
+
+    limitsDiscoverTimeoutSecs = lib.mkOption {
+      type = lib.types.nullOr (lib.types.ints.between 0 315360000);
+      default = null;
+      description = "Test discovery timeout in seconds. Unset (null) = the binary's default.";
+    };
+
+    limitsIsolatedTargetDir = lib.mkOption {
+      type = lib.types.nullOr (lib.types.bool);
+      default = null;
+      description = "Give test runs an isolated build target directory. Unset (null) = the binary's default.";
+    };
+
+    diagnosticsCrashReports = lib.mkOption {
+      type = lib.types.nullOr (lib.types.bool);
+      default = null;
+      description = "Write crash reports. Unset (null) = the binary's default.";
+    };
+
+    diagnosticsCrashRetention = lib.mkOption {
+      type = lib.types.nullOr (lib.types.ints.unsigned);
+      default = null;
+      description = "Number of crash reports to keep. Unset (null) = the binary's default.";
+    };
+
+    diagnosticsRingSize = lib.mkOption {
+      type = lib.types.nullOr (lib.types.ints.unsigned);
+      default = null;
+      description = "Entries held in the in-memory diagnostics ring. Unset (null) = the binary's default.";
     };
 
     agents = lib.mkOption {
