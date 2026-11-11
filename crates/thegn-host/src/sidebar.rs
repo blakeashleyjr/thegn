@@ -2844,6 +2844,80 @@ mod tests {
         }
     }
 
+    /// Worktree `(label, depth)` pairs `build_rows` emits for the `app` workspace,
+    /// in display order (order is part of the contract, so never sorted here).
+    fn app_worktree_rows(s: &Session, dbw: &[DbWorktree]) -> Vec<(String, u8)> {
+        let ws = vec![(
+            "app".to_string(),
+            "app".to_string(),
+            "repo".to_string(),
+            "/repos/app".to_string(),
+        )];
+        build_rows(s, &ws, &ViewState::default(), &no_activity(), dbw, &[], &[])
+            .into_iter()
+            .filter(|r| r.kind == RowKind::Worktree)
+            .map(|r| (r.label, r.depth))
+            .collect()
+    }
+
+    fn ghost_fixture() -> (Session, Vec<DbWorktree>) {
+        // The session still carries `ghost` (removed from the DB) and misses
+        // `newer` (registered).
+        let mut feat = db_row("app", "feat");
+        feat.path = "/wt/feat".into();
+        let mut newer = db_row("app", "newer");
+        newer.path = "/wt/newer".into();
+        let live = session(
+            vec![
+                tab("app/home", "/repos/app"),
+                tab("app/feat", "/wt/feat"),
+                tab("app/ghost", "/wt/ghost"),
+            ],
+            0,
+        );
+        (live, vec![feat, newer])
+    }
+
+    #[test]
+    fn live_and_dormant_rows_match_when_registry_dropped_a_worktree() {
+        let (mut live, dbw) = ghost_fixture();
+        let removed = vec!["app/ghost".to_string()];
+        crate::workspace_switch_prep::drop_removed_placeholders(&mut live, &removed, |_| false);
+        let dormant = session(vec![], 0);
+        let live_rows = app_worktree_rows(&live, &dbw);
+        assert_eq!(live_rows, app_worktree_rows(&dormant, &dbw));
+        // THE-73: the registered worktree the session missed still renders live.
+        assert!(live_rows.iter().any(|(l, _)| l == "newer"));
+    }
+
+    #[test]
+    fn removed_worktree_is_never_rendered_live_or_dormant() {
+        let (mut live, dbw) = ghost_fixture();
+        let removed = vec!["app/ghost".to_string()];
+        crate::workspace_switch_prep::drop_removed_placeholders(&mut live, &removed, |_| false);
+        for s in [live, session(vec![], 0)] {
+            assert!(
+                !app_worktree_rows(&s, &dbw)
+                    .iter()
+                    .any(|(l, _)| l == "ghost")
+            );
+        }
+    }
+
+    #[test]
+    fn live_group_with_panes_but_no_registry_row_still_renders() {
+        // A running agent in a worktree the registry does not list (quarantined
+        // tab, failed best-effort registration, background add) stays reachable.
+        let (mut live, dbw) = ghost_fixture();
+        let removed = vec!["app/ghost".to_string()];
+        crate::workspace_switch_prep::drop_removed_placeholders(&mut live, &removed, |_| true);
+        assert!(
+            app_worktree_rows(&live, &dbw)
+                .iter()
+                .any(|(l, _)| l == "ghost")
+        );
+    }
+
     #[test]
     fn dormant_groups_use_tab_identity_for_home_and_branch_named_home() {
         let mut home = db_row("app", "main");

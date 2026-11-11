@@ -100,6 +100,8 @@ the default asynchronous `post_create` work before its completion event; a
 post-create job before returning, while daemon creation reports the existing
 worktree response and completes post-create asynchronously.
 
+`thegn wt new <name> --exact-branch` uses `<name>` verbatim as the branch (no configured prefix or numbering) and refuses an existing branch.
+
 ## Lifecycle and sessions
 
 `pre_destroy` runs before provider teardown and git removal, and `post_destroy`
@@ -185,5 +187,22 @@ default branch as its base.
 The new-worktree wizard follows the same fail-closed rule in its resolve-base
 step: if Git cannot list branches or resolve the base, the step fails with
 Git's reason before anything is created.
+
 Worktree tabs are named `<repo>/<exact branch>`. See the [[config-reference]]
 for every knob.
+
+### Pruning merged worktrees
+
+`thegn wt prune --merged` removes lane worktrees whose branch is already merged
+into the target, together with those branches. It is a dry run by default: it
+lists what would be removed and why every other worktree is kept; add `--apply`
+to remove. `--target <branch>` overrides the target (default: the repo's merge
+target). `--json` emits one JSON object. A bare `wt prune` is refused.
+
+A worktree is kept when it is the primary checkout, holds the target branch,
+has a detached HEAD, is not merged (or Git cannot say), has a branch tip equal to
+the target (nothing worked on it yet), has uncommitted or
+untracked files, has a process running inside it (Linux only). Live sessions and merge-queue
+rows are not checked. Each worktree is re-checked just before its removal and
+skipped if it changed meanwhile. A removal that fails is reported and the rest continue; the exit
+status is non-zero if any failed.

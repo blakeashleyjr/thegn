@@ -10761,11 +10761,23 @@ async fn event_loop<T: Terminal>(
                 seq,
                 session_id,
                 rows,
+                registry,
+                removed,
                 land_on,
             } = &result
             {
                 if session.id == *session_id {
+                    if crate::workspace_switch_prep::adopted_snapshot_may_replace(
+                        sb.optimistic_db_edit_at,
+                    ) {
+                        model.sidebar_db_worktrees = registry.clone();
+                    }
                     session.apply_registered_adoption(rows.clone());
+                    crate::workspace_switch_prep::drop_removed_placeholders(
+                        &mut session,
+                        removed,
+                        |id| panes.table.contains_key(&id),
+                    );
                     if let Some(name) = land_on.as_deref() {
                         let current = pending_switch.current(*seq);
                         let found = session.worktrees.iter().any(|group| group.name == name);
