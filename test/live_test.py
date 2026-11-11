@@ -655,7 +655,7 @@ class LiveTests(unittest.TestCase):
             self.assertEqual(kwargs["env"]["THEGN_NO_MIGRATE"], "1")
             self.assertEqual(kwargs["env"].get("THEGN_DATABASE_MIGRATION_EXECUTABLE"), expected_pin)
             self.assertEqual(kwargs["env"]["THEGN_LOG_ROTATION_SIZE_MB"], "20")
-            self.assertEqual(kwargs["env"]["THEGN_LOG"], "debug,log=error")
+            self.assertEqual(kwargs["env"]["THEGN_LOG"], expected_log)
 
             class Child:
                 def wait(inner):
@@ -678,14 +678,29 @@ class LiveTests(unittest.TestCase):
 
         with contextlib.redirect_stdout(io.StringIO()), self.private_quiescence(), patch.object(live, "settings", return_value=self.paths), patch.object(live, "source_revision", return_value="a" * 40), patch.object(live, "build_stage", return_value=(self.root, self.binary, self.record)), patch.object(live, "install", side_effect=install), patch.object(live.sys.stdin, "isatty", return_value=True), patch.object(live.sys.stdout, "isatty", return_value=True), patch.object(live, "thegn_ancestor", return_value=None), patch.object(live, "validate_config"), patch.object(live, "stop_running"), patch.object(live, "doctor_later"), patch.object(live, "countdown"), patch.object(live.subprocess, "Popen", side_effect=spawn):
             for expected_pin in (None, str(self.target)):
-                # Keep HOME unchanged; test only captured migration override.
-                env = dict(os.environ, **self.env)
-                if expected_pin is None:
-                    env.pop("THEGN_DATABASE_MIGRATION_EXECUTABLE", None)
-                else:
-                    env["THEGN_DATABASE_MIGRATION_EXECUTABLE"] = expected_pin
-                with patch.dict(live.os.environ, env, clear=True):
-                    self.assertEqual(live.main(["--repo", str(self.repo)]), 7)
+                for argv, expected_log in (
+                    (["--repo", str(self.repo)], "info,log=error,tokei=error"),
+                    (["--repo", str(self.repo), "--level", "debug"], "debug,log=error,tokei=error"),
+                ):
+                    # Keep HOME unchanged; test only captured migration override.
+                    env = dict(os.environ, **self.env)
+                    if expected_pin is None:
+                        env.pop("THEGN_DATABASE_MIGRATION_EXECUTABLE", None)
+                    else:
+                        env["THEGN_DATABASE_MIGRATION_EXECUTABLE"] = expected_pin
+                    with patch.dict(live.os.environ, env, clear=True):
+                        self.assertEqual(live.main(argv), 7)
+
+    def test_default_log_level_is_info_and_debug_is_opt_in(self):
+        source = Path(live.__file__).read_text()
+        level_line = next(line for line in source.splitlines() if 'parser.add_argument("--level"' in line)
+        self.assertIn('default="info"', level_line)
+
+        justfile = (ROOT / "justfile").read_text()
+        self.assertIn('live level="info" ', justfile)
+        self.assertIn('live-plan level="info" ', justfile)
+        self.assertNotIn('live level="debug" ', justfile)
+        self.assertNotIn('live-plan level="debug" ', justfile)
 
     def test_just_recipe_rejects_literal_shell_injection(self):
         just = shutil.which("just")
