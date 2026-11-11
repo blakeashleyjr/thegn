@@ -89,9 +89,27 @@ pub fn parse_log(line: &str) -> ParsedLog {
         (Local::now().to_rfc3339(), LogLevel::Info, original.clone())
     };
 
-    // Lift the ` wt=<slug> ` attribution token out of the message (see
-    // `log_trace::Brand`), so it filters/displays as structure, not free text.
-    let (worktree, message) = strip_wt_token(&message);
+    // Lift the leading ` wt=<slug> ` attribution token run (which the formatter
+    // writes right after the target; see `log_trace::Brand`) out of the
+    // message, so it filters/displays as structure, not free text. Only lines
+    // with the three-part formatter shape are trusted; `wt=` text further into
+    // the message is quoted content and must neither re-attribute nor vanish.
+    let (worktree, message) = if parts.len() >= 3 {
+        match message.split_once(' ') {
+            Some((head, rest)) => {
+                let (worktree, rest) = strip_wt_token(rest);
+                let message = if rest.is_empty() {
+                    head.to_string()
+                } else {
+                    format!("{head} {rest}")
+                };
+                (worktree, message)
+            }
+            None => (None, message),
+        }
+    } else {
+        (None, message)
+    };
 
     ParsedLog {
         timestamp,
@@ -124,28 +142,24 @@ fn normalize_text_timestamp(tok: &str) -> Option<String> {
     None
 }
 
-/// Pull a `wt=<slug>` token out of a text-format message, returning the slug (if
-/// any) and the message with that token removed. Tolerates the token appearing
-/// anywhere (the formatter places it right after the target).
+/// Pull the LEADING run of identity tokens (`wt=`, `proc=`, `run=`) off a
+/// text-format message, returning the first non-empty `wt=` slug (if any) and
+/// the remaining message. Tokens after the first non-identity token are message
+/// body and are kept verbatim, so quoted `wt=` text cannot re-attribute a row.
 fn strip_wt_token(message: &str) -> (Option<String>, String) {
-    let mut wt = None;
-    let kept: Vec<&str> = message
-        .split_whitespace()
-        .filter(|tok| {
-            if let Some(slug) = tok.strip_prefix("wt=") {
-                if !slug.is_empty() {
-                    wt = Some(slug.to_string());
-                }
-                false // drop the token from the visible message
-            } else if tok.starts_with("proc=") || tok.starts_with("run=") {
-                // Process/run identity tokens are structure, not message body.
-                false
-            } else {
-                true
+    let mut wt: Option<String> = None;
+    let mut tokens = message.split_whitespace().peekable();
+    while let Some(tok) = tokens.peek() {
+        if let Some(slug) = tok.strip_prefix("wt=") {
+            if wt.is_none() && !slug.is_empty() {
+                wt = Some(slug.to_string());
             }
-        })
-        .collect();
-    (wt, kept.join(" "))
+        } else if !(tok.starts_with("proc=") || tok.starts_with("run=")) {
+            break;
+        }
+        tokens.next();
+    }
+    (wt, tokens.collect::<Vec<&str>>().join(" "))
 }
 
 fn extract_worktree(map: &mut serde_json::Map<String, Value>) -> Option<String> {
@@ -283,5 +297,43 @@ mod spec {
         let (wt, msg) = strip_wt_token("wt= leftover");
         assert!(wt.is_none());
         assert_eq!(msg, "leftover");
+    }
+
+    #[test]
+    fn quoted_wt_token_in_the_message_does_not_reattribute_the_row() {
+        let a = "a".repeat(64);
+        let b = "b".repeat(64);
+        let line = format!(
+            "2026-07-03T10:00:00  WARN  thegn::git  wt=aaa.{a}  copied wt=bbb.{b} from the other tab"
+        );
+        let parsed = parse_log(&line);
+        assert_eq!(parsed.worktree, Some(format!("aaa.{a}")));
+        assert!(parsed.message.contains("wt=bbb."), "{}", parsed.message);
+    }
+
+    #[test]
+    fn message_wt_token_without_a_leading_tag_leaves_the_row_global() {
+        let b = "b".repeat(64);
+        let line =
+            format!("2026-07-03T10:00:00  WARN  thegn::git  restored wt=bbb.{b} from backup");
+        let parsed = parse_log(&line);
+        assert_eq!(parsed.worktree, None);
+        assert!(parsed.message.contains("wt=bbb."), "{}", parsed.message);
+    }
+
+    #[test]
+    fn leading_identity_run_is_stripped_in_any_order_and_first_wt_wins() {
+        let (wt, message) = strip_wt_token("proc=host run=r1 wt=first wt=second body wt=late");
+        assert_eq!(wt, Some("first".to_string()));
+        assert_eq!(message, "body wt=late");
+    }
+
+    #[test]
+    fn quoted_run_and_proc_tokens_in_the_message_are_kept() {
+        let parsed = parse_log(
+            "2026-07-03T10:00:00  INFO  thegn::x  proc=host run=r1  wt=t  saw run=zzz in output",
+        );
+        assert_eq!(parsed.worktree, Some("t".to_string()));
+        assert!(parsed.message.contains("run=zzz"), "{}", parsed.message);
     }
 }
