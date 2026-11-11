@@ -4986,6 +4986,10 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let elsewhere = dir.path().join("elsewhere");
         std::fs::create_dir_all(elsewhere.join("pipeline/linear-X")).unwrap();
+        // The link target really has `code/`, so only the symlink can cause the
+        // inner-level refusal below (a link-following helper would accept it).
+        std::fs::create_dir_all(elsewhere.join("code")).unwrap();
+        std::fs::write(elsewhere.join("code/1.md"), "x").unwrap();
         std::fs::write(elsewhere.join("x.md"), "x").unwrap();
         let root = dir.path().join("wt");
         std::fs::create_dir_all(&root).unwrap();
@@ -4996,6 +5000,7 @@ mod tests {
         let root2 = dir.path().join("wt2");
         std::fs::create_dir_all(root2.join(".thegn/pipeline")).unwrap();
         crate::platform::test_symlink(&elsewhere, &root2.join(".thegn/pipeline/linear-X")).unwrap();
+        assert!(elsewhere.join("code/1.md").is_file());
         assert!(!artifact_chain_is_plain(
             &root2,
             ".thegn/pipeline/linear-X/code/1.md"
