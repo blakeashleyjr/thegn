@@ -32,6 +32,26 @@ pub(crate) fn step_notification(
             format!("merge queue: {branch} needs a human — {detail}"),
         )),
         MqStatus::GateError | MqStatus::AgentBlocked => {
+            if let Some(headline) = thegn_core::merge_identity_drift::hold_headline(detail) {
+                let headline = if let Some(reason_headline) =
+                    headline.strip_suffix(thegn_core::merge_identity_drift::REENQUEUE_SUFFIX)
+                {
+                    format!(
+                        "{}{}",
+                        bounded_headline(reason_headline),
+                        thegn_core::merge_identity_drift::REENQUEUE_SUFFIX
+                    )
+                } else {
+                    bounded_headline(&headline)
+                };
+                return Some((
+                    NotificationKind::QueueNeedsHuman,
+                    format!(
+                        "merge queue: {branch} held (identity changed since enqueue): {}",
+                        headline
+                    ),
+                ));
+            }
             let headline = bounded_headline(detail);
             Some((
                 NotificationKind::QueueNeedsHuman,
@@ -338,6 +358,32 @@ mod tests {
             assert!(message.starts_with(&signature), "{status:?}: {message}");
         }
         assert_eq!(hold_signature(MqStatus::Landed, "feature"), None);
+    }
+
+    #[test]
+    fn step_notification_names_identity_drift_not_environment() {
+        let detail = thegn_core::merge_identity_drift::candidate_drift_detail("r");
+        let (_, message) = step_notification(MqStatus::AgentBlocked, "feat", &detail).unwrap();
+        assert!(message.contains("identity changed since enqueue"));
+        assert!(message.contains("re-enqueue"));
+        assert!(!message.contains("environment/policy"));
+
+        let (_, message) =
+            step_notification(MqStatus::AgentBlocked, "feat", "sandbox floor not met").unwrap();
+        assert!(message.contains("environment/policy, not a code verdict"));
+    }
+
+    #[test]
+    fn step_notification_keeps_reenqueue_hint_after_truncating_long_drift_reason() {
+        let reason = "registration changed ".repeat(30);
+        let detail = thegn_core::merge_identity_drift::candidate_drift_detail(&reason);
+        let (_, message) = step_notification(MqStatus::AgentBlocked, "feat", &detail).unwrap();
+
+        assert!(
+            message.ends_with(thegn_core::merge_identity_drift::REENQUEUE_SUFFIX),
+            "the candidate drift notification must retain its re-enqueue instruction: {message}"
+        );
+        assert!(!message.contains(&reason));
     }
 
     #[test]

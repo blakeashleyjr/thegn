@@ -28,6 +28,16 @@ pub fn drift_reason(detail: &str) -> Option<&str> {
     Some(rest.strip_suffix(REENQUEUE_SUFFIX).unwrap_or(rest))
 }
 
+/// Operator headline for an identity-drift hold, or `None` when `detail` is not drift.
+pub fn hold_headline(detail: &str) -> Option<String> {
+    let reason = drift_reason(detail)?;
+    if detail.starts_with(WORKTREE_DRIFT_PREFIX) {
+        Some(format!("worktree identity drift — {reason}"))
+    } else {
+        Some(format!("identity drift — {reason}{REENQUEUE_SUFFIX}"))
+    }
+}
+
 /// Typed projection of a drift hold on a row (`{"reason": ...}`).
 #[derive(serde::Serialize)]
 pub struct IdentityDrift<'a> {
@@ -36,7 +46,7 @@ pub struct IdentityDrift<'a> {
 
 #[cfg(test)]
 mod tests {
-    use super::{candidate_drift_detail, drift_reason, worktree_drift_detail};
+    use super::{candidate_drift_detail, drift_reason, hold_headline, worktree_drift_detail};
     use crate::db::MergeQueueRow;
 
     fn row(error_detail: Option<String>) -> MergeQueueRow {
@@ -80,6 +90,27 @@ mod tests {
         );
         assert_eq!(drift_reason("note: identity drift: x"), None);
         assert_eq!(drift_reason(""), None);
+    }
+
+    #[test]
+    fn hold_headline_labels_candidate_and_worktree_drift() {
+        assert_eq!(
+            hold_headline(&candidate_drift_detail("r")),
+            Some(
+                "identity drift — r; re-enqueue with `thegn merge add` to adopt the new tip".into()
+            )
+        );
+        assert_eq!(
+            hold_headline(&worktree_drift_detail("checkout branch changed")),
+            Some("worktree identity drift — checkout branch changed".into())
+        );
+    }
+
+    #[test]
+    fn hold_headline_is_none_for_non_drift() {
+        for detail in ["candidate unreadable: x", "note: identity drift: x", ""] {
+            assert_eq!(hold_headline(detail), None, "{detail:?}");
+        }
     }
 
     #[test]

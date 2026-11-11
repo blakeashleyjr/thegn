@@ -2196,3 +2196,23 @@ fn mq_row_verbs_follow_the_typed_status_table() {
         );
     }
 }
+
+#[test]
+fn mq_row_identity_drift_label_replaces_environment_label() {
+    let mut row = mq_test_row("agent_blocked");
+    row.error_detail = Some(thegn_core::merge_identity_drift::candidate_drift_detail(
+        "registration changed",
+    ));
+    let row = super::mq_row(&row, crate::caps::active_glyphs());
+    let note = row.note.as_deref().unwrap();
+    assert!(note.contains("identity drift — "));
+    assert!(!note.contains("environment/policy blocked"));
+
+    let mut row = mq_test_row("agent_blocked");
+    row.error_detail = Some(thegn_core::merge_identity_drift::candidate_drift_detail(
+        "registration changed \u{1b}[31m",
+    ));
+    let row = super::mq_row(&row, crate::caps::active_glyphs());
+    let note = row.note.as_deref().unwrap();
+    assert!(!note.contains('\u{1b}'));
+}
