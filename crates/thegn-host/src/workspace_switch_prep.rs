@@ -107,6 +107,9 @@ pub(crate) enum SwitchResult {
         seq: u64,
         session_id: String,
         rows: Vec<crate::session::WorktreeGroup>,
+        /// Registry rows read fresh in the same DB-thread job, replacing the
+        /// sidebar's snapshot so live and parked rows share one source (THE-1965).
+        registry: Vec<crate::sidebar::DbWorktree>,
         land_on: Option<String>,
     },
     ConnectRoot {
@@ -297,10 +300,12 @@ pub(crate) fn request_registered_adoption(
     let cfg = cfg.clone();
     crate::db_task::persist_critical(move |db| {
         let rows = Session::prepare_registered_adoption(&session_id, &existing, db, &cfg);
+        let (registry, _observations) = crate::hydrate::db_worktree_list_with_snapshot(db, &cfg);
         if let Err(error) = tx.send(SwitchResult::Adopted {
             seq,
             session_id,
             rows,
+            registry,
             land_on,
         }) {
             tracing::debug!(target: "thegn::workspace_switch", %error, "worktree adoption result receiver is gone");
