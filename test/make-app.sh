@@ -39,8 +39,8 @@ run_make_app() {
 assert_no_workdirs() {
   local dest="$1"
   if find "$dest" -mindepth 1 -maxdepth 1 \
-    \( -name '.thegn.app.staging.*' -o -name '.thegn.app.old.*' \) -print -quit | grep -q .; then
-    echo "make-app test: unexpected staging/old directory in $dest" >&2
+    \( -name '.thegn.app.staging.*' -o -name '.thegn.app.old.*' -o -name '.thegn.app.lock' \) -print -quit | grep -q .; then
+    echo "make-app test: unexpected staging/old/lock directory in $dest" >&2
     return 1
   fi
 }
@@ -106,6 +106,58 @@ fi
 cmp -s "$tmp/common.sh.before" "$bundle/Contents/Resources/common.sh" || fail "failed lint changed the previous bundle"
 cmp -s "$tmp/env.before" "$bundle/Contents/Resources/env" || fail "failed lint changed the previous env data"
 assert_no_workdirs "$apps" || fail "failed lint left staging/old directories"
+
+# generation lock
+mkdir -p "$tmp/lock-live/.thegn.app.lock"
+sleep 30 &
+holder=$!
+printf '%s\n' "$holder" >"$tmp/lock-live/.thegn.app.lock/pid"
+if run_make_app --dest "$tmp/lock-live" >"$tmp/lock-live.out" 2>"$tmp/lock-live.err"; then
+  kill "$holder"
+  wait "$holder" 2>/dev/null || true
+  fail "a live lock holder was ignored"
+fi
+grep -Fq "$holder" "$tmp/lock-live.err" || fail "live-holder refusal did not name the holder pid"
+grep -Fq ".thegn.app.lock" "$tmp/lock-live.err" || fail "live-holder refusal did not name the lock"
+[[ ! -e "$tmp/lock-live/thegn.app" ]] || fail "live-holder run created a bundle"
+[[ "$(cat "$tmp/lock-live/.thegn.app.lock/pid")" == "$holder" ]] || fail "live holder's lock was modified"
+if find "$tmp/lock-live" -mindepth 1 -maxdepth 1 \( -name '.thegn.app.staging.*' -o -name '.thegn.app.old.*' \) -print -quit | grep -q .; then
+  fail "live-holder refusal left staging/old directories"
+fi
+kill "$holder"
+wait "$holder" 2>/dev/null || true
+
+mkdir -p "$tmp/lock-stale/.thegn.app.lock"
+printf '%s\n' 99999999 >"$tmp/lock-stale/.thegn.app.lock/pid"
+run_make_app --dest "$tmp/lock-stale" >"$tmp/lock-stale.out" 2>"$tmp/lock-stale.err" || fail "stale lock was not reclaimed"
+[[ -d "$tmp/lock-stale/thegn.app" ]] || fail "stale-lock run did not produce a bundle"
+assert_no_workdirs "$tmp/lock-stale" || fail "stale-lock run left staging/old/lock directories"
+
+# pid 1 belongs to another user (kill -0 fails with EPERM when not root): still a live holder.
+mkdir -p "$tmp/lock-eperm/.thegn.app.lock"
+printf '%s\n' 1 >"$tmp/lock-eperm/.thegn.app.lock/pid"
+if run_make_app --dest "$tmp/lock-eperm" >"$tmp/lock-eperm.out" 2>"$tmp/lock-eperm.err"; then
+  fail "a lock held by another user's process was reclaimed"
+fi
+[[ "$(cat "$tmp/lock-eperm/.thegn.app.lock/pid")" == 1 ]] || fail "EPERM holder's lock was modified"
+[[ ! -e "$tmp/lock-eperm/thegn.app" ]] || fail "EPERM-holder run created a bundle"
+
+mkdir -p "$tmp/lock-nopid/.thegn.app.lock"
+if run_make_app --dest "$tmp/lock-nopid" >"$tmp/lock-nopid.out" 2>"$tmp/lock-nopid.err"; then
+  fail "a pid-less lock was ignored"
+fi
+grep -Fq "without a valid pid" "$tmp/lock-nopid.err" || fail "pid-less lock refusal had the wrong message"
+[[ -d "$tmp/lock-nopid/.thegn.app.lock" ]] || fail "pid-less lock was removed"
+[[ ! -e "$tmp/lock-nopid/thegn.app" ]] || fail "pid-less lock run created a bundle"
+
+mkdir -p "$tmp/lock-garbage/.thegn.app.lock"
+printf '%s\n' abc >"$tmp/lock-garbage/.thegn.app.lock/pid"
+if run_make_app --dest "$tmp/lock-garbage" >"$tmp/lock-garbage.out" 2>"$tmp/lock-garbage.err"; then
+  fail "a garbage-pid lock was ignored"
+fi
+grep -Fq "without a valid pid" "$tmp/lock-garbage.err" || fail "garbage-pid lock refusal had the wrong message"
+[[ -d "$tmp/lock-garbage/.thegn.app.lock" ]] || fail "garbage-pid lock was removed"
+[[ ! -e "$tmp/lock-garbage/thegn.app" ]] || fail "garbage-pid lock run created a bundle"
 
 # symlinked bundle path is refused
 mkdir -p "$tmp/target-bundle"
