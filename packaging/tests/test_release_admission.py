@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import copy
 import os
 import re
 import shutil
@@ -21,6 +22,72 @@ def read_workflow(name: str) -> dict:
     if not isinstance(workflow, dict):
         raise AssertionError(f"{name} is not a YAML mapping")
     return workflow
+
+
+ADMIT_REPO_CODE_MARKERS = ("packaging/", "scripts/", "./.github/", "just ", "nix ", "cargo ")
+
+
+def _needs(job: dict) -> list[str]:
+    needs = job.get("needs", [])
+    return [needs] if isinstance(needs, str) else list(needs)
+
+
+def _needs_closure(jobs: dict, name: str) -> set[str]:
+    closure: set[str] = set()
+    pending = _needs(jobs[name])
+    while pending:
+        dependency = pending.pop()
+        if dependency in closure:
+            continue
+        closure.add(dependency)
+        pending.extend(_needs(jobs.get(dependency, {})))
+    return closure
+
+
+def _checks_out_admitted_sha(step: dict) -> bool:
+    return str(step.get("uses", "")).startswith("actions/checkout@") and (
+        "needs.admit.outputs.sha" in str((step.get("with") or {}).get("ref", ""))
+    )
+
+
+def release_ordering_violations(jobs: dict) -> list[str]:
+    """Ordering facts: no release-checkout code runs before admission (empty list = clean)."""
+    violations: list[str] = []
+    admit = jobs.get("admit")
+    if admit is None:
+        violations.append("no admit job")
+    else:
+        for step in admit.get("steps", []):
+            name = step.get("name", step.get("uses", "<unnamed>"))
+            run = str(step.get("run", ""))
+            if str(step.get("uses", "")).startswith("./") or any(
+                marker in run for marker in ADMIT_REPO_CODE_MARKERS
+            ):
+                violations.append(f"admit runs repository code: {name}")
+    for job_name, job in jobs.items():
+        if job_name == "admit":
+            continue
+        steps = job.get("steps", [])
+        if not any(_checks_out_admitted_sha(step) for step in steps):
+            continue
+        if "admit" not in _needs_closure(jobs, job_name):
+            violations.append(f"{job_name} checks out the admitted sha without depending on admit")
+        for index, step in enumerate(steps):
+            uses = str(step.get("uses", ""))
+            if not uses.startswith("./"):
+                continue
+            action_dir = uses[2:]
+            replaced = any(
+                'git archive "$TRUSTED_WORKFLOW_SHA"' in str(earlier.get("run", ""))
+                and action_dir in str(earlier.get("run", ""))
+                for earlier in steps[:index]
+            )
+            if not replaced:
+                violations.append(
+                    f"{job_name} uses {uses} from the admitted checkout "
+                    "without replacing it from the trusted revision"
+                )
+    return violations
 
 
 class ReleaseAdmissionTests(unittest.TestCase):
@@ -89,6 +156,44 @@ class ReleaseAdmissionTests(unittest.TestCase):
             text=True,
         )
         self.assertEqual("v1.2.3\n", result.stdout)
+
+    def test_release_ordering_policy_has_no_violations_today(self) -> None:
+        self.assertEqual([], release_ordering_violations(self.jobs))
+
+    def test_release_ordering_policy_flags_repository_code_in_admit(self) -> None:
+        jobs = copy.deepcopy(self.jobs)
+        jobs["admit"]["steps"].append(
+            {"name": "Run repo script", "run": "python3 packaging/release.py validate"}
+        )
+        found = release_ordering_violations(jobs)
+        self.assertEqual(1, len([v for v in found if "admit runs repository code" in v]), found)
+
+        jobs = copy.deepcopy(self.jobs)
+        jobs["admit"]["steps"].append({"uses": "./.github/actions/ci-setup"})
+        found = release_ordering_violations(jobs)
+        self.assertEqual(1, len([v for v in found if "admit runs repository code" in v]), found)
+
+    def test_release_ordering_policy_flags_an_unreplaced_local_action(self) -> None:
+        jobs = copy.deepcopy(self.jobs)
+        steps = jobs["package"]["steps"]
+        jobs["package"]["steps"] = [
+            step for step in steps if step.get("name") != "Prepare trusted workflow action"
+        ]
+        self.assertNotEqual(len(steps), len(jobs["package"]["steps"]))
+        found = release_ordering_violations(jobs)
+        self.assertTrue(
+            any("package" in v and "without replacing it from the trusted revision" in v for v in found),
+            found,
+        )
+
+    def test_release_ordering_policy_flags_a_checkout_without_admit_dependency(self) -> None:
+        jobs = copy.deepcopy(self.jobs)
+        jobs["build"]["needs"] = ["create-release"]
+        jobs["create-release"]["needs"] = []
+        found = release_ordering_violations(jobs)
+        self.assertTrue(
+            any("build" in v and "without depending on admit" in v for v in found), found
+        )
 
     def test_every_write_job_depends_on_admit(self) -> None:
         for job_name, job in self.jobs.items():
