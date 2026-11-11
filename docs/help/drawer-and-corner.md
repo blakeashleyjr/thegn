@@ -49,6 +49,10 @@ Whatever the kind, the drawer's pooling, prewarm, per-worktree open flag,
 layout and memory containment behave the same; `thegn doctor` reports the
 selected manager (binary availability, config-home mode, caps).
 
+A worktree's drawer state is keyed by its path with `.` segments and trailing or
+duplicate separators ignored, so `/r/a` and `/r/a/` share one state; symlinks
+and `..` are not resolved.
+
 The drawer registry extends `[[tools]]`: set `drawer_scope = "worktree"` for
 a tool with one pane per worktree, or `drawer_scope = "global"` for one pane
 pooled across worktree switches during this thegn process. `drawer_cwd` is
