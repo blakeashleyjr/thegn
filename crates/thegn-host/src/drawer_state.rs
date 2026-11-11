@@ -216,8 +216,8 @@ fn clear_desired_if(key: &str, occupant_id: &str) {
 // ── keep-alive pane pool ─────────────────────────────────────────────────────
 
 /// The key for a pooled drawer pane. A global occupant uses the fixed global
-/// scope key, while worktree occupants use an exact-byte digest of the
-/// already-resolved absolute path.
+/// scope key, while worktree occupants use a digest of the lexically
+/// normalised path (`.` and trailing separators collapsed).
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub(crate) struct DrawerPoolKey {
     pub scope_key: String,
@@ -942,6 +942,21 @@ mod tests {
     use super::*;
 
     const TEST_PANE_EVENT_CHANNEL_CAPACITY: usize = 256;
+
+    #[test]
+    fn drawer_alias_spellings_share_one_pool_key_and_flag_state() {
+        assert_eq!(
+            DrawerPoolKey::worktree(Path::new("/tmp/wt"), FILES_OCCUPANT_ID),
+            DrawerPoolKey::worktree(Path::new("/tmp/wt/"), FILES_OCCUPANT_ID)
+        );
+        let mut c = FlagCache::default();
+        c.set_key(
+            &drawer_scope_key(DrawerScope::Worktree, Path::new("/r/a")),
+            Some(FILES_OCCUPANT_ID.into()),
+        );
+        let alias = drawer_scope_key(DrawerScope::Worktree, Path::new("/r/a/"));
+        assert_eq!(c.occupant_for_key(&alias), Some("files".to_string()));
+    }
 
     #[test]
     fn flag_cache_round_trips_and_defaults_closed() {
