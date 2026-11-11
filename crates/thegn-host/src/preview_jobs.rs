@@ -161,12 +161,10 @@ impl PreviewSupervisor {
         };
         if spawn {
             let state = Arc::clone(&self.state);
-            let spawned = std::thread::Builder::new()
-                .name("thegn-preview".into())
-                .spawn(move || {
-                    crate::platform::qos::set_self(crate::platform::qos::Qos::Utility);
-                    worker(&state);
-                });
+            let spawned = thegn_core::thread_name::try_spawn_named("thegn-preview", move || {
+                crate::platform::qos::set_self(crate::platform::qos::Qos::Utility);
+                worker(&state);
+            });
             if let Err(e) = spawned {
                 tracing::warn!(target: "thegn::preview", error = %e, "preview worker spawn failed");
                 let pending = {
@@ -328,31 +326,29 @@ fn capture(
         let mut stdout = child.stdout.take();
         let (tx, rx) = std::sync::mpsc::channel::<Vec<u8>>();
         let capped = Arc::clone(&capped);
-        let spawned = std::thread::Builder::new()
-            .name("thegn-prev-io".into())
-            .spawn(move || {
-                crate::platform::qos::set_self(crate::platform::qos::Qos::Utility);
-                let mut buf = Vec::new();
-                if let Some(out) = stdout.as_mut() {
-                    let mut chunk = [0u8; 64 * 1024];
-                    loop {
-                        match out.read(&mut chunk) {
-                            Ok(0) | Err(_) => break,
-                            Ok(n) => {
-                                let room = max_out.saturating_sub(buf.len());
-                                buf.extend_from_slice(&chunk[..n.min(room)]);
-                                if n > room {
-                                    capped.store(true, Ordering::Release);
-                                    break;
-                                }
+        let spawned = thegn_core::thread_name::try_spawn_named("thegn-prev-io", move || {
+            crate::platform::qos::set_self(crate::platform::qos::Qos::Utility);
+            let mut buf = Vec::new();
+            if let Some(out) = stdout.as_mut() {
+                let mut chunk = [0u8; 64 * 1024];
+                loop {
+                    match out.read(&mut chunk) {
+                        Ok(0) | Err(_) => break,
+                        Ok(n) => {
+                            let room = max_out.saturating_sub(buf.len());
+                            buf.extend_from_slice(&chunk[..n.min(room)]);
+                            if n > room {
+                                capped.store(true, Ordering::Release);
+                                break;
                             }
                         }
                     }
                 }
-                if tx.send(buf).is_err() {
-                    // the waiter timed out and dropped the receiver
-                }
-            });
+            }
+            if tx.send(buf).is_err() {
+                // the waiter timed out and dropped the receiver
+            }
+        });
         if let Err(e) = spawned {
             tracing::warn!(target: "thegn::preview", error = %e, "preview reader spawn failed");
             group.kill();
