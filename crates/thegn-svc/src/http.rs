@@ -927,12 +927,12 @@ mod tests {
                 listener,
                 axum::Router::new().fallback(|request: Request| async move {
                     if request.uri().path() == "/headers" {
-                        tokio::time::sleep(Duration::from_millis(100)).await;
+                        tokio::time::sleep(Duration::from_secs(30)).await;
                         return ("late").into_response();
                     }
                     if request.uri().path() == "/idle" {
                         let stream = futures_util::stream::once(async {
-                            tokio::time::sleep(Duration::from_millis(100)).await;
+                            tokio::time::sleep(Duration::from_secs(30)).await;
                             Ok::<_, Infallible>(vec![b'x'])
                         });
                         return Body::from_stream(stream).into_response();
@@ -978,15 +978,20 @@ mod tests {
         let idle_response = idle
             .send(
                 idle.request(reqwest::Method::GET),
-                Instant::now() + Duration::from_secs(1),
+                Instant::now() + Duration::from_secs(30),
             )
             .await
             .unwrap();
-        assert!(matches!(
-            read_bounded_response(idle_response, Instant::now() + Duration::from_secs(1), 128)
-                .await,
-            Err(BodyReadError::Timeout)
-        ));
+        let started = Instant::now();
+        let idle_result =
+            read_bounded_response(idle_response, Instant::now() + Duration::from_secs(30), 128)
+                .await;
+        let elapsed = started.elapsed();
+        assert!(matches!(idle_result, Err(BodyReadError::Timeout)));
+        assert!(
+            elapsed < Duration::from_secs(10),
+            "idle read timeout took {elapsed:?}"
+        );
 
         // A body that keeps dripping is governed by the operation deadline,
         // independently of the injected idle/read timeout above.
@@ -997,7 +1002,7 @@ mod tests {
                     test_answers: None,
                     test_resolutions: None,
                 },
-                Duration::from_secs(1),
+                Duration::from_secs(30),
             )
             .unwrap(),
             url: Url::parse(&format!("http://{address}/body")).unwrap(),
@@ -1005,7 +1010,7 @@ mod tests {
         let response = body
             .send(
                 body.request(reqwest::Method::GET),
-                Instant::now() + Duration::from_secs(1),
+                Instant::now() + Duration::from_secs(30),
             )
             .await
             .unwrap();
@@ -1018,7 +1023,7 @@ mod tests {
         let error = error_client
             .send(
                 error_client.request(reqwest::Method::GET),
-                Instant::now() + Duration::from_secs(1),
+                Instant::now() + Duration::from_secs(30),
             )
             .await
             .unwrap();
