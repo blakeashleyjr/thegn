@@ -967,29 +967,88 @@ async fn gather_issue_facts(
     stage: &thegn_core::config_pipeline::PipelineStage,
     issue_id: &str,
     repo: Option<&str>,
-) -> Result<IssueFacts> {
+    force_fetch: bool,
+) -> Result<(IssueFacts, Option<thegn_core::issue::Issue>)> {
     let referenced = template_vars(&stage.prompt)
         .map_err(|e| anyhow::anyhow!("stage '{}' prompt template is invalid: {e}", stage.name))?;
     let needs_tracker = ["issue_title", "issue_body", "issue_url"]
         .iter()
         .any(|v| referenced.iter().any(|r| r == v));
-    Ok(if needs_tracker {
+    Ok(if needs_tracker || force_fetch {
         let detail = client.issue_get(issue_id, repo).await?;
         let issue = detail.issue;
-        IssueFacts {
+        let facts = IssueFacts {
             number: pipeline_run::issue_key(issue_id),
-            title: issue.title,
-            body: issue.body.unwrap_or_default(),
-            url: issue.url,
-        }
+            title: issue.title.clone(),
+            body: issue.body.clone().unwrap_or_default(),
+            url: issue.url.clone(),
+        };
+        (facts, Some(issue))
     } else {
-        IssueFacts {
-            number: pipeline_run::issue_key(issue_id),
-            title: String::new(),
-            body: String::new(),
-            url: String::new(),
-        }
+        (
+            IssueFacts {
+                number: pipeline_run::issue_key(issue_id),
+                title: String::new(),
+                body: String::new(),
+                url: String::new(),
+            },
+            None,
+        )
     })
+}
+
+/// Write the fetched issue to `<worktree>/.thegn/maintenance/issue.json`
+/// (always overwriting, atomically) so a worker can never read a stale
+/// snapshot. Refuses a symlinked `.thegn` or `.thegn/maintenance`.
+fn write_issue_snapshot(worktree: &Path, issue: &thegn_core::issue::Issue) -> Result<()> {
+    let path = thegn_core::issue_snapshot::path_for(worktree);
+    let dir = path
+        .parent()
+        .ok_or_else(|| anyhow::anyhow!("issue snapshot path has no parent"))?;
+    for part in [worktree.join(".thegn"), dir.to_path_buf()] {
+        match std::fs::symlink_metadata(&part) {
+            Ok(meta) if meta.file_type().is_symlink() => {
+                anyhow::bail!(
+                    "refusing to write the issue snapshot: {} is a symlink",
+                    part.display()
+                );
+            }
+            Ok(meta) if !meta.is_dir() => {
+                anyhow::bail!(
+                    "refusing to write the issue snapshot: {} is not a directory",
+                    part.display()
+                );
+            }
+            Ok(_) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                std::fs::create_dir(&part).map_err(|e| {
+                    anyhow::anyhow!(
+                        "cannot create {} for the issue snapshot: {e}",
+                        part.display()
+                    )
+                })?;
+            }
+            Err(e) => anyhow::bail!("cannot inspect {}: {e}", part.display()),
+        }
+    }
+    if let Ok(meta) = std::fs::symlink_metadata(&path)
+        && meta.file_type().is_symlink()
+    {
+        anyhow::bail!(
+            "refusing to write the issue snapshot: {} is a symlink",
+            path.display()
+        );
+    }
+    let tmp = dir.join(format!(".issue.json.tmp{}", std::process::id()));
+    std::fs::write(&tmp, thegn_core::issue_snapshot::render(issue))
+        .and_then(|()| std::fs::rename(&tmp, &path))
+        .map_err(|e| {
+            // Best effort cleanup of the temp file; the write error is what matters.
+            if let Err(rm) = std::fs::remove_file(&tmp) {
+                tracing::debug!(error = %rm, "issue snapshot temp cleanup");
+            }
+            anyhow::anyhow!("cannot write issue snapshot {}: {e}", path.display())
+        })
 }
 
 /// The live branch a worktree is on. Empty is acceptable (detached, unborn,
@@ -1054,7 +1113,16 @@ async fn open_stage(cfg: &Config, client: &ControlClient, d: StageDispatch<'_>) 
     //    references one of them and the lookup fails, the tracker's own error
     //    propagates — a prompt with a silently empty issue body is how a
     //    worker ends up implementing nothing.
-    let facts = gather_issue_facts(client, stage, d.issue, Some(&wt)).await?;
+    let (facts, fetched) = gather_issue_facts(client, stage, d.issue, Some(&wt), true)
+        .await
+        .map_err(|e| {
+            anyhow::anyhow!(
+                "cannot capture {issue} for .thegn/maintenance/issue.json (tracker \
+                 unavailable, offline, or provider none): {e}"
+            )
+        })?;
+    let fetched = fetched.ok_or_else(|| anyhow::anyhow!("issue fetch returned nothing"))?;
+    write_issue_snapshot(Path::new(&wt), &fetched)?;
     // 5. Chunk scope is prepared before the DB lock by shared admission.
     // Session open deliberately has no scope override.
     // 6b. Insert the roster row BEFORE opening the session (D5).
@@ -1607,7 +1675,7 @@ async fn resume_work(
         .into_owned();
     let branch = resolve_branch(&wt);
     // 4. Gather facts from the source attempt before claiming the finisher.
-    let facts = gather_issue_facts(client, stage, &row.issue_id, Some(&wt)).await?;
+    let (facts, _) = gather_issue_facts(client, stage, &row.issue_id, Some(&wt), false).await?;
     // 5. Finisher facts: source artifact state and bounded-at-render git facts.
     let source_vf = crate::cmd::dispatch::verify_facts(&row);
     let git_status = git_out_allow_empty(Path::new(&wt), &["status", "--porcelain"])
@@ -2739,6 +2807,80 @@ mod terminal_safe_output_tests {
         assert_eq!(
             terminal_safe_pretty_json(&value).unwrap(),
             serde_json::to_string_pretty(&value).unwrap()
+        );
+    }
+}
+
+#[cfg(test)]
+mod issue_snapshot_tests {
+    use super::write_issue_snapshot;
+    use thegn_core::issue::{Issue, IssuePriority, IssueStatus};
+
+    fn issue(title: &str) -> Issue {
+        Issue {
+            id: "linear:THE-1".into(),
+            number: "THE-1".into(),
+            provider: "linear".into(),
+            title: title.into(),
+            body: Some("b".into()),
+            status: IssueStatus::Todo,
+            priority: IssuePriority::Low,
+            assignees: vec![],
+            labels: vec![],
+            url: "u".into(),
+            branch_hint: None,
+            updated_at_ms: 0,
+            project_ids: vec![],
+            blocked_by: vec![],
+            due_at_ms: None,
+            account: None,
+        }
+    }
+
+    #[test]
+    fn snapshot_overwrites_stale_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = thegn_core::issue_snapshot::path_for(dir.path());
+        std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+        std::fs::write(&p, "stale").unwrap();
+        write_issue_snapshot(dir.path(), &issue("fresh")).unwrap();
+        let text = std::fs::read_to_string(&p).unwrap();
+        assert!(text.contains("fresh") && !text.contains("stale"));
+    }
+
+    #[test]
+    fn snapshot_creates_missing_dirs() {
+        let dir = tempfile::tempdir().unwrap();
+        write_issue_snapshot(dir.path(), &issue("t")).unwrap();
+        assert!(thegn_core::issue_snapshot::path_for(dir.path()).is_file());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn snapshot_refuses_symlinked_dirs() {
+        let dir = tempfile::tempdir().unwrap();
+        let elsewhere = tempfile::tempdir().unwrap();
+        std::os::unix::fs::symlink(elsewhere.path(), dir.path().join(".thegn")).unwrap();
+        let err = write_issue_snapshot(dir.path(), &issue("t")).unwrap_err();
+        assert!(err.to_string().contains("symlink"));
+        assert!(
+            std::fs::read_dir(elsewhere.path())
+                .unwrap()
+                .next()
+                .is_none()
+        );
+
+        let dir2 = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir2.path().join(".thegn")).unwrap();
+        std::os::unix::fs::symlink(elsewhere.path(), dir2.path().join(".thegn/maintenance"))
+            .unwrap();
+        let err = write_issue_snapshot(dir2.path(), &issue("t")).unwrap_err();
+        assert!(err.to_string().contains("symlink"));
+        assert!(
+            std::fs::read_dir(elsewhere.path())
+                .unwrap()
+                .next()
+                .is_none()
         );
     }
 }
