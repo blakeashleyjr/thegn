@@ -7,6 +7,39 @@ All notable changes to **thegn** are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.1.0-alpha.61] — 2026-11-11
+
+### Added
+
+- The Home Manager module exposes the `[disk]` scalar options
+  (`diskShowSizes`, `diskWarnThresholdGb`, `diskScanIntervalSecs`,
+  `diskMaxScanPerRound`, `diskAutoCleanOnMerge`, `diskCleanOnPrClosed`,
+  `diskIdleCleanDays`, `diskGenerationMinAgeDays`, `diskReclaimOnLowDisk` and
+  `diskSccache`). The two path keys stay unexposed.
+
+### Fixed
+
+- The daemon retries its control-socket bind once when an idle-prune pass
+  removes the control directory between the directory check and the bind lock,
+  instead of failing to start.
+- Pipeline verify refuses a mixed snapshot: if the worktree's HEAD or the
+  handoff artifact changes while verification is running, the result is
+  reported as unknown rather than as a verdict about two different states.
+- Filing a pipeline report is tied to the run it was verified against, so a
+  run that was republished in the meantime no longer receives the report.
+- The pipeline parent-edge check compares issues by their canonical identity:
+  `ABC-74`, `linear:abc-74` and `LINEAR:ABC-74` are one issue, while the same
+  key under two different providers stays distinct.
+- Removing a workspace now also forgets the drawer panes and remembered drawer
+  state of every worktree it closed.
+- `make-app.sh` refuses a `--name` containing `..` or ending in `.`, and
+  derives a valid macOS bundle identifier from a name containing underscores.
+- A media-player payload that reports no playback state is shown as stopped
+  rather than playing.
+- Git commit and stash listings that arrive truncated (without their final
+  terminator) are rejected as a whole instead of silently dropping the last
+  record.
+
 ## [0.1.0-alpha.60] — 2026-11-11
 
 ### Added
@@ -3093,7 +3126,8 @@ launcher picker and the merge queue's `agent_command` hook remain — they run
 whatever commands you configure. Leftover `[llm_proxy]` config sections and
 `proxy_*` tables in existing state databases are ignored harmlessly.
 
-[Unreleased]: https://github.com/blakeashleyjr/thegn/compare/v0.1.0-alpha.60...HEAD
+[Unreleased]: https://github.com/blakeashleyjr/thegn/compare/v0.1.0-alpha.61...HEAD
+[0.1.0-alpha.61]: https://github.com/blakeashleyjr/thegn/compare/v0.1.0-alpha.60...v0.1.0-alpha.61
 [0.1.0-alpha.60]: https://github.com/blakeashleyjr/thegn/compare/v0.1.0-alpha.59...v0.1.0-alpha.60
 [0.1.0-alpha.59]: https://github.com/blakeashleyjr/thegn/compare/v0.1.0-alpha.58...v0.1.0-alpha.59
 [0.1.0-alpha.58]: https://github.com/blakeashleyjr/thegn/compare/v0.1.0-alpha.57...v0.1.0-alpha.58

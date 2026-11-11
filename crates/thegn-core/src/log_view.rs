@@ -115,10 +115,30 @@ fn strip_identity_tokens(message: &str) -> String {
 
 /// The run id carried by a raw log line (`run=<id>`), if present. Used by
 /// `thegn logs tail --run <id>` to filter to one process's lines.
+///
+/// Reads only the formatter's leading identity run (the `proc=`/`run=`/`wt=`
+/// tokens right after the target), mirroring [`parse_log_line`]; a `run=`
+/// token quoted later in the message is never attributed. The first non-empty
+/// `run=` in that run wins. Returns `None` for a line without the Brand shape.
 pub fn line_run_id(raw: &str) -> Option<&str> {
-    raw.split_whitespace()
-        .find_map(|tok| tok.strip_prefix("run="))
-        .filter(|s| !s.is_empty())
+    let (_ts, rest) = raw.split_once("  ")?;
+    let (_level, rest) = rest.split_once(' ')?;
+    let (_target, message) = rest.trim_start().split_once("  ")?;
+    let mut rest = message.trim_start();
+    let mut run = None;
+    loop {
+        let end = rest.find(char::is_whitespace).unwrap_or(rest.len());
+        let tok = &rest[..end];
+        if let Some(id) = tok.strip_prefix("run=") {
+            if run.is_none() && !id.is_empty() {
+                run = Some(id);
+            }
+        } else if !(tok.starts_with("proc=") || tok.starts_with("wt=")) {
+            break;
+        }
+        rest = rest[end..].trim_start();
+    }
+    run
 }
 
 /// Return the path to the thegn log file, honouring the `[log]` config.
@@ -444,5 +464,34 @@ mod tests {
         let out = error_inclusive_tail(&lines, 400, 0);
         assert_eq!(out, lines[100..].to_vec());
         assert_eq!(error_count(&out), 0);
+    }
+
+    const RUN_ID_PREFIX: &str = "2026-07-03T10:00:00  WARN  thegn::git  ";
+
+    #[test]
+    fn line_run_id_reads_the_leading_identity_run() {
+        let a = format!("{RUN_ID_PREFIX}proc=host run=r1  wt=t  fetched");
+        assert_eq!(line_run_id(&a), Some("r1"));
+        let b = format!("{RUN_ID_PREFIX}wt=t proc=host run=r2  body");
+        assert_eq!(line_run_id(&b), Some("r2"));
+        let c = format!("{RUN_ID_PREFIX}run=first run=second body");
+        assert_eq!(line_run_id(&c), Some("first"));
+    }
+
+    #[test]
+    fn line_run_id_ignores_a_quoted_run_token_in_the_message() {
+        let with_run = format!("{RUN_ID_PREFIX}proc=host run=r1  wt=t  saw run=zzz in output");
+        assert_eq!(line_run_id(&with_run), Some("r1"));
+        let without_run = format!("{RUN_ID_PREFIX}wt=t  saw run=zzz in output");
+        assert_eq!(line_run_id(&without_run), None);
+    }
+
+    #[test]
+    fn line_run_id_is_none_without_a_leading_run_token() {
+        let quoted = format!("{RUN_ID_PREFIX}restored run=abc from backup");
+        assert_eq!(line_run_id(&quoted), None);
+        let empty = format!("{RUN_ID_PREFIX}run=  body");
+        assert_eq!(line_run_id(&empty), None);
+        assert_eq!(line_run_id("not a log line run=x"), None);
     }
 }

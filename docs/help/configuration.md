@@ -579,6 +579,12 @@ The `[limits]` and `[diagnostics]` tables are exposed as `limitsTestCpuQuota`,
 `diagnosticsRingSize`. The signed `test_nice` and the reserved `crash_sink`
 are not exposed.
 
+The `[disk]` scalar keys are exposed as `diskShowSizes`, `diskWarnThresholdGb`,
+`diskScanIntervalSecs`, `diskMaxScanPerRound`, `diskAutoCleanOnMerge`,
+`diskCleanOnPrClosed`, `diskIdleCleanDays`, `diskGenerationMinAgeDays`,
+`diskReclaimOnLowDisk` and `diskSccache`. The `sccache_dir` and
+`shared_target_dir` paths are not exposed.
+
 `keys list` covers the keymap registry **and** the zone-local tables — the
 sidebar's row keys and each panel section's row-mode keys. Those are handled
 by the focused zone rather than the registry, so they are not rebindable, but
