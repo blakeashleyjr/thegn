@@ -2,31 +2,13 @@
 # Seeded from the Builder sites at 9d160e2b5 (THE-931); every entry is debt: route the thread through spawn_named/try_spawn_named and delete the line.
 # SHRINK-ONLY. Enforced by `thread_builders_go_through_spawn_named_ratchet` in crates/thegn-host/src/platform_ratchet_tests.rs; regenerate with `just ratchet-update`.
 
-automation_runtime.rs
-db_task.rs
-devcontainer_startup.rs
-diff_watch.rs
-db_task.rs
-frame_writer.rs
 gate_capture.rs
-handlers/startup.rs
-hydrate_refresh_ticker.rs
 lsp.rs
 managed_tool.rs
 measure/mod.rs
-mise_provider.rs
-model_proxy_daemon.rs
-monitor.rs
-pane_pty.rs
-perf.rs
 platform/mod.rs
 plugins.rs
 proc_worker.rs
 run.rs
 sandbox_events.rs
-share.rs
-task.rs
-theme_store.rs
-voice.rs
-workspace_create.rs
 worktree_lifecycle.rs
