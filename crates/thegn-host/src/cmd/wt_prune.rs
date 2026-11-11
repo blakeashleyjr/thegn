@@ -244,7 +244,7 @@ mod tests {
         assert!(
             util::git_ok(
                 dir,
-                &["-c", "commit.gpgsign=false"]
+                ["-c", "commit.gpgsign=false"]
                     .iter()
                     .chain(args)
                     .copied()
@@ -279,6 +279,11 @@ mod tests {
                 "tg/merged",
                 wt.to_str().unwrap(),
             ],
+        );
+        git(&wt, &["commit", "--allow-empty", "-q", "-m", "work"]);
+        git(
+            main.path(),
+            &["merge", "--no-ff", "-q", "-m", "merge", "tg/merged"],
         );
         let f = facts_for(wt.to_str().unwrap(), "tg/merged", "main", main.path());
         assert!(f.ancestor_of_target && f.tree_clean && !f.is_primary && !f.is_target_branch);
@@ -343,15 +348,13 @@ mod tests {
         wt
     }
 
-    fn one(
-        main: &Path,
-        wt: &Path,
-        name: &str,
-    ) -> (
+    type OneResult = (
         Vec<(String, PruneDecision)>,
         HashMap<String, Option<String>>,
         String,
-    ) {
+    );
+
+    fn one(main: &Path, wt: &Path, name: &str) -> OneResult {
         let path = wt.to_str().unwrap().to_string();
         let branch = format!("tg/{name}");
         let f = facts_for(&path, &branch, "main", main);
