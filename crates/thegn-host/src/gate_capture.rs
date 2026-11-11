@@ -93,33 +93,31 @@ fn spawn_reader<R: crate::platform::GatePipe + Send + 'static>(
 ) -> io::Result<Reader> {
     crate::platform::gate_pipe_nonblocking(&pipe)?;
     let (tx, rx) = mpsc::channel();
-    let join = std::thread::Builder::new()
-        .name(name.into())
-        .spawn(move || {
-            crate::platform::qos::set_self(crate::platform::qos::Qos::Background);
-            let mut tail = ByteTail::default();
-            let mut bytes = [0; READ_BYTES];
-            let result = loop {
-                if stop.load(Ordering::Acquire) {
-                    break Ok(());
-                }
-                match crate::platform::gate_pipe_read(&mut pipe, &mut bytes) {
-                    Ok(0) => break Ok(()),
-                    Ok(n) => tail.push(&bytes[..n]),
-                    Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
-                    Err(error) if error.kind() == io::ErrorKind::BrokenPipe => break Ok(()),
-                    Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
-                        if stop.load(Ordering::Acquire) {
-                            break Ok(());
-                        }
-                        std::thread::sleep(POLL);
+    let join = thegn_core::thread_name::try_spawn_named(name, move || {
+        crate::platform::qos::set_self(crate::platform::qos::Qos::Background);
+        let mut tail = ByteTail::default();
+        let mut bytes = [0; READ_BYTES];
+        let result = loop {
+            if stop.load(Ordering::Acquire) {
+                break Ok(());
+            }
+            match crate::platform::gate_pipe_read(&mut pipe, &mut bytes) {
+                Ok(0) => break Ok(()),
+                Ok(n) => tail.push(&bytes[..n]),
+                Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+                Err(error) if error.kind() == io::ErrorKind::BrokenPipe => break Ok(()),
+                Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                    if stop.load(Ordering::Acquire) {
+                        break Ok(());
                     }
-                    Err(error) => break Err(error),
+                    std::thread::sleep(POLL);
                 }
-            };
-            let value = result.map(|()| tail.result());
-            if tx.send(value).is_err() { /* receiver left after a bounded stop */ }
-        })?;
+                Err(error) => break Err(error),
+            }
+        };
+        let value = result.map(|()| tail.result());
+        if tx.send(value).is_err() { /* receiver left after a bounded stop */ }
+    })?;
     Ok(Reader { receiver: rx, join })
 }
 
@@ -286,11 +284,11 @@ pub(super) fn run(mut command: Command, timeout: Duration) -> CaptureResult {
     let stop = Arc::new(AtomicBool::new(false));
     let out = child.stdout.take().expect("stdout was piped");
     let err = child.stderr.take().expect("stderr was piped");
-    let out_rx = match spawn_reader("thegn-gate-stdout", out, Arc::clone(&stop)) {
+    let out_rx = match spawn_reader("thegn-gate-out", out, Arc::clone(&stop)) {
         Ok(rx) => rx,
         Err(error) => return terminate_after_reader_failure(child, group, stop, None, error),
     };
-    let err_rx = match spawn_reader("thegn-gate-stderr", err, Arc::clone(&stop)) {
+    let err_rx = match spawn_reader("thegn-gate-err", err, Arc::clone(&stop)) {
         Ok(rx) => rx,
         Err(error) => {
             return terminate_after_reader_failure(child, group, stop, Some(out_rx), error);
@@ -524,9 +522,7 @@ fn queue_reaper(owner: ReapOwner) -> bool {
     REAPER_PENDING.fetch_add(1, Ordering::AcqRel);
     let sender = REAPER.get_or_init(|| {
         let (tx, rx) = mpsc::channel::<ReapOwner>();
-        std::thread::Builder::new()
-            .name("thegn-gate-reap".into())
-            .spawn(move || {
+        thegn_core::thread_name::try_spawn_named("thegn-gate-reap", move || {
                 crate::platform::qos::set_self(crate::platform::qos::Qos::Background);
                 while let Ok((mut child, group)) = rx.recv() {
                     #[expect(clippy::disallowed_methods, reason = "the dedicated off-loop gate reaper retains child ownership until the OS reports reap")]
@@ -816,7 +812,7 @@ mod tests {
         }
         let reader = FailingReader;
         let stop = Arc::new(AtomicBool::new(false));
-        let reader = spawn_reader("thegn-gate-reader-fixture", reader, stop).unwrap();
+        let reader = spawn_reader("thegn-gate-rdr", reader, stop).unwrap();
         assert!(reader.receiver.recv().unwrap().is_err());
         reader.join.join().unwrap();
     }

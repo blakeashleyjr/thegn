@@ -9,6 +9,7 @@ act's automatic container removal.
 from __future__ import annotations
 
 import os
+import re
 import subprocess
 import sys
 from pathlib import Path
@@ -25,6 +26,61 @@ def has_credentials(args: list[str]) -> bool:
 
 def has_reuse(args: list[str]) -> bool:
     return any(arg in {"--reuse", "-r", "--reuse=true"} for arg in args)
+
+
+_DIGEST = re.compile(r"@sha256:[0-9a-f]{64}$")
+
+
+def platform_mappings(tokens: list[str]) -> list[tuple[str, str]]:
+    """`label=image` pairs from `-P x=y`, `-Px=y`, `--platform x=y`, `--platform=x=y` (token list order)."""
+    out: list[tuple[str, str]] = []
+    i = 0
+    while i < len(tokens):
+        tok = tokens[i]
+        value: str | None = None
+        if tok in {"-P", "--platform"}:
+            value = tokens[i + 1] if i + 1 < len(tokens) else ""
+            i += 1
+        elif tok.startswith("--platform="):
+            value = tok[len("--platform="):]
+        elif tok.startswith("-P") and len(tok) > 2:
+            value = tok[2:]
+        if value is not None:
+            label, _, image = value.partition("=")
+            out.append((label, image))
+        i += 1
+    return out
+
+
+def actrc_tokens(actrc: str) -> list[str]:
+    """Whitespace-split tokens of every non-blank, non-comment .actrc line."""
+    tokens: list[str] = []
+    for line in actrc.splitlines():
+        stripped = line.strip()
+        if stripped and not stripped.startswith("#"):
+            tokens.extend(stripped.split())
+    return tokens
+
+
+def image_refusal(actrc: str | None, args: list[str]) -> str | None:
+    """A refusal message when the effective runner image is not digest-pinned or an override changes the pinned one."""
+    if actrc is None:
+        return "act: .actrc is missing; the runner image must be pinned by digest there"
+    pinned = dict(platform_mappings(actrc_tokens(actrc)))
+    if not pinned:
+        return "act: .actrc maps no runner image (-P label=image@sha256:...); not running"
+    for label, image in pinned.items():
+        if not _DIGEST.search(image):
+            return f"act: .actrc runner image for {label} is not pinned by digest: {image}"
+    for label, image in platform_mappings(args):
+        if not _DIGEST.search(image):
+            return f"act: the {label} runner image override is not pinned by digest: {image}"
+        if label in pinned and pinned[label] != image:
+            return (
+                f"act: the {label} runner image override differs from the pin in .actrc "
+                f"({pinned[label]}); change .actrc in a reviewed commit instead"
+            )
+    return None
 
 
 def plan(
@@ -192,6 +248,84 @@ def self_test() -> int:
     argv, _ = plan("push", ["-j", "lint"], None, None)
     cases.append(("job-flag-passthrough", argv == ["act", "push", "-j", "lint", "--rm"]))
 
+    good = "-P ubuntu-latest=img/x:t@sha256:" + "a" * 64 + "\n"
+    cases.append(("image-pin-accepts-pinned-actrc", image_refusal(good, []) is None))
+    cases.append(
+        (
+            "image-pin-ignores-comments-and-blank-lines",
+            image_refusal("# c\n\n" + good, []) is None,
+        )
+    )
+    cases.append(
+        (
+            "image-pin-refuses-tag-only-actrc",
+            "not pinned by digest"
+            in (image_refusal("-P ubuntu-latest=img/x:latest\n", []) or ""),
+        )
+    )
+    cases.append(
+        (
+            "image-pin-refuses-truncated-digest",
+            "not pinned by digest"
+            in (
+                image_refusal(
+                    "-P ubuntu-latest=img/x:t@sha256:" + "a" * 63 + "\n", []
+                )
+                or ""
+            ),
+        )
+    )
+    cases.append(
+        (
+            "image-pin-refuses-missing-or-empty-actrc",
+            "missing" in (image_refusal(None, []) or "")
+            and "maps no runner image"
+            in (image_refusal("--container-architecture linux/amd64\n", []) or ""),
+        )
+    )
+    override_forms = [
+        ["-P", "ubuntu-latest=img/x:latest"],
+        ["-Pubuntu-latest=img/x:latest"],
+        ["--platform", "ubuntu-latest=img/x:latest"],
+        ["--platform=ubuntu-latest=img/x:latest"],
+    ]
+    cases.append(
+        (
+            "image-pin-refuses-tag-override-in-all-forms",
+            all(
+                "override is not pinned by digest" in (image_refusal(good, form) or "")
+                for form in override_forms
+            ),
+        )
+    )
+    cases.append(
+        (
+            "image-pin-refuses-a-different-digest-for-a-pinned-label",
+            "differs from the pin"
+            in (
+                image_refusal(
+                    good, ["-P", "ubuntu-latest=img/y:t@sha256:" + "b" * 64]
+                )
+                or ""
+            ),
+        )
+    )
+    cases.append(
+        (
+            "image-pin-allows-the-identical-override-and-a-new-pinned-label",
+            image_refusal(good, ["-P", "ubuntu-latest=img/x:t@sha256:" + "a" * 64])
+            is None
+            and image_refusal(good, ["-P", "ubuntu-22.04=img/z:t@sha256:" + "c" * 64])
+            is None,
+        )
+    )
+    cases.append(
+        (
+            "image-pin-ignores-non-platform-flags",
+            image_refusal(good, ["-j", "lint", "--rm", "-W", "x"]) is None,
+        )
+    )
+
     for label, passed in cases:
         if not check(label, passed):
             return 1
@@ -207,6 +341,14 @@ def main(argv: list[str]) -> int:
         return 2
 
     event, *args = argv
+    try:
+        actrc_text: str | None = (ROOT / ".actrc").read_text()
+    except OSError:
+        actrc_text = None
+    refusal = image_refusal(actrc_text, args)
+    if refusal:
+        print(refusal, file=sys.stderr)
+        return 1
     implicit_secrets = (ROOT / ".secrets").exists()
     if has_credentials(args) or implicit_secrets:
         dirty = dirty_paths()

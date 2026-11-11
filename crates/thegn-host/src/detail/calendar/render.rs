@@ -338,6 +338,17 @@ fn agenda_note(st: &CalState, n: usize) -> String {
         1 => "1 event".into(),
         n => format!("{n} events"),
     };
+    let window = agenda_window(st);
+    let count = if n > 1 && window.len() < n {
+        format!(
+            "{count} {} {}-{} shown",
+            crate::caps::active_glyphs().middot,
+            window.start + 1,
+            window.end
+        )
+    } else {
+        count
+    };
     match error {
         None => count,
         Some(e) => format!(

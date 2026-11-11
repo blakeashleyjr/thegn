@@ -62,7 +62,7 @@ impl Lane {
         let Some(handle) = self.slot.get_or_init(|| {
             let (tx, rx) = mpsc::sync_channel::<Job>(1);
             let name = self.name;
-            let thread = match std::thread::Builder::new().name(name.to_owned()).spawn(move || {
+            let thread = match thegn_core::thread_name::try_spawn_named(name, move || {
                 crate::platform::qos::set_self(crate::platform::qos::Qos::Background);
                 while let Ok(job) = rx.recv() {
                     if catch_unwind(AssertUnwindSafe(job)).is_err() {

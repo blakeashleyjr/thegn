@@ -174,6 +174,15 @@
           monitorProcRows = 15;
           monitorProcesses = true;
           monitorProcessIo = true;
+          limitsTestCpuQuota = "200%";
+          limitsTestMemMax = "2G";
+          limitsTestMaxParallel = 2;
+          limitsTestTimeoutSecs = 900;
+          limitsDiscoverTimeoutSecs = 30;
+          limitsIsolatedTargetDir = false;
+          diagnosticsCrashReports = true;
+          diagnosticsCrashRetention = 5;
+          diagnosticsRingSize = 128;
           agents = [
             {
               name = "shell";

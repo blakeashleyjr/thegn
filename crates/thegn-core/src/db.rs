@@ -1265,8 +1265,8 @@ pub use crate::db_dispatch::ResumeDispatchConflict;
 pub use crate::db_dispatch::{DispatchNoteQuotaExceeded, NoteQuotaKind};
 pub use crate::db_dispatch::{DispatchOverride, FORCE_REASON_MAX_CHARS};
 pub use crate::db_dispatch::{
-    DispatchTransitionConflict, LeadLeaseConflict, LeadProof, MissingDispatch,
-    set_status_transition_allowed,
+    DispatchTransitionConflict, DoneEvidenceChanged, DoneFence, LeadLeaseConflict, LeadProof,
+    MissingDispatch, set_status_transition_allowed,
 };
 pub use crate::db_dispatch::{
     LeaseInputError, MAX_LEASE_TTL_SECS, MIN_LEASE_TTL_SECS, ParentDispatchConflict,

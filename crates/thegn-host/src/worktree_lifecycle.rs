@@ -590,75 +590,69 @@ fn spawn_event_with_completion(
     waker: Option<termwiz::terminal::TerminalWaker>,
     completion: Option<SessionEndGuard>,
 ) -> std::io::Result<()> {
-    std::thread::Builder::new()
-        .name(hook_thread_name(event).to_owned())
-        .spawn(move || {
-            // Holding this guard for the entire worker makes destructive
-            // teardown wait for all hook/report/waker work. It also releases
-            // the in-flight claim if the worker unwinds.
-            let _completion = completion;
-            crate::platform::qos::set_self(crate::platform::qos::Qos::Utility);
-            let resolved_root = if matches!(event, HookEvent::SessionStart | HookEvent::SessionEnd)
-            {
-                thegn_core::repo::main_worktree(&worktree).unwrap_or(repo_root)
-            } else {
-                repo_root
-            };
-            let db = Db::open().ok();
-            let policy = resolve(&cfg, &resolved_root, db.as_ref());
-            let specs = policy.entries(event).to_vec();
-            if !policy.pending.is_empty() {
-                thegn_core::msg::warn(&format!(
-                    "{} repo lifecycle hook request(s) await trust approval",
-                    policy.pending.len()
-                ));
-            }
-            let actual_branch = if branch.is_empty() {
-                thegn_core::util::git_out(
-                    &worktree,
-                    &["symbolic-ref", "--quiet", "--short", "HEAD"],
-                )
+    thegn_core::thread_name::try_spawn_named(hook_thread_name(event), move || {
+        // Holding this guard for the entire worker makes destructive
+        // teardown wait for all hook/report/waker work. It also releases
+        // the in-flight claim if the worker unwinds.
+        let _completion = completion;
+        crate::platform::qos::set_self(crate::platform::qos::Qos::Utility);
+        let resolved_root = if matches!(event, HookEvent::SessionStart | HookEvent::SessionEnd) {
+            thegn_core::repo::main_worktree(&worktree).unwrap_or(repo_root)
+        } else {
+            repo_root
+        };
+        let db = Db::open().ok();
+        let policy = resolve(&cfg, &resolved_root, db.as_ref());
+        let specs = policy.entries(event).to_vec();
+        if !policy.pending.is_empty() {
+            thegn_core::msg::warn(&format!(
+                "{} repo lifecycle hook request(s) await trust approval",
+                policy.pending.len()
+            ));
+        }
+        let actual_branch = if branch.is_empty() {
+            thegn_core::util::git_out(&worktree, &["symbolic-ref", "--quiet", "--short", "HEAD"])
                 .unwrap_or_default()
-            } else {
-                branch
-            };
-            let actual_workspace = if workspace.is_empty() {
-                thegn_core::repo::repo_slug(&resolved_root)
-            } else {
-                workspace
-            };
-            if !specs.is_empty() {
-                let context = context(
-                    event,
-                    &resolved_root,
-                    &worktree,
-                    &actual_branch,
-                    &actual_workspace,
-                );
-                let cwd = cwd(event, &resolved_root, &worktree);
-                let results = crate::hook_run::run_all(&specs, &context, &cwd, mode);
-                for result in &results {
-                    if !result.succeeded() {
-                        thegn_core::msg::warn(&format!("{}: {}", event.as_str(), result.summary()));
-                        report_failure(&context, result);
-                    } else if result.log_error.is_some() {
-                        report_log_failure(&context, result);
-                    }
+        } else {
+            branch
+        };
+        let actual_workspace = if workspace.is_empty() {
+            thegn_core::repo::repo_slug(&resolved_root)
+        } else {
+            workspace
+        };
+        if !specs.is_empty() {
+            let context = context(
+                event,
+                &resolved_root,
+                &worktree,
+                &actual_branch,
+                &actual_workspace,
+            );
+            let cwd = cwd(event, &resolved_root, &worktree);
+            let results = crate::hook_run::run_all(&specs, &context, &cwd, mode);
+            for result in &results {
+                if !result.succeeded() {
+                    thegn_core::msg::warn(&format!("{}: {}", event.as_str(), result.summary()));
+                    report_failure(&context, result);
+                } else if result.log_error.is_some() {
+                    report_log_failure(&context, result);
                 }
             }
-            // Hook completion is a model change even when no lifecycle
-            // transaction completion is queued. Keep the compositor's
-            // existing refresh funnel in sync with the completion pulse.
-            if let Some(tx) = REFRESH_TX.get() {
-                let _ = tx.send(crate::hydrate::RefreshKind::Model);
-            }
-            if let Some(waker) = waker {
-                let _ = waker.wake();
-            }
-        })
-        // Dropping a JoinHandle detaches the worker. Errors remain owned by the
-        // caller instead of being mistaken for a successfully scheduled event.
-        .map(drop)
+        }
+        // Hook completion is a model change even when no lifecycle
+        // transaction completion is queued. Keep the compositor's
+        // existing refresh funnel in sync with the completion pulse.
+        if let Some(tx) = REFRESH_TX.get() {
+            let _ = tx.send(crate::hydrate::RefreshKind::Model);
+        }
+        if let Some(waker) = waker {
+            let _ = waker.wake();
+        }
+    })
+    // Dropping a JoinHandle detaches the worker. Errors remain owned by the
+    // caller instead of being mistaken for a successfully scheduled event.
+    .map(drop)
 }
 
 /// Run one user/unattended destroy transaction off-loop and report its result.
@@ -673,55 +667,53 @@ pub fn spawn_worktree_destroy(
     waker: Option<termwiz::terminal::TerminalWaker>,
 ) -> std::io::Result<()> {
     let claimed_path = worktree.clone();
-    let spawned = std::thread::Builder::new()
-        .name("thegn-wt-dstroy".into())
-        .spawn(move || {
-            crate::platform::qos::set_self(crate::platform::qos::Qos::Utility);
-            let cfg = crate::config_startup::cleanup_config();
-            let db = Db::open().ok();
-            let (success, message) = thegn_core::repo::main_worktree(&worktree)
-                .map(|repo_root| {
-                    let branch = thegn_core::util::git_out(
-                        &worktree,
-                        &["symbolic-ref", "--quiet", "--short", "HEAD"],
-                    )
-                    .unwrap_or_default();
-                    let workspace = thegn_core::repo::repo_slug(&repo_root);
-                    destroy_one(
-                        &cfg,
-                        &repo_root,
-                        &worktree,
-                        &branch,
-                        &workspace,
-                        keep_files,
-                        false,
-                        mode,
-                        db.as_ref(),
-                    )
-                })
-                .unwrap_or_else(|| {
-                    (
-                        false,
-                        format!("could not resolve repository for {}", worktree.display()),
-                    )
-                });
-            if success && let Some(db) = db.as_ref() {
-                crate::handlers::workspace_remove::forget_worktree_path_in_db(
-                    db,
-                    &session_id,
-                    &worktree.to_string_lossy(),
-                );
-            }
-            complete(
-                LifecycleCompletion::WorktreeDelete {
-                    group_name,
-                    path: worktree.to_string_lossy().into_owned(),
-                    success,
-                    message,
-                },
-                waker,
+    let spawned = thegn_core::thread_name::try_spawn_named("thegn-wt-dstroy", move || {
+        crate::platform::qos::set_self(crate::platform::qos::Qos::Utility);
+        let cfg = crate::config_startup::cleanup_config();
+        let db = Db::open().ok();
+        let (success, message) = thegn_core::repo::main_worktree(&worktree)
+            .map(|repo_root| {
+                let branch = thegn_core::util::git_out(
+                    &worktree,
+                    &["symbolic-ref", "--quiet", "--short", "HEAD"],
+                )
+                .unwrap_or_default();
+                let workspace = thegn_core::repo::repo_slug(&repo_root);
+                destroy_one(
+                    &cfg,
+                    &repo_root,
+                    &worktree,
+                    &branch,
+                    &workspace,
+                    keep_files,
+                    false,
+                    mode,
+                    db.as_ref(),
+                )
+            })
+            .unwrap_or_else(|| {
+                (
+                    false,
+                    format!("could not resolve repository for {}", worktree.display()),
+                )
+            });
+        if success && let Some(db) = db.as_ref() {
+            crate::handlers::workspace_remove::forget_worktree_path_in_db(
+                db,
+                &session_id,
+                &worktree.to_string_lossy(),
             );
-        });
+        }
+        complete(
+            LifecycleCompletion::WorktreeDelete {
+                group_name,
+                path: worktree.to_string_lossy().into_owned(),
+                success,
+                message,
+            },
+            waker,
+        );
+    });
     release_destroy_claim_on_spawn_failure(&claimed_path, spawned.map(drop))
 }
 
@@ -736,87 +728,85 @@ pub fn spawn_workspace_destroy(
     waker: Option<termwiz::terminal::TerminalWaker>,
 ) -> std::io::Result<()> {
     let runtime_handle = tokio::runtime::Handle::try_current().ok();
-    std::thread::Builder::new()
-        .name("thegn-ws-dstroy".into())
-        .spawn(move || {
-            crate::platform::qos::set_self(crate::platform::qos::Qos::Utility);
-            let db = Db::open();
-            let registry_paths = match db.as_ref() {
-                Ok(db) => crate::handlers::workspace_remove::workspace_worktree_dirs(
-                    db,
-                    &repo_root.to_string_lossy(),
-                ),
-                Err(error) => Err(format!("worktree registry unavailable: {error}")),
-            };
-            let (mut candidates, mut failed_paths) =
-                workspace_destroy_candidates(paths, registry_paths);
-            let db = db.ok();
-            candidates.sort();
-            candidates.dedup();
-            let (paths, claim_failures) = claim_destroy_candidates(candidates);
-            failed_paths.extend(claim_failures);
-            for path in paths {
-                let branch = thegn_core::util::git_out(
-                    Path::new(&path),
-                    &["symbolic-ref", "--quiet", "--short", "HEAD"],
-                )
-                .unwrap_or_default();
-                let (success, message) = destroy_one(
-                    &cfg,
-                    &repo_root,
-                    Path::new(&path),
-                    &branch,
-                    &slug,
-                    false,
-                    false,
-                    HookExecutionMode::Force,
-                    db.as_ref(),
-                );
-                if !success {
-                    failed_paths.push(format!("{path}: {message}"));
-                } else if let Some(db) = db.as_ref() {
-                    crate::handlers::workspace_remove::forget_worktree_path_in_db(
-                        db,
-                        &session_id,
-                        &path,
-                    );
-                }
-                complete(
-                    LifecycleCompletion::WorkspaceDelete {
-                        repo_path: repo_root.to_string_lossy().into_owned(),
-                        slug: slug.clone(),
-                        path,
-                        success,
-                        message,
-                    },
-                    waker.clone(),
-                );
-            }
-            if failed_paths.is_empty()
-                && let Some(db) = db.as_ref()
-            {
-                let orphaned_sids = crate::handlers::workspace_remove::forget_workspace_in_db(
+    thegn_core::thread_name::try_spawn_named("thegn-ws-dstroy", move || {
+        crate::platform::qos::set_self(crate::platform::qos::Qos::Utility);
+        let db = Db::open();
+        let registry_paths = match db.as_ref() {
+            Ok(db) => crate::handlers::workspace_remove::workspace_worktree_dirs(
+                db,
+                &repo_root.to_string_lossy(),
+            ),
+            Err(error) => Err(format!("worktree registry unavailable: {error}")),
+        };
+        let (mut candidates, mut failed_paths) =
+            workspace_destroy_candidates(paths, registry_paths);
+        let db = db.ok();
+        candidates.sort();
+        candidates.dedup();
+        let (paths, claim_failures) = claim_destroy_candidates(candidates);
+        failed_paths.extend(claim_failures);
+        for path in paths {
+            let branch = thegn_core::util::git_out(
+                Path::new(&path),
+                &["symbolic-ref", "--quiet", "--short", "HEAD"],
+            )
+            .unwrap_or_default();
+            let (success, message) = destroy_one(
+                &cfg,
+                &repo_root,
+                Path::new(&path),
+                &branch,
+                &slug,
+                false,
+                false,
+                HookExecutionMode::Force,
+                db.as_ref(),
+            );
+            if !success {
+                failed_paths.push(format!("{path}: {message}"));
+            } else if let Some(db) = db.as_ref() {
+                crate::handlers::workspace_remove::forget_worktree_path_in_db(
                     db,
                     &session_id,
-                    &repo_root.to_string_lossy(),
-                    &slug,
-                );
-                crate::handlers::daemon_lifecycle::kill_orphaned_daemon_sessions_on(
-                    runtime_handle,
-                    cfg.daemon.clone(),
-                    orphaned_sids,
+                    &path,
                 );
             }
             complete(
-                LifecycleCompletion::WorkspaceDeleteFinished {
+                LifecycleCompletion::WorkspaceDelete {
                     repo_path: repo_root.to_string_lossy().into_owned(),
-                    slug,
-                    failed_paths,
+                    slug: slug.clone(),
+                    path,
+                    success,
+                    message,
                 },
-                waker,
+                waker.clone(),
             );
-        })
-        .map(drop)
+        }
+        if failed_paths.is_empty()
+            && let Some(db) = db.as_ref()
+        {
+            let orphaned_sids = crate::handlers::workspace_remove::forget_workspace_in_db(
+                db,
+                &session_id,
+                &repo_root.to_string_lossy(),
+                &slug,
+            );
+            crate::handlers::daemon_lifecycle::kill_orphaned_daemon_sessions_on(
+                runtime_handle,
+                cfg.daemon.clone(),
+                orphaned_sids,
+            );
+        }
+        complete(
+            LifecycleCompletion::WorkspaceDeleteFinished {
+                repo_path: repo_root.to_string_lossy().into_owned(),
+                slug,
+                failed_paths,
+            },
+            waker,
+        );
+    })
+    .map(drop)
 }
 
 fn release_destroy_claim_on_spawn_failure(

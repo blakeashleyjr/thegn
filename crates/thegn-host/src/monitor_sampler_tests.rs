@@ -7,7 +7,7 @@ use std::{
         atomic::{AtomicUsize, Ordering},
     },
     thread::JoinHandle,
-    time::Instant,
+    time::{Duration, Instant},
 };
 use thegn_metrics::collect::{
     self, Collector, CollectorId, CollectorSet, TickCtx,
@@ -113,7 +113,10 @@ impl Collector for FakeCollector {
             .push(ctx.tick);
         self.samples.fetch_add(1, Ordering::SeqCst);
         if let Some(drain_gate) = &self.drain_gate {
-            while drain_gate.load(Ordering::SeqCst) as u64 <= ctx.tick {
+            let started = Instant::now();
+            while drain_gate.load(Ordering::SeqCst) as u64 <= ctx.tick
+                && started.elapsed() < WAIT_DEADLINE
+            {
                 std::thread::yield_now();
             }
         }
@@ -260,27 +263,45 @@ fn demand() -> Demand {
     }
 }
 
+/// Wall-clock bound for every wait in this file: a fixed iteration count is
+/// not a time bound and starves the worker thread under load.
+const WAIT_DEADLINE: Duration = Duration::from_secs(10);
+
+/// Poll `step` until it returns `Some`, or panic naming `what` after
+/// `WAIT_DEADLINE`. Test-only, so the 0%-idle rule does not apply.
+fn poll_for<T>(what: &str, mut step: impl FnMut() -> Option<T>) -> T {
+    let started = Instant::now();
+    loop {
+        if let Some(value) = step() {
+            return value;
+        }
+        assert!(
+            started.elapsed() < WAIT_DEADLINE,
+            "timed out after {WAIT_DEADLINE:?} waiting for {what}"
+        );
+        std::thread::sleep(Duration::from_millis(1));
+    }
+}
+
 fn wait_phase(harness: &Harness, expected: Phase) {
-    for _ in 0..100_000 {
-        if harness.sampler.shared.lock().phase == expected {
+    let started = Instant::now();
+    loop {
+        let last = harness.sampler.shared.lock().phase;
+        if last == expected {
             return;
         }
-        std::thread::yield_now();
+        assert!(
+            started.elapsed() < WAIT_DEADLINE,
+            "timed out after {WAIT_DEADLINE:?} waiting for phase {expected:?}; last observed {last:?}"
+        );
+        std::thread::sleep(Duration::from_millis(1));
     }
-    assert_eq!(harness.sampler.shared.lock().phase, expected);
 }
 
 fn wait_until(mut condition: impl FnMut() -> bool) {
-    for _ in 0..100_000 {
-        if condition() {
-            return;
-        }
-        std::thread::yield_now();
-    }
-    assert!(
-        condition(),
-        "condition did not become true before the bounded wait ended"
-    );
+    poll_for("condition to become true within the 10 s deadline", || {
+        condition().then_some(())
+    });
 }
 
 #[test]
@@ -360,18 +381,15 @@ fn sample_errors_set_failing_health_and_mode_helpers_are_pure() {
     let mut h = harness(false, true);
     h.sampler.sync(Mode::Open, demand());
     wait_until(|| h.samples.load(Ordering::SeqCst) > 0);
-    let mut sampled_frame = None;
-    for _ in 0..100_000 {
-        if let Some(frame) = h.sampler.take_latest() {
-            if frame.sampled.contains(CollectorId::Loadavg) {
-                sampled_frame = Some(frame);
-                break;
-            }
+    let frame = poll_for("a sampled Loadavg frame", || {
+        let frame = h.sampler.take_latest()?;
+        if frame.sampled.contains(CollectorId::Loadavg) {
+            Some(frame)
+        } else {
             h.sampler.recycle(frame);
+            None
         }
-        std::thread::yield_now();
-    }
-    let frame = sampled_frame.expect("a sampled Loadavg frame should be published");
+    });
     assert!(matches!(
         frame.health[CollectorId::Loadavg.index()],
         Health::Failing { .. }
@@ -411,18 +429,15 @@ fn frame_publication_is_latest_wins_and_wakes_only_on_empty_to_full() {
     });
     assert_eq!(h.wakes.load(Ordering::SeqCst), 2);
     for _ in 0..20 {
-        let mut newest = None;
-        for _ in 0..100_000 {
-            if let Some(frame) = h.sampler.take_latest() {
-                if frame.seq > last_seq {
-                    newest = Some(frame);
-                    break;
-                }
+        let frame = poll_for("another published frame", || {
+            let frame = h.sampler.take_latest()?;
+            if frame.seq > last_seq {
+                Some(frame)
+            } else {
                 h.sampler.recycle(frame);
+                None
             }
-            std::thread::yield_now();
-        }
-        let frame = newest.expect("worker should publish another frame");
+        });
         last_seq = frame.seq;
         addresses.insert((&*frame as *const MonitorFrame) as usize);
         h.sampler.recycle(frame);
@@ -494,17 +509,10 @@ fn draining_consumer_gets_one_wake_per_publication() {
     let mut h = harness_with_gate(false, false, Some(Arc::clone(&drain_gate)), false, false);
     h.sampler.sync(Mode::Open, demand());
     for expected_seq in 0..=10 {
-        let frame = {
-            let mut received = None;
-            for _ in 0..100_000 {
-                if let Some(frame) = h.sampler.take_latest() {
-                    received = Some(frame);
-                    break;
-                }
-                std::thread::yield_now();
-            }
-            received.expect("worker should publish each frame after the prior frame is drained")
-        };
+        let frame = poll_for(
+            "a published frame after the prior frame was drained",
+            || h.sampler.take_latest(),
+        );
         assert_eq!(frame.seq, expected_seq);
         h.sampler.recycle(frame);
         wait_until(|| h.wakes.load(Ordering::SeqCst) == expected_seq as usize + 1);
@@ -557,19 +565,13 @@ fn external_writes_are_latest_wins_while_parked() {
     poster.post_external(CollectorId::Loadavg, Health::Warming, |_parts| {});
     poster.post_external(CollectorId::Loadavg, Health::Ok, |_parts| {});
     h.sampler.sync(Mode::Open, demand());
-    let mut applied = false;
-    for _ in 0..100_000 {
-        if let Some(frame) = h.sampler.take_latest() {
-            applied |= frame.sampled.contains(CollectorId::Loadavg)
-                && frame.health[CollectorId::Loadavg.index()] == Health::Ok;
-            h.sampler.recycle(frame);
-            if applied {
-                break;
-            }
-        }
-        std::thread::yield_now();
-    }
-    assert!(applied);
+    poll_for("the external Loadavg write to be applied", || {
+        let frame = h.sampler.take_latest()?;
+        let applied = frame.sampled.contains(CollectorId::Loadavg)
+            && frame.health[CollectorId::Loadavg.index()] == Health::Ok;
+        h.sampler.recycle(frame);
+        applied.then_some(())
+    });
 }
 
 #[test]
@@ -592,20 +594,17 @@ fn external_health_overlay_survives_registry_health_refresh() {
     let poster = h.sampler.poster().unwrap();
     poster.post_external(CollectorId::Uptime, Health::Ok, |_parts| {});
     h.sampler.sync(Mode::Open, demand());
-    let mut registry_frame = None;
-    for _ in 0..100_000 {
-        if let Some(frame) = h.sampler.take_latest() {
-            if frame.sampled.contains(CollectorId::Loadavg)
-                && !frame.sampled.contains(CollectorId::Uptime)
-            {
-                registry_frame = Some(frame);
-                break;
-            }
+    let frame = poll_for("a registry-sampled Loadavg frame", || {
+        let frame = h.sampler.take_latest()?;
+        if frame.sampled.contains(CollectorId::Loadavg)
+            && !frame.sampled.contains(CollectorId::Uptime)
+        {
+            Some(frame)
+        } else {
             h.sampler.recycle(frame);
+            None
         }
-        std::thread::yield_now();
-    }
-    let frame = registry_frame.expect("registry-sampled Loadavg frame should be published");
+    });
     assert_eq!(frame.health[CollectorId::Uptime.index()], Health::Ok);
     h.sampler.recycle(frame);
 }
@@ -614,23 +613,20 @@ fn external_health_overlay_survives_registry_health_refresh() {
 fn failed_sampler_tick_preserves_the_last_published_part_value() {
     let mut h = harness_with_options(false, true, None, false, false, true);
     h.sampler.sync(Mode::Open, demand());
-    let mut failed_frame = None;
-    for _ in 0..100_000 {
-        if let Some(frame) = h.sampler.take_latest() {
-            if frame.sampled.contains(CollectorId::Loadavg)
-                && matches!(
-                    frame.health[CollectorId::Loadavg.index()],
-                    Health::Failing { .. }
-                )
-            {
-                failed_frame = Some(frame);
-                break;
-            }
+    let frame = poll_for("a failed Loadavg tick to be published", || {
+        let frame = h.sampler.take_latest()?;
+        if frame.sampled.contains(CollectorId::Loadavg)
+            && matches!(
+                frame.health[CollectorId::Loadavg.index()],
+                Health::Failing { .. }
+            )
+        {
+            Some(frame)
+        } else {
             h.sampler.recycle(frame);
+            None
         }
-        std::thread::yield_now();
-    }
-    let frame = failed_frame.expect("failed Loadavg tick should be published");
+    });
     assert_eq!(frame.parts.loadavg.value.as_ref().unwrap().load1, 100);
     assert!(matches!(
         frame.health[CollectorId::Loadavg.index()],
@@ -661,17 +657,11 @@ fn external_write_waits_while_paused_and_is_applied_after_resume() {
     let poster = h.sampler.poster().unwrap();
     poster.post_external(CollectorId::Loadavg, Health::Ok, |_parts| {});
     h.sampler.sync(Mode::Open, demand());
-    let mut applied = false;
-    for _ in 0..100_000 {
-        if let Some(frame) = h.sampler.take_latest() {
-            applied |= frame.sampled.contains(CollectorId::Loadavg)
-                && frame.health[CollectorId::Loadavg.index()] == Health::Ok;
-            h.sampler.recycle(frame);
-            if applied {
-                break;
-            }
-        }
-        std::thread::yield_now();
-    }
-    assert!(applied);
+    poll_for("the external Loadavg write to be applied", || {
+        let frame = h.sampler.take_latest()?;
+        let applied = frame.sampled.contains(CollectorId::Loadavg)
+            && frame.health[CollectorId::Loadavg.index()] == Health::Ok;
+        h.sampler.recycle(frame);
+        applied.then_some(())
+    });
 }
