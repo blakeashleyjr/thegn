@@ -18,7 +18,8 @@ pub(crate) fn warn_if_private_tmp(cfg: &Config, worktree: &str, prompt: &str) {
     let Some((env_name, spec)) = resolve_spec(cfg, worktree) else {
         return;
     };
-    if !thegn_core::sandbox_tmp_hint::has_private_tmp(&spec) {
+    let paths = thegn_core::sandbox_tmp_hint::private_tmp_paths(&spec, &paths);
+    if paths.is_empty() {
         return;
     }
     for line in thegn_core::sandbox_tmp_hint::warning_lines(&env_name, &paths) {

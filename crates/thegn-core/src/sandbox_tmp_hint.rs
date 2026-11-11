@@ -22,7 +22,10 @@ pub fn tmp_paths_in(text: &str) -> Vec<String> {
         }
 
         let next = text[after_prefix..].chars().next();
-        if !matches!(next, Some('/')) && !is_token_end(next) {
+        if !matches!(next, Some('/'))
+            && !is_token_end(next)
+            && !next.is_some_and(is_trailing_punctuation)
+        {
             offset = after_prefix;
             continue;
         }
@@ -31,7 +34,8 @@ pub fn tmp_paths_in(text: &str) -> Vec<String> {
             .char_indices()
             .find(|(_, ch)| is_token_end(Some(*ch)))
             .map_or(text.len(), |(index, _)| after_prefix + index);
-        let path = text[start..end].trim_end_matches(['.', ':']);
+        let path =
+            text[start..end].trim_end_matches(['.', ',', ';', ':', ')', ']', '}', '\'', '"', '`']);
         if (path == "/tmp" || path.starts_with("/tmp/"))
             && !paths.iter().any(|existing| existing == path)
         {
@@ -46,12 +50,37 @@ fn is_token_end(ch: Option<char>) -> bool {
     ch.is_none_or(|ch| ch.is_whitespace() || matches!(ch, '\'' | '"' | '`' | ')' | ',' | ';'))
 }
 
+fn is_trailing_punctuation(ch: char) -> bool {
+    matches!(
+        ch,
+        '.' | ',' | ';' | ':' | ')' | ']' | '}' | '\'' | '"' | '`'
+    )
+}
+
 /// Whether the resolved sandbox gives the worker a private `/tmp`.
 pub fn has_private_tmp(spec: &SandboxSpec) -> bool {
     let family = spec.backend.profile().family;
     (family == BackendFamily::Bwrap
         && !matches!(spec.file_access, FileAccess::All | FileAccess::Host))
-        || (family == BackendFamily::Oci && spec.read_only_root)
+        || matches!(family, BackendFamily::Oci | BackendFamily::Systemd)
+}
+
+/// Keep only prompt paths whose `/tmp` contents are hidden by the sandbox.
+/// Explicit mounts at or above a path make that path host-visible.
+pub fn private_tmp_paths(spec: &SandboxSpec, paths: &[String]) -> Vec<String> {
+    if !has_private_tmp(spec) {
+        return Vec::new();
+    }
+    paths
+        .iter()
+        .filter(|path| {
+            !spec
+                .mounts
+                .iter()
+                .any(|mount| std::path::Path::new(path).starts_with(&mount.dest))
+        })
+        .cloned()
+        .collect()
 }
 
 /// Render the bounded warning lines for prompt paths hidden by a private `/tmp`.
@@ -84,7 +113,7 @@ mod tests {
 
     #[test]
     fn tmp_paths_in_finds_distinct_paths_and_strips_prompt_punctuation() {
-        let text = "write /tmp/first. '/tmp/second:' `/tmp/first` /tmp /tmpfoo /var/tmp/no; /tmp/third, and /tmp/second";
+        let text = "write /tmp/first. '/tmp/second:' `/tmp/first` /tmp. /tmp, /tmpfoo /var/tmp/no; [/tmp/third] and /tmp/second";
         assert_eq!(
             tmp_paths_in(text),
             vec!["/tmp/first", "/tmp/second", "/tmp", "/tmp/third"]
@@ -123,11 +152,36 @@ mod tests {
             FileAccess::All,
             true
         )));
-        assert!(!has_private_tmp(&spec(
+        assert!(has_private_tmp(&spec(
             Backend::Podman,
             FileAccess::All,
             false
         )));
+        assert!(has_private_tmp(&spec(
+            Backend::Systemd,
+            FileAccess::All,
+            false
+        )));
+    }
+
+    #[test]
+    fn private_tmp_paths_excludes_paths_covered_by_mounts() {
+        let mut sandbox = spec(Backend::Podman, FileAccess::All, false);
+        sandbox.mounts.push(Mount {
+            host: "/host/reports".into(),
+            dest: "/tmp/reports".into(),
+            ro: false,
+            cache: false,
+        });
+        let paths = vec![
+            "/tmp/reports/result.md".into(),
+            "/tmp/other/result.md".into(),
+            "/tmp/reports".into(),
+        ];
+        assert_eq!(
+            private_tmp_paths(&sandbox, &paths),
+            vec!["/tmp/other/result.md"]
+        );
     }
 
     #[test]
