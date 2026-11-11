@@ -482,3 +482,140 @@ fn a_failed_month_is_visible_without_the_agenda() {
         .join("\n");
     assert!(painted.contains("unavailable"), "{painted}");
 }
+
+fn busy_day(n: usize, rows: usize) -> CalState {
+    let date = NaiveDate::from_ymd_opt(2026, 9, 13).unwrap();
+    let events: Vec<Arc<CalEvent>> = (0..n)
+        .map(|i| {
+            let mut ev = CalEvent::new(
+                format!("id{i}"),
+                format!("Event {i}"),
+                EventTime::Date { date },
+                EventTime::Date {
+                    date: NaiveDate::from_ymd_opt(2026, 9, 14).unwrap(),
+                },
+            );
+            ev.url = format!("https://example.invalid/{i}");
+            Arc::new(ev)
+        })
+        .collect();
+    let mut st = status_state(BTreeMap::from([(date, events)]), true, None);
+    st.ui.agenda_rows = rows;
+    st.pane = CalPane::Agenda;
+    st
+}
+
+fn agenda_rows_of(st: &CalState) -> Vec<(String, crate::seg::Tok)> {
+    use crate::detail::{Cell, Section};
+    let sections = render::sections_of(st);
+    let Some(Section::Table(table)) = sections.get(3) else {
+        panic!("agenda table missing")
+    };
+    table
+        .rows
+        .iter()
+        .filter_map(|row| match row.get(1) {
+            Some(Cell::Text(label, tone)) => Some((label.clone(), *tone)),
+            _ => None,
+        })
+        .collect()
+}
+
+fn agenda_titles(st: &CalState) -> Vec<String> {
+    agenda_rows_of(st).into_iter().map(|(t, _)| t).collect()
+}
+
+fn focused_title(st: &CalState) -> Option<String> {
+    agenda_rows_of(st)
+        .into_iter()
+        .find(|(_, tone)| *tone == crate::seg::Tok::SelAccent)
+        .map(|(t, _)| t)
+}
+
+#[test]
+fn agenda_window_follows_the_selection_past_the_row_cap() {
+    let mut st = busy_day(8, 3);
+    for (sel, want) in [(0, 0..3), (2, 0..3), (3, 1..4), (7, 5..8)] {
+        st.agenda_sel = sel;
+        assert_eq!(render::agenda_window(&st), want, "sel {sel}");
+    }
+    st.pane = CalPane::Grid;
+    assert_eq!(render::agenda_window(&st), 0..3);
+    assert_eq!(render::agenda_window(&busy_day(0, 3)), 0..0);
+    // agenda_rows of 0 is treated as 1.
+    let mut one = busy_day(4, 0);
+    one.agenda_sel = 2;
+    assert_eq!(render::agenda_window(&one), 2..3);
+}
+
+#[test]
+fn agenda_table_draws_the_focused_event_past_the_cap() {
+    let mut st = busy_day(8, 3);
+    st.agenda_sel = 5;
+    assert_eq!(agenda_titles(&st), vec!["Event 3", "Event 4", "Event 5"]);
+    assert_eq!(focused_title(&st), Some("Event 5".to_string()));
+}
+
+#[test]
+fn down_key_walks_past_the_cap_with_a_visible_focus() {
+    use termwiz::input::{KeyCode, Modifiers};
+    let mut st = busy_day(8, 3);
+    for _ in 0..5 {
+        keys::handle_calendar_key(&mut st, &KeyCode::DownArrow, Modifiers::NONE);
+        assert_eq!(
+            focused_title(&st),
+            Some(format!("Event {}", st.agenda_sel)),
+            "focus must stay visible at sel {}",
+            st.agenda_sel
+        );
+    }
+}
+
+#[test]
+fn enter_never_opens_an_event_that_is_not_drawn() {
+    use crate::detail::{DetailAction, DetailOutcome};
+    use termwiz::input::{KeyCode, Modifiers};
+    let mut st = busy_day(8, 3);
+    st.agenda_sel = 5;
+    assert!(agenda_titles(&st).contains(&"Event 5".to_string()));
+    match keys::handle_calendar_key(&mut st, &KeyCode::Enter, Modifiers::NONE) {
+        DetailOutcome::Act(DetailAction::OpenUrl(u)) => {
+            assert_eq!(u, "https://example.invalid/5");
+        }
+        _ => panic!("Enter on a drawn, focused row must open its URL"),
+    }
+    st.agenda_sel = 20;
+    assert!(matches!(
+        keys::handle_calendar_key(&mut st, &KeyCode::Enter, Modifiers::NONE),
+        DetailOutcome::Pending
+    ));
+}
+
+#[test]
+fn agenda_click_maps_through_the_window() {
+    let mut st = busy_day(8, 3);
+    st.agenda_sel = 5;
+    let inner = Rect {
+        x: 0,
+        y: 0,
+        cols: 100,
+        rows: 40,
+    };
+    let mut y = inner.y;
+    let mut agenda_y = None;
+    for (i, sec) in render::sections_of(&st).iter().enumerate() {
+        if i == 3 {
+            agenda_y = Some(y);
+        }
+        y += sec.height();
+    }
+    let agenda_y = agenda_y.expect("agenda table located");
+    assert_eq!(
+        hit(inner, 0, &st, inner.x + 2, agenda_y),
+        Some(layout::CalHit::AgendaRow(3))
+    );
+    assert_eq!(
+        hit(inner, 0, &st, inner.x + 2, agenda_y + 2),
+        Some(layout::CalHit::AgendaRow(5))
+    );
+}
