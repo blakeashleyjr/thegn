@@ -220,6 +220,17 @@ see [[configuration]]. The roster side (verify a finished row, wait on one,
 gate `done`) is [[cli]]'s `dispatch verify` / `dispatch wait` /
 `dispatch set-status done`.
 
+Before launching, `session open --stage --issue` fetches the issue once and
+writes it to `<worktree>/.thegn/maintenance/issue.json` (atomic, always
+overwritten) so the worker and its reviewers read the captured task, never
+a stale file. The file is git-ignored only in thegn's own repo; elsewhere it
+is untracked unless you ignore it, and a worker's `git add -A` would commit it. If the tracker is unavailable, offline, or
+provider `none` and the stage prompt does not read issue fields, the file
+holds only the issue reference, `"fetched": false` and an error kind; if the
+prompt does read them, the dispatch is refused. A file that cannot be written
+(including a symlinked `.thegn` or `.thegn/maintenance`) refuses the dispatch
+before any roster row is claimed.
+
 Opening a configured agent through the daemon, control API, MCP or automation
 is refused before launch when its rendered command exceeds 100 KiB. The error
 names the command size and limit and asks you to shorten the task prompt; the
