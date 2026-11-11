@@ -61,6 +61,27 @@ def _scannable(args: list[str]) -> list[str]:
     return out
 
 
+def _dangling_value_flag(args: list[str]) -> str | None:
+    """The value-taking flag that ends `args` with no value after it, if any.
+
+    act would consume whatever comes next (the appended `--rm`, or for `.actrc` the event
+    name) as that flag's value, so the guard cannot tell what the run receives.
+    """
+    skip = False
+    last = None
+    for arg in args:
+        if skip:
+            skip = False
+            last = None
+            continue
+        if arg in _LONG_VALUE or (len(arg) == 2 and arg[0] == "-" and arg[1] in _SHORT_VALUE):
+            skip = True
+            last = arg
+        else:
+            last = None
+    return last if skip else None
+
+
 def _short_cluster(arg: str) -> tuple[bool, str | None, bool]:
     """Scan one single-dash arg the way pflag does: (reuse, value flag letter, ambiguous).
 
@@ -218,9 +239,11 @@ def plan(
     """Build guarded act argv, or return a refusal message.
 
     act prepends `.actrc` tokens to argv, so `actrc_args` count for the credential,
-    reuse and redirect checks but are not added to the built command.
+    reuse and redirect checks but are not added to the built command. The checks scan
+    exactly what act parses, `[*actrc_args, event, *args]`: a dangling value flag at the
+    end of `.actrc` consumes the event, never the first CLI arg.
     """
-    effective = [*(actrc_args or []), *args]
+    effective = [*(actrc_args or []), event, *args]
     credentialed = has_credentials(effective) or implicit_secrets
     credential_source = " (including default .secrets)" if implicit_secrets else ""
     reuse = has_reuse(effective)
@@ -229,6 +252,12 @@ def plan(
         return None, (
             f"act: --reuse cannot be combined with credentials{credential_source} "
             "(the retained container would carry them into later runs)"
+        )
+    dangling = _dangling_value_flag(effective)
+    if credentialed and dangling:
+        return None, (
+            f"act: credentialed runs cannot end on {dangling} without a value{credential_source}: "
+            "act would take the next token as its value"
         )
     ambiguous = ambiguous_short_args(effective)
     if credentialed and ambiguous:
@@ -258,7 +287,7 @@ def plan(
         )
 
     command = ["act", event, *args]
-    if not reuse and "--rm" not in args:
+    if not reuse and "--rm" not in _scannable(args):
         command.append("--rm")
     message = (
         f"act: credentialed run{credential_source} bound to HEAD {head}"
@@ -607,6 +636,22 @@ def self_test() -> int:
             and not has_credentials(["--container-options", "-s"]),
         )
     )
+    argv, message = plan("push", ["--secret", "T=x"], [" M .actrc"], "abc123", False, ["--env"])
+    cases.append(
+        (
+            "actrc-trailing-value-flag-does-not-hide-cli-credentials",
+            argv is None and ".actrc" in message,
+        )
+    )
+    argv, message = plan("push", ["--secret", "T=x", "--env"], [], "abc123")
+    cases.append(
+        (
+            "credentialed-trailing-value-flag-refused",
+            argv is None and "--env without a value" in message,
+        )
+    )
+    argv, _ = plan("push", ["--env", "--rm"], None, None)
+    cases.append(("value-rm-is-not-the-rm-flag", argv == ["act", "push", "--env", "--rm", "--rm"]))
     argv, message = plan("push", ["--secret", "T=x", "--env", "A=b", "-r"], [], "abc123")
     cases.append(
         (
@@ -667,7 +712,7 @@ def main(argv: list[str]) -> int:
         return 1
     implicit_secrets = (ROOT / ".secrets").exists()
     actrc_args = actrc_tokens(actrc_text) if actrc_text else []
-    if has_credentials([*actrc_args, *args]) or implicit_secrets:
+    if has_credentials([*actrc_args, event, *args]) or implicit_secrets:
         dirty = dirty_paths()
         head = head_sha()
     else:
