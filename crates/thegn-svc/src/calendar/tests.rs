@@ -2548,6 +2548,200 @@ async fn pass_stats_wrapper_returns_the_skipped_count() {
     assert_eq!(skipped, stats.skipped);
 }
 
+struct DropProbe {
+    started: std::sync::atomic::AtomicUsize,
+    dropped: std::sync::atomic::AtomicUsize,
+}
+
+struct HungFake {
+    delay: std::time::Duration,
+    probe: std::sync::Arc<DropProbe>,
+}
+
+impl CalendarBackend for HungFake {
+    fn provider_id(&self) -> &'static str {
+        "probe"
+    }
+
+    fn caps(&self) -> CalendarCaps {
+        CalendarCaps::default()
+    }
+
+    fn list_events<'a>(
+        &'a self,
+        _from: chrono::NaiveDate,
+        _to: chrono::NaiveDate,
+        _sync_token: &'a str,
+    ) -> futures_util::future::BoxFuture<'a, Result<EventPage, CalendarError>> {
+        Box::pin(async move {
+            struct Guard(std::sync::Arc<DropProbe>);
+            impl Drop for Guard {
+                fn drop(&mut self) {
+                    self.0
+                        .dropped
+                        .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                }
+            }
+            self.probe
+                .started
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let _guard = Guard(self.probe.clone());
+            tokio::time::sleep(self.delay).await;
+            EventPage::try_new(PageMode::Snapshot, vec![], vec![], "", &adm())
+        })
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn pass_stress_hung_command_account_does_not_delay_network_or_local_accounts() {
+    let active = std::sync::Arc::new(ActiveFetches::default());
+    let secs = std::time::Duration::from_secs;
+    let mut accounts: Vec<TimedAccount> = vec![(
+        "cmd".into(),
+        FetchClass::Command,
+        "command",
+        secs(400),
+        false,
+        active.clone(),
+    )];
+    for index in 0..3 {
+        accounts.push((
+            format!("net-{index}"),
+            FetchClass::Network,
+            "ics-url",
+            secs(1),
+            false,
+            active.clone(),
+        ));
+    }
+    accounts.push((
+        "local".into(),
+        FetchClass::Local,
+        "local",
+        secs(2),
+        false,
+        active,
+    ));
+    let router = timed_router(accounts);
+    let start = tokio::time::Instant::now();
+    let mut completed: Vec<(String, tokio::time::Instant)> = Vec::new();
+    let stats = router
+        .list_events_pass(
+            calendar_window(),
+            &BTreeMap::new(),
+            || true,
+            |result| {
+                completed.push((result.account, tokio::time::Instant::now()));
+            },
+        )
+        .await;
+    assert_eq!(completed.len(), 5);
+    for (account, at) in &completed {
+        let expected = match account.as_str() {
+            "cmd" => secs(400),
+            "local" => secs(2),
+            _ => secs(1),
+        };
+        assert_eq!(at.duration_since(start), expected, "{account}");
+    }
+    assert_eq!(completed[4].0, "cmd");
+    assert_eq!(stats.completed, 5);
+    assert_eq!(stats.abandoned, 0);
+}
+
+#[tokio::test(start_paused = true)]
+async fn pass_stress_repeated_passes_never_exceed_any_class_cap() {
+    let network = std::sync::Arc::new(ActiveFetches::default());
+    let command = std::sync::Arc::new(ActiveFetches::default());
+    let local = std::sync::Arc::new(ActiveFetches::default());
+    let delay = std::time::Duration::from_secs(1);
+    let mut accounts: Vec<TimedAccount> = Vec::new();
+    for index in 0..6 {
+        accounts.push((
+            format!("net-{index}"),
+            FetchClass::Network,
+            "ics-url",
+            delay,
+            false,
+            network.clone(),
+        ));
+    }
+    for index in 0..3 {
+        accounts.push((
+            format!("cmd-{index}"),
+            FetchClass::Command,
+            "command",
+            delay,
+            false,
+            command.clone(),
+        ));
+        accounts.push((
+            format!("local-{index}"),
+            FetchClass::Local,
+            "local",
+            delay,
+            false,
+            local.clone(),
+        ));
+    }
+    let router = timed_router(accounts);
+    for pass in 0..3 {
+        let mut delivered = 0_usize;
+        let stats = router
+            .list_events_pass(
+                calendar_window(),
+                &BTreeMap::new(),
+                || true,
+                |_| {
+                    delivered += 1;
+                },
+            )
+            .await;
+        assert_eq!(delivered, 12, "pass {pass}");
+        assert_eq!(stats.completed, 12, "pass {pass}");
+        assert!(stats.peak_active <= 6, "pass {pass}: {}", stats.peak_active);
+    }
+    let load = |fetches: &ActiveFetches| fetches.max.load(std::sync::atomic::Ordering::SeqCst);
+    assert_eq!(load(&network), 4);
+    assert_eq!(load(&command), 1);
+    assert_eq!(load(&local), 1);
+    for fetches in [&network, &command, &local] {
+        assert_eq!(fetches.active.load(std::sync::atomic::Ordering::SeqCst), 0);
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn pass_stress_dropping_a_pass_cancels_in_flight_fetches_and_starts_no_more() {
+    let probe = std::sync::Arc::new(DropProbe {
+        started: std::sync::atomic::AtomicUsize::new(0),
+        dropped: std::sync::atomic::AtomicUsize::new(0),
+    });
+    let router = CalendarRouter::from_test_backends(
+        (0..6)
+            .map(|index| {
+                let backend: Box<dyn CalendarBackend> = Box::new(HungFake {
+                    delay: std::time::Duration::from_secs(100),
+                    probe: probe.clone(),
+                });
+                (format!("hung-{index}"), FetchClass::Network, backend)
+            })
+            .collect(),
+    );
+    let outcome = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        router.list_events_pass(calendar_window(), &BTreeMap::new(), || true, |_| {}),
+    )
+    .await;
+    assert!(outcome.is_err(), "the pass must still be running at 5 s");
+    let started = || probe.started.load(std::sync::atomic::Ordering::SeqCst);
+    let dropped = || probe.dropped.load(std::sync::atomic::Ordering::SeqCst);
+    assert_eq!(started(), 4);
+    assert_eq!(dropped(), 4);
+    tokio::time::sleep(std::time::Duration::from_secs(1000)).await;
+    assert_eq!(started(), 4);
+    assert_eq!(dropped(), 4);
+}
+
 #[test]
 fn an_empty_config_builds_an_unconfigured_router() {
     let r = router(&CalendarConfig::default());
