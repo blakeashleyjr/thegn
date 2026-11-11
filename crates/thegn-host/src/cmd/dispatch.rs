@@ -374,6 +374,24 @@ pub enum Action {
         #[arg(long)]
         json: bool,
     },
+    /// Stage everything in a finished worker's worktree and commit it with the
+    /// message in `--msg-file` plus any `--trailer` lines (THE-1972). A
+    /// formatter hook that rewrites files and fails the first attempt is
+    /// retried once after re-staging. Refuses a row whose worker still runs.
+    Commit {
+        /// The dispatch row id (see `dispatch list`).
+        id: i64,
+        /// File holding the commit message (must be non-empty).
+        #[arg(long)]
+        msg_file: std::path::PathBuf,
+        /// A trailer to append, `Key: value` (repeatable; duplicates of lines
+        /// already in the message are skipped).
+        #[arg(long)]
+        trailer: Vec<String>,
+        /// Emit `{committed, sha, retried}` as JSON.
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 pub(crate) const DISPATCH_CAPABILITY_ENV: &str = "THEGN_DISPATCH_CAPABILITY";
@@ -406,6 +424,7 @@ fn worker_route(action: &Action, token: Option<&str>) -> WorkerRoute {
         Action::SetStatus { .. } => WorkerRoute::Refused("set-status"),
         Action::Lease { .. } => WorkerRoute::Refused("lease"),
         Action::Gate { .. } => WorkerRoute::Refused("gate"),
+        Action::Commit { .. } => WorkerRoute::Refused("commit"),
         Action::Reap { apply: true, .. } => WorkerRoute::Refused("reap --apply"),
         Action::List { .. }
         | Action::Reap { apply: false, .. }
@@ -707,6 +726,12 @@ pub fn run(cfg: &Config, action: Action) -> Result<()> {
             json,
         ),
         Action::Verify { id, json } => verify(id, json),
+        Action::Commit {
+            id,
+            msg_file,
+            trailer,
+            json,
+        } => crate::cmd::dispatch_commit::run(id, &msg_file, &trailer, json),
         Action::Gate { id, json } => gate::run(cfg, id, json),
         Action::Wait {
             row,
@@ -6026,6 +6051,15 @@ mod tests {
             (
                 Action::Gate { id: 1, json: false },
                 WorkerRoute::Refused("gate"),
+            ),
+            (
+                Action::Commit {
+                    id: 1,
+                    msg_file: "m".into(),
+                    trailer: Vec::new(),
+                    json: false,
+                },
+                WorkerRoute::Refused("commit"),
             ),
             (
                 Action::Wait {

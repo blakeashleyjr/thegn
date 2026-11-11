@@ -551,6 +551,15 @@ pub const CATALOG: &[Slot] = &[
         SourceKind::Reserved(Reserved::DispatchRow),
     ),
     slot(
+        "dispatch commit",
+        "id",
+        SourceKind::Reserved(Reserved::DispatchRow),
+    ),
+    // `--msg-file` is a filesystem path (clap's path completer); `--trailer`
+    // is a free-form `Key: value` line.
+    slot("dispatch commit", "msg_file", SourceKind::Structural),
+    slot("dispatch commit", "trailer", SourceKind::Structural),
+    slot(
         "dispatch wait",
         "row",
         SourceKind::Reserved(Reserved::DispatchRow),
