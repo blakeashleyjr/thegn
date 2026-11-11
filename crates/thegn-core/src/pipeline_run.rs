@@ -402,7 +402,7 @@ pub fn verify_report(f: &VerifyFacts) -> VerifyReport {
 /// A row typed `stage` or `legacy_held` must keep its pipeline identity: a stage
 /// row that lost its stage name or artifact path can never fall back to the
 /// plain-dispatch (ungated) class. `None` kind (pre-v110 or unclassified) and
-/// `plain` never refuse here. Returns the refusal reason.
+/// `plain` never refuse here; an unrecognised kind fails closed. Returns the refusal reason.
 pub fn typed_kind_refusal(
     kind: Option<&str>,
     stage: Option<&str>,
@@ -410,10 +410,14 @@ pub fn typed_kind_refusal(
 ) -> Option<String> {
     let blank = |v: Option<&str>| v.is_none_or(|s| s.trim().is_empty());
     match kind {
+        None | Some("plain") => None,
         Some(k @ ("stage" | "legacy_held")) if blank(stage) || blank(artifact) => Some(format!(
             "typed pipeline row ({k}) has no stage or artifact path; it cannot be completed as a plain dispatch (record it with `--force --why '<reason>'`)"
         )),
-        _ => None,
+        Some("stage" | "legacy_held") => None,
+        Some(other) => Some(format!(
+            "unknown dispatch kind {other:?}; it cannot be completed as a plain dispatch (record it with `--force --why '<reason>'`)"
+        )),
     }
 }
 
@@ -871,6 +875,9 @@ mod tests {
         }
         let reason = typed_kind_refusal(Some("stage"), None, None).unwrap();
         assert!(reason.contains("typed pipeline row"));
+        // Fail closed: an unrecognised non-NULL kind is refused even when complete.
+        let unknown = typed_kind_refusal(Some("bogus"), Some("code"), Some("a.md")).unwrap();
+        assert!(unknown.contains("unknown dispatch kind"));
     }
 
     #[test]
