@@ -118,7 +118,7 @@ pub const STATE_TOOLS: &[StateToolSpec] = &[
             name: "worktree",
             kind: ArgKind::String,
             required: true,
-            description: "Absolute path of a registered worktree",
+            description: "Absolute path of a registered worktree, exactly as registered",
         }],
     },
     StateToolSpec {

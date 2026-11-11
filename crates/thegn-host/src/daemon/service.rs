@@ -3357,13 +3357,23 @@ impl ControlApi for DaemonService {
             }
             self.with_db(move |db| {
                 use thegn_core::store::WorkspaceStore;
+                // Fail closed: an unregistered path must not read as "inherits".
+                if !db
+                    .repo_root_for(&query.worktree)?
+                    .is_some_and(|root| !root.is_empty())
+                {
+                    return Ok(Err(ControlError::NotFound(format!(
+                        "{} is not a registered worktree",
+                        query.worktree
+                    ))));
+                }
                 let profile = db.worktree_sandbox_profile(&query.worktree)?;
-                Ok(thegn_svc::control::SandboxProfileReply {
+                Ok(Ok(thegn_svc::control::SandboxProfileReply {
                     worktree: query.worktree,
                     profile: profile.map(|p| p.as_str().to_string()),
-                })
+                }))
             })
-            .await
+            .await?
         })
     }
 
@@ -3378,7 +3388,7 @@ impl ControlApi for DaemonService {
                 ));
             }
             // Validate the requested pin before touching the DB.
-            let pin = match req.profile.as_deref() {
+            let pin = match req.action()? {
                 Some(value) => Some(
                     thegn_core::sandbox_pin::parse_pin(value)
                         .map_err(|e| ControlError::InvalidArgument(e.to_string()))?,
@@ -5933,6 +5943,7 @@ mod tests {
             .set_worktree_sandbox_profile(thegn_svc::control::SandboxProfileSetReq {
                 worktree: "/nowhere/unregistered".into(),
                 profile: Some("sealed".into()),
+                clear: false,
             })
             .await;
         assert!(
@@ -5942,10 +5953,18 @@ mod tests {
         use thegn_core::store::WorkspaceStore;
         assert!(svc.db.lock().unwrap().worktrees().unwrap().is_empty());
 
+        let read = svc
+            .worktree_sandbox_profile(thegn_svc::control::SandboxProfileQuery {
+                worktree: "/nowhere/unregistered".into(),
+            })
+            .await;
+        assert!(matches!(read, Err(ControlError::NotFound(_))), "{read:?}");
+
         let invalid = svc
             .set_worktree_sandbox_profile(thegn_svc::control::SandboxProfileSetReq {
                 worktree: "/nowhere/unregistered".into(),
                 profile: Some("open".into()),
+                clear: false,
             })
             .await;
         assert!(
