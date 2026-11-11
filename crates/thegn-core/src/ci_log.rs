@@ -270,6 +270,9 @@ pub fn redaction_changed(raw: &str) -> bool {
 /// Name the first well-known credential shape found in `text`, never the
 /// value. High-confidence shapes only (private key block, URL userinfo, JWT,
 /// AWS access key id, provider token): absence is not proof of no secret.
+///
+/// Cost: callers scan at most `ARTIFACT_MAX_BYTES` (1 MiB) and the `regex`
+/// crate matches in linear time, so no second size cap is needed here.
 pub fn contains_known_credential(text: &str) -> Option<&'static str> {
     if text
         .lines()

@@ -812,7 +812,9 @@ mod tests {
         let mut facts = facts_report(Some("canonical.md"), true, true, false, true);
         facts.stage = Some("code".into());
         facts.artifact_identity = ArtifactIdentity::Canonical;
-        facts.artifact_content = ArtifactContent::Sensitive { kind: "jwt" };
+        let content = classify_artifact_bytes(b"see eyJabcdefghijk.abcde.lmnopqrstuv\n", false);
+        assert_eq!(content, ArtifactContent::Sensitive { kind: "jwt" });
+        facts.artifact_content = content;
         let report = verify_report(&facts);
         assert!(!report.ok);
         assert!(
@@ -821,7 +823,9 @@ mod tests {
                 .iter()
                 .any(|r| r.contains("appears to contain a credential (jwt)"))
         );
-        assert!(report.reasons.iter().all(|r| !r.contains("eyJ")));
+        assert!(report.reasons.iter().all(|r| !r.contains("eyJabc")));
+        assert!(!format!("{content:?}").contains("eyJabc"));
+        assert!(!format!("{report:?}").contains("eyJabc"));
         // Control: the same content on a stage-less row stays ok.
         let mut plain = facts_report(Some("plain.md"), true, true, false, true);
         plain.artifact_content = ArtifactContent::Sensitive { kind: "jwt" };
