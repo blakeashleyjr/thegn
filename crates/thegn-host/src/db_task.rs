@@ -109,10 +109,10 @@ fn spawn_writer(open: impl Fn() -> anyhow::Result<Db> + Send + 'static) -> Write
     let (tx, rx) = channel::<Msg>();
     let state = Arc::new(QueueState::default());
     let worker_state = Arc::clone(&state);
-    std::thread::Builder::new()
-        .name("thegn-db-writer".into())
-        .spawn(move || run(rx, open, worker_state))
-        .expect("spawn db-writer thread");
+    thegn_core::thread_name::try_spawn_named("thegn-db-writer", move || {
+        run(rx, open, worker_state)
+    })
+    .expect("spawn db-writer thread");
     Writer { tx, state }
 }
 
