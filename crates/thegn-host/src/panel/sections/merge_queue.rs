@@ -138,7 +138,11 @@ fn held_reason(r: &thegn_core::db::MergeQueueRow) -> Option<(String, Hue)> {
     }
     let reason = if let Some(d) = r.error_detail.as_deref().filter(|s| !s.is_empty()) {
         let reason = d.lines().next().unwrap_or(d);
-        if status == MqStatus::AgentBlocked {
+        if status == MqStatus::AgentBlocked
+            && let Some(headline) = thegn_core::merge_identity_drift::hold_headline(reason)
+        {
+            crate::merge_sweep::safe_display(&headline)
+        } else if status == MqStatus::AgentBlocked {
             format!("environment/policy blocked — {reason}")
         } else {
             reason.to_string()
@@ -480,6 +484,19 @@ mod expiry_tests {
         assert!(!label.contains('\u{1b}'));
         assert!(!label.contains('\u{202e}'));
         assert!(label.starts_with("evil"));
+    }
+
+    #[test]
+    fn held_reason_uses_identity_drift_label_for_a_drift_hold() {
+        let mut row = row("agent_blocked", 1);
+        row.error_detail = Some(thegn_core::merge_identity_drift::candidate_drift_detail(
+            "registration changed",
+        ));
+
+        let (reason, tone) = held_reason(&row).unwrap();
+        assert!(reason.starts_with("identity drift — registration changed"));
+        assert!(!reason.contains("environment/policy"));
+        assert_eq!(tone, Hue::Amber);
     }
 
     #[test]
