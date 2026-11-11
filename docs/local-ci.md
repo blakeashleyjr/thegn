@@ -125,10 +125,9 @@ guard reads clustered short flags such as `-vsNAME=x` the way act does, counts
 the repository `.actrc` flags as if passed on the command line, and refuses an
 unrecognised short letter on a credentialed run. Every run passes `--rm`
 unless `--reuse` is given, so act removes its containers after a failed run.
-The token
-is unnecessary for anonymous access to current public flake inputs. `--reuse`
-explicitly retains the container and its mutable `/nix` state; avoid carrying
-it across revisions or trust domains.
+The token is unnecessary for anonymous access to current public flake inputs.
+`--reuse` explicitly retains the container and its mutable `/nix` state; avoid
+carrying it across revisions or trust domains.
 
 ### Caveats
 
