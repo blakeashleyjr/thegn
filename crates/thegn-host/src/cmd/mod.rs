@@ -60,6 +60,7 @@ pub mod sandbox_profile;
 pub mod search;
 pub mod secret;
 pub mod session;
+pub mod session_brief;
 pub mod session_fork;
 pub mod session_move;
 pub mod share;
