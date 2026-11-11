@@ -1687,7 +1687,8 @@ command = "git diff"
 # `timeout_secs`. A supervising agent — the "Lead", running the `pipeline`
 # skill — reads the whole structure with `thegn config get pipeline --json`
 # and executes it with its own judgement, recording each dispatch on the
-# durable roster (`thegn dispatch put … --stage --parent --session --artifact`).
+# durable roster (`thegn dispatch put … --stage --parent --session`; a staged row
+# refuses `--artifact`, its handoff path is assigned).
 # Delete this section and nothing thegn *does* changes.
 #
 #   name         stage id; roster rows record it and `next` points at it. Unique.
