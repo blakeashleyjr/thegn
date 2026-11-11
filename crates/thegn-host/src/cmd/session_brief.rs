@@ -13,6 +13,10 @@ fn truncation_warning(path: &str, rendered_bytes: usize) -> String {
     )
 }
 
+#[expect(
+    clippy::disallowed_macros,
+    reason = "user-visible stderr warning about a truncated brief"
+)]
 pub(crate) fn resolve_brief(
     prompt: &str,
     brief_file: Option<&str>,
