@@ -193,6 +193,12 @@
           diskGenerationMinAgeDays = 21;
           diskReclaimOnLowDisk = false;
           diskSccache = true;
+          daemonEnabled = true;
+          daemonIdleExitSecs = 600;
+          daemonLeaseGraceSecs = 30;
+          daemonStreamGapWindowSecs = 300;
+          networkOfflineAfterFailures = 3;
+          networkRecoveryProbeSecs = 15;
           agents = [
             {
               name = "shell";
