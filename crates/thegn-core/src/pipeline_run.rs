@@ -148,6 +148,8 @@ pub enum ArtifactContent {
     Control { at: usize },
     /// The bounded open or read failed.
     Unreadable,
+    /// The artifact contains a known credential format; `kind` names the shape, never the value.
+    Sensitive { kind: &'static str },
 }
 
 /// Classify bounded artifact bytes without performing I/O.
@@ -172,6 +174,9 @@ pub fn classify_artifact_bytes(bytes: &[u8], over_limit: bool) -> ArtifactConten
         {
             return ArtifactContent::Control { at };
         }
+    }
+    if let Some(kind) = crate::ci_log::contains_known_credential(text) {
+        return ArtifactContent::Sensitive { kind };
     }
     ArtifactContent::Valid
 }
@@ -327,6 +332,9 @@ pub fn verify_report(f: &VerifyFacts) -> VerifyReport {
             ArtifactContent::Unreadable => {
                 Some(format!("could not read artifact {a:?}; retry verification"))
             }
+            ArtifactContent::Sensitive { kind } => Some(format!(
+                "artifact {a:?} appears to contain a credential ({kind}); remove it, commit, and re-file the handoff"
+            )),
         };
         if let Some(reason) = content_reason {
             reasons.push(reason);
@@ -720,6 +728,7 @@ mod tests {
     fn classify_artifact_bytes_table() {
         let too_many_lines = b"x\n".repeat(ARTIFACT_MAX_LINES + 1);
         let max_lines = b"x\n".repeat(ARTIFACT_MAX_LINES);
+        let ghp_line = format!("see ghp_{}\n", "a".repeat(36));
         let cases = [
             (b"# handoff\n".as_slice(), false, ArtifactContent::Valid),
             (b"".as_slice(), true, ArtifactContent::TooLarge),
@@ -744,6 +753,18 @@ mod tests {
             ),
             (b"a\r\n\tb\n".as_slice(), false, ArtifactContent::Valid),
             ("\u{200d}".as_bytes(), false, ArtifactContent::Valid),
+            (
+                ghp_line.as_bytes(),
+                false,
+                ArtifactContent::Sensitive {
+                    kind: "provider token",
+                },
+            ),
+            (
+                b"the token and password were rotated\n".as_slice(),
+                false,
+                ArtifactContent::Valid,
+            ),
         ];
         for (bytes, over_limit, expected) in cases {
             assert_eq!(
@@ -767,6 +788,10 @@ mod tests {
                 "contains a terminal control or bidi override at character 2",
             ),
             (ArtifactContent::Unreadable, "could not read artifact"),
+            (
+                ArtifactContent::Sensitive { kind: "jwt" },
+                "appears to contain a credential (jwt)",
+            ),
         ];
         for (content, reason) in cases {
             let mut facts = facts_report(Some("x.md"), true, true, false, true);
@@ -780,6 +805,31 @@ mod tests {
                 "{report:?}"
             );
         }
+    }
+
+    #[test]
+    fn sensitive_artifact_refuses_a_pipeline_row_without_echoing_the_value() {
+        let mut facts = facts_report(Some("canonical.md"), true, true, false, true);
+        facts.stage = Some("code".into());
+        facts.artifact_identity = ArtifactIdentity::Canonical;
+        let content = classify_artifact_bytes(b"see eyJabcdefghijk.abcde.lmnopqrstuv\n", false);
+        assert_eq!(content, ArtifactContent::Sensitive { kind: "jwt" });
+        facts.artifact_content = content;
+        let report = verify_report(&facts);
+        assert!(!report.ok);
+        assert!(
+            report
+                .reasons
+                .iter()
+                .any(|r| r.contains("appears to contain a credential (jwt)"))
+        );
+        assert!(report.reasons.iter().all(|r| !r.contains("eyJabc")));
+        assert!(!format!("{content:?}").contains("eyJabc"));
+        assert!(!format!("{report:?}").contains("eyJabc"));
+        // Control: the same content on a stage-less row stays ok.
+        let mut plain = facts_report(Some("plain.md"), true, true, false, true);
+        plain.artifact_content = ArtifactContent::Sensitive { kind: "jwt" };
+        assert!(verify_report(&plain).ok);
     }
 
     #[test]
