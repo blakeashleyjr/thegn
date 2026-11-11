@@ -93,6 +93,7 @@ fn classify_command(command: &Command) -> CommandIntent<'_> {
         | Command::Share { .. }
         | Command::Forward { .. }
         | Command::Wt { .. }
+        | Command::Release { .. }
         | Command::Repo { .. }
         | Command::Open { .. }
         | Command::Diff { .. }

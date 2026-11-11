@@ -72,3 +72,31 @@ That means switching channels needs no reinstall and no config
 migration — the same config file behaves correctly in both.
 
 See [[configuration]] for the config layers these keys live in.
+
+## Preparing a release
+
+`thegn release prepare --bump <alpha|beta|rc|patch>` does the version bump for
+a release in the current worktree, which must be clean. It rewrites four
+files: the `[workspace.package]` version in `Cargo.toml`, every workspace entry
+in `Cargo.lock`, the status line in `README.md`, and `CHANGELOG.md` (the
+`[Unreleased]` body becomes the new dated release section, a fresh empty
+`[Unreleased]` goes on top, and the compare links are updated). It does not
+commit, tag or push; review the diff and commit it yourself.
+
+- `alpha` takes `-alpha.N` to `-alpha.N+1`. `beta` and `rc` move to the next
+  channel (`-beta.1`, `-rc.1`) or count up within it, and refuse to go
+  backwards. `patch` turns a pre-release into its stable version, or a stable
+  version into the next patch.
+- `--from <ref>` (default `HEAD`) and `--branch <name>` (default
+  `tg/release-<new version>`) pick where the work happens; a branch other than
+  the current one is created from `--from` with `git switch -c`.
+- `--date YYYY-MM-DD` overrides today's date in the changelog heading.
+- `--lock-from <path>` takes `Cargo.lock` from another worktree (a directory or
+  a lock file) before bumping.
+- `--dry-run` shows the files that would change and writes nothing (it also
+  works with `--from <ref>`: the files are read from that ref). `--json`
+  prints the result as one JSON object.
+- Every rewrite is computed before anything changes, so a refusal (already
+  bumped, a missing marker) leaves your branch and files untouched.
+
+Running it twice refuses: the changelog already has the new version's heading.
