@@ -119,8 +119,8 @@ credentials only on commits you trust. The guard sees flags passed to `just` and
 the repository's `.secrets`, but does not inspect `~/.actrc` or
 `$XDG_CONFIG_HOME/act/actrc`, where act can also read secret or reuse flags.
 Credentials cannot be combined with `--reuse`. A credentialed run also
-refuses `-W`/`--workflows`, `-C`/`--directory` and `--local-repository`,
-because the guard only checks this checkout's `.github/` and `.actrc`. The
+refuses `-W`/`--workflows`, `-C`/`--directory`, `--local-repository`,
+`--action-cache-path` and `--action-offline-mode`, because the guard only checks this checkout's `.github/` and `.actrc`. The
 guard reads clustered short flags such as `-vsNAME=x` the way act does, counts
 the repository `.actrc` flags as if passed on the command line, and refuses an
 unrecognised short letter on a credentialed run. Every run passes `--rm`
