@@ -363,9 +363,11 @@ fn io_error_with_path_context(
 
 /// Take the advisory lock serializing [`IpcListener::bind_exclusive`]'s
 /// probe→unlink→bind critical section for `sock`. The sidecar `<sock>.lock`
-/// is created once and NEVER unlinked (unlinking it would resurrect the very
-/// race it closes); the flock (std's `File::lock`) dies with the process, so
-/// it can't go stale. Acquisition is bounded by [`BIND_LOCK_WAIT`]; a held
+/// is only ever unlinked by the control-dir prune, which holds the lock while
+/// unlinking; every binder re-checks after acquiring the flock that the path
+/// still names the inode it locked and reopens otherwise, so two binders can
+/// never hold different inodes for one endpoint. The flock (std's
+/// `File::lock`) dies with the process, so it can't go stale. Acquisition is bounded by [`BIND_LOCK_WAIT`]; a held
 /// lock that exceeds the bound is a startup error, never a wait without end.
 /// The caller is already on a blocking thread. Failure is fatal: probing or
 /// unlinking without this lock can race another daemon endpoint.
@@ -387,11 +389,25 @@ const BIND_LOCK_WAIT: std::time::Duration = std::time::Duration::from_secs(5);
 const BIND_PROBE_WAIT: std::time::Duration = BIND_LOCK_WAIT;
 
 #[cfg(unix)]
-fn bind_lock_with_wait(sock: &Path, wait: std::time::Duration) -> io::Result<std::fs::File> {
-    use std::os::unix::fs::{MetadataExt as _, OpenOptionsExt as _, PermissionsExt as _};
+const BIND_LOCK_REOPEN_LIMIT: usize = 16;
 
+#[cfg(unix)]
+fn bind_lock_path(sock: &Path) -> PathBuf {
     let mut path = sock.as_os_str().to_owned();
     path.push(".lock");
+    PathBuf::from(path)
+}
+
+#[cfg(unix)]
+fn bind_lock_with_wait(sock: &Path, wait: std::time::Duration) -> io::Result<std::fs::File> {
+    bind_lock_checked(sock, wait, &mut || {})
+}
+
+#[cfg(unix)]
+fn open_bind_lock_file(sock: &Path) -> io::Result<std::fs::File> {
+    use std::os::unix::fs::{MetadataExt as _, OpenOptionsExt as _, PermissionsExt as _};
+
+    let path = bind_lock_path(sock);
     let file = std::fs::OpenOptions::new()
         .create(true)
         .read(true)
@@ -399,7 +415,7 @@ fn bind_lock_with_wait(sock: &Path, wait: std::time::Duration) -> io::Result<std
         .truncate(false)
         .mode(0o600)
         .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
-        .open(std::path::Path::new(&path))
+        .open(&path)
         .map_err(|error| io_error_with_path_context(error, "open control socket lock", sock))?;
     let mut metadata = file
         .metadata()
@@ -440,39 +456,83 @@ fn bind_lock_with_wait(sock: &Path, wait: std::time::Duration) -> io::Result<std
             ));
         }
     }
+    Ok(file)
+}
+
+/// True when `lock_path` still names the very inode `file` holds (and it is
+/// still linked), so a flock on `file` is the endpoint's one lock domain.
+#[cfg(unix)]
+fn bind_lock_is_current(file: &std::fs::File, lock_path: &Path) -> bool {
+    use std::os::unix::fs::MetadataExt as _;
+
+    let (Ok(held), Ok(named)) = (file.metadata(), std::fs::symlink_metadata(lock_path)) else {
+        return false;
+    };
+    held.nlink() > 0
+        && named.file_type().is_file()
+        && held.dev() == named.dev()
+        && held.ino() == named.ino()
+}
+
+/// Open and flock the sidecar, then verify the path still names the locked
+/// inode; a lock unlinked or replaced in between is dropped and reopened.
+/// `after_open` runs after each open, before the flock (a test seam).
+#[cfg(unix)]
+fn bind_lock_checked(
+    sock: &Path,
+    wait: std::time::Duration,
+    after_open: &mut dyn FnMut(),
+) -> io::Result<std::fs::File> {
+    let lock_path = bind_lock_path(sock);
     let deadline = std::time::Instant::now() + wait;
     let mut interval = thegn_proc::POLL_INTERVAL;
-    loop {
-        match file.try_lock() {
-            Ok(()) => return Ok(file),
-            Err(std::fs::TryLockError::WouldBlock) => {}
-            Err(std::fs::TryLockError::Error(error)) => {
-                return Err(io_error_with_path_context(
-                    error,
-                    "lock control socket",
-                    sock,
-                ));
+    for _attempt in 0..BIND_LOCK_REOPEN_LIMIT {
+        let file = open_bind_lock_file(sock)?;
+        after_open();
+        loop {
+            match file.try_lock() {
+                Ok(()) => break,
+                Err(std::fs::TryLockError::WouldBlock) => {}
+                Err(std::fs::TryLockError::Error(error)) => {
+                    return Err(io_error_with_path_context(
+                        error,
+                        "lock control socket",
+                        sock,
+                    ));
+                }
             }
-        }
-        let remaining = match deadline.checked_duration_since(std::time::Instant::now()) {
-            Some(remaining) if !remaining.is_zero() => remaining,
-            _ => {
-                return Err(io_error_with_path_context(
-                    io::Error::new(
-                        io::ErrorKind::WouldBlock,
-                        format!(
-                            "control socket lock is held by another process (waited {}ms)",
-                            wait.as_millis()
+            let remaining = match deadline.checked_duration_since(std::time::Instant::now()) {
+                Some(remaining) if !remaining.is_zero() => remaining,
+                _ => {
+                    return Err(io_error_with_path_context(
+                        io::Error::new(
+                            io::ErrorKind::WouldBlock,
+                            format!(
+                                "control socket lock is held by another process (waited {}ms)",
+                                wait.as_millis()
+                            ),
                         ),
-                    ),
-                    "lock control socket",
-                    sock,
-                ));
-            }
-        };
-        std::thread::sleep(interval.min(remaining));
-        interval = thegn_proc::next_backoff(interval, remaining);
+                        "lock control socket",
+                        sock,
+                    ));
+                }
+            };
+            std::thread::sleep(interval.min(remaining));
+            interval = thegn_proc::next_backoff(interval, remaining);
+        }
+        if bind_lock_is_current(&file, &lock_path) {
+            return Ok(file);
+        }
+        drop(file);
     }
+    Err(io_error_with_path_context(
+        io::Error::new(
+            io::ErrorKind::WouldBlock,
+            "control socket lock kept being replaced",
+        ),
+        "lock control socket",
+        sock,
+    ))
 }
 
 #[cfg_attr(not(unix), allow(dead_code))] // Unix-only production call site.
@@ -1732,6 +1792,114 @@ mod tests {
         holder.lock().unwrap();
         drop(holder);
 
+        assert!(bind_lock_with_wait(&sock, std::time::Duration::from_secs(2)).is_ok());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn bind_lock_recheck_reopens_when_the_lock_is_unlinked_after_open() {
+        use std::os::unix::fs::MetadataExt as _;
+
+        let dir = private_tempdir();
+        prepare_control_directory(dir.path(), false).unwrap();
+        let sock = dir.path().join("r.sock");
+        assert_socket_path_fits(&sock);
+        let lock = dir.path().join("r.sock.lock");
+        let mut calls = 0_u32;
+        let mut old_ino = 0_u64;
+        let file = bind_lock_checked(&sock, std::time::Duration::from_secs(5), &mut || {
+            calls += 1;
+            if calls == 1 {
+                old_ino = std::fs::symlink_metadata(&lock).unwrap().ino();
+                std::fs::remove_file(&lock).unwrap();
+            }
+        })
+        .unwrap();
+        let current = std::fs::symlink_metadata(&lock).unwrap().ino();
+        assert_eq!(file.metadata().unwrap().ino(), current);
+        assert_ne!(current, old_ino);
+        assert_eq!(calls, 2);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn bind_lock_recheck_reopens_when_the_lock_is_replaced_after_open() {
+        use std::os::unix::fs::MetadataExt as _;
+
+        let dir = private_tempdir();
+        prepare_control_directory(dir.path(), false).unwrap();
+        let sock = dir.path().join("r.sock");
+        assert_socket_path_fits(&sock);
+        let lock = dir.path().join("r.sock.lock");
+        let other = dir.path().join("r.other");
+        let mut calls = 0_u32;
+        let mut old_ino = 0_u64;
+        let file = bind_lock_checked(&sock, std::time::Duration::from_secs(5), &mut || {
+            calls += 1;
+            if calls == 1 {
+                old_ino = std::fs::symlink_metadata(&lock).unwrap().ino();
+                drop(open_lock_holder(&other));
+                std::fs::rename(&other, &lock).unwrap();
+            }
+        })
+        .unwrap();
+        let current = std::fs::symlink_metadata(&lock).unwrap().ino();
+        assert_eq!(file.metadata().unwrap().ino(), current);
+        assert_ne!(current, old_ino);
+        assert_eq!(calls, 2);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn bind_lock_recheck_returns_the_same_inode_when_nothing_changes() {
+        use std::os::unix::fs::MetadataExt as _;
+
+        let dir = private_tempdir();
+        prepare_control_directory(dir.path(), false).unwrap();
+        let sock = dir.path().join("r.sock");
+        assert_socket_path_fits(&sock);
+        let lock = dir.path().join("r.sock.lock");
+        let mut calls = 0_u32;
+        let file = bind_lock_checked(&sock, std::time::Duration::from_secs(5), &mut || {
+            calls += 1;
+        })
+        .unwrap();
+        assert_eq!(calls, 1);
+        assert_eq!(
+            file.metadata().unwrap().ino(),
+            std::fs::symlink_metadata(&lock).unwrap().ino()
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn bind_lock_recheck_gives_up_when_the_lock_keeps_being_replaced() {
+        let dir = private_tempdir();
+        prepare_control_directory(dir.path(), false).unwrap();
+        let sock = dir.path().join("r.sock");
+        assert_socket_path_fits(&sock);
+        let lock = dir.path().join("r.sock.lock");
+        let error = bind_lock_checked(&sock, std::time::Duration::from_secs(5), &mut || {
+            if lock.exists() {
+                std::fs::remove_file(&lock).unwrap();
+            }
+        })
+        .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::WouldBlock);
+        assert!(error.to_string().contains("kept being replaced"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn bind_lock_recheck_two_binders_serialize_on_one_inode() {
+        let dir = private_tempdir();
+        prepare_control_directory(dir.path(), false).unwrap();
+        let sock = dir.path().join("r.sock");
+        assert_socket_path_fits(&sock);
+        let first = bind_lock_with_wait(&sock, std::time::Duration::from_secs(2)).unwrap();
+        let error = bind_lock_with_wait(&sock, std::time::Duration::from_millis(200)).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::WouldBlock);
+        drop(first);
         assert!(bind_lock_with_wait(&sock, std::time::Duration::from_secs(2)).is_ok());
     }
 
