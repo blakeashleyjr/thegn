@@ -613,6 +613,13 @@ fn dispatch_set_status_with_proof(
 ) -> anyhow::Result<()> {
     use thegn_core::store::NotificationStore;
 
+    // Snapshot the done gate's evidence before the row read and the gate, so
+    // the final write can refuse a row that changed in between.
+    let fence = if status == thegn_core::issue::AgentDispatchStatus::Done {
+        db.done_fence(id)?
+    } else {
+        None
+    };
     let row = db
         .get_dispatch(id)?
         .ok_or_else(|| anyhow::Error::new(DispatchStatusError::NotFound(id)))?;
@@ -626,7 +633,7 @@ fn dispatch_set_status_with_proof(
         db.check_dispatch_lead(id, proof)?;
         crate::cmd::dispatch::done_gate_bound(db, &row)?;
     }
-    db.set_dispatch_status_led(id, row.status, status, None, proof)
+    crate::cmd::dispatch::write_status(db, id, (row.status, status), fence.as_ref(), None, proof)
 }
 
 fn map_dispatch_status_error(error: anyhow::Error) -> ControlError {
@@ -661,6 +668,12 @@ fn map_dispatch_status_error(error: anyhow::Error) -> ControlError {
                 ControlError::Conflict(error.to_string())
             }
         };
+    }
+    if error
+        .downcast_ref::<thegn_core::db::DoneEvidenceChanged>()
+        .is_some()
+    {
+        return ControlError::Conflict(error.to_string());
     }
     if let Some(refused) = error.downcast_ref::<crate::cmd::dispatch::DoneGateRefused>() {
         let id = refused.id;
@@ -7301,6 +7314,17 @@ mod tests {
                 to: St::Running,
             })),
             ControlError::FailedPrecondition(_)
+        ));
+    }
+
+    #[test]
+    fn done_fence_evidence_change_maps_to_conflict() {
+        assert!(matches!(
+            map_dispatch_status_error(anyhow::Error::new(thegn_core::db::DoneEvidenceChanged {
+                id: 7,
+                field: "report",
+            })),
+            ControlError::Conflict(_)
         ));
     }
 
