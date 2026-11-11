@@ -14448,6 +14448,12 @@ async fn event_loop<T: Terminal>(
             &mut sb,
         );
         dirty |= applied.changed;
+        if drawer_runtime.drain_evictions(&mut panes) {
+            sync_drawer_runtime_mirror(&drawer_runtime, &mut drawer, &mut drawer_home);
+            need_relayout = true;
+            full_repaint = true;
+            dirty = true;
+        }
         if let Some(target) = applied.land_on
             && switch_workspace_from_region!(
                 &target,
