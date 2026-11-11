@@ -487,26 +487,28 @@ where
     };
 
     let (out_tx, out_rx) = mpsc::channel();
-    let output_reader = std::thread::Builder::new()
-        .spawn(move || {
-            let mut stdout = stdout;
-            let result = consume(&mut stdout);
-            if let Err(error) = out_tx.send(result) {
-                tracing::debug!(target: "thegn::ci", %error, "failed to return provider stdout result");
-            }
-        })
-        .map_err(|error| {
-            fallback_kill_reap(&mut child, "stdout reader setup failed");
-            CiError::Other(format!("provider stdout reader setup failed: {error}"))
-        })?;
+    let output_reader = thegn_core::thread_name::try_spawn_named("thegn-ci-stdout", move || {
+        let mut stdout = stdout;
+        let result = consume(&mut stdout);
+        if let Err(error) = out_tx.send(result) {
+            tracing::debug!(target: "thegn::ci", %error, "failed to return provider stdout result");
+        }
+    })
+    .map_err(|error| {
+        fallback_kill_reap(&mut child, "stdout reader setup failed");
+        CiError::Other(format!("provider stdout reader setup failed: {error}"))
+    })?;
     let (err_tx, err_rx) = mpsc::channel();
     let max_stderr = limits.max_stderr;
-    let error_reader = match std::thread::Builder::new().spawn(move || {
-        let result = read_stderr_checked(stderr, max_stderr);
-        if let Err(error) = err_tx.send(result) {
-            tracing::debug!(target: "thegn::ci", %error, "failed to return provider stderr result");
-        }
-    }) {
+    let error_reader = match thegn_core::thread_name::try_spawn_named(
+        "thegn-ci-stderr",
+        move || {
+            let result = read_stderr_checked(stderr, max_stderr);
+            if let Err(error) = err_tx.send(result) {
+                tracing::debug!(target: "thegn::ci", %error, "failed to return provider stderr result");
+            }
+        },
+    ) {
         Ok(reader) => reader,
         Err(error) => {
             fallback_kill_reap(&mut child, "stderr reader setup failed");

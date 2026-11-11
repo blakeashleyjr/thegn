@@ -127,10 +127,9 @@ impl AdmissionLimiter {
         queue.active += 1;
         self.active.fetch_add(1, Ordering::AcqRel);
         let limiter = self.clone();
-        match std::thread::Builder::new()
-            .name("thegn-br-exec".into())
-            .spawn(move || Self::run_worker(limiter, job))
-        {
+        match thegn_core::thread_name::try_spawn_named("thegn-br-exec", move || {
+            Self::run_worker(limiter, job)
+        }) {
             Ok(_) => Ok(()),
             Err(error) => {
                 queue.active -= 1;
@@ -914,9 +913,7 @@ type ReaderSpawner = fn(Box<dyn FnOnce() + Send>) -> std::io::Result<std::thread
 fn spawn_reader_thread(
     f: Box<dyn FnOnce() + Send>,
 ) -> std::io::Result<std::thread::JoinHandle<()>> {
-    std::thread::Builder::new()
-        .name("thegn-br-read".into())
-        .spawn(f)
+    thegn_core::thread_name::try_spawn_named("thegn-br-read", f)
 }
 
 /// Kill `child` and reap it, waiting up to `deadline`. If it has not exited by
@@ -933,11 +930,9 @@ fn reap_child(mut child: Child, deadline: Duration) -> bool {
             Ok(None) | Err(_) => break,
         }
     }
-    let spawned = std::thread::Builder::new()
-        .name("thegn-br-reap".into())
-        .spawn(move || {
-            let _ = child.wait(); // best-effort: reap only
-        });
+    let spawned = thegn_core::thread_name::try_spawn_named("thegn-br-reap", move || {
+        let _ = child.wait(); // best-effort: reap only
+    });
     if let Err(e) = spawned {
         tracing::warn!(target: "thegn::bridge", error = %e, "reaper thread unavailable; child may linger");
     }
@@ -1323,9 +1318,10 @@ pub fn serve(reader: impl Read, writer: impl Write + Send + 'static) {
                     // read loop, so the kill runs off it like the exec ops.
                     let (w, procs) = (writer.clone(), procs.clone());
                     let req_id = req.id;
-                    if let Err(e) = std::thread::Builder::new()
-                        .name("thegn-br-pkill".into())
-                        .spawn(move || write_frame(&w, &proc_kill_response(&req, &procs)))
+                    if let Err(e) =
+                        thegn_core::thread_name::try_spawn_named("thegn-br-pkill", move || {
+                            write_frame(&w, &proc_kill_response(&req, &procs))
+                        })
                     {
                         write_frame(
                             &writer,
@@ -1480,21 +1476,19 @@ fn do_spawn(p: SpawnParams, writer: SharedWriter, procs: ProcRegistry) -> Result
     // loop. The thread ends when the sender drops (ProcState removed) or the pipe
     // errors — either way stdin drops → EOF.
     let (stdin_tx, stdin_rx) = std::sync::mpsc::sync_channel::<Vec<u8>>(STDIN_QUEUE_DEPTH);
-    let writer_thread = std::thread::Builder::new()
-        .name("thegn-br-pstdin".into())
-        .spawn(move || {
-            let mut stdin = stdin;
-            while let Ok(chunk) = stdin_rx.recv() {
-                if stdin
-                    .write_all(&chunk)
-                    .and_then(|()| stdin.flush())
-                    .is_err()
-                {
-                    break;
-                }
+    let writer_thread = thegn_core::thread_name::try_spawn_named("thegn-br-pstdin", move || {
+        let mut stdin = stdin;
+        while let Ok(chunk) = stdin_rx.recv() {
+            if stdin
+                .write_all(&chunk)
+                .and_then(|()| stdin.flush())
+                .is_err()
+            {
+                break;
             }
-            // Drop stdin → child sees EOF.
-        });
+        }
+        // Drop stdin → child sees EOF.
+    });
     if let Err(e) = writer_thread {
         kill_and_reap(&mut child);
         return Err(e).context("spawn thegn-br-pstdin thread");
@@ -1513,67 +1507,65 @@ fn do_spawn(p: SpawnParams, writer: SharedWriter, procs: ProcRegistry) -> Result
     // proc.exit and deregisters exactly this generation.
     let slot = Arc::new(Mutex::new(Some(child)));
     let (slot2, ctl2, procs2) = (slot.clone(), ctl.clone(), procs.clone());
-    let waiter = std::thread::Builder::new()
-        .name("thegn-br-pwait".into())
-        .spawn(move || {
-            let relays = [out_relay, err_relay];
-            // Err = no WNOWAIT support: fall through to a plain reap.
-            let observed = crate::plugin::proc::wait_leader_exit_nowait(pid).is_ok();
-            let mut child = slot2.lock().unwrap().take();
-            let reap = |c: &mut Option<Child>| {
-                c.as_mut()
-                    .and_then(|c| c.wait().ok())
-                    .and_then(|s| s.code())
-                    .unwrap_or(-1)
-            };
-            let code = if observed {
-                // Hold the phase lock across kill + reap so a concurrent
-                // proc.kill can never signal after the pid is released.
+    let waiter = thegn_core::thread_name::try_spawn_named("thegn-br-pwait", move || {
+        let relays = [out_relay, err_relay];
+        // Err = no WNOWAIT support: fall through to a plain reap.
+        let observed = crate::plugin::proc::wait_leader_exit_nowait(pid).is_ok();
+        let mut child = slot2.lock().unwrap().take();
+        let reap = |c: &mut Option<Child>| {
+            c.as_mut()
+                .and_then(|c| c.wait().ok())
+                .and_then(|s| s.code())
+                .unwrap_or(-1)
+        };
+        let code = if observed {
+            // Hold the phase lock across kill + reap so a concurrent
+            // proc.kill can never signal after the pid is released.
+            let mut phase = ctl2.phase.lock().unwrap();
+            crate::plugin::proc::kill_group(pid);
+            let code = reap(&mut child);
+            *phase = ProcPhase::Reaped(code);
+            code
+        } else {
+            // No WNOWAIT: poll try_wait, reaping only under the phase lock so
+            // a concurrent signal() never sees Running for a released pid.
+            loop {
                 let mut phase = ctl2.phase.lock().unwrap();
-                crate::plugin::proc::kill_group(pid);
-                let code = reap(&mut child);
-                *phase = ProcPhase::Reaped(code);
-                code
-            } else {
-                // No WNOWAIT: poll try_wait, reaping only under the phase lock so
-                // a concurrent signal() never sees Running for a released pid.
-                loop {
-                    let mut phase = ctl2.phase.lock().unwrap();
-                    let done = match child.as_mut().map(Child::try_wait) {
-                        Some(Ok(None)) => None,
-                        Some(Ok(Some(st))) => Some(st.code().unwrap_or(-1)),
-                        Some(Err(_)) | None => Some(-1),
-                    };
-                    if let Some(code) = done {
-                        *phase = ProcPhase::Reaped(code);
-                        break code;
-                    }
-                    drop(phase);
-                    std::thread::sleep(Duration::from_millis(20));
+                let done = match child.as_mut().map(Child::try_wait) {
+                    Some(Ok(None)) => None,
+                    Some(Ok(Some(st))) => Some(st.code().unwrap_or(-1)),
+                    Some(Err(_)) | None => Some(-1),
+                };
+                if let Some(code) = done {
+                    *phase = ProcPhase::Reaped(code);
+                    break code;
                 }
-            };
-            let drain_deadline = Instant::now() + RELAY_DRAIN_BOUND;
-            while relays.iter().any(|h| !h.is_finished()) && Instant::now() < drain_deadline {
-                std::thread::sleep(Duration::from_millis(5));
+                drop(phase);
+                std::thread::sleep(Duration::from_millis(20));
             }
-            for h in relays {
-                if h.is_finished() {
-                    let _ = h.join(); // best-effort: relay panic must not block exit report
-                }
+        };
+        let drain_deadline = Instant::now() + RELAY_DRAIN_BOUND;
+        while relays.iter().any(|h| !h.is_finished()) && Instant::now() < drain_deadline {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        for h in relays {
+            if h.is_finished() {
+                let _ = h.join(); // best-effort: relay panic must not block exit report
             }
-            {
-                let mut map = procs2.lock().unwrap();
-                if map.get(&chan).is_some_and(|s| Arc::ptr_eq(&s.ctl, &ctl2)) {
-                    map.remove(&chan);
-                }
+        }
+        {
+            let mut map = procs2.lock().unwrap();
+            if map.get(&chan).is_some_and(|s| Arc::ptr_eq(&s.ctl, &ctl2)) {
+                map.remove(&chan);
             }
-            let note = serde_json::json!({
-                "method": "proc.exit",
-                "params": ProcExitNote { chan, code },
-            });
-            write_frame(&writer, &note);
-            ctl2.set(ProcPhase::Announced(code));
+        }
+        let note = serde_json::json!({
+            "method": "proc.exit",
+            "params": ProcExitNote { chan, code },
         });
+        write_frame(&writer, &note);
+        ctl2.set(ProcPhase::Announced(code));
+    });
     if let Err(e) = waiter {
         // The closure (and its relay handles) was dropped; the Child is still in
         // the shared slot, so kill and reap it here.
@@ -1614,27 +1606,25 @@ fn spawn_stream_relay(
     stream: &'static str,
     writer: SharedWriter,
 ) -> std::io::Result<std::thread::JoinHandle<()>> {
-    std::thread::Builder::new()
-        .name(relay_thread_name(stream).to_owned())
-        .spawn(move || {
-            let mut buf = [0u8; 8192];
-            loop {
-                match r.read(&mut buf) {
-                    Ok(0) | Err(_) => break,
-                    Ok(n) => {
-                        let note = serde_json::json!({
-                            "method": "proc.out",
-                            "params": ProcOutNote {
-                                chan,
-                                stream: stream.to_string(),
-                                data: B64.encode(&buf[..n]),
-                            },
-                        });
-                        write_frame(&writer, &note);
-                    }
+    thegn_core::thread_name::try_spawn_named(relay_thread_name(stream), move || {
+        let mut buf = [0u8; 8192];
+        loop {
+            match r.read(&mut buf) {
+                Ok(0) | Err(_) => break,
+                Ok(n) => {
+                    let note = serde_json::json!({
+                        "method": "proc.out",
+                        "params": ProcOutNote {
+                            chan,
+                            stream: stream.to_string(),
+                            data: B64.encode(&buf[..n]),
+                        },
+                    });
+                    write_frame(&writer, &note);
                 }
             }
-        })
+        }
+    })
 }
 
 fn proc_stdin_response(req: &Request, procs: &ProcRegistry) -> Response {
@@ -1846,10 +1836,10 @@ fn start_watch(
     let (nudge_tx, nudge_rx) = sync_channel(1);
     let flush_coalescer = coalescer.clone();
     let flush_writer = writer.clone();
-    std::thread::Builder::new()
-        .name("thegn-br-fsflsh".into())
-        .spawn(move || flush_watch_events(flush_coalescer, flush_writer, nudge_rx, watch_id))
-        .map_err(notify::Error::io)?;
+    thegn_core::thread_name::try_spawn_named("thegn-br-fsflsh", move || {
+        flush_watch_events(flush_coalescer, flush_writer, nudge_rx, watch_id)
+    })
+    .map_err(notify::Error::io)?;
 
     let mut watcher = notify::recommended_watcher(move |res: notify::Result<notify::Event>| {
         let Ok(ev) = res else {
@@ -2060,14 +2050,12 @@ fn output_bounded(
     let stderr_capture = Arc::new(Mutex::new(CapturedOutput::default()));
     let out_state = stdout_capture.clone();
     let out_done = done_tx.clone();
-    let out_h = match std::thread::Builder::new()
-        .name("thegn-br-stdout".into())
-        .spawn(move || {
-            drain_capture(stdout, out_state);
-            if let Err(error) = out_done.send(()) {
-                tracing::debug!(%error, "stdout capture completion receiver closed");
-            }
-        }) {
+    let out_h = match thegn_core::thread_name::try_spawn_named("thegn-br-stdout", move || {
+        drain_capture(stdout, out_state);
+        if let Err(error) = out_done.send(()) {
+            tracing::debug!(%error, "stdout capture completion receiver closed");
+        }
+    }) {
         Ok(handle) => handle,
         Err(error) => {
             if let Err(kill_error) = child.kill() {
@@ -2081,14 +2069,12 @@ fn output_bounded(
     };
     let err_state = stderr_capture.clone();
     let err_done = done_tx;
-    let err_h = match std::thread::Builder::new()
-        .name("thegn-br-stderr".into())
-        .spawn(move || {
-            drain_capture(stderr, err_state);
-            if let Err(error) = err_done.send(()) {
-                tracing::debug!(%error, "stderr capture completion receiver closed");
-            }
-        }) {
+    let err_h = match thegn_core::thread_name::try_spawn_named("thegn-br-stderr", move || {
+        drain_capture(stderr, err_state);
+        if let Err(error) = err_done.send(()) {
+            tracing::debug!(%error, "stderr capture completion receiver closed");
+        }
+    }) {
         Ok(handle) => handle,
         Err(error) => {
             if let Err(kill_error) = child.kill() {
