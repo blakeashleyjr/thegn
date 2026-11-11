@@ -944,6 +944,21 @@ mod tests {
     const TEST_PANE_EVENT_CHANNEL_CAPACITY: usize = 256;
 
     #[test]
+    fn drawer_alias_spellings_share_one_pool_key_and_flag_state() {
+        assert_eq!(
+            DrawerPoolKey::worktree(Path::new("/tmp/wt"), FILES_OCCUPANT_ID),
+            DrawerPoolKey::worktree(Path::new("/tmp/wt/"), FILES_OCCUPANT_ID)
+        );
+        let mut c = FlagCache::default();
+        c.set_key(
+            &drawer_scope_key(DrawerScope::Worktree, Path::new("/r/a")),
+            Some(FILES_OCCUPANT_ID.into()),
+        );
+        let alias = drawer_scope_key(DrawerScope::Worktree, Path::new("/r/a/"));
+        assert_eq!(c.occupant_for_key(&alias), Some("files".to_string()));
+    }
+
+    #[test]
     fn flag_cache_round_trips_and_defaults_closed() {
         let mut c = FlagCache::default();
         let a = Path::new("/tmp/wt-a");
