@@ -443,11 +443,24 @@ pub(crate) fn write_state_file(path: &std::path::Path, value: &str) {
     };
     #[cfg(test)]
     crate::testenv::refuse_real_state_write(path, "state file");
+    let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+        tracing::debug!(path = %path.display(), "state file has no UTF-8 file name");
+        return;
+    };
     if let Err(error) = thegn_core::fsperm::ensure_private_dir(parent) {
         tracing::debug!(%error, path = %path.display(), "state file parent is not a private directory");
         return;
     }
-    if let Err(error) = thegn_core::fsperm::write_owner_only_atomic(path, value.as_bytes()) {
+    // Publish through the held directory handle, not a path that re-resolves
+    // the parent (THE-523 / fsperm path-write ratchet).
+    let dir = match thegn_core::fsperm::open_private_dir(parent) {
+        Ok(dir) => dir,
+        Err(error) => {
+            tracing::debug!(%error, path = %path.display(), "state file parent could not be opened");
+            return;
+        }
+    };
+    if let Err(error) = dir.write_owner_only_atomic(name, value.as_bytes()) {
         tracing::debug!(%error, path = %path.display(), "state file write failed");
     }
 }
