@@ -1967,8 +1967,10 @@ artifact_row="$(printf '%s' "$artifact_row_json" | sed -n 's/.*"id":\([0-9]*\).*
 "$SZ" dispatch set-status "$artifact_row" running >/dev/null
 check "dispatch put records an artifact pointer" \
   "[[ -n '$artifact_row' ]] && printf '%s' '$artifact_row_json' | grep -q '\"artifact_path\":\".thegn/pipeline/SMOKE-7/missing/2.md\"'"
+# Capture, then grep: under pipefail the refused command's non-zero exit would fail a direct pipe.
+stage_refusal_err="$("$SZ" dispatch put linear:SMOKE-3B "$R" claude --stage code --artifact README.md 2>&1 >/dev/null || true)"
 check "dispatch put --stage refuses a caller-chosen --artifact" \
-  "'$SZ' dispatch put linear:SMOKE-3B '$R' claude --stage code --artifact README.md 2>&1 >/dev/null | grep -q -- '--artifact is not accepted'"
+  "grep -q -- '--artifact is not accepted' <<<'$stage_refusal_err'"
 stage_refusal_roster="$("$SZ" dispatch list --json 2>/dev/null || true)"
 check "the refused --stage --artifact put created no roster row" \
   "! grep -q SMOKE-3B <<<'$stage_refusal_roster'"
