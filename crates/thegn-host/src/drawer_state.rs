@@ -935,6 +935,47 @@ impl DrawerRuntime {
             panes.table.remove(&pane_id);
         }
     }
+
+    /// Evict every in-memory trace of a closed worktree's drawer: the visible
+    /// pane, hidden pool entries, prewarm markers and the remembered occupant.
+    /// A worktree re-created at the same path must not inherit any of it.
+    /// Pure in-memory (no flags, no I/O); returns whether anything was removed.
+    pub(crate) fn forget_worktree_panes(&mut self, dir: &Path, panes: &mut Panes) -> bool {
+        let scope_key = drawer_scope_key(DrawerScope::Worktree, dir);
+        let mut removed = false;
+        if self
+            .visible
+            .as_ref()
+            .is_some_and(|v| v.scope == DrawerScope::Worktree && v.key.scope_key == scope_key)
+            && let Some(visible) = self.visible.take()
+        {
+            panes.table.remove(&visible.pane_id);
+            removed = true;
+        }
+        let keys: Vec<DrawerPoolKey> = self
+            .pool
+            .hidden
+            .iter()
+            .filter(|(k, _)| k.scope_key == scope_key)
+            .map(|(k, _)| k.clone())
+            .collect();
+        for key in &keys {
+            self.pool.remove_key(key, panes);
+            removed = true;
+        }
+        let prewarming_before = self.prewarming.len();
+        self.prewarming.retain(|k| k.scope_key != scope_key);
+        removed |= self.prewarming.len() != prewarming_before;
+        removed |= self.last.remove(&scope_key).is_some();
+        removed
+    }
+
+    /// `forget_worktree_panes` plus persisting the closed desired state
+    /// (off-loop). The global slot is never touched.
+    pub(crate) fn forget_worktree(&mut self, dir: &Path, panes: &mut Panes) {
+        self.forget_worktree_panes(dir, panes);
+        set_desired_occupant(DrawerScope::Worktree, dir, None);
+    }
 }
 
 #[cfg(test)]
@@ -1273,6 +1314,81 @@ mod tests {
         assert!(pool.contains_key(&tool));
         assert!(!pool.contains_key(&global));
         assert_eq!(pool.take_key(&tool), Some(7));
+    }
+
+    fn forget_fixture() -> (Panes, DrawerRuntime) {
+        let (tx, _rx) = tokio_mpsc::channel(TEST_PANE_EVENT_CHANNEL_CAPACITY);
+        (Panes::new(tx), DrawerRuntime::default())
+    }
+
+    #[test]
+    fn forget_worktree_panes_evicts_only_the_closed_worktrees_state() {
+        let a = Path::new("/tmp/drawer-forget-a");
+        let b = Path::new("/tmp/drawer-forget-b");
+        let (mut panes, mut runtime) = forget_fixture();
+        let a_files = DrawerPoolKey::worktree(a, FILES_OCCUPANT_ID);
+        let a_tool = DrawerPoolKey::worktree(a, "tool:db");
+        let b_files = DrawerPoolKey::worktree(b, FILES_OCCUPANT_ID);
+        let global = DrawerPoolKey::global("tool:db");
+        runtime.pool.stash_key(a_files.clone(), 11, 8, &mut panes);
+        runtime.pool.stash_key(a_tool.clone(), 12, 8, &mut panes);
+        runtime.pool.stash_key(b_files.clone(), 13, 8, &mut panes);
+        runtime.pool.stash_key(global.clone(), 14, 8, &mut panes);
+        runtime
+            .prewarming
+            .insert(DrawerPoolKey::worktree(a, "tool:x"));
+        let a_scope = drawer_scope_key(DrawerScope::Worktree, a);
+        let b_scope = drawer_scope_key(DrawerScope::Worktree, b);
+        runtime.last.insert(a_scope.clone(), "tool:db".into());
+        runtime.last.insert(b_scope.clone(), "tool:db".into());
+        runtime
+            .last
+            .insert(GLOBAL_SCOPE_KEY.to_string(), "tool:db".into());
+
+        assert!(runtime.forget_worktree_panes(a, &mut panes));
+        assert!(!runtime.pool.contains_key(&a_files));
+        assert!(!runtime.pool.contains_key(&a_tool));
+        assert!(runtime.pool.contains_key(&b_files));
+        assert!(runtime.pool.contains_key(&global));
+        assert!(runtime.prewarming.iter().all(|k| k.scope_key != a_scope));
+        assert!(!runtime.last.contains_key(&a_scope));
+        assert!(runtime.last.contains_key(&b_scope));
+        assert!(runtime.last.contains_key(GLOBAL_SCOPE_KEY));
+        assert!(
+            !runtime.forget_worktree_panes(Path::new("/tmp/drawer-forget-unknown"), &mut panes)
+        );
+    }
+
+    #[test]
+    fn forget_worktree_panes_clears_a_visible_worktree_drawer_but_not_a_global_one() {
+        let a = Path::new("/tmp/drawer-forget-a");
+        let (mut panes, mut runtime) = forget_fixture();
+        runtime.visible = Some(VisibleDrawer {
+            key: DrawerPoolKey::worktree(a, FILES_OCCUPANT_ID),
+            scope: DrawerScope::Worktree,
+            worktree: a.to_path_buf(),
+            pane_id: 21,
+        });
+        assert!(runtime.forget_worktree_panes(a, &mut panes));
+        assert!(runtime.visible.is_none());
+
+        runtime.visible = Some(VisibleDrawer {
+            key: DrawerPoolKey::global("tool:db"),
+            scope: DrawerScope::Global,
+            worktree: a.to_path_buf(),
+            pane_id: 22,
+        });
+        assert!(!runtime.forget_worktree_panes(a, &mut panes));
+        assert!(runtime.visible.is_some());
+    }
+
+    #[test]
+    fn forget_worktree_panes_spelling_aliases_share_one_key() {
+        let (mut panes, mut runtime) = forget_fixture();
+        let key = DrawerPoolKey::worktree(Path::new("/tmp/drawer-forget-c"), FILES_OCCUPANT_ID);
+        runtime.pool.stash_key(key.clone(), 31, 8, &mut panes);
+        assert!(runtime.forget_worktree_panes(Path::new("/tmp/drawer-forget-c/"), &mut panes));
+        assert!(!runtime.pool.contains_key(&key));
     }
 
     #[test]
