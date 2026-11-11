@@ -624,32 +624,30 @@ type ReaderRx = mpsc::Receiver<std::io::Result<Capture>>;
 /// (never stdout, which carries machine data such as `--json`) — capture is
 /// identical either way, so output ownership never depends on the mode.
 fn spawn_reader(
-    name: &str,
+    name: &'static str,
     mut pipe: impl Read + Send + 'static,
     tee: bool,
 ) -> std::io::Result<ReaderRx> {
     let (tx, rx) = mpsc::sync_channel(1);
-    std::thread::Builder::new()
-        .name(name.to_string())
-        .spawn(move || {
-            crate::platform::qos::set_self(crate::platform::qos::Qos::Background);
-            let mut cap = Capture::default();
-            let mut buf = [0u8; 8192];
-            let result = loop {
-                match pipe.read(&mut buf) {
-                    Ok(0) => break Ok(()),
-                    Ok(n) => {
-                        cap.push(&buf[..n]);
-                        if tee {
-                            let _ = std::io::stderr().write_all(&buf[..n]); // best-effort: live echo; capture is authoritative
-                        }
+    thegn_core::thread_name::try_spawn_named(name, move || {
+        crate::platform::qos::set_self(crate::platform::qos::Qos::Background);
+        let mut cap = Capture::default();
+        let mut buf = [0u8; 8192];
+        let result = loop {
+            match pipe.read(&mut buf) {
+                Ok(0) => break Ok(()),
+                Ok(n) => {
+                    cap.push(&buf[..n]);
+                    if tee {
+                        let _ = std::io::stderr().write_all(&buf[..n]); // best-effort: live echo; capture is authoritative
                     }
-                    Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
-                    Err(e) => break Err(e),
                 }
-            };
-            let _ = tx.send(result.map(|()| cap)); // best-effort: the receiver may have given up
-        })?;
+                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+                Err(e) => break Err(e),
+            }
+        };
+        let _ = tx.send(result.map(|()| cap)); // best-effort: the receiver may have given up
+    })?;
     Ok(rx)
 }
 
@@ -677,8 +675,8 @@ fn run_bounded(cmd: &mut Command, limits: Limits, tee: bool) -> Result<Captured,
     let deadline = Instant::now() + limits.timeout;
     let out_pipe = child.stdout.take().expect("stdout was piped");
     let err_pipe = child.stderr.take().expect("stderr was piped");
-    let readers = spawn_reader("thegn-setup-stdout", out_pipe, tee)
-        .and_then(|out| spawn_reader("thegn-setup-stderr", err_pipe, tee).map(|err| (out, err)));
+    let readers = spawn_reader("thegn-setup-out", out_pipe, tee)
+        .and_then(|out| spawn_reader("thegn-setup-err", err_pipe, tee).map(|err| (out, err)));
     let (out_rx, err_rx) = match readers {
         Ok(pair) => pair,
         Err(e) => {

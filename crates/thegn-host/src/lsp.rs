@@ -260,15 +260,13 @@ fn teardown_off_loop(clients: Vec<Arc<LspClient>>) {
     if clients.is_empty() {
         return;
     }
-    let spawned = std::thread::Builder::new()
-        .name("thegn-lsp-down".into())
-        .spawn(move || {
-            crate::platform::qos::set_self(crate::platform::qos::Qos::Background);
-            for client in &clients {
-                client.shutdown(LSP_CLOSE_GRACE);
-            }
-            drop(clients);
-        });
+    let spawned = thegn_core::thread_name::try_spawn_named("thegn-lsp-down", move || {
+        crate::platform::qos::set_self(crate::platform::qos::Qos::Background);
+        for client in &clients {
+            client.shutdown(LSP_CLOSE_GRACE);
+        }
+        drop(clients);
+    });
     if let Err(error) = spawned {
         tracing::warn!(target: "thegn::lsp", %error, "LSP teardown thread failed to spawn");
     }
