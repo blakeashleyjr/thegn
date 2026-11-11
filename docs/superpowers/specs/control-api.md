@@ -49,6 +49,27 @@ not be able to type into terminals or execute configured tools. Read-only
 views require only `read`—an under-scoped request is rejected **before any
 action runs** (403 / `PERMISSION_DENIED`).
 
+Worked request examples: [control-api-examples.md](control-api-examples.md).
+
+## Transports and access modes
+
+Which credential a caller needs depends on how it reaches the daemon. The
+decision record is [Remote control transport
+security](control-transport-security.md); the exposure names below are the
+diagnostics `thegn doctor` reports.
+
+| Mode                                                                     | Who it is for                                                     | Credential               | Transport schemes                 | Status                     |
+| ------------------------------------------------------------------------ | ----------------------------------------------------------------- | ------------------------ | --------------------------------- | -------------------------- |
+| Local-admin unix socket (`[serve] local_admin = true`)                   | The owner's own processes on the daemon host (same effective UID) | Implicit admin, no token | `http`, `ws`                      | Supported                  |
+| Scoped token on the unix socket (`local_admin = false`, or UID mismatch) | Other local users and processes                                   | Scoped bearer token      | `http`, `ws`                      | Supported                  |
+| `safe-loopback`                                                          | Direct TCP, loopback only                                         | Scoped bearer token      | `http`, `ws`, `grpc`              | Supported                  |
+| `tls-terminated`                                                         | An operator TLS terminator on the same host as the daemon         | Scoped bearer token      | `https`, `wss`, `grpcs`           | Supported                  |
+| `tunnel`                                                                 | An operator tunnel to a loopback backend                          | Scoped bearer token      | `http`, `ws`, `grpc` (client end) | Supported                  |
+| `unsafe-plaintext`                                                       | Explicit unsafe opt-in for plaintext non-loopback TCP             | Scoped bearer token      | `http`, `ws`, `grpc`              | Supported, reported unsafe |
+| Unsupported: native TLS termination                                      | Nobody: the native TCP backend is plaintext                       | n/a                      | n/a                               | Unsupported                |
+| Unsupported: a terminator or proxy on another machine than the backend   | Nobody: the backend must stay on loopback                         | n/a                      | n/a                               | Unsupported                |
+| Unsupported: trusting `Forwarded` or `X-Forwarded-*` headers             | Nobody: the daemon does not derive identity or scheme from them   | n/a                      | n/a                               | Unsupported                |
+
 ## Tokens & pairing
 
 - Control token: `tgc1_<id:8hex>_<secret:64hex>` — the bearer credential
