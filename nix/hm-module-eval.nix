@@ -162,6 +162,18 @@
           activityAgentPrograms = ["claude" "my-agent"];
           monitorSystem = "htop";
           monitorGpu = "nvtop";
+          recordingDir = "/tmp/thegn-hm/recordings";
+          recordingMaxBytes = 1048576;
+          mediaEnabled = true;
+          mediaShowArt = false;
+          mediaOverlayOnBadgeClick = false;
+          mediaSeekStepSecs = 5;
+          mediaSeekStepVideoSecs = 20;
+          mediaPollIntervalSecs = 4;
+          mediaPlayersPriority = ["mpv" "spotify"];
+          monitorProcRows = 15;
+          monitorProcesses = true;
+          monitorProcessIo = true;
           agents = [
             {
               name = "shell";

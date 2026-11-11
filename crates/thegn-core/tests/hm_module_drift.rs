@@ -211,8 +211,20 @@ const OMITTED: &[(&str, &str)] = &[
     ("autopilot", "autopilot policy is not exposed"),
     ("pipeline", "pipeline definitions are not exposed"),
     ("skills", "skill configuration is not exposed"),
-    ("recording", "session recording is not exposed"),
-    ("media", "media controls are not exposed"),
+    (
+        "media.backend",
+        "media backend enum needs destination pinning and is not exposed",
+    ),
+    (
+        "media.default_action",
+        "media default-action enum needs destination pinning and is not exposed",
+    ),
+    (
+        "media.volume_step",
+        "media volume step is a float and needs float pinning",
+    ),
+    ("media.mpv", "mpv backend table is not exposed"),
+    ("media.mpd", "mpd backend table is not exposed"),
     ("voice", "voice input is not exposed"),
     ("usage", "usage tracking is not exposed"),
     ("model_proxy", "model proxy is not exposed"),
@@ -272,12 +284,6 @@ const OMITTED: &[(&str, &str)] = &[
         "monitor.default_scale",
         "monitor graph scale is not exposed",
     ),
-    (
-        "monitor.proc_rows",
-        "monitor process row count is not exposed",
-    ),
-    ("monitor.processes", "process sampling is not exposed"),
-    ("monitor.process_io", "process I/O sampling is not exposed"),
     (
         "log.stderr_cap_mb",
         "captured stderr retention is not exposed",
@@ -707,6 +713,8 @@ fn every_schema_key_is_rendered_or_dispositioned() {
         "notifications",
         "activity",
         "monitor",
+        "recording",
+        "media",
         "pr",
         "watch",
         "log",
@@ -1091,6 +1099,42 @@ fn hm_notifications_dnd_and_sound_bools_are_rendered_and_rest_dispositioned() {
 }
 
 #[test]
+fn hm_recording_media_and_monitor_process_keys_are_rendered_and_rest_dispositioned() {
+    let rendered = rendered_paths(&module_src());
+    for path in [
+        "recording.dir",
+        "recording.max_bytes",
+        "media.enabled",
+        "media.show_art",
+        "media.overlay_on_badge_click",
+        "media.seek_step_secs",
+        "media.seek_step_video_secs",
+        "media.poll_interval_secs",
+        "media.players_priority",
+        "monitor.proc_rows",
+        "monitor.processes",
+        "monitor.process_io",
+    ] {
+        assert!(rendered.contains(path), "Home Manager must render {path}");
+    }
+
+    let omissions: BTreeSet<&str> = OMITTED.iter().map(|(path, _)| *path).collect();
+    for table in ["recording", "media", "monitor"] {
+        let schema = schema_field(table);
+        let properties = schema["properties"]
+            .as_object()
+            .unwrap_or_else(|| panic!("{table} schema properties"));
+        for key in properties.keys() {
+            let path = format!("{table}.{key}");
+            assert!(
+                rendered.contains(&path) || omissions.contains(path.as_str()),
+                "{path} must be rendered or dispositioned by an exact ledger row"
+            );
+        }
+    }
+}
+
+#[test]
 fn hm_loc_and_replay_families_are_fully_rendered() {
     let rendered = rendered_paths(&module_src());
     for table in ["loc", "replay"] {
@@ -1253,6 +1297,11 @@ fn every_numeric_option_matches_its_destination_range() {
             "gitAutoFetchMinIntervalSecs",
             "git.auto_fetch_min_interval_secs",
         ),
+        ("recordingMaxBytes", "recording.max_bytes"),
+        ("mediaSeekStepSecs", "media.seek_step_secs"),
+        ("mediaSeekStepVideoSecs", "media.seek_step_video_secs"),
+        ("mediaPollIntervalSecs", "media.poll_interval_secs"),
+        ("monitorProcRows", "monitor.proc_rows"),
     ];
     let options = numeric_options(&module_src());
     let actual_names: BTreeSet<&str> = options.iter().map(|(name, _)| name.as_str()).collect();
