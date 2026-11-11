@@ -161,9 +161,63 @@ pub fn error_inclusive_tail(
     out
 }
 
+/// Classification of a log line's worktree tag (`wt_slug` format).
+///
+/// [`crate::log_trace::wt_slug`] writes `""` for a host-global line,
+/// `"<label>.<64 lowercase hex>"` for a worktree, and `"<label>.unbound"` when
+/// the path exceeds the identity bound. `Legacy` and `Unbound` tags can never
+/// be proven to belong to the active worktree.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WtTagClass {
+    HostGlobal,
+    Versioned,
+    Unbound,
+    Legacy,
+}
+
+pub fn classify_wt_tag(tag: Option<&str>) -> WtTagClass {
+    let Some(tag) = tag.filter(|t| !t.is_empty()) else {
+        return WtTagClass::HostGlobal;
+    };
+    if tag.ends_with(".unbound") {
+        return WtTagClass::Unbound;
+    }
+    match tag.rsplit_once('.') {
+        Some((_, hex))
+            if hex.len() == 64 && hex.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f')) =>
+        {
+            WtTagClass::Versioned
+        }
+        _ => WtTagClass::Legacy,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn classify_wt_tag_recognises_the_wt_slug_shapes() {
+        use crate::log_trace::wt_slug;
+        use std::path::Path;
+        let versioned = wt_slug(Path::new("/repos/a/feat_x"));
+        assert_eq!(classify_wt_tag(Some(&versioned)), WtTagClass::Versioned);
+        let global = wt_slug(Path::new(""));
+        assert_eq!(classify_wt_tag(Some(&global)), WtTagClass::HostGlobal);
+        assert_eq!(classify_wt_tag(None), WtTagClass::HostGlobal);
+        let long = format!("/{}", "x".repeat(20_000));
+        let unbound = wt_slug(Path::new(&long));
+        assert_eq!(classify_wt_tag(Some(&unbound)), WtTagClass::Unbound);
+        let hex63 = format!("feat.{}", "a".repeat(63));
+        let bad64 = format!("feat.{}G", "a".repeat(63));
+        for legacy in ["feat-x", "feat-x.abc", hex63.as_str(), bad64.as_str()] {
+            assert_eq!(
+                classify_wt_tag(Some(legacy)),
+                WtTagClass::Legacy,
+                "{legacy}"
+            );
+        }
+    }
 
     const INFO_LINE: &str = "2026-06-05T12:00:00  INFO  thegn::db  connection opened";
     const ERROR_LINE: &str = "2026-06-05T12:00:01  ERROR thegn::host  fatal error occurred";
