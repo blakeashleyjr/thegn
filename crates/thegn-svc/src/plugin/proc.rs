@@ -732,13 +732,13 @@ fn spawn_ndjson_stream_inner<S: NdjsonSink>(
                         .min(u64::MAX as u128) as u64,
                     Ordering::Release,
                 );
-                kill_group(pid);
+                kill_group_and_escaped(pid);
                 break 'run reap_after_kill(child);
             }
             if Instant::now() >= deadline {
                 timed_out = true;
                 kill_requested = true;
-                kill_group(pid);
+                kill_group_and_escaped(pid);
                 break 'run reap_after_kill(child);
             }
             std::thread::sleep(Duration::from_millis(20));
@@ -1354,6 +1354,16 @@ pub(crate) fn term_group(pid: u32) {
     kill_group(pid);
 }
 
+/// Kill the leader's group, then every tracked descendant that escaped it
+/// (setsid). The /proc snapshot MUST be taken while the leader is still
+/// unreaped so the pid is pinned and the walk starts at the real leader.
+#[cfg(unix)]
+fn kill_group_and_escaped(pid: u32) {
+    let tracked = super::platform::linux_descendants(pid as libc::pid_t);
+    kill_group(pid);
+    super::platform::kill_tracked(&tracked);
+}
+
 #[cfg(unix)]
 pub(crate) fn kill_group(pid: u32) {
     // Negative pid targets the whole group.
@@ -1426,6 +1436,112 @@ mod process_tree_deadline_tests {
         std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
         let marker = dir.path().join("escaped").to_string_lossy().into_owned();
         (dir, marker)
+    }
+
+    /// Script that detaches a setsid grandchild (pid published atomically in
+    /// `$1`), waits for that pid file, then blocks.
+    const SETSID_GRANDCHILD_SCRIPT: &str = "setsid sh -c 'echo $$ > \"$1.tmp\"; mv \"$1.tmp\" \"$1\"; exec sleep 300' sh \"$1\" & i=0; while [ ! -s \"$1\" ]; do i=$((i+1)); [ \"$i\" -gt 500 ] && exit 97; sleep 0.01; done; sleep 30";
+
+    fn setsid_grandchild_argv(pid_path: &Path) -> Vec<String> {
+        vec![
+            "sh".into(),
+            "-c".into(),
+            SETSID_GRANDCHILD_SCRIPT.into(),
+            "sh".into(),
+            pid_path.to_string_lossy().into_owned(),
+        ]
+    }
+
+    fn read_pid(path: &Path) -> i32 {
+        std::fs::read_to_string(path)
+            .expect("grandchild wrote its pid")
+            .trim()
+            .parse()
+            .expect("grandchild pid is numeric")
+    }
+
+    fn pid_is_alive(pid: i32) -> bool {
+        // A killed process may linger as a zombie until init reaps it.
+        if let Ok(stat) = std::fs::read_to_string(format!("/proc/{pid}/stat"))
+            && stat
+                .rsplit_once(')')
+                .is_some_and(|(_, rest)| rest.trim_start().starts_with('Z'))
+        {
+            return false;
+        }
+        // SAFETY: signal 0 only checks whether this pid still exists.
+        unsafe { libc::kill(pid, 0) == 0 }
+    }
+
+    fn assert_gone_within(pid: i32, window: Duration) {
+        let until = Instant::now() + window;
+        while pid_is_alive(pid) && Instant::now() < until {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        if pid_is_alive(pid) {
+            // SAFETY: cleanup of the pid this test started.
+            unsafe {
+                libc::kill(pid, libc::SIGKILL);
+            }
+            panic!("escaped grandchild {pid} survived");
+        }
+    }
+
+    #[test]
+    fn timeout_kills_a_setsid_grandchild() {
+        if !setsid_available() {
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        let pid_path = dir.path().join("grandchild.pid");
+        let result = spawn_ndjson(
+            &setsid_grandchild_argv(&pid_path),
+            &BTreeMap::new(),
+            None,
+            Duration::from_millis(1500),
+        );
+        assert!(matches!(result, Err(PluginError::Timeout(_))));
+        assert_gone_within(read_pid(&pid_path), Duration::from_secs(2));
+        assert_readers_exit_within_margin();
+    }
+
+    #[test]
+    fn cancel_kills_a_setsid_grandchild() {
+        if !setsid_available() {
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        let pid_path = dir.path().join("grandchild.pid");
+        let result = spawn_ndjson_cancellable(
+            &setsid_grandchild_argv(&pid_path),
+            &BTreeMap::new(),
+            None,
+            Duration::from_secs(30),
+            &|| std::fs::metadata(&pid_path).is_ok_and(|m| m.len() > 0),
+        );
+        assert!(matches!(result, Err(PluginError::Cancelled)));
+        assert_gone_within(read_pid(&pid_path), Duration::from_secs(2));
+        assert_readers_exit_within_margin();
+    }
+
+    #[test]
+    fn escaped_kill_spares_an_unrelated_process() {
+        let mut bystander = Command::new("sleep").arg("300").spawn().unwrap();
+        let pid = bystander.id() as i32;
+        let result = spawn_ndjson(
+            &["sh".into(), "-c".into(), "sleep 30".into()],
+            &BTreeMap::new(),
+            None,
+            Duration::from_millis(300),
+        );
+        let alive = pid_is_alive(pid);
+        bystander.kill().unwrap();
+        bystander.wait().unwrap();
+        assert!(matches!(result, Err(PluginError::Timeout(_))));
+        assert!(alive, "unrelated process was killed");
+        assert_readers_exit_within_margin();
     }
 
     fn run_holding_pipe(which: &str, marker: &str) -> super::PluginRun {
@@ -1517,7 +1633,9 @@ mod process_tree_deadline_tests {
             Err(PluginError::Timeout(_)) => {
                 let outcome = super::last_timeout_outcome().expect("timeout outcome recorded");
                 assert!(outcome.killed);
-                assert!(!outcome.drained);
+                // THE-1889: the tracked setsid holder is now killed with the group, so the
+                // pipes reach EOF inside the bound instead of staying held open.
+                assert!(outcome.drained);
                 assert!(outcome.reaped);
             }
             other => panic!("expected timeout, got {other:?}"),

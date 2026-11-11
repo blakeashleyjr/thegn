@@ -285,6 +285,24 @@ pub const CATALOG: &[HostCapability] = &[
         SurfaceSet::ALL,
         "Queue a worktree or worktree-relative file for local editor handoff",
     ),
+    // The worktree sandbox-profile pin. Two rows because scope is per verb: the
+    // read is a plain Read verb (and an MCP state tool), the set is host-owned
+    // and Admin-scoped, so it is HTTP + CLI only and never reaches MCP or a
+    // plugin (`admin_caps_never_reach_mcp_or_plugin`). gRPC is deliberately not
+    // claimed (no proto change); that narrowing is policy, not a SURFACE_GAPS
+    // excuse, the same shape as the pairings rows.
+    cap(
+        "worktrees.sandbox_profile",
+        Verb::WorktreeSandboxProfile,
+        SurfaceSet::of(&[Surface::Http, Surface::Cli, Surface::Mcp]),
+        "Read a worktree's pinned sandbox profile (null = inherit configured policy)",
+    ),
+    cap(
+        "worktrees.sandbox_profile_set",
+        Verb::WorktreeSandboxProfileSet,
+        SurfaceSet::of(&[Surface::Http, Surface::Cli]),
+        "Pin a worktree's sandbox profile to standard or sealed, or clear the pin (admin; host-owned, never MCP or plugin)",
+    ),
     cap(
         "launch.preset",
         Verb::LaunchPreset,
@@ -2263,6 +2281,29 @@ mod tests {
         let mcp: Vec<&str> = required_for(Surface::Mcp).map(|c| c.id.0).collect();
         assert!(mcp.contains(&"sessions.list"));
         assert!(!mcp.contains(&"git.status"), "git.status is excused on MCP");
+    }
+
+    #[test]
+    fn worktree_sandbox_profile_rows_claim_only_implemented_surfaces() {
+        let read = lookup("worktrees.sandbox_profile").unwrap();
+        assert_eq!(
+            read.surfaces,
+            SurfaceSet::of(&[Surface::Http, Surface::Cli, Surface::Mcp])
+        );
+        assert_eq!(
+            crate::control::required_scope(read.verb),
+            crate::control::Scope::Read
+        );
+        let set = lookup("worktrees.sandbox_profile_set").unwrap();
+        assert_eq!(set.surfaces, SurfaceSet::of(&[Surface::Http, Surface::Cli]));
+        assert_eq!(
+            crate::control::required_scope(set.verb),
+            crate::control::Scope::Admin
+        );
+        for c in [read, set] {
+            assert!(c.deprecated.is_none(), "{}", c.id);
+            assert!(c.stub.is_none(), "{}", c.id);
+        }
     }
 
     #[test]

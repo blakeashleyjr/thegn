@@ -753,6 +753,62 @@ pub struct FolderAssignReq {
     pub clear: bool,
 }
 
+/// Query for `worktrees.sandbox_profile`: which worktree's pin to read. The
+/// path is matched exactly as registered (no canonicalization).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct SandboxProfileQuery {
+    /// Absolute path of a registered worktree, exactly as registered.
+    pub worktree: String,
+}
+
+/// Pin or clear a worktree's sandbox profile (`worktrees.sandbox_profile_set`).
+/// Clearing is always explicit (`clear: true`), and unknown keys are refused, so
+/// a misspelled `profile` can never silently clear a pin. The path is matched
+/// exactly as registered (no canonicalization).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct SandboxProfileSetReq {
+    /// Absolute path of a registered worktree, exactly as registered.
+    pub worktree: String,
+    /// `standard` or `sealed`. Mutually exclusive with `clear`.
+    #[serde(default)]
+    pub profile: Option<String>,
+    /// `true` to clear the pin (the configured policy applies again). Mutually
+    /// exclusive with `profile`.
+    #[serde(default)]
+    pub clear: bool,
+}
+
+impl SandboxProfileSetReq {
+    /// Exactly one of `{profile: Some, clear: true}` is valid. `Ok(Some(p))`
+    /// pins `p`, `Ok(None)` clears.
+    pub fn action(&self) -> ControlResult<Option<&str>> {
+        match (self.profile.as_deref(), self.clear) {
+            (Some(profile), false) => Ok(Some(profile)),
+            (None, true) => Ok(None),
+            (Some(_), true) => Err(ControlError::InvalidArgument(
+                "worktrees.sandbox_profile_set takes either `profile` or `clear: true`, not both"
+                    .into(),
+            )),
+            (None, false) => Err(ControlError::InvalidArgument(
+                "worktrees.sandbox_profile_set needs `profile` (pin) or `clear: true` (clear)"
+                    .into(),
+            )),
+        }
+    }
+}
+
+/// A worktree's pinned sandbox profile; `profile` is null when nothing is
+/// pinned (the configured policy applies).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct SandboxProfileReply {
+    /// The worktree path the pin belongs to.
+    pub worktree: String,
+    /// The pinned profile's wire name, or null when inheriting.
+    pub profile: Option<String>,
+}
+
 /// The validated intent of a [`FolderAssignReq`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FolderAction<'a> {
@@ -1360,6 +1416,31 @@ pub trait ControlApi: Send + Sync + 'static {
         Box::pin(async {
             Err(ControlError::Unimplemented(
                 "worktree folder assignment is not available",
+            ))
+        })
+    }
+
+    /// Read a worktree's pinned sandbox profile (`worktrees.sandbox_profile`).
+    fn worktree_sandbox_profile(
+        &self,
+        _query: SandboxProfileQuery,
+    ) -> BoxFuture<'_, ControlResult<SandboxProfileReply>> {
+        Box::pin(async {
+            Err(ControlError::Unimplemented(
+                "worktree sandbox profile is not available",
+            ))
+        })
+    }
+
+    /// Pin or clear a worktree's sandbox profile
+    /// (`worktrees.sandbox_profile_set`).
+    fn set_worktree_sandbox_profile(
+        &self,
+        _req: SandboxProfileSetReq,
+    ) -> BoxFuture<'_, ControlResult<SandboxProfileReply>> {
+        Box::pin(async {
+            Err(ControlError::Unimplemented(
+                "worktree sandbox profile pinning is not available",
             ))
         })
     }

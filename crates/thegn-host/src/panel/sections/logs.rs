@@ -50,6 +50,39 @@ pub(crate) fn visible_lines<'a>(
     visible_with_seq(panel, ui).map(|(_, log)| log)
 }
 
+/// Worktree scope for one row: exact versioned tag or host-global only.
+/// Legacy and unbound tags cannot be tied to the active worktree.
+fn row_in_scope(worktree: Option<&str>, all: bool, active: &str) -> bool {
+    use thegn_core::log_view::{WtTagClass, classify_wt_tag};
+    all || match classify_wt_tag(worktree) {
+        WtTagClass::HostGlobal => true,
+        WtTagClass::Versioned => worktree == Some(active),
+        WtTagClass::Unbound | WtTagClass::Legacy => false,
+    }
+}
+
+fn scope_label(all: bool) -> &'static str {
+    if all {
+        " · all worktrees"
+    } else {
+        " · this worktree + global"
+    }
+}
+
+fn worktree_detail(tag: Option<&str>) -> String {
+    use thegn_core::log_view::{WtTagClass, classify_wt_tag};
+    match (classify_wt_tag(tag), tag) {
+        (WtTagClass::Versioned, Some(t)) => format!("worktree  {t}"),
+        (WtTagClass::Unbound, Some(t)) => {
+            format!("worktree  {t} (unbound: path too long to identify)")
+        }
+        (WtTagClass::Legacy, Some(t)) => {
+            format!("worktree  {t} (legacy tag, not tied to any worktree)")
+        }
+        _ => "host-global".to_string(),
+    }
+}
+
 pub(crate) fn visible_with_seq<'a>(
     panel: &'a crate::panel::PanelData,
     ui: &PanelUi,
@@ -63,14 +96,11 @@ pub(crate) fn visible_with_seq<'a>(
         .iter()
         .enumerate()
         .filter_map(move |(i, l)| {
-            let visible =
-                (all || match l.worktree.as_deref() {
-                    None => true,
-                    Some(w) => w == active,
-                }) && min.is_none_or(|m| rank(&l.level) >= m)
-                    && (filter.is_empty()
-                        || l.message.to_lowercase().contains(&filter)
-                        || l.original.to_lowercase().contains(&filter));
+            let visible = row_in_scope(l.worktree.as_deref(), all, &active)
+                && min.is_none_or(|m| rank(&l.level) >= m)
+                && (filter.is_empty()
+                    || l.message.to_lowercase().contains(&filter)
+                    || l.original.to_lowercase().contains(&filter));
             visible.then_some((panel.log_first_seq + i as u64, l))
         })
 }
@@ -146,11 +176,7 @@ pub fn content(ctx: &SectionCtx) -> Vec<PanelRow> {
     let mut rows = Vec::new();
 
     let total = items.len();
-    let scope = if all {
-        " · all worktrees"
-    } else {
-        " · this repo"
-    };
+    let scope = scope_label(all);
     rows.push(PanelRow::plain(Line::segs(vec![
         seg(d(), "LOGS"),
         seg(g2(), format!(" · {total} lines")),
@@ -219,7 +245,7 @@ pub fn content(ctx: &SectionCtx) -> Vec<PanelRow> {
         ("l", "level"),
         ("y", "copy"),
         ("a", "tail"),
-        ("g", if all { "this repo" } else { "all" }),
+        ("g", if all { "this worktree" } else { "all" }),
         ("w", "export"),
     ]));
 
@@ -232,11 +258,7 @@ pub fn content(ctx: &SectionCtx) -> Vec<PanelRow> {
 fn full_view(ctx: &SectionCtx, items: &[&ParsedLog], all: bool) -> Vec<PanelRow> {
     let cols = ctx.cols;
     let mut rows: Vec<PanelRow> = Vec::new();
-    let scope = if all {
-        " · all worktrees"
-    } else {
-        " · this repo"
-    };
+    let scope = scope_label(all);
     rows.push(PanelRow::plain(Line::segs(vec![
         seg(d(), "LOGS"),
         seg(g2(), format!(" · {} lines{scope}", items.len())),
@@ -295,13 +317,7 @@ fn full_view(ctx: &SectionCtx, items: &[&ParsedLog], all: bool) -> Vec<PanelRow>
             seg(g(), "  "),
             seg(g2(), l.timestamp.clone()),
         ],
-        vec![seg(
-            g2(),
-            match l.worktree.as_deref() {
-                Some(w) => format!("worktree  {w}"),
-                None => "host-global".to_string(),
-            },
-        )],
+        vec![seg(g2(), worktree_detail(l.worktree.as_deref()))],
         Vec::new(),
     ];
     for chunk in wrap_text(&l.message, detail_w) {
@@ -347,6 +363,31 @@ fn level_tok(l: &ParserLogLevel) -> crate::seg::Tok {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn scope_excludes_other_worktrees_legacy_and_unbound_rows() {
+        use std::path::Path;
+        use thegn_core::log_trace::wt_slug;
+        let active = wt_slug(Path::new("/repos/a/feat_x"));
+        let same = active.clone();
+        let other = wt_slug(Path::new("/repos/b/feat-x"));
+        let unbound = wt_slug(Path::new(&format!("/{}", "x".repeat(20_000))));
+        assert!(row_in_scope(Some(&same), false, &active));
+        assert!(row_in_scope(None, false, &active));
+        assert!(!row_in_scope(Some(&other), false, &active));
+        assert!(!row_in_scope(Some("feat-x"), false, &active));
+        assert!(!row_in_scope(Some(&unbound), false, &active));
+        assert!(!row_in_scope(Some(&unbound), false, &unbound));
+        for tag in [
+            Some(same.as_str()),
+            None,
+            Some(other.as_str()),
+            Some("feat-x"),
+            Some(unbound.as_str()),
+        ] {
+            assert!(row_in_scope(tag, true, &active));
+        }
+    }
 
     fn model_with_logs(logs: Vec<ParsedLog>, first_seq: u64) -> crate::chrome::FrameModel {
         crate::chrome::FrameModel {

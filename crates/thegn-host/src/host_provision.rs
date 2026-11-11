@@ -163,6 +163,7 @@ pub(crate) fn provision_worktree_on_host(
         return None; // bwrap/none: the pipeline targets OCI containers only
     }
     let container = spec.name.clone();
+    let sealed = spec.seal_home.is_some();
 
     let _lease = match acquire_container_lease(env_name, &container) {
         Ok(Some(lease)) => lease,
@@ -211,6 +212,9 @@ pub(crate) fn provision_worktree_on_host(
     let host_home = std::path::PathBuf::from(std::env::var("HOME").unwrap_or_default());
     let (dotfiles, _roots) =
         crate::agent_home::resolve_personal_dotfiles(&host_home, home_cfg, env_name);
+    // Warned below, only once provisioning actually runs (not on every open).
+    let dropped_dotfiles = if sealed { dotfiles.len() } else { 0 };
+    let (dotfiles, atuin) = personal_host_layer(sealed, dotfiles, home_cfg.atuin);
     let opts = envplan::PlanOpts {
         workdir: worktree.to_string(),
         origin: None,
@@ -222,7 +226,7 @@ pub(crate) fn provision_worktree_on_host(
         allow_nix: true,
         checkpoint: false,
         strategy: home_cfg.strategy,
-        atuin: home_cfg.atuin,
+        atuin,
         toolchain: cfg.toolchain.clone(),
         ..envplan::PlanOpts::default()
     };
@@ -280,6 +284,16 @@ pub(crate) fn provision_worktree_on_host(
     if already {
         return init;
     }
+    if sealed && (home_cfg.atuin || dropped_dotfiles > 0) {
+        thegn_core::msg::warn(&format!(
+            "host worktree pipeline: sealed profile: [sandbox.home] atuin ({}) and dotfiles ({dropped_dotfiles}) are not applied (they are credentials/host $HOME)",
+            if home_cfg.atuin {
+                "configured"
+            } else {
+                "not configured"
+            },
+        ));
+    }
 
     // 5. Apply, streaming the splash.
     let mut views: Vec<ProvisionStepView> = plan
@@ -297,7 +311,11 @@ pub(crate) fn provision_worktree_on_host(
     for (i, step) in plan.steps.iter().enumerate() {
         views[i].state = ProvisionState::Active;
         progress(&views);
-        let result: Result<(), String> = if step.id == TOOLCHAIN_PROVIDER_STEP {
+        let result: Result<(), String> = if let Some(refusal) =
+            host_credential_step_refusal(&step.kind, sealed)
+        {
+            Err(refusal)
+        } else if step.id == TOOLCHAIN_PROVIDER_STEP {
             detect_error.clone().map_or_else(
                 || {
                     crate::mise_provider::install_on_target(
@@ -415,6 +433,24 @@ fn synth_init(req: &envplan::EnvRequirements, cfg: &Config, worktree: &str) -> O
          fi",
         thegn_core::util::sh_quote(worktree),
     ))
+}
+
+const SEALED_HOME_REFUSAL: &str = "sealed profile: host $HOME files (atuin key/session, dotfiles) are not copied into the container";
+
+/// A sealed profile promises host `$HOME` is not visible: drop every
+/// host-`$HOME`-derived layer (dotfiles, atuin key/session) from the plan.
+fn personal_host_layer(sealed: bool, dotfiles: Vec<String>, atuin: bool) -> (Vec<String>, bool) {
+    if sealed {
+        (Vec::new(), false)
+    } else {
+        (dotfiles, atuin)
+    }
+}
+
+/// Defence in depth: refuse a host-`$HOME` step even if one is planned.
+fn host_credential_step_refusal(kind: &StepKind, sealed: bool) -> Option<String> {
+    (sealed && matches!(kind, StepKind::Dotfiles(_) | StepKind::AtuinSync))
+        .then(|| SEALED_HOME_REFUSAL.to_string())
 }
 
 fn secs(n: u64) -> Duration {
@@ -786,6 +822,51 @@ pub(crate) fn plan_summary(req: &envplan::EnvRequirements, cfg: &Config) -> (Str
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn personal_plan(dotfiles: Vec<String>, atuin: bool) -> EnvPlan {
+        envplan::plan(
+            &envplan::detect_from_probe(""),
+            &envplan::PlanOpts {
+                workdir: "/wt/x".into(),
+                strategy: thegn_core::config::ShellStrategy::Portable,
+                tools: vec!["atuin".into()],
+                dotfiles,
+                atuin,
+                ..envplan::PlanOpts::default()
+            },
+        )
+    }
+
+    #[test]
+    fn sealed_profile_plan_has_no_atuin_or_dotfile_steps() {
+        let dotfiles = vec![".zshrc".to_string()];
+        let (d, a) = personal_host_layer(true, dotfiles.clone(), true);
+        assert!(d.is_empty() && !a);
+        let plan = personal_plan(d, a);
+        assert!(plan.steps.iter().all(|s| {
+            !matches!(s.kind, StepKind::AtuinSync | StepKind::Dotfiles(_))
+                && s.id != "atuin_sync"
+                && s.id != "dotfiles"
+        }));
+        // Control: unsealed keeps both, so the assertion above is not vacuous.
+        let (d, a) = personal_host_layer(false, dotfiles.clone(), true);
+        assert_eq!((d.clone(), a), (dotfiles, true));
+        let plan = personal_plan(d, a);
+        assert!(plan.steps.iter().any(|s| s.id == "atuin_sync"));
+        assert!(plan.steps.iter().any(|s| s.id == "dotfiles"));
+    }
+
+    #[test]
+    fn sealed_profile_refuses_credential_steps_even_if_planned() {
+        let files = StepKind::Dotfiles(vec![".zshrc".into()]);
+        for kind in [&StepKind::AtuinSync, &files] {
+            let refusal = host_credential_step_refusal(kind, true).expect("refused");
+            assert!(refusal.contains("sealed"));
+            assert!(host_credential_step_refusal(kind, false).is_none());
+        }
+        assert!(host_credential_step_refusal(&StepKind::Exec(String::new()), true).is_none());
+        assert!(host_credential_step_refusal(&StepKind::AgentConfigs(Vec::new()), true).is_none());
+    }
 
     #[test]
     fn container_lease_is_exclusive_per_env_and_container() {

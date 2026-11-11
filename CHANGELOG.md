@@ -7,6 +7,46 @@ All notable changes to **thegn** are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.1.0-alpha.58] — 2026-11-10
+
+### Added
+
+- Releases now include an aggregate `SHA256SUMS` file covering the Linux
+  tarball, the `.deb` and `.rpm` packages and the notices file, plus the
+  `THIRD_PARTY_NOTICES.md` licence notices as a release asset.
+- The control API can read a worktree's sandbox profile pin
+  (`worktrees.sandbox_profile`) and set it to `standard` or `sealed`
+  (`worktrees.sandbox_profile_set`, admin only; an explicit `clear` removes the
+  pin). The change is not offered to MCP tools or plugins.
+- `thegn doctor` lists worktree sandbox pins, showing each pin and the profile
+  the worktree would use without it. The JSON report carries the same list as
+  `worktree_sandbox_pins`.
+- `just net-trace` (`scripts/first-run-net-trace.sh`) is an opt-in Linux script
+  that traces a release binary's first frame in a throwaway home and reports
+  any network connection other than local Unix sockets. It needs `strace`.
+
+### Changed
+
+- When the state database was written by a newer thegn, the refusal message now
+  points to the "Upgrading and uninstalling" help page for upgrade, rollback
+  and backup steps.
+- Verification refuses a pipeline handoff that contains a known credential
+  format, such as a private key, a token or a URL with a password, and names the
+  kind without echoing the value.
+- The Logs panel's worktree scope reads "this worktree + global". Entries with
+  a legacy or unbound worktree tag no longer appear under a single worktree and
+  are labelled in the detail view.
+
+### Fixed
+
+- Sealed worktrees on host-backed containers no longer receive your atuin key
+  and session or your dotfiles; thegn logs one warning when it drops them.
+- A one-shot plugin that times out or is cancelled now has descendants that
+  detached into their own session killed as well.
+- Spellings of one worktree path that differ only by a trailing slash or a dot
+  segment share one drawer state. Drawer state saved under a trailing-slash
+  path reopens closed once.
+
 ## [0.1.0-alpha.57] — 2026-11-10
 
 ### Added
@@ -2972,7 +3012,8 @@ launcher picker and the merge queue's `agent_command` hook remain — they run
 whatever commands you configure. Leftover `[llm_proxy]` config sections and
 `proxy_*` tables in existing state databases are ignored harmlessly.
 
-[Unreleased]: https://github.com/blakeashleyjr/thegn/compare/v0.1.0-alpha.57...HEAD
+[Unreleased]: https://github.com/blakeashleyjr/thegn/compare/v0.1.0-alpha.58...HEAD
+[0.1.0-alpha.58]: https://github.com/blakeashleyjr/thegn/compare/v0.1.0-alpha.57...v0.1.0-alpha.58
 [0.1.0-alpha.57]: https://github.com/blakeashleyjr/thegn/compare/v0.1.0-alpha.56...v0.1.0-alpha.57
 [0.1.0-alpha.56]: https://github.com/blakeashleyjr/thegn/compare/v0.1.0-alpha.55...v0.1.0-alpha.56
 [0.1.0-alpha.55]: https://github.com/blakeashleyjr/thegn/compare/v0.1.0-alpha.54...v0.1.0-alpha.55

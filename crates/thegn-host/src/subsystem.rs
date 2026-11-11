@@ -16,7 +16,10 @@
 //! A subprofile switch prepares and validates the new storage before committing
 //! it, then returns the old pane ids for the event loop to reap. It does **no
 //! polling**; any periodic work a real subsystem needs rides the existing
-//! `TerminalWaker` (0%-idle).
+//! `TerminalWaker` (0%-idle). Every binding carries a monotonic **generation**:
+//! `prepare` stamps it and `commit` refuses a prepared binding from an older
+//! generation, so a stale `PreparedBinding` or pane adoption racing a later
+//! switch/teardown can never be committed over the newer binding.
 //!
 //! Comms is the first real consumer (not built here); [`StubSubsystem`] exercises
 //! the mechanism end-to-end so Comms can adopt it without further core changes.
@@ -166,7 +169,42 @@ fn subprofile_db_file_name(name: &str) -> String {
 /// Storage opened and validated before a subprofile binding is committed.
 pub struct PreparedBinding {
     db: Db,
+    /// The subsystem's binding generation when `prepare` ran; `commit` refuses
+    /// a prepared binding whose generation no longer matches (another switch or
+    /// teardown intervened).
+    generation: u64,
 }
+
+/// A refused binding operation: the prepared binding (or pane adoption) was
+/// issued against a generation the subsystem has since left.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BindingRefusal {
+    StalePrepared { prepared_for: u64, current: u64 },
+    StalePane { pane_generation: u64, current: u64 },
+}
+
+impl fmt::Display for BindingRefusal {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::StalePrepared {
+                prepared_for,
+                current,
+            } => write!(
+                f,
+                "prepared binding is stale (prepared against generation {prepared_for}, current {current})"
+            ),
+            Self::StalePane {
+                pane_generation,
+                current,
+            } => write!(
+                f,
+                "pane adoption is stale (pane from generation {pane_generation}, current {current})"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for BindingRefusal {}
 
 /// What a subsystem's storage binding is right now. Never names a scope whose storage is closed.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -198,6 +236,22 @@ pub trait Subsystem {
     /// Adopt a pane the subsystem spawned (default: ignored — `workspace` panes
     /// are owned by the event loop, not by a subsystem).
     fn adopt_pane(&mut self, _id: u32) {}
+    /// This subsystem's binding generation: 0 until bound, bumped by every
+    /// committed bind and every effective teardown.
+    fn generation(&self) -> u64 {
+        0
+    }
+    /// Adopt a pane only if it was spawned against `generation`: refused with
+    /// [`BindingRefusal::StalePane`] when the subsystem has since switched or
+    /// torn down (default: adopt unconditionally — `workspace` owns no panes).
+    fn adopt_pane_in_generation(
+        &mut self,
+        _generation: u64,
+        id: u32,
+    ) -> Result<(), BindingRefusal> {
+        self.adopt_pane(id);
+        Ok(())
+    }
     /// Rebind to `subprofile`: (re)open its storage and reset the pane set. Must
     /// not poll. Errors if the subsystem does not support subprofiles.
     fn bind(&mut self, subprofile: &str) -> Result<()>;
@@ -205,7 +259,13 @@ pub trait Subsystem {
     /// this subsystem's current identity, storage, or panes.
     fn prepare(&self, subprofile: &str) -> Result<PreparedBinding>;
     /// Install a prepared binding and return the old pane ids for reaping.
-    fn commit(&mut self, subprofile: &str, prepared: PreparedBinding) -> Vec<u32>;
+    /// Refused with [`BindingRefusal::StalePrepared`] when the binding was
+    /// prepared against an older generation.
+    fn commit(
+        &mut self,
+        subprofile: &str,
+        prepared: PreparedBinding,
+    ) -> Result<Vec<u32>, BindingRefusal>;
     /// Relinquish this subsystem's live resources: drop its storage handle and
     /// return the pane ids the caller must reap (the loop kills them). Idempotent.
     fn teardown(&mut self) -> Vec<u32>;
@@ -244,8 +304,12 @@ impl Subsystem for WorkspaceSubsystem {
     fn prepare(&self, _subprofile: &str) -> Result<PreparedBinding> {
         anyhow::bail!("workspace does not support subprofiles")
     }
-    fn commit(&mut self, _subprofile: &str, _prepared: PreparedBinding) -> Vec<u32> {
-        Vec::new()
+    fn commit(
+        &mut self,
+        _subprofile: &str,
+        _prepared: PreparedBinding,
+    ) -> Result<Vec<u32>, BindingRefusal> {
+        Ok(Vec::new())
     }
     fn teardown(&mut self) -> Vec<u32> {
         Vec::new()
@@ -263,6 +327,8 @@ pub struct StubSubsystem {
     active: String,
     db: Option<Db>,
     panes: Vec<u32>,
+    /// Binding generation: bumped by every commit and every effective teardown.
+    generation: u64,
 }
 
 impl StubSubsystem {
@@ -275,6 +341,7 @@ impl StubSubsystem {
             active: "default".to_string(),
             db: None,
             panes: Vec::new(),
+            generation: 0,
         }
     }
 
@@ -286,6 +353,7 @@ impl StubSubsystem {
             active: "default".to_string(),
             db: None,
             panes: Vec::new(),
+            generation: 0,
         }
     }
 
@@ -324,9 +392,22 @@ impl Subsystem for StubSubsystem {
             self.panes.push(id);
         }
     }
+    fn generation(&self) -> u64 {
+        self.generation
+    }
+    fn adopt_pane_in_generation(&mut self, generation: u64, id: u32) -> Result<(), BindingRefusal> {
+        if generation != self.generation {
+            return Err(BindingRefusal::StalePane {
+                pane_generation: generation,
+                current: self.generation,
+            });
+        }
+        self.adopt_pane(id);
+        Ok(())
+    }
     fn bind(&mut self, subprofile: &str) -> Result<()> {
         let prepared = self.prepare(subprofile)?;
-        self.commit(subprofile, prepared);
+        self.commit(subprofile, prepared)?;
         Ok(())
     }
     fn prepare(&self, subprofile: &str) -> Result<PreparedBinding> {
@@ -340,14 +421,31 @@ impl Subsystem for StubSubsystem {
             }
             None => Db::open_memory()?,
         };
-        Ok(PreparedBinding { db })
+        Ok(PreparedBinding {
+            db,
+            generation: self.generation,
+        })
     }
-    fn commit(&mut self, subprofile: &str, prepared: PreparedBinding) -> Vec<u32> {
+    fn commit(
+        &mut self,
+        subprofile: &str,
+        prepared: PreparedBinding,
+    ) -> Result<Vec<u32>, BindingRefusal> {
+        if prepared.generation != self.generation {
+            return Err(BindingRefusal::StalePrepared {
+                prepared_for: prepared.generation,
+                current: self.generation,
+            });
+        }
         self.db = Some(prepared.db);
         self.active = subprofile.to_string();
-        std::mem::take(&mut self.panes)
+        self.generation += 1;
+        Ok(std::mem::take(&mut self.panes))
     }
     fn teardown(&mut self) -> Vec<u32> {
+        if self.db.is_some() {
+            self.generation += 1;
+        }
         self.db = None; // clean handle drop — never touches the shared profile DB
         self.active = "default".to_string();
         std::mem::take(&mut self.panes)
@@ -393,7 +491,7 @@ impl Subsystems {
             anyhow::bail!("subsystem {name:?} does not support subprofiles");
         }
         let prepared = sub.prepare(subprofile)?;
-        let doomed = sub.commit(subprofile, prepared);
+        let doomed = sub.commit(subprofile, prepared)?;
         Ok(doomed)
     }
 }
@@ -518,6 +616,7 @@ mod tests {
                 active: "default".into(),
                 db: None,
                 panes: Vec::new(),
+                generation: 0,
             })],
         };
         subs.switch_subprofile("comms", "work").unwrap();
@@ -553,6 +652,7 @@ mod tests {
             active: "default".into(),
             db: None,
             panes: Vec::new(),
+            generation: 0,
         };
         comms.bind(names[0]).unwrap();
         comms.bind(names[1]).unwrap();
@@ -618,6 +718,7 @@ mod tests {
             active: "default".into(),
             db: None,
             panes: Vec::new(),
+            generation: 0,
         };
         let result = comms.bind("work");
         assert!(matches!(
@@ -646,6 +747,7 @@ mod tests {
             active: "default".into(),
             db: None,
             panes: Vec::new(),
+            generation: 0,
         };
         let result = comms.bind("work/a");
         assert!(matches!(
@@ -679,6 +781,7 @@ mod tests {
             active: "default".into(),
             db: None,
             panes: Vec::new(),
+            generation: 0,
         };
         let result = comms.bind("work");
         assert!(matches!(
@@ -699,6 +802,7 @@ mod tests {
             active: "default".into(),
             db: None,
             panes: Vec::new(),
+            generation: 0,
         };
         comms.bind("work").unwrap();
         if let Some(mode) = thegn_core::fsperm::mode_bits(&db_root).unwrap() {
@@ -716,8 +820,93 @@ mod tests {
                 active: "default".into(),
                 db: None,
                 panes: Vec::new(),
+                generation: 0,
             };
             assert!(linked.bind("work").is_err());
         }
+    }
+
+    #[test]
+    fn generation_advances_on_commit_and_effective_teardown_only() {
+        let mut s = StubSubsystem::in_memory("comms");
+        assert_eq!(s.generation(), 0);
+        s.bind("work").unwrap();
+        assert_eq!(s.generation(), 1);
+        s.teardown();
+        assert_eq!(s.generation(), 2);
+        // Teardown is idempotent: a second teardown bumps nothing.
+        s.teardown();
+        assert_eq!(s.generation(), 2);
+        s.bind("home").unwrap();
+        assert_eq!(s.generation(), 3);
+    }
+
+    #[test]
+    fn generation_stale_prepared_binding_is_refused_and_changes_nothing() {
+        let mut s = StubSubsystem::in_memory("comms");
+        s.bind("work").unwrap();
+        s.adopt_pane(7);
+        let prepared = s.prepare("home").unwrap(); // stamped generation 1
+        // Another switch intervenes (generation 2)…
+        s.bind("other").unwrap();
+        // …so committing the stale prepared binding is refused.
+        assert_eq!(
+            s.commit("home", prepared),
+            Err(BindingRefusal::StalePrepared {
+                prepared_for: 1,
+                current: 2
+            })
+        );
+        assert_eq!(s.active_subprofile(), "other");
+        assert_eq!(s.status(), SubprofileStatus::Active("other".into()));
+        assert_eq!(s.pane_ids(), Vec::<u32>::new());
+        assert!(s.has_storage());
+    }
+
+    #[test]
+    fn generation_stale_prepared_after_teardown_is_refused() {
+        let mut s = StubSubsystem::in_memory("comms");
+        s.bind("work").unwrap();
+        let prepared = s.prepare("home").unwrap(); // stamped generation 1
+        s.teardown(); // generation 2, storage closed
+        assert_eq!(
+            s.commit("home", prepared),
+            Err(BindingRefusal::StalePrepared {
+                prepared_for: 1,
+                current: 2
+            })
+        );
+        assert_eq!(s.status(), SubprofileStatus::Unbound);
+    }
+
+    #[test]
+    fn generation_pane_adoption_is_fenced() {
+        let mut s = StubSubsystem::in_memory("comms");
+        s.bind("work").unwrap(); // generation 1
+        assert!(s.adopt_pane_in_generation(1, 5).is_ok());
+        assert_eq!(s.pane_ids(), vec![5]);
+        // Switching to another subprofile reaps pane 5 and bumps to 2.
+        assert_eq!(s.commit("home", s.prepare("home").unwrap()), Ok(vec![5]));
+        assert!(s.pane_ids().is_empty());
+        // A pane spawned against generation 1 is refused under generation 2.
+        assert_eq!(
+            s.adopt_pane_in_generation(1, 6),
+            Err(BindingRefusal::StalePane {
+                pane_generation: 1,
+                current: 2
+            })
+        );
+        assert!(s.pane_ids().is_empty());
+        // …while a pane from the live generation is adopted.
+        assert!(s.adopt_pane_in_generation(2, 6).is_ok());
+        assert_eq!(s.pane_ids(), vec![6]);
+    }
+
+    #[test]
+    fn generation_workspace_default_adoption_is_a_no_op() {
+        let mut workspace = WorkspaceSubsystem;
+        assert!(workspace.adopt_pane_in_generation(9, 1).is_ok());
+        assert_eq!(workspace.generation(), 0);
+        assert!(workspace.pane_ids().is_empty());
     }
 }
