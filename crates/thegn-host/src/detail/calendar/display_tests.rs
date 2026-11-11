@@ -619,3 +619,139 @@ fn agenda_click_maps_through_the_window() {
         Some(layout::CalHit::AgendaRow(5))
     );
 }
+
+fn agenda_day(st: &CalState) -> NaiveDate {
+    st.cursor.selected()
+}
+
+#[test]
+fn agenda_identity_follows_the_event_when_hydration_reorders_the_day() {
+    let mut st = busy_day(8, 3);
+    st.agenda_sel = 5;
+    let key = super::agenda_key(&st);
+    let date = agenda_day(&st);
+    st.events.get_mut(&date).unwrap().reverse();
+    super::reselect_agenda(&mut st, key.as_ref());
+    assert_eq!(st.agenda_sel, 2);
+    assert_eq!(focused_title(&st), Some("Event 5".into()));
+}
+
+#[test]
+fn agenda_identity_clamps_when_the_selected_event_is_deleted() {
+    use crate::detail::{DetailAction, DetailOutcome};
+    use termwiz::input::{KeyCode, Modifiers};
+
+    let mut st = busy_day(8, 3);
+    st.agenda_sel = 7;
+    let key = super::agenda_key(&st);
+    let date = agenda_day(&st);
+    st.events.get_mut(&date).unwrap().pop();
+    super::reselect_agenda(&mut st, key.as_ref());
+    assert_eq!(st.agenda_sel, 6);
+    assert_eq!(focused_title(&st), Some("Event 6".into()));
+
+    st.agenda_sel = 6;
+    st.events.get_mut(&date).unwrap().truncate(2);
+    super::reselect_agenda(&mut st, key.as_ref());
+    assert_eq!(st.agenda_sel, 1);
+    match keys::handle_calendar_key(&mut st, &KeyCode::Enter, Modifiers::NONE) {
+        DetailOutcome::Act(DetailAction::OpenUrl(u)) => {
+            assert_eq!(u, "https://example.invalid/1");
+        }
+        _ => panic!("Enter must open the surviving selected event"),
+    }
+}
+
+#[test]
+fn agenda_identity_ignores_the_key_when_the_grid_is_focused() {
+    let mut st = busy_day(8, 3);
+    st.pane = CalPane::Grid;
+    st.agenda_sel = 5;
+    assert_eq!(super::agenda_key(&st), None);
+    let date = agenda_day(&st);
+    st.events.get_mut(&date).unwrap().truncate(3);
+    super::reselect_agenda(&mut st, None);
+    assert_eq!(st.agenda_sel, 2);
+}
+
+#[test]
+fn agenda_identity_distinguishes_recurrence_overrides() {
+    let date = NaiveDate::from_ymd_opt(2026, 9, 13).unwrap();
+    let make = |recurrence_id: Option<EventTime>| {
+        let mut ev = CalEvent::new(
+            "series",
+            "Series",
+            EventTime::Date { date },
+            EventTime::Date {
+                date: NaiveDate::from_ymd_opt(2026, 9, 14).unwrap(),
+            },
+        );
+        ev.recurrence_id = recurrence_id;
+        Arc::new(ev)
+    };
+    let master = make(None);
+    let overridden = make(Some(EventTime::Date { date }));
+    let mut st = status_state(
+        BTreeMap::from([(date, vec![master.clone(), overridden.clone()])]),
+        true,
+        None,
+    );
+    st.pane = CalPane::Agenda;
+    st.agenda_sel = 1;
+    let key = super::agenda_key(&st);
+    st.events.get_mut(&date).unwrap().reverse();
+    super::reselect_agenda(&mut st, key.as_ref());
+    assert_eq!(st.agenda_sel, 0);
+    assert_eq!(
+        st.selected_events()[st.agenda_sel].recurrence_id,
+        overridden.recurrence_id
+    );
+}
+
+#[test]
+fn agenda_omitted_note_says_which_rows_are_shown() {
+    let mut st = busy_day(8, 3);
+    st.agenda_sel = 5;
+    assert_eq!(
+        agenda_note_of(&st),
+        format!("8 events {} 4-6 shown", crate::caps::active_glyphs().middot)
+    );
+    st.ui.agenda_rows = 8;
+    assert_eq!(agenda_note_of(&st), "8 events");
+    let one = busy_day(1, 3);
+    assert_eq!(agenda_note_of(&one), "1 event");
+}
+
+#[test]
+fn agenda_pane_home_end_and_paging_page_the_grid_not_the_list() {
+    use crate::detail::DetailOutcome;
+    use termwiz::input::{KeyCode, Modifiers};
+
+    let mut st = busy_day(8, 3);
+    st.agenda_sel = 5;
+    let outcome = keys::handle_calendar_key(&mut st, &KeyCode::Home, Modifiers::NONE);
+    assert!(matches!(outcome, DetailOutcome::Pending));
+    assert_eq!(
+        st.cursor.selected(),
+        NaiveDate::from_ymd_opt(2026, 9, 1).unwrap()
+    );
+    assert_eq!(st.agenda_sel, 0);
+    assert_eq!(st.pane, CalPane::Agenda);
+
+    let mut st = busy_day(8, 3);
+    st.agenda_sel = 5;
+    let outcome = keys::handle_calendar_key(&mut st, &KeyCode::End, Modifiers::NONE);
+    assert!(matches!(outcome, DetailOutcome::Pending));
+    assert_eq!(
+        st.cursor.selected(),
+        NaiveDate::from_ymd_opt(2026, 9, 30).unwrap()
+    );
+    assert_eq!(st.agenda_sel, 0);
+
+    let mut st = busy_day(8, 3);
+    let day = st.cursor.selected();
+    keys::handle_calendar_key(&mut st, &KeyCode::DownArrow, Modifiers::NONE);
+    keys::handle_calendar_key(&mut st, &KeyCode::DownArrow, Modifiers::NONE);
+    assert_eq!(st.cursor.selected(), day);
+    assert_eq!(st.agenda_sel, 2);
+}
