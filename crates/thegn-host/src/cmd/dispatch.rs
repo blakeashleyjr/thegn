@@ -1947,7 +1947,7 @@ fn done_gate(row: &AgentDispatch) -> Result<()> {
     require_done_report(row.id, report)
 }
 
-fn done_gate_bound(db: &Db, row: &AgentDispatch) -> Result<()> {
+pub(crate) fn done_gate_bound(db: &Db, row: &AgentDispatch) -> Result<()> {
     if row.status == AgentDispatchStatus::Spawning
         && row
             .session_id
@@ -1984,9 +1984,9 @@ fn done_gate_bound(db: &Db, row: &AgentDispatch) -> Result<()> {
 }
 
 #[derive(Debug)]
-struct DoneGateRefused {
-    id: i64,
-    reasons: Vec<String>,
+pub(crate) struct DoneGateRefused {
+    pub(crate) id: i64,
+    pub(crate) reasons: Vec<String>,
 }
 
 impl std::fmt::Display for DoneGateRefused {
