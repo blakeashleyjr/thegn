@@ -163,6 +163,10 @@ pub(crate) fn commit_in(
 mod tests {
     use super::*;
 
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "test fixture: waited git subprocess"
+    )]
     fn sh_git(dir: &Path, args: &[&str]) -> String {
         let out = thegn_core::util::git_cmd(dir)
             .args(["-c", "commit.gpgsign=false"])
