@@ -205,6 +205,7 @@ pub mod image;
 pub mod inventory;
 pub mod iroh_wire;
 pub mod issue;
+pub mod issue_snapshot;
 pub mod keymap;
 pub mod layout_import;
 pub mod lifecycle;

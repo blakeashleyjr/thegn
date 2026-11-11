@@ -220,6 +220,14 @@ see [[configuration]]. The roster side (verify a finished row, wait on one,
 gate `done`) is [[cli]]'s `dispatch verify` / `dispatch wait` /
 `dispatch set-status done`.
 
+Before launching, `session open --stage --issue` fetches the issue once and
+writes it to `<worktree>/.thegn/maintenance/issue.json` (atomic, always
+overwritten, git-ignored) so the worker and its reviewers read the captured
+task, never a stale file. If the tracker is unavailable, offline, or
+provider `none`, or the file cannot be written (including a symlinked
+`.thegn` or `.thegn/maintenance`), the dispatch is refused before any roster
+row is claimed.
+
 Opening a configured agent through the daemon, control API, MCP or automation
 is refused before launch when its rendered command exceeds 100 KiB. The error
 names the command size and limit and asks you to shorten the task prompt; the
