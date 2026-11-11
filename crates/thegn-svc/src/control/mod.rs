@@ -753,6 +753,33 @@ pub struct FolderAssignReq {
     pub clear: bool,
 }
 
+/// Query for `worktrees.sandbox_profile`: which worktree's pin to read.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct SandboxProfileQuery {
+    /// Absolute path of a registered worktree.
+    pub worktree: String,
+}
+
+/// Pin or clear a worktree's sandbox profile (`worktrees.sandbox_profile_set`).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct SandboxProfileSetReq {
+    /// Absolute path of a registered worktree.
+    pub worktree: String,
+    /// `standard` or `sealed`; absent or null clears the pin.
+    #[serde(default)]
+    pub profile: Option<String>,
+}
+
+/// A worktree's pinned sandbox profile; `profile` is null when nothing is
+/// pinned (the configured policy applies).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct SandboxProfileReply {
+    /// The worktree path the pin belongs to.
+    pub worktree: String,
+    /// The pinned profile's wire name, or null when inheriting.
+    pub profile: Option<String>,
+}
+
 /// The validated intent of a [`FolderAssignReq`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FolderAction<'a> {
@@ -1360,6 +1387,31 @@ pub trait ControlApi: Send + Sync + 'static {
         Box::pin(async {
             Err(ControlError::Unimplemented(
                 "worktree folder assignment is not available",
+            ))
+        })
+    }
+
+    /// Read a worktree's pinned sandbox profile (`worktrees.sandbox_profile`).
+    fn worktree_sandbox_profile(
+        &self,
+        _query: SandboxProfileQuery,
+    ) -> BoxFuture<'_, ControlResult<SandboxProfileReply>> {
+        Box::pin(async {
+            Err(ControlError::Unimplemented(
+                "worktree sandbox profile is not available",
+            ))
+        })
+    }
+
+    /// Pin or clear a worktree's sandbox profile
+    /// (`worktrees.sandbox_profile_set`).
+    fn set_worktree_sandbox_profile(
+        &self,
+        _req: SandboxProfileSetReq,
+    ) -> BoxFuture<'_, ControlResult<SandboxProfileReply>> {
+        Box::pin(async {
+            Err(ControlError::Unimplemented(
+                "worktree sandbox profile pinning is not available",
             ))
         })
     }

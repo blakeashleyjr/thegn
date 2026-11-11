@@ -3345,6 +3345,71 @@ impl ControlApi for DaemonService {
         })
     }
 
+    fn worktree_sandbox_profile(
+        &self,
+        query: thegn_svc::control::SandboxProfileQuery,
+    ) -> BoxFuture<'_, ControlResult<thegn_svc::control::SandboxProfileReply>> {
+        Box::pin(async move {
+            if !std::path::Path::new(&query.worktree).is_absolute() {
+                return Err(ControlError::InvalidArgument(
+                    "worktrees.sandbox_profile worktree path must be absolute".into(),
+                ));
+            }
+            self.with_db(move |db| {
+                use thegn_core::store::WorkspaceStore;
+                let profile = db.worktree_sandbox_profile(&query.worktree)?;
+                Ok(thegn_svc::control::SandboxProfileReply {
+                    worktree: query.worktree,
+                    profile: profile.map(|p| p.as_str().to_string()),
+                })
+            })
+            .await
+        })
+    }
+
+    fn set_worktree_sandbox_profile(
+        &self,
+        req: thegn_svc::control::SandboxProfileSetReq,
+    ) -> BoxFuture<'_, ControlResult<thegn_svc::control::SandboxProfileReply>> {
+        Box::pin(async move {
+            if !std::path::Path::new(&req.worktree).is_absolute() {
+                return Err(ControlError::InvalidArgument(
+                    "worktrees.sandbox_profile_set worktree path must be absolute".into(),
+                ));
+            }
+            // Validate the requested pin before touching the DB.
+            let pin = match req.profile.as_deref() {
+                Some(value) => Some(
+                    thegn_core::sandbox_pin::parse_pin(value)
+                        .map_err(|e| ControlError::InvalidArgument(e.to_string()))?,
+                ),
+                None => None,
+            };
+            self.with_db(move |db| {
+                use thegn_core::store::WorkspaceStore;
+                // The store setter upserts, so an unregistered path would
+                // gain a stray worktree row: require registration first,
+                // exactly like `thegn sandbox profile set`.
+                if !db
+                    .repo_root_for(&req.worktree)?
+                    .is_some_and(|root| !root.is_empty())
+                {
+                    return Ok(Err(ControlError::NotFound(format!(
+                        "{} is not a registered worktree",
+                        req.worktree
+                    ))));
+                }
+                db.set_worktree_sandbox_profile(&req.worktree, pin)?;
+                let profile = db.worktree_sandbox_profile(&req.worktree)?;
+                Ok(Ok(thegn_svc::control::SandboxProfileReply {
+                    worktree: req.worktree,
+                    profile: profile.map(|p| p.as_str().to_string()),
+                }))
+            })
+            .await?
+        })
+    }
+
     /// `agent.sessions`: a bounded filesystem scan of each harness's local
     /// session store. Off the runtime's worker threads (`spawn_blocking`) — it
     /// reads potentially many transcript heads. The DB supplies the tracked
@@ -5859,6 +5924,34 @@ mod tests {
         for forbidden in ["argv", "executable", "provider", "environment", "env"] {
             assert!(payload.get(forbidden).is_none(), "leaked {forbidden}");
         }
+    }
+
+    #[tokio::test]
+    async fn sandbox_profile_set_refuses_an_unregistered_worktree_without_writing() {
+        let (svc, _rx) = service(0);
+        let result = svc
+            .set_worktree_sandbox_profile(thegn_svc::control::SandboxProfileSetReq {
+                worktree: "/nowhere/unregistered".into(),
+                profile: Some("sealed".into()),
+            })
+            .await;
+        assert!(
+            matches!(result, Err(ControlError::NotFound(_))),
+            "{result:?}"
+        );
+        use thegn_core::store::WorkspaceStore;
+        assert!(svc.db.lock().unwrap().worktrees().unwrap().is_empty());
+
+        let invalid = svc
+            .set_worktree_sandbox_profile(thegn_svc::control::SandboxProfileSetReq {
+                worktree: "/nowhere/unregistered".into(),
+                profile: Some("open".into()),
+            })
+            .await;
+        assert!(
+            matches!(invalid, Err(ControlError::InvalidArgument(_))),
+            "{invalid:?}"
+        );
     }
 
     /// A supervisor waiting for a line the agent never printed still has to

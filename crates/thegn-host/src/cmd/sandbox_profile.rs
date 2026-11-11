@@ -42,11 +42,7 @@ struct ProfileRow {
 }
 
 pub fn run(cfg: &Config, action: Action) -> Result<()> {
-    if std::env::var_os("THEGN_SANDBOX").is_some() {
-        bail!(
-            "sandbox profile pins are host-owned; this command cannot change them from inside a sandbox"
-        );
-    }
+    thegn_core::sandbox_pin::refuse_inside_sandbox(std::env::var_os("THEGN_SANDBOX").is_some())?;
     match action {
         Action::Show { json, target } => show(cfg, target.get(), json),
         Action::Set {

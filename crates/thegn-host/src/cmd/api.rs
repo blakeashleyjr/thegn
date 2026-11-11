@@ -284,7 +284,17 @@ pub(crate) fn resolve_call(
     thegn_svc::control::routes::build_call(cap, params).map_err(|e| anyhow::anyhow!(e))
 }
 
+/// Host-owned capabilities cannot be driven from inside a sandbox through the
+/// generic door either: the sandbox-profile pin set shares the CLI's refusal.
+fn guard_host_owned(cap: &str, inside_sandbox: bool) -> Result<()> {
+    if cap == "worktrees.sandbox_profile_set" {
+        thegn_core::sandbox_pin::refuse_inside_sandbox(inside_sandbox)?;
+    }
+    Ok(())
+}
+
 fn call(cfg: &Config, cap: &str, params: Option<&str>) -> Result<()> {
+    guard_host_owned(cap, std::env::var_os("THEGN_SANDBOX").is_some())?;
     let params: serde_json::Map<String, serde_json::Value> = match params {
         None => Default::default(),
         Some(p) => serde_json::from_str::<serde_json::Value>(p)
@@ -310,6 +320,16 @@ fn call(cfg: &Config, cap: &str, params: Option<&str>) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn host_owned_pin_set_is_refused_inside_a_sandbox() {
+        let error = guard_host_owned("worktrees.sandbox_profile_set", true)
+            .unwrap_err()
+            .to_string();
+        assert_eq!(error, thegn_core::sandbox_pin::HOST_OWNED_REFUSAL);
+        assert!(guard_host_owned("worktrees.sandbox_profile_set", false).is_ok());
+        assert!(guard_host_owned("worktrees.sandbox_profile", true).is_ok());
+    }
 
     #[test]
     fn every_routed_cap_is_callable_or_streaming() {

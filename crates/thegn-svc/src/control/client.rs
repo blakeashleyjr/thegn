@@ -1139,6 +1139,19 @@ impl ControlClient {
         Ok(())
     }
 
+    /// `GET /v1/worktrees/sandbox-profile` — a worktree's pinned sandbox profile.
+    pub async fn worktree_sandbox_profile(
+        &self,
+        worktree: &str,
+    ) -> Result<super::SandboxProfileReply> {
+        let path = format!(
+            "/v1/worktrees/sandbox-profile?worktree={}",
+            percent_encode(worktree)
+        );
+        let v = self.request("GET", &path, None).await?;
+        Ok(serde_json::from_value(v)?)
+    }
+
     /// `GET /v1/issues` — tracker issues, filtered by status/limit.
     pub async fn issues_list(
         &self,
