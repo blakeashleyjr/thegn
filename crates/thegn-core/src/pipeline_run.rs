@@ -404,7 +404,7 @@ pub fn verify_report(f: &VerifyFacts) -> VerifyReport {
             &mut reasons,
             &mut kinds,
             VerifyRefusal::WorktreeUnknown,
-            "could not observe worktree status (`git status --porcelain` failed); retry verification"
+            "could not observe a stable worktree snapshot (HEAD, the artifact or `git status --porcelain` changed or could not be read while verifying); retry verification"
                 .into(),
         );
     }
@@ -1384,6 +1384,10 @@ mod tests {
         assert!(!r.dirty, "legacy boolean remains backward compatible");
         assert_eq!(r.worktree_state, Some(WorktreeState::Unknown));
         assert!(r.reasons.iter().any(|w| w.contains("retry verification")));
+        assert!(
+            r.reasons.iter().any(|w| w.contains("snapshot")),
+            "the reason names the moved snapshot, not only a failed git status"
+        );
     }
 
     #[test]
