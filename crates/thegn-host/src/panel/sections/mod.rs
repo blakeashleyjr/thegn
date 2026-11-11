@@ -844,21 +844,15 @@ pub fn summary(section: Section, model: &crate::chrome::FrameModel) -> Vec<Seg> 
             }
         }
         Section::Logs => {
-            let n = model.panel.log_lines_structured.len();
-            let errors = model
-                .panel
-                .log_lines_structured
-                .iter()
-                .filter(|l| {
-                    matches!(
-                        &l.level,
-                        thegn_core::log::parser::LogLevel::Error
-                            | thegn_core::log::parser::LogLevel::Fatal
-                    )
-                })
-                .count();
-            if n == 0 {
+            let (n, errors) = logs::scoped_counts(
+                &model.panel.log_lines_structured,
+                crate::panel::scope::system_all(),
+                &crate::panel::scope::active_wt_tag(),
+            );
+            if model.panel.log_lines_structured.is_empty() {
                 vec![seg(g2(), "off")]
+            } else if n == 0 {
+                vec![seg(g2(), "0 lines")]
             } else if errors > 0 {
                 vec![
                     seg(hue(Hue::Red), format!("✗ {errors}")),
