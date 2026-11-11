@@ -139,8 +139,9 @@ pub struct PipelineStage {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Requirement {
-    /// The parent row's handoff artifact exists, is committed in `HEAD`, and is
-    /// unchanged at that path — what `dispatch verify` reports.
+    /// The parent row's handoff artifact exists, is committed in `HEAD`, is
+    /// unchanged at that path, and the verification snapshot was stable — what
+    /// `dispatch verify` reports.
     ParentArtifact,
     /// The parent row carries a worker report — what the done-gate checks.
     ParentReport,

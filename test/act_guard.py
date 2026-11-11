@@ -24,6 +24,64 @@ _SHORT_VALUE = set("aCejPsW")
 _REUSE_TRUE = {"1", "t", "T", "true", "TRUE", "True"}
 
 
+# act long flags that take a value (act --help): the separate next arg is data, not a flag.
+_LONG_VALUE = {
+    "--container-options",
+    "--container-architecture",
+    "--env",
+    "--env-file",
+    "--input",
+    "--var",
+    "--job",
+    "--matrix",
+    "--platform",
+    "--secret",
+    "--secret-file",
+    "--workflows",
+    "--directory",
+    "--local-repository",
+    "--action-cache-path",
+    "--artifact-server-path",
+    "--event",
+    "--eventpath",
+}
+
+
+def _scannable(args: list[str]) -> list[str]:
+    """`args` minus the separate value token that follows a value-taking flag."""
+    out: list[str] = []
+    skip = False
+    for arg in args:
+        if skip:
+            skip = False
+            continue
+        out.append(arg)
+        if arg in _LONG_VALUE or (len(arg) == 2 and arg[0] == "-" and arg[1] in _SHORT_VALUE):
+            skip = True
+    return out
+
+
+def _dangling_value_flag(args: list[str]) -> str | None:
+    """The value-taking flag that ends `args` with no value after it, if any.
+
+    act would consume whatever comes next (the appended `--rm`, or for `.actrc` the event
+    name) as that flag's value, so the guard cannot tell what the run receives.
+    """
+    skip = False
+    last = None
+    for arg in args:
+        if skip:
+            skip = False
+            last = None
+            continue
+        if arg in _LONG_VALUE or (len(arg) == 2 and arg[0] == "-" and arg[1] in _SHORT_VALUE):
+            skip = True
+            last = arg
+        else:
+            last = None
+    return last if skip else None
+
+
 def _short_cluster(arg: str) -> tuple[bool, str | None, bool]:
     """Scan one single-dash arg the way pflag does: (reuse, value flag letter, ambiguous).
 
@@ -48,8 +106,29 @@ def _short_cluster(arg: str) -> tuple[bool, str | None, bool]:
     return reuse, None, False
 
 
+def _short_value_flag(arg: str) -> tuple[str, str] | None:
+    """(letter, rest) for the first value shorthand reached after only bool letters, else None."""
+    if len(arg) < 2 or arg[0] != "-" or arg[1] == "-":
+        return None
+    for i in range(1, len(arg)):
+        c = arg[i]
+        if c in _SHORT_BOOL:
+            if arg[i + 1 : i + 2] == "=":
+                return None
+            continue
+        if c in _SHORT_VALUE:
+            rest = arg[i + 1 :]
+            if rest.startswith("="):
+                rest = rest[1:]
+            return c, rest
+        return None
+    return None
+
+
 def has_credentials(args: list[str]) -> bool:
-    return any(arg.startswith("--secret") or _short_cluster(arg)[1] == "s" for arg in args)
+    return any(
+        arg.startswith("--secret") or _short_cluster(arg)[1] == "s" for arg in _scannable(args)
+    )
 
 
 def has_reuse(args: list[str]) -> bool:
@@ -57,22 +136,28 @@ def has_reuse(args: list[str]) -> bool:
         arg == "--reuse"
         or (arg.startswith("--reuse=") and arg.partition("=")[2] in _REUSE_TRUE)
         or _short_cluster(arg)[0]
-        for arg in args
+        for arg in _scannable(args)
     )
 
 
 def ambiguous_short_args(args: list[str]) -> list[str]:
     """Single-dash args with a letter outside act's known short flags."""
-    return [arg for arg in args if _short_cluster(arg)[2]]
+    return [arg for arg in _scannable(args) if _short_cluster(arg)[2]]
 
 
-_REDIRECT_LONG = ("--workflows", "--directory", "--local-repository")
+_REDIRECT_LONG = (
+    "--workflows",
+    "--directory",
+    "--local-repository",
+    "--action-cache-path",
+    "--action-offline-mode",
+)
 
 
 def redirect_flags(args: list[str]) -> list[str]:
     """Flags that point act at workflow/action code outside the checked `.github/` tree (in args order)."""
     found: list[str] = []
-    for arg in args:
+    for arg in _scannable(args):
         for flag in _REDIRECT_LONG:
             if arg == flag or arg.startswith(flag + "="):
                 found.append(flag)
@@ -97,8 +182,14 @@ def platform_mappings(tokens: list[str]) -> list[tuple[str, str]]:
             i += 1
         elif tok.startswith("--platform="):
             value = tok[len("--platform="):]
-        elif tok.startswith("-P") and len(tok) > 2:
-            value = tok[2:]
+        else:
+            short = _short_value_flag(tok)
+            if short and short[0] == "P":
+                if short[1]:
+                    value = short[1]
+                else:
+                    value = tokens[i + 1] if i + 1 < len(tokens) else ""
+                    i += 1
         if value is not None:
             label, _, image = value.partition("=")
             out.append((label, image))
@@ -148,9 +239,11 @@ def plan(
     """Build guarded act argv, or return a refusal message.
 
     act prepends `.actrc` tokens to argv, so `actrc_args` count for the credential,
-    reuse and redirect checks but are not added to the built command.
+    reuse and redirect checks but are not added to the built command. The checks scan
+    exactly what act parses, `[*actrc_args, event, *args]`: a dangling value flag at the
+    end of `.actrc` consumes the event, never the first CLI arg.
     """
-    effective = [*(actrc_args or []), *args]
+    effective = [*(actrc_args or []), event, *args]
     credentialed = has_credentials(effective) or implicit_secrets
     credential_source = " (including default .secrets)" if implicit_secrets else ""
     reuse = has_reuse(effective)
@@ -159,6 +252,12 @@ def plan(
         return None, (
             f"act: --reuse cannot be combined with credentials{credential_source} "
             "(the retained container would carry them into later runs)"
+        )
+    dangling = _dangling_value_flag(effective)
+    if credentialed and dangling:
+        return None, (
+            f"act: credentialed runs cannot end on {dangling} without a value{credential_source}: "
+            "act would take the next token as its value"
         )
     ambiguous = ambiguous_short_args(effective)
     if credentialed and ambiguous:
@@ -188,7 +287,7 @@ def plan(
         )
 
     command = ["act", event, *args]
-    if not reuse and "--rm" not in args:
+    if not reuse and "--rm" not in _scannable(args):
         command.append("--rm")
     message = (
         f"act: credentialed run{credential_source} bound to HEAD {head}"
@@ -516,6 +615,78 @@ def self_test() -> int:
     actrc_ok = actrc_ok and argv == ["act", "push", "--rm"]
     cases.append(("actrc-tokens-feed-guard-checks", actrc_ok))
 
+    argv, message = plan(
+        "push", ["--secret", "T=x", "--container-options", "-v /a:/b"], [], "abc123"
+    )
+    argv2, _ = plan("push", ["--secret", "T=x", "--env", "-r"], [], "abc123")
+    cases.append(
+        (
+            "long-flag-value-is-not-scanned-as-a-cluster",
+            argv is not None and "abc123" in message and argv2 is not None,
+        )
+    )
+    argv, _ = plan("push", ["--secret", "T=x", "-e", "-vr"], [], "abc123")
+    cases.append(("separate-short-value-is-not-scanned", argv is not None))
+    cases.append(
+        (
+            "credential-flag-still-detected-with-separate-value",
+            has_credentials(["--secret", "T=x"])
+            and has_credentials(["-s", "T"])
+            and not has_credentials(["--env", "--secret-file"])
+            and not has_credentials(["--container-options", "-s"]),
+        )
+    )
+    argv, message = plan("push", ["--secret", "T=x"], [" M .actrc"], "abc123", False, ["--env"])
+    cases.append(
+        (
+            "actrc-trailing-value-flag-does-not-hide-cli-credentials",
+            argv is None and ".actrc" in message,
+        )
+    )
+    argv, message = plan("push", ["--secret", "T=x", "--env"], [], "abc123")
+    cases.append(
+        (
+            "credentialed-trailing-value-flag-refused",
+            argv is None and "--env without a value" in message,
+        )
+    )
+    argv, _ = plan("push", ["--env", "--rm"], None, None)
+    cases.append(("value-rm-is-not-the-rm-flag", argv == ["act", "push", "--env", "--rm", "--rm"]))
+    argv, message = plan("push", ["--secret", "T=x", "--env", "A=b", "-r"], [], "abc123")
+    cases.append(
+        (
+            "real-flag-after-a-value-is-still-scanned",
+            argv is None and "--reuse cannot" in message,
+        )
+    )
+    pinned = "img/x@sha256:" + "a" * 64
+    clustered_ok = all(
+        "override is not pinned by digest" in (image_refusal(good, form) or "")
+        for form in (
+            ["-vPubuntu-latest=img/x:latest"],
+            ["-vP", "ubuntu-latest=img/x:latest"],
+            ["-P=ubuntu-latest=img/x:latest"],
+        )
+    )
+    cases.append(
+        (
+            "platform-override-clustered-forms-refused",
+            clustered_ok
+            and platform_mappings(["-vPubuntu-latest=" + pinned]) == [("ubuntu-latest", pinned)],
+        )
+    )
+    cache_ok = True
+    for flag, form in (
+        ("--action-cache-path", ["--action-cache-path", "/tmp/c"]),
+        ("--action-cache-path", ["--action-cache-path=/tmp/c"]),
+        ("--action-offline-mode", ["--action-offline-mode"]),
+    ):
+        argv, message = plan("push", ["--secret", "T=x", *form], [], "abc123")
+        cache_ok = cache_ok and argv is None and flag in message
+    anon = plan("push", ["--action-offline-mode"], None, None)
+    cache_ok = cache_ok and anon == (["act", "push", "--action-offline-mode", "--rm"], "")
+    cases.append(("action-cache-flags-refused-when-credentialed", cache_ok))
+
     for label, passed in cases:
         if not check(label, passed):
             return 1
@@ -541,7 +712,7 @@ def main(argv: list[str]) -> int:
         return 1
     implicit_secrets = (ROOT / ".secrets").exists()
     actrc_args = actrc_tokens(actrc_text) if actrc_text else []
-    if has_credentials([*actrc_args, *args]) or implicit_secrets:
+    if has_credentials([*actrc_args, event, *args]) or implicit_secrets:
         dirty = dirty_paths()
         head = head_sha()
     else:

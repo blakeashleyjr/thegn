@@ -703,6 +703,47 @@ fn map_with_db_error(error: anyhow::Error) -> ControlError {
     ControlError::Internal(error)
 }
 
+/// The worker report door's DB work: verify the capability, then write the
+/// report fenced to the run the token was minted for. `after_verify` runs
+/// between those two steps so a test can republish inside the race window.
+fn worker_report_in_db(
+    db: &Db,
+    id: i64,
+    secret: &[u8; 32],
+    text: &str,
+    after_verify: &mut dyn FnMut(),
+) -> anyhow::Result<Result<thegn_svc::control::DispatchReportReply, thegn_core::CapabilityRefusal>>
+{
+    let verified = db.verify_dispatch_capability(
+        secret,
+        id,
+        thegn_core::CapabilityVerb::Report,
+        thegn_core::util::now_ms(),
+    )?;
+    let grant = match verified {
+        Ok(grant) => grant,
+        Err(refusal) => return Ok(Err(refusal)),
+    };
+    after_verify();
+    // Fence to the run the token was minted for, not whatever run is current
+    // when the write happens.
+    let Some(current) = db.dispatch_run_ref(id)? else {
+        return Ok(Err(thegn_core::CapabilityRefusal::RowMissing));
+    };
+    let run = thegn_core::issue::DispatchRunRef {
+        id,
+        issue_id: current.issue_id,
+        session_id: grant.session_id,
+        run_gen: grant.run_gen,
+    };
+    let recorded = crate::cmd::dispatch::record_report_for_run(db, &run, text)?;
+    Ok(Ok(thegn_svc::control::DispatchReportReply {
+        id,
+        bytes: recorded.validated.len(),
+        pass_without_gate_evidence: recorded.ungated,
+    }))
+}
+
 #[derive(Debug)]
 struct DispatchIdentityRefused(String);
 
@@ -2999,36 +3040,7 @@ impl ControlApi for DaemonService {
         }
         Box::pin(async move {
             let outcome = self
-                .with_db(move |db| {
-                    let verified = db.verify_dispatch_capability(
-                        &secret,
-                        id,
-                        thegn_core::CapabilityVerb::Report,
-                        thegn_core::util::now_ms(),
-                    )?;
-                    let grant = match verified {
-                        Ok(grant) => grant,
-                        Err(refusal) => return Ok(Err(refusal)),
-                    };
-                    // Fence to the run the token was minted for, not whatever
-                    // run is current when the write happens.
-                    let Some(current) = db.dispatch_run_ref(id)? else {
-                        return Ok(Err(thegn_core::CapabilityRefusal::RowMissing));
-                    };
-                    let run = thegn_core::issue::DispatchRunRef {
-                        id,
-                        issue_id: current.issue_id,
-                        session_id: grant.session_id,
-                        run_gen: grant.run_gen,
-                    };
-                    let recorded =
-                        crate::cmd::dispatch::record_report_for_run(db, &run, &req.text)?;
-                    Ok(Ok(thegn_svc::control::DispatchReportReply {
-                        id,
-                        bytes: recorded.validated.len(),
-                        pass_without_gate_evidence: recorded.ungated,
-                    }))
-                })
+                .with_db(move |db| worker_report_in_db(db, id, &secret, &req.text, &mut || {}))
                 .await?;
             outcome.map_err(|refusal| {
                 tracing::warn!(target: "thegn::dispatch", dispatch_id = id, refusal = refusal.kind(), "worker dispatch capability refused");
@@ -7626,6 +7638,87 @@ mod tests {
             .await
             .unwrap();
         assert!(report.is_none());
+    }
+
+    fn door_fixture(secret: [u8; 32]) -> (Db, i64) {
+        let db = Db::open_memory().unwrap();
+        let row = staged_dispatch(&db, Some("code"));
+        assert!(db.bind_dispatch_session(row, "sess-a").unwrap());
+        let verbs = [thegn_core::CapabilityVerb::Report];
+        db.mint_dispatch_capability(
+            &secret,
+            &thegn_core::CapabilityMint {
+                dispatch_id: row,
+                verbs: &verbs,
+                ttl_ms: 60_000,
+                now_ms: thegn_core::util::now_ms(),
+            },
+        )
+        .unwrap()
+        .map_err(anyhow::Error::new)
+        .unwrap();
+        (db, row)
+    }
+
+    #[test]
+    fn worker_report_door_loses_to_a_republish_inside_the_window() {
+        let secret = [9_u8; 32];
+        let (db, row) = door_fixture(secret);
+        let result = worker_report_in_db(&db, row, &secret, "findings: none", &mut || {
+            let outcome = db.publish_dispatch_run(row, "sess-b", "a.md").unwrap();
+            assert!(matches!(
+                outcome,
+                thegn_core::issue::DispatchRunPublishOutcome::Published
+            ));
+        });
+        match result {
+            Err(error) => {
+                assert!(
+                    error
+                        .downcast_ref::<thegn_core::db::ReportRunChanged>()
+                        .is_some(),
+                    "expected the run fence, got {error:#}"
+                );
+                assert!(matches!(
+                    map_with_db_error(error),
+                    ControlError::FailedPrecondition(_)
+                ));
+            }
+            Ok(_) => panic!("the stale report was not refused"),
+        }
+        assert!(db.get_dispatch(row).unwrap().unwrap().report.is_none());
+    }
+
+    #[test]
+    fn worker_report_door_without_a_race_stores_the_report() {
+        let secret = [9_u8; 32];
+        let (db, row) = door_fixture(secret);
+        match worker_report_in_db(&db, row, &secret, "findings: none", &mut || {}) {
+            Ok(Ok(reply)) => {
+                assert_eq!(reply.id, row);
+                assert_eq!(reply.bytes, "findings: none".len());
+            }
+            _ => panic!("the report was not stored"),
+        }
+        assert_eq!(
+            db.get_dispatch(row).unwrap().unwrap().report.as_deref(),
+            Some("findings: none")
+        );
+    }
+
+    #[test]
+    fn worker_report_door_refused_capability_never_runs_the_hook() {
+        let (db, row) = door_fixture([9_u8; 32]);
+        let mut hook_ran = false;
+        let result = worker_report_in_db(&db, row, &[1_u8; 32], "findings: none", &mut || {
+            hook_ran = true;
+        });
+        match result {
+            Ok(Err(refusal)) => assert_eq!(refusal.kind(), "unknown_token"),
+            _ => panic!("an unminted token was not refused"),
+        }
+        assert!(!hook_ran);
+        assert!(db.get_dispatch(row).unwrap().unwrap().report.is_none());
     }
 
     /// With no `[issues]` provider configured, the issue verbs answer

@@ -217,7 +217,10 @@ const OMITTED: &[(&str, &str)] = &[
     ("panel", "panel layout is not exposed"),
     ("lsp", "language-server configuration is not exposed"),
     ("semantic", "semantic indexing is not exposed"),
-    ("daemon", "daemon configuration is not exposed"),
+    (
+        "daemon.socket",
+        "path-valued control-socket override is not exposed",
+    ),
     ("serve", "remote serving policy is not exposed"),
     ("merge_queue", "merge queue policy is not exposed"),
     ("pr_queue", "PR queue policy is not exposed"),
@@ -242,7 +245,10 @@ const OMITTED: &[(&str, &str)] = &[
     ("usage", "usage tracking is not exposed"),
     ("model_proxy", "model proxy is not exposed"),
     ("remote", "remote connection tuning is not exposed"),
-    ("network", "offline detection is not exposed"),
+    (
+        "network.mode",
+        "offline-detection mode enum needs destination pinning and is not exposed",
+    ),
     ("host_discovery", "host discovery is not exposed"),
     ("share", "port sharing is not exposed"),
     ("forward", "port forwarding is not exposed"),
@@ -734,6 +740,8 @@ fn every_schema_key_is_rendered_or_dispositioned() {
         "limits",
         "diagnostics",
         "disk",
+        "daemon",
+        "network",
         "sandbox.remote",
     ] {
         for (schema_section, key) in &required.keys {
@@ -1216,6 +1224,36 @@ fn hm_disk_scalar_keys_are_rendered_and_rest_dispositioned() {
 }
 
 #[test]
+fn hm_daemon_and_network_keys_are_rendered_and_rest_dispositioned() {
+    let rendered = rendered_paths(&module_src());
+    for path in [
+        "daemon.enabled",
+        "daemon.idle_exit_secs",
+        "daemon.lease_grace_secs",
+        "daemon.stream_gap_window_secs",
+        "network.offline_after_failures",
+        "network.recovery_probe_secs",
+    ] {
+        assert!(rendered.contains(path), "Home Manager must render {path}");
+    }
+
+    let omissions: BTreeSet<&str> = OMITTED.iter().map(|(path, _)| *path).collect();
+    for table in ["daemon", "network"] {
+        let schema = schema_field(table);
+        let properties = schema["properties"]
+            .as_object()
+            .unwrap_or_else(|| panic!("{table} schema properties"));
+        for key in properties.keys() {
+            let path = format!("{table}.{key}");
+            assert!(
+                rendered.contains(&path) || omissions.contains(path.as_str()),
+                "{path} must be rendered or dispositioned by an exact ledger row"
+            );
+        }
+    }
+}
+
+#[test]
 fn hm_loc_and_replay_families_are_fully_rendered() {
     let rendered = rendered_paths(&module_src());
     for table in ["loc", "replay"] {
@@ -1393,6 +1431,14 @@ fn every_numeric_option_matches_its_destination_range() {
         ("diskMaxScanPerRound", "disk.max_scan_per_round"),
         ("diskIdleCleanDays", "disk.idle_clean_days"),
         ("diskGenerationMinAgeDays", "disk.generation_min_age_days"),
+        ("daemonIdleExitSecs", "daemon.idle_exit_secs"),
+        ("daemonLeaseGraceSecs", "daemon.lease_grace_secs"),
+        ("daemonStreamGapWindowSecs", "daemon.stream_gap_window_secs"),
+        (
+            "networkOfflineAfterFailures",
+            "network.offline_after_failures",
+        ),
+        ("networkRecoveryProbeSecs", "network.recovery_probe_secs"),
     ];
     let options = numeric_options(&module_src());
     let actual_names: BTreeSet<&str> = options.iter().map(|(name, _)| name.as_str()).collect();

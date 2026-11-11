@@ -146,6 +146,11 @@ result is not accepted as proof. Completion of a stage with an artifact is
 refused while thegn cannot read the worktree's git status; retry when it can,
 or record an explicit forced completion.
 
+A report is stored only for the run it was verified against. If the row is
+republished while the report is being filed, the report is refused with "was
+republished while its report was being filed" and the old run's report is never
+attached to the new run; re-file it for the current run.
+
 Before `thegn dispatch set-status <row> done` on a stage row with a worktree,
 the Lead runs
 `thegn dispatch gate <row>` to record an attestation for the committed HEAD;
@@ -185,8 +190,19 @@ The check does not prove a handoff is free of secrets.
 Symlinked handoff files are not followed, and a handoff path reached through a
 symlinked or `..` parent directory is refused too.
 
+`thegn dispatch verify` reads the worktree's HEAD before and after it collects
+its facts and re-reads the handoff at the end. If HEAD or the handoff changed
+meanwhile, the result is the worktree-unknown refusal rather than a verdict
+about two different states; run it again once the worktree is quiet.
+
 Wait for the session to publish or open one; `--force --why '<reason>'` records
 an explicit override.
+
+A parent row must belong to the same issue as its child. Issue ids are compared
+case-insensitively and a missing provider prefix matches any provider, so
+`ABC-74`, `linear:abc-74` and `LINEAR:ABC-74` are one issue; the same key under
+two different providers is a different issue and is refused as a cross-issue
+parent.
 
 A chunk's `after:` names resolve only to rows in the same stage. The newest
 attempt of each chunk name governs, and a done or merged row satisfies the
