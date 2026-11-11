@@ -84,8 +84,14 @@ fn resolve(cfg: &Config) -> crate::env::Environment {
     // skips the main-branch Git probe even with main_env configured. The only
     // repo-overlay reads see this owned empty directory.
     let loc = GitLoc::Local(root.to_path_buf());
-    let (environment, resolved) =
-        resolve_environment(cfg, root, &loc, root, Some(NAME), &Approvals::deny_all());
+    let (environment, resolved) = resolve_environment(
+        cfg,
+        root,
+        &loc,
+        root,
+        &crate::sandbox_pin::EnvSelection::named(NAME),
+        &Approvals::deny_all(),
+    );
     assert!(resolved.events.is_empty());
     assert!(resolved.pending.is_empty());
     assert_eq!(std::fs::read_dir(root).unwrap().count(), 0);

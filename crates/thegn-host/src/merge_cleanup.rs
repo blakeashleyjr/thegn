@@ -33,7 +33,10 @@ impl LocalResources {
             root,
             &thegn_core::remote::GitLoc::Local(path.into()),
             Path::new(path),
-            selected.0.as_deref().or(selected.1.as_deref()),
+            &thegn_core::sandbox_pin::EnvSelection {
+                name: selected.0.clone().or(selected.1.clone()),
+                profile: None,
+            },
         );
         if environment.unresolved_selection
             || !environment.placement.is_local()

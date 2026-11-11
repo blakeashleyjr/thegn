@@ -11,7 +11,7 @@
 
 use std::path::Path;
 
-use thegn_core::config::{Config, SandboxConfig};
+use thegn_core::config::{Config, SandboxConfig, SandboxProfile};
 use thegn_core::config_resolve::{Approvals, ClampEvent, GatedRequest, summarize_events};
 use thegn_core::db::Db;
 use thegn_core::devcontainer::{self, ImageSource, SubstCtx};
@@ -19,6 +19,7 @@ use thegn_core::devcontainer_overlay;
 use thegn_core::devcontainer_select;
 use thegn_core::env::Environment;
 use thegn_core::remote::GitLoc;
+use thegn_core::sandbox_pin::EnvSelection;
 use thegn_core::store::{NotificationStore, RepoTrustStore, WorkspaceStore, ZoneStore};
 
 /// Notification kind for a clamped/pending repo overlay request.
@@ -28,6 +29,12 @@ pub(crate) const CLAMP_KIND: &str = "repo_config_trust";
 pub(crate) struct TrustedEnvironment {
     pub environment: Environment,
     pub devcontainer: Option<TrustedDevcontainer>,
+    /// The per-worktree isolation pin this resolution honoured: the DB pin,
+    /// or an explicit caller-supplied profile. `None` when the worktree
+    /// inherits its profile. The launch path refuses a disabled sandbox for
+    /// a sealed pin, so it needs the MERGED pin — the caller's argument alone
+    /// (usually `profile: None`) cannot answer that.
+    pub pin: Option<SandboxProfile>,
 }
 
 #[derive(Debug, Clone)]
@@ -59,8 +66,8 @@ pub(crate) fn approvals_for(db: &Db, repo_root: &str) -> Approvals {
 /// worktree. Read-only status/provisioning callers must not stop at the base
 /// repo sandbox: doing so drops the workspace/worktree env selection and its
 /// `[env.<name>.sandbox]` overlay. A failed location or selection read is an
-/// error, except that a failed selection read can use the implicit default
-/// when no named environments are configured. `db: None` performs no reads.
+/// error; isolation and environment selections both fail closed. `db: None`
+/// performs no reads.
 pub(crate) fn effective_environment_for_worktree(
     cfg: &Config,
     db: Option<&Db>,
@@ -77,8 +84,8 @@ pub(crate) fn effective_environment_for_worktree(
         (None, None) => Ok(None),
     };
     let selection_read = match db {
-        Some(db) => db.effective_env_checked(&worktree_s, &repo_s),
-        None => Ok(None),
+        Some(db) => db.effective_env_selection(&worktree_s, &repo_s),
+        None => Ok(EnvSelection::none()),
     };
     environment_from_reads(
         cfg,
@@ -96,49 +103,54 @@ fn environment_from_reads(
     repo_root: &Path,
     worktree: &Path,
     location: anyhow::Result<Option<String>>,
-    selected: anyhow::Result<Option<String>>,
+    selected: anyhow::Result<EnvSelection>,
     approvals: &Approvals,
 ) -> anyhow::Result<Environment> {
     use anyhow::Context;
     let location = location.context("the worktree's recorded location could not be read")?;
     let selected = match selected {
         Ok(selected) => selected,
-        Err(_) if cfg.env.is_empty() => None,
         Err(error) => {
-            return Err(error).context("the worktree's environment selection could not be read");
+            return Err(unreadable_worktree_isolation(
+                &worktree.to_string_lossy(),
+                &error,
+            ));
         }
     };
     let loc = GitLoc::from_db(&worktree.to_string_lossy(), location.as_deref());
     Ok(cfg
-        .resolve_env_with(repo_root, &loc, worktree, selected.as_deref(), approvals)
+        .resolve_env_with(repo_root, &loc, worktree, &selected, approvals)
         .0)
 }
 
 /// Resolve the effective [`Environment`] for a worktree honouring persisted
 /// trust-on-first-use approvals, and surface anything the clamp denied or gated.
-/// Never fails resolution — on a DB-open error it falls back to the fail-closed
-/// [`Config::resolve_env`].
+/// A DB or selection read failure is a typed halt: the isolation pin cannot be
+/// safely inferred when its storage is unreadable.
 pub(crate) fn resolve_env_trusted(
     cfg: &Config,
     repo_root: &Path,
     loc: &GitLoc,
     worktree: &str,
-    selected_env: Option<&str>,
-) -> TrustedEnvironment {
-    let Ok(db) = Db::open() else {
-        return TrustedEnvironment {
-            environment: cfg.resolve_env(repo_root, loc, Path::new(worktree), selected_env),
-            devcontainer: None,
-        };
-    };
+    selected_env: &EnvSelection,
+) -> anyhow::Result<TrustedEnvironment> {
+    let db = Db::open().map_err(|error| unreadable_worktree_isolation(worktree, &error))?;
     let root_s = repo_root.to_string_lossy().to_string();
+    let worktree_selection = db
+        .effective_env_selection(worktree, &root_s)
+        .map_err(|error| unreadable_worktree_isolation(worktree, &error))?;
+    let worktree_selection = EnvSelection {
+        name: selected_env.name.clone().or(worktree_selection.name),
+        profile: selected_env.profile.or(worktree_selection.profile),
+    };
+    let pin = worktree_selection.profile;
     let approved_canonical = db.repo_trust_approved(&root_s).unwrap_or_default();
     let approvals = Approvals::from_canonical(approved_canonical.clone());
     let (mut env, resolved) = cfg.resolve_env_with(
         repo_root,
         loc,
         Path::new(worktree),
-        selected_env,
+        &worktree_selection,
         &approvals,
     );
     let mut pending = resolved.pending.clone();
@@ -163,10 +175,15 @@ pub(crate) fn resolve_env_trusted(
         None
     };
     apply_zone(&db, cfg, worktree, &mut env);
-    TrustedEnvironment {
+    Ok(TrustedEnvironment {
         environment: env,
         devcontainer,
-    }
+        pin,
+    })
+}
+
+fn unreadable_worktree_isolation(worktree: &str, error: &anyhow::Error) -> anyhow::Error {
+    crate::agent::worktree_isolation_read_failure(worktree, error)
 }
 
 /// A [`SubstCtx`] for a worktree that thegn bind-mounts at its **real path**
@@ -393,7 +410,7 @@ pub(crate) fn devcontainer_feature_steps(
 /// floor) to the resolved sandbox, and surface any egress entries the zone
 /// dropped. No-op for an unzoned worktree or a zone with no `[zone.<name>]`
 /// policy. Membership is DB-tracked (never path-inferred). See [`thegn_core::zone`].
-fn apply_zone(db: &Db, cfg: &Config, worktree: &str, env: &mut Environment) {
+pub(crate) fn apply_zone(db: &Db, cfg: &Config, worktree: &str, env: &mut Environment) {
     let Ok(Some(zrow)) = db.zone_of_worktree(worktree) else {
         return;
     };
@@ -483,6 +500,7 @@ fn local_env_admitted(
 #[cfg(test)]
 mod tests {
     use super::{environment_from_reads, local_env_admitted};
+    use thegn_core::sandbox_pin::EnvSelection;
 
     #[test]
     fn environment_from_reads_refuses_an_unreadable_selection() {
@@ -507,15 +525,20 @@ mod tests {
         )
         .unwrap_err();
 
-        let message = format!("{error:#}");
-        assert!(message.contains("environment selection could not be read"));
+        // The error is `WorktreeIsolationReadFailure` wrapping the halt;
+        // `downcast_ref` does not follow `source()`, so walk the chain.
+        let halt = crate::handlers::provision::sandbox_halt_in(&error)
+            .expect("unreadable selection is a typed launch halt");
+        let message = halt.to_string();
+        assert!(message.contains("thegn cannot read this worktree's isolation setting"));
+        assert!(message.contains("thegn doctor"));
         assert!(message.contains("database is locked"));
     }
 
     #[test]
-    fn environment_from_reads_uses_default_when_unconfigured_selection_is_unreadable() {
+    fn environment_from_reads_refuses_an_unreadable_pin_even_without_named_envs() {
         let root = tempfile::tempdir().unwrap();
-        let environment = environment_from_reads(
+        let error = environment_from_reads(
             &thegn_core::config::Config::default(),
             root.path(),
             root.path(),
@@ -523,9 +546,13 @@ mod tests {
             Err(anyhow::anyhow!("database is locked")),
             &thegn_core::config_resolve::Approvals::deny_all(),
         )
-        .unwrap();
-
-        assert_eq!(environment.name, "default");
+        .unwrap_err();
+        let halt = crate::handlers::provision::sandbox_halt_in(&error)
+            .expect("unreadable isolation pin is a typed launch halt");
+        assert!(
+            halt.reason
+                .contains("thegn cannot read this worktree's isolation setting")
+        );
     }
 
     #[test]
@@ -536,7 +563,7 @@ mod tests {
             root.path(),
             root.path(),
             Err(anyhow::anyhow!("disk I/O error")),
-            Ok(None),
+            Ok(EnvSelection::none()),
             &thegn_core::config_resolve::Approvals::deny_all(),
         )
         .unwrap_err();
@@ -564,7 +591,7 @@ mod tests {
             root.path(),
             root.path(),
             Ok(None),
-            Ok(Some("box".into())),
+            Ok(EnvSelection::named("box")),
             &thegn_core::config_resolve::Approvals::deny_all(),
         )
         .unwrap();

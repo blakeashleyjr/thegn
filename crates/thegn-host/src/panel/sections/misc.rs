@@ -1055,6 +1055,12 @@ fn sandbox_with(ctx: &SectionCtx, show_all: bool) -> Vec<PanelRow> {
     }
     let (model, deep) = (ctx.model, ctx.deep());
     let mut rows: Vec<PanelRow> = Vec::new();
+    if let Some(profile) = model.active_sandbox_profile_pin.as_deref() {
+        rows.push(PanelRow::plain(Line::segs(vec![
+            seg(g(), "isolation  "),
+            seg(f(), format!("{profile} (pinned for this worktree)")),
+        ])));
+    }
     // Full remote-placement detail (ssh:host, k8s:ns/pod, sprite:<id>); the
     // tab bar carries only the terse kind chip. Local worktrees show nothing.
     if let Some(placement) = &model.active_placement_label {

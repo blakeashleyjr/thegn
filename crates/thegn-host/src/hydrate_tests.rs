@@ -1592,7 +1592,7 @@ fn devcontainer_status_ignores_repo_host_environment_that_weakens_backend() {
         repo.path(),
         &thegn_core::remote::GitLoc::Local(repo.path().to_path_buf()),
         repo.path(),
-        None,
+        &thegn_core::sandbox_pin::EnvSelection::none(),
         &thegn_core::config_resolve::Approvals::deny_all(),
     );
     let event = resolved
@@ -2138,6 +2138,7 @@ fn db_wt(slug: &str, repo_path: &str) -> crate::sidebar::DbWorktree {
         sandbox_backend: None,
         env_name: None,
         env_degraded: false,
+        sandbox_profile: None,
     }
 }
 

@@ -54,6 +54,7 @@ pub mod project;
 pub mod proxy;
 pub mod repos;
 pub mod sandbox;
+pub mod sandbox_profile;
 pub mod search;
 pub mod secret;
 pub mod session;

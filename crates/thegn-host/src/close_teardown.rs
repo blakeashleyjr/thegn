@@ -127,7 +127,15 @@ pub(crate) fn background_close(cfg: Option<&thegn_core::config::Config>, path: &
             return;
         }
     };
-    let env = cfg.resolve_env(&repo_root, &loc, worktree, selected.as_deref());
+    let env = cfg.resolve_env(
+        &repo_root,
+        &loc,
+        worktree,
+        &thegn_core::sandbox_pin::EnvSelection {
+            name: selected.clone(),
+            profile: None,
+        },
+    );
     sandbox_teardown(cfg, &env, &loc, path);
 }
 
