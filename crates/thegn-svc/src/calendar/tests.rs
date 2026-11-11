@@ -2398,6 +2398,156 @@ async fn pass_deadline_does_not_change_a_pass_that_finishes_in_time() {
     );
 }
 
+fn pass_stats_accounts(
+    count: usize,
+    class: FetchClass,
+    provider: &'static str,
+    delay: std::time::Duration,
+    fail_first: bool,
+) -> CalendarRouter {
+    let active = std::sync::Arc::new(ActiveFetches::default());
+    timed_router(
+        (0..count)
+            .map(|index| {
+                (
+                    format!("account-{index}"),
+                    class,
+                    provider,
+                    delay,
+                    fail_first && index == 0,
+                    active.clone(),
+                )
+            })
+            .collect(),
+    )
+}
+
+#[tokio::test(start_paused = true)]
+async fn pass_stats_count_an_all_success_pass_and_the_network_cap() {
+    let router = pass_stats_accounts(
+        8,
+        FetchClass::Network,
+        "ics-url",
+        std::time::Duration::from_secs(1),
+        false,
+    );
+    let stats = router
+        .list_events_pass(calendar_window(), &BTreeMap::new(), || true, |_| {})
+        .await;
+    assert_eq!(
+        stats,
+        PassStats {
+            accounts: 8,
+            started: 8,
+            completed: 8,
+            failed: 0,
+            abandoned: 0,
+            skipped: 0,
+            peak_active: 4,
+        }
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn pass_stats_split_completed_from_failed() {
+    let router = pass_stats_accounts(
+        2,
+        FetchClass::Network,
+        "ics-url",
+        std::time::Duration::from_secs(1),
+        true,
+    );
+    let stats = router
+        .list_events_pass(calendar_window(), &BTreeMap::new(), || true, |_| {})
+        .await;
+    assert_eq!(stats.started, 2);
+    assert_eq!(stats.completed, 1);
+    assert_eq!(stats.failed, 1);
+    assert_eq!(stats.abandoned, 0);
+}
+
+#[tokio::test(start_paused = true)]
+async fn pass_stats_report_a_deadline_cut_as_abandoned_and_skipped() {
+    let router = pass_stats_accounts(
+        3,
+        FetchClass::Command,
+        "command",
+        std::time::Duration::from_secs(100_000),
+        false,
+    );
+    let stats = router
+        .list_events_pass_bounded(
+            calendar_window(),
+            &BTreeMap::new(),
+            || true,
+            std::time::Duration::from_secs(30),
+            |_| {},
+        )
+        .await;
+    assert_eq!(stats.started, 1);
+    assert_eq!(stats.completed, 0);
+    assert_eq!(stats.failed, 0);
+    assert_eq!(stats.abandoned, 1);
+    assert_eq!(stats.skipped, 2);
+    assert_eq!(stats.peak_active, 1);
+}
+
+#[tokio::test(start_paused = true)]
+async fn pass_stats_count_a_superseded_pass_as_skipped() {
+    let router = pass_stats_accounts(
+        3,
+        FetchClass::Command,
+        "command",
+        std::time::Duration::from_secs(1),
+        false,
+    );
+    let done = std::cell::Cell::new(0_usize);
+    let stats = router
+        .list_events_pass(
+            calendar_window(),
+            &BTreeMap::new(),
+            || done.get() == 0,
+            |_| done.set(done.get() + 1),
+        )
+        .await;
+    assert_eq!(stats.started, 1);
+    assert_eq!(stats.completed, 1);
+    assert_eq!(stats.skipped, 2);
+}
+
+#[tokio::test(start_paused = true)]
+async fn pass_stats_wrapper_returns_the_skipped_count() {
+    let make = || {
+        pass_stats_accounts(
+            3,
+            FetchClass::Command,
+            "command",
+            std::time::Duration::from_secs(1),
+            false,
+        )
+    };
+    let done = std::cell::Cell::new(0_usize);
+    let stats = make()
+        .list_events_pass(
+            calendar_window(),
+            &BTreeMap::new(),
+            || done.get() == 0,
+            |_| done.set(done.get() + 1),
+        )
+        .await;
+    let done = std::cell::Cell::new(0_usize);
+    let skipped = make()
+        .list_events_each_while_bounded(
+            calendar_window(),
+            &BTreeMap::new(),
+            || done.get() == 0,
+            super::CALENDAR_PASS_DEADLINE,
+            |_| done.set(done.get() + 1),
+        )
+        .await;
+    assert_eq!(skipped, stats.skipped);
+}
+
 #[test]
 fn an_empty_config_builds_an_unconfigured_router() {
     let r = router(&CalendarConfig::default());
