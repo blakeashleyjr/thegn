@@ -60,6 +60,7 @@ fn b(obj: &Value, keys: &[&str]) -> Option<bool> {
 
 /// Fold one adapter JSON object into a [`MediaState`]. `None` when there's no
 /// track at all (empty payload between sessions).
+/// A payload that states no playback state decodes as `Stopped`, never `Playing`.
 pub fn to_state(v: &Value) -> Option<MediaState> {
     // Some adapter builds wrap the info in a `payload`/`info` object.
     let obj = v.get("payload").or_else(|| v.get("info")).unwrap_or(v);
@@ -84,18 +85,19 @@ pub fn to_state(v: &Value) -> Option<MediaState> {
     .map(Duration::from_secs_f64);
 
     // `playing` when present, else derive from playback rate (>0 == playing).
-    let playing = b(obj, &["playing"]).unwrap_or_else(|| {
-        f(
+    // A payload that states no playback state is Stopped (the model's unknown
+    // convention, `PlaybackState::from_mpris`), never Playing.
+    let state = match b(obj, &["playing"]) {
+        Some(true) => PlaybackState::Playing,
+        Some(false) => PlaybackState::Paused,
+        None => match f(
             obj,
             &["playbackRate", "kMRMediaRemoteNowPlayingInfoPlaybackRate"],
-        )
-        .map(|r| r > 0.0)
-        .unwrap_or(true)
-    });
-    let state = if playing {
-        PlaybackState::Playing
-    } else {
-        PlaybackState::Paused
+        ) {
+            Some(rate) if rate > 0.0 => PlaybackState::Playing,
+            Some(_) => PlaybackState::Paused,
+            None => PlaybackState::Stopped,
+        },
     };
 
     let player = s(
@@ -193,6 +195,64 @@ mod tests {
         let s = to_state(&v).unwrap();
         assert_eq!(s.length, Some(Duration::from_secs(90)));
         assert!(!s.can_seek);
+    }
+
+    #[test]
+    fn stateless_payload_decodes_as_stopped_not_playing() {
+        for v in [
+            json!({"title": "X", "artist": "Y"}),
+            json!({"title": "X", "duration": 90.0, "elapsedTime": 3.0}),
+            json!({"payload": {"title": "X"}}),
+        ] {
+            assert_eq!(to_state(&v).unwrap().state, PlaybackState::Stopped, "{v}");
+        }
+    }
+
+    #[test]
+    fn non_bool_playing_without_rate_is_stopped() {
+        for v in [
+            json!({"title": "X", "playing": "yes"}),
+            json!({"title": "X", "playing": 1}),
+        ] {
+            assert_eq!(to_state(&v).unwrap().state, PlaybackState::Stopped, "{v}");
+        }
+    }
+
+    #[test]
+    fn explicit_state_and_rate_still_decide() {
+        let cases = [
+            (
+                json!({"title": "X", "playing": true}),
+                PlaybackState::Playing,
+            ),
+            (
+                json!({"title": "X", "playing": false}),
+                PlaybackState::Paused,
+            ),
+            (
+                json!({"title": "X", "playbackRate": 1.0}),
+                PlaybackState::Playing,
+            ),
+            (
+                json!({"title": "X", "playbackRate": 0.0}),
+                PlaybackState::Paused,
+            ),
+            (
+                json!({"title": "X", "playing": false, "playbackRate": 1.0}),
+                PlaybackState::Paused,
+            ),
+        ];
+        for (v, want) in cases {
+            assert_eq!(to_state(&v).unwrap().state, want, "{v}");
+        }
+    }
+
+    #[test]
+    fn stateless_payload_stays_stopped_through_decode_get() {
+        let state = decode_get(r#"{"title":"Get Lucky","artist":"Daft Punk"}"#)
+            .unwrap()
+            .unwrap();
+        assert_eq!(state.state, PlaybackState::Stopped);
     }
 
     #[test]
