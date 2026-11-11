@@ -403,36 +403,34 @@ impl ShareInstance {
             let port = self.port;
             let generation = self.generation;
             let provider = self.provider;
-            let spawn = std::thread::Builder::new()
-                .name("thegn-share-dn".into())
-                .spawn(move || {
-                    crate::platform::qos::set_self(crate::platform::qos::Qos::Background);
-                    let event = match thegn_svc::share::serve_down(&td.sidecar, &td.serve) {
-                        Ok(()) => ShareEvent::Down {
-                            worktree,
-                            port,
-                            generation,
-                        },
-                        Err(error) => ShareEvent::Failed {
-                            worktree,
-                            port,
-                            generation,
-                            provider,
-                            error: format!("{error}; stop it again to retry"),
-                            teardown_unverified: true,
-                        },
-                    };
-                    if let Some(tx) = worker_tx
-                        && let Err(error) = tx.send(event)
-                    {
-                        tracing::debug!(%error, "share teardown acknowledgement receiver is gone");
-                    }
-                    if let Some(waker) = worker_waker
-                        && let Err(error) = waker.wake()
-                    {
-                        tracing::debug!(%error, "share teardown waker is unavailable");
-                    }
-                });
+            let spawn = thegn_core::thread_name::try_spawn_named("thegn-share-dn", move || {
+                crate::platform::qos::set_self(crate::platform::qos::Qos::Background);
+                let event = match thegn_svc::share::serve_down(&td.sidecar, &td.serve) {
+                    Ok(()) => ShareEvent::Down {
+                        worktree,
+                        port,
+                        generation,
+                    },
+                    Err(error) => ShareEvent::Failed {
+                        worktree,
+                        port,
+                        generation,
+                        provider,
+                        error: format!("{error}; stop it again to retry"),
+                        teardown_unverified: true,
+                    },
+                };
+                if let Some(tx) = worker_tx
+                    && let Err(error) = tx.send(event)
+                {
+                    tracing::debug!(%error, "share teardown acknowledgement receiver is gone");
+                }
+                if let Some(waker) = worker_waker
+                    && let Err(error) = waker.wake()
+                {
+                    tracing::debug!(%error, "share teardown waker is unavailable");
+                }
+            });
             if let Err(error) = spawn {
                 tracing::warn!(%error, "could not spawn share teardown worker");
                 if let Some(tx) = tx
@@ -687,14 +685,12 @@ impl ShareSupervisor {
         let t_tx = tx.clone();
         let t_waker = waker.clone();
         let wt = worktree.to_string();
-        std::thread::Builder::new()
-            .name("thegn-share".into())
-            .spawn(move || {
-                // Utility: the user started this share and is watching for its URL.
-                crate::platform::qos::set_self(crate::platform::qos::Qos::Utility);
-                supervise(spec, wt, port, generation, t_tx, t_waker, t_shared)
-            })
-            .map_err(|e| format!("could not spawn share supervisor: {e}"))?;
+        thegn_core::thread_name::try_spawn_named("thegn-share", move || {
+            // Utility: the user started this share and is watching for its URL.
+            crate::platform::qos::set_self(crate::platform::qos::Qos::Utility);
+            supervise(spec, wt, port, generation, t_tx, t_waker, t_shared)
+        })
+        .map_err(|e| format!("could not spawn share supervisor: {e}"))?;
         self.instances.push(ShareInstance {
             worktree: worktree.to_string(),
             port,

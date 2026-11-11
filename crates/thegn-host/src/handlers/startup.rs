@@ -161,9 +161,7 @@ fn reap_legacy_projection_mounts() {
             return;
         }
 
-        let spawn = std::thread::Builder::new()
-            .name("thegn-proj-reap".into())
-            .spawn(move || {
+        let spawn = thegn_core::thread_name::try_spawn_named("thegn-proj-reap", move || {
                 crate::platform::qos::set_self(crate::platform::qos::Qos::Background);
                 thegn_svc::projection::reap_legacy_mounts(&mounts_dir);
             });
@@ -184,18 +182,16 @@ fn reap_legacy_projection_mounts() {
 fn clear_stale_raised_hands() {
     static ONCE: std::sync::Once = std::sync::Once::new();
     ONCE.call_once(|| {
-        std::thread::Builder::new()
-            .name("thegn-attn-boot".into())
-            .spawn(|| {
-                crate::platform::qos::set_self(crate::platform::qos::Qos::Background);
-                if let Ok(db) = thegn_core::db::Db::open() {
-                    // best-effort: the table is disposable derived state; a
-                    // failed clear costs one stale hand until the next boot.
-                    let _ = thegn_core::store::NotificationStore::clear_all_session_attention(&db);
-                }
-                // best-effort: spawn: a failed spawn costs one stale hand until the next boot (cost described above)
-            })
-            .ok();
+        thegn_core::thread_name::try_spawn_named("thegn-attn-boot", || {
+            crate::platform::qos::set_self(crate::platform::qos::Qos::Background);
+            if let Ok(db) = thegn_core::db::Db::open() {
+                // best-effort: the table is disposable derived state; a
+                // failed clear costs one stale hand until the next boot.
+                let _ = thegn_core::store::NotificationStore::clear_all_session_attention(&db);
+            }
+            // best-effort: spawn: a failed spawn costs one stale hand until the next boot (cost described above)
+        })
+        .ok();
     });
 }
 
