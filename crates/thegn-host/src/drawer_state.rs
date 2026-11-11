@@ -216,8 +216,8 @@ fn clear_desired_if(key: &str, occupant_id: &str) {
 // ── keep-alive pane pool ─────────────────────────────────────────────────────
 
 /// The key for a pooled drawer pane. A global occupant uses the fixed global
-/// scope key, while worktree occupants use an exact-byte digest of the
-/// already-resolved absolute path.
+/// scope key, while worktree occupants use a digest of the lexically
+/// normalised path (`.` and trailing separators collapsed).
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub(crate) struct DrawerPoolKey {
     pub scope_key: String,

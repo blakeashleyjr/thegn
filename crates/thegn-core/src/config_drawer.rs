@@ -471,7 +471,7 @@ mod tests {
     fn worktree_scope_key_for_root_and_relative_stay_valid() {
         let key = |p: &str| drawer_scope_key(DrawerScope::Worktree, Path::new(p));
         assert!(key("/").starts_with("worktree--"));
-        assert_eq!(key("a/b"), key("./a/b"));
+        assert_eq!(key("a/./b"), key("a/b"));
     }
 
     #[test]
