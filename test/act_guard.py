@@ -18,14 +18,42 @@ ROOT = Path(__file__).resolve().parent.parent
 
 
 def has_credentials(args: list[str]) -> bool:
+    # `-sNAME=x` is the glued pflag short form of `-s NAME=x`.
     return any(
-        arg.startswith("--secret") or arg == "-s" or arg.startswith("-s=")
+        arg.startswith("--secret") or (arg.startswith("-s") and not arg.startswith("--"))
         for arg in args
     )
 
 
+_REUSE_TRUE = {"1", "t", "T", "true", "TRUE", "True"}
+
+
 def has_reuse(args: list[str]) -> bool:
-    return any(arg in {"--reuse", "-r", "--reuse=true"} for arg in args)
+    return any(
+        arg in {"--reuse", "-r"}
+        or (
+            (arg.startswith("--reuse=") or arg.startswith("-r="))
+            and arg.partition("=")[2] in _REUSE_TRUE
+        )
+        for arg in args
+    )
+
+
+_REDIRECT_LONG = ("--workflows", "--directory", "--local-repository")
+_REDIRECT_SHORT = ("-W", "-C")
+
+
+def redirect_flags(args: list[str]) -> list[str]:
+    """Flags that point act at workflow/action code outside the checked `.github/` tree (in args order)."""
+    found: list[str] = []
+    for arg in args:
+        for flag in _REDIRECT_LONG:
+            if arg == flag or arg.startswith(flag + "="):
+                found.append(flag)
+        for flag in _REDIRECT_SHORT:
+            if arg.startswith(flag) and not arg.startswith("--"):
+                found.append(flag)
+    return found
 
 
 _DIGEST = re.compile(r"@sha256:[0-9a-f]{64}$")
@@ -99,6 +127,13 @@ def plan(
         return None, (
             f"act: --reuse cannot be combined with credentials{credential_source} "
             "(the retained container would carry them into later runs)"
+        )
+    redirects = redirect_flags(args)
+    if credentialed and redirects:
+        flags = ", ".join(sorted(set(redirects)))
+        return None, (
+            f"act: credentialed runs cannot use {flags}{credential_source}: "
+            "the clean-HEAD check only covers .github/ and .actrc of this checkout"
         )
     if credentialed and (dirty is None or head is None):
         return None, (
@@ -323,6 +358,73 @@ def self_test() -> int:
         (
             "image-pin-ignores-non-platform-flags",
             image_refusal(good, ["-j", "lint", "--rm", "-W", "x"]) is None,
+        )
+    )
+
+    argv, message = plan("push", ["-sGITHUB_TOKEN=x"], [], "abc123")
+    cases.append(
+        (
+            "credential-glued-short-flag",
+            argv is not None and "abc123" in message,
+        )
+    )
+
+    argv, message = plan(
+        "push", ["-sGITHUB_TOKEN=x"], [" M .github/workflows/ci.yml"], "abc123"
+    )
+    cases.append(
+        (
+            "credential-glued-short-flag-dirty-refused",
+            argv is None and ".github/workflows/ci.yml" in message,
+        )
+    )
+
+    redirect_forms = [
+        (["-W", "/tmp/w"], "-W"),
+        (["-W/tmp/w"], "-W"),
+        (["--workflows", "/tmp/w"], "--workflows"),
+        (["--workflows=/tmp/w"], "--workflows"),
+        (["-C", "/tmp/c"], "-C"),
+        (["-C/tmp/c"], "-C"),
+        (["--directory=/tmp/c"], "--directory"),
+        (["--local-repository", "o/r@main=/tmp/r"], "--local-repository"),
+    ]
+    redirect_ok = True
+    for form, flag in redirect_forms:
+        argv, message = plan("push", ["--secret", "T=x", *form], [], "abc123")
+        redirect_ok = redirect_ok and argv is None and flag in message
+    cases.append(("credential-redirect-refused-in-all-forms", redirect_ok))
+
+    argv, message = plan("push", ["-W", "/tmp/w"], [], "abc123", True)
+    cases.append(
+        (
+            "implicit-secrets-redirect-refused",
+            argv is None and ".secrets" in message,
+        )
+    )
+
+    cases.append(
+        (
+            "anonymous-redirect-allowed",
+            plan("push", ["-W", "/tmp/w"], None, None)
+            == (["act", "push", "-W", "/tmp/w", "--rm"], ""),
+        )
+    )
+
+    reuse_ok = True
+    for form in (["--reuse=1"], ["--reuse=TRUE"], ["-r=true"], ["-r=t"]):
+        argv, _ = plan("push", form, None, None)
+        reuse_ok = reuse_ok and argv is not None and "--rm" not in argv
+        reuse_ok = reuse_ok and form[0] in argv
+        argv, message = plan("push", ["--secret", "T=x", form[0]], [], "abc123")
+        reuse_ok = reuse_ok and argv is None and "--reuse cannot" in message
+    cases.append(("reuse-truthy-equals-forms", reuse_ok))
+
+    argv, _ = plan("push", ["--reuse=false"], None, None)
+    cases.append(
+        (
+            "reuse-false-equals-keeps-rm",
+            argv is not None and argv[-1] == "--rm",
         )
     )
 
