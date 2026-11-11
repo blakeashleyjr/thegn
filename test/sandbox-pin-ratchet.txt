@@ -1,0 +1,14 @@
+# Deliberate worktree-less resolver selections, keyed by enclosing function.
+agent_configs.rs:resync_agent_auth  Reads profile-independent credential transfer policy only.
+close_teardown.rs:background_close  Teardown cleanup does not launch a process.
+cmd/env.rs:resolve_with_selection  Env display and image-bake use the selected env name only.
+lifecycle.rs:explicit_park  Park and teardown bookkeeping does not launch a process.
+lifecycle.rs:pool_env  Selects the warm-pool env name; it does not launch a worktree.
+lifecycle.rs:recycle_spare  Recycles a worktree-less spare using its configured env name.
+loading/track.rs:loading_context  Splash text reports the selected env while preparation resolves the pin later.
+merge_cleanup.rs:settle  Merge cleanup only tears down the old launch context.
+provider_factory.rs:resolve_provider_env  Resolves provider ownership and sandbox naming, not a worktree launch.
+pty_drain.rs:report_pane_connect_failure  Reports provider health after a pane connection failure.
+wizard.rs:new  Computes each host's effective profile default for the creation form.
+worktree_lifecycle.rs:teardown_runtime  Teardown identifies the provider runtime and never starts a process.
+cmd/wt.rs:create_and_register  New worktree has no registered worktree pin yet; resolves its inherited default.

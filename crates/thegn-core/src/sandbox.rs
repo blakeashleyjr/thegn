@@ -670,7 +670,7 @@ impl RefusalClass {
                 "remove the protected host path from the Compose file's binds, or choose a less restrictive [sandbox] profile"
             }
             Self::SealedHome => {
-                "sealed profiles hide $HOME: move the mount or worktree out of $HOME, or use profile 'standard'"
+                "sealed profiles hide $HOME: move the mount or worktree out of $HOME, or use profile 'standard' (`thegn sandbox profile set standard`)"
             }
             Self::UnsafeMountPath => {
                 "rename the mount path so it has no whitespace, quote, backslash or ':', or use the bwrap backend"
@@ -704,7 +704,7 @@ impl RefusalClass {
                 "move [daemon] socket and $XDG_RUNTIME_DIR out of $HOME, the worktree and every sandbox mount (the default /run/user/<uid> is never mounted)"
             }
             Self::StrictUnsupported => {
-                "use a backend that enforces every sealed control (bwrap or an OCI runtime), or choose a non-sealed profile"
+                "use a backend that enforces every sealed control (bwrap or an OCI runtime), or choose a non-sealed profile with `thegn sandbox profile set standard`"
             }
             Self::ContainerOwner => {
                 "another worktree's sandbox container has this container's name (worktree paths that differ only in punctuation or case share one): close that worktree's sandbox first, or rename one worktree directory"

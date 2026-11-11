@@ -259,6 +259,7 @@ mod sandbox_events;
 mod sandbox_failure;
 mod sandbox_fallback_memo;
 mod sandbox_gc_gate;
+mod sandbox_profile_ui;
 mod sandbox_start;
 mod scan_pool;
 mod sched;

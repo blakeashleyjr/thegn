@@ -230,20 +230,34 @@ pub(crate) fn try_claim_spare(cfg: &thegn_core::config::Config, worktree: &str) 
     // provision paths resolve it — claiming under the ambient default while the
     // worktree runs a picked env hands over a spare from the wrong pool.
     let read = match db.as_ref() {
-        Some(db) => db.effective_env_checked(worktree, &repo_root.to_string_lossy()),
+        Some(db) => db.effective_env_selection(worktree, &repo_root.to_string_lossy()),
         None => Err(anyhow::anyhow!("the state database could not be opened")),
     };
-    let Some(selected) = claim_selection(worktree, read) else {
+    let mut selection = match read {
+        Ok(selection) => selection,
+        Err(error) => {
+            let _selection = claim_selection(worktree, Err(error));
+            return false;
+        }
+    };
+    let Some(selected) = claim_selection(worktree, Ok(selection.name.clone())) else {
         return false;
     };
-    let env_name = cfg
-        .resolve_env(
-            &repo_root,
-            &loc,
-            std::path::Path::new(worktree),
-            selected.as_deref(),
-        )
-        .name;
+    selection.name = selected;
+    let environment = cfg.resolve_env(&repo_root, &loc, std::path::Path::new(worktree), &selection);
+    if matches!(
+        environment.placement,
+        thegn_core::placement::Placement::Provider(_)
+    ) && thegn_core::sandbox_floor::provider_refusal(
+        true,
+        &environment.sandbox,
+        &environment.name,
+    )
+    .is_some()
+    {
+        return false;
+    }
+    let env_name = environment.name;
     // Never claim for an env that can't hand a spare over (no configured
     // provider) — the bind would "succeed" while skipping branch settle, parity,
     // and the worktree's real provisioning.
@@ -311,18 +325,13 @@ pub(crate) fn guard_unprovisioned_attach(
         .map(std::path::PathBuf::from)
         .or_else(|| thegn_core::repo::main_worktree(std::path::Path::new(worktree)))
         .unwrap_or_else(|| std::path::PathBuf::from(worktree));
-    let selected_env = attach_selection(
-        thegn_core::db::Db::open()
-            .and_then(|db| db.effective_env_checked(worktree, &repo_root.to_string_lossy())),
-    )
-    .map_err(anyhow::Error::from)?;
+    let mut selection = thegn_core::db::Db::open()
+        .and_then(|db| db.effective_env_selection(worktree, &repo_root.to_string_lossy()))
+        .map_err(|error| attach_selection(Err(error)).expect_err("failed selection read"))?;
+    let selected_env = attach_selection(Ok(selection.name.clone())).map_err(anyhow::Error::from)?;
+    selection.name = selected_env.clone();
     let env_name = cfg
-        .resolve_env(
-            &repo_root,
-            &loc,
-            std::path::Path::new(worktree),
-            selected_env.as_deref(),
-        )
+        .resolve_env(&repo_root, &loc, std::path::Path::new(worktree), &selection)
         .name;
     let Some(id) = crate::agent::provider_sandbox_name(cfg, worktree, &env_name) else {
         return Ok(());
@@ -336,6 +345,7 @@ pub(crate) fn guard_unprovisioned_attach(
         reason: "sandbox is still provisioning — retry once setup finishes".into(),
         ask: false,
         dormant: None,
+        sealed_home: false,
     }
     .into())
 }
@@ -367,6 +377,7 @@ fn attach_selection(
             ),
             ask: false,
             dormant: None,
+            sealed_home: false,
         }),
     }
 }
@@ -522,6 +533,15 @@ pub fn claim_spare(
             return None;
         }
     };
+    let selection = match db.effective_env_selection(worktree, &repo) {
+        Ok(selection) => selection,
+        Err(error) => {
+            crate::close_teardown::warn_visible(&format!(
+                "warm pool: cannot read worktree isolation selection for {worktree}: {error:#}"
+            ));
+            return None;
+        }
+    };
     let (name, checkpoint) = claim_ledger_pick(
         db.begin_pool_spare_claim(&repo, env_name),
         env_name,
@@ -550,11 +570,13 @@ pub fn claim_spare(
         }
     };
     let egress_loc = thegn_core::remote::GitLoc::for_worktree(std::path::Path::new(worktree));
+    let mut egress_selection = selection.clone();
+    egress_selection.name = Some(env_name.to_string());
     let egress_env = cfg.resolve_env(
         repo_root,
         &egress_loc,
         std::path::Path::new(worktree),
-        Some(env_name),
+        &egress_selection,
     );
     let egress_provider = crate::agent::provider_for_named(&env.provider, &name);
     let egress = match egress_provider.as_ref() {

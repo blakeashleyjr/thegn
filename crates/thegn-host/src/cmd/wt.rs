@@ -91,6 +91,9 @@ pub enum Action {
         /// Pin a named execution env (`[env.<name>]`) for the new worktree.
         #[arg(long)]
         env: Option<String>,
+        /// Pin the per-worktree sandbox profile (`standard` or `sealed`).
+        #[arg(long = "isolation", id = "isolation")]
+        profile: Option<String>,
         /// Create the feature across a program's member repos: one resolved
         /// branch name + a worktree in each member (see `thegn program`).
         #[arg(long, visible_alias = "project")]
@@ -159,25 +162,34 @@ pub fn run_with_config(cfg: &Config, action: Action, config_path: &std::path::Pa
             repo,
             base,
             env,
+            profile,
             program,
             repos,
             from_issue,
             json,
             folder,
-        } => match program {
-            Some(p) => new_batched(cfg, name, &p, repos, base, env, folder, json),
-            None => new(
-                cfg,
-                name,
-                repo,
-                base,
-                env,
-                from_issue,
-                folder,
-                json,
-                config_path.parent().unwrap_or(std::path::Path::new("")),
-            ),
-        },
+        } => {
+            if profile.is_some() && std::env::var_os("THEGN_SANDBOX").is_some() {
+                anyhow::bail!(
+                    "worktree isolation profiles are host-owned; wt new cannot set one from inside a sandbox"
+                );
+            }
+            match program {
+                Some(p) => new_batched(cfg, name, &p, repos, base, env, profile, folder, json),
+                None => new(
+                    cfg,
+                    name,
+                    repo,
+                    base,
+                    env,
+                    profile,
+                    from_issue,
+                    folder,
+                    json,
+                    config_path.parent().unwrap_or(std::path::Path::new("")),
+                ),
+            }
+        }
         Action::Folder {
             worktree,
             name,
@@ -206,11 +218,16 @@ fn new(
     repo: Option<String>,
     base: Option<String>,
     env: Option<String>,
+    profile: Option<String>,
     from_issue: Option<String>,
     folder: Option<String>,
     json: bool,
     config_dir: &std::path::Path,
 ) -> Result<()> {
+    let profile = profile
+        .as_deref()
+        .map(thegn_core::sandbox_pin::parse_pin)
+        .transpose()?;
     let folder = folder.as_deref().map(validate_folder_name).transpose()?;
     let start = super::resolve_worktree(repo);
     let Some(root) = thegn_core::repo::main_worktree(&start) else {
@@ -263,8 +280,11 @@ fn new(
         &root,
         &branch,
         &base,
-        env.as_deref(),
-        folder.as_deref(),
+        WorktreeCreateOptions {
+            env: env.as_deref(),
+            profile,
+            folder: folder.as_deref(),
+        },
         &db,
     )?;
     let root_s = root.to_string_lossy().into_owned();
@@ -301,6 +321,12 @@ fn new(
     }
 }
 
+struct WorktreeCreateOptions<'a> {
+    env: Option<&'a str>,
+    profile: Option<thegn_core::config::SandboxProfile>,
+    folder: Option<&'a str>,
+}
+
 /// Create + register one worktree for an ALREADY-resolved branch name and a
 /// verified base. Shared by the single-repo `wt new` and the batched `--project`
 /// path so both run the identical pipeline (`git worktree add` → seed mq assets
@@ -316,11 +342,10 @@ fn create_and_register(
     root: &std::path::Path,
     branch: &str,
     base: &str,
-    env: Option<&str>,
-    folder: Option<&str>,
+    options: WorktreeCreateOptions<'_>,
     db: &Db,
 ) -> Result<(String, Option<anyhow::Error>)> {
-    let folder = effective_folder(folder, cfg.default_folder.as_deref());
+    let folder = effective_folder(options.folder, cfg.default_folder.as_deref());
     // An EXPLICIT folder that is going to fail filing for a knowable reason (bad
     // name, removed workspace) must not create anything. A folder that only
     // comes from the configured default is a convenience, never a reason to
@@ -396,11 +421,33 @@ fn create_and_register(
     // Pin the env only when it differs from the ambient default this worktree
     // would inherit anyway (same rule as the wizard: a matching choice stays
     // NULL for a clean inherit).
-    if let Some(e) = env
+    if let Some(e) = options.env
         && e != crate::wizard::ambient_env_name(Some(db), cfg, root)
     {
         // best-effort: the worktree exists; a missed pin re-resolves ambient.
         let _ = db.set_worktree_env(&path_s, e);
+    }
+    if let Some(profile) = options.profile {
+        let ambient_env = options
+            .env
+            .map(str::to_string)
+            .unwrap_or_else(|| crate::wizard::ambient_env_name(Some(db), cfg, root));
+        let ambient_selection = thegn_core::sandbox_pin::EnvSelection::named(&ambient_env);
+        let location = thegn_core::remote::GitLoc::Local(root.to_path_buf());
+        let ambient_profile = cfg
+            .resolve_env(root, &location, root, &ambient_selection)
+            .sandbox
+            .profile;
+        if profile != ambient_profile
+            && let Err(error) = db.set_worktree_sandbox_profile(&path_s, Some(profile))
+        {
+            let message = match crate::worktree_lifecycle::rollback_remove(cfg, root, &path, branch)
+            {
+                Ok(()) => format!("db: {error}"),
+                Err(cleanup) => format!("db: {error}; rollback failed: {cleanup}"),
+            };
+            return Err(anyhow::anyhow!(message));
+        }
     }
     // A CLI has no compositor to keep alive, so it waits for post-create
     // completion before printing success and exiting. Warn-only failures are
@@ -871,11 +918,16 @@ fn new_batched(
     repos: Option<String>,
     base: Option<String>,
     env: Option<String>,
+    profile: Option<String>,
     folder: Option<String>,
     json: bool,
 ) -> Result<()> {
     use thegn_core::project::{self, MemberPlan};
     use thegn_core::store::ProjectStore;
+    let profile = profile
+        .as_deref()
+        .map(thegn_core::sandbox_pin::parse_pin)
+        .transpose()?;
 
     let Some(feature) = name.filter(|n| !n.trim().is_empty()) else {
         anyhow::bail!(
@@ -1012,8 +1064,11 @@ fn new_batched(
                     &root,
                     &branch,
                     &resolved_base,
-                    env.as_deref(),
-                    folder.as_deref(),
+                    WorktreeCreateOptions {
+                        env: env.as_deref(),
+                        profile,
+                        folder: folder.as_deref(),
+                    },
                     &db,
                 ) {
                     Ok((path, None)) => outcomes.push(MemberOutcome {
@@ -1685,9 +1740,9 @@ mod from_issue_tests {
 #[cfg(test)]
 mod folder_tests {
     use super::{
-        FolderSource, check_folder_fileable, clear_folder_if_registered, create_and_register,
-        effective_folder, file_registered_worktree, register_and_file_worktree,
-        validate_folder_name,
+        FolderSource, WorktreeCreateOptions, check_folder_fileable, clear_folder_if_registered,
+        create_and_register, effective_folder, file_registered_worktree,
+        register_and_file_worktree, validate_folder_name,
     };
     use thegn_core::config::Config;
     use thegn_core::db::Db;
@@ -1814,7 +1869,19 @@ mod folder_tests {
         };
 
         let create = |root: &std::path::Path, branch: &str, folder: Option<&str>| {
-            create_and_register(&cfg, root, branch, "main", None, folder, &db).unwrap()
+            create_and_register(
+                &cfg,
+                root,
+                branch,
+                "main",
+                WorktreeCreateOptions {
+                    env: None,
+                    profile: None,
+                    folder,
+                },
+                &db,
+            )
+            .unwrap()
         };
         let (first_path, filing_error) = create(&first_repo, "tg/default-one", None);
         assert!(filing_error.is_none());
@@ -1861,8 +1928,11 @@ mod folder_tests {
             &first_repo,
             "tg/unfiled",
             "main",
-            None,
-            None,
+            WorktreeCreateOptions {
+                env: None,
+                profile: None,
+                folder: None,
+            },
             &db,
         )
         .unwrap();
@@ -1897,8 +1967,19 @@ mod folder_tests {
 
         // Configured default + tombstoned workspace: created, unfiled, success
         // (also the `--program` member path, which reads the same tuple).
-        let (path, filing_error) =
-            create_and_register(&cfg, &repo, "tg/cfg-default", "main", None, None, &db).unwrap();
+        let (path, filing_error) = create_and_register(
+            &cfg,
+            &repo,
+            "tg/cfg-default",
+            "main",
+            WorktreeCreateOptions {
+                env: None,
+                profile: None,
+                folder: None,
+            },
+            &db,
+        )
+        .unwrap();
         assert!(filing_error.is_none(), "{filing_error:?}");
         assert!(std::path::Path::new(&path).exists());
         assert_eq!(db.worktree_record(&path).unwrap().unwrap().folder_id, None);
@@ -1909,8 +1990,11 @@ mod folder_tests {
             &repo,
             "tg/explicit-refused",
             "main",
-            None,
-            Some("Review"),
+            WorktreeCreateOptions {
+                env: None,
+                profile: None,
+                folder: Some("Review"),
+            },
             &db,
         )
         .unwrap_err();

@@ -100,9 +100,24 @@ pub(crate) fn ssh_none_guard(
     ask: bool,
     env_name: &str,
     placement_label: &str,
+    hardening: thegn_core::config::SandboxProfile,
 ) -> anyhow::Result<()> {
     let ssh = matches!(spec.placement, thegn_core::placement::Placement::Ssh(_));
     let explicit_none = configured == thegn_core::config::SandboxBackend::None;
+    if ssh && hardening.hides_home() {
+        return Err(crate::agent::SandboxHalt {
+            env_name: env_name.to_string(),
+            placement: placement_label.to_string(),
+            reason: format!(
+                "sealed profile `{}` needs a remote container runtime; refusing a bare SSH shell",
+                hardening.as_str()
+            ),
+            ask,
+            dormant: None,
+            sealed_home: true,
+        }
+        .into());
+    }
     if ssh && !explicit_none && !degrade_allowed {
         return Err(crate::agent::SandboxHalt {
             env_name: env_name.to_string(),
@@ -113,6 +128,7 @@ pub(crate) fn ssh_none_guard(
                 .to_string(),
             ask,
             dormant: None,
+            sealed_home: hardening.hides_home(),
         }
         .into());
     }
@@ -576,13 +592,31 @@ mod tests {
     use super::{
         SyncCache, apply_diff_command, apply_remote_sync_with, claim_command,
         plan_spec_before_ensure, promote_command, record_command, refresh_command, restore_command,
-        should_apply_tracked_diff, sync_key, sync_once,
+        should_apply_tracked_diff, ssh_none_guard, sync_key, sync_once,
     };
     use std::process::Command;
     use std::sync::{
         Arc, Barrier,
         atomic::{AtomicUsize, Ordering},
     };
+
+    #[test]
+    fn remote_sync_sealed_ssh_none_refuses_a_bare_remote_shell() {
+        let error = ssh_none_guard(
+            &sandbox_spec(thegn_core::sandbox::Backend::None, true),
+            thegn_core::config::SandboxBackend::None,
+            true,
+            false,
+            "remote",
+            "ssh:builder",
+            thegn_core::config::SandboxProfile::Sealed,
+        )
+        .unwrap_err();
+        let halt = error.downcast_ref::<crate::agent::SandboxHalt>().unwrap();
+        assert!(halt.sealed_home);
+        assert!(halt.reason.contains("remote container runtime"));
+        assert!(halt.reason.contains("bare SSH shell"));
+    }
 
     fn temp_home(label: &str) -> std::path::PathBuf {
         let home = std::env::temp_dir().join(format!(
