@@ -162,6 +162,9 @@ fn apply_completion_batch(
                         if crate::handlers::worktree_delete::remove_group(session, panes, gi) {
                             landing.land(session);
                         }
+                        if !gone_path.is_empty() {
+                            crate::drawer_state::request_worktree_eviction(Path::new(&gone_path));
+                        }
                         // The worker already forgot the registry row; drop the
                         // in-memory copy too, or the sidebar's registry union
                         // keeps a ghost row for it until the next hydration.
@@ -187,9 +190,13 @@ fn apply_completion_batch(
                 let key = (repo_path.clone(), slug.clone());
                 if success {
                     if let Some(gi) = session.worktrees.iter().position(|g| g.path == path) {
+                        let gone = session.worktrees[gi].path.clone();
                         // Focus lands when the workspace finishes
                         // (`land_after_workspace_removed`), not per worktree.
                         crate::handlers::worktree_delete::remove_group(session, panes, gi);
+                        if !gone.is_empty() {
+                            crate::drawer_state::request_worktree_eviction(Path::new(&gone));
+                        }
                     }
                 } else {
                     workspace_failures
@@ -2614,6 +2621,32 @@ mod tests {
             &mut sb,
         ));
         (session, model)
+    }
+
+    #[test]
+    fn workspace_removal_completion_queues_drawer_eviction() {
+        use crate::drawer_state::{DrawerPoolKey, DrawerRuntime};
+        let (tx, _rx) = tokio::sync::mpsc::channel(1);
+        let mut panes = crate::panes::Panes::new(tx);
+        let mut runtime = DrawerRuntime::default();
+        let key = DrawerPoolKey::worktree(
+            Path::new("/tmp/repo-feature"),
+            thegn_core::config_drawer::FILES_OCCUPANT_ID,
+        );
+        runtime.pool.stash_key(key.clone(), 21, 8, &mut panes);
+        assert!(runtime.pool.contains_key(&key));
+
+        let (session, _) = apply_test_completion(LifecycleCompletion::WorkspaceDelete {
+            repo_path: "/tmp/repo".into(),
+            slug: "repo".into(),
+            path: "/tmp/repo-feature".into(),
+            success: true,
+            message: String::new(),
+        });
+        assert!(session.worktrees.is_empty());
+
+        assert!(runtime.drain_evictions(&mut panes));
+        assert!(!runtime.pool.contains_key(&key));
     }
 
     #[test]
