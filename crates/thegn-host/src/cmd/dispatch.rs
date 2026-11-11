@@ -2313,10 +2313,6 @@ fn observe_head(wt: &std::path::Path) -> Option<String> {
     }
 }
 
-fn read_artifact_content(path: &std::path::Path) -> pipeline_run::ArtifactContent {
-    read_artifact_snapshot(path).0
-}
-
 /// Classifies the artifact and returns the bounded bytes (at most
 /// `ARTIFACT_MAX_BYTES + 1`) that classification was made from, so callers can
 /// compare what was read, not just its class (THE-1945).
