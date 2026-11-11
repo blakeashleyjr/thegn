@@ -1,6 +1,7 @@
 //! DB-writer preparation and loop-side fencing for workspace switches.
 
 use crate::session::{PreparedWorkspaceSwitch, Session};
+use thegn_core::store::WorkspaceStore;
 
 type WorktreeRegistryRow = (String, String, String);
 type ConnectRegistry = (Vec<WorktreeRegistryRow>, Vec<String>);
@@ -107,6 +108,13 @@ pub(crate) enum SwitchResult {
         seq: u64,
         session_id: String,
         rows: Vec<crate::session::WorktreeGroup>,
+        /// Registry rows read fresh in the same DB-thread job, replacing the
+        /// sidebar's snapshot so live and parked rows share one source (THE-1965).
+        registry: Vec<crate::sidebar::DbWorktree>,
+        /// Tab names of session groups the same job proved the DB no longer
+        /// holds (neither by tab name nor path, quarantined rows included).
+        /// The loop drops only those that own no live pane.
+        removed: Vec<String>,
         land_on: Option<String>,
     },
     ConnectRoot {
@@ -297,10 +305,22 @@ pub(crate) fn request_registered_adoption(
     let cfg = cfg.clone();
     crate::db_task::persist_critical(move |db| {
         let rows = Session::prepare_registered_adoption(&session_id, &existing, db, &cfg);
+        let (registry, _observations) = crate::hydrate::db_worktree_list_with_snapshot(db, &cfg);
+        // Read AFTER the registry pass: it deletes dead rows, and the raw rows
+        // keep THE-516 quarantined tabs that the registry list drops on purpose.
+        let removed = match db.worktrees() {
+            Ok(raw) => removed_groups(&existing, &raw),
+            Err(error) => {
+                tracing::debug!(target: "thegn::workspace_switch", %error, "worktree registry re-read failed; keeping every group");
+                Vec::new()
+            }
+        };
         if let Err(error) = tx.send(SwitchResult::Adopted {
             seq,
             session_id,
             rows,
+            registry,
+            removed,
             land_on,
         }) {
             tracing::debug!(target: "thegn::workspace_switch", %error, "worktree adoption result receiver is gone");
@@ -309,6 +329,61 @@ pub(crate) fn request_registered_adoption(
             tracing::debug!(target: "thegn::workspace_switch", %error, "worktree adoption result wake failed");
         }
     });
+}
+
+/// Names of non-home branch groups the raw registry rows no longer list, by
+/// tab name or path (THE-1965). Raw rows (not the sidebar list) so a quarantined
+/// ambiguous tab is never reported as removed.
+fn removed_groups(
+    existing: &[crate::session::WorktreeGroup],
+    raw: &[thegn_core::models::WorktreeRow],
+) -> Vec<String> {
+    existing
+        .iter()
+        .filter(|g| matches!(g.kind, crate::session::GroupKind::Branch))
+        .filter(|g| {
+            !raw.iter()
+                .any(|w| w.tab_name == g.name || (!g.path.is_empty() && w.worktree == g.path))
+        })
+        .map(|g| g.name.clone())
+        .collect()
+}
+
+/// Drop the `removed` groups that are not active and own no live pane, so a
+/// removed worktree stops rendering live exactly as it does once parked. A group
+/// with a running pane is never dropped (it stays reachable even when the
+/// registry does not list it). The active index follows its group by name.
+pub(crate) fn drop_removed_placeholders(
+    session: &mut Session,
+    removed: &[String],
+    live_pane: impl Fn(u32) -> bool,
+) -> usize {
+    let active_name = session
+        .worktrees
+        .get(session.active)
+        .map(|g| g.name.clone());
+    let before = session.worktrees.len();
+    session.worktrees.retain(|g| {
+        !(removed.contains(&g.name)
+            && Some(&g.name) != active_name.as_ref()
+            && !g
+                .tabs
+                .iter()
+                .any(|t| t.center.pane_ids().into_iter().any(&live_pane)))
+    });
+    if let Some(name) = active_name
+        && let Some(idx) = session.worktrees.iter().position(|g| g.name == name)
+    {
+        session.active = idx;
+    }
+    before - session.worktrees.len()
+}
+
+/// Whether an `Adopted` registry snapshot may replace the loop's: not while an
+/// optimistic sidebar edit younger than hydration's 2 s window is still
+/// unpersisted (the same carry-over rule hydration honours).
+pub(crate) fn adopted_snapshot_may_replace(optimistic_edit_at: Option<std::time::Instant>) -> bool {
+    !optimistic_edit_at.is_some_and(|t| t.elapsed() < std::time::Duration::from_secs(2))
 }
 
 pub(crate) fn request_connect_root(
@@ -482,6 +557,96 @@ pub(crate) fn seed_deferred_preset(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::session::{GroupKind, WorktreeGroup};
+
+    fn group(name: &str, path: &str) -> WorktreeGroup {
+        WorktreeGroup::new(name, GroupKind::Branch, path)
+    }
+
+    fn raw_row(tab: &str, path: &str) -> thegn_core::models::WorktreeRow {
+        thegn_core::models::WorktreeRow {
+            worktree: path.into(),
+            branch: String::new(),
+            agent: String::new(),
+            created_at: 0,
+            repo_root: String::new(),
+            tab_name: tab.into(),
+            session_name: String::new(),
+            location: String::new(),
+            position: 0,
+            sandbox_backend: None,
+            observed_backend: None,
+            folder_id: None,
+            env_name: None,
+            sandbox_profile: None,
+        }
+    }
+
+    #[test]
+    fn removed_groups_matches_name_or_path_and_spares_home_and_terminals() {
+        let mut home = group("app/home", "/repos/app");
+        home.kind = GroupKind::Home;
+        let existing = vec![
+            home,
+            group("app/feat", "/wt/feat"),
+            group("app/renamed", "/wt/moved"),
+            group("app/ghost", "/wt/ghost"),
+            WorktreeGroup::terminal("term"),
+        ];
+        let raw = vec![raw_row("app/feat", "/x"), raw_row("app/other", "/wt/moved")];
+        assert_eq!(
+            removed_groups(&existing, &raw),
+            vec!["app/ghost".to_string()]
+        );
+    }
+
+    #[test]
+    fn drop_removed_placeholders_keeps_active_and_live_pane_groups() {
+        let removed = vec![
+            "app/a".to_string(),
+            "app/b".to_string(),
+            "app/c".to_string(),
+        ];
+        let mut s = Session {
+            id: "s".into(),
+            worktrees: vec![
+                group("app/home", "/h"),
+                group("app/a", "/a"),
+                group("app/b", "/b"),
+                group("app/c", "/c"),
+            ],
+            active: 3,
+        };
+        // `a` is a placeholder, `b` has a live pane, `c` is active.
+        let dropped = drop_removed_placeholders(&mut s, &removed, |_| false);
+        assert_eq!(dropped, 2);
+        assert_eq!(
+            s.worktrees
+                .iter()
+                .map(|g| g.name.as_str())
+                .collect::<Vec<_>>(),
+            ["app/home", "app/c"]
+        );
+        assert_eq!(s.active, 1);
+
+        let mut live = Session {
+            id: "s".into(),
+            worktrees: vec![group("app/home", "/h"), group("app/b", "/b")],
+            active: 0,
+        };
+        assert_eq!(drop_removed_placeholders(&mut live, &removed, |_| true), 0);
+        assert_eq!(live.worktrees.len(), 2);
+    }
+
+    #[test]
+    fn adopted_snapshot_skipped_inside_optimistic_edit_window() {
+        let now = std::time::Instant::now();
+        assert!(!adopted_snapshot_may_replace(Some(now)));
+        assert!(adopted_snapshot_may_replace(None));
+        if let Some(old) = now.checked_sub(std::time::Duration::from_secs(3)) {
+            assert!(adopted_snapshot_may_replace(Some(old)));
+        }
+    }
 
     #[test]
     #[expect(

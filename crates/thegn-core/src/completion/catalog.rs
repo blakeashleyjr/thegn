@@ -551,6 +551,15 @@ pub const CATALOG: &[Slot] = &[
         SourceKind::Reserved(Reserved::DispatchRow),
     ),
     slot(
+        "dispatch commit",
+        "id",
+        SourceKind::Reserved(Reserved::DispatchRow),
+    ),
+    // `--msg-file` is a filesystem path (clap's path completer); `--trailer`
+    // is a free-form `Key: value` line.
+    slot("dispatch commit", "msg_file", SourceKind::Structural),
+    slot("dispatch commit", "trailer", SourceKind::Structural),
+    slot(
         "dispatch wait",
         "row",
         SourceKind::Reserved(Reserved::DispatchRow),
@@ -785,6 +794,7 @@ pub const CATALOG: &[Slot] = &[
     slot("pr create", "base", SourceKind::Reserved(Reserved::Branch)),
     slot("wt diff", "base", SourceKind::Reserved(Reserved::Branch)),
     slot("wt new", "base", SourceKind::Reserved(Reserved::Branch)),
+    slot("wt prune", "target", SourceKind::Reserved(Reserved::Branch)),
     slot("wt folder", "name", SourceKind::Reserved(Reserved::Folder)),
     slot("wt new", "folder", SourceKind::Reserved(Reserved::Folder)),
     slot(
@@ -869,6 +879,23 @@ pub const CATALOG: &[Slot] = &[
         "from_issue",
         SourceKind::Reserved(Reserved::Issue),
     ),
+    slot("release prepare", "bump", SourceKind::Structural),
+    slot(
+        "release prepare",
+        "from",
+        SourceKind::Reserved(Reserved::Branch),
+    ),
+    slot(
+        "release prepare",
+        "branch",
+        SourceKind::Reserved(Reserved::Branch),
+    ),
+    slot(
+        "release prepare",
+        "date",
+        SourceKind::Reserved(Reserved::Freeform),
+    ),
+    slot("release prepare", "lock_from", SourceKind::Structural),
 ];
 
 /// The row for `(command_path, arg_id)`, if any.

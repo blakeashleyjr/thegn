@@ -79,8 +79,9 @@ pub enum Action {
     /// path as its only plain output, so `cd $(thegn wt new x)` works.
     New {
         /// Branch-name tail (the configured prefix + numbering scheme are
-        /// applied); omitted = a generated candidate name. Required with
-        /// `--program` (the feature's linked branch name).
+        /// applied, unless `--exact-branch` uses it verbatim and requires it);
+        /// omitted = a generated candidate name. Required with `--program`
+        /// (the feature's linked branch name).
         name: Option<String>,
         /// Repo to create in (default: resolved from cwd / $THEGN_WORKTREE).
         #[arg(long)]
@@ -106,8 +107,13 @@ pub enum Action {
         /// Create from a tracker issue id (`"<provider>:<key>"`): derive the
         /// branch from the issue's hint and link the issue to the worktree —
         /// the headless twin of the panel's `s`/`D` keys (THE-57).
-        #[arg(long)]
+        #[arg(long, conflicts_with = "exact_branch")]
         from_issue: Option<String>,
+        /// Use `name` verbatim as the full branch name, skipping the configured
+        /// prefix and numbering scheme. Refuses an invalid ref name or a branch
+        /// that already exists.
+        #[arg(long, requires = "name", conflicts_with = "program")]
+        exact_branch: bool,
         /// Emit the created worktree as one JSON object.
         #[arg(long)]
         json: bool,
@@ -143,6 +149,9 @@ pub enum Action {
     Disk(DiskArgs),
     /// Reclaim a worktree's `target/` build artifacts (keeps the checkout).
     Clean(CleanArgs),
+    /// Remove merged, clean, idle lane worktrees and their branches. Dry run
+    /// unless `--apply`; requires `--merged`.
+    Prune(super::wt_prune::PruneArgs),
     /// Re-register a worktree you closed: clears its close record and adds it back to the sidebar without starting a pane.
     Reopen {
         /// Worktree path (a linked worktree of a registered repo).
@@ -166,6 +175,7 @@ pub fn run_with_config(cfg: &Config, action: Action, config_path: &std::path::Pa
             program,
             repos,
             from_issue,
+            exact_branch,
             json,
             folder,
         } => {
@@ -184,6 +194,7 @@ pub fn run_with_config(cfg: &Config, action: Action, config_path: &std::path::Pa
                     env,
                     profile,
                     from_issue,
+                    exact_branch,
                     folder,
                     json,
                     config_path.parent().unwrap_or(std::path::Path::new("")),
@@ -205,6 +216,7 @@ pub fn run_with_config(cfg: &Config, action: Action, config_path: &std::path::Pa
         }
         Action::Disk(a) => super::disk::disk(cfg, a.worktree, a.all, a.json),
         Action::Clean(a) => super::disk::clean(cfg, a.worktree, a.all, a.force),
+        Action::Prune(a) => super::wt_prune::run(cfg, a),
         Action::Reopen { path } => reopen(&path),
     }
 }
@@ -220,6 +232,7 @@ fn new(
     env: Option<String>,
     profile: Option<String>,
     from_issue: Option<String>,
+    exact_branch: bool,
     folder: Option<String>,
     json: bool,
     config_dir: &std::path::Path,
@@ -263,6 +276,10 @@ fn new(
 
     let branch = match issue_branch {
         Some(b) => b,
+        None if exact_branch => {
+            let taken = worktree::BranchSet::load_checked(&root).map_err(anyhow::Error::msg)?;
+            exact_branch_name(name.as_deref(), |b| taken.taken(b))?
+        }
         None => worktree::branch_name_checked(&root, name.as_deref(), cfg)
             .map_err(anyhow::Error::msg)?,
     };
@@ -319,6 +336,22 @@ fn new(
         Some(e) => Err(e),
         None => Ok(()),
     }
+}
+
+/// `--exact-branch`: `name` verbatim as the branch, no prefix/numbering.
+/// Unlike the plain-name path (which dedupes with a `-N` suffix), an existing
+/// branch is refused rather than attached or renamed.
+fn exact_branch_name(name: Option<&str>, taken: impl Fn(&str) -> bool) -> Result<String> {
+    let name = name
+        .filter(|n| !n.trim().is_empty())
+        .ok_or_else(|| anyhow::anyhow!("--exact-branch requires a branch name"))?;
+    thegn_core::git_operand::branch_name(name)?;
+    if taken(name) {
+        anyhow::bail!(
+            "branch '{name}' conflicts with an existing branch; --exact-branch will not attach to it"
+        );
+    }
+    Ok(name.to_string())
 }
 
 struct WorktreeCreateOptions<'a> {
@@ -1319,7 +1352,19 @@ fn unregistered_live_branch(worktree: &std::path::Path, delete_branch: bool) -> 
 
 /// `wt rm` — the TUI's `delete_groups` pipeline, synchronous: resolve →
 /// confirm → provider/sandbox teardown → `git worktree remove` → DB cleanup.
-fn rm(cfg: &Config, target: &str, delete_branch: bool, force: bool) -> Result<()> {
+pub(super) fn rm(cfg: &Config, target: &str, delete_branch: bool, force: bool) -> Result<()> {
+    rm_with(cfg, target, delete_branch, force, true)
+}
+
+/// `rm` with control over the stdout `removed <path>` line (`wt prune --json`
+/// keeps stdout to a single JSON object).
+pub(super) fn rm_with(
+    cfg: &Config,
+    target: &str,
+    delete_branch: bool,
+    force: bool,
+    announce: bool,
+) -> Result<()> {
     let db = Db::open()?;
     let rows = db.worktrees()?;
 
@@ -1543,7 +1588,9 @@ fn rm(cfg: &Config, target: &str, delete_branch: bool, force: bool) -> Result<()
     // path so a renamed display group can't leave a resurrecting row behind.
     let _ = db.delete_tab_groups_for_worktree(&root_s, &path); // best-effort: cache write: the DB is a cache; git/forge stays the source of truth
 
-    outln!("removed {path}");
+    if announce {
+        outln!("removed {path}");
+    }
     Ok(())
 }
 
@@ -1741,7 +1788,7 @@ mod from_issue_tests {
 mod folder_tests {
     use super::{
         FolderSource, WorktreeCreateOptions, check_folder_fileable, clear_folder_if_registered,
-        create_and_register, effective_folder, file_registered_worktree,
+        create_and_register, effective_folder, exact_branch_name, file_registered_worktree,
         register_and_file_worktree, validate_folder_name,
     };
     use thegn_core::config::Config;
@@ -1834,6 +1881,54 @@ mod folder_tests {
                 }) if name == "Pipeline"
             ));
         }
+    }
+
+    #[test]
+    fn exact_branch_keeps_name_verbatim() {
+        assert_eq!(
+            exact_branch_name(Some("tg/b101-slug"), |_| false).unwrap(),
+            "tg/b101-slug"
+        );
+    }
+
+    #[test]
+    fn exact_branch_refuses_missing_invalid_or_existing() {
+        assert!(exact_branch_name(None, |_| false).is_err());
+        assert!(exact_branch_name(Some("  "), |_| false).is_err());
+        assert!(exact_branch_name(Some("bad..name"), |_| false).is_err());
+        assert!(exact_branch_name(Some("-x"), |_| false).is_err());
+        let e = exact_branch_name(Some("tg/x"), |b| b == "tg/x").unwrap_err();
+        assert!(e.to_string().contains("conflicts with an existing branch"));
+    }
+
+    #[test]
+    fn exact_branch_flag_constraints() {
+        assert!(parse(&["thegn", "wt", "new", "tg/x", "--exact-branch"]).is_ok());
+        assert!(parse(&["thegn", "wt", "new", "--exact-branch"]).is_err());
+        assert!(
+            parse(&[
+                "thegn",
+                "wt",
+                "new",
+                "x",
+                "--exact-branch",
+                "--program",
+                "p"
+            ])
+            .is_err()
+        );
+        assert!(
+            parse(&[
+                "thegn",
+                "wt",
+                "new",
+                "x",
+                "--exact-branch",
+                "--from-issue",
+                "a:b"
+            ])
+            .is_err()
+        );
     }
 
     #[test]
