@@ -491,26 +491,24 @@ impl Reviver {
         let (cwd, tx, wake) = (cwd.to_path_buf(), tx.clone(), wake.clone());
         // best-effort: a failed spawn just leaves the claim withdrawn, which is
         // today's fall-back-to-periodic-reads behaviour.
-        let _ = std::thread::Builder::new()
-            .name("thegn-diff-rev".into())
-            .spawn(move || {
-                crate::platform::qos::set_self(crate::platform::qos::Qos::Background);
-                std::thread::sleep(backoff);
-                if REVIVE_EPOCH.load(Ordering::SeqCst) != this.epoch {
-                    return; // retargeted meanwhile: the new binding builds its own
-                }
-                let sink = RefreshSink {
-                    tx,
-                    wake: wake.clone(),
-                    revive: Some(this.clone()),
-                };
-                if let Some(nw) = build_diff_watcher(&cwd, sink)
-                    && REVIVE_EPOCH.load(Ordering::SeqCst) == this.epoch
-                    && this.wtx.send((cwd, nw)).is_ok()
-                {
-                    wake();
-                }
-            });
+        let _ = thegn_core::thread_name::try_spawn_named("thegn-diff-rev", move || {
+            crate::platform::qos::set_self(crate::platform::qos::Qos::Background);
+            std::thread::sleep(backoff);
+            if REVIVE_EPOCH.load(Ordering::SeqCst) != this.epoch {
+                return; // retargeted meanwhile: the new binding builds its own
+            }
+            let sink = RefreshSink {
+                tx,
+                wake: wake.clone(),
+                revive: Some(this.clone()),
+            };
+            if let Some(nw) = build_diff_watcher(&cwd, sink)
+                && REVIVE_EPOCH.load(Ordering::SeqCst) == this.epoch
+                && this.wtx.send((cwd, nw)).is_ok()
+            {
+                wake();
+            }
+        });
     }
 }
 
