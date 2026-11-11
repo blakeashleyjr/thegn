@@ -376,6 +376,68 @@ fn bind_lock(sock: &Path) -> io::Result<std::fs::File> {
     bind_lock_with_wait(sock, BIND_LOCK_WAIT)
 }
 
+/// Verify the control socket's parent directory, then take the bind lock. An
+/// idle-prune pass can remove an empty control directory between the parent
+/// check and the lock open (or a second pruner can race the first), which
+/// surfaces as `NotFound`; recreate the directory once and retry. A second
+/// failure is returned as is (fail closed).
+#[cfg(unix)]
+fn bind_parent_and_lock(sock: &Path) -> io::Result<std::fs::File> {
+    bind_parent_and_lock_with(
+        sock,
+        &mut |parent| prepare_control_directory(parent, false),
+        &mut || {},
+    )
+}
+
+#[cfg(unix)]
+fn bind_parent_and_lock_with(
+    sock: &Path,
+    ensure_dir: &mut dyn FnMut(&Path) -> io::Result<()>,
+    after_parent_check: &mut dyn FnMut(),
+) -> io::Result<std::fs::File> {
+    let parent = sock.parent().ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "control socket has no parent directory",
+        )
+    })?;
+    match bind_parent_attempt(sock, parent, after_parent_check) {
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            tracing::debug!(
+                target: "thegn::daemon",
+                path = %parent.display(),
+                "control directory vanished before the bind lock; recreating once"
+            );
+            ensure_dir(parent)?;
+            bind_parent_attempt(sock, parent, after_parent_check)
+        }
+        other => other,
+    }
+}
+
+#[cfg(unix)]
+fn bind_parent_attempt(
+    sock: &Path,
+    parent: &Path,
+    after_parent_check: &mut dyn FnMut(),
+) -> io::Result<std::fs::File> {
+    let parent_metadata = std::fs::symlink_metadata(parent)?;
+    if parent_metadata.file_type().is_symlink() {
+        return Err(io_error_with_path_context(
+            io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "control socket parent must not be a symlink",
+            ),
+            "verify control socket parent",
+            parent,
+        ));
+    }
+    verify_unix_bind_parent(parent, &parent_metadata)?;
+    after_parent_check();
+    bind_lock(sock)
+}
+
 #[cfg(unix)]
 /// Upper bound for control socket lock contention. The host's
 /// `SCOPE_PROBE_TIMEOUT` planner budget is 5 s; honest contention is measured
@@ -845,25 +907,7 @@ impl IpcListener {
                     }
                     let sock = sock.clone();
                     let decision = tokio::task::spawn_blocking(move || -> io::Result<UnixBind> {
-                        let parent = sock.parent().ok_or_else(|| {
-                            io::Error::new(
-                                io::ErrorKind::InvalidInput,
-                                "control socket has no parent directory",
-                            )
-                        })?;
-                        let parent_metadata = std::fs::symlink_metadata(parent)?;
-                        if parent_metadata.file_type().is_symlink() {
-                            return Err(io_error_with_path_context(
-                                io::Error::new(
-                                    io::ErrorKind::PermissionDenied,
-                                    "control socket parent must not be a symlink",
-                                ),
-                                "verify control socket parent",
-                                parent,
-                            ));
-                        }
-                        verify_unix_bind_parent(parent, &parent_metadata)?;
-                        let _lock = bind_lock(&sock)?;
+                        let _lock = bind_parent_and_lock(&sock)?;
                         if let Some(own_dir) = sock.parent()
                             && own_dir
                                 .file_name()
@@ -2118,6 +2162,126 @@ mod tests {
             binder_waited_for_holder,
             "binder finished while the lock was held"
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn bind_retry_recreates_a_dir_removed_before_the_parent_check() {
+        let root = private_tempdir();
+        let dir = root.path().join("k");
+        prepare_control_directory(&dir, false).unwrap();
+        let sock = dir.join("d.sock");
+        assert_socket_path_fits(&sock);
+        std::fs::remove_dir(&dir).unwrap();
+        let mut ensured = 0_u32;
+        let result = bind_parent_and_lock_with(
+            &sock,
+            &mut |p| {
+                ensured += 1;
+                prepare_control_directory(p, false)
+            },
+            &mut || {},
+        );
+        assert!(result.is_ok(), "{result:?}");
+        assert!(dir.join("d.sock.lock").exists());
+        assert_eq!(ensured, 1);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn bind_retry_recovers_when_the_dir_is_pruned_between_check_and_lock() {
+        let root = private_tempdir();
+        let dir = root.path().join("k");
+        prepare_control_directory(&dir, false).unwrap();
+        let sock = dir.join("d.sock");
+        assert_socket_path_fits(&sock);
+        let mut ensured = 0_u32;
+        let mut checked = 0_u32;
+        let result = bind_parent_and_lock_with(
+            &sock,
+            &mut |p| {
+                ensured += 1;
+                prepare_control_directory(p, false)
+            },
+            &mut || {
+                checked += 1;
+                if checked == 1 {
+                    std::fs::remove_dir(&dir).unwrap();
+                }
+            },
+        );
+        assert!(result.is_ok(), "{result:?}");
+        assert_eq!(ensured, 1);
+        assert_eq!(checked, 2);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn bind_retry_gives_up_after_one_retry() {
+        let root = private_tempdir();
+        let dir = root.path().join("k");
+        prepare_control_directory(&dir, false).unwrap();
+        let sock = dir.join("d.sock");
+        assert_socket_path_fits(&sock);
+        std::fs::remove_dir(&dir).unwrap();
+        let mut ensured = 0_u32;
+        let result = bind_parent_and_lock_with(
+            &sock,
+            &mut |_| {
+                ensured += 1;
+                Ok(())
+            },
+            &mut || {},
+        );
+        let error = result.unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::NotFound);
+        assert_eq!(ensured, 1);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn bind_retry_does_not_retry_other_errors() {
+        let root = private_tempdir();
+        let dir = root.path().join("k");
+        prepare_control_directory(&dir, false).unwrap();
+        let sock = dir.join("d.sock");
+        assert_socket_path_fits(&sock);
+        std::fs::create_dir(dir.join("d.sock.lock")).unwrap();
+        let mut ensured = 0_u32;
+        let result = bind_parent_and_lock_with(
+            &sock,
+            &mut |p| {
+                ensured += 1;
+                prepare_control_directory(p, false)
+            },
+            &mut || {},
+        );
+        let error = result.unwrap_err();
+        assert_ne!(error.kind(), io::ErrorKind::NotFound);
+        assert_eq!(ensured, 0);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn bind_retry_happy_path_is_unchanged() {
+        let root = private_tempdir();
+        let dir = root.path().join("k");
+        prepare_control_directory(&dir, false).unwrap();
+        let sock = dir.join("d.sock");
+        assert_socket_path_fits(&sock);
+        let mut ensured = 0_u32;
+        let mut checked = 0_u32;
+        let result = bind_parent_and_lock_with(
+            &sock,
+            &mut |p| {
+                ensured += 1;
+                prepare_control_directory(p, false)
+            },
+            &mut || checked += 1,
+        );
+        assert!(result.is_ok(), "{result:?}");
+        assert_eq!(ensured, 0);
+        assert_eq!(checked, 1);
     }
 
     #[cfg(unix)]
