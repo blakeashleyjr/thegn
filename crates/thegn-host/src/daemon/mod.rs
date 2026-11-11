@@ -367,7 +367,7 @@ fn fallback_name_other_key(name: &str, euid: u32, own_key: &str) -> bool {
         && bytes[32] == b'-'
         && is_hex(&bytes[..32])
         && is_hex(&bytes[33..])
-        && &rest[..32] != own_key
+        && rest.get(..32) != Some(own_key)
 }
 
 #[cfg(unix)]
@@ -517,7 +517,7 @@ fn tmp_fallback_socket_live(socket: &std::path::Path) -> bool {
 /// which this process does not hold.
 #[cfg(unix)]
 const FOREIGN_RECLAIM_MIN_IDLE: std::time::Duration = std::time::Duration::from_secs(24 * 60 * 60);
-/// Cap on foreign dirs examined per start: bounds how long this process holds
+/// Cap on foreign dirs examined per allocation: bounds how long this process holds
 /// its own allocation lock probing sockets.
 #[cfg(unix)]
 const FOREIGN_RECLAIM_MAX_EXAMINED: usize = 64;
