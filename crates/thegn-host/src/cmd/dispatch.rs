@@ -1869,8 +1869,13 @@ fn set_status_on_led(
 ) -> Result<()> {
     // Snapshot the gate's evidence BEFORE reading the row or running the gate,
     // so any change after this point is caught inside the write transaction.
+    // A missing row refuses here: a non-forced done never reaches
+    // `write_status` without a fence.
     let fence = if parsed == AgentDispatchStatus::Done && !force {
-        db.done_fence(id)?
+        Some(
+            db.done_fence(id)?
+                .ok_or_else(|| anyhow::Error::new(thegn_core::db::MissingDispatch { id }))?,
+        )
     } else {
         None
     };
@@ -6091,6 +6096,25 @@ mod tests {
         assert_eq!(
             db.get_dispatch(id).unwrap().unwrap().status,
             AgentDispatchStatus::Running
+        );
+    }
+
+    #[test]
+    fn done_fence_missing_row_refuses_instead_of_writing_unfenced() {
+        let (_dir, db) = db("done-fence-missing");
+        let err = set_status_on_led(
+            &db,
+            9_999,
+            AgentDispatchStatus::Done,
+            false,
+            None,
+            LeadProof::Unbound,
+            true,
+        )
+        .unwrap_err();
+        assert!(
+            err.downcast_ref::<thegn_core::db::MissingDispatch>()
+                .is_some()
         );
     }
 
