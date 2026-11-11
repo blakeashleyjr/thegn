@@ -156,8 +156,10 @@ fn other_pane(st: &CalState) -> CalPane {
 
 /// Open the focused event's URL, if it has one.
 fn open_selected(st: &CalState) -> DetailOutcome {
+    // Only a rendered (windowed) row can be the focused one.
+    let window = super::render::agenda_window(st);
     match st.selected_events().get(st.agenda_sel) {
-        Some(e) if !e.url.trim().is_empty() => {
+        Some(e) if window.contains(&st.agenda_sel) && !e.url.trim().is_empty() => {
             DetailOutcome::Act(DetailAction::OpenUrl(e.url.clone()))
         }
         // Nothing to open is not a reason to close the popup.
