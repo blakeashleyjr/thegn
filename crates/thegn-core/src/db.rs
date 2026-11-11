@@ -1096,29 +1096,27 @@ impl CompatibleDb {
 }
 
 fn spawn_semantic_sweep(path: PathBuf) -> std::io::Result<std::thread::JoinHandle<()>> {
-    std::thread::Builder::new()
-        .name("thegn-sem-prune".to_string())
-        .spawn(move || {
-            enter_background_worker();
-            match Db::open_connection(&path) {
-                Ok(conn) => {
-                    if let Err(error) = conn.busy_timeout(std::time::Duration::from_millis(5000)) {
-                        tracing::warn!(%error, "semantic prune sweep failed");
-                        return;
-                    }
-                    let sweep_db = Db {
-                        conn,
-                        schema_mismatch: None,
-                    };
-                    if let Err(error) = sweep_missing_semantic_files(&sweep_db, 512) {
-                        tracing::warn!(%error, "semantic prune sweep failed");
-                    }
+    crate::thread_name::try_spawn_named("thegn-sem-prune", move || {
+        enter_background_worker();
+        match Db::open_connection(&path) {
+            Ok(conn) => {
+                if let Err(error) = conn.busy_timeout(std::time::Duration::from_millis(5000)) {
+                    tracing::warn!(%error, "semantic prune sweep failed");
+                    return;
                 }
-                Err(error) => {
+                let sweep_db = Db {
+                    conn,
+                    schema_mismatch: None,
+                };
+                if let Err(error) = sweep_missing_semantic_files(&sweep_db, 512) {
                     tracing::warn!(%error, "semantic prune sweep failed");
                 }
             }
-        })
+            Err(error) => {
+                tracing::warn!(%error, "semantic prune sweep failed");
+            }
+        }
+    })
 }
 
 impl Db {
