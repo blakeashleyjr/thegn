@@ -1324,6 +1324,18 @@ fn unregistered_live_branch(worktree: &std::path::Path, delete_branch: bool) -> 
 /// `wt rm` — the TUI's `delete_groups` pipeline, synchronous: resolve →
 /// confirm → provider/sandbox teardown → `git worktree remove` → DB cleanup.
 pub(super) fn rm(cfg: &Config, target: &str, delete_branch: bool, force: bool) -> Result<()> {
+    rm_with(cfg, target, delete_branch, force, true)
+}
+
+/// `rm` with control over the stdout `removed <path>` line (`wt prune --json`
+/// keeps stdout to a single JSON object).
+pub(super) fn rm_with(
+    cfg: &Config,
+    target: &str,
+    delete_branch: bool,
+    force: bool,
+    announce: bool,
+) -> Result<()> {
     let db = Db::open()?;
     let rows = db.worktrees()?;
 
@@ -1547,7 +1559,9 @@ pub(super) fn rm(cfg: &Config, target: &str, delete_branch: bool, force: bool) -
     // path so a renamed display group can't leave a resurrecting row behind.
     let _ = db.delete_tab_groups_for_worktree(&root_s, &path); // best-effort: cache write: the DB is a cache; git/forge stays the source of truth
 
-    outln!("removed {path}");
+    if announce {
+        outln!("removed {path}");
+    }
     Ok(())
 }
 

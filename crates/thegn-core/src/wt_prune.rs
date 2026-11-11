@@ -11,9 +11,11 @@
 //! 3. [`KeepReason::DetachedHead`] — no branch to prove merged.
 //! 4. [`KeepReason::NotMerged`] — the branch is not an ancestor of the target
 //!    (or Git could not say; unknown is never "merged").
-//! 5. [`KeepReason::Dirty`] — uncommitted or untracked files.
-//! 6. [`KeepReason::LiveProcess`] — a process has its cwd inside the worktree.
-//! 7. [`KeepReason::LiveSession`] — held by a live session or a queue row.
+//! 5. [`KeepReason::NoWork`] — the branch tip equals the target tip (freshly
+//!    cut, never worked), so "merged" proves nothing.
+//! 6. [`KeepReason::Dirty`] — uncommitted or untracked files.
+//! 7. [`KeepReason::LiveProcess`] — a process has its cwd inside the worktree.
+//! 8. [`KeepReason::LiveSession`] — held by a live session or a queue row.
 
 /// Facts about one worktree, gathered by the host.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -27,6 +29,8 @@ pub struct PruneFacts {
     pub is_target_branch: bool,
     /// The branch is an ancestor of the target (unknown counts as `false`).
     pub ancestor_of_target: bool,
+    /// The branch tip is the very commit the target points at.
+    pub tip_equals_target: bool,
     /// `git status --porcelain` is empty (unknown counts as `false`).
     pub tree_clean: bool,
     /// Pids whose cwd lies inside the worktree.
@@ -42,6 +46,7 @@ pub enum KeepReason {
     TargetBranch,
     DetachedHead,
     NotMerged,
+    NoWork,
     Dirty,
     LiveProcess,
     LiveSession,
@@ -55,6 +60,7 @@ impl KeepReason {
             Self::TargetBranch => "target-branch",
             Self::DetachedHead => "detached-head",
             Self::NotMerged => "not-merged",
+            Self::NoWork => "no-work",
             Self::Dirty => "dirty",
             Self::LiveProcess => "live-process",
             Self::LiveSession => "live-session",
@@ -68,6 +74,7 @@ impl KeepReason {
             Self::TargetBranch => "holds the target branch",
             Self::DetachedHead => "detached HEAD",
             Self::NotMerged => "not merged into the target",
+            Self::NoWork => "branch tip equals the target (no work on it yet)",
             Self::Dirty => "uncommitted or untracked changes",
             Self::LiveProcess => "a process is running inside it",
             Self::LiveSession => "held by a live session",
@@ -99,6 +106,9 @@ pub fn decide(f: &PruneFacts) -> PruneDecision {
     }
     if !f.ancestor_of_target {
         return PruneDecision::Keep(NotMerged);
+    }
+    if f.tip_equals_target {
+        return PruneDecision::Keep(NoWork);
     }
     if !f.tree_clean {
         return PruneDecision::Keep(Dirty);
@@ -157,6 +167,7 @@ mod tests {
             is_primary: false,
             is_target_branch: false,
             ancestor_of_target: true,
+            tip_equals_target: false,
             tree_clean: true,
             live_cwd_pids: vec![],
             held_by_session: false,
@@ -193,6 +204,7 @@ mod tests {
                 Box::new(|f| f.ancestor_of_target = false),
                 KeepReason::NotMerged,
             ),
+            (Box::new(|f| f.tip_equals_target = true), KeepReason::NoWork),
             (Box::new(|f| f.tree_clean = false), KeepReason::Dirty),
             (
                 Box::new(|f| f.live_cwd_pids = vec![7]),
@@ -217,6 +229,7 @@ mod tests {
         f.is_target_branch = true;
         f.branch = None;
         f.ancestor_of_target = false;
+        f.tip_equals_target = true;
         f.tree_clean = false;
         f.live_cwd_pids = vec![1];
         f.held_by_session = true;
@@ -225,6 +238,7 @@ mod tests {
             KeepReason::TargetBranch,
             KeepReason::DetachedHead,
             KeepReason::NotMerged,
+            KeepReason::NoWork,
             KeepReason::Dirty,
             KeepReason::LiveProcess,
             KeepReason::LiveSession,
@@ -236,6 +250,7 @@ mod tests {
                 KeepReason::TargetBranch => f.is_target_branch = false,
                 KeepReason::DetachedHead => f.branch = Some("b".into()),
                 KeepReason::NotMerged => f.ancestor_of_target = true,
+                KeepReason::NoWork => f.tip_equals_target = false,
                 KeepReason::Dirty => f.tree_clean = true,
                 KeepReason::LiveProcess => f.live_cwd_pids.clear(),
                 KeepReason::LiveSession => f.held_by_session = false,
@@ -280,6 +295,7 @@ mod tests {
             KeepReason::TargetBranch,
             KeepReason::DetachedHead,
             KeepReason::NotMerged,
+            KeepReason::NoWork,
             KeepReason::Dirty,
             KeepReason::LiveProcess,
             KeepReason::LiveSession,
