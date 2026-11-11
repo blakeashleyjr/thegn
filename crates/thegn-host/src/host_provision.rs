@@ -212,11 +212,8 @@ pub(crate) fn provision_worktree_on_host(
     let host_home = std::path::PathBuf::from(std::env::var("HOME").unwrap_or_default());
     let (dotfiles, _roots) =
         crate::agent_home::resolve_personal_dotfiles(&host_home, home_cfg, env_name);
-    if sealed && home_cfg.atuin {
-        thegn_core::msg::warn(
-            "host worktree pipeline: sealed profile: [sandbox.home] atuin is not applied (the key and session are credentials)",
-        );
-    }
+    // Warned below, only once provisioning actually runs (not on every open).
+    let dropped_dotfiles = if sealed { dotfiles.len() } else { 0 };
     let (dotfiles, atuin) = personal_host_layer(sealed, dotfiles, home_cfg.atuin);
     let opts = envplan::PlanOpts {
         workdir: worktree.to_string(),
@@ -286,6 +283,16 @@ pub(crate) fn provision_worktree_on_host(
     let init = synth_init(&req, cfg, worktree);
     if already {
         return init;
+    }
+    if sealed && (home_cfg.atuin || dropped_dotfiles > 0) {
+        thegn_core::msg::warn(&format!(
+            "host worktree pipeline: sealed profile: [sandbox.home] atuin ({}) and dotfiles ({dropped_dotfiles}) are not applied (they are credentials/host $HOME)",
+            if home_cfg.atuin {
+                "configured"
+            } else {
+                "not configured"
+            },
+        ));
     }
 
     // 5. Apply, streaming the splash.
