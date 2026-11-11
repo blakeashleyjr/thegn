@@ -1752,4 +1752,214 @@ mod tests {
             Err(mpsc::TryRecvError::Empty)
         ));
     }
+
+    struct GatedWriter {
+        started: mpsc::Sender<()>,
+        release: mpsc::Receiver<()>,
+        stalled: bool,
+        fail_after_release: bool,
+        captured: Arc<Mutex<Vec<u8>>>,
+    }
+
+    impl Write for GatedWriter {
+        fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+            if self.stalled {
+                self.started
+                    .send(())
+                    .map_err(|_| io::Error::other("test observer dropped"))?;
+                self.release
+                    .recv()
+                    .map_err(|_| io::Error::other("test stall released"))?;
+                self.stalled = false;
+                if self.fail_after_release {
+                    return Err(io::Error::other("injected failure after stall"));
+                }
+            }
+            self.captured
+                .lock()
+                .map_err(|_| io::Error::other("capture poisoned"))?
+                .extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// The recorder, the writer's "started" signal, its release handle, and
+    /// the bytes it has written.
+    type GatedRecorder = (
+        Recorder,
+        mpsc::Receiver<()>,
+        mpsc::Sender<()>,
+        Arc<Mutex<Vec<u8>>>,
+    );
+
+    fn gated_recorder(
+        budget: &Arc<AtomicUsize>,
+        limit: usize,
+        fail_after_release: bool,
+    ) -> GatedRecorder {
+        let (started_tx, started_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let captured = Arc::new(Mutex::new(Vec::new()));
+        let mut header = Header::new(80, 24);
+        header.timestamp = Some(0);
+        let writer = CastWriter::new(
+            BufWriter::new(GatedWriter {
+                started: started_tx,
+                release: release_rx,
+                stalled: true,
+                fail_after_release,
+                captured: Arc::clone(&captured),
+            }),
+            &header,
+        )
+        .expect("buffered header");
+        let recorder = start_with_writer_budget(
+            writer,
+            Arc::clone(budget),
+            limit,
+            &Arc::new(AtomicUsize::new(0)),
+            MAX_RECORDING_WORKERS,
+        )
+        .expect("test recording worker slot");
+        (recorder, started_rx, release_tx, captured)
+    }
+
+    #[test]
+    fn blocked_sink_queue_is_delivered_in_order_and_budget_fills_exactly() {
+        let limit = 4 * MAX_CHUNK_BYTES;
+        let budget = Arc::new(AtomicUsize::new(0));
+        let (mut rec, started_rx, release_tx, captured) = gated_recorder(&budget, limit, false);
+
+        rec.feed(&vec![b'a'; MAX_CHUNK_BYTES]);
+        started_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("sink entered");
+        rec.feed(&vec![b'b'; MAX_CHUNK_BYTES]);
+        rec.feed(&vec![b'c'; MAX_CHUNK_BYTES]);
+        rec.feed(&vec![b'd'; MAX_CHUNK_BYTES]);
+        assert_eq!(
+            budget.load(Ordering::Acquire),
+            limit,
+            "four chunks fill the budget to exactly its limit"
+        );
+
+        rec.feed(b"e");
+        assert_eq!(rec.dropped_bytes(), 1);
+        assert!(!rec.done());
+        assert!(rec.failure().is_none());
+        assert_eq!(
+            budget.load(Ordering::Acquire),
+            limit,
+            "the budget never exceeds its limit"
+        );
+
+        release_tx.send(()).unwrap();
+        let finished = rec.finish();
+        assert!(finished.truncated.is_none());
+        assert_eq!(
+            budget.load(Ordering::Acquire),
+            0,
+            "budget returns to baseline"
+        );
+
+        let events = captured_events(&captured);
+        let output: String = events
+            .iter()
+            .filter(|event| event[1] == "o")
+            .map(|event| event[2].as_str().unwrap())
+            .collect();
+        let expected = "a".repeat(MAX_CHUNK_BYTES)
+            + &"b".repeat(MAX_CHUNK_BYTES)
+            + &"c".repeat(MAX_CHUNK_BYTES)
+            + &"d".repeat(MAX_CHUNK_BYTES);
+        assert!(output == expected, "queued chunks lost or reordered");
+        assert_eq!(events.last().unwrap()[1], "m", "gap marker is written last");
+    }
+
+    #[test]
+    fn healthy_recorder_finishes_while_another_sink_is_blocked() {
+        let limit = 8 * MAX_CHUNK_BYTES;
+        let budget = Arc::new(AtomicUsize::new(0));
+        let (mut a, started_rx, release_tx, _a_captured) = gated_recorder(&budget, limit, false);
+        a.feed(&vec![b'a'; MAX_CHUNK_BYTES]);
+        started_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("sink entered");
+
+        let b_captured = Arc::new(Mutex::new(Vec::new()));
+        let mut header = Header::new(80, 24);
+        header.timestamp = Some(0);
+        let writer = CastWriter::new(BufWriter::new(Capture(Arc::clone(&b_captured))), &header)
+            .expect("buffered header");
+        let mut b = start_with_writer_budget(
+            writer,
+            Arc::clone(&budget),
+            limit,
+            &Arc::new(AtomicUsize::new(0)),
+            MAX_RECORDING_WORKERS,
+        )
+        .expect("test recording worker slot");
+        b.feed(b"independent");
+        b.resize(100, 30);
+        let fb = b.finish();
+        assert!(
+            fb.truncated.is_none(),
+            "B must not wait on A's blocked sink"
+        );
+        let events = captured_events(&b_captured);
+        assert!(
+            events
+                .iter()
+                .any(|event| event[1] == "o" && event[2] == "independent")
+        );
+        assert!(
+            events
+                .iter()
+                .any(|event| event[1] == "r" && event[2] == "100x30")
+        );
+        assert_eq!(
+            budget.load(Ordering::Acquire),
+            MAX_CHUNK_BYTES,
+            "only A's blocked chunk is still held"
+        );
+
+        release_tx.send(()).unwrap();
+        let fa = a.finish();
+        assert!(fa.truncated.is_none());
+        assert_eq!(budget.load(Ordering::Acquire), 0);
+    }
+
+    #[test]
+    fn failing_sink_after_saturation_reports_truncation_and_returns_budget() {
+        // Covers the real `Recorder` path; `failed_sink_is_reported_by_worker`
+        // calls `run_writer` directly.
+        let limit = 4 * MAX_CHUNK_BYTES;
+        let budget = Arc::new(AtomicUsize::new(0));
+        let (mut rec, started_rx, release_tx, _captured) = gated_recorder(&budget, limit, true);
+
+        rec.feed(&vec![b'a'; MAX_CHUNK_BYTES]);
+        started_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("sink entered");
+        rec.feed(&vec![b'b'; MAX_CHUNK_BYTES]);
+        rec.feed(&vec![b'c'; MAX_CHUNK_BYTES]);
+        rec.feed(&vec![b'd'; MAX_CHUNK_BYTES]);
+        assert_eq!(budget.load(Ordering::Acquire), limit);
+
+        release_tx.send(()).unwrap();
+        let finished = rec.finish();
+        assert!(
+            finished.truncated.is_some(),
+            "a failed sink must never report a clean save"
+        );
+        assert_eq!(
+            budget.load(Ordering::Acquire),
+            0,
+            "queued permits are returned when the worker exits"
+        );
+    }
 }
