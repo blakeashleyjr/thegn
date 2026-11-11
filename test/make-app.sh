@@ -37,9 +37,9 @@ run_make_app() {
 }
 
 assert_no_workdirs() {
-  local dest="$1"
+  local dest="$1" app_name="${2:-thegn}"
   if find "$dest" -mindepth 1 -maxdepth 1 \
-    \( -name '.thegn.app.staging.*' -o -name '.thegn.app.old.*' -o -name '.thegn.app.lock' \) -print -quit | grep -q .; then
+    \( -name ".$app_name.app.staging.*" -o -name ".$app_name.app.old.*" -o -name ".$app_name.app.lock" \) -print -quit | grep -q .; then
     echo "make-app test: unexpected staging/old/lock directory in $dest" >&2
     return 1
   fi
@@ -178,6 +178,39 @@ if run_make_app --dest "$tmp/symlink-dest" >"$tmp/symlink-dest.out" 2>"$tmp/syml
   fail "symlinked destination was accepted"
 fi
 [[ -z "$(find "$tmp/target-dest" -mindepth 1 -print -quit)" ]] || fail "symlink destination target received files"
+
+# bundle identifier grammar
+run_make_app --dest "$tmp/id-ok" --name my_app >/dev/null || fail "underscore name was refused"
+grep -Fq '<key>CFBundleIdentifier</key><string>com.github.blakeashleyjr.my-app</string>' "$tmp/id-ok/my_app.app/Contents/Info.plist" ||
+  fail "underscore name did not derive a valid bundle identifier"
+grep -Fq '<key>CFBundleName</key><string>my_app</string>' "$tmp/id-ok/my_app.app/Contents/Info.plist" ||
+  fail "underscore name changed the display name"
+assert_no_workdirs "$tmp/id-ok" my_app || fail "underscore name left temporary directories"
+
+grep -Fq '<key>CFBundleIdentifier</key><string>com.github.blakeashleyjr.thegn</string>' "$apps/thegn.app/Contents/Info.plist" ||
+  fail "default name lost its bundle identifier"
+
+# documented collision: '_' maps to '-', so my_app and my-app share an identifier
+run_make_app --dest "$tmp/id-hyphen" --name my-app >/dev/null || fail "hyphen name was refused"
+grep -Fq '<key>CFBundleIdentifier</key><string>com.github.blakeashleyjr.my-app</string>' "$tmp/id-hyphen/my-app.app/Contents/Info.plist" ||
+  fail "my_app and my-app no longer share the documented identifier"
+assert_no_workdirs "$tmp/id-hyphen" my-app || fail "hyphen name left temporary directories"
+
+for bad in a..b thegn. x..; do
+  if run_make_app --dest "$tmp/id-bad" --name "$bad" >/dev/null 2>"$tmp/id-bad.err"; then
+    fail "name $bad was accepted"
+  fi
+  grep -Fq "must not contain '..'" "$tmp/id-bad.err" || fail "name $bad was not refused for its identifier"
+  [[ ! -e "$tmp/id-bad" ]] || fail "refused name $bad created the destination"
+done
+
+leg="$tmp/id-legacy/my_app.app"
+mkdir -p "$leg/Contents/Resources"
+printf legacy >"$leg/Contents/Resources/common.sh"
+printf '<string>com.github.blakeashleyjr.my_app</string>\n' >"$leg/Contents/Info.plist"
+run_make_app --dest "$tmp/id-legacy" --name my_app >/dev/null || fail "legacy underscore bundle was not adopted"
+grep -Fq 'com.github.blakeashleyjr.my-app' "$leg/Contents/Info.plist" || fail "adopted bundle kept the invalid identifier"
+assert_no_workdirs "$tmp/id-legacy" my_app || fail "legacy underscore adoption left temporary directories"
 
 # dry-run writes nothing
 dry_dest="$tmp/dry-run-apps"

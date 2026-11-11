@@ -53,6 +53,11 @@ A worktree's drawer state is keyed by its path with `.` segments and trailing or
 duplicate separators ignored, so `/r/a` and `/r/a/` share one state; symlinks
 and `..` are not resolved.
 
+Closing (deleting) a worktree, or removing the workspace that holds it, forgets
+its drawer panes and its remembered drawer state, so a worktree created later at
+the same path starts clean. A drawer that was still launching when the worktree
+closed is discarded rather than attached to the new one.
+
 The drawer registry extends `[[tools]]`: set `drawer_scope = "worktree"` for
 a tool with one pane per worktree, or `drawer_scope = "global"` for one pane
 pooled across worktree switches during this thegn process. `drawer_cwd` is

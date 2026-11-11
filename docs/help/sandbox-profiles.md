@@ -31,6 +31,11 @@ personal layers. The `[sandbox.home]` atuin key and session and the dotfiles are
 not copied into the container, and thegn logs one warning per provisioning run
 when it drops them.
 
+A sealed container provisioned by an older thegn is scrubbed once on its next
+open: the stale atuin key, session and config, and any carried dotfile that
+still matches the host file, are removed. A mount point or a symlink target is
+never touched, and a failed scrub is retried on the next open.
+
 Profile precedence is worktree pin, `[env.<name>]` sandbox profile, repository
 and workspace configuration, global `[sandbox] profile`, then the built-in
 standard default. A repository `.thegn.toml` can only tighten its profile; a

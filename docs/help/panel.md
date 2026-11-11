@@ -110,6 +110,10 @@ show; entries with a legacy or unbound worktree tag appear only when widened,
 and the detail view labels them (legacy tag, not tied to any worktree; unbound,
 path too long to identify).
 
+The header's error and warning counts use the same scope as the rows shown, so
+another worktree's errors no longer appear in this worktree's header. Widened to
+all worktrees, they count every row.
+
 On the stable channel, `hosts` and `environments` are hidden unless named in
 `[panel] sections`; when named, each shows a one-line off banner and has no
 live keys. They are available on the dev channel; see [[release-channels]].

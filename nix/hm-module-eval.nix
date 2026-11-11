@@ -183,6 +183,16 @@
           diagnosticsCrashReports = true;
           diagnosticsCrashRetention = 5;
           diagnosticsRingSize = 128;
+          diskShowSizes = false;
+          diskWarnThresholdGb = 200;
+          diskScanIntervalSecs = 60;
+          diskMaxScanPerRound = 8;
+          diskAutoCleanOnMerge = false;
+          diskCleanOnPrClosed = true;
+          diskIdleCleanDays = 30;
+          diskGenerationMinAgeDays = 21;
+          diskReclaimOnLowDisk = false;
+          diskSccache = true;
           agents = [
             {
               name = "shell";

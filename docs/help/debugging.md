@@ -38,6 +38,13 @@ default, differs, invalid}`; `invalid` marks a stored pin that no longer parses,
 and the array is empty when the database cannot be read. See
 [[sandbox-profiles]].
 
+`doctor --json` also carries a `stage_worker` object with the same readiness the
+text report's worker line prints: `state`, `ready`, `proven`, `backend`,
+`provider_home` (null, or `{stage, path}`) and `unsafe_full_access` (an array of
+`{stage, agent}`). `ready` is true only for a ready worker, and `proven` is
+false when containment could not be judged at all (no stages, no worktree, an
+unsupported platform or an unsupported backend).
+
 The **Monitor collectors** block lists each system monitor collector and its
 discovered health. Collectors that are checked only while their panel is
 visible are marked `visible-only (not probed)`. A `denied` row includes a hint:
