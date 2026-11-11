@@ -15,6 +15,7 @@ use thegn_core::db::Db;
 use thegn_core::git_run::{GitOutcome, GitPolicy, git_run};
 use thegn_core::issue::AgentDispatchStatus;
 use thegn_core::outln;
+use thegn_core::store::NotificationStore;
 
 /// Hooks (formatters) can be slow; bound the whole git call, not just reads.
 const COMMIT_GIT_DEADLINE: Duration = Duration::from_secs(900);
@@ -47,27 +48,34 @@ fn git_ok(worktree: &Path, args: &[&str]) -> Result<()> {
     }
 }
 
+/// Pure row validation: the worktree must be set, the worker finished, and
+/// the directory still present.
+fn check_row(id: i64, worktree_path: &str, status: AgentDispatchStatus) -> Result<&Path> {
+    if worktree_path.trim().is_empty() {
+        bail!("dispatch {id} has no worktree");
+    }
+    if matches!(
+        status,
+        AgentDispatchStatus::Spawning | AgentDispatchStatus::Running
+    ) {
+        bail!(
+            "dispatch {id} is still {}; wait for the worker to exit before committing",
+            status.as_str()
+        );
+    }
+    let worktree = Path::new(worktree_path);
+    if !worktree.is_dir() {
+        bail!("dispatch {id}: worktree {} is gone", worktree.display());
+    }
+    Ok(worktree)
+}
+
 pub(crate) fn run(id: i64, msg_file: &Path, trailers: &[String], json: bool) -> Result<()> {
     let db = Db::open()?;
     let row = db
         .get_dispatch(id)?
         .ok_or_else(|| anyhow::anyhow!("no dispatch with id {id}"))?;
-    if row.worktree_path.trim().is_empty() {
-        bail!("dispatch {id} has no worktree");
-    }
-    if matches!(
-        row.status,
-        AgentDispatchStatus::Spawning | AgentDispatchStatus::Running
-    ) {
-        bail!(
-            "dispatch {id} is still {}; wait for the worker to exit before committing",
-            row.status.as_str()
-        );
-    }
-    let worktree = Path::new(&row.worktree_path);
-    if !worktree.is_dir() {
-        bail!("dispatch {id}: worktree {} is gone", worktree.display());
-    }
+    let worktree = check_row(id, &row.worktree_path, row.status)?;
     let outcome = commit_in(worktree, msg_file, trailers)?;
     if json {
         outln!(
@@ -185,6 +193,25 @@ mod tests {
         let p = dir.join("msg.txt");
         std::fs::write(&p, text).unwrap();
         p
+    }
+
+    #[test]
+    fn dispatch_commit_check_row_refusals() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().to_string_lossy().into_owned();
+        let e = check_row(1, "  ", AgentDispatchStatus::Spawning).unwrap_err();
+        assert!(e.to_string().contains("no worktree"), "{e}");
+        for st in [AgentDispatchStatus::Spawning, AgentDispatchStatus::Running] {
+            let e = check_row(2, &p, st).unwrap_err();
+            assert!(e.to_string().contains("still"), "{e}");
+        }
+        let gone = dir.path().join("missing").to_string_lossy().into_owned();
+        let e = check_row(3, &gone, AgentDispatchStatus::Spawning).unwrap_err();
+        assert!(e.to_string().contains("still"), "{e}");
+        let st = AgentDispatchStatus::Done;
+        let e = check_row(4, &gone, st).unwrap_err();
+        assert!(e.to_string().contains("gone"), "{e}");
+        assert_eq!(check_row(5, &p, st).unwrap(), dir.path());
     }
 
     #[test]
