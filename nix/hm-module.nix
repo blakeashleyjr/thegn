@@ -357,6 +357,16 @@ self: {
     diagnostics.crash_reports = cfg.diagnosticsCrashReports;
     diagnostics.crash_retention = cfg.diagnosticsCrashRetention;
     diagnostics.ring_size = cfg.diagnosticsRingSize;
+    disk.show_sizes = cfg.diskShowSizes;
+    disk.warn_threshold_gb = cfg.diskWarnThresholdGb;
+    disk.scan_interval_secs = cfg.diskScanIntervalSecs;
+    disk.max_scan_per_round = cfg.diskMaxScanPerRound;
+    disk.auto_clean_on_merge = cfg.diskAutoCleanOnMerge;
+    disk.clean_on_pr_closed = cfg.diskCleanOnPrClosed;
+    disk.idle_clean_days = cfg.diskIdleCleanDays;
+    disk.generation_min_age_days = cfg.diskGenerationMinAgeDays;
+    disk.reclaim_on_low_disk = cfg.diskReclaimOnLowDisk;
+    disk.sccache = cfg.diskSccache;
     log = {
       inherit (cfg.log) level file dir format;
       rotation_size_mb = cfg.log.rotationSizeMb;
@@ -1246,6 +1256,66 @@ in {
       type = lib.types.nullOr (lib.types.ints.unsigned);
       default = null;
       description = "Entries held in the in-memory diagnostics ring. Unset (null) = the binary's default.";
+    };
+
+    diskShowSizes = lib.mkOption {
+      type = lib.types.nullOr (lib.types.bool);
+      default = null;
+      description = "Show per-worktree disk sizes. Unset (null) = the binary's default.";
+    };
+
+    diskWarnThresholdGb = lib.mkOption {
+      type = lib.types.nullOr (lib.types.ints.unsigned);
+      default = null;
+      description = "Total GB above which `thegn disk` reports a warning. Unset (null) = the binary's default.";
+    };
+
+    diskScanIntervalSecs = lib.mkOption {
+      type = lib.types.nullOr (lib.types.ints.between 0 2678400);
+      default = null;
+      description = "Seconds between background disk scans. Unset (null) = the binary's default.";
+    };
+
+    diskMaxScanPerRound = lib.mkOption {
+      type = lib.types.nullOr (lib.types.ints.u32);
+      default = null;
+      description = "Maximum worktrees measured per scan round. Unset (null) = the binary's default.";
+    };
+
+    diskAutoCleanOnMerge = lib.mkOption {
+      type = lib.types.nullOr (lib.types.bool);
+      default = null;
+      description = "Clean a worktree's build output when its branch merges. Unset (null) = the binary's default.";
+    };
+
+    diskCleanOnPrClosed = lib.mkOption {
+      type = lib.types.nullOr (lib.types.bool);
+      default = null;
+      description = "Clean a worktree's build output when its PR closes. Unset (null) = the binary's default.";
+    };
+
+    diskIdleCleanDays = lib.mkOption {
+      type = lib.types.nullOr (lib.types.ints.u32);
+      default = null;
+      description = "Days a worktree sits idle before its build output is reclaimed. Unset (null) = the binary's default.";
+    };
+
+    diskGenerationMinAgeDays = lib.mkOption {
+      type = lib.types.nullOr (lib.types.ints.u32);
+      default = null;
+      description = "Minimum age in days before an old build generation is pruned. Unset (null) = the binary's default.";
+    };
+
+    diskReclaimOnLowDisk = lib.mkOption {
+      type = lib.types.nullOr (lib.types.bool);
+      default = null;
+      description = "Reclaim least-recently-touched build output under disk pressure. Unset (null) = the binary's default.";
+    };
+
+    diskSccache = lib.mkOption {
+      type = lib.types.nullOr (lib.types.bool);
+      default = null;
+      description = "Wire sccache into the dev shell. Unset (null) = the binary's default.";
     };
 
     agents = lib.mkOption {
