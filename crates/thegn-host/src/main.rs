@@ -432,6 +432,11 @@ pub enum Command {
         #[command(subcommand)]
         action: cmd::forward::Action,
     },
+    /// Release tooling (`release prepare`).
+    Release {
+        #[command(subcommand)]
+        action: cmd::release::Action,
+    },
     /// Worktree lifecycle + inspection (`wt list|diff|disk|clean`).
     Wt {
         #[command(subcommand)]
@@ -1453,6 +1458,7 @@ fn run_subcommand(cli: &Cli, command: Command) -> anyhow::Result<()> {
         }
         Command::Share { action } => cmd::share::run(&cfg, action),
         Command::Forward { action } => cmd::forward::run(action),
+        Command::Release { action } => cmd::release::run(action),
         Command::Wt { action } => cmd::wt::run_with_config(&cfg, action, &config_path),
         Command::Repo { action } => cmd::repos::run(&cfg, action),
         // Dispatched before run_subcommand (it may fall through to the TUI);
