@@ -7617,14 +7617,12 @@ async fn event_loop<T: Terminal>(
     {
         let wake_rx = lsp_diag_rx.clone();
         let bridge_waker = waker.clone();
-        let spawned = std::thread::Builder::new()
-            .name("thegn-lsp-brdg".into())
-            .spawn(move || {
-                crate::platform::qos::set_self(crate::platform::qos::Qos::Background);
-                while wake_rx.wait() {
-                    let _ = bridge_waker.wake(); // best-effort: waker pulse: an input nudge must never fail the calling path
-                }
-            });
+        let spawned = thegn_core::thread_name::try_spawn_named("thegn-lsp-brdg", move || {
+            crate::platform::qos::set_self(crate::platform::qos::Qos::Background);
+            while wake_rx.wait() {
+                let _ = bridge_waker.wake(); // best-effort: waker pulse: an input nudge must never fail the calling path
+            }
+        });
         if let Err(error) = spawned {
             tracing::warn!(target: "thegn::lsp", %error, "LSP diagnostics bridge failed to spawn");
         }
@@ -8164,27 +8162,25 @@ async fn event_loop<T: Terminal>(
     {
         let ns = std::sync::Arc::clone(&notify_state);
         let wk = waker.clone();
-        std::thread::Builder::new()
-            .name("thegn-crashscan".into())
-            .spawn(move || {
-                crate::platform::qos::set_self(crate::platform::qos::Qos::Background);
-                let reports = thegn_core::diagnostics::unacknowledged_reports();
-                if reports.is_empty() {
-                    return;
-                }
-                let Ok(db) = thegn_core::db::Db::open() else {
-                    return;
-                };
-                for path in reports {
-                    let p = path.display().to_string();
-                    let msg = format!("thegn crashed on a previous run — crash report at {p}");
-                    let _ = crate::notify::record(&db, &ns, "process_failed", &p, &msg, ""); // best-effort: cache write: the crash report file itself was already written; the notification row is a nicety
-                    thegn_core::diagnostics::acknowledge(&path);
-                }
-                let _ = wk.wake(); // best-effort: waker pulse: an input nudge must never fail the calling path
-                // best-effort: watcher thread: a failed spawn just disables crash-report notifications this session
-            })
-            .ok();
+        thegn_core::thread_name::try_spawn_named("thegn-crashscan", move || {
+            crate::platform::qos::set_self(crate::platform::qos::Qos::Background);
+            let reports = thegn_core::diagnostics::unacknowledged_reports();
+            if reports.is_empty() {
+                return;
+            }
+            let Ok(db) = thegn_core::db::Db::open() else {
+                return;
+            };
+            for path in reports {
+                let p = path.display().to_string();
+                let msg = format!("thegn crashed on a previous run — crash report at {p}");
+                let _ = crate::notify::record(&db, &ns, "process_failed", &p, &msg, ""); // best-effort: cache write: the crash report file itself was already written; the notification row is a nicety
+                thegn_core::diagnostics::acknowledge(&path);
+            }
+            let _ = wk.wake(); // best-effort: waker pulse: an input nudge must never fail the calling path
+            // best-effort: watcher thread: a failed spawn just disables crash-report notifications this session
+        })
+        .ok();
     }
     // Per-pane services: `[replay]` recording ring + the `[daemon]` route
     // (panes surviving UI exit) for panes spawned from here on.
