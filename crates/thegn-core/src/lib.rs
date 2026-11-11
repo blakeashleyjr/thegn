@@ -36,6 +36,7 @@ pub mod capacity;
 pub mod channel;
 pub mod ci;
 pub mod ci_log;
+pub mod commit_msg;
 pub mod completion;
 pub mod config;
 pub mod config_activity;
