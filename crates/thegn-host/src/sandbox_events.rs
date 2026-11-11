@@ -54,37 +54,35 @@ pub fn spawn(cfg: &SandboxConfig, tx: tokio_mpsc::UnboundedSender<SandboxEventBa
         return;
     }
     // Exec events.
-    subscribe_thread("sandbox-events-exec", events, EventKind::Exec, tx.clone());
+    subscribe_thread("thegn-sbx-exec", events, EventKind::Exec, tx.clone());
     // Network events (optional).
     if cfg.network_audit {
         let Some(net_events) = backend.events() else {
             return;
         };
-        subscribe_thread("sandbox-events-net", net_events, EventKind::Network, tx);
+        subscribe_thread("thegn-sbx-net", net_events, EventKind::Network, tx);
     }
 }
 
 /// Spawn one named subscriber thread running the transport's blocking
 /// subscription loop to scope end.
 fn subscribe_thread(
-    name: &str,
+    name: &'static str,
     events: Box<dyn ContainerEvents>,
     kind: EventKind,
     tx: tokio_mpsc::UnboundedSender<SandboxEventBatch>,
 ) {
-    std::thread::Builder::new()
-        .name(name.into())
-        .spawn(move || {
-            // Housekeeping: blocks on the container event stream for the
-            // process lifetime, writing audit rows nobody waits on. Declared
-            // FIRST — the thread-qos ratchet.
-            crate::platform::qos::set_self(crate::platform::qos::Qos::Background);
-            let mut sink = BatchForwarder { tx };
-            events.subscribe(kind, &mut sink);
-        })
-        // best-effort: listener thread: a failed spawn just disables sandbox
-        // event recording for this session
-        .ok();
+    thegn_core::thread_name::try_spawn_named(name, move || {
+        // Housekeeping: blocks on the container event stream for the
+        // process lifetime, writing audit rows nobody waits on. Declared
+        // FIRST — the thread-qos ratchet.
+        crate::platform::qos::set_self(crate::platform::qos::Qos::Background);
+        let mut sink = BatchForwarder { tx };
+        events.subscribe(kind, &mut sink);
+    })
+    // best-effort: listener thread: a failed spawn just disables sandbox
+    // event recording for this session
+    .ok();
 }
 
 /// Forwards the transports' persisted-rows pulses to the event loop channel.

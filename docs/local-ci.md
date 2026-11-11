@@ -105,7 +105,10 @@ just act-clean          # remove act containers if one wedges
 Defaults live in `.actrc`: the `catthehacker/ubuntu:act-latest` runner image
 is pinned by its index digest, and `linux/amd64` keeps runs identical on Apple
 silicon. To update the image, resolve and review the tag's new digest, then
-replace the pin in `.actrc` in one commit. Without `.secrets` or explicit secret
+replace the pin in `.actrc` in one commit. `just act` and `just act-job`
+refuse any run whose runner image (from `.actrc` or a `-P`/`--platform` flag)
+is not pinned by digest, and refuse a flag that swaps the image `.actrc` pins
+for the same platform label. Without `.secrets` or explicit secret
 flags, the run is anonymous and does not reuse its job container. Act loads
 `.secrets` automatically when that file exists; it gives the checked-out
 workflow and composite-action code access to the token, so use it only on code
