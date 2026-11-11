@@ -433,63 +433,35 @@ pub(crate) fn open_read_nonblocking_nofollow(
     }
 }
 
-/// Persist a small recoverable cache value without following an attacker-created
-/// state-file symlink. Unix publishes a same-directory temp file atomically;
-/// other platforms reject non-regular existing targets before using their
-/// native overwrite path.
+/// Persist a small recoverable cache value owner-only: the parent is made a
+/// private (0700) directory and the file is published (0600) by an atomic
+/// same-directory replace. A symlinked final entry is replaced, never followed,
+/// and a symlinked parent is refused.
 pub(crate) fn write_state_file(path: &std::path::Path, value: &str) {
     let Some(parent) = path.parent() else {
         return;
     };
     #[cfg(test)]
     crate::testenv::refuse_real_state_write(path, "state file");
-    if std::fs::create_dir_all(parent).is_err() {
-        return;
-    }
-    let Ok(parent_metadata) = std::fs::symlink_metadata(parent) else {
+    let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+        tracing::debug!(path = %path.display(), "state file has no UTF-8 file name");
         return;
     };
-    if !parent_metadata.file_type().is_dir() {
+    if let Err(error) = thegn_core::fsperm::ensure_private_dir(parent) {
+        tracing::debug!(%error, path = %path.display(), "state file parent is not a private directory");
         return;
     }
-
-    #[cfg(unix)]
-    {
-        use std::fs::OpenOptions;
-        use std::io::Write;
-        use std::sync::atomic::{AtomicU64, Ordering};
-
-        static NEXT_TMP: AtomicU64 = AtomicU64::new(0);
-        let name = path
-            .file_name()
-            .map(|name| name.to_string_lossy())
-            .unwrap_or_else(|| std::borrow::Cow::Borrowed("drawer-state"));
-        let tmp = parent.join(format!(
-            ".{name}.tmp-{}-{}",
-            std::process::id(),
-            NEXT_TMP.fetch_add(1, Ordering::Relaxed)
-        ));
-        let Ok(mut file) = OpenOptions::new().write(true).create_new(true).open(&tmp) else {
-            return;
-        };
-        if file.write_all(value.as_bytes()).is_err() {
-            drop(std::fs::remove_file(&tmp));
+    // Publish through the held directory handle, not a path that re-resolves
+    // the parent (THE-523 / fsperm path-write ratchet).
+    let dir = match thegn_core::fsperm::open_private_dir(parent) {
+        Ok(dir) => dir,
+        Err(error) => {
+            tracing::debug!(%error, path = %path.display(), "state file parent could not be opened");
             return;
         }
-        drop(file);
-        if std::fs::rename(&tmp, path).is_err() {
-            drop(std::fs::remove_file(&tmp));
-        }
-    }
-
-    #[cfg(not(unix))]
-    {
-        match std::fs::symlink_metadata(path) {
-            Ok(metadata) if !metadata.file_type().is_file() => return,
-            Err(error) if error.kind() != std::io::ErrorKind::NotFound => return,
-            _ => {}
-        }
-        drop(std::fs::write(path, value));
+    };
+    if let Err(error) = dir.write_owner_only_atomic(name, value.as_bytes()) {
+        tracing::debug!(%error, path = %path.display(), "state file write failed");
     }
 }
 
@@ -756,5 +728,80 @@ impl InterruptGuard {
     }
     pub fn fired(&self) -> bool {
         false
+    }
+}
+
+#[cfg(test)]
+mod state_file_tests {
+    use super::{test_symlink, test_symlink_supported, write_state_file};
+
+    fn owner_only(path: &std::path::Path, want: u32) -> bool {
+        // `None` on platforms without mode bits (Windows uses a DACL).
+        thegn_core::fsperm::mode_bits(path)
+            .unwrap()
+            .is_none_or(|mode| mode == want)
+    }
+
+    #[test]
+    fn write_state_file_publishes_an_owner_only_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("drawer/state");
+        write_state_file(&path, "tool:db");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "tool:db");
+        assert!(owner_only(&path, 0o600));
+        assert!(owner_only(path.parent().unwrap(), 0o700));
+    }
+
+    #[test]
+    fn write_state_file_tightens_an_existing_loose_parent() {
+        let dir = tempfile::tempdir().unwrap();
+        let loose = dir.path().join("loose");
+        std::fs::create_dir(&loose).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            std::fs::set_permissions(&loose, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let path = loose.join("state");
+        write_state_file(&path, "v");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "v");
+        assert!(owner_only(&loose, 0o700));
+    }
+
+    #[test]
+    fn write_state_file_replaces_a_symlinked_final_entry_without_following_it() {
+        // Positive control: this behaviour held before the owner-only rewrite.
+        if !test_symlink_supported() {
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let victim = dir.path().join("victim");
+        std::fs::write(&victim, "keep-me").unwrap();
+        let state = dir.path().join("state");
+        test_symlink(&victim, &state).unwrap();
+        write_state_file(&state, "v");
+        assert_eq!(std::fs::read_to_string(&victim).unwrap(), "keep-me");
+        assert_eq!(std::fs::read_to_string(&state).unwrap(), "v");
+        assert!(
+            !std::fs::symlink_metadata(&state)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+    }
+
+    #[test]
+    fn write_state_file_leaves_no_temporary_beside_the_state() {
+        // Positive control: the atomic publish must not strand its temp file.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("sub/state");
+        write_state_file(&path, "one");
+        write_state_file(&path, "two");
+        let names: Vec<String> = std::fs::read_dir(path.parent().unwrap())
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(names, vec!["state".to_string()]);
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "two");
     }
 }
