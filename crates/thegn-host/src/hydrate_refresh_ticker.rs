@@ -229,9 +229,7 @@ fn spawn_worker_inner(
     mut io: impl TickerIo,
     notify: impl Fn() + Send + 'static,
 ) -> std::thread::JoinHandle<()> {
-    std::thread::Builder::new()
-        .name(TICKER_THREAD_NAME.into())
-        .spawn(move || {
+    thegn_core::thread_name::try_spawn_named(TICKER_THREAD_NAME, move || {
         let _failure = crate::worker_failure::PanicNotify::new(|| {
             tracing::error!(target: "thegn::hydrate", "shared refresh ticker terminated by panic; periodic refresh is unavailable");
             notify();
