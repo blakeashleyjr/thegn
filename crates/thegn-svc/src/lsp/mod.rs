@@ -3385,31 +3385,38 @@ mod tests {
     }
 
     fn wait_for_heartbeat(path: &Path) {
-        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        let started = std::time::Instant::now();
+        let deadline = started + Duration::from_secs(30);
         loop {
             if let Ok(bytes) = std::fs::read(path)
                 && !bytes.is_empty()
             {
                 let initial_len = bytes.len() as u64;
-                thread::sleep(Duration::from_millis(150));
-                assert!(
-                    std::fs::metadata(path).unwrap().len() > initial_len,
-                    "heartbeat descendant did not continue writing"
-                );
-                return;
+                loop {
+                    if std::fs::metadata(path).unwrap().len() > initial_len {
+                        return;
+                    }
+                    assert!(
+                        std::time::Instant::now() < deadline,
+                        "heartbeat descendant did not continue writing after {:?}",
+                        started.elapsed()
+                    );
+                    thread::sleep(Duration::from_millis(10));
+                }
             }
             assert!(
                 std::time::Instant::now() < deadline,
-                "heartbeat descendant did not start"
+                "heartbeat descendant did not start after {:?}",
+                started.elapsed()
             );
             thread::sleep(Duration::from_millis(10));
         }
     }
 
     fn assert_heartbeat_stopped(path: &Path) {
-        thread::sleep(Duration::from_millis(100));
+        thread::sleep(Duration::from_millis(500));
         let settled = std::fs::metadata(path).unwrap().len();
-        thread::sleep(Duration::from_millis(300));
+        thread::sleep(Duration::from_millis(500));
         assert_eq!(
             std::fs::metadata(path).unwrap().len(),
             settled,

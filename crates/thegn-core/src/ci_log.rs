@@ -267,6 +267,31 @@ pub fn redaction_changed(raw: &str) -> bool {
     redact(raw) != raw || raw.contains(REDACTION_MARKER)
 }
 
+/// Name the first well-known credential shape found in `text`, never the
+/// value. High-confidence shapes only (private key block, URL userinfo, JWT,
+/// AWS access key id, provider token): absence is not proof of no secret.
+///
+/// Cost: callers scan at most `ARTIFACT_MAX_BYTES` (1 MiB) and the `regex`
+/// crate matches in linear time, so no second size cap is needed here.
+pub fn contains_known_credential(text: &str) -> Option<&'static str> {
+    if text
+        .lines()
+        .any(|line| line.contains("PRIVATE KEY") && last_pem_marker(line).is_some())
+    {
+        Some("private key")
+    } else if URL_USERINFO.is_match(text) {
+        Some("url credentials")
+    } else if JWT.is_match(text) {
+        Some("jwt")
+    } else if AWS_KEY_ID.is_match(text) {
+        Some("aws access key id")
+    } else if PROVIDER_TOKEN.is_match(text) {
+        Some("provider token")
+    } else {
+        None
+    }
+}
+
 /// Redact one complete provider line while preserving PEM framing state across
 /// lines. The caller must bound the line before calling this helper.
 pub fn redact_stream_line(line: &[u8], in_pem: &mut bool) -> String {
@@ -702,6 +727,38 @@ fn floor_char_boundary(text: &str, mut byte: usize) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn contains_known_credential_names_each_shape() {
+        let pem = format!(
+            "{}\nMIIBVgIBADANBgkq\n{}\n",
+            concat!("-----BE", "GIN PRIVATE KEY-----"),
+            concat!("-----E", "ND PRIVATE KEY-----")
+        );
+        let cases = [
+            (format!("ghp_{}", "a".repeat(36)), "provider token"),
+            ("eyJabcdefghijk.abcde.lmnopqrstuv".to_string(), "jwt"),
+            (format!("AKIA{}", "A".repeat(16)), "aws access key id"),
+            (pem, "private key"),
+            (
+                "https://alice:pw@example.test/x".to_string(),
+                "url credentials",
+            ),
+        ];
+        for (text, kind) in cases {
+            assert_eq!(contains_known_credential(&text), Some(kind), "{kind}");
+        }
+    }
+
+    #[test]
+    fn contains_known_credential_ignores_ordinary_prose() {
+        for text in [
+            "token: expired\npassword policy reviewed\nmonkey=ordinary\n# key = value\n",
+            "# Handoff\n\nSee https://example.test/a@b for details.\n- reviewed the diff\n",
+        ] {
+            assert_eq!(contains_known_credential(text), None, "{text:?}");
+        }
+    }
 
     #[test]
     fn cached_log_attempt_matches_requires_equal_attempts() {

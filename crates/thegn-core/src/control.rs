@@ -444,6 +444,10 @@ pub enum Verb {
     WorktreeCreate,
     /// Assign or clear a worktree's repo-local sidebar folder.
     FolderAssign,
+    /// Read a worktree's pinned sandbox profile (read-only).
+    WorktreeSandboxProfile,
+    /// Pin or clear a worktree's sandbox profile (host-owned; admin only).
+    WorktreeSandboxProfileSet,
     /// Run a workspace text/structural search (read-only; `thegn search`).
     SearchQuery,
     /// Apply a workspace search-and-replace through the guarded write path
@@ -570,6 +574,8 @@ impl Verb {
         Verb::DispatchesStatus,
         Verb::WorktreeCreate,
         Verb::FolderAssign,
+        Verb::WorktreeSandboxProfile,
+        Verb::WorktreeSandboxProfileSet,
         Verb::SearchQuery,
         Verb::SearchReplace,
         Verb::HostDiscover,
@@ -607,6 +613,7 @@ pub fn required_scope(verb: Verb) -> Scope {
     match verb {
         Verb::ListSessions
         | Verb::ListWorktrees
+        | Verb::WorktreeSandboxProfile
         | Verb::Snapshot
         | Verb::Events
         | Verb::LeaseStatus
@@ -686,6 +693,7 @@ pub fn required_scope(verb: Verb) -> Scope {
         // a workspace — its own exec-level scope, never `open`'s / `write`'s.
         Verb::LaunchPreset | Verb::ToolsRun => Scope::Exec,
         Verb::IssuePairing
+        | Verb::WorktreeSandboxProfileSet
         | Verb::ListPairings
         | Verb::RevokePairing
         | Verb::ApprovePairing
@@ -1098,6 +1106,7 @@ mod tests {
             DispatchesVerify,
             DispatchesWait,
             DispatchesStatus,
+            WorktreeSandboxProfile,
             SearchQuery,
             HostDiscover,
             ContainersList,
@@ -1155,6 +1164,7 @@ mod tests {
         let admin = [
             MigrateSession,
             IssuePairing,
+            WorktreeSandboxProfileSet,
             ListPairings,
             RevokePairing,
             ApprovePairing,

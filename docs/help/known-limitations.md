@@ -61,7 +61,7 @@ detail; if the two differ, `KNOWN_ISSUES.md` is newer.
   guarantees before using that placement; see [[sandboxing]].
 - **The default `standard` profile protects integrity, not credentials:
   `$HOME` stays readable. The opt-in `sealed` profile hides it.** See
-  [[sandboxing]].
+  [[sandboxing]] and [[sandbox-profiles]].
 - **Native plugins run unsandboxed as your user.** Enable only plugins you
   trust; see [[plugins]].
 

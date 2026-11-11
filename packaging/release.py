@@ -9,6 +9,7 @@ credentials.
 from __future__ import annotations
 
 import argparse
+import fnmatch
 import hashlib
 import json
 import os
@@ -38,6 +39,7 @@ FORBIDDEN_OUTPUT = ("REPLACE_WITH_", "thegn-dev", ".SRCINFO")
 WINDOWS_ERROR = "Windows release lane is not enabled"
 MAX_ARCHIVE_BYTES = 512 * 1024 * 1024
 MAX_TRUSTED_DIGESTS_BYTES = 64 * 1024
+TEXT_ASSET_SUFFIXES = (".sha256", "-release.json", "-manifest.json")
 RELEASE_MANIFEST_NAME = "thegn-{tag}-manifest.json"
 MAX_MEMBERS = 64
 MAX_MEMBER_BYTES = 256 * 1024 * 1024
@@ -1491,6 +1493,81 @@ def load_attestation_verification(path: Path) -> Any:
             os.close(descriptor)
 
 
+def check_release_asset_sizes(document: Any, patterns: Sequence[str]) -> list[str]:
+    if not isinstance(document, dict) or not isinstance(document.get("assets"), list):
+        raise ReleaseError("malformed release asset listing: expected an assets list")
+    sizes: dict[str, int] = {}
+    for asset in document["assets"]:
+        if not isinstance(asset, dict):
+            raise ReleaseError("malformed release asset listing: asset is not an object")
+        name = asset.get("name")
+        size = asset.get("size")
+        if not isinstance(name, str) or not name:
+            raise ReleaseError("malformed release asset listing: asset name is missing")
+        if isinstance(size, bool) or not isinstance(size, int) or size < 0:
+            raise ReleaseError(f"malformed release asset listing: bad size for {name}")
+        if name in sizes:
+            raise ReleaseError(f"malformed release asset listing: duplicate asset {name}")
+        sizes[name] = size
+    selected = sorted(
+        name
+        for name in sizes
+        if not patterns or any(fnmatch.fnmatchcase(name, pattern) for pattern in patterns)
+    )
+    if not selected:
+        raise ReleaseError("no release assets match the download patterns")
+    for name in selected:
+        limit = (
+            MAX_TRUSTED_DIGESTS_BYTES
+            if name.endswith(TEXT_ASSET_SUFFIXES)
+            else MAX_ARCHIVE_BYTES
+        )
+        if sizes[name] > limit:
+            raise ReleaseError(f"release asset {name} exceeds the {limit} byte download limit")
+    return selected
+
+
+def load_release_asset_listing(path: Path) -> Any:
+    descriptor: int | None = None
+    try:
+        path_metadata = path.lstat()
+        if not stat.S_ISREG(path_metadata.st_mode):
+            raise ReleaseError(f"release asset listing is not a regular file: {path}")
+        descriptor = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
+        metadata = os.fstat(descriptor)
+    except OSError as error:
+        if descriptor is not None:
+            os.close(descriptor)
+        raise ReleaseError(f"cannot inspect release asset listing {path}: {error}") from error
+    if not stat.S_ISREG(metadata.st_mode):
+        os.close(descriptor)
+        raise ReleaseError(f"release asset listing is not a regular file: {path}")
+    if metadata.st_size > MAX_ARCHIVE_BYTES:
+        os.close(descriptor)
+        raise ReleaseError(f"release asset listing {path} exceeds {MAX_ARCHIVE_BYTES} bytes")
+
+    def unique_object(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+        value: dict[str, Any] = {}
+        for name, item in pairs:
+            if name in value:
+                raise ReleaseError(f"release asset listing {path} has duplicate JSON key {name}")
+            value[name] = item
+        return value
+
+    try:
+        with os.fdopen(descriptor, "rb") as handle:
+            descriptor = None
+            raw = handle.read(MAX_ARCHIVE_BYTES + 1)
+            if len(raw) > MAX_ARCHIVE_BYTES:
+                raise ReleaseError(f"release asset listing {path} exceeds {MAX_ARCHIVE_BYTES} bytes")
+            return json.loads(raw.decode("utf-8"), object_pairs_hook=unique_object)
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError, RecursionError) as error:
+        raise ReleaseError(f"cannot read release asset listing {path}: {error}") from error
+    finally:
+        if descriptor is not None:
+            os.close(descriptor)
+
+
 def _run(args: argparse.Namespace) -> None:
     if args.command == "verify-assets":
         if RELEASE_TAG_RE.fullmatch(args.tag) is None:
@@ -1510,6 +1587,12 @@ def _run(args: argparse.Namespace) -> None:
             run_id=args.run_id,
         )
         print(f"{args.archive.name}: {count} attestation(s) bound to this run")
+        return
+    if args.command == "check-asset-sizes":
+        selected = check_release_asset_sizes(
+            load_release_asset_listing(args.assets_json), args.pattern or []
+        )
+        print(f"{len(selected)} release asset(s) within download limits")
         return
     manifest_path = args.manifest.resolve()
     root = args.repo_root.resolve()
@@ -1663,6 +1746,9 @@ def build_parser() -> argparse.ArgumentParser:
     verify_attestation_parser.add_argument("--server-url", required=True)
     verify_attestation_parser.add_argument("--source-digest", required=True)
     verify_attestation_parser.add_argument("--run-id", required=True)
+    check_sizes_parser = subparsers.add_parser("check-asset-sizes")
+    check_sizes_parser.add_argument("--assets-json", required=True, type=Path)
+    check_sizes_parser.add_argument("--pattern", action="append")
     return parser
 
 

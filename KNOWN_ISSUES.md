@@ -59,11 +59,11 @@ reproducible problems that are not listed here.
 
 ## Concurrency
 
-- **Active-tab persistence can race across rapid switches.** Focus changes are
-  written by independent background tasks, so overlapping writes can finish
-  out of order. The in-memory selection is unaffected; after a crash or forced
-  kill, the restored active tab may be one switch stale. A clean quit re-persists
-  the full layout.
+- **Active-tab persistence is not synchronous.** Focus changes are written in
+  the background, and writes for one session are applied in order, so a late
+  older write no longer overwrites a newer one. After a crash or forced kill
+  the restored active tab can still be the previous one if the last switch had
+  not finished writing. A clean quit re-persists the full layout.
 
 ## Security model limits
 

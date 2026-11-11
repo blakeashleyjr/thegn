@@ -82,7 +82,8 @@ By default, worktree panes run in a sandbox. The `standard` profile makes files
 outside the worktree read-only, while your home directory and its credentials
 remain readable; `sealed` hides `$HOME`. Native plugins run unsandboxed. If no
 sandbox backend is usable, the launch is refused; set `[sandbox] enabled = false`
-to opt out. See [[sandboxing]].
+to opt out. See [[sandboxing]], and [[sandbox-profiles]] to choose a profile
+per worktree.
 
 ## When you're stuck
 

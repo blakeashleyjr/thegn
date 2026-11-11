@@ -27,7 +27,7 @@ fn proc_stat_ppid_start(stat: &str) -> Option<(libc::pid_t, u64)> {
 }
 
 #[cfg(target_os = "linux")]
-fn linux_descendants(root: libc::pid_t) -> Vec<(libc::pid_t, u64)> {
+pub(crate) fn linux_descendants(root: libc::pid_t) -> Vec<(libc::pid_t, u64)> {
     let Ok(entries) = std::fs::read_dir("/proc") else {
         return Vec::new();
     };
@@ -82,12 +82,12 @@ fn linux_descendants(root: libc::pid_t) -> Vec<(libc::pid_t, u64)> {
 }
 
 #[cfg(not(target_os = "linux"))]
-fn linux_descendants(_root: libc::pid_t) -> Vec<(libc::pid_t, u64)> {
+pub(crate) fn linux_descendants(_root: libc::pid_t) -> Vec<(libc::pid_t, u64)> {
     Vec::new()
 }
 
 #[cfg(target_os = "linux")]
-fn kill_tracked(pids: &[(libc::pid_t, u64)]) {
+pub(crate) fn kill_tracked(pids: &[(libc::pid_t, u64)]) {
     for &(pid, start_time) in pids {
         let stat_path = format!("/proc/{pid}/stat");
         let Ok(stat) = std::fs::read_to_string(stat_path) else {
@@ -105,7 +105,7 @@ fn kill_tracked(pids: &[(libc::pid_t, u64)]) {
 }
 
 #[cfg(not(target_os = "linux"))]
-fn kill_tracked(_pids: &[(libc::pid_t, u64)]) {}
+pub(crate) fn kill_tracked(_pids: &[(libc::pid_t, u64)]) {}
 
 pub(crate) fn platform_is_executable_file(metadata: &std::fs::Metadata) -> bool {
     use std::os::unix::fs::PermissionsExt;
