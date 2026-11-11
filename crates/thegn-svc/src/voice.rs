@@ -409,16 +409,14 @@ fn terminate_child(mut child: Child, on_reaped: &Arc<dyn Fn() + Send + Sync>) ->
         }
     }
     let reaped = Arc::clone(on_reaped);
-    match thread::Builder::new()
-        .name("thegn-stt-reap".into())
-        .spawn(move || {
-            // thegn-svc has no QoS seam; reaper scheduling follows the platform default.
-            if let Err(error) = child.wait() {
-                tracing::warn!(%error, "voice transcriber reaper failed");
-            } else {
-                reaped();
-            }
-        }) {
+    match thegn_core::thread_name::try_spawn_named("thegn-stt-reap", move || {
+        // thegn-svc has no QoS seam; reaper scheduling follows the platform default.
+        if let Err(error) = child.wait() {
+            tracing::warn!(%error, "voice transcriber reaper failed");
+        } else {
+            reaped();
+        }
+    }) {
         Ok(_) => false,
         Err(error) => {
             // Reaper creation failure is returned as UnresolvedProcess; Child
