@@ -182,7 +182,8 @@ A pipeline row's handoff that contains a well-known credential format (a private
 key block, a URL with a password, a JWT, an AWS access key id or a provider
 token) is also refused; the reason names the kind and never echoes the value.
 The check does not prove a handoff is free of secrets.
-Symlinked handoff files are not followed.
+Symlinked handoff files are not followed, and a handoff path reached through a
+symlinked or `..` parent directory is refused too.
 
 Wait for the session to publish or open one; `--force --why '<reason>'` records
 an explicit override.

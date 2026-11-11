@@ -68,6 +68,13 @@ through a year as fast as you can hold a key. If you land on a month whose
 events aren't cached yet, the grid appears immediately and the dots and agenda
 fill in a moment later.
 
+A long day's agenda is windowed: it scrolls to keep the selected event visible,
+and the header says which rows are shown (for example `12 events · 3-9 shown`).
+Moving down past the last visible row brings the next event into view, and
+`Enter` opens the link of the event you can see. The selection follows the event
+itself, so a refresh that reorders or adds events does not move it to a
+different one.
+
 The mouse works too: click a day to select it, click `⟨h⟩` / `⟨l⟩` to page, click
 `today` to jump back, and scroll anywhere in the popup to change month.
 
