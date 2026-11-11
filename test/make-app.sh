@@ -133,6 +133,15 @@ run_make_app --dest "$tmp/lock-stale" >"$tmp/lock-stale.out" 2>"$tmp/lock-stale.
 [[ -d "$tmp/lock-stale/thegn.app" ]] || fail "stale-lock run did not produce a bundle"
 assert_no_workdirs "$tmp/lock-stale" || fail "stale-lock run left staging/old/lock directories"
 
+# pid 1 belongs to another user (kill -0 fails with EPERM when not root): still a live holder.
+mkdir -p "$tmp/lock-eperm/.thegn.app.lock"
+printf '%s\n' 1 >"$tmp/lock-eperm/.thegn.app.lock/pid"
+if run_make_app --dest "$tmp/lock-eperm" >"$tmp/lock-eperm.out" 2>"$tmp/lock-eperm.err"; then
+  fail "a lock held by another user's process was reclaimed"
+fi
+[[ "$(cat "$tmp/lock-eperm/.thegn.app.lock/pid")" == 1 ]] || fail "EPERM holder's lock was modified"
+[[ ! -e "$tmp/lock-eperm/thegn.app" ]] || fail "EPERM-holder run created a bundle"
+
 mkdir -p "$tmp/lock-nopid/.thegn.app.lock"
 if run_make_app --dest "$tmp/lock-nopid" >"$tmp/lock-nopid.out" 2>"$tmp/lock-nopid.err"; then
   fail "a pid-less lock was ignored"
