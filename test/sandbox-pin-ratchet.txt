@@ -12,3 +12,4 @@ pty_drain.rs:report_pane_connect_failure  Reports provider health after a pane c
 wizard.rs:new  Computes each host's effective profile default for the creation form.
 worktree_lifecycle.rs:teardown_runtime  Teardown identifies the provider runtime and never starts a process.
 cmd/wt.rs:create_and_register  New worktree has no registered worktree pin yet; resolves its inherited default.
+cmd/doctor_pins.rs:collect  Doctor reports what an unpinned worktree would inherit; the stored pin is shown beside it, never launched.

@@ -3116,6 +3116,7 @@ pub fn run(
         report["voice"] = super::voice::status(&cfg.voice);
         report["batteries"] =
             super::batteries_doctor::json(&super::batteries_doctor::inspect_env());
+        report["worktree_sandbox_pins"] = pins::json(&pins::collect(cfg).0);
         outln!("{}", serde_json::to_string_pretty(&report)?);
         return Ok(());
     }
@@ -3286,6 +3287,9 @@ pub fn run(
     macos_report(&env);
     outln!("");
     super::batteries_doctor::print(&super::batteries_doctor::inspect_env());
+    outln!("");
+    let (pin_rows, pin_unread) = pins::collect(cfg);
+    pins::print(&pin_rows, pin_unread.as_deref());
 
     outln!("");
     pane_daemon_report(cfg);
@@ -5672,9 +5676,17 @@ fn summary(c: &TermCaps) -> String {
     }
 }
 
+#[path = "doctor_pins.rs"]
+mod pins;
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn doctor_json_carries_the_worktree_sandbox_pins_key() {
+        assert_eq!(super::pins::json(&[]), serde_json::json!([]));
+    }
 
     #[test]
     fn doctor_reports_refusal_for_world_readable_file_secret() {
