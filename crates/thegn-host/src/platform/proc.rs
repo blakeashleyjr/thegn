@@ -387,6 +387,27 @@ pub(crate) fn cmdline(_pid: u32) -> Option<Vec<String>> {
     None
 }
 
+/// Pids whose current directory is `root` or inside it.
+///
+/// Enumerates `/proc`, so it only finds anything on Linux; elsewhere (no
+/// `/proc`) it returns an empty list — a documented limitation of
+/// `thegn wt prune`, which then cannot see processes parked in a worktree.
+/// Unreadable entries (other users' processes, pids that exited mid-scan) are
+/// skipped.
+pub(crate) fn pids_with_cwd_under(root: &std::path::Path) -> Vec<u32> {
+    let root = std::fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf());
+    let Ok(dir) = std::fs::read_dir("/proc") else {
+        return Vec::new();
+    };
+    let mut pids: Vec<u32> = dir
+        .flatten()
+        .filter_map(|e| e.file_name().to_str()?.parse::<u32>().ok())
+        .filter(|&pid| cwd_of(pid).is_some_and(|cwd| cwd.starts_with(&root)))
+        .collect();
+    pids.sort_unstable();
+    pids
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -756,5 +777,18 @@ mod tests {
         } else {
             assert!(cwd.is_none() && argv.is_none());
         }
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn scan_finds_this_process_under_its_own_cwd() {
+        let cwd = std::env::current_dir().unwrap();
+        assert!(pids_with_cwd_under(&cwd).contains(&std::process::id()));
+    }
+
+    #[test]
+    fn scan_ignores_a_directory_nothing_sits_in() {
+        let dir = tempfile::tempdir_in("/tmp").unwrap();
+        assert!(pids_with_cwd_under(dir.path()).is_empty());
     }
 }

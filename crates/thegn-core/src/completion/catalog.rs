@@ -785,6 +785,7 @@ pub const CATALOG: &[Slot] = &[
     slot("pr create", "base", SourceKind::Reserved(Reserved::Branch)),
     slot("wt diff", "base", SourceKind::Reserved(Reserved::Branch)),
     slot("wt new", "base", SourceKind::Reserved(Reserved::Branch)),
+    slot("wt prune", "target", SourceKind::Reserved(Reserved::Branch)),
     slot("wt folder", "name", SourceKind::Reserved(Reserved::Folder)),
     slot("wt new", "folder", SourceKind::Reserved(Reserved::Folder)),
     slot(
