@@ -2102,10 +2102,12 @@ fn verify_facts_with_report_head(
 /// unreadable HEAD on either side counts as moved. Any difference forces the
 /// worktree state to `Unknown`, which `verify_report` turns into the typed
 /// `WorktreeUnknown` refusal. `between` runs after every git read (the
-/// report-binding block included) and before the closing observation (a test seam for mid-verification races).
+/// report-binding block included) and before the closing observation (a test
+/// seam for mid-verification races).
 ///
-/// Cost: two extra bounded `git rev-parse` calls and one extra bounded file
-/// read per verification, on the same blocking paths as the existing git reads.
+/// Cost: two extra bounded `git rev-parse` calls, one extra bounded
+/// `git status --porcelain` and one extra bounded file read per verification,
+/// on the same blocking paths as the existing git reads.
 fn verify_facts_observed(
     row: &AgentDispatch,
     report_head: Option<&str>,
@@ -2276,7 +2278,13 @@ fn verify_facts_observed(
     } else {
         None
     };
-    let status_after = git_text_local(wt, &["status", "--porcelain"]).ok();
+    let status_after = match git_text_local(wt, &["status", "--porcelain"]) {
+        Ok(s) => Some(s),
+        Err(error) => {
+            note_git_read_failure("status --porcelain", wt, &error);
+            None
+        }
+    };
     let snapshot_moved = head_before.is_none()
         || head_after.is_none()
         || head_before != head_after
