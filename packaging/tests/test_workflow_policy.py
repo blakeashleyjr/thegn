@@ -306,6 +306,21 @@ class WorkflowPolicyTests(unittest.TestCase):
                 self.assertIn(expected, script)
         self.assertEqual("read", job.get("permissions", {}).get("attestations"))
 
+    def test_release_downloads_check_asset_sizes_first(self) -> None:
+        jobs = read_workflow("release.yml")["jobs"]
+        for job_name, step_name in (
+            ("package", "Download this tag's source assets"),
+            ("verify-manifest", "Download every draft asset"),
+        ):
+            with self.subTest(job=job_name):
+                steps = {s.get("name"): s for s in jobs[job_name]["steps"]}
+                script = steps[step_name].get("run", "")
+                self.assertIn("gh release view", script)
+                self.assertIn("check-asset-sizes", script)
+                self.assertLess(
+                    script.index("check-asset-sizes"), script.index("gh release download")
+                )
+
     def test_package_provenance_rehearsal(self) -> None:
         if shutil.which("bash") is None:
             self.skipTest("bash is required for the package provenance rehearsal")

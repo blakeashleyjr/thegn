@@ -1618,5 +1618,89 @@ class AttestationVerificationTests(unittest.TestCase):
         self.assertEqual(2, raised.exception.code)
 
 
+class ReleaseAssetSizePrecheckTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temporary.cleanup)
+        self.temp = Path(self.temporary.name)
+
+    @staticmethod
+    def listing(*assets):
+        return {"assets": [{"name": n, "size": s} for n, s in assets]}
+
+    def test_archive_cap_boundary(self) -> None:
+        with mock.patch.object(release, "MAX_ARCHIVE_BYTES", 1000):
+            self.assertEqual(
+                ["a.tar.gz"], release.check_release_asset_sizes(self.listing(("a.tar.gz", 1000)), [])
+            )
+            with self.assertRaises(release.ReleaseError):
+                release.check_release_asset_sizes(self.listing(("a.tar.gz", 1001)), [])
+
+    def test_text_asset_cap_boundary(self) -> None:
+        cap = release.MAX_TRUSTED_DIGESTS_BYTES
+        self.assertEqual(
+            ["x.sha256"], release.check_release_asset_sizes(self.listing(("x.sha256", cap)), [])
+        )
+        with self.assertRaises(release.ReleaseError):
+            release.check_release_asset_sizes(self.listing(("x.sha256", cap + 1)), [])
+
+    def test_rejects_bad_shapes(self) -> None:
+        bad = [
+            [],
+            {},
+            {"assets": "x"},
+            self.listing(("", 1)),
+            self.listing(("a", True)),
+            self.listing(("a", -1)),
+            self.listing(("a", "3")),
+            self.listing(("a", 1.5)),
+            self.listing(("a", 1), ("a", 2)),
+            {"assets": ["a"]},
+        ]
+        for document in bad:
+            with self.subTest(document=document):
+                with self.assertRaises(release.ReleaseError):
+                    release.check_release_asset_sizes(document, [])
+
+    def test_pattern_selection_ignores_unselected_oversized_asset(self) -> None:
+        document = self.listing(("keep.tar.gz", 5), ("other.bin", release.MAX_ARCHIVE_BYTES + 1))
+        self.assertEqual(
+            ["keep.tar.gz"], release.check_release_asset_sizes(document, ["keep.*"])
+        )
+        with self.assertRaises(release.ReleaseError):
+            release.check_release_asset_sizes(document, [])
+
+    def test_empty_selection_refused(self) -> None:
+        with self.assertRaises(release.ReleaseError):
+            release.check_release_asset_sizes(self.listing(("a.tar.gz", 1)), ["nomatch*"])
+        with self.assertRaises(release.ReleaseError):
+            release.check_release_asset_sizes(self.listing(), [])
+
+    def test_loader_refuses_symlink_and_duplicate_keys(self) -> None:
+        good = self.temp / "good.json"
+        good.write_text(json.dumps(self.listing(("a", 1))), encoding="utf-8")
+        self.assertEqual(self.listing(("a", 1)), release.load_release_asset_listing(good))
+        link = self.temp / "link.json"
+        link.symlink_to(good)
+        with self.assertRaises(release.ReleaseError):
+            release.load_release_asset_listing(link)
+        dup = self.temp / "dup.json"
+        dup.write_text('{"assets": [], "assets": []}', encoding="utf-8")
+        with self.assertRaises(release.ReleaseError):
+            release.load_release_asset_listing(dup)
+
+    def test_cli_exit_code_2(self) -> None:
+        path = self.temp / "assets.json"
+        path.write_text(json.dumps(self.listing(("a.tar.gz", 1))), encoding="utf-8")
+        with contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(
+                0, release.main(["check-asset-sizes", "--assets-json", str(path), "--pattern", "*.tar.gz"])
+            )
+        with contextlib.redirect_stderr(io.StringIO()):
+            with self.assertRaises(SystemExit) as raised:
+                release.main(["check-asset-sizes", "--assets-json", str(path), "--pattern", "zzz"])
+        self.assertEqual(2, raised.exception.code)
+
+
 if __name__ == "__main__":
     unittest.main()
