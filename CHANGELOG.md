@@ -9,6 +9,49 @@ All notable changes to **thegn** are documented here. The format follows
 
 ## [0.1.0-alpha.60] — 2026-11-11
 
+### Added
+
+- The Home Manager module exposes the `[limits]` options (`limitsTestCpuQuota`,
+  `limitsTestMemMax`, `limitsTestMaxParallel`, `limitsTestTimeoutSecs`,
+  `limitsDiscoverTimeoutSecs`, `limitsIsolatedTargetDir`) and the
+  `[diagnostics]` options (`diagnosticsCrashReports`,
+  `diagnosticsCrashRetention`, `diagnosticsRingSize`).
+- Pipeline verify output now carries a typed refusal kind for each refusal
+  (for example an unreadable, oversized, binary or sensitive artifact, an
+  unknown worktree, or an unproven gate), so callers no longer parse prose.
+- The calendar agenda header says which rows are shown when a long day is
+  windowed (for example `12 · 3-9 shown`).
+
+### Changed
+
+- The daemon prunes idle, abandoned control directories from other state
+  scopes when it binds, leaving the emptied directory in place, and re-checks
+  the bind lock after taking it so a pruned lock file cannot be held twice.
+- The calendar agenda keeps your selection on the same event across a
+  refresh instead of jumping to the same row number.
+- The log parser reads worktree identity tokens only from the leading run of the
+  line, so a token later in a message is no longer taken for one.
+
+### Fixed
+
+- Sealed containers no longer keep host credentials or dotfiles that an
+  earlier provisioning copied in. The cleanup removes a file only when it
+  still matches the host's copy, resolves the home directory physically, and
+  never follows symlinks or crosses mount points.
+- `thegn dispatch` completion re-checks its evidence inside the status write
+  and refuses a row that changed in between or whose fence row is missing.
+- Artifacts reached through a symlinked or `..` parent directory, and
+  absolute artifact paths, are refused.
+- A drawer launch result that arrives after its worktree was forgotten is
+  dropped instead of being applied.
+- Dispatch sessions and review tasks imported from older data are recorded
+  with their proper dispatch kind.
+- The CI `act` guard refuses a runner image that is not pinned by digest, or
+  an override that changes the pinned one.
+- The macOS app build takes a lock so concurrent runs cannot clobber each
+  other; a stale lock is reclaimed safely and the build fails closed if it
+  cannot be written.
+
 ## [0.1.0-alpha.59] — 2026-11-11
 
 ### Added
