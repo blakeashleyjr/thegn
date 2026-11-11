@@ -31,6 +31,8 @@ pub mod client;
 pub mod grpc;
 pub mod http;
 pub mod http_ci;
+pub mod route_docs;
+pub mod route_types;
 pub mod routes;
 #[cfg(test)]
 mod tests;
