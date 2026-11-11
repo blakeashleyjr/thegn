@@ -10761,10 +10761,12 @@ async fn event_loop<T: Terminal>(
                 seq,
                 session_id,
                 rows,
+                registry,
                 land_on,
             } = &result
             {
                 if session.id == *session_id {
+                    model.sidebar_db_worktrees = registry.clone();
                     session.apply_registered_adoption(rows.clone());
                     if let Some(name) = land_on.as_deref() {
                         let current = pending_switch.current(*seq);

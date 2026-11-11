@@ -1465,6 +1465,30 @@ fn push_pipeline_group(
     }
 }
 
+/// A live branch group whose worktree the registry no longer lists (THE-1965).
+///
+/// The registry rows are the freshly adopted snapshot, so a removed worktree
+/// that the session still carries must not render live while vanishing once the
+/// workspace parks. Hidden only when the slug HAS registry rows (an empty slug
+/// set means "registry unknown", never "everything was removed"), the group is
+/// a non-active, non-home `Branch` group, and neither its tab name nor its path matches a
+/// row — so the active group, home, terminals and a renamed-in-session group
+/// (same path) all stay, and THE-73 (registered-but-missed) is untouched.
+fn is_ghost_group(
+    g: &crate::session::WorktreeGroup,
+    repo_slug: &str,
+    is_active: bool,
+    slug_rows: &[&DbWorktree],
+) -> bool {
+    matches!(g.kind, crate::session::GroupKind::Branch)
+        && !is_home_tab(repo_slug, &g.name)
+        && !is_active
+        && !slug_rows.is_empty()
+        && !slug_rows
+            .iter()
+            .any(|w| w.tab_name == g.name || (!g.path.is_empty() && w.path == g.path))
+}
+
 /// Build the unsorted worktree `Group` list for one workspace: the **union** of
 /// the session's live groups and the DB registry, never one source or the other.
 ///
@@ -1521,6 +1545,9 @@ fn gather_groups(
             continue;
         };
         if repo != repo_slug {
+            continue;
+        }
+        if is_ghost_group(g, repo_slug, session.active == gi, slug_rows_for_rank) {
             continue;
         }
         live_tabs.insert(g.name.as_str());
@@ -2842,6 +2869,84 @@ mod tests {
             env_degraded: false,
             sandbox_profile: None,
         }
+    }
+
+    /// Worktree `(label, depth)` pairs `build_rows` emits for the `app` workspace.
+    fn app_worktree_rows(s: &Session, dbw: &[DbWorktree]) -> Vec<(String, u8)> {
+        let ws = vec![(
+            "app".to_string(),
+            "app".to_string(),
+            "repo".to_string(),
+            "/repos/app".to_string(),
+        )];
+        let mut out: Vec<(String, u8)> =
+            build_rows(s, &ws, &ViewState::default(), &no_activity(), dbw, &[], &[])
+                .into_iter()
+                .filter(|r| r.kind == RowKind::Worktree)
+                .map(|r| (r.label, r.depth))
+                .collect();
+        out.sort();
+        out
+    }
+
+    #[test]
+    fn live_and_dormant_rows_match_when_registry_dropped_a_worktree() {
+        // The session still carries `ghost` (removed from the DB) and misses
+        // `newer` (registered): live and dormant must agree on the fresh registry.
+        let mut feat = db_row("app", "feat");
+        feat.path = "/wt/feat".into();
+        let mut newer = db_row("app", "newer");
+        newer.path = "/wt/newer".into();
+        let dbw = vec![feat, newer];
+        let live = session(
+            vec![
+                tab("app/home", "/repos/app"),
+                tab("app/feat", "/wt/feat"),
+                tab("app/ghost", "/wt/ghost"),
+            ],
+            0,
+        );
+        let dormant = session(vec![], 0);
+        let live_rows = app_worktree_rows(&live, &dbw);
+        assert_eq!(live_rows, app_worktree_rows(&dormant, &dbw));
+        // THE-73: the registered worktree the session missed still renders live.
+        assert!(live_rows.iter().any(|(l, _)| l == "newer"));
+    }
+
+    #[test]
+    fn removed_worktree_is_never_rendered_live_or_dormant() {
+        let mut feat = db_row("app", "feat");
+        feat.path = "/wt/feat".into();
+        let dbw = vec![feat];
+        let live = session(
+            vec![
+                tab("app/home", "/repos/app"),
+                tab("app/feat", "/wt/feat"),
+                tab("app/ghost", "/wt/ghost"),
+            ],
+            0,
+        );
+        for s in [live, session(vec![], 0)] {
+            assert!(
+                !app_worktree_rows(&s, &dbw)
+                    .iter()
+                    .any(|(l, _)| l == "ghost")
+            );
+        }
+    }
+
+    #[test]
+    fn ghost_filter_spares_active_home_renamed_and_unknown_registry() {
+        let feat = db_row("app", "feat");
+        let rows = [&feat];
+        let ghost = tab("app/ghost", "/wt/ghost");
+        assert!(is_ghost_group(&ghost, "app", false, &rows));
+        assert!(!is_ghost_group(&ghost, "app", true, &rows));
+        assert!(!is_ghost_group(&ghost, "app", false, &[]));
+        assert!(!is_ghost_group(&tab("app/home", "/x"), "app", false, &rows));
+        let mut renamed = tab("app/renamed", "/wt/app-feat");
+        renamed.path = feat.path.clone();
+        assert!(!is_ghost_group(&renamed, "app", false, &rows));
     }
 
     #[test]

@@ -1399,7 +1399,7 @@ pub(crate) fn db_worktree_list(
     db_worktree_list_with_snapshot(db, cfg).0
 }
 
-fn db_worktree_list_with_snapshot(
+pub(crate) fn db_worktree_list_with_snapshot(
     db: &thegn_core::db::Db,
     cfg: &thegn_core::config::Config,
 ) -> (
