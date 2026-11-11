@@ -106,8 +106,13 @@ pub enum Action {
         /// Create from a tracker issue id (`"<provider>:<key>"`): derive the
         /// branch from the issue's hint and link the issue to the worktree —
         /// the headless twin of the panel's `s`/`D` keys (THE-57).
-        #[arg(long)]
+        #[arg(long, conflicts_with = "exact_branch")]
         from_issue: Option<String>,
+        /// Use `name` verbatim as the full branch name, skipping the configured
+        /// prefix and numbering scheme. Refuses an invalid ref name or a branch
+        /// that already exists.
+        #[arg(long, requires = "name", conflicts_with = "program")]
+        exact_branch: bool,
         /// Emit the created worktree as one JSON object.
         #[arg(long)]
         json: bool,
@@ -169,6 +174,7 @@ pub fn run_with_config(cfg: &Config, action: Action, config_path: &std::path::Pa
             program,
             repos,
             from_issue,
+            exact_branch,
             json,
             folder,
         } => {
@@ -187,6 +193,7 @@ pub fn run_with_config(cfg: &Config, action: Action, config_path: &std::path::Pa
                     env,
                     profile,
                     from_issue,
+                    exact_branch,
                     folder,
                     json,
                     config_path.parent().unwrap_or(std::path::Path::new("")),
@@ -224,6 +231,7 @@ fn new(
     env: Option<String>,
     profile: Option<String>,
     from_issue: Option<String>,
+    exact_branch: bool,
     folder: Option<String>,
     json: bool,
     config_dir: &std::path::Path,
@@ -267,6 +275,10 @@ fn new(
 
     let branch = match issue_branch {
         Some(b) => b,
+        None if exact_branch => {
+            let taken = worktree::BranchSet::load_checked(&root).map_err(anyhow::Error::msg)?;
+            exact_branch_name(name.as_deref(), |b| taken.taken(b))?
+        }
         None => worktree::branch_name_checked(&root, name.as_deref(), cfg)
             .map_err(anyhow::Error::msg)?,
     };
@@ -323,6 +335,20 @@ fn new(
         Some(e) => Err(e),
         None => Ok(()),
     }
+}
+
+/// `--exact-branch`: `name` verbatim as the branch, no prefix/numbering.
+/// Unlike the plain-name path (which dedupes with a `-N` suffix), an existing
+/// branch is refused rather than attached or renamed.
+fn exact_branch_name(name: Option<&str>, taken: impl Fn(&str) -> bool) -> Result<String> {
+    let name = name
+        .filter(|n| !n.trim().is_empty())
+        .ok_or_else(|| anyhow::anyhow!("--exact-branch requires a branch name"))?;
+    thegn_core::git_operand::branch_name(name)?;
+    if taken(name) {
+        anyhow::bail!("branch '{name}' already exists; --exact-branch will not attach to it");
+    }
+    Ok(name.to_string())
 }
 
 struct WorktreeCreateOptions<'a> {
@@ -1852,6 +1878,54 @@ mod folder_tests {
                 }) if name == "Pipeline"
             ));
         }
+    }
+
+    #[test]
+    fn exact_branch_keeps_name_verbatim() {
+        assert_eq!(
+            exact_branch_name(Some("tg/b101-slug"), |_| false).unwrap(),
+            "tg/b101-slug"
+        );
+    }
+
+    #[test]
+    fn exact_branch_refuses_missing_invalid_or_existing() {
+        assert!(exact_branch_name(None, |_| false).is_err());
+        assert!(exact_branch_name(Some("  "), |_| false).is_err());
+        assert!(exact_branch_name(Some("bad..name"), |_| false).is_err());
+        assert!(exact_branch_name(Some("-x"), |_| false).is_err());
+        let e = exact_branch_name(Some("tg/x"), |b| b == "tg/x").unwrap_err();
+        assert!(e.to_string().contains("already exists"));
+    }
+
+    #[test]
+    fn exact_branch_flag_constraints() {
+        assert!(parse(&["thegn", "wt", "new", "tg/x", "--exact-branch"]).is_ok());
+        assert!(parse(&["thegn", "wt", "new", "--exact-branch"]).is_err());
+        assert!(
+            parse(&[
+                "thegn",
+                "wt",
+                "new",
+                "x",
+                "--exact-branch",
+                "--program",
+                "p"
+            ])
+            .is_err()
+        );
+        assert!(
+            parse(&[
+                "thegn",
+                "wt",
+                "new",
+                "x",
+                "--exact-branch",
+                "--from-issue",
+                "a:b"
+            ])
+            .is_err()
+        );
     }
 
     #[test]
