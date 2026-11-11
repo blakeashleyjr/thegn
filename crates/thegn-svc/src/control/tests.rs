@@ -154,6 +154,33 @@ impl ControlApi for FakeApi {
         self.record(&format!("folder_assign:{}:{:?}", req.worktree, req.folder));
         Box::pin(async { Ok(()) })
     }
+    fn worktree_sandbox_profile(
+        &self,
+        query: super::SandboxProfileQuery,
+    ) -> BoxFuture<'_, ControlResult<super::SandboxProfileReply>> {
+        self.record(&format!("sandbox_profile:{}", query.worktree));
+        Box::pin(async move {
+            Ok(super::SandboxProfileReply {
+                worktree: query.worktree,
+                profile: None,
+            })
+        })
+    }
+    fn set_worktree_sandbox_profile(
+        &self,
+        req: super::SandboxProfileSetReq,
+    ) -> BoxFuture<'_, ControlResult<super::SandboxProfileReply>> {
+        self.record(&format!(
+            "sandbox_profile_set:{}:{:?}",
+            req.worktree, req.profile
+        ));
+        Box::pin(async move {
+            Ok(super::SandboxProfileReply {
+                worktree: req.worktree,
+                profile: req.profile,
+            })
+        })
+    }
     fn list_skills(&self) -> BoxFuture<'_, ControlResult<super::SkillsList>> {
         self.record("list_skills");
         Box::pin(async {
@@ -608,6 +635,8 @@ fn default_body(path: &str) -> &'static str {
         r#"{"client_id":"c"}"#
     } else if path.contains("/worktrees/open") {
         r#"{"repo":"r"}"#
+    } else if path.contains("/worktrees/sandbox-profile/set") {
+        r#"{"worktree":"/w","profile":"sealed"}"#
     } else if path.contains("/worktrees/folder") {
         r#"{"worktree":"/w","folder":"Agents"}"#
     } else if path.contains("/preview/fetch") {
@@ -781,6 +810,56 @@ async fn folder_assignment_requires_git_scope_and_reaches_the_control_api() {
         StatusCode::FORBIDDEN
     );
     assert_eq!(r.api.calls().len(), 1, "write token must not reach the API");
+}
+
+#[tokio::test]
+async fn sandbox_profile_set_requires_admin_and_read_requires_read() {
+    let r = rig(false);
+    let read = token(&r, "read");
+    assert_eq!(
+        call(
+            &r,
+            "GET",
+            "/v1/worktrees/sandbox-profile?worktree=%2Fw",
+            Some(&read)
+        )
+        .await,
+        StatusCode::OK
+    );
+    assert_eq!(r.api.calls(), ["sandbox_profile:/w"]);
+    assert_eq!(
+        call(&r, "POST", "/v1/worktrees/sandbox-profile/set", Some(&read)).await,
+        StatusCode::FORBIDDEN
+    );
+    let git = token(&r, "git");
+    assert_eq!(
+        call(&r, "POST", "/v1/worktrees/sandbox-profile/set", Some(&git)).await,
+        StatusCode::FORBIDDEN
+    );
+    assert_eq!(
+        r.api.calls().len(),
+        1,
+        "denied tokens must not reach the API"
+    );
+
+    let admin = token(&r, "admin");
+    assert_eq!(
+        call(
+            &r,
+            "POST",
+            "/v1/worktrees/sandbox-profile/set",
+            Some(&admin)
+        )
+        .await,
+        StatusCode::OK
+    );
+    assert_eq!(
+        r.api.calls(),
+        [
+            "sandbox_profile:/w",
+            "sandbox_profile_set:/w:Some(\"sealed\")"
+        ]
+    );
 }
 
 async fn post_folder(r: &Rig, bearer: &str, body: &'static str) -> StatusCode {

@@ -50,6 +50,10 @@ control socket — a newly routed verb is callable with no CLI change.
 For example, `folders.assign` assigns or clears a worktree's repo-local sidebar
 folder (`folder` name, or `clear: true`) through `api call` (Git scope), HTTP,
 gRPC, MCP (`folders_assign`, needs `--scopes git`), or plugin `host.call`.
+A worktree's sandbox profile pin is readable with `worktrees.sandbox_profile`
+(`api call`, HTTP, or MCP `worktrees_sandbox_profile`); changing it with
+`worktrees.sandbox_profile_set` needs admin scope, is available over HTTP and
+`api call` only, and is refused from inside a sandbox.
 `thegn plugin list|check` inspects the configured [[plugins]]; `thegn plugin
 preview` renders an app-tab fixture or recorded trace with no plugin process
 (see [[plugins]]).
