@@ -19,7 +19,8 @@ while the process is contained.
 
 `[sandbox] profile` picks a bundle of isolation knobs. Set it globally,
 per repo via a `.thegn.toml` overlay, or per run with
-`THEGN_SANDBOX_PROFILE`.
+`THEGN_SANDBOX_PROFILE`. A single worktree can also pin its own profile; see
+[[sandbox-profiles]].
 
 | Profile         | What it does                                                                                                                                                                                                |
 | --------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
