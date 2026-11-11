@@ -89,7 +89,11 @@ fn sealed_worktree_pin_refuses_a_disabled_sandbox_on_the_launch_path() {
             .downcast_ref::<SandboxHalt>()
             .expect("the refusal is a typed launch halt");
         assert!(halt.sealed_home);
-        assert!(halt.reason.contains("sealed"), "{}", halt.reason);
+        assert!(
+            halt.reason.contains("requires a sandbox that hides $HOME"),
+            "{}",
+            halt.reason
+        );
     });
 }
 

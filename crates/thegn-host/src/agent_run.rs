@@ -707,7 +707,7 @@ pub(crate) fn agent_floor_gate(
 /// Resolve the sandbox an uncontained (`agent_sandbox = false`) queue agent
 /// would run under. Returns the effective [`SandboxConfig`] plus whether its
 /// profile is KNOWN for this worktree: `true` after a full local resolve
-/// (env overlay + zone), and `true` when the pin itself was readable — but
+/// (env overlay + zone), and `true` when the worktree has a pin — but
 /// `false` on the early returns (worktree path unresolved, repo root missing,
 /// remote or unresolved env), where the profile is only the global default
 /// under an applied pin. A sealed hold must not fire on that guess.
@@ -2132,7 +2132,12 @@ mod tests {
 
         let _state = crate::testenv::IsolatedState::new();
         let fixture = git_control_fixture();
-        let worktree = fixture.worktree.to_string_lossy().into_owned();
+        let worktree = fixture
+            .worktree
+            .canonicalize()
+            .unwrap()
+            .to_string_lossy()
+            .into_owned();
         let db = thegn_core::db::Db::open().unwrap();
         db.put_worktree("repo/wt", &worktree, &worktree, "feat", None, None)
             .unwrap();
