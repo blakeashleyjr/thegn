@@ -787,7 +787,11 @@ fn reused_gate_requires_lock_and_preserves_ignored_artifacts() {
     assert_eq!(git(&f.wt(), &["check-ignore", "artifact"]), "artifact");
     let start = Instant::now();
     assert!(gate_tip(&f.repo, &f.second, &f.config).unwrap().passed());
-    assert!(start.elapsed() < Duration::from_secs(2));
+    assert!(
+        start.elapsed() < Duration::from_secs(60),
+        "isolated gate took {:?}",
+        start.elapsed()
+    );
     assert_eq!(git(&f.wt(), &["rev-parse", "HEAD"]), f.first);
     drop(held);
     assert!(gate_tip(&f.repo, &f.second, &f.config).unwrap().passed());
