@@ -291,17 +291,17 @@ impl SessionMigrationStore for Db {
         }
         // The fingerprint excludes registration metadata (a target-owned or
         // missing registration must not break the read-back), so compare the
-        // user-owned pin exactly: the target must now hold the bundle's pin —
-        // written by `insert_worktree` when its registration was missing.
-        Ok(plan
-            .bundle
-            .worktree
-            .as_ref()
-            .and_then(|worktree| worktree.sandbox_profile.as_deref())
-            == target
+        // user-owned pin exactly -- but only when the source has a
+        // registration: `plan_migration` only conflicts when both sides are
+        // registered, so an unregistered source leaves the target's row (and
+        // its pin) target-owned.
+        Ok(match plan.bundle.worktree.as_ref() {
+            None => true,
+            Some(source) => target
                 .worktree
                 .as_ref()
-                .and_then(|worktree| worktree.sandbox_profile.as_deref()))
+                .is_some_and(|registered| registered.sandbox_profile == source.sandbox_profile),
+        })
     }
 
     fn cleanup_migration(&self, bundle: &MigrationBundle) -> Result<MigrationCleanupResult> {
@@ -926,6 +926,91 @@ mod tests {
         assert!(target_state.worktree.is_some());
         assert_eq!(target_state.worktree.unwrap().sandbox_profile, None);
         assert!(target_state.groups.is_empty());
+    }
+
+    #[test]
+    fn unregistered_source_move_confirms_against_a_pinned_target_registration() {
+        let source = Db::open_memory().unwrap();
+        let target = Db::open_memory().unwrap();
+        source
+            .conn()
+            .execute(
+                "INSERT INTO tab_groups(session_name,name,kind,worktree,ordinal,active_tab)
+                 VALUES('default','x','worktree','/x',0,0)",
+                [],
+            )
+            .unwrap();
+        target
+            .conn()
+            .execute(
+                "INSERT INTO worktrees(worktree,session_name,tab_name,repo_path,branch,agent,created_at,location,position,sandbox_profile)
+                 VALUES('/x','default','tab','/repo','feature','agent',1,'',3,'sealed')",
+                [],
+            )
+            .unwrap();
+
+        let bundle = source
+            .migration_snapshot("default", "target", "default", "/x")
+            .unwrap();
+        assert!(bundle.worktree.is_none());
+        let plan = plan_migration(
+            bundle,
+            target.migration_target_snapshot("default", "/x").unwrap(),
+            HistoryPolicy::Include,
+        )
+        .unwrap();
+        target.import_migration(&plan).unwrap();
+        assert!(target.confirm_migration(&plan).unwrap());
+        let moved = target
+            .migration_target_snapshot("default", "/x")
+            .unwrap()
+            .worktree
+            .unwrap();
+        assert_eq!(moved.sandbox_profile.as_deref(), Some("sealed"));
+    }
+
+    #[test]
+    fn import_aborts_when_a_conflicting_pin_registration_appears_after_planning() {
+        let source = Db::open_memory().unwrap();
+        let target = Db::open_memory().unwrap();
+        source
+            .conn()
+            .execute_batch(
+                "INSERT INTO worktrees
+                   (worktree,session_name,tab_name,repo_path,branch,agent,created_at,location,position,sandbox_profile)
+                 VALUES('/race','default','tab','/repo','feature','agent',1,'',3,'sealed');
+                 INSERT INTO tab_groups(session_name,name,kind,worktree,ordinal,active_tab)
+                 VALUES('default','race','worktree','/race',0,0);",
+            )
+            .unwrap();
+        let bundle = source
+            .migration_snapshot("default", "target", "default", "/race")
+            .unwrap();
+        // Plan against an empty target: no conflict yet.
+        let plan = plan_migration(
+            bundle,
+            target
+                .migration_target_snapshot("default", "/race")
+                .unwrap(),
+            HistoryPolicy::Include,
+        )
+        .unwrap();
+        // A registration with a different pin lands before the import runs.
+        target
+            .conn()
+            .execute(
+                "INSERT INTO worktrees(worktree,session_name,tab_name,repo_path,branch,agent,created_at,location,position)
+                 VALUES('/race','default','tab','/repo','feature','agent',1,'',3)",
+                [],
+            )
+            .unwrap();
+
+        assert!(target.import_migration(&plan).is_err());
+        let state = target
+            .migration_target_snapshot("default", "/race")
+            .unwrap();
+        assert!(state.groups.is_empty(), "a refused import writes nothing");
+        assert_eq!(state.worktree.unwrap().sandbox_profile, None);
     }
 
     #[test]
