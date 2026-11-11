@@ -233,8 +233,9 @@ impl SessionMigrationStore for Db {
                 db.conn().execute(
                     "INSERT INTO agent_dispatches
                        (issue_id,worktree_path,agent_name,dispatched_at_ms,status,stage,
-                        parent_id,session_id,artifact_path,note,chunk_path,report,chunk_scope)
-                     VALUES (?1,?2,?3,?4,?5,?6,NULL,NULL,?7,?8,?9,?10,?11)",
+                        parent_id,session_id,artifact_path,note,chunk_path,report,chunk_scope,
+                        dispatch_kind)
+                     VALUES (?1,?2,?3,?4,?5,?6,NULL,NULL,?7,?8,?9,?10,?11,?12)",
                     params![
                         dispatch.issue_id,
                         dispatch.worktree_path,
@@ -247,6 +248,10 @@ impl SessionMigrationStore for Db {
                         row.chunk_path,
                         row.report,
                         row.chunk_scope,
+                        crate::pipeline_run::classify_dispatch_kind(
+                            row.stage.as_deref(),
+                            row.artifact_path.as_deref(),
+                        ),
                     ],
                 )?;
                 result
@@ -1378,5 +1383,57 @@ mod tests {
             MigrationCounts::default()
         );
         source.cleanup_migration(&bundle).unwrap();
+    }
+
+    /// Imports one source dispatch row (raw INSERT of `columns`/`values`) and
+    /// returns the target row's `dispatch_kind`.
+    fn imported_dispatch_kind(columns: &str, values: &str) -> Option<String> {
+        let source = Db::open_memory().unwrap();
+        let target = Db::open_memory().unwrap();
+        source
+            .conn()
+            .execute(
+                &format!(
+                    "INSERT INTO agent_dispatches
+                       (issue_id,worktree_path,agent_name,dispatched_at_ms,status{columns})
+                     VALUES('THE-1935','/park','agent',1,'done'{values})"
+                ),
+                [],
+            )
+            .unwrap();
+        let bundle = source
+            .migration_snapshot("default", "target", "default", "/park")
+            .unwrap();
+        let plan = plan_migration(
+            bundle,
+            target
+                .migration_target_snapshot("default", "/park")
+                .unwrap(),
+            HistoryPolicy::Include,
+        )
+        .unwrap();
+        target.import_migration(&plan).unwrap();
+        target
+            .conn()
+            .query_row(
+                "SELECT dispatch_kind FROM agent_dispatches WHERE issue_id='THE-1935'",
+                [],
+                |r| r.get::<_, Option<String>>(0),
+            )
+            .unwrap()
+    }
+
+    #[test]
+    fn import_stage_row_without_artifact_is_legacy_held_dispatch_kind() {
+        // Source artifact paths are dropped on import, so a stage row lands
+        // with no artifact: it must be held, never assumed plain.
+        let kind = imported_dispatch_kind(",stage", ",'review'");
+        assert_eq!(kind.as_deref(), Some("legacy_held"));
+    }
+
+    #[test]
+    fn import_plain_row_gets_plain_dispatch_kind() {
+        let kind = imported_dispatch_kind("", "");
+        assert_eq!(kind.as_deref(), Some("plain"));
     }
 }
