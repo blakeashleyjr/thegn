@@ -74,12 +74,10 @@ pub fn install(cfg: &Config) {
         tracing::error!(target: "thegn::automation", "failed to build automation runtime");
         return;
     };
-    let spawn = std::thread::Builder::new()
-        .name("thegn-automate".into())
-        .spawn(move || {
-            crate::platform::qos::set_self(crate::platform::qos::Qos::Utility);
-            rt.block_on(run(rx, cfg, rules, thread_cfg));
-        });
+    let spawn = thegn_core::thread_name::try_spawn_named("thegn-automate", move || {
+        crate::platform::qos::set_self(crate::platform::qos::Qos::Utility);
+        rt.block_on(run(rx, cfg, rules, thread_cfg));
+    });
     match spawn {
         Ok(_) => *slot.lock().expect("automation sender lock") = Some(tx),
         Err(error) => tracing::error!(
@@ -146,37 +144,35 @@ fn pending_done() {
 }
 
 fn audit_dropped(event: AutomationEvent) -> Option<std::thread::JoinHandle<anyhow::Result<()>>> {
-    std::thread::Builder::new()
-        .name("thegn-auto-drop".into())
-        .spawn(move || -> anyhow::Result<()> {
-            let result = (|| -> anyhow::Result<()> {
-                let db = thegn_core::db::Db::open()?;
-                let now = thegn_core::util::now();
-                let id = db.start_automation_run(&NewAutomationRun {
-                    rule_id: "__queue__".into(),
-                    event_id: event.id,
-                    event_key: event.key.0,
-                    trigger_kind: event.kind.as_str().into(),
-                    event_summary: bounded(event.message.as_deref().unwrap_or_default()),
-                    action_cap: String::new(),
-                    action_summary: String::new(),
-                    started_at: now,
-                })?;
-                db.finish_automation_run(id, "dropped", Some("queue_overflow"), None, now)?;
-                Ok(())
-            })();
-            if let Err(error) = &result {
-                tracing::warn!(
-                    target: "thegn::automation",
-                    %error,
-                    outcome = "dropped",
-                    "failed to persist queue-overflow audit"
-                );
-            }
-            pending_done();
-            result
-        })
-        .ok()
+    thegn_core::thread_name::try_spawn_named("thegn-auto-drop", move || -> anyhow::Result<()> {
+        let result = (|| -> anyhow::Result<()> {
+            let db = thegn_core::db::Db::open()?;
+            let now = thegn_core::util::now();
+            let id = db.start_automation_run(&NewAutomationRun {
+                rule_id: "__queue__".into(),
+                event_id: event.id,
+                event_key: event.key.0,
+                trigger_kind: event.kind.as_str().into(),
+                event_summary: bounded(event.message.as_deref().unwrap_or_default()),
+                action_cap: String::new(),
+                action_summary: String::new(),
+                started_at: now,
+            })?;
+            db.finish_automation_run(id, "dropped", Some("queue_overflow"), None, now)?;
+            Ok(())
+        })();
+        if let Err(error) = &result {
+            tracing::warn!(
+                target: "thegn::automation",
+                %error,
+                outcome = "dropped",
+                "failed to persist queue-overflow audit"
+            );
+        }
+        pending_done();
+        result
+    })
+    .ok()
 }
 
 async fn run(
