@@ -7,6 +7,8 @@ All notable changes to **thegn** are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.1.0-alpha.59] — 2026-11-11
+
 ## [0.1.0-alpha.58] — 2026-11-10
 
 ### Added
@@ -3012,7 +3014,8 @@ launcher picker and the merge queue's `agent_command` hook remain — they run
 whatever commands you configure. Leftover `[llm_proxy]` config sections and
 `proxy_*` tables in existing state databases are ignored harmlessly.
 
-[Unreleased]: https://github.com/blakeashleyjr/thegn/compare/v0.1.0-alpha.58...HEAD
+[Unreleased]: https://github.com/blakeashleyjr/thegn/compare/v0.1.0-alpha.59...HEAD
+[0.1.0-alpha.59]: https://github.com/blakeashleyjr/thegn/compare/v0.1.0-alpha.58...v0.1.0-alpha.59
 [0.1.0-alpha.58]: https://github.com/blakeashleyjr/thegn/compare/v0.1.0-alpha.57...v0.1.0-alpha.58
 [0.1.0-alpha.57]: https://github.com/blakeashleyjr/thegn/compare/v0.1.0-alpha.56...v0.1.0-alpha.57
 [0.1.0-alpha.56]: https://github.com/blakeashleyjr/thegn/compare/v0.1.0-alpha.55...v0.1.0-alpha.56
