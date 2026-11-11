@@ -459,6 +459,25 @@ impl std::fmt::Display for DoneEvidenceChanged {
 
 impl std::error::Error for DoneEvidenceChanged {}
 
+/// The run was republished while its report was being filed, so the report
+/// belongs to a superseded run and was not stored.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReportRunChanged {
+    pub id: i64,
+}
+
+impl std::fmt::Display for ReportRunChanged {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "dispatch {} was republished while its report was being filed; re-run the work or re-file the report for the current run",
+            self.id
+        )
+    }
+}
+
+impl std::error::Error for ReportRunChanged {}
+
 fn read_done_fence(conn: &rusqlite::Connection, id: i64) -> Result<Option<DoneFence>> {
     Ok(conn
         .query_row(
@@ -1302,6 +1321,31 @@ impl Db {
             "UPDATE agent_dispatches SET report=?1, report_head_oid=?2 WHERE id=?3",
             rusqlite::params![text, head_oid, id],
         )?;
+        Ok(())
+    }
+
+    /// Store a report only if the row is still the run (`run_gen` + session)
+    /// the caller observed. A republish in between (which bumps `run_gen` and
+    /// clears the HEAD binding) fails with [`ReportRunChanged`] instead of
+    /// letting the old run's report land on the new run.
+    pub fn set_dispatch_report_for_run(
+        &self,
+        run: &crate::issue::DispatchRunRef,
+        text: &str,
+        head_oid: Option<&str>,
+    ) -> Result<()> {
+        let text = crate::pipeline_report::report_text(text).map_err(|e| anyhow::anyhow!("{e}"))?;
+        let changed = self.conn().execute(
+            "UPDATE agent_dispatches SET report=?1, report_head_oid=?2 \
+             WHERE id=?3 AND run_gen=?4 AND COALESCE(session_id,'')=?5",
+            rusqlite::params![text, head_oid, run.id, run.run_gen, run.session_id],
+        )?;
+        if changed == 0 {
+            if self.get_dispatch(run.id)?.is_none() {
+                anyhow::bail!("roster row {} does not exist", run.id);
+            }
+            return Err(anyhow::Error::new(ReportRunChanged { id: run.id }));
+        }
         Ok(())
     }
 
@@ -7505,5 +7549,77 @@ mod tests {
             db.stamp_dispatch_exit(&missing, Some(1)).unwrap(),
             ExitStamp::Missing
         );
+    }
+
+    fn report_fence_running_row(db: &Db, issue: &str) -> i64 {
+        use crate::store::NotificationStore;
+        let id = put_row(db, issue, "/wt/report-fence");
+        db.update_dispatch_status(id, AgentDispatchStatus::Running)
+            .unwrap();
+        id
+    }
+
+    #[test]
+    fn report_fence_writes_when_the_run_is_unchanged() {
+        let (db, _dir) = temp_db();
+        let id = report_fence_running_row(&db, "linear:FENCE-OK");
+        let run = db.dispatch_run_ref(id).unwrap().unwrap();
+        db.set_dispatch_report_for_run(&run, "PASS\ngate: x", Some("abc"))
+            .unwrap();
+        let stored = db.get_dispatch(id).unwrap().unwrap();
+        assert_eq!(stored.report.as_deref(), Some("PASS\ngate: x"));
+        assert_eq!(db.dispatch_report_head(id).unwrap(), Some("abc".into()));
+    }
+
+    #[test]
+    fn report_fence_refuses_a_republished_run_and_leaves_the_report_unchanged() {
+        let (db, _dir) = temp_db();
+        let id = report_fence_running_row(&db, "linear:FENCE-REPUB");
+        db.set_dispatch_report(id, "old report").unwrap();
+        let run = db.dispatch_run_ref(id).unwrap().unwrap();
+        assert!(db.bind_dispatch_session(id, "sess-new").unwrap());
+        let error = db
+            .set_dispatch_report_for_run(&run, "stale run report", Some("def"))
+            .unwrap_err();
+        assert_eq!(
+            error.downcast_ref::<ReportRunChanged>(),
+            Some(&ReportRunChanged { id })
+        );
+        let stored = db.get_dispatch(id).unwrap().unwrap();
+        assert_eq!(stored.report.as_deref(), Some("old report"));
+        assert_ne!(db.dispatch_report_head(id).unwrap(), Some("def".into()));
+    }
+
+    #[test]
+    fn report_fence_refuses_a_changed_session_with_the_same_run_gen() {
+        let (db, _dir) = temp_db();
+        let id = report_fence_running_row(&db, "linear:FENCE-SESSION");
+        let run = db.dispatch_run_ref(id).unwrap().unwrap();
+        db.conn()
+            .execute(
+                "UPDATE agent_dispatches SET session_id='other' WHERE id=?1",
+                [id],
+            )
+            .unwrap();
+        let error = db
+            .set_dispatch_report_for_run(&run, "PASS\ngate: x", None)
+            .unwrap_err();
+        assert!(error.downcast_ref::<ReportRunChanged>().is_some());
+    }
+
+    #[test]
+    fn report_fence_missing_row_keeps_the_existing_message() {
+        let (db, _dir) = temp_db();
+        let run = crate::issue::DispatchRunRef {
+            id: 99_999,
+            issue_id: "linear:X".into(),
+            session_id: String::new(),
+            run_gen: 0,
+        };
+        let error = db
+            .set_dispatch_report_for_run(&run, "PASS\ngate: x", None)
+            .unwrap_err();
+        assert!(error.to_string().contains("does not exist"), "{error}");
+        assert!(error.downcast_ref::<ReportRunChanged>().is_none());
     }
 }
