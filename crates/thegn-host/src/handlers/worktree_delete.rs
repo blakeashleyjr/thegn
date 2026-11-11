@@ -192,6 +192,11 @@ pub(crate) fn perform_close(cx: &mut DeleteCtx<'_>, targets: Vec<usize>) {
     if active_removed {
         landing.land(cx.session);
     }
+    // A worktree re-created at an old path must not inherit its drawer panes.
+    for path in &removed_paths {
+        cx.drawer_runtime
+            .forget_worktree(std::path::Path::new(path), cx.panes);
+    }
 
     cx.model
         .panel
