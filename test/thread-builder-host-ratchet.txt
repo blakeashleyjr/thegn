@@ -4,17 +4,13 @@
 
 automation_runtime.rs
 db_task.rs
-devcontainer_startup.rs
-diff_watch.rs
 frame_writer.rs
 gate_capture.rs
 handlers/startup.rs
-hydrate_refresh_ticker.rs
 lsp.rs
 managed_tool.rs
 mcp_proxy/upstream.rs
 measure/mod.rs
-mise_provider.rs
 model_proxy_daemon.rs
 monitor.rs
 pane_pty.rs
