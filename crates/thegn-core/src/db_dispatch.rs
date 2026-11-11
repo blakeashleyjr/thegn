@@ -405,6 +405,86 @@ impl std::fmt::Display for DispatchTransitionConflict {
 
 impl std::error::Error for DispatchTransitionConflict {}
 
+/// Snapshot of the columns the done gate reads. Captured before the gate runs
+/// and re-compared inside the status write's transaction, so a run republish,
+/// report re-file or artifact change after the gate cannot ride on a
+/// status-only compare-and-set.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DoneFence {
+    pub run: crate::issue::DispatchRunRef,
+    pub stage: Option<String>,
+    pub artifact_path: Option<String>,
+    pub report: Option<String>,
+    pub report_head_oid: Option<String>,
+    pub dispatch_kind: Option<String>,
+}
+
+impl DoneFence {
+    /// The first field that differs from `now`, in gate-significance order.
+    fn first_difference(&self, now: &DoneFence) -> Option<&'static str> {
+        if self.run != now.run {
+            Some("run")
+        } else if self.stage != now.stage {
+            Some("stage")
+        } else if self.artifact_path != now.artifact_path {
+            Some("artifact_path")
+        } else if self.report != now.report {
+            Some("report")
+        } else if self.report_head_oid != now.report_head_oid {
+            Some("report_head_oid")
+        } else if self.dispatch_kind != now.dispatch_kind {
+            Some("dispatch_kind")
+        } else {
+            None
+        }
+    }
+}
+
+/// The evidence the done gate checked changed before the status write landed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DoneEvidenceChanged {
+    pub id: i64,
+    pub field: &'static str,
+}
+
+impl std::fmt::Display for DoneEvidenceChanged {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "dispatch {} changed ({}) after the done gate ran; re-run `thegn dispatch verify {}` and retry",
+            self.id, self.field, self.id
+        )
+    }
+}
+
+impl std::error::Error for DoneEvidenceChanged {}
+
+fn read_done_fence(conn: &rusqlite::Connection, id: i64) -> Result<Option<DoneFence>> {
+    Ok(conn
+        .query_row(
+            "SELECT id, issue_id, COALESCE(session_id,''), run_gen, stage, artifact_path, \
+                    report, report_head_oid, dispatch_kind \
+             FROM agent_dispatches WHERE id=?1",
+            [id],
+            |r| {
+                Ok(DoneFence {
+                    run: crate::issue::DispatchRunRef {
+                        id: r.get(0)?,
+                        issue_id: r.get(1)?,
+                        session_id: r.get(2)?,
+                        run_gen: r.get(3)?,
+                    },
+                    stage: r.get(4)?,
+                    artifact_path: r.get(5)?,
+                    report: r.get(6)?,
+                    report_head_oid: r.get(7)?,
+                    dispatch_kind: r.get(8)?,
+                })
+            },
+        )
+        .optional()?)
+}
+
 /// A dispatch row required by an operation was not present.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct MissingDispatch {
@@ -499,6 +579,43 @@ impl Db {
         note: Option<&str>,
         proof: LeadProof<'_>,
     ) -> Result<()> {
+        self.set_dispatch_status_inner(id, expected, to, note, proof, None)
+    }
+
+    /// Snapshot the evidence the done gate reads; `None` when the row is gone.
+    pub fn done_fence(&self, id: i64) -> Result<Option<DoneFence>> {
+        read_done_fence(self.conn(), id)
+    }
+
+    /// Mark a row done, refusing (typed [`DoneEvidenceChanged`]) when any
+    /// column in `fence` differs inside the write transaction.
+    pub fn set_dispatch_done_fenced(
+        &self,
+        id: i64,
+        expected: AgentDispatchStatus,
+        fence: &DoneFence,
+        note: Option<&str>,
+        proof: LeadProof<'_>,
+    ) -> Result<()> {
+        self.set_dispatch_status_inner(
+            id,
+            expected,
+            AgentDispatchStatus::Done,
+            note,
+            proof,
+            Some(fence),
+        )
+    }
+
+    fn set_dispatch_status_inner(
+        &self,
+        id: i64,
+        expected: AgentDispatchStatus,
+        to: AgentDispatchStatus,
+        note: Option<&str>,
+        proof: LeadProof<'_>,
+        fence: Option<&DoneFence>,
+    ) -> Result<()> {
         if self.get_dispatch(id)?.is_none() {
             return Err(anyhow::Error::new(MissingDispatch { id }));
         }
@@ -526,6 +643,13 @@ impl Db {
                 .flatten();
             let bound = bound.into_iter().collect::<Vec<_>>();
             let audit = lead_check(conn, &bound, proof, util::now_ms())?;
+            if let Some(fence) = fence {
+                let now = read_done_fence(conn, id)?
+                    .ok_or_else(|| anyhow::Error::new(MissingDispatch { id }))?;
+                if let Some(field) = fence.first_difference(&now) {
+                    return Err(anyhow::Error::new(DoneEvidenceChanged { id, field }));
+                }
+            }
             let changed = if expected == AgentDispatchStatus::Unknown {
                 conn.execute("UPDATE agent_dispatches SET status=?1 WHERE id=?2 AND trim(status) NOT IN (?3,?4,?5,?6,?7,?8,?9,?10,?11)", rusqlite::params![to.as_str(), id, AgentDispatchStatus::Queued.as_str(), AgentDispatchStatus::Spawning.as_str(), AgentDispatchStatus::Running.as_str(), AgentDispatchStatus::WaitingHuman.as_str(), AgentDispatchStatus::PrOpen.as_str(), AgentDispatchStatus::Merged.as_str(), AgentDispatchStatus::Abandoned.as_str(), AgentDispatchStatus::Done.as_str(), AgentDispatchStatus::Failed.as_str()])?
             } else {
@@ -3915,6 +4039,114 @@ mod tests {
         assert_eq!(db.dispatch_kind(stage).unwrap().as_deref(), Some("stage"));
         assert_eq!(db.dispatch_kind(plain).unwrap().as_deref(), Some("plain"));
         assert_eq!(db.dispatch_kind(i64::MAX).unwrap(), None);
+    }
+
+    fn running_row_with_fence(issue: &str) -> (Db, tempfile::TempDir, i64, DoneFence) {
+        let (db, dir) = temp_db();
+        let id = put_row(&db, issue, "/wt/fence");
+        db.update_dispatch_status(id, AgentDispatchStatus::Running)
+            .unwrap();
+        let fence = db.done_fence(id).unwrap().unwrap();
+        (db, dir, id, fence)
+    }
+
+    fn assert_fence_refused(db: &Db, id: i64, fence: &DoneFence, field: &'static str) {
+        let err = db
+            .set_dispatch_done_fenced(
+                id,
+                AgentDispatchStatus::Running,
+                fence,
+                None,
+                LeadProof::Unbound,
+            )
+            .unwrap_err();
+        assert_eq!(
+            err.downcast_ref::<DoneEvidenceChanged>(),
+            Some(&DoneEvidenceChanged { id, field })
+        );
+        assert_eq!(
+            db.get_dispatch(id).unwrap().unwrap().status,
+            AgentDispatchStatus::Running
+        );
+    }
+
+    #[test]
+    fn done_fence_refuses_a_republished_run_and_leaves_status_unchanged() {
+        let (db, _dir, id, fence) = running_row_with_fence("linear:FENCE-RUN");
+        assert!(db.bind_dispatch_session(id, "sess-new").unwrap());
+        assert_fence_refused(&db, id, &fence, "run");
+    }
+
+    #[test]
+    fn done_fence_refuses_a_report_edited_after_the_gate() {
+        let (db, _dir, id, fence) = running_row_with_fence("linear:FENCE-REPORT");
+        db.set_dispatch_report(id, "PASS: changed").unwrap();
+        assert_fence_refused(&db, id, &fence, "report");
+    }
+
+    #[test]
+    fn done_fence_refuses_an_artifact_stamped_after_the_gate() {
+        let (db, _dir) = temp_db();
+        let id = db
+            .put_agent_dispatch(crate::issue::NewDispatch {
+                stage: Some("code"),
+                ..crate::issue::NewDispatch::new("linear:FENCE-ART", "/wt/fence", "coder")
+            })
+            .unwrap();
+        db.update_dispatch_status(id, AgentDispatchStatus::Running)
+            .unwrap();
+        let fence = db.done_fence(id).unwrap().unwrap();
+        db.conn()
+            .execute(
+                "UPDATE agent_dispatches SET artifact_path='other.md' WHERE id=?1",
+                [id],
+            )
+            .unwrap();
+        assert_fence_refused(&db, id, &fence, "artifact_path");
+    }
+
+    #[test]
+    fn done_fence_accepts_an_unchanged_row_and_commits_done() {
+        let (db, _dir, id, fence) = running_row_with_fence("linear:FENCE-OK");
+        db.set_dispatch_done_fenced(
+            id,
+            AgentDispatchStatus::Running,
+            &fence,
+            Some("set-status done: ok"),
+            LeadProof::Unbound,
+        )
+        .unwrap();
+        assert_eq!(
+            db.get_dispatch(id).unwrap().unwrap().status,
+            AgentDispatchStatus::Done
+        );
+        let notes = db.dispatch_notes(id, None, 0).unwrap();
+        assert!(notes.iter().any(|n| n.text.contains("set-status done: ok")));
+    }
+
+    #[test]
+    fn done_fence_composes_with_the_status_cas() {
+        let (db, _dir, id, fence) = running_row_with_fence("linear:FENCE-CAS");
+        db.set_dispatch_status_checked(
+            id,
+            AgentDispatchStatus::Running,
+            AgentDispatchStatus::Abandoned,
+            None,
+        )
+        .unwrap();
+        let err = db
+            .set_dispatch_done_fenced(
+                id,
+                AgentDispatchStatus::Running,
+                &fence,
+                None,
+                LeadProof::Unbound,
+            )
+            .unwrap_err();
+        assert!(matches!(
+            err.downcast_ref::<DispatchTransitionConflict>(),
+            Some(DispatchTransitionConflict::Stale { .. })
+        ));
     }
 
     #[test]
