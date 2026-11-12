@@ -490,7 +490,7 @@ silently not applied: `[sandbox]` (and everything nested under it),
 `[identities]`, `[hooks]`, `[lifecycle]`, `[env.*]`, `[host.*]`,
 `[host_discovery]`, `[placement]`, `[plugins]`, `[automations]`,
 `[pipeline]`, `[autopilot]`, `[daemon]`, `[serve]`, `[share]`, `[forward]`,
-`[forges]`, `[git]`, `[editor]`, `[lsp]`, `[metrics]`, `[notifications]`,
+`[forges]`, `[git]`, `[editor]`, `[lsp]`, `[semantic]`, `[metrics]`, `[notifications]`,
 `[clipboard]`, `[apps]`, `[skills]`, `[tasks]`, `[toolchain]`, `[limits]`,
 `[presets]`, `[profiles]`, `[worktree_templates]`, `[watch]`, `[ci]`,
 `[pr]`, `[issues]`, `[model_proxy]`, `[mcp]`, `[mcp_proxy]`,
@@ -597,6 +597,12 @@ the `preview.allow_external_urls` SSRF security opt-in are not exposed.
 The `[lsp]` scalar keys are exposed as `lspEnabled`, `lspHover` and
 `lspRequireContainment`. The `lsp.servers` registry entries are not exposed
 because they carry executable commands.
+
+The `[semantic]` scalar keys are exposed as `semanticWorktreeIndex`,
+`semanticIndexMaxFiles` and `semanticMapBudgetLines`.
+
+The `[log]` scalar keys are exposed as `rotationSizeMb`, `maxFiles`,
+`stderrCapMb`, `level`, `file`, `dir` and `format` under the `log` option.
 
 The `[usage]` scalar keys are exposed as `usageEnabled`, `usageStatusbar`,
 `usageDiscoverProfiles`, `usageTokenRollups`, `usageHistoryDays` and

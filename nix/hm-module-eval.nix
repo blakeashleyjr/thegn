@@ -211,6 +211,9 @@
           lspEnabled = false;
           lspHover = false;
           lspRequireContainment = true;
+          semanticWorktreeIndex = false;
+          semanticIndexMaxFiles = 7000;
+          semanticMapBudgetLines = 500;
           hostDiscoveryTailnetEnabled = true;
           hostDiscoveryTailnetOnlineOnly = false;
           agents = [
@@ -233,6 +236,7 @@
             dir = "/tmp/thegn-hm/logs";
             rotationSizeMb = 8;
             maxFiles = 4;
+            stderrCapMb = 12;
             format = "text";
           };
           keybinds = {new-worktree = "Ctrl w";};
@@ -294,6 +298,8 @@
   oversizedPreviewMaxBodyBytes = evalWithOptions {previewMaxBodyBytes = 16777217;};
   undersizedUsagePollInterval = evalWithOptions {usagePollIntervalSecs = 59;};
   oversizedUsageHistoryDays = evalWithOptions {usageHistoryDays = 3651;};
+  zeroSemanticIndexMaxFiles = evalWithOptions {semanticIndexMaxFiles = 0;};
+  zeroSemanticMapBudgetLines = evalWithOptions {semanticMapBudgetLines = 0;};
 
   minimalConfig = minimal.config.xdg.configFile."thegn/config.toml".source;
   maximalConfig = maximal.config.xdg.configFile."thegn/config.toml".source;
@@ -304,6 +310,8 @@ in
   assert !(builtins.tryEval (builtins.deepSeq oversizedPreviewMaxBodyBytes.config.programs.thegn.previewMaxBodyBytes true)).success;
   assert !(builtins.tryEval (builtins.deepSeq undersizedUsagePollInterval.config.programs.thegn.usagePollIntervalSecs true)).success;
   assert !(builtins.tryEval (builtins.deepSeq oversizedUsageHistoryDays.config.programs.thegn.usageHistoryDays true)).success;
+  assert !(builtins.tryEval (builtins.deepSeq zeroSemanticIndexMaxFiles.config.programs.thegn.semanticIndexMaxFiles true)).success;
+  assert !(builtins.tryEval (builtins.deepSeq zeroSemanticMapBudgetLines.config.programs.thegn.semanticMapBudgetLines true)).success;
   assert minimal.config.home.packages == [thegn];
   assert maximal.config.home.packages == [thegn];
     pkgs.runCommand "thegn-hm-module-eval" {} ''
