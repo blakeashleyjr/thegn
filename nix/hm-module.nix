@@ -382,6 +382,9 @@ self: {
     usage.token_rollups = cfg.usageTokenRollups;
     usage.history_days = cfg.usageHistoryDays;
     usage.poll_interval_secs = cfg.usagePollIntervalSecs;
+    lsp.enabled = cfg.lspEnabled;
+    lsp.hover = cfg.lspHover;
+    lsp.require_containment = cfg.lspRequireContainment;
     host_discovery.tailnet.enabled = cfg.hostDiscoveryTailnetEnabled;
     host_discovery.tailnet.online_only = cfg.hostDiscoveryTailnetOnlineOnly;
     log = {
@@ -1424,6 +1427,24 @@ in {
       type = lib.types.nullOr (lib.types.ints.between 60 2678400);
       default = null;
       description = "Usage polling cadence in seconds (minimum 60). Unset (null) = the binary's default.";
+    };
+
+    lspEnabled = lib.mkOption {
+      type = lib.types.nullOr (lib.types.bool);
+      default = null;
+      description = "Enable language-server integration. Unset (null) = the binary's default.";
+    };
+
+    lspHover = lib.mkOption {
+      type = lib.types.nullOr (lib.types.bool);
+      default = null;
+      description = "Show language-server hover and signature previews. Unset (null) = the binary's default.";
+    };
+
+    lspRequireContainment = lib.mkOption {
+      type = lib.types.nullOr (lib.types.bool);
+      default = null;
+      description = "Refuse language servers that cannot join the shared resource slice. Unset (null) = the binary's default.";
     };
 
     hostDiscoveryTailnetEnabled = lib.mkOption {
