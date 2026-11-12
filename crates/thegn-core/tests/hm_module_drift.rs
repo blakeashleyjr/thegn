@@ -60,18 +60,6 @@ const OMITTED: &[(&str, &str)] = &[
         "refresh-rate list needs float list pinning and is not exposed",
     ),
     (
-        "stats.battery_warn",
-        "u8 threshold needs byte-range pinning and is not exposed",
-    ),
-    (
-        "stats.disk_free_warn",
-        "u8 threshold needs byte-range pinning and is not exposed",
-    ),
-    (
-        "stats.disk_free_critical",
-        "u8 threshold needs byte-range pinning and is not exposed",
-    ),
-    (
         "stats.alerts",
         "threshold alerts are a nested table and are not exposed",
     ),
@@ -1067,13 +1055,18 @@ fn hm_git_and_stats_families_are_rendered() {
         "git.submodules",
         "stats.refresh_secs",
         "stats.refresh_rates",
-        "stats.battery_warn",
-        "stats.disk_free_warn",
-        "stats.disk_free_critical",
         "stats.alerts",
         "stats.net_icons",
     ] {
         assert!(schema_has_path(path), "omission must stay pinned: {path}");
+    }
+
+    for path in [
+        "stats.battery_warn",
+        "stats.disk_free_warn",
+        "stats.disk_free_critical",
+    ] {
+        assert!(rendered.contains(path), "Home Manager must render {path}");
     }
 }
 
@@ -1592,6 +1585,9 @@ fn every_numeric_option_matches_its_destination_range() {
         ("usagePollIntervalSecs", "usage.poll_interval_secs"),
         ("semanticIndexMaxFiles", "semantic.index_max_files"),
         ("semanticMapBudgetLines", "semantic.map_budget_lines"),
+        ("statsBatteryWarn", "stats.battery_warn"),
+        ("statsDiskFreeWarn", "stats.disk_free_warn"),
+        ("statsDiskFreeCritical", "stats.disk_free_critical"),
         ("stderrCapMb", "log.stderr_cap_mb"),
     ];
     let options = numeric_options(&module_src());
