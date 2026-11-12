@@ -447,16 +447,25 @@ pub(crate) fn write_state_file(path: &std::path::Path, value: &str) {
         tracing::debug!(path = %path.display(), "state file has no UTF-8 file name");
         return;
     };
-    if let Err(error) = thegn_core::fsperm::ensure_private_dir(parent) {
-        tracing::debug!(%error, path = %path.display(), "state file parent is not a private directory");
+    let Some(anchor) = parent.parent() else {
         return;
+    };
+    let Some(rel) = parent.file_name() else {
+        return;
+    };
+    if !anchor.exists() {
+        if let Err(error) = thegn_core::fsperm::ensure_private_dir(anchor) {
+            tracing::debug!(%error, path = %path.display(), "state file anchor is not a private directory");
+            return;
+        }
     }
-    // Publish through the held directory handle, not a path that re-resolves
-    // the parent (THE-523 / fsperm path-write ratchet).
-    let dir = match thegn_core::fsperm::open_private_dir(parent) {
+    let dir = match thegn_core::fsperm::ensure_private_dir_beneath(
+        anchor,
+        std::path::Path::new(rel),
+    ) {
         Ok(dir) => dir,
         Err(error) => {
-            tracing::debug!(%error, path = %path.display(), "state file parent could not be opened");
+            tracing::debug!(%error, path = %path.display(), "state file parent is not a private directory");
             return;
         }
     };
@@ -766,6 +775,22 @@ mod state_file_tests {
         write_state_file(&path, "v");
         assert_eq!(std::fs::read_to_string(&path).unwrap(), "v");
         assert!(owner_only(&loose, 0o700));
+    }
+
+    #[test]
+    fn write_state_file_refuses_a_symlinked_parent_directory() {
+        if !test_symlink_supported() {
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("target");
+        let leaf = dir.path().join("leaf");
+        std::fs::create_dir(&target).unwrap();
+        test_symlink(&target, &leaf).unwrap();
+
+        write_state_file(&leaf.join("state"), "must-not-escape");
+
+        assert_eq!(std::fs::read_dir(&target).unwrap().count(), 0);
     }
 
     #[test]
