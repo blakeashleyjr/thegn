@@ -47,6 +47,23 @@ artifact target into the stage prompt, with the source artifact and
 git status/diff-stat facts carried as bounded, untrusted recovery data (prior
 terminal output is not replayed).
 
+`session open --track <issue>` is the plain-open path for an ad-hoc worker. It
+requires `--worktree`, opens the session first, then records a roster row for
+the supplied issue id (for example, `linear:THE-1976`); the row is visible to
+`dispatch list`, `dispatch wait` and `dispatch verify`. For a lane without an
+issue, `session open --brief-file F [--vars key=value]` reads the prompt from a
+file; repeatable `--vars` bindings render `{key}` placeholders in that file.
+`--brief-file` and `--vars` are for plain opens and cannot be combined with
+`--prompt`, `--issue` or `--resume-work`; `--vars` requires `--brief-file`.
+
+The daemon session controls accept either a positional session id or the
+existing `--session` spelling: `session snapshot [SESSION]`, `session attach
+[SESSION]`, and `session wait [SESSION]`. `snapshot` emits the raw ANSI screen
+by default, or plain rows with `--text` and geometry plus base64 ANSI with
+`--json`; `attach` streams live output until Ctrl-C without stopping the
+session. `wait` accepts `--until exited|idle|blocked|done|match:<regex>` and
+optional `--timeout <ms>`; a timeout exits 2.
+
 `session fork <id>` asks the daemon to start a new PTY from a live session.
 Use `--scrollback` for a bounded handoff, `--tab` for a new tab, and
 `--fork-worktree` to create a separate worktree first. `--json` includes the
@@ -130,6 +147,12 @@ Inspect it with `thegn sandbox profile show`; change it with
 `wt rm` runs provider/sandbox teardown synchronously, then
 `git worktree remove`, then cleans every DB row (including tab groups, so a
 removed worktree is never resurrected at the next launch).
+
+`wt new --batch FILE` creates one lane for each non-comment, non-blank line in
+the file. Each line is `<name>` or `<name> <base>`; a per-line base overrides
+the shared `--base`. The complete file is validated before the first checkout.
+The batch form accepts the usual `--repo`, `--env`, `--isolation`,
+`--exact-branch`, `--folder` and `--json` options.
 
 ## Embedded and configured skills (`skills`)
 
