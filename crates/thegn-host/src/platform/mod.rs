@@ -439,6 +439,7 @@ pub(crate) fn open_read_nonblocking_nofollow(
 /// and a symlinked parent is refused.
 pub(crate) fn write_state_file(path: &std::path::Path, value: &str) {
     let Some(parent) = path.parent() else {
+        tracing::debug!(path = %path.display(), "state file has no parent directory");
         return;
     };
     #[cfg(test)]
@@ -448,9 +449,11 @@ pub(crate) fn write_state_file(path: &std::path::Path, value: &str) {
         return;
     };
     let Some(anchor) = parent.parent() else {
+        tracing::debug!(path = %path.display(), "state file parent has no trusted anchor");
         return;
     };
     let Some(rel) = parent.file_name() else {
+        tracing::debug!(path = %path.display(), "state file parent has no directory name");
         return;
     };
     if !anchor.exists() {
@@ -743,6 +746,22 @@ impl InterruptGuard {
 #[cfg(test)]
 mod state_file_tests {
     use super::{test_symlink, test_symlink_supported, write_state_file};
+    use std::io::Write;
+    use std::sync::{Arc, Mutex};
+
+    #[derive(Clone, Default)]
+    struct Capture(Arc<Mutex<Vec<u8>>>);
+
+    impl Write for Capture {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
 
     fn owner_only(path: &std::path::Path, want: u32) -> bool {
         // `None` on platforms without mode bits (Windows uses a DACL).
@@ -777,6 +796,29 @@ mod state_file_tests {
         assert!(owner_only(&loose, 0o700));
     }
 
+    #[test]
+    fn write_state_file_logs_unanchored_path_refusals() {
+        let capture = Capture::default();
+        let writer = capture.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .with_max_level(tracing::Level::DEBUG)
+            .without_time()
+            .with_ansi(false)
+            .with_writer(move || writer.clone())
+            .finish();
+
+        tracing::subscriber::with_default(subscriber, || {
+            write_state_file(std::path::Path::new("state"), "v");
+            write_state_file(std::path::Path::new(""), "v");
+        });
+
+        let log = String::from_utf8(capture.0.lock().unwrap().clone()).unwrap();
+        assert!(log.contains("state file parent has no trusted anchor"));
+        assert!(log.contains("state file has no parent directory"));
+    }
+
+    /// Regression guard for symlinked-leaf refusal, not the removed
+    /// ensure-then-open race.
     #[test]
     fn write_state_file_refuses_a_symlinked_parent_directory() {
         if !test_symlink_supported() {
