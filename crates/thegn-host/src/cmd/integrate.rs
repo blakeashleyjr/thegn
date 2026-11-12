@@ -294,9 +294,11 @@ pub fn run(cfg: &Config, args: &IntegrateArgs) -> Result<()> {
             .map(|branch| branch.name.as_str())
             .collect::<Vec<_>>()
             .join(",");
-        let into = (!push_mode)
-            .then(|| format!(" --into {target}"))
-            .unwrap_or_default();
+        let into = if !push_mode {
+            format!(" --into {target}")
+        } else {
+            Default::default()
+        };
         let order = if order.is_empty() {
             ordered
         } else {
