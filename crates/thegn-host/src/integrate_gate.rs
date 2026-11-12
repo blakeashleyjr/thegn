@@ -1277,6 +1277,7 @@ impl NativeWorkspace {
 }
 
 fn run_native_isolated(repo: &Path, oid: &str, config: &MergeQueueConfig) -> Result<GateVerdict> {
+    let _slot = crate::heavy_slot::acquire(&config.heavy_gate, "integrate gate")?;
     let workspace = NativeWorkspace::prepare(repo, oid, config)
         .with_context(|| format!("isolated gate preparation failed for {}", repo.display()))?;
     let mut poisoned = false;
@@ -1323,6 +1324,7 @@ pub(super) fn run(repo: &Path, oid: &str, config: &MergeQueueConfig) -> Result<G
     if !crate::platform::gate_path::verified_workspace_supported() {
         return run_native_isolated(repo, oid, config);
     }
+    let _slot = crate::heavy_slot::acquire(&config.heavy_gate, "integrate gate")?;
     let workspace = Workspace::prepare(repo, oid, config)?;
     let mut poisoned = false;
     let verdict = (|| -> Result<GateVerdict> {
