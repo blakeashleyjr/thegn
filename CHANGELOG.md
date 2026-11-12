@@ -13,11 +13,24 @@ All notable changes to **thegn** are documented here. The format follows
   `max_body_bytes`; ports and external URLs remain config-file-only.
 - `docs/help/sandboxing.md` documents preserving worker reports with a writable
   `mounts` entry under `[env.*]`; the private-`/tmp` warning skips covered paths.
+- The Home Manager module exposes `[usage]` scalars and tailnet host-discovery
+  `enabled`/`online_only` toggles; network opt-in stays config-file only.
 
 ### Security
 
 - The local `act` guard scans user-level actrc files (XDG/`~/.actrc` and macOS
   Application Support) for credentials using act's own line tokenizer.
+- The local `act` guard handles clustered short flags whose last letter takes a
+  value (e.g. `-vs`), so the following token is read as that value.
+- Drawer state and PTY diagnostics files are written through a pinned private
+  directory handle, with no path re-resolution between create and write.
+- Hook log files are allocated through a pinned directory handle with
+  exclusive, no-follow creation.
+
+### Fixed
+
+- Git log-graph and numstat parsing reject output truncated mid-row instead of
+  returning a partial result.
 
 ## [0.1.0-alpha.65] — 2026-11-12
 
