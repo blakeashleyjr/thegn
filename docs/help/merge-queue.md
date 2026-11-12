@@ -60,6 +60,13 @@ is not shown in rail mode. The bottom-bar summary is opt-in: set
   prints that plan and stops, and `--yes` skips the prompt (required to
   fold non-interactively).
 
+For a one-off stacked fold, `thegn integrate --order a,b,c` nominates exactly
+those candidate branches in that order, even when `require_enqueue` is on.
+`--into branch` retargets that ordered fold to an existing local branch, and
+`--from branch` resumes at a named entry after confirming the earlier entries
+are already ancestors of the target. Ordered folds stop at their first
+conflict and print a resume command; `--into` is unavailable in push mode.
+
 Only branches you **queued** are folded. `--all`, or `[merge_queue]
 require_enqueue = false`, widens it to every _eligible_ worktree branch —
 which means every clean branch not already on the target, including work

@@ -166,6 +166,10 @@ pub struct LandOpts<'a> {
     pub message_template: &'a str,
     /// The target branch name, bound to `{target}` in the message template.
     pub target: &'a str,
+    /// Stop after the first deferred branch. Ordered CLI folds use this to
+    /// avoid attempting branches stacked on a conflict; ordinary queue folds
+    /// retain the historical continue-after-conflict behavior.
+    pub stop_at_first_conflict: bool,
 }
 
 impl LandOpts<'_> {
@@ -176,6 +180,7 @@ impl LandOpts<'_> {
             strategy: LandStrategy::Merge,
             message_template: "",
             target: "",
+            stop_at_first_conflict: false,
         }
     }
 }
@@ -267,6 +272,9 @@ pub fn fold(
                     kind,
                     submodule_conflicts,
                 });
+                if opts.stop_at_first_conflict {
+                    break;
+                }
             }
             One::UnsupportedMergeHistory => {
                 deferred.push(Deferred {
@@ -275,6 +283,9 @@ pub fn fold(
                     kind: ConflictKind::UnsupportedMergeHistory,
                     submodule_conflicts: Vec::new(),
                 });
+                if opts.stop_at_first_conflict {
+                    break;
+                }
             }
         }
     }
@@ -777,6 +788,25 @@ mod tests {
     }
 
     #[test]
+    fn ordered_folds_stop_after_the_first_conflict() {
+        let git = Fake::new()
+            .branch("blocked", Some(Rule::Conflict(vec!["x.rs".into()])))
+            .branch("stacked", None);
+        let mut opts = LandOpts::merge_default();
+        opts.stop_at_first_conflict = true;
+        let plan = fold(&git, "base", vec![br("blocked"), br("stacked")], &[], &opts).unwrap();
+        assert_eq!(
+            plan.deferred
+                .iter()
+                .map(|deferred| deferred.branch.name.as_str())
+                .collect::<Vec<_>>(),
+            ["blocked"]
+        );
+        assert!(plan.landed.is_empty());
+        assert_eq!(git.merge_calls.borrow().len(), 1);
+    }
+
+    #[test]
     fn typed_submodule_conflicts_are_preserved_and_textual() {
         let conflicts = vec![crate::submodule::SubmoduleConflict {
             path: "vendor/lib".into(),
@@ -998,6 +1028,7 @@ mod tests {
             strategy,
             message_template: template,
             target: "main",
+            stop_at_first_conflict: false,
         }
     }
 
