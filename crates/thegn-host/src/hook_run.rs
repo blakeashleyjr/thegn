@@ -752,7 +752,20 @@ fn write_log(
             "hook log path has no parent directory",
         )
     })?;
-    thegn_core::fsperm::ensure_private_dir(parent)?;
+    let anchor = parent.parent().ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "hook log parent has no anchor directory",
+        )
+    })?;
+    let directory_name = parent.file_name().ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "hook log parent has no directory name",
+        )
+    })?;
+    let directory =
+        thegn_core::fsperm::ensure_private_dir_beneath(anchor, Path::new(directory_name))?;
     let finished_unix_ms = unix_time_ms();
     let header = format!(
         "run_id={} event={} state={state:?} code={} started_unix_ms={} finished_unix_ms={finished_unix_ms} elapsed_ms={} worktree_digest={} command=[redacted]",
@@ -777,7 +790,7 @@ fn write_log(
                 "hook log path has no UTF-8 file name",
             )
         })?;
-    thegn_core::fsperm::open_private_dir(parent)?.write_owner_only_atomic(name, line.as_bytes())?;
+    directory.write_owner_only_atomic(name, line.as_bytes())?;
     Ok(())
 }
 
@@ -1043,6 +1056,44 @@ mod tests {
         assert!(log_path(root.path(), &worktree, HookEvent::PostCreate).is_err());
         assert_eq!(std::fs::read_dir(&victim).unwrap().count(), 0);
         assert!(moved.join("post_create-1.log").exists());
+    }
+
+    #[test]
+    fn hook_log_finalization_rejects_slug_swap_without_touching_victim() {
+        let root = tempfile::tempdir().unwrap();
+        let worktree = format!("/isolated-hook-log-finalize-swap-{}", std::process::id());
+        let path = log_path(root.path(), &worktree, HookEvent::PostCreate).unwrap();
+        let slug = path.parent().unwrap().to_path_buf();
+        let moved = root.path().join("moved-slug");
+        std::fs::rename(&slug, &moved).unwrap();
+        let victim = root.path().join("victim");
+        std::fs::create_dir(&victim).unwrap();
+        if let Err(error) = thegn_core::fsperm::create_symlink(&victim, &slug, true) {
+            tracing::debug!(%error, "skipping hook log symlink test");
+            return;
+        }
+
+        let error = write_log(
+            &path,
+            &context(),
+            &HookRunStamp::start(),
+            HookRunState::Succeeded,
+            Some(0),
+            Duration::from_millis(1),
+            HookLogOutput {
+                stdout: "fresh",
+                stderr: "",
+            },
+        )
+        .expect_err("finalization must reject the swapped slug symlink");
+        assert!(!error.to_string().is_empty());
+        assert_eq!(std::fs::read_dir(&victim).unwrap().count(), 0);
+        assert!(moved.join("post_create-1.log").exists());
+        assert!(
+            std::fs::read(moved.join("post_create-1.log"))
+                .unwrap()
+                .is_empty()
+        );
     }
 
     #[test]
@@ -1344,6 +1395,36 @@ mod tests {
             1
         );
         crate::platform::test_assert_owner_only_permissions(&path, path.parent().unwrap());
+    }
+
+    #[test]
+    fn hook_log_successful_write_leaves_owner_only_file_in_owner_only_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("hooks").join("post-create.log");
+        write_log(
+            &path,
+            &context(),
+            &HookRunStamp::start(),
+            HookRunState::Succeeded,
+            Some(0),
+            Duration::from_millis(1),
+            HookLogOutput {
+                stdout: "completed",
+                stderr: "",
+            },
+        )
+        .unwrap();
+
+        assert!(
+            thegn_core::fsperm::mode_bits(&path)
+                .unwrap()
+                .is_none_or(|mode| mode == 0o600)
+        );
+        assert!(
+            thegn_core::fsperm::mode_bits(path.parent().unwrap())
+                .unwrap()
+                .is_none_or(|mode| mode == 0o700)
+        );
     }
 
     // Positive control: passes at base; only the stamp argument was added.
