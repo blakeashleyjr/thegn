@@ -644,6 +644,7 @@ async fn run_async(cfg: &Config, action: SessionAction) -> Result<()> {
                 let wt = crate::cmd::resolve_worktree(worktree)
                     .to_string_lossy()
                     .into_owned();
+                crate::cmd::session_tmp_warn::warn_if_private_tmp(cfg, &wt, &prompt);
                 let spec = OpenSpec {
                     automation_origin: None,
                     argv: Vec::new(),
