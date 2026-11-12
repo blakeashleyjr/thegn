@@ -496,7 +496,7 @@ silently not applied: `[sandbox]` (and everything nested under it),
 `[pr]`, `[issues]`, `[model_proxy]`, `[mcp]`, `[mcp_proxy]`,
 `[mcp_servers.*]`, `[managed_tools.*]`, `[calendar]`, `[voice]`, `[pins]`,
 `[secrets]`, `[credentials]`, `[bundle]`, `[zone.*]`, `[observe]`,
-`[weather]`, `[usage]`, `[disk]`, `[drawer]`, `[media]`, `[stats]`, and the
+`[weather]`, `[usage]`, `[disk]`, `[drawer]`, `[media]`, and the
 per-project overlay
 `[project.<slug>]` (also written `[workspace.<slug>]`, which is normalized to
 `[project.<slug>]`) — that subtree holds accounts, hooks, sandbox mounts, the
@@ -556,8 +556,12 @@ the periodic auto-fetch poll. The `[stats]` masthead widgets take
 `statsCpuIcon`, `statsMemIcon`, `statsNetIcon`, `statsGpuIcon`, `statsTempIcon`,
 `statsSwapIcon`, `statsFreqIcon`, `statsLoadIcon`, `statsUptimeIcon`,
 `statsBatteryIcon`, `statsBatteryChargingIcon` and `statsDiskIcon` (text or a
-symbol), plus `statsDiskPath` (the filesystem the disk widget measures; empty
-means the filesystem holding the worktrees directory).
+symbol), plus `statsBatteryWarn`, `statsDiskFreeWarn`,
+`statsDiskFreeCritical` and `statsDiskPath` (the filesystem the disk widget
+measures; empty means the filesystem holding the worktrees directory). The
+thresholds accept values from 0 through 255. The `stats.refresh_secs`,
+`stats.refresh_rates`, `stats.alerts` and `stats.net_icons` settings remain
+omitted.
 
 The `[notifications]` booleans are `notificationsDesktop`,
 `notificationsSurfaceSelfLogErrors`, `notificationsGithubMentions`,
