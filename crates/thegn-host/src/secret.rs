@@ -853,6 +853,7 @@ fn open_private_secrets_dir(dir: &std::path::Path) -> Result<thegn_core::fsperm:
             .with_context(|| format!("prepare private secrets anchor {}", anchor.display()))?;
     }
     thegn_core::fsperm::ensure_private_dir_beneath(anchor, std::path::Path::new(name))
+        .with_context(|| format!("pin private secrets directory {}", dir.display()))
 }
 
 fn token_path_in(dir: &std::path::Path, name: &str) -> Result<PathBuf> {
