@@ -496,7 +496,7 @@ silently not applied: `[sandbox]` (and everything nested under it),
 `[pr]`, `[issues]`, `[model_proxy]`, `[mcp]`, `[mcp_proxy]`,
 `[mcp_servers.*]`, `[managed_tools.*]`, `[calendar]`, `[voice]`, `[pins]`,
 `[secrets]`, `[credentials]`, `[bundle]`, `[zone.*]`, `[observe]`,
-`[weather]`, `[usage]`, `[disk]`, `[drawer]`, `[media]`, and the
+`[weather]`, `[usage]`, `[disk]`, `[drawer]`, `[media]`, `[stats]`, and the
 per-project overlay
 `[project.<slug>]` (also written `[workspace.<slug>]`, which is normalized to
 `[project.<slug>]`) — that subtree holds accounts, hooks, sandbox mounts, the
