@@ -6,6 +6,13 @@ use thegn_core::issue::{AgentDispatchStatus, NewDispatch};
 use thegn_core::store::NotificationStore;
 use thegn_svc::control::client::ControlClient;
 
+/// The terminal result recorded for a one-shot integration row.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum IntegrationOutcome {
+    Landed,
+    RefusedGate,
+}
+
 /// Build the plain roster row for an already-open daemon session.
 ///
 /// `issue_id` and `worktree_path` are canonicalized by [`insert_and_start`]
@@ -54,6 +61,62 @@ pub(crate) fn insert_and_start(
             )
         },
     )
+}
+
+/// Record one non-root `land` in the plain roster, without making tracking
+/// authoritative for Git. A prior plain land row for this worktree is
+/// idempotent; another active row (including a pipeline row) is reused rather
+/// than creating a second active dispatch.
+pub(crate) fn track_integration(
+    db: &Db,
+    worktree: &str,
+    label: &str,
+    outcome: IntegrationOutcome,
+) -> Result<()> {
+    let issue_id = format!("local:{label}");
+    let (issue_id, canonical_worktree) =
+        crate::cmd::dispatch::dispatch_identity(&issue_id, worktree)?;
+    let mut rows = db.list_dispatches()?;
+    rows.sort_by_key(|row| row.id);
+
+    let existing_plain = rows.iter().rev().find(|row| {
+        row.worktree_path == canonical_worktree && row.stage.is_none() && row.agent_name == "land"
+    });
+    if existing_plain.is_some_and(|row| !row.status.is_active()) {
+        return Ok(());
+    }
+
+    let row_id = if let Some(row) = existing_plain.or_else(|| {
+        rows.iter()
+            .rev()
+            .find(|row| row.worktree_path == canonical_worktree && row.status.is_active())
+    }) {
+        row.id
+    } else {
+        insert_and_start(
+            db,
+            &issue_id,
+            &canonical_worktree,
+            "land",
+            &format!("land-{}", std::process::id()),
+        )?
+    };
+    let target = match outcome {
+        IntegrationOutcome::Landed => AgentDispatchStatus::Done,
+        IntegrationOutcome::RefusedGate => AgentDispatchStatus::Failed,
+    };
+    let current = db
+        .get_dispatch(row_id)?
+        .ok_or_else(|| anyhow::anyhow!("integration tracking row {row_id} disappeared"))?;
+    if current.status == AgentDispatchStatus::Queued {
+        db.set_dispatch_status_checked(
+            row_id,
+            AgentDispatchStatus::Queued,
+            AgentDispatchStatus::Running,
+            None,
+        )?;
+    }
+    db.set_dispatch_status_checked(row_id, AgentDispatchStatus::Running, target, Some(label))
 }
 
 fn insert_and_start_with_status(
@@ -133,7 +196,10 @@ pub(crate) async fn track_opened(
 
 #[cfg(test)]
 mod tests {
-    use super::{insert_and_start, insert_and_start_with_status, track_row};
+    use super::{
+        IntegrationOutcome, insert_and_start, insert_and_start_with_status, track_integration,
+        track_row,
+    };
     use std::path::PathBuf;
     use tempfile::TempDir;
     use thegn_core::db::Db;
@@ -301,5 +367,64 @@ mod tests {
             )
             .expect("active roster list");
         assert!(active.is_empty());
+    }
+
+    #[test]
+    fn track_integration_moves_running_to_done() {
+        let state = crate::testenv::IsolatedState::new();
+        let (_repo_dir, worktree) = git_repo();
+        let db = db(&state);
+        let path = worktree.to_str().expect("utf8 worktree");
+        track_integration(&db, path, "tracked", IntegrationOutcome::Landed).expect("land row");
+        let rows = db.list_dispatches().expect("roster list");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].issue_id, "local:tracked");
+        assert_eq!(rows[0].status, AgentDispatchStatus::Done);
+        assert_eq!(rows[0].agent_name, "land");
+    }
+
+    #[test]
+    fn track_integration_moves_running_to_failed_for_a_refused_gate() {
+        let state = crate::testenv::IsolatedState::new();
+        let (_repo_dir, worktree) = git_repo();
+        let db = db(&state);
+        track_integration(
+            &db,
+            worktree.to_str().expect("utf8 worktree"),
+            "tracked",
+            IntegrationOutcome::RefusedGate,
+        )
+        .expect("failed land row");
+        let rows = db.list_dispatches().expect("roster list");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].status, AgentDispatchStatus::Failed);
+    }
+
+    #[test]
+    fn track_integration_is_idempotent_for_a_repeat_land() {
+        let state = crate::testenv::IsolatedState::new();
+        let (_repo_dir, worktree) = git_repo();
+        let db = db(&state);
+        let path = worktree.to_str().expect("utf8 worktree");
+        track_integration(&db, path, "tracked", IntegrationOutcome::Landed)
+            .expect("first land row");
+        track_integration(&db, path, "tracked", IntegrationOutcome::Landed)
+            .expect("repeat land row");
+        assert_eq!(db.list_dispatches().expect("roster list").len(), 1);
+    }
+
+    #[test]
+    fn track_integration_reuses_an_active_row_for_the_same_worktree() {
+        let state = crate::testenv::IsolatedState::new();
+        let (_repo_dir, worktree) = git_repo();
+        let db = db(&state);
+        let path = worktree.to_str().expect("utf8 worktree");
+        insert_and_start(&db, "linear:THE-1980", path, "coder", "session-1980")
+            .expect("active row");
+        track_integration(&db, path, "tracked", IntegrationOutcome::RefusedGate)
+            .expect("reused land row");
+        let rows = db.list_dispatches().expect("roster list");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].status, AgentDispatchStatus::Failed);
     }
 }
