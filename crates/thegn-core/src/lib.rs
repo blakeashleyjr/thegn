@@ -27,6 +27,7 @@ pub mod autopilot;
 pub mod axis;
 pub mod backoff;
 pub mod blame;
+pub mod brief_render;
 pub mod budget_alert;
 pub mod bundle;
 pub mod calendar;
