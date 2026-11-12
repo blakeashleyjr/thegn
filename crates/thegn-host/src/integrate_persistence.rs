@@ -54,6 +54,7 @@ pub(crate) fn run_selected_fold(
     repo_root: &Path,
     candidates: &Candidates,
     override_gpg: bool,
+    stop_at_first_conflict: bool,
 ) -> Result<FoldReport> {
     run_observed_fold(
         Db::open(),
@@ -73,7 +74,7 @@ pub(crate) fn run_selected_fold(
                 &history,
             )?;
             history.revalidate()?;
-            run_fold_observed(config, repo_root, tips, history)
+            run_fold_observed(config, repo_root, tips, history, stop_at_first_conflict)
         },
     )
 }

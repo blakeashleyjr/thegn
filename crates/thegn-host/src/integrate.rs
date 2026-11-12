@@ -1518,7 +1518,7 @@ pub fn fold_active_repo(cfg: &thegn_core::config::Config, any_path: &Path) -> Re
             .unwrap_or_default();
         hold_unenqueued(&mut cands, &enqueued);
     }
-    run_selected_fold(mq, &repo_root, &cands, override_gpg)
+    run_selected_fold(mq, &repo_root, &cands, override_gpg, false)
 }
 
 /// Hold back every candidate that was not explicitly enqueued, returning the
@@ -2089,6 +2089,7 @@ fn land_opts<'a>(cfg: &'a MergeQueueConfig, target: &'a str) -> LandOpts<'a> {
         strategy: cfg.land_strategy,
         message_template: &cfg.land_message,
         target,
+        stop_at_first_conflict: false,
     }
 }
 
@@ -2261,7 +2262,7 @@ fn run_fold_with_cas(
     advance: impl FnMut(&GitLoc, &str, &str, &str, &[Branch]) -> Result<bool>,
 ) -> Result<FoldReport> {
     let (loc, history) = CanonicalHistory::worktree_loc(repo_root)?;
-    run_fold_admitted(cfg, repo_root, candidates, loc, history, advance)
+    run_fold_admitted(cfg, repo_root, candidates, loc, history, advance, false)
 }
 
 fn run_fold_observed(
@@ -2269,6 +2270,7 @@ fn run_fold_observed(
     repo_root: &Path,
     candidates: Vec<Branch>,
     history: CanonicalHistory,
+    stop_at_first_conflict: bool,
 ) -> Result<FoldReport> {
     anyhow::ensure!(
         history.worktree_path() == repo_root,
@@ -2281,6 +2283,7 @@ fn run_fold_observed(
         GitLoc::Local(repo_root.to_path_buf()),
         history,
         advance_with_source_fence,
+        stop_at_first_conflict,
     )
 }
 
@@ -2291,6 +2294,7 @@ fn run_fold_admitted(
     loc: GitLoc,
     history: CanonicalHistory,
     mut advance: impl FnMut(&GitLoc, &str, &str, &str, &[Branch]) -> Result<bool>,
+    stop_at_first_conflict: bool,
 ) -> Result<FoldReport> {
     history.revalidate()?;
     let target_branch = resolve_target(cfg, repo_root);
@@ -2324,7 +2328,8 @@ fn run_fold_admitted(
         refused,
         refusals: Mutex::new(BTreeMap::new()),
     };
-    let opts = land_opts(cfg, &target_branch);
+    let mut opts = land_opts(cfg, &target_branch);
+    opts.stop_at_first_conflict = stop_at_first_conflict;
 
     let gate_on = cfg.gate_on && !cfg.gate_command.is_empty();
     let mut excluded: HashSet<String> = HashSet::new();

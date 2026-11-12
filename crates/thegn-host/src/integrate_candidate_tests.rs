@@ -176,6 +176,94 @@ fn discovery_never_snapshots_even_when_dirty_snapshots_are_enabled() {
 }
 
 #[test]
+fn ordered_into_target_resumes_after_an_already_folded_prefix() {
+    let f = Fixture::new();
+    if !f.supported_or_refused() {
+        return;
+    }
+    git(&f.repo, &["branch", "into"]);
+    let mut config = f.config.merge_queue.clone();
+    config.target_branch = "into".into();
+    let mut candidates = candidate_branches(&config, &f.repo, "into").unwrap();
+    let candidate_names: Vec<String> = candidates
+        .branches
+        .iter()
+        .map(|branch| branch.name.clone())
+        .collect();
+    let order = vec!["queued".into(), "unqueued".into()];
+    let queued_tip = candidates
+        .branches
+        .iter()
+        .find(|branch| branch.name == "queued")
+        .unwrap()
+        .tip
+        .clone();
+    let from = crate::cmd::integrate_order::from_index(&order, "unqueued").unwrap();
+    let indexes =
+        crate::cmd::integrate_order::ordered_indices(&candidate_names, &order[from..]).unwrap();
+    candidates.branches = indexes
+        .into_iter()
+        .map(|index| candidates.branches[index].clone())
+        .collect();
+
+    git(&f.repo, &["update-ref", "refs/heads/into", &queued_tip]);
+    let local_into = thegn_core::worktree::branch_exists_checked(&f.repo, "into").unwrap();
+    assert!(crate::cmd::integrate_order::validate_into("into", local_into, false).is_ok());
+    assert_eq!(crate::integrate::resolve_target(&config, &f.repo), "into");
+
+    let target_tip = git(&f.repo, &["rev-parse", "refs/heads/into"]);
+    assert!(crate::integrate::candidate_is_ancestor(
+        &f.repo,
+        &queued_tip,
+        &target_tip
+    ));
+    assert_eq!(
+        candidates
+            .branches
+            .iter()
+            .map(|branch| branch.name.as_str())
+            .collect::<Vec<_>>(),
+        ["unqueued"]
+    );
+}
+
+#[test]
+fn ordered_from_allows_a_gone_folded_prefix() {
+    let f = Fixture::new();
+    if !f.supported_or_refused() {
+        return;
+    }
+    git(&f.repo, &["branch", "gone"]);
+    let target_tip = git(&f.repo, &["rev-parse", "refs/heads/main"]);
+    git(&f.repo, &["branch", "-D", "gone"]);
+    let order = vec!["gone".into(), "unqueued".into()];
+    let from = crate::cmd::integrate_order::from_index(&order, "unqueued").unwrap();
+    assert!(
+        thegn_core::util::git_out(
+            &f.repo,
+            &["rev-parse", "--verify", "--quiet", "refs/heads/gone"]
+        )
+        .is_none()
+    );
+    assert_eq!(target_tip, git(&f.repo, &["rev-parse", "refs/heads/main"]));
+    let candidates = f.discovered();
+    let candidate_names = candidates
+        .branches
+        .iter()
+        .map(|branch| branch.name.clone())
+        .collect::<Vec<_>>();
+    let indexes =
+        crate::cmd::integrate_order::ordered_indices(&candidate_names, &order[from..]).unwrap();
+    assert_eq!(
+        indexes
+            .into_iter()
+            .map(|index| candidates.branches[index].name.as_str())
+            .collect::<Vec<_>>(),
+        ["unqueued"]
+    );
+}
+
+#[test]
 fn ui_fold_snapshots_only_the_selected_queued_worktree() {
     let f = Fixture::new();
     if !f.supported_or_refused() {
