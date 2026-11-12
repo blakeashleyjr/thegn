@@ -36,6 +36,7 @@ pub(crate) fn acquire(cfg: &Config, label: &str) -> Result<HeavySlot> {
         &thegn_core::util::xdg_state_home(),
         HEAVY_WAIT_CAP,
         &read_loadavg1,
+        &crate::fold_cancel::requested,
     )
 }
 
@@ -45,6 +46,7 @@ fn acquire_with(
     state_home: &Path,
     wait_cap: Duration,
     loadavg1: &dyn Fn() -> Option<f64>,
+    cancelled: &dyn Fn() -> bool,
 ) -> Result<HeavySlot> {
     if cfg.slots == 0 && cfg.max_load <= 0.0 {
         return Ok(HeavySlot::inert());
@@ -56,6 +58,9 @@ fn acquire_with(
     let mut backoff = INITIAL_BACKOFF;
 
     loop {
+        if cancelled() {
+            anyhow::bail!("heavy gate wait for {label} cancelled");
+        }
         let (holders, candidate) = try_slots(&directory, cfg.slots)?;
         let load = loadavg1().unwrap_or(0.0);
         match heavy_gate::decide(cfg.slots, cfg.max_load, holders, load, cores) {
@@ -125,20 +130,13 @@ fn try_slots(directory: &PrivateDir, slots: usize) -> Result<(usize, Option<std:
 }
 
 fn read_loadavg1() -> Option<f64> {
-    #[cfg(target_os = "linux")]
-    {
-        return std::fs::read_to_string("/proc/loadavg")
-            .ok()?
-            .split_whitespace()
-            .next()?
-            .parse::<f64>()
-            .ok()
-            .filter(|load| load.is_finite() && *load >= 0.0);
-    }
-    #[cfg(not(target_os = "linux"))]
-    {
-        None
-    }
+    std::fs::read_to_string("/proc/loadavg")
+        .ok()?
+        .split_whitespace()
+        .next()?
+        .parse::<f64>()
+        .ok()
+        .filter(|load| load.is_finite() && *load >= 0.0)
 }
 
 #[cfg(test)]
@@ -148,7 +146,7 @@ mod tests {
         Arc,
         atomic::{AtomicBool, Ordering},
     };
-    use std::time::Duration;
+    use std::time::{Duration, Instant};
 
     #[test]
     fn second_guard_waits_until_first_drops() {
@@ -163,22 +161,28 @@ mod tests {
             state.path(),
             Duration::from_millis(500),
             &|| Some(0.0),
+            &|| false,
         )
         .unwrap();
         let state_path = state.path().to_path_buf();
         let worker = std::thread::spawn(move || {
-            acquire_with(
+            let started = Instant::now();
+            let slot = acquire_with(
                 &cfg,
                 "second",
                 &state_path,
                 Duration::from_millis(500),
                 &|| Some(0.0),
+                &|| false,
             )
-            .unwrap()
+            .unwrap();
+            (slot, started.elapsed())
         });
         std::thread::sleep(Duration::from_millis(50));
         drop(first);
-        worker.join().unwrap();
+        let (slot, elapsed) = worker.join().unwrap();
+        assert!(slot.lock.is_some());
+        assert!(elapsed >= Duration::from_millis(40));
     }
 
     #[test]
@@ -204,11 +208,40 @@ mod tests {
                         Some(2.0)
                     }
                 },
+                &|| false,
             )
             .unwrap()
         });
         std::thread::sleep(Duration::from_millis(50));
         released.store(true, Ordering::Release);
         worker.join().unwrap();
+    }
+
+    #[test]
+    fn cancellation_aborts_waiting_for_a_slot() {
+        let state = tempfile::tempdir().unwrap();
+        let cfg = Config {
+            slots: 1,
+            max_load: 0.0,
+        };
+        let first = acquire_with(
+            &cfg,
+            "first",
+            state.path(),
+            Duration::from_millis(500),
+            &|| Some(0.0),
+            &|| false,
+        )
+        .unwrap();
+        let result = acquire_with(
+            &cfg,
+            "cancelled",
+            state.path(),
+            Duration::from_millis(500),
+            &|| Some(0.0),
+            &|| true,
+        );
+        drop(first);
+        assert!(result.is_err());
     }
 }

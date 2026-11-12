@@ -52,9 +52,15 @@ fn allowlist() -> BTreeSet<String> {
     .collect()
 }
 
-/// A dotted config path → the env name the overlay convention would use.
-fn env_name(path: &str) -> String {
-    format!("THEGN_{}", path.replace('.', "_").to_ascii_uppercase())
+/// `section.key` → the env name the overlay convention would use.
+fn env_name(section: &str, key: &str) -> String {
+    let mut s = String::from("THEGN_");
+    if !section.is_empty() {
+        s.push_str(&section.to_ascii_uppercase());
+        s.push('_');
+    }
+    s.push_str(&key.to_ascii_uppercase());
+    s
 }
 
 #[test]
@@ -79,7 +85,10 @@ fn every_shallow_key_has_an_env_knob_or_is_pinned() {
             in_scope.insert(path);
         }
     }
-    let covered = |path: &str| knobs.contains(&env_name(path));
+    let covered = |path: &str| {
+        let (section, key) = path.split_once('.').unwrap_or(("", path));
+        knobs.contains(&env_name(section, key))
+    };
     if std::env::var("THEGN_RATCHET_UPDATE").as_deref() == Ok("1") {
         let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("../../test/env-overlay-ratchet.txt");

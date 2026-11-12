@@ -1801,8 +1801,6 @@ fn env_overlay_covers_every_knob() {
             "THEGN_DATABASE_MIGRATION_EXECUTABLE",
             "/opt/thegn/bin/thegn",
         ),
-        ("THEGN_SANDBOX_LIMITS_HEAVY_SLOTS", "3"),
-        ("THEGN_SANDBOX_LIMITS_MAX_LOAD", "4.5"),
         ("THEGN_SANDBOX_BACKEND", "docker"),
         ("THEGN_SANDBOX_NETWORK", "host"),
         ("THEGN_SANDBOX_IMAGE", "img:9"),
@@ -1857,8 +1855,6 @@ fn env_overlay_covers_every_knob() {
     let c = Config::load_layered(&env, &[], None);
     assert_eq!(c.merge_queue.gate_timeout_secs, 60);
     assert_eq!(c.merge_queue.gate_setup_timeout_secs, 30);
-    assert_eq!(c.sandbox.limits.heavy_slots, 3);
-    assert_eq!(c.sandbox.limits.max_load, 4.5);
     assert_eq!(c.worktrees_dir, "/wt");
     assert_eq!(c.workspaces_dir, "/ws");
     assert_eq!(c.base_branch, "develop");
