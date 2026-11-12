@@ -2063,7 +2063,9 @@ mod session_target_tests {
 
     #[test]
     fn snapshot_help_shows_the_positional_session() {
-        let error = parse(&["thegn", "session", "snapshot", "--help"]).unwrap_err();
+        let Err(error) = parse(&["thegn", "session", "snapshot", "--help"]) else {
+            panic!("--help must not parse as a command");
+        };
         assert_eq!(error.kind(), clap::error::ErrorKind::DisplayHelp);
         assert!(
             error
