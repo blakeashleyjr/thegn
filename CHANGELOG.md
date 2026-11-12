@@ -7,6 +7,25 @@ All notable changes to **thegn** are documented here. The format follows
 
 ## [Unreleased]
 
+### Added
+
+- The Home Manager module exposes the `[lsp]` settings `enabled`, `hover` and
+  `require_containment`; server entries remain config-file-only.
+
+### Security
+
+- Hook log files are finalized through a pinned directory handle instead of
+  reopening the directory by path.
+- The secrets store and managed-tool staging directories are created and
+  opened through one pinned private directory handle.
+- The managed SSH ledger lock and machine0 attestation store use pinned private
+  directory handles.
+
+### Fixed
+
+- Truncated or malformed `git status` replies now error instead of reading as a
+  clean tree; commit-time output must end with a newline.
+
 ## [0.1.0-alpha.66] — 2026-11-12
 
 ### Added
