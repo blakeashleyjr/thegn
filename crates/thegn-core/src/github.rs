@@ -587,6 +587,35 @@ mod bounded_probe_tests {
     }
 
     #[test]
+    fn bounded_gh_probe_rejects_successful_leader_with_live_child() {
+        if !crate::testenv::require_or_skip("Unix shell process-group fixture", !cfg!(windows)) {
+            return;
+        }
+        let bin = tempfile::tempdir().unwrap();
+        let worktree = tempfile::tempdir().unwrap();
+        let gh = bin.path().join("gh");
+        std::fs::write(&gh, "#!/bin/sh\nsleep 30 &\nexit 0\n").unwrap();
+        if crate::fsperm::set_mode_for_test(&gh, 0o755).is_err() {
+            return;
+        }
+        let old_path = std::env::var_os("PATH").unwrap_or_default();
+        let path = format!("{}:{}", bin.path().display(), old_path.to_string_lossy());
+        let _env = crate::testenv::EnvGuard::set(&[("PATH", &path)]);
+
+        let error = whoami_with_timeout(
+            &GitLoc::Local(worktree.path().to_path_buf()),
+            Duration::from_secs(1),
+        )
+        .unwrap_err();
+        assert_eq!(
+            error,
+            GhError::Other(
+                "gh exited but a child process kept running or held its output open".into()
+            )
+        );
+    }
+
+    #[test]
     fn bounded_gh_probe_maps_spawn_failure() {
         let worktree = tempfile::tempdir().unwrap();
         let empty_path = tempfile::tempdir().unwrap();
