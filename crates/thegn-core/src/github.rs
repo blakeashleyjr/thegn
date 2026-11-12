@@ -63,6 +63,9 @@ fn gh_out_bounded(loc: &GitLoc, args: &[&str], timeout: Duration) -> Result<Stri
                     .trim()
                     .to_string())
             }
+            thegn_proc::Leader::Reaped(status) if status.success() => Err(GhError::Other(
+                "gh exited but a child process kept running or held its output open".into(),
+            )),
             thegn_proc::Leader::Reaped(_) => Err(classify(
                 &String::from_utf8_lossy(&run.stderr.bytes).to_lowercase(),
             )),
@@ -555,24 +558,17 @@ mod bounded_probe_tests {
         let started = Instant::now();
         let error = whoami_with_timeout(
             &GitLoc::Local(worktree.path().to_path_buf()),
-            Duration::from_millis(200),
+            Duration::from_secs(1),
         )
         .unwrap_err();
         assert!(started.elapsed() < Duration::from_secs(10));
         assert!(matches!(error, GhError::Other(message) if message.contains("timed out")));
 
-        let pid = loop {
-            if let Ok(contents) = std::fs::read_to_string(&pid_file)
-                && let Ok(pid) = contents.trim().parse::<u32>()
-            {
-                break pid;
-            }
-            assert!(
-                started.elapsed() < Duration::from_secs(2),
-                "fake gh did not record sleep pid"
-            );
-            std::thread::sleep(Duration::from_millis(10));
-        };
+        let pid = std::fs::read_to_string(&pid_file)
+            .expect("fake gh did not record sleep pid")
+            .trim()
+            .parse::<u32>()
+            .expect("fake gh recorded an invalid sleep pid");
         let gone_by = Instant::now() + Duration::from_secs(2);
         loop {
             let alive = Command::new("kill")

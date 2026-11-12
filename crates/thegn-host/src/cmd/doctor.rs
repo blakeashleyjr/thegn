@@ -4517,7 +4517,9 @@ fn signing_ready() -> std::result::Result<(), String> {
     use std::path::Path;
     use thegn_core::util::git_cmd;
     // Empty tree oid via `mktree` (sha1 or sha256, no hardcoded oid).
-    let tree_run = doctor_probe(git_cmd(Path::new(".")).arg("mktree"));
+    let mut tree_command = git_cmd(Path::new("."));
+    tree_command.arg("mktree");
+    let tree_run = doctor_probe(tree_command);
     if !(tree_run.success()
         && tree_run.group == thegn_proc::GroupState::Drained
         && tree_run.stdout.eof)
@@ -5888,12 +5890,12 @@ mod tests {
 
     #[test]
     fn run_does_not_panic_on_default_config() {
-        let _state = thegn_core::testenv::IsolatedState::new();
         let gh_config = tempfile::tempdir().unwrap();
-        let _env = crate::testenv::EnvVarGuard::set(&[(
-            "GH_CONFIG_DIR",
-            gh_config.path().to_str().unwrap(),
-        )]);
+        let _state = crate::testenv::IsolatedState::with_env(&[
+            ("GH_CONFIG_DIR", gh_config.path().to_str().unwrap()),
+            ("GH_TOKEN", ""),
+            ("GITHUB_TOKEN", ""),
+        ]);
         let cfg = Config::default();
         assert!(run(&cfg, false, Config::path(), None, &[]).is_ok());
         assert!(run(&cfg, true, Config::path(), None, &[]).is_ok());
@@ -6778,12 +6780,12 @@ args = ["--verbose"]
 
     #[test]
     fn core_deps_json_reports_git_and_gh_without_panicking() {
-        let _state = thegn_core::testenv::IsolatedState::new();
         let gh_config = tempfile::tempdir().unwrap();
-        let _env = crate::testenv::EnvVarGuard::set(&[(
-            "GH_CONFIG_DIR",
-            gh_config.path().to_str().unwrap(),
-        )]);
+        let _state = crate::testenv::IsolatedState::with_env(&[
+            ("GH_CONFIG_DIR", gh_config.path().to_str().unwrap()),
+            ("GH_TOKEN", ""),
+            ("GITHUB_TOKEN", ""),
+        ]);
         // Never panics regardless of whether git/gh are installed; the shape is
         // always present/path/(version|authenticated) for both binaries.
         let v = core_deps_json();
