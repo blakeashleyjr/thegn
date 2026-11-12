@@ -82,6 +82,9 @@ pub fn load_in(root: &Path, vm_name: &str) -> Option<Attestation> {
 
 pub fn store_in(root: &Path, record: &Attestation) -> anyhow::Result<()> {
     let name = crate::vps::registry::checked_name(&record.vm_name)?;
+    if !root.exists() {
+        thegn_core::fsperm::ensure_private_dir(root)?;
+    }
     let dir = thegn_core::fsperm::ensure_private_dir_beneath(root, Path::new("machine0/attest"))?;
     let bytes = serde_json::to_vec(record)?;
     dir.write_owner_only_atomic(&format!("{name}.json"), &bytes)?;
@@ -145,6 +148,16 @@ mod tests {
     }
 
     #[test]
+    fn store_creates_a_missing_root_before_pinned_open() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("state");
+
+        store_in(&root, &sample()).unwrap();
+
+        assert_eq!(load_in(&root, "dev"), Some(sample()));
+    }
+
+    #[test]
     fn store_refuses_a_symlinked_attest_directory_without_touching_victim() {
         let root = tempfile::tempdir().unwrap();
         let machine0 = root.path().join("machine0");
@@ -176,10 +189,10 @@ mod tests {
         std::fs::create_dir(&machine0).unwrap();
         thegn_core::fsperm::restrict_dir_to_owner(&machine0).unwrap();
         std::fs::create_dir(&dir).unwrap();
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+        match thegn_core::fsperm::set_mode_for_test(&dir, 0o755) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::Unsupported => return,
+            Err(error) => panic!("fixture mode: {error}"),
         }
 
         store_in(root.path(), &sample()).unwrap();

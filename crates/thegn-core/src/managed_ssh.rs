@@ -545,6 +545,10 @@ fn lock_ledger(dir: &Path) -> Result<LockedLedger> {
         .parent()
         .filter(|parent| !parent.as_os_str().is_empty())
         .unwrap_or_else(|| Path::new("."));
+    if !parent.exists() {
+        crate::fsperm::ensure_private_dir(parent)
+            .with_context(|| format!("create {}", parent.display()))?;
+    }
     let name = dir
         .file_name()
         .context("managed SSH custody directory has no final component")?;
@@ -2172,6 +2176,16 @@ mod tests {
         // The base already ignores non-JSON entries; the lock's existence is
         // the new behavior this positive-control test checks.
         assert!(temp.path().join(".custody.lock").exists());
+    }
+
+    #[test]
+    fn ledger_lock_creates_missing_parent_anchor() {
+        let temp = tempfile::tempdir().unwrap();
+        let ledger = temp.path().join("missing-parent").join("ledger");
+
+        let row = record_authorized_at(&ledger, &record()).unwrap();
+
+        assert_eq!(list_at(&ledger).unwrap(), vec![row]);
     }
 
     #[test]
