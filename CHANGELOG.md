@@ -7,6 +7,18 @@ All notable changes to **thegn** are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.1.0-alpha.69] — 2026-11-12
+
+### Added
+
+- The Home Manager module exposes the `[stats]` thresholds `battery_warn`,
+  `disk_free_warn` and `disk_free_critical`.
+
+### Fixed
+
+- `thegn doctor` no longer hangs on a blocked GitHub CLI (such as a locked
+  keyring); bounded identity and git probes report an unknown result.
+
 ## [0.1.0-alpha.68] — 2026-11-12
 
 ### Added
@@ -3258,7 +3270,8 @@ launcher picker and the merge queue's `agent_command` hook remain — they run
 whatever commands you configure. Leftover `[llm_proxy]` config sections and
 `proxy_*` tables in existing state databases are ignored harmlessly.
 
-[Unreleased]: https://github.com/blakeashleyjr/thegn/compare/v0.1.0-alpha.68...HEAD
+[Unreleased]: https://github.com/blakeashleyjr/thegn/compare/v0.1.0-alpha.69...HEAD
+[0.1.0-alpha.69]: https://github.com/blakeashleyjr/thegn/compare/v0.1.0-alpha.68...v0.1.0-alpha.69
 [0.1.0-alpha.68]: https://github.com/blakeashleyjr/thegn/compare/v0.1.0-alpha.67...v0.1.0-alpha.68
 [0.1.0-alpha.67]: https://github.com/blakeashleyjr/thegn/compare/v0.1.0-alpha.66...v0.1.0-alpha.67
 [0.1.0-alpha.66]: https://github.com/blakeashleyjr/thegn/compare/v0.1.0-alpha.65...v0.1.0-alpha.66
