@@ -395,6 +395,7 @@ pub const CATALOG: &[Slot] = &[
     slot("sandbox-argv", "worktree", SourceKind::Worktree),
     slot("sandbox-argv", "worktree_pos", SourceKind::Worktree),
     slot("wt new", "isolation", SourceKind::Structural),
+    slot("wt new", "batch", SourceKind::Structural),
     slot("sandbox profile show", "worktree", SourceKind::Worktree),
     slot("sandbox profile set", "worktree", SourceKind::Worktree),
     slot("sandbox profile clear", "worktree", SourceKind::Worktree),

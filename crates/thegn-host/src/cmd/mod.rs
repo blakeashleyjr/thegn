@@ -73,6 +73,7 @@ pub mod target;
 pub mod theme;
 pub mod voice;
 pub mod wt;
+pub mod wt_batch;
 pub mod wt_prune;
 pub mod zone;
 
