@@ -115,6 +115,8 @@ pub fn run(cfg: &Config, args: &IntegrateArgs) -> Result<()> {
             );
         super::integrate_order::validate_into(into, local_exists, remote_tracking)?;
         mq.target_branch = into.clone();
+        // A stack fold is not a landing on the configured target, so defer lifecycle filing/removal to the eventual land of B.
+        mq.on_landed = thegn_core::config::OnLanded::Off;
     }
     let target = integrate::resolve_target(&mq, &repo_root);
 
@@ -130,40 +132,42 @@ pub fn run(cfg: &Config, args: &IntegrateArgs) -> Result<()> {
             .iter()
             .map(|branch| branch.name.clone())
             .collect();
-        let indexes = super::integrate_order::ordered_indices(&candidate_names, order)?;
-        cands.branches = indexes
-            .into_iter()
-            .map(|index| cands.branches[index].clone())
-            .collect();
-        if let Some(from) = &args.from {
-            let from_index = super::integrate_order::from_index(
-                &cands
-                    .branches
-                    .iter()
-                    .map(|branch| branch.name.clone())
-                    .collect::<Vec<_>>(),
-                from,
-            )?;
+        let order = if let Some(from) = &args.from {
+            let from_index = super::integrate_order::from_index(order, from)?;
             let target_tip = thegn_core::util::git_out(
                 &repo_root,
                 &["rev-parse", &format!("refs/heads/{target}")],
             )
             .context("could not read the target tip")?;
-            for branch in &cands.branches[..from_index] {
-                let branch_tip = thegn_core::util::git_out(
+            for raw_name in &order[..from_index] {
+                let name = raw_name.trim();
+                let Some(branch_tip) = thegn_core::util::git_out(
                     &repo_root,
-                    &["rev-parse", &format!("refs/heads/{}", branch.name)],
-                )
-                .with_context(|| format!("could not read dropped branch tip: {}", branch.name))?;
+                    &[
+                        "rev-parse",
+                        "--verify",
+                        "--quiet",
+                        &format!("refs/heads/{name}"),
+                    ],
+                ) else {
+                    outln!("  • {name} already folded (branch gone)");
+                    continue;
+                };
                 if !integrate::candidate_is_ancestor(&repo_root, &branch_tip, &target_tip) {
                     anyhow::bail!(
-                        "refusing --from {from}: dropped branch {} is not already folded into {target}",
-                        branch.name
+                        "refusing --from {from}: dropped branch {name} is not already folded into {target}"
                     );
                 }
             }
-            cands.branches = cands.branches[from_index..].to_vec();
-        }
+            &order[from_index..]
+        } else {
+            order.as_slice()
+        };
+        let indexes = super::integrate_order::ordered_indices(&candidate_names, order)?;
+        cands.branches = indexes
+            .into_iter()
+            .map(|index| cands.branches[index].clone())
+            .collect();
     }
 
     // `--all` is the explicit, per-run opt out of the queue: fold every eligible

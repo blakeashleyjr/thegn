@@ -68,7 +68,7 @@ pub(crate) fn from_index(names: &[String], from: &str) -> Result<usize> {
     let from = from.trim();
     names
         .iter()
-        .position(|name| name == from)
+        .position(|name| name.trim() == from)
         .ok_or_else(|| anyhow::anyhow!("--from branch is not in --order: {from}"))
 }
 
@@ -118,5 +118,11 @@ mod tests {
             ["b", "c"]
         );
         assert!(from_index(&names, "missing").is_err());
+    }
+
+    #[test]
+    fn from_index_trims_the_requested_order_entry() {
+        let names = names(&["gone", " b ", "c"]);
+        assert_eq!(from_index(&names, "b").unwrap(), 1);
     }
 }
