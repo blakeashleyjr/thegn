@@ -176,9 +176,10 @@ See [[git-and-diffs]].
 
 Local branches: check out, create, delete; open-PR badges ride each row.
 At Normal width, `↵` widens to Half; the selected branch's recent commits
-appear at Half and Full width. `p` pulls and `P` pushes HEAD only, refusing
-when another row is selected; `n` opens the new-branch name input. Menu
-pull and push also operate on HEAD only. Before the first load, the list says
+appear at Half and Full width. `p` pulls HEAD when its row is selected, or
+fast-forwards the selected branch without checking it out; `P` pushes HEAD or
+the selected branch without changing its upstream. `n` opens the new-branch
+name input. Menu pull and push still operate on HEAD only. Before the first load, the list says
 "loading…"; a failed read names the error instead of appearing empty.
 
 {{keys:branches}}

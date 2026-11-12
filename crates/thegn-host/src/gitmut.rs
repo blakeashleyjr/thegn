@@ -170,6 +170,10 @@ pub enum GitOp {
     Push {
         force: ForceMode,
     },
+    PushBranch {
+        branch: String,
+        force: ForceMode,
+    },
     PushSetUpstream {
         remote: String,
         branch: String,
@@ -286,6 +290,7 @@ impl GitOp {
             GitOp::RebaseBranch { .. } | GitOp::RebaseOnto { .. } => "rebasing",
             GitOp::FastForward { .. } => "fast-forwarding",
             GitOp::Push { .. } => "pushing",
+            GitOp::PushBranch { .. } => "pushing branch",
             GitOp::PushSetUpstream { .. } => "pushing (set upstream)",
             GitOp::Pull => "pulling",
             GitOp::Fetch => "fetching",
@@ -336,6 +341,7 @@ impl GitOp {
         matches!(
             self,
             GitOp::Push { .. }
+                | GitOp::PushBranch { .. }
                 | GitOp::PushSetUpstream { .. }
                 | GitOp::Pull
                 | GitOp::Fetch
@@ -369,8 +375,9 @@ pub enum GitOpResult {
     },
     Err(String),
     /// Push failed because the branch has no upstream. The caller can offer
-    /// to run `push -u origin <branch>`.
+    /// to run `push -u <remote> <branch>`.
     NoUpstream {
+        remote: String,
         branch: String,
     },
 }
@@ -705,6 +712,23 @@ fn execute_at_with_db(
         GitOp::FastForward { branch, current } => {
             done(g.fast_forward(loc, &branch, current, "origin"))
         }
+        GitOp::PushBranch { branch, force } => {
+            let remote = branch_remote(loc, &branch);
+            match g.push_branch(loc, &remote, &branch, force) {
+                Ok(()) => GitOpResult::Ok(None),
+                Err(e) => {
+                    let msg = format!("{e}");
+                    if msg.contains("has no upstream branch")
+                        || msg.contains("no configured push destination")
+                        || msg.contains("set-upstream")
+                    {
+                        no_upstream_result(Ok(branch), &msg, &remote)
+                    } else {
+                        GitOpResult::Err(first_line_str(&msg))
+                    }
+                }
+            }
+        }
         GitOp::PushSetUpstream { remote, branch } => {
             done(g.push_set_upstream(loc, &remote, &branch))
         }
@@ -719,10 +743,12 @@ fn execute_at_with_db(
                         || msg.contains("no configured push destination")
                         || msg.contains("set-upstream")
                     {
-                        no_upstream_result(
-                            loc.git_text(&["rev-parse", "--abbrev-ref", "HEAD"]),
-                            &msg,
-                        )
+                        let branch = loc.git_text(&["rev-parse", "--abbrev-ref", "HEAD"]);
+                        let remote = branch
+                            .as_deref()
+                            .map(|branch| branch_remote(loc, branch))
+                            .unwrap_or_else(|| "origin".to_owned());
+                        no_upstream_result(branch, &msg, &remote)
                     } else {
                         GitOpResult::Err(first_line_str(&msg))
                     }
@@ -918,12 +944,23 @@ fn first_line_str(s: &str) -> String {
     s.lines().next().unwrap_or("git error").to_string()
 }
 
+fn branch_remote(loc: &GitLoc, branch: &str) -> String {
+    loc.git_text(&["config", "--get", &format!("branch.{branch}.remote")])
+        .ok()
+        .filter(|remote| !remote.is_empty())
+        .unwrap_or_else(|| "origin".to_owned())
+}
+
 fn no_upstream_result(
     branch: std::result::Result<String, GitTextError>,
     push_error: &str,
+    remote: &str,
 ) -> GitOpResult {
     match branch {
-        Ok(branch) if !branch.is_empty() && branch != "HEAD" => GitOpResult::NoUpstream { branch },
+        Ok(branch) if !branch.is_empty() && branch != "HEAD" => GitOpResult::NoUpstream {
+            remote: remote.to_owned(),
+            branch,
+        },
         Ok(_) | Err(_) => GitOpResult::Err(first_line_str(push_error)),
     }
 }
@@ -951,17 +988,22 @@ mod tests {
     #[test]
     fn no_upstream_needs_a_named_branch() {
         assert!(matches!(
-            no_upstream_result(Ok("feat".into()), "fatal: no upstream\nmore detail"),
-            GitOpResult::NoUpstream { branch } if branch == "feat"
+            no_upstream_result(Ok("feat".into()), "fatal: no upstream\nmore detail", "upstream"),
+            GitOpResult::NoUpstream { remote, branch }
+                if remote == "upstream" && branch == "feat"
         ));
         for branch in [Ok("HEAD".to_string()), Ok(String::new())] {
             assert!(matches!(
-                no_upstream_result(branch, "fatal: no upstream\nmore detail"),
+                no_upstream_result(branch, "fatal: no upstream\nmore detail", "origin"),
                 GitOpResult::Err(message) if message == "fatal: no upstream"
             ));
         }
         assert!(matches!(
-            no_upstream_result(Err(GitTextError::InvalidUtf8), "fatal: no upstream\nmore detail"),
+            no_upstream_result(
+                Err(GitTextError::InvalidUtf8),
+                "fatal: no upstream\nmore detail",
+                "origin"
+            ),
             GitOpResult::Err(message) if message == "fatal: no upstream"
         ));
     }
@@ -1403,9 +1445,24 @@ mod tests {
     #[test]
     fn labels_exist_for_every_op_shape() {
         assert_eq!(GitOp::StageAll.label(), "staging all");
+        assert_eq!(
+            GitOp::PushBranch {
+                branch: "feature".into(),
+                force: ForceMode::None,
+            }
+            .label(),
+            "pushing branch"
+        );
         assert!(
             GitOp::Push {
                 force: ForceMode::None
+            }
+            .touches_remote()
+        );
+        assert!(
+            GitOp::PushBranch {
+                branch: "feature".into(),
+                force: ForceMode::None,
             }
             .touches_remote()
         );

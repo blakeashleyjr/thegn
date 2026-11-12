@@ -4936,27 +4936,16 @@ fn handle_git_msg(
             ));
         }
         GitMsg::Pull => {
-            if let Some(message) =
-                gitui::head_only_refusal(&model.panel, sel_branch(panel_ui, model).as_ref(), "pull")
-            {
-                model.status = message;
-            } else {
-                enqueue(panel_ui, model, GitOp::Pull);
+            if let Some(op) = gitui::branch_pull_op(sel_branch(panel_ui, model).as_ref()) {
+                enqueue(panel_ui, model, op);
             }
         }
         GitMsg::Push => {
-            if let Some(message) =
-                gitui::head_only_refusal(&model.panel, sel_branch(panel_ui, model).as_ref(), "push")
-            {
-                model.status = message;
-            } else {
-                enqueue(
-                    panel_ui,
-                    model,
-                    GitOp::Push {
-                        force: thegn_svc::git::ForceMode::None,
-                    },
-                );
+            if let Some(op) = gitui::branch_push_op(
+                sel_branch(panel_ui, model).as_ref(),
+                thegn_svc::git::ForceMode::None,
+            ) {
+                enqueue(panel_ui, model, op);
             }
         }
         GitMsg::FastForward => {
@@ -12003,11 +11992,11 @@ async fn event_loop<T: Terminal>(
                         r.todos_synced = false;
                     }
                 }
-                GitOpResult::NoUpstream { branch } => {
+                GitOpResult::NoUpstream { remote, branch } => {
                     rehydrate = false;
                     // Push failed: no upstream. Offer to push -u so the
-                    // branch tracks origin/<branch> from now on.
-                    let remote_branch = format!("origin/{branch}");
+                    // branch tracks the configured remote from now on.
+                    let remote_branch = format!("{remote}/{branch}");
                     active_menu = Some(menu::confirm_menu(
                         "no upstream branch",
                         format!("push and track {remote_branch}?"),
@@ -12015,10 +12004,7 @@ async fn event_loop<T: Terminal>(
                         String::new(),
                         false,
                     ));
-                    pending_confirm_op = Some(GitOp::PushSetUpstream {
-                        remote: "origin".to_owned(),
-                        branch,
-                    });
+                    pending_confirm_op = Some(GitOp::PushSetUpstream { remote, branch });
                 }
             }
             if rehydrate {
