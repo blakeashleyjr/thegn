@@ -549,10 +549,13 @@ It also exposes `drawerCommand`, `drawerConfigHome`, `drawerHeight`,
 and `drawerPrewarm` for `[drawer]`, and `stripVisible` for `[strip]` `visible`.
 These options default to `null`, which uses the binary's default.
 
-The `[git]` scalars are `gitOverrideGpg`, `gitMergeGuard`, `gitAutoFetch`,
-`gitAutoFetchIntervalSecs`, `gitAutoFetchMinIntervalSecs`,
-`gitAutoFetchNotify` and `gitAutoFetchColocated`; an interval of `0` disables
-the periodic auto-fetch poll. The `[stats]` masthead widgets take
+The `[git]` scalars are `gitBackend` (`auto`, `gix` or `cli`), `gitOverrideGpg`,
+`gitMergeGuard`, `gitAutoFetch`, `gitAutoFetchIntervalSecs`,
+`gitAutoFetchMinIntervalSecs`, `gitAutoFetchNotify`, `gitStructuralDiff`
+(`off`, `auto` or `difft`), `gitAutoFetchColocated` and `gitSubmodules`
+(`auto` or `off`); an interval of `0` disables the periodic auto-fetch poll.
+These git enum options are exposed with canonical spellings only; the float,
+list and table-valued git/stat settings remain omitted. The `[stats]` masthead widgets take
 `statsCpuIcon`, `statsMemIcon`, `statsNetIcon`, `statsGpuIcon`, `statsTempIcon`,
 `statsSwapIcon`, `statsFreqIcon`, `statsLoadIcon`, `statsUptimeIcon`,
 `statsBatteryIcon`, `statsBatteryChargingIcon` and `statsDiskIcon` (text or a
