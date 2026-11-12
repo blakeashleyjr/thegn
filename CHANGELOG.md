@@ -7,6 +7,28 @@ All notable changes to **thegn** are documented here. The format follows
 
 ## [Unreleased]
 
+### Added
+
+- `thegn session open --permissions` grants per-launch permissions to a Claude session; they can only narrow the agent entry's grants unless
+  `--widen-permissions` is given.
+- `thegn land --trust-gate` skips the gate only when a trusted attestation matches the branch commit and tree and the current target tip is its ancestor;
+  otherwise it runs the gate. Lands from a non-root worktree are recorded in the session roster.
+- `thegn integrate --order a,b,c --into <branch> [--from <slug>]` folds named branches in that order onto a stack branch and prints a resume command on conflict;
+  branches folded into a stack branch are not cleaned up as landed.
+- `[sandbox.limits] heavy_slots` and `max_load` (off by default) limit how many heavyweight gates run at once across processes and wait for the load average
+  to drop.
+- The Home Manager module exposes the `[git]` options `backend`,
+  `structural_diff` and `submodules` as enums.
+- The sandbox end-to-end test verifies that a stage worker can commit in its
+  worktree but cannot write outside it.
+
+### Fixed
+
+- GitHub CLI calls have deadlines (30 seconds for reads, longer for PR diffs and up to 10 minutes for merges and PR creation), so a hung `gh` no longer
+  stalls thegn.
+- In the Git panel, `P` pushes the selected branch and `p` pulls the checked-out branch or fast-forwards another selected branch; neither shortcut
+  forces a push or changes upstream configuration.
+
 ## [0.1.0-alpha.69] — 2026-11-12
 
 ### Added
