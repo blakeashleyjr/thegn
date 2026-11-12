@@ -690,4 +690,46 @@ done
         }
         assert!(!marker.exists());
     }
+
+    #[test]
+    fn trigger_input_count_cap_is_enforced_before_sending() {
+        let temp = tempfile::tempdir().unwrap();
+        let marker = temp.path().join("ops");
+        let script = format!(
+            "while read -r line; do printf 'called\\n' >> '{}'; done",
+            marker.display()
+        );
+        let rt = runtime();
+        let (_fixture, _session, bridge) = live_ci_bridge(&script, Duration::from_millis(200));
+        let provider = adapter(bridge, &rt, all_caps());
+        let inputs = (0..65)
+            .map(|index| (format!("INPUT_{index}"), "value".to_string()))
+            .collect::<Vec<_>>();
+
+        assert!(matches!(
+            provider.trigger(&loc(), "ci.yml", &inputs),
+            Err(CiError::Other(message))
+                if message.contains("too many workflow inputs") && message.contains("64")
+        ));
+        assert!(!marker.exists());
+    }
+
+    #[test]
+    fn trigger_input_count_cap_allows_exactly_64_inputs() {
+        let temp = tempfile::tempdir().unwrap();
+        let marker = temp.path().join("ops");
+        let script = format!(
+            "while read -r line; do printf 'called\\n' >> '{}'; id=${{line#*'\"id\":'}}; id=${{id%%,*}}; printf '{{\"id\":%s,\"result\":true}}\\n' \"$id\"; done",
+            marker.display()
+        );
+        let rt = runtime();
+        let (_fixture, _session, bridge) = live_ci_bridge(&script, Duration::from_secs(3));
+        let provider = adapter(bridge, &rt, all_caps());
+        let inputs = (0..64)
+            .map(|index| (format!("INPUT_{index}"), "value".to_string()))
+            .collect::<Vec<_>>();
+
+        assert!(provider.trigger(&loc(), "ci.yml", &inputs).is_ok());
+        assert_eq!(std::fs::read_to_string(marker).unwrap(), "called\n");
+    }
 }

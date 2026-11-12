@@ -9,6 +9,20 @@ All notable changes to **thegn** are documented here. The format follows
 
 ### Added
 
+- The Home Manager module exposes `[preview]` `enabled`, `fetch_timeout_ms` and
+  `max_body_bytes`; ports and external URLs remain config-file-only.
+- `docs/help/sandboxing.md` documents preserving worker reports with a writable
+  `mounts` entry under `[env.*]`; the private-`/tmp` warning skips covered paths.
+
+### Security
+
+- The local `act` guard scans user-level actrc files (XDG/`~/.actrc` and macOS
+  Application Support) for credentials using act's own line tokenizer.
+
+## [0.1.0-alpha.65] — 2026-11-12
+
+### Added
+
 - `session snapshot`, `session attach` and `session wait` accept the session id
   positionally as well as through `--session`.
 - `session open --track <issue>` records an ad-hoc worker in the dispatch roster,
@@ -3195,7 +3209,8 @@ launcher picker and the merge queue's `agent_command` hook remain — they run
 whatever commands you configure. Leftover `[llm_proxy]` config sections and
 `proxy_*` tables in existing state databases are ignored harmlessly.
 
-[Unreleased]: https://github.com/blakeashleyjr/thegn/compare/v0.1.0-alpha.64...HEAD
+[Unreleased]: https://github.com/blakeashleyjr/thegn/compare/v0.1.0-alpha.65...HEAD
+[0.1.0-alpha.65]: https://github.com/blakeashleyjr/thegn/compare/v0.1.0-alpha.64...v0.1.0-alpha.65
 [0.1.0-alpha.64]: https://github.com/blakeashleyjr/thegn/compare/v0.1.0-alpha.63...v0.1.0-alpha.64
 [0.1.0-alpha.63]: https://github.com/blakeashleyjr/thegn/compare/v0.1.0-alpha.62...v0.1.0-alpha.63
 [0.1.0-alpha.62]: https://github.com/blakeashleyjr/thegn/compare/v0.1.0-alpha.61...v0.1.0-alpha.62
