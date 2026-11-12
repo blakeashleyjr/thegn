@@ -1006,15 +1006,15 @@ pub fn effective_agent_with(
         }
     }
     if !launch_permissions.is_empty() {
-        if !eff.permissions.is_empty() && !widen {
-            if let Some(grant) = launch_permissions
+        if !eff.permissions.is_empty()
+            && !widen
+            && let Some(grant) = launch_permissions
                 .iter()
                 .find(|grant| !eff.permissions.iter().any(|baseline| baseline == *grant))
-            {
-                return Err(format!(
-                    "--permissions would widen the configured grants of `{name}` ({grant}); pass --widen-permissions to override"
-                ));
-            }
+        {
+            return Err(format!(
+                "--permissions would widen the configured grants of `{name}` ({grant}); pass --widen-permissions to override"
+            ));
         }
         eff.permissions = launch_permissions.to_vec();
     }
