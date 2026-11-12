@@ -527,7 +527,7 @@ mod tests {
                 None,
                 "open is a config-only escape hatch",
             ),
-            (None, None, Some("   "), "folder name cannot be empty"),
+            (None, None, Some("   "), "folder name must not be empty"),
         ] {
             let error = validate_names(
                 repo.path(),
