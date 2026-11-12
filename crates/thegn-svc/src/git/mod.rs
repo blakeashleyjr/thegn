@@ -236,6 +236,9 @@ pub fn is_conflict(f: &FileStatus) -> bool {
 /// unit separator). Connector rows contain only graph characters and spaces.
 /// Any malformed row rejects the entire result.
 pub fn parse_log_graph(out: &str) -> Result<Vec<LogRow>> {
+    if !out.is_empty() && !out.ends_with('\n') {
+        anyhow::bail!("log graph output truncated: missing final newline");
+    }
     let mut rows = Vec::new();
     for (index, line) in out.lines().enumerate() {
         let row_number = index + 1;
@@ -1170,6 +1173,9 @@ fn parse_status_porcelain(out: &str) -> Vec<FileStatus> {
 /// error rather than a plausible zero. Counts beyond `u32::MAX` are rejected
 /// (a single file cannot sensibly exceed it) without allocating for them.
 pub(crate) fn parse_numstat(out: &str) -> Result<Vec<DiffEntry>> {
+    if !out.is_empty() && !out.ends_with('\n') {
+        anyhow::bail!("numstat output truncated: missing final newline");
+    }
     fn count(s: &str) -> Option<u32> {
         // Bound the digits before parsing; `u32` needs at most 10.
         if s.is_empty() || s.len() > 10 || !s.bytes().all(|b| b.is_ascii_digit()) {
@@ -3542,6 +3548,18 @@ mod tests {
     }
 
     #[test]
+    fn parse_numstat_rejects_output_truncated_inside_the_last_row() {
+        let truncated = "1\t2\tpath";
+        let error = parse_numstat(truncated).unwrap_err().to_string();
+        assert!(error.contains("truncated: missing final newline"));
+    }
+
+    #[test]
+    fn parse_numstat_accepts_empty_output() {
+        assert!(parse_numstat("").unwrap().is_empty());
+    }
+
+    #[test]
     fn typed_totals_marks_saturation_binary_and_unavailable() {
         let max = u32::MAX;
         let saturated = [
@@ -4675,10 +4693,21 @@ mod tests {
         assert_eq!(rows[2].graph, "| *");
         assert!(!rows[2].is_head());
         assert_eq!(rows[3].refs, "tag: v0.1");
-        let spoof = parse_log_graph("* \u{1f}abc123\u{1f}\u{1f}x\u{1f}HEAD -> main").unwrap();
+        let spoof = parse_log_graph("* \u{1f}abc123\u{1f}\u{1f}x\u{1f}HEAD -> main\n").unwrap();
         assert_eq!(spoof[0].refs, "");
         assert_eq!(spoof[0].subject, "x\u{1f}HEAD -> main");
         assert!(!spoof[0].is_head());
+    }
+
+    #[test]
+    fn parse_log_graph_rejects_output_truncated_inside_the_last_row() {
+        let truncated = "* \u{1f}abc1234\u{1f}\u{1f}subject";
+        let error = parse_log_graph(truncated).unwrap_err().to_string();
+        assert!(error.contains("truncated: missing final newline"));
+    }
+
+    #[test]
+    fn parse_log_graph_accepts_empty_output() {
         assert_eq!(parse_log_graph("").unwrap(), Vec::<LogRow>::new());
     }
 
