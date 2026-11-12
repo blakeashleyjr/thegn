@@ -4233,12 +4233,11 @@ fn bwrap_resolver_bind_is_covered_for_nested_user_mounts() {
 
 #[test]
 fn bwrap_mount_under_private_tmp_is_bound_after_the_tmpfs() {
-    let temp = tempfile::tempdir_in(std::env::temp_dir()).unwrap();
-    let report_dir = temp.path().to_string_lossy().into_owned();
+    let report_dir = "/tmp/thegn-report-test";
     let mut sandbox = spec(Backend::Bwrap);
     sandbox.mounts.push(Mount {
-        host: report_dir.clone(),
-        dest: report_dir.clone(),
+        host: report_dir.into(),
+        dest: report_dir.into(),
         ro: false,
         cache: false,
     });
@@ -4250,7 +4249,7 @@ fn bwrap_mount_under_private_tmp_is_bound_after_the_tmpfs() {
         .expect("bwrap must create a private /tmp");
     let bind = argv
         .windows(3)
-        .position(|window| window == ["--bind", report_dir.as_str(), report_dir.as_str()])
+        .position(|window| window == ["--bind", report_dir, report_dir])
         .expect("the report mount must not be dropped");
     assert!(tmpfs < bind, "private /tmp must precede the report bind");
 }

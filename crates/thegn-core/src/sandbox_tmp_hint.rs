@@ -66,7 +66,7 @@ pub fn has_private_tmp(spec: &SandboxSpec) -> bool {
 }
 
 /// Keep only prompt paths whose `/tmp` contents are hidden by the sandbox.
-/// Explicit mounts at or above a path make that path host-visible.
+/// Explicit writable mounts at or above a path make that path host-visible.
 pub fn private_tmp_paths(spec: &SandboxSpec, paths: &[String]) -> Vec<String> {
     if !has_private_tmp(spec) {
         return Vec::new();
@@ -77,7 +77,7 @@ pub fn private_tmp_paths(spec: &SandboxSpec, paths: &[String]) -> Vec<String> {
             !spec
                 .mounts
                 .iter()
-                .any(|mount| std::path::Path::new(path).starts_with(&mount.dest))
+                .any(|mount| !mount.ro && std::path::Path::new(path).starts_with(&mount.dest))
         })
         .cloned()
         .collect()
@@ -221,6 +221,19 @@ mod tests {
             private_tmp_paths(&sandbox, &paths),
             vec!["/tmp/reports-other/x"]
         );
+    }
+
+    #[test]
+    fn private_tmp_paths_keeps_paths_covered_by_read_only_mounts() {
+        let mut sandbox = spec(Backend::Bwrap, FileAccess::Worktree, false);
+        sandbox.mounts.push(Mount {
+            host: "/host/reports".into(),
+            dest: "/tmp/reports".into(),
+            ro: true,
+            cache: false,
+        });
+        let paths = vec!["/tmp/reports/result.md".into()];
+        assert_eq!(private_tmp_paths(&sandbox, &paths), paths);
     }
 
     #[test]
