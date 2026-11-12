@@ -10,7 +10,7 @@
 use crate::sandbox::{self, Backend, EnterError, RefusalClass, SandboxSpec};
 use sha2::{Digest, Sha256};
 use std::io::Read;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 pub const VOLUME_OWNER_LABEL: &str = "thegn.volume.owner";
 pub const DEVCONTAINER_VOLUME_ROLE: &str = "devcontainer";
@@ -215,13 +215,15 @@ where
         return Ok(());
     }
     let anchor = state_home.join("thegn");
-    crate::fsperm::ensure_private_dir(&anchor).map_err(|error| {
-        refused(
-            spec,
-            "<state>",
-            &format!("claim directory unavailable: {error}"),
-        )
-    })?;
+    if !anchor.exists() {
+        crate::fsperm::ensure_private_dir(&anchor).map_err(|error| {
+            refused(
+                spec,
+                "<state>",
+                &format!("claim directory unavailable: {error}"),
+            )
+        })?;
+    }
     let dir = crate::fsperm::ensure_private_dir_beneath(&anchor, Path::new("devcontainer-volumes"))
         .map_err(|error| {
             refused(
@@ -341,6 +343,7 @@ mod tests {
     use super::*;
     use crate::config::{FileAccess, Network};
     use crate::placement::Placement;
+    use std::path::PathBuf;
 
     const OWNER: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
 
@@ -499,12 +502,13 @@ mod tests {
         let dir = state.join("thegn/devcontainer-volumes");
         assert!(dir.is_dir());
         assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 1);
-        if cfg!(unix) {
-            assert_eq!(crate::fsperm::mode_bits(&dir).unwrap(), Some(0o700));
-            assert_eq!(
-                crate::fsperm::mode_bits(&dir.join(record_path(&spec(OWNER), "data"))).unwrap(),
-                Some(0o600)
-            );
+        if let Some(mode) = crate::fsperm::mode_bits(&dir).unwrap() {
+            assert_eq!(mode, 0o700);
+        }
+        if let Some(mode) =
+            crate::fsperm::mode_bits(&dir.join(record_path(&spec(OWNER), "data"))).unwrap()
+        {
+            assert_eq!(mode, 0o600);
         }
     }
 
@@ -517,6 +521,23 @@ mod tests {
         claim_volumes(&spec(OWNER), &state, &mut runner).unwrap();
 
         assert!(state.join("thegn/devcontainer-volumes").is_dir());
+    }
+
+    #[test]
+    fn existing_symlinked_thegn_anchor_is_supported() {
+        let temp = tempfile::tempdir().unwrap();
+        let state = temp.path().join("state");
+        let anchor_target = temp.path().join("anchor-target");
+        std::fs::create_dir_all(&state).unwrap();
+        std::fs::create_dir(&anchor_target).unwrap();
+        if crate::fsperm::create_symlink(&anchor_target, &state.join("thegn"), true).is_err() {
+            return;
+        }
+
+        let mut runner = |_: &[String]| Some((true, "\n".into(), String::new()));
+        claim_volumes(&spec(OWNER), &state, &mut runner).unwrap();
+
+        assert!(anchor_target.join("devcontainer-volumes").is_dir());
     }
 
     #[test]
