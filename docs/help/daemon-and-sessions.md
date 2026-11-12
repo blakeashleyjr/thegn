@@ -94,6 +94,8 @@ the other verbs take:
 | `thegn session fork <id>`                  | start a new daemon session from a live session; `--tab` places it in a new tab  |
 | `thegn session record <id>`                | record its output to a `.cast` file; `--stop` finalizes, `--status` reports     |
 
+`session snapshot`, `session attach`, and `session wait` accept the id either positionally or with `--session`.
+
 Session output replaces terminal control and invisible formatting characters
 in ids, programs, worktree paths, and fork sources with U+FFFD. `--json` escapes
 those characters as `\uXXXX`, preserving parsed values and the layout of clean
@@ -219,6 +221,21 @@ launch layers the stage's `model` / `env` / `permissions` over the agent —
 see [[configuration]]. The roster side (verify a finished row, wait on one,
 gate `done`) is [[cli]]'s `dispatch verify` / `dispatch wait` /
 `dispatch set-status done`.
+
+For an ad-hoc plain worker, add `--track <issue-id>` to `session open`.
+This requires `--worktree` and records a plain, running dispatch row bound to
+the opened session, so `dispatch list`, `dispatch wait`, `dispatch verify`,
+and the sidebar can see it. The session is opened before the row is inserted;
+if tracking fails, the new session is killed. A headless worker that exits
+before the row insert completes can outpace the daemon's bounded exit lookup;
+the row is then left for reconciliation. `--track` cannot be combined with
+`--issue` or `--resume-work`; `--stage` may still layer launch settings onto
+the plain open.
+
+A plain `session open` can read its prompt from `--brief-file <path>`; repeat
+`--vars key=value` to render bindings (without bindings, braces in the file
+remain literal). These options are for issue-free opens and are checked before
+connecting to the daemon.
 
 Before launching, `session open --stage --issue` fetches the issue once and
 writes it to `<worktree>/.thegn/maintenance/issue.json` (atomic, always

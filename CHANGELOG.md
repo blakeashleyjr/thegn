@@ -7,6 +7,20 @@ All notable changes to **thegn** are documented here. The format follows
 
 ## [Unreleased]
 
+### Added
+
+- `session snapshot`, `session attach` and `session wait` accept the session id
+  positionally as well as through `--session`.
+- `session open --track <issue>` records an ad-hoc worker in the dispatch roster,
+  where `dispatch list`, `dispatch wait` and `dispatch verify` can see it.
+- `session open --brief-file F --vars k=v` supports file-backed prompt templates
+  for lanes without an issue.
+- `session open` warns on stderr when its prompt names a `/tmp/` path hidden by
+  a private sandbox `/tmp`.
+- `wt new --batch FILE` creates multiple worktree lanes from one batch file.
+
+## [0.1.0-alpha.64] — 2026-11-11
+
 ## [0.1.0-alpha.63] — 2026-11-11
 
 ### Added
@@ -3181,7 +3195,8 @@ launcher picker and the merge queue's `agent_command` hook remain — they run
 whatever commands you configure. Leftover `[llm_proxy]` config sections and
 `proxy_*` tables in existing state databases are ignored harmlessly.
 
-[Unreleased]: https://github.com/blakeashleyjr/thegn/compare/v0.1.0-alpha.63...HEAD
+[Unreleased]: https://github.com/blakeashleyjr/thegn/compare/v0.1.0-alpha.64...HEAD
+[0.1.0-alpha.64]: https://github.com/blakeashleyjr/thegn/compare/v0.1.0-alpha.63...v0.1.0-alpha.64
 [0.1.0-alpha.63]: https://github.com/blakeashleyjr/thegn/compare/v0.1.0-alpha.62...v0.1.0-alpha.63
 [0.1.0-alpha.62]: https://github.com/blakeashleyjr/thegn/compare/v0.1.0-alpha.61...v0.1.0-alpha.62
 [0.1.0-alpha.61]: https://github.com/blakeashleyjr/thegn/compare/v0.1.0-alpha.60...v0.1.0-alpha.61

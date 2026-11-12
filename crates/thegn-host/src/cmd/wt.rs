@@ -77,12 +77,28 @@ pub enum Action {
     /// Create a worktree headlessly (no sandbox prep — the compositor
     /// prepares lazily on first open). Prints the new worktree's absolute
     /// path as its only plain output, so `cd $(thegn wt new x)` works.
+    #[command(
+        group(
+            clap::ArgGroup::new("name_or_batch")
+                .args(["name", "batch"])
+                .multiple(true)
+        )
+    )]
+    #[group(skip)]
     New {
         /// Branch-name tail (the configured prefix + numbering scheme are
         /// applied, unless `--exact-branch` uses it verbatim and requires it);
         /// omitted = a generated candidate name. Required with `--program`
-        /// (the feature's linked branch name).
+        /// (the feature's linked branch name). Use `--batch` to create many
+        /// lanes from a file.
         name: Option<String>,
+        /// Create one lane per non-comment line in this file.
+        #[arg(
+            long,
+            value_name = "FILE",
+            conflicts_with_all = ["name", "from_issue", "program", "repos"]
+        )]
+        batch: Option<String>,
         /// Repo to create in (default: resolved from cwd / $THEGN_WORKTREE).
         #[arg(long)]
         repo: Option<String>,
@@ -112,7 +128,7 @@ pub enum Action {
         /// Use `name` verbatim as the full branch name, skipping the configured
         /// prefix and numbering scheme. Refuses an invalid ref name or a branch
         /// that already exists.
-        #[arg(long, requires = "name", conflicts_with = "program")]
+        #[arg(long, requires = "name_or_batch", conflicts_with = "program")]
         exact_branch: bool,
         /// Emit the created worktree as one JSON object.
         #[arg(long)]
@@ -168,6 +184,7 @@ pub fn run_with_config(cfg: &Config, action: Action, config_path: &std::path::Pa
         Action::List(a) => super::list::run(cfg, a.json),
         Action::New {
             name,
+            batch,
             repo,
             base,
             env,
@@ -184,18 +201,36 @@ pub fn run_with_config(cfg: &Config, action: Action, config_path: &std::path::Pa
                     "worktree isolation profiles are host-owned; wt new cannot set one from inside a sandbox"
                 );
             }
+            if let Some(batch) = batch {
+                return super::wt_batch::run(
+                    cfg,
+                    &batch,
+                    super::wt_batch::BatchOptions {
+                        repo,
+                        base,
+                        env,
+                        profile,
+                        exact_branch,
+                        folder,
+                        json,
+                    },
+                    config_path.parent().unwrap_or(std::path::Path::new("")),
+                );
+            }
             match program {
                 Some(p) => new_batched(cfg, name, &p, repos, base, env, profile, folder, json),
                 None => new(
                     cfg,
-                    name,
-                    repo,
-                    base,
-                    env,
-                    profile,
-                    from_issue,
-                    exact_branch,
-                    folder,
+                    NewOptions {
+                        name,
+                        repo,
+                        base,
+                        env,
+                        profile,
+                        from_issue,
+                        exact_branch,
+                        folder,
+                    },
                     json,
                     config_path.parent().unwrap_or(std::path::Path::new("")),
                 ),
@@ -223,20 +258,57 @@ pub fn run_with_config(cfg: &Config, action: Action, config_path: &std::path::Pa
 
 /// `wt new` — the TUI wizard's creation pipeline (wizard.rs `run_worker`)
 /// minus UI and sandbox prep: name → base → `git worktree add` → DB register.
-#[allow(clippy::too_many_arguments)]
-fn new(
+fn new(cfg: &Config, options: NewOptions, json: bool, config_dir: &std::path::Path) -> Result<()> {
+    let (created, filing_error) = new_core(cfg, options, config_dir)?;
+
+    if json {
+        super::emit_json(&created)?;
+    } else {
+        outln!("{}", created.path);
+    }
+    // The worktree exists and is fully set up; only the folder label failed.
+    // Report the path first so a caller still learns where it is, then fail.
+    match filing_error {
+        Some(e) => Err(e),
+        None => Ok(()),
+    }
+}
+
+#[derive(Debug, serde::Serialize)]
+pub(crate) struct Created {
+    pub(crate) branch: String,
+    pub(crate) path: String,
+    pub(crate) root: String,
+    pub(crate) base: String,
+}
+
+pub(crate) struct NewOptions {
+    pub(crate) name: Option<String>,
+    pub(crate) repo: Option<String>,
+    pub(crate) base: Option<String>,
+    pub(crate) env: Option<String>,
+    pub(crate) profile: Option<String>,
+    pub(crate) from_issue: Option<String>,
+    pub(crate) exact_branch: bool,
+    pub(crate) folder: Option<String>,
+}
+
+/// Non-printing `wt new` core shared by the single-lane and batch paths.
+pub(crate) fn new_core(
     cfg: &Config,
-    name: Option<String>,
-    repo: Option<String>,
-    base: Option<String>,
-    env: Option<String>,
-    profile: Option<String>,
-    from_issue: Option<String>,
-    exact_branch: bool,
-    folder: Option<String>,
-    json: bool,
+    options: NewOptions,
     config_dir: &std::path::Path,
-) -> Result<()> {
+) -> Result<(Created, Option<anyhow::Error>)> {
+    let NewOptions {
+        name,
+        repo,
+        base,
+        env,
+        profile,
+        from_issue,
+        exact_branch,
+        folder,
+    } = options;
     let profile = profile
         .as_deref()
         .map(thegn_core::sandbox_pin::parse_pin)
@@ -313,35 +385,24 @@ fn new(
         let _ = db.link_issue(&path_s, id); // best-effort: cache write: the DB is a cache; git/forge stays the source of truth
     }
 
-    if json {
-        #[derive(serde::Serialize)]
-        struct Created<'a> {
-            branch: &'a str,
-            path: &'a str,
-            root: &'a str,
-            base: &'a str,
-        }
-        super::emit_json(&Created {
-            branch: &branch,
-            path: &path_s,
-            root: &root_s,
-            base: &base,
-        })?;
-    } else {
-        outln!("{path_s}");
-    }
-    // The worktree exists and is fully set up; only the folder label failed.
-    // Report the path first so a caller still learns where it is, then fail.
-    match filing_error {
-        Some(e) => Err(e),
-        None => Ok(()),
-    }
+    Ok((
+        Created {
+            branch,
+            path: path_s,
+            root: root_s,
+            base,
+        },
+        filing_error,
+    ))
 }
 
 /// `--exact-branch`: `name` verbatim as the branch, no prefix/numbering.
 /// Unlike the plain-name path (which dedupes with a `-N` suffix), an existing
 /// branch is refused rather than attached or renamed.
-fn exact_branch_name(name: Option<&str>, taken: impl Fn(&str) -> bool) -> Result<String> {
+pub(crate) fn exact_branch_name(
+    name: Option<&str>,
+    taken: impl Fn(&str) -> bool,
+) -> Result<String> {
     let name = name
         .filter(|n| !n.trim().is_empty())
         .ok_or_else(|| anyhow::anyhow!("--exact-branch requires a branch name"))?;
@@ -1308,7 +1369,7 @@ fn delete_branch_guard_inputs(root: &std::path::Path) -> Result<(String, Option<
 
 /// Whether `base` names a commit in `root`. `git rev-parse --verify --quiet` exits 1 (empty stderr) when it
 /// does not; any other failure is an error, not "no commits".
-fn base_has_commits(root: &std::path::Path, base: &str) -> Result<bool> {
+pub(crate) fn base_has_commits(root: &std::path::Path, base: &str) -> Result<bool> {
     let loc = thegn_core::remote::GitLoc::Local(root.to_path_buf());
     match loc.git_text(&["rev-parse", "--verify", "--quiet", base]) {
         Ok(_) => Ok(true),
@@ -1905,6 +1966,19 @@ mod folder_tests {
     fn exact_branch_flag_constraints() {
         assert!(parse(&["thegn", "wt", "new", "tg/x", "--exact-branch"]).is_ok());
         assert!(parse(&["thegn", "wt", "new", "--exact-branch"]).is_err());
+        assert!(parse(&["thegn", "wt", "new", "--batch", "lanes.txt"]).is_ok());
+        assert!(
+            parse(&[
+                "thegn",
+                "wt",
+                "new",
+                "--batch",
+                "lanes.txt",
+                "--exact-branch"
+            ])
+            .is_ok()
+        );
+        assert!(parse(&["thegn", "wt", "new", "name", "--batch", "lanes.txt"]).is_err());
         assert!(
             parse(&[
                 "thegn",
