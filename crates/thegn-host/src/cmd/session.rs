@@ -24,6 +24,10 @@ use thegn_svc::control::client::{AttachControl, ControlAddr, ControlClient};
 // any roster row exists, a grant the harness cannot take (`policy_admission`).
 
 #[derive(clap::Subcommand, Clone)]
+#[expect(
+    clippy::large_enum_variant,
+    reason = "clap subcommand parsed once per process; boxing the Open fields buys nothing"
+)]
 pub enum SessionAction {
     /// Move one persisted worktree presentation and dispatch ledger to an
     /// existing profile. This is deliberately a host operation: it crosses
@@ -80,6 +84,18 @@ pub enum SessionAction {
         /// The task to seed the first turn with. Empty ⇒ launch interactively.
         #[arg(long, default_value = "")]
         prompt: String,
+        /// Read the plain-open prompt from this file. The file is a template
+        /// only when at least one `--vars` binding is supplied.
+        #[arg(long, conflicts_with_all = ["prompt", "issue", "resume_work"])]
+        brief_file: Option<String>,
+        /// Bind `KEY=VALUE` in `--brief-file` (repeatable).
+        #[arg(
+            long,
+            value_name = "KEY=VALUE",
+            requires = "brief_file",
+            conflicts_with_all = ["prompt", "issue", "resume_work"]
+        )]
+        vars: Vec<String>,
         /// Run headlessly (`claude -p …`). Defaults to headless exactly when a
         /// prompt is given.
         #[arg(long)]
@@ -96,6 +112,15 @@ pub enum SessionAction {
         /// that worktree is opened. The session opens either way.
         #[arg(long)]
         adopt: bool,
+        /// Track this plain session in the dispatch roster using the supplied
+        /// issue id (`linear:THE-1976`). Requires `--worktree`; unlike
+        /// `--stage --issue`, this opens the session before creating the row.
+        #[arg(
+            long,
+            requires = "worktree",
+            conflicts_with_all = ["issue", "resume_work"]
+        )]
+        track: Option<String>,
         /// A `[[pipeline.stages]]` name, with two behaviors. With `--issue`,
         /// the full dispatch: render the stage's prompt template, open the
         /// session headless and write the roster row, in one call — an
@@ -222,8 +247,16 @@ pub enum SessionAction {
     },
     /// Dump a session's current screen.
     Snapshot {
-        #[arg(long)]
-        session: String,
+        /// Target session id (see `session list`).
+        #[arg(long, conflicts_with = "session_pos")]
+        session: Option<String>,
+        /// Target session id (see `session list`).
+        #[arg(
+            value_name = "SESSION",
+            id = "session_pos",
+            required_unless_present = "session"
+        )]
+        session_pos: Option<String>,
         /// Emit JSON (geometry + base64 ANSI) instead of raw screen text.
         #[arg(long)]
         json: bool,
@@ -236,14 +269,30 @@ pub enum SessionAction {
     /// Stream a session's live output to stdout (Ctrl-C detaches; the
     /// session keeps running).
     Attach {
-        #[arg(long)]
-        session: String,
+        /// Target session id (see `session list`).
+        #[arg(long, conflicts_with = "session_pos")]
+        session: Option<String>,
+        /// Target session id (see `session list`).
+        #[arg(
+            value_name = "SESSION",
+            id = "session_pos",
+            required_unless_present = "session"
+        )]
+        session_pos: Option<String>,
     },
     /// Block until a session reaches a state (agent-driving `wait`). Exit 0 on
     /// match, 2 on timeout, 1 if no daemon.
     Wait {
-        #[arg(long)]
-        session: String,
+        /// Target session id (see `session list`).
+        #[arg(long, conflicts_with = "session_pos")]
+        session: Option<String>,
+        /// Target session id (see `session list`).
+        #[arg(
+            value_name = "SESSION",
+            id = "session_pos",
+            required_unless_present = "session"
+        )]
+        session_pos: Option<String>,
         /// Condition: `exited` | `idle` | `blocked` | `done` | `match:<regex>`.
         #[arg(long, default_value = "exited")]
         until: String,
@@ -418,6 +467,19 @@ async fn run_async(cfg: &Config, action: SessionAction) -> Result<()> {
     // daemon-free) — see `open_preflight`. `--resume-work` carries its own
     // offline row checks (unknown row, non-pipeline row, unknown stage) in
     // `resume_preflight`, the same pre-`connect` slot.
+    let resolved_open_prompt = match &action {
+        SessionAction::Open {
+            prompt,
+            brief_file,
+            vars,
+            ..
+        } => Some(crate::cmd::session_brief::resolve_brief(
+            prompt,
+            brief_file.as_deref(),
+            vars,
+        )?),
+        _ => None,
+    };
     match &action {
         SessionAction::Move { .. } => {
             // Migration is dispatched before `connect`: a cold source daemon
@@ -429,10 +491,20 @@ async fn run_async(cfg: &Config, action: SessionAction) -> Result<()> {
             issue,
             prompt,
             headless,
+            track,
+            worktree,
             resume_work: None,
             ..
         } => {
-            open_preflight(cfg, stage.as_deref(), issue.as_deref(), prompt, *headless)?;
+            open_preflight(
+                cfg,
+                stage.as_deref(),
+                issue.as_deref(),
+                track.as_deref(),
+                worktree.as_deref(),
+                resolved_open_prompt.as_deref().unwrap_or(prompt),
+                *headless,
+            )?;
         }
         SessionAction::Open {
             resume_work: Some(row_id),
@@ -475,7 +547,9 @@ async fn run_async(cfg: &Config, action: SessionAction) -> Result<()> {
         SessionAction::Open {
             agent,
             worktree,
-            prompt,
+            prompt: _,
+            brief_file: _,
+            vars: _,
             headless,
             bind,
             adopt,
@@ -487,6 +561,7 @@ async fn run_async(cfg: &Config, action: SessionAction) -> Result<()> {
             lease,
             owner,
             lease_gen,
+            track,
             resume_work: resume_row,
             json,
         } => {
@@ -566,6 +641,12 @@ async fn run_async(cfg: &Config, action: SessionAction) -> Result<()> {
                 let wt = crate::cmd::resolve_worktree(worktree)
                     .to_string_lossy()
                     .into_owned();
+                // The launch prompt is final here (a --brief-file brief is already
+                // read and rendered), so the private-/tmp warning sees what the
+                // agent will see (THE-1979).
+                let launch_prompt =
+                    resolved_open_prompt.expect("plain open prompt was resolved before connect");
+                crate::cmd::session_tmp_warn::warn_if_private_tmp(cfg, &wt, &launch_prompt);
                 let spec = OpenSpec {
                     automation_origin: None,
                     argv: Vec::new(),
@@ -573,10 +654,10 @@ async fn run_async(cfg: &Config, action: SessionAction) -> Result<()> {
                     env: Vec::new(),
                     rows: 24,
                     cols: 80,
-                    worktree: Some(wt),
+                    worktree: Some(wt.clone()),
                     agent: Some(AgentLaunch {
-                        agent,
-                        prompt,
+                        agent: agent.clone(),
+                        prompt: launch_prompt,
                         // A plain `--headless` forces headless; absent leaves the
                         // default (headless exactly when a prompt was given).
                         headless: headless.then_some(true),
@@ -599,10 +680,35 @@ async fn run_async(cfg: &Config, action: SessionAction) -> Result<()> {
                     already_capped: false,
                 };
                 let info = client.open(&spec).await?;
+                let tracked_row = match track.as_deref() {
+                    Some(track_issue) => Some(
+                        crate::cmd::session_track::track_opened(
+                            &client,
+                            track_issue,
+                            &wt,
+                            &agent,
+                            &info.id,
+                        )
+                        .await?,
+                    ),
+                    None => None,
+                };
                 if json {
-                    outln!("{}", terminal_safe_pretty_json(&info)?);
+                    if let Some(row) = tracked_row {
+                        let mut value = serde_json::to_value(&info)?;
+                        value
+                            .as_object_mut()
+                            .expect("SessionInfo serializes as a JSON object")
+                            .insert("row".into(), serde_json::json!(row));
+                        outln!("{}", terminal_safe_pretty_json(&value)?);
+                    } else {
+                        outln!("{}", terminal_safe_pretty_json(&info)?);
+                    }
                 } else {
                     outln!("{}", display_cell(&info.id));
+                    if let Some(row) = tracked_row {
+                        outln!("dispatch {row} tracked");
+                    }
                 }
             }
         }
@@ -653,9 +759,11 @@ async fn run_async(cfg: &Config, action: SessionAction) -> Result<()> {
         }
         SessionAction::Snapshot {
             session,
+            session_pos,
             json,
             text,
         } => {
+            let session = session_target(session, session_pos)?;
             let (seq, rows, cols, ansi) = client.snapshot(&session).await?;
             // The wire carries the screen as an ANSI repaint; render it back
             // to plain rows through the same emulator the panes use.
@@ -679,7 +787,11 @@ async fn run_async(cfg: &Config, action: SessionAction) -> Result<()> {
                 std::io::stdout().flush()?;
             }
         }
-        SessionAction::Attach { session } => {
+        SessionAction::Attach {
+            session,
+            session_pos,
+        } => {
+            let session = session_target(session, session_pos)?;
             let client_id = format!("cli-{}", std::process::id());
             let mut stream = client.attach(&session, &client_id, 0, 0, true).await?;
             // Observer stream: snapshot then deltas, raw to stdout. Ctrl-C
@@ -709,10 +821,12 @@ async fn run_async(cfg: &Config, action: SessionAction) -> Result<()> {
         }
         SessionAction::Wait {
             session,
+            session_pos,
             until,
             timeout,
             json,
         } => {
+            let session = session_target(session, session_pos)?;
             let condition = parse_wait_condition(&until)?;
             let outcome = client.wait(&session, condition, timeout).await?;
             let matched = outcome
@@ -930,9 +1044,20 @@ fn open_preflight(
     cfg: &Config,
     stage: Option<&str>,
     issue: Option<&str>,
+    track: Option<&str>,
+    worktree: Option<&str>,
     prompt: &str,
     headless: bool,
 ) -> Result<()> {
+    if let Some(track_issue) = track {
+        if issue.is_some() {
+            anyhow::bail!("--track is only available without --issue");
+        }
+        let Some(worktree) = worktree else {
+            anyhow::bail!("--track requires --worktree");
+        };
+        super::dispatch::dispatch_identity(track_issue, worktree)?;
+    }
     if let Some(name) = stage {
         stage_or_bail(cfg, name)?;
     }
@@ -1889,6 +2014,160 @@ pub(crate) fn snapshot_text(rows: u16, cols: u16, ansi: &[u8]) -> String {
     crate::copymode::extract(&emu, &crate::copymode::whole(&emu))
 }
 
+fn session_target(flag: Option<String>, pos: Option<String>) -> Result<String> {
+    match (flag, pos) {
+        (Some(_), Some(_)) => anyhow::bail!("give only one session id (positional or --session)"),
+        (Some(session), None) | (None, Some(session)) => Ok(session),
+        (None, None) => anyhow::bail!("give a session id (positional or --session)"),
+    }
+}
+
+#[cfg(test)]
+mod session_target_tests {
+    use super::{SessionAction, session_target};
+    use clap::Parser;
+
+    fn parse(args: &[&str]) -> Result<SessionAction, clap::Error> {
+        crate::Cli::try_parse_from(args).map(|cli| match cli.command {
+            Some(crate::Command::Session { action }) => action,
+            _ => panic!("expected a session command"),
+        })
+    }
+
+    #[test]
+    fn session_target_accepts_flag_only() {
+        assert_eq!(session_target(Some("abc".into()), None).unwrap(), "abc");
+    }
+
+    #[test]
+    fn session_target_accepts_positional_only() {
+        assert_eq!(session_target(None, Some("abc".into())).unwrap(), "abc");
+    }
+
+    #[test]
+    fn session_target_rejects_neither_with_actionable_error() {
+        let error = session_target(None, None).unwrap_err().to_string();
+        assert!(error.contains("give a session id (positional or --session)"));
+    }
+
+    #[test]
+    fn session_target_rejects_both() {
+        assert!(session_target(Some("abc".into()), Some("def".into())).is_err());
+    }
+
+    #[test]
+    fn snapshot_accepts_positional_session() {
+        let action = parse(&["thegn", "session", "snapshot", "abc"]).unwrap();
+        match action {
+            SessionAction::Snapshot {
+                session,
+                session_pos,
+                ..
+            } => {
+                assert_eq!(session, None);
+                assert_eq!(session_pos.as_deref(), Some("abc"));
+            }
+            _ => panic!("expected snapshot"),
+        }
+    }
+
+    #[test]
+    fn snapshot_accepts_flag_session() {
+        let action = parse(&["thegn", "session", "snapshot", "--session", "abc"]).unwrap();
+        match action {
+            SessionAction::Snapshot {
+                session,
+                session_pos,
+                ..
+            } => {
+                assert_eq!(session.as_deref(), Some("abc"));
+                assert_eq!(session_pos, None);
+            }
+            _ => panic!("expected snapshot"),
+        }
+    }
+
+    #[test]
+    fn wait_accepts_positional_session_before_until() {
+        let action = parse(&["thegn", "session", "wait", "abc", "--until", "idle"]).unwrap();
+        match action {
+            SessionAction::Wait {
+                session_pos, until, ..
+            } => {
+                assert_eq!(session_pos.as_deref(), Some("abc"));
+                assert_eq!(until, "idle");
+            }
+            _ => panic!("expected wait"),
+        }
+    }
+
+    #[test]
+    fn wait_accepts_positional_session_after_options() {
+        let action = parse(&[
+            "thegn",
+            "session",
+            "wait",
+            "--until",
+            "idle",
+            "--timeout",
+            "42",
+            "abc",
+        ])
+        .unwrap();
+        match action {
+            SessionAction::Wait {
+                session_pos,
+                until,
+                timeout,
+                ..
+            } => {
+                assert_eq!(session_pos.as_deref(), Some("abc"));
+                assert_eq!(until, "idle");
+                assert_eq!(timeout, Some(42));
+            }
+            _ => panic!("expected wait"),
+        }
+    }
+
+    #[test]
+    fn attach_accepts_positional_session() {
+        let action = parse(&["thegn", "session", "attach", "abc"]).unwrap();
+        match action {
+            SessionAction::Attach {
+                session,
+                session_pos,
+            } => {
+                assert_eq!(session, None);
+                assert_eq!(session_pos.as_deref(), Some("abc"));
+            }
+            _ => panic!("expected attach"),
+        }
+    }
+
+    #[test]
+    fn snapshot_requires_a_session() {
+        assert!(parse(&["thegn", "session", "snapshot"]).is_err());
+    }
+
+    #[test]
+    fn snapshot_rejects_both_session_forms() {
+        assert!(parse(&["thegn", "session", "snapshot", "abc", "--session", "def",]).is_err());
+    }
+
+    #[test]
+    fn snapshot_help_shows_the_positional_session() {
+        let Err(error) = parse(&["thegn", "session", "snapshot", "--help"]) else {
+            panic!("--help must not parse as a command");
+        };
+        assert_eq!(error.kind(), clap::error::ErrorKind::DisplayHelp);
+        assert!(
+            error
+                .to_string()
+                .contains("Usage: thegn session snapshot [OPTIONS] [SESSION]")
+        );
+    }
+}
+
 #[cfg(test)]
 mod snapshot_text_tests {
     use super::snapshot_text;
@@ -2071,22 +2350,31 @@ mod open_stage_tests {
     fn the_stage_lookup_is_answerable_before_connect() {
         // The offline-refusal contract: a config typo is not a daemon problem,
         // so the preflight must refuse without reaching `connect`.
-        let err = open_preflight(&cfg_with_stage(), Some("nosuchstage"), None, "", false)
-            .expect_err("must refuse");
+        let err = open_preflight(
+            &cfg_with_stage(),
+            Some("nosuchstage"),
+            None,
+            None,
+            None,
+            "",
+            false,
+        )
+        .expect_err("must refuse");
         assert!(err.to_string().contains("nosuchstage"), "got {err}");
     }
 
     #[test]
     fn headless_with_a_blank_prompt_is_refused() {
-        let err =
-            open_preflight(&cfg_with_stage(), None, None, "   ", true).expect_err("must refuse");
+        let err = open_preflight(&cfg_with_stage(), None, None, None, None, "   ", true)
+            .expect_err("must refuse");
         assert!(err.to_string().contains("empty prompt"), "got {err}");
     }
 
     #[test]
     fn a_promptless_open_stays_a_legal_interactive_launch() {
         // The real and correct use `--headless` must not break.
-        open_preflight(&cfg_with_stage(), None, None, "", false).expect("interactive launch");
+        open_preflight(&cfg_with_stage(), None, None, None, None, "", false)
+            .expect("interactive launch");
     }
 
     #[test]
@@ -2094,8 +2382,16 @@ mod open_stage_tests {
         // A stage's *rendered* prompt is checked in `open_stage`, where the
         // row can be marked `failed` — not here. (`--stage` WITHOUT `--issue`
         // is a plain overlay open and still gets the check above.)
-        open_preflight(&cfg_with_stage(), Some("code"), Some("linear:X"), "", true)
-            .expect("stage dispatch is headless by construction");
+        open_preflight(
+            &cfg_with_stage(),
+            Some("code"),
+            Some("linear:X"),
+            None,
+            None,
+            "",
+            true,
+        )
+        .expect("stage dispatch is headless by construction");
     }
 
     #[test]
@@ -2105,6 +2401,8 @@ mod open_stage_tests {
             &cfg_with_stage(),
             Some("code"),
             Some("linear:X"),
+            None,
+            None,
             "hand-written task",
             false,
         )
@@ -2113,6 +2411,66 @@ mod open_stage_tests {
             err.to_string().contains("template owns the task"),
             "got {err}"
         );
+    }
+
+    #[test]
+    fn track_refuses_an_invalid_issue_before_connect() {
+        let err = open_preflight(
+            &cfg_with_stage(),
+            None,
+            None,
+            Some("linear:THE 1976"),
+            Some("/tmp/worktree"),
+            "",
+            false,
+        )
+        .expect_err("invalid tracked issue must be refused");
+        assert!(err.to_string().contains("invalid pipeline issue id"));
+    }
+
+    #[test]
+    fn track_refuses_stage_and_issue_combinations_offline() {
+        let err = open_preflight(
+            &cfg_with_stage(),
+            Some("code"),
+            Some("linear:THE-1976"),
+            Some("linear:THE-1976"),
+            Some("/tmp/worktree"),
+            "",
+            false,
+        )
+        .expect_err("tracked stage dispatch must be refused");
+        assert!(err.to_string().contains("without --issue"));
+    }
+
+    #[test]
+    fn track_allows_a_stage_overlay_but_refuses_a_non_root_worktree_offline() {
+        let dir = tempfile::tempdir().expect("temporary repository");
+        assert!(thegn_core::util::git_ok(dir.path(), &["init", "-q"]));
+        open_preflight(
+            &cfg_with_stage(),
+            Some("code"),
+            None,
+            Some("linear:THE-1976"),
+            dir.path().to_str(),
+            "",
+            false,
+        )
+        .expect("track may layer a stage over a plain open");
+
+        let nested = dir.path().join("nested");
+        std::fs::create_dir(&nested).expect("nested path");
+        let err = open_preflight(
+            &cfg_with_stage(),
+            Some("code"),
+            None,
+            Some("linear:THE-1976"),
+            nested.to_str(),
+            "",
+            false,
+        )
+        .expect_err("track must refuse a non-root worktree before connect");
+        assert!(err.to_string().contains("needs the root"), "got {err}");
     }
 
     #[test]

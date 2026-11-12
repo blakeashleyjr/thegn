@@ -395,6 +395,7 @@ pub const CATALOG: &[Slot] = &[
     slot("sandbox-argv", "worktree", SourceKind::Worktree),
     slot("sandbox-argv", "worktree_pos", SourceKind::Worktree),
     slot("wt new", "isolation", SourceKind::Structural),
+    slot("wt new", "batch", SourceKind::Structural),
     slot("sandbox profile show", "worktree", SourceKind::Worktree),
     slot("sandbox profile set", "worktree", SourceKind::Worktree),
     slot("sandbox profile clear", "worktree", SourceKind::Worktree),
@@ -407,6 +408,9 @@ pub const CATALOG: &[Slot] = &[
         SourceKind::Worktree,
     ),
     slot("session open", "worktree", SourceKind::Worktree),
+    slot("session open", "track", SourceKind::Structural),
+    slot("session open", "brief_file", SourceKind::Structural),
+    slot("session open", "vars", SourceKind::Structural),
     slot("session fork", "worktree", SourceKind::Worktree),
     slot("session move", "worktree", SourceKind::Worktree),
     slot("share start", "worktree", SourceKind::Worktree),
@@ -487,6 +491,7 @@ pub const CATALOG: &[Slot] = &[
     slot("dispatch put", "session", SourceKind::Session),
     slot("events tail", "session", SourceKind::Session),
     slot("session attach", "session", SourceKind::Session),
+    slot("session attach", "session_pos", SourceKind::Session),
     slot("session fork", "session", SourceKind::Session),
     // A native harness id is not enumerable through the daemon session source;
     // recorded rows are selected through `agent.sessions` and the remaining
@@ -499,8 +504,10 @@ pub const CATALOG: &[Slot] = &[
     slot("session record", "session", SourceKind::Session),
     slot("session send", "session", SourceKind::Session),
     slot("session snapshot", "session", SourceKind::Session),
+    slot("session snapshot", "session_pos", SourceKind::Session),
     slot("session split", "session", SourceKind::Session),
     slot("session wait", "session", SourceKind::Session),
+    slot("session wait", "session_pos", SourceKind::Session),
     // --- host -------------------------------------------------------------
     // The `hosts` table — hosts thegn has actually registered. NOT the same as
     // `sandbox prune --host`, which takes a `[host.<name>]` config key and is
