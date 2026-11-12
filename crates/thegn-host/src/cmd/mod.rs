@@ -62,6 +62,7 @@ pub mod secret;
 pub mod session;
 pub mod session_fork;
 pub mod session_move;
+pub mod session_track;
 pub mod share;
 pub mod skills;
 pub mod skills_doctor;
