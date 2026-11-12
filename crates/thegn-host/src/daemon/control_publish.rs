@@ -118,7 +118,7 @@ fn publish_candidates_at(sockets: &[PathBuf], state_dir: &Path, sink: &mut dyn P
     }
 }
 
-pub(crate) fn prepare_run_dir(state_dir: &Path) -> std::io::Result<()> {
+pub(crate) fn ensure_run_dir(state_dir: &Path) -> std::io::Result<thegn_core::fsperm::PrivateDir> {
     let run_dir = run_dir(state_dir);
     let mut anchor = state_dir;
     while !anchor.is_dir() {
@@ -132,7 +132,11 @@ pub(crate) fn prepare_run_dir(state_dir: &Path) -> std::io::Result<()> {
     let relative = run_dir.strip_prefix(anchor).map_err(|error| {
         std::io::Error::new(std::io::ErrorKind::InvalidInput, error.to_string())
     })?;
-    let _run_dir = thegn_core::fsperm::ensure_private_dir_beneath(anchor, relative)?;
+    thegn_core::fsperm::ensure_private_dir_beneath(anchor, relative)
+}
+
+pub(crate) fn prepare_run_dir(state_dir: &Path) -> std::io::Result<()> {
+    let _run_dir = ensure_run_dir(state_dir)?;
     Ok(())
 }
 
