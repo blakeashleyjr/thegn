@@ -186,7 +186,7 @@ pub(crate) fn states(loc: &GitLoc) -> Result<Vec<SubmoduleState>> {
     let ordinary_status = parse_status_porcelain(&run(
         loc,
         &["status", "--porcelain=v1", "-z", "--no-renames"],
-    )?);
+    )?)?;
     // The recorded pointer is part of the state read. If it cannot be read,
     // fail the submodule field so the host can retain its last-known value;
     // treating the missing map as empty would misclassify every initialized
@@ -227,7 +227,7 @@ pub(crate) fn dirty_from_states(states: &[SubmoduleState]) -> bool {
 }
 
 pub(crate) fn dirty_from_outputs(submodule_output: &str, ordinary_output: &str) -> Result<bool> {
-    let ordinary = parse_status_porcelain(ordinary_output);
+    let ordinary = parse_status_porcelain(ordinary_output)?;
     let mut states = parse_submodule_status(submodule_output)
         .map_err(|e| anyhow::anyhow!("parse submodule status: {e}"))?;
     for state in &mut states {
