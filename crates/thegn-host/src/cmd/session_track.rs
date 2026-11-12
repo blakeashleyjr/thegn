@@ -231,7 +231,7 @@ mod tests {
             "session-invalid",
         )
         .expect_err("invalid issue id must be refused");
-        assert!(error.to_string().contains("invalid pipeline issue id"));
+        assert!(format!("{error:#}").contains("invalid pipeline issue id"));
         assert!(db.list_dispatches().expect("roster list").is_empty());
     }
 
@@ -245,11 +245,7 @@ mod tests {
             .expect("first tracked row");
         let error = insert_and_start(&db, "LINEAR:THE-1976", worktree, "coder", "session-2")
             .expect_err("duplicate active issue must be refused");
-        assert!(
-            error
-                .to_string()
-                .contains("already has an active dispatch row")
-        );
+        assert!(format!("{error:#}").contains("already has an active dispatch row"));
         let (active, truncated) = db
             .list_dispatches_with_status(
                 &[
@@ -280,7 +276,7 @@ mod tests {
             |_db, _row_id| Err(anyhow::anyhow!("forced start failure")),
         )
         .expect_err("forced start failure");
-        assert!(error.to_string().contains("forced start failure"));
+        assert!(format!("{error:#}").contains("forced start failure"));
         let rows = db.list_dispatches().expect("roster list");
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].status, AgentDispatchStatus::Failed);
