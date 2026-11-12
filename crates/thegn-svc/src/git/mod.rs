@@ -3447,6 +3447,12 @@ mod tests {
     }
 
     #[test]
+    fn submodule_dirty_read_rejects_truncated_ordinary_status() {
+        let submodule_output = " aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa vendor/lib\n";
+        assert!(submodule::dirty_from_outputs(submodule_output, "M  vendor/lib").is_err());
+    }
+
+    #[test]
     fn parse_status_porcelain_no_phantom_row_with_no_renames() {
         // With `--no-renames` a rename is reported as delete(old) + add(new) —
         // two well-formed XY rows, no split-`\0` phantom. This is the shape the
