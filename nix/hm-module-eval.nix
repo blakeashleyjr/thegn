@@ -203,7 +203,6 @@
           previewFetchTimeoutMs = 1000;
           previewMaxBodyBytes = 4096;
           usageEnabled = true;
-          usageAllowNetwork = false;
           usageStatusbar = false;
           usageDiscoverProfiles = true;
           usageTokenRollups = true;

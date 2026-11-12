@@ -247,6 +247,10 @@ const OMITTED: &[(&str, &str)] = &[
         "float threshold needs float pinning and is not exposed",
     ),
     (
+        "usage.allow_network",
+        "network opt-in awaits an owner decision",
+    ),
+    (
         "usage.crit_percent",
         "float threshold needs float pinning and is not exposed",
     ),
@@ -1319,7 +1323,6 @@ fn hm_usage_and_tailnet_keys_are_rendered_and_rest_dispositioned() {
     let rendered = rendered_paths(&module_src());
     for path in [
         "usage.enabled",
-        "usage.allow_network",
         "usage.statusbar",
         "usage.discover_profiles",
         "usage.token_rollups",

@@ -377,7 +377,6 @@ self: {
     preview.fetch_timeout_ms = cfg.previewFetchTimeoutMs;
     preview.max_body_bytes = cfg.previewMaxBodyBytes;
     usage.enabled = cfg.usageEnabled;
-    usage.allow_network = cfg.usageAllowNetwork;
     usage.statusbar = cfg.usageStatusbar;
     usage.discover_profiles = cfg.usageDiscoverProfiles;
     usage.token_rollups = cfg.usageTokenRollups;
@@ -1396,12 +1395,6 @@ in {
       description = "Enable the AI-account usage tracker. Unset (null) = the binary's default.";
     };
 
-    usageAllowNetwork = lib.mkOption {
-      type = lib.types.nullOr (lib.types.bool);
-      default = null;
-      description = "Allow authenticated live usage fetches for providers that do not publish local window state. Unset (null) = the binary's default.";
-    };
-
     usageStatusbar = lib.mkOption {
       type = lib.types.nullOr (lib.types.bool);
       default = null;
@@ -1426,6 +1419,7 @@ in {
       description = "Days of usage history to retain (0 disables history). Unset (null) = the binary's default.";
     };
 
+    # Rust floors values below 60 at use; keep the Nix option stricter.
     usagePollIntervalSecs = lib.mkOption {
       type = lib.types.nullOr (lib.types.ints.between 60 2678400);
       default = null;
