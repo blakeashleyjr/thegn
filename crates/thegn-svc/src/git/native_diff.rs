@@ -1233,6 +1233,11 @@ mod tests {
         spec: &str,
     ) -> (super::super::DiffCount, super::super::DiffCount) {
         let out = repo.out(&["-c", "core.quotePath=false", "diff", "--numstat", spec]);
+        let out = if out.is_empty() {
+            out
+        } else {
+            format!("{out}\n")
+        };
         super::super::typed_numstat(&out).expect("numstat parses")
     }
 
@@ -1252,6 +1257,11 @@ mod tests {
             "--numstat",
             spec,
         ]);
+        let out = if out.is_empty() {
+            out
+        } else {
+            format!("{out}\n")
+        };
         super::super::typed_numstat(&out).expect("numstat parses")
     }
 
@@ -1573,6 +1583,11 @@ mod tests {
             "--numstat",
             "main...HEAD",
         ]);
+        let cli = if cli.is_empty() {
+            cli
+        } else {
+            format!("{cli}\n")
+        };
         let want = super::super::parse_numstat(&cli).unwrap();
         let mut got = diff_entries(&repo.dir, "main...HEAD").unwrap();
         got.sort_by(|x, y| x.path.cmp(&y.path));
