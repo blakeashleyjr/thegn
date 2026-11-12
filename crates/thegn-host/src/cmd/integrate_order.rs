@@ -23,13 +23,13 @@ pub(crate) fn ordered_indices(
             .iter()
             .position(|candidate| candidate == name)
         else {
-            if !unknown.iter().any(|known: &&str| *known == name) {
+            if !unknown.contains(&name) {
                 unknown.push(name);
             }
             continue;
         };
         if indexes.contains(&index) {
-            if !duplicate.iter().any(|known: &&str| *known == name) {
+            if !duplicate.contains(&name) {
                 duplicate.push(name);
             }
         } else {
