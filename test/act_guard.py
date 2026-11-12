@@ -9,6 +9,10 @@ act's automatic container removal.
 from __future__ import annotations
 
 import os
+try:
+    import pwd
+except ImportError:  # pragma: no cover - pwd is Unix-only
+    pwd = None
 import re
 import subprocess
 import sys
@@ -200,22 +204,45 @@ def platform_mappings(tokens: list[str]) -> list[tuple[str, str]]:
     return out
 
 
-def actrc_tokens(actrc: str) -> list[str]:
-    """Whitespace-split tokens of every non-blank, non-comment .actrc line."""
+def _expand_actrc_vars(line: str, env: dict[str, str]) -> str:
+    """Expand the $var and ${var} forms accepted by Go's os.ExpandEnv."""
+    pattern = re.compile(r"\$(?:\{([^}]*)\}|([_a-zA-Z][_a-zA-Z0-9]*))")
+
+    def replace(match: re.Match[str]) -> str:
+        name = match.group(1) or match.group(2)
+        return env.get(name, match.group(0))
+
+    return pattern.sub(replace, line)
+
+
+def actrc_tokens(actrc: str, env: dict[str, str] | None = None) -> list[str]:
+    """Parse act's readArgsFile lines into one flag and one value per line."""
     tokens: list[str] = []
     for line in actrc.splitlines():
         stripped = line.strip()
-        if stripped and not stripped.startswith("#"):
-            tokens.extend(stripped.split())
+        # Mirrors act cmd/root.go readArgsFile: trim, keep '-' lines, apply
+        # os.ExpandEnv, then split each line into at most two fields.
+        if not stripped.startswith("-"):
+            continue
+        expanded = os.path.expandvars(stripped) if env is None else _expand_actrc_vars(stripped, env)
+        tokens.extend(expanded.split(None, 1))
     return tokens
 
 
-def user_actrc_paths(env: dict[str, str]) -> list[Path]:
+def user_actrc_paths(env: dict[str, str], platform_name: str = sys.platform) -> list[Path]:
     """Return act's XDG and home config paths, in its token-prepend order."""
     home = env.get("HOME")
+    if not home and pwd is not None:
+        try:
+            home = pwd.getpwuid(os.getuid()).pw_dir
+        except (KeyError, OSError):
+            pass
     xdg_config = env.get("XDG_CONFIG_HOME")
     if not xdg_config and home:
-        xdg_config = str(Path(home) / ".config")
+        if platform_name == "darwin":
+            xdg_config = str(Path(home) / "Library" / "Application Support")
+        else:
+            xdg_config = str(Path(home) / ".config")
 
     paths: list[Path] = []
     if xdg_config:
@@ -239,7 +266,7 @@ def user_actrc_tokens(env: dict[str, str]) -> list[str]:
                 getattr(error, "strerror", None) or "cannot decode file",
                 str(path),
             ) from error
-        tokens.extend(actrc_tokens(text))
+        tokens.extend(actrc_tokens(text, env))
     return tokens
 
 
@@ -659,6 +686,12 @@ def self_test() -> int:
         home.mkdir()
         user_env = {"HOME": str(home), "XDG_CONFIG_HOME": str(xdg)}
         baseline = plan("push", [], None, None)
+        passwd_home = None
+        if pwd is not None:
+            try:
+                passwd_home = Path(pwd.getpwuid(os.getuid()).pw_dir)
+            except (KeyError, OSError):
+                pass
         cases.append(
             (
                 "user-actrc-absent-is-unchanged",
@@ -666,8 +699,25 @@ def self_test() -> int:
                 == [xdg / "act" / "actrc", home / ".actrc"]
                 and user_actrc_paths({"HOME": str(home)})
                 == [home / ".config" / "act" / "actrc", home / ".actrc"]
+                and user_actrc_paths({})
+                == (
+                    [passwd_home / ".config" / "act" / "actrc", passwd_home / ".actrc"]
+                    if passwd_home is not None
+                    else []
+                )
                 and user_actrc_tokens(user_env) == []
                 and plan("push", [], None, None) == baseline,
+            )
+        )
+        darwin_home = temp_root / "darwin-home"
+        cases.append(
+            (
+                "user-actrc-darwin-config-path",
+                user_actrc_paths({"HOME": str(darwin_home)}, "darwin")
+                == [
+                    darwin_home / "Library" / "Application Support" / "act" / "actrc",
+                    darwin_home / ".actrc",
+                ],
             )
         )
 
@@ -686,12 +736,48 @@ def self_test() -> int:
             )
         )
 
+        user_actrc.write_text("--env A=1 --env\n-s T=x\n")
+        two_line_tokens = user_actrc_tokens(user_env)
+        argv, message = plan(
+            "push", [], [" M .github/workflows/ci.yml"], "abc123", False, two_line_tokens
+        )
+        cases.append(
+            (
+                "user-actrc-matches-act-two-field-tokenizer",
+                two_line_tokens == ["--env", "A=1 --env", "-s", "T=x"]
+                and argv is None
+                and ".github/workflows/ci.yml" in message,
+            )
+        )
+
+        expanded_env = {**user_env, "ACT_SECRET_VALUE": "T=x"}
+        user_actrc.write_text("--secret $ACT_SECRET_VALUE\n")
+        cases.append(
+            (
+                "user-actrc-expands-environment-values",
+                user_actrc_tokens(expanded_env) == ["--secret", "T=x"],
+            )
+        )
+
         user_actrc.write_text("-P ubuntu-latest=img/x:latest\n")
+        executed: list[tuple[str, list[str]]] = []
+        saved_env = os.environ.copy()
+        saved_execvp = os.execvp
+        try:
+            os.environ.clear()
+            os.environ.update(user_env)
+            os.execvp = lambda program, command: executed.append((program, command))
+            image_result = main(["push"])
+        finally:
+            os.execvp = saved_execvp
+            os.environ.clear()
+            os.environ.update(saved_env)
         cases.append(
             (
                 "user-actrc-image-pin-is-not-checked",
                 user_actrc_tokens(user_env) == ["-P", "ubuntu-latest=img/x:latest"]
-                and image_refusal(good, []) is None,
+                and image_result == 127
+                and executed == [("act", ["act", "push", "--rm"])],
             )
         )
 
