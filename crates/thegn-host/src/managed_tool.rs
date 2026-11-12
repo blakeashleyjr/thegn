@@ -1129,9 +1129,13 @@ fn provenance_record(
 
 fn write_provenance(staging: &Path, record: &serde_json::Value) -> Result<()> {
     let bytes = serde_json::to_vec_pretty(record).context("serialize installer provenance")?;
-    thegn_core::fsperm::ensure_private_dir(staging)
-        .context("secure managed-tool staging directory")?;
-    thegn_core::fsperm::open_private_dir(staging)
+    let anchor = staging
+        .parent()
+        .context("managed-tool staging directory has no parent")?;
+    let name = staging
+        .file_name()
+        .context("managed-tool staging directory has no filename")?;
+    thegn_core::fsperm::ensure_private_dir_beneath(anchor, Path::new(name))
         .and_then(|dir| dir.write_owner_only_atomic(".thegn-provenance.json", &bytes))
         .context("write managed-tool installer provenance")?;
     Ok(())
@@ -3145,6 +3149,18 @@ mod tests {
         if let Some(mode) = thegn_core::fsperm::mode_bits(&record).unwrap() {
             assert_eq!(mode & 0o777, 0o600);
         }
+
+        let parent = tempfile::tempdir().unwrap();
+        let target = parent.path().join("target");
+        let symlinked = parent.path().join("staging");
+        std::fs::create_dir(&target).unwrap();
+        thegn_core::fsperm::ensure_private_dir(&target).unwrap();
+        if thegn_core::fsperm::create_symlink(&target, &symlinked, true).is_err() {
+            return;
+        }
+
+        assert!(write_provenance(&symlinked, &serde_json::json!({"schema": 1})).is_err());
+        assert_eq!(std::fs::read_dir(&target).unwrap().count(), 0);
     }
 
     fn promoted_provenance_fixture() -> (TempDir, PathBuf, ManagedTool, PathBuf) {
