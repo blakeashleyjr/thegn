@@ -4938,6 +4938,8 @@ fn handle_git_msg(
         GitMsg::Pull => {
             if let Some(op) = gitui::branch_pull_op(sel_branch(panel_ui, model).as_ref()) {
                 enqueue(panel_ui, model, op);
+            } else {
+                model.status = "no branch selected".into();
             }
         }
         GitMsg::Push => {
@@ -4946,6 +4948,8 @@ fn handle_git_msg(
                 thegn_svc::git::ForceMode::None,
             ) {
                 enqueue(panel_ui, model, op);
+            } else {
+                model.status = "no branch selected".into();
             }
         }
         GitMsg::FastForward => {
@@ -28625,6 +28629,35 @@ fn action_allowed_during_schema_refusal(action: &crate::keymap::Action) -> bool 
             | Action::SwitchMode(_)
             | Action::ToggleKeyLock
     )
+}
+
+#[cfg(test)]
+mod branch_shortcut_status_tests {
+    #[test]
+    fn missing_branch_shortcuts_report_status_in_both_dispatch_arms() {
+        let source = include_str!("run.rs");
+        let pull_arm = source
+            .split(concat!("GitMsg::", "Pull =>"))
+            .nth(1)
+            .and_then(|rest| rest.split(concat!("GitMsg::", "Push =>")).next())
+            .expect("pull dispatch arm");
+        let push_arm = source
+            .split(concat!("GitMsg::", "Push =>"))
+            .nth(1)
+            .and_then(|rest| rest.split(concat!("GitMsg::", "FastForward =>")).next())
+            .expect("push dispatch arm");
+
+        for arm in [pull_arm, push_arm] {
+            assert!(
+                arm.contains("} else {"),
+                "missing no-selection branch: {arm}"
+            );
+            assert!(
+                arm.contains("no branch selected"),
+                "missing no-selection status: {arm}"
+            );
+        }
+    }
 }
 
 #[cfg(test)]
