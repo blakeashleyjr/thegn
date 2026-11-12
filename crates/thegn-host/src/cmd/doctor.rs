@@ -3897,22 +3897,43 @@ fn warm_pool_report(cfg: &Config) {
     );
 }
 
+const DOCTOR_PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3);
+const DOCTOR_PROBE_OUTPUT_CAP: usize = 4096;
+
+/// Run a short doctor probe with bounded output and process-group supervision.
+// off-loop: doctor is a synchronous CLI verb
+fn doctor_probe(mut command: std::process::Command) -> thegn_proc::Run {
+    let limits = thegn_proc::Limits {
+        stdout: thegn_proc::Stream::Head {
+            cap: DOCTOR_PROBE_OUTPUT_CAP,
+        },
+        stderr: thegn_proc::Stream::Head {
+            cap: DOCTOR_PROBE_OUTPUT_CAP,
+        },
+        ..thegn_proc::Limits::silent(DOCTOR_PROBE_TIMEOUT)
+    };
+    thegn_proc::run(
+        &mut command,
+        &limits,
+        &std::sync::atomic::AtomicBool::new(false),
+    )
+}
+
 /// The output of `<bin> <args…>` trimmed to one line, or `None` if the binary is
 /// absent or the invocation failed — used to fetch `git --version` etc. without
 /// panicking when the tool is missing (the whole point of the core-deps section).
-// off-loop: doctor is a synchronous CLI verb
-#[expect(clippy::disallowed_methods)]
 fn cmd_first_line(bin: &str, args: &[&str]) -> Option<String> {
-    let out = std::process::Command::new(bin)
-        .args(args)
-        .stdin(std::process::Stdio::null())
-        .output()
-        .ok()?;
-    if !out.status.success() {
-        return None;
-    }
-    let text = String::from_utf8_lossy(&out.stdout);
-    text.lines().next().map(|l| l.trim().to_string())
+    let mut command = std::process::Command::new(bin);
+    command.args(args);
+    let run = doctor_probe(command);
+    (run.success() && run.group == thegn_proc::GroupState::Drained && run.stdout.eof).then(
+        || {
+            String::from_utf8_lossy(&run.stdout.bytes)
+                .lines()
+                .next()
+                .map(|line| line.trim().to_string())
+        },
+    )?
 }
 
 /// Whether the default forge reports an authenticated account
@@ -4492,32 +4513,42 @@ fn custom_merge_drivers() -> Vec<String> {
 /// empty tree with `-S` and `GIT_TERMINAL_PROMPT=0`. Success ⇒ a fold can sign
 /// headlessly; the created object is dangling (unreferenced) and GC-collected.
 /// Only called when `sign_commits` is on (opt-in posture, not a seam probe).
-// off-loop: doctor is a synchronous CLI verb.
-#[expect(clippy::disallowed_methods)]
 fn signing_ready() -> std::result::Result<(), String> {
     use std::path::Path;
-    use std::process::Stdio;
     use thegn_core::util::git_cmd;
     // Empty tree oid via `mktree` (sha1 or sha256, no hardcoded oid).
-    let tree = git_cmd(Path::new("."))
-        .arg("mktree")
-        .stdin(Stdio::null())
-        .output()
-        .map_err(|e| e.to_string())?;
-    if !tree.status.success() {
-        return Err("not inside a git repository".into());
+    let tree_run = doctor_probe(git_cmd(Path::new(".")).arg("mktree"));
+    if !(tree_run.success()
+        && tree_run.group == thegn_proc::GroupState::Drained
+        && tree_run.stdout.eof)
+    {
+        return Err(tree_run.error().map_or_else(
+            || "git mktree probe failed".into(),
+            |error| error.to_string(),
+        ));
     }
-    let tree = String::from_utf8_lossy(&tree.stdout).trim().to_string();
-    let out = git_cmd(Path::new("."))
+    let tree = String::from_utf8_lossy(&tree_run.stdout.bytes)
+        .trim()
+        .to_string();
+    let mut command = git_cmd(Path::new("."));
+    command
         .args(["commit-tree", &tree, "-S", "-m", "thegn signing probe"])
-        .env("GIT_TERMINAL_PROMPT", "0")
-        .stdin(Stdio::null())
-        .output()
-        .map_err(|e| e.to_string())?;
-    if out.status.success() {
+        .env("GIT_TERMINAL_PROMPT", "0");
+    let run = doctor_probe(command);
+    if run.success() && run.group == thegn_proc::GroupState::Drained && run.stdout.eof {
         Ok(())
     } else {
-        Err(String::from_utf8_lossy(&out.stderr).trim().to_string())
+        let stderr = String::from_utf8_lossy(&run.stderr.bytes)
+            .trim()
+            .to_string();
+        Err(if stderr.is_empty() {
+            run.error().map_or_else(
+                || "git signing probe failed".into(),
+                |error| error.to_string(),
+            )
+        } else {
+            stderr
+        })
     }
 }
 
@@ -5857,6 +5888,12 @@ mod tests {
 
     #[test]
     fn run_does_not_panic_on_default_config() {
+        let _state = thegn_core::testenv::IsolatedState::new();
+        let gh_config = tempfile::tempdir().unwrap();
+        let _env = crate::testenv::EnvVarGuard::set(&[(
+            "GH_CONFIG_DIR",
+            gh_config.path().to_str().unwrap(),
+        )]);
         let cfg = Config::default();
         assert!(run(&cfg, false, Config::path(), None, &[]).is_ok());
         assert!(run(&cfg, true, Config::path(), None, &[]).is_ok());
@@ -6741,6 +6778,12 @@ args = ["--verbose"]
 
     #[test]
     fn core_deps_json_reports_git_and_gh_without_panicking() {
+        let _state = thegn_core::testenv::IsolatedState::new();
+        let gh_config = tempfile::tempdir().unwrap();
+        let _env = crate::testenv::EnvVarGuard::set(&[(
+            "GH_CONFIG_DIR",
+            gh_config.path().to_str().unwrap(),
+        )]);
         // Never panics regardless of whether git/gh are installed; the shape is
         // always present/path/(version|authenticated) for both binaries.
         let v = core_deps_json();
