@@ -122,6 +122,7 @@ pub(crate) fn pipeline_merge_admission(
 /// The target tip is deliberately not persisted in the attestation schema: a
 /// land is trusted only when that tip is an ancestor of the attested commit.
 /// Moving the target in the meantime therefore makes this check fail closed.
+#[cfg(test)]
 pub(crate) fn trusted_land_gate(
     db: &Db,
     worktree: &str,
