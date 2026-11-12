@@ -19,45 +19,185 @@ use std::time::Duration;
 
 const WHOAMI_TIMEOUT: Duration = Duration::from_secs(3);
 const GH_PROBE_OUTPUT_CAP: usize = 4096;
+const GH_READ_TIMEOUT: Duration = Duration::from_secs(30);
+const GH_READ_OUTPUT_CAP: usize = 16 * 1024 * 1024;
+const GH_DIFF_TIMEOUT: Duration = Duration::from_secs(60);
+const GH_DIFF_OUTPUT_CAP: usize = 64 * 1024 * 1024;
+const GH_MUTATION_TIMEOUT: Duration = Duration::from_secs(10 * 60);
+const GH_MUTATION_OUTPUT_CAP: usize = 1024 * 1024;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct GhDeadlineRule {
+    command: &'static [&'static str],
+    deadline: Duration,
+    cap: usize,
+}
+
+const GH_DEADLINE_TABLE: &[GhDeadlineRule] = &[
+    GhDeadlineRule {
+        command: &["pr", "diff"],
+        deadline: GH_DIFF_TIMEOUT,
+        cap: GH_DIFF_OUTPUT_CAP,
+    },
+    GhDeadlineRule {
+        command: &["pr", "list"],
+        deadline: GH_READ_TIMEOUT,
+        cap: GH_READ_OUTPUT_CAP,
+    },
+    GhDeadlineRule {
+        command: &["pr", "view"],
+        deadline: GH_READ_TIMEOUT,
+        cap: GH_READ_OUTPUT_CAP,
+    },
+    GhDeadlineRule {
+        command: &["pr", "status"],
+        deadline: GH_READ_TIMEOUT,
+        cap: GH_READ_OUTPUT_CAP,
+    },
+    GhDeadlineRule {
+        command: &["pr", "checks"],
+        deadline: GH_READ_TIMEOUT,
+        cap: GH_READ_OUTPUT_CAP,
+    },
+    GhDeadlineRule {
+        command: &["run", "list"],
+        deadline: GH_READ_TIMEOUT,
+        cap: GH_READ_OUTPUT_CAP,
+    },
+    GhDeadlineRule {
+        command: &["run", "view"],
+        deadline: GH_READ_TIMEOUT,
+        cap: GH_READ_OUTPUT_CAP,
+    },
+    GhDeadlineRule {
+        command: &["issue"],
+        deadline: GH_READ_TIMEOUT,
+        cap: GH_READ_OUTPUT_CAP,
+    },
+    GhDeadlineRule {
+        command: &["pr", "merge"],
+        deadline: GH_MUTATION_TIMEOUT,
+        cap: GH_MUTATION_OUTPUT_CAP,
+    },
+    GhDeadlineRule {
+        command: &["pr", "create"],
+        deadline: GH_MUTATION_TIMEOUT,
+        cap: GH_MUTATION_OUTPUT_CAP,
+    },
+    GhDeadlineRule {
+        command: &["pr", "close"],
+        deadline: GH_MUTATION_TIMEOUT,
+        cap: GH_MUTATION_OUTPUT_CAP,
+    },
+    GhDeadlineRule {
+        command: &["pr", "reopen"],
+        deadline: GH_MUTATION_TIMEOUT,
+        cap: GH_MUTATION_OUTPUT_CAP,
+    },
+    GhDeadlineRule {
+        command: &["pr", "ready"],
+        deadline: GH_MUTATION_TIMEOUT,
+        cap: GH_MUTATION_OUTPUT_CAP,
+    },
+    GhDeadlineRule {
+        command: &["pr", "edit"],
+        deadline: GH_MUTATION_TIMEOUT,
+        cap: GH_MUTATION_OUTPUT_CAP,
+    },
+    GhDeadlineRule {
+        command: &["pr", "review"],
+        deadline: GH_MUTATION_TIMEOUT,
+        cap: GH_MUTATION_OUTPUT_CAP,
+    },
+    GhDeadlineRule {
+        command: &["pr", "comment"],
+        deadline: GH_MUTATION_TIMEOUT,
+        cap: GH_MUTATION_OUTPUT_CAP,
+    },
+    GhDeadlineRule {
+        command: &["run", "rerun"],
+        deadline: GH_MUTATION_TIMEOUT,
+        cap: GH_MUTATION_OUTPUT_CAP,
+    },
+    GhDeadlineRule {
+        command: &["workflow", "run"],
+        deadline: GH_MUTATION_TIMEOUT,
+        cap: GH_MUTATION_OUTPUT_CAP,
+    },
+];
+
+fn deadline_for(args: &[&str]) -> (Duration, usize) {
+    if args.first() == Some(&"api") {
+        let mut index = 1;
+        while index < args.len() {
+            let arg = args[index];
+            if matches!(arg, "-f" | "-F") || arg.starts_with("-f=") || arg.starts_with("-F=") {
+                return (GH_MUTATION_TIMEOUT, GH_MUTATION_OUTPUT_CAP);
+            }
+            if matches!(arg, "-X" | "--method") {
+                let method = args.get(index + 1).copied().unwrap_or_default();
+                if !method.eq_ignore_ascii_case("GET") {
+                    return (GH_MUTATION_TIMEOUT, GH_MUTATION_OUTPUT_CAP);
+                }
+                index += 2;
+                continue;
+            }
+            if let Some(method) = arg.strip_prefix("-X")
+                && !method.is_empty()
+                && !method.eq_ignore_ascii_case("GET")
+            {
+                return (GH_MUTATION_TIMEOUT, GH_MUTATION_OUTPUT_CAP);
+            }
+            if let Some(method) = arg.strip_prefix("--method=")
+                && !method.eq_ignore_ascii_case("GET")
+            {
+                return (GH_MUTATION_TIMEOUT, GH_MUTATION_OUTPUT_CAP);
+            }
+            index += 1;
+        }
+    }
+    GH_DEADLINE_TABLE
+        .iter()
+        .find(|rule| args.starts_with(rule.command))
+        .map_or((GH_READ_TIMEOUT, GH_READ_OUTPUT_CAP), |rule| {
+            (rule.deadline, rule.cap)
+        })
+}
 
 /// Run `gh <args>` with `cwd = worktree` (local, or over ssh on the remote host);
 /// trimmed stdout on success, else a classified error.
 pub fn gh_out(loc: &GitLoc, args: &[&str]) -> Result<String, GhError> {
-    let out = loc.gh_command(args).output().map_err(spawn_err)?;
-    if out.status.success() {
-        return Ok(String::from_utf8_lossy(&out.stdout).trim().to_string());
-    }
-    Err(classify(
-        &String::from_utf8_lossy(&out.stderr).to_lowercase(),
-    ))
+    let (deadline, cap) = deadline_for(args);
+    gh_bounded(loc, args, deadline, cap)
 }
 
-/// Run the short-lived `gh` identity probe with a deadline and bounded capture.
-/// Other `gh` operations intentionally keep using [`gh_out`]: PR and merge
-/// operations may legitimately take longer than a doctor/onboarding probe.
-fn gh_out_bounded(loc: &GitLoc, args: &[&str], timeout: Duration) -> Result<String, GhError> {
+/// Run `gh <args>` with a deadline and bounded stdout/stderr capture.
+fn gh_bounded(
+    loc: &GitLoc,
+    args: &[&str],
+    deadline: Duration,
+    cap: usize,
+) -> Result<String, GhError> {
     let mut command = loc.gh_command(args);
     let limits = thegn_proc::Limits {
-        stdout: thegn_proc::Stream::Head {
-            cap: GH_PROBE_OUTPUT_CAP,
-        },
-        stderr: thegn_proc::Stream::Head {
-            cap: GH_PROBE_OUTPUT_CAP,
-        },
-        ..thegn_proc::Limits::silent(timeout)
+        stdout: thegn_proc::Stream::HeadOrFail { cap },
+        stderr: thegn_proc::Stream::HeadOrFail { cap },
+        ..thegn_proc::Limits::silent(deadline)
     };
     let run = thegn_proc::run(&mut command, &limits, &AtomicBool::new(false));
     match run.end {
         thegn_proc::End::Spawn(error) => Err(spawn_err(error)),
         thegn_proc::End::TimedOut => Err(GhError::Other(format!(
-            "gh timed out after {}s",
-            timeout.as_secs_f64()
+            "gh {} timed out after {}s",
+            args.first().copied().unwrap_or("command"),
+            deadline.as_secs_f64()
         ))),
         thegn_proc::End::LeaderExited => match run.leader {
             thegn_proc::Leader::Reaped(status)
                 if status.success()
                     && run.group == thegn_proc::GroupState::Drained
-                    && run.stdout.eof =>
+                    && run.stdout.eof
+                    && run.stderr.eof =>
             {
                 Ok(String::from_utf8_lossy(&run.stdout.bytes)
                     .trim()
@@ -73,30 +213,31 @@ fn gh_out_bounded(loc: &GitLoc, args: &[&str], timeout: Duration) -> Result<Stri
                 "gh exited but its leader was not reaped: {leader:?}"
             ))),
         },
-        thegn_proc::End::Cancelled => Err(GhError::Other("gh probe was cancelled".into())),
+        thegn_proc::End::Cancelled => Err(GhError::Other("gh was cancelled".into())),
         thegn_proc::End::OutputLimit(which) => Err(GhError::Other(format!(
-            "gh probe exceeded its {which:?} output bound"
+            "gh {} exceeded its output bound ({which:?})",
+            args.first().copied().unwrap_or("command")
         ))),
         thegn_proc::End::Supervise(error) => Err(GhError::Other(format!(
-            "gh probe could not be supervised: {error}"
+            "gh {} could not be supervised: {error}",
+            args.first().copied().unwrap_or("command")
         ))),
     }
 }
 
 fn whoami_with_timeout(loc: &GitLoc, timeout: Duration) -> Result<String, GhError> {
-    gh_out_bounded(loc, &["api", "user", "--jq", ".login"], timeout)
+    gh_bounded(
+        loc,
+        &["api", "user", "--jq", ".login"],
+        timeout,
+        GH_PROBE_OUTPUT_CAP,
+    )
 }
 
 /// Run `gh <args>` for its exit code (output discarded). Errors classified.
 pub fn gh_run(loc: &GitLoc, args: &[&str]) -> Result<(), GhError> {
-    let out = loc.gh_command(args).output().map_err(spawn_err)?;
-    if out.status.success() {
-        Ok(())
-    } else {
-        Err(classify(
-            &String::from_utf8_lossy(&out.stderr).to_lowercase(),
-        ))
-    }
+    let (deadline, cap) = deadline_for(args);
+    gh_bounded(loc, args, deadline, cap).map(|_| ())
 }
 
 /// Map a spawn failure (e.g. `gh` binary absent) onto the right `GhError`.
@@ -526,11 +667,176 @@ reviewThreads(first:20){nodes{isResolved comments(first:1){nodes{\
 author{login} path line body createdAt}}}}}}}";
 
 #[cfg(test)]
+mod deadline_tests {
+    use super::{
+        GH_DIFF_OUTPUT_CAP, GH_DIFF_TIMEOUT, GH_MUTATION_OUTPUT_CAP, GH_MUTATION_TIMEOUT,
+        GH_READ_OUTPUT_CAP, GH_READ_TIMEOUT, deadline_for,
+    };
+    use std::time::Duration;
+
+    #[test]
+    fn deadline_for_covers_every_github_cli_verb() {
+        let read_only = [
+            ["pr", "list"].as_slice(),
+            ["pr", "view"].as_slice(),
+            ["pr", "status"].as_slice(),
+            ["pr", "checks"].as_slice(),
+            ["run", "list"].as_slice(),
+            ["run", "view"].as_slice(),
+            ["issue", "list"].as_slice(),
+            ["issue", "view"].as_slice(),
+            ["issue", "create"].as_slice(),
+            ["issue", "comment"].as_slice(),
+            ["api", "notifications"].as_slice(),
+            ["api", "user", "--method", "GET"].as_slice(),
+            ["search", "prs"].as_slice(),
+        ];
+        for args in read_only {
+            assert_eq!(
+                deadline_for(args),
+                (GH_READ_TIMEOUT, GH_READ_OUTPUT_CAP),
+                "expected read-only policy for {args:?}"
+            );
+        }
+
+        for args in [["pr", "diff"].as_slice(), ["pr", "diff", "42"].as_slice()] {
+            assert_eq!(
+                deadline_for(args),
+                (GH_DIFF_TIMEOUT, GH_DIFF_OUTPUT_CAP),
+                "expected diff policy for {args:?}"
+            );
+        }
+
+        let mutations = [
+            ["pr", "merge"].as_slice(),
+            ["pr", "create"].as_slice(),
+            ["pr", "close"].as_slice(),
+            ["pr", "reopen"].as_slice(),
+            ["pr", "ready"].as_slice(),
+            ["pr", "edit"].as_slice(),
+            ["pr", "review"].as_slice(),
+            ["pr", "comment"].as_slice(),
+            ["run", "rerun"].as_slice(),
+            ["workflow", "run"].as_slice(),
+            ["api", "graphql", "-f", "query=mutation"].as_slice(),
+            ["api", "repos/x/y", "-F", "number=1"].as_slice(),
+            ["api", "repos/x/y", "-X", "POST"].as_slice(),
+            ["api", "repos/x/y", "--method", "PATCH"].as_slice(),
+        ];
+        for args in mutations {
+            assert_eq!(
+                deadline_for(args),
+                (GH_MUTATION_TIMEOUT, GH_MUTATION_OUTPUT_CAP),
+                "expected mutation policy for {args:?}"
+            );
+        }
+
+        assert_eq!(
+            deadline_for(&["api", "repos/x/y", "-X", "GET"]),
+            (GH_READ_TIMEOUT, GH_READ_OUTPUT_CAP)
+        );
+        assert_eq!(
+            deadline_for(&["api", "repos/x/y", "--method=GET"]),
+            (GH_READ_TIMEOUT, GH_READ_OUTPUT_CAP)
+        );
+        assert_eq!(
+            deadline_for(&["unknown", "verb"]),
+            (GH_READ_TIMEOUT, GH_READ_OUTPUT_CAP)
+        );
+        assert_eq!(deadline_for(&[]), (GH_READ_TIMEOUT, GH_READ_OUTPUT_CAP));
+        assert_eq!(Duration::from_secs(30), GH_READ_TIMEOUT);
+    }
+}
+
+#[cfg(test)]
 mod bounded_probe_tests {
-    use super::{GhError, whoami_with_timeout};
+    use super::{GhError, gh_bounded, whoami_with_timeout};
     use crate::remote::GitLoc;
     use std::process::Command;
     use std::time::{Duration, Instant};
+
+    #[test]
+    fn bounded_read_call_times_out_and_reaps_exec_sleep() {
+        if !crate::testenv::require_or_skip("Unix shell process-group fixture", !cfg!(windows)) {
+            return;
+        }
+        let bin = tempfile::tempdir().unwrap();
+        let worktree = tempfile::tempdir().unwrap();
+        let gh = bin.path().join("gh");
+        std::fs::write(
+            &gh,
+            "#!/bin/sh\nprintf '%s\\n' \"$$\" > \"$GH_SLEEP_PID_FILE\"\nexec sleep 30\n",
+        )
+        .unwrap();
+        if crate::fsperm::set_mode_for_test(&gh, 0o755).is_err() {
+            return;
+        }
+        let old_path = std::env::var_os("PATH").unwrap_or_default();
+        let path = format!("{}:{}", bin.path().display(), old_path.to_string_lossy());
+        let pid_file = bin.path().join("sleep.pid");
+        let pid_path = pid_file.to_string_lossy().into_owned();
+        let _env =
+            crate::testenv::EnvGuard::set(&[("PATH", &path), ("GH_SLEEP_PID_FILE", &pid_path)]);
+
+        let started = Instant::now();
+        let error = gh_bounded(
+            &GitLoc::Local(worktree.path().to_path_buf()),
+            &["pr", "list"],
+            Duration::from_millis(200),
+            4096,
+        )
+        .unwrap_err();
+        assert!(started.elapsed() < Duration::from_secs(10));
+        assert!(
+            matches!(error, GhError::Other(message) if message == "gh pr timed out after 0.2s")
+        );
+        let pid = std::fs::read_to_string(&pid_file)
+            .expect("fake gh did not record its pid")
+            .trim()
+            .parse::<u32>()
+            .expect("fake gh recorded an invalid pid");
+        let gone_by = Instant::now() + Duration::from_secs(2);
+        loop {
+            let alive = Command::new("kill")
+                .args(["-0", &pid.to_string()])
+                .status()
+                .expect("kill is available for the Unix fixture");
+            if !alive.success() {
+                break;
+            }
+            assert!(Instant::now() < gone_by, "timed-out gh process survived");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    #[test]
+    fn bounded_gh_call_rejects_output_over_cap() {
+        let bin = tempfile::tempdir().unwrap();
+        let worktree = tempfile::tempdir().unwrap();
+        let gh = bin.path().join("gh");
+        std::fs::write(
+            &gh,
+            "#!/bin/sh\nprintf '%s\\n' '0123456789012345678901234567890123456789012345678901234567890123456789'\n",
+        )
+        .unwrap();
+        if crate::fsperm::set_mode_for_test(&gh, 0o755).is_err() {
+            return;
+        }
+        let old_path = std::env::var_os("PATH").unwrap_or_default();
+        let path = format!("{}:{}", bin.path().display(), old_path.to_string_lossy());
+        let _env = crate::testenv::EnvGuard::set(&[("PATH", &path)]);
+
+        let error = gh_bounded(
+            &GitLoc::Local(worktree.path().to_path_buf()),
+            &["pr", "list"],
+            Duration::from_secs(1),
+            64,
+        )
+        .unwrap_err();
+        assert!(
+            matches!(error, GhError::Other(message) if message.contains("gh pr exceeded its output bound"))
+        );
+    }
 
     #[test]
     fn whoami_bounded_times_out_and_kills_the_gh_process_group() {
@@ -621,10 +927,11 @@ mod bounded_probe_tests {
         let empty_path = tempfile::tempdir().unwrap();
         let path = empty_path.path().to_string_lossy().into_owned();
         let _env = crate::testenv::EnvGuard::set(&[("PATH", &path)]);
-        let error = super::gh_out_bounded(
+        let error = super::gh_bounded(
             &GitLoc::Local(worktree.path().to_path_buf()),
             &["api", "user"],
             Duration::from_millis(50),
+            4096,
         )
         .unwrap_err();
         assert_eq!(error, GhError::NotInstalled);
