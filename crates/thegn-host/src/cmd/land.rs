@@ -62,6 +62,15 @@ fn integration_tracking_outcome(
     }
 }
 
+#[cfg(test)]
+/// Fold `worktree`'s current branch via the shared land helper without queue pinning.
+pub(crate) fn land_branch(
+    cfg: &Config,
+    worktree: &Path,
+) -> Result<(String, String, AttemptOutcome)> {
+    land_branch_pinned_with_options(cfg, worktree, None, None, false)
+}
+
 /// Fold `worktree`'s current branch onto the repo target via the fold-actor's
 /// CAS land, forcing the land regardless of the configured `auto_land`. Returns
 /// `(branch, target, outcome)`. Queue bookkeeping is intentionally left to the
