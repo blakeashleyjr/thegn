@@ -219,7 +219,6 @@ const OMITTED: &[(&str, &str)] = &[
         "lsp.servers",
         "language-server registry entries carry executables and are not exposed",
     ),
-    ("semantic", "semantic indexing is not exposed"),
     (
         "daemon.socket",
         "path-valued control-socket override is not exposed",
@@ -341,10 +340,6 @@ const OMITTED: &[(&str, &str)] = &[
     (
         "monitor.default_scale",
         "monitor graph scale is not exposed",
-    ),
-    (
-        "log.stderr_cap_mb",
-        "captured stderr retention is not exposed",
     ),
     (
         "sandbox",
@@ -1381,6 +1376,31 @@ fn hm_lsp_scalar_keys_are_rendered_and_rest_dispositioned() {
 }
 
 #[test]
+fn hm_semantic_scalar_keys_are_rendered_and_rest_dispositioned() {
+    let rendered = rendered_paths(&module_src());
+    for path in [
+        "semantic.worktree_index",
+        "semantic.index_max_files",
+        "semantic.map_budget_lines",
+    ] {
+        assert!(rendered.contains(path), "Home Manager must render {path}");
+    }
+
+    let omissions: BTreeSet<&str> = OMITTED.iter().map(|(path, _)| *path).collect();
+    let schema = schema_field("semantic");
+    let properties = schema["properties"]
+        .as_object()
+        .expect("semantic schema properties");
+    for key in properties.keys() {
+        let path = format!("semantic.{key}");
+        assert!(
+            rendered.contains(&path) || omissions.contains(path.as_str()),
+            "{path} must be rendered or dispositioned by an exact ledger row"
+        );
+    }
+}
+
+#[test]
 fn hm_loc_and_replay_families_are_fully_rendered() {
     let rendered = rendered_paths(&module_src());
     for table in ["loc", "replay"] {
@@ -1570,6 +1590,9 @@ fn every_numeric_option_matches_its_destination_range() {
         ("previewMaxBodyBytes", "preview.max_body_bytes"),
         ("usageHistoryDays", "usage.history_days"),
         ("usagePollIntervalSecs", "usage.poll_interval_secs"),
+        ("semanticIndexMaxFiles", "semantic.index_max_files"),
+        ("semanticMapBudgetLines", "semantic.map_budget_lines"),
+        ("stderrCapMb", "log.stderr_cap_mb"),
     ];
     let options = numeric_options(&module_src());
     let actual_names: BTreeSet<&str> = options.iter().map(|(name, _)| name.as_str()).collect();
@@ -1632,6 +1655,16 @@ fn every_numeric_option_matches_its_destination_range() {
                     thegn_core::time_policy::MAX_CADENCE_SECS
                 ),
                 "Nix type for clamped field {path}"
+            );
+            continue;
+        }
+        if matches!(
+            path,
+            "semantic.index_max_files" | "semantic.map_budget_lines"
+        ) {
+            assert_eq!(
+                nix_type, "lib.types.ints.positive",
+                "Nix type for floored field {path}"
             );
             continue;
         }

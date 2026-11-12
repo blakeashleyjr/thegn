@@ -7,6 +7,19 @@ All notable changes to **thegn** are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.1.0-alpha.68] — 2026-11-12
+
+### Added
+
+- The Home Manager module exposes the `[semantic]` settings `worktree_index`,
+  `index_max_files` and `map_budget_lines`, plus `log.stderr_cap_mb`.
+
+### Security
+
+- Managed SSH key rotation and host provisioning take their lease locks through a pinned private directory handle.
+- Plugin run directories for control publishing, plugin stats and the plugin SDK's local runner are created and opened through one pinned private directory handle.
+- Devcontainer volume ownership claims are written through a pinned private directory handle.
+
 ## [0.1.0-alpha.67] — 2026-11-12
 
 ### Added
@@ -3245,7 +3258,8 @@ launcher picker and the merge queue's `agent_command` hook remain — they run
 whatever commands you configure. Leftover `[llm_proxy]` config sections and
 `proxy_*` tables in existing state databases are ignored harmlessly.
 
-[Unreleased]: https://github.com/blakeashleyjr/thegn/compare/v0.1.0-alpha.67...HEAD
+[Unreleased]: https://github.com/blakeashleyjr/thegn/compare/v0.1.0-alpha.68...HEAD
+[0.1.0-alpha.68]: https://github.com/blakeashleyjr/thegn/compare/v0.1.0-alpha.67...v0.1.0-alpha.68
 [0.1.0-alpha.67]: https://github.com/blakeashleyjr/thegn/compare/v0.1.0-alpha.66...v0.1.0-alpha.67
 [0.1.0-alpha.66]: https://github.com/blakeashleyjr/thegn/compare/v0.1.0-alpha.65...v0.1.0-alpha.66
 [0.1.0-alpha.65]: https://github.com/blakeashleyjr/thegn/compare/v0.1.0-alpha.64...v0.1.0-alpha.65

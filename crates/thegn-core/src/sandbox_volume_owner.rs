@@ -10,7 +10,7 @@
 use crate::sandbox::{self, Backend, EnterError, RefusalClass, SandboxSpec};
 use sha2::{Digest, Sha256};
 use std::io::Read;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 pub const VOLUME_OWNER_LABEL: &str = "thegn.volume.owner";
 pub const DEVCONTAINER_VOLUME_ROLE: &str = "devcontainer";
@@ -100,11 +100,7 @@ pub fn volume_create_argv(prefix: &[String], name: &str, owner: &str) -> Vec<Str
     argv
 }
 
-fn claim_dir(state_home: &Path) -> PathBuf {
-    state_home.join("thegn/devcontainer-volumes")
-}
-
-fn record_path(spec: &SandboxSpec, dir: &Path, name: &str) -> PathBuf {
+fn record_path(spec: &SandboxSpec, name: &str) -> String {
     let mut hash = Sha256::new();
     hash.update(b"thegn.devcontainer-volume-claim.v1\0");
     hash.update(spec.backend.label().as_bytes());
@@ -113,11 +109,11 @@ fn record_path(spec: &SandboxSpec, dir: &Path, name: &str) -> PathBuf {
     hash.update(b"\0");
     hash.update(name.as_bytes());
     let hex = format!("{:x}", hash.finalize());
-    dir.join(&hex[..32])
+    hex[..32].to_string()
 }
 
-fn read_claim(path: &Path) -> std::io::Result<Option<String>> {
-    match crate::fsperm::open_regular_file_nofollow(path) {
+fn read_claim(dir: &crate::fsperm::PrivateDir, name: &str) -> std::io::Result<Option<String>> {
+    match dir.open_regular_nofollow(name) {
         Ok(file) => {
             let mut bytes = Vec::new();
             file.take(257).read_to_end(&mut bytes)?;
@@ -143,18 +139,22 @@ fn read_claim(path: &Path) -> std::io::Result<Option<String>> {
     }
 }
 
-fn write_claim(path: &Path, owner: &str) -> std::io::Result<()> {
-    let mut file = crate::fsperm::create_owner_only_exclusive(path)?;
+fn write_claim(dir: &crate::fsperm::PrivateDir, name: &str, owner: &str) -> std::io::Result<()> {
+    let mut file = dir.create_owner_only_exclusive(name)?;
     use std::io::Write;
     file.write_all(format!("{owner}\n").as_bytes())?;
     file.sync_all()
 }
 
-fn claim_legacy_record(path: &Path, owner: &str) -> Result<(), String> {
-    match write_claim(path, owner) {
+fn claim_legacy_record(
+    dir: &crate::fsperm::PrivateDir,
+    name: &str,
+    owner: &str,
+) -> Result<(), String> {
+    match write_claim(dir, name, owner) {
         Ok(()) => Ok(()),
         Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
-            let record = read_claim(path).map_err(|read_error| {
+            let record = read_claim(dir, name).map_err(|read_error| {
                 format!("claim record unreadable after race: {read_error}")
             })?;
             match plan_claim(&VolumeProbe::Unlabelled, owner, record.as_deref()) {
@@ -214,19 +214,29 @@ where
     if spec.volume_owners.is_empty() {
         return Ok(());
     }
-    let dir = claim_dir(state_home);
-    crate::fsperm::ensure_private_dir(&dir).map_err(|error| {
-        refused(
-            spec,
-            "<state>",
-            &format!("claim directory unavailable: {error}"),
-        )
-    })?;
+    let anchor = state_home.join("thegn");
+    if !anchor.exists() {
+        crate::fsperm::ensure_private_dir(&anchor).map_err(|error| {
+            refused(
+                spec,
+                "<state>",
+                &format!("claim directory unavailable: {error}"),
+            )
+        })?;
+    }
+    let dir = crate::fsperm::ensure_private_dir_beneath(&anchor, Path::new("devcontainer-volumes"))
+        .map_err(|error| {
+            refused(
+                spec,
+                "<state>",
+                &format!("claim directory unavailable: {error}"),
+            )
+        })?;
     let prefix = sandbox::oci_prefix(spec);
     for (name, owner) in &spec.volume_owners {
-        let path = record_path(spec, &dir, name);
+        let record_name = record_path(spec, name);
         let record = if spec.placement.is_local() {
-            read_claim(&path).map_err(|error| {
+            read_claim(&dir, &record_name).map_err(|error| {
                 refused(spec, name, &format!("claim record unreadable: {error}"))
             })?
         } else {
@@ -235,7 +245,7 @@ where
         if spec.backend == Backend::Apple && spec.placement.is_local() {
             match plan_claim(&VolumeProbe::Unlabelled, owner, record.as_deref()) {
                 ClaimPlan::ClaimLegacy => {
-                    claim_legacy_record(&path, owner)
+                    claim_legacy_record(&dir, &record_name, owner)
                         .map_err(|error| refused(spec, name, &error))?;
                     continue;
                 }
@@ -273,7 +283,8 @@ where
                 ));
             }
             ClaimPlan::ClaimLegacy => {
-                claim_legacy_record(&path, owner).map_err(|error| refused(spec, name, &error))?;
+                claim_legacy_record(&dir, &record_name, owner)
+                    .map_err(|error| refused(spec, name, &error))?;
                 continue;
             }
             ClaimPlan::Create => {
@@ -310,7 +321,7 @@ where
                     ClaimPlan::UseLabelled | ClaimPlan::UseClaimed => continue,
                     ClaimPlan::Refuse(why) => return Err(refused(spec, name, &why)),
                     ClaimPlan::ClaimLegacy if spec.placement.is_local() => {
-                        claim_legacy_record(&path, owner)
+                        claim_legacy_record(&dir, &record_name, owner)
                             .map_err(|error| refused(spec, name, &error))?;
                     }
                     _ => {
@@ -332,6 +343,7 @@ mod tests {
     use super::*;
     use crate::config::{FileAccess, Network};
     use crate::placement::Placement;
+    use std::path::PathBuf;
 
     const OWNER: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
 
@@ -490,5 +502,73 @@ mod tests {
         let dir = state.join("thegn/devcontainer-volumes");
         assert!(dir.is_dir());
         assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 1);
+        if let Some(mode) = crate::fsperm::mode_bits(&dir).unwrap() {
+            assert_eq!(mode, 0o700);
+        }
+        if let Some(mode) =
+            crate::fsperm::mode_bits(&dir.join(record_path(&spec(OWNER), "data"))).unwrap()
+        {
+            assert_eq!(mode, 0o600);
+        }
+    }
+
+    #[test]
+    fn fresh_state_home_without_thegn_is_supported() {
+        let temp = tempfile::tempdir().unwrap();
+        let state = temp.path().join("state");
+        let mut runner = |_: &[String]| Some((true, "\n".into(), String::new()));
+
+        claim_volumes(&spec(OWNER), &state, &mut runner).unwrap();
+
+        assert!(state.join("thegn/devcontainer-volumes").is_dir());
+    }
+
+    #[test]
+    fn existing_symlinked_thegn_anchor_is_supported() {
+        let temp = tempfile::tempdir().unwrap();
+        let state = temp.path().join("state");
+        let anchor_target = temp.path().join("anchor-target");
+        std::fs::create_dir_all(&state).unwrap();
+        std::fs::create_dir(&anchor_target).unwrap();
+        if crate::fsperm::create_symlink(&anchor_target, &state.join("thegn"), true).is_err() {
+            return;
+        }
+
+        let mut runner = |_: &[String]| Some((true, "\n".into(), String::new()));
+        claim_volumes(&spec(OWNER), &state, &mut runner).unwrap();
+
+        assert!(anchor_target.join("devcontainer-volumes").is_dir());
+    }
+
+    #[test]
+    fn symlinked_claim_dir_is_refused_without_touching_victim() {
+        let temp = tempfile::tempdir().unwrap();
+        let state = temp.path().join("state");
+        let anchor = state.join("thegn");
+        let victim = temp.path().join("victim");
+        std::fs::create_dir_all(&anchor).unwrap();
+        std::fs::create_dir(&victim).unwrap();
+        if crate::fsperm::create_symlink(&victim, &anchor.join("devcontainer-volumes"), true)
+            .is_err()
+        {
+            return;
+        }
+
+        let mut calls = 0;
+        let mut runner = |_: &[String]| {
+            calls += 1;
+            Some((true, "\n".into(), String::new()))
+        };
+        let result = claim_volumes(&spec(OWNER), &state, &mut runner);
+
+        assert!(matches!(
+            result,
+            Err(EnterError::Refused(crate::sandbox::Refusal {
+                class: RefusalClass::VolumeOwner,
+                ..
+            }))
+        ));
+        assert_eq!(calls, 0);
+        assert_eq!(std::fs::read_dir(&victim).unwrap().count(), 0);
     }
 }
