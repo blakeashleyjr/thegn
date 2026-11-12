@@ -24,6 +24,10 @@ use thegn_svc::control::client::{AttachControl, ControlAddr, ControlClient};
 // any roster row exists, a grant the harness cannot take (`policy_admission`).
 
 #[derive(clap::Subcommand, Clone)]
+#[expect(
+    clippy::large_enum_variant,
+    reason = "clap subcommand parsed once per process; boxing the Open fields buys nothing"
+)]
 pub enum SessionAction {
     /// Move one persisted worktree presentation and dispatch ledger to an
     /// existing profile. This is deliberately a host operation: it crosses
@@ -498,13 +502,6 @@ async fn run_async(cfg: &Config, action: SessionAction) -> Result<()> {
                 issue.as_deref(),
                 track.as_deref(),
                 worktree.as_deref(),
-                prompt,
-                *headless,
-            )?;
-            open_preflight(
-                cfg,
-                stage.as_deref(),
-                issue.as_deref(),
                 resolved_open_prompt.as_deref().unwrap_or(prompt),
                 *headless,
             )?;
@@ -644,7 +641,12 @@ async fn run_async(cfg: &Config, action: SessionAction) -> Result<()> {
                 let wt = crate::cmd::resolve_worktree(worktree)
                     .to_string_lossy()
                     .into_owned();
-                crate::cmd::session_tmp_warn::warn_if_private_tmp(cfg, &wt, &prompt);
+                // The launch prompt is final here (a --brief-file brief is already
+                // read and rendered), so the private-/tmp warning sees what the
+                // agent will see (THE-1979).
+                let launch_prompt =
+                    resolved_open_prompt.expect("plain open prompt was resolved before connect");
+                crate::cmd::session_tmp_warn::warn_if_private_tmp(cfg, &wt, &launch_prompt);
                 let spec = OpenSpec {
                     automation_origin: None,
                     argv: Vec::new(),
@@ -655,10 +657,7 @@ async fn run_async(cfg: &Config, action: SessionAction) -> Result<()> {
                     worktree: Some(wt.clone()),
                     agent: Some(AgentLaunch {
                         agent: agent.clone(),
-                        prompt,
-                        agent,
-                        prompt: resolved_open_prompt
-                            .expect("plain open prompt was resolved before connect"),
+                        prompt: launch_prompt,
                         // A plain `--headless` forces headless; absent leaves the
                         // default (headless exactly when a prompt was given).
                         headless: headless.then_some(true),
