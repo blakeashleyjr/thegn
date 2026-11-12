@@ -1335,13 +1335,17 @@ fn hm_usage_and_tailnet_keys_are_rendered_and_rest_dispositioned() {
     }
 
     let omissions: BTreeSet<&str> = OMITTED.iter().map(|(path, _)| *path).collect();
-    for section in ["usage", "host_discovery", "host_discovery.tailnet"] {
+    let sections = ["usage", "host_discovery", "host_discovery.tailnet"];
+    for section in sections {
         let schema = schema_field(section);
         let properties = schema["properties"]
             .as_object()
             .unwrap_or_else(|| panic!("{section} schema properties"));
         for key in properties.keys() {
             let path = format!("{section}.{key}");
+            if sections.contains(&path.as_str()) {
+                continue;
+            }
             assert!(
                 rendered.contains(&path) || omissions.contains(path.as_str()),
                 "{path} must be rendered or dispositioned by an exact ledger row"
