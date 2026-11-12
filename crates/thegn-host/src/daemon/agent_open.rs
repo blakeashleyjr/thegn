@@ -423,6 +423,7 @@ pub(crate) fn command_for(
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 fn command_for_with(
     cfg: &Config,
     agent: &str,
