@@ -252,7 +252,14 @@ const OMITTED: &[(&str, &str)] = &[
     ("host_discovery", "host discovery is not exposed"),
     ("share", "port sharing is not exposed"),
     ("forward", "port forwarding is not exposed"),
-    ("preview", "preview policy is not exposed"),
+    (
+        "preview.ports",
+        "candidate port list needs port-0 handling and is not exposed",
+    ),
+    (
+        "preview.allow_external_urls",
+        "SSRF boundary is a security opt-in and is not exposed as a convenience option",
+    ),
     ("lifecycle", "provider lifecycle policy is not exposed"),
     ("placement", "multi-host placement is not exposed"),
     ("profiles", "named profiles are not exposed"),
@@ -742,6 +749,7 @@ fn every_schema_key_is_rendered_or_dispositioned() {
         "disk",
         "daemon",
         "network",
+        "preview",
         "sandbox.remote",
     ] {
         for (schema_section, key) in &required.keys {
@@ -1254,6 +1262,31 @@ fn hm_daemon_and_network_keys_are_rendered_and_rest_dispositioned() {
 }
 
 #[test]
+fn hm_preview_keys_are_rendered_and_rest_dispositioned() {
+    let rendered = rendered_paths(&module_src());
+    for path in [
+        "preview.enabled",
+        "preview.fetch_timeout_ms",
+        "preview.max_body_bytes",
+    ] {
+        assert!(rendered.contains(path), "Home Manager must render {path}");
+    }
+
+    let omissions: BTreeSet<&str> = OMITTED.iter().map(|(path, _)| *path).collect();
+    let schema = schema_field("preview");
+    let properties = schema["properties"]
+        .as_object()
+        .expect("preview schema properties");
+    for key in properties.keys() {
+        let path = format!("preview.{key}");
+        assert!(
+            rendered.contains(&path) || omissions.contains(path.as_str()),
+            "{path} must be rendered or dispositioned by an exact ledger row"
+        );
+    }
+}
+
+#[test]
 fn hm_loc_and_replay_families_are_fully_rendered() {
     let rendered = rendered_paths(&module_src());
     for table in ["loc", "replay"] {
@@ -1439,6 +1472,8 @@ fn every_numeric_option_matches_its_destination_range() {
             "network.offline_after_failures",
         ),
         ("networkRecoveryProbeSecs", "network.recovery_probe_secs"),
+        ("previewFetchTimeoutMs", "preview.fetch_timeout_ms"),
+        ("previewMaxBodyBytes", "preview.max_body_bytes"),
     ];
     let options = numeric_options(&module_src());
     let actual_names: BTreeSet<&str> = options.iter().map(|(name, _)| name.as_str()).collect();
@@ -1459,6 +1494,29 @@ fn every_numeric_option_matches_its_destination_range() {
             Some("integer"),
             "schema type for {path}"
         );
+        if path == "preview.fetch_timeout_ms" {
+            assert_eq!(
+                nix_type,
+                format!(
+                    "lib.types.ints.between {} {}",
+                    thegn_core::config_preview::MIN_FETCH_TIMEOUT_MS,
+                    thegn_core::config_preview::MAX_FETCH_TIMEOUT_MS
+                ),
+                "Nix type for clamped field {path}"
+            );
+            continue;
+        }
+        if path == "preview.max_body_bytes" {
+            assert_eq!(
+                nix_type,
+                format!(
+                    "lib.types.ints.between 1 {}",
+                    thegn_core::config_preview::MAX_PREVIEW_BODY_BYTES
+                ),
+                "Nix type for clamped field {path}"
+            );
+            continue;
+        }
         if name == "port" {
             assert_eq!(schema.get("format").and_then(Value::as_str), Some("uint16"));
             assert_eq!(nix_type, "lib.types.port", "Nix type for {path}");
