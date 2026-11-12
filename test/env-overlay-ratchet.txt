@@ -215,8 +215,6 @@ limits.discover_timeout_secs
 limits.isolated_target_dir
 limits.test_cpu_quota
 limits.test_max_parallel
-sandbox.limits.heavy_slots
-sandbox.limits.max_load
 limits.test_mem_max
 limits.test_nice
 limits.test_timeout_secs

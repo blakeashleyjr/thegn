@@ -6290,22 +6290,6 @@ pub fn env_overlay(env: &dyn EnvSource) -> ConfigOverlay {
         o.preview.allow_external_urls = parse_bool(&v, "THEGN_PREVIEW_ALLOW_EXTERNAL_URLS");
     }
 
-    // [sandbox]
-    if let Some(v) = env.get("THEGN_SANDBOX_LIMITS_HEAVY_SLOTS") {
-        let value = parse_num(v, "THEGN_SANDBOX_LIMITS_HEAVY_SLOTS")
-            .and_then(|value| usize::try_from(value).ok());
-        let limits = o.sandbox.limits.get_or_insert_with(Default::default);
-        if let Some(value) = value {
-            limits.heavy_slots = value;
-        }
-    }
-    if let Some(v) = env.get("THEGN_SANDBOX_LIMITS_MAX_LOAD") {
-        let value = parse_float(v, "THEGN_SANDBOX_LIMITS_MAX_LOAD");
-        let limits = o.sandbox.limits.get_or_insert_with(Default::default);
-        if let Some(value) = value {
-            limits.max_load = value;
-        }
-    }
     if let Some(v) = env.get("THEGN_SANDBOX_BACKEND") {
         o.sandbox.backend = parse_enum_env(
             v.trim(),

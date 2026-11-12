@@ -210,8 +210,6 @@ pub(super) fn run(cfg: &Config, id: i64, json: bool) -> Result<()> {
     let state = util::xdg_state_home();
     let logs = ensure_private_dir_beneath(&state, Path::new("thegn/pipeline-gates"))
         .context("could not secure pipeline gate log directory")?;
-    let heavy_cfg = (&cfg.sandbox.limits).into();
-    let _slot = crate::heavy_slot::acquire(&heavy_cfg, "dispatch gate")?;
     let stored = gate_row(
         &db,
         cfg,
