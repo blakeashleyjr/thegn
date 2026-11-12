@@ -1011,6 +1011,11 @@ pub struct MergeQueueConfig {
     /// commits and imported read-only from the repository's rr-cache. Off by
     /// default. A rerere-resolved merge still runs the gate before landing.
     pub rerere: bool,
+    /// Resolved host-local heavy-gate policy. This is runtime plumbing from
+    /// `[sandbox.limits]`, not a serialised `[merge_queue]` setting.
+    #[serde(skip)]
+    #[schemars(skip)]
+    pub heavy_gate: crate::heavy_gate::Config,
 }
 
 /// `[merge_queue.prompts]` — the task prompt handed to the fixing agent, one
@@ -1112,6 +1117,7 @@ impl Default for MergeQueueConfig {
             land_message: String::new(),
             sign_commits: false,
             rerere: false,
+            heavy_gate: crate::heavy_gate::Config::default(),
         }
     }
 }
@@ -6285,6 +6291,21 @@ pub fn env_overlay(env: &dyn EnvSource) -> ConfigOverlay {
     }
 
     // [sandbox]
+    if let Some(v) = env.get("THEGN_SANDBOX_LIMITS_HEAVY_SLOTS") {
+        let value = parse_num(v, "THEGN_SANDBOX_LIMITS_HEAVY_SLOTS")
+            .and_then(|value| usize::try_from(value).ok());
+        let limits = o.sandbox.limits.get_or_insert_with(Default::default);
+        if let Some(value) = value {
+            limits.heavy_slots = value;
+        }
+    }
+    if let Some(v) = env.get("THEGN_SANDBOX_LIMITS_MAX_LOAD") {
+        let value = parse_float(v, "THEGN_SANDBOX_LIMITS_MAX_LOAD");
+        let limits = o.sandbox.limits.get_or_insert_with(Default::default);
+        if let Some(value) = value {
+            limits.max_load = value;
+        }
+    }
     if let Some(v) = env.get("THEGN_SANDBOX_BACKEND") {
         o.sandbox.backend = parse_enum_env(
             v.trim(),
@@ -7171,6 +7192,7 @@ impl Config {
             }
             _ => {}
         }
+        mq.heavy_gate = (&self.sandbox.limits).into();
         mq
     }
 
