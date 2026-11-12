@@ -82,11 +82,9 @@ pub fn load_in(root: &Path, vm_name: &str) -> Option<Attestation> {
 
 pub fn store_in(root: &Path, record: &Attestation) -> anyhow::Result<()> {
     let name = crate::vps::registry::checked_name(&record.vm_name)?;
-    let dir = dir_in(root);
-    thegn_core::fsperm::ensure_private_dir(&dir)?;
+    let dir = thegn_core::fsperm::ensure_private_dir_beneath(root, Path::new("machine0/attest"))?;
     let bytes = serde_json::to_vec(record)?;
-    thegn_core::fsperm::open_private_dir(&dir)?
-        .write_owner_only_atomic(&format!("{name}.json"), &bytes)?;
+    dir.write_owner_only_atomic(&format!("{name}.json"), &bytes)?;
     Ok(())
 }
 
@@ -144,6 +142,53 @@ mod tests {
         assert_eq!(load_in(root.path(), "dev"), Some(record));
         let mode = thegn_core::fsperm::mode_bits(&dir_in(root.path()).join("dev.json")).unwrap();
         assert!(mode.is_none() || mode == Some(0o600));
+    }
+
+    #[test]
+    fn store_refuses_a_symlinked_attest_directory_without_touching_victim() {
+        let root = tempfile::tempdir().unwrap();
+        let machine0 = root.path().join("machine0");
+        let dir = machine0.join("attest");
+        let victim = root.path().join("victim");
+        std::fs::create_dir(&machine0).unwrap();
+        thegn_core::fsperm::restrict_dir_to_owner(&machine0).unwrap();
+        std::fs::create_dir(&victim).unwrap();
+        if let Err(error) = thegn_core::fsperm::create_symlink(&victim, &dir, true) {
+            assert!(
+                matches!(
+                    error.kind(),
+                    std::io::ErrorKind::PermissionDenied | std::io::ErrorKind::Unsupported
+                ),
+                "unexpected symlink fixture error: {error}"
+            );
+            return;
+        }
+
+        assert!(store_in(root.path(), &sample()).is_err());
+        assert!(std::fs::read_dir(&victim).unwrap().next().is_none());
+    }
+
+    #[test]
+    fn store_tightens_a_preexisting_attest_directory() {
+        let root = tempfile::tempdir().unwrap();
+        let machine0 = root.path().join("machine0");
+        let dir = machine0.join("attest");
+        std::fs::create_dir(&machine0).unwrap();
+        thegn_core::fsperm::restrict_dir_to_owner(&machine0).unwrap();
+        std::fs::create_dir(&dir).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+
+        store_in(root.path(), &sample()).unwrap();
+
+        assert!(
+            thegn_core::fsperm::mode_bits(&dir)
+                .unwrap()
+                .is_none_or(|bits| bits == 0o700)
+        );
     }
 
     #[test]

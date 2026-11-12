@@ -541,9 +541,15 @@ struct LockedLedger {
 /// file operations, never across remote calls; never acquire it twice in one
 /// call chain because a second flock descriptor deadlocks.
 fn lock_ledger(dir: &Path) -> Result<LockedLedger> {
-    crate::fsperm::ensure_private_dir(dir).with_context(|| format!("create {}", dir.display()))?;
-    let held = crate::fsperm::open_private_dir(dir)
-        .with_context(|| format!("open managed SSH custody directory {}", dir.display()))?;
+    let parent = dir
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    let name = dir
+        .file_name()
+        .context("managed SSH custody directory has no final component")?;
+    let held = crate::fsperm::ensure_private_dir_beneath(parent, Path::new(name))
+        .with_context(|| format!("create {}", dir.display()))?;
     let path = held.path().join(".custody.lock");
     let file = held
         .open_or_create_regular_nofollow(".custody.lock")
@@ -2200,6 +2206,29 @@ mod tests {
         assert!(result.is_err());
         assert!(!target.exists());
         assert!(list_at(temp.path()).unwrap().is_empty());
+    }
+
+    #[test]
+    fn ledger_directory_symlink_is_refused_without_touching_target() {
+        let temp = tempfile::tempdir().unwrap();
+        let ledger = temp.path().join("ledger");
+        let target = temp.path().join("target");
+        std::fs::create_dir(&target).unwrap();
+        if let Err(error) = crate::fsperm::create_symlink(&target, &ledger, true) {
+            assert!(
+                matches!(
+                    error.kind(),
+                    std::io::ErrorKind::PermissionDenied | std::io::ErrorKind::Unsupported
+                ),
+                "unexpected symlink fixture error: {error}"
+            );
+            return;
+        }
+
+        let result = record_authorized_at(&ledger, &record());
+
+        assert!(result.is_err());
+        assert!(std::fs::read_dir(&target).unwrap().next().is_none());
     }
 
     #[test]
