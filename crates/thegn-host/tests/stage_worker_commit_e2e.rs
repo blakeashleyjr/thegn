@@ -223,7 +223,7 @@ struct Fixture {
     worktree: PathBuf,
     base_head: String,
     git_config: Vec<u8>,
-    daemon: RunningDaemon,
+    _daemon: RunningDaemon,
 }
 
 impl Fixture {
@@ -320,7 +320,7 @@ impl Fixture {
             worktree,
             base_head,
             git_config,
-            daemon,
+            _daemon: daemon,
         }
     }
 
