@@ -7,6 +7,18 @@ All notable changes to **thegn** are documented here. The format follows
 
 ## [Unreleased]
 
+### Added
+
+- The Home Manager module exposes `[preview]` `enabled`, `fetch_timeout_ms` and
+  `max_body_bytes`; ports and external URLs remain config-file-only.
+- `docs/help/sandboxing.md` documents preserving worker reports with a writable
+  `mounts` entry under `[env.*]`; the private-`/tmp` warning skips covered paths.
+
+### Security
+
+- The local `act` guard scans user-level actrc files (XDG/`~/.actrc` and macOS
+  Application Support) for credentials using act's own line tokenizer.
+
 ## [0.1.0-alpha.65] — 2026-11-12
 
 ### Added
