@@ -456,11 +456,11 @@ pub(crate) fn write_state_file(path: &std::path::Path, value: &str) {
         tracing::debug!(path = %path.display(), "state file parent has no directory name");
         return;
     };
-    if !anchor.exists() {
-        if let Err(error) = thegn_core::fsperm::ensure_private_dir(anchor) {
-            tracing::debug!(%error, path = %path.display(), "state file anchor is not a private directory");
-            return;
-        }
+    if !anchor.exists()
+        && let Err(error) = thegn_core::fsperm::ensure_private_dir(anchor)
+    {
+        tracing::debug!(%error, path = %path.display(), "state file anchor is not a private directory");
+        return;
     }
     let dir = match thegn_core::fsperm::ensure_private_dir_beneath(
         anchor,
