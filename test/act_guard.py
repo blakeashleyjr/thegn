@@ -205,27 +205,68 @@ def platform_mappings(tokens: list[str]) -> list[tuple[str, str]]:
 
 
 def _expand_actrc_vars(line: str, env: dict[str, str]) -> str:
-    """Expand the $var and ${var} forms accepted by Go's os.ExpandEnv."""
-    pattern = re.compile(r"\$(?:\{([^}]*)\}|([_a-zA-Z][_a-zA-Z0-9]*))")
+    """Expand variables with the same forms and unset behavior as Go."""
+    special = set("*#$@!?-0123456789")
 
-    def replace(match: re.Match[str]) -> str:
-        name = match.group(1) or match.group(2)
-        return env.get(name, match.group(0))
+    def is_ascii_alnum(char: str) -> bool:
+        return (
+            char == "_"
+            or "0" <= char <= "9"
+            or "a" <= char <= "z"
+            or "A" <= char <= "Z"
+        )
 
-    return pattern.sub(replace, line)
+    expanded: list[str] = []
+    i = 0
+    while i < len(line):
+        if line[i] != "$" or i + 1 == len(line):
+            expanded.append(line[i])
+            i += 1
+            continue
+        if line[i + 1] == "{":
+            if i + 3 < len(line) and line[i + 2] in special and line[i + 3] == "}":
+                name = line[i + 2]
+                i += 4
+                expanded.append(env.get(name, ""))
+                continue
+            end = line.find("}", i + 2)
+            if end < 0:
+                i += 2
+                continue
+            if end == i + 2:
+                i = end + 1
+                continue
+            name = line[i + 2 : end]
+            i = end + 1
+        else:
+            if line[i + 1] in special:
+                name = line[i + 1]
+                i += 2
+            elif is_ascii_alnum(line[i + 1]):
+                end = i + 2
+                while end < len(line) and is_ascii_alnum(line[end]):
+                    end += 1
+                name = line[i + 1 : end]
+                i = end
+            else:
+                expanded.append(line[i])
+                i += 1
+                continue
+        expanded.append(env.get(name, ""))
+    return "".join(expanded)
 
 
 def actrc_tokens(actrc: str, env: dict[str, str] | None = None) -> list[str]:
     """Parse act's readArgsFile lines into one flag and one value per line."""
     tokens: list[str] = []
     for line in actrc.splitlines():
-        stripped = line.strip()
-        # Mirrors act cmd/root.go readArgsFile: trim, keep '-' lines, apply
-        # os.ExpandEnv, then split each line into at most two fields.
+        # Mirrors act cmd/root.go readArgsFile: apply os.ExpandEnv, trim, keep
+        # '-' lines, then split each line into at most two fields.
+        expanded = _expand_actrc_vars(line, os.environ if env is None else env)
+        stripped = expanded.strip()
         if not stripped.startswith("-"):
             continue
-        expanded = os.path.expandvars(stripped) if env is None else _expand_actrc_vars(stripped, env)
-        tokens.extend(expanded.split(None, 1))
+        tokens.extend(stripped.split(None, 1))
     return tokens
 
 
@@ -756,6 +797,29 @@ def self_test() -> int:
             (
                 "user-actrc-expands-environment-values",
                 user_actrc_tokens(expanded_env) == ["--secret", "T=x"],
+            )
+        )
+
+        flag_env = {**user_env, "ACT_SECRET_FLAG": "-s"}
+        unset_tokens = actrc_tokens("$NOPE-s T=x\n", user_env)
+        direct_tokens = actrc_tokens("-s T=x\n", user_env)
+        set_tokens = actrc_tokens("$ACT_SECRET_FLAG T=x\n", flag_env)
+        unset_argv, unset_message = plan(
+            "push", [], [" M .github/workflows/ci.yml"], "abc123", False, unset_tokens
+        )
+        direct_argv, direct_message = plan(
+            "push", [], [" M .github/workflows/ci.yml"], "abc123", False, direct_tokens
+        )
+        cases.append(
+            (
+                "actrc-expands-before-flag-check-with-unset-and-set-vars",
+                unset_tokens == ["-s", "T=x"]
+                and direct_tokens == ["-s", "T=x"]
+                and set_tokens == ["-s", "T=x"]
+                and unset_argv is None
+                and direct_argv is None
+                and ".github/workflows/ci.yml" in unset_message
+                and ".github/workflows/ci.yml" in direct_message,
             )
         )
 
