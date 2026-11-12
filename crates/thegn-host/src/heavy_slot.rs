@@ -214,7 +214,7 @@ mod tests {
         });
         std::thread::sleep(Duration::from_millis(50));
         released.store(true, Ordering::Release);
-        worker.join().unwrap();
+        assert!(worker.join().unwrap().lock.is_none());
     }
 
     #[test]
