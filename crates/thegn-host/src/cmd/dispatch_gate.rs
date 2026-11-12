@@ -1018,32 +1018,62 @@ mod tests {
     #[test]
     fn trusted_land_gate_refuses_a_worker_runner_attestation() {
         let (_repo_dir, repo_path) = repo();
-        let (db, id, _cfg, _log_dir, _logs) = pipeline_setup(&repo_path);
-        let row = db.get_dispatch(id).unwrap().unwrap();
-        let stored = StoredGateAttestation {
-            id: 7,
-            dispatch_row: id,
-            repo: String::new(),
-            worktree: row.worktree_path.clone(),
-            branch_ref: String::new(),
-            commit_oid: String::new(),
-            tree_oid: String::new(),
-            command: String::new(),
-            started_ms: 0,
-            ended_ms: 0,
-            exit: None,
-            log_path: String::new(),
-            runner: "worker".to_string(),
-            outcome: GateOutcome::Passed,
-            reason: String::new(),
-        };
-        assert!(matches!(
-            trusted_gate_for(&row, Some(&stored)),
-            TrustedGate::Refused {
-                refusal: AttestationRefusal::UntrustedRunner,
-                ..
-            }
-        ));
+        let db_dir = tempfile::tempdir().unwrap();
+        let db_path = db_dir.path().join("state.db");
+        let db = Db::open_at(&db_path).unwrap();
+        let worktree = repo_path.display().to_string();
+        let id = db
+            .put_agent_dispatch(NewDispatch {
+                stage: Some("code"),
+                artifact_path: Some(".thegn/pipeline/THE-1103/code/1.md"),
+                ..NewDispatch::new("linear:THE-1103", &worktree, "fixture")
+            })
+            .unwrap();
+        finish_pipeline_row(&db, id);
+        let commit = git(&repo_path, &["rev-parse", "HEAD"]);
+        let tree = git(&repo_path, &["rev-parse", "HEAD^{tree}"]);
+        let repo_common = git(
+            &repo_path,
+            &["rev-parse", "--path-format=absolute", "--git-common-dir"],
+        );
+        let branch_ref = git(&repo_path, &["symbolic-ref", "-q", "HEAD"]);
+        let worktree = std::fs::canonicalize(&repo_path)
+            .unwrap()
+            .display()
+            .to_string();
+        let conn = rusqlite::Connection::open(&db_path).unwrap();
+        conn.execute(
+            "INSERT INTO pipeline_gate_attestations
+             (dispatch_id,repo,worktree,branch_ref,commit_oid,tree_oid,command,
+              started_ms,ended_ms,exit_code,outcome,reason,log_path,runner)
+             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14)",
+            rusqlite::params![
+                id,
+                repo_common,
+                worktree,
+                branch_ref,
+                commit,
+                tree,
+                "gate",
+                1_i64,
+                2_i64,
+                0_i32,
+                "passed",
+                "",
+                "/tmp/worker-gate.log",
+                "worker",
+            ],
+        )
+        .unwrap();
+        let error = trusted_land_gate(
+            &db,
+            &repo_path.display().to_string(),
+            &commit,
+            &commit,
+            &repo_path,
+        )
+        .unwrap_err();
+        assert!(error.contains("trust binding"), "{error}");
     }
 
     #[test]

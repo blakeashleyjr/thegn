@@ -19,7 +19,7 @@
 
 use anyhow::{Context, Result, bail};
 use std::path::Path;
-use thegn_core::config::{Config, MergeQueueConfig};
+use thegn_core::config::Config;
 use thegn_core::db::{CompatibleDb, Db, SchemaOperation};
 use thegn_core::merge_lifecycle::{LifecycleAction, LifecycleEvent, decide};
 use thegn_core::outln;
@@ -42,12 +42,6 @@ fn gate_error_message(
          fix the gate environment (see `[merge_queue] gate_setup_command`) \
          and re-run."
     )
-}
-
-fn apply_trusted_gate(mq: &mut MergeQueueConfig, trusted: bool) {
-    if trusted {
-        mq.gate_on = false;
-    }
 }
 
 fn integration_tracking_outcome(
@@ -111,7 +105,7 @@ fn land_branch_pinned_with_options(
     let mut mq = cfg.repo_merge_queue(&root);
     mq.auto_land = true;
     let target = integrate::resolve_target(&mq, &root);
-    if trust_gate {
+    let trusted = if trust_gate {
         let is_root = std::fs::canonicalize(worktree).ok().as_deref() == Some(root.as_path());
         let trusted = if is_root {
             Err("nothing to attest".to_string())
@@ -122,22 +116,23 @@ fn land_branch_pinned_with_options(
                 .map_err(|error| format!("could not bind target tip: {error}"));
             match (folded_commit, target_tip) {
                 (Ok(folded_commit), Ok(target_tip)) => {
-                    crate::cmd::dispatch_gate::trusted_land_gate(
+                    crate::cmd::dispatch_gate::trusted_land_gate_id(
                         db,
                         &worktree.to_string_lossy(),
                         &folded_commit,
                         &target_tip,
                         &root,
                     )
-                    .and_then(|()| {
-                        crate::cmd::dispatch_gate::trusted_land_gate_id(
-                            db,
-                            &worktree.to_string_lossy(),
-                            &folded_commit,
-                            &target_tip,
-                            &root,
-                        )
-                        .map(|id| (id, folded_commit, target_tip))
+                    .and_then(|id| {
+                        if let Some(expected) = expected_tip
+                            && !expected.eq_ignore_ascii_case(&folded_commit)
+                        {
+                            Err(format!(
+                                "queue pin binding is {expected} but trusted land commit is {folded_commit}"
+                            ))
+                        } else {
+                            Ok((id, folded_commit, target_tip))
+                        }
                     })
                 }
                 (Err(error), _) | (_, Err(error)) => Err(error),
@@ -146,24 +141,37 @@ fn land_branch_pinned_with_options(
             Err("trust-gate database is unavailable".to_string())
         };
         match trusted {
-            Ok((attestation_id, folded_commit, target_tip)) => {
-                apply_trusted_gate(&mut mq, true);
-                outln!(
-                    "Gate skipped: trusted attestation {attestation_id} bound to {folded_commit} and target tip {target_tip}"
-                );
-            }
+            Ok(bound) => Some(bound),
             Err(reason) => {
                 outln!("Gate trust refused: {reason}; running the normal gate");
+                None
             }
         }
-    }
+    } else {
+        None
+    };
     // `thegn land` lands the branch checked out in `worktree`; its loc tells
     // attempt_land whether that worktree is on this host (no ingest) or remote.
     let branch_loc = thegn_core::remote::GitLoc::for_worktree_op(worktree, "land")
         .map_err(anyhow::Error::msg)?;
-    let outcome = match expected_tip {
-        Some(tip) => integrate::attempt_land_pinned(&mq, &root, &branch, &branch_loc, tip)?,
-        None => integrate::attempt_land(&mq, &root, &branch, &branch_loc)?,
+    let outcome = if let Some((attestation_id, folded_commit, target_tip)) = trusted {
+        let outcome = integrate::attempt_land_trusted(
+            &mq,
+            &root,
+            &branch,
+            &branch_loc,
+            &folded_commit,
+            &target_tip,
+        )?;
+        outln!(
+            "Gate skipped: trusted attestation {attestation_id} bound to {folded_commit} and target tip {target_tip}"
+        );
+        outcome
+    } else {
+        match expected_tip {
+            Some(tip) => integrate::attempt_land_pinned(&mq, &root, &branch, &branch_loc, tip)?,
+            None => integrate::attempt_land(&mq, &root, &branch, &branch_loc)?,
+        }
     };
     Ok((branch, target, outcome))
 }
@@ -465,19 +473,6 @@ error: test run failed
     fn an_empty_or_clean_log_yields_nothing_to_report() {
         assert!(gate_failure_digest("").is_empty());
         assert!(gate_failure_digest("     Summary [ 1s] 10 tests run: 10 passed\n").is_empty());
-    }
-}
-
-#[cfg(test)]
-mod trust_gate_tests {
-    use super::apply_trusted_gate;
-    use thegn_core::config::MergeQueueConfig;
-
-    #[test]
-    fn bad_attestation_keeps_the_normal_gate_enabled() {
-        let mut mq = MergeQueueConfig::default();
-        apply_trusted_gate(&mut mq, false);
-        assert!(mq.gate_on);
     }
 }
 
