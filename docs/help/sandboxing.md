@@ -39,8 +39,8 @@ files written to the sandbox's `/tmp` disappear when the session ends.
 
 ### Keeping a report directory
 
-For a local bwrap/OCI/systemd sandbox, bind a host directory into `/tmp` so
-reports survive the session:
+For a local bwrap/OCI/systemd sandbox, bind a writable host directory into
+`/tmp` so reports survive the session:
 
 ```toml
 [env.pipeline.sandbox]
@@ -55,8 +55,10 @@ host source does not exist is skipped silently. The env-level `mounts` list
 replaces the base `[sandbox] mounts` list rather than extending it, so the
 example repeats the default `~/.gitconfig:ro` entry; use
 `[workspace.<slug>] sandbox_mounts` when you want an additive workspace mount.
-This host-directory behavior applies to local bwrap/OCI/systemd placements;
-remote and provider placements do not honor host mounts the same way. Sealed
+A `:ro` mount does not silence the private-`/tmp` warning because it cannot
+receive newly written reports. This host-directory behavior applies to local
+bwrap/OCI/systemd placements; remote and provider placements do not honor host
+mounts the same way. Sealed
 profiles still apply their credential deny list, although `/tmp` report paths
 are outside it.
 
