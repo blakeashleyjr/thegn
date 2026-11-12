@@ -25,4 +25,5 @@ keyring = { version = "3", default-features = false, features = [
 ] }
 
 [dev-dependencies]
+thegn-core = { workspace = true, features = ["test-utils"] }
 tempfile.workspace = true

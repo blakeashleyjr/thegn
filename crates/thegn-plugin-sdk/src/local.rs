@@ -1,4 +1,4 @@
-use anyhow::{Result, bail};
+use anyhow::{Context, Result, bail};
 use std::io::Read;
 use std::path::{Path, PathBuf};
 
@@ -106,8 +106,18 @@ impl PrivateState {
         if !root.is_absolute() {
             bail!("plugin state directory must be absolute");
         }
-        thegn_core::fsperm::ensure_private_dir(&root)?;
-        let dir = thegn_core::fsperm::open_private_dir(&root)?;
+        let name = root
+            .file_name()
+            .context("plugin state directory must have a file name")?;
+        let anchor = root
+            .parent()
+            .context("plugin state directory must have a parent")?;
+        if !anchor.exists() {
+            thegn_core::fsperm::ensure_private_dir(anchor)
+                .context("create plugin state directory anchor")?;
+        }
+        let dir = thegn_core::fsperm::ensure_private_dir_beneath(anchor, Path::new(name))
+            .context("create private plugin state directory")?;
         Ok(Self { dir })
     }
     pub fn root(&self) -> &Path {
@@ -261,6 +271,31 @@ mod tests {
             return;
         }
         assert!(PrivateState::new(root_link).is_err());
+    }
+
+    #[test]
+    fn private_state_tightens_an_existing_root() {
+        let temp = tempdir().unwrap();
+        let root = temp.path().join("state");
+        std::fs::create_dir(&root).unwrap();
+        if thegn_core::fsperm::set_mode_for_test(&root, 0o755).is_err() {
+            return;
+        }
+
+        let _state = PrivateState::new(root.clone()).unwrap();
+        assert_eq!(
+            thegn_core::fsperm::mode_bits(&root).unwrap().unwrap() & 0o777,
+            0o700
+        );
+    }
+
+    #[test]
+    fn private_state_root_without_a_file_name_returns_an_error() {
+        let Err(error) = PrivateState::new(PathBuf::from("/")) else {
+            panic!("root directory was accepted as plugin state")
+        };
+        let message = format!("{error:#}");
+        assert!(message.contains("plugin state directory must have a file name"));
     }
 
     #[test]

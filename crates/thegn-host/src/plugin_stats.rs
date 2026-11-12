@@ -227,8 +227,7 @@ fn write_status_file(
     };
     let bytes = thegn_core::plugin_status::encode(&snapshot)
         .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
-    crate::daemon::control_publish::prepare_run_dir(state_dir)?;
-    thegn_core::fsperm::open_private_dir(&crate::daemon::control_publish::run_dir(state_dir))?
+    crate::daemon::control_publish::ensure_run_dir(state_dir)?
         .write_owner_only_atomic(thegn_core::plugin_status::STATUS_FILE, &bytes)?;
     Ok(())
 }
@@ -484,6 +483,25 @@ mod tests {
         assert_eq!(decoded.pid, 8);
         assert_eq!(decoded.published_at_ms, 20);
         assert_eq!(decoded.rows, vec![PluginStatusRow::from(&second)]);
+    }
+
+    #[test]
+    fn status_file_refuses_a_symlinked_run_directory_without_touching_target() {
+        let dir = tempfile::tempdir_in("/tmp").expect("private status tempdir");
+        let target = dir.path().join("target");
+        std::fs::create_dir(&target).expect("create status target");
+        let run = dir.path().join("run");
+        if thegn_core::fsperm::create_symlink(&target, &run, true).is_err() {
+            return;
+        }
+
+        assert!(write_status_file(dir.path(), &[], 1, 2).is_err());
+        assert!(
+            std::fs::read_dir(target)
+                .expect("read status target")
+                .next()
+                .is_none()
+        );
     }
 
     #[test]
