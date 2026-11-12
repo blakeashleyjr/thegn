@@ -309,6 +309,8 @@ pub(crate) fn remembered_agent_relaunch(
             // this agent, and a relaunch must never be able to change it.
             suppress_agent_record: true,
             stage: stage.as_deref(),
+            permissions: &[],
+            widen_permissions: false,
         },
     )
     // Fail open: an unresolvable agent spec (provider down, sandbox error)

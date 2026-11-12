@@ -4223,6 +4223,10 @@ pub struct LaunchExtras<'a> {
     /// A `[[pipeline.stages]]` name whose `env` / `permissions` overrides
     /// apply to this launch (the model is already in `cmd_override`).
     pub stage: Option<&'a str>,
+    /// Per-launch permission grants layered over the configured agent/stage.
+    pub permissions: &'a [String],
+    /// Permit the per-launch grants to widen the configured baseline.
+    pub widen_permissions: bool,
 }
 
 /// Pure composition of the final [`LaunchSpec`] from a settled sandbox: argv
@@ -4362,7 +4366,13 @@ pub fn compose_spec(
     // as its literal ref. Keep it out of a provider CLI's host environment:
     // that process parses raw repo JSON and must not gain a new localEnv read.
     if provider_session.is_none()
-        && let Ok(eff) = thegn_core::agent_task::effective_agent(cfg, choice, extras.stage)
+        && let Ok(eff) = thegn_core::agent_task::effective_agent_with(
+            cfg,
+            choice,
+            extras.stage,
+            extras.permissions,
+            extras.widen_permissions,
+        )
     {
         env.extend(eff.expanded_env());
     }
@@ -4583,7 +4593,14 @@ pub fn launch_spec_full(
     // the harness's command-scoped mechanism (`EffectiveAgent::permission_args`,
     // THE-440), so launch preparation never reads or writes anything under the
     // repository-controlled worktree.
-    let eff_agent = thegn_core::agent_task::effective_agent(cfg, choice, extras.stage).ok();
+    let eff_agent = thegn_core::agent_task::effective_agent_with(
+        cfg,
+        choice,
+        extras.stage,
+        extras.permissions,
+        extras.widen_permissions,
+    )
+    .ok();
 
     // One DB handle for the whole spec resolution (each open re-runs pragmas).
     let db = match Db::open() {

@@ -68,6 +68,8 @@ pub async fn execute(
                         resume: None,
                         continue_last: false,
                         stage: None,
+                        permissions: Vec::new(),
+                        widen_permissions: false,
                         fork: false,
                         native_session_id: None,
                     }),

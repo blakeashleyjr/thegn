@@ -131,6 +131,17 @@ pub enum SessionAction {
         /// agent entry stays the base). Explicit `--agent` wins in both.
         #[arg(long)]
         stage: Option<String>,
+        /// Comma-separated per-launch grants. These may narrow the resolved
+        /// agent/stage grants; use `--widen-permissions` to widen them.
+        #[arg(long, value_delimiter = ',', conflicts_with_all = ["issue", "resume_work"])]
+        permissions: Vec<String>,
+        /// Permit `--permissions` to widen the configured grants.
+        #[arg(
+            long,
+            requires = "permissions",
+            conflicts_with_all = ["issue", "resume_work"]
+        )]
+        widen_permissions: bool,
         /// Tracker issue id in roster form (`linear:THE-76`). With `--stage`
         /// it dispatches the stage instead of a plain open: it names the
         /// roster row, the artifact directory, and the `{issue_*}` bindings
@@ -562,6 +573,8 @@ async fn run_async(cfg: &Config, action: SessionAction) -> Result<()> {
             owner,
             lease_gen,
             track,
+            permissions,
+            widen_permissions,
             resume_work: resume_row,
             json,
         } => {
@@ -670,6 +683,8 @@ async fn run_async(cfg: &Config, action: SessionAction) -> Result<()> {
                         // model/env/permissions over the agent; None on a
                         // plain open.
                         stage,
+                        permissions,
+                        widen_permissions,
                         fork: false,
                         native_session_id: None,
                     }),
@@ -1465,6 +1480,8 @@ async fn open_stage(cfg: &Config, client: &ControlClient, d: StageDispatch<'_>) 
                 // `model`/`env`/`permissions` over the resolved agent and
                 // seeds the effective allow-list (THE-83's launch path).
                 stage: Some(stage.name.clone()),
+                permissions: Vec::new(),
+                widen_permissions: false,
                 fork: false,
                 native_session_id: None,
             }),
@@ -1947,6 +1964,8 @@ async fn resume_work(
                 // `model`/`env`/`permissions` over the resolved agent exactly
                 // as for a fresh dispatch.
                 stage: Some(stage.name.clone()),
+                permissions: Vec::new(),
+                widen_permissions: false,
                 fork: false,
                 native_session_id: None,
             }),
@@ -2270,7 +2289,10 @@ mod session_line_tests {
 
 #[cfg(test)]
 mod open_stage_tests {
-    use super::{IssueFacts, open_preflight, policy_admission, stage_or_bail, stage_task_vars};
+    use super::{
+        IssueFacts, SessionAction, open_preflight, policy_admission, stage_or_bail, stage_task_vars,
+    };
+    use clap::Parser as _;
     use thegn_core::agent_task::render_prompt;
     use thegn_core::config::Config;
     use thegn_core::config_pipeline::PipelineStage;
@@ -2284,6 +2306,43 @@ mod open_stage_tests {
             ..Default::default()
         });
         cfg
+    }
+
+    #[test]
+    fn plain_open_spec_carries_launch_permissions() {
+        let cli = crate::Cli::try_parse_from([
+            "thegn",
+            "session",
+            "open",
+            "--agent",
+            "worker",
+            "--worktree",
+            "/tmp/worktree",
+            "--permissions",
+            "Read,Bash(git *)",
+            "--widen-permissions",
+        ])
+        .expect("plain-open permission flags parse");
+        let Some(crate::Command::Session { action }) = cli.command else {
+            panic!("expected session command");
+        };
+        let SessionAction::Open {
+            permissions,
+            widen_permissions,
+            issue,
+            stage,
+            ..
+        } = action
+        else {
+            panic!("expected session open");
+        };
+        assert_eq!(
+            permissions,
+            vec!["Read".to_string(), "Bash(git *)".to_string()]
+        );
+        assert!(widen_permissions);
+        assert!(issue.is_none());
+        assert!(stage.is_none());
     }
 
     /// THE-440: a stage whose effective allow-list the harness cannot grant
