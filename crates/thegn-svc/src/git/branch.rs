@@ -95,6 +95,27 @@ pub trait BranchOps: GitBackend {
         run_w_network(loc, &[], &args).map(|_| ())
     }
 
+    /// Push a named branch without checking it out or changing its upstream.
+    fn push_branch(
+        &self,
+        loc: &GitLoc,
+        remote: &str,
+        branch: &str,
+        force: ForceMode,
+    ) -> Result<()> {
+        let (remote, branch) = (op::remote_name(remote)?, op::branch_name(branch)?);
+        let refspec = format!("refs/heads/{branch}:refs/heads/{branch}");
+        let mut args = vec!["push"];
+        match force {
+            ForceMode::None => {}
+            ForceMode::WithLease => args.push("--force-with-lease"),
+            ForceMode::Force => args.push("--force"),
+        }
+        args.push(&remote);
+        args.push(&refspec);
+        run_w_network(loc, &[], &args).map(|_| ())
+    }
+
     fn push_set_upstream(&self, loc: &GitLoc, remote: &str, branch: &str) -> Result<()> {
         let (remote, branch) = (op::remote_name(remote)?, op::branch_name(branch)?);
         run_w_network(loc, &[], &["push", "-u", remote, branch]).map(|_| ())
@@ -638,6 +659,51 @@ mod tests {
         git_in(&clone, &["reset", "-q", "--hard", "HEAD~1"]);
         CliGit.pull(&loc).unwrap();
         assert_eq!(out_in(&clone, &["rev-parse", "HEAD"]), tip);
+    }
+
+    #[test]
+    fn push_branch_pushes_non_current_branch_without_setting_upstream() {
+        let repo = TestRepo::new("br-push-branch");
+        repo.commit_file("f.txt", "one\n", "c0");
+        let clone = with_remote(&repo);
+        let remote = repo.dir.join("remote.git");
+        let loc = GitLoc::for_worktree(&clone);
+
+        git_in(&clone, &["checkout", "-q", "-b", "feature"]);
+        std::fs::write(clone.join("feature.txt"), "feature\n").unwrap();
+        git_in(&clone, &["add", "feature.txt"]);
+        git_in(
+            &clone,
+            &[
+                "-c",
+                "commit.gpgsign=false",
+                "commit",
+                "-q",
+                "-m",
+                "feature",
+            ],
+        );
+        let feature_tip = out_in(&clone, &["rev-parse", "feature"]);
+        git_in(&clone, &["checkout", "-q", "main"]);
+
+        CliGit
+            .push_branch(&loc, "origin", "feature", ForceMode::None)
+            .unwrap();
+
+        assert_eq!(
+            out_in(&remote, &["rev-parse", "refs/heads/feature"]),
+            feature_tip
+        );
+        assert_eq!(CliGit.current_branch(&loc).unwrap(), "main");
+        assert!(
+            thegn_core::util::git_cmd(&clone)
+                .args(["config", "--get", "branch.feature.remote"])
+                .output()
+                .unwrap()
+                .stdout
+                .is_empty(),
+            "explicit branch push must not set an upstream"
+        );
     }
 
     #[test]
