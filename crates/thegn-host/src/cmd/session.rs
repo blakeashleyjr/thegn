@@ -222,8 +222,16 @@ pub enum SessionAction {
     },
     /// Dump a session's current screen.
     Snapshot {
-        #[arg(long)]
-        session: String,
+        /// Target session id (see `session list`).
+        #[arg(long, conflicts_with = "session_pos")]
+        session: Option<String>,
+        /// Target session id (see `session list`).
+        #[arg(
+            value_name = "SESSION",
+            id = "session_pos",
+            required_unless_present = "session"
+        )]
+        session_pos: Option<String>,
         /// Emit JSON (geometry + base64 ANSI) instead of raw screen text.
         #[arg(long)]
         json: bool,
@@ -236,14 +244,30 @@ pub enum SessionAction {
     /// Stream a session's live output to stdout (Ctrl-C detaches; the
     /// session keeps running).
     Attach {
-        #[arg(long)]
-        session: String,
+        /// Target session id (see `session list`).
+        #[arg(long, conflicts_with = "session_pos")]
+        session: Option<String>,
+        /// Target session id (see `session list`).
+        #[arg(
+            value_name = "SESSION",
+            id = "session_pos",
+            required_unless_present = "session"
+        )]
+        session_pos: Option<String>,
     },
     /// Block until a session reaches a state (agent-driving `wait`). Exit 0 on
     /// match, 2 on timeout, 1 if no daemon.
     Wait {
-        #[arg(long)]
-        session: String,
+        /// Target session id (see `session list`).
+        #[arg(long, conflicts_with = "session_pos")]
+        session: Option<String>,
+        /// Target session id (see `session list`).
+        #[arg(
+            value_name = "SESSION",
+            id = "session_pos",
+            required_unless_present = "session"
+        )]
+        session_pos: Option<String>,
         /// Condition: `exited` | `idle` | `blocked` | `done` | `match:<regex>`.
         #[arg(long, default_value = "exited")]
         until: String,
@@ -653,9 +677,11 @@ async fn run_async(cfg: &Config, action: SessionAction) -> Result<()> {
         }
         SessionAction::Snapshot {
             session,
+            session_pos,
             json,
             text,
         } => {
+            let session = session_target(session, session_pos)?;
             let (seq, rows, cols, ansi) = client.snapshot(&session).await?;
             // The wire carries the screen as an ANSI repaint; render it back
             // to plain rows through the same emulator the panes use.
@@ -679,7 +705,11 @@ async fn run_async(cfg: &Config, action: SessionAction) -> Result<()> {
                 std::io::stdout().flush()?;
             }
         }
-        SessionAction::Attach { session } => {
+        SessionAction::Attach {
+            session,
+            session_pos,
+        } => {
+            let session = session_target(session, session_pos)?;
             let client_id = format!("cli-{}", std::process::id());
             let mut stream = client.attach(&session, &client_id, 0, 0, true).await?;
             // Observer stream: snapshot then deltas, raw to stdout. Ctrl-C
@@ -709,10 +739,12 @@ async fn run_async(cfg: &Config, action: SessionAction) -> Result<()> {
         }
         SessionAction::Wait {
             session,
+            session_pos,
             until,
             timeout,
             json,
         } => {
+            let session = session_target(session, session_pos)?;
             let condition = parse_wait_condition(&until)?;
             let outcome = client.wait(&session, condition, timeout).await?;
             let matched = outcome
@@ -1887,6 +1919,160 @@ pub(crate) fn snapshot_text(rows: u16, cols: u16, ansi: &[u8]) -> String {
     let mut emu = crate::emulator::AlacrittyEmulator::new(rows.max(1), cols.max(1), 0);
     emu.advance(ansi);
     crate::copymode::extract(&emu, &crate::copymode::whole(&emu))
+}
+
+fn session_target(flag: Option<String>, pos: Option<String>) -> Result<String> {
+    match (flag, pos) {
+        (Some(_), Some(_)) => anyhow::bail!("give only one session id (positional or --session)"),
+        (Some(session), None) | (None, Some(session)) => Ok(session),
+        (None, None) => anyhow::bail!("give a session id (positional or --session)"),
+    }
+}
+
+#[cfg(test)]
+mod session_target_tests {
+    use super::{SessionAction, session_target};
+    use clap::Parser;
+
+    fn parse(args: &[&str]) -> Result<SessionAction, clap::Error> {
+        crate::Cli::try_parse_from(args).map(|cli| match cli.command {
+            Some(crate::Command::Session { action }) => action,
+            _ => panic!("expected a session command"),
+        })
+    }
+
+    #[test]
+    fn session_target_accepts_flag_only() {
+        assert_eq!(session_target(Some("abc".into()), None).unwrap(), "abc");
+    }
+
+    #[test]
+    fn session_target_accepts_positional_only() {
+        assert_eq!(session_target(None, Some("abc".into())).unwrap(), "abc");
+    }
+
+    #[test]
+    fn session_target_rejects_neither_with_actionable_error() {
+        let error = session_target(None, None).unwrap_err().to_string();
+        assert!(error.contains("give a session id (positional or --session)"));
+    }
+
+    #[test]
+    fn session_target_rejects_both() {
+        assert!(session_target(Some("abc".into()), Some("def".into())).is_err());
+    }
+
+    #[test]
+    fn snapshot_accepts_positional_session() {
+        let action = parse(&["thegn", "session", "snapshot", "abc"]).unwrap();
+        match action {
+            SessionAction::Snapshot {
+                session,
+                session_pos,
+                ..
+            } => {
+                assert_eq!(session, None);
+                assert_eq!(session_pos.as_deref(), Some("abc"));
+            }
+            _ => panic!("expected snapshot"),
+        }
+    }
+
+    #[test]
+    fn snapshot_accepts_flag_session() {
+        let action = parse(&["thegn", "session", "snapshot", "--session", "abc"]).unwrap();
+        match action {
+            SessionAction::Snapshot {
+                session,
+                session_pos,
+                ..
+            } => {
+                assert_eq!(session.as_deref(), Some("abc"));
+                assert_eq!(session_pos, None);
+            }
+            _ => panic!("expected snapshot"),
+        }
+    }
+
+    #[test]
+    fn wait_accepts_positional_session_before_until() {
+        let action = parse(&["thegn", "session", "wait", "abc", "--until", "idle"]).unwrap();
+        match action {
+            SessionAction::Wait {
+                session_pos, until, ..
+            } => {
+                assert_eq!(session_pos.as_deref(), Some("abc"));
+                assert_eq!(until, "idle");
+            }
+            _ => panic!("expected wait"),
+        }
+    }
+
+    #[test]
+    fn wait_accepts_positional_session_after_options() {
+        let action = parse(&[
+            "thegn",
+            "session",
+            "wait",
+            "--until",
+            "idle",
+            "--timeout",
+            "42",
+            "abc",
+        ])
+        .unwrap();
+        match action {
+            SessionAction::Wait {
+                session_pos,
+                until,
+                timeout,
+                ..
+            } => {
+                assert_eq!(session_pos.as_deref(), Some("abc"));
+                assert_eq!(until, "idle");
+                assert_eq!(timeout, Some(42));
+            }
+            _ => panic!("expected wait"),
+        }
+    }
+
+    #[test]
+    fn attach_accepts_positional_session() {
+        let action = parse(&["thegn", "session", "attach", "abc"]).unwrap();
+        match action {
+            SessionAction::Attach {
+                session,
+                session_pos,
+            } => {
+                assert_eq!(session, None);
+                assert_eq!(session_pos.as_deref(), Some("abc"));
+            }
+            _ => panic!("expected attach"),
+        }
+    }
+
+    #[test]
+    fn snapshot_requires_a_session() {
+        assert!(parse(&["thegn", "session", "snapshot"]).is_err());
+    }
+
+    #[test]
+    fn snapshot_rejects_both_session_forms() {
+        assert!(parse(&["thegn", "session", "snapshot", "abc", "--session", "def",]).is_err());
+    }
+
+    #[test]
+    fn snapshot_help_shows_the_positional_session() {
+        let Err(error) = parse(&["thegn", "session", "snapshot", "--help"]) else {
+            panic!("--help must not parse as a command");
+        };
+        assert_eq!(error.kind(), clap::error::ErrorKind::DisplayHelp);
+        assert!(
+            error
+                .to_string()
+                .contains("Usage: thegn session snapshot [OPTIONS] [SESSION]")
+        );
+    }
 }
 
 #[cfg(test)]
