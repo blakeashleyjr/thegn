@@ -7,6 +7,17 @@ All notable changes to **thegn** are documented here. The format follows
 
 ## [Unreleased]
 
+### Added
+
+- The Home Manager module exposes the `[semantic]` settings `worktree_index`,
+  `index_max_files` and `map_budget_lines`, plus `log.stderr_cap_mb`.
+
+### Security
+
+- Managed SSH key rotation and host provisioning take their lease locks through a pinned private directory handle.
+- Plugin run directories for control publishing, plugin stats and the plugin SDK's local runner are created and opened through one pinned private directory handle.
+- Devcontainer volume ownership claims are written through a pinned private directory handle.
+
 ## [0.1.0-alpha.67] — 2026-11-12
 
 ### Added
