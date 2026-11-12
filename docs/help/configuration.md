@@ -594,9 +594,9 @@ The `[preview]` scalar keys are exposed as `previewEnabled`,
 `previewFetchTimeoutMs` and `previewMaxBodyBytes`. The `preview.ports` list and
 the `preview.allow_external_urls` SSRF security opt-in are not exposed.
 
-The `[usage]` scalar keys are exposed as `usageEnabled`, `usageAllowNetwork`,
-`usageStatusbar`, `usageDiscoverProfiles`, `usageTokenRollups`,
-`usageHistoryDays` and `usagePollIntervalSecs`. The float thresholds
+The `[usage]` scalar keys are exposed as `usageEnabled`, `usageStatusbar`,
+`usageDiscoverProfiles`, `usageTokenRollups`, `usageHistoryDays` and
+`usagePollIntervalSecs`. The float thresholds
 `usage.warn_percent` and `usage.crit_percent`, `usage.providers`,
 `usage.profile_roots`, `usage.accounts` and `usage.alerts` are omitted. Tailnet
 discovery exposes `hostDiscoveryTailnetEnabled` and
