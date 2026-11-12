@@ -7,6 +7,16 @@ All notable changes to **thegn** are documented here. The format follows
 
 ## [Unreleased]
 
+### Added
+
+- The Home Manager module exposes the `[stats]` thresholds `battery_warn`,
+  `disk_free_warn` and `disk_free_critical`.
+
+### Fixed
+
+- `thegn doctor` no longer hangs on a blocked GitHub CLI (such as a locked
+  keyring); bounded identity and git probes report an unknown result.
+
 ## [0.1.0-alpha.68] — 2026-11-12
 
 ### Added
