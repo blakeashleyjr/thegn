@@ -61,7 +61,7 @@ impl From<&crate::config::SandboxLimits> for Config {
 
 #[cfg(test)]
 mod tests {
-    use super::{Decision, decide};
+    use super::{Config, Decision, decide};
 
     #[test]
     fn policy_table_covers_disabled_load_slots_and_contention() {
