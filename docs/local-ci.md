@@ -115,9 +115,11 @@ composite-action code access to the token, so use it only on code you trust. A
 credentialed run refuses unless `.github/` and the repository's `.actrc` match
 HEAD, and prints the HEAD it is bound to. Those are the only paths the guard
 checks; other uncommitted working-tree files still run, so use credentials only
-on commits you trust. The guard sees flags passed to `just` and the
-repository's `.secrets`, but does not inspect `~/.actrc` or
-`$XDG_CONFIG_HOME/act/actrc`, where act can also read secret or reuse flags.
+on commits you trust. The guard sees flags passed to `just`, the repository's
+`.secrets`, and the user actrc files at `~/.actrc` and
+`$XDG_CONFIG_HOME/act/actrc` (default `~/.config/act/actrc`), where act can also
+read secret or reuse flags. An existing user actrc that cannot be read refuses
+the run and names only its path.
 Credentials cannot be combined with `--reuse`. A credentialed run also refuses
 `-W`/`--workflows`, `-C`/`--directory`, `--local-repository`,
 `--action-cache-path` and `--action-offline-mode`, and a value-taking flag left
