@@ -1146,8 +1146,8 @@ pub fn context_keys(view: GitView) -> Vec<CtxKey> {
             k("d", "delete", GitMsg::DeleteSel),
             k("r", "rebase onto", GitMsg::RebaseOntoSel),
             k("f", "fast-forward", GitMsg::FastForward),
-            k("p", "pull HEAD", GitMsg::Pull),
-            k("P", "push HEAD", GitMsg::Push),
+            k("p", "pull / ff", GitMsg::Pull),
+            k("P", "push", GitMsg::Push),
             k("m", "actions", GitMsg::OpenMenu(MenuKind::BranchActions)),
             k("w", "worktree", GitMsg::CreateWorktree),
             k("G", "open PR", GitMsg::OpenPrInBrowser),
@@ -1794,8 +1794,8 @@ impl GitMsg {
             GitMsg::DeleteSel => "delete",
             GitMsg::RebaseOntoSel => "rebase onto",
             GitMsg::FastForward => "fast-forward",
-            GitMsg::Pull => "pull HEAD",
-            GitMsg::Push => "push HEAD",
+            GitMsg::Pull => "pull / ff",
+            GitMsg::Push => "push",
             GitMsg::NewBranch => "new branch",
             GitMsg::CreateWorktree => "worktree",
             GitMsg::StashPush => "stash",
@@ -3259,11 +3259,11 @@ mod tests {
         );
         assert!(
             keys.iter()
-                .any(|key| key.chord == "p" && key.label == "pull HEAD")
+                .any(|key| key.chord == "p" && key.label == "pull / ff")
         );
         assert!(
             keys.iter()
-                .any(|key| key.chord == "P" && key.label == "push HEAD")
+                .any(|key| key.chord == "P" && key.label == "push")
         );
     }
 
