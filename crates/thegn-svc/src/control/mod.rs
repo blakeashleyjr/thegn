@@ -253,6 +253,14 @@ pub struct AgentLaunch {
     /// Unknown stage ⇒ error. See `thegn_core::agent_task::effective_agent`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub stage: Option<String>,
+    /// Per-launch permission grants over the agent entry's configured grants.
+    /// Claude only; by default this can narrow the configured grants, while
+    /// `widen_permissions` permits a wider launch-specific set.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub permissions: Vec<String>,
+    /// Allow `permissions` to widen the configured grants for this launch.
+    #[serde(default)]
+    pub widen_permissions: bool,
     /// Ask the selected harness to create a native child session rather than
     /// resume the source in place. The daemon validates and resolves this
     /// operation through the harness seam.

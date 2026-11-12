@@ -271,6 +271,8 @@ pub(crate) fn run<'a>(
                         resume: None,
                         continue_last: false,
                         stage: None,
+                        permissions: Vec::new(),
+                        widen_permissions: false,
                         fork: true,
                         native_session_id: Some(native_session_id.clone()),
                     }),

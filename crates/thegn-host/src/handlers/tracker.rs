@@ -453,6 +453,8 @@ fn dispatch_agent(ctx: &mut TrackerCtx) {
                     // (only preset application suppresses that).
                     suppress_agent_record: false,
                     stage: None,
+                    permissions: &[],
+                    widen_permissions: false,
                 },
             ) {
                 Ok(spec) => spec,

@@ -928,6 +928,21 @@ pub fn effective_agent(
     agent: &str,
     stage: Option<&str>,
 ) -> Result<EffectiveAgent, String> {
+    effective_agent_with(cfg, agent, stage, &[], false)
+}
+
+/// Resolve an agent and apply launch-specific permission grants after the
+/// entry/stage layers. A non-empty launch list narrows the resolved baseline
+/// unless `widen` is set; an entry with no configured grants accepts the
+/// launch list as its complete set. The final list is still checked against
+/// the selected harness's command-scoped permission mechanism.
+pub fn effective_agent_with(
+    cfg: &Config,
+    agent: &str,
+    stage: Option<&str>,
+    launch_permissions: &[String],
+    widen: bool,
+) -> Result<EffectiveAgent, String> {
     let name = agent.trim();
     if name.is_empty() {
         return Err("an agent launch needs an agent name".into());
@@ -990,9 +1005,25 @@ pub fn effective_agent(
             eff.permissions = s.permissions.clone();
         }
     }
+    if !launch_permissions.is_empty() {
+        if !eff.permissions.is_empty() && !widen {
+            if let Some(grant) = launch_permissions
+                .iter()
+                .find(|grant| !eff.permissions.iter().any(|baseline| baseline == *grant))
+            {
+                return Err(format!(
+                    "--permissions would widen the configured grants of `{name}` ({grant}); pass --widen-permissions to override"
+                ));
+            }
+        }
+        eff.permissions = launch_permissions.to_vec();
+    }
     // Fail here, not at spawn: a model the harness cannot take is a config
     // error the caller should see before a session exists.
     with_model(&eff.command, &eff.harness, eff.model.as_deref())?;
+    if !launch_permissions.is_empty() {
+        permission_suffix(&eff.harness, &eff.permissions)?;
+    }
     Ok(eff)
 }
 
@@ -1343,6 +1374,89 @@ mod tests {
                 .unwrap_err()
                 .contains("unknown agent")
         );
+    }
+
+    #[test]
+    fn launch_permissions_accept_a_subset_of_the_configured_grants() {
+        let mut cfg = Config::default();
+        let mut e = entry("worker", "claude");
+        e.permissions = vec!["Read".into(), "Bash".into()];
+        cfg.agents.push(e);
+
+        let requested = vec!["Read".to_string()];
+        let eff = effective_agent_with(&cfg, "worker", None, &requested, false).unwrap();
+        assert_eq!(eff.permissions, requested);
+    }
+
+    #[test]
+    fn launch_permissions_refuse_a_superset_without_widening() {
+        let mut cfg = Config::default();
+        let mut e = entry("worker", "claude");
+        e.permissions = vec!["Read".into()];
+        cfg.agents.push(e);
+
+        let requested = vec!["Read".to_string(), "Bash".to_string()];
+        let err = effective_agent_with(&cfg, "worker", None, &requested, false).unwrap_err();
+        assert!(err.contains("--permissions would widen"), "{err}");
+        assert!(err.contains("worker"), "{err}");
+        assert!(err.contains("Bash"), "{err}");
+    }
+
+    #[test]
+    fn launch_permissions_accept_a_superset_with_widening() {
+        let mut cfg = Config::default();
+        let mut e = entry("worker", "claude");
+        e.permissions = vec!["Read".into()];
+        cfg.agents.push(e);
+
+        let requested = vec!["Read".to_string(), "Bash".to_string()];
+        let eff = effective_agent_with(&cfg, "worker", None, &requested, true).unwrap();
+        assert_eq!(eff.permissions, requested);
+    }
+
+    #[test]
+    fn launch_permissions_replace_an_empty_baseline() {
+        let mut cfg = Config::default();
+        cfg.agents.push(entry("worker", "claude"));
+
+        let requested = vec!["Bash".to_string()];
+        let eff = effective_agent_with(&cfg, "worker", None, &requested, false).unwrap();
+        assert_eq!(eff.permissions, requested);
+    }
+
+    #[test]
+    fn launch_permissions_refuse_non_claude_with_the_policy_hold() {
+        let mut cfg = Config::default();
+        cfg.agents.push(entry("worker", "codex"));
+
+        let err =
+            effective_agent_with(&cfg, "worker", None, &["Read".to_string()], false).unwrap_err();
+        assert!(err.contains("permission policy hold"), "{err}");
+        assert!(err.contains("codex"), "{err}");
+    }
+
+    #[test]
+    fn stage_permissions_are_layered_before_launch_permissions() {
+        let mut cfg = Config::default();
+        let mut e = entry("worker", "claude");
+        e.permissions = vec!["Read".into(), "Edit".into()];
+        cfg.agents.push(e);
+        cfg.pipeline
+            .stages
+            .push(crate::config_pipeline::PipelineStage {
+                name: "review".into(),
+                agent: "worker".into(),
+                permissions: vec!["Bash".into()],
+                ..Default::default()
+            });
+
+        let requested = vec!["Bash".to_string()];
+        let eff = effective_agent_with(&cfg, "worker", Some("review"), &requested, false).unwrap();
+        assert_eq!(eff.permissions, requested);
+        let err =
+            effective_agent_with(&cfg, "worker", Some("review"), &["Read".to_string()], false)
+                .unwrap_err();
+        assert!(err.contains("would widen"), "{err}");
     }
 
     /// The grant rides the command as shell-quoted argv: hostile patterns
