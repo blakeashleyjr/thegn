@@ -1151,17 +1151,23 @@ fn stop_bounded_child(child: &mut std::process::Child) {
 /// staged/unstaged flags and truncating the path. Disabling rename detection
 /// reports the change as a plain delete + add, each a well-formed XY row, which
 /// is exactly what a dirty-flag list wants.
-fn parse_status_porcelain(out: &str) -> Vec<FileStatus> {
+fn parse_status_porcelain(out: &str) -> Result<Vec<FileStatus>> {
+    if !out.is_empty() && !out.ends_with('\0') {
+        anyhow::bail!("status output truncated: missing final NUL");
+    }
     let mut v = Vec::new();
-    for entry in out.split('\0').filter(|s| s.len() >= 3) {
+    for entry in out.split_terminator('\0') {
         let bytes = entry.as_bytes();
+        if bytes.len() < 4 || !bytes[0].is_ascii() || !bytes[1].is_ascii() || bytes[2] != b' ' {
+            anyhow::bail!("malformed status record");
+        }
         v.push(FileStatus {
             staged: bytes[0] as char,
             unstaged: bytes[1] as char,
             path: entry[3..].to_string(),
         });
     }
-    v
+    Ok(v)
 }
 
 /// Strictly parse `git diff --numstat` output into per-file counts.
@@ -2162,7 +2168,7 @@ fn bridged_glyph_reads(loc: &GitLoc, include_submodules: bool) -> Option<GlyphRe
         match b.exec_batch(&cmds, &[]) {
             Ok(r) if r.len() == want => {
                 let dirty = if r[0].exit == 0 {
-                    Ok(!parse_status_porcelain(&r[0].stdout).is_empty())
+                    parse_status_porcelain(&r[0].stdout).map(|status| !status.is_empty())
                 } else {
                     Err(anyhow::anyhow!("git status failed: {}", r[0].stderr.trim()))
                 };
@@ -2610,6 +2616,9 @@ pub(crate) fn begin_mutation_txn(
 }
 
 fn parse_commit_times(out: &str) -> Result<Vec<i64>> {
+    if !out.is_empty() && !out.ends_with('\n') {
+        anyhow::bail!("commit timestamp output truncated: missing final newline");
+    }
     out.lines()
         .filter(|line| !line.trim().is_empty())
         .map(|line| {
@@ -2622,10 +2631,10 @@ fn parse_commit_times(out: &str) -> Result<Vec<i64>> {
 
 impl GitBackend for CliGit {
     fn status(&self, loc: &GitLoc) -> Result<Vec<FileStatus>> {
-        Ok(parse_status_porcelain(&run(
+        parse_status_porcelain(&run(
             loc,
             &["status", "--porcelain=v1", "-z", "--no-renames"],
-        )?))
+        )?)
     }
 
     fn diff_files(&self, loc: &GitLoc, base: &str) -> Result<Vec<DiffEntry>> {
@@ -3399,9 +3408,9 @@ mod tests {
     #[test]
     fn parse_status_porcelain_plain_rows() {
         // `-z` uses NUL terminators, XY flags in the first two columns, a space,
-        // then the path. Trailing NUL yields an empty final entry (filtered out).
+        // then the path. The final NUL terminates the last record.
         let out = "M  src/a.rs\0?? new.txt\0 M lib.rs\0";
-        let v = parse_status_porcelain(out);
+        let v = parse_status_porcelain(out).unwrap();
         assert_eq!(v.len(), 3);
         assert_eq!(v[0].staged, 'M');
         assert_eq!(v[0].unstaged, ' ');
@@ -3417,10 +3426,24 @@ mod tests {
     }
 
     #[test]
-    fn parse_status_porcelain_empty_and_short_input() {
-        assert!(parse_status_porcelain("").is_empty());
-        // Entries shorter than "XY " (3 bytes) are not valid rows and are dropped.
-        assert!(parse_status_porcelain("A\0").is_empty());
+    fn parse_status_porcelain_rejects_truncated_final_record() {
+        assert!(parse_status_porcelain("A\0").is_err());
+        assert!(parse_status_porcelain("M  path\0??").is_err());
+    }
+
+    #[test]
+    fn parse_status_porcelain_rejects_missing_final_nul() {
+        assert!(parse_status_porcelain("M  path").is_err());
+    }
+
+    #[test]
+    fn parse_status_porcelain_rejects_non_ascii_flags() {
+        assert!(parse_status_porcelain("é path\0").is_err());
+    }
+
+    #[test]
+    fn parse_status_porcelain_accepts_empty_output() {
+        assert!(parse_status_porcelain("").unwrap().is_empty());
     }
 
     #[test]
@@ -3430,7 +3453,7 @@ mod tests {
         // status invocations now request; the parser must yield exactly two
         // clean rows with valid status flags.
         let out = "D  old.txt\0A  new.txt\0";
-        let v = parse_status_porcelain(out);
+        let v = parse_status_porcelain(out).unwrap();
         assert_eq!(v.len(), 2);
         assert_eq!((v[0].staged, v[0].path.as_str()), ('D', "old.txt"));
         assert_eq!((v[1].staged, v[1].path.as_str()), ('A', "new.txt"));
@@ -4021,8 +4044,13 @@ mod tests {
 
     #[test]
     fn commit_times_rejects_malformed_rows_without_shortening_feed() {
-        assert!(parse_commit_times("1\nx\n2").is_err());
+        assert!(parse_commit_times("1\nx\n2\n").is_err());
         assert_eq!(parse_commit_times("1\n\n2\n").unwrap(), vec![1, 2]);
+    }
+
+    #[test]
+    fn parse_commit_times_rejects_output_truncated_without_final_newline() {
+        assert!(parse_commit_times("1\n2").is_err());
     }
 
     #[test]
