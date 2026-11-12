@@ -51,12 +51,14 @@ fn acquire_scope_lease_in(lock_dir: &Path, key_path: &Path) -> Result<ScopeLease
     let lock_name = lock_dir
         .file_name()
         .ok_or_else(|| anyhow!("managed SSH rotation lease directory has no name"))?;
-    thegn_core::fsperm::ensure_private_dir(anchor).with_context(|| {
-        format!(
-            "secure managed SSH rotation lease anchor {}",
-            anchor.display()
-        )
-    })?;
+    if !anchor.exists() {
+        thegn_core::fsperm::ensure_private_dir(anchor).with_context(|| {
+            format!(
+                "secure managed SSH rotation lease anchor {}",
+                anchor.display()
+            )
+        })?;
+    }
     let mut digest = Sha256::new();
     digest.update(b"thegn-ssh-rotation-lease-v1\0");
     digest.update(key_path.as_os_str().as_encoded_bytes());
@@ -1255,6 +1257,19 @@ mod tests {
         }
         assert!(acquire_scope_lease_in(&link, Path::new("managed-key")).is_err());
         assert_eq!(std::fs::read_dir(&victim).unwrap().count(), 0);
+    }
+
+    #[test]
+    fn trusted_anchor_symlink_is_allowed() {
+        let temp = tempfile::tempdir().unwrap();
+        let real_anchor = temp.path().join("real-anchor");
+        std::fs::create_dir(&real_anchor).unwrap();
+        let anchor = temp.path().join("anchor");
+        if thegn_core::fsperm::create_symlink(&real_anchor, &anchor, true).is_err() {
+            return;
+        }
+        let lock_dir = anchor.join("rotation-leases");
+        assert!(acquire_scope_lease_in(&lock_dir, Path::new("managed-key")).is_ok());
     }
 
     #[test]

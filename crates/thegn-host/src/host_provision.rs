@@ -67,7 +67,9 @@ fn acquire_container_lease_in(
             "host provision lease directory has no name",
         )
     })?;
-    thegn_core::fsperm::ensure_private_dir(anchor)?;
+    if !anchor.exists() {
+        thegn_core::fsperm::ensure_private_dir(anchor)?;
+    }
     let path = container_lease_path(lock_dir, env_name, container);
     let file_name = path
         .file_name()
@@ -1655,6 +1657,23 @@ mod tests {
         }
         assert!(acquire_container_lease_in(&link, "box", "tg-a").is_err());
         assert_eq!(std::fs::read_dir(&victim).unwrap().count(), 0);
+    }
+
+    #[test]
+    fn trusted_anchor_symlink_is_allowed() {
+        let temp = tempfile::tempdir().unwrap();
+        let real_anchor = temp.path().join("real-anchor");
+        std::fs::create_dir(&real_anchor).unwrap();
+        let anchor = temp.path().join("anchor");
+        if thegn_core::fsperm::create_symlink(&real_anchor, &anchor, true).is_err() {
+            return;
+        }
+        let lock_dir = anchor.join("host-provision-leases");
+        assert!(
+            acquire_container_lease_in(&lock_dir, "box", "tg-a")
+                .unwrap()
+                .is_some()
+        );
     }
 
     #[test]
