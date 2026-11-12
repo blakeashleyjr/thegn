@@ -44,31 +44,37 @@ impl std::fmt::Display for RotationLeaseHeld {
 
 impl std::error::Error for RotationLeaseHeld {}
 
-#[allow(deprecated)]
 fn acquire_scope_lease_in(lock_dir: &Path, key_path: &Path) -> Result<ScopeLease> {
-    thegn_core::fsperm::ensure_private_dir(lock_dir).with_context(|| {
+    let anchor = lock_dir
+        .parent()
+        .ok_or_else(|| anyhow!("managed SSH rotation lease directory has no parent"))?;
+    let lock_name = lock_dir
+        .file_name()
+        .ok_or_else(|| anyhow!("managed SSH rotation lease directory has no name"))?;
+    thegn_core::fsperm::ensure_private_dir(anchor).with_context(|| {
         format!(
-            "secure managed SSH rotation lease directory {}",
-            lock_dir.display()
+            "secure managed SSH rotation lease anchor {}",
+            anchor.display()
         )
     })?;
     let mut digest = Sha256::new();
     digest.update(b"thegn-ssh-rotation-lease-v1\0");
     digest.update(key_path.as_os_str().as_encoded_bytes());
     let path = lock_dir.join(format!("{:x}.lock", digest.finalize()));
-    let file = match thegn_core::fsperm::open_regular_file_nofollow(&path) {
-        Ok(file) => file,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            match thegn_core::fsperm::create_owner_only_exclusive(&path) {
-                Ok(file) => file,
-                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
-                    thegn_core::fsperm::open_regular_file_nofollow(&path)?
-                }
-                Err(error) => return Err(error.into()),
-            }
-        }
-        Err(error) => return Err(error.into()),
-    };
+    let file_name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| anyhow!("managed SSH rotation lease path has no valid file name"))?;
+    let private_dir = thegn_core::fsperm::ensure_private_dir_beneath(anchor, Path::new(lock_name))
+        .with_context(|| {
+            format!(
+                "secure managed SSH rotation lease directory {}",
+                lock_dir.display()
+            )
+        })?;
+    let file = private_dir
+        .open_or_create_regular_nofollow(file_name)
+        .with_context(|| format!("open managed SSH rotation lease {}", path.display()))?;
     match file.try_lock() {
         Ok(()) => Ok(ScopeLease { _file: file }),
         Err(std::fs::TryLockError::WouldBlock) => Err(RotationLeaseHeld {
@@ -1241,13 +1247,29 @@ mod tests {
     #[test]
     fn lease_dir_symlink_is_refused() {
         let temp = tempfile::tempdir().unwrap();
-        let target = temp.path().join("target");
-        std::fs::create_dir(&target).unwrap();
+        let victim = temp.path().join("victim");
+        std::fs::create_dir(&victim).unwrap();
         let link = temp.path().join("link");
-        if thegn_core::fsperm::create_symlink(&target, &link, true).is_err() {
+        if thegn_core::fsperm::create_symlink(&victim, &link, true).is_err() {
             return;
         }
         assert!(acquire_scope_lease_in(&link, Path::new("managed-key")).is_err());
+        assert_eq!(std::fs::read_dir(&victim).unwrap().count(), 0);
+    }
+
+    #[test]
+    fn pre_existing_lease_dir_is_tightened_to_owner_only() {
+        let temp = tempfile::tempdir().unwrap();
+        let lock_dir = temp.path().join("rotation-leases");
+        std::fs::create_dir(&lock_dir).unwrap();
+        if thegn_core::fsperm::set_mode_for_test(&lock_dir, 0o755).is_err() {
+            return;
+        }
+        let _lease = acquire_scope_lease_in(&lock_dir, Path::new("managed-key")).unwrap();
+        assert_eq!(
+            thegn_core::fsperm::mode_bits(&lock_dir).unwrap(),
+            Some(0o700)
+        );
     }
 
     #[test]
