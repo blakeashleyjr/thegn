@@ -598,6 +598,12 @@ The `[lsp]` scalar keys are exposed as `lspEnabled`, `lspHover` and
 `lspRequireContainment`. The `lsp.servers` registry entries are not exposed
 because they carry executable commands.
 
+The `[semantic]` scalar keys are exposed as `semanticWorktreeIndex`,
+`semanticIndexMaxFiles` and `semanticMapBudgetLines`.
+
+The `[log]` scalar keys are exposed as `rotationSizeMb`, `maxFiles`,
+`stderrCapMb`, `level`, `file`, `dir` and `format` under the `log` option.
+
 The `[usage]` scalar keys are exposed as `usageEnabled`, `usageStatusbar`,
 `usageDiscoverProfiles`, `usageTokenRollups`, `usageHistoryDays` and
 `usagePollIntervalSecs`. The float thresholds

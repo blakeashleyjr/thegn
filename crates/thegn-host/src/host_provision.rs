@@ -50,27 +50,39 @@ fn container_lease_path(
     lock_dir.join(format!("{:x}.lock", digest.finalize()))
 }
 
-#[allow(deprecated)]
 fn acquire_container_lease_in(
     lock_dir: &std::path::Path,
     env_name: &str,
     container: &str,
 ) -> std::io::Result<Option<ContainerLease>> {
-    thegn_core::fsperm::ensure_private_dir(lock_dir)?;
+    let anchor = lock_dir.parent().ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "host provision lease directory has no parent",
+        )
+    })?;
+    let lock_name = lock_dir.file_name().ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "host provision lease directory has no name",
+        )
+    })?;
+    if !anchor.exists() {
+        thegn_core::fsperm::ensure_private_dir(anchor)?;
+    }
     let path = container_lease_path(lock_dir, env_name, container);
-    let file = match thegn_core::fsperm::open_regular_file_nofollow(&path) {
-        Ok(file) => file,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            match thegn_core::fsperm::create_owner_only_exclusive(&path) {
-                Ok(file) => file,
-                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
-                    thegn_core::fsperm::open_regular_file_nofollow(&path)?
-                }
-                Err(error) => return Err(error),
-            }
-        }
-        Err(error) => return Err(error),
-    };
+    let file_name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "host provision lease path has no valid file name",
+            )
+        })?;
+    let private_dir =
+        thegn_core::fsperm::ensure_private_dir_beneath(anchor, std::path::Path::new(lock_name))?;
+    let file = private_dir.open_or_create_regular_nofollow(file_name)?;
     match file.try_lock() {
         Ok(()) => Ok(Some(ContainerLease { _file: file })),
         Err(std::fs::TryLockError::WouldBlock) => Ok(None),
@@ -1632,6 +1644,53 @@ mod tests {
                 "lease file permissions must exclude group/other"
             );
         }
+    }
+
+    #[test]
+    fn container_lease_dir_symlink_is_refused_without_touching_victim() {
+        let temp = tempfile::tempdir().unwrap();
+        let victim = temp.path().join("victim");
+        std::fs::create_dir(&victim).unwrap();
+        let link = temp.path().join("link");
+        if thegn_core::fsperm::create_symlink(&victim, &link, true).is_err() {
+            return;
+        }
+        assert!(acquire_container_lease_in(&link, "box", "tg-a").is_err());
+        assert_eq!(std::fs::read_dir(&victim).unwrap().count(), 0);
+    }
+
+    #[test]
+    fn trusted_anchor_symlink_is_allowed() {
+        let temp = tempfile::tempdir().unwrap();
+        let real_anchor = temp.path().join("real-anchor");
+        std::fs::create_dir(&real_anchor).unwrap();
+        let anchor = temp.path().join("anchor");
+        if thegn_core::fsperm::create_symlink(&real_anchor, &anchor, true).is_err() {
+            return;
+        }
+        let lock_dir = anchor.join("host-provision-leases");
+        assert!(
+            acquire_container_lease_in(&lock_dir, "box", "tg-a")
+                .unwrap()
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn pre_existing_container_lease_dir_is_tightened_to_owner_only() {
+        let temp = tempfile::tempdir().unwrap();
+        let lock_dir = temp.path().join("host-provision-leases");
+        std::fs::create_dir(&lock_dir).unwrap();
+        if thegn_core::fsperm::set_mode_for_test(&lock_dir, 0o755).is_err() {
+            return;
+        }
+        let _lease = acquire_container_lease_in(&lock_dir, "box", "tg-a")
+            .unwrap()
+            .expect("lease should be acquired");
+        assert_eq!(
+            thegn_core::fsperm::mode_bits(&lock_dir).unwrap(),
+            Some(0o700)
+        );
     }
 
     #[test]

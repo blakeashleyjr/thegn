@@ -149,6 +149,11 @@ self: {
         default = null;
         description = "How many rotated log files to keep. Unset (null) = the binary's default.";
       };
+      stderrCapMb = lib.mkOption {
+        type = lib.types.nullOr (lib.types.ints.unsigned);
+        default = null;
+        description = "Cap captured stderr retention across restarts, in MiB. Unset (null) = the binary's default.";
+      };
       format = lib.mkOption {
         type = lib.types.nullOr (lib.types.enum ["text" "json"]);
         default = null;
@@ -385,12 +390,16 @@ self: {
     lsp.enabled = cfg.lspEnabled;
     lsp.hover = cfg.lspHover;
     lsp.require_containment = cfg.lspRequireContainment;
+    semantic.worktree_index = cfg.semanticWorktreeIndex;
+    semantic.index_max_files = cfg.semanticIndexMaxFiles;
+    semantic.map_budget_lines = cfg.semanticMapBudgetLines;
     host_discovery.tailnet.enabled = cfg.hostDiscoveryTailnetEnabled;
     host_discovery.tailnet.online_only = cfg.hostDiscoveryTailnetOnlineOnly;
     log = {
       inherit (cfg.log) level file dir format;
       rotation_size_mb = cfg.log.rotationSizeMb;
       max_files = cfg.log.maxFiles;
+      stderr_cap_mb = cfg.log.stderrCapMb;
     };
     sandbox = {
       inherit (cfg.sandbox) enabled backend image network mounts devenv;
@@ -1445,6 +1454,24 @@ in {
       type = lib.types.nullOr (lib.types.bool);
       default = null;
       description = "Refuse language servers that cannot join the shared resource slice. Unset (null) = the binary's default.";
+    };
+
+    semanticWorktreeIndex = lib.mkOption {
+      type = lib.types.nullOr (lib.types.bool);
+      default = null;
+      description = "Enable the worktree-wide semantic entity index. Unset (null) = the binary's default.";
+    };
+
+    semanticIndexMaxFiles = lib.mkOption {
+      type = lib.types.nullOr (lib.types.ints.positive);
+      default = null;
+      description = "Maximum number of files parsed by the semantic index. Unset (null) = the binary's default.";
+    };
+
+    semanticMapBudgetLines = lib.mkOption {
+      type = lib.types.nullOr (lib.types.ints.positive);
+      default = null;
+      description = "Default line budget for the semantic repo map. Unset (null) = the binary's default.";
     };
 
     hostDiscoveryTailnetEnabled = lib.mkOption {
