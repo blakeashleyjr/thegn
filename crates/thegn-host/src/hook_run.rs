@@ -618,12 +618,12 @@ fn log_path_with(
     indices: &Mutex<std::collections::HashMap<(PathBuf, String), u64>>,
 ) -> std::io::Result<PathBuf> {
     let slug = log_dir_name(worktree)?;
-    let dir = log_root.join(slug);
     thegn_core::fsperm::ensure_private_dir(log_root)?;
-    thegn_core::fsperm::ensure_private_dir(&dir)?;
+    let dir = thegn_core::fsperm::ensure_private_dir_beneath(log_root, Path::new(&slug))?;
+    let dir_path = log_root.join(&slug);
 
     let event_name = event.as_str().to_string();
-    let key = (dir.clone(), event_name.clone());
+    let key = (dir_path.clone(), event_name.clone());
     let mut indices = indices
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -631,10 +631,8 @@ fn log_path_with(
         Some(last) => last.checked_add(1),
         None => {
             let mut max_index = 0u64;
-            for entry in std::fs::read_dir(&dir)? {
-                let entry = entry?;
-                if let Some(found) = entry
-                    .file_name()
+            for name in dir.file_names()? {
+                if let Some(found) = name
                     .to_str()
                     .and_then(|name| name.strip_prefix(&format!("{event_name}-")))
                     .and_then(|name| name.strip_suffix(".log"))
@@ -654,8 +652,9 @@ fn log_path_with(
     })?;
 
     for _ in 0..HOOK_LOG_ALLOCATION_ATTEMPTS {
-        let path = dir.join(format!("{event_name}-{index}.log"));
-        match thegn_core::fsperm::create_owner_only_exclusive(&path) {
+        let name = format!("{event_name}-{index}.log");
+        let path = dir_path.join(&name);
+        match dir.create_owner_only_exclusive(&name) {
             Ok(file) => {
                 // Keep this reservation even if finalization later fails: reusing a path
                 // already returned in a HookRunResult could identify a different run.
@@ -1010,6 +1009,40 @@ mod tests {
         let next = log_path(dir.path(), &worktree, HookEvent::PostCreate).unwrap();
         assert_ne!(next, first);
         assert!(next.ends_with("post_create-2.log"));
+    }
+
+    #[test]
+    fn hook_log_allocation_ignores_non_matching_names_when_scanning() {
+        let dir = tempfile::tempdir().unwrap();
+        let worktree = format!("/isolated-hook-log-scan-{}", std::process::id());
+        let slug = dir.path().join(log_dir_name(&worktree).unwrap());
+        std::fs::create_dir(&slug).unwrap();
+        std::fs::write(slug.join("post_create-not-a-number.log"), b"ignored").unwrap();
+        std::fs::write(slug.join("post_create-9.txt"), b"ignored").unwrap();
+        std::fs::write(slug.join("other-99.log"), b"ignored").unwrap();
+
+        let path = log_path(dir.path(), &worktree, HookEvent::PostCreate).unwrap();
+        assert!(path.ends_with("post_create-1.log"));
+    }
+
+    #[test]
+    fn hook_log_allocation_rejects_slug_swap_without_touching_victim() {
+        let root = tempfile::tempdir().unwrap();
+        let worktree = format!("/isolated-hook-log-swap-{}", std::process::id());
+        let first = log_path(root.path(), &worktree, HookEvent::PostCreate).unwrap();
+        let slug = first.parent().unwrap().to_path_buf();
+        let moved = root.path().join("moved-slug");
+        std::fs::rename(&slug, &moved).unwrap();
+        let victim = root.path().join("victim");
+        std::fs::create_dir(&victim).unwrap();
+        if let Err(error) = thegn_core::fsperm::create_symlink(&victim, &slug, true) {
+            tracing::debug!(%error, "skipping hook log symlink test");
+            return;
+        }
+
+        assert!(log_path(root.path(), &worktree, HookEvent::PostCreate).is_err());
+        assert_eq!(std::fs::read_dir(&victim).unwrap().count(), 0);
+        assert!(moved.join("post_create-1.log").exists());
     }
 
     #[test]
