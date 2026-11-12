@@ -63,7 +63,7 @@ def _scannable(args: list[str]) -> list[str]:
             skip = False
             continue
         out.append(arg)
-        if arg in _LONG_VALUE or (len(arg) == 2 and arg[0] == "-" and arg[1] in _SHORT_VALUE):
+        if arg in _LONG_VALUE or _short_value_takes_next(arg):
             skip = True
     return out
 
@@ -81,7 +81,7 @@ def _dangling_value_flag(args: list[str]) -> str | None:
             skip = False
             last = None
             continue
-        if arg in _LONG_VALUE or (len(arg) == 2 and arg[0] == "-" and arg[1] in _SHORT_VALUE):
+        if arg in _LONG_VALUE or _short_value_takes_next(arg):
             skip = True
             last = arg
         else:
@@ -130,6 +130,12 @@ def _short_value_flag(arg: str) -> tuple[str, str] | None:
             return c, rest
         return None
     return None
+
+
+def _short_value_takes_next(arg: str) -> bool:
+    """Whether a short value shorthand has no glued value and consumes the next token."""
+    short = _short_value_flag(arg)
+    return short is not None and not short[1] and arg.endswith(short[0])
 
 
 def has_credentials(args: list[str]) -> bool:
@@ -893,6 +899,38 @@ def self_test() -> int:
     )
     argv, _ = plan("push", ["--secret", "T=x", "-e", "-vr"], [], "abc123")
     cases.append(("separate-short-value-is-not-scanned", argv is not None))
+    argv, message = plan("push", ["-vj", "-s"], [], "abc123")
+    cases.append(
+        (
+            "clustered-short-value-skips-next-token",
+            argv == ["act", "push", "-vj", "-s", "--rm"]
+            and message == ""
+            and not has_credentials(["-vj", "-s"]),
+        )
+    )
+    argv, message = plan("push", ["-vs", "T=x"], [], "abc123")
+    cases.append(
+        (
+            "clustered-credential-flag-keeps-separate-value",
+            argv is not None and has_credentials(["-vs", "T=x"]) and "abc123" in message,
+        )
+    )
+    argv, message = plan("push", ["-vsT=x", "--secret"], [], "abc123")
+    cases.append(
+        (
+            "clustered-glued-value-does-not-skip-next-flag",
+            argv is None and "--secret without a value" in message,
+        )
+    )
+    argv, message = plan("push", ["--secret", "T=x", "-vj"], [], "abc123")
+    cases.append(
+        (
+            "clustered-trailing-value-flag-is-refused",
+            _dangling_value_flag(["-vj"]) == "-vj"
+            and argv is None
+            and "-vj without a value" in message,
+        )
+    )
     cases.append(
         (
             "credential-flag-still-detected-with-separate-value",
