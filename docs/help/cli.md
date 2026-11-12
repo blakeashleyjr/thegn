@@ -26,7 +26,7 @@ worktree):
 | Forge         | `pr` · `issue` · `ci` · `kaneo`                                                                                                               |
 | Automation    | `autopilot status [--repo PATH] [--json]`                                                                                                     |
 | Environments  | `env` · `zone` · `host` · `placement` · `debug` · `mcp` · `plugin`                                                                            |
-| Session       | `notify` · `logs` · `share` · `forward`                                                                                                       |
+| Session       | `session list\|open\|snapshot\|attach\|wait` · `notify` · `logs` · `share` · `forward`                                                        |
 | Control plane | `serve` · `session` · `events` · `attach` · `pair` · `api`                                                                                    |
 | Meta          | `config` · `keys` · `theme` · `doctor` · `db` · `setup` · `completions`                                                                       |
 
@@ -222,6 +222,12 @@ configured prefix or numbering); it conflicts with `--from-issue` and
 removes lane worktrees and branches already merged into the target; without
 `--apply` it is a dry run. See [[workspaces-and-worktrees]].
 
+`thegn wt new --batch FILE` creates one lane for each non-comment, non-blank
+line in the file. Each line is `<name>` or `<name> <base>`; a per-line base
+overrides the shared `--base`. The complete file is validated before the first
+checkout. The batch form accepts `--repo`, `--env`, `--isolation`,
+`--exact-branch`, `--folder` and `--json`.
+
 `wt new` reports an empty base as having no commits yet and reports Git read
 failures as failures to verify the base.
 
@@ -246,6 +252,21 @@ thegn session open --agent coder --stage code --worktree "$wt" --prompt "…"
 layers a `[[pipeline.stages]]` entry's `model` / `env` / `permissions`
 over the agent — see [[configuration]]. The daemon composes the same
 sandbox, credentials, model flag and env overlay an interactive pane gets.
+
+`session open --track <issue>` is the ad-hoc worker form: it requires
+`--worktree`, opens the plain session, then writes a dispatch roster row visible
+to `dispatch list`, `dispatch wait` and `dispatch verify`. For a lane without
+an issue, use `session open --brief-file F [--vars key=value]`; repeatable
+`--vars` bindings render `{key}` placeholders in the file. These options cannot
+be combined with `--prompt`, `--issue` or `--resume-work`, and `--vars` requires
+`--brief-file`.
+
+`session snapshot [SESSION]`, `session attach [SESSION]`, and `session wait
+[SESSION]` also accept `--session SESSION`. `snapshot` emits the current raw
+ANSI screen, or plain rows with `--text` and JSON geometry/base64 output with
+`--json`; `attach` streams live output and Ctrl-C only detaches. `wait` accepts
+`--until exited|idle|blocked|done|match:<regex>` and optional `--timeout <ms>`;
+timeouts exit 2.
 
 `wt new --from-issue` and batched project creation use the same lifecycle
 seam. The pipeline board itself is structure-only: an external supervisor

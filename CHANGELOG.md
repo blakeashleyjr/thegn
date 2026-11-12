@@ -7,6 +7,18 @@ All notable changes to **thegn** are documented here. The format follows
 
 ## [Unreleased]
 
+### Added
+
+- `session snapshot`, `session attach` and `session wait` accept the session id
+  positionally as well as through `--session`.
+- `session open --track <issue>` records an ad-hoc worker in the dispatch roster,
+  where `dispatch list`, `dispatch wait` and `dispatch verify` can see it.
+- `session open --brief-file F --vars k=v` supports file-backed prompt templates
+  for lanes without an issue.
+- `session open` warns on stderr when its prompt names a `/tmp/` path hidden by
+  a private sandbox `/tmp`.
+- `wt new --batch FILE` creates multiple worktree lanes from one batch file.
+
 ## [0.1.0-alpha.64] — 2026-11-11
 
 ## [0.1.0-alpha.63] — 2026-11-11
