@@ -304,13 +304,16 @@ self: {
     drawer.pool_limit = cfg.drawerPoolLimit;
     drawer.prewarm = cfg.drawerPrewarm;
     strip.visible = cfg.stripVisible;
+    git.backend = cfg.gitBackend;
     git.override_gpg = cfg.gitOverrideGpg;
     git.merge_guard = cfg.gitMergeGuard;
     git.auto_fetch = cfg.gitAutoFetch;
     git.auto_fetch_interval_secs = cfg.gitAutoFetchIntervalSecs;
     git.auto_fetch_min_interval_secs = cfg.gitAutoFetchMinIntervalSecs;
     git.auto_fetch_notify = cfg.gitAutoFetchNotify;
+    git.structural_diff = cfg.gitStructuralDiff;
     git.auto_fetch_colocated = cfg.gitAutoFetchColocated;
+    git.submodules = cfg.gitSubmodules;
     stats.cpu_icon = cfg.statsCpuIcon;
     stats.mem_icon = cfg.statsMemIcon;
     stats.net_icon = cfg.statsNetIcon;
@@ -957,6 +960,12 @@ in {
       description = "Whether the pinned-program strip is shown when it has at least one pin. Unset (null) = the binary's default.";
     };
 
+    gitBackend = lib.mkOption {
+      type = lib.types.nullOr (lib.types.enum ["auto" "gix" "cli"]);
+      default = null;
+      description = "Git read engine: auto, gix, or cli. Unset (null) = the binary's default.";
+    };
+
     gitOverrideGpg = lib.mkOption {
       type = lib.types.nullOr (lib.types.bool);
       default = null;
@@ -993,10 +1002,22 @@ in {
       description = "Also raise an inbox notification when a background fetch finds new upstream commits. Unset (null) = the binary's default.";
     };
 
+    gitStructuralDiff = lib.mkOption {
+      type = lib.types.nullOr (lib.types.enum ["off" "auto" "difft"]);
+      default = null;
+      description = "Read-only diff renderer: off, auto, or difft. Unset (null) = the binary's default.";
+    };
+
     gitAutoFetchColocated = lib.mkOption {
       type = lib.types.nullOr (lib.types.bool);
       default = null;
       description = "Also run background auto-fetch in repos colocated with jujutsu. Unset (null) = the binary's default.";
+    };
+
+    gitSubmodules = lib.mkOption {
+      type = lib.types.nullOr (lib.types.enum ["auto" "off"]);
+      default = null;
+      description = "Submodule lifecycle mode: auto or off. Unset (null) = the binary's default.";
     };
 
     statsCpuIcon = lib.mkOption {
