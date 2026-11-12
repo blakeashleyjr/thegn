@@ -812,6 +812,34 @@ impl PrivateDir {
         &self.path
     }
 
+    /// Exclusively create an owner-only file relative to this held directory.
+    /// The returned handle is the reservation; an existing entry, including a
+    /// symlink, is never replaced.
+    pub fn create_owner_only_exclusive(&self, name: &str) -> std::io::Result<std::fs::File> {
+        let name_path = single_component(name)?;
+        #[cfg(unix)]
+        {
+            use nix::fcntl::{OFlag, openat};
+            use nix::sys::stat::Mode;
+            let fd = openat(
+                &self.fd,
+                name_path,
+                OFlag::O_WRONLY
+                    | OFlag::O_CREAT
+                    | OFlag::O_EXCL
+                    | OFlag::O_NOFOLLOW
+                    | OFlag::O_CLOEXEC,
+                Mode::from_bits_truncate(0o600),
+            )
+            .map_err(nix_io_error)?;
+            Ok(std::fs::File::from(fd))
+        }
+        #[cfg(not(unix))]
+        {
+            create_owner_only_exclusive(&self.path.join(name_path))
+        }
+    }
+
     /// Create an owner-only temporary file relative to this pinned directory.
     /// The returned name can be passed to [`Self::remove_file`] for cleanup.
     #[cfg(unix)]
@@ -3197,6 +3225,53 @@ mod tests {
 
         assert!(pinned.open_or_create_regular_nofollow("link").is_err());
         assert_eq!(std::fs::read(outside).unwrap(), b"untouched");
+    }
+
+    #[test]
+    fn create_owner_only_exclusive_creates_once_and_rejects_invalid_names() {
+        let root = tempfile::tempdir().unwrap();
+        let private = root.path().join("private");
+        ensure_private_dir(&private).unwrap();
+        let pinned = open_private_dir(&private).unwrap();
+
+        let file = pinned.create_owner_only_exclusive("created").unwrap();
+        assert_eq!(file.metadata().unwrap().len(), 0);
+        assert!(
+            mode_bits(&private.join("created"))
+                .unwrap()
+                .is_none_or(|mode| mode & 0o777 == 0o600)
+        );
+        assert_eq!(
+            pinned
+                .create_owner_only_exclusive("created")
+                .unwrap_err()
+                .kind(),
+            std::io::ErrorKind::AlreadyExists
+        );
+        assert!(pinned.create_owner_only_exclusive("nested/name").is_err());
+        assert!(pinned.create_owner_only_exclusive("../name").is_err());
+    }
+
+    #[test]
+    fn create_owner_only_exclusive_refuses_a_symlink_name() {
+        let root = tempfile::tempdir().unwrap();
+        let private = root.path().join("private");
+        ensure_private_dir(&private).unwrap();
+        let outside = root.path().join("outside");
+        std::fs::write(&outside, b"untouched").unwrap();
+        if let Err(error) = create_symlink(&outside, &private.join("link"), false) {
+            if matches!(
+                error.kind(),
+                std::io::ErrorKind::Unsupported | std::io::ErrorKind::PermissionDenied
+            ) {
+                return;
+            }
+            panic!("could not create test symlink: {error}");
+        }
+
+        let pinned = open_private_dir(&private).unwrap();
+        assert!(pinned.create_owner_only_exclusive("link").is_err());
+        assert_eq!(std::fs::read(&outside).unwrap(), b"untouched");
     }
 
     #[test]
