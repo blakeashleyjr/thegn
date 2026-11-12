@@ -116,7 +116,7 @@ fn land_branch_pinned_with_options(
                 .map_err(|error| format!("could not bind target tip: {error}"));
             match (folded_commit, target_tip) {
                 (Ok(folded_commit), Ok(target_tip)) => {
-                    crate::cmd::dispatch_gate::trusted_land_gate_id(
+                    crate::cmd::dispatch::gate::trusted_land_gate_id(
                         db,
                         &worktree.to_string_lossy(),
                         &folded_commit,
@@ -219,8 +219,12 @@ pub fn run(cfg: &Config, worktree: Option<String>, trust_gate: bool) -> Result<(
     let tracking_outcome = integration_tracking_outcome(non_root, &outcome);
     if let Some(tracking_outcome) = tracking_outcome
         && let Some(label) = Path::new(&wt).file_name().and_then(|name| name.to_str())
-        && let Err(error) =
-            crate::cmd::session_track::track_integration(db.db(), &wt, label, tracking_outcome)
+        && let Err(error) = crate::cmd::session_track::track_integration(
+            db.db(),
+            wt.to_string_lossy().as_ref(),
+            label,
+            tracking_outcome,
+        )
     {
         // Land is authoritative for Git; roster tracking is best effort and
         // must not turn a landed or refused fold into an ambiguous retry.
