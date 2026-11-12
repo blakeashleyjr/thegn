@@ -111,7 +111,7 @@ pub trait BranchOps: GitBackend {
             ForceMode::WithLease => args.push("--force-with-lease"),
             ForceMode::Force => args.push("--force"),
         }
-        args.push(&remote);
+        args.push(remote);
         args.push(&refspec);
         run_w_network(loc, &[], &args).map(|_| ())
     }

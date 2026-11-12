@@ -747,7 +747,7 @@ fn execute_at_with_db(
                         let remote = branch
                             .as_deref()
                             .map(|branch| branch_remote(loc, branch))
-                            .unwrap_or_else(|| "origin".to_owned());
+                            .unwrap_or_else(|_| "origin".to_owned());
                         no_upstream_result(branch, &msg, &remote)
                     } else {
                         GitOpResult::Err(first_line_str(&msg))
