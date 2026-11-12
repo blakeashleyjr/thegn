@@ -46,6 +46,10 @@ always eligible, and `mq` requires the merge queue. Stage workers are launched
 with `thegn session open --agent <entry> --stage <stage>`, which applies the
 stage's `model` / `env` / `permissions` overrides (see [[configuration]]).
 
+Issue-free maintenance lanes can instead use `session open --brief-file <path>`
+with repeatable `--vars key=value` bindings; a brief without bindings is passed
+through verbatim, including literal braces.
+
 Below the rail, each row is one dispatch: a status mark, the worktree it works
 in, and how long it has been going.
 
