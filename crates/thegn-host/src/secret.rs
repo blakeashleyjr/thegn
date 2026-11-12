@@ -837,9 +837,23 @@ fn secrets_dir_at(dir: &std::path::Path) -> Result<()> {
 }
 
 fn open_secrets_in(dir: &std::path::Path) -> Result<thegn_core::fsperm::PrivateDir> {
-    secrets_dir_at(dir)?;
-    thegn_core::fsperm::open_private_dir(dir)
+    open_private_secrets_dir(dir)
         .with_context(|| format!("open private secrets directory {}", dir.display()))
+}
+
+fn open_private_secrets_dir(dir: &std::path::Path) -> Result<thegn_core::fsperm::PrivateDir> {
+    let anchor = dir
+        .parent()
+        .context("private secrets directory has no parent")?;
+    let name = dir
+        .file_name()
+        .context("private secrets directory has no filename")?;
+    if !anchor.exists() {
+        thegn_core::fsperm::ensure_private_dir(anchor)
+            .with_context(|| format!("prepare private secrets anchor {}", anchor.display()))?;
+    }
+    thegn_core::fsperm::ensure_private_dir_beneath(anchor, std::path::Path::new(name))
+        .with_context(|| format!("pin private secrets directory {}", dir.display()))
 }
 
 fn token_path_in(dir: &std::path::Path, name: &str) -> Result<PathBuf> {
@@ -2492,6 +2506,37 @@ mod tests {
         assert!(file_del_at(&secrets, "acct").is_err());
         assert_eq!(std::fs::read(&canary).unwrap(), b"canary");
         assert!(canary.exists());
+    }
+
+    #[test]
+    fn open_secrets_refuses_a_symlinked_directory_without_touching_its_target() {
+        let temp = private_temp();
+        let target = temp.path().join("target");
+        let secrets = temp.path().join("secrets");
+        std::fs::create_dir(&target).unwrap();
+        thegn_core::fsperm::ensure_private_dir(&target).unwrap();
+        if thegn_core::fsperm::create_symlink(&target, &secrets, true).is_err() {
+            return;
+        }
+
+        assert!(open_secrets_in(&secrets).is_err());
+        assert_eq!(std::fs::read_dir(&target).unwrap().count(), 0);
+    }
+
+    #[test]
+    fn open_secrets_tightens_an_existing_directory_to_owner_only() {
+        let temp = private_temp();
+        let secrets = temp.path().join("secrets");
+        std::fs::create_dir(&secrets).unwrap();
+        if crate::platform::test_mode_bits_supported() {
+            crate::platform::test_set_mode(&secrets, 0o755).unwrap();
+        }
+
+        open_secrets_in(&secrets).unwrap();
+
+        if let Some(mode) = thegn_core::fsperm::mode_bits(&secrets).unwrap() {
+            assert_eq!(mode & 0o777, 0o700);
+        }
     }
 
     #[test]
