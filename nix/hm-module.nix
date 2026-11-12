@@ -376,6 +376,15 @@ self: {
     preview.enabled = cfg.previewEnabled;
     preview.fetch_timeout_ms = cfg.previewFetchTimeoutMs;
     preview.max_body_bytes = cfg.previewMaxBodyBytes;
+    usage.enabled = cfg.usageEnabled;
+    usage.allow_network = cfg.usageAllowNetwork;
+    usage.statusbar = cfg.usageStatusbar;
+    usage.discover_profiles = cfg.usageDiscoverProfiles;
+    usage.token_rollups = cfg.usageTokenRollups;
+    usage.history_days = cfg.usageHistoryDays;
+    usage.poll_interval_secs = cfg.usagePollIntervalSecs;
+    host_discovery.tailnet.enabled = cfg.hostDiscoveryTailnetEnabled;
+    host_discovery.tailnet.online_only = cfg.hostDiscoveryTailnetOnlineOnly;
     log = {
       inherit (cfg.log) level file dir format;
       rotation_size_mb = cfg.log.rotationSizeMb;
@@ -1379,6 +1388,60 @@ in {
       type = lib.types.nullOr (lib.types.ints.between 1 16777216);
       default = null;
       description = "Maximum response bytes retained by one preview fetch. Unset (null) = the binary's default.";
+    };
+
+    usageEnabled = lib.mkOption {
+      type = lib.types.nullOr (lib.types.bool);
+      default = null;
+      description = "Enable the AI-account usage tracker. Unset (null) = the binary's default.";
+    };
+
+    usageAllowNetwork = lib.mkOption {
+      type = lib.types.nullOr (lib.types.bool);
+      default = null;
+      description = "Allow authenticated live usage fetches for providers that do not publish local window state. Unset (null) = the binary's default.";
+    };
+
+    usageStatusbar = lib.mkOption {
+      type = lib.types.nullOr (lib.types.bool);
+      default = null;
+      description = "Show the usage badge in the statusbar. Unset (null) = the binary's default.";
+    };
+
+    usageDiscoverProfiles = lib.mkOption {
+      type = lib.types.nullOr (lib.types.bool);
+      default = null;
+      description = "Discover additional provider credential profiles. Unset (null) = the binary's default.";
+    };
+
+    usageTokenRollups = lib.mkOption {
+      type = lib.types.nullOr (lib.types.bool);
+      default = null;
+      description = "Aggregate host-wide token counts from local transcripts. Unset (null) = the binary's default.";
+    };
+
+    usageHistoryDays = lib.mkOption {
+      type = lib.types.nullOr (lib.types.ints.between 0 3650);
+      default = null;
+      description = "Days of usage history to retain (0 disables history). Unset (null) = the binary's default.";
+    };
+
+    usagePollIntervalSecs = lib.mkOption {
+      type = lib.types.nullOr (lib.types.ints.between 60 2678400);
+      default = null;
+      description = "Usage polling cadence in seconds (minimum 60). Unset (null) = the binary's default.";
+    };
+
+    hostDiscoveryTailnetEnabled = lib.mkOption {
+      type = lib.types.nullOr (lib.types.bool);
+      default = null;
+      description = "Offer tailnet host discovery. Unset (null) = the binary's default.";
+    };
+
+    hostDiscoveryTailnetOnlineOnly = lib.mkOption {
+      type = lib.types.nullOr (lib.types.bool);
+      default = null;
+      description = "Limit tailnet discovery to online peers. Unset (null) = the binary's default.";
     };
 
     agents = lib.mkOption {

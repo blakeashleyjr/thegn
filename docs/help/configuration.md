@@ -594,6 +594,16 @@ The `[preview]` scalar keys are exposed as `previewEnabled`,
 `previewFetchTimeoutMs` and `previewMaxBodyBytes`. The `preview.ports` list and
 the `preview.allow_external_urls` SSRF security opt-in are not exposed.
 
+The `[usage]` scalar keys are exposed as `usageEnabled`, `usageAllowNetwork`,
+`usageStatusbar`, `usageDiscoverProfiles`, `usageTokenRollups`,
+`usageHistoryDays` and `usagePollIntervalSecs`. The float thresholds
+`usage.warn_percent` and `usage.crit_percent`, `usage.providers`,
+`usage.profile_roots`, `usage.accounts` and `usage.alerts` are omitted. Tailnet
+discovery exposes `hostDiscoveryTailnetEnabled` and
+`hostDiscoveryTailnetOnlineOnly`; `host_discovery.kind`,
+`host_discovery.tailnet.tag_filter` and `host_discovery.tailnet.tailscale_bin`
+are omitted.
+
 `keys list` covers the keymap registry **and** the zone-local tables — the
 sidebar's row keys and each panel section's row-mode keys. Those are handled
 by the focused zone rather than the registry, so they are not rebindable, but
