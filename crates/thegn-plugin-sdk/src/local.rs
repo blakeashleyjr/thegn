@@ -106,12 +106,12 @@ impl PrivateState {
         if !root.is_absolute() {
             bail!("plugin state directory must be absolute");
         }
-        let anchor = root
-            .parent()
-            .context("plugin state directory must have a parent")?;
         let name = root
             .file_name()
             .context("plugin state directory must have a file name")?;
+        let anchor = root
+            .parent()
+            .context("plugin state directory must have a parent")?;
         if !anchor.exists() {
             thegn_core::fsperm::ensure_private_dir(anchor)
                 .context("create plugin state directory anchor")?;
