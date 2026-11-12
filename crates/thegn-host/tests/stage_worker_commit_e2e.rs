@@ -280,9 +280,11 @@ impl Fixture {
         );
         assert_git_success(&added, "git worktree add");
 
-        let outside_write = deny_outside_write
-            .then_some(" && : > \"$OUTSIDE/denied\"")
-            .unwrap_or_default();
+        let outside_write = if deny_outside_write {
+            " && : > \"$OUTSIDE/denied\""
+        } else {
+            ""
+        };
         let script = format!(
             "printf '%s\\n' committed > stage-worker-marker && git add stage-worker-marker && git -c user.name=stage-worker-e2e -c user.email=stage-worker-e2e@example.invalid -c commit.gpgsign=false commit -m x{outside_write}"
         );
