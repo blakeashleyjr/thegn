@@ -185,6 +185,45 @@ mod tests {
     }
 
     #[test]
+    fn private_tmp_paths_excludes_paths_covered_by_mounts_for_bwrap() {
+        let mut sandbox = spec(Backend::Bwrap, FileAccess::Worktree, false);
+        sandbox.mounts.push(Mount {
+            host: "/host/reports".into(),
+            dest: "/tmp/reports".into(),
+            ro: false,
+            cache: false,
+        });
+        let paths = vec![
+            "/tmp/reports/result.md".into(),
+            "/tmp/other/result.md".into(),
+            "/tmp/reports".into(),
+        ];
+        assert_eq!(
+            private_tmp_paths(&sandbox, &paths),
+            vec!["/tmp/other/result.md"]
+        );
+    }
+
+    #[test]
+    fn private_tmp_paths_keeps_paths_beside_a_mount() {
+        let mut sandbox = spec(Backend::Bwrap, FileAccess::Worktree, false);
+        sandbox.mounts.push(Mount {
+            host: "/host/reports".into(),
+            dest: "/tmp/reports".into(),
+            ro: false,
+            cache: false,
+        });
+        let paths = vec![
+            "/tmp/reports/result.md".into(),
+            "/tmp/reports-other/x".into(),
+        ];
+        assert_eq!(
+            private_tmp_paths(&sandbox, &paths),
+            vec!["/tmp/reports-other/x"]
+        );
+    }
+
+    #[test]
     fn warning_lines_cap_paths_and_report_overflow() {
         let paths = (1..=5)
             .map(|n| format!("/tmp/path-{n}"))

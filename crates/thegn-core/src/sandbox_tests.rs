@@ -2102,6 +2102,41 @@ fn cfg_mounts_covered_by_parent_are_skipped() {
 }
 
 #[test]
+fn resolve_mounts_keeps_existing_and_skips_missing_sources() {
+    let temp = tempfile::tempdir_in(std::env::temp_dir()).unwrap();
+    let existing = temp.path().to_string_lossy().into_owned();
+    let missing = temp.path().join("missing").to_string_lossy().into_owned();
+    let loc = crate::remote::GitLoc::from_db("/wt/x", None);
+    let cfg = crate::config::SandboxConfig {
+        backend: crate::config::SandboxBackend::Bwrap,
+        backend_chain: vec!["bwrap".into()],
+        mounts: vec![existing.clone()],
+        ..Default::default()
+    };
+    let Some(resolved) = resolve(&cfg, &loc, "test") else {
+        return;
+    };
+    assert!(
+        resolved.mounts.iter().any(|mount| mount.host == existing),
+        "an existing configured mount source must reach the resolved spec"
+    );
+
+    let missing_cfg = crate::config::SandboxConfig {
+        mounts: vec![missing.clone()],
+        ..cfg
+    };
+    let Some(resolved_missing) = resolve(&missing_cfg, &loc, "test") else {
+        return;
+    };
+    assert!(
+        !resolved_missing
+            .mounts
+            .iter()
+            .any(|mount| mount.host == missing)
+    );
+}
+
+#[test]
 fn host_toolchain_mounts_injected_for_oci_not_bwrap() {
     // For OCI backends, host_toolchain_mounts() contributes only paths that
     // exist on the current host — verify that invariant holds by checking
@@ -4194,6 +4229,30 @@ fn bwrap_resolver_bind_is_covered_for_nested_user_mounts() {
         ..nested.clone()
     };
     assert!(!bwrap_mount_covered(&at_dir, &["/run/systemd/resolve"]));
+}
+
+#[test]
+fn bwrap_mount_under_private_tmp_is_bound_after_the_tmpfs() {
+    let temp = tempfile::tempdir_in(std::env::temp_dir()).unwrap();
+    let report_dir = temp.path().to_string_lossy().into_owned();
+    let mut sandbox = spec(Backend::Bwrap);
+    sandbox.mounts.push(Mount {
+        host: report_dir.clone(),
+        dest: report_dir.clone(),
+        ro: false,
+        cache: false,
+    });
+
+    let argv = backend_enter_argv(&sandbox, "true").unwrap();
+    let tmpfs = argv
+        .windows(2)
+        .position(|window| window == ["--tmpfs", "/tmp"])
+        .expect("bwrap must create a private /tmp");
+    let bind = argv
+        .windows(3)
+        .position(|window| window == ["--bind", report_dir.as_str(), report_dir.as_str()])
+        .expect("the report mount must not be dropped");
+    assert!(tmpfs < bind, "private /tmp must precede the report bind");
 }
 
 #[test]
