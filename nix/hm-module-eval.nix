@@ -147,7 +147,10 @@
           statsUptimeIcon = "U";
           statsBatteryIcon = "B";
           statsBatteryChargingIcon = "BC";
+          statsBatteryWarn = 30;
           statsDiskIcon = "D";
+          statsDiskFreeWarn = 20;
+          statsDiskFreeCritical = 5;
           statsDiskPath = "~";
           notificationsDesktop = false;
           notificationsSurfaceSelfLogErrors = true;
