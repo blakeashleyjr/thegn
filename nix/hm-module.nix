@@ -1066,7 +1066,7 @@ in {
     };
 
     statsBatteryWarn = lib.mkOption {
-      type = lib.types.nullOr (lib.types.ints.between 0 255);
+      type = lib.types.nullOr (lib.types.ints.u8);
       default = null;
       description = "Battery percentage at/below which the widget turns red. Unset (null) = the binary's default.";
     };
@@ -1078,13 +1078,13 @@ in {
     };
 
     statsDiskFreeWarn = lib.mkOption {
-      type = lib.types.nullOr (lib.types.ints.between 0 255);
+      type = lib.types.nullOr (lib.types.ints.u8);
       default = null;
       description = "Free-disk percentage at/below which the disk widget turns amber. Unset (null) = the binary's default.";
     };
 
     statsDiskFreeCritical = lib.mkOption {
-      type = lib.types.nullOr (lib.types.ints.between 0 255);
+      type = lib.types.nullOr (lib.types.ints.u8);
       default = null;
       description = "Free-disk percentage at/below which the disk widget turns red. Unset (null) = the binary's default.";
     };

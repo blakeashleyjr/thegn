@@ -1678,6 +1678,14 @@ fn every_numeric_option_matches_its_destination_range() {
             continue;
         }
 
+        if schema.get("format").and_then(Value::as_str) == Some("uint8") {
+            assert_eq!(
+                nix_type, "lib.types.ints.u8",
+                "Nix type for uint8 schema field {path}"
+            );
+            continue;
+        }
+
         if schema.get("format").and_then(Value::as_str) == Some("uint32") {
             assert_eq!(
                 nix_type, "lib.types.ints.u32",
