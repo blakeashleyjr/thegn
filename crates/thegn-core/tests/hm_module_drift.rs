@@ -242,14 +242,43 @@ const OMITTED: &[(&str, &str)] = &[
     ("media.mpv", "mpv backend table is not exposed"),
     ("media.mpd", "mpd backend table is not exposed"),
     ("voice", "voice input is not exposed"),
-    ("usage", "usage tracking is not exposed"),
+    (
+        "usage.warn_percent",
+        "float threshold needs float pinning and is not exposed",
+    ),
+    (
+        "usage.allow_network",
+        "network opt-in awaits an owner decision",
+    ),
+    (
+        "usage.crit_percent",
+        "float threshold needs float pinning and is not exposed",
+    ),
+    ("usage.providers", "provider selection list is not exposed"),
+    ("usage.profile_roots", "path list is not exposed"),
+    (
+        "usage.accounts",
+        "usage account credentials and paths are not exposed",
+    ),
+    ("usage.alerts", "usage alert policy is not exposed"),
     ("model_proxy", "model proxy is not exposed"),
     ("remote", "remote connection tuning is not exposed"),
     (
         "network.mode",
         "offline-detection mode enum needs destination pinning and is not exposed",
     ),
-    ("host_discovery", "host discovery is not exposed"),
+    (
+        "host_discovery.kind",
+        "host discovery backend enum needs destination pinning and is not exposed",
+    ),
+    (
+        "host_discovery.tailnet.tag_filter",
+        "tailnet tag filter is not exposed",
+    ),
+    (
+        "host_discovery.tailnet.tailscale_bin",
+        "tailnet executable override is not exposed",
+    ),
     ("share", "port sharing is not exposed"),
     ("forward", "port forwarding is not exposed"),
     (
@@ -750,6 +779,9 @@ fn every_schema_key_is_rendered_or_dispositioned() {
         "daemon",
         "network",
         "preview",
+        "usage",
+        "host_discovery",
+        "host_discovery.tailnet",
         "sandbox.remote",
     ] {
         for (schema_section, key) in &required.keys {
@@ -1287,6 +1319,42 @@ fn hm_preview_keys_are_rendered_and_rest_dispositioned() {
 }
 
 #[test]
+fn hm_usage_and_tailnet_keys_are_rendered_and_rest_dispositioned() {
+    let rendered = rendered_paths(&module_src());
+    for path in [
+        "usage.enabled",
+        "usage.statusbar",
+        "usage.discover_profiles",
+        "usage.token_rollups",
+        "usage.history_days",
+        "usage.poll_interval_secs",
+        "host_discovery.tailnet.enabled",
+        "host_discovery.tailnet.online_only",
+    ] {
+        assert!(rendered.contains(path), "Home Manager must render {path}");
+    }
+
+    let omissions: BTreeSet<&str> = OMITTED.iter().map(|(path, _)| *path).collect();
+    let sections = ["usage", "host_discovery", "host_discovery.tailnet"];
+    for section in sections {
+        let schema = schema_field(section);
+        let properties = schema["properties"]
+            .as_object()
+            .unwrap_or_else(|| panic!("{section} schema properties"));
+        for key in properties.keys() {
+            let path = format!("{section}.{key}");
+            if sections.contains(&path.as_str()) {
+                continue;
+            }
+            assert!(
+                rendered.contains(&path) || omissions.contains(path.as_str()),
+                "{path} must be rendered or dispositioned by an exact ledger row"
+            );
+        }
+    }
+}
+
+#[test]
 fn hm_loc_and_replay_families_are_fully_rendered() {
     let rendered = rendered_paths(&module_src());
     for table in ["loc", "replay"] {
@@ -1474,6 +1542,8 @@ fn every_numeric_option_matches_its_destination_range() {
         ("networkRecoveryProbeSecs", "network.recovery_probe_secs"),
         ("previewFetchTimeoutMs", "preview.fetch_timeout_ms"),
         ("previewMaxBodyBytes", "preview.max_body_bytes"),
+        ("usageHistoryDays", "usage.history_days"),
+        ("usagePollIntervalSecs", "usage.poll_interval_secs"),
     ];
     let options = numeric_options(&module_src());
     let actual_names: BTreeSet<&str> = options.iter().map(|(name, _)| name.as_str()).collect();
@@ -1512,6 +1582,28 @@ fn every_numeric_option_matches_its_destination_range() {
                 format!(
                     "lib.types.ints.between 1 {}",
                     thegn_core::config_preview::MAX_PREVIEW_BODY_BYTES
+                ),
+                "Nix type for clamped field {path}"
+            );
+            continue;
+        }
+        if path == "usage.history_days" {
+            assert_eq!(
+                nix_type,
+                format!(
+                    "lib.types.ints.between 0 {}",
+                    thegn_core::time_policy::MAX_DURATION_DAYS
+                ),
+                "Nix type for clamped field {path}"
+            );
+            continue;
+        }
+        if path == "usage.poll_interval_secs" {
+            assert_eq!(
+                nix_type,
+                format!(
+                    "lib.types.ints.between 60 {}",
+                    thegn_core::time_policy::MAX_CADENCE_SECS
                 ),
                 "Nix type for clamped field {path}"
             );
