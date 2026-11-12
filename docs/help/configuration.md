@@ -490,6 +490,7 @@ silently not applied: `[sandbox]` (and everything nested under it),
 `[identities]`, `[hooks]`, `[lifecycle]`, `[env.*]`, `[host.*]`,
 `[host_discovery]`, `[placement]`, `[plugins]`, `[automations]`,
 `[pipeline]`, `[autopilot]`, `[daemon]`, `[serve]`, `[share]`, `[forward]`,
+`[preview]`,
 `[forges]`, `[git]`, `[editor]`, `[lsp]`, `[metrics]`, `[notifications]`,
 `[clipboard]`, `[apps]`, `[skills]`, `[tasks]`, `[toolchain]`, `[limits]`,
 `[presets]`, `[profiles]`, `[worktree_templates]`, `[watch]`, `[ci]`,
@@ -589,6 +590,10 @@ The `[daemon]` and `[network]` scalar keys are exposed as `daemonEnabled`,
 `daemonIdleExitSecs`, `daemonLeaseGraceSecs`, `daemonStreamGapWindowSecs`,
 `networkOfflineAfterFailures` and `networkRecoveryProbeSecs`. The
 `daemon.socket` path and the `network.mode` enum are not exposed.
+
+The `[preview]` scalar keys are exposed as `previewEnabled`,
+`previewFetchTimeoutMs` and `previewMaxBodyBytes`. The `preview.ports` list and
+the `preview.allow_external_urls` SSRF security opt-in are not exposed.
 
 `keys list` covers the keymap registry **and** the zone-local tables — the
 sidebar's row keys and each panel section's row-mode keys. Those are handled

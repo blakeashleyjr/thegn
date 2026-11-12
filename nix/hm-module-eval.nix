@@ -199,6 +199,9 @@
           daemonStreamGapWindowSecs = 300;
           networkOfflineAfterFailures = 3;
           networkRecoveryProbeSecs = 15;
+          previewEnabled = false;
+          previewFetchTimeoutMs = 1000;
+          previewMaxBodyBytes = 4096;
           agents = [
             {
               name = "shell";
@@ -276,12 +279,16 @@
 
   invalidThemeColor = evalWithOptions {themeColor = "24bit";};
   oversizedThemePanePadding = evalWithOptions {themePanePadding = 65536;};
+  undersizedPreviewFetchTimeout = evalWithOptions {previewFetchTimeoutMs = 99;};
+  oversizedPreviewMaxBodyBytes = evalWithOptions {previewMaxBodyBytes = 16777217;};
 
   minimalConfig = minimal.config.xdg.configFile."thegn/config.toml".source;
   maximalConfig = maximal.config.xdg.configFile."thegn/config.toml".source;
 in
   assert !(builtins.tryEval (builtins.deepSeq invalidThemeColor.config.programs.thegn.themeColor true)).success;
   assert !(builtins.tryEval (builtins.deepSeq oversizedThemePanePadding.config.programs.thegn.themePanePadding true)).success;
+  assert !(builtins.tryEval (builtins.deepSeq undersizedPreviewFetchTimeout.config.programs.thegn.previewFetchTimeoutMs true)).success;
+  assert !(builtins.tryEval (builtins.deepSeq oversizedPreviewMaxBodyBytes.config.programs.thegn.previewMaxBodyBytes true)).success;
   assert minimal.config.home.packages == [thegn];
   assert maximal.config.home.packages == [thegn];
     pkgs.runCommand "thegn-hm-module-eval" {} ''
