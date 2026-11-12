@@ -373,6 +373,9 @@ self: {
     daemon.stream_gap_window_secs = cfg.daemonStreamGapWindowSecs;
     network.offline_after_failures = cfg.networkOfflineAfterFailures;
     network.recovery_probe_secs = cfg.networkRecoveryProbeSecs;
+    preview.enabled = cfg.previewEnabled;
+    preview.fetch_timeout_ms = cfg.previewFetchTimeoutMs;
+    preview.max_body_bytes = cfg.previewMaxBodyBytes;
     log = {
       inherit (cfg.log) level file dir format;
       rotation_size_mb = cfg.log.rotationSizeMb;
@@ -1358,6 +1361,24 @@ in {
       type = lib.types.nullOr (lib.types.ints.between 0 2678400);
       default = null;
       description = "While offline, re-probe for connectivity at most this often (seconds). Unset (null) = the binary's default.";
+    };
+
+    previewEnabled = lib.mkOption {
+      type = lib.types.nullOr (lib.types.bool);
+      default = null;
+      description = "Enable frontend preview discovery and surfaces. This never launches a dev server. Unset (null) = the binary's default.";
+    };
+
+    previewFetchTimeoutMs = lib.mkOption {
+      type = lib.types.nullOr (lib.types.ints.between 100 30000);
+      default = null;
+      description = "Wall-clock limit for one bounded preview HTTP fetch (milliseconds). Unset (null) = the binary's default.";
+    };
+
+    previewMaxBodyBytes = lib.mkOption {
+      type = lib.types.nullOr (lib.types.ints.between 1 16777216);
+      default = null;
+      description = "Maximum response bytes retained by one preview fetch. Unset (null) = the binary's default.";
     };
 
     agents = lib.mkOption {

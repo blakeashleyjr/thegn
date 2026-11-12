@@ -590,6 +590,10 @@ The `[daemon]` and `[network]` scalar keys are exposed as `daemonEnabled`,
 `networkOfflineAfterFailures` and `networkRecoveryProbeSecs`. The
 `daemon.socket` path and the `network.mode` enum are not exposed.
 
+The `[preview]` scalar keys are exposed as `previewEnabled`,
+`previewFetchTimeoutMs` and `previewMaxBodyBytes`. The `preview.ports` list and
+the `preview.allow_external_urls` SSRF security opt-in are not exposed.
+
 `keys list` covers the keymap registry **and** the zone-local tables — the
 sidebar's row keys and each panel section's row-mode keys. Those are handled
 by the focused zone rather than the registry, so they are not rebindable, but
