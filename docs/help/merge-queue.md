@@ -65,7 +65,9 @@ those candidate branches in that order, even when `require_enqueue` is on.
 `--into branch` retargets that ordered fold to an existing local branch, and
 `--from branch` resumes at a named entry after confirming the earlier entries
 are already ancestors of the target. Ordered folds stop at their first
-conflict and print a resume command; `--into` is unavailable in push mode.
+conflict and print a resume command; `--into` folds leave worktrees in place
+until the eventual land of the stack branch, and `--into` is unavailable in
+push mode.
 
 Only branches you **queued** are folded. `--all`, or `[merge_queue]
 require_enqueue = false`, widens it to every _eligible_ worktree branch —
