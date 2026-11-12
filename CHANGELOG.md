@@ -7,6 +7,8 @@ All notable changes to **thegn** are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.1.0-alpha.65] — 2026-11-12
+
 ### Added
 
 - `session snapshot`, `session attach` and `session wait` accept the session id
@@ -3195,7 +3197,8 @@ launcher picker and the merge queue's `agent_command` hook remain — they run
 whatever commands you configure. Leftover `[llm_proxy]` config sections and
 `proxy_*` tables in existing state databases are ignored harmlessly.
 
-[Unreleased]: https://github.com/blakeashleyjr/thegn/compare/v0.1.0-alpha.64...HEAD
+[Unreleased]: https://github.com/blakeashleyjr/thegn/compare/v0.1.0-alpha.65...HEAD
+[0.1.0-alpha.65]: https://github.com/blakeashleyjr/thegn/compare/v0.1.0-alpha.64...v0.1.0-alpha.65
 [0.1.0-alpha.64]: https://github.com/blakeashleyjr/thegn/compare/v0.1.0-alpha.63...v0.1.0-alpha.64
 [0.1.0-alpha.63]: https://github.com/blakeashleyjr/thegn/compare/v0.1.0-alpha.62...v0.1.0-alpha.63
 [0.1.0-alpha.62]: https://github.com/blakeashleyjr/thegn/compare/v0.1.0-alpha.61...v0.1.0-alpha.62
