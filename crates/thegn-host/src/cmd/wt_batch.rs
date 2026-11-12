@@ -251,7 +251,7 @@ fn branch_taken(candidate: &str, taken: &BranchSet, planned: &[String]) -> bool 
 
 #[cfg(test)]
 mod tests {
-    use super::{BatchOptions, read_batch, run, validate_names};
+    use super::{BatchOptions, ValidationOptions, read_batch, run, validate_names};
     use std::path::Path;
     use thegn_core::config::Config;
 
