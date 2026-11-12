@@ -37,6 +37,29 @@ worker a private `/tmp`. The warning does not block the launch; write reports
 and other artifacts under the worktree instead, for example `.thegn/`, because
 files written to the sandbox's `/tmp` disappear when the session ends.
 
+### Keeping a report directory
+
+For a local bwrap/OCI/systemd sandbox, bind a host directory into `/tmp` so
+reports survive the session:
+
+```toml
+[env.pipeline.sandbox]
+mounts = [
+  "/tmp/reports",
+  "~/.gitconfig:ro",
+]
+```
+
+Create the host directory first with `mkdir -p /tmp/reports`. A mount whose
+host source does not exist is skipped silently. The env-level `mounts` list
+replaces the base `[sandbox] mounts` list rather than extending it, so the
+example repeats the default `~/.gitconfig:ro` entry; use
+`[workspace.<slug>] sandbox_mounts` when you want an additive workspace mount.
+This host-directory behavior applies to local bwrap/OCI/systemd placements;
+remote and provider placements do not honor host mounts the same way. Sealed
+profiles still apply their credential deny list, although `/tmp` report paths
+are outside it.
+
 Under `standard`, **everything outside the worktree is read-only —
 including your `$HOME`**, so a sandboxed agent cannot `cd` out and modify
 host files. That is _integrity_ isolation only: the whole `$HOME` stays
