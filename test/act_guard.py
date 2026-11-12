@@ -9,9 +9,16 @@ act's automatic container removal.
 from __future__ import annotations
 
 import os
+try:
+    import pwd
+except ImportError:  # pragma: no cover - pwd is Unix-only
+    pwd = None
 import re
 import subprocess
 import sys
+import tempfile
+from contextlib import redirect_stderr
+from io import StringIO
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -197,13 +204,110 @@ def platform_mappings(tokens: list[str]) -> list[tuple[str, str]]:
     return out
 
 
-def actrc_tokens(actrc: str) -> list[str]:
-    """Whitespace-split tokens of every non-blank, non-comment .actrc line."""
+def _expand_actrc_vars(line: str, env: dict[str, str]) -> str:
+    """Expand variables with the same forms and unset behavior as Go."""
+    special = set("*#$@!?-0123456789")
+
+    def is_ascii_alnum(char: str) -> bool:
+        return (
+            char == "_"
+            or "0" <= char <= "9"
+            or "a" <= char <= "z"
+            or "A" <= char <= "Z"
+        )
+
+    expanded: list[str] = []
+    i = 0
+    while i < len(line):
+        if line[i] != "$" or i + 1 == len(line):
+            expanded.append(line[i])
+            i += 1
+            continue
+        if line[i + 1] == "{":
+            if i + 3 < len(line) and line[i + 2] in special and line[i + 3] == "}":
+                name = line[i + 2]
+                i += 4
+                expanded.append(env.get(name, ""))
+                continue
+            end = line.find("}", i + 2)
+            if end < 0:
+                i += 2
+                continue
+            if end == i + 2:
+                i = end + 1
+                continue
+            name = line[i + 2 : end]
+            i = end + 1
+        else:
+            if line[i + 1] in special:
+                name = line[i + 1]
+                i += 2
+            elif is_ascii_alnum(line[i + 1]):
+                end = i + 2
+                while end < len(line) and is_ascii_alnum(line[end]):
+                    end += 1
+                name = line[i + 1 : end]
+                i = end
+            else:
+                expanded.append(line[i])
+                i += 1
+                continue
+        expanded.append(env.get(name, ""))
+    return "".join(expanded)
+
+
+def actrc_tokens(actrc: str, env: dict[str, str] | None = None) -> list[str]:
+    """Parse act's readArgsFile lines into one flag and one value per line."""
     tokens: list[str] = []
     for line in actrc.splitlines():
-        stripped = line.strip()
-        if stripped and not stripped.startswith("#"):
-            tokens.extend(stripped.split())
+        # Mirrors act cmd/root.go readArgsFile: apply os.ExpandEnv, trim, keep
+        # '-' lines, then split each line into at most two fields.
+        expanded = _expand_actrc_vars(line, os.environ if env is None else env)
+        stripped = expanded.strip()
+        if not stripped.startswith("-"):
+            continue
+        tokens.extend(stripped.split(None, 1))
+    return tokens
+
+
+def user_actrc_paths(env: dict[str, str], platform_name: str = sys.platform) -> list[Path]:
+    """Return act's XDG and home config paths, in its token-prepend order."""
+    home = env.get("HOME")
+    if not home and pwd is not None:
+        try:
+            home = pwd.getpwuid(os.getuid()).pw_dir
+        except (KeyError, OSError):
+            pass
+    xdg_config = env.get("XDG_CONFIG_HOME")
+    if not xdg_config and home:
+        if platform_name == "darwin":
+            xdg_config = str(Path(home) / "Library" / "Application Support")
+        else:
+            xdg_config = str(Path(home) / ".config")
+
+    paths: list[Path] = []
+    if xdg_config:
+        paths.append(Path(xdg_config) / "act" / "actrc")
+    if home:
+        paths.append(Path(home) / ".actrc")
+    return paths
+
+
+def user_actrc_tokens(env: dict[str, str]) -> list[str]:
+    """Read existing user actrc files, failing closed for non-ENOENT errors."""
+    tokens: list[str] = []
+    for path in user_actrc_paths(env):
+        try:
+            text = path.read_text()
+        except FileNotFoundError:
+            continue
+        except (OSError, UnicodeError) as error:
+            raise OSError(
+                getattr(error, "errno", None),
+                getattr(error, "strerror", None) or "cannot decode file",
+                str(path),
+            ) from error
+        tokens.extend(actrc_tokens(text, env))
     return tokens
 
 
@@ -238,10 +342,10 @@ def plan(
 ) -> tuple[list[str] | None, str]:
     """Build guarded act argv, or return a refusal message.
 
-    act prepends `.actrc` tokens to argv, so `actrc_args` count for the credential,
-    reuse and redirect checks but are not added to the built command. The checks scan
-    exactly what act parses, `[*actrc_args, event, *args]`: a dangling value flag at the
-    end of `.actrc` consumes the event, never the first CLI arg.
+    act prepends user and repository `.actrc` tokens to argv, so `actrc_args` count for
+    the credential, reuse and redirect checks but are not added to the built command.
+    The checks scan exactly what act parses, `[*actrc_args, event, *args]`: a dangling
+    value flag at the end of the combined config consumes the next token.
     """
     effective = [*(actrc_args or []), event, *args]
     credentialed = has_credentials(effective) or implicit_secrets
@@ -615,6 +719,168 @@ def self_test() -> int:
     actrc_ok = actrc_ok and argv == ["act", "push", "--rm"]
     cases.append(("actrc-tokens-feed-guard-checks", actrc_ok))
 
+    with tempfile.TemporaryDirectory() as temp_dir:
+        temp_root = Path(temp_dir)
+        home = temp_root / "home"
+        xdg = temp_root / "xdg"
+        (xdg / "act").mkdir(parents=True)
+        home.mkdir()
+        user_env = {"HOME": str(home), "XDG_CONFIG_HOME": str(xdg)}
+        baseline = plan("push", [], None, None)
+        passwd_home = None
+        if pwd is not None:
+            try:
+                passwd_home = Path(pwd.getpwuid(os.getuid()).pw_dir)
+            except (KeyError, OSError):
+                pass
+        cases.append(
+            (
+                "user-actrc-absent-is-unchanged",
+                user_actrc_paths(user_env)
+                == [xdg / "act" / "actrc", home / ".actrc"]
+                and user_actrc_paths({"HOME": str(home)})
+                == [home / ".config" / "act" / "actrc", home / ".actrc"]
+                and user_actrc_paths({})
+                == (
+                    [passwd_home / ".config" / "act" / "actrc", passwd_home / ".actrc"]
+                    if passwd_home is not None
+                    else []
+                )
+                and user_actrc_tokens(user_env) == []
+                and plan("push", [], None, None) == baseline,
+            )
+        )
+        darwin_home = temp_root / "darwin-home"
+        cases.append(
+            (
+                "user-actrc-darwin-config-path",
+                user_actrc_paths({"HOME": str(darwin_home)}, "darwin")
+                == [
+                    darwin_home / "Library" / "Application Support" / "act" / "actrc",
+                    darwin_home / ".actrc",
+                ],
+            )
+        )
+
+        user_actrc = xdg / "act" / "actrc"
+        user_actrc.write_text("--secret T=x\n")
+        user_tokens = user_actrc_tokens(user_env)
+        argv, message = plan(
+            "push", [], [" M .github/workflows/ci.yml"], "abc123", False, user_tokens
+        )
+        cases.append(
+            (
+                "user-actrc-credential-dirty-refused",
+                user_tokens == ["--secret", "T=x"]
+                and argv is None
+                and ".github/workflows/ci.yml" in message,
+            )
+        )
+
+        user_actrc.write_text("--env A=1 --env\n-s T=x\n")
+        two_line_tokens = user_actrc_tokens(user_env)
+        argv, message = plan(
+            "push", [], [" M .github/workflows/ci.yml"], "abc123", False, two_line_tokens
+        )
+        cases.append(
+            (
+                "user-actrc-matches-act-two-field-tokenizer",
+                two_line_tokens == ["--env", "A=1 --env", "-s", "T=x"]
+                and argv is None
+                and ".github/workflows/ci.yml" in message,
+            )
+        )
+
+        expanded_env = {**user_env, "ACT_SECRET_VALUE": "T=x"}
+        user_actrc.write_text("--secret $ACT_SECRET_VALUE\n")
+        cases.append(
+            (
+                "user-actrc-expands-environment-values",
+                user_actrc_tokens(expanded_env) == ["--secret", "T=x"],
+            )
+        )
+
+        flag_env = {**user_env, "ACT_SECRET_FLAG": "-s"}
+        unset_tokens = actrc_tokens("$NOPE-s T=x\n", user_env)
+        direct_tokens = actrc_tokens("-s T=x\n", user_env)
+        set_tokens = actrc_tokens("$ACT_SECRET_FLAG T=x\n", flag_env)
+        unset_argv, unset_message = plan(
+            "push", [], [" M .github/workflows/ci.yml"], "abc123", False, unset_tokens
+        )
+        direct_argv, direct_message = plan(
+            "push", [], [" M .github/workflows/ci.yml"], "abc123", False, direct_tokens
+        )
+        cases.append(
+            (
+                "actrc-expands-before-flag-check-with-unset-and-set-vars",
+                unset_tokens == ["-s", "T=x"]
+                and direct_tokens == ["-s", "T=x"]
+                and set_tokens == ["-s", "T=x"]
+                and unset_argv is None
+                and direct_argv is None
+                and ".github/workflows/ci.yml" in unset_message
+                and ".github/workflows/ci.yml" in direct_message,
+            )
+        )
+
+        user_actrc.write_text("-P ubuntu-latest=img/x:latest\n")
+        executed: list[tuple[str, list[str]]] = []
+        saved_env = os.environ.copy()
+        saved_execvp = os.execvp
+        try:
+            os.environ.clear()
+            os.environ.update(user_env)
+            os.execvp = lambda program, command: executed.append((program, command))
+            image_result = main(["push"])
+        finally:
+            os.execvp = saved_execvp
+            os.environ.clear()
+            os.environ.update(saved_env)
+        cases.append(
+            (
+                "user-actrc-image-pin-is-not-checked",
+                user_actrc_tokens(user_env) == ["-P", "ubuntu-latest=img/x:latest"]
+                and image_result == 127
+                and executed == [("act", ["act", "push", "--rm"])],
+            )
+        )
+
+        user_actrc.unlink()
+        home_actrc = home / ".actrc"
+        home_actrc.mkdir()
+        saved_env = os.environ.copy()
+        unreadable_stderr = StringIO()
+        try:
+            os.environ.clear()
+            os.environ.update(user_env)
+            with redirect_stderr(unreadable_stderr):
+                unreadable_result = main(["push"])
+        finally:
+            os.environ.clear()
+            os.environ.update(saved_env)
+        unreadable_message = unreadable_stderr.getvalue().strip()
+        cases.append(
+            (
+                "unreadable-user-actrc-refused-by-path",
+                unreadable_result == 1
+                and unreadable_message
+                == f"act: cannot read user actrc {home_actrc}; not running"
+                and "TOKEN" not in unreadable_message,
+            )
+        )
+        home_actrc.rmdir()
+
+        user_actrc.write_text("--env\n")
+        repo_tokens = ["--secret", "T=x"]
+        combined_tokens = [*user_actrc_tokens(user_env), *repo_tokens]
+        cases.append(
+            (
+                "user-actrc-tokens-precede-repo-actrc",
+                combined_tokens == ["--env", "--secret", "T=x"]
+                and not has_credentials([*combined_tokens, "push"]),
+            )
+        )
+
     argv, message = plan(
         "push", ["--secret", "T=x", "--container-options", "-v /a:/b"], [], "abc123"
     )
@@ -703,6 +969,14 @@ def main(argv: list[str]) -> int:
 
     event, *args = argv
     try:
+        user_actrc_args = user_actrc_tokens(dict(os.environ))
+    except OSError as error:
+        print(
+            f"act: cannot read user actrc {error.filename}; not running",
+            file=sys.stderr,
+        )
+        return 1
+    try:
         actrc_text: str | None = (ROOT / ".actrc").read_text()
     except OSError:
         actrc_text = None
@@ -711,7 +985,7 @@ def main(argv: list[str]) -> int:
         print(refusal, file=sys.stderr)
         return 1
     implicit_secrets = (ROOT / ".secrets").exists()
-    actrc_args = actrc_tokens(actrc_text) if actrc_text else []
+    actrc_args = [*user_actrc_args, *(actrc_tokens(actrc_text) if actrc_text else [])]
     if has_credentials([*actrc_args, event, *args]) or implicit_secrets:
         dirty = dirty_paths()
         head = head_sha()
