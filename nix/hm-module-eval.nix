@@ -129,13 +129,16 @@
           drawerPoolLimit = 2;
           drawerPrewarm = false;
           stripVisible = false;
+          gitBackend = "cli";
           gitOverrideGpg = true;
           gitMergeGuard = false;
           gitAutoFetch = false;
           gitAutoFetchIntervalSecs = 600;
           gitAutoFetchMinIntervalSecs = 120;
           gitAutoFetchNotify = true;
+          gitStructuralDiff = "difft";
           gitAutoFetchColocated = true;
+          gitSubmodules = "off";
           statsCpuIcon = "C";
           statsMemIcon = "M";
           statsNetIcon = "N";
