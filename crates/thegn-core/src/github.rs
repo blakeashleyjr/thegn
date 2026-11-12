@@ -14,6 +14,11 @@ use crate::forge::checkout::{ForgeCheckoutScope, checkout_scope, checkout_scope_
 use crate::forge::model::*;
 use crate::remote::GitLoc;
 use serde::Deserialize;
+use std::sync::atomic::AtomicBool;
+use std::time::Duration;
+
+const WHOAMI_TIMEOUT: Duration = Duration::from_secs(3);
+const GH_PROBE_OUTPUT_CAP: usize = 4096;
 
 /// Run `gh <args>` with `cwd = worktree` (local, or over ssh on the remote host);
 /// trimmed stdout on success, else a classified error.
@@ -25,6 +30,61 @@ pub fn gh_out(loc: &GitLoc, args: &[&str]) -> Result<String, GhError> {
     Err(classify(
         &String::from_utf8_lossy(&out.stderr).to_lowercase(),
     ))
+}
+
+/// Run the short-lived `gh` identity probe with a deadline and bounded capture.
+/// Other `gh` operations intentionally keep using [`gh_out`]: PR and merge
+/// operations may legitimately take longer than a doctor/onboarding probe.
+fn gh_out_bounded(loc: &GitLoc, args: &[&str], timeout: Duration) -> Result<String, GhError> {
+    let mut command = loc.gh_command(args);
+    let limits = thegn_proc::Limits {
+        stdout: thegn_proc::Stream::Head {
+            cap: GH_PROBE_OUTPUT_CAP,
+        },
+        stderr: thegn_proc::Stream::Head {
+            cap: GH_PROBE_OUTPUT_CAP,
+        },
+        ..thegn_proc::Limits::silent(timeout)
+    };
+    let run = thegn_proc::run(&mut command, &limits, &AtomicBool::new(false));
+    match run.end {
+        thegn_proc::End::Spawn(error) => Err(spawn_err(error)),
+        thegn_proc::End::TimedOut => Err(GhError::Other(format!(
+            "gh timed out after {}s",
+            timeout.as_secs_f64()
+        ))),
+        thegn_proc::End::LeaderExited => match run.leader {
+            thegn_proc::Leader::Reaped(status)
+                if status.success()
+                    && run.group == thegn_proc::GroupState::Drained
+                    && run.stdout.eof =>
+            {
+                Ok(String::from_utf8_lossy(&run.stdout.bytes)
+                    .trim()
+                    .to_string())
+            }
+            thegn_proc::Leader::Reaped(status) if status.success() => Err(GhError::Other(
+                "gh exited but a child process kept running or held its output open".into(),
+            )),
+            thegn_proc::Leader::Reaped(_) => Err(classify(
+                &String::from_utf8_lossy(&run.stderr.bytes).to_lowercase(),
+            )),
+            leader => Err(GhError::Other(format!(
+                "gh exited but its leader was not reaped: {leader:?}"
+            ))),
+        },
+        thegn_proc::End::Cancelled => Err(GhError::Other("gh probe was cancelled".into())),
+        thegn_proc::End::OutputLimit(which) => Err(GhError::Other(format!(
+            "gh probe exceeded its {which:?} output bound"
+        ))),
+        thegn_proc::End::Supervise(error) => Err(GhError::Other(format!(
+            "gh probe could not be supervised: {error}"
+        ))),
+    }
+}
+
+fn whoami_with_timeout(loc: &GitLoc, timeout: Duration) -> Result<String, GhError> {
+    gh_out_bounded(loc, &["api", "user", "--jq", ".login"], timeout)
 }
 
 /// Run `gh <args>` for its exit code (output discarded). Errors classified.
@@ -464,6 +524,112 @@ const THREADS_QUERY: &str = "query($owner:String!,$name:String!,$number:Int!){\
 repository(owner:$owner,name:$name){pullRequest(number:$number){\
 reviewThreads(first:20){nodes{isResolved comments(first:1){nodes{\
 author{login} path line body createdAt}}}}}}}";
+
+#[cfg(test)]
+mod bounded_probe_tests {
+    use super::{GhError, whoami_with_timeout};
+    use crate::remote::GitLoc;
+    use std::process::Command;
+    use std::time::{Duration, Instant};
+
+    #[test]
+    fn whoami_bounded_times_out_and_kills_the_gh_process_group() {
+        if !crate::testenv::require_or_skip("Unix shell process-group fixture", !cfg!(windows)) {
+            return;
+        }
+        let bin = tempfile::tempdir().unwrap();
+        let worktree = tempfile::tempdir().unwrap();
+        let gh = bin.path().join("gh");
+        std::fs::write(
+            &gh,
+            "#!/bin/sh\nsleep 30 &\nprintf '%s\\n' \"$!\" > \"$GH_SLEEP_PID_FILE\"\nwait\n",
+        )
+        .unwrap();
+        if crate::fsperm::set_mode_for_test(&gh, 0o755).is_err() {
+            return;
+        }
+        let pid_file = bin.path().join("sleep.pid");
+        let old_path = std::env::var_os("PATH").unwrap_or_default();
+        let path = format!("{}:{}", bin.path().display(), old_path.to_string_lossy());
+        let pid_path = pid_file.to_string_lossy().into_owned();
+        let _env =
+            crate::testenv::EnvGuard::set(&[("PATH", &path), ("GH_SLEEP_PID_FILE", &pid_path)]);
+
+        let started = Instant::now();
+        let error = whoami_with_timeout(
+            &GitLoc::Local(worktree.path().to_path_buf()),
+            Duration::from_secs(1),
+        )
+        .unwrap_err();
+        assert!(started.elapsed() < Duration::from_secs(10));
+        assert!(matches!(error, GhError::Other(message) if message.contains("timed out")));
+
+        let pid = std::fs::read_to_string(&pid_file)
+            .expect("fake gh did not record sleep pid")
+            .trim()
+            .parse::<u32>()
+            .expect("fake gh recorded an invalid sleep pid");
+        let gone_by = Instant::now() + Duration::from_secs(2);
+        loop {
+            let alive = Command::new("kill")
+                .args(["-0", &pid.to_string()])
+                .status()
+                .expect("kill is available for the Unix fixture");
+            if !alive.success() {
+                break;
+            }
+            assert!(
+                Instant::now() < gone_by,
+                "sleep child survived bounded gh probe"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    #[test]
+    fn bounded_gh_probe_rejects_successful_leader_with_live_child() {
+        if !crate::testenv::require_or_skip("Unix shell process-group fixture", !cfg!(windows)) {
+            return;
+        }
+        let bin = tempfile::tempdir().unwrap();
+        let worktree = tempfile::tempdir().unwrap();
+        let gh = bin.path().join("gh");
+        std::fs::write(&gh, "#!/bin/sh\nsleep 30 &\nexit 0\n").unwrap();
+        if crate::fsperm::set_mode_for_test(&gh, 0o755).is_err() {
+            return;
+        }
+        let old_path = std::env::var_os("PATH").unwrap_or_default();
+        let path = format!("{}:{}", bin.path().display(), old_path.to_string_lossy());
+        let _env = crate::testenv::EnvGuard::set(&[("PATH", &path)]);
+
+        let error = whoami_with_timeout(
+            &GitLoc::Local(worktree.path().to_path_buf()),
+            Duration::from_secs(1),
+        )
+        .unwrap_err();
+        assert_eq!(
+            error,
+            GhError::Other(
+                "gh exited but a child process kept running or held its output open".into()
+            )
+        );
+    }
+
+    #[test]
+    fn bounded_gh_probe_maps_spawn_failure() {
+        let worktree = tempfile::tempdir().unwrap();
+        let empty_path = tempfile::tempdir().unwrap();
+        let path = empty_path.path().to_string_lossy().into_owned();
+        let _env = crate::testenv::EnvGuard::set(&[("PATH", &path)]);
+        let error = super::gh_out_bounded(
+            &GitLoc::Local(worktree.path().to_path_buf()),
+            &["api", "user"],
+            Duration::from_millis(50),
+        )
+        .unwrap_err();
+        assert_eq!(error, GhError::NotInstalled);
+    }
+}
 
 /// Fetch the viewer's GitHub notification threads (`gh api notifications` —
 /// unread, participating). The caller filters to @mentions for this repo via
@@ -1164,7 +1330,7 @@ impl Forge for GithubCli {
         }
     }
     fn whoami(&self, loc: &GitLoc) -> Result<String, GhError> {
-        gh_out(loc, &["api", "user", "--jq", ".login"])
+        whoami_with_timeout(loc, WHOAMI_TIMEOUT)
     }
 
     fn pr_authorship(

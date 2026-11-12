@@ -556,8 +556,12 @@ the periodic auto-fetch poll. The `[stats]` masthead widgets take
 `statsCpuIcon`, `statsMemIcon`, `statsNetIcon`, `statsGpuIcon`, `statsTempIcon`,
 `statsSwapIcon`, `statsFreqIcon`, `statsLoadIcon`, `statsUptimeIcon`,
 `statsBatteryIcon`, `statsBatteryChargingIcon` and `statsDiskIcon` (text or a
-symbol), plus `statsDiskPath` (the filesystem the disk widget measures; empty
-means the filesystem holding the worktrees directory).
+symbol), plus `statsBatteryWarn`, `statsDiskFreeWarn`,
+`statsDiskFreeCritical` and `statsDiskPath` (the filesystem the disk widget
+measures; empty means the filesystem holding the worktrees directory). The
+thresholds accept values from 0 through 255. The `stats.refresh_secs`,
+`stats.refresh_rates`, `stats.alerts` and `stats.net_icons` settings remain
+omitted.
 
 The `[notifications]` booleans are `notificationsDesktop`,
 `notificationsSurfaceSelfLogErrors`, `notificationsGithubMentions`,
