@@ -128,6 +128,28 @@ const GH_DEADLINE_TABLE: &[GhDeadlineRule] = &[
 
 fn deadline_for(args: &[&str]) -> (Duration, usize) {
     if args.first() == Some(&"api") {
+        if args.get(1) == Some(&"graphql") {
+            let field_flags = ["-f", "-F", "--field", "--raw-field"];
+            let mut index = 2;
+            while index < args.len() {
+                let arg = args[index];
+                let field_value = if field_flags.contains(&arg) {
+                    args.get(index + 1).copied()
+                } else {
+                    ["-f=", "-F=", "--field=", "--raw-field="]
+                        .iter()
+                        .find_map(|prefix| arg.strip_prefix(prefix))
+                };
+                if let Some(document) = field_value.and_then(|value| value.strip_prefix("query=")) {
+                    return if document.trim_start().starts_with("mutation") {
+                        (GH_MUTATION_TIMEOUT, GH_MUTATION_OUTPUT_CAP)
+                    } else {
+                        (GH_READ_TIMEOUT, GH_READ_OUTPUT_CAP)
+                    };
+                }
+                index += if field_flags.contains(&arg) { 2 } else { 1 };
+            }
+        }
         let mut index = 1;
         while index < args.len() {
             let arg = args[index];
@@ -689,6 +711,24 @@ mod deadline_tests {
             ["issue", "comment"].as_slice(),
             ["api", "notifications"].as_slice(),
             ["api", "user", "--method", "GET"].as_slice(),
+            [
+                "api",
+                "graphql",
+                "-f",
+                "query=query($owner:String!){x}",
+                "-f",
+                "owner=o",
+            ]
+            .as_slice(),
+            [
+                "api",
+                "graphql",
+                "--hostname",
+                "h",
+                "-f",
+                "query=query{viewer{login}}",
+            ]
+            .as_slice(),
             ["search", "prs"].as_slice(),
         ];
         for args in read_only {
@@ -719,6 +759,15 @@ mod deadline_tests {
             ["run", "rerun"].as_slice(),
             ["workflow", "run"].as_slice(),
             ["api", "graphql", "-f", "query=mutation"].as_slice(),
+            [
+                "api",
+                "graphql",
+                "-f",
+                "query=mutation($threadId:ID!){x}",
+                "-f",
+                "threadId=1",
+            ]
+            .as_slice(),
             ["api", "repos/x/y", "-F", "number=1"].as_slice(),
             ["api", "repos/x/y", "-X", "POST"].as_slice(),
             ["api", "repos/x/y", "--method", "PATCH"].as_slice(),
@@ -782,14 +831,12 @@ mod bounded_probe_tests {
         let error = gh_bounded(
             &GitLoc::Local(worktree.path().to_path_buf()),
             &["pr", "list"],
-            Duration::from_millis(200),
+            Duration::from_secs(1),
             4096,
         )
         .unwrap_err();
         assert!(started.elapsed() < Duration::from_secs(10));
-        assert!(
-            matches!(error, GhError::Other(message) if message == "gh pr timed out after 0.2s")
-        );
+        assert!(matches!(error, GhError::Other(message) if message == "gh pr timed out after 1s"));
         let pid = std::fs::read_to_string(&pid_file)
             .expect("fake gh did not record its pid")
             .trim()
