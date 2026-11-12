@@ -322,7 +322,10 @@ self: {
     stats.uptime_icon = cfg.statsUptimeIcon;
     stats.battery_icon = cfg.statsBatteryIcon;
     stats.battery_charging_icon = cfg.statsBatteryChargingIcon;
+    stats.battery_warn = cfg.statsBatteryWarn;
     stats.disk_icon = cfg.statsDiskIcon;
+    stats.disk_free_warn = cfg.statsDiskFreeWarn;
+    stats.disk_free_critical = cfg.statsDiskFreeCritical;
     stats.disk_path = cfg.statsDiskPath;
     notifications.desktop = cfg.notificationsDesktop;
     notifications.surface_self_log_errors = cfg.notificationsSurfaceSelfLogErrors;
@@ -1062,10 +1065,28 @@ in {
       description = "Battery-charging masthead stats-widget icon; text or a symbol. Unset (null) = the binary's default.";
     };
 
+    statsBatteryWarn = lib.mkOption {
+      type = lib.types.nullOr (lib.types.ints.u8);
+      default = null;
+      description = "Battery percentage at/below which the widget turns red. Unset (null) = the binary's default.";
+    };
+
     statsDiskIcon = lib.mkOption {
       type = lib.types.nullOr (lib.types.str);
       default = null;
       description = "Disk masthead stats-widget icon; text or a symbol. Unset (null) = the binary's default.";
+    };
+
+    statsDiskFreeWarn = lib.mkOption {
+      type = lib.types.nullOr (lib.types.ints.u8);
+      default = null;
+      description = "Free-disk percentage at/below which the disk widget turns amber. Unset (null) = the binary's default.";
+    };
+
+    statsDiskFreeCritical = lib.mkOption {
+      type = lib.types.nullOr (lib.types.ints.u8);
+      default = null;
+      description = "Free-disk percentage at/below which the disk widget turns red. Unset (null) = the binary's default.";
     };
 
     statsDiskPath = lib.mkOption {
