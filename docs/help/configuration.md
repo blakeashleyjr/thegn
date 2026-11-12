@@ -594,6 +594,10 @@ The `[preview]` scalar keys are exposed as `previewEnabled`,
 `previewFetchTimeoutMs` and `previewMaxBodyBytes`. The `preview.ports` list and
 the `preview.allow_external_urls` SSRF security opt-in are not exposed.
 
+The `[lsp]` scalar keys are exposed as `lspEnabled`, `lspHover` and
+`lspRequireContainment`. The `lsp.servers` registry entries are not exposed
+because they carry executable commands.
+
 The `[usage]` scalar keys are exposed as `usageEnabled`, `usageStatusbar`,
 `usageDiscoverProfiles`, `usageTokenRollups`, `usageHistoryDays` and
 `usagePollIntervalSecs`. The float thresholds

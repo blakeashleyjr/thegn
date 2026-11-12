@@ -215,7 +215,10 @@ const OMITTED: &[(&str, &str)] = &[
         "strip ratio is an f32 range that needs float pinning and is not exposed",
     ),
     ("panel", "panel layout is not exposed"),
-    ("lsp", "language-server configuration is not exposed"),
+    (
+        "lsp.servers",
+        "language-server registry entries carry executables and are not exposed",
+    ),
     ("semantic", "semantic indexing is not exposed"),
     (
         "daemon.socket",
@@ -780,6 +783,7 @@ fn every_schema_key_is_rendered_or_dispositioned() {
         "network",
         "preview",
         "usage",
+        "lsp",
         "host_discovery",
         "host_discovery.tailnet",
         "sandbox.remote",
@@ -1352,6 +1356,28 @@ fn hm_usage_and_tailnet_keys_are_rendered_and_rest_dispositioned() {
             );
         }
     }
+}
+
+#[test]
+fn hm_lsp_scalar_keys_are_rendered_and_rest_dispositioned() {
+    let rendered = rendered_paths(&module_src());
+    for path in ["lsp.enabled", "lsp.hover", "lsp.require_containment"] {
+        assert!(rendered.contains(path), "Home Manager must render {path}");
+    }
+
+    let omissions: BTreeSet<&str> = OMITTED.iter().map(|(path, _)| *path).collect();
+    let schema = schema_field("lsp");
+    let properties = schema["properties"]
+        .as_object()
+        .expect("lsp schema properties");
+    for key in properties.keys() {
+        let path = format!("lsp.{key}");
+        assert!(
+            rendered.contains(&path) || omissions.contains(path.as_str()),
+            "{path} must be rendered or dispositioned by an exact ledger row"
+        );
+    }
+    assert!(omissions.contains("lsp.servers"));
 }
 
 #[test]

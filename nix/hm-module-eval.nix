@@ -208,6 +208,9 @@
           usageTokenRollups = true;
           usageHistoryDays = 30;
           usagePollIntervalSecs = 600;
+          lspEnabled = false;
+          lspHover = false;
+          lspRequireContainment = true;
           hostDiscoveryTailnetEnabled = true;
           hostDiscoveryTailnetOnlineOnly = false;
           agents = [
