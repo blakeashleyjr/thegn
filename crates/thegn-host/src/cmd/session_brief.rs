@@ -31,7 +31,7 @@ pub(crate) fn resolve_brief(
 
     let path = Path::new(path);
     let display_path = path.display().to_string();
-    let mut file = std::fs::File::open(path)
+    let file = std::fs::File::open(path)
         .with_context(|| format!("reading brief file `{display_path}`"))?;
     let mut bytes = Vec::new();
     file.take((MAX_BRIEF_FILE_BYTES + 1) as u64)
