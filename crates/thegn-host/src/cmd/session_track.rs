@@ -64,9 +64,9 @@ pub(crate) fn insert_and_start(
 }
 
 /// Record one non-root `land` in the plain roster, without making tracking
-/// authoritative for Git. A prior plain land row for this worktree is
-/// idempotent; another active row (including a pipeline row) is reused rather
-/// than creating a second active dispatch.
+/// authoritative for Git. A prior plain land row is idempotent only when it
+/// already has the same terminal outcome; another owner's active row is left
+/// untouched rather than creating or changing a dispatch.
 pub(crate) fn track_integration(
     db: &Db,
     worktree: &str,
@@ -82,15 +82,23 @@ pub(crate) fn track_integration(
     let existing_plain = rows.iter().rev().find(|row| {
         row.worktree_path == canonical_worktree && row.stage.is_none() && row.agent_name == "land"
     });
-    if existing_plain.is_some_and(|row| !row.status.is_active()) {
+    let active = rows
+        .iter()
+        .rev()
+        .find(|row| row.worktree_path == canonical_worktree && row.status.is_active());
+    if active.is_some_and(|row| row.agent_name != "land" || row.stage.is_some()) {
         return Ok(());
     }
 
-    let row_id = if let Some(row) = existing_plain.or_else(|| {
-        rows.iter()
-            .rev()
-            .find(|row| row.worktree_path == canonical_worktree && row.status.is_active())
-    }) {
+    let target = match outcome {
+        IntegrationOutcome::Landed => AgentDispatchStatus::Done,
+        IntegrationOutcome::RefusedGate => AgentDispatchStatus::Failed,
+    };
+    if existing_plain.is_some_and(|row| !row.status.is_active() && row.status == target) {
+        return Ok(());
+    }
+
+    let row_id = if let Some(row) = active {
         row.id
     } else {
         insert_and_start(
@@ -100,10 +108,6 @@ pub(crate) fn track_integration(
             "land",
             &format!("land-{}", std::process::id()),
         )?
-    };
-    let target = match outcome {
-        IntegrationOutcome::Landed => AgentDispatchStatus::Done,
-        IntegrationOutcome::RefusedGate => AgentDispatchStatus::Failed,
     };
     let current = db
         .get_dispatch(row_id)?
@@ -414,7 +418,7 @@ mod tests {
     }
 
     #[test]
-    fn track_integration_reuses_an_active_row_for_the_same_worktree() {
+    fn track_integration_does_not_change_a_foreign_active_row() {
         let state = crate::testenv::IsolatedState::new();
         let (_repo_dir, worktree) = git_repo();
         let db = db(&state);
@@ -422,9 +426,26 @@ mod tests {
         insert_and_start(&db, "linear:THE-1980", path, "coder", "session-1980")
             .expect("active row");
         track_integration(&db, path, "tracked", IntegrationOutcome::RefusedGate)
-            .expect("reused land row");
+            .expect("ignored foreign row");
         let rows = db.list_dispatches().expect("roster list");
         assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].status, AgentDispatchStatus::Running);
+        assert_eq!(rows[0].agent_name, "coder");
+    }
+
+    #[test]
+    fn track_integration_records_a_new_outcome_after_a_different_terminal_one() {
+        let state = crate::testenv::IsolatedState::new();
+        let (_repo_dir, worktree) = git_repo();
+        let db = db(&state);
+        let path = worktree.to_str().expect("utf8 worktree");
+        track_integration(&db, path, "tracked", IntegrationOutcome::RefusedGate)
+            .expect("refused land row");
+        track_integration(&db, path, "tracked", IntegrationOutcome::Landed)
+            .expect("successful land row");
+        let rows = db.list_dispatches().expect("roster list");
+        assert_eq!(rows.len(), 2);
         assert_eq!(rows[0].status, AgentDispatchStatus::Failed);
+        assert_eq!(rows[1].status, AgentDispatchStatus::Done);
     }
 }
