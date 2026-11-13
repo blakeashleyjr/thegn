@@ -971,7 +971,10 @@ fn join_artists_bounded<'a>(names: impl IntoIterator<Item = &'a str>) -> String 
         if out.len() >= MAX_FIELD_BYTES {
             break;
         }
-        if !out.is_empty() && out.len() + 2 < MAX_FIELD_BYTES {
+        if !out.is_empty() {
+            if out.len() + 2 >= MAX_FIELD_BYTES {
+                break;
+            }
             out.push_str(", ");
         }
         if crate::helper::push_bounded(&mut out, name, MAX_FIELD_BYTES) {

@@ -10,6 +10,7 @@ use crate::{MediaCaps, MediaError};
 /// Fold raw SMTC metadata into the normalized state while it is still in the
 /// pure, Linux-testable decoder. WinRT's `HSTRING` values are provider input;
 /// clip them before they cross into the rest of the media pipeline.
+#[allow(clippy::too_many_arguments)] // pure decoder mirrors the WinRT reads 1:1
 pub(crate) fn decode_metadata(
     player: &str,
     title: &str,

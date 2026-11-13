@@ -251,9 +251,11 @@ fn parse_line(line: &str) -> Result<MediaState, MediaError> {
         .into_iter()
         .enumerate()
         .map(|(index, field)| {
-            let cap = (index == 12)
-                .then_some(MAX_ID_BYTES)
-                .unwrap_or(MAX_FIELD_BYTES);
+            let cap = if index == 12 {
+                MAX_ID_BYTES
+            } else {
+                MAX_FIELD_BYTES
+            };
             unescape_markup(field, cap)
         })
         .collect::<Result<Vec<_>, _>>()?;
