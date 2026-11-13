@@ -943,6 +943,8 @@ fn clamp_limits(
         memory: _,
         cpu_total,
         memory_total,
+        heavy_slots: _,
+        max_load: _,
     } = req;
     if let Some(ref mem) = req.memory {
         match (
@@ -2276,6 +2278,8 @@ mod tests {
             memory: Some("2g".into()),
             cpu_total: None,
             memory_total: None,
+            heavy_slots: 0,
+            max_load: 0.0,
         };
         let mut o = overlay();
         o.limits = Some(SandboxLimits {
@@ -2283,6 +2287,8 @@ mod tests {
             memory: Some("512m".into()),
             cpu_total: None,
             memory_total: None,
+            heavy_slots: 0,
+            max_load: 0.0,
         });
         let r = classify_repo_overlay(o, &b, &Approvals::deny_all());
         let lim = r.sanctioned.limits.unwrap();
@@ -2301,6 +2307,8 @@ mod tests {
             memory: None,
             cpu_total: Some("4".into()),
             memory_total: None,
+            heavy_slots: 0,
+            max_load: 0.0,
         };
 
         // A repo requesting "off" (disable the aggregate cap) is denied +
@@ -2777,6 +2785,8 @@ mod tests {
             memory: Some("512m".into()),
             cpu_total: Some("2".into()),
             memory_total: Some("4g".into()),
+            heavy_slots: 0,
+            max_load: 0.0,
         };
         let mut events = Vec::new();
         let granted = clamp_limits(&request, &unbounded, &mut events, TrustLevel::Repo);
@@ -2791,12 +2801,16 @@ mod tests {
             memory: Some("1g".into()),
             cpu_total: Some("4".into()),
             memory_total: Some("8g".into()),
+            heavy_slots: 0,
+            max_load: 0.0,
         };
         let invalid = SandboxLimits {
             cpu: Some("many".into()),
             memory: Some("much".into()),
             cpu_total: Some("off".into()),
             memory_total: Some("off".into()),
+            heavy_slots: 0,
+            max_load: 0.0,
         };
         let mut events = Vec::new();
         let kept = clamp_limits(&invalid, &trusted, &mut events, TrustLevel::Repo);
@@ -2811,6 +2825,8 @@ mod tests {
             memory: Some("2g".into()),
             cpu_total: Some("8".into()),
             memory_total: Some("16g".into()),
+            heavy_slots: 0,
+            max_load: 0.0,
         };
         let mut events = Vec::new();
         let kept = clamp_limits(&wider, &trusted, &mut events, TrustLevel::Repo);
@@ -2822,6 +2838,8 @@ mod tests {
             memory: None,
             cpu_total: None,
             memory_total: Some("2g".into()),
+            heavy_slots: 0,
+            max_load: 0.0,
         };
         let mut events = Vec::new();
         let tightened = clamp_limits(&narrower, &trusted, &mut events, TrustLevel::Repo);

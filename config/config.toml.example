@@ -3170,6 +3170,8 @@ on_floor_miss = "fail"
 # memory       = "4g"
 # cpu_total    = "auto"
 # memory_total = ""
+# heavy_slots  = 2       # concurrent host-local heavyweight gates (0 = off)
+# max_load     = 0.0     # absolute 1-minute load average ceiling (0 = off)
 
 # ── Named volumes (OCI only) ──────────────────────────────────────────────────
 # Persistent volumes that survive container recreations.
