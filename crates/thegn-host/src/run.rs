@@ -3172,9 +3172,9 @@ enum GitDoc {
         path: String,
         result: std::result::Result<gitui::StageDocState, String>,
     },
-    /// A paused rebase's live state, preserving read errors; `Ok(None)` means
-    /// the pause vanished before the read landed.
-    Rebase(std::result::Result<Option<thegn_svc::git::RebaseStatus>, String>),
+    /// A paused rebase's live state, preserving unknown sequencer state;
+    /// `NotRunning` means the pause vanished before the read landed.
+    Rebase(std::result::Result<thegn_svc::git::RebaseState, String>),
     /// A selected-commit interactive rebase plan, keyed by its base.
     RebasePlan {
         base: String,
@@ -3201,7 +3201,7 @@ enum GitDoc {
 
 fn apply_rebase_doc(
     flow: &mut GitFlow,
-    doc: std::result::Result<Option<thegn_svc::git::RebaseStatus>, String>,
+    doc: std::result::Result<thegn_svc::git::RebaseState, String>,
 ) -> Option<String> {
     let GitFlow::Rebase(rebase) = flow else {
         return None;
@@ -3211,7 +3211,7 @@ fn apply_rebase_doc(
             rebase.todos_synced = false;
             Some(error)
         }
-        Ok(Some(status)) if rebase.running => {
+        Ok(thegn_svc::git::RebaseState::Running(status)) if rebase.running => {
             rebase.todos = status.remaining.clone();
             rebase.baseline = status.remaining;
             rebase.todos_synced = true;
@@ -3220,6 +3220,12 @@ fn apply_rebase_doc(
             rebase.conflict = status.paused == thegn_svc::git::PauseReason::Conflict;
             rebase.cursor = rebase.cursor.min(rebase.todos.len().saturating_sub(1));
             None
+        }
+        // An unknown sequencer must not be treated as absence: retain the
+        // editor and its last-known todo until a later probe is conclusive.
+        Ok(thegn_svc::git::RebaseState::Unknown(reason)) => {
+            rebase.todos_synced = false;
+            Some(reason)
         }
         // The pause vanished before the read landed (for example, a fast
         // --continue elsewhere); hydration's banner sync clears the flow.

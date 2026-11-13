@@ -44,7 +44,7 @@ pub use custom::{
 pub use patch::PatchOps;
 pub use plumbing::{CasOutcome, MergeTreeOutcome, PlumbingOps};
 pub use read_budget::{ReadPriority, current_read_priority, with_read_priority};
-pub use rebase::{PauseReason, RebaseOps, RebaseOpts, RebaseOutcome, RebaseStatus};
+pub use rebase::{PauseReason, RebaseOps, RebaseOpts, RebaseOutcome, RebaseState, RebaseStatus};
 pub use stage::StageOps;
 pub use stash::StashOps;
 pub use undo::UndoOps;
