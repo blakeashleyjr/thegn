@@ -28,6 +28,10 @@ use std::path::{Path, PathBuf};
 
 const OWNER_MANIFEST: &str = ".thegn-account-owner";
 const OWNER_MANIFEST_LIMIT: u64 = 4 * 1024;
+// `fsperm::PrivateDir::write_owner_only_atomic` uses this prefix for its
+// same-directory temporary. A freshly claimed home can contain only residue
+// from this claim attempt, so it is safe to remove those entries by handle.
+const OWNER_MANIFEST_TEMP_PREFIX: &str = ".secret.tmp-";
 
 /// A managed credential home could not be safely established or verified.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -186,7 +190,26 @@ pub fn create_managed_home(provider_id: &str, name: &str) -> Result<PathBuf, Acc
         }
         Err(error) => return Err(unsafe_path(&path, error)),
     }
-    ensure_managed_home_claiming(provider_id, name, &[])
+    let rel = Path::new("accounts")
+        .join(provider_id)
+        .join(home_component(name));
+    let private = match crate::fsperm::ensure_private_dir_beneath(&anchor, &rel) {
+        Ok(private) => private,
+        Err(error) => {
+            return Err(created_home_error(
+                &path,
+                None,
+                AccountHomeError::UnsafePath {
+                    path: path.clone(),
+                    error: error.to_string(),
+                },
+            ));
+        }
+    };
+    match ensure_managed_home_in_private(&private, provider_id, name, &[]) {
+        Ok(path) => Ok(path),
+        Err(error) => Err(created_home_error(&path, Some(&private), error)),
+    }
 }
 
 fn ensure_managed_home_claiming(
@@ -214,6 +237,15 @@ fn ensure_managed_home_claiming(
             error: error.to_string(),
         }
     })?;
+    ensure_managed_home_in_private(&private, provider_id, name, legacy_aliases)
+}
+
+fn ensure_managed_home_in_private(
+    private: &crate::fsperm::PrivateDir,
+    provider_id: &str,
+    name: &str,
+    legacy_aliases: &[String],
+) -> Result<PathBuf, AccountHomeError> {
     let path = private.path().to_path_buf();
     let manifest = match private.open_regular_nofollow(OWNER_MANIFEST) {
         Ok(file) => {
@@ -287,6 +319,54 @@ fn ensure_managed_home_claiming(
         }
     }
     Ok(path)
+}
+
+/// Roll back only the directory claimed by `create_managed_home` when the
+/// owner manifest could not be established. User-created entries are never
+/// removed, and no recursive deletion is permitted here.
+fn created_home_error(
+    path: &Path,
+    private: Option<&crate::fsperm::PrivateDir>,
+    original: AccountHomeError,
+) -> AccountHomeError {
+    use anyhow::Context as _;
+
+    let rollback = match private {
+        Some(private) => rollback_created_home(private),
+        None => Err(std::io::Error::other(
+            "could not hold the newly created home for rollback",
+        )),
+    };
+    let error = anyhow::Error::new(original).context("managed account home rolled back");
+    let error = match rollback {
+        Ok(()) => error,
+        Err(rollback_error) => error.context(format!("home rollback failed: {rollback_error}")),
+    };
+    AccountHomeError::UnsafePath {
+        path: path.to_path_buf(),
+        error: error.to_string(),
+    }
+}
+
+fn rollback_created_home(private: &crate::fsperm::PrivateDir) -> std::io::Result<()> {
+    for entry in private.file_names()? {
+        let name = entry.to_str().ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "created home contains a non-UTF-8 entry",
+            )
+        })?;
+        if name.starts_with(OWNER_MANIFEST_TEMP_PREFIX) {
+            private.remove_file(name)?;
+        }
+    }
+    if !private.file_names()?.is_empty() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::DirectoryNotEmpty,
+            "created home contains entries; refusing rollback",
+        ));
+    }
+    std::fs::remove_dir(private.path())
 }
 
 /// A `[[accounts]]` entry — one credential home for a coding-agent provider
@@ -1944,5 +2024,112 @@ mod tests {
             Err(AccountHomeError::HomeExists { .. })
         ));
         assert!(!target.exists());
+    }
+
+    #[test]
+    fn create_managed_home_refuses_a_symlinked_parent_component() {
+        let state = crate::testenv::IsolatedState::new();
+        let anchor = state.state_home().join("thegn");
+        std::fs::create_dir_all(&anchor).unwrap();
+        let outside = state.root().join("outside-accounts");
+        std::fs::create_dir(&outside).unwrap();
+        let accounts = anchor.join("accounts");
+        if crate::fsperm::create_symlink(&outside, &accounts, true).is_err() {
+            return;
+        }
+
+        assert!(matches!(
+            create_managed_home("codex", "symlink-parent"),
+            Err(AccountHomeError::UnsafePath { .. })
+        ));
+        assert_eq!(std::fs::read_dir(&outside).unwrap().count(), 0);
+        assert!(!managed_dir("codex", "symlink-parent").exists());
+    }
+
+    #[test]
+    fn create_managed_home_tolerates_a_permissive_parent_mode() {
+        let state = crate::testenv::IsolatedState::new();
+        let anchor = state.state_home().join("thegn");
+        std::fs::create_dir_all(&anchor).unwrap();
+        if crate::fsperm::set_mode_for_test(&anchor, 0o777).is_err() {
+            return;
+        }
+
+        let home = create_managed_home("codex", "permissive-parent").unwrap();
+
+        assert_eq!(
+            std::fs::read(home.join(OWNER_MANIFEST)).unwrap(),
+            owner_manifest("codex", "permissive-parent")
+        );
+    }
+
+    #[test]
+    fn create_managed_home_manifest_failure_rolls_back_and_can_retry() {
+        let _state = crate::testenv::IsolatedState::new();
+        let home = managed_dir("codex", "manifest-failure");
+        let result = crate::fsperm::with_private_write_fault(
+            crate::fsperm::PrivateWriteFault::Write,
+            || create_managed_home("codex", "manifest-failure"),
+        );
+
+        match result {
+            Err(AccountHomeError::UnsafePath { error, .. }) => {
+                assert!(
+                    error.contains("managed account home rolled back"),
+                    "{error}"
+                );
+            }
+            other => panic!("manifest write should fail: {other:?}"),
+        }
+        assert!(!home.exists());
+        assert!(create_managed_home("codex", "manifest-failure").is_ok());
+    }
+
+    #[test]
+    fn create_managed_home_concurrent_creator_with_failure_leaves_a_recoverable_name() {
+        use std::sync::{Arc, Barrier};
+
+        let _state = crate::testenv::IsolatedState::new();
+        let barrier = Arc::new(Barrier::new(2));
+        let failing_barrier = Arc::clone(&barrier);
+        let failing = std::thread::spawn(move || {
+            failing_barrier.wait();
+            crate::fsperm::with_private_write_fault(crate::fsperm::PrivateWriteFault::Write, || {
+                create_managed_home("codex", "concurrent-failure")
+            })
+        });
+        let other_barrier = Arc::clone(&barrier);
+        let other = std::thread::spawn(move || {
+            other_barrier.wait();
+            create_managed_home("codex", "concurrent-failure")
+        });
+        let failing = failing.join().unwrap();
+        let other = other.join().unwrap();
+        assert!(
+            matches!(
+                &failing,
+                Err(AccountHomeError::HomeExists { .. }) | Err(AccountHomeError::UnsafePath { .. })
+            ),
+            "failing creator: {failing:?}"
+        );
+        assert!(
+            matches!(&other, Ok(_) | Err(AccountHomeError::HomeExists { .. })),
+            "other creator: {other:?}"
+        );
+        if let Err(AccountHomeError::UnsafePath { error, .. }) = &failing {
+            assert!(
+                error.contains("managed account home rolled back"),
+                "{error}"
+            );
+        }
+
+        let home = managed_dir("codex", "concurrent-failure");
+        if !home.exists() {
+            create_managed_home("codex", "concurrent-failure").unwrap();
+        }
+        assert_eq!(
+            std::fs::read(home.join(OWNER_MANIFEST)).unwrap(),
+            owner_manifest("codex", "concurrent-failure")
+        );
     }
 }
