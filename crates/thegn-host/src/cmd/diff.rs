@@ -382,6 +382,9 @@ mod tests {
 
     #[test]
     fn default_branch_checked_reports_provider_failures_in_both_exit_arms() {
+        if !crate::platform::sound_process::test_support::UNIX {
+            return;
+        }
         for exit_code in [1, 255] {
             let repo = tempfile::tempdir().expect("provider repo");
             committed_repo(repo.path());

@@ -1876,7 +1876,7 @@ pub(crate) fn spawn_diff_view_fetch(
                 review_status: None,
             };
             if tx.send(data).is_ok() {
-                let _ = waker.wake();
+                let _ = waker.wake(); // best-effort: waker pulse: an input nudge must never fail the calling path
             }
         };
         let base = match crate::cmd::diff::default_branch_checked(&loc) {

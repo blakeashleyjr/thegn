@@ -117,7 +117,12 @@ impl DiffView {
 
     /// Fold a delivered diff in (the loop guards `generation` first).
     pub fn apply_data(&mut self, data: DiffViewData) {
+        let was_unavailable = self.diff.is_none() && matches!(self.structural, Some(Err(_)));
         self.diff = data.diff;
+        if was_unavailable && self.diff.is_some() {
+            self.structural = None;
+            self.show_structural = self.want_structural;
+        }
         if let Some(structural) = data.structural {
             // A structural failure falls back to the internal view; a success
             // shows structurally (respecting a user's prior toggle-off).
@@ -977,6 +982,16 @@ mod tests {
         assert!(body.contains("unavailable: could not read origin HEAD"));
         assert!(!body.contains("Loading diff"));
         assert!(!body.contains("HEAD-only"));
+
+        v.apply_data(DiffViewData {
+            generation: 1,
+            diff: Some(thegn_core::forge::model::parse_unified_diff("")),
+            structural: None,
+            review: None,
+            review_status: None,
+        });
+        let body = format!("{:?}", v.body_lines(40));
+        assert!(!body.contains("unavailable:"));
     }
 
     #[test]
