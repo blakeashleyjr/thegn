@@ -1500,7 +1500,7 @@ mod tests {
                         assert!(after.is_empty(), "forced dirty row must be retired");
                         assert_eq!(report.cleared_rows, vec![wt.to_string_lossy().into_owned()]);
                         assert!(!report.is_incomplete(), "dirty retention is policy");
-                    } else if ordinary_dirty {
+                    } else if ordinary_dirty || force {
                         assert_eq!(after, before, "{state}, force={force}");
                     } else {
                         if matches!(
