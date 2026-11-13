@@ -123,7 +123,7 @@ impl CleanupRetry {
         }
     }
 
-    pub const fn is_due(self, now: i64) -> bool {
+    pub const fn is_due(&self, now: i64) -> bool {
         now >= self.next_at
     }
 }
