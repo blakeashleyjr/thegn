@@ -98,6 +98,20 @@ fn bridge_git_argv(loc: &GitLoc, args: &[&str]) -> Vec<String> {
     argv
 }
 
+fn numstat_diff_args<'a>(base: &'a str) -> [&'a str; 9] {
+    [
+        "-c",
+        "core.quotePath=true",
+        "diff",
+        "--no-ext-diff",
+        "--no-textconv",
+        "--numstat",
+        "-z",
+        "--no-renames",
+        base,
+    ]
+}
+
 // Fetch and push can hold this per-command lock while waiting on a remote.
 // Keep the wait long enough for ordinary transfers without blocking forever.
 const MUTATION_LOCK_WAIT: Duration = Duration::from_secs(120);
@@ -1170,58 +1184,6 @@ fn parse_status_porcelain(out: &str) -> Result<Vec<FileStatus>> {
     Ok(v)
 }
 
-/// Strictly parse `git diff --numstat` output into per-file counts.
-///
-/// Each record is `<added>\t<deleted>\t<path>`. Only git's explicit binary
-/// marker (`-\t-`) means non-text; those rows are kept with zero numeric counts
-/// so callers retain the changed path. Anything else
-/// malformed (missing path, non-decimal or oversized number, a lone `-`) is an
-/// error rather than a plausible zero. Counts beyond `u32::MAX` are rejected
-/// (a single file cannot sensibly exceed it) without allocating for them.
-pub(crate) fn parse_numstat(out: &str) -> Result<Vec<DiffEntry>> {
-    if !out.is_empty() && !out.ends_with('\n') {
-        anyhow::bail!("numstat output truncated: missing final newline");
-    }
-    fn count(s: &str) -> Option<u32> {
-        // Bound the digits before parsing; `u32` needs at most 10.
-        if s.is_empty() || s.len() > 10 || !s.bytes().all(|b| b.is_ascii_digit()) {
-            return None;
-        }
-        s.parse().ok()
-    }
-    let mut v = Vec::new();
-    for line in out.lines() {
-        let mut it = line.splitn(3, '\t');
-        let (a, d, p) = (it.next(), it.next(), it.next());
-        let (Some(a), Some(d), Some(p)) = (a, d, p) else {
-            anyhow::bail!("malformed numstat record: missing fields");
-        };
-        if p.is_empty() {
-            anyhow::bail!("malformed numstat record: empty path");
-        }
-        let path = decode_numstat_path(p);
-        if a == "-" && d == "-" {
-            v.push(DiffEntry {
-                added: 0,
-                deleted: 0,
-                path,
-                binary: true,
-            });
-            continue;
-        }
-        let (Some(added), Some(deleted)) = (count(a), count(d)) else {
-            anyhow::bail!("malformed numstat record: bad line counts");
-        };
-        v.push(DiffEntry {
-            added,
-            deleted,
-            path,
-            binary: false,
-        });
-    }
-    Ok(v)
-}
-
 /// Parse NUL-framed `git diff --numstat -z` output without decoding paths lossily.
 pub(crate) fn parse_numstat_z(out: &[u8]) -> Result<Vec<DiffEntry>> {
     fn count(bytes: &[u8]) -> Option<u32> {
@@ -1508,15 +1470,6 @@ fn quote_c_path(bytes: &[u8]) -> String {
     quoted
 }
 
-/// Decode a Git C-quoted numstat path when it is representable as UTF-8.
-/// Invalid byte paths retain Git's quoted ASCII spelling, avoiding lossy
-/// replacement-character aliases in the string-based panel protocol.
-fn decode_numstat_path(path: &str) -> String {
-    unquote_c_path(path)
-        .and_then(|bytes| String::from_utf8(bytes).ok())
-        .unwrap_or_else(|| path.to_owned())
-}
-
 fn unquote_c_path(path: &str) -> Option<Vec<u8>> {
     let bytes = path.as_bytes();
     if !(bytes.len() >= 2 && bytes.first() == Some(&b'"') && bytes.last() == Some(&b'"')) {
@@ -1629,21 +1582,15 @@ pub fn typed_totals(entries: Result<&[DiffEntry]>) -> (DiffCount, DiffCount) {
     (added, deleted)
 }
 
-/// Sum a `git diff --numstat` output into `(added, deleted)` line totals.
+/// Sum a `git diff --numstat -z` output into `(added, deleted)` line totals.
 /// Binary files contribute nothing; malformed output is an error. Totals
 /// saturate at `u32::MAX`, exactly like the native backend, so the result never
 /// depends on the build profile or backend. Shared by the batched
 /// [`GitBackend::glyph_reads`] sidebar diff-stat reads.
 #[cfg(test)]
-pub(crate) fn sum_numstat(out: &str) -> Result<(u32, u32)> {
-    let entries = parse_numstat(out)?;
+pub(crate) fn sum_numstat(out: &[u8]) -> Result<(u32, u32)> {
+    let entries = parse_numstat_z(out)?;
     Ok(sum_entries(&entries))
-}
-
-/// Parse numstat rows and preserve binary and overflow observations.
-pub(crate) fn typed_numstat(out: &str) -> Result<(DiffCount, DiffCount)> {
-    let entries = parse_numstat(out)?;
-    Ok(typed_totals(Ok(&entries)))
 }
 
 pub(crate) fn typed_numstat_z(out: &[u8]) -> Result<(DiffCount, DiffCount)> {
@@ -2137,6 +2084,8 @@ fn bridged_glyph_reads(loc: &GitLoc, include_submodules: bool) -> Option<GlyphRe
                 "--no-ext-diff",
                 "--no-textconv",
                 "--numstat",
+                "-z",
+                "--no-renames",
                 "HEAD",
             ],
         ];
@@ -2150,6 +2099,8 @@ fn bridged_glyph_reads(loc: &GitLoc, include_submodules: bool) -> Option<GlyphRe
                 "--no-ext-diff",
                 "--no-textconv",
                 "--numstat",
+                "-z",
+                "--no-renames",
                 range.as_str(),
             ]);
             Some(idx)
@@ -2185,7 +2136,7 @@ fn bridged_glyph_reads(loc: &GitLoc, include_submodules: bool) -> Option<GlyphRe
                     ))
                 };
                 let uncommitted = if r[3].exit == 0 {
-                    typed_numstat(&r[3].stdout)
+                    typed_numstat_z(r[3].stdout.as_bytes())
                 } else {
                     Err(anyhow::anyhow!("git diff failed: {}", r[3].stderr.trim()))
                 };
@@ -2193,7 +2144,7 @@ fn bridged_glyph_reads(loc: &GitLoc, include_submodules: bool) -> Option<GlyphRe
                 let branch_diff = if let Some(idx) = branch_diff_idx {
                     r.get(idx)
                         .filter(|res| res.exit == 0)
-                        .map(|res| typed_numstat(&res.stdout))
+                        .map(|res| typed_numstat_z(res.stdout.as_bytes()))
                         .transpose()
                 } else {
                     Ok(None)
@@ -2286,12 +2237,14 @@ fn local_glyph_reads(
                     "--no-ext-diff",
                     "--no-textconv",
                     "--numstat",
+                    "-z",
+                    "--no-renames",
                     "HEAD",
                 ],
             )
             .and_then(|(exit, out)| {
                 anyhow::ensure!(exit == 0, "git diff --numstat HEAD failed");
-                typed_numstat(&out)
+                typed_numstat_z(out.as_bytes())
             })
         },
         branch_diff: match &base {
@@ -2321,10 +2274,16 @@ fn local_glyph_reads(
                     "--no-ext-diff",
                     "--no-textconv",
                     "--numstat",
+                    "-z",
+                    "--no-renames",
                     &format!("{b}...HEAD"),
                 ],
             )
-            .and_then(|(exit, out)| (exit == 0).then(|| typed_numstat(&out)).transpose()),
+            .and_then(|(exit, out)| {
+                (exit == 0)
+                    .then(|| typed_numstat_z(out.as_bytes()))
+                    .transpose()
+            }),
             // No base resolvable — "no badge", not an error.
             None => Ok(None),
         },
@@ -2372,10 +2331,18 @@ fn numstat_totals(loc: &GitLoc, spec: &str) -> Result<(DiffCount, DiffCount)> {
     } else {
         let (exit, out) = run_status(
             loc,
-            &["diff", "--no-ext-diff", "--no-textconv", "--numstat", spec],
+            &[
+                "diff",
+                "--no-ext-diff",
+                "--no-textconv",
+                "--numstat",
+                "-z",
+                "--no-renames",
+                spec,
+            ],
         )?;
         anyhow::ensure!(exit == 0, "git diff --numstat {spec} failed");
-        typed_numstat(&out)
+        typed_numstat_z(out.as_bytes())
     }
 }
 
@@ -2638,26 +2605,12 @@ impl GitBackend for CliGit {
     }
 
     fn diff_files(&self, loc: &GitLoc, base: &str) -> Result<Vec<DiffEntry>> {
-        // Keep Git's C-quoted spelling so invalid UTF-8 paths remain distinct
-        // without passing through String::from_utf8_lossy. Valid UTF-8 quoted
-        // paths are decoded by `parse_numstat` for the status join.
+        // Keep Git's raw path spelling so tabs and newlines remain distinct in
+        // the status join. Invalid UTF-8 is quoted only at the parser boundary.
         let base = op::revision(base)?;
+        let args = numstat_diff_args(base);
         if local_cli(loc) {
-            let out = run_status_bytes(
-                loc,
-                &[
-                    "-c",
-                    "core.quotePath=true",
-                    "diff",
-                    "--no-ext-diff",
-                    "--no-textconv",
-                    "--numstat",
-                    "-z",
-                    "--no-renames",
-                    base,
-                ],
-                true,
-            )?;
+            let out = run_status_bytes(loc, &args, true)?;
             anyhow::ensure!(
                 out.status.success(),
                 "git diff --numstat {base} failed: {}",
@@ -2665,19 +2618,8 @@ impl GitBackend for CliGit {
             );
             parse_numstat_z(&out.stdout)
         } else {
-            let out = run(
-                loc,
-                &[
-                    "-c",
-                    "core.quotePath=true",
-                    "diff",
-                    "--no-ext-diff",
-                    "--no-textconv",
-                    "--numstat",
-                    base,
-                ],
-            )?;
-            parse_numstat(&out)
+            let out = run(loc, &args)?;
+            parse_numstat_z(out.as_bytes())
         }
     }
 
@@ -3046,6 +2988,12 @@ pub(crate) mod testutil {
 
         /// Trimmed stdout of a git command (panics on failure).
         pub fn out(&self, args: &[&str]) -> String {
+            String::from_utf8_lossy(&self.out_bytes(args))
+                .trim()
+                .to_string()
+        }
+
+        pub fn out_bytes(&self, args: &[&str]) -> Vec<u8> {
             let out = git_cmd(&self.dir, args).output().unwrap();
             assert!(
                 out.status.success(),
@@ -3053,7 +3001,7 @@ pub(crate) mod testutil {
                 args.join(" "),
                 String::from_utf8_lossy(&out.stderr)
             );
-            String::from_utf8_lossy(&out.stdout).trim().to_string()
+            out.stdout
         }
 
         /// Commit subjects, newest first.
@@ -3382,6 +3330,24 @@ mod tests {
         );
     }
 
+    #[test]
+    fn numstat_z_diff_argv_pins_quote_path_and_framing() {
+        assert_eq!(
+            numstat_diff_args("HEAD"),
+            [
+                "-c",
+                "core.quotePath=true",
+                "diff",
+                "--no-ext-diff",
+                "--no-textconv",
+                "--numstat",
+                "-z",
+                "--no-renames",
+                "HEAD",
+            ]
+        );
+    }
+
     /// Guard (SCM workflow customization, task 7.5): every stageable diff MUST
     /// keep the sanitized flags — `--no-ext-diff` above all — so a user's
     /// external diff driver (difftastic, delta) can never rewrite a patch the
@@ -3555,20 +3521,20 @@ mod tests {
 
     #[test]
     fn sum_numstat_totals_added_and_deleted() {
-        assert_eq!(sum_numstat("").unwrap(), (0, 0));
-        // `--numstat` is "<added>\t<deleted>\t<path>" per line.
-        let out = "5\t2\tsrc/a.rs\n10\t0\tsrc/b.rs\n";
-        assert_eq!(sum_numstat(out).unwrap(), (15, 2));
+        assert_eq!(sum_numstat(b"").unwrap(), (0, 0));
+        // `--numstat -z` is "<added>\t<deleted>\t<path>\0" per record.
+        let out = [b"5\t2\tsrc/a.rs\0".as_slice(), b"10\t0\tsrc/b.rs\0"].concat();
+        assert_eq!(sum_numstat(&out).unwrap(), (15, 2));
         // Binary files emit "-\t-\t<path>" and contribute nothing.
-        let out = "3\t1\tsrc/a.rs\n-\t-\tlogo.png\n";
+        let out = b"3\t1\tsrc/a.rs\0-\t-\tlogo.png\0";
         assert_eq!(sum_numstat(out).unwrap(), (3, 1));
-        // A path with spaces/tabs still parses (splitn(3) keeps the path intact).
-        assert_eq!(sum_numstat("4\t4\tdir/a b.rs\n").unwrap(), (4, 4));
+        // A path with spaces/tabs remains one NUL-framed record.
+        assert_eq!(sum_numstat(b"4\t4\tdir/a b.rs\0").unwrap(), (4, 4));
     }
 
     #[test]
     fn numstat_binary_rows_are_kept_like_native() {
-        let rows = parse_numstat("1\t2\ta\n-\t-\tb.png\n").unwrap();
+        let rows = parse_numstat_z(b"1\t2\ta\0-\t-\tb.png\0").unwrap();
         assert_eq!(rows.len(), 2);
         assert_eq!(rows[0].path, "a");
         assert_eq!(rows[1].path, "b.png");
@@ -3577,15 +3543,14 @@ mod tests {
     }
 
     #[test]
-    fn parse_numstat_rejects_output_truncated_inside_the_last_row() {
-        let truncated = "1\t2\tpath";
-        let error = parse_numstat(truncated).unwrap_err().to_string();
-        assert!(error.contains("truncated: missing final newline"));
+    fn parse_numstat_z_rejects_output_truncated_inside_the_last_row() {
+        let error = parse_numstat_z(b"1\t2\tpath").unwrap_err().to_string();
+        assert!(error.contains("missing NUL terminator"));
     }
 
     #[test]
-    fn parse_numstat_accepts_empty_output() {
-        assert!(parse_numstat("").unwrap().is_empty());
+    fn parse_numstat_z_accepts_empty_output() {
+        assert!(parse_numstat_z(b"").unwrap().is_empty());
     }
 
     #[test]
@@ -3666,16 +3631,16 @@ mod tests {
     #[test]
     fn numstat_malformed_records_are_errors() {
         for bad in [
-            "1\t2\n",             // missing path
-            "1\t2\t\n",           // empty path
-            "1\n",                // truncated
-            "x\t2\tp\n",          // non-numeric
-            "-\t2\tp\n",          // half binary marker
-            "+1\t2\tp\n",         // not plain decimal
-            "4294967296\t0\tp\n", // above u32::MAX
-            "99999999999999999999999999\t0\tp\n",
+            &b"1\t2\n\0"[..],           // missing path
+            &b"1\t2\t\0"[..],           // empty path
+            &b"1\n\0"[..],              // missing fields
+            &b"x\t2\tp\0"[..],          // non-numeric
+            &b"-\t2\tp\0"[..],          // half binary marker
+            &b"+1\t2\tp\0"[..],         // not plain decimal
+            &b"4294967296\t0\tp\0"[..], // above u32::MAX
+            &b"99999999999999999999999999\t0\tp\0"[..],
         ] {
-            assert!(parse_numstat(bad).is_err(), "{bad:?} must be an error");
+            assert!(parse_numstat_z(bad).is_err(), "{bad:?} must be an error");
         }
     }
 
@@ -3683,11 +3648,12 @@ mod tests {
     fn numstat_boundaries_and_aggregate_overflow_saturate() {
         let max = u32::MAX;
         assert_eq!(
-            sum_numstat(&format!("{}\t{}\tp\n", max - 1, max)).unwrap(),
+            sum_numstat(format!("{}\t{}\tp\0", max - 1, max).as_bytes()).unwrap(),
             (max - 1, max)
         );
         // Two max-sized files overflow the aggregate: saturate, never panic or wrap.
-        let out = format!("{max}\t{max}\ta\n1\t1\tb\n");
+        let mut out = format!("{max}\t{max}\ta\0").into_bytes();
+        out.extend_from_slice(b"1\t1\tb\0");
         assert_eq!(sum_numstat(&out).unwrap(), (max, max));
     }
 
@@ -3785,6 +3751,26 @@ mod tests {
         ];
         expected.sort();
         assert_eq!(paths, expected);
+    }
+
+    #[test]
+    fn numstat_z_cli_rename_preserves_new_path() {
+        let repo = testutil::TestRepo::new("numstat-z-rename");
+        repo.commit_file("old-name.txt", "unchanged\n", "initial");
+        testutil::git_in(&repo.dir, &["mv", "old-name.txt", "new-name.txt"]);
+        testutil::git_in(&repo.dir, &["commit", "-q", "-m", "rename"]);
+
+        let output = repo.out_bytes(&[
+            "diff",
+            "--numstat",
+            "-z",
+            "--find-renames",
+            "HEAD~1",
+            "HEAD",
+        ]);
+        let rows = parse_numstat_z(&output).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].path, "new-name.txt");
     }
 
     #[test]
@@ -5257,14 +5243,15 @@ mod tests {
         );
     }
     #[test]
-    fn typed_numstat_keeps_binary_and_capped() {
+    fn typed_numstat_z_keeps_binary_and_capped() {
         assert_eq!(
-            typed_numstat("-\t-\timage.png\n").unwrap(),
+            typed_numstat_z(b"-\t-\timage.png\0").unwrap(),
             (DiffCount::Binary, DiffCount::Binary)
         );
-        let out = format!("{}\t0\ta\n1\t0\tb\n", u32::MAX);
+        let mut out = format!("{}\t0\ta\0", u32::MAX).into_bytes();
+        out.extend_from_slice(b"1\t0\tb\0");
         assert_eq!(
-            typed_numstat(&out).unwrap(),
+            typed_numstat_z(&out).unwrap(),
             (DiffCount::Capped, DiffCount::Exact(0))
         );
     }
