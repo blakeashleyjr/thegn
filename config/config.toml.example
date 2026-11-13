@@ -4070,6 +4070,8 @@ open_on_detect = false # auto-open the browser (via `browser` above) when a new 
 # secret_key = "env:AWS_SECRET_ACCESS_KEY"  #   | file:/path | bare env-var name
 # server_side_encryption = true              # s3: sign SSE AES256 into every upload; false only for
 #                                            #   S3-compatibles that reject it (never allows http)
+# conditional_create = true                  # s3: sign If-None-Match: * into immutable uploads;
+#                                            #   false for S3-compatibles that reject conditional writes
 
 # ── Placement engine ─────────────────────────────────────────────────────────
 # WHERE each worktree sandbox runs: Dedicated (one sandbox, exclusive host),

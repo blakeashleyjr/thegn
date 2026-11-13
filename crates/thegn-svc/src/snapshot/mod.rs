@@ -21,6 +21,23 @@ use thegn_core::config_env_tables::{SnapshotBackend, SnapshotStoreConfig};
 use thegn_core::secretref::SecretRef;
 use thegn_core::snapshot_meta::{SnapshotKey, SnapshotManifest};
 
+/// An immutable snapshot object already exists at the requested key.
+///
+/// Backends use this typed error for conditional-create conflicts so callers
+/// can distinguish a generation collision from a retryable transport failure.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SnapshotAlreadyExists {
+    pub object: String,
+}
+
+impl std::fmt::Display for SnapshotAlreadyExists {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(formatter, "snapshot object already exists: {}", self.object)
+    }
+}
+
+impl std::error::Error for SnapshotAlreadyExists {}
+
 pub trait SnapshotStore: Send + Sync {
     /// Store one artifact blob under `key/id/name`.
     fn put(&self, key: &SnapshotKey, id: &str, name: &str, data: &[u8]) -> Result<()>;

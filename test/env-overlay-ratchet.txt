@@ -211,6 +211,9 @@ lifecycle.keep_active_warm
 lifecycle.keep_busy_warm
 lifecycle.max_warm
 lifecycle.serve_cached_glyphs
+# lifecycle.snapshot.conditional_create — nested S3 compatibility policy is a
+# reviewed config setting, not an ambient launcher override.
+lifecycle.snapshot.conditional_create
 limits.discover_timeout_secs
 limits.isolated_target_dir
 limits.test_cpu_quota
