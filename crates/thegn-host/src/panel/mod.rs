@@ -740,7 +740,11 @@ pub struct PanelData {
     pub changes: Vec<ChangeRow>,
     /// Git status could not be read during this hydration.
     pub status_unavailable: bool,
+    /// Git diff could not be read during this hydration.
+    pub diff_unavailable: bool,
     pub stash_count: usize,
+    /// Git stash count could not be read during this hydration.
+    pub stash_unknown: bool,
     /// Recent `git log --graph` rows (git section LOG block).
     pub log: Vec<thegn_svc::git::LogRow>,
     /// Git log could not be read during this hydration.

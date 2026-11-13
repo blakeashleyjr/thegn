@@ -3,8 +3,8 @@
 //! module adds them up and counts the bytes an admitted value actually holds.
 
 use crate::model::{
-    MAX_FIELD_BYTES, MAX_ID_BYTES, MAX_PLAYLISTS, MAX_QUEUE_ITEMS, MediaState, PlaylistPage,
-    QueuePage,
+    MAX_FIELD_BYTES, MAX_ID_BYTES, MAX_PLAYLISTS, MAX_QUEUE_ITEMS, MediaState, PLAYER_LIST_LIMIT,
+    PlaylistPage, QueuePage,
 };
 
 /// Worst-case UTF-8 payload bytes of one admitted [`MediaState`]: player,
@@ -20,6 +20,9 @@ pub const MAX_QUEUE_PAGE_BYTES: usize = MAX_QUEUE_ITEMS * MAX_QUEUE_ROW_BYTES;
 pub const MAX_PLAYLIST_ROW_BYTES: usize = MAX_ID_BYTES + MAX_FIELD_BYTES;
 /// Worst-case UTF-8 payload bytes of one admitted playlist page.
 pub const MAX_PLAYLIST_PAGE_BYTES: usize = MAX_PLAYLISTS * MAX_PLAYLIST_ROW_BYTES;
+/// Worst-case UTF-8 payload bytes of the bounded player/source picker list.
+/// The list retains one overflow row so the consumer can show truncation.
+pub const MAX_PLAYER_LIST_BYTES: usize = PLAYER_LIST_LIMIT * MAX_ID_BYTES;
 /// Worst-case UTF-8 payload bytes of a state, queue page and playlist page
 /// held together.
 pub const MAX_SNAPSHOT_BYTES: usize =
@@ -49,6 +52,16 @@ pub fn playlist_page_bytes(page: &PlaylistPage) -> usize {
     page.items
         .iter()
         .map(|playlist| playlist.id.len() + playlist.name.len())
+        .sum()
+}
+
+/// UTF-8 bytes of the retained player/source names. Callers pass the admitted
+/// list, whose names are exact opaque IDs and whose row count is bounded.
+pub fn player_list_bytes(players: &[String]) -> usize {
+    players
+        .iter()
+        .take(PLAYER_LIST_LIMIT)
+        .map(String::len)
         .sum()
 }
 
@@ -179,5 +192,12 @@ mod tests {
         assert_eq!(MAX_PLAYLIST_ROW_BYTES, 5_120);
         assert_eq!(MAX_PLAYLIST_PAGE_BYTES, 512_000);
         assert_eq!(MAX_SNAPSHOT_BYTES, 5_141_504);
+    }
+
+    #[test]
+    fn player_list_ceiling_matches_the_source_row_cap() {
+        let players = vec!["p".repeat(MAX_ID_BYTES); PLAYER_LIST_LIMIT + 10];
+        assert_eq!(player_list_bytes(&players), MAX_PLAYER_LIST_BYTES);
+        assert_eq!(MAX_PLAYER_LIST_BYTES, 66_560);
     }
 }

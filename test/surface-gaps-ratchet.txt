@@ -27,20 +27,17 @@
 #             `containers.*`, `doctor.bundle`, `launch.preset`) run against
 #             local custody today; a remote-operator route is future work.
 #   cli     — `search.*` runs in-process against the worktree (never through the
-#             control client, which is all `cli_control_caps` measures);
-#             `containers.*` ships as the TUI Containers tab this change.
+#             control client, which is all `cli_control_caps` measures).
 
 agent.sessions	grpc	not yet mirrored in control.proto
 calendar.clocks	mcp	MCP state tools land in the client-API phase
 calendar.events	mcp	MCP state tools land in the client-API phase
 calendar.ingest	mcp	MCP state tools land in the client-API phase
-containers.control	cli	container doors land in the client-API phase; TUI row actions ship now
-containers.control	grpc	container doors land in the client-API phase; TUI row actions ship now
-containers.control	http	container doors land in the client-API phase; TUI row actions ship now
+containers.control	grpc	container lifecycle and logs are local CLI-only; gRPC mirror lands in the client-API phase
+containers.control	http	container lifecycle and logs are local CLI-only; HTTP mirror lands in the client-API phase
 containers.control	mcp	container doors land in the MCP scope-gating phase
-containers.list	cli	container doors land in the client-API phase; TUI Containers tab ships now
-containers.list	grpc	container doors land in the client-API phase; TUI Containers tab ships now
-containers.list	http	container doors land in the client-API phase; TUI Containers tab ships now
+containers.list	grpc	container listing is local CLI-only; gRPC mirror lands in the client-API phase
+containers.list	http	container listing is local CLI-only; HTTP mirror lands in the client-API phase
 containers.list	mcp	container doors land in the MCP scope-gating phase
 containers.prune	grpc	prune is `thegn sandbox gc/prune` (CLI) this change; a control route lands in the client-API phase
 containers.prune	http	prune is `thegn sandbox gc/prune` (CLI) this change; a control route lands in the client-API phase
@@ -54,23 +51,17 @@ doctor.bundle	grpc	local CLI operator verb; no control route (bundle reads local
 doctor.bundle	http	local CLI operator verb; no control route (bundle reads local files)
 git.commit	mcp	MCP state tools land in the client-API phase
 git.stage	mcp	MCP state tools land in the client-API phase
-git.status	mcp	MCP state tools land in the client-API phase
 issues.comment	grpc	not yet mirrored in control.proto
 issues.comment	mcp	MCP state tools land in the client-API phase
-issues.get	grpc	not yet mirrored in control.proto
 issues.get	mcp	MCP state tools land in the client-API phase
-issues.list	grpc	not yet mirrored in control.proto
 issues.list	mcp	MCP state tools land in the client-API phase
 issues.update	grpc	not yet mirrored in control.proto
 issues.update	mcp	MCP state tools land in the client-API phase
 launch.preset	grpc	not yet mirrored in control.proto
 launch.preset	http	CLI-first (`open --preset` via the intents mailbox); an HTTP route is a follow-up
 launch.preset	mcp	MCP exec-scoped tools land in the MCP write-tools phase
-mcp_proxy.reload	grpc	not yet mirrored in control.proto
-mcp_proxy.status	grpc	not yet mirrored in control.proto
 merge.add	mcp	MCP state tools land in the client-API phase
 merge.clear	mcp	MCP state tools land in the client-API phase
-merge.list	mcp	MCP state tools land in the client-API phase
 model_proxy.start	grpc	control-API route deferred; CLI-only for now
 model_proxy.start	http	control-API route deferred; CLI-only for now
 model_proxy.stats	grpc	control-API route deferred; CLI-only for now
@@ -80,7 +71,6 @@ model_proxy.status	http	control-API route deferred; CLI-only for now
 model_proxy.stop	grpc	control-API route deferred; CLI-only for now
 model_proxy.stop	http	control-API route deferred; CLI-only for now
 notify.push	mcp	MCP state tools land in the client-API phase
-pr.status	mcp	MCP state tools land in the client-API phase
 project.assign	grpc	control-API route deferred; CLI-only for now
 project.assign	http	control-API route deferred; CLI-only for now
 program.assign	grpc	control-API route deferred; CLI-only for now

@@ -237,7 +237,12 @@ fn status_rows(model: &FrameModel, ui: &PanelUi, _focused: bool) -> Vec<PanelRow
         right.push(seg(d(), format!(" {}…", p.label)));
         right.push(sp(1));
     } else {
-        right.push(seg(g2(), format!("{} stashed · ", data.stash_count)));
+        let stash_count = if data.stash_unknown {
+            "?".to_string()
+        } else {
+            data.stash_count.to_string()
+        };
+        right.push(seg(g2(), format!("{stash_count} stashed · ")));
         right.push(seg(g2(), format!("{} changed", data.changes.len())));
         right.push(sp(1));
     }

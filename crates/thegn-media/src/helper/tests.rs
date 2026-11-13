@@ -6,7 +6,26 @@ use std::time::{Duration, Instant};
 
 use tokio::process::Command;
 
-use super::{HelperError, Limits, output};
+use super::{HelperError, Limits, clip_field, output, push_bounded, valid_id};
+
+#[test]
+fn decoded_text_clips_at_a_utf8_boundary() {
+    let mut out = String::new();
+    let truncated = push_bounded(&mut out, "aé", 2);
+    assert!(truncated);
+    assert_eq!(out, "a");
+    let clipped = clip_field(&format!("a{}", "é".repeat(crate::model::MAX_FIELD_BYTES)));
+    assert_eq!(clipped.len(), crate::model::MAX_FIELD_BYTES - 1);
+    assert!(clipped.starts_with('a') && clipped.ends_with('é'));
+}
+
+#[test]
+fn opaque_ids_are_exact_or_rejected() {
+    let exact = "i".repeat(crate::model::MAX_ID_BYTES);
+    assert_eq!(valid_id(&exact).as_deref(), Some(exact.as_str()));
+    assert!(valid_id(&"i".repeat(crate::model::MAX_ID_BYTES + 1)).is_none());
+    assert!(valid_id("a\rb").is_none());
+}
 
 fn sh(script: &str) -> Command {
     let mut c = Command::new("sh");

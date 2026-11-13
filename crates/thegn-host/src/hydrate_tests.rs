@@ -103,6 +103,26 @@ fn stash_error_still_caches_watched_status_and_diff_snapshot() {
 }
 
 #[test]
+fn failed_diff_and_stash_reads_are_marked_unknown() {
+    let diff: anyhow::Result<Vec<thegn_svc::git::DiffEntry>> = Err(anyhow::anyhow!("diff failed"));
+    let stash_count: anyhow::Result<usize> = Err(anyhow::anyhow!("stash count failed"));
+
+    assert!(diff_read_unavailable(&diff));
+    assert!(stash_read_unknown(&stash_count));
+}
+
+#[test]
+fn reused_snapshot_without_stash_count_stays_unknown() {
+    let result = reused_stash_count(None);
+
+    assert!(result.is_err());
+    assert_eq!(
+        result.unwrap_err().to_string(),
+        "stash count unavailable in reused panel snapshot"
+    );
+}
+
+#[test]
 fn dropped_panel_prefetch_completion_sends_failed_generation_and_rearms_latch() {
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
     let path = std::path::PathBuf::from("/repo/wt");
@@ -3195,9 +3215,9 @@ fn ls_files_nul_framed_keeps_a_newline_filename_once() {
 }
 
 #[test]
-fn ls_files_local_argv_is_nul_framed_and_remote_is_unchanged() {
+fn ls_files_local_and_remote_argv_is_nul_framed() {
     assert_eq!(ls_files_args(false), &["ls-files", "-z"]);
-    assert_eq!(ls_files_args(true), &["ls-files"]);
+    assert_eq!(ls_files_args(true), &["ls-files", "-z"]);
 }
 
 #[expect(
