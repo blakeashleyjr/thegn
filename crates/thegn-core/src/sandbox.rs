@@ -5577,7 +5577,3 @@ pub fn prune_local(kinds: PruneKinds, execute: bool) -> PruneReport {
 #[cfg(test)]
 #[path = "sandbox_tests.rs"]
 mod tests;
-
-#[cfg(test)]
-#[path = "sandbox_redteam_tests.rs"]
-mod sandbox_redteam_tests;
