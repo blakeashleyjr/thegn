@@ -261,7 +261,12 @@ fn gather(
             // The contract of `worker_live`: unknown maps to `true`. That is
             // exactly what `row_liveness` returns for a row with no exit stamp,
             // so the mapping is one match rather than a hand-rolled guess.
-            worker_live: matches!(pipeline_run::row_liveness(&row, now_ms), RowLiveness::Live),
+            worker_live: match pipeline_run::row_liveness(&row, now_ms) {
+                RowLiveness::Live => true,
+                RowLiveness::Parked
+                | RowLiveness::ExitedUnverified { .. }
+                | RowLiveness::Closed => false,
+            },
             merged_into_target: git.merged_into_target,
             enqueued: queued.iter().any(|w| w == &row.worktree_path),
             artifact_tracked: verify.tracked,

@@ -2265,11 +2265,13 @@ impl Db {
         })
     }
 
-    /// Worktrees carrying at least one dispatch row that still occupies a slot.
+    /// Worktrees carrying at least one active dispatch row.
     ///
     /// The disk reclaimer's unverified-work guard: such a worktree has work no
     /// supervisor has closed, so its `target/` must survive even though nothing
-    /// is running in it. Liveness is decided by the typed status
+    /// is running in it. Parked rows are included deliberately: liveness here
+    /// is the redispatch/work-preservation predicate, not stage slot capacity.
+    /// It is decided by the typed status
     /// ([`crate::issue::AgentDispatchStatus::is_active`]) rather than a SQL
     /// string list, so the closed set keeps exactly one definition.
     pub fn worktrees_with_active_dispatch(&self) -> Result<Vec<String>> {
@@ -5428,10 +5430,23 @@ mod tests {
     }
 
     #[test]
-    fn admission_active_statuses_match_pipeline_occupying_statuses() {
+    fn admission_active_statuses_keep_parked_rows_for_redispatch_and_chunks() {
+        assert!(
+            ADMISSION_ACTIVE_STATUSES
+                .iter()
+                .all(|status| status.is_active())
+        );
+        assert!(ADMISSION_ACTIVE_STATUSES.iter().any(|status| matches!(
+            status,
+            AgentDispatchStatus::WaitingHuman | AgentDispatchStatus::PrOpen
+        )));
         assert_eq!(
-            ADMISSION_ACTIVE_STATUSES.as_slice(),
-            crate::pipeline_claim::occupying_statuses().as_slice()
+            ADMISSION_ACTIVE_STATUSES
+                .iter()
+                .copied()
+                .filter(|status| status.holds_slot())
+                .collect::<Vec<_>>(),
+            crate::pipeline_claim::occupying_statuses()
         );
     }
 

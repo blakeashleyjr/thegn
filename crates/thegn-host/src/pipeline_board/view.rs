@@ -89,8 +89,8 @@ fn status_mark(
     (glyph, tone)
 }
 
-/// `2/3` — live rows over the stage's advisory concurrency. Purely a reading;
-/// nothing here enforces the budget.
+/// `2/3` — slot-occupying rows over the stage's advisory concurrency. Purely a
+/// reading; nothing here enforces the budget.
 fn load_label(head: &StageHead) -> String {
     if head.configured {
         format!("{}/{}", head.live, head.concurrency)
@@ -115,7 +115,7 @@ fn model_label(model: &EffectiveModel) -> String {
 
 /// The two chrome rows above the body.
 ///
-/// Row 0 is the stage names with their live load; row 1 is each stage's agent,
+/// Row 0 is the stage names with their slot load; row 1 is each stage's agent,
 /// effective model, and `→ next` edge, which makes the rail read as a pipeline
 /// rather than as a set of unrelated buckets. In [`Mode::Stacked`] the columns
 /// are drawn down the page instead, so the rail collapses to a summary and a
@@ -128,9 +128,11 @@ pub(crate) fn rail(board: &Board, active_col: usize, width: usize) -> [Line; 2] 
         let left = vec![seg(
             Tok::Slot(S::Text),
             format!(
-                "{} stage{}  {live} of {total} active",
+                "{} stage{}  {live} slot{} across {total} row{}",
                 board.columns.len(),
                 if board.columns.len() == 1 { "" } else { "s" },
+                if live == 1 { "" } else { "s" },
+                if total == 1 { "" } else { "s" },
             ),
         )];
         let right = vec![seg(Tok::Slot(S::Ghost), "narrow — stacked".to_string())];
