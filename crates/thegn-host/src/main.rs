@@ -510,6 +510,8 @@ pub enum Command {
     Land {
         #[command(flatten)]
         target: cmd::target::WorktreeTarget,
+        #[command(flatten)]
+        trust_gate: cmd::target::TrustGateArgs,
     },
     /// Agent-driven merge queue: assign branches (`merge add`) and drain them one
     /// by one (`merge drain`), dispatching a headless CLI agent to resolve
@@ -1477,7 +1479,9 @@ fn run_subcommand(cli: &Cli, command: Command) -> anyhow::Result<()> {
             json,
         } => cmd::map::run(&cfg, worktree, budget, file, json),
         Command::Integrate { args } => cmd::integrate::run(&cfg, &args),
-        Command::Land { target } => cmd::land::run(&cfg, target.get()),
+        Command::Land { target, trust_gate } => {
+            cmd::land::run(&cfg, target.get(), trust_gate.trust_gate)
+        }
         Command::Merge { action } => cmd::merge::run(&cfg, action),
         Command::Disk { args } => cmd::wt::run(&cfg, cmd::wt::Action::Disk(args)),
         Command::Clean { args } => cmd::wt::run(&cfg, cmd::wt::Action::Clean(args)),

@@ -51,6 +51,15 @@ impl WorktreeTarget {
     }
 }
 
+/// Opt into using a satisfied, commit-bound pipeline attestation for one land.
+#[derive(clap::Args, Clone, Debug, Default)]
+pub struct TrustGateArgs {
+    /// Skip this land's fold gate only when a trusted attestation is bound to
+    /// the branch commit and the current target tip.
+    #[arg(long)]
+    pub trust_gate: bool,
+}
+
 #[cfg(test)]
 mod tests {
     use super::WorktreeTarget;
@@ -72,7 +81,7 @@ mod tests {
     /// Pull the [`WorktreeTarget`] out of a parsed CLI, whatever verb carried it.
     fn target_of(cli: crate::Cli) -> WorktreeTarget {
         match cli.command.expect("a subcommand") {
-            crate::Command::Land { target } => target,
+            crate::Command::Land { target, .. } => target,
             crate::Command::SandboxArgv { target } => target,
             crate::Command::Merge { action } => match action {
                 cmd::merge::Action::Rm { target } => target,
@@ -248,5 +257,14 @@ mod tests {
             } => assert_eq!(worktree_pos.as_deref(), Some("/x")),
             _ => panic!("bad parse"),
         }
+    }
+
+    #[test]
+    fn land_trust_gate_flag_parses() {
+        let cli = parse(&["thegn", "land", "--trust-gate"]).unwrap();
+        let crate::Command::Land { trust_gate, .. } = cli.command.unwrap() else {
+            panic!("expected land command");
+        };
+        assert!(trust_gate.trust_gate);
     }
 }

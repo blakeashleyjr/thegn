@@ -44,12 +44,31 @@ fn gate_error_message(
     )
 }
 
+fn integration_tracking_outcome(
+    non_root: bool,
+    outcome: &AttemptOutcome,
+) -> Option<crate::cmd::session_track::IntegrationOutcome> {
+    if !non_root {
+        return None;
+    }
+    match outcome {
+        AttemptOutcome::Landed { .. } | AttemptOutcome::UpToDate { .. } => {
+            Some(crate::cmd::session_track::IntegrationOutcome::Landed)
+        }
+        AttemptOutcome::GateFailed { .. } | AttemptOutcome::GateError { .. } => {
+            Some(crate::cmd::session_track::IntegrationOutcome::RefusedGate)
+        }
+        _ => None,
+    }
+}
+
+#[cfg(test)]
 /// Fold `worktree`'s current branch via the shared land helper without queue pinning.
 pub(crate) fn land_branch(
     cfg: &Config,
     worktree: &Path,
 ) -> Result<(String, String, AttemptOutcome)> {
-    land_branch_pinned(cfg, worktree, None)
+    land_branch_pinned_with_options(cfg, worktree, None, None, false)
 }
 
 /// Fold `worktree`'s current branch onto the repo target via the fold-actor's
@@ -61,6 +80,16 @@ pub(crate) fn land_branch_pinned(
     cfg: &Config,
     worktree: &Path,
     expected_tip: Option<&str>,
+) -> Result<(String, String, AttemptOutcome)> {
+    land_branch_pinned_with_options(cfg, worktree, expected_tip, None, false)
+}
+
+fn land_branch_pinned_with_options(
+    cfg: &Config,
+    worktree: &Path,
+    expected_tip: Option<&str>,
+    db: Option<&Db>,
+    trust_gate: bool,
 ) -> Result<(String, String, AttemptOutcome)> {
     let root = integrate::main_checkout(worktree).context("not inside a git repository")?;
     let branch = match crate::merge_ops::branch_of(worktree) {
@@ -77,18 +106,78 @@ pub(crate) fn land_branch_pinned(
     let mut mq = cfg.repo_merge_queue(&root);
     mq.auto_land = true;
     let target = integrate::resolve_target(&mq, &root);
+    let trusted = if trust_gate {
+        let is_root = std::fs::canonicalize(worktree).ok().as_deref() == Some(root.as_path());
+        let trusted = if is_root {
+            Err("nothing to attest".to_string())
+        } else if let Some(db) = db {
+            let folded_commit = integrate::resolve_commit_oid(&root, &branch)
+                .map_err(|error| format!("could not bind land commit: {error}"));
+            let target_tip = integrate::resolve_commit_oid(&root, &target)
+                .map_err(|error| format!("could not bind target tip: {error}"));
+            match (folded_commit, target_tip) {
+                (Ok(folded_commit), Ok(target_tip)) => {
+                    crate::cmd::dispatch::gate::trusted_land_gate_id(
+                        db,
+                        &worktree.to_string_lossy(),
+                        &folded_commit,
+                        &target_tip,
+                        &root,
+                    )
+                    .and_then(|id| {
+                        if let Some(expected) = expected_tip
+                            && !expected.eq_ignore_ascii_case(&folded_commit)
+                        {
+                            Err(format!(
+                                "queue pin binding is {expected} but trusted land commit is {folded_commit}"
+                            ))
+                        } else {
+                            Ok((id, folded_commit, target_tip))
+                        }
+                    })
+                }
+                (Err(error), _) | (_, Err(error)) => Err(error),
+            }
+        } else {
+            Err("trust-gate database is unavailable".to_string())
+        };
+        match trusted {
+            Ok(bound) => Some(bound),
+            Err(reason) => {
+                outln!("Gate trust refused: {reason}; running the normal gate");
+                None
+            }
+        }
+    } else {
+        None
+    };
     // `thegn land` lands the branch checked out in `worktree`; its loc tells
     // attempt_land whether that worktree is on this host (no ingest) or remote.
     let branch_loc = thegn_core::remote::GitLoc::for_worktree_op(worktree, "land")
         .map_err(anyhow::Error::msg)?;
-    let outcome = match expected_tip {
-        Some(tip) => integrate::attempt_land_pinned(&mq, &root, &branch, &branch_loc, tip)?,
-        None => integrate::attempt_land(&mq, &root, &branch, &branch_loc)?,
+    let outcome = if let Some((attestation_id, folded_commit, target_tip)) = trusted {
+        let outcome = integrate::attempt_land_trusted(
+            &mq,
+            &root,
+            &branch,
+            &branch_loc,
+            &folded_commit,
+            &target_tip,
+        )?;
+        outln!(
+            "Gate skipped: trusted attestation {attestation_id} bound to {folded_commit} and target tip {target_tip}"
+        );
+        outcome
+    } else {
+        match expected_tip {
+            Some(tip) => integrate::attempt_land_pinned(&mq, &root, &branch, &branch_loc, tip)?,
+            None => integrate::attempt_land(&mq, &root, &branch, &branch_loc)?,
+        }
     };
     Ok((branch, target, outcome))
 }
 
-pub fn run(cfg: &Config, worktree: Option<String>) -> Result<()> {
+pub fn run(cfg: &Config, worktree: Option<String>, trust_gate: bool) -> Result<()> {
     let wt = super::resolve_worktree(worktree);
     let root = integrate::main_checkout(&wt).context("not inside a git repository")?;
     let mq = cfg.repo_merge_queue(&root);
@@ -126,7 +215,22 @@ pub fn run(cfg: &Config, worktree: Option<String>) -> Result<()> {
     };
     let guard = crate::platform::InterruptGuard::install();
     let _scope = crate::fold_cancel::scope(move || guard.fired());
-    let (branch, target, outcome) = land_branch(cfg, &wt)?;
+    let (branch, target, outcome) =
+        land_branch_pinned_with_options(cfg, &wt, None, Some(db.db()), trust_gate)?;
+    let tracking_outcome = integration_tracking_outcome(non_root, &outcome);
+    if let Some(tracking_outcome) = tracking_outcome
+        && let Some(label) = Path::new(&wt).file_name().and_then(|name| name.to_str())
+        && let Err(error) = crate::cmd::session_track::track_integration(
+            db.db(),
+            wt.to_string_lossy().as_ref(),
+            label,
+            tracking_outcome,
+        )
+    {
+        // Land is authoritative for Git; roster tracking is best effort and
+        // must not turn a landed or refused fold into an ambiguous retry.
+        outln!("! integration tracking unavailable: {error}");
+    }
     // On a successful land, file the worktree into the Merged folder — the same
     // destination a queue land reaches under `move`/`expire`. `thegn land` shares
     // the fold/gate/CAS core with the queue but deliberately leaves the worktree
@@ -374,6 +478,17 @@ error: test run failed
     fn an_empty_or_clean_log_yields_nothing_to_report() {
         assert!(gate_failure_digest("").is_empty());
         assert!(gate_failure_digest("     Summary [ 1s] 10 tests run: 10 passed\n").is_empty());
+    }
+}
+
+#[cfg(test)]
+mod land_tracking_tests {
+    use super::{AttemptOutcome, integration_tracking_outcome};
+
+    #[test]
+    fn root_land_writes_no_tracking_row() {
+        let outcome = AttemptOutcome::GateFailed { log: String::new() };
+        assert!(integration_tracking_outcome(false, &outcome).is_none());
     }
 }
 
