@@ -1213,6 +1213,7 @@ fn nonempty(value: &str) -> Option<&str> {
     (!value.is_empty()).then_some(value)
 }
 
+#[allow(clippy::result_large_err)]
 fn issue_patch_from_proto(
     patch: proto::IssuePatch,
 ) -> Result<thegn_core::issue::IssuePatch, Status> {
