@@ -4106,11 +4106,14 @@ mod tests {
     }
 
     fn local_history_decision(report: &FoldReport) -> HistoryDecision {
-        (report.deferred.len() == 1
+        if report.deferred.len() == 1
             && !report.advanced
-            && report.deferred[0].kind == ConflictKind::UnsupportedMergeHistory)
-            .then_some(HistoryDecision::HeldUnsupportedMergeHistory)
-            .unwrap_or(HistoryDecision::Unexpected)
+            && report.deferred[0].kind == ConflictKind::UnsupportedMergeHistory
+        {
+            HistoryDecision::HeldUnsupportedMergeHistory
+        } else {
+            HistoryDecision::Unexpected
+        }
     }
 
     fn remote_history_decision(outcome: &AttemptOutcome) -> HistoryDecision {
