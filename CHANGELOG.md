@@ -7,6 +7,22 @@ All notable changes to **thegn** are documented here. The format follows
 
 ## [Unreleased]
 
+### Added
+
+- MCP read tools `calendar_events`, `calendar_clocks`, `issues_list`, `issues_get` and `dispatches_list` expose calendar, tracker issue and dispatch-roster data.
+
+### Changed
+
+- Pipeline rows waiting for a human or an open PR remain protected from redispatch without holding a stage concurrency slot.
+- A worktree edited after landing keeps its queue row labelled; `thegn merge sweep --force` retires only the queue row, and `thegn merge list --json` shows `cleanup_class` ids.
+- Merge-queue help explains that rebase holds histories containing merge commits or unrelated roots.
+
+### Fixed
+
+- Merge-queue gate commands without shell syntax run directly, so a missing executable is reported as a gate failure instead of an infrastructure error.
+- Dispatches can no longer name a superseded parent, except when resuming that parent.
+- Diff line counts use NUL-delimited output, so paths containing tabs or newlines are counted correctly.
+
 ## [0.1.0-alpha.72] — 2026-11-13
 
 ### Added
