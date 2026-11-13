@@ -1082,13 +1082,15 @@ impl Workspace {
         Ok(())
     }
 
-    fn command_for(&self, command: &str) -> Result<std::process::Command> {
+    fn command_for(&self, command: &str) -> Result<(std::process::Command, bool)> {
         self.verify()?;
-        let argv = thegn_core::sandbox_cpucap::wrap_background_argv(
-            thegn_core::shellinv::direct_argv(command).unwrap_or_else(|| {
-                thegn_core::shellinv::run_argv(&thegn_core::util::shell(), command)
-            }),
-        );
+        let direct = thegn_core::shellinv::direct_argv(command);
+        let inner = direct
+            .clone()
+            .unwrap_or_else(|| thegn_core::shellinv::run_argv(&thegn_core::util::shell(), command));
+        let (argv, wrap) = thegn_core::sandbox_cpucap::wrap_background_argv_reporting(inner);
+        let exec_confirmed =
+            direct.is_some() && wrap != thegn_core::sandbox_cpucap::BackgroundWrap::Wrapped;
         let mut command = std::process::Command::new(&argv[0]);
         command
             .args(&argv[1..])
@@ -1105,7 +1107,7 @@ impl Workspace {
             .env("THEGN_GATE", "1")
             .env("THEGN_WORKTREE", self.checkout.worktree.path())
             .env("THEGN_GATE_OID", &self.oid);
-        Ok(command)
+        Ok((command, exec_confirmed))
     }
 
     fn spawn(
@@ -1113,15 +1115,13 @@ impl Workspace {
         command: &str,
         timeout_secs: u64,
     ) -> Result<(super::super::gate_capture::CaptureResult, bool)> {
-        let exec_confirmed = thegn_core::shellinv::direct_argv(command).is_some();
-        let command = self.command_for(command)?;
+        let (command, exec_confirmed) = self.command_for(command)?;
         Ok((
             super::super::gate_capture::run(command, std::time::Duration::from_secs(timeout_secs)),
             exec_confirmed,
         ))
     }
 }
-
 /// Native unique-worktree runner used on platforms where the descriptor-
 /// relative verified state seam is unavailable. It never opens the reused
 /// state root, so unsupported locking cannot turn into shared-worktree use.
@@ -1213,13 +1213,15 @@ impl NativeWorkspace {
         index_matches(&self.worktree, &self.oid)
     }
 
-    fn command_for(&self, command: &str) -> Result<std::process::Command> {
+    fn command_for(&self, command: &str) -> Result<(std::process::Command, bool)> {
         self.verify()?;
-        let argv = thegn_core::sandbox_cpucap::wrap_background_argv(
-            thegn_core::shellinv::direct_argv(command).unwrap_or_else(|| {
-                thegn_core::shellinv::run_argv(&thegn_core::util::shell(), command)
-            }),
-        );
+        let direct = thegn_core::shellinv::direct_argv(command);
+        let inner = direct
+            .clone()
+            .unwrap_or_else(|| thegn_core::shellinv::run_argv(&thegn_core::util::shell(), command));
+        let (argv, wrap) = thegn_core::sandbox_cpucap::wrap_background_argv_reporting(inner);
+        let exec_confirmed =
+            direct.is_some() && wrap != thegn_core::sandbox_cpucap::BackgroundWrap::Wrapped;
         let mut command = std::process::Command::new(&argv[0]);
         command
             .args(&argv[1..])
@@ -1232,7 +1234,7 @@ impl NativeWorkspace {
         for key in util::GIT_ENV_VARS {
             command.env_remove(key);
         }
-        Ok(command)
+        Ok((command, exec_confirmed))
     }
 
     fn spawn(
@@ -1240,14 +1242,12 @@ impl NativeWorkspace {
         command: &str,
         timeout_secs: u64,
     ) -> Result<(super::super::gate_capture::CaptureResult, bool)> {
-        let exec_confirmed = thegn_core::shellinv::direct_argv(command).is_some();
-        let command = self.command_for(command)?;
+        let (command, exec_confirmed) = self.command_for(command)?;
         Ok((
             super::super::gate_capture::run(command, std::time::Duration::from_secs(timeout_secs)),
             exec_confirmed,
         ))
     }
-
     #[expect(
         clippy::disallowed_methods,
         reason = "cleanup is scoped to the private unique gate parent after Git unregisters it"

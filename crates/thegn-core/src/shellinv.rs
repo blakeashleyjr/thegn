@@ -75,6 +75,16 @@ pub fn direct_argv(command: &str) -> Option<Vec<String>> {
     if first.contains('=') {
         return None;
     }
+    const SHELL_WORDS: &[&str] = &[
+        "exit", "cd", ".", "source", "export", "unset", "set", "eval", "exec", "command",
+        "builtin", "alias", "unalias", "trap", "return", "shift", "read", "wait", "ulimit",
+        "umask", "type", "hash", "local", "readonly", "declare", "typeset", "times", "break",
+        "continue", "if", "then", "else", "elif", "fi", "case", "esac", "for", "while", "until",
+        "do", "done", "function", "select", "time", "coproc", "in", "[[", "]]",
+    ];
+    if SHELL_WORDS.contains(&first.as_str()) {
+        return None;
+    }
     if argv.iter().any(|word| {
         word.chars().any(|character| {
             matches!(
@@ -180,6 +190,9 @@ mod tests {
             ("", None),
             ("   \t", None),
             ("FOO=bar cargo test", None),
+            ("exit 1", None),
+            ("cd foo", None),
+            ("source env.sh", None),
             ("echo 'hello'", None),
             ("echo \"hello\"", None),
             ("echo hi && exit 1", None),

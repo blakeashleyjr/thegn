@@ -59,7 +59,8 @@ fn replacement_refs_never_change_gate_materialization_or_inherited_git_view() {
     }
     let workspace = f.prepare(&f.first);
     for command in ["printf setup", "printf gate"] {
-        assert_explicit_no_replace(&workspace.command_for(command).unwrap());
+        let (command, _) = workspace.command_for(command).unwrap();
+        assert_explicit_no_replace(&command);
     }
 }
 
