@@ -29,6 +29,17 @@ Merge queue section. The token is omitted for empty or landed-only queues and
 is not shown in rail mode. The bottom-bar summary is opt-in: set
 `[bars] bottom_right = ["mq"]` if you want it alongside the other widgets.
 
+## History shapes
+
+With `[merge_queue] land_strategy = "rebase"`, the queue holds a branch whose
+replay range contains a merge commit — including octopus and criss-cross
+histories — or an unrelated/orphan root. Rebase is deliberately limited to a
+linear descendant of the target, so the hold is reported as
+`UnsupportedMergeHistory` with the reason that merge commits or unrelated
+history cannot be replayed; no part of the branch is replayed and the target
+ref does not move. Use the `merge` or `squash` strategy, or linearize the
+branch, when that history should be landed.
+
 ## Landing
 
 - **Integrate** (palette, or the section's key) drains the queue once:
