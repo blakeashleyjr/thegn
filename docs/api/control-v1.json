@@ -38,6 +38,13 @@
             "null"
           ]
         },
+        "permissions": {
+          "description": "Per-launch permission grants over the agent entry's configured grants. Claude only; by default this can narrow the configured grants, while `widen_permissions` permits a wider launch-specific set.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
         "prompt": {
           "default": "",
           "description": "The task to seed the first turn with. Empty ⇒ launch interactively.",
@@ -56,6 +63,11 @@
             "string",
             "null"
           ]
+        },
+        "widen_permissions": {
+          "default": false,
+          "description": "Allow `permissions` to widen the configured grants for this launch.",
+          "type": "boolean"
         }
       },
       "required": [

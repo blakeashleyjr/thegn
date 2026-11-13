@@ -84,9 +84,10 @@ as a root.
 
 Branches are local: check out, create, and delete them; open-PR badges ride
 each row. At Normal width, `↵` widens to Half. The selected branch's recent
-commits appear at Half and Full width. `p` pulls and `P` pushes HEAD only;
-both refuse when another row is selected. `n` opens the new-branch name input.
-The menu's pull and push actions also operate on HEAD only.
+commits appear at Half and Full width. `p` pulls HEAD when its row is selected,
+or fast-forwards the selected branch without checking it out; `P` pushes HEAD
+or the selected branch without changing its upstream. `n` opens the new-branch
+name input. The menu's pull and push actions still operate on HEAD only.
 If reading a branch log fails, its block says `log unavailable` and shows the
 first error line. In the fused two-column view at Full and wide Half widths,
 clicking a row in either column moves the cursor to that row, and the wheel

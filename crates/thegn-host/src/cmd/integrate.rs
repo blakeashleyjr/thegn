@@ -52,6 +52,15 @@ pub struct IntegrateArgs {
     /// Skip the confirmation prompt (required to fold non-interactively).
     #[arg(long, short = 'y')]
     pub yes: bool,
+    /// Fold exactly these candidate branches in this order.
+    #[arg(long, value_delimiter = ',')]
+    pub order: Option<Vec<String>>,
+    /// Fold into this existing local branch (requires --order).
+    #[arg(long, requires = "order")]
+    pub into: Option<String>,
+    /// Resume an ordered fold at this branch (requires --order).
+    #[arg(long, requires = "order")]
+    pub from: Option<String>,
 }
 
 pub fn run(cfg: &Config, args: &IntegrateArgs) -> Result<()> {
@@ -84,19 +93,87 @@ pub fn run(cfg: &Config, args: &IntegrateArgs) -> Result<()> {
             return Ok(());
         }
     }
-    let mq = &resolved;
-    let target = integrate::resolve_target(mq, &repo_root);
+    if args.order.is_none() && (args.into.is_some() || args.from.is_some()) {
+        anyhow::bail!("--into and --from require --order");
+    }
+    let mut mq = resolved;
+    if let Some(into) = &args.into {
+        if push_mode {
+            anyhow::bail!("--into is not available in push mode; target branches are local");
+        }
+        let local_exists = thegn_core::worktree::branch_exists_checked(&repo_root, into)
+            .map_err(anyhow::Error::msg)?;
+        let remote_tracking = into.starts_with("refs/remotes/")
+            || thegn_core::util::git_ok(
+                &repo_root,
+                &[
+                    "show-ref",
+                    "--verify",
+                    "--quiet",
+                    &format!("refs/remotes/{into}"),
+                ],
+            );
+        super::integrate_order::validate_into(into, local_exists, remote_tracking)?;
+        mq.target_branch = into.clone();
+        // A stack fold is not a landing on the configured target, so defer lifecycle filing/removal to the eventual land of B.
+        mq.on_landed = thegn_core::config::OnLanded::Off;
+    }
+    let target = integrate::resolve_target(&mq, &repo_root);
 
     let override_gpg = cfg.repo_git(&repo_root).override_gpg;
-    let mut cands = integrate::candidate_branches(mq, &repo_root, &target)?;
+    let mut cands = integrate::candidate_branches(&mq, &repo_root, &target)?;
     for s in &cands.skipped_dirty {
         outln!("  • skipped {s} (dirty — set [merge_queue] snapshot_dirty = true to fold it)");
+    }
+
+    if let Some(order) = &args.order {
+        let candidate_names: Vec<String> = cands
+            .branches
+            .iter()
+            .map(|branch| branch.name.clone())
+            .collect();
+        let order = if let Some(from) = &args.from {
+            let from_index = super::integrate_order::from_index(order, from)?;
+            let target_tip = thegn_core::util::git_out(
+                &repo_root,
+                &["rev-parse", &format!("refs/heads/{target}")],
+            )
+            .context("could not read the target tip")?;
+            for raw_name in &order[..from_index] {
+                let name = raw_name.trim();
+                let Some(branch_tip) = thegn_core::util::git_out(
+                    &repo_root,
+                    &[
+                        "rev-parse",
+                        "--verify",
+                        "--quiet",
+                        &format!("refs/heads/{name}"),
+                    ],
+                ) else {
+                    outln!("  • {name} already folded (branch gone)");
+                    continue;
+                };
+                if !integrate::candidate_is_ancestor(&repo_root, &branch_tip, &target_tip) {
+                    anyhow::bail!(
+                        "refusing --from {from}: dropped branch {name} is not already folded into {target}"
+                    );
+                }
+            }
+            &order[from_index..]
+        } else {
+            order.as_slice()
+        };
+        let indexes = super::integrate_order::ordered_indices(&candidate_names, order)?;
+        cands.branches = indexes
+            .into_iter()
+            .map(|index| cands.branches[index].clone())
+            .collect();
     }
 
     // `--all` is the explicit, per-run opt out of the queue: fold every eligible
     // branch, the pre-`require_enqueue` behavior, without editing config.
     let require_enqueue = mq.require_enqueue && !args.all;
-    if require_enqueue {
+    if require_enqueue && args.order.is_none() {
         let enqueued = Db::open()
             .map(|db| integrate::enqueued_worktrees(&db, &target))
             .unwrap_or_default();
@@ -177,7 +254,8 @@ pub fn run(cfg: &Config, args: &IntegrateArgs) -> Result<()> {
 
     let guard = crate::platform::InterruptGuard::install();
     let _scope = crate::fold_cancel::scope(move || guard.fired());
-    let report = integrate::run_selected_fold(mq, &repo_root, &cands, override_gpg)?;
+    let report =
+        integrate::run_selected_fold(&mq, &repo_root, &cands, override_gpg, args.order.is_some())?;
     // Explicit integration authorizes the listed candidates, not expiry of
     // unrelated historical worktrees. Cleanup remains an explicit sweep action.
 
@@ -206,6 +284,30 @@ pub fn run(cfg: &Config, args: &IntegrateArgs) -> Result<()> {
                 outln!("    {reason}");
             }
         }
+    }
+    if let Some(deferred) = report.deferred.first()
+        && let Some(order) = &args.order
+    {
+        let ordered = cands
+            .branches
+            .iter()
+            .map(|branch| branch.name.as_str())
+            .collect::<Vec<_>>()
+            .join(",");
+        let into = if !push_mode {
+            format!(" --into {target}")
+        } else {
+            Default::default()
+        };
+        let order = if order.is_empty() {
+            ordered
+        } else {
+            order.join(",")
+        };
+        outln!(
+            "Resume: thegn integrate --order {order}{into} --from {}",
+            deferred.branch
+        );
     }
     match &report.gate {
         GateOutcome::Passed => outln!("Gate passed."),
@@ -274,6 +376,48 @@ pub fn run(cfg: &Config, args: &IntegrateArgs) -> Result<()> {
 #[cfg(test)]
 mod truth_surface_tests {
     use super::*;
+
+    fn names(values: &[&str]) -> Vec<String> {
+        values.iter().map(|value| (*value).into()).collect()
+    }
+
+    #[test]
+    fn ordered_selection_replaces_candidate_order() {
+        assert_eq!(
+            super::super::integrate_order::ordered_indices(
+                &names(&["first", "second", "third"]),
+                &names(&["third", "first"]),
+            )
+            .unwrap(),
+            [2, 0]
+        );
+    }
+
+    #[test]
+    fn ordered_selection_lists_all_unknown_names() {
+        let error = super::super::integrate_order::ordered_indices(
+            &names(&["first", "second"]),
+            &names(&["missing", "also-missing"]),
+        )
+        .unwrap_err()
+        .to_string();
+        assert_eq!(
+            error,
+            "unknown branch name(s): missing, also-missing; candidates: first, second"
+        );
+    }
+
+    #[test]
+    fn into_validation_and_from_slice_are_pure() {
+        assert!(super::super::integrate_order::validate_into("origin/main", true, true).is_err());
+        assert!(super::super::integrate_order::validate_into("main", true, false).is_ok());
+        let names = names(&["first", "second", "third"]);
+        let from = super::super::integrate_order::from_index(&names, "second").unwrap();
+        assert_eq!(
+            names[from..].iter().map(String::as_str).collect::<Vec<_>>(),
+            ["second", "third"]
+        );
+    }
 
     #[test]
     fn gate_error_line_renders_phase_and_class() {

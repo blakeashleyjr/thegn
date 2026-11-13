@@ -252,6 +252,8 @@ thegn session open --agent coder --stage code --worktree "$wt" --prompt "…"
 layers a `[[pipeline.stages]]` entry's `model` / `env` / `permissions`
 over the agent — see [[configuration]]. The daemon composes the same
 sandbox, credentials, model flag and env overlay an interactive pane gets.
+`--permissions Read,Bash` narrows the configured grants for this launch;
+`--widen-permissions` permits a wider set and is only valid on plain opens.
 
 `session open --track <issue>` is the ad-hoc worker form: it requires
 `--worktree`, opens the plain session, then writes a dispatch roster row visible

@@ -38,18 +38,6 @@ const OMITTED: &[(&str, &str)] = &[
     ("git_commands", "custom git commands are not exposed"),
     ("plugins", "plugin configuration is not exposed"),
     ("forges", "forge connections are not exposed"),
-    (
-        "git.backend",
-        "the git read-engine enum needs destination pinning and is not exposed",
-    ),
-    (
-        "git.structural_diff",
-        "the structural-diff enum needs destination pinning and is not exposed",
-    ),
-    (
-        "git.submodules",
-        "the submodule-mode enum needs destination pinning and is not exposed",
-    ),
     ("editor", "editor integration is not exposed"),
     (
         "stats.refresh_secs",
@@ -97,6 +85,14 @@ const OMITTED: &[(&str, &str)] = &[
     (
         "notifications.desktop_min_urgency",
         "string-typed urgency has no destination enum to pin and is not exposed",
+    ),
+    (
+        "sandbox.limits.heavy_slots",
+        "serialising heavy jobs is a host-local policy, not exposed",
+    ),
+    (
+        "sandbox.limits.max_load",
+        "serialising heavy jobs is a host-local policy, not exposed",
     ),
     (
         "notifications.process_exit",
@@ -898,6 +894,35 @@ fn hm_ui_enum_options_offer_only_canonical_spellings() {
         ("uiSidebarProjectSort", "ui.sidebar_project_sort"),
         ("uiSidebarTerminalsSection", "ui.sidebar_terminals_section"),
         ("uiSidebarFocusDetail", "ui.sidebar_focus_detail"),
+    ];
+    let enums = enum_lists(&module_src());
+    for (option, path) in expected {
+        let values = enums
+            .iter()
+            .find(|(name, _)| name == option)
+            .map(|(_, values)| values)
+            .unwrap_or_else(|| panic!("Home Manager enum option `{option}` is missing"));
+        let actual: BTreeSet<&str> = values.iter().map(String::as_str).collect();
+        let schema = schema_field(path);
+        let canonical: BTreeSet<&str> = schema["enum"]
+            .as_array()
+            .unwrap_or_else(|| panic!("destination `{path}` has no enum"))
+            .iter()
+            .filter_map(Value::as_str)
+            .collect();
+        assert_eq!(
+            actual, canonical,
+            "Home Manager enum option `{option}` must expose exactly canonical values for `{path}`"
+        );
+    }
+}
+
+#[test]
+fn hm_git_enum_options_offer_only_canonical_spellings() {
+    let expected = [
+        ("gitBackend", "git.backend"),
+        ("gitStructuralDiff", "git.structural_diff"),
+        ("gitSubmodules", "git.submodules"),
     ];
     let enums = enum_lists(&module_src());
     for (option, path) in expected {
@@ -1745,6 +1770,9 @@ fn every_nix_enum_matches_its_destination_enum() {
         ("uiSidebarTerminalsSection", "ui.sidebar_terminals_section"),
         ("uiSidebarFocusDetail", "ui.sidebar_focus_detail"),
         ("searchStructural", "search.structural"),
+        ("gitBackend", "git.backend"),
+        ("gitStructuralDiff", "git.structural_diff"),
+        ("gitSubmodules", "git.submodules"),
     ];
     let enums = enum_lists(&module_src());
     let actual_names: BTreeSet<&str> = enums.iter().map(|(name, _)| name.as_str()).collect();

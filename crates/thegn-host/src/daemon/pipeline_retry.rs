@@ -675,6 +675,8 @@ fn retry_open_spec(row: &AgentDispatch, prompt: String, resume: Option<String>) 
             resume,
             continue_last: false,
             stage: row.stage.clone(),
+            permissions: Vec::new(),
+            widen_permissions: false,
             fork: false,
             native_session_id: None,
         }),

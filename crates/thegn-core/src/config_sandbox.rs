@@ -7,7 +7,7 @@
 /// degrades to "no cap" rather than a hard error; the values are handed to the
 /// backend (OCI `--cpus`/`--memory`, or a systemd `CPUQuota`/`MemoryMax`).
 #[derive(
-    Debug, Clone, Default, serde::Deserialize, PartialEq, Eq, serde::Serialize, schemars::JsonSchema,
+    Debug, Clone, Default, serde::Deserialize, PartialEq, serde::Serialize, schemars::JsonSchema,
 )]
 #[serde(default)]
 pub struct SandboxLimits {
@@ -30,6 +30,12 @@ pub struct SandboxLimits {
     /// [`Self::memory`] stays a hard `MemoryMax`. `None` (the default) means no
     /// aggregate memory cap; `"off"`/`""` also disable it.
     pub memory_total: Option<String>,
+    /// Maximum number of concurrent host-local heavyweight gates. Zero leaves
+    /// gate concurrency unlimited.
+    pub heavy_slots: usize,
+    /// Absolute one-minute load-average ceiling for heavyweight gates. Zero
+    /// disables the load gate.
+    pub max_load: f64,
 }
 
 // `impl SandboxOverlay` — extracted from the pinned-oversized `config.rs`

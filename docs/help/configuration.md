@@ -117,6 +117,10 @@ The file is watched: edits apply live, no restart.
   the new setting).
   `thegn doctor` shows whether containment is required or best-effort; JSON
   includes `require_containment`.
+- `[sandbox.limits] heavy_slots` and `max_load` serialize heavyweight merge
+  and dispatch gates on the local host; both are off by default. `heavy_slots`
+  is a slot count, while `max_load` is an absolute one-minute load-average
+  ceiling.
 - `[ci]` — cached, bounded CI run/log reads. `log_cache_runs = 0` disables
   persistence; `[ci.autofix] mode = "off"|"suggest"|"auto"` defaults to off
   and reuses the existing trusted PR-queue agent policy.
@@ -549,10 +553,13 @@ It also exposes `drawerCommand`, `drawerConfigHome`, `drawerHeight`,
 and `drawerPrewarm` for `[drawer]`, and `stripVisible` for `[strip]` `visible`.
 These options default to `null`, which uses the binary's default.
 
-The `[git]` scalars are `gitOverrideGpg`, `gitMergeGuard`, `gitAutoFetch`,
-`gitAutoFetchIntervalSecs`, `gitAutoFetchMinIntervalSecs`,
-`gitAutoFetchNotify` and `gitAutoFetchColocated`; an interval of `0` disables
-the periodic auto-fetch poll. The `[stats]` masthead widgets take
+The `[git]` scalars are `gitBackend` (`auto`, `gix` or `cli`), `gitOverrideGpg`,
+`gitMergeGuard`, `gitAutoFetch`, `gitAutoFetchIntervalSecs`,
+`gitAutoFetchMinIntervalSecs`, `gitAutoFetchNotify`, `gitStructuralDiff`
+(`off`, `auto` or `difft`), `gitAutoFetchColocated` and `gitSubmodules`
+(`auto` or `off`); an interval of `0` disables the periodic auto-fetch poll.
+These git enum options are exposed with canonical spellings only; the float,
+list and table-valued git/stat settings remain omitted. The `[stats]` masthead widgets take
 `statsCpuIcon`, `statsMemIcon`, `statsNetIcon`, `statsGpuIcon`, `statsTempIcon`,
 `statsSwapIcon`, `statsFreqIcon`, `statsLoadIcon`, `statsUptimeIcon`,
 `statsBatteryIcon`, `statsBatteryChargingIcon` and `statsDiskIcon` (text or a
