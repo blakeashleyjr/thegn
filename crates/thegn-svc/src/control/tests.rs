@@ -1103,6 +1103,7 @@ async fn grpc_agent_write_and_dispatch_handlers_match_http_auth_and_shapes() {
     }
     let read = token(&r, "read");
     let write = token(&r, "write");
+    let merge_only = token(&r, "merge_add");
 
     let update = proto::IssuesUpdateRequest {
         id: "linear:ABC-1".into(),
@@ -1165,7 +1166,7 @@ async fn grpc_agent_write_and_dispatch_handlers_match_http_auth_and_shapes() {
         limit: 5,
     };
     assert_eq!(
-        grpc.dispatches_list(request!(&write, list.clone()))
+        grpc.dispatches_list(request!(&merge_only, list.clone()))
             .await
             .unwrap_err()
             .code(),
