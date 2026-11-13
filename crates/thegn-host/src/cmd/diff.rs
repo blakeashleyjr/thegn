@@ -24,7 +24,10 @@ pub fn run(
     // remote worktree.
     let loc = GitLoc::for_worktree(&wt);
 
-    let base = base.unwrap_or_else(|| default_branch(&loc));
+    let base = match base {
+        Some(base) => base,
+        None => default_branch_checked(&loc).map_err(anyhow::Error::msg)?,
+    };
     // Validate an explicitly-resolvable base ref up front. A typo'd `--base`
     // must NOT silently diff against HEAD: exit non-zero so scripts/CI notice
     // the mistake instead of trusting an empty/HEAD-only diff.
@@ -103,7 +106,7 @@ pub fn run(
     Ok(())
 }
 
-fn resolve_target(loc: &GitLoc, base: &str) -> Result<String> {
+pub(crate) fn resolve_target(loc: &GitLoc, base: &str) -> Result<String> {
     match loc.git_text(&[
         "rev-parse",
         "--verify",
@@ -134,35 +137,49 @@ fn git_exit_is_one(error: &GitTextError) -> bool {
     )
 }
 
-/// The repo's default branch (origin/HEAD, else main/master, else HEAD), probed
-/// through the location so it works for remote worktrees too. Shared with the
-/// in-app diff viewer (`diff_view`).
-pub(crate) fn default_branch(loc: &GitLoc) -> String {
-    if let Some(r) = loc.git_out(&[
+/// The repo's default branch (origin/HEAD, else main/master, else HEAD),
+/// preserving failures from Git probes. Shared with the in-app diff viewer.
+pub(crate) fn default_branch_checked(loc: &GitLoc) -> Result<String, String> {
+    match loc.git_text(&[
         "symbolic-ref",
         "--quiet",
         "--short",
         "refs/remotes/origin/HEAD",
     ]) {
-        return r.strip_prefix("origin/").unwrap_or(&r).to_string();
+        Ok(ref_name) if !ref_name.is_empty() => {
+            return Ok(ref_name
+                .strip_prefix("origin/")
+                .unwrap_or(&ref_name)
+                .to_string());
+        }
+        Ok(_) => {}
+        Err(error) if git_exit_is_one(&error) => {}
+        Err(error) => return Err(format!("could not read origin HEAD: {error}")),
     }
-    for b in ["main", "master"] {
-        if loc.git_ok(&[
+    for branch in ["main", "master"] {
+        match loc.git_text(&[
             "show-ref",
             "--verify",
             "--quiet",
-            &format!("refs/heads/{b}"),
+            &format!("refs/heads/{branch}"),
         ]) {
-            return b.to_string();
+            Ok(_) => return Ok(branch.to_string()),
+            Err(error) if git_exit_is_one(&error) => {}
+            Err(error) => {
+                return Err(format!(
+                    "could not check default branch '{branch}': {error}"
+                ));
+            }
         }
     }
-    "HEAD".to_string()
+    Ok("HEAD".to_string())
 }
 
 #[cfg(test)]
 mod tests {
-    use super::resolve_target;
+    use super::{default_branch_checked, git_exit_is_one, resolve_target};
     use std::path::Path;
+    use thegn_core::git_run::{GitOutcome, GitTextError};
     use thegn_core::remote::GitLoc;
 
     #[expect(clippy::disallowed_methods, reason = "test fixture git command")]
@@ -305,5 +322,94 @@ mod tests {
         let result = resolve_target(&GitLoc::Local(repo.path().to_path_buf()), "nope");
         assert!(matches!(result, Err(error)
             if error.to_string() == "unknown base ref 'nope'"));
+    }
+
+    #[test]
+    fn default_branch_checked_uses_main_or_master_without_a_remote() {
+        for branch in ["main", "master"] {
+            let repo = tempfile::tempdir().expect("local repo");
+            git(repo.path(), &["init", "-q", "-b", branch]);
+            std::fs::write(repo.path().join("fixture"), "first\n").expect("write fixture");
+            git(repo.path(), &["add", "fixture"]);
+            git(repo.path(), &["commit", "-q", "-m", "initial"]);
+            assert_eq!(
+                default_branch_checked(&GitLoc::Local(repo.path().to_path_buf())).unwrap(),
+                branch
+            );
+        }
+    }
+
+    #[test]
+    fn missing_ref_classifier_table_keeps_real_failures_typed() {
+        let cases = [
+            (
+                GitTextError::Failed(GitOutcome::Exit {
+                    code: Some(1),
+                    stderr_tail: String::new(),
+                }),
+                true,
+            ),
+            (
+                GitTextError::Failed(GitOutcome::Exit {
+                    code: Some(1),
+                    stderr_tail: "permission denied".into(),
+                }),
+                false,
+            ),
+            (
+                GitTextError::Failed(GitOutcome::Exit {
+                    code: Some(255),
+                    stderr_tail: String::new(),
+                }),
+                false,
+            ),
+        ];
+        for (error, expected_missing) in cases {
+            assert_eq!(git_exit_is_one(&error), expected_missing);
+        }
+    }
+
+    #[test]
+    fn default_branch_checked_keeps_detached_head_on_the_local_default() {
+        let repo = tempfile::tempdir().expect("local repo");
+        committed_repo(repo.path());
+        git(repo.path(), &["checkout", "-q", "--detach"]);
+        assert_eq!(
+            default_branch_checked(&GitLoc::Local(repo.path().to_path_buf())).unwrap(),
+            "main"
+        );
+    }
+
+    #[test]
+    fn default_branch_checked_reports_provider_failures_in_both_exit_arms() {
+        if !crate::platform::sound_process::test_support::UNIX {
+            return;
+        }
+        for exit_code in [1, 255] {
+            let repo = tempfile::tempdir().expect("provider repo");
+            committed_repo(repo.path());
+            let wrapper_dir = tempfile::tempdir().expect("wrapper dir");
+            let location = failing_provider(
+                wrapper_dir.path(),
+                repo.path(),
+                "symbolic-ref --quiet --short",
+                exit_code,
+            );
+            let result = default_branch_checked(&location);
+            assert!(matches!(result, Err(error)
+                if error.contains("could not read origin HEAD")
+                    && error.contains("Connection refused")
+                    && error != "HEAD"));
+        }
+    }
+
+    #[test]
+    fn default_branch_checked_reports_a_bogus_directory_instead_of_head() {
+        let scratch = tempfile::tempdir().expect("scratch");
+        let bogus = scratch.path().join("bogus");
+        std::fs::create_dir(&bogus).expect("bogus directory");
+        let result = default_branch_checked(&GitLoc::Local(bogus));
+        assert!(matches!(result, Err(error)
+            if error.contains("could not read origin HEAD") && error != "HEAD"));
     }
 }

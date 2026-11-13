@@ -117,7 +117,12 @@ impl DiffView {
 
     /// Fold a delivered diff in (the loop guards `generation` first).
     pub fn apply_data(&mut self, data: DiffViewData) {
+        let was_unavailable = self.diff.is_none() && matches!(self.structural, Some(Err(_)));
         self.diff = data.diff;
+        if was_unavailable && self.diff.is_some() {
+            self.structural = None;
+            self.show_structural = self.want_structural;
+        }
         if let Some(structural) = data.structural {
             // A structural failure falls back to the internal view; a success
             // shows structurally (respecting a user's prior toggle-off).
@@ -557,6 +562,9 @@ impl DiffView {
                 false,
             ));
             out.push((Line::Blank, false));
+            if self.diff.is_none() {
+                return out;
+            }
         }
         let Some(diff) = self.active_diff() else {
             let msg = if self.want_structural && self.structural.is_none() {
@@ -959,6 +967,33 @@ mod tests {
         v.handle_key(&KeyCode::Char('t'), Modifiers::NONE);
         assert!(!v.structural_active());
     }
+
+    #[test]
+    fn unavailable_diff_shows_reason_instead_of_loading_or_head() {
+        let mut v = DiffView::with_structural("t".into(), 1, false);
+        v.apply_data(DiffViewData {
+            generation: 1,
+            diff: None,
+            structural: Some(Err("unavailable: could not read origin HEAD".into())),
+            review: None,
+            review_status: None,
+        });
+        let body = format!("{:?}", v.body_lines(40));
+        assert!(body.contains("unavailable: could not read origin HEAD"));
+        assert!(!body.contains("Loading diff"));
+        assert!(!body.contains("HEAD-only"));
+
+        v.apply_data(DiffViewData {
+            generation: 1,
+            diff: Some(thegn_core::forge::model::parse_unified_diff("")),
+            structural: None,
+            review: None,
+            review_status: None,
+        });
+        let body = format!("{:?}", v.body_lines(40));
+        assert!(!body.contains("unavailable:"));
+    }
+
     #[test]
     fn submodule_file_is_one_atomic_pointer_row() {
         let mut v = DiffView::with_structural("t".into(), 1, false);

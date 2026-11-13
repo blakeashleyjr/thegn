@@ -922,6 +922,138 @@ impl Control for GrpcControl {
         Ok(Response::new(proto::IssuesGetReply { detail_json }))
     }
 
+    async fn issues_update(
+        &self,
+        req: Request<proto::IssuesUpdateRequest>,
+    ) -> Result<Response<proto::IssuesUpdateReply>, Status> {
+        self.authed(&req, Verb::IssuesUpdate)?;
+        let request = req.into_inner();
+        crate::issue::validate_control_issue_id(&request.id)
+            .map_err(|error| Status::invalid_argument(error.to_string()))?;
+        let patch = request
+            .patch
+            .map(issue_patch_from_proto)
+            .transpose()?
+            .unwrap_or_default();
+        let issue = self
+            .api
+            .issues_update(
+                &request.id,
+                &patch,
+                nonempty(&request.repo),
+                nonempty(&request.account),
+            )
+            .await
+            .map_err(Status::from)?;
+        let issue_json =
+            serde_json::to_string(&issue).map_err(|error| Status::internal(error.to_string()))?;
+        Ok(Response::new(proto::IssuesUpdateReply { issue_json }))
+    }
+
+    async fn issues_comment(
+        &self,
+        req: Request<proto::IssuesCommentRequest>,
+    ) -> Result<Response<proto::IssuesCommentReply>, Status> {
+        self.authed(&req, Verb::IssuesComment)?;
+        let request = req.into_inner();
+        crate::issue::validate_control_issue_id(&request.id)
+            .map_err(|error| Status::invalid_argument(error.to_string()))?;
+        self.api
+            .issues_comment(
+                &request.id,
+                &request.body,
+                nonempty(&request.repo),
+                nonempty(&request.account),
+            )
+            .await
+            .map_err(Status::from)?;
+        Ok(Response::new(proto::IssuesCommentReply {
+            commented: request.id,
+        }))
+    }
+
+    async fn dispatches_list(
+        &self,
+        req: Request<proto::DispatchesListRequest>,
+    ) -> Result<Response<proto::DispatchesListReply>, Status> {
+        self.authed(&req, Verb::DispatchesList)?;
+        let request = req.into_inner();
+        let limit = if request.limit == 0 {
+            thegn_core::db::Db::ROSTER_HISTORY_LIMIT
+        } else {
+            usize::try_from(request.limit)
+                .map_err(|_| Status::invalid_argument("limit is too large"))?
+        };
+        if limit == 0 || limit > thegn_core::db::Db::ROSTER_ACTIVE_LIMIT {
+            return Err(Status::invalid_argument(format!(
+                "limit must be between 1 and {}",
+                thegn_core::db::Db::ROSTER_ACTIVE_LIMIT
+            )));
+        }
+        let page = self
+            .api
+            .dispatches_list(request.before, limit)
+            .await
+            .map_err(Status::from)?;
+        let dispatches_json = serde_json::to_string(&page.dispatches)
+            .map_err(|error| Status::internal(error.to_string()))?;
+        Ok(Response::new(proto::DispatchesListReply {
+            dispatches_json,
+            truncated: page.truncated,
+            next_before: page.next_before,
+        }))
+    }
+
+    async fn dispatches_put(
+        &self,
+        req: Request<proto::DispatchesPutRequest>,
+    ) -> Result<Response<proto::DispatchesPutReply>, Status> {
+        self.authed(&req, Verb::DispatchesPut)?;
+        let request = req.into_inner();
+        let row = self
+            .api
+            .dispatch_put(super::DispatchPutReq {
+                issue_id: request.issue_id,
+                worktree_path: request.worktree_path,
+                agent_name: request.agent_name,
+                stage: request.stage,
+                parent_id: request.parent_id,
+                session_id: request.session_id,
+                artifact_path: request.artifact_path,
+                lead: request.lead.map(dispatch_lead_from_proto),
+            })
+            .await
+            .map_err(Status::from)?;
+        let dispatch_json =
+            serde_json::to_string(&row).map_err(|error| Status::internal(error.to_string()))?;
+        Ok(Response::new(proto::DispatchesPutReply { dispatch_json }))
+    }
+
+    async fn dispatches_set_status(
+        &self,
+        req: Request<proto::DispatchesSetStatusRequest>,
+    ) -> Result<Response<proto::DispatchesSetStatusReply>, Status> {
+        self.authed(&req, Verb::DispatchesSetStatus)?;
+        let request = req.into_inner();
+        if request.status.is_empty() {
+            return Err(Status::invalid_argument("status is required"));
+        }
+        let status = thegn_core::issue::AgentDispatchStatus::parse(&request.status);
+        let result = match request.lead {
+            Some(lead) => {
+                self.api
+                    .dispatch_set_status_led(request.id, status, dispatch_lead_from_proto(lead))
+                    .await
+            }
+            None => self.api.dispatch_set_status(request.id, status).await,
+        };
+        result.map_err(Status::from)?;
+        Ok(Response::new(proto::DispatchesSetStatusReply {
+            id: request.id,
+            status: status.as_str().to_string(),
+        }))
+    }
+
     async fn notify_push(
         &self,
         req: Request<proto::NotifyPushRequest>,
@@ -1066,6 +1198,11 @@ pub const GRPC_CAPS: &[&str] = &[
     "mcp_proxy.reload",
     "issues.list",
     "issues.get",
+    "issues.update",
+    "issues.comment",
+    "dispatches.list",
+    "dispatches.put",
+    "dispatches.set_status",
     "notify.push",
     "automations.list",
     "automations.test",
@@ -1074,6 +1211,48 @@ pub const GRPC_CAPS: &[&str] = &[
 
 fn nonempty(value: &str) -> Option<&str> {
     (!value.is_empty()).then_some(value)
+}
+
+#[allow(clippy::result_large_err)]
+fn issue_patch_from_proto(
+    patch: proto::IssuePatch,
+) -> Result<thegn_core::issue::IssuePatch, Status> {
+    let status = patch
+        .status
+        .map(|status| match status.as_str() {
+            "backlog" => Ok(thegn_core::issue::IssueStatus::Backlog),
+            "todo" => Ok(thegn_core::issue::IssueStatus::Todo),
+            "in_progress" => Ok(thegn_core::issue::IssueStatus::InProgress),
+            "done" => Ok(thegn_core::issue::IssueStatus::Done),
+            "cancelled" => Ok(thegn_core::issue::IssueStatus::Cancelled),
+            _ => Err(Status::invalid_argument("unknown issue status")),
+        })
+        .transpose()?;
+    let priority = patch
+        .priority
+        .map(|priority| match priority.as_str() {
+            "urgent" => Ok(thegn_core::issue::IssuePriority::Urgent),
+            "high" => Ok(thegn_core::issue::IssuePriority::High),
+            "medium" => Ok(thegn_core::issue::IssuePriority::Medium),
+            "low" => Ok(thegn_core::issue::IssuePriority::Low),
+            "none" => Ok(thegn_core::issue::IssuePriority::None),
+            _ => Err(Status::invalid_argument("unknown issue priority")),
+        })
+        .transpose()?;
+    Ok(thegn_core::issue::IssuePatch {
+        status,
+        title: patch.title,
+        assignee_me: patch.assignee_me,
+        priority,
+    })
+}
+
+fn dispatch_lead_from_proto(lead: proto::DispatchLead) -> super::DispatchLeadReq {
+    super::DispatchLeadReq {
+        lease: lead.lease,
+        owner: lead.owner,
+        lease_gen: lead.lease_gen,
+    }
 }
 
 #[cfg(test)]

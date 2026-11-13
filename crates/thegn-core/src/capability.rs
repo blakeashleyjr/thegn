@@ -547,7 +547,7 @@ pub const CATALOG: &[HostCapability] = &[
     cap(
         "doctor.bundle",
         Verb::DoctorBundle,
-        SurfaceSet::OPERATOR,
+        SurfaceSet::of(&[Surface::Cli]),
         "Write a redacted debug support bundle (doctor JSON, config, log tails, crash reports)",
     ),
     // --- secrets (credential broker, THE-66) ---------------------------------
@@ -774,20 +774,21 @@ pub const CATALOG: &[HostCapability] = &[
         "Assign or clear a worktree's repo-local sidebar folder",
     ),
     // --- workspace search & replace (THE-5) ---------------------------------
-    // Driven by the local `thegn search` CLI verb (in-process against the
-    // worktree filesystem, like `thegn open`/`wt list`), not the control API —
-    // hence CLI-only and excused in SURFACE_GAPS for the control-client
-    // coverage test. Read/write scope is enforced via `required_scope`.
+    // Driven by the local `thegn search` implementation (in-process against
+    // the worktree filesystem, like `thegn open`/`wt list`), not an external
+    // control surface. The rows remain in the catalog for shared capability
+    // identity and scope policy, but claim no surface. Read/write scope is
+    // enforced via `required_scope`.
     cap(
         "search.query",
         Verb::SearchQuery,
-        SurfaceSet::of(&[Surface::Cli]),
+        SurfaceSet::NONE,
         "Run a workspace text/structural search (JSON output)",
     ),
     cap(
         "search.replace",
         Verb::SearchReplace,
-        SurfaceSet::of(&[Surface::Cli]),
+        SurfaceSet::NONE,
         "Apply a workspace search-and-replace through the guarded write path",
     ),
     // --- containers ----------------------------------------------------------
@@ -880,7 +881,7 @@ pub const CATALOG: &[HostCapability] = &[
 /// dispatches every non-streaming row generically); **MCP** owes its remaining state
 /// tools; **gRPC** owes the mirror for the rows HTTP already serves; and
 /// **HTTP** owes control routes for the CLI-first operator families
-/// (`secret.*`, `project.*`, `containers.*`, `doctor.bundle`, `launch.preset`)
+/// (`secret.*`, `project.*`, `containers.*`, `launch.preset`)
 /// — those run against local custody today, so the CLI implements them directly.
 pub const SURFACE_GAPS: &[(&str, Surface, &str)] = &[
     // -- gRPC: the mirror lags HTTP; each is a proto + handler addition -------
@@ -893,20 +894,6 @@ pub const SURFACE_GAPS: &[(&str, Surface, &str)] = &[
         "launch.preset",
         Surface::Http,
         "CLI-first (`open --preset` via the intents mailbox); an HTTP route is a follow-up",
-    ),
-    // The debug bundle is a local operator operation (`thegn doctor bundle`): it
-    // reads local log files + crash reports and writes an archive. The CLI verb
-    // exists; the control-plane routes are not wired (a remote client would want
-    // its own local bundle, not the daemon's), so both are excused here.
-    (
-        "doctor.bundle",
-        Surface::Http,
-        "local CLI operator verb; no control route (bundle reads local files)",
-    ),
-    (
-        "doctor.bundle",
-        Surface::Grpc,
-        "local CLI operator verb; no control route (bundle reads local files)",
     ),
     // -- secrets: CLI-implemented locally; control-API routes deferred ---------
     // The `secret.*` verbs run against local custody (keyring / config file), so
@@ -1095,19 +1082,6 @@ pub const SURFACE_GAPS: &[(&str, Surface, &str)] = &[
         Surface::Grpc,
         "control-API route deferred; CLI-only for now",
     ),
-    // -- CLI: local worktree-fs verbs, not driven through the control API ------
-    // (`thegn search` runs in-process against the worktree, like `thegn open`;
-    // `cli_control_caps` only measures control-client-driven caps).
-    (
-        "search.query",
-        Surface::Cli,
-        "local worktree-fs verb; runs in-process, not through the control API",
-    ),
-    (
-        "search.replace",
-        Surface::Cli,
-        "local worktree-fs verb; runs in-process, not through the control API",
-    ),
     // -- MCP: state tools not yet landed (the MCP write-tools branch retires
     //    these). The plugin surface has NO excuses left: `host.call` dispatches
     //    every non-streaming row generically off the `API_CALLS` spine.
@@ -1177,31 +1151,6 @@ pub const SURFACE_GAPS: &[(&str, Surface, &str)] = &[
     // gRPC mirroring and MCP state tools follow the same phased path as every
     // other state cap above — recorded, not built, here. Plugin dispatch is
     // generic and needs no excuse.
-    (
-        "issues.update",
-        Surface::Grpc,
-        "not yet mirrored in control.proto",
-    ),
-    (
-        "issues.comment",
-        Surface::Grpc,
-        "not yet mirrored in control.proto",
-    ),
-    (
-        "dispatches.list",
-        Surface::Grpc,
-        "not yet mirrored in control.proto",
-    ),
-    (
-        "dispatches.put",
-        Surface::Grpc,
-        "not yet mirrored in control.proto",
-    ),
-    (
-        "dispatches.set_status",
-        Surface::Grpc,
-        "not yet mirrored in control.proto",
-    ),
     (
         "worktrees.create",
         Surface::Grpc,
@@ -1380,37 +1329,12 @@ pub const GAP_DISPOSITIONS: &[(&str, Surface, GapDisposition)] = &[
         Surface::Http,
         GapDisposition::Deferred { review: "THE-201" },
     ),
-    ("doctor.bundle", Surface::Http, GapDisposition::LocalOnly),
-    (
-        "secret.set",
-        Surface::Http,
-        GapDisposition::Deferred { review: "THE-201" },
-    ),
-    (
-        "secret.rm",
-        Surface::Http,
-        GapDisposition::Deferred { review: "THE-201" },
-    ),
-    (
-        "secret.list",
-        Surface::Http,
-        GapDisposition::Deferred { review: "THE-201" },
-    ),
-    (
-        "secret.migrate",
-        Surface::Http,
-        GapDisposition::Deferred { review: "THE-201" },
-    ),
-    (
-        "secret.audit",
-        Surface::Http,
-        GapDisposition::Deferred { review: "THE-201" },
-    ),
-    (
-        "secret.ssh.rotate",
-        Surface::Http,
-        GapDisposition::Deferred { review: "THE-201" },
-    ),
+    ("secret.set", Surface::Http, GapDisposition::Unsafe),
+    ("secret.rm", Surface::Http, GapDisposition::Unsafe),
+    ("secret.list", Surface::Http, GapDisposition::Unsafe),
+    ("secret.migrate", Surface::Http, GapDisposition::Unsafe),
+    ("secret.audit", Surface::Http, GapDisposition::Unsafe),
+    ("secret.ssh.rotate", Surface::Http, GapDisposition::Unsafe),
     (
         "program.list",
         Surface::Http,
@@ -1512,37 +1436,12 @@ pub const GAP_DISPOSITIONS: &[(&str, Surface, GapDisposition)] = &[
         Surface::Grpc,
         GapDisposition::Deferred { review: "THE-204" },
     ),
-    ("doctor.bundle", Surface::Grpc, GapDisposition::LocalOnly),
-    (
-        "secret.set",
-        Surface::Grpc,
-        GapDisposition::Deferred { review: "THE-204" },
-    ),
-    (
-        "secret.rm",
-        Surface::Grpc,
-        GapDisposition::Deferred { review: "THE-204" },
-    ),
-    (
-        "secret.list",
-        Surface::Grpc,
-        GapDisposition::Deferred { review: "THE-204" },
-    ),
-    (
-        "secret.migrate",
-        Surface::Grpc,
-        GapDisposition::Deferred { review: "THE-204" },
-    ),
-    (
-        "secret.audit",
-        Surface::Grpc,
-        GapDisposition::Deferred { review: "THE-204" },
-    ),
-    (
-        "secret.ssh.rotate",
-        Surface::Grpc,
-        GapDisposition::Deferred { review: "THE-204" },
-    ),
+    ("secret.set", Surface::Grpc, GapDisposition::Unsafe),
+    ("secret.rm", Surface::Grpc, GapDisposition::Unsafe),
+    ("secret.list", Surface::Grpc, GapDisposition::Unsafe),
+    ("secret.migrate", Surface::Grpc, GapDisposition::Unsafe),
+    ("secret.audit", Surface::Grpc, GapDisposition::Unsafe),
+    ("secret.ssh.rotate", Surface::Grpc, GapDisposition::Unsafe),
     (
         "program.list",
         Surface::Grpc,
@@ -1600,31 +1499,6 @@ pub const GAP_DISPOSITIONS: &[(&str, Surface, GapDisposition)] = &[
     ),
     (
         "project.new_feature",
-        Surface::Grpc,
-        GapDisposition::Deferred { review: "THE-204" },
-    ),
-    (
-        "issues.update",
-        Surface::Grpc,
-        GapDisposition::Deferred { review: "THE-204" },
-    ),
-    (
-        "issues.comment",
-        Surface::Grpc,
-        GapDisposition::Deferred { review: "THE-204" },
-    ),
-    (
-        "dispatches.list",
-        Surface::Grpc,
-        GapDisposition::Deferred { review: "THE-204" },
-    ),
-    (
-        "dispatches.put",
-        Surface::Grpc,
-        GapDisposition::Deferred { review: "THE-204" },
-    ),
-    (
-        "dispatches.set_status",
         Surface::Grpc,
         GapDisposition::Deferred { review: "THE-204" },
     ),
@@ -1774,9 +1648,6 @@ pub const GAP_DISPOSITIONS: &[(&str, Surface, GapDisposition)] = &[
         Surface::Mcp,
         GapDisposition::Deferred { review: "THE-203" },
     ),
-    // -- cli: only the local worktree-fs search verbs remain excused ---------
-    ("search.query", Surface::Cli, GapDisposition::LocalOnly),
-    ("search.replace", Surface::Cli, GapDisposition::LocalOnly),
 ];
 
 /// The disposition of an excused gap; `None` when `(id, s)` is not a gap.
@@ -2190,6 +2061,20 @@ mod tests {
     }
 
     #[test]
+    fn local_search_and_doctor_rows_claim_only_intended_surfaces() {
+        let doctor = lookup("doctor.bundle").unwrap();
+        assert_eq!(doctor.surfaces, SurfaceSet::of(&[Surface::Cli]));
+        assert!(!is_gap("doctor.bundle", Surface::Http));
+        assert!(!is_gap("doctor.bundle", Surface::Grpc));
+        for id in ["search.query", "search.replace"] {
+            assert_eq!(lookup(id).unwrap().surfaces, SurfaceSet::NONE, "{id}");
+            for surface in Surface::ALL {
+                assert!(!is_gap(id, *surface), "{id}/{}", surface.as_str());
+            }
+        }
+    }
+
+    #[test]
     fn advertised_supported_operations_have_no_universal_stubs() {
         let stubbed: Vec<(&str, &str)> = stubs()
             .map(|capability| (capability.id.0, capability.stub.unwrap_or_default()))
@@ -2207,7 +2092,7 @@ mod tests {
         assert_eq!(l.implemented, 1, "sessions.list is working");
         assert_eq!(l.stub, 0, "no universally inert row is advertised");
         // HTTP is no longer excuse-free: the CLI-first operator families
-        // (`secret.*`, `project.*`, `containers.*`, `doctor.bundle`,
+        // (`secret.*`, `project.*`, `containers.*`,
         // `launch.preset`) declare an HTTP surface whose route is still owed.
         // Derive the count from the table so this pins the ledger's arithmetic,
         // not a number that rots with every burn-down.

@@ -9,9 +9,8 @@
 //!
 //! The archive is a hand-rolled ustar tar wrapped in gzip (`flate2`): no new
 //! vendored crate, cross-compilable. Everything it writes is local; the verb is
-//! catalog-gated (`doctor.bundle`, admin scope, operator surface — never MCP or
-//! plugins), so an agent in a pane cannot exfiltrate a bundle through thegn's
-//! own API.
+//! catalog-gated (`doctor.bundle`, admin scope, CLI-only), so an agent in a pane
+//! cannot exfiltrate a bundle through thegn's own API.
 
 #![allow(clippy::disallowed_macros)] // a CLI verb: println! is the user surface
 
