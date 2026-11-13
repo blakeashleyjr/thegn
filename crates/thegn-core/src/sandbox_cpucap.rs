@@ -213,14 +213,33 @@ pub fn detect_cpu_cap() -> CpuCap {
 /// Whether systemd's user manager can be reached with the current environment.
 /// `systemd-run --user` looks first for `$XDG_RUNTIME_DIR/systemd/private`,
 /// then for the user bus at `DBUS_SESSION_BUS_ADDRESS` or
-/// `$XDG_RUNTIME_DIR/bus`. A non-empty bus address is trusted, not probed.
+/// `$XDG_RUNTIME_DIR/bus`. Address transports other than a directly checkable
+/// `unix:path=` are trusted, but missing unix socket paths fall through to the
+/// runtime-directory checks below.
 pub fn user_manager_reachable(
     runtime_dir: Option<&std::ffi::OsStr>,
     bus_address: Option<&std::ffi::OsStr>,
     exists: &dyn Fn(&std::path::Path) -> bool,
 ) -> bool {
-    if bus_address.is_some_and(|address| !address.is_empty()) {
-        return true;
+    if let Some(address) = bus_address.filter(|address| !address.is_empty()) {
+        let address = address.to_string_lossy();
+        let mut saw_unix_path = false;
+        for entry in address.split([',', ';']).map(str::trim) {
+            if let Some(path) = entry.strip_prefix("unix:path=") {
+                saw_unix_path = true;
+                if exists(std::path::Path::new(path)) {
+                    return true;
+                }
+            } else if entry.starts_with("unix:") || entry.contains(':') {
+                // Abstract sockets, unix transports that cannot be checked
+                // cheaply, and every other transport retain the old trusted
+                // behavior.
+                return true;
+            }
+        }
+        if !saw_unix_path {
+            return true;
+        }
     }
     let Some(runtime_dir) = runtime_dir.filter(|dir| !dir.is_empty()) else {
         return false;
@@ -591,14 +610,28 @@ pub(crate) fn systemd_cap_args(limits: &SandboxLimits) -> Vec<String> {
 /// probed host mechanism. A no-op unless the backend is a local host-toolchain
 /// shell with something to enforce.
 pub(crate) fn wrap_pane_argv(spec: &SandboxSpec, argv: Vec<String>) -> Vec<String> {
-    cap_prefix(
+    let argv_original = argv.clone();
+    let wrapped = cap_prefix(
         spec.backend,
         spec.placement.is_local(),
         &spec.limits,
         argv,
         detect_cpu_cap(),
         CapRole::Pane,
-    )
+    );
+    pane_wrap_or_plain(wrapped, argv_original, scope_known_unusable())
+}
+
+fn pane_wrap_or_plain(
+    wrapped: Vec<String>,
+    original: Vec<String>,
+    scope_unusable: bool,
+) -> Vec<String> {
+    if wrapped.first().map(String::as_str) == Some("systemd-run") && scope_unusable {
+        original
+    } else {
+        wrapped
+    }
 }
 
 /// Wrap a provider-backed pane argv with the same CPU/memory policy used by a
@@ -761,6 +794,12 @@ pub fn wrap_uncontained_pane_argv(argv: Vec<String>) -> Vec<String> {
 /// `~/.config/thegn/config.toml` and spawning real scopes.
 static BACKGROUND_LIMITS: OnceLock<SandboxLimits> = OnceLock::new();
 
+static SCOPE_USABLE: OnceLock<bool> = OnceLock::new();
+
+fn scope_known_unusable() -> bool {
+    SCOPE_USABLE.get() == Some(&false)
+}
+
 /// Publish the resource policy for background-job wrapping. Idempotent; the
 /// first call wins.
 pub fn publish_background_limits(limits: SandboxLimits) {
@@ -782,8 +821,7 @@ pub fn publish_background_limits(limits: SandboxLimits) {
 /// process (memoized) to be sure. Only background callers reach this; the pane
 /// path must never spawn near the event loop.
 fn background_scope_usable() -> bool {
-    static OK: OnceLock<bool> = OnceLock::new();
-    *OK.get_or_init(|| {
+    *SCOPE_USABLE.get_or_init(|| {
         std::process::Command::new("systemd-run")
             .args([
                 "--user",
@@ -1394,9 +1432,37 @@ mod tests {
                 true,
             ),
             (
-                "bus address only",
+                "bus address path exists",
                 None,
                 Some("unix:path=/bus"),
+                HashSet::from([PathBuf::from("/bus")]),
+                true,
+            ),
+            (
+                "bus address path missing",
+                None,
+                Some("unix:path=/bus"),
+                HashSet::new(),
+                false,
+            ),
+            (
+                "bus address path missing but runtime bus exists",
+                Some("/runtime/test"),
+                Some("unix:path=/bus"),
+                HashSet::from([runtime.join("bus")]),
+                true,
+            ),
+            (
+                "abstract bus address",
+                None,
+                Some("unix:abstract=x"),
+                HashSet::new(),
+                true,
+            ),
+            (
+                "path and abstract bus addresses",
+                None,
+                Some("unix:path=/a,unix:abstract=b"),
                 HashSet::new(),
                 true,
             ),
@@ -1440,6 +1506,29 @@ mod tests {
         assert_eq!(scope_skipped_note(true, true, true, true), None);
         assert_eq!(scope_skipped_note(false, true, false, true), None);
         assert_eq!(scope_skipped_note(true, false, false, true), None);
+    }
+
+    #[test]
+    fn pane_scope_fallback_returns_plain_argv_when_scope_is_known_unusable() {
+        let wrapped = vec![
+            "systemd-run".into(),
+            "--scope".into(),
+            "--".into(),
+            "sh".into(),
+        ];
+        let original = vec!["sh".into(), "-lc".into(), "echo pane".into()];
+        assert_eq!(
+            pane_wrap_or_plain(wrapped.clone(), original.clone(), true),
+            original
+        );
+        assert_eq!(
+            pane_wrap_or_plain(wrapped.clone(), original, false),
+            wrapped
+        );
+        assert_eq!(
+            pane_wrap_or_plain(vec!["sh".into()], vec!["plain".into()], true),
+            vec!["sh".to_string()]
+        );
     }
 
     #[test]

@@ -224,6 +224,7 @@ pub fn run(cfg: &Config, worktree: Option<String>, trust_gate: bool) -> Result<(
             db.db(),
             wt.to_string_lossy().as_ref(),
             label,
+            "land",
             tracking_outcome,
         )
     {
