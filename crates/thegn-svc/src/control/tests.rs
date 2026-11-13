@@ -975,15 +975,13 @@ async fn grpc_mcp_proxy_reload_requires_write_before_calling_api() {
         daemon_euid: None,
         server_label: "test thegn".into(),
     };
-    for scope in ["read"] {
-        let bearer = token(&r, scope);
-        let mut request = tonic::Request::new(proto::McpProxyReloadRequest {});
-        request
-            .metadata_mut()
-            .insert("authorization", format!("Bearer {bearer}").parse().unwrap());
-        let error = grpc.mcp_proxy_reload(request).await.unwrap_err();
-        assert_eq!(error.code(), tonic::Code::PermissionDenied, "{scope}");
-    }
+    let bearer = token(&r, "read");
+    let mut request = tonic::Request::new(proto::McpProxyReloadRequest {});
+    request
+        .metadata_mut()
+        .insert("authorization", format!("Bearer {bearer}").parse().unwrap());
+    let error = grpc.mcp_proxy_reload(request).await.unwrap_err();
+    assert_eq!(error.code(), tonic::Code::PermissionDenied);
     assert!(r.api.calls().is_empty(), "denial must not reach the API");
 
     let read = token(&r, "read");
