@@ -373,7 +373,7 @@ fn validate_dns_host(host: &str) -> Option<String> {
             && !(bytes.len() >= 4
                 && bytes[2] == b'-'
                 && bytes[3] == b'-'
-                && !label.starts_with("xn--"))
+                && !bytes[..4].eq_ignore_ascii_case(b"xn--"))
     }) {
         return None;
     }
