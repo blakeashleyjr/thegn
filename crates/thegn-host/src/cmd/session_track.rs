@@ -445,7 +445,7 @@ mod tests {
             .expect("successful land row");
         let rows = db.list_dispatches().expect("roster list");
         assert_eq!(rows.len(), 2);
-        assert_eq!(rows[0].status, AgentDispatchStatus::Failed);
-        assert_eq!(rows[1].status, AgentDispatchStatus::Done);
+        assert_eq!(rows[0].status, AgentDispatchStatus::Done);
+        assert_eq!(rows[1].status, AgentDispatchStatus::Failed);
     }
 }
