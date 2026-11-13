@@ -87,14 +87,6 @@ const OMITTED: &[(&str, &str)] = &[
         "string-typed urgency has no destination enum to pin and is not exposed",
     ),
     (
-        "sandbox.limits.heavy_slots",
-        "serialising heavy jobs is a host-local policy, not exposed",
-    ),
-    (
-        "sandbox.limits.max_load",
-        "serialising heavy jobs is a host-local policy, not exposed",
-    ),
-    (
         "notifications.process_exit",
         "string-typed exit policy has no destination enum to pin and is not exposed",
     ),
@@ -218,10 +210,6 @@ const OMITTED: &[(&str, &str)] = &[
         "media backend enum needs destination pinning and is not exposed",
     ),
     (
-        "media.default_action",
-        "media default-action enum needs destination pinning and is not exposed",
-    ),
-    (
         "media.volume_step",
         "media volume step is a float and needs float pinning",
     ),
@@ -249,10 +237,6 @@ const OMITTED: &[(&str, &str)] = &[
     ("usage.alerts", "usage alert policy is not exposed"),
     ("model_proxy", "model proxy is not exposed"),
     ("remote", "remote connection tuning is not exposed"),
-    (
-        "network.mode",
-        "offline-detection mode enum needs destination pinning and is not exposed",
-    ),
     (
         "host_discovery.kind",
         "host discovery backend enum needs destination pinning and is not exposed",
@@ -638,7 +622,10 @@ fn numeric_options(src: &str) -> Vec<(String, String)> {
             continue;
         };
         let expr = strip_null_or(expr);
-        if !(expr.starts_with("lib.types.int") || expr == "lib.types.port") {
+        if !(expr.starts_with("lib.types.int")
+            || expr.starts_with("lib.types.numbers.")
+            || expr == "lib.types.port")
+        {
             continue;
         }
         let name = lines[..i]
@@ -947,6 +934,34 @@ fn hm_git_enum_options_offer_only_canonical_spellings() {
 }
 
 #[test]
+fn hm_network_media_enum_options_offer_only_canonical_spellings() {
+    let expected = [
+        ("networkMode", "network.mode"),
+        ("mediaDefaultAction", "media.default_action"),
+    ];
+    let enums = enum_lists(&module_src());
+    for (option, path) in expected {
+        let values = enums
+            .iter()
+            .find(|(name, _)| name == option)
+            .map(|(_, values)| values)
+            .unwrap_or_else(|| panic!("Home Manager enum option `{option}` is missing"));
+        let actual: BTreeSet<&str> = values.iter().map(String::as_str).collect();
+        let schema = schema_field(path);
+        let canonical: BTreeSet<&str> = schema["enum"]
+            .as_array()
+            .unwrap_or_else(|| panic!("destination `{path}` has no enum"))
+            .iter()
+            .filter_map(Value::as_str)
+            .collect();
+        assert_eq!(
+            actual, canonical,
+            "Home Manager enum option `{option}` must expose exactly canonical values for `{path}`"
+        );
+    }
+}
+
+#[test]
 fn hm_search_and_palette_families_are_fully_rendered() {
     let rendered = rendered_paths(&module_src());
     for table in ["search", "palette"] {
@@ -1225,6 +1240,8 @@ fn hm_limits_and_diagnostics_keys_are_rendered_and_rest_dispositioned() {
         "limits.test_timeout_secs",
         "limits.discover_timeout_secs",
         "limits.isolated_target_dir",
+        "sandbox.limits.heavy_slots",
+        "sandbox.limits.max_load",
         "diagnostics.crash_reports",
         "diagnostics.crash_retention",
         "diagnostics.ring_size",
@@ -1582,6 +1599,8 @@ fn every_numeric_option_matches_its_destination_range() {
             "git.auto_fetch_min_interval_secs",
         ),
         ("recordingMaxBytes", "recording.max_bytes"),
+        ("limitsHeavySlots", "sandbox.limits.heavy_slots"),
+        ("limitsMaxLoad", "sandbox.limits.max_load"),
         ("mediaSeekStepSecs", "media.seek_step_secs"),
         ("mediaSeekStepVideoSecs", "media.seek_step_video_secs"),
         ("mediaPollIntervalSecs", "media.poll_interval_secs"),
@@ -1629,11 +1648,34 @@ fn every_numeric_option_matches_its_destination_range() {
             .find_map(|(option, path)| (*option == name).then_some(*path))
             .expect("numeric option destination");
         let schema = schema_field(path);
-        assert_eq!(
-            schema.get("type").and_then(Value::as_str),
-            Some("integer"),
-            "schema type for {path}"
-        );
+        let schema_type = schema.get("type").and_then(Value::as_str);
+        if schema_type == Some("number") {
+            let format = schema.get("format").and_then(Value::as_str);
+            assert!(
+                format.is_none() || format == Some("double"),
+                "schema number format for {path} must be absent, got {format:?}"
+            );
+            let minimum = schema.get("minimum").and_then(Value::as_f64);
+            let maximum = schema.get("maximum").and_then(Value::as_f64);
+            match (minimum, maximum) {
+                (Some(0.0), None) => {
+                    assert_eq!(
+                        nix_type, "lib.types.numbers.nonnegative",
+                        "Nix type for non-negative float field {path}"
+                    );
+                }
+                (Some(minimum), Some(maximum)) => {
+                    assert_eq!(
+                        nix_type,
+                        format!("lib.types.numbers.between {minimum} {maximum}"),
+                        "Nix type for bounded float field {path}"
+                    );
+                }
+                _ => panic!("float schema range for {path} is not pinned; add a Nix mapping"),
+            }
+            continue;
+        }
+        assert_eq!(schema_type, Some("integer"), "schema type for {path}");
         if path == "preview.fetch_timeout_ms" {
             assert_eq!(
                 nix_type,
@@ -1773,6 +1815,8 @@ fn every_nix_enum_matches_its_destination_enum() {
         ("gitBackend", "git.backend"),
         ("gitStructuralDiff", "git.structural_diff"),
         ("gitSubmodules", "git.submodules"),
+        ("networkMode", "network.mode"),
+        ("mediaDefaultAction", "media.default_action"),
     ];
     let enums = enum_lists(&module_src());
     let actual_names: BTreeSet<&str> = enums.iter().map(|(name, _)| name.as_str()).collect();
