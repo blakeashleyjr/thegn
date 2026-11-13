@@ -2053,6 +2053,69 @@ async fn parallel_fast_account_applies_before_slow_sibling() {
 }
 
 #[tokio::test(start_paused = true)]
+async fn paused_clock_persists_fast_result_while_hung_sibling_runs() {
+    let active = std::sync::Arc::new(ActiveFetches::default());
+    let router = timed_router(vec![
+        (
+            "hung".into(),
+            FetchClass::Network,
+            "slow-provider",
+            std::time::Duration::from_secs(100_000),
+            false,
+            active.clone(),
+        ),
+        (
+            "fast".into(),
+            FetchClass::Network,
+            "fast-provider",
+            std::time::Duration::from_secs(1),
+            false,
+            active.clone(),
+        ),
+    ]);
+    let (persisted_tx, persisted_rx) = tokio::sync::oneshot::channel();
+    let start = tokio::time::Instant::now();
+    let pass = tokio::spawn(async move {
+        let mut persisted_tx = Some(persisted_tx);
+        router
+            .list_events_pass(
+                calendar_window(),
+                &BTreeMap::new(),
+                || true,
+                |result| {
+                    if result.account == "fast"
+                        && let Some(tx) = persisted_tx.take()
+                    {
+                        tx.send(tokio::time::Instant::now()).unwrap();
+                    }
+                },
+            )
+            .await
+    });
+
+    // Poll once to launch both accounts, then move only the fast account's
+    // clock forward. The pass must remain in flight for the hung sibling.
+    tokio::task::yield_now().await;
+    tokio::time::advance(std::time::Duration::from_secs(1)).await;
+    let persisted_at = persisted_rx.await.unwrap();
+    assert_eq!(
+        persisted_at.duration_since(start),
+        std::time::Duration::from_secs(1)
+    );
+    assert!(
+        !pass.is_finished(),
+        "the hung sibling must still hold the pass"
+    );
+    assert_eq!(active.active.load(std::sync::atomic::Ordering::SeqCst), 1);
+
+    pass.abort();
+    assert!(
+        pass.await.is_err(),
+        "aborting the pass must cancel its future"
+    );
+}
+
+#[tokio::test(start_paused = true)]
 async fn parallel_network_cap_is_never_exceeded() {
     let active = std::sync::Arc::new(ActiveFetches::default());
     let router = timed_router(
@@ -2162,6 +2225,71 @@ async fn parallel_command_accounts_run_one_at_a_time() {
     assert_eq!(commands.max.load(std::sync::atomic::Ordering::SeqCst), 1);
     assert_eq!(locals.max.load(std::sync::atomic::Ordering::SeqCst), 1);
     assert_eq!(completed, 5);
+}
+
+#[tokio::test(start_paused = true)]
+async fn repeated_ticks_do_not_starve_command_or_local_accounts() {
+    let network = std::sync::Arc::new(ActiveFetches::default());
+    let command = std::sync::Arc::new(ActiveFetches::default());
+    let local = std::sync::Arc::new(ActiveFetches::default());
+    let mut accounts = (0..8)
+        .map(|index| {
+            (
+                format!("network-{index}"),
+                FetchClass::Network,
+                "ics-url",
+                std::time::Duration::from_secs(5),
+                false,
+                network.clone(),
+            )
+        })
+        .collect::<Vec<_>>();
+    accounts.push((
+        "command".into(),
+        FetchClass::Command,
+        "command",
+        std::time::Duration::from_secs(1),
+        false,
+        command.clone(),
+    ));
+    accounts.push((
+        "local".into(),
+        FetchClass::Local,
+        "ics",
+        std::time::Duration::from_secs(1),
+        false,
+        local.clone(),
+    ));
+    let router = timed_router(accounts);
+
+    for tick in 0..6 {
+        let mut completed = Vec::new();
+        router
+            .list_events_pass(
+                calendar_window(),
+                &BTreeMap::new(),
+                || true,
+                |result| completed.push(result.account),
+            )
+            .await;
+
+        let first_network = completed
+            .iter()
+            .position(|account| account.starts_with("network-"))
+            .expect("a network account must complete");
+        for account in ["command", "local"] {
+            let position = completed
+                .iter()
+                .position(|candidate| candidate == account)
+                .unwrap_or_else(|| panic!("{account} was starved on tick {tick}"));
+            assert!(
+                position < first_network,
+                "{account} was starved behind network work on tick {tick}: {completed:?}"
+            );
+        }
+    }
+    assert_eq!(command.max.load(std::sync::atomic::Ordering::SeqCst), 1);
+    assert_eq!(local.max.load(std::sync::atomic::Ordering::SeqCst), 1);
 }
 
 #[tokio::test(start_paused = true)]
@@ -2740,6 +2868,82 @@ async fn pass_stress_dropping_a_pass_cancels_in_flight_fetches_and_starts_no_mor
     tokio::time::sleep(std::time::Duration::from_secs(1000)).await;
     assert_eq!(started(), 4);
     assert_eq!(dropped(), 4);
+}
+
+async fn wait_for_marker(path: &std::path::Path) -> String {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    loop {
+        if let Ok(contents) = std::fs::read_to_string(path)
+            && !contents.is_empty()
+        {
+            return contents;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "mixed-class command child did not start"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+}
+
+#[tokio::test]
+async fn dropping_a_mixed_class_pass_kills_command_children_and_siblings() {
+    let fixture = tempfile::tempdir().unwrap();
+    let marker = fixture.path().join("heartbeat");
+    let command = command::CommandBackend::new(
+        &CalendarAccount {
+            name: "command".into(),
+            provider: CalendarProviderKind::Command,
+            command: vec![
+                "sh".into(),
+                "-c".into(),
+                "(i=0; while :; do i=$((i+1)); printf '%s' \"$i\" > \"$1\"; sleep 0.05; done) & wait".into(),
+                "sh".into(),
+                marker.to_string_lossy().into_owned(),
+            ],
+            timeout_secs: 300,
+            ..CalendarAccount::default()
+        },
+        adm(),
+    );
+    let probe = std::sync::Arc::new(DropProbe {
+        started: std::sync::atomic::AtomicUsize::new(0),
+        dropped: std::sync::atomic::AtomicUsize::new(0),
+    });
+    let router = CalendarRouter::from_test_backends(vec![
+        (
+            "network".into(),
+            FetchClass::Network,
+            Box::new(HungFake {
+                delay: std::time::Duration::from_secs(100_000),
+                probe: probe.clone(),
+            }),
+        ),
+        ("command".into(), FetchClass::Command, Box::new(command)),
+        (
+            "local".into(),
+            FetchClass::Local,
+            Box::new(HungFake {
+                delay: std::time::Duration::from_secs(100_000),
+                probe: probe.clone(),
+            }),
+        ),
+    ]);
+    let mut pass =
+        Box::pin(router.list_events_pass(calendar_window(), &BTreeMap::new(), || true, |_| {}));
+    let heartbeat = tokio::select! {
+        _ = &mut pass => panic!("the mixed-class pass must still be running"),
+        heartbeat = wait_for_marker(&marker) => heartbeat,
+    };
+    assert_eq!(probe.started.load(std::sync::atomic::Ordering::SeqCst), 2);
+
+    drop(pass);
+    assert_eq!(probe.dropped.load(std::sync::atomic::Ordering::SeqCst), 2);
+    for _ in 0..20 {
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        let next = std::fs::read_to_string(&marker).unwrap();
+        assert_eq!(next, heartbeat, "the command child survived pass drop");
+    }
 }
 
 #[test]
