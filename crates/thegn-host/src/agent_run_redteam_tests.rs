@@ -115,15 +115,32 @@ where
 
 #[test]
 fn autonomous_credential_free_launch_has_no_sentinel_value_path_or_mount() {
-    let state = IsolatedState::new();
-    let home = state.root().to_path_buf();
+    let temp = tempfile::tempdir().unwrap();
+    let home = temp.path().to_path_buf();
     let worktree = home.join("worktree");
     std::fs::create_dir_all(&worktree).unwrap();
     for file in sentinel_home_files(&home) {
         std::fs::create_dir_all(file.parent().unwrap()).unwrap();
         std::fs::write(file, b"redteam file sentinel").unwrap();
     }
-    let _env = EnvGuard::set(SENTINEL_VALUES);
+    let mut vars: Vec<(String, String)> = thegn_core::testenv::state_env_all(&home)
+        .into_iter()
+        .map(|(key, path)| (key.to_string(), path.to_str().unwrap().to_string()))
+        .collect();
+    vars.push((
+        "THEGN_DIR".into(),
+        home.join(".thegn").to_str().unwrap().to_string(),
+    ));
+    vars.extend(
+        SENTINEL_VALUES
+            .iter()
+            .map(|(key, value)| ((*key).to_string(), (*value).to_string())),
+    );
+    let pairs: Vec<(&str, &str)> = vars
+        .iter()
+        .map(|(key, value)| (key.as_str(), value.as_str()))
+        .collect();
+    let _env = EnvGuard::set(&pairs);
 
     let interactive = redteam_spec(&home, &worktree);
     let autonomous = credential_free_spec_at(interactive.clone(), Some(&home));
