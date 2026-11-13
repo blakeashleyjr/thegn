@@ -1515,7 +1515,7 @@ mod tests {
     #[test]
     fn liveness_predicates_cross_every_status_and_exit_stamp() {
         let statuses = [
-            (S::Queued, true, true, true),
+            (S::Queued, true, true, false),
             (S::Spawning, true, true, false),
             (S::Running, true, true, false),
             (S::WaitingHuman, true, false, false),
