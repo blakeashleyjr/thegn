@@ -101,7 +101,9 @@ the local container sandbox (podman or docker) are forwarded to the host for
 local browser preview. `bind` defaults to loopback; a non-loopback bind is
 refused unless `[forward] allow_external_bind = true`. The **system → forward** section lists the
 active forwards: `↵` copies the preview URL, `o` opens it, `n` starts
-watching a port, and `x` removes a forward.
+watching a port, `a` adds a container port (the host port is auto-picked within
+`[forward]`'s range and the bind host follows `[forward]`), and `x` removes a
+forward.
 
 Forwards go through the one container runtime (podman, docker, or rootful
 podman) that holds the worktree's container. If more than one runtime has a
