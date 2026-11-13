@@ -396,43 +396,56 @@ fn canon(p: &str) -> std::path::PathBuf {
 }
 
 /// The session worktrees that live in `loc`'s repo, paired with the branch each
-/// one has checked out. One `git worktree list --porcelain` for the WHOLE repo —
+/// one has checked out. One `git worktree list --porcelain -z` for the WHOLE repo —
 /// a twenty-worktree repo (the shape thegn is built for) costs what a
 /// single-checkout repo costs. Entries with no branch (detached or bare) are
 /// retained so their cache rows can be invalidated when the session lists the
 /// path. Checkouts this session does not show are dropped.
-fn parse_remote_worktree_branches(porcelain: &str) -> Vec<(String, Option<String>)> {
-    let mut out: Vec<(String, Option<String>)> = Vec::new();
-    for line in porcelain.lines() {
-        if let Some(path) = line.strip_prefix("worktree ") {
-            out.push((path.trim().to_string(), None));
-        } else if let Some(branch) = line.strip_prefix("branch ")
-            && let Some((_, current_branch)) = out.last_mut()
-        {
-            *current_branch = Some(branch.trim().trim_start_matches("refs/heads/").to_string());
-        }
-    }
-    out
+fn parse_remote_worktree_branches(porcelain: &str) -> Option<Vec<(String, Option<String>)>> {
+    thegn_core::util::parse_worktree_branches(porcelain)
 }
 
-fn session_checkouts(loc: &GitLoc, session_worktrees: &[String]) -> Vec<(String, Option<String>)> {
-    let porcelain = match loc.git_text(&["worktree", "list", "--porcelain"]) {
-        Ok(porcelain) => porcelain,
-        Err(error) => {
+fn session_checkouts(
+    loc: &GitLoc,
+    session_worktrees: &[String],
+) -> Option<Vec<(String, Option<String>)>> {
+    let cancel = std::sync::atomic::AtomicBool::new(false);
+    let porcelain = match loc.git_run(
+        &thegn_core::util::WORKTREE_LIST_Z,
+        &thegn_core::git_run::GitPolicy::read(thegn_core::remote::GITLOC_READ_DEADLINE),
+        &cancel,
+    ) {
+        thegn_core::git_run::GitOutcome::Ok(bytes) => match String::from_utf8(bytes) {
+            Ok(porcelain) => porcelain,
+            Err(error) => {
+                tracing::debug!(target: "thegn::git", %error, "remote checkout listing was not UTF-8");
+                return None;
+            }
+        },
+        thegn_core::git_run::GitOutcome::EmptyOk => String::new(),
+        error => {
             tracing::debug!(target: "thegn::git", %error, "could not list remote checkouts after auto-fetch");
-            return Vec::new();
+            return None;
         }
     };
-    let worktrees = parse_remote_worktree_branches(&porcelain);
+    let worktrees = match parse_remote_worktree_branches(&porcelain) {
+        Some(worktrees) => worktrees,
+        None => {
+            tracing::debug!(target: "thegn::git", "remote checkout listing had malformed NUL framing");
+            return None;
+        }
+    };
     let session: HashMap<std::path::PathBuf, &String> =
         session_worktrees.iter().map(|w| (canon(w), w)).collect();
-    worktrees
-        .into_iter()
-        .filter_map(|(path, branch)| {
-            let wt = session.get(&canon(&path))?;
-            Some(((*wt).clone(), branch))
-        })
-        .collect()
+    Some(
+        worktrees
+            .into_iter()
+            .filter_map(|(path, branch)| {
+                let wt = session.get(&canon(&path))?;
+                Some(((*wt).clone(), branch))
+            })
+            .collect(),
+    )
 }
 
 /// The default, always-on half of a successful fetch: make the **badge** honest.
@@ -666,7 +679,7 @@ fn poll_one(
             // unrelated repo's branches, so neither the badge refresh nor the
             // (opt-in) notice can ever touch an unrelated worktree.
             let checkouts = session_checkouts(&loc, all_worktrees);
-            let branches = if !checkouts.is_empty()
+            let branches = if checkouts.as_ref().is_some_and(|c| !c.is_empty())
                 && (outcome == FetchOutcome::Changed || cfg.auto_fetch_notify)
             {
                 let read_at = std::time::Instant::now();
@@ -677,7 +690,9 @@ fn poll_one(
                             tracing::debug!(target: "thegn::git", repo = %repo, %error, "could not read branch counts after auto-fetch; invalidating cached glyphs");
                             crate::hydrate::invalidate_glyphs(
                                 &checkouts
-                                    .iter()
+                                    .as_ref()
+                                    .into_iter()
+                                    .flatten()
                                     .map(|(path, _)| path.clone())
                                     .collect::<Vec<_>>(),
                             );
@@ -690,13 +705,15 @@ fn poll_one(
             };
             if outcome == FetchOutcome::Changed
                 && let Some((branches, read_at)) = branches.as_ref()
+                && let Some(checkouts) = checkouts.as_ref()
             {
-                refresh_badges(&checkouts, branches, *read_at);
+                refresh_badges(checkouts, branches, *read_at);
             }
             if cfg.auto_fetch_notify
                 && let Some((branches, _)) = branches.as_ref()
+                && let Some(checkouts) = checkouts.as_ref()
             {
-                notify_behind(&checkouts, branches, notify);
+                notify_behind(checkouts, branches, notify);
             }
         }
         Err(e) => {
@@ -832,6 +849,29 @@ mod tests {
         for (outcomes, expected) in cases {
             assert_eq!(should_refresh(outcomes), expected, "{outcomes:?}");
         }
+    }
+
+    #[test]
+    fn remote_worktree_parser_preserves_newlines_in_paths() {
+        let framed =
+            "worktree /remote/path\nwith-newline\0HEAD aaaa\0branch refs/heads/feature\0\0";
+        assert_eq!(
+            parse_remote_worktree_branches(framed),
+            Some(vec![(
+                "/remote/path\nwith-newline".to_string(),
+                Some("feature".to_string()),
+            )])
+        );
+    }
+
+    #[test]
+    fn malformed_remote_worktree_framing_is_a_failed_poll() {
+        assert!(
+            parse_remote_worktree_branches(
+                "worktree /remote/path\0HEAD aaaa\0branch refs/heads/main\0"
+            )
+            .is_none()
+        );
     }
 
     #[test]
@@ -1119,7 +1159,7 @@ mod tests {
         let wt = clone.to_string_lossy().into_owned();
         let session = vec![wt.clone(), "/somewhere/else".to_string()];
         assert_eq!(
-            session_checkouts(&loc, &session),
+            session_checkouts(&loc, &session).unwrap(),
             vec![(wt.clone(), Some("main".to_string()))],
             "only THIS repo's session checkouts, paired with their branch"
         );
@@ -1171,7 +1211,11 @@ mod tests {
             );
         let read_at = std::time::Instant::now();
         let branches = crate::git_handle::get().branches_full(&loc).unwrap();
-        refresh_badges(&session_checkouts(&loc, &session), &branches, read_at);
+        refresh_badges(
+            &session_checkouts(&loc, &session).unwrap(),
+            &branches,
+            read_at,
+        );
         let cache = crate::hydrate::glyph_cache()
             .lock()
             .unwrap_or_else(|e| e.into_inner());

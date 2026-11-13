@@ -94,4 +94,21 @@ mod tests {
         assert!(ready.contains("no stashes"), "{ready}");
         assert!(failed.contains("git unavailable"), "{failed}");
     }
+
+    #[test]
+    fn stash_unknown_chip_renders_a_question_mark() {
+        let model = FrameModel {
+            panel: crate::panel::PanelData {
+                stash_unknown: true,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let summary = crate::panel::sections::summary(Section::Stash, &model);
+        let text = summary
+            .iter()
+            .map(|seg| seg.text.as_str())
+            .collect::<String>();
+        assert_eq!(text, "?");
+    }
 }
