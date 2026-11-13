@@ -984,6 +984,7 @@ mod tests {
     use crate::github::{GhError, classify, spawn_err, submit_review};
     use crate::remote::GitLoc;
     use crate::seam::SeamError;
+    use crate::testenv::IsolatedState;
 
     #[test]
     fn pr_url_in_repo_matches_owner_repo_case_insensitively() {
@@ -1484,6 +1485,7 @@ mod tests {
 
     #[test]
     fn submit_review_requires_body_for_non_approve() {
+        let _state = IsolatedState::new();
         let loc = GitLoc::for_worktree(std::path::Path::new("/nonexistent"));
         // request-changes / comment without a body fail before touching `gh`.
         assert!(matches!(
