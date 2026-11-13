@@ -1418,7 +1418,7 @@ mod tests {
         assert!(matches!(
             plan,
             crate::sandbox_control_guard::MaskPlan::Refuse(refusal)
-                if refusal.control_dir == socket_location.path()
+                if refusal.control_dir == mapped_control
                     && refusal.visible_through == Path::new("/runtime")
         ));
         assert_no_writable_control_bind(&mapped_control, &mounts);
