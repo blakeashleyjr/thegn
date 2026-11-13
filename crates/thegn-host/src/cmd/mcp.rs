@@ -1070,7 +1070,7 @@ mod tests {
             sorted(READ_CAPS.to_vec()),
             "--scopes read"
         );
-        assert_eq!(READ_CAPS.len(), 23);
+        assert_eq!(READ_CAPS.len(), 22);
     }
 
     #[test]
