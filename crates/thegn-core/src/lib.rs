@@ -184,6 +184,7 @@ pub mod diagnostics;
 pub mod graveyard;
 pub mod harness;
 pub mod heal;
+pub mod heavy_gate;
 pub mod help;
 pub mod history;
 pub mod hooks;

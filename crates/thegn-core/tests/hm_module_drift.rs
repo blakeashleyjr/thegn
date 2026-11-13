@@ -99,6 +99,14 @@ const OMITTED: &[(&str, &str)] = &[
         "string-typed urgency has no destination enum to pin and is not exposed",
     ),
     (
+        "sandbox.limits.heavy_slots",
+        "serialising heavy jobs is a host-local policy, not exposed",
+    ),
+    (
+        "sandbox.limits.max_load",
+        "serialising heavy jobs is a host-local policy, not exposed",
+    ),
+    (
         "notifications.process_exit",
         "string-typed exit policy has no destination enum to pin and is not exposed",
     ),

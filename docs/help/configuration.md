@@ -117,6 +117,10 @@ The file is watched: edits apply live, no restart.
   the new setting).
   `thegn doctor` shows whether containment is required or best-effort; JSON
   includes `require_containment`.
+- `[sandbox.limits] heavy_slots` and `max_load` serialize heavyweight merge
+  and dispatch gates on the local host; both are off by default. `heavy_slots`
+  is a slot count, while `max_load` is an absolute one-minute load-average
+  ceiling.
 - `[ci]` — cached, bounded CI run/log reads. `log_cache_runs = 0` disables
   persistence; `[ci.autofix] mode = "off"|"suggest"|"auto"` defaults to off
   and reuses the existing trusted PR-queue agent policy.
