@@ -1,6 +1,30 @@
 //! Pure selection helpers for the ordered integration CLI flags.
 
 use anyhow::{Result, bail};
+use std::path::Path;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum FoldState {
+    Deferred(String),
+    GateFailed,
+    Other,
+}
+
+/// Render the optional handoff for fixing an ordered fold across lanes.
+pub(crate) fn fixup_hint(
+    into: &str,
+    into_worktree: Option<&Path>,
+    state: FoldState,
+) -> Option<String> {
+    let worktree = into_worktree?;
+    if !matches!(state, FoldState::Deferred(_) | FoldState::GateFailed) {
+        return None;
+    }
+    Some(format!(
+        "Fix across lanes: thegn session open --agent <agent> --worktree {} --stage integration-fixup --brief-file <brief> --vars target={into}",
+        worktree.display()
+    ))
+}
 
 /// Resolve an explicit branch order to indexes in the discovered candidates.
 ///
@@ -124,5 +148,37 @@ mod tests {
     fn from_index_trims_the_requested_order_entry() {
         let names = names(&["gone", " b ", "c"]);
         assert_eq!(from_index(&names, "b").unwrap(), 1);
+    }
+
+    #[test]
+    fn fixup_hint_names_the_deferred_fold_target() {
+        let worktree = tempfile::tempdir().expect("temporary worktree");
+        assert_eq!(
+            fixup_hint(
+                "stack",
+                Some(worktree.path()),
+                FoldState::Deferred("lane-a".into())
+            ),
+            Some(format!(
+                "Fix across lanes: thegn session open --agent <agent> --worktree {} --stage integration-fixup --brief-file <brief> --vars target=stack",
+                worktree.path().display()
+            ))
+        );
+    }
+
+    #[test]
+    fn fixup_hint_names_a_failed_gate() {
+        let worktree = tempfile::tempdir().expect("temporary worktree");
+        assert!(fixup_hint("stack", Some(worktree.path()), FoldState::GateFailed).is_some());
+    }
+
+    #[test]
+    fn fixup_hint_requires_a_worktree() {
+        assert!(fixup_hint("stack", None, FoldState::Deferred("lane-a".into())).is_none());
+    }
+
+    #[test]
+    fn fixup_hint_never_appears_without_an_into_worktree_in_push_mode() {
+        assert!(fixup_hint("stack", None, FoldState::Deferred("lane-a".into())).is_none());
     }
 }

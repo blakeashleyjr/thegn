@@ -63,14 +63,16 @@ pub(crate) fn insert_and_start(
     )
 }
 
-/// Record one non-root `land` in the plain roster, without making tracking
-/// authoritative for Git. A prior plain land row is idempotent only when it
-/// already has the same terminal outcome; another owner's active row is left
-/// untouched rather than creating or changing a dispatch.
+/// Record one non-root integration in the plain roster, without making
+/// tracking authoritative for Git. A prior row for the same agent is
+/// idempotent only when it already has the same terminal outcome; another
+/// owner's active row is left untouched rather than creating or changing a
+/// dispatch.
 pub(crate) fn track_integration(
     db: &Db,
     worktree: &str,
     label: &str,
+    agent_name: &str,
     outcome: IntegrationOutcome,
 ) -> Result<()> {
     let issue_id = format!("local:{label}");
@@ -80,13 +82,15 @@ pub(crate) fn track_integration(
     rows.sort_by_key(|row| row.id);
 
     let existing_plain = rows.iter().rev().find(|row| {
-        row.worktree_path == canonical_worktree && row.stage.is_none() && row.agent_name == "land"
+        row.worktree_path == canonical_worktree
+            && row.stage.is_none()
+            && row.agent_name == agent_name
     });
     let active = rows
         .iter()
         .rev()
         .find(|row| row.worktree_path == canonical_worktree && row.status.is_active());
-    if active.is_some_and(|row| row.agent_name != "land" || row.stage.is_some()) {
+    if active.is_some_and(|row| row.agent_name != agent_name || row.stage.is_some()) {
         return Ok(());
     }
 
@@ -105,8 +109,8 @@ pub(crate) fn track_integration(
             db,
             &issue_id,
             &canonical_worktree,
-            "land",
-            &format!("land-{}", std::process::id()),
+            agent_name,
+            &format!("{agent_name}-{}", std::process::id()),
         )?
     };
     let current = db
@@ -379,7 +383,8 @@ mod tests {
         let (_repo_dir, worktree) = git_repo();
         let db = db(&state);
         let path = worktree.to_str().expect("utf8 worktree");
-        track_integration(&db, path, "tracked", IntegrationOutcome::Landed).expect("land row");
+        track_integration(&db, path, "tracked", "land", IntegrationOutcome::Landed)
+            .expect("land row");
         let rows = db.list_dispatches().expect("roster list");
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].issue_id, "local:tracked");
@@ -396,6 +401,7 @@ mod tests {
             &db,
             worktree.to_str().expect("utf8 worktree"),
             "tracked",
+            "land",
             IntegrationOutcome::RefusedGate,
         )
         .expect("failed land row");
@@ -410,9 +416,9 @@ mod tests {
         let (_repo_dir, worktree) = git_repo();
         let db = db(&state);
         let path = worktree.to_str().expect("utf8 worktree");
-        track_integration(&db, path, "tracked", IntegrationOutcome::Landed)
+        track_integration(&db, path, "tracked", "land", IntegrationOutcome::Landed)
             .expect("first land row");
-        track_integration(&db, path, "tracked", IntegrationOutcome::Landed)
+        track_integration(&db, path, "tracked", "land", IntegrationOutcome::Landed)
             .expect("repeat land row");
         assert_eq!(db.list_dispatches().expect("roster list").len(), 1);
     }
@@ -425,8 +431,14 @@ mod tests {
         let path = worktree.to_str().expect("utf8 worktree");
         insert_and_start(&db, "linear:THE-1980", path, "coder", "session-1980")
             .expect("active row");
-        track_integration(&db, path, "tracked", IntegrationOutcome::RefusedGate)
-            .expect("ignored foreign row");
+        track_integration(
+            &db,
+            path,
+            "tracked",
+            "land",
+            IntegrationOutcome::RefusedGate,
+        )
+        .expect("ignored foreign row");
         let rows = db.list_dispatches().expect("roster list");
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].status, AgentDispatchStatus::Running);
@@ -439,13 +451,110 @@ mod tests {
         let (_repo_dir, worktree) = git_repo();
         let db = db(&state);
         let path = worktree.to_str().expect("utf8 worktree");
-        track_integration(&db, path, "tracked", IntegrationOutcome::RefusedGate)
-            .expect("refused land row");
-        track_integration(&db, path, "tracked", IntegrationOutcome::Landed)
+        track_integration(
+            &db,
+            path,
+            "tracked",
+            "land",
+            IntegrationOutcome::RefusedGate,
+        )
+        .expect("refused land row");
+        track_integration(&db, path, "tracked", "land", IntegrationOutcome::Landed)
             .expect("successful land row");
         let rows = db.list_dispatches().expect("roster list");
         assert_eq!(rows.len(), 2);
         assert_eq!(rows[0].status, AgentDispatchStatus::Done);
         assert_eq!(rows[1].status, AgentDispatchStatus::Failed);
+    }
+
+    #[test]
+    fn track_integration_records_an_integrate_row_as_done() {
+        let state = crate::testenv::IsolatedState::new();
+        let (_repo_dir, worktree) = git_repo();
+        let db = db(&state);
+        track_integration(
+            &db,
+            worktree.to_str().expect("utf8 worktree"),
+            "tracked",
+            "integrate",
+            IntegrationOutcome::Landed,
+        )
+        .expect("integrate row");
+        let rows = db.list_dispatches().expect("roster list");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].status, AgentDispatchStatus::Done);
+        assert_eq!(rows[0].agent_name, "integrate");
+        assert!(
+            rows[0]
+                .session_id
+                .as_deref()
+                .is_some_and(|session| session.starts_with("integrate-"))
+        );
+    }
+
+    #[test]
+    fn track_integration_is_idempotent_for_a_repeat_integrate() {
+        let state = crate::testenv::IsolatedState::new();
+        let (_repo_dir, worktree) = git_repo();
+        let db = db(&state);
+        let path = worktree.to_str().expect("utf8 worktree");
+        track_integration(
+            &db,
+            path,
+            "tracked",
+            "integrate",
+            IntegrationOutcome::Landed,
+        )
+        .expect("first integrate row");
+        track_integration(
+            &db,
+            path,
+            "tracked",
+            "integrate",
+            IntegrationOutcome::Landed,
+        )
+        .expect("repeat integrate row");
+        assert_eq!(db.list_dispatches().expect("roster list").len(), 1);
+    }
+
+    #[test]
+    fn track_integration_integrate_does_not_change_a_foreign_active_row() {
+        let state = crate::testenv::IsolatedState::new();
+        let (_repo_dir, worktree) = git_repo();
+        let db = db(&state);
+        let path = worktree.to_str().expect("utf8 worktree");
+        insert_and_start(&db, "linear:THE-1980", path, "coder", "session-1980")
+            .expect("active row");
+        track_integration(
+            &db,
+            path,
+            "tracked",
+            "integrate",
+            IntegrationOutcome::RefusedGate,
+        )
+        .expect("ignored foreign row");
+        let rows = db.list_dispatches().expect("roster list");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].status, AgentDispatchStatus::Running);
+        assert_eq!(rows[0].agent_name, "coder");
+    }
+
+    #[test]
+    fn track_integration_records_an_integrate_gate_refusal_as_failed() {
+        let state = crate::testenv::IsolatedState::new();
+        let (_repo_dir, worktree) = git_repo();
+        let db = db(&state);
+        track_integration(
+            &db,
+            worktree.to_str().expect("utf8 worktree"),
+            "tracked",
+            "integrate",
+            IntegrationOutcome::RefusedGate,
+        )
+        .expect("failed integrate row");
+        let rows = db.list_dispatches().expect("roster list");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].status, AgentDispatchStatus::Failed);
+        assert_eq!(rows[0].agent_name, "integrate");
     }
 }
