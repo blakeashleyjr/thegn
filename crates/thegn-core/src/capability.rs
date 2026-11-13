@@ -877,7 +877,7 @@ pub const CATALOG: &[HostCapability] = &[
 /// When the table reaches empty, the pinning test asserts it stays empty.
 ///
 /// The remaining debt, by surface: the **plugin** surface has none (`host.call`
-/// dispatches every non-streaming row generically); **MCP** owes its state
+/// dispatches every non-streaming row generically); **MCP** owes its remaining state
 /// tools; **gRPC** owes the mirror for the rows HTTP already serves; and
 /// **HTTP** owes control routes for the CLI-first operator families
 /// (`secret.*`, `project.*`, `containers.*`, `doctor.bundle`, `launch.preset`)
@@ -1162,16 +1162,6 @@ pub const SURFACE_GAPS: &[(&str, Surface, &str)] = &[
         "MCP state tools land in the client-API phase",
     ),
     (
-        "calendar.events",
-        Surface::Mcp,
-        "MCP state tools land in the client-API phase",
-    ),
-    (
-        "calendar.clocks",
-        Surface::Mcp,
-        "MCP state tools land in the client-API phase",
-    ),
-    (
         "calendar.ingest",
         Surface::Mcp,
         "MCP state tools land in the client-API phase",
@@ -1218,27 +1208,12 @@ pub const SURFACE_GAPS: &[(&str, Surface, &str)] = &[
         "not yet mirrored in control.proto",
     ),
     (
-        "issues.list",
-        Surface::Mcp,
-        "MCP state tools land in the client-API phase",
-    ),
-    (
-        "issues.get",
-        Surface::Mcp,
-        "MCP state tools land in the client-API phase",
-    ),
-    (
         "issues.update",
         Surface::Mcp,
         "MCP state tools land in the client-API phase",
     ),
     (
         "issues.comment",
-        Surface::Mcp,
-        "MCP state tools land in the client-API phase",
-    ),
-    (
-        "dispatches.list",
         Surface::Mcp,
         "MCP state tools land in the client-API phase",
     ),
@@ -1755,16 +1730,6 @@ pub const GAP_DISPOSITIONS: &[(&str, Surface, GapDisposition)] = &[
         GapDisposition::Deferred { review: "THE-203" },
     ),
     (
-        "calendar.events",
-        Surface::Mcp,
-        GapDisposition::Deferred { review: "THE-203" },
-    ),
-    (
-        "calendar.clocks",
-        Surface::Mcp,
-        GapDisposition::Deferred { review: "THE-203" },
-    ),
-    (
         "calendar.ingest",
         Surface::Mcp,
         GapDisposition::Deferred { review: "THE-203" },
@@ -1775,27 +1740,12 @@ pub const GAP_DISPOSITIONS: &[(&str, Surface, GapDisposition)] = &[
         GapDisposition::Deferred { review: "THE-203" },
     ),
     (
-        "issues.list",
-        Surface::Mcp,
-        GapDisposition::Deferred { review: "THE-203" },
-    ),
-    (
-        "issues.get",
-        Surface::Mcp,
-        GapDisposition::Deferred { review: "THE-203" },
-    ),
-    (
         "issues.update",
         Surface::Mcp,
         GapDisposition::Deferred { review: "THE-203" },
     ),
     (
         "issues.comment",
-        Surface::Mcp,
-        GapDisposition::Deferred { review: "THE-203" },
-    ),
-    (
-        "dispatches.list",
         Surface::Mcp,
         GapDisposition::Deferred { review: "THE-203" },
     ),
@@ -2161,10 +2111,10 @@ mod tests {
         assert_eq!(p.len(), 1, "{p:?}");
         assert!(p[0].contains("sessions.list") && p[0].contains("not implemented"));
 
-        // Implementing an excused row ⇒ stale gap (issues.list is still
+        // Implementing an excused row ⇒ stale gap (issues.update is still
         // excused on MCP).
         let mut stale: Vec<&str> = required_for(Surface::Mcp).map(|c| c.id.0).collect();
-        stale.push("issues.list"); // excused on MCP
+        stale.push("issues.update"); // excused on MCP
         let p = coverage_problems(Surface::Mcp, &stale);
         assert_eq!(p.len(), 1, "{p:?}");
         assert!(p[0].contains("stale"));
@@ -2271,7 +2221,7 @@ mod tests {
         // MCP carries the remaining excuses; its ledger lists them.
         let mcp = ledger(Surface::Mcp, &["sessions.list"]);
         assert!(mcp.excused > 0);
-        assert!(mcp.gaps.iter().any(|(id, _)| *id == "issues.list"));
+        assert!(mcp.gaps.iter().any(|(id, _)| *id == "issues.update"));
     }
 
     #[test]
