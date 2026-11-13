@@ -297,6 +297,11 @@ until its scope is granted.
 | `git_status`                | `read`        | list changed files in a worktree                                       |
 | `merge_list`                | `read`        | list the merge queue for a worktree's repository                       |
 | `pr_status`                 | `read`        | read cached pull-request status, one row per worktree                  |
+| `calendar_events`           | `read`        | merged calendar events in an inclusive ISO-date window                 |
+| `calendar_clocks`           | `read`        | resolved home and world clocks                                         |
+| `issues_list`               | `read`        | list tracker issues (status/limit/project/query, registered repo)      |
+| `issues_get`                | `read`        | one tracker issue with detail and comments                             |
+| `dispatches_list`           | `read`        | the agent-dispatch roster, newest first (limit/before paging)          |
 | `sessions_open`             | `write`       | open a session — raw `argv`, or a configured agent by name             |
 | `sessions_kill`             | `write`       | kill a session's process (idempotent)                                  |
 | `sessions_input`            | `write` **+** | send raw terminal input/control characters to a live session           |

@@ -11,7 +11,7 @@
 //! it exposes the in-app help corpus, the generated keybindings/config-reference
 //! pages, and the user's current secret-redacted config so a coding agent can
 //! learn how thegn works — plus, gated by `--scopes`, live *state* tools
-//! (`sessions_list`, `worktrees_list`, `worktrees_sandbox_profile`, `git_status`, `merge_list`, `pr_status`, `leases_list`, `me`) answered by the
+//! (`sessions_list`, `worktrees_list`, `worktrees_sandbox_profile`, `git_status`, `merge_list`, `pr_status`, `leases_list`, `me`, `calendar_events`, `calendar_clocks`, `issues_list`, `issues_get`, `dispatches_list`) answered by the
 //! pane daemon over the control client, and daemon-free semantic read tools
 //! (`semantic_map`, `semantic_blast_radius`) answered from the state DB + git.
 //! The JSON-RPC handling is the pure
@@ -585,6 +585,18 @@ async fn fetch_state(
                 .map_err(|e| e.to_string())?;
             serde_json::to_value(reply).map_err(|e| e.to_string())
         }
+        "issues.list" | "issues.get" | "dispatches.list" | "calendar.events"
+        | "calendar.clocks" => {
+            let c = client.map_err(|_| NO_DAEMON.to_string())?;
+            let params = args
+                .as_object()
+                .cloned()
+                .ok_or("state tool arguments must be an object")?;
+            let (method, path, body) = thegn_svc::control::routes::build_call(cap, params)?;
+            c.call_raw(method, &path, body)
+                .await
+                .map_err(|e| e.to_string())
+        }
         // A pure filesystem read of the harness session stores — answered
         // locally, no daemon required (like the worktrees.list DB fallback).
         "agent.sessions" => {
@@ -1009,6 +1021,11 @@ mod tests {
         "pr.status",
         "ci.runs",
         "ci.logs",
+        "calendar.events",
+        "calendar.clocks",
+        "issues.list",
+        "issues.get",
+        "dispatches.list",
         "agent.sessions",
         "sessions.wait",
         "semantic.map",
@@ -1053,6 +1070,7 @@ mod tests {
             sorted(READ_CAPS.to_vec()),
             "--scopes read"
         );
+        assert_eq!(READ_CAPS.len(), 22);
     }
 
     #[test]
