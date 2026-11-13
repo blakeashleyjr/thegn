@@ -645,9 +645,10 @@ pub enum Command {
         #[command(flatten)]
         target: cmd::target::WorktreeTarget,
     },
-    /// Container-estate maintenance: `gc` (orphan sweep) and `prune`
-    /// (thegn-owned stopped containers + `thegn.managed` images/volumes, local
-    /// or `--host`). Owned-only; never runs on a schedule.
+    /// Inspect and control the local container estate: `ls`, `ctl`, `logs`,
+    /// `gc` (orphan sweep), and `prune` (thegn-owned stopped containers plus
+    /// `thegn.managed` images/volumes, local or `--host`). Owned-only writes;
+    /// cleanup never runs on a schedule.
     Sandbox {
         #[command(subcommand)]
         action: cmd::sandbox::Action,

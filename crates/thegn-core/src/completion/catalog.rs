@@ -397,6 +397,24 @@ pub const CATALOG: &[Slot] = &[
     slot("pr status", "worktree", SourceKind::Worktree),
     slot("sandbox-argv", "worktree", SourceKind::Worktree),
     slot("sandbox-argv", "worktree_pos", SourceKind::Worktree),
+    // Container names are runtime-owned free-form values; a future completer
+    // can enumerate the local estate without changing these argument ids.
+    slot(
+        "sandbox ctl",
+        "name",
+        SourceKind::Reserved(Reserved::Freeform),
+    ),
+    slot("sandbox ctl", "op", SourceKind::Structural),
+    slot(
+        "sandbox logs",
+        "name",
+        SourceKind::Reserved(Reserved::Freeform),
+    ),
+    slot(
+        "sandbox logs",
+        "tail",
+        SourceKind::Reserved(Reserved::Freeform),
+    ),
     slot("wt new", "isolation", SourceKind::Structural),
     slot("wt new", "batch", SourceKind::Structural),
     slot("sandbox profile show", "worktree", SourceKind::Worktree),

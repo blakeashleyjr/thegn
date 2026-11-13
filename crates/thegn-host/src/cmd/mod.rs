@@ -57,6 +57,7 @@ pub mod proxy;
 pub mod release;
 pub mod repos;
 pub mod sandbox;
+pub mod sandbox_containers;
 pub mod sandbox_profile;
 pub mod search;
 pub mod secret;
