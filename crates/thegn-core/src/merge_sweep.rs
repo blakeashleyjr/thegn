@@ -38,21 +38,38 @@ pub const CLEANUP_RETRY_BASE_SECS: u64 = 300;
 pub const CLEANUP_RETRY_MAX_SECS: u64 = 86_400;
 
 /// Retry timing for a refused landed-worktree cleanup, stored in `error_detail`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CleanupRetry {
     pub attempts: u32,
     pub next_at: i64,
+    /// Stable host-side cleanup refusal class, when the refusing sweep knows it.
+    /// Older v1 markers leave this unset and remain fully readable.
+    pub class_id: Option<String>,
 }
 
 impl CleanupRetry {
-    pub fn marker(self) -> String {
-        format!("thegn-cleanup-retry:v1:{}:{}", self.attempts, self.next_at)
+    pub fn marker(&self) -> String {
+        match self.class_id.as_deref() {
+            Some(class) => format!(
+                "thegn-cleanup-retry:v2:{}:{}:{}",
+                self.attempts, self.next_at, class
+            ),
+            None => format!("thegn-cleanup-retry:v1:{}:{}", self.attempts, self.next_at),
+        }
     }
 
-    /// Parse only the reserved marker's exact two-field decimal representation.
+    /// Parse only the reserved marker's exact decimal representation.
     pub fn from_detail(detail: Option<&str>) -> Option<Self> {
-        let fields = detail?.strip_prefix("thegn-cleanup-retry:v1:")?;
-        let (attempts, next_at) = fields.split_once(':')?;
+        let detail = detail?;
+        let (version, fields) = if let Some(fields) = detail.strip_prefix("thegn-cleanup-retry:v1:")
+        {
+            (1, fields)
+        } else {
+            (2, detail.strip_prefix("thegn-cleanup-retry:v2:")?)
+        };
+        let mut fields = fields.split(':');
+        let attempts = fields.next()?;
+        let next_at = fields.next()?;
         if attempts.is_empty()
             || next_at.is_empty()
             || !attempts.bytes().all(|byte| byte.is_ascii_digit())
@@ -62,11 +79,35 @@ impl CleanupRetry {
         }
         let attempts = attempts.parse::<u32>().ok()?;
         let next_at = next_at.parse::<i64>().ok()?;
-        (attempts >= 1 && next_at >= 0).then_some(Self { attempts, next_at })
+        let class_id = if version == 2 {
+            let class = fields.next()?;
+            if class.is_empty()
+                || fields.next().is_some()
+                || !class
+                    .bytes()
+                    .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'_')
+            {
+                return None;
+            }
+            Some(class.to_owned())
+        } else {
+            if fields.next().is_some() {
+                return None;
+            }
+            None
+        };
+        (attempts >= 1 && next_at >= 0).then_some(Self {
+            attempts,
+            next_at,
+            class_id,
+        })
     }
 
     pub fn after_refusal(previous: Option<Self>, now: i64) -> Self {
-        let attempts = previous.map_or(1, |retry| retry.attempts.saturating_add(1));
+        let attempts = previous
+            .as_ref()
+            .map_or(1, |retry| retry.attempts.saturating_add(1));
+        let class_id = previous.as_ref().and_then(|retry| retry.class_id.clone());
         let shift = attempts.saturating_sub(1);
         let delay = if shift >= 9 {
             CLEANUP_RETRY_MAX_SECS
@@ -76,10 +117,11 @@ impl CleanupRetry {
         Self {
             attempts,
             next_at: now.saturating_add(i64::try_from(delay).unwrap_or(i64::MAX)),
+            class_id,
         }
     }
 
-    pub const fn is_due(self, now: i64) -> bool {
+    pub const fn is_due(&self, now: i64) -> bool {
         now >= self.next_at
     }
 }
@@ -249,6 +291,7 @@ mod tests {
         let retry = CleanupRetry {
             attempts: 3,
             next_at: 1_234_567,
+            class_id: None,
         };
         assert_eq!(retry.marker(), "thegn-cleanup-retry:v1:3:1234567");
         assert_eq!(
@@ -258,10 +301,51 @@ mod tests {
     }
 
     #[test]
+    fn cleanup_retry_marker_round_trips_a_refusal_class() {
+        for class_id in [
+            "database",
+            "identity",
+            "claim_busy",
+            "merge_claimed",
+            "unsafe",
+            "remote",
+            "resources",
+            "removal",
+        ] {
+            let retry = CleanupRetry {
+                attempts: 2,
+                next_at: 1_234_567,
+                class_id: Some(class_id.into()),
+            };
+            assert_eq!(
+                CleanupRetry::from_detail(Some(&retry.marker())),
+                Some(retry),
+                "class id must round-trip: {class_id}"
+            );
+        }
+        assert_eq!(
+            CleanupRetry {
+                attempts: 2,
+                next_at: 1_234_567,
+                class_id: Some("claim_busy".into()),
+            }
+            .marker(),
+            "thegn-cleanup-retry:v2:2:1234567:claim_busy"
+        );
+        assert_eq!(
+            CleanupRetry::from_detail(Some("thegn-cleanup-retry:v1:2:1234567"))
+                .and_then(|retry| retry.class_id),
+            None
+        );
+    }
+
+    #[test]
     fn cleanup_retry_parser_rejects_malformed_details() {
         for detail in [
             "other:v1:1:2",
             "thegn-cleanup-retry:v2:1:2",
+            "thegn-cleanup-retry:v2:1:2:claim_busy:extra",
+            "thegn-cleanup-retry:v2:1:2:ClaimBusy",
             "thegn-cleanup-retry:v1:0:2",
             "thegn-cleanup-retry:v1:+1:2",
             "thegn-cleanup-retry:v1:1:+2",
@@ -304,6 +388,7 @@ mod tests {
             Some(CleanupRetry {
                 attempts: u32::MAX,
                 next_at: 0,
+                class_id: None,
             }),
             0,
         );
@@ -317,6 +402,7 @@ mod tests {
                 Some(CleanupRetry {
                     attempts: attempts - 1,
                     next_at: 0,
+                    class_id: None,
                 }),
                 10_000,
             );
@@ -333,6 +419,7 @@ mod tests {
         let retry = CleanupRetry {
             attempts: 1,
             next_at: 123,
+            class_id: None,
         };
         assert!(!retry.is_due(122));
         assert!(retry.is_due(123));
@@ -349,6 +436,7 @@ mod tests {
         let retry = CleanupRetry {
             attempts: 2,
             next_at: 1_060,
+            class_id: None,
         };
         assert_eq!(
             describe_reserved_detail(&retry.marker(), 1_000).as_deref(),

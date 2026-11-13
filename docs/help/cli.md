@@ -523,8 +523,11 @@ terminal escape sequences.
 `thegn agent list` is the one-screen answer to "what will actually run": one
 line per `[[agents]]`/`[[tools]]` entry and per pipeline stage — harness,
 model, env keys (never values), permission count — resolved the way a launch
-resolves them. `thegn dispatch list --active` is the roster reduced to the rows
-that occupy a slot. Both are terse by default and take `--json`.
+resolves them. `thegn dispatch list --active` is the roster reduced to active rows (including
+`waiting_human`/`pr_open` rows, which are protected from redispatch but no
+longer hold a stage slot). The `dispatch list --json` `liveness` field also
+uses the `parked` token for those rows. Both are terse by default and take
+`--json`.
 `thegn dispatch list` and `thegn dispatch status --all` show the newest 2048 rows by
 default; `--limit` sets the page size and `--before <row>` uses the cursor printed
 on stderr when older rows follow.

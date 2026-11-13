@@ -112,14 +112,15 @@ impl ClaimDecision {
     }
 }
 
-/// Whether a row still occupies a slot: any non-terminal status, whether or not
-/// its worker has exited.
+/// Whether a row still occupies a worker slot. Parked rows are deliberately
+/// excluded: they remain active for duplicate protection, but no worker is
+/// consuming stage capacity while they wait on a human or an open PR.
 ///
 /// **The exited case is the whole point.** A row whose worker finished but whose
 /// status nobody advanced is not free capacity — it is unreconciled work. Any
 /// accounting that drops it (counting live sessions, say) will over-dispatch.
 fn occupies(row: &AgentDispatch) -> bool {
-    row.status.is_active()
+    row.status.holds_slot()
 }
 
 /// Whether a row has been recorded as exited (schema v63). Absence of a stamp
@@ -175,7 +176,11 @@ pub fn decide_allowing_duplicate(
     limit: u32,
     allow_duplicate: bool,
 ) -> ClaimDecision {
-    if !allow_duplicate && let Some(dup) = rows.iter().find(|r| occupies(r) && same_work(r, req)) {
+    if !allow_duplicate
+        && let Some(dup) = rows
+            .iter()
+            .find(|r| r.status.is_active() && same_work(r, req))
+    {
         return ClaimDecision::DuplicateOf {
             id: dup.id,
             exited: exited(dup),
@@ -196,17 +201,15 @@ pub fn decide_allowing_duplicate(
 }
 
 /// The statuses a claim counts as occupying a slot, for documentation and for
-/// the CLI's help text. Mirrors [`AgentDispatchStatus::is_active`].
+/// the CLI's help text. Mirrors [`AgentDispatchStatus::holds_slot`].
 pub fn occupying_statuses() -> Vec<AgentDispatchStatus> {
     [
         AgentDispatchStatus::Queued,
         AgentDispatchStatus::Spawning,
         AgentDispatchStatus::Running,
-        AgentDispatchStatus::WaitingHuman,
-        AgentDispatchStatus::PrOpen,
     ]
     .into_iter()
-    .filter(|s| s.is_active())
+    .filter(|s| s.holds_slot())
     .collect()
 }
 
@@ -452,6 +455,34 @@ mod tests {
     }
 
     #[test]
+    fn parked_rows_free_capacity_but_still_block_duplicate_claims() {
+        let mut parked = row(41, "linear:THE-209", "code", "/wt/209", Some("handoff.md"));
+        parked.status = S::WaitingHuman;
+
+        assert_eq!(
+            decide(
+                &[parked.clone()],
+                &req("linear:THE-210", "code", "/wt/210", Some("next.md")),
+                1,
+            ),
+            ClaimDecision::Grant,
+            "a parked row must not starve the only worker slot"
+        );
+        assert_eq!(
+            decide(
+                &[parked],
+                &req("linear:THE-209", "code", "/wt/209", Some("handoff.md")),
+                1,
+            ),
+            ClaimDecision::DuplicateOf {
+                id: 41,
+                exited: false,
+            },
+            "a parked row still protects its work from redispatch"
+        );
+    }
+
+    #[test]
     fn capacity_is_counted_per_stage_not_across_the_roster() {
         let rows = vec![
             row(1, "linear:A-1", "architect", "/wt/a", Some("d.md")),
@@ -525,12 +556,12 @@ mod tests {
     }
 
     #[test]
-    fn occupying_statuses_match_the_is_active_closed_set() {
-        // Pins the two definitions together: if `is_active` ever changes, this
-        // list must be revisited rather than silently drifting.
+    fn occupying_statuses_match_the_slot_closed_set() {
+        // Pins the capacity list to the slot predicate rather than the wider
+        // active set, which also contains human-parked rows.
         let got = occupying_statuses();
-        assert_eq!(got.len(), 5, "{got:?}");
-        assert!(got.iter().all(|s| s.is_active()));
+        assert_eq!(got, vec![S::Queued, S::Spawning, S::Running], "{got:?}");
+        assert!(got.iter().all(|s| s.holds_slot()));
     }
 
     #[test]

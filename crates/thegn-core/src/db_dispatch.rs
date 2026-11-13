@@ -308,6 +308,7 @@ pub struct ParentDispatchConflict {
 pub enum ParentEdgeReason {
     Missing,
     CrossIssue,
+    Superseded,
     Ineligible(AgentDispatchStatus),
 }
 
@@ -324,6 +325,11 @@ impl std::fmt::Display for ParentDispatchConflict {
                     self.parent_id
                 )
             }
+            ParentEdgeReason::Superseded => write!(
+                f,
+                "parent dispatch {} was superseded and cannot parent new work",
+                self.parent_id
+            ),
             ParentEdgeReason::Ineligible(status) => write!(
                 f,
                 "parent dispatch {} is {} and cannot parent new work",
@@ -335,6 +341,8 @@ impl std::fmt::Display for ParentDispatchConflict {
 }
 
 impl std::error::Error for ParentDispatchConflict {}
+
+const SUPERSEDED_DISPATCH_NOTE: &str = "superseded by a --resume-work finisher dispatch";
 
 /// Whether an ordinary `dispatch set-status` transition is permitted.
 /// Idempotent writes are allowed for every recognized state except `Unknown`,
@@ -857,12 +865,22 @@ impl Db {
         let parent = self
             .conn()
             .query_row(
-                "SELECT issue_id, status FROM agent_dispatches WHERE id=?1",
-                [parent_id],
-                |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+                "SELECT d.issue_id, d.status, EXISTS(
+                     SELECT 1 FROM agent_dispatch_notes n
+                     WHERE n.dispatch_id=d.id AND n.text=?2
+                 )
+                 FROM agent_dispatches d WHERE d.id=?1",
+                rusqlite::params![parent_id, SUPERSEDED_DISPATCH_NOTE],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, i64>(2)? != 0,
+                    ))
+                },
             )
             .optional()?;
-        let Some((parent_issue, stored_status)) = parent else {
+        let Some((parent_issue, stored_status, superseded)) = parent else {
             return Err(anyhow::Error::new(ParentDispatchConflict {
                 parent_id,
                 reason: ParentEdgeReason::Missing,
@@ -875,6 +893,12 @@ impl Db {
             }));
         }
         let status = AgentDispatchStatus::parse(&stored_status);
+        if superseded {
+            return Err(anyhow::Error::new(ParentDispatchConflict {
+                parent_id,
+                reason: ParentEdgeReason::Superseded,
+            }));
+        }
         if matches!(
             status,
             AgentDispatchStatus::Failed
@@ -2041,10 +2065,7 @@ impl Db {
                             },
                         ));
                     }
-                    self.append_dispatch_note(
-                        source_id,
-                        "superseded by a --resume-work finisher dispatch",
-                    )?;
+                    self.append_dispatch_note(source_id, SUPERSEDED_DISPATCH_NOTE)?;
                 }
 
                 let rows = self.admission_rows(new.issue_id, new.worktree_path)?;
@@ -2265,11 +2286,13 @@ impl Db {
         })
     }
 
-    /// Worktrees carrying at least one dispatch row that still occupies a slot.
+    /// Worktrees carrying at least one active dispatch row.
     ///
     /// The disk reclaimer's unverified-work guard: such a worktree has work no
     /// supervisor has closed, so its `target/` must survive even though nothing
-    /// is running in it. Liveness is decided by the typed status
+    /// is running in it. Parked rows are included deliberately: liveness here
+    /// is the redispatch/work-preservation predicate, not stage slot capacity.
+    /// It is decided by the typed status
     /// ([`crate::issue::AgentDispatchStatus::is_active`]) rather than a SQL
     /// string list, so the closed set keeps exactly one definition.
     pub fn worktrees_with_active_dispatch(&self) -> Result<Vec<String>> {
@@ -3500,6 +3523,7 @@ mod tests {
                 let detail = match reason {
                     ParentEdgeReason::Missing => "does not exist".to_string(),
                     ParentEdgeReason::CrossIssue => "belongs to another issue".to_string(),
+                    ParentEdgeReason::Superseded => "was superseded".to_string(),
                     ParentEdgeReason::Ineligible(status) => {
                         format!("is {} and cannot parent new work", status.as_str())
                     }
@@ -3541,6 +3565,151 @@ mod tests {
                     "{label}; claim={claim} should admit same-issue parent"
                 );
             }
+        }
+    }
+
+    #[test]
+    fn superseded_parent_is_refused_except_for_resume_source() {
+        for claim in [false, true] {
+            let (db, _dir) = temp_db();
+            let source = db
+                .put_agent_dispatch(pipeline_row(
+                    "linear:SUPERSEDE",
+                    "/wt/source",
+                    "code",
+                    None,
+                    None,
+                ))
+                .unwrap();
+            db.update_dispatch_status(source, AgentDispatchStatus::Running)
+                .unwrap();
+            let finisher = db
+                .claim_resume_dispatch(
+                    source,
+                    AgentDispatchStatus::Running,
+                    pipeline_row(
+                        "linear:SUPERSEDE",
+                        "/wt/finisher",
+                        "code",
+                        None,
+                        Some(source),
+                    ),
+                    10,
+                )
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                db.dispatch_notes(source, None, 0).unwrap()[0].text,
+                SUPERSEDED_DISPATCH_NOTE
+            );
+
+            let child = pipeline_row("linear:SUPERSEDE", "/wt/child", "code", None, Some(source));
+            let error = if claim {
+                db.claim_dispatch_admitted(child, 10, None, None, None)
+                    .unwrap_err()
+            } else {
+                db.put_dispatch_with_parent_check(child).unwrap_err()
+            };
+            assert_eq!(
+                error
+                    .downcast_ref::<ParentDispatchConflict>()
+                    .map(|conflict| conflict.reason),
+                Some(ParentEdgeReason::Superseded),
+                "claim={claim}; error={error}"
+            );
+            assert!(error.to_string().contains("was superseded"));
+            assert_eq!(db.list_dispatches().unwrap().len(), 2);
+            assert_eq!(
+                db.get_dispatch(finisher).unwrap().unwrap().parent_id,
+                Some(source)
+            );
+
+            db.set_dispatch_status_checked(
+                source,
+                AgentDispatchStatus::Failed,
+                AgentDispatchStatus::Done,
+                None,
+            )
+            .unwrap();
+            let child = pipeline_row(
+                "linear:SUPERSEDE",
+                "/wt/done-child",
+                "code",
+                None,
+                Some(source),
+            );
+            let error = db.put_dispatch_with_parent_check(child).unwrap_err();
+            assert_eq!(
+                error
+                    .downcast_ref::<ParentDispatchConflict>()
+                    .map(|conflict| conflict.reason),
+                Some(ParentEdgeReason::Superseded),
+                "claim={claim}; done superseded parent should remain refused: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn admission_race_parent_superseded_under_a_held_write_lock_refuses_child() {
+        for claim in [false, true] {
+            let (db, dir) = temp_db();
+            let source = db
+                .put_agent_dispatch(pipeline_row(
+                    "linear:SUPERSEDE-RACE",
+                    "/wt/source",
+                    "code",
+                    None,
+                    None,
+                ))
+                .unwrap();
+            db.update_dispatch_status(source, AgentDispatchStatus::Running)
+                .unwrap();
+            let child = pipeline_row(
+                "linear:SUPERSEDE-RACE",
+                "/wt/child",
+                "code",
+                None,
+                Some(source),
+            );
+            let path = dir.path().join("thegn.db");
+            let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
+            db.conn().execute_batch("BEGIN IMMEDIATE").unwrap();
+            db.conn()
+                .execute(
+                    "UPDATE agent_dispatches SET status=?1 WHERE id=?2",
+                    rusqlite::params![AgentDispatchStatus::Failed.as_str(), source],
+                )
+                .unwrap();
+            db.append_dispatch_note(source, SUPERSEDED_DISPATCH_NOTE)
+                .unwrap();
+
+            let error = std::thread::scope(|scope| {
+                let child_path = path.clone();
+                let child_barrier = std::sync::Arc::clone(&barrier);
+                let worker = scope.spawn(move || {
+                    let other = Db::open_at(&child_path).unwrap();
+                    child_barrier.wait();
+                    if claim {
+                        other
+                            .claim_dispatch_admitted(child, 10, None, None, None)
+                            .unwrap_err()
+                    } else {
+                        other.put_dispatch_with_parent_check(child).unwrap_err()
+                    }
+                });
+                barrier.wait();
+                db.conn().execute_batch("COMMIT").unwrap();
+                worker.join().expect("child admission worker must finish")
+            });
+
+            assert_eq!(
+                error
+                    .downcast_ref::<ParentDispatchConflict>()
+                    .map(|conflict| conflict.reason),
+                Some(ParentEdgeReason::Superseded),
+                "claim={claim}; committed supersession must be observed: {error}"
+            );
+            assert_eq!(db.list_dispatches().unwrap().len(), 1);
         }
     }
 
@@ -5428,10 +5597,23 @@ mod tests {
     }
 
     #[test]
-    fn admission_active_statuses_match_pipeline_occupying_statuses() {
+    fn admission_active_statuses_keep_parked_rows_for_redispatch_and_chunks() {
+        assert!(
+            ADMISSION_ACTIVE_STATUSES
+                .iter()
+                .all(|status| status.is_active())
+        );
+        assert!(ADMISSION_ACTIVE_STATUSES.iter().any(|status| matches!(
+            status,
+            AgentDispatchStatus::WaitingHuman | AgentDispatchStatus::PrOpen
+        )));
         assert_eq!(
-            ADMISSION_ACTIVE_STATUSES.as_slice(),
-            crate::pipeline_claim::occupying_statuses().as_slice()
+            ADMISSION_ACTIVE_STATUSES
+                .iter()
+                .copied()
+                .filter(|status| status.holds_slot())
+                .collect::<Vec<_>>(),
+            crate::pipeline_claim::occupying_statuses()
         );
     }
 
