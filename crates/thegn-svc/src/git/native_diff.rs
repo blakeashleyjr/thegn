@@ -1232,13 +1232,16 @@ mod tests {
         repo: &TestRepo,
         spec: &str,
     ) -> (super::super::DiffCount, super::super::DiffCount) {
-        let out = repo.out(&["-c", "core.quotePath=false", "diff", "--numstat", spec]);
-        let out = if out.is_empty() {
-            out
-        } else {
-            format!("{out}\n")
-        };
-        super::super::typed_numstat(&out).expect("numstat parses")
+        let out = repo.out_bytes(&[
+            "-c",
+            "core.quotePath=false",
+            "diff",
+            "--numstat",
+            "-z",
+            "--no-renames",
+            spec,
+        ]);
+        super::super::typed_numstat_z(&out).expect("numstat parses")
     }
 
     /// Git's process filter in `filtered_dirty_repo` intentionally is not a
@@ -1248,21 +1251,18 @@ mod tests {
         repo: &TestRepo,
         spec: &str,
     ) -> (super::super::DiffCount, super::super::DiffCount) {
-        let out = repo.out(&[
+        let out = repo.out_bytes(&[
             "-c",
             "filter.tgtest.required=false",
             "-c",
             "core.quotePath=false",
             "diff",
             "--numstat",
+            "-z",
+            "--no-renames",
             spec,
         ]);
-        let out = if out.is_empty() {
-            out
-        } else {
-            format!("{out}\n")
-        };
-        super::super::typed_numstat(&out).expect("numstat parses")
+        super::super::typed_numstat_z(&out).expect("numstat parses")
     }
 
     /// Every native read must agree with the CLI it replaced. A performance
@@ -1576,19 +1576,16 @@ mod tests {
         std::fs::write(repo.dir.join("blob.bin"), [0u8, 1, 0, 2]).unwrap();
         repo.out(&["add", "blob.bin"]);
         repo.out(&["commit", "-q", "-m", "bin"]);
-        let cli = repo.out(&[
+        let cli = repo.out_bytes(&[
             "-c",
             "core.quotePath=false",
             "diff",
             "--numstat",
+            "-z",
+            "--no-renames",
             "main...HEAD",
         ]);
-        let cli = if cli.is_empty() {
-            cli
-        } else {
-            format!("{cli}\n")
-        };
-        let want = super::super::parse_numstat(&cli).unwrap();
+        let want = super::super::parse_numstat_z(&cli).unwrap();
         let mut got = diff_entries(&repo.dir, "main...HEAD").unwrap();
         got.sort_by(|x, y| x.path.cmp(&y.path));
         let mut want = want;
