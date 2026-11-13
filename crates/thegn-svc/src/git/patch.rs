@@ -5,7 +5,7 @@
 //! sequence around an `edit` rebase stop. The host records the pre-op HEAD
 //! in `undo_marks` so one `z` undoes the whole composite.
 
-use super::rebase::{RebaseOps, RebaseOpts, RebaseOutcome};
+use super::rebase::{RebaseOps, RebaseOpts, RebaseOutcome, RebaseState};
 use super::{GitBackend, gpg_args, run_stdin, run_w};
 use anyhow::{Context, Result, bail};
 use thegn_core::rebase_todo::TodoAction;
@@ -275,7 +275,10 @@ mod tests {
             .unwrap_err();
         assert!(err.to_string().contains("apply"), "{err}");
         // Nothing half-applied: no rebase in progress, HEAD untouched.
-        assert!(CliGit.rebase_status(&r.loc()).unwrap().is_none());
+        assert!(matches!(
+            CliGit.rebase_status(&r.loc()).unwrap(),
+            RebaseState::NotRunning
+        ));
         assert_eq!(r.head(), old_head);
         assert_eq!(r.out(&["status", "--porcelain"]), "");
     }
