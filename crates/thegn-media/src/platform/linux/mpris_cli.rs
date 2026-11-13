@@ -3,13 +3,17 @@
 //! the `playerctl` binary. No playlist support (playerctl exposes none); the UI
 //! gates that off [`MediaCaps::playlists`].
 
+use std::collections::HashSet;
 use std::time::Duration;
 
 use futures::future::BoxFuture;
 use tokio::process::Command;
 
 use crate::helper::{self, Limits};
-use crate::model::{LoopMode, MediaKind, MediaState, PlaybackState, Playlist};
+use crate::model::{
+    LoopMode, MAX_FIELD_BYTES, MAX_ID_BYTES, MediaKind, MediaState, PLAYER_LIST_LIMIT,
+    PlaybackState, Playlist, is_valid_opaque_id,
+};
 use crate::{MediaBackend, MediaCaps, MediaError, MediaSnapshot};
 
 /// Field separator for the `metadata --format` template. `markup_escape` turns
@@ -80,11 +84,7 @@ impl MprisCli {
                 error => Err(error),
             };
         }
-        Ok(String::from_utf8_lossy(&out.stdout)
-            .lines()
-            .map(|l| l.trim().to_string())
-            .filter(|l| !l.is_empty())
-            .collect())
+        Ok(parse_players(&out.stdout))
     }
 }
 
@@ -249,9 +249,17 @@ fn parse_line(line: &str) -> Result<MediaState, MediaError> {
     }
     let f = encoded
         .into_iter()
-        .map(unescape_markup)
+        .enumerate()
+        .map(|(index, field)| {
+            let cap = if index == 12 {
+                MAX_ID_BYTES
+            } else {
+                MAX_FIELD_BYTES
+            };
+            unescape_markup(field, cap)
+        })
         .collect::<Result<Vec<_>, _>>()?;
-    let get = |i: usize| f[i].trim();
+    let get = |i: usize| f[i].text.trim();
 
     let length = get(5)
         .parse::<i64>()
@@ -270,9 +278,9 @@ fn parse_line(line: &str) -> Result<MediaState, MediaError> {
     let url = get(11);
     let trackid = get(12);
     Ok(MediaState {
-        title: get(2).to_string(),
-        artist: get(3).to_string(),
-        album: get(4).to_string(),
+        title: helper::clip_field(get(2)),
+        artist: helper::clip_field(get(3)),
+        album: helper::clip_field(get(4)),
         state: PlaybackState::from_mpris(get(1)),
         position,
         length,
@@ -285,13 +293,15 @@ fn parse_line(line: &str) -> Result<MediaState, MediaError> {
             .map(|v| (v * 100.0).round().clamp(0.0, 100.0) as u8),
         can_go_next: true,
         can_go_previous: true,
-        art_url: (!art.is_empty()).then(|| art.to_string()),
+        art_url: (!art.is_empty() && !f[10].truncated).then(|| art.to_string()),
         kind: MediaKind::from_hints(&player, None, (!url.is_empty()).then_some(url)),
         // Only tracks with a reported length offer seeking; streams and tracks
         // with unknown length do not.
         can_seek: length.is_some(),
-        track_id: (!trackid.is_empty()).then(|| trackid.to_string()),
-        player,
+        track_id: (!trackid.is_empty() && !f[12].truncated)
+            .then(|| trackid.to_string())
+            .filter(|id| is_valid_opaque_id(id)),
+        player: helper::clip_field(&player),
     })
 }
 
@@ -307,11 +317,17 @@ fn parse_loop(s: &str) -> Option<LoopMode> {
     LoopMode::parse_mpris(s)
 }
 
-fn unescape_markup(s: &str) -> Result<String, MediaError> {
-    let mut decoded = String::with_capacity(s.len());
+struct Decoded {
+    text: String,
+    truncated: bool,
+}
+
+fn unescape_markup(s: &str, cap: usize) -> Result<Decoded, MediaError> {
+    let mut decoded = String::with_capacity(s.len().min(cap));
+    let mut truncated = false;
     let mut rest = s;
     while let Some(amp) = rest.find('&') {
-        decoded.push_str(&rest[..amp]);
+        truncated |= helper::push_bounded(&mut decoded, &rest[..amp], cap);
         let entity = &rest[amp + 1..];
         let end = entity
             .find(';')
@@ -347,11 +363,32 @@ fn unescape_markup(s: &str) -> Result<String, MediaError> {
             }
             _ => return Err(malformed_escape()),
         };
-        decoded.push(character);
+        let mut encoded = [0; 4];
+        truncated |= helper::push_bounded(&mut decoded, character.encode_utf8(&mut encoded), cap);
         rest = entity_remainder(rest, amp, end);
     }
-    decoded.push_str(rest);
-    Ok(decoded)
+    truncated |= helper::push_bounded(&mut decoded, rest, cap);
+    Ok(Decoded {
+        text: decoded,
+        truncated,
+    })
+}
+
+fn parse_players(output: &[u8]) -> Vec<String> {
+    let mut players = Vec::new();
+    let mut seen = HashSet::new();
+    for line in String::from_utf8_lossy(output).lines() {
+        let Some(player) = helper::valid_id(line.trim()) else {
+            continue;
+        };
+        if seen.insert(player.clone()) {
+            players.push(player);
+            if players.len() == PLAYER_LIST_LIMIT {
+                break;
+            }
+        }
+    }
+    players
 }
 
 fn entity_remainder(input: &str, amp: usize, entity_end: usize) -> &str {
@@ -516,6 +553,41 @@ mod tests {
         let state = parse_line(&line).unwrap();
         assert_eq!(state.title, "&lt;");
         assert_eq!(state.artist, "AC&DC");
+    }
+
+    #[test]
+    fn decode_clips_hostile_metadata_before_state_construction() {
+        use crate::model::MAX_FIELD_BYTES;
+
+        let hostile = format!(
+            "\u{202e}\u{200b}start\rline\nnext\u{1b}{}",
+            "artist".repeat(MAX_FIELD_BYTES)
+        );
+        let line = escaped_record([
+            "spotify",
+            "Playing",
+            hostile.as_str(),
+            hostile.as_str(),
+            hostile.as_str(),
+            "1",
+            "0",
+            "false",
+            "None",
+            "0.5",
+            "",
+            "",
+            "",
+        ]);
+        let state = parse_line(&line).unwrap();
+        for field in [&state.title, &state.artist, &state.album] {
+            assert!(field.len() <= MAX_FIELD_BYTES);
+            assert!(field.is_char_boundary(field.len()));
+        }
+        assert!(state.title.starts_with('\u{202e}'));
+        assert!(state.title.contains('\u{200b}'));
+        assert!(state.title.contains('\r'));
+        assert!(state.title.contains('\n'));
+        assert!(state.title.contains('\u{1b}'));
     }
 
     #[test]
@@ -724,9 +796,12 @@ mod tests {
             "",
             id.as_str(),
         ]);
-        let exact = parse_line(&exact_record)
-            .expect("the exact-limit id record decodes")
-            .admitted();
+        let parsed_exact = parse_line(&exact_record).expect("the exact-limit id record decodes");
+        assert_eq!(
+            parsed_exact.track_id.as_deref().map(str::len),
+            Some(MAX_ID_BYTES)
+        );
+        let exact = parsed_exact.admitted();
         assert_eq!(exact.track_id.as_deref(), Some(id.as_str()));
         assert_eq!(exact.track_id.as_deref().map(str::len), Some(MAX_ID_BYTES));
 
@@ -746,9 +821,10 @@ mod tests {
             "",
             too_long_id.as_str(),
         ]);
-        let too_long = parse_line(&too_long_record)
-            .expect("the over-limit id record decodes")
-            .admitted();
+        let parsed_too_long =
+            parse_line(&too_long_record).expect("the over-limit id record decodes");
+        assert!(parsed_too_long.track_id.is_none());
+        let too_long = parsed_too_long.admitted();
         assert!(too_long.track_id.is_none());
 
         let control_id = format!("a{}b", '\u{7}');
@@ -771,5 +847,11 @@ mod tests {
             .expect("the control-character id record decodes")
             .admitted();
         assert!(control.track_id.is_none());
+    }
+
+    #[test]
+    fn player_list_decode_deduplicates_a_duplicate_source_flood() {
+        let flood = "spotify\n".repeat(100_000);
+        assert_eq!(parse_players(flood.as_bytes()), vec!["spotify"]);
     }
 }
