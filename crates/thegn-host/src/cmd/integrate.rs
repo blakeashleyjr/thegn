@@ -64,7 +64,8 @@ fn integration_worktree(cwd: &Path, repo_root: &Path, into: Option<&str>) -> Opt
             .map(PathBuf::from)
             .filter(|path| path.is_dir());
     }
-    (cwd != repo_root).then(|| cwd.to_path_buf())
+    let root = thegn_core::repo::worktree_root_for_cwd(cwd)?;
+    (root != repo_root).then_some(root)
 }
 
 /// Flags for `thegn integrate`.
