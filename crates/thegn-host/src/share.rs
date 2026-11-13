@@ -1528,6 +1528,8 @@ mod tests {
 
     #[test]
     fn ticket_is_copied_as_data_and_never_opened_as_a_url() {
+        // Acceptance: opaque tickets are clipboard data, not browser URLs or
+        // shell commands.
         let endpoint = PublicEndpoint::parse_ticket("opaque-ticket_7").expect("valid ticket");
         let view = ShareView {
             worktree: "/wt".into(),
@@ -1550,6 +1552,8 @@ mod tests {
 
     #[test]
     fn url_and_socket_endpoints_project_to_copy_and_browser_values() {
+        // Acceptance: clipboard and browser projections preserve the endpoint
+        // type, including URL default-port canonicalization and socket data.
         let url = thegn_svc::share::UrlRule::Fixed("https://Example.com:443".into())
             .fixed()
             .expect("valid URL endpoint");
