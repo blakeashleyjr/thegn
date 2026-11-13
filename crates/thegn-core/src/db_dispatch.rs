@@ -893,7 +893,7 @@ impl Db {
             }));
         }
         let status = AgentDispatchStatus::parse(&stored_status);
-        if status == AgentDispatchStatus::Failed && superseded {
+        if superseded {
             return Err(anyhow::Error::new(ParentDispatchConflict {
                 parent_id,
                 reason: ParentEdgeReason::Superseded,
@@ -3620,6 +3620,29 @@ mod tests {
             assert_eq!(
                 db.get_dispatch(finisher).unwrap().unwrap().parent_id,
                 Some(source)
+            );
+
+            db.set_dispatch_status_checked(
+                source,
+                AgentDispatchStatus::Failed,
+                AgentDispatchStatus::Done,
+                None,
+            )
+            .unwrap();
+            let child = pipeline_row(
+                "linear:SUPERSEDE",
+                "/wt/done-child",
+                "code",
+                None,
+                Some(source),
+            );
+            let error = db.put_dispatch_with_parent_check(child).unwrap_err();
+            assert_eq!(
+                error
+                    .downcast_ref::<ParentDispatchConflict>()
+                    .map(|conflict| conflict.reason),
+                Some(ParentEdgeReason::Superseded),
+                "claim={claim}; done superseded parent should remain refused: {error}"
             );
         }
     }
