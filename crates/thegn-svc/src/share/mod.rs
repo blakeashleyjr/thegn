@@ -593,13 +593,17 @@ pub enum ShareLaunch {
     /// Spawn a tunnel-client child (bore, frp, dumbpipe) — see [`start`].
     Process(SharePlan),
     /// Run `up_argv` inside the VPN sidecar, derive the URL, and run `down_argv`
-    /// on teardown — see [`serve_up`]/[`serve_down`].
+    /// on teardown — see [`serve_up`]/[`serve_down`]. No provider endpoint
+    /// announcement exists for this path: the URL is planned, not scraped, so
+    /// endpoint conflict detection does not apply.
     SidecarServe(ServePlan),
 }
 
 /// A `tailscale serve`/`funnel` plan executed inside the worktree's VPN sidecar.
 /// The public URL is `scheme://<MagicDNS name>:<port>` — the DNS name is read
-/// from `tailscale status --json` at bring-up.
+/// from `tailscale status --json` at bring-up. Tailscale does not announce an
+/// endpoint in provider output; this planned URL is not subject to conflict
+/// detection.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ServePlan {
     pub up_argv: Vec<String>,

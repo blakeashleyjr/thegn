@@ -77,10 +77,9 @@ stopping; wait for teardown to finish first.
 
 Each share provider has a different credential channel and limit:
 
-- bore receives its secret through `BORE_SECRET`, never on the command line.
-  Other processes running as the same user may read that environment (for
-  example through `/proc/<pid>/environ`); `extra_args` containing `--secret` or
-  `-s` are refused.
+- bore's secret travels in the child's `BORE_SECRET` environment and is
+  readable by same-user processes on the host; this is the documented accepted
+  risk (option A), and `extra_args` containing `--secret` or `-s` are refused.
 - frp reads its token from a generated `frpc.toml` in the share's private state
   directory (directory mode 0700, file mode 0600).
 - Tailscale has no secret held or passed through thegn; the VPN sidecar's own
