@@ -1329,29 +1329,29 @@ mod tests {
     }
 
     #[test]
-    fn snapshot_add_failure_preserves_index_and_names_restore_failure() {
-        let repo = TestRepo::new("plumb-snap-add-lock");
+    fn snapshot_add_failure_restores_index_and_reports_add() {
+        let repo = TestRepo::new("plumb-snap-add-fail");
         ident(&repo.dir);
         repo.commit_file("f.txt", "before\n", "base");
         std::fs::write(repo.dir.join("f.txt"), "staged\n").unwrap();
         git_in(&repo.dir, &["add", "f.txt"]);
         let before = repo.out(&["ls-files", "-s"]);
-        let lock = repo.dir.join(".git/index.lock");
-        std::fs::write(&lock, b"held").unwrap();
+        let head = repo.out(&["rev-parse", "HEAD"]);
+        // An embedded repository with no commit makes `git add -A` fail
+        // ("does not have a commit checked out") after write-tree succeeded.
+        let sub = repo.dir.join("sub");
+        std::fs::create_dir_all(&sub).unwrap();
+        git_in(&sub, &["init", "-q"]);
+        std::fs::write(sub.join("a.txt"), "x\n").unwrap();
 
         let error = CliGit
             .snapshot_worktree(&repo.loc(), "snap add failure", false)
             .unwrap_err();
         let detail = format!("{error:#}");
-        assert!(detail.contains("git add -A"), "{detail}");
-        assert!(
-            detail.contains("restoring pre-snapshot index tree"),
-            "{detail}"
-        );
-        assert!(detail.contains("git read-tree"), "{detail}");
+        assert!(detail.contains("add -A"), "{detail}");
+        assert!(!detail.contains("also failed"), "{detail}");
         assert_eq!(repo.out(&["ls-files", "-s"]), before);
-
-        std::fs::remove_file(lock).unwrap();
+        assert_eq!(repo.out(&["rev-parse", "HEAD"]), head);
     }
 
     #[test]
