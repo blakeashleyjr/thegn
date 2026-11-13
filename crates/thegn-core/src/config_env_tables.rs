@@ -720,6 +720,10 @@ pub struct SnapshotStoreConfig {
     /// S3 backend: sign the x-amz-server-side-encryption: AES256 header into every snapshot upload (default). Set false only for an
     /// S3-compatible store that rejects SSE-S3; it never permits a plaintext endpoint.
     pub server_side_encryption: bool,
+    /// S3 backend: sign `If-None-Match: *` into every immutable artifact and
+    /// manifest upload (default). S3-compatible stores that reject conditional
+    /// writes must set it false.
+    pub conditional_create: bool,
 }
 
 impl Default for SnapshotStoreConfig {
@@ -736,6 +740,7 @@ impl Default for SnapshotStoreConfig {
             access_key: "env:AWS_ACCESS_KEY_ID".into(),
             secret_key: "env:AWS_SECRET_ACCESS_KEY".into(),
             server_side_encryption: true,
+            conditional_create: true,
         }
     }
 }
@@ -923,15 +928,21 @@ mod tests {
     }
 
     #[test]
-    fn snapshot_store_sse_defaults_on_and_parses_opt_out() {
+    fn snapshot_store_sse_and_conditional_create_defaults_on_and_parse_opt_outs() {
         assert!(SnapshotStoreConfig::default().server_side_encryption);
+        assert!(SnapshotStoreConfig::default().conditional_create);
 
         let opted_out = toml::from_str::<SnapshotStoreConfig>("server_side_encryption = false")
             .expect("SSE opt-out parses");
         assert!(!opted_out.server_side_encryption);
 
+        let opted_out = toml::from_str::<SnapshotStoreConfig>("conditional_create = false")
+            .expect("conditional-create opt-out parses");
+        assert!(!opted_out.conditional_create);
+
         let empty = toml::from_str::<SnapshotStoreConfig>("").expect("empty config parses");
         assert!(empty.server_side_encryption);
+        assert!(empty.conditional_create);
     }
 
     #[test]

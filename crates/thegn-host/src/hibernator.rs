@@ -38,7 +38,7 @@ use thegn_core::snapshot_meta::{
 };
 use thegn_core::store::{HibernationRow, HibernationStore, PoolStore};
 use thegn_core::syncstate;
-use thegn_svc::snapshot::SnapshotStore;
+use thegn_svc::snapshot::{SnapshotAlreadyExists, SnapshotStore};
 
 use crate::agent::block_on_provider;
 
@@ -279,11 +279,18 @@ fn spawn_cycle(cfg: Config, cycle: Cycle) {
         match cycle {
             Cycle::Hibernate { worktree, env_name } => {
                 if let Err(e) = hibernate_one(&cfg, &worktree, &env_name) {
-                    thegn_core::msg::warn(&format!(
-                        "hibernate {worktree}: {e}; the sandbox is kept (will retry later)"
-                    ));
-                    if let Ok(mut f) = failures().lock() {
-                        f.insert(worktree.clone(), Instant::now());
+                    let collision = e.downcast_ref::<SnapshotAlreadyExists>().is_some();
+                    if collision {
+                        thegn_core::msg::warn(&format!(
+                            "hibernate {worktree}: {e}; the sandbox is kept (snapshot collision)"
+                        ));
+                    } else {
+                        thegn_core::msg::warn(&format!(
+                            "hibernate {worktree}: {e}; the sandbox is kept (will retry later)"
+                        ));
+                        if let Ok(mut f) = failures().lock() {
+                            f.insert(worktree.clone(), Instant::now());
+                        }
                     }
                     // The intent row must not outlive a failed capture: the VM
                     // is alive and the snapshot is not trustworthy.

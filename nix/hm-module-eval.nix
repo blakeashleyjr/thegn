@@ -226,6 +226,8 @@
           semanticMapBudgetLines = 500;
           hostDiscoveryTailnetEnabled = true;
           hostDiscoveryTailnetOnlineOnly = false;
+          lifecycleSnapshotServerSideEncryption = false;
+          lifecycleSnapshotConditionalCreate = false;
           agents = [
             {
               name = "shell";
