@@ -105,7 +105,7 @@ fn land_branch_pinned_with_options(
     // This IS the manual land, so force it on regardless of queue policy.
     let mut mq = cfg.repo_merge_queue(&root);
     mq.auto_land = true;
-    let target = integrate::resolve_target(&mq, &root);
+    let target = integrate::resolve_target_checked(&mq, &root).map_err(anyhow::Error::msg)?;
     let trusted = if trust_gate {
         let is_root = std::fs::canonicalize(worktree).ok().as_deref() == Some(root.as_path());
         let trusted = if is_root {
