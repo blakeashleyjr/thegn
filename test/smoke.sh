@@ -251,6 +251,11 @@ cd "$R"
 
 echo "thegn smoke test"
 
+# Container discovery is read-only and degrades to an empty array when no OCI
+# runtime is installed on the machine running smoke.
+check "sandbox ls --json emits an array without requiring a runtime" \
+  "'$SZ' sandbox ls --json | grep -Eq '^\\[.*\\]$'"
+
 # Directory-agnostic repo discovery: finds the two repos under the scan root,
 # and not the one outside it — regardless of $PWD.
 check "repos discovers repos under repo_roots" \
