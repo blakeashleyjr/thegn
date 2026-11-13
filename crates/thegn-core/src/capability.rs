@@ -1786,6 +1786,16 @@ pub const GAP_DISPOSITIONS: &[(&str, Surface, GapDisposition)] = &[
         GapDisposition::Deferred { review: "THE-203" },
     ),
     (
+        "issues.list",
+        Surface::Mcp,
+        GapDisposition::Deferred { review: "THE-203" },
+    ),
+    (
+        "issues.get",
+        Surface::Mcp,
+        GapDisposition::Deferred { review: "THE-203" },
+    ),
+    (
         "issues.update",
         Surface::Mcp,
         GapDisposition::Deferred { review: "THE-203" },

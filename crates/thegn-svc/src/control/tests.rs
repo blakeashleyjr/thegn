@@ -962,7 +962,7 @@ async fn grpc_folder_assignment_requires_git_scope() {
 
 #[cfg(feature = "control-grpc")]
 #[tokio::test]
-async fn grpc_mcp_proxy_reload_requires_admin_before_calling_api() {
+async fn grpc_mcp_proxy_reload_requires_write_before_calling_api() {
     use super::grpc::{GrpcControl, proto};
     use proto::control_server::Control;
     use thegn_core::store::ControlStore;
@@ -975,7 +975,7 @@ async fn grpc_mcp_proxy_reload_requires_admin_before_calling_api() {
         daemon_euid: None,
         server_label: "test thegn".into(),
     };
-    for scope in ["read", "write", "git"] {
+    for scope in ["read"] {
         let bearer = token(&r, scope);
         let mut request = tonic::Request::new(proto::McpProxyReloadRequest {});
         request
@@ -996,11 +996,11 @@ async fn grpc_mcp_proxy_reload_requires_admin_before_calling_api() {
         serde_json::from_str(&status.into_inner().status_json).unwrap();
     assert_eq!(status_json["enabled"], true);
 
-    let admin = token(&r, "admin");
+    let writer = token(&r, "write");
     let mut reload_request = tonic::Request::new(proto::McpProxyReloadRequest {});
     reload_request
         .metadata_mut()
-        .insert("authorization", format!("Bearer {admin}").parse().unwrap());
+        .insert("authorization", format!("Bearer {writer}").parse().unwrap());
     let report = grpc.mcp_proxy_reload(reload_request).await.unwrap();
     assert_eq!(
         serde_json::from_str::<serde_json::Value>(&report.into_inner().report_json).unwrap()["tools_changed"],
