@@ -377,7 +377,96 @@ fn public_endpoint_parsing_canonicalizes_and_rejects_ambiguous_input() {
 }
 
 #[test]
+fn endpoint_acceptance_matrix_covers_url_and_ticket_boundaries() {
+    // Acceptance: IPv4 endpoints remain valid and canonical.
+    assert_eq!(
+        PublicEndpoint::parse_url("https://192.0.2.44:8443")
+            .expect("valid IPv4 endpoint")
+            .canonical(),
+        "https://192.0.2.44:8443"
+    );
+
+    // Acceptance: IPv6 literal and bracketed forms are handled without
+    // allowing an ambiguous unbracketed host:port authority.
+    assert_eq!(
+        PublicEndpoint::parse_url("https://[2001:db8::44]:8443")
+            .expect("valid bracketed IPv6 endpoint")
+            .canonical(),
+        "https://[2001:db8::44]:8443"
+    );
+    assert_eq!(
+        PublicEndpoint::parse_fixed("[2001:db8::44]:8443")
+            .expect("valid bracketed IPv6 socket")
+            .canonical(),
+        "[2001:db8::44]:8443"
+    );
+    assert!(PublicEndpoint::parse_url("https://2001:db8::44:8443").is_none());
+
+    // Acceptance: IDNA A-labels are canonicalized, while U-labels are refused
+    // because endpoint authorities are deliberately ASCII-only.
+    assert_eq!(
+        PublicEndpoint::parse_url("https://XN--BCHER-KVA.example")
+            .expect("valid IDNA A-label")
+            .canonical(),
+        "https://xn--bcher-kva.example"
+    );
+    assert!(PublicEndpoint::parse_url("https://例え.テスト").is_none());
+
+    // Acceptance: URL userinfo is rejected rather than being treated as part
+    // of the public host.
+    assert!(PublicEndpoint::parse_url("https://user:password@example.test").is_none());
+
+    // Acceptance: URL fragments are rejected at the endpoint boundary.
+    assert!(PublicEndpoint::parse_url("https://example.test/path#fragment").is_none());
+
+    // Acceptance: whitespace, control characters, and ANSI escape sequences
+    // cannot enter a URL or an opaque ticket.
+    for value in [
+        "https://example.test/path with space",
+        "https://example.test/path\twith-tab",
+        "https://example.test/path\nwith-newline",
+        "https://example.test/path\u{1b}[31m",
+    ] {
+        assert!(
+            PublicEndpoint::parse_url(value).is_none(),
+            "accepted {value:?}"
+        );
+    }
+    assert!(PublicEndpoint::parse_ticket("ticket\u{1b}[31m").is_none());
+
+    // Acceptance: delimiter injection is rejected for both URL authorities
+    // and provider-issued tickets.
+    assert!(PublicEndpoint::parse_url("https://example.test:8443;echo").is_none());
+    let ticket = UrlRule::AfterMarkerRaw {
+        marker: "connect-tcp".into(),
+    };
+    assert!(ticket.apply("connect-tcp safe-ticket;echo").is_none());
+
+    // Acceptance: oversized tickets are discarded before they can reach copy
+    // or render consumers.
+    assert!(
+        PublicEndpoint::parse_ticket(&"x".repeat(PublicEndpoint::MAX_TICKET_BYTES + 1)).is_none()
+    );
+
+    // Acceptance: malformed URLs never become startup endpoint announcements.
+    for value in [
+        "ftp://example.test",
+        "https:///example.test",
+        "https://[not-an-ipv6-address]",
+        "https://example.test:not-a-port",
+        "https://example.test/%zz",
+    ] {
+        assert!(
+            PublicEndpoint::parse_url(value).is_none(),
+            "accepted {value:?}"
+        );
+    }
+}
+
+#[test]
 fn announcements_reject_repeated_markers_and_ticket_delimiters() {
+    // Acceptance: repeated output markers are rejected, and delimiter
+    // injection cannot turn a ticket into command text.
     let rule = UrlRule::AfterMarker {
         marker: "public: ".into(),
         scheme: "https".into(),
@@ -395,6 +484,7 @@ fn announcements_reject_repeated_markers_and_ticket_delimiters() {
 
 #[test]
 fn startup_rejects_two_provider_endpoint_announcements() {
+    // Acceptance: mutating repeated announcements are a startup conflict.
     let (tx, rx) = std::sync::mpsc::sync_channel(2);
     let first = PublicEndpoint::parse_url("https://first.test").expect("valid URL");
     tx.send(first.clone()).expect("first announcement");
@@ -405,6 +495,7 @@ fn startup_rejects_two_provider_endpoint_announcements() {
 
 #[test]
 fn startup_accepts_byte_identical_endpoint_announcements() {
+    // Acceptance: byte-identical repeated announcements are harmless.
     let (tx, rx) = std::sync::mpsc::sync_channel(2);
     let first = PublicEndpoint::parse_url("https://first.test").expect("valid URL");
     tx.send(first.clone()).expect("repeat announcement");
@@ -1044,6 +1135,16 @@ fn tailscale_serve_default_443() {
     );
     assert_eq!(s.scheme, "https");
     assert_eq!(s.port, 443);
+}
+
+#[test]
+fn tailscale_serve_has_no_endpoint_announcement_to_conflict() {
+    // Acceptance: SidecarServe is N/A for provider-output conflict detection;
+    // its URL is planned from the serve plan rather than scraped from output.
+    let plan = serve_plan(thegn_core::config::TailscaleShareConfig::default(), 3000);
+    assert_eq!(plan.scheme, "https");
+    assert_eq!(plan.port, 443);
+    assert_eq!(plan.up_argv, vec!["tailscale", "serve", "--bg", "3000"]);
 }
 
 #[test]
@@ -1830,6 +1931,8 @@ fn group_stop_supervised_wait_returns_on_exit_without_poll() {
 #[cfg(unix)]
 #[test]
 fn running_share_reports_endpoint_mutation_after_startup_window() {
+    // Acceptance: a mutating post-start provider announcement becomes a
+    // sticky endpoint conflict.
     let state = tempfile::tempdir().expect("private temporary state");
     let script = "echo 'public: first.example:4123'; sleep 0.3; echo 'public: first.example:4123'; echo 'public: first.example:4123'; echo 'public: first.example:4123'; echo 'public: second.example:4123'; sleep 2";
     let plan = SharePlan {
@@ -1857,6 +1960,7 @@ fn running_share_reports_endpoint_mutation_after_startup_window() {
 #[cfg(unix)]
 #[test]
 fn running_share_accepts_post_startup_identical_announcements() {
+    // Acceptance: identical post-start provider announcements remain benign.
     let state = tempfile::tempdir().expect("private temporary state");
     let script = "echo 'public: first.example:4123'; sleep 0.3; echo 'public: first.example:4123'; echo 'public: first.example:4123'; echo 'public: first.example:4123'; sleep 2";
     let plan = SharePlan {
@@ -1881,6 +1985,8 @@ fn running_share_accepts_post_startup_identical_announcements() {
 #[cfg(unix)]
 #[test]
 fn endpoint_conflict_hook_fires_once_for_post_startup_changes() {
+    // Acceptance: a mutating announcement invokes the conflict hook exactly
+    // once even if later output changes again.
     let state = tempfile::tempdir().expect("private temporary state");
     let script = "echo 'public: first.example:4123'; sleep 0.3; echo 'public: first.example:4123'; echo 'public: first.example:4123'; echo 'public: second.example:4123'; sleep 0.3; echo 'public: third.example:4123'; sleep 1";
     let plan = SharePlan {
@@ -1914,6 +2020,8 @@ fn endpoint_conflict_hook_fires_once_for_post_startup_changes() {
 #[cfg(unix)]
 #[test]
 fn endpoint_conflict_hook_fires_when_installed_after_conflict() {
+    // Acceptance: installing the hook after a mutating announcement still
+    // reports the already-sticky conflict once.
     let state = tempfile::tempdir().expect("private temporary state");
     let script =
         "echo 'public: first.example:4123'; sleep 0.3; echo 'public: second.example:4123'; sleep 1";
@@ -1948,6 +2056,8 @@ fn endpoint_conflict_hook_fires_when_installed_after_conflict() {
 #[cfg(unix)]
 #[test]
 fn endpoint_conflict_hook_does_not_fire_for_identical_repeats() {
+    // Acceptance: identical repeated announcements never invoke the conflict
+    // hook.
     let state = tempfile::tempdir().expect("private temporary state");
     let script = "echo 'public: first.example:4123'; sleep 0.3; echo 'public: first.example:4123'; echo 'public: first.example:4123'; sleep 0.6";
     let plan = SharePlan {
