@@ -620,6 +620,8 @@ repo-root `.thegn.toml` overrides settings for that repo.
 [sandbox.limits]
 cpu    = "2"
 memory = "4g"
+heavy_slots = 2   # host-local concurrent gate slots; 0 disables
+max_load = 0.0     # absolute 1-minute load-average ceiling; 0 disables
 
 [sandbox.volumes]          # OCI backends only
 cargo-registry = "/root/.cargo/registry"
@@ -628,6 +630,12 @@ node-modules   = "/root/.npm"
 
 Named volumes survive container recreation, so a package cache does not
 cold-start on every build.
+
+Heavy merge and dispatch gates can share a host-local admission policy. Set
+`heavy_slots` to cap concurrent gates across thegn processes, and optionally
+set `max_load` to wait while the absolute one-minute host load average is at or
+above that value. Both default to zero (off). Locks are released automatically
+when a gate exits; after a bounded wait, the gate proceeds with a warning.
 
 `[sandbox] compiler_cache = "off"` is the default and is the only switch that
 authorizes an sccache wrapper inside containment. It removes inherited sccache

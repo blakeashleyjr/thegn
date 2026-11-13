@@ -1011,6 +1011,11 @@ pub struct MergeQueueConfig {
     /// commits and imported read-only from the repository's rr-cache. Off by
     /// default. A rerere-resolved merge still runs the gate before landing.
     pub rerere: bool,
+    /// Resolved host-local heavy-gate policy. This is runtime plumbing from
+    /// `[sandbox.limits]`, not a serialised `[merge_queue]` setting.
+    #[serde(skip)]
+    #[schemars(skip)]
+    pub heavy_gate: crate::heavy_gate::Config,
 }
 
 /// `[merge_queue.prompts]` — the task prompt handed to the fixing agent, one
@@ -1112,6 +1117,7 @@ impl Default for MergeQueueConfig {
             land_message: String::new(),
             sign_commits: false,
             rerere: false,
+            heavy_gate: crate::heavy_gate::Config::default(),
         }
     }
 }
@@ -6284,7 +6290,6 @@ pub fn env_overlay(env: &dyn EnvSource) -> ConfigOverlay {
         o.preview.allow_external_urls = parse_bool(&v, "THEGN_PREVIEW_ALLOW_EXTERNAL_URLS");
     }
 
-    // [sandbox]
     if let Some(v) = env.get("THEGN_SANDBOX_BACKEND") {
         o.sandbox.backend = parse_enum_env(
             v.trim(),
@@ -7171,6 +7176,7 @@ impl Config {
             }
             _ => {}
         }
+        mq.heavy_gate = (&self.sandbox.limits).into();
         mq
     }
 
