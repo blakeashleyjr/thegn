@@ -7,6 +7,8 @@ All notable changes to **thegn** are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.1.0-alpha.73] — 2026-11-13
+
 ### Added
 
 - MCP read tools `calendar_events`, `calendar_clocks`, `issues_list`, `issues_get` and `dispatches_list` expose calendar, tracker issue and dispatch-roster data.
@@ -3341,7 +3343,8 @@ launcher picker and the merge queue's `agent_command` hook remain — they run
 whatever commands you configure. Leftover `[llm_proxy]` config sections and
 `proxy_*` tables in existing state databases are ignored harmlessly.
 
-[Unreleased]: https://github.com/blakeashleyjr/thegn/compare/v0.1.0-alpha.72...HEAD
+[Unreleased]: https://github.com/blakeashleyjr/thegn/compare/v0.1.0-alpha.73...HEAD
+[0.1.0-alpha.73]: https://github.com/blakeashleyjr/thegn/compare/v0.1.0-alpha.72...v0.1.0-alpha.73
 [0.1.0-alpha.72]: https://github.com/blakeashleyjr/thegn/compare/v0.1.0-alpha.71...v0.1.0-alpha.72
 [0.1.0-alpha.71]: https://github.com/blakeashleyjr/thegn/compare/v0.1.0-alpha.70...v0.1.0-alpha.71
 [0.1.0-alpha.70]: https://github.com/blakeashleyjr/thegn/compare/v0.1.0-alpha.69...v0.1.0-alpha.70
