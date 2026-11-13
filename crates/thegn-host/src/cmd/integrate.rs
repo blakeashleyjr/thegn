@@ -146,7 +146,7 @@ pub fn run(cfg: &Config, args: &IntegrateArgs) -> Result<()> {
         // A stack fold is not a landing on the configured target, so defer lifecycle filing/removal to the eventual land of B.
         mq.on_landed = thegn_core::config::OnLanded::Off;
     }
-    let target = integrate::resolve_target(&mq, &repo_root);
+    let target = integrate::resolve_target_checked(&mq, &repo_root).map_err(anyhow::Error::msg)?;
 
     let override_gpg = cfg.repo_git(&repo_root).override_gpg;
     let mut cands = integrate::candidate_branches(&mq, &repo_root, &target)?;

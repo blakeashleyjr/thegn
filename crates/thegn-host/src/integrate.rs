@@ -1430,10 +1430,25 @@ pub(crate) fn conflict_details(
 /// Resolve the branch the fold advances. `"auto"` (or empty) → the repo's
 /// default branch; otherwise the configured name verbatim.
 pub fn resolve_target(cfg: &MergeQueueConfig, repo_root: &Path) -> String {
+    resolve_target_checked(cfg, repo_root).unwrap_or_else(|error| {
+        tracing::warn!(
+            target: "thegn::merge",
+            repo = %repo_root.display(),
+            %error,
+            "could not resolve merge target; using HEAD"
+        );
+        "HEAD".to_string()
+    })
+}
+
+/// Resolve the branch the fold advances, preserving failures from the default
+/// branch probe. Fold entry points use this form so a broken repository cannot
+/// silently turn into a fold against `HEAD`.
+pub fn resolve_target_checked(cfg: &MergeQueueConfig, repo_root: &Path) -> Result<String, String> {
     if cfg.target_branch.is_empty() || cfg.target_branch == "auto" {
-        thegn_core::worktree::default_branch(repo_root)
+        thegn_core::worktree::default_branch_checked(repo_root)
     } else {
-        cfg.target_branch.clone()
+        Ok(cfg.target_branch.clone())
     }
 }
 
@@ -1505,7 +1520,7 @@ pub fn fold_active_repo(cfg: &thegn_core::config::Config, any_path: &Path) -> Re
     // Resolved here (off the loop — this runs inside spawn_fold's blocking task)
     // because the per-repo `[merge_queue]` layer needs the repo root.
     let mq = &cfg.repo_merge_queue(&repo_root);
-    let target = resolve_target(mq, &repo_root);
+    let target = resolve_target_checked(mq, &repo_root).map_err(anyhow::Error::msg)?;
     let override_gpg = cfg.repo_git(&repo_root).override_gpg;
     let mut cands = candidate_branches(mq, &repo_root, &target)?;
     // The in-app `integrate` action reaches this too, so the opt-in guard lives
@@ -2297,7 +2312,7 @@ fn run_fold_admitted(
     stop_at_first_conflict: bool,
 ) -> Result<FoldReport> {
     history.revalidate()?;
-    let target_branch = resolve_target(cfg, repo_root);
+    let target_branch = resolve_target_checked(cfg, repo_root).map_err(anyhow::Error::msg)?;
     let target_ref = format!("refs/heads/{target_branch}");
     let original = CliGit.rev_parse(&loc, &target_ref)?;
     let refused = match configured_merge_drivers(repo_root) {
@@ -2929,7 +2944,7 @@ fn attempt_land_admitted(
     let (loc, history) = CanonicalHistory::worktree_loc(repo_root)?;
     // A target-store observation is not proof about a remote/provider source.
     let source_history = history.local_child(branch_loc)?;
-    let target_branch = resolve_target(cfg, repo_root);
+    let target_branch = resolve_target_checked(cfg, repo_root).map_err(anyhow::Error::msg)?;
     let target_ref = format!("refs/heads/{target_branch}");
     // Cross-host: if the branch's worktree lives on another machine, fetch its
     // tip into the target store first and fold that synthetic ref — a bare

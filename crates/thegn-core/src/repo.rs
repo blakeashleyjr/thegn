@@ -58,6 +58,28 @@ pub fn toplevel(dir: &Path) -> Option<PathBuf> {
     util::git_out(dir, &["rev-parse", "--show-toplevel"]).map(PathBuf::from)
 }
 
+/// Toplevel of the working tree containing `dir`, preserving Git probe errors.
+pub fn toplevel_checked(dir: &Path) -> Result<PathBuf, String> {
+    let cancel = AtomicBool::new(false);
+    let output = crate::git_run::git_run(
+        dir,
+        &["rev-parse", "--show-toplevel"],
+        &crate::git_run::GitPolicy::read(Duration::from_secs(60)),
+        &cancel,
+    );
+    let text = output
+        .into_text()
+        .map_err(|error| format!("could not read git toplevel in {}: {error}", dir.display()))?;
+    let text = text.trim();
+    if text.is_empty() {
+        return Err(format!(
+            "could not read git toplevel in {}: Git returned empty output",
+            dir.display()
+        ));
+    }
+    Ok(PathBuf::from(text))
+}
+
 /// The worktree root owning `cwd` — the "connect to root" resolver: from any
 /// nested directory (a shell pane deep in a subdir), find the git worktree it
 /// belongs to (`rev-parse --show-toplevel` from that dir). The result is
@@ -128,6 +150,31 @@ fn main_worktree_uncached(dir: &Path) -> Option<PathBuf> {
 
 pub fn is_bare(dir: &Path) -> bool {
     util::git_out(dir, &["rev-parse", "--is-bare-repository"]).as_deref() == Some("true")
+}
+
+/// Whether `dir` is a bare repository, preserving Git probe errors.
+pub fn is_bare_checked(dir: &Path) -> Result<bool, String> {
+    let cancel = AtomicBool::new(false);
+    let output = crate::git_run::git_run(
+        dir,
+        &["rev-parse", "--is-bare-repository"],
+        &crate::git_run::GitPolicy::read(Duration::from_secs(60)),
+        &cancel,
+    );
+    let text = output.into_text().map_err(|error| {
+        format!(
+            "could not check repository type in {}: {error}",
+            dir.display()
+        )
+    })?;
+    match text.trim() {
+        "true" => Ok(true),
+        "false" => Ok(false),
+        response => Err(format!(
+            "could not check repository type in {}: unexpected response {response:?}",
+            dir.display()
+        )),
+    }
 }
 
 /// Short repo name for tab names and worktree grouping.
@@ -517,6 +564,32 @@ mod tests {
                 .success(),
             "git {args:?}"
         );
+    }
+
+    #[test]
+    fn checked_repo_probes_cover_bare_and_worktree_arms() {
+        let scratch = tempfile::tempdir().unwrap();
+        let worktree = scratch.path().join("worktree");
+        std::fs::create_dir(&worktree).unwrap();
+        git_ok(&worktree, &["init", "-q", "-b", "main"]);
+        let bare = scratch.path().join("bare.git");
+        std::fs::create_dir(&bare).unwrap();
+        git_ok(&bare, &["init", "--bare", "-q"]);
+
+        for (path, expected_bare) in [(&worktree, false), (&bare, true)] {
+            assert_eq!(is_bare_checked(path).unwrap(), expected_bare);
+        }
+        assert_eq!(
+            toplevel_checked(&worktree).unwrap(),
+            std::fs::canonicalize(&worktree).unwrap()
+        );
+
+        let bogus = scratch.path().join("bogus");
+        std::fs::create_dir(&bogus).unwrap();
+        let error = is_bare_checked(&bogus).unwrap_err();
+        assert!(error.contains("could not check repository type"), "{error}");
+        let error = toplevel_checked(&bogus).unwrap_err();
+        assert!(error.contains("could not read git toplevel"), "{error}");
     }
 
     #[test]

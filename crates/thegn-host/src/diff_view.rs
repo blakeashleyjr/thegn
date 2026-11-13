@@ -557,6 +557,9 @@ impl DiffView {
                 false,
             ));
             out.push((Line::Blank, false));
+            if self.diff.is_none() {
+                return out;
+            }
         }
         let Some(diff) = self.active_diff() else {
             let msg = if self.want_structural && self.structural.is_none() {
@@ -959,6 +962,23 @@ mod tests {
         v.handle_key(&KeyCode::Char('t'), Modifiers::NONE);
         assert!(!v.structural_active());
     }
+
+    #[test]
+    fn unavailable_diff_shows_reason_instead_of_loading_or_head() {
+        let mut v = DiffView::with_structural("t".into(), 1, false);
+        v.apply_data(DiffViewData {
+            generation: 1,
+            diff: None,
+            structural: Some(Err("unavailable: could not read origin HEAD".into())),
+            review: None,
+            review_status: None,
+        });
+        let body = format!("{:?}", v.body_lines(40));
+        assert!(body.contains("unavailable: could not read origin HEAD"));
+        assert!(!body.contains("Loading diff"));
+        assert!(!body.contains("HEAD-only"));
+    }
+
     #[test]
     fn submodule_file_is_one_atomic_pointer_row() {
         let mut v = DiffView::with_structural("t".into(), 1, false);
