@@ -127,6 +127,11 @@ The file is watched: edits apply live, no restart.
 - `[merge_queue]`, `[pr_queue]`, `[autopilot]`, `[sandbox]`, `[limits]`,
   `[share]`, `[forward]`, `[media]`, `[network]`, `[replay]`, `[lifecycle]` —
   optional feature groups.
+- `[lifecycle.snapshot]` stores hibernation artifacts locally by default or in
+  an S3-compatible bucket. S3 uploads use server-side AES256 encryption and
+  conditional creation by default; set `server_side_encryption = false` or
+  `conditional_create = false` only for a compatible store that rejects that
+  request header.
 
 ### Issue autopilot
 
