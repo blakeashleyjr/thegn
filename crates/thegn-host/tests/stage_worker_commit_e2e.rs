@@ -287,7 +287,7 @@ impl Fixture {
         let outside_path = outside.path().to_string_lossy();
         let worktrees_dir = state.root().join("worktrees");
         let config = format!(
-            "worktrees_dir = {worktrees_dir:?}\n\n[sandbox]\nenabled = true\nbackend = \"bwrap\"\nbackend_chain = [\"bwrap\"]\nprofile = \"standard\"\nnetwork = \"none\"\nenv_passthrough = []\n\n[env.pipeline]\nplacement = \"local\"\n\n[[agents]]\nname = \"stub\"\ncommand = {command:?}\n\n[[pipeline.stages]]\nname = \"commit\"\nagent = \"stub\"\nprompt = \"commit the fixture\"\nconcurrency = 1\ntimeout_secs = 60\nenv = {{ OUTSIDE = {outside_path:?}, GIT_CONFIG_GLOBAL = \"/dev/null\", GIT_CONFIG_NOSYSTEM = \"1\", GIT_TERMINAL_PROMPT = \"0\" }}\n",
+            "worktrees_dir = {worktrees_dir:?}\n\n[sandbox]\nenabled = true\nbackend = \"bwrap\"\nbackend_chain = [\"bwrap\"]\nprofile = \"standard\"\nnetwork = \"none\"\nenv_passthrough = []\n\n# The fixture's sentinel session bus cannot host a systemd scope, so the CPU cap is disabled for this hermetic test.\n[sandbox.limits]\ncpu_total = \"off\"\n\n[env.pipeline]\nplacement = \"local\"\n\n[[agents]]\nname = \"stub\"\ncommand = {command:?}\n\n[[pipeline.stages]]\nname = \"commit\"\nagent = \"stub\"\nprompt = \"commit the fixture\"\nconcurrency = 1\ntimeout_secs = 60\nenv = {{ OUTSIDE = {outside_path:?}, GIT_CONFIG_GLOBAL = \"/dev/null\", GIT_CONFIG_NOSYSTEM = \"1\", GIT_TERMINAL_PROMPT = \"0\" }}\n",
         );
         let config_dir = state.config_home().join("thegn");
         fs::create_dir_all(&config_dir).expect("create isolated config directory");
