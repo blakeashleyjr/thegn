@@ -4,8 +4,50 @@
 
 use std::time::Duration;
 
-use crate::model::{LoopMode, PlaybackState};
+use crate::model::{LoopMode, MediaKind, MediaState, PlaybackState};
 use crate::{MediaCaps, MediaError};
+
+/// Fold raw SMTC metadata into the normalized state while it is still in the
+/// pure, Linux-testable decoder. WinRT's `HSTRING` values are provider input;
+/// clip them before they cross into the rest of the media pipeline.
+pub(crate) fn decode_metadata(
+    player: &str,
+    title: &str,
+    artist: &str,
+    album: &str,
+    state: PlaybackState,
+    position: Option<Duration>,
+    length: Option<Duration>,
+    shuffle: Option<bool>,
+    loop_mode: Option<LoopMode>,
+    caps: SessionCaps,
+    playback_type: Option<i32>,
+) -> MediaState {
+    let player = crate::helper::clip_field(player);
+    let kind = match playback_type {
+        Some(3) => MediaKind::Video,
+        Some(1) => MediaKind::Audio,
+        _ => MediaKind::from_hints(&player, None, None),
+    };
+    MediaState {
+        player: player.clone(),
+        title: crate::helper::clip_field(title),
+        artist: crate::helper::clip_field(artist),
+        album: crate::helper::clip_field(album),
+        state,
+        position,
+        length,
+        shuffle,
+        loop_mode,
+        volume: None,
+        can_go_next: caps.can_go_next,
+        can_go_previous: caps.can_go_previous,
+        art_url: None,
+        kind,
+        can_seek: caps.can_seek,
+        track_id: None,
+    }
+}
 
 /// Raw, best-effort reads from one SMTC session's playback controls.
 /// `None` means the individual WinRT property read failed.
@@ -530,5 +572,37 @@ mod tests {
             MediaError::Unavailable(message) if message.contains("x")
         ));
         assert!(!matches!(manager_unavailable("x"), MediaError::NoPlayer));
+    }
+
+    #[test]
+    fn metadata_decode_clips_adversarial_fields_at_utf8_boundaries() {
+        use crate::model::MAX_FIELD_BYTES;
+
+        let hostile = format!(
+            "\u{202e}\u{200b}start\rline\nnext\u{1b}{}",
+            "artist".repeat(2_000)
+        );
+        let state = decode_metadata(
+            "player",
+            &hostile,
+            &hostile,
+            &hostile,
+            PlaybackState::Playing,
+            None,
+            None,
+            None,
+            None,
+            SessionCaps::default(),
+            None,
+        );
+
+        for field in [&state.title, &state.artist, &state.album] {
+            assert!(field.len() <= MAX_FIELD_BYTES);
+            assert!(field.is_char_boundary(field.len()));
+        }
+        assert!(state.title.starts_with('\u{202e}'));
+        assert!(state.title.contains('\r'));
+        assert!(state.title.contains('\n'));
+        assert!(state.title.contains('\u{1b}'));
     }
 }

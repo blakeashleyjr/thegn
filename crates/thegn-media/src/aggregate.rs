@@ -590,6 +590,19 @@ mod tests {
             Ok(vec!["a".into(), "b".into(), "c".into()])
         );
 
+        let duplicate_flood = vec!["same".to_owned(); 100_000];
+        let aggregate = Aggregate::new(
+            vec![
+                players_backend(Ok(duplicate_flood), Ok(None)),
+                players_backend(Ok(vec!["same".into(), "other".into()]), Ok(None)),
+            ],
+            Vec::new(),
+        );
+        assert_eq!(
+            aggregate.players().await,
+            Ok(vec!["same".into(), "other".into()])
+        );
+
         let first_players = (0..crate::model::MAX_PLAYERS + 5)
             .map(|index| format!("player-{index}"))
             .collect::<Vec<_>>();
