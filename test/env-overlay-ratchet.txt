@@ -22,6 +22,8 @@
 # behavior depend on unreviewed launcher state.
 # diagnostics.crash_sink — reserved provider-seam kind (Sentry-protocol crash
 # forwarding); not implemented, rejected at config-validate, so no runtime knob.
+# lifecycle.snapshot.conditional_create — nested S3 compatibility policy is a
+# reviewed config setting, not an ambient launcher override.
 # git_commands.{argv,template_policy,timeout_secs} — trusted per-entry command
 # configuration, like command/context below. An ambient THEGN_* knob cannot
 # address one list entry or widen its shell-template admission policy.
@@ -211,8 +213,6 @@ lifecycle.keep_active_warm
 lifecycle.keep_busy_warm
 lifecycle.max_warm
 lifecycle.serve_cached_glyphs
-# lifecycle.snapshot.conditional_create — nested S3 compatibility policy is a
-# reviewed config setting, not an ambient launcher override.
 lifecycle.snapshot.conditional_create
 limits.discover_timeout_secs
 limits.isolated_target_dir

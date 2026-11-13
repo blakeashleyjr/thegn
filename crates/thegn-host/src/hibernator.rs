@@ -269,6 +269,21 @@ enum Cycle {
     FinishDestroy(HibernationRow),
 }
 
+fn note_cycle_failure(worktree: &str, error: &anyhow::Error) -> String {
+    let collision = error.downcast_ref::<SnapshotAlreadyExists>().is_some();
+    let warning = if collision {
+        format!(
+            "hibernate {worktree}: {error}; the sandbox is kept (snapshot object already exists; if this store rejects conditional writes set [lifecycle.snapshot] conditional_create = false)"
+        )
+    } else {
+        format!("hibernate {worktree}: {error}; the sandbox is kept (will retry later)")
+    };
+    if let Ok(mut f) = failures().lock() {
+        f.insert(worktree.to_string(), Instant::now());
+    }
+    warning
+}
+
 fn spawn_cycle(cfg: Config, cycle: Cycle) {
     if IN_FLIGHT.swap(true, Ordering::SeqCst) {
         return;
@@ -279,19 +294,7 @@ fn spawn_cycle(cfg: Config, cycle: Cycle) {
         match cycle {
             Cycle::Hibernate { worktree, env_name } => {
                 if let Err(e) = hibernate_one(&cfg, &worktree, &env_name) {
-                    let collision = e.downcast_ref::<SnapshotAlreadyExists>().is_some();
-                    if collision {
-                        thegn_core::msg::warn(&format!(
-                            "hibernate {worktree}: {e}; the sandbox is kept (snapshot collision)"
-                        ));
-                    } else {
-                        thegn_core::msg::warn(&format!(
-                            "hibernate {worktree}: {e}; the sandbox is kept (will retry later)"
-                        ));
-                        if let Ok(mut f) = failures().lock() {
-                            f.insert(worktree.clone(), Instant::now());
-                        }
-                    }
+                    thegn_core::msg::warn(&note_cycle_failure(&worktree, &e));
                     // The intent row must not outlive a failed capture: the VM
                     // is alive and the snapshot is not trustworthy.
                     if let Ok(db) = thegn_core::db::Db::open()
@@ -1002,6 +1005,26 @@ mod tests {
                 .bytes()
                 .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
         );
+    }
+
+    #[test]
+    fn cycle_failures_warn_and_back_off_for_collisions_and_other_errors() {
+        let collision_worktree = format!("/wt/hibernator-collision-{}", std::process::id());
+        let collision = anyhow::Error::new(SnapshotAlreadyExists {
+            object: "repo/gen/manifest.json".into(),
+        });
+        let warning = note_cycle_failure(&collision_worktree, &collision);
+        assert!(warning.contains("snapshot object already exists"));
+        assert!(warning.contains("conditional_create = false"));
+        assert!(failures().lock().unwrap().contains_key(&collision_worktree));
+        failures().lock().unwrap().remove(&collision_worktree);
+
+        let ordinary_worktree = format!("/wt/hibernator-ordinary-{}", std::process::id());
+        let ordinary = anyhow::anyhow!("network failure");
+        let warning = note_cycle_failure(&ordinary_worktree, &ordinary);
+        assert!(warning.contains("will retry later"));
+        assert!(failures().lock().unwrap().contains_key(&ordinary_worktree));
+        failures().lock().unwrap().remove(&ordinary_worktree);
     }
 
     #[test]

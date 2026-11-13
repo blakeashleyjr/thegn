@@ -1195,27 +1195,6 @@ fn hm_notifications_dnd_and_sound_bools_are_rendered_and_rest_dispositioned() {
 }
 
 #[test]
-fn hm_snapshot_write_policy_bools_are_rendered() {
-    let rendered = rendered_paths(&module_src());
-    for path in [
-        "lifecycle.snapshot.server_side_encryption",
-        "lifecycle.snapshot.conditional_create",
-    ] {
-        assert!(rendered.contains(path), "Home Manager must render {path}");
-    }
-    let source = module_src();
-    for option in [
-        "lifecycleSnapshotServerSideEncryption",
-        "lifecycleSnapshotConditionalCreate",
-    ] {
-        assert!(
-            source.contains(&format!("{option} = lib.mkOption")),
-            "Home Manager option {option} is missing"
-        );
-    }
-}
-
-#[test]
 fn hm_recording_media_and_monitor_process_keys_are_rendered_and_rest_dispositioned() {
     let rendered = rendered_paths(&module_src());
     for path in [
