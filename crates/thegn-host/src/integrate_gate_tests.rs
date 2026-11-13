@@ -59,7 +59,8 @@ fn replacement_refs_never_change_gate_materialization_or_inherited_git_view() {
     }
     let workspace = f.prepare(&f.first);
     for command in ["printf setup", "printf gate"] {
-        assert_explicit_no_replace(&workspace.command_for(command).unwrap());
+        let (command, _) = workspace.command_for(command).unwrap();
+        assert_explicit_no_replace(&command);
     }
 }
 
@@ -1602,6 +1603,55 @@ fn gate_exit_classes_distinguish_spawn_timeout_and_red_verdicts() {
     assert!(matches!(
         gate_tip(&f.repo, &f.first, &red).unwrap(),
         GateVerdict::Failed { .. }
+    ));
+}
+
+#[test]
+fn direct_exec_exit_127_is_failed_but_shell_exit_127_is_spawn_error() {
+    if !posix_shell_gate_only() {
+        return;
+    }
+    let f = Fixture::new();
+    if !f.supported_or_refused() {
+        return;
+    }
+
+    let direct = f.root.path().join("direct-exit-127");
+    std::fs::write(&direct, "#!/bin/sh\nexit 127\n").unwrap();
+    thegn_core::fsperm::set_mode_for_test(&direct, 0o755).unwrap();
+
+    let mut direct_config = f.config.clone();
+    direct_config.gate_command = direct.to_string_lossy().into_owned();
+    assert!(matches!(
+        gate_tip(&f.repo, &f.first, &direct_config).unwrap(),
+        GateVerdict::Failed { .. }
+    ));
+
+    let mut shell_config = f.config.clone();
+    shell_config.gate_command = "printf shell-marker; exit 127".into();
+    assert!(matches!(
+        gate_tip(&f.repo, &f.first, &shell_config).unwrap(),
+        GateVerdict::Error {
+            phase: crate::integrate::GatePhase::Gate,
+            class: crate::integrate::GateErrorClass::Spawn,
+            ..
+        }
+    ));
+
+    let mut missing_config = f.config.clone();
+    missing_config.gate_command = f
+        .root
+        .path()
+        .join("missing-direct-gate")
+        .to_string_lossy()
+        .into_owned();
+    assert!(matches!(
+        gate_tip(&f.repo, &f.first, &missing_config).unwrap(),
+        GateVerdict::Error {
+            phase: crate::integrate::GatePhase::Gate,
+            class: crate::integrate::GateErrorClass::Spawn,
+            ..
+        }
     ));
 }
 
