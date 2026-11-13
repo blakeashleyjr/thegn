@@ -1268,6 +1268,162 @@ pub fn sealed_home_allowlist(home: &Path) -> Vec<Mount> {
 mod tests {
     use super::*;
 
+    fn control_mount_plan(
+        control_dir: &Path,
+        mounts: &[Mount],
+    ) -> (PathBuf, crate::sandbox_control_guard::MaskPlan) {
+        let host_mounts: Vec<_> = mounts
+            .iter()
+            .map(|mount| (PathBuf::from(&mount.host), PathBuf::from(&mount.dest)))
+            .collect();
+        let mount_refs: Vec<_> = host_mounts
+            .iter()
+            .map(|(host, dest)| (host.as_path(), dest.as_path()))
+            .collect();
+        let controls = vec![control_dir.to_path_buf()];
+        let (mapped, unresolved) =
+            crate::sandbox_control_guard::in_sandbox_paths(&controls, &mount_refs);
+        assert_eq!(unresolved, None);
+        assert_eq!(
+            mapped.len(),
+            1,
+            "control directory must be visible in the plan"
+        );
+        let mapped_control = mapped[0].clone();
+        let visible_roots: Vec<_> = host_mounts.iter().map(|(_, dest)| dest.as_path()).collect();
+        let plan = crate::sandbox_control_guard::mount_inside_control_dir(&controls, &mount_refs)
+            .map_or_else(
+                || {
+                    crate::sandbox_control_guard::plan(
+                        &mapped,
+                        &visible_roots,
+                        &visible_roots,
+                        &|path| {
+                            mount_refs.iter().any(|(host, dest)| {
+                                path.strip_prefix(dest).is_ok_and(|relative| {
+                                    std::fs::metadata(host.join(relative))
+                                        .is_ok_and(|metadata| metadata.is_dir())
+                                })
+                            })
+                        },
+                    )
+                },
+                |exposure| crate::sandbox_control_guard::MaskPlan::Refuse(exposure),
+            );
+        (mapped_control, plan)
+    }
+
+    fn assert_no_writable_control_bind(control_dir: &Path, mounts: &[Mount]) {
+        for mount in mounts.iter().filter(|mount| !mount.ro) {
+            let dest = Path::new(&mount.dest);
+            assert_ne!(
+                dest, control_dir,
+                "control directory must never be bound writable: {}",
+                mount.dest
+            );
+            assert!(
+                !dest.starts_with(control_dir),
+                "a child of the control directory must never be bound writable: {}",
+                mount.dest
+            );
+        }
+    }
+
+    #[test]
+    fn symlinked_socket_dir_is_masked_without_a_writable_control_bind() {
+        let state = crate::testenv::IsolatedState::new();
+        let runtime = crate::testenv::symlinked_tempdir();
+        let control_dir = runtime.path().join("thegn");
+        std::fs::create_dir_all(&control_dir).unwrap();
+        let unrelated = state.root().join("cache");
+        std::fs::create_dir(&unrelated).unwrap();
+        let mounts = vec![
+            Mount {
+                host: runtime.path().display().to_string(),
+                dest: "/runtime".into(),
+                ro: true,
+                cache: false,
+            },
+            Mount {
+                host: unrelated.display().to_string(),
+                dest: "/cache".into(),
+                ro: false,
+                cache: true,
+            },
+        ];
+
+        let (mapped_control, plan) = control_mount_plan(&control_dir, &mounts);
+        assert_eq!(
+            plan,
+            crate::sandbox_control_guard::MaskPlan::Mask(vec![mapped_control.clone()])
+        );
+        assert_no_writable_control_bind(&mapped_control, &mounts);
+    }
+
+    #[test]
+    fn custom_control_path_is_masked_without_a_writable_control_bind() {
+        let state = crate::testenv::IsolatedState::new();
+        let control_dir = state.root().join("custom-control");
+        std::fs::create_dir(&control_dir).unwrap();
+        let unrelated = state.root().join("scratch");
+        std::fs::create_dir(&unrelated).unwrap();
+        let mounts = vec![
+            Mount {
+                host: state.root().display().to_string(),
+                dest: "/home".into(),
+                ro: true,
+                cache: false,
+            },
+            Mount {
+                host: unrelated.display().to_string(),
+                dest: "/scratch".into(),
+                ro: false,
+                cache: false,
+            },
+        ];
+
+        let (mapped_control, plan) = control_mount_plan(&control_dir, &mounts);
+        assert_eq!(
+            plan,
+            crate::sandbox_control_guard::MaskPlan::Mask(vec![mapped_control.clone()])
+        );
+        assert_no_writable_control_bind(&mapped_control, &mounts);
+    }
+
+    #[test]
+    fn preexisting_symlink_at_socket_location_is_refused_without_a_writable_control_bind() {
+        let state = crate::testenv::IsolatedState::new();
+        let socket_location = crate::testenv::symlinked_tempdir();
+        let unrelated = state.root().join("scratch");
+        std::fs::create_dir(&unrelated).unwrap();
+        let mounts = vec![
+            Mount {
+                host: socket_location.real_path().display().to_string(),
+                dest: "/runtime".into(),
+                ro: true,
+                cache: false,
+            },
+            Mount {
+                host: unrelated.display().to_string(),
+                dest: "/scratch".into(),
+                ro: false,
+                cache: false,
+            },
+        ];
+
+        // The guard tracks the socket's parent directory. A pre-existing
+        // symlink at that location is the exact bind destination, so masking
+        // it would hide the entire mount and must refuse the plan.
+        let (mapped_control, plan) = control_mount_plan(socket_location.path(), &mounts);
+        assert!(matches!(
+            plan,
+            crate::sandbox_control_guard::MaskPlan::Refuse(refusal)
+                if refusal.control_dir == socket_location.path()
+                    && refusal.visible_through == Path::new("/runtime")
+        ));
+        assert_no_writable_control_bind(&mapped_control, &mounts);
+    }
+
     #[cfg(unix)]
     fn private_tempdir() -> tempfile::TempDir {
         use std::os::unix::fs::PermissionsExt;
