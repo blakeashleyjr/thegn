@@ -235,8 +235,11 @@ impl Fixture {
             .expect("private daemon runtime directory");
         let captures = tempfile::tempdir_in(state.root()).expect("private capture directory");
         let outside = tempfile::tempdir().expect("private outside directory");
+        assert!(
+            !outside.path().starts_with(state.root()),
+            "outside fixture must remain a sibling of the isolated state root"
+        );
         let repo = state.root().join("repo");
-        let worktree = state.root().join("worker");
         fs::create_dir(&repo).expect("create disposable repository");
 
         let init = Self::git(&state, &repo, ["init", "--quiet"]);
@@ -272,14 +275,6 @@ impl Fixture {
         );
         assert_git_success(&initial, "git commit base file");
         let base_head = Self::git_output(&state, &repo, ["rev-parse", "HEAD"]);
-        let worktree_path = worktree.to_string_lossy().into_owned();
-        let added = Self::git(
-            &state,
-            &repo,
-            ["worktree", "add", "--quiet", "-b", "worker", &worktree_path],
-        );
-        assert_git_success(&added, "git worktree add");
-
         let outside_write = if deny_outside_write {
             " && : > \"$OUTSIDE/denied\""
         } else {
@@ -290,12 +285,56 @@ impl Fixture {
         );
         let command = format!("sh -c {}", thegn_core::util::sh_quote(&script));
         let outside_path = outside.path().to_string_lossy();
+        let worktrees_dir = state.root().join("worktrees");
         let config = format!(
-            "[sandbox]\nenabled = true\nbackend = \"bwrap\"\nbackend_chain = [\"bwrap\"]\nprofile = \"standard\"\nnetwork = \"none\"\nenv_passthrough = []\n\n[[agents]]\nname = \"stub\"\ncommand = {command:?}\n\n[[pipeline.stages]]\nname = \"commit\"\nagent = \"stub\"\nprompt = \"commit the fixture\"\nconcurrency = 1\ntimeout_secs = 60\nenv = {{ OUTSIDE = {outside_path:?}, GIT_CONFIG_GLOBAL = \"/dev/null\", GIT_CONFIG_NOSYSTEM = \"1\", GIT_TERMINAL_PROMPT = \"0\" }}\n",
+            "worktrees_dir = {worktrees_dir:?}\n\n[sandbox]\nenabled = true\nbackend = \"bwrap\"\nbackend_chain = [\"bwrap\"]\nprofile = \"standard\"\nnetwork = \"none\"\nenv_passthrough = []\n\n[env.pipeline]\nplacement = \"local\"\n\n[[agents]]\nname = \"stub\"\ncommand = {command:?}\n\n[[pipeline.stages]]\nname = \"commit\"\nagent = \"stub\"\nprompt = \"commit the fixture\"\nconcurrency = 1\ntimeout_secs = 60\nenv = {{ OUTSIDE = {outside_path:?}, GIT_CONFIG_GLOBAL = \"/dev/null\", GIT_CONFIG_NOSYSTEM = \"1\", GIT_TERMINAL_PROMPT = \"0\" }}\n",
         );
         let config_dir = state.config_home().join("thegn");
         fs::create_dir_all(&config_dir).expect("create isolated config directory");
         fs::write(config_dir.join("config.toml"), config).expect("write isolated config");
+
+        let repo_arg = repo.to_str().expect("repository path is UTF-8");
+        let mut create = Command::new(env!("CARGO_BIN_EXE_thegn"));
+        create
+            .args([
+                "wt",
+                "new",
+                "--repo",
+                repo_arg,
+                "--base",
+                "HEAD",
+                "--env",
+                "pipeline",
+                "--exact-branch",
+                "worker",
+                "--json",
+            ])
+            .envs(state_env_all(state.root()))
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env("GIT_TERMINAL_PROMPT", "0")
+            .env_remove("THEGN_LOG")
+            .env_remove("THEGN_DATABASE_MIGRATION_EXECUTABLE")
+            .env_remove("THEGN_DATABASE_MIGRATION_AUTHORITY");
+        let created = run_bounded(
+            &mut create,
+            captures.path(),
+            "create-worktree",
+            PROCESS_TIMEOUT,
+        );
+        assert_git_success(&created, "thegn wt new");
+        let created_json: serde_json::Value =
+            serde_json::from_slice(&created.stdout).expect("thegn wt new JSON is valid");
+        let worktree = PathBuf::from(
+            created_json["path"]
+                .as_str()
+                .expect("thegn wt new JSON has a worktree path"),
+        );
+        assert!(
+            worktree.starts_with(state.root()),
+            "thegn wt new escaped the isolated state root: {}",
+            worktree.display()
+        );
 
         let mut daemon_command = Command::new(env!("CARGO_BIN_EXE_thegn"));
         daemon_command
