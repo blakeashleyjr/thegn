@@ -547,25 +547,37 @@ pub trait PlumbingOps: GitBackend {
         if !self.is_dirty(loc)? {
             return Ok(None);
         }
+        let _txn = if !loc.is_remote() && crate::bridge::for_loc(loc).is_none() {
+            super::begin_mutation_txn(
+                loc,
+                &["write-tree", "add", "-A", "commit"],
+                super::MUTATION_LOCK_WAIT,
+            )?
+        } else {
+            None
+        };
         let index_tree = run_w(loc, &[], &fenced(loc, &["write-tree"])).context(
             "could not capture the index tree before snapshot; refusing to stage changes",
         )?;
         let index_tree = index_tree.trim();
-        run_w(loc, &[], &fenced(loc, &["add", "-A"]))?;
-        // `-c commit.gpgSign=false …` must precede the subcommand — prepend it.
-        let mut args: Vec<&str> = gpg_args(override_gpg).to_vec();
-        args.extend(fenced(loc, &["commit", "--no-verify", "-F", "-"]));
-        if let Err(commit_error) =
-            run_background_commit_stdin(loc, &[("GIT_EDITOR", ":")], &args, msg.as_bytes())
-        {
-            return match run_w(loc, &[], &fenced(loc, &["read-tree", index_tree])) {
-                Ok(_) => Err(commit_error),
-                Err(restore_error) => Err(commit_error.context(format!(
-                    "restoring pre-snapshot index tree {index_tree} also failed ({restore_error:#}); the index now has every change staged"
+        let snapshot = (|| {
+            run_w(loc, &[], &fenced(loc, &["add", "-A"]))?;
+            // `-c commit.gpgSign=false …` must precede the subcommand — prepend it.
+            let mut args: Vec<&str> = gpg_args(override_gpg).to_vec();
+            args.extend(fenced(loc, &["commit", "--no-verify", "-F", "-"]));
+            run_background_commit_stdin(loc, &[("GIT_EDITOR", ":")], &args, msg.as_bytes())?;
+            Ok(Some(self.rev_parse(loc, "HEAD")?))
+        })();
+        match snapshot {
+            Ok(tip) => Ok(tip),
+            Err(snapshot_error) => match run_w(loc, &[], &fenced(loc, &["read-tree", index_tree]))
+            {
+                Ok(_) => Err(snapshot_error),
+                Err(restore_error) => Err(snapshot_error.context(format!(
+                    "restoring pre-snapshot index tree {index_tree} also failed ({restore_error:#}); the index may still have snapshot changes staged"
                 ))),
-            };
+            },
         }
-        Ok(Some(self.rev_parse(loc, "HEAD")?))
     }
 }
 
@@ -1314,6 +1326,32 @@ mod tests {
 
         assert_eq!(repo.head(), head_before);
         assert_eq!(repo.out(&["status", "--porcelain"]), "M  f.txt\n M g.txt");
+    }
+
+    #[test]
+    fn snapshot_add_failure_preserves_index_and_names_restore_failure() {
+        let repo = TestRepo::new("plumb-snap-add-lock");
+        ident(&repo.dir);
+        repo.commit_file("f.txt", "before\n", "base");
+        std::fs::write(repo.dir.join("f.txt"), "staged\n").unwrap();
+        git_in(&repo.dir, &["add", "f.txt"]);
+        let before = repo.out(&["ls-files", "-s"]);
+        let lock = repo.dir.join(".git/index.lock");
+        std::fs::write(&lock, b"held").unwrap();
+
+        let error = CliGit
+            .snapshot_worktree(&repo.loc(), "snap add failure", false)
+            .unwrap_err();
+        let detail = format!("{error:#}");
+        assert!(detail.contains("git add -A"), "{detail}");
+        assert!(
+            detail.contains("restoring pre-snapshot index tree"),
+            "{detail}"
+        );
+        assert!(detail.contains("git read-tree"), "{detail}");
+        assert_eq!(repo.out(&["ls-files", "-s"]), before);
+
+        std::fs::remove_file(lock).unwrap();
     }
 
     #[test]
