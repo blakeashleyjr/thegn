@@ -767,7 +767,7 @@ fn normalize_name(name: &str) -> String {
     name.nfc().collect()
 }
 
-fn identity_slug(name: &str) -> String {
+pub(crate) fn identity_slug(name: &str) -> String {
     let normalized = normalize_name(name);
     thegn_core::util::slugify(&normalized)
 }
@@ -1324,6 +1324,24 @@ mod tests {
     #[test]
     fn scan_rejects_normalized_name_collisions() {
         let dir = temp_dir("normalized-scan");
+        for (filename, name) in [("one.toml", "Night-Sky"), ("two.toml", "night_sky")] {
+            let candidate = theme(name);
+            let path = dir.join(filename);
+            std::fs::write(path, candidate.to_toml().unwrap()).unwrap();
+        }
+        let (themes, warnings) = scan_dir(&dir, None);
+        assert!(themes.is_empty(), "normalized duplicates must not resolve");
+        assert!(
+            warnings
+                .iter()
+                .any(|warning| warning.contains("ambiguous normalized user theme identity"))
+        );
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn scan_rejects_nfc_nfd_name_collisions() {
+        let dir = temp_dir("normalized-scan-nfc");
         for (filename, name) in [("caf.toml", "Café"), ("legacy-cafe.toml", "Cafe\u{301}")] {
             let candidate = theme(name);
             let path = dir.join(filename);
