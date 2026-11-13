@@ -7,6 +7,8 @@ All notable changes to **thegn** are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.1.0-alpha.70] — 2026-11-12
+
 ### Added
 
 - `thegn session open --permissions` grants per-launch permissions to a Claude session; they can only narrow the agent entry's grants unless
@@ -3292,7 +3294,8 @@ launcher picker and the merge queue's `agent_command` hook remain — they run
 whatever commands you configure. Leftover `[llm_proxy]` config sections and
 `proxy_*` tables in existing state databases are ignored harmlessly.
 
-[Unreleased]: https://github.com/blakeashleyjr/thegn/compare/v0.1.0-alpha.69...HEAD
+[Unreleased]: https://github.com/blakeashleyjr/thegn/compare/v0.1.0-alpha.70...HEAD
+[0.1.0-alpha.70]: https://github.com/blakeashleyjr/thegn/compare/v0.1.0-alpha.69...v0.1.0-alpha.70
 [0.1.0-alpha.69]: https://github.com/blakeashleyjr/thegn/compare/v0.1.0-alpha.68...v0.1.0-alpha.69
 [0.1.0-alpha.68]: https://github.com/blakeashleyjr/thegn/compare/v0.1.0-alpha.67...v0.1.0-alpha.68
 [0.1.0-alpha.67]: https://github.com/blakeashleyjr/thegn/compare/v0.1.0-alpha.66...v0.1.0-alpha.67
