@@ -1137,6 +1137,91 @@ impl Control for GrpcControl {
         Ok(Response::new(info_to_proto(&session)))
     }
 
+    async fn sessions_record(
+        &self,
+        req: Request<proto::SessionsRecordRequest>,
+    ) -> Result<Response<proto::SessionsRecordReply>, Status> {
+        self.authed(&req, Verb::RecordSession)?;
+        let request = req.into_inner();
+        let session = bounded_string(request.session, "session")?;
+        let spec = match bounded_string(request.op, "op")?.as_str() {
+            "start" => super::RecordSpec::Start,
+            "stop" => super::RecordSpec::Stop,
+            "status" => super::RecordSpec::Status,
+            _ => {
+                return Err(Status::invalid_argument(
+                    "op must be start, stop, or status",
+                ));
+            }
+        };
+        let status = self
+            .api
+            .record_session(&session, spec)
+            .await
+            .map_err(Status::from)?;
+        Ok(Response::new(proto::SessionsRecordReply {
+            recording: status.recording,
+            path: status.path,
+            bytes: status.bytes,
+            capped: status.capped,
+            truncated: status.truncated,
+            dropped_bytes: status.dropped_bytes,
+            stopping: status.stopping,
+        }))
+    }
+
+    async fn agent_sessions(
+        &self,
+        req: Request<proto::AgentSessionsRequest>,
+    ) -> Result<Response<proto::AgentSessionsReply>, Status> {
+        self.authed(&req, Verb::AgentSessions)?;
+        let request = req.into_inner();
+        let worktree = bounded_string(request.worktree, "worktree")?;
+        let harness = bounded_string(request.harness, "harness")?;
+        let sessions = self
+            .api
+            .agent_sessions(nonempty(&worktree), nonempty(&harness))
+            .await
+            .map_err(Status::from)?;
+        Ok(Response::new(proto::AgentSessionsReply {
+            sessions: sessions
+                .into_iter()
+                .map(|session| proto::AgentSession {
+                    harness: session.harness,
+                    id: session.id,
+                    worktree: session.worktree,
+                    mtime: session.mtime,
+                    summary: session.summary,
+                    unlinked: session.unlinked,
+                })
+                .collect(),
+        }))
+    }
+
+    async fn worktrees_create(
+        &self,
+        req: Request<proto::WorktreesCreateRequest>,
+    ) -> Result<Response<proto::WorktreeInfo>, Status> {
+        self.authed(&req, Verb::WorktreeCreate)?;
+        let request = req.into_inner();
+        let created = self
+            .api
+            .worktree_create(super::WorktreeCreateReq {
+                repo: bounded_optional(request.repo, "repo")?,
+                issue: bounded_optional(request.issue, "issue")?,
+                branch: bounded_optional(request.branch, "branch")?,
+            })
+            .await
+            .map_err(Status::from)?;
+        Ok(Response::new(proto::WorktreeInfo {
+            path: created.path,
+            branch: created.branch,
+            repo_root: created.repo_root,
+            location: created.location,
+            created_at: created.created_at,
+        }))
+    }
+
     async fn me(&self, req: Request<proto::MeRequest>) -> Result<Response<proto::MeReply>, Status> {
         let ctx = self.authed(&req, Verb::Me)?;
         Ok(Response::new(proto::MeReply {
@@ -1207,7 +1292,25 @@ pub const GRPC_CAPS: &[&str] = &[
     "automations.list",
     "automations.test",
     "tools.run",
+    "sessions.record",
+    "agent.sessions",
+    "worktrees.create",
 ];
+
+const MAX_CONTROL_FIELD_BYTES: usize = 64 * 1024;
+
+fn bounded_string(value: String, field: &str) -> Result<String, Status> {
+    if value.len() > MAX_CONTROL_FIELD_BYTES {
+        return Err(Status::resource_exhausted(format!(
+            "{field} exceeds {MAX_CONTROL_FIELD_BYTES} bytes"
+        )));
+    }
+    Ok(value)
+}
+
+fn bounded_optional(value: Option<String>, field: &str) -> Result<Option<String>, Status> {
+    value.map(|value| bounded_string(value, field)).transpose()
+}
 
 fn nonempty(value: &str) -> Option<&str> {
     (!value.is_empty()).then_some(value)

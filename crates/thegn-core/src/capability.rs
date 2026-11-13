@@ -306,10 +306,9 @@ pub const CATALOG: &[HostCapability] = &[
     cap(
         "launch.preset",
         Verb::LaunchPreset,
-        // CLI-first: there is no generic HTTP route for the intents-mailbox
-        // launch yet, so plugin `host.call` must not advertise it as
-        // dispatchable. `tools.run` is the current exec-scoped plugin path.
-        SurfaceSet::of(&[Surface::Http, Surface::Grpc, Surface::Cli, Surface::Mcp]),
+        // The intents-mailbox launch is resolved by the local compositor from
+        // its own preset/config custody; it is deliberately CLI-only.
+        SurfaceSet::of(&[Surface::Cli]),
         "Launch a configured preset into a workspace (name only; argv/env resolve locally)",
     ),
     cap(
@@ -881,20 +880,10 @@ pub const CATALOG: &[HostCapability] = &[
 /// dispatches every non-streaming row generically); **MCP** owes its remaining state
 /// tools; **gRPC** owes the mirror for the rows HTTP already serves; and
 /// **HTTP** owes control routes for the CLI-first operator families
-/// (`secret.*`, `project.*`, `containers.*`, `launch.preset`)
+/// (`secret.*`, `project.*`, `containers.*`)
 /// — those run against local custody today, so the CLI implements them directly.
 pub const SURFACE_GAPS: &[(&str, Surface, &str)] = &[
     // -- gRPC: the mirror lags HTTP; each is a proto + handler addition -------
-    (
-        "launch.preset",
-        Surface::Grpc,
-        "not yet mirrored in control.proto",
-    ),
-    (
-        "launch.preset",
-        Surface::Http,
-        "CLI-first (`open --preset` via the intents mailbox); an HTTP route is a follow-up",
-    ),
     // -- secrets: CLI-implemented locally; control-API routes deferred ---------
     // The `secret.*` verbs run against local custody (keyring / config file), so
     // the CLI implements them directly; an HTTP/gRPC route for a remote operator
@@ -1111,11 +1100,6 @@ pub const SURFACE_GAPS: &[(&str, Surface, &str)] = &[
         "MCP state tools land in the client-API phase",
     ),
     (
-        "launch.preset",
-        Surface::Mcp,
-        "MCP exec-scoped tools land in the MCP write-tools phase",
-    ),
-    (
         "git.stage",
         Surface::Mcp,
         "MCP state tools land in the client-API phase",
@@ -1151,11 +1135,6 @@ pub const SURFACE_GAPS: &[(&str, Surface, &str)] = &[
     // gRPC mirroring and MCP state tools follow the same phased path as every
     // other state cap above — recorded, not built, here. Plugin dispatch is
     // generic and needs no excuse.
-    (
-        "worktrees.create",
-        Surface::Grpc,
-        "not yet mirrored in control.proto",
-    ),
     (
         "issues.update",
         Surface::Mcp,
@@ -1226,16 +1205,6 @@ pub const SURFACE_GAPS: &[(&str, Surface, &str)] = &[
         "prune is `thegn sandbox gc/prune` (CLI) this change; a control route lands in the client-API phase",
     ),
     // -- gRPC verbs landed after the proto was last regenerated ---------------
-    (
-        "sessions.record",
-        Surface::Grpc,
-        "not yet mirrored in control.proto",
-    ),
-    (
-        "agent.sessions",
-        Surface::Grpc,
-        "not yet mirrored in control.proto",
-    ),
     // -- model proxy (THE-58): CLI-implemented; control-API routes deferred ----
     // `thegn proxy status|stats|start|stop` run against the local daemon; an
     // HTTP/gRPC route for a remote operator is future work. NEVER MCP/plugins.
@@ -1324,11 +1293,6 @@ impl GapDisposition {
 /// (`gap_dispositions_cover_every_gap_exactly`).
 pub const GAP_DISPOSITIONS: &[(&str, Surface, GapDisposition)] = &[
     // -- http: dispositions follow the corresponding SURFACE_GAPS rows --
-    (
-        "launch.preset",
-        Surface::Http,
-        GapDisposition::Deferred { review: "THE-201" },
-    ),
     ("secret.set", Surface::Http, GapDisposition::Unsafe),
     ("secret.rm", Surface::Http, GapDisposition::Unsafe),
     ("secret.list", Surface::Http, GapDisposition::Unsafe),
@@ -1431,11 +1395,6 @@ pub const GAP_DISPOSITIONS: &[(&str, Surface, GapDisposition)] = &[
         GapDisposition::Deferred { review: "THE-201" },
     ),
     // -- grpc: dispositions follow the corresponding SURFACE_GAPS rows --
-    (
-        "launch.preset",
-        Surface::Grpc,
-        GapDisposition::Deferred { review: "THE-204" },
-    ),
     ("secret.set", Surface::Grpc, GapDisposition::Unsafe),
     ("secret.rm", Surface::Grpc, GapDisposition::Unsafe),
     ("secret.list", Surface::Grpc, GapDisposition::Unsafe),
@@ -1503,11 +1462,6 @@ pub const GAP_DISPOSITIONS: &[(&str, Surface, GapDisposition)] = &[
         GapDisposition::Deferred { review: "THE-204" },
     ),
     (
-        "worktrees.create",
-        Surface::Grpc,
-        GapDisposition::Deferred { review: "THE-204" },
-    ),
-    (
         "containers.list",
         Surface::Grpc,
         GapDisposition::Deferred { review: "THE-204" },
@@ -1519,16 +1473,6 @@ pub const GAP_DISPOSITIONS: &[(&str, Surface, GapDisposition)] = &[
     ),
     (
         "containers.prune",
-        Surface::Grpc,
-        GapDisposition::Deferred { review: "THE-204" },
-    ),
-    (
-        "sessions.record",
-        Surface::Grpc,
-        GapDisposition::Deferred { review: "THE-204" },
-    ),
-    (
-        "agent.sessions",
         Surface::Grpc,
         GapDisposition::Deferred { review: "THE-204" },
     ),
@@ -1575,11 +1519,6 @@ pub const GAP_DISPOSITIONS: &[(&str, Surface, GapDisposition)] = &[
     ),
     (
         "worktrees.open",
-        Surface::Mcp,
-        GapDisposition::Deferred { review: "THE-203" },
-    ),
-    (
-        "launch.preset",
         Surface::Mcp,
         GapDisposition::Deferred { review: "THE-203" },
     ),
@@ -2066,6 +2005,11 @@ mod tests {
         assert_eq!(doctor.surfaces, SurfaceSet::of(&[Surface::Cli]));
         assert!(!is_gap("doctor.bundle", Surface::Http));
         assert!(!is_gap("doctor.bundle", Surface::Grpc));
+        let preset = lookup("launch.preset").unwrap();
+        assert_eq!(preset.surfaces, SurfaceSet::of(&[Surface::Cli]));
+        for surface in [Surface::Http, Surface::Grpc, Surface::Mcp] {
+            assert!(!is_gap("launch.preset", surface));
+        }
         for id in ["search.query", "search.replace"] {
             assert_eq!(lookup(id).unwrap().surfaces, SurfaceSet::NONE, "{id}");
             for surface in Surface::ALL {
@@ -2092,8 +2036,8 @@ mod tests {
         assert_eq!(l.implemented, 1, "sessions.list is working");
         assert_eq!(l.stub, 0, "no universally inert row is advertised");
         // HTTP is no longer excuse-free: the CLI-first operator families
-        // (`secret.*`, `project.*`, `containers.*`,
-        // `launch.preset`) declare an HTTP surface whose route is still owed.
+        // (`secret.*`, `project.*`, `containers.*`) declare an HTTP surface
+        // whose route is still owed.
         // Derive the count from the table so this pins the ledger's arithmetic,
         // not a number that rots with every burn-down.
         let http_gaps = SURFACE_GAPS
