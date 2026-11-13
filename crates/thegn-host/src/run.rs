@@ -3223,7 +3223,10 @@ fn apply_rebase_doc(
         }
         // An unknown sequencer must not be treated as absence: retain the
         // editor and its last-known todo until a later probe is conclusive.
-        Ok(thegn_svc::git::RebaseState::Unknown(_)) => None,
+        Ok(thegn_svc::git::RebaseState::Unknown(reason)) => {
+            rebase.todos_synced = false;
+            Some(reason)
+        }
         // The pause vanished before the read landed (for example, a fast
         // --continue elsewhere); hydration's banner sync clears the flow.
         Ok(_) => None,

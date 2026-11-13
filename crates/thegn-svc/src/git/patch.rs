@@ -5,7 +5,7 @@
 //! sequence around an `edit` rebase stop. The host records the pre-op HEAD
 //! in `undo_marks` so one `z` undoes the whole composite.
 
-use super::rebase::{RebaseOps, RebaseOpts, RebaseOutcome, RebaseState};
+use super::rebase::{RebaseOps, RebaseOpts, RebaseOutcome};
 use super::{GitBackend, gpg_args, run_stdin, run_w};
 use anyhow::{Context, Result, bail};
 use thegn_core::rebase_todo::TodoAction;
@@ -145,6 +145,7 @@ impl<T: GitBackend + ?Sized> PatchOps for T {}
 #[cfg(test)]
 mod tests {
     use super::super::CliGit;
+    use super::super::rebase::RebaseState;
     use super::super::testutil::{TestRepo, git_in};
     use super::*;
     use thegn_core::patch::{LineKind, Selection, parse_patch, transform};
