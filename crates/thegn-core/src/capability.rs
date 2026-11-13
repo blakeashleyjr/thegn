@@ -890,16 +890,6 @@ pub const SURFACE_GAPS: &[(&str, Surface, &str)] = &[
         "not yet mirrored in control.proto",
     ),
     (
-        "mcp_proxy.status",
-        Surface::Grpc,
-        "not yet mirrored in control.proto",
-    ),
-    (
-        "mcp_proxy.reload",
-        Surface::Grpc,
-        "not yet mirrored in control.proto",
-    ),
-    (
         "launch.preset",
         Surface::Http,
         "CLI-first (`open --preset` via the intents mailbox); an HTTP route is a follow-up",
@@ -1152,11 +1142,6 @@ pub const SURFACE_GAPS: &[(&str, Surface, &str)] = &[
         "MCP exec-scoped tools land in the MCP write-tools phase",
     ),
     (
-        "git.status",
-        Surface::Mcp,
-        "MCP state tools land in the client-API phase",
-    ),
-    (
         "git.stage",
         Surface::Mcp,
         "MCP state tools land in the client-API phase",
@@ -1167,22 +1152,12 @@ pub const SURFACE_GAPS: &[(&str, Surface, &str)] = &[
         "MCP state tools land in the client-API phase",
     ),
     (
-        "merge.list",
-        Surface::Mcp,
-        "MCP state tools land in the client-API phase",
-    ),
-    (
         "merge.add",
         Surface::Mcp,
         "MCP state tools land in the client-API phase",
     ),
     (
         "merge.clear",
-        Surface::Mcp,
-        "MCP state tools land in the client-API phase",
-    ),
-    (
-        "pr.status",
         Surface::Mcp,
         "MCP state tools land in the client-API phase",
     ),
@@ -1212,16 +1187,6 @@ pub const SURFACE_GAPS: &[(&str, Surface, &str)] = &[
     // gRPC mirroring and MCP state tools follow the same phased path as every
     // other state cap above — recorded, not built, here. Plugin dispatch is
     // generic and needs no excuse.
-    (
-        "issues.list",
-        Surface::Grpc,
-        "not yet mirrored in control.proto",
-    ),
-    (
-        "issues.get",
-        Surface::Grpc,
-        "not yet mirrored in control.proto",
-    ),
     (
         "issues.update",
         Surface::Grpc,
@@ -1572,16 +1537,6 @@ pub const GAP_DISPOSITIONS: &[(&str, Surface, GapDisposition)] = &[
         Surface::Grpc,
         GapDisposition::Deferred { review: "THE-204" },
     ),
-    (
-        "mcp_proxy.status",
-        Surface::Grpc,
-        GapDisposition::Deferred { review: "THE-204" },
-    ),
-    (
-        "mcp_proxy.reload",
-        Surface::Grpc,
-        GapDisposition::Deferred { review: "THE-204" },
-    ),
     ("doctor.bundle", Surface::Grpc, GapDisposition::LocalOnly),
     (
         "secret.set",
@@ -1670,16 +1625,6 @@ pub const GAP_DISPOSITIONS: &[(&str, Surface, GapDisposition)] = &[
     ),
     (
         "project.new_feature",
-        Surface::Grpc,
-        GapDisposition::Deferred { review: "THE-204" },
-    ),
-    (
-        "issues.list",
-        Surface::Grpc,
-        GapDisposition::Deferred { review: "THE-204" },
-    ),
-    (
-        "issues.get",
         Surface::Grpc,
         GapDisposition::Deferred { review: "THE-204" },
     ),
@@ -1790,11 +1735,6 @@ pub const GAP_DISPOSITIONS: &[(&str, Surface, GapDisposition)] = &[
         GapDisposition::Deferred { review: "THE-203" },
     ),
     (
-        "git.status",
-        Surface::Mcp,
-        GapDisposition::Deferred { review: "THE-203" },
-    ),
-    (
         "git.stage",
         Surface::Mcp,
         GapDisposition::Deferred { review: "THE-203" },
@@ -1805,22 +1745,12 @@ pub const GAP_DISPOSITIONS: &[(&str, Surface, GapDisposition)] = &[
         GapDisposition::Deferred { review: "THE-203" },
     ),
     (
-        "merge.list",
-        Surface::Mcp,
-        GapDisposition::Deferred { review: "THE-203" },
-    ),
-    (
         "merge.add",
         Surface::Mcp,
         GapDisposition::Deferred { review: "THE-203" },
     ),
     (
         "merge.clear",
-        Surface::Mcp,
-        GapDisposition::Deferred { review: "THE-203" },
-    ),
-    (
-        "pr.status",
         Surface::Mcp,
         GapDisposition::Deferred { review: "THE-203" },
     ),
@@ -2231,9 +2161,10 @@ mod tests {
         assert_eq!(p.len(), 1, "{p:?}");
         assert!(p[0].contains("sessions.list") && p[0].contains("not implemented"));
 
-        // Implementing an excused row ⇒ stale gap (MCP still carries excuses).
+        // Implementing an excused row ⇒ stale gap (issues.list is still
+        // excused on MCP).
         let mut stale: Vec<&str> = required_for(Surface::Mcp).map(|c| c.id.0).collect();
-        stale.push("git.status"); // excused on MCP
+        stale.push("issues.list"); // excused on MCP
         let p = coverage_problems(Surface::Mcp, &stale);
         assert_eq!(p.len(), 1, "{p:?}");
         assert!(p[0].contains("stale"));
@@ -2259,7 +2190,7 @@ mod tests {
         assert!(grpc.contains(&"merge.list"), "gRPC now mirrors merge.list");
         let mcp: Vec<&str> = required_for(Surface::Mcp).map(|c| c.id.0).collect();
         assert!(mcp.contains(&"sessions.list"));
-        assert!(!mcp.contains(&"git.status"), "git.status is excused on MCP");
+        assert!(mcp.contains(&"git.status"), "git.status is mirrored on MCP");
     }
 
     #[test]
@@ -2340,7 +2271,7 @@ mod tests {
         // MCP carries the remaining excuses; its ledger lists them.
         let mcp = ledger(Surface::Mcp, &["sessions.list"]);
         assert!(mcp.excused > 0);
-        assert!(mcp.gaps.iter().any(|(id, _)| *id == "git.status"));
+        assert!(mcp.gaps.iter().any(|(id, _)| *id == "issues.list"));
     }
 
     #[test]
