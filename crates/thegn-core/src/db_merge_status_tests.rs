@@ -25,6 +25,59 @@ fn row(db: &Db) -> MergeQueueRow {
 }
 
 #[test]
+fn agent_blocked_status_rehydrates_with_its_hold_intact() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("queue.sqlite");
+    {
+        let db = Db::open_at(&path).unwrap();
+        db.enqueue_merge(WORKTREE, "feature", "target").unwrap();
+        db.set_merge_agent_attempts(WORKTREE, 2).unwrap();
+        db.update_merge_status(
+            WORKTREE,
+            crate::attention::MqStatus::AgentBlocked.as_str(),
+            None,
+            None,
+            Some("isolation policy unavailable"),
+        )
+        .unwrap();
+    }
+
+    let db = Db::open_at(&path).unwrap();
+    let saved = row(&db);
+    let status = crate::attention::MqStatus::parse(&saved.status).unwrap();
+    assert_eq!(status, crate::attention::MqStatus::AgentBlocked);
+    assert!(status.is_held());
+    assert_eq!(saved.agent_attempts, 2);
+    assert_eq!(
+        saved.error_detail.as_deref(),
+        Some("isolation policy unavailable")
+    );
+}
+
+#[test]
+fn retrying_agent_blocked_does_not_spend_an_attempt() {
+    let db = seeded();
+    db.set_merge_agent_attempts(WORKTREE, 2).unwrap();
+    db.replace_merge_status(
+        WORKTREE,
+        crate::attention::MqStatus::AgentBlocked.as_str(),
+        &MergeStatusFields {
+            error_detail: Some("isolation policy unavailable".into()),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+
+    assert_eq!(
+        db.retry_held_merge_entry(WORKTREE).unwrap(),
+        MergeRetryOutcome::Rearmed
+    );
+    let saved = row(&db);
+    assert_eq!(saved.status, crate::attention::MqStatus::Queued.as_str());
+    assert_eq!(saved.agent_attempts, 0);
+}
+
+#[test]
 fn retry_held_rearms_only_held_statuses() {
     for status in crate::attention::MqStatus::ALL {
         let db = seeded();
