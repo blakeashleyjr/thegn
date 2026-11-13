@@ -185,6 +185,17 @@ pub struct RebaseStatus {
     pub paused: PauseReason,
 }
 
+/// The observed state of the interactive rebase sequencer.
+#[derive(Debug, Clone)]
+pub enum RebaseState {
+    /// No interactive rebase markers are present.
+    NotRunning,
+    /// An interactive rebase is paused and its live state was read.
+    Running(RebaseStatus),
+    /// The sequencer could not be classified safely.
+    Unknown(String),
+}
+
 /// Run `git rebase -i` with a prepared todo, classifying the exit.
 fn rebase_with_todo(
     loc: &GitLoc,
@@ -647,37 +658,69 @@ pub trait RebaseOps: GitBackend {
         run_w(loc, &[], &["rebase", "--abort"]).map(|_| ())
     }
 
-    /// The paused rebase's live state, or `None` when no sequencer state is
-    /// present. Apply-backend rebase and `git am` state is an error.
-    fn rebase_status(&self, loc: &GitLoc) -> Result<Option<RebaseStatus>> {
-        let Some(onto) = read_rebase_marker(loc, "rebase-merge/onto")? else {
+    /// The paused rebase's live state, or `NotRunning` when no sequencer state
+    /// is present. An unreadable sequencer is `Unknown`, never absence.
+    /// Apply-backend rebase and `git am` state is an error.
+    fn rebase_status(&self, loc: &GitLoc) -> Result<RebaseState> {
+        let onto = match read_rebase_marker(loc, "rebase-merge/onto") {
+            Ok(onto) => onto,
+            Err(error) => return Ok(RebaseState::Unknown(format!("{error:#}"))),
+        };
+        let Some(onto) = onto else {
             for marker in APPLY_BACKEND_MARKERS {
-                if read_rebase_marker(loc, marker)?.is_some() {
+                let present = match read_rebase_marker(loc, marker) {
+                    Ok(present) => present,
+                    Err(error) => return Ok(RebaseState::Unknown(format!("{error:#}"))),
+                };
+                if present.is_some() {
                     return Err(anyhow!(
                         "a rebase that is not an interactive thegn rebase, or a git am, is in progress ({marker} exists); finish or abort it with git (git rebase --continue/--abort or git am --continue/--abort) before using the rebase editor"
                     ));
                 }
             }
-            return Ok(None);
+            return Ok(RebaseState::NotRunning);
         };
-        let head_name = read_rebase_marker(loc, "rebase-merge/head-name")?
-            .ok_or_else(|| anyhow!("rebase state is unreadable: missing head-name"))?;
-        let remaining = read_rebase_marker(loc, "rebase-merge/git-rebase-todo")?
-            .ok_or_else(|| anyhow!("rebase state is unreadable: missing pending todo"))?;
-        let done = read_rebase_marker(loc, "rebase-merge/done")?.unwrap_or_default();
+        let Some(head_name) = (match read_rebase_marker(loc, "rebase-merge/head-name") {
+            Ok(head_name) => head_name,
+            Err(error) => return Ok(RebaseState::Unknown(format!("{error:#}"))),
+        }) else {
+            return Ok(RebaseState::Unknown(
+                "rebase state is unreadable: missing head-name".into(),
+            ));
+        };
+        let Some(remaining) = (match read_rebase_marker(loc, "rebase-merge/git-rebase-todo") {
+            Ok(remaining) => remaining,
+            Err(error) => return Ok(RebaseState::Unknown(format!("{error:#}"))),
+        }) else {
+            return Ok(RebaseState::Unknown(
+                "rebase state is unreadable: missing pending todo".into(),
+            ));
+        };
+        let done = match read_rebase_marker(loc, "rebase-merge/done") {
+            Ok(done) => done.unwrap_or_default(),
+            Err(error) => return Ok(RebaseState::Unknown(format!("{error:#}"))),
+        };
         let text = |b: Option<Vec<u8>>| {
             b.map(|b| String::from_utf8_lossy(&b).trim().to_string())
                 .unwrap_or_default()
         };
-        let conflicts = run_read(loc, &["diff", "--name-only", "--diff-filter=U"])
-            .context("probe unmerged paths in rebase status")?;
+        let conflicts = match run_read(loc, &["diff", "--name-only", "--diff-filter=U"])
+            .context("probe unmerged paths in rebase status")
+        {
+            Ok(conflicts) => conflicts,
+            Err(error) => return Ok(RebaseState::Unknown(format!("{error:#}"))),
+        };
         let conflicted = !conflicts.trim().is_empty();
-        Ok(Some(RebaseStatus {
+        let stopped_sha = match read_rebase_marker(loc, "rebase-merge/stopped-sha") {
+            Ok(stopped_sha) => stopped_sha,
+            Err(error) => return Ok(RebaseState::Unknown(format!("{error:#}"))),
+        };
+        Ok(RebaseState::Running(RebaseStatus {
             onto: text(Some(onto)),
             head_name: text(Some(head_name))
                 .trim_start_matches("refs/heads/")
                 .to_string(),
-            stopped_sha: read_rebase_marker(loc, "rebase-merge/stopped-sha")?
+            stopped_sha: stopped_sha
                 .map(|bytes| String::from_utf8_lossy(&bytes).trim().to_string())
                 .filter(|sha| !sha.is_empty()),
             done: parse_todo(&text(Some(done))),
@@ -1338,12 +1381,16 @@ mod tests {
     }
 
     #[test]
-    fn unreadable_local_rebase_marker_is_an_error_not_absence() {
+    fn unreadable_local_rebase_marker_is_unknown_not_absence() {
         let r = repo("unreadable-rebase-marker");
         std::fs::create_dir_all(r.dir.join(".git/rebase-merge/onto")).unwrap();
         let error = read_rebase_marker(&r.loc(), "rebase-merge/onto")
             .expect_err("a directory at the marker path is unreadable, not absent");
         assert!(error.to_string().contains("read sequencer marker"));
+        assert!(matches!(
+            CliGit.rebase_status(&r.loc()).unwrap(),
+            RebaseState::Unknown(reason) if reason.contains("read sequencer marker")
+        ));
     }
 
     #[test]
@@ -1362,10 +1409,9 @@ mod tests {
         )
         .unwrap();
 
-        let status = CliGit
-            .rebase_status(&r.loc())
-            .unwrap()
-            .expect("rebase markers indicate an active rebase");
+        let RebaseState::Running(status) = CliGit.rebase_status(&r.loc()).unwrap() else {
+            panic!("rebase markers indicate an active rebase");
+        };
         assert!(status.done.is_empty());
         assert_eq!(status.remaining.len(), 1);
     }
@@ -1400,17 +1446,23 @@ mod tests {
     }
 
     #[test]
-    fn rebase_status_with_no_sequencer_state_is_none() {
+    fn rebase_status_with_no_sequencer_state_is_not_running() {
         let r = repo("rebase-status-clean");
         r.commit_file("initial.txt", "initial\n", "initial");
-        assert!(CliGit.rebase_status(&r.loc()).unwrap().is_none());
+        assert!(matches!(
+            CliGit.rebase_status(&r.loc()).unwrap(),
+            RebaseState::NotRunning
+        ));
 
         std::fs::create_dir_all(r.dir.join(".git/rebase-apply")).unwrap();
-        assert!(CliGit.rebase_status(&r.loc()).unwrap().is_none());
+        assert!(matches!(
+            CliGit.rebase_status(&r.loc()).unwrap(),
+            RebaseState::NotRunning
+        ));
     }
 
     #[test]
-    fn unreadable_remote_rebase_marker_is_an_error_not_absence() {
+    fn unreadable_remote_rebase_marker_is_unknown_not_absence() {
         let r = repo("unreadable-remote-rebase-marker");
         let loc = GitLoc::provider(vec!["env".into()], r.dir.to_string_lossy());
         assert_eq!(
@@ -1422,7 +1474,10 @@ mod tests {
         let error = read_rebase_marker(&loc, "rebase-merge/onto")
             .expect_err("a directory at the marker path is unreadable, not absent");
         assert!(error.to_string().contains("read sequencer marker"));
-        assert!(CliGit.rebase_status(&loc).is_err());
+        assert!(matches!(
+            CliGit.rebase_status(&loc).unwrap(),
+            RebaseState::Unknown(reason) if reason.contains("read sequencer marker")
+        ));
     }
 
     #[test]
@@ -1677,10 +1732,9 @@ mod tests {
             .unwrap();
         assert_eq!(out, RebaseOutcome::Conflict);
 
-        let st = CliGit
-            .rebase_status(&r.loc())
-            .unwrap()
-            .expect("mid-rebase status");
+        let RebaseState::Running(st) = CliGit.rebase_status(&r.loc()).unwrap() else {
+            panic!("mid-rebase status");
+        };
         assert_eq!(st.paused, PauseReason::Conflict);
         assert_eq!(st.head_name, "main");
         assert!(st.stopped_sha.is_some());
@@ -1696,7 +1750,10 @@ mod tests {
 
         CliGit.rebase_abort(&r.loc()).unwrap();
         assert_eq!(r.head(), old_head, "abort must restore the exact HEAD");
-        assert!(CliGit.rebase_status(&r.loc()).unwrap().is_none());
+        assert!(matches!(
+            CliGit.rebase_status(&r.loc()).unwrap(),
+            RebaseState::NotRunning
+        ));
         assert!(CliGit.merge_state(&r.loc()).unwrap().is_none());
     }
 
@@ -1730,10 +1787,9 @@ mod tests {
             .unwrap();
         assert_eq!(out, RebaseOutcome::Paused);
 
-        let st = CliGit
-            .rebase_status(&r.loc())
-            .unwrap()
-            .expect("paused status");
+        let RebaseState::Running(st) = CliGit.rebase_status(&r.loc()).unwrap() else {
+            panic!("paused status");
+        };
         assert_eq!(st.paused, PauseReason::Edit);
         let picks: Vec<&str> = st.remaining.iter().map(|e| e.subject.as_str()).collect();
         assert_eq!(picks, ["c3", "c4"]);
@@ -1794,10 +1850,9 @@ mod tests {
             .rebase_retag(&r.loc(), &c2, &[&c2], TodoAction::Edit, &opts())
             .unwrap();
         assert_eq!(out, RebaseOutcome::Paused);
-        let st = CliGit
-            .rebase_status(&r.loc())
-            .unwrap()
-            .expect("paused status");
+        let RebaseState::Running(st) = CliGit.rebase_status(&r.loc()).unwrap() else {
+            panic!("paused status");
+        };
         let baseline = st.remaining.clone();
 
         // Someone edits the live todo from another terminal mid-pause…
@@ -1821,7 +1876,9 @@ mod tests {
             .rewrite_pending_todo_checked(&r.loc(), &kept, &baseline)
             .unwrap_err();
         assert!(err.to_string().contains("changed on disk"), "{err}");
-        let st = CliGit.rebase_status(&r.loc()).unwrap().unwrap();
+        let RebaseState::Running(st) = CliGit.rebase_status(&r.loc()).unwrap() else {
+            panic!("paused status after external edit");
+        };
         assert_eq!(st.remaining, externally_edited, "external edit survived");
 
         // Re-reading the live todo makes the rewrite valid again (and the
@@ -1852,10 +1909,9 @@ mod tests {
             .rebase_retag(&r.loc(), &c2, &[&c2], TodoAction::Edit, &opts())
             .unwrap();
         assert_eq!(out, RebaseOutcome::Paused);
-        let status = CliGit
-            .rebase_status(&r.loc())
-            .unwrap()
-            .expect("paused status");
+        let RebaseState::Running(status) = CliGit.rebase_status(&r.loc()).unwrap() else {
+            panic!("paused status");
+        };
         let baseline = status.remaining;
         let kept: Vec<TodoEntry> = baseline
             .iter()
@@ -1913,7 +1969,10 @@ mod tests {
             .unwrap_err();
         assert!(err.to_string().contains("merge"), "{err}");
         // Nothing was started.
-        assert!(CliGit.rebase_status(&r.loc()).unwrap().is_none());
+        assert!(matches!(
+            CliGit.rebase_status(&r.loc()).unwrap(),
+            RebaseState::NotRunning
+        ));
     }
 
     #[test]
@@ -1966,7 +2025,10 @@ mod tests {
                 .unwrap(),
             RebaseOutcome::Paused
         );
-        let baseline = CliGit.rebase_status(&r.loc()).unwrap().unwrap().remaining;
+        let RebaseState::Running(status) = CliGit.rebase_status(&r.loc()).unwrap() else {
+            panic!("paused status");
+        };
+        let baseline = status.remaining;
         let todo_path = r.dir.join(".git/rebase-merge/git-rebase-todo");
         let outside = r.dir.join("outside-todo");
         std::fs::rename(&todo_path, &outside).unwrap();
@@ -2028,7 +2090,10 @@ mod tests {
             Err(error) => panic!("create todo symlink: {error}"),
         }
         let original = std::fs::read(&outside).unwrap();
-        let baseline = CliGit.rebase_status(&remote).unwrap().unwrap().remaining;
+        let RebaseState::Running(status) = CliGit.rebase_status(&remote).unwrap() else {
+            panic!("paused remote status");
+        };
+        let baseline = status.remaining;
         let edited: Vec<TodoEntry> = baseline
             .iter()
             .filter(|entry| entry.subject != "c3")
@@ -2058,7 +2123,10 @@ mod tests {
             RebaseOutcome::Paused
         );
         let provider = GitLoc::provider(vec!["env".into()], r.dir.to_string_lossy());
-        let baseline = CliGit.rebase_status(&provider).unwrap().unwrap().remaining;
+        let RebaseState::Running(status) = CliGit.rebase_status(&provider).unwrap() else {
+            panic!("paused provider status");
+        };
+        let baseline = status.remaining;
         let edited: Vec<TodoEntry> = baseline
             .iter()
             .filter(|entry| entry.subject != "c3")
@@ -2069,7 +2137,10 @@ mod tests {
             .rewrite_pending_todo_checked(&provider, &edited, &baseline)
             .unwrap();
         assert_eq!(
-            CliGit.rebase_status(&provider).unwrap().unwrap().remaining,
+            match CliGit.rebase_status(&provider).unwrap() {
+                RebaseState::Running(status) => status.remaining,
+                other => panic!("expected paused provider status, got {other:?}"),
+            },
             edited
         );
     }

@@ -145,6 +145,7 @@ impl<T: GitBackend + ?Sized> PatchOps for T {}
 #[cfg(test)]
 mod tests {
     use super::super::CliGit;
+    use super::super::rebase::RebaseState;
     use super::super::testutil::{TestRepo, git_in};
     use super::*;
     use thegn_core::patch::{LineKind, Selection, parse_patch, transform};
@@ -275,7 +276,10 @@ mod tests {
             .unwrap_err();
         assert!(err.to_string().contains("apply"), "{err}");
         // Nothing half-applied: no rebase in progress, HEAD untouched.
-        assert!(CliGit.rebase_status(&r.loc()).unwrap().is_none());
+        assert!(matches!(
+            CliGit.rebase_status(&r.loc()).unwrap(),
+            RebaseState::NotRunning
+        ));
         assert_eq!(r.head(), old_head);
         assert_eq!(r.out(&["status", "--porcelain"]), "");
     }
