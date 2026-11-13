@@ -885,8 +885,46 @@ fmt-check:
 # `cargo test`. This recipe is the single source of truth shared by the CI
 # `test` job and the pre-push hook. Doctests are `test-doc` (CI-only) — see
 # the note there.
-test: contract-ratchets test-live test-heredoc-guard test-build-metadata test-the429 test-action-pins test-apply-backend test-nix-metadata test-nextest-setup test-packaging test-cargo-provenance test-third-party-notices test-changelog-lint demo-script-check test-net-trace
-    cargo nextest run --workspace
+test: test-live test-heredoc-guard test-build-metadata test-the429 test-action-pins test-apply-backend test-nix-metadata test-nextest-setup test-packaging test-cargo-provenance test-third-party-notices test-changelog-lint demo-script-check test-net-trace
+    #!/usr/bin/env bash
+    set -euo pipefail
+    if ! cargo nextest run --workspace; then
+      just contract-ratchets
+      exit 1
+    fi
+
+    # Main currently discovers two plugin_api_wire tests, three control_schema
+    # tests, and one surface-gap ratchet: six tests total. Keep this pin here
+    # so a silently narrowed workspace filter cannot make the gate incomplete.
+    expected_contract_tests=6
+    contract_filter='binary(/plugin_api_wire/) or binary(/control_schema/) or test(ratchet_pins_surface_gaps)'
+    print_contract_owners() {
+      echo "  plugin API schema and accepted extension points: plugin-api / align-plugin-v03-contract"
+      echo "  control v1 generated schema: control-plane / audit-remote-surface-map"
+      echo "  cross-client surface-gap ledger: capability-catalog / audit-remote-surface-map"
+    }
+    if ! contract_test_count="$(
+      cargo nextest list --workspace -E "$contract_filter" --message-format json |
+        python3 -c 'import json, sys
+    data = json.load(sys.stdin)
+    print(sum(
+        1
+        for suite in data.get("rust-suites", {}).values()
+        for case in suite.get("testcases", {}).values()
+        if case.get("filter-match", {}).get("status") == "matches"
+    ))'
+    )"; then
+      echo "ERROR: contract-discovery could not enumerate the contract tests" >&2
+      print_contract_owners >&2
+      exit 1
+    fi
+    if (( contract_test_count < expected_contract_tests )); then
+      echo "ERROR: contract-discovery found $contract_test_count tests; expected at least $expected_contract_tests" >&2
+      print_contract_owners >&2
+      exit 1
+    fi
+    echo "contract-discovery: found $contract_test_count tests (minimum $expected_contract_tests)"
+    print_contract_owners
 
 # Doctest pass. Split out of `test` (and therefore off pre-push) because it is
 # a THIRD full-workspace compile, on top of clippy's and nextest's, and this
