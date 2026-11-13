@@ -823,12 +823,16 @@ mod tests {
 
     #[test]
     fn parent_artifact_requires_a_verified_worktree_snapshot() {
-        let mut code = PipelineStage::default();
-        code.name = "code".into();
-        code.next = Some("review".into());
-        let mut review = PipelineStage::default();
-        review.name = "review".into();
-        review.requires = vec![Requirement::ParentArtifact.as_str().into()];
+        let code = PipelineStage {
+            name: "code".into(),
+            next: Some("review".into()),
+            ..PipelineStage::default()
+        };
+        let review = PipelineStage {
+            name: "review".into(),
+            requires: vec![Requirement::ParentArtifact.as_str().into()],
+            ..PipelineStage::default()
+        };
         let chart = Pipeline {
             stages: vec![code, review],
             ..Default::default()

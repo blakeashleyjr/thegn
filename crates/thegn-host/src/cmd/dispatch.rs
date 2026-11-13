@@ -5940,7 +5940,7 @@ mod tests {
         };
         let report = pipeline_run::verify_report(&facts);
         let error = require_done_report(1, report).unwrap_err().to_string();
-        assert!(error.contains("stable worktree snapshot"), "{error}");
+        assert!(error.contains("verification snapshot moved"), "{error}");
     }
 
     #[test]
