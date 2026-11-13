@@ -35,6 +35,7 @@ pub struct SandboxLimits {
     pub heavy_slots: usize,
     /// Absolute one-minute load-average ceiling for heavyweight gates. Zero
     /// disables the load gate.
+    #[schemars(range(min = 0))]
     pub max_load: f64,
 }
 
