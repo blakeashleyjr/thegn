@@ -1024,7 +1024,7 @@ check "thegn land records the manual landed row" \
 # shellcheck disable=SC2034 # read by the check body below through eval
 manual_land_roster="$("$SZ" dispatch list --json)"
 check "manual land records exactly one dispatch roster row" \
-  "printf '%s' \"\$manual_land_roster\" | python3 -c 'import json,sys; rows=json.load(sys.stdin); assert len(rows) == 1, rows; assert rows[0][\"issue_id\"] == \"local:smoke-manual-land\", rows'"
+  "printf '%s' \"\$manual_land_roster\" | python3 -c 'import json,sys; rows=json.load(sys.stdin); assert len(rows) == 1, rows; assert rows[0][\"issue_id\"].startswith(\"local:tg-smoke-manual-land\"), rows'"
 LM_OID="$(git -C "$R" rev-parse main)"
 check "manual land records the exact fold OID and target" \
   "[[ \$(sqlite3 \"$XDG_STATE_HOME/thegn/thegn.db\" \"SELECT status || '|' || target_branch || '|' || result_oid FROM merge_queue WHERE branch='$LB'\") == 'landed|main|$LM_OID' ]]"
