@@ -353,7 +353,7 @@ fn is_gitlab_host(hostname: &str) -> bool {
 
 /// Does `hostname` dress itself up as github.com while being some other host?
 ///
-/// This is deliberately NOT [`is_github_host`]'s question. Once the operator has
+/// This is deliberately NOT `is_github_host`'s question. Once the operator has
 /// said "this is GitHub", an **enterprise** instance has an arbitrary hostname
 /// (`ghe.example.test`), so a membership test would reject every self-hosted
 /// install. What must still be refused is a host built to read like the real one:
@@ -391,7 +391,7 @@ fn github_targeted_argv(remote: &GithubRemote, args: &[&str]) -> Vec<String> {
 
 /// Map a git remote URL's host to a CI system (pure, tested).
 ///
-/// Host matching lives in [`is_github_host`] / [`is_gitlab_host`] — one rule, two
+/// Host matching lives in `is_github_host` / `is_gitlab_host` — one rule, two
 /// callers, so the lookalike-host bug cannot be fixed in one place and survive in
 /// the other.
 pub fn system_from_remote_host(url: &str) -> Option<CiSystem> {
