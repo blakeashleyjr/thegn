@@ -16,6 +16,43 @@ use tokio::process::{Child, Command};
 use tokio::time::{Instant, timeout, timeout_at};
 
 use crate::MediaError;
+use crate::model::{MAX_FIELD_BYTES, MAX_ID_BYTES, is_valid_opaque_id};
+
+/// Append provider text without ever retaining more than the field budget.
+/// Returns whether any input bytes were omitted. The returned string always
+/// ends on a UTF-8 character boundary.
+pub(crate) fn push_field(dst: &mut String, value: &str) -> bool {
+    push_bounded(dst, value, MAX_FIELD_BYTES)
+}
+
+/// Copy one provider display field at the canonical byte limit.
+pub(crate) fn clip_field(value: &str) -> String {
+    let mut clipped = String::with_capacity(value.len().min(MAX_FIELD_BYTES));
+    push_field(&mut clipped, value);
+    clipped
+}
+
+/// Retain an opaque provider identifier only when it is exact and valid.
+/// Unlike display fields, identifiers must never be truncated into a collision.
+pub(crate) fn valid_id(value: &str) -> Option<String> {
+    (value.len() <= MAX_ID_BYTES && is_valid_opaque_id(value)).then(|| value.to_owned())
+}
+
+/// Append at most `cap` UTF-8 bytes, returning whether `value` did not fit in
+/// full. This is shared by protocol decoders so the limit applies while
+/// decoding, rather than after a large temporary allocation already exists.
+pub(crate) fn push_bounded(dst: &mut String, value: &str, cap: usize) -> bool {
+    if dst.len() >= cap {
+        return !value.is_empty();
+    }
+    let remaining = cap - dst.len();
+    let mut end = value.len().min(remaining);
+    while end > 0 && !value.is_char_boundary(end) {
+        end -= 1;
+    }
+    dst.push_str(&value[..end]);
+    end < value.len()
+}
 
 /// Hard bounds for one helper invocation.
 #[derive(Debug, Clone, Copy)]
