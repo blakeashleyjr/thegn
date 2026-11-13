@@ -39,8 +39,7 @@
           ]
         },
         "permissions": {
-          "default": [],
-          "description": "Per-launch permission grants over the agent entry's configured grants.\nClaude only; by default this can narrow the configured grants, while `widen_permissions` permits a wider launch-specific set.",
+          "description": "Per-launch permission grants over the agent entry's configured grants. Claude only; by default this can narrow the configured grants, while `widen_permissions` permits a wider launch-specific set.",
           "items": {
             "type": "string"
           },
