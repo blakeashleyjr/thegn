@@ -50,7 +50,9 @@ is not shown in rail mode. The bottom-bar summary is opt-in: set
   `thegn land` or before schema v107 show only what was recorded.
 - `thegn merge list --json` and control `merges.list` rows carry
   `identity_drift`: `null`, or `{"reason": ...}` when the row is held because
-  its branch or worktree identity changed since it was queued. Re-enqueue with
+  its branch or worktree identity changed since it was queued. A landed row
+  whose cleanup was refused carries `cleanup_class`, the same stable class id
+  as `merge sweep --json` `kept[].class`, and `null` otherwise. Re-enqueue with
   `thegn merge add` to adopt the new identity.
 - The Merge queue panel shows the same claim: a held row is marked `claimed`,
   and Full view names the owner, claim phase and lease (or says an expired
@@ -251,9 +253,11 @@ else. A week is how long you have to notice.
   press: it clears the landed rows and sweeps their worktrees together. Under
   `expire` a landed row _is_ the grace-period clock, so clearing one without its worktree
   would strand the worktree in _Merged_ with nothing left to collect it.
-- A merged worktree you have gone back to and **edited is never swept**,
-  forced or not. Commit or discard the changes and it becomes eligible
-  again.
+- A merged worktree you have gone back to and **edited is never removed**. A
+  timed sweep keeps it and its row, and the worktree becomes eligible again
+  once the changes are committed or discarded. `--force` retires only its
+  landed row ("edited since landing") and leaves the worktree and branch for
+  you to remove; nothing collects it afterwards.
 - The sweep runs at startup and after each land. There is no timer, so
   something that comes due while thegn is closed is collected at the next
   launch rather than at the stroke of the deadline.
