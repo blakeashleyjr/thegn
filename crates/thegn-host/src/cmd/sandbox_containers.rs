@@ -125,6 +125,10 @@ pub fn logs(name: &str, tail: u32) -> Result<()> {
     if let Err(error) = stdout.flush() {
         tracing::debug!(%error, "container logs stdout flush failed");
     }
+    let mut stderr = std::io::stderr().lock();
+    if let Err(error) = stderr.write_all(&result.stderr) {
+        tracing::debug!(%error, "container logs stderr closed");
+    }
     Ok(())
 }
 
@@ -226,6 +230,7 @@ fn logs_plan(name: &str, tail: u32) -> Result<Vec<(Backend, Vec<String>)>> {
 struct CommandResult {
     success: bool,
     stdout: Vec<u8>,
+    stderr: Vec<u8>,
     message: String,
 }
 
@@ -253,6 +258,7 @@ fn run_argv(argv: &[String], timeout: Duration, output_cap: usize) -> CommandRes
         return CommandResult {
             success: false,
             stdout: Vec::new(),
+            stderr: Vec::new(),
             message: "empty command".into(),
         };
     };
@@ -266,7 +272,7 @@ fn run_argv(argv: &[String], timeout: Duration, output_cap: usize) -> CommandRes
     let limits = Limits {
         stdout: stream,
         stderr: if output_cap == 0 {
-            Stream::Null
+            Stream::Tail { cap: 4096 }
         } else {
             Stream::Tail { cap: output_cap }
         },
@@ -275,15 +281,25 @@ fn run_argv(argv: &[String], timeout: Duration, output_cap: usize) -> CommandRes
     };
     let run = thegn_proc::run(&mut command, &limits, &AtomicBool::new(false));
     let success = run.success() && run.group == GroupState::Drained;
+    let stderr = run.stderr.bytes;
     let message = match run.end {
         End::Spawn(error) => format!("could not start: {error}"),
         End::TimedOut => "timed out".into(),
         _ if success => String::new(),
-        _ => "runtime command failed".into(),
+        _ => {
+            let tail = String::from_utf8_lossy(&stderr);
+            let tail = tail.trim();
+            if tail.is_empty() {
+                "runtime command failed".into()
+            } else {
+                format!("runtime command failed: {tail}")
+            }
+        }
     };
     CommandResult {
         success,
         stdout: run.stdout.bytes,
+        stderr,
         message,
     }
 }
@@ -375,11 +391,28 @@ mod tests {
             CommandResult {
                 success: true,
                 stdout: Vec::new(),
+                stderr: Vec::new(),
                 message: String::new(),
             }
         })
         .unwrap();
         assert!(result.success);
         assert_eq!(seen.len(), 1);
+    }
+
+    #[test]
+    fn failed_control_keeps_bounded_runtime_stderr() {
+        let result = run_argv(
+            &[
+                "sh".into(),
+                "-c".into(),
+                "printf 'no such container\\n' >&2; exit 1".into(),
+            ],
+            Duration::from_secs(5),
+            0,
+        );
+        assert!(!result.success);
+        assert_eq!(result.stderr, b"no such container\n");
+        assert_eq!(result.message, "runtime command failed: no such container");
     }
 }
