@@ -301,6 +301,112 @@ pub const STATE_TOOLS: &[StateToolSpec] = &[
         ],
     },
     StateToolSpec {
+        cap: "calendar.events",
+        description: "Read the merged, recurrence-expanded calendar events in an inclusive \
+                      ISO-date window. Read-only; requires a running daemon.",
+        args: &[
+            ArgSpec {
+                name: "from",
+                kind: ArgKind::String,
+                required: true,
+                description: "Inclusive start date (YYYY-MM-DD)",
+            },
+            ArgSpec {
+                name: "to",
+                kind: ArgKind::String,
+                required: true,
+                description: "Inclusive end date (YYYY-MM-DD)",
+            },
+        ],
+    },
+    StateToolSpec {
+        cap: "calendar.clocks",
+        description: "Read the resolved home and configured world clocks. Read-only; \
+                      requires a running daemon.",
+        args: &[],
+    },
+    StateToolSpec {
+        cap: "issues.list",
+        description: "List tracker issues matching optional status, project, query, and \
+                      limit filters. Read-only; requires a running daemon.",
+        args: &[
+            ArgSpec {
+                name: "status",
+                kind: ArgKind::String,
+                required: false,
+                description: "Comma-separated status names",
+            },
+            ArgSpec {
+                name: "limit",
+                kind: ArgKind::Integer,
+                required: false,
+                description: "Maximum number of issues",
+            },
+            ArgSpec {
+                name: "project",
+                kind: ArgKind::String,
+                required: false,
+                description: "Project id filter",
+            },
+            ArgSpec {
+                name: "query",
+                kind: ArgKind::String,
+                required: false,
+                description: "Text query filter",
+            },
+            ArgSpec {
+                name: "repo",
+                kind: ArgKind::String,
+                required: false,
+                description: "Repository path for its issues configuration overlay",
+            },
+        ],
+    },
+    StateToolSpec {
+        cap: "issues.get",
+        description: "Read one tracker issue with its detail and comments. Read-only; \
+                      requires a running daemon.",
+        args: &[
+            ArgSpec {
+                name: "id",
+                kind: ArgKind::String,
+                required: true,
+                description: "Tracker issue id",
+            },
+            ArgSpec {
+                name: "repo",
+                kind: ArgKind::String,
+                required: false,
+                description: "Repository path for its issues configuration overlay",
+            },
+            ArgSpec {
+                name: "account",
+                kind: ArgKind::String,
+                required: false,
+                description: "Configured tracker account that owns the issue",
+            },
+        ],
+    },
+    StateToolSpec {
+        cap: "dispatches.list",
+        description: "List the agent-dispatch roster newest-first, with optional keyset \
+                      pagination. Read-only; requires a running daemon.",
+        args: &[
+            ArgSpec {
+                name: "limit",
+                kind: ArgKind::Integer,
+                required: false,
+                description: "Rows per page",
+            },
+            ArgSpec {
+                name: "before",
+                kind: ArgKind::Integer,
+                required: false,
+                description: "Last row id from the previous page",
+            },
+        ],
+    },
+    StateToolSpec {
         cap: "agent.sessions",
         description: "List discovered coding-agent sessions from each harness's local \
                       transcript store: harness, session id, worktree/project, last-modified \
@@ -631,10 +737,10 @@ pub const STATE_TOOLS: &[StateToolSpec] = &[
 
 /// Host capabilities the MCP server exposes as state tools, by catalog id.
 /// The docs tools (`search_docs`, `read_doc`, …) are not catalog items — they
-/// read the embedded help corpus, not a running instance. Every other
-/// `Surface::Mcp` catalog row is still excused in
-/// `capability::SURFACE_GAPS`; this table is the thing that grows to retire
-/// those excuses (`mcp_tools_cover_catalog` arbitrates both directions).
+/// read the embedded help corpus, not a running instance. Unimplemented
+/// `Surface::Mcp` catalog rows remain excused in `capability::SURFACE_GAPS`;
+/// this table is the thing that grows to retire those excuses
+/// (`mcp_tools_cover_catalog` arbitrates both directions).
 pub const MCP_STATE_CAPS: &[&str] = &[
     "sessions.list",
     "worktrees.list",
@@ -649,6 +755,11 @@ pub const MCP_STATE_CAPS: &[&str] = &[
     "me",
     "ci.runs",
     "ci.logs",
+    "calendar.events",
+    "calendar.clocks",
+    "issues.list",
+    "issues.get",
+    "dispatches.list",
     "agent.sessions",
     "sessions.wait",
     "sessions.open",
@@ -1003,6 +1114,28 @@ mod tests {
     }
 
     #[test]
+    fn client_api_read_tools_expose_read_only_annotations() {
+        let caps = [
+            "calendar.events",
+            "calendar.clocks",
+            "issues.list",
+            "issues.get",
+            "dispatches.list",
+        ];
+        let r = StateRouter::new(caps.to_vec(), |_, _| Ok(json!(null)));
+        let entries = r.tool_entries();
+        assert_eq!(entries.len(), caps.len());
+        for cap in caps {
+            let entry = entries
+                .iter()
+                .find(|entry| entry["name"] == tool_name(cap))
+                .expect(cap);
+            assert_eq!(entry["annotations"]["readOnlyHint"], json!(true));
+            assert_eq!(entry["annotations"]["destructiveHint"], json!(false));
+        }
+    }
+
+    #[test]
     fn folder_assignment_exposes_optional_folder_and_routes_the_mutation() {
         let r = StateRouter::new(vec!["folders.assign"], |cap, args| {
             Ok(json!({ "cap": cap, "args": args }))
@@ -1163,6 +1296,11 @@ mod tests {
             "pr.status",
             "ci.runs",
             "ci.logs",
+            "calendar.events",
+            "calendar.clocks",
+            "issues.list",
+            "issues.get",
+            "dispatches.list",
             "agent.sessions",
             "sessions.wait",
             "semantic.map",
