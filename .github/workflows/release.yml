@@ -380,6 +380,8 @@ jobs:
           set -euo pipefail
           release="$RUNNER_TEMP/release"
           assets=("$release"/thegn-"$TAG"-*.tar.gz "$release"/thegn-"$TAG"-*.sha256)
+          python3 packaging/release.py require-draft \
+            --is-draft "$(gh release view "$TAG" --json isDraft --jq .isDraft)"
           gh release upload "$TAG" "${assets[@]}" --clobber
       - name: Write and publish release record
         id: record
@@ -432,6 +434,8 @@ jobs:
             exit 1
           }
           echo "asset_digests=$asset_digests" >> "$GITHUB_OUTPUT"
+          python3 packaging/release.py require-draft \
+            --is-draft "$(gh release view "$TAG" --json isDraft --jq .isDraft)"
           gh release upload "$TAG" "$release/thegn-$TAG-release.json" --clobber
   # Read-only completion build ships ONCE, as a single arch-independent artifact, rather than
   # riding inside each per-target archive. Three reasons:
@@ -743,6 +747,8 @@ jobs:
             exit 1
           }
           echo "package_digests=$package_digests" >> "$GITHUB_OUTPUT"
+          python3 packaging/release.py require-draft \
+            --is-draft "$(gh release view "$TAG" --json isDraft --jq .isDraft)"
           gh release upload "$TAG" "$PACKAGE_ROOT/release-assets/"* --clobber
       - name: Summarize package outputs
         env:
@@ -879,6 +885,8 @@ jobs:
         run: |
           set -euo pipefail
           manifest="$RUNNER_TEMP/manifest/thegn-$TAG-manifest.json"
+          python3 packaging/release.py require-draft \
+            --is-draft "$(gh release view "$TAG" --json isDraft --jq .isDraft)"
           gh release upload "$TAG" "$manifest" --clobber
           asset_count="$(jq '.assets | length' "$manifest")"
           echo "Verified and attached $asset_count release assets in the manifest for $TAG." >> "$GITHUB_STEP_SUMMARY"
