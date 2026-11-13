@@ -410,6 +410,11 @@ pub const CATALOG: &[Slot] = &[
     slot("session open", "worktree", SourceKind::Worktree),
     slot("session open", "track", SourceKind::Structural),
     slot("session open", "brief_file", SourceKind::Structural),
+    slot(
+        "session open",
+        "permissions",
+        SourceKind::Reserved(Reserved::Freeform),
+    ),
     slot("session open", "vars", SourceKind::Structural),
     slot("session fork", "worktree", SourceKind::Worktree),
     slot("session move", "worktree", SourceKind::Worktree),
