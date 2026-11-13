@@ -64,10 +64,8 @@ impl CleanupRetry {
         let (version, fields) = if let Some(fields) = detail.strip_prefix("thegn-cleanup-retry:v1:")
         {
             (1, fields)
-        } else if let Some(fields) = detail.strip_prefix("thegn-cleanup-retry:v2:") {
-            (2, fields)
         } else {
-            return None;
+            (2, detail.strip_prefix("thegn-cleanup-retry:v2:")?)
         };
         let mut fields = fields.split(':');
         let attempts = fields.next()?;
