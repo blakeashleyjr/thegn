@@ -11,10 +11,12 @@
 //! are re-checked per worktree immediately before its removal, and a branch
 //! whose tip moved since planning is left alone.
 
-use anyhow::Result;
+use anyhow::{Context, Result, anyhow};
 use std::collections::HashMap;
 use std::path::Path;
 use thegn_core::config::Config;
+use thegn_core::git_run::{GitOutcome, GitTextError};
+use thegn_core::remote::GitLoc;
 use thegn_core::wt_prune::{self, PruneDecision, PruneFacts};
 use thegn_core::{outln, util};
 
@@ -40,34 +42,40 @@ pub struct PruneArgs {
     pub json: bool,
 }
 
-/// Commit a local branch points at (`None` when unreadable).
-fn branch_tip(dir: &Path, branch: &str) -> Option<String> {
-    util::git_out(
-        dir,
-        &[
-            "rev-parse",
-            "--verify",
-            "-q",
-            &format!("refs/heads/{branch}"),
-        ],
-    )
+/// Commit a local branch points at (`None` when the branch ref is absent).
+fn branch_tip(dir: &Path, branch: &str) -> Result<Option<String>> {
+    let reference = format!("refs/heads/{branch}");
+    match GitLoc::Local(dir.to_path_buf()).git_text(&["rev-parse", "--verify", "-q", &reference]) {
+        Ok(tip) => Ok((!tip.is_empty()).then_some(tip)),
+        Err(GitTextError::Failed(GitOutcome::Exit {
+            code: Some(128),
+            stderr_tail,
+        })) if stderr_tail.trim().is_empty() => Ok(None),
+        Err(error) => Err(anyhow!("git rev-parse {reference}: {error}")),
+    }
 }
 
 /// Gather the facts for one worktree. Anything Git cannot answer counts
 /// against removal (not merged / not clean).
-fn facts_for(path: &str, branch: &str, target: &str, root: &Path) -> PruneFacts {
+fn facts_for(path: &str, branch: &str, target: &str, root: &Path) -> Result<PruneFacts> {
     let dir = Path::new(path);
     let branch_opt = (!branch.is_empty()).then(|| branch.to_string());
     let ancestor_of_target = branch_opt
         .as_deref()
         .is_some_and(|b| util::git_is_ancestor(dir, b, target) == Some(true));
-    let tree_clean = util::git_out_allow_empty(dir, &["status", "--porcelain"])
-        .is_some_and(|s| s.trim().is_empty());
-    let tip_equals_target = branch_opt.as_deref().is_some_and(|b| {
-        let tip = branch_tip(dir, b);
-        tip.is_some() && tip == util::git_out(dir, &["rev-parse", "--verify", "-q", target])
-    });
-    PruneFacts {
+    let tree_clean = GitLoc::Local(dir.to_path_buf())
+        .git_text(&["status", "--porcelain"])
+        .map(|status| status.is_empty())
+        .map_err(|error| anyhow!("git status --porcelain: {error}"))?;
+    let target_tip = GitLoc::Local(dir.to_path_buf())
+        .git_text(&["rev-parse", "--verify", "-q", target])
+        .map_err(|error| anyhow!("git rev-parse --verify -q {target}: {error}"))
+        .with_context(|| format!("reading target ref {target}"))?;
+    let tip_equals_target = match branch_opt.as_deref() {
+        Some(branch) => branch_tip(dir, branch)?.is_some_and(|tip| tip == target_tip),
+        None => false,
+    };
+    Ok(PruneFacts {
         path: path.to_string(),
         is_primary: Path::new(path) == root,
         is_target_branch: branch == target,
@@ -77,7 +85,7 @@ fn facts_for(path: &str, branch: &str, target: &str, root: &Path) -> PruneFacts 
         tree_clean,
         live_cwd_pids: crate::platform::proc::pids_with_cwd_under(dir),
         held_by_session: false,
-    }
+    })
 }
 
 pub fn run(cfg: &Config, args: PruneArgs) -> Result<()> {
@@ -100,11 +108,11 @@ pub fn run(cfg: &Config, args: PruneArgs) -> Result<()> {
         .into_iter()
         .filter(|w| w.repo == root_s && w.exists)
         .map(|w| {
-            let tip = branch_tip(Path::new(&w.path), &w.branch);
+            let tip = branch_tip(Path::new(&w.path), &w.branch)?;
             branches.push((w.path.clone(), w.branch.clone(), tip));
             facts_for(&w.path, &w.branch, &target, &root)
         })
-        .collect();
+        .collect::<Result<Vec<_>>>()?;
     let plan = wt_prune::plan(facts);
     let (removable, kept) = wt_prune::counts(&plan);
 
@@ -212,7 +220,16 @@ fn apply_plan(
             continue;
         }
         let branch = branch_of.get(path.as_str()).copied().unwrap_or("");
-        let fresh = facts_for(path, branch, target, root);
+        let fresh = match facts_for(path, branch, target, root) {
+            Ok(fresh) => fresh,
+            Err(error) => {
+                out.skipped.push((
+                    path.clone(),
+                    format!("could not recheck Git facts: {error:#}"),
+                ));
+                continue;
+            }
+        };
         let PruneDecision::Remove { delete_branch } = wt_prune::decide(&fresh) else {
             let why = match wt_prune::decide(&fresh) {
                 PruneDecision::Keep(r) => r.describe(),
@@ -223,7 +240,17 @@ fn apply_plan(
             continue;
         };
         let planned_tip = tips.get(path).cloned().flatten();
-        if planned_tip.is_none() || branch_tip(Path::new(path), branch) != planned_tip {
+        let current_tip = match branch_tip(Path::new(path), branch) {
+            Ok(tip) => tip,
+            Err(error) => {
+                out.skipped.push((
+                    path.clone(),
+                    format!("could not recheck branch tip: {error:#}"),
+                ));
+                continue;
+            }
+        };
+        if planned_tip.is_none() || current_tip != planned_tip {
             out.skipped
                 .push((path.clone(), "branch moved since planning".to_string()));
             continue;
@@ -285,7 +312,7 @@ mod tests {
             main.path(),
             &["merge", "--no-ff", "-q", "-m", "merge", "tg/merged"],
         );
-        let f = facts_for(wt.to_str().unwrap(), "tg/merged", "main", main.path());
+        let f = facts_for(wt.to_str().unwrap(), "tg/merged", "main", main.path()).unwrap();
         assert!(f.ancestor_of_target && f.tree_clean && !f.is_primary && !f.is_target_branch);
         assert!(matches!(
             wt_prune::decide(&f),
@@ -295,7 +322,7 @@ mod tests {
         ));
 
         git(&wt, &["commit", "--allow-empty", "-q", "-m", "ahead"]);
-        let f = facts_for(wt.to_str().unwrap(), "tg/merged", "main", main.path());
+        let f = facts_for(wt.to_str().unwrap(), "tg/merged", "main", main.path()).unwrap();
         assert!(!f.ancestor_of_target);
     }
 
@@ -303,7 +330,7 @@ mod tests {
     fn untracked_file_marks_the_tree_dirty_and_primary_is_flagged() {
         let main = repo();
         std::fs::write(main.path().join("stray"), "x").unwrap();
-        let f = facts_for(main.path().to_str().unwrap(), "main", "main", main.path());
+        let f = facts_for(main.path().to_str().unwrap(), "main", "main", main.path()).unwrap();
         assert!(!f.tree_clean && f.is_primary && f.is_target_branch);
     }
 
@@ -311,11 +338,43 @@ mod tests {
     fn a_process_cwd_inside_the_worktree_is_reported() {
         // This test process's own cwd is inside the tree being probed.
         let cwd = std::env::current_dir().unwrap();
-        let f = facts_for(cwd.to_str().unwrap(), "", "main", Path::new("/nonexistent"));
+        let f = facts_for(cwd.to_str().unwrap(), "", "main", Path::new("/nonexistent")).unwrap();
         if cfg!(target_os = "linux") {
             assert!(f.live_cwd_pids.contains(&std::process::id()));
         }
         assert!(f.branch.is_none());
+    }
+
+    #[test]
+    fn unreadable_worktree_git_facts_return_an_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let branch_error = branch_tip(dir.path(), "main").unwrap_err();
+        assert!(
+            branch_error.to_string().contains("git rev-parse"),
+            "{branch_error}"
+        );
+        let error = facts_for(
+            dir.path().to_str().unwrap(),
+            "main",
+            "main",
+            Path::new("/nonexistent"),
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("git"), "{error}");
+    }
+
+    #[test]
+    fn missing_target_ref_is_not_treated_as_a_matching_tip() {
+        let main = repo();
+        assert_eq!(branch_tip(main.path(), "no-such-branch").unwrap(), None);
+        let error = facts_for(
+            main.path().to_str().unwrap(),
+            "main",
+            "no-such-target",
+            main.path(),
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("no-such-target"), "{error}");
     }
 
     /// Merge `branch` into main with a merge commit so the lane tip differs
@@ -357,8 +416,8 @@ mod tests {
     fn one(main: &Path, wt: &Path, name: &str) -> OneResult {
         let path = wt.to_str().unwrap().to_string();
         let branch = format!("tg/{name}");
-        let f = facts_for(&path, &branch, "main", main);
-        let tips = HashMap::from([(path.clone(), branch_tip(wt, &branch))]);
+        let f = facts_for(&path, &branch, "main", main).unwrap();
+        let tips = HashMap::from([(path.clone(), branch_tip(wt, &branch).unwrap())]);
         (wt_prune::plan(vec![f]), tips, branch)
     }
 
@@ -377,7 +436,7 @@ mod tests {
                 wt.to_str().unwrap(),
             ],
         );
-        let f = facts_for(wt.to_str().unwrap(), "tg/fresh", "main", main.path());
+        let f = facts_for(wt.to_str().unwrap(), "tg/fresh", "main", main.path()).unwrap();
         assert!(f.tip_equals_target && f.ancestor_of_target);
         assert!(matches!(
             wt_prune::decide(&f),

@@ -60,14 +60,20 @@ pub(crate) fn acquire(
         return Err(HELD);
     }
     let worktree = local_execution_location(db, loc)?;
-    let origin = loc.git_out(&["remote", "get-url", "origin"]).ok_or(HELD)?;
+    let origin = loc
+        .git_text(&["remote", "get-url", "origin"])
+        .map_err(|_| HELD)?;
     let repository = GithubRepository::from_origin(&origin).ok_or(HELD)?;
     let proof = forge
         .pr_authorship(loc, expected_number)
         .map_err(|_| HELD)?;
+    let current_origin = loc
+        .git_text(&["remote", "get-url", "origin"])
+        .map_err(|_| HELD)?;
+    let current_head = loc.git_text(&["rev-parse", "HEAD"]).map_err(|_| HELD)?;
     if !proof.authorizes(selected_forge, &repository, pr)
-        || loc.git_out(&["remote", "get-url", "origin"]).as_deref() != Some(origin.as_str())
-        || loc.git_out(&["rev-parse", "HEAD"]).as_deref() != Some(pr.head_ref_oid.as_str())
+        || current_origin != origin
+        || current_head != pr.head_ref_oid
     {
         return Err(HELD);
     }
@@ -166,7 +172,7 @@ pub(crate) fn revalidate_after_agent(
     if worktree != permit.worktree {
         return Err(AFTER_AGENT_HELD);
     }
-    let Some(origin) = loc.git_out(&["remote", "get-url", "origin"]) else {
+    let Ok(origin) = loc.git_text(&["remote", "get-url", "origin"]) else {
         return Err(AFTER_AGENT_HELD);
     };
     if origin != permit.origin {
