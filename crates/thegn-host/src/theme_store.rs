@@ -12,6 +12,7 @@ use notify::{Event, EventKind, RecommendedWatcher, RecursiveMode, Watcher};
 use sha2::{Digest, Sha256};
 use termwiz::terminal::TerminalWaker;
 use tokio::sync::mpsc as tokio_mpsc;
+use unicode_normalization::UnicodeNormalization;
 
 use thegn_core::theme_user::UserTheme;
 
@@ -578,12 +579,12 @@ pub(crate) fn scan_dir_hashed(
         return (themes, warnings, hashes);
     }
     let pinned = active.and_then(|name| {
-        let slug = thegn_core::util::slugify(name);
+        let slug = identity_slug(name);
         (!slug.is_empty()
             && slug.len() <= 80
             && !thegn_core::theme::PRESETS
                 .iter()
-                .any(|preset| thegn_core::util::slugify(preset) == slug))
+                .any(|preset| identity_slug(preset) == slug))
         .then(|| format!("{slug}.toml"))
     });
     let paths = bounded_theme_paths(dir, pinned.as_deref(), &mut warnings);
@@ -598,7 +599,7 @@ pub(crate) fn scan_dir_hashed(
                 Ok(theme) => {
                     let content_hash: [u8; 32] = Sha256::digest(&bytes).into();
                     *exact.entry(theme.meta.name.clone()).or_default() += 1;
-                    let identity = thegn_core::util::slugify(&theme.meta.name);
+                    let identity = identity_slug(&theme.meta.name);
                     *normalized.entry(identity.clone()).or_default() += 1;
                     if identity.is_empty() || identity.len() > 80 {
                         warnings.push(format!(
@@ -609,7 +610,7 @@ pub(crate) fn scan_dir_hashed(
                     }
                     if thegn_core::theme::PRESETS
                         .iter()
-                        .any(|preset| thegn_core::util::slugify(preset) == identity)
+                        .any(|preset| identity_slug(preset) == identity)
                     {
                         warnings.push(format!(
                             "{}: user theme `{}` conflicts with a built-in preset identity",
@@ -650,7 +651,7 @@ pub(crate) fn scan_dir_hashed(
     themes.retain(|theme| {
         let exact_count = exact.get(&theme.meta.name).copied().unwrap_or(0);
         let normalized_count = normalized
-            .get(&thegn_core::util::slugify(&theme.meta.name))
+            .get(&identity_slug(&theme.meta.name))
             .copied()
             .unwrap_or(0);
         exact_count <= 1 && normalized_count <= 1
@@ -658,7 +659,7 @@ pub(crate) fn scan_dir_hashed(
     hashes.retain(|slug, _| {
         themes
             .iter()
-            .any(|theme| thegn_core::util::slugify(&theme.meta.name) == *slug)
+            .any(|theme| identity_slug(&theme.meta.name) == *slug)
     });
     themes.sort_by(|a, b| a.meta.name.cmp(&b.meta.name));
     warnings.sort();
@@ -762,8 +763,17 @@ pub(crate) fn read_bounded(path: &Path) -> Result<Vec<u8>, String> {
     Ok(bytes)
 }
 
+fn normalize_name(name: &str) -> String {
+    name.nfc().collect()
+}
+
+fn identity_slug(name: &str) -> String {
+    let normalized = normalize_name(name);
+    thegn_core::util::slugify(&normalized)
+}
+
 fn valid_slug(name: &str) -> Result<String, String> {
-    let slug = thegn_core::util::slugify(name);
+    let slug = identity_slug(name);
     if slug.is_empty() || slug.len() > 80 {
         return Err("theme name must produce a non-empty slug of at most 80 characters".into());
     }
@@ -806,7 +816,9 @@ fn ensure_identity_unclaimed(
         let Ok(other) = UserTheme::from_toml(text) else {
             continue;
         };
-        if other.meta.name == name || thegn_core::util::slugify(&other.meta.name) == slug {
+        if normalize_name(&other.meta.name) == normalize_name(name)
+            || identity_slug(&other.meta.name) == slug
+        {
             return Err(format!(
                 "theme name `{name}` is already claimed by `{}`; rename or remove that file first (nothing was written)",
                 path.display()
@@ -826,9 +838,10 @@ pub(crate) fn write_theme_expect(
     expect: SaveExpect,
 ) -> Result<[u8; 32], String> {
     theme.validate().map_err(|e| e.to_string())?;
-    if thegn_core::theme::PRESETS.iter().any(|preset| {
-        thegn_core::util::slugify(preset) == thegn_core::util::slugify(&theme.meta.name)
-    }) {
+    if thegn_core::theme::PRESETS
+        .iter()
+        .any(|preset| identity_slug(preset) == identity_slug(&theme.meta.name))
+    {
         return Err(format!(
             "theme name `{}` is reserved by a built-in preset",
             theme.meta.name
@@ -844,7 +857,7 @@ pub(crate) fn write_theme_expect(
                 std::str::from_utf8(&bytes).map_err(|_| "existing theme is not UTF-8")?,
             )
             .map_err(|error| format!("existing theme identity is ambiguous: {error}"))?;
-            if existing.meta.name != theme.meta.name {
+            if normalize_name(&existing.meta.name) != normalize_name(&theme.meta.name) {
                 return Err(format!(
                     "theme filename collision: `{}` already belongs to `{}`",
                     destination.display(),
@@ -1311,7 +1324,7 @@ mod tests {
     #[test]
     fn scan_rejects_normalized_name_collisions() {
         let dir = temp_dir("normalized-scan");
-        for (filename, name) in [("one.toml", "Night-Sky"), ("two.toml", "night_sky")] {
+        for (filename, name) in [("caf.toml", "Café"), ("legacy-cafe.toml", "Cafe\u{301}")] {
             let candidate = theme(name);
             let path = dir.join(filename);
             std::fs::write(path, candidate.to_toml().unwrap()).unwrap();
@@ -1323,6 +1336,41 @@ mod tests {
                 .iter()
                 .any(|warning| warning.contains("ambiguous normalized user theme identity"))
         );
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn save_nfc_and_nfd_names_claim_one_identity() {
+        let dir = temp_dir("normalized-save");
+        std::fs::write(
+            dir.join("cafe.toml"),
+            theme("Cafe\u{301}").to_toml().unwrap(),
+        )
+        .unwrap();
+        let error = write_theme(&dir, &theme("Café")).unwrap_err();
+        assert!(error.contains("already claimed"), "{error}");
+        assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 1);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn precomposed_name_round_trips_unchanged() {
+        let dir = temp_dir("normalized-round-trip");
+        let name = "Café";
+        write_theme(&dir, &theme(name)).unwrap();
+        let (themes, warnings) = scan_dir(&dir, None);
+        assert!(warnings.is_empty(), "{warnings:?}");
+        assert_eq!(themes.len(), 1);
+        assert_eq!(themes[0].meta.name, name);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn normalized_slug_cap_is_measured_after_nfc() {
+        let dir = temp_dir("normalized-cap");
+        let name = format!("{}e\u{301}", "x".repeat(80));
+        write_theme(&dir, &theme(&name)).unwrap();
+        assert!(dir.join(format!("{}.toml", "x".repeat(80))).is_file());
         std::fs::remove_dir_all(dir).unwrap();
     }
 
