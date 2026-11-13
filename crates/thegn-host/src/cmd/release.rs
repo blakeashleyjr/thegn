@@ -7,12 +7,13 @@
 
 use anyhow::{Context, Result, bail};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::AtomicBool;
 use thegn_core::outln;
 use thegn_core::release_bump::{
     self, BumpKind, BumpPlan, bump_cargo_lock, bump_cargo_toml, bump_changelog, bump_readme,
     workspace_version,
 };
-use thegn_core::util::{git_ok, git_out, git_out_allow_empty};
+use thegn_core::remote::{GITLOC_READ_DEADLINE, GitLoc};
 
 #[derive(clap::ValueEnum, Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Bump {
@@ -152,25 +153,48 @@ fn lock_path(p: &Path) -> PathBuf {
     }
 }
 
+fn git_text(root: &Path, args: &[&str]) -> Result<String> {
+    GitLoc::Local(root.to_path_buf())
+        .git_text(args)
+        .map_err(|error| anyhow::anyhow!("git {}: {error}", args.join(" ")))
+}
+
+fn git_success(root: &Path, args: &[&str]) -> Result<()> {
+    let cancel = AtomicBool::new(false);
+    let outcome = GitLoc::Local(root.to_path_buf()).git_run(
+        args,
+        &thegn_core::git_run::GitPolicy::read(GITLOC_READ_DEADLINE),
+        &cancel,
+    );
+    if outcome.is_success() {
+        Ok(())
+    } else {
+        bail!("git {}: {outcome}", args.join(" "))
+    }
+}
+
 fn prepare(o: PrepareOpts) -> Result<()> {
     let cwd = std::env::current_dir().context("reading the current directory")?;
-    let Some(root) = git_out(&cwd, &["rev-parse", "--show-toplevel"]) else {
+    let root = git_text(&cwd, &["rev-parse", "--show-toplevel"])?;
+    if root.is_empty() {
         bail!("not inside a git worktree");
-    };
+    }
     let root = PathBuf::from(root);
     let date = match o.date {
         Some(d) if valid_date(&d) => d,
         Some(d) => bail!("--date `{d}` is not YYYY-MM-DD"),
         None => chrono::Local::now().format("%Y-%m-%d").to_string(),
     };
-    let Some(status) = git_out_allow_empty(&root, &["status", "--porcelain"]) else {
-        bail!("`git status` failed: is this a git worktree?");
-    };
+    let status =
+        git_text(&root, &["status", "--porcelain"]).context("reading git worktree status")?;
     if !status.is_empty() {
         bail!("the worktree is not clean; commit or stash first");
     }
-    let current = git_out(&root, &["rev-parse", "--abbrev-ref", "HEAD"])
+    let current = git_text(&root, &["rev-parse", "--abbrev-ref", "HEAD"])
         .context("could not read the current branch")?;
+    if current.is_empty() {
+        bail!("could not read the current branch: Git returned no branch name");
+    }
 
     // Compute every output before touching git or the disk: a refusal must
     // leave the worktree and branch list exactly as they were.
@@ -205,8 +229,9 @@ fn prepare(o: PrepareOpts) -> Result<()> {
         bump_changelog(&befores[3], &old, &new, &date)?,
     ];
 
-    if !o.dry_run && target != current && !git_ok(&root, &["switch", "-c", &target, &o.from]) {
-        bail!("`git switch -c {target} {}` failed", o.from);
+    if !o.dry_run && target != current {
+        git_success(&root, &["switch", "-c", &target, &o.from])
+            .with_context(|| format!("creating release branch {target}"))?;
     }
     let mut changed = Vec::new();
     for ((name, before), text) in FILES.iter().zip(&befores).zip(&outputs) {
@@ -302,5 +327,26 @@ mod tests {
         };
         let err = other.read("README.md").unwrap_err();
         assert!(err.to_string().contains("git show"));
+    }
+
+    #[test]
+    fn git_text_reports_a_git_failure_instead_of_an_empty_answer() {
+        let t = tempfile::tempdir().unwrap();
+        let err = git_text(t.path(), &["rev-parse", "--show-toplevel"]).unwrap_err();
+        assert!(
+            err.to_string().contains("git rev-parse --show-toplevel"),
+            "{err}"
+        );
+        assert!(!err.to_string().is_empty());
+    }
+
+    #[test]
+    fn git_success_reports_a_git_failure() {
+        let t = tempfile::tempdir().unwrap();
+        let err = git_success(t.path(), &["switch", "-c", "release", "HEAD"]).unwrap_err();
+        assert!(
+            err.to_string().contains("git switch -c release HEAD"),
+            "{err}"
+        );
     }
 }

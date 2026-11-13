@@ -39,7 +39,7 @@ fn git(worktree: &Path, args: &[&str]) -> GitOutcome {
     )
 }
 
-fn git_ok(worktree: &Path, args: &[&str]) -> Result<()> {
+fn git_checked(worktree: &Path, args: &[&str]) -> Result<()> {
     let outcome = git(worktree, args);
     if outcome.is_success() {
         Ok(())
@@ -117,7 +117,7 @@ pub(crate) fn commit_in(
     let tmp_path = tmp.path().to_string_lossy().into_owned();
 
     let _scope = thegn_core::util::GitWriteScope::begin();
-    git_ok(worktree, &["add", "-A"])?;
+    git_checked(worktree, &["add", "-A"])?;
     // `diff --cached --quiet` exits 1 when something is staged.
     match git(worktree, &["diff", "--cached", "--quiet"]) {
         GitOutcome::Exit { code: Some(1), .. } => {}
@@ -137,12 +137,16 @@ pub(crate) fn commit_in(
     if !first.is_success() {
         // `add -A` just staged everything, so unstaged tracked changes now
         // mean a hook rewrote files.
-        let rewritten = matches!(git(worktree, &["diff", "--name-only"]), GitOutcome::Ok(_));
+        let rewritten = match git(worktree, &["diff", "--name-only"]) {
+            GitOutcome::Ok(_) => true,
+            GitOutcome::EmptyOk => false,
+            outcome => bail!("git diff --name-only: {outcome}"),
+        };
         if !rewritten {
             bail!("git commit failed: {first}");
         }
         retried = true;
-        git_ok(worktree, &["add", "-A"])?;
+        git_checked(worktree, &["add", "-A"])?;
         let second = git(worktree, &commit_args);
         if !second.is_success() {
             bail!("git commit failed after re-staging hook changes: {second}");
@@ -273,6 +277,32 @@ mod tests {
         std::fs::write(root.join("a.txt"), "changed\n").unwrap();
         let m = msg(dir.path(), "feat: z\n");
         assert!(commit_in(&root, &m, &[]).is_err());
+    }
+
+    #[test]
+    fn dispatch_commit_unreadable_repo_surfaces_git_error() {
+        let _state = crate::testenv::IsolatedState::new();
+        let (dir, root) = repo();
+        std::fs::remove_dir_all(root.join(".git")).unwrap();
+        let m = msg(dir.path(), "feat: unavailable\n");
+        let error = commit_in(&root, &m, &[]).unwrap_err();
+        assert!(error.to_string().contains("git add"), "{error}");
+    }
+
+    #[test]
+    fn dispatch_commit_surfaces_a_diff_read_failure_after_commit_failure() {
+        let _state = crate::testenv::IsolatedState::new();
+        let (dir, root) = repo();
+        let hook = root.join(".git/hooks/pre-commit");
+        std::fs::write(&hook, "#!/bin/sh\nrm -rf .git\nexit 1\n").unwrap();
+        crate::managed_tool::make_executable(&hook).unwrap();
+        std::fs::write(root.join("a.txt"), "changed\n").unwrap();
+        let m = msg(dir.path(), "feat: diff failure\n");
+        let error = commit_in(&root, &m, &[]).unwrap_err();
+        assert!(
+            error.to_string().contains("git diff --name-only"),
+            "{error}"
+        );
     }
 
     #[test]
