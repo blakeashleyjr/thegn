@@ -329,22 +329,19 @@ fn created_home_error(
     private: Option<&crate::fsperm::PrivateDir>,
     original: AccountHomeError,
 ) -> AccountHomeError {
-    use anyhow::Context as _;
-
     let rollback = match private {
         Some(private) => rollback_created_home(private),
-        None => Err(std::io::Error::other(
-            "could not hold the newly created home for rollback",
-        )),
+        None => std::fs::remove_dir(path),
     };
-    let error = anyhow::Error::new(original).context("managed account home rolled back");
     let error = match rollback {
-        Ok(()) => error,
-        Err(rollback_error) => error.context(format!("home rollback failed: {rollback_error}")),
+        Ok(()) => format!("{original}; managed account home rolled back"),
+        Err(rollback_error) => {
+            format!("{original}; home rollback failed: {rollback_error}")
+        }
     };
     AccountHomeError::UnsafePath {
         path: path.to_path_buf(),
-        error: error.to_string(),
+        error,
     }
 }
 
@@ -2078,11 +2075,57 @@ mod tests {
                     error.contains("managed account home rolled back"),
                     "{error}"
                 );
+                assert!(error.contains("injected fault"), "{error}");
             }
             other => panic!("manifest write should fail: {other:?}"),
         }
         assert!(!home.exists());
         assert!(create_managed_home("codex", "manifest-failure").is_ok());
+    }
+
+    #[test]
+    fn created_home_error_preserves_original_and_rollback_errors() {
+        let state = crate::testenv::IsolatedState::new();
+        let anchor = state.state_home().join("thegn");
+        std::fs::create_dir_all(&anchor).unwrap();
+        let private = crate::fsperm::ensure_private_dir_beneath(
+            &anchor,
+            Path::new("accounts/codex/rollback-failure"),
+        )
+        .unwrap();
+        std::fs::write(private.path().join("user-entry"), b"keep").unwrap();
+
+        let AccountHomeError::UnsafePath { error, .. } = created_home_error(
+            private.path(),
+            Some(&private),
+            AccountHomeError::UnsafePath {
+                path: private.path().to_path_buf(),
+                error: "original manifest error".into(),
+            },
+        ) else {
+            panic!("created_home_error should return UnsafePath");
+        };
+        assert!(error.contains("original manifest error"), "{error}");
+        assert!(error.contains("home rollback failed"), "{error}");
+    }
+
+    #[test]
+    fn created_home_error_without_a_private_handle_removes_the_empty_home() {
+        let _state = crate::testenv::IsolatedState::new();
+        let home = managed_dir("codex", "no-private-handle");
+        std::fs::create_dir_all(&home).unwrap();
+
+        let result = created_home_error(
+            &home,
+            None,
+            AccountHomeError::UnsafePath {
+                path: home.clone(),
+                error: "could not verify home".into(),
+            },
+        );
+
+        assert!(matches!(result, AccountHomeError::UnsafePath { .. }));
+        assert!(!home.exists());
     }
 
     #[test]
