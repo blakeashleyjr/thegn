@@ -403,8 +403,6 @@ self: {
     semantic.map_budget_lines = cfg.semanticMapBudgetLines;
     host_discovery.tailnet.enabled = cfg.hostDiscoveryTailnetEnabled;
     host_discovery.tailnet.online_only = cfg.hostDiscoveryTailnetOnlineOnly;
-    lifecycle.snapshot.server_side_encryption = cfg.lifecycleSnapshotServerSideEncryption;
-    lifecycle.snapshot.conditional_create = cfg.lifecycleSnapshotConditionalCreate;
     log = {
       inherit (cfg.log) level file dir format;
       rotation_size_mb = cfg.log.rotationSizeMb;
@@ -1558,18 +1556,6 @@ in {
       type = lib.types.nullOr (lib.types.bool);
       default = null;
       description = "Limit tailnet discovery to online peers. Unset (null) = the binary's default.";
-    };
-
-    lifecycleSnapshotServerSideEncryption = lib.mkOption {
-      type = lib.types.nullOr (lib.types.bool);
-      default = null;
-      description = "Sign S3 snapshot uploads with server-side AES256 encryption. Unset (null) = the binary's default.";
-    };
-
-    lifecycleSnapshotConditionalCreate = lib.mkOption {
-      type = lib.types.nullOr (lib.types.bool);
-      default = null;
-      description = "Require immutable S3 snapshot uploads to create only when absent. Unset (null) = the binary's default.";
     };
 
     agents = lib.mkOption {
