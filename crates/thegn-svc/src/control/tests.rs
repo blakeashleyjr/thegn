@@ -1166,7 +1166,7 @@ async fn grpc_agent_write_and_dispatch_handlers_match_http_auth_and_shapes() {
         limit: 5,
     };
     assert_eq!(
-        grpc.dispatches_list(request!(&merge_only, list.clone()))
+        grpc.dispatches_list(request!(&merge_only, list))
             .await
             .unwrap_err()
             .code(),
