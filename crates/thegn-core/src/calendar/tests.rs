@@ -590,10 +590,17 @@ fn offset_and_delta_formatting() {
 #[test]
 fn ambiguous_local_times_resolve_to_the_earlier_instant() {
     // 2026-11-01 01:30 America/New_York happens twice (EDT then EST). RFC 5545
-    // and every mainstream client take the first.
+    // and every mainstream client take the first. GapPolicy only applies to
+    // nonexistent locals, so every policy must preserve that fold choice.
     let local = d(2026, 11, 1).and_hms_opt(1, 30, 0).unwrap();
-    let got = tz::resolve_local(local, Tz::America__New_York, GapPolicy::ShiftForward).unwrap();
-    assert_eq!(got, utc(2026, 11, 1, 5, 30), "05:30Z is the EDT reading");
+    for policy in [
+        GapPolicy::ShiftForward,
+        GapPolicy::Skip,
+        GapPolicy::Earliest,
+    ] {
+        let got = tz::resolve_local(local, Tz::America__New_York, policy).unwrap();
+        assert_eq!(got, utc(2026, 11, 1, 5, 30), "05:30Z is the EDT reading");
+    }
 }
 
 #[test]
@@ -648,6 +655,11 @@ fn tz_ref_round_trips_an_unknown_zone_instead_of_failing() {
     // A zone this build's tzdb doesn't know must survive a cache/plugin round
     // trip rather than poisoning the whole payload.
     let r = TzRef::new("Mars/Olympus_Mons");
+    let event = zoned(2026, 6, 1, 12, 0, r.as_str());
+    assert_eq!(
+        event.try_instant_in(Tz::UTC, GapPolicy::ShiftForward),
+        Err(InstantError::UnknownZone)
+    );
     let json = serde_json::to_string(&r).unwrap();
     assert_eq!(json, "\"Mars/Olympus_Mons\"");
     let back: TzRef = serde_json::from_str(&json).unwrap();
