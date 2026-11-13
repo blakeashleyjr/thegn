@@ -44,19 +44,23 @@ pub struct PruneArgs {
 
 /// Commit a local branch points at (`None` when the branch ref is absent).
 fn branch_tip(dir: &Path, branch: &str) -> Result<Option<String>> {
+    if branch.is_empty() {
+        return Ok(None);
+    }
     let reference = format!("refs/heads/{branch}");
     match GitLoc::Local(dir.to_path_buf()).git_text(&["rev-parse", "--verify", "-q", &reference]) {
         Ok(tip) => Ok((!tip.is_empty()).then_some(tip)),
         Err(GitTextError::Failed(GitOutcome::Exit {
-            code: Some(128),
+            code: Some(1),
             stderr_tail,
         })) if stderr_tail.trim().is_empty() => Ok(None),
         Err(error) => Err(anyhow!("git rev-parse {reference}: {error}")),
     }
 }
 
-/// Gather the facts for one worktree. Anything Git cannot answer counts
-/// against removal (not merged / not clean).
+/// Gather the facts for one worktree. Git read failures (status, target ref,
+/// branch tip) are returned as errors; only an absent branch ref reads as no
+/// tip. `git merge-base --is-ancestor` failures still count against removal.
 fn facts_for(path: &str, branch: &str, target: &str, root: &Path) -> Result<PruneFacts> {
     let dir = Path::new(path);
     let branch_opt = (!branch.is_empty()).then(|| branch.to_string());
