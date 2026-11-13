@@ -537,9 +537,10 @@ mod tests {
 
     #[test]
     fn manual_events_only_target_the_tracked_worktree() {
+        let runtime: Vec<String> = vec!["test-runtime".into(), "exec".into()];
         let events = manual_events(
             "/tracked",
-            &["podman".into(), "exec".into()],
+            &runtime,
             vec![("/tracked".into(), 8080), ("/other".into(), 3000)],
         );
         assert_eq!(
@@ -547,7 +548,7 @@ mod tests {
             vec![ForwardEvent::Detected {
                 worktree: "/tracked".into(),
                 container_port: 8080,
-                runtime: vec!["podman".into(), "exec".into()],
+                runtime: runtime.clone(),
                 manual: true,
             }]
         );
