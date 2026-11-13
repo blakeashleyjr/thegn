@@ -294,6 +294,9 @@ until its scope is granted.
 | `sessions_wait`             | `read`        | block until a session reaches a state (exited/idle/blocked/done/regex) |
 | `semantic_map`              | `read`        | ranked, budgeted repo map of a worktree's indexed entities             |
 | `semantic_blast_radius`     | `read`        | a worktree's blast-radius: changed entities, callers, untested, risk   |
+| `git_status`                | `read`        | list changed files in a worktree                                       |
+| `merge_list`                | `read`        | list the merge queue for a worktree's repository                       |
+| `pr_status`                 | `read`        | read cached pull-request status, one row per worktree                  |
 | `sessions_open`             | `write`       | open a session — raw `argv`, or a configured agent by name             |
 | `sessions_kill`             | `write`       | kill a session's process (idempotent)                                  |
 | `sessions_input`            | `write` **+** | send raw terminal input/control characters to a live session           |
