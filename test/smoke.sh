@@ -998,24 +998,38 @@ printf 'keep-me\n' >"$MP/.smoke-sweep-untracked"
 check "sweep --force preserves untracked non-ignored work" \
   "sweep_has 'edited since landing' --force && [[ -d '$MP' ]] \
      && [[ \$(cat '$MP/.smoke-sweep-untracked') == keep-me ]]"
+check "sweep --force retires the edited landed queue row" \
+  "[[ \$(sqlite3 \"$XDG_STATE_HOME/thegn/thegn.db\" \
+     \"SELECT count(*) FROM merge_queue WHERE branch='$MB' AND status='landed'\") -eq 0 ]]"
 rm -- "$MP/.smoke-sweep-untracked"
+# Use a separate landed fixture for the ignored-only case. The first fixture's
+# forced dirty sweep intentionally retired its queue row while keeping its
+# worktree, so it cannot also exercise physical collection and the branch hold.
+MP_IGNORED="$("$SZ" wt new smoke-merge-ignored --repo "$R")"
+MB_IGNORED="$(git -C "$MP_IGNORED" symbolic-ref --short HEAD)"
+echo ignored-only merge change >"$MP_IGNORED/smoke-merge-ignored.txt"
+git -C "$MP_IGNORED" add -f -A && git -C "$MP_IGNORED" commit -q -m "smoke ignored-only merge change"
+check "merge add queues the ignored-only fixture" \
+  "'$SZ' merge add '$MP_IGNORED' | grep -q 'queued'"
+check "merge drain lands the ignored-only fixture" \
+  "'$SZ' merge drain | grep -q 'landed'"
 # Ignored-only build state is discarded, and the report says so, so an operator
-# can see which worktrees lost a warm target/.
-printf '/.smoke-sweep-ignored\n' >>"$(git -C "$MP" rev-parse --git-path info/exclude)"
-printf 'build-output\n' >"$MP/.smoke-sweep-ignored"
+# can see which worktrees lost a warm target.
+printf '/.smoke-sweep-ignored\n' >>"$(git -C "$MP_IGNORED" rev-parse --git-path info/exclude)"
+printf 'build-output\n' >"$MP_IGNORED/.smoke-sweep-ignored"
 check "sweep fixture contains ignored work" \
-  "git -C '$MP' check-ignore -q .smoke-sweep-ignored"
+  "git -C '$MP_IGNORED' check-ignore -q .smoke-sweep-ignored"
 check "sweep --force discards ignored build state and removes the worktree" \
-  "sweep_has 'discarded build state' --force && [[ ! -d '$MP' ]]"
+  "sweep_has 'discarded build state' --force && [[ ! -d '$MP_IGNORED' ]]"
 # Physical collection deliberately retains the branch and an explicit cleanup
 # hold (THE-596); branch deletion cannot atomically prove the ref type yet.
 check "sweep --force retains the merged branch for explicit cleanup" \
-  "[[ -n \$(git -C '$R' branch --list '$MB') ]]"
+  "[[ -n \$(git -C '$R' branch --list '$MB_IGNORED') ]]"
 check "sweep records the retained branch cleanup hold" \
   "[[ \$(sqlite3 \"$XDG_STATE_HOME/thegn/thegn.db\" \
-     \"SELECT count(*) FROM merge_queue WHERE branch='$MB' AND status='landed' AND error_detail='thegn-cleanup-hold:v1:branch-retained'\") -eq 1 ]]"
+     \"SELECT count(*) FROM merge_queue WHERE branch='$MB_IGNORED' AND status='landed' AND error_detail='thegn-cleanup-hold:v1:branch-retained'\") -eq 1 ]]"
 check "explicit queue dismissal clears the collected fixture hold" \
-  "'$SZ' merge rm --worktree '$MP' >/dev/null && [[ \$(sqlite3 \"$XDG_STATE_HOME/thegn/thegn.db\" \"SELECT count(*) FROM merge_queue WHERE branch='$MB'\") -eq 0 ]]"
+  "'$SZ' merge rm --worktree '$MP_IGNORED' >/dev/null && [[ \$(sqlite3 \"$XDG_STATE_HOME/thegn/thegn.db\" \"SELECT count(*) FROM merge_queue WHERE branch='$MB_IGNORED'\") -eq 0 ]]"
 
 # THE-692: the canonical one-shot land path must enter the same landed-row
 # lifecycle as `merge drain`, including the already-landed/UpToDate retry path.

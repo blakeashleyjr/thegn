@@ -1503,15 +1503,28 @@ mod tests {
                     } else if ordinary_dirty {
                         assert_eq!(after, before, "{state}, force={force}");
                     } else {
-                        let retry = merge_sweep::CleanupRetry::from_detail(
-                            after[0].error_detail.as_deref(),
-                        )
-                        .expect("non-force cleanup refusal records retry marker");
-                        assert_eq!(retry.attempts, 1, "{state}, force={force}");
-                        assert!(retry.next_at > util::now(), "{state}, force={force}");
-                        let mut expected = before[0].clone();
-                        expected.error_detail = after[0].error_detail.clone();
-                        assert_eq!(after, [expected], "{state}, force={force}");
+                        if matches!(
+                            report.kept[0].class,
+                            crate::merge_lifecycle::CleanupRefusal::ClaimBusy
+                                | crate::merge_lifecycle::CleanupRefusal::MergeClaimed
+                        ) {
+                            assert_eq!(after, before, "{state}, force={force}");
+                        } else {
+                            let retry = merge_sweep::CleanupRetry::from_detail(
+                                after[0].error_detail.as_deref(),
+                            )
+                            .expect("non-claim cleanup refusal records retry marker");
+                            assert_eq!(retry.attempts, 1, "{state}, force={force}");
+                            assert_eq!(
+                                retry.class_id.as_deref(),
+                                Some(report.kept[0].class.id()),
+                                "{state}, force={force}"
+                            );
+                            assert!(retry.next_at > util::now(), "{state}, force={force}");
+                            let mut expected = before[0].clone();
+                            expected.error_detail = after[0].error_detail.clone();
+                            assert_eq!(after, [expected], "{state}, force={force}");
+                        }
                     }
                     assert!(db.worktree_record(wt.to_str().unwrap()).unwrap().is_some());
                 }
