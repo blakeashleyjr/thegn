@@ -851,6 +851,77 @@ impl Control for GrpcControl {
         }))
     }
 
+    async fn mcp_proxy_status(
+        &self,
+        req: Request<proto::McpProxyStatusRequest>,
+    ) -> Result<Response<proto::McpProxyStatusReply>, Status> {
+        self.authed(&req, Verb::McpProxyStatus)?;
+        let status = self.api.mcp_proxy_status().await.map_err(Status::from)?;
+        let status_json =
+            serde_json::to_string(&status).map_err(|error| Status::internal(error.to_string()))?;
+        Ok(Response::new(proto::McpProxyStatusReply { status_json }))
+    }
+
+    async fn mcp_proxy_reload(
+        &self,
+        req: Request<proto::McpProxyReloadRequest>,
+    ) -> Result<Response<proto::McpProxyReloadReply>, Status> {
+        self.authed(&req, Verb::McpProxyReload)?;
+        let report = self.api.mcp_proxy_reload().await.map_err(Status::from)?;
+        let report_json =
+            serde_json::to_string(&report).map_err(|error| Status::internal(error.to_string()))?;
+        Ok(Response::new(proto::McpProxyReloadReply { report_json }))
+    }
+
+    async fn issues_list(
+        &self,
+        req: Request<proto::IssuesListRequest>,
+    ) -> Result<Response<proto::IssuesListReply>, Status> {
+        self.authed(&req, Verb::IssuesList)?;
+        let request = req.into_inner();
+        let filter = thegn_core::issue::IssueFilter {
+            statuses: request
+                .status
+                .iter()
+                .flat_map(|status| super::http::parse_issue_statuses(status))
+                .collect(),
+            project_id: (!request.project.is_empty()).then_some(request.project),
+            query: (!request.query.is_empty()).then_some(request.query),
+            limit: request.limit as usize,
+            ..Default::default()
+        };
+        let listing = self
+            .api
+            .issues_list(&filter, nonempty(&request.repo))
+            .await
+            .map_err(Status::from)?;
+        let listing_json =
+            serde_json::to_string(&listing).map_err(|error| Status::internal(error.to_string()))?;
+        Ok(Response::new(proto::IssuesListReply { listing_json }))
+    }
+
+    async fn issues_get(
+        &self,
+        req: Request<proto::IssuesGetRequest>,
+    ) -> Result<Response<proto::IssuesGetReply>, Status> {
+        self.authed(&req, Verb::IssuesGet)?;
+        let request = req.into_inner();
+        crate::issue::validate_control_issue_id(&request.id)
+            .map_err(|error| Status::invalid_argument(error.to_string()))?;
+        let detail = self
+            .api
+            .issues_get(
+                &request.id,
+                nonempty(&request.repo),
+                nonempty(&request.account),
+            )
+            .await
+            .map_err(Status::from)?;
+        let detail_json =
+            serde_json::to_string(&detail).map_err(|error| Status::internal(error.to_string()))?;
+        Ok(Response::new(proto::IssuesGetReply { detail_json }))
+    }
+
     async fn notify_push(
         &self,
         req: Request<proto::NotifyPushRequest>,
@@ -991,11 +1062,19 @@ pub const GRPC_CAPS: &[&str] = &[
     "leases.list",
     "me",
     "pr.status",
+    "mcp_proxy.status",
+    "mcp_proxy.reload",
+    "issues.list",
+    "issues.get",
     "notify.push",
     "automations.list",
     "automations.test",
     "tools.run",
 ];
+
+fn nonempty(value: &str) -> Option<&str> {
+    (!value.is_empty()).then_some(value)
+}
 
 #[cfg(test)]
 mod tests {
