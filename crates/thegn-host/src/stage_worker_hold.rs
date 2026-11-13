@@ -230,13 +230,12 @@ mod tests {
                 .args(args)
                 .env("GIT_CONFIG_GLOBAL", "/dev/null")
                 .env("GIT_CONFIG_NOSYSTEM", "1");
-            let output = command.output().unwrap();
-            assert!(
-                output.status.success(),
-                "git {:?} failed: {}",
-                args,
-                String::from_utf8_lossy(&output.stderr)
-            );
+            crate::bounded_git_probe::capture(
+                command,
+                None,
+                "stage-worker-hold linked-worktree fixture",
+            )
+            .unwrap_or_else(|error| panic!("git {args:?} failed: {error}"));
         }
 
         git(&repo, &["init", "-q"]);
