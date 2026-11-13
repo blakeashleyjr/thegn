@@ -56,6 +56,67 @@ pub fn run_argv(shell: &str, cmd: &str) -> Vec<String> {
     }
 }
 
+/// Split a command into an argv only when doing so cannot invoke shell syntax.
+///
+/// Gate commands are normally intentionally shell commands, so this is a
+/// conservative fast path rather than a shell parser. It accepts ASCII
+/// whitespace-separated words, rejects shell operators, quoting, expansion,
+/// globbing, and a leading environment-assignment word, and leaves all other
+/// word contents untouched.
+pub fn direct_argv(command: &str) -> Option<Vec<String>> {
+    if command.contains(['\n', '\r']) {
+        return None;
+    }
+    let argv: Vec<String> = command
+        .split_ascii_whitespace()
+        .map(str::to_owned)
+        .collect();
+    let first = argv.first()?;
+    if first.contains('=') {
+        return None;
+    }
+    const SHELL_WORDS: &[&str] = &[
+        "exit", "cd", ".", "source", "export", "unset", "set", "eval", "exec", "command",
+        "builtin", "alias", "unalias", "trap", "return", "shift", "read", "wait", "ulimit",
+        "umask", "type", "hash", "local", "readonly", "declare", "typeset", "times", "break",
+        "continue", "if", "then", "else", "elif", "fi", "case", "esac", "for", "while", "until",
+        "do", "done", "function", "select", "time", "coproc", "in", "[[", "]]",
+    ];
+    if SHELL_WORDS.contains(&first.as_str()) {
+        return None;
+    }
+    if argv.iter().any(|word| {
+        word.chars().any(|character| {
+            matches!(
+                character,
+                '|' | '&'
+                    | ';'
+                    | '<'
+                    | '>'
+                    | '('
+                    | ')'
+                    | '$'
+                    | '`'
+                    | '\\'
+                    | '\''
+                    | '"'
+                    | '*'
+                    | '?'
+                    | '['
+                    | ']'
+                    | '{'
+                    | '}'
+                    | '!'
+                    | '~'
+                    | '#'
+            )
+        })
+    }) {
+        return None;
+    }
+    Some(argv)
+}
+
 /// Argv that runs `cmd` through a *login* `shell`, `exec`-replacing the shell
 /// with the program where the platform supports it (so signals reach the
 /// program, not the wrapper). On PowerShell/cmd there is no login mode and no
@@ -111,5 +172,35 @@ mod tests {
             ["pwsh.exe", "-NoProfile", "-Command", "yazi"]
         );
         assert_eq!(exec_argv("cmd.exe", "yazi"), ["cmd.exe", "/C", "yazi"]);
+    }
+
+    #[test]
+    fn direct_argv_accepts_plain_words_and_rejects_shell_syntax() {
+        for (command, want) in [
+            ("cargo test", Some(vec!["cargo".into(), "test".into()])),
+            (
+                "  ./gate --format=json\t--quiet  ",
+                Some(vec![
+                    "./gate".into(),
+                    "--format=json".into(),
+                    "--quiet".into(),
+                ]),
+            ),
+            ("echo foo=bar", Some(vec!["echo".into(), "foo=bar".into()])),
+            ("", None),
+            ("   \t", None),
+            ("FOO=bar cargo test", None),
+            ("exit 1", None),
+            ("cd foo", None),
+            ("source env.sh", None),
+            ("echo 'hello'", None),
+            ("echo \"hello\"", None),
+            ("echo hi && exit 1", None),
+            ("echo *.rs", None),
+            ("echo $HOME", None),
+            ("echo hi\nexit 1", None),
+        ] {
+            assert_eq!(direct_argv(command), want, "command {command:?}");
+        }
     }
 }

@@ -1082,11 +1082,15 @@ impl Workspace {
         Ok(())
     }
 
-    fn command_for(&self, command: &str) -> Result<std::process::Command> {
+    fn command_for(&self, command: &str) -> Result<(std::process::Command, bool)> {
         self.verify()?;
-        let argv = thegn_core::sandbox_cpucap::wrap_background_argv(
-            thegn_core::shellinv::run_argv(&thegn_core::util::shell(), command),
-        );
+        let direct = thegn_core::shellinv::direct_argv(command);
+        let inner = direct
+            .clone()
+            .unwrap_or_else(|| thegn_core::shellinv::run_argv(&thegn_core::util::shell(), command));
+        let (argv, wrap) = thegn_core::sandbox_cpucap::wrap_background_argv_reporting(inner);
+        let exec_confirmed =
+            direct.is_some() && wrap != thegn_core::sandbox_cpucap::BackgroundWrap::Wrapped;
         let mut command = std::process::Command::new(&argv[0]);
         command
             .args(&argv[1..])
@@ -1103,22 +1107,21 @@ impl Workspace {
             .env("THEGN_GATE", "1")
             .env("THEGN_WORKTREE", self.checkout.worktree.path())
             .env("THEGN_GATE_OID", &self.oid);
-        Ok(command)
+        Ok((command, exec_confirmed))
     }
 
     fn spawn(
         &self,
         command: &str,
         timeout_secs: u64,
-    ) -> Result<super::super::gate_capture::CaptureResult> {
-        let command = self.command_for(command)?;
-        Ok(super::super::gate_capture::run(
-            command,
-            std::time::Duration::from_secs(timeout_secs),
+    ) -> Result<(super::super::gate_capture::CaptureResult, bool)> {
+        let (command, exec_confirmed) = self.command_for(command)?;
+        Ok((
+            super::super::gate_capture::run(command, std::time::Duration::from_secs(timeout_secs)),
+            exec_confirmed,
         ))
     }
 }
-
 /// Native unique-worktree runner used on platforms where the descriptor-
 /// relative verified state seam is unavailable. It never opens the reused
 /// state root, so unsupported locking cannot turn into shared-worktree use.
@@ -1210,11 +1213,15 @@ impl NativeWorkspace {
         index_matches(&self.worktree, &self.oid)
     }
 
-    fn command_for(&self, command: &str) -> Result<std::process::Command> {
+    fn command_for(&self, command: &str) -> Result<(std::process::Command, bool)> {
         self.verify()?;
-        let argv = thegn_core::sandbox_cpucap::wrap_background_argv(
-            thegn_core::shellinv::run_argv(&thegn_core::util::shell(), command),
-        );
+        let direct = thegn_core::shellinv::direct_argv(command);
+        let inner = direct
+            .clone()
+            .unwrap_or_else(|| thegn_core::shellinv::run_argv(&thegn_core::util::shell(), command));
+        let (argv, wrap) = thegn_core::sandbox_cpucap::wrap_background_argv_reporting(inner);
+        let exec_confirmed =
+            direct.is_some() && wrap != thegn_core::sandbox_cpucap::BackgroundWrap::Wrapped;
         let mut command = std::process::Command::new(&argv[0]);
         command
             .args(&argv[1..])
@@ -1227,21 +1234,20 @@ impl NativeWorkspace {
         for key in util::GIT_ENV_VARS {
             command.env_remove(key);
         }
-        Ok(command)
+        Ok((command, exec_confirmed))
     }
 
     fn spawn(
         &self,
         command: &str,
         timeout_secs: u64,
-    ) -> Result<super::super::gate_capture::CaptureResult> {
-        let command = self.command_for(command)?;
-        Ok(super::super::gate_capture::run(
-            command,
-            std::time::Duration::from_secs(timeout_secs),
+    ) -> Result<(super::super::gate_capture::CaptureResult, bool)> {
+        let (command, exec_confirmed) = self.command_for(command)?;
+        Ok((
+            super::super::gate_capture::run(command, std::time::Duration::from_secs(timeout_secs)),
+            exec_confirmed,
         ))
     }
-
     #[expect(
         clippy::disallowed_methods,
         reason = "cleanup is scoped to the private unique gate parent after Git unregisters it"
@@ -1283,10 +1289,10 @@ fn run_native_isolated(repo: &Path, oid: &str, config: &MergeQueueConfig) -> Res
     let mut poisoned = false;
     let verdict = (|| -> Result<GateVerdict> {
         if !config.gate_setup_command.is_empty() {
-            let output =
+            let (output, exec_confirmed) =
                 workspace.spawn(&config.gate_setup_command, config.gate_setup_timeout_secs)?;
             let setup_passed = matches!(&output, super::super::gate_capture::CaptureResult::Completed { status, .. } if status.success());
-            let (setup_verdict, keep) = capture_verdict(output, true);
+            let (setup_verdict, keep) = capture_verdict(output, true, exec_confirmed);
             poisoned = keep;
             if keep {
                 return Ok(setup_verdict);
@@ -1299,8 +1305,9 @@ fn run_native_isolated(repo: &Path, oid: &str, config: &MergeQueueConfig) -> Res
                 return Ok(setup_verdict);
             }
         }
-        let output = workspace.spawn(&config.gate_command, config.gate_timeout_secs)?;
-        let (verdict, keep) = capture_verdict(output, false);
+        let (output, exec_confirmed) =
+            workspace.spawn(&config.gate_command, config.gate_timeout_secs)?;
+        let (verdict, keep) = capture_verdict(output, false, exec_confirmed);
         poisoned = keep;
         if !keep && let Err(error) = workspace.verify_snapshot() {
             poisoned = true;
@@ -1329,10 +1336,10 @@ pub(super) fn run(repo: &Path, oid: &str, config: &MergeQueueConfig) -> Result<G
     let mut poisoned = false;
     let verdict = (|| -> Result<GateVerdict> {
         if !config.gate_setup_command.is_empty() {
-            let output =
+            let (output, exec_confirmed) =
                 workspace.spawn(&config.gate_setup_command, config.gate_setup_timeout_secs)?;
             let setup_passed = matches!(&output, super::super::gate_capture::CaptureResult::Completed { status, .. } if status.success());
-            let (setup_verdict, keep) = capture_verdict(output, true);
+            let (setup_verdict, keep) = capture_verdict(output, true, exec_confirmed);
             poisoned = keep;
             if keep {
                 if let GateVerdict::Error { reason, .. } = &setup_verdict {
@@ -1349,8 +1356,9 @@ pub(super) fn run(repo: &Path, oid: &str, config: &MergeQueueConfig) -> Result<G
                 return Ok(setup_verdict);
             }
         }
-        let output = workspace.spawn(&config.gate_command, config.gate_timeout_secs)?;
-        let (verdict, keep) = capture_verdict(output, false);
+        let (output, exec_confirmed) =
+            workspace.spawn(&config.gate_command, config.gate_timeout_secs)?;
+        let (verdict, keep) = capture_verdict(output, false, exec_confirmed);
         poisoned = keep;
         if keep {
             if let GateVerdict::Error { reason, .. } = &verdict {
@@ -1376,8 +1384,9 @@ pub(super) fn run(repo: &Path, oid: &str, config: &MergeQueueConfig) -> Result<G
 fn capture_verdict(
     result: super::super::gate_capture::CaptureResult,
     setup: bool,
+    exec_confirmed: bool,
 ) -> (GateVerdict, bool) {
-    let (verdict, keep) = capture_verdict_inner(result, setup);
+    let (verdict, keep) = capture_verdict_inner(result, setup, exec_confirmed);
     (label_host_execution(verdict), keep)
 }
 
@@ -1412,6 +1421,7 @@ fn label_host_execution_log(log: String) -> String {
 fn capture_verdict_inner(
     result: super::super::gate_capture::CaptureResult,
     setup: bool,
+    exec_confirmed: bool,
 ) -> (GateVerdict, bool) {
     use super::super::gate_capture::CaptureResult as Capture;
     match result {
@@ -1433,7 +1443,16 @@ fn capture_verdict_inner(
             (GateVerdict::Passed, false)
         }
         Capture::Completed { status, log } => (
-            match gate::classify_exit(status.code(), false) {
+            match if exec_confirmed {
+                gate::classify_run(
+                    true,
+                    status
+                        .code()
+                        .map_or(gate::RunEnd::Unknown, gate::RunEnd::Exited),
+                )
+            } else {
+                gate::classify_exit(status.code(), false)
+            } {
                 gate::GateClass::Passed => GateVerdict::Passed,
                 gate::GateClass::Failed => GateVerdict::Failed { log },
                 gate::GateClass::Error => GateVerdict::Error {
