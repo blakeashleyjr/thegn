@@ -1850,10 +1850,9 @@ mod tests {
             .rebase_retag(&r.loc(), &c2, &[&c2], TodoAction::Edit, &opts())
             .unwrap();
         assert_eq!(out, RebaseOutcome::Paused);
-        let st = CliGit
-            .rebase_status(&r.loc())
-            .unwrap()
-            .expect("paused status");
+        let RebaseState::Running(st) = CliGit.rebase_status(&r.loc()).unwrap() else {
+            panic!("paused status");
+        };
         let baseline = st.remaining.clone();
 
         // Someone edits the live todo from another terminal mid-pause…
@@ -1910,10 +1909,9 @@ mod tests {
             .rebase_retag(&r.loc(), &c2, &[&c2], TodoAction::Edit, &opts())
             .unwrap();
         assert_eq!(out, RebaseOutcome::Paused);
-        let status = CliGit
-            .rebase_status(&r.loc())
-            .unwrap()
-            .expect("paused status");
+        let RebaseState::Running(status) = CliGit.rebase_status(&r.loc()).unwrap() else {
+            panic!("paused status");
+        };
         let baseline = status.remaining;
         let kept: Vec<TodoEntry> = baseline
             .iter()
