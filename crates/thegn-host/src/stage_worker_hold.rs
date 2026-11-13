@@ -30,6 +30,7 @@ pub(crate) struct StageHoldFacts<'a> {
 
 pub(crate) fn stage_git_common_dir(worktree: &Path) -> Option<PathBuf> {
     let common = thegn_core::util::git_common_dir(worktree);
+    let common = std::fs::canonicalize(&common).unwrap_or(common);
     (!common.starts_with(worktree)).then_some(common)
 }
 
@@ -90,7 +91,7 @@ mod tests {
     use anyhow::Error;
     use thegn_core::sandbox::{Backend, Mount};
 
-    use super::{StageHoldFacts, StageWorkerHold, stage_worker_hold};
+    use super::{StageHoldFacts, StageWorkerHold, stage_git_common_dir, stage_worker_hold};
 
     fn rw(dest: &str, ro: bool) -> Mount {
         Mount {
@@ -214,5 +215,66 @@ mod tests {
         let error = Error::new(StageWorkerHold("x".into()));
         assert!(error.downcast_ref::<StageWorkerHold>().is_some());
         assert_eq!(error.to_string(), "x");
+    }
+
+    #[test]
+    fn stage_git_common_dir_normalizes_a_linked_worktree() {
+        let state = crate::testenv::IsolatedState::new();
+        let repo = state.root().join("repo");
+        let worktree = state.root().join("worktree");
+        std::fs::create_dir(&repo).unwrap();
+
+        fn git(dir: &Path, args: &[&str]) {
+            let mut command = thegn_core::util::git_cmd(dir);
+            command
+                .args(args)
+                .env("GIT_CONFIG_GLOBAL", "/dev/null")
+                .env("GIT_CONFIG_NOSYSTEM", "1");
+            crate::bounded_git_probe::capture(
+                command,
+                None,
+                "stage-worker-hold linked-worktree fixture",
+            )
+            .unwrap_or_else(|error| panic!("git {args:?} failed: {error}"));
+        }
+
+        git(&repo, &["init", "-q"]);
+        std::fs::write(repo.join("seed"), "seed\n").unwrap();
+        git(&repo, &["add", "seed"]);
+        git(
+            &repo,
+            &[
+                "-c",
+                "user.name=stage-worker-test",
+                "-c",
+                "user.email=stage-worker-test@example.invalid",
+                "-c",
+                "commit.gpgsign=false",
+                "commit",
+                "-qm",
+                "base",
+            ],
+        );
+        git(
+            &repo,
+            &[
+                "worktree",
+                "add",
+                "-q",
+                "-b",
+                "worker",
+                worktree.to_str().unwrap(),
+            ],
+        );
+
+        let common = stage_git_common_dir(&worktree).expect("linked worktree has a common dir");
+        assert!(
+            !common
+                .components()
+                .any(|component| matches!(component, std::path::Component::ParentDir)),
+            "common dir retained a parent component: {}",
+            common.display()
+        );
+        assert_eq!(common, std::fs::canonicalize(repo.join(".git")).unwrap());
     }
 }
