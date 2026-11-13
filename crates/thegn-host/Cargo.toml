@@ -140,6 +140,7 @@ toml_edit = "0.25.12"
 unicode-width = "0.2"
 # Match the grapheme boundaries used by the existing termwiz Surface renderer.
 finl_unicode = "1.4"
+unicode-normalization = "0.1"
 sha2 = "0.10"
 tempfile.workspace = true
 same-file.workspace = true
