@@ -3848,3 +3848,7 @@ mod tests {
         assert!(headless_settings_warnings(&cfg).is_empty());
     }
 }
+
+#[cfg(test)]
+#[path = "agent_run_redteam_tests.rs"]
+mod redteam_tests;

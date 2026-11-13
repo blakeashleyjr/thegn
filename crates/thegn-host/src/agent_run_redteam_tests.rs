@@ -2,16 +2,17 @@
 //!
 //! The queue runner removes credential-shaped environment and the credential
 //! directories from a resolved spec before handing it to [`enter_argv`]. Keep
-//! this test at the core launch boundary: it checks the final serialized argv,
-//! environment pairs, and mount plan together, with sentinel data that cannot
-//! be mistaken for an ordinary fixture path.
+//! this test at the host launch boundary: it checks the final serialized argv,
+//! inherited environment, environment pairs, and mount plan together, with
+//! sentinel data that cannot be mistaken for an ordinary fixture path.
 
-use super::*;
-use crate::config::{FileAccess, Network};
-use crate::placement::Placement;
-use crate::sandbox::{Mount, SandboxLimits, SandboxSpec, enter_argv};
+use super::{credential_free_env, credential_free_spec_at};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use thegn_core::config::{FileAccess, Network};
+use thegn_core::placement::Placement;
+use thegn_core::sandbox::{Backend, Mount, SandboxLimits, SandboxSpec, enter_argv};
+use thegn_core::testenv::{EnvGuard, IsolatedState};
 
 const SENTINEL_VALUES: &[(&str, &str)] = &[
     ("SSH_AUTH_SOCK", "redteam-ssh-auth-sock-7f3a"),
@@ -61,14 +62,7 @@ fn redteam_spec(home: &Path, worktree: &Path) -> SandboxSpec {
         placement: Placement::Local,
         image: None,
         worktree: worktree.to_path_buf(),
-        mounts: std::iter::once(Mount {
-            host: home.clone(),
-            dest: home,
-            ro: true,
-            cache: false,
-        })
-        .chain(credential_mounts)
-        .collect(),
+        mounts: credential_mounts.collect(),
         env,
         env_overrides: HashMap::new(),
         env_block: Vec::new(),
@@ -104,35 +98,6 @@ fn redteam_spec(home: &Path, worktree: &Path) -> SandboxSpec {
     }
 }
 
-fn credential_free_spec(mut spec: SandboxSpec, home: &Path) -> SandboxSpec {
-    spec.env.retain(|(key, _)| {
-        !matches!(
-            key.as_str(),
-            "SSH_AUTH_SOCK"
-                | "GH_TOKEN"
-                | "GITHUB_TOKEN"
-                | "ANTHROPIC_API_KEY"
-                | "GNUPGHOME"
-                | "GH_CONFIG_DIR"
-                | "GIT_SSH_COMMAND"
-                | "GPG_TTY"
-                | "GPG_AGENT_INFO"
-        )
-    });
-    let credential_dirs = [
-        home.join(".ssh"),
-        home.join(".gnupg"),
-        home.join(".config/gh"),
-    ];
-    spec.mounts.retain(|mount| {
-        let destination = Path::new(&mount.dest);
-        !credential_dirs
-            .iter()
-            .any(|credential_dir| destination.starts_with(credential_dir))
-    });
-    spec
-}
-
 fn assert_no_sentinel<T>(values: impl IntoIterator<Item = T>, sentinels: &[String], context: &str)
 where
     T: AsRef<str>,
@@ -150,7 +115,7 @@ where
 
 #[test]
 fn autonomous_credential_free_launch_has_no_sentinel_value_path_or_mount() {
-    let state = crate::testenv::IsolatedState::new();
+    let state = IsolatedState::new();
     let home = state.root().to_path_buf();
     let worktree = home.join("worktree");
     std::fs::create_dir_all(&worktree).unwrap();
@@ -158,20 +123,11 @@ fn autonomous_credential_free_launch_has_no_sentinel_value_path_or_mount() {
         std::fs::create_dir_all(file.parent().unwrap()).unwrap();
         std::fs::write(file, b"redteam file sentinel").unwrap();
     }
-    let _env = crate::testenv::EnvGuard::set(SENTINEL_VALUES);
+    let _env = EnvGuard::set(SENTINEL_VALUES);
 
     let interactive = redteam_spec(&home, &worktree);
-    let autonomous = credential_free_spec(interactive.clone(), &home);
-    let argv = enter_argv(&autonomous, "claude").expect("red-team launch argv");
-    let argv = argv.iter().map(String::as_str).collect::<Vec<_>>();
-    let env_pairs = autonomous
-        .env
-        .iter()
-        .flat_map(|(key, value)| [key.as_str(), value.as_str()]);
-    let mounts = autonomous
-        .mounts
-        .iter()
-        .flat_map(|mount| [mount.host.as_str(), mount.dest.as_str()]);
+    let autonomous = credential_free_spec_at(interactive.clone(), Some(&home));
+    let inherited = credential_free_env(std::env::vars());
     let sentinel_strings = SENTINEL_VALUES
         .iter()
         .map(|(_, value)| (*value).to_string())
@@ -183,14 +139,42 @@ fn autonomous_credential_free_launch_has_no_sentinel_value_path_or_mount() {
         )
         .collect::<Vec<_>>();
 
+    assert_no_sentinel(
+        inherited
+            .iter()
+            .flat_map(|(key, value)| [key.as_str(), value.as_str()]),
+        &sentinel_strings,
+        "autonomous inherited environment",
+    );
+    let argv = enter_argv(&autonomous, "claude").expect("red-team launch argv");
+    let argv = argv.iter().map(String::as_str).collect::<Vec<_>>();
+    let env_pairs = autonomous
+        .env
+        .iter()
+        .flat_map(|(key, value)| [key.as_str(), value.as_str()]);
+    let mounts = autonomous
+        .mounts
+        .iter()
+        .flat_map(|mount| [mount.host.as_str(), mount.dest.as_str()]);
+
     assert_no_sentinel(argv, &sentinel_strings, "autonomous argv");
     assert_no_sentinel(env_pairs, &sentinel_strings, "autonomous environment");
     assert_no_sentinel(mounts, &sentinel_strings, "autonomous mount plan");
+    for m in &autonomous.mounts {
+        for f in sentinel_home_files(&home) {
+            assert!(
+                !f.starts_with(&m.dest),
+                "mount {} exposes {}",
+                m.dest,
+                f.display()
+            );
+        }
+    }
 }
 
 #[test]
 fn interactive_launch_keeps_credential_sentinels_as_positive_control() {
-    let state = crate::testenv::IsolatedState::new();
+    let state = IsolatedState::new();
     let home = state.root().to_path_buf();
     let worktree = home.join("worktree");
     std::fs::create_dir_all(&worktree).unwrap();
