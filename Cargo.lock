@@ -8114,6 +8114,7 @@ dependencies = [
  "tonic",
  "tracing",
  "tracing-subscriber",
+ "unicode-normalization",
  "unicode-width 0.2.2",
  "url",
  "windows-sys 0.59.0",
