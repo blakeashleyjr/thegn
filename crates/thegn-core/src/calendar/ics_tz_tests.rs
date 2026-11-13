@@ -351,6 +351,27 @@ fn custom_rules_keep_weekly_recurrence_at_nine_local_across_dst() {
 }
 
 #[test]
+fn mapped_iana_tzid_takes_precedence_over_embedded_vtimezone_rules() {
+    let misleading_definition = "BEGIN:VTIMEZONE\nTZID:Europe/Berlin\nBEGIN:STANDARD\nDTSTART:20250101T000000\nTZOFFSETFROM:+0530\nTZOFFSETTO:+0530\nEND:STANDARD\nEND:VTIMEZONE\n";
+    let input = format!(
+        "BEGIN:VCALENDAR\n{}{}END:VCALENDAR",
+        event("berlin", "TZID=Europe/Berlin:20250115T090000"),
+        misleading_definition
+    );
+    let (events, report) = parse_reported(&input);
+    assert_eq!(events.len(), 1);
+    assert_eq!(
+        start_instant(&events[0]),
+        Utc.with_ymd_and_hms(2025, 1, 15, 8, 0, 0).unwrap()
+    );
+    assert!(
+        !report
+            .diagnostics()
+            .contains(&IcsDiagnostic::UnknownTimeZone)
+    );
+}
+
+#[test]
 fn custom_zone_match_cache_stops_after_128_tzid_year_pairs() {
     let mut input = String::from("BEGIN:VCALENDAR\n");
     for year in 1900..2029 {
