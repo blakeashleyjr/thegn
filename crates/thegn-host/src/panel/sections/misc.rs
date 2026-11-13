@@ -305,7 +305,7 @@ pub(super) fn forward(ctx: &SectionCtx) -> Vec<PanelRow> {
                 g(),
                 "no preview targets — start a dev server or configure [preview]".to_string(),
             )])),
-            hint_row(&[("n", "watch port")]),
+            hint_row(&[("n", "watch port"), ("a", "add")]),
         ];
     }
     if ctx.full() {
@@ -368,6 +368,7 @@ pub(super) fn forward(ctx: &SectionCtx) -> Vec<PanelRow> {
         ("↵", "copy url"),
         ("o", "browser"),
         ("n", "watch port"),
+        ("a", "add"),
         ("x", "remove"),
     ]));
     rows
@@ -639,6 +640,7 @@ fn forward_full(ctx: &SectionCtx) -> Vec<PanelRow> {
         ("↵", "copy url"),
         ("o", "browser"),
         ("n", "watch port"),
+        ("a", "add"),
         ("x", "remove"),
     ]));
     rows
