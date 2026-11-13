@@ -7,6 +7,25 @@ All notable changes to **thegn** are documented here. The format follows
 
 ## [Unreleased]
 
+### Added
+
+- gRPC exposes `issues.update`, `issues.comment`, `dispatches.list`, `dispatches.put` and `dispatches.set_status`; doctor bundles are CLI-only and
+  workspace search is not advertised as a control surface. Secret routes are marked unsafe for remote transports.
+- S3 snapshot uploads use conditional creation (`If-None-Match: *`) by default, so existing snapshots are never overwritten; set
+  `[lifecycle.snapshot] conditional_create = false` for stores that reject conditional writes.
+
+### Changed
+
+- Share endpoint validation covers URL and ticket boundaries, and bore's environment exposure is documented.
+
+### Fixed
+
+- `thegn diff` and other default-branch reads report an error when the default branch cannot be read instead of silently
+  using `HEAD`.
+- A failed account claim removes the empty account home it created.
+- Release uploads refuse `--clobber` once a release is published, and archives reject vendor PAX headers.
+- Theme names are compared after Unicode NFC normalization.
+
 ## [0.1.0-alpha.73] — 2026-11-13
 
 ### Added
