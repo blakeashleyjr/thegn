@@ -7,6 +7,21 @@ All notable changes to **thegn** are documented here. The format follows
 
 ## [Unreleased]
 
+### Added
+
+- The Home Manager module exposes `[sandbox.limits]` `heavy_slots` and `max_load`, plus the enum options `network.mode` and `media.default_action`.
+- `thegn integrate` records integrations in the session roster; an ordered `--order` fold with `--into` that stalls or fails its gate prints a cross-lane fix-up command.
+- The example configuration includes an `integration-fixup` stage recipe.
+- In the Forward panel, `a` adds a port forward for a container port entered by hand.
+
+### Changed
+
+- `just test` runs the whole workspace as one nextest run.
+
+### Fixed
+
+- A pane no longer fails to start when the systemd user session bus is unreachable, such as with a stale `DBUS_SESSION_BUS_ADDRESS`; the hard CPU cap is skipped and a soft priority cap is used when available.
+
 ## [0.1.0-alpha.70] — 2026-11-12
 
 ### Added
