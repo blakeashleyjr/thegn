@@ -580,7 +580,10 @@ fn rebase_status_success_syncs_live_todo_state() {
         ..Default::default()
     });
 
-    assert_eq!(apply_rebase_doc(&mut flow, Ok(Some(status))), None);
+    assert_eq!(
+        apply_rebase_doc(&mut flow, Ok(thegn_svc::git::RebaseState::Running(status))),
+        None
+    );
     let crate::panel::gitui::GitFlow::Rebase(rebase) = flow else {
         panic!("rebase flow changed");
     };
@@ -588,6 +591,35 @@ fn rebase_status_success_syncs_live_todo_state() {
     assert_eq!(rebase.todos, remaining);
     assert_eq!(rebase.baseline, remaining);
     assert_eq!(rebase.stopped_sha.as_deref(), Some("def456"));
+}
+
+#[test]
+fn rebase_status_unknown_keeps_todo_locked_and_unchanged() {
+    let todos = vec![thegn_core::rebase_todo::TodoEntry {
+        action: thegn_core::rebase_todo::TodoAction::Pick,
+        sha: "abc123".into(),
+        subject: "keep this plan".into(),
+    }];
+    let original = todos.clone();
+    let mut flow = crate::panel::gitui::GitFlow::Rebase(crate::panel::gitui::RebaseUi {
+        running: true,
+        todos_synced: true,
+        todos,
+        ..Default::default()
+    });
+
+    let message = apply_rebase_doc(
+        &mut flow,
+        Ok(thegn_svc::git::RebaseState::Unknown(
+            "sequencer unreadable".into(),
+        )),
+    );
+    assert_eq!(message.as_deref(), Some("sequencer unreadable"));
+    let crate::panel::gitui::GitFlow::Rebase(rebase) = flow else {
+        panic!("rebase flow changed");
+    };
+    assert!(!rebase.todos_synced);
+    assert_eq!(rebase.todos, original);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
