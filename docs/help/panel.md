@@ -539,7 +539,8 @@ details, including its SSH/reach target.
 
 **share** and **forward** list the worktree's tunnels and port forwards
 (`↵` copy · `o` browser · share's `x` stops). In **share**, `n` starts a
-share; in **forward**, `n` watches a port and `x` removes a forward — see
+share; in **forward**, `n` watches a port, `a` adds a forward, and `x` removes
+a forward — see
 [[share-and-forward]].
 **media** is the docked now-playing view ([[media]]): `Alt-m` and the media
 badge focus the same System section. Its Normal/Half/Full widths progressively
