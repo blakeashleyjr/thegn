@@ -1071,6 +1071,7 @@ async fn grpc_new_surface_handlers_match_http_scopes_shapes_and_bounds() {
     }
     let read = token(&r, "read");
     let write = token(&r, "write");
+    let none = token(&r, "");
     let git = token(&r, "git");
 
     let agent_request = proto::AgentSessionsRequest {
@@ -1078,7 +1079,7 @@ async fn grpc_new_surface_handlers_match_http_scopes_shapes_and_bounds() {
         harness: "claude".into(),
     };
     assert_eq!(
-        grpc.agent_sessions(request!(&write, agent_request.clone()))
+        grpc.agent_sessions(request!(&none, agent_request.clone()))
             .await
             .unwrap_err()
             .code(),
