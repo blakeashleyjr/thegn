@@ -435,6 +435,11 @@ mod tests {
     #[test]
     fn coverage_text_lists_the_disposition_column() {
         let text = coverage_text(&coverage_report());
+        assert!(text.lines().any(|line| {
+            line.split_whitespace()
+                .take(4)
+                .eq(["http", "secret.set", "unsafe", "-"])
+        }));
         assert!(!text.lines().any(|line| line.contains("doctor.bundle")));
     }
 }
