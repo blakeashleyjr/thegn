@@ -1288,6 +1288,43 @@ class ArchiveLimitBoundaryTests(unittest.TestCase):
     def validate(self, path: Path, platform: str) -> None:
         release._validate_archive_layout(path, platform, self.REQUIRED)
 
+    def test_pax_header_policy_matrix(self) -> None:
+        cases = (
+            ("vendor", {"SCHILY.dev": "1"}, "unsupported PAX header"),
+            ("xattr", {"SCHILY.xattr.user.fixture": "1"}, "unsupported PAX header"),
+            ("sparse", {"GNU.sparse.major": "1"}, "is a sparse file"),
+            (
+                "posix",
+                {"path": "README.md", "uid": "0", "gid": "0", "comment": "fixture"},
+                None,
+            ),
+        )
+        for name, headers, error in cases:
+            with self.subTest(name=name):
+                path = self.temp / f"{name}.tar.gz"
+                with tarfile.open(path, "w:gz", format=tarfile.PAX_FORMAT) as archive:
+                    for member_name, content, mode in self.root_entries():
+                        info = tarfile.TarInfo(member_name)
+                        info.mode = mode
+                        info.size = len(content)
+                        if member_name == "README.md":
+                            info.pax_headers = headers
+                        archive.addfile(info, io.BytesIO(content))
+                if error is None:
+                    self.assertIsNone(self.validate(path, "unix"))
+                else:
+                    with self.assertRaisesRegex(release.ReleaseError, error):
+                        self.validate(path, "unix")
+
+    def test_require_draft_cli_refuses_published_releases_with_exit_2(self) -> None:
+        with contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(0, release.main(["require-draft", "--is-draft", "true"]))
+        stderr = io.StringIO()
+        with contextlib.redirect_stderr(stderr), self.assertRaises(SystemExit) as raised:
+            release.main(["require-draft", "--is-draft", "false"])
+        self.assertEqual(2, raised.exception.code)
+        self.assertIn(release.DRAFT_RELEASE_ERROR, stderr.getvalue())
+
     def test_sparse_tar_member_is_refused(self) -> None:
         sparse_path = self.temp / "sparse.tar.gz"
         sparse_entries = self.root_entries()

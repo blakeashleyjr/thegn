@@ -49,6 +49,24 @@ MAX_PATH_CHARS = 255
 # Release archives compress about 3-4x; gzip's ceiling is about 1032x, so 100
 # refuses decompression bombs with wide headroom.
 MAX_COMPRESSION_RATIO = 100
+POSIX_PAX_HEADERS = frozenset(
+    {
+        "path",
+        "linkpath",
+        "size",
+        "uid",
+        "gid",
+        "uname",
+        "gname",
+        "mtime",
+        "atime",
+        "ctime",
+        "charset",
+        "comment",
+        "hdrcharset",
+    }
+)
+DRAFT_RELEASE_ERROR = "release is already published; refusing to replace assets with --clobber"
 MANAGER_PLACEHOLDERS = {
     "homebrew": {
         "VERSION",
@@ -139,6 +157,11 @@ def require_matching_tag(tag: str, version: str) -> None:
         raise ReleaseError(
             f"release tag {tag!r} does not match workspace version; expected {expected!r}"
         )
+
+
+def require_draft(is_draft: str) -> None:
+    if is_draft != "true":
+        raise ReleaseError(DRAFT_RELEASE_ERROR)
 
 
 def _validate_manifest(manifest: Mapping[str, Any], packaging_dir: Path) -> None:
@@ -498,6 +521,7 @@ def stage_archive(
             with tarfile.open(fileobj=archive_file, mode="r:gz") as archive:
                 seen: set[str] = set()
                 for member in archive:
+                    _validate_tar_member_headers(archive_path, member)
                     name = member.name.removeprefix("./").rstrip("/")
                     if not member.isfile() or name not in required:
                         continue
@@ -841,6 +865,19 @@ def _safe_archive_names(names: Iterable[str], path: Path) -> set[str]:
     return normalized
 
 
+def _validate_tar_member_headers(path: Path, member: tarfile.TarInfo) -> None:
+    if member.issparse() or any(
+        key.startswith("GNU.sparse.") for key in member.pax_headers
+    ):
+        raise ReleaseError(f"archive {path} member {member.name!r} is a sparse file")
+    unsupported = sorted(set(member.pax_headers) - POSIX_PAX_HEADERS)
+    if unsupported:
+        headers = ", ".join(repr(key) for key in unsupported)
+        raise ReleaseError(
+            f"archive {path} member {member.name!r} has unsupported PAX header(s): {headers}"
+        )
+
+
 def _validate_archive_layout(
     path: Path, platform: str, required_files: Sequence[str]
 ) -> None:
@@ -856,6 +893,7 @@ def _validate_archive_layout(
                 unsafe: list[str] = []
                 thegn_executable = True
                 for member in archive:
+                    _validate_tar_member_headers(path, member)
                     count += 1
                     if count > MAX_MEMBERS:
                         raise ReleaseError(
@@ -873,12 +911,6 @@ def _validate_archive_layout(
                     if member.size > MAX_MEMBER_BYTES:
                         raise ReleaseError(
                             f"archive {path} member exceeds {MAX_MEMBER_BYTES} bytes"
-                        )
-                    if member.issparse() or any(
-                        key.startswith("GNU.sparse.") for key in member.pax_headers
-                    ):
-                        raise ReleaseError(
-                            f"archive {path} member {member.name!r} is a sparse file"
                         )
                     if member.isdir() and member.name.rstrip("/") in ("", "."):
                         continue
@@ -1569,6 +1601,9 @@ def load_release_asset_listing(path: Path) -> Any:
 
 
 def _run(args: argparse.Namespace) -> None:
+    if args.command == "require-draft":
+        require_draft(args.is_draft)
+        return
     if args.command == "verify-assets":
         if RELEASE_TAG_RE.fullmatch(args.tag) is None:
             raise ReleaseError(f"invalid release tag {args.tag!r}")
@@ -1685,6 +1720,10 @@ def _run(args: argparse.Namespace) -> None:
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     subparsers = parser.add_subparsers(dest="command", required=True)
+    draft_parser = subparsers.add_parser(
+        "require-draft", help="refuse asset replacement unless the release is a draft"
+    )
+    draft_parser.add_argument("--is-draft", required=True)
     for command in ("validate", "render"):
         subparser = subparsers.add_parser(command)
         subparser.add_argument("--tag", required=True, help="release tag, exactly v<workspace version>")
