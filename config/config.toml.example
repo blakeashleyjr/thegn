@@ -1813,6 +1813,18 @@ command = "git diff"
 #                                #   tip, and a person must have approved that
 #                                #   exact commit, before review is dispatched
 
+# [[pipeline.stages]]
+# name = "integration-fixup"
+# agent = "coder"
+# prompt = """
+# Resolve integration conflicts or regressions across lanes in {worktree}.
+# Read {parent_artifact}; write the fixup summary to {artifact} and commit it.
+# """
+# concurrency = 1
+# timeout_secs = 1800
+# on_blocked = "escalate"
+# requires = []
+
 # Headless transport-error retry (THE-86): when a stage worker launched
 # headless dies with a nonzero exit and its final screen reads as a transport
 # failure (a connection error, a provider outage), the daemon may relaunch it.
