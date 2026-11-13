@@ -394,16 +394,15 @@ pub fn spawn_detector(
                             pulsed = true;
                         }
                     }
-                } else if manual_requests_for_wt {
-                    if tx
+                } else if manual_requests_for_wt
+                    && tx
                         .send(ForwardEvent::Refused {
                             worktree: wt.clone(),
                             reason: format!("manual forward: no container runtime for {container}"),
                         })
                         .is_ok()
-                    {
-                        pulsed = true;
-                    }
+                {
+                    pulsed = true;
                 }
                 if auto_probe.load(std::sync::atomic::Ordering::Relaxed) {
                     let probe = match runtime.as_deref() {
