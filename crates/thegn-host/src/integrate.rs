@@ -2847,7 +2847,7 @@ pub(crate) fn attempt_land(
     branch_name: &str,
     branch_loc: &GitLoc,
 ) -> Result<AttemptOutcome> {
-    attempt_land_admitted(cfg, repo_root, branch_name, branch_loc, None).or_else(|error| {
+    attempt_land_admitted(cfg, repo_root, branch_name, branch_loc, None, None).or_else(|error| {
         Ok(AttemptOutcome::GateError {
             reason: "merge preparation or canonical history unavailable".into(),
             log: tail(&format!("{error:#}"), 4000),
@@ -2866,16 +2866,51 @@ pub(crate) fn attempt_land_pinned(
     branch_loc: &GitLoc,
     expected_tip: &str,
 ) -> Result<AttemptOutcome> {
-    attempt_land_admitted(cfg, repo_root, branch_name, branch_loc, Some(expected_tip)).or_else(
-        |error| {
-            Ok(AttemptOutcome::GateError {
-                reason: "merge preparation or canonical history unavailable".into(),
-                log: tail(&format!("{error:#}"), 4000),
-                phase: GatePhase::Preparation,
-                class: GateErrorClass::Preparation,
-            })
-        },
+    attempt_land_admitted(
+        cfg,
+        repo_root,
+        branch_name,
+        branch_loc,
+        Some(expected_tip),
+        None,
     )
+    .or_else(|error| {
+        Ok(AttemptOutcome::GateError {
+            reason: "merge preparation or canonical history unavailable".into(),
+            log: tail(&format!("{error:#}"), 4000),
+            phase: GatePhase::Preparation,
+            class: GateErrorClass::Preparation,
+        })
+    })
+}
+
+/// Like [`attempt_land_pinned`], but only skips the gate while the target is
+/// still the trusted base and the fold remains a fast-forward of the attested
+/// branch tree.
+pub(crate) fn attempt_land_trusted(
+    cfg: &MergeQueueConfig,
+    repo_root: &Path,
+    branch_name: &str,
+    branch_loc: &GitLoc,
+    expected_tip: &str,
+    trusted_base: &str,
+) -> Result<AttemptOutcome> {
+    attempt_land_admitted(
+        cfg,
+        repo_root,
+        branch_name,
+        branch_loc,
+        Some(expected_tip),
+        Some(trusted_base),
+    )
+    .or_else(|error| {
+        Ok(AttemptOutcome::GateError {
+            reason: "merge preparation or canonical history unavailable".into(),
+            log: tail(&format!("{error:#}"), 4000),
+            phase: GatePhase::Preparation,
+            class: GateErrorClass::Preparation,
+        })
+    })
 }
 
 fn attempt_land_admitted(
@@ -2884,6 +2919,7 @@ fn attempt_land_admitted(
     branch_name: &str,
     branch_loc: &GitLoc,
     expected_tip: Option<&str>,
+    trusted_base: Option<&str>,
 ) -> Result<AttemptOutcome> {
     let (loc, history) = CanonicalHistory::worktree_loc(repo_root)?;
     // A target-store observation is not proof about a remote/provider source.
@@ -3033,7 +3069,21 @@ fn attempt_land_admitted(
             });
         }
         let folded_tip = plan.final_tip.clone();
-        if gate_on {
+        let skip_gate = trusted_base.is_some_and(|trusted| {
+            let folded_tree = util::git_out_allow_empty(
+                repo_root,
+                &["rev-parse", "--verify", &format!("{folded_tip}^{{tree}}")],
+            );
+            let branch_tree = util::git_out_allow_empty(
+                repo_root,
+                &["rev-parse", "--verify", &format!("{branch_tip}^{{tree}}")],
+            );
+            base.eq_ignore_ascii_case(trusted)
+                && folded_tree
+                    .zip(branch_tree)
+                    .is_some_and(|(folded, branch)| folded == branch)
+        });
+        if gate_on && !skip_gate {
             if crate::fold_cancel::requested() {
                 return Ok(AttemptOutcome::GateError {
                     reason: "integration cancelled".into(),
@@ -3070,7 +3120,7 @@ fn attempt_land_admitted(
             return Ok(AttemptOutcome::GateError {
                 reason: "integration cancelled".into(),
                 log: String::new(),
-                phase: if gate_on {
+                phase: if gate_on && !skip_gate {
                     GatePhase::Gate
                 } else {
                     GatePhase::Preparation
@@ -6551,6 +6601,65 @@ mod tests {
             AttemptOutcome::Landed { .. }
         ));
         assert_ne!(repo.out(&["rev-parse", "main"]), before);
+    }
+
+    #[test]
+    fn attempt_land_trusted_lands_without_running_the_gate() {
+        let repo = Repo::new("al-trusted-current");
+        if !repo.history_supported_or_refused() {
+            return;
+        }
+        repo.feature("b1", "a.txt", "a\n");
+        let verified = repo.out(&["rev-parse", "b1"]);
+        let trusted_base = repo.out(&["rev-parse", "main"]);
+        let config = cfg("false");
+        if !repo.gate_supported_or_refused(&config) {
+            return;
+        }
+
+        assert!(matches!(
+            attempt_land_trusted(
+                &config,
+                &repo.dir,
+                "b1",
+                &GitLoc::Local(repo.dir.clone()),
+                &verified,
+                &trusted_base,
+            )
+            .unwrap(),
+            AttemptOutcome::Landed { .. }
+        ));
+    }
+
+    #[test]
+    fn attempt_land_trusted_runs_the_gate_after_the_target_moves() {
+        let repo = Repo::new("al-trusted-moved-base");
+        if !repo.history_supported_or_refused() {
+            return;
+        }
+        repo.feature("b1", "a.txt", "a\n");
+        let verified = repo.out(&["rev-parse", "b1"]);
+        let trusted_base = repo.out(&["rev-parse", "main"]);
+        repo.commit("main.txt", "main\n", "main moved");
+        let before = repo.out(&["rev-parse", "main"]);
+        let config = cfg("false");
+        if !repo.gate_supported_or_refused(&config) {
+            return;
+        }
+
+        assert!(matches!(
+            attempt_land_trusted(
+                &config,
+                &repo.dir,
+                "b1",
+                &GitLoc::Local(repo.dir.clone()),
+                &verified,
+                &trusted_base,
+            )
+            .unwrap(),
+            AttemptOutcome::GateFailed { .. }
+        ));
+        assert_eq!(repo.out(&["rev-parse", "main"]), before);
     }
 
     #[test]
