@@ -11,6 +11,15 @@ use anyhow::{Context, Result, bail};
 use thegn_core::rebase_todo::TodoAction;
 use thegn_core::remote::GitLoc;
 
+fn with_mutation_txn<T>(loc: &GitLoc, args: &[&str], f: impl FnOnce() -> Result<T>) -> Result<T> {
+    let _txn = if !loc.is_remote() && crate::bridge::for_loc(loc).is_none() {
+        super::begin_mutation_txn(loc, args, super::MUTATION_LOCK_WAIT)?
+    } else {
+        None
+    };
+    f()
+}
+
 /// Stop a rebase at `sha` with `edit`, run `at_stop`, then continue.
 fn with_edit_stop(
     loc: &GitLoc,
@@ -19,22 +28,24 @@ fn with_edit_stop(
     opts: &RebaseOpts,
     at_stop: impl FnOnce(&GitLoc) -> Result<()>,
 ) -> Result<RebaseOutcome> {
-    match backend.rebase_retag(loc, sha, &[sha], TodoAction::Edit, opts)? {
-        RebaseOutcome::Paused => {}
-        RebaseOutcome::Conflict => bail!("rebase hit a conflict before reaching the commit"),
-        RebaseOutcome::Done => bail!("rebase did not stop at the commit"),
-    }
-    if let Err(e) = at_stop(loc) {
-        // Leave nothing half-applied: a failed stop action aborts the rebase.
-        return match backend.rebase_abort(loc) {
-            Ok(()) => Err(e),
-            Err(abort) => Err(e.context(format!(
-                "rebase --abort also failed ({abort}); the repository is still mid-rebase at the edit stop: run `git rebase --abort` in {}",
-                loc.path()
-            ))),
-        };
-    }
-    backend.rebase_continue(loc)
+    with_mutation_txn(loc, &["rebase", "-i"], || {
+        match backend.rebase_retag(loc, sha, &[sha], TodoAction::Edit, opts)? {
+            RebaseOutcome::Paused => {}
+            RebaseOutcome::Conflict => bail!("rebase hit a conflict before reaching the commit"),
+            RebaseOutcome::Done => bail!("rebase did not stop at the commit"),
+        }
+        if let Err(e) = at_stop(loc) {
+            // Leave nothing half-applied: a failed stop action aborts the rebase.
+            return match backend.rebase_abort(loc) {
+                Ok(()) => Err(e),
+                Err(abort) => Err(e.context(format!(
+                    "rebase --abort also failed ({abort}); the repository is still mid-rebase at the edit stop: run `git rebase --abort` in {}",
+                    loc.path()
+                ))),
+            };
+        }
+        backend.rebase_continue(loc)
+    })
 }
 
 pub trait PatchOps: GitBackend {
@@ -123,20 +134,22 @@ pub trait PatchOps: GitBackend {
         patch: &str,
         opts: &RebaseOpts,
     ) -> Result<RebaseOutcome> {
-        let outcome = self.remove_patch_from_commit(loc, sha, patch, opts)?;
-        if outcome != RebaseOutcome::Done {
-            return Ok(outcome);
-        }
-        run_stdin(
-            loc,
-            &[],
-            &["apply", "--index", "--3way", "--whitespace=nowarn", "-"],
-            patch.as_bytes(),
-        )
-        .context(
-            "the patch was removed from the commit but could not be re-applied to the index; undo with `z` (reflog) to restore the commit",
-        )?;
-        Ok(RebaseOutcome::Done)
+        with_mutation_txn(loc, &["rebase", "-i", "apply", "--index"], || {
+            let outcome = self.remove_patch_from_commit(loc, sha, patch, opts)?;
+            if outcome != RebaseOutcome::Done {
+                return Ok(outcome);
+            }
+            run_stdin(
+                loc,
+                &[],
+                &["apply", "--index", "--3way", "--whitespace=nowarn", "-"],
+                patch.as_bytes(),
+            )
+            .context(
+                "the patch was removed from the commit but could not be re-applied to the index; undo with `z` (reflog) to restore the commit",
+            )?;
+            Ok(RebaseOutcome::Done)
+        })
     }
 }
 
