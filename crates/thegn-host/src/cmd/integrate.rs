@@ -12,7 +12,7 @@
 
 use crate::integrate::{self, GateOutcome};
 use anyhow::{Context, Result};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use thegn_core::config::Config;
 use thegn_core::db::Db;
 use thegn_core::outln;
@@ -38,6 +38,34 @@ fn gate_error_line(
 
 fn short(oid: &str) -> &str {
     &oid[..oid.len().min(12)]
+}
+
+pub(crate) fn integration_outcome(
+    report: &integrate::FoldReport,
+) -> Option<crate::cmd::session_track::IntegrationOutcome> {
+    if report.advanced || !report.landed.is_empty() {
+        Some(crate::cmd::session_track::IntegrationOutcome::Landed)
+    } else if matches!(
+        &report.gate,
+        GateOutcome::Failed { .. } | GateOutcome::Errored { .. }
+    ) {
+        Some(crate::cmd::session_track::IntegrationOutcome::RefusedGate)
+    } else {
+        None
+    }
+}
+
+fn integration_worktree(cwd: &Path, repo_root: &Path, into: Option<&str>) -> Option<PathBuf> {
+    if let Some(into) = into {
+        let pairs = thegn_core::util::worktree_branches(repo_root)?;
+        return thegn_core::util::checkouts_of_branch(&pairs, into)
+            .into_iter()
+            .next()
+            .map(PathBuf::from)
+            .filter(|path| path.is_dir());
+    }
+    let root = thegn_core::repo::worktree_root_for_cwd(cwd)?;
+    (root != repo_root).then_some(root)
 }
 
 /// Flags for `thegn integrate`.
@@ -360,6 +388,43 @@ pub fn run(cfg: &Config, args: &IntegrateArgs) -> Result<()> {
             short(&report.original)
         );
     }
+    let tracking_worktree = integration_worktree(&cwd, &repo_root, args.into.as_deref());
+    if args.order.is_some()
+        && let Some(into) = args.into.as_deref()
+    {
+        let state = if let Some(deferred) = report.deferred.first() {
+            super::integrate_order::FoldState::Deferred(deferred.branch.clone())
+        } else if matches!(
+            &report.gate,
+            GateOutcome::Failed { .. } | GateOutcome::Errored { .. }
+        ) {
+            super::integrate_order::FoldState::GateFailed
+        } else {
+            super::integrate_order::FoldState::Other
+        };
+        if let Some(hint) =
+            super::integrate_order::fixup_hint(into, tracking_worktree.as_deref(), state)
+        {
+            outln!("{hint}");
+        }
+    }
+    if let Some(outcome) = integration_outcome(&report)
+        && let Some(worktree) = tracking_worktree.as_ref()
+        && let Some(label) = worktree.file_name().and_then(|name| name.to_str())
+    {
+        let tracking = Db::open().and_then(|db| {
+            crate::cmd::session_track::track_integration(
+                &db,
+                worktree.to_string_lossy().as_ref(),
+                label,
+                "integrate",
+                outcome,
+            )
+        });
+        if let Err(error) = tracking {
+            outln!("! integration tracking unavailable: {error}");
+        }
+    }
     // push mode: converge by pushing the advanced target to origin.
     if push_mode && report.advanced {
         match crate::merge_ops::push_target(&repo_root, &target) {
@@ -379,6 +444,72 @@ mod truth_surface_tests {
 
     fn names(values: &[&str]) -> Vec<String> {
         values.iter().map(|value| (*value).into()).collect()
+    }
+
+    fn report(
+        advanced: bool,
+        landed: Vec<integrate::LandedReport>,
+        gate: GateOutcome,
+    ) -> integrate::FoldReport {
+        integrate::FoldReport {
+            target_branch: "main".into(),
+            original: "base".into(),
+            final_tip: "tip".into(),
+            advanced,
+            landed,
+            gated_sources: Vec::new(),
+            prepared: Vec::new(),
+            unprepared: Vec::new(),
+            deferred: Vec::new(),
+            gate,
+            diagnostics: String::new(),
+            bookkeeping_error: None,
+            cas_attempts: 0,
+            resyncs: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn integration_outcome_maps_fold_report_fields_without_running_a_fold() {
+        assert_eq!(
+            integration_outcome(&report(true, Vec::new(), GateOutcome::Passed)),
+            Some(crate::cmd::session_track::IntegrationOutcome::Landed)
+        );
+        assert_eq!(
+            integration_outcome(&report(
+                false,
+                vec![integrate::LandedReport {
+                    branch: "lane-a".into(),
+                    commit: "tip".into(),
+                }],
+                GateOutcome::Passed,
+            )),
+            Some(crate::cmd::session_track::IntegrationOutcome::Landed)
+        );
+        assert_eq!(
+            integration_outcome(&report(
+                false,
+                Vec::new(),
+                GateOutcome::Failed { offender: None },
+            )),
+            Some(crate::cmd::session_track::IntegrationOutcome::RefusedGate)
+        );
+        assert_eq!(
+            integration_outcome(&report(
+                false,
+                Vec::new(),
+                GateOutcome::Errored {
+                    reason: "unavailable".into(),
+                    phase: None,
+                    class: None,
+                },
+            )),
+            Some(crate::cmd::session_track::IntegrationOutcome::RefusedGate)
+        );
+        assert_eq!(
+            integration_outcome(&report(false, Vec::new(), GateOutcome::Skipped)),
+            None
+        );
     }
 
     #[test]
