@@ -34,11 +34,11 @@ use windows::Media::MediaPlaybackAutoRepeatMode;
 
 use crate::MediaWatch;
 
-use crate::model::{LoopMode, MediaKind, MediaState};
+use crate::model::{LoopMode, MediaState};
 use crate::smtc_decode::{
-    BindState, ControlFlags, accepted, lock_unpoisoned, loop_from_repeat, loop_to_repeat,
-    manager_unavailable, playback_state_from_status, register_pair, seek_target, session_caps,
-    session_lookup_error, snapshot_caps, timeline,
+    BindState, ControlFlags, accepted, decode_metadata, lock_unpoisoned, loop_from_repeat,
+    loop_to_repeat, manager_unavailable, playback_state_from_status, register_pair, seek_target,
+    session_caps, session_lookup_error, snapshot_caps, timeline,
 };
 use crate::{MediaBackend, MediaCaps, MediaError, MediaSnapshot};
 
@@ -550,32 +550,27 @@ fn snapshot_with_caps_blocking() -> Result<Option<MediaSnapshot>, MediaError> {
         .map(|h| h.to_string())
         .unwrap_or_default();
 
-    // SMTC exposes a PlaybackType (Music/Video/Image) — map it, falling back to
-    // the player-name heuristic.
-    let kind = match props.PlaybackType().ok().and_then(|r| r.Value().ok()) {
-        Some(t) if t.0 == 3 => MediaKind::Video, // MediaPlaybackType::Video
-        Some(t) if t.0 == 1 => MediaKind::Audio, // MediaPlaybackType::Music
-        _ => MediaKind::from_hints(&player, None, None),
-    };
+    // SMTC's PlaybackType is kept as a raw discriminant until the pure decoder
+    // has clipped the provider-supplied player name.
+    let playback_type = props
+        .PlaybackType()
+        .ok()
+        .and_then(|r| r.Value().ok())
+        .map(|t| t.0);
 
-    let state = MediaState {
-        player,
-        title,
-        artist,
-        album,
+    let state = decode_metadata(
+        &player,
+        &title,
+        &artist,
+        &album,
         state,
         position,
         length,
         shuffle,
         loop_mode,
-        volume: None, // SMTC has no volume
-        can_go_next: caps.can_go_next,
-        can_go_previous: caps.can_go_previous,
-        art_url: None, // thumbnail is a stream, not fetched in v1
-        kind,
-        can_seek: caps.can_seek,
-        track_id: None,
-    };
+        caps,
+        playback_type,
+    );
 
     Ok(Some(MediaSnapshot {
         state,
