@@ -7,6 +7,18 @@ All notable changes to **thegn** are documented here. The format follows
 
 ## [Unreleased]
 
+### Added
+
+- `thegn sandbox ls`, `thegn sandbox ctl` and `thegn sandbox logs` list and control sandbox containers from the CLI.
+- MCP tools `git_status`, `merge_list` and `pr_status` expose Git status, the merge queue and cached pull-request status; gRPC exposes `mcp_proxy.status`, `mcp_proxy.reload`, `issues.list` and `issues.get`.
+
+### Fixed
+
+- Remote worktrees now read file and worktree lists with NUL delimiters, so paths with newlines and other unusual names are handled safely; Changes and stash views show “unavailable” when a Git read fails instead of an empty list.
+- Rebase state is reported as running, not running or unknown instead of guessing when Git state cannot be read.
+- Failed patch application now reports rollback errors, and worktree snapshots restore the index after a failure.
+- Playerctl and SMTC media metadata is clipped to safe field lengths.
+
 ## [0.1.0-alpha.71] — 2026-11-13
 
 ### Added
