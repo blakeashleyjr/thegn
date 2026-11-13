@@ -604,6 +604,7 @@ fn provision_dispatch(
 /// main checkout's worktree mount already covers it.
 fn queue_git_common_dir(worktree: &std::path::Path) -> Option<std::path::PathBuf> {
     let common = thegn_core::util::git_common_dir(worktree);
+    let common = std::fs::canonicalize(&common).unwrap_or(common);
     (!common.starts_with(worktree)).then_some(common)
 }
 
@@ -2422,6 +2423,32 @@ mod tests {
             ro,
             cache: false,
         }
+    }
+
+    #[test]
+    fn queue_git_common_dir_normalizes_a_linked_worktree() {
+        let root = tempfile::tempdir().unwrap();
+        let repo = root.path().join("repo");
+        let worktree = root.path().join("worktree");
+        let gitdir = repo.join(".git/worktrees/worktree");
+        std::fs::create_dir_all(&gitdir).unwrap();
+        std::fs::create_dir(&worktree).unwrap();
+        std::fs::write(
+            worktree.join(".git"),
+            format!("gitdir: {}\n", gitdir.display()),
+        )
+        .unwrap();
+        std::fs::write(gitdir.join("commondir"), "../..\n").unwrap();
+
+        let common = queue_git_common_dir(&worktree).expect("linked worktree has a common dir");
+        assert!(
+            !common
+                .components()
+                .any(|component| matches!(component, std::path::Component::ParentDir)),
+            "common dir retained a parent component: {}",
+            common.display()
+        );
+        assert_eq!(common, std::fs::canonicalize(repo.join(".git")).unwrap());
     }
 
     #[test]
