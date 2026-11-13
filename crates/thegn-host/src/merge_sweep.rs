@@ -380,9 +380,9 @@ fn derive_missing_landed_oid(
 /// Collect every landed worktree whose grace period has elapsed.
 ///
 /// `force` ignores the clock and collects all of them — the manual "clear
-/// merged now" gesture. It does NOT ignore the dirty guard: a worktree you have
-/// gone back to and edited is never removed by a sweep, deliberate or not, since
-/// the gesture means "tidy what I'm done with", never "discard my edits".
+/// merged now" gesture. It does NOT remove a worktree edited after landing.
+/// In that case force retires only the landed queue row, leaving the edited
+/// worktree and branch for the user to manage.
 pub fn sweep(cfg: &Config, repo_root: &Path, force: bool) -> SweepReport {
     let mut report = SweepReport::default();
     if let Some(refusal) = cfg.workspace_overlay_refusal(repo_root) {
@@ -647,6 +647,19 @@ fn sweep_with_db(cfg: &Config, repo_root: &Path, force: bool, db: &Db) -> SweepR
             &row,
             /* delete_branch */ true,
         );
+        if force && matches!(&outcome, &crate::merge_lifecycle::CleanupOutcome::KeptDirty) {
+            match retire_dirty_queue_row(db, &row) {
+                Ok(true) => report.cleared_rows.push(entry.worktree.clone()),
+                Ok(false) => report.bookkeeping_errors.push(format!(
+                    "edited-after-land queue row changed before retirement: {}",
+                    entry.worktree
+                )),
+                Err(error) => report.bookkeeping_errors.push(format!(
+                    "edited-after-land queue row could not be retired for {}: {error}",
+                    entry.worktree
+                )),
+            }
+        }
         if !force
             && let crate::merge_lifecycle::CleanupOutcome::Refused { class, .. } = &outcome
             && !matches!(
@@ -659,6 +672,8 @@ fn sweep_with_db(cfg: &Config, repo_root: &Path, force: bool, db: &Db) -> SweepR
                 merge_sweep::CleanupRetry::from_detail(row.error_detail.as_deref()),
                 util::now(),
             );
+            let mut retry = retry;
+            retry.class_id = Some(class.id().to_owned());
             match db.defer_merge_cleanup(&row, retry) {
                 Ok(true) => {}
                 Ok(false) => report.bookkeeping_errors.push(format!(
@@ -674,6 +689,23 @@ fn sweep_with_db(cfg: &Config, repo_root: &Path, force: bool, db: &Db) -> SweepR
         record_cleanup(&mut report, &entry.branch, &entry.worktree, outcome);
     }
     report
+}
+
+/// Retire only a dirty landed row after a forced sweep. The worktree cache and
+/// physical directory are deliberately untouched; the row snapshot makes a
+/// later queue mutation revoke this operation instead of deleting a new row.
+fn retire_dirty_queue_row(db: &Db, expected: &MergeQueueRow) -> anyhow::Result<bool> {
+    db.transaction(|db| {
+        let current = db
+            .list_merge_queue()?
+            .into_iter()
+            .find(|row| row.worktree == expected.worktree);
+        if current.as_ref() != Some(expected) {
+            return Ok(false);
+        }
+        db.remove_merge_entry_as(&expected.worktree, "thegn sweep")?;
+        Ok(true)
+    })
 }
 
 /// Resolve the sweep root from any path inside the repo and sweep it.
@@ -1315,7 +1347,7 @@ mod tests {
     }
 
     #[test]
-    fn dirty_conflicted_claim_and_wrong_target_rows_keep_retry_metadata() {
+    fn dirty_conflicted_claim_and_wrong_target_rows_keep_safe_state() {
         let isolation = crate::merge_lifecycle::TestIsolation::new();
         let dir = tempfile::tempdir().unwrap();
         let parent = dir.path().canonicalize().unwrap();
@@ -1329,16 +1361,17 @@ mod tests {
         let report = sweep_with_db(&cfg, &root, true, &db);
         assert!(report.collected.is_empty());
         assert_eq!(report.kept_dirty, ["feature"]);
-        assert_eq!(db.list_merge_queue().unwrap(), before);
+        assert!(report.bookkeeping_errors.is_empty());
+        assert!(report.cleared_rows.contains(&before[0].worktree));
+        assert!(db.list_merge_queue().unwrap().is_empty());
         let claim = crate::worktree_lifecycle::try_scoped_destroy_path(&wt).unwrap();
         let report = sweep_with_db(&cfg, &root, true, &db);
-        assert!(report.collected.is_empty());
-        assert_eq!(report.kept.len(), 1);
-        assert_eq!(db.list_merge_queue().unwrap(), before);
+        assert!(report.is_empty());
+        assert!(db.list_merge_queue().unwrap().is_empty());
         drop(claim);
         cfg.merge_queue.target_branch = "other".into();
         assert!(sweep_with_db(&cfg, &root, true, &db).is_empty());
-        assert_eq!(db.list_merge_queue().unwrap(), before);
+        assert!(db.list_merge_queue().unwrap().is_empty());
         assert_eq!(
             std::fs::read_to_string(wt.join("untracked")).unwrap(),
             "private user content"
@@ -1461,7 +1494,11 @@ mod tests {
                     assert!(report.discarded_tool_state.is_empty());
                     assert!(wt.exists(), "{state}, force={force}");
                     let after = db.list_merge_queue().unwrap();
-                    if ordinary_dirty || force {
+                    if ordinary_dirty && force {
+                        assert!(after.is_empty(), "forced dirty row must be retired");
+                        assert_eq!(report.cleared_rows, vec![wt.to_string_lossy().into_owned()]);
+                        assert!(!report.is_incomplete(), "dirty retention is policy");
+                    } else if ordinary_dirty {
                         assert_eq!(after, before, "{state}, force={force}");
                     } else {
                         let retry = merge_sweep::CleanupRetry::from_detail(
@@ -1478,6 +1515,166 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn sweep_hook_veto_is_retryable() {
+        let isolation = crate::merge_lifecycle::TestIsolation::new();
+        let dir = tempfile::tempdir().unwrap();
+        let parent = dir.path().canonicalize().unwrap();
+        let db = Db::open_memory().unwrap();
+        let (root, worktree) = fixture(&parent, "fault-hook", &db, &isolation);
+        let mut cfg = local_config();
+        cfg.merge_queue.on_landed = OnLanded::Expire;
+        cfg.merge_queue.target_branch = "main".into();
+        cfg.merge_queue.merged_ttl_secs = 1;
+        cfg.hooks.pre_destroy = vec![thegn_core::hooks::HookEntry::Spec(
+            thegn_core::hooks::HookEntrySpec {
+                command: "exit 17".into(),
+                wait: Some(true),
+                timeout_secs: Some(2),
+                on_failure: Some(thegn_core::hooks::HookFailure::Block),
+            },
+        )];
+
+        let (removed, message) = crate::worktree_lifecycle::destroy_one_checked(
+            &cfg,
+            &root,
+            &worktree,
+            "feature",
+            "fault-hook",
+            false,
+            false,
+            thegn_core::hooks::HookExecutionMode::User,
+            Some(&db),
+            &|| Ok(()),
+            None,
+            None,
+        );
+        assert!(!removed);
+        assert!(message.contains("hook failed"));
+        assert!(worktree.exists());
+        let row = db.list_merge_queue().unwrap().remove(0);
+        assert_eq!(row.status, "landed");
+
+        cfg.hooks.pre_destroy.clear();
+        let resumed = sweep_with_db(&cfg, &root, true, &db);
+        assert_eq!(resumed.collected, ["feature"]);
+        assert!(!worktree.exists());
+    }
+
+    #[test]
+    fn sweep_git_remove_failure_is_retryable() {
+        let isolation = crate::merge_lifecycle::TestIsolation::new();
+        let dir = tempfile::tempdir().unwrap();
+        let parent = dir.path().canonicalize().unwrap();
+        let db = Db::open_memory().unwrap();
+        let (root, worktree) = fixture(&parent, "fault-remove", &db, &isolation);
+        let lock = thegn_core::util::git_common_dir(&root).join("thegn-git.lock");
+        std::fs::create_dir(&lock).unwrap();
+        let mut cfg = local_config();
+        cfg.merge_queue.on_landed = OnLanded::Expire;
+        cfg.merge_queue.target_branch = "main".into();
+        cfg.merge_queue.merged_ttl_secs = 1;
+
+        let refused = sweep_with_db(&cfg, &root, true, &db);
+        assert_eq!(refused.kept.len(), 1);
+        assert_eq!(
+            refused.kept[0].class,
+            crate::merge_lifecycle::CleanupRefusal::Removal
+        );
+        assert!(worktree.exists());
+        std::fs::remove_dir(&lock).unwrap();
+
+        let resumed = sweep_with_db(&cfg, &root, true, &db);
+        assert_eq!(resumed.collected, ["feature"]);
+        assert!(!worktree.exists());
+    }
+
+    #[test]
+    fn sweep_branch_action_failure_is_retry_safe() {
+        let isolation = crate::merge_lifecycle::TestIsolation::new();
+        let dir = tempfile::tempdir().unwrap();
+        let parent = dir.path().canonicalize().unwrap();
+        let db_path = parent.join("private.db");
+        let db = Db::open_at(&db_path).unwrap();
+        let (root, worktree) = fixture(&parent, "fault-branch", &db, &isolation);
+        rusqlite::Connection::open(&db_path)
+            .unwrap()
+            .execute_batch(
+                "CREATE TRIGGER deny_cleanup_hold BEFORE UPDATE OF error_detail ON merge_queue
+                 WHEN NEW.error_detail = 'thegn-cleanup-hold:v1:branch-retained'
+                 BEGIN SELECT RAISE(ABORT, 'injected branch action failure'); END;",
+            )
+            .unwrap();
+        let mut cfg = local_config();
+        cfg.merge_queue.on_landed = OnLanded::Expire;
+        cfg.merge_queue.target_branch = "main".into();
+        cfg.merge_queue.merged_ttl_secs = 1;
+
+        let failed = sweep_with_db(&cfg, &root, true, &db);
+        assert!(failed.collected.is_empty());
+        assert_eq!(failed.collected_partial.len(), 1);
+        assert!(
+            failed.collected_partial[0]
+                .1
+                .iter()
+                .any(|error| error.contains("injected branch action failure"))
+        );
+        assert!(
+            !worktree.exists(),
+            "physical cleanup completed before branch hold"
+        );
+        assert_eq!(db.list_merge_queue().unwrap().len(), 1);
+
+        let resumed = sweep_with_db(&cfg, &root, true, &db);
+        assert!(resumed.collected.is_empty());
+        assert!(
+            resumed
+                .informational
+                .iter()
+                .any(|(_, note)| note.contains("identity"))
+        );
+        assert_eq!(db.list_merge_queue().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn sweep_database_write_failure_is_retry_safe() {
+        let isolation = crate::merge_lifecycle::TestIsolation::new();
+        let dir = tempfile::tempdir().unwrap();
+        let parent = dir.path().canonicalize().unwrap();
+        let db_path = parent.join("private.db");
+        let db = Db::open_at(&db_path).unwrap();
+        let (root, worktree) = fixture(&parent, "fault-db", &db, &isolation);
+        rusqlite::Connection::open(&db_path)
+            .unwrap()
+            .execute_batch(
+                "CREATE TRIGGER deny_worktree_delete BEFORE DELETE ON worktrees
+                 BEGIN SELECT RAISE(ABORT, 'injected database write failure'); END;",
+            )
+            .unwrap();
+        let mut cfg = local_config();
+        cfg.merge_queue.on_landed = OnLanded::Expire;
+        cfg.merge_queue.target_branch = "main".into();
+        cfg.merge_queue.merged_ttl_secs = 1;
+
+        let failed = sweep_with_db(&cfg, &root, true, &db);
+        assert!(failed.collected.is_empty());
+        assert_eq!(failed.collected_partial.len(), 1);
+        assert!(
+            failed.collected_partial[0]
+                .1
+                .iter()
+                .any(|error| error.contains("injected database write failure"))
+        );
+        assert!(!worktree.exists());
+        assert_eq!(db.list_merge_queue().unwrap().len(), 1);
+
+        let resumed = sweep_with_db(&cfg, &root, true, &db);
+        assert!(resumed.collected.is_empty());
+        assert_eq!(resumed.held_branches, ["feature"]);
+        assert!(resumed.informational.is_empty());
+        assert_eq!(db.list_merge_queue().unwrap().len(), 1);
     }
 
     fn seed_persisted_layout(db: &Db, worktree: &str) {
@@ -2815,6 +3012,7 @@ mod retry_tests {
             merge_sweep::CleanupRetry {
                 attempts: 1,
                 next_at: 0,
+                class_id: None,
             }
             .marker(),
         );
@@ -2842,6 +3040,7 @@ mod retry_tests {
         let marker = merge_sweep::CleanupRetry {
             attempts: 1,
             next_at: util::now().saturating_add(300),
+            class_id: None,
         }
         .marker();
         rusqlite::Connection::open(&fixture.db_path)
