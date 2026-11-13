@@ -608,19 +608,17 @@ fn rebase_status_unknown_keeps_todo_locked_and_unchanged() {
         ..Default::default()
     });
 
-    assert_eq!(
-        apply_rebase_doc(
-            &mut flow,
-            Ok(thegn_svc::git::RebaseState::Unknown(
-                "sequencer unreadable".into()
-            ))
-        ),
-        None
+    let message = apply_rebase_doc(
+        &mut flow,
+        Ok(thegn_svc::git::RebaseState::Unknown(
+            "sequencer unreadable".into(),
+        )),
     );
+    assert_eq!(message.as_deref(), Some("sequencer unreadable"));
     let crate::panel::gitui::GitFlow::Rebase(rebase) = flow else {
         panic!("rebase flow changed");
     };
-    assert!(rebase.todos_synced);
+    assert!(!rebase.todos_synced);
     assert_eq!(rebase.todos, original);
 }
 
