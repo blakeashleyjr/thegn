@@ -15,11 +15,11 @@ pub(crate) fn rename_theme(
     new: &str,
     active: Option<&str>,
 ) -> Result<RenameOutcome, String> {
-    let old_slug = thegn_core::util::slugify(old);
-    let new_slug = thegn_core::util::slugify(new);
+    let old_slug = crate::theme_store::identity_slug(old);
+    let new_slug = crate::theme_store::identity_slug(new);
     if thegn_core::theme::PRESETS
         .iter()
-        .any(|preset| thegn_core::util::slugify(preset) == old_slug)
+        .any(|preset| crate::theme_store::identity_slug(preset) == old_slug)
     {
         return Err(format!(
             "theme `{old}` is a built-in preset and cannot be renamed (nothing was written)"
@@ -29,14 +29,14 @@ pub(crate) fn rename_theme(
     let (themes, _warnings, hashes) = crate::theme_store::scan_dir_hashed(dir, active);
     let Some(found) = themes
         .iter()
-        .find(|theme| thegn_core::util::slugify(&theme.meta.name) == old_slug)
+        .find(|theme| crate::theme_store::identity_slug(&theme.meta.name) == old_slug)
     else {
         return Err(format!(
             "unknown user theme `{old}`; run `thegn theme list` (nothing was written)"
         ));
     };
 
-    if active.map(thegn_core::util::slugify) == Some(old_slug.clone()) {
+    if active.map(crate::theme_store::identity_slug) == Some(old_slug.clone()) {
         return Err(format!(
             "theme `{old}` is the active theme; select another with `thegn theme set <name>` first (nothing was written)"
         ));
