@@ -69,6 +69,14 @@ conflict and print a resume command; `--into` folds leave worktrees in place
 until the eventual land of the stack branch, and `--into` is unavailable in
 push mode.
 
+### Fixing across lanes
+
+For a deferred branch or failed gate in an ordered `--into` fold, configure the
+commented `integration-fixup` recipe under `[[pipeline.stages]]` and use the
+printed hint to open it. It is an ordinary stage that you can run with
+`thegn session open`; `thegn integrate` only prints the handoff and never
+launches an agent automatically.
+
 Only branches you **queued** are folded. `--all`, or `[merge_queue]
 require_enqueue = false`, widens it to every _eligible_ worktree branch —
 which means every clean branch not already on the target, including work
