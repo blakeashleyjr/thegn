@@ -1853,8 +1853,8 @@ pub(crate) fn apply_pr_view_delivery(view: Option<&mut PrView>, data: PrViewData
 
 /// Fetch the worktree's branch-point diff (the `thegn diff` range, incl.
 /// uncommitted work) off the loop and deliver it over `tx`. Single-flight via
-/// `generation`; a failed read delivers an empty diff (the view shows "no
-/// changes" rather than hanging on "loading").
+/// `generation`; a failed read delivers an unavailable notice rather than
+/// guessing at a diff range.
 pub(crate) fn spawn_diff_view_fetch(
     session: Session,
     generation: u64,
@@ -1867,13 +1867,39 @@ pub(crate) fn spawn_diff_view_fetch(
     tokio::task::spawn_blocking(move || {
         let wt = active_tab_path(&session);
         let loc = thegn_core::remote::GitLoc::for_worktree(&wt);
-        let base = crate::cmd::diff::default_branch(&loc);
-        let target = loc
-            .git_out(&["merge-base", &base, "HEAD"])
-            .unwrap_or_else(|| "HEAD".to_string());
-        let raw = loc
-            .git_out(&["diff", "--no-color", &target])
-            .unwrap_or_default();
+        let send_unavailable = |reason: String| {
+            let data = DiffViewData {
+                generation,
+                diff: None,
+                structural: Some(Err(format!("unavailable: {reason}"))),
+                review: None,
+                review_status: None,
+            };
+            if tx.send(data).is_ok() {
+                let _ = waker.wake(); // best-effort: waker pulse: an input nudge must never fail the calling path
+            }
+        };
+        let base = match crate::cmd::diff::default_branch_checked(&loc) {
+            Ok(base) => base,
+            Err(error) => {
+                send_unavailable(error);
+                return;
+            }
+        };
+        let target = match crate::cmd::diff::resolve_target(&loc, &base) {
+            Ok(target) => target,
+            Err(error) => {
+                send_unavailable(error.to_string());
+                return;
+            }
+        };
+        let raw = match loc.git_text(&["diff", "--no-color", &target]) {
+            Ok(raw) => raw,
+            Err(error) => {
+                send_unavailable(format!("git diff failed: {error}"));
+                return;
+            }
+        };
         let diff = thegn_core::forge::model::parse_unified_diff(&raw);
         // Structural render (best-effort): a failure becomes a fallback notice.
         let structural = structural.map(|(difft, opts)| {

@@ -20,13 +20,15 @@ use thegn_core::config_env_tables::SnapshotStoreConfig;
 use thegn_core::secretref::{BareAs, SecretRef};
 use thegn_core::snapshot_meta::{SnapshotKey, SnapshotManifest};
 
-use super::SnapshotStore;
+use super::{SnapshotAlreadyExists, SnapshotStore};
 
 /// Presigned-URL validity. Requests fire immediately after signing; this only
 /// needs to outlive one slow artifact upload.
 const SIGN_TTL: Duration = Duration::from_secs(600);
 const SSE_HEADER: &str = "x-amz-server-side-encryption";
 const SSE_AES256: &str = "AES256";
+const IF_NONE_MATCH_HEADER: &str = "if-none-match";
+const IF_NONE_MATCH_ANY: &str = "*";
 /// Maximum size of one snapshot object, matching the filesystem backend's per-file limit.
 const MAX_SNAPSHOT_OBJECT_BYTES: u64 = 1024 * 1024 * 1024;
 /// One artifact transfer's HTTP budget.
@@ -98,6 +100,7 @@ pub struct S3SnapshotStore {
     creds: Credentials,
     prefix: String,
     sse: bool,
+    conditional_create: bool,
     rt: tokio::runtime::Runtime,
     http: reqwest::Client,
 }
@@ -157,6 +160,7 @@ impl S3SnapshotStore {
             creds: Credentials::new(access, secret),
             prefix: cfg.prefix.trim_matches('/').to_string(),
             sse: cfg.server_side_encryption,
+            conditional_create: cfg.conditional_create,
             rt,
             http,
         })
@@ -186,10 +190,21 @@ impl S3SnapshotStore {
         if self.sse {
             action.headers_mut().insert(SSE_HEADER, SSE_AES256);
         }
+        // The current layout has only generation-scoped artifact and manifest
+        // keys, all immutable. A future mutable pointer such as `latest` must
+        // use a separate request path and must not inherit this precondition.
+        if self.conditional_create {
+            action
+                .headers_mut()
+                .insert(IF_NONE_MATCH_HEADER, IF_NONE_MATCH_ANY);
+        }
         let url = action.sign(SIGN_TTL);
         let mut request = self.http.put(url).body(data.to_vec());
         if self.sse {
             request = request.header(SSE_HEADER, SSE_AES256);
+        }
+        if self.conditional_create {
+            request = request.header(IF_NONE_MATCH_HEADER, IF_NONE_MATCH_ANY);
         }
         request.build().with_context(|| format!("PUT {object}"))
     }
@@ -203,6 +218,11 @@ impl S3SnapshotStore {
                 .await
                 .map_err(reqwest::Error::without_url)
                 .with_context(|| format!("PUT {object}"))?;
+            if response.status() == reqwest::StatusCode::PRECONDITION_FAILED {
+                return Err(anyhow::Error::new(SnapshotAlreadyExists {
+                    object: object.to_string(),
+                }));
+            }
             require_success(response, &format!("PUT {object}"))?;
             Ok(())
         })
@@ -431,6 +451,27 @@ mod tests {
     }
 
     #[test]
+    fn put_signs_and_sends_conditional_create_by_default() {
+        let s = S3SnapshotStore::new(&cfg("https://minio.local:9000"), &resolver).unwrap();
+        let request = s.put_request("thegn/x/bundle", b"data").unwrap();
+
+        assert!(signed_headers(request.url()).is_some_and(|headers| {
+            headers
+                .split(';')
+                .any(|header| header == IF_NONE_MATCH_HEADER)
+        }));
+        assert_eq!(
+            request
+                .headers()
+                .get(IF_NONE_MATCH_HEADER)
+                .unwrap()
+                .to_str()
+                .unwrap(),
+            IF_NONE_MATCH_ANY
+        );
+    }
+
+    #[test]
     fn put_without_sse_when_opted_out() {
         let cfg = SnapshotStoreConfig {
             server_side_encryption: false,
@@ -444,6 +485,41 @@ mod tests {
                 .is_some_and(|headers| { headers.split(';').any(|header| header == SSE_HEADER) })
         );
         assert!(!request.headers().contains_key(SSE_HEADER));
+    }
+
+    #[test]
+    fn put_without_conditional_create_when_opted_out() {
+        let cfg = SnapshotStoreConfig {
+            conditional_create: false,
+            ..cfg("https://minio.local:9000")
+        };
+        let s = S3SnapshotStore::new(&cfg, &resolver).unwrap();
+        let request = s.put_request("thegn/x/bundle", b"data").unwrap();
+
+        assert!(!signed_headers(request.url()).is_some_and(|headers| {
+            headers
+                .split(';')
+                .any(|header| header == IF_NONE_MATCH_HEADER)
+        }));
+        assert!(!request.headers().contains_key(IF_NONE_MATCH_HEADER));
+    }
+
+    #[test]
+    fn precondition_failed_maps_to_snapshot_already_exists() {
+        let (address, server) =
+            response_server("HTTP/1.1 412 Precondition Failed\r\nConnection: close\r\n\r\n".into());
+        let s = S3SnapshotStore::new(&cfg(&format!("http://{address}")), &resolver).unwrap();
+        let error = s
+            .put_bytes("thegn/x/bundle", b"data")
+            .expect_err("412 must be a collision");
+        server.join().unwrap();
+
+        assert_eq!(
+            error.downcast_ref::<SnapshotAlreadyExists>(),
+            Some(&SnapshotAlreadyExists {
+                object: "thegn/x/bundle".into(),
+            })
+        );
     }
 
     #[test]

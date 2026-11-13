@@ -646,8 +646,16 @@ pub fn resolve_base(root: &Path, cfg: &Config) -> String {
     if cfg.base_branch != "auto" {
         return cfg.base_branch.clone();
     }
-    if repo::is_bare(root) {
-        return default_branch(root);
+    match repo::is_bare_checked(root) {
+        Ok(true) => return default_branch(root),
+        Ok(false) => {}
+        Err(error) => {
+            msg::warn(&format!(
+                "could not check repository type in {}; basing new worktree off HEAD: {error}",
+                root.display()
+            ));
+            return "HEAD".to_string();
+        }
     }
     if let Some(head) = util::git_out(root, &["symbolic-ref", "--quiet", "--short", "HEAD"]) {
         return head;
@@ -665,36 +673,11 @@ pub fn resolve_base_checked(root: &Path, cfg: &Config) -> Result<String, String>
     if cfg.base_branch != "auto" {
         return Ok(cfg.base_branch.clone());
     }
-    let cancel = std::sync::atomic::AtomicBool::new(false);
-    let bare = crate::git_run::git_run(
-        root,
-        &["rev-parse", "--is-bare-repository"],
-        &crate::git_run::GitPolicy::read(worktree_git_deadline()),
-        &cancel,
-    );
-    let bare = match bare {
-        outcome if outcome.is_success() => outcome.into_text().map_err(|error| {
-            format!(
-                "could not check repository type in {}: {error}",
-                root.display()
-            )
-        })?,
-        outcome => {
-            return Err(format!(
-                "could not read HEAD in {}: {outcome}",
-                root.display()
-            ));
-        }
-    };
-    if bare.trim() == "true" {
+    let bare = repo::is_bare_checked(root)?;
+    if bare {
         return default_branch_checked(root);
     }
-    if bare.trim() != "false" {
-        return Err(format!(
-            "could not check repository type in {}: unexpected response {bare:?}",
-            root.display()
-        ));
-    }
+    let cancel = std::sync::atomic::AtomicBool::new(false);
 
     match crate::git_run::git_run(
         root,
@@ -1772,7 +1755,7 @@ mod tests {
         let not_repo = scratch.path().join("not-repo");
         std::fs::create_dir(&not_repo).unwrap();
         let result = resolve_base_checked(&not_repo, &cfg);
-        assert!(matches!(result, Err(error) if error.contains("could not read HEAD")));
+        assert!(matches!(result, Err(error) if error.contains("could not check repository type")));
     }
 
     #[test]

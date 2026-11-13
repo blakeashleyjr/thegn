@@ -421,10 +421,15 @@ mod tests {
                 .find(|gap| gap["capability"] == id)
                 .expect("gap present")
         };
-        assert_eq!(gap("doctor.bundle")["disposition"], "local-only");
-        assert!(gap("doctor.bundle")["review"].is_null());
-        assert_eq!(gap("secret.set")["disposition"], "deferred");
-        assert_eq!(gap("secret.set")["review"], "THE-201");
+        assert!(
+            http["gaps"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|gap| gap["capability"] != "doctor.bundle")
+        );
+        assert_eq!(gap("secret.set")["disposition"], "unsafe");
+        assert!(gap("secret.set")["review"].is_null());
     }
 
     #[test]
@@ -433,7 +438,8 @@ mod tests {
         assert!(text.lines().any(|line| {
             line.split_whitespace()
                 .take(4)
-                .eq(["http", "doctor.bundle", "local-only", "-"])
+                .eq(["http", "secret.set", "unsafe", "-"])
         }));
+        assert!(!text.lines().any(|line| line.contains("doctor.bundle")));
     }
 }

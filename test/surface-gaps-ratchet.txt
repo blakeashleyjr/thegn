@@ -26,8 +26,6 @@
 #   http    — the CLI-first operator families (`secret.*`, `project.*`,
 #             `containers.*`, `doctor.bundle`, `launch.preset`) run against
 #             local custody today; a remote-operator route is future work.
-#   cli     — `search.*` runs in-process against the worktree (never through the
-#             control client, which is all `cli_control_caps` measures).
 
 agent.sessions	grpc	not yet mirrored in control.proto
 calendar.ingest	mcp	MCP state tools land in the client-API phase
@@ -39,18 +37,11 @@ containers.list	http	container listing is local CLI-only; HTTP mirror lands in t
 containers.list	mcp	container doors land in the MCP scope-gating phase
 containers.prune	grpc	prune is `thegn sandbox gc/prune` (CLI) this change; a control route lands in the client-API phase
 containers.prune	http	prune is `thegn sandbox gc/prune` (CLI) this change; a control route lands in the client-API phase
-dispatches.list	grpc	not yet mirrored in control.proto
-dispatches.put	grpc	not yet mirrored in control.proto
 dispatches.put	mcp	MCP state tools land in the client-API phase
-dispatches.set_status	grpc	not yet mirrored in control.proto
 dispatches.set_status	mcp	MCP state tools land in the client-API phase
-doctor.bundle	grpc	local CLI operator verb; no control route (bundle reads local files)
-doctor.bundle	http	local CLI operator verb; no control route (bundle reads local files)
 git.commit	mcp	MCP state tools land in the client-API phase
 git.stage	mcp	MCP state tools land in the client-API phase
-issues.comment	grpc	not yet mirrored in control.proto
 issues.comment	mcp	MCP state tools land in the client-API phase
-issues.update	grpc	not yet mirrored in control.proto
 issues.update	mcp	MCP state tools land in the client-API phase
 launch.preset	grpc	not yet mirrored in control.proto
 launch.preset	http	CLI-first (`open --preset` via the intents mailbox); an HTTP route is a follow-up
@@ -90,8 +81,6 @@ project.rm	grpc	control-API route deferred; CLI-only for now
 project.rm	http	control-API route deferred; CLI-only for now
 program.rm	grpc	control-API route deferred; CLI-only for now
 program.rm	http	control-API route deferred; CLI-only for now
-search.query	cli	local worktree-fs verb; runs in-process, not through the control API
-search.replace	cli	local worktree-fs verb; runs in-process, not through the control API
 secret.audit	grpc	control-API route deferred; CLI-only for now
 secret.audit	http	control-API route deferred; CLI-only for now
 secret.list	grpc	control-API route deferred; CLI-only for now

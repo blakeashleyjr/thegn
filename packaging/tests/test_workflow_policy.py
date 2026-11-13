@@ -275,6 +275,95 @@ class WorkflowPolicyTests(unittest.TestCase):
         self.assertIn("gh release upload", job_text)
         self.assertIn("sha256sum", job_text)
 
+    def test_clobber_uploads_require_draft_rehearsal(self) -> None:
+        workflow = read_workflow("release.yml")
+        upload_steps = (
+            ("upload", "Upload verified release assets"),
+            ("upload", "Write and publish release record"),
+            ("package", "Upload packages and rendered metadata"),
+            ("verify-manifest", "Upload release manifest"),
+        )
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            temporary_path = Path(temporary_directory)
+            stub_dir = temporary_path / "bin"
+            stub_dir.mkdir()
+            log_path = temporary_path / "gh.log"
+            (stub_dir / "gh").write_text(
+                "#!/bin/sh\n"
+                'if [ "$1" = release ] && [ "$2" = view ]; then\n'
+                '  printf \'%s\\n\' "$GH_DRAFT"\n'
+                "  exit 0\n"
+                "fi\n"
+                'if [ "$1" = release ] && [ "$2" = upload ]; then\n'
+                '  printf \'upload\\n\' >> "$GH_LOG"\n'
+                "  exit 0\n"
+                "fi\n"
+                "exit 1\n",
+                encoding="utf-8",
+            )
+            (stub_dir / "gh").chmod(0o755)
+            for job_name, step_name in upload_steps:
+                with self.subTest(job=job_name, step=step_name):
+                    step = next(
+                        candidate
+                        for candidate in workflow["jobs"][job_name]["steps"]
+                        if candidate.get("name") == step_name
+                    )
+                    lines = step["run"].splitlines()
+                    guard_index = next(
+                        index
+                        for index, line in enumerate(lines)
+                        if "packaging/release.py require-draft" in line
+                    )
+                    guard = "\n".join(lines[guard_index : guard_index + 2])
+                    upload = next(line for line in lines if "gh release upload" in line)
+                    self.assertLess(guard_index, lines.index(upload))
+                    self.assertIn('gh release view "$TAG" --json isDraft --jq .isDraft', guard)
+                    self.assertIn("--clobber", upload)
+                    harness = "\n".join(
+                        (
+                            "set -euo pipefail",
+                            'release="$PWD/release"',
+                            'manifest="$PWD/manifest.json"',
+                            'PACKAGE_ROOT="$PWD"',
+                            'TAG="v1.2.3"',
+                            guard,
+                            upload,
+                        )
+                    )
+                    for draft, expected_status, expected_uploads in (
+                        ("true", 0, 1),
+                        ("false", 2, 0),
+                    ):
+                        log_path.write_text("", encoding="utf-8")
+                        environment = os.environ.copy()
+                        environment.update(
+                            {
+                                "PATH": f"{stub_dir}{os.pathsep}{environment.get('PATH', '')}",
+                                "GH_DRAFT": draft,
+                                "GH_LOG": str(log_path),
+                            }
+                        )
+                        result = subprocess.run(
+                            ["bash", "-c", harness],
+                            cwd=ROOT,
+                            env=environment,
+                            check=False,
+                            capture_output=True,
+                            text=True,
+                        )
+                        message = (
+                            f"job={job_name} step={step_name} draft={draft} "
+                            f"returncode={result.returncode}\n"
+                            f"stdout={result.stdout}\nstderr={result.stderr}"
+                        )
+                        self.assertEqual(expected_status, result.returncode, message)
+                        self.assertEqual(
+                            expected_uploads,
+                            len(log_path.read_text(encoding="utf-8").splitlines()),
+                            message,
+                        )
+
     def test_release_record_asset(self) -> None:
         job = read_workflow("release.yml")["jobs"]["upload"]
         scripts = "\n".join(step.get("run", "") for step in job.get("steps", []))
