@@ -586,12 +586,14 @@ backend and volume-step keys and the `mpv`/`mpd` tables are not exposed. This
 exposes the existing default-action setting only; it adds no action ids.
 
 The `[limits]` and `[diagnostics]` tables are exposed as `limitsTestCpuQuota`,
-`limitsTestMemMax`, `limitsHeavySlots`, `limitsMaxLoad`,
-`limitsTestMaxParallel`, `limitsTestTimeoutSecs`, `limitsDiscoverTimeoutSecs`,
+`limitsTestMemMax`, `limitsTestMaxParallel`, `limitsTestTimeoutSecs`,
+`limitsDiscoverTimeoutSecs`,
 `limitsIsolatedTargetDir`,
 `diagnosticsCrashReports`, `diagnosticsCrashRetention` and
 `diagnosticsRingSize`. The signed `test_nice` and the reserved `crash_sink`
 are not exposed.
+
+The `[sandbox.limits]` gate-scheduling keys `heavy_slots` and `max_load` are exposed as `limitsHeavySlots` and `limitsMaxLoad`.
 
 The `[disk]` scalar keys are exposed as `diskShowSizes`, `diskWarnThresholdGb`,
 `diskScanIntervalSecs`, `diskMaxScanPerRound`, `diskAutoCleanOnMerge`,
