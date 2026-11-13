@@ -24,12 +24,8 @@ trust on this surface; not planned).
 | dispatches.set_status | grpc    | deferred    | THE-204 | not yet mirrored in control.proto                                                                  |
 | doctor.bundle         | grpc    | local-only  | -       | local CLI operator verb; no control route (bundle reads local files)                               |
 | issues.comment        | grpc    | deferred    | THE-204 | not yet mirrored in control.proto                                                                  |
-| issues.get            | grpc    | deferred    | THE-204 | not yet mirrored in control.proto                                                                  |
-| issues.list           | grpc    | deferred    | THE-204 | not yet mirrored in control.proto                                                                  |
 | issues.update         | grpc    | deferred    | THE-204 | not yet mirrored in control.proto                                                                  |
 | launch.preset         | grpc    | deferred    | THE-204 | not yet mirrored in control.proto                                                                  |
-| mcp_proxy.reload      | grpc    | deferred    | THE-204 | not yet mirrored in control.proto                                                                  |
-| mcp_proxy.status      | grpc    | deferred    | THE-204 | not yet mirrored in control.proto                                                                  |
 | model_proxy.start     | grpc    | deferred    | THE-204 | control-API route deferred; CLI-only for now                                                       |
 | model_proxy.stats     | grpc    | deferred    | THE-204 | control-API route deferred; CLI-only for now                                                       |
 | model_proxy.status    | grpc    | deferred    | THE-204 | control-API route deferred; CLI-only for now                                                       |
@@ -91,7 +87,6 @@ trust on this surface; not planned).
 | dispatches.set_status | mcp     | deferred    | THE-203 | MCP state tools land in the client-API phase                                                       |
 | git.commit            | mcp     | deferred    | THE-203 | MCP state tools land in the client-API phase                                                       |
 | git.stage             | mcp     | deferred    | THE-203 | MCP state tools land in the client-API phase                                                       |
-| git.status            | mcp     | deferred    | THE-203 | MCP state tools land in the client-API phase                                                       |
 | issues.comment        | mcp     | deferred    | THE-203 | MCP state tools land in the client-API phase                                                       |
 | issues.get            | mcp     | deferred    | THE-203 | MCP state tools land in the client-API phase                                                       |
 | issues.list           | mcp     | deferred    | THE-203 | MCP state tools land in the client-API phase                                                       |
@@ -99,9 +94,7 @@ trust on this surface; not planned).
 | launch.preset         | mcp     | deferred    | THE-203 | MCP exec-scoped tools land in the MCP write-tools phase                                            |
 | merge.add             | mcp     | deferred    | THE-203 | MCP state tools land in the client-API phase                                                       |
 | merge.clear           | mcp     | deferred    | THE-203 | MCP state tools land in the client-API phase                                                       |
-| merge.list            | mcp     | deferred    | THE-203 | MCP state tools land in the client-API phase                                                       |
 | notify.push           | mcp     | deferred    | THE-203 | MCP state tools land in the client-API phase                                                       |
-| pr.status             | mcp     | deferred    | THE-203 | MCP state tools land in the client-API phase                                                       |
 | sessions.detach       | mcp     | deferred    | THE-203 | MCP state tools land in the client-API phase                                                       |
 | sessions.resize       | mcp     | deferred    | THE-203 | MCP state tools land in the client-API phase                                                       |
 | sessions.snapshot     | mcp     | deferred    | THE-203 | MCP state tools land in the client-API phase                                                       |

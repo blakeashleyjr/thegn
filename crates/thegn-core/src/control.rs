@@ -392,8 +392,8 @@ pub enum Verb {
     /// Read the mcp-proxy hub's per-upstream state (`thegn mcp status`).
     McpProxyStatus,
     /// Re-read config and reconcile the mcp-proxy hub's upstreams
-    /// (`thegn mcp reload`). Write-scoped: a read-only client must not be able
-    /// to flip which upstream tools an agent can reach.
+    /// (`thegn mcp reload`). Admin-scoped: only an operator may flip which
+    /// upstream tools an agent can reach.
     McpProxyReload,
     /// Read the UI process's per-plugin dispatcher, queue and provider-bridge
     /// counters (`plugins.status`).
@@ -667,7 +667,6 @@ pub fn required_scope(verb: Verb) -> Scope {
         | Verb::OpenEditor
         | Verb::CalendarIngest
         | Verb::NotifyPush
-        | Verb::McpProxyReload
         | Verb::ProjectCreate
         | Verb::ProjectRename
         | Verb::ProjectRemove
@@ -710,6 +709,7 @@ pub fn required_scope(verb: Verb) -> Scope {
         | Verb::SecretMigrate
         | Verb::SecretAudit
         | Verb::SecretSshRotate
+        | Verb::McpProxyReload
         | Verb::MigrateSession
         // Starting/stopping a spend-capable daemon is an admin action; the
         // OPERATOR surfaces + Admin scope keep it off any tool-calling door.
@@ -1178,6 +1178,7 @@ mod tests {
             SecretMigrate,
             SecretAudit,
             SecretSshRotate,
+            McpProxyReload,
             ContainersPrune,
             // Model-proxy lifecycle (THE-58) — start/stop a spend-capable daemon.
             ModelProxyStart,
