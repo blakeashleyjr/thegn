@@ -30,8 +30,6 @@
 #             control client, which is all `cli_control_caps` measures).
 
 agent.sessions	grpc	not yet mirrored in control.proto
-calendar.clocks	mcp	MCP state tools land in the client-API phase
-calendar.events	mcp	MCP state tools land in the client-API phase
 calendar.ingest	mcp	MCP state tools land in the client-API phase
 containers.control	grpc	container lifecycle and logs are local CLI-only; gRPC mirror lands in the client-API phase
 containers.control	http	container lifecycle and logs are local CLI-only; HTTP mirror lands in the client-API phase
@@ -42,7 +40,6 @@ containers.list	mcp	container doors land in the MCP scope-gating phase
 containers.prune	grpc	prune is `thegn sandbox gc/prune` (CLI) this change; a control route lands in the client-API phase
 containers.prune	http	prune is `thegn sandbox gc/prune` (CLI) this change; a control route lands in the client-API phase
 dispatches.list	grpc	not yet mirrored in control.proto
-dispatches.list	mcp	MCP state tools land in the client-API phase
 dispatches.put	grpc	not yet mirrored in control.proto
 dispatches.put	mcp	MCP state tools land in the client-API phase
 dispatches.set_status	grpc	not yet mirrored in control.proto
@@ -53,8 +50,6 @@ git.commit	mcp	MCP state tools land in the client-API phase
 git.stage	mcp	MCP state tools land in the client-API phase
 issues.comment	grpc	not yet mirrored in control.proto
 issues.comment	mcp	MCP state tools land in the client-API phase
-issues.get	mcp	MCP state tools land in the client-API phase
-issues.list	mcp	MCP state tools land in the client-API phase
 issues.update	grpc	not yet mirrored in control.proto
 issues.update	mcp	MCP state tools land in the client-API phase
 launch.preset	grpc	not yet mirrored in control.proto
