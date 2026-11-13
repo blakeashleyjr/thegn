@@ -48,9 +48,11 @@ pub(crate) struct StageHead {
     /// The `[[agents]]`/`[[tools]]` entry configured to run the stage. Empty
     /// for a stage that exists only on the roster.
     pub agent: String,
-    /// Rows of this stage that are still live ([`is_active`]).
+    /// Rows of this stage that still occupy a worker slot
+    /// ([`holds_slot`]). Parked rows remain visible but do not consume the
+    /// stage's displayed load.
     ///
-    /// [`is_active`]: thegn_core::issue::AgentDispatchStatus::is_active
+    /// [`holds_slot`]: thegn_core::issue::AgentDispatchStatus::holds_slot
     pub live: usize,
     /// EVERY row of this stage, counted before hide-finished drops any — a
     /// header that under-reported while rows were hidden would be a lie.
@@ -266,7 +268,7 @@ pub(crate) fn board(
         };
         let head = &mut columns[ci].head;
         head.total += 1;
-        if r.status.is_active() {
+        if r.status.holds_slot() {
             head.live += 1;
         }
         if hide_finished && r.status.is_terminal() {
@@ -737,6 +739,23 @@ mod tests {
             (2, 1),
             "the header still reports the truth about the stage"
         );
+    }
+
+    #[test]
+    fn parked_rows_are_visible_but_do_not_count_as_stage_load() {
+        let stages = [stage("code", None)];
+        let mut parked = d(1, Some("code"), None, 0);
+        parked.status = AgentDispatchStatus::WaitingHuman;
+        let b = board(
+            &fold(&[parked], &stages, 0),
+            &config(&stages),
+            200,
+            0,
+            false,
+        );
+        assert_eq!(b.columns[0].rows.len(), 1);
+        assert_eq!(b.columns[0].head.live, 0);
+        assert_eq!(b.columns[0].head.total, 1);
     }
 
     #[test]

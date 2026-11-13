@@ -48,8 +48,8 @@ const ACTIVE_STATUSES: [AgentDispatchStatus; 5] = [
 pub enum Action {
     /// List the dispatch roster (newest first).
     List {
-        /// Only rows that occupy a slot (queued / spawning / running /
-        /// waiting_human / pr_open) — what a supervisor resumes from.
+        /// Only active rows (queued / spawning / running / waiting_human /
+        /// pr_open), including parked rows protected from redispatch.
         #[arg(long)]
         active: bool,
         /// Rows per history page (newest first; default 2048, at most 4096).
@@ -1616,13 +1616,17 @@ fn list(active: bool, page: HistoryPage, json: bool) -> Result<()> {
     for d in &rows {
         // A row whose worker exited but which nobody closed prints its status
         // with the exit made explicit — `running!exited` rather than a bare
-        // `running` that reads identically to a live worker.
+        // `running` that reads identically to a live worker. Parked rows keep
+        // their ordinary status: they are active for redispatch protection,
+        // but no longer represent a live worker or a stale exit.
         let status_cell = match pipeline_run::row_liveness(d, now_ms) {
             pipeline_run::RowLiveness::ExitedUnverified { .. } => {
                 stale += 1;
                 format!("{}!exited", d.status.as_str())
             }
-            _ => d.status.as_str().to_string(),
+            pipeline_run::RowLiveness::Live
+            | pipeline_run::RowLiveness::Parked
+            | pipeline_run::RowLiveness::Closed => d.status.as_str().to_string(),
         };
         let status_cell = status_with_override(status_cell, overrides.get(&d.id));
         // What the worker CONCLUDED, which is a different axis from what

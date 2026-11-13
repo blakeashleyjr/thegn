@@ -617,17 +617,21 @@ pub enum RowLiveness {
         /// Milliseconds since the exit was stamped, when known.
         since_ms: Option<i64>,
     },
+    /// The row is waiting on a human or an open pull request. It remains
+    /// active for duplicate/redispatch protection, but frees its worker slot.
+    Parked,
     /// Reached a terminal status — done / failed / abandoned / merged.
     Closed,
 }
 
 impl RowLiveness {
     /// Whether this row still needs a supervisor decision before its slot is
-    /// genuinely free. True for both [`Self::Live`] and
+    /// genuinely free. True for [`Self::Live`] and
     /// [`Self::ExitedUnverified`] — the point being that an exited row does
-    /// **not** free a slot merely by having exited.
+    /// **not** free a slot merely by having exited. Parked rows are active for
+    /// duplicate protection, but their worker slot is free.
     pub fn occupies_slot(self) -> bool {
-        !matches!(self, Self::Closed)
+        matches!(self, Self::Live | Self::ExitedUnverified { .. })
     }
 
     /// A short operator-facing token for the CLI table.
@@ -635,6 +639,7 @@ impl RowLiveness {
         match self {
             Self::Live => "live",
             Self::ExitedUnverified { .. } => "exited-unverified",
+            Self::Parked => "parked",
             Self::Closed => "closed",
         }
     }
@@ -648,6 +653,9 @@ impl RowLiveness {
 pub fn row_liveness(row: &crate::issue::AgentDispatch, now_ms: i64) -> RowLiveness {
     if !row.status.is_active() {
         return RowLiveness::Closed;
+    }
+    if !row.status.holds_slot() {
+        return RowLiveness::Parked;
     }
     // An exit stamp is the only positive evidence that the worker is gone. Its
     // ABSENCE means "unknown", never "exited" — a row from before v63, or one
@@ -1505,6 +1513,36 @@ mod tests {
     }
 
     #[test]
+    fn liveness_predicates_cross_every_status_and_exit_stamp() {
+        let statuses = [
+            (S::Queued, true, true, true),
+            (S::Spawning, true, true, false),
+            (S::Running, true, true, false),
+            (S::WaitingHuman, true, false, false),
+            (S::PrOpen, true, false, false),
+            (S::Merged, false, false, true),
+            (S::Abandoned, false, false, true),
+            (S::Done, false, false, true),
+            (S::Failed, false, false, true),
+            (S::Unknown, false, false, false),
+        ];
+        for (status, active, holds_slot, terminal) in statuses {
+            for stamped in [false, true] {
+                let mut row = row(1, "linear:A-1", Some("code"), status, Some("s1"));
+                if stamped {
+                    row.exit_code = Some(0);
+                    row.exited_at_ms = Some(500);
+                }
+                let liveness = row_liveness(&row, 1_500);
+                assert_eq!(status.is_active(), active, "active: {status:?}");
+                assert_eq!(status.holds_slot(), holds_slot, "slot: {status:?}");
+                assert_eq!(status.is_terminal(), terminal, "terminal: {status:?}");
+                assert_eq!(liveness.occupies_slot(), holds_slot, "liveness: {status:?}");
+            }
+        }
+    }
+
+    #[test]
     fn a_terminal_row_is_closed_whatever_its_exit_says() {
         for st in [S::Done, S::Failed, S::Abandoned] {
             let mut r = row(1, "linear:A-1", Some("code"), st, Some("s1"));
@@ -1665,6 +1703,7 @@ mod tests {
             .token(),
             "exited-unverified"
         );
+        assert_eq!(RowLiveness::Parked.token(), "parked");
         assert_eq!(RowLiveness::Closed.token(), "closed");
     }
 
