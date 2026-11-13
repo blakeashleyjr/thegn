@@ -362,8 +362,6 @@ self: {
     watch.pr_interval_secs = cfg.watchPrIntervalSecs;
     limits.test_cpu_quota = cfg.limitsTestCpuQuota;
     limits.test_mem_max = cfg.limitsTestMemMax;
-    limits.heavy_slots = cfg.limitsHeavySlots;
-    limits.max_load = cfg.limitsMaxLoad;
     limits.test_max_parallel = cfg.limitsTestMaxParallel;
     limits.test_timeout_secs = cfg.limitsTestTimeoutSecs;
     limits.discover_timeout_secs = cfg.limitsDiscoverTimeoutSecs;
@@ -417,6 +415,10 @@ self: {
       env_passthrough = cfg.sandbox.envPassthrough;
       init_script = cfg.sandbox.initScript;
       on_missing = cfg.sandbox.onMissing;
+      limits = {
+        heavy_slots = cfg.limitsHeavySlots;
+        max_load = cfg.limitsMaxLoad;
+      };
       remote = {
         inherit (cfg.sandbox.remote) host port transport mode;
         remote_dir = cfg.sandbox.remote.remoteDir;

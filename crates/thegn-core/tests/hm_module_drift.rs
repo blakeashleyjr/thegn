@@ -1240,6 +1240,8 @@ fn hm_limits_and_diagnostics_keys_are_rendered_and_rest_dispositioned() {
         "limits.test_timeout_secs",
         "limits.discover_timeout_secs",
         "limits.isolated_target_dir",
+        "sandbox.limits.heavy_slots",
+        "sandbox.limits.max_load",
         "diagnostics.crash_reports",
         "diagnostics.crash_retention",
         "diagnostics.ring_size",
