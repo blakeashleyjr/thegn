@@ -49,6 +49,12 @@ service Control {
   rpc Me(MeRequest) returns (MeReply);
   // Cached PR status, one row per worktree with a pr_cache entry.
   rpc PrStatus(PrStatusRequest) returns (PrStatusReply);
+  // MCP proxy hub state and config reconciliation.
+  rpc McpProxyStatus(McpProxyStatusRequest) returns (McpProxyStatusReply);
+  rpc McpProxyReload(McpProxyReloadRequest) returns (McpProxyReloadReply);
+  // Tracker issue listing and detail, carried as the control API's JSON wire.
+  rpc IssuesList(IssuesListRequest) returns (IssuesListReply);
+  rpc IssuesGet(IssuesGetRequest) returns (IssuesGetReply);
   // Push a notification into the tray; returns the stored row id.
   rpc NotifyPush(NotifyPushRequest) returns (NotifyPushReply);
   rpc AutomationsList(AutomationsListRequest) returns (AutomationsListReply);
@@ -265,6 +271,26 @@ message PrStatusRow {
   bool is_draft = 7;
   int64 fetched_at = 8;      // unix seconds the cache row was fetched at
 }
+
+message McpProxyStatusRequest {}
+message McpProxyStatusReply { string status_json = 1; }
+message McpProxyReloadRequest {}
+message McpProxyReloadReply { string report_json = 1; }
+
+message IssuesListRequest {
+  repeated string status = 1; // snake_case status ids; empty means all
+  uint32 limit = 2;            // 0 means provider/default limit
+  string project = 3;
+  string query = 4;
+  string repo = 5;             // daemon-host filesystem path, empty = none
+}
+message IssuesListReply { string listing_json = 1; }
+message IssuesGetRequest {
+  string id = 1;
+  string repo = 2;             // daemon-host filesystem path, empty = none
+  string account = 3;          // configured tracker account, empty = none
+}
+message IssuesGetReply { string detail_json = 1; }
 
 message NotifyPushRequest {
   string title = 1;

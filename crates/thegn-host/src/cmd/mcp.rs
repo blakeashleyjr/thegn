@@ -11,7 +11,7 @@
 //! it exposes the in-app help corpus, the generated keybindings/config-reference
 //! pages, and the user's current secret-redacted config so a coding agent can
 //! learn how thegn works — plus, gated by `--scopes`, live *state* tools
-//! (`sessions_list`, `worktrees_list`, `worktrees_sandbox_profile`, `leases_list`, `me`) answered by the
+//! (`sessions_list`, `worktrees_list`, `worktrees_sandbox_profile`, `git_status`, `merge_list`, `pr_status`, `leases_list`, `me`) answered by the
 //! pane daemon over the control client, and daemon-free semantic read tools
 //! (`semantic_map`, `semantic_blast_radius`) answered from the state DB + git.
 //! The JSON-RPC handling is the pure
@@ -119,7 +119,8 @@ pub enum Action {
         /// profile overlay — defaulting to `read` when nothing is configured;
         /// when given, it intersects that ceiling (clamp-only, never widening).
         /// The default `read` enables only the listing/observing tools
-        /// (`sessions_list`, `worktrees_list`, `worktrees_sandbox_profile`, `leases_list`, `me`,
+        /// (`sessions_list`, `worktrees_list`, `worktrees_sandbox_profile`, `git_status`,
+        /// `merge_list`, `pr_status`, `leases_list`, `me`,
         /// `agent_sessions`, `sessions_wait`, `semantic_map`,
         /// `semantic_blast_radius`); the mutating tools (`sessions_open`,
         /// `sessions_input`, `sessions_kill`) additionally need `write`, and `folders_assign` needs `git`. Pass
@@ -523,6 +524,26 @@ async fn fetch_state(
             };
             let reply = c.preview_fetch(&request).await.map_err(|e| e.to_string())?;
             serde_json::to_value(reply).map_err(|e| e.to_string())
+        }
+        "git.status" | "merge.list" => {
+            let c = client.map_err(|_| NO_DAEMON.to_string())?;
+            let worktree = str_arg(args, "worktree")
+                .map(std::path::PathBuf::from)
+                .unwrap_or_else(|| super::resolve_worktree(None));
+            let mut params = serde_json::Map::new();
+            params.insert(
+                "worktree".into(),
+                json!(worktree.to_string_lossy().to_string()),
+            );
+            let (method, path, body) = thegn_svc::control::routes::build_call(cap, params)?;
+            c.call_raw(method, &path, body)
+                .await
+                .map_err(|e| e.to_string())
+        }
+        "pr.status" => {
+            let c = client.map_err(|_| NO_DAEMON.to_string())?;
+            let rows = c.pr_status().await.map_err(|e| e.to_string())?;
+            Ok(json!({ "prs": rows }))
         }
         "leases.list" => {
             let c = client.map_err(|_| NO_DAEMON.to_string())?;
@@ -981,8 +1002,11 @@ mod tests {
         "worktrees.list",
         "worktrees.sandbox_profile",
         "preview.fetch",
+        "git.status",
+        "merge.list",
         "leases.list",
         "me",
+        "pr.status",
         "ci.runs",
         "ci.logs",
         "agent.sessions",

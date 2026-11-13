@@ -360,6 +360,25 @@ impl ControlApi for FakeApi {
             }])
         })
     }
+    fn mcp_proxy_status(&self) -> BoxFuture<'_, ControlResult<super::McpProxyStatus>> {
+        self.record("mcp_proxy_status");
+        Box::pin(async {
+            Ok(super::McpProxyStatus {
+                enabled: true,
+                daemon_owned: true,
+                upstreams: Vec::new(),
+            })
+        })
+    }
+    fn mcp_proxy_reload(&self) -> BoxFuture<'_, ControlResult<super::McpProxyReloadReport>> {
+        self.record("mcp_proxy_reload");
+        Box::pin(async {
+            Ok(super::McpProxyReloadReport {
+                actions: Vec::new(),
+                tools_changed: false,
+            })
+        })
+    }
     fn notify_push(&self, _note: super::PushedNote) -> BoxFuture<'_, ControlResult<i64>> {
         self.record("notify_push");
         Box::pin(async { Ok(7) })
@@ -939,6 +958,107 @@ async fn grpc_folder_assignment_requires_git_scope() {
         .await
         .unwrap();
     assert_eq!(r.api.calls(), ["folder_assign:/w:None"]);
+}
+
+#[cfg(feature = "control-grpc")]
+#[tokio::test]
+async fn grpc_mcp_proxy_reload_requires_admin_before_calling_api() {
+    use super::grpc::{GrpcControl, proto};
+    use proto::control_server::Control;
+    use thegn_core::store::ControlStore;
+
+    let r = rig(false);
+    let grpc = GrpcControl {
+        api: r.api.clone(),
+        store: r.db.clone() as Arc<Mutex<dyn ControlStore + Send>>,
+        local_admin: false,
+        daemon_euid: None,
+        server_label: "test thegn".into(),
+    };
+    for scope in ["read", "write", "git"] {
+        let bearer = token(&r, scope);
+        let mut request = tonic::Request::new(proto::McpProxyReloadRequest {});
+        request
+            .metadata_mut()
+            .insert("authorization", format!("Bearer {bearer}").parse().unwrap());
+        let error = grpc.mcp_proxy_reload(request).await.unwrap_err();
+        assert_eq!(error.code(), tonic::Code::PermissionDenied, "{scope}");
+    }
+    assert!(r.api.calls().is_empty(), "denial must not reach the API");
+
+    let read = token(&r, "read");
+    let mut status_request = tonic::Request::new(proto::McpProxyStatusRequest {});
+    status_request
+        .metadata_mut()
+        .insert("authorization", format!("Bearer {read}").parse().unwrap());
+    let status = grpc.mcp_proxy_status(status_request).await.unwrap();
+    let status_json: serde_json::Value =
+        serde_json::from_str(&status.into_inner().status_json).unwrap();
+    assert_eq!(status_json["enabled"], true);
+
+    let admin = token(&r, "admin");
+    let mut reload_request = tonic::Request::new(proto::McpProxyReloadRequest {});
+    reload_request
+        .metadata_mut()
+        .insert("authorization", format!("Bearer {admin}").parse().unwrap());
+    let report = grpc.mcp_proxy_reload(reload_request).await.unwrap();
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(&report.into_inner().report_json).unwrap()["tools_changed"],
+        false
+    );
+    assert_eq!(r.api.calls(), ["mcp_proxy_status", "mcp_proxy_reload"]);
+}
+
+#[cfg(feature = "control-grpc")]
+#[tokio::test]
+async fn grpc_issue_handlers_authenticate_and_forward_context() {
+    use super::grpc::{GrpcControl, proto};
+    use proto::control_server::Control;
+    use thegn_core::store::ControlStore;
+
+    let r = rig(false);
+    let grpc = GrpcControl {
+        api: r.api.clone(),
+        store: r.db.clone() as Arc<Mutex<dyn ControlStore + Send>>,
+        local_admin: false,
+        daemon_euid: None,
+        server_label: "test thegn".into(),
+    };
+    let bearer = token(&r, "read");
+    let mut list_request = tonic::Request::new(proto::IssuesListRequest {
+        status: vec!["todo".into()],
+        limit: 3,
+        project: "project-1".into(),
+        query: "needle".into(),
+        repo: "/tmp/repo".into(),
+    });
+    list_request
+        .metadata_mut()
+        .insert("authorization", format!("Bearer {bearer}").parse().unwrap());
+    assert_eq!(
+        grpc.issues_list(list_request).await.unwrap_err().code(),
+        tonic::Code::Unimplemented
+    );
+
+    let mut get_request = tonic::Request::new(proto::IssuesGetRequest {
+        id: "linear:ABC-1".into(),
+        repo: "/tmp/repo".into(),
+        account: "work".into(),
+    });
+    get_request
+        .metadata_mut()
+        .insert("authorization", format!("Bearer {bearer}").parse().unwrap());
+    assert_eq!(
+        grpc.issues_get(get_request).await.unwrap_err().code(),
+        tonic::Code::Unimplemented
+    );
+    assert_eq!(
+        r.api.calls(),
+        [
+            "issues_list:repo=/tmp/repo",
+            "issues_get:linear:ABC-1:repo=/tmp/repo:account=work"
+        ]
+    );
 }
 
 #[tokio::test]
