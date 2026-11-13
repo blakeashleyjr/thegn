@@ -1358,19 +1358,21 @@ mod tests {
         cfg.merge_queue.target_branch = "main".into();
         std::fs::write(wt.join("untracked"), "private user content").unwrap();
         let before = db.list_merge_queue().unwrap();
+        let claim = crate::worktree_lifecycle::try_scoped_destroy_path(&wt).unwrap();
+        let report = sweep_with_db(&cfg, &root, true, &db);
+        assert!(report.collected.is_empty());
+        assert_eq!(report.kept.len(), 1);
+        assert_eq!(db.list_merge_queue().unwrap(), before);
+        drop(claim);
+        cfg.merge_queue.target_branch = "other".into();
+        assert!(sweep_with_db(&cfg, &root, true, &db).is_empty());
+        assert_eq!(db.list_merge_queue().unwrap(), before);
+        cfg.merge_queue.target_branch = "main".into();
         let report = sweep_with_db(&cfg, &root, true, &db);
         assert!(report.collected.is_empty());
         assert_eq!(report.kept_dirty, ["feature"]);
         assert!(report.bookkeeping_errors.is_empty());
         assert!(report.cleared_rows.contains(&before[0].worktree));
-        assert!(db.list_merge_queue().unwrap().is_empty());
-        let claim = crate::worktree_lifecycle::try_scoped_destroy_path(&wt).unwrap();
-        let report = sweep_with_db(&cfg, &root, true, &db);
-        assert!(report.is_empty());
-        assert!(db.list_merge_queue().unwrap().is_empty());
-        drop(claim);
-        cfg.merge_queue.target_branch = "other".into();
-        assert!(sweep_with_db(&cfg, &root, true, &db).is_empty());
         assert!(db.list_merge_queue().unwrap().is_empty());
         assert_eq!(
             std::fs::read_to_string(wt.join("untracked")).unwrap(),
