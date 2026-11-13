@@ -893,10 +893,10 @@ test: test-live test-heredoc-guard test-build-metadata test-the429 test-action-p
       exit 1
     fi
 
-    # Main currently discovers two plugin_api_wire tests, two control_schema
-    # tests, and one surface-gap ratchet: five tests total. Keep this pin here
+    # Main currently discovers two plugin_api_wire tests, three control_schema
+    # tests, and one surface-gap ratchet: six tests total. Keep this pin here
     # so a silently narrowed workspace filter cannot make the gate incomplete.
-    expected_contract_tests=5
+    expected_contract_tests=6
     contract_filter='binary(/plugin_api_wire/) or binary(/control_schema/) or test(ratchet_pins_surface_gaps)'
     print_contract_owners() {
       echo "  plugin API schema and accepted extension points: plugin-api / align-plugin-v03-contract"
@@ -906,17 +906,13 @@ test: test-live test-heredoc-guard test-build-metadata test-the429 test-action-p
     if ! contract_test_count="$(
       cargo nextest list --workspace -E "$contract_filter" --message-format json |
         python3 -c 'import json, sys
-    def count(value):
-        if isinstance(value, dict):
-            if isinstance(value.get("test_count"), int):
-                return value["test_count"]
-            if isinstance(value.get("test_names"), list):
-                return len(value["test_names"])
-            return sum(count(item) for item in value.values())
-        if isinstance(value, list):
-            return sum(count(item) for item in value)
-        return 0
-    print(sum(count(json.loads(line)) for line in sys.stdin if line.strip()))'
+    data = json.load(sys.stdin)
+    print(sum(
+        1
+        for suite in data.get("rust-suites", {}).values()
+        for case in suite.get("testcases", {}).values()
+        if case.get("filter-match", {}).get("status") == "matches"
+    ))'
     )"; then
       echo "ERROR: contract-discovery could not enumerate the contract tests" >&2
       print_contract_owners >&2
