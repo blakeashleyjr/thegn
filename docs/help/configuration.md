@@ -124,8 +124,9 @@ The file is watched: edits apply live, no restart.
 - `[ci]` — cached, bounded CI run/log reads. `log_cache_runs = 0` disables
   persistence; `[ci.autofix] mode = "off"|"suggest"|"auto"` defaults to off
   and reuses the existing trusted PR-queue agent policy.
-- `[merge_queue]`, `[pr_queue]`, `[autopilot]`, `[sandbox]`, `[share]`, `[forward]`,
-  `[media]`, `[replay]`, `[lifecycle]` — optional feature groups.
+- `[merge_queue]`, `[pr_queue]`, `[autopilot]`, `[sandbox]`, `[limits]`,
+  `[share]`, `[forward]`, `[media]`, `[network]`, `[replay]`, `[lifecycle]` —
+  optional feature groups.
 
 ### Issue autopilot
 
@@ -578,14 +579,16 @@ The `[notifications]` booleans are `notificationsDesktop`,
 
 Recording, media and the monitor process table are also exposed:
 `recordingDir`, `recordingMaxBytes`, `mediaEnabled`, `mediaShowArt`,
-`mediaOverlayOnBadgeClick`, `mediaSeekStepSecs`, `mediaSeekStepVideoSecs`,
-`mediaPollIntervalSecs`, `mediaPlayersPriority`, `monitorProcRows`,
-`monitorProcesses` and `monitorProcessIo`. The media backend, default-action
-and volume-step keys and the `mpv`/`mpd` tables are not exposed.
+`mediaDefaultAction`, `mediaOverlayOnBadgeClick`, `mediaSeekStepSecs`,
+`mediaSeekStepVideoSecs`, `mediaPollIntervalSecs`, `mediaPlayersPriority`,
+`monitorProcRows`, `monitorProcesses` and `monitorProcessIo`. The media
+backend and volume-step keys and the `mpv`/`mpd` tables are not exposed. This
+exposes the existing default-action setting only; it adds no action ids.
 
 The `[limits]` and `[diagnostics]` tables are exposed as `limitsTestCpuQuota`,
-`limitsTestMemMax`, `limitsTestMaxParallel`, `limitsTestTimeoutSecs`,
-`limitsDiscoverTimeoutSecs`, `limitsIsolatedTargetDir`,
+`limitsTestMemMax`, `limitsHeavySlots`, `limitsMaxLoad`,
+`limitsTestMaxParallel`, `limitsTestTimeoutSecs`, `limitsDiscoverTimeoutSecs`,
+`limitsIsolatedTargetDir`,
 `diagnosticsCrashReports`, `diagnosticsCrashRetention` and
 `diagnosticsRingSize`. The signed `test_nice` and the reserved `crash_sink`
 are not exposed.
@@ -598,8 +601,8 @@ The `[disk]` scalar keys are exposed as `diskShowSizes`, `diskWarnThresholdGb`,
 
 The `[daemon]` and `[network]` scalar keys are exposed as `daemonEnabled`,
 `daemonIdleExitSecs`, `daemonLeaseGraceSecs`, `daemonStreamGapWindowSecs`,
-`networkOfflineAfterFailures` and `networkRecoveryProbeSecs`. The
-`daemon.socket` path and the `network.mode` enum are not exposed.
+`networkMode`, `networkOfflineAfterFailures` and `networkRecoveryProbeSecs`.
+The `daemon.socket` path is not exposed.
 
 The `[preview]` scalar keys are exposed as `previewEnabled`,
 `previewFetchTimeoutMs` and `previewMaxBodyBytes`. The `preview.ports` list and

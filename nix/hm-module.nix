@@ -344,6 +344,7 @@ self: {
     recording.dir = cfg.recordingDir;
     recording.max_bytes = cfg.recordingMaxBytes;
     media.enabled = cfg.mediaEnabled;
+    media.default_action = cfg.mediaDefaultAction;
     media.show_art = cfg.mediaShowArt;
     media.overlay_on_badge_click = cfg.mediaOverlayOnBadgeClick;
     media.seek_step_secs = cfg.mediaSeekStepSecs;
@@ -361,6 +362,8 @@ self: {
     watch.pr_interval_secs = cfg.watchPrIntervalSecs;
     limits.test_cpu_quota = cfg.limitsTestCpuQuota;
     limits.test_mem_max = cfg.limitsTestMemMax;
+    limits.heavy_slots = cfg.limitsHeavySlots;
+    limits.max_load = cfg.limitsMaxLoad;
     limits.test_max_parallel = cfg.limitsTestMaxParallel;
     limits.test_timeout_secs = cfg.limitsTestTimeoutSecs;
     limits.discover_timeout_secs = cfg.limitsDiscoverTimeoutSecs;
@@ -382,6 +385,7 @@ self: {
     daemon.idle_exit_secs = cfg.daemonIdleExitSecs;
     daemon.lease_grace_secs = cfg.daemonLeaseGraceSecs;
     daemon.stream_gap_window_secs = cfg.daemonStreamGapWindowSecs;
+    network.mode = cfg.networkMode;
     network.offline_after_failures = cfg.networkOfflineAfterFailures;
     network.recovery_probe_secs = cfg.networkRecoveryProbeSecs;
     preview.enabled = cfg.previewEnabled;
@@ -1221,6 +1225,12 @@ in {
       description = "Enable the media controls. Unset (null) = the binary's default.";
     };
 
+    mediaDefaultAction = lib.mkOption {
+      type = lib.types.nullOr (lib.types.enum ["play_pause" "next" "previous" "volume_up" "volume_down"]);
+      default = null;
+      description = "Action bound to a bare media key. Unset (null) = the binary's default.";
+    };
+
     mediaShowArt = lib.mkOption {
       type = lib.types.nullOr (lib.types.bool);
       default = null;
@@ -1285,6 +1295,18 @@ in {
       type = lib.types.nullOr (lib.types.str);
       default = null;
       description = "Memory ceiling (systemd MemoryMax, such as 4G) for test runs. Unset (null) = the binary's default.";
+    };
+
+    limitsHeavySlots = lib.mkOption {
+      type = lib.types.nullOr (lib.types.ints.unsigned);
+      default = null;
+      description = "Maximum concurrent heavyweight gates on this host. Unset (null) = the binary's default.";
+    };
+
+    limitsMaxLoad = lib.mkOption {
+      type = lib.types.nullOr (lib.types.numbers.nonnegative);
+      default = null;
+      description = "One-minute load-average ceiling for heavyweight gates. Unset (null) = the binary's default.";
     };
 
     limitsTestMaxParallel = lib.mkOption {
@@ -1417,6 +1439,12 @@ in {
       type = lib.types.nullOr (lib.types.ints.u32);
       default = null;
       description = "Consecutive transient network failures before the app concludes it is offline (auto mode). Unset (null) = the binary's default.";
+    };
+
+    networkMode = lib.mkOption {
+      type = lib.types.nullOr (lib.types.enum ["auto" "online" "offline"]);
+      default = null;
+      description = "Offline-detection mode. Unset (null) = the binary's default.";
     };
 
     networkRecoveryProbeSecs = lib.mkOption {
