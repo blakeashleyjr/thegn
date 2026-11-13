@@ -1299,6 +1299,7 @@ pub const GRPC_CAPS: &[&str] = &[
 
 const MAX_CONTROL_FIELD_BYTES: usize = 64 * 1024;
 
+#[allow(clippy::result_large_err)]
 fn bounded_string(value: String, field: &str) -> Result<String, Status> {
     if value.len() > MAX_CONTROL_FIELD_BYTES {
         return Err(Status::resource_exhausted(format!(
@@ -1308,6 +1309,7 @@ fn bounded_string(value: String, field: &str) -> Result<String, Status> {
     Ok(value)
 }
 
+#[allow(clippy::result_large_err)]
 fn bounded_optional(value: Option<String>, field: &str) -> Result<Option<String>, Status> {
     value.map(|value| bounded_string(value, field)).transpose()
 }
