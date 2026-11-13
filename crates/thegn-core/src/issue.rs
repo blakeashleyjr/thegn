@@ -699,6 +699,13 @@ impl AgentDispatchStatus {
         )
     }
 
+    /// Whether this row consumes one worker slot in its stage's concurrency
+    /// budget. Human-parked rows remain active for duplicate protection, but
+    /// their worker is no longer consuming a slot.
+    pub fn holds_slot(self) -> bool {
+        matches!(self, Self::Queued | Self::Spawning | Self::Running)
+    }
+
     /// The glyph token for this status, resolved against the live glyph set at
     /// the DRAW site — so the board degrades with `[theme] glyphs` / a non-UTF-8
     /// locale instead of mojibaking. (A `&'static str` baked in here could not

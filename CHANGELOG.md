@@ -7,6 +7,24 @@ All notable changes to **thegn** are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.1.0-alpha.73] — 2026-11-13
+
+### Added
+
+- MCP read tools `calendar_events`, `calendar_clocks`, `issues_list`, `issues_get` and `dispatches_list` expose calendar, tracker issue and dispatch-roster data.
+
+### Changed
+
+- Pipeline rows waiting for a human or an open PR remain protected from redispatch without holding a stage concurrency slot.
+- A worktree edited after landing keeps its queue row labelled; `thegn merge sweep --force` retires only the queue row, and `thegn merge list --json` shows `cleanup_class` ids.
+- Merge-queue help explains that rebase holds histories containing merge commits or unrelated roots.
+
+### Fixed
+
+- Merge-queue gate commands without shell syntax run directly, so a missing executable is reported as a gate failure instead of an infrastructure error.
+- Dispatches can no longer name a superseded parent, except when resuming that parent.
+- Diff line counts use NUL-delimited output, so paths containing tabs or newlines are counted correctly.
+
 ## [0.1.0-alpha.72] — 2026-11-13
 
 ### Added
@@ -3325,7 +3343,8 @@ launcher picker and the merge queue's `agent_command` hook remain — they run
 whatever commands you configure. Leftover `[llm_proxy]` config sections and
 `proxy_*` tables in existing state databases are ignored harmlessly.
 
-[Unreleased]: https://github.com/blakeashleyjr/thegn/compare/v0.1.0-alpha.72...HEAD
+[Unreleased]: https://github.com/blakeashleyjr/thegn/compare/v0.1.0-alpha.73...HEAD
+[0.1.0-alpha.73]: https://github.com/blakeashleyjr/thegn/compare/v0.1.0-alpha.72...v0.1.0-alpha.73
 [0.1.0-alpha.72]: https://github.com/blakeashleyjr/thegn/compare/v0.1.0-alpha.71...v0.1.0-alpha.72
 [0.1.0-alpha.71]: https://github.com/blakeashleyjr/thegn/compare/v0.1.0-alpha.70...v0.1.0-alpha.71
 [0.1.0-alpha.70]: https://github.com/blakeashleyjr/thegn/compare/v0.1.0-alpha.69...v0.1.0-alpha.70

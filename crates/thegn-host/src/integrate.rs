@@ -4099,6 +4099,153 @@ mod tests {
         );
     }
 
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum HistoryDecision {
+        HeldUnsupportedMergeHistory,
+        Unexpected,
+    }
+
+    fn local_history_decision(report: &FoldReport) -> HistoryDecision {
+        if report.deferred.len() == 1
+            && !report.advanced
+            && report.deferred[0].kind == ConflictKind::UnsupportedMergeHistory
+        {
+            HistoryDecision::HeldUnsupportedMergeHistory
+        } else {
+            HistoryDecision::Unexpected
+        }
+    }
+
+    fn remote_history_decision(outcome: &AttemptOutcome) -> HistoryDecision {
+        match outcome {
+            AttemptOutcome::Conflict {
+                driver_refusal: Some(reason),
+                ..
+            } if reason.contains("merge commits or unrelated history") => {
+                HistoryDecision::HeldUnsupportedMergeHistory
+            }
+            _ => HistoryDecision::Unexpected,
+        }
+    }
+
+    fn assert_rebase_history_parity(name: &str, build: impl FnOnce(&Repo)) {
+        let repo = Repo::new(name);
+        if !repo.history_supported_or_refused() {
+            return;
+        }
+        build(&repo);
+
+        let mut config = cfg("");
+        config.land_strategy = thegn_core::config::LandStrategy::Rebase;
+        let local = run_fold(&config, &repo.dir, repo.branch_set()).unwrap();
+        let remote =
+            attempt_land(&config, &repo.dir, "feat", &GitLoc::Local(repo.dir.clone())).unwrap();
+
+        assert_eq!(
+            local_history_decision(&local),
+            remote_history_decision(&remote),
+            "local and remote fold seams disagreed for {name}: local={local:?}, remote={remote:?}"
+        );
+        assert_eq!(
+            local_history_decision(&local),
+            HistoryDecision::HeldUnsupportedMergeHistory,
+            "history fixture must remain held: {name}"
+        );
+    }
+
+    #[test]
+    fn rebase_merge_history_local_and_remote_fold_seams_have_parity() {
+        assert_rebase_history_parity("rebase-parity-orphan", |repo| {
+            git(&repo.dir, &["checkout", "-q", "--orphan", "feat"]);
+            repo.commit("orphan.txt", "orphan\n", "orphan root");
+            git(&repo.dir, &["checkout", "-q", "main"]);
+        });
+
+        assert_rebase_history_parity("rebase-parity-octopus", |repo| {
+            repo.feature("feat", "feat.txt", "feature\n");
+            git(&repo.dir, &["checkout", "-q", "feat", "-b", "b1"]);
+            repo.commit("b1.txt", "one\n", "b1 work");
+            git(&repo.dir, &["checkout", "-q", "feat", "-b", "b2"]);
+            repo.commit("b2.txt", "two\n", "b2 work");
+            git(&repo.dir, &["checkout", "-q", "feat"]);
+            git(
+                &repo.dir,
+                &[
+                    "-c",
+                    "commit.gpgsign=false",
+                    "merge",
+                    "--no-ff",
+                    "-q",
+                    "-m",
+                    "octopus",
+                    "b1",
+                    "b2",
+                ],
+            );
+            git(&repo.dir, &["branch", "-q", "-D", "b1"]);
+            git(&repo.dir, &["branch", "-q", "-D", "b2"]);
+        });
+
+        assert_rebase_history_parity("rebase-parity-criss-cross", |repo| {
+            repo.feature("feat", "feat.txt", "feature\n");
+            repo.feature("side", "side.txt", "side\n");
+
+            git(&repo.dir, &["checkout", "-q", "-b", "combined", "main"]);
+            git(&repo.dir, &["checkout", "-q", "feat", "--", "feat.txt"]);
+            git(&repo.dir, &["checkout", "-q", "side", "--", "side.txt"]);
+            git(&repo.dir, &["add", "-A"]);
+            let merge_tree = repo.out(&["write-tree"]);
+            git(&repo.dir, &["checkout", "-q", "-f", "main"]);
+            git(&repo.dir, &["branch", "-q", "-D", "combined"]);
+
+            let forward_merge = repo.out(&[
+                "-c",
+                "commit.gpgsign=false",
+                "commit-tree",
+                &merge_tree,
+                "-p",
+                "feat",
+                "-p",
+                "side",
+                "-m",
+                "feat merge",
+            ]);
+            let reverse_merge = repo.out(&[
+                "-c",
+                "commit.gpgsign=false",
+                "commit-tree",
+                &merge_tree,
+                "-p",
+                "side",
+                "-p",
+                "feat",
+                "-m",
+                "side merge",
+            ]);
+            let criss_cross_merge = repo.out(&[
+                "-c",
+                "commit.gpgsign=false",
+                "commit-tree",
+                &merge_tree,
+                "-p",
+                &forward_merge,
+                "-p",
+                &reverse_merge,
+                "-m",
+                "criss-cross merge",
+            ]);
+            git(
+                &repo.dir,
+                &["update-ref", "refs/heads/feat", &criss_cross_merge],
+            );
+            git(
+                &repo.dir,
+                &["update-ref", "refs/heads/side", &reverse_merge],
+            );
+            git(&repo.dir, &["branch", "-q", "-D", "side"]);
+        });
+    }
+
     #[test]
     fn rebase_octopus_history_still_lands_under_merge_and_squash() {
         // Positive control: merge and squash retain their existing octopus behaviour.
