@@ -480,23 +480,42 @@ pub struct GitUi {
     )>,
 }
 
-/// Refuse pull/push shortcuts on another branch row: both operations target
-/// HEAD, so the status explains that target and how to make the row HEAD.
-pub(crate) fn head_only_refusal(
-    data: &crate::panel::PanelData,
+/// Select the operation for the branch-panel pull shortcut. A missing row is
+/// either a detached HEAD or a list with no selection, so it has no safe
+/// branch operation.
+pub(crate) fn branch_pull_op(
     row: Option<&crate::panel::BranchRow>,
-    verb: &str,
-) -> Option<String> {
-    let row = row.filter(|row| !row.is_head)?;
-    let head = if data.branch.is_empty() {
-        "HEAD"
+) -> Option<crate::gitmut::GitOp> {
+    let row = row?;
+    Some(if row.is_head {
+        crate::gitmut::GitOp::Pull
     } else {
-        &data.branch
-    };
-    Some(format!(
-        "{verb} acts on HEAD ({head}), not {}; space checks {} out; f fast-forwards it",
-        row.name, row.name
-    ))
+        crate::gitmut::GitOp::FastForward {
+            branch: row.name.clone(),
+            current: false,
+        }
+    })
+}
+
+/// Select the operation for the branch-panel push shortcut. Non-HEAD rows
+/// use an explicit refspec, so pushing them never changes the checked-out
+/// branch or its upstream configuration.
+pub(crate) fn branch_push_op(
+    row: Option<&crate::panel::BranchRow>,
+    force: thegn_svc::git::ForceMode,
+) -> Option<crate::gitmut::GitOp> {
+    let row = row?;
+    if !row.is_head && force != thegn_svc::git::ForceMode::None {
+        return None;
+    }
+    Some(if row.is_head {
+        crate::gitmut::GitOp::Push { force }
+    } else {
+        crate::gitmut::GitOp::PushBranch {
+            branch: row.name.clone(),
+            force,
+        }
+    })
 }
 
 impl GitUi {
@@ -1127,8 +1146,8 @@ pub fn context_keys(view: GitView) -> Vec<CtxKey> {
             k("d", "delete", GitMsg::DeleteSel),
             k("r", "rebase onto", GitMsg::RebaseOntoSel),
             k("f", "fast-forward", GitMsg::FastForward),
-            k("p", "pull HEAD", GitMsg::Pull),
-            k("P", "push HEAD", GitMsg::Push),
+            k("p", "pull / ff", GitMsg::Pull),
+            k("P", "push", GitMsg::Push),
             k("m", "actions", GitMsg::OpenMenu(MenuKind::BranchActions)),
             k("w", "worktree", GitMsg::CreateWorktree),
             k("G", "open PR", GitMsg::OpenPrInBrowser),
@@ -1775,8 +1794,8 @@ impl GitMsg {
             GitMsg::DeleteSel => "delete",
             GitMsg::RebaseOntoSel => "rebase onto",
             GitMsg::FastForward => "fast-forward",
-            GitMsg::Pull => "pull HEAD",
-            GitMsg::Push => "push HEAD",
+            GitMsg::Pull => "pull / ff",
+            GitMsg::Push => "push",
             GitMsg::NewBranch => "new branch",
             GitMsg::CreateWorktree => "worktree",
             GitMsg::StashPush => "stash",
@@ -3162,15 +3181,10 @@ mod tests {
         }
     }
 
-    #[test]
-    fn head_only_refusal_names_head_and_fix() {
-        let data = crate::panel::PanelData {
-            branch: "main".into(),
-            ..Default::default()
-        };
-        let row = crate::panel::BranchRow {
-            name: "feature".into(),
-            is_head: false,
+    fn branch_row(name: &str, is_head: bool) -> crate::panel::BranchRow {
+        crate::panel::BranchRow {
+            name: name.into(),
+            is_head,
             held_by: Vec::new(),
             upstream: None,
             ahead: 0,
@@ -3180,23 +3194,60 @@ mod tests {
             date: 0,
             subject: String::new(),
             pr: None,
-        };
-        let message = head_only_refusal(&data, Some(&row), "push").unwrap();
-        assert!(message.contains("HEAD (main)"), "{message}");
-        assert!(message.contains("space"), "{message}");
-        assert!(message.contains("checks feature out"), "{message}");
-        assert_eq!(head_only_refusal(&data, None, "push"), None);
-        assert_eq!(
-            head_only_refusal(
-                &data,
-                Some(&crate::panel::BranchRow {
-                    is_head: true,
-                    ..row
-                }),
-                "pull"
-            ),
-            None
-        );
+        }
+    }
+
+    #[test]
+    fn branch_pull_op_uses_pull_for_head_and_fast_forward_for_other_rows() {
+        let head = branch_row("main", true);
+        assert!(matches!(
+            branch_pull_op(Some(&head)),
+            Some(crate::gitmut::GitOp::Pull)
+        ));
+
+        let feature = branch_row("feature", false);
+        assert!(matches!(
+            branch_pull_op(Some(&feature)),
+            Some(crate::gitmut::GitOp::FastForward {
+                branch,
+                current: false
+            }) if branch == "feature"
+        ));
+    }
+
+    #[test]
+    fn branch_push_op_uses_head_push_or_explicit_branch_push() {
+        let head = branch_row("main", true);
+        assert!(matches!(
+            branch_push_op(Some(&head), thegn_svc::git::ForceMode::None),
+            Some(crate::gitmut::GitOp::Push {
+                force: thegn_svc::git::ForceMode::None
+            })
+        ));
+
+        let feature = branch_row("feature", false);
+        assert!(matches!(
+            branch_push_op(Some(&feature), thegn_svc::git::ForceMode::None),
+            Some(crate::gitmut::GitOp::PushBranch {
+                branch,
+                force: thegn_svc::git::ForceMode::None
+            }) if branch == "feature"
+        ));
+        assert!(branch_push_op(Some(&feature), thegn_svc::git::ForceMode::WithLease).is_none());
+    }
+
+    #[test]
+    fn branch_shortcuts_have_no_operation_without_a_branch_row() {
+        assert!(branch_pull_op(None).is_none());
+        assert!(branch_push_op(None, thegn_svc::git::ForceMode::None).is_none());
+    }
+
+    #[test]
+    fn detached_head_has_no_branch_shortcut_operation() {
+        // Detached HEADs are omitted from the local branch rows, so both
+        // shortcuts take the same safe no-op path as an absent row.
+        assert!(branch_pull_op(None).is_none());
+        assert!(branch_push_op(None, thegn_svc::git::ForceMode::None).is_none());
     }
 
     #[test]
@@ -3208,11 +3259,11 @@ mod tests {
         );
         assert!(
             keys.iter()
-                .any(|key| key.chord == "p" && key.label == "pull HEAD")
+                .any(|key| key.chord == "p" && key.label == "pull / ff")
         );
         assert!(
             keys.iter()
-                .any(|key| key.chord == "P" && key.label == "push HEAD")
+                .any(|key| key.chord == "P" && key.label == "push")
         );
     }
 
