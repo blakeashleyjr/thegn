@@ -33,6 +33,7 @@ pub mod events;
 pub mod forward;
 pub mod host;
 pub mod integrate;
+pub(crate) mod integrate_order;
 pub mod issue;
 pub mod issue_tracker;
 pub mod kaneo;
