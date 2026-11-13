@@ -841,7 +841,14 @@ fn drive_queue_with(
         out.warnings.push(msg);
     }
     let use_agent = wants_agent && agent_cmd.is_some();
-    let target = integrate::resolve_target(cfg, repo_root);
+    let target = match integrate::resolve_target_checked(cfg, repo_root) {
+        Ok(target) => target,
+        Err(error) => {
+            out.warnings
+                .push(format!("merge target unavailable: {error}"));
+            return out;
+        }
+    };
 
     let total_items = items.len();
     'items: for (index, item) in items.into_iter().enumerate() {
