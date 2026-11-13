@@ -117,6 +117,109 @@ pub(crate) fn pipeline_merge_admission(
     }))
 }
 
+/// Check whether one land may rely on the newest pipeline gate evidence.
+///
+/// The target tip is deliberately not persisted in the attestation schema: a
+/// land is trusted only when that tip is an ancestor of the attested commit.
+/// Moving the target in the meantime therefore makes this check fail closed.
+#[cfg(test)]
+pub(crate) fn trusted_land_gate(
+    db: &Db,
+    worktree: &str,
+    folded_commit: &str,
+    target_tip: &str,
+    repo: &Path,
+) -> std::result::Result<(), String> {
+    trusted_land_gate_id(db, worktree, folded_commit, target_tip, repo).map(|_| ())
+}
+
+/// Return the trusted attestation id for [`trusted_land_gate`], for the CLI's
+/// success message. Keeping the public check's return type as `()` makes it
+/// clear that callers must not treat the id as a new authority.
+pub(crate) fn trusted_land_gate_id(
+    db: &Db,
+    worktree: &str,
+    folded_commit: &str,
+    target_tip: &str,
+    repo: &Path,
+) -> std::result::Result<i64, String> {
+    let canonical = std::fs::canonicalize(worktree)
+        .unwrap_or_else(|_| PathBuf::from(worktree))
+        .to_string_lossy()
+        .to_string();
+    let spellings = pipeline_spellings(db, worktree, &canonical)
+        .map_err(|error| format!("could not read pipeline gate rows: {error}"))?;
+    let spellings = spellings.iter().map(String::as_str).collect::<Vec<_>>();
+    let rows = db
+        .pipeline_rows_for_worktree_paths(&spellings)
+        .map_err(|error| format!("could not read pipeline gate rows: {error}"))?;
+    let row = match gating_row(&rows) {
+        GatingRow::None => {
+            return Err(format!(
+                "no pipeline gate row is bound to worktree {worktree}"
+            ));
+        }
+        GatingRow::Unfinished(row) => {
+            return Err(format!(
+                "pipeline gate row {} binding is unfinished ({})",
+                row.id,
+                row.status.as_str()
+            ));
+        }
+        GatingRow::Unrecognized(row) => {
+            return Err(format!(
+                "pipeline gate row {} binding has unrecognized status",
+                row.id
+            ));
+        }
+        GatingRow::Finished(row) => row,
+    };
+    let latest = db
+        .latest_gate_attestation(row.id)
+        .map_err(|error| {
+            format!(
+                "could not read attestation for pipeline row {}: {error}",
+                row.id
+            )
+        })?
+        .ok_or_else(|| format!("pipeline row {} has no gate attestation", row.id))?;
+    if latest.commit_oid != folded_commit {
+        return Err(format!(
+            "attestation {} commit binding is {} but land commit is {folded_commit}",
+            latest.id, latest.commit_oid
+        ));
+    }
+    let trusted = trusted_gate_for(row, Some(&latest));
+    if !trusted.is_satisfied() {
+        return Err(format!(
+            "attestation {} trust binding is not satisfied: {}",
+            latest.id,
+            trusted.detail(row.id).replace('\n', " ")
+        ));
+    }
+    let folded_tree = util::git_out_allow_empty(
+        repo,
+        &[
+            "rev-parse",
+            "--verify",
+            &format!("{folded_commit}^{{tree}}"),
+        ],
+    )
+    .ok_or_else(|| format!("land commit {folded_commit} tree binding could not be observed"))?;
+    if folded_tree != latest.tree_oid {
+        return Err(format!(
+            "attestation {} tree binding is {} but land tree is {folded_tree}",
+            latest.id, latest.tree_oid
+        ));
+    }
+    if !crate::integrate::candidate_is_ancestor(repo, target_tip, folded_commit) {
+        return Err(format!(
+            "target-tip binding failed: target tip {target_tip} is not an ancestor of land commit {folded_commit}"
+        ));
+    }
+    Ok(latest.id)
+}
+
 fn observe_attestation_context(
     row: &thegn_core::issue::AgentDispatch,
     attestation: &GateAttestation,
@@ -472,7 +575,10 @@ fn valid_oid(value: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{gate_row, pipeline_merge_admission, trusted_gate_for};
+    use super::{
+        gate_row, pipeline_merge_admission, trusted_gate_for, trusted_land_gate,
+        trusted_land_gate_id,
+    };
     use crate::integrate::{GateErrorClass, GatePhase, GateVerdict};
     use std::path::{Path, PathBuf};
     use thegn_core::StoredGateAttestation;
@@ -859,6 +965,194 @@ mod tests {
         let (db, id, _cfg, _log_dir, _logs) = setup(&repo_path);
         let row = db.get_dispatch(id).unwrap().unwrap();
         assert_eq!(trusted_gate_for(&row, None), TrustedGate::Missing);
+    }
+
+    #[test]
+    fn trusted_land_gate_refuses_when_no_pipeline_row_exists() {
+        let (_repo_dir, repo_path) = repo();
+        let db = Db::open_memory().unwrap();
+        let commit = git(&repo_path, &["rev-parse", "HEAD"]);
+        let error = trusted_land_gate(
+            &db,
+            &repo_path.display().to_string(),
+            &commit,
+            &commit,
+            &repo_path,
+        )
+        .unwrap_err();
+        assert!(error.contains("no pipeline gate row"), "{error}");
+    }
+
+    #[test]
+    fn trusted_land_gate_refuses_an_unfinished_pipeline_row() {
+        let (_repo_dir, repo_path) = repo();
+        let (db, _id, _cfg, _log_dir, _logs) = pipeline_setup(&repo_path);
+        let commit = git(&repo_path, &["rev-parse", "HEAD"]);
+        let error = trusted_land_gate(
+            &db,
+            &repo_path.display().to_string(),
+            &commit,
+            &commit,
+            &repo_path,
+        )
+        .unwrap_err();
+        assert!(error.contains("unfinished"), "{error}");
+    }
+
+    #[test]
+    fn trusted_land_gate_refuses_a_finished_row_without_attestation() {
+        let (_repo_dir, repo_path) = repo();
+        let (db, id, _cfg, _log_dir, _logs) = pipeline_setup(&repo_path);
+        finish_pipeline_row(&db, id);
+        let commit = git(&repo_path, &["rev-parse", "HEAD"]);
+        let error = trusted_land_gate(
+            &db,
+            &repo_path.display().to_string(),
+            &commit,
+            &commit,
+            &repo_path,
+        )
+        .unwrap_err();
+        assert!(error.contains("no gate attestation"), "{error}");
+    }
+
+    #[test]
+    fn trusted_land_gate_refuses_a_worker_runner_attestation() {
+        let (_repo_dir, repo_path) = repo();
+        let db_dir = tempfile::tempdir().unwrap();
+        let db_path = db_dir.path().join("state.db");
+        let db = Db::open_at(&db_path).unwrap();
+        let worktree = repo_path.display().to_string();
+        let id = db
+            .put_agent_dispatch(NewDispatch {
+                stage: Some("code"),
+                artifact_path: Some(".thegn/pipeline/THE-1103/code/1.md"),
+                ..NewDispatch::new("linear:THE-1103", &worktree, "fixture")
+            })
+            .unwrap();
+        finish_pipeline_row(&db, id);
+        let commit = git(&repo_path, &["rev-parse", "HEAD"]);
+        let tree = git(&repo_path, &["rev-parse", "HEAD^{tree}"]);
+        let repo_common = git(
+            &repo_path,
+            &["rev-parse", "--path-format=absolute", "--git-common-dir"],
+        );
+        let branch_ref = git(&repo_path, &["symbolic-ref", "-q", "HEAD"]);
+        let worktree = std::fs::canonicalize(&repo_path)
+            .unwrap()
+            .display()
+            .to_string();
+        let conn = rusqlite::Connection::open(&db_path).unwrap();
+        conn.execute(
+            "INSERT INTO pipeline_gate_attestations
+             (dispatch_id,repo,worktree,branch_ref,commit_oid,tree_oid,command,
+              started_ms,ended_ms,exit_code,outcome,reason,log_path,runner)
+             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14)",
+            rusqlite::params![
+                id,
+                repo_common,
+                worktree,
+                branch_ref,
+                commit,
+                tree,
+                "gate",
+                1_i64,
+                2_i64,
+                0_i32,
+                "passed",
+                "",
+                "/tmp/worker-gate.log",
+                "worker",
+            ],
+        )
+        .unwrap();
+        let error = trusted_land_gate(
+            &db,
+            &repo_path.display().to_string(),
+            &commit,
+            &commit,
+            &repo_path,
+        )
+        .unwrap_err();
+        assert!(error.contains("trust binding"), "{error}");
+    }
+
+    #[test]
+    fn trusted_land_gate_refuses_a_wrong_commit_binding() {
+        let (_repo_dir, repo_path) = repo();
+        let (db, id, cfg, _log_dir, logs) = pipeline_setup(&repo_path);
+        gate_row(
+            &db,
+            &cfg,
+            id,
+            &logs,
+            &|_, _, _| Ok(GateVerdict::Passed),
+            &|| 100,
+        )
+        .unwrap();
+        finish_pipeline_row(&db, id);
+        let commit = git(&repo_path, &["rev-parse", "HEAD"]);
+        let error = trusted_land_gate(
+            &db,
+            &repo_path.display().to_string(),
+            &"f".repeat(40),
+            &commit,
+            &repo_path,
+        )
+        .unwrap_err();
+        assert!(error.contains("commit binding"), "{error}");
+    }
+
+    #[test]
+    fn trusted_land_gate_refuses_a_non_ancestor_target_tip() {
+        let (_repo_dir, repo_path) = repo();
+        let (db, id, cfg, _log_dir, logs) = pipeline_setup(&repo_path);
+        gate_row(
+            &db,
+            &cfg,
+            id,
+            &logs,
+            &|_, _, _| Ok(GateVerdict::Passed),
+            &|| 100,
+        )
+        .unwrap();
+        finish_pipeline_row(&db, id);
+        let commit = git(&repo_path, &["rev-parse", "HEAD"]);
+        let error = trusted_land_gate(
+            &db,
+            &repo_path.display().to_string(),
+            &commit,
+            &"0".repeat(40),
+            &repo_path,
+        )
+        .unwrap_err();
+        assert!(error.contains("target-tip binding"), "{error}");
+    }
+
+    #[test]
+    fn trusted_land_gate_accepts_a_satisfied_attestation_and_returns_its_id() {
+        let (_repo_dir, repo_path) = repo();
+        let (db, id, cfg, _log_dir, logs) = pipeline_setup(&repo_path);
+        gate_row(
+            &db,
+            &cfg,
+            id,
+            &logs,
+            &|_, _, _| Ok(GateVerdict::Passed),
+            &|| 100,
+        )
+        .unwrap();
+        finish_pipeline_row(&db, id);
+        let commit = git(&repo_path, &["rev-parse", "HEAD"]);
+        let attestation_id = trusted_land_gate_id(
+            &db,
+            &repo_path.display().to_string(),
+            &commit,
+            &commit,
+            &repo_path,
+        )
+        .unwrap();
+        assert!(attestation_id > 0);
     }
 
     #[test]

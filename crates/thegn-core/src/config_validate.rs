@@ -419,6 +419,11 @@ pub(crate) fn typed_semantic_errors(cfg: &Config, mode: SemanticMode) -> Vec<Str
             stop!();
         }};
     }
+    let max_load = cfg.sandbox.limits.max_load;
+    if !max_load.is_finite() || max_load < 0.0 {
+        errs.push("sandbox.limits.max_load must be a finite non-negative load average".to_string());
+        stop!();
+    }
     check_templates(cfg, &mut errs);
     stop!();
     if let Some(name) = cfg.default_folder.as_deref()
@@ -1792,6 +1797,25 @@ template = "image:registry.example/dev:1"
             Some("worktrees_dir")
         );
         assert_eq!(nearest_key("totally", ["worktrees_dir"].into_iter()), None);
+    }
+
+    #[test]
+    fn heavy_gate_rejects_negative_and_non_finite_load_limits() {
+        let negative = validate_str("[sandbox.limits]\nmax_load = -1.0\n");
+        assert!(
+            negative
+                .iter()
+                .any(|error| error.contains("sandbox.limits.max_load")),
+            "{negative:?}"
+        );
+        let mut cfg = Config::default();
+        cfg.sandbox.limits.max_load = f64::NAN;
+        let nan = typed_semantic_errors(&cfg, SemanticMode::AllDiagnostics);
+        assert!(
+            nan.iter()
+                .any(|error| error.contains("sandbox.limits.max_load")),
+            "{nan:?}"
+        );
     }
 
     #[test]

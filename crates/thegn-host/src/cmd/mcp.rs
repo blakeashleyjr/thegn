@@ -839,6 +839,8 @@ fn open_spec_from_args(args: &serde_json::Value) -> Result<thegn_svc::control::O
         // the MCP tool surface stays resume/cold.
         continue_last: false,
         stage: str_arg(args, "stage").map(str::to_string),
+        permissions: Vec::new(),
+        widen_permissions: false,
         fork: false,
         native_session_id: None,
     });

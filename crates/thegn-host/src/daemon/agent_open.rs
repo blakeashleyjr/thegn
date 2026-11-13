@@ -235,9 +235,19 @@ fn resolve_inner(
         } else {
             String::new()
         };
-        format!("{fork}{}{}", autonomous, session_grant(cfg, agent, stage)?)
+        format!(
+            "{fork}{}{}",
+            autonomous,
+            session_grant_with(
+                cfg,
+                agent,
+                stage,
+                &launch.permissions,
+                launch.widen_permissions,
+            )?
+        )
     } else {
-        command_for(
+        command_for_with(
             cfg,
             agent,
             &launch.prompt,
@@ -245,6 +255,8 @@ fn resolve_inner(
             launch.resume.as_deref().filter(|s| !s.is_empty()),
             launch.continue_last,
             stage,
+            &launch.permissions,
+            launch.widen_permissions,
         )?
     };
 
@@ -279,6 +291,8 @@ fn resolve_inner(
             cmd_override: Some(&cmd),
             prompt: Some(launch.prompt.as_str()).filter(|p| !p.is_empty()),
             stage,
+            permissions: &launch.permissions,
+            widen_permissions: launch.widen_permissions,
             ..LaunchExtras::default()
         },
     )?;
@@ -396,7 +410,32 @@ pub(crate) fn command_for(
     continue_last: bool,
     stage: Option<&str>,
 ) -> Result<String> {
-    use thegn_core::agent_task::{TaskVars, effective_agent, substitute_command};
+    command_for_with(
+        cfg,
+        agent,
+        prompt,
+        headless,
+        resume,
+        continue_last,
+        stage,
+        &[],
+        false,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn command_for_with(
+    cfg: &Config,
+    agent: &str,
+    prompt: &str,
+    headless: bool,
+    resume: Option<&str>,
+    continue_last: bool,
+    stage: Option<&str>,
+    launch_permissions: &[String],
+    widen_permissions: bool,
+) -> Result<String> {
+    use thegn_core::agent_task::{TaskVars, effective_agent_with, substitute_command};
 
     // Resume takes precedence over the normal launch form: the id is untrusted
     // (it crosses MCP/HTTP/CLI), so it is shape-validated and refused rather than
@@ -420,7 +459,10 @@ pub(crate) fn command_for(
                 &thegn_core::agent_task::TaskVars::new(),
             )
             .map_err(|e| anyhow::anyhow!("agent resume template is invalid: {e}"))?;
-            return Ok(format!("{cmd}{}", session_grant(cfg, agent, stage)?));
+            return Ok(format!(
+                "{cmd}{}",
+                session_grant_with(cfg, agent, stage, launch_permissions, widen_permissions,)?
+            ));
         }
         let cmd = harness
             .resume_command(id)
@@ -436,7 +478,11 @@ pub(crate) fn command_for(
         } else {
             String::new()
         };
-        let cmd = format!("{cmd}{}{}", autonomous, session_grant(cfg, agent, stage)?);
+        let cmd = format!(
+            "{cmd}{}{}",
+            autonomous,
+            session_grant_with(cfg, agent, stage, launch_permissions, widen_permissions,)?
+        );
         // A prompt alongside resume is handed over as an opening message, the
         // same way an interactive launch-with-task does.
         if prompt.trim().is_empty() {
@@ -465,7 +511,11 @@ pub(crate) fn command_for(
         } else {
             String::new()
         };
-        let cmd = format!("{cmd}{}{}", autonomous, session_grant(cfg, agent, stage)?);
+        let cmd = format!(
+            "{cmd}{}{}",
+            autonomous,
+            session_grant_with(cfg, agent, stage, launch_permissions, widen_permissions,)?
+        );
         if prompt.trim().is_empty() {
             return Ok(cmd);
         }
@@ -474,7 +524,8 @@ pub(crate) fn command_for(
 
     // The entry (or bare harness id) with the stage's model/env/permissions
     // layered on; the model lands on the command through the harness's flag.
-    let eff = effective_agent(cfg, agent, stage).map_err(|e| anyhow::anyhow!("{e}"))?;
+    let eff = effective_agent_with(cfg, agent, stage, launch_permissions, widen_permissions)
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
 
     if !headless {
         let cmd =
@@ -510,10 +561,23 @@ pub(crate) fn command_for(
 /// earlier launch wrote, because no launch writes one (THE-440) — so every
 /// relaunch shape must carry it or refuse. An agent the resolver cannot
 /// resolve (a bare harness id with no entry, say) has no configured list.
-fn session_grant(cfg: &Config, agent: &str, stage: Option<&str>) -> Result<String> {
-    match thegn_core::agent_task::effective_agent(cfg, agent, stage) {
+fn session_grant_with(
+    cfg: &Config,
+    agent: &str,
+    stage: Option<&str>,
+    launch_permissions: &[String],
+    widen_permissions: bool,
+) -> Result<String> {
+    match thegn_core::agent_task::effective_agent_with(
+        cfg,
+        agent,
+        stage,
+        launch_permissions,
+        widen_permissions,
+    ) {
         Ok(eff) => eff.permission_args().map_err(|e| anyhow::anyhow!("{e}")),
-        Err(_) => Ok(String::new()),
+        Err(_error) if launch_permissions.is_empty() => Ok(String::new()),
+        Err(error) => Err(anyhow::anyhow!(error)),
     }
 }
 
@@ -899,6 +963,8 @@ mod tests {
             resume: None,
             continue_last: false,
             stage: None,
+            permissions: Vec::new(),
+            widen_permissions: false,
             fork: false,
             native_session_id: None,
         };
@@ -969,6 +1035,8 @@ mod tests {
             resume: None,
             continue_last: false,
             stage: None,
+            permissions: Vec::new(),
+            widen_permissions: false,
             fork: true,
             native_session_id: Some("native-codex".into()),
         };
@@ -1000,6 +1068,8 @@ mod tests {
             resume: None,
             continue_last: false,
             stage: None,
+            permissions: Vec::new(),
+            widen_permissions: false,
             fork: false,
             native_session_id: Some("caller-supplied".into()),
         }
@@ -1113,6 +1183,8 @@ mod tests {
             resume: None,
             continue_last: false,
             stage: None,
+            permissions: Vec::new(),
+            widen_permissions: false,
             fork: false,
             native_session_id: None,
         };
@@ -1353,6 +1425,8 @@ mod tests {
             resume: None,
             continue_last: false,
             stage: None,
+            permissions: Vec::new(),
+            widen_permissions: false,
             fork: false,
             native_session_id: None,
         };
@@ -1450,6 +1524,8 @@ mod tests {
             resume: None,
             continue_last: false,
             stage: None,
+            permissions: Vec::new(),
+            widen_permissions: false,
             fork: false,
             native_session_id: None,
         };

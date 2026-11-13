@@ -177,6 +177,8 @@ fn compose_preset_command(
             prompt: None,
             suppress_agent_record: true,
             stage: None,
+            permissions: &[],
+            widen_permissions: false,
         },
     )?;
     // Preset `cwd` is worktree-relative; overlay only a local (Some) cwd — a

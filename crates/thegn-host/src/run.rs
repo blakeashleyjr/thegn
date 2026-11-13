@@ -4936,27 +4936,20 @@ fn handle_git_msg(
             ));
         }
         GitMsg::Pull => {
-            if let Some(message) =
-                gitui::head_only_refusal(&model.panel, sel_branch(panel_ui, model).as_ref(), "pull")
-            {
-                model.status = message;
+            if let Some(op) = gitui::branch_pull_op(sel_branch(panel_ui, model).as_ref()) {
+                enqueue(panel_ui, model, op);
             } else {
-                enqueue(panel_ui, model, GitOp::Pull);
+                model.status = "no branch selected".into();
             }
         }
         GitMsg::Push => {
-            if let Some(message) =
-                gitui::head_only_refusal(&model.panel, sel_branch(panel_ui, model).as_ref(), "push")
-            {
-                model.status = message;
+            if let Some(op) = gitui::branch_push_op(
+                sel_branch(panel_ui, model).as_ref(),
+                thegn_svc::git::ForceMode::None,
+            ) {
+                enqueue(panel_ui, model, op);
             } else {
-                enqueue(
-                    panel_ui,
-                    model,
-                    GitOp::Push {
-                        force: thegn_svc::git::ForceMode::None,
-                    },
-                );
+                model.status = "no branch selected".into();
             }
         }
         GitMsg::FastForward => {
@@ -12003,11 +11996,11 @@ async fn event_loop<T: Terminal>(
                         r.todos_synced = false;
                     }
                 }
-                GitOpResult::NoUpstream { branch } => {
+                GitOpResult::NoUpstream { remote, branch } => {
                     rehydrate = false;
                     // Push failed: no upstream. Offer to push -u so the
-                    // branch tracks origin/<branch> from now on.
-                    let remote_branch = format!("origin/{branch}");
+                    // branch tracks the configured remote from now on.
+                    let remote_branch = format!("{remote}/{branch}");
                     active_menu = Some(menu::confirm_menu(
                         "no upstream branch",
                         format!("push and track {remote_branch}?"),
@@ -12015,10 +12008,7 @@ async fn event_loop<T: Terminal>(
                         String::new(),
                         false,
                     ));
-                    pending_confirm_op = Some(GitOp::PushSetUpstream {
-                        remote: "origin".to_owned(),
-                        branch,
-                    });
+                    pending_confirm_op = Some(GitOp::PushSetUpstream { remote, branch });
                 }
             }
             if rehydrate {
@@ -28639,6 +28629,35 @@ fn action_allowed_during_schema_refusal(action: &crate::keymap::Action) -> bool 
             | Action::SwitchMode(_)
             | Action::ToggleKeyLock
     )
+}
+
+#[cfg(test)]
+mod branch_shortcut_status_tests {
+    #[test]
+    fn missing_branch_shortcuts_report_status_in_both_dispatch_arms() {
+        let source = include_str!("run.rs");
+        let pull_arm = source
+            .split(concat!("GitMsg::", "Pull =>"))
+            .nth(1)
+            .and_then(|rest| rest.split(concat!("GitMsg::", "Push =>")).next())
+            .expect("pull dispatch arm");
+        let push_arm = source
+            .split(concat!("GitMsg::", "Push =>"))
+            .nth(1)
+            .and_then(|rest| rest.split(concat!("GitMsg::", "FastForward =>")).next())
+            .expect("push dispatch arm");
+
+        for arm in [pull_arm, push_arm] {
+            assert!(
+                arm.contains("} else {"),
+                "missing no-selection branch: {arm}"
+            );
+            assert!(
+                arm.contains("no branch selected"),
+                "missing no-selection status: {arm}"
+            );
+        }
+    }
 }
 
 #[cfg(test)]
