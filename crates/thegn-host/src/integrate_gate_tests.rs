@@ -356,6 +356,56 @@ fn tracked_snapshot_uses_materialized_bytes_without_running_filters() {
 }
 
 #[test]
+fn native_gate_command_rewriting_tracked_file_is_rejected_by_snapshot() {
+    let f = Fixture::new();
+    if !posix_shell_gate_only() {
+        return;
+    }
+    let workspace = NativeWorkspace::prepare(&f.repo, &f.first, &f.config).unwrap();
+    let (output, _) = workspace.spawn("printf rewritten > value", 10).unwrap();
+    assert!(matches!(
+        output,
+        crate::gate_capture::CaptureResult::Completed { status, .. } if status.success()
+    ));
+    let error = workspace.verify_snapshot().unwrap_err().to_string();
+    assert!(error.contains("gate changed 1 tracked file(s) under test: \"value\""));
+    workspace.cleanup().unwrap();
+}
+
+#[test]
+fn native_gate_unchanged_tracked_tree_passes_snapshot() {
+    let f = Fixture::new();
+    if !posix_shell_gate_only() {
+        return;
+    }
+    let workspace = NativeWorkspace::prepare(&f.repo, &f.first, &f.config).unwrap();
+    let (output, _) = workspace.spawn("test \"$(cat value)\" = one", 10).unwrap();
+    assert!(matches!(
+        output,
+        crate::gate_capture::CaptureResult::Completed { status, .. } if status.success()
+    ));
+    workspace.verify_snapshot().unwrap();
+    workspace.cleanup().unwrap();
+}
+
+#[test]
+fn native_gate_ignored_file_write_does_not_fail_snapshot() {
+    let f = Fixture::new();
+    if !posix_shell_gate_only() {
+        return;
+    }
+    std::fs::write(f.repo.join(".git/info/exclude"), "/cache\n").unwrap();
+    let workspace = NativeWorkspace::prepare(&f.repo, &f.first, &f.config).unwrap();
+    let (output, _) = workspace.spawn("printf warm-cache > cache", 10).unwrap();
+    assert!(matches!(
+        output,
+        crate::gate_capture::CaptureResult::Completed { status, .. } if status.success()
+    ));
+    workspace.verify_snapshot().unwrap();
+    workspace.cleanup().unwrap();
+}
+
+#[test]
 fn required_filter_failure_is_static_infrastructure_and_retains_private_index() {
     let f = Fixture::new();
     if !f.supported_or_refused() {
