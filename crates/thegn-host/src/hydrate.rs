@@ -3098,6 +3098,14 @@ fn change_rows(
     crate::panel::build_change_rows(status, diff, incoming)
 }
 
+fn diff_read_unavailable(diff: &anyhow::Result<Vec<thegn_svc::git::DiffEntry>>) -> bool {
+    diff.is_err()
+}
+
+fn stash_read_unknown(stash_count: &anyhow::Result<usize>) -> bool {
+    stash_count.is_err()
+}
+
 /// Build diff files using the porcelain letter, `B` for binary, and `M` as the fallback.
 fn panel_diff_files(
     entries: &[thegn_svc::git::DiffEntry],
@@ -3129,12 +3137,8 @@ fn panel_diff_files(
         .collect()
 }
 
-fn ls_files_args(remote: bool) -> &'static [&'static str] {
-    if remote {
-        &["ls-files"]
-    } else {
-        &["ls-files", "-z"]
-    }
+fn ls_files_args(_remote: bool) -> &'static [&'static str] {
+    &["ls-files", "-z"]
 }
 
 fn tracked_files_from_ls_files(stdout: &[u8], nul_framed: bool) -> Vec<String> {
@@ -3265,7 +3269,7 @@ pub(crate) fn build_panel(
             if diff.is_err() {
                 reads_ok.store(false, std::sync::atomic::Ordering::Relaxed);
             }
-            let diff_ok = diff.is_ok();
+            let diff_ok = !diff_read_unavailable(&diff);
             let mut entries = diff.unwrap_or_default();
             if matches!(loc, GitLoc::Local(_)) {
                 entries.retain(|entry| !crate::git_watch::is_panel_excluded_rel(&entry.path));
@@ -3371,7 +3375,7 @@ pub(crate) fn build_panel(
                     .and_then(|out| {
                         out.status
                             .success()
-                            .then(|| tracked_files_from_ls_files(&out.stdout, !loc.is_remote()))
+                            .then(|| tracked_files_from_ls_files(&out.stdout, true))
                     })
             })
         });
@@ -3405,6 +3409,7 @@ pub(crate) fn build_panel(
     // Remember status and diff under the print taken before them. A stash
     // count failure remains unknown but does not invalidate this snapshot; a
     // status or diff failure still prevents caching the partial answer.
+    let stash_unknown = stash_read_unknown(&stash_count);
     let stash_count = cache_panel_git_snapshot(
         cwd,
         watch_print,
@@ -3640,6 +3645,8 @@ pub(crate) fn build_panel(
         total,
     });
     panel.merge_unknown = merge_unknown;
+    panel.diff_unavailable = !diff_ok;
+    panel.stash_unknown = stash_unknown;
     panel.stash_count = stash_count;
     panel.status_unavailable = lists.status_unavailable;
     panel.log = lists.log;
