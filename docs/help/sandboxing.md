@@ -974,6 +974,18 @@ The machine-global view is the system monitor's **Containers** tab
 ([[system-monitor]]), which lists every backend's containers with live
 stats and lifecycle actions on the thegn-owned ones.
 
+For scripts or a terminal without the TUI, the same local estate is available
+through the CLI:
+
+- `thegn sandbox ls` lists running containers with owned rows first;
+  `--stats` adds one bounded, non-streaming sample and `--json` emits one
+  stable JSON array.
+- `thegn sandbox ctl stop|start|restart <name>` operates only on a
+  `thegn-` owned container. It asks for confirmation unless `--yes` is given;
+  foreign names fail without invoking a runtime.
+- `thegn sandbox logs <name> [--tail N]` prints a bounded, non-following tail
+  (up to 10,000 lines).
+
 ## Cleanup
 
 Panel and monitor actions apply only to containers proven to belong to this
