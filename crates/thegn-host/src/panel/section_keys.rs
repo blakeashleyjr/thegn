@@ -189,6 +189,7 @@ const FORWARD: &[SectionKey] = &[
     k('o', "o", "open in browser"),
     nav("↵", "copy url"),
     k('n', "n", "watch port"),
+    k('a', "a", "add forward"),
     k('x', "x", "remove"),
 ];
 const HOSTS: &[SectionKey] = &[
@@ -552,6 +553,23 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn forward_advertises_manual_add_in_statusbar_and_hints() {
+        let add = section_keys(Section::Forward)
+            .iter()
+            .find(|key| key.key == Some('a'))
+            .expect("Forward advertises manual add");
+        assert_eq!(add.chord, "a");
+        assert_eq!(add.label, "add forward");
+        assert_eq!(
+            include_str!("sections/misc.rs")
+                .matches("(\"a\", \"add\")")
+                .count(),
+            3,
+            "Forward's empty, compact, and full hints all advertise add"
+        );
     }
 
     /// The strip is one line — keep every section skimmable.
