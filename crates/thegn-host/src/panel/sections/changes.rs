@@ -67,7 +67,12 @@ fn list(ctx: &SectionCtx) -> Vec<PanelRow> {
             "incoming files unavailable",
         )])));
     }
-    if data.changes.is_empty() {
+    if data.diff_unavailable {
+        rows.push(PanelRow::plain(Line::segs(vec![seg(
+            hue(Hue::Amber),
+            "changes unavailable",
+        )])));
+    } else if data.changes.is_empty() {
         if !data.status_unavailable {
             rows.push(PanelRow::plain(Line::segs(vec![seg(
                 g(),
@@ -1160,6 +1165,22 @@ mod tests {
         let rendered = render_changes(crate::panel::PanelData::default());
         assert!(
             rendered.contains("working tree clean"),
+            "rendered: {rendered}"
+        );
+    }
+
+    #[test]
+    fn diff_unavailable_does_not_claim_a_clean_tree() {
+        let rendered = render_changes(crate::panel::PanelData {
+            diff_unavailable: true,
+            ..Default::default()
+        });
+        assert!(
+            rendered.contains("changes unavailable"),
+            "rendered: {rendered}"
+        );
+        assert!(
+            !rendered.contains("working tree clean"),
             "rendered: {rendered}"
         );
     }

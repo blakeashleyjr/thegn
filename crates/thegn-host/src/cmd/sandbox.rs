@@ -57,6 +57,34 @@ pub enum Action {
         #[arg(long)]
         volumes: bool,
     },
+    /// List running containers, with thegn-owned rows first.
+    #[command(name = "ls")]
+    List {
+        /// Emit a stable JSON array instead of a human-readable table.
+        #[arg(long)]
+        json: bool,
+        /// Include one bounded, non-streaming stats sample.
+        #[arg(long)]
+        stats: bool,
+    },
+    /// Stop, start, or restart an owned container.
+    Ctl {
+        #[arg(value_enum)]
+        op: super::sandbox_containers::Control,
+        /// Exact container name.
+        name: String,
+        /// Skip the interactive confirmation prompt.
+        #[arg(long)]
+        yes: bool,
+    },
+    /// Print a bounded, non-following log tail for an owned container.
+    Logs {
+        /// Exact container name.
+        name: String,
+        /// Number of log lines to request (1–10,000).
+        #[arg(long, default_value_t = 500, value_parser = clap::value_parser!(u32).range(1..=10_000))]
+        tail: u32,
+    },
 }
 
 pub fn run(cfg: &Config, action: Action) -> Result<()> {
@@ -77,6 +105,9 @@ pub fn run(cfg: &Config, action: Action) -> Result<()> {
                 None => prune_local(kinds, yes, dry_run),
             }
         }
+        Action::List { json, stats } => super::sandbox_containers::list(json, stats),
+        Action::Ctl { op, name, yes } => super::sandbox_containers::ctl(op, &name, yes),
+        Action::Logs { name, tail } => super::sandbox_containers::logs(&name, tail),
     }
 }
 

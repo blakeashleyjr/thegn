@@ -425,7 +425,9 @@ pub fn summary(section: Section, model: &crate::chrome::FrameModel) -> Vec<Seg> 
                     }
                 },
             );
-            if data.changes.is_empty() {
+            if data.diff_unavailable {
+                vec![seg(hue(Hue::Amber), "unavailable")]
+            } else if data.changes.is_empty() {
                 vec![seg(g(), "clean")]
             } else if matches!(a, thegn_svc::git::DiffCount::Capped)
                 || matches!(del, thegn_svc::git::DiffCount::Capped)
@@ -495,7 +497,9 @@ pub fn summary(section: Section, model: &crate::chrome::FrameModel) -> Vec<Seg> 
         Section::Stash => {
             // `stash_count` is fetched unconditionally in the git fan-out, so the
             // summary populates even while the (lazily-loaded) Stash list is empty.
-            if data.stash_count == 0 {
+            if data.stash_unknown {
+                vec![seg(hue(Hue::Amber), "?")]
+            } else if data.stash_count == 0 {
                 vec![seg(g2(), "—")]
             } else {
                 vec![seg(g(), data.stash_count.to_string())]

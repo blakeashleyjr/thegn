@@ -968,11 +968,16 @@ fn queue_metadata_window(paths: &[OwnedObjectPath]) -> &[OwnedObjectPath] {
 fn join_artists_bounded<'a>(names: impl IntoIterator<Item = &'a str>) -> String {
     let mut out = String::new();
     for name in names {
+        if out.len() >= MAX_FIELD_BYTES {
+            break;
+        }
         if !out.is_empty() {
+            if out.len() + 2 >= MAX_FIELD_BYTES {
+                break;
+            }
             out.push_str(", ");
         }
-        out.push_str(name);
-        if out.len() >= MAX_FIELD_BYTES {
+        if crate::helper::push_bounded(&mut out, name, MAX_FIELD_BYTES) {
             break;
         }
     }
@@ -1161,9 +1166,17 @@ mod tests {
     fn artist_join_stops_at_the_field_budget() {
         let names = vec!["abcdefghij"; 10_000];
         let joined = join_artists_bounded(names.iter().copied());
-        assert!(joined.len() < MAX_FIELD_BYTES + 12);
+        assert!(joined.len() <= MAX_FIELD_BYTES);
         assert!(joined.starts_with("abcdefghij, abcdefghij"));
         assert_eq!(join_artists_bounded(["a", "b"]), "a, b");
+    }
+
+    #[test]
+    fn one_huge_artist_name_is_clipped_during_decode() {
+        let huge = "a".repeat(MAX_FIELD_BYTES * 8);
+        let joined = join_artists_bounded([huge.as_str()]);
+        assert_eq!(joined.len(), MAX_FIELD_BYTES);
+        assert!(joined.chars().all(|ch| ch == 'a'));
     }
 
     #[test]
