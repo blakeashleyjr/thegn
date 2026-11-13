@@ -171,6 +171,7 @@
           recordingDir = "/tmp/thegn-hm/recordings";
           recordingMaxBytes = 1048576;
           mediaEnabled = true;
+          mediaDefaultAction = "next";
           mediaShowArt = false;
           mediaOverlayOnBadgeClick = false;
           mediaSeekStepSecs = 5;
@@ -182,6 +183,8 @@
           monitorProcessIo = true;
           limitsTestCpuQuota = "200%";
           limitsTestMemMax = "2G";
+          limitsHeavySlots = 2;
+          limitsMaxLoad = 4.5;
           limitsTestMaxParallel = 2;
           limitsTestTimeoutSecs = 900;
           limitsDiscoverTimeoutSecs = 30;
@@ -203,6 +206,7 @@
           daemonIdleExitSecs = 600;
           daemonLeaseGraceSecs = 30;
           daemonStreamGapWindowSecs = 300;
+          networkMode = "offline";
           networkOfflineAfterFailures = 3;
           networkRecoveryProbeSecs = 15;
           previewEnabled = false;
