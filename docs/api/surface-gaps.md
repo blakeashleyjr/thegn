@@ -75,19 +75,14 @@ trust on this surface; not planned).
 | secret.rm             | http    | deferred    | THE-201 | control-API route deferred; CLI-only for now                                                       |
 | secret.set            | http    | deferred    | THE-201 | control-API route deferred; CLI-only for now                                                       |
 | secret.ssh.rotate     | http    | deferred    | THE-201 | control-API route deferred; CLI-only for now                                                       |
-| calendar.clocks       | mcp     | deferred    | THE-203 | MCP state tools land in the client-API phase                                                       |
-| calendar.events       | mcp     | deferred    | THE-203 | MCP state tools land in the client-API phase                                                       |
 | calendar.ingest       | mcp     | deferred    | THE-203 | MCP state tools land in the client-API phase                                                       |
 | containers.control    | mcp     | deferred    | THE-203 | container doors land in the MCP scope-gating phase                                                 |
 | containers.list       | mcp     | deferred    | THE-203 | container doors land in the MCP scope-gating phase                                                 |
-| dispatches.list       | mcp     | deferred    | THE-203 | MCP state tools land in the client-API phase                                                       |
 | dispatches.put        | mcp     | deferred    | THE-203 | MCP state tools land in the client-API phase                                                       |
 | dispatches.set_status | mcp     | deferred    | THE-203 | MCP state tools land in the client-API phase                                                       |
 | git.commit            | mcp     | deferred    | THE-203 | MCP state tools land in the client-API phase                                                       |
 | git.stage             | mcp     | deferred    | THE-203 | MCP state tools land in the client-API phase                                                       |
 | issues.comment        | mcp     | deferred    | THE-203 | MCP state tools land in the client-API phase                                                       |
-| issues.get            | mcp     | deferred    | THE-203 | MCP state tools land in the client-API phase                                                       |
-| issues.list           | mcp     | deferred    | THE-203 | MCP state tools land in the client-API phase                                                       |
 | issues.update         | mcp     | deferred    | THE-203 | MCP state tools land in the client-API phase                                                       |
 | launch.preset         | mcp     | deferred    | THE-203 | MCP exec-scoped tools land in the MCP write-tools phase                                            |
 | merge.add             | mcp     | deferred    | THE-203 | MCP state tools land in the client-API phase                                                       |
