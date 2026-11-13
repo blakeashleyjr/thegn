@@ -1658,7 +1658,7 @@ fn every_numeric_option_matches_its_destination_range() {
             let minimum = schema.get("minimum").and_then(Value::as_f64);
             let maximum = schema.get("maximum").and_then(Value::as_f64);
             match (minimum, maximum) {
-                (Some(minimum), None) if minimum == 0.0 => {
+                (Some(0.0), None) => {
                     assert_eq!(
                         nix_type, "lib.types.numbers.nonnegative",
                         "Nix type for non-negative float field {path}"
