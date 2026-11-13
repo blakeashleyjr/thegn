@@ -43,11 +43,14 @@ issue, project-link, and task totals.
 ## Normal gates
 
 `just lint` includes `delivery-check`, the offline schema/lifecycle/ownership
-gate and its negative fixtures. `just test` begins with `contract-ratchets`,
-which pins the generated plugin API/support contract, generated control-v1
-schema, and capability-owned surface-gap ledger. The fast validator also checks
-that public plugin version, extension-point, and control-scope documentation
-matches the generated plugin snapshot.
+gate and its negative fixtures. `just test` runs one workspace-wide nextest
+suite, then performs a warm contract-discovery assertion that the generated
+plugin API/support contract, generated control-v1 schema, and capability-owned
+surface-gap ledger are all represented by at least the pinned six tests. If
+the workspace suite fails, `contract-ratchets` runs as the owner-labelled
+diagnostic; it remains available as a focused developer command. The fast
+validator also checks that public plugin version, extension-point, and
+control-scope documentation matches the generated plugin snapshot.
 
 Failures name the owning capability or active change. Update a generated
 snapshot only after making an explicit compatibility decision; do not weaken a
