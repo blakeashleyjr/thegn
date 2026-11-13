@@ -302,18 +302,35 @@ mod tests {
 
     #[test]
     fn cleanup_retry_marker_round_trips_a_refusal_class() {
-        let retry = CleanupRetry {
-            attempts: 2,
-            next_at: 1_234_567,
-            class_id: Some("claim_busy".into()),
-        };
+        for class_id in [
+            "database",
+            "identity",
+            "claim_busy",
+            "merge_claimed",
+            "unsafe",
+            "remote",
+            "resources",
+            "removal",
+        ] {
+            let retry = CleanupRetry {
+                attempts: 2,
+                next_at: 1_234_567,
+                class_id: Some(class_id.into()),
+            };
+            assert_eq!(
+                CleanupRetry::from_detail(Some(&retry.marker())),
+                Some(retry),
+                "class id must round-trip: {class_id}"
+            );
+        }
         assert_eq!(
-            retry.marker(),
+            CleanupRetry {
+                attempts: 2,
+                next_at: 1_234_567,
+                class_id: Some("claim_busy".into()),
+            }
+            .marker(),
             "thegn-cleanup-retry:v2:2:1234567:claim_busy"
-        );
-        assert_eq!(
-            CleanupRetry::from_detail(Some(&retry.marker())),
-            Some(retry)
         );
         assert_eq!(
             CleanupRetry::from_detail(Some("thegn-cleanup-retry:v1:2:1234567"))
