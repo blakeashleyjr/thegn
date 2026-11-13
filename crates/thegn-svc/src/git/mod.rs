@@ -98,7 +98,7 @@ fn bridge_git_argv(loc: &GitLoc, args: &[&str]) -> Vec<String> {
     argv
 }
 
-fn numstat_diff_args<'a>(base: &'a str) -> [&'a str; 9] {
+fn numstat_diff_args(base: &str) -> [&str; 9] {
     [
         "-c",
         "core.quotePath=true",
@@ -1470,6 +1470,7 @@ fn quote_c_path(bytes: &[u8]) -> String {
     quoted
 }
 
+#[cfg(test)]
 fn unquote_c_path(path: &str) -> Option<Vec<u8>> {
     let bytes = path.as_bytes();
     if !(bytes.len() >= 2 && bytes.first() == Some(&b'"') && bytes.last() == Some(&b'"')) {
@@ -4778,12 +4779,6 @@ mod tests {
             b"\x07\x08\x0b\x0c\r"
         );
         assert_eq!(unquote_c_path(r#""caf\303\251""#).unwrap(), b"caf\xc3\xa9");
-        assert_eq!(decode_numstat_path(r#""caf\303\251.md""#), "café.md");
-        assert_eq!(decode_numstat_path(r#""bad\377""#), r#""bad\377""#);
-        assert_eq!(
-            decode_numstat_path(r#""caf\303\251" => "x""#),
-            r#""caf\303\251" => "x""#
-        );
         assert!(unquote_c_path(r#""bad\q""#).is_none());
     }
 
