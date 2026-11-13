@@ -209,6 +209,36 @@ pub const STATE_TOOLS: &[StateToolSpec] = &[
         ],
     },
     StateToolSpec {
+        cap: "git.status",
+        description: "List changed files in a worktree. Defaults to the server's resolved \
+                      worktree when `worktree` is omitted. Read-scoped; requires a running \
+                      daemon.",
+        args: &[ArgSpec {
+            name: "worktree",
+            kind: ArgKind::String,
+            required: false,
+            description: "Absolute path of the worktree; defaults to the resolved worktree",
+        }],
+    },
+    StateToolSpec {
+        cap: "merge.list",
+        description: "List the merge queue for a worktree's repository. Defaults to the \
+                      server's resolved worktree when `worktree` is omitted. Read-scoped; \
+                      requires a running daemon.",
+        args: &[ArgSpec {
+            name: "worktree",
+            kind: ArgKind::String,
+            required: false,
+            description: "Absolute path of the worktree; defaults to the resolved worktree",
+        }],
+    },
+    StateToolSpec {
+        cap: "pr.status",
+        description: "Read cached pull-request status, one row per worktree. Read-scoped; \
+                      requires a running daemon.",
+        args: &[],
+    },
+    StateToolSpec {
         cap: "leases.list",
         description: "Relay lease state per session — which detached sessions are being \
                       kept warm, and until when. Requires a running daemon.",
@@ -612,6 +642,9 @@ pub const MCP_STATE_CAPS: &[&str] = &[
     "folders.assign",
     "editor.open",
     "preview.fetch",
+    "git.status",
+    "merge.list",
+    "pr.status",
     "leases.list",
     "me",
     "ci.runs",
@@ -935,6 +968,41 @@ mod tests {
     }
 
     #[test]
+    fn mirrored_read_tools_expose_optional_worktree_and_read_annotations() {
+        let r = StateRouter::new(vec!["git.status", "merge.list", "pr.status"], |_, _| {
+            Ok(json!(null))
+        });
+        let entries = r.tool_entries();
+        assert_eq!(entries.len(), 3);
+        for name in ["git_status", "merge_list", "pr_status"] {
+            let entry = entries
+                .iter()
+                .find(|entry| entry["name"] == name)
+                .expect(name);
+            assert_eq!(entry["annotations"]["readOnlyHint"], json!(true));
+            assert_eq!(entry["annotations"]["destructiveHint"], json!(false));
+        }
+        for name in ["git_status", "merge_list"] {
+            let entry = entries
+                .iter()
+                .find(|entry| entry["name"] == name)
+                .expect(name);
+            assert_eq!(entry["inputSchema"]["required"], json!([]));
+            assert_eq!(
+                entry["inputSchema"]["properties"]["worktree"]["type"],
+                "string"
+            );
+        }
+        assert_eq!(
+            entries[2]["inputSchema"],
+            json!({
+                "type": "object",
+                "properties": {},
+            })
+        );
+    }
+
+    #[test]
     fn folder_assignment_exposes_optional_folder_and_routes_the_mutation() {
         let r = StateRouter::new(vec!["folders.assign"], |cap, args| {
             Ok(json!({ "cap": cap, "args": args }))
@@ -1088,8 +1156,11 @@ mod tests {
             "worktrees.list",
             "worktrees.sandbox_profile",
             "preview.fetch",
+            "git.status",
+            "merge.list",
             "leases.list",
             "me",
+            "pr.status",
             "ci.runs",
             "ci.logs",
             "agent.sessions",
