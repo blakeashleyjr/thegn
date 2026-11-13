@@ -193,7 +193,7 @@ pub(crate) const LAUNCH_ROUTES: &[LaunchRoute] = &[
         path: "host commands under the shared resource ceiling (integrate_gate)",
         anchor: Some((
             "integrate_gate.rs",
-            "thegn_core::sandbox_cpucap::wrap_background_argv(",
+            "thegn_core::sandbox_cpucap::wrap_background_argv_reporting(",
         )),
     },
     LaunchRoute {
