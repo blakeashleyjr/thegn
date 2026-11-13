@@ -2929,8 +2929,8 @@ async fn dropping_a_mixed_class_pass_kills_command_children_and_siblings() {
             }),
         ),
     ]);
-    let mut pass =
-        Box::pin(router.list_events_pass(calendar_window(), &BTreeMap::new(), || true, |_| {}));
+    let tokens = BTreeMap::new();
+    let mut pass = Box::pin(router.list_events_pass(calendar_window(), &tokens, || true, |_| {}));
     let heartbeat = tokio::select! {
         _ = &mut pass => panic!("the mixed-class pass must still be running"),
         heartbeat = wait_for_marker(&marker) => heartbeat,
