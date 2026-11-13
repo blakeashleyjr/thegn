@@ -30,6 +30,7 @@ use super::{
 #[derive(Default)]
 struct FakeApi {
     calls: Mutex<Vec<String>>,
+    issue_patches: Mutex<Vec<thegn_core::issue::IssuePatch>>,
     events: std::sync::OnceLock<tokio::sync::broadcast::Sender<Arc<EventFrame>>>,
 }
 
@@ -93,10 +94,11 @@ impl ControlApi for FakeApi {
     fn issues_update<'a>(
         &'a self,
         id: &'a str,
-        _patch: &'a thegn_core::issue::IssuePatch,
+        patch: &'a thegn_core::issue::IssuePatch,
         repo: Option<&'a str>,
         account: Option<&'a str>,
     ) -> BoxFuture<'a, ControlResult<thegn_core::issue::Issue>> {
+        self.issue_patches.lock().unwrap().push(patch.clone());
         let mut call = repo.map_or_else(
             || format!("issues_update:{id}"),
             |repo| format!("issues_update:{id}:repo={repo}"),
@@ -455,6 +457,21 @@ impl ControlApi for FakeApi {
     ) -> BoxFuture<'_, ControlResult<super::DispatchPage>> {
         self.record(&format!("dispatches_list:before={before:?}:limit={limit}"));
         Box::pin(async { Ok(super::DispatchPage::default()) })
+    }
+
+    fn dispatch_put(
+        &self,
+        req: super::DispatchPutReq,
+    ) -> BoxFuture<'_, ControlResult<thegn_core::issue::AgentDispatch>> {
+        self.record(&format!(
+            "dispatch_put:{}:{}:{}:{:?}",
+            req.issue_id, req.worktree_path, req.agent_name, req.lead
+        ));
+        Box::pin(async {
+            Err(super::ControlError::Unimplemented(
+                "recording dispatch fixture",
+            ))
+        })
     }
 
     fn dispatch_set_status(
@@ -1055,6 +1072,183 @@ async fn grpc_issue_handlers_authenticate_and_forward_context() {
         [
             "issues_list:repo=/tmp/repo",
             "issues_get:linear:ABC-1:repo=/tmp/repo:account=work"
+        ]
+    );
+}
+
+#[cfg(feature = "control-grpc")]
+#[tokio::test]
+async fn grpc_agent_write_and_dispatch_handlers_match_http_auth_and_shapes() {
+    use super::grpc::{GrpcControl, proto};
+    use proto::control_server::Control;
+    use thegn_core::store::ControlStore;
+
+    let r = rig(false);
+    let grpc = GrpcControl {
+        api: r.api.clone(),
+        store: r.db.clone() as Arc<Mutex<dyn ControlStore + Send>>,
+        local_admin: false,
+        daemon_euid: None,
+        server_label: "test thegn".into(),
+    };
+    macro_rules! request {
+        ($token:expr, $request:expr) => {{
+            let mut request = tonic::Request::new($request);
+            request.metadata_mut().insert(
+                "authorization",
+                format!("Bearer {}", $token).parse().unwrap(),
+            );
+            request
+        }};
+    }
+    let read = token(&r, "read");
+    let write = token(&r, "write");
+
+    let update = proto::IssuesUpdateRequest {
+        id: "linear:ABC-1".into(),
+        patch: Some(proto::IssuePatch {
+            status: Some("in_progress".into()),
+            title: Some("new title".into()),
+            assignee_me: Some(true),
+            priority: Some("high".into()),
+        }),
+        repo: "/tmp/repo".into(),
+        account: "work".into(),
+    };
+    assert_eq!(
+        grpc.issues_update(request!(&read, update.clone()))
+            .await
+            .unwrap_err()
+            .code(),
+        tonic::Code::PermissionDenied
+    );
+    assert!(r.api.calls().is_empty(), "denial must not reach the API");
+    assert_eq!(
+        grpc.issues_update(request!(&write, update))
+            .await
+            .unwrap_err()
+            .code(),
+        tonic::Code::Unimplemented
+    );
+    let patch = r.api.issue_patches.lock().unwrap().pop().unwrap();
+    assert_eq!(
+        patch.status,
+        Some(thegn_core::issue::IssueStatus::InProgress)
+    );
+    assert_eq!(patch.title.as_deref(), Some("new title"));
+    assert_eq!(patch.assignee_me, Some(true));
+    assert_eq!(patch.priority, Some(thegn_core::issue::IssuePriority::High));
+
+    let comment = proto::IssuesCommentRequest {
+        id: "linear:ABC-1".into(),
+        body: "done".into(),
+        repo: "/tmp/repo".into(),
+        account: "work".into(),
+    };
+    assert_eq!(
+        grpc.issues_comment(request!(&read, comment.clone()))
+            .await
+            .unwrap_err()
+            .code(),
+        tonic::Code::PermissionDenied
+    );
+    assert_eq!(
+        grpc.issues_comment(request!(&write, comment))
+            .await
+            .unwrap_err()
+            .code(),
+        tonic::Code::Unimplemented
+    );
+
+    let list = proto::DispatchesListRequest {
+        before: Some(7),
+        limit: 5,
+    };
+    assert_eq!(
+        grpc.dispatches_list(request!(&write, list.clone()))
+            .await
+            .unwrap_err()
+            .code(),
+        tonic::Code::PermissionDenied
+    );
+    let list_reply = grpc
+        .dispatches_list(request!(&read, list))
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(list_reply.dispatches_json, "[]");
+    assert!(!list_reply.truncated);
+    assert_eq!(list_reply.next_before, None);
+
+    let invalid_limit = proto::DispatchesListRequest {
+        before: None,
+        limit: 4097,
+    };
+    assert_eq!(
+        grpc.dispatches_list(request!(&read, invalid_limit))
+            .await
+            .unwrap_err()
+            .code(),
+        tonic::Code::InvalidArgument
+    );
+
+    let put = proto::DispatchesPutRequest {
+        issue_id: "linear:ABC-1".into(),
+        worktree_path: "/tmp/wt".into(),
+        agent_name: "coder".into(),
+        stage: Some("code".into()),
+        parent_id: Some(4),
+        session_id: Some("session-1".into()),
+        artifact_path: Some("handoff.md".into()),
+        lead: Some(proto::DispatchLead {
+            lease: "repo:linear:ABC-1".into(),
+            owner: "lead".into(),
+            lease_gen: Some(2),
+        }),
+    };
+    assert_eq!(
+        grpc.dispatches_put(request!(&read, put.clone()))
+            .await
+            .unwrap_err()
+            .code(),
+        tonic::Code::PermissionDenied
+    );
+    assert_eq!(
+        grpc.dispatches_put(request!(&write, put))
+            .await
+            .unwrap_err()
+            .code(),
+        tonic::Code::Unimplemented
+    );
+
+    let set_status = proto::DispatchesSetStatusRequest {
+        id: 42,
+        status: "running".into(),
+        lead: None,
+    };
+    assert_eq!(
+        grpc.dispatches_set_status(request!(&read, set_status.clone()))
+            .await
+            .unwrap_err()
+            .code(),
+        tonic::Code::PermissionDenied
+    );
+    let status = grpc
+        .dispatches_set_status(request!(&write, set_status))
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(status.id, 42);
+    assert_eq!(status.status, "running");
+
+    assert_eq!(
+        r.api.calls(),
+        [
+            "issues_update:linear:ABC-1:repo=/tmp/repo:account=work",
+            "issues_comment:linear:ABC-1:repo=/tmp/repo:account=work",
+            "dispatches_list:before=Some(7):limit=5",
+            "dispatch_put:linear:ABC-1:/tmp/wt:coder:Some(DispatchLeadReq { lease: \"repo:linear:ABC-1\", owner: \"lead\", lease_gen: Some(2) })",
+            "dispatch_set_status:42:running",
         ]
     );
 }

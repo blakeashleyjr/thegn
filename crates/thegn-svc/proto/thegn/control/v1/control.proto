@@ -55,6 +55,13 @@ service Control {
   // Tracker issue listing and detail, carried as the control API's JSON wire.
   rpc IssuesList(IssuesListRequest) returns (IssuesListReply);
   rpc IssuesGet(IssuesGetRequest) returns (IssuesGetReply);
+  rpc IssuesUpdate(IssuesUpdateRequest) returns (IssuesUpdateReply);
+  rpc IssuesComment(IssuesCommentRequest) returns (IssuesCommentReply);
+  // Agent-dispatch roster operations. List uses the same bounded keyset page
+  // as HTTP; rich rows are returned as the control API's JSON wire.
+  rpc DispatchesList(DispatchesListRequest) returns (DispatchesListReply);
+  rpc DispatchesPut(DispatchesPutRequest) returns (DispatchesPutReply);
+  rpc DispatchesSetStatus(DispatchesSetStatusRequest) returns (DispatchesSetStatusReply);
   // Push a notification into the tray; returns the stored row id.
   rpc NotifyPush(NotifyPushRequest) returns (NotifyPushReply);
   rpc AutomationsList(AutomationsListRequest) returns (AutomationsListReply);
@@ -291,6 +298,61 @@ message IssuesGetRequest {
   string account = 3;          // configured tracker account, empty = none
 }
 message IssuesGetReply { string detail_json = 1; }
+message IssuesUpdateRequest {
+  string id = 1;
+  IssuePatch patch = 2;
+  string repo = 3;             // daemon-host filesystem path, empty = none
+  string account = 4;          // configured tracker account, empty = none
+}
+message IssuePatch {
+  optional string status = 1;      // backlog|todo|in_progress|done|cancelled
+  optional string title = 2;
+  optional bool assignee_me = 3;
+  optional string priority = 4;    // urgent|high|medium|low|none
+}
+message IssuesUpdateReply { string issue_json = 1; }
+message IssuesCommentRequest {
+  string id = 1;
+  string body = 2;
+  string repo = 3;             // daemon-host filesystem path, empty = none
+  string account = 4;          // configured tracker account, empty = none
+}
+message IssuesCommentReply { string commented = 1; }
+
+message DispatchesListRequest {
+  optional int64 before = 1;
+  uint32 limit = 2;            // 0 = HTTP default; bounded to 1..=4096
+}
+message DispatchesListReply {
+  string dispatches_json = 1;  // bounded keyset page of AgentDispatch rows
+  bool truncated = 2;
+  optional int64 next_before = 3;
+}
+message DispatchesPutRequest {
+  string issue_id = 1;
+  string worktree_path = 2;
+  string agent_name = 3;
+  optional string stage = 4;
+  optional int64 parent_id = 5;
+  optional string session_id = 6;
+  optional string artifact_path = 7;
+  DispatchLead lead = 8;
+}
+message DispatchLead {
+  string lease = 1;
+  string owner = 2;
+  optional int64 lease_gen = 3;
+}
+message DispatchesPutReply { string dispatch_json = 1; }
+message DispatchesSetStatusRequest {
+  int64 id = 1;
+  string status = 2;
+  DispatchLead lead = 3;
+}
+message DispatchesSetStatusReply {
+  int64 id = 1;
+  string status = 2;
+}
 
 message NotifyPushRequest {
   string title = 1;

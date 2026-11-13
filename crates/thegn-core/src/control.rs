@@ -374,8 +374,8 @@ pub enum Verb {
     CiLogs,
     /// Push a notification into the tray (`thegn notify push` over the API).
     NotifyPush,
-    /// Produce a redacted debug support bundle (`thegn doctor bundle`). An
-    /// operator verb: CLI + control API, never MCP or plugins.
+    /// Produce a redacted debug support bundle (`thegn doctor bundle`). A
+    /// caller-local CLI operator verb, never a remote control or tool route.
     DoctorBundle,
     /// Store a secret value into the broker (keyring/file), returning a ref.
     SecretSet,
