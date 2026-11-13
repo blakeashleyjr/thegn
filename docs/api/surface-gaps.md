@@ -11,18 +11,10 @@ trust on this surface; not planned).
 
 | Capability            | Surface | Disposition | Review  | Reason                                                                                             |
 | --------------------- | ------- | ----------- | ------- | -------------------------------------------------------------------------------------------------- |
-| search.query          | cli     | local-only  | -       | local worktree-fs verb; runs in-process, not through the control API                               |
-| search.replace        | cli     | local-only  | -       | local worktree-fs verb; runs in-process, not through the control API                               |
 | agent.sessions        | grpc    | deferred    | THE-204 | not yet mirrored in control.proto                                                                  |
 | containers.control    | grpc    | deferred    | THE-204 | container lifecycle and logs are local CLI-only; gRPC mirror lands in the client-API phase         |
 | containers.list       | grpc    | deferred    | THE-204 | container listing is local CLI-only; gRPC mirror lands in the client-API phase                     |
 | containers.prune      | grpc    | deferred    | THE-204 | prune is `thegn sandbox gc/prune` (CLI) this change; a control route lands in the client-API phase |
-| dispatches.list       | grpc    | deferred    | THE-204 | not yet mirrored in control.proto                                                                  |
-| dispatches.put        | grpc    | deferred    | THE-204 | not yet mirrored in control.proto                                                                  |
-| dispatches.set_status | grpc    | deferred    | THE-204 | not yet mirrored in control.proto                                                                  |
-| doctor.bundle         | grpc    | local-only  | -       | local CLI operator verb; no control route (bundle reads local files)                               |
-| issues.comment        | grpc    | deferred    | THE-204 | not yet mirrored in control.proto                                                                  |
-| issues.update         | grpc    | deferred    | THE-204 | not yet mirrored in control.proto                                                                  |
 | launch.preset         | grpc    | deferred    | THE-204 | not yet mirrored in control.proto                                                                  |
 | model_proxy.start     | grpc    | deferred    | THE-204 | control-API route deferred; CLI-only for now                                                       |
 | model_proxy.stats     | grpc    | deferred    | THE-204 | control-API route deferred; CLI-only for now                                                       |
@@ -40,18 +32,17 @@ trust on this surface; not planned).
 | project.new_feature   | grpc    | deferred    | THE-204 | control-API route deferred; CLI-only for now                                                       |
 | project.rename        | grpc    | deferred    | THE-204 | control-API route deferred; CLI-only for now                                                       |
 | project.rm            | grpc    | deferred    | THE-204 | control-API route deferred; CLI-only for now                                                       |
-| secret.audit          | grpc    | deferred    | THE-204 | control-API route deferred; CLI-only for now                                                       |
-| secret.list           | grpc    | deferred    | THE-204 | control-API route deferred; CLI-only for now                                                       |
-| secret.migrate        | grpc    | deferred    | THE-204 | control-API route deferred; CLI-only for now                                                       |
-| secret.rm             | grpc    | deferred    | THE-204 | control-API route deferred; CLI-only for now                                                       |
-| secret.set            | grpc    | deferred    | THE-204 | control-API route deferred; CLI-only for now                                                       |
-| secret.ssh.rotate     | grpc    | deferred    | THE-204 | control-API route deferred; CLI-only for now                                                       |
+| secret.audit          | grpc    | unsafe      | -       | control-API route deferred; CLI-only for now                                                       |
+| secret.list           | grpc    | unsafe      | -       | control-API route deferred; CLI-only for now                                                       |
+| secret.migrate        | grpc    | unsafe      | -       | control-API route deferred; CLI-only for now                                                       |
+| secret.rm             | grpc    | unsafe      | -       | control-API route deferred; CLI-only for now                                                       |
+| secret.set            | grpc    | unsafe      | -       | control-API route deferred; CLI-only for now                                                       |
+| secret.ssh.rotate     | grpc    | unsafe      | -       | control-API route deferred; CLI-only for now                                                       |
 | sessions.record       | grpc    | deferred    | THE-204 | not yet mirrored in control.proto                                                                  |
 | worktrees.create      | grpc    | deferred    | THE-204 | not yet mirrored in control.proto                                                                  |
 | containers.control    | http    | deferred    | THE-201 | container lifecycle and logs are local CLI-only; HTTP mirror lands in the client-API phase         |
 | containers.list       | http    | deferred    | THE-201 | container listing is local CLI-only; HTTP mirror lands in the client-API phase                     |
 | containers.prune      | http    | deferred    | THE-201 | prune is `thegn sandbox gc/prune` (CLI) this change; a control route lands in the client-API phase |
-| doctor.bundle         | http    | local-only  | -       | local CLI operator verb; no control route (bundle reads local files)                               |
 | launch.preset         | http    | deferred    | THE-201 | CLI-first (`open --preset` via the intents mailbox); an HTTP route is a follow-up                  |
 | model_proxy.start     | http    | deferred    | THE-201 | control-API route deferred; CLI-only for now                                                       |
 | model_proxy.stats     | http    | deferred    | THE-201 | control-API route deferred; CLI-only for now                                                       |
@@ -69,12 +60,12 @@ trust on this surface; not planned).
 | project.new_feature   | http    | deferred    | THE-201 | control-API route deferred; CLI-only for now                                                       |
 | project.rename        | http    | deferred    | THE-201 | control-API route deferred; CLI-only for now                                                       |
 | project.rm            | http    | deferred    | THE-201 | control-API route deferred; CLI-only for now                                                       |
-| secret.audit          | http    | deferred    | THE-201 | control-API route deferred; CLI-only for now                                                       |
-| secret.list           | http    | deferred    | THE-201 | control-API route deferred; CLI-only for now                                                       |
-| secret.migrate        | http    | deferred    | THE-201 | control-API route deferred; CLI-only for now                                                       |
-| secret.rm             | http    | deferred    | THE-201 | control-API route deferred; CLI-only for now                                                       |
-| secret.set            | http    | deferred    | THE-201 | control-API route deferred; CLI-only for now                                                       |
-| secret.ssh.rotate     | http    | deferred    | THE-201 | control-API route deferred; CLI-only for now                                                       |
+| secret.audit          | http    | unsafe      | -       | control-API route deferred; CLI-only for now                                                       |
+| secret.list           | http    | unsafe      | -       | control-API route deferred; CLI-only for now                                                       |
+| secret.migrate        | http    | unsafe      | -       | control-API route deferred; CLI-only for now                                                       |
+| secret.rm             | http    | unsafe      | -       | control-API route deferred; CLI-only for now                                                       |
+| secret.set            | http    | unsafe      | -       | control-API route deferred; CLI-only for now                                                       |
+| secret.ssh.rotate     | http    | unsafe      | -       | control-API route deferred; CLI-only for now                                                       |
 | calendar.ingest       | mcp     | deferred    | THE-203 | MCP state tools land in the client-API phase                                                       |
 | containers.control    | mcp     | deferred    | THE-203 | container doors land in the MCP scope-gating phase                                                 |
 | containers.list       | mcp     | deferred    | THE-203 | container doors land in the MCP scope-gating phase                                                 |
