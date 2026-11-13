@@ -258,14 +258,14 @@ fn gather(
             issue_id: row.issue_id.clone(),
             stage: stage.clone(),
             status: row.status,
-            // The contract of `worker_live`: unknown maps to `true`. That is
-            // exactly what `row_liveness` returns for a row with no exit stamp,
-            // so the mapping is one match rather than a hand-rolled guess.
+            // The contract of `worker_live`: unknown maps to `true`. Parked
+            // rows free a stage slot but still need the exit-stamp safety rule.
             worker_live: match pipeline_run::row_liveness(&row, now_ms) {
                 RowLiveness::Live => true,
-                RowLiveness::Parked
-                | RowLiveness::ExitedUnverified { .. }
-                | RowLiveness::Closed => false,
+                // Parked frees the stage slot, but an absent exit stamp still
+                // means "a worker may be writing here" (LaneFacts contract).
+                RowLiveness::Parked => row.exit_code.is_none() && row.exited_at_ms.is_none(),
+                RowLiveness::ExitedUnverified { .. } | RowLiveness::Closed => false,
             },
             merged_into_target: git.merged_into_target,
             enqueued: queued.iter().any(|w| w == &row.worktree_path),
@@ -794,6 +794,27 @@ mod tests {
             vec![matched]
         );
         assert!(!lanes.iter().any(|lane| lane.row.id == other));
+    }
+
+    #[test]
+    fn an_unstamped_parked_row_keeps_worker_live_unknown_safe() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Db::open_at(&dir.path().join("sup.db")).unwrap();
+        let worktree_path = dir.path().display().to_string();
+        let id = insert_issue_row(
+            &db,
+            "linear:THE-407",
+            &worktree_path,
+            AgentDispatchStatus::WaitingHuman,
+        );
+
+        let lanes = gather(&Config::default(), &db, None, false, RosterPage::default()).unwrap();
+        let lane = lanes.iter().find(|lane| lane.row.id == id).unwrap();
+        assert_eq!(
+            pipeline_run::row_liveness(&lane.row, 0),
+            RowLiveness::Parked
+        );
+        assert!(lane.facts.worker_live);
     }
 
     #[test]
