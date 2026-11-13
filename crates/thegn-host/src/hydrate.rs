@@ -3106,6 +3106,10 @@ fn stash_read_unknown(stash_count: &anyhow::Result<usize>) -> bool {
     stash_count.is_err()
 }
 
+fn reused_stash_count(stash_count: Option<usize>) -> anyhow::Result<usize> {
+    stash_count.ok_or_else(|| anyhow::anyhow!("stash count unavailable in reused panel snapshot"))
+}
+
 /// Build diff files using the porcelain letter, `B` for binary, and `M` as the fallback.
 fn panel_diff_files(
     entries: &[thegn_svc::git::DiffEntry],
@@ -3324,7 +3328,7 @@ pub(crate) fn build_panel(
         });
         let h_stash_count = s.spawn(|| {
             if let Some(c) = &cached_reads {
-                return Ok(c.stash_count.unwrap_or_default());
+                return reused_stash_count(c.stash_count);
             }
             let _cpu = crate::perf::measure(crate::perf::Subsys::HydrateChild);
             crate::git_handle::get().stash_count(&loc)

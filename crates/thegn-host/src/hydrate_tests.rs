@@ -112,6 +112,17 @@ fn failed_diff_and_stash_reads_are_marked_unknown() {
 }
 
 #[test]
+fn reused_snapshot_without_stash_count_stays_unknown() {
+    let result = reused_stash_count(None);
+
+    assert!(result.is_err());
+    assert_eq!(
+        result.unwrap_err().to_string(),
+        "stash count unavailable in reused panel snapshot"
+    );
+}
+
+#[test]
 fn dropped_panel_prefetch_completion_sends_failed_generation_and_rearms_latch() {
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
     let path = std::path::PathBuf::from("/repo/wt");
