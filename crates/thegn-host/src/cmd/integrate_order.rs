@@ -21,8 +21,9 @@ pub(crate) fn fixup_hint(
         return None;
     }
     Some(format!(
-        "Fix across lanes: thegn session open --agent <agent> --worktree {} --stage integration-fixup --brief-file <brief> --vars target={into}",
-        worktree.display()
+        "Fix across lanes: thegn session open --agent <agent> --worktree {} --stage integration-fixup --brief-file <brief> --vars {}",
+        thegn_core::util::sh_quote(&worktree.display().to_string()),
+        thegn_core::util::sh_quote(&format!("target={into}")),
     ))
 }
 
@@ -170,6 +171,14 @@ mod tests {
     fn fixup_hint_names_a_failed_gate() {
         let worktree = tempfile::tempdir().expect("temporary worktree");
         assert!(fixup_hint("stack", Some(worktree.path()), FoldState::GateFailed).is_some());
+    }
+
+    #[test]
+    fn fixup_hint_quotes_worktree_and_target() {
+        let hint = fixup_hint("a;b", Some(Path::new("/tmp/my wt")), FoldState::GateFailed)
+            .expect("failed gate should produce a hint");
+        assert!(hint.contains("--worktree '/tmp/my wt'"));
+        assert!(hint.contains("--vars 'target=a;b'"));
     }
 
     #[test]
