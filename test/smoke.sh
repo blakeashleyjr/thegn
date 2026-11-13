@@ -1021,6 +1021,10 @@ git -C "$LM" -c commit.gpgsign=false add -A
 git -C "$LM" -c commit.gpgsign=false commit -q -m "smoke manual land"
 check "thegn land records the manual landed row" \
   "'$SZ' land --worktree '$LM' | grep -q 'landed'"
+# shellcheck disable=SC2034 # read by the check body below through eval
+manual_land_roster="$("$SZ" dispatch list --json)"
+check "manual land records exactly one dispatch roster row" \
+  "printf '%s' \"\$manual_land_roster\" | python3 -c 'import json,sys; rows=json.load(sys.stdin); assert len(rows) == 1, rows; assert rows[0][\"issue_id\"] == \"local:smoke-manual-land\", rows'"
 LM_OID="$(git -C "$R" rev-parse main)"
 check "manual land records the exact fold OID and target" \
   "[[ \$(sqlite3 \"$XDG_STATE_HOME/thegn/thegn.db\" \"SELECT status || '|' || target_branch || '|' || result_oid FROM merge_queue WHERE branch='$LB'\") == 'landed|main|$LM_OID' ]]"
@@ -1799,10 +1803,13 @@ check "session wait/split without a daemon exit 1 with a clear message" \
 # human), and set-status validates its inputs (closed status set + real id)
 # before touching the DB, so a supervisor never corrupts the ledger it resumes
 # from.
+# These checks intentionally use a fresh state: the THE-692 manual land above
+# proves that a non-root land is now represented in the normal roster.
+DISPATCH_EMPTY_STATE="$TMP/dispatch-empty-state"
 check "dispatch list --json is a clean empty array" \
-  "[[ \$('$SZ' dispatch list --json) == '[]' ]]"
+  "[[ \$(XDG_STATE_HOME='$DISPATCH_EMPTY_STATE' '$SZ' dispatch list --json) == '[]' ]]"
 check "dispatch list (human) says the roster is empty" \
-  "'$SZ' dispatch list | grep -q 'no dispatches'"
+  "XDG_STATE_HOME='$DISPATCH_EMPTY_STATE' '$SZ' dispatch list | grep -q 'no dispatches'"
 check "dispatch set-status rejects a status outside the closed set" \
   "'$SZ' dispatch set-status 1 bogus >/dev/null 2>&1; [[ \$? -ne 0 ]]"
 queued_matrix_row="$("$SZ" dispatch put linear:SMOKE-MATRIX "$R" claude | sed -n 's/^dispatch \([0-9]*\) .*/\1/p')"
