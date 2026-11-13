@@ -326,6 +326,7 @@ pub fn spawn_detector(
     tx: UnboundedSender<ForwardEvent>,
     waker: TerminalWaker,
     manual_forwards: ManualForwards,
+    auto_probe: Arc<std::sync::atomic::AtomicBool>,
 ) {
     // Failures widen the sleep up to this cap (e.g. when no worktree is
     // sandboxed); a successful probe resets it to `poll`.
@@ -373,10 +374,10 @@ pub fn spawn_detector(
                 // held forever, a same-port restart never re-established
                 // its forwards until a worktree switch away and back.)
                 let mut pulsed = false;
-                let manual_runtime = if manual_requests
+                let manual_requests_for_wt = manual_requests
                     .iter()
-                    .any(|(requested, _)| requested == &wt)
-                {
+                    .any(|(requested, _)| requested == &wt);
+                let manual_runtime = if manual_requests_for_wt {
                     match runtime.clone() {
                         Some(prefix) => Some(prefix),
                         None => thegn_svc::forward::resolve_container_runtime(&container)
@@ -393,67 +394,81 @@ pub fn spawn_detector(
                             pulsed = true;
                         }
                     }
+                } else if manual_requests_for_wt {
+                    if tx
+                        .send(ForwardEvent::Refused {
+                            worktree: wt.clone(),
+                            reason: format!("manual forward: no container runtime for {container}"),
+                        })
+                        .is_ok()
+                    {
+                        pulsed = true;
+                    }
                 }
-                let probe = match runtime.as_deref() {
-                    Some(prefix) => thegn_svc::forward::probe_ports_in(prefix, &container)
-                        .map(|ports| (prefix.to_vec(), ports)),
-                    None => thegn_svc::forward::resolve_container_runtime(&container),
-                };
-                match probe {
-                    Err(error) => {
-                        runtime = None;
-                        if let Some(refusal) =
-                            error.downcast_ref::<thegn_svc::forward::AmbiguousRuntime>()
-                        {
-                            let reason = refusal.to_string();
-                            if should_report(&mut reported, &reason)
-                                && tx
-                                    .send(ForwardEvent::Refused {
+                if auto_probe.load(std::sync::atomic::Ordering::Relaxed) {
+                    let probe = match runtime.as_deref() {
+                        Some(prefix) => thegn_svc::forward::probe_ports_in(prefix, &container)
+                            .map(|ports| (prefix.to_vec(), ports)),
+                        None => thegn_svc::forward::resolve_container_runtime(&container),
+                    };
+                    match probe {
+                        Err(error) => {
+                            runtime = None;
+                            if let Some(refusal) =
+                                error.downcast_ref::<thegn_svc::forward::AmbiguousRuntime>()
+                            {
+                                let reason = refusal.to_string();
+                                if should_report(&mut reported, &reason)
+                                    && tx
+                                        .send(ForwardEvent::Refused {
+                                            worktree: wt.clone(),
+                                            reason,
+                                        })
+                                        .is_ok()
+                                {
+                                    pulsed = true;
+                                }
+                            }
+                            probe_failures += 1;
+                            if probe_failures >= 3 && !last.is_empty() {
+                                last.clear();
+                            }
+                        }
+                        Ok((rt, now)) => {
+                            runtime = Some(rt.clone());
+                            reported = None;
+                            probe_failures = 0;
+                            sleep = poll;
+                            let (appeared, disappeared) = diff_listening(&last, &now);
+                            last = now;
+                            for p in appeared {
+                                if tx
+                                    .send(ForwardEvent::Detected {
                                         worktree: wt.clone(),
-                                        reason,
+                                        container_port: p,
+                                        runtime: rt.clone(),
+                                        manual: false,
                                     })
                                     .is_ok()
-                            {
-                                pulsed = true;
+                                {
+                                    pulsed = true;
+                                }
                             }
-                        }
-                        probe_failures += 1;
-                        if probe_failures >= 3 && !last.is_empty() {
-                            last.clear();
-                        }
-                    }
-                    Ok((rt, now)) => {
-                        runtime = Some(rt.clone());
-                        reported = None;
-                        probe_failures = 0;
-                        sleep = poll;
-                        let (appeared, disappeared) = diff_listening(&last, &now);
-                        last = now;
-                        for p in appeared {
-                            if tx
-                                .send(ForwardEvent::Detected {
-                                    worktree: wt.clone(),
-                                    container_port: p,
-                                    runtime: rt.clone(),
-                                    manual: false,
-                                })
-                                .is_ok()
-                            {
-                                pulsed = true;
-                            }
-                        }
-                        for p in disappeared {
-                            if tx
-                                .send(ForwardEvent::Vanished {
-                                    worktree: wt.clone(),
-                                    container_port: p,
-                                })
-                                .is_ok()
-                            {
-                                pulsed = true;
+                            for p in disappeared {
+                                if tx
+                                    .send(ForwardEvent::Vanished {
+                                        worktree: wt.clone(),
+                                        container_port: p,
+                                    })
+                                    .is_ok()
+                                {
+                                    pulsed = true;
+                                }
                             }
                         }
                     }
+                } else {
+                    sleep = poll;
                 }
                 if pulsed {
                     let _ = waker.wake(); // best-effort: waker pulse: an input nudge must never fail the calling path
@@ -537,6 +552,25 @@ mod tests {
                 manual: true,
             }]
         );
+    }
+
+    #[test]
+    fn auto_probe_is_gated_by_the_live_setting() {
+        let source = include_str!("forward.rs");
+        let detector = source
+            .split_once("pub fn spawn_detector(")
+            .map(|(_, body)| body)
+            .expect("detector source");
+        assert!(detector.contains("if auto_probe.load(std::sync::atomic::Ordering::Relaxed)"));
+        assert!(detector.contains("} else {\n                    sleep = poll;"));
+    }
+
+    #[test]
+    fn unresolved_manual_runtime_reports_a_refusal() {
+        let source = include_str!("forward.rs");
+        assert!(source.contains("let manual_requests_for_wt = manual_requests"));
+        assert!(source.contains("} else if manual_requests_for_wt {"));
+        assert!(source.contains("manual forward: no container runtime for {container}"));
     }
 
     #[test]

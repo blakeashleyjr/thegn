@@ -7563,27 +7563,29 @@ async fn event_loop<T: Terminal>(
         std::sync::Arc::new(std::sync::Mutex::new(None));
     let manual_forwards: crate::forward::ManualForwards =
         std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let forward_auto_probe = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(
+        keymap.config().forward.auto,
+    ));
     // The worktree the detector last watched — when it changes, the old
     // worktree's forwards are torn down (the detector tracks one worktree, so it
     // can't see its ports vanish once we switch away; they re-detect on return).
     let mut last_forward_target: Option<String> = None;
-    if keymap.config().forward.auto {
-        // Forwards aren't resurrected blindly (the dev server may be gone): wipe
-        // stale rows and let the detector re-discover live ports.
-        crate::db_task::persist(|db| {
-            for row in db.list_forwards().unwrap_or_default() {
-                if let Err(error) = db.delete_forward(&row.worktree, row.container_port) {
-                    tracing::debug!(target: "thegn::db", %error, "stale forward cache delete failed");
-                }
+    // Forwards aren't resurrected blindly (the dev server may be gone): wipe
+    // stale rows and let the detector or a manual request re-discover live ports.
+    crate::db_task::persist(|db| {
+        for row in db.list_forwards().unwrap_or_default() {
+            if let Err(error) = db.delete_forward(&row.worktree, row.container_port) {
+                tracing::debug!(target: "thegn::db", %error, "stale forward cache delete failed");
             }
-        });
-    }
+        }
+    });
     crate::forward::spawn_detector(
         forward_target.clone(),
         std::time::Duration::from_secs(keymap.config().forward.poll_secs.max(1)),
         forward_tx,
         waker.clone(),
         manual_forwards.clone(),
+        forward_auto_probe.clone(),
     );
 
     // LSP: lazy, warm language servers per worktree. Clients publish into a
@@ -15607,6 +15609,10 @@ async fn event_loop<T: Terminal>(
                 }
                 last_forward_target = target.clone();
             }
+            forward_auto_probe.store(
+                current_config.forward.auto,
+                std::sync::atomic::Ordering::Relaxed,
+            );
             *forward_target.lock().unwrap() = target;
         }
 
@@ -19727,14 +19733,7 @@ async fn event_loop<T: Terminal>(
                                     HostInputKind::ForwardPort => {
                                         match crate::forward::parse_manual_port(&text) {
                                             Ok(port) => {
-                                                if let Some(wt) = session
-                                                    .active_group()
-                                                    .filter(|group| {
-                                                        group.kind == GroupKind::Branch
-                                                            && !group.path.is_empty()
-                                                    })
-                                                    .map(|group| group.path.clone())
-                                                {
+                                                if let Some(wt) = last_forward_target.clone() {
                                                     if forward_supervisor.has(&wt, port) {
                                                         model.status = format!(
                                                             "Forward :{port} is already active"
@@ -19751,7 +19750,7 @@ async fn event_loop<T: Terminal>(
                                                     }
                                                 } else {
                                                     model.status =
-                                                        "Forward: no active worktree".into();
+                                                        "Forward: the active worktree has no container sandbox".into();
                                                 }
                                             }
                                             Err(error) => {
@@ -28707,6 +28706,33 @@ mod branch_shortcut_status_tests {
                 "missing no-selection status: {arm}"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod forward_review_tests {
+    #[test]
+    fn manual_forward_uses_detector_target_and_explains_missing_sandbox() {
+        let source = include_str!("run.rs");
+        let arm = source
+            .split_once("HostInputKind::ForwardPort =>")
+            .and_then(|(_, rest)| rest.split_once("HostInputKind::SaveLayout"))
+            .map(|(arm, _)| arm)
+            .expect("forward input arm");
+        assert!(arm.contains("if let Some(wt) = last_forward_target.clone()"));
+        assert!(arm.contains("Forward: the active worktree has no container sandbox"));
+    }
+
+    #[test]
+    fn stale_forward_rows_are_wiped_regardless_of_auto_policy() {
+        let source = include_str!("run.rs");
+        let startup = source
+            .split_once("let manual_forwards:")
+            .and_then(|(_, rest)| rest.split_once("crate::forward::spawn_detector"))
+            .map(|(startup, _)| startup)
+            .expect("forward detector startup");
+        assert!(startup.contains("crate::db_task::persist(|db|"));
+        assert!(!startup.contains("if keymap.config().forward.auto"));
     }
 }
 
