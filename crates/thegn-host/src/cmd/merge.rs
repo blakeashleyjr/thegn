@@ -581,6 +581,7 @@ struct ListedRow<'a> {
     row: &'a thegn_core::db::MergeQueueRow,
     claim: Option<ClaimJson>,
     landed: Option<thegn_core::db_merge_landed::MergeLandedProvenance>,
+    cleanup_class: Option<String>,
 }
 
 #[derive(serde::Serialize, Debug, Clone, PartialEq, Eq)]
@@ -700,6 +701,10 @@ fn list(json: bool) -> Result<()> {
             row,
             claim: claim_json(view.as_ref(), now_ms),
             landed,
+            cleanup_class: thegn_core::merge_sweep::CleanupRetry::from_detail(
+                row.error_detail.as_deref(),
+            )
+            .and_then(|retry| retry.class_id),
         });
     }
     if json {
@@ -1886,6 +1891,7 @@ mod list_claim_tests {
             row: &fixture_row,
             claim: claim_json(Some(&view), 100),
             landed: None,
+            cleanup_class: None,
         };
         let value = serde_json::to_value(listed).unwrap();
         assert_eq!(value["worktree"], "/repo/worktree");
@@ -1901,6 +1907,7 @@ mod list_claim_tests {
             row: &fixture_row,
             claim: claim_json(None, 100),
             landed: None,
+            cleanup_class: None,
         };
         let unclaimed_value = serde_json::to_value(unclaimed).unwrap();
         assert!(unclaimed_value["claim"].is_null());
@@ -1917,11 +1924,37 @@ mod list_claim_tests {
             row: &fixture_row,
             claim: claim_json(Some(&view), 100),
             landed: None,
+            cleanup_class: None,
         };
 
         let value = serde_json::to_value(listed).unwrap();
         assert_eq!(value["identity_drift"]["reason"], "r");
         assert_eq!(value["claim"]["phase"], "claimed_no_child");
+    }
+
+    #[test]
+    fn listed_row_json_surfaces_cleanup_class_id() {
+        let mut fixture_row = row();
+        fixture_row.error_detail = Some(
+            thegn_core::merge_sweep::CleanupRetry {
+                attempts: 1,
+                next_at: 42,
+                class_id: Some("removal".into()),
+            }
+            .marker(),
+        );
+        let listed = ListedRow {
+            row: &fixture_row,
+            claim: None,
+            landed: None,
+            cleanup_class: thegn_core::merge_sweep::CleanupRetry::from_detail(
+                fixture_row.error_detail.as_deref(),
+            )
+            .and_then(|retry| retry.class_id),
+        };
+
+        let value = serde_json::to_value(listed).unwrap();
+        assert_eq!(value["cleanup_class"], "removal");
     }
 
     #[test]
@@ -2107,6 +2140,7 @@ mod list_claim_tests {
             row: &fixture_row,
             claim: None,
             landed: None,
+            cleanup_class: None,
         };
         let unlanded_value = serde_json::to_value(unlanded).unwrap();
         assert!(unlanded_value["landed"].is_null());
@@ -2122,6 +2156,7 @@ mod list_claim_tests {
                 target_base_oid: Some(base.clone()),
                 result_oid: result.clone(),
             }),
+            cleanup_class: None,
         };
         let landed_value = serde_json::to_value(landed).unwrap();
         assert_eq!(landed_value["landed"]["source_oid"], source);
@@ -2136,6 +2171,7 @@ mod list_claim_tests {
                 target_base_oid: Some("b".repeat(40)),
                 result_oid: "c".repeat(40),
             }),
+            cleanup_class: None,
         };
         let source_missing_value = serde_json::to_value(source_missing).unwrap();
         assert!(source_missing_value["landed"]["source_oid"].is_null());

@@ -200,8 +200,9 @@ fn cleanup_retry_defer_writes_marker_without_touching_updated_at() {
     let retry = CleanupRetry {
         attempts: 1,
         next_at: 987_654,
+        class_id: None,
     };
-    assert!(db.defer_merge_cleanup(&selected, retry).unwrap());
+    assert!(db.defer_merge_cleanup(&selected, retry.clone()).unwrap());
     let mut expected = selected.clone();
     expected.error_detail = Some(retry.marker());
     assert_eq!(db.list_merge_queue().unwrap(), [expected]);
@@ -219,31 +220,33 @@ fn cleanup_retry_defer_refuses_changed_held_or_unlanded_rows() {
     let retry = CleanupRetry {
         attempts: 2,
         next_at: 999,
+        class_id: None,
     };
     db.conn()
         .execute("UPDATE merge_queue SET updated_at=23", [])
         .unwrap();
-    assert!(!db.defer_merge_cleanup(&selected, retry).unwrap());
+    assert!(!db.defer_merge_cleanup(&selected, retry.clone()).unwrap());
 
     let (db, selected) = retry_fixture();
     assert!(db.hold_merge_cleanup(&selected).unwrap());
     let held = db.list_merge_queue().unwrap().remove(0);
-    assert!(!db.defer_merge_cleanup(&held, retry).unwrap());
+    assert!(!db.defer_merge_cleanup(&held, retry.clone()).unwrap());
 
     let (db, selected) = retry_fixture();
     db.conn()
         .execute("UPDATE merge_queue SET status='queued'", [])
         .unwrap();
-    assert!(!db.defer_merge_cleanup(&selected, retry).unwrap());
+    assert!(!db.defer_merge_cleanup(&selected, retry.clone()).unwrap());
 
     let (db, selected) = retry_fixture();
-    assert!(db.defer_merge_cleanup(&selected, retry).unwrap());
+    assert!(db.defer_merge_cleanup(&selected, retry.clone()).unwrap());
     let marked = db.list_merge_queue().unwrap().remove(0);
     let next = CleanupRetry {
         attempts: 3,
         next_at: 1_999,
+        class_id: None,
     };
-    assert!(db.defer_merge_cleanup(&marked, next).unwrap());
+    assert!(db.defer_merge_cleanup(&marked, next.clone()).unwrap());
     let next_marker = next.marker();
     assert_eq!(
         db.list_merge_queue().unwrap()[0].error_detail.as_deref(),
@@ -255,7 +258,7 @@ fn cleanup_retry_defer_refuses_changed_held_or_unlanded_rows() {
         .execute("UPDATE merge_queue SET error_detail='operator detail'", [])
         .unwrap();
     selected.error_detail = Some("operator detail".into());
-    assert!(db.defer_merge_cleanup(&selected, retry).unwrap());
+    assert!(db.defer_merge_cleanup(&selected, retry.clone()).unwrap());
     let retry_marker = retry.marker();
     assert_eq!(
         db.list_merge_queue().unwrap()[0].error_detail.as_deref(),
@@ -267,5 +270,5 @@ fn cleanup_retry_defer_refuses_changed_held_or_unlanded_rows() {
         .execute("UPDATE merge_queue SET error_detail=''", [])
         .unwrap();
     selected.error_detail = Some(String::new());
-    assert!(db.defer_merge_cleanup(&selected, retry).unwrap());
+    assert!(db.defer_merge_cleanup(&selected, retry.clone()).unwrap());
 }
