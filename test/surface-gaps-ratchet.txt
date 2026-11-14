@@ -22,20 +22,12 @@
 #   grpc    — the control.proto mirror lags HTTP: each row is a proto message +
 #             handler addition, no new logic.
 #   mcp     — the state tools are not landed yet (the MCP write-tools branch
-#             retires these); scope-gated container tools land with it.
+#             retires these).
 #   http    — the CLI-first operator families (`secret.*`, `project.*`,
-#             `containers.*`, `doctor.bundle`) run against
+#             `doctor.bundle`) run against
 #             local custody today; a remote-operator route is future work.
 
 calendar.ingest	mcp	MCP state tools land in the client-API phase
-containers.control	grpc	container lifecycle and logs are local CLI-only; gRPC mirror lands in the client-API phase
-containers.control	http	container lifecycle and logs are local CLI-only; HTTP mirror lands in the client-API phase
-containers.control	mcp	container doors land in the MCP scope-gating phase
-containers.list	grpc	container listing is local CLI-only; gRPC mirror lands in the client-API phase
-containers.list	http	container listing is local CLI-only; HTTP mirror lands in the client-API phase
-containers.list	mcp	container doors land in the MCP scope-gating phase
-containers.prune	grpc	prune is `thegn sandbox gc/prune` (CLI) this change; a control route lands in the client-API phase
-containers.prune	http	prune is `thegn sandbox gc/prune` (CLI) this change; a control route lands in the client-API phase
 dispatches.put	mcp	MCP state tools land in the client-API phase
 dispatches.set_status	mcp	MCP state tools land in the client-API phase
 git.commit	mcp	MCP state tools land in the client-API phase
@@ -44,14 +36,6 @@ issues.comment	mcp	MCP state tools land in the client-API phase
 issues.update	mcp	MCP state tools land in the client-API phase
 merge.add	mcp	MCP state tools land in the client-API phase
 merge.clear	mcp	MCP state tools land in the client-API phase
-model_proxy.start	grpc	control-API route deferred; CLI-only for now
-model_proxy.start	http	control-API route deferred; CLI-only for now
-model_proxy.stats	grpc	control-API route deferred; CLI-only for now
-model_proxy.stats	http	control-API route deferred; CLI-only for now
-model_proxy.status	grpc	control-API route deferred; CLI-only for now
-model_proxy.status	http	control-API route deferred; CLI-only for now
-model_proxy.stop	grpc	control-API route deferred; CLI-only for now
-model_proxy.stop	http	control-API route deferred; CLI-only for now
 notify.push	mcp	MCP state tools land in the client-API phase
 project.assign	grpc	control-API route deferred; CLI-only for now
 project.assign	http	control-API route deferred; CLI-only for now
@@ -93,5 +77,4 @@ sessions.detach	mcp	MCP state tools land in the client-API phase
 sessions.resize	mcp	MCP state tools land in the client-API phase
 sessions.snapshot	mcp	MCP state tools land in the client-API phase
 sessions.split	mcp	MCP state tools land in the client-API phase
-worktrees.create	mcp	MCP state tools land in the client-API phase
 worktrees.open	mcp	MCP state tools land in the client-API phase
