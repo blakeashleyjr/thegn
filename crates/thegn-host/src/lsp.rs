@@ -1954,6 +1954,7 @@ mod tests {
         PublishedDiagnostics {
             root: PathBuf::from(root),
             path: path.to_string(),
+            scope: thegn_svc::lsp::LocationScope::InWorktree,
             diagnostics: diags,
             server_identity: "test".into(),
             generation: 1,

@@ -321,6 +321,9 @@ fn build_graph_with_file_persist_hook(
                 Err(_) => continue,
             };
             for l in locs {
+                if l.scope == thegn_svc::lsp::LocationScope::Outside {
+                    continue;
+                }
                 let cfile = l.path.clone();
                 let cline = l.line_1based();
                 // Skip self-references within the callee's own body.
@@ -651,6 +654,24 @@ mod tests {
     }
 
     #[test]
+    fn outside_references_are_skipped_before_their_path_is_parsed() {
+        let source = include_str!("blast_radius.rs");
+        let references = source
+            .split_once("for l in locs {")
+            .and_then(|(_, rest)| rest.split_once("if file_overloaded"))
+            .map(|(loop_body, _)| loop_body)
+            .expect("reference loop");
+        let skip = references
+            .find("if l.scope == thegn_svc::lsp::LocationScope::Outside")
+            .expect("outside guard");
+        let parse = references.find("ensure_parsed").expect("parse call");
+        assert!(
+            skip < parse,
+            "outside paths must be rejected before parsing"
+        );
+    }
+
+    #[test]
     fn read_blast_falls_back_when_graph_empty_then_enriches() {
         use thegn_core::semantic::{EntityChange, EntityKind, EntitySummary, Touch};
         use thegn_core::store::{SemEdgeRow, SemEntityRow};
@@ -788,6 +809,7 @@ mod tests {
                         character: ch,
                     },
                 },
+                scope: thegn_svc::lsp::LocationScope::InWorktree,
             },
             container: None,
         };
