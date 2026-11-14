@@ -19,6 +19,9 @@ use std::{
     time::{Duration, Instant},
 };
 
+#[cfg(target_os = "linux")]
+use std::path::{Path, PathBuf};
+
 struct Guard {
     pid: libc::pid_t,
     active: bool,
@@ -217,36 +220,123 @@ fn leader_exited(pid: libc::pid_t) -> io::Result<bool> {
     }
 }
 
+#[cfg(target_os = "linux")]
+const GLOBAL_SCAN_CACHE: Duration = Duration::from_millis(50);
+
+#[cfg(all(test, target_os = "linux"))]
+thread_local! {
+    static PROC_READS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static GLOBAL_PROC_SCANS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+#[derive(Default)]
+struct LivenessScan {
+    #[cfg(target_os = "linux")]
+    global: Option<(PathBuf, libc::pid_t, Instant, bool)>,
+}
+
+#[cfg(target_os = "linux")]
+fn proc_read_dir(path: &Path) -> io::Result<std::fs::ReadDir> {
+    #[cfg(test)]
+    PROC_READS.with(|reads| reads.set(reads.get().saturating_add(1)));
+    std::fs::read_dir(path)
+}
+
+#[cfg(target_os = "linux")]
+fn proc_read_to_string(path: &Path) -> io::Result<String> {
+    #[cfg(test)]
+    PROC_READS.with(|reads| reads.set(reads.get().saturating_add(1)));
+    std::fs::read_to_string(path)
+}
+
+#[cfg(target_os = "linux")]
+fn proc_stat_state_pgrp(stat: &str) -> Option<(u8, libc::pid_t)> {
+    let (_, rest) = stat.rsplit_once(')')?;
+    let mut fields = rest.split_whitespace();
+    let state = *fields.next()?.as_bytes().first()?;
+    let _ppid = fields.next()?;
+    let pgrp = fields.next()?.parse().ok()?;
+    Some((state, pgrp))
+}
+
+#[cfg(target_os = "linux")]
+fn proc_stat_live_in_group(stat: &str, pid: libc::pid_t) -> Option<bool> {
+    let (state, pgrp) = proc_stat_state_pgrp(stat)?;
+    Some(state != b'Z' && state != b'X' && pgrp == pid)
+}
+
+#[cfg(target_os = "linux")]
+fn proc_stat_is_live(stat: &str) -> Option<bool> {
+    let (state, _) = proc_stat_state_pgrp(stat)?;
+    Some(state != b'Z' && state != b'X')
+}
+
+#[cfg(target_os = "linux")]
+fn global_group_scan(proc_root: &Path, pid: libc::pid_t) -> bool {
+    #[cfg(test)]
+    GLOBAL_PROC_SCANS.with(|scans| scans.set(scans.get().saturating_add(1)));
+    let Ok(entries) = proc_read_dir(proc_root) else {
+        return false;
+    };
+    for entry in entries.flatten() {
+        let Some(member) = entry
+            .file_name()
+            .to_str()
+            .and_then(|name| name.parse::<libc::pid_t>().ok())
+        else {
+            continue;
+        };
+        let Ok(stat) = proc_read_to_string(&entry.path().join("stat")) else {
+            continue;
+        };
+        if (member == pid && proc_stat_is_live(&stat).is_some_and(|live| live))
+            || (member != pid && proc_stat_live_in_group(&stat, pid) == Some(true))
+        {
+            return true;
+        }
+    }
+    false
+}
+
+#[cfg(target_os = "linux")]
+fn cached_global_group_scan(proc_root: &Path, pid: libc::pid_t, scan: &mut LivenessScan) -> bool {
+    if let Some((root, cached_pid, at, result)) = &scan.global
+        && root == proc_root
+        && *cached_pid == pid
+        && at.elapsed() <= GLOBAL_SCAN_CACHE
+    {
+        return *result;
+    }
+    let result = global_group_scan(proc_root, pid);
+    scan.global = Some((proc_root.to_path_buf(), pid, Instant::now(), result));
+    result
+}
+
+#[cfg(target_os = "linux")]
+fn group_live_with_scan(proc_root: &Path, pid: libc::pid_t, scan: &mut LivenessScan) -> bool {
+    if !group_exists(pid) {
+        return false;
+    }
+    let leader_stat = proc_read_to_string(&proc_root.join(pid.to_string()).join("stat"));
+    if let Ok(stat) = &leader_stat
+        && proc_stat_is_live(stat).is_some_and(|live| live)
+    {
+        return true;
+    }
+    cached_global_group_scan(proc_root, pid, scan)
+}
+
+#[cfg(all(test, target_os = "linux"))]
+fn group_live_in(proc_root: &Path, pid: libc::pid_t) -> bool {
+    let mut scan = LivenessScan::default();
+    group_live_with_scan(proc_root, pid, &mut scan)
+}
+
+#[cfg(any(test, not(target_os = "linux")))]
 fn group_live(pid: libc::pid_t) -> bool {
     #[cfg(target_os = "linux")]
     {
-        let Ok(entries) = std::fs::read_dir("/proc") else {
-            return group_exists(pid);
-        };
-        for entry in entries.flatten() {
-            let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
-                continue;
-            };
-            if let Ok(member) = name.parse::<i32>() {
-                let Ok(stat) = std::fs::read_to_string(entry.path().join("stat")) else {
-                    continue;
-                };
-                if let Some((_, rest)) = stat.rsplit_once(") ") {
-                    let fields: Vec<_> = rest.split_whitespace().collect();
-                    if fields.len() > 2
-                        && fields[0] != "Z"
-                        && fields.get(2).and_then(|field| field.parse::<i32>().ok()) == Some(pid)
-                        && member != pid
-                    {
-                        return true;
-                    }
-                    if member == pid && fields.first().is_some_and(|state| *state != "Z") {
-                        return true;
-                    }
-                }
-            }
-        }
-        false
+        group_live_in(Path::new("/proc"), pid)
     }
     #[cfg(not(target_os = "linux"))]
     {
@@ -377,9 +467,14 @@ fn wait_empty(
     out: &mut Accumulator<'_>,
     err: &mut Accumulator<'_>,
     backoff: &mut Duration,
+    #[cfg_attr(not(target_os = "linux"), allow(unused_variables))] liveness: &mut LivenessScan,
 ) -> io::Result<bool> {
     loop {
-        if !group_live(pid) {
+        #[cfg(target_os = "linux")]
+        let group_is_live = group_live_with_scan(Path::new("/proc"), pid, liveness);
+        #[cfg(not(target_os = "linux"))]
+        let group_is_live = group_live(pid);
+        if !group_is_live {
             return Ok(true);
         }
         if Instant::now() >= deadline {
@@ -593,6 +688,7 @@ fn run_inner(
         sink: None,
     };
     let mut backoff = POLL_INTERVAL;
+    let mut liveness = LivenessScan::default();
     let mut leader_first = false;
     let mut end = loop {
         if cancel.load(Ordering::Acquire) {
@@ -614,7 +710,12 @@ fn run_inner(
                         Ok(None) => {}
                         Err(_error) => {}
                     }
-                    if !group_live(pid) {
+                    #[cfg(target_os = "linux")]
+                    let group_is_live =
+                        group_live_with_scan(Path::new("/proc"), pid, &mut liveness);
+                    #[cfg(not(target_os = "linux"))]
+                    let group_is_live = group_live(pid);
+                    if !group_is_live {
                         break End::LeaderExited;
                     }
                     if out.capture.total.saturating_add(err.capture.total) > before {
@@ -660,6 +761,7 @@ fn run_inner(
                 &mut out,
                 &mut err,
                 &mut backoff,
+                &mut liveness,
             ) {
                 Ok(true) => group = GroupState::Terminated,
                 Ok(false) => {}
@@ -675,6 +777,7 @@ fn run_inner(
                 &mut out,
                 &mut err,
                 &mut backoff,
+                &mut liveness,
             ) {
                 Ok(true) => GroupState::Terminated,
                 Ok(false) => GroupState::Survivors,
@@ -682,7 +785,11 @@ fn run_inner(
             };
         }
     } else if matches!(&end, End::LeaderExited) {
-        group = if group_live(pid) {
+        #[cfg(target_os = "linux")]
+        let group_is_live = group_live_with_scan(Path::new("/proc"), pid, &mut liveness);
+        #[cfg(not(target_os = "linux"))]
+        let group_is_live = group_live(pid);
+        group = if group_is_live {
             GroupState::Terminated
         } else {
             GroupState::Drained
@@ -698,6 +805,7 @@ fn run_inner(
                     &mut out,
                     &mut err,
                     &mut backoff,
+                    &mut liveness,
                 ) {
                     Ok(_) => {}
                     Err(_error) => {}
@@ -711,6 +819,7 @@ fn run_inner(
                 &mut out,
                 &mut err,
                 &mut backoff,
+                &mut liveness,
             ) {
                 Ok(false) => group = GroupState::Survivors,
                 Ok(true) => group = GroupState::Terminated,
@@ -786,6 +895,89 @@ mod tests {
         fn path(&self) -> &Path {
             self.0.path()
         }
+    }
+
+    #[cfg(target_os = "linux")]
+    fn fake_proc_stat(pid: libc::pid_t, state: char, pgrp: libc::pid_t) -> String {
+        format!("{pid} (fixture with spaces ) {state} 1 {pgrp} 0")
+    }
+
+    #[cfg(target_os = "linux")]
+    fn fake_proc_process(root: &Path, pid: libc::pid_t, stat: &str, children: &str) {
+        let task = root
+            .join(pid.to_string())
+            .join("task")
+            .join(pid.to_string());
+        fs::create_dir_all(&task).unwrap();
+        fs::write(root.join(pid.to_string()).join("stat"), stat).unwrap();
+        fs::write(task.join("children"), children).unwrap();
+    }
+
+    #[cfg(target_os = "linux")]
+    fn fixture_group_pid() -> libc::pid_t {
+        // The real group keeps killpg(pid, 0) successful while all /proc data
+        // below is supplied by the fixture.
+        unsafe { libc::getpgrp() }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn group_live_zombies_are_dead_and_esrch_does_not_read_proc() {
+        let root = tempfile::tempdir().unwrap();
+        let pid = fixture_group_pid();
+        fake_proc_process(root.path(), pid, &fake_proc_stat(pid, 'Z', pid), "201");
+        fake_proc_process(root.path(), 201, &fake_proc_stat(201, 'Z', pid), "");
+        GLOBAL_PROC_SCANS.with(|scans| scans.set(0));
+        assert!(!group_live_in(root.path(), pid));
+        GLOBAL_PROC_SCANS.with(|scans| assert_eq!(scans.get(), 1));
+
+        PROC_READS.with(|reads| reads.set(0));
+        assert!(!group_live_in(root.path(), i32::MAX as libc::pid_t));
+        PROC_READS.with(|reads| assert_eq!(reads.get(), 0));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn group_live_finds_reparented_member_once_per_scan_window() {
+        let root = tempfile::tempdir().unwrap();
+        let pid = fixture_group_pid();
+        fake_proc_process(root.path(), pid, &fake_proc_stat(pid, 'Z', pid), "");
+        fake_proc_process(root.path(), 301, &fake_proc_stat(301, 'S', pid), "");
+        GLOBAL_PROC_SCANS.with(|scans| scans.set(0));
+        let mut scan = LivenessScan::default();
+
+        assert!(group_live_with_scan(root.path(), pid, &mut scan));
+        assert!(group_live_with_scan(root.path(), pid, &mut scan));
+        GLOBAL_PROC_SCANS.with(|scans| assert_eq!(scans.get(), 1));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn liveness_stat_parser_accepts_spaces_parentheses_and_rejects_truncated() {
+        assert_eq!(
+            proc_stat_state_pgrp("9 (name with ) spaces) S 1 9 0"),
+            Some((b'S', 9))
+        );
+        assert_eq!(proc_stat_state_pgrp("9 (truncated) S"), None);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn real_process_group_is_live_then_dead_after_kill() {
+        let mut command = Command::new("sh");
+        command.args(["-c", "sleep 5 & wait"]);
+        command.process_group(0);
+        let mut child = command.spawn().unwrap();
+        let pid = child.id() as libc::pid_t;
+        assert!(group_live(pid));
+
+        send_group_signal(pid, Signal::SIGKILL);
+        child.wait().unwrap();
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while group_live(pid) && Instant::now() < deadline {
+            std::thread::sleep(POLL_INTERVAL);
+        }
+        assert!(!group_live(pid));
     }
 
     fn command(path: &Path) -> Command {
