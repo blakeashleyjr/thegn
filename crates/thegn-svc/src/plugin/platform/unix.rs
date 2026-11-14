@@ -4,8 +4,13 @@ use std::io;
 #[cfg(target_os = "linux")]
 use std::os::fd::{FromRawFd, OwnedFd};
 use std::os::unix::process::CommandExt;
+#[cfg(target_os = "linux")]
+use std::path::Path;
 use std::process::{Child, Command, ExitStatus};
 use std::task::{Context, Poll};
+
+#[cfg(all(test, target_os = "linux"))]
+use std::sync::atomic::AtomicUsize;
 
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::signal::unix::{Signal, SignalKind, signal};
@@ -13,6 +18,27 @@ use tokio::time::Instant;
 
 #[cfg(target_os = "linux")]
 const MAX_TRACKED_DESCENDANTS: usize = 4096;
+#[cfg(target_os = "linux")]
+const MAX_DESCENDANT_DEPTH: usize = 64;
+
+#[cfg(all(test, target_os = "linux"))]
+static PROC_READS: AtomicUsize = AtomicUsize::new(0);
+#[cfg(all(test, target_os = "linux"))]
+static GLOBAL_PROC_SCANS: AtomicUsize = AtomicUsize::new(0);
+
+#[cfg(target_os = "linux")]
+fn proc_read_dir(path: &Path) -> io::Result<std::fs::ReadDir> {
+    #[cfg(test)]
+    PROC_READS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    std::fs::read_dir(path)
+}
+
+#[cfg(target_os = "linux")]
+fn proc_read_to_string(path: &Path) -> io::Result<String> {
+    #[cfg(test)]
+    PROC_READS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    std::fs::read_to_string(path)
+}
 
 #[cfg(target_os = "linux")]
 fn proc_stat_ppid_start(stat: &str) -> Option<(libc::pid_t, u64)> {
@@ -27,8 +53,25 @@ fn proc_stat_ppid_start(stat: &str) -> Option<(libc::pid_t, u64)> {
 }
 
 #[cfg(target_os = "linux")]
+/// Snapshot descendants while `root` is still unreaped: that pins the leader
+/// identity and makes the root of this walk authoritative.
 pub(crate) fn linux_descendants(root: libc::pid_t) -> Vec<(libc::pid_t, u64)> {
-    let Ok(entries) = std::fs::read_dir("/proc") else {
+    linux_descendants_in(Path::new("/proc"), root)
+}
+
+#[cfg(target_os = "linux")]
+fn linux_descendants_in(proc_root: &Path, root: libc::pid_t) -> Vec<(libc::pid_t, u64)> {
+    match linux_descendants_subtree(proc_root, root) {
+        Ok(descendants) => descendants,
+        Err(()) => linux_descendants_full(proc_root, root),
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn linux_descendants_full(proc_root: &Path, root: libc::pid_t) -> Vec<(libc::pid_t, u64)> {
+    #[cfg(test)]
+    GLOBAL_PROC_SCANS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let Ok(entries) = proc_read_dir(proc_root) else {
         return Vec::new();
     };
     let mut children = BTreeMap::<libc::pid_t, Vec<(libc::pid_t, u64)>>::new();
@@ -40,7 +83,7 @@ pub(crate) fn linux_descendants(root: libc::pid_t) -> Vec<(libc::pid_t, u64)> {
         else {
             continue;
         };
-        let Ok(stat) = std::fs::read_to_string(entry.path().join("stat")) else {
+        let Ok(stat) = proc_read_to_string(&entry.path().join("stat")) else {
             continue;
         };
         if let Some((ppid, start_time)) = proc_stat_ppid_start(&stat) {
@@ -81,6 +124,70 @@ pub(crate) fn linux_descendants(root: libc::pid_t) -> Vec<(libc::pid_t, u64)> {
     descendants
 }
 
+#[cfg(target_os = "linux")]
+fn linux_descendants_subtree(
+    proc_root: &Path,
+    root: libc::pid_t,
+) -> Result<Vec<(libc::pid_t, u64)>, ()> {
+    let mut descendants = Vec::new();
+    let mut pending = VecDeque::from([(root, 0_usize)]);
+    let mut visited = std::collections::BTreeSet::from([root]);
+    let mut capped = false;
+    while let Some((parent, depth)) = pending.pop_front() {
+        let task_root = proc_root.join(parent.to_string()).join("task");
+        let tasks = proc_read_dir(&task_root).map_err(|_| ())?;
+        for task in tasks {
+            let task = task.map_err(|_| ())?;
+            let Some(tid) = task
+                .file_name()
+                .to_str()
+                .and_then(|name| name.parse::<libc::pid_t>().ok())
+            else {
+                continue;
+            };
+            let children_path = task_root.join(tid.to_string()).join("children");
+            let children = proc_read_to_string(&children_path).map_err(|_| ())?;
+            for child in children.split_whitespace() {
+                let Ok(child) = child.parse::<libc::pid_t>() else {
+                    continue;
+                };
+                if !visited.insert(child) {
+                    continue;
+                }
+                if descendants.len() == MAX_TRACKED_DESCENDANTS {
+                    capped = true;
+                    break;
+                }
+                let Ok(stat) = proc_read_to_string(&proc_root.join(child.to_string()).join("stat"))
+                else {
+                    continue;
+                };
+                let Some((_, start_time)) = proc_stat_ppid_start(&stat) else {
+                    continue;
+                };
+                descendants.push((child, start_time));
+                if depth < MAX_DESCENDANT_DEPTH {
+                    pending.push_back((child, depth + 1));
+                }
+            }
+            if capped {
+                break;
+            }
+        }
+        if capped {
+            break;
+        }
+    }
+    if capped {
+        tracing::warn!(
+            target: "thegn::plugin",
+            limit = MAX_TRACKED_DESCENDANTS,
+            "plugin descendant snapshot reached its process limit"
+        );
+    }
+    Ok(descendants)
+}
+
 #[cfg(not(target_os = "linux"))]
 pub(crate) fn linux_descendants(_root: libc::pid_t) -> Vec<(libc::pid_t, u64)> {
     Vec::new()
@@ -90,7 +197,7 @@ pub(crate) fn linux_descendants(_root: libc::pid_t) -> Vec<(libc::pid_t, u64)> {
 pub(crate) fn kill_tracked(pids: &[(libc::pid_t, u64)]) {
     for &(pid, start_time) in pids {
         let stat_path = format!("/proc/{pid}/stat");
-        let Ok(stat) = std::fs::read_to_string(stat_path) else {
+        let Ok(stat) = proc_read_to_string(Path::new(&stat_path)) else {
             continue;
         };
         if proc_stat_ppid_start(&stat).is_some_and(|(_, current_start)| current_start == start_time)
@@ -531,12 +638,119 @@ impl Leader {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(target_os = "linux")]
+    use std::fs;
     use std::process::Stdio;
     use std::sync::{
         Arc,
         atomic::{AtomicUsize, Ordering},
     };
     use std::time::Duration;
+
+    #[cfg(target_os = "linux")]
+    fn fake_proc_stat(pid: libc::pid_t, ppid: libc::pid_t, start_time: u64) -> String {
+        let mut fields = vec!["0".to_owned(); 20];
+        fields[0] = "S".to_owned();
+        fields[1] = ppid.to_string();
+        fields[19] = start_time.to_string();
+        format!("{pid} (fixture with spaces ) {}", fields.join(" "))
+    }
+
+    #[cfg(target_os = "linux")]
+    fn fake_proc_process(root: &std::path::Path, pid: libc::pid_t, stat: &str, children: &str) {
+        let task = root
+            .join(pid.to_string())
+            .join("task")
+            .join(pid.to_string());
+        fs::create_dir_all(&task).unwrap();
+        fs::write(root.join(pid.to_string()).join("stat"), stat).unwrap();
+        fs::write(task.join("children"), children).unwrap();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_descendants_subtree_fast_path_avoids_global_scan() {
+        let root = tempfile::tempdir().unwrap();
+        let leader = 501;
+        fake_proc_process(
+            root.path(),
+            leader,
+            &fake_proc_stat(leader, 1, 10),
+            "502 503",
+        );
+        fake_proc_process(root.path(), 502, &fake_proc_stat(502, leader, 11), "");
+        fake_proc_process(root.path(), 503, &fake_proc_stat(503, leader, 12), "");
+        GLOBAL_PROC_SCANS.store(0, Ordering::Relaxed);
+        PROC_READS.store(0, Ordering::Relaxed);
+
+        let descendants = linux_descendants_in(root.path(), leader);
+        assert_eq!(descendants, vec![(502, 11), (503, 12)]);
+        assert_eq!(GLOBAL_PROC_SCANS.load(Ordering::Relaxed), 0);
+        assert!(PROC_READS.load(Ordering::Relaxed) > 0);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_descendants_missing_children_falls_back_to_full_scan() {
+        let root = tempfile::tempdir().unwrap();
+        let leader = 601;
+        let task = root
+            .join(leader.to_string())
+            .join("task")
+            .join(leader.to_string());
+        fs::create_dir_all(&task).unwrap();
+        fs::write(
+            root.join(leader.to_string()).join("stat"),
+            fake_proc_stat(leader, 1, 20),
+        )
+        .unwrap();
+        fake_proc_process(root.path(), 602, &fake_proc_stat(602, leader, 21), "");
+        GLOBAL_PROC_SCANS.store(0, Ordering::Relaxed);
+
+        assert_eq!(linux_descendants_in(root.path(), leader), vec![(602, 21)]);
+        assert_eq!(GLOBAL_PROC_SCANS.load(Ordering::Relaxed), 1);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_descendants_subtree_respects_node_cap() {
+        let root = tempfile::tempdir().unwrap();
+        let leader = 650;
+        let ids = (7000..(7000 + MAX_TRACKED_DESCENDANTS as i32 + 1)).collect::<Vec<_>>();
+        let children = ids
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>()
+            .join(" ");
+        fake_proc_process(
+            root.path(),
+            leader,
+            &fake_proc_stat(leader, 1, 30),
+            &children,
+        );
+        for (offset, pid) in ids.iter().enumerate() {
+            fs::create_dir_all(root.path().join(pid.to_string())).unwrap();
+            fs::write(
+                root.path().join(pid.to_string()).join("stat"),
+                fake_proc_stat(*pid, leader, 31 + offset as u64),
+            )
+            .unwrap();
+        }
+
+        assert_eq!(
+            linux_descendants_subtree(root.path(), leader)
+                .unwrap()
+                .len(),
+            MAX_TRACKED_DESCENDANTS
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_proc_stat_parser_rejects_truncated_input() {
+        assert_eq!(proc_stat_ppid_start("9 (name with ) spaces) S 1 9 0"), None);
+        assert_eq!(proc_stat_ppid_start("garbage"), None);
+    }
 
     #[test]
     fn a_child_handed_to_the_reaper_is_eventually_reaped() {
