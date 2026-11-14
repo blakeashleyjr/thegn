@@ -1116,6 +1116,63 @@ mod tests {
     }
 
     #[test]
+    fn failed_verdict_keeps_unchanged_head_note_in_the_finished_row() {
+        let fixture = Fixture::new();
+        let mut handoff = handoff(&fixture, CiAutofixMode::Auto, &fixture.pr.head_ref_oid);
+        handoff.config.pr_queue.agent_command = "exit 1".into();
+
+        consider(&handoff, false);
+
+        let row = handoff.db.list_pr_queue().unwrap().remove(0);
+        assert_eq!(row.status, PrqStatus::BlockedCi.as_str());
+        let detail = row.detail.as_deref().unwrap();
+        assert!(detail.contains("CI autofix finished (exit failed)"));
+        assert!(detail.contains(
+            "PR #7: the agent finished without changing the PR head; the next refresh re-evaluates the row"
+        ));
+    }
+
+    #[test]
+    fn local_only_head_note_reaches_the_finished_row_detail() {
+        let fixture = Fixture::new();
+        let mut handoff = handoff(&fixture, CiAutofixMode::Auto, &fixture.pr.head_ref_oid);
+        handoff.config.pr_queue.agent_command = "git -c user.name=Agent -c user.email=agent@example.invalid -c commit.gpgsign=false commit --allow-empty -m agent".into();
+
+        consider(&handoff, false);
+
+        let row = handoff.db.list_pr_queue().unwrap().remove(0);
+        assert_eq!(row.status, PrqStatus::BlockedCi.as_str());
+        let detail = row.detail.as_deref().unwrap();
+        assert!(detail.contains("CI autofix finished (exit ok)"));
+        assert!(detail.contains(
+            "PR #7: the agent committed locally but the PR head did not move; nothing was pushed"
+        ));
+    }
+
+    #[test]
+    fn foreign_push_head_note_reaches_finish_detail() {
+        let fixture = Fixture::new();
+        let admitted = fixture.pr.head_ref_oid.clone();
+        let foreign = "f".repeat(40);
+        let note = crate::pr_head_outcome::run_warning(
+            &fixture.loc,
+            7,
+            &admitted,
+            Some(&foreign),
+            true,
+            &thegn_core::config_pr_queue::PrQueueConfig::default(),
+        )
+        .unwrap();
+        let detail = autofix_finish_detail(
+            &crate::agent_run::AgentRunVerdict::Exited(Some(0)),
+            Some(&note),
+        );
+
+        assert!(detail.contains("CI autofix finished (exit ok)"));
+        assert!(detail.contains("PR #7: someone else pushed to the PR while the agent ran"));
+    }
+
+    #[test]
     fn reattest_failure_never_claims_or_spends() {
         let fixture = Fixture::new();
         let handoff = handoff(&fixture, CiAutofixMode::Auto, &fixture.pr.head_ref_oid);
