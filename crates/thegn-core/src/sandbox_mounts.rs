@@ -1308,7 +1308,7 @@ mod tests {
                         },
                     )
                 },
-                |exposure| crate::sandbox_control_guard::MaskPlan::Refuse(exposure),
+                crate::sandbox_control_guard::MaskPlan::Refuse,
             );
         (mapped_control, plan)
     }
