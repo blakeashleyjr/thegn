@@ -1478,7 +1478,7 @@ mod tests {
             REDACTION_MARKER.to_owned(),
         ]);
         assert_eq!(lines, expected);
-        assert_eq!(kept_bytes, lines.iter().map(String::len).sum());
+        assert_eq!(kept_bytes, lines.iter().map(String::len).sum::<usize>());
         assert!(already_redacted);
 
         let before = lines.clone();
