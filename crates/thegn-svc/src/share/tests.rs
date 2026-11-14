@@ -2281,6 +2281,50 @@ fn bounded_reader_prioritizes_late_url_over_full_diagnostic_queue() {
 }
 
 #[test]
+fn bounded_reader_budget_drops_flood_but_keeps_late_url() {
+    // Acceptance: a 10 MiB short-line flood is bounded while URL matching and
+    // draining continue, so a URL after the flood is still discovered.
+    let (tx, rx) = std::sync::mpsc::sync_channel(2048);
+    let (url_tx, url_rx) = std::sync::mpsc::sync_channel(1);
+    let tracker = super::EndpointTracker::default();
+    let mut input = Vec::with_capacity(10 * 1024 * 1024 + 64);
+    input.extend(std::iter::repeat_n(b'x', 10 * 1024 * 1024));
+    input.iter_mut().step_by(8).for_each(|byte| *byte = b'\n');
+    input.extend_from_slice(b"\nlistening at after-flood.example:4123\n");
+    let consumer = std::thread::spawn(move || rx.into_iter().count());
+
+    super::drain_reader(
+        std::io::Cursor::new(input),
+        tx,
+        url_tx,
+        UrlRule::AfterMarker {
+            marker: "listening at ".into(),
+            scheme: "http".into(),
+        },
+        tracker.clone(),
+    );
+
+    assert_eq!(
+        url_rx
+            .recv()
+            .expect("URL after diagnostic flood")
+            .canonical(),
+        "http://after-flood.example:4123"
+    );
+    assert!(
+        consumer.join().expect("diagnostic consumer") <= super::DIAGNOSTIC_LINES_PER_SECOND,
+        "forwarded diagnostics exceeded the per-second budget"
+    );
+    assert!(
+        tracker
+            .budget_dropped_bytes
+            .load(std::sync::atomic::Ordering::Relaxed)
+            > 0,
+        "flood should report bytes dropped by the diagnostic budget"
+    );
+}
+
+#[test]
 fn bounded_lossy_output_stays_within_byte_limit() {
     let bytes = vec![0xff; super::MAX_PROVIDER_LINE];
     let text = super::bounded_lossy(&bytes);

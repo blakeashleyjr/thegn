@@ -405,7 +405,11 @@ impl ShareInstance {
             let provider = self.provider;
             let spawn = thegn_core::thread_name::try_spawn_named("thegn-share-dn", move || {
                 crate::platform::qos::set_self(crate::platform::qos::Qos::Background);
-                let event = match thegn_svc::share::serve_down(&td.sidecar, &td.serve) {
+                let event = match thegn_svc::share::serve_down_for_worktree(
+                    &td.sidecar,
+                    std::path::Path::new(&worktree),
+                    &td.serve,
+                ) {
                     Ok(()) => ShareEvent::Down {
                         worktree,
                         port,
@@ -1053,15 +1057,16 @@ fn supervise(
                     Some(&thegn_core::profile::name()),
                 ),
             );
-            match share::serve_up(&sidecar, &serve) {
+            match share::serve_up_for_worktree(&sidecar, std::path::Path::new(&worktree), &serve) {
                 Ok(url) => {
                     *shared.teardown.lock().unwrap() = Some(ServeTeardown {
                         sidecar,
                         serve: serve.clone(),
                     });
                     if shared.shutdown.load(Ordering::SeqCst) {
-                        match share::serve_down(
+                        match share::serve_down_for_worktree(
                             &shared.teardown.lock().unwrap().as_ref().unwrap().sidecar,
+                            std::path::Path::new(&worktree),
                             &serve,
                         ) {
                             Ok(()) => emit(ShareEvent::Down {
