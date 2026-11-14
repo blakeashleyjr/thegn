@@ -77,6 +77,20 @@ fn notify_ci_run_failed(db: &thegn_core::db::Db, entry: &CiLogEntry) {
     let kind = thegn_core::notification::NotificationKind::CiRunFailed.as_str();
     let source_ref = ci_run_ref_id(entry);
     let notifications = db.get_all_notifications(usize::MAX).unwrap_or_default();
+    let prefix = format!("ci-run:{}:", entry.worktree);
+    let this_run = entry.run_id.parse::<u64>().ok();
+    let newer_exists = notifications.iter().any(|n| {
+        n.kind.as_str() == kind
+            && n.worktree_path == entry.worktree
+            && n.source_ref
+                .strip_prefix(&prefix)
+                .and_then(|run| run.parse::<u64>().ok())
+                .zip(this_run)
+                .is_some_and(|(other, this)| other > this)
+    });
+    if newer_exists {
+        return;
+    }
     let mut job_names = notifications
         .iter()
         .find(|notification| {
@@ -115,22 +129,28 @@ fn notify_ci_run_failed(db: &thegn_core::db::Db, entry: &CiLogEntry) {
         {
             // Best-effort: the notification table is a cache, and supersession
             // must not block the CI refresh if one old row cannot be updated.
-            let _ = db.mark_notification_read_by_source(
-                kind,
-                &notification.source_ref,
-                &entry.worktree,
-            );
+            if let Err(error) =
+                db.mark_notification_read_by_source(kind, &notification.source_ref, &entry.worktree)
+            {
+                tracing::debug!(target: "thegn::ci_autofix", %error, "could not supersede an older CI run notification");
+            }
         }
     }
 
     match db.update_notification_message_by_source(kind, &source_ref, &message, &entry.worktree) {
-        Ok(0) => {
-            if let Err(error) =
-                db.put_notification_once(kind, &source_ref, &message, &entry.worktree)
-            {
-                tracing::debug!(target: "thegn::ci_autofix", %error, "could not save CI run failure notification");
+        Ok(0) => match db.has_notification(kind, &source_ref) {
+            Ok(true) => {}
+            Ok(false) => {
+                if let Err(error) =
+                    db.put_notification_once(kind, &source_ref, &message, &entry.worktree)
+                {
+                    tracing::debug!(target: "thegn::ci_autofix", %error, "could not save CI run failure notification");
+                }
             }
-        }
+            Err(error) => {
+                tracing::debug!(target: "thegn::ci_autofix", %error, "could not check CI run failure notification");
+            }
+        },
         Ok(_) => {}
         Err(error) => {
             tracing::debug!(target: "thegn::ci_autofix", %error, "could not update CI run failure notification");
@@ -1343,6 +1363,28 @@ mod tests {
             notification.source_ref == format!("ci-run:{}:next-run", handoff.entry.worktree)
                 && !notification.read
         }));
+    }
+
+    #[test]
+    fn no_pr_context_ignores_a_late_numeric_older_run() {
+        let db = thegn_core::db::Db::open_memory().unwrap();
+        let mut newer = CiLogEntry {
+            worktree: "/wt/ci".into(),
+            run_id: "200".into(),
+            job_name: "linux".into(),
+            ..Default::default()
+        };
+        notify_ci_run_failed(&db, &newer);
+
+        newer.run_id = "100".into();
+        newer.job_name = "macos".into();
+        notify_ci_run_failed(&db, &newer);
+
+        let notifications = db.get_all_notifications(usize::MAX).unwrap();
+        assert_eq!(notifications.len(), 1);
+        assert_eq!(notifications[0].source_ref, "ci-run:/wt/ci:200");
+        assert!(!notifications[0].read);
+        assert!(!notifications[0].message.contains("macos"));
     }
 
     #[test]

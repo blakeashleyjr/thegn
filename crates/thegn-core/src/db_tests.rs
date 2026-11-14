@@ -3817,6 +3817,38 @@ fn get_all_notifications_respects_limit() {
 }
 
 #[test]
+fn update_notification_message_by_source_rearms_only_on_change() {
+    let db = db();
+    db.put_notification_once("ci_run_failed", "src", "a", "/wt")
+        .unwrap();
+    db.mark_notification_read_by_source("ci_run_failed", "src", "/wt")
+        .unwrap();
+
+    assert_eq!(
+        db.update_notification_message_by_source("ci_run_failed", "src", "a", "/wt")
+            .unwrap(),
+        0
+    );
+    let row = db.get_all_notifications(10).unwrap();
+    assert!(row[0].read);
+
+    assert_eq!(
+        db.update_notification_message_by_source("ci_run_failed", "src", "b", "/wt")
+            .unwrap(),
+        1
+    );
+    let row = db.get_all_notifications(10).unwrap();
+    assert!(!row[0].read);
+    assert_eq!(row[0].message, "b");
+
+    assert_eq!(
+        db.update_notification_message_by_source("ci_run_failed", "src", "c", "/other")
+            .unwrap(),
+        0
+    );
+}
+
+#[test]
 fn delete_notification_removes_single_row() {
     let db = db();
     let id = db
