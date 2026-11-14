@@ -270,8 +270,7 @@ fn gather(
             merged_into_target: git.merged_into_target,
             enqueued: queued.iter().any(|w| w == &row.worktree_path),
             artifact_tracked: verify.tracked,
-            worktree_unknown: verify.worktree_state
-                == Some(thegn_core::pipeline_run::WorktreeState::Unknown),
+            worktree_unknown: worktree_snapshot_unknown(verify.worktree_state.as_ref()),
             // Both halves, matching the done-gate this requirement's
             // documentation claims to mirror: a report that is merely PRESENT
             // but carries an unsupported PASS claim does not satisfy the gate,
@@ -299,6 +298,10 @@ fn gather(
         });
     }
     Ok(out)
+}
+
+fn worktree_snapshot_unknown(state: Option<&pipeline_run::WorktreeState>) -> bool {
+    matches!(state, Some(pipeline_run::WorktreeState::Unknown))
 }
 
 fn issue_selected(row_issue: &str, want: Option<&str>) -> bool {
@@ -666,6 +669,7 @@ mod tests {
     use super::*;
     // Test fixtures seed dispatch rows through the store trait.
     use thegn_core::config_pipeline::Requirement;
+    use thegn_core::config_pipeline::{Pipeline, PipelineStage};
     use thegn_core::issue::AgentDispatchStatus;
     use thegn_core::pipeline_approval::Approval;
     use thegn_core::store::NotificationStore as _;
@@ -815,6 +819,56 @@ mod tests {
             RowLiveness::Parked
         );
         assert!(lane.facts.worker_live);
+    }
+
+    #[test]
+    fn parent_artifact_requires_a_verified_worktree_snapshot() {
+        let code = PipelineStage {
+            name: "code".into(),
+            next: Some("review".into()),
+            ..PipelineStage::default()
+        };
+        let review = PipelineStage {
+            name: "review".into(),
+            requires: vec![Requirement::ParentArtifact.as_str().into()],
+            ..PipelineStage::default()
+        };
+        let chart = Pipeline {
+            stages: vec![code, review],
+            ..Default::default()
+        };
+
+        for (label, state, expected_action) in [
+            (
+                "unknown",
+                Some(pipeline_run::WorktreeState::Unknown),
+                "escalate",
+            ),
+            // A moving HEAD/artifact/status probe is deliberately collapsed to
+            // Unknown by dispatch verification, and stays unsafe here.
+            (
+                "moved",
+                Some(pipeline_run::WorktreeState::Unknown),
+                "escalate",
+            ),
+            (
+                "verified",
+                Some(pipeline_run::WorktreeState::Clean),
+                "advance",
+            ),
+        ] {
+            let mut facts = lane("code").facts;
+            facts.worktree_unknown = worktree_snapshot_unknown(state.as_ref());
+            let action = pipeline_supervise::plan(
+                &[facts],
+                &chart,
+                &thegn_core::config_pipeline::Supervisor::default(),
+                0,
+            )
+            .pop()
+            .expect("one lane produces one action");
+            assert_eq!(action.token(), expected_action, "{label}: {action:?}");
+        }
     }
 
     #[test]

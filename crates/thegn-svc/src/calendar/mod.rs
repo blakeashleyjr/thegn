@@ -118,7 +118,7 @@ impl CalendarError {
 /// What a backend can do beyond listing.
 ///
 /// Only the mutation bits exist: they are masked by account `read_only` policy
-/// and published through [`CalendarRouter::caps`]. `server_expand` and
+/// and published through `CalendarRouter::caps`. `server_expand` and
 /// `incremental` were removed because nothing consulted them (THE-466) — add a
 /// field back only together with the production code that branches on it.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -1034,7 +1034,7 @@ impl CalendarRouter {
     /// `keep_starting` returns false (a superseded pass). Fetches already in
     /// flight still finish and reach `sink`; skipped accounts are simply not
     /// fetched this pass. A pass also ends at `CALENDAR_PASS_DEADLINE`: see
-    /// [`Self::list_events_each_while_bounded`].
+    /// `Self::list_events_each_while_bounded`.
     pub async fn list_events_each_while(
         &self,
         window: CalendarWindow,

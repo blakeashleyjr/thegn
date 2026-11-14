@@ -1131,6 +1131,7 @@ struct NativeWorkspace {
     worktree: PathBuf,
     oid: String,
     target: PathBuf,
+    tracked_snapshot: TrackedSnapshot,
 }
 
 impl NativeWorkspace {
@@ -1165,6 +1166,7 @@ impl NativeWorkspace {
             worktree.display(),
             output_tail(&output)
         );
+        let tracked_snapshot = TrackedSnapshot::capture(&worktree)?;
         if !config.gate_target_dir.is_empty() {
             tracing::info!(
                 target: "thegn::merge_gate",
@@ -1179,6 +1181,7 @@ impl NativeWorkspace {
             worktree,
             oid: oid.to_owned(),
             target,
+            tracked_snapshot,
         };
         this.verify()?;
         Ok(this)
@@ -1210,6 +1213,7 @@ impl NativeWorkspace {
 
     fn verify_snapshot(&self) -> Result<()> {
         self.verify()?;
+        self.tracked_snapshot.verify(&self.worktree)?;
         index_matches(&self.worktree, &self.oid)
     }
 

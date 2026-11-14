@@ -11,11 +11,9 @@ trust on this surface; not planned).
 
 | Capability            | Surface | Disposition | Review  | Reason                                                                                             |
 | --------------------- | ------- | ----------- | ------- | -------------------------------------------------------------------------------------------------- |
-| agent.sessions        | grpc    | deferred    | THE-204 | not yet mirrored in control.proto                                                                  |
 | containers.control    | grpc    | deferred    | THE-204 | container lifecycle and logs are local CLI-only; gRPC mirror lands in the client-API phase         |
 | containers.list       | grpc    | deferred    | THE-204 | container listing is local CLI-only; gRPC mirror lands in the client-API phase                     |
 | containers.prune      | grpc    | deferred    | THE-204 | prune is `thegn sandbox gc/prune` (CLI) this change; a control route lands in the client-API phase |
-| launch.preset         | grpc    | deferred    | THE-204 | not yet mirrored in control.proto                                                                  |
 | model_proxy.start     | grpc    | deferred    | THE-204 | control-API route deferred; CLI-only for now                                                       |
 | model_proxy.stats     | grpc    | deferred    | THE-204 | control-API route deferred; CLI-only for now                                                       |
 | model_proxy.status    | grpc    | deferred    | THE-204 | control-API route deferred; CLI-only for now                                                       |
@@ -38,12 +36,9 @@ trust on this surface; not planned).
 | secret.rm             | grpc    | unsafe      | -       | control-API route deferred; CLI-only for now                                                       |
 | secret.set            | grpc    | unsafe      | -       | control-API route deferred; CLI-only for now                                                       |
 | secret.ssh.rotate     | grpc    | unsafe      | -       | control-API route deferred; CLI-only for now                                                       |
-| sessions.record       | grpc    | deferred    | THE-204 | not yet mirrored in control.proto                                                                  |
-| worktrees.create      | grpc    | deferred    | THE-204 | not yet mirrored in control.proto                                                                  |
 | containers.control    | http    | deferred    | THE-201 | container lifecycle and logs are local CLI-only; HTTP mirror lands in the client-API phase         |
 | containers.list       | http    | deferred    | THE-201 | container listing is local CLI-only; HTTP mirror lands in the client-API phase                     |
 | containers.prune      | http    | deferred    | THE-201 | prune is `thegn sandbox gc/prune` (CLI) this change; a control route lands in the client-API phase |
-| launch.preset         | http    | deferred    | THE-201 | CLI-first (`open --preset` via the intents mailbox); an HTTP route is a follow-up                  |
 | model_proxy.start     | http    | deferred    | THE-201 | control-API route deferred; CLI-only for now                                                       |
 | model_proxy.stats     | http    | deferred    | THE-201 | control-API route deferred; CLI-only for now                                                       |
 | model_proxy.status    | http    | deferred    | THE-201 | control-API route deferred; CLI-only for now                                                       |
@@ -75,7 +70,6 @@ trust on this surface; not planned).
 | git.stage             | mcp     | deferred    | THE-203 | MCP state tools land in the client-API phase                                                       |
 | issues.comment        | mcp     | deferred    | THE-203 | MCP state tools land in the client-API phase                                                       |
 | issues.update         | mcp     | deferred    | THE-203 | MCP state tools land in the client-API phase                                                       |
-| launch.preset         | mcp     | deferred    | THE-203 | MCP exec-scoped tools land in the MCP write-tools phase                                            |
 | merge.add             | mcp     | deferred    | THE-203 | MCP state tools land in the client-API phase                                                       |
 | merge.clear           | mcp     | deferred    | THE-203 | MCP state tools land in the client-API phase                                                       |
 | notify.push           | mcp     | deferred    | THE-203 | MCP state tools land in the client-API phase                                                       |
