@@ -7,6 +7,22 @@ All notable changes to **thegn** are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.1.0-alpha.80] — 2026-11-14
+
+### Changed
+
+- Daemon status updates now keep only the latest snapshot, so rapid updates stay bounded instead of queueing every update.
+
+### Fixed
+
+- Sprites checkpoint lists now follow continuation pages instead of refusing multi-page inventories; partial inventories are still refused and transient list errors are retried.
+- Importing a merge bundle no longer drops output still in flight when the producer exits ("bundle produced no data").
+- Land and diff-watch Git reads now preserve typed failure reasons and fail closed instead of treating unreadable output as empty.
+
+### Security
+
+- CI log tails that begin inside a private key now redact retained preceding lines when the END marker arrives without a BEGIN.
+
 ## [0.1.0-alpha.79] — 2026-11-14
 
 ### Added
@@ -3441,7 +3457,8 @@ launcher picker and the merge queue's `agent_command` hook remain — they run
 whatever commands you configure. Leftover `[llm_proxy]` config sections and
 `proxy_*` tables in existing state databases are ignored harmlessly.
 
-[Unreleased]: https://github.com/blakeashleyjr/thegn/compare/v0.1.0-alpha.79...HEAD
+[Unreleased]: https://github.com/blakeashleyjr/thegn/compare/v0.1.0-alpha.80...HEAD
+[0.1.0-alpha.80]: https://github.com/blakeashleyjr/thegn/compare/v0.1.0-alpha.79...v0.1.0-alpha.80
 [0.1.0-alpha.79]: https://github.com/blakeashleyjr/thegn/compare/v0.1.0-alpha.78...v0.1.0-alpha.79
 [0.1.0-alpha.78]: https://github.com/blakeashleyjr/thegn/compare/v0.1.0-alpha.77...v0.1.0-alpha.78
 [0.1.0-alpha.77]: https://github.com/blakeashleyjr/thegn/compare/v0.1.0-alpha.76...v0.1.0-alpha.77
