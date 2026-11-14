@@ -408,6 +408,47 @@ pub(crate) fn pids_with_cwd_under(root: &std::path::Path) -> Vec<u32> {
     pids
 }
 
+/// The process memory figures needed by allocator hygiene. Linux exposes both
+/// values in `/proc/self/status`; other platforms have no equivalent through
+/// this seam and return no information.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct ProcessMemoryStatus {
+    pub(crate) swap_kb: u64,
+    pub(crate) rss_kb: u64,
+}
+
+#[cfg(target_os = "linux")]
+pub(crate) fn memory_status() -> Option<ProcessMemoryStatus> {
+    parse_memory_status(&std::fs::read_to_string("/proc/self/status").ok()?)
+}
+
+#[cfg(not(target_os = "linux"))]
+pub(crate) fn memory_status() -> Option<ProcessMemoryStatus> {
+    None
+}
+
+/// Parse the line-oriented `VmSwap` and `VmRSS` records from procfs.
+#[cfg(any(target_os = "linux", test))]
+fn parse_memory_status(text: &str) -> Option<ProcessMemoryStatus> {
+    let mut swap_kb = None;
+    let mut rss_kb = None;
+    for line in text.lines() {
+        let Some((name, value)) = line.split_once(':') else {
+            continue;
+        };
+        let value = value.split_whitespace().next();
+        match name {
+            "VmSwap" => swap_kb = Some(value?.parse().ok()?),
+            "VmRSS" => rss_kb = Some(value?.parse().ok()?),
+            _ => {}
+        }
+    }
+    Some(ProcessMemoryStatus {
+        swap_kb: swap_kb?,
+        rss_kb: rss_kb?,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -678,6 +719,30 @@ mod tests {
         assert_eq!(parse_stat_pgrps("1 (x) S 1 5 5 0 -1 0"), Some((5, -1)));
         assert_eq!(parse_stat_pgrps("garbage"), None);
         assert_eq!(parse_stat_pgrps("1 (x) S 1 5"), None);
+    }
+
+    #[test]
+    fn memory_status_parser_is_line_oriented_and_bounded() {
+        let pretty = "Name:\tthegn\nVmRSS:\t 128000 kB  \nVmSwap:\t 32000 kB\n";
+        assert_eq!(
+            parse_memory_status(pretty),
+            Some(ProcessMemoryStatus {
+                swap_kb: 32_000,
+                rss_kb: 128_000,
+            })
+        );
+        assert_eq!(parse_memory_status("Name:\tthegn\nVmRSS: 128 kB\n"), None);
+        assert_eq!(
+            parse_memory_status("VmSwap: 999999999999999999999999 kB\nVmRSS: 1 kB"),
+            None
+        );
+        assert_eq!(
+            parse_memory_status("VmSwap: 4 kB\nVmRSS: 16"),
+            Some(ProcessMemoryStatus {
+                swap_kb: 4,
+                rss_kb: 16
+            })
+        );
     }
 
     /// Real PTY: a bash with job control runs an OLD foreground job beside
