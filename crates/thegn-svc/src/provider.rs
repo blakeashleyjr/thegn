@@ -16,7 +16,7 @@
 
 use anyhow::{Context, Result, anyhow};
 use futures_util::future::BoxFuture;
-use std::collections::{HashMap, VecDeque};
+use std::collections::HashMap;
 use std::path::Path;
 use std::sync::{Arc, LazyLock, Mutex};
 use thegn_core::remote::SshTarget;
@@ -2661,10 +2661,12 @@ const EXEC_WS_MAX_FRAME_SIZE: usize = 4 << 20;
 const EXEC_WS_MAX_WRITE_BUFFER_SIZE: usize = 8 << 20;
 /// Maximum provider output retained by one session while its consumer is slow.
 const EXEC_DATA_BYTE_BUDGET: usize = 8 << 20;
-/// One channel slot is reserved for an exit/terminal frame. Data is limited to
-/// the remaining slots so a full output queue cannot strand session teardown.
-const EXEC_CHANNEL_CAPACITY: usize = 257;
-const EXEC_DATA_WAIT: std::time::Duration = std::time::Duration::from_secs(1);
+/// Item capacity of the provider output channels.
+const EXEC_CHANNEL_CAPACITY: usize = 256;
+/// Largest provider output item queued at once; with EXEC_CHANNEL_CAPACITY
+/// items this bounds retained output to EXEC_DATA_BYTE_BUDGET.
+const EXEC_DATA_CHUNK: usize = 32 << 10;
+const _: () = assert!(EXEC_DATA_CHUNK * EXEC_CHANNEL_CAPACITY <= EXEC_DATA_BYTE_BUDGET);
 const PROXY_CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
 
 #[derive(Debug)]
@@ -2731,215 +2733,23 @@ fn exec_ws_config() -> tokio_tungstenite::tungstenite::protocol::WebSocketConfig
         .max_write_buffer_size(EXEC_WS_MAX_WRITE_BUFFER_SIZE)
 }
 
-#[derive(Debug)]
-enum ExecDataError {
-    Oversized { size: usize, limit: usize },
-    BudgetWait { size: usize, limit: usize },
-    ChannelClosed,
-}
-
-impl std::fmt::Display for ExecDataError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::Oversized { size, limit } => {
-                write!(
-                    f,
-                    "provider exec frame is {size} bytes; budget is {limit} bytes"
-                )
-            }
-            Self::BudgetWait { size, limit } => write!(
-                f,
-                "provider exec output could not reserve {size} bytes within the {limit}-byte budget"
-            ),
-            Self::ChannelClosed => f.write_str("provider exec output channel closed"),
-        }
-    }
-}
-
-impl std::error::Error for ExecDataError {}
-
-struct BudgetEntry {
-    bytes: usize,
-    _byte_permit: tokio::sync::OwnedSemaphorePermit,
-    _slot_permit: tokio::sync::OwnedSemaphorePermit,
-}
-
-/// Sender-side byte accounting for provider output queues.
-///
-/// A permit remains owned by the queue entry until the receiver has dequeued
-/// that item. Reconciliation is deliberately based on the channel occupancy,
-/// not on frame count, so a slow consumer can retain at most the byte budget
-/// while a received/dropped item promptly returns its bytes to the semaphore.
-struct ByteBudget {
-    limit: usize,
-    bytes: std::sync::Arc<tokio::sync::Semaphore>,
-    slots: std::sync::Arc<tokio::sync::Semaphore>,
-    entries: VecDeque<BudgetEntry>,
-    queued: usize,
-    terminal_queued: bool,
-}
-
-impl ByteBudget {
-    fn new(limit: usize, data_slots: usize) -> Self {
-        Self {
-            limit,
-            bytes: std::sync::Arc::new(tokio::sync::Semaphore::new(limit)),
-            slots: std::sync::Arc::new(tokio::sync::Semaphore::new(data_slots.max(1))),
-            entries: VecDeque::new(),
-            queued: 0,
-            terminal_queued: false,
-        }
-    }
-
-    fn for_sender<T>(sender: &tokio::sync::mpsc::Sender<T>, limit: usize) -> Self {
-        Self::new(limit, sender.max_capacity().saturating_sub(1))
-    }
-
-    fn reconcile<T>(&mut self, sender: &tokio::sync::mpsc::Sender<T>) {
-        let terminal = if self.terminal_queued { 1 } else { 0 };
-        let in_queue = (sender.max_capacity() - sender.capacity()).saturating_sub(terminal);
-        while self.entries.len() > in_queue {
-            if let Some(entry) = self.entries.pop_front() {
-                self.queued = self.queued.saturating_sub(entry.bytes);
-            }
-        }
-    }
-
-    async fn reserve<T>(
-        &mut self,
-        sender: &tokio::sync::mpsc::Sender<T>,
-        charge: usize,
-    ) -> std::result::Result<BudgetLease, ExecDataError> {
-        if charge > self.limit {
-            return Err(ExecDataError::Oversized {
-                size: charge,
-                limit: self.limit,
-            });
-        }
-        let deadline = tokio::time::Instant::now() + EXEC_DATA_WAIT;
-        loop {
-            self.reconcile(sender);
-            let byte_permit = match self.bytes.clone().try_acquire_many_owned(charge as u32) {
-                Ok(permit) => permit,
-                Err(tokio::sync::TryAcquireError::Closed) => {
-                    return Err(ExecDataError::ChannelClosed);
-                }
-                Err(tokio::sync::TryAcquireError::NoPermits) => {
-                    if tokio::time::Instant::now() >= deadline {
-                        return Err(ExecDataError::BudgetWait {
-                            size: charge,
-                            limit: self.limit,
-                        });
-                    }
-                    tokio::time::sleep(std::time::Duration::from_millis(5)).await;
-                    continue;
-                }
-            };
-            let slot_permit = match self.slots.clone().try_acquire_owned() {
-                Ok(permit) => permit,
-                Err(tokio::sync::TryAcquireError::Closed) => {
-                    return Err(ExecDataError::ChannelClosed);
-                }
-                Err(tokio::sync::TryAcquireError::NoPermits) => {
-                    drop(byte_permit);
-                    if tokio::time::Instant::now() >= deadline {
-                        return Err(ExecDataError::BudgetWait {
-                            size: charge,
-                            limit: self.limit,
-                        });
-                    }
-                    tokio::time::sleep(std::time::Duration::from_millis(5)).await;
-                    continue;
-                }
-            };
-            return Ok(BudgetLease {
-                bytes: charge,
-                byte_permit,
-                slot_permit,
-            });
-        }
-    }
-
-    fn commit<T>(&mut self, sender: &tokio::sync::mpsc::Sender<T>, lease: BudgetLease) {
-        self.queued += lease.bytes;
-        self.entries.push_back(BudgetEntry {
-            bytes: lease.bytes,
-            _byte_permit: lease.byte_permit,
-            _slot_permit: lease.slot_permit,
-        });
-        self.reconcile(sender);
-    }
-
-    fn mark_terminal(&mut self) {
-        self.terminal_queued = true;
-    }
-}
-
-struct BudgetLease {
-    bytes: usize,
-    byte_permit: tokio::sync::OwnedSemaphorePermit,
-    slot_permit: tokio::sync::OwnedSemaphorePermit,
-}
-
-async fn send_budgeted_item<T: Send>(
+/// Forward one provider payload as items of at most `EXEC_DATA_CHUNK` bytes.
+/// `send().await` is the backpressure: a slow consumer stalls the reader
+/// instead of ending the session. Returns `false` once the receiver is gone.
+async fn send_chunked<T>(
     sender: &tokio::sync::mpsc::Sender<T>,
-    budget: &mut ByteBudget,
-    item: T,
-    charge: usize,
-) -> std::result::Result<(), ExecDataError> {
-    let lease = budget.reserve(sender, charge).await?;
-    let permit = match tokio::time::timeout(EXEC_DATA_WAIT, sender.reserve()).await {
-        Ok(Ok(permit)) => permit,
-        Ok(Err(_)) => return Err(ExecDataError::ChannelClosed),
-        Err(_) => {
-            return Err(ExecDataError::BudgetWait {
-                size: charge,
-                limit: budget.limit,
-            });
-        }
-    };
-    permit.send(item);
-    budget.commit(sender, lease);
-    Ok(())
-}
-
-async fn send_budgeted_stdout(
-    sender: &tokio::sync::mpsc::Sender<ExecFrame>,
-    budget: &mut ByteBudget,
     bytes: Vec<u8>,
-) -> std::result::Result<(), ExecDataError> {
-    if bytes.is_empty() {
-        return send_budgeted_item(sender, budget, ExecFrame::Stdout(bytes), 0).await;
+    wrap: impl Fn(Vec<u8>) -> T,
+) -> bool {
+    if bytes.len() <= EXEC_DATA_CHUNK {
+        return sender.send(wrap(bytes)).await.is_ok();
     }
-    for chunk in bytes.chunks(budget.limit) {
-        send_budgeted_item(
-            sender,
-            budget,
-            ExecFrame::Stdout(chunk.to_vec()),
-            chunk.len(),
-        )
-        .await?;
-    }
-    Ok(())
-}
-
-async fn send_exec_exit(
-    sender: &tokio::sync::mpsc::Sender<ExecFrame>,
-    budget: &mut ByteBudget,
-    code: i32,
-) -> std::result::Result<(), ExecDataError> {
-    match tokio::time::timeout(EXEC_DATA_WAIT, sender.reserve()).await {
-        Ok(Ok(permit)) => {
-            permit.send(ExecFrame::Exit(code));
-            budget.mark_terminal();
-            Ok(())
+    for chunk in bytes.chunks(EXEC_DATA_CHUNK) {
+        if sender.send(wrap(chunk.to_vec())).await.is_err() {
+            return false;
         }
-        Ok(Err(_)) => Err(ExecDataError::ChannelClosed),
-        Err(_) => Err(ExecDataError::BudgetWait {
-            size: 0,
-            limit: EXEC_DATA_BYTE_BUDGET,
-        }),
     }
+    true
 }
 
 fn next_connect_wait(
@@ -3020,8 +2830,8 @@ fn encode_stream_stdin(data: &[u8]) -> Vec<u8> {
     v
 }
 
-/// The non-PTY stdin half-close frame. It is sent once when the local control
-/// channel closes, before the WebSocket close handshake.
+/// The non-PTY stdin EOF frame. It is sent once on local control close, before
+/// the WebSocket close handshake; half-close is not implemented.
 fn encode_stream_stdin_eof() -> Vec<u8> {
     vec![4u8]
 }
@@ -3309,7 +3119,6 @@ async fn drive_proxy<S>(
     use futures_util::{SinkExt, StreamExt};
     use tokio_tungstenite::tungstenite::{Message, protocol::frame::coding::CloseCode};
     let (mut write, mut read) = ws.split();
-    let mut budget = ByteBudget::for_sender(&from_srv, EXEC_DATA_BYTE_BUDGET);
     let terminal = loop {
         tokio::select! {
             out = to_srv.recv() => match out {
@@ -3322,13 +3131,8 @@ async fn drive_proxy<S>(
             },
             msg = read.next() => match msg {
                 Some(Ok(Message::Binary(b))) => {
-                    let bytes: Vec<u8> = b.into();
-                    let charge = bytes.len();
-                    if let Err(error) =
-                        send_budgeted_item(&from_srv, &mut budget, bytes, charge).await
-                    {
-                        tracing::warn!(target: "thegn::provider", %error, "provider proxy output budget exhausted");
-                        break ProxyEnd::TransportError(error.to_string());
+                    if !send_chunked(&from_srv, b.into(), std::convert::identity).await {
+                        break ProxyEnd::LocalClosed;
                     }
                 }
                 Some(Ok(Message::Close(frame))) => {
@@ -3382,7 +3186,6 @@ async fn drive_exec<S>(
     use futures_util::{SinkExt, StreamExt};
     use tokio_tungstenite::tungstenite::Message;
     let (mut write, mut read) = ws.split();
-    let mut budget = ByteBudget::for_sender(&frames_tx, EXEC_DATA_BYTE_BUDGET);
     loop {
         tokio::select! {
             ctrl = control_rx.recv() => match ctrl {
@@ -3412,25 +3215,18 @@ async fn drive_exec<S>(
             msg = read.next() => match msg {
                 Some(Ok(Message::Binary(b))) => {
                     if tty {
-                        let bytes: Vec<u8> = b.into();
-                        if let Err(error) = send_budgeted_stdout(&frames_tx, &mut budget, bytes).await {
-                            tracing::warn!(target: "thegn::provider", %error, "provider exec output budget exhausted");
+                        if !send_chunked(&frames_tx, b.into(), ExecFrame::Stdout).await {
                             break;
                         }
                     } else {
                         match decode_stream_frame(&b) {
                             StreamMsg::Stdout(d) => {
-                                if let Err(error) =
-                                    send_budgeted_stdout(&frames_tx, &mut budget, d).await
-                                {
-                                    tracing::warn!(target: "thegn::provider", %error, "provider exec output budget exhausted");
+                                if !send_chunked(&frames_tx, d, ExecFrame::Stdout).await {
                                     break;
                                 }
                             }
                             StreamMsg::Exit(code) => {
-                                if let Err(error) = send_exec_exit(&frames_tx, &mut budget, code).await {
-                                    tracing::debug!(target: "thegn::provider", %error, "provider exec exit could not be delivered");
-                                }
+                                let _ = frames_tx.send(ExecFrame::Exit(code)).await; // best-effort: caller may have dropped the stream
                                 break;
                             }
                             // stderr (agent logs) and unknown ids: not part of the
@@ -3444,9 +3240,7 @@ async fn drive_exec<S>(
                         let _ = sid_tx.send(Some(s)); // best-effort: waiter may have timed out
                     }
                     SpriteCtrl::Exit(code) => {
-                        if let Err(error) = send_exec_exit(&frames_tx, &mut budget, code).await {
-                            tracing::debug!(target: "thegn::provider", %error, "provider exec exit could not be delivered");
-                        }
+                        let _ = frames_tx.send(ExecFrame::Exit(code)).await; // best-effort: caller may have dropped the stream
                         break;
                     }
                     SpriteCtrl::Ignore => {}
@@ -5470,60 +5264,36 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn provider_byte_budget_bounds_slow_consumers_and_releases_on_receive() {
-        let (tx, mut rx) = tokio::sync::mpsc::channel(3);
-        let mut budget = ByteBudget::new(8, 2);
-        send_budgeted_stdout(&tx, &mut budget, vec![b'a'; 4])
-            .await
-            .unwrap();
-        send_budgeted_stdout(&tx, &mut budget, vec![b'b'; 4])
-            .await
-            .unwrap();
-        assert_eq!(budget.queued, 8);
-        assert!(
-            tokio::time::timeout(
-                std::time::Duration::from_millis(25),
-                send_budgeted_stdout(&tx, &mut budget, vec![b'c'])
-            )
-            .await
-            .is_err()
-        );
-
-        assert_eq!(rx.recv().await, Some(ExecFrame::Stdout(vec![b'a'; 4])));
-        send_budgeted_stdout(&tx, &mut budget, vec![b'c'])
-            .await
-            .unwrap();
-        assert!(budget.queued <= 8);
-    }
-
-    #[tokio::test]
-    async fn provider_exit_frame_has_a_reserved_slot_when_data_budget_is_full() {
-        let (tx, mut rx) = tokio::sync::mpsc::channel(3);
-        let mut budget = ByteBudget::new(8, 2);
-        send_budgeted_stdout(&tx, &mut budget, vec![b'a'; 4])
-            .await
-            .unwrap();
-        send_budgeted_stdout(&tx, &mut budget, vec![b'b'; 4])
-            .await
-            .unwrap();
-        send_exec_exit(&tx, &mut budget, 7).await.unwrap();
-
-        assert_eq!(rx.recv().await, Some(ExecFrame::Stdout(vec![b'a'; 4])));
-        assert_eq!(rx.recv().await, Some(ExecFrame::Stdout(vec![b'b'; 4])));
-        assert_eq!(rx.recv().await, Some(ExecFrame::Exit(7)));
-    }
-
-    #[tokio::test]
-    async fn provider_oversized_output_is_chunked_at_the_byte_budget() {
+    async fn provider_output_is_chunked_to_the_item_bound() {
         let (tx, mut rx) = tokio::sync::mpsc::channel(8);
-        let mut budget = ByteBudget::new(4, 7);
-        send_budgeted_stdout(&tx, &mut budget, (0u8..10).collect())
-            .await
-            .unwrap();
+        assert!(send_chunked(&tx, vec![7u8; 2 * EXEC_DATA_CHUNK + 1], ExecFrame::Stdout).await);
+        for want in [EXEC_DATA_CHUNK, EXEC_DATA_CHUNK, 1] {
+            match rx.recv().await {
+                Some(ExecFrame::Stdout(b)) => assert_eq!(b.len(), want),
+                other => panic!("unexpected frame {other:?}"),
+            }
+        }
+    }
 
-        assert_eq!(rx.recv().await, Some(ExecFrame::Stdout(vec![0, 1, 2, 3])));
-        assert_eq!(rx.recv().await, Some(ExecFrame::Stdout(vec![4, 5, 6, 7])));
-        assert_eq!(rx.recv().await, Some(ExecFrame::Stdout(vec![8, 9])));
+    #[tokio::test]
+    async fn provider_slow_consumer_backpressures_instead_of_ending() {
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<Vec<u8>>(1);
+        let task = tokio::spawn(async move {
+            send_chunked(&tx, vec![1u8; 3 * EXEC_DATA_CHUNK], std::convert::identity).await
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        assert!(!task.is_finished());
+        for _ in 0..3 {
+            assert_eq!(rx.recv().await.map(|b| b.len()), Some(EXEC_DATA_CHUNK));
+        }
+        assert!(task.await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn provider_output_reports_a_gone_receiver() {
+        let (tx, rx) = tokio::sync::mpsc::channel::<Vec<u8>>(1);
+        drop(rx);
+        assert!(!send_chunked(&tx, vec![1u8; 4], std::convert::identity).await);
     }
 
     #[tokio::test]
