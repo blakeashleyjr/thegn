@@ -382,7 +382,7 @@ mod tests {
         let mut cache = HashMap::new();
         let mut failures = HashMap::new();
         let calls = std::cell::Cell::new(0);
-        let list = |_| {
+        let list = |_: &Path| {
             calls.set(calls.get() + 1);
             Some(vec![entry(&worktree, Some("feature"))])
         };
@@ -461,7 +461,7 @@ mod tests {
         let mut cache = HashMap::new();
         let mut failures = HashMap::new();
         let calls = std::cell::Cell::new(0);
-        let list = |_| {
+        let list = |_: &Path| {
             calls.set(calls.get() + 1);
             Some(vec![entry(&unusable, Some("unusable"))])
         };
@@ -550,7 +550,7 @@ mod tests {
         let mut cache = HashMap::new();
         let mut failures = HashMap::new();
         let calls = std::cell::Cell::new(0);
-        let list = |_| {
+        let list = |_: &Path| {
             calls.set(calls.get() + 1);
             Some(vec![entry(&worktree, Some("feature"))])
         };
