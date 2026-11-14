@@ -397,10 +397,11 @@ fn github_targeted_argv(remote: &GithubRemote, args: &[&str]) -> Vec<String> {
 /// callers, so the lookalike-host bug cannot be fixed in one place and survive in
 /// the other.
 pub fn system_from_remote_host(url: &str) -> Option<CiSystem> {
-    let host = parse_gitlab_remote(url)?.host;
-    let hostname = host.split(':').next()?;
+    let remote = parse_gitlab_remote(url)?;
+    let hostname = remote.host.split(':').next()?;
     if is_github_host(hostname) {
-        Some(CiSystem::GithubActions)
+        // GitHub has no nested namespaces: anything but owner/repo is ambiguous.
+        (remote.project.split('/').count() == 2).then_some(CiSystem::GithubActions)
     } else if is_gitlab_host(hostname) {
         Some(CiSystem::GitlabCi)
     } else {
