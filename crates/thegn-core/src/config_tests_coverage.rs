@@ -128,6 +128,10 @@ fn notification_priority_defaults_and_overrides() {
         cfg.priority_of(NotificationKind::AgentDone),
         Priority::Notice
     );
+    assert_eq!(
+        cfg.priority_of(NotificationKind::CiRunFailed),
+        Priority::Notice
+    );
 
     // Alert set: real failures + agent-attention + each queue's give-up; unread
     // excludes Info. `log_error` is NOT here — thegn's own diagnostics are Info
@@ -146,6 +150,7 @@ fn notification_priority_defaults_and_overrides() {
         !alerts.contains(&"log_error"),
         "log_error is quiet Info, never an alert"
     );
+    assert!(!alerts.contains(&"ci_run_failed"));
     let counted = cfg.counted_unread_kind_names();
     assert!(!counted.contains(&"worktree_created"));
     assert!(!counted.contains(&"process_exited"));
@@ -168,6 +173,8 @@ fn notification_priority_defaults_and_overrides() {
     cfg.priority
         .insert("worktree_created".into(), "alert".into());
     assert!(cfg.alert_kind_names().contains(&"worktree_created"));
+    cfg.priority.insert("ci_run_failed".into(), "alert".into());
+    assert!(cfg.alert_kind_names().contains(&"ci_run_failed"));
 }
 
 #[test]

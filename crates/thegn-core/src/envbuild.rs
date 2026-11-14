@@ -5,6 +5,7 @@
 //! checkpoint, teardown, `{id}` command templates) reads the resolved
 //! `ProviderPlacement.id` rather than re-deriving.
 
+use std::fmt;
 use std::path::Path;
 
 use crate::config::{EnvConfig, PlacementMode, RemoteTransport, SandboxConfig};
@@ -16,6 +17,50 @@ use crate::util;
 /// sprite URL `<name>-xxxxx.sprites.app`), capped at 63 chars; leave headroom for
 /// a provider suffix.
 const MAX_PROVIDER_ID: usize = 50;
+
+/// A validated provider sandbox identifier.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct ProviderId(String);
+
+/// Returned when a string is not a valid provider sandbox identifier.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ProviderIdError;
+
+impl ProviderId {
+    /// Parse a provider sandbox identifier using the same DNS-safe contract as
+    /// the provider-id derivation.
+    pub fn parse(value: &str) -> Result<Self, ProviderIdError> {
+        if valid_provider_id(value) {
+            Ok(Self(value.to_owned()))
+        } else {
+            Err(ProviderIdError)
+        }
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl AsRef<str> for ProviderId {
+    fn as_ref(&self) -> &str {
+        self.as_str()
+    }
+}
+
+impl fmt::Display for ProviderId {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(self.as_str())
+    }
+}
+
+impl fmt::Display for ProviderIdError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("invalid provider id")
+    }
+}
+
+impl std::error::Error for ProviderIdError {}
 
 /// Resolve a provider env's effective sandbox id for `worktree`, expanding tokens
 /// in the configured `id`:
@@ -39,6 +84,15 @@ const MAX_PROVIDER_ID: usize = 50;
 /// this one function (the host reads `ProviderPlacement.id` rather than
 /// re-deriving). `repo` is the repo dir name (`None` ⇒ `{repo}` expands empty).
 pub fn effective_provider_id(configured: &str, worktree: &Path, repo: Option<&str>) -> String {
+    effective_provider_id_typed(configured, worktree, repo).to_string()
+}
+
+/// Resolve a provider env's effective sandbox id as a validated [`ProviderId`].
+pub fn effective_provider_id_typed(
+    configured: &str,
+    worktree: &Path,
+    repo: Option<&str>,
+) -> ProviderId {
     let base = worktree
         .file_name()
         .map(|n| util::slugify(&n.to_string_lossy()))
@@ -68,7 +122,7 @@ pub fn effective_provider_id(configured: &str, worktree: &Path, repo: Option<&st
         .join("-");
 
     if valid_provider_id(&name) {
-        return name;
+        return ProviderId::parse(&name).expect("valid provider id must parse");
     }
     // Invalid configured text must never become a provider name or filesystem
     // component. Keep a deterministic suffix so distinct original values map
@@ -83,9 +137,9 @@ pub fn effective_provider_id(configured: &str, worktree: &Path, repo: Option<&st
     let head: String = slug.chars().take(keep).collect();
     let head = head.trim_end_matches('-');
     if head.is_empty() {
-        format!("id-{suffix}")
+        ProviderId::parse(&format!("id-{suffix}")).expect("canonical provider id must parse")
     } else {
-        format!("{head}-{suffix}")
+        ProviderId::parse(&format!("{head}-{suffix}")).expect("canonical provider id must parse")
     }
 }
 
@@ -298,6 +352,10 @@ mod tests {
         let wt = Path::new("/home/u/.thegn/worktrees/thegn/tg-quick-dagger");
         // Empty ⇒ conflict-free default: repo-worktree-hash.
         let def = effective_provider_id("", wt, Some("thegn"));
+        assert_eq!(
+            def,
+            effective_provider_id_typed("", wt, Some("thegn")).to_string()
+        );
         assert!(
             def.starts_with("thegn-tg-quick-dagger-"),
             "default is repo-worktree-hash: {def}"
@@ -363,6 +421,39 @@ mod tests {
             let id = effective_provider_id(&input, wt, Some("repo"));
             assert!(id.len() <= MAX_PROVIDER_ID, "{id:?}");
             assert!(valid_provider_id(&id), "{id:?}");
+        }
+    }
+
+    #[test]
+    fn provider_id_parse_validates_and_round_trips() {
+        let valid = vec![
+            "a".to_owned(),
+            "A0".to_owned(),
+            "a-b".to_owned(),
+            "a.b-c".to_owned(),
+            "a".repeat(MAX_PROVIDER_ID),
+        ];
+        for value in valid {
+            let parsed = ProviderId::parse(&value).unwrap();
+            assert_eq!(parsed.as_str(), value);
+            assert_eq!(parsed.as_ref(), value.as_str());
+            assert_eq!(parsed.to_string(), value);
+        }
+
+        let invalid = vec![
+            "".to_owned(),
+            ".".to_owned(),
+            "a..b".to_owned(),
+            "-a".to_owned(),
+            "a-".to_owned(),
+            "a_b".to_owned(),
+            "a/b".to_owned(),
+            "é".to_owned(),
+            "a".repeat(MAX_PROVIDER_ID + 1),
+        ];
+        for value in invalid {
+            let error = ProviderId::parse(&value).unwrap_err();
+            assert_eq!(error.to_string(), "invalid provider id");
         }
     }
 }

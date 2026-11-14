@@ -69,6 +69,99 @@ fn candidate_ref_id(candidate: &thegn_core::ci_log::CiLogCandidate) -> String {
     ref_id
 }
 
+fn ci_run_ref_id(entry: &CiLogEntry) -> String {
+    format!("ci-run:{}:{}", entry.worktree, entry.run_id)
+}
+
+fn parse_run_id(id: &str) -> Option<u64> {
+    id.parse().ok()
+}
+
+fn notify_ci_run_failed(db: &thegn_core::db::Db, entry: &CiLogEntry) {
+    let kind = thegn_core::notification::NotificationKind::CiRunFailed.as_str();
+    let source_ref = ci_run_ref_id(entry);
+    let notifications = db.get_all_notifications(usize::MAX).unwrap_or_default();
+    let prefix = format!("ci-run:{}:", entry.worktree);
+    let this_run = parse_run_id(&entry.run_id);
+    let newer_exists = notifications.iter().any(|n| {
+        n.kind.as_str() == kind
+            && n.worktree_path == entry.worktree
+            && n.source_ref
+                .strip_prefix(&prefix)
+                .and_then(|run| run.parse::<u64>().ok())
+                .zip(this_run)
+                .is_some_and(|(other, this)| other > this)
+    });
+    if newer_exists {
+        return;
+    }
+    let mut job_names = notifications
+        .iter()
+        .find(|notification| {
+            notification.kind.as_str() == kind
+                && notification.source_ref == source_ref
+                && notification.worktree_path == entry.worktree
+        })
+        .and_then(|notification| {
+            notification
+                .message
+                .split_once("failed jobs: ")
+                .map(|(_, jobs)| jobs.to_string())
+        })
+        .map(|jobs| {
+            jobs.split(", ")
+                .filter(|job| !job.is_empty())
+                .map(str::to_string)
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    if !job_names.iter().any(|job| job == &entry.job_name) {
+        job_names.push(entry.job_name.clone());
+    }
+    job_names.sort();
+    let message = format!(
+        "CI run {} failed; failed jobs: {}",
+        entry.run_id,
+        job_names.join(", ")
+    );
+
+    for notification in notifications {
+        if notification.kind.as_str() == kind
+            && notification.worktree_path == entry.worktree
+            && notification.source_ref.starts_with("ci-run:")
+            && notification.source_ref != source_ref
+        {
+            // Best-effort: the notification table is a cache, and supersession
+            // must not block the CI refresh if one old row cannot be updated.
+            if let Err(error) =
+                db.mark_notification_read_by_source(kind, &notification.source_ref, &entry.worktree)
+            {
+                tracing::debug!(target: "thegn::ci_autofix", %error, "could not supersede an older CI run notification");
+            }
+        }
+    }
+
+    match db.update_notification_message_by_source(kind, &source_ref, &message, &entry.worktree) {
+        Ok(0) => match db.has_notification(kind, &source_ref) {
+            Ok(true) => {}
+            Ok(false) => {
+                if let Err(error) =
+                    db.put_notification_once(kind, &source_ref, &message, &entry.worktree)
+                {
+                    tracing::debug!(target: "thegn::ci_autofix", %error, "could not save CI run failure notification");
+                }
+            }
+            Err(error) => {
+                tracing::debug!(target: "thegn::ci_autofix", %error, "could not check CI run failure notification");
+            }
+        },
+        Ok(_) => {}
+        Err(error) => {
+            tracing::debug!(target: "thegn::ci_autofix", %error, "could not update CI run failure notification");
+        }
+    }
+}
+
 /// The human-authorized gate once the entry is read and the worktree's CURRENT provider context is known:
 /// a log cached for another (or an unknown) context is never authorization to dispatch an agent.
 fn authorize_entry(
@@ -195,10 +288,7 @@ fn consider_candidate_with_forge(
     {
         QueueRowPick::One(row) => *row,
         QueueRowPick::None => {
-            notify(format!(
-                "CI job {} failed, but no queued PR context is available for autofix",
-                entry.job_name
-            ));
+            notify_ci_run_failed(db, entry);
             return;
         }
         QueueRowPick::Ambiguous(numbers) => {
@@ -1223,6 +1313,82 @@ mod tests {
                 handoff.entry.head_sha
             )
         );
+        assert_eq!(
+            notifications[0].kind,
+            thegn_core::notification::NotificationKind::PrQueueNeedsHuman
+        );
+    }
+
+    #[test]
+    fn no_pr_context_groups_failed_jobs_by_run_and_supersedes_older_runs() {
+        let fixture = Fixture::new();
+        let handoff = handoff(&fixture, CiAutofixMode::Auto, &fixture.pr.head_ref_oid);
+        let row = handoff.db.list_pr_queue().unwrap().remove(0);
+        handoff.db.remove_pr_entry(&row.key).unwrap();
+
+        for (job_id, job_name) in [("job-1", "linux"), ("job-2", "macos"), ("job-3", "windows")] {
+            let mut entry = handoff.entry.clone();
+            entry.job_id = job_id.into();
+            entry.job_name = job_name.into();
+            consider_candidate_with_forge(&handoff.config, &handoff.db, &entry, false, None);
+        }
+
+        let notifications = handoff.db.get_all_notifications(usize::MAX).unwrap();
+        assert_eq!(notifications.len(), 1);
+        assert_eq!(
+            notifications[0].kind,
+            thegn_core::notification::NotificationKind::CiRunFailed
+        );
+        assert_eq!(
+            notifications[0].source_ref,
+            format!("ci-run:{}:run", handoff.entry.worktree)
+        );
+        for job_name in ["linux", "macos", "windows"] {
+            assert!(notifications[0].message.contains(job_name));
+        }
+
+        let mut next_run = handoff.entry.clone();
+        next_run.run_id = "next-run".into();
+        next_run.job_id = "job-4".into();
+        next_run.job_name = "nightly".into();
+        consider_candidate_with_forge(&handoff.config, &handoff.db, &next_run, false, None);
+
+        let all = handoff.db.get_all_notifications(usize::MAX).unwrap();
+        assert_eq!(all.len(), 2);
+        assert_eq!(
+            all.iter().filter(|notification| !notification.read).count(),
+            1
+        );
+        assert!(all.iter().any(|notification| {
+            notification.source_ref == format!("ci-run:{}:run", handoff.entry.worktree)
+                && notification.read
+        }));
+        assert!(all.iter().any(|notification| {
+            notification.source_ref == format!("ci-run:{}:next-run", handoff.entry.worktree)
+                && !notification.read
+        }));
+    }
+
+    #[test]
+    fn no_pr_context_ignores_a_late_numeric_older_run() {
+        let db = thegn_core::db::Db::open_memory().unwrap();
+        let mut newer = CiLogEntry {
+            worktree: "/wt/ci".into(),
+            run_id: "200".into(),
+            job_name: "linux".into(),
+            ..Default::default()
+        };
+        notify_ci_run_failed(&db, &newer);
+
+        newer.run_id = "100".into();
+        newer.job_name = "macos".into();
+        notify_ci_run_failed(&db, &newer);
+
+        let notifications = db.get_all_notifications(usize::MAX).unwrap();
+        assert_eq!(notifications.len(), 1);
+        assert_eq!(notifications[0].source_ref, "ci-run:/wt/ci:200");
+        assert!(!notifications[0].read);
+        assert!(!notifications[0].message.contains("macos"));
     }
 
     #[test]
