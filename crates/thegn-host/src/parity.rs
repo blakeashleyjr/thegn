@@ -10,6 +10,7 @@ use anyhow::Context;
 use sha2::{Digest, Sha256};
 use thegn_core::db::Db;
 use thegn_core::store::WorkspaceStore;
+use thegn_core::syncstate::{ReplayStage, manifest_for_bytes as manifest_for_artifacts};
 
 use crate::agent::block_on_provider;
 
@@ -82,27 +83,10 @@ fn lower_hex(bytes: &[u8]) -> String {
         .collect()
 }
 
-fn random_staging_dir() -> anyhow::Result<String> {
+pub(crate) fn random_staging_dir() -> anyhow::Result<String> {
     let mut random = [0_u8; 16];
     getrandom::fill(&mut random)?;
     Ok(format!("/tmp/tg-parity-{}", lower_hex(&random)))
-}
-
-fn manifest_for_artifacts(
-    artifacts: &[(String, Vec<u8>)],
-) -> Vec<thegn_core::syncstate::CaptureArtifact> {
-    artifacts
-        .iter()
-        .map(|(name, bytes)| {
-            let digest = Sha256::digest(bytes);
-            let sha256 = lower_hex(&digest);
-            thegn_core::syncstate::CaptureArtifact {
-                name: name.clone(),
-                bytes: bytes.len() as u64,
-                sha256,
-            }
-        })
-        .collect()
 }
 
 fn nonempty(path: &Path) -> bool {
@@ -120,42 +104,9 @@ fn output_tail(output: &str) -> &str {
     &output[start..]
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ReplayStage {
-    Exec,
-    Checkout,
-    ArtifactValidation,
-    Fetch,
-    Reset,
-    Patch,
-    Extraction,
-    Cleanup,
-}
-
-impl ReplayStage {
-    fn from_marker(output: &str) -> Option<Self> {
-        output.lines().find_map(|line| match line.trim() {
-            "TG-PARITY-ERROR:checkout" => Some(Self::Checkout),
-            "TG-PARITY-ERROR:artifact_validation" => Some(Self::ArtifactValidation),
-            "TG-PARITY-ERROR:fetch" => Some(Self::Fetch),
-            "TG-PARITY-ERROR:reset" => Some(Self::Reset),
-            "TG-PARITY-ERROR:patch" => Some(Self::Patch),
-            "TG-PARITY-ERROR:extraction" => Some(Self::Extraction),
-            "TG-PARITY-ERROR:cleanup" => Some(Self::Cleanup),
-            _ => None,
-        })
-    }
-}
-
-impl std::fmt::Display for ReplayStage {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{self:?}")
-    }
-}
-
 #[derive(Debug)]
 struct ReplayFailure {
-    stage: ReplayStage,
+    stage: thegn_core::syncstate::ReplayStage,
     detail: String,
 }
 
