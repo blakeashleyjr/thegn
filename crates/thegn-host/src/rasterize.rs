@@ -957,6 +957,7 @@ pub(crate) fn image_bytes_with_limits(
 /// Errs (→ text fallback) when the tool is absent, fails, exceeds the renderer
 /// deadline or `cancel` is raised; the whole process group is killed and
 /// reaped on every path. Blocking.
+#[cfg(test)]
 pub fn pdf_page1(path: &Path, cancel: &AtomicBool) -> Result<Raster, String> {
     pdf_page1_with_status(path, cancel).map(|rendered| rendered.raster)
 }
@@ -999,6 +1000,7 @@ fn pdftoppm_args(path: &Path) -> Vec<OsString> {
 /// Extract a PDF's text via `pdftotext` (the no-graphics fallback). Output cut
 /// at the byte cap is returned truncated (fine for text); `Err` carries a
 /// truthful reason (absent tool, failure, timeout, cancel). Blocking.
+#[cfg(test)]
 pub fn pdf_text(path: &Path, cancel: &AtomicBool) -> Result<String, String> {
     pdf_text_with_status(path, cancel).map(|rendered| rendered.text)
 }
@@ -1038,6 +1040,7 @@ fn pdftotext_args(path: &Path) -> Vec<OsString> {
 /// fallback) when the tool is absent, fails, times out or is cancelled; the
 /// renderer's whole process tree (mmdc spawns a browser) is killed and reaped.
 /// Blocking.
+#[cfg(test)]
 pub fn mermaid(path: &Path, cancel: &AtomicBool) -> Result<Raster, String> {
     mermaid_with_status(path, cancel).map(|rendered| rendered.raster)
 }
