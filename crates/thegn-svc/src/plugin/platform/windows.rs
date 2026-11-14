@@ -47,6 +47,10 @@ pub(crate) fn platform_non_utf8_path_for_test(
     None
 }
 
+pub(crate) fn platform_os_string_from_bytes(bytes: Vec<u8>) -> Option<std::ffi::OsString> {
+    String::from_utf8(bytes).ok().map(std::ffi::OsString::from)
+}
+
 pub(crate) fn platform_is_transient_accept_resource_error(raw_os_error: Option<i32>) -> bool {
     matches!(raw_os_error, Some(10024) | Some(10055)) // WSAEMFILE, WSAENOBUFS
 }
