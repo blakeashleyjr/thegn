@@ -160,6 +160,10 @@ fn template_for(kind: NotificationKind) -> BuiltinTemplate {
             title: "PR queue needs you",
             prefix: "PR queue needs you",
         },
+        NotificationKind::CiRunFailed => BuiltinTemplate {
+            title: "CI run failed",
+            prefix: "CI run failed",
+        },
         NotificationKind::PrReviewTaskQueued => BuiltinTemplate {
             title: "PR review task queued",
             prefix: "PR review task queued",

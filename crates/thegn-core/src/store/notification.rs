@@ -48,6 +48,16 @@ pub trait NotificationStore {
         worktree_path: &str,
     ) -> Result<bool>;
 
+    /// Replace and re-arm a notification identified by its kind, source, and
+    /// worktree. Returns the number of rows updated.
+    fn update_notification_message_by_source(
+        &self,
+        kind: &str,
+        source_ref: &str,
+        message: &str,
+        worktree_path: &str,
+    ) -> Result<usize>;
+
     /// Emit-once variant returning the inserted row identity. `None` means an
     /// identical row already existed. Normalized automation events use this id
     /// so repeated appends can never collide at whole-second resolution.
