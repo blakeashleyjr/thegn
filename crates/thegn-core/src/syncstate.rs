@@ -744,10 +744,33 @@ mod tests {
 
     #[test]
     fn replay_stage_parser_names_a_patch_failure() {
-        assert_eq!(
-            ReplayStage::from_marker("noise\nTG-PARITY-ERROR:patch\n"),
-            Some(ReplayStage::Patch)
-        );
+        for (marker, stage) in [
+            ("checkout", ReplayStage::Checkout),
+            ("artifact_validation", ReplayStage::ArtifactValidation),
+            ("fetch", ReplayStage::Fetch),
+            ("reset", ReplayStage::Reset),
+            ("patch", ReplayStage::Patch),
+            ("extraction", ReplayStage::Extraction),
+            ("cleanup", ReplayStage::Cleanup),
+        ] {
+            assert_eq!(
+                ReplayStage::from_marker(&format!("x\nTG-PARITY-ERROR:{marker}\n")),
+                Some(stage)
+            );
+        }
+        assert_eq!(ReplayStage::Patch.to_string(), "Patch");
         assert_eq!(ReplayStage::from_marker("noise\n"), None);
+    }
+
+    #[test]
+    fn manifest_for_bytes_hashes_and_sizes() {
+        assert_eq!(
+            manifest_for_bytes(&[("patch".into(), b"abc".to_vec())]),
+            vec![CaptureArtifact {
+                name: "patch".into(),
+                bytes: 3,
+                sha256: "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad".into(),
+            }]
+        );
     }
 }
