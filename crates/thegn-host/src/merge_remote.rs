@@ -31,6 +31,7 @@ use thegn_core::remote::GitLoc;
 use thegn_svc::git::{CliGit, PlumbingOps};
 
 const MAX_BUNDLE_BYTES: u64 = 4 * 1024 * 1024 * 1024;
+const BUNDLE_FREE_SPACE_MARGIN: u64 = 256 * 1024 * 1024;
 const BUNDLE_STDERR_TAIL: usize = 64 * 1024;
 const BUNDLE_READER_GRACE: Duration = Duration::from_millis(100);
 
@@ -80,6 +81,8 @@ fn ref_generation_field(ref_name: &str, prefix: &str) -> Option<u32> {
 
 struct BundleLimits {
     max_bytes: u64,
+    /// Test injection; production measures the filesystem containing custody.
+    free_bytes: Option<u64>,
     deadline: Duration,
     stderr_tail: usize,
 }
@@ -88,10 +91,20 @@ impl BundleLimits {
     fn production() -> Self {
         Self {
             max_bytes: MAX_BUNDLE_BYTES,
+            free_bytes: None,
             deadline: crate::integrate::DRIVER_SUBPROCESS_TIMEOUT,
             stderr_tail: BUNDLE_STDERR_TAIL,
         }
     }
+}
+
+/// Reserve `margin` bytes on the custody filesystem and cap the bundle at the
+/// smaller of that remaining space and the configured limit.
+fn effective_bundle_cap(max: u64, free: u64, margin: u64) -> Option<u64> {
+    if free <= margin {
+        return None;
+    }
+    Some(max.min(free - margin))
 }
 
 #[derive(Debug)]
@@ -518,6 +531,18 @@ fn stream_bundle(
     tmp: &mut BundleTemp,
     limits: &BundleLimits,
 ) -> std::result::Result<u64, IngestError> {
+    let free_bytes = limits
+        .free_bytes
+        .or_else(|| thegn_metrics::disk_space(tmp.path()).map(|(_, free_bytes, _)| free_bytes));
+    let free_bytes = free_bytes.ok_or_else(|| {
+        IngestError::LocalStorage(io::Error::other(
+            "could not determine free space for bundle custody",
+        ))
+    })?;
+    let max_bytes = effective_bundle_cap(limits.max_bytes, free_bytes, BUNDLE_FREE_SPACE_MARGIN)
+        .ok_or_else(|| {
+            IngestError::LocalStorage(io::Error::other("not enough free space for bundle custody"))
+        })?;
     producer
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -647,10 +672,8 @@ fn stream_bundle(
         match rx.recv_timeout(poll_wait) {
             Ok(Ok(chunk)) => {
                 bytes = bytes.saturating_add(chunk.len() as u64);
-                if bytes > limits.max_bytes {
-                    terminal_error = Some(IngestError::SizeLimit {
-                        cap: limits.max_bytes,
-                    });
+                if bytes > max_bytes {
+                    terminal_error = Some(IngestError::SizeLimit { cap: max_bytes });
                     kill_bundle_producer(&mut child);
                     break;
                 }
@@ -1118,13 +1141,38 @@ mod tests {
     }
 
     fn ingest(fixture: &Stores, expected: Option<&str>) -> Result<IngestedTip> {
+        ingest_with_limits(
+            fixture,
+            expected,
+            test_limits(
+                MAX_BUNDLE_BYTES,
+                crate::integrate::DRIVER_SUBPROCESS_TIMEOUT,
+                BUNDLE_STDERR_TAIL,
+            ),
+        )
+    }
+
+    fn ingest_with_limits(
+        fixture: &Stores,
+        expected: Option<&str>,
+        limits: BundleLimits,
+    ) -> Result<IngestedTip> {
         ingest_tip_with_expected(
             &GitLoc::Local(fixture.target.clone()),
             "feat",
             &GitLoc::Local(fixture.source.clone()),
             expected,
-            &BundleLimits::production(),
+            &limits,
         )
+    }
+
+    fn test_limits(max_bytes: u64, deadline: Duration, stderr_tail: usize) -> BundleLimits {
+        BundleLimits {
+            max_bytes,
+            free_bytes: Some(u64::MAX),
+            deadline,
+            stderr_tail,
+        }
     }
 
     fn custody_for_fixture(fixture: &Stores, temp_root: &std::path::Path) -> (BundleTemp, String) {
@@ -1132,7 +1180,16 @@ mod tests {
         let mut custody = BundleTemp::new_in(temp_root).unwrap();
         let source = GitLoc::Local(fixture.source.clone());
         let bundle_command = source.git_command(&["bundle", "create", "-", "refs/heads/feat"]);
-        stream_bundle(bundle_command, &mut custody, &BundleLimits::production()).unwrap();
+        stream_bundle(
+            bundle_command,
+            &mut custody,
+            &test_limits(
+                MAX_BUNDLE_BYTES,
+                crate::integrate::DRIVER_SUBPROCESS_TIMEOUT,
+                BUNDLE_STDERR_TAIL,
+            ),
+        )
+        .unwrap();
         (custody, generated)
     }
 
@@ -1165,11 +1222,76 @@ mod tests {
     }
 
     fn small_limits(max_bytes: u64, deadline: Duration, stderr_tail: usize) -> BundleLimits {
-        BundleLimits {
-            max_bytes,
-            deadline,
-            stderr_tail,
+        test_limits(max_bytes, deadline, stderr_tail)
+    }
+
+    #[test]
+    fn effective_bundle_cap_reserves_free_space_margin() {
+        let margin = 256;
+        assert_eq!(
+            effective_bundle_cap(1_000, margin + 2_000, margin),
+            Some(1_000)
+        );
+        assert_eq!(effective_bundle_cap(1_000, margin + 200, margin), Some(200));
+        assert_eq!(effective_bundle_cap(1_000, margin, margin), None);
+        assert_eq!(effective_bundle_cap(1_000, 0, margin), None);
+    }
+
+    #[test]
+    fn bundle_stream_refuses_custody_below_free_space_margin() {
+        if thegn_core::util::which_path("sh").is_none() {
+            return;
         }
+        let root = tempfile::tempdir().unwrap();
+        let mut tmp = BundleTemp::new_in(root.path()).unwrap();
+        let mut limits = small_limits(1 << 20, Duration::from_secs(30), 4096);
+        limits.free_bytes = Some(BUNDLE_FREE_SPACE_MARGIN);
+        let result = stream_bundle(shell("printf x"), &mut tmp, &limits);
+        assert!(matches!(
+            result,
+            Err(IngestError::LocalStorage(error))
+                if error.to_string() == "not enough free space for bundle custody"
+        ));
+        tmp.finish().unwrap();
+        assert_eq!(std::fs::read_dir(root.path()).unwrap().count(), 0);
+    }
+
+    #[test]
+    fn ingest_refuses_custody_below_free_space_margin() {
+        let fixture = stores("source");
+        let mut limits = test_limits(
+            MAX_BUNDLE_BYTES,
+            crate::integrate::DRIVER_SUBPROCESS_TIMEOUT,
+            BUNDLE_STDERR_TAIL,
+        );
+        limits.free_bytes = Some(BUNDLE_FREE_SPACE_MARGIN);
+        let error = match ingest_with_limits(&fixture, None, limits) {
+            Ok(_) => panic!("ingest must refuse custody without the reserved margin"),
+            Err(error) => error,
+        };
+        assert!(matches!(
+            error.downcast_ref::<IngestError>(),
+            Some(IngestError::LocalStorage(error))
+                if error.to_string() == "not enough free space for bundle custody"
+        ));
+        assert!(list_refs(&fixture.target).is_empty());
+    }
+
+    #[test]
+    fn bundle_stream_size_limit_uses_reduced_free_space_cap() {
+        if thegn_core::util::which_path("sh").is_none() {
+            return;
+        }
+        let root = tempfile::tempdir().unwrap();
+        let mut tmp = BundleTemp::new_in(root.path()).unwrap();
+        let mut limits = small_limits(1 << 20, Duration::from_secs(30), 4096);
+        limits.free_bytes = Some(BUNDLE_FREE_SPACE_MARGIN + 128);
+        let result = stream_bundle(shell("yes thegn-bundle"), &mut tmp, &limits);
+        let error = result.expect_err("producer must hit the reduced cap");
+        assert!(matches!(&error, IngestError::SizeLimit { cap: 128 }));
+        assert_eq!(error.to_string(), "bundle exceeded the 128-byte size limit");
+        tmp.finish().unwrap();
+        assert_eq!(std::fs::read_dir(root.path()).unwrap().count(), 0);
     }
 
     #[test]
@@ -1204,6 +1326,25 @@ mod tests {
         let started = Instant::now();
         let result = stream_bundle(
             shell("sleep 30"),
+            &mut tmp,
+            &small_limits(1 << 20, Duration::from_secs(1), 4096),
+        );
+        assert!(matches!(result, Err(IngestError::Timeout { .. })));
+        assert!(started.elapsed() < Duration::from_secs(10));
+        tmp.finish().unwrap();
+        assert_eq!(std::fs::read_dir(root.path()).unwrap().count(), 0);
+    }
+
+    #[test]
+    fn bundle_stream_kills_and_reaps_a_producer_holding_pipe_open() {
+        if thegn_core::util::which_path("sh").is_none() {
+            return;
+        }
+        let root = tempfile::tempdir().unwrap();
+        let mut tmp = BundleTemp::new_in(root.path()).unwrap();
+        let started = Instant::now();
+        let result = stream_bundle(
+            shell("printf x; exec sleep 30"),
             &mut tmp,
             &small_limits(1 << 20, Duration::from_secs(1), 4096),
         );
@@ -1317,7 +1458,16 @@ mod tests {
         let mut custody = BundleTemp::new_in(&temp_root).unwrap();
         let source = GitLoc::Local(fixture.source.clone());
         let bundle_command = source.git_command(&["bundle", "create", "-", "refs/heads/feat"]);
-        stream_bundle(bundle_command, &mut custody, &BundleLimits::production()).unwrap();
+        stream_bundle(
+            bundle_command,
+            &mut custody,
+            &test_limits(
+                MAX_BUNDLE_BYTES,
+                crate::integrate::DRIVER_SUBPROCESS_TIMEOUT,
+                BUNDLE_STDERR_TAIL,
+            ),
+        )
+        .unwrap();
         fetch_from_custody(
             &GitLoc::Local(fixture.target.clone()),
             "feat",
@@ -1354,7 +1504,16 @@ mod tests {
         let mut custody = BundleTemp::new_in(temp_root.path()).unwrap();
         let source = GitLoc::Local(fixture.source.clone());
         let bundle_command = source.git_command(&["bundle", "create", "-", "refs/heads/feat"]);
-        stream_bundle(bundle_command, &mut custody, &BundleLimits::production()).unwrap();
+        stream_bundle(
+            bundle_command,
+            &mut custody,
+            &test_limits(
+                MAX_BUNDLE_BYTES,
+                crate::integrate::DRIVER_SUBPROCESS_TIMEOUT,
+                BUNDLE_STDERR_TAIL,
+            ),
+        )
+        .unwrap();
 
         let result = fetch_from_custody(
             &GitLoc::Local(fixture.target.clone()),
