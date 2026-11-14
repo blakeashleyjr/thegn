@@ -28,6 +28,9 @@ pub(crate) mod feed_hub;
 pub(crate) mod inbox;
 pub(crate) mod respawn;
 #[cfg(test)]
+#[path = "plugins/sched_tests.rs"]
+mod sched_tests;
+#[cfg(test)]
 #[path = "plugins/soak_tests.rs"]
 mod soak_tests;
 use inbox::PluginInbox;
@@ -884,6 +887,17 @@ struct SchedEntry {
     overloaded: u64,
 }
 
+// `Instant` has no public maximum on the supported Rust versions. Keep an
+// unrepresentably large plugin interval at a representable far-future deadline
+// instead of allowing `Instant + Duration` to panic.
+const FAR_FUTURE_SCHEDULE_CLAMP: Duration = Duration::from_secs(100 * 365 * 24 * 60 * 60);
+
+fn next_schedule_deadline(now: Instant, interval: Duration) -> Instant {
+    now.checked_add(interval)
+        .or_else(|| now.checked_add(FAR_FUTURE_SCHEDULE_CLAMP))
+        .unwrap_or(now)
+}
+
 /// Build cadence entries from negotiated contributions. Resident callbacks
 /// remain contribution-scoped; a one-shot command has only plugin-level
 /// result attribution, so its interval contributions share one poll at the
@@ -947,7 +961,7 @@ fn run_due(
         if entry.next > now || lock(disabled).contains(&entry.plugin) {
             continue;
         }
-        entry.next = now + entry.interval;
+        entry.next = next_schedule_deadline(now, entry.interval);
         match entry.mode {
             PluginMode::Resident => {
                 // Fetch the writer at fire time so a respawned session's
