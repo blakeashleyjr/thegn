@@ -140,6 +140,68 @@ impl ControlApi for FakeApi {
         self.record("list_sessions");
         Box::pin(async { Ok(vec![]) })
     }
+    fn record_session<'a>(
+        &'a self,
+        session: &'a str,
+        spec: super::RecordSpec,
+    ) -> BoxFuture<'a, ControlResult<super::RecordStatus>> {
+        self.record(&format!("record_session:{session}:{spec:?}"));
+        let result = if session == "missing" {
+            Err(super::ControlError::NotFound(session.to_string()))
+        } else {
+            Ok(super::RecordStatus {
+                recording: matches!(spec, super::RecordSpec::Start),
+                path: Some("/tmp/session.cast".into()),
+                bytes: 17,
+                capped: false,
+                truncated: None,
+                dropped_bytes: 0,
+                stopping: false,
+            })
+        };
+        Box::pin(async move { result })
+    }
+    fn agent_sessions<'a>(
+        &'a self,
+        worktree: Option<&'a str>,
+        harness: Option<&'a str>,
+    ) -> BoxFuture<'a, ControlResult<Vec<thegn_core::harness::SessionRecord>>> {
+        self.record(&format!("agent_sessions:{worktree:?}:{harness:?}"));
+        let result = if harness == Some("missing") {
+            Err(super::ControlError::NotFound("harness".into()))
+        } else {
+            Ok(vec![thegn_core::harness::SessionRecord {
+                harness: "claude".into(),
+                id: "native-1".into(),
+                worktree: Some("/w".into()),
+                mtime: 7,
+                summary: "task".into(),
+                unlinked: false,
+            }])
+        };
+        Box::pin(async move { result })
+    }
+    fn worktree_create(
+        &self,
+        req: super::WorktreeCreateReq,
+    ) -> BoxFuture<'_, ControlResult<super::WorktreeInfo>> {
+        self.record(&format!(
+            "worktree_create:{:?}:{:?}:{:?}",
+            req.repo, req.issue, req.branch
+        ));
+        let result = if req.branch.as_deref() == Some("missing") {
+            Err(super::ControlError::NotFound("branch".into()))
+        } else {
+            Ok(super::WorktreeInfo {
+                path: "/w/new".into(),
+                branch: req.branch.unwrap_or_else(|| "feature-x".into()),
+                repo_root: "/r".into(),
+                location: String::new(),
+                created_at: 9,
+            })
+        };
+        Box::pin(async move { result })
+    }
     fn list_worktrees(&self) -> BoxFuture<'_, ControlResult<Vec<super::WorktreeInfo>>> {
         self.record("list_worktrees");
         Box::pin(async {
@@ -669,6 +731,8 @@ fn default_body(path: &str) -> &'static str {
         r#"{"rows":24,"cols":80}"#
     } else if path.contains("/detach") {
         r#"{"client_id":"c"}"#
+    } else if path.contains("/record") {
+        r#"{"op":"start"}"#
     } else if path.contains("/worktrees/open") {
         r#"{"repo":"r"}"#
     } else if path.contains("/worktrees/sandbox-profile/set") {
@@ -705,6 +769,7 @@ async fn read_scope_covers_exactly_the_read_surface() {
         ("GET", "/v1/leases"),
         ("GET", "/v1/me"),
         ("GET", "/v1/sessions/s1/snapshot"),
+        ("GET", "/v1/agent/sessions"),
         ("GET", "/v1/git/status?worktree=%2Fw"),
         ("GET", "/v1/merge/list?worktree=%2Fw"),
         ("GET", "/v1/pr/status"),
@@ -775,9 +840,11 @@ async fn under_scoped_requests_are_rejected_with_zero_side_effects() {
         ("POST", "/v1/sessions"),
         ("POST", "/v1/sessions/s1/input"),
         ("POST", "/v1/sessions/s1/resize"),
+        ("POST", "/v1/sessions/s1/record"),
         ("POST", "/v1/sessions/s1/detach"),
         ("DELETE", "/v1/sessions/s1"),
         ("POST", "/v1/worktrees/open"),
+        ("POST", "/v1/worktrees"),
         ("POST", "/v1/git/stage"),
         ("POST", "/v1/git/commit"),
         ("POST", "/v1/merge/add"),
@@ -975,6 +1042,186 @@ async fn grpc_folder_assignment_requires_git_scope() {
         .await
         .unwrap();
     assert_eq!(r.api.calls(), ["folder_assign:/w:None"]);
+}
+
+#[cfg(feature = "control-grpc")]
+#[tokio::test]
+async fn grpc_new_surface_handlers_match_http_scopes_shapes_and_bounds() {
+    use super::grpc::{GrpcControl, proto};
+    use proto::control_server::Control;
+    use thegn_core::store::ControlStore;
+
+    let r = rig(false);
+    let grpc = GrpcControl {
+        api: r.api.clone(),
+        store: r.db.clone() as Arc<Mutex<dyn ControlStore + Send>>,
+        local_admin: false,
+        daemon_euid: None,
+        server_label: "test thegn".into(),
+    };
+    macro_rules! request {
+        ($token:expr, $request:expr) => {{
+            let mut request = tonic::Request::new($request);
+            request.metadata_mut().insert(
+                "authorization",
+                format!("Bearer {}", $token).parse().unwrap(),
+            );
+            request
+        }};
+    }
+    let read = token(&r, "read");
+    let write = token(&r, "write");
+    let none = token(&r, "");
+    let git = token(&r, "git");
+
+    let agent_request = proto::AgentSessionsRequest {
+        worktree: "/w".into(),
+        harness: "claude".into(),
+    };
+    assert_eq!(
+        grpc.agent_sessions(request!(&none, agent_request.clone()))
+            .await
+            .unwrap_err()
+            .code(),
+        tonic::Code::PermissionDenied
+    );
+    let agent_reply = grpc
+        .agent_sessions(request!(&read, agent_request))
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(agent_reply.sessions.len(), 1);
+    assert_eq!(agent_reply.sessions[0].id, "native-1");
+    let too_large = proto::AgentSessionsRequest {
+        worktree: "x".repeat(64 * 1024 + 1),
+        harness: String::new(),
+    };
+    assert_eq!(
+        grpc.agent_sessions(request!(&read, too_large))
+            .await
+            .unwrap_err()
+            .code(),
+        tonic::Code::ResourceExhausted
+    );
+    assert_eq!(
+        grpc.agent_sessions(request!(
+            &read,
+            proto::AgentSessionsRequest {
+                worktree: String::new(),
+                harness: "missing".into(),
+            }
+        ))
+        .await
+        .unwrap_err()
+        .code(),
+        tonic::Code::NotFound
+    );
+
+    let record_request = proto::SessionsRecordRequest {
+        session: "s1".into(),
+        op: "start".into(),
+    };
+    assert_eq!(
+        grpc.sessions_record(request!(&read, record_request.clone()))
+            .await
+            .unwrap_err()
+            .code(),
+        tonic::Code::PermissionDenied
+    );
+    let record_reply = grpc
+        .sessions_record(request!(&write, record_request))
+        .await
+        .unwrap()
+        .into_inner();
+    assert!(record_reply.recording);
+    assert_eq!(record_reply.path.as_deref(), Some("/tmp/session.cast"));
+    assert_eq!(record_reply.bytes, 17);
+    assert_eq!(
+        grpc.sessions_record(request!(
+            &write,
+            proto::SessionsRecordRequest {
+                session: "s1".into(),
+                op: "bogus".into(),
+            }
+        ))
+        .await
+        .unwrap_err()
+        .code(),
+        tonic::Code::InvalidArgument
+    );
+    assert_eq!(
+        grpc.sessions_record(request!(
+            &write,
+            proto::SessionsRecordRequest {
+                session: "missing".into(),
+                op: "status".into(),
+            }
+        ))
+        .await
+        .unwrap_err()
+        .code(),
+        tonic::Code::NotFound
+    );
+
+    let create_request = proto::WorktreesCreateRequest {
+        repo: Some("/r".into()),
+        issue: None,
+        branch: Some("feature-x".into()),
+    };
+    assert_eq!(
+        grpc.worktrees_create(request!(&read, create_request.clone()))
+            .await
+            .unwrap_err()
+            .code(),
+        tonic::Code::PermissionDenied
+    );
+    let created = grpc
+        .worktrees_create(request!(&git, create_request))
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(created.path, "/w/new");
+    assert_eq!(created.branch, "feature-x");
+    assert_eq!(
+        grpc.worktrees_create(request!(
+            &git,
+            proto::WorktreesCreateRequest {
+                repo: None,
+                issue: None,
+                branch: Some("missing".into()),
+            }
+        ))
+        .await
+        .unwrap_err()
+        .code(),
+        tonic::Code::NotFound
+    );
+    assert_eq!(
+        grpc.worktrees_create(request!(
+            &git,
+            proto::WorktreesCreateRequest {
+                repo: None,
+                issue: None,
+                branch: Some("x".repeat(64 * 1024 + 1)),
+            }
+        ))
+        .await
+        .unwrap_err()
+        .code(),
+        tonic::Code::ResourceExhausted
+    );
+
+    assert_eq!(
+        r.api.calls(),
+        [
+            "agent_sessions:Some(\"/w\"):Some(\"claude\")",
+            "agent_sessions:None:Some(\"missing\")",
+            "record_session:s1:Start",
+            "record_session:missing:Status",
+            "worktree_create:Some(\"/r\"):None:Some(\"feature-x\")",
+            "worktree_create:None:None:Some(\"missing\")",
+        ]
+    );
 }
 
 #[cfg(feature = "control-grpc")]
