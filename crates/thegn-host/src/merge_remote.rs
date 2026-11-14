@@ -85,6 +85,8 @@ struct BundleLimits {
     free_bytes: Option<u64>,
     deadline: Duration,
     stderr_tail: usize,
+    #[cfg(test)]
+    reader_delay: Option<Duration>,
 }
 
 impl BundleLimits {
@@ -94,6 +96,8 @@ impl BundleLimits {
             free_bytes: None,
             deadline: crate::integrate::DRIVER_SUBPROCESS_TIMEOUT,
             stderr_tail: BUNDLE_STDERR_TAIL,
+            #[cfg(test)]
+            reader_delay: None,
         }
     }
 }
@@ -522,6 +526,75 @@ fn needs_ingest(target: &GitLoc, branch: &GitLoc) -> bool {
     host_id(target) != host_id(branch)
 }
 
+fn write_bundle_chunk(
+    tmp: &mut BundleTemp,
+    bytes: &mut u64,
+    max_bytes: u64,
+    chunk: &[u8],
+) -> std::result::Result<(), IngestError> {
+    *bytes = bytes.saturating_add(chunk.len() as u64);
+    if *bytes > max_bytes {
+        return Err(IngestError::SizeLimit { cap: max_bytes });
+    }
+    tmp.write(chunk).map_err(IngestError::LocalStorage)
+}
+
+fn drain_bundle_output(
+    rx: &mpsc::Receiver<io::Result<Vec<u8>>>,
+    tmp: &mut BundleTemp,
+    bytes: &mut u64,
+    max_bytes: u64,
+    started: Instant,
+    deadline: Duration,
+) -> Option<IngestError> {
+    loop {
+        if crate::fold_cancel::requested() {
+            return Some(IngestError::Cancelled);
+        }
+        let remaining = deadline.saturating_sub(started.elapsed());
+        if remaining.is_zero() {
+            return Some(IngestError::Timeout { after: deadline });
+        }
+        match rx.recv_timeout(remaining.min(Duration::from_millis(10))) {
+            Ok(Ok(chunk)) => {
+                if let Err(error) = write_bundle_chunk(tmp, bytes, max_bytes, &chunk) {
+                    return Some(error);
+                }
+            }
+            Ok(Err(error)) => {
+                return Some(IngestError::Remote {
+                    code: None,
+                    stderr_tail: error.to_string(),
+                });
+            }
+            Err(RecvTimeoutError::Timeout) => {}
+            // recv_timeout delivers queued chunks before Disconnected, so the
+            // reader has no undelivered chunks when this arm is reached.
+            Err(RecvTimeoutError::Disconnected) => return None,
+        }
+    }
+}
+
+fn reap_and_drain_bundle(
+    child: &mut std::process::Child,
+    rx: &mpsc::Receiver<io::Result<Vec<u8>>>,
+    tmp: &mut BundleTemp,
+    bytes: &mut u64,
+    max_bytes: u64,
+    started: Instant,
+    deadline: Duration,
+) -> std::result::Result<std::process::ExitStatus, IngestError> {
+    kill_bundle_producer(child);
+    let exited = child.wait().map_err(|error| IngestError::Remote {
+        code: None,
+        stderr_tail: error.to_string(),
+    })?;
+    if let Some(error) = drain_bundle_output(rx, tmp, bytes, max_bytes, started, deadline) {
+        return Err(error);
+    }
+    Ok(exited)
+}
+
 #[expect(
     clippy::disallowed_methods,
     reason = "off-loop: merge-queue drain (spawn_blocking) / CLI; the killed producer must be reaped"
@@ -583,15 +656,26 @@ fn stream_bundle(
     };
     let (tx, rx) = mpsc::sync_channel::<io::Result<Vec<u8>>>(4);
     let (stdout_done_tx, stdout_done_rx) = mpsc::sync_channel(1);
+    #[cfg(test)]
+    let reader_delay = limits.reader_delay;
     let stdout_thread = thegn_core::thread_name::spawn_named("thegn-bndl-out", move || {
         crate::platform::qos::set_self(crate::platform::qos::Qos::Utility);
         let mut reader = stdout;
+        #[cfg(test)]
+        let mut first_chunk = true;
         loop {
             let mut chunk = vec![0_u8; 64 * 1024];
             match reader.read(&mut chunk) {
                 Ok(0) => break,
                 Ok(count) => {
                     chunk.truncate(count);
+                    #[cfg(test)]
+                    if first_chunk {
+                        first_chunk = false;
+                        if let Some(delay) = reader_delay {
+                            std::thread::sleep(delay);
+                        }
+                    }
                     if let Err(unsent) = tx.send(Ok(chunk)) {
                         tracing::debug!(target: "thegn::merge", "bundle stdout receiver closed: {unsent:?}");
                         break;
@@ -674,14 +758,8 @@ fn stream_bundle(
         let poll_wait = remaining.min(Duration::from_millis(10));
         match rx.recv_timeout(poll_wait) {
             Ok(Ok(chunk)) => {
-                bytes = bytes.saturating_add(chunk.len() as u64);
-                if bytes > max_bytes {
-                    terminal_error = Some(IngestError::SizeLimit { cap: max_bytes });
-                    kill_bundle_producer(&mut child);
-                    break;
-                }
-                if let Err(error) = tmp.write(&chunk) {
-                    terminal_error = Some(IngestError::LocalStorage(error));
+                if let Err(error) = write_bundle_chunk(tmp, &mut bytes, max_bytes, &chunk) {
+                    terminal_error = Some(error);
                     kill_bundle_producer(&mut child);
                     break;
                 }
@@ -697,15 +775,17 @@ fn stream_bundle(
             Err(RecvTimeoutError::Timeout) => {
                 match crate::platform::gate_child_exited(&mut child) {
                     Ok(true) => {
-                        kill_bundle_producer(&mut child);
-                        match child.wait() {
+                        match reap_and_drain_bundle(
+                            &mut child,
+                            &rx,
+                            tmp,
+                            &mut bytes,
+                            max_bytes,
+                            started,
+                            limits.deadline,
+                        ) {
                             Ok(exited) => status = Some(exited),
-                            Err(error) => {
-                                terminal_error = Some(IngestError::Remote {
-                                    code: None,
-                                    stderr_tail: error.to_string(),
-                                });
-                            }
+                            Err(error) => terminal_error = Some(error),
                         }
                         break;
                     }
@@ -723,15 +803,17 @@ fn stream_bundle(
             Err(RecvTimeoutError::Disconnected) => {
                 match crate::platform::gate_child_exited(&mut child) {
                     Ok(true) => {
-                        kill_bundle_producer(&mut child);
-                        match child.wait() {
+                        match reap_and_drain_bundle(
+                            &mut child,
+                            &rx,
+                            tmp,
+                            &mut bytes,
+                            max_bytes,
+                            started,
+                            limits.deadline,
+                        ) {
                             Ok(exited) => status = Some(exited),
-                            Err(error) => {
-                                terminal_error = Some(IngestError::Remote {
-                                    code: None,
-                                    stderr_tail: error.to_string(),
-                                });
-                            }
+                            Err(error) => terminal_error = Some(error),
                         }
                         break;
                     }
@@ -1175,6 +1257,7 @@ mod tests {
             free_bytes: Some(u64::MAX),
             deadline,
             stderr_tail,
+            reader_delay: None,
         }
     }
 
@@ -1449,6 +1532,43 @@ mod tests {
         assert!(matches!(result, Err(IngestError::InvalidBundle(_))));
         tmp.finish().unwrap();
         assert_eq!(std::fs::read_dir(root.path()).unwrap().count(), 0);
+    }
+
+    #[test]
+    fn bundle_stream_drains_reader_after_producer_exit() {
+        let fixture = stores("source");
+        let temp_root = fixture._root.path().join("bundle-temp");
+        std::fs::create_dir(&temp_root).unwrap();
+        let generated = generation_ref(&GitLoc::Local(fixture.source.clone()), "feat").unwrap();
+        let mut custody = BundleTemp::new_in(&temp_root).unwrap();
+        let source = GitLoc::Local(fixture.source.clone());
+        let bundle_command = source.git_command(&["bundle", "create", "-", "refs/heads/feat"]);
+        let mut limits = test_limits(
+            MAX_BUNDLE_BYTES,
+            crate::integrate::DRIVER_SUBPROCESS_TIMEOUT,
+            BUNDLE_STDERR_TAIL,
+        );
+        limits.reader_delay = Some(Duration::from_millis(50));
+
+        let bytes = stream_bundle(bundle_command, &mut custody, &limits).unwrap();
+        assert!(
+            bytes > 0,
+            "delayed reader still ingests the complete bundle"
+        );
+        fetch_from_custody(
+            &GitLoc::Local(fixture.target.clone()),
+            "feat",
+            custody,
+            &generated,
+            &fixture.oid,
+            limits.deadline,
+        )
+        .unwrap();
+        assert_eq!(
+            thegn_core::util::git_out(&fixture.target, &["rev-parse", &generated]).as_deref(),
+            Some(fixture.oid.as_str())
+        );
+        assert_eq!(std::fs::read_dir(&temp_root).unwrap().count(), 0);
     }
 
     #[test]
