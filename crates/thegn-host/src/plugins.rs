@@ -27,6 +27,9 @@ use tokio::sync::mpsc as tokio_mpsc;
 pub(crate) mod feed_hub;
 pub(crate) mod inbox;
 pub(crate) mod respawn;
+#[cfg(test)]
+#[path = "plugins/soak_tests.rs"]
+mod soak_tests;
 use inbox::PluginInbox;
 
 pub(crate) type SessionGen = u64;
