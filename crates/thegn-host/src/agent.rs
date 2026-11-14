@@ -1400,7 +1400,12 @@ fn attach_vpn_with<P: VpnProvider>(
     };
     let sidecar = sandbox::vpn_sidecar_name(&spec.name);
     let on_error = vpn.on_error;
-    let attach = match provider.up(rt, &sidecar) {
+    let placement = if spec.placement.is_local() {
+        "local".to_string()
+    } else {
+        spec.placement.label()
+    };
+    let attach = match provider.up_for_worktree(rt, &sidecar, &spec.worktree, &placement) {
         Ok(attach) => attach,
         Err(e) => {
             if e.downcast_ref::<thegn_svc::vpn::VpnSidecarDrift>()

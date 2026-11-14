@@ -1033,7 +1033,17 @@ fn plan_iroh(spec: &ShareSpec, i: &IrohShareConfig) -> SharePlan {
 /// A failed verification turns the serve off. Errors with guidance if no
 /// sidecar with tailscale is reachable.
 pub fn serve_up(sidecar: &str, serve: &ServePlan) -> Result<PublicEndpoint> {
-    let recorded = crate::vpn::recorded_sidecar(sidecar)?;
+    let caller_worktree = std::env::current_dir().context("share: read caller worktree")?;
+    serve_up_for_worktree(sidecar, &caller_worktree, serve)
+}
+
+/// Bring tailscale serve up after binding it to the selected worktree.
+pub fn serve_up_for_worktree(
+    sidecar: &str,
+    worktree: &std::path::Path,
+    serve: &ServePlan,
+) -> Result<PublicEndpoint> {
+    let recorded = crate::vpn::recorded_sidecar_for_worktree(sidecar, worktree, None)?;
     serve_up_with(&recorded, serve, |runtime, target, argv| {
         exec_in(runtime, target, argv)
     })
@@ -1103,7 +1113,18 @@ fn serve_up_verify(
 /// Status uses `{"TCP":{"443":{"HTTPS":true}},"Web":{"host.ts.net:443":{..}},"AllowFunnel":{"host.ts.net:443":true}}`.
 /// A failed down command is accepted only when readable status confirms the port is absent.
 pub fn serve_down(sidecar: &str, serve: &ServePlan) -> Result<()> {
-    let recorded = crate::vpn::recorded_sidecar(sidecar).context("share: teardown unverified")?;
+    let caller_worktree = std::env::current_dir().context("share: read caller worktree")?;
+    serve_down_for_worktree(sidecar, &caller_worktree, serve)
+}
+
+/// Tear tailscale serve down after binding it to the selected worktree.
+pub fn serve_down_for_worktree(
+    sidecar: &str,
+    worktree: &std::path::Path,
+    serve: &ServePlan,
+) -> Result<()> {
+    let recorded = crate::vpn::recorded_sidecar_for_worktree(sidecar, worktree, None)
+        .context("share: teardown unverified")?;
     serve_down_with(
         std::slice::from_ref(&recorded.runtime),
         serve,
@@ -1315,10 +1336,12 @@ impl RunningShare {
         if report.leaked_readers > 0 || matches!(report.outcome, StopOutcome::Failed(_)) {
             tracing::warn!(?report, "share teardown was incomplete");
         }
-        if report.truncated_lines > 0 || report.dropped_lines > 0 {
+        if report.truncated_lines > 0 || report.dropped_lines > 0 || report.budget_dropped_bytes > 0
+        {
             tracing::debug!(
                 truncated_lines = report.truncated_lines,
                 dropped_lines = report.dropped_lines,
+                budget_dropped_bytes = report.budget_dropped_bytes,
                 "share provider output exceeded its bounds"
             );
         }
@@ -1329,10 +1352,12 @@ impl RunningShare {
         if report.leaked_readers > 0 || matches!(report.outcome, StopOutcome::Failed(_)) {
             tracing::warn!(?report, "share teardown was incomplete");
         }
-        if report.truncated_lines > 0 || report.dropped_lines > 0 {
+        if report.truncated_lines > 0 || report.dropped_lines > 0 || report.budget_dropped_bytes > 0
+        {
             tracing::debug!(
                 truncated_lines = report.truncated_lines,
                 dropped_lines = report.dropped_lines,
+                budget_dropped_bytes = report.budget_dropped_bytes,
                 "share provider output exceeded its bounds"
             );
         }
@@ -1348,11 +1373,16 @@ impl RunningShare {
             .truncated_lines
             .load(Ordering::Relaxed);
         let dropped_lines = self.endpoint_tracker.dropped_lines.load(Ordering::Relaxed);
+        let budget_dropped_bytes = self
+            .endpoint_tracker
+            .budget_dropped_bytes
+            .load(Ordering::Relaxed);
         ShareTeardown {
             outcome,
             leaked_readers,
             truncated_lines,
             dropped_lines,
+            budget_dropped_bytes,
         }
     }
 
@@ -1365,11 +1395,16 @@ impl RunningShare {
             .truncated_lines
             .load(Ordering::Relaxed);
         let dropped_lines = self.endpoint_tracker.dropped_lines.load(Ordering::Relaxed);
+        let budget_dropped_bytes = self
+            .endpoint_tracker
+            .budget_dropped_bytes
+            .load(Ordering::Relaxed);
         ShareTeardown {
             outcome,
             leaked_readers,
             truncated_lines,
             dropped_lines,
+            budget_dropped_bytes,
         }
     }
 
@@ -1482,6 +1517,7 @@ pub struct ShareTeardown {
     pub leaked_readers: usize,
     pub truncated_lines: usize,
     pub dropped_lines: usize,
+    pub budget_dropped_bytes: usize,
 }
 
 /// Carries endpoint coordination and shared reader output-bound counters.
@@ -1490,8 +1526,25 @@ struct EndpointTracker {
     accepted: Arc<OnceLock<String>>,
     conflict: Arc<AtomicBool>,
     conflict_hook: Arc<Mutex<Option<ConflictHook>>>,
+    forwarded_bytes: Arc<std::sync::atomic::AtomicUsize>,
     truncated_lines: Arc<std::sync::atomic::AtomicUsize>,
     dropped_lines: Arc<std::sync::atomic::AtomicUsize>,
+    budget_dropped_bytes: Arc<std::sync::atomic::AtomicUsize>,
+    diagnostic_budget: Arc<Mutex<DiagnosticBudget>>,
+}
+
+struct DiagnosticBudget {
+    started: Instant,
+    lines: usize,
+}
+
+impl Default for DiagnosticBudget {
+    fn default() -> Self {
+        Self {
+            started: Instant::now(),
+            lines: 0,
+        }
+    }
 }
 
 impl EndpointTracker {
@@ -1515,6 +1568,22 @@ impl EndpointTracker {
         if !self.conflict.swap(true, Ordering::AcqRel) {
             self.run_conflict_hook();
         }
+    }
+
+    fn admit_diagnostic(&self) -> bool {
+        let mut budget = self
+            .diagnostic_budget
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if budget.started.elapsed() >= Duration::from_secs(1) {
+            budget.started = Instant::now();
+            budget.lines = 0;
+        }
+        if budget.lines >= DIAGNOSTIC_LINES_PER_SECOND {
+            return false;
+        }
+        budget.lines += 1;
+        true
     }
 
     fn run_conflict_hook(&self) {
@@ -2262,6 +2331,8 @@ enum Streamable {
 }
 
 const MAX_PROVIDER_LINE: usize = 4096;
+const DIAGNOSTIC_LINES_PER_SECOND: usize = 1024;
+const MAX_FORWARDED_DIAGNOSTIC_BYTES: usize = 1024 * 1024;
 
 /// Drain a provider stream for the child's full lifetime without retaining an
 /// unbounded line or queue. Oversized lines are discarded through newline;
@@ -2359,8 +2430,27 @@ fn emit_line(
             endpoint_tracker.observe(&url);
             let _ = url_tx.try_send(url);
         }
+        let text_len = text.len();
+        if endpoint_tracker
+            .forwarded_bytes
+            .load(Ordering::Relaxed)
+            .saturating_add(text_len)
+            > MAX_FORWARDED_DIAGNOSTIC_BYTES
+            || !endpoint_tracker.admit_diagnostic()
+        {
+            endpoint_tracker
+                .budget_dropped_bytes
+                .fetch_add(text_len, Ordering::Relaxed);
+            line.clear();
+            *oversized = false;
+            return;
+        }
         match tx.try_send(text) {
-            Ok(()) => {}
+            Ok(()) => {
+                endpoint_tracker
+                    .forwarded_bytes
+                    .fetch_add(text_len, Ordering::Relaxed);
+            }
             Err(mpsc::TrySendError::Full(_)) => {
                 endpoint_tracker
                     .dropped_lines
