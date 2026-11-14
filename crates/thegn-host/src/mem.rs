@@ -171,19 +171,18 @@ fn try_trim_with_status(
     if !claim(limiter) {
         return false;
     }
-    if matches!(cause, TrimCause::ScanDrain) {
-        if let Some(status) = read_memory_status()
-            && should_skip_scan_trim(status.swap_kb, status.rss_kb)
-        {
-            counters.skipped_swap.fetch_add(1, Ordering::Relaxed);
-            tracing::debug!(
-                target: "thegn::mem",
-                vm_swap_kb = status.swap_kb,
-                vm_rss_kb = status.rss_kb,
-                "skipping scan trim while swap is elevated"
-            );
-            return false;
-        }
+    if matches!(cause, TrimCause::ScanDrain)
+        && let Some(status) = read_memory_status()
+        && should_skip_scan_trim(status.swap_kb, status.rss_kb)
+    {
+        counters.skipped_swap.fetch_add(1, Ordering::Relaxed);
+        tracing::debug!(
+            target: "thegn::mem",
+            vm_swap_kb = status.swap_kb,
+            vm_rss_kb = status.rss_kb,
+            "skipping scan trim while swap is elevated"
+        );
+        return false;
     }
     let started = Instant::now();
     let Some(outcome) = trim() else {
