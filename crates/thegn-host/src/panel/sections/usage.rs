@@ -19,6 +19,7 @@
 //! view into [`PanelRow`]s: accounts worst-first, one aligned metric line per
 //! limit, facts below the numbers, legend on the last row.
 
+use thegn_core::pipeline_report::display_cell;
 use thegn_core::theme::Hue;
 use thegn_core::usage::{UsageState, UsageTone};
 use thegn_core::usage_view::{self, AccountView, MetricRow};
@@ -61,7 +62,7 @@ fn metric_row(ctx: &SectionCtx, m: &MetricRow, fg: Tone, indent: usize) -> Panel
     if indent > 0 {
         segs.push(sp(indent));
     }
-    segs.push(seg(d(), m.name.clone()));
+    segs.push(seg(d(), display_cell(&m.name)));
     segs.extend(bar_segs(m.frac, bar_w, hue(fg.0)));
     segs.push(seg(t(), format!(" {}", m.pct)));
     if !m.resets.is_empty() {
@@ -80,17 +81,17 @@ fn metric_row(ctx: &SectionCtx, m: &MetricRow, fg: Tone, indent: usize) -> Panel
 /// it can't be read.
 fn account_heading(a: &AccountView) -> PanelRow {
     let fg = a.tone.map(|t| hue(tone(t).0)).unwrap_or_else(d);
-    let mut head: Vec<Seg> = vec![seg(fg, a.label.clone())];
+    let mut head: Vec<Seg> = vec![seg(fg, display_cell(&a.label))];
     match a.state {
         // The view's note for an Ok account IS the plan; keep the teal chip.
         UsageState::Ok => {
             if !a.note.trim().is_empty() {
-                head.push(seg(hue(Hue::Teal), format!("  {}", a.note)));
+                head.push(seg(hue(Hue::Teal), format!("  {}", display_cell(&a.note))));
             }
         }
         // Loading / Unavailable / no-windows: the note is the state's own
         // words ("…", "unavailable: …", "no windows reported"), always present.
-        _ => head.push(seg(g2(), format!("  {}", a.note))),
+        _ => head.push(seg(g2(), format!("  {}", display_cell(&a.note)))),
     }
     PanelRow::plain(Line::segs(head))
 }
@@ -156,7 +157,7 @@ pub(super) fn content(ctx: &SectionCtx) -> Vec<PanelRow> {
             // reader came for leads, the org/seat/home tail follows.
             rows.push(PanelRow::plain(Line::segs(vec![
                 sp(2),
-                seg(g(), a.facts.clone()),
+                seg(g(), display_cell(&a.facts)),
             ])));
         }
     }
@@ -210,7 +211,7 @@ fn proxy_spend_rows(ctx: &SectionCtx, rows: &mut Vec<PanelRow>) {
         for na in r.by_route.iter().take(3) {
             rows.push(PanelRow::plain(Line::segs(vec![
                 sp(2),
-                seg(g(), format!("{:<20}", na.name)),
+                seg(g(), format!("{:<20}", display_cell(&na.name))),
                 seg(d(), format!("${:.2}", na.agg.cost_usd)),
             ])));
         }

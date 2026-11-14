@@ -29,6 +29,11 @@ means this build is too old), or `unavailable` with an error. Host sections
 below may be incomplete when the database cannot be read. `doctor --json`
 reports this as `worktree_identity.state_db` (`ok` when read).
 
+The **Provider dev-env cache** section prints host-cache `scope` and
+`require_sigs` (`yes (explicit)` or `yes (nix default)`) beside the signer;
+`doctor --json` carries these as `scope`, `require_sigs`, and
+`require_sigs_explicit`.
+
 `thegn doctor` also lists a "Worktree sandbox pins" section: one line per
 pinned worktree as `<path>: <pinned profile> (default <profile>; same|differs)`,
 or "none (worktrees inherit the configured profile)" when nothing is pinned. If

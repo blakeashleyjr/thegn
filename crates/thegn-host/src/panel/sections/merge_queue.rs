@@ -8,6 +8,7 @@
 //! below can never drift from the dispatch.
 
 use thegn_core::attention::MqStatus;
+use thegn_core::pipeline_report::display_cell;
 use thegn_core::remote::GitLoc;
 use thegn_core::theme::Hue;
 
@@ -85,12 +86,12 @@ pub(super) fn content(ctx: &SectionCtx) -> Vec<PanelRow> {
             status
                 .map(status_glyph_typed)
                 .unwrap_or_else(unknown_status_glyph),
-            seg(d(), format!(" {}", r.branch)),
+            seg(d(), format!(" {}", display_cell(&r.branch))),
         ];
         // Off-host branches get a host chip so the reader sees which rows live on
         // another machine (their tips are bundle-fetched into the target store).
         if let Some(host) = host_label(&r.location) {
-            left.push(seg(hue(Hue::Blue), format!(" @{host}")));
+            left.push(seg(hue(Hue::Blue), format!(" @{}", display_cell(&host))));
         }
         if let Some(view) = claim_for_row(ctx, &r.worktree)
             && let Some(chip) = row_claim_chip(Some(view), thegn_core::util::now_ms())
@@ -105,7 +106,7 @@ pub(super) fn content(ctx: &SectionCtx) -> Vec<PanelRow> {
         // only the headline's first line is shown (the log tail is in the row).
         if let Some((reason, tone)) = held_reason(r) {
             left.push(seg(g(), "  "));
-            left.push(seg(hue(tone), reason));
+            left.push(seg(hue(tone), display_cell(&reason)));
         }
         // A landed row under `on_landed = "expire"` is on a clock, so say so:
         // an expiry the reader cannot see is one they cannot act on before it
@@ -203,11 +204,11 @@ fn full_view(ctx: &SectionCtx, rows: &[thegn_core::db::MergeQueueRow]) -> Vec<Pa
                     .unwrap_or_else(unknown_status_glyph),
                 seg(
                     if i == cursor { t() } else { d() },
-                    format!(" {}", r.branch),
+                    format!(" {}", display_cell(&r.branch)),
                 ),
             ];
             if let Some(host) = host_label(&r.location) {
-                l.push(seg(hue(Hue::Blue), format!(" @{host}")));
+                l.push(seg(hue(Hue::Blue), format!(" @{}", display_cell(&host))));
             }
             (l, Some(i))
         })
@@ -228,13 +229,16 @@ fn full_view(ctx: &SectionCtx, rows: &[thegn_core::db::MergeQueueRow]) -> Vec<Pa
             .bold(),
         ],
         vec![
-            seg(d(), r.branch.clone()),
+            seg(d(), display_cell(&r.branch)),
             seg(g2(), " → "),
-            seg(d(), r.target_branch.clone()),
+            seg(d(), display_cell(&r.target_branch)),
         ],
     ];
     if let Some(host) = host_label(&r.location) {
-        detail.push(vec![seg(g2(), "host  "), seg(hue(Hue::Blue), host)]);
+        detail.push(vec![
+            seg(g2(), "host  "),
+            seg(hue(Hue::Blue), display_cell(&host)),
+        ]);
     }
     if let Some((label, tone)) = claim_detail_line(
         claim_for_row(ctx, &r.worktree),
@@ -253,7 +257,7 @@ fn full_view(ctx: &SectionCtx, rows: &[thegn_core::db::MergeQueueRow]) -> Vec<Pa
         detail.push(Vec::new());
         detail.push(vec![seg(hue(Hue::Red), "conflicts".to_string()).bold()]);
         for p in paths.lines() {
-            detail.push(vec![seg(g(), "  "), seg(d(), p.to_string())]);
+            detail.push(vec![seg(g(), "  "), seg(d(), display_cell(p))]);
         }
     }
     if let Some(err) = r.error_detail.as_deref().filter(|s| !s.is_empty()) {
@@ -265,7 +269,7 @@ fn full_view(ctx: &SectionCtx, rows: &[thegn_core::db::MergeQueueRow]) -> Vec<Pa
             if line.is_empty() {
                 detail.push(Vec::new());
             } else {
-                for chunk in wrap_text(line, detail_w) {
+                for chunk in wrap_text(&display_cell(line), detail_w) {
                     detail.push(vec![seg(d(), chunk)]);
                 }
             }

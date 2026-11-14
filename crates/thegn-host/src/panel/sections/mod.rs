@@ -3,6 +3,7 @@
 //! keyed off the panel width: a compact Normal view, a deeper Half view, and
 //! a Full view that owns the whole band (the former overlay layouts).
 
+use thegn_core::pipeline_report::{display_cell, display_clip};
 use thegn_core::theme::Hue;
 
 use crate::chrome::S;
@@ -472,7 +473,7 @@ pub fn summary(section: Section, model: &crate::chrome::FrameModel) -> Vec<Seg> 
         }
         Section::Commits => match data.commits.first() {
             Some(c) => vec![
-                seg(ac(), c.short.clone()),
+                seg(ac(), display_cell(&c.short)),
                 seg(g(), format!(" {}", truncate_summary(&c.subject, 18))),
             ],
             None => vec![seg(g2(), "—")],
@@ -990,11 +991,7 @@ fn pr_state_hue(state: &str, draft: bool) -> Tok {
 
 /// Clip a summary string to `max` chars with an ellipsis.
 fn truncate_summary(s: &str, max: usize) -> String {
-    if s.chars().count() <= max {
-        return s.to_string();
-    }
-    let cut: String = s.chars().take(max.saturating_sub(1)).collect();
-    format!("{}…", cut.trim_end())
+    display_clip(s, max)
 }
 
 fn compact_count(n: u64) -> String {

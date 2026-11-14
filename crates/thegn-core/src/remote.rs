@@ -751,14 +751,42 @@ impl GitLoc {
     /// Resolve a path inside the repo's private gitdir via
     /// `git rev-parse --git-path` — never a literal `.git/…`, which breaks in
     /// linked worktrees where `.git` is a redirect file.
-    fn resolve_git_path(&self, rel: &str) -> Option<String> {
-        let p = self.git_out(&["rev-parse", "--git-path", rel])?;
+    fn resolve_git_path(&self, rel: &str) -> std::io::Result<String> {
+        let p = self
+            .git_text(&["rev-parse", "--git-path", rel])
+            .map_err(|error| {
+                std::io::Error::other(format!("git rev-parse --git-path {rel:?} failed: {error}"))
+            })?;
+        if p.is_empty() {
+            return Err(std::io::Error::other(format!(
+                "git rev-parse --git-path {rel:?} returned no path"
+            )));
+        }
         // rev-parse may answer relative to the worktree; anchor it.
         if p.starts_with('/') {
-            Some(p)
+            Ok(p)
         } else {
-            Some(format!("{}/{p}", self.path()))
+            Ok(format!("{}/{p}", self.path()))
         }
+    }
+
+    fn resolve_git_common_dir(&self) -> std::io::Result<PathBuf> {
+        let common_dir = self
+            .git_text(&["rev-parse", "--git-common-dir"])
+            .map_err(|error| {
+                std::io::Error::other(format!("git rev-parse --git-common-dir failed: {error}"))
+            })?;
+        if common_dir.is_empty() {
+            return Err(std::io::Error::other(
+                "git rev-parse --git-common-dir returned no path",
+            ));
+        }
+        let common_dir = Path::new(&common_dir);
+        Ok(if common_dir.is_absolute() {
+            common_dir.to_path_buf()
+        } else {
+            Path::new(&self.path()).join(common_dir)
+        })
     }
 
     /// Read a file inside the gitdir (e.g. `rebase-merge/git-rebase-todo`,
@@ -781,9 +809,7 @@ impl GitLoc {
         rel: &str,
         limit: usize,
     ) -> std::io::Result<Option<Vec<u8>>> {
-        let p = self
-            .resolve_git_path(rel)
-            .ok_or_else(|| std::io::Error::other(format!("cannot resolve git path {rel:?}")))?;
+        let p = self.resolve_git_path(rel)?;
         match self {
             GitLoc::Local(_) => match std::fs::read(&p) {
                 Ok(bytes) => Ok(Some(bytes)),
@@ -813,9 +839,7 @@ impl GitLoc {
 
     /// Write a file inside the gitdir (e.g. a prepared rebase todo).
     pub fn write_git_path(&self, rel: &str, bytes: &[u8]) -> std::io::Result<()> {
-        let p = self
-            .resolve_git_path(rel)
-            .ok_or_else(|| std::io::Error::other(format!("cannot resolve git path {rel:?}")))?;
+        let p = self.resolve_git_path(rel)?;
         if let GitLoc::Local(_) = self {
             let path = Path::new(&p);
             match std::fs::symlink_metadata(path) {
@@ -886,9 +910,7 @@ impl GitLoc {
     /// Create a private gitdir file only when no entry already exists.
     /// Unlike `write_git_path`, this never replaces an existing file.
     pub fn write_git_path_new(&self, rel: &str, bytes: &[u8]) -> std::io::Result<()> {
-        let p = self
-            .resolve_git_path(rel)
-            .ok_or_else(|| std::io::Error::other(format!("cannot resolve git path {rel:?}")))?;
+        let p = self.resolve_git_path(rel)?;
         if let GitLoc::Local(_) = self {
             return crate::fsperm::write_owner_only_new(Path::new(&p), bytes);
         }
@@ -955,9 +977,7 @@ impl GitLoc {
         bytes: &[u8],
         wait: Duration,
     ) -> std::io::Result<()> {
-        let p = self
-            .resolve_git_path(rel)
-            .ok_or_else(|| std::io::Error::other(format!("cannot resolve git path {rel:?}")))?;
+        let p = self.resolve_git_path(rel)?;
         if let GitLoc::Local(_) = self {
             let _lock = crate::util::try_lock_git_mutations_within(Path::new(&self.path()), wait)
                 .map_err(|error| {
@@ -1004,17 +1024,7 @@ impl GitLoc {
         }
 
         let expected_len = expected.len();
-        let common_dir = self
-            .git_out(&["rev-parse", "--git-common-dir"])
-            .ok_or_else(|| {
-                std::io::Error::other("cannot resolve git common dir for mutation lock")
-            })?;
-        let common_dir = Path::new(&common_dir);
-        let common_dir = if common_dir.is_absolute() {
-            common_dir.to_path_buf()
-        } else {
-            Path::new(&self.path()).join(common_dir)
-        };
+        let common_dir = self.resolve_git_common_dir()?;
         let lock_path = common_dir
             .join("thegn-git.lock")
             .to_string_lossy()
@@ -1148,15 +1158,6 @@ impl GitLoc {
             }),
             _ => self.git_out(ARGS),
         }
-    }
-
-    /// Run a git command for its exit status (output discarded).
-    pub fn git_ok(&self, args: &[&str]) -> bool {
-        crate::util::note_core_git_spawn();
-        self.git_command(args)
-            .output()
-            .map(|o| o.status.success())
-            .unwrap_or(false)
     }
 }
 
@@ -2373,5 +2374,25 @@ mod tests {
             missing.git_text(&["remote"]),
             Err(crate::git_run::GitTextError::Failed(_))
         ));
+    }
+
+    #[test]
+    fn git_path_resolution_reports_a_git_failure() {
+        let dir = tempfile::tempdir().unwrap();
+        let loc = GitLoc::Local(dir.path().to_path_buf());
+        let error = loc
+            .resolve_git_path("rebase-merge/git-rebase-todo")
+            .unwrap_err();
+        assert!(error.to_string().contains("git rev-parse --git-path"));
+        assert!(error.to_string().contains("Git"));
+    }
+
+    #[test]
+    fn git_common_dir_resolution_reports_a_git_failure() {
+        let dir = tempfile::tempdir().unwrap();
+        let loc = GitLoc::Local(dir.path().to_path_buf());
+        let error = loc.resolve_git_common_dir().unwrap_err();
+        assert!(error.to_string().contains("git rev-parse --git-common-dir"));
+        assert!(error.to_string().contains("Git"));
     }
 }

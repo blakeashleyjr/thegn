@@ -702,8 +702,8 @@ pub fn required_scope(verb: Verb) -> Scope {
         | Verb::DoctorBundle
         | Verb::Shutdown
         // Secret custody is an operator/admin concern — never reachable from a
-        // tool-calling agent (the catalog rows are OPERATOR-surface, and Admin
-        // scope keeps them off any lower-scoped door).
+        // tool-calling agent (Admin scope keeps them off any lower-scoped
+        // door).
         | Verb::SecretSet
         | Verb::SecretRm
         | Verb::SecretList
@@ -712,7 +712,7 @@ pub fn required_scope(verb: Verb) -> Scope {
         | Verb::SecretSshRotate
         | Verb::MigrateSession
         // Starting/stopping a spend-capable daemon is an admin action; the
-        // OPERATOR surfaces + Admin scope keep it off any tool-calling door.
+        // Admin scope keeps it off any tool-calling door.
         | Verb::ModelProxyStart
         | Verb::ModelProxyStop => Scope::Admin,
     }

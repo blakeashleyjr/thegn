@@ -7,6 +7,7 @@
 //! dispatched by the loop's section-key arm to `handlers::pr_queue::section_key`,
 //! so the hint row below can never drift from the dispatch.
 
+use thegn_core::pipeline_report::display_cell;
 use thegn_core::pr_queue::PrqStatus;
 use thegn_core::theme::Hue;
 
@@ -49,7 +50,7 @@ pub(super) fn content(ctx: &SectionCtx) -> Vec<PanelRow> {
         let mut left = vec![
             status_glyph(&r.status),
             seg(d(), format!(" #{} ", r.number)),
-            seg(g2(), r.branch.clone()),
+            seg(g2(), display_cell(&r.branch)),
         ];
         // A PR with no local checkout can be watched but never agent-fixed, so
         // say so on the row rather than leaving the reader to wonder why nothing
@@ -61,13 +62,15 @@ pub(super) fn content(ctx: &SectionCtx) -> Vec<PanelRow> {
             let head = detail.lines().next().unwrap_or(detail);
             left.push(seg(g(), "  "));
             left.push(match r.status.as_str() {
-                "needs_human" | "blocked_ci" | "blocked_conflict" => seg(hue(Hue::Red), head),
-                "blocked_review" | "agent_running" => seg(hue(Hue::Amber), head),
-                _ => seg(g(), head),
+                "needs_human" | "blocked_ci" | "blocked_conflict" => {
+                    seg(hue(Hue::Red), display_cell(head))
+                }
+                "blocked_review" | "agent_running" => seg(hue(Hue::Amber), display_cell(head)),
+                _ => seg(g(), display_cell(head)),
             });
         }
         out.push(
-            PanelRow::plain(Line::split(left, vec![seg(g2(), r.status.clone())]))
+            PanelRow::plain(Line::split(left, vec![seg(g2(), display_cell(&r.status))]))
                 .with_hit(PanelHit::Row(Section::PrQueue, display_index)),
         );
         display_index += 1;
@@ -100,12 +103,16 @@ pub(super) fn content(ctx: &SectionCtx) -> Vec<PanelRow> {
                 seg(g(), "   "),
                 seg(hue(task_hue), crate::caps::active_glyphs().diamond_hollow),
                 seg(d(), format!(" #{} / {} ", task.pr_number, task.thread_id)),
-                seg(g2(), location),
-                seg(g(), format!("  role {role}")),
+                seg(g2(), display_cell(&location)),
+                seg(g(), format!("  role {}", display_cell(role))),
             ];
             let right = vec![seg(
                 g2(),
-                format!("{} · rev {}", task.status.as_str(), task.source_revision),
+                format!(
+                    "{} · rev {}",
+                    display_cell(task.status.as_str()),
+                    task.source_revision
+                ),
             )];
             out.push(
                 PanelRow::plain(Line::split(left, right))
