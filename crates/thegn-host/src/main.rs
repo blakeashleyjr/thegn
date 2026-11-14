@@ -300,6 +300,8 @@ mod stage_worker_hold;
 mod startup_heal;
 mod worktree_discovery;
 // THE-603 is an unwired capture primitive; THE-592 owns future startup admission.
+#[cfg(test)]
+mod flood_sched_tests;
 #[allow(dead_code)]
 mod state_host_capture;
 mod statusbar_badges;
