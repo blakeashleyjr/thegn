@@ -149,7 +149,7 @@ impl Mcp0Client {
     /// `notifications/initialized` acknowledgement. A stateless server (machine0)
     /// may 4xx or omit the session — we swallow that and proceed; the point is to
     /// never *block* a tool call on the handshake.
-    async fn ensure_initialized(&self) {
+    async fn ensure_initialized(&self, priority: bool) {
         let mut done = self.initialized.lock().await;
         if *done {
             return;
@@ -157,7 +157,14 @@ impl Mcp0Client {
         let Ok(authority) = crate::provider::authority_key(&self.endpoint) else {
             return;
         };
-        let Ok(_permit) = crate::provider::CONTROL_GATE.acquire(&authority).await else {
+        let init_permit = if priority {
+            crate::provider::CONTROL_GATE
+                .acquire_priority(&authority)
+                .await
+        } else {
+            crate::provider::CONTROL_GATE.acquire(&authority).await
+        };
+        let Ok(_permit) = init_permit else {
             return;
         };
         *done = true; // attempt at most once regardless of outcome
@@ -219,7 +226,20 @@ impl Mcp0Client {
     /// status after the retry budget. Each attempt shares the provider control
     /// gate with the other provider control-plane requests.
     pub async fn call_tool(&self, name: &str, arguments: Value) -> Result<Value> {
-        self.ensure_initialized().await;
+        self.call_tool_with_priority(name, arguments, false).await
+    }
+
+    pub(crate) async fn call_tool_priority(&self, name: &str, arguments: Value) -> Result<Value> {
+        self.call_tool_with_priority(name, arguments, true).await
+    }
+
+    async fn call_tool_with_priority(
+        &self,
+        name: &str,
+        arguments: Value,
+        priority: bool,
+    ) -> Result<Value> {
+        self.ensure_initialized(priority).await;
         let session = self.session.lock().await.clone();
         let authority = crate::provider::authority_key(&self.endpoint)
             .with_context(|| format!("machine0 mcp {name}: endpoint"))?;
@@ -230,10 +250,14 @@ impl Mcp0Client {
         let retry_ok = is_idempotent_tool(name);
         let mut last = String::new();
         for attempt in 0..ATTEMPTS {
-            let permit = crate::provider::CONTROL_GATE
-                .acquire(&authority)
-                .await
-                .with_context(|| format!("machine0 mcp {name}"))?;
+            let permit = if priority {
+                crate::provider::CONTROL_GATE
+                    .acquire_priority(&authority)
+                    .await
+            } else {
+                crate::provider::CONTROL_GATE.acquire(&authority).await
+            }
+            .with_context(|| format!("machine0 mcp {name}"))?;
             let body = tools_call_body(self.id(), name, arguments.clone());
             let mut req = self
                 .http

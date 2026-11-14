@@ -166,6 +166,19 @@ impl NotificationStore for Db {
         Ok(n > 0)
     }
 
+    fn update_notification_message_by_source(
+        &self,
+        kind: &str,
+        source_ref: &str,
+        message: &str,
+        worktree_path: &str,
+    ) -> Result<usize> {
+        Ok(self.conn().execute(
+            "UPDATE notifications SET message=?3, read=0 WHERE kind=?1 AND issue_id=?2 AND worktree_path=?4 AND message<>?3",
+            params![kind, source_ref, message, worktree_path],
+        )?)
+    }
+
     fn put_notification_once_id(
         &self,
         kind: &str,

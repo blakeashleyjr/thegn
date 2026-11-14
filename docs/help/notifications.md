@@ -10,6 +10,12 @@ parent: configuration
 The `[notifications]` section controls the in-app notification inbox, badges,
 and optional desktop notifications.
 
+CI failures without a queued PR are grouped by worktree and run into one
+`ci_run_failed` inbox notification listing the failed jobs. A newer run
+supersedes the older run's unread notification; set
+`[notifications.priority].ci_run_failed = "alert"` if these failures should
+also raise the alert badge.
+
 A `Needs you` process failure clears when you acknowledge it with `x`, when the
 same program later exits cleanly in that worktree, when the worktree is removed,
 or automatically after seven days. Acknowledging the inbox row does not stop a

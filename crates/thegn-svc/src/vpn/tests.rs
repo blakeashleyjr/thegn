@@ -319,6 +319,10 @@ fn sidecar_record_round_trips_owner_only() {
 
     let recorded = record_sidecar(&runtime, "c-tgvpn").unwrap();
     assert_eq!(recorded_sidecar("c-tgvpn").unwrap(), recorded);
+    let parsed = read_sidecar_record("c-tgvpn").unwrap();
+    assert!(parsed.worktree.is_some());
+    assert_eq!(parsed.generation, Some(1));
+    assert_eq!(parsed.placement.as_deref(), Some("local"));
     let path = std::env::var("XDG_STATE_HOME").unwrap();
     let path = std::path::PathBuf::from(path).join("thegn/vpn-runtime");
     assert_eq!(thegn_core::fsperm::mode_bits(&path).unwrap(), Some(0o700));
@@ -326,6 +330,75 @@ fn sidecar_record_round_trips_owner_only() {
         thegn_core::fsperm::mode_bits(&path.join("c-tgvpn.json")).unwrap(),
         Some(0o600)
     );
+}
+
+#[test]
+fn old_format_sidecar_record_still_parses() {
+    let _state = thegn_core::testenv::IsolatedState::new();
+    let dir = sidecar_record_dir().unwrap();
+    dir.write_owner_only_atomic(
+        &sidecar_record_name("c-tgvpn"),
+        br#"{"version":1,"container":"c-tgvpn","prefix":["podman"],"id":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}"#,
+    )
+    .unwrap();
+
+    let recorded = recorded_sidecar("c-tgvpn").expect("old record remains usable");
+    assert_eq!(recorded.runtime, OciRuntime::podman());
+    assert_eq!(recorded.id, "a".repeat(64));
+}
+
+#[cfg(unix)]
+#[test]
+fn sidecar_record_mismatched_worktree_refuses_before_runtime_use() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let _state = thegn_core::testenv::IsolatedState::new();
+    let dir = tempfile::Builder::new()
+        .permissions(std::fs::Permissions::from_mode(0o700))
+        .tempdir()
+        .unwrap();
+    let script = dir.path().join("fake.sh");
+    std::fs::write(
+        &script,
+        "if [ \"$1\" = inspect ]; then printf '%s\\n' 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa'; fi\n",
+    )
+    .unwrap();
+    let runtime = OciRuntime::new(vec!["sh".into(), script.display().to_string()]);
+    record_sidecar(&runtime, "c-tgvpn").unwrap();
+
+    let other_worktree = tempfile::Builder::new()
+        .permissions(std::fs::Permissions::from_mode(0o700))
+        .tempdir()
+        .unwrap();
+    let error = recorded_sidecar_for_worktree("c-tgvpn", other_worktree.path(), None)
+        .expect_err("different worktree must be refused");
+    assert!(error.downcast_ref::<SidecarWorktreeMismatch>().is_some());
+    assert!(error.to_string().contains("sidecar belongs to"));
+}
+
+#[cfg(unix)]
+#[test]
+fn sidecar_record_stale_generation_refuses() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let _state = thegn_core::testenv::IsolatedState::new();
+    let dir = tempfile::Builder::new()
+        .permissions(std::fs::Permissions::from_mode(0o700))
+        .tempdir()
+        .unwrap();
+    let script = dir.path().join("fake.sh");
+    std::fs::write(
+        &script,
+        "if [ \"$1\" = inspect ]; then printf '%s\\n' 'bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb'; fi\n",
+    )
+    .unwrap();
+    let runtime = OciRuntime::new(vec!["sh".into(), script.display().to_string()]);
+    record_sidecar(&runtime, "c-tgvpn").unwrap();
+    let worktree = std::env::current_dir().unwrap();
+    let error = recorded_sidecar_for_worktree("c-tgvpn", &worktree, Some(2))
+        .expect_err("lower generation must be refused");
+    assert!(error.downcast_ref::<SidecarGenerationStale>().is_some());
+    assert!(recorded_sidecar_for_worktree("c-tgvpn", &worktree, Some(1)).is_ok());
 }
 
 #[cfg(unix)]
