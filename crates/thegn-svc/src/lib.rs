@@ -10,6 +10,7 @@ pub mod bg_runtime;
 pub mod bridge;
 pub mod calendar;
 pub mod ci;
+pub mod ci_credential_report;
 pub mod conformance;
 pub mod control;
 pub mod fly;
