@@ -7,6 +7,26 @@ All notable changes to **thegn** are documented here. The format follows
 
 ## [Unreleased]
 
+### Added
+
+- `thegn doctor` prints host-cache `scope` and `require_sigs` lines beside the signer;
+  JSON adds `scope`, `require_sigs`, and `require_sigs_explicit`.
+
+### Changed
+
+- Container, model-proxy and `worktrees.create` (MCP) capabilities are advertised only on the surfaces that actually serve them.
+- Plugin manifests use a canonical bounded grammar for plugin, contribution,
+  surface and capability IDs, and invalid IDs are refused with bounded diagnostics.
+
+### Fixed
+
+- Provider executable installs take a per-destination lease, preventing concurrent
+  overwrites; failed verification restores the previous verified executable.
+- Truncated UI labels keep whole characters and terminal control characters render inert.
+- Git failures in integrate, autopilot, session resume and worktree commands identify
+  the failed Git operation instead of being treated as missing data.
+- Font configuration refuses updates through a user-owned symlinked parent directory.
+
 ## [0.1.0-alpha.77] — 2026-11-14
 
 ### Changed
