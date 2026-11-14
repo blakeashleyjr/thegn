@@ -876,11 +876,12 @@ mod tests {
             SinkMode::FailAfter { writes: 3 },
         ];
         let factor_cases = LoadFactors::audit_cases();
+        let cases = factor_cases.as_slice();
         let observations = ProducerKind::ALL
             .into_iter()
             .flat_map(|kind| {
-                modes.into_iter().flat_map(|mode| {
-                    factor_cases
+                modes.into_iter().flat_map(move |mode| {
+                    cases
                         .iter()
                         .copied()
                         .map(move |factors| run_case(kind, seed, mode, total_bytes, factors))
