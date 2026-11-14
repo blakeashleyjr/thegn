@@ -799,7 +799,15 @@ fn preview_renderers_report() {
             report["bwrap"].as_str().unwrap_or("(unresolved)")
         );
     } else {
-        outln!("  containment   unavailable: no usable bwrap; ready PDF previews run uncontained");
+        if std::env::consts::OS == "linux" {
+            outln!(
+                "  containment   unavailable: no usable bwrap; PDF and Mermaid previews are refused (source or note shown)"
+            );
+        } else {
+            outln!(
+                "  containment   unavailable: no usable bwrap; PDF previews run uncontained (marked)"
+            );
+        }
     }
     for row in report["renderers"].as_array().into_iter().flatten() {
         let program = row["program"].as_str().unwrap_or("unknown");
