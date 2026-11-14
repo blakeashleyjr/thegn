@@ -1113,7 +1113,9 @@ mod tests {
                     },
                 );
                 assert!(
-                    alias.iter().any(|arg| arg == &format!("HostKeyAlias={id}")),
+                    alias.iter().any(|arg| {
+                        arg == &format!("{}={id}", thegn_core::hostkey::HOST_KEY_LITERALS[2])
+                    }),
                     "host-key alias argv lost provider id {id:?}: {alias:?}"
                 );
             }
