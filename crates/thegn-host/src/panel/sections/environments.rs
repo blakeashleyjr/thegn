@@ -185,8 +185,8 @@ pub(super) fn content(ctx: &SectionCtx) -> Vec<PanelRow> {
     for (i, e) in envs.iter().enumerate() {
         let mut left = vec![
             glyph(e),
-            seg(d(), format!(" {}", e.name)),
-            seg(g(), format!("  {}", e.kind)),
+            seg(d(), format!(" {}", display_cell(&e.name))),
+            seg(g(), format!("  {}", display_cell(&e.kind))),
         ];
         if e.bound {
             left.push(seg(
@@ -195,10 +195,10 @@ pub(super) fn content(ctx: &SectionCtx) -> Vec<PanelRow> {
             ));
         }
         if !e.region.is_empty() {
-            left.push(seg(g(), format!("  {}", e.region)));
+            left.push(seg(g(), format!("  {}", display_cell(&e.region))));
         }
         if !e.size.is_empty() {
-            left.push(seg(g(), format!(" {}", e.size)));
+            left.push(seg(g(), format!(" {}", display_cell(&e.size))));
         }
         let right = match e.token {
             Some(true) => seg(g(), "token ✓".to_string()),

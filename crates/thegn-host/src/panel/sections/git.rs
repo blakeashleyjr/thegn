@@ -2,6 +2,7 @@
 //! velocity strip (Half), and a two-column PR page (Full).
 
 use crate::seg::{Line, Seg, seg, sp};
+use thegn_core::pipeline_report::display_cell;
 use thegn_core::theme::Hue;
 use thegn_core::viz;
 
@@ -48,7 +49,7 @@ fn header_and_checks(ctx: &SectionCtx) -> Vec<PanelRow> {
                 vec![
                     seg(d(), "PR "),
                     seg(ac(), format!("#{}", pr.number)).bold(),
-                    seg(d(), format!(" {}", pr.title)),
+                    seg(d(), format!(" {}", display_cell(&pr.title))),
                 ],
                 vec![Seg::chip(
                     pr_state_hue(&pr.state, pr.is_draft),
@@ -58,7 +59,11 @@ fn header_and_checks(ctx: &SectionCtx) -> Vec<PanelRow> {
             if !data.pr_base.is_empty() {
                 rows.push(PanelRow::plain(Line::segs(vec![seg(
                     g(),
-                    format!("{} → {}", data.branch, data.pr_base),
+                    format!(
+                        "{} → {}",
+                        display_cell(&data.branch),
+                        display_cell(&data.pr_base)
+                    ),
                 )])));
             }
             rows.push(PanelRow::blank());
@@ -81,8 +86,11 @@ fn header_and_checks(ctx: &SectionCtx) -> Vec<PanelRow> {
                     super::bar_segs(frac, 8, hue(Hue::Green)),
                 )));
                 if !passing.is_empty() {
-                    let names: Vec<&str> =
-                        passing.iter().take(4).map(|c| c.name.as_str()).collect();
+                    let names: Vec<String> = passing
+                        .iter()
+                        .take(4)
+                        .map(|c| display_cell(&c.name))
+                        .collect();
                     let dur = passing.iter().filter_map(|c| c.duration_secs).max();
                     rows.push(PanelRow::plain(Line::split(
                         vec![seg(hue(Hue::Green), "✓ "), seg(f(), names.join(" · "))],
@@ -94,7 +102,7 @@ fn header_and_checks(ctx: &SectionCtx) -> Vec<PanelRow> {
                     match c.state {
                         super::super::CheckState::Fail => {
                             rows.push(PanelRow::plain(Line::split(
-                                vec![seg(hue(Hue::Red), "✗ "), seg(d(), c.name.clone())],
+                                vec![seg(hue(Hue::Red), "✗ "), seg(d(), display_cell(&c.name))],
                                 c.duration_secs
                                     .map(|s| vec![seg(g(), super::fmt_secs(s))])
                                     .unwrap_or_default(),
@@ -104,7 +112,7 @@ fn header_and_checks(ctx: &SectionCtx) -> Vec<PanelRow> {
                             rows.push(PanelRow::plain(Line::split(
                                 vec![
                                     seg(hue(Hue::Amber), "⠼ "),
-                                    seg(f(), c.name.clone()),
+                                    seg(f(), display_cell(&c.name)),
                                     seg(g(), " · running"),
                                 ],
                                 c.duration_secs
@@ -165,12 +173,12 @@ fn log_issues_velocity(ctx: &SectionCtx) -> Vec<PanelRow> {
             rows.push(PanelRow::plain(Line::split(
                 vec![
                     seg(g2(), format!("#{} ", is.number)),
-                    seg(f(), is.title.clone()),
+                    seg(f(), display_cell(&is.title)),
                 ],
                 if label.is_empty() {
                     Vec::new()
                 } else {
-                    vec![seg(g(), label)]
+                    vec![seg(g(), display_cell(&label))]
                 },
             )));
         }
@@ -191,7 +199,7 @@ fn log_issues_velocity(ctx: &SectionCtx) -> Vec<PanelRow> {
                     vec![seg(g2(), "VELOCITY").bold()],
                     vec![seg(
                         hue(Hue::Amber),
-                        format!("history unavailable: {reason}"),
+                        format!("history unavailable: {}", display_cell(reason)),
                     )],
                 )));
             }
@@ -297,9 +305,9 @@ fn threads_and_open_prs(ctx: &SectionCtx) -> Vec<PanelRow> {
                 rows.push(
                     PanelRow::plain(Line::segs(vec![
                         mark,
-                        seg(hue(Hue::Purple), th.author.clone()),
-                        seg(g(), format!(" · {at} · ")),
-                        seg(d(), format!("“{}”", th.snippet)),
+                        seg(hue(Hue::Purple), display_cell(&th.author)),
+                        seg(g(), format!(" · {} · ", display_cell(&at))),
+                        seg(d(), format!("“{}”", display_cell(&th.snippet))),
                     ]))
                     .with_hit(PanelHit::Row(Section::Pr, i)),
                 );
@@ -360,7 +368,7 @@ fn threads_and_open_prs(ctx: &SectionCtx) -> Vec<PanelRow> {
                 if linked {
                     l.push(seg(g2(), "◈ "));
                 }
-                l.push(seg(f(), p.head_ref.clone()));
+                l.push(seg(f(), display_cell(&p.head_ref)));
                 let state_chip = if p.is_draft {
                     Seg::chip(g(), " draft ")
                 } else {
@@ -387,16 +395,19 @@ fn threads_and_open_prs(ctx: &SectionCtx) -> Vec<PanelRow> {
 
 fn log_row(row: &thegn_svc::git::LogRow) -> PanelRow {
     if row.sha.is_empty() {
-        return PanelRow::plain(Line::segs(vec![seg(g(), row.graph.clone())]));
+        return PanelRow::plain(Line::segs(vec![seg(g(), display_cell(&row.graph))]));
     }
     let graph_tok = if row.is_head() { ac() } else { g() };
     PanelRow::plain(Line::split(
         vec![
-            seg(graph_tok, row.graph.clone()),
+            seg(graph_tok, display_cell(&row.graph)),
             sp(1),
-            seg(f(), row.sha.clone()),
+            seg(f(), display_cell(&row.sha)),
             sp(1),
-            seg(if row.is_head() { d() } else { f() }, row.subject.clone()),
+            seg(
+                if row.is_head() { d() } else { f() },
+                display_cell(&row.subject),
+            ),
         ],
         if row.is_head() {
             vec![Seg::chip(ac(), " HEAD ")]
