@@ -275,14 +275,43 @@ impl FlyProvider {
             .await
     }
 
+    async fn get_json_priority(&self, url: &str) -> Result<serde_json::Value> {
+        self.get_json_timeout_priority(url, crate::provider::CONTROL_TIMEOUT)
+            .await
+    }
+
     async fn get_json_timeout(
         &self,
         url: &str,
         timeout: std::time::Duration,
     ) -> Result<serde_json::Value> {
-        let _permit = crate::provider::CONTROL_GATE
-            .acquire(&crate::provider::authority_key(url)?)
-            .await?;
+        self.get_json_timeout_with_priority(url, timeout, false)
+            .await
+    }
+
+    async fn get_json_timeout_priority(
+        &self,
+        url: &str,
+        timeout: std::time::Duration,
+    ) -> Result<serde_json::Value> {
+        self.get_json_timeout_with_priority(url, timeout, true)
+            .await
+    }
+
+    async fn get_json_timeout_with_priority(
+        &self,
+        url: &str,
+        timeout: std::time::Duration,
+        priority: bool,
+    ) -> Result<serde_json::Value> {
+        let authority = crate::provider::authority_key(url)?;
+        let _permit = if priority {
+            crate::provider::CONTROL_GATE
+                .acquire_priority(&authority)
+                .await?
+        } else {
+            crate::provider::CONTROL_GATE.acquire(&authority).await?
+        };
         let resp = self
             .client
             .get(url)
@@ -586,7 +615,7 @@ impl FlyProvider {
         let custody = thegn_core::managed_ssh::read("fly", &account, name)
             .context("fly: read persisted managed ownership before age reconciliation")?;
         self.reaper_time_with_custody(name, machine_id, custody, || async {
-            self.get_json(&machines::machines_url(
+            self.get_json_priority(&machines::machines_url(
                 &self.spec.api_base()?,
                 &app_name(name),
             ))
@@ -644,7 +673,7 @@ impl FlyProvider {
         for attempt in 0..ATTEMPTS {
             let status = {
                 let _permit = crate::provider::CONTROL_GATE
-                    .acquire(&crate::provider::authority_key(&url)?)
+                    .acquire_priority(&crate::provider::authority_key(&url)?)
                     .await?;
                 self.client
                     .delete(&url)

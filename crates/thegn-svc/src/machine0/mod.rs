@@ -326,6 +326,15 @@ impl Machine0Provider {
         Ok(v)
     }
 
+    async fn call_priority(&self, name: &str, args: Value) -> Result<Value> {
+        let v = self.mcp.call_tool_priority(name, args).await?;
+        if let Some(err) = v.get("error").and_then(Value::as_str) {
+            let msg = v.get("message").and_then(Value::as_str).unwrap_or(err);
+            return Err(mcp::DefiniteRefusal::new(format!("machine0 {name}: {err}: {msg}")).into());
+        }
+        Ok(v)
+    }
+
     /// Look up a VM by name; `Ok(None)` when it does not exist (idempotent
     /// destroy / existence checks). A genuine transport/API failure propagates.
     async fn vm_by_name(&self, name: &str) -> Result<Option<Machine0Vm>> {
@@ -343,7 +352,7 @@ impl Machine0Provider {
     /// unrecognized or ambiguous response must never be treated as absence.
     async fn vm_by_name_for_destroy(&self, name: &str) -> Result<Option<Machine0Vm>> {
         match self
-            .call(tool::VM_GET_BY_NAME, json!({ "name": name }))
+            .call_priority(tool::VM_GET_BY_NAME, json!({ "name": name }))
             .await
         {
             Ok(v) => vm_for_destroy_response(&v, name),
@@ -1223,7 +1232,10 @@ impl RemoteProvider for Machine0Provider {
                 return Ok(()); // already gone
             };
             *self.endpoint.lock().unwrap() = None;
-            match self.call(tool::VM_DESTROY, json!({ "id": vm.id })).await {
+            match self
+                .call_priority(tool::VM_DESTROY, json!({ "id": vm.id }))
+                .await
+            {
                 Ok(_) => {
                     self.retire_local_state(id).await?;
                     thegn_core::managed_ssh::record_revoked("machine0", &custody_account, id)
