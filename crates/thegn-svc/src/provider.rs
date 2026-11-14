@@ -2659,6 +2659,14 @@ const EXEC_CWD_TTY_SCRIPT: &str = "cd -- \"$1\" 2>/dev/null; shift; exec \"$@\""
 const EXEC_WS_MAX_MESSAGE_SIZE: usize = 16 << 20;
 const EXEC_WS_MAX_FRAME_SIZE: usize = 4 << 20;
 const EXEC_WS_MAX_WRITE_BUFFER_SIZE: usize = 8 << 20;
+/// Maximum provider output retained by one session while its consumer is slow.
+const EXEC_DATA_BYTE_BUDGET: usize = 8 << 20;
+/// Item capacity of the provider output channels.
+const EXEC_CHANNEL_CAPACITY: usize = 256;
+/// Largest provider output item queued at once; with EXEC_CHANNEL_CAPACITY
+/// items this bounds retained output to EXEC_DATA_BYTE_BUDGET.
+const EXEC_DATA_CHUNK: usize = 32 << 10;
+const _: () = assert!(EXEC_DATA_CHUNK * EXEC_CHANNEL_CAPACITY <= EXEC_DATA_BYTE_BUDGET);
 const PROXY_CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
 
 #[derive(Debug)]
@@ -2723,6 +2731,25 @@ fn exec_ws_config() -> tokio_tungstenite::tungstenite::protocol::WebSocketConfig
         .max_message_size(Some(EXEC_WS_MAX_MESSAGE_SIZE))
         .max_frame_size(Some(EXEC_WS_MAX_FRAME_SIZE))
         .max_write_buffer_size(EXEC_WS_MAX_WRITE_BUFFER_SIZE)
+}
+
+/// Forward one provider payload as items of at most `EXEC_DATA_CHUNK` bytes.
+/// `send().await` is the backpressure: a slow consumer stalls the reader
+/// instead of ending the session. Returns `false` once the receiver is gone.
+async fn send_chunked<T>(
+    sender: &tokio::sync::mpsc::Sender<T>,
+    bytes: Vec<u8>,
+    wrap: impl Fn(Vec<u8>) -> T,
+) -> bool {
+    if bytes.len() <= EXEC_DATA_CHUNK {
+        return sender.send(wrap(bytes)).await.is_ok();
+    }
+    for chunk in bytes.chunks(EXEC_DATA_CHUNK) {
+        if sender.send(wrap(chunk.to_vec())).await.is_err() {
+            return false;
+        }
+    }
+    true
 }
 
 fn next_connect_wait(
@@ -2801,6 +2828,12 @@ fn encode_stream_stdin(data: &[u8]) -> Vec<u8> {
     v.push(0u8);
     v.extend_from_slice(data);
     v
+}
+
+/// The non-PTY stdin EOF frame. It is sent once on local control close, before
+/// the WebSocket close handshake; half-close is not implemented.
+fn encode_stream_stdin_eof() -> Vec<u8> {
+    vec![4u8]
 }
 
 /// A decoded non-PTY server→client binary frame.
@@ -2997,7 +3030,7 @@ impl SpritesProvider {
             }
         };
 
-        let (frames_tx, frames_rx) = tokio::sync::mpsc::channel::<ExecFrame>(256);
+        let (frames_tx, frames_rx) = tokio::sync::mpsc::channel::<ExecFrame>(EXEC_CHANNEL_CAPACITY);
         let (control_tx, control_rx) = tokio::sync::mpsc::channel::<ExecControl>(256);
         let (sid_tx, sid_rx) = tokio::sync::watch::channel::<Option<String>>(None);
 
@@ -3026,7 +3059,8 @@ impl SpritesProvider {
         let ws = connect_proxy_ws(req, proxy_init_json(host, port), PROXY_CONNECT_TIMEOUT).await?;
 
         let (to_srv_tx, to_srv_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(256);
-        let (from_srv_tx, from_srv_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(256);
+        let (from_srv_tx, from_srv_rx) =
+            tokio::sync::mpsc::channel::<Vec<u8>>(EXEC_CHANNEL_CAPACITY);
         let (end_tx, end_rx) = tokio::sync::oneshot::channel();
         tokio::spawn(drive_proxy(ws, to_srv_rx, from_srv_tx, end_tx));
         Ok(ProxyStream {
@@ -3097,7 +3131,7 @@ async fn drive_proxy<S>(
             },
             msg = read.next() => match msg {
                 Some(Ok(Message::Binary(b))) => {
-                    if from_srv.send(b.into()).await.is_err() {
+                    if !send_chunked(&from_srv, b.into(), std::convert::identity).await {
                         break ProxyEnd::LocalClosed;
                     }
                 }
@@ -3165,20 +3199,29 @@ async fn drive_exec<S>(
                     let _ = write.send(Message::Text(resize_json(cols, rows).into())).await; // best-effort: consumer may be gone
                 }
                 Some(ExecControl::Close) | None => {
-                    let _ = write.send(Message::Close(None)).await; // best-effort: peer may be gone
+                    if !tty
+                        && let Err(error) = write
+                            .send(Message::Binary(encode_stream_stdin_eof().into()))
+                            .await
+                    {
+                        tracing::debug!(target: "thegn::provider", ?error, "provider exec stdin EOF could not be sent");
+                    }
+                    if let Err(error) = write.send(Message::Close(None)).await {
+                        tracing::debug!(target: "thegn::provider", ?error, "provider exec close could not be sent");
+                    }
                     break;
                 }
             },
             msg = read.next() => match msg {
                 Some(Ok(Message::Binary(b))) => {
                     if tty {
-                        if frames_tx.send(ExecFrame::Stdout(b.into())).await.is_err() {
+                        if !send_chunked(&frames_tx, b.into(), ExecFrame::Stdout).await {
                             break;
                         }
                     } else {
                         match decode_stream_frame(&b) {
                             StreamMsg::Stdout(d) => {
-                                if frames_tx.send(ExecFrame::Stdout(d)).await.is_err() {
+                                if !send_chunked(&frames_tx, d, ExecFrame::Stdout).await {
                                     break;
                                 }
                             }
@@ -5168,6 +5211,7 @@ mod tests {
     fn non_pty_stream_framing_roundtrips() {
         // stdin is prefixed with the stdin stream id (0).
         assert_eq!(encode_stream_stdin(b"hi"), vec![0, b'h', b'i']);
+        assert_eq!(encode_stream_stdin_eof(), vec![4]);
         // server frames split on the 1-byte stream id.
         assert_eq!(
             decode_stream_frame(&[1, b'o', b'k']),
@@ -5217,6 +5261,68 @@ mod tests {
             SpriteCtrl::Ignore
         );
         assert_eq!(parse_sprite_ctrl("not json"), SpriteCtrl::Ignore);
+    }
+
+    #[tokio::test]
+    async fn provider_output_is_chunked_to_the_item_bound() {
+        let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+        assert!(send_chunked(&tx, vec![7u8; 2 * EXEC_DATA_CHUNK + 1], ExecFrame::Stdout).await);
+        for want in [EXEC_DATA_CHUNK, EXEC_DATA_CHUNK, 1] {
+            match rx.recv().await {
+                Some(ExecFrame::Stdout(b)) => assert_eq!(b.len(), want),
+                other => panic!("unexpected frame {other:?}"),
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn provider_slow_consumer_backpressures_instead_of_ending() {
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<Vec<u8>>(1);
+        let task = tokio::spawn(async move {
+            send_chunked(&tx, vec![1u8; 3 * EXEC_DATA_CHUNK], std::convert::identity).await
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        assert!(!task.is_finished());
+        for _ in 0..3 {
+            assert_eq!(rx.recv().await.map(|b| b.len()), Some(EXEC_DATA_CHUNK));
+        }
+        assert!(task.await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn provider_output_reports_a_gone_receiver() {
+        let (tx, rx) = tokio::sync::mpsc::channel::<Vec<u8>>(1);
+        drop(rx);
+        assert!(!send_chunked(&tx, vec![1u8; 4], std::convert::identity).await);
+    }
+
+    #[tokio::test]
+    async fn drive_exec_sends_stdin_eof_exactly_once_on_control_close() {
+        use futures_util::StreamExt;
+        use tokio_tungstenite::tungstenite::{Message, protocol::Role};
+
+        let (client_io, server_io) = tokio::io::duplex(64 * 1024);
+        let client =
+            tokio_tungstenite::WebSocketStream::from_raw_socket(client_io, Role::Client, None)
+                .await;
+        let mut server =
+            tokio_tungstenite::WebSocketStream::from_raw_socket(server_io, Role::Server, None)
+                .await;
+        let (frames_tx, _frames_rx) = tokio::sync::mpsc::channel(4);
+        let (control_tx, control_rx) = tokio::sync::mpsc::channel(4);
+        let (sid_tx, _sid_rx) = tokio::sync::watch::channel(None);
+        let driver = tokio::spawn(drive_exec(client, false, frames_tx, control_rx, sid_tx));
+        drop(control_tx);
+
+        assert_eq!(
+            server.next().await.unwrap().unwrap(),
+            Message::Binary(vec![4].into())
+        );
+        assert!(matches!(
+            server.next().await.unwrap().unwrap(),
+            Message::Close(_)
+        ));
+        driver.await.unwrap();
     }
 
     #[tokio::test]
