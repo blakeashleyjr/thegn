@@ -5,6 +5,11 @@
 //! `Background` lanes outside these permits. Other direct `spawn_blocking`
 //! calls and `std::thread` workers are also outside this budget.
 //! Admission is non-blocking, so interactive callers never wait for a permit.
+//! This is an admission/concurrency bound, not a priority scheduler: once a
+//! closure is admitted, Tokio chooses when it runs, and this module does not
+//! assign QoS or otherwise prefer interactive work. Explicitly named native
+//! threads declare QoS at their spawn site; direct `spawn_blocking` and
+//! `std::thread` workers remain outside this module's QoS and permit budget.
 //!
 //! Measurement uses eleven `AtomicU64`s (88 bytes), with fixed cardinality and
 //! no labels. The in-flight payload bound is at most `BG_PERMITS` boxed
