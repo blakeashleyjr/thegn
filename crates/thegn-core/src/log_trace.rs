@@ -484,7 +484,7 @@ where
 {
     fn on_event(&self, event: &Event<'_>, _ctx: Context<'_, S>) {
         let meta = event.metadata();
-        if noisy_log_target(meta.target()) && *meta.level() < Level::ERROR {
+        if noisy_log_target(meta.target()) && *meta.level() > Level::ERROR {
             return;
         }
         let mut v = RingVisitor::default();

@@ -411,6 +411,7 @@ pub(crate) fn pids_with_cwd_under(root: &std::path::Path) -> Vec<u32> {
 /// The process memory figures needed by allocator hygiene. Linux exposes both
 /// values in `/proc/self/status`; other platforms have no equivalent through
 /// this seam and return no information.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct ProcessMemoryStatus {
     pub(crate) swap_kb: u64,
