@@ -2244,8 +2244,62 @@ fn sha256_hex(data: &[u8]) -> String {
     format!("{:x}", sha2::Sha256::digest(data))
 }
 
+const INSTALL_LEASE_TTL_MINUTES: &str = "5";
+const INSTALL_LEASE_ACQUIRE_SCRIPT: &str = r#"
+if mkdir -m 0700 -- "$1" 2>/dev/null; then
+    if printf '%s\n' "$2" > "$1/owner"; then
+        exit 0
+    fi
+    rmdir -- "$1" 2>/dev/null || true
+    exit 1
+fi
+if [ -d "$1" ] && [ "$(find "$1" -maxdepth 0 -mmin +$3 -print 2>/dev/null)" = "$1" ]; then
+    rm -rf -- "$1"
+    if mkdir -m 0700 -- "$1" 2>/dev/null; then
+        if printf '%s\n' "$2" > "$1/owner"; then
+            exit 0
+        fi
+        rmdir -- "$1" 2>/dev/null || true
+        exit 1
+    fi
+fi
+exit 75
+"#;
+const INSTALL_LEASE_RELEASE_SCRIPT: &str = r#"
+if [ -f "$1/owner" ] && [ "$(cat "$1/owner" 2>/dev/null)" = "$2" ]; then
+    rm -f -- "$1/owner" || exit 1
+    rmdir -- "$1" || exit 1
+fi
+exit 0
+"#;
+const INSTALL_PRESERVE_SCRIPT: &str = r#"
+if [ -e "$1" ]; then
+    mv -f -- "$1" "$2"
+fi
+"#;
+const INSTALL_RESTORE_SCRIPT: &str = r#"
+if [ -e "$2" ]; then
+    mv -f -- "$2" "$1"
+else
+    rm -f -- "$1"
+fi
+"#;
+const INSTALL_REMOVE_PREVIOUS_SCRIPT: &str = r#"
+rm -f -- "$1"
+"#;
+
+fn install_shell_argv(script: &str, args: &[&str]) -> Vec<String> {
+    let mut argv = vec!["/bin/sh".to_string(), "-c".to_string(), script.to_string()];
+    argv.push("thegn-install".to_string());
+    argv.extend(args.iter().map(|arg| (*arg).to_string()));
+    argv
+}
+
 #[derive(Debug)]
-enum ExecInstallError {
+enum InstallError {
+    Busy,
+    Lease(anyhow::Error),
+    Previous(anyhow::Error),
     StageWrite(anyhow::Error),
     StageRead(anyhow::Error),
     StageVerification(String),
@@ -2253,9 +2307,12 @@ enum ExecInstallError {
     PublishedVerification(String),
 }
 
-impl std::fmt::Display for ExecInstallError {
+impl std::fmt::Display for InstallError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            Self::Busy => write!(f, "bridge executable install is busy"),
+            Self::Lease(error) => write!(f, "lease bridge executable install: {error:#}"),
+            Self::Previous(error) => write!(f, "preserve previous bridge executable: {error:#}"),
             Self::StageWrite(error) => write!(f, "stage bridge executable: {error:#}"),
             Self::StageRead(error) => write!(
                 f,
@@ -2273,18 +2330,51 @@ impl std::fmt::Display for ExecInstallError {
     }
 }
 
-impl std::error::Error for ExecInstallError {}
+impl std::error::Error for InstallError {}
 
-async fn install_executable_verified<P, Fut>(
+async fn delete_install_stage(files: &dyn ProviderFiles, id: &str, stage: &str) {
+    if let Err(error) = files.delete(id, stage).await {
+        tracing::warn!(target: "thegn::provider", %error, "staged executable cleanup failed");
+    }
+}
+
+async fn release_install_lease<R, Fut>(release: &mut Option<R>)
+where
+    R: FnOnce() -> Fut,
+    Fut: std::future::Future<Output = Result<()>>,
+{
+    if let Some(release) = release.take()
+        && let Err(error) = release().await
+    {
+        tracing::warn!(target: "thegn::provider", %error, "executable install lease release failed");
+    }
+}
+
+async fn install_executable_verified<A, AFut, R, RFut, B, BFut, P, PFut, T, TFut, C, CFut>(
     files: &dyn ProviderFiles,
     id: &str,
     path: &str,
     data: &[u8],
+    acquire: A,
+    release: R,
+    preserve: B,
     publish: P,
+    rollback: T,
+    remove_previous: C,
 ) -> Result<bool>
 where
-    P: FnOnce(String, String) -> Fut,
-    Fut: std::future::Future<Output = Result<()>>,
+    A: FnOnce() -> AFut,
+    AFut: std::future::Future<Output = Result<bool>>,
+    R: FnOnce() -> RFut,
+    RFut: std::future::Future<Output = Result<()>>,
+    B: FnOnce() -> BFut,
+    BFut: std::future::Future<Output = Result<()>>,
+    P: FnOnce(String, String) -> PFut,
+    PFut: std::future::Future<Output = Result<()>>,
+    T: FnOnce() -> TFut,
+    TFut: std::future::Future<Output = Result<()>>,
+    C: FnOnce() -> CFut,
+    CFut: std::future::Future<Output = Result<()>>,
 {
     let want = sha256_hex(data);
     if let Ok(remote) = files.read(id, path).await
@@ -2294,24 +2384,29 @@ where
         return Ok(false);
     }
 
+    let mut release = Some(release);
+    match acquire().await {
+        Ok(true) => {}
+        Ok(false) => return Err(InstallError::Busy.into()),
+        Err(error) => return Err(InstallError::Lease(error).into()),
+    }
+
     let nanos = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |duration| duration.as_nanos());
     let stage = format!("{path}.tg-stage-{}-{nanos}", std::process::id());
     if let Err(error) = files.write_exec(id, &stage, data).await {
-        if let Err(error) = files.delete(id, &stage).await {
-            tracing::debug!(target: "thegn::provider", %error, "best-effort staged executable cleanup failed");
-        }
-        return Err(ExecInstallError::StageWrite(error).into());
+        delete_install_stage(files, id, &stage).await;
+        release_install_lease(&mut release).await;
+        return Err(InstallError::StageWrite(error).into());
     }
 
     match files.read(id, &stage).await {
         Ok(bytes) if bytes.len() == data.len() && sha256_hex(&bytes) == want => {}
         Ok(bytes) => {
-            if let Err(error) = files.delete(id, &stage).await {
-                tracing::debug!(target: "thegn::provider", %error, "best-effort staged executable cleanup failed");
-            }
-            return Err(ExecInstallError::StageVerification(format!(
+            delete_install_stage(files, id, &stage).await;
+            release_install_lease(&mut release).await;
+            return Err(InstallError::StageVerification(format!(
                 "expected {} bytes with SHA-256 {want}, got {} bytes with SHA-256 {}",
                 data.len(),
                 bytes.len(),
@@ -2320,27 +2415,36 @@ where
             .into());
         }
         Err(error) => {
-            if let Err(error) = files.delete(id, &stage).await {
-                tracing::debug!(target: "thegn::provider", %error, "best-effort staged executable cleanup failed");
-            }
-            return Err(ExecInstallError::StageRead(error).into());
+            delete_install_stage(files, id, &stage).await;
+            release_install_lease(&mut release).await;
+            return Err(InstallError::StageRead(error).into());
         }
     };
 
+    if let Err(error) = preserve().await {
+        delete_install_stage(files, id, &stage).await;
+        release_install_lease(&mut release).await;
+        return Err(InstallError::Previous(error).into());
+    }
+
     if let Err(error) = publish(stage.clone(), path.to_string()).await {
-        if let Err(error) = files.delete(id, &stage).await {
-            tracing::debug!(target: "thegn::provider", %error, "best-effort staged executable cleanup failed");
+        if let Err(rollback_error) = rollback().await {
+            tracing::warn!(target: "thegn::provider", %rollback_error, "bridge executable rollback after publish failure failed");
         }
-        return Err(ExecInstallError::Publish(error).into());
+        delete_install_stage(files, id, &stage).await;
+        release_install_lease(&mut release).await;
+        return Err(InstallError::Publish(error).into());
     }
 
     match files.read(id, path).await {
         Ok(bytes) if bytes.len() == data.len() && sha256_hex(&bytes) == want => {}
         Ok(bytes) => {
-            if let Err(error) = files.delete(id, &stage).await {
-                tracing::debug!(target: "thegn::provider", %error, "best-effort staged executable cleanup failed");
+            if let Err(error) = rollback().await {
+                tracing::warn!(target: "thegn::provider", %error, "bridge executable rollback after verification failure failed");
             }
-            return Err(ExecInstallError::PublishedVerification(format!(
+            delete_install_stage(files, id, &stage).await;
+            release_install_lease(&mut release).await;
+            return Err(InstallError::PublishedVerification(format!(
                 "expected {} bytes with SHA-256 {want}, got {} bytes with SHA-256 {}",
                 data.len(),
                 bytes.len(),
@@ -2349,20 +2453,28 @@ where
             .into());
         }
         Err(error) => {
-            if let Err(error) = files.delete(id, &stage).await {
-                tracing::debug!(target: "thegn::provider", %error, "best-effort staged executable cleanup failed");
+            if let Err(rollback_error) = rollback().await {
+                tracing::warn!(target: "thegn::provider", %rollback_error, "bridge executable rollback after read-back failure failed");
             }
-            return Err(ExecInstallError::PublishedVerification(format!(
+            delete_install_stage(files, id, &stage).await;
+            release_install_lease(&mut release).await;
+            return Err(InstallError::PublishedVerification(format!(
                 "read-back failed: {error:#}"
             ))
             .into());
         }
     };
 
+    if let Err(error) = remove_previous().await {
+        delete_install_stage(files, id, &stage).await;
+        release_install_lease(&mut release).await;
+        return Err(InstallError::Previous(error).into());
+    }
     let fp_path = format!("{path}.fp");
     if let Err(error) = files.delete(id, &fp_path).await {
-        tracing::debug!(target: "thegn::provider", %error, "best-effort legacy executable fingerprint cleanup failed");
+        tracing::warn!(target: "thegn::provider", %error, "best-effort legacy executable fingerprint cleanup failed");
     }
+    release_install_lease(&mut release).await;
     Ok(true)
 }
 
@@ -3432,8 +3544,11 @@ impl Provider {
     }
 
     /// Idempotently install the executable `data` at `path` in the sandbox.
-    /// SHA-256 is checked against the remote bytes themselves; uploads go to a
-    /// staging sibling, are read back and verified, then published with `mv -f`.
+    /// A per-destination lease serializes installers; stale leases expire after
+    /// five minutes. SHA-256 is checked against the remote bytes themselves;
+    /// uploads go to a staging sibling, are read back and verified, then the
+    /// prior generation is moved to `<path>.tg-prev` before publishing with
+    /// `mv -f`. A failed post-publish verification restores that generation.
     /// The legacy `<path>.fp` sidecar is ignored and best-effort removed. Returns
     /// whether it pushed (`true`) or the remote executable was already current
     /// (`false`). Requires the provider's file API (`caps().files`).
@@ -3442,25 +3557,163 @@ impl Provider {
             return Err(anyhow!("provider does not support a file push"));
         }
         let files = self.files_ops().ok_or_else(|| self.no_files())?;
-        install_executable_verified(files, id, path, data, |stage, dest| async move {
-            let (code, output) = self
-                .run_exec(
-                    id,
-                    &["mv".into(), "-f".into(), "--".into(), stage, dest],
-                    None,
-                    &[],
-                )
-                .await?;
-            if code != 0 {
-                let mut tail_start = output.len().saturating_sub(200);
-                while !output.is_char_boundary(tail_start) {
-                    tail_start += 1;
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |duration| duration.as_nanos());
+        let lease_path = format!("{path}.tg-lease");
+        let previous_path = format!("{path}.tg-prev");
+        let owner = format!("{}-{nanos}", std::process::id());
+        let lease_id = id.to_string();
+        let lease_path_for_acquire = lease_path.clone();
+        let owner_for_acquire = owner.clone();
+        let acquired = install_executable_verified(
+            files,
+            id,
+            path,
+            data,
+            move || async move {
+                let (code, output) = self
+                    .run_exec(
+                        &lease_id,
+                        &install_shell_argv(
+                            INSTALL_LEASE_ACQUIRE_SCRIPT,
+                            &[
+                                &lease_path_for_acquire,
+                                &owner_for_acquire,
+                                INSTALL_LEASE_TTL_MINUTES,
+                            ],
+                        ),
+                        None,
+                        &[],
+                    )
+                    .await?;
+                match code {
+                    0 => Ok(true),
+                    75 => Ok(false),
+                    _ => Err(anyhow!("install lease command exited {code}: {output}")),
                 }
-                return Err(anyhow!("mv exited {code}: {}", &output[tail_start..]));
-            }
-            Ok(())
-        })
-        .await
+            },
+            {
+                let lease_id = id.to_string();
+                let lease_path = lease_path.clone();
+                let owner = owner.clone();
+                move || async move {
+                    let (code, output) = self
+                        .run_exec(
+                            &lease_id,
+                            &install_shell_argv(
+                                INSTALL_LEASE_RELEASE_SCRIPT,
+                                &[&lease_path, &owner],
+                            ),
+                            None,
+                            &[],
+                        )
+                        .await?;
+                    if code == 0 {
+                        Ok(())
+                    } else {
+                        Err(anyhow!("install lease release exited {code}: {output}"))
+                    }
+                }
+            },
+            {
+                let previous_id = id.to_string();
+                let previous_path = previous_path.clone();
+                let target_path = path.to_string();
+                move || async move {
+                    let (code, output) = self
+                        .run_exec(
+                            &previous_id,
+                            &install_shell_argv(
+                                INSTALL_PRESERVE_SCRIPT,
+                                &[&target_path, &previous_path],
+                            ),
+                            None,
+                            &[],
+                        )
+                        .await?;
+                    if code == 0 {
+                        Ok(())
+                    } else {
+                        Err(anyhow!(
+                            "preserve previous executable exited {code}: {output}"
+                        ))
+                    }
+                }
+            },
+            |stage, dest| async move {
+                let (code, output) = self
+                    .run_exec(
+                        id,
+                        &[
+                            "/bin/sh".into(),
+                            "-c".into(),
+                            "mv -f -- \"$1\" \"$2\"".into(),
+                            "thegn-install-publish".into(),
+                            stage,
+                            dest,
+                        ],
+                        None,
+                        &[],
+                    )
+                    .await?;
+                if code != 0 {
+                    let mut tail_start = output.len().saturating_sub(200);
+                    while !output.is_char_boundary(tail_start) {
+                        tail_start += 1;
+                    }
+                    return Err(anyhow!("mv exited {code}: {}", &output[tail_start..]));
+                }
+                Ok(())
+            },
+            {
+                let rollback_id = id.to_string();
+                let previous_path = previous_path.clone();
+                let target_path = path.to_string();
+                move || async move {
+                    let (code, output) = self
+                        .run_exec(
+                            &rollback_id,
+                            &install_shell_argv(
+                                INSTALL_RESTORE_SCRIPT,
+                                &[&target_path, &previous_path],
+                            ),
+                            None,
+                            &[],
+                        )
+                        .await?;
+                    if code == 0 {
+                        Ok(())
+                    } else {
+                        Err(anyhow!(
+                            "restore previous executable exited {code}: {output}"
+                        ))
+                    }
+                }
+            },
+            {
+                let cleanup_id = id.to_string();
+                move || async move {
+                    let (code, output) = self
+                        .run_exec(
+                            &cleanup_id,
+                            &install_shell_argv(INSTALL_REMOVE_PREVIOUS_SCRIPT, &[&previous_path]),
+                            None,
+                            &[],
+                        )
+                        .await?;
+                    if code == 0 {
+                        Ok(())
+                    } else {
+                        Err(anyhow!(
+                            "remove previous executable exited {code}: {output}"
+                        ))
+                    }
+                }
+            },
+        )
+        .await?;
+        Ok(acquired)
     }
 
     /// Create and validate private directories before installing an executable.
@@ -3873,6 +4126,130 @@ mod tests {
                 .keys()
                 .any(|path| path.contains(".tg-stage-"))
         }
+
+        fn preserve(&self, path: &str, previous: &str) -> Result<()> {
+            let mut files = self
+                .files
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if let Some(bytes) = files.remove(path) {
+                files.insert(previous.to_string(), bytes);
+            }
+            Ok(())
+        }
+
+        fn restore(&self, path: &str, previous: &str) -> Result<()> {
+            let mut files = self
+                .files
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if let Some(bytes) = files.remove(previous) {
+                files.insert(path.to_string(), bytes);
+            } else {
+                files.remove(path);
+            }
+            Ok(())
+        }
+
+        fn remove_previous(&self, previous: &str) -> Result<()> {
+            self.files
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .remove(previous);
+            Ok(())
+        }
+    }
+
+    #[derive(Clone)]
+    struct TestLease {
+        held: std::sync::Arc<std::sync::atomic::AtomicBool>,
+        stale: std::sync::Arc<std::sync::atomic::AtomicBool>,
+        acquired: std::sync::Arc<tokio::sync::Notify>,
+        releases: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    impl TestLease {
+        fn new() -> Self {
+            Self {
+                held: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+                stale: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+                acquired: std::sync::Arc::new(tokio::sync::Notify::new()),
+                releases: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            }
+        }
+
+        fn acquire(&self) -> bool {
+            if self.stale.swap(false, std::sync::atomic::Ordering::SeqCst) {
+                self.held.store(false, std::sync::atomic::Ordering::SeqCst);
+            }
+            let acquired = self
+                .held
+                .compare_exchange(
+                    false,
+                    true,
+                    std::sync::atomic::Ordering::SeqCst,
+                    std::sync::atomic::Ordering::SeqCst,
+                )
+                .is_ok();
+            if acquired {
+                self.acquired.notify_one();
+            }
+            acquired
+        }
+
+        fn release(&self) {
+            self.held.store(false, std::sync::atomic::Ordering::SeqCst);
+            self.releases
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+
+    async fn test_install<P, PFut>(
+        files: &MemFiles,
+        id: &str,
+        path: &str,
+        data: &[u8],
+        lease: TestLease,
+        publish: P,
+    ) -> Result<bool>
+    where
+        P: FnOnce(String, String) -> PFut,
+        PFut: std::future::Future<Output = Result<()>>,
+    {
+        let previous = format!("{path}.tg-prev");
+        let acquire_lease = lease.clone();
+        let release_lease = lease;
+        install_executable_verified(
+            files,
+            id,
+            path,
+            data,
+            move || async move { Ok(acquire_lease.acquire()) },
+            move || async move {
+                release_lease.release();
+                Ok(())
+            },
+            {
+                let files = files;
+                let path = path.to_string();
+                let previous = previous.clone();
+                move || async move { files.preserve(&path, &previous) }
+            },
+            move |stage, dest| publish(stage, dest),
+            {
+                let files = files;
+                let path = path.to_string();
+                move || {
+                    let previous = format!("{path}.tg-prev");
+                    async move { files.restore(&path, &previous) }
+                }
+            },
+            {
+                let files = files;
+                move || async move { files.remove_previous(&previous) }
+            },
+        )
+        .await
     }
 
     impl ProviderFiles for MemFiles {
@@ -3945,13 +4322,19 @@ mod tests {
         let published = std::sync::atomic::AtomicBool::new(false);
         let mem = &files;
         let ran = &published;
-        let result =
-            install_executable_verified(&files, "id", path, b"good", |stage, dest| async move {
+        let result = test_install(
+            &files,
+            "id",
+            path,
+            b"good",
+            TestLease::new(),
+            |stage, dest| async move {
                 ran.store(true, std::sync::atomic::Ordering::SeqCst);
                 mem.publish(&stage, &dest)
-            })
-            .await
-            .unwrap();
+            },
+        )
+        .await
+        .unwrap();
         let stored = files
             .files
             .lock()
@@ -3970,10 +4353,17 @@ mod tests {
         let files = MemFiles::new(HashMap::from([(path.into(), b"same".to_vec())]), false);
         let published = std::sync::atomic::AtomicBool::new(false);
         let ran = &published;
-        let result = install_executable_verified(&files, "id", path, b"same", |_, _| async move {
-            ran.store(true, std::sync::atomic::Ordering::SeqCst);
-            Ok(())
-        })
+        let result = test_install(
+            &files,
+            "id",
+            path,
+            b"same",
+            TestLease::new(),
+            |_, _| async move {
+                ran.store(true, std::sync::atomic::Ordering::SeqCst);
+                Ok(())
+            },
+        )
         .await
         .unwrap();
         assert!(!result);
@@ -3985,11 +4375,12 @@ mod tests {
         let path = "/w/.tg/thegn";
         let files = MemFiles::new(HashMap::new(), false);
         let mem = &files;
-        let result = install_executable_verified(
+        let result = test_install(
             &files,
             "id",
             path,
             b"new binary",
+            TestLease::new(),
             |stage, dest| async move { mem.publish(&stage, &dest) },
         )
         .await
@@ -4013,11 +4404,13 @@ mod tests {
         let published = std::sync::atomic::AtomicBool::new(false);
         let mem = &files;
         let ran = &published;
-        let result = install_executable_verified(
+        let lease = TestLease::new();
+        let result = test_install(
             &files,
             "id",
             path,
             b"new binary",
+            lease.clone(),
             |stage, dest| async move {
                 ran.store(true, std::sync::atomic::Ordering::SeqCst);
                 mem.publish(&stage, &dest)
@@ -4036,6 +4429,7 @@ mod tests {
             Some(&b"prior"[..])
         );
         assert!(!files.contains_stage());
+        assert_eq!(lease.releases.load(std::sync::atomic::Ordering::SeqCst), 1);
     }
 
     #[tokio::test]
@@ -4044,12 +4438,19 @@ mod tests {
         let files = MemFiles::new(HashMap::from([(path.into(), b"prior".to_vec())]), false);
         let published = std::sync::atomic::AtomicBool::new(false);
         let ran = &published;
-        let result =
-            install_executable_verified(&files, "id", path, b"new binary", |_, _| async move {
+        let lease = TestLease::new();
+        let result = test_install(
+            &files,
+            "id",
+            path,
+            b"new binary",
+            lease.clone(),
+            |_, _| async move {
                 ran.store(true, std::sync::atomic::Ordering::SeqCst);
                 Err(anyhow!("publish refused"))
-            })
-            .await;
+            },
+        )
+        .await;
         assert!(
             matches!(result, Err(error) if error.to_string().contains("publish bridge executable"))
         );
@@ -4063,6 +4464,144 @@ mod tests {
                 .map(Vec::as_slice),
             Some(&b"prior"[..])
         );
+        assert!(!files.contains_stage());
+        assert_eq!(lease.releases.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn exec_install_concurrent_second_is_busy_without_torn_file() {
+        let path = "/w/.tg/thegn";
+        let files = std::sync::Arc::new(MemFiles::new(
+            HashMap::from([(path.into(), b"prior".to_vec())]),
+            false,
+        ));
+        let lease = TestLease::new();
+        let publish_gate = std::sync::Arc::new(tokio::sync::Notify::new());
+        let first_files = std::sync::Arc::clone(&files);
+        let first_publish_files = std::sync::Arc::clone(&files);
+        let first_lease = lease.clone();
+        let first_gate = std::sync::Arc::clone(&publish_gate);
+        let first = tokio::spawn(async move {
+            test_install(
+                first_files.as_ref(),
+                "id",
+                path,
+                b"new binary",
+                first_lease,
+                move |stage, dest| {
+                    let files = std::sync::Arc::clone(&first_publish_files);
+                    async move {
+                        first_gate.notified().await;
+                        files.publish(&stage, &dest)
+                    }
+                },
+            )
+            .await
+        });
+
+        lease.acquired.notified().await;
+        let second = test_install(
+            files.as_ref(),
+            "id",
+            path,
+            b"new binary",
+            lease.clone(),
+            |_, _| async move { Ok(()) },
+        )
+        .await;
+        let error = second.expect_err("the second installer must observe the lease");
+        assert!(matches!(
+            error.downcast_ref::<InstallError>(),
+            Some(InstallError::Busy)
+        ));
+
+        publish_gate.notify_one();
+        assert!(first.await.unwrap().unwrap());
+        assert_eq!(
+            files
+                .files
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .get(path)
+                .map(Vec::as_slice),
+            Some(&b"new binary"[..])
+        );
+        assert_eq!(lease.releases.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn exec_install_stale_lease_is_reclaimed() {
+        let path = "/w/.tg/thegn";
+        let files = MemFiles::new(HashMap::new(), false);
+        let lease = TestLease::new();
+        lease.held.store(true, std::sync::atomic::Ordering::SeqCst);
+        lease.stale.store(true, std::sync::atomic::Ordering::SeqCst);
+        let result = test_install(
+            &files,
+            "id",
+            path,
+            b"new binary",
+            lease.clone(),
+            |stage, dest| async move { files.publish(&stage, &dest) },
+        )
+        .await
+        .unwrap();
+        assert!(result);
+        assert_eq!(lease.releases.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn exec_install_publish_verification_failure_restores_previous_bytes() {
+        let path = "/w/.tg/thegn";
+        let files = MemFiles::new(HashMap::from([(path.into(), b"prior".to_vec())]), false);
+        let lease = TestLease::new();
+        let result = test_install(
+            &files,
+            "id",
+            path,
+            b"new binary",
+            lease.clone(),
+            |stage, dest| async move {
+                files.publish(&stage, &dest)?;
+                files
+                    .files
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .insert(dest, b"corrupt after publish".to_vec());
+                Ok(())
+            },
+        )
+        .await;
+        assert!(matches!(
+            result,
+            Err(error) if error.to_string().contains("published bridge executable failed verification")
+        ));
+        let stored = files
+            .files
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        assert_eq!(stored.get(path).map(Vec::as_slice), Some(&b"prior"[..]));
+        assert!(!stored.contains_key(&format!("{path}.tg-prev")));
+        drop(stored);
+        assert_eq!(lease.releases.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn exec_install_stage_error_releases_lease() {
+        let path = "/w/.tg/thegn";
+        let files = MemFiles::new(HashMap::from([(path.into(), b"prior".to_vec())]), true);
+        let lease = TestLease::new();
+        let result = test_install(
+            &files,
+            "id",
+            path,
+            b"new binary",
+            lease.clone(),
+            |stage, dest| async move { files.publish(&stage, &dest) },
+        )
+        .await;
+        assert!(result.is_err());
+        assert_eq!(lease.releases.load(std::sync::atomic::Ordering::SeqCst), 1);
         assert!(!files.contains_stage());
     }
 
