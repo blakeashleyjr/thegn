@@ -89,7 +89,7 @@ pub fn gitlab_mode(raw: &str, resolution: &SecretResolution) -> CredentialMode {
 pub fn report(provider: Provider, credential_mode: CredentialMode, placement: Placement) -> Row {
     let (reachable, detail) = match (provider, credential_mode, placement) {
         (Provider::Github, _, Placement::Local) => (true, "read from host keyring/env; reachable"),
-        (Provider::Github, _, placement) if placement.is_remote() => {
+        (Provider::Github, _, Placement::Ssh | Placement::Provider) => {
             (true, "read by remote CLI-managed auth; reachable")
         }
         (Provider::Gitlab, CredentialMode::GitlabTokenRefAbsent, Placement::Local) => {
@@ -116,7 +116,7 @@ pub fn report(provider: Provider, credential_mode: CredentialMode, placement: Pl
         {
             (
                 false,
-                "not forwarded: remote uses its own glab login; configured token is refused; unreachable",
+                "refused: configured token is never forwarded to a remote; the remote glab login is not used; unreachable",
             )
         }
         (Provider::Gitlab, CredentialMode::GitlabTokenRefUnresolvable, Placement::Local) => {
@@ -186,7 +186,7 @@ mod tests {
         assert!(
             remote
                 .note
-                .contains("not forwarded: remote uses its own glab login")
+                .contains("configured token is never forwarded to a remote")
         );
     }
 

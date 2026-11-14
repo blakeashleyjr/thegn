@@ -957,10 +957,11 @@ mod tests {
                 .iter()
                 .all(|note| !note.contains("fixture-secret-token"))
         );
-        assert!(auto.notes.iter().any(|note| {
-            note.contains("not forwarded: remote uses its own glab login")
-                && note.contains("configured token is refused")
-        }));
+        assert!(
+            auto.notes
+                .iter()
+                .any(|note| { note.contains("configured token is never forwarded to a remote") })
+        );
     }
 
     #[test]
