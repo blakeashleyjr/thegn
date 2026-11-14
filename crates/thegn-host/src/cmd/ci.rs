@@ -14,6 +14,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 use thegn_core::ci::{self, CiJob, CiRun, CiState, RerunScope};
+use thegn_core::ci_log::inert_controls;
 use thegn_core::config::Config;
 use thegn_core::config_ci::MAX_CI_RUNS;
 use thegn_core::db::Db;
@@ -181,7 +182,7 @@ fn interrupted_message(verb: &str) -> String {
 fn validate_id_at_cli(value: &str) -> Result<()> {
     thegn_svc::ci::validate_ci_id(value)
         .map(|_| ())
-        .map_err(|error| anyhow::anyhow!(error.to_string()))
+        .map_err(|error| anyhow::anyhow!(inert_controls(&error.to_string()).into_owned()))
 }
 
 fn glyph(s: CiState) -> &'static str {
@@ -227,7 +228,7 @@ fn runs(
 ) -> Result<()> {
     if let Some(branch) = branch.as_deref() {
         thegn_svc::ci::validate_branch_ref(branch)
-            .map_err(|error| anyhow::anyhow!(error.to_string()))?;
+            .map_err(|error| anyhow::anyhow!(inert_controls(&error.to_string()).into_owned()))?;
     }
     if let Some(limit) = limit
         && (limit == 0 || limit > MAX_CI_RUNS)
@@ -323,12 +324,12 @@ fn runs(
                 outln!(
                     "{} {:<22} {:<10} {:<8} {:>7}  {}  {}",
                     glyph(r.state),
-                    truncate(&thegn_svc::lsp::sanitize_for_terminal(&r.name), 22),
-                    truncate(&thegn_svc::lsp::sanitize_for_terminal(&r.branch), 10),
-                    truncate(&thegn_svc::lsp::sanitize_for_terminal(&r.event), 8),
+                    truncate(inert_controls(&r.name).as_ref(), 22),
+                    truncate(inert_controls(&r.branch).as_ref(), 10),
+                    truncate(inert_controls(&r.event).as_ref(), 8),
                     dur(r.started_at.as_deref(), r.finished_at.as_deref()),
-                    thegn_svc::lsp::sanitize_for_terminal(&r.id),
-                    truncate(&thegn_svc::lsp::sanitize_for_terminal(&r.title), 40),
+                    inert_controls(&r.id),
+                    truncate(inert_controls(&r.title).as_ref(), 40),
                 );
             }
         }
@@ -338,16 +339,10 @@ fn runs(
         // mode prints a note. The finding this fixes was a NON-JSON string on
         // stdout under --json, not a missing non-zero exit.
         Err(e) if json_out => {
-            msg::warn(&format!(
-                "ci: {}",
-                thegn_svc::lsp::sanitize_for_terminal(&e.to_string())
-            ));
+            msg::warn(&format!("ci: {}", inert_controls(&e.to_string())));
             return super::emit_json(&serde_json::json!({ "error": e.to_string() }));
         }
-        Err(e) => outln!(
-            "ci: {}",
-            thegn_svc::lsp::sanitize_for_terminal(&e.to_string())
-        ),
+        Err(e) => outln!("ci: {}", inert_controls(&e.to_string())),
     }
     Ok(())
 }
@@ -381,14 +376,11 @@ fn view(cfg: &Config, worktree: Option<String>, run_id: &str) -> Result<()> {
     match client.run_detail(&loc, run_id) {
         Ok(detail) => {
             for warning in detail_warnings(&detail) {
-                msg::warn(&warning);
+                msg::warn(inert_controls(&warning).as_ref());
             }
             print_run_detail(&detail.run);
         }
-        Err(e) => outln!(
-            "ci: {}",
-            thegn_svc::lsp::sanitize_for_terminal(&e.to_string())
-        ),
+        Err(e) => outln!("ci: {}", inert_controls(&e.to_string())),
     }
     Ok(())
 }
@@ -397,16 +389,16 @@ fn print_run_detail(run: &CiRun) {
     outln!(
         "{} {} #{}  [{}]  {}",
         glyph(run.state),
-        thegn_svc::lsp::sanitize_for_terminal(&run.name),
+        inert_controls(&run.name),
         run.run_number.unwrap_or(0),
-        thegn_svc::lsp::sanitize_for_terminal(&run.status_raw),
+        inert_controls(&run.status_raw),
         dur(run.started_at.as_deref(), run.finished_at.as_deref())
     );
     if !run.title.is_empty() {
-        outln!("  {}", thegn_svc::lsp::sanitize_for_terminal(&run.title));
+        outln!("  {}", inert_controls(&run.title));
     }
     if !run.url.is_empty() {
-        outln!("  {}", thegn_svc::lsp::sanitize_for_terminal(&run.url));
+        outln!("  {}", inert_controls(&run.url));
     }
     for j in &run.jobs {
         print_job(j);
@@ -417,16 +409,12 @@ fn print_job(j: &CiJob) {
     outln!(
         "  {} {:<24} {:>7}  {}",
         glyph(j.state),
-        truncate(&thegn_svc::lsp::sanitize_for_terminal(&j.name), 24),
+        truncate(inert_controls(&j.name).as_ref(), 24),
         dur(j.started_at.as_deref(), j.finished_at.as_deref()),
-        thegn_svc::lsp::sanitize_for_terminal(&j.id),
+        inert_controls(&j.id),
     );
     for s in &j.steps {
-        outln!(
-            "      {} {}",
-            glyph(s.state),
-            thegn_svc::lsp::sanitize_for_terminal(&s.name)
-        );
+        outln!("      {} {}", glyph(s.state), inert_controls(&s.name));
     }
 }
 
@@ -479,17 +467,14 @@ fn log(
                 None => {
                     let error = anyhow::anyhow!(NO_CI_PROVIDER_MESSAGE);
                     if json_out {
-                        msg::warn(&format!(
-                            "ci: {}",
-                            thegn_svc::lsp::sanitize_for_terminal(&error.to_string())
-                        ));
+                        msg::warn(&format!("ci: {}", inert_controls(&error.to_string())));
                         return super::emit_json(
                             &serde_json::json!({ "error": error.to_string() }),
                         );
                     }
-                    return Err(anyhow::anyhow!(thegn_svc::lsp::sanitize_for_terminal(
-                        &error.to_string()
-                    )));
+                    return Err(anyhow::anyhow!(
+                        inert_controls(&error.to_string()).into_owned()
+                    ));
                 }
             };
             let detail = provider
@@ -497,21 +482,18 @@ fn log(
                 .map_err(|error| error.to_string());
             let identity = crate::ci_refresh::log_fill_identity(&detail, run_id, job_id);
             for warning in &identity.warnings {
-                msg::warn(warning);
+                msg::warn(inert_controls(warning).as_ref());
             }
             let raw = match provider.logs(&loc, run_id, job_id) {
                 Ok(raw) => raw,
                 Err(error) if json_out => {
-                    msg::warn(&format!(
-                        "ci: {}",
-                        thegn_svc::lsp::sanitize_for_terminal(&error.to_string())
-                    ));
+                    msg::warn(&format!("ci: {}", inert_controls(&error.to_string())));
                     return super::emit_json(&serde_json::json!({ "error": error.to_string() }));
                 }
                 Err(error) => {
                     return Err(anyhow::anyhow!(
                         "ci: {}",
-                        thegn_svc::lsp::sanitize_for_terminal(&error.to_string())
+                        inert_controls(&error.to_string())
                     ));
                 }
             };
@@ -614,7 +596,7 @@ fn rerun(
         }),
         Err(e) => msg::die(&format!(
             "ci rerun failed: {}",
-            thegn_svc::lsp::sanitize_for_terminal(&e.to_string())
+            inert_controls(&e.to_string())
         )),
     }
     Ok(())
@@ -627,9 +609,9 @@ fn trigger(
     input: Vec<String>,
 ) -> Result<()> {
     thegn_svc::ci::validate_workflow_selector(workflow)
-        .map_err(|error| anyhow::anyhow!(error.to_string()))?;
+        .map_err(|error| anyhow::anyhow!(inert_controls(&error.to_string()).into_owned()))?;
     let inputs = thegn_svc::ci::parse_trigger_inputs(&input)
-        .map_err(|error| anyhow::anyhow!(error.to_string()))?;
+        .map_err(|error| anyhow::anyhow!(inert_controls(&error.to_string()).into_owned()))?;
     let cancel_flag = Arc::new(AtomicBool::new(false));
     let (loc, client) = cancellable_client(cfg, worktree, Arc::clone(&cancel_flag), "ci trigger")?;
     if !client.caps().trigger {
@@ -647,10 +629,10 @@ fn trigger(
         msg::die(&interrupted_message("trigger"));
     }
     match result {
-        Ok(()) => msg::info(&format!("triggered {workflow}")),
+        Ok(()) => msg::info(&format!("triggered {}", inert_controls(workflow))),
         Err(e) => msg::die(&format!(
             "ci trigger failed: {}",
-            thegn_svc::lsp::sanitize_for_terminal(&e.to_string())
+            inert_controls(&e.to_string())
         )),
     }
     Ok(())
@@ -678,7 +660,7 @@ fn cancel(cfg: &Config, worktree: Option<String>, run_id: &str) -> Result<()> {
         Ok(()) => msg::info("cancelled"),
         Err(e) => msg::die(&format!(
             "ci cancel failed: {}",
-            thegn_svc::lsp::sanitize_for_terminal(&e.to_string())
+            inert_controls(&e.to_string())
         )),
     }
     Ok(())
@@ -706,17 +688,18 @@ fn detect_lines(detected: &[ci::CiConfig]) -> Vec<String> {
     detected
         .iter()
         .map(|c| {
-            thegn_svc::lsp::sanitize_for_terminal(&format!(
+            inert_controls(&format!(
                 "  {:<16} {}",
                 c.system.label(),
                 c.files.join(", ")
             ))
+            .into_owned()
         })
         .collect()
 }
 
 fn render_log_output(text: &str, truncated: bool, tail_lines: usize) -> String {
-    let sanitized = thegn_svc::lsp::sanitize_for_terminal(text);
+    let sanitized = inert_controls(text);
     let mut output = String::new();
     if truncated {
         if thegn_core::ci_log::is_failure_window(text) {
@@ -814,6 +797,8 @@ mod tests {
                 .any(|c| ('\u{0080}'..='\u{009f}').contains(&c))
         );
         assert!(rendered.contains("ordinary failure\n"));
+        assert!(rendered.contains("^["));
+        assert!(rendered.contains("\\u{7}"));
         assert!(rendered.contains("split control starts\n[2J remains text"));
     }
 
