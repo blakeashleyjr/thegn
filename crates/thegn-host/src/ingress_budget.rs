@@ -369,6 +369,10 @@ mod tests {
             let mut seen = vec![0_usize; count];
             while let Some(index) = budget.next_source(&ready, &mut rotation) {
                 assert!(ready[index].pending);
+                assert!(matches!(
+                    ready[index].class,
+                    IngressClass::ReplaceableSnapshot | IngressClass::MustDeliver
+                ));
                 assert!(ready[index].used_msgs < ready[index].limits.max_msgs);
                 assert!(ready[index].used_bytes < ready[index].limits.max_bytes);
                 seen[index] += 1;

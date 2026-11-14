@@ -74,8 +74,9 @@ boundary. A plain `try_recv` loop without a count/time limit is recorded as
 
 The proposed class and limit entries are design labels only; this slice makes
 no runtime behavior claim. [`ingress_budget.rs`](../../crates/thegn-host/src/ingress_budget.rs)
-provides the pure policy seam for the [THE-657](https://linear.app/blakeashley/issue/THE-657)
-follow-up wiring. In particular, `LosslessOrdered` and `MustDeliver` sources
+is the pure policy seam for the [THE-657](https://linear.app/blakeashley/issue/THE-657)
+follow-up wiring; it is compiled only under `#[cfg(test)]` until the first source is wired.
+In particular, `LosslessOrdered` and `MustDeliver` sources
 must not be changed to drop-oldest or latest-only delivery to fit a budget.
 
 ## Findings and ownership
