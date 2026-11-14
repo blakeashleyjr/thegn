@@ -18,4 +18,4 @@ surface = "hello.segment"
 
 [contributions.cadence]
 kind = "interval"
-millis = 5000
+millis = 60000
