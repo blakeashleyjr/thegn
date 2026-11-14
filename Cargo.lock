@@ -8023,6 +8023,7 @@ dependencies = [
  "iana-time-zone",
  "ignore",
  "libc",
+ "log",
  "neo_frizbee 0.10.4",
  "nix 0.31.3",
  "once_cell",
