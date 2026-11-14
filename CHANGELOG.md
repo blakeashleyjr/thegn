@@ -7,6 +7,8 @@ All notable changes to **thegn** are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.1.0-alpha.76] — 2026-11-14
+
 ### Fixed
 
 - Scheduled CI failures without a queued PR now produce one `ci_run_failed` notice per run, and a newer run replaces the previous unread notice.
@@ -3386,7 +3388,8 @@ launcher picker and the merge queue's `agent_command` hook remain — they run
 whatever commands you configure. Leftover `[llm_proxy]` config sections and
 `proxy_*` tables in existing state databases are ignored harmlessly.
 
-[Unreleased]: https://github.com/blakeashleyjr/thegn/compare/v0.1.0-alpha.75...HEAD
+[Unreleased]: https://github.com/blakeashleyjr/thegn/compare/v0.1.0-alpha.76...HEAD
+[0.1.0-alpha.76]: https://github.com/blakeashleyjr/thegn/compare/v0.1.0-alpha.75...v0.1.0-alpha.76
 [0.1.0-alpha.75]: https://github.com/blakeashleyjr/thegn/compare/v0.1.0-alpha.74...v0.1.0-alpha.75
 [0.1.0-alpha.74]: https://github.com/blakeashleyjr/thegn/compare/v0.1.0-alpha.73...v0.1.0-alpha.74
 [0.1.0-alpha.73]: https://github.com/blakeashleyjr/thegn/compare/v0.1.0-alpha.72...v0.1.0-alpha.73
