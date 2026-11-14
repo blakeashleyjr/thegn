@@ -3279,7 +3279,7 @@ mod tests {
         let (diagnostics, _) = diagnostics_channel();
         let generation = diagnostics.register(root.path(), "stdin-eof").unwrap();
         let client = LspClient::start_argv_with_identity(
-            &shell_argv("trap '' HUP; exec sleep 1\n"),
+            &shell_argv("trap '' TERM HUP; exec sleep 30\n"),
             "fixture",
             root.path(),
             diagnostics,
@@ -3309,7 +3309,7 @@ mod tests {
         let (diagnostics, _) = diagnostics_channel();
         let generation = diagnostics.register(root.path(), "pipe-holder").unwrap();
         let client = LspClient::start_argv_with_identity(
-            &shell_argv("setsid sh -c 'sleep 1' & exit 0\n"),
+            &shell_argv("setsid sh -c 'sleep 10' & exit 0\n"),
             "fixture",
             root.path(),
             diagnostics,
@@ -3318,7 +3318,7 @@ mod tests {
         )
         .unwrap();
 
-        let leader_deadline = Instant::now() + Duration::from_secs(1);
+        let leader_deadline = Instant::now() + Duration::from_secs(5);
         loop {
             let leader_exited = client
                 .child
