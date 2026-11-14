@@ -13,6 +13,10 @@ a POSIX shell script with `printf` is enough.
    warning). Directory plugins
    default their `cwd` to their own directory. Re-invoking a running one-shot
    reports that the contribution is already running.
+   Plugin IDs are 1–64 ASCII bytes from `[A-Za-z0-9._-]`; contribution and
+   surface IDs are bounded to 1–128 ASCII bytes from `[A-Za-z0-9._/-]` with
+   non-empty segments, and capability IDs use the bounded `kind:target` grammar.
+   `thegn plugin check` rejects invalid IDs with bounded diagnostics.
 2. **Validate it**: `thegn plugin list` shows what the loader sees;
    `thegn plugin check` negotiates against the host contract and exits
    non-zero on problems. Start from `examples/plugins/hello.sh` +
