@@ -9,9 +9,6 @@ use std::path::Path;
 use std::process::{Child, Command, ExitStatus};
 use std::task::{Context, Poll};
 
-#[cfg(all(test, target_os = "linux"))]
-use std::sync::atomic::AtomicUsize;
-
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::signal::unix::{Signal, SignalKind, signal};
 use tokio::time::Instant;
@@ -22,21 +19,22 @@ const MAX_TRACKED_DESCENDANTS: usize = 4096;
 const MAX_DESCENDANT_DEPTH: usize = 64;
 
 #[cfg(all(test, target_os = "linux"))]
-static PROC_READS: AtomicUsize = AtomicUsize::new(0);
-#[cfg(all(test, target_os = "linux"))]
-static GLOBAL_PROC_SCANS: AtomicUsize = AtomicUsize::new(0);
+thread_local! {
+    static PROC_READS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static GLOBAL_PROC_SCANS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
 
 #[cfg(target_os = "linux")]
 fn proc_read_dir(path: &Path) -> io::Result<std::fs::ReadDir> {
     #[cfg(test)]
-    PROC_READS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    PROC_READS.with(|reads| reads.set(reads.get().saturating_add(1)));
     std::fs::read_dir(path)
 }
 
 #[cfg(target_os = "linux")]
 fn proc_read_to_string(path: &Path) -> io::Result<String> {
     #[cfg(test)]
-    PROC_READS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    PROC_READS.with(|reads| reads.set(reads.get().saturating_add(1)));
     std::fs::read_to_string(path)
 }
 
@@ -70,7 +68,7 @@ fn linux_descendants_in(proc_root: &Path, root: libc::pid_t) -> Vec<(libc::pid_t
 #[cfg(target_os = "linux")]
 fn linux_descendants_full(proc_root: &Path, root: libc::pid_t) -> Vec<(libc::pid_t, u64)> {
     #[cfg(test)]
-    GLOBAL_PROC_SCANS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    GLOBAL_PROC_SCANS.with(|scans| scans.set(scans.get().saturating_add(1)));
     let Ok(entries) = proc_read_dir(proc_root) else {
         return Vec::new();
     };
@@ -135,9 +133,17 @@ fn linux_descendants_subtree(
     let mut capped = false;
     while let Some((parent, depth)) = pending.pop_front() {
         let task_root = proc_root.join(parent.to_string()).join("task");
-        let tasks = proc_read_dir(&task_root).map_err(|_| ())?;
+        let tasks = match proc_read_dir(&task_root) {
+            Ok(tasks) => tasks,
+            Err(_) if parent != root => continue,
+            Err(_) => return Err(()),
+        };
         for task in tasks {
-            let task = task.map_err(|_| ())?;
+            let task = match task {
+                Ok(task) => task,
+                Err(_) if parent != root => continue,
+                Err(_) => return Err(()),
+            };
             let Some(tid) = task
                 .file_name()
                 .to_str()
@@ -146,7 +152,11 @@ fn linux_descendants_subtree(
                 continue;
             };
             let children_path = task_root.join(tid.to_string()).join("children");
-            let children = proc_read_to_string(&children_path).map_err(|_| ())?;
+            let children = match proc_read_to_string(&children_path) {
+                Ok(children) => children,
+                Err(_) if parent != root => continue,
+                Err(_) => return Err(()),
+            };
             for child in children.split_whitespace() {
                 let Ok(child) = child.parse::<libc::pid_t>() else {
                     continue;
@@ -680,13 +690,13 @@ mod tests {
         );
         fake_proc_process(root.path(), 502, &fake_proc_stat(502, leader, 11), "");
         fake_proc_process(root.path(), 503, &fake_proc_stat(503, leader, 12), "");
-        GLOBAL_PROC_SCANS.store(0, Ordering::Relaxed);
-        PROC_READS.store(0, Ordering::Relaxed);
+        GLOBAL_PROC_SCANS.with(|scans| scans.set(0));
+        PROC_READS.with(|reads| reads.set(0));
 
         let descendants = linux_descendants_in(root.path(), leader);
         assert_eq!(descendants, vec![(502, 11), (503, 12)]);
-        assert_eq!(GLOBAL_PROC_SCANS.load(Ordering::Relaxed), 0);
-        assert!(PROC_READS.load(Ordering::Relaxed) > 0);
+        GLOBAL_PROC_SCANS.with(|scans| assert_eq!(scans.get(), 0));
+        PROC_READS.with(|reads| assert!(reads.get() > 0));
     }
 
     #[cfg(target_os = "linux")]
@@ -695,20 +705,39 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         let leader = 601;
         let task = root
+            .path()
             .join(leader.to_string())
             .join("task")
             .join(leader.to_string());
         fs::create_dir_all(&task).unwrap();
         fs::write(
-            root.join(leader.to_string()).join("stat"),
+            root.path().join(leader.to_string()).join("stat"),
             fake_proc_stat(leader, 1, 20),
         )
         .unwrap();
         fake_proc_process(root.path(), 602, &fake_proc_stat(602, leader, 21), "");
-        GLOBAL_PROC_SCANS.store(0, Ordering::Relaxed);
+        GLOBAL_PROC_SCANS.with(|scans| scans.set(0));
 
         assert_eq!(linux_descendants_in(root.path(), leader), vec![(602, 21)]);
-        assert_eq!(GLOBAL_PROC_SCANS.load(Ordering::Relaxed), 1);
+        GLOBAL_PROC_SCANS.with(|scans| assert_eq!(scans.get(), 1));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_descendants_ignores_exited_descendant_task_race() {
+        let root = tempfile::tempdir().unwrap();
+        let leader = 701;
+        fake_proc_process(root.path(), leader, &fake_proc_stat(leader, 1, 30), "702");
+        fs::create_dir_all(root.path().join("702")).unwrap();
+        fs::write(
+            root.path().join("702").join("stat"),
+            fake_proc_stat(702, leader, 31),
+        )
+        .unwrap();
+        GLOBAL_PROC_SCANS.with(|scans| scans.set(0));
+
+        assert_eq!(linux_descendants_in(root.path(), leader), vec![(702, 31)]);
+        GLOBAL_PROC_SCANS.with(|scans| assert_eq!(scans.get(), 0));
     }
 
     #[cfg(target_os = "linux")]
