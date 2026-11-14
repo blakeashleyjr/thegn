@@ -73,12 +73,16 @@ fn ci_run_ref_id(entry: &CiLogEntry) -> String {
     format!("ci-run:{}:{}", entry.worktree, entry.run_id)
 }
 
+fn parse_run_id(id: &str) -> Option<u64> {
+    id.parse().ok()
+}
+
 fn notify_ci_run_failed(db: &thegn_core::db::Db, entry: &CiLogEntry) {
     let kind = thegn_core::notification::NotificationKind::CiRunFailed.as_str();
     let source_ref = ci_run_ref_id(entry);
     let notifications = db.get_all_notifications(usize::MAX).unwrap_or_default();
     let prefix = format!("ci-run:{}:", entry.worktree);
-    let this_run = entry.run_id.parse::<u64>().ok();
+    let this_run = parse_run_id(&entry.run_id);
     let newer_exists = notifications.iter().any(|n| {
         n.kind.as_str() == kind
             && n.worktree_path == entry.worktree
