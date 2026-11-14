@@ -1264,13 +1264,7 @@ fn worktree_uses_main_env(main_env: &str, is_root_checkout: bool, on_primary_bra
     !main_env.trim().is_empty() && (is_root_checkout || on_primary_branch)
 }
 
-/// Whether `worktree` is checked out on the repo's PRIMARY branch (origin/HEAD,
-/// e.g. `main`/`master`). Best-effort and gated to a LOCAL checkout: a remote /
-/// provider worktree is never the primary (the main checkout lives on the host)
-/// and probing its branch over the control plane would be expensive, so it reads
-/// as non-primary — exactly the "feature branches → `default_env`" outcome. Only
-/// invoked when `[sandbox] main_env` is set (see caller), so these two git reads
-/// never run for repos that haven't opted in.
+/// Bound on the primary-branch memo and on each log-dedupe set.
 const PRIMARY_BRANCH_MEMO_CAP: usize = 256;
 
 #[derive(Clone, PartialEq, Eq)]
@@ -1384,8 +1378,11 @@ fn is_spawn_failure(error: &GitTextError) -> bool {
     matches!(error, GitTextError::Failed(GitOutcome::Spawn(_)))
 }
 
-fn is_default_branch_spawn_failure(error: &str) -> bool {
+fn is_transient_default_branch_failure(error: &str) -> bool {
     error.contains("could not spawn Git:")
+        || error.contains("Git command timed out")
+        || error.contains("Git command was cancelled")
+        || error.contains("Git supervision failed:")
 }
 
 fn log_primary_failure(worktree: &Path, why: &str) {
@@ -1412,6 +1409,13 @@ fn primary_branch_result(
     }
 }
 
+/// Whether `worktree` is checked out on the repo's PRIMARY branch (origin/HEAD,
+/// e.g. `main`/`master`). Best-effort and gated to a LOCAL checkout: a remote /
+/// provider worktree is never the primary (the main checkout lives on the host)
+/// and probing its branch over the control plane would be expensive, so it reads
+/// as non-primary — exactly the "feature branches → `default_env`" outcome. Only
+/// invoked when `[sandbox] main_env` is set (see caller), so these two git reads
+/// never run for repos that haven't opted in.
 fn worktree_on_primary_branch(repo_root: &Path, worktree: &Path, loc: &GitLoc) -> bool {
     if !matches!(loc, GitLoc::Local(_)) {
         return false;
@@ -1423,14 +1427,14 @@ fn worktree_on_primary_branch(repo_root: &Path, worktree: &Path, loc: &GitLoc) -
             "--short",
             "HEAD",
         ]);
-        let cacheable = !result.as_ref().is_some_and(is_spawn_failure);
+        let cacheable = !result.as_ref().is_err_and(is_spawn_failure);
         (result, cacheable)
     };
     let default_probe = || {
         let result = crate::worktree::default_branch_checked(repo_root);
         let cacheable = !result
             .as_ref()
-            .is_some_and(|error| is_default_branch_spawn_failure(error));
+            .is_err_and(|error| is_transient_default_branch_failure(error));
         (result, cacheable)
     };
     worktree_on_primary_branch_with_probe(repo_root, worktree, loc, &head_probe, &default_probe)
@@ -2407,6 +2411,10 @@ mod tests {
     fn primary_branch_transient_probe_failures_are_not_memoised() {
         let (repo, worktree) = primary_fixture();
         clear_primary_branch_memo();
+        primary_git(
+            repo.path(),
+            &["symbolic-ref", "--delete", "refs/remotes/origin/HEAD"],
+        );
         let loc = GitLoc::Local(worktree.path().to_path_buf());
         let calls = std::cell::Cell::new(0_u32);
         let head_probe = || (Ok("main".to_string()), true);
@@ -2432,6 +2440,33 @@ mod tests {
             &default_probe,
         ));
         assert_eq!(calls.get(), 2);
+    }
+
+    #[test]
+    fn primary_branch_transient_classifier() {
+        let cases = [
+            ("could not spawn Git: x", true),
+            (
+                "could not read origin HEAD in /r: Git command timed out",
+                true,
+            ),
+            (
+                "could not check branch main: Git command was cancelled",
+                true,
+            ),
+            ("Git supervision failed: y", true),
+            (
+                "could not read origin HEAD in /r: unexpected symref refs/x",
+                false,
+            ),
+        ];
+        for (error, expected) in cases {
+            assert_eq!(
+                is_transient_default_branch_failure(error),
+                expected,
+                "{error}"
+            );
+        }
     }
 
     #[test]
