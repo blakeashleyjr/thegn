@@ -107,7 +107,51 @@ struct SidecarRecord {
     container: String,
     prefix: Vec<String>,
     id: String,
+    #[serde(default)]
+    worktree: Option<String>,
+    #[serde(default)]
+    generation: Option<u64>,
+    #[serde(default)]
+    placement: Option<String>,
 }
+
+/// A sidecar record was written for a different worktree than the caller.
+#[derive(Debug)]
+pub struct SidecarWorktreeMismatch {
+    pub expected: String,
+    pub found: String,
+}
+
+impl std::fmt::Display for SidecarWorktreeMismatch {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "vpn: sidecar belongs to {} (caller worktree is {})",
+            self.found, self.expected
+        )
+    }
+}
+
+impl std::error::Error for SidecarWorktreeMismatch {}
+
+/// A sidecar record is older than the generation already observed for it.
+#[derive(Debug)]
+pub struct SidecarGenerationStale {
+    pub found: u64,
+    pub stored: u64,
+}
+
+impl std::fmt::Display for SidecarGenerationStale {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "vpn: stale sidecar generation {} (stored generation is {})",
+            self.found, self.stored
+        )
+    }
+}
+
+impl std::error::Error for SidecarGenerationStale {}
 
 /// What the provider produced — consumed by `thegn_core::sandbox` to splice
 /// the tunnel into the worktree sandbox. Fields compose: a userspace sidecar
@@ -290,6 +334,18 @@ pub trait VpnProvider: Send + Sync {
     fn sidecar_plan(&self, container: &str) -> Result<SidecarPlan>;
     /// Bring the tunnel up and return the attachment the sandbox splices in.
     fn up(&self, rt: &OciRuntime, container: &str) -> Result<Attachment>;
+    /// Bring the tunnel up while binding its record to the owning worktree.
+    /// Implementations without sidecar records inherit the compatibility path.
+    fn up_for_worktree(
+        &self,
+        rt: &OciRuntime,
+        container: &str,
+        worktree: &Path,
+        placement: &str,
+    ) -> Result<Attachment> {
+        let _ = (worktree, placement);
+        self.up(rt, container)
+    }
     /// Block until ready or `timeout` elapses.
     fn ready(&self, rt: &OciRuntime, container: &str, timeout: Duration) -> Result<()>;
     /// Tear the tunnel down (de-register ephemeral node, then the sidecar is
@@ -337,11 +393,27 @@ impl VpnProvider for BuiltinProvider<'_> {
     }
 
     fn up(&self, rt: &OciRuntime, container: &str) -> Result<Attachment> {
+        self.up_for_worktree(
+            rt,
+            container,
+            &std::env::current_dir().context("vpn: read the sidecar worktree")?,
+            "local",
+        )
+    }
+
+    fn up_for_worktree(
+        &self,
+        rt: &OciRuntime,
+        container: &str,
+        worktree: &Path,
+        placement: &str,
+    ) -> Result<Attachment> {
         let plan = self.sidecar_plan(container)?;
         run_sidecar(rt, &plan)?;
         // Fail closed if identity cannot be recorded. The host launch path
         // rolls back failed up calls.
-        record_sidecar(rt, container).context("vpn: record the sidecar runtime")?;
+        record_sidecar_for_worktree(rt, container, worktree, placement)
+            .context("vpn: record the sidecar runtime")?;
         Ok(Attachment {
             join_netns: matches!(self.spec.mode, VpnMode::Sidecar | VpnMode::Proxy)
                 .then(|| container.to_string()),
@@ -368,17 +440,50 @@ impl VpnProvider for BuiltinProvider<'_> {
 }
 
 /// Inspect and persist the exact runtime and immutable id for a started sidecar.
+#[cfg(test)]
 fn record_sidecar(rt: &OciRuntime, container: &str) -> Result<RecordedSidecar> {
+    let worktree = std::env::current_dir().context("vpn: read the sidecar worktree")?;
+    record_sidecar_for_worktree(rt, container, &worktree, "local")
+}
+
+fn record_sidecar_for_worktree(
+    rt: &OciRuntime,
+    container: &str,
+    worktree: &Path,
+    placement: &str,
+) -> Result<RecordedSidecar> {
     validate_container_name(container)?;
     if rt.prefix.is_empty() {
         bail!("vpn: sidecar {container} has no runtime prefix to record");
     }
     let id = sidecar_container_id(rt, container)?;
+    let worktree = std::fs::canonicalize(worktree)
+        .or_else(|_| std::path::absolute(worktree))
+        .with_context(|| format!("vpn: resolve sidecar worktree {}", worktree.display()))?
+        .to_string_lossy()
+        .into_owned();
+    if placement != "local" && placement.trim().is_empty() {
+        bail!("vpn: sidecar {container} has an empty placement");
+    }
+    let previous_generation = sidecar_record_dir_existing()?
+        .and_then(|_| read_sidecar_record(container).ok())
+        .and_then(|record| record.generation);
+    let generation = previous_generation
+        .map(|generation| {
+            generation
+                .checked_add(1)
+                .context("vpn: sidecar record generation exhausted")
+        })
+        .transpose()?
+        .unwrap_or(1);
     let record = SidecarRecord {
         version: 1,
         container: container.to_string(),
         prefix: rt.prefix.clone(),
         id: id.clone(),
+        worktree: Some(worktree),
+        generation: Some(generation),
+        placement: Some(placement.into()),
     };
     let bytes = serde_json::to_vec(&record).context("vpn: encode sidecar runtime record")?;
     if bytes.len() > SIDECAR_RECORD_MAX_BYTES {
@@ -395,7 +500,45 @@ fn record_sidecar(rt: &OciRuntime, container: &str) -> Result<RecordedSidecar> {
 
 /// Read a bounded, no-follow sidecar runtime record and validate every field.
 pub fn recorded_sidecar(container: &str) -> Result<RecordedSidecar> {
+    recorded_sidecar_with_context(container, None, None)
+}
+
+/// Read a sidecar record and bind it to the caller's worktree. `generation`
+/// lets a caller fence a previously captured record against a newer write.
+pub fn recorded_sidecar_for_worktree(
+    container: &str,
+    worktree: &Path,
+    generation: Option<u64>,
+) -> Result<RecordedSidecar> {
+    let caller = std::fs::canonicalize(worktree)
+        .or_else(|_| std::path::absolute(worktree))
+        .with_context(|| format!("vpn: resolve caller worktree {}", worktree.display()))?;
+    recorded_sidecar_with_context(container, Some(&caller), generation)
+}
+
+fn recorded_sidecar_with_context(
+    container: &str,
+    caller_worktree: Option<&Path>,
+    expected_generation: Option<u64>,
+) -> Result<RecordedSidecar> {
     validate_container_name(container)?;
+    let parsed = read_sidecar_record(container)?;
+    if parsed.version != 1
+        || parsed.container != container
+        || parsed.prefix.is_empty()
+        || !valid_container_id(&parsed.id)
+        || !valid_sidecar_record_metadata(&parsed)
+    {
+        bail!("vpn: malformed runtime record for sidecar {container}");
+    }
+    validate_sidecar_record_context(&parsed, caller_worktree, expected_generation)?;
+    Ok(RecordedSidecar {
+        runtime: OciRuntime::new(parsed.prefix),
+        id: parsed.id,
+    })
+}
+
+fn read_sidecar_record(container: &str) -> Result<SidecarRecord> {
     let name = sidecar_record_name(container);
     let dir = match sidecar_record_dir_existing()? {
         Some(dir) => dir,
@@ -422,19 +565,48 @@ pub fn recorded_sidecar(container: &str) -> Result<RecordedSidecar> {
     if bytes.len() > SIDECAR_RECORD_MAX_BYTES {
         bail!("vpn: malformed runtime record for sidecar {container}");
     }
-    let parsed: SidecarRecord = serde_json::from_slice(&bytes)
-        .with_context(|| format!("vpn: malformed runtime record for sidecar {container}"))?;
-    if parsed.version != 1
-        || parsed.container != container
-        || parsed.prefix.is_empty()
-        || !valid_container_id(&parsed.id)
-    {
-        bail!("vpn: malformed runtime record for sidecar {container}");
+    serde_json::from_slice(&bytes)
+        .with_context(|| format!("vpn: malformed runtime record for sidecar {container}"))
+}
+
+fn valid_sidecar_record_metadata(record: &SidecarRecord) -> bool {
+    match (&record.worktree, record.generation, &record.placement) {
+        (None, None, None) => true,
+        (Some(worktree), Some(generation), Some(placement)) => {
+            !worktree.is_empty()
+                && generation > 0
+                && (placement == "local" || !placement.trim().is_empty())
+        }
+        _ => false,
     }
-    Ok(RecordedSidecar {
-        runtime: OciRuntime::new(parsed.prefix),
-        id: parsed.id,
-    })
+}
+
+fn validate_sidecar_record_context(
+    record: &SidecarRecord,
+    caller_worktree: Option<&Path>,
+    expected_generation: Option<u64>,
+) -> Result<()> {
+    if let (Some(found), Some(expected)) = (&record.worktree, caller_worktree) {
+        let expected = expected.to_string_lossy();
+        if found != expected.as_ref() {
+            return Err(anyhow::Error::new(SidecarWorktreeMismatch {
+                expected: expected.into_owned(),
+                found: found.clone(),
+            }));
+        }
+    }
+    let Some(generation) = record.generation else {
+        return Ok(());
+    };
+    if let Some(expected) = expected_generation
+        && generation < expected
+    {
+        return Err(anyhow::Error::new(SidecarGenerationStale {
+            found: generation,
+            stored: expected,
+        }));
+    }
+    Ok(())
 }
 
 fn sidecar_container_id(rt: &OciRuntime, container: &str) -> Result<String> {
