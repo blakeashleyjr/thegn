@@ -4299,7 +4299,7 @@ mod tests {
                     async move { files.restore(&path, &previous) }
                 }
             },
-            { move || async move { files.remove_previous(&previous) } },
+            move || async move { files.remove_previous(&previous) },
         )
         .await
     }
