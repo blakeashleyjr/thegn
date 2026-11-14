@@ -601,14 +601,44 @@ impl VpsProvider {
             .await
     }
 
+    async fn get_json_priority(&self, url: &str) -> Result<serde_json::Value> {
+        self.get_json_timeout_priority(url, crate::provider::CONTROL_TIMEOUT)
+            .await
+    }
+
     async fn get_json_timeout(
         &self,
         url: &str,
         timeout: std::time::Duration,
     ) -> Result<serde_json::Value> {
+        self.get_json_timeout_with_priority(url, timeout, false)
+            .await
+    }
+
+    async fn get_json_timeout_priority(
+        &self,
+        url: &str,
+        timeout: std::time::Duration,
+    ) -> Result<serde_json::Value> {
+        self.get_json_timeout_with_priority(url, timeout, true)
+            .await
+    }
+
+    async fn get_json_timeout_with_priority(
+        &self,
+        url: &str,
+        timeout: std::time::Duration,
+        priority: bool,
+    ) -> Result<serde_json::Value> {
         let base = self.spec.validated_api_base()?;
         let authority = crate::provider::authority_key(&base)?;
-        let _permit = crate::provider::CONTROL_GATE.acquire(&authority).await?;
+        let _permit = if priority {
+            crate::provider::CONTROL_GATE
+                .acquire_priority(&authority)
+                .await?
+        } else {
+            crate::provider::CONTROL_GATE.acquire(&authority).await?
+        };
         let resp = self
             .client
             .get(url)
@@ -657,18 +687,33 @@ impl VpsProvider {
 
     /// All thegn-managed instances (label-filtered server-side), with
     /// ips/creation times — complete or Err, for the reaper's view.
-    pub async fn list_detailed(&self) -> Result<Vec<VpsInstance>> {
+    async fn list_detailed_with(&self, priority: bool) -> Result<Vec<VpsInstance>> {
         let base = self.spec.validated_api_base()?;
         let base = base.as_str();
         let shaper = self.shaper();
         collect_pages(
             move |page| {
-                Box::pin(async move { self.get_json(&shaper.list_page_url(base, page)).await })
+                Box::pin(async move {
+                    let url = shaper.list_page_url(base, page);
+                    if priority {
+                        self.get_json_priority(&url).await
+                    } else {
+                        self.get_json(&url).await
+                    }
+                })
             },
             |body, page| shaper.parse_server_page(body, page),
             |server: &VpsInstance| server.id.clone(),
         )
         .await
+    }
+
+    pub async fn list_detailed(&self) -> Result<Vec<VpsInstance>> {
+        self.list_detailed_with(false).await
+    }
+
+    pub async fn list_detailed_priority(&self) -> Result<Vec<VpsInstance>> {
+        self.list_detailed_with(true).await
     }
 
     /// Find one managed instance by name.
@@ -681,10 +726,19 @@ impl VpsProvider {
             .find(|s| s.name == name))
     }
 
+    async fn find_by_name_priority(&self, name: &str) -> Result<Option<VpsInstance>> {
+        registry::checked_name(name)?;
+        Ok(self
+            .list_detailed_priority()
+            .await?
+            .into_iter()
+            .find(|s| s.name == name))
+    }
+
     /// Confirm that a deleted instance is absent from the complete managed inventory.
     async fn confirm_absent(&self, name: &str, instance_id: &str) -> Result<()> {
         for check_attempt in 0..DESTROY_ATTEMPTS {
-            let inventory = self.list_detailed().await.map_err(|error| {
+            let inventory = self.list_detailed_priority().await.map_err(|error| {
                 tracing::debug!(
                     target: "thegn::vps",
                     %error,
@@ -1316,7 +1370,7 @@ impl RemoteProvider for VpsProvider {
             let instance_id = match record.filter(|r| !r.instance_id.is_empty()) {
                 Some(r) => Some(r.instance_id),
                 None => self
-                    .find_by_name(id)
+                    .find_by_name_priority(id)
                     .await
                     .context(
                         "vps: cannot confirm whether the instance still exists (provider inventory lookup failed); keeping the ledger record and SSH custody",
@@ -1342,7 +1396,9 @@ impl RemoteProvider for VpsProvider {
             let mut last_status = None;
             for attempt in 0..DESTROY_ATTEMPTS {
                 let status = {
-                    let _permit = crate::provider::CONTROL_GATE.acquire(&authority).await?;
+                    let _permit = crate::provider::CONTROL_GATE
+                        .acquire_priority(&authority)
+                        .await?;
                     self.client
                         .delete(&url)
                         .bearer_auth(&self.spec.token)

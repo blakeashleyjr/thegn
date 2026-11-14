@@ -160,8 +160,9 @@ fn reap_unambiguous(
         }
     };
     let ours = vps::host_label();
-    let instances = match crate::agent::block_on_provider(|| async { probe.list_detailed().await })
-    {
+    let instances = match crate::agent::block_on_provider(|| async {
+        probe.list_detailed_priority().await
+    }) {
         Ok(list) => list,
         Err(error) => {
             kept.keep(
