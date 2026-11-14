@@ -2451,7 +2451,7 @@ static NO_CANCEL: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool:
 
 /// Run Git in `worktree` under `GitPolicy::read(GITLOC_READ_DEADLINE)`; trimmed UTF-8 text.
 /// Empty success is `Ok("")`; every other outcome is a typed error (never `None`).
-fn git_text_local(
+pub(crate) fn git_text_local(
     worktree: &std::path::Path,
     args: &[&str],
 ) -> std::result::Result<String, thegn_core::git_run::GitTextError> {

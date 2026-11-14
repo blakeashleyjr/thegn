@@ -406,7 +406,7 @@ fn plan_children_covered(plan: &[crate::git_watch::WatchPlanEntry], ignore: &Ign
 /// No tracked file matches an ignore rule (`git ls-files -ci`). Any failure to
 /// establish that counts as "not established".
 fn no_tracked_ignored(cwd: &Path) -> bool {
-    thegn_core::util::git_out_allow_empty(
+    let result = crate::cmd::dispatch::git_text_local(
         cwd,
         &[
             "ls-files",
@@ -415,8 +415,24 @@ fn no_tracked_ignored(cwd: &Path) -> bool {
             "--ignored",
             "--exclude-standard",
         ],
-    )
-    .is_some_and(|out| out.is_empty())
+    );
+    match result {
+        Ok(out) => out.is_empty(),
+        Err(error) => {
+            trace_git_read_failure(cwd, "ls-files --ignored", &error);
+            false
+        }
+    }
+}
+
+fn trace_git_read_failure(cwd: &Path, command: &str, error: &thegn_core::git_run::GitTextError) {
+    tracing::debug!(
+        target: "thegn::diff",
+        worktree = %cwd.display(),
+        command,
+        error = %error,
+        "diff watcher Git read failed; keeping the conservative fallback"
+    );
 }
 
 /// Where a watcher sends its refresh requests, and how it wakes the loop.
@@ -629,11 +645,17 @@ fn collect_nested_gitignores(dir: &Path, rules: &mut IgnoreRules, visited: &mut 
 }
 
 fn global_excludes_path(cwd: &Path) -> Option<PathBuf> {
-    if let Some(path) =
-        thegn_core::util::git_out(cwd, &["config", "--path", "--get", "core.excludesFile"])
-    {
-        let path = PathBuf::from(path.trim());
-        return (!path.as_os_str().is_empty()).then_some(path);
+    match crate::cmd::dispatch::git_text_local(
+        cwd,
+        &["config", "--path", "--get", "core.excludesFile"],
+    ) {
+        Ok(path) => {
+            let path = PathBuf::from(path);
+            if !path.as_os_str().is_empty() {
+                return Some(path);
+            }
+        }
+        Err(error) => trace_git_read_failure(cwd, "config core.excludesFile", &error),
     }
     let config = std::env::var_os("XDG_CONFIG_HOME")
         .map(PathBuf::from)
@@ -681,14 +703,28 @@ fn build_ignore_rules(
 }
 
 fn resolve_git_dirs(cwd: &Path) -> (Option<PathBuf>, Option<PathBuf>) {
-    let git_dir =
-        thegn_core::util::git_out(cwd, &["rev-parse", "--path-format=absolute", "--git-dir"])
-            .map(PathBuf::from);
-    let common_dir = thegn_core::util::git_out(
+    let git_dir = match crate::cmd::dispatch::git_text_local(
+        cwd,
+        &["rev-parse", "--path-format=absolute", "--git-dir"],
+    ) {
+        Ok(path) if !path.is_empty() => Some(PathBuf::from(path)),
+        Ok(_) => None,
+        Err(error) => {
+            trace_git_read_failure(cwd, "rev-parse --git-dir", &error);
+            None
+        }
+    };
+    let common_dir = match crate::cmd::dispatch::git_text_local(
         cwd,
         &["rev-parse", "--path-format=absolute", "--git-common-dir"],
-    )
-    .map(PathBuf::from);
+    ) {
+        Ok(path) if !path.is_empty() => Some(PathBuf::from(path)),
+        Ok(_) => None,
+        Err(error) => {
+            trace_git_read_failure(cwd, "rev-parse --git-common-dir", &error);
+            None
+        }
+    };
     (git_dir, common_dir)
 }
 
@@ -1964,6 +2000,21 @@ mod tests {
             },
         );
         assert!(w.is_none() || print(&base.join("nope")).is_none());
+    }
+
+    #[test]
+    fn a_non_repo_cwd_withholds_the_change_generation_claim() {
+        let base = scratch("non-repo");
+        let (tx, _rx) = tokio_mpsc::unbounded_channel();
+        let _watcher = build_diff_watcher(
+            &base,
+            RefreshSink {
+                tx,
+                wake: Arc::new(|| {}),
+                revive: None,
+            },
+        );
+        assert!(print(&base).is_none());
     }
 
     #[test]
