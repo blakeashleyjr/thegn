@@ -72,7 +72,7 @@ pub(crate) fn spawn_refresh_ticker(
     tx: tokio_mpsc::UnboundedSender<RefreshKind>,
     stats_tx: tokio_mpsc::UnboundedSender<StatsTick>,
     container_tx: tokio_mpsc::UnboundedSender<ContainerRefresh>,
-    daemon_tx: tokio_mpsc::UnboundedSender<crate::chrome::DaemonStatus>,
+    daemon_slot: crate::snapshot_slot::SnapshotSlot<crate::chrome::DaemonStatus>,
     stats_interval_ms: std::sync::Arc<std::sync::atomic::AtomicU64>,
     stats_live: std::sync::Arc<std::sync::atomic::AtomicBool>,
     // Set while a per-container-stats surface is visible; gates the expensive
@@ -93,7 +93,7 @@ pub(crate) fn spawn_refresh_ticker(
         LiveIo {
             stats_tx,
             container_tx,
-            daemon_tx,
+            daemon_slot,
             stats_interval_ms,
             stats_live,
             containers_live,
@@ -630,7 +630,7 @@ fn spawn_worker_inner(
 struct LiveIo {
     stats_tx: tokio_mpsc::UnboundedSender<StatsTick>,
     container_tx: tokio_mpsc::UnboundedSender<ContainerRefresh>,
-    daemon_tx: tokio_mpsc::UnboundedSender<crate::chrome::DaemonStatus>,
+    daemon_slot: crate::snapshot_slot::SnapshotSlot<crate::chrome::DaemonStatus>,
     stats_interval_ms: Arc<AtomicU64>,
     stats_live: Arc<AtomicBool>,
     containers_live: Arc<AtomicBool>,
@@ -748,7 +748,8 @@ impl TickerIo for LiveIo {
 
     fn prime_daemon(&mut self) {
         if let Some(status) = self.read_daemon() {
-            drop(self.daemon_tx.send(status));
+            let bytes = daemon_status_bytes(&status);
+            self.daemon_slot.publish(0, status, bytes);
         }
     }
 
@@ -763,8 +764,11 @@ impl TickerIo for LiveIo {
 
     fn send_daemon(&mut self) -> Result<bool, ()> {
         if let Some(status) = self.read_daemon() {
-            self.daemon_tx.send(status).map_err(|_| ())?;
-            Ok(true)
+            let bytes = daemon_status_bytes(&status);
+            self.daemon_slot.publish(0, status, bytes);
+            // SnapshotSlot owns the empty-to-full wake; do not pulse again
+            // through the ticker's aggregate notification path.
+            Ok(false)
         } else {
             Ok(false)
         }
@@ -839,6 +843,17 @@ impl TickerIo for LiveIo {
         self.container_tx.send(refresh).map_err(|_| ())?;
         Ok(true)
     }
+}
+
+fn daemon_status_bytes(status: &crate::chrome::DaemonStatus) -> usize {
+    std::mem::size_of_val(status)
+        + status.version.len()
+        + status.hostname.len()
+        + status.endpoint.len()
+        + status.tcp_addr.len()
+        + status.control_origin.len()
+        + status.daemon_id.len()
+        + status.scope.len()
 }
 
 #[cfg(test)]
