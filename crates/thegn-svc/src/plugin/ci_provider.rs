@@ -677,7 +677,7 @@ done
         .unwrap();
         let marker = thegn_core::ci_log::REDACTION_MARKER;
 
-        assert_eq!(log.text, format!("ordinary\n{marker}\n{marker}"));
+        assert_eq!(log.text, format!("{marker}\n{marker}\n{marker}"));
         assert!(!log.truncated);
     }
 
