@@ -9448,9 +9448,10 @@ async fn event_loop<T: Terminal>(
         let clipboard_outcome = writer.take_clipboard_outcome();
         match writer.take_status() {
             crate::frame_writer::WriterStatus::Ok => {}
-            crate::frame_writer::WriterStatus::Transient => {
+            crate::frame_writer::WriterStatus::Transient(kind) => {
                 tracing::warn!(
                     target: "thegn::frame",
+                    kind = ?kind,
                     "transient terminal write error (writer thread); forcing full repaint"
                 );
                 full_repaint = true;
@@ -9468,13 +9469,17 @@ async fn event_loop<T: Terminal>(
                 return Err(anyhow::anyhow!("terminal writer failed: {e}{note}"));
             }
         }
-        if let Some(outcome) = clipboard_outcome {
+        if let Some(outcome) = clipboard_outcome
+            && (outcome != crate::frame_writer::ClipboardOutcome::Committed
+                || model.status.is_empty())
+        {
             model.status = crate::frame_writer::clipboard_outcome_status(outcome).to_string();
             dirty = true;
         }
         // OOB capacity releases pulse the existing terminal waker; retrying
         // here keeps this path independent of cell composition and timers.
-        pending_preview_oob.retry(|bytes| writer.try_submit_oob(bytes));
+        pending_preview_oob
+            .retry(|bytes| writer.try_submit_oob(crate::frame_writer::OobKind::Graphics, bytes));
         let corner_visible = corner.is_some()
             && corner_kitty
             && !corner_occluded
@@ -9484,9 +9489,12 @@ async fn event_loop<T: Terminal>(
                 mouse_sel.is_some(),
                 replay.is_some(),
             );
-        pending_corner_oob.retry(corner_visible, |bytes| writer.try_submit_oob(bytes));
+        pending_corner_oob.retry_typed(corner_visible, |kind, bytes| {
+            writer.try_submit_oob(kind, bytes)
+        });
         pending_clipboard_oob.retry(|bytes| writer.try_submit_host_clipboard(bytes));
-        pending_bell.retry(|bytes| writer.try_submit_oob(bytes));
+        pending_bell
+            .retry(|bytes| writer.try_submit_oob(crate::frame_writer::OobKind::Bell, bytes));
         if let Some(bytes) = pending_clipboard_oob.take_oversized() {
             model.status = crate::preview_retry::oversized_copy_status(bytes);
             dirty = true;
@@ -9502,7 +9510,9 @@ async fn event_loop<T: Terminal>(
             && dirty_panes.is_empty()
         {
             let input_pending = crate::frame_write::pty_input_pending(buf, &mut pending_input);
-            pending_ready_marker.retry(input_pending, |bytes| writer.try_submit_oob(bytes));
+            pending_ready_marker.retry(input_pending, |bytes| {
+                writer.try_submit_oob(crate::frame_writer::OobKind::Marker, bytes)
+            });
         }
         // Keep the drawer geometry that `compute_chrome` reserves in sync with
         // the live drawer state. When the reservation changes (any open/close
@@ -10350,7 +10360,8 @@ async fn event_loop<T: Terminal>(
                 // at the new size on its next frame.
                 if corner_kitty {
                     pending_corner_oob.require_delete();
-                    pending_corner_oob.retry(false, |bytes| writer.try_submit_oob(bytes));
+                    pending_corner_oob
+                        .retry_typed(false, |kind, bytes| writer.try_submit_oob(kind, bytes));
                     corner_gfx.clear();
                 }
                 corner_relay.reset();
@@ -16885,7 +16896,9 @@ async fn event_loop<T: Terminal>(
             // right after the frame in the writer FIFO. BEL neither moves the
             // cursor nor prints, so it is safe between frames.
             if notify_state.take_bell() {
-                pending_bell.offer(|bytes| writer.try_submit_oob(bytes));
+                pending_bell.offer(|bytes| {
+                    writer.try_submit_oob(crate::frame_writer::OobKind::Bell, bytes)
+                });
             }
             // Corner kitty images ride ON TOP of the cell frame: emit the queued,
             // repositioned graphics AFTER the diff — the writer FIFO orders them
@@ -16918,10 +16931,13 @@ async fn event_loop<T: Terminal>(
                 }
                 corner_occluded = occluded_now;
                 if draw.is_empty() {
-                    pending_corner_oob.retry(!occluded_now, |bytes| writer.try_submit_oob(bytes));
+                    pending_corner_oob.retry_typed(!occluded_now, |kind, bytes| {
+                        writer.try_submit_oob(kind, bytes)
+                    });
                 } else {
-                    pending_corner_oob
-                        .offer_draw(draw, !occluded_now, |bytes| writer.try_submit_oob(bytes));
+                    pending_corner_oob.offer_draw_typed(draw, !occluded_now, |kind, bytes| {
+                        writer.try_submit_oob(kind, bytes)
+                    });
                 }
             } else {
                 corner_gfx.clear();
@@ -16933,7 +16949,9 @@ async fn event_loop<T: Terminal>(
                 let open_preview = panel_ui.file_preview.as_ref().map(|fp| fp.path.as_str());
                 let blob =
                     preview_gfx.frame(chrome.panel, open_preview, overlays.any(), corner_kitty);
-                pending_preview_oob.offer(blob, |bytes| writer.try_submit_oob(bytes));
+                pending_preview_oob.offer(blob, |bytes| {
+                    writer.try_submit_oob(crate::frame_writer::OobKind::Graphics, bytes)
+                });
             }
             dirty = false;
             last_flush_at = std::time::Instant::now();
@@ -16974,7 +16992,7 @@ async fn event_loop<T: Terminal>(
                         {
                             Err(bytes)
                         } else {
-                            writer.try_submit_oob(bytes)
+                            writer.try_submit_oob(crate::frame_writer::OobKind::Marker, bytes)
                         }
                     },
                 );
@@ -25601,8 +25619,9 @@ async fn event_loop<T: Terminal>(
                                     // and reset the relay.
                                     if corner_kitty {
                                         pending_corner_oob.require_delete();
-                                        pending_corner_oob
-                                            .retry(false, |bytes| writer.try_submit_oob(bytes));
+                                        pending_corner_oob.retry_typed(false, |kind, bytes| {
+                                            writer.try_submit_oob(kind, bytes)
+                                        });
                                     }
                                     corner_relay.reset();
                                     corner_gfx.clear();
