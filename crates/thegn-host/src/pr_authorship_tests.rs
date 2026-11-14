@@ -218,8 +218,9 @@ fn unreadable_git_checkout_holds_with_an_explicit_refusal() {
             "github",
             7,
             &fixture.pr,
-        ),
-        Err(HELD)
+        )
+        .err(),
+        Some(HELD)
     );
 }
 
