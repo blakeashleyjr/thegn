@@ -778,6 +778,12 @@ fn run_bounded_log_within(
 }
 
 /// Stateful push collector shared by bounded subprocess streaming and the reader wrapper.
+///
+/// A provider tail may begin after a PEM BEGIN line. If an END marker arrives
+/// before this collector has seen BEGIN, all still-retained preceding lines
+/// are conservatively replaced with redaction markers. Lines already evicted
+/// by the bounds cannot be recovered and are intentionally outside this
+/// single-collector policy.
 struct LogCollector {
     line: Vec<u8>,
     lines: VecDeque<String>,
@@ -786,6 +792,8 @@ struct LogCollector {
     discard_line: bool,
     discard_line_last_marker: Option<bool>,
     in_pem: bool,
+    seen_begin: bool,
+    unmatched_end_redacted: bool,
     marker_tail: Vec<u8>,
 }
 
@@ -799,8 +807,31 @@ impl LogCollector {
             discard_line: false,
             discard_line_last_marker: None,
             in_pem: false,
+            seen_begin: false,
+            unmatched_end_redacted: false,
             marker_tail: Vec::with_capacity(b"-----BEGIN ".len()),
         }
+    }
+
+    fn redact_retained_lines_once(&mut self) {
+        redact_retained_lines_once(
+            &mut self.lines,
+            &mut self.kept_bytes,
+            &mut self.unmatched_end_redacted,
+        );
+    }
+
+    fn finish_discarded_line(&mut self) {
+        if let Some(begin) = self.discard_line_last_marker {
+            if begin {
+                self.seen_begin = true;
+            } else if !self.seen_begin {
+                self.redact_retained_lines_once();
+            }
+            self.in_pem = begin;
+        }
+        self.discard_line_last_marker = None;
+        self.marker_tail.clear();
     }
 
     fn feed(&mut self, bytes: &[u8]) {
@@ -811,6 +842,7 @@ impl LogCollector {
             }
             if self.marker_tail.ends_with(b"-----BEGIN ") {
                 self.in_pem = true;
+                self.seen_begin = true;
                 self.discard_line_last_marker = Some(true);
             } else if self.marker_tail.ends_with(b"-----END ") {
                 self.in_pem = false;
@@ -819,35 +851,31 @@ impl LogCollector {
             if self.discard_line {
                 if byte == b'\n' {
                     self.discard_line = false;
-                    if let Some(begin) = self.discard_line_last_marker {
-                        self.in_pem = begin;
-                    }
-                    self.discard_line_last_marker = None;
-                    self.marker_tail.clear();
+                    self.finish_discarded_line();
                     self.truncated = true;
                 }
                 continue;
             }
-            self.line.push(byte);
-            if self.line.len() > PROVIDER_LOG_MAX_BYTES {
+            if self.line.len() >= PROVIDER_LOG_MAX_BYTES {
                 self.line.clear();
                 self.discard_line = true;
                 self.truncated = true;
                 if byte == b'\n' {
                     self.discard_line = false;
-                    if let Some(begin) = self.discard_line_last_marker {
-                        self.in_pem = begin;
-                    }
-                    self.discard_line_last_marker = None;
-                    self.marker_tail.clear();
+                    self.finish_discarded_line();
                 }
-            } else if byte == b'\n' {
+                continue;
+            }
+            self.line.push(byte);
+            if byte == b'\n' {
                 push_log_line(
                     &mut self.lines,
                     &mut self.kept_bytes,
                     &self.line,
                     &mut self.truncated,
                     &mut self.in_pem,
+                    &mut self.seen_begin,
+                    &mut self.unmatched_end_redacted,
                 );
                 self.line.clear();
                 self.discard_line_last_marker = None;
@@ -857,6 +885,9 @@ impl LogCollector {
     }
 
     fn finish(mut self) -> (String, bool) {
+        if self.discard_line {
+            self.finish_discarded_line();
+        }
         if !self.line.is_empty() && !self.discard_line {
             push_log_line(
                 &mut self.lines,
@@ -864,6 +895,8 @@ impl LogCollector {
                 &self.line,
                 &mut self.truncated,
                 &mut self.in_pem,
+                &mut self.seen_begin,
+                &mut self.unmatched_end_redacted,
             );
         }
         (self.lines.into_iter().collect(), self.truncated)
@@ -891,12 +924,19 @@ fn push_log_line(
     line: &[u8],
     truncated: &mut bool,
     in_pem: &mut bool,
+    seen_begin: &mut bool,
+    unmatched_end_redacted: &mut bool,
 ) {
     let Ok(line) = std::str::from_utf8(line) else {
         *truncated = true;
         return;
     };
-    let line = thegn_core::ci_log::redact_stream_line(line.as_bytes(), in_pem);
+    let (line, marker) = thegn_core::ci_log::redact_stream_line_tracked(line.as_bytes(), in_pem);
+    if marker == Some(true) {
+        *seen_begin = true;
+    } else if marker == Some(false) && !*seen_begin && !*unmatched_end_redacted {
+        redact_retained_lines_once(lines, kept_bytes, unmatched_end_redacted);
+    }
     let len = line.len();
     if len > PROVIDER_LOG_MAX_BYTES {
         *truncated = true;
@@ -910,6 +950,30 @@ fn push_log_line(
             *truncated = true;
         }
     }
+}
+
+fn redact_retained_lines_once(
+    lines: &mut VecDeque<String>,
+    kept_bytes: &mut usize,
+    already_redacted: &mut bool,
+) {
+    if *already_redacted {
+        return;
+    }
+    for line in lines.iter_mut() {
+        let newline = if line.ends_with("\r\n") {
+            "\r\n"
+        } else if line.ends_with('\n') {
+            "\n"
+        } else if line.ends_with('\r') {
+            "\r"
+        } else {
+            ""
+        };
+        *line = format!("{}{newline}", thegn_core::ci_log::REDACTION_MARKER);
+    }
+    *kept_bytes = lines.iter().map(String::len).sum();
+    *already_redacted = true;
 }
 
 fn nonempty(s: &serde_json::Value, key: &str) -> Option<String> {
@@ -3119,6 +3183,106 @@ mod tests {
         assert!(truncated);
         assert!(!tail.contains("SYNTHETIC_KEY_BODY"));
         assert!(tail.contains("ordinary line"));
+    }
+
+    #[test]
+    fn collector_redacts_retained_prefix_before_an_unmatched_end() {
+        let input = concat!(
+            "SYNTHETIC_UNKNOWN_PREFIX_SECRET\r\n",
+            "ordinary diagnostic\r\n",
+            "-----END PRIVATE KEY-----\r\n",
+            "after\r\n",
+        );
+        let (text, truncated) = collect_log(input.as_bytes()).unwrap();
+        let marker = thegn_core::ci_log::REDACTION_MARKER;
+
+        assert_eq!(
+            text,
+            format!("{marker}\r\n{marker}\r\n{marker}\r\nafter\r\n")
+        );
+        assert!(!truncated);
+    }
+
+    #[test]
+    fn collector_unmatched_end_redaction_survives_one_byte_and_chunk_edge_reads() {
+        let mut input = vec![b'x'; 8192 - 3];
+        input.extend_from_slice(
+            b"\nSYNTHETIC_SPLIT_PREFIX_SECRET\n-----END PRIVATE KEY-----\nafter\n",
+        );
+        let expected = collect_log(input.as_slice()).unwrap();
+
+        for chunk_size in [1, 8192] {
+            let mut collector = LogCollector::new();
+            for chunk in input.chunks(chunk_size) {
+                collector.feed(chunk);
+            }
+            assert_eq!(collector.finish(), expected, "chunk size {chunk_size}");
+        }
+        assert!(!expected.0.contains("SYNTHETIC_SPLIT_PREFIX_SECRET"));
+    }
+
+    #[test]
+    fn collector_redacts_retained_prefix_when_end_is_in_an_oversized_line() {
+        let mut input = b"SYNTHETIC_OVERSIZED_PREFIX_SECRET\n".to_vec();
+        input.extend_from_slice(&vec![b'x'; PROVIDER_LOG_MAX_BYTES]);
+        input.extend_from_slice(b"-----END PRIVATE KEY-----\n");
+        input.extend_from_slice(b"after\n");
+
+        let (text, truncated) = collect_log(input.as_slice()).unwrap();
+        assert!(truncated);
+        assert!(!text.contains("SYNTHETIC_OVERSIZED_PREFIX_SECRET"));
+        assert!(text.starts_with(thegn_core::ci_log::REDACTION_MARKER));
+        assert!(text.ends_with("after\n"));
+    }
+
+    #[test]
+    fn collector_redacts_retained_prefix_after_an_invalid_utf8_line() {
+        let mut input = b"SYNTHETIC_INVALID_PREFIX_SECRET\n".to_vec();
+        input.extend_from_slice(b"\xff\xfe\n-----END PRIVATE KEY-----\nafter\n");
+
+        let (text, truncated) = collect_log(input.as_slice()).unwrap();
+        assert!(truncated);
+        assert!(!text.contains("SYNTHETIC_INVALID_PREFIX_SECRET"));
+        assert!(!text.contains('\u{fffd}'));
+        assert!(text.ends_with("after\n"));
+    }
+
+    #[test]
+    fn collector_redacts_all_retained_lines_after_prefix_eviction() {
+        let mut input = String::from("SYNTHETIC_EVICTED_BODY\n");
+        for line in 0..PROVIDER_LOG_MAX_LINES {
+            input.push_str(&format!("ordinary {line}\n"));
+        }
+        input.push_str("-----END PRIVATE KEY-----\n");
+
+        let (text, truncated) = collect_log(input.as_bytes()).unwrap();
+        let marker = thegn_core::ci_log::REDACTION_MARKER;
+        assert!(truncated);
+        assert!(!text.contains("SYNTHETIC_EVICTED_BODY"));
+        assert!(!text.contains("ordinary "));
+        assert!(text.lines().all(|line| line == marker));
+        assert_eq!(text.lines().count(), PROVIDER_LOG_MAX_LINES);
+    }
+
+    #[test]
+    fn collector_bounds_retained_lines_and_unterminated_line_buffer() {
+        let mut collector = LogCollector::new();
+        let mut line = vec![b'x'; 1023];
+        line.push(b'\n');
+        let lines = line.repeat(16 * 1024);
+        collector.feed(&lines);
+        assert!(collector.lines.len() <= PROVIDER_LOG_MAX_LINES);
+        assert!(collector.kept_bytes <= PROVIDER_LOG_MAX_BYTES);
+        collector.feed(&b"x\n".repeat(PROVIDER_LOG_MAX_LINES * 2));
+        assert!(collector.lines.len() <= PROVIDER_LOG_MAX_LINES);
+        assert!(collector.kept_bytes <= PROVIDER_LOG_MAX_BYTES);
+
+        let unterminated = vec![b'y'; PROVIDER_LOG_MAX_BYTES * 2];
+        collector.feed(&unterminated);
+        assert!(collector.lines.len() <= PROVIDER_LOG_MAX_LINES);
+        assert!(collector.kept_bytes <= PROVIDER_LOG_MAX_BYTES);
+        assert!(collector.line.len() <= PROVIDER_LOG_MAX_BYTES);
+        assert!(collector.line.capacity() <= PROVIDER_LOG_MAX_BYTES);
     }
 
     #[test]
