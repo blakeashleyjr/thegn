@@ -7,6 +7,7 @@
 //! host) are dispatched by the event loop via `handlers::host::section_key`;
 //! the hint row mirrors them so they can't drift.
 
+use thegn_core::pipeline_report::display_cell;
 use thegn_core::theme::Hue;
 
 use crate::host_ui::HostSnapshot;
@@ -71,10 +72,13 @@ pub(super) fn content(ctx: &SectionCtx) -> Vec<PanelRow> {
     // index lines up with `ui.cursor` and with `panel.hosts` — the action keys
     // (p/r/c/x, m) target `hosts[cursor]`.
     for (i, h) in hosts.iter().enumerate() {
-        let mut left = vec![state_glyph(h), seg(d(), format!(" {}", h.name))];
-        left.push(seg(g(), format!("  {}", h.reach)));
+        let mut left = vec![
+            state_glyph(h),
+            seg(d(), format!(" {}", display_cell(&h.name))),
+        ];
+        left.push(seg(g(), format!("  {}", display_cell(&h.reach))));
         if !h.runtime.is_empty() {
-            left.push(seg(g(), format!(" · {}", h.runtime)));
+            left.push(seg(g(), format!(" · {}", display_cell(&h.runtime))));
         }
         rows.push(
             PanelRow::plain(Line::split(left, vec![seg(g(), h.short_status())]))
@@ -113,8 +117,18 @@ fn full_view(ctx: &SectionCtx) -> Vec<PanelRow> {
                         if selected { "▶ " } else { "  " },
                     ),
                     state_glyph(host),
-                    seg(if selected { t() } else { d() }, format!(" {}", host.name)),
-                    seg(g(), format!("  {} · {}", host.reach, host.runtime)),
+                    seg(
+                        if selected { t() } else { d() },
+                        format!(" {}", display_cell(&host.name)),
+                    ),
+                    seg(
+                        g(),
+                        format!(
+                            "  {} · {}",
+                            display_cell(&host.reach),
+                            display_cell(&host.runtime)
+                        ),
+                    ),
                 ],
                 Some(i),
             )
@@ -122,10 +136,13 @@ fn full_view(ctx: &SectionCtx) -> Vec<PanelRow> {
         .collect();
     let host = &hosts[cursor];
     let detail_w = ctx.cols.saturating_sub(list_w + 2);
-    let mut detail: Vec<Vec<Seg>> = wrap_text(&format!("reach target  {}", host.target), detail_w)
-        .into_iter()
-        .map(|part| vec![seg(g2(), part)])
-        .collect();
+    let mut detail: Vec<Vec<Seg>> = wrap_text(
+        &format!("reach target  {}", display_cell(&host.target)),
+        detail_w,
+    )
+    .into_iter()
+    .map(|part| vec![seg(g2(), part)])
+    .collect();
     detail.extend(
         detail_rows(host, ctx)
             .into_iter()
@@ -159,7 +176,10 @@ fn full_view(ctx: &SectionCtx) -> Vec<PanelRow> {
 /// event trail; the compact view keeps to identity + freshness + failure.
 fn detail_rows(h: &HostSnapshot, ctx: &SectionCtx) -> Vec<PanelRow> {
     let kv = |k: &str, v: String| {
-        PanelRow::plain(Line::segs(vec![seg(g(), format!("  {k:<8}")), seg(f(), v)]))
+        PanelRow::plain(Line::segs(vec![
+            seg(g(), format!("  {k:<8}")),
+            seg(f(), display_cell(&v)),
+        ]))
     };
     let probe = match h.last_probe {
         Some(t) => {
@@ -184,7 +204,7 @@ fn detail_rows(h: &HostSnapshot, ctx: &SectionCtx) -> Vec<PanelRow> {
     if !h.error.is_empty() {
         rows.push(PanelRow::plain(Line::segs(vec![
             seg(g(), "  "),
-            seg(hue(Hue::Red), h.error.clone()),
+            seg(hue(Hue::Red), display_cell(&h.error)),
         ])));
     }
     if ctx.deep() && !h.events.is_empty() {
@@ -192,7 +212,7 @@ fn detail_rows(h: &HostSnapshot, ctx: &SectionCtx) -> Vec<PanelRow> {
         for ev in h.events.iter().take(5) {
             rows.push(PanelRow::plain(Line::segs(vec![
                 seg(g(), "   · "),
-                seg(f(), ev.clone()),
+                seg(f(), display_cell(ev)),
             ])));
         }
     }
