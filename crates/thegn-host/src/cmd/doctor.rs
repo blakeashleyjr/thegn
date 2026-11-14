@@ -3696,7 +3696,11 @@ fn signer_line(
     use crate::nix_signing::InstallKeyStatus;
 
     let report = crate::nix_signing::cache_signing_report(status, plan);
-    let require_sigs = yn(report.require_sigs);
+    let require_sigs = if report.require_sigs_explicit {
+        "yes (explicit)"
+    } else {
+        "yes (nix default)"
+    };
     match status {
         InstallKeyStatus::Present { name } => {
             format!(
@@ -3822,6 +3826,7 @@ fn provider_cache_json_with(
                 "signer_state": report.signer_state,
                 "scope": report.scope,
                 "require_sigs": report.require_sigs,
+                "require_sigs_explicit": report.require_sigs_explicit,
             }),
         );
     }
@@ -7092,7 +7097,8 @@ args = ["--verbose"]
         assert!(json["vps"]["signer"].is_null());
         assert_eq!(json["vps"]["signer_state"], "unused");
         assert_eq!(json["vps"]["scope"], "disabled");
-        assert_eq!(json["vps"]["require_sigs"], false);
+        assert_eq!(json["vps"]["require_sigs"], true);
+        assert_eq!(json["vps"]["require_sigs_explicit"], false);
 
         let json = provider_cache_json_with(&cfg, Some(&InstallKeyStatus::Missing));
         assert!(json["sprites"]["signer"].is_null());
@@ -7160,12 +7166,13 @@ args = ["--verbose"]
                     "scope: disabled"
                 }));
                 assert!(line.contains(if plan.require_sigs {
-                    "require_sigs: yes"
+                    "require_sigs: yes (explicit)"
                 } else {
-                    "require_sigs: no"
+                    "require_sigs: yes (nix default)"
                 }));
 
-                let row = &provider_cache_json_with(&cfg, Some(status))["sprites"];
+                let json = provider_cache_json_with(&cfg, Some(status));
+                let row = &json["sprites"];
                 assert!(row.get("scope").is_some());
                 assert!(row.get("require_sigs").is_some());
                 assert_eq!(
@@ -7176,7 +7183,8 @@ args = ["--verbose"]
                         "disabled"
                     }
                 );
-                assert_eq!(row["require_sigs"], host_cache && bridge);
+                assert_eq!(row["require_sigs"], true);
+                assert_eq!(row["require_sigs_explicit"], host_cache && bridge);
             }
         }
     }
