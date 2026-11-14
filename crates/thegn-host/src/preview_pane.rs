@@ -193,6 +193,7 @@ fn route_and_render(
                     Ok(rendered) => {
                         let mut lines = bounded_lines(&rendered.text);
                         if rendered.uncontained {
+                            lines.truncate(PREVIEW_MAX_LINES.saturating_sub(1));
                             lines.push(UNCONTAINED_MARKER.to_string());
                         }
                         lines
@@ -240,6 +241,7 @@ fn mermaid_source_fallback(
 ) -> Result<Vec<String>, String> {
     let mut lines = read_text(abs)?;
     if renderer_refused {
+        lines.truncate(PREVIEW_MAX_LINES.saturating_sub(1));
         lines.push(CONTAINMENT_UNAVAILABLE_NOTE.to_string());
     }
     Ok(lines)
@@ -560,6 +562,20 @@ mod tests {
             lines.len() <= PREVIEW_MAX_LINES,
             "retained {} lines",
             lines.len()
+        );
+    }
+
+    #[test]
+    fn refused_mermaid_source_fallback_keeps_note_inside_shared_line_cap() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("many-lines.mmd");
+        std::fs::write(&path, "x\n".repeat(60_000)).unwrap();
+
+        let lines = mermaid_source_fallback(&path, true).unwrap();
+        assert!(lines.len() <= PREVIEW_MAX_LINES);
+        assert_eq!(
+            lines.last(),
+            Some(&CONTAINMENT_UNAVAILABLE_NOTE.to_string())
         );
     }
 
