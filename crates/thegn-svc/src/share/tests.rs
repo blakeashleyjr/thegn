@@ -2314,7 +2314,8 @@ fn bounded_reader_budget_drops_flood_but_keeps_late_url() {
     );
     assert!(
         consumer.join().expect("diagnostic consumer")
-            <= super::DIAGNOSTIC_LINES_PER_SECOND * (started.elapsed().as_secs() as usize + 1),
+            <= super::DIAGNOSTIC_LINES_PER_SECOND
+                * (started.elapsed().as_secs_f64().ceil() as usize + 1),
         "forwarded diagnostics exceeded the per-second budget"
     );
     assert!(
