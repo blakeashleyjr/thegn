@@ -3267,8 +3267,13 @@ mod tests {
     #[test]
     fn collector_bounds_retained_lines_and_unterminated_line_buffer() {
         let mut collector = LogCollector::new();
-        let lines = b"x\n".repeat(8 * 1024 * 1024);
+        let mut line = vec![b'x'; 1023];
+        line.push(b'\n');
+        let lines = line.repeat(16 * 1024);
         collector.feed(&lines);
+        assert!(collector.lines.len() <= PROVIDER_LOG_MAX_LINES);
+        assert!(collector.kept_bytes <= PROVIDER_LOG_MAX_BYTES);
+        collector.feed(&b"x\n".repeat(PROVIDER_LOG_MAX_LINES * 2));
         assert!(collector.lines.len() <= PROVIDER_LOG_MAX_LINES);
         assert!(collector.kept_bytes <= PROVIDER_LOG_MAX_BYTES);
 
