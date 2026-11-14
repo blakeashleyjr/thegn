@@ -369,7 +369,7 @@ fn plugin_soak_is_bounded_across_fixed_adversarial_iterations() {
     if let Some(before) = plugin_threads_before {
         wait_for_plugin_thread_count_at_most(before);
     } else {
-        eprintln!("plugin soak: skipping thread census; platform helper returned no samples");
+        tracing::warn!("plugin soak: skipping thread census; platform helper returned no samples");
     }
 
     if let Some(before) = rss_before {
@@ -380,7 +380,7 @@ fn plugin_soak_is_bounded_across_fixed_adversarial_iterations() {
             "peak RSS growth exceeded the generous 64 MiB ceiling: {peak_rss_growth} pages"
         );
     } else {
-        eprintln!("plugin soak: skipping RSS ceiling; /proc/self/statm is unavailable");
+        tracing::warn!("plugin soak: skipping RSS ceiling; /proc/self/statm is unavailable");
     }
 
     if let Some(before) = children_before {
@@ -390,6 +390,6 @@ fn plugin_soak_is_bounded_across_fixed_adversarial_iterations() {
             "plugin soak left child processes behind: before={before:?}, after={after:?}"
         );
     } else {
-        eprintln!("plugin soak: skipping child census; /proc task children is unavailable");
+        tracing::warn!("plugin soak: skipping child census; /proc task children is unavailable");
     }
 }
