@@ -39,16 +39,14 @@ fn host_label(location: &str) -> Option<String> {
 /// [`thegn_core::attention::MqStatus::glyph`] vocabulary (also the sidebar
 /// detail chip's), capability-degraded like the rest of the chrome. Unknown
 /// statuses are flagged with the attention glyph.
-pub(super) fn status_glyph(status: &str) -> Seg {
-    use thegn_core::attention::MqStatus;
+pub(super) fn status_glyph_typed(status: MqStatus) -> Seg {
     let gl = crate::caps::active_glyphs();
-    match MqStatus::parse(status) {
-        Some(mq) => {
-            let (glyph, h) = mq.glyph(gl);
-            seg(hue(h), glyph)
-        }
-        None => seg(hue(Hue::Red), gl.attention),
-    }
+    let (glyph, h) = status.glyph(gl);
+    seg(hue(h), glyph)
+}
+
+fn unknown_status_glyph() -> Seg {
+    seg(hue(Hue::Red), crate::caps::active_glyphs().attention)
 }
 
 pub(super) fn content(ctx: &SectionCtx) -> Vec<PanelRow> {
@@ -82,7 +80,13 @@ pub(super) fn content(ctx: &SectionCtx) -> Vec<PanelRow> {
         out.push(notice);
     }
     for (i, r) in rows.iter().enumerate() {
-        let mut left = vec![status_glyph(&r.status), seg(d(), format!(" {}", r.branch))];
+        let status = MqStatus::parse(&r.status);
+        let mut left = vec![
+            status
+                .map(status_glyph_typed)
+                .unwrap_or_else(unknown_status_glyph),
+            seg(d(), format!(" {}", r.branch)),
+        ];
         // Off-host branches get a host chip so the reader sees which rows live on
         // another machine (their tips are bundle-fetched into the target store).
         if let Some(host) = host_label(&r.location) {
@@ -191,9 +195,12 @@ fn full_view(ctx: &SectionCtx, rows: &[thegn_core::db::MergeQueueRow]) -> Vec<Pa
         .enumerate()
         .map(|(i, r)| {
             let sel = if i == cursor { "▶ " } else { "  " };
+            let status = MqStatus::parse(&r.status);
             let mut l = vec![
                 seg(if i == cursor { t() } else { g() }, sel),
-                status_glyph(&r.status),
+                status
+                    .map(status_glyph_typed)
+                    .unwrap_or_else(unknown_status_glyph),
                 seg(
                     if i == cursor { t() } else { d() },
                     format!(" {}", r.branch),
@@ -208,9 +215,12 @@ fn full_view(ctx: &SectionCtx, rows: &[thegn_core::db::MergeQueueRow]) -> Vec<Pa
 
     let detail_w = cols.saturating_sub(list_w + 2);
     let r = &rows[cursor];
+    let status = MqStatus::parse(&r.status);
     let mut detail: Vec<Vec<Seg>> = vec![
         vec![
-            status_glyph(&r.status),
+            status
+                .map(status_glyph_typed)
+                .unwrap_or_else(unknown_status_glyph),
             seg(
                 t(),
                 format!(" {}", crate::merge_sweep::safe_display(&r.status)),
@@ -363,7 +373,7 @@ fn claim_unavailable_notice(error: Option<&str>) -> Option<PanelRow> {
 /// — the section builder has neither, and a zero there means "no expiry", which
 /// correctly yields no countdown.
 fn expiry_label(r: &thegn_core::db::MergeQueueRow) -> Option<String> {
-    if r.status != "landed" {
+    if MqStatus::parse(&r.status) != Some(MqStatus::Landed) {
         return None;
     }
     let ttl = crate::panel::scope::merged_ttl_secs();
