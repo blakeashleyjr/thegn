@@ -7,6 +7,20 @@ All notable changes to **thegn** are documented here. The format follows
 
 ## [Unreleased]
 
+### Added
+
+- For GitHub or GitLab CI, `thegn doctor` adds a value-free `CI credential placement` section with `credential placement: github/local`, `github/ssh`, and `github/provider` (plus matching `gitlab/...` rows); JSON keeps the notes under `providers`.
+- The workspace picker adds a `broad root: … (scan limited to 20000 repos)` warning row for roots such as `/` or your home directory without refusing them.
+
+### Changed
+
+- On Linux, PDF previews require usable `bwrap` and Mermaid previews are refused as uncontained, with Mermaid falling back to source text; other platforms mark uncontained previews.
+
+### Fixed
+
+- Duplicate CI detail requests no longer run twice, and provider JSON is capped by total bytes, object and array size, depth, and item count.
+- Native provider exec output is chunked and byte-bounded, so a flood cannot grow retained memory without limit.
+
 ## [0.1.0-alpha.78] — 2026-11-14
 
 ### Added

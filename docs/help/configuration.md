@@ -408,7 +408,10 @@ thegn keys validate      # chord conflicts; exits non-zero, so it fits a hook
 thegn keys hints --zone sidebar   # what that zone's hint strip renders
 ```
 
-For GitLab CI, the `thegn doctor` probe reports the credential mode of the
+When GitHub or GitLab CI is selected, `thegn doctor` prints a value-free `CI credential placement` section with
+`credential placement: github/local`, `github/ssh`, `github/provider` (or the
+matching `gitlab/...` rows) under `Providers`; `--json` keeps these notes under
+`providers`. For GitLab CI, the probe reports the credential mode of the
 `[ci.gitlab]` token without printing its value, and what each mode does for a
 local worktree and for an SSH or provider worktree:
 
