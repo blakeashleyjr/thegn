@@ -601,14 +601,44 @@ impl VpsProvider {
             .await
     }
 
+    async fn get_json_priority(&self, url: &str) -> Result<serde_json::Value> {
+        self.get_json_timeout_priority(url, crate::provider::CONTROL_TIMEOUT)
+            .await
+    }
+
     async fn get_json_timeout(
         &self,
         url: &str,
         timeout: std::time::Duration,
     ) -> Result<serde_json::Value> {
+        self.get_json_timeout_with_priority(url, timeout, false)
+            .await
+    }
+
+    async fn get_json_timeout_priority(
+        &self,
+        url: &str,
+        timeout: std::time::Duration,
+    ) -> Result<serde_json::Value> {
+        self.get_json_timeout_with_priority(url, timeout, true)
+            .await
+    }
+
+    async fn get_json_timeout_with_priority(
+        &self,
+        url: &str,
+        timeout: std::time::Duration,
+        priority: bool,
+    ) -> Result<serde_json::Value> {
         let base = self.spec.validated_api_base()?;
         let authority = crate::provider::authority_key(&base)?;
-        let _permit = crate::provider::CONTROL_GATE.acquire(&authority).await?;
+        let _permit = if priority {
+            crate::provider::CONTROL_GATE
+                .acquire_priority(&authority)
+                .await?
+        } else {
+            crate::provider::CONTROL_GATE.acquire(&authority).await?
+        };
         let resp = self
             .client
             .get(url)
@@ -663,7 +693,10 @@ impl VpsProvider {
         let shaper = self.shaper();
         collect_pages(
             move |page| {
-                Box::pin(async move { self.get_json(&shaper.list_page_url(base, page)).await })
+                Box::pin(async move {
+                    self.get_json_priority(&shaper.list_page_url(base, page))
+                        .await
+                })
             },
             |body, page| shaper.parse_server_page(body, page),
             |server: &VpsInstance| server.id.clone(),
@@ -1342,7 +1375,9 @@ impl RemoteProvider for VpsProvider {
             let mut last_status = None;
             for attempt in 0..DESTROY_ATTEMPTS {
                 let status = {
-                    let _permit = crate::provider::CONTROL_GATE.acquire(&authority).await?;
+                    let _permit = crate::provider::CONTROL_GATE
+                        .acquire_priority(&authority)
+                        .await?;
                     self.client
                         .delete(&url)
                         .bearer_auth(&self.spec.token)
