@@ -7,6 +7,15 @@ All notable changes to **thegn** are documented here. The format follows
 
 ## [Unreleased]
 
+### Fixed
+
+- Scheduled CI failures without a queued PR now produce one `ci_run_failed` notice per run, and a newer run replaces the previous unread notice.
+- Restoring a hibernated snapshot stages artifacts in a private directory and verifies the replay before using it.
+- Destroy and reconciliation calls to cloud providers reserve control-gate capacity, so ordinary traffic cannot starve them.
+- Forwarded share and VPN diagnostics are capped by byte and rate budgets, and sidecar records include optional placement fields.
+- `dispatch put` and `dispatch claim` refuse a parent row from a later pipeline stage.
+- Merge-bundle ingest checks free disk space before streaming, falling back to the size cap when free space is unknown.
+
 ## [0.1.0-alpha.75] — 2026-11-13
 
 ### Added
