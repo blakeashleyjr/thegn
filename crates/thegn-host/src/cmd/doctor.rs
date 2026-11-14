@@ -3689,20 +3689,36 @@ fn env_devshell(cfg: &Config, e: &thegn_core::config::EnvConfig) -> String {
         .to_string()
 }
 
-fn signer_line(status: &crate::nix_signing::InstallKeyStatus) -> String {
+fn signer_line(
+    status: &crate::nix_signing::InstallKeyStatus,
+    plan: crate::nix_signing::HostCachePlanFacts,
+) -> String {
     use crate::nix_signing::InstallKeyStatus;
 
+    let report = crate::nix_signing::cache_signing_report(status, plan);
+    let require_sigs = if report.require_sigs_explicit {
+        "yes (explicit)"
+    } else {
+        "yes (nix default)"
+    };
     match status {
         InstallKeyStatus::Present { name } => {
-            format!("signer: {name} (per-installation key)")
+            format!(
+                "signer: {name} (per-installation key) · scope: {} · require_sigs: {require_sigs}",
+                report.scope
+            )
         }
         InstallKeyStatus::Missing => {
-            "signer: none yet (created at the first host-cache provision)".to_string()
+            format!(
+                "signer: none yet (created at the first host-cache provision) · scope: {} · require_sigs: {require_sigs}",
+                report.scope
+            )
         }
         InstallKeyStatus::Invalid(reason) => {
-            let reason = reason.chars().take(200).collect::<String>();
+            let reason = reason.chars().take(110).collect::<String>();
             format!(
-                "signer: INVALID ({reason}); sandboxes will not trust the host cache until it is fixed"
+                "signer: INVALID ({reason}); sandboxes will not trust the host cache until it is fixed · scope: {} · require_sigs: {require_sigs}",
+                report.scope
             )
         }
     }
@@ -3754,7 +3770,13 @@ fn provider_cache_report(cfg: &Config) {
                 }
             }
             if let Some(status) = signer.as_ref() {
-                outln!("               {}", signer_line(status));
+                outln!(
+                    "               {}",
+                    signer_line(
+                        status,
+                        crate::nix_signing::host_cache_plan_facts(p.host_cache, bridge.is_some())
+                    )
+                );
             }
         }
     }
@@ -3780,23 +3802,16 @@ fn provider_cache_json_with(
     signer: Option<&crate::nix_signing::InstallKeyStatus>,
 ) -> serde_json::Value {
     let bridge_present = crate::bridge_sup::bridge_binary_path().is_some();
+    let missing = crate::nix_signing::InstallKeyStatus::Missing;
     let mut map = serde_json::Map::new();
     for name in provider_env_names(cfg) {
         let e = &cfg.env[name];
         let p = &e.provider;
         let kind = EnvProviderKind::of(p.provider.trim());
-        let signer_name = if p.host_cache {
-            signer.and_then(crate::nix_signing::InstallKeyStatus::name)
-        } else {
-            None
-        };
-        let signer_state = if p.host_cache {
-            signer
-                .map(crate::nix_signing::InstallKeyStatus::state)
-                .unwrap_or("missing")
-        } else {
-            "unused"
-        };
+        let report = crate::nix_signing::cache_signing_report(
+            signer.unwrap_or(&missing),
+            crate::nix_signing::host_cache_plan_facts(p.host_cache, bridge_present),
+        );
         map.insert(
             name.clone(),
             serde_json::json!({
@@ -3807,8 +3822,11 @@ fn provider_cache_json_with(
                 "host_cache": p.host_cache,
                 "bridge_present": bridge_present,
                 "host_cache_effective": p.host_cache && bridge_present,
-                "signer": signer_name,
-                "signer_state": signer_state,
+                "signer": report.signer,
+                "signer_state": report.signer_state,
+                "scope": report.scope,
+                "require_sigs": report.require_sigs,
+                "require_sigs_explicit": report.require_sigs_explicit,
             }),
         );
     }
@@ -7069,18 +7087,106 @@ args = ["--verbose"]
         let json = provider_cache_json_with(&cfg, Some(&present));
         assert_eq!(json["sprites"]["signer"], "thegn-0123456789abcdef-1");
         assert_eq!(json["sprites"]["signer_state"], "present");
+        assert!(
+            json["sprites"]["scope"]
+                .as_str()
+                .unwrap()
+                .contains("signed paths only")
+        );
+        assert!(json["sprites"].get("require_sigs").is_some());
         assert!(json["vps"]["signer"].is_null());
         assert_eq!(json["vps"]["signer_state"], "unused");
+        assert_eq!(json["vps"]["scope"], "disabled");
+        assert_eq!(json["vps"]["require_sigs"], true);
+        assert_eq!(json["vps"]["require_sigs_explicit"], false);
 
         let json = provider_cache_json_with(&cfg, Some(&InstallKeyStatus::Missing));
         assert!(json["sprites"]["signer"].is_null());
         assert_eq!(json["sprites"]["signer_state"], "missing");
 
-        assert!(signer_line(&present).contains("thegn-0123456789abcdef-1"));
-        assert!(signer_line(&InstallKeyStatus::Missing).contains("none yet"));
-        let invalid = signer_line(&InstallKeyStatus::Invalid("x".repeat(500)));
+        let bridge = crate::bridge_sup::bridge_binary_path().is_some();
+        assert!(
+            signer_line(
+                &present,
+                crate::nix_signing::host_cache_plan_facts(true, bridge)
+            )
+            .contains("thegn-0123456789abcdef-1")
+        );
+        assert!(
+            signer_line(
+                &InstallKeyStatus::Missing,
+                crate::nix_signing::host_cache_plan_facts(true, bridge)
+            )
+            .contains("none yet")
+        );
+        let invalid = signer_line(
+            &InstallKeyStatus::Invalid("x".repeat(500)),
+            crate::nix_signing::host_cache_plan_facts(true, bridge),
+        );
         assert!(invalid.len() <= 300);
         assert!(invalid.contains("INVALID"));
+    }
+
+    #[test]
+    fn provider_cache_signer_scope_and_require_sigs_cover_statuses_and_cache_switch() {
+        use crate::nix_signing::InstallKeyStatus;
+        use thegn_core::config::{EnvConfig, EnvProviderConfig};
+
+        let statuses = [
+            InstallKeyStatus::Present {
+                name: "thegn-0123456789abcdef-1".into(),
+            },
+            InstallKeyStatus::Missing,
+            InstallKeyStatus::Invalid("bad key".into()),
+        ];
+        let bridge = crate::bridge_sup::bridge_binary_path().is_some();
+        for host_cache in [false, true] {
+            for status in &statuses {
+                let cfg = Config {
+                    env: [(
+                        "sprites".to_string(),
+                        EnvConfig {
+                            provider: EnvProviderConfig {
+                                provider: "sprites".into(),
+                                host_cache,
+                                ..Default::default()
+                            },
+                            ..Default::default()
+                        },
+                    )]
+                    .into_iter()
+                    .collect(),
+                    ..Default::default()
+                };
+                let plan = crate::nix_signing::host_cache_plan_facts(host_cache, bridge);
+                let line = signer_line(status, plan);
+                assert!(line.contains(if host_cache {
+                    "scope: signed paths only"
+                } else {
+                    "scope: disabled"
+                }));
+                assert!(line.contains(if plan.require_sigs {
+                    "require_sigs: yes (explicit)"
+                } else {
+                    "require_sigs: yes (nix default)"
+                }));
+
+                let json = provider_cache_json_with(&cfg, Some(status));
+                let row = &json["sprites"];
+                assert!(row.get("scope").is_some());
+                assert!(row.get("require_sigs").is_some());
+                assert_eq!(
+                    row["scope"],
+                    if host_cache {
+                        crate::nix_signing::HOST_CACHE_SCOPE
+                    } else {
+                        "disabled"
+                    }
+                );
+                assert_eq!(row["require_sigs"], true);
+                assert_eq!(row["require_sigs_explicit"], host_cache && bridge);
+            }
+        }
     }
 
     fn hard_link_test_supported() -> bool {
