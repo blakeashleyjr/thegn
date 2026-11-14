@@ -812,7 +812,8 @@ mod tests {
     fn inert_controls_handles_every_c0_del_and_c1_control() {
         for codepoint in (0x00..=0x1f).chain([0x7f]).chain(0x80..=0x9f) {
             let character = char::from_u32(codepoint).expect("control codepoint is a scalar");
-            let rendered = inert_controls(&character.to_string());
+            let text = character.to_string();
+            let rendered = inert_controls(&text);
             let expected = match character {
                 '\n' => "\n".to_string(),
                 '\t' => "\t".to_string(),
