@@ -96,7 +96,16 @@ impl PendingCornerOob {
         &mut self,
         bytes: Vec<u8>,
         visible: bool,
-        submit: impl FnMut(Vec<u8>) -> Result<(), Vec<u8>>,
+        mut submit: impl FnMut(Vec<u8>) -> Result<(), Vec<u8>>,
+    ) {
+        self.offer_draw_typed(bytes, visible, |_, bytes| submit(bytes));
+    }
+
+    pub(crate) fn offer_draw_typed(
+        &mut self,
+        bytes: Vec<u8>,
+        visible: bool,
+        mut submit: impl FnMut(crate::frame_writer::OobKind, Vec<u8>) -> Result<(), Vec<u8>>,
     ) {
         if bytes.is_empty() {
             return;
@@ -105,7 +114,7 @@ impl PendingCornerOob {
             self.delete_pending = true;
         }
         self.draw = Some(bytes);
-        self.retry(visible, submit);
+        self.retry_typed(visible, submit);
     }
 
     /// Retry on an existing OOB capacity or producer wake, without a cell frame.
@@ -114,8 +123,21 @@ impl PendingCornerOob {
         visible: bool,
         mut submit: impl FnMut(Vec<u8>) -> Result<(), Vec<u8>>,
     ) {
+        self.retry_typed(visible, |_, bytes| submit(bytes));
+    }
+
+    pub(crate) fn retry_typed(
+        &mut self,
+        visible: bool,
+        mut submit: impl FnMut(crate::frame_writer::OobKind, Vec<u8>) -> Result<(), Vec<u8>>,
+    ) {
         if self.delete_pending {
-            if submit(kitty_relay::delete_all().to_vec()).is_err() {
+            if submit(
+                crate::frame_writer::OobKind::KittyDelete,
+                kitty_relay::delete_all().to_vec(),
+            )
+            .is_err()
+            {
                 return;
             }
             self.delete_pending = false;
@@ -127,7 +149,7 @@ impl PendingCornerOob {
             let mut copy = self.spare.take().unwrap_or_default();
             copy.clear();
             copy.extend_from_slice(&bytes);
-            match submit(bytes) {
+            match submit(crate::frame_writer::OobKind::Graphics, bytes) {
                 Ok(()) => self.spare = self.shown.replace(copy),
                 Err(bytes) => {
                     self.draw = Some(bytes);

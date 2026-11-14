@@ -420,9 +420,12 @@ fn finish_exit(
     summary: &mut DrainSummary,
 ) {
     let discarded = if let Some(p) = ctx.panes.table.get_mut(&id) {
-        p.clipboard
+        let refusal_was_reported = p.clipboard.refusal_was_reported();
+        let refused = p
+            .clipboard
             .submit(|bytes| ctx.writer.try_submit_clipboard(bytes, || {}));
-        reset_terminal_streams(&mut p.clipboard, &mut p.query_parser)
+        let discarded = reset_terminal_streams(&mut p.clipboard, &mut p.query_parser);
+        discarded && (!refusal_was_reported || refused)
     } else {
         false
     };
@@ -574,7 +577,12 @@ pub(crate) fn drain<T: Terminal>(
                     .panes
                     .table
                     .get_mut(&id)
-                    .map(|p| reset_terminal_streams(&mut p.clipboard, &mut p.query_parser))
+                    .map(|p| {
+                        let refusal_was_reported = p.clipboard.refusal_was_reported();
+                        let discarded =
+                            reset_terminal_streams(&mut p.clipboard, &mut p.query_parser);
+                        discarded && !refusal_was_reported
+                    })
                     .unwrap_or(false);
                 fallbacks.push((id, discarded));
             }
@@ -584,7 +592,12 @@ pub(crate) fn drain<T: Terminal>(
                     .panes
                     .table
                     .get_mut(&id)
-                    .map(|p| reset_terminal_streams(&mut p.clipboard, &mut p.query_parser))
+                    .map(|p| {
+                        let refusal_was_reported = p.clipboard.refusal_was_reported();
+                        let discarded =
+                            reset_terminal_streams(&mut p.clipboard, &mut p.query_parser);
+                        discarded && !refusal_was_reported
+                    })
                     .unwrap_or(false);
                 note_discarded_clipboard(&mut *ctx.model, &mut *ctx.dirty, discarded, false);
                 reattached.push(id);
@@ -666,16 +679,22 @@ pub(crate) fn drain<T: Terminal>(
     // Retry a bounded round-robin pass. Writer capacity release supplies the
     // next wake; no timer runs merely because the clipboard is idle.
     let more_ready = backlog.retry_clipboards(64, |id| {
-        let p = ctx.panes.table.get_mut(&id)?;
-        if !p.clipboard.has_pending() {
-            return None;
+        let (refused, pending) = {
+            let p = ctx.panes.table.get_mut(&id)?;
+            if !p.clipboard.has_pending() {
+                return None;
+            }
+            let refused = p.clipboard.submit(|bytes| {
+                ctx.writer.try_submit_clipboard(bytes, || {
+                    let _ = ctx.waker.wake(); // best-effort: retry work may outlive the terminal
+                })
+            });
+            (refused, p.clipboard.has_pending())
+        };
+        if refused {
+            note_discarded_clipboard(&mut *ctx.model, &mut *ctx.dirty, true, true);
         }
-        p.clipboard.submit(|bytes| {
-            ctx.writer.try_submit_clipboard(bytes, || {
-                let _ = ctx.waker.wake(); // best-effort: retry work may outlive the terminal
-            })
-        });
-        Some(p.clipboard.has_pending())
+        Some(pending)
     });
     if more_ready {
         let _ = ctx.waker.wake(); // best-effort: unvisited admission work needs another bounded pass
@@ -1069,7 +1088,7 @@ fn handle_exit(ctx: &mut DrainCtx<'_>, id: u32, exit_code: Option<i32>) -> bool 
         if ctx.corner_kitty {
             ctx.pending_corner_oob.require_delete();
             ctx.pending_corner_oob
-                .retry(false, |bytes| ctx.writer.try_submit_oob(bytes));
+                .retry_typed(false, |kind, bytes| ctx.writer.try_submit_oob(kind, bytes));
         }
         ctx.corner_relay.reset();
         ctx.corner_gfx.clear();

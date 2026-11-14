@@ -53,14 +53,38 @@ pub(crate) enum WriterStatus {
     Ok,
     /// A frame/oob write hit a transient tty condition: the terminal's actual
     /// content is unknown — force a full repaint and keep going.
-    Transient,
+    Transient(OobKind),
     /// Persistent or unrecoverable failure: tear the compositor down.
     Fatal(String),
 }
 
-/// A clipboard delivery that did not commit to the terminal.
+/// The fixed set of terminal control writes that bypass composed frames.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum OobKind {
+    KittyDelete,
+    Marker,
+    Graphics,
+    Bell,
+    Other,
+}
+
+impl OobKind {
+    fn label(self) -> &'static str {
+        match self {
+            Self::KittyDelete => "kitty delete",
+            Self::Marker => "marker",
+            Self::Graphics => "graphics",
+            Self::Bell => "bell",
+            Self::Other => "other",
+        }
+    }
+}
+
+/// A clipboard delivery outcome, with no clipboard payload retained.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ClipboardOutcome {
+    /// The write committed to the terminal.
+    Committed,
     /// The write failed and was dropped; some bytes may have reached the terminal.
     Uncertain,
     /// The set was abandoned before any write attempt.
@@ -70,6 +94,7 @@ pub(crate) enum ClipboardOutcome {
 /// Fixed, payload-free status text for a clipboard delivery outcome.
 pub(crate) fn clipboard_outcome_status(outcome: ClipboardOutcome) -> &'static str {
     match outcome {
+        ClipboardOutcome::Committed => "Copy sent to the terminal clipboard",
         ClipboardOutcome::Uncertain => {
             "Copy may not have reached the terminal clipboard (terminal write failed)"
         }
@@ -83,7 +108,7 @@ enum Msg {
     /// A composed frame (wire bytes + trailing graphics/bell).
     Frame(Vec<u8>, Option<FrameStamp>, u64),
     /// Order-preserving passthrough (kitty deletes, muse marker…).
-    Oob(Vec<u8>),
+    Oob(OobKind, Vec<u8>, u64),
     Clipboard(Vec<u8>, u64),
 }
 
@@ -265,8 +290,8 @@ impl FrameWriter {
     /// Submit order-preserving passthrough bytes. Queue pressure drops this
     /// message with a warning; it never makes the compositor fatal.
     #[cfg(test)]
-    pub(crate) fn submit_oob(&self, bytes: Vec<u8>) {
-        if let Err(bytes) = self.admit_oob(bytes, false) {
+    pub(crate) fn submit_oob(&self, kind: OobKind, bytes: Vec<u8>) {
+        if let Err(bytes) = self.admit_oob(kind, bytes, false) {
             if self.inner.oob_pressure_logged.swap(true, Ordering::SeqCst) {
                 tracing::debug!(
                     bytes = bytes.len(),
@@ -288,11 +313,11 @@ impl FrameWriter {
     /// Typed, lossless admission for producers able to retain and retry bytes.
     /// Refusals record the smallest needed message size so capacity wakes only
     /// when the current queue can admit at least one retained update.
-    pub(crate) fn try_submit_oob(&self, bytes: Vec<u8>) -> Result<(), Vec<u8>> {
-        self.admit_oob(bytes, true)
+    pub(crate) fn try_submit_oob(&self, kind: OobKind, bytes: Vec<u8>) -> Result<(), Vec<u8>> {
+        self.admit_oob(kind, bytes, true)
     }
 
-    fn admit_oob(&self, bytes: Vec<u8>, retained: bool) -> Result<(), Vec<u8>> {
+    fn admit_oob(&self, kind: OobKind, bytes: Vec<u8>, retained: bool) -> Result<(), Vec<u8>> {
         if bytes.is_empty() {
             return Ok(());
         }
@@ -318,7 +343,7 @@ impl FrameWriter {
         let target = q.submitted_seq;
         q.oob_in_flight += 1;
         q.oob_bytes += bytes.len();
-        q.msgs.push_back(Msg::Oob(bytes));
+        q.msgs.push_back(Msg::Oob(kind, bytes, target));
         drop(q);
         self.inner.cv.notify_one();
         if self.sync {
@@ -386,15 +411,15 @@ impl FrameWriter {
     pub(crate) fn take_status(&self) -> WriterStatus {
         let mut q = self.inner.q.lock().unwrap_or_else(|e| e.into_inner());
         match q.status.clone() {
-            WriterStatus::Transient => {
+            WriterStatus::Transient(kind) => {
                 q.status = WriterStatus::Ok;
-                WriterStatus::Transient
+                WriterStatus::Transient(kind)
             }
             other => other,
         }
     }
 
-    /// Take the newest unresolved clipboard delivery outcome once.
+    /// Take the newest clipboard delivery outcome once.
     pub(crate) fn take_clipboard_outcome(&self) -> Option<ClipboardOutcome> {
         self.inner
             .q
@@ -535,22 +560,22 @@ fn abandon_queued_messages(q: &mut Q) {
     let queued_oob_count = q
         .msgs
         .iter()
-        .filter(|msg| matches!(msg, Msg::Oob(_)))
+        .filter(|msg| matches!(msg, Msg::Oob(..)))
         .count();
     let queued_oob_bytes = q.msgs.iter().fold(0usize, |total, msg| match msg {
-        Msg::Oob(bytes) => total.saturating_add(bytes.len()),
+        Msg::Oob(_, bytes, _) => total.saturating_add(bytes.len()),
         Msg::Frame(..) | Msg::Clipboard(..) => total,
     });
     let deferred_oob_count = q
         .deferred
         .iter()
-        .filter(|deferred| matches!(&deferred.msg, Msg::Oob(_)))
+        .filter(|deferred| matches!(&deferred.msg, Msg::Oob(..)))
         .count();
     let deferred_oob_bytes =
         q.deferred
             .iter()
             .fold(0usize, |total, deferred| match &deferred.msg {
-                Msg::Oob(bytes) => total.saturating_add(bytes.len()),
+                Msg::Oob(_, bytes, _) => total.saturating_add(bytes.len()),
                 Msg::Frame(..) | Msg::Clipboard(..) => total,
             });
     q.msgs.clear();
@@ -583,7 +608,7 @@ fn abandon_deferred_writes(q: &mut Q) {
     let (oob_count, oob_bytes, clipboard_count, clipboard_bytes) = q.deferred.iter().fold(
         (0usize, 0usize, 0usize, 0usize),
         |(oob_count, oob_bytes, clipboard_count, clipboard_bytes), deferred| match &deferred.msg {
-            Msg::Oob(bytes) => (
+            Msg::Oob(_, bytes, _) => (
                 oob_count + 1,
                 oob_bytes.saturating_add(bytes.len()),
                 clipboard_count,
@@ -618,9 +643,9 @@ fn note_clipboard(q: &mut Q, id: u64, outcome: Option<ClipboardOutcome>) {
         None => {
             q.clipboard_committed = q.clipboard_committed.max(id);
             if q.clipboard_outcome
-                .is_some_and(|(pending_id, _)| pending_id <= id)
+                .is_none_or(|(pending_id, _)| pending_id <= id)
             {
-                q.clipboard_outcome = None;
+                q.clipboard_outcome = Some((id, ClipboardOutcome::Committed));
             }
         }
         Some(outcome) if id > q.clipboard_committed => {
@@ -702,8 +727,12 @@ fn write_message(
     msg: Msg,
     mut write: impl FnMut(&[u8]) -> std::io::Result<()>,
 ) -> (bool, bool, bool) {
+    let oob_kind = match &msg {
+        Msg::Oob(kind, ..) => Some(*kind),
+        _ => None,
+    };
     let bytes = match &msg {
-        Msg::Frame(b, ..) | Msg::Oob(b) | Msg::Clipboard(b, _) => b,
+        Msg::Frame(b, ..) | Msg::Oob(_, b, _) | Msg::Clipboard(b, _) => b,
     };
     // After a Fatal, drop writes (the loop is tearing down); keep draining
     // so shutdown never deadlocks.
@@ -715,7 +744,7 @@ fn write_message(
                 note_clipboard(&mut q, *id, Some(ClipboardOutcome::NotWritten));
             }
             release_message_capacity(&mut q, &msg);
-            matches!(&msg, Msg::Oob(_))
+            matches!(&msg, Msg::Oob(..))
         } else {
             false
         };
@@ -730,7 +759,7 @@ fn write_message(
     }
     let stamp = match &msg {
         Msg::Frame(_, stamp, _) => *stamp,
-        Msg::Oob(_) | Msg::Clipboard(..) => None,
+        Msg::Oob(..) | Msg::Clipboard(..) => None,
     };
     let started = stamp.map(|_| Instant::now());
     let reset_pending = inner
@@ -765,12 +794,12 @@ fn write_message(
         let mut q = inner.q.lock().unwrap_or_else(|e| e.into_inner());
         if result.is_err()
             && inner.worker_frames
-            && matches!(&msg, Msg::Oob(_) | Msg::Clipboard(..))
+            && matches!(&msg, Msg::Oob(..) | Msg::Clipboard(..))
         {
             let defer_after = q.submitted_seq;
             q.deferred.push_back(DeferredWrite { msg, defer_after });
         } else {
-            released_oob = matches!(&msg, Msg::Oob(_));
+            released_oob = matches!(&msg, Msg::Oob(..));
             released_clipboard = matches!(&msg, Msg::Clipboard(..));
             if let Msg::Clipboard(_, id) = &msg {
                 let outcome = result.is_err().then_some(ClipboardOutcome::Uncertain);
@@ -789,7 +818,7 @@ fn write_message(
         // Keep replay failures consecutive across their successful resync
         // frames, so repeated delivery failure still reaches Fatal.
         if !(result.is_ok() && deferred_ready) {
-            apply_write_result(&mut q, result);
+            apply_write_result(&mut q, result, oob_kind);
         }
         if matches!(q.status, WriterStatus::Fatal(_)) {
             abandon_queued_messages(&mut q);
@@ -813,14 +842,14 @@ fn write_message(
         let (fatal, abandoned_oob, abandoned_clipboard) = {
             let mut q = inner.q.lock().unwrap_or_else(|e| e.into_inner());
             if matches!(q.status, WriterStatus::Fatal(_)) {
-                let mut abandoned_oob = matches!(&replay_msg, Msg::Oob(_));
+                let mut abandoned_oob = matches!(&replay_msg, Msg::Oob(..));
                 let mut abandoned_clipboard = matches!(&replay_msg, Msg::Clipboard(..));
                 if let Msg::Clipboard(_, id) = &replay_msg {
                     note_clipboard(&mut q, *id, Some(ClipboardOutcome::Uncertain));
                 }
                 release_message_capacity(&mut q, &replay_msg);
                 while let Some(remaining) = replay.pop_front() {
-                    abandoned_oob |= matches!(&remaining, Msg::Oob(_));
+                    abandoned_oob |= matches!(&remaining, Msg::Oob(..));
                     abandoned_clipboard |= matches!(&remaining, Msg::Clipboard(..));
                     if let Msg::Clipboard(_, id) = &remaining {
                         note_clipboard(&mut q, *id, Some(ClipboardOutcome::Uncertain));
@@ -841,7 +870,7 @@ fn write_message(
             break;
         }
         let replay_bytes = match &replay_msg {
-            Msg::Oob(bytes) | Msg::Clipboard(bytes, _) => bytes,
+            Msg::Oob(_, bytes, _) | Msg::Clipboard(bytes, _) => bytes,
             Msg::Frame(..) => unreachable!("only OOB and clipboard messages are deferred"),
         };
         let replay_result = write(replay_bytes);
@@ -860,14 +889,18 @@ fn write_message(
             }
             replay_errored = true;
         } else {
-            released_oob |= matches!(&replay_msg, Msg::Oob(_));
+            released_oob |= matches!(&replay_msg, Msg::Oob(..));
             released_clipboard |= matches!(&replay_msg, Msg::Clipboard(..));
             if let Msg::Clipboard(_, id) = &replay_msg {
                 note_clipboard(&mut q, *id, None);
             }
             release_message_capacity(&mut q, &replay_msg);
         }
-        apply_write_result(&mut q, replay_result);
+        let replay_kind = match &replay_msg {
+            Msg::Oob(kind, ..) => Some(*kind),
+            _ => None,
+        };
+        apply_write_result(&mut q, replay_result, replay_kind);
         if matches!(q.status, WriterStatus::Fatal(_)) {
             abandon_queued_messages(&mut q);
         }
@@ -883,7 +916,7 @@ fn write_message(
 }
 
 fn release_oob_capacity(q: &mut Q, msg: &Msg) {
-    if let Msg::Oob(bytes) = msg {
+    if let Msg::Oob(_, bytes, _) = msg {
         q.oob_in_flight = q.oob_in_flight.saturating_sub(1);
         q.oob_bytes = q.oob_bytes.saturating_sub(bytes.len());
     }
@@ -965,7 +998,7 @@ fn write_teardown_with(
 /// consecutive-failure counter; a transient error becomes `Transient` until
 /// [`crate::frame_write::RETRY_MAX`] in a row escalate to `Fatal`; a
 /// non-transient error is `Fatal` immediately. Fatal is sticky.
-fn apply_write_result(q: &mut Q, result: std::io::Result<()>) {
+fn apply_write_result(q: &mut Q, result: std::io::Result<()>, oob_kind: Option<OobKind>) {
     match result {
         Ok(()) => {
             q.consec_errs = 0;
@@ -981,12 +1014,19 @@ fn apply_write_result(q: &mut Q, result: std::io::Result<()>) {
             let transient = crate::frame_write::is_transient_io(&e);
             q.consec_errs += 1;
             if !transient || q.consec_errs > crate::frame_write::RETRY_MAX {
-                q.status = WriterStatus::Fatal(format!(
-                    "terminal write failed ({e}) after {} attempt(s)",
-                    q.consec_errs
-                ));
+                q.status = WriterStatus::Fatal(match oob_kind {
+                    Some(kind) => format!(
+                        "terminal {} OOB write failed ({e}) after {} attempt(s)",
+                        kind.label(),
+                        q.consec_errs
+                    ),
+                    None => format!(
+                        "terminal write failed ({e}) after {} attempt(s)",
+                        q.consec_errs
+                    ),
+                });
             } else {
-                q.status = WriterStatus::Transient;
+                q.status = WriterStatus::Transient(oob_kind.unwrap_or(OobKind::Other));
             }
         }
     }
@@ -1083,7 +1123,7 @@ mod tests {
         assert!(writer.submit_frame(vec![1], None));
         assert!(started.elapsed() < SYNC_WRITE_BOUND + std::time::Duration::from_millis(150));
         assert!(matches!(writer.take_status(), WriterStatus::Fatal(_)));
-        assert_eq!(writer.try_submit_oob(vec![2]), Err(vec![2]));
+        assert_eq!(writer.try_submit_oob(OobKind::Other, vec![2]), Err(vec![2]));
         release_tx.send(()).unwrap();
         drop(writer);
         assert_eq!(*log.lock().unwrap(), vec![vec![1]]);
@@ -1101,7 +1141,7 @@ mod tests {
         });
         assert!(writer.submit_frame(vec![1], None));
         assert_eq!(log.lock().unwrap().len(), 1);
-        assert_eq!(writer.try_submit_oob(vec![2]), Ok(()));
+        assert_eq!(writer.try_submit_oob(OobKind::Other, vec![2]), Ok(()));
         assert_eq!(log.lock().unwrap().len(), 2);
         let retry_deadline = Instant::now() + std::time::Duration::from_millis(250);
         loop {
@@ -1164,7 +1204,7 @@ mod tests {
             "synchronous writer deadline expired",
             "sync timeout must wake the idle event loop so Fatal is observed"
         );
-        assert_eq!(writer.try_submit_oob(vec![2]), Err(vec![2]));
+        assert_eq!(writer.try_submit_oob(OobKind::Other, vec![2]), Err(vec![2]));
         release_tx.send(()).unwrap();
         drop(writer);
         assert_eq!(*log.lock().unwrap(), vec![bytes]);
@@ -1185,7 +1225,7 @@ mod tests {
             }
         });
         assert!(writer.submit_frame(bytes.clone(), None));
-        assert_eq!(writer.try_submit_oob(vec![9]), Ok(()));
+        assert_eq!(writer.try_submit_oob(OobKind::Other, vec![9]), Ok(()));
         assert_eq!(*log.lock().unwrap(), vec![bytes, vec![9]]);
         drop(writer);
     }
@@ -1220,7 +1260,7 @@ mod tests {
             q.submitted_seq = q.submitted_seq.saturating_add(1);
             q.oob_in_flight += 1;
             q.oob_bytes += 1;
-            q.msgs.push_back(Msg::Oob(vec![2]));
+            q.msgs.push_back(Msg::Oob(OobKind::Other, vec![2], 2));
         }
         assert!(first.join().unwrap());
         let started = Instant::now();
@@ -1236,7 +1276,7 @@ mod tests {
     #[test]
     fn clipboard_admission_is_bounded_fifo_and_capacity_is_returned_after_write() {
         let writer = test_writer();
-        writer.submit_oob(vec![0]);
+        writer.submit_oob(OobKind::Other, vec![0]);
         for byte in 1..=4 {
             assert!(writer.try_submit_clipboard(vec![byte], || panic!()).is_ok());
         }
@@ -1247,7 +1287,7 @@ mod tests {
         let mut q = writer.inner.q.lock().unwrap();
         assert_eq!(q.clipboard_queued, 4);
         assert_eq!(q.clipboard_bytes, 4);
-        assert!(matches!(pop_message(&mut q), Some(Msg::Oob(ref b)) if b == &[0]));
+        assert!(matches!(pop_message(&mut q), Some(Msg::Oob(_, ref b, _)) if b == &[0]));
         for byte in 1..=4 {
             assert!(matches!(pop_message(&mut q), Some(Msg::Clipboard(ref b, _) ) if b == &[byte]));
         }
@@ -1340,7 +1380,7 @@ mod tests {
     }
 
     #[test]
-    fn failed_then_replayed_clipboard_commits_without_an_outcome() {
+    fn failed_then_replayed_clipboard_reports_a_committed_outcome() {
         let writer = test_writer();
         writer
             .try_submit_clipboard(vec![b'C'], || panic!())
@@ -1356,7 +1396,10 @@ mod tests {
         assert!(writer.submit_frame(vec![b'F'], None));
         let frame = pop_message(&mut writer.inner.q.lock().unwrap()).unwrap();
         assert!(!write_message(&writer.inner, frame, |_| Ok(())).0);
-        assert_eq!(writer.take_clipboard_outcome(), None);
+        assert_eq!(
+            writer.take_clipboard_outcome(),
+            Some(ClipboardOutcome::Committed)
+        );
     }
 
     #[test]
@@ -1392,7 +1435,11 @@ mod tests {
         );
         assert_eq!(writer.take_clipboard_outcome(), None);
 
-        assert!(writer.try_submit_oob(b"graphics".to_vec()).is_ok());
+        assert!(
+            writer
+                .try_submit_oob(OobKind::Graphics, b"graphics".to_vec())
+                .is_ok()
+        );
         let oob = pop_message(&mut writer.inner.q.lock().unwrap()).unwrap();
         assert!(
             write_message(&writer.inner, oob, |_| {
@@ -1423,13 +1470,66 @@ mod tests {
         assert!(writer.try_submit_clipboard(vec![b'B'], || panic!()).is_ok());
         let second = pop_message(&mut writer.inner.q.lock().unwrap()).unwrap();
         assert!(!write_message(&writer.inner, second, |_| Ok(())).0);
-        assert_eq!(writer.take_clipboard_outcome(), None);
+        assert_eq!(
+            writer.take_clipboard_outcome(),
+            Some(ClipboardOutcome::Committed)
+        );
         note_clipboard(
             &mut writer.inner.q.lock().unwrap(),
             first_id,
             Some(ClipboardOutcome::Uncertain),
         );
         assert_eq!(writer.take_clipboard_outcome(), None);
+    }
+
+    #[test]
+    fn oob_kind_round_trips_with_a_monotonic_delivery_id() {
+        let writer = test_writer();
+        let kinds = [
+            OobKind::KittyDelete,
+            OobKind::Marker,
+            OobKind::Graphics,
+            OobKind::Bell,
+            OobKind::Other,
+        ];
+        for (index, kind) in kinds.into_iter().enumerate() {
+            assert!(writer.try_submit_oob(kind, vec![index as u8]).is_ok());
+        }
+        let mut q = writer.inner.q.lock().unwrap();
+        for (index, kind) in kinds.into_iter().enumerate() {
+            assert!(matches!(
+                pop_message(&mut q),
+                Some(Msg::Oob(queued_kind, ref bytes, id))
+                    if queued_kind == kind && bytes == &[index as u8] && id == index as u64 + 1
+            ));
+        }
+    }
+
+    #[test]
+    fn failed_non_clipboard_oob_names_its_kind_without_clipboard_wording() {
+        for kind in [OobKind::Graphics, OobKind::Marker, OobKind::Bell] {
+            let writer = test_writer_with_worker_frames(false);
+            assert!(
+                writer
+                    .try_submit_oob(kind, b"SECRET-PAYLOAD".to_vec())
+                    .is_ok()
+            );
+            let oob = pop_message(&mut writer.inner.q.lock().unwrap()).unwrap();
+            assert!(
+                write_message(&writer.inner, oob, |_| {
+                    Err(std::io::ErrorKind::BrokenPipe.into())
+                })
+                .0
+            );
+            let status = writer.take_status();
+            let WriterStatus::Fatal(status) = status else {
+                panic!("non-transient OOB failure must be fatal")
+            };
+            assert!(status.contains(kind.label()));
+            assert!(!status.contains("clipboard"));
+            assert!(!status.contains("SECRET-PAYLOAD"));
+            assert_eq!(writer.take_clipboard_outcome(), None);
+        }
     }
 
     #[test]
@@ -1499,7 +1599,9 @@ mod tests {
         );
         assert_eq!(writer.take_metrics().unwrap().completion_us.count(), 1);
         let (errored, released_oob, _) =
-            write_message(&writer.inner, Msg::Oob(vec![2]), |_| Ok(()));
+            write_message(&writer.inner, Msg::Oob(OobKind::Other, vec![2], 1), |_| {
+                Ok(())
+            });
         assert!(!errored);
         assert!(released_oob, "completed OOB write must release capacity");
         assert!(
@@ -1536,6 +1638,7 @@ mod tests {
         apply_write_result(
             &mut writer.inner.q.lock().unwrap(),
             Err(std::io::ErrorKind::Interrupted.into()),
+            None,
         );
         assert!(writer.inner.q.lock().unwrap().parser_reset_pending);
 
@@ -1573,6 +1676,7 @@ mod tests {
         apply_write_result(
             &mut writer.inner.q.lock().unwrap(),
             Err(std::io::ErrorKind::Interrupted.into()),
+            None,
         );
         let mut calls = Vec::new();
         let (errored, _, _) = write_message(&writer.inner, Msg::Frame(vec![9], None, 1), |bytes| {
@@ -1587,7 +1691,7 @@ mod tests {
     #[test]
     fn failed_oob_is_replayed_after_the_first_later_successful_frame() {
         let writer = test_writer();
-        assert!(writer.try_submit_oob(vec![b'A']).is_ok());
+        assert!(writer.try_submit_oob(OobKind::Other, vec![b'A']).is_ok());
         let failed = pop_message(&mut writer.inner.q.lock().unwrap()).unwrap();
         let mut calls = Vec::new();
         let (errored, released, _) = write_message(&writer.inner, failed, |bytes| {
@@ -1624,7 +1728,7 @@ mod tests {
     fn deferred_oob_waits_past_pre_failure_frames_and_later_oob() {
         let writer = test_writer();
         assert!(writer.submit_frame(vec![b'P'], None));
-        assert!(writer.try_submit_oob(vec![b'A']).is_ok());
+        assert!(writer.try_submit_oob(OobKind::Other, vec![b'A']).is_ok());
         let mut q = writer.inner.q.lock().unwrap();
         let prior_frame = pop_message(&mut q).unwrap();
         let failed_oob = pop_message(&mut q).unwrap();
@@ -1644,7 +1748,7 @@ mod tests {
             })
             .0
         );
-        assert!(writer.try_submit_oob(vec![b'B']).is_ok());
+        assert!(writer.try_submit_oob(OobKind::Other, vec![b'B']).is_ok());
         let later_oob = pop_message(&mut writer.inner.q.lock().unwrap()).unwrap();
         assert!(
             !write_message(&writer.inner, later_oob, |bytes| {
@@ -1705,7 +1809,7 @@ mod tests {
     #[test]
     fn repeated_deferred_replay_failure_becomes_fatal_and_abandon_releases_capacity() {
         let writer = test_writer();
-        assert!(writer.try_submit_oob(vec![b'A']).is_ok());
+        assert!(writer.try_submit_oob(OobKind::Other, vec![b'A']).is_ok());
         let oob = pop_message(&mut writer.inner.q.lock().unwrap()).unwrap();
         assert!(
             write_message(&writer.inner, oob, |_| {
@@ -1752,7 +1856,7 @@ mod tests {
     #[test]
     fn termwiz_parity_drops_failed_oob_without_a_worker_frame() {
         let writer = test_writer_with_worker_frames(false);
-        assert!(writer.try_submit_oob(vec![b'A']).is_ok());
+        assert!(writer.try_submit_oob(OobKind::Other, vec![b'A']).is_ok());
         let oob = pop_message(&mut writer.inner.q.lock().unwrap()).unwrap();
         assert!(
             write_message(&writer.inner, oob, |_| {
@@ -1776,7 +1880,7 @@ mod tests {
         );
         let inner = Arc::clone(&writer.inner);
         assert!(writer.submit_frame(vec![b'F'], None));
-        assert!(writer.try_submit_oob(vec![b'A']).is_ok());
+        assert!(writer.try_submit_oob(OobKind::Other, vec![b'A']).is_ok());
         {
             let mut q = inner.q.lock().unwrap();
             let deadline = Instant::now() + std::time::Duration::from_secs(1);
@@ -1838,7 +1942,7 @@ mod tests {
     fn fatal_during_first_replay_abandons_remaining_oob_and_releases_capacity() {
         let writer = test_writer();
         for byte in *b"AB" {
-            assert!(writer.try_submit_oob(vec![byte]).is_ok());
+            assert!(writer.try_submit_oob(OobKind::Other, vec![byte]).is_ok());
             let oob = pop_message(&mut writer.inner.q.lock().unwrap()).unwrap();
             assert!(
                 write_message(&writer.inner, oob, |_| {
@@ -1911,18 +2015,22 @@ mod tests {
     #[test]
     fn oob_admission_accepts_four_mib_and_refusal_is_not_fatal() {
         let writer = test_writer();
-        assert!(writer.try_submit_oob(vec![0; OOB_QUEUE_BYTES]).is_ok());
+        assert!(
+            writer
+                .try_submit_oob(OobKind::Other, vec![0; OOB_QUEUE_BYTES])
+                .is_ok()
+        );
         assert_eq!(writer.inner.q.lock().unwrap().oob_bytes, 4 * 1024 * 1024);
 
         let byte_bounded = test_writer();
         assert!(
             byte_bounded
-                .try_submit_oob(vec![0; 3 * 1024 * 1024])
+                .try_submit_oob(OobKind::Other, vec![0; 3 * 1024 * 1024])
                 .is_ok()
         );
         assert_eq!(
             byte_bounded
-                .try_submit_oob(vec![1; 2 * 1024 * 1024])
+                .try_submit_oob(OobKind::Other, vec![1; 2 * 1024 * 1024])
                 .unwrap_err()
                 .len(),
             2 * 1024 * 1024
@@ -1930,16 +2038,22 @@ mod tests {
 
         let refusing = test_writer();
         for _ in 0..OOB_QUEUE_COUNT {
-            assert!(refusing.try_submit_oob(vec![1]).is_ok());
+            assert!(refusing.try_submit_oob(OobKind::Other, vec![1]).is_ok());
         }
-        refusing.submit_oob(vec![2]);
+        refusing.submit_oob(OobKind::Other, vec![2]);
         assert_eq!(refusing.take_status(), WriterStatus::Ok);
-        let refused = refusing.try_submit_oob(vec![3]).unwrap_err();
+        let refused = refusing
+            .try_submit_oob(OobKind::Other, vec![3])
+            .unwrap_err();
         assert_eq!(refused, vec![3]);
         assert!(refusing.inner.oob_retry.load(Ordering::SeqCst));
 
         let release_writer = test_writer();
-        assert!(release_writer.try_submit_oob(vec![9]).is_ok());
+        assert!(
+            release_writer
+                .try_submit_oob(OobKind::Other, vec![9])
+                .is_ok()
+        );
         let active = pop_message(&mut release_writer.inner.q.lock().unwrap()).unwrap();
         let (errored, released, _) = write_message(&release_writer.inner, active, |_| Ok(()));
         assert!(!errored);
@@ -1948,21 +2062,25 @@ mod tests {
             &release_writer.inner,
             released
         ));
-        assert!(release_writer.try_submit_oob(vec![4]).is_ok());
+        assert!(
+            release_writer
+                .try_submit_oob(OobKind::Other, vec![4])
+                .is_ok()
+        );
     }
 
     #[test]
     fn oob_pressure_warns_once_and_refusal_wakes_on_capacity_release() {
         let writer = test_writer();
         for _ in 0..OOB_QUEUE_COUNT {
-            assert!(writer.try_submit_oob(vec![1]).is_ok());
+            assert!(writer.try_submit_oob(OobKind::Other, vec![1]).is_ok());
         }
-        assert_eq!(writer.try_submit_oob(vec![2]), Err(vec![2]));
+        assert_eq!(writer.try_submit_oob(OobKind::Other, vec![2]), Err(vec![2]));
         assert!(writer.inner.oob_retry.load(Ordering::SeqCst));
 
-        writer.submit_oob(vec![3]);
+        writer.submit_oob(OobKind::Other, vec![3]);
         assert!(writer.inner.oob_pressure_logged.load(Ordering::SeqCst));
-        writer.submit_oob(vec![4]);
+        writer.submit_oob(OobKind::Other, vec![4]);
         assert!(writer.inner.oob_pressure_logged.load(Ordering::SeqCst));
 
         let active = pop_message(&mut writer.inner.q.lock().unwrap()).unwrap();
@@ -1972,7 +2090,7 @@ mod tests {
         assert!(oob_capacity_wake_requested(&writer.inner, released));
         assert!(!writer.inner.oob_retry.load(Ordering::SeqCst));
 
-        assert!(writer.try_submit_oob(vec![5]).is_ok());
+        assert!(writer.try_submit_oob(OobKind::Other, vec![5]).is_ok());
         assert!(!writer.inner.oob_pressure_logged.load(Ordering::SeqCst));
     }
 
@@ -1980,12 +2098,14 @@ mod tests {
     fn refused_clipboard_copy_retries_after_oob_capacity_wake() {
         let writer = test_writer();
         for _ in 0..OOB_QUEUE_COUNT {
-            assert!(writer.try_submit_oob(vec![1]).is_ok());
+            assert!(writer.try_submit_oob(OobKind::Other, vec![1]).is_ok());
         }
 
         let mut clipboard = crate::preview_retry::PendingClipboardOob::default();
         let osc52 = crate::copymode::osc52("hi");
-        clipboard.offer(osc52.clone(), |bytes| writer.try_submit_oob(bytes));
+        clipboard.offer(osc52.clone(), |bytes| {
+            writer.try_submit_oob(OobKind::Other, bytes)
+        });
         assert!(clipboard.is_pending());
         assert!(writer.inner.oob_retry.load(Ordering::SeqCst));
 
@@ -1995,9 +2115,9 @@ mod tests {
         assert!(released);
         assert!(oob_capacity_wake_requested(&writer.inner, released));
 
-        clipboard.retry(|bytes| writer.try_submit_oob(bytes));
+        clipboard.retry(|bytes| writer.try_submit_oob(OobKind::Other, bytes));
         let q = writer.inner.q.lock().unwrap();
-        assert!(matches!(q.msgs.back(), Some(Msg::Oob(bytes)) if bytes == &osc52));
+        assert!(matches!(q.msgs.back(), Some(Msg::Oob(_, bytes, _)) if bytes == &osc52));
         assert!(!clipboard.is_pending());
     }
 
@@ -2012,7 +2132,7 @@ mod tests {
         let written = Arc::new(Mutex::new(Vec::<Vec<u8>>::new()));
         {
             let mut q = inner.q.lock().unwrap();
-            q.msgs.push_back(Msg::Oob(vec![2]));
+            q.msgs.push_back(Msg::Oob(OobKind::Other, vec![2], 1));
             q.msgs.push_back(Msg::Frame(vec![3], None, 2));
             q.oob_in_flight = 1;
             q.oob_bytes = 1;
@@ -2080,16 +2200,18 @@ mod tests {
             apply_write_result(
                 &mut state,
                 Err(std::io::Error::from_raw_os_error(libc::EIO)),
+                None,
             );
             assert_eq!(
                 state.status,
-                WriterStatus::Transient,
+                WriterStatus::Transient(OobKind::Other),
                 "attempt {i} should still be transient"
             );
         }
         apply_write_result(
             &mut state,
             Err(std::io::Error::from_raw_os_error(libc::EIO)),
+            None,
         );
         assert!(matches!(state.status, WriterStatus::Fatal(_)));
     }
@@ -2101,12 +2223,13 @@ mod tests {
         apply_write_result(
             &mut state,
             Err(std::io::Error::from_raw_os_error(libc::EIO)),
+            None,
         );
         assert_eq!(state.consec_errs, 1);
-        apply_write_result(&mut state, Ok(()));
+        apply_write_result(&mut state, Ok(()), None);
         assert_eq!(state.consec_errs, 0);
         // The pending Transient stays for the loop to observe.
-        assert_eq!(state.status, WriterStatus::Transient);
+        assert_eq!(state.status, WriterStatus::Transient(OobKind::Other));
     }
 
     #[test]
@@ -2115,19 +2238,24 @@ mod tests {
         apply_write_result(
             &mut state,
             Err(std::io::Error::from(std::io::ErrorKind::BrokenPipe)),
+            None,
         );
         assert!(matches!(state.status, WriterStatus::Fatal(_)));
         // Sticky: later successes/errors don't downgrade it.
-        apply_write_result(&mut state, Ok(()));
+        apply_write_result(&mut state, Ok(()), None);
         assert!(matches!(state.status, WriterStatus::Fatal(_)));
     }
 
     #[test]
     fn small_oob_release_does_not_wake_a_refused_near_limit_message() {
         let writer = test_writer();
-        assert!(writer.try_submit_oob(vec![1]).is_ok());
-        assert!(writer.try_submit_oob(vec![2; 1024 * 1024]).is_ok());
-        let refused = writer.try_submit_oob(vec![3; 3_500 * 1024]);
+        assert!(writer.try_submit_oob(OobKind::Other, vec![1]).is_ok());
+        assert!(
+            writer
+                .try_submit_oob(OobKind::Other, vec![2; 1024 * 1024])
+                .is_ok()
+        );
+        let refused = writer.try_submit_oob(OobKind::Other, vec![3; 3_500 * 1024]);
         assert!(refused.is_err());
         assert!(writer.inner.oob_retry.load(Ordering::SeqCst));
 
@@ -2144,37 +2272,73 @@ mod tests {
         assert!(released);
         assert!(oob_capacity_wake_requested(&writer.inner, released));
         assert!(!writer.inner.oob_retry.load(Ordering::SeqCst));
-        assert!(writer.try_submit_oob(vec![3; 3_500 * 1024]).is_ok());
+        assert!(
+            writer
+                .try_submit_oob(OobKind::Other, vec![3; 3_500 * 1024])
+                .is_ok()
+        );
     }
 
     #[test]
     fn smallest_refused_need_wakes_first() {
         let writer = test_writer();
-        assert!(writer.try_submit_oob(vec![1; 300 * 1024]).is_ok());
-        assert!(writer.try_submit_oob(vec![2; 3_600 * 1024]).is_ok());
-        assert!(writer.try_submit_oob(vec![3; 3_500 * 1024]).is_err());
-        assert!(writer.try_submit_oob(vec![4; 200 * 1024]).is_err());
+        assert!(
+            writer
+                .try_submit_oob(OobKind::Other, vec![1; 300 * 1024])
+                .is_ok()
+        );
+        assert!(
+            writer
+                .try_submit_oob(OobKind::Other, vec![2; 3_600 * 1024])
+                .is_ok()
+        );
+        assert!(
+            writer
+                .try_submit_oob(OobKind::Other, vec![3; 3_500 * 1024])
+                .is_err()
+        );
+        assert!(
+            writer
+                .try_submit_oob(OobKind::Other, vec![4; 200 * 1024])
+                .is_err()
+        );
 
         let small = pop_message(&mut writer.inner.q.lock().unwrap()).unwrap();
         let (errored, released, _) = write_message(&writer.inner, small, |_| Ok(()));
         assert!(!errored);
         assert!(released);
         assert!(oob_capacity_wake_requested(&writer.inner, released));
-        assert!(writer.try_submit_oob(vec![4; 200 * 1024]).is_ok());
+        assert!(
+            writer
+                .try_submit_oob(OobKind::Other, vec![4; 200 * 1024])
+                .is_ok()
+        );
     }
 
     #[test]
     fn dropped_lossy_refusal_does_not_dilute_retained_wake_need() {
         let writer = test_writer();
-        assert!(writer.try_submit_oob(vec![1; 300 * 1024]).is_ok());
-        assert!(writer.try_submit_oob(vec![2; 3_600 * 1024]).is_ok());
-        assert!(writer.try_submit_oob(vec![3; 3_500 * 1024]).is_err());
+        assert!(
+            writer
+                .try_submit_oob(OobKind::Other, vec![1; 300 * 1024])
+                .is_ok()
+        );
+        assert!(
+            writer
+                .try_submit_oob(OobKind::Other, vec![2; 3_600 * 1024])
+                .is_ok()
+        );
+        assert!(
+            writer
+                .try_submit_oob(OobKind::Other, vec![3; 3_500 * 1024])
+                .is_err()
+        );
         assert_eq!(
             writer.inner.q.lock().unwrap().oob_retry_need,
             Some(3_500 * 1024)
         );
 
-        writer.submit_oob(vec![4]);
+        writer.submit_oob(OobKind::Other, vec![4]);
         assert_eq!(
             writer.inner.q.lock().unwrap().oob_retry_need,
             Some(3_500 * 1024)
@@ -2248,7 +2412,10 @@ mod tests {
         );
         let newer = pop_message(&mut writer.inner.q.lock().unwrap()).unwrap();
         assert!(!write_message(&writer.inner, newer, |_| Ok(())).0);
-        assert_eq!(writer.take_clipboard_outcome(), None);
+        assert_eq!(
+            writer.take_clipboard_outcome(),
+            Some(ClipboardOutcome::Committed)
+        );
     }
 
     #[test]
@@ -2375,7 +2542,7 @@ mod tests {
 
             for _ in 0..16 {
                 assert!(!writer.submit_frame(vec![2], None));
-                assert_eq!(writer.try_submit_oob(vec![3]), Err(vec![3]));
+                assert_eq!(writer.try_submit_oob(OobKind::Other, vec![3]), Err(vec![3]));
                 assert_eq!(writer.try_submit_clipboard(vec![4], || {}), Err(vec![4]));
             }
 
