@@ -73,6 +73,13 @@ ACP/bouncer/tool-interception, token compression, remote-sandbox tunnels, and
 the managed-agent dialer stay excised (removed before the alpha, not reopened by
 the proxy).
 
+The in-process host and daemon worker families, their wake sources, visibility
+gates, cancellation paths, and event-ingress drain budgets are source-inventoried
+in [`worker-inventory-2026-11.md`](audits/worker-inventory-2026-11.md). The
+performance rules that distinguish admission, coalescing, delivery, idle polling,
+and process-wide resource ceilings live in
+[`performance-metrics.md`](performance-metrics.md).
+
 ## 2. The event loop (0% idle)
 
 When idle the loop blocks on termwiz `poll_input(None)` — no tick, no timeout.
