@@ -66,7 +66,8 @@ It is live but not part of the stable shell, and the alpha tarball and flake
 ship only `thegn` (build `tgproxy` from source; see
 `docs/help/ai-usage.md`).
 The host supervises it off the UI loop (`model_proxy_daemon.rs`, `core::backoff`
-restarts) and projects control through four OPERATOR-only capability rows
+restarts) and projects control through four CLI-only capability rows (local
+`thegn proxy …`; no control-API, gRPC, MCP or plugin door)
 (`model_proxy.status/stats/start/stop`). The pure routing logic lives in
 `thegn_core::proxy` (95%-gated); the resurrection boundary is firm —
 ACP/bouncer/tool-interception, token compression, remote-sandbox tunnels, and
