@@ -913,7 +913,7 @@ mod tests {
             ProducerKind::FlooderPlusQuiet,
             11,
             SinkMode::Fast,
-            16 * 1024,
+            128 * 1024,
             LoadFactors::all(),
         );
         assert_eq!(observation.joined_load_threads, 1);
