@@ -799,7 +799,7 @@ mod tests {
         assert!(rendered.contains("ordinary failure\n"));
         assert!(rendered.contains("^["));
         assert!(rendered.contains("\\u{7}"));
-        assert!(rendered.contains("split control starts\n[2J remains text"));
+        assert!(rendered.contains("split control starts^[\n[2J remains text"));
     }
 
     #[test]

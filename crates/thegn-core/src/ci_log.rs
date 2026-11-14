@@ -804,7 +804,7 @@ mod tests {
 
         assert_eq!(
             inert_controls(hostile),
-            "ordinary ^[]52;c;secret\\u{7}^[[31mred^[_apc^[\\^[Pdcs^[\\u{9b}31m\\u{9d}osc\\u{9c}"
+            "ordinary ^[]52;c;secret\\u{7}^[[31mred^[_apc^[\\^[Pdcs^[\\\\u{9b}31m\\u{9d}osc\\u{9c}"
         );
     }
 
