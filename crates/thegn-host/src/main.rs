@@ -290,6 +290,7 @@ mod sidebar_pipeline;
 mod sidebar_view;
 mod skill_seed;
 mod snapshot;
+mod snapshot_slot;
 #[cfg(test)]
 mod spawn_ratchet_tests;
 mod sprite_bridge;
