@@ -3200,14 +3200,15 @@ async fn drive_exec<S>(
                 }
                 Some(ExecControl::Close) | None => {
                     if !tty
-                        && let Err(error) = write
+                        && write
                             .send(Message::Binary(encode_stream_stdin_eof().into()))
                             .await
+                            .is_err()
                     {
-                        tracing::debug!(target: "thegn::provider", ?error, "provider exec stdin EOF could not be sent");
+                        tracing::debug!(target: "thegn::provider", "provider exec stdin EOF could not be sent");
                     }
-                    if let Err(error) = write.send(Message::Close(None)).await {
-                        tracing::debug!(target: "thegn::provider", ?error, "provider exec close could not be sent");
+                    if write.send(Message::Close(None)).await.is_err() {
+                        tracing::debug!(target: "thegn::provider", "provider exec close could not be sent");
                     }
                     break;
                 }
