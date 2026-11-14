@@ -197,15 +197,15 @@ pub(crate) fn trusted_land_gate_id(
             trusted.detail(row.id).replace('\n', " ")
         ));
     }
-    let folded_tree = util::git_out_allow_empty(
+    let folded_tree = observed_text(
         repo,
         &[
             "rev-parse",
             "--verify",
             &format!("{folded_commit}^{{tree}}"),
         ],
-    )
-    .ok_or_else(|| format!("land commit {folded_commit} tree binding could not be observed"))?;
+        &format!("land commit {folded_commit} tree binding could not be observed"),
+    )?;
     if folded_tree != latest.tree_oid {
         return Err(format!(
             "attestation {} tree binding is {} but land tree is {folded_tree}",
@@ -227,37 +227,34 @@ fn observe_attestation_context(
     let input = PathBuf::from(&row.worktree_path);
     let worktree = std::fs::canonicalize(&input)
         .map_err(|error| format!("cannot canonicalize worktree {}: {error}", input.display()))?;
-    let top = util::git_out_allow_empty(&worktree, &["rev-parse", "--show-toplevel"])
-        .filter(|value| !value.trim().is_empty())
-        .ok_or_else(|| "worktree root could not be observed".to_string())?;
+    let top = observed_text(
+        &worktree,
+        &["rev-parse", "--show-toplevel"],
+        "worktree root could not be observed",
+    )?;
     let top = std::fs::canonicalize(top.trim())
         .map_err(|error| format!("cannot canonicalize Git worktree root: {error}"))?;
     if top != worktree {
         return Err("dispatch path is not the root of its Git worktree".to_string());
     }
-    let branch_ref = util::git_out_allow_empty(&worktree, &["symbolic-ref", "-q", "HEAD"])
-        .map(|value| value.trim().to_string())
-        .filter(|value| !value.is_empty())
-        .ok_or_else(|| "branch ref could not be observed (HEAD may be detached)".to_string())?;
+    let branch_ref = observed_branch_ref(&worktree)?;
     let head_oid = observed_oid(
         &worktree,
         &["rev-parse", "--verify", "HEAD^{commit}"],
         "commit",
     )?;
     let head_tree_oid = observed_oid(&worktree, &["rev-parse", "--verify", "HEAD^{tree}"], "tree")?;
-    let repo = util::git_out_allow_empty(
+    let repo = observed_text(
         &worktree,
         &["rev-parse", "--path-format=absolute", "--git-common-dir"],
-    )
-    .map(|value| value.trim().to_string())
-    .filter(|value| !value.is_empty())
-    .ok_or_else(|| "repository common directory could not be observed".to_string())?;
+        "repository common directory could not be observed",
+    )?;
     let repo = std::fs::canonicalize(repo)
         .map_err(|error| format!("cannot canonicalize repository common directory: {error}"))?
         .display()
         .to_string();
-    let dirty = util::git_out_allow_empty(&worktree, &["status", "--porcelain"])
-        .ok_or_else(|| "worktree status could not be observed".to_string())?;
+    let dirty = git_text(&worktree, &["status", "--porcelain"])
+        .map_err(|error| format!("worktree status could not be observed: {error}"))?;
     let log_present = std::fs::metadata(&attestation.log_path)
         .is_ok_and(|metadata| metadata.is_file() && metadata.len() > 0);
     Ok(AttestationContext {
@@ -277,13 +274,57 @@ fn observed_oid(
     args: &[&str],
     label: &str,
 ) -> std::result::Result<String, String> {
-    let value = util::git_out_allow_empty(worktree, args)
-        .ok_or_else(|| format!("{label} OID could not be observed"))?;
+    let value = git_text(worktree, args)
+        .map_err(|error| format!("{label} OID could not be observed: {error}"))?;
     let value = value.strip_suffix('\n').unwrap_or(&value);
     if !valid_oid(value) {
         return Err(format!("Git returned malformed {label} OID"));
     }
     Ok(value.to_string())
+}
+
+fn git_text(
+    worktree: &Path,
+    args: &[&str],
+) -> std::result::Result<String, thegn_core::git_run::GitTextError> {
+    super::git_text_local(worktree, args)
+}
+
+fn observed_text(
+    worktree: &Path,
+    args: &[&str],
+    label: &str,
+) -> std::result::Result<String, String> {
+    let value = git_text(worktree, args).map_err(|error| format!("{label}: {error}"))?;
+    if value.is_empty() {
+        return Err(format!("{label}: Git succeeded with empty stdout"));
+    }
+    Ok(value)
+}
+
+fn observed_branch_ref(worktree: &Path) -> std::result::Result<String, String> {
+    match git_text(worktree, &["symbolic-ref", "-q", "HEAD"]) {
+        Ok(value) if !value.is_empty() => Ok(value),
+        Ok(_) => Err("branch ref could not be observed (HEAD may be detached)".to_string()),
+        Err(error) if symbolic_ref_is_detached(&error) => {
+            Err("branch ref could not be observed (HEAD may be detached)".to_string())
+        }
+        Err(error) => Err(format!(
+            "branch ref could not be observed (HEAD may be detached): {error}"
+        )),
+    }
+}
+
+fn symbolic_ref_is_detached(error: &thegn_core::git_run::GitTextError) -> bool {
+    matches!(
+        error,
+        thegn_core::git_run::GitTextError::Failed(
+            thegn_core::git_run::GitOutcome::Exit {
+                code: Some(1),
+                stderr_tail,
+            }
+        ) if stderr_tail.is_empty()
+    )
 }
 
 #[derive(Debug)]
@@ -370,14 +411,12 @@ fn gate_row(
             ),
         )
     })?;
-    let top = util::git_out_allow_empty(&worktree, &["rev-parse", "--show-toplevel"])
-        .filter(|value| !value.trim().is_empty())
-        .ok_or_else(|| {
-            refusal(
-                id,
-                "worktree is not a local Git worktree; restore its local checkout",
-            )
-        })?;
+    let top = observed_text(
+        &worktree,
+        &["rev-parse", "--show-toplevel"],
+        "worktree is not a local Git worktree; restore its local checkout",
+    )
+    .map_err(|error| refusal(id, error))?;
     let top = std::fs::canonicalize(top.trim())
         .map_err(|error| refusal(id, format!("cannot resolve worktree root: {error}")))?;
     if top != worktree {
@@ -411,15 +450,29 @@ fn gate_row(
             ),
         ));
     }
-    let branch_ref = util::git_out_allow_empty(&worktree, &["symbolic-ref", "-q", "HEAD"])
-        .map(|value| value.trim().to_string())
-        .filter(|value| !value.is_empty())
-        .ok_or_else(|| {
-            refusal(
+    let branch_ref = match git_text(&worktree, &["symbolic-ref", "-q", "HEAD"]) {
+        Ok(value) if !value.is_empty() => value,
+        Ok(_) => {
+            return Err(refusal(
                 id,
                 "worktree has detached HEAD; check out a branch before running the gate",
-            )
-        })?;
+            ));
+        }
+        Err(error) if symbolic_ref_is_detached(&error) => {
+            return Err(refusal(
+                id,
+                "worktree has detached HEAD; check out a branch before running the gate",
+            ));
+        }
+        Err(error) => {
+            return Err(refusal(
+                id,
+                format!(
+                    "worktree has detached HEAD; check out a branch before running the gate: {error}"
+                ),
+            ));
+        }
+    };
     let commit_oid = required_oid(
         id,
         &worktree,
@@ -432,13 +485,12 @@ fn gate_row(
         &["rev-parse", "--verify", "HEAD^{tree}"],
         "tree",
     )?;
-    let repo = util::git_out_allow_empty(
+    let repo = observed_text(
         &worktree,
         &["rev-parse", "--path-format=absolute", "--git-common-dir"],
+        "cannot resolve repository common directory",
     )
-    .map(|value| value.trim().to_string())
-    .filter(|value| !value.is_empty())
-    .ok_or_else(|| refusal(id, "cannot resolve repository common directory"))?;
+    .map_err(|error| refusal(id, error))?;
     let repo = std::fs::canonicalize(repo)
         .map_err(|error| {
             refusal(
@@ -448,8 +500,8 @@ fn gate_row(
         })?
         .display()
         .to_string();
-    let dirty = util::git_out_allow_empty(&worktree, &["status", "--porcelain"])
-        .ok_or_else(|| refusal(id, "could not inspect worktree status"))?;
+    let dirty = git_text(&worktree, &["status", "--porcelain"])
+        .map_err(|error| refusal(id, format!("could not inspect worktree status: {error}")))?;
     if !dirty.is_empty() {
         return Err(refusal(
             id,
@@ -550,10 +602,10 @@ fn gate_row(
 }
 
 fn required_oid(id: i64, worktree: &Path, args: &[&str], label: &str) -> Result<String> {
-    let value = util::git_out_allow_empty(worktree, args).ok_or_else(|| {
+    let value = git_text(worktree, args).map_err(|error| {
         refusal(
             id,
-            format!("cannot resolve {label} OID; repair the worktree and retry"),
+            format!("cannot resolve {label} OID; repair the worktree and retry: {error}"),
         )
     })?;
     let value = value.strip_suffix('\n').unwrap_or(&value);
@@ -864,6 +916,38 @@ mod tests {
         );
         assert_refused(result, id);
         assert!(db.gate_attestations_for(id, 10).unwrap().is_empty());
+    }
+
+    #[test]
+    fn land_gate_refuses_an_unreadable_repository_with_typed_git_reason() {
+        let (_repo_dir, repo_path) = repo();
+        let (db, id, cfg, _log_dir, logs) = pipeline_setup(&repo_path);
+        gate_row(
+            &db,
+            &cfg,
+            id,
+            &logs,
+            &|_, _, _| Ok(GateVerdict::Passed),
+            &|| 100,
+        )
+        .unwrap();
+        finish_pipeline_row(&db, id);
+        let commit = git(&repo_path, &["rev-parse", "HEAD"]);
+        let git_dir = repo_path.join(".git");
+        if thegn_core::fsperm::set_mode_for_test(&git_dir, 0o000).is_err() {
+            return;
+        }
+        let result = trusted_land_gate(
+            &db,
+            &repo_path.display().to_string(),
+            &commit,
+            &commit,
+            &repo_path,
+        );
+        thegn_core::fsperm::set_mode_for_test(&git_dir, 0o700).unwrap();
+        let error = result.unwrap_err();
+        assert!(error.contains("could not be observed"), "{error}");
+        assert!(error.contains("Git exited"), "{error}");
     }
 
     #[test]
