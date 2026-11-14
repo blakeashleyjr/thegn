@@ -574,7 +574,7 @@ fn valid_sidecar_record_metadata(record: &SidecarRecord) -> bool {
         (None, None, None) => true,
         (Some(worktree), Some(generation), Some(placement)) => {
             !worktree.is_empty()
-                && *generation > 0
+                && generation > 0
                 && (placement == "local" || !placement.trim().is_empty())
         }
         _ => false,
