@@ -2,6 +2,7 @@
 //! At Full width the git-family frame (`gitfull`) renders instead — the old
 //! in-section side-by-side diff was unreachable there and has been removed.
 
+use thegn_core::pipeline_report::display_cell;
 use thegn_core::theme::Hue;
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
@@ -109,7 +110,10 @@ fn list(ctx: &SectionCtx) -> Vec<PanelRow> {
                     if n > 0 {
                         segs.push(seg(g2(), ", "));
                     }
-                    segs.push(seg(g(), format!("{} {}", ch.kind.label(), ch.name)));
+                    segs.push(seg(
+                        g(),
+                        format!("{} {}", ch.kind.label(), display_cell(&ch.name)),
+                    ));
                 }
                 rows.push(PanelRow::plain(Line::segs(segs)));
             }
@@ -232,7 +236,7 @@ fn impact_footer(
         }
         rows.push(PanelRow::plain(Line::segs(vec![
             sp(1),
-            seg(f(), path.clone()),
+            seg(f(), display_cell(path)),
         ])));
         for c in changes.iter().take(thegn_core::semantic::ENTITY_ROW_CAP) {
             let (glyph, tok) = match c.touch {
@@ -244,7 +248,7 @@ fn impact_footer(
                 sp(2),
                 seg(tok, format!("{glyph} ")),
                 seg(f(), format!("{} ", c.kind.label())),
-                seg(t(), c.name.clone()),
+                seg(t(), display_cell(&c.name)),
                 sp(1),
             ];
             segs.extend(diffstat(c.added, c.deleted));
@@ -348,11 +352,11 @@ fn change_row(c: &ChangeRow, i: usize, on: bool, deep: bool, cols: usize) -> Pan
         Stage::Unstaged => hue(Hue::Amber),
     };
     let name = match (on, c.stage) {
-        (true, _) => seg(t(), c.name.clone()).bold(),
+        (true, _) => seg(t(), display_cell(&c.name)).bold(),
         (false, Stage::Conflict) => {
-            seg(hue(Hue::Red), c.name.clone()).under(crate::seg::Under::CurlyHue(Hue::Red))
+            seg(hue(Hue::Red), display_cell(&c.name)).under(crate::seg::Under::CurlyHue(Hue::Red))
         }
-        _ => seg(d(), c.name.clone()),
+        _ => seg(d(), display_cell(&c.name)),
     };
     // Build right side first so its width is known before computing the path budget.
     let r: Vec<Seg> = match c.stage {
@@ -433,9 +437,9 @@ fn submodule_change_row(
     let path_budget = cols.saturating_sub(prefix_w);
     let dir_display = clip_dir_left(&c.dir, UnicodeWidthStr::width(c.name.as_str()), path_budget);
     let name = if on {
-        seg(t(), c.name.clone()).bold()
+        seg(t(), display_cell(&c.name)).bold()
     } else {
-        seg(d(), c.name.clone())
+        seg(d(), display_cell(&c.name))
     };
     let left = vec![
         seg(hue(Hue::Purple), gl.submodule),
@@ -642,8 +646,8 @@ fn hunk_preview(c: &ChangeRow, ui: &PanelUi, deep: bool, cols: usize) -> Vec<Pan
                     vec![
                         sp(1),
                         seg(g2(), "▾ "),
-                        seg(header_tok, h.header.clone()),
-                        seg(g(), format!(" {}", h.func)),
+                        seg(header_tok, display_cell(&h.header)),
+                        seg(g(), format!(" {}", display_cell(&h.func))),
                     ],
                     if c.stage == Stage::Staged {
                         vec![seg(hue(Hue::Green), "● staged")]
@@ -712,9 +716,9 @@ fn wrap_preview(tok: crate::seg::Tok, mark: &str, text: &str, cols: usize) -> Ve
             chunk
         };
         let segs = if first {
-            vec![sp(2), seg(tok, format!("{mark}{chunk}"))]
+            vec![sp(2), seg(tok, format!("{mark}{}", display_cell(chunk)))]
         } else {
-            vec![sp(4), seg(tok, chunk.to_string())]
+            vec![sp(4), seg(tok, display_cell(chunk))]
         };
         rows.push(PanelRow::plain(Line::segs(segs)));
         rest = &rest[chunk.len()..];

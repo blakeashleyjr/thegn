@@ -8,6 +8,7 @@
 //! or registered worktree.
 
 use thegn_core::aggregate::{AggRow, Aggregation, ExcerptKind};
+use thegn_core::pipeline_report::display_cell;
 use thegn_core::theme::Hue;
 
 use crate::seg::{Line, Seg, seg};
@@ -71,7 +72,7 @@ fn full_view(ctx: &SectionCtx) -> Vec<PanelRow> {
         match row {
             AggRow::Group { label, count } => {
                 list_rows.push(vec![
-                    seg(hue(Hue::Blue), label),
+                    seg(hue(Hue::Blue), display_cell(label)),
                     seg(d(), format!(" ·{count}")),
                 ]);
                 list_hits.push(None);
@@ -84,7 +85,10 @@ fn full_view(ctx: &SectionCtx) -> Vec<PanelRow> {
                 list_rows.push(vec![
                     seg(if sel { t() } else { g() }, if sel { "▶ " } else { "  " }),
                     kind_glyph(e.kind),
-                    seg(if sel { t() } else { d() }, format!(" {}", e.text)),
+                    seg(
+                        if sel { t() } else { d() },
+                        format!(" {}", display_cell(&e.text)),
+                    ),
                 ]);
                 list_hits.push(Some(i));
                 excerpts.push(i);
@@ -106,8 +110,8 @@ fn full_view(ctx: &SectionCtx) -> Vec<PanelRow> {
                 vec![kind_glyph(e.kind), seg(t(), format!(" {kind}")).bold()],
                 vec![
                     seg(g2(), "worktree  "),
-                    seg(d(), e.worktree_label.clone()),
-                    seg(f(), format!("  {}", e.worktree)),
+                    seg(d(), display_cell(&e.worktree_label)),
+                    seg(f(), format!("  {}", display_cell(&e.worktree))),
                 ],
             ];
             if !e.file.is_empty() {
@@ -115,14 +119,14 @@ fn full_view(ctx: &SectionCtx) -> Vec<PanelRow> {
                     Some(n) => format!("{}:{n}", e.file),
                     None => e.file.clone(),
                 };
-                d_rows.push(vec![seg(g2(), "at  "), seg(d(), loc)]);
+                d_rows.push(vec![seg(g2(), "at  "), seg(d(), display_cell(&loc))]);
             }
             d_rows.push(Vec::new());
-            for chunk in wrap_text(&e.text, detail_w) {
+            for chunk in wrap_text(&display_cell(&e.text), detail_w) {
                 d_rows.push(vec![seg(t(), chunk)]);
             }
             if !e.detail.is_empty() {
-                for chunk in wrap_text(&e.detail, detail_w) {
+                for chunk in wrap_text(&display_cell(&e.detail), detail_w) {
                     d_rows.push(vec![seg(f(), chunk)]);
                 }
             }
@@ -195,14 +199,14 @@ fn build_rows(agg: &Aggregation, deep: bool) -> Vec<PanelRow> {
                 // Source location (file:line) in the deep views; text always.
                 if deep && !e.file.is_empty() {
                     let loc = match e.line {
-                        Some(n) => format!("{}:{n} ", e.file),
-                        None => format!("{} ", e.file),
+                        Some(n) => format!("{}:{n} ", display_cell(&e.file)),
+                        None => format!("{} ", display_cell(&e.file)),
                     };
                     segs.push(seg(f(), loc));
                 }
-                segs.push(seg(d(), e.text.clone()));
+                segs.push(seg(d(), display_cell(&e.text)));
                 if deep && !e.detail.is_empty() {
-                    segs.push(seg(f(), format!("  {}", e.detail)));
+                    segs.push(seg(f(), format!("  {}", display_cell(&e.detail))));
                 }
                 rows.push(
                     PanelRow::plain(Line::segs(segs)).with_hit(PanelHit::Row(Section::Across, i)),

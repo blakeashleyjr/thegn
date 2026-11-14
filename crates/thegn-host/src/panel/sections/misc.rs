@@ -1,6 +1,7 @@
 //! The files, tests, sandbox, debug, and db sections. Files/tests/sandbox
 //! deepen per view; debug/db are placeholders (identical at every width).
 
+use thegn_core::pipeline_report::display_cell;
 use thegn_core::theme::Hue;
 use thegn_core::viz;
 
@@ -89,7 +90,7 @@ pub(super) fn files(ctx: &SectionCtx) -> Vec<PanelRow> {
             let mut l = vec![
                 sp(indent),
                 seg(g2(), chevron.to_string()),
-                seg(dir_fg, format!("{}/", e.name)),
+                seg(dir_fg, format!("{}/", display_cell(&e.name))),
             ];
             if changed_under > 0 && deep {
                 l.push(seg(g(), format!("  {changed_under}✎")));
@@ -133,7 +134,7 @@ pub(super) fn files(ctx: &SectionCtx) -> Vec<PanelRow> {
             if !st.is_empty() {
                 r.push(seg(st_tok, st));
             }
-            Line::split(vec![sp(indent + 2), seg(file_fg, e.name.clone())], r)
+            Line::split(vec![sp(indent + 2), seg(file_fg, display_cell(&e.name))], r)
         };
         let mut row = PanelRow::plain(line);
         row = row.with_hit(PanelHit::Row(Section::Files, fi));
@@ -197,7 +198,7 @@ fn file_preview_rows(fp: &crate::panel::FilePreview, cols: usize, rows: usize) -
     };
     out.push(PanelRow::plain(Line::segs(vec![
         sp(1),
-        seg(d(), fp.path.clone()).bold(),
+        seg(d(), display_cell(&fp.path)).bold(),
         seg(g2(), status),
     ])));
     out.push(PanelRow::plain(Line::segs(vec![
@@ -215,7 +216,7 @@ fn file_preview_rows(fp: &crate::panel::FilePreview, cols: usize, rows: usize) -
     if let Some(err) = &fp.error {
         out.push(PanelRow::plain(Line::segs(vec![
             sp(1),
-            seg(hue(Hue::Red), err.clone()),
+            seg(hue(Hue::Red), display_cell(err)),
         ])));
         return out;
     }
@@ -233,7 +234,7 @@ fn file_preview_rows(fp: &crate::panel::FilePreview, cols: usize, rows: usize) -
         let text: String = line.chars().take(avail).collect();
         out.push(PanelRow::plain(Line::segs(vec![
             seg(f(), format!("{num:>gutter$} ")),
-            seg(d(), text),
+            seg(d(), display_cell(&text)),
         ])));
     }
     out
@@ -338,7 +339,7 @@ pub(super) fn forward(ctx: &SectionCtx) -> Vec<PanelRow> {
                 )
                 .bold(),
                 seg(g2(), format!("{}  ", p.source)),
-                seg(g(), p.url.clone()),
+                seg(g(), display_cell(&p.url)),
             ]))
             .with_hit(PanelHit::Row(Section::Forward, 0))
         })
@@ -356,7 +357,7 @@ pub(super) fn forward(ctx: &SectionCtx) -> Vec<PanelRow> {
             };
             PanelRow::plain(Line::segs(vec![
                 seg(color, format!("\u{21c5} {port_label} ")).bold(),
-                seg(g(), f.url.clone()),
+                seg(g(), display_cell(&f.url)),
             ]))
             .with_hit(PanelHit::Row(
                 Section::Forward,
@@ -861,7 +862,7 @@ fn tests_full_tree(ctx: &SectionCtx) -> Vec<PanelRow> {
                         seg(if selected { super::t() } else { g2() }, arrow),
                         seg(
                             if selected { super::t() } else { super::d() },
-                            node.label.clone(),
+                            display_cell(&node.label),
                         )
                         .bold(),
                     ]
@@ -876,7 +877,8 @@ fn tests_full_tree(ctx: &SectionCtx) -> Vec<PanelRow> {
                     };
                     let indent = if node.depth > 0 { 2 } else { 0 };
                     let name_w = list_w.saturating_sub(indent + glyph.len() + 1);
-                    let label: String = node.label.chars().take(name_w).collect();
+                    let label = display_cell(&node.label);
+                    let label = crate::seg::clip_end(&label, name_w);
                     let mut segs = Vec::new();
                     if indent > 0 {
                         segs.push(sp(indent));

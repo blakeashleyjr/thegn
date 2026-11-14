@@ -3,6 +3,7 @@
 //! Full is the former telemetry overlay — big braille areas with an axis
 //! gutter, the per-core sparkrow, and humanized net rates.
 
+use thegn_core::pipeline_report::display_cell;
 use thegn_core::theme::Hue;
 use thegn_core::viz;
 use unicode_width::UnicodeWidthChar;
@@ -430,7 +431,7 @@ fn temps_line(ctx: &SectionCtx) -> Vec<PanelRow> {
             .take(4)
             .collect::<String>()
             .to_ascii_lowercase();
-        segs.push(seg(g(), format!("  {short} ")));
+        segs.push(seg(g(), format!("  {} ", display_cell(&short))));
         segs.push(seg(temp_tone(*c), format!("{c:.0}°")));
     }
     vec![PanelRow::plain(Line::Segs(segs))]
