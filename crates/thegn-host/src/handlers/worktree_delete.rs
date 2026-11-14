@@ -176,7 +176,7 @@ pub(crate) fn perform_close(cx: &mut DeleteCtx<'_>, targets: Vec<usize>) {
     crate::db_task::persist_critical(move |db| {
         let failures = close_groups_durably(db, &session_id, &removed_groups, Some(&cfg));
         if let Some(notice) = close_failure_notice(&failures) {
-            crate::db_task::alert(&notice);
+            crate::db_task::status(&notice);
         }
     });
 
@@ -264,20 +264,10 @@ pub(crate) fn close_failure_notice(failures: &[String]) -> Option<String> {
         return None;
     }
 
-    let shown = failures
-        .iter()
-        .take(3)
-        .map(|failure| crate::merge_sweep::safe_display(failure))
-        .collect::<Vec<_>>()
-        .join("; ");
-    let more = failures.len().saturating_sub(3);
-    let suffix = if more == 0 {
-        String::new()
-    } else {
-        format!(" (+{more} more)")
-    };
+    let shown = crate::merge_sweep::safe_display(&failures[0]);
+    let shown = shown.chars().take(120).collect::<String>();
     Some(format!(
-        "Close not recorded for {} worktree(s); they stay registered and reappear on the next refresh: {shown}{suffix}",
+        "Close not recorded for {} worktree(s); first failure: {shown}",
         failures.len()
     ))
 }
@@ -1108,7 +1098,7 @@ mod tests {
     }
 
     #[test]
-    fn close_failure_notice_names_every_failed_close() {
+    fn close_failure_notice_names_count_and_first_failed_close() {
         assert!(close_failure_notice(&[]).is_none());
 
         let failures = vec![
@@ -1117,8 +1107,8 @@ mod tests {
         ];
         let notice = close_failure_notice(&failures).unwrap();
         assert!(notice.contains("/worktrees/one"));
-        assert!(notice.contains("/worktrees/two"));
-        assert!(notice.contains("stay registered"));
+        assert!(!notice.contains("/worktrees/two"));
+        assert!(notice.contains("first failure"));
 
         let unsafe_failure = vec!["/worktrees/unsafe\u{1b}[2J: refused".into()];
         let notice = close_failure_notice(&unsafe_failure).unwrap();
@@ -1129,10 +1119,10 @@ mod tests {
             .collect::<Vec<_>>();
         let notice = close_failure_notice(&failures).unwrap();
         assert!(notice.contains("/worktrees/1"));
-        assert!(notice.contains("/worktrees/2"));
-        assert!(notice.contains("/worktrees/3"));
+        assert!(!notice.contains("/worktrees/2"));
+        assert!(!notice.contains("/worktrees/3"));
         assert!(!notice.contains("/worktrees/4"));
-        assert!(notice.contains("(+2 more)"));
+        assert!(notice.contains("5 worktree(s)"));
     }
 
     #[test]
