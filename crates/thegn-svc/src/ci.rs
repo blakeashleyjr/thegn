@@ -814,7 +814,7 @@ impl LogCollector {
     }
 
     fn redact_retained_lines_once(&mut self) {
-        redact_retained_lines_once(
+        thegn_core::ci_log::redact_retained_on_unmatched_end(
             &mut self.lines,
             &mut self.kept_bytes,
             &mut self.unmatched_end_redacted,
@@ -935,7 +935,11 @@ fn push_log_line(
     if marker == Some(true) {
         *seen_begin = true;
     } else if marker == Some(false) && !*seen_begin && !*unmatched_end_redacted {
-        redact_retained_lines_once(lines, kept_bytes, unmatched_end_redacted);
+        thegn_core::ci_log::redact_retained_on_unmatched_end(
+            lines,
+            kept_bytes,
+            unmatched_end_redacted,
+        );
     }
     let len = line.len();
     if len > PROVIDER_LOG_MAX_BYTES {
@@ -950,30 +954,6 @@ fn push_log_line(
             *truncated = true;
         }
     }
-}
-
-fn redact_retained_lines_once(
-    lines: &mut VecDeque<String>,
-    kept_bytes: &mut usize,
-    already_redacted: &mut bool,
-) {
-    if *already_redacted {
-        return;
-    }
-    for line in lines.iter_mut() {
-        let newline = if line.ends_with("\r\n") {
-            "\r\n"
-        } else if line.ends_with('\n') {
-            "\n"
-        } else if line.ends_with('\r') {
-            "\r"
-        } else {
-            ""
-        };
-        *line = format!("{}{newline}", thegn_core::ci_log::REDACTION_MARKER);
-    }
-    *kept_bytes = lines.iter().map(String::len).sum();
-    *already_redacted = true;
 }
 
 fn nonempty(s: &serde_json::Value, key: &str) -> Option<String> {
