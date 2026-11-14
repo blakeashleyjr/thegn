@@ -951,6 +951,7 @@ fn config_read_error(path: &Path, error: std::io::Error) -> String {
     }
 }
 
+// A symlinked ancestor owned by the current user (a dotfile-manager or planted redirect) is refused like a symlinked final component; root-owned OS symlinks such as /var or /home are trusted.
 fn reject_symlinked_parent(path: &Path) -> Result<(), String> {
     let mut parent = path.parent();
     while let Some(current) = parent {
@@ -958,7 +959,10 @@ fn reject_symlinked_parent(path: &Path) -> Result<(), String> {
             break;
         }
         match std::fs::symlink_metadata(current) {
-            Ok(metadata) if metadata.file_type().is_symlink() => {
+            Ok(metadata)
+                if metadata.file_type().is_symlink()
+                    && thegn_core::fsperm::owned_by_current_user(&metadata) =>
+            {
                 return Err(format!(
                     "{} has a symlinked parent directory; not modified",
                     path.display()
@@ -1045,10 +1049,11 @@ fn replace_config_checked(
         suffix,
         sync_parent,
         before_rename,
-        &mut |from, to| thegn_core::fsperm::rename_replace(from, to),
+        &mut thegn_core::fsperm::rename_replace,
     )
 }
 
+#[allow(clippy::too_many_arguments)] // test seams: suffix, sync, pre-rename hook, rename
 fn replace_config_checked_with_rename(
     path: &Path,
     observed: &[u8],
@@ -1557,6 +1562,30 @@ mod tests {
                 .to_string_lossy()
                 .contains(".tmp-")
         }));
+    }
+
+    #[test]
+    fn config_replacement_trusts_root_owned_system_symlink_ancestors() {
+        let Some((root, _metadata)) = [Path::new("/var"), Path::new("/home"), Path::new("/lib")]
+            .into_iter()
+            .filter_map(|root| {
+                std::fs::symlink_metadata(root)
+                    .ok()
+                    .map(|metadata| (root, metadata))
+            })
+            .find(|(_, metadata)| {
+                metadata.file_type().is_symlink()
+                    && !thegn_core::fsperm::owned_by_current_user(metadata)
+            })
+        else {
+            return;
+        };
+
+        let config = root.join("thegn-font-config-test/kitty.conf");
+        assert!(
+            reject_symlinked_parent(&config).is_ok(),
+            "root-owned system symlink {root:?} should be trusted"
+        );
     }
 
     #[test]
