@@ -2765,10 +2765,13 @@ impl LspClient {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .take();
-        let reader_deadline = Instant::now() + grace;
+        let termination_deadline = Instant::now() + grace;
         if let Some(mut child) = child {
-            terminate_tree(&mut child, Some(reader_deadline));
+            terminate_tree(&mut child, Some(termination_deadline));
         }
+        // The reader gets its own window after the tree is gone: sharing the
+        // termination deadline left it no time to observe EOF after a kill.
+        let reader_deadline = Instant::now() + grace;
 
         let reader = self
             .reader

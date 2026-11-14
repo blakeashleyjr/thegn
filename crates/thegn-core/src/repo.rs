@@ -298,6 +298,85 @@ pub fn repo_slug_guess(root: &Path) -> String {
     slug_base(&repo_name_from_path(root))
 }
 
+/// A configured root broad enough that discovery may visit a large portion of
+/// the filesystem. The picker uses the original configured spelling in its
+/// warning row; no filesystem access or path canonicalization is involved.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BroadRoot {
+    pub path: String,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct ComparablePath {
+    drive: Option<String>,
+    absolute: bool,
+    components: Vec<String>,
+}
+
+fn comparable_path(path: &str) -> ComparablePath {
+    let has_drive =
+        path.len() >= 2 && path.as_bytes()[0].is_ascii_alphabetic() && path.as_bytes()[1] == b':';
+    let (drive, rest) = if has_drive {
+        (
+            Some(
+                char::from(path.as_bytes()[0])
+                    .to_ascii_lowercase()
+                    .to_string(),
+            ),
+            &path[2..],
+        )
+    } else {
+        (None, path)
+    };
+    let absolute = rest.starts_with('/') || rest.starts_with('\\');
+    let components = rest
+        .split(['/', '\\'])
+        .filter(|component| !component.is_empty() && *component != ".")
+        .map(str::to_owned)
+        .collect();
+    ComparablePath {
+        drive,
+        absolute,
+        components,
+    }
+}
+
+fn same_path_components(left: &ComparablePath, right: &ComparablePath) -> bool {
+    left.drive == right.drive
+        && left.absolute == right.absolute
+        && left.components == right.components
+}
+
+/// Identify configured roots for which the bounded discovery scan deserves a
+/// warning. A root is broad when it has fewer than two path components, is the
+/// supplied home path, or is one of the conventional top-level mount roots.
+/// Separators and Windows drive prefixes are handled as data, so this stays
+/// platform-neutral and never resolves symlinks or touches the filesystem.
+///
+/// `Config::post_process_inner` expands a leading `~` in `repo_roots` before
+/// the picker calls this function; this pure helper deliberately does not read
+/// the ambient environment itself.
+pub fn broad_roots(roots: &[String], home: Option<&Path>) -> Vec<BroadRoot> {
+    let home = home.map(|path| comparable_path(&path.to_string_lossy()));
+    roots
+        .iter()
+        .filter_map(|root| {
+            let comparable = comparable_path(root);
+            let top_level_mount = comparable.absolute
+                && comparable.components.len() == 1
+                && matches!(
+                    comparable.components[0].as_str(),
+                    "home" | "Users" | "mnt" | "media"
+                );
+            let is_home = home
+                .as_ref()
+                .is_some_and(|home| same_path_components(&comparable, home));
+            (comparable.components.len() < 2 || is_home || top_level_mount)
+                .then(|| BroadRoot { path: root.clone() })
+        })
+        .collect()
+}
+
 /// Discover git repos under the configured roots (parent dirs of a `.git`
 /// directory). Skips worktrees (whose `.git` is a file). Sorted + deduped.
 pub fn discover_repos(cfg: &Config) -> Vec<String> {
@@ -545,6 +624,52 @@ mod tests {
 
     fn tmp(name: &str) -> PathBuf {
         std::env::temp_dir().join(format!("tg-repo-{}-{}", std::process::id(), name))
+    }
+
+    #[test]
+    fn broad_roots_uses_componentwise_platform_neutral_rules() {
+        let cases = [
+            (vec!["/"], None, vec!["/"]),
+            (vec!["//"], None, vec!["//"]),
+            (vec!["/code/"], None, vec!["/code/"]),
+            (vec!["code"], None, vec!["code"]),
+            (vec!["code/repos"], None, Vec::new()),
+            (vec!["/home"], None, vec!["/home"]),
+            (vec!["/Users"], None, vec!["/Users"]),
+            (vec!["/mnt"], None, vec!["/mnt"]),
+            (vec!["/media"], None, vec!["/media"]),
+            (vec!["/home/user/repos"], Some("/home/user/"), Vec::new()),
+            // Config::post_process_inner expands `~` before this pure helper
+            // is called, including a home path with a trailing separator.
+            (
+                vec!["/home/user/"],
+                Some("/home/user/"),
+                vec!["/home/user/"],
+            ),
+            (vec![r"C:\"], None, vec![r"C:\"]),
+            (vec![r"C:\Users\"], None, vec![r"C:\Users\"]),
+            (
+                vec![r"C:\Users\me\repos"],
+                Some(r"C:\Users\me\"),
+                Vec::new(),
+            ),
+            (
+                vec![r"C:\Users\me\"],
+                Some(r"C:\Users\me"),
+                vec![r"C:\Users\me\"],
+            ),
+        ];
+
+        for (roots, home, expected) in cases {
+            let root_debug = roots.clone();
+            let home = home.map(Path::new);
+            let flagged = broad_roots(
+                &roots.into_iter().map(str::to_owned).collect::<Vec<_>>(),
+                home,
+            );
+            let paths: Vec<&str> = flagged.iter().map(|root| root.path.as_str()).collect();
+            assert_eq!(paths, expected, "roots={root_debug:?}, home={home:?}");
+        }
     }
 
     fn git_ok(dir: &Path, args: &[&str]) {
