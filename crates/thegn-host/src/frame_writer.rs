@@ -878,6 +878,10 @@ fn write_message(
         };
         let replay_result = write(replay_bytes);
         let replay_failed = replay_result.is_err();
+        let replay_kind = match &replay_msg {
+            Msg::Oob(kind, ..) => Some(*kind),
+            _ => None,
+        };
         let mut q = inner.q.lock().unwrap_or_else(|e| e.into_inner());
         if replay_failed {
             let defer_after = q.submitted_seq;
@@ -899,10 +903,6 @@ fn write_message(
             }
             release_message_capacity(&mut q, &replay_msg);
         }
-        let replay_kind = match &replay_msg {
-            Msg::Oob(kind, ..) => Some(*kind),
-            _ => None,
-        };
         apply_write_result(&mut q, replay_result, replay_kind);
         if matches!(q.status, WriterStatus::Fatal(_)) {
             abandon_queued_messages(&mut q);

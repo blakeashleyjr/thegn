@@ -106,7 +106,7 @@ impl PendingCornerOob {
         &mut self,
         bytes: Vec<u8>,
         visible: bool,
-        mut submit: impl FnMut(crate::frame_writer::OobKind, Vec<u8>) -> Result<(), Vec<u8>>,
+        submit: impl FnMut(crate::frame_writer::OobKind, Vec<u8>) -> Result<(), Vec<u8>>,
     ) {
         if bytes.is_empty() {
             return;
