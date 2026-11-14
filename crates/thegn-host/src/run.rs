@@ -9459,7 +9459,10 @@ async fn event_loop<T: Terminal>(
                 return Err(anyhow::anyhow!("terminal writer failed: {e}{note}"));
             }
         }
-        if let Some(outcome) = clipboard_outcome {
+        if let Some(outcome) = clipboard_outcome
+            && (outcome != crate::frame_writer::ClipboardOutcome::Committed
+                || model.status.is_empty())
+        {
             model.status = crate::frame_writer::clipboard_outcome_status(outcome).to_string();
             dirty = true;
         }
