@@ -223,8 +223,27 @@ fn host_discovery_probes(cfg: &Config) -> Vec<ProbeReport> {
 }
 
 fn ci_probes(cfg: &Config) -> Vec<ProbeReport> {
-    use crate::ci::{client_for_system_with_config, gitlab_credential_note, system_for_kind};
+    use crate::ci::{client_for_system_with_config, system_for_kind};
+    use crate::ci_credential_report::{self, CredentialMode, Placement, Provider};
     use thegn_core::config::CiProviderKind;
+
+    let gitlab_mode = || {
+        ci_credential_report::gitlab_mode(
+            &cfg.ci.gitlab.token,
+            &crate::secret::resolve_outcome(
+                &cfg.ci.gitlab.token,
+                thegn_core::secretref::BareAs::Literal,
+                "ci:gitlab",
+            ),
+        )
+    };
+    let with_credential_notes =
+        |mut report: ProbeReport, provider: Provider, mode: CredentialMode| {
+            for placement in Placement::ALL {
+                report = report.note(ci_credential_report::report(provider, mode, placement).note);
+            }
+            report
+        };
     let kind = cfg.ci.provider;
     if kind.is_reserved() {
         return vec![ProbeReport::reserved("ci", kind.as_str())];
@@ -233,15 +252,27 @@ fn ci_probes(cfg: &Config) -> Vec<ProbeReport> {
         CiProviderKind::None => {
             vec![ProbeReport::new("ci", "none", Availability::Ready).note("CI inspection disabled")]
         }
-        CiProviderKind::Auto => vec![
+        CiProviderKind::Auto => vec![with_credential_notes(
             ProbeReport::new("ci", "auto", Availability::Ready)
-                .note("resolved per worktree from the origin host / CI files")
-                .note(format!("gitlab {}", gitlab_credential_note(&cfg.ci))),
-        ],
+                .note("resolved per worktree from the origin host / CI files"),
+            Provider::Gitlab,
+            gitlab_mode(),
+        )],
         explicit => match system_for_kind(explicit)
             .and_then(|system| client_for_system_with_config(system, &cfg.ci))
         {
-            Some(c) => vec![c.probe()],
+            Some(c) => {
+                let provider = match explicit {
+                    CiProviderKind::Github => Provider::Github,
+                    CiProviderKind::Gitlab => Provider::Gitlab,
+                    _ => return vec![c.probe()],
+                };
+                let mode = match provider {
+                    Provider::Github => CredentialMode::GithubCliManaged,
+                    Provider::Gitlab => gitlab_mode(),
+                };
+                vec![with_credential_notes(c.probe(), provider, mode)]
+            }
             None => vec![ProbeReport::new(
                 "ci",
                 explicit.as_str(),
@@ -914,15 +945,22 @@ mod tests {
         cfg.ci.gitlab.token = "fixture-secret-token".into();
         let reports = ci_probes(&cfg);
         let auto = &reports[0];
-        assert!(
+        assert_eq!(
             auto.notes
                 .iter()
-                .any(|note| note.contains("gitlab credential:") && note.contains("resolved"))
+                .filter(|note| note.starts_with("credential placement:"))
+                .count(),
+            3
         );
         assert!(
             auto.notes
                 .iter()
                 .all(|note| !note.contains("fixture-secret-token"))
+        );
+        assert!(
+            auto.notes
+                .iter()
+                .any(|note| { note.contains("configured token is never forwarded to a remote") })
         );
     }
 
