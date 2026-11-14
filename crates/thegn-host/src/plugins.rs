@@ -887,6 +887,12 @@ struct SchedEntry {
     overloaded: u64,
 }
 
+const MIN_PLUGIN_INTERVAL_MS: u64 = 1_000;
+
+fn clamp_plugin_interval_millis(millis: u64) -> u64 {
+    millis.max(MIN_PLUGIN_INTERVAL_MS)
+}
+
 // `Instant` has no public maximum on the supported Rust versions. Keep an
 // unrepresentably large plugin interval at a representable far-future deadline
 // instead of allowing `Instant + Duration` to panic.
@@ -904,6 +910,7 @@ fn next_schedule_deadline(now: Instant, interval: Duration) -> Instant {
 /// shortest requested cadence.
 fn build_schedule(loaded: &[LoadedState], now: Instant) -> Vec<SchedEntry> {
     let mut sched: Vec<SchedEntry> = Vec::new();
+    let mut clamped_plugins = BTreeSet::new();
     for state in loaded {
         let plugin = &state.plugin;
         let id = plugin.spec.manifest.id.as_str().to_string();
@@ -911,7 +918,17 @@ fn build_schedule(loaded: &[LoadedState], now: Instant) -> Vec<SchedEntry> {
             let CadenceHint::Interval { millis } = contribution.cadence else {
                 continue;
             };
-            let interval = Duration::from_millis(millis.max(1));
+            let clamped_millis = clamp_plugin_interval_millis(millis);
+            if clamped_millis != millis && clamped_plugins.insert(id.clone()) {
+                tracing::debug!(
+                    target: "thegn::plugin",
+                    plugin = %id,
+                    requested_millis = millis,
+                    minimum_millis = MIN_PLUGIN_INTERVAL_MS,
+                    "plugin interval below minimum; clamping cadence"
+                );
+            }
+            let interval = Duration::from_millis(clamped_millis);
             if plugin.spec.mode == PluginMode::OneShot
                 && let Some(entry) = sched
                     .iter_mut()
@@ -1819,8 +1836,8 @@ mod tests {
         spec.mode = mode;
         let mut second = spec.manifest.contributions[0].clone();
         second.id = ContributionId::new("hello.other");
-        spec.manifest.contributions[0].cadence = CadenceHint::Interval { millis: 800 };
-        second.cadence = CadenceHint::Interval { millis: 300 };
+        spec.manifest.contributions[0].cadence = CadenceHint::Interval { millis: 1_800 };
+        second.cadence = CadenceHint::Interval { millis: 1_300 };
         spec.manifest.contributions.push(second);
         spec
     }
@@ -2058,7 +2075,7 @@ mod tests {
         );
         assert_eq!(one_shot.len(), 1);
         assert_eq!(one_shot[0].plugin, "cadenced");
-        assert_eq!(one_shot[0].interval, Duration::from_millis(300));
+        assert_eq!(one_shot[0].interval, Duration::from_millis(1_300));
 
         let mut unbounded_timeout = spec_with_two_intervals(PluginMode::OneShot);
         unbounded_timeout.timeout_secs = u64::MAX;
