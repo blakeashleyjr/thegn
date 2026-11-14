@@ -887,6 +887,7 @@ fn write_simple_key(
     family: &str,
 ) -> Result<Replaced, String> {
     validate_family(family)?;
+    reject_symlinked_parent(path)?;
     let (observed, observed_exists) = match read_config(path) {
         Ok(bytes) => (bytes, true),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => (Vec::new(), false),
@@ -950,6 +951,37 @@ fn config_read_error(path: &Path, error: std::io::Error) -> String {
     }
 }
 
+// A symlinked ancestor owned by the current user (a dotfile-manager or planted redirect) is refused like a symlinked final component; root-owned OS symlinks such as /var or /home are trusted.
+fn reject_symlinked_parent(path: &Path) -> Result<(), String> {
+    let mut parent = path.parent();
+    while let Some(current) = parent {
+        if current.as_os_str().is_empty() {
+            break;
+        }
+        match std::fs::symlink_metadata(current) {
+            Ok(metadata)
+                if metadata.file_type().is_symlink()
+                    && thegn_core::fsperm::owned_by_current_user(&metadata) =>
+            {
+                return Err(format!(
+                    "{} has a symlinked parent directory; not modified",
+                    path.display()
+                ));
+            }
+            Ok(_) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                return Err(format!(
+                    "inspect config parent {} failed: {error}",
+                    current.display()
+                ));
+            }
+        }
+        parent = current.parent();
+    }
+    Ok(())
+}
+
 /// Publish only if the no-follow destination still has the bytes we observed.
 /// Existing destinations must be owned by this user and have one link; refuse
 /// ambiguity instead of breaking a hard link. Staging names are unpredictable
@@ -1009,6 +1041,30 @@ fn replace_config_checked(
     sync_parent: &mut dyn FnMut(&Path) -> std::io::Result<()>,
     before_rename: &mut dyn FnMut(),
 ) -> Result<Replaced, String> {
+    replace_config_checked_with_rename(
+        path,
+        observed,
+        observed_exists,
+        new,
+        suffix,
+        sync_parent,
+        before_rename,
+        &mut thegn_core::fsperm::rename_replace,
+    )
+}
+
+#[allow(clippy::too_many_arguments)] // test seams: suffix, sync, pre-rename hook, rename
+fn replace_config_checked_with_rename(
+    path: &Path,
+    observed: &[u8],
+    observed_exists: bool,
+    new: &[u8],
+    suffix: &mut dyn FnMut() -> Result<String, String>,
+    sync_parent: &mut dyn FnMut(&Path) -> std::io::Result<()>,
+    before_rename: &mut dyn FnMut(),
+    rename: &mut dyn FnMut(&Path, &Path) -> std::io::Result<()>,
+) -> Result<Replaced, String> {
+    reject_symlinked_parent(path)?;
     let (current, metadata) = match thegn_core::fsperm::open_regular_file_nofollow(path) {
         Ok(mut file) => {
             let metadata = file
@@ -1070,7 +1126,7 @@ fn replace_config_checked(
             )),
         };
     }
-    if let Err(error) = thegn_core::fsperm::rename_replace(&temporary, path) {
+    if let Err(error) = rename(&temporary, path) {
         let cleanup = std::fs::remove_file(&temporary);
         return match cleanup {
             Ok(()) => Err(format!("replace {} failed: {error}", path.display())),
@@ -1400,6 +1456,23 @@ mod tests {
     }
 
     #[test]
+    fn simple_key_treats_missing_as_absent_but_surfaces_parent_read_errors() {
+        let tmp = tempfile::tempdir().unwrap();
+        let missing = tmp.path().join("missing/kitty.conf");
+        write_simple_key(&missing, "font_family", "font_family Hack", "Hack").unwrap();
+        assert_eq!(std::fs::read(&missing).unwrap(), b"font_family Hack\n");
+
+        let parent = tmp.path().join("not-a-directory");
+        std::fs::write(&parent, b"keep me").unwrap();
+        let blocked = parent.join("kitty.conf");
+        let error = write_simple_key(&blocked, "font_family", "font_family Iosevka", "Iosevka")
+            .unwrap_err();
+
+        assert!(error.starts_with("read "), "{error}");
+        assert_eq!(std::fs::read(&parent).unwrap(), b"keep me");
+    }
+
+    #[test]
     fn relative_alacritty_override_falls_through_to_xdg_path() {
         let tmp = tempfile::tempdir().unwrap();
         let xdg = tmp.path();
@@ -1451,6 +1524,68 @@ mod tests {
                 .is_symlink()
         );
         assert_eq!(std::fs::read(&target).unwrap(), original);
+    }
+
+    #[test]
+    fn config_replacement_refuses_a_symlinked_parent_and_preserves_the_target() {
+        let tmp = tempfile::tempdir().unwrap();
+        let target_dir = tmp.path().join("target");
+        let linked_parent = tmp.path().join("config");
+        let target = target_dir.join("kitty.conf");
+        let original = b"font_family Menlo\n";
+        std::fs::create_dir(&target_dir).unwrap();
+        std::fs::write(&target, original).unwrap();
+        if thegn_core::fsperm::create_symlink(&target_dir, &linked_parent, true).is_err() {
+            return;
+        }
+
+        let error = write_simple_key(
+            &linked_parent.join("kitty.conf"),
+            "font_family",
+            "font_family Hack",
+            "Hack",
+        )
+        .unwrap_err();
+
+        assert!(error.contains("symlinked parent"), "{error}");
+        assert_eq!(std::fs::read(&target).unwrap(), original);
+        assert!(
+            std::fs::symlink_metadata(&linked_parent)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+        assert!(std::fs::read_dir(&target_dir).unwrap().all(|entry| {
+            !entry
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .contains(".tmp-")
+        }));
+    }
+
+    #[test]
+    fn config_replacement_trusts_root_owned_system_symlink_ancestors() {
+        let Some((root, _metadata)) = [Path::new("/var"), Path::new("/home"), Path::new("/lib")]
+            .into_iter()
+            .filter_map(|root| {
+                std::fs::symlink_metadata(root)
+                    .ok()
+                    .map(|metadata| (root, metadata))
+            })
+            .find(|(_, metadata)| {
+                metadata.file_type().is_symlink()
+                    && !thegn_core::fsperm::owned_by_current_user(metadata)
+            })
+        else {
+            return;
+        };
+
+        let config = root.join("thegn-font-config-test/kitty.conf");
+        assert!(
+            reject_symlinked_parent(&config).is_ok(),
+            "root-owned system symlink {root:?} should be trusted"
+        );
     }
 
     #[test]
@@ -1566,6 +1701,38 @@ mod tests {
         replace_config(&config, observed, true, b"font_family Hack\n").unwrap();
 
         assert_eq!(std::fs::read(&config).unwrap(), b"font_family Hack\n");
+        assert!(std::fs::read_dir(tmp.path()).unwrap().all(|entry| {
+            !entry
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .contains(".tmp-")
+        }));
+    }
+
+    #[test]
+    fn config_replacement_rename_failure_preserves_original_and_cleans_staging() {
+        let tmp = tempfile::tempdir().unwrap();
+        let config = tmp.path().join("kitty.conf");
+        let observed = b"font_family Menlo\n";
+        std::fs::write(&config, observed).unwrap();
+
+        let result = replace_config_checked_with_rename(
+            &config,
+            observed,
+            true,
+            b"font_family Hack\n",
+            &mut || Ok("rename-failure".to_string()),
+            &mut |_| Ok(()),
+            &mut || {},
+            &mut |_, _| Err(std::io::Error::other("injected rename failure")),
+        );
+
+        assert!(matches!(
+            result,
+            Err(ref error) if error.contains("injected rename failure")
+        ));
+        assert_eq!(std::fs::read(&config).unwrap(), observed);
         assert!(std::fs::read_dir(tmp.path()).unwrap().all(|entry| {
             !entry
                 .unwrap()

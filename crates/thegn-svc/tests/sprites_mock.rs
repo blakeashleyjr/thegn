@@ -158,9 +158,9 @@ fn read_line(reader: &mut TcpStream, out: &mut String) -> Option<()> {
     }
 }
 
-/// Complete the Sprites exec WebSocket handshake and emulate the `mv -f --`
-/// used to publish a staged executable. The two binary frames mirror the
-/// provider's non-tty stdout and exit-status framing.
+/// Complete the Sprites exec WebSocket handshake and emulate the install shell
+/// steps and `mv -f --` used to publish a staged executable. The two binary
+/// frames mirror the provider's non-tty stdout and exit-status framing.
 fn handle_exec_websocket(
     mut stream: TcpStream,
     headers: &HashMap<String, String>,
@@ -188,8 +188,53 @@ fn handle_exec_websocket(
                 .collect()
         })
         .unwrap_or_default();
-    let (code, output) = if args.len() == 5 && args[0] == "mv" && args[1] == "-f" && args[2] == "--"
-    {
+    let (code, output) = if args.len() >= 4 && args[0] == "/bin/sh" && args[1] == "-c" {
+        match args[3].as_str() {
+            "thegn-install-lease" | "thegn-install-release" => (0, String::new()),
+            "thegn-install-preserve" if args.len() >= 6 => {
+                let previous = args[5].clone();
+                let bytes = {
+                    let files = fs.lock().unwrap();
+                    files.get(&args[4]).cloned()
+                };
+                let mut files = fs.lock().unwrap();
+                files.remove(&previous);
+                if let Some(bytes) = bytes {
+                    files.insert(previous, bytes);
+                }
+                (0, String::new())
+            }
+            "thegn-install-publish" if args.len() >= 6 => {
+                let stage = &args[4];
+                let destination = &args[5];
+                let mut files = fs.lock().unwrap();
+                match files.remove(stage) {
+                    Some(bytes) => {
+                        files.insert(destination.clone(), bytes);
+                        (0, String::new())
+                    }
+                    None => (1, "missing staging file".to_string()),
+                }
+            }
+            "thegn-install-restore" if args.len() >= 6 => {
+                let mut files = fs.lock().unwrap();
+                match files.remove(&args[5]) {
+                    Some(bytes) => {
+                        files.insert(args[4].clone(), bytes);
+                    }
+                    None => {
+                        files.remove(&args[4]);
+                    }
+                }
+                (0, String::new())
+            }
+            "thegn-install-cleanup" if args.len() >= 5 => {
+                fs.lock().unwrap().remove(&args[4]);
+                (0, String::new())
+            }
+            _ => (1, format!("unexpected install command: {args:?}")),
+        }
+    } else if args.len() == 5 && args[0] == "mv" && args[1] == "-f" && args[2] == "--" {
         let stage = &args[3];
         let destination = &args[4];
         let mut files = fs.lock().unwrap();
