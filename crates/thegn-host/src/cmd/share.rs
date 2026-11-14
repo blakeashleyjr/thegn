@@ -181,9 +181,9 @@ fn start(cfg: &Config, port: u16, worktree: Option<String>, reach: Option<String
                 &kind,
                 thegn_svc::vpn::recorded_sidecar(&sidecar).map(|_| ()),
             )?;
-            let url = match share::serve_up(&sidecar, &serve) {
+            let url = match share::serve_up_for_worktree(&sidecar, &wt_path, &serve) {
                 Ok(url) => url,
-                Err(error) => match share::serve_down(&sidecar, &serve) {
+                Err(error) => match share::serve_down_for_worktree(&sidecar, &wt_path, &serve) {
                     Ok(()) => {
                         let error = error.context("share: serve start failed; teardown verified");
                         return Err(abandon_pending_with_error(
@@ -220,7 +220,7 @@ fn start(cfg: &Config, port: u16, worktree: Option<String>, reach: Option<String
                 "share: serve persists in the tailnet; `thegn share stop {port}` to tear it down"
             );
             if let Err(error) = db.upsert_share(&wt, port, generation, &kind, Some(&url), "up") {
-                return match share::serve_down(&sidecar, &serve) {
+                return match share::serve_down_for_worktree(&sidecar, &wt_path, &serve) {
                     Ok(()) => {
                         let error = error.context(
                             "share: could not record the started provider; teardown verified",
@@ -462,7 +462,9 @@ fn stop_with_store(
     let sidecar = thegn_core::sandbox::vpn_sidecar_name(
         &thegn_core::sandbox::container_name_with_profile(wt, Some(&thegn_core::profile::name())),
     );
-    finish_stop(store, &row, || share::serve_down(&sidecar, &serve))?;
+    finish_stop(store, &row, || {
+        share::serve_down_for_worktree(&sidecar, std::path::Path::new(wt), &serve)
+    })?;
     outln!("share: verified teardown for port {port}");
     Ok(())
 }
