@@ -195,7 +195,7 @@ pub fn display_clip_meta(s: &str, cells: usize) -> DisplayClipMeta {
     let mut clusters = Vec::new();
     let mut width = 0;
     let byte_budget = cells.saturating_mul(16);
-    let mut bytes = 0;
+    let mut bytes: usize = 0;
     let mut truncated = false;
 
     for cluster in safe.graphemes(true) {
