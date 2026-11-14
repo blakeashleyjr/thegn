@@ -220,6 +220,10 @@ fn feed_source() -> (
 }
 
 #[test]
+#[expect(
+    clippy::disallowed_methods,
+    reason = "test launcher: re-exec the soak in an isolated process and reap it"
+)]
 fn plugin_soak_is_bounded_across_fixed_adversarial_iterations() {
     const TEST_PATH: &str =
         "plugins::soak_tests::plugin_soak_is_bounded_across_fixed_adversarial_iterations";
