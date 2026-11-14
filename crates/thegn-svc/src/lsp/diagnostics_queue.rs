@@ -984,7 +984,7 @@ mod tests {
         PublishedDiagnostics {
             root: PathBuf::from(root),
             path: path.into(),
-            scope: classify_location(Path::new(root), Path::new(path)),
+            scope: crate::lsp::classify_location(Path::new(root), Path::new(path)),
             diagnostics,
             server_identity: identity.into(),
             generation,
