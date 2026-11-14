@@ -12,7 +12,9 @@
 //! trusts the download. Everything here is pure string work — no I/O — so it
 //! sits in core under the coverage gate.
 
+use crate::snapshot_meta::ArtifactMeta;
 use crate::util::sh_quote;
+use sha2::{Digest, Sha256};
 
 /// The artifact short-names, in capture/replay order. These are the `<name>`
 /// in `/tmp/<stem>.<name>` on the sandbox side and the `TG-ART <name> …`
@@ -62,6 +64,67 @@ impl CaptureReport {
     /// Nothing to persist: clean tree, nothing unpushed, nothing untracked.
     pub fn is_empty(&self) -> bool {
         self.artifacts.is_empty()
+    }
+}
+
+/// Convert snapshot-store metadata into the manifest shape consumed by the
+/// verified replay script.
+pub fn manifest_for_snapshot(artifacts: &[ArtifactMeta]) -> Vec<CaptureArtifact> {
+    artifacts
+        .iter()
+        .map(|artifact| CaptureArtifact {
+            name: artifact.name.clone(),
+            bytes: artifact.bytes,
+            sha256: artifact.sha256.clone(),
+        })
+        .collect()
+}
+
+/// Build capture metadata for host-side bytes before uploading them to a
+/// sandbox.
+pub fn manifest_for_bytes(artifacts: &[(String, Vec<u8>)]) -> Vec<CaptureArtifact> {
+    artifacts
+        .iter()
+        .map(|(name, bytes)| CaptureArtifact {
+            name: name.clone(),
+            bytes: bytes.len() as u64,
+            sha256: format!("{:x}", Sha256::digest(bytes)),
+        })
+        .collect()
+}
+
+/// A stage reported by a replay script's machine-readable failure marker.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReplayStage {
+    Exec,
+    Checkout,
+    ArtifactValidation,
+    Fetch,
+    Reset,
+    Patch,
+    Extraction,
+    Cleanup,
+}
+
+impl ReplayStage {
+    /// Find the first known `TG-PARITY-ERROR:<stage>` marker in command output.
+    pub fn from_marker(output: &str) -> Option<Self> {
+        output.lines().find_map(|line| match line.trim() {
+            "TG-PARITY-ERROR:checkout" => Some(Self::Checkout),
+            "TG-PARITY-ERROR:artifact_validation" => Some(Self::ArtifactValidation),
+            "TG-PARITY-ERROR:fetch" => Some(Self::Fetch),
+            "TG-PARITY-ERROR:reset" => Some(Self::Reset),
+            "TG-PARITY-ERROR:patch" => Some(Self::Patch),
+            "TG-PARITY-ERROR:extraction" => Some(Self::Extraction),
+            "TG-PARITY-ERROR:cleanup" => Some(Self::Cleanup),
+            _ => None,
+        })
+    }
+}
+
+impl std::fmt::Display for ReplayStage {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{self:?}")
     }
 }
 
@@ -660,5 +723,31 @@ mod tests {
         for n in ARTIFACT_NAMES {
             assert!(artifact_path("s", n).starts_with("/tmp/s."));
         }
+    }
+
+    #[test]
+    fn snapshot_manifest_conversion_preserves_name_size_and_digest() {
+        let artifacts = [ArtifactMeta {
+            name: "patch".into(),
+            bytes: 42,
+            sha256: "a".repeat(64),
+        }];
+        assert_eq!(
+            manifest_for_snapshot(&artifacts),
+            vec![CaptureArtifact {
+                name: "patch".into(),
+                bytes: 42,
+                sha256: "a".repeat(64),
+            }]
+        );
+    }
+
+    #[test]
+    fn replay_stage_parser_names_a_patch_failure() {
+        assert_eq!(
+            ReplayStage::from_marker("noise\nTG-PARITY-ERROR:patch\n"),
+            Some(ReplayStage::Patch)
+        );
+        assert_eq!(ReplayStage::from_marker("noise\n"), None);
     }
 }

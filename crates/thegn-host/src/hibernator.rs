@@ -28,6 +28,7 @@ use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
+use anyhow::Context;
 use sha2::{Digest, Sha256};
 use thegn_core::config::Config;
 use thegn_core::config_env_tables::SnapshotStoreConfig;
@@ -606,57 +607,106 @@ fn restore_into_sandbox(
         Err(error) => return Err(error),
     };
 
-    let mut bundle_data: Option<Vec<u8>> = None;
-    for a in &manifest.artifacts {
-        let data = store.get(restore_key, snapshot_id, &a.name)?;
-        // Same integrity bar as capture: what the store returns must be what
-        // the manifest published.
-        if data.len() as u64 != a.bytes || !hex_sha256(&data).eq_ignore_ascii_case(&a.sha256) {
-            anyhow::bail!("artifact {} corrupt in the snapshot store", a.name);
-        }
-        let path = syncstate::artifact_path(STEM, &a.name);
-        block_on_provider(|| async {
-            tokio::time::timeout(READ_TIMEOUT, provider.write(id, &path, &data))
-                .await
-                .unwrap_or_else(|_| Err(anyhow::anyhow!("upload of {path} timed out")))
-        })?;
-        if a.name == "bundle" {
-            bundle_data = Some(data);
-        }
-    }
-
-    let has_bundle = manifest.artifact("bundle").is_some();
-    let script = syncstate::replay_script(
-        workdir,
-        STEM,
-        (has_bundle && !manifest.head.is_empty()).then_some(manifest.head.as_str()),
-        manifest.artifact("patch").is_some(),
-        manifest.artifact("tar").is_some(),
-        "snapshot restored",
-    );
-    exec_capture(provider, id, &script, CAPTURE_TIMEOUT)?;
-
-    // The replay stages are individually non-fatal (`|| true`), so prove the
-    // part that matters: when commits were carried, the sandbox HEAD must now
-    // BE the captured head.
-    if has_bundle && !manifest.head.is_empty() {
-        let head = exec_capture(
-            provider,
-            id,
-            &format!(
-                "cd {} && git rev-parse HEAD",
-                thegn_core::util::sh_quote(workdir)
-            ),
-            Duration::from_secs(30),
-        )?;
-        let got = head.trim().lines().last().unwrap_or("").trim().to_string();
-        if got != manifest.head {
+    let replay_manifest = syncstate::manifest_for_snapshot(&manifest.artifacts);
+    let mut names = Vec::new();
+    for artifact in &replay_manifest {
+        if !syncstate::ARTIFACT_NAMES.contains(&artifact.name.as_str()) {
             anyhow::bail!(
-                "replay did not land on the captured head (got {got}, want {})",
-                manifest.head
+                "snapshot manifest contains unknown artifact {}",
+                artifact.name
             );
         }
+        if names.iter().any(|name| name == &artifact.name) {
+            anyhow::bail!(
+                "snapshot manifest contains duplicate artifact {}",
+                artifact.name
+            );
+        }
+        names.push(artifact.name.clone());
     }
+
+    let dir = crate::parity::random_staging_dir()?;
+    exec_capture(
+        provider,
+        id,
+        &syncstate::stage_dir_script(&dir),
+        Duration::from_secs(30),
+    )?;
+
+    let restore = (|| -> anyhow::Result<Option<Vec<u8>>> {
+        let mut bundle_data: Option<Vec<u8>> = None;
+        for a in &manifest.artifacts {
+            let data = store.get(restore_key, snapshot_id, &a.name)?;
+            // Same integrity bar as capture: what the store returns must be what
+            // the manifest published.
+            if data.len() as u64 != a.bytes || !hex_sha256(&data).eq_ignore_ascii_case(&a.sha256) {
+                anyhow::bail!("artifact {} corrupt in the snapshot store", a.name);
+            }
+            let path = syncstate::staged_artifact_path(&dir, &a.name);
+            block_on_provider(|| async {
+                tokio::time::timeout(READ_TIMEOUT, provider.write(id, &path, &data))
+                    .await
+                    .unwrap_or_else(|_| Err(anyhow::anyhow!("upload of {path} timed out")))
+            })
+            .with_context(|| format!("upload of {path} timed out or failed"))?;
+            if a.name == "bundle" {
+                bundle_data = Some(data);
+            }
+        }
+
+        let has_bundle = replay_manifest.iter().any(|a| a.name == "bundle");
+        let script = syncstate::replay_script_verified(
+            workdir,
+            &dir,
+            &replay_manifest,
+            (has_bundle && !manifest.head.is_empty()).then_some(manifest.head.as_str()),
+            replay_manifest.iter().any(|a| a.name == "patch"),
+            replay_manifest.iter().any(|a| a.name == "tar"),
+            "snapshot restored",
+        );
+        replay_capture(provider, id, &script, CAPTURE_TIMEOUT)?;
+
+        // Keep the HEAD check as a belt-and-braces final check after verified
+        // replay has completed.
+        if has_bundle && !manifest.head.is_empty() {
+            let head = exec_capture(
+                provider,
+                id,
+                &format!(
+                    "cd {} && git rev-parse HEAD",
+                    thegn_core::util::sh_quote(workdir)
+                ),
+                Duration::from_secs(30),
+            )?;
+            let got = head.trim().lines().last().unwrap_or("").trim().to_string();
+            if got != manifest.head {
+                anyhow::bail!(
+                    "replay did not land on the captured head (got {got}, want {})",
+                    manifest.head
+                );
+            }
+        }
+        Ok(bundle_data)
+    })();
+
+    let cleanup = exec_capture(
+        provider,
+        id,
+        &format!("rm -rf -- {}", thegn_core::util::sh_quote(&dir)),
+        Duration::from_secs(30),
+    );
+    let bundle_data = match (restore, cleanup) {
+        (Ok(bundle_data), Ok(())) => bundle_data,
+        (Err(error), Ok(())) => return Err(error),
+        (Ok(_), Err(error)) => {
+            return Err(error.context(format!("could not clean restore staging directory {dir}")));
+        }
+        (Err(error), Err(cleanup)) => {
+            return Err(error.context(format!(
+                "could not clean restore staging directory {dir}: {cleanup:#}"
+            )));
+        }
+    };
 
     // Durability bonus, best-effort: park the carried commits in the HOST
     // worktree under a hibernate ref (prerequisite commits may be absent
@@ -666,6 +716,54 @@ fn restore_into_sandbox(
         backup_bundle_to_host(worktree, snapshot_id, &data);
     }
     Ok(())
+}
+
+#[derive(Debug)]
+struct RestoreReplayFailure {
+    stage: syncstate::ReplayStage,
+    detail: String,
+}
+
+impl std::fmt::Display for RestoreReplayFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "snapshot restore replay failed at {}: {}",
+            self.stage, self.detail
+        )
+    }
+}
+
+impl std::error::Error for RestoreReplayFailure {}
+
+fn replay_result(code: i32, output: &str) -> anyhow::Result<()> {
+    if code == 0 {
+        return Ok(());
+    }
+    Err(anyhow::Error::new(RestoreReplayFailure {
+        stage: syncstate::ReplayStage::from_marker(output).unwrap_or(syncstate::ReplayStage::Exec),
+        detail: output.trim().to_string(),
+    }))
+}
+
+fn replay_capture(
+    provider: &thegn_svc::provider::Provider,
+    id: &str,
+    script: &str,
+    timeout: Duration,
+) -> anyhow::Result<()> {
+    let argv = vec!["/bin/sh".to_string(), "-lc".to_string(), script.to_string()];
+    let (code, output) = block_on_provider(|| async {
+        tokio::time::timeout(timeout, provider.run_exec(id, &argv, None, &[]))
+            .await
+            .unwrap_or_else(|_| {
+                Err(anyhow::anyhow!(
+                    "sandbox replay timed out after {}s",
+                    timeout.as_secs()
+                ))
+            })
+    })?;
+    replay_result(code, &output)
 }
 
 // off-loop: provision worker thread only.
@@ -1405,6 +1503,25 @@ mod tests {
         for enabled in [true, false] {
             assert_eq!(restore_snapshot_id("/wt", enabled, Ok(None)).unwrap(), None);
         }
+    }
+
+    #[test]
+    fn patch_replay_failure_is_not_hidden_by_a_matching_head() {
+        let error = replay_result(70, "HEAD abc123\nTG-PARITY-ERROR:patch\n").unwrap_err();
+        let failure = error
+            .downcast_ref::<RestoreReplayFailure>()
+            .expect("replay output should become a typed restore error");
+        assert_eq!(failure.stage, syncstate::ReplayStage::Patch);
+        assert!(failure.to_string().contains("Patch"));
+    }
+
+    #[test]
+    fn restore_operations_use_distinct_private_staging_dirs() {
+        let first = crate::parity::random_staging_dir().unwrap();
+        let second = crate::parity::random_staging_dir().unwrap();
+        assert_ne!(first, second);
+        assert!(first.starts_with("/tmp/tg-parity-"));
+        assert!(second.starts_with("/tmp/tg-parity-"));
     }
 
     #[test]
