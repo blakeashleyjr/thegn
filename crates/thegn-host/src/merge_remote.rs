@@ -534,15 +534,18 @@ fn stream_bundle(
     let free_bytes = limits
         .free_bytes
         .or_else(|| thegn_metrics::disk_space(tmp.path()).map(|(_, free_bytes, _)| free_bytes));
-    let free_bytes = free_bytes.ok_or_else(|| {
-        IngestError::LocalStorage(io::Error::other(
-            "could not determine free space for bundle custody",
-        ))
-    })?;
-    let max_bytes = effective_bundle_cap(limits.max_bytes, free_bytes, BUNDLE_FREE_SPACE_MARGIN)
-        .ok_or_else(|| {
-            IngestError::LocalStorage(io::Error::other("not enough free space for bundle custody"))
-        })?;
+    let max_bytes = match free_bytes {
+        Some(free) => effective_bundle_cap(limits.max_bytes, free, BUNDLE_FREE_SPACE_MARGIN)
+            .ok_or_else(|| {
+                IngestError::LocalStorage(io::Error::other(
+                    "not enough free space for bundle custody",
+                ))
+            })?,
+        None => {
+            tracing::debug!(target: "thegn::merge", "bundle custody free space unknown; using the static cap");
+            limits.max_bytes
+        }
+    };
     producer
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -1252,6 +1255,25 @@ mod tests {
             Err(IngestError::LocalStorage(error))
                 if error.to_string() == "not enough free space for bundle custody"
         ));
+        tmp.finish().unwrap();
+        assert_eq!(std::fs::read_dir(root.path()).unwrap().count(), 0);
+    }
+
+    #[test]
+    fn bundle_stream_uses_static_cap_when_free_space_is_unknown() {
+        if cfg!(unix) || thegn_core::util::which_path("sh").is_none() {
+            return;
+        }
+        let root = tempfile::tempdir().unwrap();
+        let Ok(mut tmp) = BundleTemp::new_in(root.path()) else {
+            return;
+        };
+        let result = stream_bundle(
+            shell("printf x"),
+            &mut tmp,
+            &small_limits(1 << 20, Duration::from_secs(30), 4096),
+        );
+        assert!(matches!(result, Ok(1)));
         tmp.finish().unwrap();
         assert_eq!(std::fs::read_dir(root.path()).unwrap().count(), 0);
     }
