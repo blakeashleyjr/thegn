@@ -2644,9 +2644,19 @@ mod tests {
         );
         assert_eq!(
             flight.submit(flight_token("/wt", Some(4), true)),
-            FlightAdmission::Busy
+            FlightAdmission::Queued
         );
-        assert!(flight.running.as_ref().is_some_and(|token| token.force));
+        let queued = flight.finish().expect("coalesced queued refresh");
+        assert!(queued.force);
+        assert_eq!(
+            queued.key,
+            FlightKey {
+                active_path: Some("/wt".into()),
+                run_id: None,
+                kind: FlightKind::Refresh,
+                generation: Some(4),
+            }
+        );
         assert!(flight.finish().is_none());
     }
 
@@ -2666,7 +2676,7 @@ mod tests {
 
         let second = flight_token("/wt-a", Some(4), false);
         let cancel = Arc::clone(&second.cancel);
-        assert_eq!(flight.submit(second), FlightAdmission::Started);
+        assert_eq!(flight.submit(second), FlightAdmission::Queued);
         assert_eq!(
             flight.submit(flight_token("/wt-a", Some(5), false)),
             FlightAdmission::Queued
@@ -2827,6 +2837,7 @@ mod tests {
     #[test]
     fn ci_refresh_latch_clears_when_worker_unwinds() {
         let _lock = FLIGHT_TEST_LOCK.lock().expect("flight test lock");
+        clear_ci_refresh_flight();
         let token = flight_token("/panic", None, false);
         let cancel = Arc::clone(&token.cancel);
         {
