@@ -1085,10 +1085,10 @@ pub struct WorktreeEntry {
 
 /// Parse `git worktree list --porcelain -z` into detailed records.
 ///
-/// The NUL framing is strict: a missing final record separator or an unknown
-/// field is malformed input. `locked` and `prunable` are retained so callers
-/// that resurrect sidebar rows can refuse those records without guessing from
-/// their paths.
+/// The NUL framing is strict: a missing final record separator or a field
+/// outside a record is malformed input; unknown fields inside a record are
+/// ignored. `locked` and `prunable` are retained so callers that resurrect
+/// sidebar rows can refuse those records without guessing from their paths.
 pub fn parse_worktree_entries(porcelain: &str) -> Option<Vec<WorktreeEntry>> {
     if porcelain.is_empty() {
         return Some(Vec::new());
@@ -1159,8 +1159,6 @@ pub fn parse_worktree_entries(porcelain: &str) -> Option<Vec<WorktreeEntry>> {
             }
             entry.prunable = true;
         } else if record.is_none() {
-            return None;
-        } else {
             return None;
         }
     }
@@ -3149,6 +3147,12 @@ mod tests {
             ]
         );
         assert!(parse_worktree_branches("").unwrap().is_empty());
+        assert_eq!(
+            parse_worktree_branches(
+                "worktree /a\0HEAD aa\0branch refs/heads/x\0future-field v\0\0"
+            ),
+            Some(vec![("/a".to_string(), Some("x".to_string()))])
+        );
     }
 
     #[test]
