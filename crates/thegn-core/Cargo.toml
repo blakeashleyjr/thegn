@@ -106,6 +106,7 @@ sysinfo = { workspace = true }
 # compiled only under `test-utils`; enable it for this crate's own tests.
 thegn-core = { path = ".", features = ["test-utils"] }
 criterion.workspace = true
+log = "0.4"
 tempfile.workspace = true
 
 # Theme/palette construction — runs at startup and on every theme cycle.
