@@ -163,24 +163,12 @@ pub fn known_hosts_path(name: &str) -> Result<PathBuf> {
     Ok(dir().join("known_hosts.d").join(safe))
 }
 
-/// Accept only a single provider name component using the RFC 1123 hostname
-/// subset used by VPS admission.
+/// Accept only a provider ID using the shared RFC 1123 hostname subset and
+/// length limit used by VPS admission.
 pub fn checked_name(name: &str) -> Result<&str> {
-    if name.is_empty() || name.len() > 63 || !name.split('.').all(valid_dns_label) {
-        anyhow::bail!("vps registry: invalid provider name")
-    }
-    Ok(name)
-}
-
-fn valid_dns_label(label: &str) -> bool {
-    let bytes = label.as_bytes();
-    !bytes.is_empty()
-        && bytes.len() <= 63
-        && bytes[0].is_ascii_alphanumeric()
-        && bytes[bytes.len() - 1].is_ascii_alphanumeric()
-        && bytes
-            .iter()
-            .all(|byte| byte.is_ascii_alphanumeric() || *byte == b'-')
+    thegn_core::envbuild::ProviderId::parse(name)
+        .map(|_| name)
+        .map_err(|_| anyhow::anyhow!("vps registry: invalid provider name"))
 }
 
 fn open_root(d: &Path, create: bool) -> Result<Option<thegn_core::fsperm::PrivateDir>> {
@@ -949,6 +937,7 @@ mod tests {
     #[test]
     fn known_hosts_path_refuses_every_invalid_name() {
         let too_long_multibyte = format!("{}é", "a".repeat(62));
+        let too_long_provider_id = "a".repeat(51);
         let too_long = "a".repeat(64);
         let names = [
             "".to_string(),
@@ -971,6 +960,7 @@ mod tests {
             "a.".to_string(),
             "a_b".to_string(),
             "a b".to_string(),
+            too_long_provider_id,
             too_long,
             too_long_multibyte,
         ];
@@ -985,7 +975,7 @@ mod tests {
 
     #[test]
     fn known_hosts_path_keeps_valid_names_beneath_the_pin_root() {
-        let max_name = "a".repeat(63);
+        let max_name = "a".repeat(50);
         for name in ["tg-dev-x1", max_name.as_str(), "a.b-c"] {
             let path = known_hosts_path(name).unwrap();
             assert!(path.starts_with(dir().join("known_hosts.d")));
@@ -996,6 +986,7 @@ mod tests {
     #[test]
     fn checked_name_matrix_matches_the_known_hosts_matrix() {
         let too_long_multibyte = format!("{}é", "a".repeat(62));
+        let too_long_provider_id = "a".repeat(51);
         let too_long = "a".repeat(64);
         let names = [
             "".to_string(),
@@ -1018,6 +1009,7 @@ mod tests {
             "a.".to_string(),
             "a_b".to_string(),
             "a b".to_string(),
+            too_long_provider_id,
             too_long,
             too_long_multibyte,
         ];
@@ -1064,6 +1056,59 @@ mod tests {
                 checked_name(&id).is_ok(),
                 "effective id {id:?} from {config:?}"
             );
+        }
+    }
+
+    #[test]
+    fn provider_id_round_trips_across_registry_and_ssh_identity_surfaces() {
+        let worktrees = [
+            Path::new("/home/u/code/repo/worktrees/repo/main"),
+            Path::new("/home/u/code/repo/worktrees/repo/feature-one"),
+            Path::new("/srv/other/repo/worktrees/repo/main"),
+        ];
+        let templates = [
+            "",
+            "{worktree}",
+            "{repo}-{worktree}",
+            "{repo}-{worktree}-{hash}",
+            "{slug}",
+            "my_sprite",
+            "../unsafe/{worktree}",
+        ];
+        let temp = tempfile::tempdir().unwrap();
+
+        for (case, worktree) in worktrees.iter().enumerate() {
+            for (template, configured) in templates.iter().enumerate() {
+                let id = thegn_core::envbuild::effective_provider_id_typed(
+                    configured,
+                    worktree,
+                    Some("repo"),
+                );
+                let id = id.as_str();
+                assert_eq!(checked_name(id).unwrap(), id);
+
+                let root = temp.path().join(format!("case-{case}-{template}"));
+                write_at(&root, &rec(id, "creating")).unwrap();
+                assert_eq!(read_at(&root, id).unwrap().name, id);
+
+                let known_hosts = known_hosts_path(id).unwrap();
+                assert_eq!(
+                    known_hosts.file_stem().and_then(|stem| stem.to_str()),
+                    Some(id)
+                );
+
+                let alias = thegn_core::hostkey::host_key_args(
+                    thegn_core::hostkey::HostKeyClass::LoopbackTunneled,
+                    &thegn_core::hostkey::HostKeyContext {
+                        alias: Some(id.to_owned()),
+                        ..Default::default()
+                    },
+                );
+                assert!(
+                    alias.iter().any(|arg| arg == &format!("HostKeyAlias={id}")),
+                    "host-key alias argv lost provider id {id:?}: {alias:?}"
+                );
+            }
         }
     }
 
