@@ -201,10 +201,14 @@ mod tests {
     #[test]
     fn daemon_status_drain_uses_latest_value() {
         let slot = SnapshotSlot::new(64 * 1024);
-        let mut first = crate::chrome::DaemonStatus::default();
-        first.hostname = "old-host".to_owned();
-        let mut latest = crate::chrome::DaemonStatus::default();
-        latest.hostname = "new-host".to_owned();
+        let first = crate::chrome::DaemonStatus {
+            hostname: "old-host".to_owned(),
+            ..Default::default()
+        };
+        let latest = crate::chrome::DaemonStatus {
+            hostname: "new-host".to_owned(),
+            ..Default::default()
+        };
         assert_eq!(slot.publish(0, first, 128), PublishOutcome::Stored);
         assert_eq!(slot.publish(0, latest, 128), PublishOutcome::Replaced);
         let (_, status) = slot.take().expect("daemon status snapshot");
