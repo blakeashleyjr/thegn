@@ -2439,6 +2439,58 @@ impl Drop for InflightGuard {
     }
 }
 
+fn reference_symbol_row(
+    location: thegn_svc::lsp::Location,
+    root: &Path,
+) -> crate::panel::SymbolRow {
+    let outside = location.scope == thegn_svc::lsp::LocationScope::Outside;
+    let rel = Path::new(&location.path)
+        .strip_prefix(root)
+        .map(|path| path.to_string_lossy().into_owned())
+        .unwrap_or_else(|_| location.path.clone());
+    let line = location.line_1based() as u64;
+    crate::panel::SymbolRow {
+        kind: "→".to_string(),
+        name: if outside {
+            format!("{rel}:{line} (outside worktree)")
+        } else {
+            format!("{rel}:{line}")
+        },
+        file: rel,
+        line,
+        col: 0,
+        depth: 0,
+    }
+}
+
+#[cfg(test)]
+mod reference_symbol_row_tests {
+    use super::*;
+
+    #[test]
+    fn outside_reference_rows_are_explicitly_labeled() {
+        let row = reference_symbol_row(
+            thegn_svc::lsp::Location {
+                path: "/other/src/lib.rs".into(),
+                range: thegn_svc::lsp::Range {
+                    start: thegn_svc::lsp::Position {
+                        line: 2,
+                        character: 0,
+                    },
+                    end: thegn_svc::lsp::Position {
+                        line: 2,
+                        character: 1,
+                    },
+                },
+                scope: thegn_svc::lsp::LocationScope::Outside,
+            },
+            Path::new("/worktree"),
+        );
+
+        assert_eq!(row.name, "/other/src/lib.rs:3 (outside worktree)");
+    }
+}
+
 /// Fetch the document-symbol outline for `file` (repo-relative) off the loop:
 /// the language server when one is available, the tree-sitter entity parser
 /// otherwise. Sends a `SymbolsFetch::Outline` and pulses the waker.
@@ -2525,21 +2577,7 @@ fn spawn_refs_fetch(
                     Ok(locs) => {
                         rows = locs
                             .into_iter()
-                            .map(|l| {
-                                let rel = std::path::Path::new(&l.path)
-                                    .strip_prefix(&root)
-                                    .map(|p| p.to_string_lossy().into_owned())
-                                    .unwrap_or_else(|_| l.path.clone());
-                                let line = l.line_1based() as u64;
-                                crate::panel::SymbolRow {
-                                    kind: "→".to_string(),
-                                    name: format!("{rel}:{line}"),
-                                    file: rel,
-                                    line,
-                                    col: 0,
-                                    depth: 0,
-                                }
-                            })
+                            .map(|location| reference_symbol_row(location, &root))
                             .collect()
                     }
                     Err(thegn_svc::lsp::LspError::Cancelled) => return,

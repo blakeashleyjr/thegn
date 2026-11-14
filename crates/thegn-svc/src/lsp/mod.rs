@@ -1107,18 +1107,20 @@ pub fn windows_uri_path(uri: &str) -> Option<String> {
     }
     let path = String::from_utf8(decoded.path).ok()?;
     match decoded.authority {
-        None => windows_drive_path(&path),
-        Some(authority) if authority.eq_ignore_ascii_case("localhost") => windows_drive_path(&path),
+        None => windows_drive_path(path.strip_prefix('/')?),
+        Some(authority) if authority.eq_ignore_ascii_case("localhost") => {
+            windows_drive_path(path.strip_prefix('/')?)
+        }
         Some(authority) => {
             if authority.is_empty()
-                || authority.contains(':')
-                || authority.contains('\\')
-                || authority.chars().any(char::is_control)
+                || !authority
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'.' | b'_'))
             {
                 return None;
             }
             let share = path.strip_prefix('/')?;
-            if share.is_empty() {
+            if share.split('/').next().is_none_or(str::is_empty) {
                 return None;
             }
             Some(format!(r"\\{authority}\{}", share.replace('/', "\\")))
@@ -1228,11 +1230,14 @@ fn path_from_uri(uri: &str) -> Option<String> {
 pub fn classify_location(root: &Path, path: &Path) -> LocationScope {
     let root = lexical_components(root);
     let path = lexical_components(path);
-    (!root.is_empty()
+    if !root.is_empty()
         && path.len() >= root.len()
-        && path.iter().zip(&root).all(|(path, root)| path == root))
-    .then_some(LocationScope::InWorktree)
-    .unwrap_or(LocationScope::Outside)
+        && path.iter().zip(&root).all(|(path, root)| path == root)
+    {
+        LocationScope::InWorktree
+    } else {
+        LocationScope::Outside
+    }
 }
 
 fn lexical_components(path: &Path) -> Vec<std::path::Component<'_>> {
@@ -4426,6 +4431,8 @@ mod tests {
             ("file:///c:/work/src.rs", Some(r"C:\work\src.rs")),
             ("file://server/share/src.rs", Some(r"\\server\share\src.rs")),
             ("file://C:/work/src.rs", None),
+            ("file://host@SSL/share/x", None),
+            ("file://server//x", None),
         ] {
             assert_eq!(windows_uri_path(uri).as_deref(), expected, "{uri}");
         }
