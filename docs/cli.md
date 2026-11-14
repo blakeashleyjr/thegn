@@ -17,6 +17,11 @@ Noun-verb namespaces mirror the domain model (repo → workspace → worktree):
 | Control plane | `serve` · `session` · `attach` · `pair` · `api` · `proxy` — Model proxy: status/stats (read), start/stop (admin) (`status\|stats\|start\|stop`) · `agent`                                                                                                                                                                                                                                                                                       | stable                                                                 |
 | Meta          | `voice setup\|status\|model list\|model pull\|model rm` · `config` · `secret` — Credential broker: store/remove/list/migrate/audit secrets, rotate SSH keys (`set\|rm\|list\|migrate\|audit\|ssh rotate`) · `keys` — Inspect and check keybindings: `list`, `validate`, `hints` · `theme` · `skills` · `doctor` · `db` — Inspect or reclaim unused state database space (`vacuum`) · `setup` · `completions`                                    | stable; `voice` is dev                                                 |
 
+The gRPC control service also exposes `AgentSessions`, `SessionsRecord` and
+`WorktreesCreate`; their capability ids and request/response details are in the
+[gRPC method reference](api/grpc.md). Launch presets stay CLI-only because
+their configuration and environment resolve in the local compositor.
+
 ### Channels
 
 Stable verbs are available in every build. Dev verbs are available in the dev
