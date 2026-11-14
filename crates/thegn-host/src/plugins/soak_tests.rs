@@ -8,6 +8,7 @@
 //! queue, output, subscription, and ownership assertions.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::process::Command;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -219,7 +220,29 @@ fn feed_source() -> (
 }
 
 #[test]
+#[expect(
+    clippy::disallowed_methods,
+    reason = "test launcher: re-exec the soak in an isolated process and reap it"
+)]
 fn plugin_soak_is_bounded_across_fixed_adversarial_iterations() {
+    const TEST_PATH: &str =
+        "plugins::soak_tests::plugin_soak_is_bounded_across_fixed_adversarial_iterations";
+    if std::env::var_os("THEGN_SOAK_CHILD").is_none() {
+        let output =
+            Command::new(std::env::current_exe().expect("soak test executable is available"))
+                .args(["--exact", TEST_PATH, "--test-threads=1", "--nocapture"])
+                .env("THEGN_SOAK_CHILD", "1")
+                .output()
+                .expect("re-exec the isolated plugin soak test");
+        assert!(
+            output.status.success(),
+            "isolated plugin soak child failed\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        return;
+    }
+
     let _state = crate::testenv::IsolatedState::new();
     let rss_before = rss_pages();
     let children_before = child_ids();
