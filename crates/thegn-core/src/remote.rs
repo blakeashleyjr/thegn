@@ -1089,7 +1089,13 @@ impl GitLoc {
 
     /// Run a git command, returning trimmed stdout on success (None otherwise).
     pub fn git_out(&self, args: &[&str]) -> Option<String> {
-        self.git_text(args).ok().filter(|text| !text.is_empty())
+        crate::util::note_core_git_spawn();
+        let out = self.git_command(args).output().ok()?;
+        if !out.status.success() {
+            return None;
+        }
+        let s = String::from_utf8_lossy(&out.stdout).trim().to_string();
+        (!s.is_empty()).then_some(s)
     }
 
     /// Run a GitLoc command with bounded execution and typed outcomes, preserving
@@ -1150,7 +1156,7 @@ impl GitLoc {
                     }
                 }
             }),
-            _ => self.git_text(ARGS).ok().filter(|text| !text.is_empty()),
+            _ => self.git_out(ARGS),
         }
     }
 }

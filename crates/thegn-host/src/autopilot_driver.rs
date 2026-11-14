@@ -1075,6 +1075,10 @@ mod tests {
     use thegn_svc::issue::{IssueBackend, IssueCaps, IssueError};
 
     #[test]
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "initialize the isolated git fixture"
+    )]
     fn autopilot_base_probe_distinguishes_missing_ref_from_git_failure() {
         let repo = tempfile::tempdir().unwrap();
         let mut init = thegn_core::util::git_cmd(repo.path());
@@ -1087,13 +1091,13 @@ mod tests {
         let broken = tempfile::tempdir().unwrap();
         let error = base_has_commits(broken.path(), "main").unwrap_err();
         assert!(error.to_string().contains("could not verify base branch"));
-        assert!(error.to_string().contains("Git"));
+        assert!(format!("{error:#}").contains("Git"));
     }
 
     #[test]
     fn autopilot_ahead_probe_reports_git_failure() {
         let dir = tempfile::tempdir().unwrap();
-        let error = commits_ahead(dir.path(), "main").unwrap_err().to_string();
+        let error = format!("{:#}", commits_ahead(dir.path(), "main").unwrap_err());
         assert!(error.contains("reading commits ahead of base"), "{error}");
         assert!(error.contains("Git"), "{error}");
     }
