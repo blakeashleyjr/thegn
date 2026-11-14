@@ -52,6 +52,8 @@ fn provider_http_client_with_deadline(total: std::time::Duration) -> reqwest::Cl
 pub(crate) const CONTROL_BODY_LIMIT: usize = 2 * 1024 * 1024;
 pub(crate) const CONTROL_GLOBAL_CONCURRENCY: usize = 16;
 pub(crate) const CONTROL_PER_AUTHORITY_CONCURRENCY: usize = 4;
+pub(crate) const CONTROL_GLOBAL_PRIORITY_RESERVE: usize = 2;
+pub(crate) const CONTROL_PER_AUTHORITY_PRIORITY_RESERVE: usize = 1;
 /// File contents use a separate, longer policy than metadata/control calls.
 const FILE_TRANSFER_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(600);
 const FILE_TRANSFER_BODY_LIMIT: usize = 256 * 1024 * 1024;
@@ -150,9 +152,16 @@ mod sessions;
 pub(crate) const CONTROL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 
 /// Bounds simultaneous provider control calls across provider instances.
+///
+/// Ordinary calls use only the normal global and per-authority pools. Priority
+/// calls first try those pools without waiting, then use the small reserved
+/// global and per-authority pools so destructive cleanup and reconciliation can
+/// make progress when ordinary reads have filled the normal capacity.
 pub(crate) struct ControlGate {
     global: Arc<tokio::sync::Semaphore>,
     per_authority: Mutex<HashMap<String, Arc<tokio::sync::Semaphore>>>,
+    priority_global: Arc<tokio::sync::Semaphore>,
+    priority_per_authority: Mutex<HashMap<String, Arc<tokio::sync::Semaphore>>>,
     per_cap: usize,
 }
 
@@ -166,6 +175,8 @@ impl ControlGate {
         Self {
             global: Arc::new(tokio::sync::Semaphore::new(global)),
             per_authority: Mutex::new(HashMap::new()),
+            priority_global: Arc::new(tokio::sync::Semaphore::new(CONTROL_GLOBAL_PRIORITY_RESERVE)),
+            priority_per_authority: Mutex::new(HashMap::new()),
             per_cap: per,
         }
     }
@@ -182,6 +193,30 @@ impl ControlGate {
         )
     }
 
+    fn priority_authority_gate(&self, authority: &str) -> Arc<tokio::sync::Semaphore> {
+        let mut gates = self
+            .priority_per_authority
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        Arc::clone(gates.entry(authority.to_string()).or_insert_with(|| {
+            Arc::new(tokio::sync::Semaphore::new(
+                CONTROL_PER_AUTHORITY_PRIORITY_RESERVE,
+            ))
+        }))
+    }
+
+    fn try_acquire_pair(
+        authority: Arc<tokio::sync::Semaphore>,
+        global: Arc<tokio::sync::Semaphore>,
+    ) -> Option<ControlPermit> {
+        let authority_permit = authority.try_acquire_owned().ok()?;
+        let global_permit = global.try_acquire_owned().ok()?;
+        Some(ControlPermit {
+            _authority: authority_permit,
+            _global: global_permit,
+        })
+    }
+
     pub(crate) async fn acquire(&self, authority: &str) -> Result<ControlPermit> {
         let authority = self.authority_gate(authority);
         let authority_permit =
@@ -194,6 +229,35 @@ impl ControlGate {
                 .await
                 .map_err(|_| anyhow!("provider concurrency cap reached"))?
                 .map_err(|_| anyhow!("provider concurrency gate closed"))?;
+        Ok(ControlPermit {
+            _authority: authority_permit,
+            _global: global_permit,
+        })
+    }
+
+    pub(crate) async fn acquire_priority(&self, authority: &str) -> Result<ControlPermit> {
+        let authority_gate = self.authority_gate(authority);
+        if let Some(permit) =
+            Self::try_acquire_pair(Arc::clone(&authority_gate), Arc::clone(&self.global))
+        {
+            return Ok(permit);
+        }
+
+        let priority_authority = self.priority_authority_gate(authority);
+        let authority_permit = tokio::time::timeout(
+            CONTROL_TIMEOUT,
+            Arc::clone(&priority_authority).acquire_owned(),
+        )
+        .await
+        .map_err(|_| anyhow!("provider priority concurrency cap reached"))?
+        .map_err(|_| anyhow!("provider priority concurrency gate closed"))?;
+        let global_permit = tokio::time::timeout(
+            CONTROL_TIMEOUT,
+            Arc::clone(&self.priority_global).acquire_owned(),
+        )
+        .await
+        .map_err(|_| anyhow!("provider priority concurrency cap reached"))?
+        .map_err(|_| anyhow!("provider priority concurrency gate closed"))?;
         Ok(ControlPermit {
             _authority: authority_permit,
             _global: global_permit,
@@ -456,7 +520,7 @@ impl RemoteProvider for DaytonaProvider {
 
     fn destroy<'a>(&'a self, id: &'a str) -> BoxFuture<'a, Result<()>> {
         Box::pin(async move {
-            let _permit = CONTROL_GATE.acquire(&self.authority()?).await?;
+            let _permit = CONTROL_GATE.acquire_priority(&self.authority()?).await?;
             let resp = self
                 .client
                 .delete(self.sandbox_id_url(id)?)
@@ -791,7 +855,7 @@ impl RemoteProvider for SpritesProvider {
 
     fn destroy<'a>(&'a self, id: &'a str) -> BoxFuture<'a, Result<()>> {
         Box::pin(async move {
-            let _permit = CONTROL_GATE.acquire(&self.authority()?).await?;
+            let _permit = CONTROL_GATE.acquire_priority(&self.authority()?).await?;
             // Validate custody before the irreversible remote delete. A corrupt
             // row may be the only evidence of an authorized key and must never
             // be collapsed into "missing" by lifecycle cleanup.
@@ -3729,6 +3793,44 @@ mod tests {
         drop(first);
         let same_authority_again = gate.try_acquire("a").unwrap();
         drop((second, same_authority_again));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn control_gate_priority_uses_and_releases_reserved_capacity() {
+        let gate = ControlGate::new(2, 1);
+        let normal_a = gate.try_acquire("a").unwrap();
+        let normal_b = gate.try_acquire("b").unwrap();
+
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_secs(1), gate.acquire("a"))
+                .await
+                .is_err(),
+            "ordinary acquisition must not use the priority reserve"
+        );
+
+        let priority_a = gate.acquire_priority("a").await.unwrap();
+        let priority_b = gate.acquire_priority("b").await.unwrap();
+        assert!(
+            tokio::time::timeout(
+                std::time::Duration::from_secs(1),
+                gate.acquire_priority("a"),
+            )
+            .await
+            .is_err(),
+            "one priority caller must not exceed the per-authority reserve"
+        );
+        assert!(
+            tokio::time::timeout(
+                std::time::Duration::from_secs(1),
+                gate.acquire_priority("c"),
+            )
+            .await
+            .is_err(),
+            "priority callers must not exceed the global reserve"
+        );
+
+        drop((normal_a, normal_b, priority_a, priority_b));
+        assert!(gate.acquire_priority("a").await.is_ok());
     }
 
     #[test]
