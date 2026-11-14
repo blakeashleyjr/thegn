@@ -184,20 +184,19 @@ pub struct LspSlotCounts {
 
 /// The observable state of one language-server slot.
 ///
-/// `Closed` is reserved for a teardown snapshot. The current supervisor
-/// removes slots as it tears them down, so [`LspInner::slot_states`] omits it
-/// because that transient state is not representable there.
+/// Teardown removes slots from the map, so no closed state exists in this
+/// snapshot.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LspSlotState {
     Starting,
     Ready,
     Degraded { failures: u32 },
     Backoff { retry_in_secs: u64 },
-    Closed,
 }
 
 /// A non-blocking snapshot of the live LSP resource footprint.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[allow(dead_code)] // THE-335: resource-count consumer pending (aggregate policy is owner/design); exercised by tests
 pub struct LspResourceCounts {
     /// Live clients and clients whose subprocess startup is in flight.
     pub total_clients: u32,
@@ -777,8 +776,8 @@ impl LspInner {
     ///
     /// Ready and degraded live slots, starts in flight, and active backoffs
     /// are reported in sorted key order. Unavailable slots and expired
-    /// backoffs have no actionable state and are omitted. Teardown removes a
-    /// slot from the map, so `Closed` is not observable in this snapshot.
+    /// backoffs have no actionable state and are omitted. Teardown removes
+    /// slots from the map, so no closed state exists in this snapshot.
     /// Results are bounded by `limits::MAX_SERVERS_PER_ROOT`.
     pub fn slot_states(&self, root: &Path) -> Option<Vec<(String, LspSlotState)>> {
         let state = self.clients.try_lock().ok()?;
@@ -813,6 +812,7 @@ impl LspInner {
     /// Read-only, NON-BLOCKING resource counts from the same client-map lock
     /// as the per-root snapshots. Failed and unavailable cache entries do not
     /// own a client or a root resource, so they are omitted.
+    #[allow(dead_code)] // THE-335: resource-count consumer pending (aggregate policy is owner/design); exercised by tests
     pub fn resource_counts(&self) -> Option<LspResourceCounts> {
         let state = self.clients.try_lock().ok()?;
         let mut counts = LspResourceCounts::default();
@@ -1372,7 +1372,6 @@ fn slot_state_label(state: &LspSlotState) -> String {
         LspSlotState::Ready => "ready".to_string(),
         LspSlotState::Degraded { failures } => format!("degraded({failures})"),
         LspSlotState::Backoff { retry_in_secs } => format!("backoff({retry_in_secs}s)"),
-        LspSlotState::Closed => "closed".to_string(),
     }
 }
 
@@ -1631,7 +1630,6 @@ impl LspDiagnostics {
                         LspSlotState::Backoff { .. } => {
                             counts.backing_off = counts.backing_off.saturating_add(1)
                         }
-                        LspSlotState::Closed => {}
                     }
                     counts
                 })
@@ -1873,7 +1871,7 @@ impl LspDiagnostics {
 
     /// Record bounded slot states for `root`. Ready-only snapshots are kept
     /// only while the counts row is already needed for starting/backoff
-    /// pressure; degraded, backoff, starting, and closed states create the
+    /// pressure; degraded, backoff, and starting states create the
     /// same single info row even when no count is nonzero.
     pub fn set_slot_states(&mut self, root: &Path, mut states: Vec<(String, LspSlotState)>) {
         states.sort_by(|a, b| a.0.cmp(&b.0));
