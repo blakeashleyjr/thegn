@@ -1068,6 +1068,61 @@ mod tests {
     }
 
     #[test]
+    fn provider_id_round_trips_across_registry_and_ssh_identity_surfaces() {
+        let worktrees = [
+            Path::new("/home/u/code/repo/worktrees/repo/main"),
+            Path::new("/home/u/code/repo/worktrees/repo/feature-one"),
+            Path::new("/srv/other/repo/worktrees/repo/main"),
+        ];
+        let templates = [
+            "",
+            "{worktree}",
+            "{repo}-{worktree}",
+            "{repo}-{worktree}-{hash}",
+            "{slug}",
+            "my_sprite",
+            "../unsafe/{worktree}",
+        ];
+        let temp = tempfile::tempdir().unwrap();
+
+        for (case, worktree) in worktrees.iter().enumerate() {
+            for (template, configured) in templates.iter().enumerate() {
+                let id = thegn_core::envbuild::effective_provider_id_typed(
+                    configured,
+                    worktree,
+                    Some("repo"),
+                );
+                let id = id.as_str();
+                assert_eq!(checked_name(id).unwrap(), id);
+
+                let root = temp.path().join(format!("case-{case}-{template}"));
+                write_at(&root, &rec(id, "creating")).unwrap();
+                assert_eq!(read_at(&root, id).unwrap().name, id);
+
+                let known_hosts = known_hosts_path(id).unwrap();
+                assert_eq!(
+                    known_hosts.file_stem().and_then(|stem| stem.to_str()),
+                    Some(id)
+                );
+
+                let alias = thegn_core::hostkey::host_key_args(
+                    thegn_core::hostkey::HostKeyClass::LoopbackTunneled,
+                    &thegn_core::hostkey::HostKeyContext {
+                        alias: Some(id.to_owned()),
+                        ..Default::default()
+                    },
+                );
+                assert!(
+                    alias.iter().any(|arg| {
+                        arg == &format!("{}={id}", thegn_core::hostkey::HOST_KEY_LITERALS[2])
+                    }),
+                    "host-key alias argv lost provider id {id:?}: {alias:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
     fn write_rejects_symlinked_registry_root() {
         let tmp = tempfile::tempdir().unwrap();
         let real = tmp.path().join("real");
