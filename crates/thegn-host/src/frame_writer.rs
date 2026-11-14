@@ -727,9 +727,9 @@ fn write_message(
     msg: Msg,
     mut write: impl FnMut(&[u8]) -> std::io::Result<()>,
 ) -> (bool, bool, bool) {
-    let oob_kind = match &msg {
-        Msg::Oob(kind, ..) => Some(*kind),
-        _ => None,
+    let (oob_kind, oob_id) = match &msg {
+        Msg::Oob(kind, _, id) => (Some(*kind), *id),
+        _ => (None, 0),
     };
     let bytes = match &msg {
         Msg::Frame(b, ..) | Msg::Oob(_, b, _) | Msg::Clipboard(b, _) => b,
@@ -815,6 +815,9 @@ fn write_message(
                 .front()
                 .is_some_and(|deferred| deferred.defer_after < frame_seq)
         });
+        if let (Some(kind), Err(error)) = (oob_kind, &result) {
+            tracing::debug!(target: "thegn::frame", kind = ?kind, delivery = oob_id, %error, "OOB terminal write failed");
+        }
         // Keep replay failures consecutive across their successful resync
         // frames, so repeated delivery failure still reaches Fatal.
         if !(result.is_ok() && deferred_ready) {

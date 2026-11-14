@@ -92,6 +92,7 @@ impl PendingCornerOob {
 
     /// Retain the newest complete draw. Hidden draws wait until the corner is
     /// visible; every admission failure leaves the bytes here for a later wake.
+    #[cfg(test)]
     pub(crate) fn offer_draw(
         &mut self,
         bytes: Vec<u8>,
@@ -118,6 +119,7 @@ impl PendingCornerOob {
     }
 
     /// Retry on an existing OOB capacity or producer wake, without a cell frame.
+    #[cfg(test)]
     pub(crate) fn retry(
         &mut self,
         visible: bool,
