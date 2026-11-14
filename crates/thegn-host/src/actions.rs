@@ -513,33 +513,97 @@ pub(crate) fn spawn_ci_action(
     });
 }
 
-/// (worktree, run id, schedule generation) of a CI drill fetch in flight.
-type CiDetailKey = (std::path::PathBuf, String, Option<u64>);
-static CI_DETAIL_IN_FLIGHT: std::sync::Mutex<std::collections::BTreeSet<CiDetailKey>> =
-    std::sync::Mutex::new(std::collections::BTreeSet::new());
+struct CiDetailRequest {
+    worktree: std::path::PathBuf,
+    cfg: thegn_core::config::CiConfig,
+    refresh_tx: UnboundedSender<RefreshKind>,
+    waker: TerminalWaker,
+    run: thegn_core::ci::CiRun,
+    generation: Option<crate::hydrate_schedule::ScheduleFence>,
+    token: crate::ci_flight::FlightToken,
+}
 
-/// Held by the one fetch allowed per key; dropping it (any return path or a panic) frees the key.
-struct CiDetailClaim(CiDetailKey);
+#[derive(Default)]
+struct CiDetailCoordinator {
+    flight: crate::ci_flight::CiFlight,
+    queued: Option<CiDetailRequest>,
+}
 
-fn claim_ci_detail(key: CiDetailKey) -> Option<CiDetailClaim> {
-    let inserted = CI_DETAIL_IN_FLIGHT
+static CI_DETAIL_FLIGHT: std::sync::Mutex<CiDetailCoordinator> =
+    std::sync::Mutex::new(CiDetailCoordinator {
+        flight: crate::ci_flight::CiFlight {
+            running: None,
+            queued: None,
+        },
+        queued: None,
+    });
+
+fn submit_ci_detail(request: CiDetailRequest) {
+    let mut coordinator = CI_DETAIL_FLIGHT
         .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .insert(key.clone());
-    // Build the claim only after a successful insert; its Drop takes this same lock.
-    if inserted {
-        Some(CiDetailClaim(key))
-    } else {
-        None
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    match coordinator.flight.submit(request.token.clone()) {
+        crate::ci_flight::FlightAdmission::Started => {
+            drop(coordinator);
+            spawn_ci_detail_worker(request);
+        }
+        crate::ci_flight::FlightAdmission::Busy => {
+            tracing::debug!(
+                target: "thegn::ci",
+                run = %request.run.id,
+                "CI run detail fetch already in flight; busy"
+            );
+        }
+        crate::ci_flight::FlightAdmission::Queued => {
+            coordinator.queued = Some(request);
+        }
     }
 }
 
-impl Drop for CiDetailClaim {
+fn spawn_ci_detail_worker(mut request: CiDetailRequest) {
+    tokio::task::spawn_blocking(move || {
+        loop {
+            let _guard = CiDetailFlightGuard {
+                cancel: std::sync::Arc::clone(&request.token.cancel),
+            };
+            run_ci_detail_request(&request);
+            let next = {
+                let mut coordinator = CI_DETAIL_FLIGHT
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                coordinator.flight.finish().and_then(|token| {
+                    coordinator.queued.take().map(|mut next| {
+                        next.token = token;
+                        next
+                    })
+                })
+            };
+            let Some(next) = next else {
+                return;
+            };
+            request = next;
+        }
+    });
+}
+
+struct CiDetailFlightGuard {
+    cancel: std::sync::Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl Drop for CiDetailFlightGuard {
     fn drop(&mut self) {
-        let mut in_flight = CI_DETAIL_IN_FLIGHT
+        let mut coordinator = CI_DETAIL_FLIGHT
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        in_flight.remove(&self.0);
+        if coordinator
+            .flight
+            .running
+            .as_ref()
+            .is_some_and(|running| std::sync::Arc::ptr_eq(&running.cancel, &self.cancel))
+        {
+            coordinator.flight.clear();
+            coordinator.queued = None;
+        }
     }
 }
 
@@ -549,8 +613,9 @@ impl Drop for CiDetailClaim {
 /// `crate::detail::apply_ci_detail`). The header already painted from the cached
 /// run; this fills the drill. On any fetch error we fall back to the cached run
 /// so the modal still shows the header rather than crashing or spawning a pane.
-/// At most one fetch per worktree, run and schedule generation runs at a time;
-/// a repeat request while it runs is dropped.
+/// At most one drill fetch runs at a time. A repeat for the same worktree/run
+/// is reported busy; a different run supersedes the active fetch and is handed
+/// off when that fetch finishes.
 pub(crate) fn spawn_ci_detail(
     worktree: std::path::PathBuf,
     cfg: &thegn_core::config::CiConfig,
@@ -559,167 +624,190 @@ pub(crate) fn spawn_ci_detail(
     run: thegn_core::ci::CiRun,
     generation: Option<crate::hydrate_schedule::ScheduleFence>,
 ) {
-    use thegn_core::ci::CiState;
-    let wt = worktree;
-    let cfg = cfg.clone();
-    let tx = refresh_tx.clone();
-    let waker = waker.clone();
-    let Some(claim) = claim_ci_detail((
-        wt.clone(),
-        run.id.clone(),
-        generation.as_ref().map(|(_, g)| *g),
-    )) else {
-        tracing::debug!(
-            target: "thegn::ci",
-            run = %run.id,
-            "CI run detail fetch already in flight; coalesced"
-        );
-        return;
+    let token = crate::ci_flight::FlightToken {
+        key: crate::ci_flight::FlightKey {
+            active_path: Some(worktree.to_string_lossy().into_owned()),
+            run_id: Some(run.id.clone()),
+            kind: crate::ci_flight::FlightKind::RunDetail,
+            generation: None,
+        },
+        force: false,
+        cancel: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
     };
-    tokio::task::spawn_blocking(move || {
-        let _claim = claim;
-        let loc = thegn_core::remote::GitLoc::for_worktree(&wt);
-        let key = thegn_core::remote::GitLoc::worktree_cache_key(&wt);
-        let db = thegn_core::db::Db::open().ok();
-        let (client, context) = thegn_svc::ci::provider_and_context_for(&loc, &cfg)
-            .map(|(client, context)| (Some(client), context))
-            .unwrap_or((None, None));
-        // Full run (jobs/steps); on error keep the cached run so the header stays.
-        let (detail, discarded_jobs, incomplete, detail_error) = match client.as_ref() {
-            Some(c) => match c.run_detail(&loc, &run.id) {
-                Ok(detail) => (
-                    detail.run,
-                    detail.discarded_jobs,
-                    detail.incomplete.map(|incomplete| incomplete.reason()),
-                    None,
-                ),
-                Err(error) => (run, 0, None, Some(error.to_string())),
-            },
-            None => (
-                run,
-                0,
+    submit_ci_detail(CiDetailRequest {
+        worktree,
+        cfg: cfg.clone(),
+        refresh_tx: refresh_tx.clone(),
+        waker: waker.clone(),
+        run,
+        generation,
+        token,
+    });
+}
+
+fn run_ci_detail_request(request: &CiDetailRequest) {
+    use thegn_core::ci::CiState;
+    let wt = &request.worktree;
+    let cfg = &request.cfg;
+    let tx = &request.refresh_tx;
+    let waker = &request.waker;
+    let run = &request.run;
+    let generation = &request.generation;
+    if request
+        .token
+        .cancel
+        .load(std::sync::atomic::Ordering::Relaxed)
+    {
+        return;
+    }
+    let loc = thegn_core::remote::GitLoc::for_worktree(wt.as_path());
+    let key = thegn_core::remote::GitLoc::worktree_cache_key(wt.as_path());
+    let db = thegn_core::db::Db::open().ok();
+    let (client, context) = thegn_svc::ci::provider_and_context_for(&loc, cfg)
+        .map(|(client, context)| (Some(client), context))
+        .unwrap_or((None, None));
+    // Full run (jobs/steps); on error keep the cached run so the header stays.
+    let (detail, discarded_jobs, incomplete, detail_error) = match client.as_ref() {
+        Some(c) => match c.run_detail(&loc, &run.id) {
+            Ok(detail) => (
+                detail.run,
+                detail.discarded_jobs,
+                detail.incomplete.map(|incomplete| incomplete.reason()),
                 None,
-                Some("no CI provider for this worktree".to_string()),
             ),
-        };
-        // `log_cache_runs = 0` is the explicit privacy/IO opt-out: refresh
-        // ingestion, CLI, and control already honor it, so the interactive
-        // drill must not bypass it by fetching provider logs on a cache miss.
-        if cfg.log_cache_runs == 0 || detail_error.is_some() {
-            let payload = crate::detail::CiDetailPayload {
-                run: detail,
-                origin: wt.clone(),
-                discarded_jobs,
-                incomplete,
-                detail_error,
-                log_tail: Vec::new(),
-                log_entries: Vec::new(),
-            };
-            if let Some(result) = crate::hydrate_schedule::scheduled_delivery(
-                generation.as_ref(),
-                RefreshKind::CiDetail(Box::new(payload)),
-            ) && tx.send(result).is_ok()
-            {
-                let _ = waker.wake();
-            }
-            return;
-        }
-        // Read the cache before asking the provider.  A cache miss is fetched
-        // in this blocking lane and written back through CiLogEntry, which
-        // applies the same byte/line bounds and redaction as refresh ingestion.
-        let failing: Vec<&thegn_core::ci::CiJob> = detail
-            .jobs
-            .iter()
-            .filter(|j| j.state == CiState::Fail)
-            .collect();
-        let mut log_tail: Vec<String> = Vec::new();
-        let mut log_entries = Vec::new();
-        // A provider can report a very large matrix. Keep detail responsive and
-        // predictable by inspecting only a bounded failed-job batch.
-        for job in failing.into_iter().take(16) {
-            let cached = (cfg.log_cache_runs > 0)
-                .then(|| {
-                    db.as_ref().and_then(|db| {
-                        use thegn_core::store::CacheStore;
-                        db.get_ci_log(&key, &detail.id, &job.id).ok().flatten()
-                    })
-                })
-                .flatten();
-            let entry = if cached.as_ref().is_some_and(|e| {
-                thegn_core::ci_log::cached_log_is_evidence_for(
-                    e,
-                    &detail.sha,
-                    job.finished_at.as_deref(),
-                ) && crate::ci_refresh::context_row_current(&e.context, context.as_deref())
-                    && thegn_core::ci_log::cached_log_attempt_matches(e, detail.attempt)
-            }) {
-                cached
-            } else {
-                client.as_ref().and_then(|c| {
-                    let log = c.logs(&loc, &detail.id, &job.id).ok()?;
-                    let mut entry = thegn_core::ci_log::CiLogEntry::new(
-                        &key,
-                        &detail.id,
-                        &job.id,
-                        &job.name,
-                        &log.text,
-                        cfg.log_tail_lines
-                            .min(thegn_core::ci_log::HARD_MAX_LOG_LINES),
-                        cfg.log_max_bytes
-                            .min(thegn_core::ci_log::HARD_MAX_LOG_BYTES),
-                        thegn_core::util::now(),
-                    );
-                    entry.truncated |= log.truncated;
-                    entry.head_sha = detail.sha.clone();
-                    entry.attempt = detail.attempt;
-                    entry.context = context.clone().unwrap_or_default();
-                    if cfg.log_cache_runs > 0
-                        && thegn_core::ci_log::cacheable_log_entry(&entry)
-                        && let Some(db) = db.as_ref()
-                    {
-                        use thegn_core::store::CacheStore;
-                        if crate::hydrate_schedule::generation_is_current(generation.as_ref()) {
-                            let _ = db.put_ci_log(&entry);
-                        }
-                    }
-                    Some(entry)
-                })
-            };
-            if let Some(mut entry) = entry {
-                let (text, truncated) = thegn_core::ci_log::served_window(
-                    &entry.text,
-                    None,
-                    cfg.log_tail_lines,
-                    cfg.log_max_bytes,
-                );
-                entry.text = text;
-                entry.truncated |= truncated;
-                entry.redacted = true;
-                log_tail.push(format!(
-                    "\u{2500}\u{2500} {} \u{2500}\u{2500}",
-                    entry.job_name
-                ));
-                log_tail.extend(entry.text.lines().map(str::to_string));
-                log_entries.push(entry);
-            }
-        }
+            Err(error) => ((*run).clone(), 0, None, Some(error.to_string())),
+        },
+        None => (
+            (*run).clone(),
+            0,
+            None,
+            Some("no CI provider for this worktree".to_string()),
+        ),
+    };
+    // `log_cache_runs = 0` is the explicit privacy/IO opt-out: refresh
+    // ingestion, CLI, and control already honor it, so the interactive
+    // drill must not bypass it by fetching provider logs on a cache miss.
+    if cfg.log_cache_runs == 0 || detail_error.is_some() {
         let payload = crate::detail::CiDetailPayload {
             run: detail,
-            origin: wt.clone(),
+            origin: wt.to_path_buf(),
             discarded_jobs,
             incomplete,
             detail_error,
-            log_tail,
-            log_entries,
+            log_tail: Vec::new(),
+            log_entries: Vec::new(),
         };
         if let Some(result) = crate::hydrate_schedule::scheduled_delivery(
             generation.as_ref(),
             RefreshKind::CiDetail(Box::new(payload)),
         ) && tx.send(result).is_ok()
         {
-            let _ = waker.wake(); // best-effort: waker pulse: an input nudge must never fail the calling path
+            let _ = waker.wake();
         }
-    });
+        return;
+    }
+    // Read the cache before asking the provider.  A cache miss is fetched
+    // in this blocking lane and written back through CiLogEntry, which
+    // applies the same byte/line bounds and redaction as refresh ingestion.
+    let failing: Vec<&thegn_core::ci::CiJob> = detail
+        .jobs
+        .iter()
+        .filter(|j| j.state == CiState::Fail)
+        .collect();
+    let mut log_tail: Vec<String> = Vec::new();
+    let mut log_entries = Vec::new();
+    // A provider can report a very large matrix. Keep detail responsive and
+    // predictable by inspecting only a bounded failed-job batch.
+    for job in failing.into_iter().take(16) {
+        if request
+            .token
+            .cancel
+            .load(std::sync::atomic::Ordering::Relaxed)
+        {
+            return;
+        }
+        let cached = (cfg.log_cache_runs > 0)
+            .then(|| {
+                db.as_ref().and_then(|db| {
+                    use thegn_core::store::CacheStore;
+                    db.get_ci_log(&key, &detail.id, &job.id).ok().flatten()
+                })
+            })
+            .flatten();
+        let entry = if cached.as_ref().is_some_and(|e| {
+            thegn_core::ci_log::cached_log_is_evidence_for(
+                e,
+                &detail.sha,
+                job.finished_at.as_deref(),
+            ) && crate::ci_refresh::context_row_current(&e.context, context.as_deref())
+                && thegn_core::ci_log::cached_log_attempt_matches(e, detail.attempt)
+        }) {
+            cached
+        } else {
+            client.as_ref().and_then(|c| {
+                let log = c.logs(&loc, &detail.id, &job.id).ok()?;
+                let mut entry = thegn_core::ci_log::CiLogEntry::new(
+                    &key,
+                    &detail.id,
+                    &job.id,
+                    &job.name,
+                    &log.text,
+                    cfg.log_tail_lines
+                        .min(thegn_core::ci_log::HARD_MAX_LOG_LINES),
+                    cfg.log_max_bytes
+                        .min(thegn_core::ci_log::HARD_MAX_LOG_BYTES),
+                    thegn_core::util::now(),
+                );
+                entry.truncated |= log.truncated;
+                entry.head_sha = detail.sha.clone();
+                entry.attempt = detail.attempt;
+                entry.context = context.clone().unwrap_or_default();
+                if cfg.log_cache_runs > 0
+                    && thegn_core::ci_log::cacheable_log_entry(&entry)
+                    && let Some(db) = db.as_ref()
+                {
+                    use thegn_core::store::CacheStore;
+                    if crate::hydrate_schedule::generation_is_current(generation.as_ref()) {
+                        let _ = db.put_ci_log(&entry);
+                    }
+                }
+                Some(entry)
+            })
+        };
+        if let Some(mut entry) = entry {
+            let (text, truncated) = thegn_core::ci_log::served_window(
+                &entry.text,
+                None,
+                cfg.log_tail_lines,
+                cfg.log_max_bytes,
+            );
+            entry.text = text;
+            entry.truncated |= truncated;
+            entry.redacted = true;
+            log_tail.push(format!(
+                "\u{2500}\u{2500} {} \u{2500}\u{2500}",
+                entry.job_name
+            ));
+            log_tail.extend(entry.text.lines().map(str::to_string));
+            log_entries.push(entry);
+        }
+    }
+    let payload = crate::detail::CiDetailPayload {
+        run: detail,
+        origin: wt.to_path_buf(),
+        discarded_jobs,
+        incomplete,
+        detail_error,
+        log_tail,
+        log_entries,
+    };
+    if let Some(result) = crate::hydrate_schedule::scheduled_delivery(
+        generation.as_ref(),
+        RefreshKind::CiDetail(Box::new(payload)),
+    ) && tx.send(result).is_ok()
+    {
+        let _ = waker.wake(); // best-effort: waker pulse: an input nudge must never fail the calling path
+    }
 }
 
 /// Gather AI-account usage off the loop (each account's local credential home:
@@ -2932,54 +3020,40 @@ mod tests {
         );
     }
 
-    #[test]
-    fn ci_detail_claim_coalesces_a_repeat_for_the_same_run() {
-        let key = (
-            std::path::PathBuf::from("/nonexistent/thegn-ci-detail-claim-coalesce"),
-            "run-1".to_string(),
-            None,
-        );
-
-        let first = claim_ci_detail(key.clone());
-        assert!(first.is_some());
-        assert!(claim_ci_detail(key.clone()).is_none());
-        assert!(claim_ci_detail(key.clone()).is_none());
-
-        drop(first);
-        assert!(claim_ci_detail(key).is_some());
+    fn ci_detail_token(worktree: &str, run_id: &str) -> crate::ci_flight::FlightToken {
+        crate::ci_flight::FlightToken {
+            key: crate::ci_flight::FlightKey {
+                active_path: Some(worktree.into()),
+                run_id: Some(run_id.into()),
+                kind: crate::ci_flight::FlightKind::RunDetail,
+                generation: None,
+            },
+            force: false,
+            cancel: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        }
     }
 
     #[test]
-    fn ci_detail_claim_keys_on_worktree_run_and_generation() {
-        let worktree = std::path::PathBuf::from("/nonexistent/thegn-ci-detail-claim-keys");
-        let other_worktree =
-            std::path::PathBuf::from("/nonexistent/thegn-ci-detail-claim-keys-other");
-        let key = (worktree.clone(), "run-1".to_string(), None);
-
-        let first = claim_ci_detail(key);
-        let other_run = claim_ci_detail((worktree.clone(), "run-2".to_string(), None));
-        let other_worktree = claim_ci_detail((other_worktree, "run-1".to_string(), None));
-        let other_generation = claim_ci_detail((worktree, "run-1".to_string(), Some(7)));
-
-        assert!(first.is_some());
-        assert!(other_run.is_some());
-        assert!(other_worktree.is_some());
-        assert!(other_generation.is_some());
-    }
-
-    #[test]
-    fn ci_detail_claim_is_released_by_a_panicking_holder() {
-        let key = (
-            std::path::PathBuf::from("/nonexistent/thegn-ci-detail-claim-panic"),
-            "run-1".to_string(),
-            None,
+    fn ci_detail_flight_joins_repeats_and_hands_off_a_new_run() {
+        let mut flight = crate::ci_flight::CiFlight::default();
+        assert_eq!(
+            flight.submit(ci_detail_token("/wt", "run-1")),
+            crate::ci_flight::FlightAdmission::Started
         );
-
-        let result = std::panic::catch_unwind(|| {
-            let _claim = claim_ci_detail(key.clone()).unwrap();
-            panic!("boom");
-        });
-        assert!(result.is_err());
-        assert!(claim_ci_detail(key).is_some());
+        assert_eq!(
+            flight.submit(ci_detail_token("/wt", "run-1")),
+            crate::ci_flight::FlightAdmission::Busy
+        );
+        let next = ci_detail_token("/wt", "run-2");
+        let cancel = std::sync::Arc::clone(&next.cancel);
+        assert_eq!(
+            flight.submit(next),
+            crate::ci_flight::FlightAdmission::Queued
+        );
+        assert!(!cancel.load(std::sync::atomic::Ordering::Relaxed));
+        assert_eq!(
+            flight.finish().expect("queued run").key.run_id.as_deref(),
+            Some("run-2")
+        );
     }
 }
