@@ -1089,6 +1089,7 @@ fn scan_json_value(
                 return Ok(());
             }
             loop {
+                skip_json_whitespace(input, position);
                 scan_json_string(input, position, limits.string_len)?;
                 skip_json_whitespace(input, position);
                 if input.get(*position) != Some(&b':') {
@@ -2830,6 +2831,13 @@ mod tests {
     }
 
     #[test]
+    fn bounded_json_accepts_pretty_printed_object_and_array_whitespace() {
+        let input = "{\n  \"a\": 1,\n  \"b\": [ 1 ,\n 2 ]\n}";
+
+        assert!(bounded_json(input, PROVIDER_JSON_LIMITS).is_ok());
+    }
+
+    #[test]
     fn oversized_provider_json_is_refused_before_tree_decode() {
         let input = " ".repeat(PROVIDER_JSON_LIMITS.bytes + 1);
         assert!(matches!(
@@ -3726,7 +3734,7 @@ esac
             _ => panic!("unexpected page {page}"),
         });
 
-        assert!(matches!(result, Err(CiError::Other(_))));
+        assert!(matches!(result, Err(CiError::Malformed(_))));
     }
 
     #[test]
