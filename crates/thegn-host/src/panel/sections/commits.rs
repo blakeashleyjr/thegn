@@ -3,6 +3,7 @@
 //! copied (cherry-pick clipboard), rebase base, diff mark — and the focused
 //! filter line when `/` is live.
 
+use thegn_core::pipeline_report::display_cell;
 use thegn_core::theme::Hue;
 use thegn_core::util::age;
 
@@ -73,7 +74,7 @@ pub(super) fn content(ctx: &SectionCtx) -> Vec<PanelRow> {
             sp(1)
         };
         l.push(mark);
-        l.push(seg(ac(), c.short.clone()));
+        l.push(seg(ac(), display_cell(&c.short)));
         l.push(sp(1));
         // Range-selection tint rides the subject (the cursor row itself is
         // tinted by the frame).
@@ -81,9 +82,9 @@ pub(super) fn content(ctx: &SectionCtx) -> Vec<PanelRow> {
             .as_ref()
             .is_some_and(|r| r.contains(&display) && ui.git.sel_anchor.is_some());
         let subject = if in_range {
-            seg(t(), c.subject.clone()).bold()
+            seg(t(), display_cell(&c.subject)).bold()
         } else {
-            seg(d(), c.subject.clone())
+            seg(d(), display_cell(&c.subject))
         };
         l.push(subject);
         if !c.refs.is_empty() && ctx.deep() {

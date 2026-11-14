@@ -1,6 +1,7 @@
 //! The branches section: local branches with upstream divergence and the
 //! per-branch PR badge (joined from `pr_branch_cache`).
 
+use thegn_core::pipeline_report::display_cell;
 use thegn_core::theme::Hue;
 use thegn_core::util::age;
 
@@ -31,7 +32,7 @@ pub(super) fn content(ctx: &SectionCtx) -> Vec<PanelRow> {
         let message = match &data.branches_load {
             DocLoad::Pending => "loading branches…".to_string(),
             DocLoad::Ready => "no branches".to_string(),
-            DocLoad::Failed(error) => format!("branches unavailable: {error}"),
+            DocLoad::Failed(error) => format!("branches unavailable: {}", display_cell(error)),
         };
         rows.push(PanelRow::plain(Line::segs(vec![seg(g(), message)])));
         return rows;
@@ -49,9 +50,9 @@ pub(super) fn content(ctx: &SectionCtx) -> Vec<PanelRow> {
         });
         l.push(sp(1));
         l.push(if b.is_head {
-            seg(t(), b.name.clone()).bold()
+            seg(t(), display_cell(&b.name)).bold()
         } else {
-            seg(d(), b.name.clone())
+            seg(d(), display_cell(&b.name))
         });
         if b.ahead > 0 || b.behind > 0 {
             l.push(sp(1));

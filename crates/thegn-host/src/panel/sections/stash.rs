@@ -1,5 +1,6 @@
 //! The stash section: structured stash entries.
 
+use thegn_core::pipeline_report::display_cell;
 use thegn_core::util::age;
 
 use crate::panel::gitui::DocLoad;
@@ -18,7 +19,7 @@ pub(super) fn content(ctx: &SectionCtx) -> Vec<PanelRow> {
         let message = match &data.stashes_load {
             DocLoad::Pending => "loading stashes…".to_string(),
             DocLoad::Ready => "no stashes".to_string(),
-            DocLoad::Failed(error) => format!("stashes unavailable: {error}"),
+            DocLoad::Failed(error) => format!("stashes unavailable: {}", display_cell(error)),
         };
         rows.push(PanelRow::plain(Line::segs(vec![seg(g(), message)])));
         return rows;
@@ -31,7 +32,7 @@ pub(super) fn content(ctx: &SectionCtx) -> Vec<PanelRow> {
         let l: Vec<Seg> = vec![
             seg(ac(), format!("{{{}}}", s.index)),
             sp(1),
-            seg(d(), s.message.clone()),
+            seg(d(), display_cell(&s.message)),
         ];
         let r = vec![seg(g2(), age(s.date))];
         rows.push(
