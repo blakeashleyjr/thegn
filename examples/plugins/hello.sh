@@ -11,5 +11,5 @@
 #
 # Wire reference: openspec/specs/plugin-api + docs/extending/plugin.md.
 
-printf '%s\n' '{"method":"register","params":{"id":"hello.seg","extension_point":"StatusBarSegment","label":"Hello","surface":"hello.segment","cadence":{"kind":"interval","millis":5000}}}'
+printf '%s\n' '{"method":"register","params":{"id":"hello.seg","extension_point":"StatusBarSegment","label":"Hello","surface":"hello.segment","cadence":{"kind":"interval","millis":60000}}}'
 printf '%s\n' '{"method":"update","params":{"surface":"hello.segment","view":{"spans":[{"text":"hello from a plugin","role":"Accent"}]}}}'
