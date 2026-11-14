@@ -444,6 +444,9 @@ pub(crate) fn ci_rerun_scope(
     Err("ci: this provider can't re-run runs")
 }
 
+const CI_ACTION_NOT_STARTED_MESSAGE: &str =
+    "ci: another CI action is running (or thegn is quitting); CI action not started";
+
 /// Run a CI mutation (rerun / cancel) off the loop, then pulse a CI refresh so
 /// the badge + panel repaint. The provider is resolved inside the blocking task;
 /// ops it can't perform are declined with a warning (mirrors `cmd::ci`, keeping
@@ -462,7 +465,7 @@ pub(crate) fn spawn_ci_action(
     let waker = waker.clone();
     tokio::task::spawn_blocking(move || {
         let Some(mutation) = crate::ci_refresh::begin_ci_mutation() else {
-            thegn_core::msg::warn("ci: thegn is quitting; CI action not started");
+            thegn_core::msg::warn(CI_ACTION_NOT_STARTED_MESSAGE);
             return;
         };
         let loc = match thegn_core::remote::GitLoc::for_worktree_op(&wt, "ci action") {
@@ -607,6 +610,19 @@ impl Drop for CiDetailFlightGuard {
     }
 }
 
+fn ci_detail_flight_key(
+    worktree: &std::path::Path,
+    run_id: &str,
+    generation: Option<crate::hydrate_schedule::ScheduleFence>,
+) -> crate::ci_flight::FlightKey {
+    crate::ci_flight::FlightKey {
+        active_path: Some(worktree.to_string_lossy().into_owned()),
+        run_id: Some(run_id.to_owned()),
+        kind: crate::ci_flight::FlightKind::RunDetail,
+        generation: generation.as_ref().map(|(_, value)| *value),
+    }
+}
+
 /// Fetch a CI run's full detail (jobs/steps) + the failing jobs' log tails off
 /// the loop, then deliver them into the live modal overlay via a
 /// `RefreshKind::CiDetail` on the refresh channel (applied by
@@ -625,12 +641,7 @@ pub(crate) fn spawn_ci_detail(
     generation: Option<crate::hydrate_schedule::ScheduleFence>,
 ) {
     let token = crate::ci_flight::FlightToken {
-        key: crate::ci_flight::FlightKey {
-            active_path: Some(worktree.to_string_lossy().into_owned()),
-            run_id: Some(run.id.clone()),
-            kind: crate::ci_flight::FlightKind::RunDetail,
-            generation: None,
-        },
+        key: ci_detail_flight_key(worktree.as_path(), &run.id, generation.clone()),
         force: false,
         cancel: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
     };
@@ -3034,6 +3045,21 @@ mod tests {
     }
 
     #[test]
+    fn ci_detail_flight_key_includes_schedule_generation() {
+        let current = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(7));
+        let key = ci_detail_flight_key(std::path::Path::new("/wt"), "run-1", Some((current, 42)));
+        assert_eq!(key.generation, Some(42));
+    }
+
+    #[test]
+    fn ci_action_busy_warning_explains_the_two_refusal_causes() {
+        assert_eq!(
+            CI_ACTION_NOT_STARTED_MESSAGE,
+            "ci: another CI action is running (or thegn is quitting); CI action not started"
+        );
+    }
+
+    #[test]
     fn ci_detail_flight_joins_repeats_and_hands_off_a_new_run() {
         let mut flight = crate::ci_flight::CiFlight::default();
         assert_eq!(
@@ -3051,9 +3077,15 @@ mod tests {
             crate::ci_flight::FlightAdmission::Queued
         );
         assert!(!cancel.load(std::sync::atomic::Ordering::Relaxed));
+        let latest = ci_detail_token("/wt", "run-1");
+        assert_eq!(
+            flight.submit(latest),
+            crate::ci_flight::FlightAdmission::Queued
+        );
+        assert!(cancel.load(std::sync::atomic::Ordering::Relaxed));
         assert_eq!(
             flight.finish().expect("queued run").key.run_id.as_deref(),
-            Some("run-2")
+            Some("run-1")
         );
     }
 }

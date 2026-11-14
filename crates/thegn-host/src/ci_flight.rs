@@ -7,7 +7,6 @@ use std::sync::{
 pub(crate) enum FlightKind {
     Refresh,
     RunDetail,
-    LogDrilldown { job_id: String },
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -40,15 +39,20 @@ pub(crate) struct CiFlight {
 
 impl CiFlight {
     pub(crate) fn submit(&mut self, request: FlightToken) -> FlightAdmission {
-        let Some(running) = self.running.as_mut() else {
+        let Some(running) = self.running.as_ref() else {
             self.running = Some(request);
             return FlightAdmission::Started;
         };
-        if running.key == request.key {
-            running.force |= request.force;
+        if running.key == request.key
+            && request.key.kind != FlightKind::Refresh
+            && !running.cancel.load(Ordering::Relaxed)
+        {
+            // The live detail fetch for this exact key already produces this answer.
             return FlightAdmission::Busy;
         }
-        running.cancel.store(true, Ordering::Relaxed);
+        if running.key != request.key {
+            running.cancel.store(true, Ordering::Relaxed);
+        }
         if let Some(queued) = self.queued.as_ref()
             && queued.key != request.key
         {
