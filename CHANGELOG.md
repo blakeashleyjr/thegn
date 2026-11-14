@@ -13,6 +13,14 @@ All notable changes to **thegn** are documented here. The format follows
   and unit kind, and reclaims older generations after the shorter of the
   configured age and a three-day safety floor, including in active and dirty
   worktrees.
+- Plugin schedules now run at most once per second, and the shipped `hello` example plugin now runs every 60 seconds instead of every 5.
+
+### Fixed
+
+- Idle sessions cache primary-branch checks until branch refs change, so they no longer spawn Git repeatedly; missing worktrees no longer warn on every check.
+- Finished subprocess group liveness checks reuse one global `/proc` scan per short window; plugin descendant checks walk the child's own subtree.
+- Background memory trimming backs off after slow scans and skips scan trimming when swapped memory is elevated; noisy `tokei`, `ignore`, and `globset` logs are limited to errors.
+- Plugin CI log streams now redact retained private-key lines when an END marker arrives without a BEGIN marker.
 
 ## [0.1.0-alpha.80] — 2026-11-14
 
