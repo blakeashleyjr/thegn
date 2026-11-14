@@ -27,6 +27,7 @@ pub(crate) struct Clipboard {
     state: State,
     partial: Vec<u8>,
     pending: Option<Vec<u8>>,
+    refusal_reported: bool,
     #[cfg(test)]
     scanned: usize,
 }
@@ -36,6 +37,7 @@ impl Clipboard {
     /// An unfinished partial sequence is not a set and does not count.
     pub fn reset(&mut self) -> bool {
         let discarded = self.pending.take().is_some();
+        self.refusal_reported = false;
         self.state = State::Text;
         self.partial = Vec::new();
         discarded
@@ -88,6 +90,7 @@ impl Clipboard {
                         let end = self.partial.len() - if byte == 7 { 1 } else { 2 };
                         if valid_set(&self.partial[2..end]) {
                             self.pending = Some(std::mem::take(&mut self.partial));
+                            self.refusal_reported = false;
                         } else {
                             self.partial.clear();
                         }
@@ -144,11 +147,28 @@ impl Clipboard {
         self.pending.is_some()
     }
 
+    pub fn refusal_was_reported(&self) -> bool {
+        self.refusal_reported
+    }
+
     /// A refused write stays owned by this pane. Rejected input cannot replace
     /// it; a later validated set can. Successful admission transfers ownership.
-    pub fn submit(&mut self, admit: impl FnOnce(Vec<u8>) -> Result<(), Vec<u8>>) {
+    pub fn submit(&mut self, admit: impl FnOnce(Vec<u8>) -> Result<(), Vec<u8>>) -> bool {
         if let Some(bytes) = self.pending.take() {
-            self.pending = admit(bytes).err();
+            match admit(bytes) {
+                Ok(()) => {
+                    self.refusal_reported = false;
+                    false
+                }
+                Err(bytes) => {
+                    let report = !self.refusal_reported;
+                    self.refusal_reported = true;
+                    self.pending = Some(bytes);
+                    report
+                }
+            }
+        } else {
+            false
         }
     }
 }
@@ -256,6 +276,18 @@ mod tests {
                 "{body:?}"
             );
         }
+    }
+
+    #[test]
+    fn refused_clipboard_set_reports_once_until_replaced_or_admitted() {
+        let mut clipboard = Clipboard::default();
+        clipboard.feed(b"\x1b]52;c;eA==\x07");
+        assert!(clipboard.submit(Err));
+        assert!(!clipboard.submit(Err));
+        assert!(!clipboard.submit(|_| Ok(())));
+
+        clipboard.feed(b"\x1b]52;c;eQ==\x07");
+        assert!(clipboard.submit(Err));
     }
     #[test]
     fn valid_replacement_is_latest_and_panes_are_isolated() {
