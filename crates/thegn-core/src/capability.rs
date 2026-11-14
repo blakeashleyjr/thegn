@@ -763,7 +763,7 @@ pub const CATALOG: &[HostCapability] = &[
     cap(
         "worktrees.create",
         Verb::WorktreeCreate,
-        SurfaceSet::ALL,
+        SurfaceSet::of(&[Surface::Http, Surface::Grpc, Surface::Cli, Surface::Plugin]),
         "Create a worktree, optionally from an issue (branch from its hint, link it)",
     ),
     cap(
@@ -793,56 +793,50 @@ pub const CATALOG: &[HostCapability] = &[
     // --- containers ----------------------------------------------------------
     // First-party container management: read = list, write = lifecycle on OWNED
     // containers, admin = estate cleanup. Ownership is enforced structurally in
-    // `sandbox_manage` regardless of surface; the scope is the only per-door
-    // policy, via `required_scope`. `containers.prune` is `OPERATOR`, not `ALL`:
-    // it is admin-scoped and `admin_caps_never_reach_mcp_or_plugin` forbids an
-    // admin capability on the untrusted MCP/plugin doors — the same shape as
-    // `daemon.shutdown`.
+    // `sandbox_manage`; `containers.prune` remains admin-scoped via
+    // `required_scope`, while all three verbs are local CLI operations.
     cap(
         "containers.list",
         Verb::ContainersList,
-        // The TUI calls the container service in-process. No generic control
-        // route exists yet, so plugins must not advertise this as a callable
-        // `host.call` capability.
-        SurfaceSet::of(&[Surface::Http, Surface::Grpc, Surface::Cli, Surface::Mcp]),
+        SurfaceSet::of(&[Surface::Cli]),
         "List thegn's containers across backends (owned first; foreign read-only)",
     ),
     cap(
         "containers.control",
         Verb::ContainersControl,
-        SurfaceSet::of(&[Surface::Http, Surface::Grpc, Surface::Cli, Surface::Mcp]),
+        SurfaceSet::of(&[Surface::Cli]),
         "Lifecycle on an owned container: stop/start/restart/logs",
     ),
     cap(
         "containers.prune",
         Verb::ContainersPrune,
-        SurfaceSet::OPERATOR,
+        SurfaceSet::of(&[Surface::Cli]),
         "Clean up thegn-owned containers/images/volumes (gc + prune)",
     ),
-    // Model proxy (THE-58) — OPERATOR-surface only (control HTTP/gRPC + CLI),
-    // never MCP or plugins. status/stats are read; start/stop are admin.
+    // Model proxy (THE-58) — local CLI operations; their scopes remain defined
+    // by `required_scope` in the control catalog.
     cap(
         "model_proxy.status",
         Verb::ModelProxyStatus,
-        SurfaceSet::OPERATOR,
+        SurfaceSet::of(&[Surface::Cli]),
         "Report the model proxy: enabled, listen, reachability, providers",
     ),
     cap(
         "model_proxy.stats",
         Verb::ModelProxyStats,
-        SurfaceSet::OPERATOR,
+        SurfaceSet::of(&[Surface::Cli]),
         "Read the model proxy's spend/token/latency stats rollup",
     ),
     cap(
         "model_proxy.start",
         Verb::ModelProxyStart,
-        SurfaceSet::OPERATOR,
+        SurfaceSet::of(&[Surface::Cli]),
         "Launch the model proxy daemon",
     ),
     cap(
         "model_proxy.stop",
         Verb::ModelProxyStop,
-        SurfaceSet::OPERATOR,
+        SurfaceSet::of(&[Surface::Cli]),
         "Stop the model proxy daemon",
     ),
     // The supervisor's status view is intentionally local and read-only. A
@@ -880,7 +874,7 @@ pub const CATALOG: &[HostCapability] = &[
 /// dispatches every non-streaming row generically); **MCP** owes its remaining state
 /// tools; **gRPC** owes the mirror for the rows HTTP already serves; and
 /// **HTTP** owes control routes for the CLI-first operator families
-/// (`secret.*`, `project.*`, `containers.*`)
+/// (`secret.*`, `project.*`)
 /// — those run against local custody today, so the CLI implements them directly.
 pub const SURFACE_GAPS: &[(&str, Surface, &str)] = &[
     // -- gRPC: the mirror lags HTTP; each is a proto + handler addition -------
@@ -1155,99 +1149,6 @@ pub const SURFACE_GAPS: &[(&str, Surface, &str)] = &[
         Surface::Mcp,
         "MCP state tools land in the client-API phase",
     ),
-    (
-        "worktrees.create",
-        Surface::Mcp,
-        "MCP state tools land in the client-API phase",
-    ),
-    // -- containers: the local CLI (`thegn sandbox ls/ctl/logs/gc/prune`) owns
-    //    the CLI surface. HTTP, gRPC and MCP mirrors remain separate doors,
-    //    each deferred to its own client-API phase; `containers.prune` stays
-    //    OPERATOR-only. The plugin door is omitted until generic routes exist.
-    (
-        "containers.list",
-        Surface::Http,
-        "container listing is local CLI-only; HTTP mirror lands in the client-API phase",
-    ),
-    (
-        "containers.list",
-        Surface::Grpc,
-        "container listing is local CLI-only; gRPC mirror lands in the client-API phase",
-    ),
-    (
-        "containers.list",
-        Surface::Mcp,
-        "container doors land in the MCP scope-gating phase",
-    ),
-    (
-        "containers.control",
-        Surface::Http,
-        "container lifecycle and logs are local CLI-only; HTTP mirror lands in the client-API phase",
-    ),
-    (
-        "containers.control",
-        Surface::Grpc,
-        "container lifecycle and logs are local CLI-only; gRPC mirror lands in the client-API phase",
-    ),
-    (
-        "containers.control",
-        Surface::Mcp,
-        "container doors land in the MCP scope-gating phase",
-    ),
-    (
-        "containers.prune",
-        Surface::Http,
-        "prune is `thegn sandbox gc/prune` (CLI) this change; a control route lands in the client-API phase",
-    ),
-    (
-        "containers.prune",
-        Surface::Grpc,
-        "prune is `thegn sandbox gc/prune` (CLI) this change; a control route lands in the client-API phase",
-    ),
-    // -- gRPC verbs landed after the proto was last regenerated ---------------
-    // -- model proxy (THE-58): CLI-implemented; control-API routes deferred ----
-    // `thegn proxy status|stats|start|stop` run against the local daemon; an
-    // HTTP/gRPC route for a remote operator is future work. NEVER MCP/plugins.
-    (
-        "model_proxy.status",
-        Surface::Http,
-        "control-API route deferred; CLI-only for now",
-    ),
-    (
-        "model_proxy.status",
-        Surface::Grpc,
-        "control-API route deferred; CLI-only for now",
-    ),
-    (
-        "model_proxy.stats",
-        Surface::Http,
-        "control-API route deferred; CLI-only for now",
-    ),
-    (
-        "model_proxy.stats",
-        Surface::Grpc,
-        "control-API route deferred; CLI-only for now",
-    ),
-    (
-        "model_proxy.start",
-        Surface::Http,
-        "control-API route deferred; CLI-only for now",
-    ),
-    (
-        "model_proxy.start",
-        Surface::Grpc,
-        "control-API route deferred; CLI-only for now",
-    ),
-    (
-        "model_proxy.stop",
-        Surface::Http,
-        "control-API route deferred; CLI-only for now",
-    ),
-    (
-        "model_proxy.stop",
-        Surface::Grpc,
-        "control-API route deferred; CLI-only for now",
-    ),
 ];
 
 /// Why a SURFACE_GAPS row is excused (THE-201). Every row has exactly one, in [`GAP_DISPOSITIONS`].
@@ -1359,41 +1260,6 @@ pub const GAP_DISPOSITIONS: &[(&str, Surface, GapDisposition)] = &[
         Surface::Http,
         GapDisposition::Deferred { review: "THE-201" },
     ),
-    (
-        "containers.list",
-        Surface::Http,
-        GapDisposition::Deferred { review: "THE-201" },
-    ),
-    (
-        "containers.control",
-        Surface::Http,
-        GapDisposition::Deferred { review: "THE-201" },
-    ),
-    (
-        "containers.prune",
-        Surface::Http,
-        GapDisposition::Deferred { review: "THE-201" },
-    ),
-    (
-        "model_proxy.status",
-        Surface::Http,
-        GapDisposition::Deferred { review: "THE-201" },
-    ),
-    (
-        "model_proxy.stats",
-        Surface::Http,
-        GapDisposition::Deferred { review: "THE-201" },
-    ),
-    (
-        "model_proxy.start",
-        Surface::Http,
-        GapDisposition::Deferred { review: "THE-201" },
-    ),
-    (
-        "model_proxy.stop",
-        Surface::Http,
-        GapDisposition::Deferred { review: "THE-201" },
-    ),
     // -- grpc: dispositions follow the corresponding SURFACE_GAPS rows --
     ("secret.set", Surface::Grpc, GapDisposition::Unsafe),
     ("secret.rm", Surface::Grpc, GapDisposition::Unsafe),
@@ -1458,41 +1324,6 @@ pub const GAP_DISPOSITIONS: &[(&str, Surface, GapDisposition)] = &[
     ),
     (
         "project.new_feature",
-        Surface::Grpc,
-        GapDisposition::Deferred { review: "THE-204" },
-    ),
-    (
-        "containers.list",
-        Surface::Grpc,
-        GapDisposition::Deferred { review: "THE-204" },
-    ),
-    (
-        "containers.control",
-        Surface::Grpc,
-        GapDisposition::Deferred { review: "THE-204" },
-    ),
-    (
-        "containers.prune",
-        Surface::Grpc,
-        GapDisposition::Deferred { review: "THE-204" },
-    ),
-    (
-        "model_proxy.status",
-        Surface::Grpc,
-        GapDisposition::Deferred { review: "THE-204" },
-    ),
-    (
-        "model_proxy.stats",
-        Surface::Grpc,
-        GapDisposition::Deferred { review: "THE-204" },
-    ),
-    (
-        "model_proxy.start",
-        Surface::Grpc,
-        GapDisposition::Deferred { review: "THE-204" },
-    ),
-    (
-        "model_proxy.stop",
         Surface::Grpc,
         GapDisposition::Deferred { review: "THE-204" },
     ),
@@ -1569,21 +1400,6 @@ pub const GAP_DISPOSITIONS: &[(&str, Surface, GapDisposition)] = &[
     ),
     (
         "dispatches.set_status",
-        Surface::Mcp,
-        GapDisposition::Deferred { review: "THE-203" },
-    ),
-    (
-        "worktrees.create",
-        Surface::Mcp,
-        GapDisposition::Deferred { review: "THE-203" },
-    ),
-    (
-        "containers.list",
-        Surface::Mcp,
-        GapDisposition::Deferred { review: "THE-203" },
-    ),
-    (
-        "containers.control",
         Surface::Mcp,
         GapDisposition::Deferred { review: "THE-203" },
     ),
@@ -2019,6 +1835,58 @@ mod tests {
     }
 
     #[test]
+    fn narrowed_verbs_are_not_routed_on_dropped_surfaces() {
+        let cli_only = [
+            "containers.list",
+            "containers.control",
+            "containers.prune",
+            "model_proxy.status",
+            "model_proxy.stats",
+            "model_proxy.start",
+            "model_proxy.stop",
+        ];
+        for surface in [Surface::Http, Surface::Grpc, Surface::Mcp, Surface::Plugin] {
+            let routed: Vec<_> = required_for(surface)
+                .filter(|capability| cli_only.contains(&capability.id.0))
+                .map(|capability| capability.id.0)
+                .collect();
+            assert!(
+                routed.is_empty(),
+                "narrowed verbs routed on {}: {routed:?}",
+                surface.as_str()
+            );
+        }
+        for id in cli_only {
+            let capability = lookup(id).unwrap();
+            assert_eq!(capability.surfaces, SurfaceSet::of(&[Surface::Cli]), "{id}");
+            for surface in [Surface::Http, Surface::Grpc, Surface::Mcp, Surface::Plugin] {
+                assert!(
+                    !capability.surfaces.contains(surface),
+                    "{id} on {}",
+                    surface.as_str()
+                );
+                assert!(
+                    !is_gap(id, surface),
+                    "{id}/{} remains an excuse",
+                    surface.as_str()
+                );
+            }
+        }
+        assert_eq!(
+            required_scope(lookup("containers.prune").unwrap().verb),
+            Scope::Admin
+        );
+
+        let create = lookup("worktrees.create").unwrap();
+        assert_eq!(
+            create.surfaces,
+            SurfaceSet::of(&[Surface::Http, Surface::Grpc, Surface::Cli, Surface::Plugin])
+        );
+        assert!(!create.surfaces.contains(Surface::Mcp));
+        assert!(!is_gap("worktrees.create", Surface::Mcp));
+    }
+
+    #[test]
     fn advertised_supported_operations_have_no_universal_stubs() {
         let stubbed: Vec<(&str, &str)> = stubs()
             .map(|capability| (capability.id.0, capability.stub.unwrap_or_default()))
@@ -2036,7 +1904,7 @@ mod tests {
         assert_eq!(l.implemented, 1, "sessions.list is working");
         assert_eq!(l.stub, 0, "no universally inert row is advertised");
         // HTTP is no longer excuse-free: the CLI-first operator families
-        // (`secret.*`, `project.*`, `containers.*`) declare an HTTP surface
+        // (`secret.*`, `project.*`) declare an HTTP surface
         // whose route is still owed.
         // Derive the count from the table so this pins the ledger's arithmetic,
         // not a number that rots with every burn-down.
