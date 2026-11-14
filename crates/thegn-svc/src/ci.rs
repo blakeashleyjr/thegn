@@ -44,10 +44,12 @@ const CI_LOG_TIMEOUT: Duration = Duration::from_secs(60);
 const GITLAB_DETAIL_DEADLINE: Duration = CI_LOG_TIMEOUT;
 const CI_CLI_MAX_STDOUT: usize = 8 * 1024 * 1024;
 const CI_CLI_MAX_STDERR: usize = 64 * 1024;
-const PROVIDER_JSON_MAX_DEPTH: usize = 32;
-const PROVIDER_JSON_MAX_NODES: usize = 262_144;
-const PROVIDER_JSON_MAX_CONTAINER_ITEMS: usize = 10_000;
-const PROVIDER_JSON_MAX_STRING_BYTES: usize = 1024 * 1024;
+const PROVIDER_JSON_LIMITS: JsonLimits = JsonLimits {
+    bytes: CI_CLI_MAX_STDOUT,
+    depth: 32,
+    items: 262_144,
+    string_len: 1024 * 1024,
+};
 pub(crate) const MAX_PROVIDER_FIELD_BYTES: usize = 4096;
 /// Most workflow inputs one trigger may carry (GitHub's own workflow_dispatch
 /// ceiling is lower; this bounds the argv a caller can build). A chosen policy
@@ -395,10 +397,11 @@ fn github_targeted_argv(remote: &GithubRemote, args: &[&str]) -> Vec<String> {
 /// callers, so the lookalike-host bug cannot be fixed in one place and survive in
 /// the other.
 pub fn system_from_remote_host(url: &str) -> Option<CiSystem> {
-    let host = parse_gitlab_remote(url)?.host;
-    let hostname = host.split(':').next()?;
+    let remote = parse_gitlab_remote(url)?;
+    let hostname = remote.host.split(':').next()?;
     if is_github_host(hostname) {
-        Some(CiSystem::GithubActions)
+        // GitHub has no nested namespaces: anything but owner/repo is ambiguous.
+        (remote.project.split('/').count() == 2).then_some(CiSystem::GithubActions)
     } else if is_gitlab_host(hostname) {
         Some(CiSystem::GitlabCi)
     } else {
@@ -443,7 +446,7 @@ fn ci_run_error(error: crate::issue::gh_run::RunError) -> CiError {
         RunError::NotInstalled => CiError::NotInstalled,
         RunError::Exit { stderr, .. } => classify_stderr(&stderr),
         RunError::Timeout => CiError::Other("CI provider command timed out".into()),
-        RunError::Truncated => CiError::Other("provider output byte budget exhausted".into()),
+        RunError::Truncated => CiError::TooLarge("provider output byte budget exhausted".into()),
         RunError::Io(message) => CiError::Other(format!("CI provider command failed: {message}")),
         RunError::Cancelled => CiError::Other("CI provider command cancelled".into()),
     }
@@ -718,7 +721,7 @@ fn read_capped<R: Read>(mut reader: R, max: usize) -> Result<Vec<u8>, CiError> {
             return Ok(output);
         }
         if n > remaining {
-            return Err(CiError::Other(
+            return Err(CiError::TooLarge(
                 "provider output byte budget exhausted".into(),
             ));
         }
@@ -916,139 +919,280 @@ fn nonempty(s: &serde_json::Value, key: &str) -> Option<String> {
         .filter(|v| !v.is_empty())
 }
 
-/// Allocation-free structural scan before serde constructs a provider tree.
-fn preflight_provider_json(input: &[u8]) -> Result<(), &'static str> {
-    if input.len() > CI_CLI_MAX_STDOUT {
-        return Err("json byte limit");
+/// Bounds applied before serde constructs a provider response tree.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct JsonLimits {
+    pub bytes: usize,
+    pub depth: usize,
+    pub items: usize,
+    pub string_len: usize,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum JsonScanError {
+    TooLarge(&'static str),
+    Malformed(&'static str),
+}
+
+fn skip_json_whitespace(input: &[u8], position: &mut usize) {
+    while input
+        .get(*position)
+        .is_some_and(|byte| matches!(byte, b' ' | b'\n' | b'\r' | b'\t'))
+    {
+        *position += 1;
     }
-    let mut stack: Vec<(u8, usize, bool)> = Vec::new();
-    let mut nodes = 0usize;
-    let mut i = 0usize;
-    while i < input.len() {
-        match input[i] {
-            b' ' | b'\n' | b'\r' | b'\t' | b':' => i += 1,
-            b',' => {
-                if let Some((_, commas, has_item)) = stack.last_mut()
-                    && *has_item
-                {
-                    *commas = commas.saturating_add(1);
-                    *has_item = false;
-                }
-                i += 1;
-            }
-            b'{' | b'[' => {
-                nodes = nodes.saturating_add(1);
-                if nodes > PROVIDER_JSON_MAX_NODES {
-                    return Err("json node limit");
-                }
-                if let Some((_, _, has_item)) = stack.last_mut() {
-                    *has_item = true;
-                }
-                stack.push((input[i], 0, false));
-                if stack.len() > PROVIDER_JSON_MAX_DEPTH {
-                    return Err("json depth limit");
-                }
-                i += 1;
-            }
-            b'}' | b']' => {
-                let expected = if input[i] == b'}' { b'{' } else { b'[' };
-                let Some((kind, commas, has_item)) = stack.pop() else {
-                    return Err("json nesting");
-                };
-                if kind != expected {
-                    return Err("json nesting");
-                }
-                if commas.saturating_add(usize::from(has_item)) > PROVIDER_JSON_MAX_CONTAINER_ITEMS
-                {
-                    return Err("json container limit");
-                }
-                i += 1;
-            }
+}
+
+fn scan_json_string(input: &[u8], position: &mut usize, limit: usize) -> Result<(), JsonScanError> {
+    if input.get(*position) != Some(&b'"') {
+        return Err(JsonScanError::Malformed("expected JSON string"));
+    }
+    *position += 1;
+    let mut length = 0usize;
+    loop {
+        let Some(byte) = input.get(*position).copied() else {
+            return Err(JsonScanError::Malformed("unterminated JSON string"));
+        };
+        match byte {
             b'"' => {
-                if let Some((_, _, has_item)) = stack.last_mut() {
-                    *has_item = true;
-                }
-                nodes = nodes.saturating_add(1);
-                if nodes > PROVIDER_JSON_MAX_NODES {
-                    return Err("json node limit");
-                }
-                i += 1;
-                let mut decoded = 0usize;
-                let mut closed = false;
-                while i < input.len() {
-                    match input[i] {
-                        b'"' => {
-                            i += 1;
-                            closed = true;
-                            break;
-                        }
-                        b'\\' => {
-                            i += 1;
-                            let Some(escape) = input.get(i).copied() else {
-                                return Err("json string");
-                            };
-                            if escape == b'u' {
-                                if i + 4 >= input.len()
-                                    || !input[i + 1..i + 5].iter().all(|b| b.is_ascii_hexdigit())
-                                {
-                                    return Err("json escape");
-                                }
-                                decoded = decoded.saturating_add(3);
-                                i += 5;
-                            } else if matches!(
-                                escape,
-                                b'"' | b'\\' | b'/' | b'b' | b'f' | b'n' | b'r' | b't'
-                            ) {
-                                decoded = decoded.saturating_add(1);
-                                i += 1;
-                            } else {
-                                return Err("json escape");
-                            }
-                        }
-                        b if b < 0x20 => return Err("json control"),
-                        _ => {
-                            decoded = decoded.saturating_add(1);
-                            i += 1;
-                        }
+                *position += 1;
+                return Ok(());
+            }
+            b'\\' => {
+                *position += 1;
+                let Some(escape) = input.get(*position).copied() else {
+                    return Err(JsonScanError::Malformed("unterminated JSON escape"));
+                };
+                if escape == b'u' {
+                    if *position + 4 >= input.len()
+                        || !input[*position + 1..*position + 5]
+                            .iter()
+                            .all(u8::is_ascii_hexdigit)
+                    {
+                        return Err(JsonScanError::Malformed("invalid JSON escape"));
                     }
-                    if decoded > PROVIDER_JSON_MAX_STRING_BYTES {
-                        return Err("json string limit");
-                    }
+                    length = length.saturating_add(3);
+                    *position += 5;
+                } else if matches!(
+                    escape,
+                    b'"' | b'\\' | b'/' | b'b' | b'f' | b'n' | b'r' | b't'
+                ) {
+                    length = length.saturating_add(1);
+                    *position += 1;
+                } else {
+                    return Err(JsonScanError::Malformed("invalid JSON escape"));
                 }
-                if !closed {
-                    return Err("json string");
-                }
+            }
+            byte if byte < 0x20 => {
+                return Err(JsonScanError::Malformed(
+                    "JSON string contains a control byte",
+                ));
             }
             _ => {
-                if let Some((_, _, has_item)) = stack.last_mut() {
-                    *has_item = true;
+                length = length.saturating_add(1);
+                *position += 1;
+            }
+        }
+        if length > limit {
+            return Err(JsonScanError::TooLarge("JSON string length limit"));
+        }
+    }
+}
+
+fn scan_json_number(input: &[u8], position: &mut usize) -> Result<(), JsonScanError> {
+    let start = *position;
+    if input.get(*position) == Some(&b'-') {
+        *position += 1;
+    }
+    match input.get(*position).copied() {
+        Some(b'0') => *position += 1,
+        Some(b'1'..=b'9') => {
+            *position += 1;
+            while input
+                .get(*position)
+                .is_some_and(|byte| byte.is_ascii_digit())
+            {
+                *position += 1;
+            }
+        }
+        _ => return Err(JsonScanError::Malformed("invalid JSON number")),
+    }
+    if input.get(*position) == Some(&b'.') {
+        *position += 1;
+        let fraction_start = *position;
+        while input
+            .get(*position)
+            .is_some_and(|byte| byte.is_ascii_digit())
+        {
+            *position += 1;
+        }
+        if *position == fraction_start {
+            return Err(JsonScanError::Malformed("invalid JSON fraction"));
+        }
+    }
+    if input
+        .get(*position)
+        .is_some_and(|byte| matches!(byte, b'e' | b'E'))
+    {
+        *position += 1;
+        if input
+            .get(*position)
+            .is_some_and(|byte| matches!(byte, b'+' | b'-'))
+        {
+            *position += 1;
+        }
+        let exponent_start = *position;
+        while input
+            .get(*position)
+            .is_some_and(|byte| byte.is_ascii_digit())
+        {
+            *position += 1;
+        }
+        if *position == exponent_start {
+            return Err(JsonScanError::Malformed("invalid JSON exponent"));
+        }
+    }
+    if *position == start {
+        Err(JsonScanError::Malformed("invalid JSON number"))
+    } else {
+        Ok(())
+    }
+}
+
+fn scan_json_value(
+    input: &[u8],
+    position: &mut usize,
+    depth: usize,
+    limits: JsonLimits,
+    items: &mut usize,
+    is_item: bool,
+) -> Result<(), JsonScanError> {
+    skip_json_whitespace(input, position);
+    if is_item {
+        *items = items.saturating_add(1);
+        if *items > limits.items {
+            return Err(JsonScanError::TooLarge("JSON item limit"));
+        }
+    }
+    let Some(byte) = input.get(*position).copied() else {
+        return Err(JsonScanError::Malformed("missing JSON value"));
+    };
+    match byte {
+        b'{' => {
+            if depth.saturating_add(1) > limits.depth {
+                return Err(JsonScanError::TooLarge("JSON depth limit"));
+            }
+            *position += 1;
+            skip_json_whitespace(input, position);
+            if input.get(*position) == Some(&b'}') {
+                *position += 1;
+                return Ok(());
+            }
+            loop {
+                skip_json_whitespace(input, position);
+                scan_json_string(input, position, limits.string_len)?;
+                skip_json_whitespace(input, position);
+                if input.get(*position) != Some(&b':') {
+                    return Err(JsonScanError::Malformed("missing JSON object colon"));
                 }
-                nodes = nodes.saturating_add(1);
-                if nodes > PROVIDER_JSON_MAX_NODES {
-                    return Err("json node limit");
-                }
-                while i < input.len()
-                    && !matches!(input[i], b' ' | b'\n' | b'\r' | b'\t' | b',' | b']' | b'}')
-                {
-                    i += 1;
+                *position += 1;
+                scan_json_value(input, position, depth + 1, limits, items, true)?;
+                skip_json_whitespace(input, position);
+                match input.get(*position).copied() {
+                    Some(b',') => *position += 1,
+                    Some(b'}') => {
+                        *position += 1;
+                        return Ok(());
+                    }
+                    _ => return Err(JsonScanError::Malformed("malformed JSON object")),
                 }
             }
         }
+        b'[' => {
+            if depth.saturating_add(1) > limits.depth {
+                return Err(JsonScanError::TooLarge("JSON depth limit"));
+            }
+            *position += 1;
+            skip_json_whitespace(input, position);
+            if input.get(*position) == Some(&b']') {
+                *position += 1;
+                return Ok(());
+            }
+            loop {
+                scan_json_value(input, position, depth + 1, limits, items, true)?;
+                skip_json_whitespace(input, position);
+                match input.get(*position).copied() {
+                    Some(b',') => *position += 1,
+                    Some(b']') => {
+                        *position += 1;
+                        return Ok(());
+                    }
+                    _ => return Err(JsonScanError::Malformed("malformed JSON array")),
+                }
+            }
+        }
+        b'"' => scan_json_string(input, position, limits.string_len),
+        b't' if input.get(*position..(*position).saturating_add(4)) == Some(b"true") => {
+            *position += 4;
+            Ok(())
+        }
+        b'f' if input.get(*position..(*position).saturating_add(5)) == Some(b"false") => {
+            *position += 5;
+            Ok(())
+        }
+        b'n' if input.get(*position..(*position).saturating_add(4)) == Some(b"null") => {
+            *position += 4;
+            Ok(())
+        }
+        b'-' | b'0'..=b'9' => scan_json_number(input, position),
+        _ => Err(JsonScanError::Malformed("invalid JSON value")),
     }
-    if stack.is_empty() {
+}
+
+/// Scan provider JSON without constructing its serde value tree.
+fn bounded_json(input: &str, limits: JsonLimits) -> Result<(), JsonScanError> {
+    if input.len() > limits.bytes {
+        return Err(JsonScanError::TooLarge("JSON byte limit"));
+    }
+    // The provider policy is intentionally finite. Keeping the recursive scan
+    // below this constant prevents a caller-supplied test limit from turning
+    // malformed input into an unbounded call stack.
+    let limits = JsonLimits {
+        depth: limits.depth.min(PROVIDER_JSON_LIMITS.depth),
+        ..limits
+    };
+    let mut position = 0;
+    let mut items = 0;
+    scan_json_value(
+        input.as_bytes(),
+        &mut position,
+        0,
+        limits,
+        &mut items,
+        false,
+    )?;
+    skip_json_whitespace(input.as_bytes(), &mut position);
+    if position == input.len() {
         Ok(())
     } else {
-        Err("json nesting")
+        Err(JsonScanError::Malformed("trailing JSON data"))
     }
 }
 
 fn decode_provider_json<T: serde::de::DeserializeOwned>(
     json: &str,
     what: &str,
-) -> Result<T, String> {
-    preflight_provider_json(json.as_bytes())
-        .map_err(|reason| format!("invalid {what} response: {reason}"))?;
-    serde_json::from_str(json).map_err(|error| format!("invalid {what} response: {error}"))
+) -> Result<T, CiError> {
+    bounded_json(json, PROVIDER_JSON_LIMITS).map_err(|error| match error {
+        JsonScanError::TooLarge(reason) => {
+            CiError::TooLarge(format!("invalid {what} response: {reason}"))
+        }
+        JsonScanError::Malformed(reason) => {
+            CiError::Malformed(format!("invalid {what} response: {reason}"))
+        }
+    })?;
+    serde_json::from_str(json)
+        .map_err(|error| CiError::Malformed(format!("invalid {what} response: {error}")))
 }
 
 fn cap_provider_rows(mut runs: Vec<CiRun>, limit: usize) -> (Vec<CiRun>, usize) {
@@ -1390,7 +1534,7 @@ impl CiProvider for GithubCi {
             args.push(b);
         }
         let json = run_cli(self.command(loc, &args)?, &self.cancel)?;
-        let (runs, discarded_rows) = parse_gh_runs_with_discarded(&json).map_err(CiError::Other)?;
+        let (runs, discarded_rows) = parse_gh_runs_with_discarded(&json)?;
         let (runs, overflow) = cap_provider_rows(runs, limit);
         let discarded_rows = discarded_rows.saturating_add(overflow);
         if discarded_rows > 0 {
@@ -1406,8 +1550,7 @@ impl CiProvider for GithubCi {
         let args = github_run_detail_argv(run_id)?;
         let argv: Vec<_> = args.iter().map(String::as_str).collect();
         let json = run_cli(self.command(loc, &argv)?, &self.cancel)?;
-        let value: serde_json::Value =
-            decode_provider_json(&json, "provider run").map_err(CiError::Other)?;
+        let value: serde_json::Value = decode_provider_json(&json, "provider run")?;
         let observed = value
             .get("databaseId")
             .cloned()
@@ -1458,7 +1601,7 @@ impl CiProvider for GithubCi {
             self.command(loc, &["workflow", "list", "--json", "id,name,path,state"])?,
             &self.cancel,
         )?;
-        parse_gh_workflows(&json).map_err(CiError::Other)
+        parse_gh_workflows(&json)
     }
 
     fn trigger(
@@ -1505,27 +1648,31 @@ impl CiProvider for GithubCi {
 }
 
 /// Parse `gh run list --json …` (an array) into runs.
-pub fn parse_gh_runs(json: &str) -> Result<Vec<CiRun>, String> {
+pub fn parse_gh_runs(json: &str) -> Result<Vec<CiRun>, CiError> {
     parse_gh_runs_with_discarded(json).map(|parsed| parsed.0)
 }
 
-pub fn parse_gh_runs_with_discarded(json: &str) -> Result<(Vec<CiRun>, usize), String> {
+pub fn parse_gh_runs_with_discarded(json: &str) -> Result<(Vec<CiRun>, usize), CiError> {
     let rows = decode_provider_json::<Vec<serde_json::Value>>(json, "GitHub runs")?;
     Ok(parse_provider_row(&rows, gh_run_from_value))
 }
 
 /// Parse `gh run view <id> --json …` (a single object, with `jobs`).
-pub fn parse_gh_run_detail(json: &str) -> Option<CiRun> {
-    let v: serde_json::Value = decode_provider_json(json, "GitHub run").ok()?;
+pub fn parse_gh_run_detail(json: &str) -> Result<Option<CiRun>, CiError> {
+    let v: serde_json::Value = decode_provider_json(json, "GitHub run")?;
     if !v.is_object() {
-        return None;
+        return Ok(None);
     }
-    let run = gh_run_from_value(&v)?;
-    let jobs = v.get("jobs")?.as_array()?;
+    let Some(run) = gh_run_from_value(&v) else {
+        return Ok(None);
+    };
+    let Some(jobs) = v.get("jobs").and_then(serde_json::Value::as_array) else {
+        return Ok(None);
+    };
     if jobs.iter().any(|job| gh_job_from_value(job).is_none()) {
-        return None;
+        return Ok(None);
     }
-    Some(run)
+    Ok(Some(run))
 }
 
 fn gh_run_from_value(v: &serde_json::Value) -> Option<CiRun> {
@@ -1629,7 +1776,7 @@ fn warn_unknown_github_state(kind: &str, status: &str, conclusion: Option<&str>)
 }
 
 /// Parse `gh workflow list --json id,name,path,state`.
-pub fn parse_gh_workflows(json: &str) -> Result<Vec<CiWorkflow>, String> {
+pub fn parse_gh_workflows(json: &str) -> Result<Vec<CiWorkflow>, CiError> {
     let arr = decode_provider_json::<Vec<serde_json::Value>>(json, "GitHub workflows")?;
     arr.iter()
         .map(|v| {
@@ -1647,7 +1794,7 @@ pub fn parse_gh_workflows(json: &str) -> Result<Vec<CiWorkflow>, String> {
             })
         })
         .collect::<Option<Vec<_>>>()
-        .ok_or_else(|| "invalid GitHub workflow row".to_string())
+        .ok_or_else(|| CiError::Malformed("invalid GitHub workflow row".into()))
 }
 
 // === GitLab CI (glab + GitLab API) ========================================
@@ -1854,8 +2001,7 @@ impl CiProvider for GitlabCi {
             self.command(loc, &remote, &["api", &endpoint])?,
             &self.cancel,
         )?;
-        let (runs, discarded) =
-            parse_gitlab_pipelines_with_discarded(&json).map_err(CiError::Other)?;
+        let (runs, discarded) = parse_gitlab_pipelines_with_discarded(&json)?;
         let (runs, overflow) = cap_provider_rows(runs, limit);
         let discarded = discarded.saturating_add(overflow);
         if discarded > 0 {
@@ -1879,8 +2025,7 @@ impl CiProvider for GitlabCi {
             self.command(loc, &remote, &["api", &run_endpoint])?,
             &self.cancel,
         )?;
-        let value: serde_json::Value =
-            decode_provider_json(&pipe_json, "provider pipeline").map_err(CiError::Other)?;
+        let value: serde_json::Value = decode_provider_json(&pipe_json, "provider pipeline")?;
         let observed = value.get("id").cloned().unwrap_or(serde_json::Value::Null);
         let mut run = gitlab_pipeline_from_value(&value)
             .filter(|_| nonempty(&value, "status").is_some())
@@ -2060,7 +2205,7 @@ fn collect_gitlab_jobs(
         let jobs_json = match fetch(page, remaining)? {
             GitlabJobPage::Body(body) => body,
             GitlabJobPage::OverBudget if page == 1 => {
-                return Err(CiError::Other(
+                return Err(CiError::TooLarge(
                     "provider output byte budget exhausted".into(),
                 ));
             }
@@ -2079,8 +2224,7 @@ fn collect_gitlab_jobs(
             }
         };
         bytes = bytes.saturating_add(jobs_json.len());
-        let page_rows = decode_provider_json::<Vec<serde_json::Value>>(&jobs_json, "GitLab jobs")
-            .map_err(CiError::Other)?;
+        let page_rows = decode_provider_json::<Vec<serde_json::Value>>(&jobs_json, "GitLab jobs")?;
         let page_length = page_rows.len();
         let (parsed, discarded) = parse_provider_row(&page_rows, gitlab_job_from_value);
         for job in &parsed {
@@ -2280,24 +2424,28 @@ fn encode_project_segment(project: &str) -> String {
 }
 
 /// Parse `GET projects/:id/pipelines` (array) into runs.
-pub fn parse_gitlab_pipelines(json: &str) -> Result<Vec<CiRun>, String> {
+pub fn parse_gitlab_pipelines(json: &str) -> Result<Vec<CiRun>, CiError> {
     parse_gitlab_pipelines_with_discarded(json).map(|parsed| parsed.0)
 }
 
-pub fn parse_gitlab_pipelines_with_discarded(json: &str) -> Result<(Vec<CiRun>, usize), String> {
+pub fn parse_gitlab_pipelines_with_discarded(json: &str) -> Result<(Vec<CiRun>, usize), CiError> {
     let rows = decode_provider_json::<Vec<serde_json::Value>>(json, "GitLab pipelines")?;
     Ok(parse_provider_row(&rows, gitlab_pipeline_from_value))
 }
 
 /// Parse `GET projects/:id/pipelines/:id` (single object) into a run header.
-pub fn parse_gitlab_pipeline_detail(json: &str) -> Option<CiRun> {
-    let v: serde_json::Value = decode_provider_json(json, "GitLab pipeline").ok()?;
+pub fn parse_gitlab_pipeline_detail(json: &str) -> Result<Option<CiRun>, CiError> {
+    let v: serde_json::Value = decode_provider_json(json, "GitLab pipeline")?;
     if !v.is_object() {
-        return None;
+        return Ok(None);
     }
-    let run = gitlab_pipeline_from_value(&v)?;
-    nonempty(&v, "status")?;
-    Some(run)
+    let Some(run) = gitlab_pipeline_from_value(&v) else {
+        return Ok(None);
+    };
+    if nonempty(&v, "status").is_none() {
+        return Ok(None);
+    }
+    Ok(Some(run))
 }
 
 fn gitlab_pipeline_from_value(v: &serde_json::Value) -> Option<CiRun> {
@@ -2325,11 +2473,11 @@ fn gitlab_pipeline_from_value(v: &serde_json::Value) -> Option<CiRun> {
 }
 
 /// Parse `GET projects/:id/pipelines/:id/jobs` (array) into jobs.
-pub fn parse_gitlab_jobs(json: &str) -> Result<Vec<CiJob>, String> {
+pub fn parse_gitlab_jobs(json: &str) -> Result<Vec<CiJob>, CiError> {
     parse_gitlab_jobs_with_discarded(json).map(|parsed| parsed.0)
 }
 
-pub fn parse_gitlab_jobs_with_discarded(json: &str) -> Result<(Vec<CiJob>, usize), String> {
+pub fn parse_gitlab_jobs_with_discarded(json: &str) -> Result<(Vec<CiJob>, usize), CiError> {
     let arr = decode_provider_json::<Vec<serde_json::Value>>(json, "GitLab jobs")?;
     Ok(parse_provider_row(&arr, gitlab_job_from_value))
 }
@@ -2598,10 +2746,7 @@ mod tests {
 
     #[test]
     fn provider_json_preflight_rejects_structure_and_field_overflow() {
-        let too_many = format!(
-            "[{}]",
-            vec!["0"; PROVIDER_JSON_MAX_CONTAINER_ITEMS + 1].join(",")
-        );
+        let too_many = format!("[{}]", vec!["0"; PROVIDER_JSON_LIMITS.items + 1].join(","));
         assert!(parse_gh_runs_with_discarded(&too_many).is_err());
 
         let object = format!(
@@ -2611,21 +2756,98 @@ mod tests {
                 .collect::<Vec<_>>()
                 .join(",")
         );
-        let many_nodes = format!("[{}]", vec![object; 2500].join(","));
+        let many_nodes = format!("[{}]", vec![object; 5000].join(","));
         assert!(parse_gh_runs_with_discarded(&many_nodes).is_err());
 
         let nested = format!(
             "{}0{}",
-            "[".repeat(PROVIDER_JSON_MAX_DEPTH + 1),
-            "]".repeat(PROVIDER_JSON_MAX_DEPTH + 1)
+            "[".repeat(PROVIDER_JSON_LIMITS.depth + 1),
+            "]".repeat(PROVIDER_JSON_LIMITS.depth + 1)
         );
         assert!(parse_gh_runs_with_discarded(&nested).is_err());
 
-        let oversized = "x".repeat(PROVIDER_JSON_MAX_STRING_BYTES + 1);
+        let oversized = "x".repeat(PROVIDER_JSON_LIMITS.string_len + 1);
         let row = format!(
             r#"[{{"databaseId":1,"workflowName":"CI","status":"completed","displayTitle":"{oversized}"}}]"#
         );
         assert!(parse_gh_runs_with_discarded(&row).is_err());
+    }
+
+    #[test]
+    fn bounded_json_has_below_at_and_above_boundaries_for_every_limit() {
+        let base = PROVIDER_JSON_LIMITS;
+
+        assert!(matches!(
+            bounded_json("{}", JsonLimits { bytes: 1, ..base }),
+            Err(JsonScanError::TooLarge(_))
+        ));
+        assert!(bounded_json("{}", JsonLimits { bytes: 2, ..base }).is_ok());
+        assert!(bounded_json("{}", JsonLimits { bytes: 3, ..base }).is_ok());
+
+        assert!(matches!(
+            bounded_json("[0]", JsonLimits { depth: 0, ..base }),
+            Err(JsonScanError::TooLarge(_))
+        ));
+        assert!(bounded_json("[0]", JsonLimits { depth: 1, ..base }).is_ok());
+        assert!(bounded_json("[0]", JsonLimits { depth: 2, ..base }).is_ok());
+
+        assert!(matches!(
+            bounded_json("[0,1]", JsonLimits { items: 1, ..base }),
+            Err(JsonScanError::TooLarge(_))
+        ));
+        assert!(bounded_json("[0,1]", JsonLimits { items: 2, ..base }).is_ok());
+        assert!(bounded_json("[0,1]", JsonLimits { items: 3, ..base }).is_ok());
+
+        assert!(matches!(
+            bounded_json(
+                "\"ab\"",
+                JsonLimits {
+                    string_len: 1,
+                    ..base
+                }
+            ),
+            Err(JsonScanError::TooLarge(_))
+        ));
+        assert!(
+            bounded_json(
+                "\"ab\"",
+                JsonLimits {
+                    string_len: 2,
+                    ..base
+                }
+            )
+            .is_ok()
+        );
+        assert!(
+            bounded_json(
+                "\"ab\"",
+                JsonLimits {
+                    string_len: 3,
+                    ..base
+                }
+            )
+            .is_ok()
+        );
+    }
+
+    #[test]
+    fn bounded_json_accepts_pretty_printed_object_and_array_whitespace() {
+        let input = "{\n  \"a\": 1,\n  \"b\": [ 1 ,\n 2 ]\n}";
+
+        assert!(bounded_json(input, PROVIDER_JSON_LIMITS).is_ok());
+    }
+
+    #[test]
+    fn oversized_provider_json_is_refused_before_tree_decode() {
+        let input = " ".repeat(PROVIDER_JSON_LIMITS.bytes + 1);
+        assert!(matches!(
+            parse_gh_runs(&input),
+            Err(CiError::TooLarge(message)) if message.contains("byte limit")
+        ));
+        assert!(matches!(
+            parse_gh_runs("not json"),
+            Err(CiError::Malformed(_))
+        ));
     }
 
     #[test]
@@ -2797,7 +3019,7 @@ mod tests {
             &test_cancel(),
         );
         assert!(
-            matches!(result, Err(CiError::Other(message)) if message == "provider output byte budget exhausted")
+            matches!(result, Err(CiError::TooLarge(message)) if message == "provider output byte budget exhausted")
         );
     }
 
@@ -3029,6 +3251,22 @@ mod tests {
             system_from_remote_host("https://evil.test/gitlab.com/g/r"),
             None
         );
+
+        for (raw, expected) in [
+            ("https://evil.example/github.com/owner/repo", None),
+            ("https://user:password@github.com/owner/repo", None),
+            ("https://github.com/owner/team/repo", None),
+            ("https://ghe.example.test:8443/owner/repo", None),
+            ("ssh://git@ghe.example.test:2222/owner/repo", None),
+            (
+                "https://github.com:443/owner/repo",
+                Some(CiSystem::GithubActions),
+            ),
+            ("https://github.com@evil.example/owner/repo", None),
+        ] {
+            assert_eq!(system_from_remote_host(raw), expected, "{raw:?}");
+        }
+        assert!(parse_github_remote("https://ghe.example.test:8443/owner/repo").is_some());
     }
 
     #[test]
@@ -3176,16 +3414,19 @@ mod tests {
         let detail = parse_gh_run_detail(
             r#"{"databaseId":5,"workflowName":"CI","status":"completed","conclusion":"failure","attempt":3,"jobs":[]}"#,
         )
+        .unwrap()
         .unwrap();
         assert_eq!(detail.attempt, Some(3));
         let zero = parse_gh_run_detail(
             r#"{"databaseId":5,"workflowName":"CI","status":"completed","conclusion":"failure","attempt":0,"jobs":[]}"#,
         )
+        .unwrap()
         .unwrap();
         assert_eq!(zero.attempt, None);
         let missing = parse_gh_run_detail(
             r#"{"databaseId":5,"workflowName":"CI","status":"completed","conclusion":"failure","jobs":[]}"#,
         )
+        .unwrap()
         .unwrap();
         assert_eq!(missing.attempt, None);
         let (runs, discarded) = parse_gh_runs_with_discarded(
@@ -3464,7 +3705,7 @@ esac
         let result = collect_gitlab_jobs(1, |_page, _remaining| Ok(GitlabJobPage::OverBudget));
         assert!(matches!(
             result,
-            Err(CiError::Other(message)) if message == "provider output byte budget exhausted"
+            Err(CiError::TooLarge(message)) if message == "provider output byte budget exhausted"
         ));
     }
 
@@ -3493,7 +3734,7 @@ esac
             _ => panic!("unexpected page {page}"),
         });
 
-        assert!(matches!(result, Err(CiError::Other(_))));
+        assert!(matches!(result, Err(CiError::Malformed(_))));
     }
 
     #[test]
@@ -4869,7 +5110,7 @@ esac
              "url":"https://gh/job/2","steps":[]}
           ]
         }"#;
-        let run = parse_gh_run_detail(json).unwrap();
+        let run = parse_gh_run_detail(json).unwrap().unwrap();
         assert_eq!(run.id, "123");
         assert_eq!(run.jobs.len(), 2);
         assert_eq!(run.jobs[0].name, "build");
@@ -4877,9 +5118,15 @@ esac
         assert_eq!(run.jobs[0].steps.len(), 1);
         assert_eq!(run.jobs[0].steps[0].state, CiState::Pass);
         assert_eq!(run.jobs[1].state, CiState::Fail);
-        assert!(parse_gh_run_detail("[]").is_none());
-        assert!(parse_gh_run_detail(r#"{"databaseId":1,"status":"completed"}"#).is_none());
-        assert!(parse_gh_run_detail(r#"{"databaseId":1,"status":"completed","jobs":[{"databaseId":2,"status":"completed","steps":[{}]}]}"#).is_none());
+        assert!(parse_gh_run_detail("[]").unwrap().is_none());
+        assert!(
+            parse_gh_run_detail(r#"{"databaseId":1,"status":"completed"}"#)
+                .unwrap()
+                .is_none()
+        );
+        assert!(parse_gh_run_detail(r#"{"databaseId":1,"status":"completed","jobs":[{"databaseId":2,"status":"completed","steps":[{}]}]}"#)
+            .unwrap()
+            .is_none());
     }
 
     #[test]
@@ -5019,7 +5266,10 @@ esac
         let detail = r#"{"id":1001,"iid":7,"ref":"main","sha":"abc","status":"failed",
           "source":"push","web_url":"https://gl/p/1001","created_at":"2026-06-25T10:00:00Z",
           "updated_at":"2026-06-25T10:06:00Z"}"#;
-        assert_eq!(parse_gitlab_pipeline_detail(detail).unwrap().id, "1001");
+        assert_eq!(
+            parse_gitlab_pipeline_detail(detail).unwrap().unwrap().id,
+            "1001"
+        );
 
         let jobs = r#"[
           {"id":5001,"name":"build","stage":"build","status":"success",

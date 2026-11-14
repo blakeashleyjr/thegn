@@ -1072,25 +1072,33 @@ pub fn resync_ff_checkout(root: &Path, branch: &str, old: &str, new: &str) -> Re
     }
 }
 
-/// Parse `git worktree list --porcelain -z` into `(path, branch)` pairs.
+/// One record from `git worktree list --porcelain -z`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct WorktreeEntry {
+    pub path: String,
+    pub branch: Option<String>,
+    pub bare: bool,
+    pub locked: bool,
+    pub prunable: bool,
+    pub detached: bool,
+}
+
+/// Parse `git worktree list --porcelain -z` into detailed records.
 ///
-/// THE-376 slice b: non-`-z` porcelain cannot frame a newline in a path.
-/// Each record opens with `worktree <path>` and carries a branch only when one
-/// is checked out (a detached or bare entry has none). Kept pure so malformed
-/// framing and exact path preservation are unit-tested.
-pub fn parse_worktree_branches(porcelain: &str) -> Option<Vec<(String, Option<String>)>> {
+/// The NUL framing is strict: a missing final record separator or a field
+/// outside a record is malformed input; unknown fields inside a record are
+/// ignored. `locked` and `prunable` are retained so callers that resurrect
+/// sidebar rows can refuse those records without guessing from their paths.
+pub fn parse_worktree_entries(porcelain: &str) -> Option<Vec<WorktreeEntry>> {
     if porcelain.is_empty() {
         return Some(Vec::new());
     }
-    // Every field is NUL-terminated and every record ends with an empty field,
-    // so a complete listing ends with two NULs.
     if !porcelain.ends_with("\0\0") {
         return None;
     }
 
     let mut out = Vec::new();
-    let mut record: Option<(String, Option<String>)> = None;
-    // A bare entry has no `HEAD`; a `branch` line needs one before it.
+    let mut record: Option<WorktreeEntry> = None;
     let mut has_head = false;
     for field in porcelain.split('\0') {
         if field.is_empty() {
@@ -1102,34 +1110,70 @@ pub fn parse_worktree_branches(porcelain: &str) -> Option<Vec<(String, Option<St
             if record.is_some() || path.is_empty() {
                 return None;
             }
-            record = Some((path.to_string(), None));
+            record = Some(WorktreeEntry {
+                path: path.to_string(),
+                branch: None,
+                bare: false,
+                locked: false,
+                prunable: false,
+                detached: false,
+            });
         } else if let Some(head) = field.strip_prefix("HEAD ") {
             if record.is_none() || head.is_empty() || has_head {
                 return None;
             }
             has_head = true;
         } else if let Some(branch) = field.strip_prefix("branch ") {
-            let (_, current_branch) = record.as_mut()?;
-            if !has_head {
+            let entry = record.as_mut()?;
+            if !has_head || entry.branch.is_some() || entry.detached || branch.is_empty() {
                 return None;
             }
-            if current_branch.is_some() {
-                return None;
-            }
-            *current_branch = Some(
+            entry.branch = Some(
                 branch
                     .strip_prefix("refs/heads/")
                     .unwrap_or(branch)
                     .to_string(),
             );
+        } else if field == "detached" {
+            let entry = record.as_mut()?;
+            if !has_head || entry.detached || entry.branch.is_some() {
+                return None;
+            }
+            entry.detached = true;
+        } else if field == "bare" {
+            let entry = record.as_mut()?;
+            if entry.bare {
+                return None;
+            }
+            entry.bare = true;
+        } else if field == "locked" || field.starts_with("locked ") {
+            let entry = record.as_mut()?;
+            if entry.locked {
+                return None;
+            }
+            entry.locked = true;
+        } else if field == "prunable" || field.starts_with("prunable ") {
+            let entry = record.as_mut()?;
+            if entry.prunable {
+                return None;
+            }
+            entry.prunable = true;
         } else if record.is_none() {
             return None;
         }
     }
-    if record.is_some() {
-        return None;
-    }
-    Some(out)
+    record.is_none().then_some(out)
+}
+
+/// Parse `git worktree list --porcelain -z` into `(path, branch)` pairs.
+///
+/// THE-376 slice b: non-`-z` porcelain cannot frame a newline in a path.
+/// Each record opens with `worktree <path>` and carries a branch only when one
+/// is checked out (a detached or bare entry has none). Kept pure so malformed
+/// framing and exact path preservation are unit-tested.
+pub fn parse_worktree_branches(porcelain: &str) -> Option<Vec<(String, Option<String>)>> {
+    parse_worktree_entries(porcelain)
+        .map(|entries| entries.into_iter().map(|e| (e.path, e.branch)).collect())
 }
 
 /// The exact Git argv for the NUL-framed worktree listing protocol.
@@ -1143,6 +1187,18 @@ pub fn worktree_branches(root: &Path) -> Option<Vec<(String, Option<String>)>> {
     let porcelain = git_out_allow_empty(root, &WORKTREE_LIST_Z)?;
     match parse_worktree_branches(&porcelain) {
         Some(branches) => Some(branches),
+        None => {
+            tracing::debug!(target: "thegn::git", "malformed git worktree list --porcelain -z output");
+            None
+        }
+    }
+}
+
+/// Read and strictly parse detailed worktree records from Git.
+pub fn worktree_entries(root: &Path) -> Option<Vec<WorktreeEntry>> {
+    let porcelain = git_out_allow_empty(root, &WORKTREE_LIST_Z)?;
+    match parse_worktree_entries(&porcelain) {
+        Some(entries) => Some(entries),
         None => {
             tracing::debug!(target: "thegn::git", "malformed git worktree list --porcelain -z output");
             None
@@ -3091,6 +3147,12 @@ mod tests {
             ]
         );
         assert!(parse_worktree_branches("").unwrap().is_empty());
+        assert_eq!(
+            parse_worktree_branches(
+                "worktree /a\0HEAD aa\0branch refs/heads/x\0future-field v\0\0"
+            ),
+            Some(vec![("/a".to_string(), Some("x".to_string()))])
+        );
     }
 
     #[test]
@@ -3134,6 +3196,16 @@ mod tests {
                 "accepted malformed listing {malformed:?}"
             );
         }
+    }
+
+    #[test]
+    fn parse_worktree_entries_retains_discovery_exclusions() {
+        let porcelain = "worktree /wt/locked\0HEAD aaaa\0branch refs/heads/locked\0locked reason\0\0worktree /wt/prunable\0HEAD bbbb\0branch refs/heads/prunable\0prunable missing\0\0worktree /wt/detached\0HEAD cccc\0detached\0\0worktree /repo/bare\0bare\0\0";
+        let entries = parse_worktree_entries(porcelain).unwrap();
+        assert!(entries[0].locked);
+        assert!(entries[1].prunable);
+        assert!(entries[2].detached && entries[2].branch.is_none());
+        assert!(entries[3].bare);
     }
 
     #[test]

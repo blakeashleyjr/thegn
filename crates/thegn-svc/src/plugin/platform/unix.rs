@@ -165,6 +165,12 @@ pub(crate) fn platform_non_utf8_path_for_test(
     Some(parent.join(std::ffi::OsStr::from_bytes(b"src-\xff.rs")))
 }
 
+pub(crate) fn platform_os_string_from_bytes(bytes: Vec<u8>) -> Option<std::ffi::OsString> {
+    use std::os::unix::ffi::OsStringExt;
+
+    Some(std::ffi::OsString::from_vec(bytes))
+}
+
 pub(crate) fn platform_is_transient_accept_resource_error(raw_os_error: Option<i32>) -> bool {
     matches!(
         raw_os_error,

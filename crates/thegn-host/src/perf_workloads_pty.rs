@@ -272,7 +272,7 @@ fn run_case(kind: ProducerKind, seed: u64, mode: SinkMode, total_bytes: usize) -
                     let retry_deadline = Instant::now() + Duration::from_secs(10);
                     let mut attempts = 0;
                     loop {
-                        match writer.try_submit_oob(bytes) {
+                        match writer.try_submit_oob(crate::frame_writer::OobKind::Other, bytes) {
                             Ok(()) => {
                                 admitted
                                     .lock()

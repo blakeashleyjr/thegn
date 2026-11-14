@@ -265,6 +265,22 @@ pub(crate) fn alert(message: &str) {
     notify_drop_target(message);
 }
 
+/// Deliver a bounded asynchronous status-line update from a DB-writer job.
+pub(crate) fn status(message: &str) {
+    if let Ok(target) = drop_notice_target().lock()
+        && let Some(target) = target.as_ref()
+    {
+        if let Err(error) = target.tx.send(crate::hydrate::RefreshKind::PrActionStatus(
+            message.to_owned(),
+        )) {
+            tracing::debug!(%error, "failed to send database status update");
+        }
+        if let Err(error) = target.waker.wake() {
+            tracing::debug!(%error, "failed to wake after database status update");
+        }
+    }
+}
+
 fn enqueue(writer: &Writer, job: impl FnOnce(&Db) + Send + 'static) -> bool {
     if !reserve(&writer.state) {
         note_drop(&writer.state);
