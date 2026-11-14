@@ -8,7 +8,7 @@ use once_cell::sync::Lazy;
 use regex::Regex;
 use serde::{Deserialize, Serialize};
 use std::borrow::Cow;
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, VecDeque};
 
 /// The marker used for every value removed from a CI log.
 pub const REDACTION_MARKER: &str = "***redacted***";
@@ -394,6 +394,33 @@ pub fn redact_stream_line_tracked(line: &[u8], in_pem: &mut bool) -> (String, Op
         *in_pem = begin;
     }
     (format!("{result}{cr}{newline}"), marker)
+}
+
+/// Replace all currently retained lines after a provider tail ends a PEM block
+/// that had no retained BEGIN marker. Line count and line endings are kept;
+/// callers must reapply their byte/line caps after this operation.
+pub fn redact_retained_on_unmatched_end(
+    lines: &mut VecDeque<String>,
+    kept_bytes: &mut usize,
+    already_redacted: &mut bool,
+) {
+    if *already_redacted {
+        return;
+    }
+    for line in lines.iter_mut() {
+        let newline = if line.ends_with("\r\n") {
+            "\r\n"
+        } else if line.ends_with('\n') {
+            "\n"
+        } else if line.ends_with('\r') {
+            "\r"
+        } else {
+            ""
+        };
+        *line = format!("{REDACTION_MARKER}{newline}");
+    }
+    *kept_bytes = lines.iter().map(String::len).sum();
+    *already_redacted = true;
 }
 
 /// Select the terminal run identities retained by a configured cache policy.
@@ -1429,6 +1456,36 @@ mod tests {
         let (invalid, marker) = redact_stream_line_tracked(b"\xff\n", &mut in_pem);
         assert_eq!(invalid, format!("{REDACTION_MARKER}\n"));
         assert_eq!(marker, None);
+    }
+
+    #[test]
+    fn retained_unmatched_end_redaction_preserves_line_endings_and_bytes() {
+        let mut lines = VecDeque::from([
+            "crlf\r\n".to_owned(),
+            "lf\n".to_owned(),
+            "cr\r".to_owned(),
+            "unterminated".to_owned(),
+        ]);
+        let mut kept_bytes = lines.iter().map(String::len).sum();
+        let mut already_redacted = false;
+
+        redact_retained_on_unmatched_end(&mut lines, &mut kept_bytes, &mut already_redacted);
+
+        let expected = VecDeque::from([
+            format!("{REDACTION_MARKER}\r\n"),
+            format!("{REDACTION_MARKER}\n"),
+            format!("{REDACTION_MARKER}\r"),
+            REDACTION_MARKER.to_owned(),
+        ]);
+        assert_eq!(lines, expected);
+        assert_eq!(kept_bytes, lines.iter().map(String::len).sum());
+        assert!(already_redacted);
+
+        let before = lines.clone();
+        kept_bytes = 7;
+        redact_retained_on_unmatched_end(&mut lines, &mut kept_bytes, &mut already_redacted);
+        assert_eq!(lines, before);
+        assert_eq!(kept_bytes, 7);
     }
 
     #[test]
