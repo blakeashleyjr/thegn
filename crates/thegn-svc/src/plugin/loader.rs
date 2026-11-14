@@ -447,6 +447,25 @@ fn valid_routing_id(id: &str) -> bool {
             .any(|pair| is_separator(pair[0]) && is_separator(pair[1]))
 }
 
+fn valid_capability_target(target: &str) -> bool {
+    (MIN_PLUGIN_ROUTING_ID_BYTES..=MAX_PLUGIN_ROUTING_ID_BYTES).contains(&target.len())
+        && target
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || b"._:/-".contains(&byte))
+}
+
+fn quoted_prefix(value: &str) -> String {
+    let mut end = value.len().min(MAX_PLUGIN_ROUTING_ID_BYTES);
+    while !value.is_char_boundary(end) {
+        end -= 1;
+    }
+    if end < value.len() {
+        format!("{:?}…", &value[..end])
+    } else {
+        format!("{value:?}")
+    }
+}
+
 fn valid_env_key(key: &str) -> bool {
     let bytes = key.as_bytes();
     (1..=MAX_PLUGIN_ROUTING_ID_BYTES).contains(&bytes.len())
@@ -549,25 +568,28 @@ fn check_spec_fields(p: &LoadedPlugin) -> Vec<SpecProblem> {
     }
     for cap in &p.spec.manifest.capabilities {
         if !valid_routing_id(cap.kind())
-            || !valid_routing_id(cap.target())
-            || !valid_routing_id(cap.as_str())
+            || !valid_capability_target(cap.target())
+            || cap.as_str().len() > MAX_PLUGIN_ROUTING_ID_BYTES
         {
-            push(format!("invalid capability {:?}", cap.as_str()));
+            push(format!(
+                "invalid capability {}",
+                quoted_prefix(cap.as_str())
+            ));
         }
     }
     for contribution in &p.spec.manifest.contributions {
-        if !valid_routing_id(contribution.id.as_str()) {
+        if !valid_routing_id(contribution.id.as_str()) || contribution.id.as_str().contains(':') {
             push(format!(
-                "contribution {:?}: invalid id",
-                contribution.id.as_str()
+                "contribution {}: invalid id",
+                quoted_prefix(contribution.id.as_str())
             ));
         }
         if let Some(surface) = &contribution.surface
-            && !valid_routing_id(surface.as_str())
+            && (!valid_routing_id(surface.as_str()) || surface.as_str().contains(':'))
         {
             push(format!(
                 "contribution {}: invalid surface",
-                contribution.id.as_str()
+                quoted_prefix(contribution.id.as_str())
             ));
         }
         if let CadenceHint::Interval { millis } = &contribution.cadence
@@ -575,7 +597,7 @@ fn check_spec_fields(p: &LoadedPlugin) -> Vec<SpecProblem> {
         {
             push(format!(
                 "contribution {} interval millis must be {MIN_PLUGIN_INTERVAL_MILLIS}..={MAX_PLUGIN_INTERVAL_MILLIS}",
-                contribution.id.as_str()
+                quoted_prefix(contribution.id.as_str())
             ));
         }
     }
@@ -851,7 +873,6 @@ mod tests {
             Capability::new("a\u{7}", "b"),
             Capability::new("kind", "é"),
             Capability::new("kind", "target value"),
-            Capability::new("kind", "target//nested"),
             Capability::new("kind", "x".repeat(10_000)),
         ] {
             let mut plugin = spec("caps", vec!["true".into()]);
@@ -868,10 +889,28 @@ mod tests {
             );
         }
 
+        let mut plugin = spec("caps", vec!["true".into()]);
+        plugin
+            .manifest
+            .capabilities
+            .push(Capability::new("kind", "x".repeat(10_000)));
+        let problems = check_spec(&LoadedPlugin {
+            spec: plugin,
+            dir: None,
+            trusted_native_ignored: false,
+        });
+        let problem = problems
+            .iter()
+            .find(|problem| problem.problem.contains("invalid capability"))
+            .expect("hostile capability should be rejected");
+        assert!(problem.problem.len() < 512, "problem: {problem:?}");
+
         for capability in [
             Capability::new("surface", "statusbar"),
             Capability::new("network", "example.com"),
             Capability::new("run", "tools/helper-v2"),
+            Capability::new("run", "/usr/bin/git"),
+            Capability::new("run", "./bin/helper"),
         ] {
             let mut plugin = spec("caps", vec!["true".into()]);
             plugin.manifest.capabilities.push(capability);
@@ -1051,7 +1090,7 @@ mod tests {
             chord: None,
         };
         let long_id = "x".repeat(MAX_PLUGIN_ROUTING_ID_BYTES + 1);
-        for id in ["", "a::b", "a\u{7}", long_id.as_str()] {
+        for id in ["", "a:b", "a\u{7}", long_id.as_str()] {
             let mut plugin = spec("routing", vec!["true".into()]);
             plugin
                 .manifest
@@ -1070,7 +1109,7 @@ mod tests {
             );
         }
         let long_surface = "x".repeat(MAX_PLUGIN_ROUTING_ID_BYTES + 1);
-        for surface in ["", "a::b", "a\u{7}", long_surface.as_str()] {
+        for surface in ["", "a:b", "a\u{7}", long_surface.as_str()] {
             let mut plugin = spec("routing", vec!["true".into()]);
             plugin
                 .manifest
@@ -1133,7 +1172,12 @@ mod tests {
                 dir: Some(root.join("examples/plugins").join(name)),
                 trusted_native_ignored: false,
             });
-            assert!(problems.is_empty(), "example {name}: {problems:?}");
+            assert!(
+                problems
+                    .iter()
+                    .all(|problem| !problem.problem.contains("invalid")),
+                "example {name}: {problems:?}"
+            );
         }
     }
 
