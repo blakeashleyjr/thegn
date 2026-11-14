@@ -224,7 +224,8 @@ dependency. If same-stage rows make a name ambiguous, admission is refused
 and names every matching row.
 
 Dispatch identity fields reject terminal control and Unicode format characters.
-`dispatch put` also refuses a missing, cross-issue or ineligible parent row;
+`dispatch put` and `dispatch claim` also refuse a missing, cross-issue,
+ineligible or later-stage parent row;
 the control API reports identity text as an invalid argument and parent
 refusals as failed preconditions. A new dispatch row is refused before
 write once 4,096 rows are active (`queued`, `spawning`, `running`,
