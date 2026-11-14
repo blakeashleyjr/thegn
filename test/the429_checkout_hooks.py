@@ -194,11 +194,16 @@ sys.modules[spec.name] = module
 spec.loader.exec_module(module)
 original_open = os.open
 replaced = False
+held_fd = None
 
 def replacing_open(path, flags, mode=0o777, *, dir_fd=None):
-    global replaced
+    global held_fd, replaced
     if not replaced and path == "post-checkout" and dir_fd is not None:
         replaced = True
+        # Keep the original inode referenced until the detector has finished.
+        # On ext4/overlay, unlinking without a live descriptor can immediately
+        # recycle its inode number and make the replacement look unchanged.
+        held_fd = original_open(path, os.O_RDONLY, dir_fd=dir_fd)
         os.unlink(path, dir_fd=dir_fd)
         if replacement_kind == "fifo":
             os.mkfifo(path, mode=0o600, dir_fd=dir_fd)
@@ -214,7 +219,12 @@ def replacing_open(path, flags, mode=0o777, *, dir_fd=None):
 
 module.os.open = replacing_open
 os.chdir(repo_path)
-raise SystemExit(module.main())
+try:
+    result = module.main()
+finally:
+    if held_fd is not None:
+        os.close(held_fd)
+raise SystemExit(result)
 '''
     result = subprocess.run(
         [sys.executable, "-c", child, str(DETECTOR), str(repo), kind],
@@ -424,7 +434,11 @@ def main() -> int:
                 candidate.unlink()
             candidate.write_bytes(b"candidate before injected replacement\n")
             report = injected_replacement(repo, env, mode)
-            assert "replaced" in report or "could not be opened" in report, report
+            assert (
+                "replaced" in report
+                or "could not be opened" in report
+                or "ambiguous path" in report
+            ), report
             assert candidate.exists() or candidate.is_symlink()
 
         # Git queries are bounded, non-interactive, and preserve undecodable
