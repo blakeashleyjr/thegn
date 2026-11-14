@@ -12777,6 +12777,9 @@ async fn event_loop<T: Terminal>(
             if let Some(counts) = lsp_supervisor.handle().slot_counts(&swapped_root) {
                 lsp_diags.set_slot_counts(&swapped_root, counts);
             }
+            if let Some(states) = lsp_supervisor.handle().slot_states(&swapped_root) {
+                lsp_diags.set_slot_states(&swapped_root, states);
+            }
             lsp_diags.merge_into(&swapped_root, &mut model.panel.diagnostics);
             lsp_visible.rebuilt(&swapped_root);
             // Shares live on the supervisor (loop-local), not in hydration; a
