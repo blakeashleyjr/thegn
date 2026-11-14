@@ -1108,8 +1108,12 @@ pub async fn main(
     let (stats_tx, stats_rx) = tokio_mpsc::unbounded_channel::<crate::hydrate::StatsTick>();
     let (container_tx, container_rx) =
         tokio_mpsc::unbounded_channel::<crate::hydrate::ContainerRefresh>();
-    let (daemon_status_tx, daemon_status_rx) =
-        tokio_mpsc::unbounded_channel::<crate::chrome::DaemonStatus>();
+    let daemon_status_slot = crate::snapshot_slot::SnapshotSlot::with_waker(64 * 1024, {
+        let waker = waker.clone();
+        move || {
+            let _ = waker.wake(); // best-effort: a snapshot wake must not fail the producer
+        }
+    });
     let (metrics_tx, metrics_rx) = tokio_mpsc::unbounded_channel::<crate::metrics::MetricsState>();
     crate::metrics::spawn_metrics_supervisor(cfg.metrics.clone(), metrics_tx, waker.clone());
     // The stats cadence is user-cyclable at runtime (click the top-right
@@ -1171,7 +1175,7 @@ pub async fn main(
         refresh_tx.clone(),
         stats_tx,
         container_tx,
-        daemon_status_tx,
+        daemon_status_slot.clone(),
         stats_interval_ms.clone(),
         stats_live.clone(),
         containers_live.clone(),
@@ -1258,7 +1262,7 @@ pub async fn main(
         prq_rx,
         stats_rx,
         container_rx,
-        daemon_status_rx,
+        daemon_status_slot,
         metrics_rx,
         sandbox_event_rx,
         stats_interval_ms,
@@ -6942,7 +6946,7 @@ async fn event_loop<T: Terminal>(
     mut prq_rx: crate::handlers::pr_queue::PrqRx,
     mut stats_rx: tokio_mpsc::UnboundedReceiver<crate::hydrate::StatsTick>,
     mut container_rx: tokio_mpsc::UnboundedReceiver<crate::hydrate::ContainerRefresh>,
-    mut daemon_status_rx: tokio_mpsc::UnboundedReceiver<crate::chrome::DaemonStatus>,
+    daemon_status_slot: crate::snapshot_slot::SnapshotSlot<crate::chrome::DaemonStatus>,
     mut metrics_rx: tokio_mpsc::UnboundedReceiver<crate::metrics::MetricsState>,
     mut sandbox_event_rx: tokio_mpsc::UnboundedReceiver<crate::sandbox_events::SandboxEventBatch>,
     stats_interval_ms: std::sync::Arc<std::sync::atomic::AtomicU64>,
@@ -13238,7 +13242,7 @@ async fn event_loop<T: Terminal>(
         // Cached daemon/status from the ticker (far-right chip + its modal). A
         // changed record re-renders the bars so the chip glyph tracks the daemon
         // role/sessions; the per-frame model block recomputes `daemon_state`.
-        while let Ok(status) = daemon_status_rx.try_recv() {
+        while let Some((_, status)) = daemon_status_slot.take() {
             loop_perf.tick(crate::perf::WakeSource::Stats);
             if panel_ui.docs.daemon != status {
                 panel_ui.docs.daemon = status;
