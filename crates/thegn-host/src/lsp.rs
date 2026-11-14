@@ -182,6 +182,28 @@ pub struct LspSlotCounts {
     pub backing_off: u32,
 }
 
+/// The observable state of one language-server slot.
+///
+/// Teardown removes slots from the map, so no closed state exists in this
+/// snapshot.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LspSlotState {
+    Starting,
+    Ready,
+    Degraded { failures: u32 },
+    Backoff { retry_in_secs: u64 },
+}
+
+/// A non-blocking snapshot of the live LSP resource footprint.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[allow(dead_code)] // THE-335: resource-count consumer pending (aggregate policy is owner/design); exercised by tests
+pub struct LspResourceCounts {
+    /// Live clients and clients whose subprocess startup is in flight.
+    pub total_clients: u32,
+    /// Roots with at least one live or starting client.
+    pub roots: u32,
+}
+
 /// The client map plus the worktree-root set it was last reconciled against.
 /// Both live under one lock so a request for a root that was just closed can
 /// never respawn a server behind a reconcile.
@@ -749,6 +771,62 @@ impl LspInner {
         Some(counts)
     }
 
+    /// Read-only, NON-BLOCKING per-root slot states. `None` when the map lock
+    /// is busy or poisoned (the caller keeps what it last showed).
+    ///
+    /// Ready and degraded live slots, starts in flight, and active backoffs
+    /// are reported in sorted key order. Unavailable slots and expired
+    /// backoffs have no actionable state and are omitted. Teardown removes
+    /// slots from the map, so no closed state exists in this snapshot.
+    /// Results are bounded by `limits::MAX_SERVERS_PER_ROOT`.
+    pub fn slot_states(&self, root: &Path) -> Option<Vec<(String, LspSlotState)>> {
+        let state = self.clients.try_lock().ok()?;
+        let now = Instant::now();
+        let mut states: Vec<(String, LspSlotState)> = state
+            .map
+            .iter()
+            .filter(|((slot_root, _), _)| slot_root == root)
+            .filter_map(|((_, key), slot)| {
+                let slot_state = match slot {
+                    ClientSlot::Live { failures, .. } if *failures == 0 => LspSlotState::Ready,
+                    ClientSlot::Live { failures, .. } => LspSlotState::Degraded {
+                        failures: *failures,
+                    },
+                    ClientSlot::Starting { .. } => LspSlotState::Starting,
+                    ClientSlot::Failed { until, .. } if now < *until => LspSlotState::Backoff {
+                        retry_in_secs: until
+                            .saturating_duration_since(now)
+                            .as_secs()
+                            .saturating_add(1),
+                    },
+                    ClientSlot::Failed { .. } | ClientSlot::Unavailable => return None,
+                };
+                Some((key.clone(), slot_state))
+            })
+            .collect();
+        states.sort_by(|a, b| a.0.cmp(&b.0));
+        states.truncate(limits::MAX_SERVERS_PER_ROOT);
+        Some(states)
+    }
+
+    /// Read-only, NON-BLOCKING resource counts from the same client-map lock
+    /// as the per-root snapshots. Failed and unavailable cache entries do not
+    /// own a client or a root resource, so they are omitted.
+    #[allow(dead_code)] // THE-335: resource-count consumer pending (aggregate policy is owner/design); exercised by tests
+    pub fn resource_counts(&self) -> Option<LspResourceCounts> {
+        let state = self.clients.try_lock().ok()?;
+        let mut counts = LspResourceCounts::default();
+        let mut roots = HashSet::new();
+        for ((root, _), slot) in &state.map {
+            if matches!(slot, ClientSlot::Live { .. } | ClientSlot::Starting { .. }) {
+                counts.total_clients = counts.total_clients.saturating_add(1);
+                roots.insert(root);
+            }
+        }
+        counts.roots = u32::try_from(roots.len()).unwrap_or(u32::MAX);
+        Some(counts)
+    }
+
     /// Retire every server (and negative-cache slot) whose worktree is no
     /// longer in `live_roots`, releasing registry capacity; subprocess
     /// teardown happens on a worker thread. This only briefly takes the map
@@ -1173,6 +1251,8 @@ pub struct LspDiagnostics {
     servers: HashMap<PathBuf, Vec<FailedServer>>,
     /// Slot counts per root while something is starting or backing off, refreshed with `servers`; roots without pressure are never stored.
     slot_counts: HashMap<PathBuf, LspSlotCounts>,
+    /// Bounded per-root slot states, refreshed with `slot_counts`.
+    slot_states: HashMap<PathBuf, Vec<(String, LspSlotState)>>,
 }
 
 #[derive(Debug, Default)]
@@ -1245,6 +1325,10 @@ const SERVER_CODE: &str = "thegn-lsp-server";
 const MAX_SERVER_ROWS: usize = limits::MAX_SERVERS_PER_ROOT;
 /// Diagnostic code identifying the per-root LSP slot-count health row.
 const SERVER_COUNT_CODE: &str = "thegn-lsp-counts";
+/// Maximum bytes of state detail appended to the single slot-count row.
+const MAX_SLOT_STATE_TEXT_BYTES: usize = 512;
+/// Maximum bytes of one untrusted registry key shown in that row.
+const MAX_SLOT_KEY_TEXT_BYTES: usize = 64;
 
 /// Owned bytes of one loss entry (its stream key plus the empty set).
 fn loss_entry_bytes(stream: &StoreStreamKey) -> usize {
@@ -1269,6 +1353,26 @@ fn is_health_row(item: &DiagnosticItem) -> bool {
             item.code.as_deref(),
             Some(HEALTH_CODE) | Some(SERVER_CODE) | Some(SERVER_COUNT_CODE)
         )
+}
+
+fn bounded_display(value: &str, max_bytes: usize) -> String {
+    let mut out = String::new();
+    for character in value.chars() {
+        if out.len().saturating_add(character.len_utf8()) > max_bytes {
+            break;
+        }
+        out.push(character);
+    }
+    out
+}
+
+fn slot_state_label(state: &LspSlotState) -> String {
+    match state {
+        LspSlotState::Starting => "starting".to_string(),
+        LspSlotState::Ready => "ready".to_string(),
+        LspSlotState::Degraded { failures } => format!("degraded({failures})"),
+        LspSlotState::Backoff { retry_in_secs } => format!("backoff({retry_in_secs}s)"),
+    }
 }
 
 fn severity_rank(item: &DiagnosticItem) -> u8 {
@@ -1511,16 +1615,72 @@ impl LspDiagnostics {
                 code: Some(SERVER_CODE.to_string()),
             })
             .collect();
-        if let Some(counts) = self.slot_counts.get(root) {
+        let states = self.slot_states.get(root);
+        let state_counts = states.map_or_else(LspSlotCounts::default, |states| {
+            states
+                .iter()
+                .fold(LspSlotCounts::default(), |mut counts, (_, state)| {
+                    match state {
+                        LspSlotState::Starting => {
+                            counts.starting = counts.starting.saturating_add(1)
+                        }
+                        LspSlotState::Ready | LspSlotState::Degraded { .. } => {
+                            counts.live = counts.live.saturating_add(1)
+                        }
+                        LspSlotState::Backoff { .. } => {
+                            counts.backing_off = counts.backing_off.saturating_add(1)
+                        }
+                    }
+                    counts
+                })
+        });
+        let counts = self.slot_counts.get(root).copied().unwrap_or(state_counts);
+        let states_need_row = states.is_some_and(|states| {
+            states
+                .iter()
+                .any(|(_, state)| !matches!(state, LspSlotState::Ready))
+        });
+        if self.slot_counts.contains_key(root) || states_need_row {
+            let mut message = format!(
+                "LSP servers: {} running, {} starting, {} backing off",
+                counts.live, counts.starting, counts.backing_off
+            );
+            if let Some(states) = states {
+                let mut detail = String::new();
+                for (key, state) in states.iter().take(MAX_SERVER_ROWS) {
+                    let entry = format!(
+                        "{}={}",
+                        bounded_display(
+                            &thegn_svc::lsp::sanitize_for_terminal(key),
+                            MAX_SLOT_KEY_TEXT_BYTES
+                        ),
+                        slot_state_label(state)
+                    );
+                    let separator = usize::from(!detail.is_empty()) * 2;
+                    if detail
+                        .len()
+                        .saturating_add(separator)
+                        .saturating_add(entry.len())
+                        > MAX_SLOT_STATE_TEXT_BYTES
+                    {
+                        break;
+                    }
+                    if !detail.is_empty() {
+                        detail.push_str(", ");
+                    }
+                    detail.push_str(&entry);
+                }
+                if !detail.is_empty() {
+                    message.push_str("; states: ");
+                    message.push_str(&detail);
+                }
+            }
             rows.push(DiagnosticItem {
                 file: String::new(),
                 line: 0,
                 col: None,
                 severity: Severity::Info,
-                message: format!(
-                    "LSP servers: {} running, {} starting, {} backing off",
-                    counts.live, counts.starting, counts.backing_off
-                ),
+                message,
                 source: HEALTH_SOURCE.to_string(),
                 code: Some(SERVER_COUNT_CODE.to_string()),
             });
@@ -1626,6 +1786,7 @@ impl LspDiagnostics {
         self.loss.retain(|key, _| keep(&key.root));
         self.servers.retain(|root, _| keep(root));
         self.slot_counts.retain(|root, _| keep(root));
+        self.slot_states.retain(|root, _| keep(root));
         self.settle_loss();
     }
 
@@ -1677,6 +1838,7 @@ impl LspDiagnostics {
             && !self.loss_overflow
             && self.servers.is_empty()
             && self.slot_counts.is_empty()
+            && self.slot_states.is_empty()
     }
 
     pub fn record_health(&mut self, health: LspHealth) {
@@ -1695,8 +1857,32 @@ impl LspDiagnostics {
     pub fn set_slot_counts(&mut self, root: &Path, counts: LspSlotCounts) {
         if counts.starting == 0 && counts.backing_off == 0 {
             self.slot_counts.remove(root);
+            if self.slot_states.get(root).is_some_and(|states| {
+                states
+                    .iter()
+                    .all(|(_, state)| matches!(state, LspSlotState::Ready))
+            }) {
+                self.slot_states.remove(root);
+            }
         } else {
             self.slot_counts.insert(root.to_path_buf(), counts);
+        }
+    }
+
+    /// Record bounded slot states for `root`. Ready-only snapshots are kept
+    /// only while the counts row is already needed for starting/backoff
+    /// pressure; degraded, backoff, and starting states create the
+    /// same single info row even when no count is nonzero.
+    pub fn set_slot_states(&mut self, root: &Path, mut states: Vec<(String, LspSlotState)>) {
+        states.sort_by(|a, b| a.0.cmp(&b.0));
+        states.truncate(MAX_SERVER_ROWS);
+        let has_pressure = states
+            .iter()
+            .any(|(_, state)| !matches!(state, LspSlotState::Ready));
+        if states.is_empty() || (!has_pressure && !self.slot_counts.contains_key(root)) {
+            self.slot_states.remove(root);
+        } else {
+            self.slot_states.insert(root.to_path_buf(), states);
         }
     }
 
@@ -4191,6 +4377,190 @@ mod tests {
             .unwrap();
         assert!(!row.message.contains('\u{1b}'));
         assert!(!row.message.contains('\u{7}'));
+    }
+
+    #[test]
+    fn slot_states_report_ready_degraded_starting_and_backoff() {
+        let (inner, _rx) = enabled_inner();
+        let _ready = inner
+            .client_with(Path::new("/r"), "rust", live_fake_client)
+            .unwrap();
+        let _degraded = inner
+            .client_with(Path::new("/r"), "go", live_fake_client)
+            .unwrap();
+        let now = Instant::now();
+        {
+            let mut state = inner.clients.lock().unwrap();
+            if let Some(ClientSlot::Live { failures, .. }) =
+                state.map.get_mut(&(PathBuf::from("/r"), "go".into()))
+            {
+                *failures = 3;
+            } else {
+                panic!("degraded client must be live");
+            }
+            state.map.insert(
+                (PathBuf::from("/r"), "py".into()),
+                ClientSlot::Starting {
+                    cell: Arc::new(StartCell::new()),
+                    generation: 1,
+                },
+            );
+            state.map.insert(
+                (PathBuf::from("/r"), "zig".into()),
+                ClientSlot::Failed {
+                    until: now + Duration::from_secs(30),
+                    failures: 2,
+                },
+            );
+            state
+                .map
+                .insert((PathBuf::from("/r"), "lua".into()), ClientSlot::Unavailable);
+        }
+
+        let states = inner.slot_states(Path::new("/r")).unwrap();
+        assert_eq!(
+            states
+                .iter()
+                .map(|(key, _)| key.as_str())
+                .collect::<Vec<_>>(),
+            vec!["go", "py", "rust", "zig"]
+        );
+        assert!(matches!(
+            states[0].1,
+            LspSlotState::Degraded { failures: 3 }
+        ));
+        assert_eq!(states[1].1, LspSlotState::Starting);
+        assert_eq!(states[2].1, LspSlotState::Ready);
+        assert!(matches!(
+            states[3].1,
+            LspSlotState::Backoff { retry_in_secs } if (1..=31).contains(&retry_in_secs)
+        ));
+    }
+
+    #[test]
+    fn slot_states_snapshot_never_blocks_on_a_held_map_lock() {
+        let (inner, _rx) = enabled_inner();
+        let guard = inner.clients.lock().unwrap();
+        assert!(inner.slot_states(Path::new("/r")).is_none());
+        assert!(inner.resource_counts().is_none());
+        drop(guard);
+        assert_eq!(inner.slot_states(Path::new("/r")), Some(vec![]));
+        assert_eq!(inner.resource_counts(), Some(LspResourceCounts::default()));
+    }
+
+    #[test]
+    fn slot_states_are_sorted_and_truncated_at_server_cap() {
+        let (inner, _rx) = enabled_inner();
+        {
+            let mut state = inner.clients.lock().unwrap();
+            for index in (0..limits::MAX_SERVERS_PER_ROOT + 2).rev() {
+                state.map.insert(
+                    (PathBuf::from("/r"), format!("lang-{index:03}")),
+                    ClientSlot::Starting {
+                        cell: Arc::new(StartCell::new()),
+                        generation: index as u64,
+                    },
+                );
+            }
+        }
+
+        let states = inner.slot_states(Path::new("/r")).unwrap();
+        assert_eq!(states.len(), limits::MAX_SERVERS_PER_ROOT);
+        assert_eq!(
+            states.first().map(|(key, _)| key.as_str()),
+            Some("lang-000")
+        );
+        let expected_last = format!("lang-{:03}", limits::MAX_SERVERS_PER_ROOT - 1);
+        assert_eq!(
+            states.last().map(|(key, _)| key.as_str()),
+            Some(expected_last.as_str())
+        );
+    }
+
+    #[test]
+    fn resource_counts_include_live_and_starting_clients_per_root() {
+        let (inner, _rx) = enabled_inner();
+        let _live = inner
+            .client_with(Path::new("/r"), "rust", live_fake_client)
+            .unwrap();
+        {
+            let mut state = inner.clients.lock().unwrap();
+            for (root, key) in [("/r", "py"), ("/other", "rust")] {
+                state.map.insert(
+                    (PathBuf::from(root), key.into()),
+                    ClientSlot::Starting {
+                        cell: Arc::new(StartCell::new()),
+                        generation: 1,
+                    },
+                );
+            }
+            state.map.insert(
+                (PathBuf::from("/unused"), "zig".into()),
+                ClientSlot::Failed {
+                    until: Instant::now() + Duration::from_secs(30),
+                    failures: 1,
+                },
+            );
+        }
+
+        assert_eq!(
+            inner.resource_counts(),
+            Some(LspResourceCounts {
+                total_clients: 3,
+                roots: 2,
+            })
+        );
+    }
+
+    #[test]
+    fn slot_states_row_is_one_bounded_sanitized_info_row_replaced_not_duplicated() {
+        let root = Path::new("/r");
+        let mut store = LspDiagnostics::new();
+        store.set_slot_counts(
+            root,
+            LspSlotCounts {
+                live: 1,
+                starting: 1,
+                backing_off: 0,
+            },
+        );
+        store.set_slot_states(
+            root,
+            vec![
+                (
+                    "ru\u{1b}]0;evil\u{7}".into(),
+                    LspSlotState::Degraded { failures: 2 },
+                ),
+                ("py".into(), LspSlotState::Starting),
+                ("rust".into(), LspSlotState::Ready),
+            ],
+        );
+
+        let mut dst = Vec::new();
+        store.merge_into(root, &mut dst);
+        let count_row = |items: &[DiagnosticItem]| {
+            items
+                .iter()
+                .filter(|item| item.code.as_deref() == Some(SERVER_COUNT_CODE))
+                .count()
+        };
+        assert_eq!(count_row(&dst), 1);
+        let row = dst
+            .iter()
+            .find(|item| item.code.as_deref() == Some(SERVER_COUNT_CODE))
+            .unwrap();
+        assert_eq!(row.severity, Severity::Info);
+        assert!(row.message.contains("states:"));
+        assert!(row.message.contains("degraded(2)"));
+        assert!(row.message.contains("py=starting"));
+        assert!(!row.message.contains('\u{1b}'));
+        assert!(!row.message.contains('\u{7}'));
+        assert!(row.message.len() <= MAX_SLOT_STATE_TEXT_BYTES + 128);
+
+        store.patch_into(root, &mut dst, &HashSet::new());
+        store.patch_into(root, &mut dst, &HashSet::new());
+        assert_eq!(count_row(&dst), 1);
+        assert_eq!(dst.iter().filter(|item| is_health_row(item)).count(), 1);
     }
 
     #[test]
