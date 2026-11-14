@@ -14,8 +14,8 @@ use std::time::Duration;
 
 use thegn_core::control_wire::EventFrame;
 use thegn_core::plugin_api::RpcMessage;
-use thegn_svc::plugin::proc::{MAX_LINE_BYTES, MAX_RUN_BYTES, NdjsonSink};
-use thegn_svc::plugin::{SessionEvent, spawn_ndjson, spawn_ndjson_stream};
+use thegn_svc::plugin::proc::{MAX_LINE_BYTES, MAX_RUN_BYTES, NdjsonSink, spawn_ndjson_stream};
+use thegn_svc::plugin::{SessionEvent, spawn_ndjson};
 
 use super::feed_hub::{Feed, FeedHub, FeedSource, MAX_FEED_SUBSCRIBERS, SubscribeError};
 use super::inbox::{
@@ -105,27 +105,31 @@ fn rss_pages() -> Option<u64> {
         Err(_) => return None,
     };
     let resident = statm.split_whitespace().nth(1)?;
-    match resident.parse() {
-        Ok(pages) => Some(pages),
-        Err(_) => None,
-    }
+    let Ok(pages) = resident.parse::<u64>() else {
+        return None;
+    };
+    Some(pages)
 }
 
 fn child_ids() -> Option<BTreeSet<u32>> {
-    let path = format!("/proc/self/task/{}/children", std::process::id());
-    let children = match std::fs::read_to_string(path) {
-        Ok(children) => children,
-        Err(_) => return None,
+    let Ok(tasks) = std::fs::read_dir("/proc/self/task") else {
+        return None;
     };
-    Some(
-        children
-            .split_whitespace()
-            .filter_map(|child| match child.parse() {
-                Ok(pid) => Some(pid),
-                Err(_) => None,
-            })
-            .collect(),
-    )
+    let mut ids = BTreeSet::new();
+    let mut any_read = false;
+    for task in tasks.flatten() {
+        let Ok(children) = std::fs::read_to_string(task.path().join("children")) else {
+            continue;
+        };
+        any_read = true;
+        for child in children.split_whitespace() {
+            let Ok(pid) = child.parse::<u32>() else {
+                continue;
+            };
+            ids.insert(pid);
+        }
+    }
+    any_read.then_some(ids)
 }
 
 fn named_thread_count(name: &str) -> Option<usize> {
@@ -152,11 +156,11 @@ fn plugin_thread_count() -> Option<usize> {
 }
 
 fn wait_for_plugin_thread_count_at_most(expected: usize) {
-    for _ in 0..CENSUS_CAP * 8 {
+    for _ in 0..2_500 {
         if plugin_thread_count().is_some_and(|count| count <= expected) {
             return;
         }
-        std::thread::yield_now();
+        std::thread::sleep(Duration::from_millis(2));
     }
     assert!(
         plugin_thread_count().is_none_or(|count| count <= expected),
@@ -355,7 +359,7 @@ fn plugin_soak_is_bounded_across_fixed_adversarial_iterations() {
     }
     drop(frame_tx);
     feed_dropped
-        .recv()
+        .recv_timeout(Duration::from_secs(10))
         .expect("feed owner releases its retained stream");
     drop(subscriptions);
     assert!(
