@@ -26,7 +26,6 @@ use std::io::Read;
 use std::path::{Component, Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::mpsc::{self, Receiver};
-use std::sync::{Mutex, OnceLock};
 use std::thread;
 use std::time::{Duration, Instant};
 use thegn_core::config::{VpnDnsMode, VpnMode, VpnProviderKind};
@@ -441,6 +440,7 @@ impl VpnProvider for BuiltinProvider<'_> {
 }
 
 /// Inspect and persist the exact runtime and immutable id for a started sidecar.
+#[cfg(test)]
 fn record_sidecar(rt: &OciRuntime, container: &str) -> Result<RecordedSidecar> {
     let worktree = std::env::current_dir().context("vpn: read the sidecar worktree")?;
     record_sidecar_for_worktree(rt, container, &worktree, "local")
@@ -531,7 +531,7 @@ fn recorded_sidecar_with_context(
     {
         bail!("vpn: malformed runtime record for sidecar {container}");
     }
-    validate_sidecar_record_context(container, &parsed, caller_worktree, expected_generation)?;
+    validate_sidecar_record_context(&parsed, caller_worktree, expected_generation)?;
     Ok(RecordedSidecar {
         runtime: OciRuntime::new(parsed.prefix),
         id: parsed.id,
@@ -582,7 +582,6 @@ fn valid_sidecar_record_metadata(record: &SidecarRecord) -> bool {
 }
 
 fn validate_sidecar_record_context(
-    container: &str,
     record: &SidecarRecord,
     caller_worktree: Option<&Path>,
     expected_generation: Option<u64>,
@@ -607,29 +606,7 @@ fn validate_sidecar_record_context(
             stored: expected,
         }));
     }
-    let key = (
-        sidecar_record_dir()?.path().to_path_buf(),
-        container.to_string(),
-    );
-    let mut stored = sidecar_generations()
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    if let Some(previous) = stored.get(&key)
-        && generation < *previous
-    {
-        return Err(anyhow::Error::new(SidecarGenerationStale {
-            found: generation,
-            stored: *previous,
-        }));
-    }
-    stored.insert(key, generation);
     Ok(())
-}
-
-fn sidecar_generations() -> &'static Mutex<std::collections::HashMap<(PathBuf, String), u64>> {
-    static GENERATIONS: OnceLock<Mutex<std::collections::HashMap<(PathBuf, String), u64>>> =
-        OnceLock::new();
-    GENERATIONS.get_or_init(|| Mutex::new(std::collections::HashMap::new()))
 }
 
 fn sidecar_container_id(rt: &OciRuntime, container: &str) -> Result<String> {
