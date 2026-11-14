@@ -1,6 +1,6 @@
 //! Generator for the `## Routes` table in `docs/superpowers/specs/control-api.md`
 //! (THE-192): one row per HTTP route, derived from the route registry
-//! ([`API_CALLS`], [`ROUTES`]), the capability catalog and [`ROUTE_TYPES`], so
+//! ([`API_CALLS`], [`ROUTES`]), the capability catalog and `ROUTE_TYPES`, so
 //! a removed or renamed route cannot leave a stale documented entry. The doc
 //! carries the output between [`BEGIN`] and [`END`]; a drift test regenerates
 //! it and fails when the committed text differs.

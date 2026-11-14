@@ -67,6 +67,12 @@ service Control {
   rpc AutomationsList(AutomationsListRequest) returns (AutomationsListReply);
   rpc AutomationsTest(AutomationsTestRequest) returns (AutomationsTestReply);
   rpc ToolsRun(ToolsRunRequest) returns (SessionInfo);
+  // Start/stop/query the bounded asciicast recording for one session.
+  rpc SessionsRecord(SessionsRecordRequest) returns (SessionsRecordReply);
+  // Discover bounded, credential-free native coding-agent session metadata.
+  rpc AgentSessions(AgentSessionsRequest) returns (AgentSessionsReply);
+  // Create one worktree through the daemon's git/DB control path.
+  rpc WorktreesCreate(WorktreesCreateRequest) returns (WorktreeInfo);
 }
 
 message Empty {}
@@ -385,6 +391,40 @@ message ToolsRunRequest {
   string name = 1;
   string worktree = 2;
   AutomationOrigin automation_origin = 3;
+}
+
+message SessionsRecordRequest {
+  string session = 1;
+  string op = 2;                // start | stop | status
+}
+message SessionsRecordReply {
+  bool recording = 1;
+  optional string path = 2;     // active or finalized cast path
+  uint64 bytes = 3;
+  bool capped = 4;
+  optional string truncated = 5;
+  uint64 dropped_bytes = 6;
+  bool stopping = 7;
+}
+
+message AgentSessionsRequest {
+  string worktree = 1;          // empty = all worktrees
+  string harness = 2;           // empty = every harness
+}
+message AgentSessionsReply { repeated AgentSession sessions = 1; }
+message AgentSession {
+  string harness = 1;
+  string id = 2;
+  optional string worktree = 3;
+  int64 mtime = 4;
+  string summary = 5;
+  bool unlinked = 6;
+}
+
+message WorktreesCreateRequest {
+  optional string repo = 1;     // empty = daemon's current repository
+  optional string issue = 2;    // provider:key; mutually optional with branch
+  optional string branch = 3;   // explicit branch overrides issue derivation
 }
 
 message MeRequest {}

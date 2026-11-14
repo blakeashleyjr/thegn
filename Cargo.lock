@@ -1329,9 +1329,9 @@ dependencies = [
 
 [[package]]
 name = "ctutils"
-version = "0.4.2"
+version = "0.4.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7d5515a3834141de9eafb9717ad39eea8247b5674e6066c404e8c4b365d2a29e"
+checksum = "12218662ccac37d9714f2191252553d67585b97df8c839cbe49e0bde278dc865"
 dependencies = [
  "cmov",
 ]
@@ -3398,7 +3398,7 @@ dependencies = [
 
 [[package]]
 name = "gtui-app"
-version = "0.1.0-alpha.74"
+version = "0.1.0-alpha.75"
 dependencies = [
  "chrono",
  "gtui-core",
@@ -3407,7 +3407,7 @@ dependencies = [
 
 [[package]]
 name = "gtui-core"
-version = "0.1.0-alpha.74"
+version = "0.1.0-alpha.75"
 dependencies = [
  "chrono",
  "serde",
@@ -3417,7 +3417,7 @@ dependencies = [
 
 [[package]]
 name = "gtui-embed"
-version = "0.1.0-alpha.74"
+version = "0.1.0-alpha.75"
 dependencies = [
  "chrono",
  "gtui-app",
@@ -3432,7 +3432,7 @@ dependencies = [
 
 [[package]]
 name = "gtui-query"
-version = "0.1.0-alpha.74"
+version = "0.1.0-alpha.75"
 dependencies = [
  "chrono",
  "gtui-core",
@@ -3446,7 +3446,7 @@ dependencies = [
 
 [[package]]
 name = "gtui-render"
-version = "0.1.0-alpha.74"
+version = "0.1.0-alpha.75"
 dependencies = [
  "criterion",
  "gtui-core",
@@ -3597,9 +3597,9 @@ checksum = "7f24254aa9a54b5c858eaee2f5bccdb46aaf0e486a595ed5fd8f86ba55232a70"
 
 [[package]]
 name = "hickory-net"
-version = "0.26.1"
+version = "0.26.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e2295ed2f9c31e471e1428a8f88a3f0e1f4b27c15049592138d1eebe9c35b183"
+checksum = "084e7bd6a377435d568f652153e571b50970d7ccc1d1eeec0519f834632287e1"
 dependencies = [
  "async-trait",
  "bytes",
@@ -8011,7 +8011,7 @@ dependencies = [
 
 [[package]]
 name = "thegn-core"
-version = "0.1.0-alpha.74"
+version = "0.1.0-alpha.75"
 dependencies = [
  "anyhow",
  "chrono",
@@ -8060,7 +8060,7 @@ dependencies = [
 
 [[package]]
 name = "thegn-host"
-version = "0.1.0-alpha.74"
+version = "0.1.0-alpha.75"
 dependencies = [
  "alacritty_terminal",
  "anyhow",
@@ -8123,7 +8123,7 @@ dependencies = [
 
 [[package]]
 name = "thegn-media"
-version = "0.1.0-alpha.74"
+version = "0.1.0-alpha.75"
 dependencies = [
  "futures",
  "libc",
@@ -8140,7 +8140,7 @@ dependencies = [
 
 [[package]]
 name = "thegn-metrics"
-version = "0.1.0-alpha.74"
+version = "0.1.0-alpha.75"
 dependencies = [
  "core-foundation 0.9.4",
  "libc",
@@ -8179,7 +8179,7 @@ dependencies = [
 
 [[package]]
 name = "thegn-proc"
-version = "0.1.0-alpha.74"
+version = "0.1.0-alpha.75"
 dependencies = [
  "libc",
  "nix 0.31.3",
@@ -8188,7 +8188,7 @@ dependencies = [
 
 [[package]]
 name = "thegn-proxy"
-version = "0.1.0-alpha.74"
+version = "0.1.0-alpha.75"
 dependencies = [
  "anyhow",
  "axum",
@@ -8207,7 +8207,7 @@ dependencies = [
 
 [[package]]
 name = "thegn-svc"
-version = "0.1.0-alpha.74"
+version = "0.1.0-alpha.75"
 dependencies = [
  "anyhow",
  "axum",
@@ -8251,7 +8251,7 @@ dependencies = [
 
 [[package]]
 name = "thegn-voice"
-version = "0.1.0-alpha.74"
+version = "0.1.0-alpha.75"
 dependencies = [
  "anyhow",
  "cpal",
