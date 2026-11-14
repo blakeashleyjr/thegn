@@ -27,6 +27,15 @@ The two core objects. A **project** is a repo; a **worktree** is a git
 worktree inside it, shown as a tab. git is the source of truth — thegn's
 database only caches and resurrects what git already knows.
 
+During background hydration, the sidebar also notices linked worktrees added
+outside thegn. It checks the repository's shared Git worktree metadata first,
+so an unchanged project causes no Git listing; a changed project is read with
+`git worktree list --porcelain -z` and missing rows are added without opening a
+pane or running lifecycle hooks. Existing order, folders, hidden state, and
+closed-worktree suppression are preserved. Bare, prunable, locked, detached,
+and internal gate worktrees stay out of the sidebar. Discovery is add-only: it
+does not infer removals.
+
 ## Creating
 
 - `Alt-W` — **new project**: pick a repo from your scanned roots
@@ -160,6 +169,12 @@ aliases; their chords do not change.
 - `Alt-X` removes the worktree and its tab; **the branch is kept**.
 - Deleting from disk is always an explicit second step in the [[sidebar]]
   delete menu — nothing destructive rides on a single keystroke.
+
+Closing a worktree keeps its checkout but records a suppression entry, so a
+later hydration does not immediately rediscover it. Use `thegn wt reopen
+<path>` to clear that record and re-register the worktree; reopening does not
+start a pane. If close bookkeeping fails, the worktree remains registered and
+the status line reports the number of failures and the first reason.
 
 From the sidebar delete menu, the worktree row and its pipeline rows disappear
 at once, and focus moves on. If removal fails, the row returns in place and

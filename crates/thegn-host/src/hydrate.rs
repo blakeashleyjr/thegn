@@ -351,8 +351,8 @@ pub(crate) enum RefreshKind {
     Model,
     Pr,
     /// Status-line text from an off-loop producer: a completed PR merge action,
-    /// or a launch-gate warning (`launch_notice`), applied to the
-    /// event-loop-owned status line.
+    /// a launch-gate warning (`launch_notice`), or durable worktree bookkeeping
+    /// failure, applied to the event-loop-owned status line.
     PrActionStatus(String),
     /// The wall clock crossed a display boundary, so the `date`/`clock` bar
     /// widgets now render different text.
@@ -4271,6 +4271,7 @@ pub(crate) fn spawn_model_hydration(
                     return None;
                 }
             };
+            crate::worktree_discovery::discover_registered(&db);
             let first = build_model(&session, &db, hints.clone());
             // `commits_loading` = the open Commits section needs a fresh list;
             // `warm_commits` (set on a switch) also pre-warms a *closed* section.

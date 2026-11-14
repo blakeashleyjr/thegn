@@ -7,6 +7,21 @@ All notable changes to **thegn** are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.1.0-alpha.77] — 2026-11-14
+
+### Changed
+
+- LSP slots now report typed states, making ready, starting, degraded, and backoff states visible.
+
+### Fixed
+
+- Worktrees created outside thegn are discovered without rerunning Git when their metadata is unchanged.
+- A failed worktree close now leaves a status message.
+- LSP locations preserve exact OS paths, including Windows drive and UNC paths, and mark locations outside the worktree.
+- Human-readable CI logs render terminal control characters as visible escapes instead of passing them to the terminal.
+- CI provider responses are size-bounded, and only exact owner/repository remotes are recognized as GitHub.
+- Clipboard status wording appears only for clipboard operations and no longer overwrites a specific copy message.
+
 ## [0.1.0-alpha.76] — 2026-11-14
 
 ### Fixed
@@ -3388,7 +3403,8 @@ launcher picker and the merge queue's `agent_command` hook remain — they run
 whatever commands you configure. Leftover `[llm_proxy]` config sections and
 `proxy_*` tables in existing state databases are ignored harmlessly.
 
-[Unreleased]: https://github.com/blakeashleyjr/thegn/compare/v0.1.0-alpha.76...HEAD
+[Unreleased]: https://github.com/blakeashleyjr/thegn/compare/v0.1.0-alpha.77...HEAD
+[0.1.0-alpha.77]: https://github.com/blakeashleyjr/thegn/compare/v0.1.0-alpha.76...v0.1.0-alpha.77
 [0.1.0-alpha.76]: https://github.com/blakeashleyjr/thegn/compare/v0.1.0-alpha.75...v0.1.0-alpha.76
 [0.1.0-alpha.75]: https://github.com/blakeashleyjr/thegn/compare/v0.1.0-alpha.74...v0.1.0-alpha.75
 [0.1.0-alpha.74]: https://github.com/blakeashleyjr/thegn/compare/v0.1.0-alpha.73...v0.1.0-alpha.74

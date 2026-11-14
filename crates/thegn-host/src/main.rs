@@ -294,6 +294,7 @@ mod ssh_shim;
 mod stage_prompt;
 mod stage_worker_hold;
 mod startup_heal;
+mod worktree_discovery;
 // THE-603 is an unwired capture primitive; THE-592 owns future startup admission.
 #[allow(dead_code)]
 mod state_host_capture;

@@ -345,6 +345,7 @@ impl LspHealth {
 pub struct PublishedDiagnostics {
     pub root: PathBuf,
     pub path: String,
+    pub scope: LocationScope,
     pub diagnostics: Vec<LspDiagnostic>,
     pub server_identity: String,
     pub generation: u64,
@@ -464,11 +465,21 @@ pub struct Range {
     pub end: Position,
 }
 
+/// Whether an LSP location belongs to the client's worktree after lexical
+/// normalization. No filesystem access is used, so symlinks do not affect the
+/// result.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LocationScope {
+    InWorktree,
+    Outside,
+}
+
 /// A resolved location: a repo/abs file path plus a range.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Location {
     pub path: String,
     pub range: Range,
+    pub scope: LocationScope,
 }
 
 impl Location {
@@ -1061,23 +1072,86 @@ pub fn path_to_uri_os(path: &Path) -> String {
 /// Decode a canonical local `file:` URI. Remote authorities and ambiguous URI
 /// components are rejected instead of being interpreted as filesystem text.
 pub fn uri_to_path(uri: &str) -> String {
-    bounded_uri_to_path(uri).unwrap_or_default()
+    if crate::plugin::platform::is_windows() {
+        windows_uri_path(uri).unwrap_or_default()
+    } else {
+        bounded_uri_to_path(uri).unwrap_or_default()
+    }
 }
 
-fn bounded_uri_to_path(uri: &str) -> Option<String> {
+/// Decode a local `file:` URI without forcing its path through UTF-8.
+pub fn uri_to_path_os(uri: &str) -> Option<PathBuf> {
+    if crate::plugin::platform::is_windows() {
+        return windows_uri_path(uri).map(PathBuf::from);
+    }
+    let decoded = decoded_file_uri(uri)?;
+    if decoded
+        .authority
+        .is_some_and(|authority| !authority.eq_ignore_ascii_case("localhost"))
+        || !valid_decoded_path(&decoded.path)
+    {
+        return None;
+    }
+    Some(PathBuf::from(
+        crate::plugin::platform::os_string_from_bytes(decoded.path)?,
+    ))
+}
+
+/// Decode a Windows local or UNC `file:` URI. This is deliberately pure and
+/// is selected by [`uri_to_path_os`] only on Windows; Linux callers can test
+/// the Windows URI grammar without constructing Windows paths.
+pub fn windows_uri_path(uri: &str) -> Option<String> {
+    let decoded = decoded_file_uri(uri)?;
+    if !valid_decoded_path(&decoded.path) {
+        return None;
+    }
+    let path = String::from_utf8(decoded.path).ok()?;
+    match decoded.authority {
+        None => windows_drive_path(path.strip_prefix('/')?),
+        Some(authority) if authority.eq_ignore_ascii_case("localhost") => {
+            windows_drive_path(path.strip_prefix('/')?)
+        }
+        Some(authority) => {
+            if authority.is_empty()
+                || !authority
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'.' | b'_'))
+            {
+                return None;
+            }
+            let share = path.strip_prefix('/')?;
+            if share.split('/').next().is_none_or(str::is_empty) {
+                return None;
+            }
+            Some(format!(r"\\{authority}\{}", share.replace('/', "\\")))
+        }
+    }
+}
+
+struct DecodedFileUri<'a> {
+    authority: Option<&'a str>,
+    path: Vec<u8>,
+}
+
+fn decoded_file_uri(uri: &str) -> Option<DecodedFileUri<'_>> {
     if uri.len() > limits::MAX_URI_BYTES || uri.contains('?') || uri.contains('#') {
         return None;
     }
     let remainder = uri.strip_prefix("file://")?;
-    let path_part = if let Some(after_authority) = remainder.strip_prefix("localhost/") {
-        format!("/{after_authority}")
-    } else if remainder.starts_with('/') {
-        remainder.to_string()
+    let (authority, path_part, prepend_separator) = if remainder.starts_with('/') {
+        (None, remainder, false)
     } else {
-        return None;
+        let (authority, path_part) = remainder.split_once('/')?;
+        if authority.is_empty() {
+            return None;
+        }
+        (Some(authority), path_part, true)
     };
+    let mut path = Vec::with_capacity(path_part.len() + usize::from(prepend_separator));
+    if prepend_separator {
+        path.push(b'/');
+    }
     let bytes = path_part.as_bytes();
-    let mut decoded = Vec::with_capacity(bytes.len());
     let mut index = 0;
     while index < bytes.len() {
         if bytes[index] == b'%' {
@@ -1092,22 +1166,103 @@ fn bounded_uri_to_path(uri: &str) -> Option<String> {
             if matches!(byte, b'/' | b'\\' | 0) {
                 return None;
             }
-            decoded.push(byte);
+            path.push(byte);
             index += 3;
         } else {
-            decoded.push(bytes[index]);
+            path.push(bytes[index]);
             index += 1;
         }
     }
-    let path = String::from_utf8(decoded).ok()?;
-    (path.starts_with('/')
-        && path.len() <= limits::MAX_IDENTITY_BYTES
-        && !path.chars().any(char::is_control))
-    .then_some(path)
+    Some(DecodedFileUri { authority, path })
+}
+
+fn valid_decoded_path(path: &[u8]) -> bool {
+    if path.len() > limits::MAX_IDENTITY_BYTES
+        || !path.starts_with(b"/")
+        || path.iter().any(|byte| *byte < 0x20 || *byte == 0x7f)
+    {
+        return false;
+    }
+    String::from_utf8(path.to_vec())
+        .map(|path| !path.chars().any(char::is_control))
+        .unwrap_or(true)
+}
+
+fn windows_drive_path(path: &str) -> Option<String> {
+    let drive = path.as_bytes();
+    if drive.len() < 3
+        || !drive[1..2].eq(b":")
+        || !drive[2..3].eq(b"/")
+        || !drive[0].is_ascii_alphabetic()
+    {
+        return None;
+    }
+    let mut result = String::with_capacity(path.len());
+    result.push(drive[0].to_ascii_uppercase() as char);
+    result.push(':');
+    result.push('\\');
+    result.push_str(&path[3..].replace('/', "\\"));
+    Some(result)
+}
+
+fn bounded_uri_to_path(uri: &str) -> Option<String> {
+    let decoded = decoded_file_uri(uri)?;
+    if decoded
+        .authority
+        .is_some_and(|authority| !authority.eq_ignore_ascii_case("localhost"))
+        || !valid_decoded_path(&decoded.path)
+    {
+        return None;
+    }
+    String::from_utf8(decoded.path).ok()
+}
+
+fn path_from_uri(uri: &str) -> Option<String> {
+    if crate::plugin::platform::is_windows() {
+        windows_uri_path(uri)
+    } else {
+        bounded_uri_to_path(uri)
+    }
+}
+
+/// Classify a path using only normalized path components. In particular,
+/// `root/../outside` is outside even when neither path exists on disk.
+pub fn classify_location(root: &Path, path: &Path) -> LocationScope {
+    let root = lexical_components(root);
+    let path = lexical_components(path);
+    if !root.is_empty()
+        && path.len() >= root.len()
+        && path.iter().zip(&root).all(|(path, root)| path == root)
+    {
+        LocationScope::InWorktree
+    } else {
+        LocationScope::Outside
+    }
+}
+
+fn lexical_components(path: &Path) -> Vec<std::path::Component<'_>> {
+    let mut normalized = Vec::new();
+    for component in path.components() {
+        match component {
+            std::path::Component::CurDir => {}
+            std::path::Component::ParentDir => {
+                if matches!(normalized.last(), Some(std::path::Component::Normal(_))) {
+                    normalized.pop();
+                } else if !matches!(
+                    normalized.last(),
+                    Some(std::path::Component::RootDir | std::path::Component::Prefix(_))
+                ) {
+                    normalized.push(component);
+                }
+            }
+            _ => normalized.push(component),
+        }
+    }
+    normalized
 }
 
 fn ensure_identity_uri(uri: &str) -> Result<(), LspError> {
-    bounded_uri_to_path(uri)
+    uri_to_path_os(uri)
         .map(|_| ())
         .ok_or_else(|| LspError::Bounded("LSP identity URI limit or unsupported URI".into()))
 }
@@ -1145,13 +1300,20 @@ fn range_from_json(v: &Value) -> Option<Range> {
         .then_some(range)
 }
 
-fn location_from_json(v: &Value) -> Option<Location> {
+fn location_from_json(v: &Value, root: Option<&Path>) -> Option<Location> {
+    let location = |path: String, range: Range| Location {
+        scope: root
+            .map(|root| classify_location(root, Path::new(&path)))
+            .unwrap_or(LocationScope::Outside),
+        path,
+        range,
+    };
     // Plain `Location { uri, range }`.
     if let (Some(uri), Some(range)) = (v.get("uri"), v.get("range")) {
-        return Some(Location {
-            path: bounded_uri_to_path(uri.as_str()?)?,
-            range: range_from_json(range)?,
-        });
+        return Some(location(
+            path_from_uri(uri.as_str()?)?,
+            range_from_json(range)?,
+        ));
     }
     // `LocationLink { targetUri, targetSelectionRange | targetRange }`.
     if let Some(uri) = v.get("targetUri").and_then(Value::as_str) {
@@ -1159,10 +1321,7 @@ fn location_from_json(v: &Value) -> Option<Location> {
             v.get("targetSelectionRange")
                 .or_else(|| v.get("targetRange"))?,
         )?;
-        return Some(Location {
-            path: bounded_uri_to_path(uri)?,
-            range,
-        });
+        return Some(location(path_from_uri(uri)?, range));
     }
     None
 }
@@ -1170,10 +1329,20 @@ fn location_from_json(v: &Value) -> Option<Location> {
 /// Parse a definition/references result: `Location | Location[] | LocationLink[]`.
 pub fn parse_locations(result: &Value) -> Vec<Location> {
     let mut health = ProjectionHealth::default();
-    parse_locations_limited(result, &mut health)
+    parse_locations_limited_with_root(result, &mut health, None)
 }
 
-fn parse_locations_limited(result: &Value, health: &mut ProjectionHealth) -> Vec<Location> {
+/// Parse locations and classify each path against the owning worktree root.
+pub fn parse_locations_with_root(result: &Value, root: &Path) -> Vec<Location> {
+    let mut health = ProjectionHealth::default();
+    parse_locations_limited_with_root(result, &mut health, Some(root))
+}
+
+fn parse_locations_limited_with_root(
+    result: &Value,
+    health: &mut ProjectionHealth,
+    root: Option<&Path>,
+) -> Vec<Location> {
     if result
         .as_array()
         .is_some_and(|items| items.len() > limits::MAX_RESULT_ITEMS)
@@ -1187,7 +1356,7 @@ fn parse_locations_limited(result: &Value, health: &mut ProjectionHealth) -> Vec
                 .iter()
                 .take(limits::MAX_RESULT_ITEMS)
                 .filter_map(|item| {
-                    let location = location_from_json(item)?;
+                    let location = location_from_json(item, root)?;
                     let item_bytes = location
                         .path
                         .len()
@@ -1201,7 +1370,7 @@ fn parse_locations_limited(result: &Value, health: &mut ProjectionHealth) -> Vec
                 })
                 .collect()
         }
-        Value::Object(_) => location_from_json(result).into_iter().collect(),
+        Value::Object(_) => location_from_json(result, root).into_iter().collect(),
         _ => Vec::new(),
     }
 }
@@ -1210,13 +1379,24 @@ fn parse_locations_limited(result: &Value, health: &mut ProjectionHealth) -> Vec
 /// hierarchical `DocumentSymbol[]` and the flat `SymbolInformation[]` shapes.
 pub fn parse_symbols(result: &Value, fallback_path: &str) -> Vec<SymbolInfo> {
     let mut health = ProjectionHealth::default();
-    project_symbols(result, fallback_path, &mut health)
+    project_symbols(result, fallback_path, &mut health, None)
+}
+
+/// Parse symbols and classify their resolved locations against `root`.
+pub fn parse_symbols_with_root(
+    result: &Value,
+    fallback_path: &str,
+    root: &Path,
+) -> Vec<SymbolInfo> {
+    let mut health = ProjectionHealth::default();
+    project_symbols(result, fallback_path, &mut health, Some(root))
 }
 
 fn project_symbols(
     result: &Value,
     fallback_path: &str,
     health: &mut ProjectionHealth,
+    root: Option<&Path>,
 ) -> Vec<SymbolInfo> {
     let Some(items) = result.as_array() else {
         return Vec::new();
@@ -1245,7 +1425,10 @@ fn project_symbols(
         let Some(name) = bounded_string(raw_name, limits::MAX_SCALAR_STRING_BYTES, health) else {
             continue;
         };
-        let location = if let Some(loc) = item.get("location").and_then(location_from_json) {
+        let location = if let Some(loc) = item
+            .get("location")
+            .and_then(|location| location_from_json(location, root))
+        {
             loc
         } else {
             let range = item
@@ -1259,6 +1442,9 @@ fn project_symbols(
             Location {
                 path: fallback_path.to_string(),
                 range,
+                scope: root
+                    .map(|root| classify_location(root, Path::new(fallback_path)))
+                    .unwrap_or(LocationScope::Outside),
             }
         };
         let container_name = item
@@ -1476,7 +1662,7 @@ fn parse_published_diagnostics_with_context(
     let Some(path) = params
         .get("uri")
         .and_then(Value::as_str)
-        .and_then(bounded_uri_to_path)
+        .and_then(path_from_uri)
     else {
         return (
             None,
@@ -1486,11 +1672,13 @@ fn parse_published_diagnostics_with_context(
             },
         );
     };
+    let scope = classify_location(root, Path::new(&path));
     let Some(raw_diagnostics) = params.get("diagnostics").and_then(Value::as_array) else {
         return (
             Some(PublishedDiagnostics {
                 root: root.to_path_buf(),
                 path,
+                scope,
                 diagnostics: Vec::new(),
                 server_identity,
                 generation,
@@ -1541,6 +1729,7 @@ fn parse_published_diagnostics_with_context(
         Some(PublishedDiagnostics {
             root: root.to_path_buf(),
             path,
+            scope,
             diagnostics,
             server_identity,
             generation,
@@ -2181,7 +2370,7 @@ impl LspClient {
             return Err(LspError::NotAvailable);
         }
         ensure_identity_uri(uri)?;
-        let fallback = bounded_uri_to_path(uri)
+        let fallback = path_from_uri(uri)
             .ok_or_else(|| LspError::Bounded("document identity path limit".into()))?;
         let res = self.request_cancellable(
             "textDocument/documentSymbol",
@@ -2189,7 +2378,7 @@ impl LspClient {
             cancel,
         )?;
         let mut health = ProjectionHealth::default();
-        let symbols = project_symbols(&res, &fallback, &mut health);
+        let symbols = project_symbols(&res, &fallback, &mut health, Some(&self.root));
         health.record(&self.diagnostics);
         Ok(symbols)
     }
@@ -2223,7 +2412,7 @@ impl LspClient {
             cancel,
         )?;
         let mut health = ProjectionHealth::default();
-        let symbols = project_symbols(&res, "", &mut health);
+        let symbols = project_symbols(&res, "", &mut health, Some(&self.root));
         health.record(&self.diagnostics);
         Ok(symbols)
     }
@@ -2236,7 +2425,7 @@ impl LspClient {
         ensure_identity_uri(uri)?;
         let res = self.request("textDocument/definition", self.pos_params(uri, pos))?;
         let mut health = ProjectionHealth::default();
-        let locations = parse_locations_limited(&res, &mut health);
+        let locations = parse_locations_limited_with_root(&res, &mut health, Some(&self.root));
         health.record(&self.diagnostics);
         Ok(locations)
     }
@@ -2275,7 +2464,7 @@ impl LspClient {
             cancel,
         )?;
         let mut health = ProjectionHealth::default();
-        let locations = parse_locations_limited(&res, &mut health);
+        let locations = parse_locations_limited_with_root(&res, &mut health, Some(&self.root));
         health.record(&self.diagnostics);
         Ok(locations)
     }
@@ -2827,7 +3016,7 @@ fn reject_unparsed(ctx: &ReaderContext, body: &[u8], reason: &str) {
             .params_uri
             .and_then(|(start, end)| unescape_solidus(&body[start..end]))
             .as_deref()
-            .and_then(bounded_uri_to_path);
+            .and_then(path_from_uri);
         ctx.diag_tx.mark_lost(
             &ctx.root,
             &ctx.server_identity,
@@ -4222,6 +4411,63 @@ mod tests {
     }
 
     #[test]
+    fn uri_to_path_os_round_trips_non_utf8_path_bytes() {
+        let Some(path) = crate::plugin::platform::non_utf8_path_for_test(Path::new("/tmp/proj"))
+        else {
+            return;
+        };
+
+        let decoded = uri_to_path_os("file:///tmp/proj/src-%FF.rs").unwrap();
+        assert_eq!(
+            decoded.as_os_str().as_encoded_bytes(),
+            path.as_os_str().as_encoded_bytes()
+        );
+    }
+
+    #[test]
+    fn windows_uri_path_handles_drive_and_unc_forms() {
+        for (uri, expected) in [
+            ("file:///C:/work/src.rs", Some(r"C:\work\src.rs")),
+            ("file:///c:/work/src.rs", Some(r"C:\work\src.rs")),
+            ("file://server/share/src.rs", Some(r"\\server\share\src.rs")),
+            ("file://C:/work/src.rs", None),
+            ("file://host@SSL/share/x", None),
+            ("file://server//x", None),
+        ] {
+            assert_eq!(windows_uri_path(uri).as_deref(), expected, "{uri}");
+        }
+    }
+
+    #[test]
+    fn uri_to_path_os_rejects_encoded_separators_nul_and_overlong_paths() {
+        for uri in ["file:///a%2Fb.rs", "file:///a%5Cb.rs", "file:///a%00b.rs"] {
+            assert_eq!(uri_to_path_os(uri), None, "accepted {uri}");
+        }
+        let overlong = format!("file:///{}", "a".repeat(limits::MAX_IDENTITY_BYTES));
+        assert_eq!(uri_to_path_os(&overlong), None);
+    }
+
+    #[test]
+    fn location_scope_is_lexical_component_wise_and_parent_aware() {
+        let root = Path::new("/workspace/worktree");
+        for (path, expected) in [
+            ("/workspace/worktree/src/lib.rs", LocationScope::InWorktree),
+            (
+                "/workspace/worktree/src/../Cargo.toml",
+                LocationScope::InWorktree,
+            ),
+            ("/workspace/worktree/../other.rs", LocationScope::Outside),
+            ("/workspace/worktree/../../other.rs", LocationScope::Outside),
+            (
+                "/workspace/worktree-sibling/file.rs",
+                LocationScope::Outside,
+            ),
+        ] {
+            assert_eq!(classify_location(root, Path::new(path)), expected, "{path}");
+        }
+    }
+
+    #[test]
     fn path_to_uri_os_matches_path_to_uri_for_utf8_paths() {
         for path in [
             "/home/u/proj/src/lib.rs",
@@ -4313,6 +4559,18 @@ mod tests {
         assert_eq!(locs.len(), 1);
         assert_eq!(locs[0].path, "/x/y.rs");
         assert_eq!(locs[0].line_1based(), 5);
+    }
+
+    #[test]
+    fn parsed_locations_and_diagnostics_label_outside_scope() {
+        let v = json!({ "uri": "file:///outside.rs", "range": {
+            "start": { "line": 0, "character": 0 }, "end": { "line": 0, "character": 1 } } });
+        let locations = parse_locations_with_root(&v, Path::new("/worktree"));
+        assert_eq!(locations[0].scope, LocationScope::Outside);
+
+        let params = json!({ "uri": "file:///worktree/src/lib.rs", "diagnostics": [] });
+        let diagnostics = parse_published_diagnostics(&params, Path::new("/worktree")).unwrap();
+        assert_eq!(diagnostics.scope, LocationScope::InWorktree);
     }
 
     #[test]
@@ -4543,7 +4801,7 @@ mod tests {
             .collect();
         let tree = json!([chain, symbol("wide".into(), 0, wide)]);
         let mut health = ProjectionHealth::default();
-        let symbols = project_symbols(&tree, "/safe.rs", &mut health);
+        let symbols = project_symbols(&tree, "/safe.rs", &mut health, None);
         assert_eq!(symbols.len(), limits::MAX_RESULT_ITEMS, "exact total cap");
         assert!(health.truncated, "cap + 1 is reported");
         // Stable pre-order prefix: the chain first, root to leaf, then `wide`.
@@ -4558,7 +4816,7 @@ mod tests {
             .map(|index| symbol(format!("e{index}"), index, vec![]))
             .collect();
         let mut health = ProjectionHealth::default();
-        let symbols = project_symbols(&Value::Array(exact), "/safe.rs", &mut health);
+        let symbols = project_symbols(&Value::Array(exact), "/safe.rs", &mut health, None);
         assert_eq!(symbols.len(), limits::MAX_RESULT_ITEMS);
         assert!(!health.truncated);
     }
@@ -4576,7 +4834,7 @@ mod tests {
             }]
         }]);
         let mut health = ProjectionHealth::default();
-        let symbols = project_symbols(&tree, "/safe.rs", &mut health);
+        let symbols = project_symbols(&tree, "/safe.rs", &mut health, None);
         assert!(symbols.is_empty());
         assert!(
             health.invalid,
@@ -4855,6 +5113,7 @@ mod tests {
         diag_tx.publish(PublishedDiagnostics {
             root: PathBuf::from("/fixture"),
             path: "/fixture/a.rs".into(),
+            scope: LocationScope::InWorktree,
             diagnostics: vec![],
             server_identity: "fixture".into(),
             generation,
