@@ -491,7 +491,7 @@ fn reap_unregistered(cfg: &Config, _db: &Db, rows: &[HostCapacityRow]) {
             continue;
         };
         let Ok(instances) =
-            crate::agent::block_on_provider(|| async { provider.list_detailed().await })
+            crate::agent::block_on_provider(|| async { provider.list_detailed_priority().await })
         else {
             continue;
         };
