@@ -6,12 +6,14 @@
 
 use std::path::Path;
 
+use anyhow::{Context, Result};
 use thegn_core::agent_task::{TaskKind, TaskVars, default_prompt, render_kind_prompt};
 use thegn_core::autopilot::{AutopilotIssueKey, AutopilotState, bounded_reason, matches_issue};
 use thegn_core::config::{AutopilotConfig, Config};
 use thegn_core::db::Db;
 use thegn_core::forge::PrRef;
 use thegn_core::forge::model::CreateOpts;
+use thegn_core::git_run::{GitOutcome, GitTextError};
 use thegn_core::issue::{AgentDispatchStatus, Issue, IssuePatch, NewDispatch};
 use thegn_core::remote::GitLoc;
 use thegn_core::store::{AutopilotStore, NotificationStore, WorkspaceStore, WorktreeAuxStore};
@@ -135,10 +137,18 @@ fn drive_claim(
             return;
         }
     };
-    if thegn_core::util::git_out(repo_root, &["rev-parse", "--verify", "--quiet", &base]).is_none()
-    {
-        fail("configured base branch has no commit");
-        return;
+    match base_has_commits(repo_root, &base) {
+        Ok(true) => {}
+        Ok(false) => {
+            fail("configured base branch has no commit");
+            return;
+        }
+        Err(error) => {
+            fail(&format!(
+                "configured base branch could not be verified: {error}"
+            ));
+            return;
+        }
     }
     let worktree = match thegn_core::worktree::allocate_worktree_path(repo_root, &branch, cfg) {
         Ok(path) => path,
@@ -371,12 +381,18 @@ fn drive_claim(
         .status(&loc)
         .map(|s| s.is_empty())
         .unwrap_or(false);
-    let ahead = thegn_core::util::git_out(
-        &worktree,
-        &["rev-list", "--count", &format!("{base}..HEAD")],
-    )
-    .and_then(|n| n.parse::<u64>().ok())
-    .unwrap_or(0);
+    let ahead = match commits_ahead(&worktree, &base) {
+        Ok(ahead) => ahead,
+        Err(error) => {
+            mark_worker_failed(
+                db,
+                run_id,
+                dispatch_id,
+                &format!("could not read commits ahead of base: {error}"),
+            );
+            return;
+        }
+    };
     if current != branch || !clean || ahead == 0 {
         mark_worker_failed(
             db,
@@ -567,6 +583,39 @@ fn drive_claim(
             ),
         }
     }
+}
+
+fn base_has_commits(repo_root: &Path, base: &str) -> Result<bool> {
+    let loc = GitLoc::Local(repo_root.to_path_buf());
+    match loc.git_text(&["rev-parse", "--verify", "--quiet", base]) {
+        Ok(commit) => Ok(!commit.is_empty()),
+        Err(error) if base_is_absent(&error) => Ok(false),
+        Err(error) => Err(anyhow::anyhow!("Git base probe failed: {error}")).context(format!(
+            "could not verify base branch '{base}' in {}",
+            repo_root.display()
+        )),
+    }
+}
+
+fn base_is_absent(error: &GitTextError) -> bool {
+    matches!(
+        error,
+        GitTextError::Failed(GitOutcome::Exit {
+            code: Some(1),
+            stderr_tail,
+        }) if stderr_tail.is_empty()
+    )
+}
+
+fn commits_ahead(worktree: &Path, base: &str) -> Result<u64> {
+    let range = format!("{base}..HEAD");
+    let output = GitLoc::Local(worktree.to_path_buf())
+        .git_text(&["rev-list", "--count", &range])
+        .map_err(|error| anyhow::anyhow!("git rev-list --count {range}: {error}"))
+        .context("reading commits ahead of base")?;
+    output
+        .parse()
+        .context("parsing commits-ahead count returned by Git")
 }
 
 fn issue_prompt(
@@ -1012,10 +1061,10 @@ pub(crate) fn on_pr_merged(cfg: &Config, repo_root: &Path, number: u64) {
 #[cfg(test)]
 mod tests {
     use super::{
-        autopilot_backend_is_isolated, autopilot_issue_router, autopilot_pickup_hold, issue_prompt,
-        needs_human_overwrites, pr_opened_reason, record_pr_open, record_worker_result,
-        sealed_autopilot_sandbox, tracker_config_for_account, tracker_in_progress_note,
-        worker_failure, worker_run_stop, worker_start_reason,
+        autopilot_backend_is_isolated, autopilot_issue_router, autopilot_pickup_hold,
+        base_has_commits, commits_ahead, issue_prompt, needs_human_overwrites, pr_opened_reason,
+        record_pr_open, record_worker_result, sealed_autopilot_sandbox, tracker_config_for_account,
+        tracker_in_progress_note, worker_failure, worker_run_stop, worker_start_reason,
     };
     use std::path::{Path, PathBuf};
 
@@ -1024,6 +1073,30 @@ mod tests {
     use thegn_core::sandbox::Backend;
     use thegn_core::store::{AutopilotStore, NotificationStore, WorkspaceStore};
     use thegn_svc::issue::{IssueBackend, IssueCaps, IssueError};
+
+    #[test]
+    fn autopilot_base_probe_distinguishes_missing_ref_from_git_failure() {
+        let repo = tempfile::tempdir().unwrap();
+        let mut init = thegn_core::util::git_cmd(repo.path());
+        init.args(["init", "-q"])
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_CONFIG_NOSYSTEM", "1");
+        assert!(init.status().unwrap().success());
+        assert!(!base_has_commits(repo.path(), "main").unwrap());
+
+        let broken = tempfile::tempdir().unwrap();
+        let error = base_has_commits(broken.path(), "main").unwrap_err();
+        assert!(error.to_string().contains("could not verify base branch"));
+        assert!(error.to_string().contains("Git"));
+    }
+
+    #[test]
+    fn autopilot_ahead_probe_reports_git_failure() {
+        let dir = tempfile::tempdir().unwrap();
+        let error = commits_ahead(dir.path(), "main").unwrap_err().to_string();
+        assert!(error.contains("reading commits ahead of base"), "{error}");
+        assert!(error.contains("Git"), "{error}");
+    }
 
     #[test]
     fn sealed_autopilot_sandbox_refuses_an_unrecognised_worktree_location() {
