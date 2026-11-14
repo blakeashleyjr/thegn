@@ -40,6 +40,7 @@ mod center;
 mod channel_state;
 mod chrome;
 mod chrome_text;
+mod ci_flight;
 mod ci_refresh;
 mod cli_help;
 mod clipboard;

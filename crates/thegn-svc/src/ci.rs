@@ -48,6 +48,7 @@ const PROVIDER_JSON_LIMITS: JsonLimits = JsonLimits {
     bytes: CI_CLI_MAX_STDOUT,
     depth: 32,
     items: 262_144,
+    container_items: 65_536,
     string_len: 1024 * 1024,
 };
 pub(crate) const MAX_PROVIDER_FIELD_BYTES: usize = 4096;
@@ -925,6 +926,7 @@ pub(crate) struct JsonLimits {
     pub bytes: usize,
     pub depth: usize,
     pub items: usize,
+    pub container_items: usize,
     pub string_len: usize,
 }
 
@@ -1088,8 +1090,13 @@ fn scan_json_value(
                 *position += 1;
                 return Ok(());
             }
+            let mut container_items: usize = 0;
             loop {
                 skip_json_whitespace(input, position);
+                container_items = container_items.saturating_add(1);
+                if container_items > limits.container_items {
+                    return Err(JsonScanError::TooLarge("JSON container item limit"));
+                }
                 scan_json_string(input, position, limits.string_len)?;
                 skip_json_whitespace(input, position);
                 if input.get(*position) != Some(&b':') {
@@ -1118,7 +1125,12 @@ fn scan_json_value(
                 *position += 1;
                 return Ok(());
             }
+            let mut container_items: usize = 0;
             loop {
+                container_items = container_items.saturating_add(1);
+                if container_items > limits.container_items {
+                    return Err(JsonScanError::TooLarge("JSON container item limit"));
+                }
                 scan_json_value(input, position, depth + 1, limits, items, true)?;
                 skip_json_whitespace(input, position);
                 match input.get(*position).copied() {
@@ -2835,6 +2847,41 @@ mod tests {
         let input = "{\n  \"a\": 1,\n  \"b\": [ 1 ,\n 2 ]\n}";
 
         assert!(bounded_json(input, PROVIDER_JSON_LIMITS).is_ok());
+    }
+
+    #[test]
+    fn bounded_json_enforces_each_container_cap_with_all_common_whitespace() {
+        let limits = JsonLimits {
+            items: 32,
+            container_items: 2,
+            ..PROVIDER_JSON_LIMITS
+        };
+        for input in [
+            "[0,1]",
+            "[\n  0,\n  1\n]",
+            r#"{"a":0,"b":1}"#,
+            "{\n  \"a\" : 0 ,\n  \"b\" : 1\n}",
+            "{\"outer\" : [ 0 , 1 ] , \"other\" : { \"x\" : 2 , \"y\" : 3 } }",
+        ] {
+            assert!(
+                bounded_json(input, limits).is_ok(),
+                "accepted input: {input}"
+            );
+        }
+        for input in [
+            "[0,1,2]",
+            "{\"a\":0,\"b\":1,\"c\":2}",
+            "{\n  \"a\" : 0 ,\n  \"b\" : 1 ,\n  \"c\" : 2\n}",
+            "{\"outer\" : [ 0 , 1 , 2 ]}",
+        ] {
+            assert!(
+                matches!(
+                    bounded_json(input, limits),
+                    Err(JsonScanError::TooLarge("JSON container item limit"))
+                ),
+                "accepted over-cap input: {input}"
+            );
+        }
     }
 
     #[test]
