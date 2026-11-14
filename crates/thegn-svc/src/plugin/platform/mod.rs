@@ -12,6 +12,14 @@ mod windows;
 #[cfg(windows)]
 pub(crate) use windows::*;
 
+pub(crate) fn is_windows() -> bool {
+    cfg!(windows)
+}
+
+pub(crate) fn os_string_from_bytes(bytes: Vec<u8>) -> Option<std::ffi::OsString> {
+    platform_os_string_from_bytes(bytes)
+}
+
 /// Whether metadata describes a file the current platform can execute.
 /// Unix checks execute mode bits; Windows applies its normal process lookup
 /// rules after regular-file validation.
