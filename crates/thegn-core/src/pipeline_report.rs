@@ -229,8 +229,7 @@ pub fn display_clip_meta(s: &str, cells: usize) -> DisplayClipMeta {
         .last()
         .is_some_and(|cluster| cluster.chars().all(char::is_whitespace))
     {
-        let last = clusters.pop().expect("last cluster exists");
-        width -= UnicodeWidthStr::width(last);
+        clusters.pop();
     }
     clusters.push("…");
     let text = clusters.concat();

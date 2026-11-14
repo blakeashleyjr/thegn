@@ -72,7 +72,7 @@ fn full_view(ctx: &SectionCtx) -> Vec<PanelRow> {
         match row {
             AggRow::Group { label, count } => {
                 list_rows.push(vec![
-                    seg(hue(Hue::Blue), display_cell(label)),
+                    seg(hue(Hue::Blue), display_cell(&label)),
                     seg(d(), format!(" ·{count}")),
                 ]);
                 list_hits.push(None);
