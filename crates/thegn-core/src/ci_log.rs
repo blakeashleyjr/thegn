@@ -357,10 +357,21 @@ pub fn contains_known_credential(text: &str) -> Option<&'static str> {
 /// Redact one complete provider line while preserving PEM framing state across
 /// lines. The caller must bound the line before calling this helper.
 pub fn redact_stream_line(line: &[u8], in_pem: &mut bool) -> String {
+    redact_stream_line_tracked(line, in_pem).0
+}
+
+/// As [`redact_stream_line`], also returning the last PEM marker on the line.
+/// `Some(true)` is a BEGIN marker and `Some(false)` is an END marker. Keeping
+/// this detail beside the redaction result lets bounded collectors apply the
+/// conservative policy for a tail whose retained prefix starts mid-key.
+pub fn redact_stream_line_tracked(line: &[u8], in_pem: &mut bool) -> (String, Option<bool>) {
     let Ok(line) = std::str::from_utf8(line) else {
-        return format!(
-            "{REDACTION_MARKER}{}",
-            if line.ends_with(b"\n") { "\n" } else { "" }
+        return (
+            format!(
+                "{REDACTION_MARKER}{}",
+                if line.ends_with(b"\n") { "\n" } else { "" }
+            ),
+            None,
         );
     };
     let (body, newline) = line
@@ -382,7 +393,7 @@ pub fn redact_stream_line(line: &[u8], in_pem: &mut bool) -> String {
     if let Some(begin) = marker {
         *in_pem = begin;
     }
-    format!("{result}{cr}{newline}")
+    (format!("{result}{cr}{newline}"), marker)
 }
 
 /// Select the terminal run identities retained by a configured cache policy.
@@ -1397,6 +1408,27 @@ mod tests {
             redact_stream_line(b"ordinary\r\n", &mut in_pem),
             "ordinary\r\n"
         );
+    }
+
+    #[test]
+    fn tracked_stream_redaction_reports_the_last_pem_marker() {
+        let mut in_pem = false;
+        let (ordinary, marker) = redact_stream_line_tracked(b"ordinary\n", &mut in_pem);
+        assert_eq!(ordinary, "ordinary\n");
+        assert_eq!(marker, None);
+
+        let (begin, marker) = redact_stream_line_tracked(b"-----BEGIN X-----\r\n", &mut in_pem);
+        assert_eq!(begin, format!("{REDACTION_MARKER}\r\n"));
+        assert_eq!(marker, Some(true));
+
+        let (end, marker) = redact_stream_line_tracked(b"-----END X-----\r\n", &mut in_pem);
+        assert_eq!(end, format!("{REDACTION_MARKER}\r\n"));
+        assert_eq!(marker, Some(false));
+        assert!(!in_pem);
+
+        let (invalid, marker) = redact_stream_line_tracked(b"\xff\n", &mut in_pem);
+        assert_eq!(invalid, format!("{REDACTION_MARKER}\n"));
+        assert_eq!(marker, None);
     }
 
     #[test]
