@@ -346,6 +346,7 @@ pub(crate) struct WorkspacePicker {
     truncated: bool,
     generation: u64,
     cancel: Option<Arc<AtomicBool>>,
+    broad_roots: Vec<thegn_core::repo::BroadRoot>,
     /// Deferred scans retain only the newest request; the UI loop never joins workers.
     deferred_discovery: Option<(thegn_core::config::Config, TerminalWaker)>,
     /// Shared process-wide live worker count, replaceable in isolated tests.
@@ -413,6 +414,7 @@ impl WorkspacePicker {
             truncated: false,
             generation: 0,
             cancel: None,
+            broad_roots: Vec::new(),
             deferred_discovery: None,
             live_workers: live_discovery_workers(),
             scan_roots: Vec::new(),
@@ -553,6 +555,10 @@ impl WorkspacePicker {
         self.cancel = Some(cancel.clone());
         self.scan_roots.clone_from(&cfg.repo_roots);
         self.scan_depth = cfg.repo_scan_depth;
+        // Config::post_process_inner expands leading `~` before this runtime
+        // call, so the pure detector sees the roots that discovery will walk.
+        self.broad_roots =
+            thegn_core::repo::broad_roots(&cfg.repo_roots, Some(&thegn_core::util::home()));
         self.truncated = false;
         self.scanning = true;
         if let Some(slot) = try_acquire_slot(
@@ -1107,11 +1113,13 @@ impl WorkspacePicker {
         };
         {
             let shown = self.matches.len().min(MAX_ITEMS);
+            let broad_root = self.broad_roots.first();
+            let warning_rows = usize::from(broad_root.is_some());
             let spec = LayerSpec {
                 title: "new project".into(),
                 badge: Some(" tab: manual ".into()),
                 cols: COLS,
-                rows: shown + 4, // prompt + rule + items + rule + footer
+                rows: shown + 4 + warning_rows, // prompt + rule + warning? + items + rule + footer
                 anchor: Anchor::TopThird,
                 ..LayerSpec::default()
             };
@@ -1139,7 +1147,23 @@ impl WorkspacePicker {
             }
             seg::draw_line(surface, inner.x, inner.y + 1, inner.cols, &rule, panel);
 
-            let rows_avail = inner.rows.saturating_sub(4);
+            if let Some(root) = broad_root {
+                let warning = format!(
+                    "broad root: {} (scan limited to {} repos)",
+                    root.path,
+                    thegn_core::repo::DiscoveryBudget::default().max_repositories
+                );
+                seg::draw_line(
+                    surface,
+                    inner.x,
+                    inner.y + 2,
+                    inner.cols,
+                    &Line::segs(vec![seg(Tok::Slot(S::ActivityWaiting), warning)]),
+                    panel,
+                );
+            }
+
+            let rows_avail = inner.rows.saturating_sub(4 + warning_rows);
             for row in 0..rows_avail {
                 let match_idx = self.scroll_offset + row;
                 let Some(&item_idx) = self.matches.get(match_idx) else {
@@ -1159,7 +1183,14 @@ impl WorkspacePicker {
                     vec![sp(1), name],
                     vec![seg(Tok::Slot(S::Ghost3), item.path.clone()), sp(1)],
                 );
-                seg::draw_line(surface, inner.x, inner.y + 2 + row, inner.cols, &line, pad);
+                seg::draw_line(
+                    surface,
+                    inner.x,
+                    inner.y + 2 + warning_rows + row,
+                    inner.cols,
+                    &line,
+                    pad,
+                );
             }
 
             if inner.rows >= 4 {
@@ -1273,6 +1304,29 @@ mod tests {
         for c in s.chars() {
             key(p, KeyCode::Char(c));
         }
+    }
+
+    #[test]
+    fn render_shows_broad_root_warning_above_repo_rows() {
+        let mut p = picker(&["/code/repo"]);
+        p.broad_roots = vec![thegn_core::repo::BroadRoot { path: "/".into() }];
+        let mut surface = Surface::new(100, 20);
+        p.render(
+            &mut surface,
+            Rect {
+                x: 0,
+                y: 0,
+                cols: 100,
+                rows: 20,
+            },
+        );
+        let text = surface.screen_chars_to_string();
+        let warning = "broad root: / (scan limited to 20000 repos)";
+        assert!(text.contains(warning), "warning row drawn: {text:?}");
+        assert!(
+            text.find(warning).unwrap() < text.find("/code/repo").unwrap(),
+            "warning must precede the repo row: {text:?}"
+        );
     }
 
     #[test]
