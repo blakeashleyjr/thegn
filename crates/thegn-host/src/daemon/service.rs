@@ -2957,8 +2957,22 @@ impl ControlApi for DaemonService {
                     )));
                 }
             };
+            let stage_order = self.config.pipeline.stage_names();
             self.with_db(move |db| {
                 use thegn_core::store::NotificationStore;
+                if let Some(parent_id) = req.parent_id
+                    && let Some(parent) = db.get_dispatch(parent_id)?
+                    && let Err(conflict) = thegn_core::db::check_parent_stage(
+                        &stage_order,
+                        parent.stage.as_deref(),
+                        req.stage.as_deref(),
+                    )
+                {
+                    return Err(anyhow::Error::new(thegn_core::db::ParentDispatchConflict {
+                        parent_id,
+                        reason: conflict.reason,
+                    }));
+                }
                 let id = db.put_dispatch_with_parent_check_led(
                     thegn_core::issue::NewDispatch {
                         issue_id: &issue_id,
@@ -6854,6 +6868,60 @@ mod tests {
         assert!(matches!(
             result,
             Err(ControlError::FailedPrecondition(message)) if message.contains("another issue")
+        ));
+        assert_eq!(
+            svc.dispatches_list(None, Db::ROSTER_HISTORY_LIMIT)
+                .await
+                .unwrap()
+                .dispatches
+                .len(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn dispatch_put_refuses_a_later_stage_parent() {
+        let mut config = thegn_core::config::Config::default();
+        config.pipeline.stages = vec![
+            thegn_core::config_pipeline::PipelineStage {
+                name: "code".into(),
+                ..Default::default()
+            },
+            thegn_core::config_pipeline::PipelineStage {
+                name: "review".into(),
+                ..Default::default()
+            },
+        ];
+        let (svc, _rx) = service_with_config(0, config);
+        let (_dir_parent, parent_wt) = git_worktree();
+        let (_dir_child, child_wt) = git_worktree();
+        let parent = svc
+            .dispatch_put(thegn_svc::control::DispatchPutReq {
+                issue_id: "linear:A-1".into(),
+                worktree_path: parent_wt.to_string_lossy().into_owned(),
+                agent_name: "claude".into(),
+                stage: Some("review".into()),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        let result = svc
+            .dispatch_put(thegn_svc::control::DispatchPutReq {
+                issue_id: "linear:A-1".into(),
+                worktree_path: child_wt.to_string_lossy().into_owned(),
+                agent_name: "claude".into(),
+                stage: Some("code".into()),
+                parent_id: Some(parent.id),
+                ..Default::default()
+            })
+            .await;
+        assert!(matches!(
+            result,
+            Err(ControlError::FailedPrecondition(message))
+                if message == format!(
+                    "parent dispatch {} is from stage review, later than stage code",
+                    parent.id
+                )
         ));
         assert_eq!(
             svc.dispatches_list(None, Db::ROSTER_HISTORY_LIMIT)
