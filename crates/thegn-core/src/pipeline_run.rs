@@ -404,7 +404,7 @@ pub fn verify_report(f: &VerifyFacts) -> VerifyReport {
             &mut reasons,
             &mut kinds,
             VerifyRefusal::WorktreeUnknown,
-            "could not observe a stable worktree snapshot (HEAD, the artifact or `git status --porcelain` changed or could not be read while verifying); retry verification"
+            "verification snapshot moved or could not be observed (HEAD, the artifact or `git status --porcelain` changed or could not be read while verifying); retry verification"
                 .into(),
         );
     }
@@ -1009,18 +1009,18 @@ mod tests {
 
     #[test]
     fn typed_refusals_name_each_failed_gate() {
-        let mut cases: Vec<(VerifyRefusal, VerifyFacts)> = Vec::new();
+        let mut cases: Vec<(VerifyRefusal, VerifyFacts, Option<&str>)> = Vec::new();
         let mut reserved = facts(None, false, false, false);
         reserved.stage = Some("code".into());
-        cases.push((VerifyRefusal::UnpublishedReservation, reserved));
+        cases.push((VerifyRefusal::UnpublishedReservation, reserved, None));
         let mut f = good_stage_facts();
         f.artifact_identity = ArtifactIdentity::Mismatch {
             expected: "x".into(),
         };
-        cases.push((VerifyRefusal::WrongIdentity, f));
+        cases.push((VerifyRefusal::WrongIdentity, f, None));
         let mut f = good_stage_facts();
         f.artifact_empty = true;
-        cases.push((VerifyRefusal::Empty, f));
+        cases.push((VerifyRefusal::Empty, f, None));
         for (kind, content) in [
             (VerifyRefusal::TooLarge, ArtifactContent::TooLarge),
             (VerifyRefusal::TooManyLines, ArtifactContent::TooManyLines),
@@ -1038,37 +1038,50 @@ mod tests {
         ] {
             let mut f = good_stage_facts();
             f.artifact_content = content;
-            cases.push((kind, f));
+            cases.push((kind, f, None));
         }
         let mut f = good_stage_facts();
         f.worktree_state = Some(WorktreeState::Unknown);
-        cases.push((VerifyRefusal::WorktreeUnknown, f));
+        cases.push((
+            VerifyRefusal::WorktreeUnknown,
+            f,
+            Some("verification snapshot moved"),
+        ));
         let mut f = good_stage_facts();
         f.exists = false;
         f.tracked = false;
-        cases.push((VerifyRefusal::Absent, f));
+        cases.push((VerifyRefusal::Absent, f, None));
         let mut f = good_stage_facts();
         f.tracked = false;
-        cases.push((VerifyRefusal::Uncommitted, f));
+        cases.push((VerifyRefusal::Uncommitted, f, None));
         let mut f = good_stage_facts();
         f.report_present = false;
-        cases.push((VerifyRefusal::ReportMissing, f));
+        cases.push((VerifyRefusal::ReportMissing, f, None));
         let mut f = good_stage_facts();
         f.report_gate_valid = false;
-        cases.push((VerifyRefusal::GateUnproven, f));
+        cases.push((VerifyRefusal::GateUnproven, f, None));
         let mut f = good_stage_facts();
         f.report_verdict = crate::pipeline_report::Verdict::Fail;
-        cases.push((VerifyRefusal::VerdictNotPass, f));
+        cases.push((VerifyRefusal::VerdictNotPass, f, None));
         let mut f = good_stage_facts();
         f.report_commit_binding = ReportCommitBinding::Stale;
-        cases.push((VerifyRefusal::ReportStale, f));
+        cases.push((VerifyRefusal::ReportStale, f, None));
         let mut f = good_stage_facts();
         f.report_commit_binding = ReportCommitBinding::Unknown;
-        cases.push((VerifyRefusal::ReportBindingUnknown, f));
-        for (kind, f) in &cases {
+        cases.push((VerifyRefusal::ReportBindingUnknown, f, None));
+        for (kind, f, expected_reason) in &cases {
             let report = verify_report(f);
             assert!(!report.ok, "{kind:?}: {report:?}");
             assert!(report.refusals.contains(kind), "{kind:?}: {report:?}");
+            if let Some(expected_reason) = expected_reason {
+                assert!(
+                    report
+                        .reasons
+                        .iter()
+                        .any(|reason| reason.contains(expected_reason)),
+                    "{kind:?}: expected {expected_reason:?} in {report:?}"
+                );
+            }
         }
     }
 
@@ -1393,7 +1406,9 @@ mod tests {
         assert_eq!(r.worktree_state, Some(WorktreeState::Unknown));
         assert!(r.reasons.iter().any(|w| w.contains("retry verification")));
         assert!(
-            r.reasons.iter().any(|w| w.contains("snapshot")),
+            r.reasons
+                .iter()
+                .any(|w| w.contains("verification snapshot moved")),
             "the reason names the moved snapshot, not only a failed git status"
         );
     }
