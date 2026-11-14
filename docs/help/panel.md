@@ -340,6 +340,10 @@ uploads them, but redacted excerpts are passed to the agent command you
 configure for the PR queue and CI autofix. They are purged when provider
 context changes. Redaction is pattern-based and best-effort, so treat cached
 logs as sensitive. Set `log_cache_runs = 0` to disable persistence.
+During streaming capture, if the first PEM marker observed is an END marker,
+the collector conservatively redacts every still-retained preceding line while
+preserving its line endings; lines already evicted by the retention bounds are
+gone and cannot be recovered.
 
 Thegn does not run workflows locally. To run them locally, add a tool such as
 `act` and launch it from the tool picker:
