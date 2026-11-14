@@ -8,6 +8,7 @@
 //! `y` copied a line the user wasn't looking at.
 
 use thegn_core::log::parser::{LogLevel as ParserLogLevel, ParsedLog};
+use thegn_core::pipeline_report::display_cell;
 use thegn_core::theme::Hue;
 
 use crate::panel::{PanelHit, PanelUi, Section};
@@ -84,12 +85,18 @@ fn scope_label(all: bool) -> &'static str {
 fn worktree_detail(tag: Option<&str>) -> String {
     use thegn_core::log_view::{WtTagClass, classify_wt_tag};
     match (classify_wt_tag(tag), tag) {
-        (WtTagClass::Versioned, Some(t)) => format!("worktree  {t}"),
+        (WtTagClass::Versioned, Some(t)) => format!("worktree  {}", display_cell(t)),
         (WtTagClass::Unbound, Some(t)) => {
-            format!("worktree  {t} (unbound: path too long to identify)")
+            format!(
+                "worktree  {} (unbound: path too long to identify)",
+                display_cell(t)
+            )
         }
         (WtTagClass::Legacy, Some(t)) => {
-            format!("worktree  {t} (legacy tag, not tied to any worktree)")
+            format!(
+                "worktree  {} (legacy tag, not tied to any worktree)",
+                display_cell(t)
+            )
         }
         _ => "host-global".to_string(),
     }
@@ -239,7 +246,10 @@ pub fn content(ctx: &SectionCtx) -> Vec<PanelRow> {
         if ctx.deep() {
             let target = log.target.as_deref().unwrap_or("-");
             let worktree = log.worktree.as_deref().unwrap_or("global");
-            text.push(seg(g2(), format!("{target} [{worktree}] ")));
+            text.push(seg(
+                g2(),
+                format!("{} [{}] ", display_cell(target), display_cell(worktree)),
+            ));
         }
         text.push(seg(t(), msg));
 
@@ -314,7 +324,10 @@ fn full_view(ctx: &SectionCtx, items: &[&ParsedLog], all: bool) -> Vec<PanelRow>
                 vec![
                     seg(if i == cursor { t() } else { g() }, sel),
                     seg(level_tok(&l.level), format!("{lvl:<5} ")),
-                    seg(if i == cursor { t() } else { d() }, l.message.clone()),
+                    seg(
+                        if i == cursor { t() } else { d() },
+                        display_cell(&l.message),
+                    ),
                 ],
                 Some(i),
             )
