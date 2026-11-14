@@ -63,6 +63,104 @@ fn output_and_stderr_with_timeout_runs_the_command_once() {
     assert_eq!(std::fs::read_to_string(marker).unwrap(), "x");
 }
 
+#[cfg(unix)]
+#[test]
+fn output_with_timeout_flood_is_bounded() {
+    let argv = vec!["sh".into(), "-c".into(), "head -c 4000000 /dev/zero".into()];
+    let started = std::time::Instant::now();
+    assert!(
+        output_with_timeout(&argv, Duration::from_secs(2)).is_none(),
+        "output beyond the capture cap must not be reported as complete"
+    );
+    assert!(
+        started.elapsed() < Duration::from_secs(2),
+        "flooding stdout must not block the bounded runner"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn output_with_timeout_descendant_holding_pipe_is_quiesced() {
+    let dir = tempfile::tempdir().unwrap();
+    let pid_file = dir.path().join("stdout-descendant-pid");
+    let script = format!(
+        "sleep 30 & echo $! > '{}'; printf output",
+        pid_file.display()
+    );
+    let argv = vec!["sh".into(), "-c".into(), script];
+    let started = std::time::Instant::now();
+    let (success, output) =
+        output_with_timeout(&argv, Duration::from_millis(300)).expect("leader output is retained");
+
+    assert!(success);
+    assert_eq!(output, "output");
+    assert!(started.elapsed() < Duration::from_secs(2));
+    let pid: i32 = std::fs::read_to_string(pid_file)
+        .unwrap()
+        .trim()
+        .parse()
+        .unwrap();
+    let deadline = std::time::Instant::now() + Duration::from_millis(500);
+    while nix::sys::signal::kill(nix::unistd::Pid::from_raw(pid), None).is_ok() {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "stdout-holding descendant {pid} survived"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn stderr_with_timeout_flood_is_bounded() {
+    let argv = vec![
+        "sh".into(),
+        "-c".into(),
+        "head -c 4000000 /dev/zero >&2".into(),
+    ];
+    let started = std::time::Instant::now();
+    assert!(
+        stderr_with_timeout(&argv, Duration::from_secs(2)).is_none(),
+        "stderr beyond the capture cap must not be reported as complete"
+    );
+    assert!(
+        started.elapsed() < Duration::from_secs(2),
+        "flooding stderr must not block the bounded runner"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn stderr_with_timeout_descendant_holding_pipe_is_quiesced() {
+    let dir = tempfile::tempdir().unwrap();
+    let pid_file = dir.path().join("stderr-descendant-pid");
+    let script = format!(
+        "sleep 30 & echo $! > '{}'; printf diagnostic >&2",
+        pid_file.display()
+    );
+    let argv = vec!["sh".into(), "-c".into(), script];
+    let started = std::time::Instant::now();
+    let (success, stderr) = stderr_with_timeout(&argv, Duration::from_millis(300))
+        .expect("leader diagnostics are retained");
+
+    assert!(success);
+    assert_eq!(stderr, "diagnostic");
+    assert!(started.elapsed() < Duration::from_secs(2));
+    let pid: i32 = std::fs::read_to_string(pid_file)
+        .unwrap()
+        .trim()
+        .parse()
+        .unwrap();
+    let deadline = std::time::Instant::now() + Duration::from_millis(500);
+    while nix::sys::signal::kill(nix::unistd::Pid::from_raw(pid), None).is_ok() {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "stderr-holding descendant {pid} survived"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}
+
 #[test]
 fn none_backend_skips_cd_for_unretargeted_remote_worktree() {
     // A bare remote shell whose worktree was NOT retargeted (local path) must
