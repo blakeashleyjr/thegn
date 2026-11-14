@@ -50,7 +50,8 @@ The contribution id and surface identify what the script registers and
 updates. Keep them consistent between this file and the script.
 
 Each interval tick of a `one_shot` plugin spawns a process, so choose the
-longest cadence that is useful.
+longest cadence that is useful. The manifest loader accepts intervals from
+100 ms through 24 hours; the scheduler clamps the effective cadence to 1 second.
 
 ## Step 3: the script
 
