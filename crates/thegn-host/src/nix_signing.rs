@@ -59,6 +59,7 @@ pub(crate) struct CacheSigningReport<'a> {
     pub(crate) signer_state: &'static str,
     pub(crate) scope: &'static str,
     pub(crate) require_sigs: bool,
+    pub(crate) require_sigs_explicit: bool,
 }
 
 /// Project installation-key state and pure provider-plan facts into doctor
@@ -80,7 +81,9 @@ pub(crate) fn cache_signing_report<'a>(
         } else {
             "disabled"
         },
-        require_sigs: plan.host_cache && plan.require_sigs,
+        // The plan never writes require-sigs = false: explicit when the cache is effective, Nix's default otherwise.
+        require_sigs: true,
+        require_sigs_explicit: plan.host_cache && plan.require_sigs,
     }
 }
 
@@ -488,7 +491,8 @@ mod tests {
                         "disabled"
                     }
                 );
-                assert_eq!(report.require_sigs, host_cache);
+                assert!(report.require_sigs);
+                assert_eq!(report.require_sigs_explicit, host_cache);
                 assert_eq!(
                     report.signer_state,
                     if host_cache { status.state() } else { "unused" }
