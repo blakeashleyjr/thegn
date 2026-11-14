@@ -53,7 +53,7 @@ pub fn run(cfg: &Config, worktree: Option<String>) -> Result<()> {
     let cleanup = rt.block_on(provider.destroy(&name)).and_then(|()| {
         outln!("verifying bake instance {name} is gone…");
         rt.block_on(await_absence(
-            || provider.list_detailed(),
+            || provider.list_detailed_priority(),
             &name,
             ABSENCE_ATTEMPTS,
             ABSENCE_INTERVAL,

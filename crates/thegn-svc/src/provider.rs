@@ -3802,7 +3802,7 @@ mod tests {
         let normal_b = gate.try_acquire("b").unwrap();
 
         assert!(
-            tokio::time::timeout(CONTROL_TIMEOUT, gate.acquire("a"))
+            tokio::time::timeout(std::time::Duration::from_secs(1), gate.acquire("a"))
                 .await
                 .is_err(),
             "ordinary acquisition must not use the priority reserve"
@@ -3811,15 +3811,21 @@ mod tests {
         let priority_a = gate.acquire_priority("a").await.unwrap();
         let priority_b = gate.acquire_priority("b").await.unwrap();
         assert!(
-            tokio::time::timeout(CONTROL_TIMEOUT, gate.acquire_priority("a"))
-                .await
-                .is_err(),
+            tokio::time::timeout(
+                std::time::Duration::from_secs(1),
+                gate.acquire_priority("a"),
+            )
+            .await
+            .is_err(),
             "one priority caller must not exceed the per-authority reserve"
         );
         assert!(
-            tokio::time::timeout(CONTROL_TIMEOUT, gate.acquire_priority("c"))
-                .await
-                .is_err(),
+            tokio::time::timeout(
+                std::time::Duration::from_secs(1),
+                gate.acquire_priority("c"),
+            )
+            .await
+            .is_err(),
             "priority callers must not exceed the global reserve"
         );
 
