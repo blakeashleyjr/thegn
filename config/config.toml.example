@@ -1955,9 +1955,10 @@ command = "git diff"
 #                              #   Exempt: the active worktree, a running build, uncommitted
 #                              #   changes, and any target/ under 256 MiB. 0 = off.
 # generation_min_age_days = 14 # reap Cargo fingerprints beyond the newest two per
-#                              #   package after this many untouched days, capped at
-#                              #   a one-day safety floor. The newest two per package
-#                              #   are always retained; 0 = immediately beyond those.
+#                              #   package and unit kind after this many untouched
+#                              #   days, capped at a three-day safety floor. Active
+#                              #   and dirty worktrees are included; running slots
+#                              #   and held .cargo-lock profiles are skipped.
 # reclaim_on_low_disk = true   # under real disk pressure evict least-recently-touched
 #                              #   target/ dirs until free space is back above
 #                              #   [stats] disk_free_warn. Engages only at/below

@@ -276,22 +276,16 @@ pub(crate) fn spawn_scan(
             walked += 1;
         }
 
+        let reclaimed = reclaim(&db, &policy, &fresh, active.as_deref());
         // The active checkout is marked due whenever its cache stamp is stale,
         // but a recently stamped checkout can pass the lazy gate. Generation
-        // pruning is independent of the size measurement, so keep the active
-        // path in the measured set as a direct fallback for that case.
-        if let Some(active_path) = active.as_deref()
-            && !fresh.iter().any(|(path, _)| path == active_path)
-        {
-            fresh.push((
-                active_path.to_owned(),
-                thegn_core::disk::DiskUsage::default(),
-            ));
-        }
-
-        let reclaimed = reclaim(&db, &policy, &fresh, active.as_deref());
+        // pruning is independent of the size measurement, so add the active
+        // path only to the generation set as a direct fallback. Keep `fresh`
+        // untouched for whole-target reclaim: a fabricated zero measurement
+        // would make that path do unnecessary DB, UI-state, and statvfs work.
+        let generation_rows = generation_prune_rows(&fresh, active.as_deref());
         let generation_reclaimed = reap_generation_footprints(
-            &fresh,
+            &generation_rows,
             cfg.generation_min_age_days,
             thegn_core::util::now().max(0) as u64,
         );
@@ -667,6 +661,22 @@ fn reap_generation_footprints(
     all_removed
 }
 
+fn generation_prune_rows(
+    fresh: &[(String, thegn_core::disk::DiskUsage)],
+    active: Option<&str>,
+) -> Vec<(String, thegn_core::disk::DiskUsage)> {
+    let mut rows = fresh.to_vec();
+    if let Some(active_path) = active
+        && !rows.iter().any(|(path, _)| path == active_path)
+    {
+        rows.push((
+            active_path.to_owned(),
+            thegn_core::disk::DiskUsage::default(),
+        ));
+    }
+    rows
+}
+
 /// Inventory `<profile>/.fingerprint/<package>-<id>` records and associate only
 /// Cargo outputs for that package and opaque id. Cargo library outputs start
 /// with `lib`, while dep-info files and executables do not. Package/target
@@ -728,6 +738,7 @@ fn generation_inventory(profile: &std::path::Path) -> std::io::Result<Vec<Genera
             continue;
         }
         let marker = format!("-{generation_id}");
+        let unit_kind = fingerprint_unit_kind(&fingerprint)?;
         let mut dep_paths = Vec::new();
         for entry in &deps {
             let name = entry.file_name();
@@ -766,7 +777,7 @@ fn generation_inventory(profile: &std::path::Path) -> std::io::Result<Vec<Genera
             newest = newest.max(path_newest);
         }
         result.push(GenerationFootprint {
-            package_name: package_name.to_string(),
+            package_name: format!("{package_name}/{unit_kind}"),
             generation_id: generation_id.to_string(),
             fingerprint,
             deps: dep_paths,
@@ -776,6 +787,27 @@ fn generation_inventory(profile: &std::path::Path) -> std::io::Result<Vec<Genera
         });
     }
     Ok(result)
+}
+
+/// Cargo names a unit's hash file `<kind>-<target>` (`lib-serde`,
+/// `build-script-build-script-build`, `run-build-script-build-script-build`,
+/// `test-lib-foo`, `bin-foo`). Generations are only comparable within one kind.
+fn fingerprint_unit_kind(dir: &std::path::Path) -> std::io::Result<String> {
+    let mut names = Vec::new();
+    for entry in std::fs::read_dir(dir)? {
+        let name = entry?.file_name();
+        let Some(name) = name.to_str() else { continue };
+        if name == "invoked.timestamp"
+            || name.starts_with("dep-")
+            || name.starts_with("output-")
+            || name.ends_with(".json")
+        {
+            continue;
+        }
+        names.push(name.to_string());
+    }
+    names.sort();
+    Ok(names.join(","))
 }
 
 /// Match `<package>-<id>` and `<package>-<target>-<id>` Cargo output names,
@@ -816,6 +848,11 @@ fn measure_safe_tree(
         } else if meta.is_file() {
             bytes = bytes.saturating_add(meta.len());
             if let Ok(time) = meta.modified()
+                && let Ok(time) = time.duration_since(std::time::UNIX_EPOCH)
+            {
+                newest = newest.max(time.as_secs());
+            }
+            if let Ok(time) = meta.accessed()
                 && let Ok(time) = time.duration_since(std::time::UNIX_EPOCH)
             {
                 newest = newest.max(time.as_secs());
@@ -1102,6 +1139,68 @@ mod generation_tests {
         assert!(removed > 0);
         assert!(!profile.join(".fingerprint/pkg-a").exists());
         fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn build_script_units_are_not_evicted_by_lib_generations() {
+        let root = tempfile::tempdir().unwrap();
+        let profile = root.path().join("target/debug");
+        fs::create_dir_all(profile.join(".fingerprint")).unwrap();
+        fs::write(profile.join(".cargo-lock"), []).unwrap();
+        for (fingerprint, marker) in [
+            ("pkg-b1", "build-script-build-script-build"),
+            ("pkg-r1", "run-build-script-build-script-build"),
+            ("pkg-l1", "lib-pkg"),
+            ("pkg-l2", "lib-pkg"),
+        ] {
+            let dir = profile.join(".fingerprint").join(fingerprint);
+            fs::create_dir_all(&dir).unwrap();
+            fs::write(dir.join(marker), b"fingerprint").unwrap();
+        }
+        let worktree = root.path().to_string_lossy().into_owned();
+        assert_eq!(
+            reap_generation_footprints(
+                &[(worktree, thegn_core::disk::DiskUsage::default())],
+                0,
+                u64::MAX,
+            ),
+            0
+        );
+        for fingerprint in ["pkg-b1", "pkg-r1", "pkg-l1", "pkg-l2"] {
+            assert!(profile.join(".fingerprint").join(fingerprint).exists());
+        }
+    }
+
+    #[test]
+    fn accessed_time_keeps_a_generation_footprint_recent() {
+        let root = tempfile::tempdir().unwrap();
+        let file = root.path().join("fingerprint");
+        fs::write(&file, b"fingerprint").unwrap();
+        let accessed = std::time::SystemTime::now();
+        std::fs::File::open(&file)
+            .unwrap()
+            .set_times(
+                std::fs::FileTimes::new()
+                    .set_modified(std::time::UNIX_EPOCH + std::time::Duration::from_secs(1))
+                    .set_accessed(accessed),
+            )
+            .unwrap();
+        let (_, newest) = measure_safe_tree(&file, root.path()).unwrap();
+        let accessed_secs = accessed
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        assert!(newest >= accessed_secs);
+    }
+
+    #[test]
+    fn active_generation_fallback_does_not_enter_reclaim_rows() {
+        let fresh = Vec::new();
+        let rows = generation_prune_rows(&fresh, Some("/active"));
+        assert!(fresh.is_empty());
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].0, "/active");
+        assert_eq!(rows[0].1, thegn_core::disk::DiskUsage::default());
     }
 
     #[test]
