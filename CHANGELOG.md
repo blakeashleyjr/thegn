@@ -7,6 +7,19 @@ All notable changes to **thegn** are documented here. The format follows
 
 ## [Unreleased]
 
+### Changed
+
+- LSP slots now report typed states, making ready, starting, degraded, and backoff states visible.
+
+### Fixed
+
+- Worktrees created outside thegn are discovered without rerunning Git when their metadata is unchanged.
+- A failed worktree close now leaves a status message.
+- LSP locations preserve exact OS paths, including Windows drive and UNC paths, and mark locations outside the worktree.
+- Human-readable CI logs render terminal control characters as visible escapes instead of passing them to the terminal.
+- CI provider responses are size-bounded, and only exact owner/repository remotes are recognized as GitHub.
+- Clipboard status wording appears only for clipboard operations and no longer overwrites a specific copy message.
+
 ## [0.1.0-alpha.76] — 2026-11-14
 
 ### Fixed
