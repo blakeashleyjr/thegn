@@ -171,9 +171,7 @@ pub fn display_fit(s: &str, cells: usize) -> String {
     output
 }
 
-/// Render untrusted text clipped to at most `cells` display columns.
-/// Controls and format characters are replaced, leading zero-width characters
-/// are dropped, and a truncated value ends in an ellipsis without padding.
+/// A clipped display cell plus how many columns it occupies and whether it was cut.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DisplayClipMeta {
     pub text: String,
@@ -196,7 +194,7 @@ pub fn display_clip_meta(s: &str, cells: usize) -> DisplayClipMeta {
     let safe = display_cell(s);
     let mut clusters = Vec::new();
     let mut width = 0;
-    let byte_budget = cells.saturating_mul(4);
+    let byte_budget = cells.saturating_mul(16);
     let mut bytes = 0;
     let mut truncated = false;
 
@@ -222,16 +220,16 @@ pub fn display_clip_meta(s: &str, cells: usize) -> DisplayClipMeta {
         };
     }
 
+    while width + 1 > cells
+        && let Some(last) = clusters.pop()
+    {
+        width -= UnicodeWidthStr::width(last);
+    }
     while clusters
         .last()
         .is_some_and(|cluster| cluster.chars().all(char::is_whitespace))
     {
         let last = clusters.pop().expect("last cluster exists");
-        width -= UnicodeWidthStr::width(last);
-    }
-    while width + 1 > cells
-        && let Some(last) = clusters.pop()
-    {
         width -= UnicodeWidthStr::width(last);
     }
     clusters.push("…");
@@ -243,6 +241,9 @@ pub fn display_clip_meta(s: &str, cells: usize) -> DisplayClipMeta {
     }
 }
 
+/// Render untrusted text clipped to at most `cells` display columns.
+/// Controls and format characters are replaced, leading zero-width characters
+/// are dropped, and a truncated value ends in an ellipsis without padding.
 pub fn display_clip(s: &str, cells: usize) -> String {
     display_clip_meta(s, cells).text
 }
@@ -1137,6 +1138,15 @@ mod tests {
     }
 
     #[test]
+    fn display_clip_keeps_wide_utf8_clusters_within_their_cell_budget() {
+        let script = "स्ते";
+        let clipped = display_clip_meta(script, 2);
+        assert_eq!(clipped.text, script);
+        assert_eq!(clipped.shown_cells, 2);
+        assert!(!clipped.truncated);
+    }
+
+    #[test]
     fn display_clip_keeps_combining_marks_with_their_base() {
         let clipped = display_clip("e\u{301}e\u{301}e\u{301}x", 3);
         assert!(!clipped.ends_with('\u{301}'), "{clipped:?}");
@@ -1148,6 +1158,7 @@ mod tests {
     fn display_clip_does_not_pad_and_matches_ascii_truncate() {
         assert_eq!(display_clip("short", 10), "short");
         assert_eq!(display_clip("hello world", 8), "hello w…");
+        assert_eq!(display_clip("hello world", 7), "hello…");
         assert_eq!(display_clip("ab", 1), "…");
         assert_eq!(display_clip("anything", 0), "");
     }
@@ -1218,8 +1229,8 @@ mod tests {
             assert!(clipped.is_empty() || !clipped.ends_with('\u{301}'));
         }
 
-        let combining = display_clip_meta("a\u{301}\u{302}b", 2);
-        assert_eq!(combining.text, "a…");
+        let combining = display_clip_meta("a\u{301}\u{302}bc", 2);
+        assert_eq!(combining.text, "a\u{301}\u{302}…");
         assert_eq!(combining.shown_cells, 2);
         assert!(combining.truncated);
 
