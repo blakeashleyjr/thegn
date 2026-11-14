@@ -3271,6 +3271,115 @@ mod tests {
     }
 
     #[test]
+    fn shutdown_escalates_when_server_ignores_stdin_eof() {
+        if !binary_on_path("sh") {
+            return;
+        }
+        let root = tempfile::tempdir().unwrap();
+        let (diagnostics, _) = diagnostics_channel();
+        let generation = diagnostics.register(root.path(), "stdin-eof").unwrap();
+        let client = LspClient::start_argv_with_identity(
+            &shell_argv("trap '' HUP; exec sleep 1\n"),
+            "fixture",
+            root.path(),
+            diagnostics,
+            "stdin-eof".into(),
+            generation,
+        )
+        .unwrap();
+
+        let started = Instant::now();
+        client.shutdown(Duration::from_millis(150));
+
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "shutdown exceeded its bounded escalation deadline: {:?}",
+            started.elapsed()
+        );
+        assert!(client.is_closed());
+        assert_eq!(client.reader_state(), (false, false));
+    }
+
+    #[test]
+    fn shutdown_detaches_reader_when_grandchild_holds_stdout_after_leader_exit() {
+        if !binary_on_path("sh") || !binary_on_path("setsid") {
+            return;
+        }
+        let root = tempfile::tempdir().unwrap();
+        let (diagnostics, _) = diagnostics_channel();
+        let generation = diagnostics.register(root.path(), "pipe-holder").unwrap();
+        let client = LspClient::start_argv_with_identity(
+            &shell_argv("setsid sh -c 'sleep 1' & exit 0\n"),
+            "fixture",
+            root.path(),
+            diagnostics,
+            "pipe-holder".into(),
+            generation,
+        )
+        .unwrap();
+
+        let leader_deadline = Instant::now() + Duration::from_secs(1);
+        loop {
+            let leader_exited = client
+                .child
+                .lock()
+                .unwrap()
+                .as_mut()
+                .unwrap()
+                .try_wait()
+                .unwrap()
+                .is_some();
+            if leader_exited || Instant::now() >= leader_deadline {
+                assert!(leader_exited, "shell leader did not exit");
+                break;
+            }
+            thread::sleep(Duration::from_millis(5));
+        }
+
+        let before = leaked_reader_count();
+        let started = Instant::now();
+        client.shutdown(Duration::from_millis(150));
+
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "shutdown hung on a grandchild-held stdout pipe: {:?}",
+            started.elapsed()
+        );
+        assert_eq!(client.reader_state(), (false, true));
+        assert!(leaked_reader_count() > before);
+    }
+
+    #[test]
+    fn natural_exit_racing_shutdown_is_idempotent() {
+        if !binary_on_path("sh") {
+            return;
+        }
+        let root = tempfile::tempdir().unwrap();
+        let (diagnostics, _) = diagnostics_channel();
+        let generation = diagnostics.register(root.path(), "natural-exit").unwrap();
+        let client = LspClient::start_argv_with_identity(
+            &shell_argv("exit 0\n"),
+            "fixture",
+            root.path(),
+            diagnostics,
+            "natural-exit".into(),
+            generation,
+        )
+        .unwrap();
+
+        let started = Instant::now();
+        client.shutdown(Duration::from_millis(150));
+        client.shutdown(Duration::from_millis(150));
+
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "repeated shutdown after natural exit was not bounded: {:?}",
+            started.elapsed()
+        );
+        assert_eq!(client.reader_state(), (false, false));
+    }
+
+    #[test]
     fn lifecycle_world_writable_server_is_refused() {
         if !cfg!(unix) {
             return;
@@ -3637,6 +3746,15 @@ mod tests {
             ": > \"$1\"; ( i=0; while [ $i -lt 200 ]; do echo x >> \"$1\"; i=$((i+1)); sleep 0.05; done ) & exec cat >/dev/null".into(),
             "lsp-heartbeat".into(),
             heartbeat.display().to_string(),
+        ]
+    }
+
+    fn shell_argv(script: &str) -> Vec<String> {
+        vec![
+            "sh".into(),
+            "-c".into(),
+            script.into(),
+            "lsp-fixture".into(),
         ]
     }
 
