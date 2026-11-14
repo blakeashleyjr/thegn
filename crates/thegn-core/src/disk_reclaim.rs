@@ -28,10 +28,10 @@
 //! stays silent while there is room.
 //!
 //! A separate generation rule limits accumulation inside an active `target/`:
-//! it requires an age floor and keeps the newest touched fingerprint footprint
-//! per package name. This is a retention invariant, not an oracle for whether
-//! Cargo will use an artifact in a future build, and it makes no bound on the
-//! resulting rebuild cost.
+//! it requires an age floor and keeps the two newest touched fingerprint
+//! footprints per package name. This is a retention invariant, not an oracle
+//! for whether Cargo will use an artifact in a future build, and it makes no
+//! bound on the resulting rebuild cost.
 //!
 //! **The worktree-level trade-off, stated plainly:** an unexpected cold rebuild
 //! costs an agent mid-task real wall-clock. Its guards keep cleanup away from a
@@ -135,11 +135,17 @@ pub struct Generation {
     pub bytes: u64,
 }
 
-/// Age floor for pruning generation footprints.
+/// Configured age floor for pruning generation footprints; the policy applies
+/// the shorter of this value and the one-day safety floor.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct GenerationPolicy {
     pub min_age_secs: u64,
 }
+
+/// Number of newest Cargo generations retained for every package.
+pub const GENERATION_KEEP_NEWEST: usize = 2;
+
+const GENERATION_SAFETY_FLOOR_SECS: u64 = 86_400;
 
 /// One hook log directly inside a worktree-slug directory.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -177,27 +183,19 @@ pub fn plan_hook_log_prune(
 }
 
 /// Earliest time an old generation might meet the age floor. `None` means all
-/// packages have only one generation, so no age passage alone can make a
-/// prune possible. The minimum is intentionally conservative: it includes
-/// every generation belonging to a package with at least two entries.
+/// packages have at most [`GENERATION_KEEP_NEWEST`] generations, so no age
+/// passage alone can make a prune possible. The configured age is capped at a
+/// one-day safety floor, matching [`plan_generations`].
 pub fn generation_recheck_after(inventory: &[Generation], policy: GenerationPolicy) -> Option<u64> {
-    let mut counts = std::collections::BTreeMap::<&str, usize>::new();
-    for generation in inventory {
-        *counts.entry(generation.package_name.as_str()).or_default() += 1;
-    }
-    inventory
-        .iter()
-        .filter(|generation| {
-            counts
-                .get(generation.package_name.as_str())
-                .copied()
-                .unwrap_or(0)
-                >= 2
-        })
-        .map(|generation| {
-            generation
-                .newest_mtime_secs
-                .saturating_add(policy.min_age_secs)
+    let age_floor = policy.min_age_secs.min(GENERATION_SAFETY_FLOOR_SECS);
+    generation_groups(inventory)
+        .into_values()
+        .filter_map(|mut generations| {
+            sort_generations_newest_first(&mut generations);
+            generations
+                .into_iter()
+                .nth(GENERATION_KEEP_NEWEST)
+                .map(|generation| generation.newest_mtime_secs.saturating_add(age_floor))
         })
         .min()
 }
@@ -211,55 +209,34 @@ pub struct GenerationEviction {
     pub bytes: u64,
 }
 
-/// Select old generations while preserving the most recently touched footprint
-/// for every package name. Equal mtimes retain the lexically greatest ID,
-/// giving a stable newest choice when timestamps have only second precision.
-/// Duplicate package/ID rows are ignored after their first occurrence.
+/// Select old generations while preserving the [`GENERATION_KEEP_NEWEST`]
+/// most recently touched footprints for every package name. Equal mtimes
+/// retain lexically greatest IDs, giving a stable newest choice when
+/// timestamps have only second precision. Duplicate package/ID rows are
+/// ignored after their first occurrence. Generations beyond the retained set
+/// use the shorter of the configured age and the one-day safety floor.
 pub fn plan_generations(
     inventory: &[Generation],
     policy: GenerationPolicy,
     now_secs: u64,
 ) -> Vec<GenerationEviction> {
-    use std::collections::{BTreeMap, BTreeSet};
-
-    let mut newest: BTreeMap<&str, (&str, u64)> = BTreeMap::new();
-    let mut seen = BTreeSet::new();
-    let mut unique = Vec::new();
-    for generation in inventory {
-        if !seen.insert((
-            generation.package_name.as_str(),
-            generation.generation_id.as_str(),
-        )) {
-            continue;
-        }
-        unique.push(generation);
-        let candidate = (
-            generation.generation_id.as_str(),
-            generation.newest_mtime_secs,
-        );
-        newest
-            .entry(&generation.package_name)
-            .and_modify(|current| {
-                if (candidate.1, candidate.0) > (current.1, current.0) {
-                    *current = candidate;
-                }
-            })
-            .or_insert(candidate);
-    }
-
-    let mut evictions: Vec<_> = unique
-        .iter()
-        .filter(|generation| {
-            let Some((newest_id, _)) = newest.get(generation.package_name.as_str()) else {
-                return false;
-            };
-            generation.generation_id.as_str() != *newest_id
-                && now_secs.saturating_sub(generation.newest_mtime_secs) >= policy.min_age_secs
-        })
-        .map(|generation| GenerationEviction {
-            package_name: generation.package_name.clone(),
-            generation_id: generation.generation_id.clone(),
-            bytes: generation.bytes,
+    let age_floor = policy.min_age_secs.min(GENERATION_SAFETY_FLOOR_SECS);
+    let mut evictions: Vec<_> = generation_groups(inventory)
+        .into_values()
+        .flat_map(|mut generations| {
+            sort_generations_newest_first(&mut generations);
+            generations
+                .into_iter()
+                .skip(GENERATION_KEEP_NEWEST)
+                .filter(|generation| {
+                    now_secs.saturating_sub(generation.newest_mtime_secs) >= age_floor
+                })
+                .map(|generation| GenerationEviction {
+                    package_name: generation.package_name.clone(),
+                    generation_id: generation.generation_id.clone(),
+                    bytes: generation.bytes,
+                })
+                .collect::<Vec<_>>()
         })
         .collect();
     evictions.sort_by(|a, b| {
@@ -268,6 +245,35 @@ pub fn plan_generations(
             .then(a.generation_id.cmp(&b.generation_id))
     });
     evictions
+}
+
+fn generation_groups(
+    inventory: &[Generation],
+) -> std::collections::BTreeMap<&str, Vec<&Generation>> {
+    use std::collections::{BTreeMap, BTreeSet};
+
+    let mut groups = BTreeMap::new();
+    let mut seen = BTreeSet::new();
+    for generation in inventory {
+        if seen.insert((
+            generation.package_name.as_str(),
+            generation.generation_id.as_str(),
+        )) {
+            groups
+                .entry(generation.package_name.as_str())
+                .or_insert_with(Vec::new)
+                .push(generation);
+        }
+    }
+    groups
+}
+
+fn sort_generations_newest_first(generations: &mut [&Generation]) {
+    generations.sort_by(|a, b| {
+        b.newest_mtime_secs
+            .cmp(&a.newest_mtime_secs)
+            .then(b.generation_id.cmp(&a.generation_id))
+    });
 }
 
 /// Below this a `target/` is not worth a cold rebuild: an empty or barely-warm
@@ -535,6 +541,13 @@ mod tests {
     }
 
     #[test]
+    fn active_worktree_survives_low_disk_whole_target_reclaim() {
+        let mut active = cand("/wt/active", 16, 30);
+        active.active = true;
+        assert!(plan(&[active], &policy(), Some(pressure(2))).is_empty());
+    }
+
+    #[test]
     fn a_tiny_target_is_not_worth_a_cold_rebuild() {
         let mut small = cand("/wt/small", 0, 90);
         small.target_bytes = MIN_RECLAIM_BYTES - 1;
@@ -652,9 +665,10 @@ mod tests {
     }
 
     #[test]
-    fn generation_policy_keeps_newest_per_package_and_respects_age_floor() {
+    fn generation_policy_keeps_newest_two_per_package_and_respects_age_floor() {
         let inventory = [
             generation("thegn_core", "old", 10, 100),
+            generation("thegn_core", "middle", 20, 150),
             generation("thegn_core", "young", 95, 200),
             generation("thegn_core", "newest", 100, 300),
             generation("other", "only", 1, 400),
@@ -662,23 +676,37 @@ mod tests {
         let got = plan_generations(&inventory, GenerationPolicy { min_age_secs: 10 }, 100);
         assert_eq!(
             got,
-            vec![GenerationEviction {
-                package_name: "thegn_core".into(),
-                generation_id: "old".into(),
-                bytes: 100
-            }]
+            vec![
+                GenerationEviction {
+                    package_name: "thegn_core".into(),
+                    generation_id: "middle".into(),
+                    bytes: 150
+                },
+                GenerationEviction {
+                    package_name: "thegn_core".into(),
+                    generation_id: "old".into(),
+                    bytes: 100
+                }
+            ]
         );
     }
 
     #[test]
     fn generation_policy_handles_floor_boundary_future_times_ties_and_duplicates() {
         let inventory = [
-            generation("pkg", "a", 90, 11),
-            generation("pkg", "b", 90, 12),
-            generation("pkg", "future", 110, 13),
+            generation("pkg", "a", 0, 11),
+            generation("pkg", "b", 0, 12),
+            generation("pkg", "c", 0, 13),
+            generation("pkg", "future", 110, 14),
             generation("pkg", "a", 90, 99), // duplicate identity uses first row
         ];
-        let got = plan_generations(&inventory, GenerationPolicy { min_age_secs: 10 }, 100);
+        let got = plan_generations(
+            &inventory,
+            GenerationPolicy {
+                min_age_secs: 14 * 86_400,
+            },
+            86_400,
+        );
         assert_eq!(
             got,
             vec![
@@ -690,7 +718,7 @@ mod tests {
                 GenerationEviction {
                     package_name: "pkg".into(),
                     generation_id: "b".into(),
-                    bytes: 12
+                    bytes: 12,
                 }
             ]
         );
@@ -703,6 +731,17 @@ mod tests {
                 100
             )
             .is_empty()
+        );
+    }
+
+    #[test]
+    fn two_generations_are_never_evicted_even_when_they_are_old() {
+        let inventory = [
+            generation("pkg", "old", 0, 1),
+            generation("pkg", "new", 1, 2),
+        ];
+        assert!(
+            plan_generations(&inventory, GenerationPolicy { min_age_secs: 0 }, u64::MAX).is_empty()
         );
     }
 
@@ -745,15 +784,27 @@ mod tests {
     }
 
     #[test]
-    fn generation_recheck_uses_oldest_candidate_and_ignores_singletons() {
+    fn generation_recheck_uses_oldest_candidate_and_ignores_retained_rows() {
         let policy = GenerationPolicy { min_age_secs: 10 };
         let rows = [
             generation("multi", "a", 20, 1),
             generation("multi", "b", 50, 1),
+            generation("multi", "c", 60, 1),
+            generation("pair", "a", 0, 1),
+            generation("pair", "b", 1, 1),
             generation("single", "only", 0, 1),
         ];
         assert_eq!(generation_recheck_after(&rows, policy), Some(30));
-        assert_eq!(generation_recheck_after(&rows[2..], policy), None);
+        assert_eq!(
+            generation_recheck_after(
+                &rows[..3],
+                GenerationPolicy {
+                    min_age_secs: 14 * 86_400,
+                }
+            ),
+            Some(86_420)
+        );
+        assert_eq!(generation_recheck_after(&rows[3..], policy), None);
         assert_eq!(generation_recheck_after(&[], policy), None);
     }
 }

@@ -22,7 +22,6 @@ static LAST_WALK: OnceLock<Mutex<std::collections::HashMap<std::path::PathBuf, i
 #[cfg(test)]
 thread_local! {
     static GENERATION_INVENTORY_CALLS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
-    static GENERATION_STATUS_PROBES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
 fn fingerprint_mtime(profile_dir: &std::path::Path) -> Option<u128> {
@@ -277,12 +276,22 @@ pub(crate) fn spawn_scan(
             walked += 1;
         }
 
+        // The active checkout is marked due whenever its cache stamp is stale,
+        // but a recently stamped checkout can pass the lazy gate. Generation
+        // pruning is independent of the size measurement, so keep the active
+        // path in the measured set as a direct fallback for that case.
+        if let Some(active_path) = active.as_deref()
+            && !fresh.iter().any(|(path, _)| path == active_path)
+        {
+            fresh.push((
+                active_path.to_owned(),
+                thegn_core::disk::DiskUsage::default(),
+            ));
+        }
+
         let reclaimed = reclaim(&db, &policy, &fresh, active.as_deref());
-        let awaiting = db.worktrees_with_active_dispatch().unwrap_or_default();
         let generation_reclaimed = reap_generation_footprints(
             &fresh,
-            active.as_deref(),
-            &awaiting,
             cfg.generation_min_age_days,
             thegn_core::util::now().max(0) as u64,
         );
@@ -468,8 +477,6 @@ struct GenerationFootprint {
 /// begin a profile build midway through pruning.
 fn reap_generation_footprints(
     fresh: &[(String, thegn_core::disk::DiskUsage)],
-    active: Option<&str>,
-    awaiting_verification: &[String],
     min_age_days: u32,
     now_secs: u64,
 ) -> u64 {
@@ -482,50 +489,82 @@ fn reap_generation_footprints(
         let target = worktree_path.join("target");
         let profiles = [target.join("debug"), target.join("release")];
         let min_age_secs = u64::from(min_age_days).saturating_mul(86_400);
-        let prunable_profiles: Vec<_> = profiles
-            .iter()
-            .filter(|profile| {
-                safe_regular_file(&profile.join(".cargo-lock"))
-                    && safe_directory(profile)
-                    && fingerprint_mtime(profile).is_some()
-            })
-            .collect();
-        if prunable_profiles.is_empty()
-            || prunable_profiles
-                .iter()
-                .all(|profile| generation_memoized(profile, min_age_secs, now_secs))
-        {
-            continue;
-        }
-        // `git_out` collapses EMPTY stdout to `None`, and an empty
-        // `status --porcelain` is precisely "clean" — the only state we may
-        // prune in. Using it here made this guard skip every clean worktree, so
-        // the reclaim never ran at all. `git_out_allow_empty` keeps "clean"
-        // (`Some("")`) distinct from "git failed" (`None`), and a failed status
-        // read must still refuse.
-        if active == Some(worktree.as_str())
-            || awaiting_verification.iter().any(|path| path == worktree)
-            || crate::task::slot_active(worktree_path)
-            || {
-                #[cfg(test)]
-                GENERATION_STATUS_PROBES.with(|calls| calls.set(calls.get() + 1));
-                thegn_core::util::git_out_allow_empty(worktree_path, &["status", "--porcelain"])
-                    .is_none_or(|output| !output.trim().is_empty())
+        if crate::task::slot_active(worktree_path) {
+            for profile_dir in &profiles {
+                tracing::debug!(
+                    target: LOG,
+                    profile = %profile_dir.display(),
+                    reason = "slot_active",
+                    "generation prune skipped"
+                );
             }
-        {
             continue;
         }
         for profile_dir in profiles {
             let lock_path = profile_dir.join(".cargo-lock");
+            if !profile_dir.is_dir() {
+                tracing::debug!(
+                    target: LOG,
+                    profile = %profile_dir.display(),
+                    reason = "not_cargo_profile",
+                    "generation prune skipped"
+                );
+                continue;
+            }
+            if !safe_directory(&profile_dir) {
+                tracing::debug!(
+                    target: LOG,
+                    profile = %profile_dir.display(),
+                    reason = "unsafe_profile",
+                    "generation prune skipped"
+                );
+                continue;
+            }
             // Do not create a missing Cargo lock file. No existing lock means
             // this profile is not a Cargo profile we can safely synchronize.
-            if !safe_regular_file(&lock_path) || !safe_directory(&profile_dir) {
+            if !lock_path.exists() {
+                tracing::debug!(
+                    target: LOG,
+                    profile = %profile_dir.display(),
+                    reason = "not_cargo_profile",
+                    "generation prune skipped"
+                );
+                continue;
+            }
+            if !safe_regular_file(&lock_path) {
+                tracing::debug!(
+                    target: LOG,
+                    profile = %profile_dir.display(),
+                    reason = "unsafe_profile",
+                    "generation prune skipped"
+                );
+                continue;
+            }
+            if fingerprint_mtime(&profile_dir).is_none() {
+                tracing::debug!(
+                    target: LOG,
+                    profile = %profile_dir.display(),
+                    reason = "not_cargo_profile",
+                    "generation prune skipped"
+                );
                 continue;
             }
             if generation_memoized(&profile_dir, min_age_secs, now_secs) {
+                tracing::debug!(
+                    target: LOG,
+                    profile = %profile_dir.display(),
+                    reason = "memoised_noop",
+                    "generation prune skipped"
+                );
                 continue;
             }
             let Ok(lock) = OpenOptions::new().read(true).write(true).open(&lock_path) else {
+                tracing::debug!(
+                    target: LOG,
+                    profile = %profile_dir.display(),
+                    reason = "unsafe_profile",
+                    "generation prune skipped"
+                );
                 continue;
             };
             // `File::try_lock` returns `Ok(())` only after acquiring the lock;
@@ -534,6 +573,7 @@ fn reap_generation_footprints(
                 tracing::debug!(
                     target: LOG,
                     profile = %profile_dir.display(),
+                    reason = "lock_held",
                     planned_bytes = 0u64,
                     removed_bytes = 0u64,
                     failures = 1usize,
@@ -885,15 +925,20 @@ mod generation_tests {
         ));
         let profile = root.join("target/debug");
         fs::create_dir_all(profile.join(".fingerprint/pkg-a")).unwrap();
+        fs::create_dir_all(profile.join(".fingerprint/pkg-m")).unwrap();
         fs::create_dir_all(profile.join(".fingerprint/pkg-z")).unwrap();
         fs::create_dir_all(profile.join("deps")).unwrap();
         fs::create_dir_all(profile.join("incremental/pkg-a")).unwrap();
         fs::write(profile.join(".cargo-lock"), []).unwrap();
         fs::write(profile.join(".fingerprint/pkg-a/lib-pkg"), b"fingerprint-a").unwrap();
+        fs::write(profile.join(".fingerprint/pkg-m/lib-pkg"), b"fingerprint-m").unwrap();
         fs::write(profile.join(".fingerprint/pkg-z/lib-pkg"), b"fingerprint-z").unwrap();
         fs::write(profile.join("deps/libpkg-a.rlib"), b"artifact-a").unwrap();
         fs::write(profile.join("deps/pkg-a.d"), b"dep-info-a").unwrap();
         fs::write(profile.join("deps/pkg-a"), b"executable-a").unwrap();
+        fs::write(profile.join("deps/libpkg-m.rlib"), b"artifact-m").unwrap();
+        fs::write(profile.join("deps/pkg-m.d"), b"dep-info-m").unwrap();
+        fs::write(profile.join("deps/pkg-m"), b"executable-m").unwrap();
         fs::write(profile.join("deps/libpkg-z.rlib"), b"artifact-z").unwrap();
         fs::write(profile.join("deps/pkg-z.d"), b"dep-info-z").unwrap();
         fs::write(profile.join("deps/pkg-z"), b"executable-z").unwrap();
@@ -930,41 +975,24 @@ mod generation_tests {
             thegn_core::disk::DiskUsage::default(),
         )];
         assert_eq!(
-            reap_generation_footprints(
-                &fresh,
-                None,
-                &[],
-                14,
-                thegn_core::util::now().max(0) as u64,
-            ),
+            reap_generation_footprints(&fresh, 14, thegn_core::util::now().max(0) as u64,),
             0
         );
         GENERATION_INVENTORY_CALLS.with(|calls| assert_eq!(calls.get(), 2));
         assert_eq!(
-            reap_generation_footprints(
-                &fresh,
-                None,
-                &[],
-                14,
-                thegn_core::util::now().max(0) as u64,
-            ),
+            reap_generation_footprints(&fresh, 14, thegn_core::util::now().max(0) as u64,),
             0
         );
         GENERATION_INVENTORY_CALLS.with(|calls| assert_eq!(calls.get(), 2));
 
         fs::write(debug_profile.join(".fingerprint/touched"), b"mtime change").unwrap();
         assert_eq!(
-            reap_generation_footprints(
-                &fresh,
-                None,
-                &[],
-                14,
-                thegn_core::util::now().max(0) as u64,
-            ),
+            reap_generation_footprints(&fresh, 14, thegn_core::util::now().max(0) as u64,),
             0
         );
         GENERATION_INVENTORY_CALLS.with(|calls| assert_eq!(calls.get(), 3));
         assert!(debug_profile.join(".fingerprint/pkg-a").exists());
+        assert!(debug_profile.join(".fingerprint/pkg-m").exists());
         assert!(debug_profile.join(".fingerprint/pkg-z").exists());
         assert!(debug_profile.join("deps/libpkg-a.rlib").exists());
         assert!(debug_profile.join("deps/libpkg-z.rlib").exists());
@@ -974,25 +1002,21 @@ mod generation_tests {
     }
 
     #[test]
-    fn memoized_debug_only_profile_skips_git_status_probe() {
+    fn memoized_debug_only_profile_skips_inventory() {
         let (root, _) = profile_tree();
         GENERATION_INVENTORY_CALLS.with(|calls| calls.set(0));
-        GENERATION_STATUS_PROBES.with(|calls| calls.set(0));
         let fresh = [(
             root.to_string_lossy().into_owned(),
             thegn_core::disk::DiskUsage::default(),
         )];
         let now = thegn_core::util::now().max(0) as u64;
-        assert_eq!(reap_generation_footprints(&fresh, None, &[], 14, now), 0);
-        GENERATION_STATUS_PROBES.with(|calls| assert_eq!(calls.get(), 1));
+        assert_eq!(reap_generation_footprints(&fresh, 14, now), 0);
         GENERATION_INVENTORY_CALLS.with(|calls| assert_eq!(calls.get(), 1));
 
-        assert_eq!(reap_generation_footprints(&fresh, None, &[], 14, now), 0);
-        GENERATION_STATUS_PROBES.with(|calls| assert_eq!(calls.get(), 1));
+        assert_eq!(reap_generation_footprints(&fresh, 14, now), 0);
         GENERATION_INVENTORY_CALLS.with(|calls| assert_eq!(calls.get(), 1));
 
-        assert_eq!(reap_generation_footprints(&fresh, None, &[], 13, now), 0);
-        GENERATION_STATUS_PROBES.with(|calls| assert_eq!(calls.get(), 2));
+        assert_eq!(reap_generation_footprints(&fresh, 13, now), 0);
         GENERATION_INVENTORY_CALLS.with(|calls| assert_eq!(calls.get(), 2));
         fs::remove_dir_all(root).unwrap();
     }
@@ -1004,8 +1028,6 @@ mod generation_tests {
         let usage = thegn_core::disk::DiskUsage::default();
         let removed = reap_generation_footprints(
             &[(root.to_string_lossy().into_owned(), usage)],
-            None,
-            &[],
             0,
             u64::MAX,
         );
@@ -1016,11 +1038,12 @@ mod generation_tests {
         assert!(!profile.join("deps/pkg-a").exists());
         assert!(!profile.join("incremental/pkg-a").exists());
         assert!(profile.join(".fingerprint/pkg-z").exists());
+        assert!(profile.join(".fingerprint/pkg-m").exists());
         assert!(profile.join("deps/libpkg-z.rlib").exists());
         assert!(profile.join("deps/pkg-z.d").exists());
         assert!(profile.join("deps/pkg-z").exists());
         assert!(profile.join("deps/libpkgx-a.rlib").exists());
-        assert_eq!(before, 2);
+        assert_eq!(before, 3);
         fs::remove_dir_all(root).unwrap();
     }
 
@@ -1038,8 +1061,6 @@ mod generation_tests {
                 root.to_string_lossy().into_owned(),
                 thegn_core::disk::DiskUsage::default(),
             )],
-            None,
-            &[],
             0,
             u64::MAX,
         );
@@ -1050,7 +1071,7 @@ mod generation_tests {
     }
 
     #[test]
-    fn dirty_worktree_is_exempt_from_generation_pruning() {
+    fn dirty_worktree_is_pruned_for_generation_pruning() {
         let (root, profile) = profile_tree();
         fs::write(root.join("uncommitted.txt"), b"work in progress").unwrap();
         let removed = reap_generation_footprints(
@@ -1058,18 +1079,16 @@ mod generation_tests {
                 root.to_string_lossy().into_owned(),
                 thegn_core::disk::DiskUsage::default(),
             )],
-            None,
-            &[],
             0,
             u64::MAX,
         );
-        assert_eq!(removed, 0);
-        assert!(profile.join(".fingerprint/pkg-a").exists());
+        assert!(removed > 0);
+        assert!(!profile.join(".fingerprint/pkg-a").exists());
         fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
-    fn active_worktree_is_exempt_from_generation_pruning() {
+    fn active_worktree_is_pruned_for_generation_pruning() {
         let (root, profile) = profile_tree();
         let worktree = root.to_string_lossy().into_owned();
         // `slot_active` consults only the in-process job registry; it does not
@@ -1077,13 +1096,11 @@ mod generation_tests {
         assert!(!crate::task::slot_active(&root));
         let removed = reap_generation_footprints(
             &[(worktree.clone(), thegn_core::disk::DiskUsage::default())],
-            Some(&worktree),
-            &[],
             0,
             u64::MAX,
         );
-        assert_eq!(removed, 0);
-        assert!(profile.join(".fingerprint/pkg-a").exists());
+        assert!(removed > 0);
+        assert!(!profile.join(".fingerprint/pkg-a").exists());
         fs::remove_dir_all(root).unwrap();
     }
 
@@ -1095,12 +1112,15 @@ mod generation_tests {
 
         let release = root.join("target/release");
         fs::create_dir_all(release.join(".fingerprint/pkg-a")).unwrap();
+        fs::create_dir_all(release.join(".fingerprint/pkg-m")).unwrap();
         fs::create_dir_all(release.join(".fingerprint/pkg-z")).unwrap();
         fs::create_dir_all(release.join("deps")).unwrap();
         fs::write(release.join(".cargo-lock"), []).unwrap();
         fs::write(release.join(".fingerprint/pkg-a/marker"), b"a").unwrap();
+        fs::write(release.join(".fingerprint/pkg-m/marker"), b"m").unwrap();
         fs::write(release.join(".fingerprint/pkg-z/marker"), b"z").unwrap();
         fs::write(release.join("deps/libpkg-a.rlib"), b"artifact-a").unwrap();
+        fs::write(release.join("deps/libpkg-m.rlib"), b"artifact-m").unwrap();
         fs::write(release.join("deps/libpkg-z.rlib"), b"artifact-z").unwrap();
 
         let removed = reap_generation_footprints(
@@ -1108,29 +1128,26 @@ mod generation_tests {
                 root.to_string_lossy().into_owned(),
                 thegn_core::disk::DiskUsage::default(),
             )],
-            None,
-            &[],
             0,
             u64::MAX,
         );
         assert!(removed > 0);
         assert!(debug_profile.join(".fingerprint").is_file());
         assert!(!release.join(".fingerprint/pkg-a").exists());
+        assert!(release.join(".fingerprint/pkg-m").exists());
         assert!(release.join(".fingerprint/pkg-z").exists());
         fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
-    fn worktree_without_target_skips_git_status_probe() {
+    fn worktree_without_target_skips_generation_pruning() {
         let root = tempfile::tempdir().unwrap();
-        GENERATION_STATUS_PROBES.with(|calls| calls.set(0));
         let fresh = [(
             root.path().to_string_lossy().into_owned(),
             thegn_core::disk::DiskUsage::default(),
         )];
 
-        assert_eq!(reap_generation_footprints(&fresh, None, &[], 14, 0), 0);
-        GENERATION_STATUS_PROBES.with(|calls| assert_eq!(calls.get(), 0));
+        assert_eq!(reap_generation_footprints(&fresh, 14, 0), 0);
     }
 
     #[test]
