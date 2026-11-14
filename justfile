@@ -1174,8 +1174,9 @@ term-check: build
 # Point THIS repo (all its worktrees) at a sandbox backend / managed-sandbox
 # provider. Writes a per-repo `.thegn.toml` overlay at the main worktree.
 # Existing overlays are replaced only when absent or byte-for-byte equal to a
-# backend value generated here; unrelated hand-written content must be edited
-# by hand. The stdlib script serializes Sprites config writes with thegn's
+# backend value generated here. Hand-written overlays are refused by design;
+# only generated overlays apply, so unrelated content must be edited by hand.
+# The stdlib script serializes Sprites config writes with thegn's
 # config-writer lock, generation-checks both destinations, fsyncs installs and
 # restores the prior global config if the overlay install fails.
 # Empty `backend` is a no-op. To revert the overlay, remove it from the main
