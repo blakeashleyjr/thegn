@@ -49,7 +49,7 @@ pub trait NotificationStore {
     ) -> Result<bool>;
 
     /// Replace and re-arm a notification identified by its kind, source, and
-    /// worktree. Returns the number of rows updated.
+    /// worktree when the message changed. Returns the number of rows updated.
     fn update_notification_message_by_source(
         &self,
         kind: &str,

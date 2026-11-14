@@ -174,7 +174,7 @@ impl NotificationStore for Db {
         worktree_path: &str,
     ) -> Result<usize> {
         Ok(self.conn().execute(
-            "UPDATE notifications SET message=?3, read=0 WHERE kind=?1 AND issue_id=?2 AND worktree_path=?4",
+            "UPDATE notifications SET message=?3, read=0 WHERE kind=?1 AND issue_id=?2 AND worktree_path=?4 AND message<>?3",
             params![kind, source_ref, message, worktree_path],
         )?)
     }
