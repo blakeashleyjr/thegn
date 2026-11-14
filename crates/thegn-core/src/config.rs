@@ -3482,9 +3482,11 @@ pub struct DiskConfig {
     /// an unexpected cold rebuild costs an agent mid-task real wall-clock.
     #[schemars(range(max = "crate::time_policy::MAX_DURATION_DAYS"))]
     pub idle_clean_days: u32,
-    /// Reap stale Cargo fingerprint generations only after this many untouched
-    /// days. Defaults to the same conservative two-week floor as
-    /// `idle_clean_days`; the newest footprint for each package is always kept.
+    /// Reap Cargo fingerprint generations beyond the two newest per package
+    /// after this many untouched days, capped at a one-day safety floor.
+    /// Defaults to two weeks; the newest two footprints for each package are
+    /// always kept, so the configured value remains an upper age bound without
+    /// allowing an active target to grow indefinitely.
     #[schemars(range(max = "crate::time_policy::MAX_DURATION_DAYS"))]
     pub generation_min_age_days: u32,
     /// Under genuine disk pressure, evict least-recently-touched `target/` dirs
