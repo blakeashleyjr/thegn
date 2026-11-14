@@ -959,6 +959,7 @@ impl DiagnosticsReceiver {
 mod tests {
     use super::*;
     use crate::lsp::LspSeverity;
+    use std::path::Path;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     fn diag(message: &str) -> LspDiagnostic {
@@ -983,6 +984,7 @@ mod tests {
         PublishedDiagnostics {
             root: PathBuf::from(root),
             path: path.into(),
+            scope: classify_location(Path::new(root), Path::new(path)),
             diagnostics,
             server_identity: identity.into(),
             generation,
