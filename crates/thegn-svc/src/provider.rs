@@ -2254,13 +2254,15 @@ if mkdir -m 0700 -- "$1" 2>/dev/null; then
     exit 1
 fi
 if [ -d "$1" ] && [ "$(find "$1" -maxdepth 0 -mmin +$3 -print 2>/dev/null)" = "$1" ]; then
-    rm -rf -- "$1"
-    if mkdir -m 0700 -- "$1" 2>/dev/null; then
-        if printf '%s\n' "$2" > "$1/owner"; then
-            exit 0
+    if mkdir -- "$1.reclaim" 2>/dev/null; then
+        if [ -d "$1" ] && [ "$(find "$1" -maxdepth 0 -mmin +"$3" -print 2>/dev/null)" = "$1" ]; then
+            rm -rf -- "$1"
+            if mkdir -m 0700 -- "$1" 2>/dev/null && printf '%s\n' "$2" > "$1/owner"; then
+                rmdir -- "$1.reclaim"
+                exit 0
+            fi
         fi
-        rmdir -- "$1" 2>/dev/null || true
-        exit 1
+        rmdir -- "$1.reclaim"
     fi
 fi
 exit 75
@@ -2273,8 +2275,9 @@ fi
 exit 0
 "#;
 const INSTALL_PRESERVE_SCRIPT: &str = r#"
+rm -f -- "$2" || exit 1
 if [ -e "$1" ]; then
-    mv -f -- "$1" "$2"
+    ln -- "$1" "$2" 2>/dev/null || cp -p -- "$1" "$2" || exit 1
 fi
 "#;
 const INSTALL_RESTORE_SCRIPT: &str = r#"
@@ -2288,9 +2291,9 @@ const INSTALL_REMOVE_PREVIOUS_SCRIPT: &str = r#"
 rm -f -- "$1"
 "#;
 
-fn install_shell_argv(script: &str, args: &[&str]) -> Vec<String> {
+fn install_shell_argv(name: &str, script: &str, args: &[&str]) -> Vec<String> {
     let mut argv = vec!["/bin/sh".to_string(), "-c".to_string(), script.to_string()];
-    argv.push("thegn-install".to_string());
+    argv.push(name.to_string());
     argv.extend(args.iter().map(|arg| (*arg).to_string()));
     argv
 }
@@ -2350,6 +2353,7 @@ where
     }
 }
 
+#[allow(clippy::too_many_arguments)] // each install step is an injected seam for the in-memory tests
 async fn install_executable_verified<A, AFut, R, RFut, B, BFut, P, PFut, T, TFut, C, CFut>(
     files: &dyn ProviderFiles,
     id: &str,
@@ -2466,13 +2470,11 @@ where
     };
 
     if let Err(error) = remove_previous().await {
-        delete_install_stage(files, id, &stage).await;
-        release_install_lease(&mut release).await;
-        return Err(InstallError::Previous(error).into());
+        tracing::warn!(target: "thegn::provider", %error, "previous executable generation cleanup failed");
     }
     let fp_path = format!("{path}.fp");
     if let Err(error) = files.delete(id, &fp_path).await {
-        tracing::warn!(target: "thegn::provider", %error, "best-effort legacy executable fingerprint cleanup failed");
+        tracing::debug!(target: "thegn::provider", %error, "best-effort legacy executable fingerprint cleanup failed");
     }
     release_install_lease(&mut release).await;
     Ok(true)
@@ -3547,8 +3549,10 @@ impl Provider {
     /// A per-destination lease serializes installers; stale leases expire after
     /// five minutes. SHA-256 is checked against the remote bytes themselves;
     /// uploads go to a staging sibling, are read back and verified, then the
-    /// prior generation is moved to `<path>.tg-prev` before publishing with
+    /// prior generation is hard-linked to `<path>.tg-prev` before publishing with
     /// `mv -f`. A failed post-publish verification restores that generation.
+    /// A crashed lease reclaimer leaves `<path>.tg-lease.reclaim`, which reports
+    /// Busy until it is removed.
     /// The legacy `<path>.fp` sidecar is ignored and best-effort removed. Returns
     /// whether it pushed (`true`) or the remote executable was already current
     /// (`false`). Requires the provider's file API (`caps().files`).
@@ -3576,6 +3580,7 @@ impl Provider {
                     .run_exec(
                         &lease_id,
                         &install_shell_argv(
+                            "thegn-install-lease",
                             INSTALL_LEASE_ACQUIRE_SCRIPT,
                             &[
                                 &lease_path_for_acquire,
@@ -3602,6 +3607,7 @@ impl Provider {
                         .run_exec(
                             &lease_id,
                             &install_shell_argv(
+                                "thegn-install-release",
                                 INSTALL_LEASE_RELEASE_SCRIPT,
                                 &[&lease_path, &owner],
                             ),
@@ -3625,6 +3631,7 @@ impl Provider {
                         .run_exec(
                             &previous_id,
                             &install_shell_argv(
+                                "thegn-install-preserve",
                                 INSTALL_PRESERVE_SCRIPT,
                                 &[&target_path, &previous_path],
                             ),
@@ -3675,6 +3682,7 @@ impl Provider {
                         .run_exec(
                             &rollback_id,
                             &install_shell_argv(
+                                "thegn-install-restore",
                                 INSTALL_RESTORE_SCRIPT,
                                 &[&target_path, &previous_path],
                             ),
@@ -3697,7 +3705,11 @@ impl Provider {
                     let (code, output) = self
                         .run_exec(
                             &cleanup_id,
-                            &install_shell_argv(INSTALL_REMOVE_PREVIOUS_SCRIPT, &[&previous_path]),
+                            &install_shell_argv(
+                                "thegn-install-cleanup",
+                                INSTALL_REMOVE_PREVIOUS_SCRIPT,
+                                &[&previous_path],
+                            ),
                             None,
                             &[],
                         )
@@ -4097,13 +4109,23 @@ mod tests {
     struct MemFiles {
         files: std::sync::Mutex<HashMap<String, Vec<u8>>>,
         corrupt_stage: bool,
+        fail_remove_previous: bool,
     }
 
     impl MemFiles {
         fn new(files: HashMap<String, Vec<u8>>, corrupt_stage: bool) -> Self {
+            Self::with_remove_previous_failure(files, corrupt_stage, false)
+        }
+
+        fn with_remove_previous_failure(
+            files: HashMap<String, Vec<u8>>,
+            corrupt_stage: bool,
+            fail_remove_previous: bool,
+        ) -> Self {
             Self {
                 files: std::sync::Mutex::new(files),
                 corrupt_stage,
+                fail_remove_previous,
             }
         }
 
@@ -4132,7 +4154,8 @@ mod tests {
                 .files
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
-            if let Some(bytes) = files.remove(path) {
+            files.remove(previous);
+            if let Some(bytes) = files.get(path).cloned() {
                 files.insert(previous.to_string(), bytes);
             }
             Ok(())
@@ -4152,12 +4175,46 @@ mod tests {
         }
 
         fn remove_previous(&self, previous: &str) -> Result<()> {
+            if self.fail_remove_previous {
+                return Err(anyhow!("remove previous refused"));
+            }
             self.files
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .remove(previous);
             Ok(())
         }
+    }
+
+    #[test]
+    fn install_lease_reclaim_rechecks_staleness_under_atomic_guard() {
+        assert!(
+            INSTALL_LEASE_ACQUIRE_SCRIPT.contains("if mkdir -- \"$1.reclaim\" 2>/dev/null; then")
+        );
+        assert!(
+            INSTALL_LEASE_ACQUIRE_SCRIPT
+                .contains("find \"$1\" -maxdepth 0 -mmin +\"$3\" -print 2>/dev/null")
+        );
+    }
+
+    #[test]
+    fn preserve_clears_stale_previous_when_target_is_absent() {
+        let path = "/w/.tg/thegn";
+        let previous = format!("{path}.tg-prev");
+        let files = MemFiles::new(
+            HashMap::from([(previous.clone(), b"stale".to_vec())]),
+            false,
+        );
+
+        files.preserve(path, &previous).unwrap();
+
+        let stored = files
+            .files
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        assert!(!stored.contains_key(&previous));
+        assert!(INSTALL_PRESERVE_SCRIPT.contains("rm -f -- \"$2\" || exit 1"));
+        assert!(INSTALL_PRESERVE_SCRIPT.contains("ln -- \"$1\" \"$2\""));
     }
 
     #[derive(Clone)]
@@ -4230,24 +4287,19 @@ mod tests {
                 Ok(())
             },
             {
-                let files = files;
                 let path = path.to_string();
                 let previous = previous.clone();
                 move || async move { files.preserve(&path, &previous) }
             },
-            move |stage, dest| publish(stage, dest),
+            publish,
             {
-                let files = files;
                 let path = path.to_string();
                 move || {
                     let previous = format!("{path}.tg-prev");
                     async move { files.restore(&path, &previous) }
                 }
             },
-            {
-                let files = files;
-                move || async move { files.remove_previous(&previous) }
-            },
+            { move || async move { files.remove_previous(&previous) } },
         )
         .await
     }
@@ -4534,6 +4586,7 @@ mod tests {
         let path = "/w/.tg/thegn";
         let files = MemFiles::new(HashMap::new(), false);
         let lease = TestLease::new();
+        let mem = &files;
         lease.held.store(true, std::sync::atomic::Ordering::SeqCst);
         lease.stale.store(true, std::sync::atomic::Ordering::SeqCst);
         let result = test_install(
@@ -4542,7 +4595,7 @@ mod tests {
             path,
             b"new binary",
             lease.clone(),
-            |stage, dest| async move { files.publish(&stage, &dest) },
+            |stage, dest| async move { mem.publish(&stage, &dest) },
         )
         .await
         .unwrap();
@@ -4555,6 +4608,7 @@ mod tests {
         let path = "/w/.tg/thegn";
         let files = MemFiles::new(HashMap::from([(path.into(), b"prior".to_vec())]), false);
         let lease = TestLease::new();
+        let mem = &files;
         let result = test_install(
             &files,
             "id",
@@ -4562,9 +4616,8 @@ mod tests {
             b"new binary",
             lease.clone(),
             |stage, dest| async move {
-                files.publish(&stage, &dest)?;
-                files
-                    .files
+                mem.publish(&stage, &dest)?;
+                mem.files
                     .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner)
                     .insert(dest, b"corrupt after publish".to_vec());
@@ -4591,18 +4644,53 @@ mod tests {
         let path = "/w/.tg/thegn";
         let files = MemFiles::new(HashMap::from([(path.into(), b"prior".to_vec())]), true);
         let lease = TestLease::new();
+        let mem = &files;
         let result = test_install(
             &files,
             "id",
             path,
             b"new binary",
             lease.clone(),
-            |stage, dest| async move { files.publish(&stage, &dest) },
+            |stage, dest| async move { mem.publish(&stage, &dest) },
         )
         .await;
         assert!(result.is_err());
         assert_eq!(lease.releases.load(std::sync::atomic::Ordering::SeqCst), 1);
         assert!(!files.contains_stage());
+    }
+
+    #[tokio::test]
+    async fn exec_install_previous_cleanup_failure_is_nonfatal() {
+        let path = "/w/.tg/thegn";
+        let files = MemFiles::with_remove_previous_failure(
+            HashMap::from([(path.into(), b"prior".to_vec())]),
+            false,
+            true,
+        );
+        let mem = &files;
+        let lease = TestLease::new();
+        let result = test_install(
+            &files,
+            "id",
+            path,
+            b"new binary",
+            lease.clone(),
+            |stage, dest| async move { mem.publish(&stage, &dest) },
+        )
+        .await
+        .unwrap();
+
+        assert!(result);
+        assert_eq!(
+            files
+                .files
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .get(path)
+                .map(Vec::as_slice),
+            Some(&b"new binary"[..])
+        );
+        assert_eq!(lease.releases.load(std::sync::atomic::Ordering::SeqCst), 1);
     }
 
     #[test]
