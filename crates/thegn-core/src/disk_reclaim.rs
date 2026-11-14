@@ -29,7 +29,7 @@
 //!
 //! A separate generation rule limits accumulation inside an active `target/`:
 //! it requires an age floor and keeps the two newest touched fingerprint
-//! footprints per package name. This is a retention invariant, not an oracle
+//! footprints per package and unit kind. This is a retention invariant, not an oracle
 //! for whether Cargo will use an artifact in a future build, and it makes no
 //! bound on the resulting rebuild cost.
 //!
@@ -136,16 +136,16 @@ pub struct Generation {
 }
 
 /// Configured age floor for pruning generation footprints; the policy applies
-/// the shorter of this value and the one-day safety floor.
+/// the shorter of this value and the three-day safety floor.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct GenerationPolicy {
     pub min_age_secs: u64,
 }
 
-/// Number of newest Cargo generations retained for every package.
+/// Number of newest Cargo generations retained for every package and unit kind.
 pub const GENERATION_KEEP_NEWEST: usize = 2;
 
-const GENERATION_SAFETY_FLOOR_SECS: u64 = 86_400;
+const GENERATION_SAFETY_FLOOR_SECS: u64 = 3 * 86_400;
 
 /// One hook log directly inside a worktree-slug directory.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -185,7 +185,7 @@ pub fn plan_hook_log_prune(
 /// Earliest time an old generation might meet the age floor. `None` means all
 /// packages have at most [`GENERATION_KEEP_NEWEST`] generations, so no age
 /// passage alone can make a prune possible. The configured age is capped at a
-/// one-day safety floor, matching [`plan_generations`].
+/// three-day safety floor, matching [`plan_generations`].
 pub fn generation_recheck_after(inventory: &[Generation], policy: GenerationPolicy) -> Option<u64> {
     let age_floor = policy.min_age_secs.min(GENERATION_SAFETY_FLOOR_SECS);
     generation_groups(inventory)
@@ -194,8 +194,10 @@ pub fn generation_recheck_after(inventory: &[Generation], policy: GenerationPoli
             sort_generations_newest_first(&mut generations);
             generations
                 .into_iter()
-                .nth(GENERATION_KEEP_NEWEST)
-                .map(|generation| generation.newest_mtime_secs.saturating_add(age_floor))
+                .skip(GENERATION_KEEP_NEWEST)
+                .map(|generation| generation.newest_mtime_secs)
+                .min()
+                .map(|mtime| mtime.saturating_add(age_floor))
         })
         .min()
 }
@@ -210,11 +212,11 @@ pub struct GenerationEviction {
 }
 
 /// Select old generations while preserving the [`GENERATION_KEEP_NEWEST`]
-/// most recently touched footprints for every package name. Equal mtimes
+/// most recently touched footprints for every package and unit kind. Equal mtimes
 /// retain lexically greatest IDs, giving a stable newest choice when
 /// timestamps have only second precision. Duplicate package/ID rows are
 /// ignored after their first occurrence. Generations beyond the retained set
-/// use the shorter of the configured age and the one-day safety floor.
+/// use the shorter of the configured age and the three-day safety floor.
 pub fn plan_generations(
     inventory: &[Generation],
     policy: GenerationPolicy,
@@ -705,7 +707,7 @@ mod tests {
             GenerationPolicy {
                 min_age_secs: 14 * 86_400,
             },
-            86_400,
+            3 * 86_400,
         );
         assert_eq!(
             got,
@@ -795,6 +797,13 @@ mod tests {
             generation("single", "only", 0, 1),
         ];
         assert_eq!(generation_recheck_after(&rows, policy), Some(30));
+        let four = [
+            generation("multi", "a", 20, 1),
+            generation("multi", "b", 50, 1),
+            generation("multi", "c", 60, 1),
+            generation("multi", "d", 10, 1),
+        ];
+        assert_eq!(generation_recheck_after(&four, policy), Some(20));
         assert_eq!(
             generation_recheck_after(
                 &rows[..3],
@@ -802,7 +811,7 @@ mod tests {
                     min_age_secs: 14 * 86_400,
                 }
             ),
-            Some(86_420)
+            Some(259_220)
         );
         assert_eq!(generation_recheck_after(&rows[3..], policy), None);
         assert_eq!(generation_recheck_after(&[], policy), None);

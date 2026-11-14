@@ -3482,11 +3482,11 @@ pub struct DiskConfig {
     /// an unexpected cold rebuild costs an agent mid-task real wall-clock.
     #[schemars(range(max = "crate::time_policy::MAX_DURATION_DAYS"))]
     pub idle_clean_days: u32,
-    /// Reap Cargo fingerprint generations beyond the two newest per package
-    /// after this many untouched days, capped at a one-day safety floor.
-    /// Defaults to two weeks; the newest two footprints for each package are
-    /// always kept, so the configured value remains an upper age bound without
-    /// allowing an active target to grow indefinitely.
+    /// Reap Cargo fingerprint generations beyond the two newest per package and
+    /// unit kind after this many untouched days, capped at a three-day safety
+    /// floor. Defaults to two weeks; the newest two footprints for each group
+    /// are always kept. This applies to active and dirty worktrees too; a
+    /// running slot or held `.cargo-lock` still skips that profile.
     #[schemars(range(max = "crate::time_policy::MAX_DURATION_DAYS"))]
     pub generation_min_age_days: u32,
     /// Under genuine disk pressure, evict least-recently-touched `target/` dirs

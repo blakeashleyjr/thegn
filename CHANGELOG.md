@@ -10,8 +10,9 @@ All notable changes to **thegn** are documented here. The format follows
 ### Changed
 
 - Cargo generation pruning now retains the two newest fingerprints per package
-  and reclaims older generations after the shorter of the configured age and a
-  one-day safety floor, including in active and dirty worktrees.
+  and unit kind, and reclaims older generations after the shorter of the
+  configured age and a three-day safety floor, including in active and dirty
+  worktrees.
 
 ## [0.1.0-alpha.80] — 2026-11-14
 
