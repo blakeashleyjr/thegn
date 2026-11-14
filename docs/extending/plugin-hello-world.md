@@ -43,18 +43,21 @@ surface = "hello-world.segment"
 
 [contributions.cadence]
 kind = "interval"
-millis = 5000
+millis = 60000
 ```
 
 The contribution id and surface identify what the script registers and
 updates. Keep them consistent between this file and the script.
+
+Each interval tick of a `one_shot` plugin spawns a process, so choose the
+longest cadence that is useful.
 
 ## Step 3: the script
 
 Create `$CFG_DIR/plugins/hello-world/hello.sh` with these two lines:
 
 ```sh
-printf '%s\n' '{"method":"register","params":{"id":"hello-world.seg","extension_point":"StatusBarSegment","label":"Hello","surface":"hello-world.segment","cadence":{"kind":"interval","millis":5000}}}'
+printf '%s\n' '{"method":"register","params":{"id":"hello-world.seg","extension_point":"StatusBarSegment","label":"Hello","surface":"hello-world.segment","cadence":{"kind":"interval","millis":60000}}}'
 printf '%s\n' '{"method":"update","params":{"surface":"hello-world.segment","view":{"spans":[{"text":"hello from a plugin","role":"Accent"}]}}}'
 ```
 
