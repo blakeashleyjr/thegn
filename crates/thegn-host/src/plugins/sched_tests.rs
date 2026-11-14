@@ -45,7 +45,7 @@ fn empty_runtime_state() -> (Disabled, Sessions) {
 #[test]
 fn schedule_deadlines_cover_small_and_unrepresentably_large_intervals() {
     let base = Instant::now();
-    for millis in [1, u64::MAX] {
+    for millis in [MIN_PLUGIN_INTERVAL_MS, u64::MAX] {
         let interval = Duration::from_millis(millis);
         let mut schedule = build_schedule(
             &[loaded_state("deadline", PluginMode::OneShot, millis)],
@@ -75,6 +75,72 @@ fn schedule_deadlines_cover_small_and_unrepresentably_large_intervals() {
         );
         assert!(schedule[0].next > base, "interval {millis} must not wrap");
     }
+}
+
+#[test]
+fn plugin_interval_floor_clamps_without_deadline_overflow() {
+    for (requested, expected) in [
+        (0, MIN_PLUGIN_INTERVAL_MS),
+        (1, MIN_PLUGIN_INTERVAL_MS),
+        (999, MIN_PLUGIN_INTERVAL_MS),
+        (MIN_PLUGIN_INTERVAL_MS, MIN_PLUGIN_INTERVAL_MS),
+        (5_000, 5_000),
+        (u64::MAX, u64::MAX),
+    ] {
+        let clamped = clamp_plugin_interval_millis(requested);
+        assert_eq!(clamped, expected, "requested interval {requested}");
+
+        let base = Instant::now();
+        let interval = Duration::from_millis(clamped);
+        let deadline = next_schedule_deadline(base, interval);
+        match base.checked_add(interval) {
+            Some(expected_deadline) => assert_eq!(deadline, expected_deadline),
+            None => assert!(deadline > base),
+        }
+    }
+}
+
+#[test]
+fn build_schedule_clamps_interval_below_floor() {
+    let now = Instant::now();
+    let schedule = build_schedule(
+        &[loaded_state("below-floor", PluginMode::OneShot, 999)],
+        now,
+    );
+
+    assert_eq!(schedule.len(), 1);
+    assert_eq!(
+        schedule[0].interval,
+        Duration::from_millis(MIN_PLUGIN_INTERVAL_MS)
+    );
+}
+
+#[test]
+fn shipped_hello_example_uses_at_least_the_plugin_interval_floor() {
+    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../examples/plugins/hello/plugin.toml");
+    let text = std::fs::read_to_string(path).expect("shipped hello manifest is readable");
+    let spec: PluginSpec = toml::from_str(&text).expect("shipped hello manifest is valid");
+    let intervals: Vec<_> = spec
+        .manifest
+        .contributions
+        .iter()
+        .filter_map(|contribution| match &contribution.cadence {
+            CadenceHint::Interval { millis } => Some(*millis),
+            _ => None,
+        })
+        .collect();
+
+    assert!(
+        !intervals.is_empty(),
+        "hello example must declare an interval"
+    );
+    assert!(
+        intervals
+            .iter()
+            .all(|&millis| millis >= MIN_PLUGIN_INTERVAL_MS),
+        "hello example cadence must respect the {MIN_PLUGIN_INTERVAL_MS} ms floor: {intervals:?}"
+    );
 }
 
 #[test]
