@@ -719,6 +719,7 @@ pub(crate) fn compose_detail_line(
 ) -> Option<crate::seg::Line> {
     use crate::chrome::S;
     use crate::seg::{Line, Seg, Tok, seg, sp};
+    use thegn_core::pipeline_report::display_cell;
     use thegn_core::theme;
     // Gutter + indent so the detail reads as hanging under the name.
     let mut segs: Vec<Seg> = vec![sp(5)];
@@ -732,7 +733,7 @@ pub(crate) fn compose_detail_line(
         .filter(|b| !b.is_empty())
         .unwrap_or(&row.label);
     if disp.detail_branch && !branch.is_empty() {
-        segs.push(seg(Tok::Slot(S::Dim), format!("{branch} ")));
+        segs.push(seg(Tok::Slot(S::Dim), format!("{} ", display_cell(branch))));
     }
     // This branch's own work over the repo's LOCAL default branch (`+adds` green
     // / `-dels` red) — the same base `thegn diff` and the diff viewer use, so a
@@ -798,27 +799,42 @@ pub(crate) fn compose_detail_line(
         if row.env_degraded {
             segs.push(seg(
                 Tok::Hue(theme::Hue::Amber),
-                format!("{}{env} {}{} ", gl.quote_open, gl.cross, gl.quote_close),
+                format!(
+                    "{}{} {}{} ",
+                    gl.quote_open,
+                    display_cell(env),
+                    gl.cross,
+                    gl.quote_close
+                ),
             ));
         } else {
             segs.push(seg(
                 Tok::Slot(S::Faint),
-                format!("{}{env}{} ", gl.quote_open, gl.quote_close),
+                format!("{}{}{} ", gl.quote_open, display_cell(env), gl.quote_close),
             ));
         }
     }
     if let Some(profile) = &row.sandbox_profile {
-        segs.push(seg(Tok::Slot(S::Faint), format!("[{profile}] ")));
+        segs.push(seg(
+            Tok::Slot(S::Faint),
+            format!("[{}] ", display_cell(profile)),
+        ));
     }
     if let Some(backend) = &row.sandbox_backend
         && !backend.is_empty()
         && backend != "none"
         && backend != "host"
     {
-        segs.push(seg(Tok::Slot(S::Faint), format!("({backend}) ")));
+        segs.push(seg(
+            Tok::Slot(S::Faint),
+            format!("({}) ", display_cell(backend)),
+        ));
     }
     if let Some(devcontainer) = &row.devcontainer_status {
-        segs.push(seg(Tok::Slot(S::Faint), format!("{devcontainer} ")));
+        segs.push(seg(
+            Tok::Slot(S::Faint),
+            format!("{} ", display_cell(devcontainer)),
+        ));
     }
     if row
         .worktree_path
@@ -5024,5 +5040,28 @@ mod tests {
         assert!(text.contains("diff ?"), "{text:?}");
         assert!(!text.contains("+0"), "{text:?}");
         assert!(!text.contains("-0"), "{text:?}");
+    }
+
+    #[test]
+    fn detail_line_replaces_hostile_label_cells() {
+        let mut row = SidebarRow::base(
+            RowKind::Worktree,
+            1,
+            "feat\u{1b}]52;c;QQ==\u{7}\u{202e}",
+            "app",
+        );
+        row.branch = Some("branch\u{200b}\u{9b}".into());
+        let line = compose_detail_line(&row, &crate::sidebar_view::SidebarDisplay::default())
+            .expect("hostile branch should still produce detail");
+        let crate::seg::Line::Segs(segs) = line else {
+            panic!("detail line is composed from segments")
+        };
+        let text = segs.iter().map(|seg| seg.text.as_str()).collect::<String>();
+        assert!(
+            text.chars()
+                .all(|c| !c.is_control() && !thegn_core::pipeline_report::is_format_control(c)),
+            "{text:?}"
+        );
+        assert!(text.contains('�'), "{text:?}");
     }
 }

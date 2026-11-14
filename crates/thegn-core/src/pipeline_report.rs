@@ -5,7 +5,9 @@
 use crate::issue::{AgentDispatch, DispatchNote};
 use std::collections::HashMap;
 use std::fmt;
+use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::UnicodeWidthChar;
+use unicode_width::UnicodeWidthStr;
 
 // --- text validation --------------------------------------------------------
 
@@ -169,54 +171,80 @@ pub fn display_fit(s: &str, cells: usize) -> String {
     output
 }
 
+/// A clipped display cell plus how many columns it occupies and whether it was cut.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DisplayClipMeta {
+    pub text: String,
+    pub shown_cells: usize,
+    pub truncated: bool,
+}
+
+/// Render untrusted text clipped to at most `cells` display columns and report
+/// how much of the rendered cell was shown. Grapheme clusters are the unit of
+/// clipping, so a combining run or an emoji sequence is never cut in half.
+pub fn display_clip_meta(s: &str, cells: usize) -> DisplayClipMeta {
+    if cells == 0 {
+        return DisplayClipMeta {
+            text: String::new(),
+            shown_cells: 0,
+            truncated: !s.is_empty(),
+        };
+    }
+
+    let safe = display_cell(s);
+    let mut clusters = Vec::new();
+    let mut width = 0;
+    let byte_budget = cells.saturating_mul(16);
+    let mut bytes: usize = 0;
+    let mut truncated = false;
+
+    for cluster in safe.graphemes(true) {
+        let cluster_width = UnicodeWidthStr::width(cluster);
+        if clusters.is_empty() && cluster_width == 0 {
+            continue;
+        }
+        if width + cluster_width > cells || bytes.saturating_add(cluster.len()) > byte_budget {
+            truncated = true;
+            break;
+        }
+        clusters.push(cluster);
+        width += cluster_width;
+        bytes += cluster.len();
+    }
+
+    if !truncated {
+        return DisplayClipMeta {
+            text: clusters.concat(),
+            shown_cells: width,
+            truncated: false,
+        };
+    }
+
+    while width + 1 > cells
+        && let Some(last) = clusters.pop()
+    {
+        width -= UnicodeWidthStr::width(last);
+    }
+    while clusters
+        .last()
+        .is_some_and(|cluster| cluster.chars().all(char::is_whitespace))
+    {
+        clusters.pop();
+    }
+    clusters.push("…");
+    let text = clusters.concat();
+    DisplayClipMeta {
+        shown_cells: UnicodeWidthStr::width(text.as_str()),
+        text,
+        truncated: true,
+    }
+}
+
 /// Render untrusted text clipped to at most `cells` display columns.
 /// Controls and format characters are replaced, leading zero-width characters
 /// are dropped, and a truncated value ends in an ellipsis without padding.
 pub fn display_clip(s: &str, cells: usize) -> String {
-    if cells == 0 {
-        return String::new();
-    }
-
-    let safe = display_cell(s);
-    let mut output = String::new();
-    let mut width = 0;
-    let mut truncated = false;
-
-    for c in safe.chars() {
-        let char_width = UnicodeWidthChar::width(c).unwrap_or(0);
-        if output.is_empty() && char_width == 0 {
-            continue;
-        }
-        if width + char_width > cells {
-            truncated = true;
-            break;
-        }
-        output.push(c);
-        width += char_width;
-    }
-
-    if !truncated {
-        return output;
-    }
-
-    while width + 1 > cells
-        && let Some(last) = output.pop()
-    {
-        width -= UnicodeWidthChar::width(last).unwrap_or(0);
-        if width + 1 > cells {
-            while let Some(mark) = output.chars().last()
-                && UnicodeWidthChar::width(mark).unwrap_or(0) == 0
-            {
-                output.pop();
-            }
-            if let Some(base) = output.pop() {
-                width -= UnicodeWidthChar::width(base).unwrap_or(0);
-            }
-        }
-    }
-    output = output.trim_end().to_string();
-    output.push('…');
-    output
+    display_clip_meta(s, cells).text
 }
 
 /// A report that cannot be stored.
@@ -1109,6 +1137,15 @@ mod tests {
     }
 
     #[test]
+    fn display_clip_keeps_wide_utf8_clusters_within_their_cell_budget() {
+        let script = "स्ते";
+        let clipped = display_clip_meta(script, 2);
+        assert_eq!(clipped.text, script);
+        assert_eq!(clipped.shown_cells, 2);
+        assert!(!clipped.truncated);
+    }
+
+    #[test]
     fn display_clip_keeps_combining_marks_with_their_base() {
         let clipped = display_clip("e\u{301}e\u{301}e\u{301}x", 3);
         assert!(!clipped.ends_with('\u{301}'), "{clipped:?}");
@@ -1120,6 +1157,7 @@ mod tests {
     fn display_clip_does_not_pad_and_matches_ascii_truncate() {
         assert_eq!(display_clip("short", 10), "short");
         assert_eq!(display_clip("hello world", 8), "hello w…");
+        assert_eq!(display_clip("hello world", 7), "hello…");
         assert_eq!(display_clip("ab", 1), "…");
         assert_eq!(display_clip("anything", 0), "");
     }
@@ -1129,5 +1167,81 @@ mod tests {
         let clipped = display_clip("\x1b]52;c;AAAA\x07\u{202e}\u{200b}", 40);
         assert_eq!(clipped, "�]52;c;AAAA���");
         assert!(clipped.chars().all(|c| !c.is_control()));
+    }
+
+    #[test]
+    fn hostile_display_matrix_is_safe_bounded_and_cluster_atomic() {
+        use crate::msg::terminal_safe;
+
+        let invalid_utf8 = String::from_utf8_lossy(&[0xf0, 0x28, 0x8c, 0x28]).into_owned();
+        let long = "x".repeat(1_048_576);
+        let cases = [
+            (
+                "pretty",
+                "ESC \x1b[31m CSI \x1b[0m OSC \x1b]0;title\x07 OSC52 \x1b]52;c;AAAA\x07",
+            ),
+            (
+                "minified",
+                "\x1b[31m\x1b]52;c;AAAA\x07\u{9b}\u{9d}\u{7f}\u{202e}\u{2066}\u{200b}",
+            ),
+            ("c1", "\u{80}\u{85}\u{90}\u{9b}\u{9d}\u{9f}"),
+            ("bidi", "left\u{202a}right\u{202e}end\u{2066}"),
+            ("zero-width", "\u{200b}\u{200c}\u{200d}\u{2060}text"),
+            ("zwj", "👩‍👩‍👧‍👦 family"),
+            ("combining", "a\u{301}\u{302}\u{303}b\u{301}c"),
+            ("wide", "日本語テキスト"),
+            ("invalid utf8 loss", &invalid_utf8),
+            ("one mib label", &long),
+        ];
+
+        for (name, input) in cases {
+            let cell = display_cell(input);
+            let clipped = display_clip(input, 64);
+            let metadata = display_clip_meta(input, 64);
+            let diagnostic = terminal_safe(input);
+            assert!(
+                cell.chars()
+                    .all(|c| !c.is_control() && !is_format_control(c)),
+                "display_cell leaked {name}: {cell:?}"
+            );
+            assert!(
+                clipped
+                    .chars()
+                    .all(|c| !c.is_control() && !is_format_control(c)),
+                "display_clip leaked {name}: {clipped:?}"
+            );
+            assert!(
+                diagnostic.chars().all(|c| {
+                    (!c.is_control() || c == '\n' || c == '\t') && !is_format_control(c)
+                }),
+                "terminal_safe leaked {name}: {diagnostic:?}"
+            );
+            assert!(cell.chars().count() <= input.chars().count());
+            assert!(diagnostic.chars().count() <= input.chars().count());
+            assert!(metadata.shown_cells <= 64);
+            assert_eq!(metadata.text, clipped);
+            assert_eq!(
+                metadata.shown_cells,
+                UnicodeWidthStr::width(clipped.as_str())
+            );
+            assert_eq!(metadata.truncated, clipped.ends_with('…'));
+            assert!(clipped.is_empty() || !clipped.ends_with('\u{301}'));
+        }
+
+        let combining = display_clip_meta("a\u{301}\u{302}bc", 2);
+        assert_eq!(combining.text, "a\u{301}\u{302}…");
+        assert_eq!(combining.shown_cells, 2);
+        assert!(combining.truncated);
+
+        let zwj = display_clip_meta("👩‍👩‍👧‍👦x", 2);
+        assert_eq!(zwj.shown_cells, 1);
+        assert_eq!(zwj.text, "…");
+        assert!(zwj.truncated);
+
+        let long_combining = format!("a{}", "\u{301}".repeat(1_048_576));
+        let long_combining = display_clip_meta(&long_combining, 4);
+        assert_eq!(long_combining.text, "…");
+        assert_eq!(long_combining.shown_cells, 1);
+        assert!(long_combining.truncated);
     }
 }
