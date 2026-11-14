@@ -7,6 +7,17 @@ All notable changes to **thegn** are documented here. The format follows
 
 ## [Unreleased]
 
+### Added
+
+- gRPC exposes `AgentSessions`, `SessionsRecord` and `WorktreesCreate`; launch
+  presets remain CLI-only because their configuration and environment resolve locally.
+
+### Fixed
+
+- A reused gate worktree verifies that tracked files still match the branch snapshot before gating.
+- Pipeline supervision no longer treats a worktree in an unknown state as satisfying a parent-artifact requirement.
+- Release, worktree-prune, dispatch-commit and PR-authorship Git reads report errors instead of treating unreadable output as empty.
+
 ## [0.1.0-alpha.74] — 2026-11-13
 
 ### Added
