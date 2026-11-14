@@ -16,6 +16,8 @@ use std::time::{Duration, Instant};
 use termwiz::terminal::TerminalWaker;
 use thegn_core::store::WorkspaceStore;
 
+use crate::ci_flight::{CiFlight, FlightAdmission, FlightKey, FlightKind, FlightToken};
+
 /// One request's aggregate cap across active and background worktrees, including run lists.
 const MAX_LOG_INGEST_CALLS: usize = 32;
 /// Log bytes ingested by one refresh request (active worktree plus the background sweep).
@@ -168,66 +170,6 @@ impl CallBudget {
     }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
-struct FlightKey {
-    active_path: Option<String>,
-    generation: Option<u64>,
-}
-
-#[derive(Clone)]
-struct FlightToken {
-    key: FlightKey,
-    force: bool,
-    cancel: Arc<AtomicBool>,
-}
-
-#[derive(Default)]
-struct CiFlight {
-    running: Option<FlightToken>,
-    queued: Option<FlightToken>,
-}
-
-impl CiFlight {
-    fn submit(&mut self, request: FlightToken) -> bool {
-        let Some(running) = self.running.as_ref() else {
-            self.running = Some(request);
-            return true;
-        };
-        let different_key = running.key != request.key;
-        if different_key {
-            running.cancel.store(true, Ordering::Relaxed);
-        }
-        if let Some(queued) = self.queued.as_ref()
-            && queued.key != request.key
-        {
-            queued.cancel.store(true, Ordering::Relaxed);
-        }
-        let force = self
-            .queued
-            .as_ref()
-            .filter(|queued| queued.key == request.key)
-            .is_some_and(|queued| queued.force)
-            || request.force;
-        self.queued = Some(FlightToken { force, ..request });
-        different_key
-    }
-
-    fn finish(&mut self) -> Option<FlightToken> {
-        let next = self.queued.take();
-        self.running = next.as_ref().map(|token| FlightToken {
-            key: token.key.clone(),
-            force: token.force,
-            cancel: Arc::clone(&token.cancel),
-        });
-        next
-    }
-
-    fn clear(&mut self) {
-        self.running = None;
-        self.queued = None;
-    }
-}
-
 #[derive(Clone)]
 struct RefreshRequest {
     session: crate::session::Session,
@@ -267,17 +209,22 @@ impl CiRefreshCoordinator {
             force: request.token.force,
             cancel: Arc::clone(&request.token.cancel),
         };
-        let start = self.flight.running.is_none();
-        self.flight.submit(token);
-        if !start {
-            self.queued = Some(request);
+        match self.flight.submit(token) {
+            FlightAdmission::Started => true,
+            FlightAdmission::Busy => false,
+            FlightAdmission::Queued => {
+                self.queued = Some(request);
+                false
+            }
         }
-        start
     }
 }
 
 fn register_mutation(coordinator: &mut CiRefreshCoordinator) -> Option<Arc<AtomicBool>> {
     if coordinator.shut_down {
+        return None;
+    }
+    if !coordinator.mutations.is_empty() {
         return None;
     }
     let cancel = Arc::new(AtomicBool::new(false));
@@ -940,6 +887,8 @@ pub(crate) fn spawn_ci_cache_refresh_with_generation(
 ) {
     let key = FlightKey {
         active_path: session.active_group().map(|group| group.path.clone()),
+        run_id: None,
+        kind: FlightKind::Refresh,
         generation: generation.as_ref().map(|(_, value)| *value),
     };
     let token = FlightToken {
@@ -2677,6 +2626,8 @@ mod tests {
         FlightToken {
             key: FlightKey {
                 active_path: Some(path.to_string()),
+                run_id: None,
+                kind: FlightKind::Refresh,
                 generation,
             },
             force,
@@ -2687,17 +2638,15 @@ mod tests {
     #[test]
     fn ci_flight_coalesces_same_key_and_keeps_force_sticky() {
         let mut flight = CiFlight::default();
-        assert!(flight.submit(flight_token("/wt", Some(4), false)));
-        assert!(!flight.submit(flight_token("/wt", Some(4), true)));
-        let queued = flight.finish().expect("coalesced queued refresh");
-        assert!(queued.force);
         assert_eq!(
-            queued.key,
-            FlightKey {
-                active_path: Some("/wt".into()),
-                generation: Some(4)
-            }
+            flight.submit(flight_token("/wt", Some(4), false)),
+            FlightAdmission::Started
         );
+        assert_eq!(
+            flight.submit(flight_token("/wt", Some(4), true)),
+            FlightAdmission::Busy
+        );
+        assert!(flight.running.as_ref().is_some_and(|token| token.force));
         assert!(flight.finish().is_none());
     }
 
@@ -2706,16 +2655,22 @@ mod tests {
         let mut flight = CiFlight::default();
         let first = flight_token("/wt-a", Some(4), false);
         let cancel = Arc::clone(&first.cancel);
-        assert!(flight.submit(first));
-        assert!(flight.submit(flight_token("/wt-b", Some(4), false)));
+        assert_eq!(flight.submit(first), FlightAdmission::Started);
+        assert_eq!(
+            flight.submit(flight_token("/wt-b", Some(4), false)),
+            FlightAdmission::Queued
+        );
         assert!(cancel.load(Ordering::Relaxed));
         let queued = flight.finish().expect("changed path refresh is queued");
         assert_eq!(queued.key.active_path.as_deref(), Some("/wt-b"));
 
         let second = flight_token("/wt-a", Some(4), false);
         let cancel = Arc::clone(&second.cancel);
-        assert!(flight.submit(second));
-        assert!(flight.submit(flight_token("/wt-a", Some(5), false)));
+        assert_eq!(flight.submit(second), FlightAdmission::Started);
+        assert_eq!(
+            flight.submit(flight_token("/wt-a", Some(5), false)),
+            FlightAdmission::Queued
+        );
         assert!(cancel.load(Ordering::Relaxed));
     }
 
@@ -2729,7 +2684,7 @@ mod tests {
         let queued_cancel = Arc::clone(&queued.cancel);
         {
             let mut coordinator = lock.lock().expect("local coordinator");
-            coordinator.flight.submit(running);
+            assert_eq!(coordinator.flight.submit(running), FlightAdmission::Started);
             coordinator.flight.queued = Some(queued.clone());
             coordinator.queued = Some(RefreshRequest {
                 session: crate::session::Session::default(),
@@ -2832,6 +2787,28 @@ mod tests {
     }
 
     #[test]
+    fn ci_mutation_admission_serializes_concurrent_provider_calls() {
+        let lock: &'static Mutex<CiRefreshCoordinator> =
+            Box::leak(Box::new(Mutex::new(CiRefreshCoordinator::default())));
+        let idle: &'static Condvar = Box::leak(Box::new(Condvar::new()));
+        std::thread::scope(|scope| {
+            let first = scope.spawn(|| begin_ci_mutation_in(lock, idle));
+            let second = scope.spawn(|| begin_ci_mutation_in(lock, idle));
+            let first = first.join().expect("first mutation admission");
+            let second = second.join().expect("second mutation admission");
+            assert_eq!(
+                [first.is_some(), second.is_some()]
+                    .into_iter()
+                    .filter(|admitted| *admitted)
+                    .count(),
+                1
+            );
+            drop(first);
+            drop(second);
+        });
+    }
+
+    #[test]
     fn ci_refresh_latch_clears_after_refused_admission() {
         let _lock = FLIGHT_TEST_LOCK.lock().expect("flight test lock");
         clear_ci_refresh_flight();
@@ -2854,7 +2831,7 @@ mod tests {
         let cancel = Arc::clone(&token.cancel);
         {
             let mut coordinator = ci_refresh_coordinator().lock().expect("coordinator");
-            coordinator.flight.submit(token);
+            assert_eq!(coordinator.flight.submit(token), FlightAdmission::Started);
         }
         let panic = std::panic::catch_unwind(|| {
             let _guard = FlightGuard { cancel };
