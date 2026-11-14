@@ -423,11 +423,28 @@ fn discovery_problem(path: &Path, problem: String) -> SpecProblem {
     }
 }
 
+/// Return whether a plugin routing identifier follows the wire grammar.
+///
+/// Separators divide non-empty ASCII segments; underscores remain ordinary
+/// identifier characters. Keeping this as a byte-only predicate makes the
+/// length and alphabet checks bounded and panic-free for hostile input.
 fn valid_routing_id(id: &str) -> bool {
-    (MIN_PLUGIN_ROUTING_ID_BYTES..=MAX_PLUGIN_ROUTING_ID_BYTES).contains(&id.len())
-        && !id
-            .chars()
-            .any(|character| character.is_control() || character == ':')
+    let bytes = id.as_bytes();
+    if !(MIN_PLUGIN_ROUTING_ID_BYTES..=MAX_PLUGIN_ROUTING_ID_BYTES).contains(&bytes.len()) {
+        return false;
+    }
+    if !bytes
+        .iter()
+        .all(|byte| byte.is_ascii_alphanumeric() || b"._:/-".contains(byte))
+    {
+        return false;
+    }
+    let is_separator = |byte: u8| b".:/-".contains(&byte);
+    !is_separator(bytes[0])
+        && !is_separator(bytes[bytes.len() - 1])
+        && !bytes
+            .windows(2)
+            .any(|pair| is_separator(pair[0]) && is_separator(pair[1]))
 }
 
 fn valid_env_key(key: &str) -> bool {
@@ -531,9 +548,9 @@ fn check_spec_fields(p: &LoadedPlugin) -> Vec<SpecProblem> {
         ));
     }
     for cap in &p.spec.manifest.capabilities {
-        if cap.kind().is_empty()
-            || cap.target().is_empty()
-            || cap.as_str().chars().any(char::is_control)
+        if !valid_routing_id(cap.kind())
+            || !valid_routing_id(cap.target())
+            || !valid_routing_id(cap.as_str())
         {
             push(format!("invalid capability {:?}", cap.as_str()));
         }
@@ -832,6 +849,10 @@ mod tests {
             Capability::new("", "target"),
             Capability::new("kind", ""),
             Capability::new("a\u{7}", "b"),
+            Capability::new("kind", "é"),
+            Capability::new("kind", "target value"),
+            Capability::new("kind", "target//nested"),
+            Capability::new("kind", "x".repeat(10_000)),
         ] {
             let mut plugin = spec("caps", vec!["true".into()]);
             plugin.manifest.capabilities.push(capability);
@@ -846,6 +867,52 @@ mod tests {
                     .any(|problem| problem.problem.contains("invalid capability"))
             );
         }
+
+        for capability in [
+            Capability::new("surface", "statusbar"),
+            Capability::new("network", "example.com"),
+            Capability::new("run", "tools/helper-v2"),
+        ] {
+            let mut plugin = spec("caps", vec!["true".into()]);
+            plugin.manifest.capabilities.push(capability);
+            assert!(
+                check_spec(&LoadedPlugin {
+                    spec: plugin,
+                    dir: None,
+                    trusted_native_ignored: false,
+                })
+                .iter()
+                .all(|problem| !problem.problem.contains("invalid capability"))
+            );
+        }
+    }
+
+    #[test]
+    fn routing_id_grammar_has_one_accept_reject_table() {
+        let overlong = "x".repeat(MAX_PLUGIN_ROUTING_ID_BYTES + 1);
+        let hostile = "x".repeat(10_000);
+        let cases = [
+            ("a", true),
+            ("A1_thing", true),
+            ("hello-world", true),
+            ("surface:statusbar", true),
+            ("plugin.v1/alerts", true),
+            ("", false),
+            (".leading", false),
+            ("trailing/", false),
+            ("a..b", false),
+            ("a//b", false),
+            ("a::b", false),
+            ("a--b", false),
+            ("has space", false),
+            ("é", false),
+            ("control\u{7}", false),
+        ];
+        for (value, expected) in cases {
+            assert_eq!(valid_routing_id(value), expected, "routing id {value:?}");
+        }
+        assert!(!valid_routing_id(&overlong));
+        assert!(!valid_routing_id(&hostile));
     }
 
     #[test]
@@ -984,7 +1051,7 @@ mod tests {
             chord: None,
         };
         let long_id = "x".repeat(MAX_PLUGIN_ROUTING_ID_BYTES + 1);
-        for id in ["", "a:b", "a\u{7}", long_id.as_str()] {
+        for id in ["", "a::b", "a\u{7}", long_id.as_str()] {
             let mut plugin = spec("routing", vec!["true".into()]);
             plugin
                 .manifest
@@ -1003,7 +1070,7 @@ mod tests {
             );
         }
         let long_surface = "x".repeat(MAX_PLUGIN_ROUTING_ID_BYTES + 1);
-        for surface in ["", "a:b", "a\u{7}", long_surface.as_str()] {
+        for surface in ["", "a::b", "a\u{7}", long_surface.as_str()] {
             let mut plugin = spec("routing", vec!["true".into()]);
             plugin
                 .manifest
@@ -1030,14 +1097,44 @@ mod tests {
             .manifest
             .contributions
             .push(make_contribution("é", "n/alerts"));
+        let problems = check_spec(&LoadedPlugin {
+            spec: plugin,
+            dir: None,
+            trusted_native_ignored: false,
+        });
         assert!(
-            check_spec(&LoadedPlugin {
-                spec: plugin,
-                dir: None,
-                trusted_native_ignored: false,
-            })
-            .is_empty()
+            problems
+                .iter()
+                .any(|problem| problem.problem.contains("invalid id")),
+            "unicode contribution id should fail: {problems:?}"
         );
+    }
+
+    #[test]
+    fn shipped_example_manifests_pass_routing_grammar() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        for (name, text) in [
+            (
+                "hello",
+                include_str!("../../../../examples/plugins/hello/plugin.toml"),
+            ),
+            (
+                "fixtures",
+                include_str!("../../../../examples/plugins/fixtures/plugin.toml"),
+            ),
+            (
+                "cell-grid",
+                include_str!("../../../../examples/plugins/cell-grid/plugin.toml"),
+            ),
+        ] {
+            let plugin: PluginSpec = toml::from_str(text).unwrap();
+            let problems = check_spec(&LoadedPlugin {
+                spec: plugin,
+                dir: Some(root.join("examples/plugins").join(name)),
+                trusted_native_ignored: false,
+            });
+            assert!(problems.is_empty(), "example {name}: {problems:?}");
+        }
     }
 
     #[test]
