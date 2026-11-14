@@ -34,6 +34,59 @@ impl InstallKeyStatus {
     }
 }
 
+pub(crate) const HOST_CACHE_SCOPE: &str = "signed paths only (fail-closed without key)";
+
+/// Facts from the provider's pure environment plan that affect the host cache
+/// signing boundary. `require_sigs` follows the same `host_cache_url` gate as
+/// the `PlanOpts` assembled for provider provisioning; it is not a live Nix
+/// probe.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct HostCachePlanFacts {
+    pub(crate) host_cache: bool,
+    pub(crate) require_sigs: bool,
+}
+
+pub(crate) fn host_cache_plan_facts(host_cache: bool, bridge_present: bool) -> HostCachePlanFacts {
+    HostCachePlanFacts {
+        host_cache,
+        require_sigs: host_cache && bridge_present,
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct CacheSigningReport<'a> {
+    pub(crate) signer: Option<&'a str>,
+    pub(crate) signer_state: &'static str,
+    pub(crate) scope: &'static str,
+    pub(crate) require_sigs: bool,
+    pub(crate) require_sigs_explicit: bool,
+}
+
+/// Project installation-key state and pure provider-plan facts into doctor
+/// fields. The disabled path deliberately reports no signer scope or signature
+/// requirement, while an enabled cache remains signed-only and fail-closed.
+pub(crate) fn cache_signing_report<'a>(
+    status: &'a InstallKeyStatus,
+    plan: HostCachePlanFacts,
+) -> CacheSigningReport<'a> {
+    CacheSigningReport {
+        signer: if plan.host_cache { status.name() } else { None },
+        signer_state: if plan.host_cache {
+            status.state()
+        } else {
+            "unused"
+        },
+        scope: if plan.host_cache {
+            HOST_CACHE_SCOPE
+        } else {
+            "disabled"
+        },
+        // The plan never writes require-sigs = false: explicit when the cache is effective, Nix's default otherwise.
+        require_sigs: true,
+        require_sigs_explicit: plan.host_cache && plan.require_sigs,
+    }
+}
+
 pub(crate) fn ensure_install_key() -> anyhow::Result<InstallKey> {
     let config = thegn_core::config::Config::path();
     let dir = config
@@ -404,14 +457,50 @@ fn key_name_suffix(name: &str) -> Option<&str> {
 #[cfg(test)]
 mod tests {
     use super::{
-        InstallKey, InstallKeyStatus, install_key_name, install_key_status_in,
-        install_key_status_in_with_owner_check, load_or_create_in, parse_public_key, sign_argv,
-        trust_script, trusted_key_conf_line,
+        HostCachePlanFacts, InstallKey, InstallKeyStatus, cache_signing_report, install_key_name,
+        install_key_status_in, install_key_status_in_with_owner_check, load_or_create_in,
+        parse_public_key, sign_argv, trust_script, trusted_key_conf_line,
     };
     use std::path::Path;
 
     const SECRET: &str = "thegn-0123456789abcdef-1:c2VjcmV0";
     const PUBLIC: &str = "thegn-0123456789abcdef-1:cHVibGlj";
+
+    #[test]
+    fn cache_signing_report_covers_each_key_state_and_plan_switch() {
+        let present = InstallKeyStatus::Present {
+            name: "thegn-0123456789abcdef-1".to_string(),
+        };
+        let statuses = [
+            present,
+            InstallKeyStatus::Missing,
+            InstallKeyStatus::Invalid("bad key".to_string()),
+        ];
+        for host_cache in [false, true] {
+            let plan = HostCachePlanFacts {
+                host_cache,
+                require_sigs: host_cache,
+            };
+            for status in &statuses {
+                let report = cache_signing_report(status, plan);
+                assert_eq!(
+                    report.scope,
+                    if host_cache {
+                        super::HOST_CACHE_SCOPE
+                    } else {
+                        "disabled"
+                    }
+                );
+                assert!(report.require_sigs);
+                assert_eq!(report.require_sigs_explicit, host_cache);
+                assert_eq!(
+                    report.signer_state,
+                    if host_cache { status.state() } else { "unused" }
+                );
+                assert_eq!(report.signer, if host_cache { status.name() } else { None });
+            }
+        }
+    }
 
     #[test]
     fn install_key_name_is_the_public_key_prefix() {
