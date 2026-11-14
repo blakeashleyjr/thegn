@@ -283,6 +283,33 @@ fn is_ancestor(repo_root: &Path, ancestor: &str, descendant: &str) -> Result<boo
     }
 }
 
+fn git_text(repo_root: &Path, args: &[&str]) -> Result<String> {
+    GitLoc::Local(repo_root.to_path_buf())
+        .git_text(args)
+        .map_err(|error| anyhow::anyhow!("git {}: {error}", args.join(" ")))
+}
+
+fn skip_gate_if_tree_unchanged(
+    repo_root: &Path,
+    base: &str,
+    folded_tip: &str,
+    branch_tip: &str,
+    trusted_base: Option<&str>,
+) -> Result<bool> {
+    let Some(trusted_base) = trusted_base else {
+        return Ok(false);
+    };
+    let folded_spec = format!("{folded_tip}^{{tree}}");
+    let folded_tree = git_text(repo_root, &["rev-parse", "--verify", &folded_spec])
+        .context("reading folded tree for gate skip")?;
+    anyhow::ensure!(!folded_tree.is_empty(), "Git returned an empty folded tree");
+    let branch_spec = format!("{branch_tip}^{{tree}}");
+    let branch_tree = git_text(repo_root, &["rev-parse", "--verify", &branch_spec])
+        .context("reading branch tree for gate skip")?;
+    anyhow::ensure!(!branch_tree.is_empty(), "Git returned an empty branch tree");
+    Ok(base.eq_ignore_ascii_case(trusted_base) && folded_tree == branch_tree)
+}
+
 /// Reconstruct the landed commit identity for a branch already integrated into
 /// the target. This rebuilds **cache metadata only, never merged-ness**: the
 /// ancestry proof runs first and independently, so a failure to derive can never
@@ -3089,20 +3116,8 @@ fn attempt_land_admitted(
             });
         }
         let folded_tip = plan.final_tip.clone();
-        let skip_gate = trusted_base.is_some_and(|trusted| {
-            let folded_tree = util::git_out_allow_empty(
-                repo_root,
-                &["rev-parse", "--verify", &format!("{folded_tip}^{{tree}}")],
-            );
-            let branch_tree = util::git_out_allow_empty(
-                repo_root,
-                &["rev-parse", "--verify", &format!("{branch_tip}^{{tree}}")],
-            );
-            base.eq_ignore_ascii_case(trusted)
-                && folded_tree
-                    .zip(branch_tree)
-                    .is_some_and(|(folded, branch)| folded == branch)
-        });
+        let skip_gate =
+            skip_gate_if_tree_unchanged(repo_root, &base, &folded_tip, &branch_tip, trusted_base)?;
         if gate_on && !skip_gate {
             if crate::fold_cancel::requested() {
                 return Ok(AttemptOutcome::GateError {
@@ -3324,6 +3339,15 @@ mod tests {
         assert!(parse_merge_config(b"").unwrap().is_empty());
         assert!(parse_merge_config(b"merge.bad=name.driver\ncmd\0").is_err());
         assert!(parse_merge_config(b"merge.bad.driver\ncmd\0merge.bad.driver\ncmd=evil\0").is_ok());
+    }
+
+    #[test]
+    fn gate_skip_tree_probe_reports_a_git_failure() {
+        let dir = tempfile::tempdir().unwrap();
+        let error = skip_gate_if_tree_unchanged(dir.path(), "main", "HEAD", "HEAD", Some("main"))
+            .unwrap_err();
+        assert!(error.to_string().contains("folded tree"), "{error}");
+        assert!(error.to_string().contains("Git"), "{error}");
     }
 
     /// Minimal real-git fixture: a repo with `main` plus N branches each adding

@@ -7,9 +7,10 @@
 //! hidden top-level commands; both spellings share these arg structs and
 //! dispatch to the same functions, so they cannot drift.
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use thegn_core::config::Config;
 use thegn_core::db::Db;
+use thegn_core::remote::GitLoc;
 use thegn_core::store::WorkspaceStore;
 use thegn_core::{msg, outln, util, worktree};
 
@@ -860,17 +861,34 @@ pub(crate) fn resolve_folder_target(target: &std::path::Path) -> Result<FolderTa
     let worktree_root = resolve_worktree_root(target)?;
     let repo_root =
         thegn_core::repo::main_worktree(&worktree_root).ok_or_else(|| not_worktree(target))?;
-    let branch = util::git_out(&worktree_root, &["symbolic-ref", "--short", "-q", "HEAD"])
-        .or_else(|| {
-            util::git_out(&worktree_root, &["rev-parse", "--short", "HEAD"])
-                .map(|commit| format!("detached-{commit}"))
-        })
-        .ok_or_else(|| anyhow::anyhow!("could not determine worktree identity"))?;
+    let branch = resolve_folder_branch(&worktree_root)
+        .with_context(|| format!("resolving worktree identity in {}", worktree_root.display()))?;
     Ok(FolderTarget {
         repo_path: repo_root.to_string_lossy().into_owned(),
         worktree_path: worktree_root.to_string_lossy().into_owned(),
         branch,
     })
+}
+
+fn resolve_folder_branch(worktree_root: &std::path::Path) -> Result<String> {
+    let loc = GitLoc::Local(worktree_root.to_path_buf());
+    match loc.git_text(&["symbolic-ref", "--short", "-q", "HEAD"]) {
+        Ok(branch) if !branch.is_empty() => Ok(branch),
+        Ok(_) => anyhow::bail!("Git returned an empty worktree branch"),
+        Err(error) if base_is_absent(&error) => {
+            let commit = loc
+                .git_text(&["rev-parse", "--short", "HEAD"])
+                .map_err(|error| anyhow::anyhow!("Git detached HEAD probe failed: {error}"))
+                .context("reading detached HEAD")?;
+            if commit.is_empty() {
+                anyhow::bail!("Git returned an empty detached HEAD");
+            }
+            Ok(format!("detached-{commit}"))
+        }
+        Err(error) => Err(anyhow::anyhow!(
+            "could not read the worktree branch: {error}"
+        )),
+    }
 }
 
 /// File a resolved target into `folder_name`. Everything knowable up front is
@@ -1744,6 +1762,17 @@ mod rm_tests {
             code: Some(1),
             stderr_tail: "repository error".to_string(),
         })));
+    }
+
+    #[test]
+    fn folder_branch_probe_reports_git_failure_instead_of_detached_fallback() {
+        let dir = tempfile::tempdir_in("/tmp").unwrap();
+        let error = resolve_folder_branch(dir.path()).unwrap_err().to_string();
+        assert!(
+            error.contains("could not read the worktree branch"),
+            "{error}"
+        );
+        assert!(error.contains("Git"), "{error}");
     }
 
     #[test]
