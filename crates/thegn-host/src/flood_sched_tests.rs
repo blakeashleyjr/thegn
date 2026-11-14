@@ -233,10 +233,12 @@ impl Simulator {
             self.last_flush_step = self.clock.step;
         }
 
-        let mut damage = Damage::default();
-        damage.chrome = input.is_some();
-        damage.bars = status_taken;
-        damage.panes = drained_panes.iter().copied().collect::<HashSet<_>>();
+        let damage = Damage {
+            chrome: input.is_some(),
+            bars: status_taken,
+            panes: drained_panes.iter().copied().collect::<HashSet<_>>(),
+            ..Damage::default()
+        };
         let render_skipped = matches!(plan(&damage, &Overlays::default()), RenderPlan::Skip);
         let follow_up_scheduled = self.total_backlog() > 0;
         self.scheduled_follow_up = follow_up_scheduled;
