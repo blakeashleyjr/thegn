@@ -7,6 +7,22 @@ All notable changes to **thegn** are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.1.0-alpha.79] — 2026-11-14
+
+### Added
+
+- For GitHub or GitLab CI, `thegn doctor` adds a value-free `CI credential placement` section with `credential placement: github/local`, `github/ssh`, and `github/provider` (plus matching `gitlab/...` rows); JSON keeps the notes under `providers`.
+- The workspace picker adds a `broad root: … (scan limited to 20000 repos)` warning row for roots such as `/` or your home directory without refusing them.
+
+### Changed
+
+- On Linux, PDF previews require usable `bwrap` and Mermaid previews are refused as uncontained, with Mermaid falling back to source text; other platforms mark uncontained previews.
+
+### Fixed
+
+- Duplicate CI detail requests no longer run twice, and provider JSON is capped by total bytes, object and array size, depth, and item count.
+- Native provider exec output is chunked and byte-bounded, so a flood cannot grow retained memory without limit.
+
 ## [0.1.0-alpha.78] — 2026-11-14
 
 ### Added
@@ -3425,7 +3441,8 @@ launcher picker and the merge queue's `agent_command` hook remain — they run
 whatever commands you configure. Leftover `[llm_proxy]` config sections and
 `proxy_*` tables in existing state databases are ignored harmlessly.
 
-[Unreleased]: https://github.com/blakeashleyjr/thegn/compare/v0.1.0-alpha.78...HEAD
+[Unreleased]: https://github.com/blakeashleyjr/thegn/compare/v0.1.0-alpha.79...HEAD
+[0.1.0-alpha.79]: https://github.com/blakeashleyjr/thegn/compare/v0.1.0-alpha.78...v0.1.0-alpha.79
 [0.1.0-alpha.78]: https://github.com/blakeashleyjr/thegn/compare/v0.1.0-alpha.77...v0.1.0-alpha.78
 [0.1.0-alpha.77]: https://github.com/blakeashleyjr/thegn/compare/v0.1.0-alpha.76...v0.1.0-alpha.77
 [0.1.0-alpha.76]: https://github.com/blakeashleyjr/thegn/compare/v0.1.0-alpha.75...v0.1.0-alpha.76

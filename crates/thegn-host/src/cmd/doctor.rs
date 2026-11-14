@@ -799,7 +799,15 @@ fn preview_renderers_report() {
             report["bwrap"].as_str().unwrap_or("(unresolved)")
         );
     } else {
-        outln!("  containment   unavailable: no usable bwrap; ready PDF previews run uncontained");
+        if std::env::consts::OS == "linux" {
+            outln!(
+                "  containment   unavailable: no usable bwrap; PDF and Mermaid previews are refused (source or note shown)"
+            );
+        } else {
+            outln!(
+                "  containment   unavailable: no usable bwrap; PDF previews run uncontained (marked)"
+            );
+        }
     }
     for row in report["renderers"].as_array().into_iter().flatten() {
         let program = row["program"].as_str().unwrap_or("unknown");
@@ -989,6 +997,35 @@ fn providers_json(cfg: &Config) -> serde_json::Value {
     serde_json::to_value(thegn_svc::seam::registry::probes(cfg)).unwrap_or_default()
 }
 
+fn ci_credential_placement_report(cfg: &Config) {
+    use thegn_core::config::CiProviderKind;
+    use thegn_core::secretref::BareAs;
+    use thegn_svc::ci_credential_report::{self, CredentialMode, Placement, Provider};
+
+    let (provider, mode) = match cfg.ci.provider {
+        CiProviderKind::Github => (Provider::Github, CredentialMode::GithubCliManaged),
+        CiProviderKind::Auto | CiProviderKind::Gitlab => (
+            Provider::Gitlab,
+            ci_credential_report::gitlab_mode(
+                &cfg.ci.gitlab.token,
+                &thegn_svc::secret::resolve_outcome(
+                    &cfg.ci.gitlab.token,
+                    BareAs::Literal,
+                    "ci:gitlab",
+                ),
+            ),
+        ),
+        _ => return,
+    };
+    outln!("CI credential placement");
+    for placement in Placement::ALL {
+        outln!(
+            "  {}",
+            ci_credential_report::report(provider, mode, placement).note
+        );
+    }
+}
+
 fn toolchain_json(cfg: &Config) -> serde_json::Value {
     let worktree = std::env::current_dir().unwrap_or_else(|_| std::env::temp_dir());
     let root = thegn_core::repo::main_worktree(&worktree).unwrap_or_else(|| worktree.clone());
@@ -1060,9 +1097,13 @@ fn providers_report(cfg: &Config) {
         };
         outln!("  {:<9} {:<24} {state}{why}", r.seam, r.id);
         for n in &r.notes {
+            if n.starts_with("credential placement:") {
+                continue;
+            }
             outln!("  {:<9} {:<24}   {n}", "", "");
         }
     }
+    ci_credential_placement_report(cfg);
     let sound = crate::notification_sound::SoundRuntime::report(&cfg.notifications.sound);
     let provider = &sound["provider"];
     let availability = provider["availability"]["state"]
@@ -5827,6 +5868,46 @@ mod pins;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn doctor_json_credential_notes_match_shared_value_free_rows() {
+        use thegn_core::secretref::BareAs;
+        use thegn_svc::ci_credential_report::{self, CredentialMode, Placement, Provider};
+
+        let mut cfg = Config::default();
+        cfg.ci.gitlab.token = "literal-token-configured-in-test".into();
+        let report = doctor_json(&cfg);
+        let provider = report["providers"]
+            .as_array()
+            .and_then(|rows| rows.iter().find(|row| row["id"] == "auto"))
+            .expect("auto CI provider row");
+        let notes = provider["notes"]
+            .as_array()
+            .expect("provider notes")
+            .iter()
+            .filter_map(serde_json::Value::as_str)
+            .filter(|note| note.starts_with("credential placement:"))
+            .map(str::to_owned)
+            .collect::<Vec<_>>();
+        let mode = ci_credential_report::gitlab_mode(
+            &cfg.ci.gitlab.token,
+            &thegn_svc::secret::resolve_outcome(&cfg.ci.gitlab.token, BareAs::Literal, "ci:gitlab"),
+        );
+        let expected = Placement::ALL
+            .map(|placement| ci_credential_report::report(Provider::Gitlab, mode, placement).note)
+            .into_iter()
+            .collect::<Vec<_>>();
+        assert_eq!(notes, expected);
+        assert!(
+            notes
+                .iter()
+                .all(|note| !note.contains("literal-token-configured-in-test"))
+        );
+        assert_eq!(
+            CredentialMode::GitlabTokenRefPresent { explicit: true },
+            mode
+        );
+    }
 
     #[test]
     fn doctor_json_carries_the_worktree_sandbox_pins_key() {

@@ -22,6 +22,53 @@ pub struct Raster {
     pub kitty: Option<std::sync::Arc<crate::graphics::KittyPayload>>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Policy {
+    Run,
+    RunMarked,
+    Refuse,
+}
+
+/// Select the renderer action without consulting the host platform at compile
+/// time. Linux refuses an uncontained renderer; other platforms can show the
+/// result with an explicit marker.
+pub(crate) const fn containment_policy(os_is_linux: bool, contained: bool) -> Policy {
+    match (os_is_linux, contained) {
+        (true, true) | (false, true) => Policy::Run,
+        (true, false) => Policy::Refuse,
+        (false, false) => Policy::RunMarked,
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RendererRefusal {
+    ContainmentUnavailable,
+}
+
+impl RendererRefusal {
+    pub(crate) const fn note(self) -> &'static str {
+        match self {
+            Self::ContainmentUnavailable => "containment unavailable",
+        }
+    }
+}
+
+impl std::fmt::Display for RendererRefusal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.note())
+    }
+}
+
+pub(crate) struct RenderedRaster {
+    pub(crate) raster: Raster,
+    pub(crate) uncontained: bool,
+}
+
+pub(crate) struct RenderedText {
+    pub(crate) text: String,
+    pub(crate) uncontained: bool,
+}
+
 /// Cap the longest visible raster side so the kitty payload (and base64 of it)
 /// stays bounded — a preview pane is a few hundred pixels at most. This display
 /// cap is separate from the source decode budget in [`PREVIEW_LIMITS`].
@@ -623,29 +670,51 @@ fn renderer_launch(
     command
 }
 
+fn renderer_command_for_policy(
+    program: &Path,
+    stage: &RenderStage,
+    bwrap: Option<&Path>,
+    host_home: Option<&Path>,
+    os_is_linux: bool,
+) -> Result<Command, RendererRefusal> {
+    match containment_policy(os_is_linux, bwrap.is_some()) {
+        Policy::Refuse => Err(RendererRefusal::ContainmentUnavailable),
+        Policy::Run | Policy::RunMarked => Ok(renderer_launch(
+            program,
+            stage,
+            bwrap,
+            host_home,
+            &renderer_hidden_dirs(),
+        )),
+    }
+}
+
 fn contained_renderer_command_with_cancel(
     program: &Path,
     stage: &RenderStage,
     previewed: &Path,
     cancel: &AtomicBool,
-) -> Command {
+) -> Result<Command, RendererRefusal> {
     let host_home = canonical_renderer_home(std::env::var_os("HOME").map(PathBuf::from));
     let bwrap = renderer_for("bwrap", previewed)
         .ok()
         .filter(|bwrap| bwrap_usable(bwrap, stage, host_home.as_deref(), cancel));
-    if bwrap.is_none() {
+    if matches!(
+        containment_policy(std::env::consts::OS == "linux", bwrap.is_some()),
+        Policy::RunMarked
+    ) {
         tracing::debug!(
             target: "thegn::preview",
             program = %program.display(),
             "renderer containment unavailable; running uncontained"
         );
     }
-    renderer_launch(
+    renderer_command_for_policy(
         program,
         stage,
         bwrap.as_deref(),
         host_home.as_deref(),
-        &renderer_hidden_dirs(),
+        std::env::consts::OS == "linux",
     )
 }
 
@@ -888,17 +957,30 @@ pub(crate) fn image_bytes_with_limits(
 /// Errs (→ text fallback) when the tool is absent, fails, exceeds the renderer
 /// deadline or `cancel` is raised; the whole process group is killed and
 /// reaped on every path. Blocking.
+#[cfg(test)]
 pub fn pdf_page1(path: &Path, cancel: &AtomicBool) -> Result<Raster, String> {
+    pdf_page1_with_status(path, cancel).map(|rendered| rendered.raster)
+}
+
+pub(crate) fn pdf_page1_with_status(
+    path: &Path,
+    cancel: &AtomicBool,
+) -> Result<RenderedRaster, String> {
     let stage = RenderStage::new()?;
     let staged = stage_input(&stage, path, "input.pdf", MAX_PREVIEW_FILE_BYTES)
         .map_err(|e| format!("preview staging failed: {e}"))?;
     let program = renderer_for("pdftoppm", path)
         .map_err(|e| format!("pdftoppm: {}", e.describe("pdftoppm")))?;
-    let mut cmd = contained_renderer_command_with_cancel(&program, &stage, path, cancel);
+    let mut cmd = contained_renderer_command_with_cancel(&program, &stage, path, cancel)
+        .map_err(|error| error.to_string())?;
+    let uncontained = cmd.get_program() == program.as_os_str();
     cmd.args(pdftoppm_args(&staged));
     let out = crate::preview_jobs::run_renderer(&mut cmd, cancel)
         .map_err(|e| format!("pdftoppm: {}", capture_err(&e)))?;
-    decode_and_fit(&out, PREVIEW_LIMITS)
+    Ok(RenderedRaster {
+        raster: decode_and_fit(&out, PREVIEW_LIMITS)?,
+        uncontained,
+    })
 }
 
 /// Bound pdftoppm's own page bitmap allocation. The visible raster is at most
@@ -918,7 +1000,15 @@ fn pdftoppm_args(path: &Path) -> Vec<OsString> {
 /// Extract a PDF's text via `pdftotext` (the no-graphics fallback). Output cut
 /// at the byte cap is returned truncated (fine for text); `Err` carries a
 /// truthful reason (absent tool, failure, timeout, cancel). Blocking.
+#[cfg(test)]
 pub fn pdf_text(path: &Path, cancel: &AtomicBool) -> Result<String, String> {
+    pdf_text_with_status(path, cancel).map(|rendered| rendered.text)
+}
+
+pub(crate) fn pdf_text_with_status(
+    path: &Path,
+    cancel: &AtomicBool,
+) -> Result<RenderedText, String> {
     use crate::preview_jobs::CaptureError as C;
     let stage = RenderStage::new()?;
     let staged = stage_input(&stage, path, "input.pdf", MAX_PREVIEW_FILE_BYTES)
@@ -928,10 +1018,15 @@ pub fn pdf_text(path: &Path, cancel: &AtomicBool) -> Result<String, String> {
         Err(RendererLookup::Missing) => return Err("no text extractor available".to_string()),
         Err(error) => return Err(error.describe("pdftotext")),
     };
-    let mut cmd = contained_renderer_command_with_cancel(&program, &stage, path, cancel);
+    let mut cmd = contained_renderer_command_with_cancel(&program, &stage, path, cancel)
+        .map_err(|error| error.to_string())?;
+    let uncontained = cmd.get_program() == program.as_os_str();
     cmd.args(pdftotext_args(&staged));
     match crate::preview_jobs::run_renderer(&mut cmd, cancel) {
-        Ok(out) | Err(C::Capped(out)) => Ok(String::from_utf8_lossy(&out).into_owned()),
+        Ok(out) | Err(C::Capped(out)) => Ok(RenderedText {
+            text: String::from_utf8_lossy(&out).into_owned(),
+            uncontained,
+        }),
         Err(C::Spawn(_)) => Err("no text extractor available".to_string()),
         Err(e) => Err(format!("text extraction {}", capture_err(&e))),
     }
@@ -945,17 +1040,33 @@ fn pdftotext_args(path: &Path) -> Vec<OsString> {
 /// fallback) when the tool is absent, fails, times out or is cancelled; the
 /// renderer's whole process tree (mmdc spawns a browser) is killed and reaped.
 /// Blocking.
+#[cfg(test)]
 pub fn mermaid(path: &Path, cancel: &AtomicBool) -> Result<Raster, String> {
+    mermaid_with_status(path, cancel).map(|rendered| rendered.raster)
+}
+
+pub(crate) fn mermaid_with_status(
+    path: &Path,
+    cancel: &AtomicBool,
+) -> Result<RenderedRaster, String> {
     let stage = RenderStage::new()?;
     let staged = stage_input(&stage, path, "input.mmd", MAX_MERMAID_INPUT_BYTES)
         .map_err(|e| format!("preview staging failed: {e}"))?;
     let tmp = stage.path().join("render.png");
     let program =
         renderer_for("mmdc", path).map_err(|e| format!("mmdc: {}", e.describe("mmdc")))?;
+    let uncontained = match containment_policy(std::env::consts::OS == "linux", false) {
+        Policy::Refuse => return Err(RendererRefusal::ContainmentUnavailable.to_string()),
+        Policy::RunMarked => true,
+        Policy::Run => false,
+    };
     let mut cmd = renderer_command(&program, &stage);
     cmd.args(mermaid_args(&staged, &tmp));
     match crate::preview_jobs::run_renderer_quiet(&mut cmd, cancel) {
-        Ok(()) => read_mermaid_output(stage.path(), "render.png", MAX_MERMAID_OUTPUT_BYTES),
+        Ok(()) => Ok(RenderedRaster {
+            raster: read_mermaid_output(stage.path(), "render.png", MAX_MERMAID_OUTPUT_BYTES)?,
+            uncontained,
+        }),
         Err(e) => Err(format!("mmdc: {}", capture_err(&e))),
     }
 }
@@ -1032,6 +1143,35 @@ mod tests {
             repo_bin,
             system,
             other,
+        }
+    }
+
+    #[test]
+    fn containment_policy_covers_platform_and_containment_table() {
+        let cases = [
+            (true, true, Policy::Run),
+            (true, false, Policy::Refuse),
+            (false, true, Policy::Run),
+            (false, false, Policy::RunMarked),
+        ];
+        for (os_is_linux, contained, expected) in cases {
+            assert_eq!(containment_policy(os_is_linux, contained), expected);
+        }
+    }
+
+    #[test]
+    fn containment_refusal_never_returns_a_command_to_spawn() {
+        let stage = RenderStage::new().unwrap();
+        let result = renderer_command_for_policy(
+            Path::new("/tmp/fake-renderer-that-panics-if-run"),
+            &stage,
+            None,
+            None,
+            true,
+        );
+        match result {
+            Err(RendererRefusal::ContainmentUnavailable) => {}
+            Ok(_) => panic!("an uncontained Linux renderer must not be returned"),
         }
     }
 

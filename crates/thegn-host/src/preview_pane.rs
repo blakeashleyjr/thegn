@@ -37,6 +37,8 @@ pub(crate) const PREVIEW_MAX_LINE_BYTES: usize = 4096;
 pub(crate) const PREVIEW_MAX_TOTAL_BYTES: usize = 4 * 1024 * 1024;
 /// Maximum prefix retained for a binary hex preview.
 const HEX_PREVIEW_BYTES: usize = 4096;
+const UNCONTAINED_MARKER: &str = "(renderer ran uncontained)";
+const CONTAINMENT_UNAVAILABLE_NOTE: &str = "(containment unavailable)";
 
 /// Read a file off the loop for the inline Files preview and route it by
 /// content type, sending text lines (always) and — when `kitty` and the route
@@ -152,26 +154,50 @@ fn route_and_render(
         PreviewRoute::Image => graphical(
             abs,
             kitty,
-            || crate::rasterize::image_file(abs),
-            || Err("image preview needs a graphics-capable terminal".to_string()),
+            || crate::rasterize::image_file(abs).map(|r| (r, false)),
+            |_| Err("image preview needs a graphics-capable terminal".to_string()),
         ),
         PreviewRoute::Mermaid => graphical(
             abs,
             kitty,
-            || crate::rasterize::mermaid(abs, cancel),
             || {
-                // Fallback: show the Mermaid source as text.
-                read_text(abs)
+                crate::rasterize::mermaid_with_status(abs, cancel)
+                    .map(|rendered| (rendered.raster, rendered.uncontained))
+            },
+            |reason| {
+                mermaid_source_fallback(
+                    abs,
+                    reason.is_some_and(|reason| {
+                        reason == crate::rasterize::RendererRefusal::ContainmentUnavailable.note()
+                    }) || (!kitty
+                        && matches!(
+                            crate::rasterize::containment_policy(
+                                std::env::consts::OS == "linux",
+                                false
+                            ),
+                            crate::rasterize::Policy::Refuse
+                        )),
+                )
             },
         ),
         PreviewRoute::Pdf => graphical(
             abs,
             kitty,
-            || crate::rasterize::pdf_page1(abs, cancel),
             || {
+                crate::rasterize::pdf_page1_with_status(abs, cancel)
+                    .map(|rendered| (rendered.raster, rendered.uncontained))
+            },
+            |_| {
                 // Fallback: extracted text, or a truthful note on why there is none.
-                Ok(match crate::rasterize::pdf_text(abs, cancel) {
-                    Ok(t) => bounded_lines(&t),
+                Ok(match crate::rasterize::pdf_text_with_status(abs, cancel) {
+                    Ok(rendered) => {
+                        let mut lines = bounded_lines(&rendered.text);
+                        if rendered.uncontained {
+                            lines.truncate(PREVIEW_MAX_LINES.saturating_sub(1));
+                            lines.push(UNCONTAINED_MARKER.to_string());
+                        }
+                        lines
+                    }
                     Err(why) => vec![bounded_line(&format!("(PDF — {why})"))],
                 })
             },
@@ -187,23 +213,38 @@ fn route_and_render(
 fn graphical(
     abs: &std::path::Path,
     kitty: bool,
-    rasterize: impl FnOnce() -> Result<Raster, String>,
-    text_fallback: impl FnOnce() -> Result<Vec<String>, String>,
+    rasterize: impl FnOnce() -> Result<(Raster, bool), String>,
+    text_fallback: impl FnOnce(Option<&str>) -> Result<Vec<String>, String>,
 ) -> Rendered {
     if kitty {
         match rasterize() {
-            Ok(r) => {
-                let caption = vec![
-                    caption(abs, r.w, r.h),
-                    String::new(),
-                    "(shown via terminal graphics)".to_string(),
-                ];
+            Ok((r, uncontained)) => {
+                let mut caption = vec![caption(abs, r.w, r.h), String::new()];
+                if uncontained {
+                    caption.push(UNCONTAINED_MARKER.to_string());
+                }
+                caption.push("(shown via terminal graphics)".to_string());
                 return (Ok(caption), Some((r.rgba, r.w, r.h)));
             }
-            Err(e) => tracing::debug!("preview rasterize failed, using text: {e}"),
+            Err(e) => {
+                tracing::debug!("preview rasterize failed, using text: {e}");
+                return (text_fallback(Some(&e)), None);
+            }
         }
     }
-    (text_fallback(), None)
+    (text_fallback(None), None)
+}
+
+fn mermaid_source_fallback(
+    abs: &std::path::Path,
+    renderer_refused: bool,
+) -> Result<Vec<String>, String> {
+    let mut lines = read_text(abs)?;
+    if renderer_refused {
+        lines.truncate(PREVIEW_MAX_LINES.saturating_sub(1));
+        lines.push(CONTAINMENT_UNAVAILABLE_NOTE.to_string());
+    }
+    Ok(lines)
 }
 
 /// A one-line caption for a graphical preview.
@@ -521,6 +562,67 @@ mod tests {
             lines.len() <= PREVIEW_MAX_LINES,
             "retained {} lines",
             lines.len()
+        );
+    }
+
+    #[test]
+    fn refused_mermaid_source_fallback_keeps_note_inside_shared_line_cap() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("many-lines.mmd");
+        std::fs::write(&path, "x\n".repeat(60_000)).unwrap();
+
+        let lines = mermaid_source_fallback(&path, true).unwrap();
+        assert!(lines.len() <= PREVIEW_MAX_LINES);
+        assert_eq!(
+            lines.last(),
+            Some(&CONTAINMENT_UNAVAILABLE_NOTE.to_string())
+        );
+    }
+
+    #[test]
+    fn graphical_preview_marks_an_uncontained_renderer() {
+        let (text, raster) = graphical(
+            std::path::Path::new("diagram.pdf"),
+            true,
+            || {
+                Ok((
+                    Raster {
+                        rgba: vec![255, 0, 0, 255],
+                        w: 1,
+                        h: 1,
+                        kitty: None,
+                    },
+                    true,
+                ))
+            },
+            |_| Err("fallback should not run".to_string()),
+        );
+        assert!(raster.is_some());
+        assert!(text.unwrap().iter().any(|line| line == UNCONTAINED_MARKER));
+    }
+
+    #[test]
+    fn mermaid_linux_source_fallback_explains_containment_refusal() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("diagram.mmd");
+        std::fs::write(&path, "graph TD\n  A-->B\n").unwrap();
+
+        let lines = mermaid_source_fallback(
+            &path,
+            matches!(
+                crate::rasterize::containment_policy(std::env::consts::OS == "linux", false),
+                crate::rasterize::Policy::Refuse
+            ),
+        )
+        .unwrap();
+        let policy = crate::rasterize::containment_policy(std::env::consts::OS == "linux", false);
+        assert_eq!(
+            lines.last().map(String::as_str),
+            if matches!(policy, crate::rasterize::Policy::Refuse) {
+                Some(CONTAINMENT_UNAVAILABLE_NOTE)
+            } else {
+                Some("  A-->B")
+            }
         );
     }
 
