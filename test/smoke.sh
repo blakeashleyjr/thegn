@@ -19,6 +19,7 @@ SZ="$(cd "$(dirname "$SZ")" && pwd)/$(basename "$SZ")"
 }
 
 TMP="$(mktemp -d)"
+SMOKE_RUNTIME_DIR=""
 FIXTURE_DAEMON_PIDS=()
 FIXTURE_DAEMON_SOCKETS=()
 track_daemon() {
@@ -94,9 +95,14 @@ cleanup() {
   [[ -d "$TMP/.local/share/containers" ]] && podman unshare rm -rf "$TMP/.local/share/containers" >/dev/null 2>&1 || true
   # Cleanup must stay inside this test's runtime root even if a signal arrives
   # before the isolated XDG_RUNTIME_DIR export below.
-  local pause_pid_file="$TMP/run/libpod/tmp/pause.pid"
-  if [[ -f $pause_pid_file ]]; then
-    kill "$(cat "$pause_pid_file" 2>/dev/null)" 2>/dev/null || true
+  if [[ -n $SMOKE_RUNTIME_DIR ]]; then
+    local pause_pid_file="$SMOKE_RUNTIME_DIR/libpod/tmp/pause.pid"
+    if [[ -f $pause_pid_file ]]; then
+      kill "$(cat "$pause_pid_file" 2>/dev/null)" 2>/dev/null || true
+    fi
+  fi
+  if [[ -n $SMOKE_RUNTIME_DIR && -d $SMOKE_RUNTIME_DIR ]]; then
+    rm -rf "$SMOKE_RUNTIME_DIR" 2>/dev/null || true
   fi
   rm -rf "$TMP" 2>/dev/null || true
   exit "$rc"
@@ -105,6 +111,24 @@ trap cleanup EXIT
 trap 'exit 129' HUP
 trap 'exit 130' INT
 trap 'exit 143' TERM
+
+# Keep the runtime directory outside $TMP. `mktemp` places $TMP under the
+# caller's TMPDIR, which is commonly a bound /tmp/nix-shell.* tree in CI; the
+# sandbox must not be able to reach the daemon socket through that bind.
+SMOKE_RUNTIME_PARENT="${RUNTIME_PARENT:-/var/tmp}"
+if [[ ! -d $SMOKE_RUNTIME_PARENT ]]; then
+  # Minimal containers may omit /var/tmp. The /tmp fallback is still outside
+  # the per-run /tmp/nix-shell.* tree created through TMPDIR.
+  SMOKE_RUNTIME_PARENT=/tmp
+fi
+SMOKE_RUNTIME_DIR="$(mktemp -d "$SMOKE_RUNTIME_PARENT/tg-smoke-run.XXXXXX")"
+chmod 700 "$SMOKE_RUNTIME_DIR"
+case $SMOKE_RUNTIME_DIR in
+"$TMP" | "$TMP"/*)
+  echo "smoke: runtime directory must be outside the fixture root: $SMOKE_RUNTIME_DIR" >&2
+  exit 1
+  ;;
+esac
 
 export HOME="$TMP" XDG_CONFIG_HOME="$TMP/.config" XDG_STATE_HOME="$TMP/.local/state"
 # Git's config is part of the fixture boundary too. A runner may provide a
@@ -121,7 +145,7 @@ done
 # Isolate the runtime dir too: the daemon control socket lives under
 # $XDG_RUNTIME_DIR/thegn/<scope>/daemon.sock, so leaving the real one exported
 # would let the socket probe cross-connect these checks to a live daemon.
-export XDG_RUNTIME_DIR="$TMP/run"
+export XDG_RUNTIME_DIR="$SMOKE_RUNTIME_DIR"
 mkdir -p "$XDG_RUNTIME_DIR"
 # Isolate the `[database]` migration policy. These are ambient in any shell
 # started from inside a live thegn (it exports the pin so a stale binary can
