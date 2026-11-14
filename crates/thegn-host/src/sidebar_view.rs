@@ -1686,11 +1686,15 @@ fn row_is_blocked(row: &crate::sidebar::SidebarRow) -> bool {
 /// is this worktree's agent in"), never a label to read in full, and the
 /// worktree name must keep the space.
 fn stage_tag(row: &crate::sidebar::SidebarRow) -> Option<String> {
+    use thegn_core::pipeline_report::display_cell;
     let s = row.pipeline_stage.as_deref()?.trim();
     if s.is_empty() {
         return None;
     }
-    let short: String = s.chars().take(STAGE_TAG_MAX).collect();
+    let short = display_cell(s)
+        .chars()
+        .take(STAGE_TAG_MAX)
+        .collect::<String>();
     Some(format!("{short} "))
 }
 
@@ -1763,6 +1767,7 @@ fn compose_row_lines(
 ) -> Vec<crate::seg::Line> {
     use crate::seg::{Line, Seg, Tok, seg, sp};
     use crate::sidebar::{ActivityState, RowKind};
+    use thegn_core::pipeline_report::display_cell;
     let gl = crate::caps::active_glyphs();
     let caret = |collapsed: bool| {
         if collapsed {
@@ -1807,7 +1812,7 @@ fn compose_row_lines(
                 // generic emphasis diamond (`◆`, ASCII `*`).
                 l.push(seg(Tok::Slot(S::Accent), format!("{} ", gl.diamond_filled)));
             }
-            l.push(seg(Tok::Slot(S::Accent), row.label.clone()).bold());
+            l.push(seg(Tok::Slot(S::Accent), display_cell(&row.label)).bold());
             let (right, mq_width) = workspace_right_cluster(row, pool, content_cols);
             *mq_geometry = mq_width.map(|width| (width, crate::seg::seg_width(&right)));
             if right.is_empty() {
@@ -1818,11 +1823,11 @@ fn compose_row_lines(
         }
         RowKind::SectionHeading => vec![Line::Segs(vec![
             sp(1),
-            seg(Tok::Slot(S::Text), row.label.clone()).bold(),
+            seg(Tok::Slot(S::Text), display_cell(&row.label)).bold(),
         ])],
         RowKind::EmptyHint => vec![Line::Segs(vec![
             sp(3),
-            seg(Tok::Slot(S::Faint), row.label.clone()),
+            seg(Tok::Slot(S::Faint), display_cell(&row.label)),
         ])],
         // A derived `Pipelines` group under a workspace: caret + name + how
         // many lanes it holds. It reads like a folder because it behaves like
@@ -1830,9 +1835,9 @@ fn compose_row_lines(
         // derived folder never outranks the user's own.
         RowKind::PipelineGroup => {
             let label = if row.child_count > 0 {
-                format!("{} ({})", row.label, row.child_count)
+                format!("{} ({})", display_cell(&row.label), row.child_count)
             } else {
-                row.label.clone()
+                display_cell(&row.label)
             };
             vec![Line::Segs(vec![
                 sp(1),
@@ -1846,9 +1851,9 @@ fn compose_row_lines(
         // level in from its group's caret.
         RowKind::PipelineLane => {
             let label = if row.child_count > 0 {
-                format!("{} ({})", row.label, row.child_count)
+                format!("{} ({})", display_cell(&row.label), row.child_count)
             } else {
-                row.label.clone()
+                display_cell(&row.label)
             };
             vec![Line::Segs(vec![
                 sp(1),
@@ -1872,7 +1877,7 @@ fn compose_row_lines(
             } else {
                 Tok::Slot(S::Faint)
             };
-            l.push(seg(tok, row.label.clone()));
+            l.push(seg(tok, display_cell(&row.label)));
             vec![Line::Segs(l)]
         }
         RowKind::Folder => {
@@ -1885,7 +1890,7 @@ fn compose_row_lines(
                 seg(Tok::Slot(S::Faint), caret(row.collapsed)),
                 sp(1),
                 seg(Tok::Slot(S::Faint), format!("{} ", gl.folder)), // ▪
-                seg(Tok::Slot(S::Text), row.label.clone()),
+                seg(Tok::Slot(S::Text), display_cell(&row.label)),
             ];
             if row.child_count > 0 {
                 l.push(seg(Tok::Slot(S::Faint), format!(" ({})", row.child_count)));
@@ -1907,7 +1912,7 @@ fn compose_row_lines(
             let mut l = vec![sp(1)];
             l.extend(tree_lead(row.depth, is_last));
             l.push(seg(Tok::Slot(S::Dim), format!("{host} ")));
-            l.push(seg(Tok::Slot(S::Dim), row.label.clone()));
+            l.push(seg(Tok::Slot(S::Dim), display_cell(&row.label)));
             vec![Line::Segs(l)]
         }
         RowKind::Worktree => {
@@ -1944,7 +1949,10 @@ fn compose_row_lines(
             // Flat cross-workspace layout tags each row with its repo, dim, so
             // a cross-repo list still shows which workspace a worktree is in.
             if let Some(prefix) = &row.repo_prefix {
-                left.push(seg(Tok::Slot(S::Faint), format!("{prefix}/")));
+                left.push(seg(
+                    Tok::Slot(S::Faint),
+                    format!("{}/", display_cell(prefix)),
+                ));
             }
             // Main line is the dynamic name (OSC window title) or the branch; PR
             // moves to a compact right-cluster chip + the focused detail line.
@@ -1952,7 +1960,7 @@ fn compose_row_lines(
                 window_title,
                 crate::sidebar::row_display_branch(row),
             );
-            left.push(seg(name_fg, label));
+            left.push(seg(name_fg, display_cell(&label)));
 
             // Right cluster (always-on): git status icon + uncommitted diff stat +
             // ahead/behind + PR chip + alert badge (the rest moves to the detail).
@@ -2102,6 +2110,7 @@ fn compose_row_lines(
 fn compose_rail_line(row: &crate::sidebar::SidebarRow) -> crate::seg::Line {
     use crate::seg::{Line, Tok, seg, sp};
     use crate::sidebar::{ActivityState, RowKind};
+    use thegn_core::pipeline_report::display_cell;
     let gl = crate::caps::active_glyphs();
     let initial = |label: &str| -> String {
         label
@@ -2125,7 +2134,12 @@ fn compose_rail_line(row: &crate::sidebar::SidebarRow) -> crate::seg::Line {
             } else {
                 Tok::Slot(S::Dim)
             };
-            Line::Segs(vec![sp(1), dot, sp(1), seg(fg, initial(&row.label))])
+            Line::Segs(vec![
+                sp(1),
+                dot,
+                sp(1),
+                seg(fg, initial(&display_cell(&row.label))),
+            ])
         }
         // A workspace keeps its identity at rail width: a bold initial in the
         // letter column (no dot cell — headers have no activity).
@@ -2133,7 +2147,7 @@ fn compose_rail_line(row: &crate::sidebar::SidebarRow) -> crate::seg::Line {
             sp(3),
             seg(
                 crate::sidebar_mq::rail_tone(row.mq_rollup),
-                initial(&row.label),
+                initial(&display_cell(&row.label)),
             )
             .bold(),
         ]),
@@ -2152,6 +2166,7 @@ fn draw_row_menu(
     menu: &RowMenu,
     accent: ColorAttribute,
 ) {
+    use thegn_core::pipeline_report::display_cell;
     let gl = crate::caps::active_glyphs();
     let mrect = menu_rect(rect, frame, menu);
     // The other `layer::open_layer` bypass (hand-rolled rows, no card). It draws
@@ -2193,7 +2208,7 @@ fn draw_row_menu(
             surface,
             rect.x + 1,
             y,
-            &format!("{} {}", gl.chevron, entry.label),
+            &format!("{} {}", gl.chevron, display_cell(&entry.label)),
             fg,
             bg,
             width.saturating_sub(1),
