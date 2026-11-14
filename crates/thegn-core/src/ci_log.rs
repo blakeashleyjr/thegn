@@ -7,6 +7,7 @@
 use once_cell::sync::Lazy;
 use regex::Regex;
 use serde::{Deserialize, Serialize};
+use std::borrow::Cow;
 use std::collections::BTreeSet;
 
 /// The marker used for every value removed from a CI log.
@@ -21,6 +22,67 @@ pub const HARD_MAX_LOG_LINES: usize = 100_000;
 /// whenever `redact`/`redact_stream_line` learn a new secret shape, so cached
 /// rows are re-redacted on their next read.
 pub const REDACTION_POLICY_VERSION: u32 = 2;
+
+/// Render terminal control characters as inert, visible text.
+///
+/// Newlines and tabs remain usable formatting.  CRLF is preserved as-is so a
+/// provider log does not change line-ending bytes merely by being displayed.
+/// ESC and DEL use the familiar caret forms; the remaining C0/C1 controls use
+/// lowercase Unicode escape notation.  A clean string is borrowed, keeping
+/// the common ANSI-free path byte-identical and allocation-free.
+pub fn inert_controls(input: &str) -> Cow<'_, str> {
+    let mut output = None::<String>;
+    let mut copied_until = 0;
+    let mut chars = input.char_indices().peekable();
+
+    while let Some((byte_index, character)) = chars.next() {
+        let is_crlf = character == '\r' && chars.peek().is_some_and(|(_, next)| *next == '\n');
+        let replacement = match character {
+            '\u{1b}' => Some("^["),
+            '\u{7f}' => Some("^?"),
+            _ => None,
+        };
+
+        if character.is_control() && !matches!(character, '\n' | '\t') && !is_crlf {
+            let escaped =
+                output.get_or_insert_with(|| String::with_capacity(input.len().saturating_add(8)));
+            escaped.push_str(&input[copied_until..byte_index]);
+            match replacement {
+                Some(value) => escaped.push_str(value),
+                None => {
+                    escaped.push_str("\\u{");
+                    let mut digits = [0u8; 8];
+                    let mut value = character as u32;
+                    let mut count = 0;
+                    loop {
+                        digits[count] = (value & 0xf) as u8;
+                        count += 1;
+                        value >>= 4;
+                        if value == 0 {
+                            break;
+                        }
+                    }
+                    for digit in digits[..count].iter().rev() {
+                        escaped.push(char::from(match *digit {
+                            0..=9 => b'0' + *digit,
+                            _ => b'a' + *digit - 10,
+                        }));
+                    }
+                    escaped.push('}');
+                }
+            }
+            copied_until = byte_index + character.len_utf8();
+        }
+    }
+
+    match output {
+        Some(mut output) => {
+            output.push_str(&input[copied_until..]);
+            Cow::Owned(output)
+        }
+        None => Cow::Borrowed(input),
+    }
+}
 
 /// A redacted, bounded log entry suitable for persistence or transport.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -727,6 +789,53 @@ fn floor_char_boundary(text: &str, mut byte: usize) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn inert_controls_renders_osc_csi_apc_dcs_and_c1_visibly() {
+        let hostile = concat!(
+            "ordinary ",
+            "\u{1b}]52;c;secret\u{7}",
+            "\u{1b}[31mred",
+            "\u{1b}_apc\u{1b}\\",
+            "\u{1b}Pdcs\u{1b}\\",
+            "\u{009b}31m",
+            "\u{009d}osc\u{009c}"
+        );
+
+        assert_eq!(
+            inert_controls(hostile),
+            "ordinary ^[]52;c;secret\\u{7}^[[31mred^[_apc^[\\^[Pdcs^[\\\\u{9b}31m\\u{9d}osc\\u{9c}"
+        );
+    }
+
+    #[test]
+    fn inert_controls_handles_every_c0_del_and_c1_control() {
+        for codepoint in (0x00..=0x1f).chain([0x7f]).chain(0x80..=0x9f) {
+            let character = char::from_u32(codepoint).expect("control codepoint is a scalar");
+            let rendered = inert_controls(&character.to_string());
+            let expected = match character {
+                '\n' => "\n".to_string(),
+                '\t' => "\t".to_string(),
+                '\u{1b}' => "^[".to_string(),
+                '\u{7f}' => "^?".to_string(),
+                _ => format!(r"\u{{{codepoint:x}}}"),
+            };
+            assert_eq!(rendered, expected, "U+{codepoint:04X}");
+        }
+    }
+
+    #[test]
+    fn inert_controls_preserves_crlf_clean_text_and_split_controls() {
+        for input in ["ordinary text\n", "ordinary\ttext", "ordinary\r\ntext"] {
+            let rendered = inert_controls(input);
+            assert_eq!(rendered, input);
+            assert!(matches!(rendered, Cow::Borrowed(_)));
+        }
+        assert_eq!(
+            inert_controls("split starts\u{1b}\n[2J remains text"),
+            "split starts^[\n[2J remains text"
+        );
+    }
 
     #[test]
     fn contains_known_credential_names_each_shape() {
