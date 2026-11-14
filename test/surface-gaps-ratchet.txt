@@ -24,10 +24,9 @@
 #   mcp     — the state tools are not landed yet (the MCP write-tools branch
 #             retires these); scope-gated container tools land with it.
 #   http    — the CLI-first operator families (`secret.*`, `project.*`,
-#             `containers.*`, `doctor.bundle`, `launch.preset`) run against
+#             `containers.*`, `doctor.bundle`) run against
 #             local custody today; a remote-operator route is future work.
 
-agent.sessions	grpc	not yet mirrored in control.proto
 calendar.ingest	mcp	MCP state tools land in the client-API phase
 containers.control	grpc	container lifecycle and logs are local CLI-only; gRPC mirror lands in the client-API phase
 containers.control	http	container lifecycle and logs are local CLI-only; HTTP mirror lands in the client-API phase
@@ -43,9 +42,6 @@ git.commit	mcp	MCP state tools land in the client-API phase
 git.stage	mcp	MCP state tools land in the client-API phase
 issues.comment	mcp	MCP state tools land in the client-API phase
 issues.update	mcp	MCP state tools land in the client-API phase
-launch.preset	grpc	not yet mirrored in control.proto
-launch.preset	http	CLI-first (`open --preset` via the intents mailbox); an HTTP route is a follow-up
-launch.preset	mcp	MCP exec-scoped tools land in the MCP write-tools phase
 merge.add	mcp	MCP state tools land in the client-API phase
 merge.clear	mcp	MCP state tools land in the client-API phase
 model_proxy.start	grpc	control-API route deferred; CLI-only for now
@@ -94,10 +90,8 @@ secret.set	http	control-API route deferred; CLI-only for now
 secret.ssh.rotate	grpc	control-API route deferred; CLI-only for now
 secret.ssh.rotate	http	control-API route deferred; CLI-only for now
 sessions.detach	mcp	MCP state tools land in the client-API phase
-sessions.record	grpc	not yet mirrored in control.proto
 sessions.resize	mcp	MCP state tools land in the client-API phase
 sessions.snapshot	mcp	MCP state tools land in the client-API phase
 sessions.split	mcp	MCP state tools land in the client-API phase
-worktrees.create	grpc	not yet mirrored in control.proto
 worktrees.create	mcp	MCP state tools land in the client-API phase
 worktrees.open	mcp	MCP state tools land in the client-API phase
