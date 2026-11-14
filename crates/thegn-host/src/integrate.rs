@@ -299,6 +299,9 @@ fn skip_gate_if_tree_unchanged(
     let Some(trusted_base) = trusted_base else {
         return Ok(false);
     };
+    if !base.eq_ignore_ascii_case(trusted_base) {
+        return Ok(false);
+    }
     let folded_spec = format!("{folded_tip}^{{tree}}");
     let folded_tree = git_text(repo_root, &["rev-parse", "--verify", &folded_spec])
         .context("reading folded tree for gate skip")?;
@@ -307,7 +310,7 @@ fn skip_gate_if_tree_unchanged(
     let branch_tree = git_text(repo_root, &["rev-parse", "--verify", &branch_spec])
         .context("reading branch tree for gate skip")?;
     anyhow::ensure!(!branch_tree.is_empty(), "Git returned an empty branch tree");
-    Ok(base.eq_ignore_ascii_case(trusted_base) && folded_tree == branch_tree)
+    Ok(folded_tree == branch_tree)
 }
 
 /// Reconstruct the landed commit identity for a branch already integrated into
@@ -3347,7 +3350,16 @@ mod tests {
         let error = skip_gate_if_tree_unchanged(dir.path(), "main", "HEAD", "HEAD", Some("main"))
             .unwrap_err();
         assert!(error.to_string().contains("folded tree"), "{error}");
-        assert!(error.to_string().contains("Git"), "{error}");
+        assert!(format!("{error:#}").contains("Git"), "{error:#}");
+    }
+
+    #[test]
+    fn gate_skip_tree_probe_skips_probes_when_bases_differ() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(
+            !skip_gate_if_tree_unchanged(dir.path(), "main", "HEAD", "HEAD", Some("other"))
+                .unwrap()
+        );
     }
 
     /// Minimal real-git fixture: a repo with `main` plus N branches each adding

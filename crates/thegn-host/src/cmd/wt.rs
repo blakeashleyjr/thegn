@@ -12,7 +12,7 @@ use thegn_core::config::Config;
 use thegn_core::db::Db;
 use thegn_core::remote::GitLoc;
 use thegn_core::store::WorkspaceStore;
-use thegn_core::{msg, outln, util, worktree};
+use thegn_core::{msg, outln, worktree};
 
 /// Args shared by `diff` and `wt diff`.
 #[derive(clap::Args, Clone)]
