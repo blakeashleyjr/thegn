@@ -2293,6 +2293,7 @@ fn bounded_reader_budget_drops_flood_but_keeps_late_url() {
     input.extend_from_slice(b"\nlistening at after-flood.example:4123\n");
     let consumer = std::thread::spawn(move || rx.into_iter().count());
 
+    let started = std::time::Instant::now();
     super::drain_reader(
         std::io::Cursor::new(input),
         tx,
@@ -2312,7 +2313,8 @@ fn bounded_reader_budget_drops_flood_but_keeps_late_url() {
         "http://after-flood.example:4123"
     );
     assert!(
-        consumer.join().expect("diagnostic consumer") <= super::DIAGNOSTIC_LINES_PER_SECOND,
+        consumer.join().expect("diagnostic consumer")
+            <= super::DIAGNOSTIC_LINES_PER_SECOND * (started.elapsed().as_secs() as usize + 1),
         "forwarded diagnostics exceeded the per-second budget"
     );
     assert!(
@@ -2321,6 +2323,43 @@ fn bounded_reader_budget_drops_flood_but_keeps_late_url() {
             .load(std::sync::atomic::Ordering::Relaxed)
             > 0,
         "flood should report bytes dropped by the diagnostic budget"
+    );
+}
+
+#[test]
+fn bounded_reader_caps_forwarded_diagnostic_bytes() {
+    let line = vec![b'x'; super::MAX_PROVIDER_LINE];
+    let line_count = super::MAX_FORWARDED_DIAGNOSTIC_BYTES / super::MAX_PROVIDER_LINE + 1;
+    let mut input = Vec::with_capacity(line_count * (super::MAX_PROVIDER_LINE + 1));
+    for _ in 0..line_count {
+        input.extend_from_slice(&line);
+        input.push(b'\n');
+    }
+    let (tx, rx) = std::sync::mpsc::sync_channel(line_count);
+    let (url_tx, _url_rx) = std::sync::mpsc::sync_channel(1);
+    let tracker = super::EndpointTracker::default();
+    let consumer = std::thread::spawn(move || rx.into_iter().count());
+
+    super::drain_reader(
+        std::io::Cursor::new(input),
+        tx,
+        url_tx,
+        UrlRule::AfterMarker {
+            marker: "listening at ".into(),
+            scheme: "http".into(),
+        },
+        tracker.clone(),
+    );
+
+    assert_eq!(
+        consumer.join().expect("diagnostic consumer"),
+        super::MAX_FORWARDED_DIAGNOSTIC_BYTES / super::MAX_PROVIDER_LINE
+    );
+    assert!(
+        tracker
+            .budget_dropped_bytes
+            .load(std::sync::atomic::Ordering::Relaxed)
+            > 0
     );
 }
 

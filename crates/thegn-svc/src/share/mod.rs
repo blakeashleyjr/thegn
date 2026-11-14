@@ -2332,6 +2332,7 @@ enum Streamable {
 
 const MAX_PROVIDER_LINE: usize = 4096;
 const DIAGNOSTIC_LINES_PER_SECOND: usize = 1024;
+const MAX_FORWARDED_DIAGNOSTIC_BYTES: usize = 1024 * 1024;
 
 /// Drain a provider stream for the child's full lifetime without retaining an
 /// unbounded line or queue. Oversized lines are discarded through newline;
@@ -2430,7 +2431,13 @@ fn emit_line(
             let _ = url_tx.try_send(url);
         }
         let text_len = text.len();
-        if !endpoint_tracker.admit_diagnostic() {
+        if endpoint_tracker
+            .forwarded_bytes
+            .load(Ordering::Relaxed)
+            .saturating_add(text_len)
+            > MAX_FORWARDED_DIAGNOSTIC_BYTES
+            || !endpoint_tracker.admit_diagnostic()
+        {
             endpoint_tracker
                 .budget_dropped_bytes
                 .fetch_add(text_len, Ordering::Relaxed);

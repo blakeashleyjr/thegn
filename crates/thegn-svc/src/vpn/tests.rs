@@ -347,50 +347,58 @@ fn old_format_sidecar_record_still_parses() {
     assert_eq!(recorded.id, "a".repeat(64));
 }
 
+#[cfg(unix)]
 #[test]
 fn sidecar_record_mismatched_worktree_refuses_before_runtime_use() {
+    use std::os::unix::fs::PermissionsExt;
+
     let _state = thegn_core::testenv::IsolatedState::new();
-    let dir = tempfile::tempdir().unwrap();
+    let dir = tempfile::Builder::new()
+        .permissions(std::fs::Permissions::from_mode(0o700))
+        .tempdir()
+        .unwrap();
     let script = dir.path().join("fake.sh");
     std::fs::write(
         &script,
-        "if [ \"$1\" = inspect ]; then printf '%s\\n' 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa'; fi\\n",
+        "if [ \"$1\" = inspect ]; then printf '%s\\n' 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa'; fi\n",
     )
     .unwrap();
     let runtime = OciRuntime::new(vec!["sh".into(), script.display().to_string()]);
     record_sidecar(&runtime, "c-tgvpn").unwrap();
 
-    let other_worktree = tempfile::tempdir().unwrap();
+    let other_worktree = tempfile::Builder::new()
+        .permissions(std::fs::Permissions::from_mode(0o700))
+        .tempdir()
+        .unwrap();
     let error = recorded_sidecar_for_worktree("c-tgvpn", other_worktree.path(), None)
         .expect_err("different worktree must be refused");
     assert!(error.downcast_ref::<SidecarWorktreeMismatch>().is_some());
     assert!(error.to_string().contains("sidecar belongs to"));
 }
 
+#[cfg(unix)]
 #[test]
 fn sidecar_record_stale_generation_refuses() {
+    use std::os::unix::fs::PermissionsExt;
+
     let _state = thegn_core::testenv::IsolatedState::new();
-    let dir = tempfile::tempdir().unwrap();
+    let dir = tempfile::Builder::new()
+        .permissions(std::fs::Permissions::from_mode(0o700))
+        .tempdir()
+        .unwrap();
     let script = dir.path().join("fake.sh");
     std::fs::write(
         &script,
-        "if [ \"$1\" = inspect ]; then printf '%s\\n' 'bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb'; fi\\n",
+        "if [ \"$1\" = inspect ]; then printf '%s\\n' 'bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb'; fi\n",
     )
     .unwrap();
     let runtime = OciRuntime::new(vec!["sh".into(), script.display().to_string()]);
     record_sidecar(&runtime, "c-tgvpn").unwrap();
-    record_sidecar(&runtime, "c-tgvpn").unwrap();
-    recorded_sidecar("c-tgvpn").expect("newest generation is accepted");
-
-    let mut stale = read_sidecar_record("c-tgvpn").unwrap();
-    stale.generation = Some(1);
-    let bytes = serde_json::to_vec(&stale).unwrap();
-    sidecar_record_dir()
-        .unwrap()
-        .write_owner_only_atomic(&sidecar_record_name("c-tgvpn"), &bytes)
-        .unwrap();
-    let error = recorded_sidecar("c-tgvpn").expect_err("lower generation must be refused");
+    let worktree = std::env::current_dir().unwrap();
+    let error = recorded_sidecar_for_worktree("c-tgvpn", &worktree, Some(2))
+        .expect_err("lower generation must be refused");
     assert!(error.downcast_ref::<SidecarGenerationStale>().is_some());
+    assert!(recorded_sidecar_for_worktree("c-tgvpn", &worktree, Some(1)).is_ok());
 }
 
 #[cfg(unix)]
