@@ -81,6 +81,8 @@ pub enum NotificationKind {
     PrQueueReady,
     /// The PR queue could not unblock a pull request — human intervention needed.
     PrQueueNeedsHuman,
+    /// A CI run failed without queued PR context for autofix.
+    CiRunFailed,
     /// A watched PR produced a new or revised per-thread review task.
     PrReviewTaskQueued,
     /// A watched PR review thread was successfully resolved.
@@ -168,7 +170,7 @@ impl NotificationKind {
     /// Every notification kind, for exhaustive iteration (config classification,
     /// SQL `IN` set construction, tests). Kept in sync with the enum by the
     /// `notification_kind_*` tests, which loop over this.
-    pub const ALL: [NotificationKind; 31] = [
+    pub const ALL: [NotificationKind; 32] = [
         Self::Assigned,
         Self::Mentioned,
         Self::StatusChanged,
@@ -191,6 +193,7 @@ impl NotificationKind {
         Self::PrQueueMerged,
         Self::PrQueueReady,
         Self::PrQueueNeedsHuman,
+        Self::CiRunFailed,
         Self::PrReviewTaskQueued,
         Self::PrReviewThreadResolved,
         Self::CalendarReminder,
@@ -229,6 +232,7 @@ impl NotificationKind {
             Self::PrQueueMerged => "pr_queue_merged",
             Self::PrQueueReady => "pr_queue_ready",
             Self::PrQueueNeedsHuman => "pr_queue_needs_human",
+            Self::CiRunFailed => "ci_run_failed",
             Self::PrReviewTaskQueued => "pr_review_task_queued",
             Self::PrReviewThreadResolved => "pr_review_thread_resolved",
             Self::CalendarReminder => "calendar_reminder",
@@ -287,7 +291,8 @@ impl NotificationKind {
             // Time-critical, but not a failure: `Notice` reaches the desktop at
             // the default threshold without claiming the red Alert group.
             | Self::CalendarReminder
-            | Self::UpstreamBehind => Priority::Notice,
+            | Self::UpstreamBehind
+            | Self::CiRunFailed => Priority::Notice,
             Self::QueueHeld => Priority::Notice,
             Self::Automation => Priority::Notice,
         }
@@ -318,6 +323,7 @@ impl NotificationKind {
             Self::PrQueueMerged => "✓",
             Self::PrQueueReady => "⑂",
             Self::PrQueueNeedsHuman => "✋",
+            Self::CiRunFailed => "✗",
             Self::PrReviewTaskQueued => "③",
             Self::PrReviewThreadResolved => "✓",
             Self::CalendarReminder => "◷",
@@ -363,6 +369,7 @@ impl NotificationKind {
             Self::PrQueueMerged => (gl.check, Hue::Green),
             Self::PrQueueReady => ("⑂", Hue::Blue),
             Self::PrQueueNeedsHuman => (gl.attention, Hue::Red),
+            Self::CiRunFailed => (gl.cross, Hue::Amber),
             Self::PrReviewTaskQueued => (gl.diamond_hollow, Hue::Blue),
             Self::PrReviewThreadResolved => (gl.check, Hue::Green),
             // A reminder is time-critical but not a failure: amber, not red.
@@ -400,6 +407,7 @@ impl NotificationKind {
             Self::PrQueueMerged => "pull request merged",
             Self::PrQueueReady => "pull request ready to merge",
             Self::PrQueueNeedsHuman => "pr queue needs you",
+            Self::CiRunFailed => "CI run failed",
             Self::PrReviewTaskQueued => "review task queued",
             Self::PrReviewThreadResolved => "review thread resolved",
             Self::CalendarReminder => "event starting soon",
@@ -491,7 +499,7 @@ mod tests {
             assert_eq!(kind.as_str(), serde_name, "{kind:?}");
             assert!(seen.insert(kind), "{kind:?} duplicated in ALL");
         }
-        assert_eq!(seen.len(), 31, "ALL is missing kinds");
+        assert_eq!(seen.len(), 32, "ALL is missing kinds");
     }
 
     #[test]
