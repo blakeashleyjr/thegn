@@ -295,26 +295,30 @@ impl std::fmt::Display for ResumeDispatchConflict {
 
 impl std::error::Error for ResumeDispatchConflict {}
 
-/// A child admission named a parent edge that failed validation under the
-/// admission write lock.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// A child admission named a parent edge that failed validation during
+/// admission or its host-side pre-check.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ParentDispatchConflict {
     pub parent_id: i64,
     pub reason: ParentEdgeReason,
 }
 
 /// Why a proposed parent edge cannot be admitted for new work.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ParentEdgeReason {
     Missing,
     CrossIssue,
     Superseded,
     Ineligible(AgentDispatchStatus),
+    WrongStage {
+        parent_stage: String,
+        child_stage: String,
+    },
 }
 
 impl std::fmt::Display for ParentDispatchConflict {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self.reason {
+        match &self.reason {
             ParentEdgeReason::Missing => {
                 write!(f, "parent dispatch {} does not exist", self.parent_id)
             }
@@ -336,11 +340,52 @@ impl std::fmt::Display for ParentDispatchConflict {
                 self.parent_id,
                 status.as_str()
             ),
+            ParentEdgeReason::WrongStage {
+                parent_stage,
+                child_stage,
+            } => write!(
+                f,
+                "parent dispatch {} is from stage {parent_stage}, later than stage {child_stage}",
+                self.parent_id
+            ),
         }
     }
 }
 
 impl std::error::Error for ParentDispatchConflict {}
+
+/// Check that a parent is not from a later configured pipeline stage than its
+/// child. Missing and unknown stages are deliberately allowed: old rows and
+/// configurations without a declared pipeline must remain dispatchable.
+///
+/// The returned conflict has no dispatch id because this pure check is also
+/// useful before the host has resolved the parent row. Host callers replace
+/// the placeholder with the actual parent id before returning the error.
+pub fn check_parent_stage(
+    stage_order: &[String],
+    parent_stage: Option<&str>,
+    child_stage: Option<&str>,
+) -> std::result::Result<(), ParentDispatchConflict> {
+    let (Some(parent_stage), Some(child_stage)) = (parent_stage, child_stage) else {
+        return Ok(());
+    };
+    let (Some(parent_index), Some(child_index)) = (
+        stage_order.iter().position(|stage| stage == parent_stage),
+        stage_order.iter().position(|stage| stage == child_stage),
+    ) else {
+        return Ok(());
+    };
+    if parent_index <= child_index {
+        return Ok(());
+    }
+    Err(ParentDispatchConflict {
+        parent_id: 0,
+        reason: ParentEdgeReason::WrongStage {
+            parent_stage: parent_stage.to_string(),
+            child_stage: child_stage.to_string(),
+        },
+    })
+}
 
 const SUPERSEDED_DISPATCH_NOTE: &str = "superseded by a --resume-work finisher dispatch";
 
@@ -3030,6 +3075,54 @@ mod tests {
         assert!(db.put_dispatch_with_parent_check(child).is_ok());
     }
 
+    #[test]
+    fn parent_stage_check_allows_earlier_same_later_and_unknown_stages() {
+        let order = [
+            "architect".to_string(),
+            "code".to_string(),
+            "review".to_string(),
+        ];
+        let cases = [
+            (Some("architect"), Some("code"), true),
+            (Some("code"), Some("code"), true),
+            (Some("review"), Some("code"), false),
+            (Some("unknown"), Some("code"), true),
+            (Some("code"), Some("unknown"), true),
+            (None, Some("code"), true),
+        ];
+        for (parent, child, allowed) in cases {
+            let result = check_parent_stage(&order, parent, child);
+            assert_eq!(
+                result.is_ok(),
+                allowed,
+                "parent={parent:?}, child={child:?}"
+            );
+            if !allowed {
+                let conflict = result.unwrap_err();
+                assert_eq!(conflict.parent_id, 0);
+                assert_eq!(
+                    conflict.reason,
+                    ParentEdgeReason::WrongStage {
+                        parent_stage: "review".into(),
+                        child_stage: "code".into(),
+                    }
+                );
+                assert_eq!(
+                    conflict.to_string(),
+                    "parent dispatch 0 is from stage review, later than stage code"
+                );
+            }
+        }
+        assert!(check_parent_stage(&[], Some("review"), Some("code")).is_ok());
+    }
+
+    #[test]
+    fn parent_stage_check_keeps_resume_source_and_same_stage_fan_out_legal() {
+        let order = ["architect".to_string(), "code".to_string()];
+        assert!(check_parent_stage(&order, Some("code"), Some("code")).is_ok());
+        assert!(check_parent_stage(&order, Some("architect"), Some("code")).is_ok());
+    }
+
     fn put_row(db: &Db, issue_id: &str, wt: &str) -> i64 {
         use crate::store::NotificationStore;
         db.put_agent_dispatch(crate::issue::NewDispatch::new(issue_id, wt, "claude"))
@@ -3516,17 +3609,18 @@ mod tests {
                 assert_eq!(
                     error
                         .downcast_ref::<ParentDispatchConflict>()
-                        .map(|conflict| conflict.reason),
-                    Some(reason),
+                        .map(|conflict| conflict.reason.clone()),
+                    Some(reason.clone()),
                     "{label}; claim={claim}; error={error}"
                 );
-                let detail = match reason {
+                let detail = match &reason {
                     ParentEdgeReason::Missing => "does not exist".to_string(),
                     ParentEdgeReason::CrossIssue => "belongs to another issue".to_string(),
                     ParentEdgeReason::Superseded => "was superseded".to_string(),
                     ParentEdgeReason::Ineligible(status) => {
                         format!("is {} and cannot parent new work", status.as_str())
                     }
+                    ParentEdgeReason::WrongStage { .. } => unreachable!(),
                 };
                 assert!(error.to_string().contains(&detail), "{label}: {error}");
                 assert_eq!(
@@ -3613,7 +3707,7 @@ mod tests {
             assert_eq!(
                 error
                     .downcast_ref::<ParentDispatchConflict>()
-                    .map(|conflict| conflict.reason),
+                    .map(|conflict| conflict.reason.clone()),
                 Some(ParentEdgeReason::Superseded),
                 "claim={claim}; error={error}"
             );
@@ -3642,7 +3736,7 @@ mod tests {
             assert_eq!(
                 error
                     .downcast_ref::<ParentDispatchConflict>()
-                    .map(|conflict| conflict.reason),
+                    .map(|conflict| conflict.reason.clone()),
                 Some(ParentEdgeReason::Superseded),
                 "claim={claim}; done superseded parent should remain refused: {error}"
             );
@@ -3705,7 +3799,7 @@ mod tests {
             assert_eq!(
                 error
                     .downcast_ref::<ParentDispatchConflict>()
-                    .map(|conflict| conflict.reason),
+                    .map(|conflict| conflict.reason.clone()),
                 Some(ParentEdgeReason::Superseded),
                 "claim={claim}; committed supersession must be observed: {error}"
             );
@@ -3720,7 +3814,7 @@ mod tests {
         let reason = |error: &anyhow::Error| {
             error
                 .downcast_ref::<ParentDispatchConflict>()
-                .map(|conflict| conflict.reason)
+                .map(|conflict| conflict.reason.clone())
         };
 
         let mut child = crate::issue::NewDispatch::new("linear:X-1", "/wt/y", "coder");
@@ -3773,7 +3867,7 @@ mod tests {
         assert_eq!(
             error
                 .downcast_ref::<ParentDispatchConflict>()
-                .map(|conflict| conflict.reason),
+                .map(|conflict| conflict.reason.clone()),
             Some(ParentEdgeReason::CrossIssue),
             "{error}"
         );
@@ -3847,7 +3941,7 @@ mod tests {
                     assert_eq!(
                         error
                             .downcast_ref::<ParentDispatchConflict>()
-                            .map(|conflict| conflict.reason),
+                            .map(|conflict| conflict.reason.clone()),
                         Some(ParentEdgeReason::Ineligible(status)),
                         "{status:?}; claim={claim}; error={error}"
                     );
@@ -3880,7 +3974,7 @@ mod tests {
         assert_eq!(
             error
                 .downcast_ref::<ParentDispatchConflict>()
-                .map(|conflict| conflict.reason),
+                .map(|conflict| conflict.reason.clone()),
             Some(ParentEdgeReason::Missing)
         );
         assert!(db.list_dispatches().unwrap().is_empty());
@@ -3954,7 +4048,7 @@ mod tests {
             assert_eq!(
                 error
                     .downcast_ref::<ParentDispatchConflict>()
-                    .map(|conflict| conflict.reason),
+                    .map(|conflict| conflict.reason.clone()),
                 Some(ParentEdgeReason::Ineligible(AgentDispatchStatus::Abandoned)),
                 "claim={claim}; the committed parent transition must be observed: {error}"
             );
@@ -4849,8 +4943,8 @@ mod tests {
             assert_eq!(
                 error
                     .downcast_ref::<ParentDispatchConflict>()
-                    .map(|conflict| conflict.reason),
-                Some(expected_reason),
+                    .map(|conflict| conflict.reason.clone()),
+                Some(expected_reason.clone()),
                 "parent={parent}; error={error}"
             );
             assert_eq!(

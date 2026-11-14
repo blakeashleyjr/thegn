@@ -591,6 +591,12 @@ pub fn run(cfg: &Config, action: Action) -> Result<()> {
             refuse_stage_artifact_override(stage.as_deref(), artifact.as_deref())?;
             let (issue_id, worktree_path) = dispatch_identity(&issue_id, &worktree_path)?;
             let db = Db::open()?;
+            check_parent_stage_before_admission(
+                &db,
+                &cfg.pipeline.stage_names(),
+                parent,
+                stage.as_deref(),
+            )?;
             let proof = lead_proof(
                 lease.as_deref(),
                 owner.as_deref(),
@@ -765,6 +771,29 @@ fn put_led(db: &Db, new: NewDispatch<'_>, proof: LeadProof<'_>) -> Result<AgentD
     let id = db.put_dispatch_with_parent_check_led(new, proof)?;
     db.get_dispatch(id)?
         .ok_or_else(|| anyhow::anyhow!("dispatch {id} vanished after insert"))
+}
+
+fn check_parent_stage_before_admission(
+    db: &Db,
+    stage_order: &[String],
+    parent_id: Option<i64>,
+    child_stage: Option<&str>,
+) -> Result<()> {
+    let Some(parent_id) = parent_id else {
+        return Ok(());
+    };
+    let Some(parent) = db.get_dispatch(parent_id)? else {
+        return Ok(());
+    };
+    if let Err(conflict) =
+        thegn_core::db::check_parent_stage(stage_order, parent.stage.as_deref(), child_stage)
+    {
+        return Err(anyhow::Error::new(thegn_core::db::ParentDispatchConflict {
+            parent_id,
+            reason: conflict.reason,
+        }));
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -1217,6 +1246,7 @@ fn claim(
             "unknown pipeline stage {stage:?}; configure it under [[pipeline.stages]] before claiming work"
         );
     };
+    check_parent_stage_before_admission(&db, &cfg.pipeline.stage_names(), parent, Some(stage))?;
     // A grant the harness cannot take command-scoped refuses the launch, so
     // refuse the CLAIM too (THE-440): a row claimed here is dispatched later,
     // and a supervisor should learn about the policy hold before it occupies a
@@ -4610,6 +4640,37 @@ mod tests {
             db.list_dispatches().unwrap().is_empty(),
             "a rejected parent must not leave an orphan row"
         );
+    }
+
+    #[test]
+    fn put_stage_check_refuses_a_later_stage_parent_before_admission() {
+        let (_d, db) = db("put-parent-stage");
+        let parent = put(
+            &db,
+            NewDispatch {
+                stage: Some("review"),
+                ..NewDispatch::new("linear:A-1", "/wt/a", "reviewer")
+            },
+        )
+        .unwrap();
+        let order = ["code".to_string(), "review".to_string()];
+        let error = check_parent_stage_before_admission(&db, &order, Some(parent.id), Some("code"))
+            .unwrap_err();
+        assert!(matches!(
+            error.downcast_ref::<thegn_core::db::ParentDispatchConflict>(),
+            Some(thegn_core::db::ParentDispatchConflict {
+                parent_id,
+                reason: thegn_core::db::ParentEdgeReason::WrongStage { .. },
+            }) if *parent_id == parent.id
+        ));
+        assert_eq!(
+            error.to_string(),
+            format!(
+                "parent dispatch {} is from stage review, later than stage code",
+                parent.id
+            )
+        );
+        assert_eq!(db.list_dispatches().unwrap().len(), 1);
     }
 
     // --- chunk-scope gate (THE-86) -------------------------------------------
