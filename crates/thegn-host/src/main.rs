@@ -119,6 +119,8 @@ mod hydrate_weather;
 mod i18n_surface;
 mod ide_handoff;
 mod idle_poll;
+#[cfg(test)]
+mod ingress_budget;
 mod input;
 mod integrate;
 mod iroh_home;
