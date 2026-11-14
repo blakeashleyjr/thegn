@@ -2463,34 +2463,6 @@ fn reference_symbol_row(
     }
 }
 
-#[cfg(test)]
-mod reference_symbol_row_tests {
-    use super::*;
-
-    #[test]
-    fn outside_reference_rows_are_explicitly_labeled() {
-        let row = reference_symbol_row(
-            thegn_svc::lsp::Location {
-                path: "/other/src/lib.rs".into(),
-                range: thegn_svc::lsp::Range {
-                    start: thegn_svc::lsp::Position {
-                        line: 2,
-                        character: 0,
-                    },
-                    end: thegn_svc::lsp::Position {
-                        line: 2,
-                        character: 1,
-                    },
-                },
-                scope: thegn_svc::lsp::LocationScope::Outside,
-            },
-            Path::new("/worktree"),
-        );
-
-        assert_eq!(row.name, "/other/src/lib.rs:3 (outside worktree)");
-    }
-}
-
 /// Fetch the document-symbol outline for `file` (repo-relative) off the loop:
 /// the language server when one is available, the tree-sitter entity parser
 /// otherwise. Sends a `SymbolsFetch::Outline` and pulses the waker.
@@ -28722,6 +28694,34 @@ fn action_allowed_during_schema_refusal(action: &crate::keymap::Action) -> bool 
             | Action::SwitchMode(_)
             | Action::ToggleKeyLock
     )
+}
+
+#[cfg(test)]
+mod reference_symbol_row_tests {
+    use super::*;
+
+    #[test]
+    fn outside_reference_rows_are_explicitly_labeled() {
+        let row = reference_symbol_row(
+            thegn_svc::lsp::Location {
+                path: "/other/src/lib.rs".into(),
+                range: thegn_svc::lsp::Range {
+                    start: thegn_svc::lsp::Position {
+                        line: 2,
+                        character: 0,
+                    },
+                    end: thegn_svc::lsp::Position {
+                        line: 2,
+                        character: 1,
+                    },
+                },
+                scope: thegn_svc::lsp::LocationScope::Outside,
+            },
+            Path::new("/worktree"),
+        );
+
+        assert_eq!(row.name, "/other/src/lib.rs:3 (outside worktree)");
+    }
 }
 
 #[cfg(test)]
