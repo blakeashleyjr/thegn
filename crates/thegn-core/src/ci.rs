@@ -498,6 +498,10 @@ pub enum CiError {
     Offline,
     /// The provider cannot perform this exact operation.
     Unsupported(String),
+    /// Provider output exceeded a bounded response budget.
+    TooLarge(String),
+    /// Provider output was not valid JSON or did not have the expected shape.
+    Malformed(String),
     Other(String),
 }
 
@@ -511,6 +515,8 @@ impl CiError {
             CiError::RateLimited => "CI provider API rate limited".into(),
             CiError::Offline => "CI provider unreachable".into(),
             CiError::Unsupported(message) => message.clone(),
+            CiError::TooLarge(message) => message.clone(),
+            CiError::Malformed(message) => message.clone(),
             CiError::Other(m) => m.clone(),
         }
     }
@@ -1117,6 +1123,8 @@ mod tests {
             CiError::RateLimited,
             CiError::Offline,
             CiError::Unsupported("x".into()),
+            CiError::TooLarge("x".into()),
+            CiError::Malformed("x".into()),
             CiError::Other("x".into()),
         ] {
             assert!(!e.message().is_empty());
