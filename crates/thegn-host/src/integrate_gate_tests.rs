@@ -394,6 +394,7 @@ fn native_gate_ignored_file_write_does_not_fail_snapshot() {
     if !posix_shell_gate_only() {
         return;
     }
+    std::fs::create_dir_all(f.repo.join(".git/info")).unwrap();
     std::fs::write(f.repo.join(".git/info/exclude"), "/cache\n").unwrap();
     let workspace = NativeWorkspace::prepare(&f.repo, &f.first, &f.config).unwrap();
     let (output, _) = workspace.spawn("printf warm-cache > cache", 10).unwrap();
