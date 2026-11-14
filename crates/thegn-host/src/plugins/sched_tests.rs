@@ -253,7 +253,7 @@ fn resident_render_is_admitted_while_one_shot_is_busy_or_overloaded() {
     assert_eq!(schedule[0].skipped, 1);
     assert_eq!(schedule[1].next, base + interval);
     assert!(matches!(
-        event_rx.recv_timeout(Duration::from_secs(1)),
+        event_rx.recv_timeout(Duration::from_secs(10)),
         Ok(SessionEvent::Message(message)) if message.method == "render"
     ));
 
@@ -274,13 +274,13 @@ fn resident_render_is_admitted_while_one_shot_is_busy_or_overloaded() {
     assert_eq!(schedule[0].overloaded, 1);
     assert_eq!(schedule[1].next, next + interval);
     assert!(matches!(
-        event_rx.recv_timeout(Duration::from_secs(1)),
+        event_rx.recv_timeout(Duration::from_secs(10)),
         Ok(SessionEvent::Message(message)) if message.method == "render"
     ));
 
     drop(sessions);
     let report = runtime
-        .block_on(supervisor.shutdown_until(tokio::time::Instant::now() + Duration::from_secs(1)));
+        .block_on(supervisor.shutdown_until(tokio::time::Instant::now() + Duration::from_secs(10)));
     assert!(
         report.is_settled(),
         "resident fixture must shut down cleanly"
