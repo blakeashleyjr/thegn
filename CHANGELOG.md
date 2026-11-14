@@ -7,6 +7,20 @@ All notable changes to **thegn** are documented here. The format follows
 
 ## [Unreleased]
 
+### Changed
+
+- Daemon status updates now keep only the latest snapshot, so rapid updates stay bounded instead of queueing every update.
+
+### Fixed
+
+- Sprites checkpoint lists now follow continuation pages instead of refusing multi-page inventories; partial inventories are still refused and transient list errors are retried.
+- Importing a merge bundle no longer drops output still in flight when the producer exits ("bundle produced no data").
+- Land and diff-watch Git reads now preserve typed failure reasons and fail closed instead of treating unreadable output as empty.
+
+### Security
+
+- CI log tails that begin inside a private key now redact retained preceding lines when the END marker arrives without a BEGIN.
+
 ## [0.1.0-alpha.79] — 2026-11-14
 
 ### Added
