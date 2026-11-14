@@ -15,8 +15,8 @@ use thegn_core::outln;
 use thegn_core::pipeline_report::{display_cell, json_terminal_safe};
 use thegn_core::pipeline_resume;
 use thegn_core::pipeline_run;
+use thegn_core::remote::GitLoc;
 use thegn_core::store::NotificationStore;
-use thegn_core::util::{git_out, git_out_allow_empty};
 use thegn_svc::control::client::{AttachControl, ControlAddr, ControlClient};
 // NOTE: stage `permissions` ride the daemon's launch command (the harness's
 // command-scoped grant, over the *effective* list — THE-440); the dispatch
@@ -1830,6 +1830,12 @@ fn render_resume_prompt(input: &ResumePromptInput<'_>) -> Result<String> {
     ))
 }
 
+fn git_text(worktree: &Path, args: &[&str]) -> Result<String> {
+    GitLoc::Local(worktree.to_path_buf())
+        .git_text(args)
+        .map_err(|error| anyhow::anyhow!("git {}: {error}", args.join(" ")))
+}
+
 /// The `--resume-work` composition (THE-86): turn an eligible failed, parked,
 /// queued, or positively exited pipeline row into a fresh finisher dispatch.
 /// An unstamped `spawning`/`running` row is refused because its worker may
@@ -1876,9 +1882,10 @@ async fn resume_work(
     let (facts, _) = gather_issue_facts(client, stage, &row.issue_id, Some(&wt), false).await?;
     // 5. Finisher facts: source artifact state and bounded-at-render git facts.
     let source_vf = crate::cmd::dispatch::verify_facts(&row);
-    let git_status = git_out_allow_empty(Path::new(&wt), &["status", "--porcelain"])
-        .unwrap_or_else(|| "unknown (git status probe failed)".to_string());
-    let diff_stat = git_out(Path::new(&wt), &["diff", "--stat"]).unwrap_or_default();
+    let git_status = git_text(Path::new(&wt), &["status", "--porcelain"])
+        .context("reading git status for resume")?;
+    let diff_stat =
+        git_text(Path::new(&wt), &["diff", "--stat"]).context("reading git diff for resume")?;
     // 6. Reconcile the source before competing for a fresh slot. Failed rows
     //    are already terminal/free; queued, parked, and positively exited rows
     //    are deliberately closed as superseded. A compare-and-set preserves a
@@ -2290,7 +2297,8 @@ mod session_line_tests {
 #[cfg(test)]
 mod open_stage_tests {
     use super::{
-        IssueFacts, SessionAction, open_preflight, policy_admission, stage_or_bail, stage_task_vars,
+        IssueFacts, SessionAction, git_text, open_preflight, policy_admission, stage_or_bail,
+        stage_task_vars,
     };
     use clap::Parser as _;
     use thegn_core::agent_task::render_prompt;
@@ -2306,6 +2314,16 @@ mod open_stage_tests {
             ..Default::default()
         });
         cfg
+    }
+
+    #[test]
+    fn resume_git_fact_probe_reports_a_git_failure() {
+        let dir = tempfile::tempdir().unwrap();
+        let error = git_text(dir.path(), &["status", "--porcelain"])
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("git status --porcelain"), "{error}");
+        assert!(error.contains("Git"), "{error}");
     }
 
     #[test]
