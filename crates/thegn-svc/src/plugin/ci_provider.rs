@@ -221,27 +221,54 @@ fn bounded_log(value: serde_json::Value) -> Result<CiLog, CiError> {
     let mut log: CiLog = serde_json::from_value(value)
         .map_err(|error| CiError::Other(format!("malformed plugin logs reply: {error}")))?;
     let mut in_pem = false;
+    let mut seen_begin = false;
+    let mut unmatched_end_redacted = false;
     let mut lines = VecDeque::new();
     let mut kept_bytes = 0usize;
     let mut truncated = log.truncated;
     for line in log.text.split_inclusive('\n') {
-        let redacted = thegn_core::ci_log::redact_stream_line(line.as_bytes(), &mut in_pem);
+        // The tracked redactor reports only the last marker on a line. Count
+        // BEGIN before handling END so a same-line PEM frame matches the
+        // streaming collector, including when the line is later discarded.
+        if line.contains("-----BEGIN ") {
+            seen_begin = true;
+        }
+        let (redacted, marker) =
+            thegn_core::ci_log::redact_stream_line_tracked(line.as_bytes(), &mut in_pem);
+        if marker == Some(true) {
+            seen_begin = true;
+        } else if marker == Some(false) && !seen_begin && !unmatched_end_redacted {
+            thegn_core::ci_log::redact_retained_on_unmatched_end(
+                &mut lines,
+                &mut kept_bytes,
+                &mut unmatched_end_redacted,
+            );
+            evict_bounded_log_lines(&mut lines, &mut kept_bytes, &mut truncated);
+        }
         if redacted.len() > PROVIDER_LOG_MAX_BYTES {
             truncated = true;
             continue;
         }
         kept_bytes += redacted.len();
         lines.push_back(redacted);
-        while lines.len() > PROVIDER_LOG_MAX_LINES || kept_bytes > PROVIDER_LOG_MAX_BYTES {
-            if let Some(old) = lines.pop_front() {
-                kept_bytes -= old.len();
-                truncated = true;
-            }
-        }
+        evict_bounded_log_lines(&mut lines, &mut kept_bytes, &mut truncated);
     }
     log.text = lines.into_iter().collect();
     log.truncated = truncated;
     Ok(log)
+}
+
+fn evict_bounded_log_lines(
+    lines: &mut VecDeque<String>,
+    kept_bytes: &mut usize,
+    truncated: &mut bool,
+) {
+    while lines.len() > PROVIDER_LOG_MAX_LINES || *kept_bytes > PROVIDER_LOG_MAX_BYTES {
+        if let Some(old) = lines.pop_front() {
+            *kept_bytes -= old.len();
+            *truncated = true;
+        }
+    }
 }
 
 fn mutation_result(op: &'static str, value: serde_json::Value) -> Result<(), CiError> {
@@ -555,6 +582,103 @@ done
         let capped = bounded_log(serde_json::json!({"text":text,"truncated":false})).unwrap();
         assert!(capped.truncated);
         assert_eq!(capped.text.lines().count(), PROVIDER_LOG_MAX_LINES);
+    }
+
+    #[test]
+    fn plugin_logs_redact_retained_body_on_unmatched_end() {
+        let reply = serde_json::json!({
+            "text": "SYNTHETIC_KEY_BODY\r\nordinary diagnostic\r\n-----END PRIVATE KEY-----\r\nafter",
+            "truncated": false
+        });
+        let log = bounded_log(reply).unwrap();
+        let marker = thegn_core::ci_log::REDACTION_MARKER;
+
+        assert_eq!(
+            log.text,
+            format!("{marker}\r\n{marker}\r\n{marker}\r\nafter")
+        );
+        assert!(!log.text.contains("SYNTHETIC_KEY_BODY"));
+        assert!(!log.truncated);
+    }
+
+    #[test]
+    fn plugin_logs_keep_normal_pem_redaction_unchanged() {
+        let reply = serde_json::json!({
+            "text": "before\n-----BEGIN PRIVATE KEY-----\nSYNTHETIC_KEY_BODY\n-----END PRIVATE KEY-----\nafter\n",
+            "truncated": false
+        });
+        let log = bounded_log(reply).unwrap();
+        let marker = thegn_core::ci_log::REDACTION_MARKER;
+
+        assert_eq!(
+            log.text,
+            format!("before\n{marker}\n{marker}\n{marker}\nafter\n")
+        );
+        assert!(!log.truncated);
+    }
+
+    #[test]
+    fn plugin_logs_redact_after_oversized_line_and_keep_caps() {
+        let oversized = "x".repeat(PROVIDER_LOG_MAX_BYTES + 1);
+        let end_inside_oversized = format!(
+            "{}-----END PRIVATE KEY-----",
+            "x".repeat(PROVIDER_LOG_MAX_BYTES + 1)
+        );
+        let text = format!("SYNTHETIC_PREFIX_SECRET\n{oversized}\n{end_inside_oversized}\n");
+        let log = bounded_log(serde_json::json!({"text": text, "truncated": false})).unwrap();
+        let marker = thegn_core::ci_log::REDACTION_MARKER;
+
+        assert!(log.truncated);
+        assert!(!log.text.contains("SYNTHETIC_PREFIX_SECRET"));
+        assert!(log.text.lines().all(|line| line == marker));
+        assert!(log.text.len() <= PROVIDER_LOG_MAX_BYTES);
+        assert!(log.text.lines().count() <= PROVIDER_LOG_MAX_LINES);
+    }
+
+    #[test]
+    fn plugin_logs_redact_all_retained_lines_after_eviction() {
+        let mut text = String::from("SYNTHETIC_EVICTED_BODY\n");
+        for line in 0..PROVIDER_LOG_MAX_LINES {
+            text.push_str(&format!("ordinary {line}\n"));
+        }
+        text.push_str("-----END PRIVATE KEY-----\n");
+        let log = bounded_log(serde_json::json!({"text": text, "truncated": false})).unwrap();
+        let marker = thegn_core::ci_log::REDACTION_MARKER;
+
+        assert!(log.truncated);
+        assert!(!log.text.contains("SYNTHETIC_EVICTED_BODY"));
+        assert!(!log.text.contains("ordinary "));
+        assert!(log.text.lines().all(|line| line == marker));
+        assert_eq!(log.text.lines().count(), PROVIDER_LOG_MAX_LINES);
+    }
+
+    #[test]
+    fn plugin_logs_accept_pretty_and_minified_json_with_truncated_flag() {
+        let pretty = r#"{
+            "text": "ordinary\n",
+            "truncated": true
+        }"#;
+        let minified = r#"{"text":"ordinary\n","truncated":false}"#;
+
+        let pretty_log = bounded_log(serde_json::from_str(pretty).unwrap()).unwrap();
+        let minified_log = bounded_log(serde_json::from_str(minified).unwrap()).unwrap();
+        assert_eq!(pretty_log.text, "ordinary\n");
+        assert!(pretty_log.truncated);
+        assert_eq!(minified_log.text, "ordinary\n");
+        assert!(!minified_log.truncated);
+    }
+
+    #[test]
+    fn plugin_logs_preserve_unterminated_last_line() {
+        let log = bounded_log(serde_json::json!({
+            "text": "ordinary\nSYNTHETIC_KEY_BODY\n-----END PRIVATE KEY-----",
+            "truncated": false
+        }))
+        .unwrap();
+        let marker = thegn_core::ci_log::REDACTION_MARKER;
+
+        assert_eq!(log.text, format!("ordinary\n{marker}\n{marker}"));
+        assert!(!log.truncated);
     }
 
     #[test]
