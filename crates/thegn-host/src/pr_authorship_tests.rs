@@ -205,6 +205,26 @@ fn fresh_organization_authorship_is_admitted_and_disabled_policy_needs_no_proof(
 }
 
 #[test]
+fn unreadable_git_checkout_holds_with_an_explicit_refusal() {
+    let fixture = Fixture::new();
+    let forge = fixture.forge(vec![fixture.proof.clone()]);
+    let unavailable = GitLoc::Local(fixture.dir.path().join("missing"));
+    assert_eq!(
+        acquire(
+            true,
+            &fixture.db,
+            &forge,
+            &unavailable,
+            "github",
+            7,
+            &fixture.pr,
+        )
+        .err(),
+        Some(HELD)
+    );
+}
+
+#[test]
 fn after_agent_viewer_change_holds() {
     let fixture = Fixture::new();
     let mut foreign = fixture.proof.clone();
