@@ -163,12 +163,24 @@ pub fn known_hosts_path(name: &str) -> Result<PathBuf> {
     Ok(dir().join("known_hosts.d").join(safe))
 }
 
-/// Accept only a provider ID using the shared RFC 1123 hostname subset and
-/// length limit used by VPS admission.
+/// Accept only a single provider name component using the RFC 1123 hostname
+/// subset used by VPS admission.
 pub fn checked_name(name: &str) -> Result<&str> {
-    thegn_core::envbuild::ProviderId::parse(name)
-        .map(|_| name)
-        .map_err(|_| anyhow::anyhow!("vps registry: invalid provider name"))
+    if name.is_empty() || name.len() > 63 || !name.split('.').all(valid_dns_label) {
+        anyhow::bail!("vps registry: invalid provider name")
+    }
+    Ok(name)
+}
+
+fn valid_dns_label(label: &str) -> bool {
+    let bytes = label.as_bytes();
+    !bytes.is_empty()
+        && bytes.len() <= 63
+        && bytes[0].is_ascii_alphanumeric()
+        && bytes[bytes.len() - 1].is_ascii_alphanumeric()
+        && bytes
+            .iter()
+            .all(|byte| byte.is_ascii_alphanumeric() || *byte == b'-')
 }
 
 fn open_root(d: &Path, create: bool) -> Result<Option<thegn_core::fsperm::PrivateDir>> {
@@ -937,7 +949,6 @@ mod tests {
     #[test]
     fn known_hosts_path_refuses_every_invalid_name() {
         let too_long_multibyte = format!("{}é", "a".repeat(62));
-        let too_long_provider_id = "a".repeat(51);
         let too_long = "a".repeat(64);
         let names = [
             "".to_string(),
@@ -960,7 +971,6 @@ mod tests {
             "a.".to_string(),
             "a_b".to_string(),
             "a b".to_string(),
-            too_long_provider_id,
             too_long,
             too_long_multibyte,
         ];
@@ -975,7 +985,7 @@ mod tests {
 
     #[test]
     fn known_hosts_path_keeps_valid_names_beneath_the_pin_root() {
-        let max_name = "a".repeat(50);
+        let max_name = "a".repeat(63);
         for name in ["tg-dev-x1", max_name.as_str(), "a.b-c"] {
             let path = known_hosts_path(name).unwrap();
             assert!(path.starts_with(dir().join("known_hosts.d")));
@@ -986,7 +996,6 @@ mod tests {
     #[test]
     fn checked_name_matrix_matches_the_known_hosts_matrix() {
         let too_long_multibyte = format!("{}é", "a".repeat(62));
-        let too_long_provider_id = "a".repeat(51);
         let too_long = "a".repeat(64);
         let names = [
             "".to_string(),
@@ -1009,7 +1018,6 @@ mod tests {
             "a.".to_string(),
             "a_b".to_string(),
             "a b".to_string(),
-            too_long_provider_id,
             too_long,
             too_long_multibyte,
         ];
