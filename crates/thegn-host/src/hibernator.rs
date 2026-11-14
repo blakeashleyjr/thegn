@@ -694,7 +694,8 @@ fn restore_into_sandbox(
         id,
         &format!("rm -rf -- {}", thegn_core::util::sh_quote(&dir)),
         Duration::from_secs(30),
-    );
+    )
+    .map(|_| ());
     let bundle_data = match (restore, cleanup) {
         (Ok(bundle_data), Ok(())) => bundle_data,
         (Err(error), Ok(())) => return Err(error),
