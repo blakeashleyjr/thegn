@@ -155,8 +155,18 @@ pub(crate) fn gix(loc: &GitLoc, base: Option<&str>) -> Result<BranchMeta> {
             (None, None)
         } else if let Some(base) = base {
             (
-                Some(count_excluding(&repo, head.detach(), base.detach())?),
-                Some(count_excluding(&repo, base.detach(), head.detach())?),
+                Some(count_excluding(
+                    &repo,
+                    head.detach(),
+                    base.detach(),
+                    META_COUNT_CAP,
+                )?),
+                Some(count_excluding(
+                    &repo,
+                    base.detach(),
+                    head.detach(),
+                    META_COUNT_CAP,
+                )?),
             )
         } else {
             (None, None)
@@ -179,6 +189,7 @@ fn count_excluding(
     repo: &gix::Repository,
     tip: gix::ObjectId,
     hidden: gix::ObjectId,
+    cap: u32,
 ) -> Result<u32> {
     let walk = repo
         .rev_walk([tip])
@@ -189,8 +200,8 @@ fn count_excluding(
     for info in walk {
         info.map_err(|error| anyhow::anyhow!("gix rev_walk item: {error}"))?;
         count = count.saturating_add(1);
-        if count >= META_COUNT_CAP {
-            return Ok(META_COUNT_CAP);
+        if count >= cap {
+            return Ok(cap);
         }
     }
     Ok(count)
@@ -259,7 +270,7 @@ pub(crate) fn with_dirty(
 
 #[cfg(test)]
 mod tests {
-    use super::super::{GitBackend, GixGit};
+    use super::super::{CliGit, GitBackend, GixGit};
     use super::*;
 
     #[test]
@@ -292,6 +303,29 @@ mod tests {
         assert_eq!(dirty_count(0, META_COUNT_CAP), Some(0));
         assert_eq!(dirty_count(2, META_COUNT_CAP), Some(2));
         assert_eq!(dirty_count(1_000, META_COUNT_CAP), Some(META_COUNT_CAP));
+
+        let repo = super::super::testutil::TestRepo::new("branch-meta-dirty");
+        repo.commit_file("a", "1", "a");
+        repo.commit_file("b", "1", "b");
+        std::fs::write(repo.dir.join("a"), "2").unwrap();
+        std::fs::write(repo.dir.join("b"), "2").unwrap();
+        super::super::testutil::git_in(&repo.dir, &["add", "b"]);
+        std::fs::write(repo.dir.join("b"), "3").unwrap();
+        std::fs::write(repo.dir.join("u"), "x").unwrap();
+        assert_eq!(
+            GixGit::new()
+                .dirty_and_count(&repo.loc(), META_COUNT_CAP)
+                .unwrap(),
+            (true, Some(3))
+        );
+        assert_eq!(
+            GixGit::new().dirty_and_count(&repo.loc(), 2).unwrap(),
+            (true, Some(2))
+        );
+        assert_eq!(
+            CliGit.dirty_and_count(&repo.loc(), META_COUNT_CAP).unwrap(),
+            (true, Some(3))
+        );
     }
 
     #[test]
@@ -310,6 +344,11 @@ mod tests {
         let meta = gix(&repo.loc(), Some("main")).unwrap();
         assert_eq!(meta.ahead_base, Some(3));
         assert_eq!(meta.behind_base, Some(1));
+
+        let r = super::native_diff::open(&repo.dir).unwrap();
+        let h = r.rev_parse_single("feature").unwrap().detach();
+        let m = r.rev_parse_single("main").unwrap().detach();
+        assert_eq!(count_excluding(&r, h, m, 2).unwrap(), 2);
     }
 
     #[test]
