@@ -51,7 +51,9 @@ A Tailscale `thegn share stop` records the share as `stopping` before teardown,
 so an interrupted stop stays `stopping` and stopping it again retries. The
 `thegn share list` command appends `(retry: thegn share stop)`, `(needs reconcile)`
 or `(needs teardown)` when a row needs recovery; `--json` carries a `recovery`
-field. A missing owner is treated as unverified, so a healthy host-supervised
+field. A Tailscale row whose serve teardown is still pending in the sidecar
+record gains a `(teardown pending; ...)` hint and `"teardown_pending": true`
+with `--json`; a pending port with no share record prints its own line. A missing owner is treated as unverified, so a healthy host-supervised
 share or a pre-v101 row can also receive a recovery hint.
 When thegn opens, a saved `starting` share whose `thegn share start` process has
 exited is recorded as `failed` (stop it to retry the teardown), and an `up`
