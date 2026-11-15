@@ -122,6 +122,21 @@ fn reap(envs: &[(String, thegn_core::config::EnvProviderConfig)]) {
     }
 }
 
+/// The reaper's inventory decision: only a `Complete` listing may be used for
+/// reaping or absence inference; `Partial` rows are dropped and `Unknown`
+/// carries no rows. The `Err` is the exact skip text to record.
+fn inventory_gate<T>(kind: &str, inventory: vps::Inventory<T>) -> Result<Vec<T>, String> {
+    match inventory {
+        vps::Inventory::Complete(rows) => Ok(rows),
+        vps::Inventory::Partial { reason, .. } => Err(format!(
+            "vps reaper: skipped {kind}: provider inventory partial ({reason}); no provider or ledger actions attempted"
+        )),
+        vps::Inventory::Unknown(reason) => Err(format!(
+            "vps reaper: skipped {kind}: provider inventory unknown ({reason}); no provider or ledger actions attempted"
+        )),
+    }
+}
+
 fn reap_unambiguous(
     pc: &thegn_core::config::EnvProviderConfig,
     kept: &mut crate::reaper_policy::KeptReport,
@@ -160,15 +175,16 @@ fn reap_unambiguous(
         }
     };
     let ours = vps::host_label();
-    let instances = match crate::agent::block_on_provider(|| async {
-        probe.list_detailed_priority().await
+    let inventory = match crate::agent::block_on_provider(|| async {
+        Ok(probe.list_detailed_inventory(true).await)
     }) {
+        Ok(inventory) => inventory,
+        Err(error) => vps::Inventory::Unknown(format!("{error:#}")),
+    };
+    let instances = match inventory_gate(kind, inventory) {
         Ok(list) => list,
-        Err(error) => {
-            kept.keep(
-                kind,
-                format!("vps reaper: skipped {kind}: provider inventory unavailable ({error:#}); no provider or ledger actions attempted"),
-            );
+        Err(skip) => {
+            kept.keep(kind, skip);
             return;
         }
     };
@@ -446,6 +462,40 @@ fn cleanup_ledger(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn inventory_gate_complete_returns_rows() {
+        let rows = inventory_gate("hetzner", vps::Inventory::Complete(vec![1, 2])).unwrap();
+        assert_eq!(rows, vec![1, 2]);
+    }
+
+    #[test]
+    fn inventory_gate_partial_skips_and_drops_rows() {
+        let err = inventory_gate(
+            "hetzner",
+            vps::Inventory::Partial {
+                rows: vec![1, 2],
+                reason: vps::PartialReason::PageCap,
+            },
+        )
+        .unwrap_err();
+        assert!(
+            err.starts_with("vps reaper: skipped hetzner: provider inventory partial (page cap);")
+        );
+        assert!(err.ends_with("no provider or ledger actions attempted"));
+    }
+
+    #[test]
+    fn inventory_gate_unknown_skips_with_reason() {
+        let err = inventory_gate::<u8>(
+            "digitalocean",
+            vps::Inventory::Unknown("fetch failed".into()),
+        )
+        .unwrap_err();
+        assert!(err.starts_with(
+            "vps reaper: skipped digitalocean: provider inventory unknown (fetch failed);"
+        ));
+    }
 
     #[test]
     fn staged_or_mismatched_record_never_admits_resource_deletion() {
