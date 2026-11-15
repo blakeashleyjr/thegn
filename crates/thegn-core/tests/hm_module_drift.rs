@@ -2206,7 +2206,10 @@ fn hm_alert_submodules_cover_every_schema_leaf_and_default_to_null() {
     let src = module_src();
     let rendered = rendered_paths(&src);
     for path in ["stats.alerts", "usage.alerts"] {
-        assert!(rendered.contains(path), "Home Manager must render {path}");
+        assert!(
+            path_is_rendered(path, &rendered),
+            "Home Manager must render {path}"
+        );
     }
     for (submodule, table) in [
         ("statsAlertsSubmodule", "stats.alerts"),
