@@ -994,10 +994,24 @@ fn format_xdg_omissions(omissions: &[thegn_core::sandbox_mounts::XdgOmissionEntr
 /// provider-seams registry). Reserved kinds show up as unavailable with the
 /// reason, so "why is CI empty?" has a one-line answer.
 fn providers_json(cfg: &Config) -> serde_json::Value {
-    serde_json::to_value(thegn_svc::seam::registry::probes(cfg)).unwrap_or_default()
+    let mut providers =
+        serde_json::to_value(thegn_svc::seam::registry::probes(cfg)).unwrap_or_default();
+    let credential_rows = ci_credential_placement_rows(cfg)
+        .into_iter()
+        .map(|row| row.json())
+        .collect::<Vec<_>>();
+    if let Some(rows) = providers.as_array_mut() {
+        for provider in rows {
+            if provider["seam"] == "ci" && !credential_rows.is_empty() {
+                provider["credential_placements"] =
+                    serde_json::Value::Array(credential_rows.clone());
+            }
+        }
+    }
+    providers
 }
 
-fn ci_credential_placement_report(cfg: &Config) {
+fn ci_credential_placement_rows(cfg: &Config) -> Vec<thegn_svc::ci_credential_report::Row> {
     use thegn_core::config::CiProviderKind;
     use thegn_core::secretref::BareAs;
     use thegn_svc::ci_credential_report::{self, CredentialMode, Placement, Provider};
@@ -1015,14 +1029,22 @@ fn ci_credential_placement_report(cfg: &Config) {
                 ),
             ),
         ),
-        _ => return,
+        _ => return Vec::new(),
     };
+    Placement::ALL
+        .map(|placement| ci_credential_report::report(provider, mode, placement))
+        .into_iter()
+        .collect()
+}
+
+fn ci_credential_placement_report(cfg: &Config) {
+    let rows = ci_credential_placement_rows(cfg);
+    if rows.is_empty() {
+        return;
+    }
     outln!("CI credential placement");
-    for placement in Placement::ALL {
-        outln!(
-            "  {}",
-            ci_credential_report::report(provider, mode, placement).note
-        );
+    for row in rows {
+        outln!("  {}", row.note);
     }
 }
 
@@ -5907,6 +5929,69 @@ mod tests {
             CredentialMode::GitlabTokenRefPresent { explicit: true },
             mode
         );
+    }
+
+    #[test]
+    fn doctor_credential_rows_report_not_probed_without_secret_values() {
+        use thegn_core::config::CiProviderKind;
+
+        let cases = [
+            (
+                "literal-token-configured-in-test",
+                CiProviderKind::Gitlab,
+                Some("literal-token-configured-in-test"),
+            ),
+            ("", CiProviderKind::Gitlab, None),
+            (
+                "env:THE541_SURELY_UNSET_VAR",
+                CiProviderKind::Gitlab,
+                Some("env:THE541_SURELY_UNSET_VAR"),
+            ),
+        ];
+        assert!(std::env::var_os("THE541_SURELY_UNSET_VAR").is_none());
+
+        for (secret, provider_kind, expected_secret) in cases {
+            let mut cfg = Config::default();
+            cfg.ci.provider = provider_kind;
+            cfg.ci.gitlab.token = secret.into();
+
+            let rows = ci_credential_placement_rows(&cfg);
+            assert_eq!(rows.len(), 3);
+            for row in &rows {
+                assert!(row.note.contains("configured (not probed)"));
+                assert!(!row.note.contains("ready"));
+                assert!(!row.note.contains("OK"));
+                if let Some(secret) = expected_secret {
+                    assert!(!row.note.contains(secret));
+                }
+            }
+
+            let report = doctor_json(&cfg);
+            let provider = report["providers"]
+                .as_array()
+                .and_then(|providers| {
+                    providers
+                        .iter()
+                        .find(|provider| provider["seam"] == "ci" && provider["id"] == "gitlab")
+                })
+                .expect("GitLab CI provider row");
+            let json_rows = provider["credential_placements"]
+                .as_array()
+                .expect("credential placement JSON rows");
+            assert_eq!(json_rows.len(), 3);
+            for row in json_rows {
+                assert_eq!(row["probe"], "not_probed");
+                assert!(
+                    row.as_object()
+                        .expect("credential row object")
+                        .contains_key("probe")
+                );
+            }
+            let rendered = serde_json::to_string(&report).expect("render doctor JSON");
+            if let Some(secret) = expected_secret {
+                assert!(!rendered.contains(secret));
+            }
+        }
     }
 
     #[test]
