@@ -1797,6 +1797,99 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn list_exact_limit_equal_to_row_count_is_complete_not_partial() {
+        for limit in [3usize, 5] {
+            let (backend, server, calls) = kaneo_fixture(
+                vec![(
+                    "/api/task/tasks/p1".into(),
+                    StatusCode::OK,
+                    cap_board(3, 0).to_string(),
+                )],
+                Some("p1".into()),
+            )
+            .await;
+            let issues = backend
+                .list_issues(&IssueFilter {
+                    limit,
+                    ..Default::default()
+                })
+                .await
+                .unwrap();
+            assert_eq!(issues.len(), 3);
+            assert_eq!(
+                calls.lock().unwrap().as_slice(),
+                [format!("GET /api/task/tasks/p1?limit={limit}")]
+            );
+            server.abort();
+            assert!(server.await.unwrap_err().is_cancelled());
+        }
+    }
+
+    #[tokio::test]
+    async fn list_with_failed_comment_fetch_never_reports_empty_comments_as_complete() {
+        // list_issues carries no comments at all: it must neither request the
+        // comment endpoint nor be affected by its failure; the only path that
+        // reports comments (get_issue) is covered by
+        // failed_comment_read_is_returned_from_get_issue.
+        let (backend, server, calls) = kaneo_fixture(
+            vec![
+                (
+                    "/api/task/tasks/p1".into(),
+                    StatusCode::OK,
+                    cap_board(2, 0).to_string(),
+                ),
+                (
+                    "/api/comment/todo-0".into(),
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "comment failure".into(),
+                ),
+            ],
+            Some("p1".into()),
+        )
+        .await;
+        let issues = backend.list_issues(&IssueFilter::default()).await.unwrap();
+        assert_eq!(issues.len(), 2);
+        assert!(
+            calls
+                .lock()
+                .unwrap()
+                .iter()
+                .all(|call| !call.contains("/api/comment/")),
+            "{:?}",
+            calls.lock().unwrap()
+        );
+        server.abort();
+        assert!(server.await.unwrap_err().is_cancelled());
+    }
+
+    #[tokio::test]
+    async fn limit_one_requests_clamped_page_and_truncates() {
+        let (backend, server, calls) = kaneo_fixture(
+            vec![(
+                "/api/task/tasks/p1".into(),
+                StatusCode::OK,
+                cap_board(2, 0).to_string(),
+            )],
+            Some("p1".into()),
+        )
+        .await;
+        let issues = backend
+            .list_issues(&IssueFilter {
+                limit: 1,
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert_eq!(issues.len(), 1);
+        assert_eq!(
+            calls.lock().unwrap().as_slice(),
+            ["GET /api/task/tasks/p1?limit=1"]
+        );
+        server.abort();
+        assert!(server.await.unwrap_err().is_cancelled());
+    }
+
+    #[tokio::test]
     async fn search_filters_titles_before_truncating_to_limit() {
         let (backend, server, calls) = kaneo_fixture(
             vec![(
