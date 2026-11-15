@@ -1,13 +1,15 @@
 //! Shared bounded capture for fixed local Git and capability probes, not gates.
 //! Git retains its two-slot budget; capability probes have a separate one-slot
-//! budget and reaper, including late readers, writers and unreaped children.
+//! budget. Each capture runs on `thegn_proc` (own process group, pipes read on
+//! the calling thread, leader reaped before return); a slot is consumed for the
+//! process lifetime only when a child or group member could not be confirmed gone.
 //! OS spawn/filesystem calls are not interruptible; this is not a general command sandbox or cancellation lease.
 
 use std::sync::{
-    Arc, OnceLock,
-    atomic::{AtomicUsize, Ordering},
-    mpsc,
+    Arc,
+    atomic::{AtomicBool, AtomicUsize, Ordering},
 };
+use thegn_proc::{End, GroupState, InputFeed, Leader, Limits, Run, Stream};
 
 static GIT_IN_FLIGHT: AtomicUsize = AtomicUsize::new(0);
 static CAPABILITY_IN_FLIGHT: AtomicUsize = AtomicUsize::new(0);
@@ -49,14 +51,13 @@ pub(crate) fn capture(
         label,
         std::time::Duration::from_secs(15),
         &GIT_IN_FLIGHT,
-        spawn_worker,
     )
 }
 
 /// Fixed local capability queries run off the compositor. Unlike Git probes,
 /// a nonzero process exit is data for the provider's existing status policy.
 /// Output, child lifetime and retained ownership are bounded independently of
-/// Git, so a stuck provider cannot occupy the Git reaper or its two slots.
+/// Git, so a stuck provider cannot occupy the Git lane or its two slots.
 pub(crate) fn capture_capability(
     command: std::process::Command,
     timeout: std::time::Duration,
@@ -74,7 +75,6 @@ pub(crate) fn capture_capability(
         byte_limit,
         &CAPABILITY_IN_FLIGHT,
         CaptureLane::Capability,
-        spawn_worker,
     )
 }
 
@@ -112,79 +112,12 @@ fn budget_for(
         })
 }
 
-type ReapJob = (std::process::Child, Arc<GitBudget>);
-fn reaper(lane: CaptureLane) -> Result<&'static mpsc::SyncSender<ReapJob>, ProbeError> {
-    static GIT_REAPER: OnceLock<Result<mpsc::SyncSender<ReapJob>, String>> = OnceLock::new();
-    static CAPABILITY_REAPER: OnceLock<Result<mpsc::SyncSender<ReapJob>, String>> = OnceLock::new();
-    let (holder, slots, name) = match lane {
-        CaptureLane::Git => (&GIT_REAPER, 2, "thegn-git-reap"),
-        CaptureLane::Capability => (&CAPABILITY_REAPER, 1, "thegn-cap-reap"),
-    };
-    holder
-        .get_or_init(|| {
-            let (tx, rx) = mpsc::sync_channel::<ReapJob>(slots);
-            thegn_core::thread_name::try_spawn_named(name, move || {
-                crate::platform::qos::set_self(crate::platform::qos::Qos::Background);
-                while let Ok((mut child, budget)) = rx.recv() {
-                    #[expect(
-                        clippy::disallowed_methods,
-                        reason = "blocking reap runs only on this dedicated background thread"
-                    )]
-                    let status = child.wait();
-                    if status.is_err() {
-                        // Unknown ownership/reap state must not free capacity for
-                        // an unbounded succession of unreaped children.
-                        std::mem::forget((child, budget));
-                    }
-                }
-            })
-            .map(|_| tx)
-            .map_err(|e| e.to_string())
-        })
-        .as_ref()
-        .map_err(|e| probe_error(format!("cleanup reaper unavailable: {e}")))
-}
-
-fn reap_later(child: std::process::Child, budget: Arc<GitBudget>, lane: CaptureLane) {
-    let sender = reaper(lane).expect("reaper initialized before child spawn");
-    if let Err(job) = sender.try_send((child, budget)) {
-        // A dead/full reaper must never release capacity for endless unreaped
-        // children. Permanently consume this bounded slot and refuse later work.
-        let (mpsc::TrySendError::Full(job) | mpsc::TrySendError::Disconnected(job)) = job;
-        std::mem::forget(job);
-    }
-}
-
-type WorkerSpawner = fn(&'static str, Box<dyn FnOnce() + Send>) -> std::io::Result<()>;
-fn spawn_worker(name: &'static str, task: Box<dyn FnOnce() + Send>) -> std::io::Result<()> {
-    thegn_core::thread_name::try_spawn_named(name, move || {
-        crate::platform::qos::set_self(crate::platform::qos::Qos::Background);
-        task();
-    })
-    .map(drop)
-}
-
-fn abort_setup(
-    mut child: std::process::Child,
-    group: &crate::platform::GroupHandle,
-    budget: Arc<GitBudget>,
-    lane: CaptureLane,
-) {
-    match child.try_wait() {
-        Ok(Some(_)) => return,
-        Ok(None) => group.kill(),
-        Err(_) => {} // unknown wait identity: reaper only, never signal a numeric PID
-    }
-    reap_later(child, budget, lane);
-}
-
 fn capture_with(
     command: std::process::Command,
     input: Option<String>,
     label: &str,
     timeout: std::time::Duration,
     counter: &'static AtomicUsize,
-    worker: WorkerSpawner,
 ) -> Result<Vec<u8>, ProbeError> {
     let output = capture_output_with(
         command,
@@ -193,7 +126,6 @@ fn capture_with(
         2 * 1024 * 1024,
         counter,
         CaptureLane::Git,
-        worker,
     )?;
     if !output.status.success() {
         return Err(probe_error(format!(
@@ -215,134 +147,102 @@ fn capture_output_with(
     byte_limit: usize,
     counter: &'static AtomicUsize,
     lane: CaptureLane,
-    worker: WorkerSpawner,
 ) -> Result<std::process::Output, ProbeError> {
-    use std::io::Read;
-    use std::process::Stdio;
-    use std::time::{Duration, Instant};
-    let prefix = lane.prefix();
-    let deadline = Instant::now()
-        .checked_add(timeout)
-        .filter(|_| !timeout.is_zero())
-        .ok_or_else(|| probe_error("invalid capture deadline"))?;
-    let read_limit = u64::try_from(byte_limit)
-        .ok()
-        .filter(|limit| *limit > 0)
-        .and_then(|limit| limit.checked_add(1))
-        .ok_or_else(|| probe_error("invalid capture byte bound"))?;
-    reaper(lane)?;
+    use std::time::Duration;
+    if timeout.is_zero() {
+        return Err(probe_error("invalid capture deadline"));
+    }
+    if byte_limit == 0 {
+        return Err(probe_error("invalid capture byte bound"));
+    }
     let budget = match lane {
         CaptureLane::Git => git_budget(counter)?,
         CaptureLane::Capability => budget_for(counter, lane)?,
     };
-    command
-        .stdin(if input.is_some() {
-            Stdio::piped()
-        } else {
-            Stdio::null()
-        })
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
-    let (mut child, group) = crate::platform::spawn_grouped(&mut command)
-        .map_err(|e| probe_error(format!("{prefix} could not start: {e}")))?;
-    let stdout = child.stdout.take().expect("piped stdout");
-    let stderr = child.stderr.take().expect("piped stderr");
-    let read = |name: &'static str, stream: Box<dyn Read + Send>| -> std::io::Result<_> {
-        let (tx, rx) = std::sync::mpsc::channel();
-        let budget = Arc::clone(&budget);
-        worker(
-            name,
-            Box::new(move || {
-                let mut bytes = Vec::new();
-                let value = stream
-                    .take(read_limit)
-                    .read_to_end(&mut bytes)
-                    .map(|_| bytes);
-                drop(budget);
-                if tx.send(value).is_err() { /* timed-out receiver has relinquished the result */ }
-            }),
-        )?;
-        Ok(rx)
+    let limits = Limits {
+        stdout: Stream::HeadOrFail { cap: byte_limit },
+        stderr: Stream::HeadOrFail { cap: byte_limit },
+        quiesce_after_leader: Some(Duration::ZERO),
+        term_grace: Duration::from_millis(200),
+        reader_grace: Duration::from_millis(250),
+        ..Limits::silent(timeout)
     };
-    let out = match read("thegn-probe-out", Box::new(stdout)) {
-        Ok(rx) => rx,
-        Err(error) => {
-            abort_setup(child, &group, Arc::clone(&budget), lane);
-            return Err(probe_error(format!("stdout worker unavailable: {error}")));
+    let cancel = AtomicBool::new(false);
+    let (run, feed) = match input {
+        Some(input) => {
+            let (run, feed) =
+                thegn_proc::run_with_input(&mut command, &limits, input.as_bytes(), &cancel);
+            (run, Some(feed))
         }
+        None => (thegn_proc::run(&mut command, &limits, &cancel), None),
     };
-    let err = match read("thegn-probe-err", Box::new(stderr)) {
-        Ok(rx) => rx,
-        Err(error) => {
-            abort_setup(child, &group, Arc::clone(&budget), lane);
-            return Err(probe_error(format!("stderr worker unavailable: {error}")));
-        }
-    };
-    let input_result = if let Some(input) = input {
-        use std::io::Write;
-        let mut stdin = child.stdin.take().expect("requested stdin pipe");
-        let (tx, rx) = mpsc::channel();
-        let writer_budget = Arc::clone(&budget);
-        if let Err(error) = worker(
-            "thegn-probe-in",
-            Box::new(move || {
-                let value = stdin.write_all(input.as_bytes());
-                drop(stdin);
-                drop(writer_budget);
-                if tx.send(value).is_err() { /* timed-out receiver has relinquished the result */ }
-            }),
-        ) {
-            abort_setup(child, &group, Arc::clone(&budget), lane);
-            return Err(probe_error(format!("stdin worker unavailable: {error}")));
-        }
-        Some(rx)
+    if releases_budget(&run) {
+        drop(budget);
     } else {
-        None
-    };
-    let status = loop {
-        match child.try_wait() {
-            Ok(Some(status)) => break status,
-            Ok(None) if Instant::now() < deadline => std::thread::sleep(Duration::from_millis(10)),
-            Ok(None) => {
-                group.kill(); // owned child has not been reaped; kill helper descendants too
-                reap_later(child, Arc::clone(&budget), lane);
-                return Err(probe_error(format!(
-                    "{prefix} operation exceeded cleanup deadline"
-                )));
-            }
-            Err(error) => {
-                // No numeric PID/PGID signal when wait ownership is uncertain.
-                reap_later(child, Arc::clone(&budget), lane);
-                return Err(probe_error(format!("{prefix} wait failed: {error}")));
-            }
+        // Never release capacity for a child (or group member) that was not
+        // observed reaped and gone: the slot stays consumed for the process.
+        std::mem::forget(budget);
+    }
+    map_capture(run, feed, lane.prefix())
+}
+
+/// Capacity is returned only when nothing can outlive the capture: the leader
+/// never ran, or it was reaped and its process group was observed empty.
+fn releases_budget(run: &Run) -> bool {
+    match (&run.leader, run.group) {
+        (Leader::NotSpawned, _) => matches!(run.end, End::Spawn(_)),
+        (Leader::Reaped(_), GroupState::Drained | GroupState::Terminated) => true,
+        _ => false,
+    }
+}
+
+/// Map one bounded run to the probe contract, in fixed precedence: spawn,
+/// timeout, output bound, supervision, reap, stdin feed, then the output.
+fn map_capture(
+    run: Run,
+    feed: Option<InputFeed>,
+    prefix: &str,
+) -> Result<std::process::Output, ProbeError> {
+    match run.end {
+        End::Spawn(error) => return Err(probe_error(format!("{prefix} could not start: {error}"))),
+        End::TimedOut => {
+            return Err(probe_error(format!(
+                "{prefix} operation exceeded cleanup deadline"
+            )));
+        }
+        End::OutputLimit(_) => {
+            return Err(probe_error(format!(
+                "{prefix} probe output exceeded the safety bound"
+            )));
+        }
+        End::Cancelled => return Err(probe_error(format!("{prefix} wait failed: cancelled"))),
+        End::Supervise(error) => return Err(probe_error(format!("{prefix} wait failed: {error}"))),
+        End::LeaderExited => {}
+    }
+    let status = match run.leader {
+        Leader::Reaped(status) => status,
+        Leader::ReapFailed(error) => {
+            return Err(probe_error(format!("{prefix} wait failed: {error}")));
+        }
+        Leader::Detached | Leader::NotSpawned => {
+            return Err(probe_error(format!("{prefix} wait failed")));
         }
     };
-    // Reader/writer leases retain global capacity if a descendant holds a pipe.
-    // No unbounded join/wait on this caller; late helpers cannot cause unlimited
-    // per-timeout threads or children beyond the lane's fixed budget.
-    if let Some(input_result) = input_result {
-        input_result
-            .recv_timeout(deadline.saturating_duration_since(Instant::now()))
-            .map_err(|_| probe_error(format!("{prefix} input timed out")))?
-            .map_err(|e| probe_error(format!("{prefix} input failed: {e}")))?;
-    }
-    let stdout = out
-        .recv_timeout(deadline.saturating_duration_since(Instant::now()))
-        .map_err(|_| probe_error(format!("{prefix} stdout reader failed or timed out")))?
-        .map_err(|e| probe_error(format!("{prefix} stdout unavailable: {e}")))?;
-    let stderr = err
-        .recv_timeout(deadline.saturating_duration_since(Instant::now()))
-        .map_err(|_| probe_error(format!("{prefix} stderr reader failed or timed out")))?
-        .map_err(|e| probe_error(format!("{prefix} stderr unavailable: {e}")))?;
-    if stdout.len() > byte_limit || stderr.len() > byte_limit {
+    if let Some(InputFeed {
+        complete: false,
+        error: Some(kind),
+        ..
+    }) = feed
+    {
         return Err(probe_error(format!(
-            "{prefix} probe output exceeded the safety bound"
+            "{prefix} input failed: {}",
+            std::io::Error::from(kind)
         )));
     }
     Ok(std::process::Output {
         status,
-        stdout,
-        stderr,
+        stdout: run.stdout.bytes,
+        stderr: run.stderr.bytes,
     })
 }
 
