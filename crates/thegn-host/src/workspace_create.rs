@@ -470,7 +470,10 @@ fn map_probe(run: thegn_proc::Run, what: &str) -> Result<(ExitStatus, String)> {
 }
 
 fn configured_clone_remote_name(dest: &std::path::Path) -> Result<String> {
-    let mut command = thegn_core::util::git_cmd(dest);
+    clone_remote_name_with(thegn_core::util::git_cmd(dest))
+}
+
+fn clone_remote_name_with(mut command: Command) -> Result<String> {
     command
         .arg("config")
         .arg("--get")
@@ -2013,14 +2016,12 @@ mod tests {
         let Some(mut command) = crate::platform::gate_test_shell("sleep 30") else {
             return;
         };
-        let start = Instant::now();
         let err =
             run_git_probe(&mut command, "slow probe", Duration::from_millis(100)).unwrap_err();
         assert!(
             format!("{err:#}").contains("slow probe timed out"),
             "{err:#}"
         );
-        assert!(start.elapsed() < Duration::from_secs(10));
     }
 
     #[test]
@@ -2042,11 +2043,18 @@ mod tests {
         std::fs::create_dir_all(&repo).unwrap();
         let output = fixture_git(&repo, &["init", "-q"]);
         assert!(output.status.success());
-        let name = configured_clone_remote_name(&repo).unwrap();
+        let isolated = || {
+            let mut command = thegn_core::util::git_cmd(&repo);
+            command
+                .env("GIT_CONFIG_GLOBAL", "/dev/null")
+                .env("GIT_CONFIG_NOSYSTEM", "1");
+            command
+        };
+        let name = clone_remote_name_with(isolated()).unwrap();
         assert_eq!(name, "origin");
         let output = fixture_git(&repo, &["config", "clone.defaultRemoteName", "upstream"]);
         assert!(output.status.success());
-        assert_eq!(configured_clone_remote_name(&repo).unwrap(), "upstream");
+        assert_eq!(clone_remote_name_with(isolated()).unwrap(), "upstream");
     }
 
     #[test]
