@@ -5,13 +5,15 @@
 //! or a wall-clock timer.
 
 use crate::loop_policy::{
-    BACKLOG_HIGH_WATER, DrainBudget, FrameGate, MAX_SLICE, PANE_FRAME_WINDOW, drain_budget,
-    frame_gate, pane_slice,
+    BACKLOG_HIGH_WATER, DrainBudget, FrameGate, LOG_RETAIN, MAX_SLICE, PANE_FRAME_WINDOW,
+    drain_budget, drain_logs, frame_gate, log_budget, pane_slice,
 };
 use crate::render_plan::{Damage, Overlays, RenderPlan, plan};
 use crate::snapshot_slot::{PublishOutcome, SnapshotSlot};
 use std::collections::HashSet;
-use std::time::Duration;
+use std::time::{Duration, Instant};
+use thegn_core::log::parser::parse_log;
+use thegn_svc::log::ingress::LogIngress;
 
 const FLOODER: usize = 0;
 const QUIET: usize = 1;
@@ -395,5 +397,113 @@ fn stalled_writer_backpressure_bounds_memory() {
     for _ in 0..4 {
         sim.step();
         assert!(sim.total_backlog() <= bound);
+    }
+}
+
+#[test]
+fn flood_quiet_pane_and_log_burst_follow_visibility_damage_table() {
+    struct Case {
+        name: &'static str,
+        logs_visible: bool,
+        expected_log_damage: usize,
+    }
+
+    let burst = LOG_RETAIN * 2;
+    let cases = [
+        Case {
+            name: "logs-hidden",
+            logs_visible: false,
+            expected_log_damage: 0,
+        },
+        Case {
+            name: "logs-visible",
+            logs_visible: true,
+            expected_log_damage: burst.div_ceil(log_budget(false).max_records),
+        },
+    ];
+
+    for case in cases {
+        let mut sim = Simulator::flood();
+        let ingress = LogIngress::new();
+        ingress.push(
+            (0..burst)
+                .map(|index| parse_log(&format!("burst-{index}")))
+                .collect(),
+        );
+        let fixed_clock = Instant::now();
+        let mut rows = Vec::new();
+        let mut first_seq = 0;
+        let mut log_damage = 0;
+        let mut steps = 0;
+
+        while ingress.has_pending() {
+            let outcome = sim.step();
+            let logs = drain_logs(
+                &ingress,
+                &mut rows,
+                &mut first_seq,
+                log_budget(false),
+                case.logs_visible,
+                || fixed_clock,
+            );
+            log_damage += usize::from(logs.dirty);
+
+            // This mirrors run.rs: log `dirty` is chrome damage, while pane
+            // output stays in the pane-only channel. Hidden logs therefore
+            // cannot turn the flood's incremental frame into a full render.
+            let damage = Damage {
+                chrome: logs.dirty,
+                panes: [FLOODER as u32, QUIET as u32, BURSTY as u32]
+                    .into_iter()
+                    .collect(),
+                ..Damage::default()
+            };
+            let frame = plan(&damage, &Overlays::default());
+            if case.logs_visible {
+                assert_eq!(frame, RenderPlan::Full, "{}", case.name);
+            } else {
+                assert_eq!(
+                    frame,
+                    RenderPlan::Incremental {
+                        panes: vec![FLOODER as u32, QUIET as u32, BURSTY as u32],
+                        bars: false,
+                        statusbar: false,
+                        sidebar: false,
+                    },
+                    "{}",
+                    case.name
+                );
+                assert_eq!(
+                    plan(
+                        &Damage {
+                            chrome: logs.dirty,
+                            ..Damage::default()
+                        },
+                        &Overlays::default(),
+                    ),
+                    RenderPlan::Skip,
+                    "a hidden log slice must not render by itself: {}",
+                    case.name,
+                );
+            }
+
+            assert!(outcome.drained > 0, "pane flood made no progress");
+            assert!(sim.panes[FLOODER].drained > 0);
+            assert!(sim.panes[QUIET].first_served_step.is_some());
+            steps += 1;
+            assert!(steps <= burst.div_ceil(log_budget(false).max_records));
+        }
+
+        assert_eq!(log_damage, case.expected_log_damage, "{}", case.name);
+        assert_eq!(rows.len(), LOG_RETAIN, "{}", case.name);
+        assert_eq!(first_seq + rows.len() as u64, burst as u64, "{}", case.name);
+        assert_eq!(ingress.stats().pushed_total, burst as u64, "{}", case.name);
+        assert_eq!(ingress.stats().taken_total, burst as u64, "{}", case.name);
+        assert!(!ingress.has_pending(), "{}", case.name);
+        assert!(
+            log_damage < burst,
+            "log damage was emitted per line: {}",
+            case.name
+        );
     }
 }
