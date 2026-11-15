@@ -7,6 +7,8 @@ All notable changes to **thegn** are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.1.0-alpha.85] — 2026-11-15
+
 ### Added
 
 - An opt-in `issue` sidebar detail field shows the newest issue linked to the worktree, with `+N` when more are linked. (THE-2003)
@@ -3563,7 +3565,8 @@ launcher picker and the merge queue's `agent_command` hook remain — they run
 whatever commands you configure. Leftover `[llm_proxy]` config sections and
 `proxy_*` tables in existing state databases are ignored harmlessly.
 
-[Unreleased]: https://github.com/blakeashleyjr/thegn/compare/v0.1.0-alpha.84...HEAD
+[Unreleased]: https://github.com/blakeashleyjr/thegn/compare/v0.1.0-alpha.85...HEAD
+[0.1.0-alpha.85]: https://github.com/blakeashleyjr/thegn/compare/v0.1.0-alpha.84...v0.1.0-alpha.85
 [0.1.0-alpha.84]: https://github.com/blakeashleyjr/thegn/compare/v0.1.0-alpha.83...v0.1.0-alpha.84
 [0.1.0-alpha.83]: https://github.com/blakeashleyjr/thegn/compare/v0.1.0-alpha.82...v0.1.0-alpha.83
 [0.1.0-alpha.82]: https://github.com/blakeashleyjr/thegn/compare/v0.1.0-alpha.81...v0.1.0-alpha.82
