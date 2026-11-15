@@ -1107,16 +1107,30 @@ pub async fn main(
     // back here, so a running pass patches its panel row live.
     let (prq_tx, prq_rx) = tokio_mpsc::unbounded_channel::<crate::handlers::pr_queue::PrqMsg>();
     let (stats_tx, stats_rx) = tokio_mpsc::unbounded_channel::<crate::hydrate::StatsTick>();
-    let (container_tx, container_rx) =
-        tokio_mpsc::unbounded_channel::<crate::hydrate::ContainerRefresh>();
+    // Latest-value container snapshot: the ticker carries the last footprint
+    // into a footprint-less tick, so replacing an unconsumed one loses nothing.
+    let container_slot =
+        crate::snapshot_slot::SnapshotSlot::with_waker(crate::hydrate::CONTAINER_SLOT_MAX_BYTES, {
+            let waker = waker.clone();
+            move || {
+                let _ = waker.wake(); // best-effort: a snapshot wake must not fail the producer
+            }
+        });
     let daemon_status_slot = crate::snapshot_slot::SnapshotSlot::with_waker(64 * 1024, {
         let waker = waker.clone();
         move || {
             let _ = waker.wake(); // best-effort: a snapshot wake must not fail the producer
         }
     });
-    let (metrics_tx, metrics_rx) = tokio_mpsc::unbounded_channel::<crate::metrics::MetricsState>();
-    crate::metrics::spawn_metrics_supervisor(cfg.metrics.clone(), metrics_tx, waker.clone());
+    // Latest-value metrics state: each scrape replaces the last; dropping the
+    // inbox (the loop ending) stops the supervisor.
+    let (metrics_outbox, metrics_inbox) = crate::metrics::metrics_slot({
+        let waker = waker.clone();
+        move || {
+            let _ = waker.wake(); // best-effort: a snapshot wake must not fail the producer
+        }
+    });
+    crate::metrics::spawn_metrics_supervisor(cfg.metrics.clone(), metrics_outbox);
     // The stats cadence is user-cyclable at runtime (click the top-right
     // stats block); the ticker thread reads it per tick.
     let stats_interval_ms = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(
@@ -1175,7 +1189,7 @@ pub async fn main(
         &cfg,
         refresh_tx.clone(),
         stats_tx,
-        container_tx,
+        container_slot.clone(),
         daemon_status_slot.clone(),
         stats_interval_ms.clone(),
         stats_live.clone(),
@@ -1262,9 +1276,9 @@ pub async fn main(
         prq_tx,
         prq_rx,
         stats_rx,
-        container_rx,
+        container_slot,
         daemon_status_slot,
-        metrics_rx,
+        metrics_inbox,
         sandbox_event_rx,
         stats_interval_ms,
         stats_live,
@@ -6971,9 +6985,9 @@ async fn event_loop<T: Terminal>(
     prq_tx: crate::handlers::pr_queue::PrqTx,
     mut prq_rx: crate::handlers::pr_queue::PrqRx,
     mut stats_rx: tokio_mpsc::UnboundedReceiver<crate::hydrate::StatsTick>,
-    mut container_rx: tokio_mpsc::UnboundedReceiver<crate::hydrate::ContainerRefresh>,
+    container_slot: crate::snapshot_slot::SnapshotSlot<crate::hydrate::ContainerRefresh>,
     daemon_status_slot: crate::snapshot_slot::SnapshotSlot<crate::chrome::DaemonStatus>,
-    mut metrics_rx: tokio_mpsc::UnboundedReceiver<crate::metrics::MetricsState>,
+    metrics_inbox: crate::metrics::MetricsInbox,
     mut sandbox_event_rx: tokio_mpsc::UnboundedReceiver<crate::sandbox_events::SandboxEventBatch>,
     stats_interval_ms: std::sync::Arc<std::sync::atomic::AtomicU64>,
     stats_live: std::sync::Arc<std::sync::atomic::AtomicBool>,
@@ -13362,7 +13376,7 @@ async fn event_loop<T: Terminal>(
 
         // Container list from the demand-tiered ticker — replaces the old inline call
         // inside model hydration so `podman ps` never blocks the hydrate path.
-        while let Ok(refresh) = container_rx.try_recv() {
+        while let Some((_, refresh)) = container_slot.take() {
             let mut containers = refresh.containers;
             crate::handlers::sandbox_panel::stamp_ownership(
                 &mut containers,
@@ -13418,7 +13432,7 @@ async fn event_loop<T: Terminal>(
         }
 
         // Fresh metrics readings from the scrape supervisor (sidebar section).
-        while let Ok(state) = metrics_rx.try_recv() {
+        while let Some((_, state)) = metrics_inbox.take() {
             loop_perf.tick(crate::perf::WakeSource::Metrics);
             if model.metrics != state {
                 model.metrics = state;
