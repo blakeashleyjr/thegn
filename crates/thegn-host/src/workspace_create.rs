@@ -1900,6 +1900,7 @@ mod tests {
             group,
             leader,
             leader_exited_first: true,
+            idle_expired: false,
             stdout: thegn_proc::Capture {
                 eof: true,
                 ..thegn_proc::Capture::default()
