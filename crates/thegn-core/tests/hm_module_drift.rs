@@ -881,6 +881,7 @@ fn hm_ui_enum_options_offer_only_canonical_spellings() {
         ("uiSidebarProjectSort", "ui.sidebar_project_sort"),
         ("uiSidebarTerminalsSection", "ui.sidebar_terminals_section"),
         ("uiSidebarFocusDetail", "ui.sidebar_focus_detail"),
+        ("uiSidebarDetailWhen", "ui.sidebar_detail_when"),
     ];
     let enums = enum_lists(&module_src());
     for (option, path) in expected {
@@ -1811,6 +1812,7 @@ fn every_nix_enum_matches_its_destination_enum() {
         ("uiSidebarProjectSort", "ui.sidebar_project_sort"),
         ("uiSidebarTerminalsSection", "ui.sidebar_terminals_section"),
         ("uiSidebarFocusDetail", "ui.sidebar_focus_detail"),
+        ("uiSidebarDetailWhen", "ui.sidebar_detail_when"),
         ("searchStructural", "search.structural"),
         ("gitBackend", "git.backend"),
         ("gitStructuralDiff", "git.structural_diff"),

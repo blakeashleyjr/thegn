@@ -852,6 +852,10 @@ fn sidebar_worktree_detail_hidden_when_sidebar_unfocused() {
         sidebar_rows: vec![ws, wt],
         sidebar_selected: 1,
         sidebar_focused: false,
+        sidebar_display: crate::sidebar_view::SidebarDisplay {
+            detail_when: thegn_core::config::DetailWhen::Focused,
+            ..Default::default()
+        },
         ..Default::default()
     };
     let mut s = Surface::new(rect.cols, rect.rows);
@@ -1488,6 +1492,7 @@ fn focusing_the_sidebar_announces_the_tail_it_hides() {
     }
     let display = crate::sidebar_view::SidebarDisplay {
         focus_detail: thegn_core::config::FocusDetail::All,
+        detail_when: thegn_core::config::DetailWhen::Focused,
         ..Default::default()
     };
 
