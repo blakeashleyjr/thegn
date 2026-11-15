@@ -10,7 +10,7 @@ use thegn_svc::git::{DiffCount, META_COUNT_CAP};
 
 use crate::chrome::S;
 use crate::seg::{Line, Seg, Tok, seg, seg_width, sp};
-use crate::sidebar::{PluginFieldValue, RowKind, SidebarRow};
+use crate::sidebar::{CiBadge, PluginFieldValue, RowKind, SidebarRow};
 use crate::sidebar_view::SidebarDisplay;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -27,6 +27,8 @@ pub(crate) enum FieldId {
     Stage,
     Activity,
     Author,
+    Stash,
+    Ci,
     TailEnv,
     TailSandbox,
     TailDevcontainer,
@@ -103,6 +105,8 @@ fn field_id(field: DetailField) -> FieldId {
         DetailField::Unread => FieldId::TailUnread,
         DetailField::Disk => FieldId::TailDisk,
         DetailField::Author => FieldId::Author,
+        DetailField::Stash => FieldId::Stash,
+        DetailField::Ci => FieldId::Ci,
     }
 }
 
@@ -310,8 +314,43 @@ fn requested_fields(
             .map(|author| Field::new(id, vec![seg(Tok::Slot(S::Dim), display_cell(author))], 1))
             .into_iter()
             .collect(),
+        DetailField::Stash => row
+            .branch_meta
+            .as_ref()
+            .and_then(|meta| meta.stash)
+            .filter(|count| *count > 0)
+            .map(|count| {
+                Field::new(
+                    id,
+                    vec![seg(
+                        Tok::Slot(S::Dim),
+                        format!("stash {}", count_text(count)),
+                    )],
+                    1,
+                )
+            })
+            .into_iter()
+            .collect(),
+        DetailField::Ci => row
+            .ci_state
+            .map(|state| ci_field(state, id))
+            .into_iter()
+            .collect(),
         _ => Vec::new(),
     }
+}
+
+/// The `ci` detail field: glyph-free text for the latest cached CI result,
+/// coloured by the same roles plugin fields use (a failure takes the error
+/// role).
+fn ci_field(state: CiBadge, id: FieldId) -> Field {
+    let (role, text) = match state {
+        CiBadge::Pass => (RowRole::Good, "ci pass"),
+        CiBadge::Fail => (RowRole::Bad, "ci fail"),
+        CiBadge::Running => (RowRole::Warn, "ci run"),
+        CiBadge::Pending => (RowRole::Dim, "ci pend"),
+    };
+    Field::new(id, vec![seg(plugin_role(role), text)], 1)
 }
 
 fn branch_stat_field(row: &SidebarRow, id: FieldId) -> Option<Field> {
@@ -552,6 +591,8 @@ pub(crate) fn fit_fields(mut fields: Vec<Field>, budget: usize) -> Vec<Field> {
         FieldId::Stage,
         FieldId::Upstream,
         FieldId::Author,
+        FieldId::Stash,
+        FieldId::Ci,
         FieldId::Subject,
         FieldId::Age,
         FieldId::TailDisk,
@@ -653,6 +694,7 @@ mod tests {
             last_commit_unix: Some(1_000),
             last_subject: Some("fix retry loop".into()),
             last_author: Some("Ada Lovelace".into()),
+            stash: None,
         });
         row
     }
@@ -903,6 +945,188 @@ mod tests {
             };
             assert_eq!(got, expected, "{budget}: {fitted:?}");
         }
+    }
+
+    fn detail_text(row: &SidebarRow, display: &SidebarDisplay, cols: usize) -> Option<String> {
+        let line = compose_detail_line_at(row, display, 2_000, 0, cols)?;
+        let Line::Segs(segs) = line else {
+            panic!("detail line is a segment line")
+        };
+        Some(
+            segs.iter()
+                .map(|segment| segment.text.as_str())
+                .collect::<String>(),
+        )
+    }
+
+    fn with_stash(stash: Option<u32>) -> SidebarRow {
+        let mut row = row();
+        if let Some(meta) = row.branch_meta.as_mut() {
+            meta.stash = stash;
+        }
+        row
+    }
+
+    #[test]
+    fn stash_field_renders_count_and_hides_zero_and_unknown() {
+        let display = SidebarDisplay {
+            detail_fields: vec![builtin(DetailField::Stash)],
+            ..SidebarDisplay::default()
+        };
+        assert_eq!(
+            detail_text(&with_stash(Some(3)), &display, 80).as_deref(),
+            Some("stash 3")
+        );
+        assert_eq!(
+            detail_text(&with_stash(Some(META_COUNT_CAP)), &display, 80).as_deref(),
+            Some("stash 999+")
+        );
+        assert_eq!(detail_text(&with_stash(Some(0)), &display, 80), None);
+        assert_eq!(detail_text(&with_stash(None), &display, 80), None);
+        let mut no_meta = row();
+        no_meta.branch_meta = None;
+        assert_eq!(detail_text(&no_meta, &display, 80), None);
+    }
+
+    #[test]
+    fn stash_field_is_opt_in_and_parses_from_config() {
+        let row = with_stash(Some(2));
+        let defaults = SidebarDisplay::default();
+        assert!(
+            !defaults
+                .detail_fields
+                .contains(&builtin(DetailField::Stash))
+        );
+        assert!(
+            !detail_fields(&row, &defaults, 2_000)
+                .iter()
+                .any(|field| field.id == FieldId::Stash)
+        );
+
+        let ui: thegn_core::config::UiConfig =
+            toml::from_str(r#"sidebar_detail_fields = ["branch", "stash"]"#).unwrap();
+        let display = SidebarDisplay {
+            detail_fields: ui.detail_entries_resolved(),
+            ..SidebarDisplay::default()
+        };
+        let ids: Vec<FieldId> = detail_fields(&row, &display, 2_000)
+            .into_iter()
+            .map(|field| field.id)
+            .collect();
+        assert_eq!(ids, vec![FieldId::Branch, FieldId::Stash]);
+    }
+
+    #[test]
+    fn stash_drops_after_author_and_before_subject() {
+        let ids = [
+            FieldId::Branch,
+            FieldId::Subject,
+            FieldId::Stash,
+            FieldId::Author,
+        ];
+        let fields = |ids: &[FieldId]| -> Vec<Field> {
+            ids.iter()
+                .map(|id| Field::new(*id, vec![seg(Tok::Slot(S::Dim), "1234567890")], 10))
+                .collect()
+        };
+        let got = |budget: usize| -> Vec<FieldId> {
+            fit_fields(fields(&ids), budget)
+                .iter()
+                .map(|field| field.id)
+                .collect()
+        };
+        assert_eq!(
+            got(36),
+            vec![FieldId::Branch, FieldId::Subject, FieldId::Stash]
+        );
+        assert_eq!(got(24), vec![FieldId::Branch, FieldId::Subject]);
+        assert_eq!(got(12), vec![FieldId::Branch]);
+    }
+
+    fn with_ci(state: Option<CiBadge>) -> SidebarRow {
+        let mut row = row();
+        row.ci_state = state;
+        row
+    }
+
+    #[test]
+    fn ci_field_renders_state_text_and_hides_unknown() {
+        let display = SidebarDisplay {
+            detail_fields: vec![builtin(DetailField::Ci)],
+            ..SidebarDisplay::default()
+        };
+        for (state, text) in [
+            (CiBadge::Pass, "ci pass"),
+            (CiBadge::Fail, "ci fail"),
+            (CiBadge::Running, "ci run"),
+            (CiBadge::Pending, "ci pend"),
+        ] {
+            assert_eq!(
+                detail_text(&with_ci(Some(state)), &display, 80).as_deref(),
+                Some(text)
+            );
+        }
+        assert_eq!(detail_text(&with_ci(None), &display, 80), None);
+    }
+
+    #[test]
+    fn ci_fail_uses_the_error_role() {
+        let fail = ci_field(CiBadge::Fail, FieldId::Ci);
+        assert_eq!(fail.segs.len(), 1);
+        assert_eq!(fail.segs[0].fg, plugin_role(RowRole::Bad));
+        let pass = ci_field(CiBadge::Pass, FieldId::Ci);
+        assert_eq!(pass.segs[0].fg, plugin_role(RowRole::Good));
+    }
+
+    #[test]
+    fn ci_field_is_opt_in_and_parses_from_config() {
+        let row = with_ci(Some(CiBadge::Fail));
+        let defaults = SidebarDisplay::default();
+        assert!(!defaults.detail_fields.contains(&builtin(DetailField::Ci)));
+        assert!(
+            !detail_fields(&row, &defaults, 2_000)
+                .iter()
+                .any(|field| field.id == FieldId::Ci)
+        );
+
+        let ui: thegn_core::config::UiConfig =
+            toml::from_str(r#"sidebar_detail_fields = ["branch", "ci"]"#).unwrap();
+        let display = SidebarDisplay {
+            detail_fields: ui.detail_entries_resolved(),
+            ..SidebarDisplay::default()
+        };
+        let ids: Vec<FieldId> = detail_fields(&row, &display, 2_000)
+            .into_iter()
+            .map(|field| field.id)
+            .collect();
+        assert_eq!(ids, vec![FieldId::Branch, FieldId::Ci]);
+    }
+
+    #[test]
+    fn ci_drops_after_stash_and_before_subject() {
+        let ids = [
+            FieldId::Branch,
+            FieldId::Subject,
+            FieldId::Ci,
+            FieldId::Stash,
+        ];
+        let fields = |ids: &[FieldId]| -> Vec<Field> {
+            ids.iter()
+                .map(|id| Field::new(*id, vec![seg(Tok::Slot(S::Dim), "1234567890")], 10))
+                .collect()
+        };
+        let got = |budget: usize| -> Vec<FieldId> {
+            fit_fields(fields(&ids), budget)
+                .iter()
+                .map(|field| field.id)
+                .collect()
+        };
+        assert_eq!(
+            got(36),
+            vec![FieldId::Branch, FieldId::Subject, FieldId::Ci]
+        );
+        assert_eq!(got(24), vec![FieldId::Branch, FieldId::Subject]);
+        assert_eq!(got(12), vec![FieldId::Branch]);
     }
 
     #[test]

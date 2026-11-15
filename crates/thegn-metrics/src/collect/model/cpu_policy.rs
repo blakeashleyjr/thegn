@@ -109,6 +109,18 @@ pub enum GovernorSummary {
     Mixed,
 }
 
+/// Hybrid core class of a cpufreq policy, read once at discover.
+///
+/// `Unknown` covers homogeneous machines (no classes to tell apart) and any
+/// policy whose classification inputs were missing or unreadable.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum CoreClass {
+    #[default]
+    Unknown,
+    Performance,
+    Efficiency,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct CpuPolicy {
     pub policy: u16,
@@ -125,6 +137,10 @@ pub struct CpuPolicy {
     pub boost: Option<bool>,
     pub prefcore_rank: Option<u32>,
     pub highest_perf: Option<u32>,
+    /// Hybrid core class (Intel `cpu_core`/`cpu_atom` lists, else `cpu_capacity`).
+    pub core_class: CoreClass,
+    /// Scheduler `cpu_capacity` (1..=1024) of the policy's first cpu.
+    pub capacity: Option<u16>,
 }
 impl CpuPolicy {
     pub fn capped(&self) -> bool {
@@ -145,7 +161,14 @@ pub struct PowerPolicy {
 
 #[cfg(test)]
 mod tests {
-    use super::{CpuPolicy, CpuSet, SysToken, TokenList};
+    use super::{CoreClass, CpuPolicy, CpuSet, SysToken, TokenList};
+    #[test]
+    fn core_class_defaults_to_unknown() {
+        let policy = CpuPolicy::default();
+        assert_eq!(policy.core_class, CoreClass::Unknown);
+        assert_eq!(policy.capacity, None);
+        assert_eq!(CoreClass::default(), CoreClass::Unknown);
+    }
     #[test]
     fn token_and_cpu_set_are_bounded() {
         assert!(SysToken::new(b"balanced").is_some());

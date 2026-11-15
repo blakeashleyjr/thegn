@@ -127,7 +127,9 @@ Press `Enter` (`↵ core`) to toggle the `cpu.core` panel in the C-states slot.
 It shows six rows of busy history, current mode shares, that core's frequency
 policy, C-state residencies, and package/die/core topology with SMT siblings.
 The `C states residency` panel shows C0 and reported C-state residency per core.
-Frequency, load/pressure, IRQ/softirq, and scheduler wait have separate panels.
+Frequency, load/pressure, IRQ/softirq, and scheduler wait have separate panels. On
+hybrid Linux CPUs the Frequency panel and the Power tab policy rows tag each policy
+`perf` or `eff`, and the Frequency summary adds `hybrid <n>P/<n>E`.
 Panel focus (`f`/`F`), zoom (`z`), and Escape follow the monitor board controls.
 
 ## Memory

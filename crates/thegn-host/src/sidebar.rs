@@ -202,6 +202,18 @@ impl SortMode {
     }
 }
 
+/// The latest cached CI result for one worktree, as the sidebar `ci` detail
+/// field shows it. Derived off-loop from the same newest valid-id cached run
+/// the attention scorer reads (`attention_status::ci_badge`). Absent means
+/// unknown, never a pass.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CiBadge {
+    Pass,
+    Fail,
+    Running,
+    Pending,
+}
+
 /// A value supplied by a plugin for one worktree row field.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PluginFieldValue {
@@ -302,6 +314,9 @@ pub struct SidebarRow {
     /// reaches the dot through the EXISTING blocked evidence (the attention
     /// tier), not through a stage-shaped activity variant.
     pub pipeline_stage: Option<String>,
+    /// The worktree's latest cached CI result, denormalized from
+    /// `SidebarStatus::ci_states` in the same pass. `None` = no cached run.
+    pub ci_state: Option<CiBadge>,
     /// Flat-layout only: the owning workspace's display name, rendered as a dim
     /// prefix so a flat cross-repo worktree row still shows which repo it
     /// belongs to. `None` in grouped mode (the workspace header gives context).
@@ -359,6 +374,7 @@ impl SidebarRow {
             attention: None,
             mq_status: None,
             pipeline_stage: None,
+            ci_state: None,
             repo_prefix: None,
             mq_rollup: None,
             plugin_fields: Vec::new(),
@@ -469,6 +485,10 @@ pub struct SidebarStatus {
     /// Absent for a worktree with no live staged dispatch (see
     /// `monitor_pipeline::stage_badges`).
     pub pipeline_stages: std::collections::BTreeMap<String, String>,
+    /// Per-worktree latest cached CI result (keyed by path), filled by the
+    /// attention scan from the CI cache it already reads. A worktree with no
+    /// cached run has no entry.
+    pub ci_states: std::collections::BTreeMap<String, CiBadge>,
     /// Resident plugin row-field values keyed by worktree path.
     pub plugin_fields: std::collections::BTreeMap<String, Vec<PluginFieldValue>>,
     /// The derived lane folders under the Pipeline row: one per issue/worktree
@@ -1237,6 +1257,11 @@ pub fn build_rows(
                     .as_deref()
                     .and_then(|p| status.pipeline_stages.get(p))
                     .cloned();
+                row.ci_state = row
+                    .worktree_path
+                    .as_deref()
+                    .and_then(|p| status.ci_states.get(p))
+                    .copied();
             }
             RowKind::Workspace => {
                 row.attention = status.workspace_attention.get(&row.workspace_slug).copied();
@@ -1557,17 +1582,11 @@ fn worktree_row(
         .as_deref()
         .and_then(|p| status.branches.get(p))
         .cloned();
+    // `plugin_row_sync::project_plugin_fields` keys this map by worktree path
+    // only (a plugin's branch-name key is resolved to the path there).
     let plugin_fields = wt_path
         .as_deref()
         .and_then(|p| status.plugin_fields.get(p))
-        .or_else(|| {
-            status.plugin_fields.get(
-                live_branch
-                    .as_deref()
-                    .filter(|branch| !branch.is_empty())
-                    .unwrap_or(gr.label.as_str()),
-            )
-        })
         .cloned()
         .unwrap_or_default();
     let branch_meta = wt_path
@@ -2123,6 +2142,77 @@ mod tests {
             row.branch_meta.as_ref().and_then(|meta| meta.ahead_base),
             Some(5)
         );
+    }
+
+    #[test]
+    fn worktree_row_carries_ci_state_by_path() {
+        let s = session(
+            vec![tab("app/tg-red", "/wt/red"), tab("app/tg-none", "/wt/none")],
+            0,
+        );
+        let ws = vec![(
+            "app".to_string(),
+            "app".to_string(),
+            "repo".to_string(),
+            "/repos/app".to_string(),
+        )];
+        let mut status = no_activity();
+        status.ci_states.insert("/wt/red".into(), CiBadge::Fail);
+        let rows = build_rows(&s, &ws, &ViewState::default(), &status, &[], &[], &[]);
+        let ci = |path: &str| {
+            rows.iter()
+                .find(|r| r.kind == RowKind::Worktree && r.worktree_path.as_deref() == Some(path))
+                .expect("worktree row")
+                .ci_state
+        };
+        assert_eq!(ci("/wt/red"), Some(CiBadge::Fail));
+        assert_eq!(ci("/wt/none"), None);
+    }
+
+    #[test]
+    fn worktree_row_looks_up_plugin_fields_by_path_only() {
+        let s = session(vec![tab("app/tg-old", "/wt/a")], 0);
+        let ws = vec![(
+            "app".to_string(),
+            "app".to_string(),
+            "repo".to_string(),
+            "/repos/app".to_string(),
+        )];
+        let value = |text: &str| PluginFieldValue {
+            plugin: "ci".into(),
+            field: "status".into(),
+            text: text.into(),
+            role: thegn_core::plugin_api::RowRole::Good,
+            slot: thegn_core::plugin_api::RowFieldSlot::Detail,
+        };
+        let find = |rows: &[SidebarRow]| {
+            rows.iter()
+                .find(|r| {
+                    r.kind == RowKind::Worktree && r.worktree_path.as_deref() == Some("/wt/a")
+                })
+                .expect("worktree row")
+                .plugin_fields
+                .clone()
+        };
+
+        // A branch-name or tab-label key in the status map no longer resolves.
+        let mut status = no_activity();
+        status.branches.insert("/wt/a".into(), "tg/live".into());
+        status
+            .plugin_fields
+            .insert("tg/live".into(), vec![value("by-branch")]);
+        status
+            .plugin_fields
+            .insert("tg-old".into(), vec![value("by-label")]);
+        let rows = build_rows(&s, &ws, &ViewState::default(), &status, &[], &[], &[]);
+        assert!(find(&rows[..]).is_empty());
+
+        // The path key does.
+        status
+            .plugin_fields
+            .insert("/wt/a".into(), vec![value("by-path")]);
+        let rows = build_rows(&s, &ws, &ViewState::default(), &status, &[], &[], &[]);
+        assert_eq!(find(&rows[..]), vec![value("by-path")]);
     }
 
     #[test]

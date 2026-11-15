@@ -9,6 +9,14 @@ pub fn parse_khz(bytes: &[u8]) -> Option<u64> {
 pub fn parse_u32(bytes: &[u8]) -> Option<u32> {
     u32::try_from(parse_u64_trimmed(bytes)?).ok()
 }
+/// Scheduler `cpu_capacity`: decimal digits in `1..=1024`, surrounding ASCII
+/// whitespace tolerated. Empty, signed, hex, out-of-range and overflowing
+/// values are rejected.
+pub fn parse_capacity(bytes: &[u8]) -> Option<u16> {
+    u16::try_from(parse_u64_trimmed(bytes)?)
+        .ok()
+        .filter(|value| (1..=1024).contains(value))
+}
 pub fn parse_flag(bytes: &[u8]) -> Option<bool> {
     match trim(bytes) {
         b"1" | b"enabled" => Some(true),
@@ -105,8 +113,40 @@ fn trim(bytes: &[u8]) -> &[u8] {
 
 #[cfg(test)]
 mod tests {
-    use super::{parse_cpu_list, parse_flag, parse_khz, parse_token_list, parse_u32};
+    use super::{
+        parse_capacity, parse_cpu_list, parse_flag, parse_khz, parse_token_list, parse_u32,
+    };
     use crate::collect::model::cpu_policy::CpuSet;
+    #[test]
+    fn capacity_parser_accepts_terminated_and_unterminated_values() {
+        for (input, expected) in [
+            (b"1024".as_slice(), Some(1024)),
+            (b"1024\n", Some(1024)),
+            (b"512 ", Some(512)),
+            (b"512 \n", Some(512)),
+            (b"1", Some(1)),
+            (b"1\n", Some(1)),
+        ] {
+            assert_eq!(parse_capacity(input), expected, "{input:?}");
+        }
+        for bad in [
+            b"".as_slice(),
+            b"\n",
+            b"abc",
+            b"abc\n",
+            b"-5",
+            b"+5",
+            b"0x400",
+            b"0",
+            b"0\n",
+            b"1025",
+            b"99999999999",
+            b"99999999999999999999999",
+            b"5 12",
+        ] {
+            assert_eq!(parse_capacity(bad), None, "{bad:?}");
+        }
+    }
     #[test]
     fn parsers_cover_frequency_flags_tokens_and_cpu_lists() {
         assert_eq!(parse_khz(b" \t1237661\r\n"), Some(1_237_661));

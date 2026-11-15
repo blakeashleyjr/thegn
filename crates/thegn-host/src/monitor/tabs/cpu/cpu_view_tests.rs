@@ -11,7 +11,7 @@ use thegn_metrics::collect::{
     CollectorId,
     health::{Absent, Health},
     model::{
-        cpu_policy::{CpuPolicy, PowerPolicy, SysToken},
+        cpu_policy::{CoreClass, CpuPolicy, PowerPolicy, SysToken},
         cpu_stat::{CoreSample, ModeShare},
         loadavg::LoadavgPart,
         psi::PsiPart,
@@ -887,4 +887,85 @@ fn drill_down_paint_is_allocation_free_when_warm() {
         counts.allocation_calls,
         counts.realloc_calls,
     );
+}
+
+fn freq_lines(classes: &[CoreClass], cols: usize, rows: usize) -> Vec<String> {
+    let part = thegn_metrics::collect::model::cpu_freq::CpuFreqPart {
+        policies: classes
+            .iter()
+            .enumerate()
+            .map(|(n, class)| CpuPolicy {
+                policy: n as u16,
+                cur_khz: Some(2_000_000),
+                core_class: *class,
+                ..CpuPolicy::default()
+            })
+            .collect(),
+        ..Default::default()
+    };
+    let mut grid = crate::monitor::kit::grid::CellGrid::new(cols, rows);
+    super::paint::paint_freq(&mut grid, Rect::full(cols, rows), &part, Health::Ok);
+    (0..rows)
+        .map(|row| {
+            (0..cols)
+                .map(|col| grid.get(col, row).map_or(' ', |cell| cell.ch))
+                .collect::<String>()
+        })
+        .collect()
+}
+
+#[test]
+fn frequency_rows_show_core_class_and_unknown_is_unchanged() {
+    let lines = freq_lines(
+        &[
+            CoreClass::Performance,
+            CoreClass::Efficiency,
+            CoreClass::Unknown,
+        ],
+        80,
+        14,
+    );
+    assert!(lines.iter().any(|line| line.contains("P0 perf 2000MHz")));
+    assert!(lines.iter().any(|line| line.contains("P1 eff 2000MHz")));
+    let unknown = lines
+        .iter()
+        .find(|line| line.contains("P2"))
+        .cloned()
+        .unwrap_or_default();
+    assert!(unknown.contains("P2 2000MHz"));
+    assert!(!unknown.contains("perf") && !unknown.contains("eff"));
+}
+
+#[test]
+fn frequency_row_tag_overflow_is_clipped_without_panic() {
+    let lines = freq_lines(&[CoreClass::Efficiency], 6, 4);
+    assert_eq!(lines.len(), 4);
+}
+
+#[test]
+fn frequency_profile_line_appends_hybrid_counts_only_for_mixed_parts() {
+    let first = |classes: &[CoreClass], cols: usize| freq_lines(classes, cols, 14).remove(1);
+    let mixed = first(
+        &[
+            CoreClass::Performance,
+            CoreClass::Performance,
+            CoreClass::Efficiency,
+            CoreClass::Unknown,
+        ],
+        80,
+    );
+    assert!(mixed.contains(" hybrid 2P/1E"), "{mixed:?}");
+    let unknown = first(&[CoreClass::Unknown, CoreClass::Unknown], 80);
+    assert!(!unknown.contains("hybrid"), "{unknown:?}");
+    let single = first(&[CoreClass::Performance, CoreClass::Performance], 80);
+    assert!(!single.contains("hybrid"), "{single:?}");
+    assert_eq!(single.trim_end(), unknown.trim_end());
+}
+
+#[test]
+fn frequency_hybrid_summary_is_clipped_at_narrow_widths() {
+    for cols in 1..12 {
+        let lines = freq_lines(&[CoreClass::Performance, CoreClass::Efficiency], cols, 4);
+        assert_eq!(lines.len(), 4);
+    }
 }

@@ -277,6 +277,7 @@ mod tests {
             last_commit_unix: Some(42),
             last_subject: Some("subject".into()),
             last_author: None,
+            stash: Some(2),
         };
         let encoded = serde_json::to_value(&row).unwrap();
         assert_eq!(serde_json::from_value::<GlyphRow>(encoded).unwrap(), row);

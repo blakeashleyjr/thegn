@@ -252,10 +252,11 @@ The richer detail line is configured by `sidebar_detail_when`,
 `[ui]`. Commits count commits ahead of the repository's default branch; the
 badge caps at `999+`. Valid field names are `branch`, `commits`, `dirty`,
 `branch_stat`, `pr`, `subject`, `age`, `upstream`, `stage`, `activity`, `env`,
-`sandbox`, `devcontainer`, `hibernated`, `mq`, `unread`, `disk`, and `author`.
+`sandbox`, `devcontainer`, `hibernated`, `mq`, `unread`, `disk`, `author`,
+`stash`, and `ci`.
 The default field order is `branch`, `commits`, `dirty`, `branch_stat`, `pr`,
 `subject`, `age`, `env`, `sandbox`, `devcontainer`, `hibernated`, `mq`, `unread`,
-`disk`; `upstream`, `stage`, `activity`, and `author` are opt-in. The legacy
+`disk`; `upstream`, `stage`, `activity`, `author`, `stash`, and `ci` are opt-in. The legacy
 `sidebar_detail_branch`, `sidebar_detail_branch_stat`, and `sidebar_detail_pr`
 toggles remain AND gates; prefer `sidebar_detail_fields` for membership and
 order. An entry can also be `plugin:<plugin>/<field>`; plugin IDs use
@@ -265,20 +266,32 @@ rendered in the requested order, including environment, sandbox, devcontainer,
 hibernation, merge-queue, unread, and disk.
 
 Plugin fields whose manifest caps set `slot = "badge"` render as compact badges
-after the commit badge. They are capped to 12 columns and are dropped before
-the row label is truncated. A badge still needs its `plugin:<plugin>/<field>`
+after the commit badge. They are capped to 12 columns and are removed first
+when the row is narrow, before the label is truncated. A badge still needs its `plugin:<plugin>/<field>`
 entry in `sidebar_detail_fields` to be enabled.
 
 The author field is read with the existing branch metadata scan and adds no
-git spawn. Four source areas were considered for this feature: stash count (the
-stash backend is currently read only by the diff panel), last-commit author
-(now shipped here; further `BranchMeta` enrichment can follow), CI state (there
-is no per-worktree CI datum), and linked issue ID (it exists only in the
-pipeline lane folder). Stash count, CI state, and linked issue ID remain
-deferred and are not produced by the current glyph scan.
+git spawn. The `stash` field shows `stash N` when the repository has stash
+entries and is hidden when there are none or the count is unknown (for
+example, on a remote worktree). It counts the stash reflog directly, so it adds
+no git spawn either. The stash is shared by every worktree of a repository, so
+each of them shows the same count.
 
-When the row is narrow, elision drops content in this order: activity, stage,
-upstream, author, subject (first truncated to eight cells), age, tail badges
+The `ci` field shows the worktree's latest CI result as `ci pass`, `ci fail`
+(in the error colour), `ci run`, or `ci pend`. It reads the cached latest run
+that the attention scan already uses, so it adds no CI fetch or spawn, and it
+can lag the live provider by the CI refresh cadence. It is hidden while no run
+is cached, and `ci run` and `ci pend` are also hidden while the CI refresh for
+that worktree is failing, because no live result backs them; a cached pass or
+failure stays shown.
+
+Four source areas were considered for this feature: stash count, last-commit
+author, and CI state (all shipped here), and linked issue ID (it exists only in
+the pipeline lane folder). Linked issue ID remains deferred and is not produced
+by the current scan.
+
+When the row is narrow, elision drops content in this order: plugin fields,
+activity, stage, upstream, author, stash, ci, subject (first truncated to eight cells), age, tail badges
 (disk, unread, merge queue, hibernation, devcontainer, sandbox, environment),
 branch stat, PR, dirty, commits, then branch. The branch is always retained and
 gets an ellipsis.

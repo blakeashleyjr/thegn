@@ -7,6 +7,30 @@ All notable changes to **thegn** are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.1.0-alpha.84] — 2026-11-15
+
+### Added
+
+- An opt-in `stash` sidebar detail field shows the repository's stash count, read from the stash log without a git process and hidden at zero. (THE-2003)
+- An opt-in `ci` sidebar detail field shows the worktree's latest cached CI result (`ci pass`, `ci fail`, `ci run`, `ci pend`) with no extra fetch. (THE-2003)
+- On hybrid Linux CPUs, the CPU Frequency panel and the Power tab policy rows tag each policy `perf` or `eff`, and the Frequency summary adds `hybrid <n>P/<n>E`. (THE-844)
+- The `[activity]` float keys, plus `media.volume_step`, `usage.warn_percent`, `usage.crit_percent`, and `stats.refresh_secs`, are now Home Manager options with range checks. (THE-428)
+
+### Changed
+
+- Git write commands now have a deadline: 1 hour for network commands (fetch, push, pull, clone and similar) and 15 minutes for other writes. Set `THEGN_GIT_WRITE_TIMEOUT_SECS` to override it, or `0` to disable it.
+  Background processes a git write leaves in its process group are now stopped when it finishes. (THE-368)
+- Git commands that read from stdin now share the write deadline, and Git output beyond 256 MiB on stdout or 8 MiB on stderr stops the command with an error naming the limit. (THE-368)
+- Git output larger than 64 MiB, or any single field larger than 1 MiB, is refused as an error instead of being parsed. (THE-383)
+- Daemon fallback notices name the newest unacknowledged crash report. (THE-119)
+- An out-of-range `media.volume_step`, `usage.warn_percent`, `usage.crit_percent`, `activity.cpu_percent`, or `activity.runaway_core_fraction` now logs a warning naming the key and valid range, and the value still loads. (THE-428)
+- Internal: typed VPS inventory results for the server reaper; latest-value slots for metrics, container, provisioning, and live job output; per-drain ingress budgets; a `test/podman-pause-bisect.sh` harness; a minicore graph painter; and tests for each. (THE-530, THE-661, THE-657, THE-870, THE-842)
+
+### Fixed
+
+- Live job output, metrics, container, and provisioning updates now keep only the newest value instead of queueing every update, and chatty container events wake the screen at most once per 250 ms. (THE-661)
+- The review-pane structural diff and the workspace clone probes now run under a deadline and output cap, and an incomplete structural diff is reported as an error instead of shown partial. (THE-729)
+
 ## [0.1.0-alpha.83] — 2026-11-15
 
 ### Added
@@ -3519,7 +3543,8 @@ launcher picker and the merge queue's `agent_command` hook remain — they run
 whatever commands you configure. Leftover `[llm_proxy]` config sections and
 `proxy_*` tables in existing state databases are ignored harmlessly.
 
-[Unreleased]: https://github.com/blakeashleyjr/thegn/compare/v0.1.0-alpha.83...HEAD
+[Unreleased]: https://github.com/blakeashleyjr/thegn/compare/v0.1.0-alpha.84...HEAD
+[0.1.0-alpha.84]: https://github.com/blakeashleyjr/thegn/compare/v0.1.0-alpha.83...v0.1.0-alpha.84
 [0.1.0-alpha.83]: https://github.com/blakeashleyjr/thegn/compare/v0.1.0-alpha.82...v0.1.0-alpha.83
 [0.1.0-alpha.82]: https://github.com/blakeashleyjr/thegn/compare/v0.1.0-alpha.81...v0.1.0-alpha.82
 [0.1.0-alpha.81]: https://github.com/blakeashleyjr/thegn/compare/v0.1.0-alpha.80...v0.1.0-alpha.81

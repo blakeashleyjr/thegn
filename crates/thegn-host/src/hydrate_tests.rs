@@ -734,6 +734,7 @@ fn reused_glyph_row_carries_meta_into_status() {
         last_commit_unix: Some(42),
         last_subject: Some("subject".into()),
         last_author: None,
+        stash: None,
     };
     let (row, _clean) = merge_glyph_scan(
         Some(&prior),
