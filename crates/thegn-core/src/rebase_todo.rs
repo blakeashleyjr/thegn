@@ -867,4 +867,314 @@ mod tests {
             "cannot move entry: already first"
         );
     }
+
+    // --- truncation / mutation / shape tables (THE-383) ---
+
+    const US: char = '\u{1f}';
+    /// Subject holding tab, a non-ASCII char and an embedded `\r` (a newline
+    /// cannot occur in a line-oriented format).
+    const LINE_HOSTILE: &str = "subj\twith tab \u{e9}\rmid";
+
+    fn full_sha(n: usize) -> String {
+        format!("{n:040x}")
+    }
+
+    fn log_row(n: usize) -> String {
+        format!("{US}{}{US}{LINE_HOSTILE} {n}\n", full_sha(n + 1))
+    }
+
+    fn log_rows(count: usize) -> Vec<String> {
+        let mut rows = Vec::new();
+        for n in 0..count {
+            rows.push(log_row(n));
+        }
+        rows
+    }
+
+    fn assert_log_error(input: &str, expect: &str, label: &str) {
+        match todo_from_log(input) {
+            Ok(rows) => panic!(
+                "{label}: expected error {expect:?}, parsed {} rows",
+                rows.len()
+            ),
+            Err(error) => assert!(error.to_string().contains(expect), "{label}: {error}"),
+        }
+    }
+
+    #[test]
+    fn todo_from_log_truncation_table_every_byte_offset() {
+        let rows = log_rows(4);
+        let input: String = rows.concat();
+        let mut starts = vec![0usize];
+        let mut total = 0usize;
+        for row in &rows {
+            total += row.len();
+            starts.push(total);
+        }
+        let full = todo_from_log(&input).unwrap();
+        assert_eq!(full.len(), 4);
+        // One unit separator, a 40-char sha and the second separator.
+        let header = 1 + 40 + 1;
+        for cut in 0..=input.len() {
+            if !input.is_char_boundary(cut) {
+                continue;
+            }
+            let whole = starts.iter().rposition(|s| *s <= cut).unwrap();
+            let partial = cut - starts[whole];
+            let parsed = todo_from_log(&input[..cut]);
+            if partial == 0 {
+                let got = parsed.unwrap_or_else(|e| panic!("cut {cut} must parse: {e}"));
+                assert_eq!(got, full[..whole].to_vec(), "cut {cut}");
+            } else if partial < header {
+                assert!(
+                    parsed.is_err(),
+                    "cut {cut} inside the header must be rejected"
+                );
+            } else {
+                // Tolerant by line shape: a truncated subject is kept short.
+                let got = parsed.unwrap_or_else(|e| panic!("cut {cut} must parse: {e}"));
+                assert_eq!(got.len(), whole + 1, "cut {cut}");
+                assert_eq!(got[..whole].to_vec(), full[..whole].to_vec(), "cut {cut}");
+                let last = &got[whole];
+                assert_eq!(last.sha, full[whole].sha, "cut {cut}: sha never truncated");
+                assert!(
+                    full[whole].subject.starts_with(&last.subject),
+                    "cut {cut}: subject {:?} is not a prefix",
+                    last.subject
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn todo_from_log_mutation_table() {
+        let sha = full_sha(1);
+        let table = vec![
+            (
+                "missing record separator",
+                format!("{sha}{US}s\n"),
+                "missing record separator",
+            ),
+            (
+                "missing second separator",
+                format!("{US}{sha}\n"),
+                "expected sha and subject",
+            ),
+            (
+                "only a separator",
+                format!("{US}\n"),
+                "expected sha and subject",
+            ),
+            (
+                "uppercase sha",
+                format!("{US}{}{US}s\n", sha.to_uppercase().replace('0', "A")),
+                "invalid full sha",
+            ),
+            (
+                "non-hex sha",
+                format!("{US}{}{US}s\n", "z".repeat(40)),
+                "invalid full sha",
+            ),
+            (
+                "39-char sha",
+                format!("{US}{}{US}s\n", "a".repeat(39)),
+                "invalid full sha",
+            ),
+            (
+                "41-char sha",
+                format!("{US}{}{US}s\n", "a".repeat(41)),
+                "invalid full sha",
+            ),
+            ("empty sha", format!("{US}{US}s\n"), "invalid full sha"),
+            (
+                "doubled separator",
+                format!("{US}{US}{sha}{US}s\n"),
+                "invalid full sha",
+            ),
+            (
+                "sha with NUL",
+                format!("{US}{}\0{US}s\n", &sha[..39]),
+                "invalid full sha",
+            ),
+            (
+                "duplicate commit",
+                format!("{US}{sha}{US}a\n{US}{sha}{US}b\n"),
+                "duplicate commit",
+            ),
+            ("bad second row", format!("{US}{sha}{US}a\nnope\n"), "row 2"),
+        ];
+        for (label, input, expect) in &table {
+            assert_log_error(input, expect, label);
+        }
+    }
+
+    #[test]
+    fn todo_from_log_subject_may_hold_separators_and_empty() {
+        let sha = full_sha(1);
+        let got =
+            todo_from_log(&format!("{US}{sha}{US}a{US}b\n{US}{}{US}\n", full_sha(2))).unwrap();
+        assert_eq!(got[0].subject, format!("a{US}b"));
+        assert_eq!(got[1].subject, "");
+    }
+
+    #[test]
+    fn todo_from_log_line_ending_variants_agree() {
+        let rows = log_rows(3);
+        let lf: String = rows.concat();
+        let want = todo_from_log(&lf).unwrap();
+        assert_eq!(want.len(), 3);
+        assert_eq!(want[0].subject, format!("{LINE_HOSTILE} 0"));
+
+        let crlf = lf.replace('\n', "\r\n");
+        let no_trailing = lf.trim_end_matches('\n').to_string();
+        let crlf_no_trailing = crlf.trim_end_matches("\r\n").to_string();
+        let blank_tail = format!("{lf}\n\n");
+        let crlf_blank_tail = format!("{crlf}\r\n\r\n");
+        let lone_cr_tail = format!("{lf}\r\n");
+        for (label, input) in [
+            ("crlf", crlf),
+            ("no trailing newline", no_trailing),
+            ("crlf without trailing newline", crlf_no_trailing),
+            ("trailing blank lines", blank_tail),
+            ("crlf trailing blank lines", crlf_blank_tail),
+            ("trailing lone CRLF", lone_cr_tail),
+        ] {
+            assert_eq!(todo_from_log(&input).unwrap(), want, "{label}");
+        }
+    }
+
+    #[test]
+    fn todo_from_log_minimal_thousand_and_five_thousand() {
+        assert_eq!(todo_from_log(&log_rows(1).concat()).unwrap().len(), 1);
+        assert_eq!(todo_from_log("").unwrap().len(), 0);
+        assert_eq!(todo_from_log(&log_rows(1000).concat()).unwrap().len(), 1000);
+        let parsed = todo_from_log(&log_rows(5000).concat()).unwrap();
+        assert_eq!(parsed.len(), 5000);
+        assert_eq!(parsed[4999].sha, full_sha(5000));
+    }
+
+    fn todo_text() -> String {
+        let mut text = String::new();
+        text.push_str(&format!("pick {} {LINE_HOSTILE}\n", full_sha(1)));
+        text.push_str(&format!("reword {} second \u{e9}\n", full_sha(2)));
+        text.push_str("# a comment line\n");
+        text.push_str("exec make test\n");
+        text.push_str("break\n");
+        text.push_str(&format!("drop {} last\n", full_sha(3)));
+        text
+    }
+
+    #[test]
+    fn parse_todo_truncation_never_panics_and_never_corrupts_a_sha() {
+        let input = todo_text();
+        let full = parse_todo(&input);
+        assert_eq!(full.len(), 5);
+        for cut in 0..=input.len() {
+            if !input.is_char_boundary(cut) {
+                continue;
+            }
+            let prefix = &input[..cut];
+            let line_start = prefix.rfind('\n').map_or(0, |i| i + 1);
+            let whole = parse_todo(&prefix[..line_start]);
+            let n = whole.len();
+            assert_eq!(
+                whole,
+                full[..n].to_vec(),
+                "cut {cut}: whole lines unchanged"
+            );
+            let got = parse_todo(prefix);
+            assert!(got.len() <= n + 1, "cut {cut}");
+            assert_eq!(got[..n].to_vec(), whole, "cut {cut}");
+            if got.len() == n {
+                continue; // cut on a line start, or inside a comment / blank
+            }
+            let partial = &got[n];
+            let want = &full[n];
+            let full_line = input[line_start..].lines().next().unwrap_or("");
+            match &partial.action {
+                TodoAction::Unknown(text) => {
+                    assert!(full_line.starts_with(text.as_str()), "cut {cut}: {text:?}");
+                }
+                TodoAction::Exec(arg) => {
+                    let TodoAction::Exec(whole_arg) = &want.action else {
+                        panic!("cut {cut}: exec partial of a non-exec line");
+                    };
+                    assert!(whole_arg.starts_with(arg.as_str()), "cut {cut}");
+                }
+                action if action.is_commit() => {
+                    assert_eq!(*action, want.action, "cut {cut}");
+                    assert!(
+                        want.sha.starts_with(&partial.sha),
+                        "cut {cut}: sha {:?}",
+                        partial.sha
+                    );
+                    assert!(want.subject.starts_with(&partial.subject), "cut {cut}");
+                }
+                other => assert_eq!(*other, want.action, "cut {cut}"),
+            }
+        }
+    }
+
+    #[test]
+    fn parse_todo_truncated_fixup_flag_is_read_as_a_sha_pinned() {
+        // Tolerant by design: a todo cut right after `fixup -` is a Fixup
+        // whose "sha" is the flag stub, not a corrupted real sha.
+        let got = parse_todo("fixup -");
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].action, TodoAction::Fixup);
+        assert_eq!(got[0].sha, "-");
+        assert!(matches!(
+            parse_todo("fixup -C")[0].action,
+            TodoAction::Unknown(_)
+        ));
+    }
+
+    #[test]
+    fn parse_todo_garbage_is_preserved_never_an_error() {
+        let got = parse_todo("\u{0}\u{1f}weird\npi\n\t \nexec\n");
+        assert_eq!(got.len(), 3);
+        assert!(
+            got.iter()
+                .all(|e| matches!(e.action, TodoAction::Unknown(_)))
+        );
+    }
+
+    #[test]
+    fn parse_todo_line_ending_variants_agree() {
+        let lf = todo_text();
+        let want = parse_todo(&lf);
+        assert_eq!(want.len(), 5);
+        assert_eq!(want[0].subject, LINE_HOSTILE);
+        let crlf = lf.replace('\n', "\r\n");
+        let no_trailing = lf.trim_end_matches('\n').to_string();
+        let crlf_no_trailing = crlf.trim_end_matches("\r\n").to_string();
+        let blank_tail = format!("{lf}\n\n");
+        let crlf_blank_tail = format!("{crlf}\r\n\r\n");
+        let blank_head = format!("\n\n{lf}");
+        for (label, input) in [
+            ("crlf", crlf),
+            ("no trailing newline", no_trailing),
+            ("crlf without trailing newline", crlf_no_trailing),
+            ("trailing blank lines", blank_tail),
+            ("crlf trailing blank lines", crlf_blank_tail),
+            ("leading blank lines", blank_head),
+        ] {
+            assert_eq!(parse_todo(&input), want, "{label}");
+        }
+    }
+
+    #[test]
+    fn parse_todo_minimal_thousand_and_five_thousand() {
+        assert!(parse_todo("").is_empty());
+        assert_eq!(parse_todo("pick abc\n").len(), 1);
+        let mut text = String::new();
+        for n in 0..5000 {
+            text.push_str(&format!("pick {} {LINE_HOSTILE}\n", full_sha(n)));
+        }
+        let parsed = parse_todo(&text);
+        assert_eq!(parsed.len(), 5000);
+        assert_eq!(parsed[4999].sha, full_sha(4999));
+        let thousand: String = text.lines().take(1000).map(|l| format!("{l}\n")).collect();
+        assert_eq!(parse_todo(&thousand).len(), 1000);
+    }
 }
