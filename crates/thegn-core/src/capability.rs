@@ -1104,22 +1104,12 @@ pub const SURFACE_GAPS: &[(&str, Surface, &str)] = &[
         "MCP state tools land in the client-API phase",
     ),
     (
-        "merge.add",
-        Surface::Mcp,
-        "MCP state tools land in the client-API phase",
-    ),
-    (
         "merge.clear",
         Surface::Mcp,
         "MCP state tools land in the client-API phase",
     ),
     (
         "calendar.ingest",
-        Surface::Mcp,
-        "MCP state tools land in the client-API phase",
-    ),
-    (
-        "notify.push",
         Surface::Mcp,
         "MCP state tools land in the client-API phase",
     ),
@@ -1364,22 +1354,12 @@ pub const GAP_DISPOSITIONS: &[(&str, Surface, GapDisposition)] = &[
         GapDisposition::Deferred { review: "THE-203" },
     ),
     (
-        "merge.add",
-        Surface::Mcp,
-        GapDisposition::Deferred { review: "THE-203" },
-    ),
-    (
         "merge.clear",
         Surface::Mcp,
         GapDisposition::Deferred { review: "THE-203" },
     ),
     (
         "calendar.ingest",
-        Surface::Mcp,
-        GapDisposition::Deferred { review: "THE-203" },
-    ),
-    (
-        "notify.push",
         Surface::Mcp,
         GapDisposition::Deferred { review: "THE-203" },
     ),
