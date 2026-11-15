@@ -3227,10 +3227,10 @@ mod tests {
             msg.to_str().unwrap(),
         ]);
         assert!(matches!(
-            git_out_strict(dir.path(), &["log", "-1", "--format=%B"]),
+            git_out_strict(dir.path(), &["cat-file", "commit", "HEAD"]),
             Err(GitTextError::InvalidUtf8)
         ));
-        assert!(git_out_raw(dir.path(), &["log", "-1", "--format=%B"]).is_ok());
+        assert!(git_out_raw(dir.path(), &["cat-file", "commit", "HEAD"]).is_ok());
     }
 
     #[test]
