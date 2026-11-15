@@ -1012,3 +1012,32 @@ fn frequency_itmt_suffix_is_clipped_at_narrow_widths() {
         assert_eq!(itmt_lines(Some(true), cols).len(), 6);
     }
 }
+
+#[test]
+fn usage_panel_io_and_steal_rows_show_label_and_latest_percent() {
+    let frame = fixture_frame();
+    let mut model = CpuModel::default();
+    for _ in 0..8 {
+        model.absorb_frame(&frame);
+    }
+    for cols in [8usize, 20, 80] {
+        let rect = Rect::full(cols, 12);
+        let mut surface = Surface::new(cols + 4, 12);
+        super::paint::paint(&model, &mut surface, USAGE, rect);
+        let text = lines(&surface);
+        // graph rect starts at y + 2 with rows - 5 = 7 rows; io/st are its last two.
+        let (io, st) = (&text[2 + 5], &text[2 + 6]);
+        for row in [io, st] {
+            assert!(
+                row.chars().skip(cols).all(|c| c == ' '),
+                "row wrote past the panel at width {cols}: {row:?}"
+            );
+        }
+        if cols >= 20 {
+            assert!(io.contains("io"), "{io:?}");
+            assert!(st.contains("st"), "{st:?}");
+            assert!(io.contains('7') && io.contains('%'), "{io:?}");
+            assert!(st.contains("3%"), "{st:?}");
+        }
+    }
+}
