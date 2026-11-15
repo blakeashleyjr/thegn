@@ -1187,7 +1187,7 @@ mod tests {
         records
     }
 
-    fn branch_row(n: usize) -> String {
+    fn table_branch_row(n: usize) -> String {
         let (head, upstream, track) = match n % 3 {
             0 => ("*", "origin/main", "[ahead 1, behind 2]"),
             1 => (" ", "", ""),
@@ -1203,7 +1203,7 @@ mod tests {
     fn branch_rows(count: usize) -> Vec<String> {
         let mut rows = Vec::new();
         for n in 0..count {
-            rows.push(branch_row(n));
+            rows.push(table_branch_row(n));
         }
         rows
     }
@@ -1351,7 +1351,7 @@ mod tests {
     #[test]
     fn commits_signed_timestamp_is_rejected() {
         // `%ct` is plain decimal digits; a sign is corruption, as in reflog.
-        let table = vec![
+        let table = [
             (
                 "plus sign",
                 commit_with(4, "+100"),
@@ -1558,7 +1558,7 @@ mod tests {
     #[test]
     fn branches_signed_date_is_rejected_and_extra_separator_fields_are_accepted() {
         let row = |date: &str| format!("*{US}main{US}{US}{US}{}{US}{date}{US}a{US}b\n", oid(1));
-        let table = vec![
+        let table = [
             ("plus-signed date", row("+5"), "malformed branch row 1"),
             ("minus-signed date", row("-5"), "malformed branch row 1"),
         ];
