@@ -211,6 +211,36 @@ pub(crate) fn paint_sparkline(
     });
 }
 
+/// Paint `label sparkline pct` into one row of `rect`, degrading to fit.
+pub(crate) fn paint_minicore_row(
+    label: &str,
+    values: &[f32],
+    pct: f64,
+    ramp: RampId,
+    rect: crate::compositor::Rect,
+    surface: &mut termwiz::surface::Surface,
+) {
+    if rect.rows == 0 || rect.cols == 0 {
+        return;
+    }
+    GRAPH_OUT.with(|scratch| {
+        let mut out = scratch.borrow_mut();
+        with_palette(|palette| {
+            paint_minicore(&mut out, label, values, pct, rect.cols, ramp, palette);
+        });
+        if let Some(line) = out.lines.first() {
+            crate::seg::draw_line(
+                surface,
+                rect.x,
+                rect.y,
+                rect.cols,
+                line,
+                crate::seg::Tok::Slot(crate::chrome::S::Panel),
+            );
+        }
+    });
+}
+
 /// Paint retained telemetry history into a multi-row graph area.
 pub(crate) fn paint_history_graph(
     values: &[f32],
