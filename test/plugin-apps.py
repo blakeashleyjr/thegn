@@ -142,7 +142,7 @@ class Host:
             'tab_order = ["work", "plugin:pty:workspace"]',
             '[profiles.emacs]', 'default_mode = "emacs"',
             '[[plugins]]', 'id = "pty"', 'name = "PTY conformance"',
-            'version = "0.1.0"', 'api = "0.4.0"', 'mode = "resident"',
+            'version = "0.1.0"', 'api = "0.5.0"', 'mode = "resident"',
             'timeout_secs = 2',
             'trusted_native = true', 'background = false',
             'cwd = ' + json.dumps(str(root / "projects")),
