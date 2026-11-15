@@ -185,8 +185,8 @@ is a THE-661 candidate; pick one with a measured case (a backlog observed under
    above): done for refresh requests, workspace clone, merge-queue drive,
    PR-queue, worktree creation, share and forward events (at most 32 or 64
    messages / 4 ms deadline per drain, lossless, one re-armed wake after the
-   last budgeted drain). Remaining: app tile hooks (deliberately drain-all, see
-   its row) and model hydration (not a candidate).
+   last budgeted drain). Remaining: host UI events, app tile hooks
+   (deliberately drain-all, see its row) and model hydration (not a candidate).
 
 Not candidates: `stats_rx` (every tick feeds telemetry history) and `model_rx`
 (the model carries queued intents that must all be delivered, run.rs:12397).
