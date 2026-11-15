@@ -252,6 +252,23 @@ fn deliver(
     }
 }
 
+/// Whether a live config reload moved weather to a different cache row
+/// (provider, location or resolved units) while weather stays active, so the
+/// shown reading belongs to the old place and one immediate poll is owed.
+pub(crate) fn reload_needs_poll(
+    old: &WeatherConfig,
+    new: &WeatherConfig,
+    locale: Option<&str>,
+) -> bool {
+    if !(old.is_active() && new.is_active()) {
+        return false;
+    }
+    let key = |c: &WeatherConfig| {
+        thegn_core::weather::cache_key(c.provider.as_str(), &c.location, c.resolved_units(locale))
+    };
+    key(old) != key(new)
+}
+
 #[cfg(test)]
 #[path = "hydrate_weather_tests.rs"]
 mod tests;
