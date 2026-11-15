@@ -411,9 +411,13 @@ thegn keys hints --zone sidebar   # what that zone's hint strip renders
 When GitHub or GitLab CI is selected, `thegn doctor` prints a value-free `CI credential placement` section with
 `credential placement: github/local`, `github/ssh`, `github/provider` (or the
 matching `gitlab/...` rows) under `Providers`; `--json` keeps these notes under
-`providers`. For GitLab CI, the probe reports the credential mode of the
-`[ci.gitlab]` token without printing its value, and what each mode does for a
-local worktree and for an SSH or provider worktree:
+`providers` and adds matching `credential_placements` rows with a stable
+`probe` state. The placement rows say `configured (not probed)` unless an
+existing bounded local probe supplies stronger evidence; `thegn doctor` does
+not make a network call just to validate a credential. For GitLab CI, the
+probe reports the configured credential mode of the `[ci.gitlab]` token
+without printing its value, and what each mode does for a local worktree and
+for an SSH or provider worktree:
 
 - CLI-managed (no token, or the default `env:GITLAB_TOKEN` is unset): a local
   worktree uses the local `glab auth login`; an SSH or provider worktree

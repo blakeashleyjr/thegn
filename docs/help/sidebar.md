@@ -238,12 +238,52 @@ reading, it shows an amber `?`.
   header always names the current layout (`grouped`, or `flat` in the accent
   colour) next to the sort chip. Click it to switch back: if your projects
   and folders have vanished into one long list, that is flat mode
-- `i` — row detail: cycle the secondary line (branch, ahead/behind, PR)
-  between **all** rows, the **cursor** row only, and **off**. The detail
-  line only ever shows while the sidebar has focus. Defaults to the cursor
-  row — **all** doubles every worktree row's height on focus, so it halves
-  how much of the tree fits. This overrides
-  `sidebar_focus_detail` from [[config-reference]] `[ui]` and persists
+- `i` — row detail: cycle `sidebar_focus_detail` between **all** rows, the
+  **cursor** row only, and **off**. The default is **all**. Visibility outside
+  sidebar focus is controlled separately by `sidebar_detail_when`; `i` cycles
+  only `sidebar_focus_detail`. Both settings are in [[config-reference]] `[ui]`
+  and the `sidebar_focus_detail` runtime choice persists.
+
+### Row detail
+
+The richer detail line is configured by `sidebar_detail_when`,
+`sidebar_show_commits`, `sidebar_show_behind_base`, `sidebar_commit_badge`,
+`sidebar_behind_badge`, and `sidebar_detail_fields` in [[config-reference]]
+`[ui]`. Commits count commits ahead of the repository's default branch; the
+badge caps at `999+`. Valid field names are `branch`, `commits`, `dirty`,
+`branch_stat`, `pr`, `subject`, `age`, `upstream`, `stage`, `activity`, `env`,
+`sandbox`, `devcontainer`, `hibernated`, `mq`, `unread`, `disk`, and `author`.
+The default field order is `branch`, `commits`, `dirty`, `branch_stat`, `pr`,
+`subject`, `age`, `env`, `sandbox`, `devcontainer`, `hibernated`, `mq`, `unread`,
+`disk`; `upstream`, `stage`, `activity`, and `author` are opt-in. The legacy
+`sidebar_detail_branch`, `sidebar_detail_branch_stat`, and `sidebar_detail_pr`
+toggles remain AND gates; prefer `sidebar_detail_fields` for membership and
+order. An entry can also be `plugin:<plugin>/<field>`; plugin IDs use
+`[A-Za-z0-9._-]{1,64}` and fields use `[a-z0-9_-]{1,32}`. An absent plugin is
+silently empty. An empty list keeps only the branch fallback. Each requested field is
+rendered in the requested order, including environment, sandbox, devcontainer,
+hibernation, merge-queue, unread, and disk.
+
+Plugin fields whose manifest caps set `slot = "badge"` render as compact badges
+after the commit badge. They are capped to 12 columns and are dropped before
+the row label is truncated. A badge still needs its `plugin:<plugin>/<field>`
+entry in `sidebar_detail_fields` to be enabled.
+
+The author field is read with the existing branch metadata scan and adds no
+git spawn. Four source areas were considered for this feature: stash count (the
+stash backend is currently read only by the diff panel), last-commit author
+(now shipped here; further `BranchMeta` enrichment can follow), CI state (there
+is no per-worktree CI datum), and linked issue ID (it exists only in the
+pipeline lane folder). Stash count, CI state, and linked issue ID remain
+deferred and are not produced by the current glyph scan.
+
+When the row is narrow, elision drops content in this order: activity, stage,
+upstream, author, subject (first truncated to eight cells), age, tail badges
+(disk, unread, merge queue, hibernation, devcontainer, sandbox, environment),
+branch stat, PR, dirty, commits, then branch. The branch is always retained and
+gets an ellipsis.
+Age is approximate and is read when the line is composed; it does not tick
+while the UI is idle.
 
 Project ordering is configurable: `sidebar_project_sort = "attention"`
 bubbles the project that most needs you to the top. See

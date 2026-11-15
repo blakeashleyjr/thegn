@@ -17,7 +17,7 @@ statusbar segment.
 Two equivalent homes:
 
 - A `[[plugins]]` entry in your config (the full spec: id, name, version,
-  `api = "0.4.0"`, `command = ["…"]`, contributions).
+  `api = "0.5.0"`, `command = ["…"]`, contributions).
 - A directory: `<config dir>/plugins/<name>/plugin.toml` with the same
   fields. Its `cwd` defaults to that directory.
 
@@ -143,8 +143,13 @@ dropped; requests get a `rate_limited` reply with `host plugin queue full`.
 Saturation logs one `thegn::plugin` warning per plugin per flush. Exit is never
 dropped.
 
-Those three rendering/event points plus `IssueProvider` are the extension
-points the general compositor host accepts. `PanelSection`, `SidebarTab`,
+`WorktreeField` is also wired for resident, on-demand row-field producers.
+It requires `surface:rowfield`; its `caps.field` name uses
+`[a-z0-9_-]{1,32}`, and each `update` replaces the field's row values.
+
+The general compositor host accepts `WorktreeField`, `AppTab`,
+`StatusBarSegment`, `NotificationSource`, `PaletteAction`, and `IssueProvider`
+extension points. `PanelSection`, `SidebarTab`,
 `Theme`, `Automation`, `HarnessAdapter`, `ProgramAdapter`, `CiProvider`,
 `ForgeProvider`, and `DebugAdapter` are wire vocabulary only there:
 `thegn plugin check` rejects them until their host runtime lands. `DataSource`
@@ -158,7 +163,7 @@ Plugin themes will be data-only palettes, and plugin keys will be
 surface-local actions.
 
 The machine-readable source for this classification is embedded in
-`docs/api/plugin-api-0.4.json` as `x-thegn-extension-support`; its companion
+`docs/api/plugin-api-0.5.json` as `x-thegn-extension-support`; its companion
 `x-thegn-host-verb-support` table names verb authority and permitted modes, and
 the API version each verb needs (a verb newer than the plugin's declared `api`
 is refused as unsupported). `x-thegn-host-call-capabilities` is the exact set

@@ -1862,6 +1862,66 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn list_stops_at_exact_limit_without_another_page() {
+        let (result, requests) = run_list(
+            IssueFilter {
+                limit: 150,
+                ..Default::default()
+            },
+            vec![
+                jira_search_page(0, 900, 100),
+                jira_search_page(100, 900, 50),
+                jira_search_page(150, 900, 100),
+            ],
+            Arc::new(TrackerHttpBudget::with_permits(1)),
+        )
+        .await;
+        assert_eq!(result.unwrap().len(), 150);
+        assert_eq!(requests.len(), 2, "{requests:?}");
+        assert!(requests[0].contains("maxResults=100"), "{}", requests[0]);
+        assert!(requests[1].contains("maxResults=50"), "{}", requests[1]);
+        assert!(requests.iter().all(|r| !r.contains("startAt=150")));
+    }
+
+    #[tokio::test]
+    async fn list_total_shrinking_between_pages_is_not_an_infinite_loop_or_error() {
+        // The collector stops once startAt reaches the latest reported total
+        // and returns the rows gathered so far as complete.
+        let (result, requests) = run_list(
+            IssueFilter::default(),
+            vec![
+                jira_search_page(0, 250, 100),
+                jira_search_page(100, 120, 100),
+                jira_search_page(200, 120, 100),
+            ],
+            Arc::new(TrackerHttpBudget::with_permits(1)),
+        )
+        .await;
+        assert_eq!(result.unwrap().len(), 200);
+        assert_eq!(requests.len(), 2, "{requests:?}");
+    }
+
+    #[tokio::test]
+    async fn list_total_growth_between_pages_follows_until_page_cap_then_partial() {
+        let (result, requests) = run_list(
+            IssueFilter::default(),
+            (0..MAX_LIST_PAGES)
+                .map(|page| jira_search_page(page * 100, (page + 2) * 100, 100))
+                .collect(),
+            Arc::new(TrackerHttpBudget::with_permits(1)),
+        )
+        .await;
+        match result {
+            Err(IssueError::PartialList { issues, reason }) => {
+                assert_eq!(issues.len(), 100 * MAX_LIST_PAGES);
+                assert_eq!(reason, "Jira listing page cap reached");
+            }
+            other => panic!("expected capped partial listing, got {other:?}"),
+        }
+        assert_eq!(requests.len(), MAX_LIST_PAGES);
+    }
+
+    #[tokio::test]
     async fn list_deadline_after_first_page_returns_collected_rows_as_partial() {
         let budget = Arc::new(TrackerHttpBudget::with_permits(1));
         budget.expire_after_responses_for_test(1);

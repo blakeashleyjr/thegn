@@ -295,6 +295,12 @@ pub fn validate_diagnostics_with_policy(
         message,
     }));
     if let Ok(cfg) = toml::from_str::<Config>(&normalized.body) {
+        diagnostics.extend(sidebar_detail_warnings(&cfg).into_iter().map(|message| {
+            ValidationDiagnostic {
+                severity: ValidationSeverity::Warning,
+                message,
+            }
+        }));
         if cfg.voice.kind == crate::config::VoiceKind::Http
             && let Err(message) = cfg.voice.validate_credential_transport()
         {
@@ -548,6 +554,28 @@ pub(crate) fn typed_semantic_errors(cfg: &Config, mode: SemanticMode) -> Vec<Str
     batch!(cfg.ci.validate());
     batch!(crate::provider_admission::validate_config(cfg));
     errs
+}
+
+fn sidebar_detail_warnings(cfg: &Config) -> Vec<String> {
+    let mut warnings = Vec::new();
+    for field in &cfg.ui.sidebar_detail_fields {
+        if crate::config_ui::parse_entry(field).is_none() {
+            warnings.push(format!(
+                "ui.sidebar_detail_fields: unknown field {field:?}; expected a built-in name or plugin:<name>/<field>"
+            ));
+        }
+    }
+    for (key, badge) in [
+        ("ui.sidebar_commit_badge", &cfg.ui.sidebar_commit_badge),
+        ("ui.sidebar_behind_badge", &cfg.ui.sidebar_behind_badge),
+    ] {
+        if !badge.contains("{n}") {
+            warnings.push(format!(
+                "{key}: badge template must contain {{n}}; the default will be used"
+            ));
+        }
+    }
+    warnings
 }
 
 /// Same project-specific schema semantics as document validation, including
@@ -1412,9 +1440,11 @@ mod tests {
         // (SandboxCompilerCache) makes cache enablement explicit and trusted,
         // while `[serve] topology` (ServeTopology) distinguishes direct,
         // TLS-terminated, and tunnel-only control-plane deployments.
+        // 101 → 102 (THE-2002): `[ui] sidebar_detail_when` (DetailWhen) —
+        // whether the sidebar detail line needs sidebar focus.
         assert_eq!(
             defs.len(),
-            101,
+            102,
             "config_enum definitions in the Config schema changed; update the \
              pin (and the exclusion note) deliberately: {defs:?}"
         );
@@ -1455,6 +1485,7 @@ mod tests {
         has("toolchain.mise.inject", "MiseInject");
         has("issues.provider", "IssueProviderKind");
         has("ui.sidebar_focus_detail", "FocusDetail");
+        has("ui.sidebar_detail_when", "DetailWhen");
         // Maps via additionalProperties.
         has("env.*.provider.connect", "ProviderConnect");
         has("host.*.reach", "HostReach");
@@ -1950,6 +1981,24 @@ sidebar_workspace_sort = "attention"
     }
 
     #[test]
+    fn warns_on_unknown_detail_field_and_badge_without_n() {
+        let body = "[ui]\nsidebar_detail_fields = [\"branch\", \"bogus\"]\nsidebar_commit_badge = \"commits\"\nsidebar_behind_badge = \"{n}b\"\n";
+        let diagnostics = validate_diagnostics(body);
+        assert!(diagnostics.iter().any(|diagnostic| {
+            diagnostic.severity == ValidationSeverity::Warning
+                && diagnostic.message.contains("sidebar_detail_fields")
+                && diagnostic.message.contains("bogus")
+                && diagnostic.message.contains("plugin:<name>/<field>")
+        }));
+        assert!(diagnostics.iter().any(|diagnostic| {
+            diagnostic.severity == ValidationSeverity::Warning
+                && diagnostic.message.contains("sidebar_commit_badge")
+                && diagnostic.message.contains("{n}")
+        }));
+        assert!(validate_str(body).is_empty());
+    }
+
+    #[test]
     fn malformed_workspace_sandbox_mount_is_a_warning() {
         let body = "[project.repo]\nsandbox_mounts = [\"/a:relative\"]\n";
         let diagnostics = validate_diagnostics(body);
@@ -2188,6 +2237,14 @@ mod security_root_rot_tests {
     /// a root whose exec field is spelled `run` is exactly the one a
     /// command/argv-only vocabulary would miss.
     fn is_dangerous_field(name: &str) -> bool {
+        // Names the suffix vocabulary matches by accident, each a
+        // presentation knob that executes, holds and reaches nothing:
+        // `[ui] sidebar_show_behind_base` is a boolean badge toggle ("behind
+        // the base branch"), not a `*_base` URL.
+        const NOT_DANGEROUS: &[&str] = &["sidebar_show_behind_base"];
+        if NOT_DANGEROUS.contains(&name) {
+            return false;
+        }
         const EXACT: &[&str] = &[
             "command", "argv", "exec", "cmd", "run", "script", "shell", "args", "bin", "path",
             "image", "socket", "proxy", "url", "host", "endpoint", "server", "token", "secret",

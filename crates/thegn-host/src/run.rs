@@ -42,6 +42,7 @@ use crate::hydrate_schedule::{RefreshGeneration, ScheduleOwner};
 use crate::input::key_bytes;
 use crate::layout;
 use crate::loading::{SpecOrigin, provision_owns_tab};
+use crate::loop_policy::{self, FrameInputs};
 use crate::menu::{self, MenuChoice, MenuOverlay};
 use crate::palette::build_palette;
 use crate::pane::PaneEvent;
@@ -1192,7 +1193,7 @@ pub async fn main(
     let (sandbox_event_tx, sandbox_event_rx) =
         tokio_mpsc::unbounded_channel::<crate::sandbox_events::SandboxEventBatch>();
     crate::sandbox_gc_gate::with_startup_sandbox_events(&cfg, || {
-        crate::sandbox_events::spawn(&cfg.sandbox, sandbox_event_tx);
+        crate::sandbox_events::spawn(&cfg.sandbox, sandbox_event_tx, waker.clone());
     });
     // Drained in the event loop below (audit run.rs:825): a container event was
     // written to the DB, so mark the audit panel dirty. Draining also stops the
@@ -1681,6 +1682,72 @@ impl SidebarState {
         self.cursor = visible_index_of_active(model);
         self.sync(model);
     }
+}
+
+/// Project the loop-owned plugin row store onto the current sidebar rows.
+/// This is called only after plugin damage or a model swap, never from a
+/// timer, so an idle session cannot acquire a new wake source.
+fn sync_plugin_fields(model: &mut FrameModel, plugins: &crate::handlers::plugins::PluginsState) {
+    let snapshot = crate::handlers::plugins::row_field_values(plugins);
+    let mut slots = std::collections::BTreeMap::new();
+    for (plugin, entry) in &plugins.plugins {
+        for contribution in &entry.contributions {
+            if contribution.extension_point != thegn_core::plugin_api::ExtensionPoint::WorktreeField
+            {
+                continue;
+            }
+            let Ok(caps) = serde_json::from_value::<thegn_core::plugin_api::WorktreeFieldCaps>(
+                contribution.caps.clone(),
+            ) else {
+                continue;
+            };
+            slots.insert((plugin.clone(), caps.field), caps.slot);
+        }
+    }
+
+    let mut projected = std::collections::BTreeMap::new();
+    for row in model
+        .sidebar_rows
+        .iter()
+        .filter(|row| row.kind == crate::sidebar::RowKind::Worktree)
+    {
+        let Some(path) = row.worktree_path.as_deref() else {
+            continue;
+        };
+        let branch = row
+            .branch
+            .as_deref()
+            .filter(|branch| !branch.is_empty())
+            .unwrap_or(&row.label);
+        let mut values = Vec::new();
+        for ((plugin, field), worktrees) in &snapshot {
+            let Some(value) = worktrees.get(path).or_else(|| worktrees.get(branch)) else {
+                continue;
+            };
+            let Some(slot) = slots.get(&(plugin.clone(), field.clone())).copied() else {
+                continue;
+            };
+            values.push(crate::sidebar::PluginFieldValue {
+                plugin: plugin.clone(),
+                field: field.clone(),
+                text: value.text.clone(),
+                role: value.role,
+                slot,
+            });
+        }
+        if !values.is_empty() {
+            projected.insert(path.to_string(), values);
+        }
+    }
+    for row in &mut model.sidebar_rows {
+        row.plugin_fields = row
+            .worktree_path
+            .as_deref()
+            .and_then(|path| projected.get(path))
+            .cloned()
+            .unwrap_or_default();
+    }
+    model.sidebar_status.plugin_fields = projected;
 }
 
 // Sidebar row activation lives in `handlers/sidebar_activate.rs` (extracted
@@ -12818,6 +12885,7 @@ async fn event_loop<T: Terminal>(
             // Plugin statusbar segments are loop-owned (handlers::plugins), not
             // hydrated — re-stamp them so a model swap doesn't blank the bar.
             model.plugin_segments = crate::handlers::plugins::statusbar_views(&plugins_state);
+            sync_plugin_fields(&mut model, &plugins_state);
             // The Symbols list (outline/refs) is re-derived in the pre-render block.
             // Mirror an externally-started (or externally-finished) rebase
             // into the git flow state, so the TODO view and conflict chrome
@@ -14429,16 +14497,20 @@ async fn event_loop<T: Terminal>(
         // Plugin runtime messages: apply verbs to the per-plugin runtimes and
         // map the aggregate plugin damage to the narrowest compositor channel.
         // Raised alerts are recorded to the inbox off-loop by `flush_alerts`.
-        match crate::handlers::plugins::drain(
+        let plugin_damage = crate::handlers::plugins::drain(
             &mut plugin_rx,
             &mut plugins_state,
             &mut model,
             plugins_host.as_ref(),
-        ) {
+        );
+        match plugin_damage {
             crate::plugin_damage::PluginDamage::None => {}
             crate::plugin_damage::PluginDamage::StatusbarContent => {
                 model.plugin_segments = crate::handlers::plugins::statusbar_views(&plugins_state);
                 statusbar_dirty = true;
+            }
+            crate::plugin_damage::PluginDamage::SidebarContent => {
+                sidebar_dirty = true;
             }
             crate::plugin_damage::PluginDamage::Structural => {
                 model.plugin_segments = crate::handlers::plugins::statusbar_views(&plugins_state);
@@ -14448,6 +14520,9 @@ async fn event_loop<T: Terminal>(
                 bars_dirty = true;
                 dirty = true;
             }
+        }
+        if !matches!(plugin_damage, crate::plugin_damage::PluginDamage::None) {
+            sync_plugin_fields(&mut model, &plugins_state);
         }
         let plugin_backlog = !plugin_rx.is_empty();
         crate::handlers::plugins::flush_alerts(&mut plugins_state);
@@ -15831,11 +15906,8 @@ async fn event_loop<T: Terminal>(
         // 2. Render if anything changed (diff-flush): damaged panes and/or chrome,
         //    cursor in the focused pane. `dirty` = chrome/overlay/geometry channel;
         //    `dirty_panes` = per-pane content; either (or `full_repaint`) → a frame.
-        //    The pure pacing gate (`loop_policy::frame_gate`) may defer a
-        //    pane-only streaming frame inside the window (damage stays armed;
-        //    the poll timeout below guarantees the trailing flush) and defers
-        //    composition past a queued-but-undispatched keystroke so one frame
-        //    carries its effect.
+        //    The pure frame decision may defer pane-only output or a queued
+        //    input while retaining the trailing-frame wake guarantee.
         let have_damage = dirty
             || full_repaint
             || !dirty_panes.is_empty()
@@ -15843,7 +15915,6 @@ async fn event_loop<T: Terminal>(
             || statusbar_dirty
             || sidebar_dirty
             || scroll_dirty;
-        let mut defer_timeout: Option<std::time::Duration> = None;
         let pane_only_damage = !dirty
             && !full_repaint
             && switch_at.is_none()
@@ -15857,34 +15928,22 @@ async fn event_loop<T: Terminal>(
                 InputEvent::Key(_) | InputEvent::Mouse(_) | InputEvent::Paste(_)
             )
         });
-        // Writer backpressure: with 2 frames already in flight, composing a
-        // third would either block or corrupt the diff chain — defer instead
-        // (damage stays armed and coalesces; the slow terminal's drain rate
-        // paces the frame rate). Checked BEFORE the wire renderer runs, whose
-        // SGR state must only advance for frames that are actually delivered.
-        let writer_busy = !writer.frame_slot_free();
-        let should_render = have_damage
-            && !writer_busy
-            && match crate::loop_policy::frame_gate(
-                input_at.is_some(),
-                input_queued,
-                pane_only_damage,
-                last_flush_at.elapsed(),
-                crate::loop_policy::PANE_FRAME_WINDOW,
-            ) {
-                crate::loop_policy::FrameGate::RenderNow => true,
-                crate::loop_policy::FrameGate::Defer { remaining } => {
-                    defer_timeout = Some(remaining);
-                    loop_perf.frame_deferred();
-                    false
-                }
-            };
-        if writer_busy && have_damage {
-            // Re-check soon; the writer pulses no wake on success, so poll.
-            defer_timeout = Some(std::time::Duration::from_millis(2));
+        // Writer backpressure is checked before the wire renderer advances SGR.
+        let decision = loop_policy::decide_frame(&FrameInputs {
+            have_damage,
+            pane_only_damage,
+            input_awaiting_frame: input_at.is_some(),
+            input_queued,
+            writer_busy: !writer.frame_slot_free(),
+            since_last_flush: last_flush_at.elapsed(),
+            window: loop_policy::PANE_FRAME_WINDOW,
+        });
+        let should_render = decision.render;
+        let defer_timeout = decision.defer_timeout;
+        if decision.count_deferred {
             loop_perf.frame_deferred();
         }
-        if !have_damage {
+        if decision.idle_wake {
             // Woke but nothing changed — a wasted wakeup (storm signal).
             loop_perf.render_skip();
             // An idle wake is the right moment to return freed arena pages to

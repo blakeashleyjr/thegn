@@ -233,6 +233,7 @@ impl IcsBackend {
         candidates = select_candidates(candidates)?;
         let mut total_bytes = 0usize;
         let mut diagnostics = PageDiagnostics::default();
+        let mut diag_budget = super::DiagnosticsBudget::default();
         let mut saw_series_tombstone = false;
         for path in candidates {
             check_deadline(deadline)
@@ -249,7 +250,7 @@ impl IcsBackend {
             ) {
                 Ok((n, file_diagnostics, file_has_series_tombstone)) => {
                     total_bytes += n;
-                    diagnostics.absorb(file_diagnostics);
+                    diagnostics.absorb_within(file_diagnostics, &mut diag_budget);
                     saw_series_tombstone |= file_has_series_tombstone;
                 }
                 Err(ReadFailure::Io(e)) => {

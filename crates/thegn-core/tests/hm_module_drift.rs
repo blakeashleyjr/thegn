@@ -418,13 +418,61 @@ fn every_value_option_defaults_to_null() {
             || (name == "remote"
                 && src[..declaration_offset].rfind("sandboxSubmodule =")
                     > src[..declaration_offset].rfind("remoteSubmodule ="));
-        if !is_list_item_field && !is_submodule_container {
+        if !is_list_item_field && !is_submodule_container && name != "uiSidebarDetailFields" {
             offenders.push(format!("{name}: {value}"));
         }
     }
     assert!(
         offenders.is_empty(),
         "value options must default to null (allowed submodule containers and list-item fields excluded): {offenders:?}"
+    );
+}
+
+#[test]
+fn sidebar_detail_field_defaults_match_example_and_module() {
+    let fields = [
+        "branch",
+        "commits",
+        "dirty",
+        "branch_stat",
+        "pr",
+        "subject",
+        "age",
+        "env",
+        "sandbox",
+        "devcontainer",
+        "hibernated",
+        "mq",
+        "unread",
+        "disk",
+    ];
+    let toml = format!(
+        "sidebar_detail_fields = [{}]",
+        fields
+            .iter()
+            .map(|field| format!("\"{field}\""))
+            .collect::<Vec<_>>()
+            .join(", ")
+    );
+    let nix = format!(
+        "default = [{}];",
+        fields
+            .iter()
+            .map(|field| format!("\"{field}\""))
+            .collect::<Vec<_>>()
+            .join(" ")
+    );
+    let example = std::fs::read_to_string(
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../config/config.toml.example"),
+    )
+    .expect("config/config.toml.example");
+    assert!(
+        example.contains(toml.as_str()),
+        "config example default drifted"
+    );
+    assert!(
+        module_src().contains(nix.as_str()),
+        "Home Manager default drifted"
     );
 }
 
@@ -881,6 +929,7 @@ fn hm_ui_enum_options_offer_only_canonical_spellings() {
         ("uiSidebarProjectSort", "ui.sidebar_project_sort"),
         ("uiSidebarTerminalsSection", "ui.sidebar_terminals_section"),
         ("uiSidebarFocusDetail", "ui.sidebar_focus_detail"),
+        ("uiSidebarDetailWhen", "ui.sidebar_detail_when"),
     ];
     let enums = enum_lists(&module_src());
     for (option, path) in expected {
@@ -1811,6 +1860,7 @@ fn every_nix_enum_matches_its_destination_enum() {
         ("uiSidebarProjectSort", "ui.sidebar_project_sort"),
         ("uiSidebarTerminalsSection", "ui.sidebar_terminals_section"),
         ("uiSidebarFocusDetail", "ui.sidebar_focus_detail"),
+        ("uiSidebarDetailWhen", "ui.sidebar_detail_when"),
         ("searchStructural", "search.structural"),
         ("gitBackend", "git.backend"),
         ("gitStructuralDiff", "git.structural_diff"),

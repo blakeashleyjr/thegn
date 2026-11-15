@@ -166,6 +166,9 @@ export GIT_AUTHOR_NAME=t GIT_AUTHOR_EMAIL=t@t GIT_COMMITTER_NAME=t GIT_COMMITTER
 # kaneo) are dev-channel-only, so run smoke in the dev channel. A dedicated
 # section below verifies the stable channel refuses them + clamps.
 export THEGN_CHANNEL=dev
+# Smoke exercises CLI/config behavior, not a live container runtime. Keep
+# backend discovery from starting rootless Podman pause processes.
+export THEGN_SANDBOX_BACKEND=none
 
 mkdir -p "$XDG_CONFIG_HOME/thegn"
 cat >"$XDG_CONFIG_HOME/thegn/config.toml" <<EOF
@@ -352,7 +355,7 @@ check "doctor reports a Paths section" \
 check "doctor reports a Mobile access section" \
   "'$SZ' doctor | grep -q '^Mobile access'"
 check "doctor states the fail-closed default floor" \
-  "D=\$(mktemp -d); mkdir -p \"\$D/config/thegn\"; printf '[sandbox]\\nenabled = true\\n' > \"\$D/config/thegn/config.toml\"; XDG_CONFIG_HOME=\"\$D/config\" '$SZ' doctor | grep -q '^  floor         shared-kernel (on miss: fail; default)$'"
+  "D=\$(mktemp -d); mkdir -p \"\$D/config/thegn\"; printf '[sandbox]\\nenabled = true\\n' > \"\$D/config/thegn/config.toml\"; env -u THEGN_SANDBOX_BACKEND XDG_CONFIG_HOME=\"\$D/config\" '$SZ' doctor | grep -q '^  floor         shared-kernel (on miss: fail; default)$'"
 check "doctor reports devcontainer selection and provider status" \
   "D2=\$(mktemp -d); mkdir -p \"\$D2/repo/.devcontainer\"; git init -q \"\$D2/repo\"; printf '{\"image\":\"alpine\"}\n' > \"\$D2/repo/.devcontainer/devcontainer.json\"; (cd \"\$D2/repo\" && XDG_STATE_HOME=\"\$D2/state\" '$SZ' doctor --json | grep -q '\"devcontainer\"')"
 # The drawer's file-manager provider is a seam like every other backend: it

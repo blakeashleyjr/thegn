@@ -16,6 +16,7 @@ use thegn_core::remote::GitLoc;
 mod background_commit;
 mod bisect;
 mod branch;
+mod branch_meta;
 mod cherry;
 mod commit;
 mod custom;
@@ -34,6 +35,7 @@ pub(crate) use background_commit::run as run_background_commit_stdin;
 pub use background_commit::{BackgroundCommitFailure, BackgroundCommitTimeout};
 pub use bisect::BisectOps;
 pub use branch::{BranchOps, ForceMode};
+pub use branch_meta::{BranchMeta, META_COUNT_CAP, branch_meta_compute_count};
 pub use cherry::CherryOps;
 pub use commit::{CommitOps, ResetMode};
 pub use custom::{
@@ -348,6 +350,11 @@ pub fn parse_unified_hunks(diff: &str, max_lines: usize) -> Vec<Hunk> {
 /// Reads go native (gix) for local locs; writes and remote stay CLI.
 pub trait GitBackend: thegn_core::seam::Probe + Send + Sync {
     fn status(&self, loc: &GitLoc) -> Result<Vec<FileStatus>>;
+    fn dirty_and_count(&self, loc: &GitLoc, cap: u32) -> Result<(bool, Option<u32>)> {
+        let status = self.status(loc)?;
+        let count = branch_meta::dirty_count(status.len(), cap).unwrap_or_default();
+        Ok((count > 0, Some(count)))
+    }
     /// Whether the worktree has any local changes — staged, unstaged, or
     /// untracked — i.e. `git status --porcelain` non-emptiness. The boolean
     /// the sidebar's dirty glyph needs, without paying for the full file list.
@@ -1013,7 +1020,6 @@ pub(super) fn output_bounded_with_input(
     input: Option<&[u8]>,
     timeout: Option<std::time::Duration>,
 ) -> Result<std::process::Output> {
-    use std::io::Read;
     use std::process::Stdio;
     use std::time::Duration;
 
@@ -1037,113 +1043,61 @@ pub(super) fn output_bounded_with_input(
         }
         return Ok(cmd.output()?);
     };
-    if input.is_none() {
-        let cancel = std::sync::atomic::AtomicBool::new(false);
-        let limits = thegn_proc::Limits {
-            quiesce_after_leader: Some(Duration::ZERO),
-            term_grace: Duration::from_millis(200),
-            reader_grace: Duration::from_millis(100),
-            stdout: thegn_proc::Stream::Head { cap: usize::MAX },
-            stderr: thegn_proc::Stream::Head { cap: usize::MAX },
-            ..thegn_proc::Limits::silent(timeout)
-        };
-        let run = thegn_proc::run(&mut cmd, &limits, &cancel);
-        return match run.end {
-            thegn_proc::End::Spawn(error) => Err(error.into()),
-            thegn_proc::End::TimedOut => anyhow::bail!(
-                "git {} timed out after {}s (killed)",
-                args.join(" "),
-                timeout.as_secs()
-            ),
-            thegn_proc::End::Supervise(error) => {
-                anyhow::bail!("git {} could not be supervised: {error}", args.join(" "))
-            }
-            thegn_proc::End::Cancelled => {
-                anyhow::bail!("git {} was unexpectedly cancelled", args.join(" "))
-            }
-            thegn_proc::End::OutputLimit(which) => {
-                anyhow::bail!(
-                    "git {} unexpectedly hit output limit {which:?}",
-                    args.join(" ")
-                )
-            }
-            thegn_proc::End::LeaderExited => {
-                if run.group == thegn_proc::GroupState::Survivors {
-                    anyhow::bail!(
-                        "git {} left processes that survived termination",
-                        args.join(" ")
-                    );
-                }
-                match run.leader {
-                    thegn_proc::Leader::Reaped(status) => Ok(std::process::Output {
-                        status,
-                        stdout: run.stdout.bytes,
-                        stderr: run.stderr.bytes,
-                    }),
-                    leader => anyhow::bail!("git {} was not reaped: {leader:?}", args.join(" ")),
-                }
-            }
-        };
-    }
-    // The stdin-fed ref-transaction path remains on the legacy runner (THE-368b work).
-    let mut child = cmd
-        .stdin(if input.is_some() {
-            Stdio::piped()
-        } else {
-            Stdio::null()
-        })
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()?;
-    if let Some(input) = input {
-        use std::io::Write;
 
-        if let Some(mut stdin) = child.stdin.take()
-            && let Err(error) = stdin.write_all(input)
-        {
-            stop_bounded_child(&mut child);
-            return Err(error.into());
+    let cancel = std::sync::atomic::AtomicBool::new(false);
+    let limits = thegn_proc::Limits {
+        quiesce_after_leader: Some(Duration::ZERO),
+        term_grace: Duration::from_millis(200),
+        reader_grace: Duration::from_millis(100),
+        stdout: thegn_proc::Stream::Head { cap: usize::MAX },
+        stderr: thegn_proc::Stream::Head { cap: usize::MAX },
+        ..thegn_proc::Limits::silent(timeout)
+    };
+    let run = match input {
+        Some(input) => {
+            // A child may close stdin before consuming the payload. Keep the
+            // run result so a non-zero exit still reports Git's stderr.
+            let (run, _feed) = thegn_proc::run_with_input(&mut cmd, &limits, input, &cancel);
+            run
+        }
+        None => thegn_proc::run(&mut cmd, &limits, &cancel),
+    };
+    match run.end {
+        thegn_proc::End::Spawn(error) => Err(error.into()),
+        thegn_proc::End::TimedOut => anyhow::bail!(
+            "git {} timed out after {}s (killed)",
+            args.join(" "),
+            timeout.as_secs()
+        ),
+        thegn_proc::End::Supervise(error) => {
+            anyhow::bail!("git {} could not be supervised: {error}", args.join(" "))
+        }
+        thegn_proc::End::Cancelled => {
+            anyhow::bail!("git {} was unexpectedly cancelled", args.join(" "))
+        }
+        thegn_proc::End::OutputLimit(which) => {
+            anyhow::bail!(
+                "git {} unexpectedly hit output limit {which:?}",
+                args.join(" ")
+            )
+        }
+        thegn_proc::End::LeaderExited => {
+            if run.group == thegn_proc::GroupState::Survivors {
+                anyhow::bail!(
+                    "git {} left processes that survived termination",
+                    args.join(" ")
+                );
+            }
+            match run.leader {
+                thegn_proc::Leader::Reaped(status) => Ok(std::process::Output {
+                    status,
+                    stdout: run.stdout.bytes,
+                    stderr: run.stderr.bytes,
+                }),
+                leader => anyhow::bail!("git {} was not reaped: {leader:?}", args.join(" ")),
+            }
         }
     }
-    let mut so = child.stdout.take().expect("piped stdout");
-    let mut se = child.stderr.take().expect("piped stderr");
-    let so_h = thegn_core::thread_name::spawn_named("thegn-git-out", move || {
-        let mut b = Vec::new();
-        let _ = so.read_to_end(&mut b); // best-effort: read error just truncates captured output
-        b
-    });
-    let se_h = thegn_core::thread_name::spawn_named("thegn-git-err", move || {
-        let mut b = Vec::new();
-        let _ = se.read_to_end(&mut b); // best-effort: read error just truncates captured output
-        b
-    });
-    let deadline = std::time::Instant::now() + timeout;
-    let mut backoff = Duration::from_millis(1);
-    let status = loop {
-        if let Some(status) = child.try_wait()? {
-            break status;
-        }
-        let remaining = deadline.saturating_duration_since(std::time::Instant::now());
-        if remaining.is_zero() {
-            let _ = child.kill(); // best-effort: child may already have exited
-            let _ = child.wait(); // best-effort: reap-or-not is terminal here
-            anyhow::bail!(
-                "git {} timed out after {}s (killed)",
-                args.join(" "),
-                timeout.as_secs()
-            );
-        }
-        std::thread::sleep(backoff.min(remaining));
-        backoff = (backoff * 2).min(Duration::from_millis(25));
-    };
-    // Pipes are closed now the child has exited, so the readers finish promptly.
-    let stdout = so_h.join().unwrap_or_default();
-    let stderr = se_h.join().unwrap_or_default();
-    Ok(std::process::Output {
-        status,
-        stdout,
-        stderr,
-    })
 }
 
 fn stop_bounded_child(child: &mut std::process::Child) {
@@ -2108,6 +2062,17 @@ fn bridged_glyph_reads(loc: &GitLoc, include_submodules: bool) -> Option<GlyphRe
         } else {
             None
         };
+        let meta_ahead_behind_range = base.as_ref().map(|base| format!("{base}...HEAD"));
+        let meta_ahead_behind_idx = meta_ahead_behind_range.as_ref().map(|range| {
+            let idx = specs.len();
+            specs.push(vec!["rev-list", "--left-right", "--count", range.as_str()]);
+            idx
+        });
+        let meta_log_idx = {
+            let idx = specs.len();
+            specs.push(vec!["log", "-1", "--format=%ct%x00%an%x00%s", "HEAD"]);
+            idx
+        };
         let submodule_status_idx = include_submodules.then_some(specs.len());
         if include_submodules {
             specs.push(vec!["submodule", "status", "--recursive"]);
@@ -2119,11 +2084,6 @@ fn bridged_glyph_reads(loc: &GitLoc, include_submodules: bool) -> Option<GlyphRe
             .collect();
         match b.exec_batch(&cmds, &[]) {
             Ok(r) if r.len() == want => {
-                let dirty = if r[0].exit == 0 {
-                    parse_status_porcelain(&r[0].stdout).map(|status| !status.is_empty())
-                } else {
-                    Err(anyhow::anyhow!("git status failed: {}", r[0].stderr.trim()))
-                };
                 // A non-zero exit means "no upstream" — data, not an error.
                 let ahead_behind = Ok((r[1].exit == 0)
                     .then(|| parse_ahead_behind(&r[1].stdout))
@@ -2170,13 +2130,61 @@ fn bridged_glyph_reads(loc: &GitLoc, include_submodules: bool) -> Option<GlyphRe
                 } else {
                     Ok(false)
                 };
+                let status = if r[0].exit == 0 {
+                    parse_status_porcelain(&r[0].stdout)
+                } else {
+                    Err(anyhow::anyhow!("git status failed: {}", r[0].stderr.trim()))
+                };
+                let dirty_files = status
+                    .as_ref()
+                    .map(|status| {
+                        branch_meta::dirty_count(status.len(), branch_meta::META_COUNT_CAP)
+                    })
+                    .map_err(|error| anyhow::anyhow!("{error}"));
+                let meta = (|| -> Result<BranchMeta> {
+                    let detached = branch.as_ref().is_ok_and(|branch| branch == "HEAD");
+                    let meta_ahead_behind = if detached {
+                        None
+                    } else if let Some(idx) = meta_ahead_behind_idx {
+                        let result = r.get(idx).context("git rev-list metadata result missing")?;
+                        anyhow::ensure!(
+                            result.exit == 0,
+                            "git rev-list metadata failed: {}",
+                            result.stderr.trim()
+                        );
+                        Some(
+                            branch_meta::parse_ahead_behind(
+                                &result.stdout,
+                                branch_meta::META_COUNT_CAP,
+                            )
+                            .context("git rev-list metadata was malformed")?,
+                        )
+                    } else {
+                        None
+                    };
+                    let log_result = r
+                        .get(meta_log_idx)
+                        .context("git log metadata result missing")?;
+                    anyhow::ensure!(
+                        log_result.exit == 0,
+                        "git log metadata failed: {}",
+                        log_result.stderr.trim()
+                    );
+                    let log = branch_meta::parse_log_record(log_result.stdout.as_bytes())?;
+                    let dirty_files = dirty_files?;
+                    Ok(branch_meta::from_parts(meta_ahead_behind, log, dirty_files))
+                })();
                 return Some(GlyphReads {
-                    dirty,
+                    dirty: status
+                        .as_ref()
+                        .map(|status| !status.is_empty())
+                        .map_err(|error| anyhow::anyhow!("{error}")),
                     ahead_behind,
                     branch,
                     uncommitted,
                     branch_diff,
                     submodule_dirty,
+                    meta,
                 });
             }
             _ => {
@@ -2188,6 +2196,7 @@ fn bridged_glyph_reads(loc: &GitLoc, include_submodules: bool) -> Option<GlyphRe
                     uncommitted: Err(err()),
                     branch_diff: Err(err()),
                     submodule_dirty: Err(err()),
+                    meta: Err(err()),
                 });
             }
         }
@@ -2204,10 +2213,24 @@ fn local_glyph_reads(
     include_submodules: bool,
 ) -> GlyphReads {
     let base = glyph_base(loc);
+    let branch = git.current_branch(loc);
+    let dirty_and_count = git.dirty_and_count(loc, branch_meta::META_COUNT_CAP);
+    let detached = branch.as_ref().is_ok_and(|branch| branch == "HEAD");
+    let meta = branch_meta::with_dirty(
+        if loc.is_remote() || local_cli(loc) {
+            branch_meta::cli(loc, base.as_deref(), detached)
+        } else {
+            branch_meta::gix(loc, base.as_deref())
+        },
+        dirty_and_count
+            .as_ref()
+            .map(|(_, count)| *count)
+            .map_err(|error| anyhow::anyhow!("{error}")),
+    );
     GlyphReads {
-        dirty: git.is_dirty(loc),
+        dirty: dirty_and_count.map(|(dirty, _)| dirty),
         ahead_behind: git.ahead_behind(loc),
-        branch: git.current_branch(loc),
+        branch,
         uncommitted: if local_cli(loc) {
             run_status_bytes(
                 loc,
@@ -2294,6 +2317,7 @@ fn local_glyph_reads(
         } else {
             Ok(false)
         },
+        meta,
     }
 }
 
@@ -2351,10 +2375,27 @@ fn numstat_totals(loc: &GitLoc, spec: &str) -> Result<(DiffCount, DiffCount)> {
 /// two `--numstat` diffs served natively instead of by a subprocess each.
 fn gix_glyph_reads(git: &GixGit, loc: &GitLoc, include_submodules: bool) -> GlyphReads {
     let base = glyph_base(loc);
+    let branch = git.current_branch(loc);
+    let dirty_and_count = git.dirty_and_count(loc, branch_meta::META_COUNT_CAP);
+    let meta = branch_meta::with_dirty(
+        if loc.is_remote() {
+            branch_meta::cli(
+                loc,
+                base.as_deref(),
+                branch.as_ref().is_ok_and(|b| b == "HEAD"),
+            )
+        } else {
+            branch_meta::gix(loc, base.as_deref())
+        },
+        dirty_and_count
+            .as_ref()
+            .map(|(_, count)| *count)
+            .map_err(|error| anyhow::anyhow!("{error}")),
+    );
     GlyphReads {
-        dirty: git.is_dirty(loc),
+        dirty: dirty_and_count.map(|(dirty, _)| dirty),
         ahead_behind: git.ahead_behind(loc),
-        branch: git.current_branch(loc),
+        branch,
         uncommitted: numstat_totals(loc, "HEAD"),
         branch_diff: match &base {
             Some(b) => numstat_totals(loc, &format!("{b}...HEAD")).map(Some),
@@ -2367,6 +2408,7 @@ fn gix_glyph_reads(git: &GixGit, loc: &GitLoc, include_submodules: bool) -> Glyp
         } else {
             Ok(false)
         },
+        meta,
     }
 }
 
@@ -2387,6 +2429,7 @@ pub struct GlyphReads {
     /// Whether any gitlink is moved, dirty, untracked, diverged, conflicted,
     /// unavailable, or uninitialized. This is independent of ordinary files.
     pub submodule_dirty: Result<bool>,
+    pub meta: Result<BranchMeta>,
 }
 
 /// The write-op runner: like [`run`] but with extra env, a null stdin, and
@@ -2823,6 +2866,42 @@ impl GitBackend for GixGit {
             // be an error, never a silent `false`.
             dirty_or_expired(found, interrupt.load(std::sync::atomic::Ordering::SeqCst))
         })
+    }
+
+    fn dirty_and_count(&self, loc: &GitLoc, cap: u32) -> Result<(bool, Option<u32>)> {
+        if loc.is_remote() {
+            return self.fallback.dirty_and_count(loc, cap);
+        }
+        let dirty = self.is_dirty(loc)?;
+        if !dirty {
+            return Ok((false, Some(0)));
+        }
+        let (repo, mut status_route) = native_diff::discover_for_routed_status(loc.path())?;
+        let status = read_budget::budgeted_status(&repo).context("gix status")?;
+        let count = with_read_deadline(git_read_timeout(), |interrupt| {
+            let iter = status
+                .should_interrupt_owned(interrupt.clone())
+                .into_iter(Vec::<gix::bstr::BString>::new())
+                .context("gix status iter")?;
+            let mut seen = std::collections::HashSet::<gix::bstr::BString>::new();
+            for item in iter {
+                let item = item.context("gix status item")?;
+                if status_route
+                    .as_mut()
+                    .map_or(Ok(true), |route| route.keep(&item))?
+                {
+                    seen.insert(item.location().to_owned());
+                    if seen.len() >= cap as usize {
+                        break;
+                    }
+                }
+            }
+            if interrupt.load(std::sync::atomic::Ordering::SeqCst) {
+                anyhow::bail!("gix status exceeded the git read timeout");
+            }
+            Ok((seen.len() as u32).min(cap))
+        })?;
+        Ok((true, Some(count)))
     }
 
     fn current_branch(&self, loc: &GitLoc) -> Result<String> {
@@ -3486,6 +3565,72 @@ mod tests {
         c.arg("ok");
         let out = output_bounded_with(c, &["printf", "ok"], None).unwrap();
         assert_eq!(String::from_utf8_lossy(&out.stdout), "ok");
+    }
+
+    #[test]
+    fn output_bounded_with_input_captures_echo_byte_exact() {
+        let input = b"binary\0payload\xff\n";
+        let c = std::process::Command::new("cat");
+        let before = git_spawn_count();
+        let out = output_bounded_with_input(
+            c,
+            &["cat"],
+            Some(input),
+            Some(std::time::Duration::from_secs(5)),
+        )
+        .unwrap();
+        assert_eq!(out.stdout, input);
+        assert_eq!(git_spawn_count(), before + 1);
+    }
+
+    #[test]
+    fn output_bounded_with_input_kills_a_command_that_never_reads_stdin() {
+        let start = std::time::Instant::now();
+        let mut c = std::process::Command::new("sh");
+        c.args(["-c", "sleep 30"]);
+        let error = output_bounded_with_input(
+            c,
+            &["sh", "-c", "sleep 30"],
+            Some(b"payload"),
+            Some(std::time::Duration::from_secs(1)),
+        )
+        .expect_err("a sleeping command must hit the input-aware deadline");
+        assert_eq!(
+            error.to_string(),
+            "git sh -c sleep 30 timed out after 1s (killed)"
+        );
+        assert!(start.elapsed() < std::time::Duration::from_secs(5));
+    }
+
+    #[test]
+    fn output_bounded_with_input_handles_a_child_that_closes_stdin_early() {
+        let c = std::process::Command::new("true");
+        let input = vec![b'x'; 1 << 20];
+        let out = output_bounded_with_input(
+            c,
+            &["true"],
+            Some(&input),
+            Some(std::time::Duration::from_secs(5)),
+        )
+        .unwrap();
+        assert!(out.status.success());
+        assert!(out.stdout.is_empty());
+    }
+
+    #[test]
+    fn output_bounded_with_input_preserves_stderr_after_early_nonzero_exit() {
+        let mut c = std::process::Command::new("sh");
+        c.args(["-c", "printf failure >&2; exit 1"]);
+        let input = vec![b'x'; 1 << 20];
+        let out = output_bounded_with_input(
+            c,
+            &["sh", "-c", "printf failure >&2; exit 1"],
+            Some(&input),
+            Some(std::time::Duration::from_secs(5)),
+        )
+        .unwrap();
+        assert!(!out.status.success());
+        assert_eq!(out.stderr, b"failure");
     }
 
     #[test]

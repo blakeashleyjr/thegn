@@ -21,6 +21,7 @@ use crate::compositor::Rect;
 /// [`FrameModel`] so the pure row composers stay config-free (same pattern as
 /// the other model-carried presentation flags). `Default` matches the config
 /// defaults (everything on) so unit-built models render the full row.
+/// Exception: `detail_when` defaults to `Focused` here so unit-built unfocused models keep one-row worktrees; production uses `from_ui` (config default `always`).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SidebarDisplay {
     pub show_status_icon: bool,
@@ -30,6 +31,12 @@ pub struct SidebarDisplay {
     pub show_jj: bool,
     pub show_submodules: bool,
     pub focus_detail: thegn_core::config::FocusDetail,
+    pub detail_when: thegn_core::config::DetailWhen,
+    pub show_commits: bool,
+    pub show_behind_base: bool,
+    pub commit_badge: String,
+    pub behind_badge: String,
+    pub detail_fields: Vec<thegn_core::config::DetailEntry>,
     pub detail_branch: bool,
     pub detail_branch_stat: bool,
     pub detail_pr: bool,
@@ -52,6 +59,15 @@ impl Default for SidebarDisplay {
             show_jj: true,
             show_submodules: true,
             focus_detail: thegn_core::config::FocusDetail::All,
+            detail_when: thegn_core::config::DetailWhen::Focused,
+            show_commits: true,
+            show_behind_base: false,
+            commit_badge: "{n}c".into(),
+            behind_badge: "{n}b".into(),
+            detail_fields: thegn_core::config::DetailField::default_order()
+                .into_iter()
+                .map(thegn_core::config::DetailEntry::Builtin)
+                .collect(),
             detail_branch: true,
             detail_branch_stat: true,
             detail_pr: true,
@@ -74,6 +90,12 @@ impl SidebarDisplay {
             show_jj: ui.sidebar_show_jj,
             show_submodules: ui.sidebar_show_submodules,
             focus_detail: ui.sidebar_focus_detail,
+            detail_when: ui.sidebar_detail_when,
+            show_commits: ui.sidebar_show_commits,
+            show_behind_base: ui.sidebar_show_behind_base,
+            commit_badge: ui.sidebar_commit_badge.clone(),
+            behind_badge: ui.sidebar_behind_badge.clone(),
+            detail_fields: ui.detail_entries_resolved(),
             detail_branch: ui.sidebar_detail_branch,
             detail_branch_stat: ui.sidebar_detail_branch_stat,
             detail_pr: ui.sidebar_detail_pr,
@@ -104,7 +126,7 @@ impl SidebarDisplay {
     }
 
     /// The dirty-status marker glyph: override or caps default (`●` / `*`).
-    fn status_glyph(&self) -> String {
+    pub(crate) fn status_glyph(&self) -> String {
         if self.icon_status.is_empty() {
             crate::caps::active_glyphs().dot_filled.to_string()
         } else {
@@ -113,14 +135,19 @@ impl SidebarDisplay {
     }
 
     /// Whether a row's detail line shows, given focus and whether it's the
-    /// cursor row. The detail line only appears while the sidebar owns focus.
+    /// cursor row.
     fn show_detail(&self, focused: bool, is_cursor: bool) -> bool {
         use thegn_core::config::FocusDetail;
+        if self.focus_detail == FocusDetail::Off {
+            return false;
+        }
+        if !focused && self.detail_when == thegn_core::config::DetailWhen::Focused {
+            return false;
+        }
         match self.focus_detail {
-            FocusDetail::Off => false,
-            _ if !focused => false,
             FocusDetail::All => true,
             FocusDetail::Cursor => is_cursor,
+            FocusDetail::Off => false,
         }
     }
 }
@@ -731,8 +758,7 @@ fn sidebar_geom_from(
     // (~10 allocations each) before the scroll clamp threw the off-screen ones
     // away — O(all worktrees) waste on every Full frame. The only
     // variable-height cases are a Worktree row's detail tier (probed via
-    // `compose_detail_line`, and only when `show_detail` can be true — the
-    // sidebar must be focused) and the lead gap (`lead_gap_rows`: the
+    // `detail_has_content` when `show_detail` can be true) and the lead gap (`lead_gap_rows`: the
     // SectionHeading breathing gap, the only one left); every
     // other row is exactly one line. `compose_row_lines` is the source of truth
     // for that rule — a debug assertion in `build_sidebar` keeps them lockstep.
@@ -748,7 +774,7 @@ fn sidebar_geom_from(
                 && model
                     .sidebar_display
                     .show_detail(detail_focused, i == detail_cursor)
-                && crate::sidebar::compose_detail_line(row, &model.sidebar_display).is_some()
+                && crate::sidebar_detail::detail_has_content(row, &model.sidebar_display)
             {
                 h = 2;
             }
@@ -1961,6 +1987,48 @@ fn compose_row_lines(
                 crate::sidebar::row_display_branch(row),
             );
             left.push(seg(name_fg, display_cell(&label)));
+            if let Some(meta) = row.branch_meta.as_ref() {
+                if disp.show_commits
+                    && let Some(count) = meta.ahead_base
+                    && count > 0
+                {
+                    left.push(sp(1));
+                    left.push(seg(
+                        Tok::Slot(S::Dim),
+                        crate::sidebar_detail::format_badge(&disp.commit_badge, count, "{n}c"),
+                    ));
+                }
+                if disp.show_behind_base
+                    && let Some(count) = meta.behind_base
+                    && count > 0
+                {
+                    left.push(sp(1));
+                    left.push(seg(
+                        Tok::Hue(theme::Hue::Amber),
+                        crate::sidebar_detail::format_badge(&disp.behind_badge, count, "{n}b"),
+                    ));
+                }
+            }
+            for value in row.plugin_fields.iter().filter(|value| {
+                value.slot == thegn_core::plugin_api::RowFieldSlot::Badge
+                    && !display_cell(&value.text).is_empty()
+                    && disp.detail_fields.iter().any(|entry| {
+                        matches!(
+                            entry,
+                            thegn_core::config::DetailEntry::Plugin { plugin, field }
+                                if plugin == &value.plugin && field == &value.field
+                        )
+                    })
+            }) {
+                left.push(sp(1));
+                left.push(seg(
+                    crate::sidebar_detail::plugin_role(value.role),
+                    display_cell(&thegn_core::pipeline_report::display_clip(
+                        &display_cell(&value.text),
+                        12,
+                    )),
+                ));
+            }
 
             // Right cluster (always-on): git status icon + uncommitted diff stat +
             // ahead/behind + PR chip + alert badge (the rest moves to the detail).
@@ -2095,7 +2163,15 @@ fn compose_row_lines(
                     min_l: 18,
                 }
             }];
-            if show_detail && let Some(detail) = crate::sidebar::compose_detail_line(row, disp) {
+            if show_detail
+                && let Some(detail) = crate::sidebar_detail::compose_detail_line_at(
+                    row,
+                    disp,
+                    crate::sidebar_detail::unix_now(),
+                    4 + (row.depth.saturating_sub(1) as usize) * 2 + 2 + 2,
+                    content_cols,
+                )
+            {
                 lines.push(detail);
             }
             lines
@@ -2572,6 +2648,7 @@ mod tests {
         // focused row grows a second line regardless of git/PR/env data.
         model.sidebar_display = SidebarDisplay {
             focus_detail: FocusDetail::All,
+            detail_when: thegn_core::config::DetailWhen::Focused,
             detail_branch: true,
             ..SidebarDisplay::default()
         };
@@ -3698,5 +3775,300 @@ mod tests {
         let partial_text = text(&partial);
         assert!(!partial_text.contains("+3"), "{partial_text:?}");
         assert!(!partial_text.contains("-0"), "{partial_text:?}");
+    }
+
+    #[test]
+    fn show_detail_always_vs_focused() {
+        let display = SidebarDisplay {
+            detail_when: thegn_core::config::DetailWhen::Always,
+            ..SidebarDisplay::default()
+        };
+        assert!(display.show_detail(false, true));
+        let focused = SidebarDisplay {
+            detail_when: thegn_core::config::DetailWhen::Focused,
+            ..display
+        };
+        assert!(!focused.show_detail(false, true));
+        assert!(focused.show_detail(true, true));
+    }
+
+    #[test]
+    fn commit_badge_renders_after_label_and_is_clipped_first_at_narrow() {
+        use thegn_svc::git::BranchMeta;
+        let mut row = crate::sidebar::SidebarRow::base(RowKind::Worktree, 1, "feature", "repo");
+        row.branch_meta = Some(BranchMeta {
+            ahead_base: Some(5),
+            ..BranchMeta::default()
+        });
+        let line = compose_row_lines(
+            &row,
+            None,
+            None,
+            false,
+            false,
+            true,
+            None,
+            None,
+            24,
+            &mut None,
+            &SidebarDisplay::default(),
+        )
+        .into_iter()
+        .next()
+        .unwrap();
+        let l = match line {
+            crate::seg::Line::Segs(segs) => segs,
+            crate::seg::Line::SplitMinLeft { l, .. } => l,
+            _ => panic!("badges stay in the left identity cluster"),
+        };
+        let text = l
+            .iter()
+            .map(|segment| segment.text.as_str())
+            .collect::<String>();
+        assert!(text.find("feature").unwrap() < text.find("5c").unwrap());
+        let clipped = crate::seg::cut(&l, 12);
+        let clipped_text = clipped
+            .iter()
+            .map(|segment| segment.text.as_str())
+            .collect::<String>();
+        assert!(!clipped_text.contains("5c"), "{clipped_text:?}");
+    }
+
+    #[test]
+    fn plugin_badge_follows_commit_badge_and_is_clipped_first() {
+        use thegn_svc::git::BranchMeta;
+        let mut row = crate::sidebar::SidebarRow::base(RowKind::Worktree, 1, "feature", "repo");
+        row.branch_meta = Some(BranchMeta {
+            ahead_base: Some(5),
+            ..BranchMeta::default()
+        });
+        row.plugin_fields.push(crate::sidebar::PluginFieldValue {
+            plugin: "ci".into(),
+            field: "check".into(),
+            text: "passing-value-that-is-long".into(),
+            role: thegn_core::plugin_api::RowRole::Good,
+            slot: thegn_core::plugin_api::RowFieldSlot::Badge,
+        });
+        let display = SidebarDisplay {
+            detail_fields: vec![thegn_core::config::DetailEntry::Plugin {
+                plugin: "ci".into(),
+                field: "check".into(),
+            }],
+            ..SidebarDisplay::default()
+        };
+        let line = compose_row_lines(
+            &row, None, None, false, false, true, None, None, 32, &mut None, &display,
+        )
+        .into_iter()
+        .next()
+        .unwrap();
+        let l = match line {
+            crate::seg::Line::Segs(segs) => segs,
+            crate::seg::Line::SplitMinLeft { l, .. } => l,
+            _ => panic!("badges stay in the left identity cluster"),
+        };
+        let text = l
+            .iter()
+            .map(|segment| segment.text.as_str())
+            .collect::<String>();
+        assert!(text.find("5c").unwrap() < text.find("passing").unwrap());
+        assert!(l.iter().any(|segment| segment.text.contains('…')));
+        let clipped = crate::seg::cut(&l, 12);
+        assert!(
+            !clipped
+                .iter()
+                .any(|segment| segment.text.contains("passing"))
+        );
+    }
+
+    #[test]
+    fn badge_hidden_when_zero_or_toggle_off() {
+        use thegn_svc::git::BranchMeta;
+        let mut row = crate::sidebar::SidebarRow::base(RowKind::Worktree, 1, "feature", "repo");
+        row.branch_meta = Some(BranchMeta::default());
+        let render = |row: &crate::sidebar::SidebarRow, display: &SidebarDisplay| {
+            compose_row_lines(
+                row, None, None, false, false, true, None, None, 40, &mut None, display,
+            )
+            .into_iter()
+            .flat_map(|line| match line {
+                crate::seg::Line::Segs(segs) => segs,
+                crate::seg::Line::Split { l, r } | crate::seg::Line::SplitMinLeft { l, r, .. } => {
+                    l.into_iter().chain(r).collect()
+                }
+                _ => Vec::new(),
+            })
+            .map(|segment| segment.text)
+            .collect::<String>()
+        };
+        assert!(!render(&row, &SidebarDisplay::default()).contains("2c"));
+        row.branch_meta.as_mut().unwrap().ahead_base = Some(2);
+        assert!(
+            !render(
+                &row,
+                &SidebarDisplay {
+                    show_commits: false,
+                    ..SidebarDisplay::default()
+                }
+            )
+            .contains("2c")
+        );
+    }
+
+    #[test]
+    fn behind_badge_only_when_enabled() {
+        use thegn_svc::git::BranchMeta;
+        let mut row = crate::sidebar::SidebarRow::base(RowKind::Worktree, 1, "feature", "repo");
+        row.branch_meta = Some(BranchMeta {
+            ahead_base: Some(1),
+            behind_base: Some(2),
+            ..BranchMeta::default()
+        });
+        let render = |display: &SidebarDisplay| -> Vec<crate::seg::Seg> {
+            let mut mq_geometry = None;
+            compose_row_lines(
+                &row,
+                None,
+                None,
+                false,
+                false,
+                true,
+                None,
+                None,
+                40,
+                &mut mq_geometry,
+                display,
+            )
+            .into_iter()
+            .flat_map(|line| match line {
+                crate::seg::Line::Segs(segs) => segs,
+                crate::seg::Line::Split { l, r } | crate::seg::Line::SplitMinLeft { l, r, .. } => {
+                    l.into_iter().chain(r).collect()
+                }
+                crate::seg::Line::Blank => Vec::new(),
+                _ => Vec::new(),
+            })
+            .collect()
+        };
+        let default = render(&SidebarDisplay::default());
+        let default_text = default
+            .iter()
+            .map(|segment| segment.text.as_str())
+            .collect::<String>();
+        assert!(!default_text.contains("2b"), "{default_text:?}");
+
+        let enabled = SidebarDisplay {
+            show_behind_base: true,
+            ..SidebarDisplay::default()
+        };
+        let rendered = render(&enabled);
+        assert!(rendered.iter().any(|segment| {
+            segment.text == "2b" && segment.fg == crate::seg::Tok::Hue(theme::Hue::Amber)
+        }));
+    }
+
+    #[test]
+    fn heights_pass_agrees_with_compose_for_default_all() {
+        use thegn_svc::git::BranchMeta;
+        let mut rows = two_ws_rows();
+        for index in [1, 3] {
+            rows[index].branch_meta = Some(BranchMeta {
+                ahead_base: Some(3),
+                ..BranchMeta::default()
+            });
+        }
+        let model = FrameModel {
+            sidebar_rows: rows,
+            sidebar_focused: false,
+            sidebar_display: SidebarDisplay::from_ui(&thegn_core::config::UiConfig::default()),
+            ..FrameModel::default()
+        };
+        let rect = Rect {
+            x: 0,
+            y: 0,
+            cols: 48,
+            rows: 40,
+        };
+        assert_eq!(sidebar_geom(&model, rect).heights, vec![1, 2, 1, 2]);
+        build_sidebar(&model, rect, 0);
+    }
+
+    #[test]
+    fn ascii_caps_has_no_unicode_in_badge_or_detail() {
+        use thegn_svc::git::BranchMeta;
+        let mut row = crate::sidebar::SidebarRow::base(RowKind::Worktree, 1, "feature", "repo");
+        row.branch_meta = Some(BranchMeta {
+            ahead_base: Some(5),
+            behind_base: Some(2),
+            dirty_files: Some(3),
+            last_commit_unix: Some(0),
+            last_subject: Some("ascii subject".into()),
+            last_author: None,
+        });
+        let display = SidebarDisplay {
+            show_behind_base: true,
+            detail_when: thegn_core::config::DetailWhen::Always,
+            ..SidebarDisplay::default()
+        };
+        crate::caps::test_override::with_unicode(thegn_core::termcaps::UnicodeLevel::Ascii, || {
+            for cols in [48, 24] {
+                let mut mq_geometry = None;
+                let lines = compose_row_lines(
+                    &row,
+                    None,
+                    None,
+                    false,
+                    true,
+                    true,
+                    None,
+                    None,
+                    cols,
+                    &mut mq_geometry,
+                    &display,
+                );
+                for line in lines {
+                    let segs = match line {
+                        crate::seg::Line::Segs(segs) => segs,
+                        crate::seg::Line::Split { l, r }
+                        | crate::seg::Line::SplitMinLeft { l, r, .. } => {
+                            l.into_iter().chain(r).collect()
+                        }
+                        crate::seg::Line::Blank => Vec::new(),
+                        _ => Vec::new(),
+                    };
+                    assert!(
+                        segs.iter().all(|segment| segment.text.is_ascii()),
+                        "cols={cols}: {segs:?}"
+                    );
+                }
+            }
+        });
+    }
+
+    #[test]
+    fn custom_badge_template() {
+        use thegn_svc::git::BranchMeta;
+        let mut row = crate::sidebar::SidebarRow::base(RowKind::Worktree, 1, "feature", "repo");
+        row.branch_meta = Some(BranchMeta {
+            ahead_base: Some(3),
+            ..BranchMeta::default()
+        });
+        let display = SidebarDisplay {
+            commit_badge: "#{n}".into(),
+            ..SidebarDisplay::default()
+        };
+        let line = compose_row_lines(
+            &row, None, None, false, false, true, None, None, 40, &mut None, &display,
+        );
+        let text = line
+            .into_iter()
+            .flat_map(|line| match line {
+                crate::seg::Line::Segs(segs) => segs,
+                crate::seg::Line::SplitMinLeft { l, r, .. } => l.into_iter().chain(r).collect(),
+                _ => Vec::new(),
+            })
+            .map(|segment| segment.text)
+            .collect::<String>();
+        assert!(text.contains("#3"), "{text:?}");
     }
 }

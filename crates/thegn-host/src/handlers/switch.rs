@@ -120,8 +120,13 @@ pub(crate) fn refresh_tab_model(model: &mut FrameModel, session: &Session, sb: &
         )
         .filter(|p| !p.is_empty())
         .collect();
-    let crate::sidebar::SidebarStatus { git, branches, .. } = &mut model.sidebar_status;
-    crate::glyph_refresh::seed_from_global_cache(git, branches, seed_paths);
+    let crate::sidebar::SidebarStatus {
+        git,
+        branches,
+        branch_meta,
+        ..
+    } = &mut model.sidebar_status;
+    crate::glyph_refresh::seed_from_global_cache(git, branches, branch_meta, seed_paths);
     sb.rebuild(model, session);
 }
 
