@@ -1689,7 +1689,7 @@ impl SidebarState {
 /// timer, so an idle session cannot acquire a new wake source.
 fn sync_plugin_fields(model: &mut FrameModel, plugins: &crate::handlers::plugins::PluginsState) {
     let snapshot = crate::handlers::plugins::row_field_values(plugins);
-    let mut slots = std::collections::BTreeMap::new();
+    let mut slots = crate::plugin_row_sync::FieldSlots::new();
     for (plugin, entry) in &plugins.plugins {
         for contribution in &entry.contributions {
             if contribution.extension_point != thegn_core::plugin_api::ExtensionPoint::WorktreeField
@@ -1705,49 +1705,8 @@ fn sync_plugin_fields(model: &mut FrameModel, plugins: &crate::handlers::plugins
         }
     }
 
-    let mut projected = std::collections::BTreeMap::new();
-    for row in model
-        .sidebar_rows
-        .iter()
-        .filter(|row| row.kind == crate::sidebar::RowKind::Worktree)
-    {
-        let Some(path) = row.worktree_path.as_deref() else {
-            continue;
-        };
-        let branch = row
-            .branch
-            .as_deref()
-            .filter(|branch| !branch.is_empty())
-            .unwrap_or(&row.label);
-        let mut values = Vec::new();
-        for ((plugin, field), worktrees) in &snapshot {
-            let Some(value) = worktrees.get(path).or_else(|| worktrees.get(branch)) else {
-                continue;
-            };
-            let Some(slot) = slots.get(&(plugin.clone(), field.clone())).copied() else {
-                continue;
-            };
-            values.push(crate::sidebar::PluginFieldValue {
-                plugin: plugin.clone(),
-                field: field.clone(),
-                text: value.text.clone(),
-                role: value.role,
-                slot,
-            });
-        }
-        if !values.is_empty() {
-            projected.insert(path.to_string(), values);
-        }
-    }
-    for row in &mut model.sidebar_rows {
-        row.plugin_fields = row
-            .worktree_path
-            .as_deref()
-            .and_then(|path| projected.get(path))
-            .cloned()
-            .unwrap_or_default();
-    }
-    model.sidebar_status.plugin_fields = projected;
+    model.sidebar_status.plugin_fields =
+        crate::plugin_row_sync::project_plugin_fields(&mut model.sidebar_rows, &snapshot, &slots);
 }
 
 // Sidebar row activation lives in `handlers/sidebar_activate.rs` (extracted
@@ -7349,7 +7308,8 @@ async fn event_loop<T: Terminal>(
         tokio_mpsc::unbounded_channel::<crate::task::TaskOutcome>();
     let (job_output_tx, mut job_output_rx) =
         tokio_mpsc::unbounded_channel::<std::result::Result<PathBuf, String>>();
-    let (job_live_tx, mut job_live_rx) = tokio_mpsc::unbounded_channel::<crate::task::JobLive>();
+    // Live job tails: latest-per-job slot, bounded at 64 names (THE-661).
+    let job_live_latest = crate::task::JobLiveLatest::default();
     let mut restart_arm = crate::task::RestartArm::default();
     let mut confirm_guard = crate::panel::confirm::TwoPress::default();
     // Off-loop worktree-rename completions (audit run.rs:12131/12147): the git
@@ -11557,7 +11517,7 @@ async fn event_loop<T: Terminal>(
             }
             dirty = true;
         }
-        while let Ok(msg) = job_live_rx.try_recv() {
+        for msg in job_live_latest.drain() {
             loop_perf.tick(crate::perf::WakeSource::Other);
             if crate::task::apply_job_live(
                 &mut model.panel.task_last_runs,
@@ -22895,7 +22855,7 @@ async fn event_loop<T: Terminal>(
                                                         crate::hydrate::active_tab_path(&session);
                                                     let tx2 = named_task_run_tx.clone();
                                                     let wk2 = waker.clone();
-                                                    let live_tx = job_live_tx.clone();
+                                                    let live_latest = job_live_latest.clone();
                                                     let live_waker = waker.clone();
                                                     let limits2 = keymap.config().limits.clone();
                                                     named_task_generation += 1;
@@ -22904,16 +22864,7 @@ async fn event_loop<T: Terminal>(
                                                         .insert(task.name.clone(), run_gen);
                                                     tokio::task::spawn_blocking(move || {
                                                         let sink: crate::task::JobLiveSink =
-                                                            std::sync::Arc::new(move |msg| {
-                                                                if let Err(error) =
-                                                                    live_tx.send(msg)
-                                                                {
-                                                                    tracing::debug!(
-                                                                        target: "thegn::tasks",
-                                                                        %error,
-                                                                        "job live receiver is gone"
-                                                                    );
-                                                                }
+                                                            live_latest.sink(move || {
                                                                 if let Err(error) =
                                                                     live_waker.wake()
                                                                 {
@@ -23727,7 +23678,7 @@ async fn event_loop<T: Terminal>(
                                     let wt = crate::hydrate::active_tab_path(&session);
                                     let tx2 = named_task_run_tx.clone();
                                     let wk2 = waker.clone();
-                                    let live_tx = job_live_tx.clone();
+                                    let live_latest = job_live_latest.clone();
                                     let live_waker = waker.clone();
                                     let limits2 = keymap.config().limits.clone();
                                     named_task_generation += 1;
@@ -23735,14 +23686,7 @@ async fn event_loop<T: Terminal>(
                                     latest_job_generation.insert(task.name.clone(), run_gen);
                                     tokio::task::spawn_blocking(move || {
                                         let sink: crate::task::JobLiveSink =
-                                            std::sync::Arc::new(move |msg| {
-                                                if let Err(error) = live_tx.send(msg) {
-                                                    tracing::debug!(
-                                                        target: "thegn::tasks",
-                                                        %error,
-                                                        "job live receiver is gone"
-                                                    );
-                                                }
+                                            live_latest.sink(move || {
                                                 if let Err(error) = live_waker.wake() {
                                                     tracing::debug!(
                                                         target: "thegn::tasks",
