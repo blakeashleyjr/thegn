@@ -70,10 +70,16 @@ pub struct Limits {
     pub stderr: Stream,
     /// Cap across both Tail streams (older bytes of the larger tail trimmed first). None = no aggregate cap.
     pub aggregate_tail_cap: Option<usize>,
+    /// After this long with no byte read on any piped stream (Head/HeadOrFail/Tail/Consume),
+    /// terminate the group as for `timeout` (End::TimedOut with `Run::idle_expired`). The clock
+    /// starts at spawn (a child that never writes expires after this span), resets on every chunk
+    /// read, and stops once the leader exits (the quiesce/reader-grace phases keep their own
+    /// bounds). None = no idle bound.
+    pub idle_output: Option<Duration>,
 }
 impl Limits {
     /// No pipes: timeout = `timeout`, quiesce None, term_grace ZERO, kill_settle 250 ms,
-    /// reader_grace ZERO, stdout/stderr Null, aggregate None. Callers adjust with
+    /// reader_grace ZERO, stdout/stderr Null, aggregate None, idle_output None. Callers adjust with
     /// `Limits { field: v, ..Limits::silent(t) }` (never assign fields after construction).
     pub fn silent(timeout: Duration) -> Self {
         Self {
@@ -85,6 +91,7 @@ impl Limits {
             stdout: Stream::Null,
             stderr: Stream::Null,
             aggregate_tail_cap: None,
+            idle_output: None,
         }
     }
 }
@@ -189,6 +196,8 @@ pub struct Run {
     pub stdout: Capture,
     pub stderr: Capture,
     pub containment: Containment,
+    /// True when the run ended because `Limits::idle_output` elapsed; `end` is then End::TimedOut.
+    pub idle_expired: bool,
 }
 impl Run {
     /// End::LeaderExited and Leader::Reaped(s) with s.success().
