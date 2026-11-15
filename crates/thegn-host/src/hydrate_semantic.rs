@@ -18,7 +18,7 @@ pub(crate) fn compute_entity_summary(
     }
     // Same sanitized flags the git backend uses (see svc SANITIZED_DIFF) so the
     // patch parses cleanly: no color/ext-diff/renames, 3 lines of context.
-    let diff = loc.git_out(&[
+    let diff = match loc.git_text(&[
         "-c",
         "diff.noprefix=false",
         "diff",
@@ -27,7 +27,13 @@ pub(crate) fn compute_entity_summary(
         "--no-renames",
         "-U3",
         "HEAD",
-    ])?;
+    ]) {
+        Ok(diff) => diff,
+        Err(error) => {
+            tracing::debug!(%error, "could not read semantic git diff");
+            return None;
+        }
+    };
     let root = loc.path();
     let mut per_file = Vec::new();
     for f in thegn_core::patch::parse_patch(&diff) {
@@ -97,12 +103,25 @@ mod tests {
         let impact = summary.impact.expect("impact");
         assert_eq!(impact.entities, 1);
 
-        // A clean repo (no diff vs HEAD) yields None. `git_out` returns None on
-        // empty output, so a clean tree shows no changed names.
+        // A clean repo (no diff vs HEAD) yields None because an empty typed
+        // Git response parses to no changed names.
         run(&["checkout", "--", "lib.rs"]);
         assert!(git_out(&dir, &["diff", "--name-only", "HEAD"]).is_none());
         assert!(compute_entity_summary(&loc, &entries).is_none());
 
         let _ = std::fs::remove_dir_all(&dir); // best-effort: cleanup: the target may already be gone; a failed removal never fails the caller
+    }
+
+    #[test]
+    fn compute_entity_summary_returns_none_when_git_diff_fails() {
+        let dir = tempfile::tempdir().unwrap();
+        let loc = thegn_core::remote::GitLoc::Local(dir.path().to_path_buf());
+        let entries = vec![thegn_svc::git::DiffEntry {
+            path: "lib.rs".into(),
+            added: 1,
+            deleted: 1,
+            binary: false,
+        }];
+        assert!(compute_entity_summary(&loc, &entries).is_none());
     }
 }
