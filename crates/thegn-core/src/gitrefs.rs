@@ -7,6 +7,45 @@
 //! Git ref names cannot contain control bytes. Parsers reject malformed rows
 //! as a whole rather than silently returning partial repository state.
 
+/// Whole-output byte cap applied by every parser before it allocates.
+pub const MAX_GIT_OUTPUT_BYTES: usize = 64 * 1024 * 1024;
+/// Per-field byte cap (NUL- or unit-separator-delimited fields).
+pub const MAX_GIT_FIELD_BYTES: usize = 1024 * 1024;
+
+/// Reject output above `max_output` bytes, or containing any NUL- or
+/// unit-separator-delimited field above `max_field` bytes. One pass, no
+/// allocation. The result is a whole-output error, never a truncation.
+pub fn check_git_output(out: &str, max_output: usize, max_field: usize) -> anyhow::Result<()> {
+    check_limits(out, max_output, max_field, false)
+}
+
+/// [`check_git_output`] for line-framed output, where `\n` also ends a field.
+fn check_limits(
+    out: &str,
+    max_output: usize,
+    max_field: usize,
+    newline_delim: bool,
+) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        out.len() <= max_output,
+        "git output is {} bytes, over the {max_output}-byte whole-output cap",
+        out.len()
+    );
+    let mut run = 0usize;
+    for b in out.bytes() {
+        if b == 0 || b == 0x1f || (newline_delim && b == b'\n') {
+            run = 0;
+            continue;
+        }
+        run += 1;
+        anyhow::ensure!(
+            run <= max_field,
+            "git output has a field over the {max_field}-byte per-field cap"
+        );
+    }
+    Ok(())
+}
+
 /// One commit from `git log` (see [`parse_commits`] for the format).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Commit {
@@ -28,6 +67,15 @@ pub struct Commit {
 /// Every record, including the last, must end with NUL; output that does not
 /// is truncated and is rejected as a whole.
 pub fn parse_commits(out: &str) -> anyhow::Result<Vec<Commit>> {
+    parse_commits_with_limits(out, MAX_GIT_OUTPUT_BYTES, MAX_GIT_FIELD_BYTES)
+}
+
+fn parse_commits_with_limits(
+    out: &str,
+    max_output: usize,
+    max_field: usize,
+) -> anyhow::Result<Vec<Commit>> {
+    check_limits(out, max_output, max_field, false)?;
     if out.is_empty() {
         return Ok(Vec::new());
     }
@@ -162,6 +210,15 @@ fn parse_track(track: &str) -> anyhow::Result<(usize, usize, bool)> {
 /// output must end with `\n` (git terminates every record); otherwise it is
 /// rejected as truncated.
 pub fn parse_branches(out: &str) -> anyhow::Result<Vec<BranchInfo>> {
+    parse_branches_with_limits(out, MAX_GIT_OUTPUT_BYTES, MAX_GIT_FIELD_BYTES)
+}
+
+fn parse_branches_with_limits(
+    out: &str,
+    max_output: usize,
+    max_field: usize,
+) -> anyhow::Result<Vec<BranchInfo>> {
+    check_limits(out, max_output, max_field, true)?;
     if out.is_empty() {
         return Ok(Vec::new());
     }
@@ -234,6 +291,15 @@ pub struct StashEntry {
 /// output that does not is truncated and is rejected as a whole. Any
 /// malformed row makes the complete parse fail.
 pub fn parse_stashes(out: &str) -> anyhow::Result<Vec<StashEntry>> {
+    parse_stashes_with_limits(out, MAX_GIT_OUTPUT_BYTES, MAX_GIT_FIELD_BYTES)
+}
+
+fn parse_stashes_with_limits(
+    out: &str,
+    max_output: usize,
+    max_field: usize,
+) -> anyhow::Result<Vec<StashEntry>> {
+    check_limits(out, max_output, max_field, false)?;
     if out.is_empty() {
         return Ok(Vec::new());
     }
@@ -301,6 +367,15 @@ pub struct TagInfo {
 /// point at) means lightweight. Non-empty output must end with `\n`;
 /// otherwise it is rejected as truncated.
 pub fn parse_tags(out: &str) -> anyhow::Result<Vec<TagInfo>> {
+    parse_tags_with_limits(out, MAX_GIT_OUTPUT_BYTES, MAX_GIT_FIELD_BYTES)
+}
+
+fn parse_tags_with_limits(
+    out: &str,
+    max_output: usize,
+    max_field: usize,
+) -> anyhow::Result<Vec<TagInfo>> {
+    check_limits(out, max_output, max_field, true)?;
     if out.is_empty() {
         return Ok(Vec::new());
     }
@@ -1770,5 +1845,138 @@ mod tests {
             bisect_rows(&bisect_row_list(5000).concat()).unwrap().len(),
             5000
         );
+    }
+
+    // --- parser byte caps (THE-383) ---
+
+    /// Exactly-at-cap passes, one byte over fails, for both limits.
+    fn assert_caps_edges<T: std::fmt::Debug>(
+        input: &str,
+        newline_delim: bool,
+        parse: impl Fn(&str, usize, usize) -> anyhow::Result<Vec<T>>,
+    ) {
+        let total = input.len();
+        let longest = input
+            .split(|c: char| c == '\0' || c == US || (newline_delim && c == '\n'))
+            .map(str::len)
+            .max()
+            .unwrap();
+        parse(input, total, longest).unwrap();
+        parse(input, usize::MAX, usize::MAX).unwrap();
+        let over = parse(input, total - 1, longest).unwrap_err().to_string();
+        assert!(over.contains("whole-output cap"), "{over}");
+        let field = parse(input, total, longest - 1).unwrap_err().to_string();
+        assert!(field.contains("per-field cap"), "{field}");
+    }
+
+    fn assert_field_over_cap<T: std::fmt::Debug>(
+        input: &str,
+        parse: impl Fn(&str, usize, usize) -> anyhow::Result<Vec<T>>,
+    ) {
+        parse(input, usize::MAX, usize::MAX).unwrap();
+        let error = parse(input, usize::MAX, 100).unwrap_err().to_string();
+        assert!(error.contains("per-field cap"), "{error}");
+    }
+
+    #[test]
+    fn caps_check_git_output_delimiters() {
+        assert!(check_git_output("", 0, 0).is_ok());
+        assert!(check_git_output("aaa\0bb\u{1f}c", 100, 3).is_ok());
+        assert!(check_git_output("aaa\0bb\u{1f}c", 100, 2).is_err());
+        // A newline is not a delimiter for the NUL/US form.
+        assert!(check_git_output("aa\naa", 100, 4).is_err());
+        assert!(check_limits("aa\naa", 100, 2, true).is_ok());
+        assert!(check_git_output("abcdef", 5, 100).is_err());
+    }
+
+    #[test]
+    fn caps_commits_exact_and_over() {
+        let many = commit_records(3).concat();
+        assert_caps_edges(&many, false, parse_commits_with_limits);
+        let one = commit_records(1).concat();
+        assert_caps_edges(&one, false, parse_commits_with_limits);
+    }
+
+    #[test]
+    fn caps_commits_field_in_middle_fails_whole_parse() {
+        let records = commit_records(3);
+        let long = "x".repeat(200);
+        let input = format!("{}{}{}", records[0], commit_with(7, &long), records[2]);
+        assert_field_over_cap(&input, parse_commits_with_limits);
+    }
+
+    #[test]
+    fn caps_branches_exact_and_over() {
+        let many = branch_rows(3).concat();
+        assert_caps_edges(&many, true, parse_branches_with_limits);
+        let one = branch_rows(1).concat();
+        assert_caps_edges(&one, true, parse_branches_with_limits);
+        // Minified without the trailing newline is rejected as truncated, not by a cap.
+        let minified = one.trim_end_matches('\n');
+        let error = parse_branches(minified).unwrap_err().to_string();
+        assert!(error.contains("missing final newline"), "{error}");
+    }
+
+    #[test]
+    fn caps_branches_field_in_middle_fails_whole_parse() {
+        let rows = branch_rows(3);
+        let mid = table_branch_row(1).replace(LINE_HOSTILE, &"x".repeat(200));
+        let input = format!("{}{}{}", rows[0], mid, rows[2]);
+        assert_field_over_cap(&input, parse_branches_with_limits);
+    }
+
+    #[test]
+    fn caps_stashes_exact_and_over() {
+        let many = stash_records(3).concat();
+        assert_caps_edges(&many, false, parse_stashes_with_limits);
+        let one = stash_records(1).concat();
+        assert_caps_edges(&one, false, parse_stashes_with_limits);
+    }
+
+    #[test]
+    fn caps_stashes_field_in_middle_fails_whole_parse() {
+        let records = stash_records(3);
+        let mut fields = stash_fields(1);
+        fields[3] = "x".repeat(200);
+        let input = format!("{}{}{}", records[0], nul_record(&fields), records[2]);
+        assert_field_over_cap(&input, parse_stashes_with_limits);
+    }
+
+    #[test]
+    fn caps_tags_exact_and_over() {
+        let many = tag_rows(3).concat();
+        assert_caps_edges(&many, true, parse_tags_with_limits);
+        let one = tag_rows(1).concat();
+        assert_caps_edges(&one, true, parse_tags_with_limits);
+        let minified = one.trim_end_matches('\n');
+        let error = parse_tags(minified).unwrap_err().to_string();
+        assert!(error.contains("missing final newline"), "{error}");
+    }
+
+    #[test]
+    fn caps_tags_field_in_middle_fails_whole_parse() {
+        let rows = tag_rows(3);
+        let mid = tag_row(1).replace("rel/\u{e9}-1", &"x".repeat(200));
+        let input = format!("{}{}{}", rows[0], mid, rows[2]);
+        assert_field_over_cap(&input, parse_tags_with_limits);
+    }
+
+    #[test]
+    fn caps_thousand_records_stay_ok_under_real_caps() {
+        assert_eq!(
+            parse_commits(&commit_records(1000).concat()).unwrap().len(),
+            1000
+        );
+        assert_eq!(
+            parse_stashes(&stash_records(1000).concat()).unwrap().len(),
+            1000
+        );
+        assert_eq!(
+            parse_branches(&branch_rows(1000).concat()).unwrap().len(),
+            1000
+        );
+        assert_eq!(parse_tags(&tag_rows(1000).concat()).unwrap().len(), 1000);
+        assert_eq!(MAX_GIT_OUTPUT_BYTES, 64 * 1024 * 1024);
+        assert_eq!(MAX_GIT_FIELD_BYTES, 1024 * 1024);
     }
 }

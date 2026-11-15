@@ -123,6 +123,20 @@ fn parse_object_id_output(stdout: &str, command: &str) -> Result<String> {
 /// Repository-controlled strings can contain every other byte without moving
 /// a field boundary.
 fn parse_commit_metas(out: &str) -> Result<Vec<CommitMeta>> {
+    parse_commit_metas_with_limits(
+        out,
+        thegn_core::gitrefs::MAX_GIT_OUTPUT_BYTES,
+        thegn_core::gitrefs::MAX_GIT_FIELD_BYTES,
+    )
+}
+
+fn parse_commit_metas_with_limits(
+    out: &str,
+    max_output: usize,
+    max_field: usize,
+) -> Result<Vec<CommitMeta>> {
+    thegn_core::gitrefs::check_git_output(out, max_output, max_field)
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
     if out.is_empty() {
         return Ok(Vec::new());
     }
@@ -615,7 +629,8 @@ mod tests {
     use super::super::{CliGit, GitBackend};
     use super::{
         CasOutcome, MergeTreeOutcome, PlumbingOps, RefRead, classify_cas_failure, fenced,
-        is_object_id, parse_commit_metas, parse_merge_base, parse_merge_tree,
+        is_object_id, parse_commit_metas, parse_commit_metas_with_limits, parse_merge_base,
+        parse_merge_tree,
     };
     use std::path::Path;
     use std::process::Command;
@@ -1773,5 +1788,57 @@ mod tests {
             let error = parse_merge_tree(1, &stdout, "").unwrap_err();
             assert!(error.to_string().contains(expect), "{label}: {error}");
         }
+    }
+
+    // --- parser byte caps (THE-383) ---
+
+    #[test]
+    fn commit_metas_caps_exact_and_over() {
+        for count in [1usize, 3] {
+            let input = meta_records(count).concat();
+            let total = input.len();
+            let longest = input.split('\0').map(str::len).max().unwrap();
+            assert_eq!(
+                parse_commit_metas_with_limits(&input, total, longest)
+                    .unwrap()
+                    .len(),
+                count
+            );
+            let over = parse_commit_metas_with_limits(&input, total - 1, longest)
+                .unwrap_err()
+                .to_string();
+            assert!(over.contains("whole-output cap"), "{over}");
+            let field = parse_commit_metas_with_limits(&input, total, longest - 1)
+                .unwrap_err()
+                .to_string();
+            assert!(field.contains("per-field cap"), "{field}");
+        }
+    }
+
+    #[test]
+    fn commit_metas_caps_field_in_middle_fails_whole_parse() {
+        let records = meta_records(3);
+        let input = format!(
+            "{}{}{}",
+            records[0],
+            meta_with(5, &"x".repeat(200)),
+            records[2]
+        );
+        assert_eq!(
+            parse_commit_metas_with_limits(&input, usize::MAX, usize::MAX)
+                .unwrap()
+                .len(),
+            3
+        );
+        let error = parse_commit_metas_with_limits(&input, usize::MAX, 100)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("per-field cap"), "{error}");
+    }
+
+    #[test]
+    fn commit_metas_caps_thousand_records_stay_ok_under_real_caps() {
+        let input = meta_records(1000).concat();
+        assert_eq!(parse_commit_metas(&input).unwrap().len(), 1000);
     }
 }
