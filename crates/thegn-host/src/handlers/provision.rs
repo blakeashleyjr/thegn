@@ -381,8 +381,17 @@ pub(crate) fn drain_provision(
     loop_perf: &mut crate::perf::LoopPerf,
 ) -> bool {
     let mut dirty = false;
-    while let Ok((name, ti, steps)) = rx.try_recv() {
+    let mut batch = Vec::new();
+    while let Ok(msg) = rx.try_recv() {
+        // Wake accounting stays honest: one tick per received message.
         loop_perf.tick(crate::perf::WakeSource::Spec);
+        batch.push(msg);
+    }
+    // Each message replaces the whole step list for its key, so only the last
+    // per key matters. Known, accepted difference: a step that went Pending to
+    // Active to Done entirely within one drain pass records no `took` (it
+    // would have been about 0 ms).
+    for (name, ti, steps) in coalesce_latest(batch) {
         let key = (name, ti);
         // A tab whose shell has already spoken has RETIRED its splash: a late
         // provisioning update (queued before the first-output clear) must not
@@ -411,6 +420,20 @@ pub(crate) fn drain_provision(
         }
     }
     dirty
+}
+
+/// Collapse progress messages to the latest steps per `(group, tab)` key,
+/// keeping first-seen key order. Bounded by the number of distinct keys.
+fn coalesce_latest(msgs: impl IntoIterator<Item = ProvisionProgress>) -> Vec<ProvisionProgress> {
+    let mut out: Vec<ProvisionProgress> = Vec::new();
+    for (name, ti, steps) in msgs {
+        if let Some(slot) = out.iter_mut().find(|(n, t, _)| *n == name && *t == ti) {
+            slot.2 = steps;
+        } else {
+            out.push((name, ti, steps));
+        }
+    }
+    out
 }
 
 /// Adopt live daemon sessions when a prewarm has no safe fresh spec to spawn.
@@ -907,6 +930,126 @@ mod tests {
     use crate::pane::PaneEvent;
     use crate::session::{GroupKind, ProviderSession, Session, WorktreeGroup};
     use tokio::sync::mpsc as tokio_mpsc;
+
+    fn ls(label: &str, state: crate::chrome::StepState) -> LoadStep {
+        LoadStep {
+            label: label.into(),
+            state,
+            detail: None,
+            kind: crate::chrome::StepKind::default(),
+            started_at: None,
+            took: None,
+            progress: None,
+        }
+    }
+
+    fn msg(g: &str, t: usize, label: &str) -> ProvisionProgress {
+        (
+            g.into(),
+            t,
+            vec![ls(label, crate::chrome::StepState::Active)],
+        )
+    }
+
+    fn labels(m: &[ProvisionProgress]) -> Vec<(String, usize, String)> {
+        m.iter()
+            .map(|(g, t, s)| (g.clone(), *t, s[0].label.clone()))
+            .collect::<Vec<_>>()
+    }
+
+    #[test]
+    fn coalesce_latest_table() {
+        assert!(coalesce_latest(Vec::new()).is_empty());
+        assert_eq!(
+            labels(&coalesce_latest(vec![msg("a", 0, "x")])),
+            vec![("a".to_string(), 0, "x".to_string())]
+        );
+        assert_eq!(
+            labels(&coalesce_latest(vec![
+                msg("a", 0, "1"),
+                msg("a", 0, "2"),
+                msg("a", 0, "3")
+            ])),
+            vec![("a".to_string(), 0, "3".to_string())]
+        );
+        assert_eq!(
+            labels(&coalesce_latest(vec![msg("a", 0, "1"), msg("b", 1, "2")])),
+            vec![
+                ("a".to_string(), 0, "1".to_string()),
+                ("b".to_string(), 1, "2".to_string())
+            ]
+        );
+        assert_eq!(
+            labels(&coalesce_latest(vec![
+                msg("a", 0, "a1"),
+                msg("b", 0, "b1"),
+                msg("a", 0, "a2"),
+                msg("b", 0, "b2"),
+                msg("a", 1, "c1"),
+            ])),
+            vec![
+                ("a".to_string(), 0, "a2".to_string()),
+                ("b".to_string(), 0, "b2".to_string()),
+                ("a".to_string(), 1, "c1".to_string())
+            ]
+        );
+    }
+
+    #[test]
+    fn drain_provision_keeps_latest_per_key_and_honors_retired() {
+        let session = Session {
+            id: "s1".into(),
+            worktrees: vec![
+                WorktreeGroup::new("app/home", GroupKind::Home, ""),
+                WorktreeGroup::new("app/other", GroupKind::Home, ""),
+            ],
+            active: 0,
+        };
+        let (tx, mut rx) = tokio_mpsc::unbounded_channel::<ProvisionProgress>();
+        let mut tracker = crate::loading::track::LoadingTracker::default();
+        let mut remote = std::collections::HashMap::new();
+        let mut perf = crate::perf::LoopPerf::new();
+        let retired: std::collections::HashSet<(String, usize)> =
+            std::iter::once(("app/other".to_string(), 0)).collect();
+
+        tx.send(msg("app/other", 1, "o1")).unwrap();
+        tx.send(msg("app/home", 0, "h1")).unwrap();
+        tx.send(msg("app/other", 0, "retired")).unwrap();
+        tx.send(msg("app/home", 0, "h2")).unwrap();
+        tx.send(msg("app/home", 0, "h3")).unwrap();
+        let dirty = drain_provision(
+            &mut rx,
+            &session,
+            &mut tracker,
+            &mut remote,
+            &retired,
+            &mut perf,
+        );
+        assert!(dirty, "active tab got an update");
+        let home = tracker.get(&("app/home".to_string(), 0)).unwrap();
+        assert_eq!(home.len(), 1);
+        assert_eq!(home[0].label, "h3");
+        assert_eq!(
+            tracker.get(&("app/other".to_string(), 1)).unwrap()[0].label,
+            "o1"
+        );
+        assert!(tracker.get(&("app/other".to_string(), 0)).is_none());
+
+        tx.send(msg("app/other", 1, "o2")).unwrap();
+        let dirty = drain_provision(
+            &mut rx,
+            &session,
+            &mut tracker,
+            &mut remote,
+            &retired,
+            &mut perf,
+        );
+        assert!(!dirty, "only a non-active tab updated");
+        assert_eq!(
+            tracker.get(&("app/other".to_string(), 1)).unwrap()[0].label,
+            "o2"
+        );
+    }
 
     /// THE regression gate for the daemon-disabled claim, at the level where
     /// it can break: a real `SpecBatch` flows through the real `drain_specs`
