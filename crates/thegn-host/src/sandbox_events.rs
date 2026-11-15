@@ -20,7 +20,19 @@ use thegn_core::config::{SandboxBackend, SandboxConfig};
 use thegn_core::sandbox::Backend;
 use thegn_core::sandbox_events::{ContainerEventSink, ContainerEvents, EventKind, EventsCap};
 
+use termwiz::terminal::TerminalWaker;
 use tokio::sync::mpsc as tokio_mpsc;
+
+/// Pulse that wakes the event loop after a batch send.
+type Wake = Box<dyn Fn() + Send>;
+
+fn waker_pulse(waker: TerminalWaker) -> Wake {
+    Box::new(move || {
+        if let Err(error) = waker.wake() {
+            tracing::debug!(%error, "sandbox events: waker pulse failed");
+        }
+    })
+}
 
 /// Update type sent to the event loop: tells it to refresh the audit panel.
 #[derive(Debug)]
@@ -36,7 +48,11 @@ pub struct SandboxEventBatch {
 /// Silently does nothing when sandboxing is disabled or the selection yields no
 /// transport (auto with no events-capable chain entry, a reserved or `No` cap,
 /// or the transport's binary not on PATH) — audit is best-effort.
-pub fn spawn(cfg: &SandboxConfig, tx: tokio_mpsc::UnboundedSender<SandboxEventBatch>) {
+pub fn spawn(
+    cfg: &SandboxConfig,
+    tx: tokio_mpsc::UnboundedSender<SandboxEventBatch>,
+    waker: TerminalWaker,
+) {
     let Some(backend) = select_backend(cfg) else {
         return;
     };
@@ -54,13 +70,25 @@ pub fn spawn(cfg: &SandboxConfig, tx: tokio_mpsc::UnboundedSender<SandboxEventBa
         return;
     }
     // Exec events.
-    subscribe_thread("thegn-sbx-exec", events, EventKind::Exec, tx.clone());
+    subscribe_thread(
+        "thegn-sbx-exec",
+        events,
+        EventKind::Exec,
+        tx.clone(),
+        waker_pulse(waker.clone()),
+    );
     // Network events (optional).
     if cfg.network_audit {
         let Some(net_events) = backend.events() else {
             return;
         };
-        subscribe_thread("thegn-sbx-net", net_events, EventKind::Network, tx);
+        subscribe_thread(
+            "thegn-sbx-net",
+            net_events,
+            EventKind::Network,
+            tx,
+            waker_pulse(waker),
+        );
     }
 }
 
@@ -71,13 +99,14 @@ fn subscribe_thread(
     events: Box<dyn ContainerEvents>,
     kind: EventKind,
     tx: tokio_mpsc::UnboundedSender<SandboxEventBatch>,
+    wake: Wake,
 ) {
     thegn_core::thread_name::try_spawn_named(name, move || {
         // Housekeeping: blocks on the container event stream for the
         // process lifetime, writing audit rows nobody waits on. Declared
         // FIRST — the thread-qos ratchet.
         crate::platform::qos::set_self(crate::platform::qos::Qos::Background);
-        let mut sink = BatchForwarder { tx };
+        let mut sink = BatchForwarder { tx, wake };
         events.subscribe(kind, &mut sink);
     })
     // best-effort: listener thread: a failed spawn just disables sandbox
@@ -88,13 +117,21 @@ fn subscribe_thread(
 /// Forwards the transports' persisted-rows pulses to the event loop channel.
 struct BatchForwarder {
     tx: tokio_mpsc::UnboundedSender<SandboxEventBatch>,
+    wake: Wake,
 }
 
 impl ContainerEventSink for BatchForwarder {
     fn on_batch(&mut self, count: usize) {
         // best-effort: the consumer may be gone (shutdown) — a dropped update
         // pulse must never take down the subscriber thread.
-        let _ = self.tx.send(SandboxEventBatch { count });
+        if count == 0 {
+            return;
+        }
+        // Pulse only when the send landed: the loop blocks on poll_input, so
+        // an unpulsed batch would wait for an unrelated wake.
+        if self.tx.send(SandboxEventBatch { count }).is_ok() {
+            (self.wake)();
+        }
     }
 }
 
@@ -128,6 +165,34 @@ mod tests {
             backend_chain: chain.iter().map(|s| (*s).to_string()).collect(),
             ..Default::default()
         }
+    }
+
+    #[test]
+    fn batch_sends_and_pulses_once_empty_batch_does_neither() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let (tx, mut rx) = tokio_mpsc::unbounded_channel();
+        let pulses = Arc::new(AtomicUsize::new(0));
+        let p = pulses.clone();
+        let mut sink = BatchForwarder {
+            tx,
+            wake: Box::new(move || {
+                p.fetch_add(1, Ordering::SeqCst);
+            }),
+        };
+        sink.on_batch(0);
+        assert_eq!(pulses.load(Ordering::SeqCst), 0);
+        assert!(rx.try_recv().is_err());
+        sink.on_batch(3);
+        assert_eq!(pulses.load(Ordering::SeqCst), 1);
+        assert_eq!(rx.try_recv().unwrap().count, 3);
+        drop(rx);
+        sink.on_batch(1);
+        assert_eq!(
+            pulses.load(Ordering::SeqCst),
+            1,
+            "no pulse when send failed"
+        );
     }
 
     #[test]
