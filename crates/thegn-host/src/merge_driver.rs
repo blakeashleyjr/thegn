@@ -658,13 +658,12 @@ fn verify_fixer_checkout(
     if path != canonical_worktree {
         return Err("worktree path uses a non-canonical alias".into());
     }
-    let top_level = local_git_text(path, &["rev-parse", "--show-toplevel"])
-        .map_err(|error| format!("path is not a Git worktree: {error}"))?;
-    // GitPolicy::read permits empty stdout, so this explicit empty check is load-bearing.
-    if top_level.is_empty() {
-        return Err("path is not a Git worktree".into());
-    }
-    let canonical_top_level = PathBuf::from(top_level)
+    let top_level = thegn_core::util::git_out_path(path, &["rev-parse", "--show-toplevel"])
+        .map_err(|error| match error {
+            thegn_core::util::GitPathError::Empty => "path is not a Git worktree".to_string(),
+            error => format!("path is not a Git worktree: {error}"),
+        })?;
+    let canonical_top_level = top_level
         .canonicalize()
         .map_err(|error| format!("cannot resolve Git worktree root: {error}"))?;
     if canonical_worktree != canonical_top_level {
@@ -2370,6 +2369,25 @@ mod tests {
                 ],
             );
             verify_fixer_checkout(&root, nl.to_str().unwrap(), "nlb", None).unwrap();
+        }
+
+        #[test]
+        fn fixer_checkout_accepts_a_worktree_dir_with_a_trailing_space() {
+            let (_fixture, root, _feat_wt) = conflicting_repo("sp-reg");
+            let sp = root.parent().unwrap().join("wt ");
+            git(
+                &root,
+                &[
+                    "worktree",
+                    "add",
+                    "-q",
+                    "-b",
+                    "spb",
+                    sp.to_str().unwrap(),
+                    "main",
+                ],
+            );
+            verify_fixer_checkout(&root, sp.to_str().unwrap(), "spb", None).unwrap();
         }
 
         #[test]
