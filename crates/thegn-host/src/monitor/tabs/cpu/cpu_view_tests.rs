@@ -941,3 +941,31 @@ fn frequency_row_tag_overflow_is_clipped_without_panic() {
     let lines = freq_lines(&[CoreClass::Efficiency], 6, 4);
     assert_eq!(lines.len(), 4);
 }
+
+#[test]
+fn frequency_profile_line_appends_hybrid_counts_only_for_mixed_parts() {
+    let first = |classes: &[CoreClass], cols: usize| freq_lines(classes, cols, 14).remove(1);
+    let mixed = first(
+        &[
+            CoreClass::Performance,
+            CoreClass::Performance,
+            CoreClass::Efficiency,
+            CoreClass::Unknown,
+        ],
+        80,
+    );
+    assert!(mixed.contains(" hybrid 2P/1E"), "{mixed:?}");
+    let unknown = first(&[CoreClass::Unknown, CoreClass::Unknown], 80);
+    assert!(!unknown.contains("hybrid"), "{unknown:?}");
+    let single = first(&[CoreClass::Performance, CoreClass::Performance], 80);
+    assert!(!single.contains("hybrid"), "{single:?}");
+    assert_eq!(single.trim_end(), unknown.trim_end());
+}
+
+#[test]
+fn frequency_hybrid_summary_is_clipped_at_narrow_widths() {
+    for cols in 1..12 {
+        let lines = freq_lines(&[CoreClass::Performance, CoreClass::Efficiency], cols, 4);
+        assert_eq!(lines.len(), 4);
+    }
+}
