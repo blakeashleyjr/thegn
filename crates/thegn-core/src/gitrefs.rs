@@ -2069,4 +2069,103 @@ mod tests {
         assert_eq!(MAX_GIT_OUTPUT_BYTES, 64 * 1024 * 1024);
         assert_eq!(MAX_GIT_FIELD_BYTES, 1024 * 1024);
     }
+
+    /// NUL-terminate every field and decode the bytes the way the svc runner
+    /// does (`String::from_utf8_lossy`), so invalid UTF-8 reaches the parser.
+    fn lossy_z(fields: &[&[u8]]) -> String {
+        let mut bytes = Vec::new();
+        for field in fields {
+            bytes.extend_from_slice(field);
+            bytes.push(0);
+        }
+        String::from_utf8_lossy(&bytes).into_owned()
+    }
+
+    #[test]
+    fn lossy_invalid_utf8_in_commit_display_fields_keeps_alignment() {
+        let a = "a".repeat(40);
+        let b = "b".repeat(40);
+        let out = lossy_z(&[
+            a.as_bytes(),
+            b"aaaaaaa",
+            b"Ann \xff\xfe",
+            b"ann\xff\xfe@example.invalid",
+            b"1700000000",
+            b.as_bytes(),
+            b"HEAD -> main",
+            b"first \xff\xfe subject",
+            b.as_bytes(),
+            b"bbbbbbb",
+            b"Bob",
+            b"bob@example.invalid",
+            b"1600000000",
+            b"",
+            b"",
+            b"\xff\xfe",
+        ]);
+        let commits = parse_commits(&out).unwrap();
+        assert_eq!(commits.len(), 2);
+        assert_eq!(commits[0].sha, a);
+        assert_eq!(commits[0].short, "aaaaaaa");
+        assert_eq!(commits[0].date, 1_700_000_000);
+        assert_eq!(commits[0].parents, vec![b.clone()]);
+        assert_eq!(commits[0].refs, "HEAD -> main");
+        assert!(commits[0].author.contains('\u{FFFD}'));
+        assert!(commits[0].email.contains('\u{FFFD}'));
+        assert!(commits[0].subject.contains('\u{FFFD}'));
+        assert_eq!(commits[1].sha, b);
+        assert_eq!(commits[1].date, 1_600_000_000);
+        assert_eq!(commits[1].author, "Bob");
+        assert!(commits[1].parents.is_empty());
+        assert!(commits[1].subject.contains('\u{FFFD}'));
+    }
+
+    #[test]
+    fn lossy_invalid_utf8_in_stash_message_keeps_alignment() {
+        let a = "a".repeat(40);
+        let b = "b".repeat(40);
+        let out = lossy_z(&[
+            b"stash@{0}",
+            a.as_bytes(),
+            b"1700000000",
+            b"WIP on main: \xff\xfe",
+            b"stash@{1}",
+            b.as_bytes(),
+            b"1600000000",
+            b"On main: plain",
+        ]);
+        let stashes = parse_stashes(&out).unwrap();
+        assert_eq!(stashes.len(), 2);
+        assert_eq!((stashes[0].index, stashes[0].sha.as_str()), (0, a.as_str()));
+        assert_eq!(stashes[0].date, 1_700_000_000);
+        assert!(stashes[0].message.contains('\u{FFFD}'));
+        assert_eq!((stashes[1].index, stashes[1].sha.as_str()), (1, b.as_str()));
+        assert_eq!(stashes[1].date, 1_600_000_000);
+        assert_eq!(stashes[1].message, "On main: plain");
+    }
+
+    #[test]
+    fn lossy_invalid_utf8_in_a_fixed_field_is_an_error() {
+        let a = "a".repeat(40);
+        let mut bad_sha = a.clone().into_bytes();
+        bad_sha[10] = 0xff;
+        let commit = |sha: &[u8], date: &[u8]| {
+            lossy_z(&[
+                sha,
+                b"aaaaaaa",
+                b"Ann",
+                b"ann@example.invalid",
+                date,
+                b"",
+                b"",
+                b"subject",
+            ])
+        };
+        assert!(parse_commits(&commit(&bad_sha, b"1700000000")).is_err());
+        assert!(parse_commits(&commit(a.as_bytes(), b"17000\xff0000")).is_err());
+        let stash =
+            |sha: &[u8], date: &[u8]| lossy_z(&[b"stash@{0}", sha, date, b"WIP on main: x"]);
+        assert!(parse_stashes(&stash(&bad_sha, b"1700000000")).is_err());
+        assert!(parse_stashes(&stash(a.as_bytes(), b"17000\xff0000")).is_err());
+    }
 }
