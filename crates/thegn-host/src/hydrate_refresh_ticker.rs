@@ -1,9 +1,9 @@
 //! Shared refresh worker and its owned I/O boundary. Scheduling is identical
 //! for the live host and the channel-clock integration fixture.
 use super::{
-    CONTAINER_DF_EVERY_TICKS, ContainerDemand, ContainerRefresh, DAEMON_REFRESH_INTERVAL,
-    ISSUE_REFRESH_INTERVAL, PR_REFRESH_INTERVAL, RefreshKind, STARTUP_FETCH_SLOT,
-    STARTUP_MEASURE_SLOT, StatsTick, USAGE_FIRST_SLOT, WEATHER_FIRST_SLOT,
+    CONTAINER_DF_EVERY_TICKS, CONTAINER_SLOT_MAX_BYTES, ContainerDemand, ContainerRefresh,
+    DAEMON_REFRESH_INTERVAL, ISSUE_REFRESH_INTERVAL, PR_REFRESH_INTERVAL, RefreshKind,
+    STARTUP_FETCH_SLOT, STARTUP_MEASURE_SLOT, StatsTick, USAGE_FIRST_SLOT, WEATHER_FIRST_SLOT,
 };
 use crate::hydrate_schedule::ScheduleConfig;
 use std::sync::{
@@ -71,7 +71,7 @@ pub(crate) fn spawn_refresh_ticker(
     generation: Arc<AtomicU64>,
     tx: tokio_mpsc::UnboundedSender<RefreshKind>,
     stats_tx: tokio_mpsc::UnboundedSender<StatsTick>,
-    container_tx: tokio_mpsc::UnboundedSender<ContainerRefresh>,
+    container_slot: crate::snapshot_slot::SnapshotSlot<ContainerRefresh>,
     daemon_slot: crate::snapshot_slot::SnapshotSlot<crate::chrome::DaemonStatus>,
     stats_interval_ms: std::sync::Arc<std::sync::atomic::AtomicU64>,
     stats_live: std::sync::Arc<std::sync::atomic::AtomicBool>,
@@ -92,7 +92,8 @@ pub(crate) fn spawn_refresh_ticker(
         tx,
         LiveIo {
             stats_tx,
-            container_tx,
+            container_slot,
+            container_generation: 0,
             daemon_slot,
             stats_interval_ms,
             stats_live,
@@ -629,7 +630,9 @@ fn spawn_worker_inner(
 /// worker closure. Constructing it performs no I/O; priming stays on the worker.
 struct LiveIo {
     stats_tx: tokio_mpsc::UnboundedSender<StatsTick>,
-    container_tx: tokio_mpsc::UnboundedSender<ContainerRefresh>,
+    container_slot: crate::snapshot_slot::SnapshotSlot<ContainerRefresh>,
+    /// Monotonic publish generation for `container_slot`.
+    container_generation: u64,
     daemon_slot: crate::snapshot_slot::SnapshotSlot<crate::chrome::DaemonStatus>,
     stats_interval_ms: Arc<AtomicU64>,
     stats_live: Arc<AtomicBool>,
@@ -840,9 +843,55 @@ impl TickerIo for LiveIo {
         let Some(refresh) = self.delivery.filter(refresh, live, demand_rise) else {
             return Ok(false);
         };
-        self.container_tx.send(refresh).map_err(|_| ())?;
-        Ok(true)
+        // The size estimate does not depend on the merge (the footprint is
+        // always counted): an oversized snapshot is refused and the slot and
+        // the model keep the old value.
+        let bytes = container_refresh_bytes(&refresh);
+        if bytes > CONTAINER_SLOT_MAX_BYTES {
+            tracing::debug!(
+                target: "thegn::hydrate",
+                bytes,
+                "container snapshot over the slot cap; keeping the last value"
+            );
+            return Ok(false);
+        }
+        // Latest-wins: an unconsumed snapshot is replaced outright, so a
+        // footprint-less tick (`None` = no update) carries the last delivered
+        // footprint forward instead of losing one the loop has not taken yet.
+        // The producer never `take()`s, so it cannot race the consumer or
+        // reset the slot's pending wake (one wake per empty-to-full change).
+        let refresh = merge_container_refresh(self.delivery.last_footprint, refresh);
+        self.container_generation = self.container_generation.saturating_add(1);
+        // Size was checked above and the generation only rises, so this
+        // stores or replaces.
+        self.container_slot
+            .publish(self.container_generation, refresh, bytes);
+        // SnapshotSlot owns the empty-to-full wake; do not pulse again
+        // through the ticker's aggregate notification path.
+        Ok(false)
     }
+}
+
+/// Carry the last delivered footprint into a footprint-less snapshot. The
+/// listing is replaced wholesale, but `footprint: None` means "no update this
+/// tick", so a latest-wins replacement must not drop a footprint the loop may
+/// not have taken yet. Re-delivering an unchanged footprint is a no-op for the
+/// consumer (it only applies a footprint that differs from the model's).
+fn merge_container_refresh(
+    carried: Option<thegn_core::sandbox_manage::ContainerFootprint>,
+    mut next: ContainerRefresh,
+) -> ContainerRefresh {
+    if next.footprint.is_none() {
+        next.footprint = carried;
+    }
+    next
+}
+
+/// Approximate retained size of a container snapshot for the slot's byte cap.
+fn container_refresh_bytes(refresh: &ContainerRefresh) -> usize {
+    std::mem::size_of_val(refresh)
+        + refresh.containers.len().saturating_mul(512)
+        + std::mem::size_of::<thegn_core::sandbox_manage::ContainerFootprint>()
 }
 
 fn daemon_status_bytes(status: &crate::chrome::DaemonStatus) -> usize {
