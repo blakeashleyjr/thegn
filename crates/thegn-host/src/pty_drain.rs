@@ -2772,3 +2772,7 @@ mod tests {
         assert!(dirty);
     }
 }
+
+#[cfg(test)]
+#[path = "pty_drain_flood_tests.rs"]
+mod flood_tests;
