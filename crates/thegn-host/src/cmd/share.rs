@@ -381,16 +381,54 @@ fn list(json: bool) -> Result<()> {
     let db = Db::open().context("share: open the state DB")?;
     let rows = db.list_shares().context("share: read the state DB")?;
     if json {
-        return super::emit_json(&listed_shares(&rows, crate::share::owner_state_of));
+        let pending = pending_reader(&rows);
+        return super::emit_json(&listed_shares(
+            &rows,
+            crate::share::owner_state_of,
+            &pending,
+        ));
     }
     if rows.is_empty() {
         outln!("no shares");
         return Ok(());
     }
-    for line in list_lines(&rows, crate::share::owner_state_of) {
+    let pending = pending_reader(&rows);
+    for line in list_lines(&rows, crate::share::owner_state_of, &pending) {
         outln!("{line}");
     }
     Ok(())
+}
+
+/// Read each listed worktree's pending serve teardowns once. This is a
+/// read-only, lock-free read of the sidecar record. A missing record (the
+/// sandbox never started a sidecar) is detected by the "no recorded runtime"
+/// error text and means nothing is pending; any other failure is kept so the
+/// listing can say the state is unreadable.
+fn pending_reader(rows: &[ShareRow]) -> impl Fn(&str) -> Result<Vec<u16>> {
+    let mut memo: std::collections::BTreeMap<String, std::result::Result<Vec<u16>, String>> =
+        std::collections::BTreeMap::new();
+    for row in rows {
+        memo.entry(row.worktree.clone()).or_insert_with(|| {
+            let sidecar = thegn_core::sandbox::vpn_sidecar_name(
+                &thegn_core::sandbox::container_name_with_profile(
+                    &row.worktree,
+                    Some(&thegn_core::profile::name()),
+                ),
+            );
+            match thegn_svc::vpn::pending_teardowns(&sidecar) {
+                Ok(ports) => Ok(ports),
+                Err(error) if format!("{error:#}").contains("no recorded runtime") => {
+                    Ok(Vec::new())
+                }
+                Err(error) => Err(format!("{error:#}")),
+            }
+        });
+    }
+    move |wt: &str| match memo.get(wt) {
+        Some(Ok(ports)) => Ok(ports.clone()),
+        Some(Err(message)) => Err(anyhow::anyhow!("{message}")),
+        None => Ok(Vec::new()),
+    }
 }
 
 fn stop(cfg: &Config, port: u16, worktree: Option<String>, forget: bool) -> Result<()> {
@@ -476,6 +514,8 @@ struct ListedShare<'a> {
     owner_state: &'static str,
     #[serde(skip_serializing_if = "Option::is_none")]
     recovery: Option<&'static str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    teardown_pending: Option<bool>,
 }
 
 fn begin_stop(store: &dyn WorktreeAuxStore, row: &ShareRow) -> Result<()> {
@@ -494,8 +534,10 @@ fn begin_stop(store: &dyn WorktreeAuxStore, row: &ShareRow) -> Result<()> {
 fn list_lines(
     rows: &[ShareRow],
     owner_state: impl Fn(&ShareRow) -> ShareOwnerState,
+    pending: impl Fn(&str) -> Result<Vec<u16>>,
 ) -> Vec<String> {
-    rows.iter()
+    let mut lines: Vec<String> = rows
+        .iter()
         .map(|row| {
             let state = if owner_state(row) == ShareOwnerState::Exited {
                 format!("{} (owner exited)", row.state)
@@ -505,10 +547,13 @@ fn list_lines(
             let hint = ShareState::parse(&row.state)
                 .map(|state| state.recovery(owner_state(row)))
                 .and_then(ShareRecovery::hint);
-            let hint = match hint {
+            let mut hint = match hint {
                 Some(hint) => format!("  ({hint})"),
                 None => String::new(),
             };
+            if row_teardown_pending(row, &pending(&row.worktree)) == Some(true) {
+                hint.push_str("  (teardown pending; retry with `thegn share stop <local port>`)");
+            }
             format!(
                 "{:<6} {:<6} {:<17} {}{}",
                 row.local_port,
@@ -522,12 +567,55 @@ fn list_lines(
                 hint,
             )
         })
-        .collect()
+        .collect();
+    let mut seen: Vec<&str> = Vec::new();
+    for row in rows {
+        if seen.contains(&row.worktree.as_str()) {
+            continue;
+        }
+        seen.push(&row.worktree);
+        let wt = thegn_svc::lsp::sanitize_for_terminal(&row.worktree);
+        match pending(&row.worktree) {
+            Err(error) => lines.push(format!(
+                "{wt}: pending teardown state unreadable ({})",
+                thegn_svc::lsp::sanitize_for_terminal(&format!("{error:#}"))
+            )),
+            Ok(ports) => {
+                for port in ports {
+                    let matched = rows.iter().any(|other| {
+                        other.worktree == row.worktree
+                            && other.provider == "tailscale"
+                            && other.public_url.as_deref().and_then(url_port) == Some(port)
+                    });
+                    if !matched {
+                        lines.push(format!(
+                            "{wt}: tailscale serve port {port} teardown pending (no share record)"
+                        ));
+                    }
+                }
+            }
+        }
+    }
+    lines
+}
+
+fn row_teardown_pending(row: &ShareRow, pending: &Result<Vec<u16>>) -> Option<bool> {
+    if row.provider != "tailscale" {
+        return None;
+    }
+    let ports = pending.as_ref().ok()?;
+    Some(
+        row.public_url
+            .as_deref()
+            .and_then(url_port)
+            .is_some_and(|port| ports.contains(&port)),
+    )
 }
 
 fn listed_shares<'a>(
     rows: &'a [ShareRow],
     owner_state: impl Fn(&ShareRow) -> ShareOwnerState,
+    pending: impl Fn(&str) -> Result<Vec<u16>>,
 ) -> Vec<ListedShare<'a>> {
     rows.iter()
         .map(|row| ListedShare {
@@ -535,6 +623,7 @@ fn listed_shares<'a>(
             owner_state: owner_state(row).as_str(),
             recovery: ShareState::parse(&row.state)
                 .map(|state| state.recovery(owner_state(row)).as_str()),
+            teardown_pending: row_teardown_pending(row, &pending(&row.worktree)),
         })
         .collect()
 }
@@ -691,24 +780,32 @@ mod tests {
                 owner: None,
             },
         ];
-        let lines = list_lines(&rows, |row| {
-            if row.owner.is_some() {
-                ShareOwnerState::Exited
-            } else {
-                ShareOwnerState::Unrecorded
-            }
-        });
+        let lines = list_lines(
+            &rows,
+            |row| {
+                if row.owner.is_some() {
+                    ShareOwnerState::Exited
+                } else {
+                    ShareOwnerState::Unrecorded
+                }
+            },
+            |_| Ok(Vec::new()),
+        );
         assert!(lines[0].contains("up (owner exited)"));
         assert!(lines[0][32..].starts_with("https://demo.test"));
         assert!(lines[0].contains("(needs reconcile)"));
         assert!(!lines[1].contains("owner exited"));
-        let json = serde_json::to_value(listed_shares(&rows, |row| {
-            if row.owner.is_some() {
-                ShareOwnerState::Exited
-            } else {
-                ShareOwnerState::Unrecorded
-            }
-        }))
+        let json = serde_json::to_value(listed_shares(
+            &rows,
+            |row| {
+                if row.owner.is_some() {
+                    ShareOwnerState::Exited
+                } else {
+                    ShareOwnerState::Unrecorded
+                }
+            },
+            |_| Ok(Vec::new()),
+        ))
         .unwrap();
         let entries = json.as_array().expect("one JSON array");
         assert_eq!(entries[0]["owner_state"], "exited");
@@ -790,7 +887,7 @@ mod tests {
             3003 => ShareOwnerState::Alive,
             _ => ShareOwnerState::Unrecorded,
         };
-        let lines = list_lines(&rows, owner_state);
+        let lines = list_lines(&rows, owner_state, |_| Ok(Vec::new()));
         assert!(lines[0].contains("(retry: thegn share stop)"));
         assert!(lines[1].contains("(needs reconcile)"));
         assert!(lines[2].contains("(needs reconcile)"));
@@ -798,7 +895,8 @@ mod tests {
         assert!(!lines[4].contains("("));
         assert!(!lines[5].contains("("));
 
-        let json = serde_json::to_value(listed_shares(&rows, owner_state)).unwrap();
+        let json =
+            serde_json::to_value(listed_shares(&rows, owner_state, |_| Ok(Vec::new()))).unwrap();
         let entries = json.as_array().expect("share list is an array");
         assert_eq!(entries[0]["recovery"], "retry_teardown");
         assert_eq!(entries[1]["recovery"], "reconcile");
@@ -806,6 +904,58 @@ mod tests {
         assert_eq!(entries[3]["recovery"], "keep");
         assert_eq!(entries[4]["recovery"], "keep");
         assert!(entries[5].get("recovery").is_none());
+    }
+
+    fn pending_row(provider: &str, url: Option<&str>, port: u16) -> ShareRow {
+        ShareRow {
+            worktree: "/worktree/demo".into(),
+            local_port: port,
+            provider: provider.into(),
+            public_url: url.map(str::to_owned),
+            state: "up".into(),
+            created_at: 0,
+            generation: 1,
+            owner: None,
+        }
+    }
+
+    #[test]
+    fn list_rows_show_pending_teardown_hint_orphan_and_unreadable() {
+        let owner_state = |_: &ShareRow| ShareOwnerState::Alive;
+        let rows = vec![
+            pending_row("tailscale", Some("https://demo.ts.net:8443"), 3000),
+            pending_row("tailscale", Some("https://demo.ts.net:9443"), 3001),
+            pending_row("frp", Some("https://frp.test:8443"), 3002),
+        ];
+        let lines = list_lines(&rows, owner_state, |_| Ok(vec![8443, 7777]));
+        assert!(lines[0].contains("teardown pending; retry with `thegn share stop <local port>`"));
+        assert!(!lines[1].contains("teardown pending"));
+        assert!(!lines[2].contains("teardown pending"));
+        assert_eq!(lines.len(), 4);
+        assert_eq!(
+            lines[3],
+            "/worktree/demo: tailscale serve port 7777 teardown pending (no share record)"
+        );
+
+        let lines = list_lines(&rows, owner_state, |_| Err(anyhow::anyhow!("boom")));
+        assert_eq!(lines.len(), 4);
+        assert!(!lines[0].contains("teardown pending"));
+        assert_eq!(
+            lines[3],
+            "/worktree/demo: pending teardown state unreadable (boom)"
+        );
+
+        let json =
+            serde_json::to_value(listed_shares(&rows, owner_state, |_| Ok(vec![8443]))).unwrap();
+        assert_eq!(json[0]["teardown_pending"], true);
+        assert_eq!(json[1]["teardown_pending"], false);
+        assert!(json[2].get("teardown_pending").is_none());
+        let json = serde_json::to_value(listed_shares(&rows, owner_state, |_| {
+            Err(anyhow::anyhow!("boom"))
+        }))
+        .unwrap();
+        assert_eq!(json.as_array().unwrap().len(), 3);
+        assert!(json[0].get("teardown_pending").is_none());
     }
 
     #[test]
