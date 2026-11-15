@@ -358,6 +358,44 @@ fn gh_issue_to_domain_with_host(
     })
 }
 
+/// `gh issue view --json labels` fetches one page of labels.
+const GH_LABEL_PAGE: usize = 100;
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct GhIssueDetail {
+    #[serde(flatten)]
+    issue: GhIssue,
+    #[serde(default)]
+    comments: Vec<GhComment>,
+}
+
+fn parse_issue_detail(json: &str, expected_host: Option<&str>) -> Result<IssueDetail, IssueError> {
+    let detail: GhIssueDetail =
+        serde_json::from_str(json).map_err(|e| IssueError::Parse(e.to_string()))?;
+    let label_count = detail.issue.labels.len();
+    let comments = detail
+        .comments
+        .into_iter()
+        .map(|c| IssueComment {
+            author: c
+                .author
+                .map(|a| a.login)
+                .unwrap_or_else(|| "unknown".into()),
+            body: c.body,
+            created_at_ms: parse_ms(c.created_at.as_deref()),
+        })
+        .collect();
+    Ok(IssueDetail {
+        issue: gh_issue_to_domain_with_host(detail.issue, expected_host)?,
+        comments,
+        // gh preloads every comment page when the comments field is requested.
+        comments_complete: true,
+        // gh fetches one page of 100 labels; a full page may be truncated.
+        labels_complete: label_count < GH_LABEL_PAGE,
+    })
+}
+
 const GH_LIST_FIELDS: &str = "number,title,state,body,assignees,labels,url,updatedAt";
 
 fn requested_github_fields(patch: &IssuePatch) -> Vec<&'static str> {
@@ -452,36 +490,7 @@ impl IssueBackend for GitHubIssuesBackend {
                 args.extend(["--repo", repo]);
             }
             let json = self.gh(&args).await?;
-            #[derive(Deserialize)]
-            #[serde(rename_all = "camelCase")]
-            struct GhIssueDetail {
-                #[serde(flatten)]
-                issue: GhIssue,
-                #[serde(default)]
-                comments: Vec<GhComment>,
-            }
-            let detail: GhIssueDetail =
-                serde_json::from_str(&json).map_err(|e| IssueError::Parse(e.to_string()))?;
-            let comments = detail
-                .comments
-                .into_iter()
-                .map(|c| IssueComment {
-                    author: c
-                        .author
-                        .map(|a| a.login)
-                        .unwrap_or_else(|| "unknown".into()),
-                    body: c.body,
-                    created_at_ms: parse_ms(c.created_at.as_deref()),
-                })
-                .collect();
-            Ok(IssueDetail {
-                issue: gh_issue_to_domain_with_host(detail.issue, expected_host.as_deref())?,
-                comments,
-                // gh preloads every comment page when the comments field is requested.
-                comments_complete: true,
-                // gh returns every label.
-                labels_complete: true,
-            })
+            parse_issue_detail(&json, expected_host.as_deref())
         })
     }
 
@@ -709,6 +718,48 @@ impl IssueBackend for GitHubIssuesBackend {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    fn detail_json_with_labels(n: usize) -> serde_json::Value {
+        let labels: Vec<_> = (0..n).map(|i| json!({ "name": format!("l{i}") })).collect();
+        json!({
+            "number": 7,
+            "title": "t",
+            "state": "OPEN",
+            "body": "",
+            "assignees": [],
+            "labels": labels,
+            "url": "https://github.com/o/r/issues/7",
+            "updatedAt": "1970-01-01T00:00:06Z",
+            "comments": []
+        })
+    }
+
+    #[test]
+    fn detail_labels_complete_below_page() {
+        for n in [0usize, 99] {
+            let v = detail_json_with_labels(n);
+            for text in [
+                serde_json::to_string(&v).unwrap(),
+                serde_json::to_string_pretty(&v).unwrap(),
+            ] {
+                let d = parse_issue_detail(&text, Some("github.com")).unwrap();
+                assert!(d.labels_complete, "{n} labels");
+                assert_eq!(d.issue.labels.len(), n);
+            }
+        }
+    }
+
+    #[test]
+    fn detail_labels_incomplete_at_full_page() {
+        let v = detail_json_with_labels(100);
+        for text in [
+            serde_json::to_string(&v).unwrap(),
+            serde_json::to_string_pretty(&v).unwrap(),
+        ] {
+            let d = parse_issue_detail(&text, Some("github.com")).unwrap();
+            assert!(!d.labels_complete);
+        }
+    }
 
     #[test]
     fn parse_ms_valid_and_invalid() {
