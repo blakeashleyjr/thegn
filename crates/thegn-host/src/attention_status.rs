@@ -192,6 +192,25 @@ fn ci_badge(
     }
 }
 
+/// Fold the issue-link rows (newest first, as `issue_link_worktrees` returns
+/// them) into `path -> (newest id, total linked count)`, keeping only the
+/// paths `keep` accepts. The first row seen for a path is its newest link.
+fn linked_issues_by_path(
+    links: Vec<(String, String)>,
+    keep: impl Fn(&str) -> bool,
+) -> BTreeMap<String, (String, usize)> {
+    let mut out: BTreeMap<String, (String, usize)> = BTreeMap::new();
+    for (issue_id, path) in links {
+        if !keep(&path) {
+            continue;
+        }
+        out.entry(path)
+            .and_modify(|(_, count): &mut (String, usize)| *count = count.saturating_add(1))
+            .or_insert((issue_id, 1_usize));
+    }
+    out
+}
+
 /// Compute `status.attention` / `attention_ranks` / `workspace_attention` for
 /// every registered + live worktree. All inputs are cheap DB/snapshot reads;
 /// the branching lives in `thegn_core::attention::score`.
@@ -270,6 +289,9 @@ fn collect_attention_inner(
     // Per-worktree CI badge for the sidebar `ci` detail field, rebuilt every
     // scan from the same cached run the scorer reads below.
     status.ci_states.clear();
+    // Per-worktree newest linked issue for the sidebar `issue` detail field,
+    // rebuilt every scan from the local link table (no fetch).
+    status.linked_issues.clear();
     if meta.is_empty() {
         return;
     }
@@ -517,6 +539,18 @@ fn collect_attention_inner(
         scores.insert(path.clone(), attention::score(&inputs));
     }
     status.ci_states = ci_states;
+    match db.issue_link_worktrees() {
+        Ok(links) => {
+            status.linked_issues = linked_issues_by_path(links, |path| meta.contains_key(path));
+        }
+        Err(error) => {
+            tracing::debug!(
+                target: "thegn::attention",
+                %error,
+                "issue link lookup failed; sidebar issue field left empty"
+            );
+        }
+    }
 
     // Acknowledgements: an acked worktree is suppressed from the nag surfaces
     // (badge + "Needs you" popup) while its current score still matches the
@@ -1579,5 +1613,81 @@ mod tests {
         );
         assert!(!status.ci_states.contains_key("/wt/ci-badge-none"));
         assert!(!status.ci_states.contains_key("/wt/stale"));
+    }
+
+    #[test]
+    fn linked_issues_by_path_keeps_newest_id_and_counts() {
+        let links = vec![
+            ("ABC-9".to_string(), "/wt/a".to_string()),
+            ("123".to_string(), "/wt/b".to_string()),
+            ("ABC-7".to_string(), "/wt/a".to_string()),
+            ("ABC-1".to_string(), "/wt/a".to_string()),
+            ("999".to_string(), "/wt/gone".to_string()),
+        ];
+        let got = linked_issues_by_path(links, |path| path != "/wt/gone");
+        assert_eq!(got.get("/wt/a"), Some(&("ABC-9".to_string(), 3_usize)));
+        assert_eq!(got.get("/wt/b"), Some(&("123".to_string(), 1_usize)));
+        assert!(!got.contains_key("/wt/gone"));
+        assert!(linked_issues_by_path(Vec::new(), |_| true).is_empty());
+    }
+
+    #[test]
+    fn attention_scan_records_newest_linked_issue_and_count() {
+        order_memo().lock().unwrap().clear();
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("issue-links.db");
+        let db = thegn_core::db::Db::open_at(&file).unwrap();
+        db.put_worktree("app/two", "/repo", "/wt/issue-two", "topic", None, None)
+            .unwrap();
+        db.put_worktree("app/one", "/repo", "/wt/issue-one", "topic", None, None)
+            .unwrap();
+        db.link_issue("/wt/issue-two", "ABC-1").unwrap();
+        db.link_issue("/wt/issue-two", "ABC-9").unwrap();
+        db.link_issue("/wt/issue-one", "123").unwrap();
+        // `link_issue` stamps whole seconds; pin distinct times so "newest"
+        // is deterministic.
+        let writer = rusqlite::Connection::open(&file).unwrap();
+        for (issue, at) in [("ABC-1", 100_i64), ("ABC-9", 200), ("123", 150)] {
+            writer
+                .execute(
+                    "UPDATE issue_links SET linked_at=?1 WHERE issue_id=?2",
+                    rusqlite::params![at, issue],
+                )
+                .unwrap();
+        }
+        let session = session_with(&[("app/two", "/wt/issue-two"), ("app/one", "/wt/issue-one")]);
+        let mut status = crate::sidebar::SidebarStatus::default();
+        status
+            .linked_issues
+            .insert("/wt/stale".into(), ("OLD-1".into(), 1));
+
+        collect_attention_inner(&session, &db, &mut status, None, thegn_core::util::now());
+
+        assert_eq!(
+            status.linked_issues.get("/wt/issue-two"),
+            Some(&("ABC-9".to_string(), 2_usize))
+        );
+        assert_eq!(
+            status.linked_issues.get("/wt/issue-one"),
+            Some(&("123".to_string(), 1_usize))
+        );
+        assert!(!status.linked_issues.contains_key("/wt/stale"));
+    }
+
+    #[test]
+    fn attention_scan_with_no_issue_links_leaves_the_map_empty() {
+        order_memo().lock().unwrap().clear();
+        let db = thegn_core::db::Db::open_memory().unwrap();
+        db.put_worktree("app/bare", "/repo", "/wt/issue-bare", "topic", None, None)
+            .unwrap();
+        let session = session_with(&[("app/bare", "/wt/issue-bare")]);
+        let mut status = crate::sidebar::SidebarStatus::default();
+        status
+            .linked_issues
+            .insert("/wt/stale".into(), ("OLD-1".into(), 1));
+
+        collect_attention_inner(&session, &db, &mut status, None, thegn_core::util::now());
+
+        assert!(status.linked_issues.is_empty());
     }
 }

@@ -94,6 +94,9 @@ pub enum DetailField {
     Stash,
     /// The latest cached CI result (opt-in; hidden while no run is cached).
     Ci,
+    /// The newest linked issue id (+N when more are linked; opt-in; hidden
+    /// while none is linked). Read from the local link table, no fetch.
+    Issue,
 }
 
 /// One entry in the ordered sidebar detail list.
@@ -152,6 +155,7 @@ impl DetailField {
             "author" => Some(Self::Author),
             "stash" => Some(Self::Stash),
             "ci" => Some(Self::Ci),
+            "issue" => Some(Self::Issue),
             _ => None,
         }
     }
@@ -179,11 +183,12 @@ impl DetailField {
             Self::Author => "author",
             Self::Stash => "stash",
             Self::Ci => "ci",
+            Self::Issue => "issue",
         }
     }
 
     /// The valid spellings, in documentation order.
-    pub const fn valid_names() -> [&'static str; 20] {
+    pub const fn valid_names() -> [&'static str; 21] {
         [
             "branch",
             "commits",
@@ -205,6 +210,7 @@ impl DetailField {
             "author",
             "stash",
             "ci",
+            "issue",
         ]
     }
 
@@ -602,8 +608,13 @@ mod tests {
         assert!(!DetailField::default_order().contains(&DetailField::Stash));
         assert_eq!(DetailField::parse("ci"), Some(DetailField::Ci));
         assert_eq!(DetailField::Ci.as_str(), "ci");
-        assert_eq!(DetailField::valid_names().last(), Some(&"ci"));
+        assert!(DetailField::valid_names().contains(&"ci"));
         assert!(!DetailField::default_order().contains(&DetailField::Ci));
+        assert_eq!(DetailField::parse("issue"), Some(DetailField::Issue));
+        assert_eq!(DetailField::parse(" Issue "), Some(DetailField::Issue));
+        assert_eq!(DetailField::Issue.as_str(), "issue");
+        assert_eq!(DetailField::valid_names().last(), Some(&"issue"));
+        assert!(!DetailField::default_order().contains(&DetailField::Issue));
     }
 
     #[test]
