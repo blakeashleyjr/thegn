@@ -438,18 +438,84 @@ fn run_cli_within(
     cancel: &AtomicBool,
 ) -> Result<String, CiError> {
     use crate::issue::gh_run::run_blocking;
-    run_blocking(cmd, limits, cancel).map_err(ci_run_error)
+    let secrets = command_secrets(&cmd);
+    run_blocking(cmd, limits, cancel).map_err(|error| ci_run_error(error, &secrets))
 }
 
-fn ci_run_error(error: crate::issue::gh_run::RunError) -> CiError {
+fn ci_run_error(error: crate::issue::gh_run::RunError, secrets: &[String]) -> CiError {
     use crate::issue::gh_run::RunError;
-    match error {
+    let error = match error {
         RunError::NotInstalled => CiError::NotInstalled,
         RunError::Exit { stderr, .. } => classify_stderr(&stderr),
         RunError::Timeout => CiError::Other("CI provider command timed out".into()),
         RunError::Truncated => CiError::TooLarge("provider output byte budget exhausted".into()),
         RunError::Io(message) => CiError::Other(format!("CI provider command failed: {message}")),
         RunError::Cancelled => CiError::Other("CI provider command cancelled".into()),
+    };
+    redact_ci_error(error, secrets)
+}
+
+/// Credential variables a provider CLI reads. Their values are known secrets
+/// for the command that carries (or inherits) them.
+const CI_TOKEN_ENV_VARS: &[&str] = &[
+    "GITLAB_TOKEN",
+    "GITLAB_ACCESS_TOKEN",
+    "GH_TOKEN",
+    "GITHUB_TOKEN",
+    "GH_ENTERPRISE_TOKEN",
+    "GITHUB_ENTERPRISE_TOKEN",
+];
+
+/// Shorter values are not replaced verbatim: a short string would mangle
+/// ordinary diagnostic text, and a real provider token is never that short.
+const MIN_LITERAL_SECRET_LEN: usize = 8;
+
+/// The resolved token values a CI command can expose: every credential
+/// variable set on the command (the configured `[ci.gitlab] token` is exported
+/// here) plus any inherited from this process and not overridden.
+fn command_secrets(cmd: &Command) -> Vec<String> {
+    let mut secrets = Vec::new();
+    for &name in CI_TOKEN_ENV_VARS {
+        let explicit = cmd
+            .get_envs()
+            .find(|(key, _)| key.to_str() == Some(name))
+            .map(|(_, value)| value.map(std::ffi::OsStr::to_os_string));
+        let value = match explicit {
+            Some(value) => value,
+            None => std::env::var_os(name),
+        };
+        if let Some(value) = value.and_then(|value| value.into_string().ok())
+            && value.len() >= MIN_LITERAL_SECRET_LEN
+            && !secrets.contains(&value)
+        {
+            secrets.push(value);
+        }
+    }
+    secrets
+}
+
+/// Remove credentials from CLI-derived text before it is stored in an error:
+/// the known token values verbatim, then the common token and header shapes
+/// ([`thegn_core::ci_log::redact`]) as defence in depth.
+fn scrub_cli_text(text: &str, secrets: &[String]) -> String {
+    let mut text = text.to_string();
+    for secret in secrets {
+        if secret.len() >= MIN_LITERAL_SECRET_LEN {
+            text = text.replace(secret.as_str(), thegn_core::ci_log::REDACTION_MARKER);
+        }
+    }
+    thegn_core::ci_log::redact(&text)
+}
+
+/// Scrub every text-carrying variant. Classification has already happened on
+/// the raw stderr, so redaction never changes which variant is returned.
+fn redact_ci_error(error: CiError, secrets: &[String]) -> CiError {
+    match error {
+        CiError::Other(message) => CiError::Other(scrub_cli_text(&message, secrets)),
+        CiError::Unsupported(message) => CiError::Unsupported(scrub_cli_text(&message, secrets)),
+        CiError::TooLarge(message) => CiError::TooLarge(scrub_cli_text(&message, secrets)),
+        CiError::Malformed(message) => CiError::Malformed(scrub_cli_text(&message, secrets)),
+        other => other,
     }
 }
 
@@ -758,20 +824,22 @@ fn run_bounded_log_within(
     use crate::issue::gh_run::run_blocking_streaming;
     use crate::plugin::proc::bounded_group_termination_supported;
 
+    let secrets = command_secrets(&cmd);
     if bounded_group_termination_supported() {
         let mut collector = LogCollector::new();
         run_blocking_streaming(cmd, limits, cancel, &mut |bytes: &[u8]| {
             collector.feed(bytes);
         })
-        .map_err(ci_run_error)?;
+        .map_err(|error| ci_run_error(error, &secrets))?;
         let (text, truncated) = collector.finish();
         return Ok(CiLog { text, truncated });
     }
 
     let (log_result, status, stderr) =
-        run_fallback_bounded(cmd, limits, cancel, |reader| collect_log(reader))?;
+        run_fallback_bounded(cmd, limits, cancel, |reader| collect_log(reader))
+            .map_err(|error| redact_ci_error(error, &secrets))?;
     if !status.success() {
-        return Err(classify_stderr(&stderr));
+        return Err(redact_ci_error(classify_stderr(&stderr), &secrets));
     }
     let (text, truncated) = log_result;
     Ok(CiLog { text, truncated })
@@ -2104,8 +2172,10 @@ impl CiProvider for GitlabCi {
                 };
                 let endpoint =
                     format!("{jobs_endpoint}?per_page={GITLAB_JOBS_PAGE_SIZE}&page={page}");
+                let cmd = self.command(loc, &remote, &["api", &endpoint])?;
+                let secrets = command_secrets(&cmd);
                 let result = crate::issue::gh_run::run_blocking(
-                    self.command(loc, &remote, &["api", &endpoint])?,
+                    cmd,
                     crate::issue::gh_run::Limits {
                         timeout,
                         max_stdout: remaining,
@@ -2113,7 +2183,7 @@ impl CiProvider for GitlabCi {
                     },
                     &self.cancel,
                 );
-                gitlab_page_result(result, clipped)
+                gitlab_page_result(result, clipped, &secrets)
             })?;
         if discarded_jobs > 0 {
             tracing::warn!(target: "thegn::ci", discarded_rows = discarded_jobs, "discarded malformed GitLab job rows");
@@ -2232,13 +2302,14 @@ fn gitlab_page_timeout(left: Duration) -> Option<(Duration, bool)> {
 fn gitlab_page_result(
     result: Result<String, crate::issue::gh_run::RunError>,
     clipped: bool,
+    secrets: &[String],
 ) -> Result<GitlabJobPage, CiError> {
     use crate::issue::gh_run::RunError;
     match result {
         Ok(body) => Ok(GitlabJobPage::Body(body)),
         Err(RunError::Truncated) => Ok(GitlabJobPage::OverBudget),
         Err(RunError::Timeout) if clipped => Ok(GitlabJobPage::OverDeadline),
-        Err(error) => Err(ci_run_error(error)),
+        Err(error) => Err(ci_run_error(error, secrets)),
     }
 }
 
@@ -3827,19 +3898,19 @@ esac
         use crate::issue::gh_run::RunError;
 
         assert!(matches!(
-            gitlab_page_result(Err(RunError::Timeout), true),
+            gitlab_page_result(Err(RunError::Timeout), true, &[]),
             Ok(GitlabJobPage::OverDeadline)
         ));
         assert!(matches!(
-            gitlab_page_result(Err(RunError::Timeout), false),
+            gitlab_page_result(Err(RunError::Timeout), false, &[]),
             Err(CiError::Other(message)) if message == "CI provider command timed out"
         ));
         assert!(matches!(
-            gitlab_page_result(Err(RunError::Truncated), false),
+            gitlab_page_result(Err(RunError::Truncated), false, &[]),
             Ok(GitlabJobPage::OverBudget)
         ));
         assert!(matches!(
-            gitlab_page_result(Ok("[]".to_owned()), false),
+            gitlab_page_result(Ok("[]".to_owned()), false, &[]),
             Ok(GitlabJobPage::Body(body)) if body == "[]"
         ));
     }

@@ -305,3 +305,103 @@ fn transport_failing_cli_error_text_never_contains_the_token() {
     assert_eq!(calls.len(), 1, "the fake must have run: {calls:?}");
     assert_eq!(calls[0].2, TOKEN_A, "the token reached the child env only");
 }
+
+/// A configured token with no classifier keyword in it, so a stderr that
+/// echoes it stays unclassified and reaches `CiError::Other`.
+const PLAIN_TOKEN: &str = "Qz7mWv3kPx9LrT2nHs4c";
+
+fn exit_error(stderr: &str) -> crate::issue::gh_run::RunError {
+    crate::issue::gh_run::RunError::Exit {
+        code: Some(1),
+        stderr: stderr.into(),
+    }
+}
+
+#[test]
+fn transport_unclassified_failure_redacts_the_configured_token() {
+    let Some(fake) = FakeGlab::new(
+        "printf 'glab: unexpected failure for %s\\n' \"$GITLAB_TOKEN\" >&2\nexit 1\n",
+    ) else {
+        return;
+    };
+    let _env = fake.path_guard(&[("GITLAB_TOKEN", None)]);
+    let (_repo, loc) = repo_with_origin(&format!("https://{HOST_A}/group/repo.git"));
+    let (client, _) = provider_and_context_for(&loc, &gitlab_cfg(PLAIN_TOKEN)).unwrap();
+    let error = client.runs(&loc, None, 10).expect_err("fake glab exits 1");
+    assert!(matches!(error, CiError::Other(_)), "{error:?}");
+    let rendered = error.to_string();
+    assert!(!rendered.contains(PLAIN_TOKEN), "{rendered}");
+    assert!(
+        rendered.contains(thegn_core::ci_log::REDACTION_MARKER),
+        "{rendered}"
+    );
+    assert!(rendered.contains("unexpected failure"), "{rendered}");
+    let calls = fake.calls();
+    assert!(!calls.is_empty(), "the fake must have run");
+    assert!(
+        calls.iter().all(|call| call.2 == PLAIN_TOKEN),
+        "the token reached the child env only"
+    );
+}
+
+#[test]
+fn transport_provider_token_shapes_are_scrubbed_without_a_configured_token() {
+    let glpat = format!("glpat-{}", "Ab1".repeat(8));
+    let ghp = format!("ghp_{}", "Cd2".repeat(8));
+    let error = ci_run_error(
+        exit_error(&format!(
+            "glab: bad response {glpat} then gh: {ghp} rejected"
+        )),
+        &[],
+    );
+    assert!(matches!(error, CiError::Other(_)), "{error:?}");
+    let rendered = error.to_string();
+    assert!(!rendered.contains(&glpat), "{rendered}");
+    assert!(!rendered.contains(&ghp), "{rendered}");
+    assert!(
+        rendered.contains(thegn_core::ci_log::REDACTION_MARKER),
+        "{rendered}"
+    );
+    assert!(rendered.contains("bad response"), "{rendered}");
+
+    let header = format!("Authorization: Bearer {PLAIN_TOKEN}\nPRIVATE-TOKEN: {PLAIN_TOKEN}");
+    let scrubbed = scrub_cli_text(&header, &[]);
+    assert!(!scrubbed.contains(PLAIN_TOKEN), "{scrubbed}");
+}
+
+#[test]
+fn transport_short_configured_value_does_not_mangle_error_text() {
+    let stderr = "abc failed at abcdef";
+    let error = ci_run_error(exit_error(stderr), &["abc".into()]);
+    assert_eq!(error.to_string(), stderr);
+}
+
+#[test]
+fn transport_redaction_keeps_401_classification() {
+    let stderr = format!("HTTP 401 for {PLAIN_TOKEN}");
+    let error = ci_run_error(exit_error(&stderr), &[PLAIN_TOKEN.into()]);
+    assert_eq!(error, classify_stderr(&stderr));
+    assert_eq!(error, CiError::NotAuthenticated);
+    assert!(!error.to_string().contains(PLAIN_TOKEN));
+}
+
+#[test]
+fn transport_command_secrets_include_the_exported_configured_token() {
+    let _env = thegn_core::testenv::EnvGuard::mutate_pairs(&[("GITLAB_TOKEN", None)]);
+    let repo = tempfile::tempdir().unwrap();
+    let loc = GitLoc::Local(repo.path().to_path_buf());
+    let remote = parse_gitlab_remote(&format!("https://{HOST_A}/g/r")).unwrap();
+    let gitlab = GitlabCi {
+        credential: GitlabCredential::Configured {
+            token: PLAIN_TOKEN.into(),
+            explicit: true,
+        },
+        ..GitlabCi::default()
+    };
+    let cmd = gitlab.command(&loc, &remote, &["api", "x"]).unwrap();
+    assert!(
+        command_secrets(&cmd)
+            .iter()
+            .any(|secret| secret == PLAIN_TOKEN)
+    );
+}
