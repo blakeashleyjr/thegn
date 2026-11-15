@@ -1503,7 +1503,11 @@ mod tests {
 
     #[test]
     fn bundle_in_flight_memory_ceiling_is_bounded() {
-        assert!((BUNDLE_QUEUE_DEPTH + 2) * BUNDLE_CHUNK_BYTES <= 1 * 1024 * 1024);
+        let ceiling = std::hint::black_box((BUNDLE_QUEUE_DEPTH + 2) * BUNDLE_CHUNK_BYTES);
+        assert!(
+            ceiling <= 1024 * 1024,
+            "in-flight bundle ceiling is {ceiling} bytes"
+        );
     }
 
     #[test]
