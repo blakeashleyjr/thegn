@@ -147,6 +147,18 @@ fn at(location: &str) -> WeatherConfig {
 }
 
 #[test]
+fn live_key_tracks_location_and_ignores_case() {
+    assert_ne!(
+        live_key(&at("Oceanside"), None),
+        live_key(&at("Reykjavik"), None)
+    );
+    assert_eq!(
+        live_key(&at("Oceanside, CA"), None),
+        live_key(&at(" oceanside, ca"), None)
+    );
+}
+
+#[test]
 fn reload_needs_poll_on_location_change() {
     assert!(reload_needs_poll(&at("Oceanside"), &at("Reykjavik"), None));
 }
