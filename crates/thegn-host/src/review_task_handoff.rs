@@ -215,7 +215,10 @@ fn handle_loaded(
     let pending_feedback = current.pending_source_revision.is_some()
         && current.pending_content_revision.as_deref() != Some(current.content_revision.as_str());
 
-    let local_head = loc.git_out(&["rev-parse", "HEAD"]);
+    let local_head = match read_head(loc) {
+        Ok(local_head) => local_head,
+        Err(error) => return park(db, &task, &error),
+    };
     let after = match forge.pr_status(loc, PrRef::Number(context.pr_number)) {
         Ok(pr) => pr,
         Err(error) => return park_after_forge_error(db, &task, "post-agent PR refresh", &error),
@@ -334,6 +337,22 @@ fn head_verdict(expected: &str, before: &str, local: Option<&str>, remote: &str)
         None => HeadVerdict::Foreign(
             "could not verify the task worktree head against the moved PR".into(),
         ),
+    }
+}
+
+fn read_head(loc: &GitLoc) -> Result<Option<String>, String> {
+    use thegn_core::git_run::{GitOutcome, GitTextError};
+
+    match loc.git_text(&["rev-parse", "--verify", "--quiet", "HEAD"]) {
+        Ok(head) if head.is_empty() => Ok(None),
+        Ok(head) => Ok(Some(head)),
+        Err(GitTextError::Failed(GitOutcome::Exit {
+            code: Some(1),
+            stderr_tail,
+        })) if stderr_tail.is_empty() => Ok(None),
+        Err(error) => Err(format!(
+            "review task worktree git HEAD read failed: {error}"
+        )),
     }
 }
 
@@ -602,6 +621,51 @@ mod tests {
             head_verdict("a", "a", Some("b"), "c"),
             HeadVerdict::Foreign(_)
         ));
+    }
+
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "the fixture initializes an isolated unborn Git repository"
+    )]
+    #[test]
+    fn review_head_probe_table_distinguishes_unborn_from_git_failure() {
+        use crate::pr_authorship::tests::Fixture;
+
+        let fixture = Fixture::new();
+        let head = fixture.pr.head_ref_oid.clone();
+        assert_eq!(
+            read_head(&fixture.loc),
+            Ok(Some(head.clone())),
+            "HEAD == admitted"
+        );
+        assert!(matches!(
+            head_verdict(&head, &head, Some(&head), &format!("{head}-descendant")),
+            HeadVerdict::Foreign(_)
+        ));
+        assert!(matches!(
+            head_verdict(&head, &head, Some("diverged"), "remote"),
+            HeadVerdict::Foreign(_)
+        ));
+
+        let unborn = tempfile::tempdir().unwrap();
+        let status = thegn_core::util::git_cmd(unborn.path())
+            .args(["init", "--quiet"])
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .status()
+            .unwrap();
+        assert!(status.success());
+        let unborn_loc = GitLoc::Local(unborn.path().to_path_buf());
+        assert_eq!(read_head(&unborn_loc), Ok(None), "unborn HEAD");
+        assert!(matches!(
+            head_verdict(&head, &head, None, &head),
+            HeadVerdict::NoMovement
+        ));
+
+        let broken = tempfile::tempdir().unwrap();
+        std::fs::write(broken.path().join(".git"), "gitdir: missing\n").unwrap();
+        let broken_loc = GitLoc::Local(broken.path().to_path_buf());
+        let error = read_head(&broken_loc).unwrap_err();
+        assert!(error.contains("git"), "{error}");
     }
 
     #[test]
