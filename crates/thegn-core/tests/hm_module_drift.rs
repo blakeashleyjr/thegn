@@ -455,7 +455,7 @@ fn sidebar_detail_field_defaults_match_example_and_module() {
             .join(", ")
     );
     let nix = format!(
-        "default = [ {} ];",
+        "default = [{}];",
         fields
             .iter()
             .map(|field| format!("\"{field}\""))
