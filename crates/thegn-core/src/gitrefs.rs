@@ -1209,7 +1209,7 @@ mod tests {
     }
 
     fn tag_row(n: usize) -> String {
-        let kind = if n % 2 == 0 { "tag" } else { "commit" };
+        let kind = if n.is_multiple_of(2) { "tag" } else { "commit" };
         format!("rel/\u{e9}-{n}{US}{}{US}{kind}\n", oid(n + 1))
     }
 
@@ -1235,7 +1235,7 @@ mod tests {
     fn bisect_row_list(count: usize) -> Vec<String> {
         let mut rows = vec![format!("bad{US}{}\n", oid(1))];
         for n in 0..count.saturating_sub(1) {
-            if n % 2 == 0 {
+            if n.is_multiple_of(2) {
                 rows.push(format!("good-{}{US}{}\n", oid(n + 10), oid(n + 10)));
             } else {
                 rows.push(format!("skip-{}{US}{}\n", oid(n + 10), oid(n + 10)));
@@ -1476,7 +1476,7 @@ mod tests {
     #[test]
     fn branches_mutation_table() {
         let row_with = |index: usize, value: &str| {
-            let mut fields: Vec<String> = vec![
+            let mut fields: [String; 7] = [
                 "*".to_string(),
                 "main".to_string(),
                 "origin/main".to_string(),
@@ -1590,7 +1590,7 @@ mod tests {
     #[test]
     fn tags_mutation_table() {
         let row_with = |index: usize, value: &str| {
-            let mut fields = vec!["v1".to_string(), oid(1), "tag".to_string()];
+            let mut fields = ["v1".to_string(), oid(1), "tag".to_string()];
             fields[index] = value.to_string();
             format!("{}\n", fields.join("\u{1f}"))
         };
