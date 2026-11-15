@@ -562,15 +562,6 @@ pub fn dedupe(base: &str, taken: &BranchSet) -> String {
     candidate
 }
 
-/// Generate a collision-free branch name. `human` is an optional friendly name.
-pub fn branch_name(root: &Path, human: Option<&str>, cfg: &Config) -> String {
-    let base = match human {
-        Some(h) => human_base(h, cfg),
-        None => candidate_name(cfg),
-    };
-    dedupe(&base, &BranchSet::load(root))
-}
-
 /// Generate a collision-free branch name, refusing if Git cannot provide the
 /// branch inventory needed to prove that the name is free.
 pub fn branch_name_checked(
@@ -2151,10 +2142,13 @@ mod tests {
     fn branch_name_dedupes_against_repo() {
         let repo = temp_repo("name");
         let cfg = Config::default();
-        let first = branch_name(&repo, Some("dup"), &cfg);
+        let first = branch_name_checked(&repo, Some("dup"), &cfg).unwrap();
         assert_eq!(first, format!("{}dup", cfg.branch_prefix));
         assert!(util::git_ok(&repo, &["branch", &first]));
-        assert_eq!(branch_name(&repo, Some("dup"), &cfg), format!("{first}-1"));
+        assert_eq!(
+            branch_name_checked(&repo, Some("dup"), &cfg).unwrap(),
+            format!("{first}-1")
+        );
         // best-effort: test cleanup: scratch removal must never fail the test
         let _ = std::fs::remove_dir_all(&repo);
     }
