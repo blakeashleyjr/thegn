@@ -39,9 +39,10 @@ pub enum Stream {
     HeadOrFail { cap: usize },
     /// Piped and drained to EOF for the whole run; keep only the newest `cap` bytes. Never ends the run.
     Tail { cap: usize },
-    /// Piped and drained to EOF for the whole run; every stdout byte is handed, in order, to the
-    /// consumer passed to [`run_consuming`] on the calling thread. Nothing is retained
-    /// (`Capture::bytes` stays empty, `total` counts every byte). Never ends the run. On stderr it
+    /// Piped and drained to EOF for the whole run; every byte of this stream is handed, in order,
+    /// to the consumer passed to [`run_consuming_streams`] (or, for stdout only,
+    /// [`run_consuming`]) on the calling thread. Nothing is retained (`Capture::bytes` stays
+    /// empty, `total` counts every byte). Never ends the run. Under [`run_consuming`] stderr
     /// drains and drops.
     Consume,
 }
@@ -288,13 +289,35 @@ pub fn run_consuming(
     cancel: &AtomicBool,
     consume: &mut dyn FnMut(&[u8]),
 ) -> Run {
+    run_consuming_streams(cmd, limits, cancel, &mut |which: Which, bytes: &[u8]| {
+        if which == Which::Stdout {
+            consume(bytes);
+        }
+    })
+}
+
+/// A consumer of [`Stream::Consume`] bytes, told which stream each chunk came from.
+pub type StreamConsumer<'a> = &'a mut dyn FnMut(Which, &[u8]);
+
+/// Like [`run_consuming`], but every [`Stream::Consume`] stream (stdout, stderr or both) hands
+/// its bytes to `consume(which, bytes)` on the calling thread, in order within each stream.
+/// Overrides stdin (always null; use [`run_with_input`] for a payload) and stdout/stderr (per
+/// `limits`); everything else (args, env, cwd) is the caller's. Blocking: call it from a worker
+/// thread, never the UI loop. Wall time <= timeout + term_grace + 2 * kill_settle + reader_grace
+/// + one BACKOFF_CAP.
+pub fn run_consuming_streams(
+    cmd: &mut Command,
+    limits: &Limits,
+    cancel: &AtomicBool,
+    consume: StreamConsumer<'_>,
+) -> Run {
     #[cfg(unix)]
     {
-        unix::run_consuming(cmd, limits, cancel, consume)
+        unix::run_consuming_streams(cmd, limits, cancel, consume)
     }
     #[cfg(not(unix))]
     {
-        fallback::run_consuming(cmd, limits, cancel, consume)
+        fallback::run_consuming_streams(cmd, limits, cancel, consume)
     }
 }
 
