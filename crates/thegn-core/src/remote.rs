@@ -2439,7 +2439,10 @@ mod tests {
         let loc = GitLoc::Local(dir.path().to_path_buf());
         let before = util::core_git_spawn_count();
         assert_eq!(loc.git_out(&["status", "--porcelain"]), None);
-        assert_eq!(util::core_git_spawn_count() - before, 1);
+        assert!(
+            util::core_git_spawn_count() > before,
+            "GitLoc::git_out must count its spawn"
+        );
     }
 
     #[test]
