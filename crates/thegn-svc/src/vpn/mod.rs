@@ -113,7 +113,15 @@ struct SidecarRecord {
     generation: Option<u64>,
     #[serde(default)]
     placement: Option<String>,
+    /// Ports whose share teardown no runtime verified (THE-330). Sorted,
+    /// deduplicated, at most [`MAX_PENDING_TEARDOWN`] entries; cleared only by
+    /// a later verified teardown. Absent in older records.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pending_teardown: Vec<u16>,
 }
+
+/// Most share ports one sidecar record retains as pending teardown.
+pub const MAX_PENDING_TEARDOWN: usize = 16;
 
 /// A sidecar record was written for a different worktree than the caller.
 #[derive(Debug)]
@@ -465,9 +473,8 @@ fn record_sidecar_for_worktree(
     if placement != "local" && placement.trim().is_empty() {
         bail!("vpn: sidecar {container} has an empty placement");
     }
-    let previous_generation = sidecar_record_dir_existing()?
-        .and_then(|_| read_sidecar_record(container).ok())
-        .and_then(|record| record.generation);
+    let previous = sidecar_record_dir_existing()?.and_then(|_| read_sidecar_record(container).ok());
+    let previous_generation = previous.as_ref().and_then(|record| record.generation);
     let generation = previous_generation
         .map(|generation| {
             generation
@@ -484,18 +491,117 @@ fn record_sidecar_for_worktree(
         worktree: Some(worktree),
         generation: Some(generation),
         placement: Some(placement.into()),
+        pending_teardown: carried_pending_teardown(previous.as_ref(), &id),
     };
-    let bytes = serde_json::to_vec(&record).context("vpn: encode sidecar runtime record")?;
+    write_sidecar_record(container, &record)?;
+    Ok(RecordedSidecar {
+        runtime: rt.clone(),
+        id,
+    })
+}
+
+/// Pending teardowns survive a reused sidecar (same container id) and are
+/// dropped with a replaced one, whose ingress state is new.
+fn carried_pending_teardown(previous: Option<&SidecarRecord>, id: &str) -> Vec<u16> {
+    match previous {
+        Some(record) if record.id == id && valid_pending_teardown(&record.pending_teardown) => {
+            record.pending_teardown.clone()
+        }
+        _ => Vec::new(),
+    }
+}
+
+/// Test fixture: write a podman sidecar record bound to `worktree`.
+#[cfg(test)]
+pub(crate) fn write_sidecar_record_for_test(
+    container: &str,
+    worktree: &Path,
+    id: &str,
+    generation: u64,
+    pending_teardown: Vec<u16>,
+) -> Result<()> {
+    let worktree = canonical_caller_worktree(worktree)?
+        .to_string_lossy()
+        .into_owned();
+    write_sidecar_record(
+        container,
+        &SidecarRecord {
+            version: 1,
+            container: container.to_string(),
+            prefix: vec!["podman".into()],
+            id: id.to_string(),
+            worktree: Some(worktree),
+            generation: Some(generation),
+            placement: Some("local".into()),
+            pending_teardown,
+        },
+    )
+}
+
+fn write_sidecar_record(container: &str, record: &SidecarRecord) -> Result<()> {
+    let bytes = serde_json::to_vec(record).context("vpn: encode sidecar runtime record")?;
     if bytes.len() > SIDECAR_RECORD_MAX_BYTES {
         bail!("vpn: sidecar runtime record for {container} exceeds the size limit");
     }
     sidecar_record_dir()?
         .write_owner_only_atomic(&sidecar_record_name(container), &bytes)
-        .context("vpn: write sidecar runtime record")?;
-    Ok(RecordedSidecar {
-        runtime: rt.clone(),
-        id,
+        .context("vpn: write sidecar runtime record")
+}
+
+/// Record that a share teardown of `port` was not verified, in the sidecar
+/// record bound to `worktree`. Idempotent; the record's generation is kept.
+/// Refuses once [`MAX_PENDING_TEARDOWN`] ports are already pending.
+pub fn mark_teardown_pending(container: &str, worktree: &Path, port: u16) -> Result<()> {
+    update_pending_teardown(container, worktree, |pending| {
+        match pending.binary_search(&port) {
+            Ok(_) => Ok(false),
+            Err(_) if pending.len() >= MAX_PENDING_TEARDOWN => bail!(
+                "vpn: sidecar {container} already has {MAX_PENDING_TEARDOWN} pending share teardowns (the cap); port {port} was not recorded"
+            ),
+            Err(index) => {
+                pending.insert(index, port);
+                Ok(true)
+            }
+        }
     })
+}
+
+/// Drop `port` from the pending teardowns after a verified teardown. A port
+/// that is not pending leaves the record untouched.
+pub fn clear_teardown_pending(container: &str, worktree: &Path, port: u16) -> Result<()> {
+    update_pending_teardown(container, worktree, |pending| {
+        match pending.binary_search(&port) {
+            Ok(index) => {
+                pending.remove(index);
+                Ok(true)
+            }
+            Err(_) => Ok(false),
+        }
+    })
+}
+
+/// Ports whose share teardown is still unverified for `container`.
+pub fn pending_teardowns(container: &str) -> Result<Vec<u16>> {
+    Ok(read_validated_sidecar_record(container, None, None)?.pending_teardown)
+}
+
+fn update_pending_teardown(
+    container: &str,
+    worktree: &Path,
+    update: impl FnOnce(&mut Vec<u16>) -> Result<bool>,
+) -> Result<()> {
+    let caller = canonical_caller_worktree(worktree)?;
+    let mut record = read_validated_sidecar_record(container, Some(&caller), None)?;
+    if update(&mut record.pending_teardown)? {
+        write_sidecar_record(container, &record)?;
+    }
+    Ok(())
+}
+
+fn canonical_caller_worktree(worktree: &Path) -> Result<PathBuf> {
+    std::fs::canonicalize(worktree)
+        .or_else(|_| std::path::absolute(worktree))
+        .with_context(|| format!("vpn: resolve caller worktree {}", worktree.display()))
 }
 
 /// Read a bounded, no-follow sidecar runtime record and validate every field.
@@ -510,9 +616,7 @@ pub fn recorded_sidecar_for_worktree(
     worktree: &Path,
     generation: Option<u64>,
 ) -> Result<RecordedSidecar> {
-    let caller = std::fs::canonicalize(worktree)
-        .or_else(|_| std::path::absolute(worktree))
-        .with_context(|| format!("vpn: resolve caller worktree {}", worktree.display()))?;
+    let caller = canonical_caller_worktree(worktree)?;
     recorded_sidecar_with_context(container, Some(&caller), generation)
 }
 
@@ -521,6 +625,18 @@ fn recorded_sidecar_with_context(
     caller_worktree: Option<&Path>,
     expected_generation: Option<u64>,
 ) -> Result<RecordedSidecar> {
+    let parsed = read_validated_sidecar_record(container, caller_worktree, expected_generation)?;
+    Ok(RecordedSidecar {
+        runtime: OciRuntime::new(parsed.prefix),
+        id: parsed.id,
+    })
+}
+
+fn read_validated_sidecar_record(
+    container: &str,
+    caller_worktree: Option<&Path>,
+    expected_generation: Option<u64>,
+) -> Result<SidecarRecord> {
     validate_container_name(container)?;
     let parsed = read_sidecar_record(container)?;
     if parsed.version != 1
@@ -532,10 +648,7 @@ fn recorded_sidecar_with_context(
         bail!("vpn: malformed runtime record for sidecar {container}");
     }
     validate_sidecar_record_context(&parsed, caller_worktree, expected_generation)?;
-    Ok(RecordedSidecar {
-        runtime: OciRuntime::new(parsed.prefix),
-        id: parsed.id,
-    })
+    Ok(parsed)
 }
 
 fn read_sidecar_record(container: &str) -> Result<SidecarRecord> {
@@ -570,7 +683,7 @@ fn read_sidecar_record(container: &str) -> Result<SidecarRecord> {
 }
 
 fn valid_sidecar_record_metadata(record: &SidecarRecord) -> bool {
-    match (&record.worktree, record.generation, &record.placement) {
+    let bound = match (&record.worktree, record.generation, &record.placement) {
         (None, None, None) => true,
         (Some(worktree), Some(generation), Some(placement)) => {
             !worktree.is_empty()
@@ -578,7 +691,13 @@ fn valid_sidecar_record_metadata(record: &SidecarRecord) -> bool {
                 && (placement == "local" || !placement.trim().is_empty())
         }
         _ => false,
-    }
+    };
+    bound && valid_pending_teardown(&record.pending_teardown)
+}
+
+/// Strictly ascending (so sorted and duplicate-free) and within the cap.
+fn valid_pending_teardown(pending: &[u16]) -> bool {
+    pending.len() <= MAX_PENDING_TEARDOWN && pending.windows(2).all(|pair| pair[0] < pair[1])
 }
 
 fn validate_sidecar_record_context(
