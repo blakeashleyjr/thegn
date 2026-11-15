@@ -17,6 +17,9 @@ pub struct BranchMeta {
     pub dirty_files: Option<u32>,
     pub last_commit_unix: Option<i64>,
     pub last_subject: Option<String>,
+    /// Sanitised author name from the last commit, when available.
+    #[serde(default)]
+    pub last_author: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -25,6 +28,7 @@ struct CommitMeta {
     behind_base: Option<u32>,
     last_commit_unix: Option<i64>,
     last_subject: Option<String>,
+    last_author: Option<String>,
 }
 
 impl CommitMeta {
@@ -35,6 +39,7 @@ impl CommitMeta {
             dirty_files,
             last_commit_unix: self.last_commit_unix,
             last_subject: self.last_subject,
+            last_author: self.last_author,
         }
     }
 }
@@ -69,7 +74,7 @@ fn memoized(
     Ok(meta)
 }
 
-fn sanitized_subject(message: &[u8]) -> String {
+fn sanitized_text(message: &[u8], cap: usize) -> String {
     let first_line = message
         .split(|byte| *byte == b'\n')
         .next()
@@ -79,7 +84,7 @@ fn sanitized_subject(message: &[u8]) -> String {
         if character.is_control() {
             continue;
         }
-        if subject.len() + character.len_utf8() > 200 {
+        if subject.len() + character.len_utf8() > cap {
             break;
         }
         subject.push(character);
@@ -87,16 +92,31 @@ fn sanitized_subject(message: &[u8]) -> String {
     subject
 }
 
-pub(crate) fn parse_log_record(output: &[u8]) -> Result<(i64, String)> {
-    let (timestamp, subject) = output
+fn sanitized_subject(message: &[u8]) -> String {
+    sanitized_text(message, 200)
+}
+
+fn sanitized_author(message: &[u8]) -> String {
+    sanitized_text(message, 64)
+}
+
+pub(crate) fn parse_log_record(output: &[u8]) -> Result<(i64, String, String)> {
+    let (timestamp, rest) = output
         .split_once(|byte| *byte == b'\0')
         .context("git log metadata missing NUL separator")?;
+    let (author, subject) = rest
+        .split_once(|byte| *byte == b'\0')
+        .context("git log metadata missing author separator")?;
     let timestamp = std::str::from_utf8(timestamp)
         .context("git log metadata timestamp is not UTF-8")?
         .trim()
         .parse::<i64>()
         .context("git log metadata timestamp is not an integer")?;
-    Ok((timestamp, sanitized_subject(subject)))
+    Ok((
+        timestamp,
+        sanitized_author(author),
+        sanitized_subject(subject),
+    ))
 }
 
 pub(crate) fn parse_ahead_behind(output: &str, cap: u32) -> Option<(u32, u32)> {
@@ -121,7 +141,7 @@ pub(crate) fn dirty_count(status_len: usize, cap: u32) -> Option<u32> {
 
 pub(crate) fn from_parts(
     ahead_behind: Option<(u32, u32)>,
-    log: (i64, String),
+    log: (i64, String, String),
     dirty_files: Option<u32>,
 ) -> BranchMeta {
     BranchMeta {
@@ -129,7 +149,8 @@ pub(crate) fn from_parts(
         behind_base: ahead_behind.map(|(_, behind)| behind),
         dirty_files,
         last_commit_unix: Some(log.0),
-        last_subject: Some(log.1),
+        last_author: Some(log.1),
+        last_subject: Some(log.2),
     }
 }
 
@@ -175,10 +196,12 @@ pub(crate) fn gix(loc: &GitLoc, base: Option<&str>) -> Result<BranchMeta> {
             .committer()
             .context("gix commit committer")?
             .seconds();
+        let author = commit.author().context("gix commit author")?;
         Ok(CommitMeta {
             ahead_base,
             behind_base,
             last_commit_unix: Some(last_commit_unix),
+            last_author: Some(sanitized_author(author.name.as_ref())),
             last_subject: Some(sanitized_subject(commit.message_raw_sloppy())),
         })
     })?;
@@ -246,14 +269,16 @@ pub(crate) fn cli(loc: &GitLoc, base: Option<&str>, detached: bool) -> Result<Br
         } else {
             None
         };
-        let (exit, output) = super::run_status(loc, &["log", "-1", "--format=%ct%x00%s", "HEAD"])?;
+        let (exit, output) =
+            super::run_status(loc, &["log", "-1", "--format=%ct%x00%an%x00%s", "HEAD"])?;
         anyhow::ensure!(exit == 0, "git log for branch metadata failed");
         let log = parse_log_record(output.as_bytes())?;
         Ok(CommitMeta {
             ahead_base: ahead_behind.map(|(ahead, _)| ahead),
             behind_base: ahead_behind.map(|(_, behind)| behind),
             last_commit_unix: Some(log.0),
-            last_subject: Some(log.1),
+            last_author: Some(log.1),
+            last_subject: Some(log.2),
         })
     })?;
     Ok(commit_meta.with_dirty(None))
@@ -283,19 +308,35 @@ mod tests {
     #[test]
     fn last_commit_subject_and_time_are_first_line_sanitised() {
         assert_eq!(
-            parse_log_record(b"1700000000\0first\x01 line\nsecond\n").unwrap(),
-            (1_700_000_000, "first line".to_string())
+            parse_log_record(b"1700000000\0Ada\x01 Lovelace\0first\x01 line\nsecond\n").unwrap(),
+            (
+                1_700_000_000,
+                "Ada Lovelace".to_string(),
+                "first line".to_string()
+            )
         );
-        assert_eq!(parse_log_record(b"1700000000\0\n").unwrap().1, "");
+        assert_eq!(
+            parse_log_record(b"1700000000\0\0\n").unwrap(),
+            (1_700_000_000, "".to_string(), "".to_string())
+        );
     }
 
     #[test]
     fn bridged_batch_parsers() {
         assert_eq!(parse_ahead_behind("2\t5", META_COUNT_CAP), Some((5, 2)));
         assert_eq!(
-            parse_log_record(b"42\0subject\x1f\n").unwrap(),
-            (42, "subject".to_string())
+            parse_log_record(b"42\0author\0subject\x1f\n").unwrap(),
+            (42, "author".to_string(), "subject".to_string())
         );
+    }
+
+    #[test]
+    fn author_is_control_free_and_capped_in_the_pure_parser() {
+        let author = format!("{}\x01tail", "a".repeat(64));
+        let output = format!("42\0{author}\0subject");
+        let parsed = parse_log_record(output.as_bytes()).unwrap();
+        assert_eq!(parsed.1, "a".repeat(64));
+        assert!(!parsed.1.chars().any(char::is_control));
     }
 
     #[test]
