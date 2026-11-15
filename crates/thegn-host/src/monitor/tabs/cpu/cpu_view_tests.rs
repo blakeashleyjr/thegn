@@ -944,7 +944,7 @@ fn frequency_row_tag_overflow_is_clipped_without_panic() {
 
 #[test]
 fn frequency_profile_line_appends_hybrid_counts_only_for_mixed_parts() {
-    let first = |classes: &[CoreClass], cols: usize| freq_lines(classes, cols, 14).remove(0);
+    let first = |classes: &[CoreClass], cols: usize| freq_lines(classes, cols, 14).remove(1);
     let mixed = first(
         &[
             CoreClass::Performance,
