@@ -1075,6 +1075,7 @@ mod tests {
     use super::*;
     use std::path::{Path, PathBuf};
     use thegn_core::config::OnLanded;
+    use thegn_core::store::NotificationStore;
     use thegn_core::util;
 
     #[test]
