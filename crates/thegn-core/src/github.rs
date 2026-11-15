@@ -337,9 +337,18 @@ pub fn pr_status_for(loc: &GitLoc, number: u64) -> PrPanel {
 }
 
 fn pr_status_of(loc: &GitLoc, number: Option<u64>) -> PrPanel {
-    let branch = loc
-        .git_out(&["rev-parse", "--abbrev-ref", "HEAD"])
-        .unwrap_or_default();
+    let branch = match loc.git_text(&["rev-parse", "--abbrev-ref", "HEAD"]) {
+        Ok(branch) => branch,
+        Err(error) => {
+            tracing::debug!(
+                target: "thegn::github",
+                path = %loc.path(),
+                %error,
+                "could not read branch for pull-request panel"
+            );
+            String::new()
+        }
+    };
     PrPanel::from_result(pr_status_raw(loc, number), loc.path(), branch)
 }
 
