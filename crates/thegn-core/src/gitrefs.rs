@@ -39,7 +39,6 @@ pub fn parse_commits(out: &str) -> anyhow::Result<Vec<Commit>> {
     if fields.last() == Some(&"") {
         fields.pop();
     }
-    anyhow::ensure!(!fields.is_empty(), "empty commit record terminator");
     anyhow::ensure!(
         fields.len().is_multiple_of(8),
         "malformed commit record field count"
@@ -58,9 +57,8 @@ pub fn parse_commits(out: &str) -> anyhow::Result<Vec<Commit>> {
                 && sha.starts_with(short),
             "malformed abbreviated commit object id"
         );
-        let date = row[4]
-            .parse::<i64>()
-            .map_err(|_| anyhow::anyhow!("malformed commit timestamp"))?;
+        let date = parse_epoch_seconds(row[4])
+            .ok_or_else(|| anyhow::anyhow!("malformed commit timestamp"))?;
         let parents = row[5]
             .split_whitespace()
             .map(str::to_owned)
@@ -81,6 +79,16 @@ pub fn parse_commits(out: &str) -> anyhow::Result<Vec<Commit>> {
         });
     }
     Ok(commits)
+}
+
+/// Parse a numeric `%ct` / `%(committerdate:unix)` field. Git emits plain
+/// decimal digits; a sign (`+100`, `-5`) or any other byte is corruption, which
+/// `i64::from_str` alone would accept. Mirrors the reflog timestamp check.
+fn parse_epoch_seconds(field: &str) -> Option<i64> {
+    if field.is_empty() || !field.bytes().all(|byte| byte.is_ascii_digit()) {
+        return None;
+    }
+    field.parse().ok()
 }
 
 fn valid_oid(oid: &str) -> bool {
@@ -190,11 +198,8 @@ pub fn parse_branches(out: &str) -> anyhow::Result<Vec<BranchInfo>> {
                 "malformed branch object id on row {}",
                 line_no + 1
             );
-            let date = it
-                .next()
-                .ok_or_else(malformed)?
-                .parse()
-                .map_err(|_| malformed())?;
+            let date =
+                parse_epoch_seconds(it.next().ok_or_else(malformed)?).ok_or_else(malformed)?;
             let subject = it.next().ok_or_else(malformed)?.to_string();
             Ok(BranchInfo {
                 name,
@@ -240,7 +245,6 @@ pub fn parse_stashes(out: &str) -> anyhow::Result<Vec<StashEntry>> {
     if fields.last() == Some(&"") {
         fields.pop();
     }
-    anyhow::ensure!(!fields.is_empty(), "empty stash record terminator");
     anyhow::ensure!(
         fields.len().is_multiple_of(4),
         "malformed stash record field count"
@@ -269,7 +273,7 @@ pub fn parse_stashes(out: &str) -> anyhow::Result<Vec<StashEntry>> {
                 "malformed stash object id on row {}",
                 line_no + 1
             );
-            let date = row[2].parse().map_err(|_| malformed())?;
+            let date = parse_epoch_seconds(row[2]).ok_or_else(malformed)?;
             let message = row[3].to_string();
             Ok(StashEntry {
                 index,
@@ -313,11 +317,6 @@ pub fn parse_tags(out: &str) -> anyhow::Result<Vec<TagInfo>> {
             let name = it.next().ok_or_else(malformed)?.to_string();
             let sha = it.next().ok_or_else(malformed)?.to_string();
             let kind = it.next().ok_or_else(malformed)?;
-            anyhow::ensure!(
-                it.next().is_none(),
-                "extra tag fields on row {}",
-                line_no + 1
-            );
             anyhow::ensure!(
                 !name.is_empty() && !sha.is_empty(),
                 "empty tag field on row {}",
@@ -1070,5 +1069,706 @@ mod tests {
     fn terminated_empty_chunk_only_input_still_reports_empty_record() {
         assert!(parse_commits("\0").is_err());
         assert!(parse_stashes("\0").is_err());
+    }
+
+    // --- truncation / mutation / shape tables (THE-383) ---
+
+    /// Subject holding tab, newline, a non-ASCII char and an embedded `\r`.
+    const HOSTILE: &str = "tab\there\nnew line \u{e9}\rcr";
+    /// Same, minus the newline (line-oriented parsers cannot carry one).
+    const LINE_HOSTILE: &str = "tab\there \u{e9}\rcr";
+
+    fn oid(n: usize) -> String {
+        format!("{n:040x}")
+    }
+
+    /// Cumulative byte offsets of every record boundary, starting at 0.
+    fn boundaries(records: &[String]) -> Vec<usize> {
+        let mut out = vec![0usize];
+        let mut total = 0usize;
+        for record in records {
+            total += record.len();
+            out.push(total);
+        }
+        out
+    }
+
+    /// Cut `input` at every char boundary: `Ok` only on a record boundary
+    /// (with the whole-record count), `Err` everywhere else.
+    fn assert_truncation_table<T>(
+        input: &str,
+        bounds: &[usize],
+        parse: impl Fn(&str) -> anyhow::Result<Vec<T>>,
+    ) {
+        for cut in 0..=input.len() {
+            if !input.is_char_boundary(cut) {
+                continue;
+            }
+            match (bounds.iter().position(|b| *b == cut), parse(&input[..cut])) {
+                (Some(records), Ok(rows)) => assert_eq!(rows.len(), records, "cut {cut}"),
+                (Some(_), Err(error)) => {
+                    panic!("cut {cut} on a record boundary must parse: {error}")
+                }
+                (None, Ok(rows)) => {
+                    panic!(
+                        "cut {cut} mid-record must be rejected, got {} rows",
+                        rows.len()
+                    )
+                }
+                (None, Err(_)) => {}
+            }
+        }
+    }
+
+    fn assert_rejects<T>(
+        table: &[(&str, String, &str)],
+        parse: impl Fn(&str) -> anyhow::Result<Vec<T>>,
+    ) {
+        for (label, input, expect) in table {
+            match parse(input) {
+                Ok(rows) => panic!(
+                    "{label}: expected error containing {expect:?}, parsed {} rows",
+                    rows.len()
+                ),
+                Err(error) => assert!(error.to_string().contains(expect), "{label}: {error}"),
+            }
+        }
+    }
+
+    fn commit_fields(n: usize, subject: &str) -> Vec<String> {
+        let sha = oid(n);
+        let parent = if n == 0 { String::new() } else { oid(n - 1) };
+        vec![
+            sha.clone(),
+            sha[..7].to_string(),
+            "Ann \u{d6}".to_string(),
+            "a@e".to_string(),
+            format!("{}", 100 + n),
+            parent,
+            "HEAD -> main".to_string(),
+            subject.to_string(),
+        ]
+    }
+
+    fn nul_record(fields: &[String]) -> String {
+        let mut out = fields.join("\0");
+        out.push('\0');
+        out
+    }
+
+    fn commit_records(count: usize) -> Vec<String> {
+        let mut records = Vec::new();
+        for n in 0..count {
+            records.push(nul_record(&commit_fields(n, HOSTILE)));
+        }
+        records
+    }
+
+    fn commit_with(index: usize, value: &str) -> String {
+        let mut fields = commit_fields(1, "subject");
+        fields[index] = value.to_string();
+        nul_record(&fields)
+    }
+
+    fn stash_fields(n: usize) -> Vec<String> {
+        vec![
+            format!("stash@{{{n}}}"),
+            oid(n + 1),
+            format!("{}", 200 + n),
+            format!("WIP on main: {HOSTILE}"),
+        ]
+    }
+
+    fn stash_records(count: usize) -> Vec<String> {
+        let mut records = Vec::new();
+        for n in 0..count {
+            records.push(nul_record(&stash_fields(n)));
+        }
+        records
+    }
+
+    fn table_branch_row(n: usize) -> String {
+        let (head, upstream, track) = match n % 3 {
+            0 => ("*", "origin/main", "[ahead 1, behind 2]"),
+            1 => (" ", "", ""),
+            _ => (" ", "origin/gone", "[gone]"),
+        };
+        format!(
+            "{head}{US}feat/\u{e9}-{n}{US}{upstream}{US}{track}{US}{}{US}{}{US}{LINE_HOSTILE}\n",
+            oid(n + 1),
+            300 + n
+        )
+    }
+
+    fn branch_rows(count: usize) -> Vec<String> {
+        let mut rows = Vec::new();
+        for n in 0..count {
+            rows.push(table_branch_row(n));
+        }
+        rows
+    }
+
+    fn tag_row(n: usize) -> String {
+        let kind = if n.is_multiple_of(2) { "tag" } else { "commit" };
+        format!("rel/\u{e9}-{n}{US}{}{US}{kind}\n", oid(n + 1))
+    }
+
+    fn tag_rows(count: usize) -> Vec<String> {
+        let mut rows = Vec::new();
+        for n in 0..count {
+            rows.push(tag_row(n));
+        }
+        rows
+    }
+
+    fn bisect_head() -> String {
+        "f".repeat(40)
+    }
+
+    /// Row count of a parsed bisect state: bad mark + good + skip refs.
+    fn bisect_rows(refs: &str) -> anyhow::Result<Vec<()>> {
+        let state = parse_bisect(refs, None, &bisect_head())?;
+        let count = usize::from(state.bad.is_some()) + state.good.len() + state.skipped.len();
+        Ok(vec![(); count])
+    }
+
+    fn bisect_row_list(count: usize) -> Vec<String> {
+        let mut rows = vec![format!("bad{US}{}\n", oid(1))];
+        for n in 0..count.saturating_sub(1) {
+            if n.is_multiple_of(2) {
+                rows.push(format!("good-{}{US}{}\n", oid(n + 10), oid(n + 10)));
+            } else {
+                rows.push(format!("skip-{}{US}{}\n", oid(n + 10), oid(n + 10)));
+            }
+        }
+        rows.truncate(count);
+        rows
+    }
+
+    #[test]
+    fn commits_truncation_table_every_byte_offset() {
+        let records = commit_records(4);
+        let input: String = records.concat();
+        assert_truncation_table(&input, &boundaries(&records), parse_commits);
+    }
+
+    #[test]
+    fn commits_hostile_subject_round_trips() {
+        let records = commit_records(2);
+        let parsed = parse_commits(&records.concat()).unwrap();
+        assert_eq!(parsed.len(), 2);
+        assert_eq!(parsed[1].subject, HOSTILE);
+        assert_eq!(parsed[1].author, "Ann \u{d6}");
+        assert_eq!(parsed[1].parents, vec![oid(0)]);
+    }
+
+    #[test]
+    fn commits_mutation_table() {
+        let good = commit_with(7, "subject");
+        let dup = format!("{good}{good}");
+        let mut nine = commit_fields(1, "subject");
+        nine.push("extra".to_string());
+        let mut missing = commit_fields(1, "subject");
+        missing.remove(6);
+        let doubled = good.replacen('\0', "\0\0", 1);
+        let table = vec![
+            (
+                "non-hex oid",
+                commit_with(0, &"z".repeat(40)),
+                "malformed commit object id",
+            ),
+            (
+                "39-char oid",
+                commit_with(0, &"a".repeat(39)),
+                "malformed commit object id",
+            ),
+            (
+                "41-char oid",
+                commit_with(0, &"a".repeat(41)),
+                "malformed commit object id",
+            ),
+            (
+                "empty oid",
+                commit_with(0, ""),
+                "malformed commit object id",
+            ),
+            (
+                "non-hex short",
+                commit_with(1, "zzzzzzz"),
+                "malformed abbreviated",
+            ),
+            ("empty short", commit_with(1, ""), "malformed abbreviated"),
+            (
+                "short not a prefix",
+                commit_with(1, "1234567"),
+                "malformed abbreviated",
+            ),
+            (
+                "letters in date",
+                commit_with(4, "12ab"),
+                "malformed commit timestamp",
+            ),
+            (
+                "empty date",
+                commit_with(4, ""),
+                "malformed commit timestamp",
+            ),
+            (
+                "fractional date",
+                commit_with(4, "1.5"),
+                "malformed commit timestamp",
+            ),
+            (
+                "overflow date",
+                commit_with(4, "99999999999999999999"),
+                "malformed commit timestamp",
+            ),
+            (
+                "non-hex parent",
+                commit_with(5, &"z".repeat(40)),
+                "malformed parent object id",
+            ),
+            (
+                "short parent",
+                commit_with(5, "abc"),
+                "malformed parent object id",
+            ),
+            ("duplicate record", dup, "duplicate commit object id"),
+            ("extra trailing NUL", format!("{good}\0"), "field count"),
+            ("doubled NUL", doubled, "field count"),
+            ("missing field", nul_record(&missing), "field count"),
+            ("extra field", nul_record(&nine), "field count"),
+            (
+                "no final NUL",
+                good.trim_end_matches('\0').to_string(),
+                "final NUL",
+            ),
+            ("lone NUL", "\0".to_string(), "malformed commit record"),
+        ];
+        assert_rejects(&table, parse_commits);
+    }
+
+    #[test]
+    fn commits_signed_timestamp_is_rejected() {
+        // `%ct` is plain decimal digits; a sign is corruption, as in reflog.
+        let table = [
+            (
+                "plus sign",
+                commit_with(4, "+100"),
+                "malformed commit timestamp",
+            ),
+            (
+                "minus sign",
+                commit_with(4, "-5"),
+                "malformed commit timestamp",
+            ),
+        ];
+        assert_rejects(&table, parse_commits);
+    }
+
+    #[test]
+    fn commits_minimal_and_thousand_record_inputs() {
+        let one = commit_records(1);
+        assert_eq!(parse_commits(&one.concat()).unwrap().len(), 1);
+        let records = commit_records(1000);
+        let parsed = parse_commits(&records.concat()).unwrap();
+        assert_eq!(parsed.len(), 1000);
+        assert_eq!(parsed[999].sha, oid(999));
+    }
+
+    #[test]
+    fn commits_five_thousand_records_parse() {
+        let records = commit_records(5000);
+        assert_eq!(parse_commits(&records.concat()).unwrap().len(), 5000);
+    }
+
+    #[test]
+    fn stashes_truncation_table_every_byte_offset() {
+        let records = stash_records(4);
+        let input: String = records.concat();
+        assert_truncation_table(&input, &boundaries(&records), parse_stashes);
+    }
+
+    #[test]
+    fn stashes_mutation_table() {
+        let with = |index: usize, value: &str| {
+            let mut fields = stash_fields(1);
+            fields[index] = value.to_string();
+            nul_record(&fields)
+        };
+        let good = nul_record(&stash_fields(1));
+        let mut missing = stash_fields(1);
+        missing.remove(2);
+        let table = vec![
+            ("empty selector", with(0, ""), "malformed stash row 1"),
+            (
+                "non-numeric selector",
+                with(0, "stash@{x}"),
+                "malformed stash row 1",
+            ),
+            (
+                "negative selector",
+                with(0, "stash@{-1}"),
+                "malformed stash row 1",
+            ),
+            ("bare selector", with(0, "stash"), "malformed stash row 1"),
+            (
+                "non-hex oid",
+                with(1, &"z".repeat(40)),
+                "malformed stash object id",
+            ),
+            (
+                "short oid",
+                with(1, &"a".repeat(39)),
+                "malformed stash object id",
+            ),
+            ("letters in date", with(2, "12ab"), "malformed stash row 1"),
+            ("empty date", with(2, ""), "malformed stash row 1"),
+            ("plus-signed date", with(2, "+100"), "malformed stash row 1"),
+            ("minus-signed date", with(2, "-5"), "malformed stash row 1"),
+            (
+                "duplicate selector",
+                format!("{good}{good}"),
+                "duplicate stash selector",
+            ),
+            ("extra trailing NUL", format!("{good}\0"), "field count"),
+            ("doubled NUL", good.replacen('\0', "\0\0", 1), "field count"),
+            ("missing field", nul_record(&missing), "field count"),
+            (
+                "no final NUL",
+                good.trim_end_matches('\0').to_string(),
+                "final NUL",
+            ),
+        ];
+        assert_rejects(&table, parse_stashes);
+    }
+
+    #[test]
+    fn stashes_duplicate_sha_with_distinct_selectors_is_legal() {
+        let mut second = stash_fields(1);
+        second[1] = oid(1);
+        let input = format!("{}{}", nul_record(&stash_fields(0)), nul_record(&second));
+        let parsed = parse_stashes(&input).unwrap();
+        assert_eq!(parsed.len(), 2);
+        assert_eq!(parsed[0].sha, parsed[1].sha);
+        assert_eq!(parsed[0].message, format!("WIP on main: {HOSTILE}"));
+    }
+
+    #[test]
+    fn stashes_minimal_thousand_and_five_thousand() {
+        assert_eq!(parse_stashes(&stash_records(1).concat()).unwrap().len(), 1);
+        assert_eq!(
+            parse_stashes(&stash_records(1000).concat()).unwrap().len(),
+            1000
+        );
+        let parsed = parse_stashes(&stash_records(5000).concat()).unwrap();
+        assert_eq!(parsed.len(), 5000);
+        assert_eq!(parsed[4999].index, 4999);
+    }
+
+    #[test]
+    fn branches_truncation_table_every_byte_offset() {
+        let rows = branch_rows(4);
+        let input: String = rows.concat();
+        assert_truncation_table(&input, &boundaries(&rows), parse_branches);
+    }
+
+    #[test]
+    fn branches_mutation_table() {
+        let row_with = |index: usize, value: &str| {
+            let mut fields: [String; 7] = [
+                "*".to_string(),
+                "main".to_string(),
+                "origin/main".to_string(),
+                "[ahead 1, behind 2]".to_string(),
+                oid(1),
+                "300".to_string(),
+                "subject".to_string(),
+            ];
+            fields[index] = value.to_string();
+            format!("{}\n", fields.join("\u{1f}"))
+        };
+        let good = row_with(1, "main");
+        let short = good.replacen("\u{1f}subject", "", 1);
+        let doubled = good.replacen("main\u{1f}", "main\u{1f}\u{1f}", 1);
+        let table = vec![
+            (
+                "bad head marker",
+                row_with(0, "x"),
+                "malformed branch marker on row 1",
+            ),
+            ("empty name", row_with(1, ""), "empty branch name on row 1"),
+            (
+                "bad track",
+                row_with(3, "[ahead x]"),
+                "invalid upstream tracking count",
+            ),
+            (
+                "unbracketed track",
+                row_with(3, "ahead 1"),
+                "malformed upstream tracking field",
+            ),
+            (
+                "empty bracket",
+                row_with(3, "[]"),
+                "empty upstream tracking",
+            ),
+            (
+                "non-hex oid",
+                row_with(4, &"z".repeat(40)),
+                "malformed branch object id",
+            ),
+            (
+                "short oid",
+                row_with(4, &"a".repeat(39)),
+                "malformed branch object id",
+            ),
+            ("empty oid", row_with(4, ""), "malformed branch object id"),
+            (
+                "letters in date",
+                row_with(5, "12ab"),
+                "malformed branch row 1",
+            ),
+            ("empty date", row_with(5, ""), "malformed branch row 1"),
+            ("missing field", short, "malformed branch row 1"),
+            (
+                "doubled separator",
+                doubled,
+                "malformed upstream tracking field",
+            ),
+            (
+                "duplicate name",
+                format!("{good}{good}"),
+                "duplicate branch name on row 2",
+            ),
+            (
+                "extra blank line",
+                format!("{good}\n"),
+                "malformed branch marker on row 2",
+            ),
+            (
+                "no final newline",
+                good.trim_end_matches('\n').to_string(),
+                "final newline",
+            ),
+        ];
+        assert_rejects(&table, parse_branches);
+    }
+
+    #[test]
+    fn branches_signed_date_is_rejected_and_extra_separator_fields_are_accepted() {
+        let row = |date: &str| format!("*{US}main{US}{US}{US}{}{US}{date}{US}a{US}b\n", oid(1));
+        let table = [
+            ("plus-signed date", row("+5"), "malformed branch row 1"),
+            ("minus-signed date", row("-5"), "malformed branch row 1"),
+        ];
+        assert_rejects(&table, parse_branches);
+        let parsed = parse_branches(&row("5")).unwrap();
+        assert_eq!(parsed[0].date, 5);
+        assert_eq!(parsed[0].subject, format!("a{US}b"));
+    }
+
+    #[test]
+    fn branches_minimal_thousand_and_five_thousand() {
+        assert_eq!(parse_branches(&branch_rows(1).concat()).unwrap().len(), 1);
+        assert_eq!(
+            parse_branches(&branch_rows(1000).concat()).unwrap().len(),
+            1000
+        );
+        let parsed = parse_branches(&branch_rows(5000).concat()).unwrap();
+        assert_eq!(parsed.len(), 5000);
+        assert_eq!(parsed[4999].subject, LINE_HOSTILE);
+    }
+
+    #[test]
+    fn tags_truncation_table_every_byte_offset() {
+        let rows = tag_rows(4);
+        let input: String = rows.concat();
+        assert_truncation_table(&input, &boundaries(&rows), parse_tags);
+    }
+
+    #[test]
+    fn tags_mutation_table() {
+        let row_with = |index: usize, value: &str| {
+            let mut fields = ["v1".to_string(), oid(1), "tag".to_string()];
+            fields[index] = value.to_string();
+            format!("{}\n", fields.join("\u{1f}"))
+        };
+        let good = row_with(0, "v1");
+        let table = vec![
+            ("empty name", row_with(0, ""), "empty tag field on row 1"),
+            ("empty oid", row_with(1, ""), "empty tag field on row 1"),
+            (
+                "non-hex oid",
+                row_with(1, &"z".repeat(40)),
+                "malformed tag object id",
+            ),
+            (
+                "short oid",
+                row_with(1, &"a".repeat(39)),
+                "malformed tag object id",
+            ),
+            (
+                "unknown type",
+                row_with(2, "banana"),
+                "unknown tag object type",
+            ),
+            ("empty type", row_with(2, ""), "unknown tag object type"),
+            (
+                "extra field",
+                format!("v1{US}{}{US}tag{US}x\n", oid(1)),
+                "unknown tag object type",
+            ),
+            (
+                "missing field",
+                format!("v1{US}{}\n", oid(1)),
+                "malformed tag row 1",
+            ),
+            (
+                "duplicate name",
+                format!("{good}{good}"),
+                "duplicate tag name on row 2",
+            ),
+            (
+                "extra blank line",
+                format!("{good}\n"),
+                "malformed tag row 2",
+            ),
+            (
+                "no final newline",
+                good.trim_end_matches('\n').to_string(),
+                "final newline",
+            ),
+        ];
+        assert_rejects(&table, parse_tags);
+    }
+
+    #[test]
+    fn tags_minimal_thousand_and_five_thousand() {
+        assert_eq!(parse_tags(&tag_rows(1).concat()).unwrap().len(), 1);
+        assert_eq!(parse_tags(&tag_rows(1000).concat()).unwrap().len(), 1000);
+        let parsed = parse_tags(&tag_rows(5000).concat()).unwrap();
+        assert_eq!(parsed.len(), 5000);
+        assert!(parsed[0].annotated && !parsed[1].annotated);
+    }
+
+    #[test]
+    fn bisect_truncation_table_every_byte_offset() {
+        let rows = bisect_row_list(5);
+        let input: String = rows.concat();
+        assert_truncation_table(&input, &boundaries(&rows), bisect_rows);
+    }
+
+    #[test]
+    fn bisect_mutation_table() {
+        let head = bisect_head();
+        let bad = format!("bad{US}{}\n", oid(1));
+        let refs_table = vec![
+            (
+                "no final newline",
+                bad.trim_end_matches('\n').to_string(),
+                "final newline",
+            ),
+            (
+                "no separator",
+                "bad\n".to_string(),
+                "malformed bisect ref row 1",
+            ),
+            (
+                "empty name",
+                format!("{US}{}\n", oid(1)),
+                "malformed bisect ref row 1",
+            ),
+            (
+                "non-hex oid",
+                format!("bad{US}{}\n", "z".repeat(40)),
+                "malformed bisect ref row 1",
+            ),
+            (
+                "short oid",
+                format!("bad{US}{}\n", "a".repeat(39)),
+                "malformed bisect ref row 1",
+            ),
+            (
+                "empty oid",
+                format!("bad{US}\n"),
+                "malformed bisect ref row 1",
+            ),
+            (
+                "extra separator",
+                format!("bad{US}{}{US}x\n", oid(1)),
+                "malformed bisect ref row 1",
+            ),
+            (
+                "duplicate bad",
+                format!("{bad}{bad}"),
+                "duplicate bisect bad mark on row 2",
+            ),
+            (
+                "unknown ref",
+                format!("other{US}{}\n", oid(1)),
+                "unknown bisect ref on row 1",
+            ),
+            (
+                "extra blank line",
+                format!("{bad}\n"),
+                "malformed bisect ref row 2",
+            ),
+        ];
+        for (label, input, expect) in &refs_table {
+            let error = parse_bisect(input, None, &head).expect_err(label);
+            assert!(error.to_string().contains(expect), "{label}: {error}");
+        }
+        let head_and_terms = [
+            (
+                "bad head",
+                parse_bisect("", None, &"z".repeat(40)),
+                "malformed bisect HEAD",
+            ),
+            (
+                "short head",
+                parse_bisect("", None, "abc"),
+                "malformed bisect HEAD",
+            ),
+            (
+                "one-line terms",
+                parse_bisect("", Some("bad\n"), &head),
+                "malformed BISECT_TERMS",
+            ),
+            (
+                "three-line terms",
+                parse_bisect("", Some("a\nb\nc\n"), &head),
+                "malformed BISECT_TERMS",
+            ),
+            (
+                "blank term",
+                parse_bisect("", Some("bad\n\n"), &head),
+                "malformed BISECT_TERMS",
+            ),
+        ];
+        for (label, result, expect) in head_and_terms {
+            let error = result.expect_err(label);
+            assert!(error.to_string().contains(expect), "{label}: {error}");
+        }
+    }
+
+    #[test]
+    fn bisect_duplicate_good_marks_are_legal() {
+        let row = format!("good-{}{US}{}\n", oid(5), oid(5));
+        let state = parse_bisect(&format!("{row}{row}"), None, &bisect_head()).unwrap();
+        assert_eq!(state.good, vec![oid(5), oid(5)]);
+    }
+
+    #[test]
+    fn bisect_minimal_thousand_and_five_thousand() {
+        assert_eq!(bisect_rows(&bisect_row_list(1).concat()).unwrap().len(), 1);
+        assert_eq!(
+            bisect_rows(&bisect_row_list(1000).concat()).unwrap().len(),
+            1000
+        );
+        assert_eq!(
+            bisect_rows(&bisect_row_list(5000).concat()).unwrap().len(),
+            5000
+        );
     }
 }
