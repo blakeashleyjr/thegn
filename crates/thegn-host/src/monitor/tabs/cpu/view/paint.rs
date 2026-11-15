@@ -955,7 +955,7 @@ pub(super) fn paint_freq(grid: &mut CellGrid, rect: Rect, part: &CpuFreqPart, he
     let mut profile_line = format!("profile {profile}");
     let (perf, eff) = part.core_class_counts();
     if perf > 0 && eff > 0 {
-        profile_line.push_str(&format!(" hybrid {perf}P/{eff}E"));
+        write!(profile_line, " hybrid {perf}P/{eff}E").expect("write to String");
     }
     body.put_str(0, 0, &profile_line, CellStyle::default());
     let count = part.policies.len().min(area.rows.saturating_sub(1) / 2);
