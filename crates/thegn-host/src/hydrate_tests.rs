@@ -179,6 +179,7 @@ fn glyph_row(
             )
         }),
         submodule_dirty: false,
+        meta: thegn_svc::git::BranchMeta::default(),
     }
 }
 
@@ -443,6 +444,7 @@ fn patching_cached_glyph_counts_preserves_the_scan_age() {
                     del: thegn_svc::git::DiffCount::Exact(2),
                     branch_diff: None,
                     submodule_dirty: false,
+                    meta: thegn_svc::git::BranchMeta::default(),
                 },
                 scanned_at,
             ),
@@ -495,6 +497,7 @@ fn patching_a_newer_glyph_scan_evicts_without_changing_its_counts() {
                     del: thegn_svc::git::DiffCount::Exact(2),
                     branch_diff: None,
                     submodule_dirty: false,
+                    meta: thegn_svc::git::BranchMeta::default(),
                 },
                 scanned_at,
             ),
@@ -539,6 +542,7 @@ fn patching_a_different_branch_is_rejected_without_changing_counts() {
                     del: thegn_svc::git::DiffCount::Exact(2),
                     branch_diff: None,
                     submodule_dirty: false,
+                    meta: thegn_svc::git::BranchMeta::default(),
                 },
                 scanned_at,
             ),
@@ -614,6 +618,7 @@ fn glyph_scan_clean_read_updates() {
             thegn_svc::git::DiffCount::Exact(84),
         ))),
         Ok(false),
+        Ok(thegn_svc::git::BranchMeta::default()),
     );
     assert_eq!(
         row,
@@ -640,6 +645,7 @@ fn glyph_scan_no_upstream_is_zero_not_error() {
         )),
         Ok(None),
         Ok(false),
+        Ok(thegn_svc::git::BranchMeta::default()),
     );
     assert_eq!(
         row,
@@ -659,6 +665,7 @@ fn glyph_scan_transient_error_reuses_prior() {
         Err(()),
         Err(()),
         "/repo".into(),
+        Err(()),
         Err(()),
         Err(()),
         Err(()),
@@ -683,12 +690,62 @@ fn glyph_scan_partial_error_keeps_only_failed_field() {
         )),
         Err(()),
         Err(()),
+        Err(()),
     );
     assert_eq!(
         row,
         glyph_row(false, 4, 1, Some("feat"), "/repo", 5, 2, Some((310, 84)))
     );
     assert!(!clean);
+}
+
+#[test]
+fn merge_glyph_scan_meta_error_reuses_prior_and_stays_clean() {
+    let mut prior = glyph_row(true, 4, 1, Some("feat"), "/repo", 42, 7, Some((310, 84)));
+    prior.meta.ahead_base = Some(3);
+    let (row, clean) = merge_glyph_scan(
+        Some(&prior),
+        Ok(true),
+        Ok(Some((4, 1))),
+        Ok(Some("feat".into())),
+        "/repo".into(),
+        Ok((
+            thegn_svc::git::DiffCount::Exact(42),
+            thegn_svc::git::DiffCount::Exact(7),
+        )),
+        Ok(Some((
+            thegn_svc::git::DiffCount::Exact(310),
+            thegn_svc::git::DiffCount::Exact(84),
+        ))),
+        Ok(false),
+        Err(()),
+    );
+    assert_eq!(row.meta, prior.meta);
+    assert!(clean);
+}
+
+#[test]
+fn reused_glyph_row_carries_meta_into_status() {
+    let mut prior = glyph_row(true, 4, 1, Some("feat"), "/repo", 42, 7, Some((310, 84)));
+    prior.meta = thegn_svc::git::BranchMeta {
+        ahead_base: Some(3),
+        behind_base: Some(1),
+        dirty_files: Some(2),
+        last_commit_unix: Some(42),
+        last_subject: Some("subject".into()),
+    };
+    let (row, _clean) = merge_glyph_scan(
+        Some(&prior),
+        Err(()),
+        Err(()),
+        Err(()),
+        "/repo".into(),
+        Err(()),
+        Err(()),
+        Err(()),
+        Err(()),
+    );
+    assert_eq!(row.meta, prior.meta);
 }
 
 #[test]
@@ -701,6 +758,7 @@ fn glyph_scan_error_without_prior_marks_counts_unavailable() {
         Err(()),
         Err(()),
         "/repo".into(),
+        Err(()),
         Err(()),
         Err(()),
         Err(()),
@@ -2809,6 +2867,7 @@ fn glyph_scan_preserves_binary_diff_counts() {
             thegn_svc::git::DiffCount::Binary,
         ))),
         Ok(false),
+        Ok(thegn_svc::git::BranchMeta::default()),
     );
 
     assert!(clean);
@@ -2988,6 +3047,7 @@ fn glyph_scan_error_with_prior_keeps_typed_counts() {
         Err(()),
         Err(()),
         Ok(false),
+        Err(()),
     );
 
     assert_eq!(row.add, thegn_svc::git::DiffCount::Exact(42));
@@ -3011,6 +3071,7 @@ fn glyph_scan_branch_diff_error_preserves_prior_no_base() {
         )),
         Err(()),
         Ok(false),
+        Err(()),
     );
 
     assert_eq!(row.branch_diff, None);
