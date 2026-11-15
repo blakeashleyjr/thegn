@@ -373,11 +373,13 @@ on cache writes are the sanctioned best-effort pattern and are marked
 `test/ignored-result-ratchet.txt`.
 
 The background disk scan also prunes Cargo fingerprint generations for profiles
-measured in that round. `[disk] generation_min_age_days` defaults to 14, matching
-`idle_clean_days`; a footprint is eligible only after that age and the newest
-touched footprint for each package name is retained. Each profile's existing
-`.cargo-lock` must be acquired nonblocking and held through pruning; lock errors
-skip that profile. The host removes the fingerprint directory before its mapped
+measured in that round, plus the active/main checkout even when its size walk is
+skipped. `[disk] generation_min_age_days` defaults to 14; the two newest
+generations per (package, unit kind) are retained, and older generations are
+eligible after the smaller of that configured age and three days. This applies
+to active and dirty worktrees too. A running slot or a held `.cargo-lock` still
+skips that profile; the existing lock must be acquired nonblocking and held
+through pruning. The host removes the fingerprint directory before its mapped
 `deps/` and `incremental/` paths. Mapping covers `lib<crate>-<id>` library
 outputs plus `<crate>-<id>` dep-info/executable names and package target-name
 suffixes. If interrupted, Cargo sees a missing fingerprint and rebuilds rather

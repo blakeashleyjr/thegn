@@ -187,16 +187,24 @@ impl Role {
 /// bundle — a ring that is supposed to cost nothing while idle.
 ///
 /// `tracing-log` preserves each record's original target (`tokei::…`, for
-/// example); it does not normalize bridged records to `log`. Tokei emits a
-/// warning for every unrecognized file extension during LOC scans, so those
+/// example); it does not normalize bridged records to `log`. These libraries
+/// emit warnings for files they cannot classify during LOC scans, so those
 /// records must be filtered by their real target in both the configured sink
-/// and the always-on ring. Keep `log=error` for records explicitly targeted at
-/// `log`, and `tokei=error` for tokei's bridged records. `THEGN_LOG` replaces
-/// this baseline outright, allowing users to request those warnings.
-const BRIDGED_LOG_DIRECTIVE: &str = "log=error,tokei=error";
+/// and the always-on ring. These directives are appended last even when
+/// `THEGN_LOG` is set, so a user filter cannot re-enable the noise.
+const NOISY_LOG_DIRECTIVE: &str = "log=error,tokei=error,ignore=error,globset=error";
+
+fn noisy_log_target(target: &str) -> bool {
+    ["tokei", "ignore", "globset"].iter().any(|prefix| {
+        target == *prefix
+            || target
+                .strip_prefix(prefix)
+                .is_some_and(|rest| rest.starts_with("::"))
+    })
+}
 
 fn bridged_filter(base: &str) -> EnvFilter {
-    EnvFilter::new(format!("{base},{BRIDGED_LOG_DIRECTIVE}"))
+    EnvFilter::new(format!("{base},{NOISY_LOG_DIRECTIVE}"))
 }
 
 fn default_level_filter(level: LogLevel) -> EnvFilter {
@@ -206,7 +214,9 @@ fn default_level_filter(level: LogLevel) -> EnvFilter {
 fn level_filter(default: LogLevel) -> EnvFilter {
     // `THEGN_LOG` (tracing directives) wins; else the configured level.
     match std::env::var("THEGN_LOG") {
-        Ok(s) if !s.trim().is_empty() => EnvFilter::builder().parse_lossy(s),
+        Ok(s) if !s.trim().is_empty() => {
+            EnvFilter::builder().parse_lossy(format!("{s},{NOISY_LOG_DIRECTIVE}"))
+        }
         _ => default_level_filter(default),
     }
 }
@@ -252,7 +262,7 @@ pub fn install(role: Role, cfg: &LogConfig) {
     let file_json = matches!(cfg.format, LogFormat::Json);
 
     // The always-on ring: WARN and above only, minus bridged `log`-crate noise
-    // (see `BRIDGED_LOG_DIRECTIVE` — tokei alone contributed 14,917 WARNs in one
+    // (see `NOISY_LOG_DIRECTIVE` — tokei alone contributed 14,917 WARNs in one
     // session, which would evict thegn's own records from a fixed-size ring that
     // exists to explain a crash).
     //
@@ -474,6 +484,9 @@ where
 {
     fn on_event(&self, event: &Event<'_>, _ctx: Context<'_, S>) {
         let meta = event.metadata();
+        if noisy_log_target(meta.target()) && *meta.level() > Level::ERROR {
+            return;
+        }
         let mut v = RingVisitor::default();
         event.record(&mut v);
         let ts = chrono::Local::now().format("%Y-%m-%dT%H:%M:%S").to_string();
@@ -892,7 +905,11 @@ mod tests {
         }
         {
             let _env = crate::testenv::EnvGuard::set(&[("THEGN_LOG", "thegn_core=trace")]);
-            assert_eq!(level_filter(LogLevel::Warn).to_string(), "thegn_core=trace");
+            let filter = level_filter(LogLevel::Warn).to_string();
+            assert!(filter.starts_with("thegn_core=trace"), "{filter}");
+            for directive in NOISY_LOG_DIRECTIVE.split(',') {
+                assert!(filter.contains(directive), "{filter}");
+            }
             assert!(env_level_is_set());
         }
         {
@@ -903,6 +920,23 @@ mod tests {
             let filter = level_filter(LogLevel::Error).to_string();
             assert!(filter.contains("error"), "{filter}");
             assert!(env_level_is_set());
+        }
+    }
+
+    #[test]
+    fn noisy_log_target_table() {
+        for (target, expected) in [
+            ("tokei", true),
+            ("tokei::language", true),
+            ("ignore", true),
+            ("ignore::gitignore", true),
+            ("globset", true),
+            ("globset::glob", true),
+            ("thegn::x", false),
+            ("tokei_extra", false),
+            ("log", false),
+        ] {
+            assert_eq!(noisy_log_target(target), expected, "target={target}");
         }
     }
 
@@ -1231,6 +1265,25 @@ mod tests {
     }
 
     #[test]
+    fn install_filters_noisy_log_bridge_out_of_file_and_ring() {
+        let dir = tmp("noisy-bridge");
+        let output = run_install_child("noisy-bridge", &dir);
+        assert!(
+            output.status.success(),
+            "status={} stdout={} stderr={}",
+            output.status,
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let log = std::fs::read_to_string(dir.join("thegn.log")).unwrap();
+        assert!(!log.contains("bridged noisy warning"), "{log}");
+        assert!(!log.contains("bridged ignore warning"), "{log}");
+        assert!(!log.contains("bridged globset warning"), "{log}");
+        assert!(log.contains("thegn::x warning"), "{log}");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
     fn install_child_case() {
         let Ok(case) = std::env::var("THEGN_LOG_TRACE_INSTALL_CASE") else {
             return;
@@ -1316,10 +1369,10 @@ mod tests {
                 tracing::trace!(target: "thegn::install-test", "application trace after reload");
                 let log = std::fs::read_to_string(dir.join("thegn.log")).unwrap();
                 let explicit = case == "host-filter-override";
-                assert_eq!(log.contains("dependency before reload"), explicit);
-                assert_eq!(log.contains("dependency after reload"), explicit);
-                assert_eq!(log.contains("tokei before reload"), explicit);
-                assert_eq!(log.contains("tokei after reload"), explicit);
+                assert!(!log.contains("dependency before reload"));
+                assert!(!log.contains("dependency after reload"));
+                assert!(!log.contains("tokei before reload"));
+                assert!(!log.contains("tokei after reload"));
                 assert!(!tokei_ring_before);
                 assert!(
                     !diagnostics::ring_snapshot()
@@ -1334,6 +1387,27 @@ mod tests {
                 assert!(log.contains("application before reload"));
                 assert!(log.contains("application after reload"));
                 assert_eq!(log.contains("application trace after reload"), !explicit);
+            }
+            "noisy-bridge" => {
+                let cfg = LogConfig {
+                    file: true,
+                    dir: dir.to_string_lossy().into_owned(),
+                    ..LogConfig::default()
+                };
+                install(Role::Host, &cfg);
+                log::warn!(target: "tokei", "bridged noisy warning");
+                log::warn!(target: "ignore::walk", "bridged ignore warning");
+                log::warn!(target: "globset::glob", "bridged globset warning");
+                tracing::warn!(target: "thegn::x", "thegn::x warning");
+                let snapshot = diagnostics::ring_snapshot();
+                assert!(!snapshot.iter().any(|line| line.contains("bridged noisy")));
+                assert!(!snapshot.iter().any(|line| line.contains("bridged ignore")));
+                assert!(!snapshot.iter().any(|line| line.contains("bridged globset")));
+                assert!(
+                    snapshot
+                        .iter()
+                        .any(|line| line.contains("thegn::x warning"))
+                );
             }
             "host-json" => {
                 let cfg = LogConfig {
