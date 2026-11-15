@@ -15,8 +15,8 @@ use std::sync::{Arc, Mutex};
 use thegn_core::plugin_api::{
     API_VERSION, Alert, AuditDecision, Capability, Contribution, Event, EventKind, ExtensionPoint,
     HOST_VERB_SUPPORT, HostVerb, IoRequest, NegotiatedManifest, PluginApiError, PluginId,
-    PluginMode, PluginRuntime, PluginSpec, RpcError, RpcErrorCode, RpcMessage, RpcResponse,
-    SupportState, SurfaceId, View,
+    PluginMode, PluginRuntime, PluginSpec, RowRole, RowUpdate, RpcError, RpcErrorCode, RpcMessage,
+    RpcResponse, SupportState, SurfaceId, View, WorktreeFieldCaps,
 };
 use thegn_svc::issue::IssueCaps;
 use thegn_svc::plugin::session::SessionFailure;
@@ -37,6 +37,20 @@ const MAX_PLUGIN_MESSAGES_PER_DRAIN: usize = 256;
 const DISPATCH_QUEUE_CAPACITY: usize = 64;
 const MAX_DISPATCH_IN_FLIGHT_PER_PLUGIN: usize = 8;
 const DISPATCH_DEADLINE: std::time::Duration = std::time::Duration::from_secs(30);
+const MAX_ROW_UPDATES_PER_MESSAGE: usize = 256;
+const MAX_ROW_FIELDS_PER_PLUGIN: usize = 8;
+const MAX_ROW_WORKTREES_PER_FIELD: usize = 256;
+const MAX_ROW_WORKTREE_KEY_BYTES: usize = 4096;
+const MAX_ROW_TEXT_BYTES: usize = 256;
+const MAX_ROW_TEXT_CELLS: usize = 48;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct RowValue {
+    pub text: String,
+    pub role: RowRole,
+}
+
+pub(crate) type RowFieldSnapshot = BTreeMap<(String, String), BTreeMap<String, RowValue>>;
 
 /// One live (or dead-but-remembered) plugin on the loop side.
 pub(crate) struct PluginEntry {
@@ -82,6 +96,7 @@ struct FocusTicket {
 /// order) plus the outboxes the loop flushes off-thread after each drain.
 pub(crate) struct PluginsState {
     pub plugins: BTreeMap<String, PluginEntry>,
+    pub(crate) row_fields: RowFieldSnapshot,
     pub(crate) loading: bool,
     /// Notifications raised via the `notify` verb this drain, recorded to the
     /// inbox off-loop by [`flush_alerts`]. `(plugin id, alert)`.
@@ -106,6 +121,7 @@ impl PluginsState {
         let cfg = Arc::new(cfg);
         Self {
             plugins: BTreeMap::new(),
+            row_fields: BTreeMap::new(),
             loading: true,
             pending_alerts: Vec::new(),
             pending_alert_drops: BTreeMap::new(),
@@ -331,6 +347,9 @@ pub(crate) fn effective_grants(
     let mut notification_source = false;
     for c in &neg.accepted_contributions {
         match c.extension_point {
+            ExtensionPoint::WorktreeField => {
+                grants.insert(Capability::new("surface", "rowfield"));
+            }
             ExtensionPoint::AppTab => {
                 grants.insert(Capability::new("surface", "app"));
             }
@@ -508,6 +527,14 @@ fn send_activate(entry: &PluginEntry) {
 /// Keep activation grants identical to the negotiated runtime grant set.
 fn effective_grants_of(entry: &PluginEntry) -> std::collections::HashSet<Capability> {
     entry.grants.clone()
+}
+
+/// Snapshot the generic row-field store for sidebar composition. The clone is
+/// bounded by the per-plugin field/worktree quotas and keeps rendering
+/// independent from plugin runtime state.
+#[allow(dead_code)] // sidebar rendering consumes this seam in the following lane
+pub(crate) fn row_field_values(state: &PluginsState) -> RowFieldSnapshot {
+    state.row_fields.clone()
 }
 
 /// The statusbar segments to render: `(label, cached view)` for every
@@ -831,6 +858,7 @@ fn drain_with_responder(
                     if let Some(dispatcher) = &state.dispatcher {
                         dispatcher.discard_outcomes_for_plugin(&id);
                     }
+                    state.row_fields.retain(|(owner, _), _| owner != &id);
                     state.plugins.insert(id.clone(), entry);
                     if !removed_apps.is_empty() {
                         model.status = format!("Plugin {id}: unsupported app tabs were removed");
@@ -1090,6 +1118,9 @@ fn handle_exit(
     let Some(entry) = state.plugins.get_mut(plugin) else {
         return PluginDamage::None;
     };
+    let rows_before = state.row_fields.len();
+    state.row_fields.retain(|(owner, _), _| owner != plugin);
+    let rows_cleared = state.row_fields.len() != rows_before;
     entry.writer = None;
     entry
         .focus_tickets
@@ -1118,7 +1149,11 @@ fn handle_exit(
     sync_provider_registry(state);
     let entry = state.plugins.get_mut(plugin).expect("looked up above");
     if entry.disabled {
-        return PluginDamage::None;
+        return if rows_cleared {
+            PluginDamage::SidebarContent
+        } else {
+            PluginDamage::None
+        };
     }
     match crate::plugins::restart_delay(entry.restarts) {
         Some(delay) => {
@@ -1184,6 +1219,147 @@ fn param_str(params: &serde_json::Value, key: &str) -> Option<String> {
     params.get(key)?.as_str().map(str::to_string)
 }
 
+/// Bound hostile plugin text before measuring it for the terminal. Controls
+/// and bidi direction markers are removed, then the result is clipped by
+/// display cells so wide characters cannot evade the visual cap.
+fn sanitize_row_text(input: &str) -> String {
+    let mut end = input.len().min(MAX_ROW_TEXT_BYTES);
+    while !input.is_char_boundary(end) {
+        end -= 1;
+    }
+    let filtered: String = input[..end]
+        .chars()
+        .filter(|c| !c.is_control() && !thegn_core::pipeline_report::is_format_control(*c))
+        .collect();
+    thegn_core::pipeline_report::display_clip(&filtered, MAX_ROW_TEXT_CELLS)
+}
+
+fn apply_row_update(
+    state: &mut PluginsState,
+    plugin: &str,
+    params: &serde_json::Value,
+) -> Result<bool, RpcError> {
+    if params.get("app").is_some() {
+        return Err(RpcError::new(
+            RpcErrorCode::Invalid,
+            "row updates cannot include an app view",
+        ));
+    }
+    let surface = param_str(params, "surface")
+        .ok_or_else(|| RpcError::new(RpcErrorCode::Invalid, "missing row-field surface"))?;
+    let rows = params
+        .get("rows")
+        .and_then(serde_json::Value::as_array)
+        .ok_or_else(|| RpcError::new(RpcErrorCode::Invalid, "rows must be an array"))?;
+    if rows.len() > MAX_ROW_UPDATES_PER_MESSAGE {
+        return Err(RpcError::new(
+            RpcErrorCode::RateLimited,
+            format!("row update exceeds {MAX_ROW_UPDATES_PER_MESSAGE} rows"),
+        ));
+    }
+    let updates: Vec<RowUpdate> = serde_json::from_value(serde_json::Value::Array(rows.clone()))
+        .map_err(|error| RpcError::new(RpcErrorCode::Invalid, format!("bad rows: {error}")))?;
+    let mut values = BTreeMap::new();
+    for update in updates {
+        if update.worktree.is_empty() || update.worktree.len() > MAX_ROW_WORKTREE_KEY_BYTES {
+            return Err(RpcError::new(
+                RpcErrorCode::Invalid,
+                format!("row worktree key must be 1..={MAX_ROW_WORKTREE_KEY_BYTES} bytes"),
+            ));
+        }
+        if values
+            .insert(
+                update.worktree.clone(),
+                RowValue {
+                    text: sanitize_row_text(&update.text),
+                    role: update.role,
+                },
+            )
+            .is_some()
+        {
+            return Err(RpcError::new(
+                RpcErrorCode::Invalid,
+                "rows must contain one value per worktree",
+            ));
+        }
+    }
+    if values.len() > MAX_ROW_WORKTREES_PER_FIELD {
+        return Err(RpcError::new(
+            RpcErrorCode::RateLimited,
+            format!("row field exceeds {MAX_ROW_WORKTREES_PER_FIELD} worktrees"),
+        ));
+    }
+
+    let pid = PluginId::new(plugin);
+    let entry = state
+        .plugins
+        .get_mut(plugin)
+        .ok_or_else(|| RpcError::new(RpcErrorCode::Invalid, "unknown plugin"))?;
+    if entry.plugin.spec.mode != PluginMode::Resident {
+        return Err(RpcError::new(
+            RpcErrorCode::Invalid,
+            "row-field updates require a resident plugin",
+        ));
+    }
+    if entry.session.is_none() {
+        return Err(RpcError::new(
+            RpcErrorCode::Other,
+            "row-field updates require a live resident session",
+        ));
+    }
+    let Some(contribution) = entry.contributions.iter().find(|contribution| {
+        contribution.extension_point == ExtensionPoint::WorktreeField
+            && contribution
+                .surface
+                .as_ref()
+                .is_some_and(|owned| owned.as_str() == surface)
+    }) else {
+        return Err(RpcError::new(
+            RpcErrorCode::Invalid,
+            "row-field surface is not declared by this plugin",
+        ));
+    };
+    let caps = serde_json::from_value::<WorktreeFieldCaps>(contribution.caps.clone()).map_err(
+        |error| {
+            RpcError::new(
+                RpcErrorCode::Invalid,
+                format!("invalid row-field caps: {error}"),
+            )
+        },
+    )?;
+    entry
+        .runtime
+        .authorize_row_field_update(pid, &SurfaceId::new(surface))
+        .map_err(rpc_error_of)?;
+
+    let key = (plugin.to_string(), caps.field);
+    if !state.row_fields.contains_key(&key)
+        && state
+            .row_fields
+            .keys()
+            .filter(|(owner, _)| owner == plugin)
+            .count()
+            >= MAX_ROW_FIELDS_PER_PLUGIN
+    {
+        return Err(RpcError::new(
+            RpcErrorCode::RateLimited,
+            format!("plugin exceeds {MAX_ROW_FIELDS_PER_PLUGIN} row fields"),
+        ));
+    }
+    let changed = state
+        .row_fields
+        .get(&key)
+        .map_or(!values.is_empty(), |old| old != &values);
+    if changed {
+        if values.is_empty() {
+            state.row_fields.remove(&key);
+        } else {
+            state.row_fields.insert(key, values);
+        }
+    }
+    Ok(changed)
+}
+
 fn parse_register_contribution(params: serde_json::Value) -> Result<Contribution, RpcError> {
     serde_json::from_value::<Contribution>(params)
         .map_err(|e| RpcError::new(RpcErrorCode::Invalid, format!("bad contribution: {e}")))
@@ -1229,6 +1405,26 @@ fn apply_message(state: &mut PluginsState, plugin: &str, msg: RpcMessage) -> Plu
         return apply_host_call(state, plugin, msg);
     }
     let pid = PluginId::new(plugin);
+    if verb == HostVerb::Update && params_has_rows(&msg.params) {
+        let id = msg.id;
+        let changed = apply_row_update(state, plugin, &msg.params);
+        let damage = match &changed {
+            Ok(true) => PluginDamage::SidebarContent,
+            Ok(false) | Err(_) => PluginDamage::None,
+        };
+        if let Some(id) = id {
+            let entry = state
+                .plugins
+                .get(plugin)
+                .expect("plugin existence checked before row update");
+            let response = match changed {
+                Ok(_) => RpcResponse::ok(id, serde_json::Value::Null),
+                Err(error) => RpcResponse::err(id, error),
+            };
+            respond(entry, response);
+        }
+        return damage;
+    }
     if verb == HostVerb::Update && params_has_app(&msg.params) {
         let navigation_epoch = state.navigation_epoch;
         let modal_owns_input = state.modal_owns_input;
@@ -1479,6 +1675,10 @@ fn apply_message(state: &mut PluginsState, plugin: &str, msg: RpcMessage) -> Plu
 
 fn params_has_app(params: &serde_json::Value) -> bool {
     params.get("app").is_some()
+}
+
+fn params_has_rows(params: &serde_json::Value) -> bool {
+    params.get("rows").is_some()
 }
 
 fn subscribe_kinds(
@@ -3063,6 +3263,25 @@ mod tests {
         )
     }
 
+    fn row_spec(id: &str, field: &str) -> PluginSpec {
+        let mut plugin = spec(
+            id,
+            vec![contribution(
+                "row",
+                ExtensionPoint::WorktreeField,
+                &format!("{id}/row"),
+                "Row",
+            )],
+            Vec::new(),
+        );
+        plugin.manifest.api = API_VERSION;
+        plugin.manifest.contributions[0].caps = serde_json::json!({
+            "field": field,
+            "slot": "detail"
+        });
+        plugin
+    }
+
     type TestFeedSenders =
         Arc<Mutex<Vec<tokio::sync::mpsc::Sender<thegn_core::control_wire::EventFrame>>>>;
 
@@ -3706,6 +3925,230 @@ mod tests {
         drain(&mut rx, &mut state, &mut model, None);
 
         assert_eq!(statusbar_views(&state)[0].1.text_content(), "flood-99999");
+    }
+
+    #[test]
+    fn sanitize_row_text_strips_controls_and_caps_display_cells() {
+        for (input, expected) in [
+            ("a\x1b[31mb", "a[31mb"),
+            ("a\r\nb", "ab"),
+            ("a\u{202e}b", "ab"),
+            ("a\u{2028}b", "ab"),
+            ("a\u{2066}b", "ab"),
+            ("a\u{200b}b", "ab"),
+            ("a\0b", "ab"),
+            ("", ""),
+        ] {
+            assert_eq!(sanitize_row_text(input), expected, "input {input:?}");
+        }
+        let huge = sanitize_row_text(&"x".repeat(10_000));
+        assert!(huge.ends_with('…'));
+        assert!(huge.len() <= MAX_ROW_TEXT_CELLS * 4);
+        let wide = sanitize_row_text(&"界".repeat(40));
+        assert!(wide.ends_with('…'));
+        assert!(wide.chars().count() <= 25);
+    }
+
+    #[test]
+    fn row_field_updates_replace_clear_and_skip_identical_damage() {
+        let mut state = state_with(vec![row_spec("p", "ci")]);
+        let mut model = FrameModel::default();
+        let update = |rows| {
+            msg(
+                "update",
+                serde_json::json!({
+                    "surface": "p/row",
+                    "rows": rows,
+                }),
+            )
+        };
+
+        assert_eq!(
+            drain_one(
+                &mut state,
+                &mut model,
+                event(
+                    "p",
+                    1,
+                    SessionEvent::Message(update(serde_json::json!([
+                        {"worktree": "/tmp/a", "text": "ready", "role": "Good"},
+                        {"worktree": "main", "text": "warn", "role": "Warn"}
+                    ])))
+                ),
+            ),
+            PluginDamage::SidebarContent
+        );
+        let snapshot = row_field_values(&state);
+        assert_eq!(snapshot[&(String::from("p"), String::from("ci"))].len(), 2);
+        assert_eq!(
+            snapshot[&(String::from("p"), String::from("ci"))]["/tmp/a"].text,
+            "ready"
+        );
+
+        assert_eq!(
+            drain_one(
+                &mut state,
+                &mut model,
+                event(
+                    "p",
+                    1,
+                    SessionEvent::Message(update(serde_json::json!([
+                        {"worktree": "/tmp/a", "text": "ready", "role": "Good"},
+                        {"worktree": "main", "text": "warn", "role": "Warn"}
+                    ])))
+                ),
+            ),
+            PluginDamage::None
+        );
+        assert_eq!(
+            drain_one(
+                &mut state,
+                &mut model,
+                event(
+                    "p",
+                    1,
+                    SessionEvent::Message(update(serde_json::json!([
+                        {"worktree": "main", "text": "new", "role": "Accent"}
+                    ])))
+                ),
+            ),
+            PluginDamage::SidebarContent
+        );
+        assert_eq!(
+            row_field_values(&state)[&(String::from("p"), String::from("ci"))].len(),
+            1
+        );
+        assert_eq!(
+            drain_one(
+                &mut state,
+                &mut model,
+                event("p", 1, SessionEvent::Message(update(serde_json::json!([])))),
+            ),
+            PluginDamage::SidebarContent
+        );
+        assert!(row_field_values(&state).is_empty());
+    }
+
+    #[test]
+    fn row_field_limits_and_authorization_keep_previous_values() {
+        let mut state = state_with(vec![row_spec("p", "ci"), row_spec("q", "other")]);
+        let mut model = FrameModel::default();
+        let one = |plugin: &str, surface: &str, rows| {
+            event(
+                plugin,
+                1,
+                SessionEvent::Message(msg(
+                    "update",
+                    serde_json::json!({"surface": surface, "rows": rows}),
+                )),
+            )
+        };
+        let seed = serde_json::json!([
+            {"worktree": "main", "text": "old", "role": "Good"}
+        ]);
+        assert_eq!(
+            drain_one(&mut state, &mut model, one("p", "p/row", seed)),
+            PluginDamage::SidebarContent
+        );
+        let too_many: Vec<_> = (0..=MAX_ROW_UPDATES_PER_MESSAGE)
+            .map(|index| {
+                serde_json::json!({
+                    "worktree": format!("wt-{index}"),
+                    "text": "new",
+                    "role": "Accent"
+                })
+            })
+            .collect();
+        assert_eq!(
+            drain_one(
+                &mut state,
+                &mut model,
+                one("p", "p/row", serde_json::Value::Array(too_many)),
+            ),
+            PluginDamage::None
+        );
+        assert_eq!(
+            row_field_values(&state)[&(String::from("p"), String::from("ci"))]["main"].text,
+            "old"
+        );
+        for worktree in [String::new(), "x".repeat(MAX_ROW_WORKTREE_KEY_BYTES + 1)] {
+            assert_eq!(
+                drain_one(
+                    &mut state,
+                    &mut model,
+                    one(
+                        "p",
+                        "p/row",
+                        serde_json::json!([{
+                            "worktree": worktree,
+                            "text": "new",
+                            "role": "Accent"
+                        }]),
+                    ),
+                ),
+                PluginDamage::None
+            );
+        }
+        assert_eq!(
+            drain_one(
+                &mut state,
+                &mut model,
+                one("q", "p/row", serde_json::json!([])),
+            ),
+            PluginDamage::None
+        );
+        assert!(row_field_values(&state).contains_key(&(String::from("p"), String::from("ci"))));
+        assert_eq!(
+            drain_one(
+                &mut state,
+                &mut model,
+                one("p", "p/missing", serde_json::json!([])),
+            ),
+            PluginDamage::None
+        );
+
+        state.plugins.get_mut("p").unwrap().disabled = true;
+        assert_eq!(
+            drain_one(
+                &mut state,
+                &mut model,
+                event("p", 1, SessionEvent::Exit { code: Some(1) }),
+            ),
+            PluginDamage::SidebarContent
+        );
+        assert!(row_field_values(&state).is_empty());
+    }
+
+    #[test]
+    fn reloading_plugin_clears_stale_row_fields() {
+        let mut state = state_with(vec![row_spec("p", "ci")]);
+        let mut model = FrameModel::default();
+        drain_one(
+            &mut state,
+            &mut model,
+            event(
+                "p",
+                1,
+                SessionEvent::Message(msg(
+                    "update",
+                    serde_json::json!({
+                        "surface": "p/row",
+                        "rows": [{"worktree": "main", "text": "old", "role": "Good"}]
+                    }),
+                )),
+            ),
+        );
+        assert!(!row_field_values(&state).is_empty());
+
+        assert_eq!(
+            drain_one(
+                &mut state,
+                &mut model,
+                PluginMsg::Loaded(vec![loaded_state(row_spec("p", "ci"))]),
+            ),
+            PluginDamage::Structural
+        );
+        assert!(row_field_values(&state).is_empty());
     }
 
     #[test]
