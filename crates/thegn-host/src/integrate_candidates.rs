@@ -9,7 +9,6 @@ use std::io::Read;
 use std::path::{Path, PathBuf};
 use thegn_core::config::MergeQueueConfig;
 use thegn_core::remote::GitLoc;
-use thegn_core::util;
 use thegn_svc::git::{CliGit, GitBackend, PlumbingOps};
 
 #[cfg(test)]
@@ -27,8 +26,14 @@ pub(crate) struct LocalIdentity {
 }
 
 fn git_path(path: &Path, flag: &str) -> Result<PathBuf> {
-    let value = util::git_out(path, &["rev-parse", "--path-format=absolute", flag])
+    let value = GitLoc::Local(path.to_path_buf())
+        .git_text(&["rev-parse", "--path-format=absolute", flag])
+        .map_err(|error| anyhow::anyhow!("{error}"))
         .with_context(|| format!("cannot inspect local Git {flag}"))?;
+    ensure!(
+        !value.is_empty(),
+        "cannot inspect local Git {flag}: empty output"
+    );
     std::fs::canonicalize(value.trim()).context("cannot canonicalize local Git identity")
 }
 

@@ -1476,9 +1476,20 @@ fn resolve_placed_with(
     let worktree = PathBuf::from(loc.path());
     // Path-preserving git mounts: the worktree and the repo's git-common dir
     // (probed via the location, so it's the *remote* path for remote worktrees).
-    let git_common = loc
-        .git_out(&["rev-parse", "--path-format=absolute", "--git-common-dir"])
-        .map(PathBuf::from)
+    let git_common =
+        match loc.git_text(&["rev-parse", "--path-format=absolute", "--git-common-dir"]) {
+            Ok(path) if !path.is_empty() => Some(PathBuf::from(path)),
+            Ok(_) => None,
+            Err(error) => {
+                tracing::warn!(
+                    target: "thegn::sandbox",
+                    path = %loc.path(),
+                    %error,
+                    "could not read git common directory; omitting sandbox mount"
+                );
+                None
+            }
+        }
         .filter(|p| p.as_path() != worktree && !worktree.starts_with(p));
 
     let mut mounts = vec![];
