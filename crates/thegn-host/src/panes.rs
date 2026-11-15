@@ -1987,12 +1987,17 @@ mod tests {
     fn materialize_mid_batch_spawn_failure_errs_and_leaves_tree_and_focus_untouched() {
         // Leaf 0 has a valid spec, leaf 1 names a program that cannot exec. The
         // failure returns before the post-loop remap, so the tree and focus must
-        // be the original ids.
+        // be the original ids. Materialize reads the remembered agent from
+        // the state DB, so keep that read off the real state root.
+        let _state = crate::testenv::IsolatedState::new();
         let mut session = one_tab_session();
         let path = session.worktrees[0].path.clone();
         let tab = &mut session.worktrees[0].tabs[0];
         let first = tab.center.pane_ids()[0];
-        let second = first + 1;
+        // Far from `Panes::new`'s first fresh id (1): an adjacent leaf id
+        // collides with the id the first leaf's pane is given, and the batch
+        // then skips this leaf as "raced a direct spawn" instead of failing it.
+        let second = first + 1000;
         assert!(tab.center.split(first, crate::center::Dir::Row, second));
         tab.focused_pane = first;
         let (tx, _rx) = tokio_mpsc::channel::<PaneEvent>(1024);
@@ -2043,10 +2048,10 @@ mod tests {
 
     #[test]
     fn materialize_with_missing_worktree_falls_back_to_home_and_succeeds() {
-        let home = tempfile::tempdir().unwrap();
-        let _env = crate::testenv::EnvVarGuard::set(&[("HOME", home.path().to_str().unwrap())]);
+        // The isolated root is HOME: the fallback cwd lands inside it.
+        let state = crate::testenv::IsolatedState::new();
         let mut session = one_tab_session();
-        let missing = home.path().join("no-such-worktree");
+        let missing = state.root().join("no-such-worktree");
         let path = missing.to_str().unwrap().to_string();
         let tab = &mut session.worktrees[0].tabs[0];
         let leaf = tab.center.pane_ids()[0];

@@ -7,6 +7,8 @@ All notable changes to **thegn** are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.1.0-alpha.83] — 2026-11-15
+
 ### Added
 
 - Sidebar worktree rows now show commits ahead of the default branch (`5c`, capped at `999+`) and a detail line with the branch, commit count, changed files, diff stat, PR, last commit subject, and age. Configure badges, visibility, and field order with the new `[ui]` keys `sidebar_detail_when`, `sidebar_show_commits`, `sidebar_show_behind_base`, `sidebar_commit_badge`, `sidebar_behind_badge`, and `sidebar_detail_fields`.
@@ -3517,7 +3519,8 @@ launcher picker and the merge queue's `agent_command` hook remain — they run
 whatever commands you configure. Leftover `[llm_proxy]` config sections and
 `proxy_*` tables in existing state databases are ignored harmlessly.
 
-[Unreleased]: https://github.com/blakeashleyjr/thegn/compare/v0.1.0-alpha.82...HEAD
+[Unreleased]: https://github.com/blakeashleyjr/thegn/compare/v0.1.0-alpha.83...HEAD
+[0.1.0-alpha.83]: https://github.com/blakeashleyjr/thegn/compare/v0.1.0-alpha.82...v0.1.0-alpha.83
 [0.1.0-alpha.82]: https://github.com/blakeashleyjr/thegn/compare/v0.1.0-alpha.81...v0.1.0-alpha.82
 [0.1.0-alpha.81]: https://github.com/blakeashleyjr/thegn/compare/v0.1.0-alpha.80...v0.1.0-alpha.81
 [0.1.0-alpha.80]: https://github.com/blakeashleyjr/thegn/compare/v0.1.0-alpha.79...v0.1.0-alpha.80

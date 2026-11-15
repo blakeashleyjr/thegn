@@ -9,11 +9,11 @@
 //! byte identity needs THE-368), and SSH/provider transports.
 
 use std::path::Path;
-use std::process::Command;
 
 use thegn_core::config::GitBackendKind;
 use thegn_core::remote::GitLoc;
 use thegn_core::testenv::require_or_skip;
+use thegn_core::util::git_cmd;
 use thegn_svc::git::backend_for;
 
 /// `(name, reason a filesystem may refuse it)`.
@@ -37,15 +37,14 @@ const NAMES: &[(&str, &str)] = &[
 ];
 
 fn git_available() -> bool {
-    Command::new("git")
+    git_cmd(Path::new("."))
         .arg("--version")
         .output()
         .is_ok_and(|out| out.status.success())
 }
 
 fn git(dir: &Path, args: &[&str]) {
-    let out = Command::new("git")
-        .current_dir(dir)
+    let out = git_cmd(dir)
         .args([
             "-c",
             "commit.gpgsign=false",

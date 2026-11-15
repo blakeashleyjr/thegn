@@ -1440,9 +1440,11 @@ mod tests {
         // (SandboxCompilerCache) makes cache enablement explicit and trusted,
         // while `[serve] topology` (ServeTopology) distinguishes direct,
         // TLS-terminated, and tunnel-only control-plane deployments.
+        // 101 → 102 (THE-2002): `[ui] sidebar_detail_when` (DetailWhen) —
+        // whether the sidebar detail line needs sidebar focus.
         assert_eq!(
             defs.len(),
-            101,
+            102,
             "config_enum definitions in the Config schema changed; update the \
              pin (and the exclusion note) deliberately: {defs:?}"
         );
@@ -1986,7 +1988,7 @@ sidebar_workspace_sort = "attention"
             diagnostic.severity == ValidationSeverity::Warning
                 && diagnostic.message.contains("sidebar_detail_fields")
                 && diagnostic.message.contains("bogus")
-                && diagnostic.message.contains("branch_stat")
+                && diagnostic.message.contains("plugin:<name>/<field>")
         }));
         assert!(diagnostics.iter().any(|diagnostic| {
             diagnostic.severity == ValidationSeverity::Warning
@@ -2235,6 +2237,14 @@ mod security_root_rot_tests {
     /// a root whose exec field is spelled `run` is exactly the one a
     /// command/argv-only vocabulary would miss.
     fn is_dangerous_field(name: &str) -> bool {
+        // Names the suffix vocabulary matches by accident, each a
+        // presentation knob that executes, holds and reaches nothing:
+        // `[ui] sidebar_show_behind_base` is a boolean badge toggle ("behind
+        // the base branch"), not a `*_base` URL.
+        const NOT_DANGEROUS: &[&str] = &["sidebar_show_behind_base"];
+        if NOT_DANGEROUS.contains(&name) {
+            return false;
+        }
         const EXACT: &[&str] = &[
             "command", "argv", "exec", "cmd", "run", "script", "shell", "args", "bin", "path",
             "image", "socket", "proxy", "url", "host", "endpoint", "server", "token", "secret",
