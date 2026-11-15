@@ -9,7 +9,6 @@ use std::io::Read;
 use std::path::{Path, PathBuf};
 use thegn_core::config::MergeQueueConfig;
 use thegn_core::remote::GitLoc;
-use thegn_core::util;
 use thegn_svc::git::{CliGit, GitBackend, PlumbingOps};
 
 #[cfg(test)]
