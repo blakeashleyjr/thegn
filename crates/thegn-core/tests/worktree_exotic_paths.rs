@@ -3,22 +3,21 @@
 //! (THE-376). Invalid-UTF-8 directory names are unsupported (needs THE-368).
 
 use std::path::Path;
-use std::process::Command;
 
 use thegn_core::testenv::require_or_skip;
+use thegn_core::util::git_cmd;
 use thegn_core::util::worktree_branches;
 use thegn_core::worktree::BranchSet;
 
 fn git_available() -> bool {
-    Command::new("git")
+    git_cmd(Path::new("."))
         .arg("--version")
         .output()
         .is_ok_and(|out| out.status.success())
 }
 
 fn git(dir: &Path, args: &[&str]) {
-    let out = Command::new("git")
-        .current_dir(dir)
+    let out = git_cmd(dir)
         .args([
             "-c",
             "commit.gpgsign=false",
