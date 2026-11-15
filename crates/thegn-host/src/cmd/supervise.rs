@@ -33,8 +33,8 @@ use thegn_core::outln;
 use thegn_core::pipeline_approval::{ApprovalState, state_for};
 use thegn_core::pipeline_run::{self, RowLiveness};
 use thegn_core::pipeline_supervise::{self, LaneFacts, SuperviseAction, ValidationRecord};
+use thegn_core::remote::GitLoc;
 use thegn_core::store::WorktreeAuxStore as _;
-use thegn_core::util::{git_ok, git_out};
 
 #[derive(clap::Subcommand, Clone)]
 pub enum Action {
@@ -345,7 +345,7 @@ fn gather_rows(
 
 /// The two git facts about a worktree, gathered together so they can be cached
 /// per worktree rather than re-derived per roster row.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 struct WorktreeGit {
     /// The branch tip, or empty when the worktree is gone or has no commits.
     head_sha: String,
@@ -360,26 +360,64 @@ struct WorktreeGit {
 /// so a diff-based test reads it as an empty change and files it as something
 /// suspicious. That mistake put four already-landed lanes into a review queue.
 fn worktree_git_facts(cfg: &Config, worktree: &Path) -> WorktreeGit {
-    let Some(head_sha) = git_out(worktree, &["rev-parse", "HEAD"]) else {
-        // Gone, or not a repository: the caller holds this lane rather than
-        // reasoning about a tree that is not there.
-        return WorktreeGit::default();
+    let loc = GitLoc::Local(worktree.to_path_buf());
+    let head_sha = match loc.git_text(&["rev-parse", "HEAD"]) {
+        Ok(head_sha) if !head_sha.is_empty() => head_sha,
+        Ok(_) => return WorktreeGit::default(),
+        Err(error) => {
+            if !git_read_was_absent(&error) {
+                tracing::warn!(worktree = %worktree.display(), %error, "could not read worktree Git facts");
+            }
+            // Gone, not a repository, or a failed Git read: the caller holds
+            // this lane rather than reasoning about a tree that is unknown.
+            return WorktreeGit::default();
+        }
     };
-    let Some(root) = git_out(worktree, &["rev-parse", "--show-toplevel"]) else {
-        return WorktreeGit {
-            head_sha,
-            merged_into_target: false,
-        };
+    let root = match loc.git_text(&["rev-parse", "--show-toplevel"]) {
+        Ok(root) if !root.is_empty() => root,
+        Ok(_) => {
+            return WorktreeGit {
+                head_sha,
+                merged_into_target: false,
+            };
+        }
+        Err(error) => {
+            if !git_read_was_absent(&error) {
+                tracing::warn!(worktree = %worktree.display(), %error, "could not read worktree Git facts");
+            }
+            return WorktreeGit {
+                head_sha,
+                merged_into_target: false,
+            };
+        }
     };
     let target = crate::integrate::resolve_target(&cfg.merge_queue, Path::new(&root));
-    let merged_into_target = git_ok(
-        Path::new(&root),
+    let merged_into_target = match GitLoc::Local(Path::new(&root).to_path_buf()).git_run(
         &["merge-base", "--is-ancestor", &head_sha, &target],
-    );
+        &thegn_core::git_run::GitPolicy::read(thegn_core::remote::GITLOC_READ_DEADLINE),
+        &std::sync::atomic::AtomicBool::new(false),
+    ) {
+        thegn_core::git_run::GitOutcome::Ok(_) | thegn_core::git_run::GitOutcome::EmptyOk => true,
+        thegn_core::git_run::GitOutcome::Exit { code: Some(1), .. } => false,
+        error => {
+            tracing::warn!(worktree = %worktree.display(), %error, "could not verify worktree ancestry");
+            false
+        }
+    };
     WorktreeGit {
         head_sha,
         merged_into_target,
     }
+}
+
+fn git_read_was_absent(error: &thegn_core::git_run::GitTextError) -> bool {
+    matches!(
+        error,
+        thegn_core::git_run::GitTextError::Failed(thegn_core::git_run::GitOutcome::Exit {
+            code: Some(128),
+            ..
+        })
+    )
 }
 
 // --- plan -------------------------------------------------------------------
@@ -760,6 +798,62 @@ mod tests {
             .unwrap();
         db.update_dispatch_status(id, status).unwrap();
         id
+    }
+
+    #[expect(clippy::disallowed_methods)]
+    fn fixture_git(path: &Path, args: &[&str]) -> String {
+        let output = thegn_core::util::git_cmd(path)
+            .args(["-c", "commit.gpgsign=false"])
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_CONFIG_SYSTEM", "/dev/null")
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "git {args:?}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        String::from_utf8(output.stdout).unwrap().trim().to_owned()
+    }
+
+    #[test]
+    fn worktree_git_facts_fail_closed_for_absent_detached_and_unmerged_paths() {
+        let dir = tempfile::tempdir().unwrap();
+        let missing = dir.path().join("missing");
+        assert_eq!(
+            worktree_git_facts(&Config::default(), &missing),
+            WorktreeGit::default()
+        );
+
+        let file = dir.path().join("not-a-repo");
+        std::fs::write(&file, "not git").unwrap();
+        assert_eq!(
+            worktree_git_facts(&Config::default(), &file),
+            WorktreeGit::default()
+        );
+
+        fixture_git(dir.path(), &["init", "-q", "-b", "main"]);
+        fixture_git(dir.path(), &["config", "user.name", "fixture"]);
+        fixture_git(
+            dir.path(),
+            &["config", "user.email", "fixture@example.invalid"],
+        );
+        fixture_git(dir.path(), &["commit", "--allow-empty", "-q", "-m", "base"]);
+        let base = fixture_git(dir.path(), &["rev-parse", "HEAD"]);
+
+        fixture_git(dir.path(), &["checkout", "--detach", "main"]);
+        let detached = worktree_git_facts(&Config::default(), dir.path());
+        assert_eq!(detached.head_sha, base);
+        assert!(detached.merged_into_target);
+
+        fixture_git(dir.path(), &["checkout", "-q", "-b", "feature"]);
+        std::fs::write(dir.path().join("change"), "change\n").unwrap();
+        fixture_git(dir.path(), &["add", "change"]);
+        fixture_git(dir.path(), &["commit", "-q", "-m", "feature"]);
+        let unmerged = worktree_git_facts(&Config::default(), dir.path());
+        assert!(!unmerged.head_sha.is_empty());
+        assert!(!unmerged.merged_into_target);
     }
 
     #[test]

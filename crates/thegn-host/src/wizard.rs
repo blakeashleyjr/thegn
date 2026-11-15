@@ -1287,12 +1287,20 @@ fn verify_base(root: &Path, base: &str) -> Result<(), String> {
     } else {
         format!("refs/heads/{base}")
     };
-    let unborn = util::git_out(root, &["symbolic-ref", "--quiet", "HEAD"])
-        .is_some_and(|head| head == branch_ref)
-        && util::git_cmd(root)
-            .args(["show-ref", "--verify", "--quiet", &branch_ref])
-            .output()
-            .is_ok_and(|output| output.status.code() == Some(1));
+    let unborn = match GitLoc::Local(root.to_path_buf()).git_text(&[
+        "symbolic-ref",
+        "--quiet",
+        "HEAD",
+    ]) {
+        Ok(head) => head == branch_ref,
+        Err(error) => {
+            tracing::debug!(root = %root.display(), %error, "could not probe HEAD while resolving base");
+            false
+        }
+    } && util::git_cmd(root)
+        .args(["show-ref", "--verify", "--quiet", &branch_ref])
+        .output()
+        .is_ok_and(|output| output.status.code() == Some(1));
     if unborn {
         return Err(format!(
             "Base branch '{base}' has no commit yet. Make an initial commit before creating a worktree. Repository: {}. Git: {reason}",
@@ -2651,6 +2659,25 @@ mod tests {
         assert!(verify_base(&repo, "HEAD^{tree}").is_err());
         assert!(verify_base(&repo, "--help").is_err());
         std::fs::remove_dir_all(&repo).unwrap();
+    }
+
+    #[test]
+    fn verify_base_unborn_probe_distinguishes_empty_and_committed_branches() {
+        let empty = tempfile::tempdir().unwrap();
+        assert!(
+            test_git_cmd(empty.path())
+                .args(["init", "-q", "-b", "main"])
+                .status()
+                .unwrap()
+                .success()
+        );
+        let unborn = verify_base(empty.path(), "main").unwrap_err();
+        assert!(unborn.contains("has no commit"), "{unborn}");
+
+        let committed = temp_repo("verify-base-committed");
+        let missing = verify_base(&committed, "missing-branch").unwrap_err();
+        assert!(!missing.contains("has no commit"), "{missing}");
+        std::fs::remove_dir_all(&committed).unwrap();
     }
 
     #[test]
