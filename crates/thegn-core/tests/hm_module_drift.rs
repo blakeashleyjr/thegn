@@ -40,10 +40,6 @@ const OMITTED: &[(&str, &str)] = &[
     ("forges", "forge connections are not exposed"),
     ("editor", "editor integration is not exposed"),
     (
-        "stats.refresh_secs",
-        "refresh interval is an f64 range that needs float pinning and is not exposed",
-    ),
-    (
         "stats.refresh_rates",
         "refresh-rate list needs float list pinning and is not exposed",
     ),
@@ -209,24 +205,12 @@ const OMITTED: &[(&str, &str)] = &[
         "media.backend",
         "media backend enum needs destination pinning and is not exposed",
     ),
-    (
-        "media.volume_step",
-        "media volume step is a float and needs float pinning",
-    ),
     ("media.mpv", "mpv backend table is not exposed"),
     ("media.mpd", "mpd backend table is not exposed"),
     ("voice", "voice input is not exposed"),
     (
-        "usage.warn_percent",
-        "float threshold needs float pinning and is not exposed",
-    ),
-    (
         "usage.allow_network",
         "network opt-in awaits an owner decision",
-    ),
-    (
-        "usage.crit_percent",
-        "float threshold needs float pinning and is not exposed",
     ),
     ("usage.providers", "provider selection list is not exposed"),
     ("usage.profile_roots", "path list is not exposed"),
@@ -1142,7 +1126,6 @@ fn hm_git_and_stats_families_are_rendered() {
         "git.backend",
         "git.structural_diff",
         "git.submodules",
-        "stats.refresh_secs",
         "stats.refresh_rates",
         "stats.alerts",
         "stats.net_icons",
@@ -1151,6 +1134,7 @@ fn hm_git_and_stats_families_are_rendered() {
     }
 
     for path in [
+        "stats.refresh_secs",
         "stats.battery_warn",
         "stats.disk_free_warn",
         "stats.disk_free_critical",
@@ -1256,6 +1240,7 @@ fn hm_recording_media_and_monitor_process_keys_are_rendered_and_rest_disposition
         "media.seek_step_video_secs",
         "media.poll_interval_secs",
         "media.players_priority",
+        "media.volume_step",
         "monitor.proc_rows",
         "monitor.processes",
         "monitor.process_io",
@@ -1411,6 +1396,8 @@ fn hm_usage_and_tailnet_keys_are_rendered_and_rest_dispositioned() {
         "usage.token_rollups",
         "usage.history_days",
         "usage.poll_interval_secs",
+        "usage.warn_percent",
+        "usage.crit_percent",
         "host_discovery.tailnet.enabled",
         "host_discovery.tailnet.online_only",
     ] {
@@ -1653,6 +1640,7 @@ fn every_numeric_option_matches_its_destination_range() {
         ("mediaSeekStepSecs", "media.seek_step_secs"),
         ("mediaSeekStepVideoSecs", "media.seek_step_video_secs"),
         ("mediaPollIntervalSecs", "media.poll_interval_secs"),
+        ("mediaVolumeStep", "media.volume_step"),
         ("monitorProcRows", "monitor.proc_rows"),
         ("limitsTestMaxParallel", "limits.test_max_parallel"),
         ("limitsTestTimeoutSecs", "limits.test_timeout_secs"),
@@ -1676,8 +1664,11 @@ fn every_numeric_option_matches_its_destination_range() {
         ("previewMaxBodyBytes", "preview.max_body_bytes"),
         ("usageHistoryDays", "usage.history_days"),
         ("usagePollIntervalSecs", "usage.poll_interval_secs"),
+        ("usageWarnPercent", "usage.warn_percent"),
+        ("usageCritPercent", "usage.crit_percent"),
         ("semanticIndexMaxFiles", "semantic.index_max_files"),
         ("semanticMapBudgetLines", "semantic.map_budget_lines"),
+        ("statsRefreshSecs", "stats.refresh_secs"),
         ("statsBatteryWarn", "stats.battery_warn"),
         ("statsDiskFreeWarn", "stats.disk_free_warn"),
         ("statsDiskFreeCritical", "stats.disk_free_critical"),
@@ -1691,6 +1682,7 @@ fn every_numeric_option_matches_its_destination_range() {
         "every Nix integer/port type must have an explicit Rust schema destination"
     );
 
+    let mut pinned_floats = BTreeSet::new();
     for (name, nix_type) in options {
         let path = expected
             .iter()
@@ -1700,6 +1692,22 @@ fn every_numeric_option_matches_its_destination_range() {
         let schema_type = schema.get("type").and_then(Value::as_str);
         if schema_type == Some("number") {
             let format = schema.get("format").and_then(Value::as_str);
+            if let Some((min, max)) = float_range(path) {
+                assert!(
+                    matches!(format, None | Some("double" | "float")),
+                    "schema number format for {path} must be f64 or f32, got {format:?}"
+                );
+                if let Some(maximum) = schema.get("maximum").and_then(Value::as_f64) {
+                    assert_eq!(maximum, max, "schema maximum for pinned float field {path}");
+                }
+                assert_eq!(
+                    nix_type,
+                    format!("lib.types.numbers.between {min} {max}"),
+                    "Nix type for pinned float field {path}"
+                );
+                pinned_floats.insert(path);
+                continue;
+            }
             assert!(
                 format.is_none() || format == Some("double"),
                 "schema number format for {path} must be absent, got {format:?}"
@@ -1834,6 +1842,112 @@ fn every_numeric_option_matches_its_destination_range() {
                 nix_type, "lib.types.ints.unsigned",
                 "Nix type for unsigned schema field {path}"
             );
+        }
+    }
+    assert_eq!(
+        pinned_floats,
+        FLOAT_RANGES
+            .iter()
+            .map(|(path, _, _)| *path)
+            .collect::<BTreeSet<&str>>(),
+        "every pinned float range must map to a rendered Nix option"
+    );
+}
+
+/// Float keys whose valid range is enforced outside the schema (a Rust
+/// validator, or a schema maximum whose minimum comes from the duration walk).
+/// Each range is pinned three ways: the Nix `numbers.between` type, the Rust
+/// validator's endpoints, and `config_validate::FLOAT_KEY_RANGES`.
+const FLOAT_RANGES: &[(&str, f64, f64)] = &[
+    (
+        "stats.refresh_secs",
+        0.0,
+        thegn_core::time_policy::MAX_CADENCE_SECS as f64,
+    ),
+    ("media.volume_step", 0.0, 1.0),
+    ("usage.warn_percent", 0.0, 100.0),
+    ("usage.crit_percent", 0.0, 100.0),
+];
+
+fn float_range(path: &str) -> Option<(f64, f64)> {
+    FLOAT_RANGES
+        .iter()
+        .find_map(|(candidate, min, max)| (*candidate == path).then_some((*min, *max)))
+}
+
+/// `(errors, warnings)` naming `path` for a one-key config body.
+fn float_key_diagnostics(path: &str, value: &str) -> (Vec<String>, Vec<String>) {
+    use thegn_core::config_validate::{ValidationSeverity, validate_diagnostics};
+    let (section, key) = path.split_once('.').expect("dotted float key");
+    let mut errors = Vec::new();
+    let mut warnings = Vec::new();
+    for diagnostic in validate_diagnostics(&format!("[{section}]\n{key} = {value}\n")) {
+        if !diagnostic.message.contains(path) {
+            continue;
+        }
+        match diagnostic.severity {
+            ValidationSeverity::Error => errors.push(diagnostic.message),
+            ValidationSeverity::Warning => warnings.push(diagnostic.message),
+        }
+    }
+    (errors, warnings)
+}
+
+/// The Rust-validated float display keys WARN (never refuse startup) on an
+/// out-of-range or non-finite value; the schema-ranged `stats.refresh_secs`
+/// keeps its existing error. Endpoints produce nothing either way.
+#[test]
+fn pinned_float_ranges_match_the_rust_validators() {
+    let warn_only: BTreeSet<&str> = thegn_core::config_validate::FLOAT_KEY_RANGES
+        .iter()
+        .map(|(path, _, _)| *path)
+        .collect();
+    for (path, min, max) in thegn_core::config_validate::FLOAT_KEY_RANGES {
+        assert_eq!(
+            float_range(path),
+            Some((min, max)),
+            "validator range for {path} must be pinned in FLOAT_RANGES"
+        );
+    }
+    for (path, min, max) in FLOAT_RANGES {
+        for accepted in [*min, *max] {
+            let (errors, warnings) = float_key_diagnostics(path, &format!("{accepted:?}"));
+            assert!(errors.is_empty(), "{path} = {accepted}: {errors:?}");
+            assert!(warnings.is_empty(), "{path} = {accepted}: {warnings:?}");
+        }
+        for out_of_range in [
+            format!("{:?}", min - 0.001),
+            format!("{:?}", max + 0.001),
+            "nan".to_string(),
+            "inf".to_string(),
+        ] {
+            let (errors, warnings) = float_key_diagnostics(path, &out_of_range);
+            if warn_only.contains(path) {
+                // TOML `nan`/`inf` have no JSON number, so the schema walk's
+                // pre-existing type check still names them ("expected number,
+                // got null"); the range validator itself never errors.
+                let finite = out_of_range != "nan" && out_of_range != "inf";
+                assert!(
+                    errors
+                        .iter()
+                        .all(|error| { !finite && error.contains("expected number, got null") }),
+                    "{path} = {out_of_range} must not refuse on range: {errors:?}"
+                );
+                assert_eq!(
+                    warnings.len(),
+                    1,
+                    "{path} = {out_of_range} must warn: {warnings:?}"
+                );
+                assert!(
+                    warnings[0].contains(&format!("{min}..={max}")),
+                    "{warnings:?}"
+                );
+            } else {
+                assert!(
+                    !errors.is_empty(),
+                    "{path} = {out_of_range} must be rejected"
+                );
+            }
         }
     }
 }
