@@ -311,6 +311,8 @@ until its scope is granted.
 | `notify_push`               | `write`       | push a tray notification (title, optional body/urgency/source)         |
 | `sessions_open`             | `write`       | open a session — raw `argv`, or a configured agent by name             |
 | `sessions_kill`             | `write`       | kill a session's process (idempotent)                                  |
+| `sessions_resize`           | `write`       | resize a live session's PTY (`session`, `rows`, `cols`)                |
+| `worktrees_open`            | `write`       | focus a workspace in the running instance (`repo`, optional `branch`)  |
 | `sessions_input`            | `write` **+** | send raw terminal input/control characters to a live session           |
 
 The two `semantic_*` read tools (default `--scopes read`) answer from the
@@ -337,8 +339,8 @@ verbatim.
 Every tool in `tools/list` carries MCP `annotations`: the docs tools and the
 `read`-scope state tools are `readOnlyHint: true`; `sessions_kill`,
 `sessions_input` and `tools_run` are `destructiveHint: true`; `folders_assign`,
-`editor_open`, `merge_add`, `notify_push`, `sessions_open` and `sessions_fork`
-are write tools marked `destructiveHint: false`. A new write tool is marked destructive until it is
+`editor_open`, `merge_add`, `notify_push`, `sessions_open`, `sessions_fork`,
+`sessions_resize` and `worktrees_open` are write tools marked `destructiveHint: false`. A new write tool is marked destructive until it is
 reviewed. The hints help clients ask before acting; the scopes above are what
 thegn enforces.
 

@@ -1320,6 +1320,96 @@ mod tests {
         rows
     }
 
+    /// Every control byte Git can store in a text field (0x00 frames records).
+    fn control_bytes() -> Vec<u8> {
+        let mut bytes: Vec<u8> = (0x01u8..=0x1f).collect();
+        bytes.push(0x7f);
+        bytes
+    }
+
+    #[test]
+    fn commits_every_control_byte_round_trips_without_shifting_fields() {
+        for b in control_bytes() {
+            let c = char::from(b);
+            let author = format!("A{c}nn");
+            let email = format!("a{c}@e");
+            let subject = format!("sub{c}ject{c}");
+            let mut mid = commit_fields(1, &subject);
+            mid[2] = author.clone();
+            mid[3] = email.clone();
+            let records = [
+                nul_record(&commit_fields(0, "first")),
+                nul_record(&mid),
+                nul_record(&commit_fields(2, "third")),
+            ];
+            let parsed = parse_commits(&records.concat())
+                .unwrap_or_else(|e| panic!("byte {b:#04x} must parse: {e}"));
+            assert_eq!(parsed.len(), 3, "byte {b:#04x}");
+            let expect_first = parse_commits(&records[0]).unwrap();
+            let expect_third = parse_commits(&records[2]).unwrap();
+            assert_eq!(parsed[0], expect_first[0], "byte {b:#04x}");
+            assert_eq!(parsed[2], expect_third[0], "byte {b:#04x}");
+            assert_eq!(parsed[1].author, author, "byte {b:#04x}");
+            assert_eq!(parsed[1].email, email, "byte {b:#04x}");
+            assert_eq!(parsed[1].subject, subject, "byte {b:#04x}");
+            assert_eq!(parsed[1].sha, oid(1), "byte {b:#04x}");
+            assert_eq!(parsed[1].date, 101, "byte {b:#04x}");
+        }
+    }
+
+    #[test]
+    fn stashes_every_control_byte_round_trips_without_shifting_fields() {
+        for b in control_bytes() {
+            let c = char::from(b);
+            let message = format!("WIP{c}on{c}main");
+            let mut mid = stash_fields(1);
+            mid[3] = message.clone();
+            let records = [
+                nul_record(&stash_fields(0)),
+                nul_record(&mid),
+                nul_record(&stash_fields(2)),
+            ];
+            let parsed = parse_stashes(&records.concat())
+                .unwrap_or_else(|e| panic!("byte {b:#04x} must parse: {e}"));
+            assert_eq!(parsed.len(), 3, "byte {b:#04x}");
+            assert_eq!(parsed[0], parse_stashes(&records[0]).unwrap()[0]);
+            assert_eq!(parsed[2], parse_stashes(&records[2]).unwrap()[0]);
+            assert_eq!(parsed[1].message, message, "byte {b:#04x}");
+            assert_eq!(parsed[1].index, 1, "byte {b:#04x}");
+            assert_eq!(parsed[1].sha, oid(2), "byte {b:#04x}");
+        }
+    }
+
+    #[test]
+    fn commit_and_stash_truncation_prefixes_equal_the_leading_records() {
+        let records = commit_records(3);
+        let input: String = records.concat();
+        let bounds = boundaries(&records);
+        for cut in 0..=input.len() {
+            if !input.is_char_boundary(cut) {
+                continue;
+            }
+            if let Ok(rows) = parse_commits(&input[..cut]) {
+                let k = bounds.iter().position(|b| *b == cut).expect("boundary");
+                let expect = parse_commits(&records[..k].concat()).unwrap();
+                assert_eq!(rows, expect, "cut {cut}");
+            }
+        }
+        let records = stash_records(3);
+        let input: String = records.concat();
+        let bounds = boundaries(&records);
+        for cut in 0..=input.len() {
+            if !input.is_char_boundary(cut) {
+                continue;
+            }
+            if let Ok(rows) = parse_stashes(&input[..cut]) {
+                let k = bounds.iter().position(|b| *b == cut).expect("boundary");
+                let expect = parse_stashes(&records[..k].concat()).unwrap();
+                assert_eq!(rows, expect, "cut {cut}");
+            }
+        }
+    }
+
     #[test]
     fn commits_truncation_table_every_byte_offset() {
         let records = commit_records(4);

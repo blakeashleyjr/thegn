@@ -30,6 +30,14 @@ pub struct PluginStatusRow {
     pub queue_drops: u64,
     pub coalesced: u64,
     pub bridge: BridgeCounts,
+    /// Scheduler ticks skipped because the plugin's previous one-shot run was
+    /// still in flight. Absent in snapshots written before the field existed.
+    #[serde(default)]
+    pub sched_skipped: u64,
+    /// Scheduler ticks deferred to the next interval because the global
+    /// one-shot in-flight cap was reached.
+    #[serde(default)]
+    pub sched_overloaded: u64,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
@@ -69,6 +77,8 @@ pub fn encode(snapshot: &PluginStatusSnapshot) -> Result<Vec<u8>, String> {
                     queue_drops: row.queue_drops,
                     coalesced: row.coalesced,
                     bridge: row.bridge,
+                    sched_skipped: row.sched_skipped,
+                    sched_overloaded: row.sched_overloaded,
                 })
             })
             .take(MAX_STATUS_ROWS)
@@ -147,6 +157,8 @@ mod tests {
                     malformed: 11,
                     closed_wakeups: 12,
                 },
+                sched_skipped: 13,
+                sched_overloaded: 14,
             }],
         }
     }
@@ -270,6 +282,8 @@ mod tests {
                         malformed: u64::MAX,
                         closed_wakeups: u64::MAX,
                     },
+                    sched_skipped: u64::MAX,
+                    sched_overloaded: u64::MAX,
                 })
                 .collect(),
             ..Default::default()
@@ -284,5 +298,57 @@ mod tests {
             encode(&oversized).unwrap_err(),
             format!("plugin status snapshot is {encoded_len} bytes (max {MAX_STATUS_BYTES})")
         );
+    }
+
+    #[test]
+    fn round_trip_keeps_scheduler_counters() {
+        let snapshot = sample_snapshot();
+        let decoded = decode(&encode(&snapshot).expect("encode snapshot")).expect("decode bytes");
+        assert_eq!(decoded.rows[0].sched_skipped, 13);
+        assert_eq!(decoded.rows[0].sched_overloaded, 14);
+    }
+
+    #[test]
+    fn decoding_a_row_without_scheduler_counters_reads_zero() {
+        let old = br#"{"schema":1,"pid":3,"published_at_ms":5,"rows":[{"plugin":"old","in_flight":0,"rejected":1,"timed_out":0,"lost":0,"queue_drops":0,"coalesced":0,"bridge":{"calls":0,"timed_out":0,"cancelled":0,"late_replies":0,"malformed":0,"closed_wakeups":0}}]}"#;
+        let decoded = decode(old).expect("decode a pre-scheduler snapshot");
+        assert_eq!(decoded.rows[0].plugin, "old");
+        assert_eq!(decoded.rows[0].rejected, 1);
+        assert_eq!(decoded.rows[0].sched_skipped, 0);
+        assert_eq!(decoded.rows[0].sched_overloaded, 0);
+    }
+
+    #[test]
+    fn maximal_rows_with_scheduler_counters_fit_the_byte_bound() {
+        let maximal = PluginStatusSnapshot {
+            schema: STATUS_SCHEMA,
+            pid: u32::MAX,
+            published_at_ms: i64::MIN,
+            rows: (0..MAX_STATUS_ROWS)
+                .map(|index| PluginStatusRow {
+                    plugin: format!("{index:03}{}", "p".repeat(MAX_PLUGIN_ID_BYTES - 3)),
+                    in_flight: u64::MAX,
+                    rejected: u64::MAX,
+                    timed_out: u64::MAX,
+                    lost: u64::MAX,
+                    queue_drops: u64::MAX,
+                    coalesced: u64::MAX,
+                    bridge: BridgeCounts {
+                        calls: u64::MAX,
+                        timed_out: u64::MAX,
+                        cancelled: u64::MAX,
+                        late_replies: u64::MAX,
+                        malformed: u64::MAX,
+                        closed_wakeups: u64::MAX,
+                    },
+                    sched_skipped: u64::MAX,
+                    sched_overloaded: u64::MAX,
+                })
+                .collect(),
+        };
+        let bytes = encode(&maximal).expect("64 maximal rows fit the byte bound");
+        assert!(bytes.len() <= MAX_STATUS_BYTES);
+        let decoded = decode(&bytes).expect("decode maximal snapshot");
+        assert_eq!(decoded, maximal);
     }
 }
