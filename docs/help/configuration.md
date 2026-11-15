@@ -588,7 +588,11 @@ The `[notifications]` booleans are `notificationsDesktop`,
 `notificationsSurfaceSelfLogErrors`, `notificationsGithubMentions`,
 `notificationsAgentAttentionInbox` and `notificationsMergeQueueHoldDesktop`.
 `notificationsSoundMode` (`command` also needs `notifications.sound.command`
-in TOML) and `notificationsSoundAlwaysKinds` are exposed too.
+in TOML) and `notificationsSoundAlwaysKinds` are exposed too, along with
+`notificationsSoundMinPriority` and `notificationsDndAllowPriority` (`info`,
+`notice` or `alert`) and the `notificationsSoundPerPriority` and
+`notificationsSoundPerKind` maps (priority or kind name to a sound reference;
+invalid entries are refused at load).
 `[activity]` takes `activityEnabled`, `activityRedRequiresAgent` and
 `activityAgentPrograms` (a list of extra agent CLI program names).
 
