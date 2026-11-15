@@ -34,23 +34,25 @@ use std::time::{Duration, Instant};
 pub(crate) const PROVIDER_LOG_MAX_LINES: usize = 2_000;
 pub(crate) const PROVIDER_LOG_MAX_BYTES: usize = 1024 * 1024;
 
-/// Worst-case bytes one `LogCollector` holds at once. Terms, from `feed`:
+/// Bytes one `LogCollector` retains between `feed` calls (what `held_bytes`
+/// measures). Terms, from `feed`:
 /// - retained lines: `push_log_line` evicts until `kept_bytes <=
-///   PROVIDER_LOG_MAX_BYTES` (and at most `PROVIDER_LOG_MAX_LINES` lines, which
-///   after an unmatched-END redaction is at most `PROVIDER_LOG_MAX_LINES x
-///   (marker + newline)` bytes, still under the same cap);
-/// - the partial-line buffer `line`: `feed` clears it once it reaches
-///   `PROVIDER_LOG_MAX_BYTES`, so it never exceeds that;
-/// - the PEM marker tail: at most `"-----BEGIN ".len()` bytes;
-/// - one redaction margin: while a completed line is pushed, its redacted copy
-///   coexists with the raw line, and a line whose redacted length exceeds the
-///   cap is dropped, so the copy is budgeted at `PROVIDER_LOG_MAX_BYTES`.
+///   PROVIDER_LOG_MAX_BYTES`, and an unmatched-END redaction rewrites each of
+///   at most `PROVIDER_LOG_MAX_LINES` lines to the marker plus its line ending,
+///   which is still under that cap;
+/// - the partial line `line`: `feed` clears it once it reaches
+///   `PROVIDER_LOG_MAX_BYTES`;
+/// - the PEM marker tail: at most `"-----BEGIN ".len()` bytes.
 ///
+/// Not included: the transient working set while one completed line (at most
+/// `PROVIDER_LOG_MAX_BYTES` of input) is redacted and pushed. `ci_log::redact`
+/// builds intermediate strings and can expand matched secrets, so that working
+/// set is a small multiple of one line and is freed before `feed` returns.
 /// `finish` returns the retained lines only, so its text is at most
-/// `PROVIDER_LOG_MAX_BYTES` (tests allow one redaction-marker line on top).
+/// `PROVIDER_LOG_MAX_BYTES`.
 #[cfg_attr(not(test), allow(dead_code))]
 pub(crate) const LOG_COLLECTOR_PEAK_BYTES: usize =
-    3 * PROVIDER_LOG_MAX_BYTES + b"-----BEGIN ".len();
+    2 * PROVIDER_LOG_MAX_BYTES + b"-----BEGIN ".len();
 const GITLAB_JOBS_PAGE_SIZE: usize = 100;
 const GITLAB_JOBS_MAX_PAGES: usize = 50;
 const GITLAB_JOBS_MAX_ROWS: usize = GITLAB_JOBS_PAGE_SIZE * GITLAB_JOBS_MAX_PAGES;
