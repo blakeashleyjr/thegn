@@ -7962,4 +7962,155 @@ mod tests {
         assert!(error.to_string().contains("does not exist"), "{error}");
         assert!(error.downcast_ref::<ReportRunChanged>().is_none());
     }
+
+    fn old_done_parent(db: &Db) -> i64 {
+        let parent = put_row(db, "linear:PRUNE-RACE", "/wt/parent");
+        db.update_dispatch_status(parent, AgentDispatchStatus::Done)
+            .unwrap();
+        db.conn()
+            .execute(
+                "UPDATE agent_dispatches SET status_changed_at_ms=0 WHERE id=?1",
+                [parent],
+            )
+            .unwrap();
+        parent
+    }
+
+    #[test]
+    fn admission_race_prune_vs_child_claim_never_orphans() {
+        for _ in 0..20 {
+            let (db, dir) = temp_db();
+            let parent = old_done_parent(&db);
+            let child = crate::issue::NewDispatch {
+                parent_id: Some(parent),
+                ..crate::issue::NewDispatch::new("linear:PRUNE-RACE", "/wt/child", "coder")
+            };
+            let path = dir.path().join("thegn.db");
+            let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
+            let prune_at = crate::util::now_ms() + 100 * 24 * 60 * 60 * 1000;
+            let (claim_result, prune_result) = std::thread::scope(|scope| {
+                let claim_path = path.clone();
+                let claim_barrier = std::sync::Arc::clone(&barrier);
+                let claim_worker = scope.spawn(move || {
+                    let other = Db::open_at(&claim_path).unwrap();
+                    claim_barrier.wait();
+                    other.claim_dispatch_admitted(child, 10, None, None, None)
+                });
+                let prune_path = path.clone();
+                let prune_barrier = std::sync::Arc::clone(&barrier);
+                let prune_worker = scope.spawn(move || {
+                    let other = Db::open_at(&prune_path).unwrap();
+                    prune_barrier.wait();
+                    other.prune_terminal_dispatches(prune_at)
+                });
+                (
+                    claim_worker.join().expect("child claim worker must finish"),
+                    prune_worker.join().expect("prune worker must finish"),
+                )
+            });
+            assert!(prune_result.is_ok(), "prune failed: {prune_result:?}");
+
+            let claim_succeeded = matches!(&claim_result, Ok(Ok(_)));
+            let missing_parent = claim_result.as_ref().err().is_some_and(|error| {
+                error
+                    .downcast_ref::<ParentDispatchConflict>()
+                    .is_some_and(|conflict| conflict.reason == ParentEdgeReason::Missing)
+            });
+            let parent_present = db.get_dispatch(parent).unwrap().is_some();
+            assert_eq!(
+                claim_succeeded, parent_present,
+                "claim={claim_result:?}; prune={prune_result:?}"
+            );
+            assert!(
+                claim_succeeded || missing_parent,
+                "claim must either commit with its parent or refuse a missing parent: {claim_result:?}"
+            );
+            let dangling: i64 = db
+                .conn()
+                .query_row(
+                    "SELECT count(*) FROM agent_dispatches c
+                     WHERE c.parent_id IS NOT NULL
+                       AND NOT EXISTS (
+                           SELECT 1 FROM agent_dispatches p WHERE p.id=c.parent_id
+                       )",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(
+                dangling, 0,
+                "prune/claim race created a dangling parent edge"
+            );
+        }
+    }
+
+    #[test]
+    fn admission_race_prune_commit_precedes_child_claim_refuses_missing_parent() {
+        let (db, dir) = temp_db();
+        let parent = old_done_parent(&db);
+        let child = crate::issue::NewDispatch {
+            parent_id: Some(parent),
+            ..crate::issue::NewDispatch::new("linear:PRUNE-RACE", "/wt/child", "coder")
+        };
+        let path = dir.path().join("thegn.db");
+        let prune_at = crate::util::now_ms() + 100 * 24 * 60 * 60 * 1000;
+        db.conn().execute_batch("BEGIN IMMEDIATE").unwrap();
+        let pruned = std::thread::scope(|scope| {
+            let worker_path = path.clone();
+            let worker = scope.spawn(move || {
+                let other = Db::open_at(&worker_path).unwrap();
+                other.prune_terminal_dispatches(prune_at)
+            });
+            std::thread::sleep(std::time::Duration::from_millis(25));
+            db.conn().execute_batch("COMMIT").unwrap();
+            worker.join().expect("prune worker must finish")
+        })
+        .unwrap();
+        assert_eq!(pruned, 1);
+
+        let error = db
+            .claim_dispatch_admitted(child, 10, None, None, None)
+            .unwrap_err();
+        assert_eq!(
+            error
+                .downcast_ref::<ParentDispatchConflict>()
+                .map(|conflict| conflict.reason.clone()),
+            Some(ParentEdgeReason::Missing)
+        );
+        assert!(db.get_dispatch(parent).unwrap().is_none());
+    }
+
+    #[test]
+    fn admission_race_child_claim_commit_precedes_prune_keeps_parent() {
+        let (db, _dir) = temp_db();
+        let parent = old_done_parent(&db);
+        let child = crate::issue::NewDispatch {
+            parent_id: Some(parent),
+            ..crate::issue::NewDispatch::new("linear:PRUNE-RACE", "/wt/child", "coder")
+        };
+        assert!(
+            db.claim_dispatch_admitted(child, 10, None, None, None)
+                .unwrap()
+                .is_ok()
+        );
+        assert_eq!(
+            db.prune_terminal_dispatches(crate::util::now_ms() + 100 * 24 * 60 * 60 * 1000)
+                .unwrap(),
+            0
+        );
+        assert!(db.get_dispatch(parent).unwrap().is_some());
+        let dangling: i64 = db
+            .conn()
+            .query_row(
+                "SELECT count(*) FROM agent_dispatches c
+                 WHERE c.parent_id IS NOT NULL
+                   AND NOT EXISTS (
+                       SELECT 1 FROM agent_dispatches p WHERE p.id=c.parent_id
+                   )",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(dangling, 0);
+    }
 }
