@@ -64,10 +64,7 @@ impl Default for SidebarDisplay {
             show_behind_base: false,
             commit_badge: "{n}c".into(),
             behind_badge: "{n}b".into(),
-            detail_fields: thegn_core::config::DetailField::valid_names()
-                .into_iter()
-                .filter_map(thegn_core::config::DetailField::parse)
-                .collect(),
+            detail_fields: thegn_core::config::DetailField::default_order().into(),
             detail_branch: true,
             detail_branch_stat: true,
             detail_pr: true,
@@ -3936,6 +3933,7 @@ mod tests {
             dirty_files: Some(3),
             last_commit_unix: Some(0),
             last_subject: Some("ascii subject".into()),
+            last_author: None,
         });
         let display = SidebarDisplay {
             show_behind_base: true,
