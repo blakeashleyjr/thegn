@@ -4,7 +4,7 @@
 //! user action. The workers communicate through a bounded-output channel and
 //! pulse the terminal waker; no process or blocking operation runs on the loop.
 
-use std::io::{Read, Write};
+use std::io::Write;
 use std::process::{Command, Stdio};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -15,8 +15,11 @@ use std::time::Duration;
 use termwiz::terminal::TerminalWaker;
 use thegn_core::config::VoiceConfig;
 use thegn_core::voice::VoiceState;
+use thegn_proc::{End, GroupState, Leader, Limits, Stream};
 
 const MAX_CAPTURE_BYTES: usize = 32 * 1024 * 1024;
+/// Newest capture stderr kept for a failure reason; never fails a capture.
+const CAPTURE_STDERR_TAIL: usize = 64 * 1024;
 
 #[derive(Debug)]
 pub(crate) enum VoiceMessage {
@@ -83,6 +86,10 @@ pub(crate) struct VoiceController {
     tx: Sender<VoiceMessage>,
     rx: Receiver<VoiceMessage>,
     capture_stop: Option<Sender<CaptureCommand>>,
+    /// Cancel flag of the in-flight COMMAND capture's `thegn_proc` run. Set
+    /// wherever `capture_stop` is taken, dropped or replaced (native captures
+    /// keep the channel only).
+    capture_stop_flag: Option<Arc<AtomicBool>>,
     capture_worker: Option<thread::JoinHandle<()>>,
     capture_terminal: bool,
     capture_generation: u64,
@@ -107,6 +114,7 @@ impl VoiceController {
             tx,
             rx,
             capture_stop: None,
+            capture_stop_flag: None,
             capture_worker: None,
             capture_terminal: true,
             capture_generation: 0,
@@ -192,7 +200,7 @@ impl VoiceController {
                 ..
             } if *generation == self.capture_generation => {
                 self.capture_terminal = true;
-                self.capture_stop = None;
+                self.release_capture_stop();
                 self.native_cancel = None;
             }
             VoiceMessage::CaptureComplete { generation, .. }
@@ -236,7 +244,7 @@ impl VoiceController {
             tracing::warn!("voice capture start refused while previous worker is still running");
             self.capture_generation = self.capture_generation.saturating_add(1);
             let generation = self.capture_generation;
-            self.capture_stop = None;
+            self.release_capture_stop();
             self.capture_terminal = true;
             send_capture(
                 &self.tx,
@@ -253,6 +261,7 @@ impl VoiceController {
         self.capture_generation = self.capture_generation.saturating_add(1);
         let generation = self.capture_generation;
         let (stop_tx, stop_rx) = mpsc::channel();
+        self.release_capture_stop();
         self.capture_stop = Some(stop_tx);
         self.capture_terminal = false;
         if self.cfg.capture_command.is_empty()
@@ -271,17 +280,21 @@ impl VoiceController {
                 waker.clone(),
             );
         } else {
+            // The command path observes the cancel flag, not the channel.
+            drop(stop_rx);
+            let stop_flag = Arc::new(AtomicBool::new(false));
+            self.capture_stop_flag = Some(stop_flag.clone());
             self.capture_worker = spawn_capture(
                 self.cfg.clone(),
                 pane_id,
                 generation,
-                stop_rx,
+                stop_flag,
                 self.tx.clone(),
                 waker.clone(),
             );
         }
         if self.capture_worker.is_none() {
-            self.capture_stop = None;
+            self.release_capture_stop();
             self.capture_terminal = true;
             let _ = self.tx.send(VoiceMessage::CaptureFailed {
                 pane_id,
@@ -296,6 +309,17 @@ impl VoiceController {
         if let Some(tx) = self.capture_stop.take() {
             let _ = tx.send(CaptureCommand::Stop);
         }
+        self.release_capture_stop();
+    }
+
+    /// Drop the stop channel and raise the command capture's cancel flag. A
+    /// dropped channel already stops a native capture; the flag is the
+    /// equivalent for a command capture under `thegn_proc`.
+    fn release_capture_stop(&mut self) {
+        self.capture_stop = None;
+        if let Some(flag) = self.capture_stop_flag.take() {
+            flag.store(true, Ordering::Release);
+        }
     }
 
     /// Signal the current transcriber without waiting on its worker. The
@@ -306,6 +330,7 @@ impl VoiceController {
             if let Some(tx) = self.capture_stop.take() {
                 let _ = tx.send(CaptureCommand::Cancel);
             }
+            self.release_capture_stop();
         }
         if let Some((_, cancel)) = self.transcription_cancel.take() {
             cancel.store(true, Ordering::Release);
@@ -341,7 +366,7 @@ impl VoiceController {
         } else if self.capture_unresolved == Some(generation) {
             self.capture_unresolved = None;
         }
-        self.capture_stop = None;
+        self.release_capture_stop();
         self.join_finished_workers();
     }
 
@@ -455,10 +480,17 @@ impl VoiceController {
 impl Drop for VoiceController {
     fn drop(&mut self) {
         let native = self.native_cancel.is_some();
+        let command = self.capture_stop_flag.is_some();
         self.stop_capture();
         self.cancel_transcription();
-        let deadline =
-            std::time::Instant::now() + Duration::from_millis(if native { 250 } else { 10 });
+        let deadline = std::time::Instant::now()
+            + Duration::from_millis(if native {
+                250
+            } else if command {
+                1_000
+            } else {
+                10
+            });
         while std::time::Instant::now() < deadline
             && (self
                 .capture_worker
@@ -479,21 +511,12 @@ fn spawn_capture(
     cfg: VoiceConfig,
     pane_id: u32,
     generation: u64,
-    stop_rx: Receiver<CaptureCommand>,
+    stop_flag: Arc<AtomicBool>,
     tx: Sender<VoiceMessage>,
     waker: TerminalWaker,
 ) -> Option<thread::JoinHandle<()>> {
     thegn_core::thread_name::try_spawn_named("thegn-voice-cap", move || {
         crate::platform::qos::set_self(crate::platform::qos::Qos::Utility);
-        let reaped_tx = tx.clone();
-        let reaped_waker = waker.clone();
-        let on_reaped: Arc<dyn Fn() + Send + Sync> = Arc::new(move || {
-            send_capture(
-                &reaped_tx,
-                &reaped_waker,
-                VoiceMessage::CaptureReaped { generation },
-            );
-        });
         let Some(program) = cfg.capture_command.first().cloned() else {
             send_capture(
                 &tx,
@@ -513,259 +536,156 @@ fn spawn_capture(
             .args(&argv[1..])
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
-        let (mut child, group) = match crate::platform::spawn_grouped_best_effort(&mut command) {
-            Ok(children) => children,
-            Err(e) => {
-                send_capture(
-                    &tx,
-                    &waker,
-                    VoiceMessage::CaptureFailed {
-                        pane_id,
-                        generation,
-                        reason: format!("start {program}: {e}"),
-                    },
-                );
-                return;
-            }
-        };
-        let stdout = child.stdout.take().expect("capture stdout was piped");
-        let stderr = child.stderr.take().expect("capture stderr was piped");
-        let (output_tx, output_rx) = mpsc::channel();
-        let output_thread = thegn_core::thread_name::spawn_named("thegn-voice-out", move || {
-            crate::platform::qos::set_self(crate::platform::qos::Qos::Utility);
-            let _ = output_tx.send(read_capped(stdout, MAX_CAPTURE_BYTES));
-        });
-        let (error_tx, error_rx) = mpsc::channel();
-        let error_thread = thegn_core::thread_name::spawn_named("thegn-voice-err", move || {
-            crate::platform::qos::set_self(crate::platform::qos::Qos::Utility);
-            let _ = error_tx.send(read_capped(stderr, MAX_CAPTURE_BYTES));
-        });
-        let mut requested_stop = false;
-        let mut stop_deadline = None;
-        let deadline = std::time::Instant::now() + max_duration;
-        let mut output = None;
-        let mut error = None;
-        let status = loop {
-            match stop_rx.try_recv() {
-                Ok(CaptureCommand::Stop | CaptureCommand::Cancel) => {
-                    if !requested_stop {
-                        requested_stop = true;
-                        stop_deadline =
-                            Some(std::time::Instant::now() + Duration::from_millis(200));
-                        kill_capture_child(&mut child, &group);
-                    }
-                }
-                Err(TryRecvError::Disconnected) => {
-                    if !requested_stop {
-                        requested_stop = true;
-                        stop_deadline =
-                            Some(std::time::Instant::now() + Duration::from_millis(200));
-                        kill_capture_child(&mut child, &group);
-                    }
-                }
-                Err(TryRecvError::Empty) => {}
-            }
-            if !requested_stop && std::time::Instant::now() >= deadline {
-                requested_stop = true;
-                stop_deadline = Some(std::time::Instant::now() + Duration::from_millis(200));
-                send_capture(
-                    &tx,
-                    &waker,
-                    VoiceMessage::MaxDuration {
-                        pane_id,
-                        generation,
-                    },
-                );
-                kill_capture_child(&mut child, &group);
-            }
-            if stop_deadline.is_some_and(|until| std::time::Instant::now() >= until) {
-                let process_stopped = terminate_capture_child(child, group, &on_reaped);
-                let readers_stopped = join_capture_workers(output_thread, error_thread);
-                send_capture(
-                    &tx,
-                    &waker,
-                    capture_failure(
-                        pane_id,
-                        generation,
-                        if process_stopped && readers_stopped {
-                            "capture shutdown did not produce a complete result"
-                        } else {
-                            "capture process shutdown could not be proven"
-                        },
-                        !process_stopped || !readers_stopped,
-                    ),
-                );
-                return;
-            }
-            if output.is_none() {
-                output = output_rx.try_recv().ok();
-                if matches!(&output, Some(Err(_))) {
-                    let process_stopped = terminate_capture_child(child, group, &on_reaped);
-                    let readers_stopped = join_capture_workers(output_thread, error_thread);
-                    let reason = output
-                        .and_then(Result::err)
-                        .unwrap_or_else(|| "capture output reader failed".into());
-                    send_capture(
-                        &tx,
-                        &waker,
-                        capture_failure(
-                            pane_id,
-                            generation,
-                            if process_stopped && readers_stopped {
-                                reason
-                            } else {
-                                "capture shutdown unresolved after output failure".into()
-                            },
-                            !process_stopped || !readers_stopped,
-                        ),
-                    );
-                    return;
-                }
-            }
-            if error.is_none() {
-                error = error_rx.try_recv().ok();
-                if matches!(&error, Some(Err(_))) {
-                    let process_stopped = terminate_capture_child(child, group, &on_reaped);
-                    let readers_stopped = join_capture_workers(output_thread, error_thread);
-                    let reason = error
-                        .and_then(Result::err)
-                        .unwrap_or_else(|| "capture error reader failed".into());
-                    send_capture(
-                        &tx,
-                        &waker,
-                        capture_failure(
-                            pane_id,
-                            generation,
-                            if process_stopped && readers_stopped {
-                                reason
-                            } else {
-                                "capture shutdown unresolved after error-pipe failure".into()
-                            },
-                            !process_stopped || !readers_stopped,
-                        ),
-                    );
-                    return;
-                }
-            }
-            match child.try_wait() {
-                Ok(Some(status)) => break status,
-                Ok(None) => thread::sleep(Duration::from_millis(5)),
-                Err(e) => {
-                    let process_stopped = terminate_capture_child(child, group, &on_reaped);
-                    let readers_stopped = join_capture_workers(output_thread, error_thread);
-                    send_capture(
-                        &tx,
-                        &waker,
-                        capture_failure(
-                            pane_id,
-                            generation,
-                            if process_stopped && readers_stopped {
-                                format!("wait for capture: {e}")
-                            } else {
-                                format!("capture shutdown unresolved after wait failure: {e}")
-                            },
-                            !process_stopped || !readers_stopped,
-                        ),
-                    );
-                    return;
-                }
-            }
-        };
-        // A child can exit while a descendant still owns one of the
-        // pipes. Kill the grouped process tree before joining helpers so
-        // no reader survives the utterance.
-        if (!group.is_empty() || output.is_none() || error.is_none())
-            && !terminate_capture_child(child, group, &on_reaped)
-        {
-            let readers_stopped = join_capture_workers(output_thread, error_thread);
-            send_capture(
-                &tx,
-                &waker,
-                capture_failure(
-                    pane_id,
-                    generation,
-                    if readers_stopped {
-                        "capture process shutdown could not be proven"
-                    } else {
-                        "capture process and pipe-worker shutdown could not be proven"
-                    },
-                    true,
-                ),
-            );
-            return;
-        }
-        if !join_capture_workers(output_thread, error_thread) {
-            send_capture(
-                &tx,
-                &waker,
-                capture_failure(
-                    pane_id,
-                    generation,
-                    "capture pipe reader did not settle",
-                    true,
-                ),
-            );
-            return;
-        }
-        let wav = match output.or_else(|| output_rx.recv().ok()) {
-            Some(Ok(wav)) => wav,
-            Some(Err(reason)) => {
-                send_capture(
-                    &tx,
-                    &waker,
-                    VoiceMessage::CaptureFailed {
-                        pane_id,
-                        generation,
-                        reason,
-                    },
-                );
-                return;
-            }
-            None => {
-                send_capture(
-                    &tx,
-                    &waker,
-                    VoiceMessage::CaptureFailed {
-                        pane_id,
-                        generation,
-                        reason: "capture output reader did not report".into(),
-                    },
-                );
-                return;
-            }
-        };
-        let stderr = error
-            .or_else(|| error_rx.recv().ok())
-            .and_then(Result::ok)
-            .unwrap_or_default();
-        if !status.success() && (!requested_stop || wav.is_empty()) {
-            let detail = String::from_utf8_lossy(&stderr).trim().to_string();
-            send_capture(
-                &tx,
-                &waker,
-                VoiceMessage::CaptureFailed {
-                    pane_id,
-                    generation,
-                    reason: if detail.is_empty() {
-                        format!("capture exited with {status}")
-                    } else {
-                        detail
-                    },
+        // thegn_proc owns the process group: a stop is a cancel (TERM, then
+        // KILL after `term_grace`), `max_duration` is the group timeout, and
+        // stdout is capped. Escalation and reaping happen inside `run`.
+        let run = thegn_proc::run(
+            &mut command,
+            &Limits {
+                stdout: Stream::HeadOrFail {
+                    cap: MAX_CAPTURE_BYTES,
                 },
-            );
-        } else {
+                stderr: Stream::Tail {
+                    cap: CAPTURE_STDERR_TAIL,
+                },
+                term_grace: Duration::from_millis(200),
+                kill_settle: Duration::from_millis(200),
+                reader_grace: Duration::from_millis(100),
+                quiesce_after_leader: Some(Duration::ZERO),
+                ..Limits::silent(max_duration)
+            },
+            &stop_flag,
+        );
+        let leader = match &run.leader {
+            Leader::Reaped(status) => Some(LeaderStatus {
+                success: status.success(),
+                text: status.to_string(),
+            }),
+            Leader::ReapFailed(_) | Leader::Detached | Leader::NotSpawned => None,
+        };
+        if matches!(run.leader, Leader::Reaped(_)) {
+            send_capture(&tx, &waker, VoiceMessage::CaptureReaped { generation });
+        }
+        let end = match run.end {
+            End::LeaderExited => EndClass::LeaderExited,
+            End::Cancelled => EndClass::Stopped,
+            End::TimedOut => EndClass::TimedOut,
+            End::OutputLimit(which) => EndClass::OutputLimit(which),
+            End::Spawn(error) => EndClass::Spawn {
+                program,
+                error: error.to_string(),
+            },
+            End::Supervise(error) => EndClass::Supervise(error.to_string()),
+        };
+        let outcome = capture_outcome(end, run.group, leader, run.stdout.bytes, &run.stderr.bytes);
+        if outcome.max_duration {
             send_capture(
                 &tx,
                 &waker,
-                VoiceMessage::CaptureComplete {
+                VoiceMessage::MaxDuration {
                     pane_id,
                     generation,
-                    wav,
                 },
             );
         }
+        let message = match outcome.result {
+            CaptureResult::Complete(wav) => VoiceMessage::CaptureComplete {
+                pane_id,
+                generation,
+                wav,
+            },
+            CaptureResult::Failed { reason, unresolved } => {
+                capture_failure(pane_id, generation, reason, unresolved)
+            }
+        };
+        send_capture(&tx, &waker, message);
     })
     .ok()
+}
+
+/// How a command capture's `thegn_proc` run ended, reduced to what the
+/// outcome mapping needs (pure, so the matrix is unit-testable).
+#[derive(Debug)]
+enum EndClass {
+    LeaderExited,
+    /// The stop flag was seen (stop, cancel, or the controller dropped the capture).
+    Stopped,
+    /// `max_duration` elapsed.
+    TimedOut,
+    OutputLimit(thegn_proc::Which),
+    Spawn {
+        program: String,
+        error: String,
+    },
+    Supervise(String),
+}
+
+/// The reaped leader's exit status.
+#[derive(Debug)]
+struct LeaderStatus {
+    success: bool,
+    text: String,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum CaptureResult {
+    Complete(Vec<u8>),
+    Failed { reason: String, unresolved: bool },
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct CaptureOutcome {
+    /// Send `VoiceMessage::MaxDuration` before the result.
+    max_duration: bool,
+    result: CaptureResult,
+}
+
+fn capture_outcome(
+    end: EndClass,
+    group: GroupState,
+    leader: Option<LeaderStatus>,
+    wav: Vec<u8>,
+    stderr: &[u8],
+) -> CaptureOutcome {
+    let failed = |reason: String, unresolved: bool| CaptureResult::Failed { reason, unresolved };
+    let max_duration = matches!(end, EndClass::TimedOut);
+    let requested_stop = !matches!(end, EndClass::LeaderExited);
+    let result = match end {
+        EndClass::Spawn { program, error } => failed(format!("start {program}: {error}"), false),
+        EndClass::Supervise(error) => failed(format!("wait for capture: {error}"), true),
+        // Fail closed: a member that outlived SIGKILL may still hold the device.
+        _ if group == GroupState::Survivors => {
+            failed("capture process shutdown could not be proven".into(), true)
+        }
+        EndClass::OutputLimit(thegn_proc::Which::Stdout) => failed(
+            format!("command output exceeds {MAX_CAPTURE_BYTES} byte limit"),
+            false,
+        ),
+        EndClass::OutputLimit(thegn_proc::Which::Stderr) => failed(
+            format!("capture stderr exceeds {CAPTURE_STDERR_TAIL} byte limit"),
+            false,
+        ),
+        EndClass::LeaderExited | EndClass::Stopped | EndClass::TimedOut => {
+            let success = leader.as_ref().is_some_and(|status| status.success);
+            if !success && (!requested_stop || wav.is_empty()) {
+                let detail = String::from_utf8_lossy(stderr).trim().to_string();
+                let reason = if !detail.is_empty() {
+                    detail
+                } else if let Some(status) = &leader {
+                    format!("capture exited with {}", status.text)
+                } else {
+                    "capture exited without a reapable status".into()
+                };
+                failed(reason, false)
+            } else {
+                CaptureResult::Complete(wav)
+            }
+        }
+    };
+    CaptureOutcome {
+        max_duration,
+        result,
+    }
 }
 
 #[expect(
@@ -829,10 +749,6 @@ fn terminate_capture_child(
     }
 }
 
-fn join_capture_workers(output: thread::JoinHandle<()>, error: thread::JoinHandle<()>) -> bool {
-    join_voice_workers(vec![output, error])
-}
-
 fn join_voice_workers(workers: Vec<thread::JoinHandle<()>>) -> bool {
     let until = std::time::Instant::now() + Duration::from_millis(60);
     while std::time::Instant::now() < until && !workers.iter().all(thread::JoinHandle::is_finished)
@@ -875,19 +791,6 @@ fn worker_eof_before_final() -> String {
     "voice worker exited without a final transcript".into()
 }
 
-fn kill_capture_child(child: &mut std::process::Child, group: &crate::platform::GroupHandle) {
-    group.kill();
-    if let Err(kill_error) = child.kill() {
-        match child.try_wait() {
-            Ok(Some(_)) => {}
-            Ok(None) => tracing::warn!(%kill_error, "voice capture child kill failed"),
-            Err(wait_error) => {
-                tracing::warn!(%kill_error, %wait_error, "voice capture child kill and wait failed")
-            }
-        }
-    }
-}
-
 fn send_capture(tx: &Sender<VoiceMessage>, waker: &TerminalWaker, msg: VoiceMessage) {
     let _ = tx.send(msg); // best-effort: loop may have exited
     let _ = waker.wake(); // best-effort: waker pulse
@@ -912,18 +815,6 @@ fn capture_failure(
             reason: reason.into(),
         }
     }
-}
-
-fn read_capped(reader: impl Read, cap: usize) -> Result<Vec<u8>, String> {
-    let mut out = Vec::new();
-    reader
-        .take(cap as u64 + 1)
-        .read_to_end(&mut out)
-        .map_err(|e| e.to_string())?;
-    if out.len() > cap {
-        return Err(format!("command output exceeds {cap} byte limit"));
-    }
-    Ok(out)
 }
 
 /// Return the ordinary mode chip plus a capability-safe recording marker.
@@ -1308,12 +1199,226 @@ mod tests {
         );
     }
 
+    fn reaped(success: bool) -> Option<LeaderStatus> {
+        Some(LeaderStatus {
+            success,
+            text: if success {
+                "exit status: 0".into()
+            } else {
+                "signal: 15 (SIGTERM)".into()
+            },
+        })
+    }
+
+    fn failed(reason: &str, unresolved: bool) -> CaptureResult {
+        CaptureResult::Failed {
+            reason: reason.into(),
+            unresolved,
+        }
+    }
+
+    #[test]
+    fn capture_outcome_maps_every_run_end() {
+        let wav = || b"RIFF".to_vec();
+        // Leader exits successfully: complete.
+        let success = capture_outcome(
+            EndClass::LeaderExited,
+            GroupState::Drained,
+            reaped(true),
+            wav(),
+            b"",
+        );
+        assert_eq!(success.result, CaptureResult::Complete(wav()));
+        assert!(!success.max_duration);
+
+        // Non-success without a stop: fail with stderr, else the status.
+        let with_detail = capture_outcome(
+            EndClass::LeaderExited,
+            GroupState::Drained,
+            reaped(false),
+            wav(),
+            b"  no microphone\n",
+        );
+        assert_eq!(with_detail.result, failed("no microphone", false));
+        let with_status = capture_outcome(
+            EndClass::LeaderExited,
+            GroupState::Drained,
+            reaped(false),
+            wav(),
+            b"",
+        );
+        assert_eq!(
+            with_status.result,
+            failed("capture exited with signal: 15 (SIGTERM)", false)
+        );
+
+        // Stop with audio keeps the audio even though the leader was signalled.
+        let stop_with_wav = capture_outcome(
+            EndClass::Stopped,
+            GroupState::Terminated,
+            reaped(false),
+            wav(),
+            b"",
+        );
+        assert_eq!(stop_with_wav.result, CaptureResult::Complete(wav()));
+        assert!(!stop_with_wav.max_duration);
+
+        // Stop without audio fails.
+        let stop_without_wav = capture_outcome(
+            EndClass::Stopped,
+            GroupState::Terminated,
+            reaped(false),
+            Vec::new(),
+            b"interrupted",
+        );
+        assert_eq!(stop_without_wav.result, failed("interrupted", false));
+
+        // Timeout announces MaxDuration first, then behaves as a stop.
+        let timeout = capture_outcome(
+            EndClass::TimedOut,
+            GroupState::Terminated,
+            reaped(false),
+            wav(),
+            b"",
+        );
+        assert!(timeout.max_duration);
+        assert_eq!(timeout.result, CaptureResult::Complete(wav()));
+
+        // Oversized stdout keeps the historical wording.
+        let limit = capture_outcome(
+            EndClass::OutputLimit(thegn_proc::Which::Stdout),
+            GroupState::Terminated,
+            reaped(false),
+            Vec::new(),
+            b"",
+        );
+        assert_eq!(
+            limit.result,
+            failed(
+                &format!("command output exceeds {MAX_CAPTURE_BYTES} byte limit"),
+                false
+            )
+        );
+
+        // Survivors fail closed as unresolved, whatever else happened.
+        let survivors = capture_outcome(
+            EndClass::LeaderExited,
+            GroupState::Survivors,
+            reaped(true),
+            wav(),
+            b"",
+        );
+        assert_eq!(
+            survivors.result,
+            failed("capture process shutdown could not be proven", true)
+        );
+
+        // Spawn failure keeps the `start {program}` wording.
+        let spawn = capture_outcome(
+            EndClass::Spawn {
+                program: "arecord".into(),
+                error: "No such file or directory (os error 2)".into(),
+            },
+            GroupState::Unknown,
+            None,
+            Vec::new(),
+            b"",
+        );
+        assert_eq!(
+            spawn.result,
+            failed(
+                "start arecord: No such file or directory (os error 2)",
+                false
+            )
+        );
+
+        // A supervision failure could not prove shutdown.
+        let supervise = capture_outcome(
+            EndClass::Supervise("waitid failed".into()),
+            GroupState::Unknown,
+            None,
+            Vec::new(),
+            b"",
+        );
+        assert_eq!(
+            supervise.result,
+            failed("wait for capture: waitid failed", true)
+        );
+    }
+
+    #[test]
+    fn stop_capture_sets_the_capture_flag() {
+        let mut controller = VoiceController::new(VoiceConfig::default());
+        let flag = Arc::new(AtomicBool::new(false));
+        let (stop_tx, _stop_rx) = mpsc::channel();
+        controller.capture_stop = Some(stop_tx);
+        controller.capture_stop_flag = Some(flag.clone());
+        controller.stop_capture();
+        assert!(flag.load(Ordering::Acquire));
+        assert!(controller.capture_stop.is_none());
+        assert!(controller.capture_stop_flag.is_none());
+
+        // Finishing (or replacing) a capture also releases its flag.
+        let finished = Arc::new(AtomicBool::new(false));
+        controller.capture_stop_flag = Some(finished.clone());
+        controller.capture_finished(1, false);
+        assert!(finished.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn command_capture_returns_wav_on_stop() {
+        if !UNIX {
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let marker = dir.path().join("ready");
+        let config = VoiceConfig {
+            capture_command: vec![
+                "sh".into(),
+                "-c".into(),
+                "printf RIFF; : >\"$1\"; exec sleep 30".into(),
+                "sh".into(),
+                marker.display().to_string(),
+            ],
+            ..VoiceConfig::default()
+        };
+        let (waker, _master, _terminal) = test_waker();
+        let (tx, rx) = mpsc::channel();
+        let stop = Arc::new(AtomicBool::new(false));
+        let worker = spawn_capture(config, 1, 1, stop.clone(), tx, waker).unwrap();
+        let ready_by = std::time::Instant::now() + Duration::from_secs(10);
+        while !marker.exists() {
+            assert!(
+                std::time::Instant::now() < ready_by,
+                "capture command never started"
+            );
+            thread::sleep(Duration::from_millis(5));
+        }
+        stop.store(true, Ordering::Release);
+        let terminal = loop {
+            match rx.recv_timeout(Duration::from_secs(3)).unwrap() {
+                VoiceMessage::CaptureReaped { generation } => assert_eq!(generation, 1),
+                message => break message,
+            }
+        };
+        match terminal {
+            VoiceMessage::CaptureComplete {
+                generation, wav, ..
+            } => {
+                assert_eq!(generation, 1);
+                assert_eq!(wav, b"RIFF");
+            }
+            other => panic!("expected CaptureComplete, got {other:?}"),
+        }
+        worker.join().unwrap();
+    }
+
     #[test]
     fn stalled_capture_reader_does_not_make_join_unbounded() {
         let output = thread::spawn(|| thread::sleep(Duration::from_millis(300)));
         let error = thread::spawn(|| {});
         let start = std::time::Instant::now();
-        assert!(!join_capture_workers(output, error));
+        assert!(!join_voice_workers(vec![output, error]));
         assert!(start.elapsed() < Duration::from_millis(200));
     }
 
@@ -1417,8 +1522,8 @@ mod tests {
         };
         let (waker, _master, _terminal) = test_waker();
         let (tx, rx) = mpsc::channel();
-        let (_stop_tx, stop_rx) = mpsc::channel();
-        let worker = spawn_capture(config, 1, 1, stop_rx, tx, waker).unwrap();
+        let worker =
+            spawn_capture(config, 1, 1, Arc::new(AtomicBool::new(false)), tx, waker).unwrap();
         let mut saw_reaped = false;
         let terminal = loop {
             match rx.recv_timeout(Duration::from_secs(2)).unwrap() {
