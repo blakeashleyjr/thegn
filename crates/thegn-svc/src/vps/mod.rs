@@ -53,34 +53,126 @@ pub struct InventoryPage<T> {
     pub total: Option<u64>,
 }
 
-async fn collect_pages<'a, T, F, P, I>(mut fetch: F, parse: P, id_of: I) -> Result<Vec<T>>
+/// Why a provider inventory is only a prefix of the truth.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PartialReason {
+    PageCap,
+    RowCap,
+    Budget,
+    TotalMismatch,
+    DuplicateId,
+}
+
+impl PartialReason {
+    /// The legacy refusal text (what `collect_pages` has always returned).
+    pub fn message(self) -> &'static str {
+        match self {
+            PartialReason::PageCap => "inventory exceeds the page cap; refusing a partial list",
+            PartialReason::RowCap => "inventory exceeds the row cap; refusing a partial list",
+            PartialReason::Budget => {
+                "inventory listing exceeded the 120 second budget; refusing a partial list"
+            }
+            PartialReason::TotalMismatch => "inventory total does not match collected rows",
+            PartialReason::DuplicateId => {
+                "inventory contains a duplicate id; refusing a partial list"
+            }
+        }
+    }
+}
+
+impl fmt::Display for PartialReason {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            PartialReason::PageCap => "page cap",
+            PartialReason::RowCap => "row cap",
+            PartialReason::Budget => "budget",
+            PartialReason::TotalMismatch => "total mismatch",
+            PartialReason::DuplicateId => "duplicate id",
+        })
+    }
+}
+
+/// A provider inventory with its completeness made explicit. Only `Complete`
+/// may drive absence inference or deletion; `Partial` rows are diagnostics.
+#[derive(Debug)]
+pub enum Inventory<T> {
+    Complete(Vec<T>),
+    Partial {
+        rows: Vec<T>,
+        reason: PartialReason,
+    },
+    /// A fetch, parse or configuration error: nothing is known.
+    Unknown(String),
+}
+
+impl<T> Inventory<T> {
+    pub fn is_complete(&self) -> bool {
+        matches!(self, Inventory::Complete(_))
+    }
+
+    /// Collapse to the legacy complete-or-error shape (same error strings).
+    pub fn into_complete(self) -> Result<Vec<T>> {
+        match self {
+            Inventory::Complete(rows) => Ok(rows),
+            Inventory::Partial { reason, .. } => Err(anyhow!(reason.message())),
+            Inventory::Unknown(reason) => Err(anyhow!(reason)),
+        }
+    }
+}
+
+enum InventoryStop {
+    Partial(PartialReason),
+    Unknown(String),
+}
+
+async fn collect_pages<'a, T, F, P, I>(fetch: F, parse: P, id_of: I) -> Result<Vec<T>>
 where
     F: FnMut(u32) -> BoxFuture<'a, Result<serde_json::Value>>,
     P: Fn(&serde_json::Value, u32) -> Result<InventoryPage<T>>,
     I: Fn(&T) -> String,
 {
-    tokio::time::timeout(INVENTORY_BUDGET, async {
-        let mut all = Vec::new();
+    collect_inventory(fetch, parse, id_of).await.into_complete()
+}
+
+async fn collect_inventory<'a, T, F, P, I>(fetch: F, parse: P, id_of: I) -> Inventory<T>
+where
+    F: FnMut(u32) -> BoxFuture<'a, Result<serde_json::Value>>,
+    P: Fn(&serde_json::Value, u32) -> Result<InventoryPage<T>>,
+    I: Fn(&T) -> String,
+{
+    collect_inventory_with_budget(INVENTORY_BUDGET, fetch, parse, id_of).await
+}
+
+async fn collect_inventory_with_budget<'a, T, F, P, I>(
+    budget: Duration,
+    mut fetch: F,
+    parse: P,
+    id_of: I,
+) -> Inventory<T>
+where
+    F: FnMut(u32) -> BoxFuture<'a, Result<serde_json::Value>>,
+    P: Fn(&serde_json::Value, u32) -> Result<InventoryPage<T>>,
+    I: Fn(&T) -> String,
+{
+    let mut all = Vec::new();
+    let outcome = tokio::time::timeout(budget, async {
         let mut ids = HashSet::new();
         let mut page_number = 1_u32;
         loop {
             if page_number > MAX_INVENTORY_PAGES {
-                return Err(anyhow!(
-                    "inventory exceeds the page cap; refusing a partial list"
-                ));
+                return Err(InventoryStop::Partial(PartialReason::PageCap));
             }
-            let body = fetch(page_number).await?;
-            let page = parse(&body, page_number)?;
+            let body = fetch(page_number)
+                .await
+                .map_err(|e| InventoryStop::Unknown(format!("{e:#}")))?;
+            let page =
+                parse(&body, page_number).map_err(|e| InventoryStop::Unknown(format!("{e:#}")))?;
             if all.len().saturating_add(page.items.len()) > MAX_INVENTORY_ROWS {
-                return Err(anyhow!(
-                    "inventory exceeds the row cap; refusing a partial list"
-                ));
+                return Err(InventoryStop::Partial(PartialReason::RowCap));
             }
             for item in page.items {
                 if !ids.insert(id_of(&item)) {
-                    return Err(anyhow!(
-                        "inventory contains a duplicate id; refusing a partial list"
-                    ));
+                    return Err(InventoryStop::Partial(PartialReason::DuplicateId));
                 }
                 all.push(item);
             }
@@ -88,17 +180,23 @@ where
                 if let Some(total) = page.total
                     && u64::try_from(all.len()).ok() != Some(total)
                 {
-                    return Err(anyhow!("inventory total does not match collected rows"));
+                    return Err(InventoryStop::Partial(PartialReason::TotalMismatch));
                 }
-                return Ok(all);
+                return Ok(());
             }
             page_number += 1;
         }
     })
-    .await
-    .map_err(|_| {
-        anyhow!("inventory listing exceeded the 120 second budget; refusing a partial list")
-    })?
+    .await;
+    match outcome {
+        Ok(Ok(())) => Inventory::Complete(all),
+        Ok(Err(InventoryStop::Partial(reason))) => Inventory::Partial { rows: all, reason },
+        Ok(Err(InventoryStop::Unknown(reason))) => Inventory::Unknown(reason),
+        Err(_) => Inventory::Partial {
+            rows: all,
+            reason: PartialReason::Budget,
+        },
+    }
 }
 
 fn matching_ssh_key(keys: Vec<(i64, String)>, pubkey: &str) -> Option<i64> {
@@ -688,10 +786,19 @@ impl VpsProvider {
     /// All thegn-managed instances (label-filtered server-side), with
     /// ips/creation times — complete or Err, for the reaper's view.
     async fn list_detailed_with(&self, priority: bool) -> Result<Vec<VpsInstance>> {
-        let base = self.spec.validated_api_base()?;
+        self.list_detailed_inventory(priority).await.into_complete()
+    }
+
+    /// Typed view of the managed-instance listing: complete, a labelled
+    /// partial prefix, or unknown. Only `Complete` may drive reaping.
+    pub async fn list_detailed_inventory(&self, priority: bool) -> Inventory<VpsInstance> {
+        let base = match self.spec.validated_api_base() {
+            Ok(base) => base,
+            Err(error) => return Inventory::Unknown(format!("{error:#}")),
+        };
         let base = base.as_str();
         let shaper = self.shaper();
-        collect_pages(
+        collect_inventory(
             move |page| {
                 Box::pin(async move {
                     let url = shaper.list_page_url(base, page);
@@ -713,7 +820,7 @@ impl VpsProvider {
     }
 
     pub async fn list_detailed_priority(&self) -> Result<Vec<VpsInstance>> {
-        self.list_detailed_with(true).await
+        self.list_detailed_inventory(true).await.into_complete()
     }
 
     /// Find one managed instance by name.
@@ -1647,6 +1754,154 @@ mod tests {
         )
         .await;
         assert!(failed.is_err());
+    }
+
+    #[tokio::test]
+    async fn inventory_typed_variants_for_each_failure_class() {
+        let dup_pages = vec![
+            hetzner_page(&[1], 1, true, 2),
+            hetzner_page(&[1], 2, false, 2),
+        ];
+        let dup_pages = &dup_pages;
+        match collect_inventory(
+            |page| Box::pin(async move { Ok(dup_pages[(page - 1) as usize].clone()) }),
+            hetzner::parse_server_page,
+            |row: &VpsInstance| row.id.clone(),
+        )
+        .await
+        {
+            Inventory::Partial { rows, reason } => {
+                assert_eq!(reason, PartialReason::DuplicateId);
+                assert_eq!(rows.len(), 1);
+            }
+            other => panic!("expected duplicate partial, got {other:?}"),
+        }
+
+        let mm_pages = vec![
+            hetzner_page(&[1], 1, true, 3),
+            hetzner_page(&[2], 2, false, 3),
+        ];
+        let mm_pages = &mm_pages;
+        match collect_inventory(
+            |page| Box::pin(async move { Ok(mm_pages[(page - 1) as usize].clone()) }),
+            hetzner::parse_server_page,
+            |row: &VpsInstance| row.id.clone(),
+        )
+        .await
+        {
+            Inventory::Partial { rows, reason } => {
+                assert_eq!(reason, PartialReason::TotalMismatch);
+                assert_eq!(rows.len(), 2);
+            }
+            other => panic!("expected mismatch partial, got {other:?}"),
+        }
+
+        let capped = collect_inventory(
+            |page| Box::pin(async move { Ok(hetzner_page(&[], page, true, 0)) }),
+            hetzner::parse_server_page,
+            |row: &VpsInstance| row.id.clone(),
+        )
+        .await;
+        assert!(matches!(
+            capped,
+            Inventory::Partial {
+                reason: PartialReason::PageCap,
+                ..
+            }
+        ));
+
+        let failed = collect_inventory(
+            |page| {
+                Box::pin(async move {
+                    if page == 1 {
+                        Ok(hetzner_page(&[1], 1, true, 2))
+                    } else {
+                        Err(anyhow!("fixture fetch failure"))
+                    }
+                })
+            },
+            hetzner::parse_server_page,
+            |row: &VpsInstance| row.id.clone(),
+        )
+        .await;
+        match failed {
+            Inventory::Unknown(reason) => assert!(reason.contains("fixture fetch failure")),
+            other => panic!("expected unknown, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn inventory_row_cap_is_typed_partial() {
+        let ids: Vec<i64> = (1..=(MAX_INVENTORY_ROWS as i64 + 1)).collect();
+        let ids = &ids;
+        let inv = collect_inventory(
+            |page| Box::pin(async move { Ok(hetzner_page(ids, page, false, ids.len() as u64)) }),
+            hetzner::parse_server_page,
+            |row: &VpsInstance| row.id.clone(),
+        )
+        .await;
+        assert!(matches!(
+            inv,
+            Inventory::Partial {
+                reason: PartialReason::RowCap,
+                ..
+            }
+        ));
+    }
+
+    #[tokio::test]
+    async fn inventory_budget_expiry_is_typed_partial_with_rows_so_far() {
+        let inv = collect_inventory_with_budget(
+            Duration::from_millis(50),
+            |page| {
+                Box::pin(async move {
+                    if page == 1 {
+                        Ok(hetzner_page(&[1], 1, true, 2))
+                    } else {
+                        tokio::time::sleep(Duration::from_secs(30)).await;
+                        Ok(hetzner_page(&[2], 2, false, 2))
+                    }
+                })
+            },
+            hetzner::parse_server_page,
+            |row: &VpsInstance| row.id.clone(),
+        )
+        .await;
+        match inv {
+            Inventory::Partial { rows, reason } => {
+                assert_eq!(reason, PartialReason::Budget);
+                assert_eq!(rows.len(), 1);
+            }
+            other => panic!("expected budget partial, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn inventory_into_complete_keeps_legacy_messages_and_round_trips() {
+        let complete: Inventory<u8> = Inventory::Complete(vec![1, 2]);
+        assert!(complete.is_complete());
+        assert_eq!(complete.into_complete().unwrap(), vec![1, 2]);
+
+        let partial: Inventory<u8> = Inventory::Partial {
+            rows: vec![1],
+            reason: PartialReason::PageCap,
+        };
+        assert!(!partial.is_complete());
+        assert_eq!(
+            partial.into_complete().unwrap_err().to_string(),
+            "inventory exceeds the page cap; refusing a partial list"
+        );
+        let budget: Inventory<u8> = Inventory::Partial {
+            rows: vec![],
+            reason: PartialReason::Budget,
+        };
+        assert_eq!(
+            budget.into_complete().unwrap_err().to_string(),
+            "inventory listing exceeded the 120 second budget; refusing a partial list"
+        );
+        let unknown: Inventory<u8> = Inventory::Unknown("boom".into());
+        assert!(!unknown.is_complete());
+        assert_eq!(unknown.into_complete().unwrap_err().to_string(), "boom");
     }
 
     #[tokio::test]
