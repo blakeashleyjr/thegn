@@ -4,7 +4,8 @@
 //! through the DB-writer switch flow. Extracted from `run.rs` (god-file ratchet).
 
 use anyhow::{Context, Result};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::process::{Command, ExitStatus};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Condvar, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
@@ -408,31 +409,77 @@ pub(crate) fn configured_origin(
     Ok(None)
 }
 
+/// Deadline for the tiny git probes (`config --get`, `rev-parse`).
+const PROBE_TIMEOUT: Duration = Duration::from_secs(30);
+/// Output cap for a probe; a legitimate answer is a few bytes.
+const PROBE_OUTPUT_CAP: usize = 4096;
+
+/// Run a tiny git probe with a deadline and a bounded stdout, killing the
+/// whole process group on timeout or overflow. Stderr is discarded.
+fn run_git_probe(
+    command: &mut Command,
+    what: &str,
+    timeout: Duration,
+) -> Result<(ExitStatus, String)> {
+    let limits = thegn_proc::Limits {
+        stdout: thegn_proc::Stream::HeadOrFail {
+            cap: PROBE_OUTPUT_CAP,
+        },
+        quiesce_after_leader: Some(Duration::ZERO),
+        term_grace: Duration::from_millis(200),
+        reader_grace: Duration::from_millis(250),
+        ..thegn_proc::Limits::silent(timeout)
+    };
+    map_probe(
+        thegn_proc::run(command, &limits, &AtomicBool::new(false)),
+        what,
+    )
+}
+
+/// Pure mapping of a finished probe run, with fixed precedence: spawn,
+/// supervise, cancel, timeout, output limit, surviving group, then the
+/// leader's exit status.
+fn map_probe(run: thegn_proc::Run, what: &str) -> Result<(ExitStatus, String)> {
+    use thegn_proc::{End, GroupState, Leader};
+    match run.end {
+        End::Spawn(error) => return Err(error).context(what.to_string()),
+        End::Supervise(error) => {
+            return Err(error).with_context(|| format!("supervise {what}"));
+        }
+        End::Cancelled => anyhow::bail!("{what} cancelled"),
+        End::TimedOut => anyhow::bail!("{what} timed out"),
+        End::OutputLimit(_) => anyhow::bail!("{what} output too large"),
+        End::LeaderExited => {}
+    }
+    if run.group == GroupState::Survivors {
+        anyhow::bail!("{what}: descendants survived termination");
+    }
+    match run.leader {
+        Leader::Reaped(status) => {
+            if status.success() && !run.stdout.eof {
+                anyhow::bail!("{what} output incomplete: a descendant held the pipe open");
+            }
+            Ok((
+                status,
+                String::from_utf8_lossy(&run.stdout.bytes).into_owned(),
+            ))
+        }
+        Leader::ReapFailed(error) => Err(error).with_context(|| format!("reap {what}")),
+        Leader::Detached | Leader::NotSpawned => anyhow::bail!("{what} was not reaped"),
+    }
+}
+
 fn configured_clone_remote_name(dest: &std::path::Path) -> Result<String> {
     let mut command = thegn_core::util::git_cmd(dest);
     command
         .arg("config")
         .arg("--get")
-        .arg("clone.defaultRemoteName")
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::null());
-    let (mut child, _group) = crate::platform::spawn_grouped(&mut command)
-        .context("read configured clone remote name")?;
-    let mut output = String::new();
-    let read_result = if let Some(mut stdout) = child.stdout.take() {
-        std::io::Read::read_to_string(&mut stdout, &mut output)
-            .context("read configured clone remote name output")
-    } else {
-        Ok(0)
-    };
-    #[expect(
-        clippy::disallowed_methods,
-        reason = "wait for the owned git config child"
-    )]
-    let status = child
-        .wait()
-        .context("wait for configured clone remote name")?;
-    read_result?;
+        .arg("clone.defaultRemoteName");
+    let (status, output) = run_git_probe(
+        &mut command,
+        "read configured clone remote name",
+        PROBE_TIMEOUT,
+    )?;
     if status.success() {
         let name = output.trim();
         anyhow::ensure!(
@@ -757,26 +804,12 @@ fn validate_staged_clone(staging: &std::path::Path, expected_origin: Option<&str
         staging.display()
     );
     let mut command = thegn_core::util::git_cmd(staging);
-    command
-        .arg("rev-parse")
-        .arg("--is-inside-work-tree")
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::null());
-    let (mut child, _group) =
-        crate::platform::spawn_grouped(&mut command).context("validate staged clone worktree")?;
-    let mut output = String::new();
-    let read_result = if let Some(mut stdout) = child.stdout.take() {
-        std::io::Read::read_to_string(&mut stdout, &mut output)
-            .context("read staged clone validation output")
-    } else {
-        Ok(0)
-    };
-    #[expect(
-        clippy::disallowed_methods,
-        reason = "wait for the owned validation git child"
-    )]
-    let status = child.wait().context("wait for staged clone validation")?;
-    read_result?;
+    command.arg("rev-parse").arg("--is-inside-work-tree");
+    let (status, output) = run_git_probe(
+        &mut command,
+        "validate staged clone worktree",
+        PROBE_TIMEOUT,
+    )?;
     anyhow::ensure!(
         status.success() && output.trim() == "true",
         "staged clone is not a git work tree: {}",
@@ -1852,6 +1885,168 @@ mod tests {
 
     fn tmp(name: &str) -> std::path::PathBuf {
         std::env::temp_dir().join(format!("tg-wscreate-{}-{}", std::process::id(), name))
+    }
+
+    fn probe_run(
+        end: thegn_proc::End,
+        group: thegn_proc::GroupState,
+        leader: thegn_proc::Leader,
+    ) -> thegn_proc::Run {
+        thegn_proc::Run {
+            end,
+            group,
+            leader,
+            leader_exited_first: true,
+            stdout: thegn_proc::Capture {
+                eof: true,
+                ..thegn_proc::Capture::default()
+            },
+            stderr: thegn_proc::Capture::default(),
+            containment: thegn_proc::Containment::ProcessGroup,
+        }
+    }
+
+    fn probe_status(script: &str) -> Option<ExitStatus> {
+        let mut command = crate::platform::gate_test_shell(script)?;
+        thegn_proc::run(
+            &mut command,
+            &thegn_proc::Limits::silent(Duration::from_secs(10)),
+            &AtomicBool::new(false),
+        )
+        .exit_status()
+    }
+
+    #[test]
+    fn map_probe_maps_every_non_exit_end() {
+        use thegn_proc::{End, GroupState, Leader, Which};
+        let err = |end: End| {
+            format!(
+                "{:#}",
+                map_probe(
+                    probe_run(end, GroupState::Unknown, Leader::NotSpawned),
+                    "probe"
+                )
+                .unwrap_err()
+            )
+        };
+        let spawn = err(End::Spawn(std::io::Error::other("nope")));
+        assert!(spawn.contains("probe") && spawn.contains("nope"), "{spawn}");
+        assert!(err(End::Supervise(std::io::Error::other("wait"))).contains("supervise probe"));
+        assert!(err(End::Cancelled).contains("probe cancelled"));
+        assert!(err(End::TimedOut).contains("probe timed out"));
+        assert!(err(End::OutputLimit(Which::Stdout)).contains("probe output too large"));
+        assert!(err(End::OutputLimit(Which::Stderr)).contains("probe output too large"));
+    }
+
+    #[test]
+    fn map_probe_timeout_beats_survivors() {
+        use thegn_proc::{End, GroupState, Leader};
+        let run = probe_run(End::TimedOut, GroupState::Survivors, Leader::Detached);
+        let text = format!("{:#}", map_probe(run, "probe").unwrap_err());
+        assert!(text.contains("timed out"), "{text}");
+    }
+
+    #[test]
+    fn map_probe_survivors_and_unreaped_are_errors() {
+        use thegn_proc::{End, GroupState, Leader};
+        if let Some(status) = probe_status("exit 0") {
+            let run = probe_run(
+                End::LeaderExited,
+                GroupState::Survivors,
+                Leader::Reaped(status),
+            );
+            let text = format!("{:#}", map_probe(run, "probe").unwrap_err());
+            assert!(text.contains("survived"), "{text}");
+        }
+        for leader in [
+            Leader::Detached,
+            Leader::NotSpawned,
+            Leader::ReapFailed(std::io::Error::other("reap")),
+        ] {
+            let run = probe_run(End::LeaderExited, GroupState::Drained, leader);
+            assert!(map_probe(run, "probe").is_err());
+        }
+    }
+
+    #[test]
+    fn map_probe_undrained_stdout_after_clean_exit_is_an_error() {
+        use thegn_proc::{End, GroupState, Leader};
+        let Some(status) = probe_status("exit 0") else {
+            return;
+        };
+        let mut run = probe_run(
+            End::LeaderExited,
+            GroupState::Drained,
+            Leader::Reaped(status),
+        );
+        run.stdout.eof = false;
+        let text = format!("{:#}", map_probe(run, "probe").unwrap_err());
+        assert!(text.contains("incomplete"), "{text}");
+    }
+
+    #[test]
+    fn map_probe_success_and_failure_decode_stdout() {
+        use thegn_proc::{End, GroupState, Leader};
+        let Some(ok) = probe_status("exit 0") else {
+            return;
+        };
+        let mut run = probe_run(
+            End::LeaderExited,
+            GroupState::Terminated,
+            Leader::Reaped(ok),
+        );
+        run.stdout.bytes = vec![b'o', b'k', 0xff];
+        let (status, text) = map_probe(run, "probe").unwrap();
+        assert!(status.success());
+        assert_eq!(text, "ok\u{fffd}");
+        let Some(one) = probe_status("exit 1") else {
+            return;
+        };
+        let run = probe_run(End::LeaderExited, GroupState::Drained, Leader::Reaped(one));
+        let (status, text) = map_probe(run, "probe").unwrap();
+        assert_eq!(status.code(), Some(1));
+        assert!(text.is_empty());
+    }
+
+    #[test]
+    fn run_git_probe_kills_a_probe_that_outlives_its_deadline() {
+        let Some(mut command) = crate::platform::gate_test_shell("sleep 30") else {
+            return;
+        };
+        let start = Instant::now();
+        let err =
+            run_git_probe(&mut command, "slow probe", Duration::from_millis(100)).unwrap_err();
+        assert!(
+            format!("{err:#}").contains("slow probe timed out"),
+            "{err:#}"
+        );
+        assert!(start.elapsed() < Duration::from_secs(10));
+    }
+
+    #[test]
+    fn run_git_probe_rejects_oversized_output() {
+        let Some(mut command) = crate::platform::gate_test_shell("head -c 20000 /dev/zero") else {
+            return;
+        };
+        let err = run_git_probe(&mut command, "big probe", Duration::from_secs(10)).unwrap_err();
+        assert!(
+            format!("{err:#}").contains("big probe output too large"),
+            "{err:#}"
+        );
+    }
+
+    #[test]
+    fn configured_clone_remote_name_reads_config_or_defaults_to_origin() {
+        let temp = tempfile::tempdir().unwrap();
+        let repo = temp.path().join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        let output = fixture_git(&repo, &["init", "-q"]);
+        assert!(output.status.success());
+        let name = configured_clone_remote_name(&repo).unwrap();
+        assert_eq!(name, "origin");
+        let output = fixture_git(&repo, &["config", "clone.defaultRemoteName", "upstream"]);
+        assert!(output.status.success());
+        assert_eq!(configured_clone_remote_name(&repo).unwrap(), "upstream");
     }
 
     #[test]
