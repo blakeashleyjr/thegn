@@ -14319,6 +14319,26 @@ async fn event_loop<T: Terminal>(
                     model.bars = new_cfg.bars.clone();
                     model.stats_icons = new_cfg.stats.clone();
                     model.usage_cfg = new_cfg.usage.clone();
+                    // A moved provider/location/units leaves the old reading
+                    // on screen until the next scheduled poll (>= 10 min):
+                    // clear it and poll once now. One-shot spawn_blocking.
+                    let weather_locale = crate::calendar_docs::CalendarDocs::env_locale();
+                    if crate::hydrate_weather::reload_needs_poll(
+                        &model.weather_cfg,
+                        &new_cfg.weather,
+                        weather_locale.as_deref(),
+                    ) {
+                        model.weather = None;
+                        bars_dirty = true;
+                        dirty |= crate::detail::retick_open(&mut bar_detail, None);
+                        crate::hydrate_weather::spawn_poll_with_generation(
+                            new_cfg.weather.clone(),
+                            weather_locale,
+                            refresh_tx.clone(),
+                            waker.clone(),
+                            None,
+                        );
+                    }
                     model.weather_cfg = new_cfg.weather.clone();
                     // Live `[panel] sections` reload: reorder/hide accordions;
                     // the keys section's cheatsheet follows the new keymap.
