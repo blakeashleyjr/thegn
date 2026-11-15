@@ -37,6 +37,50 @@ pub enum CredentialMode {
     GitlabTokenRefUnresolvable,
 }
 
+impl CredentialMode {
+    const fn label(self) -> &'static str {
+        match self {
+            Self::GithubCliManaged => "github_cli_managed",
+            Self::GitlabTokenRefAbsent => "gitlab_token_ref_absent",
+            Self::GitlabTokenRefPresent { explicit: true } => "gitlab_token_ref_present_explicit",
+            Self::GitlabTokenRefPresent { explicit: false } => "gitlab_token_ref_present_default",
+            Self::GitlabTokenRefUnresolvable => "gitlab_token_ref_unresolvable",
+        }
+    }
+}
+
+/// Evidence level for a credential placement row.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ProbeEvidence {
+    /// The placement follows from configuration only; no credential probe ran.
+    ConfiguredNotProbed,
+    /// An existing bounded local probe confirmed the placement.
+    ProbedOk,
+    /// An existing bounded local probe rejected the placement.
+    ProbedFailed(String),
+}
+
+impl ProbeEvidence {
+    /// The evidence wording used in the human-facing placement row.
+    pub fn text(&self) -> String {
+        match self {
+            Self::ConfiguredNotProbed => "configured (not probed)".into(),
+            Self::ProbedOk => "probed: ok".into(),
+            Self::ProbedFailed(kind) => format!("probed: failed ({kind})"),
+        }
+    }
+
+    /// The stable machine-facing state. Failure details stay in the text
+    /// rendering, so this field remains a small, additive enum.
+    pub const fn json_state(&self) -> &'static str {
+        match self {
+            Self::ConfiguredNotProbed => "not_probed",
+            Self::ProbedOk => "ok",
+            Self::ProbedFailed(_) => "failed",
+        }
+    }
+}
+
 /// One value-free credential placement row.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Row {
@@ -44,6 +88,7 @@ pub struct Row {
     pub credential_mode: CredentialMode,
     pub placement: Placement,
     pub reachable: bool,
+    pub probe: ProbeEvidence,
     pub note: String,
 }
 
@@ -137,11 +182,31 @@ pub fn report(provider: Provider, credential_mode: CredentialMode, placement: Pl
         credential_mode,
         placement,
         reachable,
+        // Doctor deliberately does not add a network call or a new child
+        // process merely to fill in this evidence. An existing bounded local
+        // probe can replace this state at the call site when one is available.
+        probe: ProbeEvidence::ConfiguredNotProbed,
         note: format!(
-            "credential placement: {}/{} — {detail}",
+            "credential placement: {}/{} — {detail}; {}",
             provider.label(),
-            placement.label()
+            placement.label(),
+            ProbeEvidence::ConfiguredNotProbed.text()
         ),
+    }
+}
+
+impl Row {
+    /// Additive JSON representation for `doctor --json` credential rows.
+    /// Values and references are intentionally absent.
+    pub fn json(&self) -> serde_json::Value {
+        serde_json::json!({
+            "provider": self.provider.label(),
+            "credential_mode": self.credential_mode.label(),
+            "placement": self.placement.label(),
+            "reachable": self.reachable,
+            "note": self.note,
+            "probe": self.probe.json_state(),
+        })
     }
 }
 
@@ -174,6 +239,8 @@ mod tests {
                 if matches!(mode, CredentialMode::GitlabTokenRefUnresolvable) {
                     assert!(!row.reachable);
                 }
+                assert_eq!(row.probe.text(), "configured (not probed)");
+                assert_eq!(row.probe.json_state(), "not_probed");
             }
         }
 
@@ -205,5 +272,26 @@ mod tests {
         );
         let failed = gitlab_mode("keyring:missing", &SecretResolution::Failed);
         assert_eq!(failed, CredentialMode::GitlabTokenRefUnresolvable);
+    }
+
+    #[test]
+    fn probe_evidence_has_stable_text_and_json_states() {
+        let cases = [
+            (
+                ProbeEvidence::ConfiguredNotProbed,
+                "configured (not probed)",
+                "not_probed",
+            ),
+            (ProbeEvidence::ProbedOk, "probed: ok", "ok"),
+            (
+                ProbeEvidence::ProbedFailed("auth".into()),
+                "probed: failed (auth)",
+                "failed",
+            ),
+        ];
+        for (evidence, text, json) in cases {
+            assert_eq!(evidence.text(), text);
+            assert_eq!(evidence.json_state(), json);
+        }
     }
 }
