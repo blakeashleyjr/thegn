@@ -478,9 +478,18 @@ pub trait Forge: Probe + Send + Sync {
     /// threads and the issue list, or at `PrDepth::Threads` threads only.
     /// Extra fetches never fail the panel.
     fn pr_panel(&self, loc: &GitLoc, pr: PrRef, depth: PrDepth) -> PrPanel {
-        let branch = loc
-            .git_out(&["rev-parse", "--abbrev-ref", "HEAD"])
-            .unwrap_or_default();
+        let branch = match loc.git_text(&["rev-parse", "--abbrev-ref", "HEAD"]) {
+            Ok(branch) => branch,
+            Err(error) => {
+                tracing::debug!(
+                    target: "thegn::forge",
+                    path = %loc.path(),
+                    %error,
+                    "could not read branch for pull-request panel"
+                );
+                String::new()
+            }
+        };
         let mut panel = PrPanel::from_result(self.pr_status(loc, pr), loc.path(), branch);
         if depth != PrDepth::Header
             && let PanelState::Pr(p) = &panel.state
