@@ -11,6 +11,7 @@ use thegn_core::viz_raster::{CellBuf, RCell, RasterTable};
 
 mod graph;
 mod heatmap;
+mod minicore;
 mod mirrored;
 mod spark;
 mod stacked;
@@ -37,7 +38,11 @@ pub(crate) fn with_palette<R>(f: impl FnOnce(&Palette) -> R) -> R {
 }
 
 pub(crate) use heatmap::paint_heatmap;
+#[allow(unused_imports)] // F6b is the first caller (see the module-level dead_code allow).
+pub(crate) use minicore::paint_minicore;
 
+#[cfg(test)]
+mod minicore_tests;
 #[cfg(test)]
 mod tests;
 
