@@ -425,11 +425,11 @@ fn stage_worker_status(cfg: &Config) -> StageWorkerStatus {
         .and_then(|s| s.to_str())
         .unwrap_or("stage-worker");
     let spec = thegn_core::sandbox::resolve(&cfg.sandbox, &loc, name);
-    let git_common_dir = thegn_core::util::git_out(
+    let git_common_dir = thegn_core::util::git_out_path(
         &worktree,
         &["rev-parse", "--path-format=absolute", "--git-common-dir"],
     )
-    .map(std::path::PathBuf::from)
+    .ok()
     .filter(|p| p.as_path() != worktree.as_path() && !worktree.starts_with(p));
     let callback_ok =
         thegn_core::util::self_exe_path().is_some() && !thegn_core::util::self_exe_is_stale();
@@ -4561,8 +4561,7 @@ fn current_repo_root() -> Option<std::path::PathBuf> {
 /// git directory back to the main checkout.
 fn current_worktree_root() -> Option<std::path::PathBuf> {
     let cwd = std::env::current_dir().ok()?;
-    thegn_core::util::git_out(&cwd, &["rev-parse", "--show-toplevel"])
-        .map(|path| std::path::PathBuf::from(path.trim()))
+    thegn_core::util::git_out_path(&cwd, &["rev-parse", "--show-toplevel"]).ok()
 }
 
 /// Names of custom `merge.<name>.driver` definitions in the repo's git config
