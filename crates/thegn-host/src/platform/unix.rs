@@ -979,16 +979,20 @@ pub fn spawn_grouped(cmd: &mut Command) -> std::io::Result<(std::process::Child,
     Ok((child, GroupHandle { pgid }))
 }
 
-/// [`spawn_grouped`] for a helper that must not outlive thegn: on Linux the
-/// child also asks the kernel to SIGKILL it when its parent dies
+/// Arm `cmd` so the helper it spawns does not outlive thegn: on Linux the
+/// child asks the kernel to SIGKILL it when its parent dies
 /// (`PR_SET_PDEATHSIG`). A process group is not signalled when its parent
 /// exits, so without this a renderer would be orphaned by a crash or a
 /// shutdown that never reached the supervisor. The signal is keyed to the
-/// forking *thread*, so the caller must keep that thread alive until the child
-/// is reaped (the preview worker does). Elsewhere this is [`spawn_grouped`].
-pub fn spawn_grouped_die_with_parent(
-    cmd: &mut Command,
-) -> std::io::Result<(std::process::Child, GroupHandle)> {
+/// forking *thread*, so the caller must spawn on a thread that stays alive
+/// until the child is reaped (the preview worker runs `thegn_proc::run`
+/// inline). Composes with `thegn_proc`'s own process-group setup. Elsewhere
+/// this is a no-op.
+#[cfg_attr(
+    not(target_os = "linux"),
+    allow(unused_variables, reason = "the parent-death signal is Linux-only")
+)]
+pub fn set_die_with_parent(cmd: &mut Command) {
     #[cfg(target_os = "linux")]
     {
         use std::os::unix::process::CommandExt;
@@ -1008,7 +1012,6 @@ pub fn spawn_grouped_die_with_parent(
             });
         }
     }
-    spawn_grouped(cmd)
 }
 
 /// Gate-only spelling keeps this call site explicit about its containment
