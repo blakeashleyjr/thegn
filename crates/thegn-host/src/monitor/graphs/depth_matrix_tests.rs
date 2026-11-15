@@ -168,15 +168,15 @@ fn golden(level: UnicodeLevel) -> Vec<(&'static str, Vec<&'static str>)> {
             ("history", vec!["#"]),
         ],
         UnicodeLevel::Basic | UnicodeLevel::Full => vec![
-            ("area", vec!["\u{28f8}"]),
+            ("area", vec!["\u{28b8}"]),
             ("blocks", vec!["\u{2588} "]),
             ("stacked", vec!["\u{2588}", "\u{2588}"]),
-            ("mirrored", vec!["\u{28f8}", "\u{28f8}"]),
-            ("heatmap", vec!["\u{2580}\u{2580}", "\u{2580}\u{2580}"]),
+            ("mirrored", vec!["\u{28b8}", "\u{28b8}"]),
+            ("heatmap", vec!["\u{2580}\u{2580}"]),
             ("spark", vec!["\u{2581}\u{2588}\u{2581}\u{2588}"]),
             ("minicore", vec!["c0 \u{2581}\u{2588}\u{2581}\u{2588}  42%"]),
             ("sparkline", vec!["\u{2581}\u{2588}\u{2581}\u{2588}"]),
-            ("history", vec!["\u{28f8}"]),
+            ("history", vec!["\u{28b8}"]),
         ],
     }
 }
