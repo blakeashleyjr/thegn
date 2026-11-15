@@ -890,17 +890,19 @@ fn drill_down_paint_is_allocation_free_when_warm() {
 }
 
 fn freq_lines(classes: &[CoreClass], cols: usize, rows: usize) -> Vec<String> {
-    let mut part = thegn_metrics::collect::model::cpu_freq::CpuFreqPart::default();
-    part.policies = classes
-        .iter()
-        .enumerate()
-        .map(|(n, class)| CpuPolicy {
-            policy: n as u16,
-            cur_khz: Some(2_000_000),
-            core_class: *class,
-            ..CpuPolicy::default()
-        })
-        .collect();
+    let part = thegn_metrics::collect::model::cpu_freq::CpuFreqPart {
+        policies: classes
+            .iter()
+            .enumerate()
+            .map(|(n, class)| CpuPolicy {
+                policy: n as u16,
+                cur_khz: Some(2_000_000),
+                core_class: *class,
+                ..CpuPolicy::default()
+            })
+            .collect(),
+        ..Default::default()
+    };
     let mut grid = crate::monitor::kit::grid::CellGrid::new(cols, rows);
     super::paint::paint_freq(&mut grid, Rect::full(cols, rows), &part, Health::Ok);
     (0..rows)
