@@ -1474,6 +1474,13 @@ struct BoundedOutput {
     stdout: String,
     stderr: String,
     stdout_truncated: bool,
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "read by tests; production reads the combined `truncated`"
+        )
+    )]
     stderr_truncated: bool,
     truncated: bool,
 }
