@@ -36,7 +36,9 @@ use crate::config::{
 };
 use crate::hooks::{HookEvent, HookSpec};
 use serde_json::json;
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
+use std::path::PathBuf;
+use std::sync::{Mutex, OnceLock};
 
 /// A layer in the trust ladder, most-trusted first. Constraint clamping engages
 /// only for levels at or below [`TrustLevel::Zone`].
@@ -1262,6 +1264,151 @@ fn worktree_uses_main_env(main_env: &str, is_root_checkout: bool, on_primary_bra
     !main_env.trim().is_empty() && (is_root_checkout || on_primary_branch)
 }
 
+/// Bound on the primary-branch memo and on each log-dedupe set.
+const PRIMARY_BRANCH_MEMO_CAP: usize = 256;
+
+#[derive(Clone, PartialEq, Eq)]
+struct PrimaryBranchInputs {
+    head: crate::git_memo::HeadInputs,
+    base: crate::git_memo::BaseRefsPrint,
+}
+
+#[derive(Clone, Hash, PartialEq, Eq)]
+struct PrimaryBranchKey {
+    repo_root: PathBuf,
+    worktree: PathBuf,
+}
+
+struct PrimaryBranchMemo {
+    entries: HashMap<PrimaryBranchKey, (PrimaryBranchInputs, bool)>,
+    order: VecDeque<PrimaryBranchKey>,
+}
+
+impl PrimaryBranchMemo {
+    fn new() -> Self {
+        Self {
+            entries: HashMap::new(),
+            order: VecDeque::new(),
+        }
+    }
+
+    fn get(&self, key: &PrimaryBranchKey, inputs: &PrimaryBranchInputs) -> Option<bool> {
+        self.entries
+            .get(key)
+            .filter(|(stored, _)| stored == inputs)
+            .map(|(_, answer)| *answer)
+    }
+
+    fn put(&mut self, key: PrimaryBranchKey, inputs: PrimaryBranchInputs, answer: bool) {
+        if self.entries.insert(key.clone(), (inputs, answer)).is_none() {
+            self.order.push_back(key);
+            while self.entries.len() > PRIMARY_BRANCH_MEMO_CAP {
+                match self.order.pop_front() {
+                    Some(old) => {
+                        self.entries.remove(&old);
+                    }
+                    None => break,
+                }
+            }
+        }
+    }
+
+    #[cfg(test)]
+    fn clear(&mut self) {
+        self.entries.clear();
+        self.order.clear();
+    }
+}
+
+static PRIMARY_BRANCH_MEMO: OnceLock<Mutex<PrimaryBranchMemo>> = OnceLock::new();
+
+fn primary_branch_memo() -> &'static Mutex<PrimaryBranchMemo> {
+    PRIMARY_BRANCH_MEMO.get_or_init(|| Mutex::new(PrimaryBranchMemo::new()))
+}
+
+struct BoundedLogSet<K> {
+    cap: usize,
+    set: HashSet<K>,
+    order: VecDeque<K>,
+}
+
+impl<K: Clone + Eq + std::hash::Hash> BoundedLogSet<K> {
+    fn new(cap: usize) -> Self {
+        Self {
+            cap: cap.max(1),
+            set: HashSet::new(),
+            order: VecDeque::new(),
+        }
+    }
+
+    fn insert(&mut self, key: K) -> bool {
+        if self.set.contains(&key) {
+            return false;
+        }
+        if self.set.len() >= self.cap {
+            self.set.clear();
+            self.order.clear();
+        }
+        self.set.insert(key.clone());
+        self.order.push_back(key);
+        true
+    }
+}
+
+static PRIMARY_MISSING_LOGGED: OnceLock<Mutex<BoundedLogSet<PathBuf>>> = OnceLock::new();
+static PRIMARY_FAILURE_LOGGED: OnceLock<Mutex<BoundedLogSet<(PathBuf, String)>>> = OnceLock::new();
+
+fn primary_missing_logged(worktree: &Path) -> bool {
+    PRIMARY_MISSING_LOGGED
+        .get_or_init(|| Mutex::new(BoundedLogSet::new(PRIMARY_BRANCH_MEMO_CAP)))
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .insert(worktree.to_path_buf())
+}
+
+fn primary_failure_logged(worktree: &Path, why: &str) -> bool {
+    PRIMARY_FAILURE_LOGGED
+        .get_or_init(|| Mutex::new(BoundedLogSet::new(PRIMARY_BRANCH_MEMO_CAP)))
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .insert((worktree.to_path_buf(), why.to_string()))
+}
+
+fn is_spawn_failure(error: &GitTextError) -> bool {
+    matches!(error, GitTextError::Failed(GitOutcome::Spawn(_)))
+}
+
+fn is_transient_default_branch_failure(error: &str) -> bool {
+    error.contains("could not spawn Git:")
+        || error.contains("Git command timed out")
+        || error.contains("Git command was cancelled")
+        || error.contains("Git supervision failed:")
+}
+
+fn log_primary_failure(worktree: &Path, why: &str) {
+    if primary_failure_logged(worktree, why) {
+        tracing::warn!(
+            target: "thegn::config",
+            "primary-branch check failed for worktree {}, treating it as a feature branch: {why}",
+            worktree.display()
+        );
+    }
+}
+
+fn primary_branch_result(
+    worktree: &Path,
+    result: Result<bool, String>,
+    cacheable: bool,
+) -> (bool, bool) {
+    match result {
+        Ok(answer) => (answer, cacheable),
+        Err(why) => {
+            log_primary_failure(worktree, &why);
+            (false, cacheable)
+        }
+    }
+}
+
 /// Whether `worktree` is checked out on the repo's PRIMARY branch (origin/HEAD,
 /// e.g. `main`/`master`). Best-effort and gated to a LOCAL checkout: a remote /
 /// provider worktree is never the primary (the main checkout lives on the host)
@@ -1273,24 +1420,126 @@ fn worktree_on_primary_branch(repo_root: &Path, worktree: &Path, loc: &GitLoc) -
     if !matches!(loc, GitLoc::Local(_)) {
         return false;
     }
-    let head = GitLoc::Local(worktree.to_path_buf()).git_text(&[
-        "symbolic-ref",
-        "--quiet",
-        "--short",
-        "HEAD",
-    ]);
-    let default_branch = if head.as_ref().is_ok_and(|branch| !branch.is_empty()) {
-        crate::worktree::default_branch_checked(repo_root)
-    } else {
-        Ok(String::new())
+    let head_probe = || {
+        let result = GitLoc::Local(worktree.to_path_buf()).git_text(&[
+            "symbolic-ref",
+            "--quiet",
+            "--short",
+            "HEAD",
+        ]);
+        let cacheable = !result.as_ref().is_err_and(is_spawn_failure);
+        (result, cacheable)
     };
-    match primary_branch_verdict(head, default_branch) {
-        Ok(verdict) => verdict,
-        Err(why) => {
-            tracing::warn!(target: "thegn::config", "primary-branch check failed, treating the worktree as a feature branch: {why}");
-            false
-        }
+    let default_probe = || {
+        let result = crate::worktree::default_branch_checked(repo_root);
+        let cacheable = !result
+            .as_ref()
+            .is_err_and(|error| is_transient_default_branch_failure(error));
+        (result, cacheable)
+    };
+    worktree_on_primary_branch_with_probe(repo_root, worktree, loc, &head_probe, &default_probe)
+}
+
+fn worktree_on_primary_branch_with_probe(
+    repo_root: &Path,
+    worktree: &Path,
+    loc: &GitLoc,
+    head_probe: &dyn Fn() -> (Result<String, GitTextError>, bool),
+    default_probe: &dyn Fn() -> (Result<String, String>, bool),
+) -> bool {
+    if !matches!(loc, GitLoc::Local(_)) {
+        return false;
     }
+    if !worktree.exists() || crate::git_memo::git_dir(worktree).is_none() {
+        if primary_missing_logged(worktree) {
+            tracing::debug!(
+                target: "thegn::config",
+                "primary-branch check skipped for missing or non-git worktree {}",
+                worktree.display()
+            );
+        }
+        return false;
+    }
+
+    let Some(head) = crate::git_memo::head_inputs(worktree) else {
+        return legacy_primary_branch_check(worktree, head_probe, default_probe);
+    };
+    let Some(base) = crate::git_memo::base_refs_print(repo_root) else {
+        return legacy_primary_branch_check(worktree, head_probe, default_probe);
+    };
+    let inputs = PrimaryBranchInputs { head, base };
+    let key = PrimaryBranchKey {
+        repo_root: repo_root.to_path_buf(),
+        worktree: worktree.to_path_buf(),
+    };
+    if let Some(answer) = primary_branch_memo()
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .get(&key, &inputs)
+    {
+        return answer;
+    }
+
+    let branch = inputs
+        .head
+        .head_text()
+        .trim()
+        .strip_prefix("ref: refs/heads/")
+        .filter(|branch| !branch.is_empty())
+        .map(str::to_owned);
+    let Some(branch) = branch else {
+        let answer = primary_branch_result(worktree, Ok(false), true);
+        primary_branch_memo()
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .put(key, inputs, answer.0);
+        return answer.0;
+    };
+
+    let (default_branch, cacheable) = match inputs.base.origin_head() {
+        Some(origin_head) => match origin_head
+            .trim()
+            .strip_prefix("ref: refs/remotes/origin/")
+            .filter(|branch| !branch.is_empty())
+        {
+            Some(default_branch) => (Ok(default_branch.to_string()), true),
+            None => default_probe(),
+        },
+        None => default_probe(),
+    };
+    let answer = primary_branch_result(
+        worktree,
+        primary_branch_verdict(Ok(branch), default_branch),
+        cacheable,
+    );
+    if answer.1 {
+        primary_branch_memo()
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .put(key, inputs, answer.0);
+    }
+    answer.0
+}
+
+fn legacy_primary_branch_check(
+    worktree: &Path,
+    head_probe: &dyn Fn() -> (Result<String, GitTextError>, bool),
+    default_probe: &dyn Fn() -> (Result<String, String>, bool),
+) -> bool {
+    let (head, head_cacheable) = head_probe();
+    let needs_default = head.as_ref().is_ok_and(|branch| !branch.is_empty());
+    let (default_branch, default_cacheable) = if needs_default {
+        default_probe()
+    } else {
+        (Ok(String::new()), true)
+    };
+    let cacheable = head_cacheable && default_cacheable;
+    primary_branch_result(
+        worktree,
+        primary_branch_verdict(head, default_branch),
+        cacheable,
+    )
+    .0
 }
 
 fn head_is_detached(error: &GitTextError) -> bool {
@@ -1921,6 +2170,313 @@ mod tests {
             primary_branch_verdict(Ok(String::new()), Ok("main".into())),
             Ok(false)
         );
+    }
+
+    fn primary_git(dir: &Path, args: &[&str]) {
+        let status = crate::util::git_cmd(dir).args(args).status().unwrap();
+        assert!(status.success(), "git {args:?} failed with {status}");
+    }
+
+    fn primary_fixture() -> (tempfile::TempDir, tempfile::TempDir) {
+        let repo = tempfile::tempdir().unwrap();
+        primary_git(repo.path(), &["init", "-q"]);
+        primary_git(
+            repo.path(),
+            &["config", "user.email", "test@example.invalid"],
+        );
+        primary_git(repo.path(), &["config", "user.name", "thegn-test"]);
+        std::fs::write(repo.path().join("file"), "fixture\n").unwrap();
+        primary_git(repo.path(), &["add", "file"]);
+        primary_git(
+            repo.path(),
+            &[
+                "-c",
+                "commit.gpgsign=false",
+                "commit",
+                "-q",
+                "-m",
+                "fixture",
+            ],
+        );
+        primary_git(repo.path(), &["branch", "-M", "main"]);
+        primary_git(repo.path(), &["branch", "feature"]);
+        primary_git(repo.path(), &["checkout", "-q", "--detach", "HEAD"]);
+        let worktree = tempfile::tempdir().unwrap();
+        primary_git(
+            repo.path(),
+            &[
+                "worktree",
+                "add",
+                "-q",
+                worktree.path().to_str().unwrap(),
+                "main",
+            ],
+        );
+        primary_git(
+            repo.path(),
+            &["update-ref", "refs/remotes/origin/main", "HEAD"],
+        );
+        primary_git(
+            repo.path(),
+            &[
+                "symbolic-ref",
+                "refs/remotes/origin/HEAD",
+                "refs/remotes/origin/main",
+            ],
+        );
+        (repo, worktree)
+    }
+
+    fn clear_primary_branch_memo() {
+        if let Some(memo) = PRIMARY_BRANCH_MEMO.get() {
+            memo.lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .clear();
+        }
+    }
+
+    #[test]
+    fn primary_branch_check_memoises_file_prints_without_probe_spawns() {
+        let (repo, worktree) = primary_fixture();
+        clear_primary_branch_memo();
+        let loc = GitLoc::Local(worktree.path().to_path_buf());
+        let head_calls = std::cell::Cell::new(0_u32);
+        let default_calls = std::cell::Cell::new(0_u32);
+        let head_probe = || {
+            head_calls.set(head_calls.get() + 1);
+            (
+                loc.git_text(&["symbolic-ref", "--quiet", "--short", "HEAD"]),
+                true,
+            )
+        };
+        let default_probe = || {
+            default_calls.set(default_calls.get() + 1);
+            (crate::worktree::default_branch_checked(repo.path()), true)
+        };
+        for _ in 0..50 {
+            assert!(worktree_on_primary_branch_with_probe(
+                repo.path(),
+                worktree.path(),
+                &loc,
+                &head_probe,
+                &default_probe,
+            ));
+        }
+        assert_eq!(head_calls.get(), 0);
+        assert_eq!(default_calls.get(), 0);
+    }
+
+    #[test]
+    fn primary_branch_memo_invalidates_when_worktree_head_changes() {
+        let (repo, worktree) = primary_fixture();
+        clear_primary_branch_memo();
+        let loc = GitLoc::Local(worktree.path().to_path_buf());
+        assert!(worktree_on_primary_branch(
+            repo.path(),
+            worktree.path(),
+            &loc
+        ));
+        primary_git(worktree.path(), &["switch", "-q", "feature"]);
+        assert!(!worktree_on_primary_branch(
+            repo.path(),
+            worktree.path(),
+            &loc
+        ));
+    }
+
+    #[test]
+    fn primary_branch_memo_invalidates_when_origin_head_changes() {
+        let (repo, worktree) = primary_fixture();
+        clear_primary_branch_memo();
+        let loc = GitLoc::Local(worktree.path().to_path_buf());
+        assert!(worktree_on_primary_branch(
+            repo.path(),
+            worktree.path(),
+            &loc
+        ));
+        primary_git(repo.path(), &["branch", "trunk"]);
+        primary_git(
+            repo.path(),
+            &["update-ref", "refs/remotes/origin/trunk", "HEAD"],
+        );
+        primary_git(
+            repo.path(),
+            &[
+                "symbolic-ref",
+                "refs/remotes/origin/HEAD",
+                "refs/remotes/origin/trunk",
+            ],
+        );
+        assert!(!worktree_on_primary_branch(
+            repo.path(),
+            worktree.path(),
+            &loc
+        ));
+        primary_git(
+            repo.path(),
+            &[
+                "symbolic-ref",
+                "refs/remotes/origin/HEAD",
+                "refs/remotes/origin/main",
+            ],
+        );
+        assert!(worktree_on_primary_branch(
+            repo.path(),
+            worktree.path(),
+            &loc
+        ));
+    }
+
+    #[test]
+    fn primary_branch_check_treats_detached_head_as_non_primary() {
+        let (repo, worktree) = primary_fixture();
+        clear_primary_branch_memo();
+        let loc = GitLoc::Local(worktree.path().to_path_buf());
+        primary_git(worktree.path(), &["checkout", "-q", "--detach", "HEAD"]);
+        assert!(!worktree_on_primary_branch(
+            repo.path(),
+            worktree.path(),
+            &loc
+        ));
+    }
+
+    #[test]
+    fn primary_branch_check_missing_or_plain_directory_skips_probes() {
+        let base = tempfile::tempdir().unwrap();
+        let missing = base.path().join("missing");
+        let plain = base.path().join("plain");
+        std::fs::create_dir(&plain).unwrap();
+        let missing_loc = GitLoc::Local(missing.clone());
+        let plain_loc = GitLoc::Local(plain.clone());
+        let calls = std::cell::Cell::new(0_u32);
+        let head_probe = || {
+            calls.set(calls.get() + 1);
+            (Ok("main".to_string()), true)
+        };
+        let default_probe = || {
+            calls.set(calls.get() + 1);
+            (Ok("main".to_string()), true)
+        };
+        assert!(!worktree_on_primary_branch_with_probe(
+            base.path(),
+            &missing,
+            &missing_loc,
+            &head_probe,
+            &default_probe,
+        ));
+        assert!(!worktree_on_primary_branch_with_probe(
+            base.path(),
+            &plain,
+            &plain_loc,
+            &head_probe,
+            &default_probe,
+        ));
+        assert_eq!(calls.get(), 0);
+    }
+
+    #[test]
+    fn primary_branch_check_bypasses_memo_for_reftable_inputs() {
+        let (repo, worktree) = primary_fixture();
+        clear_primary_branch_memo();
+        let common = crate::util::git_common_dir(worktree.path());
+        std::fs::create_dir_all(common.join("reftable")).unwrap();
+        let loc = GitLoc::Local(worktree.path().to_path_buf());
+        let calls = std::cell::Cell::new(0_u32);
+        let head_probe = || {
+            calls.set(calls.get() + 1);
+            (Ok("main".to_string()), true)
+        };
+        let default_probe = || {
+            calls.set(calls.get() + 1);
+            (Ok("main".to_string()), true)
+        };
+        assert!(worktree_on_primary_branch_with_probe(
+            repo.path(),
+            worktree.path(),
+            &loc,
+            &head_probe,
+            &default_probe,
+        ));
+        assert!(worktree_on_primary_branch_with_probe(
+            repo.path(),
+            worktree.path(),
+            &loc,
+            &head_probe,
+            &default_probe,
+        ));
+        assert_eq!(calls.get(), 4);
+    }
+
+    #[test]
+    fn primary_branch_transient_probe_failures_are_not_memoised() {
+        let (repo, worktree) = primary_fixture();
+        clear_primary_branch_memo();
+        primary_git(
+            repo.path(),
+            &["symbolic-ref", "--delete", "refs/remotes/origin/HEAD"],
+        );
+        let loc = GitLoc::Local(worktree.path().to_path_buf());
+        let calls = std::cell::Cell::new(0_u32);
+        let head_probe = || (Ok("main".to_string()), true);
+        let default_probe = || {
+            calls.set(calls.get() + 1);
+            (
+                Err("could not spawn Git: temporary exhaustion".to_string()),
+                false,
+            )
+        };
+        assert!(!worktree_on_primary_branch_with_probe(
+            repo.path(),
+            worktree.path(),
+            &loc,
+            &head_probe,
+            &default_probe,
+        ));
+        assert!(!worktree_on_primary_branch_with_probe(
+            repo.path(),
+            worktree.path(),
+            &loc,
+            &head_probe,
+            &default_probe,
+        ));
+        assert_eq!(calls.get(), 2);
+    }
+
+    #[test]
+    fn primary_branch_transient_classifier() {
+        let cases = [
+            ("could not spawn Git: x", true),
+            (
+                "could not read origin HEAD in /r: Git command timed out",
+                true,
+            ),
+            (
+                "could not check branch main: Git command was cancelled",
+                true,
+            ),
+            ("Git supervision failed: y", true),
+            (
+                "could not read origin HEAD in /r: unexpected symref refs/x",
+                false,
+            ),
+        ];
+        for (error, expected) in cases {
+            assert_eq!(
+                is_transient_default_branch_failure(error),
+                expected,
+                "{error}"
+            );
+        }
+    }
+
+    #[test]
+    fn primary_branch_log_sets_clear_after_bounded_overflow() {
+        let mut paths = BoundedLogSet::new(2);
+        assert!(paths.insert(PathBuf::from("a")));
+        assert!(paths.insert(PathBuf::from("b")));
+        assert!(paths.insert(PathBuf::from("c")));
+        assert!(!paths.insert(PathBuf::from("c")));
+        assert!(paths.insert(PathBuf::from("a")));
     }
 
     #[test]

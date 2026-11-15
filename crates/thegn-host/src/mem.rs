@@ -2,7 +2,8 @@
 //!
 //! `tune_allocator` records whether the requested glibc arena cap applied and
 //! anchors the process epoch. Idle loop wakes and completed scan bursts share
-//! one 30-second trim limiter; scan drains run only after the last worker exits
+//! one trim limiter with a 30-second floor; scan drains back off further after
+//! slow trims and run only after the last worker exits
 //! and switches to Background QoS first. The cumulative counters report trims
 //! by cause, drained scan bursts (including throttled ones), successful
 //! allocator releases, macOS released bytes, and trim duration. The cap can be
@@ -61,6 +62,8 @@ struct TrimCounters {
     bytes: AtomicU64,
     total_us: AtomicU64,
     max_us: AtomicU64,
+    skipped_swap: AtomicU64,
+    last_scan_duration_us: AtomicU64,
 }
 
 impl TrimCounters {
@@ -73,6 +76,8 @@ impl TrimCounters {
             bytes: AtomicU64::new(0),
             total_us: AtomicU64::new(0),
             max_us: AtomicU64::new(0),
+            skipped_swap: AtomicU64::new(0),
+            last_scan_duration_us: AtomicU64::new(0),
         }
     }
 }
@@ -80,6 +85,7 @@ impl TrimCounters {
 #[derive(Clone, Copy)]
 struct TrimLimiter<'a> {
     last: &'a AtomicU64,
+    last_scan_duration_us: Option<&'a AtomicU64>,
     now_ms: u64,
     min_ms: u64,
 }
@@ -116,13 +122,24 @@ fn epoch_ms() -> u64 {
     epoch().elapsed().as_millis().min(u64::MAX as u128) as u64
 }
 
-fn claim(last: &AtomicU64, now_ms: u64, min_ms: u64) -> bool {
-    let mut previous = last.load(Ordering::Acquire);
+fn claim(limiter: TrimLimiter<'_>) -> bool {
+    let adaptive_ms = limiter
+        .last_scan_duration_us
+        .map(|duration_us| duration_us.load(Ordering::Acquire).saturating_mul(200))
+        .map(|duration_us| duration_us.saturating_add(999) / 1_000)
+        .unwrap_or(0);
+    let min_ms = limiter.min_ms.max(adaptive_ms);
+    let mut previous = limiter.last.load(Ordering::Acquire);
     loop {
-        if now_ms.saturating_sub(previous) < min_ms {
+        if limiter.now_ms.saturating_sub(previous) < min_ms {
             return false;
         }
-        match last.compare_exchange_weak(previous, now_ms, Ordering::AcqRel, Ordering::Acquire) {
+        match limiter.last.compare_exchange_weak(
+            previous,
+            limiter.now_ms,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        ) {
             Ok(_) => return true,
             Err(observed) => previous = observed,
         }
@@ -135,7 +152,36 @@ fn try_trim_with(
     counters: &TrimCounters,
     trim: impl FnOnce() -> Option<TrimOutcome>,
 ) -> bool {
-    if !claim(limiter.last, limiter.now_ms, limiter.min_ms) {
+    try_trim_with_status(
+        cause,
+        limiter,
+        counters,
+        crate::platform::proc::memory_status,
+        trim,
+    )
+}
+
+fn try_trim_with_status(
+    cause: TrimCause,
+    limiter: TrimLimiter<'_>,
+    counters: &TrimCounters,
+    read_memory_status: impl FnOnce() -> Option<crate::platform::proc::ProcessMemoryStatus>,
+    trim: impl FnOnce() -> Option<TrimOutcome>,
+) -> bool {
+    if !claim(limiter) {
+        return false;
+    }
+    if matches!(cause, TrimCause::ScanDrain)
+        && let Some(status) = read_memory_status()
+        && should_skip_scan_trim(status.swap_kb, status.rss_kb)
+    {
+        counters.skipped_swap.fetch_add(1, Ordering::Relaxed);
+        tracing::debug!(
+            target: "thegn::mem",
+            vm_swap_kb = status.swap_kb,
+            vm_rss_kb = status.rss_kb,
+            "skipping scan trim while swap is elevated"
+        );
         return false;
     }
     let started = Instant::now();
@@ -153,7 +199,16 @@ fn try_trim_with(
     counters.bytes.fetch_add(outcome.bytes, Ordering::Relaxed);
     counters.total_us.fetch_add(elapsed, Ordering::Relaxed);
     counters.max_us.fetch_max(elapsed, Ordering::Relaxed);
+    if matches!(cause, TrimCause::ScanDrain) {
+        counters
+            .last_scan_duration_us
+            .store(elapsed, Ordering::Release);
+    }
     true
+}
+
+fn should_skip_scan_trim(swap_kb: u64, rss_kb: u64) -> bool {
+    swap_kb > rss_kb / 4
 }
 
 /// Return freed pages when the loop has been idle, sharing a limiter with
@@ -163,6 +218,7 @@ pub fn trim_if_idle(last_activity: Instant) {
         last_activity,
         TrimLimiter {
             last: &LAST_TRIM_MS,
+            last_scan_duration_us: None,
             now_ms: epoch_ms(),
             min_ms: TRIM_MIN_INTERVAL,
         },
@@ -187,6 +243,7 @@ pub(crate) fn trim_after_scan_burst() {
         TrimCause::ScanDrain,
         TrimLimiter {
             last: &LAST_TRIM_MS,
+            last_scan_duration_us: Some(&TRIMS.last_scan_duration_us),
             now_ms: epoch_ms(),
             min_ms: TRIM_MIN_INTERVAL,
         },
@@ -251,6 +308,7 @@ pub(crate) fn record_test_idle_trim() {
         TrimCause::Idle,
         TrimLimiter {
             last: &limiter,
+            last_scan_duration_us: None,
             now_ms: 30_000,
             min_ms: TRIM_MIN_INTERVAL,
         },
@@ -286,11 +344,67 @@ mod tests {
     #[test]
     fn claim_respects_the_shared_interval() {
         let last = AtomicU64::new(0);
-        assert!(!claim(&last, 29_999, 30_000));
-        assert!(claim(&last, 30_000, 30_000));
+        assert!(!claim(TrimLimiter {
+            last: &last,
+            last_scan_duration_us: None,
+            now_ms: 29_999,
+            min_ms: 30_000
+        }));
+        assert!(claim(TrimLimiter {
+            last: &last,
+            last_scan_duration_us: None,
+            now_ms: 30_000,
+            min_ms: 30_000
+        }));
         assert_eq!(last.load(Ordering::Relaxed), 30_000);
-        assert!(!claim(&last, 59_999, 30_000));
-        assert!(claim(&last, 60_000, 30_000));
+        assert!(!claim(TrimLimiter {
+            last: &last,
+            last_scan_duration_us: None,
+            now_ms: 59_999,
+            min_ms: 30_000
+        }));
+        assert!(claim(TrimLimiter {
+            last: &last,
+            last_scan_duration_us: None,
+            now_ms: 60_000,
+            min_ms: 30_000
+        }));
+    }
+
+    #[test]
+    fn fast_scan_trim_keeps_the_thirty_second_floor() {
+        let last = AtomicU64::new(30_000);
+        let duration = AtomicU64::new(25_000);
+        assert!(!claim(TrimLimiter {
+            last: &last,
+            last_scan_duration_us: Some(&duration),
+            now_ms: 59_999,
+            min_ms: TRIM_MIN_INTERVAL,
+        }));
+        assert!(claim(TrimLimiter {
+            last: &last,
+            last_scan_duration_us: Some(&duration),
+            now_ms: 60_000,
+            min_ms: TRIM_MIN_INTERVAL,
+        }));
+    }
+
+    #[test]
+    fn slow_scan_trim_pushes_next_admission_to_two_hundred_sixty_seconds() {
+        let last = AtomicU64::new(30_000);
+        let duration = AtomicU64::new(1_300_000);
+        assert!(!claim(TrimLimiter {
+            last: &last,
+            last_scan_duration_us: Some(&duration),
+            now_ms: 289_999,
+            min_ms: TRIM_MIN_INTERVAL,
+        }));
+        assert!(claim(TrimLimiter {
+            last: &last,
+            last_scan_duration_us: Some(&duration),
+            now_ms: 290_000,
+            min_ms: TRIM_MIN_INTERVAL,
+        }));
     }
 
     #[test]
@@ -301,7 +415,12 @@ mod tests {
             .map(|_| {
                 let (last, winners) = (last.clone(), winners.clone());
                 std::thread::spawn(move || {
-                    if claim(&last, 30_000, 30_000) {
+                    if claim(TrimLimiter {
+                        last: &last,
+                        last_scan_duration_us: None,
+                        now_ms: 30_000,
+                        min_ms: 30_000,
+                    }) {
                         winners.fetch_add(1, Ordering::SeqCst);
                     }
                 })
@@ -319,6 +438,7 @@ mod tests {
         let last = AtomicU64::new(0);
         let limiter = TrimLimiter {
             last: &last,
+            last_scan_duration_us: None,
             now_ms: 30_000,
             min_ms: 30_000,
         };
@@ -330,13 +450,14 @@ mod tests {
             })
         }));
         let called = AtomicUsize::new(0);
-        assert!(!try_trim_with(
+        assert!(!try_trim_with_status(
             TrimCause::ScanDrain,
             TrimLimiter {
                 now_ms: 59_999,
                 ..limiter
             },
             &counters,
+            || None,
             || {
                 called.fetch_add(1, Ordering::Relaxed);
                 Some(TrimOutcome {
@@ -346,22 +467,24 @@ mod tests {
             }
         ));
         assert_eq!(called.load(Ordering::Relaxed), 0);
-        assert!(!try_trim_with(
+        assert!(!try_trim_with_status(
             TrimCause::ScanDrain,
             TrimLimiter {
                 now_ms: 60_000,
                 ..limiter
             },
             &counters,
+            || None,
             || None
         ));
-        assert!(try_trim_with(
+        assert!(try_trim_with_status(
             TrimCause::ScanDrain,
             TrimLimiter {
                 now_ms: 90_000,
                 ..limiter
             },
             &counters,
+            || None,
             || {
                 std::thread::sleep(Duration::from_millis(1));
                 Some(TrimOutcome {
@@ -378,6 +501,7 @@ mod tests {
         assert!(
             counters.max_us.load(Ordering::Relaxed) <= counters.total_us.load(Ordering::Relaxed)
         );
+        assert!(counters.last_scan_duration_us.load(Ordering::Acquire) > 0);
     }
 
     #[test]
@@ -388,6 +512,7 @@ mod tests {
         let called = AtomicUsize::new(0);
         let limiter = TrimLimiter {
             last: &last,
+            last_scan_duration_us: None,
             now_ms: 30_000,
             min_ms: 30_000,
         };
@@ -416,6 +541,7 @@ mod tests {
             idle,
             TrimLimiter {
                 last: &last,
+                last_scan_duration_us: None,
                 now_ms: 59_999,
                 min_ms: 30_000,
             },
@@ -429,6 +555,46 @@ mod tests {
             }
         ));
         assert_eq!(called.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn swap_skip_decision_has_an_exact_quarter_boundary() {
+        assert!(!should_skip_scan_trim(0, 0));
+        assert!(!should_skip_scan_trim(25, 100));
+        assert!(should_skip_scan_trim(26, 100));
+        assert!(!should_skip_scan_trim(1, u64::MAX));
+        assert!(should_skip_scan_trim(u64::MAX, u64::MAX));
+    }
+
+    #[test]
+    fn admitted_scan_trim_counts_and_skips_elevated_swap() {
+        let counters = TrimCounters::new();
+        let last = AtomicU64::new(30_000);
+        let called = AtomicUsize::new(0);
+        assert!(!try_trim_with_status(
+            TrimCause::ScanDrain,
+            TrimLimiter {
+                last: &last,
+                last_scan_duration_us: Some(&counters.last_scan_duration_us),
+                now_ms: 60_000,
+                min_ms: TRIM_MIN_INTERVAL,
+            },
+            &counters,
+            || Some(crate::platform::proc::ProcessMemoryStatus {
+                swap_kb: 26,
+                rss_kb: 100,
+            }),
+            || {
+                called.fetch_add(1, Ordering::Relaxed);
+                Some(TrimOutcome {
+                    released: false,
+                    bytes: 0,
+                })
+            }
+        ));
+        assert_eq!(called.load(Ordering::Relaxed), 0);
+        assert_eq!(counters.skipped_swap.load(Ordering::Relaxed), 1);
+        assert_eq!(counters.scan.load(Ordering::Relaxed), 0);
     }
 
     #[test]

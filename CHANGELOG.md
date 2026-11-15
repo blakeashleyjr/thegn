@@ -7,6 +7,23 @@ All notable changes to **thegn** are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.1.0-alpha.81] — 2026-11-14
+
+### Changed
+
+- Cargo generation pruning now retains the two newest fingerprints per package
+  and unit kind, and reclaims older generations after the shorter of the
+  configured age and a three-day safety floor, including in active and dirty
+  worktrees.
+- Plugin schedules now run at most once per second, and the shipped `hello` example plugin now runs every 60 seconds instead of every 5.
+
+### Fixed
+
+- Idle sessions cache primary-branch checks until branch refs change, so they no longer spawn Git repeatedly; missing worktrees no longer warn on every check.
+- Finished subprocess group liveness checks reuse one global `/proc` scan per short window; plugin descendant checks walk the child's own subtree.
+- Background memory trimming backs off after slow scans and skips scan trimming when swapped memory is elevated; noisy `tokei`, `ignore`, and `globset` logs are limited to errors.
+- Plugin CI log streams now redact retained private-key lines when an END marker arrives without a BEGIN marker.
+
 ## [0.1.0-alpha.80] — 2026-11-14
 
 ### Changed
@@ -3457,7 +3474,8 @@ launcher picker and the merge queue's `agent_command` hook remain — they run
 whatever commands you configure. Leftover `[llm_proxy]` config sections and
 `proxy_*` tables in existing state databases are ignored harmlessly.
 
-[Unreleased]: https://github.com/blakeashleyjr/thegn/compare/v0.1.0-alpha.80...HEAD
+[Unreleased]: https://github.com/blakeashleyjr/thegn/compare/v0.1.0-alpha.81...HEAD
+[0.1.0-alpha.81]: https://github.com/blakeashleyjr/thegn/compare/v0.1.0-alpha.80...v0.1.0-alpha.81
 [0.1.0-alpha.80]: https://github.com/blakeashleyjr/thegn/compare/v0.1.0-alpha.79...v0.1.0-alpha.80
 [0.1.0-alpha.79]: https://github.com/blakeashleyjr/thegn/compare/v0.1.0-alpha.78...v0.1.0-alpha.79
 [0.1.0-alpha.78]: https://github.com/blakeashleyjr/thegn/compare/v0.1.0-alpha.77...v0.1.0-alpha.78

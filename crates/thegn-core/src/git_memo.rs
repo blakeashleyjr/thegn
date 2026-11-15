@@ -688,6 +688,13 @@ pub struct HeadInputs {
     packed: Stamp,
 }
 
+impl HeadInputs {
+    /// The literal contents of the worktree's `HEAD` file.
+    pub fn head_text(&self) -> &str {
+        &self.head
+    }
+}
+
 /// Compute [`HeadInputs`] for `dir`; `None` = cannot be modelled completely.
 pub fn head_inputs(dir: &Path) -> Option<HeadInputs> {
     let gitdir = git_dir(dir)?;
@@ -750,6 +757,13 @@ pub struct BaseRefsPrint {
     origin_head: Option<String>,
     loose: Vec<(PathBuf, Stamp)>,
     packed: Stamp,
+}
+
+impl BaseRefsPrint {
+    /// The literal contents of `refs/remotes/origin/HEAD`, when readable.
+    pub fn origin_head(&self) -> Option<&str> {
+        self.origin_head.as_deref()
+    }
 }
 
 /// Compute [`BaseRefsPrint`] for a local worktree, or `None` when it cannot be

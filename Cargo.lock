@@ -3398,7 +3398,7 @@ dependencies = [
 
 [[package]]
 name = "gtui-app"
-version = "0.1.0-alpha.80"
+version = "0.1.0-alpha.81"
 dependencies = [
  "chrono",
  "gtui-core",
@@ -3407,7 +3407,7 @@ dependencies = [
 
 [[package]]
 name = "gtui-core"
-version = "0.1.0-alpha.80"
+version = "0.1.0-alpha.81"
 dependencies = [
  "chrono",
  "serde",
@@ -3417,7 +3417,7 @@ dependencies = [
 
 [[package]]
 name = "gtui-embed"
-version = "0.1.0-alpha.80"
+version = "0.1.0-alpha.81"
 dependencies = [
  "chrono",
  "gtui-app",
@@ -3432,7 +3432,7 @@ dependencies = [
 
 [[package]]
 name = "gtui-query"
-version = "0.1.0-alpha.80"
+version = "0.1.0-alpha.81"
 dependencies = [
  "chrono",
  "gtui-core",
@@ -3446,7 +3446,7 @@ dependencies = [
 
 [[package]]
 name = "gtui-render"
-version = "0.1.0-alpha.80"
+version = "0.1.0-alpha.81"
 dependencies = [
  "criterion",
  "gtui-core",
@@ -8011,7 +8011,7 @@ dependencies = [
 
 [[package]]
 name = "thegn-core"
-version = "0.1.0-alpha.80"
+version = "0.1.0-alpha.81"
 dependencies = [
  "anyhow",
  "chrono",
@@ -8023,6 +8023,7 @@ dependencies = [
  "iana-time-zone",
  "ignore",
  "libc",
+ "log",
  "neo_frizbee 0.10.4",
  "nix 0.31.3",
  "once_cell",
@@ -8061,7 +8062,7 @@ dependencies = [
 
 [[package]]
 name = "thegn-host"
-version = "0.1.0-alpha.80"
+version = "0.1.0-alpha.81"
 dependencies = [
  "alacritty_terminal",
  "anyhow",
@@ -8124,7 +8125,7 @@ dependencies = [
 
 [[package]]
 name = "thegn-media"
-version = "0.1.0-alpha.80"
+version = "0.1.0-alpha.81"
 dependencies = [
  "futures",
  "libc",
@@ -8141,7 +8142,7 @@ dependencies = [
 
 [[package]]
 name = "thegn-metrics"
-version = "0.1.0-alpha.80"
+version = "0.1.0-alpha.81"
 dependencies = [
  "core-foundation 0.9.4",
  "libc",
@@ -8180,7 +8181,7 @@ dependencies = [
 
 [[package]]
 name = "thegn-proc"
-version = "0.1.0-alpha.80"
+version = "0.1.0-alpha.81"
 dependencies = [
  "libc",
  "nix 0.31.3",
@@ -8189,7 +8190,7 @@ dependencies = [
 
 [[package]]
 name = "thegn-proxy"
-version = "0.1.0-alpha.80"
+version = "0.1.0-alpha.81"
 dependencies = [
  "anyhow",
  "axum",
@@ -8208,7 +8209,7 @@ dependencies = [
 
 [[package]]
 name = "thegn-svc"
-version = "0.1.0-alpha.80"
+version = "0.1.0-alpha.81"
 dependencies = [
  "anyhow",
  "axum",
@@ -8252,7 +8253,7 @@ dependencies = [
 
 [[package]]
 name = "thegn-voice"
-version = "0.1.0-alpha.80"
+version = "0.1.0-alpha.81"
 dependencies = [
  "anyhow",
  "cpal",
