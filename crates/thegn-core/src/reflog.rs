@@ -132,6 +132,19 @@ fn classify(raw: &str) -> ReflogAction {
 /// subjects containing other control characters. Malformed output is rejected
 /// as a whole so positional undo planning can never use a shortened history.
 pub fn parse_reflog(out: &str) -> anyhow::Result<Vec<ReflogEntry>> {
+    parse_reflog_with_limits(
+        out,
+        crate::gitrefs::MAX_GIT_OUTPUT_BYTES,
+        crate::gitrefs::MAX_GIT_FIELD_BYTES,
+    )
+}
+
+fn parse_reflog_with_limits(
+    out: &str,
+    max_output: usize,
+    max_field: usize,
+) -> anyhow::Result<Vec<ReflogEntry>> {
+    crate::gitrefs::check_git_output(out, max_output, max_field)?;
     if out.is_empty() {
         return Ok(Vec::new());
     }
@@ -862,5 +875,57 @@ mod tests {
         let parsed = parse_reflog(&reflog_records(5000).concat()).unwrap();
         assert_eq!(parsed.len(), 5000);
         assert_eq!(parsed[4999].selector, "HEAD@{4999}");
+    }
+
+    // --- parser byte caps (THE-383) ---
+
+    #[test]
+    fn reflog_caps_exact_and_over() {
+        for count in [1usize, 3] {
+            let input = reflog_records(count).concat();
+            let total = input.len();
+            let longest = input.split('\0').map(str::len).max().unwrap();
+            assert_eq!(
+                parse_reflog_with_limits(&input, total, longest)
+                    .unwrap()
+                    .len(),
+                count
+            );
+            let over = parse_reflog_with_limits(&input, total - 1, longest)
+                .unwrap_err()
+                .to_string();
+            assert!(over.contains("whole-output cap"), "{over}");
+            let field = parse_reflog_with_limits(&input, total, longest - 1)
+                .unwrap_err()
+                .to_string();
+            assert!(field.contains("per-field cap"), "{field}");
+        }
+    }
+
+    #[test]
+    fn reflog_caps_field_in_middle_fails_whole_parse() {
+        let records = reflog_records(3);
+        let input = format!(
+            "{}{}{}",
+            records[0],
+            reflog_with(3, &"x".repeat(200)),
+            records[2]
+        );
+        assert_eq!(
+            parse_reflog_with_limits(&input, usize::MAX, usize::MAX)
+                .unwrap()
+                .len(),
+            3
+        );
+        let error = parse_reflog_with_limits(&input, usize::MAX, 100)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("per-field cap"), "{error}");
+    }
+
+    #[test]
+    fn reflog_caps_thousand_records_stay_ok_under_real_caps() {
+        let input = reflog_records(1000).concat();
+        assert_eq!(parse_reflog(&input).unwrap().len(), 1000);
     }
 }
