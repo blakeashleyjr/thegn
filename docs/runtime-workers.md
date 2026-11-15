@@ -31,6 +31,10 @@ background maintenance; **(c)** retry/work already in hand; **(d)** avoidable hi
 polling. “No explicit cap” means the source does not enforce an aggregate cap for
 that thread family; it is not a claim that the operating system has no limits.
 
+The consuming side of these workers, every receiver the event loop drains with its
+channel bound, delivery semantics, wake and per-iteration budget, is the
+[host event ingress](host-event-ingress.md) contract table.
+
 ## Runtimes and caps
 
 | Runtime or pool                | Creation and owner                                                                                                                                                                                                                                                                                                                                                                                                                                               | Bounds and scope                                                                                                                                                                                                                                                 | Wake / gate / shutdown                                                                                                                                       |
