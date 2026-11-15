@@ -195,6 +195,11 @@ fn map_run(run: Run, timeout: Duration) -> Result<String> {
     }
     match run.leader {
         Leader::Reaped(status) if status.success() => {
+            // A descendant that escaped the group and kept stdout open past the
+            // reader grace leaves a partial capture; never present it as a diff.
+            if !run.stdout.eof {
+                anyhow::bail!("difft output incomplete: a descendant held the pipe open");
+            }
             Ok(String::from_utf8_lossy(&run.stdout.bytes).into_owned())
         }
         Leader::Reaped(status) => anyhow::bail!(
@@ -313,7 +318,11 @@ mod tests {
             group,
             leader,
             leader_exited_first: true,
-            stdout: Capture::default(),
+            // Fully drained by default; the incomplete case sets `eof = false`.
+            stdout: Capture {
+                eof: true,
+                ..Capture::default()
+            },
             stderr: Capture::default(),
             containment: Containment::ProcessGroup,
         }
@@ -375,6 +384,22 @@ mod tests {
         );
         let text = format!("{:#}", map_run(run, Duration::from_secs(1)).unwrap_err());
         assert!(text.contains("survived"), "{text}");
+    }
+
+    #[test]
+    fn map_run_undrained_stdout_after_a_clean_exit_is_an_error() {
+        let Some(status) = status_of("exit 0") else {
+            return;
+        };
+        let mut run = run_with(
+            End::LeaderExited,
+            GroupState::Drained,
+            Leader::Reaped(status),
+        );
+        run.stdout.bytes = b"partial".to_vec();
+        run.stdout.eof = false;
+        let text = format!("{:#}", map_run(run, Duration::from_secs(1)).unwrap_err());
+        assert!(text.contains("output incomplete"), "{text}");
     }
 
     #[test]
