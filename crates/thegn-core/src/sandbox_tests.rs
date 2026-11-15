@@ -1924,14 +1924,25 @@ fn canonical_mount_sources_preserve_visible_destinations_for_every_backend_famil
 }
 
 pub fn pull_image(img: &str) -> anyhow::Result<()> {
+    if sandbox_backend_forced_none() {
+        return Ok(());
+    }
     let _ = std::process::Command::new("podman") // best-effort: test scaffolding: pull failures are ignored (the image may be cached)
         .args(["pull", img])
         .output();
     Ok(())
 }
 
+fn sandbox_backend_forced_none() -> bool {
+    std::env::var("THEGN_SANDBOX_BACKEND")
+        .is_ok_and(|backend| matches!(backend.trim(), "none" | "host"))
+}
+
 #[test]
 fn integration_test_sandbox_net_and_file() {
+    if sandbox_backend_forced_none() {
+        return;
+    }
     // Only run if podman is installed.
     if !crate::util::have("podman") {
         return;
@@ -2001,6 +2012,9 @@ fn integration_test_sandbox_net_and_file() {
 
 #[test]
 fn integration_test_sandbox_lifecycle() {
+    if sandbox_backend_forced_none() {
+        return;
+    }
     // Only run if podman is installed.
     if !crate::util::have("podman") {
         return;
