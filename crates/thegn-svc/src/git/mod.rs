@@ -1020,7 +1020,6 @@ pub(super) fn output_bounded_with_input(
     input: Option<&[u8]>,
     timeout: Option<std::time::Duration>,
 ) -> Result<std::process::Output> {
-    use std::io::Read;
     use std::process::Stdio;
     use std::time::Duration;
 
@@ -1044,113 +1043,61 @@ pub(super) fn output_bounded_with_input(
         }
         return Ok(cmd.output()?);
     };
-    if input.is_none() {
-        let cancel = std::sync::atomic::AtomicBool::new(false);
-        let limits = thegn_proc::Limits {
-            quiesce_after_leader: Some(Duration::ZERO),
-            term_grace: Duration::from_millis(200),
-            reader_grace: Duration::from_millis(100),
-            stdout: thegn_proc::Stream::Head { cap: usize::MAX },
-            stderr: thegn_proc::Stream::Head { cap: usize::MAX },
-            ..thegn_proc::Limits::silent(timeout)
-        };
-        let run = thegn_proc::run(&mut cmd, &limits, &cancel);
-        return match run.end {
-            thegn_proc::End::Spawn(error) => Err(error.into()),
-            thegn_proc::End::TimedOut => anyhow::bail!(
-                "git {} timed out after {}s (killed)",
-                args.join(" "),
-                timeout.as_secs()
-            ),
-            thegn_proc::End::Supervise(error) => {
-                anyhow::bail!("git {} could not be supervised: {error}", args.join(" "))
-            }
-            thegn_proc::End::Cancelled => {
-                anyhow::bail!("git {} was unexpectedly cancelled", args.join(" "))
-            }
-            thegn_proc::End::OutputLimit(which) => {
-                anyhow::bail!(
-                    "git {} unexpectedly hit output limit {which:?}",
-                    args.join(" ")
-                )
-            }
-            thegn_proc::End::LeaderExited => {
-                if run.group == thegn_proc::GroupState::Survivors {
-                    anyhow::bail!(
-                        "git {} left processes that survived termination",
-                        args.join(" ")
-                    );
-                }
-                match run.leader {
-                    thegn_proc::Leader::Reaped(status) => Ok(std::process::Output {
-                        status,
-                        stdout: run.stdout.bytes,
-                        stderr: run.stderr.bytes,
-                    }),
-                    leader => anyhow::bail!("git {} was not reaped: {leader:?}", args.join(" ")),
-                }
-            }
-        };
-    }
-    // The stdin-fed ref-transaction path remains on the legacy runner (THE-368b work).
-    let mut child = cmd
-        .stdin(if input.is_some() {
-            Stdio::piped()
-        } else {
-            Stdio::null()
-        })
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()?;
-    if let Some(input) = input {
-        use std::io::Write;
 
-        if let Some(mut stdin) = child.stdin.take()
-            && let Err(error) = stdin.write_all(input)
-        {
-            stop_bounded_child(&mut child);
-            return Err(error.into());
+    let cancel = std::sync::atomic::AtomicBool::new(false);
+    let limits = thegn_proc::Limits {
+        quiesce_after_leader: Some(Duration::ZERO),
+        term_grace: Duration::from_millis(200),
+        reader_grace: Duration::from_millis(100),
+        stdout: thegn_proc::Stream::Head { cap: usize::MAX },
+        stderr: thegn_proc::Stream::Head { cap: usize::MAX },
+        ..thegn_proc::Limits::silent(timeout)
+    };
+    let run = match input {
+        Some(input) => {
+            // A child may close stdin before consuming the payload. Keep the
+            // run result so a non-zero exit still reports Git's stderr.
+            let (run, _feed) = thegn_proc::run_with_input(&mut cmd, &limits, input, &cancel);
+            run
+        }
+        None => thegn_proc::run(&mut cmd, &limits, &cancel),
+    };
+    match run.end {
+        thegn_proc::End::Spawn(error) => Err(error.into()),
+        thegn_proc::End::TimedOut => anyhow::bail!(
+            "git {} timed out after {}s (killed)",
+            args.join(" "),
+            timeout.as_secs()
+        ),
+        thegn_proc::End::Supervise(error) => {
+            anyhow::bail!("git {} could not be supervised: {error}", args.join(" "))
+        }
+        thegn_proc::End::Cancelled => {
+            anyhow::bail!("git {} was unexpectedly cancelled", args.join(" "))
+        }
+        thegn_proc::End::OutputLimit(which) => {
+            anyhow::bail!(
+                "git {} unexpectedly hit output limit {which:?}",
+                args.join(" ")
+            )
+        }
+        thegn_proc::End::LeaderExited => {
+            if run.group == thegn_proc::GroupState::Survivors {
+                anyhow::bail!(
+                    "git {} left processes that survived termination",
+                    args.join(" ")
+                );
+            }
+            match run.leader {
+                thegn_proc::Leader::Reaped(status) => Ok(std::process::Output {
+                    status,
+                    stdout: run.stdout.bytes,
+                    stderr: run.stderr.bytes,
+                }),
+                leader => anyhow::bail!("git {} was not reaped: {leader:?}", args.join(" ")),
+            }
         }
     }
-    let mut so = child.stdout.take().expect("piped stdout");
-    let mut se = child.stderr.take().expect("piped stderr");
-    let so_h = thegn_core::thread_name::spawn_named("thegn-git-out", move || {
-        let mut b = Vec::new();
-        let _ = so.read_to_end(&mut b); // best-effort: read error just truncates captured output
-        b
-    });
-    let se_h = thegn_core::thread_name::spawn_named("thegn-git-err", move || {
-        let mut b = Vec::new();
-        let _ = se.read_to_end(&mut b); // best-effort: read error just truncates captured output
-        b
-    });
-    let deadline = std::time::Instant::now() + timeout;
-    let mut backoff = Duration::from_millis(1);
-    let status = loop {
-        if let Some(status) = child.try_wait()? {
-            break status;
-        }
-        let remaining = deadline.saturating_duration_since(std::time::Instant::now());
-        if remaining.is_zero() {
-            let _ = child.kill(); // best-effort: child may already have exited
-            let _ = child.wait(); // best-effort: reap-or-not is terminal here
-            anyhow::bail!(
-                "git {} timed out after {}s (killed)",
-                args.join(" "),
-                timeout.as_secs()
-            );
-        }
-        std::thread::sleep(backoff.min(remaining));
-        backoff = (backoff * 2).min(Duration::from_millis(25));
-    };
-    // Pipes are closed now the child has exited, so the readers finish promptly.
-    let stdout = so_h.join().unwrap_or_default();
-    let stderr = se_h.join().unwrap_or_default();
-    Ok(std::process::Output {
-        status,
-        stdout,
-        stderr,
-    })
 }
 
 fn stop_bounded_child(child: &mut std::process::Child) {
@@ -3618,6 +3565,72 @@ mod tests {
         c.arg("ok");
         let out = output_bounded_with(c, &["printf", "ok"], None).unwrap();
         assert_eq!(String::from_utf8_lossy(&out.stdout), "ok");
+    }
+
+    #[test]
+    fn output_bounded_with_input_captures_echo_byte_exact() {
+        let input = b"binary\0payload\xff\n";
+        let c = std::process::Command::new("cat");
+        let before = git_spawn_count();
+        let out = output_bounded_with_input(
+            c,
+            &["cat"],
+            Some(input),
+            Some(std::time::Duration::from_secs(5)),
+        )
+        .unwrap();
+        assert_eq!(out.stdout, input);
+        assert_eq!(git_spawn_count(), before + 1);
+    }
+
+    #[test]
+    fn output_bounded_with_input_kills_a_command_that_never_reads_stdin() {
+        let start = std::time::Instant::now();
+        let mut c = std::process::Command::new("sh");
+        c.args(["-c", "sleep 30"]);
+        let error = output_bounded_with_input(
+            c,
+            &["sh", "-c", "sleep 30"],
+            Some(b"payload"),
+            Some(std::time::Duration::from_secs(1)),
+        )
+        .expect_err("a sleeping command must hit the input-aware deadline");
+        assert_eq!(
+            error.to_string(),
+            "git sh -c sleep 30 timed out after 1s (killed)"
+        );
+        assert!(start.elapsed() < std::time::Duration::from_secs(5));
+    }
+
+    #[test]
+    fn output_bounded_with_input_handles_a_child_that_closes_stdin_early() {
+        let c = std::process::Command::new("true");
+        let input = vec![b'x'; 1 << 20];
+        let out = output_bounded_with_input(
+            c,
+            &["true"],
+            Some(&input),
+            Some(std::time::Duration::from_secs(5)),
+        )
+        .unwrap();
+        assert!(out.status.success());
+        assert!(out.stdout.is_empty());
+    }
+
+    #[test]
+    fn output_bounded_with_input_preserves_stderr_after_early_nonzero_exit() {
+        let mut c = std::process::Command::new("sh");
+        c.args(["-c", "printf failure >&2; exit 1"]);
+        let input = vec![b'x'; 1 << 20];
+        let out = output_bounded_with_input(
+            c,
+            &["sh", "-c", "printf failure >&2; exit 1"],
+            Some(&input),
+            Some(std::time::Duration::from_secs(5)),
+        )
+        .unwrap();
+        assert!(!out.status.success());
+        assert_eq!(out.stderr, b"failure");
     }
 
     #[test]
