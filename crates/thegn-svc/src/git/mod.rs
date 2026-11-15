@@ -961,15 +961,79 @@ fn dirty_or_expired(found: bool, expired: bool) -> Result<bool> {
 /// so a wedged git — a lock held by a crashed process, a hung NFS/SSH mount, a
 /// stalled pack negotiation on a remote loc — can't pin a background hydration
 /// worker forever (the symptom is a silent, permanently-stale sidebar). Reads
-/// and fast local staging flow through [`run`]/`run_status`; the network-heavy
-/// writes (fetch/clone/push/pull) go through `run_w` and are deliberately *not*
-/// bounded here. Override with `THEGN_GIT_READ_TIMEOUT_SECS`; `0` disables it.
+/// and fast local staging flow through [`run`]/`run_status`; writes go through
+/// `run_w` and carry their own, much longer bound ([`git_write_timeout`]), so a
+/// slow fetch or push is never cut off at the read deadline. Override with
+/// `THEGN_GIT_READ_TIMEOUT_SECS`; `0` disables it.
 fn git_read_timeout() -> Option<std::time::Duration> {
     let secs = std::env::var("THEGN_GIT_READ_TIMEOUT_SECS")
         .ok()
         .and_then(|s| s.trim().parse::<u64>().ok())
         .unwrap_or(60);
     (secs > 0).then(|| std::time::Duration::from_secs(secs))
+}
+
+/// Git subcommands whose run time is dominated by network transfer; they get the
+/// long write bound ([`GIT_WRITE_NETWORK_TIMEOUT`]).
+const GIT_NETWORK_VERBS: &[&str] = &[
+    "fetch",
+    "push",
+    "pull",
+    "clone",
+    "ls-remote",
+    "remote",
+    "submodule",
+    "lfs",
+];
+
+/// Write bound for network verbs: a large clone or push over a slow link can
+/// legitimately take a long time, but not forever.
+const GIT_WRITE_NETWORK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60 * 60);
+
+/// Write bound for every other (local) mutation: commit hooks, rebases and
+/// large `add`s can be slow, but a write still running after this is wedged.
+const GIT_WRITE_LOCAL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15 * 60);
+
+/// Upper bound on a subprocess git *write* (`run_w`, `run_w_network`,
+/// `run_w_locked`) before its process group is killed, so a wedged write — a
+/// stalled push, a hook waiting on a terminal, a lock held by a crashed
+/// process — can't pin the mutation thread forever. Network verbs
+/// ([`GIT_NETWORK_VERBS`]) get one hour, every other write fifteen minutes.
+/// `THEGN_GIT_WRITE_TIMEOUT_SECS` overrides both; `0` disables the bound.
+/// `run_stdin` is not covered (see its doc).
+fn git_write_timeout(args: &[&str]) -> Option<std::time::Duration> {
+    let env = std::env::var("THEGN_GIT_WRITE_TIMEOUT_SECS");
+    git_write_timeout_with(args, env.as_deref().ok())
+}
+
+/// [`git_write_timeout`] with the env override injected, so tests never mutate
+/// the process-global `THEGN_GIT_WRITE_TIMEOUT_SECS`. An override that does not
+/// parse as whole seconds is ignored and the per-verb default applies.
+fn git_write_timeout_with(args: &[&str], env_secs: Option<&str>) -> Option<std::time::Duration> {
+    if let Some(secs) = env_secs.and_then(|s| s.trim().parse::<u64>().ok()) {
+        return (secs > 0).then(|| std::time::Duration::from_secs(secs));
+    }
+    match git_subcommand(args) {
+        Some(verb) if GIT_NETWORK_VERBS.contains(&verb) => Some(GIT_WRITE_NETWORK_TIMEOUT),
+        _ => Some(GIT_WRITE_LOCAL_TIMEOUT),
+    }
+}
+
+/// The git subcommand in `args`, skipping leading global options (`-c k=v`,
+/// `-C <dir>`, `--no-pager`, …) so `["-c", "x=y", "fetch"]` classifies as
+/// `fetch`.
+fn git_subcommand<'a>(args: &[&'a str]) -> Option<&'a str> {
+    let mut it = args.iter();
+    while let Some(arg) = it.next() {
+        match *arg {
+            "-c" | "-C" | "--git-dir" | "--work-tree" | "--namespace" => {
+                it.next();
+            }
+            a if a.starts_with('-') => {}
+            a => return Some(a),
+        }
+    }
+    None
 }
 
 /// Run a prepared git `Command` capturing full output, but kill the child if it
@@ -2459,18 +2523,39 @@ pub(crate) fn run_w(loc: &GitLoc, envs: &[(&str, &str)], args: &[&str]) -> Resul
     }
 }
 
-/// Run the write subprocess after the caller has selected the locking policy.
+/// Run the write subprocess after the caller has selected the locking policy,
+/// bounded by [`git_write_timeout`].
 fn run_w_unlocked(loc: &GitLoc, envs: &[(&str, &str)], args: &[&str]) -> Result<String> {
+    run_w_unlocked_with(loc, envs, args, git_write_timeout(args))
+}
+
+/// [`run_w_unlocked`] with the timeout injected — the test seam. On expiry the
+/// child's whole process group is killed (via [`output_bounded_with`]) and the
+/// error names the timeout; `None` runs unbounded.
+fn run_w_unlocked_with(
+    loc: &GitLoc,
+    envs: &[(&str, &str)],
+    args: &[&str],
+    timeout: Option<std::time::Duration>,
+) -> Result<String> {
     // Marks the write for snapshot caches of git reads (THE-718); dropped
     // (advancing the epoch) after the subprocess and its lock are done.
     let _epoch = thegn_core::util::GitWriteScope::begin();
     let mut env: Vec<(&str, &str)> = vec![("GIT_TERMINAL_PROMPT", "0")];
     env.extend_from_slice(envs);
-    let out = loc
-        .git_command_env(&env, args)
-        .stdin(std::process::Stdio::null())
-        .output()
-        .with_context(|| format!("git {}", args.join(" ")))?;
+    let mut cmd = loc.git_command_env(&env, args);
+    // `thegn_proc::run` and `Command::output` both null stdin already; set it
+    // explicitly so a credential/gpg prompt can never read the parent's tty.
+    cmd.stdin(std::process::Stdio::null());
+    let out = output_bounded_with(cmd, args, timeout).map_err(|error| {
+        // Spawn failures surface as a bare io::Error: name the command. The
+        // runner's own errors (timeout, supervision) already do.
+        if error.downcast_ref::<std::io::Error>().is_some() {
+            error.context(format!("git {}", args.join(" ")))
+        } else {
+            error
+        }
+    })?;
     if !out.status.success() {
         anyhow::bail!(
             "git {} failed: {}",
@@ -2509,10 +2594,10 @@ pub(crate) fn run_w_locked(
 
 /// [`run_w`] with bytes piped to stdin (`git apply -`, `git commit -F -`).
 ///
-/// This general mutation runner is deliberately unbounded: callers include
-/// patch/index operations, while other write runners carry fetch/push traffic
-/// for which a short local timeout would be destructive. Automated commit
-/// creation uses [`run_background_commit_stdin`] instead.
+/// This general mutation runner is deliberately unbounded, unlike the other
+/// write runners ([`git_write_timeout`]): its callers are patch/index
+/// operations with a caller-supplied payload. Automated commit creation uses
+/// [`run_background_commit_stdin`] instead.
 pub(crate) fn run_stdin(
     loc: &GitLoc,
     envs: &[(&str, &str)],
@@ -3556,6 +3641,114 @@ mod tests {
         assert!(
             start.elapsed() < std::time::Duration::from_secs(5),
             "should return shortly after the bound, not after the sleep"
+        );
+    }
+
+    #[test]
+    fn git_write_timeout_bounds_network_verbs_at_one_hour() {
+        let hour = Some(std::time::Duration::from_secs(3600));
+        for verb in [
+            "fetch",
+            "push",
+            "pull",
+            "clone",
+            "ls-remote",
+            "remote",
+            "submodule",
+            "lfs",
+        ] {
+            assert_eq!(
+                git_write_timeout_with(&[verb, "origin"], None),
+                hour,
+                "{verb}"
+            );
+        }
+        assert_eq!(
+            git_write_timeout_with(&["-c", "http.lowSpeedLimit=1", "fetch"], None),
+            hour
+        );
+        assert_eq!(
+            git_write_timeout_with(&["-C", "/repo", "--no-pager", "push"], None),
+            hour
+        );
+    }
+
+    #[test]
+    fn git_write_timeout_bounds_local_writes_at_fifteen_minutes() {
+        let quarter = Some(std::time::Duration::from_secs(15 * 60));
+        for args in [
+            &["commit", "-m", "x"][..],
+            &["add", "--", "f"][..],
+            &["rebase", "main"][..],
+            &["-c", "remote.x=fetch", "update-ref", "refs/x", "HEAD"][..],
+            &[][..],
+        ] {
+            assert_eq!(git_write_timeout_with(args, None), quarter, "{args:?}");
+        }
+    }
+
+    #[test]
+    fn git_write_timeout_env_override_and_zero_disable() {
+        let ten = Some(std::time::Duration::from_secs(10));
+        assert_eq!(git_write_timeout_with(&["fetch"], Some("10")), ten);
+        assert_eq!(git_write_timeout_with(&["commit"], Some(" 10 ")), ten);
+        assert_eq!(git_write_timeout_with(&["push"], Some("0")), None);
+        assert_eq!(git_write_timeout_with(&["commit"], Some("0")), None);
+        // An unparseable override falls back to the per-verb default.
+        assert_eq!(
+            git_write_timeout_with(&["commit"], Some("soon")),
+            Some(std::time::Duration::from_secs(15 * 60))
+        );
+    }
+
+    #[test]
+    fn run_w_unlocked_with_returns_stdout_of_a_finished_write() {
+        let repo = testutil::TestRepo::new("w-ok");
+        let out = run_w_unlocked_with(
+            &repo.loc(),
+            &[],
+            &["config", "--local", "--get", "core.bare"],
+            Some(std::time::Duration::from_secs(30)),
+        )
+        .unwrap();
+        assert_eq!(out.trim(), "false");
+    }
+
+    #[test]
+    fn run_w_unlocked_with_keeps_the_failed_text_on_nonzero_exit() {
+        let repo = testutil::TestRepo::new("w-fail");
+        let error = run_w_unlocked_with(
+            &repo.loc(),
+            &[],
+            &["update-ref", "refs/heads/x", "not-a-revision"],
+            Some(std::time::Duration::from_secs(30)),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            error.contains("git update-ref refs/heads/x not-a-revision failed:"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn run_w_unlocked_with_kills_a_hung_write() {
+        // A shell alias stands in for a wedged write; its `sleep` is a child of
+        // git, so only a process-group kill returns promptly.
+        let repo = testutil::TestRepo::new("w-hang");
+        let start = std::time::Instant::now();
+        let error = run_w_unlocked_with(
+            &repo.loc(),
+            &[],
+            &["-c", "alias.hang=!sleep 30", "hang"],
+            Some(std::time::Duration::from_millis(300)),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("timed out after"), "{error}");
+        assert!(
+            start.elapsed() < std::time::Duration::from_secs(10),
+            "the write must be killed at its bound, not after the sleep"
         );
     }
 
