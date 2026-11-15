@@ -14,7 +14,7 @@ use thegn_core::submodule::{
     parse_submodule_status,
 };
 
-use super::{FileStatus, parse_status_porcelain, run, run_w};
+use super::{FileStatus, parse_status_porcelain, run, run_text_strict, run_w};
 
 /// Recursive initialization is blocked until the complete nested metadata
 /// closure can be pinned and approved at the executing repository authority.
@@ -171,7 +171,7 @@ fn parse_stage_gitlinks(out: &str) -> Result<HashMap<String, String>> {
 }
 
 fn recorded_gitlinks(loc: &GitLoc) -> Result<HashMap<String, String>> {
-    let out = run(loc, &["ls-files", "--stage", "-z", "--"])?;
+    let out = run_text_strict(loc, &["ls-files", "--stage", "-z", "--"])?;
     parse_stage_gitlinks(&out)
 }
 
@@ -183,7 +183,7 @@ pub(crate) fn states(loc: &GitLoc) -> Result<Vec<SubmoduleState>> {
         return Ok(Vec::new());
     }
     let status_output = run(loc, &["submodule", "status", "--recursive"])?;
-    let ordinary_status = parse_status_porcelain(&run(
+    let ordinary_status = parse_status_porcelain(&run_text_strict(
         loc,
         &["status", "--porcelain=v1", "-z", "--no-renames"],
     )?)?;
@@ -502,6 +502,12 @@ mod tests {
     use super::*;
     use crate::git::PlumbingOps;
     use crate::git::testutil::{TestRepo, git_in};
+
+    #[test]
+    fn states_without_gitmodules_is_empty_ok() {
+        let repo = TestRepo::new("submodule-states-no-gitmodules");
+        assert!(states(&repo.loc()).unwrap().is_empty());
+    }
 
     #[test]
     fn recursive_initialization_is_refused_with_a_typed_reason() {

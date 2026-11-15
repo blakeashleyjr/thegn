@@ -815,6 +815,35 @@ fn run(loc: &GitLoc, args: &[&str]) -> Result<String> {
     Ok(String::from_utf8_lossy(&out.stdout).into_owned())
 }
 
+/// Decode git stdout strictly: a non-UTF-8 byte (for example a non-UTF-8 path
+/// in a `-z` NUL-framed read) is an error, never a silent U+FFFD substitution.
+fn decode_strict(bytes: Vec<u8>, args: &[&str]) -> Result<String> {
+    String::from_utf8(bytes).map_err(|_| {
+        anyhow::anyhow!(
+            "git {} output is not valid UTF-8 (non-UTF-8 path); refusing a lossy decode",
+            args.join(" ")
+        )
+    })
+}
+
+/// Like [`run`], but refuses a lossy UTF-8 decode of local stdout. For
+/// NUL-framed reads where a replaced byte would mismatch the real path.
+/// Non-local locations fall back to [`run`] (the bridge decodes remotely).
+pub(super) fn run_text_strict(loc: &GitLoc, args: &[&str]) -> Result<String> {
+    if !local_cli(loc) {
+        return run(loc, args);
+    }
+    let out = run_status_bytes(loc, args, true)?;
+    if !out.status.success() {
+        anyhow::bail!(
+            "git {} failed: {}",
+            args.join(" "),
+            String::from_utf8_lossy(&out.stderr).trim()
+        );
+    }
+    decode_strict(out.stdout, args)
+}
+
 /// Like [`run`], but returns `(exit_code, stdout)` instead of bailing on a
 /// non-zero exit — for reads that treat a non-zero exit as *data* rather than an
 /// error (`ahead_behind`: no upstream; `merge_state`: a `*_HEAD` ref is absent;
@@ -5998,6 +6027,46 @@ mod backend_kind_tests {
                 .probe()
                 .id,
             "gix"
+        );
+    }
+}
+
+#[cfg(test)]
+mod strict_text_tests {
+    use super::{decode_strict, run, run_text_strict};
+    use crate::git::testutil::TestRepo;
+
+    #[test]
+    fn strict_matches_run_on_valid_utf8() {
+        let repo = TestRepo::new("strict-text-valid");
+        let args = ["ls-files", "--stage", "-z", "--"];
+        assert_eq!(
+            run_text_strict(&repo.loc(), &args).unwrap(),
+            run(&repo.loc(), &args).unwrap()
+        );
+    }
+
+    #[test]
+    fn strict_nonzero_exit_has_same_error_text_as_run() {
+        let repo = TestRepo::new("strict-text-fail");
+        let args = ["rev-parse", "--verify", "refs/heads/does-not-exist-xyz"];
+        let a = run(&repo.loc(), &args).unwrap_err().to_string();
+        let b = run_text_strict(&repo.loc(), &args).unwrap_err().to_string();
+        assert_eq!(a, b);
+    }
+
+    #[test]
+    fn decode_strict_accepts_utf8_and_refuses_invalid_bytes() {
+        assert_eq!(
+            decode_strict(b"a\0b\0".to_vec(), &["ls-files", "-z"]).unwrap(),
+            "a\0b\0"
+        );
+        let err = decode_strict(vec![b'a', 0xff, 0], &["ls-files", "-z"])
+            .unwrap_err()
+            .to_string();
+        assert_eq!(
+            err,
+            "git ls-files -z output is not valid UTF-8 (non-UTF-8 path); refusing a lossy decode"
         );
     }
 }
