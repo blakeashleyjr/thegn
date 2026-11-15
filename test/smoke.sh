@@ -166,6 +166,9 @@ export GIT_AUTHOR_NAME=t GIT_AUTHOR_EMAIL=t@t GIT_COMMITTER_NAME=t GIT_COMMITTER
 # kaneo) are dev-channel-only, so run smoke in the dev channel. A dedicated
 # section below verifies the stable channel refuses them + clamps.
 export THEGN_CHANNEL=dev
+# Smoke exercises CLI/config behavior, not a live container runtime. Keep
+# backend discovery from starting rootless Podman pause processes.
+export THEGN_SANDBOX_BACKEND=none
 
 mkdir -p "$XDG_CONFIG_HOME/thegn"
 cat >"$XDG_CONFIG_HOME/thegn/config.toml" <<EOF
