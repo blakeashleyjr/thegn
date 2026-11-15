@@ -1,6 +1,7 @@
 //! What a finished PR-queue agent run did to the PR head (THE-549): the host half of the pure taxonomy in `thegn_core::pr_queue`.
 
 use thegn_core::config_pr_queue::PrQueueConfig;
+use thegn_core::git_run::{GitOutcome, GitTextError};
 use thegn_core::pr_queue::{self, AgentHeadOutcome, AgentRunObservation};
 use thegn_core::remote::GitLoc;
 
@@ -25,29 +26,72 @@ pub(crate) fn classify_run(
 
 /// Reads the worktree HEAD and ancestry (two local git spawns, off the UI loop:
 /// the driver runs on a worker). None for a remote/provider checkout (the
-/// observation is local-only; acceptance 2 stays open) or when HEAD is unreadable.
+/// observation is local-only; acceptance 2 stays open). An unreadable local HEAD
+/// is classified as Unverified so callers cannot claim agent progress.
 pub(crate) fn observe_outcome(
     loc: &GitLoc,
     admitted: &str,
     remote_head: Option<&str>,
     lease_current: bool,
 ) -> Option<AgentHeadOutcome> {
+    match observe_outcome_with_reason(loc, admitted, remote_head, lease_current) {
+        Ok(outcome) => outcome,
+        Err(error) => {
+            tracing::warn!(target: "thegn::prq", %error, "could not read local PR-agent HEAD; treating the outcome as unverified");
+            Some(AgentHeadOutcome::Unverified)
+        }
+    }
+}
+
+fn observe_outcome_with_reason(
+    loc: &GitLoc,
+    admitted: &str,
+    remote_head: Option<&str>,
+    lease_current: bool,
+) -> Result<Option<AgentHeadOutcome>, String> {
     let GitLoc::Local(path) = loc else {
-        return None;
+        return Ok(None);
     };
-    let local = loc.git_out(&["rev-parse", "HEAD"])?;
+    let Some(local) = read_head(loc)? else {
+        return Ok(Some(classify_run(
+            admitted,
+            None,
+            None,
+            remote_head,
+            lease_current,
+        )));
+    };
     let descends = if local == admitted {
         None
     } else {
         thegn_core::util::git_is_ancestor(path, admitted, &local)
     };
-    Some(classify_run(
+    Ok(Some(classify_run(
         admitted,
         Some(&local),
         descends,
         remote_head,
         lease_current,
-    ))
+    )))
+}
+
+fn read_head(loc: &GitLoc) -> Result<Option<String>, String> {
+    match loc.git_text(&["rev-parse", "--verify", "--quiet", "HEAD"]) {
+        Ok(head) if head.is_empty() => Ok(None),
+        Ok(head) => Ok(Some(head)),
+        Err(error) if is_unborn_head(&error) => Ok(None),
+        Err(error) => Err(format!("git HEAD read failed: {error}")),
+    }
+}
+
+fn is_unborn_head(error: &GitTextError) -> bool {
+    matches!(
+        error,
+        GitTextError::Failed(GitOutcome::Exit {
+            code: Some(1),
+            stderr_tail,
+        }) if stderr_tail.is_empty()
+    )
 }
 
 /// The operator-facing line for an outcome, or None when nothing needs saying
@@ -103,8 +147,12 @@ pub(crate) fn run_warning(
     lease_current: bool,
     cfg: &PrQueueConfig,
 ) -> Option<String> {
-    observe_outcome(loc, admitted, remote_head, lease_current)
-        .and_then(|outcome| outcome_warning(number, outcome, cfg))
+    match observe_outcome_with_reason(loc, admitted, remote_head, lease_current) {
+        Ok(outcome) => outcome.and_then(|outcome| outcome_warning(number, outcome, cfg)),
+        Err(error) => Some(format!(
+            "PR #{number}: thegn could not prove who moved the PR head ({error}); the row is held for a human"
+        )),
+    }
 }
 
 #[cfg(test)]
@@ -340,6 +388,83 @@ mod tests {
         assert_eq!(
             observe_outcome(&loc, &admitted, Some(&local), true),
             Some(AgentHeadOutcome::AgentProgress)
+        );
+    }
+
+    #[test]
+    fn local_head_probe_table_keeps_unborn_distinct_and_fails_closed_on_git_error() {
+        let fixture = tempfile::tempdir().unwrap();
+        thegn_core::fsperm::restrict_dir_to_owner(fixture.path()).unwrap();
+        git_fixture_command(
+            fixture.path(),
+            &["-c", "commit.gpgsign=false", "init", "--quiet"],
+        );
+        git_fixture_command(
+            fixture.path(),
+            &["config", "user.email", "test@example.invalid"],
+        );
+        git_fixture_command(fixture.path(), &["config", "user.name", "Test"]);
+        std::fs::write(fixture.path().join("tracked"), "base\n").unwrap();
+        git_fixture_command(fixture.path(), &["add", "tracked"]);
+        git_fixture_command(
+            fixture.path(),
+            &["-c", "commit.gpgsign=false", "commit", "-m", "base"],
+        );
+        let admitted = git_fixture_command(fixture.path(), &["rev-parse", "HEAD"]);
+        let loc = GitLoc::Local(fixture.path().to_path_buf());
+        assert_eq!(
+            read_head(&loc),
+            Ok(Some(admitted.clone())),
+            "HEAD == admitted"
+        );
+
+        std::fs::write(fixture.path().join("tracked"), "descendant\n").unwrap();
+        git_fixture_command(fixture.path(), &["add", "tracked"]);
+        git_fixture_command(
+            fixture.path(),
+            &["-c", "commit.gpgsign=false", "commit", "-m", "descendant"],
+        );
+        let descendant = git_fixture_command(fixture.path(), &["rev-parse", "HEAD"]);
+        assert_ne!(descendant, admitted, "HEAD descends from admitted");
+
+        git_fixture_command(fixture.path(), &["checkout", "--orphan", "diverged"]);
+        git_fixture_command(fixture.path(), &["rm", "-rf", "."]);
+        std::fs::write(fixture.path().join("diverged"), "diverged\n").unwrap();
+        git_fixture_command(fixture.path(), &["add", "diverged"]);
+        git_fixture_command(
+            fixture.path(),
+            &["-c", "commit.gpgsign=false", "commit", "-m", "diverged"],
+        );
+        let diverged = git_fixture_command(fixture.path(), &["rev-parse", "HEAD"]);
+        assert_ne!(diverged, admitted, "HEAD diverged from admitted");
+        let foreign = "f".repeat(40);
+        assert_eq!(
+            observe_outcome(&loc, &admitted, Some(&foreign), true),
+            Some(AgentHeadOutcome::TeammatePush),
+            "diverged HEAD is not attributed to the agent"
+        );
+
+        let unborn = tempfile::tempdir().unwrap();
+        git_fixture_command(
+            unborn.path(),
+            &["-c", "commit.gpgsign=false", "init", "--quiet"],
+        );
+        let unborn_loc = GitLoc::Local(unborn.path().to_path_buf());
+        assert_eq!(read_head(&unborn_loc), Ok(None), "unborn HEAD");
+        assert_eq!(
+            observe_outcome(&unborn_loc, &admitted, Some(&admitted), true),
+            Some(AgentHeadOutcome::Unchanged)
+        );
+
+        let broken = tempfile::tempdir().unwrap();
+        std::fs::write(broken.path().join(".git"), "gitdir: missing\n").unwrap();
+        let broken_loc = GitLoc::Local(broken.path().to_path_buf());
+        let error =
+            observe_outcome_with_reason(&broken_loc, &admitted, Some(&admitted), true).unwrap_err();
+        assert!(error.contains("git"), "{error}");
+        assert_eq!(
+            observe_outcome(&broken_loc, &admitted, Some(&admitted), true),
+            Some(AgentHeadOutcome::Unverified)
         );
     }
 
