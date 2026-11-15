@@ -531,7 +531,7 @@ mod tests {
             "[\"surface:app\"]"
         };
         let manifest = format!(
-            "id = \"livetest\"\nname = \"Live test\"\nversion = \"0.1.0\"\napi = \"0.4.0\"\nmode = {mode:?}\ncapabilities = {capabilities}\ncommand = {}\n\n[[contributions]]\nid = \"workspace\"\nextension_point = \"{extension}\"\nlabel = \"Live\"\nsurface = \"{surface}\"\n",
+            "id = \"livetest\"\nname = \"Live test\"\nversion = \"0.1.0\"\napi = \"0.5.0\"\nmode = {mode:?}\ncapabilities = {capabilities}\ncommand = {}\n\n[[contributions]]\nid = \"workspace\"\nextension_point = \"{extension}\"\nlabel = \"Live\"\nsurface = \"{surface}\"\n",
             serde_json::to_value(&command).unwrap(),
         );
         std::fs::write(temp.path().join("plugin.toml"), manifest).unwrap();
