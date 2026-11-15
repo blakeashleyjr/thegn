@@ -6103,6 +6103,10 @@ esac
 }
 
 #[cfg(test)]
+#[path = "ci_transport_tests.rs"]
+mod transport_tests;
+
+#[cfg(test)]
 mod kind_coverage_tests {
     use super::*;
 
