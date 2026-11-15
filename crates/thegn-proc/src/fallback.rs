@@ -1,6 +1,6 @@
 use crate::{
     Capture, Containment, End, GroupState, InputFeed, Leader, Limits, POLL_INTERVAL, Run, Stream,
-    Which, aggregate_fit,
+    StreamConsumer, Which, aggregate_fit,
 };
 use std::{
     io::{self, Read, Write},
@@ -98,18 +98,18 @@ fn drain(
     rx: &Receiver<Message>,
     run: &mut Run,
     limits: &Limits,
-    consume: &mut dyn FnMut(&[u8]),
+    consume: &mut dyn FnMut(Which, &[u8]),
 ) -> Option<Which> {
     loop {
         match rx.try_recv() {
             Ok(Message::Bytes(which, bytes)) => {
-                if which == Which::Stdout && matches!(limits.stdout, Stream::Consume) {
-                    consume(&bytes);
-                }
                 let (capture, stream) = match which {
                     Which::Stdout => (&mut run.stdout, limits.stdout),
                     Which::Stderr => (&mut run.stderr, limits.stderr),
                 };
+                if matches!(stream, Stream::Consume) {
+                    consume(which, &bytes);
+                }
                 if append(capture, stream, &bytes) {
                     return Some(which);
                 }
@@ -166,14 +166,14 @@ fn detach(child: Child) -> Leader {
 
 #[cfg(test)]
 pub(super) fn run(cmd: &mut Command, limits: &Limits, cancel: &AtomicBool) -> Run {
-    run_consuming(cmd, limits, cancel, &mut |_bytes: &[u8]| {})
+    run_consuming_streams(cmd, limits, cancel, &mut |_which: Which, _bytes: &[u8]| {})
 }
 
-pub(super) fn run_consuming(
+pub(super) fn run_consuming_streams(
     cmd: &mut Command,
     limits: &Limits,
     cancel: &AtomicBool,
-    consume: &mut dyn FnMut(&[u8]),
+    consume: StreamConsumer<'_>,
 ) -> Run {
     run_inner_wrapped(cmd, limits, cancel, consume, None).0
 }
@@ -184,22 +184,28 @@ pub(super) fn run_with_input(
     input: &[u8],
     cancel: &AtomicBool,
 ) -> (Run, InputFeed) {
-    run_inner_wrapped(cmd, limits, cancel, &mut |_bytes: &[u8]| {}, Some(input))
+    run_inner_wrapped(
+        cmd,
+        limits,
+        cancel,
+        &mut |_which: Which, _bytes: &[u8]| {},
+        Some(input),
+    )
 }
 
 fn run_inner_wrapped(
     cmd: &mut Command,
     limits: &Limits,
     cancel: &AtomicBool,
-    consume: &mut dyn FnMut(&[u8]),
+    consume: StreamConsumer<'_>,
     input: Option<&[u8]>,
 ) -> (Run, InputFeed) {
     // Without the Unix Guard, contain consumer panics until the child is drained and reaped.
     let mut panic_payload = None;
-    let mut guarded_consume = |bytes: &[u8]| {
+    let mut guarded_consume = |which: Which, bytes: &[u8]| {
         if panic_payload.is_none()
             && let Err(payload) =
-                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| consume(bytes)))
+                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| consume(which, bytes)))
         {
             panic_payload = Some(payload);
         }
@@ -215,7 +221,7 @@ fn run_inner(
     cmd: &mut Command,
     limits: &Limits,
     cancel: &AtomicBool,
-    consume: &mut dyn FnMut(&[u8]),
+    consume: StreamConsumer<'_>,
     input: Option<&[u8]>,
 ) -> (Run, InputFeed) {
     cmd.stdin(if input.is_some() {
