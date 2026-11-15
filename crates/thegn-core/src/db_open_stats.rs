@@ -182,6 +182,22 @@ impl OpenStats {
     pub fn mean_us(self) -> u64 {
         self.total_us.checked_div(self.calls).unwrap_or(0)
     }
+
+    /// Render the three busiest loop-thread open call sites for a rollup.
+    pub fn top_sites_text(&self) -> String {
+        self.top_sites()
+            .into_iter()
+            .flatten()
+            .map(|site| {
+                let marker = if site.overestimate > 0 { "~" } else { "" };
+                format!(
+                    "{marker}{}:{} x{} max={}us",
+                    site.file, site.line, site.calls, site.max_us
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("; ")
+    }
 }
 
 /// Cumulative counts since process start. Monotonic, so a caller that wants a
@@ -385,6 +401,121 @@ mod tests {
         assert_eq!(
             top.map(|site| site.map(|site| site.file)),
             [Some("b.rs"), Some("c.rs"), Some("d.rs")]
+        );
+    }
+
+    #[test]
+    fn top_sites_text_is_empty_when_there_are_no_sites() {
+        assert_eq!(OpenStats::default().top_sites_text(), "");
+    }
+
+    #[test]
+    fn top_sites_text_formats_one_site() {
+        let mut stats = OpenStats::default();
+        stats.sites[0] = Some(OpenSiteStats {
+            file: "src/db.rs",
+            line: 42,
+            calls: 7,
+            overestimate: 0,
+            max_us: 125,
+        });
+
+        assert_eq!(stats.top_sites_text(), "src/db.rs:42 x7 max=125us");
+    }
+
+    #[test]
+    fn top_sites_text_orders_three_sites_by_calls() {
+        let mut stats = OpenStats::default();
+        for (slot, (file, calls)) in [("a.rs", 4), ("b.rs", 9), ("c.rs", 6)]
+            .into_iter()
+            .enumerate()
+        {
+            stats.sites[slot] = Some(OpenSiteStats {
+                file,
+                line: slot as u32 + 1,
+                calls,
+                overestimate: 0,
+                max_us: calls * 10,
+            });
+        }
+
+        assert_eq!(
+            stats.top_sites_text(),
+            "b.rs:2 x9 max=90us; c.rs:3 x6 max=60us; a.rs:1 x4 max=40us"
+        );
+    }
+
+    #[test]
+    fn top_sites_text_keeps_stable_order_for_ties() {
+        let mut stats = OpenStats::default();
+        stats.sites[0] = Some(OpenSiteStats {
+            file: "first.rs",
+            line: 1,
+            calls: 8,
+            overestimate: 0,
+            max_us: 11,
+        });
+        stats.sites[1] = Some(OpenSiteStats {
+            file: "second.rs",
+            line: 2,
+            calls: 8,
+            overestimate: 0,
+            max_us: 22,
+        });
+
+        assert_eq!(
+            stats.top_sites_text(),
+            "first.rs:1 x8 max=11us; second.rs:2 x8 max=22us"
+        );
+    }
+
+    #[test]
+    fn top_sites_text_marks_overestimated_counts() {
+        let mut stats = OpenStats::default();
+        stats.sites[0] = Some(OpenSiteStats {
+            file: "evicted.rs",
+            line: 9,
+            calls: 12,
+            overestimate: 4,
+            max_us: 300,
+        });
+
+        assert_eq!(stats.top_sites_text(), "~evicted.rs:9 x12 max=300us");
+    }
+
+    #[test]
+    fn top_sites_text_drops_the_fourth_site() {
+        let mut stats = OpenStats::default();
+        for (slot, calls) in [10, 9, 8, 7].into_iter().enumerate() {
+            stats.sites[slot] = Some(OpenSiteStats {
+                file: ["one.rs", "two.rs", "three.rs", "four.rs"][slot],
+                line: slot as u32 + 1,
+                calls,
+                overestimate: 0,
+                max_us: 1,
+            });
+        }
+
+        assert_eq!(
+            stats.top_sites_text(),
+            "one.rs:1 x10 max=1us; two.rs:2 x9 max=1us; three.rs:3 x8 max=1us"
+        );
+    }
+
+    #[test]
+    fn top_sites_text_keeps_the_full_long_file_path() {
+        let mut stats = OpenStats::default();
+        stats.sites[0] = Some(OpenSiteStats {
+            file: "/a/very/long/worktree/path/crates/thegn-host/src/perf.rs",
+            line: 1160,
+            calls: 1,
+            overestimate: 0,
+            max_us: 2,
+        });
+
+        assert_eq!(
+            stats.top_sites_text(),
+            "/a/very/long/worktree/path/crates/thegn-host/src/perf.rs:1160 x1 max=2us"
         );
     }
 }
