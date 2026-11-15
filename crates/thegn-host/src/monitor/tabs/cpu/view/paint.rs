@@ -19,7 +19,10 @@ use termwiz::surface::Surface;
 use thegn_core::{numfmt::NumFmt, theme::RampId};
 use thegn_metrics::collect::{
     health::{Absent, Health},
-    model::{cpu_freq::CpuFreqPart, cpu_sched::CpuSchedPart, cpu_stat::CpuStatPart},
+    model::{
+        cpu_freq::CpuFreqPart, cpu_policy::CoreClass, cpu_sched::CpuSchedPart,
+        cpu_stat::CpuStatPart,
+    },
 };
 
 const USAGE: PanelId = PanelId("cpu.usage");
@@ -926,7 +929,17 @@ fn mark(health: Health) -> &'static str {
     }
 }
 
-fn paint_freq(grid: &mut CellGrid, rect: Rect, part: &CpuFreqPart, health: Health) {
+/// Hybrid core-class tag with its leading space, empty for `Unknown` so a
+/// homogeneous policy renders exactly as it did before the classifier.
+fn core_class_tag(class: CoreClass) -> &'static str {
+    match class {
+        CoreClass::Performance => " perf",
+        CoreClass::Efficiency => " eff",
+        CoreClass::Unknown => "",
+    }
+}
+
+pub(super) fn paint_freq(grid: &mut CellGrid, rect: Rect, part: &CpuFreqPart, health: Health) {
     let mut body = panel::panel(grid, Rect::full(rect.cols, rect.rows), "Frequency", None);
     let area = body.rect();
     if area.cols == 0 || area.rows == 0 {
@@ -976,8 +989,9 @@ fn paint_freq(grid: &mut CellGrid, rect: Rect, part: &CpuFreqPart, health: Healt
             .map(|khz| khz / 1000)
             .map_or_else(|| mark(missing).to_owned(), |value| value.to_string());
         let label = format!(
-            "P{} {mhz} {minimum}-{maximum}MHz {governor}/{epp}",
-            policy.policy
+            "P{}{} {mhz} {minimum}-{maximum}MHz {governor}/{epp}",
+            policy.policy,
+            core_class_tag(policy.core_class)
         );
         body.put_str(0, row + 1, &label, CellStyle::default());
         if let (Some(min), Some(max), Some(current)) = (min, max, current) {
