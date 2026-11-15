@@ -21,6 +21,7 @@ use crate::compositor::Rect;
 /// [`FrameModel`] so the pure row composers stay config-free (same pattern as
 /// the other model-carried presentation flags). `Default` matches the config
 /// defaults (everything on) so unit-built models render the full row.
+/// Exception: `detail_when` defaults to `Focused` here so unit-built unfocused models keep one-row worktrees; production uses `from_ui` (config default `always`).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SidebarDisplay {
     pub show_status_icon: bool,
@@ -58,7 +59,7 @@ impl Default for SidebarDisplay {
             show_jj: true,
             show_submodules: true,
             focus_detail: thegn_core::config::FocusDetail::All,
-            detail_when: thegn_core::config::DetailWhen::Always,
+            detail_when: thegn_core::config::DetailWhen::Focused,
             show_commits: true,
             show_behind_base: false,
             commit_badge: "{n}c".into(),
@@ -757,8 +758,7 @@ fn sidebar_geom_from(
     // (~10 allocations each) before the scroll clamp threw the off-screen ones
     // away — O(all worktrees) waste on every Full frame. The only
     // variable-height cases are a Worktree row's detail tier (probed via
-    // `compose_detail_line`, and only when `show_detail` can be true — the
-    // sidebar must be focused) and the lead gap (`lead_gap_rows`: the
+    // `detail_has_content` when `show_detail` can be true) and the lead gap (`lead_gap_rows`: the
     // SectionHeading breathing gap, the only one left); every
     // other row is exactly one line. `compose_row_lines` is the source of truth
     // for that rule — a debug assertion in `build_sidebar` keeps them lockstep.
@@ -3759,7 +3759,10 @@ mod tests {
 
     #[test]
     fn show_detail_always_vs_focused() {
-        let display = SidebarDisplay::default();
+        let display = SidebarDisplay {
+            detail_when: thegn_core::config::DetailWhen::Always,
+            ..SidebarDisplay::default()
+        };
         assert!(display.show_detail(false, true));
         let focused = SidebarDisplay {
             detail_when: thegn_core::config::DetailWhen::Focused,
@@ -3843,6 +3846,135 @@ mod tests {
             )
             .contains("2c")
         );
+    }
+
+    #[test]
+    fn behind_badge_only_when_enabled() {
+        use thegn_svc::git::BranchMeta;
+        let mut row = crate::sidebar::SidebarRow::base(RowKind::Worktree, 1, "feature", "repo");
+        row.branch_meta = Some(BranchMeta {
+            ahead_base: Some(1),
+            behind_base: Some(2),
+            ..BranchMeta::default()
+        });
+        let render = |display: &SidebarDisplay| -> Vec<crate::seg::Seg> {
+            let mut mq_geometry = None;
+            compose_row_lines(
+                &row,
+                None,
+                None,
+                false,
+                false,
+                true,
+                None,
+                None,
+                40,
+                &mut mq_geometry,
+                display,
+            )
+            .into_iter()
+            .flat_map(|line| match line {
+                crate::seg::Line::Segs(segs) => segs,
+                crate::seg::Line::Split { l, r } | crate::seg::Line::SplitMinLeft { l, r, .. } => {
+                    l.into_iter().chain(r).collect()
+                }
+                crate::seg::Line::Blank => Vec::new(),
+                _ => Vec::new(),
+            })
+            .collect()
+        };
+        let default = render(&SidebarDisplay::default());
+        let default_text = default
+            .iter()
+            .map(|segment| segment.text.as_str())
+            .collect::<String>();
+        assert!(!default_text.contains("2b"), "{default_text:?}");
+
+        let enabled = SidebarDisplay {
+            show_behind_base: true,
+            ..SidebarDisplay::default()
+        };
+        let rendered = render(&enabled);
+        assert!(rendered.iter().any(|segment| {
+            segment.text == "2b" && segment.fg == crate::seg::Tok::Hue(theme::Hue::Amber)
+        }));
+    }
+
+    #[test]
+    fn heights_pass_agrees_with_compose_for_default_all() {
+        use thegn_svc::git::BranchMeta;
+        let mut rows = two_ws_rows();
+        for index in [1, 3] {
+            rows[index].branch_meta = Some(BranchMeta {
+                ahead_base: Some(3),
+                ..BranchMeta::default()
+            });
+        }
+        let model = FrameModel {
+            sidebar_rows: rows,
+            sidebar_focused: false,
+            sidebar_display: SidebarDisplay::from_ui(&thegn_core::config::UiConfig::default()),
+            ..FrameModel::default()
+        };
+        let rect = Rect {
+            x: 0,
+            y: 0,
+            cols: 48,
+            rows: 40,
+        };
+        assert_eq!(sidebar_geom(&model, rect).heights, vec![1, 2, 1, 2]);
+        build_sidebar(&model, rect, 0);
+    }
+
+    #[test]
+    fn ascii_caps_has_no_unicode_in_badge_or_detail() {
+        use thegn_svc::git::BranchMeta;
+        let mut row = crate::sidebar::SidebarRow::base(RowKind::Worktree, 1, "feature", "repo");
+        row.branch_meta = Some(BranchMeta {
+            ahead_base: Some(5),
+            behind_base: Some(2),
+            dirty_files: Some(3),
+            last_commit_unix: Some(0),
+            last_subject: Some("ascii subject".into()),
+        });
+        let display = SidebarDisplay {
+            show_behind_base: true,
+            detail_when: thegn_core::config::DetailWhen::Always,
+            ..SidebarDisplay::default()
+        };
+        crate::caps::test_override::with_unicode(thegn_core::termcaps::UnicodeLevel::Ascii, || {
+            for cols in [48, 24] {
+                let mut mq_geometry = None;
+                let lines = compose_row_lines(
+                    &row,
+                    None,
+                    None,
+                    false,
+                    true,
+                    true,
+                    None,
+                    None,
+                    cols,
+                    &mut mq_geometry,
+                    &display,
+                );
+                for line in lines {
+                    let segs = match line {
+                        crate::seg::Line::Segs(segs) => segs,
+                        crate::seg::Line::Split { l, r }
+                        | crate::seg::Line::SplitMinLeft { l, r, .. } => {
+                            l.into_iter().chain(r).collect()
+                        }
+                        crate::seg::Line::Blank => Vec::new(),
+                        _ => Vec::new(),
+                    };
+                    assert!(
+                        segs.iter().all(|segment| segment.text.is_ascii()),
+                        "cols={cols}: {segs:?}"
+                    );
+                }
+            }
+        });
     }
 
     #[test]
