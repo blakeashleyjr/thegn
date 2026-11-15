@@ -201,6 +201,85 @@ pub enum FrameGate {
 /// compose+diff+flush volume, freeing the loop for parsing and input.
 pub const PANE_FRAME_WINDOW: Duration = Duration::from_millis(8);
 
+/// Inputs to the pure frame render/defer decision.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FrameInputs {
+    /// Any damage is pending, including geometry, chrome, bars, or panes.
+    pub have_damage: bool,
+    /// The pending damage is only pane output, so it may be paced.
+    pub pane_only_damage: bool,
+    /// A dispatched input is waiting for the frame that answers it.
+    pub input_awaiting_frame: bool,
+    /// An interactive input is queued but has not been dispatched yet.
+    pub input_queued: bool,
+    /// The frame writer has no free in-flight slot.
+    pub writer_busy: bool,
+    /// Time since the last successfully flushed frame.
+    pub since_last_flush: Duration,
+    /// Maximum interval between pane-only frames.
+    pub window: Duration,
+}
+
+/// Result of the pure frame render/defer decision.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FrameDecision {
+    /// Whether the renderer should compose and flush this iteration.
+    pub render: bool,
+    /// A one-shot wake to recheck deferred work, if one is needed.
+    pub defer_timeout: Option<Duration>,
+    /// Whether the loop should count this decision as a deferred frame.
+    pub count_deferred: bool,
+    /// Whether the loop woke without any damage and should record an idle wake.
+    pub idle_wake: bool,
+}
+
+/// Writer backpressure recheck interval.
+pub const WRITER_BUSY_RECHECK: Duration = Duration::from_millis(2);
+
+/// Decide whether this iteration renders, defers, or records an idle wake.
+///
+/// The writer check intentionally precedes [`frame_gate`]: when the terminal
+/// has no free frame slot, the decision must not pace through the gate or count
+/// two deferrals for one blocked frame.
+pub fn decide_frame(inputs: &FrameInputs) -> FrameDecision {
+    if !inputs.have_damage {
+        return FrameDecision {
+            render: false,
+            defer_timeout: None,
+            count_deferred: false,
+            idle_wake: true,
+        };
+    }
+    if inputs.writer_busy {
+        return FrameDecision {
+            render: false,
+            defer_timeout: Some(WRITER_BUSY_RECHECK),
+            count_deferred: true,
+            idle_wake: false,
+        };
+    }
+    match frame_gate(
+        inputs.input_awaiting_frame,
+        inputs.input_queued,
+        inputs.pane_only_damage,
+        inputs.since_last_flush,
+        inputs.window,
+    ) {
+        FrameGate::RenderNow => FrameDecision {
+            render: true,
+            defer_timeout: None,
+            count_deferred: false,
+            idle_wake: false,
+        },
+        FrameGate::Defer { remaining } => FrameDecision {
+            render: false,
+            defer_timeout: Some(remaining),
+            count_deferred: true,
+            idle_wake: false,
+        },
+    }
+}
+
 /// Decide whether to render now or defer.
 ///
 /// Rules, in precedence order:
@@ -668,6 +747,278 @@ mod tests {
                 PANE_FRAME_WINDOW
             ),
             FrameGate::RenderNow
+        );
+    }
+
+    fn frame_inputs(
+        have_damage: bool,
+        pane_only_damage: bool,
+        input_awaiting_frame: bool,
+        input_queued: bool,
+        writer_busy: bool,
+        since_last_flush: Duration,
+    ) -> FrameInputs {
+        FrameInputs {
+            have_damage,
+            pane_only_damage,
+            input_awaiting_frame,
+            input_queued,
+            writer_busy,
+            since_last_flush,
+            window: PANE_FRAME_WINDOW,
+        }
+    }
+
+    #[test]
+    fn frame_decision_truth_table_covers_damage_input_writer_and_pacing() {
+        let since_values = [
+            Duration::ZERO,
+            PANE_FRAME_WINDOW - Duration::from_nanos(1),
+            PANE_FRAME_WINDOW,
+            PANE_FRAME_WINDOW + Duration::from_nanos(1),
+        ];
+        for have_damage in [false, true] {
+            for pane_only_damage in [false, true] {
+                for input_awaiting_frame in [false, true] {
+                    for input_queued in [false, true] {
+                        for writer_busy in [false, true] {
+                            for since_last_flush in since_values {
+                                let decision = decide_frame(&frame_inputs(
+                                    have_damage,
+                                    pane_only_damage,
+                                    input_awaiting_frame,
+                                    input_queued,
+                                    writer_busy,
+                                    since_last_flush,
+                                ));
+                                if !have_damage {
+                                    assert_eq!(
+                                        decision,
+                                        FrameDecision {
+                                            render: false,
+                                            defer_timeout: None,
+                                            count_deferred: false,
+                                            idle_wake: true,
+                                        }
+                                    );
+                                } else if writer_busy {
+                                    assert_eq!(
+                                        decision,
+                                        FrameDecision {
+                                            render: false,
+                                            defer_timeout: Some(WRITER_BUSY_RECHECK),
+                                            count_deferred: true,
+                                            idle_wake: false,
+                                        }
+                                    );
+                                } else if input_awaiting_frame {
+                                    assert!(decision.render);
+                                    assert_eq!(decision.defer_timeout, None);
+                                    assert!(!decision.count_deferred);
+                                    assert!(!decision.idle_wake);
+                                } else if input_queued {
+                                    assert_eq!(
+                                        decision,
+                                        FrameDecision {
+                                            render: false,
+                                            defer_timeout: Some(Duration::ZERO),
+                                            count_deferred: true,
+                                            idle_wake: false,
+                                        }
+                                    );
+                                } else if !pane_only_damage || since_last_flush >= PANE_FRAME_WINDOW
+                                {
+                                    assert!(decision.render);
+                                    assert_eq!(decision.defer_timeout, None);
+                                    assert!(!decision.count_deferred);
+                                    assert!(!decision.idle_wake);
+                                } else {
+                                    assert!(!decision.render);
+                                    assert_eq!(
+                                        decision.defer_timeout,
+                                        Some(PANE_FRAME_WINDOW - since_last_flush)
+                                    );
+                                    assert!(decision.count_deferred);
+                                    assert!(!decision.idle_wake);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn decide_frame_matches_frame_gate_for_every_boolean_combination() {
+        let since_values = [
+            Duration::ZERO,
+            PANE_FRAME_WINDOW - Duration::from_nanos(1),
+            PANE_FRAME_WINDOW,
+            PANE_FRAME_WINDOW + Duration::from_nanos(1),
+        ];
+        for have_damage in [false, true] {
+            for pane_only_damage in [false, true] {
+                for input_awaiting_frame in [false, true] {
+                    for input_queued in [false, true] {
+                        for writer_busy in [false, true] {
+                            for since_last_flush in since_values {
+                                let inputs = frame_inputs(
+                                    have_damage,
+                                    pane_only_damage,
+                                    input_awaiting_frame,
+                                    input_queued,
+                                    writer_busy,
+                                    since_last_flush,
+                                );
+                                let expected = if !have_damage {
+                                    FrameDecision {
+                                        render: false,
+                                        defer_timeout: None,
+                                        count_deferred: false,
+                                        idle_wake: true,
+                                    }
+                                } else if writer_busy {
+                                    FrameDecision {
+                                        render: false,
+                                        defer_timeout: Some(WRITER_BUSY_RECHECK),
+                                        count_deferred: true,
+                                        idle_wake: false,
+                                    }
+                                } else {
+                                    match frame_gate(
+                                        input_awaiting_frame,
+                                        input_queued,
+                                        pane_only_damage,
+                                        since_last_flush,
+                                        PANE_FRAME_WINDOW,
+                                    ) {
+                                        FrameGate::RenderNow => FrameDecision {
+                                            render: true,
+                                            defer_timeout: None,
+                                            count_deferred: false,
+                                            idle_wake: false,
+                                        },
+                                        FrameGate::Defer { remaining } => FrameDecision {
+                                            render: false,
+                                            defer_timeout: Some(remaining),
+                                            count_deferred: true,
+                                            idle_wake: false,
+                                        },
+                                    }
+                                };
+                                assert_eq!(decide_frame(&inputs), expected, "{inputs:?}");
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn writer_busy_damage_is_one_counted_recheck_not_a_gate_defer() {
+        let decision = decide_frame(&frame_inputs(true, true, false, true, true, Duration::ZERO));
+        assert_eq!(decision.defer_timeout, Some(WRITER_BUSY_RECHECK));
+        assert!(decision.count_deferred);
+        assert!(!decision.render);
+    }
+
+    #[test]
+    fn key_flood_renders_within_two_decisions() {
+        let queued = decide_frame(&frame_inputs(
+            true,
+            true,
+            false,
+            true,
+            false,
+            Duration::ZERO,
+        ));
+        assert!(!queued.render);
+        let awaiting = decide_frame(&frame_inputs(true, true, true, true, false, Duration::ZERO));
+        assert!(awaiting.render);
+    }
+
+    #[test]
+    fn pane_flood_is_bounded_and_flushes_after_it_stops() {
+        let mut last_flush = Duration::ZERO;
+        let mut frames = 0;
+        let mut trailing_timeout = None;
+        for elapsed_ms in 0..=100 {
+            let now = Duration::from_millis(elapsed_ms);
+            let decision = decide_frame(&frame_inputs(
+                true,
+                true,
+                false,
+                false,
+                false,
+                now.saturating_sub(last_flush),
+            ));
+            if decision.render {
+                frames += 1;
+                last_flush = now;
+            } else {
+                trailing_timeout = decision.defer_timeout;
+            }
+        }
+        assert!(frames <= 14, "{frames} frames during the 100ms flood");
+        let remaining = trailing_timeout.expect("flood leaves a trailing wake");
+        let final_decision = decide_frame(&frame_inputs(
+            true,
+            true,
+            false,
+            false,
+            false,
+            Duration::from_millis(100).saturating_sub(last_flush) + remaining,
+        ));
+        assert!(final_decision.render);
+        assert_eq!(final_decision.defer_timeout, None);
+    }
+
+    #[test]
+    fn render_plan_pairing_keeps_panes_incremental_and_chrome_full() {
+        use crate::render_plan::{Damage, Overlays, RenderPlan, plan};
+
+        let pane_damage = Damage {
+            panes: std::iter::once(1_u32).collect(),
+            ..Default::default()
+        };
+        assert_eq!(
+            plan(&pane_damage, &Overlays::default()),
+            RenderPlan::Incremental {
+                panes: vec![1],
+                bars: false,
+                statusbar: false,
+                sidebar: false,
+            }
+        );
+        assert!(
+            !decide_frame(&frame_inputs(
+                true,
+                true,
+                false,
+                false,
+                false,
+                Duration::ZERO,
+            ))
+            .render
+        );
+
+        let chrome_damage = Damage {
+            chrome: true,
+            ..Default::default()
+        };
+        assert_eq!(plan(&chrome_damage, &Overlays::default()), RenderPlan::Full);
+        assert!(
+            decide_frame(&frame_inputs(
+                true,
+                false,
+                false,
+                false,
+                false,
+                Duration::ZERO,
+            ))
+            .render
         );
     }
 }
