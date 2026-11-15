@@ -14,6 +14,9 @@ pub(crate) enum PluginDamage {
     /// Existing statusbar segments changed without changing their rendered
     /// widths or placement.  Only the statusbar row needs repainting.
     StatusbarContent,
+    /// Existing sidebar row fields changed without changing sidebar geometry.
+    /// Only the sidebar row needs repainting.
+    SidebarContent,
     /// A contribution/lifecycle or layout change.  The chrome compositor must
     /// recompute statusbar fitting and placement in a full frame.
     Structural,
@@ -21,7 +24,14 @@ pub(crate) enum PluginDamage {
 
 impl PluginDamage {
     pub(crate) fn merge(&mut self, other: Self) {
-        *self = (*self).max(other);
+        *self = match (*self, other) {
+            (Self::Structural, _) | (_, Self::Structural) => Self::Structural,
+            (Self::None, next) | (next, Self::None) => next,
+            (Self::StatusbarContent, Self::StatusbarContent) => Self::StatusbarContent,
+            (Self::SidebarContent, Self::SidebarContent) => Self::SidebarContent,
+            (Self::StatusbarContent, Self::SidebarContent)
+            | (Self::SidebarContent, Self::StatusbarContent) => Self::Structural,
+        };
     }
 }
 
