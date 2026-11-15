@@ -128,6 +128,18 @@ fn reap(envs: &[EnvProviderConfig]) {
     kept.publish("fly");
 }
 
+/// Whether the ledger record a pass snapshotted is still exactly what the
+/// ledger holds now. An unreadable record or any field change fails the fence.
+fn fly_record_unchanged(snapshot: &registry::VpsRecord, fresh: &registry::LedgerView) -> bool {
+    if fresh.unreadable.iter().any(|n| n == &snapshot.name) {
+        return false;
+    }
+    fresh
+        .records
+        .iter()
+        .any(|r| r.name == snapshot.name && r == snapshot)
+}
+
 fn reap_unambiguous(pc: &EnvProviderConfig, kept: &mut crate::reaper_policy::KeptReport) {
     let view = match registry::list_checked() {
         Ok(view) => view,
@@ -207,6 +219,19 @@ fn reap_unambiguous(pc: &EnvProviderConfig, kept: &mut crate::reaper_policy::Kep
                 continue;
             }
             thegn_core::time_policy::ResourceExpiry::Expired => {}
+        }
+        let unchanged = registry::list_checked()
+            .map(|fresh| fly_record_unchanged(&rec, &fresh))
+            .unwrap_or(false);
+        if !unchanged {
+            kept.keep(
+                &rec.name,
+                format!(
+                    "fly reaper: kept {}: the ledger record changed during this pass; next pass will retry; no deletion attempted",
+                    rec.name
+                ),
+            );
+            continue;
         }
         thegn_core::msg::warn(&format!(
             "fly reaper: destroying {} (verified provider age exceeds lifetime/stale-create policy)",
@@ -298,6 +323,36 @@ mod tests {
             owner: String::new(),
             account: account.to_string(),
         }
+    }
+
+    #[test]
+    fn fly_record_unchanged_matrix() {
+        let snap = account_record("acct");
+        let view =
+            |records: Vec<registry::VpsRecord>, unreadable: Vec<String>| registry::LedgerView {
+                records,
+                unreadable,
+            };
+        assert!(fly_record_unchanged(
+            &snap,
+            &view(vec![snap.clone()], vec![])
+        ));
+        assert!(!fly_record_unchanged(&snap, &view(vec![], vec![])));
+        let mutations: [fn(&mut registry::VpsRecord); 4] = [
+            |r| r.state = "creating".into(),
+            |r| r.instance_id = "i-1".into(),
+            |r| r.created_at = 2,
+            |r| r.account = "other".into(),
+        ];
+        for m in mutations {
+            let mut changed = snap.clone();
+            m(&mut changed);
+            assert!(!fly_record_unchanged(&snap, &view(vec![changed], vec![])));
+        }
+        assert!(!fly_record_unchanged(
+            &snap,
+            &view(vec![snap.clone()], vec![snap.name.clone()])
+        ));
     }
 
     fn run_with_failure(fail: Option<&str>) -> (Result<()>, Vec<&'static str>) {
