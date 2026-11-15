@@ -1004,6 +1004,11 @@ fn run_due(
                 }
                 Err(GateRefusal::Busy) => {
                     entry.skipped += 1;
+                    crate::plugin_stats::record_sched(
+                        &entry.plugin,
+                        entry.skipped,
+                        entry.overloaded,
+                    );
                     tracing::debug!(
                         target: "thegn::plugin",
                         plugin = %entry.plugin,
@@ -1013,6 +1018,11 @@ fn run_due(
                 }
                 Err(GateRefusal::Overloaded) => {
                     entry.overloaded += 1;
+                    crate::plugin_stats::record_sched(
+                        &entry.plugin,
+                        entry.skipped,
+                        entry.overloaded,
+                    );
                     tracing::debug!(
                         target: "thegn::plugin",
                         plugin = %entry.plugin,
@@ -2127,14 +2137,21 @@ mod tests {
 
     #[test]
     fn sched_busy_one_shot_tick_is_skipped_and_counted() {
+        let _guard = crate::plugin_stats::TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let now = Instant::now();
         let mut schedule = build_schedule(
             &[loaded_state(spec_with_two_intervals(PluginMode::OneShot))],
             now,
         );
+        // A test-unique id keeps the process-global sched map free of other
+        // tests' `cadenced` entries.
+        let plugin = format!("sched-busy-{}", std::process::id());
+        schedule[0].plugin = plugin.clone();
         let interval = schedule[0].interval;
         let gate = OneShotGate::default();
-        let ticket = gate.try_begin("cadenced").unwrap();
+        let ticket = gate.try_begin(&plugin).unwrap();
         let disabled = Arc::new(Mutex::new(BTreeSet::new()));
         let sessions = Arc::new(Mutex::new(BTreeMap::new()));
         let mut spawned = 0;
@@ -2152,6 +2169,7 @@ mod tests {
         assert_eq!(schedule[0].skipped, 1);
         assert_eq!(schedule[0].overloaded, 0);
         assert_eq!(schedule[0].next, now + interval);
+        assert_eq!(crate::plugin_stats::sched_counts(&plugin), Some((1, 0)));
 
         drop(ticket);
         run_due(
@@ -2166,15 +2184,23 @@ mod tests {
         assert_eq!(spawned, 1);
         assert_eq!(schedule[0].skipped, 1);
         assert_eq!(schedule[0].overloaded, 0);
+        // A started tick records nothing new; the published total stays put.
+        assert_eq!(crate::plugin_stats::sched_counts(&plugin), Some((1, 0)));
+        crate::plugin_stats::retain_sched(|id| id != plugin);
     }
 
     #[test]
     fn sched_overloaded_tick_is_counted_apart_from_busy() {
+        let _guard = crate::plugin_stats::TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let now = Instant::now();
         let mut schedule = build_schedule(
             &[loaded_state(spec_with_two_intervals(PluginMode::OneShot))],
             now,
         );
+        let plugin = format!("sched-overloaded-{}", std::process::id());
+        schedule[0].plugin = plugin.clone();
         let interval = schedule[0].interval;
         let gate = OneShotGate::default();
         let mut tickets: Vec<_> = (0..MAX_INFLIGHT_ONE_SHOTS)
@@ -2197,6 +2223,7 @@ mod tests {
         assert_eq!(schedule[0].overloaded, 1);
         assert_eq!(schedule[0].skipped, 0);
         assert_eq!(schedule[0].next, now + interval);
+        assert_eq!(crate::plugin_stats::sched_counts(&plugin), Some((0, 1)));
 
         drop(tickets.pop());
         run_due(
@@ -2211,6 +2238,8 @@ mod tests {
             },
         );
         assert_eq!(spawned, 1);
+        assert_eq!(crate::plugin_stats::sched_counts(&plugin), Some((0, 1)));
+        crate::plugin_stats::retain_sched(|id| id != plugin);
     }
 
     #[test]
