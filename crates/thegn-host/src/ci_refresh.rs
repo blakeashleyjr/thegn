@@ -1112,8 +1112,14 @@ fn refresh_ci_cache_for(
         return false;
     };
     let branch = if loc.is_remote() {
-        loc.git_out(&["rev-parse", "--abbrev-ref", "HEAD"])
-            .filter(|branch| !branch.is_empty())
+        match loc.git_text(&["rev-parse", "--abbrev-ref", "HEAD"]) {
+            Ok(branch) if !branch.is_empty() => Some(branch),
+            Ok(_) => None,
+            Err(error) => {
+                tracing::debug!(%error, "could not read remote worktree branch for CI refresh");
+                None
+            }
+        }
     } else {
         local_ci_cache_branch(loc)
     };
