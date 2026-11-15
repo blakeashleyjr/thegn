@@ -30,6 +30,19 @@ impl CpuFreqPart {
             });
         (count > 0).then_some(sum / count / 1000)
     }
+    /// Mean current frequency (MHz) over the policies of `class` that report
+    /// one; `None` when no such policy has a current value.
+    pub fn class_mean_cur_mhz(&self, class: CoreClass) -> Option<u64> {
+        let (sum, count) = self
+            .policies
+            .iter()
+            .filter(|policy| policy.core_class == class)
+            .filter_map(|policy| policy.cur_khz)
+            .fold((0_u64, 0_u64), |(sum, count), value| {
+                (sum.saturating_add(value), count + 1)
+            });
+        (count > 0).then_some(sum / count / 1000)
+    }
     pub fn max_cur_khz(&self) -> Option<u64> {
         self.policies.iter().filter_map(|p| p.cur_khz).max()
     }
@@ -92,6 +105,61 @@ mod tests {
             ..CpuFreqPart::default()
         };
         assert_eq!(unknown.core_class_counts(), (0, 0));
+    }
+    #[test]
+    fn class_mean_cur_mhz_averages_per_class() {
+        let with = |core_class, cur_khz| CpuPolicy {
+            core_class,
+            cur_khz,
+            ..CpuPolicy::default()
+        };
+        let part = CpuFreqPart {
+            policies: vec![
+                with(CoreClass::Performance, Some(4_000_000)),
+                with(CoreClass::Performance, Some(4_200_000)),
+                with(CoreClass::Performance, None),
+                with(CoreClass::Efficiency, Some(2_000_000)),
+                with(CoreClass::Efficiency, Some(2_400_000)),
+                with(CoreClass::Unknown, Some(9_000_000)),
+            ],
+            ..CpuFreqPart::default()
+        };
+        assert_eq!(part.class_mean_cur_mhz(CoreClass::Performance), Some(4100));
+        assert_eq!(part.class_mean_cur_mhz(CoreClass::Efficiency), Some(2200));
+        assert_eq!(part.class_mean_cur_mhz(CoreClass::Unknown), Some(9000));
+        assert_eq!(
+            CpuFreqPart::default().class_mean_cur_mhz(CoreClass::Performance),
+            None
+        );
+        let none = CpuFreqPart {
+            policies: vec![with(CoreClass::Efficiency, None)],
+            ..CpuFreqPart::default()
+        };
+        assert_eq!(none.class_mean_cur_mhz(CoreClass::Efficiency), None);
+        assert_eq!(none.class_mean_cur_mhz(CoreClass::Performance), None);
+    }
+    #[test]
+    fn class_mean_cur_mhz_does_not_overflow_on_huge_values() {
+        let part = CpuFreqPart {
+            policies: vec![
+                CpuPolicy {
+                    core_class: CoreClass::Performance,
+                    cur_khz: Some(u64::MAX),
+                    ..CpuPolicy::default()
+                },
+                CpuPolicy {
+                    core_class: CoreClass::Performance,
+                    cur_khz: Some(u64::MAX),
+                    ..CpuPolicy::default()
+                },
+            ],
+            ..CpuFreqPart::default()
+        };
+        // Sum saturates at u64::MAX; mean = MAX / 2 / 1000.
+        assert_eq!(
+            part.class_mean_cur_mhz(CoreClass::Performance),
+            Some(u64::MAX / 2 / 1000)
+        );
     }
     #[test]
     fn part_clears_values_and_retains_policy_capacity() {
