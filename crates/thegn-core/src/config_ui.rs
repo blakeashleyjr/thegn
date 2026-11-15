@@ -90,6 +90,8 @@ pub enum DetailField {
     Disk,
     /// The name of the last commit's author.
     Author,
+    /// The repo-wide stash entry count (opt-in; hidden when zero).
+    Stash,
 }
 
 /// One entry in the ordered sidebar detail list.
@@ -146,6 +148,7 @@ impl DetailField {
             "unread" => Some(Self::Unread),
             "disk" => Some(Self::Disk),
             "author" => Some(Self::Author),
+            "stash" => Some(Self::Stash),
             _ => None,
         }
     }
@@ -171,11 +174,12 @@ impl DetailField {
             Self::Unread => "unread",
             Self::Disk => "disk",
             Self::Author => "author",
+            Self::Stash => "stash",
         }
     }
 
     /// The valid spellings, in documentation order.
-    pub const fn valid_names() -> [&'static str; 18] {
+    pub const fn valid_names() -> [&'static str; 19] {
         [
             "branch",
             "commits",
@@ -195,6 +199,7 @@ impl DetailField {
             "unread",
             "disk",
             "author",
+            "stash",
         ]
     }
 
@@ -587,6 +592,10 @@ mod tests {
             );
         }
         assert_eq!(DetailField::parse(" Branch "), Some(DetailField::Branch));
+        assert_eq!(DetailField::parse("stash"), Some(DetailField::Stash));
+        assert_eq!(DetailField::Stash.as_str(), "stash");
+        assert_eq!(DetailField::valid_names().last(), Some(&"stash"));
+        assert!(!DetailField::default_order().contains(&DetailField::Stash));
     }
 
     #[test]
