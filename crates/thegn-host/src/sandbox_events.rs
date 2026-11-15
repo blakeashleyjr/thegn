@@ -12,20 +12,20 @@
 //!   is configured.
 //!
 //! The transports' subscription loops block their calling thread and pulse
-//! the sink per persisted batch; the sink forwards the count through a
-//! channel so the event loop can refresh the panel dirty flag without
-//! polling.
+//! the sink per persisted batch; the sink adds the count to a shared atomic
+//! [`SandboxEventCounter`] (THE-661: bounded, one word however many batches
+//! land between drains) and pulses the waker, so the event loop can refresh
+//! the panel dirty flag without polling.
 
 use thegn_core::config::{SandboxBackend, SandboxConfig};
 use thegn_core::sandbox::Backend;
 use thegn_core::sandbox_events::{ContainerEventSink, ContainerEvents, EventKind, EventsCap};
 
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use termwiz::terminal::TerminalWaker;
-use tokio::sync::mpsc as tokio_mpsc;
 
 /// Pulse that wakes the event loop after a batch send. Shared with the
 /// short-lived trailing-flush thread, hence `Arc` + `Sync`.
@@ -43,12 +43,36 @@ fn waker_pulse(waker: TerminalWaker) -> Wake {
     })
 }
 
-/// Update type sent to the event loop: tells it to refresh the audit panel.
-#[derive(Debug)]
-#[allow(dead_code)]
-pub struct SandboxEventBatch {
-    /// Number of new events written to the DB.
-    pub count: usize,
+/// THE-661: pending new-event count shared with the event loop, replacing an
+/// unbounded channel of `{ count }` batches. Producers add (saturating at
+/// `u64::MAX`); the loop takes the whole count with one swap, so the state is
+/// one word however far the producers run ahead of the drain.
+#[derive(Debug, Default)]
+pub struct SandboxEventCounter {
+    pending: AtomicU64,
+}
+
+impl SandboxEventCounter {
+    /// Add `count` new events, saturating rather than wrapping.
+    pub fn add(&self, count: u64) {
+        let mut current = self.pending.load(Ordering::Relaxed);
+        loop {
+            match self.pending.compare_exchange_weak(
+                current,
+                current.saturating_add(count),
+                Ordering::AcqRel,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => break,
+                Err(actual) => current = actual,
+            }
+        }
+    }
+
+    /// Take the pending count, resetting it to zero.
+    pub fn take(&self) -> u64 {
+        self.pending.swap(0, Ordering::AcqRel)
+    }
 }
 
 /// Start the background container-events subscriber for the configured
@@ -57,11 +81,7 @@ pub struct SandboxEventBatch {
 /// Silently does nothing when sandboxing is disabled or the selection yields no
 /// transport (auto with no events-capable chain entry, a reserved or `No` cap,
 /// or the transport's binary not on PATH) — audit is best-effort.
-pub fn spawn(
-    cfg: &SandboxConfig,
-    tx: tokio_mpsc::UnboundedSender<SandboxEventBatch>,
-    waker: TerminalWaker,
-) {
+pub fn spawn(cfg: &SandboxConfig, counter: Arc<SandboxEventCounter>, waker: TerminalWaker) {
     let Some(backend) = select_backend(cfg) else {
         return;
     };
@@ -83,7 +103,7 @@ pub fn spawn(
         "thegn-sbx-exec",
         events,
         EventKind::Exec,
-        tx.clone(),
+        Arc::clone(&counter),
         waker_pulse(waker.clone()),
     );
     // Network events (optional).
@@ -95,7 +115,7 @@ pub fn spawn(
             "thegn-sbx-net",
             net_events,
             EventKind::Network,
-            tx,
+            counter,
             waker_pulse(waker),
         );
     }
@@ -107,7 +127,7 @@ fn subscribe_thread(
     name: &'static str,
     events: Box<dyn ContainerEvents>,
     kind: EventKind,
-    tx: tokio_mpsc::UnboundedSender<SandboxEventBatch>,
+    counter: Arc<SandboxEventCounter>,
     wake: Wake,
 ) {
     thegn_core::thread_name::try_spawn_named(name, move || {
@@ -115,7 +135,7 @@ fn subscribe_thread(
         // process lifetime, writing audit rows nobody waits on. Declared
         // FIRST — the thread-qos ratchet.
         crate::platform::qos::set_self(crate::platform::qos::Qos::Background);
-        let mut sink = BatchForwarder::new(tx, wake);
+        let mut sink = BatchForwarder::new(counter, wake);
         events.subscribe(kind, &mut sink);
     })
     // best-effort: listener thread: a failed spawn just disables sandbox
@@ -176,26 +196,28 @@ struct Shared {
     flush_scheduled: AtomicBool,
 }
 
-/// Send one batch and pulse only when the send landed: the loop blocks on
-/// poll_input, so an unpulsed batch would wait for an unrelated wake.
-fn send_and_pulse(tx: &tokio_mpsc::UnboundedSender<SandboxEventBatch>, wake: &Wake, count: usize) {
-    if count > 0 && tx.send(SandboxEventBatch { count }).is_ok() {
+/// Add one batch's count and pulse: the loop blocks on poll_input, so an
+/// unpulsed count would wait for an unrelated wake. An empty batch does
+/// neither.
+fn send_and_pulse(counter: &SandboxEventCounter, wake: &Wake, count: usize) {
+    if count > 0 {
+        counter.add(u64::try_from(count).unwrap_or(u64::MAX));
         wake();
     }
 }
 
-/// Forwards the transports' persisted-rows pulses to the event loop channel,
+/// Forwards the transports' persisted-rows pulses to the event loop counter,
 /// coalesced per [`PULSE_WINDOW`] with a trailing flush.
 struct BatchForwarder {
-    tx: tokio_mpsc::UnboundedSender<SandboxEventBatch>,
+    counter: Arc<SandboxEventCounter>,
     wake: Wake,
     shared: Arc<Shared>,
 }
 
 impl BatchForwarder {
-    fn new(tx: tokio_mpsc::UnboundedSender<SandboxEventBatch>, wake: Wake) -> Self {
+    fn new(counter: Arc<SandboxEventCounter>, wake: Wake) -> Self {
         Self {
-            tx,
+            counter,
             wake,
             shared: Arc::new(Shared {
                 coalescer: Mutex::new(PulseCoalescer::default()),
@@ -220,7 +242,7 @@ impl BatchForwarder {
     /// Spawn the one short-lived trailing-flush thread. It exists only while
     /// a deferred batch is pending (0% idle: no permanent timer).
     fn schedule_flush(&self, delay: Duration) {
-        let tx = self.tx.clone();
+        let counter = self.counter.clone();
         let wake = self.wake.clone();
         let shared = self.shared.clone();
         let spawned = thegn_core::thread_name::try_spawn_named("thegn-sbx-flush", move || {
@@ -228,12 +250,12 @@ impl BatchForwarder {
             crate::platform::qos::set_self(crate::platform::qos::Qos::Background);
             std::thread::sleep(delay);
             let n = Self::drain_for_flush(&shared);
-            send_and_pulse(&tx, &wake, n);
+            send_and_pulse(&counter, &wake, n);
         });
         if spawned.is_err() {
             // Never lose the pulse: send what is pending right now.
             let n = Self::drain_for_flush(&self.shared);
-            send_and_pulse(&self.tx, &self.wake, n);
+            send_and_pulse(&self.counter, &self.wake, n);
         }
     }
 }
@@ -254,7 +276,7 @@ impl ContainerEventSink for BatchForwarder {
             (d, c.due_flush(now))
         };
         match decision {
-            Decision::Send(total) => send_and_pulse(&self.tx, &self.wake, total),
+            Decision::Send(total) => send_and_pulse(&self.counter, &self.wake, total),
             Decision::Defer => {
                 if !self.shared.flush_scheduled.swap(true, Ordering::SeqCst) {
                     self.schedule_flush(due.unwrap_or(PULSE_WINDOW));
@@ -298,38 +320,60 @@ mod tests {
     }
 
     #[test]
-    fn batch_sends_and_pulses_once_empty_batch_does_neither() {
+    fn batch_adds_and_pulses_once_empty_batch_does_neither() {
         use std::sync::atomic::AtomicUsize;
-        let (tx, mut rx) = tokio_mpsc::unbounded_channel();
+        let counter = Arc::new(SandboxEventCounter::default());
         let pulses = Arc::new(AtomicUsize::new(0));
         let p = pulses.clone();
         let mut sink = BatchForwarder::new(
-            tx,
+            Arc::clone(&counter),
             Arc::new(move || {
                 p.fetch_add(1, Ordering::SeqCst);
             }),
         );
         sink.on_batch(0);
         assert_eq!(pulses.load(Ordering::SeqCst), 0);
-        assert!(rx.try_recv().is_err());
+        assert_eq!(counter.take(), 0);
         sink.on_batch(3);
         assert_eq!(pulses.load(Ordering::SeqCst), 1);
-        assert_eq!(rx.try_recv().unwrap().count, 3);
-        let (tx2, rx2) = tokio_mpsc::unbounded_channel();
-        drop(rx2);
-        let p2 = pulses.clone();
-        let mut closed = BatchForwarder::new(
-            tx2,
-            Arc::new(move || {
-                p2.fetch_add(1, Ordering::SeqCst);
-            }),
-        );
-        closed.on_batch(1);
-        assert_eq!(
-            pulses.load(Ordering::SeqCst),
-            1,
-            "no pulse when send failed"
-        );
+        assert_eq!(counter.take(), 3);
+        assert_eq!(counter.take(), 0, "take resets the count");
+    }
+
+    #[test]
+    fn counter_sums_concurrent_adds_exactly() {
+        const THREADS: u64 = 8;
+        const PER_THREAD: u64 = 10_000;
+        let counter = Arc::new(SandboxEventCounter::default());
+        let handles: Vec<_> = (0..THREADS)
+            .map(|t| {
+                let counter = Arc::clone(&counter);
+                std::thread::spawn(move || {
+                    for i in 0..PER_THREAD {
+                        counter.add(1 + (i + t) % 3);
+                    }
+                })
+            })
+            .collect();
+        for handle in handles {
+            assert!(handle.join().is_ok());
+        }
+        let expected = (0..THREADS)
+            .flat_map(|t| (0..PER_THREAD).map(move |i| 1 + (i + t) % 3))
+            .sum::<u64>();
+        assert_eq!(counter.take(), expected);
+        assert_eq!(counter.take(), 0);
+    }
+
+    #[test]
+    fn counter_saturates_at_u64_max() {
+        let counter = SandboxEventCounter::default();
+        counter.add(u64::MAX - 1);
+        counter.add(5);
+        counter.add(u64::MAX);
+        assert_eq!(counter.take(), u64::MAX);
+        counter.add(2);
+        assert_eq!(counter.take(), 2);
     }
 
     #[test]
@@ -380,30 +424,25 @@ mod tests {
     #[test]
     fn deferred_batch_is_flushed_by_trailing_thread() {
         use std::sync::atomic::AtomicUsize;
-        let (tx, mut rx) = tokio_mpsc::unbounded_channel();
+        let counter = Arc::new(SandboxEventCounter::default());
         let pulses = Arc::new(AtomicUsize::new(0));
         let p = pulses.clone();
         let mut sink = BatchForwarder::new(
-            tx,
+            Arc::clone(&counter),
             Arc::new(move || {
                 p.fetch_add(1, Ordering::SeqCst);
             }),
         );
         sink.on_batch(1);
-        let mut total: usize = 0;
-        let mut msgs: usize = 0;
-        let first = rx.try_recv().unwrap();
-        total += first.count;
-        msgs += 1;
-        assert_eq!(first.count, 1);
+        assert_eq!(counter.take(), 1);
+        assert_eq!(pulses.load(Ordering::SeqCst), 1);
+        let mut total: u64 = 1;
         sink.on_batch(2);
         sink.on_batch(3);
+        // Normally both are deferred inside the window and land in one trailing flush.
         let deadline = Instant::now() + Duration::from_secs(3);
         while Instant::now() < deadline {
-            while let Ok(b) = rx.try_recv() {
-                total += b.count;
-                msgs += 1;
-            }
+            total += counter.take();
             if total == 6 {
                 break;
             }
@@ -411,15 +450,14 @@ mod tests {
         }
         assert_eq!(total, 6);
         let deadline = Instant::now() + Duration::from_secs(3);
-        while Instant::now() < deadline && pulses.load(Ordering::SeqCst) != msgs {
+        while Instant::now() < deadline && pulses.load(Ordering::SeqCst) < 2 {
             std::thread::sleep(Duration::from_millis(10));
         }
-        assert_eq!(
-            pulses.load(Ordering::SeqCst),
-            msgs,
-            "one pulse per landed send"
+        let landed = pulses.load(Ordering::SeqCst);
+        assert!(
+            (2..=3).contains(&landed),
+            "one pulse for the first send, then one per landed send or coalesced flush (3 only if the test thread stalled past PULSE_WINDOW): {landed}"
         );
-        assert!(msgs >= 2);
     }
 
     #[test]
