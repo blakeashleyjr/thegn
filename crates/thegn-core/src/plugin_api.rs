@@ -269,13 +269,30 @@ impl ExtensionPoint {
 }
 
 /// The visual role a plugin may assign to a worktree row field.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize, schemars::JsonSchema)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, schemars::JsonSchema)]
 pub enum RowRole {
     Accent,
     Dim,
     Good,
     Warn,
     Bad,
+    Unknown,
+}
+
+impl<'de> Deserialize<'de> for RowRole {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        Ok(match String::deserialize(deserializer)?.as_str() {
+            "Accent" => Self::Accent,
+            "Dim" => Self::Dim,
+            "Good" => Self::Good,
+            "Warn" => Self::Warn,
+            "Bad" => Self::Bad,
+            _ => Self::Unknown,
+        })
+    }
 }
 
 /// One row-field value carried by an `update` notification.

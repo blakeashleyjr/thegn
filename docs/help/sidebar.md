@@ -258,9 +258,16 @@ The default field order is `branch`, `commits`, `dirty`, `branch_stat`, `pr`,
 `disk`; `upstream`, `stage`, `activity`, and `author` are opt-in. The legacy
 `sidebar_detail_branch`, `sidebar_detail_branch_stat`, and `sidebar_detail_pr`
 toggles remain AND gates; prefer `sidebar_detail_fields` for membership and
-order. An empty list keeps only the branch fallback. Each requested field is
+order. An entry can also be `plugin:<plugin>/<field>`; plugin IDs use
+`[A-Za-z0-9._-]{1,64}` and fields use `[a-z0-9_-]{1,32}`. An absent plugin is
+silently empty. An empty list keeps only the branch fallback. Each requested field is
 rendered in the requested order, including environment, sandbox, devcontainer,
 hibernation, merge-queue, unread, and disk.
+
+Plugin fields whose manifest caps set `slot = "badge"` render as compact badges
+after the commit badge. They are capped to 12 columns and are dropped before
+the row label is truncated. A badge still needs its `plugin:<plugin>/<field>`
+entry in `sidebar_detail_fields` to be enabled.
 
 The author field is read with the existing branch metadata scan and adds no
 git spawn. Four source areas were considered for this feature: stash count (the

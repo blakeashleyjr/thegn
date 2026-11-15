@@ -36,7 +36,7 @@ pub struct SidebarDisplay {
     pub show_behind_base: bool,
     pub commit_badge: String,
     pub behind_badge: String,
-    pub detail_fields: Vec<thegn_core::config::DetailField>,
+    pub detail_fields: Vec<thegn_core::config::DetailEntry>,
     pub detail_branch: bool,
     pub detail_branch_stat: bool,
     pub detail_pr: bool,
@@ -64,7 +64,10 @@ impl Default for SidebarDisplay {
             show_behind_base: false,
             commit_badge: "{n}c".into(),
             behind_badge: "{n}b".into(),
-            detail_fields: thegn_core::config::DetailField::default_order().into(),
+            detail_fields: thegn_core::config::DetailField::default_order()
+                .into_iter()
+                .map(thegn_core::config::DetailEntry::Builtin)
+                .collect(),
             detail_branch: true,
             detail_branch_stat: true,
             detail_pr: true,
@@ -92,7 +95,7 @@ impl SidebarDisplay {
             show_behind_base: ui.sidebar_show_behind_base,
             commit_badge: ui.sidebar_commit_badge.clone(),
             behind_badge: ui.sidebar_behind_badge.clone(),
-            detail_fields: ui.detail_fields_resolved(),
+            detail_fields: ui.detail_entries_resolved(),
             detail_branch: ui.sidebar_detail_branch,
             detail_branch_stat: ui.sidebar_detail_branch_stat,
             detail_pr: ui.sidebar_detail_pr,
@@ -2006,6 +2009,26 @@ fn compose_row_lines(
                     ));
                 }
             }
+            for value in row.plugin_fields.iter().filter(|value| {
+                value.slot == thegn_core::plugin_api::RowFieldSlot::Badge
+                    && !display_cell(&value.text).is_empty()
+                    && disp.detail_fields.iter().any(|entry| {
+                        matches!(
+                            entry,
+                            thegn_core::config::DetailEntry::Plugin { plugin, field }
+                                if plugin == &value.plugin && field == &value.field
+                        )
+                    })
+            }) {
+                left.push(sp(1));
+                left.push(seg(
+                    crate::sidebar_detail::plugin_role(value.role),
+                    display_cell(&thegn_core::pipeline_report::display_clip(
+                        &display_cell(&value.text),
+                        12,
+                    )),
+                ));
+            }
 
             // Right cluster (always-on): git status icon + uncommitted diff stat +
             // ahead/behind + PR chip + alert badge (the rest moves to the detail).
@@ -3809,6 +3832,52 @@ mod tests {
             .map(|segment| segment.text.as_str())
             .collect::<String>();
         assert!(!clipped_text.contains("5c"), "{clipped_text:?}");
+    }
+
+    #[test]
+    fn plugin_badge_follows_commit_badge_and_is_clipped_first() {
+        use thegn_svc::git::BranchMeta;
+        let mut row = crate::sidebar::SidebarRow::base(RowKind::Worktree, 1, "feature", "repo");
+        row.branch_meta = Some(BranchMeta {
+            ahead_base: Some(5),
+            ..BranchMeta::default()
+        });
+        row.plugin_fields.push(crate::sidebar::PluginFieldValue {
+            plugin: "ci".into(),
+            field: "check".into(),
+            text: "passing-value-that-is-long".into(),
+            role: thegn_core::plugin_api::RowRole::Good,
+            slot: thegn_core::plugin_api::RowFieldSlot::Badge,
+        });
+        let display = SidebarDisplay {
+            detail_fields: vec![thegn_core::config::DetailEntry::Plugin {
+                plugin: "ci".into(),
+                field: "check".into(),
+            }],
+            ..SidebarDisplay::default()
+        };
+        let line = compose_row_lines(
+            &row, None, None, false, false, true, None, None, 32, &mut None, &display,
+        )
+        .into_iter()
+        .next()
+        .unwrap();
+        let l = match line {
+            crate::seg::Line::SplitMinLeft { l, .. } => l,
+            _ => panic!("badges stay in the left identity cluster"),
+        };
+        let text = l
+            .iter()
+            .map(|segment| segment.text.as_str())
+            .collect::<String>();
+        assert!(text.find("5c").unwrap() < text.find("passing").unwrap());
+        assert!(l.iter().any(|segment| segment.text.contains('…')));
+        let clipped = crate::seg::cut(&l, 12);
+        assert!(
+            !clipped
+                .iter()
+                .any(|segment| segment.text.contains("passing"))
+        );
     }
 
     #[test]
