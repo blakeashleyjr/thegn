@@ -1407,6 +1407,16 @@ impl Panes {
                         backend = %spec.backend,
                         "materialize spawn failed: {line}"
                     );
+                    // Roll back the panes this call already spawned for earlier
+                    // leaves (THE-2004): the tree is not remapped on this path,
+                    // so no leaf references them and they would be orphaned live
+                    // shells. Removing them is the explicit-close teardown
+                    // (`handlers::close::close_pane`): the kill-on-drop default
+                    // terminates and reaps a PTY child off-loop, and kills a
+                    // daemon-backed pane's server-side session.
+                    for fresh in map.values() {
+                        self.table.remove(fresh);
+                    }
                     return Err(e);
                 }
             }
@@ -1982,13 +1992,18 @@ mod tests {
             "the tree is not remapped after a partial batch"
         );
         assert_eq!(tab.focused_pane, first, "focus is not remapped");
-        // Pinned current behaviour: the first leaf's freshly spawned pane is NOT
-        // rolled back; it stays in `panes.table` (un-attached to any leaf) when a
-        // later leaf fails.
+        // THE-2004: the first leaf's freshly spawned pane is rolled back, not
+        // left in `panes.table` as an orphaned live shell no leaf references.
         assert_eq!(
             panes.table.len(),
-            1,
-            "the first leaf's pane stays in the table after a partial batch"
+            0,
+            "the first leaf's pane is rolled back after a partial batch"
+        );
+        // Dropping it starts the detached terminate-and-reap; every in-flight
+        // reaper settling proves the first leaf's child was reaped, not leaked.
+        assert!(
+            crate::pane_pty::drain_detached_reapers(std::time::Duration::from_secs(5)),
+            "the rolled-back pane's child must be terminated and reaped"
         );
     }
 
