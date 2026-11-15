@@ -244,11 +244,15 @@ fn plugin_soak_is_bounded_across_fixed_adversarial_iterations() {
     }
 
     let _state = crate::testenv::IsolatedState::new();
-    let rss_before = rss_pages();
     let children_before = child_ids();
     let plugin_threads_before = plugin_thread_count();
 
     assert_retained_output_is_bounded();
+    // Baseline after the one-shot retained-output check: its bounded buffers
+    // (asserted above) stay in the allocator's free lists, and counting them
+    // put this leak check within a page of its ceiling under gate load. The
+    // ceiling below bounds growth across the soak iterations.
+    let rss_before = rss_pages();
 
     let inbox = Arc::new(PluginInbox::default());
     let mut peak_rss_growth = rss_before
