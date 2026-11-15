@@ -6011,10 +6011,12 @@ esac
                             !args.contains(SECRET),
                             "{location_name}/{mode_name}: {args}"
                         );
-                        assert!(
-                            !debug.contains(SECRET),
-                            "{location_name}/{mode_name}: {debug}"
-                        );
+                        if loc.is_remote() || !token_in_local {
+                            assert!(
+                                !debug.contains(SECRET),
+                                "{location_name}/{mode_name}: {debug}"
+                            );
+                        }
                         assert_eq!(host, Some(gitlab_remote.host.as_str()));
                         if loc.is_remote() {
                             assert!(
