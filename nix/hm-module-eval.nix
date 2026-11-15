@@ -139,6 +139,7 @@
           gitStructuralDiff = "difft";
           gitAutoFetchColocated = true;
           gitSubmodules = "off";
+          statsRefreshSecs = 1.5;
           statsCpuIcon = "C";
           statsMemIcon = "M";
           statsNetIcon = "N";
@@ -178,6 +179,7 @@
           mediaSeekStepVideoSecs = 20;
           mediaPollIntervalSecs = 4;
           mediaPlayersPriority = ["mpv" "spotify"];
+          mediaVolumeStep = 0.1;
           monitorProcRows = 15;
           monitorProcesses = true;
           monitorProcessIo = true;
@@ -218,6 +220,8 @@
           usageTokenRollups = true;
           usageHistoryDays = 30;
           usagePollIntervalSecs = 600;
+          usageWarnPercent = 70.5;
+          usageCritPercent = 95;
           lspEnabled = false;
           lspHover = false;
           lspRequireContainment = true;
@@ -310,6 +314,8 @@
   oversizedUsageHistoryDays = evalWithOptions {usageHistoryDays = 3651;};
   zeroSemanticIndexMaxFiles = evalWithOptions {semanticIndexMaxFiles = 0;};
   zeroSemanticMapBudgetLines = evalWithOptions {semanticMapBudgetLines = 0;};
+  oversizedMediaVolumeStep = evalWithOptions {mediaVolumeStep = 1.5;};
+  oversizedUsageCritPercent = evalWithOptions {usageCritPercent = 100.5;};
 
   minimalConfig = minimal.config.xdg.configFile."thegn/config.toml".source;
   maximalConfig = maximal.config.xdg.configFile."thegn/config.toml".source;
@@ -322,6 +328,8 @@ in
   assert !(builtins.tryEval (builtins.deepSeq oversizedUsageHistoryDays.config.programs.thegn.usageHistoryDays true)).success;
   assert !(builtins.tryEval (builtins.deepSeq zeroSemanticIndexMaxFiles.config.programs.thegn.semanticIndexMaxFiles true)).success;
   assert !(builtins.tryEval (builtins.deepSeq zeroSemanticMapBudgetLines.config.programs.thegn.semanticMapBudgetLines true)).success;
+  assert !(builtins.tryEval (builtins.deepSeq oversizedMediaVolumeStep.config.programs.thegn.mediaVolumeStep true)).success;
+  assert !(builtins.tryEval (builtins.deepSeq oversizedUsageCritPercent.config.programs.thegn.usageCritPercent true)).success;
   assert minimal.config.home.packages == [thegn];
   assert maximal.config.home.packages == [thegn];
     pkgs.runCommand "thegn-hm-module-eval" {} ''

@@ -430,6 +430,7 @@ pub(crate) fn typed_semantic_errors(cfg: &Config, mode: SemanticMode) -> Vec<Str
         errs.push("sandbox.limits.max_load must be a finite non-negative load average".to_string());
         stop!();
     }
+    batch!(float_range_errors(cfg));
     check_templates(cfg, &mut errs);
     stop!();
     if let Some(name) = cfg.default_folder.as_deref()
@@ -554,6 +555,29 @@ pub(crate) fn typed_semantic_errors(cfg: &Config, mode: SemanticMode) -> Vec<Str
     batch!(cfg.ci.validate());
     batch!(crate::provider_admission::validate_config(cfg));
     errs
+}
+
+/// Inclusive ranges for float keys whose schema carries no `maximum` (a schema
+/// maximum is reported as a duration by `check_number`). `crit_percent` below
+/// `warn_percent` is deliberately allowed: the usage tone treats it as warn.
+pub const FLOAT_KEY_RANGES: [(&str, f64, f64); 3] = [
+    ("media.volume_step", 0.0, 1.0),
+    ("usage.warn_percent", 0.0, 100.0),
+    ("usage.crit_percent", 0.0, 100.0),
+];
+
+fn float_range_errors(cfg: &Config) -> Vec<String> {
+    let values = [
+        cfg.media.volume_step,
+        f64::from(cfg.usage.warn_percent),
+        f64::from(cfg.usage.crit_percent),
+    ];
+    FLOAT_KEY_RANGES
+        .iter()
+        .zip(values)
+        .filter(|((_, min, max), value)| !(value.is_finite() && *min <= *value && *value <= *max))
+        .map(|((path, min, max), _)| format!("{path} must be a finite number in {min}..={max}"))
+        .collect()
 }
 
 fn sidebar_detail_warnings(cfg: &Config) -> Vec<String> {
@@ -1845,6 +1869,73 @@ template = "image:registry.example/dev:1"
                 .any(|error| error.contains("sandbox.limits.max_load")),
             "{nan:?}"
         );
+    }
+
+    fn float_errors_for(path: &str, value: f64) -> Vec<String> {
+        let mut cfg = Config::default();
+        match path {
+            "media.volume_step" => cfg.media.volume_step = value,
+            "usage.warn_percent" => cfg.usage.warn_percent = value as f32,
+            "usage.crit_percent" => cfg.usage.crit_percent = value as f32,
+            other => panic!("unknown float key {other}"),
+        }
+        typed_semantic_errors(&cfg, SemanticMode::AllDiagnostics)
+            .into_iter()
+            .filter(|error| error.contains(path))
+            .collect()
+    }
+
+    #[test]
+    fn float_key_ranges_reject_out_of_range_and_non_finite_values() {
+        assert!(float_range_errors(&Config::default()).is_empty());
+        for (path, min, max) in FLOAT_KEY_RANGES {
+            for accepted in [min, max, (min + max) / 2.0] {
+                assert!(
+                    float_errors_for(path, accepted).is_empty(),
+                    "{path} = {accepted}"
+                );
+            }
+            for rejected in [
+                -1.0,
+                min - 0.001,
+                max + 0.001,
+                f64::NAN,
+                f64::INFINITY,
+                f64::NEG_INFINITY,
+            ] {
+                let errors = float_errors_for(path, rejected);
+                assert_eq!(errors.len(), 1, "{path} = {rejected}: {errors:?}");
+                assert!(errors[0].starts_with(path), "{errors:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn float_key_ranges_reach_validate_str_and_allow_crit_below_warn() {
+        let errors = validate_str("[media]\nvolume_step = 1.5\n");
+        assert!(
+            errors
+                .iter()
+                .any(|error| error.contains("media.volume_step")),
+            "{errors:?}"
+        );
+        let errors = validate_str("[usage]\nwarn_percent = 101.0\ncrit_percent = -2.0\n");
+        assert!(
+            errors
+                .iter()
+                .any(|error| error.contains("usage.warn_percent")),
+            "{errors:?}"
+        );
+        assert!(
+            errors
+                .iter()
+                .any(|error| error.contains("usage.crit_percent")),
+            "{errors:?}"
+        );
+        // crit below warn keeps the existing behaviour (treated as warn).
+        assert!(validate_str("[usage]\nwarn_percent = 90.0\ncrit_percent = 50.0\n").is_empty());
+        assert!(validate_str("[media]\nvolume_step = 0.0\n").is_empty());
+        assert!(validate_str("[usage]\nwarn_percent = 100.0\ncrit_percent = 0.0\n").is_empty());
     }
 
     #[test]
