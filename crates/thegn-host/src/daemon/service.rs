@@ -703,6 +703,12 @@ fn map_with_db_error(error: anyhow::Error) -> ControlError {
     ControlError::Internal(error)
 }
 
+/// Branch inventory for a creation door. Fails closed: when git cannot list
+/// branches or worktrees, creating could pick a name that is already taken.
+fn taken_or_refuse(root: &std::path::Path) -> Result<thegn_core::worktree::BranchSet, String> {
+    thegn_core::worktree::BranchSet::load_checked(root)
+}
+
 /// The worker report door's DB work: verify the capability, then write the
 /// report fenced to the run the token was minted for. `after_verify` runs
 /// between those two steps so a test can republish inside the race window.
@@ -3202,7 +3208,8 @@ impl ControlApi for DaemonService {
                         anyhow::anyhow!("worktrees.create: no git repo (pass `repo`)")
                     })?;
                 let base = wt::resolve_base(&root, &cfg1);
-                let taken = wt::BranchSet::load(&root);
+                let taken =
+                    taken_or_refuse(&root).map_err(|e| anyhow::anyhow!("worktrees.create: {e}"))?;
                 let (branch, reservation) = CreateReservation::claim(&root, &seed1, &taken);
                 // THE-516: fallible identities, never a basename/slug alias.
                 let path = wt::allocate_worktree_path(&root, &branch, &cfg1)
@@ -3583,6 +3590,12 @@ fn merge_queue_control_error(error: anyhow::Error) -> ControlError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn taken_or_refuse_errors_on_non_repo() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(taken_or_refuse(dir.path()).is_err());
+    }
 
     fn shutdown_test_entry(msg_tx: mpsc::Sender<SessionMsg>) -> SessionEntry {
         SessionEntry {
