@@ -1307,7 +1307,9 @@ fn check_final_config(cfg: &Config, schema_walk: bool) -> Result<(), ConfigAdmis
 /// Values the runtime normalizer has always clamped, dropped, or replaced
 /// with a default. They are display/telemetry settings, not authority, so
 /// admission keeps that compatibility behavior — but names each one as a
-/// warning (key path only, never the value) instead of hiding it.
+/// warning (key path only, never the value — except the float display ranges
+/// of `config_validate::FLOAT_KEY_RANGES`, whose numbers are named) instead of
+/// hiding it.
 fn pre_process_warnings(cfg: &Config) -> Vec<String> {
     let mut warnings = Vec::new();
     let mut warn = |key: &str, action: &str| {
@@ -1359,6 +1361,8 @@ fn pre_process_warnings(cfg: &Config) -> Vec<String> {
     if crate::config::validate_strftime(&cfg.bars.clock_format).is_err() {
         warn("bars.clock_format", "falls back to the default");
     }
+    // Float display ranges name the value too (a number, never a secret).
+    warnings.extend(config_validate::float_range_warnings(cfg));
     warnings
 }
 

@@ -612,8 +612,10 @@ The `[sandbox.limits]` gate-scheduling keys `heavy_slots` and `max_load` are exp
 The float keys `stats.refresh_secs`, `media.volume_step`, `usage.warn_percent`
 and `usage.crit_percent` are exposed as `statsRefreshSecs`, `mediaVolumeStep`,
 `usageWarnPercent` and `usageCritPercent`, each a bounded `numbers.between`
-option. `thegn config validate` rejects a volume step outside 0.0 through 1.0
-and a usage percentage outside 0 through 100, or any non-finite value. A
+option. thegn warns about a volume step outside 0.0 through 1.0 or a usage
+percentage outside 0 through 100, or any non-finite value; the warning names
+the key, the value and the valid range, and the value is still loaded, so an
+existing config never stops thegn from starting. A
 critical percentage below the warning percentage is accepted and treated as
 the warning tone.
 
