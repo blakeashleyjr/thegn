@@ -157,7 +157,10 @@ pub(crate) fn run_warning(
 
 #[cfg(test)]
 mod tests {
-    use super::{classify_run, observe_outcome, outcome_warning, run_warning};
+    use super::{
+        classify_run, observe_outcome, observe_outcome_with_reason, outcome_warning, read_head,
+        run_warning,
+    };
     use thegn_core::config_pr_queue::PrQueueConfig;
     use thegn_core::pr_queue::{self, AgentHeadOutcome, AgentRunObservation};
     use thegn_core::remote::GitLoc;
