@@ -280,6 +280,7 @@ mod session;
 mod share;
 mod shell_snippet;
 mod sidebar;
+mod sidebar_detail;
 mod sidebar_freeze;
 mod sidebar_help;
 mod sidebar_keytable;

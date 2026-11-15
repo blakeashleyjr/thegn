@@ -30,6 +30,12 @@ pub struct SidebarDisplay {
     pub show_jj: bool,
     pub show_submodules: bool,
     pub focus_detail: thegn_core::config::FocusDetail,
+    pub detail_when: thegn_core::config::DetailWhen,
+    pub show_commits: bool,
+    pub show_behind_base: bool,
+    pub commit_badge: String,
+    pub behind_badge: String,
+    pub detail_fields: Vec<thegn_core::config::DetailField>,
     pub detail_branch: bool,
     pub detail_branch_stat: bool,
     pub detail_pr: bool,
@@ -52,6 +58,15 @@ impl Default for SidebarDisplay {
             show_jj: true,
             show_submodules: true,
             focus_detail: thegn_core::config::FocusDetail::All,
+            detail_when: thegn_core::config::DetailWhen::Always,
+            show_commits: true,
+            show_behind_base: false,
+            commit_badge: "{n}c".into(),
+            behind_badge: "{n}b".into(),
+            detail_fields: thegn_core::config::DetailField::valid_names()
+                .into_iter()
+                .filter_map(thegn_core::config::DetailField::parse)
+                .collect(),
             detail_branch: true,
             detail_branch_stat: true,
             detail_pr: true,
@@ -74,6 +89,12 @@ impl SidebarDisplay {
             show_jj: ui.sidebar_show_jj,
             show_submodules: ui.sidebar_show_submodules,
             focus_detail: ui.sidebar_focus_detail,
+            detail_when: ui.sidebar_detail_when,
+            show_commits: ui.sidebar_show_commits,
+            show_behind_base: ui.sidebar_show_behind_base,
+            commit_badge: ui.sidebar_commit_badge.clone(),
+            behind_badge: ui.sidebar_behind_badge.clone(),
+            detail_fields: ui.detail_fields_resolved(),
             detail_branch: ui.sidebar_detail_branch,
             detail_branch_stat: ui.sidebar_detail_branch_stat,
             detail_pr: ui.sidebar_detail_pr,
@@ -104,7 +125,7 @@ impl SidebarDisplay {
     }
 
     /// The dirty-status marker glyph: override or caps default (`●` / `*`).
-    fn status_glyph(&self) -> String {
+    pub(crate) fn status_glyph(&self) -> String {
         if self.icon_status.is_empty() {
             crate::caps::active_glyphs().dot_filled.to_string()
         } else {
@@ -113,14 +134,19 @@ impl SidebarDisplay {
     }
 
     /// Whether a row's detail line shows, given focus and whether it's the
-    /// cursor row. The detail line only appears while the sidebar owns focus.
+    /// cursor row.
     fn show_detail(&self, focused: bool, is_cursor: bool) -> bool {
         use thegn_core::config::FocusDetail;
+        if self.focus_detail == FocusDetail::Off {
+            return false;
+        }
+        if !focused && self.detail_when == thegn_core::config::DetailWhen::Focused {
+            return false;
+        }
         match self.focus_detail {
-            FocusDetail::Off => false,
-            _ if !focused => false,
             FocusDetail::All => true,
             FocusDetail::Cursor => is_cursor,
+            FocusDetail::Off => false,
         }
     }
 }
@@ -748,7 +774,7 @@ fn sidebar_geom_from(
                 && model
                     .sidebar_display
                     .show_detail(detail_focused, i == detail_cursor)
-                && crate::sidebar::compose_detail_line(row, &model.sidebar_display).is_some()
+                && crate::sidebar_detail::detail_has_content(row, &model.sidebar_display)
             {
                 h = 2;
             }
@@ -1961,6 +1987,28 @@ fn compose_row_lines(
                 crate::sidebar::row_display_branch(row),
             );
             left.push(seg(name_fg, display_cell(&label)));
+            if let Some(meta) = row.branch_meta.as_ref() {
+                if disp.show_commits
+                    && let Some(count) = meta.ahead_base
+                    && count > 0
+                {
+                    left.push(sp(1));
+                    left.push(seg(
+                        Tok::Slot(S::Dim),
+                        crate::sidebar_detail::format_badge(&disp.commit_badge, count, "{n}c"),
+                    ));
+                }
+                if disp.show_behind_base
+                    && let Some(count) = meta.behind_base
+                    && count > 0
+                {
+                    left.push(sp(1));
+                    left.push(seg(
+                        Tok::Hue(theme::Hue::Amber),
+                        crate::sidebar_detail::format_badge(&disp.behind_badge, count, "{n}b"),
+                    ));
+                }
+            }
 
             // Right cluster (always-on): git status icon + uncommitted diff stat +
             // ahead/behind + PR chip + alert badge (the rest moves to the detail).
@@ -2095,7 +2143,15 @@ fn compose_row_lines(
                     min_l: 18,
                 }
             }];
-            if show_detail && let Some(detail) = crate::sidebar::compose_detail_line(row, disp) {
+            if show_detail
+                && let Some(detail) = crate::sidebar_detail::compose_detail_line_at(
+                    row,
+                    disp,
+                    crate::sidebar_detail::unix_now(),
+                    4 + (row.depth.saturating_sub(1) as usize) * 2 + 2 + 2,
+                    content_cols,
+                )
+            {
                 lines.push(detail);
             }
             lines
@@ -2572,6 +2628,7 @@ mod tests {
         // focused row grows a second line regardless of git/PR/env data.
         model.sidebar_display = SidebarDisplay {
             focus_detail: FocusDetail::All,
+            detail_when: thegn_core::config::DetailWhen::Focused,
             detail_branch: true,
             ..SidebarDisplay::default()
         };
@@ -3698,5 +3755,120 @@ mod tests {
         let partial_text = text(&partial);
         assert!(!partial_text.contains("+3"), "{partial_text:?}");
         assert!(!partial_text.contains("-0"), "{partial_text:?}");
+    }
+
+    #[test]
+    fn show_detail_always_vs_focused() {
+        let display = SidebarDisplay::default();
+        assert!(display.show_detail(false, true));
+        let focused = SidebarDisplay {
+            detail_when: thegn_core::config::DetailWhen::Focused,
+            ..display
+        };
+        assert!(!focused.show_detail(false, true));
+        assert!(focused.show_detail(true, true));
+    }
+
+    #[test]
+    fn commit_badge_renders_after_label_and_is_clipped_first_at_narrow() {
+        use thegn_svc::git::BranchMeta;
+        let mut row = crate::sidebar::SidebarRow::base(RowKind::Worktree, 1, "feature", "repo");
+        row.branch_meta = Some(BranchMeta {
+            ahead_base: Some(5),
+            ..BranchMeta::default()
+        });
+        let line = compose_row_lines(
+            &row,
+            None,
+            None,
+            false,
+            false,
+            true,
+            None,
+            None,
+            24,
+            &mut None,
+            &SidebarDisplay::default(),
+        )
+        .into_iter()
+        .next()
+        .unwrap();
+        let l = match line {
+            crate::seg::Line::Segs(segs) => segs,
+            crate::seg::Line::SplitMinLeft { l, .. } => l,
+            _ => panic!("badges stay in the left identity cluster"),
+        };
+        let text = l
+            .iter()
+            .map(|segment| segment.text.as_str())
+            .collect::<String>();
+        assert!(text.find("feature").unwrap() < text.find("5c").unwrap());
+        let clipped = crate::seg::cut(&l, 12);
+        let clipped_text = clipped
+            .iter()
+            .map(|segment| segment.text.as_str())
+            .collect::<String>();
+        assert!(!clipped_text.contains("5c"), "{clipped_text:?}");
+    }
+
+    #[test]
+    fn badge_hidden_when_zero_or_toggle_off() {
+        use thegn_svc::git::BranchMeta;
+        let mut row = crate::sidebar::SidebarRow::base(RowKind::Worktree, 1, "feature", "repo");
+        row.branch_meta = Some(BranchMeta::default());
+        let render = |row: &crate::sidebar::SidebarRow, display: &SidebarDisplay| {
+            compose_row_lines(
+                row, None, None, false, false, true, None, None, 40, &mut None, display,
+            )
+            .into_iter()
+            .flat_map(|line| match line {
+                crate::seg::Line::Segs(segs) => segs,
+                crate::seg::Line::Split { l, r } | crate::seg::Line::SplitMinLeft { l, r, .. } => {
+                    l.into_iter().chain(r).collect()
+                }
+                _ => Vec::new(),
+            })
+            .map(|segment| segment.text)
+            .collect::<String>()
+        };
+        assert!(!render(&row, &SidebarDisplay::default()).contains("2c"));
+        row.branch_meta.as_mut().unwrap().ahead_base = Some(2);
+        assert!(
+            !render(
+                &row,
+                &SidebarDisplay {
+                    show_commits: false,
+                    ..SidebarDisplay::default()
+                }
+            )
+            .contains("2c")
+        );
+    }
+
+    #[test]
+    fn custom_badge_template() {
+        use thegn_svc::git::BranchMeta;
+        let mut row = crate::sidebar::SidebarRow::base(RowKind::Worktree, 1, "feature", "repo");
+        row.branch_meta = Some(BranchMeta {
+            ahead_base: Some(3),
+            ..BranchMeta::default()
+        });
+        let display = SidebarDisplay {
+            commit_badge: "#{n}".into(),
+            ..SidebarDisplay::default()
+        };
+        let line = compose_row_lines(
+            &row, None, None, false, false, true, None, None, 40, &mut None, &display,
+        );
+        let text = line
+            .into_iter()
+            .flat_map(|line| match line {
+                crate::seg::Line::Segs(segs) => segs,
+                crate::seg::Line::SplitMinLeft { l, r, .. } => l.into_iter().chain(r).collect(),
+                _ => Vec::new(),
+            })
+            .map(|segment| segment.text)
+            .collect::<String>();
+        assert!(text.contains("#3"), "{text:?}");
     }
 }
