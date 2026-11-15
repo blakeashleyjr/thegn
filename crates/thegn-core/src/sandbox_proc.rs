@@ -328,6 +328,7 @@ mod tests {
             group: thegn_proc::GroupState::Unknown,
             leader,
             leader_exited_first: false,
+            idle_expired: false,
             stdout: thegn_proc::Capture {
                 eof: true,
                 ..Default::default()
@@ -412,6 +413,7 @@ mod tests {
             group: thegn_proc::GroupState::Drained,
             leader: thegn_proc::Leader::Reaped(status),
             leader_exited_first: true,
+            idle_expired: false,
             stdout: thegn_proc::Capture {
                 bytes: b"partial".to_vec(),
                 eof: false,
