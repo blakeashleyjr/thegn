@@ -75,14 +75,6 @@ const OMITTED: &[(&str, &str)] = &[
         "path-valued shared target directory is deliberately opt-in and is not exposed",
     ),
     (
-        "notifications.desktop_min_urgency",
-        "string-typed urgency has no destination enum to pin and is not exposed",
-    ),
-    (
-        "notifications.process_exit",
-        "string-typed exit policy has no destination enum to pin and is not exposed",
-    ),
-    (
         "notifications.agent_error_signatures",
         "bounded validated signature list is not exposed",
     ),
@@ -1155,6 +1147,10 @@ fn hm_notifications_and_activity_families_are_rendered() {
     for path in [
         "notifications.desktop_min_urgency",
         "notifications.process_exit",
+    ] {
+        assert!(rendered.contains(path), "Home Manager must render {path}");
+    }
+    for path in [
         "notifications.agent_error_signatures",
         "notifications.priority",
         "notifications.rules",
