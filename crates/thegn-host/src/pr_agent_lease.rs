@@ -4,6 +4,7 @@ use std::thread::JoinHandle;
 use std::time::Duration;
 
 use thegn_core::db::Db;
+use thegn_core::git_run::{GitOutcome, GitTextError};
 use thegn_core::pr_queue::{
     AgentHeadOutcome, PR_AGENT_MAX_LEASE_MS, PrAgentAdmit, PrAgentLease, PrAgentLeaseView,
     PrAgentRefusal, PrqStatus, expired_pr_agent_detail, pr_agent_lease_live,
@@ -223,18 +224,58 @@ pub(crate) fn observe_own_head(
     admitted: &str,
     remote_head: impl FnOnce() -> Option<String>,
 ) -> Option<String> {
+    match observe_own_head_with_reason(loc, admitted, remote_head) {
+        Ok(own) => own,
+        Err(error) => {
+            tracing::warn!(target: "thegn::prq", %error, "could not read local PR-agent HEAD; not attributing a push");
+            None
+        }
+    }
+}
+
+fn observe_own_head_with_reason(
+    loc: &thegn_core::remote::GitLoc,
+    admitted: &str,
+    remote_head: impl FnOnce() -> Option<String>,
+) -> Result<Option<String>, String> {
     let thegn_core::remote::GitLoc::Local(path) = loc else {
-        return None;
+        return Ok(None);
     };
-    let local = loc.git_out(&["rev-parse", "HEAD"])?;
+    let Some(local) = read_head(loc)? else {
+        return Ok(None);
+    };
     if local == admitted {
-        return None;
+        return Ok(None);
     }
     let descends = thegn_core::util::git_is_ancestor(path, admitted, &local);
     if descends != Some(true) {
-        return None;
+        return Ok(None);
     }
-    thegn_core::pr_queue::own_agent_head(admitted, Some(&local), remote_head().as_deref(), descends)
+    Ok(thegn_core::pr_queue::own_agent_head(
+        admitted,
+        Some(&local),
+        remote_head().as_deref(),
+        descends,
+    ))
+}
+
+fn read_head(loc: &thegn_core::remote::GitLoc) -> Result<Option<String>, String> {
+    match loc.git_text(&["rev-parse", "--verify", "--quiet", "HEAD"]) {
+        Ok(head) if head.is_empty() => Ok(None),
+        Ok(head) => Ok(Some(head)),
+        Err(error) if is_unborn_head(&error) => Ok(None),
+        Err(error) => Err(format!("git HEAD read failed: {error}")),
+    }
+}
+
+fn is_unborn_head(error: &GitTextError) -> bool {
+    matches!(
+        error,
+        GitTextError::Failed(GitOutcome::Exit {
+            code: Some(1),
+            stderr_tail,
+        }) if stderr_tail.is_empty()
+    )
 }
 
 pub(crate) fn own_head_record_warning(number: u64, result: anyhow::Result<bool>) -> Option<String> {
@@ -535,6 +576,29 @@ mod tests {
             None
         );
         assert!(!called.get());
+
+        let unborn = tempfile::tempdir().unwrap();
+        let unborn_loc = thegn_core::remote::GitLoc::Local(unborn.path().to_path_buf());
+        let status = thegn_core::util::git_cmd(unborn.path())
+            .args(["init", "--quiet"])
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .status()
+            .unwrap();
+        assert!(status.success());
+        assert_eq!(
+            observe_own_head(&unborn_loc, &admitted, || unreachable!()),
+            None
+        );
+
+        let broken = tempfile::tempdir().unwrap();
+        std::fs::write(broken.path().join(".git"), "gitdir: missing\n").unwrap();
+        let broken_loc = thegn_core::remote::GitLoc::Local(broken.path().to_path_buf());
+        let error = observe_own_head_with_reason(&broken_loc, &admitted, || None).unwrap_err();
+        assert!(error.contains("git"), "{error}");
+        assert_eq!(
+            observe_own_head(&broken_loc, &admitted, || unreachable!()),
+            None
+        );
     }
 
     #[expect(
