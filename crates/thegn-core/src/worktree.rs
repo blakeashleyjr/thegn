@@ -371,20 +371,25 @@ const NOUN: &[&str] = &[
     "walnut", "water", "wave", "whale", "wind", "wing", "wolf", "zebra", "zenith", "zephyr",
 ];
 
-/// Whether an exact local branch `refs/heads/{branch}` exists in `root`. Exact
-/// (not the hierarchical [`BranchSet::taken`] collision check): the batched
-/// cross-repo create uses it to decide attach-vs-create per member, where
-/// identity is literal branch-name equality.
+/// Best effort; failures are logged at debug; use the `_checked` variant when
+/// failure must be distinguished. Whether an exact local branch
+/// `refs/heads/{branch}` exists in `root`. Exact (not the hierarchical
+/// [`BranchSet::taken`] collision check): the batched cross-repo create uses it
+/// to decide attach-vs-create per member, where identity is literal
+/// branch-name equality.
 pub fn branch_exists(root: &Path, branch: &str) -> bool {
-    util::git_ok(
-        root,
-        &[
-            "show-ref",
-            "--verify",
-            "--quiet",
-            &format!("refs/heads/{branch}"),
-        ],
-    )
+    match branch_exists_checked(root, branch) {
+        Ok(exists) => exists,
+        Err(error) => {
+            tracing::debug!(
+                target: "thegn::worktree",
+                root = %root.display(),
+                %error,
+                "could not check whether branch exists"
+            );
+            false
+        }
+    }
 }
 
 /// Check whether an exact local branch exists, preserving probe failures.
@@ -435,20 +440,31 @@ pub struct BranchSet {
 }
 
 impl BranchSet {
-    /// Best effort (a failed read yields fewer names); creation paths use
-    /// [`BranchSet::load_checked`].
+    /// Best effort; failures are logged at debug; use the `_checked` variant
+    /// when failure must be distinguished. Branch inventory failures are also
+    /// warned because this is a user action. A failed read yields an empty set;
+    /// creation paths use [`BranchSet::load_checked`].
     pub fn load(root: &Path) -> Self {
-        let mut taken = std::collections::HashSet::new();
-        if let Some(out) = util::git_out(
-            root,
-            &["for-each-ref", "refs/heads", "--format=%(refname:short)"],
-        ) {
-            taken.extend(out.lines().map(str::to_string).filter(|l| !l.is_empty()));
+        match Self::load_checked(root) {
+            Ok(branches) => branches,
+            Err(error) => {
+                tracing::debug!(
+                    target: "thegn::worktree",
+                    root = %root.display(),
+                    %error,
+                    "could not load branch inventory"
+                );
+                tracing::warn!(
+                    target: "thegn::worktree",
+                    root = %root.display(),
+                    %error,
+                    "could not load branch inventory"
+                );
+                Self {
+                    taken: std::collections::HashSet::new(),
+                }
+            }
         }
-        if let Some(worktrees) = util::worktree_branches(root) {
-            taken.extend(worktrees.into_iter().filter_map(|(_, branch)| branch));
-        }
-        Self { taken }
     }
 
     /// Read local branches and checked-out worktree branches without losing
@@ -575,25 +591,22 @@ pub fn branch_name_checked(
     Ok(dedupe(&base, &BranchSet::load_checked(root)?))
 }
 
-/// Best-effort default branch: origin/HEAD, else main, else master, else HEAD.
+/// Best effort; failures are logged at debug; use the `_checked` variant when
+/// failure must be distinguished. Uses origin/HEAD, else main, else master,
+/// else HEAD.
 pub fn default_branch(root: &Path) -> String {
-    if let Some(r) = util::git_out(
-        root,
-        &[
-            "symbolic-ref",
-            "--quiet",
-            "--short",
-            "refs/remotes/origin/HEAD",
-        ],
-    ) {
-        return r.strip_prefix("origin/").unwrap_or(&r).to_string();
-    }
-    for b in ["main", "master"] {
-        if branch_exists(root, b) {
-            return b.to_string();
+    match default_branch_checked(root) {
+        Ok(branch) => branch,
+        Err(error) => {
+            tracing::debug!(
+                target: "thegn::worktree",
+                root = %root.display(),
+                %error,
+                "could not read default branch"
+            );
+            "HEAD".to_string()
         }
     }
-    "HEAD".to_string()
 }
 
 /// Read the default branch while preserving failures from Git probes.
@@ -641,30 +654,26 @@ pub fn default_branch_checked(root: &Path) -> Result<String, String> {
     Ok("HEAD".to_string())
 }
 
-/// Resolve the base ref to branch a new worktree off (honours `base_branch`).
+/// Best effort; failures are logged at debug; use the `_checked` variant when
+/// failure must be distinguished. Resolve the base ref to branch a new
+/// worktree off (honours `base_branch`), falling back to HEAD on failure.
 pub fn resolve_base(root: &Path, cfg: &Config) -> String {
-    if cfg.base_branch != "auto" {
-        return cfg.base_branch.clone();
-    }
-    match repo::is_bare_checked(root) {
-        Ok(true) => return default_branch(root),
-        Ok(false) => {}
+    match resolve_base_checked(root, cfg) {
+        Ok(base) => base,
         Err(error) => {
+            tracing::debug!(
+                target: "thegn::worktree",
+                root = %root.display(),
+                %error,
+                "could not resolve worktree base"
+            );
             msg::warn(&format!(
                 "could not check repository type in {}; basing new worktree off HEAD: {error}",
                 root.display()
             ));
-            return "HEAD".to_string();
+            "HEAD".to_string()
         }
     }
-    if let Some(head) = util::git_out(root, &["symbolic-ref", "--quiet", "--short", "HEAD"]) {
-        return head;
-    }
-    let def = default_branch(root);
-    msg::warn(&format!(
-        "main worktree is on a detached HEAD; basing new worktree off '{def}'"
-    ));
-    def
 }
 
 /// Resolve the base ref for a new worktree, distinguishing detached HEAD from
@@ -1687,6 +1696,28 @@ mod tests {
     }
 
     #[test]
+    fn branch_exists_best_effort_covers_present_absent_unborn_and_probe_failure() {
+        let repo = temp_repo("best-effort-branch");
+        assert!(branch_exists(&repo, "main"));
+        assert!(!branch_exists(&repo, "missing"));
+
+        let scratch = tempfile::tempdir().unwrap();
+        let unborn = scratch.path().join("unborn");
+        std::fs::create_dir(&unborn).unwrap();
+        assert!(
+            util::git_cmd(&unborn)
+                .args(["-c", "commit.gpgsign=false", "init", "-q", "-b", "main"])
+                .status()
+                .unwrap()
+                .success()
+        );
+        assert!(!branch_exists(&unborn, "main"));
+
+        WORKTREE_NEXT_BRANCH_PROBE_FAILURE.with(|failure| failure.set(true));
+        assert!(!branch_exists(&repo, "main"));
+    }
+
+    #[test]
     fn checked_branch_set_refuses_a_non_repository() {
         let scratch = tempfile::tempdir().unwrap();
         let checked = BranchSet::load_checked(scratch.path());
@@ -1802,6 +1833,62 @@ mod tests {
         let not_repo = scratch.path().join("not-repo");
         std::fs::create_dir(&not_repo).unwrap();
         assert!(default_branch_checked(&not_repo).is_err());
+    }
+
+    #[test]
+    fn default_branch_best_effort_uses_origin_main_master_and_head_fallbacks() {
+        let scratch = tempfile::tempdir().unwrap();
+        let repo = scratch.path().join("repo");
+        std::fs::create_dir(&repo).unwrap();
+        temp_repo_in(&repo);
+        assert_eq!(resolve_base(&repo, &Config::default()), "main");
+
+        assert!(
+            util::git_cmd(&repo)
+                .args([
+                    "symbolic-ref",
+                    "refs/remotes/origin/HEAD",
+                    "refs/remotes/origin/trunk",
+                ])
+                .status()
+                .unwrap()
+                .success()
+        );
+        assert_eq!(default_branch(&repo), "trunk");
+
+        assert!(
+            util::git_cmd(&repo)
+                .args(["update-ref", "-d", "refs/remotes/origin/HEAD"])
+                .status()
+                .unwrap()
+                .success()
+        );
+        assert_eq!(default_branch(&repo), "main");
+
+        assert!(
+            util::git_cmd(&repo)
+                .args(["branch", "-m", "main", "master"])
+                .status()
+                .unwrap()
+                .success()
+        );
+        assert_eq!(default_branch(&repo), "master");
+
+        let unborn = scratch.path().join("unborn");
+        std::fs::create_dir(&unborn).unwrap();
+        assert!(
+            util::git_cmd(&unborn)
+                .args(["-c", "commit.gpgsign=false", "init", "-q", "-b", "main"])
+                .status()
+                .unwrap()
+                .success()
+        );
+        assert_eq!(default_branch(&unborn), "HEAD");
+
+        let not_repo = scratch.path().join("not-repo");
+        std::fs::create_dir(&not_repo).unwrap();
+        assert_eq!(default_branch(&not_repo), "HEAD");
+        assert_eq!(resolve_base(&not_repo, &Config::default()), "HEAD");
     }
 
     #[test]
