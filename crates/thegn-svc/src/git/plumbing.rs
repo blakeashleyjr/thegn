@@ -188,14 +188,22 @@ fn parse_merge_base(code: i32, stdout: &str, stderr: &str) -> Result<Option<Stri
     }
 }
 
-/// Parse a `git merge-tree --write-tree --name-only -z` result. Output sections
-/// are NUL-separated: `<tree-oid>` then (on conflict) the conflicted filenames,
-/// then an empty record before informational messages. Exit 0 = clean, 1 =
-/// conflicts, >1 = genuine failure. Shared by [`PlumbingOps::merge_tree`] and
-/// [`PlumbingOps::merge_tree_base`].
+/// Parse a `git merge-tree --write-tree --name-only -z` result. Exit 0 =
+/// clean, 1 = conflicts, >1 = genuine failure. Shared by
+/// [`PlumbingOps::merge_tree`] and [`PlumbingOps::merge_tree_base`].
+///
+/// A clean merge prints only the tree oid. A conflicted merge prints the tree
+/// oid NUL, one NUL-terminated record per conflicted path, an empty record
+/// (git always shows messages on conflict), then NUL-terminated informational
+/// messages. Every record must be terminated and the empty section separator
+/// must be present: a truncated stream is an error rather than a shorter (or
+/// cut-short) conflict list that could misreport which paths conflict.
 fn parse_merge_tree(code: i32, stdout: &str, stderr: &str) -> Result<MergeTreeOutcome> {
-    let mut parts = stdout.split('\0');
-    let tree = parts.next().unwrap_or("").trim().to_string();
+    let (tree_record, rest) = match stdout.split_once('\0') {
+        Some((tree, rest)) => (tree, Some(rest)),
+        None => (stdout, None),
+    };
+    let tree = tree_record.trim().to_string();
     match code {
         0 => {
             if !is_object_id(&tree) {
@@ -213,12 +221,30 @@ fn parse_merge_tree(code: i32, stdout: &str, stderr: &str) -> Result<MergeTreeOu
                     stderr.trim()
                 );
             }
+            let Some(mut rest) = rest else {
+                anyhow::bail!(
+                    "merge-tree: truncated conflict output: tree oid is not NUL-terminated"
+                );
+            };
             let mut paths = Vec::new();
-            for p in parts {
-                if p.is_empty() {
-                    break; // section separator → informational messages follow
+            loop {
+                let Some((record, tail)) = rest.split_once('\0') else {
+                    anyhow::bail!(
+                        "merge-tree: truncated conflict output: path list is missing its \
+                         NUL terminator or section separator"
+                    );
+                };
+                rest = tail;
+                if record.is_empty() {
+                    break; // section separator: informational messages follow
                 }
-                paths.push(p.to_string());
+                paths.push(record.to_string());
+            }
+            if !rest.is_empty() && !rest.ends_with('\0') {
+                anyhow::bail!(
+                    "merge-tree: truncated conflict output: informational messages are not \
+                     NUL-terminated"
+                );
             }
             Ok(MergeTreeOutcome::Conflict { tree, paths })
         }
@@ -1544,7 +1570,9 @@ mod tests {
 
     #[test]
     fn commit_metas_date_is_opaque_so_letters_and_signs_are_accepted() {
-        // Pinned laxity: only empty / whitespace-bearing dates are refused.
+        // The caller's format is `%aI` (strict ISO 8601), not a numeric
+        // `%at`/`%ct`, so the date stays opaque: only empty /
+        // whitespace-bearing dates are refused.
         for date in ["abc", "+100", "-5", "@100"] {
             let parsed = parse_commit_metas(&meta_with(4, date)).unwrap();
             assert_eq!(parsed[0].author.date, date);
@@ -1623,30 +1651,38 @@ mod tests {
         }
 
         let stdout = merge_tree_conflict_stdout(&tree);
-        let full_paths = ["a b.txt", "dir/\u{e9}.txt"];
+        let full = MergeTreeOutcome::Conflict {
+            tree: tree.clone(),
+            paths: vec!["a b.txt".to_string(), "dir/\u{e9}.txt".to_string()],
+        };
+        // The path list ends at the empty separator record.
+        let separator_end = stdout.find("\0\0").unwrap() + 2;
         for cut in 0..=stdout.len() {
             if !stdout.is_char_boundary(cut) {
                 continue;
             }
-            let parsed = parse_merge_tree(1, &stdout[..cut], "");
-            if cut < 40 {
-                assert!(parsed.is_err(), "conflict cut {cut} must be rejected");
-                continue;
-            }
-            // Pinned: once the tree oid is whole, a truncated conflict list
-            // is accepted (shorter list, last path possibly cut short).
-            let MergeTreeOutcome::Conflict { tree: got, paths } =
-                parsed.unwrap_or_else(|e| panic!("conflict cut {cut} must parse: {e}"))
-            else {
-                panic!("exit 1 is always a conflict");
-            };
-            assert_eq!(got, tree, "cut {cut}");
-            assert!(paths.len() <= full_paths.len(), "cut {cut}");
-            for (index, path) in paths.iter().enumerate() {
-                assert!(
-                    full_paths[index].starts_with(path.as_str()),
-                    "cut {cut}: {path:?}"
+            let prefix = &stdout[..cut];
+            let parsed = parse_merge_tree(1, prefix, "");
+            // Strict: a cut anywhere before the separator, or mid-record in
+            // the informational messages, is rejected. Only a prefix that
+            // ends on a record boundary after the separator parses, and then
+            // always with the complete conflict list.
+            if cut >= separator_end && prefix.ends_with('\0') {
+                assert_eq!(
+                    parsed.unwrap_or_else(|e| panic!("conflict cut {cut} must parse: {e}")),
+                    full,
+                    "cut {cut}"
                 );
+            } else {
+                let Err(error) = parsed else {
+                    panic!("conflict cut {cut} must be rejected");
+                };
+                if cut >= 41 {
+                    assert!(
+                        error.to_string().contains("truncated conflict output"),
+                        "cut {cut}: {error}"
+                    );
+                }
             }
         }
         let whole = parse_merge_tree(1, &stdout, "").unwrap();
@@ -1708,11 +1744,34 @@ mod tests {
         );
         // Paths are kept verbatim, newline included.
         assert_eq!(
-            parse_merge_tree(1, &format!("{tree}\0a\nb\0"), "").unwrap(),
+            parse_merge_tree(1, &format!("{tree}\0a\nb\0\0"), "").unwrap(),
             MergeTreeOutcome::Conflict {
-                tree,
+                tree: tree.clone(),
                 paths: vec!["a\nb".to_string()]
             }
         );
+        // Strict framing: a missing tree terminator, a missing separator, or
+        // unterminated messages are truncation, never a shorter path list.
+        for (label, stdout, expect) in [
+            ("bare tree", tree.clone(), "tree oid is not NUL-terminated"),
+            (
+                "no separator",
+                format!("{tree}\0a\nb\0"),
+                "missing its NUL terminator or section separator",
+            ),
+            (
+                "cut path",
+                format!("{tree}\0a\0b"),
+                "missing its NUL terminator or section separator",
+            ),
+            (
+                "cut message",
+                format!("{tree}\0a\0\0msg"),
+                "messages are not NUL-terminated",
+            ),
+        ] {
+            let error = parse_merge_tree(1, &stdout, "").unwrap_err();
+            assert!(error.to_string().contains(expect), "{label}: {error}");
+        }
     }
 }
