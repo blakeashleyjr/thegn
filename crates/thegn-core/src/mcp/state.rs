@@ -236,9 +236,9 @@ pub const STATE_TOOLS: &[StateToolSpec] = &[
         cap: "merge.add",
         description: "Enqueue a worktree's branch on its repository's merge queue. Defaults \
                       to the server's resolved worktree when `worktree` is omitted. \
-                      Additive: it never removes queue entries. Merge-add-scoped \
-                      (`--scopes merge_add`, also granted by `--scopes git`); requires a \
-                      running daemon.",
+                      Additive: it never removes queue entries. Git-scoped \
+                      (`--scopes git`; the narrow `merge_add` grant is for worktree-bound \
+                      route tokens and does not enable this tool); requires a running daemon.",
         args: &[ArgSpec {
             name: "worktree",
             kind: ArgKind::String,
@@ -871,9 +871,13 @@ impl<'a> StateRouter<'a> {
     pub fn call(&self, name: &str, args: &Value) -> Option<Result<Value, (i32, String)>> {
         let spec = STATE_TOOLS.iter().find(|t| tool_name(t.cap) == name)?;
         if !self.allowed.contains(&spec.cap) {
-            let scope = lookup(spec.cap)
-                .map(|c| scope_of(c).as_str())
-                .unwrap_or("read");
+            let scope = if spec.cap == "merge.add" {
+                "git"
+            } else {
+                lookup(spec.cap)
+                    .map(|c| scope_of(c).as_str())
+                    .unwrap_or("read")
+            };
             return Some(Err((
                 -32001,
                 format!(
@@ -1234,7 +1238,7 @@ mod tests {
         });
         let (code, msg) = denied.call("merge_add", &json!({})).unwrap().unwrap_err();
         assert_eq!(code, -32001);
-        assert!(msg.contains("--scopes merge_add"), "{msg}");
+        assert!(msg.contains("--scopes git"), "{msg}");
         let (code, msg) = denied
             .call("notify_push", &json!({ "title": "t" }))
             .unwrap()

@@ -52,8 +52,7 @@ folder (`folder` name, or `clear: true`) through `api call` (Git scope), HTTP,
 gRPC, MCP (`folders_assign`, needs `--scopes git`), or plugin `host.call`.
 `thegn mcp serve` also exposes two additive write tools: `merge_add`
 enqueues a worktree's branch on the merge queue (`worktree` optional,
-defaulting to the server's resolved worktree; needs `--scopes merge_add`,
-which `git` also grants), and `notify_push` pushes a tray notification
+defaulting to the server's resolved worktree; needs `--scopes git`), and `notify_push` pushes a tray notification
 (`title`, plus optional `body`, `urgency` and `source`; needs `--scopes
 write`). Clearing the merge queue stays off MCP.
 A worktree's sandbox profile pin is readable with `worktrees.sandbox_profile`
