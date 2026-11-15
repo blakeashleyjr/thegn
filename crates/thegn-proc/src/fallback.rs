@@ -1,6 +1,6 @@
 use crate::{
-    Capture, Containment, End, GroupState, InputFeed, Leader, Limits, POLL_INTERVAL, Run, Stream,
-    StreamConsumer, Which, aggregate_fit,
+    Capture, Containment, End, GroupState, InputFeed, Leader, LeaderExit, Limits, POLL_INTERVAL,
+    Run, Stream, StreamConsumer, Which, aggregate_fit,
 };
 use std::{
     io::{self, Read, Write},
@@ -121,6 +121,22 @@ fn drain(
             Err(mpsc::TryRecvError::Empty) => return None,
             Err(mpsc::TryRecvError::Disconnected) => return None,
         }
+    }
+}
+
+/// Whether both piped streams are finished (EOF seen, or never piped).
+fn streams_done(run: &Run, limits: &Limits) -> bool {
+    (run.stdout.eof || matches!(limits.stdout, Stream::Null))
+        && (run.stderr.eof || matches!(limits.stderr, Stream::Null))
+}
+
+/// The group state a `LeaderExit::Detach` run reports once the leader exited on its own and the
+/// reader grace is over: a pipe still open means something the leader started still holds it.
+fn detached_group(streams_done: bool) -> GroupState {
+    if streams_done {
+        GroupState::Drained
+    } else {
+        GroupState::Detached
     }
 }
 
@@ -321,6 +337,11 @@ fn run_inner(
         if status.is_some() {
             run.leader_exited_first = true;
             run.end = End::LeaderExited;
+            if limits.leader_exit == LeaderExit::Detach {
+                // Detach: the leader's exit ends the run; the reader grace below bounds the wait
+                // for EOF and nothing is signalled.
+                break;
+            }
             if cancel.load(Ordering::Acquire) {
                 run.end = End::Cancelled;
                 break;
@@ -332,9 +353,7 @@ fn run_inner(
             {
                 break;
             }
-            if (run.stdout.eof || matches!(limits.stdout, Stream::Null))
-                && (run.stderr.eof || matches!(limits.stderr, Stream::Null))
-            {
+            if streams_done(&run, limits) {
                 break;
             }
         } else if cancel.load(Ordering::Acquire) {
@@ -425,10 +444,7 @@ fn run_inner(
         };
     }
     let grace = Instant::now();
-    while !((run.stdout.eof || matches!(limits.stdout, Stream::Null))
-        && (run.stderr.eof || matches!(limits.stderr, Stream::Null)))
-        && grace.elapsed() < limits.reader_grace
-    {
+    while !streams_done(&run, limits) && grace.elapsed() < limits.reader_grace {
         if let Some(which) = drain(&rx, &mut run, limits, consume) {
             run.end = End::OutputLimit(which);
         }
@@ -436,6 +452,12 @@ fn run_inner(
     }
     if let Some(which) = drain(&rx, &mut run, limits, consume) {
         run.end = End::OutputLimit(which);
+    }
+    if limits.leader_exit == LeaderExit::Detach
+        && run.leader_exited_first
+        && matches!(run.group, GroupState::Drained)
+    {
+        run.group = detached_group(streams_done(&run, limits));
     }
     // A reader-grace OutputLimit overrides the end; the flag only ever accompanies TimedOut.
     run.idle_expired = run.idle_expired && matches!(&run.end, End::TimedOut);
@@ -495,6 +517,12 @@ mod tests {
         assert_eq!(capture.bytes, first);
         assert!(capture.truncated);
         assert_eq!(capture.total, 3 * 1024 * 1024);
+    }
+
+    #[test]
+    fn detached_group_reports_detached_only_while_a_pipe_is_held() {
+        assert_eq!(detached_group(true), GroupState::Drained);
+        assert_eq!(detached_group(false), GroupState::Detached);
     }
 
     #[test]

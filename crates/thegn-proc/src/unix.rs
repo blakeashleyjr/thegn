@@ -1,6 +1,6 @@
 use crate::{
-    BACKOFF_CAP, Capture, Containment, End, GroupState, InputFeed, Leader, Limits, POLL_INTERVAL,
-    Run, Stream, StreamConsumer, Which, aggregate_fit,
+    BACKOFF_CAP, Capture, Containment, End, GroupState, InputFeed, Leader, LeaderExit, Limits,
+    POLL_INTERVAL, Run, Stream, StreamConsumer, Which, aggregate_fit,
 };
 use nix::{
     errno::Errno,
@@ -726,6 +726,15 @@ fn run_inner(
         match leader_exited(pid) {
             Ok(true) => {
                 leader_first = true;
+                if limits.leader_exit == LeaderExit::Detach {
+                    // Detach: no quiesce window. One last drain (the leader is still a pinned
+                    // zombie, so an overflow here can still terminate the group safely), then the
+                    // run ends; the members left are not signalled.
+                    break match drain(&mut pipes, &mut out, &mut err) {
+                        Ok(Some(which)) => End::OutputLimit(which),
+                        Ok(None) | Err(_) => End::LeaderExited,
+                    };
+                }
                 let quiesce = limits
                     .quiesce_after_leader
                     .map_or(deadline, |span| deadline.min(Instant::now() + span));
@@ -830,10 +839,11 @@ fn run_inner(
         let group_is_live = group_live_with_scan(Path::new("/proc"), pid, &mut liveness);
         #[cfg(not(target_os = "linux"))]
         let group_is_live = group_live(pid);
-        group = if group_is_live {
-            GroupState::Terminated
-        } else {
-            GroupState::Drained
+        group = match (group_is_live, limits.leader_exit) {
+            (false, _) => GroupState::Drained,
+            // Detach: never signal the members the leader left behind.
+            (true, LeaderExit::Detach) => GroupState::Detached,
+            (true, LeaderExit::Quiesce) => GroupState::Terminated,
         };
         if group == GroupState::Terminated {
             signalled = true;
@@ -874,6 +884,11 @@ fn run_inner(
         limits.kill_settle,
         signalled || leader_first,
     );
+    // The leader is reaped (or owned by the reap thread) from here on, so the guard has nothing
+    // left to pin: its pgid may belong to detached survivors or be recycled. Disarm before the
+    // reader-grace drain, so a consumer panic there cannot SIGKILL a detached group or waitpid a
+    // reused pid.
+    guard.disarm();
     let grace_end = Instant::now() + limits.reader_grace;
     while (pipes.out_open || pipes.err_open) && Instant::now() < grace_end {
         match drain(&mut pipes, &mut out, &mut err) {
@@ -908,7 +923,6 @@ fn run_inner(
         limits.stderr,
         limits.aggregate_tail_cap,
     );
-    guard.disarm();
     (run, pipes.feed.state)
 }
 
@@ -1451,12 +1465,116 @@ mod tests {
         let configured = Limits::silent(Duration::from_secs(4));
         assert_eq!(configured.timeout, Duration::from_secs(4));
         assert_eq!(configured.quiesce_after_leader, None);
+        assert_eq!(configured.leader_exit, LeaderExit::Quiesce);
         assert_eq!(configured.term_grace, Duration::ZERO);
         assert_eq!(configured.kill_settle, Duration::from_millis(250));
         assert_eq!(configured.reader_grace, Duration::ZERO);
         assert_eq!(configured.stdout, Stream::Null);
         assert_eq!(configured.stderr, Stream::Null);
         assert_eq!(configured.aggregate_tail_cap, None);
+    }
+
+    fn detach_limits(timeout: Duration) -> Limits {
+        Limits {
+            stdout: Stream::Tail { cap: 4096 },
+            stderr: Stream::Tail { cap: 4096 },
+            leader_exit: LeaderExit::Detach,
+            term_grace: Duration::from_millis(50),
+            kill_settle: Duration::from_millis(500),
+            reader_grace: Duration::from_millis(200),
+            ..Limits::silent(timeout)
+        }
+    }
+
+    #[test]
+    fn detach_leaves_background_member_running_and_returns_promptly() {
+        let mut cmd = Command::new("sh");
+        cmd.args(["-c", "sleep 30 & echo \"started $$\""]);
+        let started = Instant::now();
+        let run = run(
+            &mut cmd,
+            &detach_limits(Duration::from_secs(10)),
+            &AtomicBool::new(false),
+        );
+        let elapsed = started.elapsed();
+        let text = String::from_utf8_lossy(&run.stdout.bytes).into_owned();
+        let pgid: libc::pid_t = text
+            .trim()
+            .strip_prefix("started ")
+            .and_then(|pid| pid.parse().ok())
+            .unwrap_or_else(|| panic!("no pid in {text:?}"));
+        let survivors = crate::group_has_live_members(pgid as u32);
+        // SAFETY: killpg only signals the test's own detached process group.
+        let killed = unsafe { libc::killpg(pgid, libc::SIGKILL) };
+        assert!(elapsed < Duration::from_secs(3), "{elapsed:?}");
+        assert!(matches!(&run.end, End::LeaderExited), "{:?}", run.end);
+        assert!(
+            matches!(&run.leader, Leader::Reaped(status) if status.success()),
+            "{:?}",
+            run.leader
+        );
+        assert_eq!(run.group, GroupState::Detached);
+        assert!(run.leader_exited_first);
+        assert!(run.success());
+        assert_eq!(run.error(), None);
+        assert!(text.contains("started"), "{text:?}");
+        assert!(survivors, "the backgrounded sleep must still be running");
+        assert_eq!(
+            killed, 0,
+            "the detached group must still exist to be killed"
+        );
+    }
+
+    #[test]
+    fn detach_with_no_survivors_reports_drained() {
+        let run = run(
+            &mut Command::new("true"),
+            &detach_limits(Duration::from_secs(10)),
+            &AtomicBool::new(false),
+        );
+        assert!(matches!(&run.end, End::LeaderExited), "{:?}", run.end);
+        assert_eq!(run.group, GroupState::Drained);
+        assert!(run.success());
+        assert!(run.stdout.eof);
+    }
+
+    #[test]
+    fn detach_still_terminates_on_timeout() {
+        let scripts = Scripts::new();
+        let script = scripts.write("detach-timeout.sh", "sleep 30\n");
+        let started = Instant::now();
+        let run = run(
+            &mut command(&script),
+            &detach_limits(Duration::from_millis(200)),
+            &AtomicBool::new(false),
+        );
+        assert!(matches!(&run.end, End::TimedOut), "{:?}", run.end);
+        assert_eq!(run.group, GroupState::Terminated);
+        assert!(matches!(run.leader, Leader::Reaped(_)), "{:?}", run.leader);
+        assert!(started.elapsed() < Duration::from_secs(5));
+    }
+
+    #[test]
+    fn detach_still_terminates_on_cancel() {
+        let scripts = Scripts::new();
+        let script = scripts.write("detach-cancel.sh", "sleep 30 & wait\n");
+        let cancel = Arc::new(AtomicBool::new(false));
+        let child_cancel = Arc::clone(&cancel);
+        let started = Instant::now();
+        let runner = thread::spawn(move || {
+            run(
+                &mut command(&script),
+                &detach_limits(Duration::from_secs(10)),
+                &child_cancel,
+            )
+        });
+        thread::sleep(Duration::from_millis(100));
+        cancel.store(true, Ordering::Release);
+        let run = runner.join().unwrap();
+        assert!(matches!(&run.end, End::Cancelled), "{:?}", run.end);
+        assert_eq!(run.group, GroupState::Terminated);
+        assert!(!run.leader_exited_first);
+        assert!(started.elapsed() < Duration::from_secs(5));
     }
 
     #[test]
