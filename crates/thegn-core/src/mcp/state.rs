@@ -687,7 +687,7 @@ pub const STATE_TOOLS: &[StateToolSpec] = &[
         cap: "sessions.snapshot",
         description: "The current emulator screen of a live session (the wire mirror of \
                       `GET /v1/sessions/{s}/snapshot`): `{session, seq, cols, rows, \
-                      ansi_b64}`. Read-scoped; requires a running daemon. Requires a running daemon.",
+                      ansi_b64}`. Read-scoped; requires a running daemon.",
         args: &[ArgSpec {
             name: "session",
             kind: ArgKind::String,
