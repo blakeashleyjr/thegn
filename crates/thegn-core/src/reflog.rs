@@ -725,4 +725,142 @@ mod tests {
         // …and redo is spent.
         assert_eq!(plan_redo(&entries, &m), UndoPlan::Nothing);
     }
+
+    // --- truncation / mutation / shape tables (THE-383) ---
+
+    /// Subject holding tab, newline, a non-ASCII char and an embedded `\r`.
+    const HOSTILE: &str = "commit: tab\there\nnew line \u{e9}\rcr";
+
+    fn reflog_oid(n: usize) -> String {
+        format!("{n:040x}")
+    }
+
+    fn reflog_fields(n: usize) -> Vec<String> {
+        vec![
+            reflog_oid(n + 1),
+            format!("HEAD@{{{n}}}"),
+            format!("{}", 1_700_000_000 + n),
+            HOSTILE.to_string(),
+        ]
+    }
+
+    fn reflog_record(fields: &[String]) -> String {
+        let mut out = fields.join("\0");
+        out.push('\0');
+        out
+    }
+
+    fn reflog_records(count: usize) -> Vec<String> {
+        let mut records = Vec::new();
+        for n in 0..count {
+            records.push(reflog_record(&reflog_fields(n)));
+        }
+        records
+    }
+
+    fn reflog_with(index: usize, value: &str) -> String {
+        let mut fields = reflog_fields(1);
+        fields[index] = value.to_string();
+        reflog_record(&fields)
+    }
+
+    #[test]
+    fn reflog_truncation_table_every_byte_offset() {
+        let records = reflog_records(4);
+        let input: String = records.concat();
+        let mut bounds = vec![0usize];
+        let mut total = 0usize;
+        for record in &records {
+            total += record.len();
+            bounds.push(total);
+        }
+        for cut in 0..=input.len() {
+            if !input.is_char_boundary(cut) {
+                continue;
+            }
+            let parsed = parse_reflog(&input[..cut]);
+            match bounds.iter().position(|b| *b == cut) {
+                Some(count) => {
+                    let rows = parsed.unwrap_or_else(|e| panic!("cut {cut} must parse: {e}"));
+                    assert_eq!(rows.len(), count, "cut {cut}");
+                }
+                None => assert!(parsed.is_err(), "cut {cut} mid-record must be rejected"),
+            }
+        }
+    }
+
+    #[test]
+    fn reflog_hostile_subject_round_trips() {
+        let parsed = parse_reflog(&reflog_records(2).concat()).unwrap();
+        assert_eq!(parsed.len(), 2);
+        assert_eq!(parsed[1].raw, HOSTILE);
+        assert_eq!(parsed[1].action, ReflogAction::Commit);
+        assert_eq!(parsed[1].date, 1_700_000_001);
+    }
+
+    #[test]
+    fn reflog_mutation_table() {
+        let good = reflog_with(1, "HEAD@{1}");
+        let mut missing = reflog_fields(1);
+        missing.remove(2);
+        let mut five = reflog_fields(1);
+        five.push("extra".to_string());
+        let sha_msg = "object id must be 40 or 64 hexadecimal characters";
+        let ts_msg = "timestamp must contain decimal digits only";
+        let table = vec![
+            ("non-hex oid", reflog_with(0, &"z".repeat(40)), sha_msg),
+            ("39-char oid", reflog_with(0, &"a".repeat(39)), sha_msg),
+            ("41-char oid", reflog_with(0, &"a".repeat(41)), sha_msg),
+            ("empty oid", reflog_with(0, ""), sha_msg),
+            ("empty selector", reflog_with(1, ""), "selector is empty"),
+            ("empty timestamp", reflog_with(2, ""), ts_msg),
+            ("signed timestamp", reflog_with(2, "+5"), ts_msg),
+            ("negative timestamp", reflog_with(2, "-5"), ts_msg),
+            ("letters in timestamp", reflog_with(2, "12ab"), ts_msg),
+            (
+                "overflow timestamp",
+                reflog_with(2, "99999999999999999999"),
+                "invalid timestamp",
+            ),
+            (
+                "no final NUL",
+                good.trim_end_matches('\0').to_string(),
+                "missing final NUL",
+            ),
+            ("extra trailing NUL", format!("{good}\0"), "of 4 fields"),
+            ("doubled NUL", good.replacen('\0', "\0\0", 1), "of 4 fields"),
+            ("missing field", reflog_record(&missing), "of 4 fields"),
+            ("extra field", reflog_record(&five), "of 4 fields"),
+        ];
+        for (label, input, expect) in &table {
+            let error = parse_reflog(input).expect_err(label);
+            assert!(error.to_string().contains(expect), "{label}: {error}");
+        }
+    }
+
+    #[test]
+    fn reflog_duplicate_records_are_legal() {
+        let one = reflog_record(&reflog_fields(0));
+        let parsed = parse_reflog(&format!("{one}{one}")).unwrap();
+        assert_eq!(parsed.len(), 2);
+        assert_eq!(parsed[0], parsed[1]);
+    }
+
+    #[test]
+    fn reflog_sha256_oid_is_accepted() {
+        let parsed = parse_reflog(&reflog_with(0, &"b".repeat(64))).unwrap();
+        assert_eq!(parsed[0].sha.len(), 64);
+    }
+
+    #[test]
+    fn reflog_minimal_thousand_and_five_thousand() {
+        assert_eq!(parse_reflog(&reflog_records(1).concat()).unwrap().len(), 1);
+        assert_eq!(
+            parse_reflog(&reflog_records(1000).concat()).unwrap().len(),
+            1000
+        );
+        let parsed = parse_reflog(&reflog_records(5000).concat()).unwrap();
+        assert_eq!(parsed.len(), 5000);
+        assert_eq!(parsed[4999].selector, "HEAD@{4999}");
+    }
 }
