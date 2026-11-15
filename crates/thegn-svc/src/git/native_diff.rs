@@ -467,7 +467,7 @@ fn tree_of<'r>(repo: &'r gix::Repository, rev: &str) -> Result<gix::Tree<'r>> {
 /// Open the repo at `path` with status-safe filters and an object cache sized
 /// for repeated commit lookups — gix's `merge_base` docs call this out
 /// specifically, and the glyph scan calls it on every refresh.
-fn open(path: impl AsRef<std::path::Path>) -> Result<gix::Repository> {
+pub(super) fn open(path: impl AsRef<std::path::Path>) -> Result<gix::Repository> {
     let mut repo = discover_for_status(path)?;
     repo.object_cache_size_if_unset(4 * 1024 * 1024);
     Ok(repo)

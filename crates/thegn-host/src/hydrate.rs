@@ -261,6 +261,7 @@ pub(crate) fn merge_glyph_scan(
         (),
     >,
     submodule_dirty: std::result::Result<bool, ()>,
+    meta: std::result::Result<thegn_svc::git::BranchMeta, ()>,
 ) -> (GlyphRow, bool) {
     let mut clean = true;
     let dirty = match dirty {
@@ -312,6 +313,10 @@ pub(crate) fn merge_glyph_scan(
             prior.map(|p| p.submodule_dirty).unwrap_or(false)
         }
     };
+    let meta = match meta {
+        Ok(meta) => meta,
+        Err(()) => prior.map(|p| p.meta.clone()).unwrap_or_default(),
+    };
     (
         GlyphRow {
             dirty,
@@ -323,6 +328,7 @@ pub(crate) fn merge_glyph_scan(
             del,
             branch_diff,
             submodule_dirty,
+            meta,
         },
         clean,
     )
@@ -1991,6 +1997,7 @@ fn collect_sidebar_status(
                     reads.uncommitted.map_err(|_| ()),
                     reads.branch_diff.map_err(|_| ()),
                     reads.submodule_dirty.map_err(|_| ()),
+                    reads.meta.map_err(|_| ()),
                 );
                 (row, clean, dirty_known)
             });
@@ -2017,6 +2024,7 @@ fn collect_sidebar_status(
                     Err(()),
                     Err(()),
                     repo_root.to_string_lossy().into_owned(),
+                    Err(()),
                     Err(()),
                     Err(()),
                     Err(()),
@@ -2093,6 +2101,7 @@ fn collect_sidebar_status(
             del,
             branch_diff,
             submodule_dirty,
+            meta,
         } = row;
         // jj colocation is a repo-level property (a `.jj/` beside `.git/`); a
         // cheap stat on the glyph-scan cadence, never a `jj` subprocess.
@@ -2111,6 +2120,7 @@ fn collect_sidebar_status(
                 jj,
             },
         );
+        status.branch_meta.insert(path.clone(), meta);
         if let Ok(Some(agent)) = db.worktree_agent(&path)
             && app_cfg.tool_command(&agent).is_none()
         {
@@ -2153,6 +2163,7 @@ fn collect_sidebar_status(
     crate::glyph_refresh::seed_from_global_cache(
         &mut status.git,
         &mut status.branches,
+        &mut status.branch_meta,
         all_wt_paths.iter().cloned(),
     );
     // Rows the glyph scan / cache did not cover (dormant, gated, never

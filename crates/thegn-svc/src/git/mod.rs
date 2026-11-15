@@ -16,6 +16,7 @@ use thegn_core::remote::GitLoc;
 mod background_commit;
 mod bisect;
 mod branch;
+mod branch_meta;
 mod cherry;
 mod commit;
 mod custom;
@@ -34,6 +35,7 @@ pub(crate) use background_commit::run as run_background_commit_stdin;
 pub use background_commit::{BackgroundCommitFailure, BackgroundCommitTimeout};
 pub use bisect::BisectOps;
 pub use branch::{BranchOps, ForceMode};
+pub use branch_meta::{BranchMeta, META_COUNT_CAP, branch_meta_compute_count};
 pub use cherry::CherryOps;
 pub use commit::{CommitOps, ResetMode};
 pub use custom::{
@@ -348,6 +350,11 @@ pub fn parse_unified_hunks(diff: &str, max_lines: usize) -> Vec<Hunk> {
 /// Reads go native (gix) for local locs; writes and remote stay CLI.
 pub trait GitBackend: thegn_core::seam::Probe + Send + Sync {
     fn status(&self, loc: &GitLoc) -> Result<Vec<FileStatus>>;
+    fn dirty_and_count(&self, loc: &GitLoc, cap: u32) -> Result<(bool, Option<u32>)> {
+        let status = self.status(loc)?;
+        let count = branch_meta::dirty_count(status.len(), cap).unwrap_or_default();
+        Ok((count > 0, Some(count)))
+    }
     /// Whether the worktree has any local changes — staged, unstaged, or
     /// untracked — i.e. `git status --porcelain` non-emptiness. The boolean
     /// the sidebar's dirty glyph needs, without paying for the full file list.
@@ -2108,6 +2115,17 @@ fn bridged_glyph_reads(loc: &GitLoc, include_submodules: bool) -> Option<GlyphRe
         } else {
             None
         };
+        let meta_ahead_behind_range = base.as_ref().map(|base| format!("{base}...HEAD"));
+        let meta_ahead_behind_idx = meta_ahead_behind_range.as_ref().map(|range| {
+            let idx = specs.len();
+            specs.push(vec!["rev-list", "--left-right", "--count", range.as_str()]);
+            idx
+        });
+        let meta_log_idx = {
+            let idx = specs.len();
+            specs.push(vec!["log", "-1", "--format=%ct%x00%s", "HEAD"]);
+            idx
+        };
         let submodule_status_idx = include_submodules.then_some(specs.len());
         if include_submodules {
             specs.push(vec!["submodule", "status", "--recursive"]);
@@ -2119,11 +2137,6 @@ fn bridged_glyph_reads(loc: &GitLoc, include_submodules: bool) -> Option<GlyphRe
             .collect();
         match b.exec_batch(&cmds, &[]) {
             Ok(r) if r.len() == want => {
-                let dirty = if r[0].exit == 0 {
-                    parse_status_porcelain(&r[0].stdout).map(|status| !status.is_empty())
-                } else {
-                    Err(anyhow::anyhow!("git status failed: {}", r[0].stderr.trim()))
-                };
                 // A non-zero exit means "no upstream" — data, not an error.
                 let ahead_behind = Ok((r[1].exit == 0)
                     .then(|| parse_ahead_behind(&r[1].stdout))
@@ -2170,13 +2183,61 @@ fn bridged_glyph_reads(loc: &GitLoc, include_submodules: bool) -> Option<GlyphRe
                 } else {
                     Ok(false)
                 };
+                let status = if r[0].exit == 0 {
+                    parse_status_porcelain(&r[0].stdout)
+                } else {
+                    Err(anyhow::anyhow!("git status failed: {}", r[0].stderr.trim()))
+                };
+                let dirty_files = status
+                    .as_ref()
+                    .map(|status| {
+                        branch_meta::dirty_count(status.len(), branch_meta::META_COUNT_CAP)
+                    })
+                    .map_err(|error| anyhow::anyhow!("{error}"));
+                let meta = (|| -> Result<BranchMeta> {
+                    let detached = branch.as_ref().is_ok_and(|branch| branch == "HEAD");
+                    let meta_ahead_behind = if detached {
+                        None
+                    } else if let Some(idx) = meta_ahead_behind_idx {
+                        let result = r.get(idx).context("git rev-list metadata result missing")?;
+                        anyhow::ensure!(
+                            result.exit == 0,
+                            "git rev-list metadata failed: {}",
+                            result.stderr.trim()
+                        );
+                        Some(
+                            branch_meta::parse_ahead_behind(
+                                &result.stdout,
+                                branch_meta::META_COUNT_CAP,
+                            )
+                            .context("git rev-list metadata was malformed")?,
+                        )
+                    } else {
+                        None
+                    };
+                    let log_result = r
+                        .get(meta_log_idx)
+                        .context("git log metadata result missing")?;
+                    anyhow::ensure!(
+                        log_result.exit == 0,
+                        "git log metadata failed: {}",
+                        log_result.stderr.trim()
+                    );
+                    let log = branch_meta::parse_log_record(log_result.stdout.as_bytes())?;
+                    let dirty_files = dirty_files?;
+                    Ok(branch_meta::from_parts(meta_ahead_behind, log, dirty_files))
+                })();
                 return Some(GlyphReads {
-                    dirty,
+                    dirty: status
+                        .as_ref()
+                        .map(|status| !status.is_empty())
+                        .map_err(|error| anyhow::anyhow!("{error}")),
                     ahead_behind,
                     branch,
                     uncommitted,
                     branch_diff,
                     submodule_dirty,
+                    meta,
                 });
             }
             _ => {
@@ -2188,6 +2249,7 @@ fn bridged_glyph_reads(loc: &GitLoc, include_submodules: bool) -> Option<GlyphRe
                     uncommitted: Err(err()),
                     branch_diff: Err(err()),
                     submodule_dirty: Err(err()),
+                    meta: Err(err()),
                 });
             }
         }
@@ -2204,10 +2266,24 @@ fn local_glyph_reads(
     include_submodules: bool,
 ) -> GlyphReads {
     let base = glyph_base(loc);
+    let branch = git.current_branch(loc);
+    let dirty_and_count = git.dirty_and_count(loc, branch_meta::META_COUNT_CAP);
+    let detached = branch.as_ref().is_ok_and(|branch| branch == "HEAD");
+    let meta = branch_meta::with_dirty(
+        if loc.is_remote() || local_cli(loc) {
+            branch_meta::cli(loc, base.as_deref(), detached)
+        } else {
+            branch_meta::gix(loc, base.as_deref())
+        },
+        dirty_and_count
+            .as_ref()
+            .map(|(_, count)| *count)
+            .map_err(|error| anyhow::anyhow!("{error}")),
+    );
     GlyphReads {
-        dirty: git.is_dirty(loc),
+        dirty: dirty_and_count.map(|(dirty, _)| dirty),
         ahead_behind: git.ahead_behind(loc),
-        branch: git.current_branch(loc),
+        branch,
         uncommitted: if local_cli(loc) {
             run_status_bytes(
                 loc,
@@ -2294,6 +2370,7 @@ fn local_glyph_reads(
         } else {
             Ok(false)
         },
+        meta,
     }
 }
 
@@ -2351,10 +2428,19 @@ fn numstat_totals(loc: &GitLoc, spec: &str) -> Result<(DiffCount, DiffCount)> {
 /// two `--numstat` diffs served natively instead of by a subprocess each.
 fn gix_glyph_reads(git: &GixGit, loc: &GitLoc, include_submodules: bool) -> GlyphReads {
     let base = glyph_base(loc);
+    let branch = git.current_branch(loc);
+    let dirty_and_count = git.dirty_and_count(loc, branch_meta::META_COUNT_CAP);
+    let meta = branch_meta::with_dirty(
+        branch_meta::gix(loc, base.as_deref()),
+        dirty_and_count
+            .as_ref()
+            .map(|(_, count)| *count)
+            .map_err(|error| anyhow::anyhow!("{error}")),
+    );
     GlyphReads {
-        dirty: git.is_dirty(loc),
+        dirty: dirty_and_count.map(|(dirty, _)| dirty),
         ahead_behind: git.ahead_behind(loc),
-        branch: git.current_branch(loc),
+        branch,
         uncommitted: numstat_totals(loc, "HEAD"),
         branch_diff: match &base {
             Some(b) => numstat_totals(loc, &format!("{b}...HEAD")).map(Some),
@@ -2367,6 +2453,7 @@ fn gix_glyph_reads(git: &GixGit, loc: &GitLoc, include_submodules: bool) -> Glyp
         } else {
             Ok(false)
         },
+        meta,
     }
 }
 
@@ -2387,6 +2474,7 @@ pub struct GlyphReads {
     /// Whether any gitlink is moved, dirty, untracked, diverged, conflicted,
     /// unavailable, or uninitialized. This is independent of ordinary files.
     pub submodule_dirty: Result<bool>,
+    pub meta: Result<BranchMeta>,
 }
 
 /// The write-op runner: like [`run`] but with extra env, a null stdin, and
@@ -2823,6 +2911,43 @@ impl GitBackend for GixGit {
             // be an error, never a silent `false`.
             dirty_or_expired(found, interrupt.load(std::sync::atomic::Ordering::SeqCst))
         })
+    }
+
+    fn dirty_and_count(&self, loc: &GitLoc, cap: u32) -> Result<(bool, Option<u32>)> {
+        if loc.is_remote() {
+            return self.fallback.dirty_and_count(loc, cap);
+        }
+        let dirty = self.is_dirty(loc)?;
+        if !dirty {
+            return Ok((false, Some(0)));
+        }
+        let (repo, mut status_route) = native_diff::discover_for_routed_status(loc.path())?;
+        let status = read_budget::budgeted_status(&repo).context("gix status")?;
+        let count = with_read_deadline(git_read_timeout(), |interrupt| {
+            let iter = status
+                .should_interrupt_owned(interrupt.clone())
+                .into_iter(Vec::<gix::bstr::BString>::new())
+                .context("gix status iter")?;
+            let mut count = 0u32;
+            for item in iter {
+                let item = item.context("gix status item")?;
+                if status_route
+                    .as_mut()
+                    .map_or(Ok(true), |route| route.keep(&item))?
+                {
+                    count = count.saturating_add(1);
+                    if count >= cap {
+                        break;
+                    }
+                }
+            }
+            dirty_or_expired(
+                count > 0,
+                interrupt.load(std::sync::atomic::Ordering::SeqCst),
+            )
+            .map(|_| count.min(cap))
+        })?;
+        Ok((true, Some(count)))
     }
 
     fn current_branch(&self, loc: &GitLoc) -> Result<String> {

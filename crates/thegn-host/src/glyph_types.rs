@@ -4,7 +4,7 @@
 //! upgrades do not need a migration, but write a named record from now on.
 
 use serde::{Deserialize, Deserializer, Serialize};
-use thegn_svc::git::DiffCount;
+use thegn_svc::git::{BranchMeta, DiffCount};
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub(crate) struct GlyphRow {
@@ -21,6 +21,8 @@ pub(crate) struct GlyphRow {
     pub(crate) branch_diff: Option<(DiffCount, DiffCount)>,
     #[serde(default)]
     pub(crate) submodule_dirty: bool,
+    #[serde(default)]
+    pub(crate) meta: BranchMeta,
 }
 
 #[derive(Deserialize)]
@@ -38,6 +40,8 @@ struct NamedGlyphRow {
     branch_diff: Option<(DiffCount, DiffCount)>,
     #[serde(default)]
     submodule_dirty: bool,
+    #[serde(default)]
+    meta: BranchMeta,
 }
 
 mod count_serde {
@@ -147,6 +151,7 @@ impl From<NamedGlyphRow> for GlyphRow {
             del: row.del,
             branch_diff: row.branch_diff,
             submodule_dirty: row.submodule_dirty,
+            meta: row.meta,
         }
     }
 }
@@ -197,6 +202,7 @@ impl<'de> Deserialize<'de> for GlyphRow {
                     // Legacy arrays predate this field and therefore mean
                     // "not observed", not a fabricated dirty result.
                     submodule_dirty: false,
+                    meta: BranchMeta::default(),
                 })
             }
             _ => Err(serde::de::Error::custom(
@@ -221,6 +227,7 @@ mod tests {
             del,
             branch_diff: Some((DiffCount::Binary, DiffCount::Capped)),
             submodule_dirty: false,
+            meta: BranchMeta::default(),
         }
     }
 
@@ -249,6 +256,7 @@ mod tests {
             legacy.branch_diff,
             Some((DiffCount::Exact(310), DiffCount::Exact(84)))
         );
+        assert_eq!(legacy.meta, BranchMeta::default());
 
         let old_named: GlyphRow = serde_json::from_str(
             r#"{"dirty":true,"ahead":1,"behind":2,"branch":"feat","repo_root":"/repo","add":42,"del":7,"branch_diff":[310,84]}"#,
@@ -256,6 +264,27 @@ mod tests {
         .unwrap();
         assert_eq!(old_named.add, DiffCount::Exact(42));
         assert_eq!(old_named.del, DiffCount::Exact(7));
+        assert_eq!(old_named.meta, BranchMeta::default());
+    }
+
+    #[test]
+    fn meta_roundtrips() {
+        let mut row = row(DiffCount::Exact(1), DiffCount::Exact(2));
+        row.meta = BranchMeta {
+            ahead_base: Some(3),
+            behind_base: Some(1),
+            dirty_files: Some(4),
+            last_commit_unix: Some(42),
+            last_subject: Some("subject".into()),
+        };
+        let encoded = serde_json::to_value(&row).unwrap();
+        assert_eq!(serde_json::from_value::<GlyphRow>(encoded).unwrap(), row);
+    }
+
+    #[test]
+    fn legacy_row_without_meta_decodes_with_default_meta() {
+        let row: GlyphRow = serde_json::from_str(r#"[false,0,0,null,"/repo",0,0,null]"#).unwrap();
+        assert_eq!(row.meta, BranchMeta::default());
     }
 
     #[test]

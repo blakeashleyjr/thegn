@@ -11,7 +11,7 @@
 use std::collections::HashSet;
 
 use crate::session::Session;
-use thegn_svc::git::DiffCount;
+use thegn_svc::git::{BranchMeta, DiffCount};
 
 /// Which level of the tree a row sits at.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -228,6 +228,7 @@ pub struct SidebarRow {
     /// The worktree's branch (Worktree rows) — the seed for the rename prompt
     /// and the base of the "branch from this" action.
     pub branch: Option<String>,
+    pub branch_meta: Option<BranchMeta>,
     pub git: Option<GitGlyphs>,
     pub sandbox_backend: Option<String>,
     /// Selected execution environment (`[env.<name>]`); `None`/`"default"` ⇒
@@ -322,6 +323,7 @@ impl SidebarRow {
             worktree_path: None,
             pin_key: String::new(),
             branch: None,
+            branch_meta: None,
             git: None,
             sandbox_backend: None,
             env_name: None,
@@ -392,6 +394,7 @@ impl SidebarRow {
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct SidebarStatus {
     pub git: std::collections::BTreeMap<String, GitGlyphs>,
+    pub branch_meta: std::collections::BTreeMap<String, BranchMeta>,
     /// The worktree's LIVE `HEAD` branch, keyed by path — read by the same git
     /// scan that produces `git`. The row's `{slug}/{branch}` tab name is only a
     /// creation-time identity (it never moves when you `git checkout` inside the
@@ -1695,6 +1698,10 @@ fn worktree_row(
         .as_deref()
         .and_then(|p| status.branches.get(p))
         .cloned();
+    let branch_meta = wt_path
+        .as_deref()
+        .and_then(|p| status.branch_meta.get(p))
+        .cloned();
     let devcontainer_status = wt_path
         .as_deref()
         .and_then(|p| status.devcontainer_status.get(p))
@@ -1705,6 +1712,7 @@ fn worktree_row(
         worktree_path: wt_path,
         pin_key,
         branch: Some(live_branch.unwrap_or_else(|| gr.label.clone())),
+        branch_meta,
         git,
         sandbox_backend: gr.sandbox_backend.clone(),
         env_name: gr.env_name.clone(),
@@ -2209,7 +2217,7 @@ mod tests {
     }
 
     #[test]
-    fn worktree_rows_carry_the_live_branch_not_the_tab_name() {
+    fn worktree_row_carries_branch_meta() {
         let s = session(vec![tab("app/tg-old", "/wt/a")], 0);
         let ws = vec![(
             "app".to_string(),
@@ -2221,6 +2229,13 @@ mod tests {
         status
             .branches
             .insert("/wt/a".into(), "tg/checked-out-later".into());
+        status.branch_meta.insert(
+            "/wt/a".into(),
+            BranchMeta {
+                ahead_base: Some(5),
+                ..BranchMeta::default()
+            },
+        );
         let rows = build_rows(&s, &ws, &ViewState::default(), &status, &[], &[], &[]);
         let row = rows
             .iter()
@@ -2231,6 +2246,10 @@ mod tests {
         // the `== "home"` checks all key off it.
         assert_eq!(row.label, "tg-old");
         assert_eq!(row.pin_key, "app/tg-old");
+        assert_eq!(
+            row.branch_meta.as_ref().and_then(|meta| meta.ahead_base),
+            Some(5)
+        );
     }
 
     #[test]
