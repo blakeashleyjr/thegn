@@ -1035,6 +1035,34 @@ fn previously_clamped_values_clamp_with_a_named_warning() {
     assert_eq!(admitted.config().metrics.timeout_ms, 100);
 }
 
+/// THE-428: an out-of-range float display setting used to load; it must keep
+/// loading (startup is never refused) and carry a warning naming key and value.
+#[test]
+fn out_of_range_usage_percent_is_admitted_with_a_warning() {
+    let env = TestEnv::default();
+    let host_snapshot = hosts();
+    let admitted = admit(AdmissionInputs {
+        defaults: Config::default(),
+        base: SourceInput::bytes("base", false, b"[usage]\nwarn_percent = 101\n"),
+        profile: None,
+        env: &env,
+        overrides: &[],
+        hosts: &host_snapshot,
+        paths: &path_context(),
+    })
+    .unwrap_or_else(|error| panic!("usage.warn_percent = 101 must be admitted: {error}"));
+    assert_eq!(admitted.config().usage.warn_percent, 101.0);
+    assert!(
+        admitted.trace().diagnostics().iter().any(|d| {
+            d.severity == DiagnosticSeverity::Warning
+                && d.message.starts_with("usage.warn_percent = 101")
+                && d.message.contains("0..=100")
+        }),
+        "{:?}",
+        admitted.trace().diagnostics()
+    );
+}
+
 /// A selected profile whose overlay file does not exist is an empty layer
 /// (nothing creates one); an explicit missing source stays an error.
 #[test]
