@@ -1,11 +1,13 @@
 //! Metrics scraper supervisor — runs off-thread, scrapes Prometheus endpoints,
-//! and sends updates to the TUI via mpsc channel.
+//! and publishes the latest state to the TUI through a latest-value
+//! [`SnapshotSlot`] (whole-state replace, so only the newest scrape matters).
 
 use std::io::Read;
 use std::time::{Duration, Instant};
 
-use tokio::sync::mpsc;
+use std::sync::{Arc, Weak};
 
+use crate::snapshot_slot::{PublishOutcome, SnapshotSlot};
 use thegn_core::config::MetricsConfig;
 use thegn_core::metrics::{MetricSample, filter_samples, parse_metrics};
 
@@ -63,29 +65,129 @@ pub fn format_sample_value(value: f64) -> String {
     }
 }
 
+/// Byte cap for the latest-value metrics slot. Generous: a handful of targets
+/// with allowlisted samples is a few KiB.
+const METRICS_SLOT_MAX_BYTES: usize = 256 * 1024;
+
+/// The loop's end of the metrics slot. Dropping it (the loop ending) is what
+/// stops the supervisor: the outbox sees its consumer token die.
+pub(crate) struct MetricsInbox {
+    slot: SnapshotSlot<MetricsState>,
+    _consumer: Arc<()>,
+}
+
+impl MetricsInbox {
+    /// Take the newest unconsumed state, if any.
+    pub(crate) fn take(&self) -> Option<(u64, MetricsState)> {
+        self.slot.take()
+    }
+}
+
+/// The supervisor's end of the metrics slot: publishes with a per-scrape
+/// generation and knows when the consumer has gone away.
+pub(crate) struct MetricsOutbox {
+    slot: SnapshotSlot<MetricsState>,
+    consumer: Weak<()>,
+    generation: u64,
+}
+
+impl MetricsOutbox {
+    fn consumer_gone(&self) -> bool {
+        self.consumer.strong_count() == 0
+    }
+
+    /// Publish one scrape; `None` when the consumer is gone (stop scraping).
+    fn publish(&mut self, state: &MetricsState) -> Option<PublishOutcome> {
+        if self.consumer_gone() {
+            return None;
+        }
+        Some(publish_metrics(&self.slot, &mut self.generation, state))
+    }
+}
+
+/// Build the metrics slot pair. `wake` runs once per empty-to-full change, so
+/// the supervisor never pulses the loop for a value the loop has not taken.
+pub(crate) fn metrics_slot(
+    wake: impl Fn() + Send + Sync + 'static,
+) -> (MetricsOutbox, MetricsInbox) {
+    let slot = SnapshotSlot::with_waker(METRICS_SLOT_MAX_BYTES, wake);
+    let consumer = Arc::new(());
+    (
+        MetricsOutbox {
+            slot: slot.clone(),
+            consumer: Arc::downgrade(&consumer),
+            generation: 0,
+        },
+        MetricsInbox {
+            slot,
+            _consumer: consumer,
+        },
+    )
+}
+
+/// Publish one scrape under the next generation. Latest-wins: an unconsumed
+/// earlier scrape is replaced, never queued.
+fn publish_metrics(
+    slot: &SnapshotSlot<MetricsState>,
+    generation: &mut u64,
+    state: &MetricsState,
+) -> PublishOutcome {
+    *generation = generation.saturating_add(1);
+    let bytes = metrics_state_bytes(state);
+    let outcome = slot.publish(*generation, state.clone(), bytes);
+    if outcome == PublishOutcome::TooLarge {
+        tracing::debug!(
+            target: "thegn::metrics",
+            bytes,
+            "metrics state over the slot cap; keeping the last value"
+        );
+    }
+    outcome
+}
+
+/// Approximate retained size of a metrics state for the slot's byte cap.
+fn metrics_state_bytes(state: &MetricsState) -> usize {
+    std::mem::size_of_val(state)
+        + state
+            .targets
+            .iter()
+            .map(|target| {
+                std::mem::size_of_val(target)
+                    + target.name.len()
+                    + target.url.len()
+                    + target.error.as_ref().map_or(0, String::len)
+                    + target
+                        .samples
+                        .iter()
+                        .map(|sample| {
+                            std::mem::size_of_val(sample)
+                                + sample.name.len()
+                                + sample
+                                    .labels
+                                    .iter()
+                                    .map(|(k, v)| k.len() + v.len())
+                                    .sum::<usize>()
+                        })
+                        .sum::<usize>()
+            })
+            .sum::<usize>()
+}
+
 /// Spawn the metrics supervisor. It owns a plain OS thread so HTTP and sleeping
 /// never touch the render/event loop and do not require an event-loop timeout.
-pub fn spawn_metrics_supervisor(
-    config: MetricsConfig,
-    tx: mpsc::UnboundedSender<MetricsState>,
-    waker: termwiz::terminal::TerminalWaker,
-) {
+pub(crate) fn spawn_metrics_supervisor(config: MetricsConfig, outbox: MetricsOutbox) {
     if config.targets.is_empty() {
         return;
     }
 
     // best-effort: supervisor thread: a failed spawn just disables metrics this session
     thegn_core::thread_name::try_spawn_named("thegn-metrics", move || {
-        run_supervisor(config, tx, waker)
+        run_supervisor(config, outbox)
     })
     .ok();
 }
 
-fn run_supervisor(
-    config: MetricsConfig,
-    tx: mpsc::UnboundedSender<MetricsState>,
-    waker: termwiz::terminal::TerminalWaker,
-) {
+fn run_supervisor(config: MetricsConfig, mut outbox: MetricsOutbox) {
     // Housekeeping: a sampler that sleeps between blocking HTTP scrapes and
     // that nothing ever waits on — it must not compete for a P-core.
     crate::platform::qos::set_self(crate::platform::qos::Qos::Background);
@@ -110,14 +212,15 @@ fn run_supervisor(
             .collect(),
     };
 
-    let _ = tx.send(state.clone()); // best-effort: send: the consumer may be gone; a closed channel is the consumer going away
-    let _ = waker.wake(); // best-effort: waker pulse: an input nudge must never fail the calling path
+    if outbox.publish(&state).is_none() {
+        return; // consumer gone (session ended) before the first scrape
+    }
 
     loop {
         let now = Instant::now();
         for (i, target_cfg) in config.targets.iter().enumerate() {
-            if tx.is_closed() {
-                return; // receiver gone (session ended): stop promptly
+            if outbox.consumer_gone() {
+                return; // consumer gone (session ended): stop promptly
             }
             let result = {
                 let _g = crate::perf::measure(crate::perf::Subsys::Metrics);
@@ -159,10 +262,10 @@ fn run_supervisor(
             }
         }
 
-        if tx.send(state.clone()).is_err() {
-            return; // receiver gone (session ended): stop the supervisor
+        // The slot owns the empty-to-full wake; no explicit pulse here.
+        if outbox.publish(&state).is_none() {
+            return; // consumer gone (session ended): stop the supervisor
         }
-        let _ = waker.wake(); // best-effort: waker pulse: an input nudge must never fail the calling path
         std::thread::sleep(interval);
     }
 }
@@ -222,6 +325,76 @@ fn collect_command(argv: &[String], timeout: Duration, max_bytes: usize) -> Resu
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn publish_metrics_bumps_generation_and_replaces_unconsumed_state() {
+        let wakes = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counted = std::sync::Arc::clone(&wakes);
+        let (mut outbox, inbox) = metrics_slot(move || {
+            counted.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        });
+        let first = MetricsState::default();
+        let latest = MetricsState {
+            targets: vec![MetricTargetState {
+                name: "svc".into(),
+                url: "http://127.0.0.1:1/metrics".into(),
+                samples: Vec::new(),
+                health: MetricHealth::Up,
+                last_ok: None,
+                error: None,
+            }],
+        };
+        assert_eq!(
+            publish_metrics(&outbox.slot, &mut outbox.generation, &first),
+            PublishOutcome::Stored
+        );
+        assert_eq!(outbox.generation, 1);
+        assert_eq!(
+            publish_metrics(&outbox.slot, &mut outbox.generation, &latest),
+            PublishOutcome::Replaced
+        );
+        assert_eq!(outbox.generation, 2);
+        // Two publishes, no take: one wake, exactly one (the newest) value.
+        assert_eq!(wakes.load(std::sync::atomic::Ordering::Relaxed), 1);
+        let (taken_generation, state) = inbox.take().expect("latest metrics state");
+        assert_eq!(taken_generation, 2);
+        assert_eq!(state, latest);
+        assert!(inbox.take().is_none());
+        // The next scrape after a take refills the slot with a fresh wake.
+        assert_eq!(outbox.publish(&first), Some(PublishOutcome::Stored));
+        assert_eq!(outbox.generation, 3);
+        assert_eq!(wakes.load(std::sync::atomic::Ordering::Relaxed), 2);
+    }
+
+    #[test]
+    fn metrics_outbox_stops_once_the_inbox_is_dropped() {
+        let (mut outbox, inbox) = metrics_slot(|| {});
+        assert!(!outbox.consumer_gone());
+        drop(inbox);
+        assert!(outbox.consumer_gone());
+        assert_eq!(outbox.publish(&MetricsState::default()), None);
+    }
+
+    #[test]
+    fn metrics_state_bytes_grows_with_samples() {
+        let empty = MetricsState::default();
+        let one = MetricsState {
+            targets: vec![MetricTargetState {
+                name: "svc".into(),
+                url: "u".into(),
+                samples: vec![thegn_core::metrics::MetricSample {
+                    name: "requests".into(),
+                    value: 1.0,
+                    labels: [("k".to_owned(), "v".to_owned())].into_iter().collect(),
+                }],
+                health: MetricHealth::Up,
+                last_ok: None,
+                error: None,
+            }],
+        };
+        assert!(metrics_state_bytes(&one) > metrics_state_bytes(&empty));
+        assert!(metrics_state_bytes(&one) < METRICS_SLOT_MAX_BYTES);
+    }
 
     #[test]
     fn metrics_state_equality_tracks_sample_values() {
