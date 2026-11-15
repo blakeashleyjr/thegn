@@ -2,18 +2,20 @@
 
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use thegn_core::config::DetailField;
+use thegn_core::config::{DetailEntry, DetailField};
 use thegn_core::pipeline_report::display_cell;
+use thegn_core::plugin_api::{RowFieldSlot, RowRole};
 use thegn_core::theme;
 use thegn_svc::git::{DiffCount, META_COUNT_CAP};
 
 use crate::chrome::S;
 use crate::seg::{Line, Seg, Tok, seg, seg_width, sp};
-use crate::sidebar::{RowKind, SidebarRow};
+use crate::sidebar::{PluginFieldValue, RowKind, SidebarRow};
 use crate::sidebar_view::SidebarDisplay;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum FieldId {
+    Plugin,
     Branch,
     Commits,
     Dirty,
@@ -139,7 +141,40 @@ fn detail_fields(row: &SidebarRow, disp: &SidebarDisplay, now_unix: i64) -> Vec<
 
     disp.detail_fields
         .iter()
-        .flat_map(|requested| requested_fields(row, disp, *requested, branch, now_unix))
+        .flat_map(|requested| match requested {
+            DetailEntry::Builtin(field) => requested_fields(row, disp, *field, branch, now_unix),
+            DetailEntry::Plugin { plugin, field } => plugin_fields(row, plugin, field),
+        })
+        .collect()
+}
+
+pub(crate) fn plugin_role(role: RowRole) -> Tok {
+    match role {
+        RowRole::Accent => Tok::Slot(S::Accent),
+        RowRole::Dim => Tok::Slot(S::Dim),
+        RowRole::Good => Tok::Hue(theme::Hue::Green),
+        RowRole::Warn => Tok::Hue(theme::Hue::Amber),
+        RowRole::Bad => Tok::Hue(theme::Hue::Red),
+        RowRole::Unknown => Tok::Slot(S::Dim),
+    }
+}
+
+fn plugin_fields(row: &SidebarRow, plugin: &str, field: &str) -> Vec<Field> {
+    row.plugin_fields
+        .iter()
+        .filter(|value| {
+            value.plugin == plugin
+                && value.field == field
+                && value.slot == RowFieldSlot::Detail
+                && !display_cell(&value.text).is_empty()
+        })
+        .map(|value: &PluginFieldValue| {
+            Field::new(
+                FieldId::Plugin,
+                vec![seg(plugin_role(value.role), display_cell(&value.text))],
+                1,
+            )
+        })
         .collect()
 }
 
@@ -512,6 +547,7 @@ pub(crate) fn fit_fields(mut fields: Vec<Field>, budget: usize) -> Vec<Field> {
     }
 
     let drop_order = [
+        FieldId::Plugin,
         FieldId::Activity,
         FieldId::Stage,
         FieldId::Upstream,
@@ -621,6 +657,10 @@ mod tests {
         row
     }
 
+    fn builtin(field: DetailField) -> thegn_core::config::DetailEntry {
+        thegn_core::config::DetailEntry::Builtin(field)
+    }
+
     #[test]
     fn fmt_age_buckets() {
         assert_eq!(fmt_age(0), "<1m");
@@ -654,7 +694,7 @@ mod tests {
             ..crate::sidebar::GitGlyphs::default()
         });
         let display = SidebarDisplay {
-            detail_fields: vec![DetailField::Dirty],
+            detail_fields: vec![builtin(DetailField::Dirty)],
             ..SidebarDisplay::default()
         };
         let line = compose_detail_line_at(&row, &display, 2_000, 0, 80).unwrap();
@@ -673,7 +713,7 @@ mod tests {
         row.env_name = Some("host".into());
         row.env_degraded = true;
         let display = SidebarDisplay {
-            detail_fields: vec![DetailField::Env],
+            detail_fields: vec![builtin(DetailField::Env)],
             ..SidebarDisplay::default()
         };
         let line = compose_detail_line_at(&row, &display, 2_000, 0, 80).unwrap();
@@ -724,17 +764,17 @@ mod tests {
         row.disk_bytes = Some(10_000);
         let display = SidebarDisplay {
             detail_fields: vec![
-                DetailField::Upstream,
-                DetailField::Stage,
-                DetailField::Activity,
-                DetailField::Env,
-                DetailField::Sandbox,
-                DetailField::Devcontainer,
-                DetailField::Hibernated,
-                DetailField::Mq,
-                DetailField::Unread,
-                DetailField::Disk,
-                DetailField::Author,
+                builtin(DetailField::Upstream),
+                builtin(DetailField::Stage),
+                builtin(DetailField::Activity),
+                builtin(DetailField::Env),
+                builtin(DetailField::Sandbox),
+                builtin(DetailField::Devcontainer),
+                builtin(DetailField::Hibernated),
+                builtin(DetailField::Mq),
+                builtin(DetailField::Unread),
+                builtin(DetailField::Disk),
+                builtin(DetailField::Author),
             ],
             ..SidebarDisplay::default()
         };
@@ -782,7 +822,7 @@ mod tests {
         row.env_name = Some("dev".into());
         row.disk_bytes = Some(10_000);
         let display = SidebarDisplay {
-            detail_fields: vec![DetailField::Env, DetailField::Branch],
+            detail_fields: vec![builtin(DetailField::Env), builtin(DetailField::Branch)],
             ..SidebarDisplay::default()
         };
         let line = compose_detail_line_at(&row, &display, 2_000, 0, 80).unwrap();
@@ -796,7 +836,7 @@ mod tests {
         assert!(text.find("dev").unwrap() < text.find("feature/retry").unwrap());
 
         let display = SidebarDisplay {
-            detail_fields: vec![DetailField::Branch],
+            detail_fields: vec![builtin(DetailField::Branch)],
             ..SidebarDisplay::default()
         };
         let line = compose_detail_line_at(&row, &display, 2_000, 0, 80).unwrap();
@@ -818,7 +858,7 @@ mod tests {
             ..crate::sidebar::GitGlyphs::default()
         });
         let display = SidebarDisplay {
-            detail_fields: vec![DetailField::BranchStat],
+            detail_fields: vec![builtin(DetailField::BranchStat)],
             detail_branch_stat: false,
             ..SidebarDisplay::default()
         };
@@ -879,7 +919,7 @@ mod tests {
     fn detail_fields_order_is_respected() {
         let row = row();
         let display = SidebarDisplay {
-            detail_fields: vec![DetailField::Subject, DetailField::Branch],
+            detail_fields: vec![builtin(DetailField::Subject), builtin(DetailField::Branch)],
             ..SidebarDisplay::default()
         };
         let line = compose_detail_line_at(&row, &display, 2_000, 0, 80).unwrap();
@@ -898,7 +938,7 @@ mod tests {
         let mut row = row();
         row.pr_number = Some(42);
         let display = SidebarDisplay {
-            detail_fields: vec![DetailField::Pr],
+            detail_fields: vec![builtin(DetailField::Pr)],
             detail_pr: false,
             ..SidebarDisplay::default()
         };
@@ -923,7 +963,7 @@ mod tests {
         let mut row = row();
         row.branch_meta.as_mut().unwrap().last_subject = Some("你好世界 retry".into());
         let display = SidebarDisplay {
-            detail_fields: vec![DetailField::Subject],
+            detail_fields: vec![builtin(DetailField::Subject)],
             ..SidebarDisplay::default()
         };
         let line = compose_detail_line_at(&row, &display, 2_000, 0, 8).unwrap();
@@ -939,5 +979,102 @@ mod tests {
             "{text:?}"
         );
         assert!(seg_width(&segs) <= 8);
+    }
+
+    #[test]
+    fn plugin_detail_field_renders_in_configured_position() {
+        let mut row = row();
+        row.plugin_fields.push(PluginFieldValue {
+            plugin: "ci".into(),
+            field: "check".into(),
+            text: "ready".into(),
+            role: RowRole::Good,
+            slot: RowFieldSlot::Detail,
+        });
+        let display = SidebarDisplay {
+            detail_fields: vec![
+                DetailEntry::Plugin {
+                    plugin: "ci".into(),
+                    field: "check".into(),
+                },
+                builtin(DetailField::Branch),
+            ],
+            ..SidebarDisplay::default()
+        };
+        let line = compose_detail_line_at(&row, &display, 2_000, 0, 80).unwrap();
+        let Line::Segs(segs) = line else {
+            panic!("detail line is a segment line")
+        };
+        let text = segs
+            .iter()
+            .map(|segment| segment.text.as_str())
+            .collect::<String>();
+        assert!(text.find("ready").unwrap() < text.find("feature/retry").unwrap());
+    }
+
+    #[test]
+    fn plugin_detail_fields_drop_before_subject_at_narrow_width() {
+        let mut row = row();
+        row.plugin_fields.push(PluginFieldValue {
+            plugin: "ci".into(),
+            field: "check".into(),
+            text: "ready".into(),
+            role: RowRole::Dim,
+            slot: RowFieldSlot::Detail,
+        });
+        let display = SidebarDisplay {
+            detail_fields: vec![
+                DetailEntry::Plugin {
+                    plugin: "ci".into(),
+                    field: "check".into(),
+                },
+                builtin(DetailField::Subject),
+                builtin(DetailField::Branch),
+            ],
+            ..SidebarDisplay::default()
+        };
+        let fitted = fit_fields(detail_fields(&row, &display, 2_000), 20);
+        assert!(!fitted.iter().any(|field| field.id == FieldId::Plugin));
+        assert!(fitted.iter().any(|field| field.id == FieldId::Branch));
+    }
+
+    #[test]
+    fn plugin_detail_defensively_sanitises_text_and_absent_values_do_not_shift() {
+        let mut row = row();
+        row.plugin_fields.push(PluginFieldValue {
+            plugin: "ci".into(),
+            field: "check".into(),
+            text: "ok\u{1b}[31m\nnow".into(),
+            role: RowRole::Unknown,
+            slot: RowFieldSlot::Detail,
+        });
+        let display = SidebarDisplay {
+            detail_fields: vec![
+                DetailEntry::Plugin {
+                    plugin: "missing".into(),
+                    field: "badge".into(),
+                },
+                DetailEntry::Plugin {
+                    plugin: "ci".into(),
+                    field: "check".into(),
+                },
+                builtin(DetailField::Branch),
+            ],
+            ..SidebarDisplay::default()
+        };
+        let line = compose_detail_line_at(&row, &display, 2_000, 0, 80).unwrap();
+        let Line::Segs(segs) = line else {
+            panic!("detail line is a segment line")
+        };
+        assert!(
+            segs.iter()
+                .all(|segment| !segment.text.chars().any(char::is_control))
+        );
+        assert!(segs.iter().any(|segment| segment.text.contains("ok")));
+        assert!(segs.iter().any(|segment| segment.fg == Tok::Slot(S::Dim)));
+        assert!(
+            segs.iter()
+                .any(|segment| segment.text.contains("feature/retry"))
+        );
     }
 }
