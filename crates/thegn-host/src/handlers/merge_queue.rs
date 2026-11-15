@@ -364,8 +364,27 @@ pub(crate) fn drain_fold_results(rx: &mut FoldRx, ctx: &mut DrainCtx) {
 /// Drain drive messages: patch the panel row in place (live repaint, no wait
 /// for the model tick), toast the settled transitions, and route them to the
 /// notification inbox.
-pub(crate) fn drain_drive_msgs(rx: &mut DriveRx, ctx: &mut DrainCtx) {
-    while let Ok(msg) = rx.try_recv() {
+///
+/// Budgeted per drain (THE-657): at most [`MERGE_DRIVE_SOURCE`]'s 64 messages
+/// or the iteration deadline, whichever comes first, with at least one message
+/// always taken. Nothing is dropped or reordered; what is left stays queued and
+/// the returned `more_pending` tells the loop to re-arm one wake.
+///
+/// [`MERGE_DRIVE_SOURCE`]: crate::ingress_budget::MERGE_DRIVE_SOURCE
+pub(crate) fn drain_drive_msgs(
+    rx: &mut DriveRx,
+    ctx: &mut DrainCtx,
+    budget: &mut crate::ingress_budget::IterationBudget,
+    rotation: &mut usize,
+) -> bool {
+    let (batch, more_pending) = crate::ingress_budget::take_batch(
+        rx,
+        crate::ingress_budget::MERGE_DRIVE_SOURCE,
+        budget,
+        rotation,
+        Instant::now,
+    );
+    for msg in batch {
         ctx.loop_perf.tick(crate::perf::WakeSource::Fold);
         let now = std::time::Instant::now();
         match msg {
@@ -532,6 +551,7 @@ pub(crate) fn drain_drive_msgs(rx: &mut DriveRx, ctx: &mut DrainCtx) {
         }
         *ctx.dirty = true;
     }
+    more_pending
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1982,7 +2002,7 @@ mod tests {
         let (tx, mut rx) = tokio_mpsc::unbounded_channel();
         let note = "Skipped main — that's the target branch".to_string();
         tx.send(DriveMsg::Note(note.clone())).unwrap();
-        drain_drive_msgs(
+        assert!(!drain_drive_msgs(
             &mut rx,
             &mut DrainCtx {
                 model: &mut model,
@@ -1996,7 +2016,9 @@ mod tests {
                 session: &session,
                 waker: &waker,
             },
-        );
+            &mut fresh_budget(),
+            &mut 0usize,
+        ));
         assert_eq!(model.status, note);
     }
 
@@ -2025,7 +2047,7 @@ mod tests {
             let mut loop_perf = crate::perf::LoopPerf::new();
             let (tx, mut rx) = tokio_mpsc::unbounded_channel();
             tx.send(message).unwrap();
-            drain_drive_msgs(
+            assert!(!drain_drive_msgs(
                 &mut rx,
                 &mut DrainCtx {
                     model: &mut model,
@@ -2039,7 +2061,9 @@ mod tests {
                     session: &session,
                     waker: &waker,
                 },
-            );
+                &mut fresh_budget(),
+                &mut 0usize,
+            ));
             model.status
         };
 
@@ -2049,6 +2073,150 @@ mod tests {
             status_after(DriveMsg::Done(outcome.clone())),
             drive_summary(&outcome).0
         );
+    }
+
+    /// A real-clock budget with the loop's deadline, as `run.rs` builds one.
+    fn fresh_budget() -> crate::ingress_budget::IterationBudget {
+        crate::ingress_budget::IterationBudget::new(
+            Instant::now(),
+            crate::ingress_budget::LOOP_DEADLINE,
+            false,
+        )
+    }
+
+    /// A budget whose deadline cannot expire mid-test, so the message cap is
+    /// the only bound being measured.
+    fn roomy_budget() -> crate::ingress_budget::IterationBudget {
+        crate::ingress_budget::IterationBudget::new(
+            Instant::now(),
+            std::time::Duration::from_secs(3600),
+            false,
+        )
+    }
+
+    /// Run `f` against a throwaway drain context (the waker needs a pty, so
+    /// this is a no-op where the test support has none).
+    fn with_drive_ctx(f: impl FnOnce(&mut DrainCtx<'_>)) {
+        if !crate::platform::sound_process::test_support::UNIX {
+            return;
+        }
+        let (waker, _master, _terminal) =
+            crate::platform::sound_process::test_support::test_waker();
+        let cfg = Config::default();
+        let notify = crate::notify::NotifyState::new(
+            cfg.notifications.clone(),
+            String::new(),
+            waker.clone(),
+        );
+        let event_bus = thegn_core::event_bus::EventBus::new();
+        let session = crate::session::Session::default();
+        let mut model = crate::chrome::FrameModel::default();
+        let mut toasts = Toasts::default();
+        let mut fold_inflight = false;
+        let mut want_model_refresh = false;
+        let mut dirty = false;
+        let mut loop_perf = crate::perf::LoopPerf::new();
+        f(&mut DrainCtx {
+            model: &mut model,
+            toasts: &mut toasts,
+            notify_state: &notify,
+            event_bus: &event_bus,
+            fold_inflight: &mut fold_inflight,
+            want_model_refresh: &mut want_model_refresh,
+            dirty: &mut dirty,
+            loop_perf: &mut loop_perf,
+            session: &session,
+            waker: &waker,
+        });
+    }
+
+    #[test]
+    fn drive_drain_is_bounded_per_call_and_lossless_in_order() {
+        with_drive_ctx(|ctx| {
+            let cap = crate::ingress_budget::MERGE_DRIVE_SOURCE.limits.max_msgs;
+            assert_eq!(cap, 64);
+            let total = 200usize;
+            let (tx, mut rx) = tokio_mpsc::unbounded_channel();
+            for i in 0..total {
+                assert!(tx.send(DriveMsg::Note(format!("note {i}"))).is_ok());
+            }
+            let mut rotation = 0usize;
+
+            // One call applies exactly the cap and reports more pending.
+            assert!(drain_drive_msgs(
+                &mut rx,
+                ctx,
+                &mut roomy_budget(),
+                &mut rotation
+            ));
+            assert_eq!(rx.len(), total - cap);
+            assert_eq!(ctx.model.status, format!("note {}", cap - 1));
+            assert!(*ctx.dirty);
+
+            // Later calls drain the rest in order, nothing dropped.
+            let mut applied = cap;
+            loop {
+                let before = rx.len();
+                let more = drain_drive_msgs(&mut rx, ctx, &mut roomy_budget(), &mut rotation);
+                let taken = before - rx.len();
+                assert_eq!(taken, cap.min(before));
+                applied += taken;
+                assert_eq!(ctx.model.status, format!("note {}", applied - 1));
+                assert_eq!(more, !rx.is_empty());
+                if !more {
+                    break;
+                }
+            }
+            assert_eq!(applied, total);
+            assert!(rx.is_empty());
+        });
+    }
+
+    #[test]
+    fn drive_drain_of_empty_receiver_reports_nothing_and_does_not_tick() {
+        with_drive_ctx(|ctx| {
+            let was_on = crate::perf::enabled();
+            crate::perf::set_enabled(true);
+            let (tx, mut rx) = tokio_mpsc::unbounded_channel::<DriveMsg>();
+            let mut rotation = 0usize;
+            assert!(!drain_drive_msgs(
+                &mut rx,
+                ctx,
+                &mut fresh_budget(),
+                &mut rotation
+            ));
+            assert_eq!(ctx.loop_perf.items(crate::perf::WakeSource::Fold), 0);
+            assert!(!*ctx.dirty);
+            assert!(ctx.model.status.is_empty());
+
+            // One message ticks exactly once (the per-message tick stays).
+            assert!(tx.send(DriveMsg::Note("one".into())).is_ok());
+            assert!(!drain_drive_msgs(
+                &mut rx,
+                ctx,
+                &mut fresh_budget(),
+                &mut rotation
+            ));
+            assert_eq!(ctx.loop_perf.items(crate::perf::WakeSource::Fold), 1);
+            crate::perf::set_enabled(was_on);
+        });
+    }
+
+    #[test]
+    fn drive_drain_with_spent_clock_still_takes_one_message() {
+        with_drive_ctx(|ctx| {
+            use crate::ingress_budget::{IterationBudget, LOOP_DEADLINE};
+            let start = Instant::now();
+            let mut spent = IterationBudget::new(start - LOOP_DEADLINE * 2, LOOP_DEADLINE, false);
+            let (tx, mut rx) = tokio_mpsc::unbounded_channel();
+            for i in 0..3 {
+                assert!(tx.send(DriveMsg::Note(format!("note {i}"))).is_ok());
+            }
+            let mut rotation = 0usize;
+            assert!(drain_drive_msgs(&mut rx, ctx, &mut spent, &mut rotation));
+            assert_eq!(rx.len(), 2);
+            assert_eq!(ctx.model.status, "note 0");
+        });
     }
 
     #[test]

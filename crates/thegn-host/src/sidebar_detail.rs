@@ -29,6 +29,7 @@ pub(crate) enum FieldId {
     Author,
     Stash,
     Ci,
+    Issue,
     TailEnv,
     TailSandbox,
     TailDevcontainer,
@@ -107,6 +108,7 @@ fn field_id(field: DetailField) -> FieldId {
         DetailField::Author => FieldId::Author,
         DetailField::Stash => FieldId::Stash,
         DetailField::Ci => FieldId::Ci,
+        DetailField::Issue => FieldId::Issue,
     }
 }
 
@@ -336,6 +338,12 @@ fn requested_fields(
             .map(|state| ci_field(state, id))
             .into_iter()
             .collect(),
+        DetailField::Issue => row
+            .linked_issue
+            .as_ref()
+            .and_then(|(issue, count)| issue_field(issue, *count, id))
+            .into_iter()
+            .collect(),
         _ => Vec::new(),
     }
 }
@@ -351,6 +359,31 @@ fn ci_field(state: CiBadge, id: FieldId) -> Field {
         CiBadge::Pending => (RowRole::Dim, "ci pend"),
     };
     Field::new(id, vec![seg(plugin_role(role), text)], 1)
+}
+
+/// Display cap (cells) for a linked issue id before the `#` prefix and `+N`.
+const ISSUE_ID_MAX_CELLS: usize = 24;
+
+/// The `issue` detail field: the newest linked issue id (`#123` for an
+/// all-digit id, otherwise the id as stored) plus ` +N` when N more issues are
+/// linked. Control characters are stripped, the id is clipped to
+/// [`ISSUE_ID_MAX_CELLS`], and an id that sanitises to nothing hides the field.
+fn issue_field(issue: &str, count: usize, id: FieldId) -> Option<Field> {
+    let stripped: String = issue.chars().filter(|c| !c.is_control()).collect();
+    let clean = display_cell(stripped.trim());
+    if clean.is_empty() {
+        return None;
+    }
+    let clipped = crate::seg::clip_end(&clean, ISSUE_ID_MAX_CELLS);
+    let mut text = if clean.chars().all(|c| c.is_ascii_digit()) {
+        format!("#{clipped}")
+    } else {
+        clipped
+    };
+    if count > 1 {
+        text.push_str(&format!(" +{}", count - 1));
+    }
+    Some(Field::new(id, vec![seg(Tok::Slot(S::Dim), text)], 1))
 }
 
 fn branch_stat_field(row: &SidebarRow, id: FieldId) -> Option<Field> {
@@ -593,6 +626,7 @@ pub(crate) fn fit_fields(mut fields: Vec<Field>, budget: usize) -> Vec<Field> {
         FieldId::Author,
         FieldId::Stash,
         FieldId::Ci,
+        FieldId::Issue,
         FieldId::Subject,
         FieldId::Age,
         FieldId::TailDisk,
@@ -1124,6 +1158,125 @@ mod tests {
         assert_eq!(
             got(36),
             vec![FieldId::Branch, FieldId::Subject, FieldId::Ci]
+        );
+        assert_eq!(got(24), vec![FieldId::Branch, FieldId::Subject]);
+        assert_eq!(got(12), vec![FieldId::Branch]);
+    }
+
+    fn with_issue(issue: Option<(&str, usize)>) -> SidebarRow {
+        let mut row = row();
+        row.linked_issue = issue.map(|(id, count)| (id.to_string(), count));
+        row
+    }
+
+    fn issue_display() -> SidebarDisplay {
+        SidebarDisplay {
+            detail_fields: vec![builtin(DetailField::Issue)],
+            ..SidebarDisplay::default()
+        }
+    }
+
+    #[test]
+    fn issue_field_renders_id_and_extra_count_and_hides_absent() {
+        let display = issue_display();
+        assert_eq!(
+            detail_text(&with_issue(Some(("123", 1))), &display, 80).as_deref(),
+            Some("#123")
+        );
+        assert_eq!(
+            detail_text(&with_issue(Some(("ABC-9", 3))), &display, 80).as_deref(),
+            Some("ABC-9 +2")
+        );
+        assert_eq!(
+            detail_text(&with_issue(Some(("42", 2))), &display, 80).as_deref(),
+            Some("#42 +1")
+        );
+        assert_eq!(detail_text(&with_issue(None), &display, 80), None);
+        assert_eq!(
+            detail_text(&with_issue(Some(("\u{1b}\u{7}", 1))), &display, 80),
+            None
+        );
+    }
+
+    #[test]
+    fn issue_field_strips_control_characters() {
+        let text = detail_text(
+            &with_issue(Some(("AB\u{1b}[31mC-1\n", 1))),
+            &issue_display(),
+            80,
+        )
+        .unwrap();
+        assert!(!text.chars().any(char::is_control), "{text:?}");
+        assert_eq!(text, "AB[31mC-1");
+    }
+
+    #[test]
+    fn issue_field_truncates_a_long_id() {
+        let long = "X".repeat(200);
+        let field = issue_field(&long, 1, FieldId::Issue).unwrap();
+        assert_eq!(field.width, ISSUE_ID_MAX_CELLS);
+        let digits = "9".repeat(200);
+        let field = issue_field(&digits, 4, FieldId::Issue).unwrap();
+        let text = field
+            .segs
+            .iter()
+            .map(|segment| segment.text.as_str())
+            .collect::<String>();
+        assert!(text.starts_with('#'), "{text:?}");
+        assert!(text.ends_with(" +3"), "{text:?}");
+        assert_eq!(field.width, ISSUE_ID_MAX_CELLS + "#".len() + " +3".len());
+    }
+
+    #[test]
+    fn issue_field_is_opt_in_and_parses_from_config() {
+        let row = with_issue(Some(("ABC-9", 1)));
+        let defaults = SidebarDisplay::default();
+        assert!(
+            !defaults
+                .detail_fields
+                .contains(&builtin(DetailField::Issue))
+        );
+        assert!(
+            !detail_fields(&row, &defaults, 2_000)
+                .iter()
+                .any(|field| field.id == FieldId::Issue)
+        );
+
+        let ui: thegn_core::config::UiConfig =
+            toml::from_str(r#"sidebar_detail_fields = ["branch", "ci", "issue"]"#).unwrap();
+        let display = SidebarDisplay {
+            detail_fields: ui.detail_entries_resolved(),
+            ..SidebarDisplay::default()
+        };
+        let ids: Vec<FieldId> = detail_fields(&row, &display, 2_000)
+            .into_iter()
+            .map(|field| field.id)
+            .collect();
+        assert_eq!(ids, vec![FieldId::Branch, FieldId::Issue]);
+    }
+
+    #[test]
+    fn issue_drops_after_ci_and_before_subject() {
+        let ids = [
+            FieldId::Branch,
+            FieldId::Subject,
+            FieldId::Issue,
+            FieldId::Ci,
+        ];
+        let fields = |ids: &[FieldId]| -> Vec<Field> {
+            ids.iter()
+                .map(|id| Field::new(*id, vec![seg(Tok::Slot(S::Dim), "1234567890")], 10))
+                .collect()
+        };
+        let got = |budget: usize| -> Vec<FieldId> {
+            fit_fields(fields(&ids), budget)
+                .iter()
+                .map(|field| field.id)
+                .collect()
+        };
+        assert_eq!(
+            got(36),
+            vec![FieldId::Branch, FieldId::Subject, FieldId::Issue]
         );
         assert_eq!(got(24), vec![FieldId::Branch, FieldId::Subject]);
         assert_eq!(got(12), vec![FieldId::Branch]);

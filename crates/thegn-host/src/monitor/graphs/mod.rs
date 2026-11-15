@@ -42,6 +42,8 @@ pub(crate) use heatmap::paint_heatmap;
 pub(crate) use minicore::paint_minicore;
 
 #[cfg(test)]
+mod depth_matrix_tests;
+#[cfg(test)]
 mod minicore_tests;
 #[cfg(test)]
 mod tests;

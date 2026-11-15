@@ -1032,6 +1032,243 @@ fn bounded_runner_timeout_kills_descendant() {
     }
 }
 
+// The tests below carry no `#[cfg]` (vpn/tests.rs is cfg-ratcheted): each
+// returns early where bounded process-group termination is unavailable, which
+// is also where `run_bounded` refuses to run at all.
+fn bounded_runner_available() -> bool {
+    crate::plugin::proc::bounded_group_termination_supported()
+}
+
+fn sh(script: &str) -> Vec<String> {
+    vec!["sh".to_string(), "-c".to_string(), script.to_string()]
+}
+
+#[test]
+fn bounded_runner_returns_promptly_when_leader_backgrounds_a_child() {
+    if !bounded_runner_available() {
+        return;
+    }
+    // The `podman run -d` shape: the leader prints an id and exits while a
+    // background member still holds the inherited stdout pipe.
+    let start = std::time::Instant::now();
+    let output = run_bounded(&sh("sleep 30 & echo id"), Duration::from_secs(10), 128, 64)
+        .expect("leader exit with a live background member is a success");
+    assert!(
+        start.elapsed() < Duration::from_secs(3),
+        "must not wait for the background member ({:?})",
+        start.elapsed()
+    );
+    assert!(output.success);
+    assert_eq!(output.stdout, "id\n");
+    assert!(!output.truncated);
+}
+
+#[test]
+fn run_output_timed_rejects_stdout_over_capture_limit() {
+    if !bounded_runner_available() {
+        return;
+    }
+    // Input above EXEC_STDOUT_CAPTURE_CAP, so the producer must be drained.
+    let over = EXEC_STDOUT_CAPTURE_CAP * 3;
+    let argv = sh(&format!("head -c {over} /dev/zero"));
+    let output = run_bounded(
+        &argv,
+        Duration::from_secs(10),
+        EXEC_STDOUT_CAPTURE_CAP,
+        STDERR_CAPTURE_CAP,
+    )
+    .expect("a flood is drained, not an error");
+    assert!(output.success);
+    assert!(output.stdout_truncated);
+    assert!(output.truncated);
+    assert!(!output.stderr_truncated);
+    assert_eq!(output.stdout.len(), EXEC_STDOUT_CAPTURE_CAP);
+    let error = run_output_timed(&argv, Duration::from_secs(10))
+        .expect_err("truncated stdout must be refused");
+    assert!(
+        format!("{error:#}").contains("exceeded capture limit"),
+        "{error:#}"
+    );
+}
+
+#[test]
+fn bounded_runner_reports_missing_program_as_spawn_error() {
+    if !bounded_runner_available() {
+        return;
+    }
+    let argv = vec!["thegn-vpn-test-no-such-program".to_string()];
+    let error = run_bounded(&argv, Duration::from_secs(5), 64, 64)
+        .err()
+        .expect("a missing program cannot run");
+    let text = format!("{error:#}");
+    assert!(
+        text.contains("vpn: spawn thegn-vpn-test-no-such-program"),
+        "{text}"
+    );
+}
+
+#[test]
+fn bounded_runner_timeout_error_names_the_timeout() {
+    if !bounded_runner_available() {
+        return;
+    }
+    let error = run_bounded(&sh("sleep 30"), Duration::from_millis(200), 64, 64)
+        .err()
+        .expect("a hung child times out");
+    let text = format!("{error:#}");
+    assert!(text.contains("timed out after"), "{text}");
+}
+
+/// A real reaped exit status for the hand-built `Run` values below.
+fn exit_status(code: i32) -> thegn_proc::ExitStatus {
+    let mut command = Command::new("sh");
+    command.args(["-c", &format!("exit {code}")]);
+    thegn_proc::run(
+        &mut command,
+        &Limits::silent(Duration::from_secs(5)),
+        &AtomicBool::new(false),
+    )
+    .exit_status()
+    .expect("sh exits and is reaped")
+}
+
+fn captured(bytes: &[u8], truncated: bool) -> thegn_proc::Capture {
+    thegn_proc::Capture {
+        bytes: bytes.to_vec(),
+        total: u64::try_from(bytes.len()).unwrap_or(u64::MAX),
+        truncated,
+        eof: true,
+    }
+}
+
+fn hand_run(end: End, leader: Leader) -> Run {
+    Run {
+        end,
+        group: GroupState::Terminated,
+        leader,
+        leader_exited_first: true,
+        stdout: captured(b"", false),
+        stderr: captured(b"", false),
+        containment: thegn_proc::Containment::ProcessGroup,
+    }
+}
+
+fn piped_limits() -> Limits {
+    bounded_limits(Duration::from_secs(7), 64, 64)
+}
+
+fn map_err_text(run: Run, limits: &Limits) -> String {
+    match map_run(run, "oci-cli", limits) {
+        Ok(_) => panic!("expected an error"),
+        Err(error) => format!("{error:#}"),
+    }
+}
+
+#[test]
+fn map_run_maps_failure_ends_to_existing_error_texts() {
+    let limits = piped_limits();
+    let spawn = hand_run(
+        End::Spawn(std::io::Error::new(std::io::ErrorKind::NotFound, "gone")),
+        Leader::NotSpawned,
+    );
+    let text = map_err_text(spawn, &limits);
+    assert!(text.contains("vpn: spawn oci-cli"), "{text}");
+    assert!(text.contains("gone"), "{text}");
+
+    let timed_out = hand_run(End::TimedOut, Leader::Detached);
+    assert_eq!(
+        map_err_text(timed_out, &limits),
+        "vpn: subprocess timed out after 7s"
+    );
+
+    let supervise = hand_run(
+        End::Supervise(std::io::Error::other("waitid failed")),
+        Leader::Detached,
+    );
+    let text = map_err_text(supervise, &limits);
+    assert!(text.contains("vpn: wait for subprocess"), "{text}");
+    assert!(text.contains("waitid failed"), "{text}");
+
+    for end in [End::Cancelled, End::OutputLimit(thegn_proc::Which::Stdout)] {
+        assert_eq!(
+            map_err_text(hand_run(end, Leader::Detached), &limits),
+            "vpn: wait for subprocess"
+        );
+    }
+}
+
+#[test]
+fn map_run_refuses_an_unreaped_leader() {
+    let limits = piped_limits();
+    for leader in [Leader::Detached, Leader::NotSpawned] {
+        assert_eq!(
+            map_err_text(hand_run(End::LeaderExited, leader), &limits),
+            "vpn: reap subprocess"
+        );
+    }
+    let text = map_err_text(
+        hand_run(
+            End::LeaderExited,
+            Leader::ReapFailed(std::io::Error::other("ECHILD")),
+        ),
+        &limits,
+    );
+    assert!(text.contains("vpn: reap subprocess"), "{text}");
+    assert!(text.contains("ECHILD"), "{text}");
+}
+
+#[test]
+fn map_run_refuses_a_piped_stream_that_never_reached_eof() {
+    if !bounded_runner_available() {
+        return;
+    }
+    let limits = piped_limits();
+    for stream in [thegn_proc::Which::Stdout, thegn_proc::Which::Stderr] {
+        let mut run = hand_run(End::LeaderExited, Leader::Reaped(exit_status(0)));
+        match stream {
+            thegn_proc::Which::Stdout => run.stdout.eof = false,
+            thegn_proc::Which::Stderr => run.stderr.eof = false,
+        }
+        assert_eq!(
+            map_err_text(run, &limits),
+            "vpn: subprocess output drain timed out"
+        );
+    }
+    // A `/dev/null` stream never reaches EOF and must not trip the refusal.
+    let null_limits = bounded_limits(Duration::from_secs(7), 0, 0);
+    let mut run = hand_run(End::LeaderExited, Leader::Reaped(exit_status(0)));
+    run.stdout = thegn_proc::Capture::default();
+    run.stderr = thegn_proc::Capture::default();
+    let output = map_run(run, "oci-cli", &null_limits).expect("null streams are fine");
+    assert!(output.success);
+    assert!(output.stdout.is_empty() && output.stderr.is_empty());
+}
+
+#[test]
+fn map_run_maps_a_reaped_leader_to_bounded_output() {
+    if !bounded_runner_available() {
+        return;
+    }
+    let limits = piped_limits();
+    let mut run = hand_run(End::LeaderExited, Leader::Reaped(exit_status(3)));
+    run.stdout = captured(b"out\xff", false);
+    run.stderr = captured(b"err", true);
+    let output = map_run(run, "oci-cli", &limits).expect("a reaped exit maps to output");
+    assert!(!output.success);
+    assert_eq!(output.stdout, "out\u{fffd}");
+    assert_eq!(output.stderr, "err");
+    assert!(!output.stdout_truncated);
+    assert!(output.stderr_truncated);
+    assert!(output.truncated);
+
+    let mut run = hand_run(End::LeaderExited, Leader::Reaped(exit_status(0)));
+    run.stdout = captured(b"id\n", true);
+    let output = map_run(run, "oci-cli", &limits).expect("success maps to output");
+    assert!(output.success);
+    assert_eq!(output.stdout, "id\n");
+    assert!(output.stdout_truncated && !output.stderr_truncated && output.truncated);
+}
+
 #[test]
 fn filter_only_dns_suppresses_magicdns() {
     let mut c = ts_cfg();

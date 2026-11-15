@@ -253,10 +253,10 @@ The richer detail line is configured by `sidebar_detail_when`,
 badge caps at `999+`. Valid field names are `branch`, `commits`, `dirty`,
 `branch_stat`, `pr`, `subject`, `age`, `upstream`, `stage`, `activity`, `env`,
 `sandbox`, `devcontainer`, `hibernated`, `mq`, `unread`, `disk`, `author`,
-`stash`, and `ci`.
+`stash`, `ci`, and `issue`.
 The default field order is `branch`, `commits`, `dirty`, `branch_stat`, `pr`,
 `subject`, `age`, `env`, `sandbox`, `devcontainer`, `hibernated`, `mq`, `unread`,
-`disk`; `upstream`, `stage`, `activity`, `author`, `stash`, and `ci` are opt-in. The legacy
+`disk`; `upstream`, `stage`, `activity`, `author`, `stash`, `ci`, and `issue` are opt-in. The legacy
 `sidebar_detail_branch`, `sidebar_detail_branch_stat`, and `sidebar_detail_pr`
 toggles remain AND gates; prefer `sidebar_detail_fields` for membership and
 order. An entry can also be `plugin:<plugin>/<field>`; plugin IDs use
@@ -285,13 +285,15 @@ is cached, and `ci run` and `ci pend` are also hidden while the CI refresh for
 that worktree is failing, because no live result backs them; a cached pass or
 failure stays shown.
 
-Four source areas were considered for this feature: stash count, last-commit
-author, and CI state (all shipped here), and linked issue ID (it exists only in
-the pipeline lane folder). Linked issue ID remains deferred and is not produced
-by the current scan.
+The `issue` field shows the newest linked issue id, +N when more are linked;
+read from the local link table, no fetch. An all-digit id is shown as `#123`,
+any other id as stored (for example `ABC-9 +2`). Control characters are
+stripped, the id is clipped to 24 cells, and the field is hidden while the
+worktree has no linked issue. The link table is read once per attention scan,
+so a new link appears on the next scan.
 
 When the row is narrow, elision drops content in this order: plugin fields,
-activity, stage, upstream, author, stash, ci, subject (first truncated to eight cells), age, tail badges
+activity, stage, upstream, author, stash, ci, issue, subject (first truncated to eight cells), age, tail badges
 (disk, unread, merge queue, hibernation, devcontainer, sandbox, environment),
 branch stat, PR, dirty, commits, then branch. The branch is always retained and
 gets an ellipsis.
