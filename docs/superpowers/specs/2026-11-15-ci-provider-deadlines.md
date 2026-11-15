@@ -181,11 +181,13 @@ Each slice is one lane: one file set, one change, named tests.
    and notes the cut. Tests (actions.rs, with a fake `CiProvider` like
    `FakeCi` ci_refresh.rs:1521): `ci_detail_drill_stops_fetching_logs_after_wall`,
    `ci_detail_cancel_reaches_the_provider_call`.
-2. **The refresh wall is checked only before a call** (ci*refresh.rs:148,
-   :1338, :1422). Slice: in svc ci.rs, let a client carry an optional operation
-   deadline and clip each runner timeout to
-   `min(CI*\*\_TIMEOUT, remaining)`, as `gitlab_page_timeout`(ci.rs:2326) already
-does. The refresh passes its`CallBudget`deadline. Tests:`run_cli_timeout_is_clipped_to_the_operation_deadline`(svc ci.rs),`refresh_call_admitted_near_the_wall_ends_by_the_wall` (ci_refresh.rs).
+2. **The refresh wall is checked only before a call** (`ci_refresh.rs:148`,
+   `:1338`, `:1422`). Slice: in svc `ci.rs`, let a client carry an optional
+   operation deadline and clip each runner timeout to
+   `min(CI_*_TIMEOUT, remaining)`, as `gitlab_page_timeout` (`ci.rs:2326`)
+   already does. The refresh passes its `CallBudget` deadline. Tests:
+   `run_cli_timeout_is_clipped_to_the_operation_deadline` (svc `ci.rs`) and
+   `refresh_call_admitted_near_the_wall_ends_by_the_wall` (`ci_refresh.rs`).
 3. **Remote git reads in the CI path are cancel-blind** (`git_out` /
    `git_text` build a fresh `AtomicBool`, remote.rs:1083, :1130; reached from
    ci_refresh.rs:1115, ci.rs:433, daemon/service.rs:2228-2232). They also run
