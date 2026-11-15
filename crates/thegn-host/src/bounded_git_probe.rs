@@ -78,6 +78,7 @@ pub(crate) fn capture_capability(
     )
 }
 
+#[derive(Debug)]
 struct GitBudget(&'static AtomicUsize);
 impl Drop for GitBudget {
     fn drop(&mut self) {
