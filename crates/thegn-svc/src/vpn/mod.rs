@@ -562,6 +562,7 @@ fn write_sidecar_record(container: &str, record: &SidecarRecord) -> Result<()> {
     }
     sidecar_record_dir()?
         .write_owner_only_atomic(&sidecar_record_name(container), &bytes)
+        .map(|_| ())
         .context("vpn: write sidecar runtime record")
 }
 
