@@ -31,8 +31,8 @@ use thegn_core::osc_attention::{AttentionSignal, OscAttentionScanner};
 use thegn_core::session_activity::{Observation, SessionActivity};
 use thegn_core::term_snapshot::{ScreenSnapshot, SnapCell, SnapColor, encode_ansi};
 use thegn_svc::control::{
-    AttachKind, AttachReply, ControlError, RecordSpec, RecordStatus, SessionActivityEvent,
-    SessionInfo,
+    AttachKind, AttachReply, ControlError, MAX_PTY_COLS, MAX_PTY_ROWS, RecordSpec, RecordStatus,
+    SessionActivityEvent, SessionInfo,
 };
 
 use crate::emulator::{AlacrittyEmulator, CellColor, PaneEmulator};
@@ -797,6 +797,11 @@ impl SessionActor {
     }
 
     fn on_resize(&mut self, rows: u16, cols: u16) {
+        // Defensive clamp: the control API refuses oversized geometry, but an
+        // in-process caller that bypasses it must never make the emulator
+        // allocate past the bound (it allocates rows x cols cells). The actor
+        // has no reply channel, so it clamps rather than refusing.
+        let (rows, cols) = (rows.min(MAX_PTY_ROWS), cols.min(MAX_PTY_COLS));
         let (cur_rows, cur_cols) = self.emulator.size();
         if (cur_rows, cur_cols) == (rows, cols) {
             return; // no-op resize: don't SIGWINCH the child
@@ -1650,6 +1655,21 @@ mod tests {
                 db,
             },
         }
+    }
+
+    /// `on_resize` clamps a geometry past the shared bound instead of letting
+    /// the emulator allocate it.
+    #[tokio::test]
+    async fn on_resize_clamps_to_the_pty_bound() {
+        let BuiltActor { mut actor, .. } = build_actor_cfg("cat", None, "sh", Config::default());
+        actor.on_resize(5000, 5000);
+        assert_eq!(actor.emulator.size(), (MAX_PTY_ROWS, MAX_PTY_COLS));
+        assert_eq!(actor.emulator.size(), (1000, 1000));
+        let recorded = {
+            let live = actor.live.lock().unwrap();
+            (live.rows, live.cols)
+        };
+        assert_eq!(recorded, (1000, 1000));
     }
 
     #[tokio::test]
