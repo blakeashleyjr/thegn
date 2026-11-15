@@ -126,7 +126,8 @@ const FALLBACK_BUNDLE_HINT: &str =
     "Run `thegn doctor bundle` to collect the retained crash reports and logs.";
 
 /// The user-facing text; `line` is ALREADY redacted (`spawn_failure_line`).
-fn daemon_fallback_notice(kind: DaemonFallback, line: &str) -> String {
+/// `crash_hint` is `crash_report_hint(..)` output (empty or a leading-space sentence).
+fn daemon_fallback_notice(kind: DaemonFallback, line: &str, crash_hint: &str) -> String {
     let text = match kind {
         DaemonFallback::Spawn => format!(
             "pane daemon unavailable: {line}; this pane runs in-process and will not survive closing thegn"
@@ -141,7 +142,20 @@ fn daemon_fallback_notice(kind: DaemonFallback, line: &str) -> String {
             "provider exec attach failed: {line}; this pane fell back to the standard launch path and may not be connected to the remote session"
         ),
     };
-    format!("{text} {FALLBACK_BUNDLE_HINT}")
+    format!("{text}{crash_hint} {FALLBACK_BUNDLE_HINT}")
+}
+
+/// Pointer to the newest unacknowledged crash report (`reports` is newest last); empty when none.
+fn crash_report_hint(reports: &[std::path::PathBuf]) -> String {
+    let Some(newest) = reports.last() else {
+        return String::new();
+    };
+    let path: String = newest
+        .to_string_lossy()
+        .chars()
+        .map(|c| if c.is_control() { '?' } else { c })
+        .collect();
+    format!(" Newest unacknowledged crash report: {path}.")
 }
 
 /// Post the notice once per kind. A no-op without the compositor (CLI paths) and non-blocking (launch_notice::post hands the DB write to a Background thread).
@@ -150,10 +164,22 @@ fn note_daemon_fallback(kind: DaemonFallback, worktree: &str, error: &anyhow::Er
     {
         return;
     }
-    crate::launch_notice::post(
-        worktree,
-        &daemon_fallback_notice(kind, &spawn_failure_line(error)),
-    );
+    let line = spawn_failure_line(error);
+    let owned_worktree = worktree.to_owned();
+    let bg_line = line.clone();
+    // The crash dir read is I/O, so it runs off the calling thread.
+    let spawned = thegn_core::thread_name::try_spawn_named("thegn-fbnotice", move || {
+        crate::platform::qos::set_self(crate::platform::qos::Qos::Background);
+        let hint = crash_report_hint(&thegn_core::diagnostics::unacknowledged_reports());
+        crate::launch_notice::post(
+            &owned_worktree,
+            &daemon_fallback_notice(kind, &bg_line, &hint),
+        );
+    });
+    if spawned.is_err() {
+        // No thread: post the static text (no I/O) so the notice is never lost.
+        crate::launch_notice::post(worktree, &daemon_fallback_notice(kind, &line, ""));
+    }
 }
 
 fn materialize_fallback_cwd(
@@ -2373,21 +2399,21 @@ mod tests {
         let err = anyhow::anyhow!("connect refused").context("GH_TOKEN=ghp_secret exec failed");
         let line = spawn_failure_line(&err);
 
-        let spawn = daemon_fallback_notice(DaemonFallback::Spawn, &line);
+        let spawn = daemon_fallback_notice(DaemonFallback::Spawn, &line, "");
         assert!(spawn.contains("in-process"));
         assert!(spawn.contains("connect refused"));
         assert!(!spawn.contains("ghp_secret"));
 
-        let reattach = daemon_fallback_notice(DaemonFallback::Reattach, &line);
+        let reattach = daemon_fallback_notice(DaemonFallback::Reattach, &line, "");
         assert!(reattach.contains("fresh pane"));
         assert!(!reattach.contains("ghp_secret"));
 
-        let ssh_over_wss = daemon_fallback_notice(DaemonFallback::SshOverWss, &line);
+        let ssh_over_wss = daemon_fallback_notice(DaemonFallback::SshOverWss, &line, "");
         assert!(ssh_over_wss.contains("SSH-over-WebSocket"));
         assert!(ssh_over_wss.contains("connect refused"));
         assert!(!ssh_over_wss.contains("ghp_secret"));
 
-        let native_exec = daemon_fallback_notice(DaemonFallback::NativeExec, &line);
+        let native_exec = daemon_fallback_notice(DaemonFallback::NativeExec, &line, "");
         assert!(native_exec.contains("provider exec"));
         assert!(native_exec.contains("connect refused"));
         assert!(!native_exec.contains("ghp_secret"));
@@ -2405,7 +2431,7 @@ mod tests {
         ];
 
         for kind in kinds {
-            let notice = daemon_fallback_notice(kind, &line);
+            let notice = daemon_fallback_notice(kind, &line, "");
             assert!(notice.ends_with(FALLBACK_BUNDLE_HINT), "{notice}");
             assert!(notice.contains("thegn doctor bundle"), "{notice}");
             assert!(!notice.contains("ghp_secret"), "{notice}");
@@ -2423,10 +2449,63 @@ mod tests {
         ];
 
         for kind in kinds {
-            let notice = daemon_fallback_notice(kind, &line);
+            let notice = daemon_fallback_notice(kind, &line, "");
             assert_eq!(notice.matches("thegn doctor bundle").count(), 1);
             assert!(notice.ends_with(FALLBACK_BUNDLE_HINT));
         }
+    }
+
+    #[test]
+    fn crash_report_hint_none_one_many() {
+        use std::path::PathBuf;
+        assert_eq!(crash_report_hint(&[]), "");
+        let one = [PathBuf::from("/state/crash/a.txt")];
+        assert_eq!(
+            crash_report_hint(&one),
+            " Newest unacknowledged crash report: /state/crash/a.txt."
+        );
+        let many = [
+            PathBuf::from("/state/crash/old.txt"),
+            PathBuf::from("/state/crash/new.txt"),
+        ];
+        let hint = crash_report_hint(&many);
+        assert!(hint.contains("new.txt"), "{hint}");
+        assert!(!hint.contains("old.txt"), "{hint}");
+    }
+
+    #[test]
+    fn crash_report_hint_replaces_control_characters() {
+        let hint = crash_report_hint(&[std::path::PathBuf::from("/state/cr\u{1b}[31m\nash.txt")]);
+        assert!(!hint.chars().any(|c| c.is_control()), "{hint:?}");
+        assert!(hint.contains("ash.txt"));
+    }
+
+    #[test]
+    fn daemon_fallback_notice_with_crash_hint_keeps_one_bundle_pointer() {
+        let line = spawn_failure_line(&anyhow::anyhow!("connect refused"));
+        let hint = crash_report_hint(&[std::path::PathBuf::from("/state/crash/x.txt")]);
+        let kinds = [
+            DaemonFallback::Spawn,
+            DaemonFallback::Reattach,
+            DaemonFallback::SshOverWss,
+            DaemonFallback::NativeExec,
+        ];
+        for kind in kinds {
+            let notice = daemon_fallback_notice(kind, &line, &hint);
+            assert_eq!(notice.matches("thegn doctor bundle").count(), 1, "{notice}");
+            assert!(notice.contains("/state/crash/x.txt"), "{notice}");
+            assert!(notice.ends_with(FALLBACK_BUNDLE_HINT), "{notice}");
+        }
+    }
+
+    #[test]
+    fn ssh_over_wss_and_native_exec_notices_are_distinct() {
+        let line = spawn_failure_line(&anyhow::anyhow!("boom"));
+        let wss = daemon_fallback_notice(DaemonFallback::SshOverWss, &line, "");
+        let native = daemon_fallback_notice(DaemonFallback::NativeExec, &line, "");
+        assert!(wss.contains("SSH-over-WebSocket") && wss.contains("boom"));
+        assert!(native.contains("provider exec") && native.contains("boom"));
+        assert_ne!(wss, native);
     }
 
     #[test]
