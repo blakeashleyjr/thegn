@@ -44,7 +44,7 @@ a POSIX shell script with `printf` is enough.
    `label` becomes the account name in the panel. See the complete
    [tracker-provider recipe](tracker-provider.md).
 
-## Current host support (API 0.5)
+## Current host support (API 0.6)
 
 The checked-in JSON schema carries this same table as
 `x-thegn-extension-support`; `thegn plugin check` applies it without launching

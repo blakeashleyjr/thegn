@@ -166,7 +166,7 @@ Plugin themes will be data-only palettes, and plugin keys will be
 surface-local actions.
 
 The machine-readable source for this classification is embedded in
-`docs/api/plugin-api-0.5.json` as `x-thegn-extension-support`; its companion
+`docs/api/plugin-api-0.6.json` as `x-thegn-extension-support`; its companion
 `x-thegn-host-verb-support` table names verb authority and permitted modes, and
 the API version each verb needs (a verb newer than the plugin's declared `api`
 is refused as unsupported). `x-thegn-host-call-capabilities` is the exact set
