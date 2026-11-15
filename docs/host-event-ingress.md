@@ -139,8 +139,9 @@ daemon session messages (`daemon/session.rs:1212`) and the test-only drains in
 - **Pending work always schedules a future wake.** A drain that stops on a budget
   with work left must arm the poll (`budget_exhausted`, `log_backlog`,
   `plugin_backlog` into `idle_poll::poll_timeout`, run.rs:17053-17058) or re-arm a
-  producer wake obligation (LSP). A producer that sends must pulse the waker; the
-  container-event row is the one found without one.
+  producer wake obligation (LSP). A producer that sends must pulse the waker. The
+  container-event producer was found without a pulse during this inventory and was
+  fixed in the same change: it now pulses after each non-empty batch.
 - **Input preemption is preserved.** Bounded drains shrink their budget while input
   is pending (`drain_budget`, `log_budget`, the LSP `input_pending` hook) and check
   input between slices. A new slice must keep that check and must not add a
