@@ -2610,3 +2610,7 @@ mod tests {
         assert_eq!(*log.lock().unwrap(), vec![vec![1]]);
     }
 }
+
+#[cfg(test)]
+#[path = "frame_writer_backpressure_tests.rs"]
+mod backpressure_tests;
