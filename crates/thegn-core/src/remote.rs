@@ -1089,13 +1089,36 @@ impl GitLoc {
 
     /// Run a git command, returning trimmed stdout on success (None otherwise).
     pub fn git_out(&self, args: &[&str]) -> Option<String> {
-        crate::util::note_core_git_spawn();
-        let out = self.git_command(args).output().ok()?;
-        if !out.status.success() {
-            return None;
+        let policy = crate::git_run::GitPolicy {
+            stdout_cap: 64 * 1024 * 1024,
+            ..crate::git_run::GitPolicy::read(GITLOC_READ_DEADLINE)
+        };
+        self.git_out_with_policy(args, &policy)
+    }
+
+    fn git_out_with_policy(
+        &self,
+        args: &[&str],
+        policy: &crate::git_run::GitPolicy,
+    ) -> Option<String> {
+        let cancel = std::sync::atomic::AtomicBool::new(false);
+        let outcome = self.git_run(args, policy, &cancel);
+        match outcome {
+            crate::git_run::GitOutcome::Ok(bytes) => {
+                let text = String::from_utf8_lossy(&bytes).trim().to_string();
+                (!text.is_empty()).then_some(text)
+            }
+            crate::git_run::GitOutcome::EmptyOk => None,
+            other => {
+                tracing::debug!(
+                    target: "thegn::git",
+                    command = args.first().copied().unwrap_or("<missing>"),
+                    outcome = crate::util::git_outcome_class(&other),
+                    "bounded GitLoc command failed"
+                );
+                None
+            }
         }
-        let s = String::from_utf8_lossy(&out.stdout).trim().to_string();
-        (!s.is_empty()).then_some(s)
     }
 
     /// Run a GitLoc command with bounded execution and typed outcomes, preserving
@@ -2374,6 +2397,52 @@ mod tests {
             missing.git_text(&["remote"]),
             Err(crate::git_run::GitTextError::Failed(_))
         ));
+    }
+
+    #[test]
+    fn git_out_is_bounded_and_keeps_trailing_empty_as_none() {
+        let dir = tempfile::tempdir().unwrap();
+        let init = util::git_cmd(dir.path())
+            .args(["-c", "commit.gpgsign=false", "init", "-q"])
+            .status()
+            .unwrap();
+        assert!(init.success());
+        std::fs::create_dir_all(dir.path().join(".git/info")).unwrap();
+        let loc = GitLoc::Local(dir.path().to_path_buf());
+
+        assert_eq!(
+            loc.git_out(&["rev-parse", "--git-dir"]),
+            Some(".git".into())
+        );
+        assert_eq!(loc.git_out(&["status", "--porcelain"]), None);
+
+        let tiny = crate::git_run::GitPolicy {
+            stdout_cap: 1,
+            ..crate::git_run::GitPolicy::read(Duration::from_secs(1))
+        };
+        assert_eq!(
+            loc.git_out_with_policy(&["rev-parse", "--git-dir"], &tiny),
+            None
+        );
+    }
+
+    #[test]
+    fn git_out_counts_one_bounded_spawn() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(
+            util::git_cmd(dir.path())
+                .args(["-c", "commit.gpgsign=false", "init", "-q"])
+                .status()
+                .unwrap()
+                .success()
+        );
+        let loc = GitLoc::Local(dir.path().to_path_buf());
+        let before = util::core_git_spawn_count();
+        assert_eq!(loc.git_out(&["status", "--porcelain"]), None);
+        assert!(
+            util::core_git_spawn_count() > before,
+            "GitLoc::git_out must count its spawn"
+        );
     }
 
     #[test]
