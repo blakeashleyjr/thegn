@@ -1000,7 +1000,7 @@ const GIT_WRITE_LOCAL_TIMEOUT: std::time::Duration = std::time::Duration::from_s
 /// process — can't pin the mutation thread forever. Network verbs
 /// ([`GIT_NETWORK_VERBS`]) get one hour, every other write fifteen minutes.
 /// `THEGN_GIT_WRITE_TIMEOUT_SECS` overrides both; `0` disables the bound.
-/// `run_stdin` is not covered (see its doc).
+/// `run_stdin` is covered too (see its doc).
 fn git_write_timeout(args: &[&str]) -> Option<std::time::Duration> {
     let env = std::env::var("THEGN_GIT_WRITE_TIMEOUT_SECS");
     git_write_timeout_with(args, env.as_deref().ok())
@@ -2638,15 +2638,27 @@ pub(crate) fn run_w_locked(
 
 /// [`run_w`] with bytes piped to stdin (`git apply -`, `git commit -F -`).
 ///
-/// This general mutation runner is deliberately unbounded, unlike the other
-/// write runners ([`git_write_timeout`]): its callers are patch/index
-/// operations with a caller-supplied payload. Automated commit creation uses
+/// Bounded like the other write runners: [`git_write_timeout`] is the deadline
+/// (the process group is killed on expiry) and the 256 MiB / 8 MiB output caps
+/// of [`output_bounded_with_input`] apply. `THEGN_GIT_WRITE_TIMEOUT_SECS=0`
+/// keeps the explicit unbounded opt-out. Automated commit creation uses
 /// [`run_background_commit_stdin`] instead.
 pub(crate) fn run_stdin(
     loc: &GitLoc,
     envs: &[(&str, &str)],
     args: &[&str],
     stdin: &[u8],
+) -> Result<String> {
+    run_stdin_with(loc, envs, args, stdin, git_write_timeout(args))
+}
+
+/// [`run_stdin`] with the timeout injected — the test seam.
+fn run_stdin_with(
+    loc: &GitLoc,
+    envs: &[(&str, &str)],
+    args: &[&str],
+    stdin: &[u8],
+    timeout: Option<std::time::Duration>,
 ) -> Result<String> {
     let _lock = if loc.is_remote() {
         None
@@ -2659,9 +2671,15 @@ pub(crate) fn run_stdin(
     let _epoch = thegn_core::util::GitWriteScope::begin();
     let mut env: Vec<(&str, &str)> = vec![("GIT_TERMINAL_PROMPT", "0")];
     env.extend_from_slice(envs);
-    let out = loc
-        .git_with_stdin(&env, args, stdin)
-        .with_context(|| format!("git {}", args.join(" ")))?;
+    let cmd = loc.git_command_env(&env, args);
+    let out = output_bounded_with_input(cmd, args, Some(stdin), timeout).map_err(|error| {
+        // Spawn failures surface as a bare io::Error: name the command.
+        if error.downcast_ref::<std::io::Error>().is_some() {
+            error.context(format!("git {}", args.join(" ")))
+        } else {
+            error
+        }
+    })?;
     if !out.status.success() {
         // Pre-commit / commit-msg hooks commonly print to stdout, not stderr,
         // so fold both streams into the error — that's what makes a rejected
@@ -3773,6 +3791,56 @@ mod tests {
             error.contains("git update-ref refs/heads/x not-a-revision failed:"),
             "{error}"
         );
+    }
+
+    #[test]
+    fn run_stdin_with_returns_stdout_of_a_finished_command() {
+        let repo = testutil::TestRepo::new("stdin-ok");
+        let out = run_stdin_with(
+            &repo.loc(),
+            &[],
+            &["hash-object", "--stdin"],
+            b"hello\n",
+            Some(std::time::Duration::from_secs(30)),
+        )
+        .unwrap();
+        assert_eq!(out.trim(), "ce013625030ba8dba906f756967f9e9ca394464a");
+    }
+
+    #[test]
+    fn run_stdin_with_folds_stderr_into_the_error_on_nonzero_exit() {
+        let repo = testutil::TestRepo::new("stdin-fail");
+        let error = run_stdin_with(
+            &repo.loc(),
+            &[],
+            &["apply", "--check", "-"],
+            b"this is not a patch\n",
+            Some(std::time::Duration::from_secs(30)),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("git apply --check - failed:"), "{error}");
+        assert!(
+            error.len() > "git apply --check - failed: ".len(),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn run_stdin_with_kills_a_hung_command() {
+        let repo = testutil::TestRepo::new("stdin-hang");
+        let start = std::time::Instant::now();
+        let error = run_stdin_with(
+            &repo.loc(),
+            &[],
+            &["-c", "alias.hang=!sleep 30", "hang"],
+            b"payload",
+            Some(std::time::Duration::from_millis(300)),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("timed out after"), "{error}");
+        assert!(start.elapsed() < std::time::Duration::from_secs(10));
     }
 
     #[test]
