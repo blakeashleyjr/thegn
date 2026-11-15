@@ -24,14 +24,14 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::io::Read;
 use std::path::{Component, Path, PathBuf};
-use std::process::{Child, Command, Stdio};
-use std::sync::mpsc::{self, Receiver};
-use std::thread;
+use std::process::Command;
+use std::sync::atomic::AtomicBool;
 use std::time::{Duration, Instant};
 use thegn_core::config::{VpnDnsMode, VpnMode, VpnProviderKind};
 use thegn_core::sandbox::{VpnParams, VpnSpec};
 use thegn_core::sandbox_manage::{OWNED_LABEL, owner_label_arg};
 use thegn_core::secretref::{BareAs, SecretRef};
+use thegn_proc::{End, GroupState, Leader, Limits, Run, Stream};
 
 pub const VPN_PLAN_LABEL: &str = "thegn.vpn.plan";
 
@@ -1439,7 +1439,6 @@ const EXEC_ATTEMPT_TIMEOUT: Duration = Duration::from_secs(10);
 const SIDECAR_RUN_TIMEOUT: Duration = Duration::from_secs(120);
 const INSPECT_TIMEOUT: Duration = Duration::from_secs(10);
 const STDERR_CAPTURE_CAP: usize = 64 * 1024;
-const PROCESS_REAP_BUDGET: Duration = Duration::from_millis(250);
 const READER_REAP_BUDGET: Duration = Duration::from_millis(250);
 
 /// `exec` a command inside the sidecar; returns `(success, stdout)`. Public so
@@ -1475,15 +1474,21 @@ struct BoundedOutput {
     stdout: String,
     stderr: String,
     stdout_truncated: bool,
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "read by tests; production reads the combined `truncated`"
+        )
+    )]
     stderr_truncated: bool,
     truncated: bool,
 }
 
-enum ReaderOutcome {
-    Captured(Vec<u8>, bool),
-    Failed,
-}
-
+/// Run `argv` under `thegn_proc`: own process group, group terminated (SIGKILL)
+/// the moment the leader exits or at `timeout`, leader always reaped, and each
+/// piped stream drained to EOF keeping the first `*_cap` bytes. A zero cap
+/// means the stream is `/dev/null`.
 fn run_bounded(
     argv: &[String],
     timeout: Duration,
@@ -1497,157 +1502,68 @@ fn run_bounded(
         .first()
         .ok_or_else(|| anyhow!("vpn: empty subprocess argv"))?;
     let mut command = Command::new(program);
-    command.args(&argv[1..]).stdin(Stdio::null());
-    command.stdout(if stdout_cap > 0 {
-        Stdio::piped()
+    command.args(&argv[1..]);
+    let limits = bounded_limits(timeout, stdout_cap, stderr_cap);
+    let run = thegn_proc::run(&mut command, &limits, &AtomicBool::new(false));
+    map_run(run, program, &limits)
+}
+
+fn bounded_stream(cap: usize) -> Stream {
+    if cap > 0 {
+        Stream::Head { cap }
     } else {
-        Stdio::null()
-    });
-    command.stderr(if stderr_cap > 0 {
-        Stdio::piped()
-    } else {
-        Stdio::null()
-    });
-    crate::plugin::proc::set_process_group(&mut command);
-    let mut child = command
-        .spawn()
-        .with_context(|| format!("vpn: spawn {program}"))?;
-    let pid = child.id();
-    let stdout = child
-        .stdout
-        .take()
-        .map(|pipe| spawn_bounded_reader(pipe, stdout_cap));
-    let stderr = child
-        .stderr
-        .take()
-        .map(|pipe| spawn_bounded_reader(pipe, stderr_cap));
-    let deadline = Instant::now() + timeout;
-    let status = loop {
-        let exited = match crate::plugin::proc::leader_exited_nowait(pid) {
-            Ok(exited) => exited,
-            Err(_) => match child.try_wait() {
-                Ok(Some(status)) => break status,
-                Ok(None) => false,
-                Err(error) => {
-                    terminate_and_reap(&mut child, pid);
-                    return Err(error).context("vpn: wait for subprocess");
-                }
-            },
-        };
-        if exited {
-            // This success path also runs for `run -d`: podman/docker hand the
-            // container to their daemon, and their long-lived helpers leave
-            // this process group. The unreaped leader pins the group while we
-            // terminate remaining inherited-pipe holders, then wait() reaps it.
-            crate::plugin::proc::kill_group(pid);
-            break child.wait().context("vpn: reap subprocess")?;
-        }
-        if Instant::now() >= deadline {
-            terminate_and_reap(&mut child, pid);
-            drain_readers_after_termination(&stdout, &stderr);
-            return Err(anyhow!(
-                "vpn: subprocess timed out after {}s",
-                timeout.as_secs()
-            ));
-        }
-        thread::sleep(
-            Duration::from_millis(10).min(deadline.saturating_duration_since(Instant::now())),
-        );
+        Stream::Null
+    }
+}
+
+fn bounded_limits(timeout: Duration, stdout_cap: usize, stderr_cap: usize) -> Limits {
+    Limits {
+        // This also covers `run -d`: podman/docker hand the container to their
+        // daemon, so whatever is left in this group once the leader exits is a
+        // stray pipe holder and is terminated at once.
+        quiesce_after_leader: Some(Duration::ZERO),
+        term_grace: Duration::ZERO,
+        reader_grace: READER_REAP_BUDGET,
+        stdout: bounded_stream(stdout_cap),
+        stderr: bounded_stream(stderr_cap),
+        ..Limits::silent(timeout)
+    }
+}
+
+/// Map a finished `thegn_proc` run onto the VPN runner's result. Pure: no I/O.
+fn map_run(run: Run, program: &str, limits: &Limits) -> Result<BoundedOutput> {
+    if run.group == GroupState::Survivors {
+        tracing::debug!(target: "thegn::vpn", program, "subprocess group had survivors after termination");
+    }
+    let status = match run.end {
+        End::Spawn(error) => return Err(error).context(format!("vpn: spawn {program}")),
+        End::TimedOut => bail!(
+            "vpn: subprocess timed out after {}s",
+            limits.timeout.as_secs()
+        ),
+        End::Supervise(error) => return Err(error).context("vpn: wait for subprocess"),
+        // Unreachable with a fresh cancel flag and `Head` streams; refuse anyway.
+        End::Cancelled | End::OutputLimit(_) => bail!("vpn: wait for subprocess"),
+        End::LeaderExited => match run.leader {
+            Leader::Reaped(status) => status,
+            Leader::ReapFailed(error) => return Err(error).context("vpn: reap subprocess"),
+            Leader::Detached | Leader::NotSpawned => bail!("vpn: reap subprocess"),
+        },
     };
-    let drain_deadline = deadline + READER_REAP_BUDGET;
-    let stdout = read_bounded_result(&stdout, drain_deadline)?;
-    let stderr = read_bounded_result(&stderr, drain_deadline)?;
-    let mut output = BoundedOutput {
+    let piped = |stream: Stream| stream != Stream::Null;
+    if (piped(limits.stdout) && !run.stdout.eof) || (piped(limits.stderr) && !run.stderr.eof) {
+        bail!("vpn: subprocess output drain timed out");
+    }
+    let stdout_truncated = run.stdout.truncated;
+    let stderr_truncated = run.stderr.truncated;
+    Ok(BoundedOutput {
         success: status.success(),
-        stdout: String::from_utf8_lossy(&stdout.0).into_owned(),
-        stderr: String::from_utf8_lossy(&stderr.0).into_owned(),
-        stdout_truncated: stdout.1,
-        stderr_truncated: stderr.1,
-        truncated: false,
-    };
-    output.truncated = output.stdout_truncated || output.stderr_truncated;
-    Ok(output)
-}
-
-fn spawn_bounded_reader<R: Read + Send + 'static>(
-    mut pipe: R,
-    cap: usize,
-) -> Receiver<ReaderOutcome> {
-    let (sender, receiver) = mpsc::sync_channel(1);
-    thegn_core::thread_name::spawn_named("thegn-vpn-read", move || {
-        let mut bytes = Vec::with_capacity(cap.min(4096));
-        let mut truncated = false;
-        let mut buffer = [0_u8; 8192];
-        loop {
-            match pipe.read(&mut buffer) {
-                Ok(0) => break,
-                Ok(count) => {
-                    let keep = cap.saturating_sub(bytes.len()).min(count);
-                    bytes.extend_from_slice(&buffer[..keep]);
-                    truncated |= keep < count;
-                }
-                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
-                Err(_) => {
-                    if let Err(send_error) = sender.send(ReaderOutcome::Failed) {
-                        tracing::debug!(target: "thegn::vpn", %send_error, "subprocess reader result receiver closed");
-                    }
-                    return;
-                }
-            }
-        }
-        if let Err(send_error) = sender.send(ReaderOutcome::Captured(bytes, truncated)) {
-            tracing::debug!(target: "thegn::vpn", %send_error, "subprocess reader result receiver closed");
-        }
-    });
-    receiver
-}
-
-fn read_bounded_result(
-    receiver: &Option<Receiver<ReaderOutcome>>,
-    deadline: Instant,
-) -> Result<(Vec<u8>, bool)> {
-    let Some(receiver) = receiver else {
-        return Ok((Vec::new(), false));
-    };
-    match receiver.recv_timeout(deadline.saturating_duration_since(Instant::now())) {
-        Ok(ReaderOutcome::Captured(bytes, truncated)) => Ok((bytes, truncated)),
-        Ok(ReaderOutcome::Failed) => bail!("vpn: failed to read subprocess output"),
-        Err(mpsc::RecvTimeoutError::Timeout) => bail!("vpn: subprocess output drain timed out"),
-        Err(mpsc::RecvTimeoutError::Disconnected) => bail!("vpn: subprocess output reader stopped"),
-    }
-}
-
-fn drain_readers_after_termination(
-    stdout: &Option<Receiver<ReaderOutcome>>,
-    stderr: &Option<Receiver<ReaderOutcome>>,
-) {
-    let deadline = Instant::now() + READER_REAP_BUDGET;
-    for (stream, receiver) in [("stdout", stdout), ("stderr", stderr)] {
-        if let Err(error) = read_bounded_result(receiver, deadline) {
-            tracing::debug!(target: "thegn::vpn", %error, stream, "subprocess reader did not stop after termination");
-        }
-    }
-}
-
-fn terminate_and_reap(child: &mut Child, pid: u32) {
-    crate::plugin::proc::kill_group(pid);
-    let deadline = Instant::now() + PROCESS_REAP_BUDGET;
-    loop {
-        match child.try_wait() {
-            Ok(Some(_)) => return,
-            Err(error) => {
-                tracing::debug!(target: "thegn::vpn", %error, "subprocess reap poll failed");
-                break;
-            }
-            Ok(None) if Instant::now() < deadline => thread::sleep(Duration::from_millis(10)),
-            Ok(None) => break,
-        }
-    }
-    // Child owns its process until wait completes; never detach an unreaped
-    // Child handle even if the bounded polling budget was exhausted.
-    if let Err(error) = child.wait() {
-        tracing::debug!(target: "thegn::vpn", %error, "subprocess wait failed after termination");
-    }
+        stdout: String::from_utf8_lossy(&run.stdout.bytes).into_owned(),
+        stderr: String::from_utf8_lossy(&run.stderr.bytes).into_owned(),
+        stdout_truncated,
+        stderr_truncated,
+        truncated: stdout_truncated || stderr_truncated,
+    })
 }
 
 /// Poll the readiness probe until it succeeds or `timeout` elapses.
