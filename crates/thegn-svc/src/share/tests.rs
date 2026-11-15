@@ -3172,3 +3172,114 @@ fn stop_verified_reports_truncated_provider_output() {
     assert_eq!(report.dropped_lines, 0);
     assert_eq!(report.leaked_readers, 0);
 }
+
+// ── pending teardown retention (THE-330) ─────────────────────────────────────
+
+fn still_served(plan: &ServePlan) -> Result<()> {
+    serve_down_with(&[OciRuntime::podman()], plan, |_, argv| {
+        if argv == plan.down_argv.as_slice() {
+            Ok((true, String::new()))
+        } else {
+            Ok((true, r#"{"TCP":{"443":{"HTTPS":true}}}"#.into()))
+        }
+    })
+}
+
+#[test]
+fn teardown_outcome_decides_the_pending_record() {
+    let plan = serve_plan(thegn_core::config::TailscaleShareConfig::default(), 3000);
+    assert_eq!(teardown_outcome(&Ok(())), TeardownRecord::Clear);
+    assert_eq!(
+        teardown_outcome(&still_served(&plan)),
+        TeardownRecord::MarkPending
+    );
+    let other: Result<()> = Err(anyhow::anyhow!("vpn: no recorded runtime"));
+    assert_eq!(teardown_outcome(&other), TeardownRecord::Unchanged);
+    // Context on top of the typed error still marks the port.
+    let wrapped = still_served(&plan).context("share: outer");
+    assert_eq!(teardown_outcome(&wrapped), TeardownRecord::MarkPending);
+}
+
+#[test]
+fn serve_up_rollback_failure_is_a_typed_unverified_teardown() {
+    let plan = serve_plan(thegn_core::config::TailscaleShareConfig::default(), 3000);
+    let recorded = crate::vpn::RecordedSidecar {
+        runtime: OciRuntime::podman(),
+        id: "a".repeat(64),
+    };
+    let result = serve_up_with(&recorded, &plan, |_, _, argv| {
+        if argv == plan.up_argv.as_slice() || argv == plan.down_argv.as_slice() {
+            Ok((true, String::new()))
+        } else {
+            // Neither the DNS name nor a port-free status ever reads back.
+            Ok((false, String::new()))
+        }
+    });
+    let error = result.expect_err("unverified rollback must fail");
+    assert!(is_teardown_unverified(&error), "{error:#}");
+    assert!(error.to_string().contains("teardown unverified"));
+}
+
+#[test]
+fn unverified_teardown_is_recorded_pending_then_cleared_when_verified() {
+    let _state = thegn_core::testenv::IsolatedState::new();
+    let worktree = tempfile::tempdir().unwrap();
+    let plan = serve_plan(thegn_core::config::TailscaleShareConfig::default(), 3000);
+    crate::vpn::write_sidecar_record_for_test(
+        "c-tgvpn",
+        worktree.path(),
+        &"a".repeat(64),
+        2,
+        Vec::new(),
+    )
+    .unwrap();
+
+    let error = apply_teardown_outcome(still_served(&plan), "c-tgvpn", worktree.path(), plan.port)
+        .expect_err("unverified stays an error");
+    let message = format!("{error:#}");
+    assert!(message.contains("teardown unverified"), "{message}");
+    assert!(
+        message.contains(
+            "recorded tailscale serve port 443 as pending teardown; retry with `thegn share stop <local port>`"
+        ),
+        "{message}"
+    );
+    assert!(is_teardown_unverified(&error));
+    assert_eq!(
+        crate::vpn::pending_teardowns("c-tgvpn").unwrap(),
+        vec![plan.port]
+    );
+
+    apply_teardown_outcome(Ok(()), "c-tgvpn", worktree.path(), plan.port).unwrap();
+    assert_eq!(
+        crate::vpn::pending_teardowns("c-tgvpn").unwrap(),
+        Vec::<u16>::new()
+    );
+}
+
+#[test]
+fn unverified_teardown_reports_a_failed_pending_record() {
+    let _state = thegn_core::testenv::IsolatedState::new();
+    let worktree = tempfile::tempdir().unwrap();
+    let plan = serve_plan(thegn_core::config::TailscaleShareConfig::default(), 3000);
+
+    let error =
+        apply_teardown_outcome(still_served(&plan), "c-missing", worktree.path(), plan.port)
+            .expect_err("unverified stays an error");
+    let message = format!("{error:#}");
+    assert!(message.contains("teardown unverified"), "{message}");
+    assert!(
+        message.contains("could not record serve port 443 as pending teardown"),
+        "{message}"
+    );
+    assert!(message.contains("no recorded runtime"), "{message}");
+}
+
+#[test]
+fn verified_teardown_survives_a_failed_clear() {
+    let _state = thegn_core::testenv::IsolatedState::new();
+    let worktree = tempfile::tempdir().unwrap();
+
+    // No record: the clear fails, the verified teardown still succeeds.
+    assert!(apply_teardown_outcome(Ok(()), "c-missing", worktree.path(), 443).is_ok());
+}
