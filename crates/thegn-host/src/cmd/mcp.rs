@@ -114,7 +114,7 @@ pub enum Action {
     /// `claude mcp add thegn -- thegn mcp serve`.
     Serve {
         /// Scopes granted to the live-state tools (comma-separated:
-        /// read,write,git,merge_add,exec,admin). When omitted, the ceiling is resolved from
+        /// read,write,git,exec,admin). When omitted, the ceiling is resolved from
         /// config — the global `[mcp.serve] scopes`, narrowed by the active
         /// profile overlay — defaulting to `read` when nothing is configured;
         /// when given, it intersects that ceiling (clamp-only, never widening).
@@ -125,7 +125,7 @@ pub enum Action {
         /// `semantic_blast_radius`); the mutating tools (`sessions_open`,
         /// `sessions_input`, `sessions_kill`, `notify_push`) additionally need
         /// `write`, `folders_assign` needs `git`, and `merge_add` needs
-        /// `merge_add` (or `git`). Pass
+        /// `git`. Pass
         /// `none` (or any empty/unknown set) to serve docs tools only.
         #[arg(long, value_delimiter = ',')]
         scopes: Option<Vec<String>>,
@@ -443,6 +443,8 @@ fn allowed_state_caps(
         .filter(|id| {
             lookup(id).is_some_and(|c| scopes.allows(scope_of(c)))
                 && (*id != "sessions.input" || allow_session_input)
+                && (*id != "merge.add"
+                    || thegn_core::control::route_to_host_token_allows_worktree(scopes, "", ""))
         })
         .collect()
 }
@@ -1110,8 +1112,7 @@ mod tests {
 
     #[test]
     fn read_plus_git_adds_exactly_folder_assignment_and_merge_add() {
-        // `git` implies the narrow `merge_add` grant, so a Git-scoped server
-        // keeps merge enqueue alongside folder assignment.
+        // `git` grants merge enqueue alongside folder assignment.
         let mut expected = READ_CAPS.to_vec();
         expected.push("folders.assign");
         expected.push("merge.add");
@@ -1134,12 +1135,8 @@ mod tests {
         let write = allowed_state_caps(ScopeSet::parse("write"), false);
         assert!(write.contains(&"notify.push"), "{write:?}");
         assert!(!write.contains(&"merge.add"), "{write:?}");
-        // The single-verb grant enables exactly merge enqueue: it implies no
-        // read surface and no other write.
-        assert_eq!(
-            allowed_state_caps(ScopeSet::parse("merge_add"), false),
-            ["merge.add"]
-        );
+        // A naked merge_add grant is a worktree-bound route-to-host scope; unbound MCP callers need git (parity with HTTP/plugin).
+        assert!(allowed_state_caps(ScopeSet::parse("merge_add"), false).is_empty());
         let git = allowed_state_caps(ScopeSet::parse("git"), false);
         assert!(git.contains(&"merge.add"), "{git:?}");
         assert!(!git.contains(&"notify.push"), "{git:?}");
