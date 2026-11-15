@@ -1193,7 +1193,7 @@ pub async fn main(
     let (sandbox_event_tx, sandbox_event_rx) =
         tokio_mpsc::unbounded_channel::<crate::sandbox_events::SandboxEventBatch>();
     crate::sandbox_gc_gate::with_startup_sandbox_events(&cfg, || {
-        crate::sandbox_events::spawn(&cfg.sandbox, sandbox_event_tx);
+        crate::sandbox_events::spawn(&cfg.sandbox, sandbox_event_tx, waker.clone());
     });
     // Drained in the event loop below (audit run.rs:825): a container event was
     // written to the DB, so mark the audit panel dirty. Draining also stops the
