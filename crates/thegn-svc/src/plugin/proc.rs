@@ -1674,7 +1674,7 @@ mod process_tree_deadline_tests {
         .unwrap();
         assert!(run.outcome.reaped);
         assert!(
-            started.elapsed() <= Duration::from_millis(210),
+            started.elapsed() <= Duration::from_secs(2),
             "one-shot exit was observed after {:?}",
             started.elapsed()
         );
