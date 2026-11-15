@@ -30,6 +30,9 @@ impl schemars::JsonSchema for ApiVersion {
 
 /// Current Plugin API contract version implemented by this crate.
 ///
+/// v0.5 (additive over v0.4): the [`ExtensionPoint::WorktreeField`] extension point with
+/// resident row-field producers. A v0.4 manifest negotiates unchanged.
+///
 /// v0.4 (additive over v0.3): the [`ExtensionPoint::AppTab`] extension point with the
 /// [`crate::plugin_app`] AppView/AppEvent widget contract, and the [`PluginSpec::background`]
 /// permission for `background:sync`. A v0.3 manifest negotiates unchanged.
@@ -45,7 +48,7 @@ impl schemars::JsonSchema for ApiVersion {
 /// manifest projects. Older plugins keep negotiating; nothing was removed.
 pub const API_VERSION: ApiVersion = ApiVersion {
     major: 0,
-    minor: 4,
+    minor: 5,
     patch: 0,
 };
 
@@ -179,6 +182,7 @@ impl std::fmt::Display for Capability {
 fn surface_capability_for(ep: &ExtensionPoint) -> Option<Capability> {
     let scope = match ep {
         ExtensionPoint::AppTab => "app",
+        ExtensionPoint::WorktreeField => "rowfield",
         ExtensionPoint::StatusBarSegment => "statusbar",
         ExtensionPoint::PanelSection => "panel",
         ExtensionPoint::SidebarTab => "sidebar",
@@ -201,6 +205,8 @@ fn surface_capability_for(ep: &ExtensionPoint) -> Option<Capability> {
 /// The typed slots the host offers for plugins to fill.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Deserialize, Serialize, schemars::JsonSchema)]
 pub enum ExtensionPoint {
+    /// A resident producer of one sidebar worktree field (API 0.5).
+    WorktreeField,
     /// Resident application tab rendered from an [`crate::plugin_app::AppView`] (API 0.4).
     AppTab,
     StatusBarSegment,
@@ -241,6 +247,7 @@ impl ExtensionPoint {
     /// Stable wire spelling used by contract inspection and diagnostics.
     pub fn wire_name(&self) -> &str {
         match self {
+            Self::WorktreeField => "WorktreeField",
             Self::AppTab => "AppTab",
             Self::StatusBarSegment => "StatusBarSegment",
             Self::PanelSection => "PanelSection",
@@ -259,6 +266,42 @@ impl ExtensionPoint {
             Self::Unknown(name) => name,
         }
     }
+}
+
+/// The visual role a plugin may assign to a worktree row field.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize, schemars::JsonSchema)]
+pub enum RowRole {
+    Accent,
+    Dim,
+    Good,
+    Warn,
+    Bad,
+}
+
+/// One row-field value carried by an `update` notification.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize, schemars::JsonSchema)]
+pub struct RowUpdate {
+    pub worktree: String,
+    pub text: String,
+    pub role: RowRole,
+}
+
+/// The manifest capability payload for a `WorktreeField` contribution.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize, schemars::JsonSchema)]
+pub struct WorktreeFieldCaps {
+    pub field: String,
+    #[serde(default)]
+    pub slot: RowFieldSlot,
+}
+
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize, Serialize, schemars::JsonSchema,
+)]
+#[serde(rename_all = "lowercase")]
+pub enum RowFieldSlot {
+    #[default]
+    Detail,
+    Badge,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize, schemars::JsonSchema)]
@@ -680,9 +723,15 @@ impl HostContract {
                     "extension point {} requires declared capability {required}",
                     contrib.extension_point.wire_name()
                 ))
-            } else if contrib.extension_point == ExtensionPoint::AppTab && contrib.surface.is_none()
+            } else if matches!(
+                contrib.extension_point,
+                ExtensionPoint::AppTab | ExtensionPoint::WorktreeField
+            ) && contrib.surface.is_none()
             {
-                Some("extension point AppTab requires a surface".into())
+                Some(format!(
+                    "extension point {} requires a surface",
+                    contrib.extension_point.wire_name()
+                ))
             } else if accepted_ids.contains(contrib.id.as_str()) {
                 Some(format!("duplicate contribution id {}", contrib.id.as_str()))
             } else if let Some(surface) = &contrib.surface
@@ -1218,6 +1267,32 @@ impl PluginRuntime {
             .cloned()
             .unwrap_or_else(|| Capability::new("surface", "unknown"));
         self.audit(plugin, cap, "app.update")
+    }
+
+    /// Authorize a row-field update against the contribution's negotiated
+    /// `surface:rowfield` grant. The host performs the field/contribution
+    /// lookup; this method keeps the audit and surface capability check in the
+    /// same runtime boundary as app updates.
+    pub fn authorize_row_field_update(
+        &mut self,
+        plugin: PluginId,
+        surface: &SurfaceId,
+    ) -> Result<(), PluginApiError> {
+        let surface_bytes = surface.as_str().len();
+        if surface_bytes > MAX_PLUGIN_IDENTIFIER_BYTES {
+            return Err(quota_error(
+                "surface identifier bytes",
+                surface_bytes,
+                MAX_PLUGIN_IDENTIFIER_BYTES,
+            ));
+        }
+        let cap = self
+            .surface_caps
+            .get(surface)
+            .filter(|c| c.as_str() == "surface:rowfield")
+            .cloned()
+            .unwrap_or_else(|| Capability::new("surface", "unknown"));
+        self.audit(plugin, cap, "rowfield.update")
     }
 
     pub fn update(
@@ -2241,6 +2316,16 @@ const PROVIDER_CALLBACKS: &[PluginCallback] =
 /// the wire enum independently.
 pub static HOST_EXTENSION_SUPPORT: &[ExtensionPointSupport] = &[
     ExtensionPointSupport {
+        extension_point: ExtensionPoint::WorktreeField,
+        since: ApiVersion::new(0, 5, 0),
+        state: SupportState::Wired,
+        required_capability: Some("surface:rowfield"),
+        modes: RESIDENT_MODE,
+        cadences: ON_DEMAND,
+        callbacks: PALETTE_CALLBACKS,
+        owner: "sidebar row fields",
+    },
+    ExtensionPointSupport {
         extension_point: ExtensionPoint::AppTab,
         since: ApiVersion::new(0, 4, 0),
         state: SupportState::Wired,
@@ -2618,9 +2703,9 @@ mod wire_tests {
 
     #[test]
     fn current_version_and_panel_section_capability() {
-        // The bump is 0.4.0; app and panel rendering surfaces map to their capabilities.
+        // The bump is 0.5.0; app, row-field, and panel rendering surfaces map to their capabilities.
         // surface capability beside statusbar — covering the new match arm.
-        assert_eq!(API_VERSION, ApiVersion::new(0, 4, 0));
+        assert_eq!(API_VERSION, ApiVersion::new(0, 5, 0));
         assert_eq!(
             surface_capability_for(&ExtensionPoint::AppTab),
             Some(Capability::new("surface", "app"))
@@ -2628,6 +2713,10 @@ mod wire_tests {
         assert_eq!(
             surface_capability_for(&ExtensionPoint::PanelSection),
             Some(Capability::new("surface", "panel"))
+        );
+        assert_eq!(
+            surface_capability_for(&ExtensionPoint::WorktreeField),
+            Some(Capability::new("surface", "rowfield"))
         );
         // The existing surfaces are unchanged.
         assert_eq!(
@@ -2653,6 +2742,7 @@ mod wire_tests {
 
         for (point, target) in [
             (ExtensionPoint::AppTab, Some("app")),
+            (ExtensionPoint::WorktreeField, Some("rowfield")),
             (ExtensionPoint::StatusBarSegment, Some("statusbar")),
             (ExtensionPoint::PanelSection, Some("panel")),
             (ExtensionPoint::SidebarTab, Some("sidebar")),
@@ -4133,6 +4223,92 @@ timeout_secs = 5
     }
 
     #[test]
+    fn v0_4_manifest_still_negotiates_on_a_v0_5_host() {
+        let host = current_host_contract();
+        let mut spec = support_spec(
+            ExtensionPoint::StatusBarSegment,
+            vec![Capability::new("surface", "statusbar")],
+            PluginMode::Resident,
+        );
+        spec.manifest.api = ApiVersion::new(0, 4, 0);
+        let negotiated = host.negotiate_spec(&spec).unwrap();
+        assert_eq!(
+            negotiated.accepted_contributions,
+            spec.manifest.contributions
+        );
+    }
+
+    #[test]
+    fn row_field_negotiation_is_capability_and_mode_gated() {
+        let host = current_host_contract();
+        let mut spec = support_spec(
+            ExtensionPoint::WorktreeField,
+            vec![Capability::new("surface", "rowfield")],
+            PluginMode::Resident,
+        );
+        spec.manifest.contributions[0].caps = serde_json::json!({
+            "field": "ci",
+            "slot": "badge"
+        });
+        assert_eq!(
+            host.negotiate_spec(&spec)
+                .unwrap()
+                .accepted_contributions
+                .len(),
+            1
+        );
+
+        let mut old = spec.clone();
+        old.manifest.api = ApiVersion::new(0, 4, 0);
+        let old_negotiated = host.negotiate_spec(&old).unwrap();
+        assert!(old_negotiated.accepted_contributions.is_empty());
+        assert!(
+            old_negotiated.rejected_contributions[0]
+                .reason
+                .contains("requires API 0.5.0")
+        );
+
+        let mut missing_capability = spec.clone();
+        missing_capability.manifest.capabilities.clear();
+        let rejected = host.negotiate_spec(&missing_capability).unwrap();
+        assert!(
+            rejected.rejected_contributions[0]
+                .reason
+                .contains("requires declared capability surface:rowfield")
+        );
+
+        let mut one_shot = spec;
+        one_shot.mode = PluginMode::OneShot;
+        let rejected = host.negotiate_spec(&one_shot).unwrap();
+        assert!(
+            rejected.rejected_contributions[0]
+                .reason
+                .contains("does not support mode one_shot")
+        );
+    }
+
+    #[test]
+    fn row_update_wire_round_trips_with_empty_rows() {
+        let message = RpcMessage::notification(
+            PluginCallback::Render,
+            serde_json::json!({
+                "surface": "ci",
+                "rows": [{"worktree": "/tmp/a", "text": "ok", "role": "Good"}]
+            }),
+        );
+        let encoded = serde_json::to_string(&message).unwrap();
+        let decoded: RpcMessage = serde_json::from_str(&encoded).unwrap();
+        assert_eq!(decoded.params["rows"][0]["role"], "Good");
+        let empty = serde_json::to_value(RowUpdate {
+            worktree: "/tmp/a".into(),
+            text: String::new(),
+            role: RowRole::Dim,
+        })
+        .unwrap();
+        assert_eq!(empty["text"], "");
+    }
+
+    #[test]
     fn authorize_app_update_audits_app_capability_and_checks_surface_quota() {
         let plugin = PluginId::new("app-update-test");
         let spec = support_spec(
@@ -4167,8 +4343,44 @@ timeout_secs = 5
     }
 
     #[test]
+    fn authorize_row_field_update_audits_rowfield_capability_and_checks_surface_quota() {
+        let plugin = PluginId::new("row-update-test");
+        let mut spec = support_spec(
+            ExtensionPoint::WorktreeField,
+            vec![Capability::new("surface", "rowfield")],
+            PluginMode::Resident,
+        );
+        spec.manifest.contributions[0].caps = serde_json::json!({"field": "ci"});
+        let negotiated = current_host_contract().negotiate_spec(&spec).unwrap();
+        let surface = spec.manifest.contributions[0].surface.clone().unwrap();
+        let mut runtime = PluginRuntime::new(negotiated);
+        assert!(
+            runtime
+                .authorize_row_field_update(plugin.clone(), &surface)
+                .is_ok()
+        );
+        let audit = runtime.audit_log().last().unwrap();
+        assert_eq!(audit.capability, Capability::new("surface", "rowfield"));
+        assert_eq!(audit.operation, "rowfield.update");
+        assert!(
+            runtime
+                .authorize_row_field_update(plugin.clone(), &SurfaceId::new("undeclared"))
+                .is_err()
+        );
+        let oversized = SurfaceId::new("s".repeat(MAX_PLUGIN_IDENTIFIER_BYTES + 1));
+        assert!(matches!(
+            runtime.authorize_row_field_update(plugin, &oversized),
+            Err(PluginApiError::QuotaExceeded {
+                what: "surface identifier bytes",
+                ..
+            })
+        ));
+    }
+
+    #[test]
     fn current_host_support_tables_are_complete_and_unique() {
         let expected_points = [
+            "WorktreeField",
             "AppTab",
             "StatusBarSegment",
             "PanelSection",
