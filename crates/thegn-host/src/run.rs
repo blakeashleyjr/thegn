@@ -30,8 +30,8 @@ use crate::detail::apply_ci_detail;
 pub(crate) use crate::drawer_state::DrawerRuntime;
 use crate::gitmut::{GitOp, GitOpResult};
 use crate::handlers::provision::{
-    ProvisionProgress, SpecBatch, SpecDrainCtx, SpecError, drain_provision, drain_specs,
-    sandbox_halt_in, sandbox_halt_overlay, spec_err,
+    ProvisionTx, SpecBatch, SpecDrainCtx, SpecError, drain_provision, drain_specs, sandbox_halt_in,
+    sandbox_halt_overlay, spec_err,
 };
 use crate::hydrate::{
     RefreshKind, active_tab_path, build_initial_model, load_or_seed_session,
@@ -1204,15 +1204,18 @@ pub async fn main(
     // the audit panel has live data. Silently no-ops when the selected backend
     // has no events transport (reserved/no cap) or its runtime binary is not
     // on PATH.
-    let (sandbox_event_tx, sandbox_event_rx) =
-        tokio_mpsc::unbounded_channel::<crate::sandbox_events::SandboxEventBatch>();
+    // THE-661: a bounded atomic count, not an unbounded channel of batches.
+    let sandbox_event_counter =
+        std::sync::Arc::new(crate::sandbox_events::SandboxEventCounter::default());
     crate::sandbox_gc_gate::with_startup_sandbox_events(&cfg, || {
-        crate::sandbox_events::spawn(&cfg.sandbox, sandbox_event_tx, waker.clone());
+        crate::sandbox_events::spawn(
+            &cfg.sandbox,
+            std::sync::Arc::clone(&sandbox_event_counter),
+            waker.clone(),
+        );
     });
-    // Drained in the event loop below (audit run.rs:825): a container event was
-    // written to the DB, so mark the audit panel dirty. Draining also stops the
-    // unbounded channel from growing for the process lifetime when the sidecar
-    // produces but nothing consumes.
+    // Taken in the event loop below (audit run.rs:825): a container event was
+    // written to the DB, so mark the audit panel dirty.
 
     // Notification event bus (items 420/421/430): aggregates git/agent/test/log
     // events and feeds desktop notifications + the in-app inbox + sidebar badges.
@@ -1279,7 +1282,7 @@ pub async fn main(
         container_slot,
         daemon_status_slot,
         metrics_inbox,
-        sandbox_event_rx,
+        sandbox_event_counter,
         stats_interval_ms,
         stats_live,
         process_worker
@@ -6988,7 +6991,7 @@ async fn event_loop<T: Terminal>(
     container_slot: crate::snapshot_slot::SnapshotSlot<crate::hydrate::ContainerRefresh>,
     daemon_status_slot: crate::snapshot_slot::SnapshotSlot<crate::chrome::DaemonStatus>,
     metrics_inbox: crate::metrics::MetricsInbox,
-    mut sandbox_event_rx: tokio_mpsc::UnboundedReceiver<crate::sandbox_events::SandboxEventBatch>,
+    sandbox_event_counter: std::sync::Arc<crate::sandbox_events::SandboxEventCounter>,
     stats_interval_ms: std::sync::Arc<std::sync::atomic::AtomicU64>,
     stats_live: std::sync::Arc<std::sync::atomic::AtomicBool>,
     process_control: Option<crate::proc_worker::Control>,
@@ -7154,7 +7157,9 @@ async fn event_loop<T: Terminal>(
     // streams the setup steps (clone → toolchain → tools → dotfiles → snapshot)
     // as `LoadStep`s so the splash shows a rich "setting up your environment"
     // screen while a fresh provider sandbox is built. Keyed (group name, tab).
-    let (provision_tx, mut provision_rx) = tokio_mpsc::unbounded_channel::<ProvisionProgress>();
+    // THE-661: a bounded latest-per-key slot (key and byte caps), waking the
+    // loop only on empty-to-non-empty.
+    let (provision_tx, mut provision_inbox) = ProvisionTx::channel(waker.clone());
     // Drawer cold-spawn pipeline: policy resolution and PATH/filesystem work
     // run off-loop; the registry channel is the only result boundary.
     let (drawer_registry_tx, mut drawer_registry_rx) =
@@ -7181,7 +7186,7 @@ async fn event_loop<T: Terminal>(
     // source of truth for the splash. `model.load_steps` is DERIVED from the
     // active worktree's entry each frame (see below), so switching worktrees
     // preserves each one's provisioning progress instead of resetting it. Written
-    // by the lazy-materialize seed + `provision_rx`/`spec_rx`; an entry is dropped
+    // by the lazy-materialize seed + `provision_inbox`/`spec_rx`; an entry is dropped
     // on the owning pane's first PTY output (loading done) or on a hard failure.
     // The tracker (not a bare map) is the one write path: it stamps/carries each
     // step's `started_at` across whole-Vec replacement so per-step elapsed time
@@ -7215,7 +7220,7 @@ async fn event_loop<T: Terminal>(
     let mut loading_remote: std::collections::HashMap<(String, usize), bool> =
         std::collections::HashMap::new();
     // Keys (group name, tab) whose shell already spoke ⇒ splash RETIRED: drop a
-    // late `provision_rx` update that would re-raise it (the flash-back flicker).
+    // late `provision_inbox` update that would re-raise it (the flash-back flicker).
     // Cleared on a fresh materialize. See `loading::splash_update_allowed`.
     let mut loading_retired: std::collections::HashSet<(String, usize)> =
         std::collections::HashSet::new();
@@ -11457,18 +11462,16 @@ async fn event_loop<T: Terminal>(
         {
             dirty = true;
         }
-        // THE-657: one shared ingress budget per iteration. Budgeted sources
-        // take a bounded, lossless batch; anything left queued re-arms one
-        // wake after the refresh drain below (no timer).
-        let mut ingress = crate::ingress_budget::IterationBudget::new(
-            std::time::Instant::now(),
-            crate::ingress_budget::LOOP_DEADLINE,
-            !pending_input.is_empty(),
-        );
+        // THE-657: budgeted sources take a bounded, lossless batch; anything
+        // left queued re-arms one wake after the refresh drain below (no
+        // timer). A budget measures only its own drain: each drain gets a
+        // fresh one created right before it, so the thousands of lines of
+        // loop body between two drains cannot spend the later one's deadline.
+        let mut clone_budget = drain_budget(std::time::Instant::now(), !pending_input.is_empty());
         let (clone_batch, clone_more) = crate::ingress_budget::take_batch(
             &mut workspace_clone_rx,
             crate::ingress_budget::WORKSPACE_CLONE_SOURCE,
-            &mut ingress,
+            &mut clone_budget,
             &mut ingress_rotation,
             std::time::Instant::now,
         );
@@ -12268,7 +12271,7 @@ async fn event_loop<T: Terminal>(
         // Live env-provisioning progress for the active tab → the splash
         // (see handlers::provision::drain_provision).
         if drain_provision(
-            &mut provision_rx,
+            &mut provision_inbox,
             &session,
             &mut loading_state,
             &mut loading_remote,
@@ -13460,9 +13463,10 @@ async fn event_loop<T: Terminal>(
 
         // Sandbox container audit events (exec/network, via the sandbox seam's
         // events op) landed in the DB
-        // off-thread; drain so the audit panel re-renders and the channel can't
-        // grow unbounded (audit run.rs:825).
-        while sandbox_event_rx.try_recv().is_ok() {
+        // off-thread; take the pending count so the audit panel re-renders.
+        // THE-661: one atomic word, so nothing can grow unbounded; one tick
+        // per drain that found new events.
+        if sandbox_event_counter.take() > 0 {
             loop_perf.tick(crate::perf::WakeSource::Container);
             dirty = true;
         }
@@ -14580,10 +14584,12 @@ async fn event_loop<T: Terminal>(
             kick_model_hydration!();
             need_relayout = true;
         }
+        // THE-657: a fresh budget, measuring only this drain (see the clone drain).
+        let mut refresh_budget = drain_budget(std::time::Instant::now(), !pending_input.is_empty());
         let (refresh_batch, refresh_more) = crate::ingress_budget::take_batch(
             &mut refresh_rx,
             crate::ingress_budget::REFRESH_SOURCE,
-            &mut ingress,
+            &mut refresh_budget,
             &mut ingress_rotation,
             std::time::Instant::now,
         );
@@ -28769,6 +28775,85 @@ fn action_allowed_during_schema_refusal(action: &crate::keymap::Action) -> bool 
             | Action::SwitchMode(_)
             | Action::ToggleKeyLock
     )
+}
+
+/// THE-657: a fresh ingress budget for exactly one budgeted drain.
+///
+/// A budget measures only the drain it is created for. Sharing one across
+/// drains far apart in the loop body let the earlier work spend the later
+/// drain's deadline, starving it to one message per iteration.
+fn drain_budget(
+    now: std::time::Instant,
+    input_pending: bool,
+) -> crate::ingress_budget::IterationBudget {
+    crate::ingress_budget::IterationBudget::new(
+        now,
+        crate::ingress_budget::LOOP_DEADLINE,
+        input_pending,
+    )
+}
+
+#[cfg(test)]
+mod drain_budget_tests {
+    use super::drain_budget;
+    use crate::ingress_budget::{LOOP_DEADLINE, REFRESH_SOURCE, take_batch};
+    use std::time::{Duration, Instant};
+
+    #[test]
+    fn spent_clone_budget_does_not_constrain_fresh_refresh_budget() {
+        let start = Instant::now();
+        // The clone drain's budget is spent long before the refresh drain runs.
+        let mut clone_budget = drain_budget(start, false);
+        clone_budget.advance(start + LOOP_DEADLINE * 10);
+        assert!(clone_budget.deadline_spent());
+
+        // The refresh drain, created later, has its own full deadline.
+        let later = start + LOOP_DEADLINE * 10;
+        let mut refresh_budget = drain_budget(later, false);
+        assert!(!refresh_budget.deadline_spent());
+        assert_eq!(refresh_budget.deadline_at(), later + LOOP_DEADLINE);
+
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<u32>();
+        for i in 0..200 {
+            assert!(tx.send(i).is_ok());
+        }
+        let mut rotation = 0usize;
+        let (batch, more) = take_batch(
+            &mut rx,
+            REFRESH_SOURCE,
+            &mut refresh_budget,
+            &mut rotation,
+            || later,
+        );
+        // Bounded by the message limit, not the stale clock: 64 per drain.
+        assert_eq!(batch.len(), REFRESH_SOURCE.limits.max_msgs);
+        assert!(more);
+
+        // The old shared-budget shape: a spent budget yields only mandatory progress.
+        let (tx2, mut rx2) = tokio::sync::mpsc::unbounded_channel::<u32>();
+        for i in 0..200 {
+            assert!(tx2.send(i).is_ok());
+        }
+        let (starved, _) = take_batch(
+            &mut rx2,
+            REFRESH_SOURCE,
+            &mut clone_budget,
+            &mut rotation,
+            || later,
+        );
+        assert_eq!(starved.len(), 1);
+    }
+
+    #[test]
+    fn pending_input_halves_each_drain_budget() {
+        let start = Instant::now();
+        let budget = drain_budget(start + Duration::from_millis(1), true);
+        assert!(budget.input_pending());
+        assert_eq!(
+            budget.deadline_at(),
+            start + Duration::from_millis(1) + LOOP_DEADLINE / 2
+        );
+    }
 }
 
 #[cfg(test)]
