@@ -96,7 +96,7 @@ mod tests {
         for (plugin, field, key, text) in entries {
             snapshot
                 .entry((plugin.to_string(), field.to_string()))
-                .or_insert_with(BTreeMap::new)
+                .or_default()
                 .insert(key.to_string(), value(text));
         }
         snapshot
