@@ -284,7 +284,7 @@ Resources mirror these: `thegn://help/<id>` per page, `thegn://config/current`,
 resources/tools never serve secrets — token/key/credential fields are masked
 before `get_config` / `thegn://config/current` go out.
 
-Beyond the docs tools, `--scopes` (comma-separated `read,write,git,exec,admin`,
+Beyond the docs tools, `--scopes` (comma-separated `read,write,git,merge_add,exec,admin`,
 default `read`) gates a set of **state tools** that talk to a running pane
 daemon — default-deny: a tool neither appears in `tools/list` nor is callable
 until its scope is granted.
@@ -307,6 +307,8 @@ until its scope is granted.
 | `issues_list`               | `read`        | list tracker issues (status/limit/project/query, registered repo)      |
 | `issues_get`                | `read`        | one tracker issue with detail and comments                             |
 | `dispatches_list`           | `read`        | the agent-dispatch roster, newest first (limit/before paging)          |
+| `merge_add`                 | `merge_add`   | enqueue a worktree's branch on the merge queue (`git` also grants it)  |
+| `notify_push`               | `write`       | push a tray notification (title, optional body/urgency/source)         |
 | `sessions_open`             | `write`       | open a session — raw `argv`, or a configured agent by name             |
 | `sessions_kill`             | `write`       | kill a session's process (idempotent)                                  |
 | `sessions_input`            | `write` **+** | send raw terminal input/control characters to a live session           |
@@ -335,8 +337,8 @@ verbatim.
 Every tool in `tools/list` carries MCP `annotations`: the docs tools and the
 `read`-scope state tools are `readOnlyHint: true`; `sessions_kill`,
 `sessions_input` and `tools_run` are `destructiveHint: true`; `folders_assign`,
-`editor_open`, `sessions_open` and `sessions_fork` are write tools marked
-`destructiveHint: false`. A new write tool is marked destructive until it is
+`editor_open`, `merge_add`, `notify_push`, `sessions_open` and `sessions_fork`
+are write tools marked `destructiveHint: false`. A new write tool is marked destructive until it is
 reviewed. The hints help clients ask before acting; the scopes above are what
 thegn enforces.
 

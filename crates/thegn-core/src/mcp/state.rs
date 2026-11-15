@@ -233,6 +233,20 @@ pub const STATE_TOOLS: &[StateToolSpec] = &[
         }],
     },
     StateToolSpec {
+        cap: "merge.add",
+        description: "Enqueue a worktree's branch on its repository's merge queue. Defaults \
+                      to the server's resolved worktree when `worktree` is omitted. \
+                      Additive: it never removes queue entries. Merge-add-scoped \
+                      (`--scopes merge_add`, also granted by `--scopes git`); requires a \
+                      running daemon.",
+        args: &[ArgSpec {
+            name: "worktree",
+            kind: ArgKind::String,
+            required: false,
+            description: "Absolute path of the worktree; defaults to the resolved worktree",
+        }],
+    },
+    StateToolSpec {
         cap: "pr.status",
         description: "Read cached pull-request status, one row per worktree. Read-scoped; \
                       requires a running daemon.",
@@ -687,6 +701,39 @@ pub const STATE_TOOLS: &[StateToolSpec] = &[
         }],
     },
     StateToolSpec {
+        cap: "notify.push",
+        description: "Push a notification into thegn's tray (the wire mirror of `thegn notify \
+                      push`). `urgency` `alert`/`critical` raise the red-flag priority; \
+                      anything else lands at the normal notice tier. Additive. Write-scoped \
+                      (`--scopes write`); requires a running daemon.",
+        args: &[
+            ArgSpec {
+                name: "title",
+                kind: ArgKind::String,
+                required: true,
+                description: "Short summary line (the inbox message when `body` is empty)",
+            },
+            ArgSpec {
+                name: "body",
+                kind: ArgKind::String,
+                required: false,
+                description: "Longer detail, appended to the inbox message when non-empty",
+            },
+            ArgSpec {
+                name: "urgency",
+                kind: ArgKind::String,
+                required: false,
+                description: "`alert` or `critical` for the red-flag tier; otherwise normal",
+            },
+            ArgSpec {
+                name: "source",
+                kind: ArgKind::String,
+                required: false,
+                description: "Opaque source reference stored on the row (defaults to `api`)",
+            },
+        ],
+    },
+    StateToolSpec {
         cap: "automations.list",
         description: "List trusted global/profile automation rules, inert reasons, and recent audited outcomes. Read-only.",
         args: &[],
@@ -750,6 +797,7 @@ pub const MCP_STATE_CAPS: &[&str] = &[
     "preview.fetch",
     "git.status",
     "merge.list",
+    "merge.add",
     "pr.status",
     "leases.list",
     "me",
@@ -768,6 +816,7 @@ pub const MCP_STATE_CAPS: &[&str] = &[
     "sessions.kill",
     "semantic.map",
     "semantic.blast_radius",
+    "notify.push",
     "automations.list",
     "automations.test",
     "tools.run",
@@ -897,6 +946,8 @@ fn input_schema(args: &[ArgSpec]) -> Value {
 const NON_DESTRUCTIVE_WRITE_CAPS: &[&str] = &[
     "folders.assign",
     "editor.open",
+    "merge.add",
+    "notify.push",
     "sessions.open",
     "sessions.fork",
 ];
@@ -1168,6 +1219,104 @@ mod tests {
     }
 
     #[test]
+    fn merge_add_and_notify_push_are_advertised_only_when_allowed() {
+        let r = StateRouter::new(vec!["merge.list", "pr.status"], |_, _| Ok(json!(null)));
+        let names: Vec<String> = r
+            .tool_entries()
+            .iter()
+            .map(|t| t["name"].as_str().unwrap().to_string())
+            .collect();
+        assert!(!names.iter().any(|n| n == "merge_add" || n == "notify_push"));
+        // A disallowed call is refused with the scope that would grant it,
+        // and never reaches the fetch.
+        let denied = StateRouter::new(vec!["merge.list"], |_, _| -> Result<Value, String> {
+            panic!("a denied tool must not reach fetch")
+        });
+        let (code, msg) = denied.call("merge_add", &json!({})).unwrap().unwrap_err();
+        assert_eq!(code, -32001);
+        assert!(msg.contains("--scopes merge_add"), "{msg}");
+        let (code, msg) = denied
+            .call("notify_push", &json!({ "title": "t" }))
+            .unwrap()
+            .unwrap_err();
+        assert_eq!(code, -32001);
+        assert!(msg.contains("--scopes write"), "{msg}");
+
+        let r = StateRouter::new(vec!["merge.add", "notify.push"], |_, _| Ok(json!(null)));
+        let entries = r.tool_entries();
+        let names: Vec<&str> = entries
+            .iter()
+            .map(|e| e["name"].as_str().unwrap())
+            .collect();
+        assert_eq!(names, ["merge_add", "notify_push"]);
+        let merge = &entries[0]["inputSchema"];
+        assert_eq!(merge["required"], json!([]));
+        assert_eq!(merge["properties"]["worktree"]["type"], "string");
+        let note = &entries[1]["inputSchema"];
+        assert_eq!(note["required"], json!(["title"]));
+        for key in ["title", "body", "urgency", "source"] {
+            assert_eq!(note["properties"][key]["type"], "string", "{key}");
+        }
+        // Daemon-internal automation ancestry is never caller-supplied.
+        assert!(note["properties"].get("automation_origin").is_none());
+    }
+
+    #[test]
+    fn merge_add_rejects_a_non_string_worktree_before_fetch() {
+        let r = StateRouter::new(vec!["merge.add"], |_, _| -> Result<Value, String> {
+            panic!("invalid args must not reach fetch")
+        });
+        let (code, msg) = r
+            .call("merge_add", &json!({ "worktree": 7 }))
+            .unwrap()
+            .unwrap_err();
+        assert_eq!(code, -32602);
+        assert!(msg.contains("`worktree`"), "{msg}");
+    }
+
+    #[test]
+    fn notify_push_requires_a_string_title_and_rejects_ancestry() {
+        let r = StateRouter::new(vec!["notify.push"], |_, _| -> Result<Value, String> {
+            panic!("invalid args must not reach fetch")
+        });
+        for bad in [
+            json!({}),
+            json!({ "title": 1 }),
+            json!({ "title": "t", "urgency": true }),
+            json!({ "title": "t", "automation_origin": {} }),
+        ] {
+            let (code, _) = r.call("notify_push", &bad).unwrap().unwrap_err();
+            assert_eq!(code, -32602, "{bad}");
+        }
+    }
+
+    #[test]
+    fn merge_add_and_notify_push_route_their_cap_ids_to_fetch() {
+        let r = StateRouter::new(vec!["merge.add", "notify.push"], |cap, args| {
+            Ok(json!({ "cap": cap, "args": args }))
+        });
+        let merged = r
+            .call("merge_add", &json!({ "worktree": "/repo/wt" }))
+            .unwrap()
+            .unwrap();
+        let text = merged["content"][0]["text"].as_str().unwrap();
+        assert!(text.contains("merge.add"), "{text}");
+        assert!(text.contains("/repo/wt"), "{text}");
+        // `worktree` is optional: the host resolves it when omitted.
+        assert!(r.call("merge_add", &json!({})).unwrap().is_ok());
+        let pushed = r
+            .call(
+                "notify_push",
+                &json!({ "title": "done", "body": "b", "urgency": "alert", "source": "ci" }),
+            )
+            .unwrap()
+            .unwrap();
+        let text = pushed["content"][0]["text"].as_str().unwrap();
+        assert!(text.contains("notify.push"), "{text}");
+        assert!(text.contains("done"), "{text}");
+    }
+
+    #[test]
     fn tool_entries_string_array_declares_items() {
         let r = StateRouter::new(vec!["sessions.open"], |_, _| Ok(json!(null)));
         let entries = r.tool_entries();
@@ -1310,6 +1459,7 @@ mod tests {
         ];
         let write = [
             "editor.open",
+            "notify.push",
             "sessions.open",
             "sessions.fork",
             "sessions.input",
@@ -1317,6 +1467,8 @@ mod tests {
         ];
         // Folder assignment is a repo-local worktree metadata mutation: Git.
         let git = ["folders.assign"];
+        // Merge enqueue has its own single-verb scope (which `git` implies).
+        let merge_add = ["merge.add"];
         let exec = ["tools.run"];
         for cap in read {
             let c = lookup(cap).expect("state cap in catalog");
@@ -1334,11 +1486,16 @@ mod tests {
             let c = lookup(cap).expect("state cap in catalog");
             assert_eq!(scope_of(c), Scope::Exec, "{cap}");
         }
+        for cap in merge_add {
+            let c = lookup(cap).expect("state cap in catalog");
+            assert_eq!(scope_of(c), Scope::MergeAdd, "{cap}");
+        }
         // Exhaustive: every implemented cap is in one of the two groups.
         let mut grouped: Vec<&str> = read
             .iter()
             .chain(write.iter())
             .chain(git.iter())
+            .chain(merge_add.iter())
             .chain(exec.iter())
             .copied()
             .collect();
@@ -1489,6 +1646,8 @@ mod tests {
             ("sessions_input", false, true),
             ("tools_run", false, true),
             ("folders_assign", false, false),
+            ("merge_add", false, false),
+            ("notify_push", false, false),
             ("editor_open", false, false),
             ("sessions_open", false, false),
             ("sessions_fork", false, false),

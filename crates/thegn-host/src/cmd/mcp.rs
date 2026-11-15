@@ -114,7 +114,7 @@ pub enum Action {
     /// `claude mcp add thegn -- thegn mcp serve`.
     Serve {
         /// Scopes granted to the live-state tools (comma-separated:
-        /// read,write,git,exec,admin). When omitted, the ceiling is resolved from
+        /// read,write,git,merge_add,exec,admin). When omitted, the ceiling is resolved from
         /// config — the global `[mcp.serve] scopes`, narrowed by the active
         /// profile overlay — defaulting to `read` when nothing is configured;
         /// when given, it intersects that ceiling (clamp-only, never widening).
@@ -123,7 +123,9 @@ pub enum Action {
         /// `merge_list`, `pr_status`, `leases_list`, `me`,
         /// `agent_sessions`, `sessions_wait`, `semantic_map`,
         /// `semantic_blast_radius`); the mutating tools (`sessions_open`,
-        /// `sessions_input`, `sessions_kill`) additionally need `write`, and `folders_assign` needs `git`. Pass
+        /// `sessions_input`, `sessions_kill`, `notify_push`) additionally need
+        /// `write`, `folders_assign` needs `git`, and `merge_add` needs
+        /// `merge_add` (or `git`). Pass
         /// `none` (or any empty/unknown set) to serve docs tools only.
         #[arg(long, value_delimiter = ',')]
         scopes: Option<Vec<String>>,
@@ -535,6 +537,25 @@ async fn fetch_state(
                 "worktree".into(),
                 json!(worktree.to_string_lossy().to_string()),
             );
+            let (method, path, body) = thegn_svc::control::routes::build_call(cap, params)?;
+            c.call_raw(method, &path, body)
+                .await
+                .map_err(|e| e.to_string())
+        }
+        // Additive writes routed generically through the control catalog.
+        // `merge.add` resolves an omitted `worktree` like `merge.list`; the
+        // `notify.push` arguments are exactly the validated `PushedNote`
+        // caller fields (automation ancestry is never MCP-supplied).
+        "merge.add" | "notify.push" => {
+            let c = client.map_err(|_| NO_DAEMON.to_string())?;
+            let mut params = args.as_object().cloned().unwrap_or_default();
+            if cap == "merge.add" && !params.contains_key("worktree") {
+                let worktree = super::resolve_worktree(None);
+                params.insert(
+                    "worktree".into(),
+                    json!(worktree.to_string_lossy().to_string()),
+                );
+            }
             let (method, path, body) = thegn_svc::control::routes::build_call(cap, params)?;
             c.call_raw(method, &path, body)
                 .await
@@ -1088,14 +1109,42 @@ mod tests {
     }
 
     #[test]
-    fn read_plus_git_adds_exactly_folder_assignment() {
+    fn read_plus_git_adds_exactly_folder_assignment_and_merge_add() {
+        // `git` implies the narrow `merge_add` grant, so a Git-scoped server
+        // keeps merge enqueue alongside folder assignment.
         let mut expected = READ_CAPS.to_vec();
         expected.push("folders.assign");
+        expected.push("merge.add");
         assert_eq!(
             sorted(allowed_state_caps(ScopeSet::parse("read,git"), false)),
             sorted(expected),
             "--scopes read,git"
         );
+    }
+
+    #[test]
+    fn merge_add_and_notify_push_are_write_tools_never_read() {
+        for cap in ["merge.add", "notify.push"] {
+            assert!(!READ_CAPS.contains(&cap), "{cap} must not be read-scoped");
+            assert!(
+                !allowed_state_caps(ScopeSet::parse("read"), true).contains(&cap),
+                "--scopes read must not grant {cap}"
+            );
+        }
+        let write = allowed_state_caps(ScopeSet::parse("write"), false);
+        assert!(write.contains(&"notify.push"), "{write:?}");
+        assert!(!write.contains(&"merge.add"), "{write:?}");
+        // The single-verb grant enables exactly merge enqueue: it implies no
+        // read surface and no other write.
+        assert_eq!(
+            allowed_state_caps(ScopeSet::parse("merge_add"), false),
+            ["merge.add"]
+        );
+        let git = allowed_state_caps(ScopeSet::parse("git"), false);
+        assert!(git.contains(&"merge.add"), "{git:?}");
+        assert!(!git.contains(&"notify.push"), "{git:?}");
+        let both = allowed_state_caps(ScopeSet::parse("write,git"), false);
+        assert!(both.contains(&"merge.add") && both.contains(&"notify.push"));
     }
 
     #[test]
