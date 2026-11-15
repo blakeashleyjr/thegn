@@ -3216,21 +3216,21 @@ mod tests {
         run(&["commit", "-q", "--allow-empty", "-m", "init"]);
         let head = git_out_strict(dir.path(), &["rev-parse", "HEAD"]).unwrap();
         assert!(head.ends_with('\n'), "strict output must stay untrimmed");
-        let msg = dir.path().join("msg.bin");
-        std::fs::write(&msg, b"bad \xff byte\n").unwrap();
-        run(&[
-            "commit",
-            "-q",
-            "--allow-empty",
-            "--cleanup=verbatim",
-            "-F",
-            msg.to_str().unwrap(),
-        ]);
+        // git re-encodes a non-UTF-8 commit message to UTF-8, so store the byte in a blob
+        // (kept verbatim) and read it back with cat-file.
+        let blob = dir.path().join("blob.bin");
+        std::fs::write(&blob, b"bad \xff byte\n").unwrap();
+        let sha =
+            git_out_strict(dir.path(), &["hash-object", "-w", blob.to_str().unwrap()]).unwrap();
+        let sha = sha.trim();
         assert!(matches!(
-            git_out_strict(dir.path(), &["cat-file", "commit", "HEAD"]),
+            git_out_strict(dir.path(), &["cat-file", "blob", sha]),
             Err(GitTextError::InvalidUtf8)
         ));
-        assert!(git_out_raw(dir.path(), &["cat-file", "commit", "HEAD"]).is_ok());
+        assert_eq!(
+            git_out_raw(dir.path(), &["cat-file", "blob", sha]).unwrap(),
+            b"bad \xff byte\n".to_vec()
+        );
     }
 
     #[test]
