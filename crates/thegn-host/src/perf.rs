@@ -66,6 +66,10 @@ pub fn report_interval() -> Duration {
     Duration::from_millis(ms)
 }
 
+fn db_open_top_sites_text(stats: &thegn_core::db_open_stats::OpenStats) -> String {
+    stats.top_sites_text()
+}
+
 /// Wakes/sec above which, while the loop is otherwise idle, we shout a wake
 /// storm warning (`THEGN_PERF_WAKE_LIMIT`, default 20).
 pub fn wake_storm_limit() -> f64 {
@@ -1160,6 +1164,7 @@ impl LoopPerf {
             db_open_loop_calls = db_open.calls,
             db_open_loop_mean_us = db_open.mean_us(),
             db_open_loop_max_us = db_open.max_us,
+            db_open_loop_top_sites = %db_open_top_sites_text(&db_open),
             render_full_p50_us = snap.render_full_p50_us,
             render_full_p99_us = snap.render_full_p99_us,
             render_incr_p50_us = snap.render_incr_p50_us,
@@ -1324,6 +1329,13 @@ mod tests {
     // Fixed limits matching the production defaults so the cases read clearly.
     const WAKE: f64 = 20.0;
     const PTY: f64 = 200.0;
+
+    #[test]
+    fn db_open_top_sites_text_returns_an_owned_string() {
+        let rendered: String =
+            db_open_top_sites_text(&thegn_core::db_open_stats::OpenStats::default());
+        assert!(rendered.is_empty());
+    }
 
     #[test]
     fn busy_loop_never_storms() {
