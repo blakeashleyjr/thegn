@@ -17,7 +17,7 @@ use thegn_metrics::collect::{
     health::{Absent, Health},
     model::{
         amd_smu::{AmdSmuCard, AmdSmuStatus},
-        cpu_policy::{CpuPolicy, SysToken},
+        cpu_policy::{CoreClass, CpuPolicy, SysToken},
         power_supply::{SupplyKind, SupplyReading, SupplyStatus},
         powercap::{PowerDomain, PowercapZone},
     },
@@ -1149,3 +1149,63 @@ fn empty_warming_frame_renders_ellipsis_for_unavailable_values() {
     assert!(text(&mut surface).contains(caps::active_glyphs().ellipsis));
 }
 const HISTORY_SEED: usize = 120;
+
+fn policy_lines(policies: Vec<CpuPolicy>, cols: usize, rows: usize) -> Vec<String> {
+    let mut frame = fixture();
+    frame.parts.cpu_freq.policies = policies;
+    let mut model = PowerModel::default();
+    model.absorb_frame(&frame);
+    let mut grid = crate::monitor::kit::grid::CellGrid::new(cols, rows);
+    super::paint::paint_policy(&mut grid, Rect::full(cols, rows), &model);
+    (0..rows)
+        .map(|row| {
+            (0..cols)
+                .map(|col| grid.get(col, row).map_or(' ', |cell| cell.ch))
+                .collect::<String>()
+        })
+        .collect()
+}
+
+#[test]
+fn policy_rows_show_core_class_and_unknown_is_unchanged() {
+    let policy = |n: u16, core_class| CpuPolicy {
+        policy: n,
+        core_class,
+        ..CpuPolicy::default()
+    };
+    let lines = policy_lines(
+        vec![
+            policy(0, CoreClass::Performance),
+            policy(1, CoreClass::Efficiency),
+            policy(2, CoreClass::Unknown),
+        ],
+        80,
+        8,
+    );
+    let row = |needle: &str| {
+        lines
+            .iter()
+            .find(|line| line.contains(needle))
+            .cloned()
+            .unwrap_or_default()
+    };
+    assert!(row("policy 0 perf  ").contains("policy 0 perf  "));
+    assert!(row("policy 1 eff  ").contains("policy 1 eff  "));
+    let unknown = row("policy 2");
+    assert!(unknown.contains("policy 2  "));
+    assert!(!unknown.contains("perf") && !unknown.contains("eff"));
+}
+
+#[test]
+fn policy_row_tag_overflow_is_clipped_without_panic() {
+    let lines = policy_lines(
+        vec![CpuPolicy {
+            policy: 0,
+            core_class: CoreClass::Efficiency,
+            ..CpuPolicy::default()
+        }],
+        8,
+        4,
+    );
+    assert_eq!(lines.len(), 4);
+}
