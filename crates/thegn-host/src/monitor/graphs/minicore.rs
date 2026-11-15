@@ -94,7 +94,7 @@ pub(crate) fn paint_minicore(
     }
     let mut fresh = Vec::new();
     if w > 0 {
-        if label_w > 0 && w >= label_w + PCT_W + 1 {
+        if label_w > 0 && w > label_w + PCT_W {
             fresh.push(text_seg(out, label_tok, &[label], 0));
             fresh.push(text_seg(
                 out,
