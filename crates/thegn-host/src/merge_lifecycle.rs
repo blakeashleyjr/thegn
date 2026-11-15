@@ -1036,6 +1036,10 @@ fn vanished_group_indices(
 }
 
 #[cfg(test)]
+#[path = "merge_lifecycle_cleanup_tests.rs"]
+mod cleanup_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use std::path::{Path, PathBuf};
