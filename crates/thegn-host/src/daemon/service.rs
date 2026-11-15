@@ -145,6 +145,11 @@ pub(crate) static CI_LOG_FLIGHTS: CiLogFlights = CiLogFlights::new();
 /// `MAX_CONCURRENT_CI_LOG_FETCHES x LOG_COLLECTOR_PEAK_BYTES` of streamed provider log at once, however many clients call.
 pub(crate) const MAX_CONCURRENT_CI_LOG_FETCHES: usize = 2;
 
+/// One run-detail call plus one log call share this deadline; each provider
+/// call's own timeout is clipped to what is left. Permit queue wait is not counted.
+pub(crate) const CI_LOGS_OPERATION_DEADLINE: std::time::Duration =
+    std::time::Duration::from_secs(90);
+
 /// How long a cache-missing `ci.logs` request waits for a fetch slot before a typed busy refusal (well under the ingest wall).
 pub(crate) const CI_LOG_FETCH_PERMIT_WAIT: std::time::Duration = std::time::Duration::from_secs(30);
 
@@ -2538,11 +2543,15 @@ impl ControlApi for DaemonService {
             let _cancel_on_drop = CancelOnDrop(cancel.clone());
             let (mut entry, warnings, _flight, _permit) = tokio::task::spawn_blocking(move || {
                 let flight = flight_for_provider;
+                let deadline = std::time::Instant::now() + CI_LOGS_OPERATION_DEADLINE;
                 let permit = permit;
                 let loc = thegn_core::remote::GitLoc::for_worktree(&provider_path);
-                let Some((client, context)) =
-                    thegn_svc::ci::provider_and_context_for_cancellable(&loc, &cfg, cancel)
-                else {
+                let Some((client, context)) = thegn_svc::ci::provider_and_context_for_deadline(
+                    &loc,
+                    &cfg,
+                    cancel,
+                    Some(deadline),
+                ) else {
                     return Ok(None);
                 };
                 let detail = client
@@ -4781,6 +4790,14 @@ mod tests {
                 "registered repo must pass confinement: {e:?}"
             );
         }
+    }
+
+    #[test]
+    fn ci_logs_operation_deadline_is_ninety_seconds() {
+        assert_eq!(
+            CI_LOGS_OPERATION_DEADLINE,
+            std::time::Duration::from_secs(90)
+        );
     }
 
     #[tokio::test]
