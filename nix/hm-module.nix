@@ -344,11 +344,15 @@ self: {
     notifications.agent_attention_inbox = cfg.notificationsAgentAttentionInbox;
     notifications.merge_queue_hold_desktop = cfg.notificationsMergeQueueHoldDesktop;
     notifications.dnd.enabled = cfg.notificationsDndEnabled;
+    notifications.dnd.allow_priority = cfg.notificationsDndAllowPriority;
     notifications.sound.mode = cfg.notificationsSoundMode;
     notifications.sound.always_kinds = cfg.notificationsSoundAlwaysKinds;
     notifications.sound.mute = cfg.notificationsSoundMute;
     notifications.sound.suppress_focused = cfg.notificationsSoundSuppressFocused;
     notifications.sound.volume = cfg.notificationsSoundVolume;
+    notifications.sound.min_priority = cfg.notificationsSoundMinPriority;
+    notifications.sound.per_priority = cfg.notificationsSoundPerPriority;
+    notifications.sound.per_kind = cfg.notificationsSoundPerKind;
     activity.enabled = cfg.activityEnabled;
     activity.red_requires_agent = cfg.activityRedRequiresAgent;
     activity.agent_programs = cfg.activityAgentPrograms;
@@ -1229,6 +1233,12 @@ in {
       description = "Enable do-not-disturb notification handling. Unset (null) = the binary's default.";
     };
 
+    notificationsDndAllowPriority = lib.mkOption {
+      type = lib.types.nullOr (lib.types.enum ["info" "notice" "alert"]);
+      default = null;
+      description = "Lowest notification priority that still gets through do-not-disturb. Unset (null) = the binary's default.";
+    };
+
     notificationsSoundMode = lib.mkOption {
       type = lib.types.nullOr (lib.types.enum ["off" "chime" "bell" "command"]);
       default = null;
@@ -1257,6 +1267,26 @@ in {
       type = lib.types.nullOr (lib.types.numbers.between 0 1);
       default = null;
       description = "Notification sound volume (0.0 through 1.0). Unset (null) = the binary's default.";
+    };
+
+    notificationsSoundMinPriority = lib.mkOption {
+      type = lib.types.nullOr (lib.types.enum ["info" "notice" "alert"]);
+      default = null;
+      description = "Lowest notification priority that plays a sound. Unset (null) = the binary's default.";
+    };
+
+    notificationsSoundPerPriority = lib.mkOption {
+      type = lib.types.nullOr (lib.types.attrsOf lib.types.str);
+      default = null;
+      example = lib.literalExpression ''{ alert = "bell"; }'';
+      description = "Per-priority sound overrides. Keys are priorities (info, notice, alert), values are sound references; invalid entries are refused at load. Unset (null) = the binary's default.";
+    };
+
+    notificationsSoundPerKind = lib.mkOption {
+      type = lib.types.nullOr (lib.types.attrsOf lib.types.str);
+      default = null;
+      example = lib.literalExpression ''{ agent_blocked = "bell"; }'';
+      description = "Per-kind sound overrides. Keys are notification kind names, values are sound references; invalid entries are refused at load. Unset (null) = the binary's default.";
     };
 
     activityEnabled = lib.mkOption {

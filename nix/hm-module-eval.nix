@@ -168,6 +168,10 @@
           notificationsSoundAlwaysKinds = ["agent_blocked"];
           notificationsSoundSuppressFocused = false;
           notificationsSoundVolume = 0.5;
+          notificationsDndAllowPriority = "notice";
+          notificationsSoundMinPriority = "notice";
+          notificationsSoundPerPriority = {alert = "bell";};
+          notificationsSoundPerKind = {agent_blocked = "bell";};
           activityEnabled = false;
           activityRedRequiresAgent = false;
           activityAgentPrograms = ["claude" "my-agent"];
