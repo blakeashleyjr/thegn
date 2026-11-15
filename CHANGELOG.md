@@ -7,6 +7,8 @@ All notable changes to **thegn** are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.1.0-alpha.82] — 2026-11-14
+
 ### Added
 
 - The `THEGN_PERF=1` rollup now reports the three busiest database-open call sites.
@@ -3487,7 +3489,8 @@ launcher picker and the merge queue's `agent_command` hook remain — they run
 whatever commands you configure. Leftover `[llm_proxy]` config sections and
 `proxy_*` tables in existing state databases are ignored harmlessly.
 
-[Unreleased]: https://github.com/blakeashleyjr/thegn/compare/v0.1.0-alpha.81...HEAD
+[Unreleased]: https://github.com/blakeashleyjr/thegn/compare/v0.1.0-alpha.82...HEAD
+[0.1.0-alpha.82]: https://github.com/blakeashleyjr/thegn/compare/v0.1.0-alpha.81...v0.1.0-alpha.82
 [0.1.0-alpha.81]: https://github.com/blakeashleyjr/thegn/compare/v0.1.0-alpha.80...v0.1.0-alpha.81
 [0.1.0-alpha.80]: https://github.com/blakeashleyjr/thegn/compare/v0.1.0-alpha.79...v0.1.0-alpha.80
 [0.1.0-alpha.79]: https://github.com/blakeashleyjr/thegn/compare/v0.1.0-alpha.78...v0.1.0-alpha.79
