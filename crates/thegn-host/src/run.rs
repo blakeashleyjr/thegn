@@ -9393,6 +9393,9 @@ async fn event_loop<T: Terminal>(
     drop(startup_db);
     loop_perf.take(); // loop metrics start here; startup has its own waterfall
     let mut active_clock = crate::perf_timing::ActiveClock::default();
+    // THE-657: fair-turn rotation shared by the budgeted ingress drains,
+    // carried across iterations so sustained readiness cannot pin one source.
+    let mut ingress_rotation: usize = 0;
     loop {
         // Input handlers may continue early after closing/pausing the view.
         // Revoke first, before unrelated hydration work; positive admission
@@ -11454,7 +11457,22 @@ async fn event_loop<T: Terminal>(
         {
             dirty = true;
         }
-        while let Ok(ev) = workspace_clone_rx.try_recv() {
+        // THE-657: one shared ingress budget per iteration. Budgeted sources
+        // take a bounded, lossless batch; anything left queued re-arms one
+        // wake after the refresh drain below (no timer).
+        let mut ingress = crate::ingress_budget::IterationBudget::new(
+            std::time::Instant::now(),
+            crate::ingress_budget::LOOP_DEADLINE,
+            !pending_input.is_empty(),
+        );
+        let (clone_batch, clone_more) = crate::ingress_budget::take_batch(
+            &mut workspace_clone_rx,
+            crate::ingress_budget::WORKSPACE_CLONE_SOURCE,
+            &mut ingress,
+            &mut ingress_rotation,
+            std::time::Instant::now,
+        );
+        for ev in clone_batch {
             loop_perf.tick(crate::perf::WakeSource::Other);
             crate::workspace_create::apply_clone_event(
                 ev,
@@ -14562,7 +14580,14 @@ async fn event_loop<T: Terminal>(
             kick_model_hydration!();
             need_relayout = true;
         }
-        while let Ok(kind) = refresh_rx.try_recv() {
+        let (refresh_batch, refresh_more) = crate::ingress_budget::take_batch(
+            &mut refresh_rx,
+            crate::ingress_budget::REFRESH_SOURCE,
+            &mut ingress,
+            &mut ingress_rotation,
+            std::time::Instant::now,
+        );
+        for kind in refresh_batch {
             loop_perf.tick(crate::perf::WakeSource::Refresh);
             let kind = match kind {
                 RefreshKind::Scheduled { generation, kind } => {
@@ -14946,6 +14971,13 @@ async fn event_loop<T: Terminal>(
                 // future producer cannot silently bypass the admission fence.
                 RefreshKind::Scheduled { .. } => {}
             }
+        }
+        // THE-657: a budgeted source that stopped with work queued re-arms
+        // exactly one wake, so the remainder drains on the next iteration.
+        if (clone_more || refresh_more)
+            && let Err(e) = waker.wake()
+        {
+            tracing::debug!(target: "thegn::ingress", "ingress re-arm waker pulse failed: {e}");
         }
         // Fast-forward the canonical main checkout if its ref advanced (throttled ~2s,
         // off-loop). What the heal saw is recorded only if it really spawns (a
