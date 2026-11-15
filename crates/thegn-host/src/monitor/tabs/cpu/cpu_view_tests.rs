@@ -969,3 +969,46 @@ fn frequency_hybrid_summary_is_clipped_at_narrow_widths() {
         assert_eq!(lines.len(), 4);
     }
 }
+
+fn itmt_lines(itmt: Option<bool>, cols: usize) -> Vec<String> {
+    let mut part = thegn_metrics::collect::model::cpu_freq::CpuFreqPart::default();
+    part.policies.push(CpuPolicy {
+        cur_khz: Some(2_000_000),
+        core_class: CoreClass::Performance,
+        ..CpuPolicy::default()
+    });
+    part.policies.push(CpuPolicy {
+        policy: 1,
+        cur_khz: Some(2_000_000),
+        core_class: CoreClass::Efficiency,
+        ..CpuPolicy::default()
+    });
+    part.power.itmt = itmt;
+    let mut grid = crate::monitor::kit::grid::CellGrid::new(cols, 6);
+    super::paint::paint_freq(&mut grid, Rect::full(cols, 6), &part, Health::Ok);
+    (0..6)
+        .map(|row| {
+            (0..cols)
+                .map(|col| grid.get(col, row).map_or(' ', |cell| cell.ch))
+                .collect::<String>()
+        })
+        .collect()
+}
+
+#[test]
+fn frequency_profile_line_shows_itmt_only_when_enabled() {
+    let on = itmt_lines(Some(true), 80).remove(1);
+    assert!(on.contains(" hybrid 1P/1E itmt"), "{on:?}");
+    let off = itmt_lines(Some(false), 80).remove(1);
+    let none = itmt_lines(None, 80).remove(1);
+    assert!(!off.contains("itmt") && !none.contains("itmt"));
+    assert!(off.contains(" hybrid 1P/1E"), "{off:?}");
+    assert_eq!(off, none);
+}
+
+#[test]
+fn frequency_itmt_suffix_is_clipped_at_narrow_widths() {
+    for cols in 1..24 {
+        assert_eq!(itmt_lines(Some(true), cols).len(), 6);
+    }
+}
