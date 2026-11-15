@@ -8,8 +8,8 @@ use std::path::{Path, PathBuf};
 
 use thegn_core::config::Config;
 use thegn_core::plugin_api::{
-    API_VERSION, CadenceHint, Capability, HOST_EXTENSION_SUPPORT, HostContract, NativeTrust,
-    NegotiatedManifest, PluginSpec, SupportState,
+    API_VERSION, CadenceHint, Capability, ExtensionPoint, HOST_EXTENSION_SUPPORT, HostContract,
+    NativeTrust, NegotiatedManifest, PluginSpec, SupportState, WorktreeFieldCaps,
 };
 
 pub use thegn_core::plugin_api::MAX_PLUGIN_TIMEOUT_SECS;
@@ -26,6 +26,7 @@ pub const MAX_PLUGIN_DIRS: usize = 256;
 pub const MAX_MANIFEST_BYTES: usize = 64 * 1024;
 pub const MIN_PLUGIN_ROUTING_ID_BYTES: usize = 1;
 pub const MAX_PLUGIN_ROUTING_ID_BYTES: usize = 128;
+pub const MAX_WORKTREE_FIELD_NAME_BYTES: usize = 32;
 
 /// The extension points this host build actually renders/consumes. The wire
 /// enum is intentionally broader; a point belongs here only after its complete
@@ -507,6 +508,14 @@ fn valid_env_key(key: &str) -> bool {
             .all(|byte| byte.is_ascii_alphanumeric() || *byte == b'_')
 }
 
+fn valid_worktree_field_name(name: &str) -> bool {
+    let bytes = name.as_bytes();
+    (1..=MAX_WORKTREE_FIELD_NAME_BYTES).contains(&bytes.len())
+        && bytes.iter().all(|byte| {
+            byte.is_ascii_lowercase() || byte.is_ascii_digit() || *byte == b'_' || *byte == b'-'
+        })
+}
+
 fn launch_field_bytes(spec: &PluginSpec) -> usize {
     let command_bytes = spec.command.iter().fold(0_usize, |total, argument| {
         total.saturating_add(argument.len()).saturating_add(1)
@@ -631,6 +640,20 @@ fn check_spec_fields(p: &LoadedPlugin) -> Vec<SpecProblem> {
                 "contribution {} interval millis must be {MIN_PLUGIN_INTERVAL_MILLIS}..={MAX_PLUGIN_INTERVAL_MILLIS}",
                 quoted_prefix(contribution.id.as_str())
             ));
+        }
+        if contribution.extension_point == ExtensionPoint::WorktreeField {
+            match serde_json::from_value::<WorktreeFieldCaps>(contribution.caps.clone()) {
+                Ok(caps) if valid_worktree_field_name(&caps.field) => {}
+                Ok(caps) => push(format!(
+                    "contribution {}: worktree field name must be 1..={MAX_WORKTREE_FIELD_NAME_BYTES} ASCII bytes using [a-z0-9_-] (got {})",
+                    quoted_prefix(contribution.id.as_str()),
+                    quoted_prefix(&caps.field)
+                )),
+                Err(error) => push(format!(
+                    "contribution {}: invalid WorktreeField caps: {error}",
+                    quoted_prefix(contribution.id.as_str())
+                )),
+            }
         }
     }
     match p.spec.command.first() {
@@ -865,6 +888,63 @@ mod tests {
                 .iter()
                 .any(|problem| problem.problem.contains("plugin id must be"))
         );
+    }
+
+    #[test]
+    fn check_spec_accepts_worktree_field_and_rejects_invalid_field_name() {
+        let mut plugin = spec("rowfield", vec!["true".into()]);
+        plugin
+            .manifest
+            .capabilities
+            .push(Capability::new("surface", "rowfield"));
+        plugin
+            .manifest
+            .contributions
+            .push(thegn_core::plugin_api::Contribution {
+                id: thegn_core::plugin_api::ContributionId::new("rowfield.detail"),
+                extension_point: ExtensionPoint::WorktreeField,
+                label: "CI".into(),
+                surface: Some(thegn_core::plugin_api::SurfaceId::new("rowfield.ci")),
+                cadence: CadenceHint::OnDemand,
+                metadata: Default::default(),
+                caps: serde_json::to_value(WorktreeFieldCaps {
+                    field: "ci_status".into(),
+                    slot: thegn_core::plugin_api::RowFieldSlot::Detail,
+                })
+                .unwrap(),
+                chord: None,
+            });
+        let loaded = LoadedPlugin {
+            spec: plugin.clone(),
+            dir: None,
+            trusted_native_ignored: false,
+        };
+        assert!(check_spec(&loaded).is_empty());
+
+        let invalid_fields = [
+            String::new(),
+            "CI".into(),
+            "has space".into(),
+            "x".repeat(33),
+        ];
+        for field in &invalid_fields {
+            let mut invalid = plugin.clone();
+            invalid.spec.manifest.contributions[0].caps = serde_json::json!({
+                "field": field,
+                "slot": "detail"
+            });
+            let problems = check_spec(&LoadedPlugin {
+                spec: invalid,
+                dir: None,
+                trusted_native_ignored: false,
+            });
+            assert!(
+                problems
+                    .iter()
+                    .any(|problem| problem.problem.contains("worktree field name")),
+                "field {field:?} should be rejected: {problems:?}"
+            );
+        }
     }
 
     #[test]
