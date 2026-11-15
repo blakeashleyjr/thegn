@@ -589,7 +589,7 @@ mod tests {
     use super::super::{CliGit, GitBackend};
     use super::{
         CasOutcome, MergeTreeOutcome, PlumbingOps, RefRead, classify_cas_failure, fenced,
-        is_object_id, parse_commit_metas, parse_merge_base,
+        is_object_id, parse_commit_metas, parse_merge_base, parse_merge_tree,
     };
     use std::path::Path;
     use std::process::Command;
@@ -1401,5 +1401,318 @@ mod tests {
         let status = repo.out(&["status", "--porcelain"]);
         assert!(status.lines().any(|line| line == " M g.txt"), "{status}");
         assert!(!status.lines().any(|line| line == "M  g.txt"), "{status}");
+    }
+
+    // --- truncation / mutation / shape tables (THE-383) ---
+
+    /// Message holding tab, newline, a non-ASCII char and an embedded `\r`.
+    const HOSTILE_MESSAGE: &str = "tab\there\nnew line \u{e9}\rcr";
+    const META_DATE: &str = "2026-01-02T03:04:05+00:00";
+
+    fn meta_oid(n: usize) -> String {
+        format!("{n:040x}")
+    }
+
+    fn meta_fields(n: usize) -> Vec<String> {
+        let parent = if n == 0 {
+            String::new()
+        } else {
+            meta_oid(n - 1)
+        };
+        vec![
+            meta_oid(n),
+            parent,
+            "Ann \u{d6}".to_string(),
+            "a@e".to_string(),
+            META_DATE.to_string(),
+            HOSTILE_MESSAGE.to_string(),
+        ]
+    }
+
+    fn meta_record(fields: &[String]) -> String {
+        let mut out = fields.join("\0");
+        out.push('\0');
+        out
+    }
+
+    fn meta_records(count: usize) -> Vec<String> {
+        let mut records = Vec::new();
+        for n in 0..count {
+            records.push(meta_record(&meta_fields(n)));
+        }
+        records
+    }
+
+    fn meta_with(index: usize, value: &str) -> String {
+        let mut fields = meta_fields(1);
+        fields[index] = value.to_string();
+        meta_record(&fields)
+    }
+
+    #[test]
+    fn commit_metas_truncation_table_every_byte_offset() {
+        let records = meta_records(4);
+        let input: String = records.concat();
+        let mut bounds = vec![0usize];
+        let mut total = 0usize;
+        for record in &records {
+            total += record.len();
+            bounds.push(total);
+        }
+        for cut in 0..=input.len() {
+            if !input.is_char_boundary(cut) {
+                continue;
+            }
+            let parsed = parse_commit_metas(&input[..cut]);
+            match bounds.iter().position(|b| *b == cut) {
+                Some(count) => {
+                    let rows = parsed.unwrap_or_else(|e| panic!("cut {cut} must parse: {e}"));
+                    assert_eq!(rows.len(), count, "cut {cut}");
+                }
+                None => assert!(parsed.is_err(), "cut {cut} mid-record must be rejected"),
+            }
+        }
+    }
+
+    #[test]
+    fn commit_metas_hostile_message_round_trips() {
+        let parsed = parse_commit_metas(&meta_records(2).concat()).unwrap();
+        assert_eq!(parsed.len(), 2);
+        assert_eq!(parsed[1].message, format!("{HOSTILE_MESSAGE}\n"));
+        assert_eq!(parsed[1].author.name, "Ann \u{d6}");
+        assert_eq!(parsed[1].parents, vec![meta_oid(0)]);
+        assert_eq!(parsed[0].parent, "");
+    }
+
+    #[test]
+    fn commit_metas_mutation_table() {
+        let good = meta_with(2, "Ann");
+        let mut missing = meta_fields(1);
+        missing.remove(3);
+        let mut seven = meta_fields(1);
+        seven.push("extra".to_string());
+        let arity = "expected a multiple of 6";
+        let table = vec![
+            (
+                "non-hex oid",
+                meta_with(0, &"z".repeat(40)),
+                "invalid commit object id",
+            ),
+            (
+                "39-char oid",
+                meta_with(0, &"a".repeat(39)),
+                "invalid commit object id",
+            ),
+            ("empty oid", meta_with(0, ""), "invalid commit object id"),
+            (
+                "non-hex parent",
+                meta_with(1, &"z".repeat(40)),
+                "invalid parent object ids",
+            ),
+            (
+                "short parent",
+                meta_with(1, "abc"),
+                "invalid parent object ids",
+            ),
+            ("empty date", meta_with(4, ""), "invalid author date"),
+            (
+                "spaced date",
+                meta_with(4, "2026-01-02 03:04"),
+                "invalid author date",
+            ),
+            ("tab date", meta_with(4, "\t"), "invalid author date"),
+            (
+                "duplicate record",
+                format!("{good}{good}"),
+                "duplicate commit object id",
+            ),
+            ("extra trailing NUL", format!("{good}\0"), arity),
+            ("doubled NUL", good.replacen('\0', "\0\0", 1), arity),
+            ("missing field", meta_record(&missing), arity),
+            ("extra field", meta_record(&seven), arity),
+            (
+                "no final NUL",
+                good.trim_end_matches('\0').to_string(),
+                "final NUL",
+            ),
+        ];
+        for (label, input, expect) in &table {
+            let error = parse_commit_metas(input).expect_err(label);
+            assert!(error.to_string().contains(expect), "{label}: {error}");
+        }
+    }
+
+    #[test]
+    fn commit_metas_date_is_opaque_so_letters_and_signs_are_accepted() {
+        // Pinned laxity: only empty / whitespace-bearing dates are refused.
+        for date in ["abc", "+100", "-5", "@100"] {
+            let parsed = parse_commit_metas(&meta_with(4, date)).unwrap();
+            assert_eq!(parsed[0].author.date, date);
+        }
+    }
+
+    #[test]
+    fn commit_metas_minimal_thousand_and_five_thousand() {
+        assert_eq!(
+            parse_commit_metas(&meta_records(1).concat()).unwrap().len(),
+            1
+        );
+        assert_eq!(
+            parse_commit_metas(&meta_records(1000).concat())
+                .unwrap()
+                .len(),
+            1000
+        );
+        let parsed = parse_commit_metas(&meta_records(5000).concat()).unwrap();
+        assert_eq!(parsed.len(), 5000);
+        assert_eq!(parsed[4999].parent, meta_oid(4998));
+    }
+
+    #[test]
+    fn merge_base_output_truncation_and_mutation_table() {
+        let oid = "ab".repeat(20);
+        let input = format!("{oid}\n");
+        for cut in 0..=input.len() {
+            let parsed = parse_merge_base(0, &input[..cut], "");
+            if cut >= 40 {
+                assert_eq!(parsed.unwrap(), Some(oid.clone()), "cut {cut}");
+            } else {
+                assert!(parsed.is_err(), "cut {cut} must be rejected");
+            }
+        }
+        let bad = [
+            ("empty", String::new()),
+            ("blank line", "\n".to_string()),
+            ("doubled newline", format!("{oid}\n\n")),
+            ("crlf", format!("{oid}\r\n")),
+            ("trailing space", format!("{oid} \n")),
+            ("trailing NUL", format!("{oid}\0")),
+            ("non-hex", format!("{}\n", "z".repeat(40))),
+            ("two lines", format!("{oid}\n{oid}\n")),
+            ("short", format!("{}\n", "a".repeat(39))),
+            ("long", format!("{}\n", "a".repeat(41))),
+        ];
+        for (label, stdout) in &bad {
+            assert!(parse_merge_base(0, stdout, "").is_err(), "{label}");
+        }
+        assert!(parse_merge_base(0, &"c".repeat(64), "").is_ok());
+        let failed = parse_merge_base(2, "", " boom \n").unwrap_err();
+        assert!(failed.to_string().contains("failed: boom"), "{failed}");
+        assert_eq!(parse_merge_base(1, "ignored", "").unwrap(), None);
+    }
+
+    fn merge_tree_conflict_stdout(tree: &str) -> String {
+        format!("{tree}\0a b.txt\0dir/\u{e9}.txt\0\0Auto-merging x\0CONFLICT (content): msg\0")
+    }
+
+    #[test]
+    fn merge_tree_truncation_table_every_byte_offset() {
+        let tree = "cd".repeat(20);
+        let clean = format!("{tree}\n");
+        for cut in 0..=clean.len() {
+            let parsed = parse_merge_tree(0, &clean[..cut], "");
+            if cut >= 40 {
+                assert_eq!(
+                    parsed.unwrap(),
+                    MergeTreeOutcome::Clean { tree: tree.clone() },
+                    "clean cut {cut}"
+                );
+            } else {
+                assert!(parsed.is_err(), "clean cut {cut} must be rejected");
+            }
+        }
+
+        let stdout = merge_tree_conflict_stdout(&tree);
+        let full_paths = ["a b.txt", "dir/\u{e9}.txt"];
+        for cut in 0..=stdout.len() {
+            if !stdout.is_char_boundary(cut) {
+                continue;
+            }
+            let parsed = parse_merge_tree(1, &stdout[..cut], "");
+            if cut < 40 {
+                assert!(parsed.is_err(), "conflict cut {cut} must be rejected");
+                continue;
+            }
+            // Pinned: once the tree oid is whole, a truncated conflict list
+            // is accepted (shorter list, last path possibly cut short).
+            let MergeTreeOutcome::Conflict { tree: got, paths } =
+                parsed.unwrap_or_else(|e| panic!("conflict cut {cut} must parse: {e}"))
+            else {
+                panic!("exit 1 is always a conflict");
+            };
+            assert_eq!(got, tree, "cut {cut}");
+            assert!(paths.len() <= full_paths.len(), "cut {cut}");
+            for (index, path) in paths.iter().enumerate() {
+                assert!(
+                    full_paths[index].starts_with(path.as_str()),
+                    "cut {cut}: {path:?}"
+                );
+            }
+        }
+        let whole = parse_merge_tree(1, &stdout, "").unwrap();
+        assert_eq!(
+            whole,
+            MergeTreeOutcome::Conflict {
+                tree,
+                paths: vec!["a b.txt".to_string(), "dir/\u{e9}.txt".to_string()],
+            }
+        );
+    }
+
+    #[test]
+    fn merge_tree_mutation_table() {
+        let tree = "ef".repeat(20);
+        let bad_oids = [
+            ("empty", String::new()),
+            ("non-hex", "z".repeat(40)),
+            ("39-char", "a".repeat(39)),
+            ("41-char", "a".repeat(41)),
+            ("two oids", format!("{tree}\n{tree}")),
+        ];
+        for (label, oid) in &bad_oids {
+            let clean = parse_merge_tree(0, &format!("{oid}\n"), "").unwrap_err();
+            assert!(
+                clean.to_string().contains("invalid tree oid"),
+                "{label}: {clean}"
+            );
+            let conflict = parse_merge_tree(1, &format!("{oid}\0f\0"), "").unwrap_err();
+            assert!(
+                conflict.to_string().contains("on conflict"),
+                "{label}: {conflict}"
+            );
+        }
+        for code in [2, 128, -1] {
+            let failed = parse_merge_tree(code, &tree, "boom\n").unwrap_err();
+            assert!(
+                failed.to_string().contains("failed: boom"),
+                "{code}: {failed}"
+            );
+        }
+    }
+
+    #[test]
+    fn merge_tree_tolerant_shapes_are_pinned() {
+        let tree = "12".repeat(20);
+        // Surrounding whitespace on the oid and trailing NULs are ignored.
+        assert_eq!(
+            parse_merge_tree(0, &format!("  {tree}\n\0\0junk"), "").unwrap(),
+            MergeTreeOutcome::Clean { tree: tree.clone() }
+        );
+        // A doubled NUL right after the oid ends the path list immediately.
+        assert_eq!(
+            parse_merge_tree(1, &format!("{tree}\0\0f\0"), "").unwrap(),
+            MergeTreeOutcome::Conflict {
+                tree: tree.clone(),
+                paths: vec![]
+            }
+        );
+        // Paths are kept verbatim, newline included.
+        assert_eq!(
+            parse_merge_tree(1, &format!("{tree}\0a\nb\0"), "").unwrap(),
+            MergeTreeOutcome::Conflict {
+                tree,
+                paths: vec!["a\nb".to_string()]
+            }
+        );
     }
 }
