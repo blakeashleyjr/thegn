@@ -694,8 +694,8 @@ in {
 
     uiSidebarDetailFields = lib.mkOption {
       type = lib.types.nullOr (lib.types.listOf lib.types.str);
-      default = null;
-      description = "Ordered sidebar detail field names. Unset (null) = the binary's default.";
+      default = ["branch" "commits" "dirty" "branch_stat" "pr" "subject" "age" "env" "sandbox" "devcontainer" "hibernated" "mq" "unread" "disk"];
+      description = "Ordered sidebar detail field names. The default matches the binary's default.";
     };
 
     uiSidebarDetailWhen = lib.mkOption {

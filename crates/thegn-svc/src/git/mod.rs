@@ -2123,7 +2123,7 @@ fn bridged_glyph_reads(loc: &GitLoc, include_submodules: bool) -> Option<GlyphRe
         });
         let meta_log_idx = {
             let idx = specs.len();
-            specs.push(vec!["log", "-1", "--format=%ct%x00%s", "HEAD"]);
+            specs.push(vec!["log", "-1", "--format=%ct%x00%an%x00%s", "HEAD"]);
             idx
         };
         let submodule_status_idx = include_submodules.then_some(specs.len());

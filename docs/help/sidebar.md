@@ -250,17 +250,31 @@ The richer detail line is configured by `sidebar_detail_when`,
 `sidebar_show_commits`, `sidebar_show_behind_base`, `sidebar_commit_badge`,
 `sidebar_behind_badge`, and `sidebar_detail_fields` in [[config-reference]]
 `[ui]`. Commits count commits ahead of the repository's default branch; the
-badge caps at `999+`. The default field order is `branch`, `commits`, `dirty`,
-`branch_stat`, `pr`, `subject`, `age`. The legacy
+badge caps at `999+`. Valid field names are `branch`, `commits`, `dirty`,
+`branch_stat`, `pr`, `subject`, `age`, `upstream`, `stage`, `activity`, `env`,
+`sandbox`, `devcontainer`, `hibernated`, `mq`, `unread`, `disk`, and `author`.
+The default field order is `branch`, `commits`, `dirty`, `branch_stat`, `pr`,
+`subject`, `age`, `env`, `sandbox`, `devcontainer`, `hibernated`, `mq`, `unread`,
+`disk`; `upstream`, `stage`, `activity`, and `author` are opt-in. The legacy
 `sidebar_detail_branch`, `sidebar_detail_branch_stat`, and `sidebar_detail_pr`
 toggles remain AND gates; prefer `sidebar_detail_fields` for membership and
-order. The fixed tail (environment, sandbox, devcontainer, hibernation, merge
-queue, unread, and disk badges) follows the ordered fields and is not listed.
+order. An empty list keeps only the branch fallback. Each requested field is
+rendered in the requested order, including environment, sandbox, devcontainer,
+hibernation, merge-queue, unread, and disk.
 
-When the row is narrow, elision drops content in this order: subject (first
-truncated to eight cells), age, tail badges (disk, unread, merge queue,
-hibernation, devcontainer, sandbox, environment), branch stat, PR, dirty,
-commits, then branch. The branch is always retained and gets an ellipsis.
+The author field is read with the existing branch metadata scan and adds no
+git spawn. Four source areas were considered for this feature: stash count (the
+stash backend is currently read only by the diff panel), last-commit author
+(now shipped here; further `BranchMeta` enrichment can follow), CI state (there
+is no per-worktree CI datum), and linked issue ID (it exists only in the
+pipeline lane folder). Stash count, CI state, and linked issue ID remain
+deferred and are not produced by the current glyph scan.
+
+When the row is narrow, elision drops content in this order: activity, stage,
+upstream, author, subject (first truncated to eight cells), age, tail badges
+(disk, unread, merge queue, hibernation, devcontainer, sandbox, environment),
+branch stat, PR, dirty, commits, then branch. The branch is always retained and
+gets an ellipsis.
 Age is approximate and is read when the line is composed; it does not tick
 while the UI is idle.
 
