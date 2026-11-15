@@ -104,6 +104,10 @@ const OMITTED: &[(&str, &str)] = &[
         "notifications.sound.command",
         "sound command is executable-bearing and is not exposed yet",
     ),
+    (
+        "notifications.sound.per_priority",
+        "per-priority map holds legacy command-mode shell commands (executable-bearing) and is not exposed yet",
+    ),
     ("notifications.modes", "notification modes are not exposed"),
     (
         "notifications.active_mode",
@@ -1161,6 +1165,7 @@ fn hm_notifications_and_activity_families_are_rendered() {
         "notifications.sound.pack",
         "notifications.sound.chime_file",
         "notifications.sound.command",
+        "notifications.sound.per_priority",
         "notifications.modes",
         "notifications.active_mode",
         "notifications.push",
@@ -1179,7 +1184,6 @@ fn hm_notifications_dnd_and_sound_bools_are_rendered_and_rest_dispositioned() {
         "notifications.sound.volume",
         "notifications.dnd.allow_priority",
         "notifications.sound.min_priority",
-        "notifications.sound.per_priority",
         "notifications.sound.per_kind",
     ] {
         assert!(rendered.contains(path), "Home Manager must render {path}");
@@ -1213,7 +1217,6 @@ fn hm_priority_enum_options_match_the_priority_type() {
         assert_eq!(values, priority_spellings(), "{option}");
     }
     let rendered = rendered_paths(&module_src());
-    assert!(rendered.contains("notifications.sound.per_priority"));
     assert!(rendered.contains("notifications.sound.per_kind"));
 }
 

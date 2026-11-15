@@ -590,9 +590,8 @@ The `[notifications]` booleans are `notificationsDesktop`,
 `notificationsSoundMode` (`command` also needs `notifications.sound.command`
 in TOML) and `notificationsSoundAlwaysKinds` are exposed too, along with
 `notificationsSoundMinPriority` and `notificationsDndAllowPriority` (`info`,
-`notice` or `alert`) and the `notificationsSoundPerPriority` and
-`notificationsSoundPerKind` maps (priority or kind name to a sound reference;
-invalid entries are refused at load).
+`notice` or `alert`) and the `notificationsSoundPerKind` map (notification
+kind name to a sound reference; invalid entries are refused at load).
 `[activity]` takes `activityEnabled`, `activityRedRequiresAgent` and
 `activityAgentPrograms` (a list of extra agent CLI program names).
 
