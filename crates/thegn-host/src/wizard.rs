@@ -2661,6 +2661,10 @@ mod tests {
         std::fs::remove_dir_all(&repo).unwrap();
     }
 
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "hermetic test git: blocking status is fine in a unit test"
+    )]
     #[test]
     fn verify_base_unborn_probe_distinguishes_empty_and_committed_branches() {
         let empty = tempfile::tempdir().unwrap();

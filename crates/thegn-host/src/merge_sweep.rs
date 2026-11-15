@@ -841,6 +841,10 @@ mod tests {
         (root, wt)
     }
 
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "hermetic test git: blocking output is fine in a unit test"
+    )]
     #[test]
     fn derive_missing_landed_oid_distinguishes_not_ancestor_from_git_failure() {
         let isolation = crate::merge_lifecycle::TestIsolation::new();
