@@ -3863,6 +3863,7 @@ mod tests {
         .next()
         .unwrap();
         let l = match line {
+            crate::seg::Line::Segs(segs) => segs,
             crate::seg::Line::SplitMinLeft { l, .. } => l,
             _ => panic!("badges stay in the left identity cluster"),
         };

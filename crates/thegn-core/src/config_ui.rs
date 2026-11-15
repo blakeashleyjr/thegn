@@ -105,9 +105,7 @@ pub enum DetailEntry {
 pub(crate) fn parse_entry(value: &str) -> Option<DetailEntry> {
     let value = value.trim();
     if let Some(rest) = value.strip_prefix("plugin:") {
-        let Some((plugin, field)) = rest.split_once('/') else {
-            return None;
-        };
+        let (plugin, field) = rest.split_once('/')?;
         let valid_plugin = !plugin.is_empty()
             && plugin.len() <= 64
             && plugin
