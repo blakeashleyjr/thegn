@@ -969,7 +969,7 @@ mod tests {
             false,
             false,
             false,
-            PANE_FRAME_WINDOW - remaining,
+            Duration::from_millis(100).saturating_sub(last_flush) + remaining,
         ));
         assert!(final_decision.render);
         assert_eq!(final_decision.defer_timeout, None);
