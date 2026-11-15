@@ -168,15 +168,22 @@ sidebar_show_ahead_behind = true
 sidebar_show_pr_chip = true
 sidebar_show_jj = true   # jujutsu-colocation marker (ĵ) when a repo has .jj/ beside .git/
 sidebar_show_submodules = true  # separate marker for dirty/moved submodule pointers
-# The focused detail line (branch name + more) hangs under a worktree row while
-# the sidebar owns focus. "all" expands every worktree row; "cursor" expands only
-# the highlighted row; "off" never shows it. "all" doubles the height of every
-# worktree row on focus, which halves how much of the tree fits on screen.
-sidebar_focus_detail = "cursor"
-# Which fields the focused detail line carries (branch name first, then the
-# branch's own work over the LOCAL default branch — the same base `thegn diff`
-# uses, so a row sitting on the trunk shows nothing — then the open PR;
-# env/backend/disk badges always show when present):
+# The detail line (branch name + more) hangs under a worktree row. "all" expands
+# every worktree row; "cursor" expands only
+# the highlighted row; "off" never shows it. The default is "all".
+sidebar_focus_detail = "all"
+# Show the detail line only while the sidebar is focused, or always (the default).
+sidebar_detail_when = "always"
+# Row badges count commits ahead of the repository's default branch; behind is
+# opt-in. `{n}` is replaced by the count and large counts render as 999+.
+sidebar_show_commits = true
+sidebar_show_behind_base = false
+sidebar_commit_badge = "{n}c"
+sidebar_behind_badge = "{n}b"
+# Ordered detail fields: branch, commits, dirty, branch_stat, pr, subject, age.
+# Unknown entries warn and are ignored; duplicates are ignored. Empty means
+# only the fixed tail. Prefer this list over the legacy toggles below.
+sidebar_detail_fields = ["branch", "commits", "dirty", "branch_stat", "pr", "subject", "age"]
 sidebar_detail_branch = true
 sidebar_detail_branch_stat = true
 sidebar_detail_pr = true
