@@ -145,38 +145,6 @@ const OMITTED: &[(&str, &str)] = &[
         "notifications.push",
         "push sinks carry credentials and are not exposed",
     ),
-    (
-        "activity.cpu_percent",
-        "f64 threshold needs float pinning and is not exposed",
-    ),
-    (
-        "activity.runaway_core_fraction",
-        "f64 threshold needs float pinning and is not exposed",
-    ),
-    (
-        "activity.runaway_secs",
-        "f64 threshold needs float pinning and is not exposed",
-    ),
-    (
-        "activity.quiet_grace_secs",
-        "f64 threshold needs float pinning and is not exposed",
-    ),
-    (
-        "activity.resume_grace_secs",
-        "f64 threshold needs float pinning and is not exposed",
-    ),
-    (
-        "activity.spawn_grace_secs",
-        "f64 threshold needs float pinning and is not exposed",
-    ),
-    (
-        "activity.unsolicited_gap_secs",
-        "f64 threshold needs float pinning and is not exposed",
-    ),
-    (
-        "activity.output_hint_ttl_secs",
-        "f64 threshold needs float pinning and is not exposed",
-    ),
     ("automations", "automation rules are not exposed"),
     (
         "drawer.kind",
@@ -1187,14 +1155,6 @@ fn hm_notifications_and_activity_families_are_rendered() {
         "notifications.modes",
         "notifications.active_mode",
         "notifications.push",
-        "activity.cpu_percent",
-        "activity.runaway_core_fraction",
-        "activity.runaway_secs",
-        "activity.quiet_grace_secs",
-        "activity.resume_grace_secs",
-        "activity.spawn_grace_secs",
-        "activity.unsolicited_gap_secs",
-        "activity.output_hint_ttl_secs",
     ] {
         assert!(schema_has_path(path), "omission must stay pinned: {path}");
     }
@@ -1641,6 +1601,20 @@ fn every_numeric_option_matches_its_destination_range() {
         ("mediaSeekStepVideoSecs", "media.seek_step_video_secs"),
         ("mediaPollIntervalSecs", "media.poll_interval_secs"),
         ("mediaVolumeStep", "media.volume_step"),
+        ("activityCpuPercent", "activity.cpu_percent"),
+        (
+            "activityRunawayCoreFraction",
+            "activity.runaway_core_fraction",
+        ),
+        ("activityRunawaySecs", "activity.runaway_secs"),
+        ("activityQuietGraceSecs", "activity.quiet_grace_secs"),
+        ("activityResumeGraceSecs", "activity.resume_grace_secs"),
+        ("activitySpawnGraceSecs", "activity.spawn_grace_secs"),
+        (
+            "activityUnsolicitedGapSecs",
+            "activity.unsolicited_gap_secs",
+        ),
+        ("activityOutputHintTtlSecs", "activity.output_hint_ttl_secs"),
         ("monitorProcRows", "monitor.proc_rows"),
         ("limitsTestMaxParallel", "limits.test_max_parallel"),
         ("limitsTestTimeoutSecs", "limits.test_timeout_secs"),
@@ -1867,6 +1841,38 @@ const FLOAT_RANGES: &[(&str, f64, f64)] = &[
     ("media.volume_step", 0.0, 1.0),
     ("usage.warn_percent", 0.0, 100.0),
     ("usage.crit_percent", 0.0, 100.0),
+    ("activity.cpu_percent", 0.0, 100.0),
+    ("activity.runaway_core_fraction", 0.0, 1.0),
+    (
+        "activity.runaway_secs",
+        0.0,
+        thegn_core::time_policy::MAX_DURATION_SECS as f64,
+    ),
+    (
+        "activity.quiet_grace_secs",
+        0.0,
+        thegn_core::time_policy::MAX_DURATION_SECS as f64,
+    ),
+    (
+        "activity.resume_grace_secs",
+        0.0,
+        thegn_core::time_policy::MAX_DURATION_SECS as f64,
+    ),
+    (
+        "activity.spawn_grace_secs",
+        0.0,
+        thegn_core::time_policy::MAX_DURATION_SECS as f64,
+    ),
+    (
+        "activity.unsolicited_gap_secs",
+        0.0,
+        thegn_core::time_policy::MAX_DURATION_SECS as f64,
+    ),
+    (
+        "activity.output_hint_ttl_secs",
+        0.0,
+        thegn_core::time_policy::MAX_DURATION_SECS as f64,
+    ),
 ];
 
 fn float_range(path: &str) -> Option<(f64, f64)> {
