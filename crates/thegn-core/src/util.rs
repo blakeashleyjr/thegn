@@ -1730,11 +1730,52 @@ pub fn note_core_git_spawn() {
 /// **empty** stdout as `Some("")`. `None` means the command could not be run or
 /// exited non-zero, which is a different fact from an empty answer.
 pub fn git_out_allow_empty(dir: &Path, args: &[&str]) -> Option<String> {
-    GIT_SPAWNS.fetch_add(1, Ordering::Relaxed);
-    let out = git_cmd(dir).args(args).output().ok()?;
-    out.status
-        .success()
-        .then(|| String::from_utf8_lossy(&out.stdout).trim().to_string())
+    git_out_allow_empty_with_policy(dir, args, &bounded_git_read_policy())
+}
+
+fn bounded_git_read_policy() -> crate::git_run::GitPolicy {
+    crate::git_run::GitPolicy {
+        stdout_cap: 64 * 1024 * 1024,
+        ..crate::git_run::GitPolicy::read(crate::remote::GITLOC_READ_DEADLINE)
+    }
+}
+
+fn git_out_allow_empty_with_policy(
+    dir: &Path,
+    args: &[&str],
+    policy: &crate::git_run::GitPolicy,
+) -> Option<String> {
+    let cancel = AtomicBool::new(false);
+    let outcome = crate::git_run::git_run(dir, args, policy, &cancel);
+    match outcome {
+        crate::git_run::GitOutcome::Ok(bytes) => {
+            Some(String::from_utf8_lossy(&bytes).trim().to_string())
+        }
+        crate::git_run::GitOutcome::EmptyOk => Some(String::new()),
+        other => {
+            tracing::debug!(
+                target: "thegn::git",
+                command = args.first().copied().unwrap_or("<missing>"),
+                outcome = git_outcome_class(&other),
+                "bounded git command failed"
+            );
+            None
+        }
+    }
+}
+
+pub(crate) fn git_outcome_class(outcome: &crate::git_run::GitOutcome) -> &'static str {
+    match outcome {
+        crate::git_run::GitOutcome::Ok(_) => "ok",
+        crate::git_run::GitOutcome::EmptyOk => "empty_ok",
+        crate::git_run::GitOutcome::EmptyRefused => "empty_refused",
+        crate::git_run::GitOutcome::Exit { .. } => "exit",
+        crate::git_run::GitOutcome::Spawn(_) => "spawn",
+        crate::git_run::GitOutcome::Supervise(_) => "supervise",
+        crate::git_run::GitOutcome::Timeout => "timeout",
+        crate::git_run::GitOutcome::Cancelled => "cancelled",
+        crate::git_run::GitOutcome::OutputLimit(_) => "output_limit",
+    }
 }
 
 /// The last path component of a string (no trailing-slash handling needed
@@ -1859,12 +1900,12 @@ pub fn sh_join(argv: &[String]) -> String {
 
 /// Run `git -C <dir> <args...>`, returning success (stdout/stderr discarded).
 pub fn git_ok(dir: &Path, args: &[&str]) -> bool {
-    GIT_SPAWNS.fetch_add(1, Ordering::Relaxed);
-    git_cmd(dir)
-        .args(args)
-        .output()
-        .map(|o| o.status.success())
-        .unwrap_or(false)
+    git_ok_with_policy(dir, args, &bounded_git_read_policy())
+}
+
+fn git_ok_with_policy(dir: &Path, args: &[&str], policy: &crate::git_run::GitPolicy) -> bool {
+    let cancel = AtomicBool::new(false);
+    crate::git_run::git_run(dir, args, policy, &cancel).is_success()
 }
 
 /// Typed `git merge-base --is-ancestor`: `Some(true)` on exit 0, `Some(false)`
@@ -1872,15 +1913,35 @@ pub fn git_ok(dir: &Path, args: &[&str]) -> bool {
 /// failure, bad object, repository/permission error). Callers choosing a
 /// destructive branch must treat `None` as unknown, never as "not an ancestor".
 pub fn git_is_ancestor(dir: &Path, ancestor: &str, descendant: &str) -> Option<bool> {
-    GIT_SPAWNS.fetch_add(1, Ordering::Relaxed);
-    let out = git_cmd(dir)
-        .args(["merge-base", "--is-ancestor", ancestor, descendant])
-        .output()
-        .ok()?;
-    match out.status.code() {
-        Some(0) => Some(true),
-        Some(1) => Some(false),
-        _ => None,
+    git_is_ancestor_with_policy(dir, ancestor, descendant, &bounded_git_read_policy())
+}
+
+fn git_is_ancestor_with_policy(
+    dir: &Path,
+    ancestor: &str,
+    descendant: &str,
+    policy: &crate::git_run::GitPolicy,
+) -> Option<bool> {
+    let cancel = AtomicBool::new(false);
+    let outcome = crate::git_run::git_run(
+        dir,
+        &["merge-base", "--is-ancestor", ancestor, descendant],
+        policy,
+        &cancel,
+    );
+    match outcome {
+        crate::git_run::GitOutcome::Exit { code: Some(1), .. } => Some(false),
+        crate::git_run::GitOutcome::EmptyOk
+        | crate::git_run::GitOutcome::Exit { code: Some(0), .. } => Some(true),
+        other => {
+            tracing::debug!(
+                target: "thegn::git",
+                command = "merge-base",
+                outcome = git_outcome_class(&other),
+                "bounded git ancestor check failed"
+            );
+            None
+        }
     }
 }
 
@@ -3041,6 +3102,112 @@ mod tests {
             Some(std::ffi::OsStr::new("0")),
             "git_cmd must set GIT_OPTIONAL_LOCKS=0 so read housekeeping never locks the index"
         );
+    }
+
+    fn bounded_git_fixture() -> tempfile::TempDir {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(
+            git_cmd(dir.path())
+                .args(["-c", "commit.gpgsign=false", "init", "-q"])
+                .status()
+                .unwrap()
+                .success()
+        );
+        std::fs::create_dir_all(dir.path().join(".git/info")).unwrap();
+        dir
+    }
+
+    #[test]
+    fn bounded_git_output_shims_preserve_trim_and_empty_semantics() {
+        let dir = bounded_git_fixture();
+        assert_eq!(
+            git_out(dir.path(), &["rev-parse", "--git-dir"]),
+            Some(".git".into())
+        );
+        assert_eq!(git_out(dir.path(), &["status", "--porcelain"]), None);
+        assert_eq!(
+            git_out_allow_empty(dir.path(), &["status", "--porcelain"]),
+            Some(String::new())
+        );
+        let plain = tempfile::tempdir().unwrap();
+        assert_eq!(git_out(plain.path(), &["status", "--porcelain"]), None);
+        assert_eq!(git_out_allow_empty(plain.path(), &["status"]), None);
+    }
+
+    #[test]
+    fn bounded_git_ok_and_spawn_count_keep_their_contracts() {
+        let dir = bounded_git_fixture();
+        assert!(git_ok(dir.path(), &["status", "--porcelain"]));
+        assert!(!git_ok(
+            dir.path(),
+            &["rev-parse", "--verify", "no-such-object"]
+        ));
+        let before = core_git_spawn_count();
+        assert_eq!(
+            git_out_allow_empty(dir.path(), &["status", "--porcelain"]),
+            Some(String::new())
+        );
+        assert_eq!(core_git_spawn_count() - before, 1);
+    }
+
+    #[test]
+    fn bounded_git_policy_rejects_timeout_and_output_limit() {
+        let dir = bounded_git_fixture();
+        let timeout = crate::git_run::GitPolicy {
+            deadline: Duration::from_millis(100),
+            ..crate::git_run::GitPolicy::read(Duration::from_millis(100))
+        };
+        let started = Instant::now();
+        assert_eq!(
+            git_out_allow_empty_with_policy(
+                dir.path(),
+                &["-c", "alias.hang=!sleep 30", "hang"],
+                &timeout,
+            ),
+            None
+        );
+        assert!(started.elapsed() < Duration::from_secs(2));
+
+        let tiny = crate::git_run::GitPolicy {
+            stdout_cap: 1,
+            ..crate::git_run::GitPolicy::read(Duration::from_secs(1))
+        };
+        assert_eq!(
+            git_out_allow_empty_with_policy(dir.path(), &["rev-parse", "--git-dir"], &tiny),
+            None
+        );
+    }
+
+    #[test]
+    fn bounded_git_outcome_classes_are_typed() {
+        use crate::git_run::GitOutcome;
+        assert_eq!(git_outcome_class(&GitOutcome::Timeout), "timeout");
+        assert_eq!(
+            git_outcome_class(&GitOutcome::OutputLimit(thegn_proc::Which::Stdout)),
+            "output_limit"
+        );
+        assert_eq!(git_outcome_class(&GitOutcome::Cancelled), "cancelled");
+        assert_eq!(
+            git_outcome_class(&GitOutcome::EmptyRefused),
+            "empty_refused"
+        );
+        assert_eq!(
+            git_outcome_class(&GitOutcome::Exit {
+                code: Some(2),
+                stderr_tail: String::new()
+            }),
+            "exit"
+        );
+        assert_eq!(
+            git_outcome_class(&GitOutcome::Spawn(std::io::Error::other("spawn"))),
+            "spawn"
+        );
+        assert_eq!(
+            git_outcome_class(&GitOutcome::Supervise(String::new())),
+            "supervise"
+        );
+        assert_eq!(git_outcome_class(&GitOutcome::Ok(Vec::new())), "ok");
+        assert_eq!(git_outcome_class(&GitOutcome::EmptyOk), "empty_ok");
     }
 
     #[test]
