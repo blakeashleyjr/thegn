@@ -18,6 +18,8 @@ pub const MIN_PLUGIN_ID_BYTES: usize = 1;
 pub const MAX_PLUGIN_ID_BYTES: usize = 64;
 pub const MIN_PLUGIN_TIMEOUT_SECS: u64 = 1;
 pub const MIN_PLUGIN_INTERVAL_MILLIS: u64 = 100;
+/// Scheduler cadence floor; the manifest bound above remains the hard reject.
+pub const PLUGIN_INTERVAL_FLOOR_MILLIS: u64 = 1_000;
 pub const MAX_PLUGIN_INTERVAL_MILLIS: u64 = 86_400_000;
 /// Maximum discovered plugin directories that contain a `plugin.toml`.
 pub const MAX_PLUGIN_DIRS: usize = 256;
@@ -99,6 +101,24 @@ pub struct AdmittedPluginSet {
     pub digest: String,
 }
 
+/// Clamp manifest intervals that are valid but below the scheduler floor.
+///
+/// Values outside the manifest bounds are intentionally left alone so
+/// [`check_spec_fields`] still reports them as invalid.
+pub fn clamp_sub_floor_intervals(plugin: &mut LoadedPlugin) -> Vec<(String, u64)> {
+    let mut clamped = Vec::new();
+    for contribution in &mut plugin.spec.manifest.contributions {
+        if let CadenceHint::Interval { millis } = &mut contribution.cadence
+            && (MIN_PLUGIN_INTERVAL_MILLIS..PLUGIN_INTERVAL_FLOOR_MILLIS).contains(millis)
+        {
+            let requested = *millis;
+            *millis = PLUGIN_INTERVAL_FLOOR_MILLIS;
+            clamped.push((contribution.id.as_str().to_string(), requested));
+        }
+    }
+    clamped
+}
+
 impl AdmittedPluginSet {
     /// Return negotiated plugins only when all set-wide and enabled-plugin
     /// validation passed. Disabled and untrusted plugins remain non-startable.
@@ -154,8 +174,20 @@ pub fn admit(cfg: &Config, config_dir: &Path) -> AdmittedPluginSet {
         .sort_by(|left, right| (&left.plugin, &left.problem).cmp(&(&right.plugin, &right.problem)));
 
     let mut plugins = Vec::with_capacity(loaded.len());
-    for (plugin, source_digest) in loaded.into_iter().zip(source_digests) {
+    for (mut plugin, source_digest) in loaded.into_iter().zip(source_digests) {
         let id = plugin.spec.manifest.id.as_str().to_string();
+        if plugin.spec.enabled {
+            for (contribution, requested_millis) in clamp_sub_floor_intervals(&mut plugin) {
+                tracing::warn!(
+                    target: "thegn::plugin",
+                    plugin = %id,
+                    contribution = %contribution,
+                    requested_millis,
+                    applied_millis = PLUGIN_INTERVAL_FLOOR_MILLIS,
+                    "plugin interval below the 1 s minimum; clamped"
+                );
+            }
+        }
         let decision = if !plugin.spec.enabled {
             PluginDecision::Disabled
         } else if let Some(problem) = native_trust_refusal(&plugin) {
@@ -660,11 +692,17 @@ pub fn check_specs(cfg: &Config, config_dir: &Path) -> Vec<SpecProblem> {
 
 /// Validate one discovered snapshot (including parse failures from discovery).
 pub fn check_loaded(loaded: &[LoadedPlugin], broken: Vec<SpecProblem>) -> Vec<SpecProblem> {
+    let mut normalized = loaded.to_vec();
+    for plugin in normalized.iter_mut().filter(|plugin| plugin.spec.enabled) {
+        clamp_sub_floor_intervals(plugin);
+    }
     let mut out = broken;
     out.extend(duplicate_id_problems(
-        loaded.iter().map(|plugin| plugin.spec.manifest.id.as_str()),
+        normalized
+            .iter()
+            .map(|plugin| plugin.spec.manifest.id.as_str()),
     ));
-    for p in loaded.iter().filter(|p| p.spec.enabled) {
+    for p in normalized.iter().filter(|p| p.spec.enabled) {
         out.extend(check_spec(p));
     }
     out
@@ -720,6 +758,35 @@ mod tests {
             background: false,
             trusted_native: false,
         }
+    }
+
+    fn interval_contribution(id: &str, millis: u64) -> Contribution {
+        Contribution {
+            id: thegn_core::plugin_api::ContributionId::new(id),
+            extension_point: ExtensionPoint::StatusBarSegment,
+            label: id.into(),
+            surface: Some(thegn_core::plugin_api::SurfaceId::new(format!(
+                "{id}.surface"
+            ))),
+            cadence: CadenceHint::Interval { millis },
+            metadata: Default::default(),
+            caps: serde_json::Value::Null,
+            chord: None,
+        }
+    }
+
+    fn interval_spec(id: &str, millis: u64, enabled: bool) -> PluginSpec {
+        let mut plugin = spec(id, vec!["true".into()]);
+        plugin.enabled = enabled;
+        plugin
+            .manifest
+            .capabilities
+            .push(Capability::new("surface", "statusbar"));
+        plugin
+            .manifest
+            .contributions
+            .push(interval_contribution(&format!("{id}.interval"), millis));
+        plugin
     }
 
     #[test]
@@ -863,6 +930,157 @@ mod tests {
                 "interval {millis}"
             );
         }
+    }
+
+    #[test]
+    fn clamp_sub_floor_intervals_uses_manifest_bounds_and_floor() {
+        for (millis, requested) in [
+            (99, None),
+            (100, Some(100)),
+            (999, Some(999)),
+            (1_000, None),
+            (5_000, None),
+            (MAX_PLUGIN_INTERVAL_MILLIS, None),
+            (MAX_PLUGIN_INTERVAL_MILLIS + 1, None),
+            (u64::MAX, None),
+        ] {
+            let mut plugin = LoadedPlugin {
+                spec: interval_spec("bounded", millis, true),
+                dir: None,
+                trusted_native_ignored: false,
+            };
+            let clamped = clamp_sub_floor_intervals(&mut plugin);
+            let expected = requested
+                .map(|requested| vec![("bounded.interval".to_string(), requested)])
+                .unwrap_or_default();
+            assert_eq!(clamped, expected, "interval {millis}");
+            let expected_millis = requested
+                .map(|_| PLUGIN_INTERVAL_FLOOR_MILLIS)
+                .unwrap_or(millis);
+            assert_eq!(
+                plugin.spec.manifest.contributions[0].cadence,
+                CadenceHint::Interval {
+                    millis: expected_millis
+                },
+                "interval {millis}"
+            );
+            let invalid = check_spec(&plugin)
+                .iter()
+                .any(|problem| problem.problem.contains("interval millis must be"));
+            assert_eq!(
+                invalid,
+                millis == 99 || millis == MAX_PLUGIN_INTERVAL_MILLIS + 1 || millis == u64::MAX
+            );
+        }
+    }
+
+    #[test]
+    fn clamp_sub_floor_intervals_clamps_each_eligible_contribution() {
+        let mut plugin = LoadedPlugin {
+            spec: interval_spec("many", 250, true),
+            dir: None,
+            trusted_native_ignored: false,
+        };
+        plugin
+            .spec
+            .manifest
+            .contributions
+            .push(interval_contribution("many.high", 5_000));
+
+        assert_eq!(
+            clamp_sub_floor_intervals(&mut plugin),
+            vec![("many.interval".to_string(), 250)]
+        );
+        assert_eq!(
+            plugin.spec.manifest.contributions[0].cadence,
+            CadenceHint::Interval { millis: 1_000 }
+        );
+        assert_eq!(
+            plugin.spec.manifest.contributions[1].cadence,
+            CadenceHint::Interval { millis: 5_000 }
+        );
+    }
+
+    #[test]
+    fn admit_and_check_clamp_pretty_and_inline_interval_manifests() {
+        let tmp = tempfile::tempdir().unwrap();
+        let manifests = [
+            toml::to_string(&interval_spec("pretty", 250, true)).unwrap(),
+            r#"id = "inline"
+name = "inline"
+version = "0.1.0"
+api = "0.4.0"
+capabilities = ["surface:statusbar"]
+command = ["true"]
+
+[[contributions]]
+id = "inline.interval"
+extension_point = "StatusBarSegment"
+label = "inline.interval"
+surface = "inline.interval.surface"
+cadence = { kind = "interval", millis = 250 }
+"#
+            .to_string(),
+        ];
+
+        for (index, source) in manifests.iter().enumerate() {
+            let dir = tmp.path().join(format!("plugins/interval-{index}"));
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(dir.join("plugin.toml"), source).unwrap();
+
+            let admitted = admit(&Config::default(), tmp.path());
+            assert_eq!(admitted.plugins.len(), 1, "manifest {index}");
+            let admitted_plugin = &admitted.plugins[0];
+            let PluginDecision::Admitted(manifest) = &admitted_plugin.decision else {
+                panic!("interval manifest {index} should be admitted");
+            };
+            assert_eq!(manifest.accepted_contributions.len(), 1);
+            assert_eq!(
+                manifest.accepted_contributions[0].cadence,
+                CadenceHint::Interval { millis: 1_000 }
+            );
+            assert_eq!(
+                admitted_plugin.plugin.spec.manifest.contributions[0].cadence,
+                CadenceHint::Interval { millis: 1_000 }
+            );
+            assert_eq!(
+                admitted_plugin.source_digest,
+                digest_bytes(source.as_bytes())
+            );
+            assert!(check_specs(&Config::default(), tmp.path()).is_empty());
+
+            let (loaded, problems) = discover(&Config::default(), tmp.path());
+            assert!(problems.is_empty());
+            assert_eq!(
+                loaded[0].spec.manifest.contributions[0].cadence,
+                CadenceHint::Interval { millis: 250 }
+            );
+            assert!(check_loaded(&loaded, Vec::new()).is_empty());
+            assert_eq!(
+                loaded[0].spec.manifest.contributions[0].cadence,
+                CadenceHint::Interval { millis: 250 }
+            );
+
+            std::fs::remove_dir_all(tmp.path().join("plugins")).unwrap();
+        }
+    }
+
+    #[test]
+    fn admit_does_not_touch_disabled_plugin_intervals() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cfg = Config {
+            plugins: vec![interval_spec("disabled", 250, false)],
+            ..Default::default()
+        };
+        let admitted = admit(&cfg, tmp.path());
+        assert!(matches!(
+            &admitted.plugins[0].decision,
+            PluginDecision::Disabled
+        ));
+        assert_eq!(
+            admitted.plugins[0].plugin.spec.manifest.contributions[0].cadence,
+            CadenceHint::Interval { millis: 250 }
+        );
     }
 
     #[test]
