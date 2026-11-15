@@ -1,5 +1,5 @@
 //! Aggregated CPU frequency policies and power controls.
-use super::cpu_policy::{CpuPolicy, GovernorSummary, PowerPolicy, SysToken};
+use super::cpu_policy::{CoreClass, CpuPolicy, GovernorSummary, PowerPolicy, SysToken};
 
 #[derive(Debug, Default, Clone, PartialEq)]
 pub struct CpuFreqPart {
@@ -44,6 +44,16 @@ impl CpuFreqPart {
         }
         first.map(GovernorSummary::Common)
     }
+    /// Number of (performance, efficiency) policies; `Unknown` counts in neither.
+    pub fn core_class_counts(&self) -> (usize, usize) {
+        self.policies
+            .iter()
+            .fold((0, 0), |(perf, eff), policy| match policy.core_class {
+                CoreClass::Performance => (perf + 1, eff),
+                CoreClass::Efficiency => (perf, eff + 1),
+                CoreClass::Unknown => (perf, eff),
+            })
+    }
     pub fn governor_token(&self) -> Option<SysToken> {
         match self.governor_summary()? {
             GovernorSummary::Common(token) => Some(token),
@@ -56,7 +66,33 @@ impl CpuFreqPart {
 mod tests {
     use super::{CpuFreqPart, mean_mhz};
     use crate::collect::frame::Part;
-    use crate::collect::model::cpu_policy::{CpuPolicy, GovernorSummary, SysToken};
+    use crate::collect::model::cpu_policy::{CoreClass, CpuPolicy, GovernorSummary, SysToken};
+
+    #[test]
+    fn core_class_counts_split_performance_and_efficiency() {
+        assert_eq!(CpuFreqPart::default().core_class_counts(), (0, 0));
+        let with = |core_class| CpuPolicy {
+            core_class,
+            ..CpuPolicy::default()
+        };
+        let part = CpuFreqPart {
+            policies: vec![
+                with(CoreClass::Performance),
+                with(CoreClass::Efficiency),
+                with(CoreClass::Efficiency),
+                with(CoreClass::Unknown),
+                with(CoreClass::Performance),
+                with(CoreClass::Efficiency),
+            ],
+            ..CpuFreqPart::default()
+        };
+        assert_eq!(part.core_class_counts(), (2, 3));
+        let unknown = CpuFreqPart {
+            policies: vec![CpuPolicy::default(); 4],
+            ..CpuFreqPart::default()
+        };
+        assert_eq!(unknown.core_class_counts(), (0, 0));
+    }
     #[test]
     fn part_clears_values_and_retains_policy_capacity() {
         let mut part = CpuFreqPart::default();
