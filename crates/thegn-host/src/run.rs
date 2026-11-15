@@ -14944,12 +14944,21 @@ async fn event_loop<T: Terminal>(
                         );
                     }
                 }
-                RefreshKind::Weather(snap) => {
+                RefreshKind::Weather(snap, key) => {
                     // Only a CHANGED reading repaints. A cached redelivery
                     // (every restart, and every poll inside the interval) is
                     // byte-identical, and a half-hourly datum must not become a
                     // half-hourly repaint source.
-                    if model.weather.as_ref() != Some(&*snap) {
+                    // A poll in flight across a reload that moved the cache row
+                    // delivers the old place: drop it (THE-2006). Compared
+                    // against `current_config`, which the WeatherPoll arm also
+                    // polls with (model.weather_cfg is re-applied after model
+                    // swaps, so it is not used here).
+                    let live = crate::hydrate_weather::live_key(
+                        &current_config.weather,
+                        crate::calendar_docs::CalendarDocs::env_locale().as_deref(),
+                    );
+                    if key == live && model.weather.as_ref() != Some(&*snap) {
                         model.weather = Some(*snap);
                         // `bars_dirty`, never `dirty`: this is the clock tick's
                         // damage class — two 1-row rects — not a full-chrome
