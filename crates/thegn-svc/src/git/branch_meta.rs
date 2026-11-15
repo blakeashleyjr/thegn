@@ -100,13 +100,16 @@ fn sanitized_author(message: &[u8]) -> String {
     sanitized_text(message, 64)
 }
 
+fn split_at_nul(bytes: &[u8]) -> Option<(&[u8], &[u8])> {
+    let index = bytes.iter().position(|byte| *byte == 0)?;
+    Some((&bytes[..index], &bytes[index + 1..]))
+}
+
 pub(crate) fn parse_log_record(output: &[u8]) -> Result<(i64, String, String)> {
-    let (timestamp, rest) = output
-        .split_once(|byte| *byte == b'\0')
-        .context("git log metadata missing NUL separator")?;
-    let (author, subject) = rest
-        .split_once(|byte| *byte == b'\0')
-        .context("git log metadata missing author separator")?;
+    let (timestamp, rest) =
+        split_at_nul(output).context("git log metadata missing NUL separator")?;
+    let (author, subject) =
+        split_at_nul(rest).context("git log metadata missing author separator")?;
     let timestamp = std::str::from_utf8(timestamp)
         .context("git log metadata timestamp is not UTF-8")?
         .trim()
@@ -248,7 +251,7 @@ pub(crate) fn cli(loc: &GitLoc, base: Option<&str>, detached: bool) -> Result<Br
     let key = (
         PathBuf::from(loc.path()),
         head.to_string(),
-        base_id.clone().unwrap_or_default(),
+        base_id.unwrap_or_default().to_string(),
     );
     let commit_meta = memoized(key, || {
         let ahead_behind = if detached {
