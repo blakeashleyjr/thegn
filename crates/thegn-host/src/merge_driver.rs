@@ -16,7 +16,7 @@
 
 use std::cell::RefCell;
 use std::collections::HashMap;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::sync::atomic::AtomicBool;
 
 use thegn_core::attention::MqStatus;
@@ -658,12 +658,17 @@ fn verify_fixer_checkout(
     if path != canonical_worktree {
         return Err("worktree path uses a non-canonical alias".into());
     }
-    let top_level = thegn_core::util::git_out_path(path, &["rev-parse", "--show-toplevel"])
-        .map_err(|error| match error {
-            thegn_core::util::GitPathError::Empty => "path is not a Git worktree".to_string(),
-            error => format!("path is not a Git worktree: {error}"),
-        })?;
-    let canonical_top_level = top_level
+    let top_level = thegn_core::util::git_out_strict(path, &["rev-parse", "--show-toplevel"])
+        .map_err(|error| format!("path is not a Git worktree: {error}"))?;
+    // Strip exactly one line terminator: a worktree path may contain a newline or end in whitespace.
+    let top_level = match top_level.strip_suffix('\n') {
+        Some(body) => body.strip_suffix('\r').unwrap_or(body),
+        None => top_level.as_str(),
+    };
+    if top_level.is_empty() {
+        return Err("path is not a Git worktree".into());
+    }
+    let canonical_top_level = Path::new(top_level)
         .canonicalize()
         .map_err(|error| format!("cannot resolve Git worktree root: {error}"))?;
     if canonical_worktree != canonical_top_level {
