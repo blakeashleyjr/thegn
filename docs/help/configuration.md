@@ -580,9 +580,9 @@ symbol), plus `statsBatteryWarn`, `statsDiskFreeWarn`,
 `statsDiskFreeCritical` and `statsDiskPath` (the filesystem the disk widget
 measures; empty means the filesystem holding the worktrees directory). The
 thresholds accept values from 0 through 255. `statsRefreshSecs` sets the
-polling interval in seconds (fractions allowed, 0 through 2678400). The
-`stats.refresh_rates`, `stats.alerts` and `stats.net_icons` settings remain
-omitted.
+polling interval in seconds (fractions allowed, 0 through 2678400), and
+`statsRefreshRates` the rates the refresh keybind cycles through (see below).
+The `stats.alerts` and `stats.net_icons` settings remain omitted.
 
 The `[notifications]` booleans are `notificationsDesktop`,
 `notificationsSurfaceSelfLogErrors`, `notificationsGithubMentions`,
@@ -618,6 +618,15 @@ the key, the value and the valid range, and the value is still loaded, so an
 existing config never stops thegn from starting. A
 critical percentage below the warning percentage is accepted and treated as
 the warning tone.
+
+The list `stats.refresh_rates` and the float `notifications.sound.volume` are
+exposed as `statsRefreshRates` (a list of `numbers.between 0.5 315360000`) and
+`notificationsSoundVolume` (`numbers.between 0 1`). thegn warns about each
+refresh rate below 0.5 seconds, above the duration cap or non-finite, naming
+its index, value and range, and still loads it; an empty list is valid and
+turns off rate cycling. A sound volume outside 0.0 through 1.0 is an error.
+The other `[notifications.sound]` keys apart from `mute` and
+`suppress_focused` are not exposed.
 
 The `[activity]` float keys `cpu_percent`, `runaway_core_fraction`,
 `runaway_secs`, `quiet_grace_secs`, `resume_grace_secs`, `spawn_grace_secs`,

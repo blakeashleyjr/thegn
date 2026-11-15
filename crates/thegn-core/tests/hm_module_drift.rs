@@ -40,10 +40,6 @@ const OMITTED: &[(&str, &str)] = &[
     ("forges", "forge connections are not exposed"),
     ("editor", "editor integration is not exposed"),
     (
-        "stats.refresh_rates",
-        "refresh-rate list needs float list pinning and is not exposed",
-    ),
-    (
         "stats.alerts",
         "threshold alerts are a nested table and are not exposed",
     ),
@@ -115,10 +111,6 @@ const OMITTED: &[(&str, &str)] = &[
     (
         "notifications.sound.pack",
         "sound pack path is not exposed yet",
-    ),
-    (
-        "notifications.sound.volume",
-        "sound volume float is not exposed yet",
     ),
     (
         "notifications.sound.chime_file",
@@ -1094,7 +1086,6 @@ fn hm_git_and_stats_families_are_rendered() {
         "git.backend",
         "git.structural_diff",
         "git.submodules",
-        "stats.refresh_rates",
         "stats.alerts",
         "stats.net_icons",
     ] {
@@ -1103,6 +1094,7 @@ fn hm_git_and_stats_families_are_rendered() {
 
     for path in [
         "stats.refresh_secs",
+        "stats.refresh_rates",
         "stats.battery_warn",
         "stats.disk_free_warn",
         "stats.disk_free_critical",
@@ -1147,7 +1139,6 @@ fn hm_notifications_and_activity_families_are_rendered() {
         "notifications.sound.min_priority",
         "notifications.sound.always_kinds",
         "notifications.sound.pack",
-        "notifications.sound.volume",
         "notifications.sound.chime_file",
         "notifications.sound.command",
         "notifications.sound.per_priority",
@@ -1167,6 +1158,7 @@ fn hm_notifications_dnd_and_sound_bools_are_rendered_and_rest_dispositioned() {
         "notifications.dnd.enabled",
         "notifications.sound.mute",
         "notifications.sound.suppress_focused",
+        "notifications.sound.volume",
     ] {
         assert!(rendered.contains(path), "Home Manager must render {path}");
     }
@@ -1601,6 +1593,7 @@ fn every_numeric_option_matches_its_destination_range() {
         ("mediaSeekStepVideoSecs", "media.seek_step_video_secs"),
         ("mediaPollIntervalSecs", "media.poll_interval_secs"),
         ("mediaVolumeStep", "media.volume_step"),
+        ("notificationsSoundVolume", "notifications.sound.volume"),
         ("activityCpuPercent", "activity.cpu_percent"),
         (
             "activityRunawayCoreFraction",
@@ -1839,6 +1832,8 @@ const FLOAT_RANGES: &[(&str, f64, f64)] = &[
         thegn_core::time_policy::MAX_CADENCE_SECS as f64,
     ),
     ("media.volume_step", 0.0, 1.0),
+    // Validated as an ERROR by `SoundConfig::validate_at`, not warn-only.
+    ("notifications.sound.volume", 0.0, 1.0),
     ("usage.warn_percent", 0.0, 100.0),
     ("usage.crit_percent", 0.0, 100.0),
     ("activity.cpu_percent", 0.0, 100.0),
@@ -1955,6 +1950,116 @@ fn pinned_float_ranges_match_the_rust_validators() {
                 );
             }
         }
+    }
+}
+
+/// Options whose Nix type is a list of bounded floats, with their Rust schema
+/// destination and the warn-only validator range each element is pinned to.
+const FLOAT_LIST_OPTIONS: &[(&str, &str, (f64, f64))] = &[(
+    "statsRefreshRates",
+    "stats.refresh_rates",
+    thegn_core::config_validate::REFRESH_RATE_RANGE,
+)];
+
+/// `(option name, element type)` for every `listOf (lib.types.numbers.…)`
+/// option in the module.
+fn float_list_options(src: &str) -> Vec<(String, String)> {
+    let mut out = Vec::new();
+    let lines: Vec<&str> = src.lines().collect();
+    for (i, line) in lines.iter().enumerate() {
+        let Some(expr) = line
+            .trim()
+            .strip_prefix("type = ")
+            .map(|s| s.trim_end_matches(';'))
+        else {
+            continue;
+        };
+        let Some(element) = strip_null_or(expr)
+            .strip_prefix("lib.types.listOf (")
+            .and_then(|rest| rest.strip_suffix(')'))
+        else {
+            continue;
+        };
+        if !element.starts_with("lib.types.numbers.") {
+            continue;
+        }
+        let name = lines[..i]
+            .iter()
+            .rev()
+            .find_map(|previous| {
+                previous
+                    .trim()
+                    .strip_suffix("= lib.mkOption {")
+                    .map(|n| n.trim().to_string())
+            })
+            .unwrap_or_else(|| format!("float-list@{}", i + 1));
+        out.push((name, element.to_string()));
+    }
+    out
+}
+
+#[test]
+fn every_float_list_option_matches_its_validator_range() {
+    let options = float_list_options(&module_src());
+    assert_eq!(
+        options
+            .iter()
+            .map(|(name, _)| name.as_str())
+            .collect::<BTreeSet<&str>>(),
+        FLOAT_LIST_OPTIONS
+            .iter()
+            .map(|(name, _, _)| *name)
+            .collect::<BTreeSet<&str>>(),
+        "every Nix float-list option must have a pinned destination and range"
+    );
+    let rendered = rendered_paths(&module_src());
+    for (name, path, (min, max)) in FLOAT_LIST_OPTIONS {
+        assert!(rendered.contains(*path), "Home Manager must render {path}");
+        let schema = schema_field(path);
+        assert_eq!(
+            schema.get("type").and_then(Value::as_str),
+            Some("array"),
+            "schema type for {path}"
+        );
+        assert_eq!(
+            schema["items"].get("type").and_then(Value::as_str),
+            Some("number"),
+            "schema element type for {path}"
+        );
+        let element = options
+            .iter()
+            .find_map(|(option, element)| (option == name).then_some(element.as_str()))
+            .expect("float-list option element type");
+        assert_eq!(
+            element,
+            format!("lib.types.numbers.between {min} {max}"),
+            "Nix element type for {path}"
+        );
+    }
+    assert_eq!(
+        thegn_core::config_validate::REFRESH_RATE_RANGE,
+        (0.5, thegn_core::time_policy::MAX_DURATION_SECS as f64)
+    );
+}
+
+/// Each `stats.refresh_rates` entry warns (never errors) outside the pinned
+/// range, once per offending entry; the endpoints and an empty list are clean.
+#[test]
+fn refresh_rates_entries_warn_but_never_refuse() {
+    let (min, max) = thegn_core::config_validate::REFRESH_RATE_RANGE;
+    for accepted in [format!("[{min:?}, {max:?}]"), "[]".to_string()] {
+        let (errors, warnings) = float_key_diagnostics("stats.refresh_rates", &accepted);
+        assert!(errors.is_empty(), "{accepted}: {errors:?}");
+        assert!(warnings.is_empty(), "{accepted}: {warnings:?}");
+    }
+    let body = format!("[1.0, {:?}, 2.0, {:?}]", min - 0.001, max + 0.001);
+    let (errors, warnings) = float_key_diagnostics("stats.refresh_rates", &body);
+    assert!(errors.is_empty(), "{body}: {errors:?}");
+    assert_eq!(warnings.len(), 2, "{body}: {warnings:?}");
+    assert!(warnings[0].starts_with("stats.refresh_rates[1] = "));
+    assert!(warnings[1].starts_with("stats.refresh_rates[3] = "));
+    for warning in &warnings {
+        assert!(warning.contains(&format!("{min}..={max}")), "{warning}");
     }
 }
 
