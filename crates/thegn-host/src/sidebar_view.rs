@@ -3933,6 +3933,7 @@ mod tests {
             dirty_files: Some(3),
             last_commit_unix: Some(0),
             last_subject: Some("ascii subject".into()),
+            last_author: None,
         });
         let display = SidebarDisplay {
             show_behind_base: true,
