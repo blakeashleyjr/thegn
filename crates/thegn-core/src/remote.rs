@@ -727,27 +727,6 @@ impl GitLoc {
         parts.join(" ")
     }
 
-    /// Run git with `stdin` piped in (e.g. `git apply -`, `git commit -F -`),
-    /// returning the full `Output`. Works over ssh (ssh forwards stdin).
-    pub fn git_with_stdin(
-        &self,
-        envs: &[(&str, &str)],
-        args: &[&str],
-        stdin: &[u8],
-    ) -> std::io::Result<std::process::Output> {
-        use std::io::Write;
-        let mut cmd = self.git_command_env(envs, args);
-        cmd.stdin(std::process::Stdio::piped())
-            .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::piped());
-        let mut child = cmd.spawn()?;
-        if let Some(mut sink) = child.stdin.take() {
-            // A dead child (bad args) closes the pipe; the wait below reports it.
-            let _ = sink.write_all(stdin);
-        }
-        child.wait_with_output()
-    }
-
     /// Resolve a path inside the repo's private gitdir via
     /// `git rev-parse --git-path` — never a literal `.git/…`, which breaks in
     /// linked worktrees where `.git` is a redirect file.
@@ -2233,22 +2212,6 @@ mod tests {
                 assert!(removed.contains(&var.to_string()), "{var} not scrubbed");
             }
         }
-    }
-
-    #[test]
-    fn git_with_stdin_pipes_bytes_through() {
-        // `git hash-object --stdin` works without a repo and echoes a stable
-        // sha for known input — a hermetic stdin round-trip.
-        let root = tempfile::tempdir().unwrap();
-        let loc = GitLoc::Local(root.path().to_path_buf());
-        let out = loc
-            .git_with_stdin(&[], &["hash-object", "--stdin"], b"hello\n")
-            .unwrap();
-        assert!(out.status.success());
-        assert_eq!(
-            String::from_utf8_lossy(&out.stdout).trim(),
-            "ce013625030ba8dba906f756967f9e9ca394464a"
-        );
     }
 
     #[test]
