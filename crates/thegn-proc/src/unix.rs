@@ -1,6 +1,6 @@
 use crate::{
     BACKOFF_CAP, Capture, Containment, End, GroupState, InputFeed, Leader, Limits, POLL_INTERVAL,
-    Run, Stream, Which, aggregate_fit,
+    Run, Stream, StreamConsumer, Which, aggregate_fit,
 };
 use nix::{
     errno::Errno,
@@ -53,6 +53,9 @@ struct Pipes<'a> {
     out_open: bool,
     err_open: bool,
     feed: Feed<'a>,
+    /// The one consumer for every `Stream::Consume` stream; each Accumulator only flags whether
+    /// its stream is delivered (two streams cannot each hold this `&mut`).
+    consume: StreamConsumer<'a>,
 }
 
 struct Feed<'a> {
@@ -115,16 +118,20 @@ impl Feed<'_> {
     }
 }
 
-type Consumer<'a> = &'a mut dyn FnMut(&[u8]);
-
-struct Accumulator<'a> {
+struct Accumulator {
     capture: Capture,
     stream: Stream,
-    sink: Option<Consumer<'a>>,
+    which: Which,
+    /// This stream is `Stream::Consume`: hand every chunk to the run's consumer.
+    consume: bool,
 }
 
-impl Accumulator<'_> {
-    fn read(&mut self, fd: libc::c_int) -> io::Result<(bool, bool)> {
+impl Accumulator {
+    fn read(
+        &mut self,
+        fd: libc::c_int,
+        consume: &mut dyn FnMut(Which, &[u8]),
+    ) -> io::Result<(bool, bool)> {
         let mut buf = [0_u8; 8192];
         let mut drained = 0;
         loop {
@@ -147,8 +154,8 @@ impl Accumulator<'_> {
             let bytes = &buf[..count as usize];
             drained += bytes.len();
             self.capture.total = self.capture.total.saturating_add(bytes.len() as u64);
-            if let Some(sink) = self.sink.as_mut() {
-                sink(bytes);
+            if self.consume {
+                consume(self.which, bytes);
             }
             match self.stream {
                 Stream::Null => {}
@@ -408,15 +415,15 @@ fn poll_pipes(pipes: &Pipes<'_>, timeout: Duration) -> io::Result<bool> {
 
 fn drain(
     pipes: &mut Pipes<'_>,
-    out: &mut Accumulator<'_>,
-    err: &mut Accumulator<'_>,
+    out: &mut Accumulator,
+    err: &mut Accumulator,
 ) -> io::Result<Option<Which>> {
     pipes.feed.pump();
     let mut result = None;
     if pipes.out_open
         && let Some(pipe) = &pipes.stdout
     {
-        let (_, overflow) = match out.read(pipe.as_raw_fd()) {
+        let (_, overflow) = match out.read(pipe.as_raw_fd(), &mut *pipes.consume) {
             Ok(result) => result,
             Err(_error) => {
                 pipes.out_open = false;
@@ -433,7 +440,7 @@ fn drain(
     if pipes.err_open
         && let Some(pipe) = &pipes.stderr
     {
-        let (_, overflow) = match err.read(pipe.as_raw_fd()) {
+        let (_, overflow) = match err.read(pipe.as_raw_fd(), &mut *pipes.consume) {
             Ok(result) => result,
             Err(_error) => {
                 pipes.err_open = false;
@@ -472,8 +479,8 @@ fn wait_empty(
     pid: libc::pid_t,
     deadline: Instant,
     pipes: &mut Pipes<'_>,
-    out: &mut Accumulator<'_>,
-    err: &mut Accumulator<'_>,
+    out: &mut Accumulator,
+    err: &mut Accumulator,
     backoff: &mut Duration,
     #[cfg_attr(not(target_os = "linux"), allow(unused_variables))] liveness: &mut LivenessScan,
 ) -> io::Result<bool> {
@@ -556,14 +563,14 @@ fn detach(child: &mut Child) -> Leader {
 
 #[cfg(test)]
 pub(super) fn run(cmd: &mut Command, limits: &Limits, cancel: &AtomicBool) -> Run {
-    run_consuming(cmd, limits, cancel, &mut |_bytes: &[u8]| {})
+    run_consuming_streams(cmd, limits, cancel, &mut |_which: Which, _bytes: &[u8]| {})
 }
 
-pub(super) fn run_consuming(
+pub(super) fn run_consuming_streams(
     cmd: &mut Command,
     limits: &Limits,
     cancel: &AtomicBool,
-    consume: &mut dyn FnMut(&[u8]),
+    consume: StreamConsumer<'_>,
 ) -> Run {
     run_inner(cmd, limits, cancel, consume, None).0
 }
@@ -574,14 +581,20 @@ pub(super) fn run_with_input(
     input: &[u8],
     cancel: &AtomicBool,
 ) -> (Run, InputFeed) {
-    run_inner(cmd, limits, cancel, &mut |_bytes: &[u8]| {}, Some(input))
+    run_inner(
+        cmd,
+        limits,
+        cancel,
+        &mut |_which: Which, _bytes: &[u8]| {},
+        Some(input),
+    )
 }
 
 fn run_inner(
     cmd: &mut Command,
     limits: &Limits,
     cancel: &AtomicBool,
-    consume: &mut dyn FnMut(&[u8]),
+    consume: StreamConsumer<'_>,
     input: Option<&[u8]>,
 ) -> (Run, InputFeed) {
     cmd.stdin(if input.is_some() {
@@ -651,6 +664,7 @@ fn run_inner(
         stdout,
         stderr,
         feed,
+        consume,
     };
     let setup_error = [&pipes.stdout, &pipes.stderr, &pipes.feed.stdin]
         .into_iter()
@@ -688,12 +702,14 @@ fn run_inner(
     let mut out = Accumulator {
         capture: Capture::default(),
         stream: limits.stdout,
-        sink: matches!(limits.stdout, Stream::Consume).then_some(consume),
+        which: Which::Stdout,
+        consume: matches!(limits.stdout, Stream::Consume),
     };
     let mut err = Accumulator {
         capture: Capture::default(),
         stream: limits.stderr,
-        sink: None,
+        which: Which::Stderr,
+        consume: matches!(limits.stderr, Stream::Consume),
     };
     let mut backoff = POLL_INTERVAL;
     let mut liveness = LivenessScan::default();
@@ -886,6 +902,8 @@ mod tests {
         sync::{Arc, atomic::AtomicBool},
         thread,
     };
+
+    use crate::run_consuming;
 
     struct Scripts(tempfile::TempDir);
 
@@ -1498,6 +1516,192 @@ mod tests {
         assert!(run.success());
         assert!(run.stdout.bytes.is_empty());
         assert_eq!(run.stdout.total, 100_000);
+    }
+
+    #[test]
+    fn consume_streams_hand_both_streams_every_byte_in_order_and_retain_none() {
+        let scripts = Scripts::new();
+        let script = scripts.write(
+            "consume-both.sh",
+            "(i=0; while [ \"$i\" -lt 2000 ]; do printf 'e%04d' \"$i\" >&2; i=$((i+1)); done) &\n\
+             yes x | head -c 3000000\nwait\nprintf 'tail\\n'\n",
+        );
+        let limits = Limits {
+            stdout: Stream::Consume,
+            stderr: Stream::Consume,
+            ..Limits::silent(Duration::from_secs(20))
+        };
+        let (mut total, mut last, mut first_mismatch) = (0_u64, Vec::new(), None);
+        let mut err_seen = Vec::new();
+        let run = run_consuming_streams(
+            &mut command(&script),
+            &limits,
+            &AtomicBool::new(false),
+            &mut |which: Which, bytes: &[u8]| match which {
+                Which::Stdout => {
+                    for &byte in bytes {
+                        let expected = if total < 3_000_000 {
+                            Some(if total.is_multiple_of(2) { b'x' } else { b'\n' })
+                        } else {
+                            b"tail\n".get((total - 3_000_000) as usize).copied()
+                        };
+                        if expected != Some(byte) && first_mismatch.is_none() {
+                            first_mismatch = Some(total);
+                        }
+                        total += 1;
+                        if last.len() == 5 {
+                            last.remove(0);
+                        }
+                        last.push(byte);
+                    }
+                }
+                Which::Stderr => err_seen.extend_from_slice(bytes),
+            },
+        );
+        let expected_err = (0..2000)
+            .map(|index| format!("e{index:04}"))
+            .collect::<String>()
+            .into_bytes();
+        assert!(run.success());
+        assert_eq!(first_mismatch, None, "first mismatched stdout byte index");
+        assert_eq!(total, 3_000_005);
+        assert_eq!(last, b"tail\n");
+        assert_eq!(err_seen, expected_err);
+        assert!(run.stdout.bytes.is_empty());
+        assert!(run.stderr.bytes.is_empty());
+        assert_eq!(run.stdout.total, 3_000_005);
+        assert_eq!(run.stderr.total, 10_000);
+        assert!(run.stdout.eof);
+        assert!(run.stderr.eof);
+    }
+
+    #[test]
+    fn consume_streams_deliver_stderr_while_stdout_head_is_retained() {
+        let scripts = Scripts::new();
+        let script = scripts.write(
+            "consume-stderr-only.sh",
+            "head -c 5000 /dev/zero\nprintf 'warn' >&2\n",
+        );
+        let limits = Limits {
+            stdout: Stream::Head { cap: 1000 },
+            stderr: Stream::Consume,
+            ..Limits::silent(Duration::from_secs(10))
+        };
+        let (mut stdout_calls, mut err_seen) = (0_usize, Vec::new());
+        let run = run_consuming_streams(
+            &mut command(&script),
+            &limits,
+            &AtomicBool::new(false),
+            &mut |which: Which, bytes: &[u8]| match which {
+                Which::Stdout => stdout_calls += 1,
+                Which::Stderr => err_seen.extend_from_slice(bytes),
+            },
+        );
+        assert!(run.success());
+        assert_eq!(stdout_calls, 0);
+        assert_eq!(err_seen, b"warn");
+        assert_eq!(run.stdout.bytes, vec![0_u8; 1000]);
+        assert!(run.stdout.truncated);
+        assert_eq!(run.stdout.total, 5000);
+        assert!(run.stderr.bytes.is_empty());
+        assert_eq!(run.stderr.total, 4);
+    }
+
+    #[test]
+    fn run_consuming_hands_only_stdout_even_with_stderr_consume() {
+        let scripts = Scripts::new();
+        let script = scripts.write("consume-wrapper.sh", "printf out\nprintf err >&2\n");
+        let limits = Limits {
+            stdout: Stream::Consume,
+            stderr: Stream::Consume,
+            ..Limits::silent(Duration::from_secs(10))
+        };
+        let mut seen = Vec::new();
+        let run = run_consuming(
+            &mut command(&script),
+            &limits,
+            &AtomicBool::new(false),
+            &mut |bytes: &[u8]| seen.extend_from_slice(bytes),
+        );
+        assert!(run.success());
+        assert_eq!(seen, b"out");
+        assert!(run.stderr.bytes.is_empty());
+        assert_eq!(run.stderr.total, 3);
+        assert!(run.stderr.eof);
+    }
+
+    #[test]
+    fn stderr_consume_keeps_the_deadline_and_kills_the_group() {
+        let scripts = Scripts::new();
+        let script = scripts.write("consume-stderr-timeout.sh", "printf x >&2; sleep 30\n");
+        let limits = Limits {
+            stdout: Stream::Null,
+            stderr: Stream::Consume,
+            ..Limits::silent(Duration::from_millis(300))
+        };
+        let mut seen = Vec::new();
+        let started = Instant::now();
+        let run = run_consuming_streams(
+            &mut command(&script),
+            &limits,
+            &AtomicBool::new(false),
+            &mut |which: Which, bytes: &[u8]| {
+                if which == Which::Stderr {
+                    seen.extend_from_slice(bytes);
+                }
+            },
+        );
+        assert!(matches!(run.end, End::TimedOut));
+        assert_eq!(seen, b"x");
+        assert!(matches!(run.leader, Leader::Reaped(_)));
+        assert!(started.elapsed() < Duration::from_secs(5));
+    }
+
+    #[test]
+    fn stderr_consumer_panic_unwinds_after_killing_and_reaping_the_group() {
+        let scripts = Scripts::new();
+        let pid_file = scripts.path().join("leader.pid");
+        let script = scripts.write(
+            "consume-stderr-panic.sh",
+            &format!(
+                "printf '%s' \"$$\" > '{}'\nprintf boom >&2\nsleep 30\n",
+                pid_file.display()
+            ),
+        );
+        let limits = Limits {
+            stdout: Stream::Null,
+            stderr: Stream::Consume,
+            ..Limits::silent(Duration::from_secs(20))
+        };
+        let started = Instant::now();
+        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            run_consuming_streams(
+                &mut command(&script),
+                &limits,
+                &AtomicBool::new(false),
+                &mut |which: Which, _bytes: &[u8]| {
+                    if which == Which::Stderr {
+                        panic!("consumer rejects stderr");
+                    }
+                },
+            )
+        }));
+        assert!(outcome.is_err(), "the consumer panic must propagate");
+        assert!(started.elapsed() < Duration::from_secs(5));
+        let pid: u32 = fs::read_to_string(&pid_file)
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
+        assert!(proc_state_gone_or_zombie(pid));
+        let settle = Instant::now() + Duration::from_secs(2);
+        while group_live(pid as libc::pid_t) && Instant::now() < settle {
+            thread::sleep(Duration::from_millis(10));
+        }
+        assert!(
+            !group_live(pid as libc::pid_t),
+            "the guard must kill the group"
+        );
     }
 
     #[test]
