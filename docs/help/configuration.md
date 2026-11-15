@@ -579,7 +579,8 @@ list and table-valued git/stat settings remain omitted. The `[stats]` masthead w
 symbol), plus `statsBatteryWarn`, `statsDiskFreeWarn`,
 `statsDiskFreeCritical` and `statsDiskPath` (the filesystem the disk widget
 measures; empty means the filesystem holding the worktrees directory). The
-thresholds accept values from 0 through 255. The `stats.refresh_secs`,
+thresholds accept values from 0 through 255. `statsRefreshSecs` sets the
+polling interval in seconds (fractions allowed, 0 through 2678400). The
 `stats.refresh_rates`, `stats.alerts` and `stats.net_icons` settings remain
 omitted.
 
@@ -593,8 +594,9 @@ Recording, media and the monitor process table are also exposed:
 `recordingDir`, `recordingMaxBytes`, `mediaEnabled`, `mediaShowArt`,
 `mediaDefaultAction`, `mediaOverlayOnBadgeClick`, `mediaSeekStepSecs`,
 `mediaSeekStepVideoSecs`, `mediaPollIntervalSecs`, `mediaPlayersPriority`,
-`monitorProcRows`, `monitorProcesses` and `monitorProcessIo`. The media
-backend and volume-step keys and the `mpv`/`mpd` tables are not exposed. This
+`monitorProcRows`, `monitorProcesses` and `monitorProcessIo`, plus
+`mediaVolumeStep` (0.0 through 1.0). The media backend key and the
+`mpv`/`mpd` tables are not exposed. This
 exposes the existing default-action setting only; it adds no action ids.
 
 The `[limits]` and `[diagnostics]` tables are exposed as `limitsTestCpuQuota`,
@@ -606,6 +608,16 @@ The `[limits]` and `[diagnostics]` tables are exposed as `limitsTestCpuQuota`,
 are not exposed.
 
 The `[sandbox.limits]` gate-scheduling keys `heavy_slots` and `max_load` are exposed as `limitsHeavySlots` and `limitsMaxLoad`.
+
+The float keys `stats.refresh_secs`, `media.volume_step`, `usage.warn_percent`
+and `usage.crit_percent` are exposed as `statsRefreshSecs`, `mediaVolumeStep`,
+`usageWarnPercent` and `usageCritPercent`, each a bounded `numbers.between`
+option. thegn warns about a volume step outside 0.0 through 1.0 or a usage
+percentage outside 0 through 100, or any non-finite value; the warning names
+the key, the value and the valid range, and the value is still loaded, so an
+existing config never stops thegn from starting. A
+critical percentage below the warning percentage is accepted and treated as
+the warning tone.
 
 The `[disk]` scalar keys are exposed as `diskShowSizes`, `diskWarnThresholdGb`,
 `diskScanIntervalSecs`, `diskMaxScanPerRound`, `diskAutoCleanOnMerge`,
@@ -633,9 +645,9 @@ The `[log]` scalar keys are exposed as `rotationSizeMb`, `maxFiles`,
 `stderrCapMb`, `level`, `file`, `dir` and `format` under the `log` option.
 
 The `[usage]` scalar keys are exposed as `usageEnabled`, `usageStatusbar`,
-`usageDiscoverProfiles`, `usageTokenRollups`, `usageHistoryDays` and
-`usagePollIntervalSecs`. The float thresholds
-`usage.warn_percent` and `usage.crit_percent`, `usage.providers`,
+`usageDiscoverProfiles`, `usageTokenRollups`, `usageHistoryDays`,
+`usagePollIntervalSecs`, `usageWarnPercent` and `usageCritPercent`. The
+`usage.providers`,
 `usage.profile_roots`, `usage.accounts` and `usage.alerts` are omitted. Tailnet
 discovery exposes `hostDiscoveryTailnetEnabled` and
 `hostDiscoveryTailnetOnlineOnly`; `host_discovery.kind`,

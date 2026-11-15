@@ -320,6 +320,7 @@ self: {
     git.structural_diff = cfg.gitStructuralDiff;
     git.auto_fetch_colocated = cfg.gitAutoFetchColocated;
     git.submodules = cfg.gitSubmodules;
+    stats.refresh_secs = cfg.statsRefreshSecs;
     stats.cpu_icon = cfg.statsCpuIcon;
     stats.mem_icon = cfg.statsMemIcon;
     stats.net_icon = cfg.statsNetIcon;
@@ -357,6 +358,7 @@ self: {
     media.seek_step_video_secs = cfg.mediaSeekStepVideoSecs;
     media.poll_interval_secs = cfg.mediaPollIntervalSecs;
     media.players_priority = cfg.mediaPlayersPriority;
+    media.volume_step = cfg.mediaVolumeStep;
     monitor = {
       system = cfg.monitorSystem;
       gpu = cfg.monitorGpu;
@@ -401,6 +403,8 @@ self: {
     usage.token_rollups = cfg.usageTokenRollups;
     usage.history_days = cfg.usageHistoryDays;
     usage.poll_interval_secs = cfg.usagePollIntervalSecs;
+    usage.warn_percent = cfg.usageWarnPercent;
+    usage.crit_percent = cfg.usageCritPercent;
     lsp.enabled = cfg.lspEnabled;
     lsp.hover = cfg.lspHover;
     lsp.require_containment = cfg.lspRequireContainment;
@@ -1068,6 +1072,12 @@ in {
       description = "Submodule lifecycle mode: auto or off. Unset (null) = the binary's default.";
     };
 
+    statsRefreshSecs = lib.mkOption {
+      type = lib.types.nullOr (lib.types.numbers.between 0 2678400);
+      default = null;
+      description = "Masthead stats polling interval in seconds (fractions allowed). Unset (null) = the binary's default.";
+    };
+
     statsCpuIcon = lib.mkOption {
       type = lib.types.nullOr (lib.types.str);
       default = null;
@@ -1311,6 +1321,12 @@ in {
       description = "Preferred media players, highest priority first. Unset (null) = the binary's default.";
     };
 
+    mediaVolumeStep = lib.mkOption {
+      type = lib.types.nullOr (lib.types.numbers.between 0 1);
+      default = null;
+      description = "Volume step (0.0 through 1.0) applied by the media volume actions. Unset (null) = the binary's default.";
+    };
+
     monitorProcRows = lib.mkOption {
       type = lib.types.nullOr (lib.types.ints.unsigned);
       default = null;
@@ -1550,6 +1566,18 @@ in {
       type = lib.types.nullOr (lib.types.ints.between 60 2678400);
       default = null;
       description = "Usage polling cadence in seconds (minimum 60). Unset (null) = the binary's default.";
+    };
+
+    usageWarnPercent = lib.mkOption {
+      type = lib.types.nullOr (lib.types.numbers.between 0 100);
+      default = null;
+      description = "Usage percentage at which the usage badge shows its warning tone. Unset (null) = the binary's default.";
+    };
+
+    usageCritPercent = lib.mkOption {
+      type = lib.types.nullOr (lib.types.numbers.between 0 100);
+      default = null;
+      description = "Usage percentage at which the usage badge shows its critical tone; below the warn percentage it is treated as warn. Unset (null) = the binary's default.";
     };
 
     lspEnabled = lib.mkOption {
