@@ -476,8 +476,27 @@ fn rewatch_row(
 
 /// Drain everything the off-loop work reported, patching panel rows in place so
 /// a running pass paints live instead of waiting for the next model tick.
-pub(crate) fn drain_msgs(rx: &mut PrqRx, ctx: &mut PrqDrainCtx) {
-    while let Ok(msg) = rx.try_recv() {
+///
+/// Budgeted per drain (THE-657): at most [`PR_QUEUE_SOURCE`]'s 64 messages or
+/// the iteration deadline, whichever comes first, with at least one message
+/// always taken. Nothing is dropped or reordered; what is left stays queued and
+/// the returned `more_pending` tells the loop to re-arm one wake.
+///
+/// [`PR_QUEUE_SOURCE`]: crate::ingress_budget::PR_QUEUE_SOURCE
+pub(crate) fn drain_msgs(
+    rx: &mut PrqRx,
+    ctx: &mut PrqDrainCtx,
+    budget: &mut crate::ingress_budget::IterationBudget,
+    rotation: &mut usize,
+) -> bool {
+    let (batch, more_pending) = crate::ingress_budget::take_batch(
+        rx,
+        crate::ingress_budget::PR_QUEUE_SOURCE,
+        budget,
+        rotation,
+        Instant::now,
+    );
+    for msg in batch {
         ctx.loop_perf.tick(crate::perf::WakeSource::Fold);
         let now = std::time::Instant::now();
         match msg {
@@ -618,6 +637,7 @@ pub(crate) fn drain_msgs(rx: &mut PrqRx, ctx: &mut PrqDrainCtx) {
             }
         }
     }
+    more_pending
 }
 
 /// Patch one panel row in place. Pure over `PanelData` so it is unit-testable
@@ -1218,6 +1238,136 @@ mod tests {
             ),
             Ok(PrqAction::HandleReview)
         );
+    }
+
+    /// Run `f` against a throwaway drain context whose panel holds one
+    /// `/repo#1` row (the waker needs a pty, so this is a no-op where the test
+    /// support has none).
+    fn with_prq_ctx(f: impl FnOnce(&mut PrqDrainCtx<'_>)) {
+        if !crate::platform::sound_process::test_support::UNIX {
+            return;
+        }
+        let (waker, _master, _terminal) =
+            crate::platform::sound_process::test_support::test_waker();
+        let cfg = Config::default();
+        let notify =
+            crate::notify::NotifyState::new(cfg.notifications.clone(), String::new(), waker);
+        let event_bus = thegn_core::event_bus::EventBus::new();
+        let mut model = crate::chrome::FrameModel::default();
+        model.panel.pr_queue = vec![row("/repo#1", 1, "watching")];
+        let mut toasts = Toasts::default();
+        let mut inflight = false;
+        let mut want_model_refresh = false;
+        let mut loop_perf = crate::perf::LoopPerf::new();
+        f(&mut PrqDrainCtx {
+            model: &mut model,
+            toasts: &mut toasts,
+            notify_state: &notify,
+            event_bus: &event_bus,
+            inflight: &mut inflight,
+            want_model_refresh: &mut want_model_refresh,
+            loop_perf: &mut loop_perf,
+        });
+    }
+
+    /// A transient step on the fixture row: only the row's detail changes.
+    fn step(i: usize) -> PrqMsg {
+        PrqMsg::Step {
+            key: "/repo#1".into(),
+            number: 1,
+            branch: "feat".into(),
+            status: "checking".into(),
+            detail: format!("step {i}"),
+        }
+    }
+
+    fn row_detail(ctx: &PrqDrainCtx<'_>) -> Option<String> {
+        ctx.model.panel.pr_queue[0].detail.clone()
+    }
+
+    #[test]
+    fn prq_drain_is_bounded_per_call_and_lossless_in_order() {
+        with_prq_ctx(|ctx| {
+            let cap = crate::ingress_budget::PR_QUEUE_SOURCE.limits.max_msgs;
+            assert_eq!(cap, 64);
+            let total = 200usize;
+            let (tx, mut rx) = tokio_mpsc::unbounded_channel();
+            for i in 0..total {
+                assert!(tx.send(step(i)).is_ok());
+            }
+            let mut rotation = 0usize;
+            // The deadline cannot expire mid-test: the cap is the only bound.
+            let roomy = || {
+                crate::ingress_budget::IterationBudget::new(
+                    Instant::now(),
+                    std::time::Duration::from_secs(3600),
+                    false,
+                )
+            };
+
+            assert!(drain_msgs(&mut rx, ctx, &mut roomy(), &mut rotation));
+            assert_eq!(rx.len(), total - cap);
+            assert_eq!(row_detail(ctx), Some(format!("step {}", cap - 1)));
+            assert_eq!(ctx.model.panel.pr_queue[0].status, "checking");
+
+            let mut applied = cap;
+            loop {
+                let before = rx.len();
+                let more = drain_msgs(&mut rx, ctx, &mut roomy(), &mut rotation);
+                let taken = before - rx.len();
+                assert_eq!(taken, cap.min(before));
+                applied += taken;
+                assert_eq!(row_detail(ctx), Some(format!("step {}", applied - 1)));
+                assert_eq!(more, !rx.is_empty());
+                if !more {
+                    break;
+                }
+            }
+            assert_eq!(applied, total);
+            assert!(rx.is_empty());
+        });
+    }
+
+    #[test]
+    fn prq_drain_of_empty_receiver_reports_nothing_and_does_not_tick() {
+        with_prq_ctx(|ctx| {
+            let was_on = crate::perf::enabled();
+            crate::perf::set_enabled(true);
+            let (tx, mut rx) = tokio_mpsc::unbounded_channel::<PrqMsg>();
+            let mut rotation = 0usize;
+            let fresh = || {
+                crate::ingress_budget::IterationBudget::new(
+                    Instant::now(),
+                    crate::ingress_budget::LOOP_DEADLINE,
+                    false,
+                )
+            };
+            assert!(!drain_msgs(&mut rx, ctx, &mut fresh(), &mut rotation));
+            assert_eq!(ctx.loop_perf.items(crate::perf::WakeSource::Fold), 0);
+            assert_eq!(row_detail(ctx), None);
+
+            assert!(tx.send(step(0)).is_ok());
+            assert!(!drain_msgs(&mut rx, ctx, &mut fresh(), &mut rotation));
+            assert_eq!(ctx.loop_perf.items(crate::perf::WakeSource::Fold), 1);
+            crate::perf::set_enabled(was_on);
+        });
+    }
+
+    #[test]
+    fn prq_drain_with_spent_clock_still_takes_one_message() {
+        with_prq_ctx(|ctx| {
+            use crate::ingress_budget::{IterationBudget, LOOP_DEADLINE};
+            let start = Instant::now();
+            let mut spent = IterationBudget::new(start - LOOP_DEADLINE * 2, LOOP_DEADLINE, false);
+            let (tx, mut rx) = tokio_mpsc::unbounded_channel();
+            for i in 0..3 {
+                assert!(tx.send(step(i)).is_ok());
+            }
+            let mut rotation = 0usize;
+            assert!(drain_msgs(&mut rx, ctx, &mut spent, &mut rotation));
+            assert_eq!(rx.len(), 2);
+            assert_eq!(row_detail(ctx), Some("step 0".to_string()));
+        });
     }
 
     #[test]
