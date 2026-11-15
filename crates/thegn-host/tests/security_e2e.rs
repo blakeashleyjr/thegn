@@ -425,6 +425,7 @@ impl Fixture {
             .arg("daemon")
             .envs(state_env_all(state.root()))
             .env_remove("THEGN_LOG")
+            .env_remove("THEGN_SANDBOX_BACKEND")
             .env_remove("THEGN_DATABASE_MIGRATION_EXECUTABLE")
             .env_remove("THEGN_DATABASE_MIGRATION_AUTHORITY");
         if state_run_probe {
@@ -509,6 +510,7 @@ impl Fixture {
             // session-spawn test must account for it because it is unreachable.
             .env("DBUS_SESSION_BUS_ADDRESS", BUS_SENTINEL)
             .env_remove("THEGN_LOG")
+            .env_remove("THEGN_SANDBOX_BACKEND")
             .env_remove("THEGN_DATABASE_MIGRATION_EXECUTABLE")
             .env_remove("THEGN_DATABASE_MIGRATION_AUTHORITY");
     }
@@ -874,6 +876,7 @@ fn isolated_cli_env(
         .env("XDG_RUNTIME_DIR", runtime)
         .env("DBUS_SESSION_BUS_ADDRESS", BUS_SENTINEL)
         .env_remove("THEGN_LOG")
+        .env_remove("THEGN_SANDBOX_BACKEND")
         .env_remove("THEGN_DATABASE_MIGRATION_EXECUTABLE")
         .env_remove("THEGN_DATABASE_MIGRATION_AUTHORITY")
         .env("XDG_CONFIG_HOME", config_home);

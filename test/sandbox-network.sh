@@ -11,6 +11,11 @@ if [ "${PODMAN_E2E_FORCE:-}" != "1" ]; then
   exit 0
 fi
 
+if [[ ${THEGN_SANDBOX_BACKEND:-} == none || ${THEGN_SANDBOX_BACKEND:-} == host ]]; then
+  echo "sandbox-network.sh: sandbox backend forced off — skipping"
+  exit 0
+fi
+
 if ! command -v podman >/dev/null 2>&1; then
   echo "sandbox-network.sh: podman not found — skipping"
   exit 0
