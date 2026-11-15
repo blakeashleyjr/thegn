@@ -131,12 +131,7 @@ fn cached_ci_signals(
     cache: Option<&thegn_core::ci::CiRunCache>,
     refresh_failing: bool,
 ) -> CachedCiSignals {
-    let Some(latest) = cache.and_then(|cache| {
-        cache
-            .runs
-            .iter()
-            .find(|run| thegn_svc::ci::validate_ci_id(&run.id).is_ok())
-    }) else {
+    let Some(latest) = newest_valid_ci_run(cache) else {
         return CachedCiSignals::default();
     };
 
@@ -160,6 +155,40 @@ fn cached_ci_signals(
             .started_at
             .as_deref()
             .and_then(thegn_core::ci::epoch_secs),
+    }
+}
+
+/// The newest cached run (the cache is newest first) whose id passes
+/// `validate_ci_id`. The attention signal and the sidebar CI badge both read
+/// this one run, so they can never disagree.
+fn newest_valid_ci_run(
+    cache: Option<&thegn_core::ci::CiRunCache>,
+) -> Option<&thegn_core::ci::CiRun> {
+    cache.and_then(|cache| {
+        cache
+            .runs
+            .iter()
+            .find(|run| thegn_svc::ci::validate_ci_id(&run.id).is_ok())
+    })
+}
+
+/// The sidebar `ci` detail badge for one worktree's cached CI runs. `Pass` and
+/// `Fail` are last-known results and survive a failing refresh; `Running` and
+/// `Pending` show only while the refresh is healthy, because a failing refresh
+/// has no live result behind them. No cache, no valid run, or a cancelled or
+/// skipped newest run is `None` (unknown, never a pass).
+fn ci_badge(
+    cache: Option<&thegn_core::ci::CiRunCache>,
+    refresh_failing: bool,
+) -> Option<crate::sidebar::CiBadge> {
+    use crate::sidebar::CiBadge;
+    use thegn_core::ci::CiState;
+    match newest_valid_ci_run(cache)?.state {
+        CiState::Pass => Some(CiBadge::Pass),
+        CiState::Fail => Some(CiBadge::Fail),
+        CiState::Running if !refresh_failing => Some(CiBadge::Running),
+        CiState::Pending if !refresh_failing => Some(CiBadge::Pending),
+        _ => None,
     }
 }
 
@@ -238,6 +267,9 @@ fn collect_attention_inner(
             repo: db.repo_root_for(&g.path).ok().flatten().unwrap_or_default(),
         });
     }
+    // Per-worktree CI badge for the sidebar `ci` detail field, rebuilt every
+    // scan from the same cached run the scorer reads below.
+    status.ci_states.clear();
     if meta.is_empty() {
         return;
     }
@@ -392,6 +424,7 @@ fn collect_attention_inner(
 
     // Score every worktree.
     let mut scores: BTreeMap<String, AttentionScore> = BTreeMap::new();
+    let mut ci_states: BTreeMap<String, crate::sidebar::CiBadge> = BTreeMap::new();
     for path in meta.keys() {
         let act = activity.get(path);
         let (activity_kind, activity_since) = match act.map(|e| e.state.as_str()) {
@@ -440,6 +473,9 @@ fn collect_attention_inner(
             };
         let refresh_failing = crate::ci_refresh::note_for(path).is_some();
         let ci_signals = cached_ci_signals(cache.as_ref(), refresh_failing);
+        if let Some(badge) = ci_badge(cache.as_ref(), refresh_failing) {
+            ci_states.insert(path.clone(), badge);
+        }
         let ci_failing = ci_signals.failing;
         let ci_running = ci_signals.running;
         let ci_episode = ci_signals.episode;
@@ -480,6 +516,7 @@ fn collect_attention_inner(
         };
         scores.insert(path.clone(), attention::score(&inputs));
     }
+    status.ci_states = ci_states;
 
     // Acknowledgements: an acked worktree is suppressed from the nag surfaces
     // (badge + "Needs you" popup) while its current score still matches the
@@ -1434,5 +1471,113 @@ mod tests {
         assert!(signals.running);
         assert!(!signals.failing);
         assert_eq!(signals.episode, thegn_core::attention::episode_of("102"));
+    }
+
+    #[test]
+    fn ci_badge_table_tracks_the_newest_valid_run() {
+        use crate::sidebar::CiBadge;
+        use thegn_core::ci::CiState;
+        assert_eq!(ci_badge(None, false), None);
+        assert_eq!(
+            ci_badge(Some(&thegn_core::ci::CiRunCache::default()), false),
+            None
+        );
+
+        let cases = [
+            (CiState::Pass, false, Some(CiBadge::Pass)),
+            (CiState::Fail, false, Some(CiBadge::Fail)),
+            (CiState::Running, false, Some(CiBadge::Running)),
+            (CiState::Pending, false, Some(CiBadge::Pending)),
+            (CiState::Cancelled, false, None),
+            (CiState::Skipped, false, None),
+            // A failing refresh has no live result: in-flight states hide,
+            // last-known results stay.
+            (CiState::Pass, true, Some(CiBadge::Pass)),
+            (CiState::Fail, true, Some(CiBadge::Fail)),
+            (CiState::Running, true, None),
+            (CiState::Pending, true, None),
+        ];
+        for (state, refresh_failing, expected) in cases {
+            assert_eq!(
+                ci_badge(Some(&cached_ci_run(state)), refresh_failing),
+                expected,
+                "{state:?} refresh_failing={refresh_failing}"
+            );
+        }
+    }
+
+    #[test]
+    fn ci_badge_skips_an_invalid_id_newest_run_like_the_signal() {
+        use crate::sidebar::CiBadge;
+        let cache = thegn_core::ci::CiRunCache {
+            runs: vec![
+                thegn_core::ci::CiRun {
+                    id: "1 ".into(),
+                    state: thegn_core::ci::CiState::Pass,
+                    ..Default::default()
+                },
+                thegn_core::ci::CiRun {
+                    id: "102".into(),
+                    state: thegn_core::ci::CiState::Fail,
+                    ..Default::default()
+                },
+            ],
+            ..Default::default()
+        };
+        assert_eq!(ci_badge(Some(&cache), false), Some(CiBadge::Fail));
+        assert!(cached_ci_signals(Some(&cache), false).failing);
+
+        let only_invalid = thegn_core::ci::CiRunCache {
+            runs: vec![thegn_core::ci::CiRun {
+                id: "1 ".into(),
+                state: thegn_core::ci::CiState::Fail,
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        assert_eq!(ci_badge(Some(&only_invalid), false), None);
+    }
+
+    #[test]
+    fn attention_scan_records_ci_state_only_for_cached_worktrees() {
+        order_memo().lock().unwrap().clear();
+        let db = thegn_core::db::Db::open_memory().unwrap();
+        db.put_worktree(
+            "app/ci-red",
+            "/repo",
+            "/wt/ci-badge-red",
+            "topic",
+            None,
+            None,
+        )
+        .unwrap();
+        db.put_worktree(
+            "app/ci-none",
+            "/repo",
+            "/wt/ci-badge-none",
+            "topic",
+            None,
+            None,
+        )
+        .unwrap();
+        db.put_ci_cache("/wt/ci-badge-red", "topic", &failing_cache(""))
+            .unwrap();
+        let session = session_with(&[
+            ("app/ci-red", "/wt/ci-badge-red"),
+            ("app/ci-none", "/wt/ci-badge-none"),
+        ]);
+        let mut status = crate::sidebar::SidebarStatus::default();
+        status
+            .ci_states
+            .insert("/wt/stale".into(), crate::sidebar::CiBadge::Pass);
+
+        collect_attention_inner(&session, &db, &mut status, None, thegn_core::util::now());
+
+        assert_eq!(
+            status.ci_states.get("/wt/ci-badge-red"),
+            Some(&crate::sidebar::CiBadge::Fail)
+        );
+        assert!(!status.ci_states.contains_key("/wt/ci-badge-none"));
+        assert!(!status.ci_states.contains_key("/wt/stale"));
     }
 }

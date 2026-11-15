@@ -961,15 +961,79 @@ fn dirty_or_expired(found: bool, expired: bool) -> Result<bool> {
 /// so a wedged git — a lock held by a crashed process, a hung NFS/SSH mount, a
 /// stalled pack negotiation on a remote loc — can't pin a background hydration
 /// worker forever (the symptom is a silent, permanently-stale sidebar). Reads
-/// and fast local staging flow through [`run`]/`run_status`; the network-heavy
-/// writes (fetch/clone/push/pull) go through `run_w` and are deliberately *not*
-/// bounded here. Override with `THEGN_GIT_READ_TIMEOUT_SECS`; `0` disables it.
+/// and fast local staging flow through [`run`]/`run_status`; writes go through
+/// `run_w` and carry their own, much longer bound ([`git_write_timeout`]), so a
+/// slow fetch or push is never cut off at the read deadline. Override with
+/// `THEGN_GIT_READ_TIMEOUT_SECS`; `0` disables it.
 fn git_read_timeout() -> Option<std::time::Duration> {
     let secs = std::env::var("THEGN_GIT_READ_TIMEOUT_SECS")
         .ok()
         .and_then(|s| s.trim().parse::<u64>().ok())
         .unwrap_or(60);
     (secs > 0).then(|| std::time::Duration::from_secs(secs))
+}
+
+/// Git subcommands whose run time is dominated by network transfer; they get the
+/// long write bound ([`GIT_WRITE_NETWORK_TIMEOUT`]).
+const GIT_NETWORK_VERBS: &[&str] = &[
+    "fetch",
+    "push",
+    "pull",
+    "clone",
+    "ls-remote",
+    "remote",
+    "submodule",
+    "lfs",
+];
+
+/// Write bound for network verbs: a large clone or push over a slow link can
+/// legitimately take a long time, but not forever.
+const GIT_WRITE_NETWORK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60 * 60);
+
+/// Write bound for every other (local) mutation: commit hooks, rebases and
+/// large `add`s can be slow, but a write still running after this is wedged.
+const GIT_WRITE_LOCAL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15 * 60);
+
+/// Upper bound on a subprocess git *write* (`run_w`, `run_w_network`,
+/// `run_w_locked`) before its process group is killed, so a wedged write — a
+/// stalled push, a hook waiting on a terminal, a lock held by a crashed
+/// process — can't pin the mutation thread forever. Network verbs
+/// ([`GIT_NETWORK_VERBS`]) get one hour, every other write fifteen minutes.
+/// `THEGN_GIT_WRITE_TIMEOUT_SECS` overrides both; `0` disables the bound.
+/// `run_stdin` is covered too (see its doc).
+fn git_write_timeout(args: &[&str]) -> Option<std::time::Duration> {
+    let env = std::env::var("THEGN_GIT_WRITE_TIMEOUT_SECS");
+    git_write_timeout_with(args, env.as_deref().ok())
+}
+
+/// [`git_write_timeout`] with the env override injected, so tests never mutate
+/// the process-global `THEGN_GIT_WRITE_TIMEOUT_SECS`. An override that does not
+/// parse as whole seconds is ignored and the per-verb default applies.
+fn git_write_timeout_with(args: &[&str], env_secs: Option<&str>) -> Option<std::time::Duration> {
+    if let Some(secs) = env_secs.and_then(|s| s.trim().parse::<u64>().ok()) {
+        return (secs > 0).then(|| std::time::Duration::from_secs(secs));
+    }
+    match git_subcommand(args) {
+        Some(verb) if GIT_NETWORK_VERBS.contains(&verb) => Some(GIT_WRITE_NETWORK_TIMEOUT),
+        _ => Some(GIT_WRITE_LOCAL_TIMEOUT),
+    }
+}
+
+/// The git subcommand in `args`, skipping leading global options (`-c k=v`,
+/// `-C <dir>`, `--no-pager`, …) so `["-c", "x=y", "fetch"]` classifies as
+/// `fetch`.
+fn git_subcommand<'a>(args: &[&'a str]) -> Option<&'a str> {
+    let mut it = args.iter();
+    while let Some(arg) = it.next() {
+        match *arg {
+            "-c" | "-C" | "--git-dir" | "--work-tree" | "--namespace" => {
+                it.next();
+            }
+            a if a.starts_with('-') => {}
+            a => return Some(a),
+        }
+    }
+    None
 }
 
 /// Run a prepared git `Command` capturing full output, but kill the child if it
@@ -1012,13 +1076,52 @@ fn output_bounded_with(
     output_bounded_with_input(cmd, args, None, timeout)
 }
 
+/// Captured-stdout ceiling for a bounded svc git child: 256 MiB. Far above any
+/// legitimate git read (the parser-side 64 MiB caps sit below it), so it only
+/// trips on a pathological diff or log that would otherwise be buffered whole.
+const GIT_STDOUT_CAP: usize = 256 * 1024 * 1024;
+/// Captured-stderr ceiling for a bounded svc git child: 8 MiB.
+const GIT_STDERR_CAP: usize = 8 * 1024 * 1024;
+
 /// [`output_bounded_with`] with an optional stdin payload. The same bounded
 /// child lifecycle and spawn accounting apply to ref transactions and reads.
+///
+/// With a timeout, stdout is capped at [`GIT_STDOUT_CAP`] and stderr at
+/// [`GIT_STDERR_CAP`]: more than that ends the run, kills the process group and
+/// returns a named "output exceeded" error. `timeout == None` (the explicit
+/// `THEGN_GIT_WRITE_TIMEOUT_SECS=0` opt-out) stays unbounded in both time and
+/// output size by design.
 pub(super) fn output_bounded_with_input(
+    cmd: std::process::Command,
+    args: &[&str],
+    input: Option<&[u8]>,
+    timeout: Option<std::time::Duration>,
+) -> Result<std::process::Output> {
+    output_bounded_with_input_caps(cmd, args, input, timeout, GIT_STDOUT_CAP, GIT_STDERR_CAP)
+}
+
+/// Render an output cap for the over-cap error: whole MiB when it is one,
+/// bytes otherwise (the unit tests inject sub-MiB caps).
+fn describe_output_cap(cap: usize) -> String {
+    const MIB: usize = 1024 * 1024;
+    if cap >= MIB && cap.is_multiple_of(MIB) {
+        format!("{} MiB", cap / MIB)
+    } else {
+        format!("{cap} bytes")
+    }
+}
+
+/// [`output_bounded_with_input`] with the stream caps injected — the seam the
+/// unit tests drive with small caps. A stream producing more than its cap ends
+/// the run (the cap itself is allowed). The caps apply only when `timeout` is
+/// `Some`; the unbounded `None` path ignores them.
+fn output_bounded_with_input_caps(
     mut cmd: std::process::Command,
     args: &[&str],
     input: Option<&[u8]>,
     timeout: Option<std::time::Duration>,
+    stdout_cap: usize,
+    stderr_cap: usize,
 ) -> Result<std::process::Output> {
     use std::process::Stdio;
     use std::time::Duration;
@@ -1049,8 +1152,8 @@ pub(super) fn output_bounded_with_input(
         quiesce_after_leader: Some(Duration::ZERO),
         term_grace: Duration::from_millis(200),
         reader_grace: Duration::from_millis(100),
-        stdout: thegn_proc::Stream::Head { cap: usize::MAX },
-        stderr: thegn_proc::Stream::Head { cap: usize::MAX },
+        stdout: thegn_proc::Stream::HeadOrFail { cap: stdout_cap },
+        stderr: thegn_proc::Stream::HeadOrFail { cap: stderr_cap },
         ..thegn_proc::Limits::silent(timeout)
     };
     let run = match input {
@@ -1076,9 +1179,14 @@ pub(super) fn output_bounded_with_input(
             anyhow::bail!("git {} was unexpectedly cancelled", args.join(" "))
         }
         thegn_proc::End::OutputLimit(which) => {
+            let (stream, cap) = match which {
+                thegn_proc::Which::Stdout => ("stdout", stdout_cap),
+                thegn_proc::Which::Stderr => ("stderr", stderr_cap),
+            };
             anyhow::bail!(
-                "git {} unexpectedly hit output limit {which:?}",
-                args.join(" ")
+                "git {} output exceeded {} on {stream} (killed)",
+                args.join(" "),
+                describe_output_cap(cap)
             )
         }
         thegn_proc::End::LeaderExited => {
@@ -2459,18 +2567,39 @@ pub(crate) fn run_w(loc: &GitLoc, envs: &[(&str, &str)], args: &[&str]) -> Resul
     }
 }
 
-/// Run the write subprocess after the caller has selected the locking policy.
+/// Run the write subprocess after the caller has selected the locking policy,
+/// bounded by [`git_write_timeout`].
 fn run_w_unlocked(loc: &GitLoc, envs: &[(&str, &str)], args: &[&str]) -> Result<String> {
+    run_w_unlocked_with(loc, envs, args, git_write_timeout(args))
+}
+
+/// [`run_w_unlocked`] with the timeout injected — the test seam. On expiry the
+/// child's whole process group is killed (via [`output_bounded_with`]) and the
+/// error names the timeout; `None` runs unbounded.
+fn run_w_unlocked_with(
+    loc: &GitLoc,
+    envs: &[(&str, &str)],
+    args: &[&str],
+    timeout: Option<std::time::Duration>,
+) -> Result<String> {
     // Marks the write for snapshot caches of git reads (THE-718); dropped
     // (advancing the epoch) after the subprocess and its lock are done.
     let _epoch = thegn_core::util::GitWriteScope::begin();
     let mut env: Vec<(&str, &str)> = vec![("GIT_TERMINAL_PROMPT", "0")];
     env.extend_from_slice(envs);
-    let out = loc
-        .git_command_env(&env, args)
-        .stdin(std::process::Stdio::null())
-        .output()
-        .with_context(|| format!("git {}", args.join(" ")))?;
+    let mut cmd = loc.git_command_env(&env, args);
+    // `thegn_proc::run` and `Command::output` both null stdin already; set it
+    // explicitly so a credential/gpg prompt can never read the parent's tty.
+    cmd.stdin(std::process::Stdio::null());
+    let out = output_bounded_with(cmd, args, timeout).map_err(|error| {
+        // Spawn failures surface as a bare io::Error: name the command. The
+        // runner's own errors (timeout, supervision) already do.
+        if error.downcast_ref::<std::io::Error>().is_some() {
+            error.context(format!("git {}", args.join(" ")))
+        } else {
+            error
+        }
+    })?;
     if !out.status.success() {
         anyhow::bail!(
             "git {} failed: {}",
@@ -2509,15 +2638,27 @@ pub(crate) fn run_w_locked(
 
 /// [`run_w`] with bytes piped to stdin (`git apply -`, `git commit -F -`).
 ///
-/// This general mutation runner is deliberately unbounded: callers include
-/// patch/index operations, while other write runners carry fetch/push traffic
-/// for which a short local timeout would be destructive. Automated commit
-/// creation uses [`run_background_commit_stdin`] instead.
+/// Bounded like the other write runners: [`git_write_timeout`] is the deadline
+/// (the process group is killed on expiry) and the 256 MiB / 8 MiB output caps
+/// of [`output_bounded_with_input`] apply. `THEGN_GIT_WRITE_TIMEOUT_SECS=0`
+/// keeps the explicit unbounded opt-out. Automated commit creation uses
+/// [`run_background_commit_stdin`] instead.
 pub(crate) fn run_stdin(
     loc: &GitLoc,
     envs: &[(&str, &str)],
     args: &[&str],
     stdin: &[u8],
+) -> Result<String> {
+    run_stdin_with(loc, envs, args, stdin, git_write_timeout(args))
+}
+
+/// [`run_stdin`] with the timeout injected — the test seam.
+fn run_stdin_with(
+    loc: &GitLoc,
+    envs: &[(&str, &str)],
+    args: &[&str],
+    stdin: &[u8],
+    timeout: Option<std::time::Duration>,
 ) -> Result<String> {
     let _lock = if loc.is_remote() {
         None
@@ -2530,9 +2671,15 @@ pub(crate) fn run_stdin(
     let _epoch = thegn_core::util::GitWriteScope::begin();
     let mut env: Vec<(&str, &str)> = vec![("GIT_TERMINAL_PROMPT", "0")];
     env.extend_from_slice(envs);
-    let out = loc
-        .git_with_stdin(&env, args, stdin)
-        .with_context(|| format!("git {}", args.join(" ")))?;
+    let cmd = loc.git_command_env(&env, args);
+    let out = output_bounded_with_input(cmd, args, Some(stdin), timeout).map_err(|error| {
+        // Spawn failures surface as a bare io::Error: name the command.
+        if error.downcast_ref::<std::io::Error>().is_some() {
+            error.context(format!("git {}", args.join(" ")))
+        } else {
+            error
+        }
+    })?;
     if !out.status.success() {
         // Pre-commit / commit-msg hooks commonly print to stdout, not stderr,
         // so fold both streams into the error — that's what makes a rejected
@@ -3560,6 +3707,164 @@ mod tests {
     }
 
     #[test]
+    fn git_write_timeout_bounds_network_verbs_at_one_hour() {
+        let hour = Some(std::time::Duration::from_secs(3600));
+        for verb in [
+            "fetch",
+            "push",
+            "pull",
+            "clone",
+            "ls-remote",
+            "remote",
+            "submodule",
+            "lfs",
+        ] {
+            assert_eq!(
+                git_write_timeout_with(&[verb, "origin"], None),
+                hour,
+                "{verb}"
+            );
+        }
+        assert_eq!(
+            git_write_timeout_with(&["-c", "http.lowSpeedLimit=1", "fetch"], None),
+            hour
+        );
+        assert_eq!(
+            git_write_timeout_with(&["-C", "/repo", "--no-pager", "push"], None),
+            hour
+        );
+    }
+
+    #[test]
+    fn git_write_timeout_bounds_local_writes_at_fifteen_minutes() {
+        let quarter = Some(std::time::Duration::from_secs(15 * 60));
+        for args in [
+            &["commit", "-m", "x"][..],
+            &["add", "--", "f"][..],
+            &["rebase", "main"][..],
+            &["-c", "remote.x=fetch", "update-ref", "refs/x", "HEAD"][..],
+            &[][..],
+        ] {
+            assert_eq!(git_write_timeout_with(args, None), quarter, "{args:?}");
+        }
+    }
+
+    #[test]
+    fn git_write_timeout_env_override_and_zero_disable() {
+        let ten = Some(std::time::Duration::from_secs(10));
+        assert_eq!(git_write_timeout_with(&["fetch"], Some("10")), ten);
+        assert_eq!(git_write_timeout_with(&["commit"], Some(" 10 ")), ten);
+        assert_eq!(git_write_timeout_with(&["push"], Some("0")), None);
+        assert_eq!(git_write_timeout_with(&["commit"], Some("0")), None);
+        // An unparseable override falls back to the per-verb default.
+        assert_eq!(
+            git_write_timeout_with(&["commit"], Some("soon")),
+            Some(std::time::Duration::from_secs(15 * 60))
+        );
+    }
+
+    #[test]
+    fn run_w_unlocked_with_returns_stdout_of_a_finished_write() {
+        let repo = testutil::TestRepo::new("w-ok");
+        let out = run_w_unlocked_with(
+            &repo.loc(),
+            &[],
+            &["config", "--local", "--get", "core.bare"],
+            Some(std::time::Duration::from_secs(30)),
+        )
+        .unwrap();
+        assert_eq!(out.trim(), "false");
+    }
+
+    #[test]
+    fn run_w_unlocked_with_keeps_the_failed_text_on_nonzero_exit() {
+        let repo = testutil::TestRepo::new("w-fail");
+        let error = run_w_unlocked_with(
+            &repo.loc(),
+            &[],
+            &["update-ref", "refs/heads/x", "not-a-revision"],
+            Some(std::time::Duration::from_secs(30)),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            error.contains("git update-ref refs/heads/x not-a-revision failed:"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn run_stdin_with_returns_stdout_of_a_finished_command() {
+        let repo = testutil::TestRepo::new("stdin-ok");
+        let out = run_stdin_with(
+            &repo.loc(),
+            &[],
+            &["hash-object", "--stdin"],
+            b"hello\n",
+            Some(std::time::Duration::from_secs(30)),
+        )
+        .unwrap();
+        assert_eq!(out.trim(), "ce013625030ba8dba906f756967f9e9ca394464a");
+    }
+
+    #[test]
+    fn run_stdin_with_folds_stderr_into_the_error_on_nonzero_exit() {
+        let repo = testutil::TestRepo::new("stdin-fail");
+        let error = run_stdin_with(
+            &repo.loc(),
+            &[],
+            &["apply", "--check", "-"],
+            b"this is not a patch\n",
+            Some(std::time::Duration::from_secs(30)),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("git apply --check - failed:"), "{error}");
+        assert!(
+            error.len() > "git apply --check - failed: ".len(),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn run_stdin_with_kills_a_hung_command() {
+        let repo = testutil::TestRepo::new("stdin-hang");
+        let start = std::time::Instant::now();
+        let error = run_stdin_with(
+            &repo.loc(),
+            &[],
+            &["-c", "alias.hang=!sleep 30", "hang"],
+            b"payload",
+            Some(std::time::Duration::from_millis(300)),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("timed out after"), "{error}");
+        assert!(start.elapsed() < std::time::Duration::from_secs(10));
+    }
+
+    #[test]
+    fn run_w_unlocked_with_kills_a_hung_write() {
+        // A shell alias stands in for a wedged write; its `sleep` is a child of
+        // git, so only a process-group kill returns promptly.
+        let repo = testutil::TestRepo::new("w-hang");
+        let start = std::time::Instant::now();
+        let error = run_w_unlocked_with(
+            &repo.loc(),
+            &[],
+            &["-c", "alias.hang=!sleep 30", "hang"],
+            Some(std::time::Duration::from_millis(300)),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("timed out after"), "{error}");
+        assert!(
+            start.elapsed() < std::time::Duration::from_secs(10),
+            "the write must be killed at its bound, not after the sleep"
+        );
+    }
+
+    #[test]
     fn output_bounded_disabled_timeout_runs_to_completion() {
         let mut c = std::process::Command::new("printf");
         c.arg("ok");
@@ -3655,6 +3960,86 @@ mod tests {
         let out =
             output_bounded_with(c, &["sh"], Some(std::time::Duration::from_secs(20))).unwrap();
         assert_eq!(out.stdout.len(), 200000);
+    }
+
+    #[test]
+    fn output_bounded_caps_kill_a_stdout_flood() {
+        let mut c = std::process::Command::new("sh");
+        c.args(["-c", "head -c 5000 /dev/zero"]);
+        let error = output_bounded_with_input_caps(
+            c,
+            &["sh"],
+            None,
+            Some(std::time::Duration::from_secs(20)),
+            1024,
+            256,
+        )
+        .expect_err("5000 stdout bytes must exceed a 1024-byte cap")
+        .to_string();
+        assert!(error.contains("exceeded"), "{error}");
+        assert!(error.contains("stdout"), "{error}");
+        assert!(error.contains("1024 bytes"), "{error}");
+    }
+
+    #[test]
+    fn output_bounded_caps_kill_a_stderr_flood() {
+        let mut c = std::process::Command::new("sh");
+        c.args(["-c", "head -c 5000 /dev/zero >&2"]);
+        let error = output_bounded_with_input_caps(
+            c,
+            &["sh"],
+            None,
+            Some(std::time::Duration::from_secs(20)),
+            1024,
+            256,
+        )
+        .expect_err("5000 stderr bytes must exceed a 256-byte cap")
+        .to_string();
+        assert!(error.contains("exceeded"), "{error}");
+        assert!(error.contains("stderr"), "{error}");
+    }
+
+    #[test]
+    fn output_bounded_caps_allow_output_exactly_at_the_cap() {
+        let mut c = std::process::Command::new("sh");
+        c.args(["-c", "head -c 1024 /dev/zero; head -c 256 /dev/zero >&2"]);
+        let out = output_bounded_with_input_caps(
+            c,
+            &["sh"],
+            None,
+            Some(std::time::Duration::from_secs(20)),
+            1024,
+            256,
+        )
+        .unwrap();
+        assert!(out.status.success());
+        assert_eq!(out.stdout, vec![0u8; 1024]);
+        assert_eq!(out.stderr, vec![0u8; 256]);
+    }
+
+    #[test]
+    fn output_bounded_caps_leave_a_small_run_byte_identical() {
+        let mut c = std::process::Command::new("printf");
+        c.arg("small\\0run");
+        let out = output_bounded_with_input_caps(
+            c,
+            &["printf"],
+            None,
+            Some(std::time::Duration::from_secs(5)),
+            1024,
+            256,
+        )
+        .unwrap();
+        assert!(out.status.success());
+        assert_eq!(out.stdout, b"small\0run");
+        assert!(out.stderr.is_empty());
+    }
+
+    #[test]
+    fn output_cap_is_described_in_mib_when_whole() {
+        assert_eq!(describe_output_cap(GIT_STDOUT_CAP), "256 MiB");
+        assert_eq!(describe_output_cap(GIT_STDERR_CAP), "8 MiB");
+        assert_eq!(describe_output_cap(1024), "1024 bytes");
     }
 
     #[test]

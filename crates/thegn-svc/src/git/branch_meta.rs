@@ -1,7 +1,8 @@
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::io::Read;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{LazyLock, Mutex};
 
@@ -9,6 +10,9 @@ use thegn_core::remote::GitLoc;
 
 pub const META_COUNT_CAP: u32 = 999;
 const META_MEMO_CAP: usize = 256;
+/// The most bytes of `logs/refs/stash` read for the sidebar stash count; a
+/// larger reflog reports the count cap instead of being read in full.
+const STASH_REFLOG_READ_CAP: u64 = 4 * 1024 * 1024;
 
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub struct BranchMeta {
@@ -20,6 +24,11 @@ pub struct BranchMeta {
     /// Sanitised author name from the last commit, when available.
     #[serde(default)]
     pub last_author: Option<String>,
+    /// Repo-wide stash entry count (capped), read from the stash reflog.
+    /// `None` = unknown (remote location or a failed read), never `Some(0)`
+    /// for a failure.
+    #[serde(default)]
+    pub stash: Option<u32>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -40,6 +49,7 @@ impl CommitMeta {
             last_commit_unix: self.last_commit_unix,
             last_subject: self.last_subject,
             last_author: self.last_author,
+            stash: None,
         }
     }
 }
@@ -47,6 +57,44 @@ impl CommitMeta {
 type MetaKey = (PathBuf, String, String);
 type MetaMemo = Mutex<HashMap<MetaKey, CommitMeta>>;
 static META_MEMO: LazyLock<MetaMemo> = LazyLock::new(|| Mutex::new(HashMap::new()));
+impl BranchMeta {
+    /// Attach the stash count. Applied after the commit memo, because the
+    /// stash changes without HEAD or the base moving.
+    fn with_stash(mut self, stash: Option<u32>) -> Self {
+        self.stash = stash;
+        self
+    }
+}
+
+/// Count stash entries from `<common-dir>/logs/refs/stash` without spawning
+/// git: one entry per non-empty line (a final line without a trailing newline
+/// counts; a CRLF line counts once). At most [`STASH_REFLOG_READ_CAP`] bytes
+/// are read; a larger reflog reports `cap`. A missing reflog is an empty stash
+/// (`Some(0)`); any other IO error is unknown (`None`).
+fn stash_from_reflog(common_dir: &Path, cap: u32) -> Option<u32> {
+    let path = common_dir.join("logs").join("refs").join("stash");
+    let file = match std::fs::File::open(&path) {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Some(0),
+        Err(_) => return None,
+    };
+    let mut bytes = Vec::new();
+    if file
+        .take(STASH_REFLOG_READ_CAP + 1)
+        .read_to_end(&mut bytes)
+        .is_err()
+    {
+        return None;
+    }
+    if bytes.len() as u64 > STASH_REFLOG_READ_CAP {
+        return Some(cap);
+    }
+    let count = bytes
+        .split(|byte| *byte == b'\n')
+        .filter(|line| line.iter().any(|byte| *byte != b'\r'))
+        .count();
+    Some(count.min(cap as usize) as u32)
+}
 static META_COMPUTES: AtomicU64 = AtomicU64::new(0);
 
 pub fn branch_meta_compute_count() -> u64 {
@@ -152,6 +200,7 @@ pub(crate) fn from_parts(
         last_commit_unix: Some(log.0),
         last_author: Some(log.1),
         last_subject: Some(log.2),
+        stash: None,
     }
 }
 
@@ -206,7 +255,8 @@ pub(crate) fn gix(loc: &GitLoc, base: Option<&str>) -> Result<BranchMeta> {
             last_subject: Some(sanitized_subject(commit.message_raw_sloppy())),
         })
     })?;
-    Ok(commit_meta.with_dirty(None))
+    let stash = stash_from_reflog(repo.common_dir(), META_COUNT_CAP);
+    Ok(commit_meta.with_dirty(None).with_stash(stash))
 }
 
 fn count_excluding(
@@ -282,7 +332,14 @@ pub(crate) fn cli(loc: &GitLoc, base: Option<&str>, detached: bool) -> Result<Br
             last_subject: Some(log.2),
         })
     })?;
-    Ok(commit_meta.with_dirty(None))
+    let stash = if loc.is_remote() {
+        None
+    } else {
+        super::native_diff::open(loc.path())
+            .ok()
+            .and_then(|repo| stash_from_reflog(repo.common_dir(), META_COUNT_CAP))
+    };
+    Ok(commit_meta.with_dirty(None).with_stash(stash))
 }
 
 pub(crate) fn with_dirty(
@@ -338,6 +395,102 @@ mod tests {
         let parsed = parse_log_record(output.as_bytes()).unwrap();
         assert_eq!(parsed.1, "a".repeat(64));
         assert!(!parsed.1.chars().any(char::is_control));
+    }
+
+    fn stash_fixture(contents: Option<&[u8]>) -> tempfile::TempDir {
+        let dir = tempfile::tempdir().unwrap();
+        let refs = dir.path().join("logs").join("refs");
+        std::fs::create_dir_all(&refs).unwrap();
+        if let Some(contents) = contents {
+            std::fs::write(refs.join("stash"), contents).unwrap();
+        }
+        dir
+    }
+
+    const STASH_LINE: &str = "0000000000000000000000000000000000000000 \
+1111111111111111111111111111111111111111 A U Thor <a@example.com> 1700000000 +0000\tWIP on main: x";
+
+    #[test]
+    fn stash_reflog_counts_lines() {
+        let one = format!("{STASH_LINE}\n");
+        let three = format!("{STASH_LINE}\n{STASH_LINE}\n{STASH_LINE}\n");
+        let three_no_trailing = format!("{STASH_LINE}\n{STASH_LINE}\n{STASH_LINE}");
+        let crlf = format!("{STASH_LINE}\r\n{STASH_LINE}\r\n\r\n");
+        let cases: [(&[u8], Option<u32>); 6] = [
+            (&b""[..], Some(0)),
+            (&b"\n\n"[..], Some(0)),
+            (one.as_bytes(), Some(1)),
+            (three.as_bytes(), Some(3)),
+            (three_no_trailing.as_bytes(), Some(3)),
+            (crlf.as_bytes(), Some(2)),
+        ];
+        for (contents, expected) in cases {
+            let dir = stash_fixture(Some(contents));
+            assert_eq!(
+                stash_from_reflog(dir.path(), META_COUNT_CAP),
+                expected,
+                "{:?}",
+                String::from_utf8_lossy(contents)
+            );
+        }
+    }
+
+    #[test]
+    fn stash_reflog_caps_count_and_size() {
+        let three = format!("{STASH_LINE}\n{STASH_LINE}\n{STASH_LINE}\n");
+        let dir = stash_fixture(Some(three.as_bytes()));
+        assert_eq!(stash_from_reflog(dir.path(), 2), Some(2));
+
+        let oversized = vec![b'x'; STASH_REFLOG_READ_CAP as usize + 1];
+        let dir = stash_fixture(Some(oversized.as_slice()));
+        assert_eq!(stash_from_reflog(dir.path(), 7), Some(7));
+
+        let exact = vec![b'x'; STASH_REFLOG_READ_CAP as usize];
+        let dir = stash_fixture(Some(exact.as_slice()));
+        assert_eq!(stash_from_reflog(dir.path(), 7), Some(1));
+    }
+
+    #[test]
+    fn stash_reflog_missing_is_zero_and_unreadable_is_unknown() {
+        let dir = stash_fixture(None);
+        assert_eq!(stash_from_reflog(dir.path(), META_COUNT_CAP), Some(0));
+        let empty = tempfile::tempdir().unwrap();
+        assert_eq!(stash_from_reflog(empty.path(), META_COUNT_CAP), Some(0));
+
+        // A plain (non-symlink) directory where the reflog file belongs is an
+        // IO error other than NotFound: unknown, never a false zero.
+        let dir = stash_fixture(None);
+        std::fs::create_dir_all(dir.path().join("logs").join("refs").join("stash")).unwrap();
+        assert_eq!(stash_from_reflog(dir.path(), META_COUNT_CAP), None);
+    }
+
+    #[test]
+    fn stash_defaults_to_unknown_for_older_serialised_meta() {
+        let meta: BranchMeta = serde_json::from_str(r#"{"ahead_base":1}"#).unwrap();
+        assert_eq!(meta.stash, None);
+        assert_eq!(
+            from_parts(None, (1, String::new(), String::new()), None).stash,
+            None
+        );
+    }
+
+    #[test]
+    fn stash_count_reaches_meta_on_both_backends_after_memo() {
+        let repo = super::super::testutil::TestRepo::new("branch-meta-stash");
+        repo.commit_file("tracked", "one", "subject");
+        let loc = repo.loc();
+        assert_eq!(gix(&loc, None).unwrap().stash, Some(0));
+        assert_eq!(cli(&loc, None, false).unwrap().stash, Some(0));
+
+        std::fs::write(repo.dir.join("tracked"), "two").unwrap();
+        super::super::testutil::git_in(&repo.dir, &["stash", "push", "-q"]);
+        // HEAD did not move, so the commit memo hits; the stash is still fresh.
+        assert_eq!(gix(&loc, None).unwrap().stash, Some(1));
+        assert_eq!(cli(&loc, None, false).unwrap().stash, Some(1));
+        let gix_meta = GixGit::new().glyph_reads_with_submodules(&loc, false).meta;
+        assert_eq!(gix_meta.unwrap().stash, Some(1));
+        let cli_meta = CliGit.glyph_reads_with_submodules(&loc, false).meta;
+        assert_eq!(cli_meta.unwrap().stash, Some(1));
     }
 
     #[test]

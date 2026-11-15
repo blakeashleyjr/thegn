@@ -43,6 +43,215 @@ pub(crate) struct SpecBatch {
 /// Live env-provisioning progress for a tab's splash, keyed (group name, tab).
 pub(crate) type ProvisionProgress = (String, usize, Vec<LoadStep>);
 
+/// THE-661: most distinct `(group, tab)` keys the provisioning slot holds
+/// between two loop drains. At the cap a new key evicts the oldest-first-seen
+/// non-empty entry (counted as a drop); the slot never grows past it except
+/// as documented on [`ProvisionTx::send`] for clear messages.
+pub(crate) const MAX_PROVISION_KEYS: usize = 64;
+
+/// THE-661: byte ceiling (measured by [`provision_entry_bytes`]) for all
+/// pending provisioning entries. A non-empty entry larger than this on its
+/// own is refused; otherwise the oldest other non-empty entries are evicted
+/// until the slot fits again.
+pub(crate) const MAX_PROVISION_BYTES: usize = 256 * 1024;
+
+/// Approximate retained size of one pending provisioning entry: the key, the
+/// step structs, and their owned strings.
+fn provision_entry_bytes(msg: &ProvisionProgress) -> usize {
+    msg.0.len()
+        + msg
+            .2
+            .iter()
+            .map(|step| {
+                std::mem::size_of::<LoadStep>()
+                    + step.label.len()
+                    + step.detail.as_ref().map_or(0, String::len)
+            })
+            .sum::<usize>()
+}
+
+#[derive(Default)]
+struct ProvisionState {
+    /// Latest steps per `(group, tab)`, in first-seen key order.
+    entries: Vec<ProvisionProgress>,
+    bytes: usize,
+    drops: u64,
+}
+
+impl ProvisionState {
+    fn position(&self, group: &str, tab: usize) -> Option<usize> {
+        self.entries
+            .iter()
+            .position(|(name, ti, _)| name == group && *ti == tab)
+    }
+
+    /// Oldest-first-seen non-empty entry, skipping `keep`.
+    fn oldest_non_empty(&self, keep: Option<(&str, usize)>) -> Option<usize> {
+        self.entries
+            .iter()
+            .position(|(name, ti, steps)| !steps.is_empty() && keep != Some((name.as_str(), *ti)))
+    }
+
+    fn evict(&mut self, index: usize) {
+        let removed = self.entries.remove(index);
+        self.bytes = self.bytes.saturating_sub(provision_entry_bytes(&removed));
+        self.drops = self.drops.saturating_add(1);
+    }
+}
+
+struct ProvisionShared {
+    state: std::sync::Mutex<ProvisionState>,
+    wake: Box<dyn Fn() + Send + Sync>,
+}
+
+impl ProvisionShared {
+    fn lock(&self) -> std::sync::MutexGuard<'_, ProvisionState> {
+        // Same poisoning policy as `snapshot_slot`: the state is plain data
+        // that every operation leaves consistent, so recover rather than
+        // panic the loop.
+        self.state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+}
+
+/// THE-661: sender half of the bounded provisioning-progress slot. Each send
+/// stores or replaces the latest steps for its `(group, tab)` key and wakes
+/// the loop only when the slot goes from empty to non-empty.
+#[derive(Clone)]
+pub(crate) struct ProvisionTx {
+    shared: std::sync::Arc<ProvisionShared>,
+}
+
+/// THE-661: loop-side half of the provisioning slot.
+pub(crate) struct ProvisionInbox {
+    shared: std::sync::Arc<ProvisionShared>,
+}
+
+impl ProvisionTx {
+    /// Build the slot, waking `waker` on each empty-to-non-empty change.
+    pub(crate) fn channel(waker: termwiz::terminal::TerminalWaker) -> (Self, ProvisionInbox) {
+        Self::with_wake(move || {
+            if let Err(e) = waker.wake() {
+                tracing::debug!(target: "thegn::ingress", "provision slot wake failed: {e}");
+            }
+        })
+    }
+
+    /// Build the slot with an arbitrary wake callback (the test seam).
+    fn with_wake(wake: impl Fn() + Send + Sync + 'static) -> (Self, ProvisionInbox) {
+        let shared = std::sync::Arc::new(ProvisionShared {
+            state: std::sync::Mutex::new(ProvisionState::default()),
+            wake: Box::new(wake),
+        });
+        (
+            Self {
+                shared: std::sync::Arc::clone(&shared),
+            },
+            ProvisionInbox { shared },
+        )
+    }
+
+    /// Store or replace the latest steps for the message's key. Returns
+    /// whether the message was accepted.
+    ///
+    /// An empty step list (the "clear the splash lock" signal) always lands:
+    /// it replaces its key's entry, and at the key cap it evicts the oldest
+    /// non-empty entry. Only when every pending entry is itself a clear does a
+    /// new clear evict the oldest clear, which needs more than
+    /// [`MAX_PROVISION_KEYS`] tabs finishing within one loop iteration.
+    pub(crate) fn send(&self, msg: ProvisionProgress) -> bool {
+        let bytes = provision_entry_bytes(&msg);
+        let is_clear = msg.2.is_empty();
+        let pulse = {
+            let mut state = self.shared.lock();
+            if !is_clear && bytes > MAX_PROVISION_BYTES {
+                state.drops = state.drops.saturating_add(1);
+                return false;
+            }
+            let was_empty = state.entries.is_empty();
+            let (name, ti, steps) = msg;
+            if let Some(index) = state.position(&name, ti) {
+                let old = provision_entry_bytes(&state.entries[index]);
+                state.bytes = state.bytes.saturating_sub(old).saturating_add(bytes);
+                state.entries[index].2 = steps;
+            } else {
+                if state.entries.len() >= MAX_PROVISION_KEYS {
+                    match state.oldest_non_empty(None) {
+                        Some(victim) => state.evict(victim),
+                        None if is_clear => state.evict(0),
+                        None => {
+                            state.drops = state.drops.saturating_add(1);
+                            return false;
+                        }
+                    }
+                }
+                state.bytes = state.bytes.saturating_add(bytes);
+                state.entries.push((name.clone(), ti, steps));
+            }
+            while state.bytes > MAX_PROVISION_BYTES {
+                match state.oldest_non_empty(Some((name.as_str(), ti))) {
+                    Some(victim) => state.evict(victim),
+                    None => break,
+                }
+            }
+            was_empty
+        };
+        if pulse {
+            (self.shared.wake)();
+        }
+        true
+    }
+}
+
+impl ProvisionInbox {
+    /// Take every pending entry (first-seen key order) under the lock. A send
+    /// that lands after this take finds the slot empty and wakes again.
+    pub(crate) fn take_all(&self) -> Vec<ProvisionProgress> {
+        let mut state = self.shared.lock();
+        state.bytes = 0;
+        std::mem::take(&mut state.entries)
+    }
+
+    #[cfg(test)]
+    fn drops(&self) -> u64 {
+        self.shared.lock().drops
+    }
+
+    #[cfg(test)]
+    fn len(&self) -> usize {
+        self.shared.lock().entries.len()
+    }
+
+    #[cfg(test)]
+    fn bytes(&self) -> usize {
+        self.shared.lock().bytes
+    }
+}
+
+/// Where [`drain_provision`] takes pending progress from: the bounded slot in
+/// production; an unbounded channel in older tests that build one directly.
+pub(crate) trait ProvisionSource {
+    fn take_pending(&mut self) -> Vec<ProvisionProgress>;
+}
+
+impl ProvisionSource for ProvisionInbox {
+    fn take_pending(&mut self) -> Vec<ProvisionProgress> {
+        self.take_all()
+    }
+}
+
+#[cfg(test)]
+impl ProvisionSource for tokio::sync::mpsc::UnboundedReceiver<ProvisionProgress> {
+    fn take_pending(&mut self) -> Vec<ProvisionProgress> {
+        let mut out = Vec::new();
+        while let Ok(msg) = self.try_recv() {
+            out.push(msg);
+        }
+        out
+    }
+}
+
 /// Error carried over the off-thread spec-resolution channel. Preserves a
 /// [`SandboxHalt`](crate::agent::SandboxHalt) (so the receiver can raise the
 /// warning modal) and stringifies everything else.
@@ -299,7 +508,7 @@ pub(crate) fn kick_eager(
     cfg: &thegn_core::config::Config,
     session: &crate::session::Session,
     eager_inflight: &mut std::collections::HashSet<String>,
-    provision_tx: &tokio::sync::mpsc::UnboundedSender<ProvisionProgress>,
+    provision_tx: &ProvisionTx,
     waker: &termwiz::terminal::TerminalWaker,
     host_ui: &crate::host_flow::HostUiTx,
 ) {
@@ -373,7 +582,7 @@ pub(crate) fn kick_eager(
 /// built; only the active tab's stream drives the loading screen. Returns
 /// whether the frame went dirty.
 pub(crate) fn drain_provision(
-    rx: &mut tokio::sync::mpsc::UnboundedReceiver<ProvisionProgress>,
+    rx: &mut impl ProvisionSource,
     session: &crate::session::Session,
     loading_state: &mut crate::loading::track::LoadingTracker,
     loading_remote: &mut std::collections::HashMap<(String, usize), bool>,
@@ -381,8 +590,17 @@ pub(crate) fn drain_provision(
     loop_perf: &mut crate::perf::LoopPerf,
 ) -> bool {
     let mut dirty = false;
-    while let Ok((name, ti, steps)) = rx.try_recv() {
+    let mut batch = Vec::new();
+    for msg in rx.take_pending() {
+        // Wake accounting stays honest: one tick per taken entry.
         loop_perf.tick(crate::perf::WakeSource::Spec);
+        batch.push(msg);
+    }
+    // Each message replaces the whole step list for its key, so only the last
+    // per key matters. Known, accepted difference: a step that went Pending to
+    // Active to Done entirely within one drain pass records no `took` (it
+    // would have been about 0 ms).
+    for (name, ti, steps) in coalesce_latest(batch) {
         let key = (name, ti);
         // A tab whose shell has already spoken has RETIRED its splash: a late
         // provisioning update (queued before the first-output clear) must not
@@ -411,6 +629,20 @@ pub(crate) fn drain_provision(
         }
     }
     dirty
+}
+
+/// Collapse progress messages to the latest steps per `(group, tab)` key,
+/// keeping first-seen key order. Bounded by the number of distinct keys.
+fn coalesce_latest(msgs: impl IntoIterator<Item = ProvisionProgress>) -> Vec<ProvisionProgress> {
+    let mut out: Vec<ProvisionProgress> = Vec::new();
+    for (name, ti, steps) in msgs {
+        if let Some(slot) = out.iter_mut().find(|(n, t, _)| *n == name && *t == ti) {
+            slot.2 = steps;
+        } else {
+            out.push((name, ti, steps));
+        }
+    }
+    out
 }
 
 /// Adopt live daemon sessions when a prewarm has no safe fresh spec to spawn.
@@ -907,6 +1139,243 @@ mod tests {
     use crate::pane::PaneEvent;
     use crate::session::{GroupKind, ProviderSession, Session, WorktreeGroup};
     use tokio::sync::mpsc as tokio_mpsc;
+
+    fn ls(label: &str, state: crate::chrome::StepState) -> LoadStep {
+        LoadStep {
+            label: label.into(),
+            state,
+            detail: None,
+            kind: crate::chrome::StepKind::default(),
+            started_at: None,
+            took: None,
+            progress: None,
+        }
+    }
+
+    fn msg(g: &str, t: usize, label: &str) -> ProvisionProgress {
+        (
+            g.into(),
+            t,
+            vec![ls(label, crate::chrome::StepState::Active)],
+        )
+    }
+
+    fn labels(m: &[ProvisionProgress]) -> Vec<(String, usize, String)> {
+        m.iter()
+            .map(|(g, t, s)| (g.clone(), *t, s[0].label.clone()))
+            .collect::<Vec<_>>()
+    }
+
+    #[test]
+    fn coalesce_latest_table() {
+        assert!(coalesce_latest(Vec::new()).is_empty());
+        assert_eq!(
+            labels(&coalesce_latest(vec![msg("a", 0, "x")])),
+            vec![("a".to_string(), 0, "x".to_string())]
+        );
+        assert_eq!(
+            labels(&coalesce_latest(vec![
+                msg("a", 0, "1"),
+                msg("a", 0, "2"),
+                msg("a", 0, "3")
+            ])),
+            vec![("a".to_string(), 0, "3".to_string())]
+        );
+        assert_eq!(
+            labels(&coalesce_latest(vec![msg("a", 0, "1"), msg("b", 1, "2")])),
+            vec![
+                ("a".to_string(), 0, "1".to_string()),
+                ("b".to_string(), 1, "2".to_string())
+            ]
+        );
+        assert_eq!(
+            labels(&coalesce_latest(vec![
+                msg("a", 0, "a1"),
+                msg("b", 0, "b1"),
+                msg("a", 0, "a2"),
+                msg("b", 0, "b2"),
+                msg("a", 1, "c1"),
+            ])),
+            vec![
+                ("a".to_string(), 0, "a2".to_string()),
+                ("b".to_string(), 0, "b2".to_string()),
+                ("a".to_string(), 1, "c1".to_string())
+            ]
+        );
+    }
+
+    #[test]
+    fn provision_slot_flood_keeps_latest_per_key_in_first_seen_order() {
+        let (tx, inbox) = ProvisionTx::with_wake(|| {});
+        let keys = [("b", 0usize), ("a", 1usize), ("c", 0usize)];
+        for i in 0..10_000usize {
+            let (g, t) = keys[i % keys.len()];
+            assert!(tx.send(msg(g, t, &i.to_string())));
+        }
+        assert_eq!(inbox.len(), 3);
+        assert_eq!(inbox.drops(), 0);
+        assert_eq!(
+            labels(&inbox.take_all()),
+            vec![
+                ("b".to_string(), 0, "9999".to_string()),
+                ("a".to_string(), 1, "9997".to_string()),
+                ("c".to_string(), 0, "9998".to_string()),
+            ]
+        );
+        assert_eq!(inbox.len(), 0);
+        assert_eq!(inbox.bytes(), 0);
+    }
+
+    #[test]
+    fn provision_slot_distinct_key_flood_stays_at_cap_and_counts_drops() {
+        let (tx, inbox) = ProvisionTx::with_wake(|| {});
+        let total = MAX_PROVISION_KEYS * 4;
+        for i in 0..total {
+            assert!(tx.send(msg(&format!("g{i}"), 0, "x")));
+            assert!(inbox.len() <= MAX_PROVISION_KEYS);
+        }
+        assert_eq!(inbox.len(), MAX_PROVISION_KEYS);
+        assert_eq!(inbox.drops(), (total - MAX_PROVISION_KEYS) as u64);
+        assert!(inbox.bytes() <= MAX_PROVISION_BYTES);
+        // The oldest keys were evicted; the newest MAX_PROVISION_KEYS remain.
+        let taken = inbox.take_all();
+        assert_eq!(
+            taken.first().map(|m| m.0.as_str()),
+            Some(format!("g{}", total - MAX_PROVISION_KEYS).as_str())
+        );
+        assert_eq!(
+            taken.last().map(|m| m.0.as_str()),
+            Some(format!("g{}", total - 1).as_str())
+        );
+    }
+
+    #[test]
+    fn provision_slot_byte_cap_evicts_oldest_and_refuses_oversized() {
+        let (tx, inbox) = ProvisionTx::with_wake(|| {});
+        let big = "x".repeat(MAX_PROVISION_BYTES / 4);
+        for i in 0..8usize {
+            assert!(tx.send(msg(&format!("g{i}"), 0, &big)));
+            assert!(inbox.bytes() <= MAX_PROVISION_BYTES);
+        }
+        assert!(inbox.len() < 8);
+        assert!(inbox.drops() > 0);
+        let huge = "y".repeat(MAX_PROVISION_BYTES + 1);
+        let before = inbox.drops();
+        assert!(!tx.send(msg("huge", 0, &huge)));
+        assert_eq!(inbox.drops(), before + 1);
+        assert!(inbox.bytes() <= MAX_PROVISION_BYTES);
+    }
+
+    #[test]
+    fn provision_slot_clear_replaces_and_survives_the_cap() {
+        let (tx, inbox) = ProvisionTx::with_wake(|| {});
+        assert!(tx.send(msg("a", 0, "busy")));
+        assert!(tx.send(("a".to_string(), 0, Vec::new())));
+        let taken = inbox.take_all();
+        assert_eq!(taken.len(), 1);
+        assert!(
+            taken[0].2.is_empty(),
+            "the clear replaced the non-empty list"
+        );
+
+        // Fill to the cap with a clear first-seen, then flood new keys.
+        assert!(tx.send(("cleared".to_string(), 0, Vec::new())));
+        for i in 0..MAX_PROVISION_KEYS * 3 {
+            assert!(tx.send(msg(&format!("g{i}"), 0, "x")));
+        }
+        // A clear for a NEW key at the cap boundary lands too.
+        assert!(tx.send(("late".to_string(), 0, Vec::new())));
+        assert_eq!(inbox.len(), MAX_PROVISION_KEYS);
+        let taken = inbox.take_all();
+        assert!(
+            taken.iter().any(|(g, _, s)| g == "cleared" && s.is_empty()),
+            "a pending clear is never evicted by non-empty traffic"
+        );
+        assert!(taken.iter().any(|(g, _, s)| g == "late" && s.is_empty()));
+    }
+
+    #[test]
+    fn provision_slot_wakes_only_on_empty_to_non_empty_and_after_take() {
+        let wakes = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let (tx, inbox) = ProvisionTx::with_wake({
+            let wakes = std::sync::Arc::clone(&wakes);
+            move || {
+                wakes.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            }
+        });
+        for i in 0..1_000usize {
+            assert!(tx.send(msg(&format!("g{}", i % 5), 0, "x")));
+        }
+        assert_eq!(wakes.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert_eq!(inbox.take_all().len(), 5);
+        assert!(inbox.take_all().is_empty());
+
+        // A replacement arriving after the take is returned next time and re-wakes.
+        assert!(tx.send(msg("g0", 0, "late")));
+        assert_eq!(wakes.load(std::sync::atomic::Ordering::SeqCst), 2);
+        assert!(tx.send(msg("g0", 0, "later")));
+        assert_eq!(wakes.load(std::sync::atomic::Ordering::SeqCst), 2);
+        assert_eq!(
+            labels(&inbox.take_all()),
+            vec![("g0".to_string(), 0, "later".to_string())]
+        );
+    }
+
+    #[test]
+    fn drain_provision_keeps_latest_per_key_and_honors_retired() {
+        let session = Session {
+            id: "s1".into(),
+            worktrees: vec![
+                WorktreeGroup::new("app/home", GroupKind::Home, ""),
+                WorktreeGroup::new("app/other", GroupKind::Home, ""),
+            ],
+            active: 0,
+        };
+        let (tx, mut rx) = ProvisionTx::with_wake(|| {});
+        let mut tracker = crate::loading::track::LoadingTracker::default();
+        let mut remote = std::collections::HashMap::new();
+        let mut perf = crate::perf::LoopPerf::new();
+        let retired: std::collections::HashSet<(String, usize)> =
+            std::iter::once(("app/other".to_string(), 0)).collect();
+
+        assert!(tx.send(msg("app/other", 1, "o1")));
+        assert!(tx.send(msg("app/home", 0, "h1")));
+        assert!(tx.send(msg("app/other", 0, "retired")));
+        assert!(tx.send(msg("app/home", 0, "h2")));
+        assert!(tx.send(msg("app/home", 0, "h3")));
+        let dirty = drain_provision(
+            &mut rx,
+            &session,
+            &mut tracker,
+            &mut remote,
+            &retired,
+            &mut perf,
+        );
+        assert!(dirty, "active tab got an update");
+        let home = tracker.get(&("app/home".to_string(), 0)).unwrap();
+        assert_eq!(home.len(), 1);
+        assert_eq!(home[0].label, "h3");
+        assert_eq!(
+            tracker.get(&("app/other".to_string(), 1)).unwrap()[0].label,
+            "o1"
+        );
+        assert!(tracker.get(&("app/other".to_string(), 0)).is_none());
+
+        assert!(tx.send(msg("app/other", 1, "o2")));
+        let dirty = drain_provision(
+            &mut rx,
+            &session,
+            &mut tracker,
+            &mut remote,
+            &retired,
+            &mut perf,
+        );
+        assert!(!dirty, "only a non-active tab updated");
+        assert_eq!(
+            tracker.get(&("app/other".to_string(), 1)).unwrap()[0].label,
+            "o2"
+        );
+    }
 
     /// THE regression gate for the daemon-disabled claim, at the level where
     /// it can break: a real `SpecBatch` flows through the real `drain_specs`
