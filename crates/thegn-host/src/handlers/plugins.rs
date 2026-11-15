@@ -2466,6 +2466,7 @@ async fn dispatch_one(
 
 #[cfg(test)]
 mod tests {
+    use super::app_tests::{stop_test_session, test_session};
     use super::*;
     use thegn_core::control::Scope;
     use thegn_core::plugin_api::{
