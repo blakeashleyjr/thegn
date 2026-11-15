@@ -19,7 +19,7 @@ use std::collections::{HashMap, HashSet};
 
 use tokio::task;
 
-use crate::handlers::provision::{ProvisionProgress, SpecBatch, SpecError, spec_err};
+use crate::handlers::provision::{ProvisionTx, SpecBatch, SpecError, spec_err};
 use crate::loading::{SpecOrigin, provision_load_steps, seed_materialize_steps};
 
 type Key = (String, usize);
@@ -39,7 +39,7 @@ pub(crate) struct MaterializeCtx<'a> {
 #[derive(Clone)]
 pub(crate) struct MaterializeTx {
     pub spec_tx: tokio::sync::mpsc::UnboundedSender<SpecBatch>,
-    pub provision_tx: tokio::sync::mpsc::UnboundedSender<ProvisionProgress>,
+    pub provision_tx: ProvisionTx,
     pub waker: termwiz::terminal::TerminalWaker,
     pub host_ui: crate::host_flow::HostUiTx,
     /// The compositor's runtime handle, captured on the loop (which runs
