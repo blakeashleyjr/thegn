@@ -465,6 +465,7 @@ pub(crate) fn detail_has_content(row: &SidebarRow, disp: &SidebarDisplay) -> boo
 }
 
 /// Stable wrapper retained for sidebar callers and unit tests.
+#[cfg(test)]
 pub(crate) fn compose_detail_line(row: &SidebarRow, disp: &SidebarDisplay) -> Option<Line> {
     compose_detail_line_at(
         row,

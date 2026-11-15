@@ -712,6 +712,7 @@ pub(crate) fn terminal_host(conn: &str, kind: &str) -> (String, String, bool) {
 
 /// The worktree row's second line. Composition lives in the pure detail module;
 /// this wrapper preserves the sidebar module's existing call surface.
+#[cfg(test)]
 pub(crate) fn compose_detail_line(
     row: &SidebarRow,
     disp: &crate::sidebar_view::SidebarDisplay,
