@@ -20,14 +20,23 @@ use thegn_core::config::{SandboxBackend, SandboxConfig};
 use thegn_core::sandbox::Backend;
 use thegn_core::sandbox_events::{ContainerEventSink, ContainerEvents, EventKind, EventsCap};
 
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
+
 use termwiz::terminal::TerminalWaker;
 use tokio::sync::mpsc as tokio_mpsc;
 
-/// Pulse that wakes the event loop after a batch send.
-type Wake = Box<dyn Fn() + Send>;
+/// Pulse that wakes the event loop after a batch send. Shared with the
+/// short-lived trailing-flush thread, hence `Arc` + `Sync`.
+type Wake = Arc<dyn Fn() + Send + Sync>;
+
+/// Coalescing window: at most one send + loop wake per window, plus one
+/// trailing flush for anything deferred inside it.
+const PULSE_WINDOW: Duration = Duration::from_millis(250);
 
 fn waker_pulse(waker: TerminalWaker) -> Wake {
-    Box::new(move || {
+    Arc::new(move || {
         if let Err(error) = waker.wake() {
             tracing::debug!(%error, "sandbox events: waker pulse failed");
         }
@@ -106,7 +115,7 @@ fn subscribe_thread(
         // process lifetime, writing audit rows nobody waits on. Declared
         // FIRST — the thread-qos ratchet.
         crate::platform::qos::set_self(crate::platform::qos::Qos::Background);
-        let mut sink = BatchForwarder { tx, wake };
+        let mut sink = BatchForwarder::new(tx, wake);
         events.subscribe(kind, &mut sink);
     })
     // best-effort: listener thread: a failed spawn just disables sandbox
@@ -114,23 +123,143 @@ fn subscribe_thread(
     .ok();
 }
 
-/// Forwards the transports' persisted-rows pulses to the event loop channel.
+/// Outcome of offering a batch to the [`PulseCoalescer`].
+#[derive(Debug, PartialEq, Eq)]
+enum Decision {
+    /// Outside the window: send this accumulated count now and pulse.
+    Send(usize),
+    /// Inside the window: the count was accumulated; send nothing yet.
+    Defer,
+}
+
+/// Pure rate limiter for loop wakes. No clock reads: `now` is injected.
+#[derive(Debug, Default)]
+struct PulseCoalescer {
+    last_sent: Option<Instant>,
+    pending: usize,
+}
+
+impl PulseCoalescer {
+    fn on_batch(&mut self, now: Instant, count: usize) -> Decision {
+        self.pending = self.pending.saturating_add(count);
+        let in_window = self
+            .last_sent
+            .is_some_and(|t| now.saturating_duration_since(t) < PULSE_WINDOW);
+        if in_window {
+            Decision::Defer
+        } else {
+            Decision::Send(self.take(now))
+        }
+    }
+
+    /// Time until the trailing flush is due; `None` when nothing is pending.
+    fn due_flush(&self, now: Instant) -> Option<Duration> {
+        if self.pending == 0 {
+            return None;
+        }
+        let elapsed = self
+            .last_sent
+            .map_or(PULSE_WINDOW, |t| now.saturating_duration_since(t));
+        Some(PULSE_WINDOW.saturating_sub(elapsed))
+    }
+
+    /// Drain the accumulated count and mark a send at `now`.
+    fn take(&mut self, now: Instant) -> usize {
+        self.last_sent = Some(now);
+        std::mem::take(&mut self.pending)
+    }
+}
+
+/// State shared between the subscriber thread and the trailing-flush thread.
+struct Shared {
+    coalescer: Mutex<PulseCoalescer>,
+    flush_scheduled: AtomicBool,
+}
+
+/// Send one batch and pulse only when the send landed: the loop blocks on
+/// poll_input, so an unpulsed batch would wait for an unrelated wake.
+fn send_and_pulse(tx: &tokio_mpsc::UnboundedSender<SandboxEventBatch>, wake: &Wake, count: usize) {
+    if count > 0 && tx.send(SandboxEventBatch { count }).is_ok() {
+        wake();
+    }
+}
+
+/// Forwards the transports' persisted-rows pulses to the event loop channel,
+/// coalesced per [`PULSE_WINDOW`] with a trailing flush.
 struct BatchForwarder {
     tx: tokio_mpsc::UnboundedSender<SandboxEventBatch>,
     wake: Wake,
+    shared: Arc<Shared>,
+}
+
+impl BatchForwarder {
+    fn new(tx: tokio_mpsc::UnboundedSender<SandboxEventBatch>, wake: Wake) -> Self {
+        Self {
+            tx,
+            wake,
+            shared: Arc::new(Shared {
+                coalescer: Mutex::new(PulseCoalescer::default()),
+                flush_scheduled: AtomicBool::new(false),
+            }),
+        }
+    }
+
+    /// Drain pending and clear the flush flag under the coalescer lock, so a
+    /// deferral racing the flush either lands before the drain or schedules
+    /// a fresh flush after it.
+    fn drain_for_flush(shared: &Shared) -> usize {
+        let mut c = shared
+            .coalescer
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let n = c.take(Instant::now());
+        shared.flush_scheduled.store(false, Ordering::SeqCst);
+        n
+    }
+
+    /// Spawn the one short-lived trailing-flush thread. It exists only while
+    /// a deferred batch is pending (0% idle: no permanent timer).
+    fn schedule_flush(&self, delay: Duration) {
+        let tx = self.tx.clone();
+        let wake = self.wake.clone();
+        let shared = self.shared.clone();
+        let spawned = thegn_core::thread_name::try_spawn_named("thegn-sbx-flush", move || {
+            // Declared FIRST — the thread-qos ratchet.
+            crate::platform::qos::set_self(crate::platform::qos::Qos::Background);
+            std::thread::sleep(delay);
+            let n = Self::drain_for_flush(&shared);
+            send_and_pulse(&tx, &wake, n);
+        });
+        if spawned.is_err() {
+            // Never lose the pulse: send what is pending right now.
+            let n = Self::drain_for_flush(&self.shared);
+            send_and_pulse(&self.tx, &self.wake, n);
+        }
+    }
 }
 
 impl ContainerEventSink for BatchForwarder {
     fn on_batch(&mut self, count: usize) {
-        // best-effort: the consumer may be gone (shutdown) — a dropped update
-        // pulse must never take down the subscriber thread.
         if count == 0 {
             return;
         }
-        // Pulse only when the send landed: the loop blocks on poll_input, so
-        // an unpulsed batch would wait for an unrelated wake.
-        if self.tx.send(SandboxEventBatch { count }).is_ok() {
-            (self.wake)();
+        let (decision, due) = {
+            let mut c = self
+                .shared
+                .coalescer
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let now = Instant::now();
+            let d = c.on_batch(now, count);
+            (d, c.due_flush(now))
+        };
+        match decision {
+            Decision::Send(total) => send_and_pulse(&self.tx, &self.wake, total),
+            Decision::Defer => {
+                if !self.shared.flush_scheduled.swap(true, Ordering::SeqCst) {
+                    self.schedule_flush(due.unwrap_or(PULSE_WINDOW));
+                }
+            }
         }
     }
 }
@@ -158,6 +287,7 @@ fn select_backend(cfg: &SandboxConfig) -> Option<Backend> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::Ordering;
 
     fn cfg(backend: SandboxBackend, chain: &[&str]) -> SandboxConfig {
         SandboxConfig {
@@ -169,17 +299,16 @@ mod tests {
 
     #[test]
     fn batch_sends_and_pulses_once_empty_batch_does_neither() {
-        use std::sync::Arc;
-        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::atomic::AtomicUsize;
         let (tx, mut rx) = tokio_mpsc::unbounded_channel();
         let pulses = Arc::new(AtomicUsize::new(0));
         let p = pulses.clone();
-        let mut sink = BatchForwarder {
+        let mut sink = BatchForwarder::new(
             tx,
-            wake: Box::new(move || {
+            Arc::new(move || {
                 p.fetch_add(1, Ordering::SeqCst);
             }),
-        };
+        );
         sink.on_batch(0);
         assert_eq!(pulses.load(Ordering::SeqCst), 0);
         assert!(rx.try_recv().is_err());
@@ -193,6 +322,81 @@ mod tests {
             1,
             "no pulse when send failed"
         );
+    }
+
+    #[test]
+    fn coalescer_first_sends_second_defers_after_window_sends_sum() {
+        let t0 = Instant::now();
+        let mut c = PulseCoalescer::default();
+        assert_eq!(c.due_flush(t0), None);
+        assert_eq!(c.on_batch(t0, 2), Decision::Send(2));
+        assert_eq!(
+            c.on_batch(t0 + Duration::from_millis(50), 3),
+            Decision::Defer
+        );
+        assert_eq!(
+            c.on_batch(t0 + Duration::from_millis(100), 4),
+            Decision::Defer
+        );
+        assert_eq!(
+            c.due_flush(t0 + Duration::from_millis(100)),
+            Some(Duration::from_millis(150))
+        );
+        assert_eq!(
+            c.on_batch(t0 + PULSE_WINDOW + Duration::from_millis(1), 1),
+            Decision::Send(8)
+        );
+        assert_eq!(c.due_flush(t0 + PULSE_WINDOW * 2), None);
+    }
+
+    #[test]
+    fn coalescer_due_flush_saturates_past_the_window() {
+        let t0 = Instant::now();
+        let mut c = PulseCoalescer::default();
+        c.on_batch(t0, 1);
+        c.on_batch(t0 + Duration::from_millis(10), 1);
+        assert_eq!(c.due_flush(t0 + PULSE_WINDOW * 4), Some(Duration::ZERO));
+    }
+
+    #[test]
+    fn coalescer_count_saturates() {
+        let t0 = Instant::now();
+        let mut c = PulseCoalescer::default();
+        c.on_batch(t0, 1);
+        c.on_batch(t0, usize::MAX);
+        c.on_batch(t0, usize::MAX);
+        let total: usize = c.take(t0);
+        assert_eq!(total, usize::MAX);
+    }
+
+    #[test]
+    fn deferred_batch_is_flushed_by_trailing_thread() {
+        use std::sync::atomic::AtomicUsize;
+        let (tx, mut rx) = tokio_mpsc::unbounded_channel();
+        let pulses = Arc::new(AtomicUsize::new(0));
+        let p = pulses.clone();
+        let mut sink = BatchForwarder::new(
+            tx,
+            Arc::new(move || {
+                p.fetch_add(1, Ordering::SeqCst);
+            }),
+        );
+        sink.on_batch(1);
+        assert_eq!(rx.try_recv().unwrap().count, 1);
+        sink.on_batch(2);
+        sink.on_batch(3);
+        assert!(rx.try_recv().is_err(), "deferred inside the window");
+        let deadline = Instant::now() + Duration::from_secs(3);
+        let mut got = None;
+        while Instant::now() < deadline {
+            if let Ok(b) = rx.try_recv() {
+                got = Some(b.count);
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(got, Some(5));
+        assert_eq!(pulses.load(Ordering::SeqCst), 2);
     }
 
     #[test]
