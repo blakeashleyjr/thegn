@@ -887,7 +887,7 @@ struct SchedEntry {
     overloaded: u64,
 }
 
-const MIN_PLUGIN_INTERVAL_MS: u64 = 1_000;
+const MIN_PLUGIN_INTERVAL_MS: u64 = thegn_svc::plugin::loader::PLUGIN_INTERVAL_FLOOR_MILLIS;
 
 fn clamp_plugin_interval_millis(millis: u64) -> u64 {
     millis.max(MIN_PLUGIN_INTERVAL_MS)
