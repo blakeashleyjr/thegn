@@ -22,6 +22,7 @@ fn sink_with(scrub: SecretScrub) -> AdmittingSink {
         granted: Vec::new(),
         scrub,
         junk: Vec::new(),
+        junk_lines: 0,
         error: None,
         saw_events: false,
         saw_manifest: false,
@@ -531,4 +532,20 @@ fn transp_command_plugin_value_is_kept_as_sent() {
         sink.admitted.events[1].busy,
         thegn_core::calendar::Busy::Busy
     );
+}
+
+#[test]
+fn plugin_page_counts_junk_lines_without_plugin_text() {
+    let mut sink = sink();
+    for _ in 0..5 {
+        assert!(sink.line("malformed row PLUGIN-SECRET-TEXT"));
+    }
+    assert_eq!(sink.junk_lines, 5);
+    let diagnostics = plugin_diagnostics(sink.junk_lines);
+    assert_eq!(diagnostics.other, 5);
+    assert_eq!(diagnostics.quarantined_events, 0);
+    let page = EventPage::default().with_diagnostics(diagnostics);
+    let shown = format!("{:?} {:?}", page.diagnostics(), diagnostics);
+    assert!(!shown.contains("PLUGIN-SECRET-TEXT"), "{shown}");
+    assert_eq!(plugin_diagnostics(0), PageDiagnostics::default());
 }
