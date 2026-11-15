@@ -14,7 +14,7 @@ experimental = ["setup-scripts"]
 command = [
   "sh",
   "-c",
-  "{ find \"${TMPDIR:-/tmp}\" -maxdepth 1 -name 'thegn-nextest-state.*' -mmin +1440 -exec rm -rf {} + 2>/dev/null || true; }; d=$(mktemp -d \"${TMPDIR:-/tmp}/thegn-nextest-state.XXXXXX\") && printf 'XDG_STATE_HOME=%s\\n' \"$d\" >> \"$NEXTEST_ENV\"",
+  "{ find \"${TMPDIR:-/tmp}\" -maxdepth 1 -name 'thegn-nextest-state.*' -mmin +1440 -exec rm -rf {} + 2>/dev/null || true; }; d=$(mktemp -d \"${TMPDIR:-/tmp}/thegn-nextest-state.XXXXXX\") && printf 'XDG_STATE_HOME=%s\\nTHEGN_SANDBOX_BACKEND=none\\n' \"$d\" >> \"$NEXTEST_ENV\"",
 ]
 
 [[profile.default.scripts]]
