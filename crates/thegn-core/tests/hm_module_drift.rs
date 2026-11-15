@@ -40,10 +40,6 @@ const OMITTED: &[(&str, &str)] = &[
     ("forges", "forge connections are not exposed"),
     ("editor", "editor integration is not exposed"),
     (
-        "stats.alerts",
-        "threshold alerts are a nested table and are not exposed",
-    ),
-    (
         "stats.net_icons",
         "per-medium network glyph table is not exposed",
     ),
@@ -83,14 +79,6 @@ const OMITTED: &[(&str, &str)] = &[
         "per-kind priority map is not exposed",
     ),
     ("notifications.rules", "routing rules are not exposed"),
-    (
-        "notifications.sound.pack",
-        "sound pack path is not exposed yet",
-    ),
-    (
-        "notifications.sound.chime_file",
-        "sound chime path is not exposed yet",
-    ),
     (
         "notifications.sound.command",
         "sound command is executable-bearing and is not exposed yet",
@@ -143,7 +131,6 @@ const OMITTED: &[(&str, &str)] = &[
         "usage.accounts",
         "usage account credentials and paths are not exposed",
     ),
-    ("usage.alerts", "usage alert policy is not exposed"),
     ("model_proxy", "model proxy is not exposed"),
     ("remote", "remote connection tuning is not exposed"),
     (
@@ -1103,7 +1090,6 @@ fn hm_git_and_stats_families_are_rendered() {
         "git.backend",
         "git.structural_diff",
         "git.submodules",
-        "stats.alerts",
         "stats.net_icons",
     ] {
         assert!(schema_has_path(path), "omission must stay pinned: {path}");
@@ -1115,6 +1101,7 @@ fn hm_git_and_stats_families_are_rendered() {
         "stats.battery_warn",
         "stats.disk_free_warn",
         "stats.disk_free_critical",
+        "stats.alerts",
     ] {
         assert!(rendered.contains(path), "Home Manager must render {path}");
     }
@@ -1154,8 +1141,6 @@ fn hm_notifications_and_activity_families_are_rendered() {
         "notifications.agent_error_signatures",
         "notifications.priority",
         "notifications.rules",
-        "notifications.sound.pack",
-        "notifications.sound.chime_file",
         "notifications.sound.command",
         "notifications.sound.per_priority",
         "notifications.modes",
@@ -1178,6 +1163,8 @@ fn hm_notifications_dnd_and_sound_bools_are_rendered_and_rest_dispositioned() {
         "notifications.dnd.windows",
         "notifications.sound.min_priority",
         "notifications.sound.per_kind",
+        "notifications.sound.pack",
+        "notifications.sound.chime_file",
     ] {
         assert!(rendered.contains(path), "Home Manager must render {path}");
     }
@@ -2199,4 +2186,70 @@ fn every_nix_enum_matches_its_destination_enum() {
                 .collect::<Vec<_>>()
         );
     }
+}
+
+/// Alert tables are rendered as one submodule attrset per table. Their leaf
+/// names are the TOML keys, so pin the whole set against the Rust schema, and
+/// pin that executable-bearing sound keys stay unexposed.
+#[test]
+fn hm_alert_submodules_cover_every_schema_leaf_and_default_to_null() {
+    let src = module_src();
+    let rendered = rendered_paths(&src);
+    for path in ["stats.alerts", "usage.alerts"] {
+        assert!(rendered.contains(path), "Home Manager must render {path}");
+    }
+    for (submodule, table) in [
+        ("statsAlertsSubmodule", "stats.alerts"),
+        ("usageAlertsSubmodule", "usage.alerts"),
+    ] {
+        let start = src
+            .find(&format!("  {submodule} ="))
+            .unwrap_or_else(|| panic!("{submodule} declaration"));
+        let end = start
+            + src[start..]
+                .find("\n  };\n")
+                .unwrap_or_else(|| panic!("{submodule} end"));
+        let block = &src[start..end];
+        let schema = schema_field(table);
+        let properties = schema["properties"]
+            .as_object()
+            .unwrap_or_else(|| panic!("{table} schema properties"));
+        for key in properties.keys() {
+            assert!(
+                block.contains(&format!("      {key} = lib.mkOption {{")),
+                "{submodule} must expose {table}.{key}"
+            );
+        }
+        let declared = block.matches("= lib.mkOption {").count();
+        assert_eq!(declared, properties.len(), "{submodule} option count");
+        assert_eq!(
+            block.matches("default = null;").count(),
+            declared,
+            "every {submodule} leaf must default to null"
+        );
+    }
+    let rule = schema_field("stats.alerts.cpu");
+    let rule_keys: BTreeSet<&str> = rule["properties"]
+        .as_object()
+        .expect("AlertRule properties")
+        .keys()
+        .map(String::as_str)
+        .collect();
+    assert_eq!(rule_keys, BTreeSet::from(["warn", "critical"]));
+    let rule_start = src
+        .find("  alertRuleSubmodule =")
+        .expect("alertRuleSubmodule declaration");
+    let rule_block = &src[rule_start..rule_start + 600];
+    assert!(rule_block.contains("      warn = lib.mkOption {"));
+    assert!(rule_block.contains("      critical = lib.mkOption {"));
+
+    let omissions: BTreeSet<&str> = OMITTED.iter().map(|(path, _)| *path).collect();
+    for path in [
+        "notifications.sound.command",
+        "notifications.sound.per_priority",
+    ] {
+        assert!(omissions.contains(path), "{path} must stay omitted");
+        assert!(!rendered.contains(path), "{path} must not be rendered");
+    }
+    assert!(src.contains("alertSecs = lib.types.nullOr lib.types.ints.u32;"));
 }
