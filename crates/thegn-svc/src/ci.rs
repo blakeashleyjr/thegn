@@ -5890,6 +5890,216 @@ esac
                 .contains("fixture-token-a")
         );
     }
+
+    fn command_text(cmd: &Command) -> String {
+        let mut text = cmd.get_program().to_string_lossy().into_owned();
+        for arg in cmd.get_args() {
+            text.push(' ');
+            text.push_str(&arg.to_string_lossy());
+        }
+        for (key, value) in cmd.get_envs() {
+            text.push(' ');
+            text.push_str(&key.to_string_lossy());
+            text.push('=');
+            if let Some(value) = value {
+                text.push_str(&value.to_string_lossy());
+            }
+        }
+        text.push(' ');
+        text.push_str(&format!("{cmd:?}"));
+        text
+    }
+
+    #[test]
+    fn ci_credential_transport_command_matrix_is_secret_free_off_host() {
+        const SECRET: &str = "the541-matrix-secret";
+        const AMBIENT: &str = "the541-ambient-process-token";
+
+        let _env = thegn_core::testenv::EnvGuard::mutate_pairs(&[("GITLAB_TOKEN", Some(AMBIENT))]);
+        let gitlab_remote = parse_gitlab_remote("https://gitlab.example.test/g/r")
+            .expect("valid GitLab fixture remote");
+        let github_remote = parse_github_remote("https://github.example.test/o/r")
+            .expect("valid GitHub fixture remote");
+        let locations = [
+            (
+                "Local",
+                GitLoc::Local(std::path::PathBuf::from("/workspace")),
+            ),
+            (
+                "Remote",
+                GitLoc::Remote {
+                    ssh: thegn_core::remote::SshTarget::plain(
+                        "build.example.test".into(),
+                        22,
+                        false,
+                    ),
+                    path: "/workspace".into(),
+                },
+            ),
+            (
+                "Provider",
+                GitLoc::Provider {
+                    control_prefix: vec![
+                        "sprite".into(),
+                        "exec".into(),
+                        "-s".into(),
+                        "fixture".into(),
+                        "--".into(),
+                    ],
+                    path: "/workspace".into(),
+                },
+            ),
+        ];
+        let credentials = [
+            ("CliManaged", GitlabCredential::CliManaged, false),
+            (
+                "default-resolved",
+                GitlabCredential::Configured {
+                    token: SECRET.into(),
+                    explicit: false,
+                },
+                true,
+            ),
+            (
+                "explicit-configured",
+                GitlabCredential::Configured {
+                    token: SECRET.into(),
+                    explicit: true,
+                },
+                true,
+            ),
+        ];
+
+        for (location_name, loc) in locations {
+            for (mode_name, credential, token_in_local) in credentials.iter().cloned() {
+                let gitlab = GitlabCi {
+                    credential,
+                    host: None,
+                    ..GitlabCi::default()
+                };
+                let gitlab_result =
+                    gitlab.command(&loc, &gitlab_remote, &["api", "projects/g%2Fr/pipelines"]);
+                match gitlab_result {
+                    Ok(command) => {
+                        let text = command_text(&command);
+                        let args = command
+                            .get_args()
+                            .map(|arg| arg.to_string_lossy().into_owned())
+                            .collect::<Vec<_>>()
+                            .join(" ");
+                        let debug = format!("{command:?}");
+                        let env = command
+                            .get_envs()
+                            .map(|(key, value)| {
+                                (
+                                    key.to_string_lossy().into_owned(),
+                                    value.map(|value| value.to_string_lossy().into_owned()),
+                                )
+                            })
+                            .collect::<Vec<_>>();
+                        let token = env
+                            .iter()
+                            .find(|(key, _)| key == "GITLAB_TOKEN")
+                            .and_then(|(_, value)| value.as_deref());
+                        let has_token_key = env.iter().any(|(key, _)| key == "GITLAB_TOKEN");
+                        let host = env
+                            .iter()
+                            .find(|(key, _)| key == "GITLAB_HOST")
+                            .and_then(|(_, value)| value.as_deref());
+
+                        assert!(
+                            !args.contains(SECRET),
+                            "{location_name}/{mode_name}: {args}"
+                        );
+                        if loc.is_remote() || !token_in_local {
+                            assert!(
+                                !debug.contains(SECRET),
+                                "{location_name}/{mode_name}: {debug}"
+                            );
+                        }
+                        assert_eq!(host, Some(gitlab_remote.host.as_str()));
+                        if loc.is_remote() {
+                            assert!(
+                                text.contains(&format!("--hostname={}", gitlab_remote.host)),
+                                "{location_name}/{mode_name}: {text}"
+                            );
+                            assert!(
+                                !text.contains(SECRET),
+                                "{location_name}/{mode_name}: {text}"
+                            );
+                            assert!(
+                                !text.contains(AMBIENT),
+                                "{location_name}/{mode_name}: {text}"
+                            );
+                            assert!(!has_token_key);
+                        } else if token_in_local {
+                            assert_eq!(token, Some(SECRET));
+                        } else {
+                            assert!(!has_token_key);
+                            assert!(!text.contains(SECRET));
+                        }
+                    }
+                    Err(error) => {
+                        assert!(loc.is_remote());
+                        assert_eq!(mode_name, "explicit-configured");
+                        let message = error.to_string();
+                        assert!(message.contains("cannot be forwarded"));
+                        assert!(!message.contains(SECRET));
+                    }
+                }
+
+                let github = GithubCi {
+                    remote: Some(github_remote.clone()),
+                    cancel: Arc::new(AtomicBool::new(false)),
+                };
+                let command = github
+                    .command(&loc, &["run", "list"])
+                    .unwrap_or_else(|error| panic!("{location_name}/{mode_name}: {error}"));
+                let text = command_text(&command);
+                let env = command
+                    .get_envs()
+                    .map(|(key, value)| {
+                        (
+                            key.to_string_lossy().into_owned(),
+                            value.map(|value| value.to_string_lossy().into_owned()),
+                        )
+                    })
+                    .collect::<Vec<_>>();
+                let gh_host = env
+                    .iter()
+                    .find(|(key, _)| key == "GH_HOST")
+                    .and_then(|(_, value)| value.as_deref());
+                let gh_repo = env
+                    .iter()
+                    .find(|(key, _)| key == "GH_REPO")
+                    .and_then(|(_, value)| value.as_deref());
+                let expected_gh_repo =
+                    format!("{}/{}", github_remote.host, github_remote.repository);
+                assert_eq!(gh_host, Some(github_remote.host.as_str()));
+                assert_eq!(gh_repo, Some(expected_gh_repo.as_str()));
+                assert!(
+                    !env.iter()
+                        .any(|(key, _)| { key == "GH_TOKEN" || key == "GITHUB_TOKEN" })
+                );
+                assert!(
+                    !text.contains(SECRET),
+                    "{location_name}/{mode_name}: {text}"
+                );
+                assert!(
+                    !text.contains(AMBIENT),
+                    "{location_name}/{mode_name}: {text}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn ci_authority_userinfo_never_becomes_a_pinned_host() {
+        let misleading = "https://gitlab.example.test@evil.test/g/r";
+        assert!(parse_gitlab_remote(misleading).is_none());
+        assert!(parse_github_remote(misleading).is_none());
+        assert_eq!(system_from_remote_host(misleading), None);
+    }
 }
 
 #[cfg(test)]
