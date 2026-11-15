@@ -29,6 +29,10 @@ impl CleanupHold {
     pub const fn marker(self) -> &'static str {
         "thegn-cleanup-hold:v1:branch-retained"
     }
+    /// Stable machine id for JSON surfaces.
+    pub const fn id(self) -> &'static str {
+        "branch_retained"
+    }
     pub fn from_detail(detail: Option<&str>) -> Option<Self> {
         (detail == Some(Self::BranchRetained.marker())).then_some(Self::BranchRetained)
     }
@@ -38,7 +42,7 @@ pub const CLEANUP_RETRY_BASE_SECS: u64 = 300;
 pub const CLEANUP_RETRY_MAX_SECS: u64 = 86_400;
 
 /// Retry timing for a refused landed-worktree cleanup, stored in `error_detail`.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 pub struct CleanupRetry {
     pub attempts: u32,
     pub next_at: i64,
