@@ -147,8 +147,9 @@ dropped.
 It requires `surface:rowfield`; its `caps.field` name uses
 `[a-z0-9_-]{1,32}`, and each `update` replaces the field's row values.
 
-Those three rendering/event points plus `IssueProvider` are the extension
-points the general compositor host accepts. `PanelSection`, `SidebarTab`,
+The general compositor host accepts `WorktreeField`, `AppTab`,
+`StatusBarSegment`, `NotificationSource`, `PaletteAction`, and `IssueProvider`
+extension points. `PanelSection`, `SidebarTab`,
 `Theme`, `Automation`, `HarnessAdapter`, `ProgramAdapter`, `CiProvider`,
 `ForgeProvider`, and `DebugAdapter` are wire vocabulary only there:
 `thegn plugin check` rejects them until their host runtime lands. `DataSource`

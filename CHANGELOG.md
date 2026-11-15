@@ -10,15 +10,30 @@ All notable changes to **thegn** are documented here. The format follows
 ### Added
 
 - Sidebar worktree rows now show commits ahead of the default branch (`5c`, capped at `999+`) and a detail line with the branch, commit count, changed files, diff stat, PR, last commit subject, and age. Configure badges, visibility, and field order with the new `[ui]` keys `sidebar_detail_when`, `sidebar_show_commits`, `sidebar_show_behind_base`, `sidebar_commit_badge`, `sidebar_behind_badge`, and `sidebar_detail_fields`.
+- Sidebar detail fields can now be ordered or removed with `sidebar_detail_fields`; the former fixed tail (`env`, `sandbox`, `devcontainer`, `hibernated`, `mq`, `unread`, `disk`) remains the default, while upstream, stage, activity, and last-commit author are opt-in.
+- Plugins can add sidebar detail fields and row badges through the `WorktreeField` extension point. API 0.5.0 plugins list them as `plugin:<plugin>/<field>`; API 0.3 and 0.4 manifests still work, plugin text is sanitized and width-capped, and plugin fields are dropped first when a row is narrow. See `docs/extending/row-field.md`.
 
 ### Changed
 
 - Sidebar details now show on every row by default, including when the sidebar is unfocused. Set `sidebar_focus_detail = "cursor"` and `sidebar_detail_when = "focused"` to restore the previous behavior.
+- `thegn doctor` now labels CI credential rows `configured (not probed)` when it has not checked the connection.
+- Internal tests now cover writer backpressure, hidden log panel feedback, tracker paging limits, Git parser truncation, exotic file names, repository discovery budgets, cleanup failure injection, process resource growth, and the Podman pause-process leak investigation; `docs/host-event-ingress.md` records the host event-ingress contract table.
+
+### Security
+
+- Errors from `gh` and `glab`, including JSON decoding errors, no longer expose configured tokens or token-shaped strings.
 
 ### Fixed
 
 - Plugin runs that exit cleanly are no longer reported as killed; on Linux, a run is marked killed only when a leftover process in its group had to be stopped.
 - Core Git helpers now have a 60-second deadline and bounded output, so a hung or runaway Git command cannot stall the caller.
+- The gix Git backend now reports both sides of a staged rename instead of dropping the deleted side.
+- If one pane of a tab fails to start, panes already started for it are closed; reattached sessions are detached and keep running.
+- Git parsers now reject truncated `merge-tree` conflict output and signed timestamps instead of returning partial results.
+- Worktree creation, rename, the creation wizard, and agent dispatch now refuse when the branch list cannot be read, avoiding duplicate names.
+- The Git runner now applies its deadline and output cap to commands fed on stdin.
+- The screen now updates promptly after container events instead of waiting for another wake-up.
+- Calendar diagnostics now share one budget across all pages of a fetch, count truncated output, and report junk output lines from calendar plugins.
 
 ## [0.1.0-alpha.82] — 2026-11-14
 
