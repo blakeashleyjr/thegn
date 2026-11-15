@@ -6,7 +6,7 @@ a POSIX shell script with `printf` is enough.
 
 1. **Manifest**: declared, not printed — a `[[plugins]]` entry or a
    `<config_dir>/plugins/<name>/plugin.toml` with `id`, `name`, `version`,
-   `api` (the contract version, currently `"0.4.0"`), `capabilities`
+   `api` (the contract version, currently `"0.5.0"`), `capabilities`
    (`surface:statusbar`, …), `contributions` (extension point + label +
    surface + cadence), `command = ["…"]`, and optional `scopes`, `mode`
    (`one_shot`/`resident`), `timeout_secs` (clamped to 1–3600 seconds with a
@@ -44,7 +44,7 @@ a POSIX shell script with `printf` is enough.
    `label` becomes the account name in the panel. See the complete
    [tracker-provider recipe](tracker-provider.md).
 
-## Current host support (API 0.4)
+## Current host support (API 0.5)
 
 The checked-in JSON schema carries this same table as
 `x-thegn-extension-support`; `thegn plugin check` applies it without launching
@@ -52,6 +52,7 @@ the plugin.
 
 | Extension point      | State            | Required capability    | Modes              | Cadence             | Owner                     |
 | -------------------- | ---------------- | ---------------------- | ------------------ | ------------------- | ------------------------- |
+| `WorktreeField`      | wired            | `surface:rowfield`     | resident           | on-demand           | sidebar row fields        |
 | `AppTab`             | wired            | `surface:app`          | resident           | on-demand           | plugin app runtime        |
 | `StatusBarSegment`   | wired            | `surface:statusbar`    | one-shot, resident | on-demand, interval | general compositor        |
 | `PanelSection`       | reserved         | `surface:panel`        | —                  | —                   | THE-108                   |
@@ -70,6 +71,13 @@ the plugin.
 
 AppTab requires API 0.4.0 and a `surface`. An app-tab plugin is resident
 third-party code; granting `background:sync` requires `trusted_native = true`.
+
+WorktreeField requires API 0.5.0, a `surface`, and a `caps` object with a
+`field` name matching `[a-z0-9_-]{1,32}`; `slot` defaults to `detail` and may
+also be `badge`. Resident plugins update the field with `update` params of the
+form `{"surface":"…","rows":[{"worktree":"…","text":"…","role":"Good"}]}`.
+Each update replaces the complete field value set; an empty `rows` list clears
+it. The host sanitises text to one line and at most 48 display columns.
 
 The host verb matrix is also embedded as `x-thegn-host-verb-support`, and the
 exact currently dispatchable catalog ids are in
