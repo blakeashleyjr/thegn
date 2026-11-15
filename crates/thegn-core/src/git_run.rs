@@ -109,6 +109,10 @@ impl fmt::Display for GitTextError {
     }
 }
 
+impl std::error::Error for GitOutcome {}
+
+impl std::error::Error for GitTextError {}
+
 /// Execute an already-built command with bounded capture and process supervision.
 pub fn run_command(cmd: &mut Command, policy: &GitPolicy, cancel: &AtomicBool) -> GitOutcome {
     let limits = Limits {
