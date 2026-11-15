@@ -27,7 +27,8 @@ fn container_running(name: &str) -> bool {
 }
 
 fn skip() -> bool {
-    !thegn_core::util::have("podman")
+    bounded_run::sandbox_backend_forced_none()
+        || !thegn_core::util::have("podman")
         || std::env::var("CI").is_ok()
         || std::env::var("SKIP_PODMAN_E2E").is_ok()
         || std::env::var("PODMAN_E2E_FORCE").is_err()
