@@ -40,6 +40,7 @@ const DISPATCH_DEADLINE: std::time::Duration = std::time::Duration::from_secs(30
 const MAX_ROW_UPDATES_PER_MESSAGE: usize = 256;
 const MAX_ROW_FIELDS_PER_PLUGIN: usize = 8;
 const MAX_ROW_WORKTREES_PER_FIELD: usize = 256;
+const MAX_ROW_WORKTREE_KEY_BYTES: usize = 4096;
 const MAX_ROW_TEXT_BYTES: usize = 256;
 const MAX_ROW_TEXT_CELLS: usize = 48;
 
@@ -857,6 +858,7 @@ fn drain_with_responder(
                     if let Some(dispatcher) = &state.dispatcher {
                         dispatcher.discard_outcomes_for_plugin(&id);
                     }
+                    state.row_fields.retain(|(owner, _), _| owner != &id);
                     state.plugins.insert(id.clone(), entry);
                     if !removed_apps.is_empty() {
                         model.status = format!("Plugin {id}: unsupported app tabs were removed");
@@ -1116,7 +1118,9 @@ fn handle_exit(
     let Some(entry) = state.plugins.get_mut(plugin) else {
         return PluginDamage::None;
     };
+    let rows_before = state.row_fields.len();
     state.row_fields.retain(|(owner, _), _| owner != plugin);
+    let rows_cleared = state.row_fields.len() != rows_before;
     entry.writer = None;
     entry
         .focus_tickets
@@ -1145,7 +1149,11 @@ fn handle_exit(
     sync_provider_registry(state);
     let entry = state.plugins.get_mut(plugin).expect("looked up above");
     if entry.disabled {
-        return PluginDamage::None;
+        return if rows_cleared {
+            PluginDamage::SidebarContent
+        } else {
+            PluginDamage::None
+        };
     }
     match crate::plugins::restart_delay(entry.restarts) {
         Some(delay) => {
@@ -1211,17 +1219,6 @@ fn param_str(params: &serde_json::Value, key: &str) -> Option<String> {
     params.get(key)?.as_str().map(str::to_string)
 }
 
-fn is_bidi_control(c: char) -> bool {
-    matches!(
-        c,
-        '\u{061c}'
-            | '\u{200e}'
-            | '\u{200f}'
-            | '\u{202a}'..='\u{202e}'
-            | '\u{2066}'..='\u{2069}'
-    )
-}
-
 /// Bound hostile plugin text before measuring it for the terminal. Controls
 /// and bidi direction markers are removed, then the result is clipped by
 /// display cells so wide characters cannot evade the visual cap.
@@ -1232,7 +1229,7 @@ fn sanitize_row_text(input: &str) -> String {
     }
     let filtered: String = input[..end]
         .chars()
-        .filter(|c| !c.is_control() && !is_bidi_control(*c))
+        .filter(|c| !c.is_control() && !thegn_core::pipeline_report::is_format_control(*c))
         .collect();
     thegn_core::pipeline_report::display_clip(&filtered, MAX_ROW_TEXT_CELLS)
 }
@@ -1252,18 +1249,24 @@ fn apply_row_update(
         .ok_or_else(|| RpcError::new(RpcErrorCode::Invalid, "missing row-field surface"))?;
     let rows = params
         .get("rows")
-        .cloned()
-        .ok_or_else(|| RpcError::new(RpcErrorCode::Invalid, "missing rows"))?;
-    let updates: Vec<RowUpdate> = serde_json::from_value(rows)
-        .map_err(|error| RpcError::new(RpcErrorCode::Invalid, format!("bad rows: {error}")))?;
-    if updates.len() > MAX_ROW_UPDATES_PER_MESSAGE {
+        .and_then(serde_json::Value::as_array)
+        .ok_or_else(|| RpcError::new(RpcErrorCode::Invalid, "rows must be an array"))?;
+    if rows.len() > MAX_ROW_UPDATES_PER_MESSAGE {
         return Err(RpcError::new(
             RpcErrorCode::RateLimited,
             format!("row update exceeds {MAX_ROW_UPDATES_PER_MESSAGE} rows"),
         ));
     }
+    let updates: Vec<RowUpdate> = serde_json::from_value(serde_json::Value::Array(rows.clone()))
+        .map_err(|error| RpcError::new(RpcErrorCode::Invalid, format!("bad rows: {error}")))?;
     let mut values = BTreeMap::new();
     for update in updates {
+        if update.worktree.is_empty() || update.worktree.len() > MAX_ROW_WORKTREE_KEY_BYTES {
+            return Err(RpcError::new(
+                RpcErrorCode::Invalid,
+                format!("row worktree key must be 1..={MAX_ROW_WORKTREE_KEY_BYTES} bytes"),
+            ));
+        }
         if values
             .insert(
                 update.worktree.clone(),
@@ -3930,6 +3933,9 @@ mod tests {
             ("a\x1b[31mb", "a[31mb"),
             ("a\r\nb", "ab"),
             ("a\u{202e}b", "ab"),
+            ("a\u{2028}b", "ab"),
+            ("a\u{2066}b", "ab"),
+            ("a\u{200b}b", "ab"),
             ("a\0b", "ab"),
             ("", ""),
         ] {
@@ -4054,13 +4060,35 @@ mod tests {
             })
             .collect();
         assert_eq!(
-            drain_one(&mut state, &mut model, one("p", "p/row", too_many)),
+            drain_one(
+                &mut state,
+                &mut model,
+                one("p", "p/row", serde_json::Value::Array(too_many)),
+            ),
             PluginDamage::None
         );
         assert_eq!(
             row_field_values(&state)[&(String::from("p"), String::from("ci"))]["main"].text,
             "old"
         );
+        for worktree in [String::new(), "x".repeat(MAX_ROW_WORKTREE_KEY_BYTES + 1)] {
+            assert_eq!(
+                drain_one(
+                    &mut state,
+                    &mut model,
+                    one(
+                        "p",
+                        "p/row",
+                        serde_json::json!([{
+                            "worktree": worktree,
+                            "text": "new",
+                            "role": "Accent"
+                        }]),
+                    ),
+                ),
+                PluginDamage::None
+            );
+        }
         assert_eq!(
             drain_one(
                 &mut state,
@@ -4079,10 +4107,46 @@ mod tests {
             PluginDamage::None
         );
 
+        state.plugins.get_mut("p").unwrap().disabled = true;
+        assert_eq!(
+            drain_one(
+                &mut state,
+                &mut model,
+                event("p", 1, SessionEvent::Exit { code: Some(1) }),
+            ),
+            PluginDamage::SidebarContent
+        );
+        assert!(row_field_values(&state).is_empty());
+    }
+
+    #[test]
+    fn reloading_plugin_clears_stale_row_fields() {
+        let mut state = state_with(vec![row_spec("p", "ci")]);
+        let mut model = FrameModel::default();
         drain_one(
             &mut state,
             &mut model,
-            event("p", 1, SessionEvent::Exit { code: Some(1) }),
+            event(
+                "p",
+                1,
+                SessionEvent::Message(msg(
+                    "update",
+                    serde_json::json!({
+                        "surface": "p/row",
+                        "rows": [{"worktree": "main", "text": "old", "role": "Good"}]
+                    }),
+                )),
+            ),
+        );
+        assert!(!row_field_values(&state).is_empty());
+
+        assert_eq!(
+            drain_one(
+                &mut state,
+                &mut model,
+                PluginMsg::Loaded(vec![loaded_state(row_spec("p", "ci"))]),
+            ),
+            PluginDamage::Structural
         );
         assert!(row_field_values(&state).is_empty());
     }

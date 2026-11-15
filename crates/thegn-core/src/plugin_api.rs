@@ -4343,6 +4343,41 @@ timeout_secs = 5
     }
 
     #[test]
+    fn authorize_row_field_update_audits_rowfield_capability_and_checks_surface_quota() {
+        let plugin = PluginId::new("row-update-test");
+        let mut spec = support_spec(
+            ExtensionPoint::WorktreeField,
+            vec![Capability::new("surface", "rowfield")],
+            PluginMode::Resident,
+        );
+        spec.manifest.contributions[0].caps = serde_json::json!({"field": "ci"});
+        let negotiated = current_host_contract().negotiate_spec(&spec).unwrap();
+        let surface = spec.manifest.contributions[0].surface.clone().unwrap();
+        let mut runtime = PluginRuntime::new(negotiated);
+        assert!(
+            runtime
+                .authorize_row_field_update(plugin.clone(), &surface)
+                .is_ok()
+        );
+        let audit = runtime.audit_log().last().unwrap();
+        assert_eq!(audit.capability, Capability::new("surface", "rowfield"));
+        assert_eq!(audit.operation, "rowfield.update");
+        assert!(
+            runtime
+                .authorize_row_field_update(plugin.clone(), &SurfaceId::new("undeclared"))
+                .is_err()
+        );
+        let oversized = SurfaceId::new("s".repeat(MAX_PLUGIN_IDENTIFIER_BYTES + 1));
+        assert!(matches!(
+            runtime.authorize_row_field_update(plugin, &oversized),
+            Err(PluginApiError::QuotaExceeded {
+                what: "surface identifier bytes",
+                ..
+            })
+        ));
+    }
+
+    #[test]
     fn current_host_support_tables_are_complete_and_unique() {
         let expected_points = [
             "WorktreeField",

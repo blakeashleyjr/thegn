@@ -893,6 +893,7 @@ mod tests {
     #[test]
     fn check_spec_accepts_worktree_field_and_rejects_invalid_field_name() {
         let mut plugin = spec("rowfield", vec!["true".into()]);
+        plugin.mode = thegn_core::plugin_api::PluginMode::Resident;
         plugin
             .manifest
             .capabilities
@@ -929,7 +930,7 @@ mod tests {
         ];
         for field in &invalid_fields {
             let mut invalid = plugin.clone();
-            invalid.spec.manifest.contributions[0].caps = serde_json::json!({
+            invalid.manifest.contributions[0].caps = serde_json::json!({
                 "field": field,
                 "slot": "detail"
             });
