@@ -1545,6 +1545,7 @@
       "type": "string"
     },
     "RowRole": {
+      "description": "The visual role a plugin may assign to a worktree row field.",
       "enum": [
         "Accent",
         "Dim",
