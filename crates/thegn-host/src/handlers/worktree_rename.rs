@@ -170,9 +170,23 @@ pub(crate) fn request(
         }
         // Dedupe the typed name against existing branches (excluding the one
         // being renamed) — this is a git read, hence off-loop.
-        let mut taken = thegn_core::worktree::BranchSet::load(root);
-        taken.remove(&old_branch);
-        let want = thegn_core::worktree::dedupe(text.trim(), &taken);
+        let want = match deduped_name(root, &old_branch, text.trim()) {
+            Ok(want) => want,
+            Err(reason) => {
+                // A closed channel means the consumer is going away; the refusal still must not run Git.
+                if let Err(error) = tx.send(RenameDone {
+                    old_path,
+                    want: text.trim().to_string(),
+                    result: Err(reason),
+                }) {
+                    tracing::debug!(target: "thegn::worktree", %error, "branch-inventory rename refusal receiver is gone");
+                }
+                if let Err(error) = waker.wake() {
+                    tracing::debug!(target: "thegn::worktree", %error, "branch-inventory rename refusal waker pulse failed");
+                }
+                return;
+            }
+        };
         let result = thegn_core::worktree::rename(
             root,
             std::path::Path::new(&old_path),
@@ -220,6 +234,18 @@ pub(crate) fn apply(
 
 pub(crate) fn registry_failure_status(want: &str, error: &str) -> String {
     format!("Renamed to {want} (registry update failed: {error})")
+}
+
+/// Dedupe `typed` against the repo's branches (excluding `old_branch`),
+/// refusing when Git cannot provide the inventory that proves the name free.
+fn deduped_name(root: &std::path::Path, old_branch: &str, typed: &str) -> Result<String, String> {
+    let mut taken = thegn_core::worktree::BranchSet::load_checked(root).map_err(|error| {
+        format!(
+            "refusing to rename {old_branch}: could not list existing branches ({error}); nothing was changed"
+        )
+    })?;
+    taken.remove(old_branch);
+    Ok(thegn_core::worktree::dedupe(typed, &taken))
 }
 
 /// Why a rename must not start: the worktree has a merge-queue row (held by a
@@ -708,5 +734,13 @@ mod tests {
             )
             .is_none()
         );
+    }
+
+    #[test]
+    fn deduped_name_refuses_when_branch_inventory_unreadable() {
+        let scratch = tempfile::tempdir().unwrap();
+        let error = deduped_name(scratch.path(), "tg/old", "tg/new").unwrap_err();
+        assert!(error.contains("refusing to rename tg/old"), "{error}");
+        assert!(error.contains("nothing was changed"), "{error}");
     }
 }
