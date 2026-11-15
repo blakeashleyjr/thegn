@@ -96,6 +96,8 @@ fn load_checked_errs_outside_a_git_dir() {
         return;
     }
     let tmp = tempfile::tempdir().expect("tempdir");
-    let error = BranchSet::load_checked(tmp.path()).expect_err("not a git dir");
-    assert!(error.contains("could not list branches"), "{error}");
+    match BranchSet::load_checked(tmp.path()) {
+        Ok(_) => panic!("load_checked must refuse outside a git dir"),
+        Err(error) => assert!(error.contains("could not list branches"), "{error}"),
+    }
 }
