@@ -457,18 +457,20 @@ fn status_lines(reply: &thegn_svc::control::PluginsStatusReply) -> Vec<String> {
         ];
     }
     let mut lines = vec![
-        "plugin  busy  refused  timeout  lost  drops  bridge(timeout/cancel/late/malformed/closed)"
+        "plugin  busy  refused  timeout  lost  drops  skipped  deferred  bridge(timeout/cancel/late/malformed/closed)"
             .into(),
     ];
     for row in &reply.rows {
         lines.push(format!(
-            "{}  {}  {}  {}  {}  {}  {}/{}/{}/{}/{}",
+            "{}  {}  {}  {}  {}  {}  {}  {}  {}/{}/{}/{}/{}",
             row.plugin,
             row.in_flight,
             row.rejected,
             row.timed_out,
             row.lost,
             row.queue_drops,
+            row.sched_skipped,
+            row.sched_overloaded,
             row.bridge.timed_out,
             row.bridge.cancelled,
             row.bridge.late_replies,
@@ -514,15 +516,17 @@ mod tests {
                     closed_wakeups: 10,
                     ..Default::default()
                 },
+                sched_skipped: 11,
+                sched_overloaded: 12,
                 ..Default::default()
             }],
         };
         let lines = status_lines(&reply);
         assert_eq!(
             lines[0],
-            "plugin  busy  refused  timeout  lost  drops  bridge(timeout/cancel/late/malformed/closed)"
+            "plugin  busy  refused  timeout  lost  drops  skipped  deferred  bridge(timeout/cancel/late/malformed/closed)"
         );
-        assert_eq!(lines[1], "sample  1  2  3  4  5  6/7/8/9/10");
+        assert_eq!(lines[1], "sample  1  2  3  4  5  11  12  6/7/8/9/10");
         assert_eq!(lines[2], "live: no (pid 42)");
     }
 
