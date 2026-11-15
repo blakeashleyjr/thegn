@@ -29,6 +29,7 @@ pub(crate) struct LocalIdentity {
 fn git_path(path: &Path, flag: &str) -> Result<PathBuf> {
     let value = GitLoc::Local(path.to_path_buf())
         .git_text(&["rev-parse", "--path-format=absolute", flag])
+        .map_err(|error| anyhow::anyhow!("{error}"))
         .with_context(|| format!("cannot inspect local Git {flag}"))?;
     ensure!(
         !value.is_empty(),
