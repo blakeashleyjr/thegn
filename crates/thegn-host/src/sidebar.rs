@@ -202,6 +202,16 @@ impl SortMode {
     }
 }
 
+/// A value supplied by a plugin for one worktree row field.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PluginFieldValue {
+    pub plugin: String,
+    pub field: String,
+    pub text: String,
+    pub role: thegn_core::plugin_api::RowRole,
+    pub slot: thegn_core::plugin_api::RowFieldSlot,
+}
+
 /// One row in the workspace tree.
 #[derive(Debug, Clone)]
 pub struct SidebarRow {
@@ -300,6 +310,9 @@ pub struct SidebarRow {
     /// child worktree rows. `None` for worktrees and workspaces with no active
     /// queue entries.
     pub mq_rollup: Option<thegn_core::merge_queue_view::MqRollup>,
+    /// Resident plugin values resolved for this worktree. Empty when no
+    /// installed plugin has published a value for the row.
+    pub plugin_fields: Vec<PluginFieldValue>,
 }
 
 impl SidebarRow {
@@ -348,6 +361,7 @@ impl SidebarRow {
             pipeline_stage: None,
             repo_prefix: None,
             mq_rollup: None,
+            plugin_fields: Vec::new(),
         }
     }
 
@@ -455,6 +469,8 @@ pub struct SidebarStatus {
     /// Absent for a worktree with no live staged dispatch (see
     /// `monitor_pipeline::stage_badges`).
     pub pipeline_stages: std::collections::BTreeMap<String, String>,
+    /// Resident plugin row-field values keyed by worktree path.
+    pub plugin_fields: std::collections::BTreeMap<String, Vec<PluginFieldValue>>,
     /// The derived lane folders under the Pipeline row: one per issue/worktree
     /// with **active** dispatch rows, each carrying its agents (see
     /// [`crate::sidebar_pipeline::lanes`]). A fourth pure fold over the same
@@ -1541,6 +1557,19 @@ fn worktree_row(
         .as_deref()
         .and_then(|p| status.branches.get(p))
         .cloned();
+    let plugin_fields = wt_path
+        .as_deref()
+        .and_then(|p| status.plugin_fields.get(p))
+        .or_else(|| {
+            status.plugin_fields.get(
+                live_branch
+                    .as_deref()
+                    .filter(|branch| !branch.is_empty())
+                    .unwrap_or(gr.label.as_str()),
+            )
+        })
+        .cloned()
+        .unwrap_or_default();
     let branch_meta = wt_path
         .as_deref()
         .and_then(|p| status.branch_meta.get(p))
@@ -1569,6 +1598,7 @@ fn worktree_row(
         unread_count,
         alert_count,
         repo_prefix,
+        plugin_fields,
         ..SidebarRow::base(
             RowKind::Worktree,
             depth,

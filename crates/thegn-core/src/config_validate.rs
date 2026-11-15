@@ -558,11 +558,10 @@ pub(crate) fn typed_semantic_errors(cfg: &Config, mode: SemanticMode) -> Vec<Str
 
 fn sidebar_detail_warnings(cfg: &Config) -> Vec<String> {
     let mut warnings = Vec::new();
-    let valid = crate::config::DetailField::valid_names().join(", ");
     for field in &cfg.ui.sidebar_detail_fields {
-        if crate::config::DetailField::parse(field).is_none() {
+        if crate::config_ui::parse_entry(field).is_none() {
             warnings.push(format!(
-                "ui.sidebar_detail_fields: unknown field {field:?}; expected one of: {valid}"
+                "ui.sidebar_detail_fields: unknown field {field:?}; expected a built-in name or plugin:<name>/<field>"
             ));
         }
     }
@@ -1989,7 +1988,7 @@ sidebar_workspace_sort = "attention"
             diagnostic.severity == ValidationSeverity::Warning
                 && diagnostic.message.contains("sidebar_detail_fields")
                 && diagnostic.message.contains("bogus")
-                && diagnostic.message.contains("branch_stat")
+                && diagnostic.message.contains("plugin:<name>/<field>")
         }));
         assert!(diagnostics.iter().any(|diagnostic| {
             diagnostic.severity == ValidationSeverity::Warning
