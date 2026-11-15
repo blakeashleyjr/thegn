@@ -68,6 +68,28 @@ pub enum DetailField {
     Subject,
     /// The approximate last-commit age.
     Age,
+    /// Commits ahead of and behind the upstream branch.
+    Upstream,
+    /// The current pipeline stage.
+    Stage,
+    /// The current short activity state.
+    Activity,
+    /// The selected execution environment.
+    Env,
+    /// The sandbox profile and backend.
+    Sandbox,
+    /// The devcontainer status.
+    Devcontainer,
+    /// Whether the worktree is hibernated.
+    Hibernated,
+    /// The merge-queue status.
+    Mq,
+    /// The unread notification count.
+    Unread,
+    /// The worktree disk usage.
+    Disk,
+    /// The name of the last commit's author.
+    Author,
 }
 
 impl DetailField {
@@ -81,6 +103,17 @@ impl DetailField {
             "pr" => Some(Self::Pr),
             "subject" => Some(Self::Subject),
             "age" => Some(Self::Age),
+            "upstream" => Some(Self::Upstream),
+            "stage" => Some(Self::Stage),
+            "activity" => Some(Self::Activity),
+            "env" => Some(Self::Env),
+            "sandbox" => Some(Self::Sandbox),
+            "devcontainer" => Some(Self::Devcontainer),
+            "hibernated" => Some(Self::Hibernated),
+            "mq" => Some(Self::Mq),
+            "unread" => Some(Self::Unread),
+            "disk" => Some(Self::Disk),
+            "author" => Some(Self::Author),
             _ => None,
         }
     }
@@ -95,11 +128,22 @@ impl DetailField {
             Self::Pr => "pr",
             Self::Subject => "subject",
             Self::Age => "age",
+            Self::Upstream => "upstream",
+            Self::Stage => "stage",
+            Self::Activity => "activity",
+            Self::Env => "env",
+            Self::Sandbox => "sandbox",
+            Self::Devcontainer => "devcontainer",
+            Self::Hibernated => "hibernated",
+            Self::Mq => "mq",
+            Self::Unread => "unread",
+            Self::Disk => "disk",
+            Self::Author => "author",
         }
     }
 
     /// The valid spellings, in documentation order.
-    pub const fn valid_names() -> [&'static str; 7] {
+    pub const fn valid_names() -> [&'static str; 18] {
         [
             "branch",
             "commits",
@@ -108,6 +152,38 @@ impl DetailField {
             "pr",
             "subject",
             "age",
+            "upstream",
+            "stage",
+            "activity",
+            "env",
+            "sandbox",
+            "devcontainer",
+            "hibernated",
+            "mq",
+            "unread",
+            "disk",
+            "author",
+        ]
+    }
+
+    /// The default ordered fields. Optional metadata fields are deliberately
+    /// omitted so existing rows keep their established appearance.
+    pub const fn default_order() -> [Self; 14] {
+        [
+            Self::Branch,
+            Self::Commits,
+            Self::Dirty,
+            Self::BranchStat,
+            Self::Pr,
+            Self::Subject,
+            Self::Age,
+            Self::Env,
+            Self::Sandbox,
+            Self::Devcontainer,
+            Self::Hibernated,
+            Self::Mq,
+            Self::Unread,
+            Self::Disk,
         ]
     }
 }
@@ -243,9 +319,9 @@ impl Default for UiConfig {
             sidebar_show_behind_base: false,
             sidebar_commit_badge: "{n}c".to_string(),
             sidebar_behind_badge: "{n}b".to_string(),
-            sidebar_detail_fields: DetailField::valid_names()
+            sidebar_detail_fields: DetailField::default_order()
                 .into_iter()
-                .map(str::to_string)
+                .map(|field| field.as_str().to_string())
                 .collect(),
             sidebar_detail_branch: true,
             sidebar_detail_branch_stat: true,
@@ -421,6 +497,13 @@ mod tests {
                 DetailField::Pr,
                 DetailField::Subject,
                 DetailField::Age,
+                DetailField::Env,
+                DetailField::Sandbox,
+                DetailField::Devcontainer,
+                DetailField::Hibernated,
+                DetailField::Mq,
+                DetailField::Unread,
+                DetailField::Disk,
             ]
         );
         let cfg: UiConfig = toml::from_str(
