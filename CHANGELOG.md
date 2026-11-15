@@ -14,6 +14,10 @@ All notable changes to **thegn** are documented here. The format follows
 - Control API, gRPC, and MCP `merge.list` rows now carry `cleanup_retry` (attempts, next attempt time, class) and `cleanup_hold`, so clients no longer have to decode the retry marker. (THE-236)
 - On Linux, the CPU Frequency panel shows ` itmt` when the kernel has Intel Turbo Boost Max scheduling enabled, and falls back to ACPI CPPC `highest_perf` when the AMD value is absent. (THE-844)
 - `stats.refresh_rates` is now a Home Manager option. (THE-428)
+- The MCP server gains `sessions_resize` and `worktrees_open`, both needing the `write` scope. (THE-203)
+- `media.backend`, `notifications.sound.mode`, and `notifications.sound.always_kinds` are now Home Manager options. (THE-428)
+- `thegn plugin status` gains `skipped` and `deferred` columns for scheduler ticks that were skipped or pushed back. (THE-537)
+- On hybrid Linux CPUs, the CPU Frequency summary shows the mean frequency of the performance and efficiency cores. (THE-844)
 
 ### Changed
 
@@ -21,11 +25,17 @@ All notable changes to **thegn** are documented here. The format follows
 - Merge-queue and PR-queue messages are now handled in bounded slices per loop turn (64 messages or 4 ms), so a burst cannot stall input. (THE-657)
 - The plugin alert outbox now has a 64 KiB budget per drain across all plugins; alerts over it are dropped and counted. (THE-537)
 - Internal: Git and capability probes, review-pane preview capture, and VPN subprocesses now run on `thegn_proc` and no longer start their own reader and reaper threads; typed inventory results for Sprites and Daytona listings; a color-depth test matrix over every graph painter; and tests for each. (THE-729, THE-251, THE-530, THE-842)
+- The CPU usage panel's `io` and `st` rows now show the latest percent beside the sparkline. (THE-842)
+- Internal: a `run_consuming_streams` entry point and an `idle_output` limit on `thegn_proc`; strict and byte-exact git output helpers; control-byte tests for the git list parsers; per-drain budgets for worktree-creation, share, forward, and host UI events; and tests for each. (THE-729, THE-368, THE-383, THE-657)
 
 ### Fixed
 
 - GitHub issue detail now reports its label list as incomplete when it reaches the 100-label page limit, instead of claiming it is complete. (THE-323)
 - Submodule status reads now fail with an error on non-UTF-8 paths instead of silently substituting replacement characters. (THE-368, THE-383, THE-376)
+- PTY open, attach, and resize now refuse sizes over 1000x1000 on every surface, instead of allocating a huge terminal grid.
+- When `thegn share` cannot verify a Tailscale teardown, it records the port as pending and tells you to retry with `thegn share stop <local port>`. (THE-330)
+- Worktree listings now fail with an error on a non-UTF-8 path instead of showing a replacement-character path. (THE-368, THE-376)
+- The VPS reaper re-reads its ledger before destroying an instance and keeps any record that changed in the meantime. (THE-529)
 
 ## [0.1.0-alpha.84] — 2026-11-15
 
