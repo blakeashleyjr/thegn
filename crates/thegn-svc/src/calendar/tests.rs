@@ -4999,6 +4999,7 @@ fn diagnostics_budget_caps_retained_detail_across_three_pages() {
     total.absorb_within(page(1, 0), &mut budget);
     assert_eq!(total.quarantined_events, before.quarantined_events);
     assert_eq!(total.truncated, 5);
+    assert_eq!(total.total(), 10);
 }
 
 #[test]

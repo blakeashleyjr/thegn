@@ -442,6 +442,7 @@ impl PageDiagnostics {
             .saturating_add(self.unresolved_zones)
             .saturating_add(self.other)
             .saturating_add(self.overflow)
+            .saturating_add(self.truncated)
     }
 
     pub fn is_empty(&self) -> bool {
