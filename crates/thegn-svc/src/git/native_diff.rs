@@ -691,6 +691,9 @@ fn tree_to_worktree(repo: &gix::Repository, rev: &str) -> Result<Vec<DiffEntry>>
     let status_source = status_repo.as_ref().map_or(repo, |status_repo| status_repo);
     let iter = super::read_budget::budgeted_status(status_source)
         .context("gix status")?
+        // Like `tree_to_tree`: `git diff --numstat --no-renames` reports a
+        // rename as delete + add, so HEAD-vs-index must not pair them.
+        .tree_index_track_renames(gix::status::tree_index::TrackRenames::Disabled)
         .untracked_files(gix::status::UntrackedFiles::None)
         .into_iter(None)
         .context("gix status iter")?;
