@@ -459,7 +459,9 @@ pub fn spawn_ndjson(
 
 /// Run `argv`, stopping early when `cancel` returns true (polled every wait
 /// tick): the process group is killed, the leader reaped within the reader
-/// grace, and the result is [`PluginError::Cancelled`].
+/// grace, and the result is [`PluginError::Cancelled`]. Polling backs off to
+/// a 50 ms cap after one second, so cancellation is observed within at most
+/// that interval apart from scheduler latency.
 pub fn spawn_ndjson_cancellable(
     argv: &[String],
     env: &BTreeMap<String, String>,
@@ -501,7 +503,9 @@ pub fn spawn_ndjson_stream<S: NdjsonSink>(
 
 /// [`spawn_ndjson_stream`] that also stops when `cancel` returns true (polled
 /// every wait tick): the process group is killed and the result is
-/// [`PluginError::Cancelled`].
+/// [`PluginError::Cancelled`]. Polling backs off to a 50 ms cap after one
+/// second, so cancellation is observed within at most that interval apart
+/// from scheduler latency.
 pub fn spawn_ndjson_stream_cancellable<S: NdjsonSink>(
     argv: &[String],
     env: &BTreeMap<String, String>,
@@ -511,6 +515,21 @@ pub fn spawn_ndjson_stream_cancellable<S: NdjsonSink>(
     cancel: &dyn Fn() -> bool,
 ) -> Result<StreamRun<S>, PluginError> {
     spawn_ndjson_stream_inner(argv, env, cwd, timeout, sink, cancel)
+}
+
+/// Return the supervision poll interval for a running one-shot plugin.
+///
+/// Short runs stay responsive, while long-running plugins avoid waking 50
+/// times per second. Once the interval reaches its 50 ms cap, cancellation
+/// latency is bounded by one poll interval, apart from scheduler latency.
+fn supervise_poll_interval(elapsed: Duration) -> Duration {
+    if elapsed < Duration::from_millis(100) {
+        Duration::from_millis(5)
+    } else if elapsed < Duration::from_secs(1) {
+        Duration::from_millis(20)
+    } else {
+        Duration::from_millis(50)
+    }
 }
 
 fn spawn_ndjson_stream_inner<S: NdjsonSink>(
@@ -741,7 +760,9 @@ fn spawn_ndjson_stream_inner<S: NdjsonSink>(
                 kill_group_and_escaped(pid);
                 break 'run reap_after_kill(child);
             }
-            std::thread::sleep(Duration::from_millis(20));
+            let sleep_for = supervise_poll_interval(started.elapsed())
+                .min(deadline.saturating_duration_since(Instant::now()));
+            std::thread::sleep(sleep_for);
         }
     };
     #[cfg(not(unix))]
@@ -768,7 +789,9 @@ fn spawn_ndjson_stream_inner<S: NdjsonSink>(
             hand_off_unreaped_child(child);
             break None;
         }
-        std::thread::sleep(Duration::from_millis(20));
+        let sleep_for = supervise_poll_interval(started.elapsed())
+            .min(deadline.saturating_duration_since(Instant::now()));
+        std::thread::sleep(sleep_for);
     };
 
     #[cfg(unix)]
@@ -1394,7 +1417,7 @@ pub(crate) fn kill_group(pid: u32) {
 mod process_tree_deadline_tests {
     use super::{
         LIVE_PIPE_READERS, PluginError, READER_GRACE, READER_RECEIVE_MARGIN, poll_wait_ms,
-        spawn_ndjson, spawn_ndjson_cancellable,
+        spawn_ndjson, spawn_ndjson_cancellable, supervise_poll_interval,
     };
     use std::collections::BTreeMap;
     use std::os::unix::fs::PermissionsExt;
@@ -1611,6 +1634,51 @@ mod process_tree_deadline_tests {
         assert_eq!(poll_wait_ms(Duration::from_millis(1)), 1);
         assert_eq!(poll_wait_ms(Duration::from_micros(1_500)), 2);
         assert_eq!(poll_wait_ms(Duration::from_millis(120)), 50);
+    }
+
+    #[test]
+    fn supervision_poll_interval_backs_off_and_clamps_to_deadline() {
+        let cases = [
+            (Duration::ZERO, Duration::from_millis(5)),
+            (Duration::from_millis(99), Duration::from_millis(5)),
+            (Duration::from_millis(100), Duration::from_millis(20)),
+            (Duration::from_millis(999), Duration::from_millis(20)),
+            (Duration::from_secs(1), Duration::from_millis(50)),
+            (Duration::from_secs(60 * 60), Duration::from_millis(50)),
+            (Duration::MAX, Duration::from_millis(50)),
+        ];
+        let mut previous = Duration::ZERO;
+        for (elapsed, expected) in cases {
+            let interval = supervise_poll_interval(elapsed);
+            assert_eq!(interval, expected);
+            assert!(interval >= previous);
+            assert!(interval <= Duration::from_millis(50));
+            previous = interval;
+        }
+
+        let deadline = Instant::now() + Duration::from_millis(3);
+        let sleep_for = supervise_poll_interval(Duration::from_secs(1))
+            .min(deadline.saturating_duration_since(Instant::now()));
+        assert!(sleep_for <= Duration::from_millis(3));
+    }
+
+    #[test]
+    fn one_shot_sleep_is_observed_exited_within_poll_margin() {
+        let started = Instant::now();
+        let run = spawn_ndjson(
+            &["sh".into(), "-c".into(), "sleep 0.15".into()],
+            &BTreeMap::new(),
+            None,
+            Duration::from_secs(2),
+        )
+        .unwrap();
+        assert!(run.outcome.reaped);
+        assert!(
+            started.elapsed() <= Duration::from_millis(210),
+            "one-shot exit was observed after {:?}",
+            started.elapsed()
+        );
+        assert_readers_exit_within_margin();
     }
 
     #[test]
