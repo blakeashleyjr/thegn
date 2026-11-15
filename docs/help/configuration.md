@@ -587,16 +587,17 @@ The `stats.alerts` and `stats.net_icons` settings remain omitted.
 The `[notifications]` booleans are `notificationsDesktop`,
 `notificationsSurfaceSelfLogErrors`, `notificationsGithubMentions`,
 `notificationsAgentAttentionInbox` and `notificationsMergeQueueHoldDesktop`.
+`notificationsSoundMode` (`command` also needs `notifications.sound.command`
+in TOML) and `notificationsSoundAlwaysKinds` are exposed too.
 `[activity]` takes `activityEnabled`, `activityRedRequiresAgent` and
 `activityAgentPrograms` (a list of extra agent CLI program names).
 
 Recording, media and the monitor process table are also exposed:
-`recordingDir`, `recordingMaxBytes`, `mediaEnabled`, `mediaShowArt`,
+`recordingDir`, `recordingMaxBytes`, `mediaEnabled`, `mediaBackend`, `mediaShowArt`,
 `mediaDefaultAction`, `mediaOverlayOnBadgeClick`, `mediaSeekStepSecs`,
 `mediaSeekStepVideoSecs`, `mediaPollIntervalSecs`, `mediaPlayersPriority`,
 `monitorProcRows`, `monitorProcesses` and `monitorProcessIo`, plus
-`mediaVolumeStep` (0.0 through 1.0). The media backend key and the
-`mpv`/`mpd` tables are not exposed. This
+`mediaVolumeStep` (0.0 through 1.0). The `mpv`/`mpd` backend tables are not exposed. This
 exposes the existing default-action setting only; it adds no action ids.
 
 The `[limits]` and `[diagnostics]` tables are exposed as `limitsTestCpuQuota`,
