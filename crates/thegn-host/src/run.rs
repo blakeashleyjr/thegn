@@ -42,6 +42,7 @@ use crate::hydrate_schedule::{RefreshGeneration, ScheduleOwner};
 use crate::input::key_bytes;
 use crate::layout;
 use crate::loading::{SpecOrigin, provision_owns_tab};
+use crate::loop_policy::{self, FrameInputs};
 use crate::menu::{self, MenuChoice, MenuOverlay};
 use crate::palette::build_palette;
 use crate::pane::PaneEvent;
@@ -15831,11 +15832,8 @@ async fn event_loop<T: Terminal>(
         // 2. Render if anything changed (diff-flush): damaged panes and/or chrome,
         //    cursor in the focused pane. `dirty` = chrome/overlay/geometry channel;
         //    `dirty_panes` = per-pane content; either (or `full_repaint`) → a frame.
-        //    The pure pacing gate (`loop_policy::frame_gate`) may defer a
-        //    pane-only streaming frame inside the window (damage stays armed;
-        //    the poll timeout below guarantees the trailing flush) and defers
-        //    composition past a queued-but-undispatched keystroke so one frame
-        //    carries its effect.
+        //    The pure frame decision may defer pane-only output or a queued
+        //    input while retaining the trailing-frame wake guarantee.
         let have_damage = dirty
             || full_repaint
             || !dirty_panes.is_empty()
@@ -15843,7 +15841,6 @@ async fn event_loop<T: Terminal>(
             || statusbar_dirty
             || sidebar_dirty
             || scroll_dirty;
-        let mut defer_timeout: Option<std::time::Duration> = None;
         let pane_only_damage = !dirty
             && !full_repaint
             && switch_at.is_none()
@@ -15857,34 +15854,22 @@ async fn event_loop<T: Terminal>(
                 InputEvent::Key(_) | InputEvent::Mouse(_) | InputEvent::Paste(_)
             )
         });
-        // Writer backpressure: with 2 frames already in flight, composing a
-        // third would either block or corrupt the diff chain — defer instead
-        // (damage stays armed and coalesces; the slow terminal's drain rate
-        // paces the frame rate). Checked BEFORE the wire renderer runs, whose
-        // SGR state must only advance for frames that are actually delivered.
-        let writer_busy = !writer.frame_slot_free();
-        let should_render = have_damage
-            && !writer_busy
-            && match crate::loop_policy::frame_gate(
-                input_at.is_some(),
-                input_queued,
-                pane_only_damage,
-                last_flush_at.elapsed(),
-                crate::loop_policy::PANE_FRAME_WINDOW,
-            ) {
-                crate::loop_policy::FrameGate::RenderNow => true,
-                crate::loop_policy::FrameGate::Defer { remaining } => {
-                    defer_timeout = Some(remaining);
-                    loop_perf.frame_deferred();
-                    false
-                }
-            };
-        if writer_busy && have_damage {
-            // Re-check soon; the writer pulses no wake on success, so poll.
-            defer_timeout = Some(std::time::Duration::from_millis(2));
+        // Writer backpressure is checked before the wire renderer advances SGR.
+        let decision = loop_policy::decide_frame(&FrameInputs {
+            have_damage,
+            pane_only_damage,
+            input_awaiting_frame: input_at.is_some(),
+            input_queued,
+            writer_busy: !writer.frame_slot_free(),
+            since_last_flush: last_flush_at.elapsed(),
+            window: loop_policy::PANE_FRAME_WINDOW,
+        });
+        let should_render = decision.render;
+        let defer_timeout = decision.defer_timeout;
+        if decision.count_deferred {
             loop_perf.frame_deferred();
         }
-        if !have_damage {
+        if decision.idle_wake {
             // Woke but nothing changed — a wasted wakeup (storm signal).
             loop_perf.render_skip();
             // An idle wake is the right moment to return freed arena pages to
