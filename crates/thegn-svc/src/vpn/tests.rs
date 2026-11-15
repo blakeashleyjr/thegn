@@ -1428,3 +1428,24 @@ fn pending_teardown_cap_fits_the_record_size_limit() {
     };
     assert!(serde_json::to_vec(&record).unwrap().len() < SIDECAR_RECORD_MAX_BYTES);
 }
+
+#[test]
+fn pending_teardown_updates_under_the_record_lock_keep_both_ports() {
+    let _state = thegn_core::testenv::IsolatedState::new();
+    let worktree = pending_fixture_worktree();
+    write_sidecar_record_for_test("c-tgvpn", worktree.path(), &"a".repeat(64), 4, Vec::new())
+        .unwrap();
+
+    mark_teardown_pending("c-tgvpn", worktree.path(), 443).unwrap();
+    mark_teardown_pending("c-tgvpn", worktree.path(), 8443).unwrap();
+    clear_teardown_pending("c-tgvpn", worktree.path(), 9999).unwrap();
+    assert_eq!(pending_teardowns("c-tgvpn").unwrap(), vec![443, 8443]);
+    assert_eq!(read_sidecar_record("c-tgvpn").unwrap().generation, Some(4));
+
+    let dir = sidecar_record_dir().unwrap();
+    assert!(dir.path().join("c-tgvpn.lock").is_file());
+    assert!(dir.path().join("c-tgvpn.json").is_file());
+    // Every update released the lock on return.
+    let held = lock_sidecar_record(&dir, "c-tgvpn").unwrap();
+    drop(held);
+}

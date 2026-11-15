@@ -3239,7 +3239,9 @@ fn unverified_teardown_is_recorded_pending_then_cleared_when_verified() {
     let message = format!("{error:#}");
     assert!(message.contains("teardown unverified"), "{message}");
     assert!(
-        message.contains("recorded as pending (serve port 443), retry with `thegn share stop`"),
+        message.contains(
+            "recorded tailscale serve port 443 as pending teardown; retry with `thegn share stop <local port>`"
+        ),
         "{message}"
     );
     assert!(is_teardown_unverified(&error));

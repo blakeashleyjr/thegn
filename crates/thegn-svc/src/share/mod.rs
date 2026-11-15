@@ -1112,7 +1112,7 @@ fn record_pending_teardown(
 ) -> anyhow::Error {
     let message = match crate::vpn::mark_teardown_pending(sidecar, worktree, port) {
         Ok(()) => format!(
-            "{error:#}; recorded as pending (serve port {port}), retry with `thegn share stop`"
+            "{error:#}; recorded tailscale serve port {port} as pending teardown; retry with `thegn share stop <local port>`"
         ),
         Err(mark) => {
             format!("{error:#}; could not record serve port {port} as pending teardown: {mark:#}")
