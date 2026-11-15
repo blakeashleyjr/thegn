@@ -223,8 +223,39 @@ pub(crate) fn apply_landed(
     branch: &str,
     commit: &str,
 ) {
-    for note in apply_landed_reported(cfg, db, repo_root, worktree, branch, commit) {
+    let notes = apply_landed_reported(cfg, db, repo_root, worktree, branch, commit);
+    for note in &notes {
         note.emit();
+    }
+    // A retained worktree must leave a durable trace: this path runs from the
+    // CLI/daemon, where the terminal warning above is easily lost.
+    if let Some(text) = hold_notice(&notes) {
+        let source_ref = format!("merge-cleanup:{commit}:{worktree}");
+        if let Err(error) = crate::automation_events::emit_once(
+            db,
+            thegn_core::notification::NotificationKind::QueueHeld.as_str(),
+            &source_ref,
+            &text,
+            worktree,
+        ) {
+            tracing::debug!(target: "thegn::merge", %error, "could not record landed-cleanup hold");
+        }
+    }
+}
+
+/// The joined `Warn` note text (one inbox notice per land), `None` without any.
+fn hold_notice(notes: &[LifecycleNote]) -> Option<String> {
+    let warns: Vec<&str> = notes
+        .iter()
+        .filter_map(|note| match note {
+            LifecycleNote::Warn(text) => Some(text.as_str()),
+            LifecycleNote::Info(_) => None,
+        })
+        .collect();
+    if warns.is_empty() {
+        None
+    } else {
+        Some(warns.join("; "))
     }
 }
 
@@ -2618,6 +2649,67 @@ mod tests {
         assert!(notes.contains(&LifecycleNote::Info(
             "merge cleanup: removed feat; branch kept for explicit cleanup".into()
         )));
+        if let Err(error) = std::fs::remove_dir_all(&root) {
+            tracing::debug!(%error, "test cleanup");
+        }
+    }
+
+    #[test]
+    fn hold_notice_joins_warn_notes_and_skips_info() {
+        let notes = [
+            LifecycleNote::Info("removed".into()),
+            LifecycleNote::Warn("first".into()),
+            LifecycleNote::Warn("second".into()),
+        ];
+        assert_eq!(hold_notice(&notes).as_deref(), Some("first; second"));
+    }
+
+    #[test]
+    fn hold_notice_none_without_warnings() {
+        assert_eq!(hold_notice(&[]), None);
+        assert_eq!(hold_notice(&[LifecycleNote::Info("ok".into())]), None);
+    }
+
+    #[test]
+    fn apply_landed_records_one_queue_held_notice_for_a_kept_worktree() {
+        let _isolation = TestIsolation::new();
+        let db = Db::open_memory().unwrap();
+        let (root, feat) = repo_with_feat(&db, "hold-inbox");
+        let feat_s = feat.to_string_lossy().to_string();
+        db.enqueue_merge(&feat_s, "feat", "main").unwrap();
+        let commit = record_private_land(&db, &root, &feat_s, "feat");
+        let claim = crate::worktree_lifecycle::try_scoped_destroy_path(&feat)
+            .expect("test should own the first destroy claim");
+
+        apply_landed(&cfg(OnLanded::Remove), &db, &root, &feat_s, "feat", &commit);
+        let held = db.get_unread_notifications().unwrap();
+        assert_eq!(held.len(), 1);
+        assert_eq!(held[0].kind.as_str(), "queue_held");
+        assert!(held[0].message.contains("kept feat"));
+
+        apply_landed(&cfg(OnLanded::Remove), &db, &root, &feat_s, "feat", &commit);
+        assert_eq!(db.get_unread_notifications().unwrap().len(), 1);
+
+        drop(claim);
+        if let Err(error) = std::fs::remove_dir_all(&root) {
+            tracing::debug!(%error, "test cleanup");
+        }
+        if let Err(error) = std::fs::remove_dir_all(&feat) {
+            tracing::debug!(%error, "test cleanup");
+        }
+    }
+
+    #[test]
+    fn apply_landed_records_nothing_on_a_clean_removal() {
+        let _isolation = TestIsolation::new();
+        let db = Db::open_memory().unwrap();
+        let (root, feat) = repo_with_feat(&db, "hold-none");
+        let feat_s = feat.to_string_lossy().to_string();
+        let commit = record_private_land(&db, &root, &feat_s, "feat");
+
+        apply_landed(&cfg(OnLanded::Remove), &db, &root, &feat_s, "feat", &commit);
+
+        assert!(db.get_unread_notifications().unwrap().is_empty());
         if let Err(error) = std::fs::remove_dir_all(&root) {
             tracing::debug!(%error, "test cleanup");
         }
