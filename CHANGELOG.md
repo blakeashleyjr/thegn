@@ -7,6 +7,8 @@ All notable changes to **thegn** are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.1.0-alpha.84] — 2026-11-15
+
 ### Added
 
 - An opt-in `stash` sidebar detail field shows the repository's stash count, read from the stash log without a git process and hidden at zero. (THE-2003)
@@ -3541,7 +3543,8 @@ launcher picker and the merge queue's `agent_command` hook remain — they run
 whatever commands you configure. Leftover `[llm_proxy]` config sections and
 `proxy_*` tables in existing state databases are ignored harmlessly.
 
-[Unreleased]: https://github.com/blakeashleyjr/thegn/compare/v0.1.0-alpha.83...HEAD
+[Unreleased]: https://github.com/blakeashleyjr/thegn/compare/v0.1.0-alpha.84...HEAD
+[0.1.0-alpha.84]: https://github.com/blakeashleyjr/thegn/compare/v0.1.0-alpha.83...v0.1.0-alpha.84
 [0.1.0-alpha.83]: https://github.com/blakeashleyjr/thegn/compare/v0.1.0-alpha.82...v0.1.0-alpha.83
 [0.1.0-alpha.82]: https://github.com/blakeashleyjr/thegn/compare/v0.1.0-alpha.81...v0.1.0-alpha.82
 [0.1.0-alpha.81]: https://github.com/blakeashleyjr/thegn/compare/v0.1.0-alpha.80...v0.1.0-alpha.81
