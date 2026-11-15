@@ -15,18 +15,18 @@
 //!   generation is ever delivered, so queued + completed bytes are bounded by
 //!   one active + one pending job plus the one result the loop has yet to drain.
 
-use std::io::Read;
-use std::process::{Command, Stdio};
+use std::process::Command;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
+
+use thegn_proc::{End, Limits, Stream};
 
 /// Wall-clock budget for one external renderer. On expiry the whole process
 /// group is SIGKILLed immediately (there is no grace period) and reaped.
 pub(crate) const RENDERER_DEADLINE: Duration = Duration::from_secs(15);
 /// Max stdout bytes kept from a renderer (a 96 dpi page PNG is far smaller).
 pub(crate) const RENDERER_MAX_OUTPUT: usize = 32 * 1024 * 1024;
-const POLL: Duration = Duration::from_millis(10);
 const READER_GRACE: Duration = Duration::from_millis(500);
 
 /// Exact observable counters (test-only: nothing in production reads them).
@@ -301,102 +301,49 @@ pub fn bounded_run(
     capture(cmd, cancel, deadline, None).map(|_| ())
 }
 
-#[expect(
-    clippy::disallowed_methods,
-    reason = "the wait follows a confirmed exit or a group kill, on the dedicated preview worker"
-)]
 fn capture(
     cmd: &mut Command,
     cancel: &AtomicBool,
     deadline: Duration,
     max_out: Option<usize>,
 ) -> Result<Vec<u8>, CaptureError> {
-    cmd.stdin(Stdio::null())
-        .stdout(if max_out.is_some() {
-            Stdio::piped()
-        } else {
-            Stdio::null()
-        })
-        .stderr(Stdio::null());
-    let (mut child, group) =
-        crate::platform::spawn_grouped_die_with_parent(cmd).map_err(CaptureError::Spawn)?;
-    let capped = Arc::new(AtomicBool::new(false));
-    let mut reader_rx = None;
-    if let Some(max_out) = max_out {
-        let mut stdout = child.stdout.take();
-        let (tx, rx) = std::sync::mpsc::channel::<Vec<u8>>();
-        let capped = Arc::clone(&capped);
-        let spawned = thegn_core::thread_name::try_spawn_named("thegn-prev-io", move || {
-            crate::platform::qos::set_self(crate::platform::qos::Qos::Utility);
-            let mut buf = Vec::new();
-            if let Some(out) = stdout.as_mut() {
-                let mut chunk = [0u8; 64 * 1024];
-                loop {
-                    match out.read(&mut chunk) {
-                        Ok(0) | Err(_) => break,
-                        Ok(n) => {
-                            let room = max_out.saturating_sub(buf.len());
-                            buf.extend_from_slice(&chunk[..n.min(room)]);
-                            if n > room {
-                                capped.store(true, Ordering::Release);
-                                break;
-                            }
-                        }
-                    }
-                }
-            }
-            if tx.send(buf).is_err() {
-                // the waiter timed out and dropped the receiver
-            }
-        });
-        if let Err(e) = spawned {
-            tracing::warn!(target: "thegn::preview", error = %e, "preview reader spawn failed");
-            group.kill();
-            if let Err(e) = child.wait() {
-                tracing::warn!(target: "thegn::preview", error = %e, "renderer reap failed");
-            }
-            return Err(CaptureError::Failed);
-        }
-        reader_rx = Some(rx);
-    }
-    let started = Instant::now();
-    let outcome = loop {
-        if cancel.load(Ordering::Acquire) {
-            break Err(CaptureError::Cancelled);
-        }
-        if started.elapsed() >= deadline {
-            break Err(CaptureError::Timeout);
-        }
-        // Output cap reached: stop the renderer too.
-        if capped.load(Ordering::Acquire) {
-            break Err(CaptureError::Capped(Vec::new()));
-        }
-        match crate::platform::gate_child_exited(&mut child) {
-            Ok(true) => break Ok(()),
-            Ok(false) => {}
-            Err(_) => break Err(CaptureError::Failed),
-        }
-        std::thread::sleep(POLL);
+    // `thegn_proc` owns stdin (null), the pipes, the process group, the
+    // deadline/cancel polling, the group kill and the reap; this only adds the
+    // parent-death signal. The run happens inline on the calling (preview
+    // worker) thread, which the Linux PDEATHSIG is keyed to.
+    crate::platform::set_die_with_parent(cmd);
+    let limits = Limits {
+        stdout: max_out.map_or(Stream::Null, |cap| Stream::HeadOrFail { cap }),
+        stderr: Stream::Null,
+        // The group is killed as soon as the leader exits.
+        quiesce_after_leader: Some(Duration::ZERO),
+        // SIGKILL straight away: there is no grace period.
+        term_grace: Duration::ZERO,
+        // A descendant that escaped the group cannot hang the worker.
+        reader_grace: READER_GRACE,
+        ..Limits::silent(deadline)
     };
-    // Kill the whole group before reaping so no descendant outlives the job and
-    // the unreaped leader pins the pgid against reuse.
-    group.kill();
-    let status = child.wait();
-    let bytes = reader_rx
-        .and_then(|rx| rx.recv_timeout(READER_GRACE).ok())
-        .unwrap_or_default();
-    match outcome {
-        Err(CaptureError::Capped(_)) => return Err(CaptureError::Capped(bytes)),
-        Err(e) => return Err(e),
-        Ok(()) => {}
-    }
-    // The renderer exited on its own right at the cap: still truncated.
-    if capped.load(Ordering::Acquire) {
-        return Err(CaptureError::Capped(bytes));
-    }
-    match status {
-        Ok(s) if s.success() => Ok(bytes),
-        _ => Err(CaptureError::Failed),
+    map_run(thegn_proc::run(cmd, &limits, cancel), max_out.is_some())
+}
+
+/// Map a finished [`thegn_proc::Run`] onto the renderer outcome. `piped` says
+/// whether stdout was captured (it only documents intent: a `Null` stream
+/// yields empty bytes either way).
+fn map_run(run: thegn_proc::Run, piped: bool) -> Result<Vec<u8>, CaptureError> {
+    debug_assert!(piped || run.stdout.bytes.is_empty());
+    let success = run.success();
+    let thegn_proc::Run { end, stdout, .. } = run;
+    match end {
+        End::Spawn(e) => Err(CaptureError::Spawn(e)),
+        End::Cancelled => Err(CaptureError::Cancelled),
+        End::TimedOut => Err(CaptureError::Timeout),
+        End::OutputLimit(_) => Err(CaptureError::Capped(stdout.bytes)),
+        End::Supervise(_) => Err(CaptureError::Failed),
+        // The renderer exited on its own right at the cap: still truncated.
+        End::LeaderExited if stdout.truncated => Err(CaptureError::Capped(stdout.bytes)),
+        End::LeaderExited if success => Ok(stdout.bytes),
+        // Non-zero exit, or the leader was not reaped.
+        End::LeaderExited => Err(CaptureError::Failed),
     }
 }
 
@@ -633,5 +580,242 @@ mod tests {
             16,
         );
         assert!(matches!(r, Err(CaptureError::Failed)));
+    }
+
+    #[test]
+    fn stdout_round_trips() {
+        let r = bounded_capture(
+            &mut sh("printf hello"),
+            &AtomicBool::new(false),
+            Duration::from_secs(5),
+            1024,
+        );
+        assert!(matches!(&r, Ok(b) if b == b"hello"), "{r:?}");
+    }
+
+    #[test]
+    fn output_above_the_cap_is_capped_within_the_cap() {
+        let cap = 1024;
+        // 3 x the cap: the producer is well past the limit.
+        let r = bounded_capture(
+            &mut sh("head -c 3072 /dev/zero"),
+            &AtomicBool::new(false),
+            Duration::from_secs(5),
+            cap,
+        );
+        match r {
+            Err(CaptureError::Capped(bytes)) => {
+                assert!(bytes.len() <= cap, "{} > {cap}", bytes.len());
+                assert!(bytes.iter().all(|b| *b == 0));
+            }
+            other => panic!("expected the capped outcome, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn deadline_is_a_timeout_and_returns_promptly() {
+        let t = Instant::now();
+        let r = bounded_capture(
+            &mut sh("sleep 30"),
+            &AtomicBool::new(false),
+            Duration::from_millis(200),
+            1024,
+        );
+        assert!(matches!(r, Err(CaptureError::Timeout)), "{r:?}");
+        assert!(t.elapsed() < Duration::from_secs(2), "{:?}", t.elapsed());
+    }
+
+    #[test]
+    fn cancel_from_another_thread_is_cancelled() {
+        let cancel = Arc::new(AtomicBool::new(false));
+        let flag = Arc::clone(&cancel);
+        let setter = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(100));
+            flag.store(true, Ordering::Release);
+        });
+        let t = Instant::now();
+        let r = bounded_capture(&mut sh("sleep 30"), &cancel, Duration::from_secs(20), 1024);
+        setter.join().unwrap();
+        assert!(matches!(r, Err(CaptureError::Cancelled)), "{r:?}");
+        assert!(t.elapsed() < Duration::from_secs(5), "{:?}", t.elapsed());
+    }
+
+    #[test]
+    fn grandchild_holding_stdout_does_not_hang_the_capture() {
+        let deadline = Duration::from_secs(10);
+        let t = Instant::now();
+        let r = bounded_capture(
+            &mut sh("sleep 30 & echo x"),
+            &AtomicBool::new(false),
+            deadline,
+            1024,
+        );
+        assert!(
+            t.elapsed() < deadline + READER_GRACE,
+            "took {:?}",
+            t.elapsed()
+        );
+        assert!(matches!(&r, Ok(b) if b == b"x\n"), "{r:?}");
+    }
+
+    #[test]
+    fn missing_program_is_a_spawn_error() {
+        let r = bounded_capture(
+            &mut Command::new("thegn-definitely-not-a-real-renderer"),
+            &AtomicBool::new(false),
+            Duration::from_secs(5),
+            16,
+        );
+        assert!(matches!(r, Err(CaptureError::Spawn(_))), "{r:?}");
+    }
+
+    #[test]
+    fn bounded_run_without_stdout_succeeds() {
+        let r = bounded_run(
+            &mut sh("true"),
+            &AtomicBool::new(false),
+            Duration::from_secs(5),
+        );
+        assert!(r.is_ok(), "{r:?}");
+    }
+
+    /// A real reaped status for `exit code` (portable: no `ExitStatusExt`).
+    fn status(code: u8) -> std::process::ExitStatus {
+        thegn_proc::run(
+            &mut sh(&format!("exit {code}")),
+            &Limits::silent(Duration::from_secs(10)),
+            &AtomicBool::new(false),
+        )
+        .exit_status()
+        .expect("sh reaped")
+    }
+
+    fn hand_run(
+        end: End,
+        leader: thegn_proc::Leader,
+        stdout: thegn_proc::Capture,
+    ) -> thegn_proc::Run {
+        thegn_proc::Run {
+            end,
+            group: thegn_proc::GroupState::Terminated,
+            leader,
+            leader_exited_first: true,
+            stdout,
+            stderr: thegn_proc::Capture::default(),
+            containment: thegn_proc::Containment::ProcessGroup,
+        }
+    }
+
+    fn out(bytes: &[u8], truncated: bool) -> thegn_proc::Capture {
+        thegn_proc::Capture {
+            bytes: bytes.to_vec(),
+            total: bytes.len() as u64,
+            truncated,
+            eof: !truncated,
+        }
+    }
+
+    #[test]
+    fn map_run_covers_every_end() {
+        use thegn_proc::{Leader, Which};
+        let ok = status(0);
+        let bad = status(3);
+
+        let r = map_run(
+            hand_run(
+                End::Spawn(std::io::Error::from(std::io::ErrorKind::NotFound)),
+                Leader::NotSpawned,
+                thegn_proc::Capture::default(),
+            ),
+            true,
+        );
+        assert!(
+            matches!(&r, Err(CaptureError::Spawn(e)) if e.kind() == std::io::ErrorKind::NotFound),
+            "{r:?}"
+        );
+
+        let r = map_run(
+            hand_run(End::Cancelled, Leader::Reaped(bad), out(b"", false)),
+            true,
+        );
+        assert!(matches!(r, Err(CaptureError::Cancelled)), "{r:?}");
+
+        let r = map_run(
+            hand_run(End::TimedOut, Leader::Reaped(bad), out(b"part", false)),
+            true,
+        );
+        assert!(matches!(r, Err(CaptureError::Timeout)), "{r:?}");
+
+        let r = map_run(
+            hand_run(
+                End::OutputLimit(Which::Stdout),
+                Leader::Reaped(bad),
+                out(b"head", true),
+            ),
+            true,
+        );
+        assert!(
+            matches!(&r, Err(CaptureError::Capped(b)) if b == b"head"),
+            "{r:?}"
+        );
+
+        let r = map_run(
+            hand_run(
+                End::Supervise(std::io::Error::other("waitid")),
+                Leader::NotSpawned,
+                thegn_proc::Capture::default(),
+            ),
+            true,
+        );
+        assert!(matches!(r, Err(CaptureError::Failed)), "{r:?}");
+
+        // Exited on its own right at the cap: still truncated, even on success.
+        let r = map_run(
+            hand_run(End::LeaderExited, Leader::Reaped(ok), out(b"cap", true)),
+            true,
+        );
+        assert!(
+            matches!(&r, Err(CaptureError::Capped(b)) if b == b"cap"),
+            "{r:?}"
+        );
+
+        let r = map_run(
+            hand_run(End::LeaderExited, Leader::Reaped(ok), out(b"png", false)),
+            true,
+        );
+        assert!(matches!(&r, Ok(b) if b == b"png"), "{r:?}");
+
+        // Quiet run: no stdout, success.
+        let r = map_run(
+            hand_run(
+                End::LeaderExited,
+                Leader::Reaped(ok),
+                thegn_proc::Capture::default(),
+            ),
+            false,
+        );
+        assert!(matches!(&r, Ok(b) if b.is_empty()), "{r:?}");
+
+        let r = map_run(
+            hand_run(End::LeaderExited, Leader::Reaped(bad), out(b"", false)),
+            true,
+        );
+        assert!(matches!(r, Err(CaptureError::Failed)), "{r:?}");
+
+        let r = map_run(
+            hand_run(End::LeaderExited, Leader::Detached, out(b"x", false)),
+            true,
+        );
+        assert!(matches!(r, Err(CaptureError::Failed)), "{r:?}");
+
+        let r = map_run(
+            hand_run(
+                End::LeaderExited,
+                Leader::ReapFailed(std::io::Error::other("reap")),
+                out(b"x", false),
+            ),
+            true,
+        );
+        assert!(matches!(r, Err(CaptureError::Failed)), "{r:?}");
     }
 }
