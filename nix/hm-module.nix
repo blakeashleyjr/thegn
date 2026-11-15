@@ -351,7 +351,6 @@ self: {
     notifications.sound.suppress_focused = cfg.notificationsSoundSuppressFocused;
     notifications.sound.volume = cfg.notificationsSoundVolume;
     notifications.sound.min_priority = cfg.notificationsSoundMinPriority;
-    notifications.sound.per_priority = cfg.notificationsSoundPerPriority;
     notifications.sound.per_kind = cfg.notificationsSoundPerKind;
     activity.enabled = cfg.activityEnabled;
     activity.red_requires_agent = cfg.activityRedRequiresAgent;
@@ -1273,13 +1272,6 @@ in {
       type = lib.types.nullOr (lib.types.enum ["info" "notice" "alert"]);
       default = null;
       description = "Lowest notification priority that plays a sound. Unset (null) = the binary's default.";
-    };
-
-    notificationsSoundPerPriority = lib.mkOption {
-      type = lib.types.nullOr (lib.types.attrsOf lib.types.str);
-      default = null;
-      example = lib.literalExpression ''{ alert = "bell"; }'';
-      description = "Per-priority sound overrides. Keys are priorities (info, notice, alert), values are sound references; invalid entries are refused at load. Unset (null) = the binary's default.";
     };
 
     notificationsSoundPerKind = lib.mkOption {
