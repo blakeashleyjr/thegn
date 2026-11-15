@@ -1078,6 +1078,34 @@ fn refresh_client(
     thegn_svc::ci::provider_and_context_for_deadline(loc, cfg, cancel, budget.deadline)
 }
 
+/// Branch to filter the refresh's run list by. Outer `None` means skip the
+/// refresh (budget spent or cancelled); the remote read is cancellable.
+fn remote_branch_for_refresh(
+    loc: &thegn_core::remote::GitLoc,
+    budget: &CallBudget,
+    cancel: &std::sync::atomic::AtomicBool,
+) -> Option<Option<String>> {
+    if budget.exhausted() {
+        return None;
+    }
+    let branch = if loc.is_remote() {
+        match loc.git_text_cancellable(&["rev-parse", "--abbrev-ref", "HEAD"], cancel) {
+            Ok(branch) if !branch.is_empty() => Some(branch),
+            Ok(_) => None,
+            Err(error) => {
+                tracing::debug!(%error, "could not read remote worktree branch for CI refresh");
+                None
+            }
+        }
+    } else {
+        local_ci_cache_branch(loc)
+    };
+    if cancel.load(Ordering::Relaxed) {
+        return None;
+    }
+    Some(branch)
+}
+
 /// The blocking body of a CI cache refresh for one worktree location. Returns
 /// whether a fetch was actually attempted (`false` when skipped by the
 /// freshness/backoff guards or when no provider resolves).
@@ -1122,17 +1150,8 @@ fn refresh_ci_cache_for(
     let Some((client, context)) = refresh_client(loc, cfg, Arc::clone(&cancel), budget) else {
         return false;
     };
-    let branch = if loc.is_remote() {
-        match loc.git_text(&["rev-parse", "--abbrev-ref", "HEAD"]) {
-            Ok(branch) if !branch.is_empty() => Some(branch),
-            Ok(_) => None,
-            Err(error) => {
-                tracing::debug!(%error, "could not read remote worktree branch for CI refresh");
-                None
-            }
-        }
-    } else {
-        local_ci_cache_branch(loc)
+    let Some(branch) = remote_branch_for_refresh(loc, budget, &cancel) else {
+        return false;
     };
     if !budget.take() {
         return false;
@@ -1992,6 +2011,22 @@ mod tests {
         assert_eq!(budget.bytes_remaining, MAX_LOG_INGEST_BYTES);
         assert!(budget.deadline.is_some());
         assert!(!budget.exhausted());
+    }
+
+    #[test]
+    fn refresh_skips_the_remote_prelude_when_the_budget_is_spent() {
+        let loc = thegn_core::remote::GitLoc::Local(std::path::PathBuf::from("/nonexistent"));
+        let spent = CallBudget {
+            remaining: 0,
+            bytes_remaining: MAX_LOG_INGEST_BYTES,
+            deadline: None,
+        };
+        let cancel = std::sync::atomic::AtomicBool::new(false);
+        assert_eq!(remote_branch_for_refresh(&loc, &spent, &cancel), None);
+
+        let live = CallBudget::per_refresh();
+        let cancelled = std::sync::atomic::AtomicBool::new(true);
+        assert_eq!(remote_branch_for_refresh(&loc, &live, &cancelled), None);
     }
 
     #[test]
