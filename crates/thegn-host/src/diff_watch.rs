@@ -425,7 +425,7 @@ fn no_tracked_ignored(cwd: &Path) -> bool {
     }
 }
 
-fn trace_git_read_failure(cwd: &Path, command: &str, error: &thegn_core::git_run::GitTextError) {
+fn trace_git_read_failure(cwd: &Path, command: &str, error: &impl std::fmt::Display) {
     tracing::debug!(
         target: "thegn::diff",
         worktree = %cwd.display(),
@@ -703,23 +703,23 @@ fn build_ignore_rules(
 }
 
 fn resolve_git_dirs(cwd: &Path) -> (Option<PathBuf>, Option<PathBuf>) {
-    let git_dir = match crate::cmd::dispatch::git_text_local(
+    let git_dir = match thegn_core::util::git_out_path(
         cwd,
         &["rev-parse", "--path-format=absolute", "--git-dir"],
     ) {
-        Ok(path) if !path.is_empty() => Some(PathBuf::from(path)),
-        Ok(_) => None,
+        Ok(path) => Some(path),
+        Err(thegn_core::util::GitPathError::Empty) => None,
         Err(error) => {
             trace_git_read_failure(cwd, "rev-parse --git-dir", &error);
             None
         }
     };
-    let common_dir = match crate::cmd::dispatch::git_text_local(
+    let common_dir = match thegn_core::util::git_out_path(
         cwd,
         &["rev-parse", "--path-format=absolute", "--git-common-dir"],
     ) {
-        Ok(path) if !path.is_empty() => Some(PathBuf::from(path)),
-        Ok(_) => None,
+        Ok(path) => Some(path),
+        Err(thegn_core::util::GitPathError::Empty) => None,
         Err(error) => {
             trace_git_read_failure(cwd, "rev-parse --git-common-dir", &error);
             None
