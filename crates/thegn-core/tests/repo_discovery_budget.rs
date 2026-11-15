@@ -108,7 +108,7 @@ fn max_repositories_budget_truncates_but_keeps_found_repos() {
 fn max_single_path_bytes_budget_truncates_on_a_deep_path() {
     let temp = tempfile::tempdir().unwrap();
     let root = temp.path().to_path_buf();
-    make_repo(&root.join("a/b/c/d/repo"));
+    make_repo(&root.join("a/b/repo"));
     let limit = root.to_string_lossy().len();
     let (report, found) = walk(
         &config(&root),
