@@ -345,7 +345,7 @@ mod tests {
         assert_eq!(meta.ahead_base, Some(3));
         assert_eq!(meta.behind_base, Some(1));
 
-        let r = super::native_diff::open(&repo.dir).unwrap();
+        let r = super::super::native_diff::open(&repo.dir).unwrap();
         let h = r.rev_parse_single("feature").unwrap().detach();
         let m = r.rev_parse_single("main").unwrap().detach();
         assert_eq!(count_excluding(&r, h, m, 2).unwrap(), 2);
