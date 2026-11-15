@@ -134,6 +134,9 @@ impl CpuFreqCollector {
     fn sys(&self, path: &str) -> PathBuf {
         self.root.join("sys").join(path)
     }
+    fn proc_sys(&self, path: &str) -> PathBuf {
+        self.root.join("proc/sys").join(path)
+    }
     fn dynamic(&mut self, path: PathBuf) -> Attr {
         Attr::open(path, &mut self.held, self.cap)
     }
@@ -239,6 +242,14 @@ impl Collector for CpuFreqCollector {
             policy.highest_perf = read_static(path.join("amd_pstate_highest_perf"))
                 .as_deref()
                 .and_then(parse_u32);
+            if policy.highest_perf.is_none() {
+                let cpu = first_cpu(&policy);
+                policy.highest_perf = read_static(self.sys(&format!(
+                    "devices/system/cpu/cpu{cpu}/acpi_cppc/highest_perf"
+                )))
+                .as_deref()
+                .and_then(parse_u32);
+            }
             if first_epp_choices.is_none() {
                 first_epp_choices =
                     read_static(path.join("energy_performance_available_preferences"))
@@ -293,6 +304,9 @@ impl Collector for CpuFreqCollector {
         let prefcore_static = read_static(self.sys("devices/system/cpu/amd_pstate/prefcore"))
             .as_deref()
             .and_then(parse_flag);
+        let itmt_static = read_static(self.proc_sys("kernel/sched_itmt_enabled"))
+            .as_deref()
+            .and_then(parse_flag);
         let boost_path = base.join("boost");
         let no_turbo_path = self.sys("devices/system/cpu/intel_pstate/no_turbo");
         let profile = profile_path.exists().then(|| self.dynamic(profile_path));
@@ -304,6 +318,7 @@ impl Collector for CpuFreqCollector {
             amd_prefcore: prefcore_static,
             platform_profile_choices: profile_choices,
             epp_choices: first_epp_choices.unwrap_or_default(),
+            itmt: itmt_static,
             ..PowerPolicy::default()
         };
         self.power_files = Some(PowerFiles {
@@ -618,6 +633,54 @@ mod tests {
             .sample(&crate::collect::TickCtx { tick: 5, now_ms: 5 }, &mut frame)
             .unwrap();
         assert_eq!(frame.parts.cpu_freq.power.boost, Some(false));
+    }
+
+    fn discovered(root: &std::path::Path) -> crate::collect::frame::MonitorFrame {
+        let mut collector = CpuFreqCollector::new(root.to_path_buf());
+        collector.discover(&Env::default());
+        let mut frame = crate::collect::frame::MonitorFrame::default();
+        collector
+            .sample(&crate::collect::TickCtx { tick: 0, now_ms: 0 }, &mut frame)
+            .unwrap();
+        frame
+    }
+    fn itmt_file(root: &std::path::Path, text: &str) {
+        let dir = root.join("proc/sys/kernel");
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join("sched_itmt_enabled"), text).unwrap();
+    }
+
+    #[test]
+    fn itmt_flag_reads_one_zero_absent_and_garbage() {
+        for (text, want) in [
+            (Some("1\n"), Some(true)),
+            (Some("0\n"), Some(false)),
+            (None, None),
+            (Some("zzz"), None),
+        ] {
+            let root = tempdir().unwrap();
+            policy(root.path(), 0, "0-3", "3000000");
+            if let Some(text) = text {
+                itmt_file(root.path(), text);
+            }
+            let frame = discovered(root.path());
+            assert_eq!(frame.parts.cpu_freq.power.itmt, want, "{text:?}");
+        }
+    }
+
+    #[test]
+    fn cppc_highest_perf_is_fallback_behind_amd_file() {
+        let root = tempdir().unwrap();
+        policy(root.path(), 0, "2-3", "3000000");
+        let cppc = root.path().join("sys/devices/system/cpu/cpu2/acpi_cppc");
+        fs::create_dir_all(&cppc).unwrap();
+        fs::write(cppc.join("highest_perf"), "236\n").unwrap();
+        let frame = discovered(root.path());
+        assert_eq!(frame.parts.cpu_freq.policies[0].highest_perf, Some(236));
+        let dir = root.path().join("sys/devices/system/cpu/cpufreq/policy0");
+        fs::write(dir.join("amd_pstate_highest_perf"), "166\n").unwrap();
+        let frame = discovered(root.path());
+        assert_eq!(frame.parts.cpu_freq.policies[0].highest_perf, Some(166));
     }
 
     #[test]
