@@ -14460,6 +14460,10 @@ async fn event_loop<T: Terminal>(
         // Fold-actor results (batch fold + agent-driven drain): toast outcomes,
         // patch queue rows in place, route settled transitions to the inbox, and
         // re-hydrate so the advanced tip and cleared dots show immediately.
+        // THE-657: the drive and PR-queue drains are budgeted per drain (fresh
+        // budget each, lossless); leftovers re-arm the one wake below.
+        let mq_more;
+        let prq_more;
         {
             let mut mq_ctx = crate::handlers::merge_queue::DrainCtx {
                 model: &mut model,
@@ -14476,7 +14480,13 @@ async fn event_loop<T: Terminal>(
                 waker: &waker,
             };
             crate::handlers::merge_queue::drain_fold_results(&mut fold_rx, &mut mq_ctx);
-            crate::handlers::merge_queue::drain_drive_msgs(&mut drive_rx, &mut mq_ctx);
+            let mut mq_budget = drain_budget(std::time::Instant::now(), !pending_input.is_empty());
+            mq_more = crate::handlers::merge_queue::drain_drive_msgs(
+                &mut drive_rx,
+                &mut mq_ctx,
+                &mut mq_budget,
+                &mut ingress_rotation,
+            );
         }
         {
             let mut prq_ctx = crate::handlers::pr_queue::PrqDrainCtx {
@@ -14488,7 +14498,13 @@ async fn event_loop<T: Terminal>(
                 want_model_refresh: &mut want_model_refresh,
                 loop_perf: &mut loop_perf,
             };
-            crate::handlers::pr_queue::drain_msgs(&mut prq_rx, &mut prq_ctx);
+            let mut prq_budget = drain_budget(std::time::Instant::now(), !pending_input.is_empty());
+            prq_more = crate::handlers::pr_queue::drain_msgs(
+                &mut prq_rx,
+                &mut prq_ctx,
+                &mut prq_budget,
+                &mut ingress_rotation,
+            );
         }
         // Plugin runtime messages: apply verbs to the per-plugin runtimes and
         // map the aggregate plugin damage to the narrowest compositor channel.
@@ -14980,7 +14996,7 @@ async fn event_loop<T: Terminal>(
         }
         // THE-657: a budgeted source that stopped with work queued re-arms
         // exactly one wake, so the remainder drains on the next iteration.
-        if (clone_more || refresh_more)
+        if (clone_more || refresh_more || mq_more || prq_more)
             && let Err(e) = waker.wake()
         {
             tracing::debug!(target: "thegn::ingress", "ingress re-arm waker pulse failed: {e}");
