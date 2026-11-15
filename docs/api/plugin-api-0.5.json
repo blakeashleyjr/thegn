@@ -1550,7 +1550,8 @@
         "Dim",
         "Good",
         "Warn",
-        "Bad"
+        "Bad",
+        "Unknown"
       ],
       "type": "string"
     },

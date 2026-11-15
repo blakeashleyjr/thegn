@@ -92,6 +92,38 @@ pub enum DetailField {
     Author,
 }
 
+/// One entry in the ordered sidebar detail list.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DetailEntry {
+    /// A field supplied by thegn itself.
+    Builtin(DetailField),
+    /// A field supplied by a resident plugin. The plugin need not be installed
+    /// on this machine; an absent producer simply contributes no value.
+    Plugin { plugin: String, field: String },
+}
+
+pub(crate) fn parse_entry(value: &str) -> Option<DetailEntry> {
+    let value = value.trim();
+    if let Some(rest) = value.strip_prefix("plugin:") {
+        let (plugin, field) = rest.split_once('/')?;
+        let valid_plugin = !plugin.is_empty()
+            && plugin.len() <= 64
+            && plugin
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || "._-".contains(c));
+        let valid_field = !field.is_empty()
+            && field.len() <= 32
+            && field
+                .chars()
+                .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || "_-".contains(c));
+        return (valid_plugin && valid_field).then(|| DetailEntry::Plugin {
+            plugin: plugin.to_string(),
+            field: field.to_string(),
+        });
+    }
+    DetailField::parse(value).map(DetailEntry::Builtin)
+}
+
 impl DetailField {
     /// Parse a canonical detail-field name.
     pub fn parse(value: &str) -> Option<Self> {
@@ -268,6 +300,8 @@ pub struct UiConfig {
     /// Template for the commits-behind badge; `{n}` is replaced by the count.
     pub sidebar_behind_badge: String,
     /// Ordered detail fields; unknown names are warned about and ignored.
+    /// Plugin fields use `plugin:<plugin>/<field>` where the plugin id is
+    /// `[A-Za-z0-9._-]{1,64}` and the field is `[a-z0-9_-]{1,32}`.
     pub sidebar_detail_fields: Vec<String>,
     /// Lead the focused detail line with the branch name.
     pub sidebar_detail_branch: bool,
@@ -339,23 +373,35 @@ impl UiConfig {
     /// Resolve the ordered detail list, dropping unknown and duplicate names.
     /// Legacy field toggles remain an AND gate for their corresponding fields.
     pub fn detail_fields_resolved(&self) -> Vec<DetailField> {
+        self.detail_entries_resolved()
+            .into_iter()
+            .filter_map(|entry| match entry {
+                DetailEntry::Builtin(field) => Some(field),
+                DetailEntry::Plugin { .. } => None,
+            })
+            .collect()
+    }
+
+    /// Resolve the ordered detail list, retaining valid plugin entries even
+    /// when their producer is not installed. Duplicate built-in and plugin
+    /// entries are dropped while preserving the first occurrence.
+    pub fn detail_entries_resolved(&self) -> Vec<DetailEntry> {
         let mut resolved = Vec::new();
         for value in &self.sidebar_detail_fields {
-            let Some(field) = DetailField::parse(value) else {
+            let Some(entry) = parse_entry(value) else {
                 config_warn(&format!(
-                    "ui.sidebar_detail_fields: unknown field {value:?}; expected one of: {}",
-                    DetailField::valid_names().join(", ")
+                    "ui.sidebar_detail_fields: unknown field {value:?}; expected a built-in name or plugin:<name>/<field>"
                 ));
                 continue;
             };
-            let enabled = match field {
-                DetailField::Branch => self.sidebar_detail_branch,
-                DetailField::BranchStat => self.sidebar_detail_branch_stat,
-                DetailField::Pr => self.sidebar_detail_pr,
-                _ => true,
+            let enabled = match entry {
+                DetailEntry::Builtin(DetailField::Branch) => self.sidebar_detail_branch,
+                DetailEntry::Builtin(DetailField::BranchStat) => self.sidebar_detail_branch_stat,
+                DetailEntry::Builtin(DetailField::Pr) => self.sidebar_detail_pr,
+                DetailEntry::Builtin(_) | DetailEntry::Plugin { .. } => true,
             };
-            if enabled && !resolved.contains(&field) {
-                resolved.push(field);
+            if enabled && !resolved.contains(&entry) {
+                resolved.push(entry);
             }
         }
         resolved
@@ -541,6 +587,45 @@ mod tests {
             );
         }
         assert_eq!(DetailField::parse(" Branch "), Some(DetailField::Branch));
+    }
+
+    #[test]
+    fn detail_entries_parse_plugin_syntax_and_preserve_order() {
+        let cfg: UiConfig = toml::from_str(
+            r#"sidebar_detail_fields = ["age", "plugin:ci/check", "branch", "plugin:ci/check", "plugin:missing/badge"]"#,
+        )
+        .unwrap();
+        assert_eq!(
+            cfg.detail_entries_resolved(),
+            vec![
+                DetailEntry::Builtin(DetailField::Age),
+                DetailEntry::Plugin {
+                    plugin: "ci".into(),
+                    field: "check".into()
+                },
+                DetailEntry::Builtin(DetailField::Branch),
+                DetailEntry::Plugin {
+                    plugin: "missing".into(),
+                    field: "badge".into()
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn detail_entries_drop_malformed_plugin_values() {
+        let long_id = "a".repeat(200);
+        let cfg: UiConfig = toml::from_str(&format!(
+            "sidebar_detail_fields = [\"plugin:\", \"plugin:a\", \"plugin:a/\", \"plugin:/field\", \"plugin:A/UPPER\", \"plugin:{long_id}/field\", \"plugin:ok/field\"]"
+        ))
+        .unwrap();
+        assert_eq!(
+            cfg.detail_entries_resolved(),
+            vec![DetailEntry::Plugin {
+                plugin: "ok".into(),
+                field: "field".into()
+            }]
+        );
     }
 
     #[test]
