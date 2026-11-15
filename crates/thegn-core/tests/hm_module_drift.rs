@@ -1875,16 +1875,33 @@ fn float_range(path: &str) -> Option<(f64, f64)> {
         .find_map(|(candidate, min, max)| (*candidate == path).then_some((*min, *max)))
 }
 
-fn float_key_errors(path: &str, value: &str) -> Vec<String> {
+/// `(errors, warnings)` naming `path` for a one-key config body.
+fn float_key_diagnostics(path: &str, value: &str) -> (Vec<String>, Vec<String>) {
+    use thegn_core::config_validate::{ValidationSeverity, validate_diagnostics};
     let (section, key) = path.split_once('.').expect("dotted float key");
-    thegn_core::config_validate::validate_str(&format!("[{section}]\n{key} = {value}\n"))
-        .into_iter()
-        .filter(|error| error.contains(path))
-        .collect()
+    let mut errors = Vec::new();
+    let mut warnings = Vec::new();
+    for diagnostic in validate_diagnostics(&format!("[{section}]\n{key} = {value}\n")) {
+        if !diagnostic.message.contains(path) {
+            continue;
+        }
+        match diagnostic.severity {
+            ValidationSeverity::Error => errors.push(diagnostic.message),
+            ValidationSeverity::Warning => warnings.push(diagnostic.message),
+        }
+    }
+    (errors, warnings)
 }
 
+/// The Rust-validated float display keys WARN (never refuse startup) on an
+/// out-of-range or non-finite value; the schema-ranged `stats.refresh_secs`
+/// keeps its existing error. Endpoints produce nothing either way.
 #[test]
 fn pinned_float_ranges_match_the_rust_validators() {
+    let warn_only: BTreeSet<&str> = thegn_core::config_validate::FLOAT_KEY_RANGES
+        .iter()
+        .map(|(path, _, _)| *path)
+        .collect();
     for (path, min, max) in thegn_core::config_validate::FLOAT_KEY_RANGES {
         assert_eq!(
             float_range(path),
@@ -1894,17 +1911,43 @@ fn pinned_float_ranges_match_the_rust_validators() {
     }
     for (path, min, max) in FLOAT_RANGES {
         for accepted in [*min, *max] {
-            let errors = float_key_errors(path, &format!("{accepted:?}"));
+            let (errors, warnings) = float_key_diagnostics(path, &format!("{accepted:?}"));
             assert!(errors.is_empty(), "{path} = {accepted}: {errors:?}");
+            assert!(warnings.is_empty(), "{path} = {accepted}: {warnings:?}");
         }
-        for rejected in [
+        for out_of_range in [
             format!("{:?}", min - 0.001),
             format!("{:?}", max + 0.001),
             "nan".to_string(),
             "inf".to_string(),
         ] {
-            let errors = float_key_errors(path, &rejected);
-            assert!(!errors.is_empty(), "{path} = {rejected} must be rejected");
+            let (errors, warnings) = float_key_diagnostics(path, &out_of_range);
+            if warn_only.contains(path) {
+                // TOML `nan`/`inf` have no JSON number, so the schema walk's
+                // pre-existing type check still names them ("expected number,
+                // got null"); the range validator itself never errors.
+                let finite = out_of_range != "nan" && out_of_range != "inf";
+                assert!(
+                    errors
+                        .iter()
+                        .all(|error| { !finite && error.contains("expected number, got null") }),
+                    "{path} = {out_of_range} must not refuse on range: {errors:?}"
+                );
+                assert_eq!(
+                    warnings.len(),
+                    1,
+                    "{path} = {out_of_range} must warn: {warnings:?}"
+                );
+                assert!(
+                    warnings[0].contains(&format!("{min}..={max}")),
+                    "{warnings:?}"
+                );
+            } else {
+                assert!(
+                    !errors.is_empty(),
+                    "{path} = {out_of_range} must be rejected"
+                );
+            }
         }
     }
 }
