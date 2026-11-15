@@ -1,6 +1,6 @@
 //! Allocation-free parsers for Linux CPU frequency sysfs values.
 //! Numeric values accept digits only, stricter than the old `str::parse` shim's leading `+`.
-use super::super::model::cpu_policy::{CpuSet, SysToken, TokenList};
+use super::super::model::cpu_policy::{CoreClass, CpuSet, SysToken, TokenList};
 
 pub fn parse_khz(bytes: &[u8]) -> Option<u64> {
     let value = parse_u64_trimmed(bytes)?;
@@ -8,6 +8,27 @@ pub fn parse_khz(bytes: &[u8]) -> Option<u64> {
 }
 pub fn parse_u32(bytes: &[u8]) -> Option<u32> {
     u32::try_from(parse_u64_trimmed(bytes)?).ok()
+}
+/// Scheduler `cpu_capacity`: decimal digits in `1..=1024`, surrounding ASCII
+/// whitespace tolerated. Empty, signed, hex, out-of-range and overflowing
+/// values are rejected.
+pub fn parse_capacity(bytes: &[u8]) -> Option<u16> {
+    u16::try_from(parse_u64_trimmed(bytes)?)
+        .ok()
+        .filter(|value| (1..=1024).contains(value))
+}
+/// Classify one capacity against the smallest and largest capacity seen across
+/// all policies. A machine with a single distinct capacity is homogeneous and
+/// has no classes, so everything is `Unknown`; otherwise the maximum is
+/// `Performance` and anything strictly below it is `Efficiency`.
+pub fn classify_by_capacity(capacity: u16, min_seen: u16, max_seen: u16) -> CoreClass {
+    if min_seen >= max_seen || capacity > max_seen {
+        CoreClass::Unknown
+    } else if capacity == max_seen {
+        CoreClass::Performance
+    } else {
+        CoreClass::Efficiency
+    }
 }
 pub fn parse_flag(bytes: &[u8]) -> Option<bool> {
     match trim(bytes) {
@@ -105,8 +126,52 @@ fn trim(bytes: &[u8]) -> &[u8] {
 
 #[cfg(test)]
 mod tests {
-    use super::{parse_cpu_list, parse_flag, parse_khz, parse_token_list, parse_u32};
-    use crate::collect::model::cpu_policy::CpuSet;
+    use super::{
+        classify_by_capacity, parse_capacity, parse_cpu_list, parse_flag, parse_khz,
+        parse_token_list, parse_u32,
+    };
+    use crate::collect::model::cpu_policy::{CoreClass, CpuSet};
+    #[test]
+    fn capacity_parser_accepts_terminated_and_unterminated_values() {
+        for (input, expected) in [
+            (b"1024".as_slice(), Some(1024)),
+            (b"1024\n", Some(1024)),
+            (b"512 ", Some(512)),
+            (b"512 \n", Some(512)),
+            (b"1", Some(1)),
+            (b"1\n", Some(1)),
+        ] {
+            assert_eq!(parse_capacity(input), expected, "{input:?}");
+        }
+        for bad in [
+            b"".as_slice(),
+            b"\n",
+            b"abc",
+            b"abc\n",
+            b"-5",
+            b"+5",
+            b"0x400",
+            b"0",
+            b"0\n",
+            b"1025",
+            b"99999999999",
+            b"99999999999999999999999",
+            b"5 12",
+        ] {
+            assert_eq!(parse_capacity(bad), None, "{bad:?}");
+        }
+    }
+    #[test]
+    fn capacity_classification_needs_two_distinct_values() {
+        assert_eq!(
+            classify_by_capacity(1024, 512, 1024),
+            CoreClass::Performance
+        );
+        assert_eq!(classify_by_capacity(512, 512, 1024), CoreClass::Efficiency);
+        assert_eq!(classify_by_capacity(768, 512, 1024), CoreClass::Efficiency);
+        assert_eq!(classify_by_capacity(1024, 1024, 1024), CoreClass::Unknown);
+        assert_eq!(classify_by_capacity(2000, 512, 1024), CoreClass::Unknown);
+    }
     #[test]
     fn parsers_cover_frequency_flags_tokens_and_cpu_lists() {
         assert_eq!(parse_khz(b" \t1237661\r\n"), Some(1_237_661));

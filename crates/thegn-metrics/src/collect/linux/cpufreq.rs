@@ -6,9 +6,10 @@ use std::path::{Path, PathBuf};
 use super::procfile::ProcFile;
 use crate::collect::frame::MonitorFrame;
 use crate::collect::health::{Absent, Health};
-use crate::collect::model::cpu_policy::{CpuPolicy, FreqSource, PowerPolicy};
+use crate::collect::model::cpu_policy::{CoreClass, CpuPolicy, CpuSet, FreqSource, PowerPolicy};
 use crate::collect::parse::cpufreq::{
-    parse_cpu_list, parse_flag, parse_khz, parse_token, parse_token_list, parse_u32,
+    classify_by_capacity, parse_capacity, parse_cpu_list, parse_flag, parse_khz, parse_token,
+    parse_token_list, parse_u32,
 };
 use crate::collect::schedule::Cadence;
 use crate::collect::{CollectError, Collector, CollectorId, TickCtx, env::Env};
@@ -136,6 +137,46 @@ impl CpuFreqCollector {
     fn dynamic(&mut self, path: PathBuf) -> Attr {
         Attr::open(path, &mut self.held, self.cap)
     }
+    /// Read a static Intel hybrid cpu list (`cpu_core`/`cpu_atom`); missing or
+    /// invalid lists are `None`.
+    fn intel_list(&self, pmu: &str) -> Option<CpuSet> {
+        let bytes = read_static(self.sys(&format!("devices/{pmu}/cpus")))?;
+        let mut set = CpuSet::default();
+        parse_cpu_list(&bytes, &mut set).then_some(set)
+    }
+    /// Fill `capacity` and `core_class` for every policy. Each attribute is read
+    /// once and closed (no held descriptor). Intel `cpu_core`/`cpu_atom` lists win
+    /// over `cpu_capacity`; a missing or invalid input leaves only that policy
+    /// `Unknown`.
+    fn classify_core_classes(&self, policies: &mut [(CpuPolicy, PathBuf)]) {
+        let core = self.intel_list("cpu_core");
+        let atom = self.intel_list("cpu_atom");
+        let mut min_seen = u16::MAX;
+        let mut max_seen = 0_u16;
+        for (policy, _) in policies.iter_mut() {
+            let cpu = first_cpu(policy);
+            policy.capacity =
+                read_static(self.sys(&format!("devices/system/cpu/cpu{cpu}/cpu_capacity")))
+                    .as_deref()
+                    .and_then(parse_capacity);
+            if let Some(capacity) = policy.capacity {
+                min_seen = min_seen.min(capacity);
+                max_seen = max_seen.max(capacity);
+            }
+        }
+        for (policy, _) in policies.iter_mut() {
+            let cpu = first_cpu(policy);
+            policy.core_class = if core.is_some_and(|set| set.contains(cpu)) {
+                CoreClass::Performance
+            } else if atom.is_some_and(|set| set.contains(cpu)) {
+                CoreClass::Efficiency
+            } else {
+                policy.capacity.map_or(CoreClass::Unknown, |capacity| {
+                    classify_by_capacity(capacity, min_seen, max_seen)
+                })
+            };
+        }
+    }
 }
 
 pub fn slow_due(last: Option<u64>, tick: u64) -> bool {
@@ -197,6 +238,7 @@ impl Collector for CpuFreqCollector {
             }
             policy_dirs.push((policy, path));
         }
+        self.classify_core_classes(&mut policy_dirs);
         // Current frequency is sampled every tick, so reserve held descriptors for
         // every policy before allocating the slower attributes.
         let mut policy_attrs = Vec::with_capacity(policy_dirs.len());
@@ -362,6 +404,12 @@ impl Collector for CpuFreqCollector {
     }
 }
 
+/// The cpu a policy's static per-cpu attributes are read from: its first
+/// related cpu, or the policy number when `related_cpus` was unreadable.
+fn first_cpu(policy: &CpuPolicy) -> u32 {
+    policy.cpus.first().unwrap_or(u32::from(policy.policy))
+}
+
 fn read_static(path: impl AsRef<Path>) -> Option<Vec<u8>> {
     fs::read(path).ok()
 }
@@ -369,6 +417,7 @@ fn read_static(path: impl AsRef<Path>) -> Option<Vec<u8>> {
 #[cfg(test)]
 mod tests {
     use super::{AttrRead, CpuFreqCollector, slow_due};
+    use crate::collect::model::cpu_policy::CoreClass;
     use crate::collect::{
         Collector,
         env::Env,
@@ -668,6 +717,171 @@ mod tests {
         assert!(frame.parts.cpu_freq.policies[0].cpus.contains(3));
         assert_eq!(frame.parts.cpu_freq.policies[1].cpus.first(), Some(4));
         assert!(frame.parts.cpu_freq.any_capped());
+    }
+
+    fn capacity(root: &std::path::Path, cpu: u32, value: &str) {
+        let dir = root.join(format!("sys/devices/system/cpu/cpu{cpu}"));
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join("cpu_capacity"), value).unwrap();
+    }
+    fn sampled(collector: &mut CpuFreqCollector) -> crate::collect::frame::MonitorFrame {
+        let mut frame = crate::collect::frame::MonitorFrame::default();
+        collector
+            .sample(&crate::collect::TickCtx { tick: 0, now_ms: 0 }, &mut frame)
+            .unwrap();
+        frame
+    }
+    fn classes(frame: &crate::collect::frame::MonitorFrame) -> Vec<CoreClass> {
+        frame
+            .parts
+            .cpu_freq
+            .policies
+            .iter()
+            .map(|policy| policy.core_class)
+            .collect()
+    }
+
+    #[test]
+    fn intel_hybrid_cpu_lists_classify_core_and_atom_policies() {
+        let root = tempdir().unwrap();
+        for number in 0..16_u16 {
+            policy(root.path(), number, &number.to_string(), "5000000");
+            // Inverted capacities prove the Intel lists win over cpu_capacity.
+            capacity(
+                root.path(),
+                u32::from(number),
+                if number < 8 { "512\n" } else { "1024" },
+            );
+        }
+        let devices = root.path().join("sys/devices");
+        fs::create_dir_all(devices.join("cpu_core")).unwrap();
+        fs::create_dir_all(devices.join("cpu_atom")).unwrap();
+        fs::write(devices.join("cpu_core/cpus"), "0-7\n").unwrap();
+        fs::write(devices.join("cpu_atom/cpus"), "8-15").unwrap();
+        let mut collector = CpuFreqCollector::new(root.path().to_path_buf());
+        assert_eq!(collector.discover(&Env::default()), Health::Ok);
+        let frame = sampled(&mut collector);
+        let classes = classes(&frame);
+        assert!(classes[..8].iter().all(|c| *c == CoreClass::Performance));
+        assert!(classes[8..].iter().all(|c| *c == CoreClass::Efficiency));
+        assert_eq!(frame.parts.cpu_freq.core_class_counts(), (8, 8));
+        assert_eq!(frame.parts.cpu_freq.policies[0].capacity, Some(512));
+    }
+
+    #[test]
+    fn big_little_capacities_classify_using_each_policy_first_cpu() {
+        let root = tempdir().unwrap();
+        policy(root.path(), 0, "0-3", "2000000");
+        policy(root.path(), 4, "4-7", "3000000");
+        let mut collector = CpuFreqCollector::new(root.path().to_path_buf());
+        collector.discover(&Env::default());
+        let held_without_capacity = collector.held_count();
+        // Only the first cpu of each policy counts: cpus 1-3 claim big capacity.
+        capacity(root.path(), 0, "512\n");
+        for cpu in 1..4 {
+            capacity(root.path(), cpu, "1024\n");
+        }
+        for cpu in 4..8 {
+            capacity(root.path(), cpu, "1024");
+        }
+        assert_eq!(collector.discover(&Env::default()), Health::Ok);
+        assert_eq!(collector.held_count(), held_without_capacity);
+        let frame = sampled(&mut collector);
+        assert_eq!(
+            classes(&frame),
+            [CoreClass::Efficiency, CoreClass::Performance]
+        );
+        assert_eq!(frame.parts.cpu_freq.policies[0].capacity, Some(512));
+        assert_eq!(frame.parts.cpu_freq.policies[1].capacity, Some(1024));
+        assert_eq!(frame.parts.cpu_freq.core_class_counts(), (1, 1));
+    }
+
+    #[test]
+    fn homogeneous_capacities_stay_unknown() {
+        let root = tempdir().unwrap();
+        for number in 0..4_u16 {
+            policy(root.path(), number, &number.to_string(), "3000000");
+            capacity(
+                root.path(),
+                u32::from(number),
+                if number % 2 == 0 { "1024\n" } else { "1024" },
+            );
+        }
+        let mut collector = CpuFreqCollector::new(root.path().to_path_buf());
+        collector.discover(&Env::default());
+        let frame = sampled(&mut collector);
+        assert!(classes(&frame).iter().all(|c| *c == CoreClass::Unknown));
+        assert!(
+            frame
+                .parts
+                .cpu_freq
+                .policies
+                .iter()
+                .all(|policy| policy.capacity == Some(1024))
+        );
+        assert_eq!(frame.parts.cpu_freq.core_class_counts(), (0, 0));
+    }
+
+    #[test]
+    fn missing_capacity_and_cpu_lists_stay_unknown() {
+        let root = tempdir().unwrap();
+        policy(root.path(), 0, "0-3", "3000000");
+        policy(root.path(), 4, "4-7", "2000000");
+        let mut collector = CpuFreqCollector::new(root.path().to_path_buf());
+        assert_eq!(collector.discover(&Env::default()), Health::Ok);
+        let frame = sampled(&mut collector);
+        assert_eq!(classes(&frame), [CoreClass::Unknown, CoreClass::Unknown]);
+        assert!(
+            frame
+                .parts
+                .cpu_freq
+                .policies
+                .iter()
+                .all(|policy| policy.capacity.is_none())
+        );
+    }
+
+    #[test]
+    fn garbage_capacity_leaves_only_that_policy_unknown() {
+        let root = tempdir().unwrap();
+        for number in 0..7_u16 {
+            policy(root.path(), number, &number.to_string(), "3000000");
+        }
+        capacity(root.path(), 0, "1024\n");
+        capacity(root.path(), 1, "512");
+        capacity(root.path(), 2, "abc");
+        capacity(root.path(), 3, "");
+        capacity(root.path(), 4, "-5\n");
+        capacity(root.path(), 5, "99999999999");
+        // A directory where the file should be makes the read itself fail.
+        fs::create_dir_all(root.path().join("sys/devices/system/cpu/cpu6/cpu_capacity")).unwrap();
+        // An invalid Intel list is ignored rather than trusted.
+        fs::create_dir_all(root.path().join("sys/devices/cpu_core")).unwrap();
+        fs::write(root.path().join("sys/devices/cpu_core/cpus"), "3-1\n").unwrap();
+        let mut collector = CpuFreqCollector::new(root.path().to_path_buf());
+        assert_eq!(collector.discover(&Env::default()), Health::Ok);
+        let mut frame = crate::collect::frame::MonitorFrame::default();
+        assert!(
+            collector
+                .sample(&crate::collect::TickCtx { tick: 0, now_ms: 0 }, &mut frame)
+                .is_ok()
+        );
+        assert_eq!(
+            classes(&frame),
+            [
+                CoreClass::Performance,
+                CoreClass::Efficiency,
+                CoreClass::Unknown,
+                CoreClass::Unknown,
+                CoreClass::Unknown,
+                CoreClass::Unknown,
+                CoreClass::Unknown,
+            ]
+        );
+        for policy in &frame.parts.cpu_freq.policies[2..] {
+            assert_eq!(policy.capacity, None);
+            assert_eq!(policy.cur_khz, Some(1_200_000));
+        }
     }
 
     #[derive(Debug)]
