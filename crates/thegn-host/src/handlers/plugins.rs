@@ -550,6 +550,122 @@ pub(crate) fn row_field_values(state: &PluginsState) -> RowFieldSnapshot {
     state.row_fields.clone()
 }
 
+/// Host-originated `on_event` kind sent when a worktree's git glyph scan lands
+/// with a changed result. Delivered straight to the plugin writer, never via
+/// the daemon feed hub.
+pub(crate) const WORKTREE_SCANNED_EVENT: &str = "thegn.worktree_scanned";
+
+/// One changed worktree: `(path, live branch or None for a detached HEAD)`.
+pub(crate) type ScannedWorktree<'a> = (&'a str, Option<&'a str>);
+
+/// Paths of `new` whose glyph value differs from `old` or that `old` lacks, in
+/// path order. A path only in `old` (a removed worktree) is not reported.
+pub(crate) fn changed_scan_paths<'a>(
+    old: &BTreeMap<String, crate::sidebar::GitGlyphs>,
+    new: &'a BTreeMap<String, crate::sidebar::GitGlyphs>,
+) -> Vec<&'a str> {
+    new.iter()
+        .filter(|(path, glyphs)| old.get(*path) != Some(*glyphs))
+        .map(|(path, _)| path.as_str())
+        .collect()
+}
+
+/// A plugin receives `thegn.worktree_scanned` only when it owns an accepted
+/// `WorktreeField`, subscribed to the event, and has a live resident writer.
+/// Computed on demand (no I/O) so it cannot go stale across subscribe, exit
+/// or reload.
+fn scan_recipient(entry: &PluginEntry) -> Option<&SessionWriter> {
+    if entry.disabled {
+        return None;
+    }
+    let writer = entry.writer.as_ref()?;
+    let has_field = entry.contributions.iter().any(|contribution| {
+        contribution.extension_point == ExtensionPoint::WorktreeField
+            && serde_json::from_value::<WorktreeFieldCaps>(contribution.caps.clone()).is_ok()
+    });
+    if !has_field {
+        return None;
+    }
+    let subscribed =
+        entry.runtime.subscriptions().iter().any(
+            |(_, kind)| matches!(kind, EventKind::Custom(name) if name == WORKTREE_SCANNED_EVENT),
+        );
+    subscribed.then_some(writer)
+}
+
+/// Whether any plugin is eligible for `thegn.worktree_scanned`. Lets the
+/// model-swap path skip the glyph diff entirely when nobody listens.
+pub(crate) fn has_scan_subscriber(state: &PluginsState) -> bool {
+    state
+        .plugins
+        .values()
+        .any(|entry| scan_recipient(entry).is_some())
+}
+
+/// Model-swap hook: diff the accepted hydration's glyphs against the
+/// on-screen model and notify eligible plugins of each changed worktree. The
+/// branch is the scan's live `HEAD` (`SidebarStatus::branches`, absent for a
+/// detached HEAD); the incoming model's rows are not rebuilt yet at this point.
+pub(crate) fn emit_changed_scans(state: &PluginsState, old: &FrameModel, new: &FrameModel) {
+    let pairs = changed_scans(old, new);
+    if !pairs.is_empty() {
+        emit_worktree_scanned(state, &pairs);
+    }
+}
+
+/// The changed worktrees of a model swap with their live branch.
+fn changed_scans<'a>(old: &FrameModel, new: &'a FrameModel) -> Vec<ScannedWorktree<'a>> {
+    changed_scan_paths(&old.sidebar_status.git, &new.sidebar_status.git)
+        .into_iter()
+        .map(|path| {
+            let branch = new.sidebar_status.branches.get(path).map(String::as_str);
+            (path, branch)
+        })
+        .collect()
+}
+
+/// Send one coalesced `thegn.worktree_scanned` notification per eligible
+/// plugin per changed worktree. The coalescing key is per worktree, so at
+/// most one frame per (plugin, worktree) is pending and it carries the latest
+/// payload. A full or closed queue drops the event (debug log, no retry): the
+/// next changed scan self-heals. Admission is a mutex push, safe on the loop.
+pub(crate) fn emit_worktree_scanned(state: &PluginsState, changed: &[ScannedWorktree<'_>]) {
+    emit_worktree_scanned_with(state, changed, |writer, key, params| {
+        writer.notify_coalesced(thegn_core::plugin_api::PluginCallback::OnEvent, key, params)
+    });
+}
+
+fn emit_worktree_scanned_with(
+    state: &PluginsState,
+    changed: &[ScannedWorktree<'_>],
+    mut send: impl FnMut(&SessionWriter, &str, serde_json::Value) -> Result<(), SessionFailure>,
+) {
+    if changed.is_empty() {
+        return;
+    }
+    for (plugin, entry) in &state.plugins {
+        let Some(writer) = scan_recipient(entry) else {
+            continue;
+        };
+        for (path, branch) in changed {
+            let key = format!("{WORKTREE_SCANNED_EVENT}\0{path}");
+            let params = serde_json::json!({
+                "kind": EventKind::Custom(WORKTREE_SCANNED_EVENT.into()),
+                "payload": { "path": path, "branch": branch },
+            });
+            if let Err(error) = send(writer, &key, params) {
+                tracing::debug!(
+                    target: "thegn::plugin",
+                    plugin = %plugin,
+                    path = %path,
+                    ?error,
+                    "worktree_scanned event dropped"
+                );
+            }
+        }
+    }
+}
+
 /// The statusbar segments to render: `(label, cached view)` for every
 /// accepted `StatusBarSegment` contribution that has produced a view, in
 /// stable (plugin id, contribution) order.
@@ -3561,6 +3677,244 @@ mod tests {
             vec![EventKind::Custom("custom-0".into())],
         )
         .expect("an existing subscription is accepted at the cap");
+    }
+
+    fn subscribe_scanned(state: &mut PluginsState, plugin: &str) {
+        let mut model = FrameModel::default();
+        drain_one(
+            state,
+            &mut model,
+            PluginMsg::Event {
+                session: 1,
+                plugin: plugin.into(),
+                event: SessionEvent::Message(msg(
+                    "subscribe",
+                    serde_json::json!({ "events": [WORKTREE_SCANNED_EVENT] }),
+                )),
+            },
+        );
+        assert!(
+            state.plugins[plugin].runtime.subscriptions().contains(&(
+                PluginId::new(plugin),
+                EventKind::Custom(WORKTREE_SCANNED_EVENT.into())
+            )),
+            "a plain string event name subscribes the custom kind"
+        );
+    }
+
+    /// Models the svc writer's keyed replacement (owned and tested by
+    /// `notify_coalesced` in thegn-svc) so the host's key choice is observable:
+    /// a frame with a still-queued key replaces it in place; past `cap` new
+    /// keys are refused with `Full`.
+    struct KeyedQueue {
+        cap: usize,
+        frames: Vec<(String, serde_json::Value)>,
+        attempts: usize,
+    }
+
+    impl KeyedQueue {
+        fn new(cap: usize) -> Self {
+            Self {
+                cap,
+                frames: Vec::new(),
+                attempts: 0,
+            }
+        }
+
+        fn send(&mut self, key: &str, params: serde_json::Value) -> Result<(), SessionFailure> {
+            self.attempts += 1;
+            if let Some(slot) = self.frames.iter_mut().find(|(queued, _)| queued == key) {
+                slot.1 = params;
+                return Ok(());
+            }
+            if self.frames.len() >= self.cap {
+                return Err(SessionFailure::Full);
+            }
+            self.frames.push((key.to_owned(), params));
+            Ok(())
+        }
+    }
+
+    fn emit_into(state: &PluginsState, queue: &mut KeyedQueue, changed: &[ScannedWorktree<'_>]) {
+        emit_worktree_scanned_with(state, changed, |_, key, params| queue.send(key, params));
+    }
+
+    #[test]
+    fn changed_scan_paths_reports_new_and_changed_only() {
+        let clean = crate::sidebar::GitGlyphs::default();
+        let dirty = crate::sidebar::GitGlyphs {
+            dirty: true,
+            ..Default::default()
+        };
+        let old = BTreeMap::from([
+            ("/wt/same".to_owned(), clean),
+            ("/wt/changed".to_owned(), clean),
+            ("/wt/removed".to_owned(), clean),
+        ]);
+        let new = BTreeMap::from([
+            ("/wt/same".to_owned(), clean),
+            ("/wt/changed".to_owned(), dirty),
+            ("/wt/added".to_owned(), clean),
+        ]);
+
+        assert_eq!(
+            changed_scan_paths(&old, &new),
+            ["/wt/added", "/wt/changed"],
+            "changed and new paths in path order; equal and removed are silent"
+        );
+        assert!(changed_scan_paths(&new, &new).is_empty());
+    }
+
+    #[test]
+    fn worktree_scanned_coalesces_per_plugin_and_path() {
+        let mut state = state_with(vec![row_spec("p", "review")]);
+        let (runtime, supervisor, session) = test_session();
+        state.plugins.get_mut("p").unwrap().writer = Some(session.writer());
+        subscribe_scanned(&mut state, "p");
+        let mut queue = KeyedQueue::new(8);
+
+        emit_into(&state, &mut queue, &[("/wt/a", Some("old"))]);
+        emit_into(&state, &mut queue, &[("/wt/a", Some("new"))]);
+        assert_eq!(
+            queue.frames.len(),
+            1,
+            "same worktree coalesces to one frame"
+        );
+        assert_eq!(queue.frames[0].1["payload"]["branch"], "new");
+
+        emit_into(&state, &mut queue, &[("/wt/b", None)]);
+        assert_eq!(
+            queue.frames.len(),
+            2,
+            "a second worktree queues its own frame"
+        );
+        assert_eq!(queue.frames[0].1["payload"]["path"], "/wt/a");
+        assert_eq!(queue.frames[1].1["payload"]["path"], "/wt/b");
+        assert_ne!(queue.frames[0].0, queue.frames[1].0);
+        stop_test_session(&runtime, &supervisor, session);
+    }
+
+    #[test]
+    fn worktree_scanned_without_subscriber_is_a_no_op() {
+        // (a) row field, not subscribed; (b) subscribed, no row field.
+        let mut state = state_with(vec![row_spec("a", "review"), seg_spec("b")]);
+        let (runtime, supervisor, session) = test_session();
+        for id in ["a", "b"] {
+            state.plugins.get_mut(id).unwrap().writer = Some(session.writer());
+        }
+        subscribe_scanned(&mut state, "b");
+        let mut queue = KeyedQueue::new(8);
+
+        assert!(!has_scan_subscriber(&state));
+        emit_into(&state, &mut queue, &[("/wt/a", Some("main"))]);
+        assert_eq!(queue.attempts, 0, "no eligible plugin receives the event");
+
+        // (c) row field and subscription, but no live writer.
+        subscribe_scanned(&mut state, "a");
+        state.plugins.get_mut("a").unwrap().writer = None;
+        assert!(!has_scan_subscriber(&state));
+        // (d) all three, but disabled at the restart cap.
+        state.plugins.get_mut("a").unwrap().writer = Some(session.writer());
+        state.plugins.get_mut("a").unwrap().disabled = true;
+        assert!(!has_scan_subscriber(&state));
+
+        state.plugins.get_mut("a").unwrap().disabled = false;
+        assert!(has_scan_subscriber(&state), "all three conditions hold");
+        emit_into(&state, &mut queue, &[("/wt/a", Some("main"))]);
+        assert_eq!(queue.attempts, 1, "only the eligible plugin is sent to");
+        stop_test_session(&runtime, &supervisor, session);
+    }
+
+    #[test]
+    fn worktree_scanned_payload_carries_path_and_branch() {
+        let mut old = FrameModel::default();
+        let mut new = FrameModel::default();
+        let dirty = crate::sidebar::GitGlyphs {
+            dirty: true,
+            ..Default::default()
+        };
+        old.sidebar_status
+            .git
+            .insert("/wt/same".into(), crate::sidebar::GitGlyphs::default());
+        new.sidebar_status
+            .git
+            .insert("/wt/same".into(), crate::sidebar::GitGlyphs::default());
+        new.sidebar_status.git.insert("/wt/branch".into(), dirty);
+        new.sidebar_status.git.insert("/wt/detached".into(), dirty);
+        new.sidebar_status
+            .branches
+            .insert("/wt/branch".into(), "feat/x".into());
+        let pairs = changed_scans(&old, &new);
+        assert_eq!(
+            pairs,
+            [("/wt/branch", Some("feat/x")), ("/wt/detached", None)]
+        );
+
+        let mut state = state_with(vec![row_spec("p", "review")]);
+        let (runtime, supervisor, session) = test_session();
+        state.plugins.get_mut("p").unwrap().writer = Some(session.writer());
+        subscribe_scanned(&mut state, "p");
+        let mut queue = KeyedQueue::new(8);
+        emit_into(&state, &mut queue, &pairs);
+
+        assert_eq!(queue.frames.len(), 2);
+        assert_eq!(
+            queue.frames[0].0,
+            format!("{WORKTREE_SCANNED_EVENT}\0/wt/branch")
+        );
+        assert_eq!(
+            queue.frames[0].1,
+            serde_json::json!({
+                "kind": "thegn.worktree_scanned",
+                "payload": { "path": "/wt/branch", "branch": "feat/x" },
+            })
+        );
+        assert_eq!(
+            queue.frames[1].1["payload"],
+            serde_json::json!({ "path": "/wt/detached", "branch": null }),
+            "a detached HEAD sends a null branch"
+        );
+        stop_test_session(&runtime, &supervisor, session);
+    }
+
+    #[test]
+    fn worktree_scanned_full_queue_drops_without_blocking() {
+        let mut state = state_with(vec![row_spec("p", "review")]);
+        let (runtime, supervisor, session) = test_session();
+        state.plugins.get_mut("p").unwrap().writer = Some(session.writer());
+        subscribe_scanned(&mut state, "p");
+        let paths = (0..5).map(|i| format!("/wt/{i}")).collect::<Vec<_>>();
+        let changed = paths
+            .iter()
+            .map(|path| (path.as_str(), None))
+            .collect::<Vec<ScannedWorktree<'_>>>();
+        let mut queue = KeyedQueue::new(3);
+
+        emit_into(&state, &mut queue, &changed);
+
+        assert_eq!(queue.attempts, 5, "a refused frame does not stop the sweep");
+        let queued = queue
+            .frames
+            .iter()
+            .map(|(_, params)| params["payload"]["path"].as_str().unwrap().to_owned())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            queued,
+            ["/wt/0", "/wt/1", "/wt/2"],
+            "earlier frames stay intact"
+        );
+
+        // The production path against a real writer: well past the per-plugin
+        // cap, admission refuses or accepts but never panics or blocks.
+        let many = (0..thegn_svc::plugin::session::MAX_QUEUED_FRAMES * 2)
+            .map(|i| format!("/wt/many-{i}"))
+            .collect::<Vec<_>>();
+        let many_changed = many
+            .iter()
+            .map(|path| (path.as_str(), Some("main")))
+            .collect::<Vec<ScannedWorktree<'_>>>();
+        emit_worktree_scanned(&state, &many_changed);
+        stop_test_session(&runtime, &supervisor, session);
     }
 
     fn msg(method: &str, params: serde_json::Value) -> RpcMessage {
