@@ -182,9 +182,10 @@ sidebar_commit_badge = "{n}c"
 sidebar_behind_badge = "{n}b"
 # Ordered detail fields: branch, commits, dirty, branch_stat, pr, subject, age,
 # env, sandbox, devcontainer, hibernated, mq, unread, disk. Opt-in names are
-# upstream, stage, activity, and author. Unknown entries warn and are ignored;
-# duplicates are ignored. Empty keeps only the branch fallback. Prefer this
-# list over the legacy toggles below.
+# upstream, stage, activity, author, and stash (repo-wide stash count, hidden
+# at zero). Unknown entries warn and are ignored; duplicates are ignored. Empty
+# keeps only the branch fallback. Prefer this list over the legacy toggles
+# below.
 sidebar_detail_fields = ["branch", "commits", "dirty", "branch_stat", "pr", "subject", "age", "env", "sandbox", "devcontainer", "hibernated", "mq", "unread", "disk"]
 sidebar_detail_branch = true
 sidebar_detail_branch_stat = true
