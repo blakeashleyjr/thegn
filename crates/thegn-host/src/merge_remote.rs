@@ -33,6 +33,8 @@ use thegn_svc::git::{CliGit, PlumbingOps};
 const MAX_BUNDLE_BYTES: u64 = 4 * 1024 * 1024 * 1024;
 const BUNDLE_FREE_SPACE_MARGIN: u64 = 256 * 1024 * 1024;
 const BUNDLE_STDERR_TAIL: usize = 64 * 1024;
+const BUNDLE_CHUNK_BYTES: usize = 64 * 1024;
+const BUNDLE_QUEUE_DEPTH: usize = 4;
 const BUNDLE_READER_GRACE: Duration = Duration::from_millis(100);
 
 thread_local! {
@@ -87,6 +89,14 @@ struct BundleLimits {
     stderr_tail: usize,
     #[cfg(test)]
     reader_delay: Option<Duration>,
+    #[cfg(test)]
+    chunk_metrics: Option<Arc<ChunkMetrics>>,
+}
+
+#[cfg(test)]
+struct ChunkMetrics {
+    outstanding: std::sync::atomic::AtomicUsize,
+    high_water: std::sync::atomic::AtomicUsize,
 }
 
 impl BundleLimits {
@@ -98,6 +108,8 @@ impl BundleLimits {
             stderr_tail: BUNDLE_STDERR_TAIL,
             #[cfg(test)]
             reader_delay: None,
+            #[cfg(test)]
+            chunk_metrics: None,
         }
     }
 }
@@ -546,6 +558,7 @@ fn drain_bundle_output(
     max_bytes: u64,
     started: Instant,
     deadline: Duration,
+    #[cfg(test)] chunk_metrics: Option<&Arc<ChunkMetrics>>,
 ) -> Option<IngestError> {
     loop {
         if crate::fold_cancel::requested() {
@@ -557,7 +570,14 @@ fn drain_bundle_output(
         }
         match rx.recv_timeout(remaining.min(Duration::from_millis(10))) {
             Ok(Ok(chunk)) => {
-                if let Err(error) = write_bundle_chunk(tmp, bytes, max_bytes, &chunk) {
+                let result = write_bundle_chunk(tmp, bytes, max_bytes, &chunk);
+                #[cfg(test)]
+                if let Some(metrics) = chunk_metrics {
+                    metrics
+                        .outstanding
+                        .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+                }
+                if let Err(error) = result {
                     return Some(error);
                 }
             }
@@ -587,13 +607,23 @@ fn reap_and_drain_bundle(
     max_bytes: u64,
     started: Instant,
     deadline: Duration,
+    #[cfg(test)] chunk_metrics: Option<&Arc<ChunkMetrics>>,
 ) -> std::result::Result<std::process::ExitStatus, IngestError> {
     kill_bundle_producer(child);
     let exited = child.wait().map_err(|error| IngestError::Remote {
         code: None,
         stderr_tail: error.to_string(),
     })?;
-    if let Some(error) = drain_bundle_output(rx, tmp, bytes, max_bytes, started, deadline) {
+    if let Some(error) = drain_bundle_output(
+        rx,
+        tmp,
+        bytes,
+        max_bytes,
+        started,
+        deadline,
+        #[cfg(test)]
+        chunk_metrics,
+    ) {
         return Err(error);
     }
     Ok(exited)
@@ -658,19 +688,39 @@ fn stream_bundle(
             });
         }
     };
-    let (tx, rx) = mpsc::sync_channel::<io::Result<Vec<u8>>>(4);
+    let (tx, rx) = mpsc::sync_channel::<io::Result<Vec<u8>>>(BUNDLE_QUEUE_DEPTH);
     let (stdout_done_tx, stdout_done_rx) = mpsc::sync_channel(1);
     #[cfg(test)]
     let reader_delay = limits.reader_delay;
+    #[cfg(test)]
+    let reader_metrics = limits.chunk_metrics.clone();
     let stdout_thread = thegn_core::thread_name::spawn_named("thegn-bndl-out", move || {
         crate::platform::qos::set_self(crate::platform::qos::Qos::Utility);
         let mut reader = stdout;
         #[cfg(test)]
         let mut first_chunk = true;
         loop {
-            let mut chunk = vec![0_u8; 64 * 1024];
+            #[cfg(test)]
+            if let Some(metrics) = reader_metrics.as_ref() {
+                let outstanding = metrics
+                    .outstanding
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+                    + 1;
+                metrics
+                    .high_water
+                    .fetch_max(outstanding, std::sync::atomic::Ordering::Relaxed);
+            }
+            let mut chunk = vec![0_u8; BUNDLE_CHUNK_BYTES];
             match reader.read(&mut chunk) {
-                Ok(0) => break,
+                Ok(0) => {
+                    #[cfg(test)]
+                    if let Some(metrics) = reader_metrics.as_ref() {
+                        metrics
+                            .outstanding
+                            .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+                    }
+                    break;
+                }
                 Ok(count) => {
                     chunk.truncate(count);
                     #[cfg(test)]
@@ -681,11 +731,23 @@ fn stream_bundle(
                         }
                     }
                     if let Err(unsent) = tx.send(Ok(chunk)) {
+                        #[cfg(test)]
+                        if let Some(metrics) = reader_metrics.as_ref() {
+                            metrics
+                                .outstanding
+                                .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+                        }
                         tracing::debug!(target: "thegn::merge", "bundle stdout receiver closed: {unsent:?}");
                         break;
                     }
                 }
                 Err(error) => {
+                    #[cfg(test)]
+                    if let Some(metrics) = reader_metrics.as_ref() {
+                        metrics
+                            .outstanding
+                            .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+                    }
                     if let Err(unsent) = tx.send(Err(error)) {
                         tracing::debug!(target: "thegn::merge", "bundle stdout receiver closed after read error: {unsent:?}");
                     }
@@ -697,6 +759,8 @@ fn stream_bundle(
             tracing::debug!(target: "thegn::merge", "bundle stdout completion receiver closed: {error}");
         }
     });
+    #[cfg(test)]
+    let chunk_metrics = limits.chunk_metrics.clone();
     let stderr_limit = limits.stderr_tail;
     let stderr_tail = Arc::new(Mutex::new((
         Vec::with_capacity(stderr_limit.min(64 * 1024)),
@@ -762,7 +826,14 @@ fn stream_bundle(
         let poll_wait = remaining.min(Duration::from_millis(10));
         match rx.recv_timeout(poll_wait) {
             Ok(Ok(chunk)) => {
-                if let Err(error) = write_bundle_chunk(tmp, &mut bytes, max_bytes, &chunk) {
+                let result = write_bundle_chunk(tmp, &mut bytes, max_bytes, &chunk);
+                #[cfg(test)]
+                if let Some(metrics) = chunk_metrics.as_ref() {
+                    metrics
+                        .outstanding
+                        .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+                }
+                if let Err(error) = result {
                     terminal_error = Some(error);
                     kill_bundle_producer(&mut child);
                     break;
@@ -787,6 +858,8 @@ fn stream_bundle(
                             max_bytes,
                             started,
                             limits.deadline,
+                            #[cfg(test)]
+                            chunk_metrics.as_ref(),
                         ) {
                             Ok(exited) => status = Some(exited),
                             Err(error) => terminal_error = Some(error),
@@ -815,6 +888,8 @@ fn stream_bundle(
                             max_bytes,
                             started,
                             limits.deadline,
+                            #[cfg(test)]
+                            chunk_metrics.as_ref(),
                         ) {
                             Ok(exited) => status = Some(exited),
                             Err(error) => terminal_error = Some(error),
@@ -1262,6 +1337,7 @@ mod tests {
             deadline,
             stderr_tail,
             reader_delay: None,
+            chunk_metrics: None,
         }
     }
 
@@ -1421,6 +1497,63 @@ mod tests {
             Err(IngestError::SizeLimit { cap }) if cap == 1 << 20
         ));
         assert!(started.elapsed() < Duration::from_secs(10));
+        tmp.finish().unwrap();
+        assert_eq!(std::fs::read_dir(root.path()).unwrap().count(), 0);
+    }
+
+    #[test]
+    fn bundle_in_flight_memory_ceiling_is_bounded() {
+        assert!((BUNDLE_QUEUE_DEPTH + 2) * BUNDLE_CHUNK_BYTES <= 1 * 1024 * 1024);
+    }
+
+    #[test]
+    fn bundle_stream_never_writes_past_the_cap_to_disk() {
+        if thegn_core::util::which_path("sh").is_none() {
+            return;
+        }
+        let root = tempfile::tempdir().unwrap();
+        let mut tmp = BundleTemp::new_in(root.path()).unwrap();
+        let cap = BUNDLE_CHUNK_BYTES as u64 + 123;
+        let result = stream_bundle(
+            shell("yes thegn-bundle"),
+            &mut tmp,
+            &small_limits(cap, Duration::from_secs(30), 4096),
+        );
+        assert!(matches!(result, Err(IngestError::SizeLimit { cap: actual }) if actual == cap));
+        assert!(std::fs::metadata(tmp.path()).unwrap().len() <= cap);
+        tmp.finish().unwrap();
+        assert_eq!(std::fs::read_dir(root.path()).unwrap().count(), 0);
+    }
+
+    #[test]
+    fn bundle_stream_slow_consumer_does_not_buffer_unboundedly() {
+        if thegn_core::util::which_path("sh").is_none() {
+            return;
+        }
+        let root = tempfile::tempdir().unwrap();
+        let mut tmp = BundleTemp::new_in(root.path()).unwrap();
+        let chunks = BUNDLE_QUEUE_DEPTH + 8;
+        let output_bytes = chunks * BUNDLE_CHUNK_BYTES;
+        let metrics = Arc::new(ChunkMetrics {
+            outstanding: std::sync::atomic::AtomicUsize::new(0),
+            high_water: std::sync::atomic::AtomicUsize::new(0),
+        });
+        let mut limits = small_limits(
+            ((chunks - 1) * BUNDLE_CHUNK_BYTES + 123) as u64,
+            Duration::from_secs(30),
+            4096,
+        );
+        limits.reader_delay = Some(Duration::from_millis(50));
+        limits.chunk_metrics = Some(Arc::clone(&metrics));
+        let producer = shell(&format!("yes thegn-bundle | head -c {output_bytes}"));
+        let result = stream_bundle(producer, &mut tmp, &limits);
+        assert!(matches!(result, Err(IngestError::SizeLimit { .. })));
+        assert!(
+            metrics
+                .high_water
+                .load(std::sync::atomic::Ordering::Relaxed)
+                <= BUNDLE_QUEUE_DEPTH + 2
+        );
         tmp.finish().unwrap();
         assert_eq!(std::fs::read_dir(root.path()).unwrap().count(), 0);
     }
