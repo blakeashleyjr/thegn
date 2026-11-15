@@ -39,7 +39,6 @@ pub fn parse_commits(out: &str) -> anyhow::Result<Vec<Commit>> {
     if fields.last() == Some(&"") {
         fields.pop();
     }
-    anyhow::ensure!(!fields.is_empty(), "empty commit record terminator");
     anyhow::ensure!(
         fields.len().is_multiple_of(8),
         "malformed commit record field count"
@@ -58,9 +57,8 @@ pub fn parse_commits(out: &str) -> anyhow::Result<Vec<Commit>> {
                 && sha.starts_with(short),
             "malformed abbreviated commit object id"
         );
-        let date = row[4]
-            .parse::<i64>()
-            .map_err(|_| anyhow::anyhow!("malformed commit timestamp"))?;
+        let date = parse_epoch_seconds(row[4])
+            .ok_or_else(|| anyhow::anyhow!("malformed commit timestamp"))?;
         let parents = row[5]
             .split_whitespace()
             .map(str::to_owned)
@@ -81,6 +79,16 @@ pub fn parse_commits(out: &str) -> anyhow::Result<Vec<Commit>> {
         });
     }
     Ok(commits)
+}
+
+/// Parse a numeric `%ct` / `%(committerdate:unix)` field. Git emits plain
+/// decimal digits; a sign (`+100`, `-5`) or any other byte is corruption, which
+/// `i64::from_str` alone would accept. Mirrors the reflog timestamp check.
+fn parse_epoch_seconds(field: &str) -> Option<i64> {
+    if field.is_empty() || !field.bytes().all(|byte| byte.is_ascii_digit()) {
+        return None;
+    }
+    field.parse().ok()
 }
 
 fn valid_oid(oid: &str) -> bool {
@@ -190,11 +198,8 @@ pub fn parse_branches(out: &str) -> anyhow::Result<Vec<BranchInfo>> {
                 "malformed branch object id on row {}",
                 line_no + 1
             );
-            let date = it
-                .next()
-                .ok_or_else(malformed)?
-                .parse()
-                .map_err(|_| malformed())?;
+            let date =
+                parse_epoch_seconds(it.next().ok_or_else(malformed)?).ok_or_else(malformed)?;
             let subject = it.next().ok_or_else(malformed)?.to_string();
             Ok(BranchInfo {
                 name,
@@ -240,7 +245,6 @@ pub fn parse_stashes(out: &str) -> anyhow::Result<Vec<StashEntry>> {
     if fields.last() == Some(&"") {
         fields.pop();
     }
-    anyhow::ensure!(!fields.is_empty(), "empty stash record terminator");
     anyhow::ensure!(
         fields.len().is_multiple_of(4),
         "malformed stash record field count"
@@ -269,7 +273,7 @@ pub fn parse_stashes(out: &str) -> anyhow::Result<Vec<StashEntry>> {
                 "malformed stash object id on row {}",
                 line_no + 1
             );
-            let date = row[2].parse().map_err(|_| malformed())?;
+            let date = parse_epoch_seconds(row[2]).ok_or_else(malformed)?;
             let message = row[3].to_string();
             Ok(StashEntry {
                 index,
@@ -313,11 +317,6 @@ pub fn parse_tags(out: &str) -> anyhow::Result<Vec<TagInfo>> {
             let name = it.next().ok_or_else(malformed)?.to_string();
             let sha = it.next().ok_or_else(malformed)?.to_string();
             let kind = it.next().ok_or_else(malformed)?;
-            anyhow::ensure!(
-                it.next().is_none(),
-                "extra tag fields on row {}",
-                line_no + 1
-            );
             anyhow::ensure!(
                 !name.is_empty() && !sha.is_empty(),
                 "empty tag field on row {}",
@@ -1350,10 +1349,21 @@ mod tests {
     }
 
     #[test]
-    fn commits_signed_timestamp_is_accepted_by_i64_parse() {
-        // Pinned laxity: `i64::from_str` takes a sign, unlike the reflog parser.
-        assert_eq!(parse_commits(&commit_with(4, "+100")).unwrap()[0].date, 100);
-        assert_eq!(parse_commits(&commit_with(4, "-5")).unwrap()[0].date, -5);
+    fn commits_signed_timestamp_is_rejected() {
+        // `%ct` is plain decimal digits; a sign is corruption, as in reflog.
+        let table = vec![
+            (
+                "plus sign",
+                commit_with(4, "+100"),
+                "malformed commit timestamp",
+            ),
+            (
+                "minus sign",
+                commit_with(4, "-5"),
+                "malformed commit timestamp",
+            ),
+        ];
+        assert_rejects(&table, parse_commits);
     }
 
     #[test]
@@ -1414,6 +1424,8 @@ mod tests {
             ),
             ("letters in date", with(2, "12ab"), "malformed stash row 1"),
             ("empty date", with(2, ""), "malformed stash row 1"),
+            ("plus-signed date", with(2, "+100"), "malformed stash row 1"),
+            ("minus-signed date", with(2, "-5"), "malformed stash row 1"),
             (
                 "duplicate selector",
                 format!("{good}{good}"),
@@ -1544,9 +1556,14 @@ mod tests {
     }
 
     #[test]
-    fn branches_signed_date_and_extra_separator_fields_are_accepted() {
-        let base = format!("*{US}main{US}{US}{US}{}{US}+5{US}a{US}b\n", oid(1));
-        let parsed = parse_branches(&base).unwrap();
+    fn branches_signed_date_is_rejected_and_extra_separator_fields_are_accepted() {
+        let row = |date: &str| format!("*{US}main{US}{US}{US}{}{US}{date}{US}a{US}b\n", oid(1));
+        let table = vec![
+            ("plus-signed date", row("+5"), "malformed branch row 1"),
+            ("minus-signed date", row("-5"), "malformed branch row 1"),
+        ];
+        assert_rejects(&table, parse_branches);
+        let parsed = parse_branches(&row("5")).unwrap();
         assert_eq!(parsed[0].date, 5);
         assert_eq!(parsed[0].subject, format!("a{US}b"));
     }

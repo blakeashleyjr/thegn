@@ -153,8 +153,10 @@ fn parse_line(line: &str) -> Option<TodoEntry> {
             .or_else(|| rest.strip_prefix("-c "))
         {
             Some(rest) => commit_entry(TodoAction::FixupC, rest.trim_start()),
-            // A flag with no sha is malformed; let it fall to Unknown.
-            None if rest == "-C" || rest == "-c" => None,
+            // A flag with no sha (`-C`, `-c`, or a cut-short `-`) or any
+            // other flag-looking token is not a sha: it is malformed, so let
+            // it fall to Unknown like every other malformed line.
+            None if rest.starts_with('-') => None,
             None => commit_entry(TodoAction::Fixup, rest),
         },
         "exec" | "x" if !rest.is_empty() => Some(entry(TodoAction::Exec(rest.to_string()))),
@@ -1116,17 +1118,16 @@ mod tests {
     }
 
     #[test]
-    fn parse_todo_truncated_fixup_flag_is_read_as_a_sha_pinned() {
-        // Tolerant by design: a todo cut right after `fixup -` is a Fixup
-        // whose "sha" is the flag stub, not a corrupted real sha.
-        let got = parse_todo("fixup -");
-        assert_eq!(got.len(), 1);
-        assert_eq!(got[0].action, TodoAction::Fixup);
-        assert_eq!(got[0].sha, "-");
-        assert!(matches!(
-            parse_todo("fixup -C")[0].action,
-            TodoAction::Unknown(_)
-        ));
+    fn parse_todo_truncated_fixup_flag_is_preserved_as_unknown() {
+        // Tolerant (never an error), but a todo cut right after `fixup -` or
+        // a flag with no sha never becomes a commit entry with a flag "sha".
+        for line in ["fixup -", "f -", "fixup -C", "fixup -c", "fixup -x"] {
+            assert_eq!(
+                parse_todo(line),
+                vec![entry(TodoAction::Unknown(line.to_string()))],
+                "{line}"
+            );
+        }
     }
 
     #[test]
