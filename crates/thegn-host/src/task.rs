@@ -495,9 +495,11 @@ fn cap_outcome(end: &EndClass, group: thegn_proc::GroupState) -> CapOutcome {
 
 /// The supervision limits for a task run. Backgrounded children (a dev server a
 /// task starts) keep running after the leader exits, as they always have; only
-/// the deadline or a cancel terminates the group. Their pipes are abandoned
-/// `reader_grace` after the leader exits, so the task completes instead of
-/// waiting on output it may never stop producing.
+/// the deadline or a cancel terminates the group. Their output is captured for
+/// `reader_grace` after the leader exits and discarded after that (the pipes
+/// stay drained, so a survivor that keeps logging is not killed by SIGPIPE),
+/// so the task completes instead of waiting on output it may never stop
+/// producing.
 fn task_proc_limits(timeout: Option<Duration>) -> thegn_proc::Limits {
     thegn_proc::Limits {
         stdout: thegn_proc::Stream::Consume,
@@ -2435,10 +2437,14 @@ mod tests {
             (out, started.elapsed())
         });
         let mut waited = 0;
-        while registry().lock().unwrap().get(&slot).is_none() && waited < 100 {
+        while registry().lock().unwrap().get(&slot).is_none() && waited < 500 {
             std::thread::sleep(Duration::from_millis(20));
             waited += 1;
         }
+        assert!(
+            registry().lock().unwrap().contains_key(&slot),
+            "old run never registered"
+        );
         let newer = run_capped(
             "true",
             &GitLoc::Local(wt.clone()),

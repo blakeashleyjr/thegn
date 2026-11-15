@@ -208,6 +208,39 @@ fn set_nonblocking(file: &File) -> io::Result<()> {
     Ok(())
 }
 
+fn set_blocking(file: &File) -> io::Result<()> {
+    // SAFETY: fcntl operates on the live descriptor owned by file.
+    let flags = unsafe { libc::fcntl(file.as_raw_fd(), libc::F_GETFL) };
+    if flags < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: this updates only the status flags on the owned pipe descriptor.
+    if unsafe { libc::fcntl(file.as_raw_fd(), libc::F_SETFL, flags & !libc::O_NONBLOCK) } < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+/// Detach: a survivor still holds this pipe. Closing the read end would SIGPIPE it on its next
+/// write, so a one-shot named thread reads and discards until EOF (the survivor exits or closes
+/// it). If the thread cannot be started the pipe is closed, as before.
+fn sink_abandoned(file: File) {
+    if let Err(_error) = set_blocking(&file) {
+        return;
+    }
+    if let Err(_spawn_error) = std::thread::Builder::new()
+        .name("thegn-proc-sink".to_owned())
+        .spawn(move || {
+            let mut file = file;
+            if let Err(_error) = io::copy(&mut file, &mut io::sink()) {
+                // The survivor's end failed or closed; dropping the read end is all that is left.
+            }
+        })
+    {
+        // Spawn failure drops the closure and with it the pipe: the pre-sink behaviour.
+    }
+}
+
 fn leader_exited(pid: libc::pid_t) -> io::Result<bool> {
     let mut info = std::mem::MaybeUninit::<libc::siginfo_t>::zeroed();
     // SAFETY: waitid initializes siginfo on success. WNOWAIT leaves the leader waitable and pins its pid.
@@ -904,6 +937,18 @@ fn run_inner(
         Ok(None) => {}
         Err(_error) => {}
     }
+    if group == GroupState::Detached {
+        if pipes.out_open
+            && let Some(file) = pipes.stdout.take()
+        {
+            sink_abandoned(file);
+        }
+        if pipes.err_open
+            && let Some(file) = pipes.stderr.take()
+        {
+            sink_abandoned(file);
+        }
+    }
     // A reader-grace OutputLimit overrides the end; the flag only ever accompanies TimedOut.
     let idle_expired = idle_expired && matches!(&end, End::TimedOut);
     let mut run = Run {
@@ -1536,6 +1581,33 @@ mod tests {
         assert_eq!(run.group, GroupState::Drained);
         assert!(run.success());
         assert!(run.stdout.eof);
+    }
+
+    #[test]
+    fn detach_survivor_keeps_writing_after_reader_grace() {
+        let scripts = Scripts::new();
+        let marker = scripts.path().join("alive");
+        let mut cmd = Command::new("sh");
+        cmd.args([
+            "-c",
+            "(sleep 1; echo late; echo late >&2; : > \"$1\") & echo started",
+            "sh",
+        ])
+        .arg(&marker);
+        let run = run(
+            &mut cmd,
+            &detach_limits(Duration::from_secs(10)),
+            &AtomicBool::new(false),
+        );
+        assert_eq!(run.group, GroupState::Detached);
+        let deadline = Instant::now() + Duration::from_secs(20);
+        while !marker.exists() && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(20));
+        }
+        assert!(
+            marker.exists(),
+            "the survivor died writing to an abandoned pipe"
+        );
     }
 
     #[test]
