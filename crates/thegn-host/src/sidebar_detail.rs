@@ -104,14 +104,13 @@ pub(crate) fn format_badge(template: &str, count: u32, fallback: &str) -> String
     } else {
         fallback
     };
-    template.replace("{n}", &count_text(count))
+    display_cell(&template.replace("{n}", &count_text(count)))
 }
 
 fn detail_fields(row: &SidebarRow, disp: &SidebarDisplay, now_unix: i64) -> Vec<Field> {
     if row.kind != RowKind::Worktree {
         return Vec::new();
     }
-    let gl = crate::caps::active_glyphs();
     let branch = row
         .branch
         .as_deref()
@@ -150,22 +149,25 @@ fn detail_fields(row: &SidebarRow, disp: &SidebarDisplay, now_unix: i64) -> Vec<
                     }
                     (!segs.is_empty()).then(|| Field::new(id, segs, 1))
                 }
-                DetailField::Dirty => row
-                    .branch_meta
-                    .as_ref()
-                    .and_then(|meta| meta.dirty_files)
-                    .filter(|count| *count > 0)
-                    .map(|count| {
+                DetailField::Dirty => match row.branch_meta.as_ref().and_then(|m| m.dirty_files) {
+                    Some(count) if count > 0 => Some(Field::new(
+                        id,
+                        vec![seg(
+                            Tok::Hue(theme::Hue::Amber),
+                            format!("{}{}", disp.status_glyph(), count),
+                        )],
+                        1,
+                    )),
+                    Some(_) => None,
+                    None => row.git.is_some_and(|g| g.dirty).then(|| {
                         Field::new(
                             id,
-                            vec![seg(
-                                Tok::Hue(theme::Hue::Amber),
-                                format!("{}{}", disp.status_glyph(), count),
-                            )],
+                            vec![seg(Tok::Hue(theme::Hue::Amber), disp.status_glyph())],
                             1,
                         )
                     }),
-                DetailField::BranchStat => branch_stat_field(row, id),
+                },
+                DetailField::BranchStat if disp.detail_branch_stat => branch_stat_field(row, id),
                 DetailField::Pr if disp.detail_pr => pr_field(row, id),
                 DetailField::Subject => row
                     .branch_meta
@@ -276,11 +278,12 @@ fn fixed_tail_fields(row: &SidebarRow) -> Vec<Field> {
         } else {
             format!("{}{}{}", gl.quote_open, display_cell(env), gl.quote_close)
         };
-        fields.push(Field::new(
-            FieldId::TailEnv,
-            vec![seg(Tok::Slot(S::Faint), text)],
-            1,
-        ));
+        let fg = if row.env_degraded {
+            Tok::Hue(theme::Hue::Amber)
+        } else {
+            Tok::Slot(S::Faint)
+        };
+        fields.push(Field::new(FieldId::TailEnv, vec![seg(fg, text)], 1));
     }
     if let Some(profile) = &row.sandbox_profile {
         fields.push(Field::new(
@@ -509,6 +512,67 @@ mod tests {
     }
 
     #[test]
+    fn badge_templates_strip_control_chars() {
+        let rendered = format_badge("\u{1b}[31m{n}", 2, "{n}c");
+        assert!(!rendered.chars().any(char::is_control), "{rendered:?}");
+    }
+
+    #[test]
+    fn dirty_detail_falls_back_to_git_signal_without_meta() {
+        let mut row = row();
+        row.branch_meta = None;
+        row.git = Some(crate::sidebar::GitGlyphs {
+            dirty: true,
+            ..crate::sidebar::GitGlyphs::default()
+        });
+        let display = SidebarDisplay {
+            detail_fields: vec![DetailField::Dirty],
+            ..SidebarDisplay::default()
+        };
+        let line = compose_detail_line_at(&row, &display, 2_000, 0, 80).unwrap();
+        let Line::Segs(segs) = line else {
+            panic!("detail line is a segment line")
+        };
+        assert!(
+            segs.iter()
+                .any(|segment| segment.text == display.status_glyph())
+        );
+    }
+
+    #[test]
+    fn degraded_environment_badge_is_amber() {
+        let mut row = row();
+        row.env_name = Some("host".into());
+        row.env_degraded = true;
+        let display = SidebarDisplay {
+            detail_fields: Vec::new(),
+            ..SidebarDisplay::default()
+        };
+        let line = compose_detail_line_at(&row, &display, 2_000, 0, 80).unwrap();
+        let Line::Segs(segs) = line else {
+            panic!("detail line is a segment line")
+        };
+        assert!(segs.iter().any(|segment| {
+            segment.text.contains("host") && segment.fg == Tok::Hue(theme::Hue::Amber)
+        }));
+    }
+
+    #[test]
+    fn legacy_branch_stat_toggle_hides_listed_stat() {
+        let mut row = row();
+        row.git = Some(crate::sidebar::GitGlyphs {
+            branch_diff: Some((DiffCount::Exact(1), DiffCount::Exact(2))),
+            ..crate::sidebar::GitGlyphs::default()
+        });
+        let display = SidebarDisplay {
+            detail_fields: vec![DetailField::BranchStat],
+            detail_branch_stat: false,
+            ..SidebarDisplay::default()
+        };
+        assert!(compose_detail_line_at(&row, &display, 2_000, 0, 80).is_none());
+    }
+
+    #[test]
     fn fit_fields_drops_in_priority_order() {
         let ids = [
             FieldId::Branch,
@@ -529,6 +593,22 @@ mod tests {
             assert!(field_width(&fitted) <= budget, "{budget}: {fitted:?}");
             assert!(!fitted.is_empty(), "{budget}");
             assert!(fitted.iter().any(|field| field.id == FieldId::Branch));
+            let got: Vec<FieldId> = fitted.iter().map(|field| field.id).collect();
+            let expected: &[FieldId] = match budget {
+                80 => &[
+                    FieldId::Branch,
+                    FieldId::Commits,
+                    FieldId::Dirty,
+                    FieldId::Pr,
+                    FieldId::BranchStat,
+                    FieldId::TailDisk,
+                ],
+                40 => &[FieldId::Branch, FieldId::Commits, FieldId::Dirty],
+                24 => &[FieldId::Branch, FieldId::Commits],
+                16 | 8 => &[FieldId::Branch],
+                _ => unreachable!(),
+            };
+            assert_eq!(got, expected, "{budget}: {fitted:?}");
         }
     }
 
@@ -545,8 +625,10 @@ mod tests {
     #[test]
     fn detail_fields_order_is_respected() {
         let row = row();
-        let mut display = SidebarDisplay::default();
-        display.detail_fields = vec![DetailField::Subject, DetailField::Branch];
+        let display = SidebarDisplay {
+            detail_fields: vec![DetailField::Subject, DetailField::Branch],
+            ..SidebarDisplay::default()
+        };
         let line = compose_detail_line_at(&row, &display, 2_000, 0, 80).unwrap();
         let Line::Segs(segs) = line else {
             panic!("detail line is a segment line")
@@ -562,9 +644,11 @@ mod tests {
     fn legacy_detail_pr_false_hides_pr_even_when_listed() {
         let mut row = row();
         row.pr_number = Some(42);
-        let mut display = SidebarDisplay::default();
-        display.detail_fields = vec![DetailField::Pr];
-        display.detail_pr = false;
+        let display = SidebarDisplay {
+            detail_fields: vec![DetailField::Pr],
+            detail_pr: false,
+            ..SidebarDisplay::default()
+        };
         assert!(compose_detail_line_at(&row, &display, 2_000, 0, 80).is_none());
     }
 
@@ -585,8 +669,10 @@ mod tests {
     fn subject_truncates_with_ellipsis_and_wide_chars() {
         let mut row = row();
         row.branch_meta.as_mut().unwrap().last_subject = Some("你好世界 retry".into());
-        let mut display = SidebarDisplay::default();
-        display.detail_fields = vec![DetailField::Subject];
+        let display = SidebarDisplay {
+            detail_fields: vec![DetailField::Subject],
+            ..SidebarDisplay::default()
+        };
         let line = compose_detail_line_at(&row, &display, 2_000, 0, 8).unwrap();
         let Line::Segs(segs) = line else {
             panic!("detail line is a segment line")

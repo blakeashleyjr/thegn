@@ -450,6 +450,17 @@ mod tests {
     }
 
     #[test]
+    fn detail_field_names_roundtrip() {
+        for name in DetailField::valid_names() {
+            assert_eq!(
+                DetailField::parse(name).map(DetailField::as_str),
+                Some(name)
+            );
+        }
+        assert_eq!(DetailField::parse(" Branch "), Some(DetailField::Branch));
+    }
+
+    #[test]
     fn detail_when_parses_and_unknown_degrades() {
         assert_eq!(DetailWhen::default(), DetailWhen::Always);
         let cfg: UiConfig = toml::from_str("sidebar_detail_when = \"focused\"").unwrap();
