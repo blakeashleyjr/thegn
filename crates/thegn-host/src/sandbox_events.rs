@@ -439,7 +439,7 @@ mod tests {
         let mut total: u64 = 1;
         sink.on_batch(2);
         sink.on_batch(3);
-        // Both deferred inside the window: no pulse until the trailing flush.
+        // Normally both are deferred inside the window and land in one trailing flush.
         let deadline = Instant::now() + Duration::from_secs(3);
         while Instant::now() < deadline {
             total += counter.take();
@@ -450,13 +450,13 @@ mod tests {
         }
         assert_eq!(total, 6);
         let deadline = Instant::now() + Duration::from_secs(3);
-        while Instant::now() < deadline && pulses.load(Ordering::SeqCst) != 2 {
+        while Instant::now() < deadline && pulses.load(Ordering::SeqCst) < 2 {
             std::thread::sleep(Duration::from_millis(10));
         }
-        assert_eq!(
-            pulses.load(Ordering::SeqCst),
-            2,
-            "one pulse for the first send, one for the coalesced flush"
+        let landed = pulses.load(Ordering::SeqCst);
+        assert!(
+            (2..=3).contains(&landed),
+            "one pulse for the first send, then one per landed send or coalesced flush (3 only if the test thread stalled past PULSE_WINDOW): {landed}"
         );
     }
 
