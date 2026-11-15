@@ -832,3 +832,89 @@ fn owner_drop_supersedes_its_fence() {
 
     assert!(!generation_is_current(Some(&fence)));
 }
+
+fn footprint(containers: u64) -> thegn_core::sandbox_manage::ContainerFootprint {
+    thegn_core::sandbox_manage::ContainerFootprint {
+        containers,
+        ..Default::default()
+    }
+}
+
+fn container_refresh(
+    names: &[&str],
+    footprint: Option<thegn_core::sandbox_manage::ContainerFootprint>,
+) -> ContainerRefresh {
+    ContainerRefresh {
+        containers: names.iter().map(|name| sample_container(name)).collect(),
+        footprint,
+    }
+}
+
+fn container_names(refresh: &ContainerRefresh) -> Vec<String> {
+    refresh.containers.iter().map(|c| c.name.clone()).collect()
+}
+
+#[test]
+fn merge_container_refresh_carries_footprint_forward() {
+    // (carried footprint, next footprint, expected merged footprint)
+    let cases = [
+        // Next has no update: the carried footprint is kept.
+        (Some(footprint(1)), None, Some(footprint(1))),
+        // Next carries its own footprint: it wins.
+        (Some(footprint(1)), Some(footprint(2)), Some(footprint(2))),
+        // Nothing carried: still none, or next's own.
+        (None, None, None),
+        (None, Some(footprint(3)), Some(footprint(3))),
+    ];
+    for (carried, next, expected) in cases {
+        let merged = merge_container_refresh(carried, container_refresh(&["new"], next));
+        assert_eq!(merged.footprint, expected);
+        // The listing itself is always the newest one.
+        assert_eq!(container_names(&merged), vec!["new".to_owned()]);
+    }
+}
+
+#[test]
+fn container_slot_two_publishes_without_take_keep_one_value_and_one_wake() {
+    let wakes = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let counted = Arc::clone(&wakes);
+    let slot =
+        crate::snapshot_slot::SnapshotSlot::with_waker(CONTAINER_SLOT_MAX_BYTES, move || {
+            counted.fetch_add(1, Ordering::Relaxed);
+        });
+    // The producer's shape: run the delivery gate, carry its last footprint
+    // into a footprint-less tick, then publish (never take).
+    let mut delivery = ContainerDelivery::default();
+    let mut publish = |generation: u64, refresh: ContainerRefresh| {
+        let refresh = delivery
+            .filter(refresh, false, false)
+            .expect("changed set is delivered");
+        let merged = merge_container_refresh(delivery.last_footprint, refresh);
+        let bytes = container_refresh_bytes(&merged);
+        slot.publish(generation, merged, bytes)
+    };
+    assert_eq!(
+        publish(1, container_refresh(&["a"], Some(footprint(7)))),
+        crate::snapshot_slot::PublishOutcome::Stored
+    );
+    // The consumer never took the first snapshot: the second replaces it,
+    // keeping its footprint, and does not pulse again.
+    assert_eq!(
+        publish(2, container_refresh(&["b"], None)),
+        crate::snapshot_slot::PublishOutcome::Replaced
+    );
+    assert_eq!(wakes.load(Ordering::Relaxed), 1);
+    let (generation, refresh) = slot.take().expect("latest container snapshot");
+    assert_eq!(generation, 2);
+    assert_eq!(container_names(&refresh), vec!["b".to_owned()]);
+    assert_eq!(refresh.footprint, Some(footprint(7)));
+    assert!(slot.take().is_none());
+}
+
+#[test]
+fn container_refresh_bytes_scales_with_listing() {
+    let small = container_refresh(&["a"], None);
+    let large = container_refresh(&["a", "b", "c"], None);
+    assert!(container_refresh_bytes(&large) > container_refresh_bytes(&small));
+    assert!(container_refresh_bytes(&large) < CONTAINER_SLOT_MAX_BYTES);
+}

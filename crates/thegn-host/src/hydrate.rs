@@ -590,6 +590,11 @@ pub(crate) struct ContainerRefresh {
     pub footprint: Option<thegn_core::sandbox_manage::ContainerFootprint>,
 }
 
+/// Byte cap for the loop's latest-value [`ContainerRefresh`] slot. The
+/// producer refuses (and logs at debug) a snapshot whose estimate exceeds it,
+/// leaving the last value in place.
+pub(crate) const CONTAINER_SLOT_MAX_BYTES: usize = 4 * 1024 * 1024;
+
 /// Daemon registry-row refresh cadence (feeds the far-right chip + modal).
 const DAEMON_REFRESH_INTERVAL: Duration = Duration::from_secs(10);
 
@@ -651,7 +656,8 @@ fn weather_every_slots(poll_secs: Option<u64>) -> Option<u64> {
 /// wakes to service it. This is the staleness backstop; fs-watch + on-switch
 /// refresh handle the common, latency-sensitive cases.
 ///
-/// Also refreshes the container list on a 5s cadence (sent on `container_tx`),
+/// Also refreshes the container list on a 5s cadence (published to the
+/// latest-value `container_slot`),
 /// keeping the sandbox panel live without blocking the hydration path.
 ///
 /// One stats sample plus the wall-clock instant it was taken.
