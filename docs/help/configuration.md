@@ -619,6 +619,17 @@ existing config never stops thegn from starting. A
 critical percentage below the warning percentage is accepted and treated as
 the warning tone.
 
+The `[activity]` float keys `cpu_percent`, `runaway_core_fraction`,
+`runaway_secs`, `quiet_grace_secs`, `resume_grace_secs`, `spawn_grace_secs`,
+`unsolicited_gap_secs` and `output_hint_ttl_secs` are exposed as
+`activityCpuPercent`, `activityRunawayCoreFraction`, `activityRunawaySecs`,
+`activityQuietGraceSecs`, `activityResumeGraceSecs`, `activitySpawnGraceSecs`,
+`activityUnsolicitedGapSecs` and `activityOutputHintTtlSecs`, each a bounded
+`numbers.between` option. thegn warns about a CPU percentage outside 0 through
+100 or a runaway core fraction outside 0.0 through 1.0, or any non-finite
+value, and still loads it. The six seconds keys are durations: a negative,
+non-finite or over-ten-year value is rejected, as before.
+
 The `[disk]` scalar keys are exposed as `diskShowSizes`, `diskWarnThresholdGb`,
 `diskScanIntervalSecs`, `diskMaxScanPerRound`, `diskAutoCleanOnMerge`,
 `diskCleanOnPrClosed`, `diskIdleCleanDays`, `diskGenerationMinAgeDays`,
