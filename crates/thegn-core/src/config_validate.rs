@@ -569,10 +569,16 @@ pub(crate) fn typed_semantic_errors(cfg: &Config, mode: SemanticMode) -> Vec<Str
 /// These are display settings whose consumers already tolerate any value, so
 /// an out-of-range or non-finite value is a WARNING (named with its value and
 /// range) and never refuses startup: configs that loaded before keep loading.
-pub const FLOAT_KEY_RANGES: [(&str, f64, f64); 3] = [
+///
+/// The six `activity.*_secs` floats are not listed: their schema already
+/// carries `range(max = MAX_DURATION_SECS)`, so `check_number` rejects a
+/// negative, non-finite or over-max value as a duration error.
+pub const FLOAT_KEY_RANGES: [(&str, f64, f64); 5] = [
     ("media.volume_step", 0.0, 1.0),
     ("usage.warn_percent", 0.0, 100.0),
     ("usage.crit_percent", 0.0, 100.0),
+    ("activity.cpu_percent", 0.0, 100.0),
+    ("activity.runaway_core_fraction", 0.0, 1.0),
 ];
 
 pub(crate) fn float_range_warnings(cfg: &Config) -> Vec<String> {
@@ -585,6 +591,14 @@ pub(crate) fn float_range_warnings(cfg: &Config) -> Vec<String> {
         (
             f64::from(cfg.usage.crit_percent),
             cfg.usage.crit_percent.to_string(),
+        ),
+        (
+            cfg.activity.cpu_percent,
+            cfg.activity.cpu_percent.to_string(),
+        ),
+        (
+            cfg.activity.runaway_core_fraction,
+            cfg.activity.runaway_core_fraction.to_string(),
         ),
     ];
     FLOAT_KEY_RANGES
@@ -1900,6 +1914,8 @@ template = "image:registry.example/dev:1"
             "media.volume_step" => cfg.media.volume_step = value,
             "usage.warn_percent" => cfg.usage.warn_percent = value as f32,
             "usage.crit_percent" => cfg.usage.crit_percent = value as f32,
+            "activity.cpu_percent" => cfg.activity.cpu_percent = value,
+            "activity.runaway_core_fraction" => cfg.activity.runaway_core_fraction = value,
             other => panic!("unknown float key {other}"),
         }
         cfg
@@ -1954,6 +1970,63 @@ template = "image:registry.example/dev:1"
                 "usage.warn_percent = 101 is outside the valid range 0..=100 (finite numbers only); the value is kept"
                     .to_string()
             ]
+        );
+    }
+
+    #[test]
+    fn activity_float_ranges_warn_once_and_never_error() {
+        let defaults = Config::default();
+        assert!(float_range_warnings(&defaults).is_empty());
+        assert!(
+            FLOAT_KEY_RANGES
+                .iter()
+                .any(|(path, _, _)| *path == "activity.cpu_percent")
+        );
+        for (path, max) in [
+            ("activity.cpu_percent", 100.0),
+            ("activity.runaway_core_fraction", 1.0),
+        ] {
+            for accepted in [0.0, max] {
+                assert!(
+                    float_range_warnings(&float_config(path, accepted)).is_empty(),
+                    "{path} = {accepted}"
+                );
+            }
+            for rejected in [-0.5, max + 1.0, f64::NAN, f64::INFINITY] {
+                let cfg = float_config(path, rejected);
+                assert!(
+                    typed_semantic_errors(&cfg, SemanticMode::AllDiagnostics)
+                        .iter()
+                        .all(|error| !error.contains(path)),
+                    "{path} = {rejected} must not be an error"
+                );
+                let warnings = float_range_warnings(&cfg);
+                assert_eq!(warnings.len(), 1, "{path} = {rejected}: {warnings:?}");
+                assert!(warnings[0].starts_with(&format!("{path} = ")));
+                assert!(warnings[0].contains(&format!("0..={max}")));
+            }
+        }
+        assert_eq!(
+            float_range_warnings(&float_config("activity.runaway_core_fraction", 1.5)),
+            vec![
+                "activity.runaway_core_fraction = 1.5 is outside the valid range 0..=1 (finite numbers only); the value is kept"
+                    .to_string()
+            ]
+        );
+    }
+
+    #[test]
+    fn activity_float_ranges_reach_validate_diagnostics_as_warnings() {
+        let body = "[activity]\ncpu_percent = 150.0\nrunaway_core_fraction = -0.1\n";
+        assert!(validate_str(body).is_empty(), "{:?}", validate_str(body));
+        assert_eq!(float_warnings_in(body, "activity.cpu_percent").len(), 1);
+        assert_eq!(
+            float_warnings_in(body, "activity.runaway_core_fraction").len(),
+            1
+        );
+        assert!(
+            validate_diagnostics("[activity]\ncpu_percent = 100.0\nrunaway_core_fraction = 0.0\n")
+                .is_empty()
         );
     }
 
