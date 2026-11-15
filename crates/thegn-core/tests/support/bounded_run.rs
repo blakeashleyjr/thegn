@@ -12,6 +12,13 @@ pub const DEADLINE: Duration = Duration::from_secs(120);
 pub const OUTPUT_CAP: u64 = 1024 * 1024;
 const POLL: Duration = Duration::from_millis(10);
 
+/// Nextest forces the sandbox backend to `none` so test probes cannot start a
+/// rootless Podman namespace. Treat the `host` alias the same way as config.
+pub fn sandbox_backend_forced_none() -> bool {
+    std::env::var("THEGN_SANDBOX_BACKEND")
+        .is_ok_and(|backend| matches!(backend.trim(), "none" | "host"))
+}
+
 #[derive(Debug)]
 pub enum Outcome {
     Exited(Output),
@@ -152,6 +159,13 @@ mod tests {
     use std::io;
     use std::panic::{AssertUnwindSafe, catch_unwind};
     use std::process::Command;
+
+    #[test]
+    fn nextest_forces_the_sandbox_backend_off() {
+        if std::env::var_os("NEXTEST").is_some() {
+            assert!(super::sandbox_backend_forced_none());
+        }
+    }
 
     #[test]
     fn output_panics_with_post_spawn_supervision_errors() {

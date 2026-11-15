@@ -64,11 +64,12 @@ class NextestSetupTests(unittest.TestCase):
 
         self.assertEqual(result.returncode, 0, result.stderr.decode())
         lines = (tmpdir / "env").read_text(encoding="utf-8").splitlines()
-        self.assertEqual(len(lines), 1)
+        self.assertEqual(len(lines), 2)
         self.assertTrue(lines[0].startswith("XDG_STATE_HOME="))
         state_dir = Path(lines[0].removeprefix("XDG_STATE_HOME="))
         self.assertEqual(state_dir.parent, tmpdir)
         self.assertTrue(state_dir.name.startswith("thegn-nextest-state."))
+        self.assertEqual(lines[1], "THEGN_SANDBOX_BACKEND=none")
         self.assertTrue(state_dir.is_dir())
 
     def test_stale_dirs_are_still_swept(self):
@@ -88,7 +89,8 @@ class NextestSetupTests(unittest.TestCase):
         created_dirs = list(tmpdir.glob("thegn-nextest-state.*"))
         self.assertEqual(len(created_dirs), 2)
         env_lines = (tmpdir / "env").read_text(encoding="utf-8").splitlines()
-        self.assertEqual(len(env_lines), 1)
+        self.assertEqual(len(env_lines), 2)
+        self.assertEqual(env_lines[1], "THEGN_SANDBOX_BACKEND=none")
 
     def test_mktemp_failure_still_fails(self):
         parent = self.temporary_directory()
@@ -99,6 +101,15 @@ class NextestSetupTests(unittest.TestCase):
 
         self.assertNotEqual(result.returncode, 0)
         self.assertFalse(env_path.exists())
+
+    def test_forces_no_reachable_podman_backend(self):
+        tmpdir = self.temporary_directory()
+
+        result = run(setup_command(), tmpdir)
+
+        self.assertEqual(result.returncode, 0, result.stderr.decode())
+        env_lines = (tmpdir / "env").read_text(encoding="utf-8").splitlines()
+        self.assertIn("THEGN_SANDBOX_BACKEND=none", env_lines)
 
 
 if __name__ == "__main__":
