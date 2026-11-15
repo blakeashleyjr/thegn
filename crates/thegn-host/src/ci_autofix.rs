@@ -450,10 +450,10 @@ fn consider_candidate_with_forge(
         hold_identity_mismatch(db, &item.key, item.number, &detail, &notify);
         return;
     }
-    if !head_is_current(provider, &loc, &fetched, entry.head_sha.as_str()) {
+    if let Err(reason) = head_is_current(provider, &loc, &fetched, entry.head_sha.as_str()) {
         notify(format!(
-            "CI job {} failed for PR #{}; the PR head changed, so autofix is held",
-            entry.job_name, item.number
+            "CI job {} failed for PR #{}; {reason}, so autofix is held",
+            entry.job_name, item.number,
         ));
         return;
     }
@@ -783,11 +783,21 @@ fn head_is_current(
     loc: &thegn_core::remote::GitLoc,
     fetched: &FetchedPr,
     expected: &str,
-) -> bool {
-    fetched.pr.state.eq_ignore_ascii_case("OPEN")
-        && fetched.pr.head_ref_oid == expected
-        && loc.git_out(&["rev-parse", "HEAD"]).as_deref() == Some(expected)
-        && !forge.id().is_empty()
+) -> Result<(), String> {
+    if !fetched.pr.state.eq_ignore_ascii_case("OPEN") {
+        return Err("the PR is no longer open".to_owned());
+    }
+    if fetched.pr.head_ref_oid != expected {
+        return Err("the PR head changed".to_owned());
+    }
+    if forge.id().is_empty() {
+        return Err("the forge identity is unavailable".to_owned());
+    }
+    match read_head(loc)? {
+        Some(head) if head == expected => Ok(()),
+        Some(_) => Err("the worktree HEAD changed".to_owned()),
+        None => Err("the worktree HEAD is unborn".to_owned()),
+    }
 }
 
 fn hold_not_started(
@@ -830,10 +840,24 @@ fn admitted_head_still_checked_out(
     loc: &thegn_core::remote::GitLoc,
     admitted: &str,
 ) -> Result<(), String> {
-    match loc.git_out(&["rev-parse", "HEAD"]) {
+    match read_head(loc)? {
         Some(head) if head == admitted => Ok(()),
         Some(_) => Err("the worktree HEAD moved after the agent was admitted".to_owned()),
-        None => Err("the worktree HEAD could not be read after the agent was admitted".to_owned()),
+        None => Err("the worktree HEAD is unborn after the agent was admitted".to_owned()),
+    }
+}
+
+fn read_head(loc: &thegn_core::remote::GitLoc) -> Result<Option<String>, String> {
+    use thegn_core::git_run::{GitOutcome, GitTextError};
+
+    match loc.git_text(&["rev-parse", "--verify", "--quiet", "HEAD"]) {
+        Ok(head) if head.is_empty() => Ok(None),
+        Ok(head) => Ok(Some(head)),
+        Err(GitTextError::Failed(GitOutcome::Exit {
+            code: Some(1),
+            stderr_tail,
+        })) if stderr_tail.is_empty() => Ok(None),
+        Err(error) => Err(format!("git HEAD read failed: {error}")),
     }
 }
 
@@ -921,7 +945,50 @@ mod tests {
         let path = empty.path().to_str().unwrap();
         let unreadable = thegn_core::remote::GitLoc::from_db(path, None);
         let result = admitted_head_still_checked_out(&unreadable, &head);
-        assert!(matches!(result, Err(reason) if reason.contains("could not be read")));
+        assert!(matches!(result, Err(reason) if reason.contains("git")));
+    }
+
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "the fixture initializes an isolated unborn Git repository"
+    )]
+    #[test]
+    fn ci_head_probe_table_keeps_unborn_and_git_failure_conservative() {
+        let fixture = Fixture::new();
+        let head = fixture.pr.head_ref_oid.clone();
+        let fetched = FetchedPr {
+            pr: fixture.pr.clone(),
+            threads: Vec::new(),
+        };
+        let forge = fixture.forge(vec![fixture.proof.clone()]);
+        assert_eq!(
+            head_is_current(&forge, &fixture.loc, &fetched, &head),
+            Ok(()),
+            "HEAD == admitted"
+        );
+        assert!(matches!(
+            head_is_current(&forge, &fixture.loc, &fetched, "diverged"),
+            Err(reason) if reason.contains("PR head")
+        ));
+
+        let unborn = tempfile::tempdir().unwrap();
+        let status = thegn_core::util::git_cmd(unborn.path())
+            .args(["init", "--quiet"])
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .status()
+            .unwrap();
+        assert!(status.success());
+        let unborn_loc = thegn_core::remote::GitLoc::Local(unborn.path().to_path_buf());
+        assert!(matches!(
+            head_is_current(&forge, &unborn_loc, &fetched, &head),
+            Err(reason) if reason.contains("unborn")
+        ));
+
+        let broken = tempfile::tempdir().unwrap();
+        std::fs::write(broken.path().join(".git"), "gitdir: missing\n").unwrap();
+        let broken_loc = thegn_core::remote::GitLoc::Local(broken.path().to_path_buf());
+        let error = head_is_current(&forge, &broken_loc, &fetched, &head).unwrap_err();
+        assert!(error.contains("git"), "{error}");
     }
 
     #[test]
