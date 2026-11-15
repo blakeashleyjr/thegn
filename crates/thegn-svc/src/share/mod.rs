@@ -1047,6 +1047,104 @@ pub fn serve_up_for_worktree(
     serve_up_with(&recorded, serve, |runtime, target, argv| {
         exec_in(runtime, target, argv)
     })
+    .map_err(|error| {
+        if is_teardown_unverified(&error) {
+            record_pending_teardown(error, sidecar, worktree, serve.port)
+        } else {
+            error
+        }
+    })
+}
+
+/// A share teardown that no runtime verified absent. Typed so the worktree
+/// wrappers can retain the port as pending teardown in the sidecar record.
+#[derive(Debug)]
+pub struct TeardownUnverified {
+    message: String,
+}
+
+impl TeardownUnverified {
+    fn new(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+        }
+    }
+}
+
+impl fmt::Display for TeardownUnverified {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for TeardownUnverified {}
+
+/// What a teardown result means for the sidecar's pending-teardown list.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TeardownRecord {
+    /// Verified absent: drop the port from the pending list.
+    Clear,
+    /// Unverified: retain the port as pending until a later verified teardown.
+    MarkPending,
+    /// Any other failure (no record, wrong worktree): leave the list alone.
+    Unchanged,
+}
+
+fn teardown_outcome(result: &Result<()>) -> TeardownRecord {
+    match result {
+        Ok(()) => TeardownRecord::Clear,
+        Err(error) if is_teardown_unverified(error) => TeardownRecord::MarkPending,
+        Err(_) => TeardownRecord::Unchanged,
+    }
+}
+
+fn is_teardown_unverified(error: &anyhow::Error) -> bool {
+    error.downcast_ref::<TeardownUnverified>().is_some()
+}
+
+/// Retain the tailscale serve (https) `port` as pending teardown and say so
+/// in the returned error. A failure to record is appended, never swallowed.
+fn record_pending_teardown(
+    error: anyhow::Error,
+    sidecar: &str,
+    worktree: &std::path::Path,
+    port: u16,
+) -> anyhow::Error {
+    let message = match crate::vpn::mark_teardown_pending(sidecar, worktree, port) {
+        Ok(()) => format!(
+            "{error:#}; recorded as pending (serve port {port}), retry with `thegn share stop`"
+        ),
+        Err(mark) => {
+            format!("{error:#}; could not record serve port {port} as pending teardown: {mark:#}")
+        }
+    };
+    anyhow::Error::new(TeardownUnverified::new(message))
+}
+
+fn apply_teardown_outcome(
+    result: Result<()>,
+    sidecar: &str,
+    worktree: &std::path::Path,
+    port: u16,
+) -> Result<()> {
+    match teardown_outcome(&result) {
+        TeardownRecord::Clear => {
+            if let Err(error) = crate::vpn::clear_teardown_pending(sidecar, worktree, port) {
+                tracing::warn!(
+                    target: "thegn::share",
+                    error = %format!("{error:#}"),
+                    port,
+                    "share: verified teardown, but could not clear its pending record"
+                );
+            }
+            result
+        }
+        TeardownRecord::MarkPending => match result {
+            Err(error) => Err(record_pending_teardown(error, sidecar, worktree, port)),
+            Ok(()) => Ok(()),
+        },
+        TeardownRecord::Unchanged => result,
+    }
 }
 
 fn serve_up_with(
@@ -1064,9 +1162,9 @@ fn serve_up_with(
                 |rt, argv| exec(rt, &recorded.id, argv),
             ) {
                 Ok(()) => Err(error).context("share: tailscale serve was turned off"),
-                Err(teardown) => Err(anyhow::anyhow!(
+                Err(teardown) => Err(anyhow::Error::new(TeardownUnverified::new(format!(
                     "{error:#}; teardown unverified; the share may still be reachable: {teardown:#}"
-                )),
+                )))),
             },
         },
         Ok((false, output)) => bail!(
@@ -1125,11 +1223,12 @@ pub fn serve_down_for_worktree(
 ) -> Result<()> {
     let recorded = crate::vpn::recorded_sidecar_for_worktree(sidecar, worktree, None)
         .context("share: teardown unverified")?;
-    serve_down_with(
+    let result = serve_down_with(
         std::slice::from_ref(&recorded.runtime),
         serve,
         |rt, argv| exec_in(rt, &recorded.id, argv),
-    )
+    );
+    apply_teardown_outcome(result, sidecar, worktree, serve.port)
 }
 
 fn serve_down_with(
@@ -1156,7 +1255,9 @@ fn serve_down_with(
             return Ok(());
         }
     }
-    bail!("share: teardown unverified; no runtime verified tailscale serve is absent")
+    Err(anyhow::Error::new(TeardownUnverified::new(
+        "share: teardown unverified; no runtime verified tailscale serve is absent",
+    )))
 }
 
 /// Return whether Tailscale status reports a serve/funnel on `port`.
