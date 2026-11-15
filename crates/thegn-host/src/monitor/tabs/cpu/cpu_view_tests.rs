@@ -1037,7 +1037,7 @@ fn usage_panel_io_and_steal_rows_show_label_and_latest_percent() {
             assert!(io.contains("io"), "{io:?}");
             assert!(st.contains("st"), "{st:?}");
             assert!(io.contains('7') && io.contains('%'), "{io:?}");
-            assert!(st.contains('2') && st.contains('%'), "{st:?}");
+            assert!(st.contains("3%"), "{st:?}");
         }
     }
 }
