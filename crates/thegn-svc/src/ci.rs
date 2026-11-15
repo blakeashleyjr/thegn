@@ -1315,8 +1315,14 @@ fn decode_provider_json<T: serde::de::DeserializeOwned>(
             CiError::Malformed(format!("invalid {what} response: {reason}"))
         }
     })?;
-    serde_json::from_str(json)
-        .map_err(|error| CiError::Malformed(format!("invalid {what} response: {error}")))
+    // serde errors can quote the offending string value from provider stdout;
+    // callers hold no token values, so apply the shape-based scrub.
+    serde_json::from_str(json).map_err(|error| {
+        CiError::Malformed(scrub_cli_text(
+            &format!("invalid {what} response: {error}"),
+            &[],
+        ))
+    })
 }
 
 fn cap_provider_rows(mut runs: Vec<CiRun>, limit: usize) -> (Vec<CiRun>, usize) {

@@ -405,3 +405,17 @@ fn transport_command_secrets_include_the_exported_configured_token() {
             .any(|secret| secret == PLAIN_TOKEN)
     );
 }
+
+#[test]
+fn transport_json_decode_errors_do_not_quote_token_values() {
+    let glpat = format!("glpat-{}", "Ab1".repeat(8));
+    let json = format!("[\"{glpat}\"]");
+    let error = decode_provider_json::<Vec<u64>>(&json, "provider runs").unwrap_err();
+    assert!(matches!(error, CiError::Malformed(_)), "{error:?}");
+    let rendered = error.to_string();
+    assert!(!rendered.contains(&glpat), "{rendered}");
+    assert!(
+        rendered.contains(thegn_core::ci_log::REDACTION_MARKER),
+        "{rendered}"
+    );
+}
