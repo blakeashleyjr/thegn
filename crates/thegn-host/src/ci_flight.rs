@@ -32,9 +32,10 @@ pub(crate) enum FlightAdmission {
 }
 
 /// At most one fetch runs per `CiFlight`; a queued token does not fetch (it is
-/// promoted by `finish`). A host therefore holds at most
+/// promoted by `finish`). A host therefore retains at most
 /// `MAX_RUNNING_FETCHES x thegn_svc::ci::LOG_COLLECTOR_PEAK_BYTES` of streamed
-/// log per flight. Every host path that calls the svc log fetch (`logs`):
+/// log per flight (between reads; plus one line's redaction working set).
+/// Every host path that calls the svc log fetch (`logs`):
 /// - `ci_refresh.rs` ingestion (`client.logs`): the refresh `CiFlight`, one at a
 ///   time, further capped by `MAX_LOG_INGEST_CALLS`/`MAX_LOG_INGEST_BYTES` per call.
 /// - `actions.rs` run-detail drill (`c.logs`): `CI_DETAIL_FLIGHT`, one at a time.
