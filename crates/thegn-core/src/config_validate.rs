@@ -581,6 +581,13 @@ pub const FLOAT_KEY_RANGES: [(&str, f64, f64); 5] = [
     ("activity.runaway_core_fraction", 0.0, 1.0),
 ];
 
+/// Inclusive range for each `stats.refresh_rates` entry (seconds). The keybind
+/// consumer floors an entry at 0.5, so a smaller one is silently raised; the
+/// ceiling is the shared duration cap. Out-of-range and non-finite entries
+/// WARN (one per entry, named by index) and are kept; an empty list is valid
+/// (the consumer then skips cycling).
+pub const REFRESH_RATE_RANGE: (f64, f64) = (0.5, crate::time_policy::MAX_DURATION_SECS as f64);
+
 pub(crate) fn float_range_warnings(cfg: &Config) -> Vec<String> {
     let values = [
         (cfg.media.volume_step, cfg.media.volume_step.to_string()),
@@ -601,7 +608,7 @@ pub(crate) fn float_range_warnings(cfg: &Config) -> Vec<String> {
             cfg.activity.runaway_core_fraction.to_string(),
         ),
     ];
-    FLOAT_KEY_RANGES
+    let mut warnings: Vec<String> = FLOAT_KEY_RANGES
         .iter()
         .zip(values)
         .filter(|((_, min, max), (value, _))| {
@@ -612,7 +619,16 @@ pub(crate) fn float_range_warnings(cfg: &Config) -> Vec<String> {
                 "{path} = {shown} is outside the valid range {min}..={max} (finite numbers only); the value is kept"
             )
         })
-        .collect()
+        .collect();
+    let (min, max) = REFRESH_RATE_RANGE;
+    for (index, value) in cfg.stats.refresh_rates.iter().enumerate() {
+        if !(value.is_finite() && min <= *value && *value <= max) {
+            warnings.push(format!(
+                "stats.refresh_rates[{index}] = {value} is outside the valid range {min}..={max} (finite numbers only); the value is kept"
+            ));
+        }
+    }
+    warnings
 }
 
 fn sidebar_detail_warnings(cfg: &Config) -> Vec<String> {
@@ -1971,6 +1987,91 @@ template = "image:registry.example/dev:1"
                     .to_string()
             ]
         );
+    }
+
+    fn refresh_rates_config(rates: &[f64]) -> Config {
+        let mut cfg = Config::default();
+        cfg.stats.refresh_rates = rates.to_vec();
+        cfg
+    }
+
+    fn refresh_rate_warnings(rates: &[f64]) -> Vec<String> {
+        let cfg = refresh_rates_config(rates);
+        // Never an admission error: startup must not be refused.
+        assert!(
+            typed_semantic_errors(&cfg, SemanticMode::AllDiagnostics)
+                .iter()
+                .all(|error| !error.contains("stats.refresh_rates")),
+            "{rates:?} must not be an error"
+        );
+        float_range_warnings(&cfg)
+    }
+
+    #[test]
+    fn refresh_rates_accept_the_default_empty_and_endpoint_lists() {
+        assert_eq!(REFRESH_RATE_RANGE, (0.5, 315_360_000.0));
+        assert!(
+            Config::default()
+                .stats
+                .refresh_rates
+                .iter()
+                .all(|rate| *rate >= REFRESH_RATE_RANGE.0)
+        );
+        assert!(refresh_rate_warnings(&Config::default().stats.refresh_rates).is_empty());
+        assert!(refresh_rate_warnings(&[]).is_empty());
+        assert!(refresh_rate_warnings(&[0.5, 315_360_000.0]).is_empty());
+    }
+
+    #[test]
+    fn refresh_rates_warn_once_per_bad_entry_and_never_error() {
+        assert_eq!(
+            refresh_rate_warnings(&[0.1]),
+            vec![
+                "stats.refresh_rates[0] = 0.1 is outside the valid range 0.5..=315360000 (finite numbers only); the value is kept"
+                    .to_string()
+            ]
+        );
+        for bad in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY, 315_360_000.5] {
+            let warnings = refresh_rate_warnings(&[bad]);
+            assert_eq!(warnings.len(), 1, "{bad}: {warnings:?}");
+            assert!(
+                warnings[0].starts_with(&format!("stats.refresh_rates[0] = {bad} ")),
+                "{warnings:?}"
+            );
+            assert!(warnings[0].contains("0.5..=315360000"), "{warnings:?}");
+        }
+        assert_eq!(
+            refresh_rate_warnings(&[1.0, -2.0, 3.0]),
+            vec![
+                "stats.refresh_rates[1] = -2 is outside the valid range 0.5..=315360000 (finite numbers only); the value is kept"
+                    .to_string()
+            ]
+        );
+        let warnings = refresh_rate_warnings(&[0.0, 2.0, f64::NAN, 1e12]);
+        assert_eq!(
+            warnings
+                .iter()
+                .map(|warning| warning.split(" = ").next().unwrap_or_default())
+                .collect::<Vec<&str>>(),
+            vec![
+                "stats.refresh_rates[0]",
+                "stats.refresh_rates[2]",
+                "stats.refresh_rates[3]",
+            ]
+        );
+    }
+
+    #[test]
+    fn refresh_rate_warnings_reach_validate_diagnostics_as_warnings() {
+        let body = "[stats]\nrefresh_rates = [1.0, 0.25, 2.0]\n";
+        assert!(validate_str(body).is_empty(), "{:?}", validate_str(body));
+        let warnings = float_warnings_in(body, "stats.refresh_rates");
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
+        assert!(
+            warnings[0].starts_with("stats.refresh_rates[1] = 0.25 "),
+            "{warnings:?}"
+        );
+        assert!(validate_diagnostics("[stats]\nrefresh_rates = []\n").is_empty());
     }
 
     #[test]
