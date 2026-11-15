@@ -803,6 +803,53 @@ mod tests {
     }
 
     #[test]
+    fn reflog_every_control_byte_round_trips_without_shifting_fields() {
+        let controls: Vec<u8> = (0x01u8..=0x1f).chain([0x7f]).collect();
+        for b in controls {
+            let c = char::from(b);
+            let subject = format!("commit: a{c}b{c}");
+            let mut mid = reflog_fields(1);
+            mid[3] = subject.clone();
+            let records = [
+                reflog_record(&reflog_fields(0)),
+                reflog_record(&mid),
+                reflog_record(&reflog_fields(2)),
+            ];
+            let parsed = parse_reflog(&records.concat())
+                .unwrap_or_else(|e| panic!("byte {b:#04x} must parse: {e}"));
+            assert_eq!(parsed.len(), 3, "byte {b:#04x}");
+            assert_eq!(parsed[0], parse_reflog(&records[0]).unwrap()[0]);
+            assert_eq!(parsed[2], parse_reflog(&records[2]).unwrap()[0]);
+            assert_eq!(parsed[1].raw, subject, "byte {b:#04x}");
+            assert_eq!(parsed[1].sha, reflog_oid(2), "byte {b:#04x}");
+            assert_eq!(parsed[1].selector, "HEAD@{1}", "byte {b:#04x}");
+            assert_eq!(parsed[1].date, 1_700_000_001, "byte {b:#04x}");
+        }
+    }
+
+    #[test]
+    fn reflog_truncation_prefixes_equal_the_leading_records() {
+        let records = reflog_records(3);
+        let input: String = records.concat();
+        let mut bounds = vec![0usize];
+        let mut total = 0usize;
+        for record in &records {
+            total += record.len();
+            bounds.push(total);
+        }
+        for cut in 0..=input.len() {
+            if !input.is_char_boundary(cut) {
+                continue;
+            }
+            if let Ok(rows) = parse_reflog(&input[..cut]) {
+                let k = bounds.iter().position(|b| *b == cut).expect("boundary");
+                let expect = parse_reflog(&records[..k].concat()).unwrap();
+                assert_eq!(rows, expect, "cut {cut}");
+            }
+        }
+    }
+
+    #[test]
     fn reflog_hostile_subject_round_trips() {
         let parsed = parse_reflog(&reflog_records(2).concat()).unwrap();
         assert_eq!(parsed.len(), 2);
