@@ -140,6 +140,7 @@
           gitAutoFetchColocated = true;
           gitSubmodules = "off";
           statsRefreshSecs = 1.5;
+          statsRefreshRates = [0.5 1.5 5 10];
           statsCpuIcon = "C";
           statsMemIcon = "M";
           statsNetIcon = "N";
@@ -164,6 +165,7 @@
           notificationsDndEnabled = true;
           notificationsSoundMute = true;
           notificationsSoundSuppressFocused = false;
+          notificationsSoundVolume = 0.5;
           activityEnabled = false;
           activityRedRequiresAgent = false;
           activityAgentPrograms = ["claude" "my-agent"];
@@ -323,6 +325,8 @@
   zeroSemanticIndexMaxFiles = evalWithOptions {semanticIndexMaxFiles = 0;};
   zeroSemanticMapBudgetLines = evalWithOptions {semanticMapBudgetLines = 0;};
   oversizedMediaVolumeStep = evalWithOptions {mediaVolumeStep = 1.5;};
+  undersizedStatsRefreshRates = evalWithOptions {statsRefreshRates = [1 0.1];};
+  oversizedNotificationsSoundVolume = evalWithOptions {notificationsSoundVolume = 1.5;};
   oversizedUsageCritPercent = evalWithOptions {usageCritPercent = 100.5;};
   oversizedActivityRunawayCoreFraction = evalWithOptions {activityRunawayCoreFraction = 1.5;};
   negativeActivityQuietGraceSecs = evalWithOptions {activityQuietGraceSecs = -1;};
@@ -339,6 +343,8 @@ in
   assert !(builtins.tryEval (builtins.deepSeq zeroSemanticIndexMaxFiles.config.programs.thegn.semanticIndexMaxFiles true)).success;
   assert !(builtins.tryEval (builtins.deepSeq zeroSemanticMapBudgetLines.config.programs.thegn.semanticMapBudgetLines true)).success;
   assert !(builtins.tryEval (builtins.deepSeq oversizedMediaVolumeStep.config.programs.thegn.mediaVolumeStep true)).success;
+  assert !(builtins.tryEval (builtins.deepSeq undersizedStatsRefreshRates.config.programs.thegn.statsRefreshRates true)).success;
+  assert !(builtins.tryEval (builtins.deepSeq oversizedNotificationsSoundVolume.config.programs.thegn.notificationsSoundVolume true)).success;
   assert !(builtins.tryEval (builtins.deepSeq oversizedUsageCritPercent.config.programs.thegn.usageCritPercent true)).success;
   assert !(builtins.tryEval (builtins.deepSeq oversizedActivityRunawayCoreFraction.config.programs.thegn.activityRunawayCoreFraction true)).success;
   assert !(builtins.tryEval (builtins.deepSeq negativeActivityQuietGraceSecs.config.programs.thegn.activityQuietGraceSecs true)).success;
