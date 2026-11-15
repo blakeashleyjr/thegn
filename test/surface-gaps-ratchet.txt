@@ -72,7 +72,5 @@ secret.set	http	control-API route deferred; CLI-only for now
 secret.ssh.rotate	grpc	control-API route deferred; CLI-only for now
 secret.ssh.rotate	http	control-API route deferred; CLI-only for now
 sessions.detach	mcp	MCP state tools land in the client-API phase
-sessions.resize	mcp	MCP state tools land in the client-API phase
 sessions.snapshot	mcp	MCP state tools land in the client-API phase
 sessions.split	mcp	MCP state tools land in the client-API phase
-worktrees.open	mcp	MCP state tools land in the client-API phase
