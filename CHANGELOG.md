@@ -7,6 +7,19 @@ All notable changes to **thegn** are documented here. The format follows
 
 ## [Unreleased]
 
+### Added
+
+- The `THEGN_PERF=1` rollup now reports the three busiest database-open call sites.
+
+### Changed
+
+- Plugin schedule intervals from 100 through 999 ms are raised to 1 second when the plugin loads, with a warning naming the plugin; intervals under 100 ms are rejected.
+- One-shot plugin commands now use 5, 20, then 50 ms polling backoff, so quick commands finish sooner and long-running commands wake less often.
+
+### Fixed
+
+- Git reads in worktree, repository, supervision, merge, wizard, integration, hydration, CI, and PR flows now use bounded, typed calls and fail closed on errors; the sandbox's shared Git-directory mount also fails closed.
+
 ## [0.1.0-alpha.81] — 2026-11-14
 
 ### Changed
