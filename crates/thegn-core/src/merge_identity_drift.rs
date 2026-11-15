@@ -128,6 +128,35 @@ mod tests {
     }
 
     #[test]
+    fn row_serializes_cleanup_retry_and_hold() {
+        let v2 = crate::merge_sweep::CleanupRetry {
+            attempts: 2,
+            next_at: 99,
+            class_id: Some("removal".into()),
+        }
+        .marker();
+        let value = serde_json::to_value(row(Some(v2))).unwrap();
+        assert_eq!(value["cleanup_retry"]["attempts"], 2);
+        assert_eq!(value["cleanup_retry"]["next_at"], 99);
+        assert_eq!(value["cleanup_retry"]["class_id"], "removal");
+        assert!(value["cleanup_hold"].is_null());
+
+        let value =
+            serde_json::to_value(row(Some("thegn-cleanup-retry:v1:1:42".to_owned()))).unwrap();
+        assert_eq!(value["cleanup_retry"]["attempts"], 1);
+        assert!(value["cleanup_retry"]["class_id"].is_null());
+
+        let hold = crate::merge_sweep::CleanupHold::BranchRetained.marker();
+        let value = serde_json::to_value(row(Some(hold.to_owned()))).unwrap();
+        assert_eq!(value["cleanup_hold"], "branch_retained");
+        assert!(value["cleanup_retry"].is_null());
+
+        let value = serde_json::to_value(row(None)).unwrap();
+        assert!(value["cleanup_retry"].is_null());
+        assert!(value["cleanup_hold"].is_null());
+    }
+
+    #[test]
     fn row_key_set_is_stable() {
         let encoded = serde_json::to_string(&row(None)).unwrap();
         let fields = [
@@ -143,6 +172,8 @@ mod tests {
             "location",
             "agent_attempts",
             "identity_drift",
+            "cleanup_retry",
+            "cleanup_hold",
         ];
         let mut previous_position = 0;
         for field in fields {
