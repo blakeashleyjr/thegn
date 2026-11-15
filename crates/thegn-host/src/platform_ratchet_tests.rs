@@ -333,7 +333,6 @@ fn thread_names_fit_the_comm_limit_ratchet() {
 fn burned_down_builder_files_use_spawn_named_with_entry_qos() {
     // THE-931 slice f: these files left thread-builder-host-ratchet.txt; keep them there.
     const ENTRY_QOS: &[&str] = &[
-        "bounded_git_probe.rs",
         "notification_sound.rs",
         "pane_writer.rs",
         "preview_watch.rs",
