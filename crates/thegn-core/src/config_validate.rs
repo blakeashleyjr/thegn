@@ -1986,7 +1986,7 @@ sidebar_workspace_sort = "attention"
             diagnostic.severity == ValidationSeverity::Warning
                 && diagnostic.message.contains("sidebar_detail_fields")
                 && diagnostic.message.contains("bogus")
-                && diagnostic.message.contains("branch_stat")
+                && diagnostic.message.contains("plugin:<name>/<field>")
         }));
         assert!(diagnostics.iter().any(|diagnostic| {
             diagnostic.severity == ValidationSeverity::Warning
