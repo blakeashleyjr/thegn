@@ -2245,8 +2245,8 @@ fn verify_facts_observed(
         wt,
         &["ls-files", "--error-unmatch", "--", artifact.as_str()],
     ) == Some(true);
-    let git_root = match git_text_local(wt, &["rev-parse", "--show-toplevel"]) {
-        Ok(root) => std::path::PathBuf::from(root).canonicalize().ok(),
+    let git_root = match thegn_core::util::git_out_path(wt, &["rev-parse", "--show-toplevel"]) {
+        Ok(root) => root.canonicalize().ok(),
         Err(error) => {
             note_git_read_failure("rev-parse --show-toplevel", wt, &error);
             None
