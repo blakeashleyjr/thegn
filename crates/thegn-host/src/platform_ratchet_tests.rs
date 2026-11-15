@@ -193,7 +193,6 @@ fn qos_debt_threads_declare_on_entry() {
         "lifecycle.rs",
         "placement_flow.rs",
         "secret.rs",
-        "structural_diff.rs",
     ];
 
     for file in FILES {
