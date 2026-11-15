@@ -175,12 +175,6 @@ struct LinearLabelList {
     page_info: Option<LinearPageInfo>,
 }
 
-fn linear_labels_complete(labels: Option<&LinearLabelList>) -> bool {
-    labels
-        .and_then(|list| list.page_info.as_ref())
-        .is_none_or(|info| !info.has_next_page)
-}
-
 #[derive(Deserialize)]
 struct LinearLabel {
     name: String,
@@ -599,7 +593,7 @@ fn build_get_query(identifier: &str) -> String {
     format!(
         r#"query {{ issue(id: "{identifier}") {{
                 {ISSUE_FIELDS}
-                labels {{ pageInfo {{ hasNextPage }} }}
+                labels {{ pageInfo {{ hasNextPage endCursor }} }}
                 comments(first: {MAX_PAGE_SIZE}) {{
                     nodes {{ id body user {{ name }} createdAt }}
                     pageInfo {{ hasNextPage endCursor }}
@@ -619,6 +613,78 @@ fn build_comments_page_query(identifier: &str, after: &str) -> String {
                 }}
             }} }}"#
     )
+}
+
+/// One follow-up page of an issue's labels, after `after` (escaped like the
+/// comments query: both values are spliced into the document).
+fn build_labels_page_query(identifier: &str, after: &str) -> String {
+    let identifier = escape_graphql_str(identifier);
+    let after = escape_graphql_str(after);
+    format!(
+        r#"query {{ issue(id: "{identifier}") {{
+                labels(first: {MAX_PAGE_SIZE}, after: "{after}") {{
+                    nodes {{ name }}
+                    pageInfo {{ hasNextPage endCursor }}
+                }}
+            }} }}"#
+    )
+}
+
+#[derive(Deserialize)]
+struct LinearIssueLabels {
+    issue: LinearLabelDetail,
+}
+
+#[derive(Deserialize)]
+struct LinearLabelDetail {
+    labels: Option<LinearLabelList>,
+}
+
+/// What the label pager wants next.
+#[derive(Debug, PartialEq, Eq)]
+enum LabelStep {
+    /// Fetch the page after this cursor.
+    Fetch(String),
+    /// Stop; `true` when every page was read.
+    Done(bool),
+}
+
+/// Folds an issue's label pages with the comment loop's discipline: a repeated
+/// cursor, a missing cursor or the page cap stops paging as incomplete. Names
+/// are de-duplicated, keeping first-seen order.
+#[derive(Default)]
+struct LabelPager {
+    labels: Vec<String>,
+    seen_names: std::collections::HashSet<String>,
+    seen_cursors: std::collections::HashSet<String>,
+    pages: usize,
+}
+
+impl LabelPager {
+    fn absorb(&mut self, names: Vec<String>, info: Option<LinearPageInfo>) -> LabelStep {
+        self.pages = self.pages.saturating_add(1);
+        for name in names {
+            if self.seen_names.insert(name.clone()) {
+                self.labels.push(name);
+            }
+        }
+        // Absent metadata on the issue's own page reads as one complete page
+        // (an issue with no label connection); on a follow-up page it is a
+        // malformed answer, so paging stops incomplete.
+        let Some(info) = info else {
+            return LabelStep::Done(self.pages == 1);
+        };
+        if !info.has_next_page {
+            return LabelStep::Done(true);
+        }
+        let Some(cursor) = info.end_cursor else {
+            return LabelStep::Done(false);
+        };
+        if !self.seen_cursors.insert(cursor.clone()) || self.pages >= MAX_LIST_PAGES {
+            return LabelStep::Done(false);
+        }
+        LabelStep::Fetch(cursor)
+    }
 }
 
 #[derive(Deserialize)]
@@ -767,7 +833,12 @@ impl IssueBackend for LinearBackend {
             ensure_dynamic_input(identifier)?;
             let query = build_get_query(identifier);
             let data: LinearIssueWithComments = Self::gql(&mut op, &query, Vars {}).await?;
-            let li = data.issue;
+            let mut li = data.issue;
+            let first_label_info = li
+                .issue
+                .labels
+                .as_mut()
+                .and_then(|labels| labels.page_info.take());
             let mut comment_page = li.comments.ok_or_else(|| {
                 IssueError::Parse("Linear comment pagination incomplete: missing comments".into())
             })?;
@@ -816,13 +887,38 @@ impl IssueBackend for LinearBackend {
                     created_at_ms: parse_updated_at(&c.created_at),
                 })
                 .collect();
-            let labels_complete = linear_labels_complete(li.issue.labels.as_ref());
+            let mut issue = linear_issue_to_domain(li.issue)?;
+            // Label paging is followed, but labels are display data: a failed,
+            // cursorless, repeating or capped label page keeps what was read
+            // and reports `labels_complete = false` instead of failing the read.
+            let mut pager = LabelPager::default();
+            let mut step = pager.absorb(std::mem::take(&mut issue.labels), first_label_info);
+            let labels_complete = loop {
+                let cursor = match step {
+                    LabelStep::Done(complete) => break complete,
+                    LabelStep::Fetch(cursor) => cursor,
+                };
+                let query = build_labels_page_query(identifier, &cursor);
+                let page = match Self::gql::<_, LinearIssueLabels>(&mut op, &query, Vars {}).await {
+                    Ok(data) => data.issue.labels,
+                    Err(error) => {
+                        tracing::debug!(%error, "Linear label paging stopped; labels incomplete");
+                        break false;
+                    }
+                };
+                let Some(page) = page else {
+                    tracing::debug!("Linear label page missing labels; labels incomplete");
+                    break false;
+                };
+                let names = page.nodes.into_iter().map(|label| label.name).collect();
+                step = pager.absorb(names, page.page_info);
+            };
+            issue.labels = pager.labels;
             Ok(IssueDetail {
-                issue: linear_issue_to_domain(li.issue)?,
+                issue,
                 comments,
                 // Incomplete comment paging returns an error before reaching this result.
                 comments_complete: true,
-                // Label paging is reported, not followed: a truncated label page sets this false.
                 labels_complete,
             })
         })
@@ -1012,6 +1108,18 @@ mod tests {
         serde_json::from_value(json!({ "type": ty })).unwrap()
     }
 
+    /// The pager's verdict on an issue's own (first) label page.
+    fn first_page_step(issue: LinearIssue) -> LabelStep {
+        let (names, info) = match issue.labels {
+            Some(list) => (
+                list.nodes.into_iter().map(|label| label.name).collect(),
+                list.page_info,
+            ),
+            None => (Vec::new(), None),
+        };
+        LabelPager::default().absorb(names, info)
+    }
+
     #[test]
     fn labels_complete_reads_the_label_page_info() {
         let issue = |labels| {
@@ -1030,16 +1138,22 @@ mod tests {
             "nodes": [{"name": "a"}],
             "pageInfo": {"hasNextPage": true, "endCursor": "c"}
         }));
-        assert!(!linear_labels_complete(partial.labels.as_ref()));
+        assert_eq!(first_page_step(partial), LabelStep::Fetch("c".into()));
 
         let complete = issue(json!({
             "nodes": [{"name": "a"}],
             "pageInfo": {"hasNextPage": false, "endCursor": null}
         }));
-        assert!(linear_labels_complete(complete.labels.as_ref()));
+        assert_eq!(first_page_step(complete), LabelStep::Done(true));
 
         let absent_metadata = issue(json!({"nodes": [{"name": "a"}]}));
-        assert!(linear_labels_complete(absent_metadata.labels.as_ref()));
+        assert_eq!(first_page_step(absent_metadata), LabelStep::Done(true));
+
+        let no_cursor = issue(json!({
+            "nodes": [{"name": "a"}],
+            "pageInfo": {"hasNextPage": true, "endCursor": null}
+        }));
+        assert_eq!(first_page_step(no_cursor), LabelStep::Done(false));
 
         let absent_labels = serde_json::from_value::<LinearIssue>(json!({
             "id": "u",
@@ -1049,14 +1163,242 @@ mod tests {
             "updatedAt": "1970-01-01T00:00:04Z"
         }))
         .unwrap();
-        assert!(linear_labels_complete(absent_labels.labels.as_ref()));
+        assert_eq!(first_page_step(absent_labels), LabelStep::Done(true));
     }
 
     #[test]
-    fn get_query_asks_for_label_page_info() {
+    fn get_query_asks_for_label_end_cursor() {
         let query = build_get_query("ABC-1");
-        assert!(query.contains("labels { pageInfo { hasNextPage } }"));
+        assert!(query.contains("labels { pageInfo { hasNextPage endCursor } }"));
         assert!(query.contains("comments(first: 250)"));
+    }
+
+    #[test]
+    fn labels_page_query_escapes_identifier_and_cursor() {
+        let query = build_labels_page_query("ABC-1\"} x", "cur\"sor\n");
+        assert!(query.contains(r#"issue(id: "ABC-1\"} x")"#), "{query}");
+        assert!(
+            query.contains(r#"labels(first: 250, after: "cur\"sor\n")"#),
+            "{query}"
+        );
+        assert!(query.contains("pageInfo { hasNextPage endCursor }"));
+        assert!(!query.contains("comments"));
+    }
+
+    /// Outcome of folding canned label pages: the labels kept, whether every
+    /// page was read, and the cursors the pager asked for.
+    type LabelFold = (Vec<String>, bool, Vec<String>);
+
+    /// Drive the pager over JSON label pages exactly as `get_issue` does: the
+    /// first page is the issue's own, later pages answer the follow-up query.
+    fn fold_label_pages(pages: &[String]) -> LabelFold {
+        let mut pages = pages.iter().map(|page| {
+            serde_json::from_str::<LinearLabelList>(page).expect("label page fixture parses")
+        });
+        let mut pager = LabelPager::default();
+        let first = pages.next().expect("a first label page");
+        let names = first.nodes.into_iter().map(|label| label.name).collect();
+        let mut step = pager.absorb(names, first.page_info);
+        let mut asked = Vec::new();
+        let complete = loop {
+            match step {
+                LabelStep::Done(complete) => break complete,
+                LabelStep::Fetch(cursor) => {
+                    asked.push(cursor);
+                    let page = pages.next().expect("the pager asked past the fixtures");
+                    let names = page.nodes.into_iter().map(|label| label.name).collect();
+                    step = pager.absorb(names, page.page_info);
+                }
+            }
+        };
+        (pager.labels, complete, asked)
+    }
+
+    /// Each fixture page as minified and as pretty-printed JSON.
+    fn label_page_texts(pages: &[serde_json::Value]) -> [Vec<String>; 2] {
+        [
+            pages
+                .iter()
+                .map(|page| serde_json::to_string(page).unwrap())
+                .collect(),
+            pages
+                .iter()
+                .map(|page| serde_json::to_string_pretty(page).unwrap())
+                .collect(),
+        ]
+    }
+
+    #[test]
+    fn fold_label_pages_reads_two_pages_complete_and_deduplicated() {
+        let pages = [
+            json!({
+                "nodes": [{"name": "bug"}, {"name": "ui"}],
+                "pageInfo": {"hasNextPage": true, "endCursor": "c-1"}
+            }),
+            json!({
+                "nodes": [{"name": "ui"}, {"name": "perf"}],
+                "pageInfo": {"hasNextPage": false, "endCursor": null}
+            }),
+        ];
+        for texts in label_page_texts(&pages) {
+            let (labels, complete, asked) = fold_label_pages(&texts);
+            assert_eq!(labels, ["bug", "ui", "perf"]);
+            assert!(complete);
+            assert_eq!(asked, ["c-1"]);
+        }
+    }
+
+    #[test]
+    fn fold_label_pages_repeated_cursor_is_incomplete_and_keeps_first_page() {
+        let pages = [
+            json!({
+                "nodes": [{"name": "bug"}],
+                "pageInfo": {"hasNextPage": true, "endCursor": "same"}
+            }),
+            json!({
+                "nodes": [{"name": "ui"}],
+                "pageInfo": {"hasNextPage": true, "endCursor": "same"}
+            }),
+        ];
+        for texts in label_page_texts(&pages) {
+            let (labels, complete, asked) = fold_label_pages(&texts);
+            assert!(!complete);
+            assert_eq!(labels.first().map(String::as_str), Some("bug"));
+            assert_eq!(asked, ["same"]);
+        }
+    }
+
+    #[test]
+    fn fold_label_pages_stops_incomplete_at_the_page_cap() {
+        let pages = (0..MAX_LIST_PAGES)
+            .map(|page| {
+                json!({
+                    "nodes": [{"name": format!("l{page}")}],
+                    "pageInfo": {"hasNextPage": true, "endCursor": format!("c-{page}")}
+                })
+            })
+            .collect::<Vec<_>>();
+        for texts in label_page_texts(&pages) {
+            let (labels, complete, asked) = fold_label_pages(&texts);
+            assert!(!complete);
+            assert_eq!(labels.len(), MAX_LIST_PAGES);
+            assert_eq!(asked.len(), MAX_LIST_PAGES - 1);
+        }
+    }
+
+    #[test]
+    fn fold_label_pages_follow_up_without_metadata_is_incomplete() {
+        let pages = [
+            json!({
+                "nodes": [{"name": "bug"}],
+                "pageInfo": {"hasNextPage": true, "endCursor": "c-1"}
+            }),
+            json!({"nodes": [{"name": "ui"}]}),
+        ];
+        for texts in label_page_texts(&pages) {
+            let (labels, complete, _) = fold_label_pages(&texts);
+            assert!(!complete);
+            assert_eq!(labels, ["bug", "ui"]);
+        }
+    }
+
+    async fn run_get(
+        responses: Vec<serde_json::Value>,
+    ) -> (Result<IssueDetail, IssueError>, Vec<String>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let queries = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let route_queries = Arc::clone(&queries);
+        let responses = Arc::new(responses);
+        let route_responses = Arc::clone(&responses);
+        let server = tokio::spawn(async move {
+            let app = Router::new().fallback(any(move |request: Request| {
+                let route_queries = Arc::clone(&route_queries);
+                let route_responses = Arc::clone(&route_responses);
+                async move {
+                    let body = axum::body::to_bytes(request.into_body(), usize::MAX)
+                        .await
+                        .unwrap();
+                    let request: serde_json::Value = serde_json::from_slice(&body).unwrap();
+                    let mut queries = route_queries.lock().unwrap();
+                    let index = queries.len();
+                    queries.push(request["query"].as_str().unwrap().to_string());
+                    drop(queries);
+                    let payload = route_responses
+                        .get(index)
+                        .or_else(|| route_responses.last())
+                        .expect("at least one Linear fixture response");
+                    let mut response =
+                        (StatusCode::OK, Body::from(payload.to_string())).into_response();
+                    response.headers_mut().insert(
+                        reqwest::header::CONTENT_TYPE,
+                        HeaderValue::from_static("application/json"),
+                    );
+                    response
+                }
+            }));
+            axum::serve(listener, app).await.unwrap();
+        });
+        let backend = LinearBackend::new_for_test(
+            "linear-secret".into(),
+            None,
+            Arc::new(TrackerHttpBudget::with_permits(1)),
+            &format!("http://{address}"),
+        );
+        let result = backend.get_issue("linear:ABC-1").await;
+        server.abort();
+        assert!(server.await.unwrap_err().is_cancelled());
+        let queries = queries.lock().unwrap().clone();
+        (result, queries)
+    }
+
+    /// The issue's own page: two labels, more to come, comments complete.
+    fn issue_with_label_page() -> serde_json::Value {
+        let mut issue = list_item(1);
+        issue["labels"] = json!({
+            "nodes": [{"name": "bug"}, {"name": "ui"}],
+            "pageInfo": {"hasNextPage": true, "endCursor": "l-1"}
+        });
+        issue["comments"] = json!({
+            "nodes": [],
+            "pageInfo": {"hasNextPage": false, "endCursor": null}
+        });
+        json!({"data": {"issue": issue}})
+    }
+
+    #[tokio::test]
+    async fn get_issue_follows_label_cursors() {
+        let (result, queries) = run_get(vec![
+            issue_with_label_page(),
+            json!({"data": {"issue": {"labels": {
+                "nodes": [{"name": "ui"}, {"name": "perf"}],
+                "pageInfo": {"hasNextPage": false, "endCursor": null}
+            }}}}),
+        ])
+        .await;
+        let detail = result.unwrap();
+        assert_eq!(detail.issue.labels, ["bug", "ui", "perf"]);
+        assert!(detail.labels_complete);
+        assert!(detail.comments_complete);
+        assert_eq!(queries.len(), 2);
+        assert!(
+            queries[1].contains(r#"labels(first: 250, after: "l-1")"#),
+            "{}",
+            queries[1]
+        );
+    }
+
+    #[tokio::test]
+    async fn get_issue_label_page_failure_keeps_first_page() {
+        let (result, queries) = run_get(vec![
+            issue_with_label_page(),
+            json!({"errors": [{"message": "boom"}]}),
+        ])
+        .await;
+        let detail = result.unwrap();
+        assert_eq!(detail.issue.labels, ["bug", "ui"]);
+        assert!(!detail.labels_complete);
+        assert_eq!(queries.len(), 2);
     }
 
     fn list_item(n: usize) -> serde_json::Value {
