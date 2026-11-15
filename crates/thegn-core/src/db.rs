@@ -1170,7 +1170,7 @@ impl serde::Serialize for MergeQueueRow {
     ) -> std::result::Result<S::Ok, S::Error> {
         use serde::ser::SerializeStruct;
 
-        let mut state = serializer.serialize_struct("MergeQueueRow", 12)?;
+        let mut state = serializer.serialize_struct("MergeQueueRow", 14)?;
         state.serialize_field("worktree", &self.worktree)?;
         state.serialize_field("branch", &self.branch)?;
         state.serialize_field("target_branch", &self.target_branch)?;
@@ -1186,6 +1186,13 @@ impl serde::Serialize for MergeQueueRow {
             .identity_drift()
             .map(|reason| crate::merge_identity_drift::IdentityDrift { reason });
         state.serialize_field("identity_drift", &drift)?;
+        let cleanup_retry =
+            crate::merge_sweep::CleanupRetry::from_detail(self.error_detail.as_deref());
+        state.serialize_field("cleanup_retry", &cleanup_retry)?;
+        let cleanup_hold =
+            crate::merge_sweep::CleanupHold::from_detail(self.error_detail.as_deref())
+                .map(crate::merge_sweep::CleanupHold::id);
+        state.serialize_field("cleanup_hold", &cleanup_hold)?;
         state.end()
     }
 }
