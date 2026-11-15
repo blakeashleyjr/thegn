@@ -1065,6 +1065,19 @@ fn sweep_one_background(
     }
 }
 
+/// Build the refresh's provider client bound to the refresh wall: every
+/// provider call clips its timeout to the time left on `budget.deadline`, so a
+/// call admitted just before the wall still ends by it (a clipped call fails
+/// like any other, and the cached row is kept).
+fn refresh_client(
+    loc: &thegn_core::remote::GitLoc,
+    cfg: &thegn_core::config::CiConfig,
+    cancel: Arc<AtomicBool>,
+    budget: &CallBudget,
+) -> Option<(thegn_svc::ci::CiClient, Option<String>)> {
+    thegn_svc::ci::provider_and_context_for_deadline(loc, cfg, cancel, budget.deadline)
+}
+
 /// The blocking body of a CI cache refresh for one worktree location. Returns
 /// whether a fetch was actually attempted (`false` when skipped by the
 /// freshness/backoff guards or when no provider resolves).
@@ -1106,9 +1119,7 @@ fn refresh_ci_cache_for(
     if cancel.load(Ordering::Relaxed) {
         return false;
     }
-    let Some((client, context)) =
-        thegn_svc::ci::provider_and_context_for_cancellable(loc, cfg, Arc::clone(&cancel))
-    else {
+    let Some((client, context)) = refresh_client(loc, cfg, Arc::clone(&cancel), budget) else {
         return false;
     };
     let branch = if loc.is_remote() {
@@ -2248,6 +2259,52 @@ mod tests {
             cached.as_ref(),
             thegn_core::util::now()
         ));
+    }
+
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "test fixture: initialize an isolated Git repository"
+    )]
+    #[test]
+    fn refresh_call_admitted_near_the_wall_ends_by_the_wall() {
+        let temp = private_tempdir();
+        let worktree = temp.path().join("repo");
+        std::fs::create_dir(&worktree).expect("create fixture repo");
+        let status = thegn_core::util::git_cmd(&worktree)
+            .args(["init", "-q", "-b", "topic"])
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .status()
+            .expect("initialize fixture repo");
+        assert!(status.success(), "git init failed for fixture repo");
+        let status = thegn_core::util::git_cmd(&worktree)
+            .args(["remote", "add", "origin", "https://github.com/o/b.git"])
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .status()
+            .expect("add fixture origin");
+        assert!(status.success(), "adding fixture origin failed");
+        let loc = thegn_core::remote::GitLoc::for_worktree(&worktree);
+        let cfg = thegn_core::config::CiConfig::default();
+
+        // The wall has been reached by the time the provider call runs: the
+        // client carries the refresh's deadline, so the call ends at once with
+        // the deadline error instead of spawning `gh` for its full timeout.
+        let budget = CallBudget {
+            remaining: 1,
+            bytes_remaining: MAX_LOG_INGEST_BYTES,
+            deadline: Some(Instant::now()),
+        };
+        let (client, context) =
+            refresh_client(&loc, &cfg, Arc::new(AtomicBool::new(false)), &budget)
+                .expect("GitHub origin resolves a provider");
+        assert_eq!(context.as_deref(), Some("github:github.com/o/b"));
+        let error = client
+            .run_detail(&loc, "123")
+            .map(|_| ())
+            .expect_err("a spent wall fails the call");
+        assert_eq!(
+            error,
+            thegn_core::ci::CiError::Other("CI operation deadline reached".into())
+        );
     }
 
     #[test]
