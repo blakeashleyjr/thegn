@@ -1684,6 +1684,72 @@ impl SidebarState {
     }
 }
 
+/// Project the loop-owned plugin row store onto the current sidebar rows.
+/// This is called only after plugin damage or a model swap, never from a
+/// timer, so an idle session cannot acquire a new wake source.
+fn sync_plugin_fields(model: &mut FrameModel, plugins: &crate::handlers::plugins::PluginsState) {
+    let snapshot = crate::handlers::plugins::row_field_values(plugins);
+    let mut slots = std::collections::BTreeMap::new();
+    for (plugin, entry) in &plugins.plugins {
+        for contribution in &entry.contributions {
+            if contribution.extension_point != thegn_core::plugin_api::ExtensionPoint::WorktreeField
+            {
+                continue;
+            }
+            let Ok(caps) = serde_json::from_value::<thegn_core::plugin_api::WorktreeFieldCaps>(
+                contribution.caps.clone(),
+            ) else {
+                continue;
+            };
+            slots.insert((plugin.clone(), caps.field), caps.slot);
+        }
+    }
+
+    let mut projected = std::collections::BTreeMap::new();
+    for row in model
+        .sidebar_rows
+        .iter()
+        .filter(|row| row.kind == crate::sidebar::RowKind::Worktree)
+    {
+        let Some(path) = row.worktree_path.as_deref() else {
+            continue;
+        };
+        let branch = row
+            .branch
+            .as_deref()
+            .filter(|branch| !branch.is_empty())
+            .unwrap_or(&row.label);
+        let mut values = Vec::new();
+        for ((plugin, field), worktrees) in &snapshot {
+            let Some(value) = worktrees.get(path).or_else(|| worktrees.get(branch)) else {
+                continue;
+            };
+            let Some(slot) = slots.get(&(plugin.clone(), field.clone())).copied() else {
+                continue;
+            };
+            values.push(crate::sidebar::PluginFieldValue {
+                plugin: plugin.clone(),
+                field: field.clone(),
+                text: value.text.clone(),
+                role: value.role,
+                slot,
+            });
+        }
+        if !values.is_empty() {
+            projected.insert(path.to_string(), values);
+        }
+    }
+    for row in &mut model.sidebar_rows {
+        row.plugin_fields = row
+            .worktree_path
+            .as_deref()
+            .and_then(|path| projected.get(path))
+            .cloned()
+            .unwrap_or_default();
+    }
+    model.sidebar_status.plugin_fields = projected;
+}
+
 // Sidebar row activation lives in `handlers/sidebar_activate.rs` (extracted
 // from this ratchet-pinned file); re-exported so call sites read unchanged.
 pub(crate) use crate::handlers::sidebar_activate::activate_row_target;
@@ -12819,6 +12885,7 @@ async fn event_loop<T: Terminal>(
             // Plugin statusbar segments are loop-owned (handlers::plugins), not
             // hydrated — re-stamp them so a model swap doesn't blank the bar.
             model.plugin_segments = crate::handlers::plugins::statusbar_views(&plugins_state);
+            sync_plugin_fields(&mut model, &plugins_state);
             // The Symbols list (outline/refs) is re-derived in the pre-render block.
             // Mirror an externally-started (or externally-finished) rebase
             // into the git flow state, so the TODO view and conflict chrome
@@ -14430,12 +14497,13 @@ async fn event_loop<T: Terminal>(
         // Plugin runtime messages: apply verbs to the per-plugin runtimes and
         // map the aggregate plugin damage to the narrowest compositor channel.
         // Raised alerts are recorded to the inbox off-loop by `flush_alerts`.
-        match crate::handlers::plugins::drain(
+        let plugin_damage = crate::handlers::plugins::drain(
             &mut plugin_rx,
             &mut plugins_state,
             &mut model,
             plugins_host.as_ref(),
-        ) {
+        );
+        match plugin_damage {
             crate::plugin_damage::PluginDamage::None => {}
             crate::plugin_damage::PluginDamage::StatusbarContent => {
                 model.plugin_segments = crate::handlers::plugins::statusbar_views(&plugins_state);
@@ -14452,6 +14520,9 @@ async fn event_loop<T: Terminal>(
                 bars_dirty = true;
                 dirty = true;
             }
+        }
+        if !matches!(plugin_damage, crate::plugin_damage::PluginDamage::None) {
+            sync_plugin_fields(&mut model, &plugins_state);
         }
         let plugin_backlog = !plugin_rx.is_empty();
         crate::handlers::plugins::flush_alerts(&mut plugins_state);
