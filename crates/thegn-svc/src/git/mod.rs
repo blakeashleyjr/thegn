@@ -1104,7 +1104,7 @@ pub(super) fn output_bounded_with_input(
 /// bytes otherwise (the unit tests inject sub-MiB caps).
 fn describe_output_cap(cap: usize) -> String {
     const MIB: usize = 1024 * 1024;
-    if cap >= MIB && cap % MIB == 0 {
+    if cap >= MIB && cap.is_multiple_of(MIB) {
         format!("{} MiB", cap / MIB)
     } else {
         format!("{cap} bytes")
