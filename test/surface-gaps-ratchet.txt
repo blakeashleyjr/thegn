@@ -34,9 +34,7 @@ git.commit	mcp	MCP state tools land in the client-API phase
 git.stage	mcp	MCP state tools land in the client-API phase
 issues.comment	mcp	MCP state tools land in the client-API phase
 issues.update	mcp	MCP state tools land in the client-API phase
-merge.add	mcp	MCP state tools land in the client-API phase
 merge.clear	mcp	MCP state tools land in the client-API phase
-notify.push	mcp	MCP state tools land in the client-API phase
 project.assign	grpc	control-API route deferred; CLI-only for now
 project.assign	http	control-API route deferred; CLI-only for now
 program.assign	grpc	control-API route deferred; CLI-only for now
