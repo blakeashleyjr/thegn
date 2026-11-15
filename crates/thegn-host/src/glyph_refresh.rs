@@ -15,6 +15,7 @@ use std::time::Instant;
 
 use crate::glyph_types::GlyphRow;
 use crate::sidebar::GitGlyphs;
+use thegn_svc::git::BranchMeta;
 
 fn jj_memo() -> &'static Mutex<HashMap<String, bool>> {
     static MEMO: OnceLock<Mutex<HashMap<String, bool>>> = OnceLock::new();
@@ -89,15 +90,17 @@ pub(crate) fn glyphs_from_row(row: &GlyphRow, jj: bool) -> GitGlyphs {
 pub(crate) fn seed_glyphs_from_cache(
     git: &mut BTreeMap<String, GitGlyphs>,
     branches: &mut BTreeMap<String, String>,
+    meta: &mut BTreeMap<String, BranchMeta>,
     paths: impl IntoIterator<Item = String>,
     cache: &HashMap<String, (GlyphRow, Instant)>,
     jj: &HashMap<String, bool>,
 ) {
     for p in paths {
-        if git.contains_key(&p) {
-            continue;
-        }
         if let Some((row, _)) = cache.get(&p) {
+            if git.contains_key(&p) {
+                meta.entry(p).or_insert_with(|| row.meta.clone());
+                continue;
+            }
             // The cached row carries the branch HEAD pointed at when it was
             // scanned — the right fallback for a row whose live scan is gated
             // (suspended sandbox, other workspace), and still fresher than the
@@ -106,9 +109,10 @@ pub(crate) fn seed_glyphs_from_cache(
                 branches.entry(p.clone()).or_insert_with(|| branch.clone());
             }
             git.insert(
-                p,
+                p.clone(),
                 glyphs_from_row(row, jj.get(&row.repo_root).copied().unwrap_or(false)),
             );
+            meta.insert(p, row.meta.clone());
         }
     }
 }
@@ -119,6 +123,7 @@ pub(crate) fn seed_glyphs_from_cache(
 pub(crate) fn seed_from_global_cache(
     git: &mut BTreeMap<String, GitGlyphs>,
     branches: &mut BTreeMap<String, String>,
+    meta: &mut BTreeMap<String, BranchMeta>,
     paths: impl IntoIterator<Item = String>,
 ) {
     // The only dual-lock site: cache before memo. Neither lock is held during a
@@ -127,7 +132,7 @@ pub(crate) fn seed_from_global_cache(
         .lock()
         .unwrap_or_else(|error| error.into_inner());
     let memo = jj_memo().lock().unwrap_or_else(|error| error.into_inner());
-    seed_glyphs_from_cache(git, branches, paths, &cache, &memo);
+    seed_glyphs_from_cache(git, branches, meta, paths, &cache, &memo);
 }
 
 #[cfg(test)]
@@ -146,6 +151,7 @@ mod tests {
                 del: thegn_svc::git::DiffCount::Exact(0),
                 branch_diff: None,
                 submodule_dirty: false,
+                meta: BranchMeta::default(),
             },
             Instant::now(),
         )
@@ -180,6 +186,7 @@ mod tests {
                 thegn_svc::git::DiffCount::Exact(84),
             )),
             submodule_dirty: false,
+            meta: BranchMeta::default(),
         };
         assert_eq!(
             glyphs_from_row(&r, false),
@@ -206,6 +213,7 @@ mod tests {
         seed_glyphs_from_cache(
             &mut git,
             &mut branches,
+            &mut BTreeMap::new(),
             ["/a".to_string(), "/b".to_string()],
             &cache,
             &HashMap::new(),
@@ -231,6 +239,25 @@ mod tests {
     }
 
     #[test]
+    fn seed_from_cache_fills_branch_meta() {
+        let mut cached = row(false, 0, 0).0;
+        cached.meta.ahead_base = Some(7);
+        let cache = HashMap::from([(String::from("/a"), (cached, Instant::now()))]);
+        let mut git = BTreeMap::new();
+        let mut branches = BTreeMap::new();
+        let mut meta = BTreeMap::new();
+        seed_glyphs_from_cache(
+            &mut git,
+            &mut branches,
+            &mut meta,
+            ["/a".to_string()],
+            &cache,
+            &HashMap::new(),
+        );
+        assert_eq!(meta["/a"].ahead_base, Some(7));
+    }
+
+    #[test]
     fn does_not_overwrite_existing_scanned_rows() {
         let mut cache = HashMap::new();
         cache.insert("/a".to_string(), row(false, 0, 0)); // stale cache
@@ -246,6 +273,7 @@ mod tests {
         seed_glyphs_from_cache(
             &mut git,
             &mut branches,
+            &mut BTreeMap::new(),
             ["/a".to_string()],
             &cache,
             &HashMap::new(),
@@ -272,6 +300,7 @@ mod tests {
                     del: thegn_svc::git::DiffCount::Exact(0),
                     branch_diff: None,
                     submodule_dirty: false,
+                    meta: BranchMeta::default(),
                 },
                 Instant::now(),
             ),
@@ -281,6 +310,7 @@ mod tests {
         seed_glyphs_from_cache(
             &mut git,
             &mut branches,
+            &mut BTreeMap::new(),
             ["/a".to_string()],
             &cache,
             &HashMap::new(),
@@ -294,6 +324,7 @@ mod tests {
         seed_glyphs_from_cache(
             &mut git,
             &mut branches,
+            &mut BTreeMap::new(),
             ["/a".to_string()],
             &cache,
             &HashMap::new(),
@@ -309,6 +340,7 @@ mod tests {
         seed_glyphs_from_cache(
             &mut git,
             &mut branches,
+            &mut BTreeMap::new(),
             ["/nope".to_string()],
             &cache,
             &HashMap::new(),
@@ -331,6 +363,7 @@ mod tests {
         seed_glyphs_from_cache(
             &mut git,
             &mut branches,
+            &mut BTreeMap::new(),
             ["/worktree".to_string()],
             &cache,
             &HashMap::new(),
@@ -342,6 +375,7 @@ mod tests {
         seed_glyphs_from_cache(
             &mut git,
             &mut branches,
+            &mut BTreeMap::new(),
             ["/worktree".to_string()],
             &cache,
             &jj_memo,

@@ -11,7 +11,7 @@
 use std::collections::HashSet;
 
 use crate::session::Session;
-use thegn_svc::git::DiffCount;
+use thegn_svc::git::{BranchMeta, DiffCount};
 
 /// Which level of the tree a row sits at.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -202,6 +202,16 @@ impl SortMode {
     }
 }
 
+/// A value supplied by a plugin for one worktree row field.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PluginFieldValue {
+    pub plugin: String,
+    pub field: String,
+    pub text: String,
+    pub role: thegn_core::plugin_api::RowRole,
+    pub slot: thegn_core::plugin_api::RowFieldSlot,
+}
+
 /// One row in the workspace tree.
 #[derive(Debug, Clone)]
 pub struct SidebarRow {
@@ -228,6 +238,7 @@ pub struct SidebarRow {
     /// The worktree's branch (Worktree rows) — the seed for the rename prompt
     /// and the base of the "branch from this" action.
     pub branch: Option<String>,
+    pub branch_meta: Option<BranchMeta>,
     pub git: Option<GitGlyphs>,
     pub sandbox_backend: Option<String>,
     /// Selected execution environment (`[env.<name>]`); `None`/`"default"` ⇒
@@ -299,6 +310,9 @@ pub struct SidebarRow {
     /// child worktree rows. `None` for worktrees and workspaces with no active
     /// queue entries.
     pub mq_rollup: Option<thegn_core::merge_queue_view::MqRollup>,
+    /// Resident plugin values resolved for this worktree. Empty when no
+    /// installed plugin has published a value for the row.
+    pub plugin_fields: Vec<PluginFieldValue>,
 }
 
 impl SidebarRow {
@@ -322,6 +336,7 @@ impl SidebarRow {
             worktree_path: None,
             pin_key: String::new(),
             branch: None,
+            branch_meta: None,
             git: None,
             sandbox_backend: None,
             env_name: None,
@@ -346,6 +361,7 @@ impl SidebarRow {
             pipeline_stage: None,
             repo_prefix: None,
             mq_rollup: None,
+            plugin_fields: Vec::new(),
         }
     }
 
@@ -392,6 +408,7 @@ impl SidebarRow {
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct SidebarStatus {
     pub git: std::collections::BTreeMap<String, GitGlyphs>,
+    pub branch_meta: std::collections::BTreeMap<String, BranchMeta>,
     /// The worktree's LIVE `HEAD` branch, keyed by path — read by the same git
     /// scan that produces `git`. The row's `{slug}/{branch}` tab name is only a
     /// creation-time identity (it never moves when you `git checkout` inside the
@@ -452,6 +469,8 @@ pub struct SidebarStatus {
     /// Absent for a worktree with no live staged dispatch (see
     /// `monitor_pipeline::stage_badges`).
     pub pipeline_stages: std::collections::BTreeMap<String, String>,
+    /// Resident plugin row-field values keyed by worktree path.
+    pub plugin_fields: std::collections::BTreeMap<String, Vec<PluginFieldValue>>,
     /// The derived lane folders under the Pipeline row: one per issue/worktree
     /// with **active** dispatch rows, each carrying its agents (see
     /// [`crate::sidebar_pipeline::lanes`]). A fourth pure fold over the same
@@ -707,180 +726,23 @@ pub(crate) fn terminal_host(conn: &str, kind: &str) -> (String, String, bool) {
     (host.to_lowercase(), host.to_string(), false)
 }
 
-/// The focused row's second line: the branch name plus the secondary metadata
-/// that would crowd the always-on row — branch-vs-local-default-branch line stat,
-/// execution env, sandbox backend, hibernation, open PRs, unread notifications,
-/// and disk size. Field visibility follows the `[ui]` sidebar toggles carried on
-/// `disp`. `None` when the row has nothing to show. (Extracted from the
-/// ratchet-pinned `chrome.rs`.)
+/// The worktree row's second line. Composition lives in the pure detail module;
+/// this wrapper preserves the sidebar module's existing call surface.
+#[cfg(test)]
 pub(crate) fn compose_detail_line(
     row: &SidebarRow,
     disp: &crate::sidebar_view::SidebarDisplay,
 ) -> Option<crate::seg::Line> {
-    use crate::chrome::S;
-    use crate::seg::{Line, Seg, Tok, seg, sp};
-    use thegn_core::pipeline_report::display_cell;
-    use thegn_core::theme;
-    // Gutter + indent so the detail reads as hanging under the name.
-    let mut segs: Vec<Seg> = vec![sp(5)];
-    let start = segs.len();
-    // Lead with the branch name — the main line now shows the dynamic name.
-    // `row.branch` is the LIVE `HEAD` (it tracks a `git checkout`); `row.label`
-    // is the creation-time tab name and is only the fallback.
-    let branch = row
-        .branch
-        .as_deref()
-        .filter(|b| !b.is_empty())
-        .unwrap_or(&row.label);
-    if disp.detail_branch && !branch.is_empty() {
-        segs.push(seg(Tok::Slot(S::Dim), format!("{} ", display_cell(branch))));
-    }
-    // This branch's own work over the repo's LOCAL default branch (`+adds` green
-    // / `-dels` red) — the same base `thegn diff` and the diff viewer use, so a
-    // row on the trunk (or freshly branched off it) correctly shows nothing.
-    if disp.detail_branch_stat
-        && let Some((add, del)) = row.git.and_then(|g| g.branch_diff)
-    {
-        if add == DiffCount::Unavailable || del == DiffCount::Unavailable {
-            segs.push(seg(Tok::Hue(theme::Hue::Amber), "diff ?"));
-            segs.push(sp(1));
-        } else {
-            let mut shown = false;
-            if add == DiffCount::Binary || del == DiffCount::Binary {
-                segs.push(seg(Tok::Slot(S::Dim), "bin"));
-                shown = true;
-            }
-            if let DiffCount::Exact(n) = add
-                && n > 0
-            {
-                if shown {
-                    segs.push(sp(1));
-                }
-                segs.push(seg(Tok::Hue(theme::Hue::Green), format!("+{n}")));
-                shown = true;
-            } else if matches!(add, DiffCount::Capped) {
-                if shown {
-                    segs.push(sp(1));
-                }
-                segs.push(seg(Tok::Hue(theme::Hue::Green), "+capped"));
-                shown = true;
-            }
-            if let DiffCount::Exact(n) = del
-                && n > 0
-            {
-                if shown {
-                    segs.push(sp(1));
-                }
-                segs.push(seg(Tok::Hue(theme::Hue::Red), format!("-{n}")));
-                shown = true;
-            } else if matches!(del, DiffCount::Capped) {
-                if shown {
-                    segs.push(sp(1));
-                }
-                segs.push(seg(Tok::Hue(theme::Hue::Red), "-capped"));
-                shown = true;
-            }
-            if shown {
-                segs.push(sp(1));
-            }
-        }
-    }
-    let dirty = row.git.is_some_and(|g| g.dirty);
-    crate::sidebar_legend::push_row_markers(dirty, &mut segs);
-
-    if let Some(env) = &row.env_name
-        && !env.is_empty()
-        && env != "default"
-    {
-        let gl = crate::caps::active_glyphs();
-        // Degraded provider pin: mark the badge (`«env ✗»`, amber) so it doesn't
-        // imply the pane is on the provider when it's really on the host. ASCII
-        // fallback swaps `✗`→`x` and `«»`→`<>` via the caps glyph set.
-        if row.env_degraded {
-            segs.push(seg(
-                Tok::Hue(theme::Hue::Amber),
-                format!(
-                    "{}{} {}{} ",
-                    gl.quote_open,
-                    display_cell(env),
-                    gl.cross,
-                    gl.quote_close
-                ),
-            ));
-        } else {
-            segs.push(seg(
-                Tok::Slot(S::Faint),
-                format!("{}{}{} ", gl.quote_open, display_cell(env), gl.quote_close),
-            ));
-        }
-    }
-    if let Some(profile) = &row.sandbox_profile {
-        segs.push(seg(
-            Tok::Slot(S::Faint),
-            format!("[{}] ", display_cell(profile)),
-        ));
-    }
-    if let Some(backend) = &row.sandbox_backend
-        && !backend.is_empty()
-        && backend != "none"
-        && backend != "host"
-    {
-        segs.push(seg(
-            Tok::Slot(S::Faint),
-            format!("({}) ", display_cell(backend)),
-        ));
-    }
-    if let Some(devcontainer) = &row.devcontainer_status {
-        segs.push(seg(
-            Tok::Slot(S::Faint),
-            format!("{} ", display_cell(devcontainer)),
-        ));
-    }
-    if row
-        .worktree_path
-        .as_deref()
-        .is_some_and(crate::hibernator::is_hibernated)
-    {
-        let moon = crate::caps::active_glyphs().moon;
-        segs.push(seg(Tok::Slot(S::Faint), format!("{moon} hibernated ")));
-    }
-    if disp.detail_pr {
-        let hex = crate::caps::active_glyphs().hex;
-        // Prefer the concrete PR number (`⬡ PR #123`); fall back to the count
-        // (`⬡ 2 PR`) when only a count is known for this branch.
-        if let Some(n) = row.pr_number {
-            segs.push(seg(Tok::Hue(theme::Hue::Green), format!("{hex} PR #{n} ")));
-        } else if let Some(pr) = row.pr_count.filter(|&c| c > 0) {
-            segs.push(seg(Tok::Hue(theme::Hue::Green), format!("{hex} {pr} PR ")));
-        }
-    }
-    if let Some((glyph, hue)) = row.mq_status.and_then(mq_chip) {
-        segs.push(seg(Tok::Hue(hue), format!("{glyph} MQ ")));
-    }
-    if row.unread_count > 0 {
-        let mail = crate::caps::active_glyphs().mail;
-        let blue = Tok::Hue(theme::Hue::Blue);
-        segs.push(seg(blue, format!("{mail} {} unread ", row.unread_count)));
-    }
-    if let Some(total) = row.disk_bytes {
-        let target = row.target_bytes.unwrap_or(0);
-        let heavy = target > 1024 * 1024 * 1024 && target * 2 > total;
-        let fg = if heavy {
-            Tok::Hue(theme::Hue::Amber)
-        } else {
-            Tok::Slot(S::Dim)
-        };
-        segs.push(seg(fg, thegn_core::disk::human(total)));
-    }
-
-    (segs.len() > start).then_some(Line::Segs(segs))
+    crate::sidebar_detail::compose_detail_line(row, disp)
 }
 
 /// The detail line's merge-queue chip for a status: the shared
 /// [`thegn_core::attention::MqStatus::glyph`] vocabulary (also used by
 /// `panel/sections/merge_queue.rs`), minus `Landed` — a finished row is panel
 /// detail, not sidebar-worthy signal.
-fn mq_chip(mq: thegn_core::attention::MqStatus) -> Option<(&'static str, thegn_core::theme::Hue)> {
+pub(crate) fn mq_chip(
+    mq: thegn_core::attention::MqStatus,
+) -> Option<(&'static str, thegn_core::theme::Hue)> {
     if mq == thegn_core::attention::MqStatus::Landed {
         return None;
     }
@@ -1695,6 +1557,23 @@ fn worktree_row(
         .as_deref()
         .and_then(|p| status.branches.get(p))
         .cloned();
+    let plugin_fields = wt_path
+        .as_deref()
+        .and_then(|p| status.plugin_fields.get(p))
+        .or_else(|| {
+            status.plugin_fields.get(
+                live_branch
+                    .as_deref()
+                    .filter(|branch| !branch.is_empty())
+                    .unwrap_or(gr.label.as_str()),
+            )
+        })
+        .cloned()
+        .unwrap_or_default();
+    let branch_meta = wt_path
+        .as_deref()
+        .and_then(|p| status.branch_meta.get(p))
+        .cloned();
     let devcontainer_status = wt_path
         .as_deref()
         .and_then(|p| status.devcontainer_status.get(p))
@@ -1705,6 +1584,7 @@ fn worktree_row(
         worktree_path: wt_path,
         pin_key,
         branch: Some(live_branch.unwrap_or_else(|| gr.label.clone())),
+        branch_meta,
         git,
         sandbox_backend: gr.sandbox_backend.clone(),
         env_name: gr.env_name.clone(),
@@ -1718,6 +1598,7 @@ fn worktree_row(
         unread_count,
         alert_count,
         repo_prefix,
+        plugin_fields,
         ..SidebarRow::base(
             RowKind::Worktree,
             depth,
@@ -2209,7 +2090,7 @@ mod tests {
     }
 
     #[test]
-    fn worktree_rows_carry_the_live_branch_not_the_tab_name() {
+    fn worktree_row_carries_branch_meta() {
         let s = session(vec![tab("app/tg-old", "/wt/a")], 0);
         let ws = vec![(
             "app".to_string(),
@@ -2221,6 +2102,13 @@ mod tests {
         status
             .branches
             .insert("/wt/a".into(), "tg/checked-out-later".into());
+        status.branch_meta.insert(
+            "/wt/a".into(),
+            BranchMeta {
+                ahead_base: Some(5),
+                ..BranchMeta::default()
+            },
+        );
         let rows = build_rows(&s, &ws, &ViewState::default(), &status, &[], &[], &[]);
         let row = rows
             .iter()
@@ -2231,6 +2119,10 @@ mod tests {
         // the `== "home"` checks all key off it.
         assert_eq!(row.label, "tg-old");
         assert_eq!(row.pin_key, "app/tg-old");
+        assert_eq!(
+            row.branch_meta.as_ref().and_then(|meta| meta.ahead_base),
+            Some(5)
+        );
     }
 
     #[test]

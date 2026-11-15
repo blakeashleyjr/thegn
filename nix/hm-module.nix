@@ -251,6 +251,12 @@ self: {
     ui.sidebar_show_status_icon = cfg.uiSidebarShowStatusIcon;
     ui.sidebar_show_diff_stat = cfg.uiSidebarShowDiffStat;
     ui.sidebar_show_ahead_behind = cfg.uiSidebarShowAheadBehind;
+    ui.sidebar_show_commits = cfg.uiSidebarShowCommits;
+    ui.sidebar_show_behind_base = cfg.uiSidebarShowBehindBase;
+    ui.sidebar_commit_badge = cfg.uiSidebarCommitBadge;
+    ui.sidebar_behind_badge = cfg.uiSidebarBehindBadge;
+    ui.sidebar_detail_fields = cfg.uiSidebarDetailFields;
+    ui.sidebar_detail_when = cfg.uiSidebarDetailWhen;
     ui.sidebar_show_pr_chip = cfg.uiSidebarShowPrChip;
     ui.sidebar_show_jj = cfg.uiSidebarShowJj;
     ui.sidebar_show_submodules = cfg.uiSidebarShowSubmodules;
@@ -662,6 +668,42 @@ in {
       description = "Show a separate indicator when a submodule pointer or checkout is dirty. Unset (null) = the binary's default.";
     };
 
+    uiSidebarShowCommits = lib.mkOption {
+      type = lib.types.nullOr (lib.types.bool);
+      default = null;
+      description = "Show the commits-ahead badge on worktree rows. Unset (null) = the binary's default.";
+    };
+
+    uiSidebarShowBehindBase = lib.mkOption {
+      type = lib.types.nullOr (lib.types.bool);
+      default = null;
+      description = "Show the commits-behind-default-branch badge on worktree rows. Unset (null) = the binary's default.";
+    };
+
+    uiSidebarCommitBadge = lib.mkOption {
+      type = lib.types.nullOr (lib.types.str);
+      default = null;
+      description = "Template for the commits-ahead badge; {n} is replaced by the count. Unset (null) = the binary's default.";
+    };
+
+    uiSidebarBehindBadge = lib.mkOption {
+      type = lib.types.nullOr (lib.types.str);
+      default = null;
+      description = "Template for the commits-behind badge; {n} is replaced by the count. Unset (null) = the binary's default.";
+    };
+
+    uiSidebarDetailFields = lib.mkOption {
+      type = lib.types.nullOr (lib.types.listOf lib.types.str);
+      default = ["branch" "commits" "dirty" "branch_stat" "pr" "subject" "age" "env" "sandbox" "devcontainer" "hibernated" "mq" "unread" "disk"];
+      description = "Ordered sidebar detail field names. The default matches the binary's default.";
+    };
+
+    uiSidebarDetailWhen = lib.mkOption {
+      type = lib.types.nullOr (lib.types.enum ["focused" "always"]);
+      default = null;
+      description = "Whether sidebar detail remains visible when unfocused. Unset (null) = the binary's default.";
+    };
+
     uiSidebarDetailBranch = lib.mkOption {
       type = lib.types.nullOr (lib.types.bool);
       default = null;
@@ -695,7 +737,7 @@ in {
     uiSidebarFocusDetail = lib.mkOption {
       type = lib.types.nullOr (lib.types.enum ["all" "cursor" "off"]);
       default = null;
-      description = "Which rows expand to a detail line while the sidebar is focused. Unset (null) = the binary's default.";
+      description = "Which rows expand to a detail line; the default is all rows. Unset (null) = the binary's default.";
     };
 
     uiLanguage = lib.mkOption {

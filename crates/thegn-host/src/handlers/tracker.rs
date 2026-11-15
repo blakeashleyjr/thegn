@@ -373,7 +373,13 @@ fn dispatch_agent(ctx: &mut TrackerCtx) {
             };
 
             let base = wt::resolve_base(&root, &cfg2);
-            let taken = wt::BranchSet::load(&root);
+            let taken = match taken_or_refuse(&root) {
+                Ok(taken) => taken,
+                Err(e) => {
+                    thegn_core::msg::warn(&format!("agent dispatch: {e}"));
+                    return;
+                }
+            };
             // Shared derivation with the headless `worktrees.create` door, so
             // the TUI action and the catalog door never diverge.
             let raw_branch =
@@ -697,6 +703,23 @@ pub(crate) fn move_linked_issues_done(
         }
     }
     failures
+}
+
+/// Branch inventory for agent dispatch. Fails closed: an unavailable
+/// inventory must refuse rather than pick a possibly-taken branch name.
+fn taken_or_refuse(root: &Path) -> Result<thegn_core::worktree::BranchSet, String> {
+    thegn_core::worktree::BranchSet::load_checked(root)
+}
+
+#[cfg(test)]
+mod taken_refuse_tests {
+    use super::taken_or_refuse;
+
+    #[test]
+    fn taken_or_refuse_errors_on_non_repo() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(taken_or_refuse(dir.path()).is_err());
+    }
 }
 
 #[cfg(test)]

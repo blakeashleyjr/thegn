@@ -508,9 +508,13 @@ ui.full_mode_chip
 ui.fullscreen_keep_masthead
 ui.fullscreen_keep_statusbar
 ui.language
+ui.sidebar_behind_badge
+ui.sidebar_commit_badge
 ui.sidebar_detail_branch
 ui.sidebar_detail_branch_stat
+ui.sidebar_detail_fields
 ui.sidebar_detail_pr
+ui.sidebar_detail_when
 ui.sidebar_dividers
 ui.sidebar_focus_detail
 ui.sidebar_freeze_sort
@@ -520,6 +524,8 @@ ui.sidebar_icon_status
 ui.sidebar_nav_skips_collapsed
 ui.sidebar_project_sort
 ui.sidebar_show_ahead_behind
+ui.sidebar_show_behind_base
+ui.sidebar_show_commits
 ui.sidebar_show_diff_stat
 ui.sidebar_show_jj
 ui.sidebar_show_pr_chip

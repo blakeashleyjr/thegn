@@ -314,6 +314,7 @@ impl Fixture {
             .env("GIT_CONFIG_NOSYSTEM", "1")
             .env("GIT_TERMINAL_PROMPT", "0")
             .env_remove("THEGN_LOG")
+            .env_remove("THEGN_SANDBOX_BACKEND")
             .env_remove("THEGN_DATABASE_MIGRATION_EXECUTABLE")
             .env_remove("THEGN_DATABASE_MIGRATION_AUTHORITY");
         let created = run_bounded(
@@ -343,6 +344,7 @@ impl Fixture {
             .env("XDG_RUNTIME_DIR", runtime.path())
             .env("DBUS_SESSION_BUS_ADDRESS", BUS_SENTINEL)
             .env_remove("THEGN_LOG")
+            .env_remove("THEGN_SANDBOX_BACKEND")
             .env_remove("THEGN_DATABASE_MIGRATION_EXECUTABLE")
             .env_remove("THEGN_DATABASE_MIGRATION_AUTHORITY")
             .stdout(Stdio::null())
@@ -400,6 +402,7 @@ impl Fixture {
             .env("XDG_RUNTIME_DIR", self.runtime.path())
             .env("DBUS_SESSION_BUS_ADDRESS", BUS_SENTINEL)
             .env_remove("THEGN_LOG")
+            .env_remove("THEGN_SANDBOX_BACKEND")
             .env_remove("THEGN_DATABASE_MIGRATION_EXECUTABLE")
             .env_remove("THEGN_DATABASE_MIGRATION_AUTHORITY");
         run_bounded(&mut command, self.captures.path(), "cli", PROCESS_TIMEOUT)

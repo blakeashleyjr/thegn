@@ -2265,7 +2265,9 @@ pub struct GitCommand {
 
 // UI/presentation (`[ui]`) settings live in the `config_ui` sibling module;
 // re-exported so `config::UiConfig` keeps working.
-pub use crate::config_ui::{FocusDetail, TerminalsSection, UiConfig, WorkspaceSort};
+pub use crate::config_ui::{
+    DetailEntry, DetailField, DetailWhen, FocusDetail, TerminalsSection, UiConfig, WorkspaceSort,
+};
 /// Git behavior knobs for the panel's write operations (`[git]`).
 #[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
 #[serde(default)]

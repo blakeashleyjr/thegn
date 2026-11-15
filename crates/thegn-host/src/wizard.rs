@@ -1568,11 +1568,22 @@ pub fn run_worker(
             step(CreateStep::FinalizeName, StepState::Skipped, None);
         }
         NameChoice::Human(tail) => {
-            let want = worktree::dedupe(
-                &worktree::human_base(tail, cfg),
-                &worktree::BranchSet::load(root),
-            );
-            if want == branch {
+            let want = match worktree::BranchSet::load_checked(root) {
+                Ok(taken) => worktree::dedupe(&worktree::human_base(tail, cfg), &taken),
+                Err(why) => {
+                    // Cannot prove the typed name free: do not rename; keep the
+                    // generated name like any other rename failure.
+                    step(
+                        CreateStep::FinalizeName,
+                        StepState::Done,
+                        Some(format!("rename failed — kept {branch} ({why})")),
+                    );
+                    String::new()
+                }
+            };
+            if want.is_empty() {
+                // finalize-name already reported above
+            } else if want == branch {
                 step(CreateStep::FinalizeName, StepState::Skipped, None);
             } else {
                 step(CreateStep::FinalizeName, StepState::Running, None);

@@ -34,16 +34,190 @@ config_enum! {
     /// Which worktree rows show the secondary detail line (branch + extra info)
     /// while the sidebar is focused. "all" expands every worktree row; "cursor"
     /// expands only the highlighted row; "off" never shows the detail line. The
-    /// detail line only appears while the sidebar owns focus.
+    /// Whether focus is required is controlled by [`DetailWhen`].
     ///
-    /// Defaults to "cursor". "all" doubles the height of EVERY worktree row the
-    /// moment the sidebar takes focus, which on a full tree pushed the bottom
-    /// rows out of the viewport — merely focusing the sidebar appeared to
-    /// delete the last workspace. Scrolling now reaches them either way, but
-    /// halving the visible tree on focus is a poor default. `i` cycles it.
+    /// Defaults to "all". `i` cycles this setting.
     pub enum FocusDetail: "focus detail" {
         All = "all", Cursor = "cursor", Off = "off",
-    } default = Cursor;
+    } default = All;
+}
+
+config_enum! {
+    /// Whether the detail line is available only while the sidebar is focused
+    /// ("focused"), or remains available while another pane owns focus
+    /// ("always").
+    pub enum DetailWhen: "detail visibility" {
+        Focused = "focused", Always = "always",
+    } default = Always;
+}
+
+/// A field that can be requested in the sidebar's ordered detail line.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DetailField {
+    /// The worktree branch name.
+    Branch,
+    /// Commits ahead of the default branch, and optionally behind it.
+    Commits,
+    /// The dirty-file count.
+    Dirty,
+    /// The branch-vs-default-branch line statistic.
+    BranchStat,
+    /// The open pull request marker.
+    Pr,
+    /// The last commit subject.
+    Subject,
+    /// The approximate last-commit age.
+    Age,
+    /// Commits ahead of and behind the upstream branch.
+    Upstream,
+    /// The current pipeline stage.
+    Stage,
+    /// The current short activity state.
+    Activity,
+    /// The selected execution environment.
+    Env,
+    /// The sandbox profile and backend.
+    Sandbox,
+    /// The devcontainer status.
+    Devcontainer,
+    /// Whether the worktree is hibernated.
+    Hibernated,
+    /// The merge-queue status.
+    Mq,
+    /// The unread notification count.
+    Unread,
+    /// The worktree disk usage.
+    Disk,
+    /// The name of the last commit's author.
+    Author,
+}
+
+/// One entry in the ordered sidebar detail list.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DetailEntry {
+    /// A field supplied by thegn itself.
+    Builtin(DetailField),
+    /// A field supplied by a resident plugin. The plugin need not be installed
+    /// on this machine; an absent producer simply contributes no value.
+    Plugin { plugin: String, field: String },
+}
+
+pub(crate) fn parse_entry(value: &str) -> Option<DetailEntry> {
+    let value = value.trim();
+    if let Some(rest) = value.strip_prefix("plugin:") {
+        let (plugin, field) = rest.split_once('/')?;
+        let valid_plugin = !plugin.is_empty()
+            && plugin.len() <= 64
+            && plugin
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || "._-".contains(c));
+        let valid_field = !field.is_empty()
+            && field.len() <= 32
+            && field
+                .chars()
+                .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || "_-".contains(c));
+        return (valid_plugin && valid_field).then(|| DetailEntry::Plugin {
+            plugin: plugin.to_string(),
+            field: field.to_string(),
+        });
+    }
+    DetailField::parse(value).map(DetailEntry::Builtin)
+}
+
+impl DetailField {
+    /// Parse a canonical detail-field name.
+    pub fn parse(value: &str) -> Option<Self> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "branch" => Some(Self::Branch),
+            "commits" => Some(Self::Commits),
+            "dirty" => Some(Self::Dirty),
+            "branch_stat" => Some(Self::BranchStat),
+            "pr" => Some(Self::Pr),
+            "subject" => Some(Self::Subject),
+            "age" => Some(Self::Age),
+            "upstream" => Some(Self::Upstream),
+            "stage" => Some(Self::Stage),
+            "activity" => Some(Self::Activity),
+            "env" => Some(Self::Env),
+            "sandbox" => Some(Self::Sandbox),
+            "devcontainer" => Some(Self::Devcontainer),
+            "hibernated" => Some(Self::Hibernated),
+            "mq" => Some(Self::Mq),
+            "unread" => Some(Self::Unread),
+            "disk" => Some(Self::Disk),
+            "author" => Some(Self::Author),
+            _ => None,
+        }
+    }
+
+    /// Return the canonical configuration spelling.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Branch => "branch",
+            Self::Commits => "commits",
+            Self::Dirty => "dirty",
+            Self::BranchStat => "branch_stat",
+            Self::Pr => "pr",
+            Self::Subject => "subject",
+            Self::Age => "age",
+            Self::Upstream => "upstream",
+            Self::Stage => "stage",
+            Self::Activity => "activity",
+            Self::Env => "env",
+            Self::Sandbox => "sandbox",
+            Self::Devcontainer => "devcontainer",
+            Self::Hibernated => "hibernated",
+            Self::Mq => "mq",
+            Self::Unread => "unread",
+            Self::Disk => "disk",
+            Self::Author => "author",
+        }
+    }
+
+    /// The valid spellings, in documentation order.
+    pub const fn valid_names() -> [&'static str; 18] {
+        [
+            "branch",
+            "commits",
+            "dirty",
+            "branch_stat",
+            "pr",
+            "subject",
+            "age",
+            "upstream",
+            "stage",
+            "activity",
+            "env",
+            "sandbox",
+            "devcontainer",
+            "hibernated",
+            "mq",
+            "unread",
+            "disk",
+            "author",
+        ]
+    }
+
+    /// The default ordered fields. Optional metadata fields are deliberately
+    /// omitted so existing rows keep their established appearance.
+    pub const fn default_order() -> [Self; 14] {
+        [
+            Self::Branch,
+            Self::Commits,
+            Self::Dirty,
+            Self::BranchStat,
+            Self::Pr,
+            Self::Subject,
+            Self::Age,
+            Self::Env,
+            Self::Sandbox,
+            Self::Devcontainer,
+            Self::Hibernated,
+            Self::Mq,
+            Self::Unread,
+            Self::Disk,
+        ]
+    }
 }
 
 /// UI/Presentation settings (`[ui]`).
@@ -115,6 +289,20 @@ pub struct UiConfig {
     /// Which rows expand to a detail line while the sidebar is focused (see
     /// [`FocusDetail`]).
     pub sidebar_focus_detail: FocusDetail,
+    /// Whether detail remains visible when the sidebar is unfocused.
+    pub sidebar_detail_when: DetailWhen,
+    /// Show the commits-ahead badge on worktree rows.
+    pub sidebar_show_commits: bool,
+    /// Show the commits-behind-default-branch badge on worktree rows.
+    pub sidebar_show_behind_base: bool,
+    /// Template for the commits-ahead badge; `{n}` is replaced by the count.
+    pub sidebar_commit_badge: String,
+    /// Template for the commits-behind badge; `{n}` is replaced by the count.
+    pub sidebar_behind_badge: String,
+    /// Ordered detail fields; unknown names are warned about and ignored.
+    /// Plugin fields use `plugin:<plugin>/<field>` where the plugin id is
+    /// `[A-Za-z0-9._-]{1,64}` and the field is `[a-z0-9_-]{1,32}`.
+    pub sidebar_detail_fields: Vec<String>,
     /// Lead the focused detail line with the branch name.
     pub sidebar_detail_branch: bool,
     /// Show the total branch-vs-default-branch line stat on the focused detail
@@ -160,6 +348,15 @@ impl Default for UiConfig {
             sidebar_show_jj: true,
             sidebar_show_submodules: true,
             sidebar_focus_detail: FocusDetail::default(),
+            sidebar_detail_when: DetailWhen::default(),
+            sidebar_show_commits: true,
+            sidebar_show_behind_base: false,
+            sidebar_commit_badge: "{n}c".to_string(),
+            sidebar_behind_badge: "{n}b".to_string(),
+            sidebar_detail_fields: DetailField::default_order()
+                .into_iter()
+                .map(|field| field.as_str().to_string())
+                .collect(),
             sidebar_detail_branch: true,
             sidebar_detail_branch_stat: true,
             sidebar_detail_pr: true,
@@ -169,6 +366,45 @@ impl Default for UiConfig {
             sidebar_width: None,
             sidebar_wide_ratio: None,
         }
+    }
+}
+
+impl UiConfig {
+    /// Resolve the ordered detail list, dropping unknown and duplicate names.
+    /// Legacy field toggles remain an AND gate for their corresponding fields.
+    pub fn detail_fields_resolved(&self) -> Vec<DetailField> {
+        self.detail_entries_resolved()
+            .into_iter()
+            .filter_map(|entry| match entry {
+                DetailEntry::Builtin(field) => Some(field),
+                DetailEntry::Plugin { .. } => None,
+            })
+            .collect()
+    }
+
+    /// Resolve the ordered detail list, retaining valid plugin entries even
+    /// when their producer is not installed. Duplicate built-in and plugin
+    /// entries are dropped while preserving the first occurrence.
+    pub fn detail_entries_resolved(&self) -> Vec<DetailEntry> {
+        let mut resolved = Vec::new();
+        for value in &self.sidebar_detail_fields {
+            let Some(entry) = parse_entry(value) else {
+                config_warn(&format!(
+                    "ui.sidebar_detail_fields: unknown field {value:?}; expected a built-in name or plugin:<name>/<field>"
+                ));
+                continue;
+            };
+            let enabled = match entry {
+                DetailEntry::Builtin(DetailField::Branch) => self.sidebar_detail_branch,
+                DetailEntry::Builtin(DetailField::BranchStat) => self.sidebar_detail_branch_stat,
+                DetailEntry::Builtin(DetailField::Pr) => self.sidebar_detail_pr,
+                DetailEntry::Builtin(_) | DetailEntry::Plugin { .. } => true,
+            };
+            if enabled && !resolved.contains(&entry) {
+                resolved.push(entry);
+            }
+        }
+        resolved
     }
 }
 
@@ -274,7 +510,7 @@ mod tests {
     }
 
     #[test]
-    fn focus_detail_parses_and_defaults_to_cursor() {
+    fn focus_detail_defaults_to_all_and_zzz_degrades_to_all() {
         assert_eq!(
             FocusDetail::from_str_validated("all").unwrap(),
             FocusDetail::All
@@ -284,12 +520,121 @@ mod tests {
             FocusDetail::Off
         );
         assert!(FocusDetail::from_str_validated("bogus").is_err());
-        // "cursor", not "all": expanding EVERY worktree row on focus doubles
-        // the list's height and pushes the bottom of the tree off screen.
-        assert_eq!(FocusDetail::default(), FocusDetail::Cursor);
+        assert_eq!(FocusDetail::default(), FocusDetail::All);
         // Unknown value degrades to the default with a warning, not an error.
         let cfg: UiConfig = toml::from_str("sidebar_focus_detail = \"zzz\"").unwrap();
-        assert_eq!(cfg.sidebar_focus_detail, FocusDetail::Cursor);
+        assert_eq!(cfg.sidebar_focus_detail, FocusDetail::All);
+    }
+
+    #[test]
+    fn sidebar_commit_detail_keys_default_and_parse() {
+        let cfg = UiConfig::default();
+        assert!(cfg.sidebar_show_commits);
+        assert!(!cfg.sidebar_show_behind_base);
+        assert_eq!(cfg.sidebar_commit_badge, "{n}c");
+        assert_eq!(cfg.sidebar_behind_badge, "{n}b");
+        assert_eq!(
+            cfg.detail_fields_resolved(),
+            vec![
+                DetailField::Branch,
+                DetailField::Commits,
+                DetailField::Dirty,
+                DetailField::BranchStat,
+                DetailField::Pr,
+                DetailField::Subject,
+                DetailField::Age,
+                DetailField::Env,
+                DetailField::Sandbox,
+                DetailField::Devcontainer,
+                DetailField::Hibernated,
+                DetailField::Mq,
+                DetailField::Unread,
+                DetailField::Disk,
+            ]
+        );
+        let cfg: UiConfig = toml::from_str(
+            "sidebar_show_commits = false\nsidebar_show_behind_base = true\nsidebar_commit_badge = \"#{n}\"\nsidebar_behind_badge = \"{n}{n}\"\nsidebar_detail_fields = [\"age\", \"branch\"]",
+        )
+        .unwrap();
+        assert!(!cfg.sidebar_show_commits);
+        assert!(cfg.sidebar_show_behind_base);
+        assert_eq!(cfg.sidebar_commit_badge, "#{n}");
+        assert_eq!(
+            cfg.detail_fields_resolved(),
+            vec![DetailField::Age, DetailField::Branch]
+        );
+    }
+
+    #[test]
+    fn detail_fields_resolve_order_dedup_and_drop_unknown() {
+        let cfg: UiConfig =
+            toml::from_str("sidebar_detail_fields = [\"age\", \"bogus\", \"branch\", \"age\"]")
+                .unwrap();
+        assert_eq!(
+            cfg.detail_fields_resolved(),
+            vec![DetailField::Age, DetailField::Branch]
+        );
+        let cfg: UiConfig = toml::from_str("sidebar_detail_fields = []").unwrap();
+        assert!(cfg.detail_fields_resolved().is_empty());
+    }
+
+    #[test]
+    fn detail_field_names_roundtrip() {
+        for name in DetailField::valid_names() {
+            assert_eq!(
+                DetailField::parse(name).map(DetailField::as_str),
+                Some(name)
+            );
+        }
+        assert_eq!(DetailField::parse(" Branch "), Some(DetailField::Branch));
+    }
+
+    #[test]
+    fn detail_entries_parse_plugin_syntax_and_preserve_order() {
+        let cfg: UiConfig = toml::from_str(
+            r#"sidebar_detail_fields = ["age", "plugin:ci/check", "branch", "plugin:ci/check", "plugin:missing/badge"]"#,
+        )
+        .unwrap();
+        assert_eq!(
+            cfg.detail_entries_resolved(),
+            vec![
+                DetailEntry::Builtin(DetailField::Age),
+                DetailEntry::Plugin {
+                    plugin: "ci".into(),
+                    field: "check".into()
+                },
+                DetailEntry::Builtin(DetailField::Branch),
+                DetailEntry::Plugin {
+                    plugin: "missing".into(),
+                    field: "badge".into()
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn detail_entries_drop_malformed_plugin_values() {
+        let long_id = "a".repeat(200);
+        let cfg: UiConfig = toml::from_str(&format!(
+            "sidebar_detail_fields = [\"plugin:\", \"plugin:a\", \"plugin:a/\", \"plugin:/field\", \"plugin:A/UPPER\", \"plugin:{long_id}/field\", \"plugin:ok/field\"]"
+        ))
+        .unwrap();
+        assert_eq!(
+            cfg.detail_entries_resolved(),
+            vec![DetailEntry::Plugin {
+                plugin: "ok".into(),
+                field: "field".into()
+            }]
+        );
+    }
+
+    #[test]
+    fn detail_when_parses_and_unknown_degrades() {
+        assert_eq!(DetailWhen::default(), DetailWhen::Always);
+        let cfg: UiConfig = toml::from_str("sidebar_detail_when = \"focused\"").unwrap();
+        assert_eq!(cfg.sidebar_detail_when, DetailWhen::Focused);
+        let cfg: UiConfig = toml::from_str("sidebar_detail_when = \"zzz\"").unwrap();
+        assert_eq!(cfg.sidebar_detail_when, DetailWhen::Always);
     }
 
     #[test]
