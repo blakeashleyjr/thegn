@@ -1458,6 +1458,45 @@
       ],
       "type": "string"
     },
+    "RowFieldSlot": {
+      "enum": [
+        "detail",
+        "badge"
+      ],
+      "type": "string"
+    },
+    "RowRole": {
+      "description": "The visual role a plugin may assign to a worktree row field.",
+      "enum": [
+        "Accent",
+        "Dim",
+        "Good",
+        "Warn",
+        "Bad",
+        "Unknown"
+      ],
+      "type": "string"
+    },
+    "RowUpdate": {
+      "description": "One row-field value carried by an `update` notification.",
+      "properties": {
+        "role": {
+          "$ref": "#/definitions/RowRole"
+        },
+        "text": {
+          "type": "string"
+        },
+        "worktree": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "role",
+        "text",
+        "worktree"
+      ],
+      "type": "object"
+    },
     "RpcError": {
       "properties": {
         "code": {
@@ -1534,44 +1573,6 @@
       },
       "required": [
         "id"
-      ],
-      "type": "object"
-    },
-    "RowFieldSlot": {
-      "enum": [
-        "detail",
-        "badge"
-      ],
-      "type": "string"
-    },
-    "RowRole": {
-      "enum": [
-        "Accent",
-        "Dim",
-        "Good",
-        "Warn",
-        "Bad",
-        "Unknown"
-      ],
-      "type": "string"
-    },
-    "RowUpdate": {
-      "description": "One row-field value carried by an `update` notification.",
-      "properties": {
-        "role": {
-          "$ref": "#/definitions/RowRole"
-        },
-        "text": {
-          "type": "string"
-        },
-        "worktree": {
-          "type": "string"
-        }
-      },
-      "required": [
-        "role",
-        "text",
-        "worktree"
       ],
       "type": "object"
     },
@@ -1847,22 +1848,6 @@
       },
       "required": [
         "spans"
-      ],
-      "type": "object"
-    },
-    "WorktreeFieldCaps": {
-      "description": "The manifest capability payload for a `WorktreeField` contribution.",
-      "properties": {
-        "field": {
-          "type": "string"
-        },
-        "slot": {
-          "$ref": "#/definitions/RowFieldSlot",
-          "default": "detail"
-        }
-      },
-      "required": [
-        "field"
       ],
       "type": "object"
     },
@@ -2311,6 +2296,22 @@
           "type": "object"
         }
       ]
+    },
+    "WorktreeFieldCaps": {
+      "description": "The manifest capability payload for a `WorktreeField` contribution.",
+      "properties": {
+        "field": {
+          "type": "string"
+        },
+        "slot": {
+          "$ref": "#/definitions/RowFieldSlot",
+          "default": "detail"
+        }
+      },
+      "required": [
+        "field"
+      ],
+      "type": "object"
     }
   },
   "properties": {
@@ -2362,6 +2363,15 @@
     "PluginSpec": {
       "$ref": "#/definitions/PluginSpec"
     },
+    "RowFieldSlot": {
+      "$ref": "#/definitions/RowFieldSlot"
+    },
+    "RowRole": {
+      "$ref": "#/definitions/RowRole"
+    },
+    "RowUpdate": {
+      "$ref": "#/definitions/RowUpdate"
+    },
     "RpcError": {
       "$ref": "#/definitions/RpcError"
     },
@@ -2383,17 +2393,8 @@
     "View": {
       "$ref": "#/definitions/View"
     },
-    "RowRole": {
-      "$ref": "#/definitions/RowRole"
-    },
-    "RowUpdate": {
-      "$ref": "#/definitions/RowUpdate"
-    },
     "WorktreeFieldCaps": {
       "$ref": "#/definitions/WorktreeFieldCaps"
-    },
-    "RowFieldSlot": {
-      "$ref": "#/definitions/RowFieldSlot"
     },
     "thegn_core::plugin_app::AppEventParams": {
       "$ref": "#/definitions/AppEventParams"
@@ -2408,13 +2409,6 @@
   "x-thegn-api-version": "0.5.0",
   "x-thegn-extension-support": [
     {
-      "extension_point": "WorktreeField",
-      "since": "0.5.0",
-      "state": "wired",
-      "required_capability": "surface:rowfield",
-      "modes": [
-        "resident"
-      ],
       "cadences": [
         "on_demand"
       ],
@@ -2423,7 +2417,14 @@
         "on_event",
         "deactivate"
       ],
-      "owner": "sidebar row fields"
+      "extension_point": "WorktreeField",
+      "modes": [
+        "resident"
+      ],
+      "owner": "sidebar row fields",
+      "required_capability": "surface:rowfield",
+      "since": "0.5.0",
+      "state": "wired"
     },
     {
       "cadences": [

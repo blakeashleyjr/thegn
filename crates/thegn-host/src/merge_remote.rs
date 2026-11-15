@@ -599,6 +599,13 @@ fn drain_bundle_output(
     clippy::disallowed_methods,
     reason = "off-loop: merge-queue drain (spawn_blocking) / CLI; the exited producer must be reaped"
 )]
+#[cfg_attr(
+    test,
+    expect(
+        clippy::too_many_arguments,
+        reason = "the test-only chunk_metrics probe is the eighth parameter"
+    )
+)]
 fn reap_and_drain_bundle(
     child: &mut std::process::Child,
     rx: &mpsc::Receiver<io::Result<Vec<u8>>>,
