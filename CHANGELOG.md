@@ -7,6 +7,26 @@ All notable changes to **thegn** are documented here. The format follows
 
 ## [Unreleased]
 
+### Added
+
+- An opt-in `issue` sidebar detail field shows the newest issue linked to the worktree, with `+N` when more are linked. (THE-2003)
+- The MCP server gains `merge_add`, which enqueues a worktree's branch on its repository's merge queue and needs the `git` (or admin) scope, and `notify_push`, which pushes a tray notification and needs the `write` scope. (THE-203)
+- Control API, gRPC, and MCP `merge.list` rows now carry `cleanup_retry` (attempts, next attempt time, class) and `cleanup_hold`, so clients no longer have to decode the retry marker. (THE-236)
+- On Linux, the CPU Frequency panel shows ` itmt` when the kernel has Intel Turbo Boost Max scheduling enabled, and falls back to ACPI CPPC `highest_perf` when the AMD value is absent. (THE-844)
+- `stats.refresh_rates` is now a Home Manager option. (THE-428)
+
+### Changed
+
+- An out-of-range `stats.refresh_rates` entry (below 0.5 seconds, above the duration cap, or not finite) now logs a warning naming the index, and the value still loads. (THE-428)
+- Merge-queue and PR-queue messages are now handled in bounded slices per loop turn (64 messages or 4 ms), so a burst cannot stall input. (THE-657)
+- The plugin alert outbox now has a 64 KiB budget per drain across all plugins; alerts over it are dropped and counted. (THE-537)
+- Internal: Git and capability probes, review-pane preview capture, and VPN subprocesses now run on `thegn_proc` and no longer start their own reader and reaper threads; typed inventory results for Sprites and Daytona listings; a color-depth test matrix over every graph painter; and tests for each. (THE-729, THE-251, THE-530, THE-842)
+
+### Fixed
+
+- GitHub issue detail now reports its label list as incomplete when it reaches the 100-label page limit, instead of claiming it is complete. (THE-323)
+- Submodule status reads now fail with an error on non-UTF-8 paths instead of silently substituting replacement characters. (THE-368, THE-383, THE-376)
+
 ## [0.1.0-alpha.84] — 2026-11-15
 
 ### Added
