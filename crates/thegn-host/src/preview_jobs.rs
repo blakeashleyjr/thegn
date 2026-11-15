@@ -700,6 +700,7 @@ mod tests {
             group: thegn_proc::GroupState::Terminated,
             leader,
             leader_exited_first: true,
+            idle_expired: false,
             stdout,
             stderr: thegn_proc::Capture::default(),
             containment: thegn_proc::Containment::ProcessGroup,
