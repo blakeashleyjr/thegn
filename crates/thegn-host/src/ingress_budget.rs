@@ -2,8 +2,9 @@
 //!
 //! This is the contract that host-loop drain call sites share while their
 //! individual wiring is migrated under THE-657.  Wired today: refresh requests
-//! ([`REFRESH_SOURCE`]) and workspace-clone events ([`WORKSPACE_CLONE_SOURCE`]),
-//! both through [`take_batch`].  A caller snapshots each
+//! ([`REFRESH_SOURCE`]), workspace-clone events ([`WORKSPACE_CLONE_SOURCE`]),
+//! merge-queue drive messages ([`MERGE_DRIVE_SOURCE`]) and PR-queue messages
+//! ([`PR_QUEUE_SOURCE`]), all through [`take_batch`].  A caller snapshots each
 //! source's readiness and work already consumed in this iteration, asks for a
 //! source turn, drains one bounded portion, updates the snapshot, and asks
 //! again.  The caller owns the clock: [`IterationBudget::advance`] is the only
@@ -30,6 +31,18 @@ pub const REFRESH_SOURCE: SourceReady =
 pub const WORKSPACE_CLONE_SOURCE: SourceReady = SourceReady::new(
     IngressClass::LosslessOrdered,
     SourceLimits::new(32, usize::MAX),
+);
+
+/// Merge-queue drive messages: every message in order, at most 64 per drain.
+pub const MERGE_DRIVE_SOURCE: SourceReady = SourceReady::new(
+    IngressClass::LosslessOrdered,
+    SourceLimits::new(64, usize::MAX),
+);
+
+/// PR-queue driver messages: every message in order, at most 64 per drain.
+pub const PR_QUEUE_SOURCE: SourceReady = SourceReady::new(
+    IngressClass::LosslessOrdered,
+    SourceLimits::new(64, usize::MAX),
 );
 
 /// Delivery semantics for an ingress source.
@@ -619,6 +632,10 @@ mod tests {
             WORKSPACE_CLONE_SOURCE.limits,
             SourceLimits::new(32, usize::MAX)
         );
+        assert_eq!(MERGE_DRIVE_SOURCE.class, IngressClass::LosslessOrdered);
+        assert_eq!(MERGE_DRIVE_SOURCE.limits, SourceLimits::new(64, usize::MAX));
+        assert_eq!(PR_QUEUE_SOURCE.class, IngressClass::LosslessOrdered);
+        assert_eq!(PR_QUEUE_SOURCE.limits, SourceLimits::new(64, usize::MAX));
         assert_eq!(LOOP_DEADLINE, Duration::from_millis(4));
     }
 }

@@ -50,6 +50,11 @@ control socket — a newly routed verb is callable with no CLI change.
 For example, `folders.assign` assigns or clears a worktree's repo-local sidebar
 folder (`folder` name, or `clear: true`) through `api call` (Git scope), HTTP,
 gRPC, MCP (`folders_assign`, needs `--scopes git`), or plugin `host.call`.
+`thegn mcp serve` also exposes two additive write tools: `merge_add`
+enqueues a worktree's branch on the merge queue (`worktree` optional,
+defaulting to the server's resolved worktree; needs `--scopes git`), and `notify_push` pushes a tray notification
+(`title`, plus optional `body`, `urgency` and `source`; needs `--scopes
+write`). Clearing the merge queue stays off MCP.
 A worktree's sandbox profile pin is readable with `worktrees.sandbox_profile`
 (`api call`, HTTP, or MCP `worktrees_sandbox_profile`); changing it with
 `worktrees.sandbox_profile_set` (`profile`, or `clear: true`) needs admin scope

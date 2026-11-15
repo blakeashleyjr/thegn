@@ -939,12 +939,9 @@ fn spawn_contained_with_stage(
     Ok((child, group))
 }
 
-/// Windows' kill-on-close Job Object already ends the tree with thegn.
-pub fn spawn_grouped_die_with_parent(
-    cmd: &mut Command,
-) -> std::io::Result<(std::process::Child, GroupHandle)> {
-    spawn_grouped(cmd)
-}
+/// No-op: Windows has no parent-death signal (Job Object containment for
+/// `thegn_proc` is THE-274).
+pub fn set_die_with_parent(_cmd: &mut Command) {}
 
 /// Gate spawn uses the shared fail-closed suspended-create/assign/resume path.
 fn resume_suspended_gate_process(pid: u32) -> io::Result<()> {

@@ -31,6 +31,13 @@ const MAX_PENDING_ALERTS_PER_PLUGIN: usize = 16;
 // The inbox/toast row is display text, so keep its stricter host-side cap.
 const MAX_ALERT_MESSAGE_BYTES: usize = 1024;
 const _: () = assert!(MAX_ALERT_MESSAGE_BYTES <= thegn_core::plugin_api::MAX_ALERT_MESSAGE_BYTES);
+/// Global per-drain byte budget for the alert outbox across all plugins
+/// (`source.len() + message.len()` summed over `pending_alerts`).
+const MAX_PENDING_ALERT_BYTES: usize = 64 * 1024;
+const _: () = assert!(
+    MAX_PENDING_ALERT_BYTES
+        >= MAX_ALERT_MESSAGE_BYTES + thegn_core::plugin_api::MAX_ALERT_SOURCE_BYTES
+);
 const MAX_FEED_BRIDGES: usize = crate::plugins::feed_hub::MAX_FEED_SUBSCRIBERS;
 const MAX_SUBSCRIPTIONS_PER_PLUGIN: usize = thegn_core::plugin_api::MAX_PLUGIN_SUBSCRIPTIONS;
 const MAX_PLUGIN_MESSAGES_PER_DRAIN: usize = 256;
@@ -103,6 +110,10 @@ pub(crate) struct PluginsState {
     pub pending_alerts: Vec<(String, Alert)>,
     /// Number of alerts dropped per plugin in the current outbox batch.
     pending_alert_drops: BTreeMap<String, usize>,
+    /// Running `source.len() + message.len()` over `pending_alerts`.
+    pending_alert_bytes: usize,
+    /// Alerts dropped per plugin because the global byte budget was reached.
+    pending_alert_byte_drops: BTreeMap<String, usize>,
     inbox: Option<Arc<PluginInbox>>,
     /// Lazily started `host.call` dispatcher (a thread is only spawned once a
     /// plugin actually calls).
@@ -125,6 +136,8 @@ impl PluginsState {
             loading: true,
             pending_alerts: Vec::new(),
             pending_alert_drops: BTreeMap::new(),
+            pending_alert_bytes: 0,
+            pending_alert_byte_drops: BTreeMap::new(),
             inbox: None,
             dispatcher: None,
             counters: crate::plugin_stats::Totals::default(),
@@ -787,6 +800,10 @@ fn flush_alerts_with(state: &mut PluginsState, submit: impl FnOnce(Vec<(String, 
         &bridge,
     ));
     let alerts = std::mem::take(&mut state.pending_alerts);
+    state.pending_alert_bytes = 0;
+    for (plugin, dropped) in std::mem::take(&mut state.pending_alert_byte_drops) {
+        tracing::warn!(target: "thegn::plugin", plugin = %plugin, dropped, budget = MAX_PENDING_ALERT_BYTES, "plugin alerts dropped: per-drain outbox byte budget reached");
+    }
     for (plugin, dropped) in std::mem::take(&mut state.pending_alert_drops) {
         tracing::warn!(target: "thegn::plugin", plugin = %plugin, dropped, cap = MAX_PENDING_ALERTS_PER_PLUGIN, "plugin alerts dropped: per-drain outbox cap reached");
     }
@@ -1618,8 +1635,17 @@ fn apply_message(state: &mut PluginsState, plugin: &str, msg: RpcMessage) -> Plu
                     .iter()
                     .filter(|(queued_plugin, _)| queued_plugin == plugin)
                     .count();
+                let cost = alert.source.len().saturating_add(alert.message.len());
                 if queued < MAX_PENDING_ALERTS_PER_PLUGIN {
-                    state.pending_alerts.push((plugin.to_string(), alert));
+                    if state.pending_alert_bytes.saturating_add(cost) > MAX_PENDING_ALERT_BYTES {
+                        *state
+                            .pending_alert_byte_drops
+                            .entry(plugin.to_string())
+                            .or_default() += 1;
+                    } else {
+                        state.pending_alerts.push((plugin.to_string(), alert));
+                        state.pending_alert_bytes = state.pending_alert_bytes.saturating_add(cost);
+                    }
                 } else {
                     *state
                         .pending_alert_drops
@@ -4487,6 +4513,115 @@ mod tests {
                 .iter()
                 .all(|(_, alert)| alert.message.len() <= MAX_ALERT_MESSAGE_BYTES)
         );
+    }
+
+    fn byte_budget_state(n: usize) -> (PluginsState, Vec<String>) {
+        let ids: Vec<String> = (0..n).map(|i| format!("p{i}")).collect();
+        let specs = ids
+            .iter()
+            .map(|id| {
+                spec(
+                    id,
+                    vec![contribution(
+                        "src",
+                        ExtensionPoint::NotificationSource,
+                        &format!("{id}/alerts"),
+                        id,
+                    )],
+                    Vec::new(),
+                )
+            })
+            .collect();
+        (state_with(specs), ids)
+    }
+
+    fn notify_msg(plugin: &str, message: String) -> PluginMsg {
+        PluginMsg::Event {
+            session: 1,
+            plugin: plugin.into(),
+            event: SessionEvent::Message(msg(
+                "notify",
+                serde_json::json!({"source": plugin, "message": message}),
+            )),
+        }
+    }
+
+    #[test]
+    fn alert_outbox_enforces_global_byte_budget_across_plugins() {
+        let (mut state, ids) = byte_budget_state(8);
+        let mut model = FrameModel::default();
+        let mut msgs = Vec::new();
+        for id in &ids {
+            for _ in 0..MAX_PENDING_ALERTS_PER_PLUGIN {
+                msgs.push(notify_msg(id, "a".repeat(MAX_ALERT_MESSAGE_BYTES)));
+            }
+        }
+        let sent = msgs.len();
+        let sent_bytes: usize = ids.iter().map(|id| id.len()).sum::<usize>()
+            * MAX_PENDING_ALERTS_PER_PLUGIN
+            + sent * MAX_ALERT_MESSAGE_BYTES;
+        assert!(
+            sent_bytes > MAX_PENDING_ALERT_BYTES,
+            "input must exceed the budget"
+        );
+
+        drain_messages(&mut state, &mut model, msgs);
+
+        let admitted = state.pending_alerts.len();
+        let recomputed: usize = state
+            .pending_alerts
+            .iter()
+            .map(|(_, a)| a.source.len() + a.message.len())
+            .sum::<usize>();
+        assert_eq!(state.pending_alert_bytes, recomputed);
+        assert!(state.pending_alert_bytes <= MAX_PENDING_ALERT_BYTES);
+        assert!(admitted > 0 && admitted < sent);
+        let byte_drops: usize = state.pending_alert_byte_drops.values().sum::<usize>();
+        assert!(byte_drops > 0);
+        assert_eq!(admitted + byte_drops, sent);
+        assert!(state.pending_alert_drops.is_empty());
+        // Nothing more fits: the next maximal alert would overflow the budget.
+        assert!(
+            state.pending_alert_bytes + MAX_ALERT_MESSAGE_BYTES + 2 > MAX_PENDING_ALERT_BYTES
+                || admitted == sent
+        );
+    }
+
+    #[test]
+    fn alert_outbox_byte_budget_resets_after_flush() {
+        let (mut state, ids) = byte_budget_state(8);
+        let mut model = FrameModel::default();
+        let fill: Vec<PluginMsg> = ids
+            .iter()
+            .flat_map(|id| {
+                (0..MAX_PENDING_ALERTS_PER_PLUGIN)
+                    .map(|_| notify_msg(id, "a".repeat(MAX_ALERT_MESSAGE_BYTES)))
+            })
+            .collect();
+        drain_messages(&mut state, &mut model, fill);
+        assert!(state.pending_alert_bytes > 0);
+
+        flush_alerts_with(&mut state, |_| {});
+        assert_eq!(state.pending_alert_bytes, 0);
+        assert!(state.pending_alert_byte_drops.is_empty());
+
+        drain_messages(&mut state, &mut model, [notify_msg("p0", "again".into())]);
+        assert_eq!(state.pending_alerts.len(), 1);
+        assert_eq!(state.pending_alert_bytes, "p0".len() + "again".len());
+    }
+
+    #[test]
+    fn one_maximal_alert_always_fits_an_empty_outbox() {
+        let (mut state, _) = byte_budget_state(1);
+        let mut model = FrameModel::default();
+        drain_messages(
+            &mut state,
+            &mut model,
+            [notify_msg("p0", "x".repeat(MAX_ALERT_MESSAGE_BYTES * 2))],
+        );
+        assert_eq!(state.pending_alerts.len(), 1);
+        assert!(state.pending_alert_byte_drops.is_empty());
+        assert!(state.pending_alert_bytes <= MAX_PENDING_ALERT_BYTES);
     }
 
     #[test]

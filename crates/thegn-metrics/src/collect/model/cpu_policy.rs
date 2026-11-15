@@ -157,6 +157,8 @@ pub struct PowerPolicy {
     pub platform_profile: Option<SysToken>,
     pub platform_profile_choices: TokenList,
     pub epp_choices: TokenList,
+    /// Intel Turbo Boost Max / ITMT scheduler flag (`kernel/sched_itmt_enabled`).
+    pub itmt: Option<bool>,
 }
 
 #[cfg(test)]
