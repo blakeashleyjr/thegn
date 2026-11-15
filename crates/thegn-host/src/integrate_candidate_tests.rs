@@ -4,6 +4,7 @@ use std::collections::HashSet;
 use thegn_core::config::{Config, OnLanded};
 use thegn_core::db::Db;
 use thegn_core::store::{WorkspaceStore, WorktreeAuxStore};
+use thegn_core::util;
 
 struct Fixture {
     _env: crate::testenv::EnvVarGuard,
