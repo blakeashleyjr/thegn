@@ -53,9 +53,22 @@ fn trim_git_line(output: &[u8]) -> Option<&[u8]> {
     (end > 0).then_some(&output[..end])
 }
 
-/// Toplevel of the working tree containing `dir`.
+/// Best effort; failures are logged at debug; use the `_checked` variant when
+/// failure must be distinguished. Toplevel of the working tree containing
+/// `dir`.
 pub fn toplevel(dir: &Path) -> Option<PathBuf> {
-    util::git_out(dir, &["rev-parse", "--show-toplevel"]).map(PathBuf::from)
+    match toplevel_checked(dir) {
+        Ok(root) => Some(root),
+        Err(error) => {
+            tracing::debug!(
+                target: "thegn::repo",
+                dir = %dir.display(),
+                %error,
+                "could not read git toplevel"
+            );
+            None
+        }
+    }
 }
 
 /// Toplevel of the working tree containing `dir`, preserving Git probe errors.
@@ -148,8 +161,21 @@ fn main_worktree_uncached(dir: &Path) -> Option<PathBuf> {
     main_worktree_checked(dir).0
 }
 
+/// Best effort; failures are logged at debug; use the `_checked` variant when
+/// failure must be distinguished. Whether `dir` is a bare repository.
 pub fn is_bare(dir: &Path) -> bool {
-    util::git_out(dir, &["rev-parse", "--is-bare-repository"]).as_deref() == Some("true")
+    match is_bare_checked(dir) {
+        Ok(bare) => bare,
+        Err(error) => {
+            tracing::debug!(
+                target: "thegn::repo",
+                dir = %dir.display(),
+                %error,
+                "could not check repository type"
+            );
+            false
+        }
+    }
 }
 
 /// Whether `dir` is a bare repository, preserving Git probe errors.
@@ -715,6 +741,29 @@ mod tests {
         assert!(error.contains("could not check repository type"), "{error}");
         let error = toplevel_checked(&bogus).unwrap_err();
         assert!(error.contains("could not read git toplevel"), "{error}");
+    }
+
+    #[test]
+    fn lossy_repo_probes_delegate_for_subdirs_bare_repos_and_non_repos() {
+        let scratch = tempfile::tempdir().unwrap();
+        let worktree = scratch.path().join("worktree");
+        std::fs::create_dir(&worktree).unwrap();
+        git_ok(&worktree, &["init", "-q", "-b", "main"]);
+        let nested = worktree.join("nested");
+        std::fs::create_dir(&nested).unwrap();
+        let expected = std::fs::canonicalize(&worktree).unwrap();
+        assert_eq!(toplevel(&nested), Some(expected));
+        assert!(!is_bare(&worktree));
+
+        let bare = scratch.path().join("bare.git");
+        std::fs::create_dir(&bare).unwrap();
+        git_ok(&bare, &["init", "--bare", "-q"]);
+        assert!(is_bare(&bare));
+
+        let not_repo = scratch.path().join("not-repo");
+        std::fs::create_dir(&not_repo).unwrap();
+        assert_eq!(toplevel(&not_repo), None);
+        assert!(!is_bare(&not_repo));
     }
 
     #[test]
