@@ -168,6 +168,25 @@ fn materialize_fallback_cwd(
     current.or(home)
 }
 
+/// Split the panes a failed materialize already spawned (THE-2004) into the
+/// ones to detach and the ones to kill. A pane that warm-reattached a
+/// pre-existing session (a persisted daemon session, an attach-on-open agent
+/// session, or a native exec with a recorded session id) must be detached so
+/// the user's server-side session survives for the next reattach; a freshly
+/// opened pane is killed and reaped. Both lists are sorted for determinism.
+fn materialize_rollback_plan(
+    spawned: &std::collections::HashMap<u32, u32>,
+    reattached: &std::collections::HashSet<u32>,
+) -> (Vec<u32>, Vec<u32>) {
+    let (mut detach, mut kill): (Vec<u32>, Vec<u32>) = spawned
+        .values()
+        .copied()
+        .partition(|fresh| reattached.contains(fresh));
+    detach.sort_unstable();
+    kill.sort_unstable();
+    (detach, kill)
+}
+
 fn git_scrubbed_env(env: &[(String, String)]) -> Vec<(String, String)> {
     env.iter()
         .filter(|(key, _)| !thegn_core::util::GIT_ENV_VARS.contains(&key.as_str()))
@@ -1167,6 +1186,9 @@ impl Panes {
 
         let spawn_t0 = std::time::Instant::now();
         let mut map = std::collections::HashMap::new();
+        // Panes in `map` that reattached a pre-existing session rather than
+        // opening a fresh one: a rollback detaches these instead of killing.
+        let mut reattached: std::collections::HashSet<u32> = std::collections::HashSet::new();
         // A leaf explicitly closed while its spec batch was in flight is no
         // longer in the tree: spawning for its departed id would orphan the
         // fresh pane (the remap below would find no leaf to attach it to).
@@ -1235,6 +1257,7 @@ impl Panes {
                                         .filter(|s| !s.is_empty()),
                                 );
                             }
+                            reattached.insert(fresh);
                             map.insert(*old, fresh);
                             continue;
                         }
@@ -1343,8 +1366,12 @@ impl Panes {
             };
             if let Some((n, program)) = native {
                 let session = tab.pane_sessions.get(old).map(|s| s.session.clone());
+                let reattach = session.is_some();
                 match self.spawn_native_shell(n, session, program, center) {
                     Ok(fresh) => {
+                        if reattach {
+                            reattached.insert(fresh);
+                        }
                         map.insert(*old, fresh);
                         continue;
                     }
@@ -1407,6 +1434,23 @@ impl Panes {
                         backend = %spec.backend,
                         "materialize spawn failed: {line}"
                     );
+                    // Roll back the panes this call already spawned for earlier
+                    // leaves (THE-2004): the tree is not remapped on this path,
+                    // so no leaf references them and they would be orphaned live
+                    // shells. A pane that reattached a pre-existing daemon or
+                    // native session is detached (`detach_pane`), so that
+                    // session stays alive for the next reattach; a freshly
+                    // opened pane takes the explicit-close teardown
+                    // (`handlers::close::close_pane`): the kill-on-drop default
+                    // terminates and reaps a PTY child off-loop, and kills a
+                    // fresh daemon-backed pane's server-side session.
+                    let (detach, kill) = materialize_rollback_plan(&map, &reattached);
+                    for id in detach {
+                        self.detach_pane(id);
+                    }
+                    for id in kill {
+                        self.table.remove(&id);
+                    }
                     return Err(e);
                 }
             }
@@ -1927,6 +1971,109 @@ mod tests {
         assert_eq!(tab.focused_pane, leaf, "focus stays on the surviving leaf");
     }
 
+    fn host_spec(argv: &[&str], env: Vec<(String, String)>) -> crate::agent::LaunchSpec {
+        crate::agent::LaunchSpec {
+            argv: argv.iter().map(|a| (*a).to_string()).collect(),
+            cwd: None,
+            env,
+            backend: "host".into(),
+            warnings: Vec::new(),
+            degraded: false,
+            remote: false,
+        }
+    }
+
+    #[test]
+    fn materialize_mid_batch_spawn_failure_errs_and_leaves_tree_and_focus_untouched() {
+        // Leaf 0 has a valid spec, leaf 1 names a program that cannot exec. The
+        // failure returns before the post-loop remap, so the tree and focus must
+        // be the original ids. Materialize reads the remembered agent from
+        // the state DB, so keep that read off the real state root.
+        let _state = crate::testenv::IsolatedState::new();
+        let mut session = one_tab_session();
+        let path = session.worktrees[0].path.clone();
+        let tab = &mut session.worktrees[0].tabs[0];
+        let first = tab.center.pane_ids()[0];
+        // Far from `Panes::new`'s first fresh id (1): an adjacent leaf id
+        // collides with the id the first leaf's pane is given, and the batch
+        // then skips this leaf as "raced a direct spawn" instead of failing it.
+        let second = first + 1000;
+        assert!(tab.center.split(first, crate::center::Dir::Row, second));
+        tab.focused_pane = first;
+        let (tx, _rx) = tokio_mpsc::channel::<PaneEvent>(1024);
+        let mut panes = Panes::new(tx);
+        let cfg = thegn_core::config::Config::default();
+        let specs = [
+            (first, host_spec(&["/bin/sh"], Vec::new())),
+            (
+                second,
+                host_spec(
+                    &["/nonexistent/thegn-missing-program"],
+                    vec![("GH_TOKEN".into(), "ghp_secret".into())],
+                ),
+            ),
+        ];
+        let chrome = layout::compute(160, 40, true, true);
+
+        let err = panes
+            .materialize_with_specs(&cfg, tab, &path, &specs, chrome.center, &[])
+            .expect_err("a spawn failure mid-batch must surface as Err");
+
+        let line = spawn_failure_line(&err);
+        assert!(!line.is_empty());
+        assert!(
+            !line.contains("ghp_secret"),
+            "the redacted failure line must not carry env secrets: {line}"
+        );
+        assert_eq!(
+            tab.center.pane_ids(),
+            vec![first, second],
+            "the tree is not remapped after a partial batch"
+        );
+        assert_eq!(tab.focused_pane, first, "focus is not remapped");
+        // THE-2004: the first leaf's freshly spawned pane is rolled back, not
+        // left in `panes.table` as an orphaned live shell no leaf references.
+        assert_eq!(
+            panes.table.len(),
+            0,
+            "the first leaf's pane is rolled back after a partial batch"
+        );
+        // Dropping it starts the detached terminate-and-reap; every in-flight
+        // reaper settling proves the first leaf's child was reaped, not leaked.
+        assert!(
+            crate::pane_pty::drain_detached_reapers(std::time::Duration::from_secs(5)),
+            "the rolled-back pane's child must be terminated and reaped"
+        );
+    }
+
+    #[test]
+    fn materialize_with_missing_worktree_falls_back_to_home_and_succeeds() {
+        // The isolated root is HOME: the fallback cwd lands inside it.
+        let state = crate::testenv::IsolatedState::new();
+        let mut session = one_tab_session();
+        let missing = state.root().join("no-such-worktree");
+        let path = missing.to_str().unwrap().to_string();
+        let tab = &mut session.worktrees[0].tabs[0];
+        let leaf = tab.center.pane_ids()[0];
+        let (tx, _rx) = tokio_mpsc::channel::<PaneEvent>(1024);
+        let mut panes = Panes::new(tx);
+        let cfg = thegn_core::config::Config::default();
+        let specs = [(leaf, host_spec(&["/bin/sh"], Vec::new()))];
+        let chrome = layout::compute(160, 40, true, true);
+
+        panes
+            .materialize_with_specs(&cfg, tab, &path, &specs, chrome.center, &[])
+            .expect("a missing worktree directory falls back to home, not Err");
+
+        assert_eq!(panes.table.len(), 1);
+        let ids = tab.center.pane_ids();
+        assert_eq!(ids.len(), 1);
+        assert!(
+            panes.table.contains_key(&ids[0]),
+            "leaf maps to a live pane"
+        );
+    }
+
     #[test]
     fn prewarm_targets_returns_clamped_neighbors_excluding_active() {
         // Middle of a list: both neighbors.
@@ -2333,6 +2480,25 @@ mod tests {
             assert_eq!(kind.slot(), expected);
             assert!(kind.slot() < DAEMON_FALLBACK_KINDS);
         }
+    }
+
+    #[test]
+    fn materialize_rollback_detaches_reattached_panes_and_kills_fresh_ones() {
+        // leaf -> spawned pane id. Panes 11 and 13 reattached a surviving
+        // session; 12 and 14 were freshly opened.
+        let spawned: std::collections::HashMap<u32, u32> =
+            [(1, 11), (2, 12), (3, 13), (4, 14)].into_iter().collect();
+        let reattached: std::collections::HashSet<u32> = [11, 13].into_iter().collect();
+
+        let (detach, kill) = super::materialize_rollback_plan(&spawned, &reattached);
+
+        assert_eq!(detach, vec![11, 13], "reattached sessions must survive");
+        assert_eq!(kill, vec![12, 14], "fresh panes are killed and reaped");
+
+        let none = std::collections::HashSet::new();
+        let (detach, kill) = super::materialize_rollback_plan(&spawned, &none);
+        assert!(detach.is_empty());
+        assert_eq!(kill, vec![11, 12, 13, 14]);
     }
 
     #[test]
