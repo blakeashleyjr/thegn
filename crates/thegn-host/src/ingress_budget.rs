@@ -1,7 +1,9 @@
 //! Pure scheduling policy for sharing one host-loop ingress iteration.
 //!
-//! This is the contract that future drain call sites can share while their
-//! individual wiring is migrated under THE-657.  A caller snapshots each
+//! This is the contract that host-loop drain call sites share while their
+//! individual wiring is migrated under THE-657.  Wired today: refresh requests
+//! ([`REFRESH_SOURCE`]) and workspace-clone events ([`WORKSPACE_CLONE_SOURCE`]),
+//! both through [`take_batch`].  A caller snapshots each
 //! source's readiness and work already consumed in this iteration, asks for a
 //! source turn, drains one bounded portion, updates the snapshot, and asks
 //! again.  The caller owns the clock: [`IterationBudget::advance`] is the only
@@ -14,6 +16,22 @@
 
 use std::time::{Duration, Instant};
 
+use tokio::sync::mpsc::UnboundedReceiver;
+
+/// Shared per-iteration deadline for the budgeted host-loop drains.
+pub const LOOP_DEADLINE: Duration = Duration::from_millis(4);
+
+/// Refresh requests: every request is delivered, at most 64 per iteration.
+pub const REFRESH_SOURCE: SourceReady =
+    SourceReady::new(IngressClass::MustDeliver, SourceLimits::new(64, usize::MAX));
+
+/// Workspace-clone progress and completion: every event in order, at most 32
+/// per iteration.
+pub const WORKSPACE_CLONE_SOURCE: SourceReady = SourceReady::new(
+    IngressClass::LosslessOrdered,
+    SourceLimits::new(32, usize::MAX),
+);
+
 /// Delivery semantics for an ingress source.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum IngressClass {
@@ -22,8 +40,22 @@ pub enum IngressClass {
     /// Deliver every item, although ordering may be defined by the source.
     MustDeliver,
     /// A newer value supersedes an older value.
+    #[cfg_attr(
+        not(test),
+        allow(
+            dead_code,
+            reason = "named by docs/host-event-ingress.md; no wired source yet"
+        )
+    )]
     ReplaceableSnapshot,
     /// Adjacent values may be combined without losing the source's meaning.
+    #[cfg_attr(
+        not(test),
+        allow(
+            dead_code,
+            reason = "named by docs/host-event-ingress.md; no wired source yet"
+        )
+    )]
     Coalescible,
 }
 
@@ -52,6 +84,13 @@ impl SourceLimits {
 /// message; the next selection observes the updated usage and stops.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SourceReady {
+    #[cfg_attr(
+        not(test),
+        allow(
+            dead_code,
+            reason = "the delivery contract is asserted by tests and the doc"
+        )
+    )]
     pub class: IngressClass,
     pub pending: bool,
     pub limits: SourceLimits,
@@ -105,6 +144,10 @@ pub struct IterationBudget {
     rotation_start: usize,
     served: Vec<bool>,
     started: bool,
+    #[cfg_attr(
+        not(test),
+        allow(dead_code, reason = "wired callers use take_batch's more_pending")
+    )]
     pub pending_left: bool,
 }
 
@@ -143,14 +186,35 @@ impl IterationBudget {
         }
     }
 
+    #[cfg_attr(
+        not(test),
+        allow(
+            dead_code,
+            reason = "inspection accessor; wired callers do not need it"
+        )
+    )]
     pub fn started_at(&self) -> Instant {
         self.started_at
     }
 
+    #[cfg_attr(
+        not(test),
+        allow(
+            dead_code,
+            reason = "inspection accessor; wired callers do not need it"
+        )
+    )]
     pub fn deadline_at(&self) -> Instant {
         self.deadline_at
     }
 
+    #[cfg_attr(
+        not(test),
+        allow(
+            dead_code,
+            reason = "inspection accessor; wired callers do not need it"
+        )
+    )]
     pub fn input_pending(&self) -> bool {
         self.input_pending
     }
@@ -205,9 +269,58 @@ impl IterationBudget {
     }
 
     /// Convenience accessor for callers that only need the re-arm decision.
+    #[cfg_attr(
+        not(test),
+        allow(
+            dead_code,
+            reason = "inspection accessor; wired callers do not need it"
+        )
+    )]
     pub fn pending_left_for(&self, ready: &[SourceReady]) -> bool {
         self.result(ready).pending_left
     }
+}
+
+/// Pop one bounded portion of a lossless channel into a `Vec`.
+///
+/// The caller keeps its existing per-message body as a `for` over the
+/// returned items, so every `continue` and local borrow stays as it was.  At
+/// most `source.limits.max_msgs` items are taken, and none after the shared
+/// iteration deadline, except that one item is always taken when the channel
+/// is non-empty: a spent deadline must never stall a source outright.  Nothing
+/// is ever dropped or coalesced; what is not taken stays queued in order, and
+/// the returned `more_pending` tells the caller to re-arm one wake.
+///
+/// `clock` is the caller's clock, read before each further item, so tests can
+/// inject a logical time.  Bytes are not measured here: `source.used_bytes` is
+/// carried through unchanged.
+pub fn take_batch<T>(
+    rx: &mut UnboundedReceiver<T>,
+    source: SourceReady,
+    budget: &mut IterationBudget,
+    rotation: &mut usize,
+    mut clock: impl FnMut() -> Instant,
+) -> (Vec<T>, bool) {
+    let mut items = Vec::new();
+    // Mandatory progress: the first queued item is taken unconditionally.
+    match rx.try_recv() {
+        Ok(item) => items.push(item),
+        Err(_) => return (items, false),
+    }
+    loop {
+        budget.advance(clock());
+        let turn = [source.with_usage(items.len(), source.used_bytes)];
+        if budget.next_source(&turn, rotation).is_none() {
+            break;
+        }
+        match rx.try_recv() {
+            Ok(item) => items.push(item),
+            Err(_) => return (items, false),
+        }
+    }
+    let left = if rx.is_empty() { source.idle() } else { source };
+    let more_pending = budget.result(&[left]).pending_left;
+    (items, more_pending)
 }
 
 #[cfg(test)]
@@ -384,5 +497,128 @@ mod tests {
                 assert!(turns <= ready[index].limits.max_bytes);
             }
         }
+    }
+
+    fn flood(count: u32) -> UnboundedReceiver<u32> {
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        for value in 0..count {
+            tx.send(value).unwrap();
+        }
+        rx
+    }
+
+    #[test]
+    fn take_batch_flood_yields_exactly_max_msgs_and_reports_more() {
+        let start = base();
+        let mut rx = flood(10_000);
+        let mut budget = IterationBudget::new(start, LOOP_DEADLINE, false);
+        let mut rotation = 0;
+        let (items, more) = take_batch(&mut rx, REFRESH_SOURCE, &mut budget, &mut rotation, || {
+            start
+        });
+        assert_eq!(items.len(), REFRESH_SOURCE.limits.max_msgs);
+        assert_eq!(items, (0..64).collect::<Vec<u32>>());
+        assert!(more);
+    }
+
+    #[test]
+    fn take_batch_repeated_calls_drain_everything_in_order() {
+        let start = base();
+        let mut rx = flood(10_000);
+        let mut rotation = 0;
+        let mut drained = Vec::new();
+        let mut calls = 0_u32;
+        loop {
+            let now = start + LOOP_DEADLINE * calls;
+            let mut budget = IterationBudget::new(now, LOOP_DEADLINE, false);
+            let (items, more) = take_batch(
+                &mut rx,
+                WORKSPACE_CLONE_SOURCE,
+                &mut budget,
+                &mut rotation,
+                || now,
+            );
+            assert!(items.len() <= WORKSPACE_CLONE_SOURCE.limits.max_msgs);
+            drained.extend(items);
+            calls += 1;
+            if !more {
+                break;
+            }
+        }
+        assert_eq!(drained, (0..10_000).collect::<Vec<u32>>());
+        assert_eq!(calls, 10_000_u32.div_ceil(32));
+        assert!(rx.is_empty());
+    }
+
+    #[test]
+    fn take_batch_yields_one_message_when_the_deadline_is_spent() {
+        let start = base();
+        let mut rx = flood(5);
+        let mut budget = IterationBudget::new(start, LOOP_DEADLINE, false);
+        budget.advance(start + LOOP_DEADLINE);
+        let mut rotation = 0;
+        let (items, more) = take_batch(&mut rx, REFRESH_SOURCE, &mut budget, &mut rotation, || {
+            start + LOOP_DEADLINE
+        });
+        assert_eq!(items, [0]);
+        assert!(more);
+    }
+
+    #[test]
+    fn take_batch_input_pending_halves_the_deadline() {
+        let start = base();
+        // Three quarters of the full deadline: inside it when input is quiet,
+        // past the halved deadline when input is pending.
+        let later = start + LOOP_DEADLINE * 3 / 4;
+        let mut quiet_rx = flood(10);
+        let mut quiet = IterationBudget::new(start, LOOP_DEADLINE, false);
+        let mut rotation = 0;
+        let (quiet_items, quiet_more) = take_batch(
+            &mut quiet_rx,
+            REFRESH_SOURCE,
+            &mut quiet,
+            &mut rotation,
+            || later,
+        );
+        assert_eq!(quiet_items.len(), 10);
+        assert!(!quiet_more);
+
+        let mut hot_rx = flood(10);
+        let mut hot = IterationBudget::new(start, LOOP_DEADLINE, true);
+        let (hot_items, hot_more) =
+            take_batch(&mut hot_rx, REFRESH_SOURCE, &mut hot, &mut rotation, || {
+                later
+            });
+        assert_eq!(hot_items, [0]);
+        assert!(hot_more);
+    }
+
+    #[test]
+    fn take_batch_empty_channel_returns_nothing_and_no_pending() {
+        let start = base();
+        let (_tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<u32>();
+        let mut budget = IterationBudget::new(start, LOOP_DEADLINE, false);
+        let mut rotation = 0;
+        let (items, more) = take_batch(
+            &mut rx,
+            WORKSPACE_CLONE_SOURCE,
+            &mut budget,
+            &mut rotation,
+            || start,
+        );
+        assert_eq!(items, Vec::<u32>::new());
+        assert!(!more);
+    }
+
+    #[test]
+    fn wired_sources_keep_lossless_delivery_classes() {
+        assert_eq!(REFRESH_SOURCE.class, IngressClass::MustDeliver);
+        assert_eq!(REFRESH_SOURCE.limits, SourceLimits::new(64, usize::MAX));
+        assert_eq!(WORKSPACE_CLONE_SOURCE.class, IngressClass::LosslessOrdered);
+        assert_eq!(
+            WORKSPACE_CLONE_SOURCE.limits,
+            SourceLimits::new(32, usize::MAX)
+        );
+        assert_eq!(LOOP_DEADLINE, Duration::from_millis(4));
     }
 }
