@@ -14441,6 +14441,9 @@ async fn event_loop<T: Terminal>(
                 model.plugin_segments = crate::handlers::plugins::statusbar_views(&plugins_state);
                 statusbar_dirty = true;
             }
+            crate::plugin_damage::PluginDamage::SidebarContent => {
+                sidebar_dirty = true;
+            }
             crate::plugin_damage::PluginDamage::Structural => {
                 model.plugin_segments = crate::handlers::plugins::statusbar_views(&plugins_state);
                 // Contribution/lifecycle or placement changes must retain the
