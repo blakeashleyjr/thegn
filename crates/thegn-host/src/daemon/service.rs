@@ -141,6 +141,31 @@ impl CiLogFlights {
 
 pub(crate) static CI_LOG_FLIGHTS: CiLogFlights = CiLogFlights::new();
 
+/// Bound on concurrent daemon `ci.logs` provider fetches: the daemon holds at most
+/// `MAX_CONCURRENT_CI_LOG_FETCHES x LOG_COLLECTOR_PEAK_BYTES` of streamed provider log at once, however many clients call.
+pub(crate) const MAX_CONCURRENT_CI_LOG_FETCHES: usize = 2;
+
+/// How long a cache-missing `ci.logs` request waits for a fetch slot before a typed busy refusal (well under the ingest wall).
+pub(crate) const CI_LOG_FETCH_PERMIT_WAIT: std::time::Duration = std::time::Duration::from_secs(30);
+
+pub(crate) static CI_LOG_FETCH_PERMITS: tokio::sync::Semaphore =
+    tokio::sync::Semaphore::const_new(MAX_CONCURRENT_CI_LOG_FETCHES);
+
+/// No fetch slot became free within the wait (or the semaphore was closed).
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) struct CiLogFetchBusy;
+
+/// Async wait for a fetch slot; the permit is RAII, so dropping it on any path (panic, cancellation) frees the slot.
+pub(crate) async fn acquire_fetch_permit(
+    sem: &'static tokio::sync::Semaphore,
+    wait: std::time::Duration,
+) -> Result<tokio::sync::SemaphorePermit<'static>, CiLogFetchBusy> {
+    match tokio::time::timeout(wait, sem.acquire()).await {
+        Ok(Ok(permit)) => Ok(permit),
+        Ok(Err(_)) | Err(_) => Err(CiLogFetchBusy),
+    }
+}
+
 pub(crate) struct DaemonService {
     pub daemon_id: String,
     pub sessions: Arc<tokio::sync::Mutex<HashMap<String, SessionEntry>>>,
@@ -2461,13 +2486,21 @@ impl ControlApi for DaemonService {
                 });
             }
 
+            let permit = acquire_fetch_permit(&CI_LOG_FETCH_PERMITS, CI_LOG_FETCH_PERMIT_WAIT)
+                .await
+                .map_err(|CiLogFetchBusy| {
+                    ControlError::Unavailable(format!(
+                        "{MAX_CONCURRENT_CI_LOG_FETCHES} CI log fetches are already running; retry ci.logs for run {run_id_owned} job {job_id_owned} shortly"
+                    ))
+                })?;
             let cfg = self.config.ci.clone();
             let provider_path = path.clone();
             let run_for_provider = run_id_owned.clone();
             let job_for_provider = job_id_owned.clone();
             let flight_for_provider = flight;
-            let (mut entry, warnings, _flight) = tokio::task::spawn_blocking(move || {
+            let (mut entry, warnings, _flight, _permit) = tokio::task::spawn_blocking(move || {
                 let flight = flight_for_provider;
+                let permit = permit;
                 let loc = thegn_core::remote::GitLoc::for_worktree(&provider_path);
                 let Some((client, context)) = thegn_svc::ci::provider_and_context_for(&loc, &cfg)
                 else {
@@ -2505,7 +2538,7 @@ impl ControlApi for DaemonService {
                     .iter()
                     .map(|warning| thegn_svc::lsp::sanitize_for_terminal(warning))
                     .collect();
-                Ok::<_, anyhow::Error>(Some((entry, warnings, flight)))
+                Ok::<_, anyhow::Error>(Some((entry, warnings, flight, permit)))
             })
             .await
             .map_err(|e| ControlError::Internal(anyhow::anyhow!("CI logs task join: {e}")))?
@@ -4896,6 +4929,38 @@ mod tests {
             served.lines().count() <= 3,
             "a cache hit must honor log_tail_lines even when tail_lines requests more"
         );
+    }
+
+    #[tokio::test]
+    async fn ci_log_fetch_permits_cap_concurrency() {
+        static TEST_SEM: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(2);
+        let wait = std::time::Duration::from_millis(50);
+        let a = acquire_fetch_permit(&TEST_SEM, wait).await.expect("first");
+        let _b = acquire_fetch_permit(&TEST_SEM, wait).await.expect("second");
+        assert_eq!(
+            acquire_fetch_permit(&TEST_SEM, wait).await.err(),
+            Some(CiLogFetchBusy)
+        );
+        drop(a);
+        assert!(acquire_fetch_permit(&TEST_SEM, wait).await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn ci_log_fetch_permit_waits_then_proceeds() {
+        static TEST_SEM: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(2);
+        let a = acquire_fetch_permit(&TEST_SEM, std::time::Duration::from_secs(2))
+            .await
+            .expect("first");
+        let _b = acquire_fetch_permit(&TEST_SEM, std::time::Duration::from_secs(2))
+            .await
+            .expect("second");
+        let waiter = acquire_fetch_permit(&TEST_SEM, std::time::Duration::from_secs(2));
+        let release = async {
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            drop(a);
+        };
+        let (got, ()) = tokio::join!(waiter, release);
+        assert!(got.is_ok());
     }
 
     #[tokio::test]
