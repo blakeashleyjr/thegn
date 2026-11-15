@@ -92,6 +92,8 @@ pub enum DetailField {
     Author,
     /// The repo-wide stash entry count (opt-in; hidden when zero).
     Stash,
+    /// The latest cached CI result (opt-in; hidden while no run is cached).
+    Ci,
 }
 
 /// One entry in the ordered sidebar detail list.
@@ -149,6 +151,7 @@ impl DetailField {
             "disk" => Some(Self::Disk),
             "author" => Some(Self::Author),
             "stash" => Some(Self::Stash),
+            "ci" => Some(Self::Ci),
             _ => None,
         }
     }
@@ -175,11 +178,12 @@ impl DetailField {
             Self::Disk => "disk",
             Self::Author => "author",
             Self::Stash => "stash",
+            Self::Ci => "ci",
         }
     }
 
     /// The valid spellings, in documentation order.
-    pub const fn valid_names() -> [&'static str; 19] {
+    pub const fn valid_names() -> [&'static str; 20] {
         [
             "branch",
             "commits",
@@ -200,6 +204,7 @@ impl DetailField {
             "disk",
             "author",
             "stash",
+            "ci",
         ]
     }
 
@@ -594,8 +599,11 @@ mod tests {
         assert_eq!(DetailField::parse(" Branch "), Some(DetailField::Branch));
         assert_eq!(DetailField::parse("stash"), Some(DetailField::Stash));
         assert_eq!(DetailField::Stash.as_str(), "stash");
-        assert_eq!(DetailField::valid_names().last(), Some(&"stash"));
         assert!(!DetailField::default_order().contains(&DetailField::Stash));
+        assert_eq!(DetailField::parse("ci"), Some(DetailField::Ci));
+        assert_eq!(DetailField::Ci.as_str(), "ci");
+        assert_eq!(DetailField::valid_names().last(), Some(&"ci"));
+        assert!(!DetailField::default_order().contains(&DetailField::Ci));
     }
 
     #[test]
