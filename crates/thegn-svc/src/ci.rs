@@ -208,6 +208,19 @@ pub fn provider_and_context_for_cancellable(
     cfg: &CiConfig,
     cancel: Arc<AtomicBool>,
 ) -> Option<(CiClient, Option<String>)> {
+    provider_and_context_for_deadline(loc, cfg, cancel, None)
+}
+
+/// [`provider_and_context_for_cancellable`] plus an operation deadline: every
+/// provider subprocess the client starts has its timeout clipped to the time
+/// left before `deadline`, and a call started after it fails without
+/// spawning. `None` keeps the per-call timeouts unchanged.
+pub fn provider_and_context_for_deadline(
+    loc: &GitLoc,
+    cfg: &CiConfig,
+    cancel: Arc<AtomicBool>,
+    deadline: Option<Instant>,
+) -> Option<(CiClient, Option<String>)> {
     if cfg.provider == CiProviderKind::None {
         return None;
     }
@@ -224,6 +237,7 @@ pub fn provider_and_context_for_cancellable(
             Box::new(GithubCi {
                 remote: Some(remote),
                 cancel,
+                deadline,
             }),
             context,
         ));
@@ -238,9 +252,11 @@ pub fn provider_and_context_for_cancellable(
         };
         let mut client = GitlabCi::from_config(cfg, cancel);
         client.binding = binding;
+        client.deadline = deadline;
         return Some((Box::new(client), context));
     }
-    client_for_system_with_config_and_cancel(system, cfg, cancel).map(|client| (client, context))
+    client_for_system_with_config_and_cancel(system, cfg, cancel, deadline)
+        .map(|client| (client, context))
 }
 
 /// Stable, account-free cache context for a parsed provider origin.
@@ -273,7 +289,7 @@ pub fn client_for_system(system: CiSystem) -> Option<CiClient> {
 /// configured token once, at construction. The value is injected into the
 /// child environment (never argv) for every `glab` call.
 pub fn client_for_system_with_config(system: CiSystem, cfg: &CiConfig) -> Option<CiClient> {
-    client_for_system_with_config_and_cancel(system, cfg, Arc::new(AtomicBool::new(false)))
+    client_for_system_with_config_and_cancel(system, cfg, Arc::new(AtomicBool::new(false)), None)
 }
 
 /// Value-free credential mode suitable for an `auto` doctor probe.
@@ -289,13 +305,19 @@ fn client_for_system_with_config_and_cancel(
     system: CiSystem,
     cfg: &CiConfig,
     cancel: Arc<AtomicBool>,
+    deadline: Option<Instant>,
 ) -> Option<CiClient> {
     match system {
         CiSystem::GithubActions => Some(Box::new(GithubCi {
             remote: None,
             cancel,
+            deadline,
         })),
-        CiSystem::GitlabCi => Some(Box::new(GitlabCi::from_config(cfg, cancel))),
+        CiSystem::GitlabCi => {
+            let mut client = GitlabCi::from_config(cfg, cancel);
+            client.deadline = deadline;
+            Some(Box::new(client))
+        }
         CiSystem::Drone
         | CiSystem::Woodpecker
         | CiSystem::Jenkins
@@ -440,11 +462,33 @@ pub type CiClient = Box<dyn CiProvider>;
 
 // === helpers ===============================================================
 
-fn run_cli(cmd: Command, cancel: &AtomicBool) -> Result<String, CiError> {
+/// The per-call timeout under an operation deadline: `base` with no deadline,
+/// otherwise `base` clipped to the time left. A spent deadline is an error,
+/// so the call never spawns.
+fn clip_timeout(
+    base: Duration,
+    deadline: Option<Instant>,
+    now: Instant,
+) -> Result<Duration, CiError> {
+    let Some(deadline) = deadline else {
+        return Ok(base);
+    };
+    let left = deadline.saturating_duration_since(now);
+    if left.is_zero() {
+        return Err(CiError::Other("CI operation deadline reached".into()));
+    }
+    Ok(base.min(left))
+}
+
+fn run_cli(
+    cmd: Command,
+    cancel: &AtomicBool,
+    deadline: Option<Instant>,
+) -> Result<String, CiError> {
     run_cli_within(
         cmd,
         crate::issue::gh_run::Limits {
-            timeout: CI_CLI_TIMEOUT,
+            timeout: clip_timeout(CI_CLI_TIMEOUT, deadline, Instant::now())?,
             max_stdout: CI_CLI_MAX_STDOUT,
             max_stderr: CI_CLI_MAX_STDERR,
         },
@@ -822,11 +866,15 @@ fn read_capped<R: Read>(mut reader: R, max: usize) -> Result<Vec<u8>, CiError> {
 /// stdout before the caller can impose a cap. Feed stdout chunks directly into
 /// a bounded line collector; the shared process runner drains stderr alongside
 /// it. The status and error classification remain identical to [`run_cli`].
-fn run_bounded_log(cmd: Command, cancel: &AtomicBool) -> Result<CiLog, CiError> {
+fn run_bounded_log(
+    cmd: Command,
+    cancel: &AtomicBool,
+    deadline: Option<Instant>,
+) -> Result<CiLog, CiError> {
     run_bounded_log_within(
         cmd,
         crate::issue::gh_run::Limits {
-            timeout: CI_LOG_TIMEOUT,
+            timeout: clip_timeout(CI_LOG_TIMEOUT, deadline, Instant::now())?,
             // Streaming consumers own stdout retention; the streaming runner
             // does not use this stdout limit, but Limits keeps it explicit.
             max_stdout: PROVIDER_LOG_MAX_BYTES,
@@ -1616,6 +1664,8 @@ pub struct GithubCi {
     // when the operation starts.
     remote: Option<GithubRemote>,
     cancel: Arc<AtomicBool>,
+    /// Operation deadline every provider call's timeout is clipped to.
+    deadline: Option<Instant>,
 }
 
 impl GithubCi {
@@ -1689,7 +1739,7 @@ impl CiProvider for GithubCi {
             args.push("--branch");
             args.push(b);
         }
-        let json = run_cli(self.command(loc, &args)?, &self.cancel)?;
+        let json = run_cli(self.command(loc, &args)?, &self.cancel, self.deadline)?;
         let (runs, discarded_rows) = parse_gh_runs_with_discarded(&json)?;
         let (runs, overflow) = cap_provider_rows(runs, limit);
         let discarded_rows = discarded_rows.saturating_add(overflow);
@@ -1705,7 +1755,7 @@ impl CiProvider for GithubCi {
     fn run_detail(&self, loc: &GitLoc, run_id: &str) -> Result<CiRunDetail, CiError> {
         let args = github_run_detail_argv(run_id)?;
         let argv: Vec<_> = args.iter().map(String::as_str).collect();
-        let json = run_cli(self.command(loc, &argv)?, &self.cancel)?;
+        let json = run_cli(self.command(loc, &argv)?, &self.cancel, self.deadline)?;
         let value: serde_json::Value = decode_provider_json(&json, "provider run")?;
         let observed = value
             .get("databaseId")
@@ -1749,6 +1799,7 @@ impl CiProvider for GithubCi {
         run_bounded_log(
             self.command(loc, &["run", "view", "--job", job_id, "--log"])?,
             &self.cancel,
+            self.deadline,
         )
     }
 
@@ -1756,6 +1807,7 @@ impl CiProvider for GithubCi {
         let json = run_cli(
             self.command(loc, &["workflow", "list", "--json", "id,name,path,state"])?,
             &self.cancel,
+            self.deadline,
         )?;
         parse_gh_workflows(&json)
     }
@@ -1769,7 +1821,7 @@ impl CiProvider for GithubCi {
         validate_trigger_inputs(inputs)?;
         let args = github_workflow_argv(workflow, inputs)?;
         let argv: Vec<&str> = args.iter().map(String::as_str).collect();
-        run_cli(self.command(loc, &argv)?, &self.cancel).map(|_| ())
+        run_cli(self.command(loc, &argv)?, &self.cancel, self.deadline).map(|_| ())
     }
 
     fn rerun(&self, loc: &GitLoc, run_id: &str, scope: RerunScope) -> Result<(), CiError> {
@@ -1780,13 +1832,13 @@ impl CiProvider for GithubCi {
             ));
         }
         let argv: Vec<_> = args.iter().map(String::as_str).collect();
-        run_cli(self.command(loc, &argv)?, &self.cancel).map(|_| ())
+        run_cli(self.command(loc, &argv)?, &self.cancel, self.deadline).map(|_| ())
     }
 
     fn cancel(&self, loc: &GitLoc, run_id: &str) -> Result<(), CiError> {
         let args = github_cancel_argv(run_id)?;
         let argv: Vec<_> = args.iter().map(String::as_str).collect();
-        run_cli(self.command(loc, &argv)?, &self.cancel).map(|_| ())
+        run_cli(self.command(loc, &argv)?, &self.cancel, self.deadline).map(|_| ())
     }
 
     fn caps(&self) -> CiCaps {
@@ -2029,6 +2081,8 @@ pub struct GitlabCi {
     host: Option<String>,
     cancel: Arc<AtomicBool>,
     binding: GitlabBinding,
+    /// Operation deadline every provider call's timeout is clipped to.
+    deadline: Option<Instant>,
 }
 
 #[derive(Default)]
@@ -2066,6 +2120,7 @@ impl GitlabCi {
             host: (!cfg.gitlab.host.trim().is_empty()).then(|| cfg.gitlab.host.trim().to_string()),
             cancel,
             binding: GitlabBinding::Unbound,
+            deadline: None,
         }
     }
 
@@ -2156,6 +2211,7 @@ impl CiProvider for GitlabCi {
         let json = run_cli(
             self.command(loc, &remote, &["api", &endpoint])?,
             &self.cancel,
+            self.deadline,
         )?;
         let (runs, discarded) = parse_gitlab_pipelines_with_discarded(&json)?;
         let (runs, overflow) = cap_provider_rows(runs, limit);
@@ -2177,9 +2233,12 @@ impl CiProvider for GitlabCi {
         let run_endpoint = gitlab_run_endpoint(&proj, run_id, "")?;
         let jobs_endpoint = gitlab_run_endpoint(&proj, run_id, "jobs")?;
         let deadline = Instant::now() + GITLAB_DETAIL_DEADLINE;
+        // The operation deadline also bounds every page (take the earlier).
+        let deadline = self.deadline.map_or(deadline, |op| op.min(deadline));
         let pipe_json = run_cli(
             self.command(loc, &remote, &["api", &run_endpoint])?,
             &self.cancel,
+            self.deadline,
         )?;
         let value: serde_json::Value = decode_provider_json(&pipe_json, "provider pipeline")?;
         let observed = value.get("id").cloned().unwrap_or(serde_json::Value::Null);
@@ -2240,6 +2299,7 @@ impl CiProvider for GitlabCi {
         run_bounded_log(
             self.command(loc, &remote, &["api", &endpoint])?,
             &self.cancel,
+            self.deadline,
         )
     }
 
@@ -2266,7 +2326,12 @@ impl CiProvider for GitlabCi {
             args.push(format!("{k}={v}"));
         }
         let argv: Vec<&str> = args.iter().map(String::as_str).collect();
-        run_cli(self.command(loc, &remote, &argv)?, &self.cancel).map(|_| ())
+        run_cli(
+            self.command(loc, &remote, &argv)?,
+            &self.cancel,
+            self.deadline,
+        )
+        .map(|_| ())
     }
 
     fn rerun(&self, loc: &GitLoc, run_id: &str, scope: RerunScope) -> Result<(), CiError> {
@@ -2287,6 +2352,7 @@ impl CiProvider for GitlabCi {
         run_cli(
             self.command(loc, &remote, &["api", "-X", "POST", &endpoint])?,
             &self.cancel,
+            self.deadline,
         )
         .map(|_| ())
     }
@@ -2299,6 +2365,7 @@ impl CiProvider for GitlabCi {
         run_cli(
             self.command(loc, &remote, &["api", "-X", "POST", &endpoint])?,
             &self.cancel,
+            self.deadline,
         )
         .map(|_| ())
     }
@@ -3987,6 +4054,69 @@ esac
     }
 
     #[test]
+    fn clip_timeout_none_is_base() {
+        let now = Instant::now();
+        assert_eq!(
+            clip_timeout(CI_CLI_TIMEOUT, None, now).unwrap(),
+            CI_CLI_TIMEOUT
+        );
+    }
+
+    #[test]
+    fn clip_timeout_clips_to_remaining() {
+        let now = Instant::now();
+        let near = now + Duration::from_secs(5);
+        assert_eq!(
+            clip_timeout(CI_CLI_TIMEOUT, Some(near), now).unwrap(),
+            Duration::from_secs(5)
+        );
+        let far = now + Duration::from_secs(600);
+        assert_eq!(
+            clip_timeout(CI_LOG_TIMEOUT, Some(far), now).unwrap(),
+            CI_LOG_TIMEOUT
+        );
+    }
+
+    #[test]
+    fn clip_timeout_spent_is_an_error() {
+        let deadline = Instant::now();
+        let later = deadline + Duration::from_millis(1);
+        for now in [deadline, later] {
+            match clip_timeout(CI_CLI_TIMEOUT, Some(deadline), now) {
+                Err(CiError::Other(message)) => {
+                    assert_eq!(message, "CI operation deadline reached");
+                }
+                other => panic!("expected the deadline error, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn run_cli_timeout_is_clipped_to_the_operation_deadline() {
+        // A spent operation deadline fails every provider call before it
+        // spawns: the error is the deadline's, not gh's (absent, timed out,
+        // or a provider failure would each read differently).
+        let client = GithubCi {
+            remote: Some(parse_github_remote("https://github.com/owner/repo.git").unwrap()),
+            cancel: Arc::new(AtomicBool::new(false)),
+            deadline: Some(Instant::now()),
+        };
+        let loc = GitLoc::Local(std::path::PathBuf::from("/nonexistent/thegn-ci-deadline"));
+        let errors = [
+            client.run_detail(&loc, "123").map(|_| ()).unwrap_err(),
+            client.logs(&loc, "123", "456").map(|_| ()).unwrap_err(),
+            client.workflows(&loc).map(|_| ()).unwrap_err(),
+            client.cancel(&loc, "123").unwrap_err(),
+        ];
+        for error in errors {
+            assert!(
+                matches!(&error, CiError::Other(message) if message == "CI operation deadline reached"),
+                "{error:?}"
+            );
+        }
+    }
+
+    #[test]
     fn gitlab_page_timeout_clips_to_the_deadline() {
         assert_eq!(gitlab_page_timeout(Duration::ZERO), None);
         assert_eq!(
@@ -4333,6 +4463,7 @@ esac
         let client = GithubCi {
             remote: Some(remote),
             cancel: Arc::new(AtomicBool::new(false)),
+            deadline: None,
         };
         client
             .runs(&loc, Some("feature&status=success"), 7)
@@ -4522,6 +4653,7 @@ esac
         let client = GithubCi {
             remote: Some(parse_github_remote("https://github.com/owner/repo.git").unwrap()),
             cancel: Arc::new(AtomicBool::new(false)),
+            deadline: None,
         };
         let result = client.runs(&loc, None, 10).unwrap();
         assert_eq!(result.discarded_rows, 0);
@@ -4629,6 +4761,7 @@ esac
         let client = GithubCi {
             remote: Some(parse_github_remote("https://github.com/owner/repo.git").unwrap()),
             cancel: Arc::new(AtomicBool::new(false)),
+            deadline: None,
         };
         let detail = client.run_detail(&loc, "22345678901").unwrap();
         assert!(detail.is_complete());
@@ -4883,6 +5016,7 @@ esac
         let github = GithubCi {
             remote: Some(parse_github_remote("https://github.com/owner/repo.git").unwrap()),
             cancel: Arc::new(AtomicBool::new(false)),
+            deadline: None,
         }
         .runs(&github_loc, None, 10)
         .unwrap();
@@ -4949,6 +5083,7 @@ esac
         let github = GithubCi {
             remote: None,
             cancel: Arc::new(AtomicBool::new(false)),
+            deadline: None,
         };
         let gitlab = GitlabCi::default();
 
@@ -5570,6 +5705,7 @@ esac
         let github_error = GithubCi {
             remote: None,
             cancel: Arc::new(AtomicBool::new(false)),
+            deadline: None,
         }
         .trigger(&loc, "ci", &duplicate)
         .unwrap_err()
@@ -5666,7 +5802,8 @@ esac
         assert!(
             GithubCi {
                 remote: None,
-                cancel: Arc::new(AtomicBool::new(false))
+                cancel: Arc::new(AtomicBool::new(false)),
+                deadline: None,
             }
             .caps()
             .steps
@@ -5675,7 +5812,8 @@ esac
         assert!(
             GithubCi {
                 remote: None,
-                cancel: Arc::new(AtomicBool::new(false))
+                cancel: Arc::new(AtomicBool::new(false)),
+                deadline: None,
             }
             .caps()
             .trigger
@@ -5686,7 +5824,8 @@ esac
         assert!(
             GithubCi {
                 remote: None,
-                cancel: Arc::new(AtomicBool::new(false))
+                cancel: Arc::new(AtomicBool::new(false)),
+                deadline: None,
             }
             .caps()
             .rerun_failed
@@ -5695,7 +5834,8 @@ esac
         assert!(
             GithubCi {
                 remote: None,
-                cancel: Arc::new(AtomicBool::new(false))
+                cancel: Arc::new(AtomicBool::new(false)),
+                deadline: None,
             }
             .caps()
             .rerun_all
@@ -5704,7 +5844,8 @@ esac
         assert!(
             !GithubCi {
                 remote: None,
-                cancel: Arc::new(AtomicBool::new(false))
+                cancel: Arc::new(AtomicBool::new(false)),
+                deadline: None,
             }
             .caps()
             .rerun_failed_or_canceled
@@ -5734,6 +5875,7 @@ esac
         let provider = GithubCi {
             remote: None,
             cancel: Arc::new(AtomicBool::new(false)),
+            deadline: None,
         };
         assert!(matches!(
             provider.rerun(&loc, "123", RerunScope::FailedOrCanceled),
@@ -5749,6 +5891,7 @@ esac
                 GithubCi {
                     remote: None,
                     cancel: Arc::new(AtomicBool::new(false)),
+                    deadline: None,
                 }
                 .caps(),
                 [true, true, false],
@@ -5773,6 +5916,7 @@ esac
                         "GitHub" => GithubCi {
                             remote: None,
                             cancel: Arc::new(AtomicBool::new(false)),
+                            deadline: None,
                         }
                         .rerun(&loc, "123", scope),
                         "GitLab" => GitlabCi::default().rerun(&loc, "123", scope),
@@ -5859,6 +6003,7 @@ esac
                 repository: "acme/widget".into(),
             }),
             cancel: Arc::new(AtomicBool::new(false)),
+            deadline: None,
         };
         let loc = GitLoc::Local(temp.path().to_path_buf());
         let result = client.runs(&loc, None, 10);
@@ -6232,6 +6377,7 @@ esac
                 let github = GithubCi {
                     remote: Some(github_remote.clone()),
                     cancel: Arc::new(AtomicBool::new(false)),
+                    deadline: None,
                 };
                 let command = github
                     .command(&loc, &["run", "list"])
