@@ -448,12 +448,6 @@ impl BranchSet {
         match Self::load_checked(root) {
             Ok(branches) => branches,
             Err(error) => {
-                tracing::debug!(
-                    target: "thegn::worktree",
-                    root = %root.display(),
-                    %error,
-                    "could not load branch inventory"
-                );
                 tracing::warn!(
                     target: "thegn::worktree",
                     root = %root.display(),
@@ -668,7 +662,7 @@ pub fn resolve_base(root: &Path, cfg: &Config) -> String {
                 "could not resolve worktree base"
             );
             msg::warn(&format!(
-                "could not check repository type in {}; basing new worktree off HEAD: {error}",
+                "could not resolve the base branch in {}; basing new worktree off HEAD: {error}",
                 root.display()
             ));
             "HEAD".to_string()
@@ -1843,6 +1837,13 @@ mod tests {
         temp_repo_in(&repo);
         assert_eq!(resolve_base(&repo, &Config::default()), "main");
 
+        assert!(
+            util::git_cmd(&repo)
+                .args(["update-ref", "refs/remotes/origin/trunk", "HEAD"])
+                .status()
+                .unwrap()
+                .success()
+        );
         assert!(
             util::git_cmd(&repo)
                 .args([
