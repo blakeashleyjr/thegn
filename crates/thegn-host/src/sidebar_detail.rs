@@ -1,0 +1,604 @@
+//! Pure composition and width fitting for worktree detail lines.
+
+use std::time::{SystemTime, UNIX_EPOCH};
+
+use thegn_core::config::DetailField;
+use thegn_core::pipeline_report::display_cell;
+use thegn_core::theme;
+use thegn_svc::git::{DiffCount, META_COUNT_CAP};
+
+use crate::chrome::S;
+use crate::seg::{Line, Seg, Tok, seg, seg_width, sp};
+use crate::sidebar::{RowKind, SidebarRow};
+use crate::sidebar_view::SidebarDisplay;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum FieldId {
+    Branch,
+    Commits,
+    Dirty,
+    BranchStat,
+    Pr,
+    Subject,
+    Age,
+    TailEnv,
+    TailSandbox,
+    TailDevcontainer,
+    TailHibernated,
+    TailMq,
+    TailUnread,
+    TailDisk,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct Field {
+    pub(crate) id: FieldId,
+    pub(crate) segs: Vec<Seg>,
+    pub(crate) width: usize,
+    pub(crate) min_width: usize,
+}
+
+impl Field {
+    fn new(id: FieldId, segs: Vec<Seg>, min_width: usize) -> Self {
+        let width = seg_width(&segs);
+        Self {
+            id,
+            segs,
+            width,
+            min_width,
+        }
+    }
+}
+
+/// Current Unix time used only when composing a visible detail line.
+pub(crate) fn unix_now() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |duration| duration.as_secs().min(i64::MAX as u64) as i64)
+}
+
+/// Format an approximate, idle-stable age using the largest useful unit.
+pub(crate) fn fmt_age(secs: i64) -> String {
+    let secs = secs.max(0) as u64;
+    if secs < 60 {
+        "<1m".into()
+    } else if secs < 3_600 {
+        format!("{}m", secs / 60)
+    } else if secs < 86_400 {
+        format!("{}h", secs / 3_600)
+    } else if secs < 604_800 {
+        format!("{}d", secs / 86_400)
+    } else if secs < 4_838_400 {
+        format!("{}w", secs / 604_800)
+    } else if secs < 31_536_000 {
+        format!("{}mo", secs / 2_592_000)
+    } else {
+        format!("{}y", secs / 31_536_000)
+    }
+}
+
+fn field_id(field: DetailField) -> FieldId {
+    match field {
+        DetailField::Branch => FieldId::Branch,
+        DetailField::Commits => FieldId::Commits,
+        DetailField::Dirty => FieldId::Dirty,
+        DetailField::BranchStat => FieldId::BranchStat,
+        DetailField::Pr => FieldId::Pr,
+        DetailField::Subject => FieldId::Subject,
+        DetailField::Age => FieldId::Age,
+    }
+}
+
+fn count_text(count: u32) -> String {
+    if count >= META_COUNT_CAP {
+        "999+".into()
+    } else {
+        count.to_string()
+    }
+}
+
+/// Substitute every `{n}` occurrence, including compact or repeated templates.
+pub(crate) fn format_badge(template: &str, count: u32, fallback: &str) -> String {
+    let template = if template.contains("{n}") {
+        template
+    } else {
+        fallback
+    };
+    template.replace("{n}", &count_text(count))
+}
+
+fn detail_fields(row: &SidebarRow, disp: &SidebarDisplay, now_unix: i64) -> Vec<Field> {
+    if row.kind != RowKind::Worktree {
+        return Vec::new();
+    }
+    let gl = crate::caps::active_glyphs();
+    let branch = row
+        .branch
+        .as_deref()
+        .filter(|branch| !branch.is_empty())
+        .unwrap_or(&row.label);
+    let mut fields = Vec::new();
+    for requested in &disp.detail_fields {
+        let id = field_id(*requested);
+        let Some(field) =
+            (match requested {
+                DetailField::Branch if disp.detail_branch && !branch.is_empty() => Some(
+                    Field::new(id, vec![seg(Tok::Slot(S::Dim), display_cell(branch))], 1),
+                ),
+                DetailField::Commits => {
+                    let mut segs = Vec::new();
+                    if disp.show_commits
+                        && let Some(count) = row.branch_meta.as_ref().and_then(|m| m.ahead_base)
+                        && count > 0
+                    {
+                        segs.push(seg(
+                            Tok::Slot(S::Dim),
+                            format_badge(&disp.commit_badge, count, "{n}c"),
+                        ));
+                    }
+                    if disp.show_behind_base
+                        && let Some(count) = row.branch_meta.as_ref().and_then(|m| m.behind_base)
+                        && count > 0
+                    {
+                        if !segs.is_empty() {
+                            segs.push(sp(1));
+                        }
+                        segs.push(seg(
+                            Tok::Hue(theme::Hue::Amber),
+                            format_badge(&disp.behind_badge, count, "{n}b"),
+                        ));
+                    }
+                    (!segs.is_empty()).then(|| Field::new(id, segs, 1))
+                }
+                DetailField::Dirty => row
+                    .branch_meta
+                    .as_ref()
+                    .and_then(|meta| meta.dirty_files)
+                    .filter(|count| *count > 0)
+                    .map(|count| {
+                        Field::new(
+                            id,
+                            vec![seg(
+                                Tok::Hue(theme::Hue::Amber),
+                                format!("{}{}", disp.status_glyph(), count),
+                            )],
+                            1,
+                        )
+                    }),
+                DetailField::BranchStat => branch_stat_field(row, id),
+                DetailField::Pr if disp.detail_pr => pr_field(row, id),
+                DetailField::Subject => row
+                    .branch_meta
+                    .as_ref()
+                    .and_then(|meta| meta.last_subject.as_deref())
+                    .filter(|subject| !subject.is_empty())
+                    .map(|subject| {
+                        Field::new(id, vec![seg(Tok::Slot(S::Dim), display_cell(subject))], 8)
+                    }),
+                DetailField::Age => row
+                    .branch_meta
+                    .as_ref()
+                    .and_then(|meta| meta.last_commit_unix)
+                    .map(|stamp| {
+                        Field::new(
+                            id,
+                            vec![seg(
+                                Tok::Slot(S::Faint),
+                                fmt_age(now_unix.saturating_sub(stamp)),
+                            )],
+                            1,
+                        )
+                    }),
+                _ => None,
+            })
+        else {
+            continue;
+        };
+        fields.push(field);
+    }
+
+    let fixed_tail = fixed_tail_fields(row);
+    fields.extend(fixed_tail);
+    fields
+}
+
+fn branch_stat_field(row: &SidebarRow, id: FieldId) -> Option<Field> {
+    let (add, del) = row.git.and_then(|git| git.branch_diff)?;
+    let mut segs = Vec::new();
+    if add == DiffCount::Unavailable || del == DiffCount::Unavailable {
+        segs.push(seg(Tok::Hue(theme::Hue::Amber), "diff ?"));
+    } else {
+        if add == DiffCount::Binary || del == DiffCount::Binary {
+            segs.push(seg(Tok::Slot(S::Dim), "bin"));
+        }
+        if let DiffCount::Exact(count) = add
+            && count > 0
+        {
+            if !segs.is_empty() {
+                segs.push(sp(1));
+            }
+            segs.push(seg(Tok::Hue(theme::Hue::Green), format!("+{count}")));
+        } else if add == DiffCount::Capped {
+            if !segs.is_empty() {
+                segs.push(sp(1));
+            }
+            segs.push(seg(Tok::Hue(theme::Hue::Green), "+capped"));
+        }
+        if let DiffCount::Exact(count) = del
+            && count > 0
+        {
+            if !segs.is_empty() {
+                segs.push(sp(1));
+            }
+            segs.push(seg(Tok::Hue(theme::Hue::Red), format!("-{count}")));
+        } else if del == DiffCount::Capped {
+            if !segs.is_empty() {
+                segs.push(sp(1));
+            }
+            segs.push(seg(Tok::Hue(theme::Hue::Red), "-capped"));
+        }
+    }
+    (!segs.is_empty()).then(|| Field::new(id, segs, 1))
+}
+
+fn pr_field(row: &SidebarRow, id: FieldId) -> Option<Field> {
+    let gl = crate::caps::active_glyphs();
+    let text = row
+        .pr_number
+        .map(|number| format!("{}#{number}", gl.hex))
+        .or_else(|| {
+            row.pr_count
+                .filter(|count| *count > 0)
+                .map(|count| format!("{}{count}", gl.hex))
+        })?;
+    Some(Field::new(
+        id,
+        vec![seg(Tok::Hue(theme::Hue::Green), text)],
+        1,
+    ))
+}
+
+fn fixed_tail_fields(row: &SidebarRow) -> Vec<Field> {
+    let gl = crate::caps::active_glyphs();
+    let mut fields = Vec::new();
+    if let Some(env) = &row.env_name
+        && !env.is_empty()
+        && env != "default"
+    {
+        let text = if row.env_degraded {
+            format!(
+                "{}{} {}{}",
+                gl.quote_open,
+                display_cell(env),
+                gl.cross,
+                gl.quote_close
+            )
+        } else {
+            format!("{}{}{}", gl.quote_open, display_cell(env), gl.quote_close)
+        };
+        fields.push(Field::new(
+            FieldId::TailEnv,
+            vec![seg(Tok::Slot(S::Faint), text)],
+            1,
+        ));
+    }
+    if let Some(profile) = &row.sandbox_profile {
+        fields.push(Field::new(
+            FieldId::TailSandbox,
+            vec![seg(
+                Tok::Slot(S::Faint),
+                format!("[{}]", display_cell(profile)),
+            )],
+            1,
+        ));
+    }
+    if let Some(backend) = &row.sandbox_backend
+        && !backend.is_empty()
+        && backend != "none"
+        && backend != "host"
+    {
+        fields.push(Field::new(
+            FieldId::TailSandbox,
+            vec![seg(
+                Tok::Slot(S::Faint),
+                format!("({})", display_cell(backend)),
+            )],
+            1,
+        ));
+    }
+    if let Some(status) = &row.devcontainer_status {
+        fields.push(Field::new(
+            FieldId::TailDevcontainer,
+            vec![seg(Tok::Slot(S::Faint), display_cell(status))],
+            1,
+        ));
+    }
+    if row
+        .worktree_path
+        .as_deref()
+        .is_some_and(crate::hibernator::is_hibernated)
+    {
+        fields.push(Field::new(
+            FieldId::TailHibernated,
+            vec![seg(Tok::Slot(S::Faint), gl.moon)],
+            1,
+        ));
+    }
+    if let Some((glyph, hue)) = row.mq_status.and_then(crate::sidebar::mq_chip) {
+        fields.push(Field::new(
+            FieldId::TailMq,
+            vec![seg(Tok::Hue(hue), glyph)],
+            1,
+        ));
+    }
+    if row.unread_count > 0 {
+        fields.push(Field::new(
+            FieldId::TailUnread,
+            vec![seg(
+                Tok::Hue(theme::Hue::Blue),
+                format!("{}{}", gl.mail, row.unread_count),
+            )],
+            1,
+        ));
+    }
+    if let Some(total) = row.disk_bytes {
+        let target = row.target_bytes.unwrap_or(0);
+        let heavy = target > 1024 * 1024 * 1024 && target.saturating_mul(2) > total;
+        let fg = if heavy {
+            Tok::Hue(theme::Hue::Amber)
+        } else {
+            Tok::Slot(S::Dim)
+        };
+        fields.push(Field::new(
+            FieldId::TailDisk,
+            vec![seg(fg, thegn_core::disk::human(total))],
+            1,
+        ));
+    }
+    fields
+}
+
+fn field_width(fields: &[Field]) -> usize {
+    fields
+        .iter()
+        .map(|field| field.width)
+        .sum::<usize>()
+        .saturating_add(fields.len().saturating_sub(1) * 2)
+}
+
+fn truncate_field(field: &mut Field, max: usize) {
+    field.segs = crate::seg::cut(&field.segs, max);
+    field.width = seg_width(&field.segs);
+}
+
+/// Fit fields by dropping the least important content first. The final field
+/// is always retained and clipped, so content presence never changes at the
+/// width boundary.
+pub(crate) fn fit_fields(mut fields: Vec<Field>, budget: usize) -> Vec<Field> {
+    if fields.is_empty() {
+        return fields;
+    }
+    if field_width(&fields) <= budget {
+        return fields;
+    }
+
+    if let Some(field) = fields.iter_mut().find(|field| field.id == FieldId::Subject) {
+        truncate_field(field, field.min_width);
+    }
+
+    let drop_order = [
+        FieldId::Subject,
+        FieldId::Age,
+        FieldId::TailDisk,
+        FieldId::TailUnread,
+        FieldId::TailMq,
+        FieldId::TailHibernated,
+        FieldId::TailDevcontainer,
+        FieldId::TailSandbox,
+        FieldId::TailEnv,
+        FieldId::BranchStat,
+        FieldId::Pr,
+        FieldId::Dirty,
+        FieldId::Commits,
+    ];
+    for id in drop_order {
+        while field_width(&fields) > budget {
+            let Some(index) = fields.iter().position(|field| field.id == id) else {
+                break;
+            };
+            if fields.len() == 1 {
+                break;
+            }
+            fields.remove(index);
+        }
+    }
+    if field_width(&fields) > budget {
+        let branch_index = fields
+            .iter()
+            .position(|field| field.id == FieldId::Branch)
+            .unwrap_or(fields.len().saturating_sub(1));
+        if fields.len() > 1 {
+            let keep = fields.remove(branch_index);
+            fields.clear();
+            fields.push(keep);
+        }
+        let max = budget.saturating_sub(0);
+        if let Some(field) = fields.first_mut() {
+            truncate_field(field, max);
+        }
+    }
+    fields
+}
+
+/// Compose a detail line using the caller's measured indentation and width.
+pub(crate) fn compose_detail_line_at(
+    row: &SidebarRow,
+    disp: &SidebarDisplay,
+    now_unix: i64,
+    indent: usize,
+    cols: usize,
+) -> Option<Line> {
+    let indent = indent.min(cols / 2);
+    let fields = fit_fields(
+        detail_fields(row, disp, now_unix),
+        cols.saturating_sub(indent),
+    );
+    if fields.is_empty() {
+        return None;
+    }
+    let mut segs = vec![sp(indent)];
+    for (index, field) in fields.into_iter().enumerate() {
+        if index > 0 {
+            segs.push(sp(2));
+        }
+        segs.extend(field.segs);
+    }
+    Some(Line::Segs(segs))
+}
+
+/// The width-independent content predicate used by the heights pass.
+pub(crate) fn detail_has_content(row: &SidebarRow, disp: &SidebarDisplay) -> bool {
+    !detail_fields(row, disp, 0).is_empty()
+}
+
+/// Stable wrapper retained for sidebar callers and unit tests.
+pub(crate) fn compose_detail_line(row: &SidebarRow, disp: &SidebarDisplay) -> Option<Line> {
+    compose_detail_line_at(
+        row,
+        disp,
+        unix_now(),
+        4 + (row.depth.saturating_sub(1) as usize) * 2 + 2 + 2,
+        80,
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use thegn_svc::git::BranchMeta;
+
+    fn row() -> SidebarRow {
+        let mut row = SidebarRow::base(RowKind::Worktree, 1, "feature", "repo");
+        row.branch = Some("feature/retry-loop".into());
+        row.branch_meta = Some(BranchMeta {
+            ahead_base: Some(5),
+            behind_base: Some(2),
+            dirty_files: Some(3),
+            last_commit_unix: Some(1_000),
+            last_subject: Some("fix retry loop".into()),
+        });
+        row
+    }
+
+    #[test]
+    fn fmt_age_buckets() {
+        assert_eq!(fmt_age(0), "<1m");
+        assert_eq!(fmt_age(300), "5m");
+        assert_eq!(fmt_age(10_800), "3h");
+        assert_eq!(fmt_age(172_800), "2d");
+        assert_eq!(fmt_age(3_628_800), "6w");
+        assert_eq!(fmt_age(10_368_000), "4mo");
+        assert_eq!(fmt_age(63_072_000), "2y");
+    }
+
+    #[test]
+    fn badge_templates_replace_all_occurrences_and_cap() {
+        assert_eq!(format_badge("{n}c", 5, "{n}c"), "5c");
+        assert_eq!(format_badge("{n}{n}", 1_000, "{n}c"), "999+999+");
+        assert_eq!(format_badge("odd", 2, "{n}b"), "2b");
+    }
+
+    #[test]
+    fn fit_fields_drops_in_priority_order() {
+        let ids = [
+            FieldId::Branch,
+            FieldId::Commits,
+            FieldId::Dirty,
+            FieldId::Pr,
+            FieldId::BranchStat,
+            FieldId::Age,
+            FieldId::Subject,
+            FieldId::TailDisk,
+        ];
+        for budget in [80, 40, 24, 16, 8] {
+            let fields = ids
+                .into_iter()
+                .map(|id| Field::new(id, vec![seg(Tok::Slot(S::Dim), "1234567890")], 8))
+                .collect();
+            let fitted = fit_fields(fields, budget);
+            assert!(field_width(&fitted) <= budget, "{budget}: {fitted:?}");
+            assert!(!fitted.is_empty(), "{budget}");
+            assert!(fitted.iter().any(|field| field.id == FieldId::Branch));
+        }
+    }
+
+    #[test]
+    fn detail_has_content_matches_compose_is_some() {
+        let row = row();
+        let display = SidebarDisplay::default();
+        assert_eq!(
+            detail_has_content(&row, &display),
+            compose_detail_line_at(&row, &display, 2_000, 8, 24).is_some()
+        );
+    }
+
+    #[test]
+    fn detail_fields_order_is_respected() {
+        let row = row();
+        let mut display = SidebarDisplay::default();
+        display.detail_fields = vec![DetailField::Subject, DetailField::Branch];
+        let line = compose_detail_line_at(&row, &display, 2_000, 0, 80).unwrap();
+        let Line::Segs(segs) = line else {
+            panic!("detail line is a segment line")
+        };
+        let text = segs
+            .iter()
+            .map(|segment| segment.text.as_str())
+            .collect::<String>();
+        assert!(text.find("fix retry").unwrap() < text.find("feature/retry").unwrap());
+    }
+
+    #[test]
+    fn legacy_detail_pr_false_hides_pr_even_when_listed() {
+        let mut row = row();
+        row.pr_number = Some(42);
+        let mut display = SidebarDisplay::default();
+        display.detail_fields = vec![DetailField::Pr];
+        display.detail_pr = false;
+        assert!(compose_detail_line_at(&row, &display, 2_000, 0, 80).is_none());
+    }
+
+    #[test]
+    fn no_line_wider_than_cols() {
+        let row = row();
+        let display = SidebarDisplay::default();
+        for cols in 8..=80 {
+            let line = compose_detail_line_at(&row, &display, 2_000, 8, cols).unwrap();
+            let Line::Segs(segs) = line else {
+                panic!("detail line is a segment line")
+            };
+            assert!(seg_width(&segs) <= cols, "{cols}: {segs:?}");
+        }
+    }
+
+    #[test]
+    fn subject_truncates_with_ellipsis_and_wide_chars() {
+        let mut row = row();
+        row.branch_meta.as_mut().unwrap().last_subject = Some("你好世界 retry".into());
+        let mut display = SidebarDisplay::default();
+        display.detail_fields = vec![DetailField::Subject];
+        let line = compose_detail_line_at(&row, &display, 2_000, 0, 8).unwrap();
+        let Line::Segs(segs) = line else {
+            panic!("detail line is a segment line")
+        };
+        let text = segs
+            .iter()
+            .map(|segment| segment.text.as_str())
+            .collect::<String>();
+        assert!(
+            text.contains(crate::caps::active_glyphs().ellipsis),
+            "{text:?}"
+        );
+        assert!(seg_width(&segs) <= 8);
+    }
+}

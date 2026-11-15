@@ -34,16 +34,82 @@ config_enum! {
     /// Which worktree rows show the secondary detail line (branch + extra info)
     /// while the sidebar is focused. "all" expands every worktree row; "cursor"
     /// expands only the highlighted row; "off" never shows the detail line. The
-    /// detail line only appears while the sidebar owns focus.
+    /// Whether focus is required is controlled by [`DetailWhen`].
     ///
-    /// Defaults to "cursor". "all" doubles the height of EVERY worktree row the
-    /// moment the sidebar takes focus, which on a full tree pushed the bottom
-    /// rows out of the viewport — merely focusing the sidebar appeared to
-    /// delete the last workspace. Scrolling now reaches them either way, but
-    /// halving the visible tree on focus is a poor default. `i` cycles it.
+    /// Defaults to "all". `i` cycles this setting.
     pub enum FocusDetail: "focus detail" {
         All = "all", Cursor = "cursor", Off = "off",
-    } default = Cursor;
+    } default = All;
+}
+
+config_enum! {
+    /// Whether the detail line is available only while the sidebar is focused
+    /// ("focused"), or remains available while another pane owns focus
+    /// ("always").
+    pub enum DetailWhen: "detail visibility" {
+        Focused = "focused", Always = "always",
+    } default = Always;
+}
+
+/// A field that can be requested in the sidebar's ordered detail line.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DetailField {
+    /// The worktree branch name.
+    Branch,
+    /// Commits ahead of the default branch, and optionally behind it.
+    Commits,
+    /// The dirty-file count.
+    Dirty,
+    /// The branch-vs-default-branch line statistic.
+    BranchStat,
+    /// The open pull request marker.
+    Pr,
+    /// The last commit subject.
+    Subject,
+    /// The approximate last-commit age.
+    Age,
+}
+
+impl DetailField {
+    /// Parse a canonical detail-field name.
+    pub fn parse(value: &str) -> Option<Self> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "branch" => Some(Self::Branch),
+            "commits" => Some(Self::Commits),
+            "dirty" => Some(Self::Dirty),
+            "branch_stat" => Some(Self::BranchStat),
+            "pr" => Some(Self::Pr),
+            "subject" => Some(Self::Subject),
+            "age" => Some(Self::Age),
+            _ => None,
+        }
+    }
+
+    /// Return the canonical configuration spelling.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Branch => "branch",
+            Self::Commits => "commits",
+            Self::Dirty => "dirty",
+            Self::BranchStat => "branch_stat",
+            Self::Pr => "pr",
+            Self::Subject => "subject",
+            Self::Age => "age",
+        }
+    }
+
+    /// The valid spellings, in documentation order.
+    pub const fn valid_names() -> [&'static str; 7] {
+        [
+            "branch",
+            "commits",
+            "dirty",
+            "branch_stat",
+            "pr",
+            "subject",
+            "age",
+        ]
+    }
 }
 
 /// UI/Presentation settings (`[ui]`).
@@ -115,6 +181,18 @@ pub struct UiConfig {
     /// Which rows expand to a detail line while the sidebar is focused (see
     /// [`FocusDetail`]).
     pub sidebar_focus_detail: FocusDetail,
+    /// Whether detail remains visible when the sidebar is unfocused.
+    pub sidebar_detail_when: DetailWhen,
+    /// Show the commits-ahead badge on worktree rows.
+    pub sidebar_show_commits: bool,
+    /// Show the commits-behind-default-branch badge on worktree rows.
+    pub sidebar_show_behind_base: bool,
+    /// Template for the commits-ahead badge; `{n}` is replaced by the count.
+    pub sidebar_commit_badge: String,
+    /// Template for the commits-behind badge; `{n}` is replaced by the count.
+    pub sidebar_behind_badge: String,
+    /// Ordered detail fields; unknown names are warned about and ignored.
+    pub sidebar_detail_fields: Vec<String>,
     /// Lead the focused detail line with the branch name.
     pub sidebar_detail_branch: bool,
     /// Show the total branch-vs-default-branch line stat on the focused detail
@@ -160,6 +238,15 @@ impl Default for UiConfig {
             sidebar_show_jj: true,
             sidebar_show_submodules: true,
             sidebar_focus_detail: FocusDetail::default(),
+            sidebar_detail_when: DetailWhen::default(),
+            sidebar_show_commits: true,
+            sidebar_show_behind_base: false,
+            sidebar_commit_badge: "{n}c".to_string(),
+            sidebar_behind_badge: "{n}b".to_string(),
+            sidebar_detail_fields: DetailField::valid_names()
+                .into_iter()
+                .map(str::to_string)
+                .collect(),
             sidebar_detail_branch: true,
             sidebar_detail_branch_stat: true,
             sidebar_detail_pr: true,
@@ -169,6 +256,33 @@ impl Default for UiConfig {
             sidebar_width: None,
             sidebar_wide_ratio: None,
         }
+    }
+}
+
+impl UiConfig {
+    /// Resolve the ordered detail list, dropping unknown and duplicate names.
+    /// Legacy field toggles remain an AND gate for their corresponding fields.
+    pub fn detail_fields_resolved(&self) -> Vec<DetailField> {
+        let mut resolved = Vec::new();
+        for value in &self.sidebar_detail_fields {
+            let Some(field) = DetailField::parse(value) else {
+                config_warn(&format!(
+                    "ui.sidebar_detail_fields: unknown field {value:?}; expected one of: {}",
+                    DetailField::valid_names().join(", ")
+                ));
+                continue;
+            };
+            let enabled = match field {
+                DetailField::Branch => self.sidebar_detail_branch,
+                DetailField::BranchStat => self.sidebar_detail_branch_stat,
+                DetailField::Pr => self.sidebar_detail_pr,
+                _ => true,
+            };
+            if enabled && !resolved.contains(&field) {
+                resolved.push(field);
+            }
+        }
+        resolved
     }
 }
 
@@ -274,7 +388,7 @@ mod tests {
     }
 
     #[test]
-    fn focus_detail_parses_and_defaults_to_cursor() {
+    fn focus_detail_defaults_to_all_and_zzz_degrades_to_all() {
         assert_eq!(
             FocusDetail::from_str_validated("all").unwrap(),
             FocusDetail::All
@@ -284,12 +398,64 @@ mod tests {
             FocusDetail::Off
         );
         assert!(FocusDetail::from_str_validated("bogus").is_err());
-        // "cursor", not "all": expanding EVERY worktree row on focus doubles
-        // the list's height and pushes the bottom of the tree off screen.
-        assert_eq!(FocusDetail::default(), FocusDetail::Cursor);
+        assert_eq!(FocusDetail::default(), FocusDetail::All);
         // Unknown value degrades to the default with a warning, not an error.
         let cfg: UiConfig = toml::from_str("sidebar_focus_detail = \"zzz\"").unwrap();
-        assert_eq!(cfg.sidebar_focus_detail, FocusDetail::Cursor);
+        assert_eq!(cfg.sidebar_focus_detail, FocusDetail::All);
+    }
+
+    #[test]
+    fn sidebar_commit_detail_keys_default_and_parse() {
+        let cfg = UiConfig::default();
+        assert!(cfg.sidebar_show_commits);
+        assert!(!cfg.sidebar_show_behind_base);
+        assert_eq!(cfg.sidebar_commit_badge, "{n}c");
+        assert_eq!(cfg.sidebar_behind_badge, "{n}b");
+        assert_eq!(
+            cfg.detail_fields_resolved(),
+            vec![
+                DetailField::Branch,
+                DetailField::Commits,
+                DetailField::Dirty,
+                DetailField::BranchStat,
+                DetailField::Pr,
+                DetailField::Subject,
+                DetailField::Age,
+            ]
+        );
+        let cfg: UiConfig = toml::from_str(
+            "sidebar_show_commits = false\nsidebar_show_behind_base = true\nsidebar_commit_badge = \"#{n}\"\nsidebar_behind_badge = \"{n}{n}\"\nsidebar_detail_fields = [\"age\", \"branch\"]",
+        )
+        .unwrap();
+        assert!(!cfg.sidebar_show_commits);
+        assert!(cfg.sidebar_show_behind_base);
+        assert_eq!(cfg.sidebar_commit_badge, "#{n}");
+        assert_eq!(
+            cfg.detail_fields_resolved(),
+            vec![DetailField::Age, DetailField::Branch]
+        );
+    }
+
+    #[test]
+    fn detail_fields_resolve_order_dedup_and_drop_unknown() {
+        let cfg: UiConfig =
+            toml::from_str("sidebar_detail_fields = [\"age\", \"bogus\", \"branch\", \"age\"]")
+                .unwrap();
+        assert_eq!(
+            cfg.detail_fields_resolved(),
+            vec![DetailField::Age, DetailField::Branch]
+        );
+        let cfg: UiConfig = toml::from_str("sidebar_detail_fields = []").unwrap();
+        assert!(cfg.detail_fields_resolved().is_empty());
+    }
+
+    #[test]
+    fn detail_when_parses_and_unknown_degrades() {
+        assert_eq!(DetailWhen::default(), DetailWhen::Always);
+        let cfg: UiConfig = toml::from_str("sidebar_detail_when = \"focused\"").unwrap();
+        assert_eq!(cfg.sidebar_detail_when, DetailWhen::Focused);
+        let cfg: UiConfig = toml::from_str("sidebar_detail_when = \"zzz\"").unwrap();
+        assert_eq!(cfg.sidebar_detail_when, DetailWhen::Always);
     }
 
     #[test]

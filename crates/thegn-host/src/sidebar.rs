@@ -710,12 +710,16 @@ pub(crate) fn terminal_host(conn: &str, kind: &str) -> (String, String, bool) {
     (host.to_lowercase(), host.to_string(), false)
 }
 
-/// The focused row's second line: the branch name plus the secondary metadata
-/// that would crowd the always-on row — branch-vs-local-default-branch line stat,
-/// execution env, sandbox backend, hibernation, open PRs, unread notifications,
-/// and disk size. Field visibility follows the `[ui]` sidebar toggles carried on
-/// `disp`. `None` when the row has nothing to show. (Extracted from the
-/// ratchet-pinned `chrome.rs`.)
+/// The worktree row's second line. Composition lives in the pure detail module;
+/// this wrapper preserves the sidebar module's existing call surface.
+pub(crate) fn compose_detail_line(
+    row: &SidebarRow,
+    disp: &crate::sidebar_view::SidebarDisplay,
+) -> Option<crate::seg::Line> {
+    crate::sidebar_detail::compose_detail_line(row, disp)
+}
+
+#[cfg(any())]
 pub(crate) fn compose_detail_line(
     row: &SidebarRow,
     disp: &crate::sidebar_view::SidebarDisplay,
@@ -883,7 +887,9 @@ pub(crate) fn compose_detail_line(
 /// [`thegn_core::attention::MqStatus::glyph`] vocabulary (also used by
 /// `panel/sections/merge_queue.rs`), minus `Landed` — a finished row is panel
 /// detail, not sidebar-worthy signal.
-fn mq_chip(mq: thegn_core::attention::MqStatus) -> Option<(&'static str, thegn_core::theme::Hue)> {
+pub(crate) fn mq_chip(
+    mq: thegn_core::attention::MqStatus,
+) -> Option<(&'static str, thegn_core::theme::Hue)> {
     if mq == thegn_core::attention::MqStatus::Landed {
         return None;
     }
