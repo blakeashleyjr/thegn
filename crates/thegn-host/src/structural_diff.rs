@@ -14,19 +14,18 @@
 //! composed in truecolor and quantized once at the `wire.rs` chokepoint.
 
 use anyhow::{Context, Result};
-use std::io::{self, Read};
-use std::process::{Command, Stdio};
-use std::sync::mpsc::{self, Receiver, RecvTimeoutError};
-use std::time::{Duration, Instant};
+use std::process::Command;
+use std::sync::atomic::AtomicBool;
+use std::time::Duration;
 use thegn_core::ansi_cells::{self, StyledLine};
 use thegn_core::config::{Config, StructuralDiff};
 use thegn_core::managed_tool::Resolution;
 use thegn_core::remote::GitLoc;
+use thegn_proc::{End, GroupState, Leader, Limits, Run, Stream, Which};
 
 const MAX_STRUCTURAL_STDOUT: usize = 8 * 1024 * 1024;
 const MAX_STRUCTURAL_STDERR_TAIL: usize = 16 * 1024;
 const READER_GRACE: Duration = Duration::from_millis(500);
-const READ_CHUNK: usize = 8 * 1024;
 
 /// Resolve difft through an override → PATH → an already-installed managed
 /// copy, returning a *usable* binary path — `None` when nothing resolves (or
@@ -151,136 +150,68 @@ pub fn run_cli(loc: &GitLoc, target: &str, file: Option<&str>, difft: &str) -> R
     Ok(())
 }
 
-/// Spawn `cmd` in a managed process group, with bounded output and runtime.
-/// Reader threads report over channels so a descendant holding a pipe cannot
-/// keep this worker blocked beyond the collection grace.
-#[expect(clippy::disallowed_methods)]
+/// Run `cmd` through the shared bounded runner (`thegn_proc`): its own process
+/// group, stdout capped at 8 MiB (more ends the run), a 16 KiB stderr tail,
+/// and the group terminated as soon as the leader exits so a descendant holding
+/// a pipe cannot extend the capture beyond the reader grace.
 fn run_capture(cmd: &mut Command, timeout: Duration) -> Result<String> {
-    let deadline = Instant::now() + timeout;
-    cmd.stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .stdin(Stdio::null());
-    let (mut child, group) = crate::platform::spawn_grouped(cmd).context("spawn difft")?;
-    let Some(stdout_pipe) = child.stdout.take() else {
-        group.kill();
-        if let Err(error) = child.wait() {
-            tracing::debug!(target: "thegn::diff", %error, "failed to reap difft child without stdout pipe");
-        }
-        anyhow::bail!("missing difft stdout pipe");
+    let limits = Limits {
+        quiesce_after_leader: Some(Duration::ZERO),
+        term_grace: Duration::from_millis(200),
+        reader_grace: READER_GRACE,
+        stdout: Stream::HeadOrFail {
+            cap: MAX_STRUCTURAL_STDOUT,
+        },
+        stderr: Stream::Tail {
+            cap: MAX_STRUCTURAL_STDERR_TAIL,
+        },
+        ..Limits::silent(timeout)
     };
-    let Some(stderr_pipe) = child.stderr.take() else {
-        group.kill();
-        if let Err(error) = child.wait() {
-            tracing::debug!(target: "thegn::diff", %error, "failed to reap difft child without stderr pipe");
-        }
-        anyhow::bail!("missing difft stderr pipe");
-    };
-    let (out_tx, out_rx) = mpsc::sync_channel(1);
-    let (err_tx, err_rx) = mpsc::sync_channel(1);
-    thegn_core::thread_name::spawn_named("thegn-difft-out", move || {
-        crate::platform::qos::set_self(crate::platform::qos::Qos::Utility); // Utility: drain output for a user-opened diff.
-        if let Err(error) = out_tx.send(drain_stdout(stdout_pipe)) {
-            tracing::debug!(target: "thegn::diff", %error, "stdout reader result receiver closed");
-        }
-    });
-    thegn_core::thread_name::spawn_named("thegn-difft-err", move || {
-        crate::platform::qos::set_self(crate::platform::qos::Qos::Utility); // Utility: drain output for a user-opened diff.
-        if let Err(error) = err_tx.send(drain_stderr(stderr_pipe)) {
-            tracing::debug!(target: "thegn::diff", %error, "stderr reader result receiver closed");
-        }
-    });
-
-    let status = loop {
-        match child.try_wait() {
-            Err(error) => {
-                group.kill();
-                if let Err(wait_error) = child.wait() {
-                    tracing::debug!(target: "thegn::diff", %wait_error, "failed to reap difft after wait error");
-                }
-                return Err(error).context("wait difft");
-            }
-            Ok(Some(status)) => break status,
-            Ok(None) if Instant::now() < deadline => std::thread::sleep(Duration::from_millis(20)),
-            Ok(None) => {
-                group.kill();
-                if let Err(error) = child.wait() {
-                    tracing::debug!(target: "thegn::diff", %error, "failed to reap timed-out difft child");
-                }
-                anyhow::bail!("difft timed out after {}s", timeout.as_secs());
-            }
-        }
-    };
-
-    // The leader has exited. Kill any external-diff descendants before waiting
-    // for EOF so inherited pipe handles cannot extend the capture indefinitely.
-    group.kill();
-    let collect_deadline = Instant::now() + READER_GRACE;
-    let stdout = receive_reader(&out_rx, collect_deadline, "stdout")??;
-    let stderr = receive_reader(&err_rx, collect_deadline, "stderr")??;
-    if stdout.1 {
-        anyhow::bail!("structural diff output exceeded 8 MiB");
-    }
-    let stdout = String::from_utf8_lossy(&stdout.0).into_owned();
-    if status.success() {
-        return Ok(stdout);
-    }
-    anyhow::bail!(
-        "difft exited {}: {}",
-        status,
-        String::from_utf8_lossy(&stderr).trim()
-    );
+    map_run(
+        thegn_proc::run(cmd, &limits, &AtomicBool::new(false)),
+        timeout,
+    )
 }
 
-fn receive_reader<T>(rx: &Receiver<T>, deadline: Instant, stream: &str) -> Result<T> {
-    let remaining = deadline.saturating_duration_since(Instant::now());
-    match rx.recv_timeout(remaining) {
-        Ok(result) => Ok(result),
-        Err(RecvTimeoutError::Timeout) => {
-            tracing::debug!(target: "thegn::diff", stream, "structural diff reader exceeded collection grace");
-            anyhow::bail!("structural diff {stream} reader exceeded collection grace")
+/// Pure mapping of a finished run to the captured text, with fixed precedence:
+/// spawn, supervise, cancel, timeout, output limit, surviving group, then the
+/// leader's exit status.
+fn map_run(run: Run, timeout: Duration) -> Result<String> {
+    match run.end {
+        End::Spawn(error) => return Err(error).context("spawn difft"),
+        End::Supervise(error) => return Err(error).context("supervise difft"),
+        End::Cancelled => anyhow::bail!("difft capture cancelled"),
+        End::TimedOut => anyhow::bail!("difft timed out after {}s", timeout.as_secs()),
+        End::OutputLimit(Which::Stdout) => {
+            anyhow::bail!("structural diff output exceeded 8 MiB")
         }
-        Err(RecvTimeoutError::Disconnected) => {
-            anyhow::bail!("structural diff {stream} reader stopped")
+        End::OutputLimit(Which::Stderr) => {
+            anyhow::bail!("structural diff stderr exceeded its limit")
         }
+        End::LeaderExited => {}
     }
-}
-
-fn drain_stdout(mut pipe: impl Read) -> io::Result<(Vec<u8>, bool)> {
-    let mut retained = Vec::new();
-    let mut chunk = [0; READ_CHUNK];
-    let mut exceeded = false;
-    loop {
-        let read = pipe.read(&mut chunk)?;
-        if read == 0 {
-            return Ok((retained, exceeded));
-        }
-        let available = MAX_STRUCTURAL_STDOUT.saturating_sub(retained.len());
-        let keep = read.min(available);
-        retained.extend_from_slice(&chunk[..keep]);
-        exceeded |= keep < read;
+    if run.group == GroupState::Survivors {
+        anyhow::bail!("difft descendants survived termination");
     }
-}
-
-fn drain_stderr(mut pipe: impl Read) -> io::Result<Vec<u8>> {
-    let mut tail = Vec::new();
-    let mut chunk = [0; READ_CHUNK];
-    loop {
-        let read = pipe.read(&mut chunk)?;
-        if read == 0 {
-            return Ok(tail);
+    match run.leader {
+        Leader::Reaped(status) if status.success() => {
+            Ok(String::from_utf8_lossy(&run.stdout.bytes).into_owned())
         }
-        let excess = tail
-            .len()
-            .saturating_add(read)
-            .saturating_sub(MAX_STRUCTURAL_STDERR_TAIL);
-        tail.drain(..excess);
-        tail.extend_from_slice(&chunk[..read]);
+        Leader::Reaped(status) => anyhow::bail!(
+            "difft exited {}: {}",
+            status,
+            String::from_utf8_lossy(&run.stderr.bytes).trim()
+        ),
+        Leader::ReapFailed(error) => Err(error).context("reap difft"),
+        Leader::Detached | Leader::NotSpawned => anyhow::bail!("difft was not reaped"),
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::Instant;
+    use thegn_proc::{Capture, Containment};
 
     fn shell_available() -> bool {
         crate::platform::gate_test_shell("true").is_some()
@@ -374,6 +305,120 @@ mod tests {
         let result = capture_with("head -c 20000000 /dev/zero #", Duration::from_secs(10));
         let err = result.unwrap_err();
         assert!(format!("{err:#}").contains("exceeded 8 MiB"), "{err:#}");
+    }
+
+    fn run_with(end: End, group: GroupState, leader: Leader) -> Run {
+        Run {
+            end,
+            group,
+            leader,
+            leader_exited_first: true,
+            stdout: Capture::default(),
+            stderr: Capture::default(),
+            containment: Containment::ProcessGroup,
+        }
+    }
+
+    /// A real reaped exit status for `script`, or `None` without a shell.
+    fn status_of(script: &str) -> Option<std::process::ExitStatus> {
+        let mut command = crate::platform::gate_test_shell(script)?;
+        thegn_proc::run(
+            &mut command,
+            &Limits::silent(Duration::from_secs(10)),
+            &AtomicBool::new(false),
+        )
+        .exit_status()
+    }
+
+    #[test]
+    fn map_run_maps_every_non_exit_end() {
+        let timeout = Duration::from_secs(7);
+        let err = |end: End| {
+            format!(
+                "{:#}",
+                map_run(
+                    run_with(end, GroupState::Unknown, Leader::NotSpawned),
+                    timeout
+                )
+                .unwrap_err()
+            )
+        };
+        let spawn = err(End::Spawn(std::io::Error::other("nope")));
+        assert!(
+            spawn.contains("spawn difft") && spawn.contains("nope"),
+            "{spawn}"
+        );
+        let supervise = err(End::Supervise(std::io::Error::other("wait")));
+        assert!(supervise.contains("supervise difft"), "{supervise}");
+        assert!(err(End::Cancelled).contains("cancelled"));
+        assert!(err(End::TimedOut).contains("difft timed out after 7s"));
+        assert!(err(End::OutputLimit(Which::Stdout)).contains("exceeded 8 MiB"));
+        assert!(err(End::OutputLimit(Which::Stderr)).contains("stderr"));
+    }
+
+    #[test]
+    fn map_run_timeout_takes_precedence_over_a_survivor_group() {
+        let run = run_with(End::TimedOut, GroupState::Survivors, Leader::Detached);
+        let text = format!("{:#}", map_run(run, Duration::from_secs(1)).unwrap_err());
+        assert!(text.contains("timed out"), "{text}");
+    }
+
+    #[test]
+    fn map_run_survivors_after_a_clean_exit_are_an_error() {
+        let Some(status) = status_of("exit 0") else {
+            return;
+        };
+        let run = run_with(
+            End::LeaderExited,
+            GroupState::Survivors,
+            Leader::Reaped(status),
+        );
+        let text = format!("{:#}", map_run(run, Duration::from_secs(1)).unwrap_err());
+        assert!(text.contains("survived"), "{text}");
+    }
+
+    #[test]
+    fn map_run_unreaped_leader_is_an_error() {
+        for leader in [
+            Leader::Detached,
+            Leader::NotSpawned,
+            Leader::ReapFailed(std::io::Error::other("reap")),
+        ] {
+            let run = run_with(End::LeaderExited, GroupState::Drained, leader);
+            assert!(map_run(run, Duration::from_secs(1)).is_err());
+        }
+    }
+
+    #[test]
+    fn map_run_non_zero_exit_reports_the_trimmed_stderr_tail() {
+        let Some(status) = status_of("exit 3") else {
+            return;
+        };
+        let mut run = run_with(
+            End::LeaderExited,
+            GroupState::Drained,
+            Leader::Reaped(status),
+        );
+        run.stderr.bytes = b"  boom: bad input \n".to_vec();
+        run.stdout.bytes = b"ignored".to_vec();
+        let text = format!("{:#}", map_run(run, Duration::from_secs(1)).unwrap_err());
+        assert!(text.starts_with("difft exited "), "{text}");
+        assert!(text.ends_with(": boom: bad input"), "{text}");
+    }
+
+    #[test]
+    fn map_run_success_lossy_decodes_stdout_after_termination() {
+        let Some(status) = status_of("exit 0") else {
+            return;
+        };
+        // Quiesce-zero terminates the group after the leader, so Terminated is normal.
+        let mut run = run_with(
+            End::LeaderExited,
+            GroupState::Terminated,
+            Leader::Reaped(status),
+        );
+        run.stdout.bytes = vec![b'o', b'k', 0xff];
+        assert_eq!(map_run(run, Duration::from_secs(1)).unwrap(), "ok\u{fffd}");
     }
 
     #[test]
