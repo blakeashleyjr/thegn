@@ -540,6 +540,30 @@ impl RemoteProvider for DaytonaProvider {
 
     fn list<'a>(&'a self) -> BoxFuture<'a, Result<Vec<String>>> {
         Box::pin(async move {
+            let (inventory, total) = self.list_inventory_detail().await;
+            match inventory {
+                crate::vps::Inventory::Complete(ids) => Ok(ids),
+                crate::vps::Inventory::Partial { rows, .. } => Err(anyhow!(
+                    "daytona: GET /sandbox returned a partial inventory (total {}, got {})",
+                    total.unwrap_or_default(),
+                    rows.len()
+                )),
+                crate::vps::Inventory::Unknown(reason) => Err(anyhow!(reason)),
+            }
+        })
+    }
+}
+
+impl DaytonaProvider {
+    /// The sandbox id inventory with its completeness made explicit.
+    pub async fn list_inventory(&self) -> crate::vps::Inventory<String> {
+        self.list_inventory_detail().await.0
+    }
+
+    /// The inventory plus, for `TotalMismatch`, the announced total.
+    async fn list_inventory_detail(&self) -> (crate::vps::Inventory<String>, Option<u64>) {
+        use crate::vps::{Inventory, PartialReason};
+        let fetched: Result<serde_json::Value> = async {
             let _permit = CONTROL_GATE.acquire(&self.authority()?).await?;
             let resp = self
                 .client
@@ -553,9 +577,31 @@ impl RemoteProvider for DaytonaProvider {
             if !status.is_success() {
                 return Err(anyhow!("daytona list failed ({status})"));
             }
-            let body = response_json(resp, "daytona", "GET /sandbox").await?;
-            Self::parse_list(&body)
-        })
+            response_json(resp, "daytona", "GET /sandbox").await
+        }
+        .await;
+        let body = match fetched {
+            Ok(body) => body,
+            Err(error) => return (Inventory::Unknown(format!("{error:#}")), None),
+        };
+        let ids = match Self::parse_list(&body) {
+            Ok(ids) => ids,
+            Err(error) => return (Inventory::Unknown(format!("{error:#}")), None),
+        };
+        let announced = body
+            .get("total")
+            .or_else(|| body.get("totalItems"))
+            .and_then(serde_json::Value::as_u64);
+        match announced {
+            Some(total) if total != ids.len() as u64 => (
+                Inventory::Partial {
+                    rows: ids,
+                    reason: PartialReason::TotalMismatch,
+                },
+                Some(total),
+            ),
+            _ => (Inventory::Complete(ids), None),
+        }
     }
 }
 
@@ -926,57 +972,124 @@ impl RemoteProvider for SpritesProvider {
 
     fn list<'a>(&'a self) -> BoxFuture<'a, Result<Vec<String>>> {
         Box::pin(async move {
-            let _permit = CONTROL_GATE.acquire(&self.authority()?).await?;
-            let listing = async {
-                let mut names = Vec::new();
-                let mut seen_names = std::collections::HashSet::new();
-                let mut seen_tokens = std::collections::HashSet::new();
-                let mut token: Option<String> = None;
-                let mut pages: u32 = 0;
-                loop {
-                    if pages >= crate::vps::MAX_INVENTORY_PAGES {
-                        return Err(anyhow!(
-                            "sprites list exceeded the page limit; refusing a partial list"
-                        ));
+            let (inventory, duplicate) = self.list_inventory_detail().await;
+            match inventory {
+                crate::vps::Inventory::Complete(names) => Ok(names),
+                crate::vps::Inventory::Partial { reason, .. } => Err(match reason {
+                    crate::vps::PartialReason::PageCap => {
+                        anyhow!("sprites list exceeded the page limit; refusing a partial list")
                     }
-                    pages += 1;
-                    let url = self.sprites_list_url(token.as_deref())?;
-                    let body = self.get_list_page(&url, "GET /sprites").await?;
-                    let page = Self::parse_list_page(&body)?;
-                    if names.len().saturating_add(page.names.len()) > crate::vps::MAX_INVENTORY_ROWS
-                    {
-                        return Err(anyhow!(
-                            "sprites list exceeded the row limit; refusing a partial list"
-                        ));
+                    crate::vps::PartialReason::RowCap => {
+                        anyhow!("sprites list exceeded the row limit; refusing a partial list")
                     }
-                    for name in page.names {
-                        if !seen_names.insert(name.clone()) {
-                            return Err(anyhow!(
-                                "sprites list returned duplicate sprite name {name} (the continuation token may have been ignored)"
-                            ));
-                        }
-                        names.push(name);
-                    }
-                    let Some(next) = page.next else {
-                        return Ok(names);
-                    };
-                    if !seen_tokens.insert(next.clone()) {
-                        return Err(anyhow!(
-                            "sprites list returned a repeated continuation token"
-                        ));
-                    }
-                    token = Some(next);
-                }
-            };
-            tokio::time::timeout(crate::vps::INVENTORY_BUDGET, listing)
-                .await
-                .map_err(|_| {
-                    anyhow!(
+                    crate::vps::PartialReason::DuplicateId => anyhow!(
+                        "sprites list returned duplicate sprite name {} (the continuation token may have been ignored)",
+                        duplicate.unwrap_or_default()
+                    ),
+                    crate::vps::PartialReason::Budget
+                    | crate::vps::PartialReason::TotalMismatch => anyhow!(
                         "sprites list exceeded the {} second budget; refusing a partial list",
                         crate::vps::INVENTORY_BUDGET.as_secs()
-                    )
-                })?
+                    ),
+                }),
+                crate::vps::Inventory::Unknown(reason) => Err(anyhow!(reason)),
+            }
         })
+    }
+}
+
+impl SpritesProvider {
+    /// The sprite name inventory with its completeness made explicit.
+    pub async fn list_inventory(&self) -> crate::vps::Inventory<String> {
+        self.list_inventory_detail().await.0
+    }
+
+    /// The inventory plus, for `DuplicateId`, the offending name (so `list()`
+    /// can keep its legacy message).
+    async fn list_inventory_detail(&self) -> (crate::vps::Inventory<String>, Option<String>) {
+        use crate::vps::{Inventory, PartialReason};
+        let authority = match self.authority() {
+            Ok(authority) => authority,
+            Err(error) => return (Inventory::Unknown(format!("{error:#}")), None),
+        };
+        let _permit = match CONTROL_GATE.acquire(&authority).await {
+            Ok(permit) => permit,
+            Err(error) => return (Inventory::Unknown(format!("{error:#}")), None),
+        };
+        let listing = async {
+            let mut names: Vec<String> = Vec::new();
+            let mut seen_names = std::collections::HashSet::new();
+            let mut seen_tokens = std::collections::HashSet::new();
+            let mut token: Option<String> = None;
+            let mut pages: u32 = 0;
+            loop {
+                if pages >= crate::vps::MAX_INVENTORY_PAGES {
+                    return (
+                        Inventory::Partial {
+                            rows: names,
+                            reason: PartialReason::PageCap,
+                        },
+                        None,
+                    );
+                }
+                pages += 1;
+                let page = async {
+                    let url = self.sprites_list_url(token.as_deref())?;
+                    let body = self.get_list_page(&url, "GET /sprites").await?;
+                    Self::parse_list_page(&body)
+                }
+                .await;
+                let page = match page {
+                    Ok(page) => page,
+                    Err(error) => return (Inventory::Unknown(format!("{error:#}")), None),
+                };
+                if names.len().saturating_add(page.names.len()) > crate::vps::MAX_INVENTORY_ROWS {
+                    return (
+                        Inventory::Partial {
+                            rows: names,
+                            reason: PartialReason::RowCap,
+                        },
+                        None,
+                    );
+                }
+                for name in page.names {
+                    if !seen_names.insert(name.clone()) {
+                        return (
+                            Inventory::Partial {
+                                rows: names,
+                                reason: PartialReason::DuplicateId,
+                            },
+                            Some(name),
+                        );
+                    }
+                    names.push(name);
+                }
+                let Some(next) = page.next else {
+                    return (Inventory::Complete(names), None);
+                };
+                if !seen_tokens.insert(next.clone()) {
+                    return (
+                        Inventory::Unknown(
+                            "sprites list returned a repeated continuation token".to_string(),
+                        ),
+                        None,
+                    );
+                }
+                token = Some(next);
+            }
+        };
+        // Rows collected inside a timed-out future are lost with it, so a
+        // budget overrun reports no rows.
+        match tokio::time::timeout(crate::vps::INVENTORY_BUDGET, listing).await {
+            Ok(result) => result,
+            Err(_) => (
+                Inventory::Partial {
+                    rows: Vec::new(),
+                    reason: PartialReason::Budget,
+                },
+                None,
+            ),
+        }
     }
 }
 
@@ -4932,6 +5045,184 @@ mod tests {
                 .to_string()
                 .contains("continuation token without has_more")
         );
+    }
+
+    #[tokio::test]
+    async fn sprites_inventory_complete_across_two_pages() {
+        let (base, server) = paged_list_server(vec![
+            r#"{"sprites":[{"name":"a"}],"has_more":true,"next_continuation_token":"t1"}"#.into(),
+            r#"{"sprites":[{"name":"b"}],"has_more":false}"#.into(),
+        ])
+        .await;
+        match SpritesProvider::new(&base, "tok", "x")
+            .list_inventory()
+            .await
+        {
+            crate::vps::Inventory::Complete(rows) => assert_eq!(rows, vec!["a", "b"]),
+            other => panic!("expected Complete, got {other:?}"),
+        }
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn sprites_inventory_page_cap_is_partial_and_list_keeps_old_text() {
+        let bodies = |n: u32| -> Vec<String> {
+            (0..n)
+                .map(|page| {
+                    format!(
+                        "{{\"sprites\":[{{\"name\":\"s-{page}\"}}],\"has_more\":true,\"next_continuation_token\":\"t-{page}\"}}"
+                    )
+                })
+                .collect()
+        };
+        let (base, server) = paged_list_server(bodies(crate::vps::MAX_INVENTORY_PAGES)).await;
+        match SpritesProvider::new(&base, "tok", "x")
+            .list_inventory()
+            .await
+        {
+            crate::vps::Inventory::Partial { rows, reason } => {
+                assert_eq!(reason, crate::vps::PartialReason::PageCap);
+                assert_eq!(rows.len(), crate::vps::MAX_INVENTORY_PAGES as usize);
+            }
+            other => panic!("expected Partial, got {other:?}"),
+        }
+        server.await.unwrap();
+        let (base, server) = paged_list_server(bodies(crate::vps::MAX_INVENTORY_PAGES)).await;
+        let error = SpritesProvider::new(&base, "tok", "x").list().await;
+        assert!(error.unwrap_err().to_string().contains("page limit"));
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn sprites_inventory_duplicate_is_partial_and_list_names_it() {
+        let pages = || -> Vec<String> {
+            vec![
+                r#"{"sprites":[{"name":"a"}],"has_more":true,"next_continuation_token":"t1"}"#
+                    .into(),
+                r#"{"sprites":[{"name":"a"}],"has_more":false}"#.into(),
+            ]
+        };
+        let (base, server) = paged_list_server(pages()).await;
+        match SpritesProvider::new(&base, "tok", "x")
+            .list_inventory()
+            .await
+        {
+            crate::vps::Inventory::Partial { rows, reason } => {
+                assert_eq!(reason, crate::vps::PartialReason::DuplicateId);
+                assert_eq!(rows, vec!["a"]);
+            }
+            other => panic!("expected Partial, got {other:?}"),
+        }
+        server.await.unwrap();
+        let (base, server) = paged_list_server(pages()).await;
+        let message = SpritesProvider::new(&base, "tok", "x")
+            .list()
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(message.contains("duplicate sprite name a"), "{message}");
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn sprites_inventory_repeated_token_is_unknown() {
+        let pages = || -> Vec<String> {
+            vec![
+                r#"{"sprites":[{"name":"a"}],"has_more":true,"next_continuation_token":"t1"}"#
+                    .into(),
+                r#"{"sprites":[{"name":"b"}],"has_more":true,"next_continuation_token":"t1"}"#
+                    .into(),
+            ]
+        };
+        let (base, server) = paged_list_server(pages()).await;
+        match SpritesProvider::new(&base, "tok", "x")
+            .list_inventory()
+            .await
+        {
+            crate::vps::Inventory::Unknown(reason) => {
+                assert!(reason.contains("repeated continuation token"), "{reason}");
+            }
+            other => panic!("expected Unknown, got {other:?}"),
+        }
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn sprites_inventory_non_2xx_is_unknown() {
+        let (base, server) = list_response("500 Internal Server Error", "{}").await;
+        let inventory = SpritesProvider::new(&base, "tok", "x")
+            .list_inventory()
+            .await;
+        assert!(
+            matches!(inventory, crate::vps::Inventory::Unknown(_)),
+            "{inventory:?}"
+        );
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn daytona_inventory_array_is_complete_pretty_and_minified() {
+        let value = serde_json::json!([{"id": "d1"}, {"id": "d2"}]);
+        for body in [
+            value.to_string(),
+            serde_json::to_string_pretty(&value).unwrap(),
+        ] {
+            let (base, server) = list_response("200 OK", &body).await;
+            match DaytonaProvider::new(&base, "tok", "img")
+                .list_inventory()
+                .await
+            {
+                crate::vps::Inventory::Complete(rows) => assert_eq!(rows, vec!["d1", "d2"]),
+                other => panic!("expected Complete, got {other:?}"),
+            }
+            server.await.unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn daytona_inventory_total_mismatch_is_partial() {
+        let value = serde_json::json!({"sandboxes": [{"id": "d1"}, {"id": "d2"}], "total": 3});
+        for body in [
+            value.to_string(),
+            serde_json::to_string_pretty(&value).unwrap(),
+        ] {
+            let (base, server) = list_response("200 OK", &body).await;
+            match DaytonaProvider::new(&base, "tok", "img")
+                .list_inventory()
+                .await
+            {
+                crate::vps::Inventory::Partial { rows, reason } => {
+                    assert_eq!(reason, crate::vps::PartialReason::TotalMismatch);
+                    assert_eq!(rows.len(), 2);
+                }
+                other => panic!("expected Partial, got {other:?}"),
+            }
+            server.await.unwrap();
+            let (base, server) = list_response("200 OK", &body).await;
+            let message = DaytonaProvider::new(&base, "tok", "img")
+                .list()
+                .await
+                .unwrap_err()
+                .to_string();
+            assert_eq!(
+                message,
+                "daytona: GET /sandbox returned a partial inventory (total 3, got 2)"
+            );
+            server.await.unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn daytona_inventory_malformed_envelope_is_unknown() {
+        let (base, server) = list_response("200 OK", r#"{"unexpected": true}"#).await;
+        let inventory = DaytonaProvider::new(&base, "tok", "img")
+            .list_inventory()
+            .await;
+        assert!(
+            matches!(inventory, crate::vps::Inventory::Unknown(_)),
+            "{inventory:?}"
+        );
+        server.await.unwrap();
     }
 
     #[tokio::test]
