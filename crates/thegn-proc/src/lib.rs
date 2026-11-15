@@ -8,6 +8,18 @@ mod platform_ratchet_tests;
 #[cfg(unix)]
 mod unix;
 
+#[cfg(target_os = "linux")]
+pub use unix::group_has_live_members;
+
+#[cfg(not(target_os = "linux"))]
+/// Return whether the process group has a live member.
+///
+/// Platforms without the Linux `/proc` liveness probe conservatively report
+/// that the group is live.
+pub fn group_has_live_members(_pgid: u32) -> bool {
+    true
+}
+
 /// First drain/supervise poll interval; doubles up to BACKOFF_CAP.
 pub const POLL_INTERVAL: Duration = Duration::from_millis(10);
 /// Ceiling of the supervise/drain backoff (each liveness check is a /proc scan on Linux).
