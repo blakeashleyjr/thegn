@@ -1867,6 +1867,72 @@ mod process_tree_deadline_tests {
         assert!(!run.truncated);
         assert_readers_exit_within_margin();
     }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn clean_one_shot_reports_no_kill() {
+        for script in ["exit 0", "true"] {
+            let out = spawn_ndjson(
+                &["sh".into(), "-c".into(), script.into()],
+                &BTreeMap::new(),
+                None,
+                Duration::from_secs(10),
+            )
+            .unwrap();
+            assert!(!out.outcome.killed, "script {script:?} reported a kill");
+            assert!(out.outcome.reaped);
+            assert!(out.outcome.drained);
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn clean_one_shot_kills_a_background_group_helper() {
+        let dir = tempfile::tempdir().unwrap();
+        let group_path = dir.path().join("group.pid");
+        let helper_path = dir.path().join("helper.pid");
+        let out = spawn_ndjson(
+            &[
+                "sh".into(),
+                "-c".into(),
+                "sleep 5 >/dev/null 2>&1 & echo $$ > \"$1\"; echo $! > \"$2\"; exit 0".into(),
+                "sh".into(),
+                group_path.to_string_lossy().into_owned(),
+                helper_path.to_string_lossy().into_owned(),
+            ],
+            &BTreeMap::new(),
+            None,
+            Duration::from_secs(10),
+        )
+        .unwrap();
+        assert!(out.outcome.killed);
+        assert!(out.outcome.reaped);
+        assert!(out.outcome.drained);
+
+        let group_pid: i32 = std::fs::read_to_string(&group_path)
+            .expect("leader wrote its process-group pid")
+            .trim()
+            .parse()
+            .expect("process-group pid is numeric");
+        assert!(
+            std::fs::read_to_string(&helper_path).is_ok(),
+            "background helper did not start"
+        );
+        let gone_by = std::time::Instant::now() + Duration::from_secs(2);
+        loop {
+            // SAFETY: signal 0 only checks whether this test's process group exists.
+            let gone = unsafe { libc::kill(-group_pid, 0) } == -1
+                && std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH);
+            if gone {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < gone_by,
+                "clean one-shot left its helper process group alive"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
 }
 
 #[cfg(test)]
