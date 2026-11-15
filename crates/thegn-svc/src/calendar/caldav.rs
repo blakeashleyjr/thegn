@@ -240,6 +240,7 @@ fn page_from_multistatus(
     let mut event_etags = Vec::new();
     let mut deleted_hrefs = Vec::new();
     let mut diagnostics = PageDiagnostics::default();
+    let mut diag_budget = super::DiagnosticsBudget::default();
     let mut saw_series_tombstone = false;
     let token = xml::walk_multistatus(text, |r| {
         // `calendar_ids` restricts to named collections; a resource outside
@@ -309,7 +310,7 @@ fn page_from_multistatus(
                 "calendar resource is incomplete or structurally malformed".into(),
             ));
         }
-        diagnostics.absorb(PageDiagnostics::from_report(&report));
+        diagnostics.absorb_within(PageDiagnostics::from_report(&report), &mut diag_budget);
         let has_tombstone = events.len() == before && !report.cancelled_uids().is_empty();
         if mode == PageMode::Snapshot && has_tombstone {
             saw_series_tombstone = true;

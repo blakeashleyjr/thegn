@@ -65,7 +65,10 @@ use thegn_core::calendar::{AdmissionError, AdmissionMeter, CalEvent};
 use thegn_core::config_calendar::CalendarAccount;
 use thegn_core::plugin_api::{Capability, ExtensionPoint, HostContract, PluginManifest};
 
-use super::{AccountAdmission, CalendarBackend, CalendarCaps, CalendarError, EventPage, PageMode};
+use super::{
+    AccountAdmission, CalendarBackend, CalendarCaps, CalendarError, EventPage, PageDiagnostics,
+    PageMode,
+};
 use crate::plugin::proc::{self, NdjsonSink, PluginError};
 
 /// Non-JSON stdout lines kept for the warning log.
@@ -186,6 +189,8 @@ struct AdmittingSink {
     granted: Vec<Capability>,
     scrub: SecretScrub,
     junk: Vec<String>,
+    /// Uncapped count of non-JSON lines (`junk` keeps only a few, scrubbed).
+    junk_lines: usize,
     error: Option<CalendarError>,
     saw_events: bool,
     saw_manifest: bool,
@@ -461,6 +466,7 @@ impl AdmittingSink {
 impl NdjsonSink for AdmittingSink {
     fn line(&mut self, text: &str) -> bool {
         let Ok(head) = serde_json::from_str::<Head>(text) else {
+            self.junk_lines = self.junk_lines.saturating_add(1);
             if self.junk.len() < MAX_JUNK_KEPT {
                 self.junk
                     .push(self.scrub.scrub(text).chars().take(200).collect());
@@ -658,6 +664,7 @@ impl CommandBackend {
             granted: self.granted.clone(),
             scrub: scrub.clone(),
             junk: Vec::new(),
+            junk_lines: 0,
             error: None,
             saw_events: false,
             saw_manifest: false,
@@ -713,6 +720,7 @@ impl CommandBackend {
         if run.truncated {
             return Err(AdmissionError::new(AdmissionLimit::Messages).into());
         }
+        let diagnostics = plugin_diagnostics(sink.junk_lines);
         let a = sink.admitted;
         let resumed = !sync_token.is_empty();
         let mode = match a.mode {
@@ -762,8 +770,19 @@ impl CommandBackend {
                     deleted,
                     super::ics_url::stored_cursor(self.zone.name(), &a.sync_token),
                 )
+                .map(|page| page.with_diagnostics(diagnostics))
             }
         }
+    }
+}
+
+/// Value-free diagnostics for a plugin page: the host can only count what it saw
+/// itself (non-JSON stdout lines, as `other`); plugin text never enters. A row the host's
+/// own validation rejects fails the whole fetch, so no page carries `rejected` counts.
+fn plugin_diagnostics(junk_lines: usize) -> PageDiagnostics {
+    PageDiagnostics {
+        other: junk_lines,
+        ..Default::default()
     }
 }
 
