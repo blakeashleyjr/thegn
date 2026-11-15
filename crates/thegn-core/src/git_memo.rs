@@ -299,7 +299,16 @@ fn push_config(
 fn system_config_path() -> Option<PathBuf> {
     static PATH: std::sync::OnceLock<Option<PathBuf>> = std::sync::OnceLock::new();
     PATH.get_or_init(|| {
-        let asked = crate::util::git_out(&std::env::temp_dir(), &["var", "GIT_CONFIG_SYSTEM"]);
+        let cancel = std::sync::atomic::AtomicBool::new(false);
+        let asked = system_config_output(
+            crate::git_run::git_run(
+                &std::env::temp_dir(),
+                &["var", "GIT_CONFIG_SYSTEM"],
+                &crate::git_run::GitPolicy::read(std::time::Duration::from_secs(3)),
+                &cancel,
+            )
+            .into_text(),
+        );
         let path = system_config_from(asked);
         if path.is_none() {
             tracing::debug!(
@@ -310,6 +319,20 @@ fn system_config_path() -> Option<PathBuf> {
         path
     })
     .clone()
+}
+
+fn system_config_output(result: Result<String, crate::git_run::GitTextError>) -> Option<String> {
+    match result {
+        Ok(output) => Some(output),
+        Err(error) => {
+            tracing::debug!(
+                target: "thegn::watch",
+                %error,
+                "git var GIT_CONFIG_SYSTEM failed"
+            );
+            None
+        }
+    }
 }
 
 /// The system config path from `git var GIT_CONFIG_SYSTEM`'s output; unavailable
@@ -1735,6 +1758,16 @@ mod tests {
         assert_eq!(
             system_config_from(Some("/etc/gitconfig\n".into())),
             Some(PathBuf::from("/etc/gitconfig"))
+        );
+        assert_eq!(
+            system_config_output(Ok("/etc/gitconfig\n".into())),
+            Some("/etc/gitconfig\n".into())
+        );
+        assert!(
+            system_config_output(Err(crate::git_run::GitTextError::Failed(
+                crate::git_run::GitOutcome::Timeout,
+            )))
+            .is_none()
         );
     }
 
