@@ -32,6 +32,72 @@ pub(crate) struct JobLive {
 
 pub(crate) type JobLiveSink = Arc<dyn Fn(JobLive) + Send + Sync>;
 
+/// Most distinct job names [`JobLiveLatest`] holds between two drains.
+pub(crate) const JOB_LIVE_LATEST_CAP: usize = 64;
+
+/// Bounded latest-per-job slot for live job tails (THE-661).
+///
+/// A live tail is a replaceable snapshot: only the newest one per job matters
+/// to the event loop. Producers overwrite the entry for their job name, so the
+/// slot never holds more than [`JOB_LIVE_LATEST_CAP`] values no matter how far
+/// the loop falls behind. When the map is full, a message for a 65th distinct
+/// name is dropped (refused); the dropped job's next emit, at most 100 ms
+/// later, retries after the loop drains.
+#[derive(Clone, Default)]
+pub(crate) struct JobLiveLatest {
+    slots: Arc<Mutex<HashMap<String, JobLive>>>,
+}
+
+impl JobLiveLatest {
+    fn lock(&self) -> std::sync::MutexGuard<'_, HashMap<String, JobLive>> {
+        self.slots
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// Store `msg` as its job's latest tail. An older generation never
+    /// replaces a newer one. Returns true only when the slot went from empty
+    /// to non-empty, the one transition that needs a loop wake: a non-empty
+    /// slot already has a wake pending that has not been drained yet.
+    pub(crate) fn publish(&self, msg: JobLive) -> bool {
+        let mut slots = self.lock();
+        let was_empty = slots.is_empty();
+        match slots.get_mut(&msg.name) {
+            Some(existing) => {
+                if msg.generation >= existing.generation {
+                    *existing = msg;
+                }
+            }
+            None => {
+                if slots.len() >= JOB_LIVE_LATEST_CAP {
+                    return false;
+                }
+                slots.insert(msg.name.clone(), msg);
+            }
+        }
+        was_empty && !slots.is_empty()
+    }
+
+    /// Take every pending tail, leaving the slot empty. Sorted by job name so
+    /// the apply order is deterministic.
+    pub(crate) fn drain(&self) -> Vec<JobLive> {
+        let taken = std::mem::take(&mut *self.lock());
+        let ordered: std::collections::BTreeMap<String, JobLive> = taken.into_iter().collect();
+        ordered.into_values().collect()
+    }
+
+    /// A [`JobLiveSink`] that publishes into this slot and calls `wake` only
+    /// on the empty to non-empty transition.
+    pub(crate) fn sink(&self, wake: impl Fn() + Send + Sync + 'static) -> JobLiveSink {
+        let latest = self.clone();
+        Arc::new(move |msg| {
+            if latest.publish(msg) {
+                wake();
+            }
+        })
+    }
+}
+
 struct CapRun {
     slot: String,
     generation: u64,
@@ -2837,6 +2903,143 @@ mod tests {
                 if expected { "same" } else { tail }
             );
         }
+    }
+
+    fn live(name: &str, generation: u64, tail: &str) -> JobLive {
+        JobLive {
+            worktree: "/a".into(),
+            name: name.into(),
+            generation,
+            tail: tail.into(),
+        }
+    }
+
+    #[test]
+    fn job_live_latest_publish_replaces_per_name() {
+        let latest = JobLiveLatest::default();
+        latest.publish(live("build", 1, "one"));
+        latest.publish(live("build", 1, "two"));
+        latest.publish(live("test", 1, "t"));
+        let drained = latest.drain();
+        assert_eq!(drained, vec![live("build", 1, "two"), live("test", 1, "t")]);
+    }
+
+    #[test]
+    fn job_live_latest_older_generation_never_replaces_newer() {
+        let latest = JobLiveLatest::default();
+        latest.publish(live("build", 5, "new"));
+        latest.publish(live("build", 4, "old"));
+        assert_eq!(latest.drain(), vec![live("build", 5, "new")]);
+        latest.publish(live("build", 4, "old"));
+        latest.publish(live("build", 6, "newer"));
+        assert_eq!(latest.drain(), vec![live("build", 6, "newer")]);
+    }
+
+    #[test]
+    fn job_live_latest_wakes_only_on_empty_to_non_empty() {
+        let latest = JobLiveLatest::default();
+        assert!(latest.publish(live("build", 1, "a")));
+        assert!(!latest.publish(live("build", 1, "b")));
+        assert!(!latest.publish(live("test", 1, "c")));
+        assert_eq!(latest.drain().len(), 2);
+        assert!(latest.publish(live("build", 2, "d")));
+
+        let wakes = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counted = wakes.clone();
+        let latest = JobLiveLatest::default();
+        let sink = latest.sink(move || {
+            counted.fetch_add(1, Ordering::SeqCst);
+        });
+        sink(live("build", 1, "a"));
+        sink(live("build", 1, "b"));
+        assert_eq!(wakes.load(Ordering::SeqCst), 1);
+        assert_eq!(latest.drain(), vec![live("build", 1, "b")]);
+        sink(live("build", 1, "c"));
+        assert_eq!(wakes.load(Ordering::SeqCst), 2);
+    }
+
+    #[test]
+    fn job_live_latest_refuses_name_past_cap() {
+        let latest = JobLiveLatest::default();
+        for i in 0..JOB_LIVE_LATEST_CAP {
+            latest.publish(live(&format!("job{i:02}"), 1, "x"));
+        }
+        assert!(!latest.publish(live("overflow", 1, "x")));
+        // An existing name still updates while full.
+        latest.publish(live("job00", 2, "y"));
+        let drained = latest.drain();
+        assert_eq!(drained.len(), JOB_LIVE_LATEST_CAP);
+        assert!(drained.iter().all(|msg| msg.name != "overflow"));
+        assert!(drained.contains(&live("job00", 2, "y")));
+        // After the drain the refused name is accepted again.
+        assert!(latest.publish(live("overflow", 1, "x")));
+    }
+
+    #[test]
+    fn job_live_latest_drain_empties() {
+        let latest = JobLiveLatest::default();
+        latest.publish(live("build", 1, "a"));
+        assert_eq!(latest.drain().len(), 1);
+        assert!(latest.drain().is_empty());
+    }
+
+    #[test]
+    fn job_live_latest_concurrent_publish_keeps_newest_generation() {
+        let latest = JobLiveLatest::default();
+        let handles: Vec<_> = [1u64..=500, 501u64..=1000]
+            .into_iter()
+            .map(|range| {
+                let latest = latest.clone();
+                std::thread::spawn(move || {
+                    for generation in range {
+                        latest.publish(live("build", generation, &generation.to_string()));
+                    }
+                })
+            })
+            .collect();
+        for handle in handles {
+            handle.join().unwrap();
+        }
+        assert_eq!(latest.drain(), vec![live("build", 1000, "1000")]);
+    }
+
+    #[test]
+    fn job_live_latest_pipeline_with_apply_job_live_gates_stale_and_worktree() {
+        let latest = JobLiveLatest::default();
+        let generations = HashMap::from([("build".to_string(), 7), ("test".to_string(), 3)]);
+        let mut runs: HashMap<String, crate::panel::TaskRunRecord> = ["build", "test"]
+            .into_iter()
+            .map(|name| {
+                (
+                    name.to_string(),
+                    crate::panel::TaskRunRecord {
+                        running: true,
+                        ..Default::default()
+                    },
+                )
+            })
+            .collect();
+        latest.publish(live("build", 6, "stale"));
+        let mut other_wt = live("test", 3, "elsewhere");
+        other_wt.worktree = "/b".into();
+        latest.publish(other_wt);
+        let changed: Vec<bool> = latest
+            .drain()
+            .into_iter()
+            .map(|msg| apply_job_live(&mut runs, &generations, "/a", msg))
+            .collect();
+        assert_eq!(changed, vec![false, false]);
+        assert_eq!(runs["build"].output_tail, "");
+        assert_eq!(runs["test"].output_tail, "");
+
+        latest.publish(live("build", 7, "fresh"));
+        let changed: Vec<bool> = latest
+            .drain()
+            .into_iter()
+            .map(|msg| apply_job_live(&mut runs, &generations, "/a", msg))
+            .collect();
+        assert_eq!(changed, vec![true]);
+        assert_eq!(runs["build"].output_tail, "fresh");
     }
 
     #[test]
