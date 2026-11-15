@@ -473,7 +473,9 @@ fn record_sidecar_for_worktree(
     if placement != "local" && placement.trim().is_empty() {
         bail!("vpn: sidecar {container} has an empty placement");
     }
-    let previous = sidecar_record_dir_existing()?.and_then(|_| read_sidecar_record(container).ok());
+    let dir = sidecar_record_dir()?;
+    let _lock = lock_sidecar_record(&dir, container)?;
+    let previous = read_sidecar_record(container).ok();
     let previous_generation = previous.as_ref().and_then(|record| record.generation);
     let generation = previous_generation
         .map(|generation| {
@@ -538,6 +540,21 @@ pub(crate) fn write_sidecar_record_for_test(
     )
 }
 
+/// Serialize read-modify-write of one sidecar record across processes. The
+/// lock is held until the returned file drops. The lock file is never
+/// removed, because removing a held flock file breaks the exclusion.
+fn lock_sidecar_record(
+    dir: &thegn_core::fsperm::PrivateDir,
+    container: &str,
+) -> Result<std::fs::File> {
+    let file = dir
+        .open_or_create_regular_nofollow(&format!("{container}.lock"))
+        .with_context(|| format!("vpn: open runtime record lock for sidecar {container}"))?;
+    file.lock()
+        .with_context(|| format!("vpn: lock runtime record for sidecar {container}"))?;
+    Ok(file)
+}
+
 fn write_sidecar_record(container: &str, record: &SidecarRecord) -> Result<()> {
     let bytes = serde_json::to_vec(record).context("vpn: encode sidecar runtime record")?;
     if bytes.len() > SIDECAR_RECORD_MAX_BYTES {
@@ -591,6 +608,10 @@ fn update_pending_teardown(
     update: impl FnOnce(&mut Vec<u16>) -> Result<bool>,
 ) -> Result<()> {
     let caller = canonical_caller_worktree(worktree)?;
+    let _lock = match sidecar_record_dir_existing()? {
+        Some(dir) => Some(lock_sidecar_record(&dir, container)?),
+        None => None,
+    };
     let mut record = read_validated_sidecar_record(container, Some(&caller), None)?;
     if update(&mut record.pending_teardown)? {
         write_sidecar_record(container, &record)?;
@@ -753,6 +774,7 @@ fn remove_sidecar_record(rt: &OciRuntime, container: &str) {
         let Some(dir) = sidecar_record_dir_existing()? else {
             return Ok(());
         };
+        let _lock = lock_sidecar_record(&dir, container)?;
         let name = sidecar_record_name(container);
         if let Ok(recorded) = recorded_sidecar(container)
             && recorded.runtime.prefix != rt.prefix
