@@ -109,7 +109,7 @@ pub struct PluginRun {
 /// Bounded process-tree cleanup result for a one-shot plugin run.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct RunOutcome {
-    /// A process-group termination was requested.
+    /// A live process in the group had to be signalled.
     pub killed: bool,
     /// The direct child was reaped by this run.
     pub reaped: bool,
@@ -721,7 +721,8 @@ fn spawn_ndjson_stream_inner<S: NdjsonSink>(
                 Ok(true) => {
                     // A successful one-shot run also kills helpers left in its process group,
                     // matching gh_run; backgrounded helpers do not outlive the plugin run.
-                    kill_requested = true;
+                    let stragglers = thegn_proc::group_has_live_members(pid);
+                    kill_requested = stragglers;
                     #[cfg(unix)]
                     reader_deadline_ms.store(
                         started
