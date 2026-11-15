@@ -167,6 +167,14 @@
           activityEnabled = false;
           activityRedRequiresAgent = false;
           activityAgentPrograms = ["claude" "my-agent"];
+          activityCpuPercent = 5.5;
+          activityRunawayCoreFraction = 0.75;
+          activityRunawaySecs = 1800;
+          activityQuietGraceSecs = 2.5;
+          activityResumeGraceSecs = 4;
+          activitySpawnGraceSecs = 1.5;
+          activityUnsolicitedGapSecs = 30;
+          activityOutputHintTtlSecs = 0.5;
           monitorSystem = "htop";
           monitorGpu = "nvtop";
           recordingDir = "/tmp/thegn-hm/recordings";
@@ -316,6 +324,8 @@
   zeroSemanticMapBudgetLines = evalWithOptions {semanticMapBudgetLines = 0;};
   oversizedMediaVolumeStep = evalWithOptions {mediaVolumeStep = 1.5;};
   oversizedUsageCritPercent = evalWithOptions {usageCritPercent = 100.5;};
+  oversizedActivityRunawayCoreFraction = evalWithOptions {activityRunawayCoreFraction = 1.5;};
+  negativeActivityQuietGraceSecs = evalWithOptions {activityQuietGraceSecs = -1;};
 
   minimalConfig = minimal.config.xdg.configFile."thegn/config.toml".source;
   maximalConfig = maximal.config.xdg.configFile."thegn/config.toml".source;
@@ -330,6 +340,8 @@ in
   assert !(builtins.tryEval (builtins.deepSeq zeroSemanticMapBudgetLines.config.programs.thegn.semanticMapBudgetLines true)).success;
   assert !(builtins.tryEval (builtins.deepSeq oversizedMediaVolumeStep.config.programs.thegn.mediaVolumeStep true)).success;
   assert !(builtins.tryEval (builtins.deepSeq oversizedUsageCritPercent.config.programs.thegn.usageCritPercent true)).success;
+  assert !(builtins.tryEval (builtins.deepSeq oversizedActivityRunawayCoreFraction.config.programs.thegn.activityRunawayCoreFraction true)).success;
+  assert !(builtins.tryEval (builtins.deepSeq negativeActivityQuietGraceSecs.config.programs.thegn.activityQuietGraceSecs true)).success;
   assert minimal.config.home.packages == [thegn];
   assert maximal.config.home.packages == [thegn];
     pkgs.runCommand "thegn-hm-module-eval" {} ''
