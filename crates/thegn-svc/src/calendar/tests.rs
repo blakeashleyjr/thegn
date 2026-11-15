@@ -4973,3 +4973,48 @@ END:VCALENDAR";
     combined.absorb(diagnostics);
     assert_eq!(combined.rejected.mixed_shape, 2);
 }
+
+#[test]
+fn diagnostics_budget_caps_retained_detail_across_three_pages() {
+    let page = |q: usize, o: usize| PageDiagnostics {
+        quarantined_events: q,
+        other: o,
+        rejected: RejectedEvents {
+            mixed_shape: q,
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    let mut budget = DiagnosticsBudget::new(5);
+    let mut total = PageDiagnostics::default();
+    for _ in 0..3 {
+        total.absorb_within(page(2, 1), &mut budget);
+    }
+    // 9 records offered, 5 retained, 4 truncated.
+    assert_eq!(total.quarantined_events + total.other, 5);
+    assert_eq!(total.truncated, 4);
+    assert_eq!(budget.remaining(), 0);
+    assert!(total.rejected.mixed_shape <= total.quarantined_events);
+    let before = total;
+    total.absorb_within(page(1, 0), &mut budget);
+    assert_eq!(total.quarantined_events, before.quarantined_events);
+    assert_eq!(total.truncated, 5);
+    assert_eq!(total.total(), 10);
+}
+
+#[test]
+fn diagnostics_budget_leaves_empty_page_default_and_absorb_saturates() {
+    let mut budget = DiagnosticsBudget::default();
+    let mut d = PageDiagnostics::default();
+    d.absorb_within(PageDiagnostics::default(), &mut budget);
+    assert_eq!(d, PageDiagnostics::default());
+    assert_eq!(budget.remaining(), DEFAULT_DIAGNOSTICS_BUDGET);
+    let mut max = PageDiagnostics {
+        truncated: usize::MAX,
+        other: usize::MAX,
+        ..Default::default()
+    };
+    max.absorb(max);
+    assert_eq!(max.truncated, usize::MAX);
+    assert_eq!(max.other, usize::MAX);
+}
