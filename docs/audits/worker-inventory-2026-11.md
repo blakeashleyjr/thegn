@@ -75,7 +75,13 @@ boundary. A plain `try_recv` loop without a count/time limit is recorded as
 The proposed class and limit entries are design labels only; this slice makes
 no runtime behavior claim. [`ingress_budget.rs`](../../crates/thegn-host/src/ingress_budget.rs)
 is the pure policy seam for the [THE-657](https://linear.app/blakeashley/issue/THE-657)
-follow-up wiring; it is compiled only under `#[cfg(test)]` until the first source is wired.
+follow-up wiring. It is wired for refresh requests (`MustDeliver`, 64 msgs) and
+workspace-clone events (`LosslessOrdered`, 32 msgs) through `ingress_budget::take_batch`,
+sharing one 4 ms iteration deadline and re-arming one wake when work is left (no timer).
+Remaining sources are the other `needs slice` rows in
+[host event ingress](../host-event-ingress.md): merge-queue drive, PR queue, host UI
+events, and model hydration; app tile hooks stay drain-until-empty by design (each
+message only sets one bool).
 In particular, `LosslessOrdered` and `MustDeliver` sources
 must not be changed to drop-oldest or latest-only delivery to fit a budget.
 
