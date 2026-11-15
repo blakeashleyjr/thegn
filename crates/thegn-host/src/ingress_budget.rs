@@ -3,8 +3,11 @@
 //! This is the contract that host-loop drain call sites share while their
 //! individual wiring is migrated under THE-657.  Wired today: refresh requests
 //! ([`REFRESH_SOURCE`]), workspace-clone events ([`WORKSPACE_CLONE_SOURCE`]),
-//! merge-queue drive messages ([`MERGE_DRIVE_SOURCE`]) and PR-queue messages
-//! ([`PR_QUEUE_SOURCE`]), all through [`take_batch`].  A caller snapshots each
+//! merge-queue drive messages ([`MERGE_DRIVE_SOURCE`]), PR-queue messages
+//! ([`PR_QUEUE_SOURCE`]), worktree-creation progress
+//! ([`WIZARD_CREATE_SOURCE`]), share supervisor events ([`SHARE_SOURCE`]) and
+//! forward detector events ([`FORWARD_SOURCE`]), all through [`take_batch`].
+//! A caller snapshots each
 //! source's readiness and work already consumed in this iteration, asks for a
 //! source turn, drains one bounded portion, updates the snapshot, and asks
 //! again.  The caller owns the clock: [`IterationBudget::advance`] is the only
@@ -41,6 +44,24 @@ pub const MERGE_DRIVE_SOURCE: SourceReady = SourceReady::new(
 
 /// PR-queue driver messages: every message in order, at most 64 per drain.
 pub const PR_QUEUE_SOURCE: SourceReady = SourceReady::new(
+    IngressClass::LosslessOrdered,
+    SourceLimits::new(64, usize::MAX),
+);
+
+/// Worktree-creation progress: every event in order, at most 32 per drain.
+pub const WIZARD_CREATE_SOURCE: SourceReady = SourceReady::new(
+    IngressClass::LosslessOrdered,
+    SourceLimits::new(32, usize::MAX),
+);
+
+/// Share supervisor events: every event in order, at most 64 per drain.
+pub const SHARE_SOURCE: SourceReady = SourceReady::new(
+    IngressClass::LosslessOrdered,
+    SourceLimits::new(64, usize::MAX),
+);
+
+/// Forward detector events: every event in order, at most 64 per drain.
+pub const FORWARD_SOURCE: SourceReady = SourceReady::new(
     IngressClass::LosslessOrdered,
     SourceLimits::new(64, usize::MAX),
 );
@@ -637,5 +658,60 @@ mod tests {
         assert_eq!(PR_QUEUE_SOURCE.class, IngressClass::LosslessOrdered);
         assert_eq!(PR_QUEUE_SOURCE.limits, SourceLimits::new(64, usize::MAX));
         assert_eq!(LOOP_DEADLINE, Duration::from_millis(4));
+    }
+
+    #[test]
+    fn ui_event_sources_keep_lossless_ordered_delivery() {
+        assert_eq!(WIZARD_CREATE_SOURCE.class, IngressClass::LosslessOrdered);
+        assert_eq!(WIZARD_CREATE_SOURCE.limits.max_msgs, 32);
+        assert_eq!(
+            WIZARD_CREATE_SOURCE.limits,
+            SourceLimits::new(32, usize::MAX)
+        );
+        assert_eq!(SHARE_SOURCE.class, IngressClass::LosslessOrdered);
+        assert_eq!(SHARE_SOURCE.limits.max_msgs, 64);
+        assert_eq!(SHARE_SOURCE.limits, SourceLimits::new(64, usize::MAX));
+        assert_eq!(FORWARD_SOURCE.class, IngressClass::LosslessOrdered);
+        assert_eq!(FORWARD_SOURCE.limits.max_msgs, 64);
+        assert_eq!(FORWARD_SOURCE.limits, SourceLimits::new(64, usize::MAX));
+    }
+
+    /// One item over the cap: the first call takes exactly `max_msgs` in
+    /// order and reports more; the second takes the last item and reports
+    /// none.  The input exceeds the limit, so the cap is really exercised.
+    fn assert_cap_plus_one_drains_in_two_batches(source: SourceReady) {
+        let cap = source.limits.max_msgs;
+        let total = u32::try_from(cap + 1).unwrap();
+        let start = base();
+        let mut rx = flood(total);
+        let mut rotation = 0;
+
+        let mut first = IterationBudget::new(start, LOOP_DEADLINE, false);
+        let (items, more) = take_batch(&mut rx, source, &mut first, &mut rotation, || start);
+        assert_eq!(items.len(), cap);
+        assert_eq!(items, (0..total - 1).collect::<Vec<u32>>());
+        assert!(more);
+
+        let later = start + LOOP_DEADLINE;
+        let mut second = IterationBudget::new(later, LOOP_DEADLINE, false);
+        let (rest, more) = take_batch(&mut rx, source, &mut second, &mut rotation, || later);
+        assert_eq!(rest, vec![total - 1]);
+        assert!(!more);
+        assert!(rx.is_empty());
+    }
+
+    #[test]
+    fn take_batch_wizard_create_caps_at_32_then_drains_the_rest() {
+        assert_cap_plus_one_drains_in_two_batches(WIZARD_CREATE_SOURCE);
+    }
+
+    #[test]
+    fn take_batch_share_caps_at_64_then_drains_the_rest() {
+        assert_cap_plus_one_drains_in_two_batches(SHARE_SOURCE);
+    }
+
+    #[test]
+    fn take_batch_forward_caps_at_64_then_drains_the_rest() {
+        assert_cap_plus_one_drains_in_two_batches(FORWARD_SOURCE);
     }
 }

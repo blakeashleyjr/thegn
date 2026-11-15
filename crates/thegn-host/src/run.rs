@@ -13517,7 +13517,15 @@ async fn event_loop<T: Terminal>(
 
         // Worktree-creation progress from the wizard worker; stale
         // generations (a cancelled run's stragglers) are dropped.
-        while let Ok(ev) = create_rx.try_recv() {
+        let mut create_budget = drain_budget(std::time::Instant::now(), !pending_input.is_empty());
+        let (create_batch, create_more) = crate::ingress_budget::take_batch(
+            &mut create_rx,
+            crate::ingress_budget::WIZARD_CREATE_SOURCE,
+            &mut create_budget,
+            &mut ingress_rotation,
+            std::time::Instant::now,
+        );
+        for ev in create_batch {
             loop_perf.tick(crate::perf::WakeSource::Create);
             match ev {
                 wizard::CreateEvent::Preflight {
@@ -14994,13 +15002,6 @@ async fn event_loop<T: Terminal>(
                 RefreshKind::Scheduled { .. } => {}
             }
         }
-        // THE-657: a budgeted source that stopped with work queued re-arms
-        // exactly one wake, so the remainder drains on the next iteration.
-        if (clone_more || refresh_more || mq_more || prq_more)
-            && let Err(e) = waker.wake()
-        {
-            tracing::debug!(target: "thegn::ingress", "ingress re-arm waker pulse failed: {e}");
-        }
         // Fast-forward the canonical main checkout if its ref advanced (throttled ~2s,
         // off-loop). What the heal saw is recorded only if it really spawns (a
         // request the throttle drops must stay due); see `maybe_spawn_heal`.
@@ -15660,7 +15661,15 @@ async fn event_loop<T: Terminal>(
         // Ingress-share state from the supervisor threads: persist the row,
         // update the supervisor, and re-sync the model so the badge + Share
         // panel repaint (a chrome change ⇒ Full frame).
-        while let Ok(ev) = share_rx.try_recv() {
+        let mut share_budget = drain_budget(std::time::Instant::now(), !pending_input.is_empty());
+        let (share_batch, share_more) = crate::ingress_budget::take_batch(
+            &mut share_rx,
+            crate::ingress_budget::SHARE_SOURCE,
+            &mut share_budget,
+            &mut ingress_rotation,
+            std::time::Instant::now,
+        );
+        for ev in share_batch {
             let stopping_generation = match &ev {
                 crate::share::ShareEvent::Down {
                     worktree,
@@ -15756,7 +15765,15 @@ async fn event_loop<T: Terminal>(
         // Auto-forward state from the detector thread: bring up / tear down the
         // host-side proxy, persist the row, notify on a conflict remap, and
         // re-sync the model (a chrome change ⇒ Full frame).
-        while let Ok(ev) = forward_rx.try_recv() {
+        let mut forward_budget = drain_budget(std::time::Instant::now(), !pending_input.is_empty());
+        let (forward_batch, forward_more) = crate::ingress_budget::take_batch(
+            &mut forward_rx,
+            crate::ingress_budget::FORWARD_SOURCE,
+            &mut forward_budget,
+            &mut ingress_rotation,
+            std::time::Instant::now,
+        );
+        for ev in forward_batch {
             match ev {
                 crate::forward::ForwardEvent::Detected {
                     worktree,
@@ -15861,6 +15878,21 @@ async fn event_loop<T: Terminal>(
                     }
                 }
             }
+        }
+        // THE-657: a budgeted source that stopped with work queued re-arms
+        // exactly one wake, so the remainder drains on the next iteration.
+        // This sits after the last budgeted drain (forward events) so every
+        // source's leftover is covered by the one pulse.
+        if (clone_more
+            || refresh_more
+            || mq_more
+            || prq_more
+            || create_more
+            || share_more
+            || forward_more)
+            && let Err(e) = waker.wake()
+        {
+            tracing::debug!(target: "thegn::ingress", "ingress re-arm waker pulse failed: {e}");
         }
 
         // One-shot package/config discovery results. Stale generations (rapid
