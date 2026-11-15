@@ -488,7 +488,55 @@ self: {
     stats.disk_free_warn = cfg.statsDiskFreeWarn;
     stats.disk_free_critical = cfg.statsDiskFreeCritical;
     stats.disk_path = cfg.statsDiskPath;
-    stats.alerts = cfg.statsAlerts;
+    stats.alerts = {
+      enabled = cfg.statsAlerts.enabled or null;
+      toast = cfg.statsAlerts.toast or null;
+      notify = cfg.statsAlerts.notify or null;
+      sustain_secs = cfg.statsAlerts.sustain_secs or null;
+      repeat_secs = cfg.statsAlerts.repeat_secs or null;
+      clear_margin = cfg.statsAlerts.clear_margin or null;
+      notify_clear = cfg.statsAlerts.notify_clear or null;
+      cpu = {
+        warn = cfg.statsAlerts.cpu.warn or null;
+        critical = cfg.statsAlerts.cpu.critical or null;
+      };
+      mem = {
+        warn = cfg.statsAlerts.mem.warn or null;
+        critical = cfg.statsAlerts.mem.critical or null;
+      };
+      swap = {
+        warn = cfg.statsAlerts.swap.warn or null;
+        critical = cfg.statsAlerts.swap.critical or null;
+      };
+      gpu = {
+        warn = cfg.statsAlerts.gpu.warn or null;
+        critical = cfg.statsAlerts.gpu.critical or null;
+      };
+      temp = {
+        warn = cfg.statsAlerts.temp.warn or null;
+        critical = cfg.statsAlerts.temp.critical or null;
+      };
+      load = {
+        warn = cfg.statsAlerts.load.warn or null;
+        critical = cfg.statsAlerts.load.critical or null;
+      };
+      disk_free = {
+        warn = cfg.statsAlerts.disk_free.warn or null;
+        critical = cfg.statsAlerts.disk_free.critical or null;
+      };
+      battery = {
+        warn = cfg.statsAlerts.battery.warn or null;
+        critical = cfg.statsAlerts.battery.critical or null;
+      };
+      reclaim = {
+        warn = cfg.statsAlerts.reclaim.warn or null;
+        critical = cfg.statsAlerts.reclaim.critical or null;
+      };
+      disk_eta = {
+        warn = cfg.statsAlerts.disk_eta.warn or null;
+        critical = cfg.statsAlerts.disk_eta.critical or null;
+      };
+    };
     notifications.desktop = cfg.notificationsDesktop;
     notifications.surface_self_log_errors = cfg.notificationsSurfaceSelfLogErrors;
     notifications.github_mentions = cfg.notificationsGithubMentions;
@@ -579,7 +627,18 @@ self: {
     usage.crit_percent = cfg.usageCritPercent;
     usage.providers = cfg.usageProviders;
     usage.profile_roots = cfg.usageProfileRoots;
-    usage.alerts = cfg.usageAlerts;
+    usage.alerts = {
+      enabled = cfg.usageAlerts.enabled or null;
+      notify = cfg.usageAlerts.notify or null;
+      sustain_secs = cfg.usageAlerts.sustain_secs or null;
+      repeat_secs = cfg.usageAlerts.repeat_secs or null;
+      clear_margin = cfg.usageAlerts.clear_margin or null;
+      notify_clear = cfg.usageAlerts.notify_clear or null;
+      used = {
+        warn = cfg.usageAlerts.used.warn or null;
+        critical = cfg.usageAlerts.used.critical or null;
+      };
+    };
     lsp.enabled = cfg.lspEnabled;
     lsp.hover = cfg.lspHover;
     lsp.require_containment = cfg.lspRequireContainment;
