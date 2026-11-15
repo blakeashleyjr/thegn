@@ -106,14 +106,21 @@ bisect_self_test() {
 # bisect_run <label> <filterset>: run nextest privately, print/record leaks.
 LEAKERS=()
 bisect_run() {
-  local label="$1" filter="$2" priv rows n ch rh
+  local label="$1" filter="$2" priv rows n ch rh rc=0
   priv="$(mktemp -d "${TMPDIR:-/tmp}/podman-bisect.XXXXXX")"
   mkdir -p "$priv/run" "$priv/home"
   chmod 700 "$priv/run"
   ch="${CARGO_HOME:-$HOME/.cargo}"
   rh="${RUSTUP_HOME:-$HOME/.rustup}"
   env CARGO_HOME="$ch" RUSTUP_HOME="$rh" HOME="$priv/home" XDG_RUNTIME_DIR="$priv/run" \
-    cargo nextest run --workspace -E "$filter" --no-fail-fast >"$priv/out.log" 2>&1 || true
+    cargo nextest run --workspace -E "$filter" --no-fail-fast >"$priv/out.log" 2>&1 || rc=$?
+  # 0 = all passed, 100 = test failures (both normal). 4 = nextest matched no
+  # tests; anything else is a non-test error. Warn, but keep the harness going.
+  case "$rc" in
+  0 | 100) ;;
+  4) printf 'WARNING: %s: nextest matched no tests (filter: %s); count is not evidence (see %s/out.log)\n' "$label" "$filter" "$priv" ;;
+  *) printf 'WARNING: %s: nextest exited %s (non-test error); count is not evidence (see %s/out.log)\n' "$label" "$rc" "$priv" ;;
+  esac
   rows="$(bisect_attribute "$priv/run")"
   if [ -z "$rows" ]; then
     printf '%-60s 0\n' "$label"
@@ -183,7 +190,7 @@ main() {
   if [ -n "$narrow" ]; then
     while IFS= read -r t; do
       [ -n "$t" ] || continue
-      bisect_run "$narrow :: $t" "binary(=$narrow) & test(=$t)"
+      bisect_run "$narrow :: $t" "binary_id(=$narrow) & test(=$t)"
     done < <(printf '%s\n' "$tests" | awk -v b="$narrow" '$1==b {print $2}')
   else
     while IFS= read -r b; do
@@ -191,7 +198,7 @@ main() {
       if [ -n "$binary" ] && [ "$b" != "$binary" ]; then
         continue
       fi
-      bisect_run "$b" "binary(=$b)"
+      bisect_run "$b" "binary_id(=$b)"
     done <<<"$bins"
   fi
 
