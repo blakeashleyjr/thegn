@@ -8,7 +8,19 @@ use thegn_core::{
     numfmt::{NumFmt, Reading, Unit},
     theme::StateRole,
 };
-use thegn_metrics::collect::health::{Absent, Health};
+use thegn_metrics::collect::{
+    health::{Absent, Health},
+    model::cpu_policy::CoreClass,
+};
+
+/// Hybrid core-class tag with its leading space, empty for `Unknown`.
+fn core_class_tag(class: CoreClass) -> &'static str {
+    match class {
+        CoreClass::Performance => " perf",
+        CoreClass::Efficiency => " eff",
+        CoreClass::Unknown => "",
+    }
+}
 
 fn style() -> crate::monitor::kit::grid::CellStyle {
     crate::monitor::kit::grid::CellStyle::default()
@@ -310,8 +322,9 @@ pub(super) fn paint_policy(grid: &mut CellGrid, rect: Rect, model: &PowerModel) 
             rect,
             row + chip_rows,
             &format!(
-                "policy {}  {} / {} / EPP {}",
+                "policy {}{}  {} / {} / EPP {}",
                 policy.policy,
+                core_class_tag(policy.core_class),
                 policy
                     .driver
                     .map(|v| v.as_str().to_owned())
