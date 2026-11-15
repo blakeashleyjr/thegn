@@ -365,15 +365,29 @@ fn derive_missing_landed_oid(
 ) -> anyhow::Result<String> {
     let branch_ref = format!("refs/heads/{branch}");
     let target_ref = format!("refs/heads/{target}");
-    let branch_tip = crate::integrate::resolve_commit_oid(repo_root, &branch_ref)?;
-    let target_tip = crate::integrate::resolve_commit_oid(repo_root, &target_ref)?;
-    anyhow::ensure!(
-        util::git_ok(
-            repo_root,
-            &["merge-base", "--is-ancestor", &branch_tip, &target_tip],
-        ),
-        "branch tip is not an ancestor of target"
-    );
+    let branch_tip =
+        crate::integrate::resolve_commit_oid(repo_root, &branch_ref).map_err(|reason| {
+            anyhow::anyhow!("could not verify the branch is on the target: {reason}")
+        })?;
+    let target_tip =
+        crate::integrate::resolve_commit_oid(repo_root, &target_ref).map_err(|reason| {
+            anyhow::anyhow!("could not verify the branch is on the target: {reason}")
+        })?;
+    match thegn_core::remote::GitLoc::Local(repo_root.to_path_buf()).git_run(
+        &["merge-base", "--is-ancestor", &branch_tip, &target_tip],
+        &thegn_core::git_run::GitPolicy::read(crate::integrate::DRIVER_SUBPROCESS_TIMEOUT),
+        &std::sync::atomic::AtomicBool::new(false),
+    ) {
+        thegn_core::git_run::GitOutcome::Ok(_) | thegn_core::git_run::GitOutcome::EmptyOk => {}
+        thegn_core::git_run::GitOutcome::Exit { code: Some(1), .. } => {
+            anyhow::bail!(
+                "could not verify the branch is on the target: branch tip is not an ancestor of target"
+            )
+        }
+        reason => {
+            anyhow::bail!("could not verify the branch is on the target: {reason}")
+        }
+    }
     crate::integrate::derive_landed_commit(repo_root, &branch_tip, &target_tip)
 }
 
@@ -825,6 +839,51 @@ mod tests {
         db.update_merge_status(wt.to_str().unwrap(), "landed", Some(&oid), None, None)
             .unwrap();
         (root, wt)
+    }
+
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "hermetic test git: blocking output is fine in a unit test"
+    )]
+    #[test]
+    fn derive_missing_landed_oid_distinguishes_not_ancestor_from_git_failure() {
+        let isolation = crate::merge_lifecycle::TestIsolation::new();
+        let dir = tempfile::tempdir().unwrap();
+        let parent = dir.path().canonicalize().unwrap();
+        let db = Db::open_at(&parent.join("private.db")).unwrap();
+        let (root, worktree) = fixture(&parent, "ancestry", &db, &isolation);
+
+        std::fs::write(worktree.join("new-file"), "new\n").unwrap();
+        let output = isolation
+            .git(&worktree)
+            .args(["-c", "commit.gpgsign=false", "add", "new-file"])
+            .output()
+            .unwrap();
+        assert!(output.status.success());
+        let output = isolation
+            .git(&worktree)
+            .args(["-c", "commit.gpgsign=false", "commit", "-q", "-m", "new"])
+            .output()
+            .unwrap();
+        assert!(output.status.success());
+        let not_ancestor = derive_missing_landed_oid(&root, "feature", "main").unwrap_err();
+        assert!(
+            not_ancestor
+                .to_string()
+                .contains("could not verify the branch is on the target")
+        );
+        assert!(not_ancestor.to_string().contains("not an ancestor"));
+
+        let corrupt = parent.join("corrupt");
+        std::fs::create_dir(&corrupt).unwrap();
+        std::fs::write(corrupt.join(".git"), "gitdir: /does/not/exist\n").unwrap();
+        let git_failure = derive_missing_landed_oid(&corrupt, "feature", "main").unwrap_err();
+        assert!(
+            git_failure
+                .to_string()
+                .contains("could not verify the branch is on the target")
+        );
+        assert!(!git_failure.to_string().contains("not an ancestor"));
     }
 
     fn seed_unignored(cfg: &Config, worktree: &Path) {
