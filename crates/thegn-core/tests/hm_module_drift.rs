@@ -1082,7 +1082,11 @@ fn hm_git_and_stats_families_are_rendered() {
                     "omitted schema key must exist: {path}"
                 );
             } else {
-                assert!(rendered.contains(&path), "Home Manager must render {path}");
+                assert!(
+                    rendered.contains(&path)
+                        || (path == "stats.alerts" && path_is_rendered(&path, &rendered)),
+                    "Home Manager must render {path}"
+                );
             }
         }
     }
@@ -1101,9 +1105,13 @@ fn hm_git_and_stats_families_are_rendered() {
         "stats.battery_warn",
         "stats.disk_free_warn",
         "stats.disk_free_critical",
-        "stats.alerts",
+        "stats.alerts.enabled",
+        "stats.alerts.cpu.warn",
     ] {
-        assert!(rendered.contains(path), "Home Manager must render {path}");
+        assert!(
+            path_is_rendered(path, &rendered),
+            "Home Manager must render {path}"
+        );
     }
 }
 
@@ -1178,7 +1186,9 @@ fn hm_notifications_dnd_and_sound_bools_are_rendered_and_rest_dispositioned() {
         for key in properties.keys() {
             let path = format!("{table}.{key}");
             assert!(
-                rendered.contains(&path) || omissions.contains(path.as_str()),
+                rendered.contains(&path)
+                    || (path == "usage.alerts" && path_is_rendered(&path, &rendered))
+                    || omissions.contains(path.as_str()),
                 "{path} must be rendered or dispositioned by an exact ledger row"
             );
         }
