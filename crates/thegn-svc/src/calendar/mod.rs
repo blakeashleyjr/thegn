@@ -284,9 +284,44 @@ pub struct PageDiagnostics {
     pub other: usize,
     /// Diagnostics beyond the parser's bounded report capacity, counted but not retained.
     pub overflow: usize,
+    /// Diagnostic records dropped because the fetch-wide [`DiagnosticsBudget`] was spent;
+    /// counted but not retained in the other fields.
+    pub truncated: usize,
     /// Breakdown of validator rejections by defect; each such event is ALSO counted in
     /// `quarantined_events`, so this is not added to `total()`.
     pub rejected: RejectedEvents,
+}
+
+/// Default cap on retained diagnostic records across ALL pages/files/resources of one fetch.
+pub const DEFAULT_DIAGNOSTICS_BUDGET: usize = 64;
+
+/// A fetch-wide allowance of retained diagnostic records, shared by every page, file or
+/// resource of one fetch so a later one does not get a fresh allowance.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DiagnosticsBudget {
+    remaining: usize,
+}
+
+impl Default for DiagnosticsBudget {
+    fn default() -> Self {
+        Self::new(DEFAULT_DIAGNOSTICS_BUDGET)
+    }
+}
+
+impl DiagnosticsBudget {
+    pub fn new(cap: usize) -> Self {
+        Self { remaining: cap }
+    }
+
+    pub fn remaining(&self) -> usize {
+        self.remaining
+    }
+
+    fn take(&mut self, wanted: usize) -> usize {
+        let granted = wanted.min(self.remaining);
+        self.remaining -= granted;
+        granted
+    }
 }
 
 /// Counts of validator-rejected events by value-free defect category.
@@ -369,7 +404,37 @@ impl PageDiagnostics {
         self.unresolved_zones = self.unresolved_zones.saturating_add(other.unresolved_zones);
         self.other = self.other.saturating_add(other.other);
         self.overflow = self.overflow.saturating_add(other.overflow);
+        self.truncated = self.truncated.saturating_add(other.truncated);
         self.rejected.absorb(other.rejected);
+    }
+
+    /// Like [`absorb`](Self::absorb), but retains at most the budget's remaining records;
+    /// what does not fit is added to `truncated`. `overflow` is already a count of
+    /// unretained records and passes through unclamped.
+    pub fn absorb_within(&mut self, other: PageDiagnostics, budget: &mut DiagnosticsBudget) {
+        let quarantined = budget.take(other.quarantined_events);
+        let zones = budget.take(other.unresolved_zones);
+        let misc = budget.take(other.other);
+        let dropped = (other.quarantined_events - quarantined)
+            .saturating_add(other.unresolved_zones - zones)
+            .saturating_add(other.other - misc);
+        // `rejected` is a breakdown of `quarantined_events`: keep no more of it than was kept.
+        let mut rejected = RejectedEvents::default();
+        let mut room = quarantined;
+        for (defect, count) in other.rejected.counts() {
+            for _ in 0..count.min(room) {
+                rejected.bump(defect);
+            }
+            room -= count.min(room);
+        }
+        self.absorb(PageDiagnostics {
+            quarantined_events: quarantined,
+            unresolved_zones: zones,
+            other: misc,
+            overflow: other.overflow,
+            truncated: other.truncated.saturating_add(dropped),
+            rejected,
+        });
     }
 
     pub fn total(&self) -> usize {
