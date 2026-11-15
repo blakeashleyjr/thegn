@@ -480,10 +480,17 @@ impl VoiceController {
 impl Drop for VoiceController {
     fn drop(&mut self) {
         let native = self.native_cancel.is_some();
+        let command = self.capture_stop_flag.is_some();
         self.stop_capture();
         self.cancel_transcription();
-        let deadline =
-            std::time::Instant::now() + Duration::from_millis(if native { 250 } else { 10 });
+        let deadline = std::time::Instant::now()
+            + Duration::from_millis(if native {
+                250
+            } else if command {
+                1_000
+            } else {
+                10
+            });
         while std::time::Instant::now() < deadline
             && (self
                 .capture_worker
@@ -556,7 +563,7 @@ fn spawn_capture(
             }),
             Leader::ReapFailed(_) | Leader::Detached | Leader::NotSpawned => None,
         };
-        if matches!(run.leader, Leader::Reaped(_)) && run.group != GroupState::Survivors {
+        if matches!(run.leader, Leader::Reaped(_)) {
             send_capture(&tx, &waker, VoiceMessage::CaptureReaped { generation });
         }
         let end = match run.end {
@@ -1363,16 +1370,30 @@ mod tests {
         if !UNIX {
             return;
         }
+        let dir = tempfile::tempdir().unwrap();
+        let marker = dir.path().join("ready");
         let config = VoiceConfig {
-            capture_command: vec!["sh".into(), "-c".into(), "printf RIFF; sleep 30".into()],
+            capture_command: vec![
+                "sh".into(),
+                "-c".into(),
+                "printf RIFF; : >\"$1\"; exec sleep 30".into(),
+                "sh".into(),
+                marker.display().to_string(),
+            ],
             ..VoiceConfig::default()
         };
         let (waker, _master, _terminal) = test_waker();
         let (tx, rx) = mpsc::channel();
         let stop = Arc::new(AtomicBool::new(false));
-        let started = std::time::Instant::now();
         let worker = spawn_capture(config, 1, 1, stop.clone(), tx, waker).unwrap();
-        thread::sleep(Duration::from_millis(200));
+        let ready_by = std::time::Instant::now() + Duration::from_secs(10);
+        while !marker.exists() {
+            assert!(
+                std::time::Instant::now() < ready_by,
+                "capture command never started"
+            );
+            thread::sleep(Duration::from_millis(5));
+        }
         stop.store(true, Ordering::Release);
         let terminal = loop {
             match rx.recv_timeout(Duration::from_secs(3)).unwrap() {
@@ -1389,7 +1410,6 @@ mod tests {
             }
             other => panic!("expected CaptureComplete, got {other:?}"),
         }
-        assert!(started.elapsed() < Duration::from_secs(3));
         worker.join().unwrap();
     }
 
