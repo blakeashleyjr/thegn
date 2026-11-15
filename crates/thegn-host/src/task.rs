@@ -41,8 +41,8 @@ pub(crate) const JOB_LIVE_LATEST_CAP: usize = 64;
 /// to the event loop. Producers overwrite the entry for their job name, so the
 /// slot never holds more than [`JOB_LIVE_LATEST_CAP`] values no matter how far
 /// the loop falls behind. When the map is full, a message for a 65th distinct
-/// name is dropped (refused); the dropped job's next emit, at most 100 ms
-/// later, retries after the loop drains.
+/// name is dropped (refused); a refused update is not retried by itself, and
+/// the job's next output after a drain is published.
 #[derive(Clone, Default)]
 pub(crate) struct JobLiveLatest {
     slots: Arc<Mutex<HashMap<String, JobLive>>>,
