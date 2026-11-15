@@ -44,18 +44,16 @@ impl CommitMeta {
     }
 }
 
-static META_MEMO: LazyLock<Mutex<HashMap<(PathBuf, String, String), CommitMeta>>> =
-    LazyLock::new(|| Mutex::new(HashMap::new()));
+type MetaKey = (PathBuf, String, String);
+type MetaMemo = Mutex<HashMap<MetaKey, CommitMeta>>;
+static META_MEMO: LazyLock<MetaMemo> = LazyLock::new(|| Mutex::new(HashMap::new()));
 static META_COMPUTES: AtomicU64 = AtomicU64::new(0);
 
 pub fn branch_meta_compute_count() -> u64 {
     META_COMPUTES.load(Ordering::Relaxed)
 }
 
-fn memoized(
-    key: (PathBuf, String, String),
-    compute: impl FnOnce() -> Result<CommitMeta>,
-) -> Result<CommitMeta> {
+fn memoized(key: MetaKey, compute: impl FnOnce() -> Result<CommitMeta>) -> Result<CommitMeta> {
     if let Some(meta) = META_MEMO
         .lock()
         .unwrap_or_else(|error| error.into_inner())
