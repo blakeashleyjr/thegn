@@ -1076,13 +1076,52 @@ fn output_bounded_with(
     output_bounded_with_input(cmd, args, None, timeout)
 }
 
+/// Captured-stdout ceiling for a bounded svc git child: 256 MiB. Far above any
+/// legitimate git read (the parser-side 64 MiB caps sit below it), so it only
+/// trips on a pathological diff or log that would otherwise be buffered whole.
+const GIT_STDOUT_CAP: usize = 256 * 1024 * 1024;
+/// Captured-stderr ceiling for a bounded svc git child: 8 MiB.
+const GIT_STDERR_CAP: usize = 8 * 1024 * 1024;
+
 /// [`output_bounded_with`] with an optional stdin payload. The same bounded
 /// child lifecycle and spawn accounting apply to ref transactions and reads.
+///
+/// With a timeout, stdout is capped at [`GIT_STDOUT_CAP`] and stderr at
+/// [`GIT_STDERR_CAP`]: more than that ends the run, kills the process group and
+/// returns a named "output exceeded" error. `timeout == None` (the explicit
+/// `THEGN_GIT_WRITE_TIMEOUT_SECS=0` opt-out) stays unbounded in both time and
+/// output size by design.
 pub(super) fn output_bounded_with_input(
+    cmd: std::process::Command,
+    args: &[&str],
+    input: Option<&[u8]>,
+    timeout: Option<std::time::Duration>,
+) -> Result<std::process::Output> {
+    output_bounded_with_input_caps(cmd, args, input, timeout, GIT_STDOUT_CAP, GIT_STDERR_CAP)
+}
+
+/// Render an output cap for the over-cap error: whole MiB when it is one,
+/// bytes otherwise (the unit tests inject sub-MiB caps).
+fn describe_output_cap(cap: usize) -> String {
+    const MIB: usize = 1024 * 1024;
+    if cap >= MIB && cap.is_multiple_of(MIB) {
+        format!("{} MiB", cap / MIB)
+    } else {
+        format!("{cap} bytes")
+    }
+}
+
+/// [`output_bounded_with_input`] with the stream caps injected — the seam the
+/// unit tests drive with small caps. A stream producing more than its cap ends
+/// the run (the cap itself is allowed). The caps apply only when `timeout` is
+/// `Some`; the unbounded `None` path ignores them.
+fn output_bounded_with_input_caps(
     mut cmd: std::process::Command,
     args: &[&str],
     input: Option<&[u8]>,
     timeout: Option<std::time::Duration>,
+    stdout_cap: usize,
+    stderr_cap: usize,
 ) -> Result<std::process::Output> {
     use std::process::Stdio;
     use std::time::Duration;
@@ -1113,8 +1152,8 @@ pub(super) fn output_bounded_with_input(
         quiesce_after_leader: Some(Duration::ZERO),
         term_grace: Duration::from_millis(200),
         reader_grace: Duration::from_millis(100),
-        stdout: thegn_proc::Stream::Head { cap: usize::MAX },
-        stderr: thegn_proc::Stream::Head { cap: usize::MAX },
+        stdout: thegn_proc::Stream::HeadOrFail { cap: stdout_cap },
+        stderr: thegn_proc::Stream::HeadOrFail { cap: stderr_cap },
         ..thegn_proc::Limits::silent(timeout)
     };
     let run = match input {
@@ -1140,9 +1179,14 @@ pub(super) fn output_bounded_with_input(
             anyhow::bail!("git {} was unexpectedly cancelled", args.join(" "))
         }
         thegn_proc::End::OutputLimit(which) => {
+            let (stream, cap) = match which {
+                thegn_proc::Which::Stdout => ("stdout", stdout_cap),
+                thegn_proc::Which::Stderr => ("stderr", stderr_cap),
+            };
             anyhow::bail!(
-                "git {} unexpectedly hit output limit {which:?}",
-                args.join(" ")
+                "git {} output exceeded {} on {stream} (killed)",
+                args.join(" "),
+                describe_output_cap(cap)
             )
         }
         thegn_proc::End::LeaderExited => {
@@ -3848,6 +3892,86 @@ mod tests {
         let out =
             output_bounded_with(c, &["sh"], Some(std::time::Duration::from_secs(20))).unwrap();
         assert_eq!(out.stdout.len(), 200000);
+    }
+
+    #[test]
+    fn output_bounded_caps_kill_a_stdout_flood() {
+        let mut c = std::process::Command::new("sh");
+        c.args(["-c", "head -c 5000 /dev/zero"]);
+        let error = output_bounded_with_input_caps(
+            c,
+            &["sh"],
+            None,
+            Some(std::time::Duration::from_secs(20)),
+            1024,
+            256,
+        )
+        .expect_err("5000 stdout bytes must exceed a 1024-byte cap")
+        .to_string();
+        assert!(error.contains("exceeded"), "{error}");
+        assert!(error.contains("stdout"), "{error}");
+        assert!(error.contains("1024 bytes"), "{error}");
+    }
+
+    #[test]
+    fn output_bounded_caps_kill_a_stderr_flood() {
+        let mut c = std::process::Command::new("sh");
+        c.args(["-c", "head -c 5000 /dev/zero >&2"]);
+        let error = output_bounded_with_input_caps(
+            c,
+            &["sh"],
+            None,
+            Some(std::time::Duration::from_secs(20)),
+            1024,
+            256,
+        )
+        .expect_err("5000 stderr bytes must exceed a 256-byte cap")
+        .to_string();
+        assert!(error.contains("exceeded"), "{error}");
+        assert!(error.contains("stderr"), "{error}");
+    }
+
+    #[test]
+    fn output_bounded_caps_allow_output_exactly_at_the_cap() {
+        let mut c = std::process::Command::new("sh");
+        c.args(["-c", "head -c 1024 /dev/zero; head -c 256 /dev/zero >&2"]);
+        let out = output_bounded_with_input_caps(
+            c,
+            &["sh"],
+            None,
+            Some(std::time::Duration::from_secs(20)),
+            1024,
+            256,
+        )
+        .unwrap();
+        assert!(out.status.success());
+        assert_eq!(out.stdout, vec![0u8; 1024]);
+        assert_eq!(out.stderr, vec![0u8; 256]);
+    }
+
+    #[test]
+    fn output_bounded_caps_leave_a_small_run_byte_identical() {
+        let mut c = std::process::Command::new("printf");
+        c.arg("small\\0run");
+        let out = output_bounded_with_input_caps(
+            c,
+            &["printf"],
+            None,
+            Some(std::time::Duration::from_secs(5)),
+            1024,
+            256,
+        )
+        .unwrap();
+        assert!(out.status.success());
+        assert_eq!(out.stdout, b"small\0run");
+        assert!(out.stderr.is_empty());
+    }
+
+    #[test]
+    fn output_cap_is_described_in_mib_when_whole() {
+        assert_eq!(describe_output_cap(GIT_STDOUT_CAP), "256 MiB");
+        assert_eq!(describe_output_cap(GIT_STDERR_CAP), "8 MiB");
+        assert_eq!(describe_output_cap(1024), "1024 bytes");
     }
 
     #[test]
