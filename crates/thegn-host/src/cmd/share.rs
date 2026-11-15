@@ -401,8 +401,7 @@ fn list(json: bool) -> Result<()> {
 
 /// Read each listed worktree's pending serve teardowns once. This is a
 /// read-only, lock-free read of the sidecar record. A missing record (the
-/// sandbox never started a sidecar) is detected by the "no recorded runtime"
-/// error text and means nothing is pending; any other failure is kept so the
+/// sandbox never started a sidecar) means nothing is pending; any other failure is kept so the
 /// listing can say the state is unreadable.
 fn pending_reader(rows: &[ShareRow]) -> impl Fn(&str) -> Result<Vec<u16>> {
     let mut memo: std::collections::BTreeMap<String, std::result::Result<Vec<u16>, String>> =
@@ -415,13 +414,8 @@ fn pending_reader(rows: &[ShareRow]) -> impl Fn(&str) -> Result<Vec<u16>> {
                     Some(&thegn_core::profile::name()),
                 ),
             );
-            match thegn_svc::vpn::pending_teardowns(&sidecar) {
-                Ok(ports) => Ok(ports),
-                Err(error) if format!("{error:#}").contains("no recorded runtime") => {
-                    Ok(Vec::new())
-                }
-                Err(error) => Err(format!("{error:#}")),
-            }
+            thegn_svc::vpn::pending_teardowns_if_recorded(&sidecar)
+                .map_err(|error| format!("{error:#}"))
         });
     }
     move |wt: &str| match memo.get(wt) {

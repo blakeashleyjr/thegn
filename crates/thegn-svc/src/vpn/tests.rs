@@ -429,6 +429,17 @@ fn sidecar_record_missing_is_a_typed_refusal() {
 }
 
 #[test]
+fn pending_teardowns_if_recorded_treats_missing_record_as_empty() {
+    let _state = thegn_core::testenv::IsolatedState::new();
+
+    assert_eq!(
+        pending_teardowns_if_recorded("c-tgvpn").unwrap(),
+        Vec::<u16>::new()
+    );
+    assert!(pending_teardowns("c-tgvpn").is_err());
+}
+
+#[test]
 fn sidecar_record_empty_runtime_prefix_has_specific_error() {
     let _state = thegn_core::testenv::IsolatedState::new();
     let runtime = OciRuntime::new(Vec::new());
