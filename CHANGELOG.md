@@ -7,6 +7,19 @@ All notable changes to **thegn** are documented here. The format follows
 
 ## [Unreleased]
 
+### Added
+
+- Sidebar worktree rows now show commits ahead of the default branch (`5c`, capped at `999+`) and a detail line with the branch, commit count, changed files, diff stat, PR, last commit subject, and age. Configure badges, visibility, and field order with the new `[ui]` keys `sidebar_detail_when`, `sidebar_show_commits`, `sidebar_show_behind_base`, `sidebar_commit_badge`, `sidebar_behind_badge`, and `sidebar_detail_fields`.
+
+### Changed
+
+- Sidebar details now show on every row by default, including when the sidebar is unfocused. Set `sidebar_focus_detail = "cursor"` and `sidebar_detail_when = "focused"` to restore the previous behavior.
+
+### Fixed
+
+- Plugin runs that exit cleanly are no longer reported as killed; on Linux, a run is marked killed only when a leftover process in its group had to be stopped.
+- Core Git helpers now have a 60-second deadline and bounded output, so a hung or runaway Git command cannot stall the caller.
+
 ## [0.1.0-alpha.82] — 2026-11-14
 
 ### Added
