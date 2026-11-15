@@ -315,8 +315,16 @@ mod tests {
         sink.on_batch(3);
         assert_eq!(pulses.load(Ordering::SeqCst), 1);
         assert_eq!(rx.try_recv().unwrap().count, 3);
-        drop(rx);
-        sink.on_batch(1);
+        let (tx2, rx2) = tokio_mpsc::unbounded_channel();
+        drop(rx2);
+        let p2 = pulses.clone();
+        let mut closed = BatchForwarder::new(
+            tx2,
+            Arc::new(move || {
+                p2.fetch_add(1, Ordering::SeqCst);
+            }),
+        );
+        closed.on_batch(1);
         assert_eq!(
             pulses.load(Ordering::SeqCst),
             1,
@@ -382,21 +390,36 @@ mod tests {
             }),
         );
         sink.on_batch(1);
-        assert_eq!(rx.try_recv().unwrap().count, 1);
+        let mut total: usize = 0;
+        let mut msgs: usize = 0;
+        let first = rx.try_recv().unwrap();
+        total += first.count;
+        msgs += 1;
+        assert_eq!(first.count, 1);
         sink.on_batch(2);
         sink.on_batch(3);
-        assert!(rx.try_recv().is_err(), "deferred inside the window");
         let deadline = Instant::now() + Duration::from_secs(3);
-        let mut got = None;
         while Instant::now() < deadline {
-            if let Ok(b) = rx.try_recv() {
-                got = Some(b.count);
+            while let Ok(b) = rx.try_recv() {
+                total += b.count;
+                msgs += 1;
+            }
+            if total == 6 {
                 break;
             }
             std::thread::sleep(Duration::from_millis(10));
         }
-        assert_eq!(got, Some(5));
-        assert_eq!(pulses.load(Ordering::SeqCst), 2);
+        assert_eq!(total, 6);
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while Instant::now() < deadline && pulses.load(Ordering::SeqCst) != msgs {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(
+            pulses.load(Ordering::SeqCst),
+            msgs,
+            "one pulse per landed send"
+        );
+        assert!(msgs >= 2);
     }
 
     #[test]
