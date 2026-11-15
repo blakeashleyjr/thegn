@@ -295,6 +295,12 @@ pub fn validate_diagnostics_with_policy(
         message,
     }));
     if let Ok(cfg) = toml::from_str::<Config>(&normalized.body) {
+        diagnostics.extend(sidebar_detail_warnings(&cfg).into_iter().map(|message| {
+            ValidationDiagnostic {
+                severity: ValidationSeverity::Warning,
+                message,
+            }
+        }));
         if cfg.voice.kind == crate::config::VoiceKind::Http
             && let Err(message) = cfg.voice.validate_credential_transport()
         {
@@ -548,6 +554,29 @@ pub(crate) fn typed_semantic_errors(cfg: &Config, mode: SemanticMode) -> Vec<Str
     batch!(cfg.ci.validate());
     batch!(crate::provider_admission::validate_config(cfg));
     errs
+}
+
+fn sidebar_detail_warnings(cfg: &Config) -> Vec<String> {
+    let mut warnings = Vec::new();
+    let valid = crate::config::DetailField::valid_names().join(", ");
+    for field in &cfg.ui.sidebar_detail_fields {
+        if crate::config::DetailField::parse(field).is_none() {
+            warnings.push(format!(
+                "ui.sidebar_detail_fields: unknown field {field:?}; expected one of: {valid}"
+            ));
+        }
+    }
+    for (key, badge) in [
+        ("ui.sidebar_commit_badge", &cfg.ui.sidebar_commit_badge),
+        ("ui.sidebar_behind_badge", &cfg.ui.sidebar_behind_badge),
+    ] {
+        if !badge.contains("{n}") {
+            warnings.push(format!(
+                "{key}: badge template must contain {{n}}; the default will be used"
+            ));
+        }
+    }
+    warnings
 }
 
 /// Same project-specific schema semantics as document validation, including
@@ -1455,6 +1484,7 @@ mod tests {
         has("toolchain.mise.inject", "MiseInject");
         has("issues.provider", "IssueProviderKind");
         has("ui.sidebar_focus_detail", "FocusDetail");
+        has("ui.sidebar_detail_when", "DetailWhen");
         // Maps via additionalProperties.
         has("env.*.provider.connect", "ProviderConnect");
         has("host.*.reach", "HostReach");
@@ -1946,6 +1976,24 @@ sidebar_workspace_sort = "attention"
         assert_eq!(diagnostics[0].severity, ValidationSeverity::Warning);
         assert!(diagnostics[0].message.contains("mounts[0]"));
         assert!(diagnostics[0].message.contains("bogus"));
+        assert!(validate_str(body).is_empty());
+    }
+
+    #[test]
+    fn warns_on_unknown_detail_field_and_badge_without_n() {
+        let body = "[ui]\nsidebar_detail_fields = [\"branch\", \"bogus\"]\nsidebar_commit_badge = \"commits\"\nsidebar_behind_badge = \"{n}b\"\n";
+        let diagnostics = validate_diagnostics(body);
+        assert!(diagnostics.iter().any(|diagnostic| {
+            diagnostic.severity == ValidationSeverity::Warning
+                && diagnostic.message.contains("sidebar_detail_fields")
+                && diagnostic.message.contains("bogus")
+                && diagnostic.message.contains("branch_stat")
+        }));
+        assert!(diagnostics.iter().any(|diagnostic| {
+            diagnostic.severity == ValidationSeverity::Warning
+                && diagnostic.message.contains("sidebar_commit_badge")
+                && diagnostic.message.contains("{n}")
+        }));
         assert!(validate_str(body).is_empty());
     }
 
