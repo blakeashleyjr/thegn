@@ -1927,6 +1927,99 @@ mod tests {
         assert_eq!(tab.focused_pane, leaf, "focus stays on the surviving leaf");
     }
 
+    fn host_spec(argv: &[&str], env: Vec<(String, String)>) -> crate::agent::LaunchSpec {
+        crate::agent::LaunchSpec {
+            argv: argv.iter().map(|a| (*a).to_string()).collect(),
+            cwd: None,
+            env,
+            backend: "host".into(),
+            warnings: Vec::new(),
+            degraded: false,
+            remote: false,
+        }
+    }
+
+    #[test]
+    fn materialize_mid_batch_spawn_failure_errs_and_leaves_tree_and_focus_untouched() {
+        // Leaf 0 has a valid spec, leaf 1 names a program that cannot exec. The
+        // failure returns before the post-loop remap, so the tree and focus must
+        // be the original ids.
+        let mut session = one_tab_session();
+        let path = session.worktrees[0].path.clone();
+        let tab = &mut session.worktrees[0].tabs[0];
+        let first = tab.center.pane_ids()[0];
+        let second = first + 1;
+        assert!(tab.center.split(first, crate::center::Dir::Row, second));
+        tab.focused_pane = first;
+        let (tx, _rx) = tokio_mpsc::channel::<PaneEvent>(1024);
+        let mut panes = Panes::new(tx);
+        let cfg = thegn_core::config::Config::default();
+        let specs = [
+            (first, host_spec(&["/bin/sh"], Vec::new())),
+            (
+                second,
+                host_spec(
+                    &["/nonexistent/thegn-missing-program"],
+                    vec![("GH_TOKEN".into(), "ghp_secret".into())],
+                ),
+            ),
+        ];
+        let chrome = layout::compute(160, 40, true, true);
+
+        let err = panes
+            .materialize_with_specs(&cfg, tab, &path, &specs, chrome.center, &[])
+            .expect_err("a spawn failure mid-batch must surface as Err");
+
+        let line = spawn_failure_line(&err);
+        assert!(!line.is_empty());
+        assert!(
+            !line.contains("ghp_secret"),
+            "the redacted failure line must not carry env secrets: {line}"
+        );
+        assert_eq!(
+            tab.center.pane_ids(),
+            vec![first, second],
+            "the tree is not remapped after a partial batch"
+        );
+        assert_eq!(tab.focused_pane, first, "focus is not remapped");
+        // Pinned current behaviour: the first leaf's freshly spawned pane is NOT
+        // rolled back; it stays in `panes.table` (un-attached to any leaf) when a
+        // later leaf fails.
+        assert_eq!(
+            panes.table.len(),
+            1,
+            "the first leaf's pane stays in the table after a partial batch"
+        );
+    }
+
+    #[test]
+    fn materialize_with_missing_worktree_falls_back_to_home_and_succeeds() {
+        let home = tempfile::tempdir().unwrap();
+        let _env = crate::testenv::EnvVarGuard::set(&[("HOME", home.path().to_str().unwrap())]);
+        let mut session = one_tab_session();
+        let missing = home.path().join("no-such-worktree");
+        let path = missing.to_str().unwrap().to_string();
+        let tab = &mut session.worktrees[0].tabs[0];
+        let leaf = tab.center.pane_ids()[0];
+        let (tx, _rx) = tokio_mpsc::channel::<PaneEvent>(1024);
+        let mut panes = Panes::new(tx);
+        let cfg = thegn_core::config::Config::default();
+        let specs = [(leaf, host_spec(&["/bin/sh"], Vec::new()))];
+        let chrome = layout::compute(160, 40, true, true);
+
+        panes
+            .materialize_with_specs(&cfg, tab, &path, &specs, chrome.center, &[])
+            .expect("a missing worktree directory falls back to home, not Err");
+
+        assert_eq!(panes.table.len(), 1);
+        let ids = tab.center.pane_ids();
+        assert_eq!(ids.len(), 1);
+        assert!(
+            panes.table.contains_key(&ids[0]),
+            "leaf maps to a live pane"
+        );
+    }
+
     #[test]
     fn prewarm_targets_returns_clamped_neighbors_excluding_active() {
         // Middle of a list: both neighbors.
