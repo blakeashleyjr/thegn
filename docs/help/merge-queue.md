@@ -64,7 +64,9 @@ branch, when that history should be landed.
   its branch or worktree identity changed since it was queued. A landed row
   whose cleanup was refused carries `cleanup_class`, the same stable class id
   as `merge sweep --json` `kept[].class`, and `null` otherwise. Re-enqueue with
-  `thegn merge add` to adopt the new identity.
+  `thegn merge add` to adopt the new identity. `merge.list` (HTTP, gRPC and
+  MCP) also reports `cleanup_retry` (attempts, next retry time, refusal class)
+  and `cleanup_hold` for landed rows whose cleanup was refused or held.
 - The Merge queue panel shows the same claim: a held row is marked `claimed`,
   and Full view names the owner, claim phase and lease (or says an expired
   claim is recoverable).
