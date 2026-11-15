@@ -168,6 +168,25 @@ fn materialize_fallback_cwd(
     current.or(home)
 }
 
+/// Split the panes a failed materialize already spawned (THE-2004) into the
+/// ones to detach and the ones to kill. A pane that warm-reattached a
+/// pre-existing session (a persisted daemon session, an attach-on-open agent
+/// session, or a native exec with a recorded session id) must be detached so
+/// the user's server-side session survives for the next reattach; a freshly
+/// opened pane is killed and reaped. Both lists are sorted for determinism.
+fn materialize_rollback_plan(
+    spawned: &std::collections::HashMap<u32, u32>,
+    reattached: &std::collections::HashSet<u32>,
+) -> (Vec<u32>, Vec<u32>) {
+    let (mut detach, mut kill): (Vec<u32>, Vec<u32>) = spawned
+        .values()
+        .copied()
+        .partition(|fresh| reattached.contains(fresh));
+    detach.sort_unstable();
+    kill.sort_unstable();
+    (detach, kill)
+}
+
 fn git_scrubbed_env(env: &[(String, String)]) -> Vec<(String, String)> {
     env.iter()
         .filter(|(key, _)| !thegn_core::util::GIT_ENV_VARS.contains(&key.as_str()))
@@ -1167,6 +1186,9 @@ impl Panes {
 
         let spawn_t0 = std::time::Instant::now();
         let mut map = std::collections::HashMap::new();
+        // Panes in `map` that reattached a pre-existing session rather than
+        // opening a fresh one: a rollback detaches these instead of killing.
+        let mut reattached: std::collections::HashSet<u32> = std::collections::HashSet::new();
         // A leaf explicitly closed while its spec batch was in flight is no
         // longer in the tree: spawning for its departed id would orphan the
         // fresh pane (the remap below would find no leaf to attach it to).
@@ -1235,6 +1257,7 @@ impl Panes {
                                         .filter(|s| !s.is_empty()),
                                 );
                             }
+                            reattached.insert(fresh);
                             map.insert(*old, fresh);
                             continue;
                         }
@@ -1343,8 +1366,12 @@ impl Panes {
             };
             if let Some((n, program)) = native {
                 let session = tab.pane_sessions.get(old).map(|s| s.session.clone());
+                let reattach = session.is_some();
                 match self.spawn_native_shell(n, session, program, center) {
                     Ok(fresh) => {
+                        if reattach {
+                            reattached.insert(fresh);
+                        }
                         map.insert(*old, fresh);
                         continue;
                     }
@@ -1410,12 +1437,19 @@ impl Panes {
                     // Roll back the panes this call already spawned for earlier
                     // leaves (THE-2004): the tree is not remapped on this path,
                     // so no leaf references them and they would be orphaned live
-                    // shells. Removing them is the explicit-close teardown
+                    // shells. A pane that reattached a pre-existing daemon or
+                    // native session is detached (`detach_pane`), so that
+                    // session stays alive for the next reattach; a freshly
+                    // opened pane takes the explicit-close teardown
                     // (`handlers::close::close_pane`): the kill-on-drop default
                     // terminates and reaps a PTY child off-loop, and kills a
-                    // daemon-backed pane's server-side session.
-                    for fresh in map.values() {
-                        self.table.remove(fresh);
+                    // fresh daemon-backed pane's server-side session.
+                    let (detach, kill) = materialize_rollback_plan(&map, &reattached);
+                    for id in detach {
+                        self.detach_pane(id);
+                    }
+                    for id in kill {
+                        self.table.remove(&id);
                     }
                     return Err(e);
                 }
@@ -2441,6 +2475,25 @@ mod tests {
             assert_eq!(kind.slot(), expected);
             assert!(kind.slot() < DAEMON_FALLBACK_KINDS);
         }
+    }
+
+    #[test]
+    fn materialize_rollback_detaches_reattached_panes_and_kills_fresh_ones() {
+        // leaf -> spawned pane id. Panes 11 and 13 reattached a surviving
+        // session; 12 and 14 were freshly opened.
+        let spawned: std::collections::HashMap<u32, u32> =
+            [(1, 11), (2, 12), (3, 13), (4, 14)].into_iter().collect();
+        let reattached: std::collections::HashSet<u32> = [11, 13].into_iter().collect();
+
+        let (detach, kill) = super::materialize_rollback_plan(&spawned, &reattached);
+
+        assert_eq!(detach, vec![11, 13], "reattached sessions must survive");
+        assert_eq!(kill, vec![12, 14], "fresh panes are killed and reaped");
+
+        let none = std::collections::HashSet::new();
+        let (detach, kill) = super::materialize_rollback_plan(&spawned, &none);
+        assert!(detach.is_empty());
+        assert_eq!(kill, vec![11, 12, 13, 14]);
     }
 
     #[test]
