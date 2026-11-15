@@ -82,10 +82,10 @@ admitted with.
   timeout, the run times out. On timeout or cancel, thegn also stops
   descendants that detached into their own session; on Linux this uses the
   process tree under `/proc`, and other platforms stop the process group only.
-  Manifests may declare intervals from 100 ms through 24 hours. The loader
-  clamps anything under 1 second up to 1 second and logs a warning; values below
-  100 ms are rejected. Each tick of a one-shot plugin spawns a process, so
-  choose the longest cadence that is useful.
+  Manifests may declare intervals from 100 ms through 24 hours. Intervals under
+  100 ms are rejected; intervals from 100 through 999 ms are raised to 1 second
+  when the plugin loads, with a warning naming the plugin. Each tick of a
+  one-shot plugin spawns a process, so choose the longest cadence that is useful.
   Output still unread at the reader deadline is discarded; messages already read are kept. Each run accepts at most 20,000
   lines, 1 MiB per line, 8 MiB of retained stdout, and keeps up to 8 KiB of
   stderr.
