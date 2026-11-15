@@ -54,9 +54,7 @@ trust on this surface; not planned).
 | git.stage             | mcp     | deferred    | THE-203 | MCP state tools land in the client-API phase |
 | issues.comment        | mcp     | deferred    | THE-203 | MCP state tools land in the client-API phase |
 | issues.update         | mcp     | deferred    | THE-203 | MCP state tools land in the client-API phase |
-| merge.add             | mcp     | deferred    | THE-203 | MCP state tools land in the client-API phase |
 | merge.clear           | mcp     | deferred    | THE-203 | MCP state tools land in the client-API phase |
-| notify.push           | mcp     | deferred    | THE-203 | MCP state tools land in the client-API phase |
 | sessions.detach       | mcp     | deferred    | THE-203 | MCP state tools land in the client-API phase |
 | sessions.resize       | mcp     | deferred    | THE-203 | MCP state tools land in the client-API phase |
 | sessions.snapshot     | mcp     | deferred    | THE-203 | MCP state tools land in the client-API phase |
