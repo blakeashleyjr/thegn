@@ -221,6 +221,7 @@ mod tests {
             group,
             leader,
             leader_exited_first,
+            idle_expired: false,
             stdout: thegn_proc::Capture::default(),
             stderr: thegn_proc::Capture::default(),
             containment: thegn_proc::Containment::ProcessGroup,

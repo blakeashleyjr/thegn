@@ -1299,6 +1299,20 @@
           "minimum": 0.0,
           "type": "integer"
         },
+        "sched_overloaded": {
+          "default": 0,
+          "description": "Scheduler ticks deferred to the next interval because the global one-shot in-flight cap was reached.",
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "sched_skipped": {
+          "default": 0,
+          "description": "Scheduler ticks skipped because the plugin's previous one-shot run was still in flight. Absent in snapshots written before the field existed.",
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": "integer"
+        },
         "timed_out": {
           "format": "uint64",
           "minimum": 0.0,

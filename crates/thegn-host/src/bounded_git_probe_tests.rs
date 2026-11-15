@@ -100,6 +100,7 @@ fn fake_run(end: End, group: GroupState, leader: Leader) -> Run {
         group,
         leader,
         leader_exited_first: true,
+        idle_expired: false,
         stdout: Capture {
             bytes: b"out".to_vec(),
             eof: true,

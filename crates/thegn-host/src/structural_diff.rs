@@ -318,6 +318,7 @@ mod tests {
             group,
             leader,
             leader_exited_first: true,
+            idle_expired: false,
             // Fully drained by default; the incomplete case sets `eof = false`.
             stdout: Capture {
                 eof: true,

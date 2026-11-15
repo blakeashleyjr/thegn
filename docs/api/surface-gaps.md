@@ -56,7 +56,5 @@ trust on this surface; not planned).
 | issues.update         | mcp     | deferred    | THE-203 | MCP state tools land in the client-API phase |
 | merge.clear           | mcp     | deferred    | THE-203 | MCP state tools land in the client-API phase |
 | sessions.detach       | mcp     | deferred    | THE-203 | MCP state tools land in the client-API phase |
-| sessions.resize       | mcp     | deferred    | THE-203 | MCP state tools land in the client-API phase |
 | sessions.snapshot     | mcp     | deferred    | THE-203 | MCP state tools land in the client-API phase |
 | sessions.split        | mcp     | deferred    | THE-203 | MCP state tools land in the client-API phase |
-| worktrees.open        | mcp     | deferred    | THE-203 | MCP state tools land in the client-API phase |
