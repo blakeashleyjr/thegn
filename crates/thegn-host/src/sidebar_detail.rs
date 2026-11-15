@@ -21,6 +21,10 @@ pub(crate) enum FieldId {
     Pr,
     Subject,
     Age,
+    Upstream,
+    Stage,
+    Activity,
+    Author,
     TailEnv,
     TailSandbox,
     TailDevcontainer,
@@ -86,6 +90,17 @@ fn field_id(field: DetailField) -> FieldId {
         DetailField::Pr => FieldId::Pr,
         DetailField::Subject => FieldId::Subject,
         DetailField::Age => FieldId::Age,
+        DetailField::Upstream => FieldId::Upstream,
+        DetailField::Stage => FieldId::Stage,
+        DetailField::Activity => FieldId::Activity,
+        DetailField::Env => FieldId::TailEnv,
+        DetailField::Sandbox => FieldId::TailSandbox,
+        DetailField::Devcontainer => FieldId::TailDevcontainer,
+        DetailField::Hibernated => FieldId::TailHibernated,
+        DetailField::Mq => FieldId::TailMq,
+        DetailField::Unread => FieldId::TailUnread,
+        DetailField::Disk => FieldId::TailDisk,
+        DetailField::Author => FieldId::Author,
     }
 }
 
@@ -116,92 +131,152 @@ fn detail_fields(row: &SidebarRow, disp: &SidebarDisplay, now_unix: i64) -> Vec<
         .as_deref()
         .filter(|branch| !branch.is_empty())
         .unwrap_or(&row.label);
-    let mut fields = Vec::new();
-    for requested in &disp.detail_fields {
-        let id = field_id(*requested);
-        let Some(field) =
-            (match requested {
-                DetailField::Branch if disp.detail_branch && !branch.is_empty() => Some(
-                    Field::new(id, vec![seg(Tok::Slot(S::Dim), display_cell(branch))], 1),
-                ),
-                DetailField::Commits => {
-                    let mut segs = Vec::new();
-                    if disp.show_commits
-                        && let Some(count) = row.branch_meta.as_ref().and_then(|m| m.ahead_base)
-                        && count > 0
-                    {
-                        segs.push(seg(
-                            Tok::Slot(S::Dim),
-                            format_badge(&disp.commit_badge, count, "{n}c"),
-                        ));
-                    }
-                    if disp.show_behind_base
-                        && let Some(count) = row.branch_meta.as_ref().and_then(|m| m.behind_base)
-                        && count > 0
-                    {
-                        if !segs.is_empty() {
-                            segs.push(sp(1));
-                        }
-                        segs.push(seg(
-                            Tok::Hue(theme::Hue::Amber),
-                            format_badge(&disp.behind_badge, count, "{n}b"),
-                        ));
-                    }
-                    (!segs.is_empty()).then(|| Field::new(id, segs, 1))
-                }
-                DetailField::Dirty => match row.branch_meta.as_ref().and_then(|m| m.dirty_files) {
-                    Some(count) if count > 0 => Some(Field::new(
-                        id,
-                        vec![seg(
-                            Tok::Hue(theme::Hue::Amber),
-                            format!("{}{}", disp.status_glyph(), count),
-                        )],
-                        1,
-                    )),
-                    Some(_) => None,
-                    None => row.git.is_some_and(|g| g.dirty).then(|| {
-                        Field::new(
-                            id,
-                            vec![seg(Tok::Hue(theme::Hue::Amber), disp.status_glyph())],
-                            1,
-                        )
-                    }),
-                },
-                DetailField::BranchStat if disp.detail_branch_stat => branch_stat_field(row, id),
-                DetailField::Pr if disp.detail_pr => pr_field(row, id),
-                DetailField::Subject => row
-                    .branch_meta
-                    .as_ref()
-                    .and_then(|meta| meta.last_subject.as_deref())
-                    .filter(|subject| !subject.is_empty())
-                    .map(|subject| {
-                        Field::new(id, vec![seg(Tok::Slot(S::Dim), display_cell(subject))], 8)
-                    }),
-                DetailField::Age => row
-                    .branch_meta
-                    .as_ref()
-                    .and_then(|meta| meta.last_commit_unix)
-                    .map(|stamp| {
-                        Field::new(
-                            id,
-                            vec![seg(
-                                Tok::Slot(S::Faint),
-                                fmt_age(now_unix.saturating_sub(stamp)),
-                            )],
-                            1,
-                        )
-                    }),
-                _ => None,
-            })
-        else {
-            continue;
-        };
-        fields.push(field);
+    if disp.detail_fields.is_empty() {
+        return branch_field(row, branch, FieldId::Branch)
+            .into_iter()
+            .collect();
     }
 
-    let fixed_tail = fixed_tail_fields(row);
-    fields.extend(fixed_tail);
-    fields
+    disp.detail_fields
+        .iter()
+        .flat_map(|requested| requested_fields(row, disp, *requested, branch, now_unix))
+        .collect()
+}
+
+fn branch_field(row: &SidebarRow, branch: &str, id: FieldId) -> Option<Field> {
+    (row.kind == RowKind::Worktree && !branch.is_empty())
+        .then(|| Field::new(id, vec![seg(Tok::Slot(S::Dim), display_cell(branch))], 1))
+}
+
+fn requested_fields(
+    row: &SidebarRow,
+    disp: &SidebarDisplay,
+    requested: DetailField,
+    branch: &str,
+    now_unix: i64,
+) -> Vec<Field> {
+    let id = field_id(requested);
+    match requested {
+        DetailField::Branch if disp.detail_branch => {
+            branch_field(row, branch, id).into_iter().collect()
+        }
+        DetailField::Commits => {
+            let mut segs = Vec::new();
+            if disp.show_commits
+                && let Some(count) = row.branch_meta.as_ref().and_then(|m| m.ahead_base)
+                && count > 0
+            {
+                segs.push(seg(
+                    Tok::Slot(S::Dim),
+                    format_badge(&disp.commit_badge, count, "{n}c"),
+                ));
+            }
+            if disp.show_behind_base
+                && let Some(count) = row.branch_meta.as_ref().and_then(|m| m.behind_base)
+                && count > 0
+            {
+                if !segs.is_empty() {
+                    segs.push(sp(1));
+                }
+                segs.push(seg(
+                    Tok::Hue(theme::Hue::Amber),
+                    format_badge(&disp.behind_badge, count, "{n}b"),
+                ));
+            }
+            (!segs.is_empty())
+                .then(|| Field::new(id, segs, 1))
+                .into_iter()
+                .collect()
+        }
+        DetailField::Dirty => match row.branch_meta.as_ref().and_then(|m| m.dirty_files) {
+            Some(count) if count > 0 => vec![Field::new(
+                id,
+                vec![seg(
+                    Tok::Hue(theme::Hue::Amber),
+                    format!("{}{}", disp.status_glyph(), count),
+                )],
+                1,
+            )],
+            Some(_) => Vec::new(),
+            None => row
+                .git
+                .is_some_and(|g| g.dirty)
+                .then(|| {
+                    Field::new(
+                        id,
+                        vec![seg(Tok::Hue(theme::Hue::Amber), disp.status_glyph())],
+                        1,
+                    )
+                })
+                .into_iter()
+                .collect(),
+        },
+        DetailField::BranchStat if disp.detail_branch_stat => {
+            branch_stat_field(row, id).into_iter().collect()
+        }
+        DetailField::Pr if disp.detail_pr => pr_field(row, id).into_iter().collect(),
+        DetailField::Subject => row
+            .branch_meta
+            .as_ref()
+            .and_then(|meta| meta.last_subject.as_deref())
+            .filter(|subject| !subject.is_empty())
+            .map(|subject| Field::new(id, vec![seg(Tok::Slot(S::Dim), display_cell(subject))], 8))
+            .into_iter()
+            .collect(),
+        DetailField::Age => row
+            .branch_meta
+            .as_ref()
+            .and_then(|meta| meta.last_commit_unix)
+            .map(|stamp| {
+                Field::new(
+                    id,
+                    vec![seg(
+                        Tok::Slot(S::Faint),
+                        fmt_age(now_unix.saturating_sub(stamp)),
+                    )],
+                    1,
+                )
+            })
+            .into_iter()
+            .collect(),
+        DetailField::Upstream => upstream_fields(row, id),
+        DetailField::Stage => row
+            .pipeline_stage
+            .as_deref()
+            .filter(|stage| !stage.trim().is_empty())
+            .map(|stage| Field::new(id, vec![seg(Tok::Slot(S::Dim), display_cell(stage))], 1))
+            .into_iter()
+            .collect(),
+        DetailField::Activity => match row.activity {
+            crate::sidebar::ActivityState::Active => vec![Field::new(
+                id,
+                vec![seg(Tok::Slot(S::ActivityActive), "active")],
+                1,
+            )],
+            crate::sidebar::ActivityState::Waiting => vec![Field::new(
+                id,
+                vec![seg(Tok::Slot(S::ActivityWaiting), "waiting")],
+                1,
+            )],
+            _ => Vec::new(),
+        },
+        DetailField::Env => env_fields(row),
+        DetailField::Sandbox => sandbox_fields(row),
+        DetailField::Devcontainer => devcontainer_fields(row),
+        DetailField::Hibernated => hibernated_fields(row),
+        DetailField::Mq => mq_fields(row),
+        DetailField::Unread => unread_fields(row),
+        DetailField::Disk => disk_fields(row),
+        DetailField::Author => row
+            .branch_meta
+            .as_ref()
+            .and_then(|meta| meta.last_author.as_deref())
+            .filter(|author| !author.is_empty())
+            .map(|author| Field::new(id, vec![seg(Tok::Slot(S::Dim), display_cell(author))], 1))
+            .into_iter()
+            .collect(),
+        _ => Vec::new(),
+    }
 }
 
 fn branch_stat_field(row: &SidebarRow, id: FieldId) -> Option<Field> {
@@ -260,9 +335,29 @@ fn pr_field(row: &SidebarRow, id: FieldId) -> Option<Field> {
     ))
 }
 
-fn fixed_tail_fields(row: &SidebarRow) -> Vec<Field> {
+fn upstream_fields(row: &SidebarRow, id: FieldId) -> Vec<Field> {
+    let Some(git) = row.git else {
+        return Vec::new();
+    };
+    if git.ahead == 0 && git.behind == 0 {
+        return Vec::new();
+    }
     let gl = crate::caps::active_glyphs();
-    let mut fields = Vec::new();
+    vec![Field::new(
+        id,
+        vec![
+            seg(Tok::Slot(S::Dim), format!("{}{}", gl.arrow_up, git.ahead)),
+            seg(
+                Tok::Hue(theme::Hue::Amber),
+                format!("{}{}", gl.arrow_down, git.behind),
+            ),
+        ],
+        1,
+    )]
+}
+
+fn env_fields(row: &SidebarRow) -> Vec<Field> {
+    let gl = crate::caps::active_glyphs();
     if let Some(env) = &row.env_name
         && !env.is_empty()
         && env != "default"
@@ -283,8 +378,13 @@ fn fixed_tail_fields(row: &SidebarRow) -> Vec<Field> {
         } else {
             Tok::Slot(S::Faint)
         };
-        fields.push(Field::new(FieldId::TailEnv, vec![seg(fg, text)], 1));
+        return vec![Field::new(FieldId::TailEnv, vec![seg(fg, text)], 1)];
     }
+    Vec::new()
+}
+
+fn sandbox_fields(row: &SidebarRow) -> Vec<Field> {
+    let mut fields = Vec::new();
     if let Some(profile) = &row.sandbox_profile {
         fields.push(Field::new(
             FieldId::TailSandbox,
@@ -309,41 +409,63 @@ fn fixed_tail_fields(row: &SidebarRow) -> Vec<Field> {
             1,
         ));
     }
+    fields
+}
+
+fn devcontainer_fields(row: &SidebarRow) -> Vec<Field> {
     if let Some(status) = &row.devcontainer_status {
-        fields.push(Field::new(
+        return vec![Field::new(
             FieldId::TailDevcontainer,
             vec![seg(Tok::Slot(S::Faint), display_cell(status))],
             1,
-        ));
+        )];
     }
+    Vec::new()
+}
+
+fn hibernated_fields(row: &SidebarRow) -> Vec<Field> {
+    let gl = crate::caps::active_glyphs();
     if row
         .worktree_path
         .as_deref()
         .is_some_and(crate::hibernator::is_hibernated)
     {
-        fields.push(Field::new(
+        return vec![Field::new(
             FieldId::TailHibernated,
             vec![seg(Tok::Slot(S::Faint), gl.moon)],
             1,
-        ));
+        )];
     }
+    Vec::new()
+}
+
+fn mq_fields(row: &SidebarRow) -> Vec<Field> {
     if let Some((glyph, hue)) = row.mq_status.and_then(crate::sidebar::mq_chip) {
-        fields.push(Field::new(
+        return vec![Field::new(
             FieldId::TailMq,
             vec![seg(Tok::Hue(hue), glyph)],
             1,
-        ));
+        )];
     }
+    Vec::new()
+}
+
+fn unread_fields(row: &SidebarRow) -> Vec<Field> {
+    let gl = crate::caps::active_glyphs();
     if row.unread_count > 0 {
-        fields.push(Field::new(
+        return vec![Field::new(
             FieldId::TailUnread,
             vec![seg(
                 Tok::Hue(theme::Hue::Blue),
                 format!("{}{}", gl.mail, row.unread_count),
             )],
             1,
-        ));
+        )];
     }
+    Vec::new()
+}
+
+fn disk_fields(row: &SidebarRow) -> Vec<Field> {
     if let Some(total) = row.disk_bytes {
         let target = row.target_bytes.unwrap_or(0);
         let heavy = target > 1024 * 1024 * 1024 && target.saturating_mul(2) > total;
@@ -352,13 +474,13 @@ fn fixed_tail_fields(row: &SidebarRow) -> Vec<Field> {
         } else {
             Tok::Slot(S::Dim)
         };
-        fields.push(Field::new(
+        return vec![Field::new(
             FieldId::TailDisk,
             vec![seg(fg, thegn_core::disk::human(total))],
             1,
-        ));
+        )];
     }
-    fields
+    Vec::new()
 }
 
 fn field_width(fields: &[Field]) -> usize {
@@ -390,6 +512,10 @@ pub(crate) fn fit_fields(mut fields: Vec<Field>, budget: usize) -> Vec<Field> {
     }
 
     let drop_order = [
+        FieldId::Activity,
+        FieldId::Stage,
+        FieldId::Upstream,
+        FieldId::Author,
         FieldId::Subject,
         FieldId::Age,
         FieldId::TailDisk,
@@ -490,6 +616,7 @@ mod tests {
             dirty_files: Some(3),
             last_commit_unix: Some(1_000),
             last_subject: Some("fix retry loop".into()),
+            last_author: Some("Ada Lovelace".into()),
         });
         row
     }
@@ -546,7 +673,7 @@ mod tests {
         row.env_name = Some("host".into());
         row.env_degraded = true;
         let display = SidebarDisplay {
-            detail_fields: Vec::new(),
+            detail_fields: vec![DetailField::Env],
             ..SidebarDisplay::default()
         };
         let line = compose_detail_line_at(&row, &display, 2_000, 0, 80).unwrap();
@@ -556,6 +683,131 @@ mod tests {
         assert!(segs.iter().any(|segment| {
             segment.text.contains("host") && segment.fg == Tok::Hue(theme::Hue::Amber)
         }));
+    }
+
+    #[test]
+    fn empty_detail_list_keeps_only_the_branch_fallback() {
+        let mut row = row();
+        row.env_name = Some("host".into());
+        row.disk_bytes = Some(10_000);
+        let display = SidebarDisplay {
+            detail_fields: Vec::new(),
+            ..SidebarDisplay::default()
+        };
+        let line = compose_detail_line_at(&row, &display, 2_000, 0, 80).unwrap();
+        let Line::Segs(segs) = line else {
+            panic!("detail line is a segment line")
+        };
+        let text = segs
+            .iter()
+            .map(|segment| segment.text.as_str())
+            .collect::<String>();
+        assert_eq!(text, "feature/retry-loop");
+    }
+
+    #[test]
+    fn new_fields_render_when_present_and_omit_absent_values() {
+        let mut row = row();
+        row.git = Some(crate::sidebar::GitGlyphs {
+            ahead: 2,
+            behind: 1,
+            ..crate::sidebar::GitGlyphs::default()
+        });
+        row.pipeline_stage = Some("review".into());
+        row.activity = crate::sidebar::ActivityState::Active;
+        row.env_name = Some("dev".into());
+        row.sandbox_profile = Some("strict".into());
+        row.sandbox_backend = Some("bwrap".into());
+        row.devcontainer_status = Some("running".into());
+        row.mq_status = Some(thegn_core::attention::MqStatus::Queued);
+        row.unread_count = 3;
+        row.disk_bytes = Some(10_000);
+        let display = SidebarDisplay {
+            detail_fields: vec![
+                DetailField::Upstream,
+                DetailField::Stage,
+                DetailField::Activity,
+                DetailField::Env,
+                DetailField::Sandbox,
+                DetailField::Devcontainer,
+                DetailField::Hibernated,
+                DetailField::Mq,
+                DetailField::Unread,
+                DetailField::Disk,
+                DetailField::Author,
+            ],
+            ..SidebarDisplay::default()
+        };
+        let ids: Vec<FieldId> = detail_fields(&row, &display, 2_000)
+            .into_iter()
+            .map(|field| field.id)
+            .collect();
+        assert_eq!(
+            ids,
+            vec![
+                FieldId::Upstream,
+                FieldId::Stage,
+                FieldId::Activity,
+                FieldId::TailEnv,
+                FieldId::TailSandbox,
+                FieldId::TailSandbox,
+                FieldId::TailDevcontainer,
+                FieldId::TailMq,
+                FieldId::TailUnread,
+                FieldId::TailDisk,
+                FieldId::Author,
+            ]
+        );
+
+        row.pipeline_stage = None;
+        row.activity = crate::sidebar::ActivityState::Read;
+        row.env_name = None;
+        row.sandbox_profile = None;
+        row.sandbox_backend = None;
+        row.devcontainer_status = None;
+        row.mq_status = None;
+        row.unread_count = 0;
+        row.disk_bytes = None;
+        row.git = Some(crate::sidebar::GitGlyphs::default());
+        let ids: Vec<FieldId> = detail_fields(&row, &display, 2_000)
+            .into_iter()
+            .map(|field| field.id)
+            .collect();
+        assert_eq!(ids, vec![FieldId::Author]);
+    }
+
+    #[test]
+    fn user_order_can_put_environment_before_branch_and_disk_can_be_dropped() {
+        let mut row = row();
+        row.env_name = Some("dev".into());
+        row.disk_bytes = Some(10_000);
+        let display = SidebarDisplay {
+            detail_fields: vec![DetailField::Env, DetailField::Branch],
+            ..SidebarDisplay::default()
+        };
+        let line = compose_detail_line_at(&row, &display, 2_000, 0, 80).unwrap();
+        let Line::Segs(segs) = line else {
+            panic!("detail line is a segment line")
+        };
+        let text = segs
+            .iter()
+            .map(|segment| segment.text.as_str())
+            .collect::<String>();
+        assert!(text.find("dev").unwrap() < text.find("feature/retry").unwrap());
+
+        let display = SidebarDisplay {
+            detail_fields: vec![DetailField::Branch],
+            ..SidebarDisplay::default()
+        };
+        let line = compose_detail_line_at(&row, &display, 2_000, 0, 80).unwrap();
+        let Line::Segs(segs) = line else {
+            panic!("detail line is a segment line")
+        };
+        let text = segs
+            .iter()
+            .map(|segment| segment.text.as_str())
+            .collect::<String>();
+        assert_eq!(text, "feature/retry-loop");
     }
 
     #[test]
