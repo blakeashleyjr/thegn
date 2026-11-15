@@ -326,8 +326,16 @@ fn group_live_with_scan(proc_root: &Path, pid: libc::pid_t, scan: &mut LivenessS
     cached_global_group_scan(proc_root, pid, scan)
 }
 
+#[cfg(target_os = "linux")]
+/// Return whether the process group has a live member using the cached `/proc`
+/// liveness scan used by the supervisor.
+pub fn group_has_live_members(pgid: u32) -> bool {
+    let mut scan = LivenessScan::default();
+    group_live_with_scan(Path::new("/proc"), pgid as libc::pid_t, &mut scan)
+}
+
 #[cfg(all(test, target_os = "linux"))]
-fn group_live_in(proc_root: &Path, pid: libc::pid_t) -> bool {
+fn group_has_live_members_in(proc_root: &Path, pid: libc::pid_t) -> bool {
     let mut scan = LivenessScan::default();
     group_live_with_scan(proc_root, pid, &mut scan)
 }
@@ -336,7 +344,7 @@ fn group_live_in(proc_root: &Path, pid: libc::pid_t) -> bool {
 fn group_live(pid: libc::pid_t) -> bool {
     #[cfg(target_os = "linux")]
     {
-        group_live_in(Path::new("/proc"), pid)
+        group_has_live_members_in(Path::new("/proc"), pid)
     }
     #[cfg(not(target_os = "linux"))]
     {
@@ -922,23 +930,26 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     #[test]
-    fn group_live_zombies_are_dead_and_esrch_does_not_read_proc() {
+    fn group_has_live_members_zombies_are_dead_and_esrch_does_not_read_proc() {
         let root = tempfile::tempdir().unwrap();
         let pid = fixture_group_pid();
         fake_proc_process(root.path(), pid, &fake_proc_stat(pid, 'Z', pid), "201");
         fake_proc_process(root.path(), 201, &fake_proc_stat(201, 'Z', pid), "");
         GLOBAL_PROC_SCANS.with(|scans| scans.set(0));
-        assert!(!group_live_in(root.path(), pid));
+        assert!(!group_has_live_members_in(root.path(), pid));
         GLOBAL_PROC_SCANS.with(|scans| assert_eq!(scans.get(), 1));
 
         PROC_READS.with(|reads| reads.set(0));
-        assert!(!group_live_in(root.path(), i32::MAX as libc::pid_t));
+        assert!(!group_has_live_members_in(
+            root.path(),
+            i32::MAX as libc::pid_t
+        ));
         PROC_READS.with(|reads| assert_eq!(reads.get(), 0));
     }
 
     #[cfg(target_os = "linux")]
     #[test]
-    fn group_live_finds_reparented_member_once_per_scan_window() {
+    fn group_has_live_members_finds_reparented_member_once_per_scan_window() {
         let root = tempfile::tempdir().unwrap();
         let pid = fixture_group_pid();
         fake_proc_process(root.path(), pid, &fake_proc_stat(pid, 'Z', pid), "");
