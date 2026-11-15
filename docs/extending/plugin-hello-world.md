@@ -51,8 +51,9 @@ updates. Keep them consistent between this file and the script.
 
 Each interval tick of a `one_shot` plugin spawns a process, so choose the
 longest cadence that is useful. Manifests may declare intervals from 100 ms
-through 24 hours; the loader clamps anything under 1 second up to 1 second and
-logs a warning. Values below 100 ms are rejected.
+through 24 hours. Intervals under 100 ms are rejected; intervals from 100
+through 999 ms are raised to 1 second when the plugin loads, with a warning
+naming the plugin.
 
 ## Step 3: the script
 
