@@ -2431,7 +2431,15 @@ fn gix_glyph_reads(git: &GixGit, loc: &GitLoc, include_submodules: bool) -> Glyp
     let branch = git.current_branch(loc);
     let dirty_and_count = git.dirty_and_count(loc, branch_meta::META_COUNT_CAP);
     let meta = branch_meta::with_dirty(
-        branch_meta::gix(loc, base.as_deref()),
+        if loc.is_remote() {
+            branch_meta::cli(
+                loc,
+                base.as_deref(),
+                branch.as_ref().is_ok_and(|b| b == "HEAD"),
+            )
+        } else {
+            branch_meta::gix(loc, base.as_deref())
+        },
         dirty_and_count
             .as_ref()
             .map(|(_, count)| *count)
@@ -2928,24 +2936,23 @@ impl GitBackend for GixGit {
                 .should_interrupt_owned(interrupt.clone())
                 .into_iter(Vec::<gix::bstr::BString>::new())
                 .context("gix status iter")?;
-            let mut count = 0u32;
+            let mut seen = std::collections::HashSet::<gix::bstr::BString>::new();
             for item in iter {
                 let item = item.context("gix status item")?;
                 if status_route
                     .as_mut()
                     .map_or(Ok(true), |route| route.keep(&item))?
                 {
-                    count = count.saturating_add(1);
-                    if count >= cap {
+                    seen.insert(item.location().to_owned());
+                    if seen.len() >= cap as usize {
                         break;
                     }
                 }
             }
-            dirty_or_expired(
-                count > 0,
-                interrupt.load(std::sync::atomic::Ordering::SeqCst),
-            )
-            .map(|_| count.min(cap))
+            if interrupt.load(std::sync::atomic::Ordering::SeqCst) {
+                anyhow::bail!("gix status exceeded the git read timeout");
+            }
+            Ok((seen.len() as u32).min(cap))
         })?;
         Ok((true, Some(count)))
     }
