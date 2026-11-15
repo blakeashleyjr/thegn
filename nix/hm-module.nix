@@ -348,6 +348,14 @@ self: {
     activity.enabled = cfg.activityEnabled;
     activity.red_requires_agent = cfg.activityRedRequiresAgent;
     activity.agent_programs = cfg.activityAgentPrograms;
+    activity.cpu_percent = cfg.activityCpuPercent;
+    activity.runaway_core_fraction = cfg.activityRunawayCoreFraction;
+    activity.runaway_secs = cfg.activityRunawaySecs;
+    activity.quiet_grace_secs = cfg.activityQuietGraceSecs;
+    activity.resume_grace_secs = cfg.activityResumeGraceSecs;
+    activity.spawn_grace_secs = cfg.activitySpawnGraceSecs;
+    activity.unsolicited_gap_secs = cfg.activityUnsolicitedGapSecs;
+    activity.output_hint_ttl_secs = cfg.activityOutputHintTtlSecs;
     recording.dir = cfg.recordingDir;
     recording.max_bytes = cfg.recordingMaxBytes;
     media.enabled = cfg.mediaEnabled;
@@ -1238,6 +1246,54 @@ in {
       type = lib.types.nullOr (lib.types.listOf lib.types.str);
       default = null;
       description = "Additional agent CLI program names. Unset (null) = the binary's default.";
+    };
+
+    activityCpuPercent = lib.mkOption {
+      type = lib.types.nullOr (lib.types.numbers.between 0 100);
+      default = null;
+      description = "Worktree CPU share (0 through 100, percent of one core) that counts as working. Unset (null) = the binary's default.";
+    };
+
+    activityRunawayCoreFraction = lib.mkOption {
+      type = lib.types.nullOr (lib.types.numbers.between 0 1);
+      default = null;
+      description = "Fraction of one core (0.0 through 1.0) a single process must hold to be a runaway candidate; 0 disables the check. Unset (null) = the binary's default.";
+    };
+
+    activityRunawaySecs = lib.mkOption {
+      type = lib.types.nullOr (lib.types.numbers.between 0 315360000);
+      default = null;
+      description = "Seconds a process must hold the runaway core fraction continuously before it is reported; 0 disables the check. Unset (null) = the binary's default.";
+    };
+
+    activityQuietGraceSecs = lib.mkOption {
+      type = lib.types.nullOr (lib.types.numbers.between 0 315360000);
+      default = null;
+      description = "Seconds a working worktree must stay quiet before its dot says needs you. Unset (null) = the binary's default.";
+    };
+
+    activityResumeGraceSecs = lib.mkOption {
+      type = lib.types.nullOr (lib.types.numbers.between 0 315360000);
+      default = null;
+      description = "Seconds work must be continuous before a needs-you dot goes back to working. Unset (null) = the binary's default.";
+    };
+
+    activitySpawnGraceSecs = lib.mkOption {
+      type = lib.types.nullOr (lib.types.numbers.between 0 315360000);
+      default = null;
+      description = "Ignore pane output younger than this many seconds (spawn banners, prompt paint, reattach replay). Unset (null) = the binary's default.";
+    };
+
+    activityUnsolicitedGapSecs = lib.mkOption {
+      type = lib.types.nullOr (lib.types.numbers.between 0 315360000);
+      default = null;
+      description = "Output within this many seconds of a keystroke is echo, not agent work. Unset (null) = the binary's default.";
+    };
+
+    activityOutputHintTtlSecs = lib.mkOption {
+      type = lib.types.nullOr (lib.types.numbers.between 0 315360000);
+      default = null;
+      description = "Floor (seconds) on the output-freshness window. Unset (null) = the binary's default.";
     };
 
     monitorSystem = lib.mkOption {
