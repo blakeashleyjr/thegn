@@ -1557,17 +1557,11 @@ fn worktree_row(
         .as_deref()
         .and_then(|p| status.branches.get(p))
         .cloned();
+    // `plugin_row_sync::project_plugin_fields` keys this map by worktree path
+    // only (a plugin's branch-name key is resolved to the path there).
     let plugin_fields = wt_path
         .as_deref()
         .and_then(|p| status.plugin_fields.get(p))
-        .or_else(|| {
-            status.plugin_fields.get(
-                live_branch
-                    .as_deref()
-                    .filter(|branch| !branch.is_empty())
-                    .unwrap_or(gr.label.as_str()),
-            )
-        })
         .cloned()
         .unwrap_or_default();
     let branch_meta = wt_path
@@ -2123,6 +2117,52 @@ mod tests {
             row.branch_meta.as_ref().and_then(|meta| meta.ahead_base),
             Some(5)
         );
+    }
+
+    #[test]
+    fn worktree_row_looks_up_plugin_fields_by_path_only() {
+        let s = session(vec![tab("app/tg-old", "/wt/a")], 0);
+        let ws = vec![(
+            "app".to_string(),
+            "app".to_string(),
+            "repo".to_string(),
+            "/repos/app".to_string(),
+        )];
+        let value = |text: &str| PluginFieldValue {
+            plugin: "ci".into(),
+            field: "status".into(),
+            text: text.into(),
+            role: thegn_core::plugin_api::RowRole::Good,
+            slot: thegn_core::plugin_api::RowFieldSlot::Detail,
+        };
+        let find = |rows: &[SidebarRow]| {
+            rows.iter()
+                .find(|r| {
+                    r.kind == RowKind::Worktree && r.worktree_path.as_deref() == Some("/wt/a")
+                })
+                .expect("worktree row")
+                .plugin_fields
+                .clone()
+        };
+
+        // A branch-name or tab-label key in the status map no longer resolves.
+        let mut status = no_activity();
+        status.branches.insert("/wt/a".into(), "tg/live".into());
+        status
+            .plugin_fields
+            .insert("tg/live".into(), vec![value("by-branch")]);
+        status
+            .plugin_fields
+            .insert("tg-old".into(), vec![value("by-label")]);
+        let rows = build_rows(&s, &ws, &ViewState::default(), &status, &[], &[], &[]);
+        assert!(find(&rows[..]).is_empty());
+
+        // The path key does.
+        status
+            .plugin_fields
+            .insert("/wt/a".into(), vec![value("by-path")]);
+        let rows = build_rows(&s, &ws, &ViewState::default(), &status, &[], &[], &[]);
+        assert_eq!(find(&rows[..]), vec![value("by-path")]);
     }
 
     #[test]
