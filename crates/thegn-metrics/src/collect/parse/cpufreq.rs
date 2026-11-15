@@ -1,6 +1,6 @@
 //! Allocation-free parsers for Linux CPU frequency sysfs values.
 //! Numeric values accept digits only, stricter than the old `str::parse` shim's leading `+`.
-use super::super::model::cpu_policy::{CoreClass, CpuSet, SysToken, TokenList};
+use super::super::model::cpu_policy::{CpuSet, SysToken, TokenList};
 
 pub fn parse_khz(bytes: &[u8]) -> Option<u64> {
     let value = parse_u64_trimmed(bytes)?;
@@ -16,19 +16,6 @@ pub fn parse_capacity(bytes: &[u8]) -> Option<u16> {
     u16::try_from(parse_u64_trimmed(bytes)?)
         .ok()
         .filter(|value| (1..=1024).contains(value))
-}
-/// Classify one capacity against the smallest and largest capacity seen across
-/// all policies. A machine with a single distinct capacity is homogeneous and
-/// has no classes, so everything is `Unknown`; otherwise the maximum is
-/// `Performance` and anything strictly below it is `Efficiency`.
-pub fn classify_by_capacity(capacity: u16, min_seen: u16, max_seen: u16) -> CoreClass {
-    if min_seen >= max_seen || capacity > max_seen {
-        CoreClass::Unknown
-    } else if capacity == max_seen {
-        CoreClass::Performance
-    } else {
-        CoreClass::Efficiency
-    }
 }
 pub fn parse_flag(bytes: &[u8]) -> Option<bool> {
     match trim(bytes) {
@@ -127,10 +114,9 @@ fn trim(bytes: &[u8]) -> &[u8] {
 #[cfg(test)]
 mod tests {
     use super::{
-        classify_by_capacity, parse_capacity, parse_cpu_list, parse_flag, parse_khz,
-        parse_token_list, parse_u32,
+        parse_capacity, parse_cpu_list, parse_flag, parse_khz, parse_token_list, parse_u32,
     };
-    use crate::collect::model::cpu_policy::{CoreClass, CpuSet};
+    use crate::collect::model::cpu_policy::CpuSet;
     #[test]
     fn capacity_parser_accepts_terminated_and_unterminated_values() {
         for (input, expected) in [
@@ -160,17 +146,6 @@ mod tests {
         ] {
             assert_eq!(parse_capacity(bad), None, "{bad:?}");
         }
-    }
-    #[test]
-    fn capacity_classification_needs_two_distinct_values() {
-        assert_eq!(
-            classify_by_capacity(1024, 512, 1024),
-            CoreClass::Performance
-        );
-        assert_eq!(classify_by_capacity(512, 512, 1024), CoreClass::Efficiency);
-        assert_eq!(classify_by_capacity(768, 512, 1024), CoreClass::Efficiency);
-        assert_eq!(classify_by_capacity(1024, 1024, 1024), CoreClass::Unknown);
-        assert_eq!(classify_by_capacity(2000, 512, 1024), CoreClass::Unknown);
     }
     #[test]
     fn parsers_cover_frequency_flags_tokens_and_cpu_lists() {

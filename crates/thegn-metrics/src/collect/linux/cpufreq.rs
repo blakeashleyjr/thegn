@@ -8,9 +8,9 @@ use crate::collect::frame::MonitorFrame;
 use crate::collect::health::{Absent, Health};
 use crate::collect::model::cpu_policy::{CoreClass, CpuPolicy, CpuSet, FreqSource, PowerPolicy};
 use crate::collect::parse::cpufreq::{
-    classify_by_capacity, parse_capacity, parse_cpu_list, parse_flag, parse_khz, parse_token,
-    parse_token_list, parse_u32,
+    parse_capacity, parse_cpu_list, parse_flag, parse_khz, parse_token, parse_token_list, parse_u32,
 };
+use crate::collect::policy::cpu_topology::{CoreType, CpuClassInput, classify_core_types};
 use crate::collect::schedule::Cadence;
 use crate::collect::{CollectError, Collector, CollectorId, TickCtx, env::Env};
 
@@ -145,35 +145,43 @@ impl CpuFreqCollector {
         parse_cpu_list(&bytes, &mut set).then_some(set)
     }
     /// Fill `capacity` and `core_class` for every policy. Each attribute is read
-    /// once and closed (no held descriptor). Intel `cpu_core`/`cpu_atom` lists win
-    /// over `cpu_capacity`; a missing or invalid input leaves only that policy
-    /// `Unknown`.
+    /// once and closed (no held descriptor). Classification delegates to the
+    /// shared `classify_core_types` (the same answer the per-CPU topology
+    /// `core_type` gives), fed each policy's first CPU: Intel
+    /// `cpu_core`/`cpu_atom` membership wins over `cpu_capacity`; otherwise the
+    /// maximum capacity is `Performance`, the minimum `Efficiency`, and anything
+    /// between (or a missing/invalid input) is `Unknown`.
     fn classify_core_classes(&self, policies: &mut [(CpuPolicy, PathBuf)]) {
         let core = self.intel_list("cpu_core");
         let atom = self.intel_list("cpu_atom");
-        let mut min_seen = u16::MAX;
-        let mut max_seen = 0_u16;
         for (policy, _) in policies.iter_mut() {
             let cpu = first_cpu(policy);
             policy.capacity =
                 read_static(self.sys(&format!("devices/system/cpu/cpu{cpu}/cpu_capacity")))
                     .as_deref()
                     .and_then(parse_capacity);
-            if let Some(capacity) = policy.capacity {
-                min_seen = min_seen.min(capacity);
-                max_seen = max_seen.max(capacity);
-            }
         }
-        for (policy, _) in policies.iter_mut() {
-            let cpu = first_cpu(policy);
-            policy.core_class = if core.is_some_and(|set| set.contains(cpu)) {
-                CoreClass::Performance
-            } else if atom.is_some_and(|set| set.contains(cpu)) {
-                CoreClass::Efficiency
-            } else {
-                policy.capacity.map_or(CoreClass::Unknown, |capacity| {
-                    classify_by_capacity(capacity, min_seen, max_seen)
-                })
+        let inputs: Vec<(u16, CpuClassInput)> = policies
+            .iter()
+            .enumerate()
+            .map(|(index, (policy, _))| {
+                let cpu = first_cpu(policy);
+                (
+                    index as u16,
+                    CpuClassInput {
+                        intel_core: core.is_some_and(|set| set.contains(cpu)),
+                        intel_atom: atom.is_some_and(|set| set.contains(cpu)),
+                        arm_capacity: policy.capacity.map(u32::from),
+                        ..CpuClassInput::default()
+                    },
+                )
+            })
+            .collect();
+        for ((policy, _), (_, kind)) in policies.iter_mut().zip(classify_core_types(&inputs)) {
+            policy.core_class = match kind {
+                CoreType::Performance => CoreClass::Performance,
+                CoreType::Efficiency => CoreClass::Efficiency,
+                CoreType::Uniform => CoreClass::Unknown,
             };
         }
     }
