@@ -4,8 +4,9 @@
 such as CI state. It is deliberately an on-demand surface: the host starts no
 timer or per-plugin scheduler for it.
 
-Declare API `0.5.0`, the `surface:rowfield` capability, resident mode, and a
-`WorktreeField` contribution. The contribution's `caps` names the field and
+Declare API `0.5.0` (or `0.6.0` to use [transient values](#transient-values)),
+the `surface:rowfield` capability, resident mode, and a `WorktreeField`
+contribution. The contribution's `caps` names the field and
 its slot:
 
 ```toml
@@ -96,3 +97,52 @@ Recompute the value for that worktree and push a fresh `update`.
 The event rides the host's existing hydration wake, so it costs nothing while
 the user is idle. The rule above still holds: do not add an idle timer of your
 own.
+
+## Transient values
+
+API `0.6.0` adds two optional per-row fields for values that should not
+outlive a moment, such as "rebase in progress" or "pushed 30s ago":
+
+```json
+{
+  "method": "update",
+  "params": {
+    "surface": "ci/status",
+    "rows": [
+      {
+        "worktree": "/repo/wt",
+        "text": "rebasing",
+        "role": "Warn",
+        "until_scan": true
+      },
+      { "worktree": "feat/x", "text": "pushed", "role": "Good", "ttl_secs": 30 }
+    ]
+  }
+}
+```
+
+- **`ttl_secs`** (`1..=86400`): the host drops the value this many seconds
+  after it admitted the update and repaints the row. `0` and anything above a
+  day are rejected as `Invalid` (the whole update is refused and the previous
+  values stay), so a zero is never read as "never expires". The expiry is a
+  one-shot deadline folded into the host's single poll site: one wake per
+  distinct expiry, no cadence, and nothing at all when no value carries a TTL.
+- **`until_scan: true`**: the host drops the value on that worktree's next
+  _changed_ git glyph scan, the same trigger as `thegn.worktree_scanned`
+  above. It is matched by the value's key, path or branch name, and applies
+  whether or not you subscribed to the event. An unchanged scan keeps it.
+- **Both set**: whichever fires first drops the value.
+- **Neither set**: the value persists until your next push or your exit, as
+  before.
+
+The drop happens **before** the host queues the `thegn.worktree_scanned`
+event for that scan, so a value you re-push in answer to the event lands after
+the drop and is never erased by it.
+
+Re-pushing the same text and role with a fresh `ttl_secs` (or a changed
+`until_scan`) refreshes the stored deadline without repainting the sidebar.
+
+Declare `api = "0.6.0"` to use either field. A host older than 0.6 does not
+know them and would keep the value forever; a 0.6 manifest makes such a host
+refuse the plugin instead, so the transient value fails closed. A `0.5.0`
+manifest keeps working unchanged on a 0.6 host.
