@@ -61,7 +61,8 @@ pub enum LeaderExit {
     #[default]
     Quiesce,
     /// When the leader exits on its own, the group is not signalled. The leader is reaped,
-    /// still-open pipes get `reader_grace` and are then closed, and `group` is
+    /// still-open pipes get `reader_grace`; after it their output is read and discarded until
+    /// EOF by a `thegn-proc-sink` thread, so survivors can keep writing, and `group` is
     /// [`GroupState::Detached`] if members remain ([`GroupState::Drained`] if none). Timeout,
     /// cancel and output-limit ends seen while the leader runs still terminate the group (fail
     /// closed). `quiesce_after_leader` is ignored.

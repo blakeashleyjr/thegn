@@ -1328,9 +1328,11 @@ pub(crate) mod bounded {
             (End::TimedOut, GroupState::Terminated | GroupState::Drained, Leader::Reaped(_)) => {
                 AgentRunOutcome::TimedOut
             }
-            (End::TimedOut, GroupState::Survivors | GroupState::Unknown, Leader::Reaped(_)) => {
-                AgentRunOutcome::Unsettled
-            }
+            (
+                End::TimedOut,
+                GroupState::Survivors | GroupState::Unknown | GroupState::Detached,
+                Leader::Reaped(_),
+            ) => AgentRunOutcome::Unsettled,
             (End::LeaderExited, _, Leader::Reaped(status)) => AgentRunOutcome::Exited(status),
             // Tail streams cannot trigger OutputLimit; treat it as infrastructure, never success.
             (End::OutputLimit(_), _, Leader::Reaped(_)) => AgentRunOutcome::Unsettled,
