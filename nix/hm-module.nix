@@ -321,6 +321,7 @@ self: {
     git.auto_fetch_colocated = cfg.gitAutoFetchColocated;
     git.submodules = cfg.gitSubmodules;
     stats.refresh_secs = cfg.statsRefreshSecs;
+    stats.refresh_rates = cfg.statsRefreshRates;
     stats.cpu_icon = cfg.statsCpuIcon;
     stats.mem_icon = cfg.statsMemIcon;
     stats.net_icon = cfg.statsNetIcon;
@@ -345,6 +346,7 @@ self: {
     notifications.dnd.enabled = cfg.notificationsDndEnabled;
     notifications.sound.mute = cfg.notificationsSoundMute;
     notifications.sound.suppress_focused = cfg.notificationsSoundSuppressFocused;
+    notifications.sound.volume = cfg.notificationsSoundVolume;
     activity.enabled = cfg.activityEnabled;
     activity.red_requires_agent = cfg.activityRedRequiresAgent;
     activity.agent_programs = cfg.activityAgentPrograms;
@@ -1086,6 +1088,12 @@ in {
       description = "Masthead stats polling interval in seconds (fractions allowed). Unset (null) = the binary's default.";
     };
 
+    statsRefreshRates = lib.mkOption {
+      type = lib.types.nullOr (lib.types.listOf (lib.types.numbers.between 0.5 315360000));
+      default = null;
+      description = "Refresh rates in seconds (0.5 through 315360000) cycled by the stats refresh keybind; an empty list disables cycling. Unset (null) = the binary's default.";
+    };
+
     statsCpuIcon = lib.mkOption {
       type = lib.types.nullOr (lib.types.str);
       default = null;
@@ -1228,6 +1236,12 @@ in {
       type = lib.types.nullOr (lib.types.bool);
       default = null;
       description = "Suppress sounds for focused notifications. Unset (null) = the binary's default.";
+    };
+
+    notificationsSoundVolume = lib.mkOption {
+      type = lib.types.nullOr (lib.types.numbers.between 0 1);
+      default = null;
+      description = "Notification sound volume (0.0 through 1.0). Unset (null) = the binary's default.";
     };
 
     activityEnabled = lib.mkOption {
