@@ -64,11 +64,20 @@ fn remember_generation_noop(
     profile_dir: &std::path::Path,
     inventory: &[thegn_core::disk_reclaim::Generation],
     policy: thegn_core::disk_reclaim::GenerationPolicy,
+    orphan_recheck: Option<u64>,
 ) {
     let Some(mtime) = fingerprint_mtime(profile_dir) else {
         return;
     };
-    let recheck = thegn_core::disk_reclaim::generation_recheck_after(inventory, policy);
+    // Wake for whichever comes first: an old generation or a young orphan
+    // reaching the age floor. Neither moves the `.fingerprint` mtime.
+    let recheck = [
+        thegn_core::disk_reclaim::generation_recheck_after(inventory, policy),
+        orphan_recheck,
+    ]
+    .into_iter()
+    .flatten()
+    .min();
     GENERATION_MEMO
         .get_or_init(|| Mutex::new(GenerationMemo::new()))
         .lock()
@@ -288,7 +297,12 @@ pub(crate) fn spawn_scan(
             &generation_rows,
             cfg.generation_min_age_days,
             thegn_core::util::now().max(0) as u64,
-        );
+        )
+        .saturating_add(reap_stale_live_builds(
+            &generation_rows,
+            policy.idle_days,
+            thegn_core::util::now().max(0) as u64,
+        ));
 
         // `skipped` is the whole point of the lazy gate, so make it visible:
         // a healthy steady state is a round that is nearly all skips. A round
@@ -466,9 +480,63 @@ struct GenerationFootprint {
     bytes: u64,
 }
 
+/// Tracing target for the per-profile prune outcome lines
+/// (`THEGN_LOG=thegn::disk=info`).
+const DISK_LOG: &str = "thegn::disk";
+
+/// What one profile's prune round did, for its single `thegn::disk` log line.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+struct ProfileRound {
+    generations: usize,
+    orphans: usize,
+    before_bytes: u64,
+    planned_bytes: u64,
+    removed_bytes: u64,
+    failures: usize,
+}
+
+/// `outcome` is `pruned` or `skipped`; `reason` is one of `lock_held`,
+/// `not_due`, `exempt`, `unsafe_tree` (empty for `pruned`).
+fn log_profile_round(profile: &std::path::Path, outcome: &str, reason: &str, round: ProfileRound) {
+    tracing::info!(
+        target: DISK_LOG,
+        profile = %profile.display(),
+        outcome,
+        reason,
+        generations = round.generations,
+        orphans = round.orphans,
+        before_bytes = round.before_bytes,
+        planned_bytes = round.planned_bytes,
+        removed_bytes = round.removed_bytes,
+        after_bytes = round.before_bytes.saturating_sub(round.removed_bytes),
+        failures = round.failures,
+        "cargo profile prune"
+    );
+}
+
+/// Cargo output roots whose whole size is the honest `before_bytes`
+/// denominator: everything the generation and orphan passes can remove from.
+const PROFILE_OUTPUT_ROOTS: [&str; 4] = [".fingerprint", "deps", "incremental", "build"];
+
+/// Bytes under `.fingerprint/`, `deps/`, `incremental/` and `build/` (absent
+/// roots count zero). Any symlink or out-of-profile path is an error.
+fn profile_output_bytes(profile: &std::path::Path) -> std::io::Result<u64> {
+    let mut total = 0u64;
+    for root in PROFILE_OUTPUT_ROOTS {
+        let path = profile.join(root);
+        if std::fs::symlink_metadata(&path).is_err() {
+            continue;
+        }
+        total = total.saturating_add(measure_safe_tree(&path, profile)?.0);
+    }
+    Ok(total)
+}
+
 /// Prune only generation records in profiles measured during this scan. The
 /// lock is held from before inventory through the final unlink so Cargo cannot
-/// begin a profile build midway through pruning.
+/// begin a profile build midway through pruning. The same window then removes
+/// orphan artifacts: `deps/`, `incremental/` and `build/` entries whose unit
+/// hash names no live fingerprint (see [`orphan_inventory`]).
 fn reap_generation_footprints(
     fresh: &[(String, thegn_core::disk::DiskUsage)],
     min_age_days: u32,
@@ -484,19 +552,16 @@ fn reap_generation_footprints(
         let profiles = [target.join("debug"), target.join("release")];
         let min_age_secs = u64::from(min_age_days).saturating_mul(86_400);
         if crate::task::slot_active(worktree_path) {
-            for profile_dir in &profiles {
-                tracing::debug!(
-                    target: LOG,
-                    profile = %profile_dir.display(),
-                    reason = "slot_active",
-                    "generation prune skipped"
-                );
+            for profile_dir in profiles.iter().filter(|dir| dir.is_dir()) {
+                log_profile_round(profile_dir, "skipped", "exempt", ProfileRound::default());
             }
             continue;
         }
         for profile_dir in profiles {
             let lock_path = profile_dir.join(".cargo-lock");
-            if !profile_dir.is_dir() {
+            // Not a profile at all (no dir, no Cargo lock, no fingerprints):
+            // nothing to report per round. Do not create a missing lock file.
+            if !profile_dir.is_dir() || std::fs::symlink_metadata(&lock_path).is_err() {
                 tracing::debug!(
                     target: LOG,
                     profile = %profile_dir.display(),
@@ -505,32 +570,12 @@ fn reap_generation_footprints(
                 );
                 continue;
             }
-            if !safe_directory(&profile_dir) {
-                tracing::debug!(
-                    target: LOG,
-                    profile = %profile_dir.display(),
-                    reason = "unsafe_profile",
-                    "generation prune skipped"
-                );
-                continue;
-            }
-            // Do not create a missing Cargo lock file. No existing lock means
-            // this profile is not a Cargo profile we can safely synchronize.
-            if !lock_path.exists() {
-                tracing::debug!(
-                    target: LOG,
-                    profile = %profile_dir.display(),
-                    reason = "not_cargo_profile",
-                    "generation prune skipped"
-                );
-                continue;
-            }
-            if !safe_regular_file(&lock_path) {
-                tracing::debug!(
-                    target: LOG,
-                    profile = %profile_dir.display(),
-                    reason = "unsafe_profile",
-                    "generation prune skipped"
+            if !safe_directory(&profile_dir) || !safe_regular_file(&lock_path) {
+                log_profile_round(
+                    &profile_dir,
+                    "skipped",
+                    "unsafe_tree",
+                    ProfileRound::default(),
                 );
                 continue;
             }
@@ -544,34 +589,26 @@ fn reap_generation_footprints(
                 continue;
             }
             if generation_memoized(&profile_dir, min_age_secs, now_secs) {
-                tracing::debug!(
-                    target: LOG,
-                    profile = %profile_dir.display(),
-                    reason = "memoised_noop",
-                    "generation prune skipped"
-                );
+                log_profile_round(&profile_dir, "skipped", "not_due", ProfileRound::default());
                 continue;
             }
             let Ok(lock) = OpenOptions::new().read(true).write(true).open(&lock_path) else {
-                tracing::debug!(
-                    target: LOG,
-                    profile = %profile_dir.display(),
-                    reason = "unsafe_profile",
-                    "generation prune skipped"
+                log_profile_round(
+                    &profile_dir,
+                    "skipped",
+                    "unsafe_tree",
+                    ProfileRound::default(),
                 );
                 continue;
             };
             // `File::try_lock` returns `Ok(())` only after acquiring the lock;
             // both contention and lock errors skip this profile.
             if !matches!(lock.try_lock(), Ok(())) {
-                tracing::debug!(
-                    target: LOG,
-                    profile = %profile_dir.display(),
-                    reason = "lock_held",
-                    planned_bytes = 0u64,
-                    removed_bytes = 0u64,
-                    failures = 1usize,
-                    "generation prune skipped: cargo lock unavailable"
+                log_profile_round(
+                    &profile_dir,
+                    "skipped",
+                    "lock_held",
+                    ProfileRound::default(),
                 );
                 continue;
             }
@@ -583,10 +620,16 @@ fn reap_generation_footprints(
                         target: LOG,
                         profile = %profile_dir.display(),
                         error = %error,
-                        planned_bytes = 0u64,
-                        removed_bytes = 0u64,
-                        failures = 1usize,
                         "generation inventory failed"
+                    );
+                    log_profile_round(
+                        &profile_dir,
+                        "skipped",
+                        "unsafe_tree",
+                        ProfileRound {
+                            failures: 1,
+                            ..ProfileRound::default()
+                        },
                     );
                     continue;
                 }
@@ -600,53 +643,116 @@ fn reap_generation_footprints(
                     bytes: footprint.bytes,
                 })
                 .collect();
-            let before_bytes = inventory.iter().map(|entry| entry.bytes).sum::<u64>();
+            // Honest denominator: the whole of the removable output roots,
+            // orphans included, not just the fingerprinted footprints. An
+            // unmeasurable tree (a symlink somewhere) falls back to the
+            // inventory sum and disables the orphan pass below.
+            let measured_before = profile_output_bytes(&profile_dir);
+            let mut round = ProfileRound {
+                before_bytes: measured_before
+                    .as_ref()
+                    .copied()
+                    .unwrap_or_else(|_| inventory.iter().map(|entry| entry.bytes).sum::<u64>()),
+                ..ProfileRound::default()
+            };
             let generation_policy = GenerationPolicy { min_age_secs };
             let plan =
                 thegn_core::disk_reclaim::plan_generations(&inventory, generation_policy, now_secs);
-            let mut planned_bytes = 0u64;
-            let mut removed_bytes = 0u64;
-            let mut failures = 0usize;
             for eviction in plan {
                 let Some(footprint) = footprints.iter().find(|candidate| {
                     candidate.package_name == eviction.package_name
                         && candidate.generation_id == eviction.generation_id
                 }) else {
-                    failures += 1;
+                    round.failures += 1;
                     continue;
                 };
-                planned_bytes = planned_bytes.saturating_add(footprint.bytes);
+                round.planned_bytes = round.planned_bytes.saturating_add(footprint.bytes);
+                round.generations += 1;
                 // Cargo treats a missing fingerprint as stale. Delete it
                 // before artifacts: if interrupted, leftovers are rebuildable;
                 // deleting outputs first while freshness metadata survives is
                 // the unsafe ordering.
-                if remove_tree_counted(&footprint.fingerprint, &profile_dir, &mut removed_bytes)
-                    .is_err()
+                if remove_tree_counted(
+                    &footprint.fingerprint,
+                    &profile_dir,
+                    &mut round.removed_bytes,
+                )
+                .is_err()
                 {
-                    failures += 1;
+                    round.failures += 1;
                     continue;
                 }
                 for path in footprint.deps.iter().chain(&footprint.incremental) {
-                    if remove_tree_counted(path, &profile_dir, &mut removed_bytes).is_err() {
-                        failures += 1;
+                    if remove_tree_counted(path, &profile_dir, &mut round.removed_bytes).is_err() {
+                        round.failures += 1;
                     }
                 }
             }
+
+            // Orphans, still inside the lock. The live set is every
+            // fingerprint the inventory saw (including any just evicted: their
+            // own artifacts went with them, and a failed eviction keeps its
+            // leftovers protected rather than half-removed twice).
+            let live: std::collections::HashSet<&str> = footprints
+                .iter()
+                .map(|footprint| footprint.generation_id.as_str())
+                .collect();
+            let mut orphan_unsafe = measured_before.is_err();
+            let mut orphan_recheck = None;
+            if !orphan_unsafe {
+                match orphan_inventory(&profile_dir, &live) {
+                    Ok(orphans) => {
+                        let rows: Vec<_> = orphans.iter().map(|(_, row)| row.clone()).collect();
+                        orphan_recheck = thegn_core::disk_reclaim::orphan_recheck_after(
+                            &rows,
+                            now_secs,
+                            min_age_secs,
+                        );
+                        for index in thegn_core::disk_reclaim::plan_orphan_artifacts(
+                            &rows,
+                            now_secs,
+                            min_age_secs,
+                        ) {
+                            let (path, row) = &orphans[index];
+                            round.planned_bytes = round.planned_bytes.saturating_add(row.bytes);
+                            round.orphans += 1;
+                            if remove_tree_counted(path, &profile_dir, &mut round.removed_bytes)
+                                .is_err()
+                            {
+                                round.failures += 1;
+                            }
+                        }
+                    }
+                    Err(error) => {
+                        tracing::debug!(
+                            target: LOG,
+                            profile = %profile_dir.display(),
+                            error = %error,
+                            "orphan inventory aborted"
+                        );
+                        orphan_unsafe = true;
+                    }
+                }
+            }
+
             // `planned_bytes` is the measured complete selection; `removed_bytes`
             // counts only successful files actually unlinked. Keep the two
             // metrics distinct when permission or I/O errors cause partial work.
-            tracing::info!(
-                target: LOG,
-                profile = %profile_dir.display(),
-                before_bytes,
-                planned_bytes,
-                removed_bytes,
-                after_bytes = before_bytes.saturating_sub(removed_bytes),
-                failures,
-                "Cargo generation prune"
-            );
-            if planned_bytes == 0 {
-                remember_generation_noop(&profile_dir, &inventory, generation_policy);
+            let (outcome, reason) = if round.planned_bytes > 0 || round.removed_bytes > 0 {
+                ("pruned", "")
+            } else if orphan_unsafe {
+                ("skipped", "unsafe_tree")
+            } else {
+                ("skipped", "not_due")
+            };
+            log_profile_round(&profile_dir, outcome, reason, round);
+            if round.planned_bytes == 0 && round.generations == 0 && round.orphans == 0 {
+                remember_generation_noop(
+                    &profile_dir,
+                    &inventory,
+                    generation_policy,
+                    orphan_recheck,
+                );
             } else {
                 GENERATION_MEMO
                     .get_or_init(|| Mutex::new(GenerationMemo::new()))
@@ -654,11 +760,238 @@ fn reap_generation_footprints(
                     .unwrap_or_else(std::sync::PoisonError::into_inner)
                     .remove(&profile_dir);
             }
-            all_removed = all_removed.saturating_add(removed_bytes);
+            all_removed = all_removed.saturating_add(round.removed_bytes);
             drop(lock);
         }
     }
     all_removed
+}
+
+/// Orphan Cargo outputs in a profile: `deps/` regular files and
+/// `incremental/` / `build/` directories whose name ends in a 16-hex unit hash
+/// that no live fingerprint carries. Names without such a suffix are ignored.
+/// Any symlink directly under one of the three roots aborts the whole scan
+/// (the caller then removes nothing), and every candidate is measured with
+/// [`measure_safe_tree`], which also refuses symlinks and out-of-profile paths.
+fn orphan_inventory(
+    profile: &std::path::Path,
+    live: &std::collections::HashSet<&str>,
+) -> std::io::Result<Vec<(std::path::PathBuf, thegn_core::disk_reclaim::Orphan)>> {
+    use thegn_core::disk_reclaim::{Orphan, cargo_unit_hash};
+
+    let mut out = Vec::new();
+    for (root, files) in [("deps", true), ("incremental", false), ("build", false)] {
+        let root = profile.join(root);
+        if std::fs::symlink_metadata(&root).is_err() {
+            continue;
+        }
+        if !safe_directory(&root) {
+            return Err(std::io::Error::other("unsafe orphan root"));
+        }
+        let mut entries = std::fs::read_dir(&root)?.collect::<Result<Vec<_>, _>>()?;
+        entries.sort_by_key(std::fs::DirEntry::file_name);
+        for entry in entries {
+            let ty = entry.file_type()?;
+            if ty.is_symlink() {
+                return Err(std::io::Error::other("symlink in orphan root"));
+            }
+            // `deps/` holds files; `incremental/` and `build/` hold one
+            // directory per unit. Anything else is not ours to judge.
+            if (files && !ty.is_file()) || (!files && !ty.is_dir()) {
+                continue;
+            }
+            let name = entry.file_name();
+            let Some(name) = name.to_str() else {
+                continue;
+            };
+            let stem = if files {
+                name.split_once('.').map_or(name, |(stem, _)| stem)
+            } else {
+                name
+            };
+            let Some(hash) = cargo_unit_hash(stem) else {
+                continue;
+            };
+            if live.contains(hash) {
+                continue;
+            }
+            let path = entry.path();
+            let (bytes, newest) = measure_safe_tree(&path, profile)?;
+            // A unit directory's own mtime counts too, so a freshly created
+            // but still empty one is young rather than epoch-old.
+            let mtime_secs = newest.max(mtime_secs_of(&entry.metadata()?));
+            out.push((
+                path,
+                Orphan {
+                    hash: hash.to_string(),
+                    mtime_secs,
+                    bytes,
+                },
+            ));
+        }
+    }
+    Ok(out)
+}
+
+/// Modification time in whole seconds since the epoch; `0` when unknown.
+fn mtime_secs_of(meta: &std::fs::Metadata) -> u64 {
+    meta.modified()
+        .ok()
+        .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
+        .map_or(0, |since| since.as_secs())
+}
+
+/// `just live` staging directories (`scripts/live.py` `LIVE_STAGE_PREFIX`).
+const LIVE_BUILD_PREFIX: &str = ".thegn-live-build-";
+
+/// Lock files whose holder marks a stage as in use: Cargo's profile lock and
+/// the stage lock `scripts/live.py` holds for the whole staged build.
+const LIVE_BUILD_LOCK_NAMES: [&str; 2] = [".cargo-lock", ".thegn-live-build.lock"];
+
+/// Remove `target/.thegn-live-build-*` stages untouched for `idle_days`
+/// (`[disk] idle_clean_days`; `0` = off) in the worktrees of this round.
+/// Returns bytes removed.
+fn reap_stale_live_builds(
+    rows: &[(String, thegn_core::disk::DiskUsage)],
+    idle_days: u32,
+    now_secs: u64,
+) -> u64 {
+    if idle_days == 0 {
+        return 0;
+    }
+    rows.iter()
+        .map(|(worktree, _)| std::path::Path::new(worktree).join("target"))
+        .filter(|target| safe_directory(target))
+        .map(|target| reap_live_builds_in(&target, idle_days, now_secs))
+        .fold(0u64, u64::saturating_add)
+}
+
+/// Every stage lock file inside `stage`, refusing symlinks anywhere.
+fn live_build_lock_files(stage: &std::path::Path) -> std::io::Result<Vec<std::path::PathBuf>> {
+    let mut out = Vec::new();
+    let mut stack = vec![stage.to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        for entry in std::fs::read_dir(&dir)? {
+            let entry = entry?;
+            let ty = entry.file_type()?;
+            if ty.is_symlink() {
+                return Err(std::io::Error::other("symlink in live build stage"));
+            }
+            if ty.is_dir() {
+                stack.push(entry.path());
+            } else if ty.is_file()
+                && entry
+                    .file_name()
+                    .to_str()
+                    .is_some_and(|name| LIVE_BUILD_LOCK_NAMES.contains(&name))
+            {
+                out.push(entry.path());
+            }
+        }
+    }
+    Ok(out)
+}
+
+/// Try-lock every lock file. Returns the held handles (kept open until the
+/// removal finishes) and whether any lock is taken by someone else. A lock
+/// that cannot be opened or tried counts as held: keep rather than guess.
+fn try_lock_all(paths: &[std::path::PathBuf]) -> (Vec<std::fs::File>, bool) {
+    let mut held = Vec::new();
+    for path in paths {
+        let Ok(file) = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(path)
+        else {
+            return (held, true);
+        };
+        if !matches!(file.try_lock(), Ok(())) {
+            return (held, true);
+        }
+        held.push(file);
+    }
+    (held, false)
+}
+
+fn reap_live_builds_in(target: &std::path::Path, idle_days: u32, now_secs: u64) -> u64 {
+    use thegn_core::disk_reclaim::LiveBuild;
+
+    let Ok(entries) = std::fs::read_dir(target) else {
+        return 0;
+    };
+    let mut stages = Vec::new();
+    let mut unsafe_trees = 0usize;
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        if !name.to_str().is_some_and(|name| {
+            name.len() > LIVE_BUILD_PREFIX.len() && name.starts_with(LIVE_BUILD_PREFIX)
+        }) {
+            continue;
+        }
+        let Ok(ty) = entry.file_type() else {
+            unsafe_trees += 1;
+            continue;
+        };
+        if ty.is_symlink() || !ty.is_dir() {
+            unsafe_trees += 1;
+            continue;
+        }
+        let path = entry.path();
+        // The stage root's own mtime counts: `live.py` creates the stage with
+        // `mkdtemp` before any file exists, and that empty dir must read young.
+        let inspected = live_build_lock_files(&path).and_then(|locks| {
+            let (_, newest) = measure_safe_tree(&path, target)?;
+            Ok((locks, newest.max(mtime_secs_of(&entry.metadata()?))))
+        });
+        let Ok((locks, newest_mtime_secs)) = inspected else {
+            unsafe_trees += 1;
+            continue;
+        };
+        let (handles, lock_held) = try_lock_all(&locks);
+        stages.push((
+            path,
+            LiveBuild {
+                newest_mtime_secs,
+                lock_held,
+            },
+            handles,
+        ));
+    }
+    if stages.is_empty() && unsafe_trees == 0 {
+        return 0;
+    }
+    let rows: Vec<_> = stages.iter().map(|(_, row, _)| row.clone()).collect();
+    let plan = thegn_core::disk_reclaim::plan_stale_live_builds(&rows, now_secs, idle_days);
+    let lock_held = rows.iter().filter(|row| row.lock_held).count();
+    // Release the locks of every stage that stays, so a build waiting on one
+    // is not held up for the rest of this pass.
+    for (index, stage) in stages.iter_mut().enumerate() {
+        if !plan.contains(&index) {
+            stage.2.clear();
+        }
+    }
+    let mut removed_bytes = 0u64;
+    let mut failures = 0usize;
+    for &index in &plan {
+        // The stage's locks stay held (in `stages`) across the removal.
+        if remove_tree_counted(&stages[index].0, target, &mut removed_bytes).is_err() {
+            failures += 1;
+        }
+    }
+    drop(stages);
+    tracing::info!(
+        target: DISK_LOG,
+        target_dir = %target.display(),
+        outcome = if plan.is_empty() { "skipped" } else { "pruned" },
+        pruned = plan.len(),
+        lock_held,
+        not_due = rows.len().saturating_sub(plan.len()).saturating_sub(lock_held),
+        unsafe_tree = unsafe_trees,
+        removed_bytes,
+        failures,
+        "live build prune"
+    );
+    removed_bytes
 }
 
 fn generation_prune_rows(
@@ -1270,5 +1603,290 @@ mod generation_tests {
         );
         let after = thegn_core::util::core_git_spawn_count();
         assert_eq!(after - before, 1);
+    }
+    const LIVE_HASH: &str = "00112233445566aa";
+    const OLD_HASH: &str = "0123456789abcdef";
+    const YOUNG_HASH: &str = "fedcba9876543210";
+
+    /// Pin both times so `measure_safe_tree`'s `max(mtime, atime)` sees `at`.
+    fn set_file_time(path: &std::path::Path, at: std::time::SystemTime) {
+        fs::File::options()
+            .write(true)
+            .open(path)
+            .unwrap()
+            .set_times(fs::FileTimes::new().set_modified(at).set_accessed(at))
+            .unwrap();
+    }
+
+    fn write_file(path: &std::path::Path, bytes: &[u8]) {
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(path, bytes).unwrap();
+    }
+
+    /// A profile with one live fingerprint, its artifacts, and orphans. The
+    /// caller injects `now` thirty days ahead, so everything written here reads
+    /// a month old except the files pinned to `young_at`.
+    fn orphan_profile(
+        root: &std::path::Path,
+        young_at: std::time::SystemTime,
+    ) -> std::path::PathBuf {
+        let profile = root.join("target/debug");
+        write_file(&profile.join(".cargo-lock"), b"");
+        write_file(
+            &profile.join(format!(".fingerprint/pkg-{LIVE_HASH}/lib-pkg")),
+            b"fp",
+        );
+        write_file(
+            &profile.join(format!("deps/libpkg-{LIVE_HASH}.rlib")),
+            b"live-rlib",
+        );
+        write_file(&profile.join(format!("deps/pkg-{LIVE_HASH}.d")), b"live-d");
+        write_file(
+            &profile.join(format!("deps/libpkg-{OLD_HASH}.rlib")),
+            b"old-rlib",
+        );
+        write_file(&profile.join(format!("deps/pkg-{OLD_HASH}.d")), b"old-d");
+        write_file(
+            &profile.join(format!("deps/libpkg-{YOUNG_HASH}.rlib")),
+            b"young",
+        );
+        set_file_time(
+            &profile.join(format!("deps/libpkg-{YOUNG_HASH}.rlib")),
+            young_at,
+        );
+        // Uppercase hex is not Cargo's suffix: ignored, never removed.
+        write_file(
+            &profile.join("deps/libpkg-0123456789ABCDEF.rlib"),
+            b"not-hex",
+        );
+        write_file(
+            &profile.join(format!("incremental/pkg-{OLD_HASH}/s-x/work.bin")),
+            b"old-incr",
+        );
+        write_file(
+            &profile.join(format!("incremental/pkg-{LIVE_HASH}/s-y/work.bin")),
+            b"live-incr",
+        );
+        write_file(
+            &profile.join(format!("build/pkg-{OLD_HASH}/out/gen.rs")),
+            b"old-build",
+        );
+        write_file(
+            &profile.join(format!("build/pkg-{LIVE_HASH}/output")),
+            b"live-build",
+        );
+        profile
+    }
+
+    fn month_ahead() -> (u64, std::time::SystemTime) {
+        let now = thegn_core::util::now().max(0) as u64 + 30 * 86_400;
+        let young_at = std::time::UNIX_EPOCH + std::time::Duration::from_secs(now - 3_600);
+        (now, young_at)
+    }
+
+    #[test]
+    fn orphan_artifacts_are_pruned_by_age_and_live_ones_kept() {
+        let root = tempfile::tempdir().unwrap();
+        let (now, young_at) = month_ahead();
+        let profile = orphan_profile(root.path(), young_at);
+        let removed = reap_generation_footprints(
+            &[(
+                root.path().to_string_lossy().into_owned(),
+                thegn_core::disk::DiskUsage::default(),
+            )],
+            14,
+            now,
+        );
+        let old_bytes = ["old-rlib", "old-d", "old-incr", "old-build"]
+            .iter()
+            .map(|s| s.len() as u64)
+            .sum::<u64>();
+        assert_eq!(removed, old_bytes);
+        assert!(
+            !profile
+                .join(format!("deps/libpkg-{OLD_HASH}.rlib"))
+                .exists()
+        );
+        assert!(!profile.join(format!("deps/pkg-{OLD_HASH}.d")).exists());
+        assert!(!profile.join(format!("incremental/pkg-{OLD_HASH}")).exists());
+        assert!(!profile.join(format!("build/pkg-{OLD_HASH}")).exists());
+        for kept in [
+            format!(".fingerprint/pkg-{LIVE_HASH}/lib-pkg"),
+            format!("deps/libpkg-{LIVE_HASH}.rlib"),
+            format!("deps/pkg-{LIVE_HASH}.d"),
+            format!("deps/libpkg-{YOUNG_HASH}.rlib"),
+            "deps/libpkg-0123456789ABCDEF.rlib".to_string(),
+            format!("incremental/pkg-{LIVE_HASH}/s-y/work.bin"),
+            format!("build/pkg-{LIVE_HASH}/output"),
+        ] {
+            assert!(profile.join(&kept).exists(), "{kept} must survive");
+        }
+    }
+
+    #[test]
+    fn symlink_in_deps_aborts_the_orphan_pass() {
+        if !crate::platform::test_symlink_supported() {
+            return;
+        }
+        let root = tempfile::tempdir().unwrap();
+        let (now, young_at) = month_ahead();
+        let profile = orphan_profile(root.path(), young_at);
+        let outside = root.path().join("outside.rlib");
+        fs::write(&outside, b"outside").unwrap();
+        let link = profile.join("deps/libother-0000000000000001.rlib");
+        crate::platform::test_symlink(&outside, &link).unwrap();
+        let removed = reap_generation_footprints(
+            &[(
+                root.path().to_string_lossy().into_owned(),
+                thegn_core::disk::DiskUsage::default(),
+            )],
+            14,
+            now,
+        );
+        assert_eq!(removed, 0);
+        assert!(
+            profile
+                .join(format!("deps/libpkg-{OLD_HASH}.rlib"))
+                .exists()
+        );
+        assert!(
+            profile
+                .join(format!("build/pkg-{OLD_HASH}/out/gen.rs"))
+                .exists()
+        );
+        assert!(
+            fs::symlink_metadata(&link)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+        assert!(outside.exists());
+    }
+
+    #[test]
+    fn held_profile_lock_keeps_orphans() {
+        let root = tempfile::tempdir().unwrap();
+        let (now, young_at) = month_ahead();
+        let profile = orphan_profile(root.path(), young_at);
+        let lock = fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(profile.join(".cargo-lock"))
+            .unwrap();
+        lock.try_lock().unwrap();
+        let removed = reap_generation_footprints(
+            &[(
+                root.path().to_string_lossy().into_owned(),
+                thegn_core::disk::DiskUsage::default(),
+            )],
+            14,
+            now,
+        );
+        assert_eq!(removed, 0);
+        assert!(
+            profile
+                .join(format!("deps/libpkg-{OLD_HASH}.rlib"))
+                .exists()
+        );
+        drop(lock);
+    }
+
+    #[test]
+    fn before_bytes_covers_orphans_and_every_output_root() {
+        let root = tempfile::tempdir().unwrap();
+        let (_, young_at) = month_ahead();
+        let profile = orphan_profile(root.path(), young_at);
+        let expected = [
+            "fp",
+            "live-rlib",
+            "live-d",
+            "old-rlib",
+            "old-d",
+            "young",
+            "not-hex",
+            "old-incr",
+            "live-incr",
+            "old-build",
+            "live-build",
+        ]
+        .iter()
+        .map(|s| s.len() as u64)
+        .sum::<u64>();
+        assert_eq!(profile_output_bytes(&profile).unwrap(), expected);
+        // The fingerprint-only inventory sum would miss every orphan.
+        let inventory = generation_inventory(&profile)
+            .unwrap()
+            .iter()
+            .map(|footprint| footprint.bytes)
+            .sum::<u64>();
+        assert!(inventory < expected);
+    }
+
+    #[test]
+    fn stale_live_builds_are_reaped_only_when_old_unlocked_and_real_dirs() {
+        let root = tempfile::tempdir().unwrap();
+        let target = root.path().join("target");
+        let (now, young_at) = month_ahead();
+        write_file(
+            &target.join(".thegn-live-build-old1/output/release/thegn"),
+            b"old-bin",
+        );
+        write_file(&target.join(".thegn-live-build-young/build.json"), b"{}");
+        set_file_time(&target.join(".thegn-live-build-young/build.json"), young_at);
+        let held_lock = target.join(".thegn-live-build-held/output/release/.cargo-lock");
+        write_file(&held_lock, b"");
+        write_file(
+            &target.join(".thegn-live-build-held/output/release/thegn"),
+            b"held",
+        );
+        write_file(&target.join("unrelated/keep"), b"keep");
+        let rows = [(
+            root.path().to_string_lossy().into_owned(),
+            thegn_core::disk::DiskUsage::default(),
+        )];
+
+        // `idle_clean_days = 0` turns the rule off.
+        assert_eq!(reap_stale_live_builds(&rows, 0, now), 0);
+        assert!(target.join(".thegn-live-build-old1").exists());
+
+        let lock = fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&held_lock)
+            .unwrap();
+        lock.try_lock().unwrap();
+        let mut outside = None;
+        if crate::platform::test_symlink_supported() {
+            let elsewhere = root.path().join("elsewhere");
+            write_file(&elsewhere.join("precious"), b"precious");
+            crate::platform::test_symlink(&elsewhere, &target.join(".thegn-live-build-link"))
+                .unwrap();
+            write_file(&root.path().join("victim"), b"victim");
+            fs::create_dir_all(target.join(".thegn-live-build-inner")).unwrap();
+            crate::platform::test_symlink(
+                &root.path().join("victim"),
+                &target.join(".thegn-live-build-inner/x"),
+            )
+            .unwrap();
+            outside = Some(elsewhere);
+        }
+
+        let removed = reap_stale_live_builds(&rows, 14, now);
+        assert_eq!(removed, "old-bin".len() as u64);
+        assert!(!target.join(".thegn-live-build-old1").exists());
+        assert!(target.join(".thegn-live-build-young/build.json").exists());
+        assert!(
+            target
+                .join(".thegn-live-build-held/output/release/thegn")
+                .exists()
+        );
+        assert!(target.join("unrelated/keep").exists());
+        if let Some(elsewhere) = outside {
+            assert!(elsewhere.join("precious").exists());
+            assert!(fs::symlink_metadata(target.join(".thegn-live-build-link")).is_ok());
+            assert!(target.join(".thegn-live-build-inner").exists());
+            assert!(root.path().join("victim").exists());
+        }
+        drop(lock);
     }
 }
