@@ -502,12 +502,20 @@ fn run_mount_bounded_with(
     let wait_result = child.wait();
     if cancelled {
         // Roll back (never-cancel unmount) so a half-made mount does not linger.
-        let _ = rollback();
+        let rollback_note = rollback()
+            .err()
+            .filter(|e| !rollback_means_not_mounted(e))
+            .map(|e| format!("rollback unmount also failed: {e}"));
+        let mut tail = stderr_tail(stderr_reader).unwrap_or_default();
+        if let Some(note) = rollback_note {
+            tail.push_str("; ");
+            tail.push_str(&note);
+        }
         return Err(anyhow::Error::new(TransportError {
             program: argv[0].clone(),
             error: thegn_proc::ProcError::Cancelled,
             timeout,
-            stderr_tail: stderr_tail(stderr_reader).unwrap_or_default(),
+            stderr_tail: tail,
         }));
     }
     let mut message = format!(
