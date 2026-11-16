@@ -3949,6 +3949,7 @@ fn host_argv_refusal_blocks_remote_host_shells() {
 
 #[test]
 fn compose_spec_refuses_provider_spec_without_transport() {
+    let _state = crate::testenv::IsolatedState::new();
     let cfg = Config::default();
     let loc = GitLoc::from_db("/wt/x", None);
     let outcome = outcome_for(Some(provider_spec_without_transport()), true, None);
