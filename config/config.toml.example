@@ -3866,7 +3866,8 @@ open_on_detect = false # auto-open the browser (via `browser` above) when a new 
 # #                          #   cli  — always use the `*_command` CLI bridge below.
 # #                          # Native exec also persists its session id, so a restart
 # #                          # reattaches the live sprite session and replays scrollback.
-# # The CLI bridge (used for exec = "cli", and as the auto fallback). PTY-capable:
+# # The CLI bridge (used for exec = "cli", and as the auto fallback). PTY-capable.
+# `interactive_command` is used only with exec = "cli"; headless sessions never need the CLI:
 # exec_command = ["sprite", "exec", "-s", "{id}", "--"]
 # interactive_command = ["sprite", "exec", "-s", "{id}", "--tty", "--"]
 # up_command = ["sprite", "create", "{id}", "--skip-console"]
@@ -3890,7 +3891,7 @@ open_on_detect = false # auto-open the browser (via `browser` above) when a new 
 # #  • NATIVE EXEC — with `exec = "auto"` (default) the interactive pane attaches
 # #    over the Sprites WSS exec API directly (no `sprite` CLI), and reattaches its
 # #    live session (replaying scrollback) across restarts. Set `exec = "cli"` to
-# #    fall back to the `interactive_command` bridge.
+# #    use the `interactive_command` bridge (the only case it is used).
 # # FAILOVER — by default, if the sprite can't be brought up (bad/expired token,
 # #   API down, quota), the worktree's pane HALTS with a warning modal (the real
 # #   cause + a retry) rather than silently dropping to a host shell (see
