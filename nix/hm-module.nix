@@ -1663,13 +1663,13 @@ in {
     mediaMpvSocket = lib.mkOption {
       type = lib.types.nullOr lib.types.str;
       default = null;
-      description = "mpv IPC socket path; ~ is expanded by thegn. Unset (null) = the binary's default.";
+      description = "mpv JSON-IPC socket path (the --input-ipc-server path; absolute, ~ is not expanded). Unset (null) = the binary's default (/tmp/mpvsocket).";
     };
 
     mediaMpdSocket = lib.mkOption {
       type = lib.types.nullOr lib.types.str;
       default = null;
-      description = "mpd socket path; ~ is expanded by thegn. Unset (null) = the binary's default.";
+      description = "MPD address: host:port or an absolute unix-socket path (~ is not expanded). Unset (null) = the binary's default (127.0.0.1:6600; $MPD_HOST/$MPD_PORT apply then).";
     };
 
     monitorProcRows = lib.mkOption {
