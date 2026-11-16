@@ -731,6 +731,17 @@ fn checkout_parent(root: &Path, repo_dir_name: &str, cfg: &Config) -> PathBuf {
     }
 }
 
+/// Whether `path` sits where thegn itself places checkouts of this repo:
+/// under [`checkout_parent`] (`<worktrees_dir>/<repo dir name>/` or
+/// `<root>/.worktrees`) or anywhere under the repo `root` itself.
+///
+/// Pure and loop-safe: a lexical, component-wise prefix test on the stored
+/// strings (no canonicalisation, no Git), so `/a/b` never claims `/a/bc`. The
+/// sidebar uses the negation to find worktrees another tool created.
+pub fn is_managed_checkout(root: &Path, repo_dir_name: &str, path: &Path, cfg: &Config) -> bool {
+    path.starts_with(root) || path.starts_with(checkout_parent(root, repo_dir_name, cfg))
+}
+
 /// The collision-resistant checkout directory for an exact branch of an exact
 /// repository (THE-516).
 ///
@@ -2666,6 +2677,38 @@ mod tests {
         let cfg = Config::default();
         assert!(worktree_path_for(&repository, root, "app", "", &cfg).is_err());
         assert!(worktree_path_for(&repository, root, "app", "a\0b", &cfg).is_err());
+    }
+
+    #[test]
+    fn is_managed_checkout_global_and_in_repo_modes() {
+        let root = Path::new("/src/app");
+        let global = Config {
+            worktrees_dir: "/wt".into(),
+            worktree_mode: WorktreeMode::Global,
+            ..Default::default()
+        };
+        let managed = |p: &str, cfg: &Config| is_managed_checkout(root, "app", Path::new(p), cfg);
+        // Global: under `<worktrees_dir>/<repo dir name>` or under the root.
+        assert!(managed("/wt/app/feat--abc", &global));
+        assert!(managed("/wt/app", &global));
+        assert!(managed("/src/app", &global));
+        assert!(managed("/src/app/.worktrees/x", &global));
+        // Directly under worktrees_dir (another tool's layout) is not ours.
+        assert!(!managed("/wt/ms2-feature", &global));
+        assert!(!managed("/home/u/.claude/wt/x", &global));
+        // Component-wise: `/wt/app` never claims `/wt/apple`, nor the root `/src/app` `/src/app2`.
+        assert!(!managed("/wt/apple/x", &global));
+        assert!(!managed("/src/app2", &global));
+        // In-repo: `<root>/.worktrees`, and the worktrees_dir parent no longer applies.
+        let in_repo = Config {
+            worktrees_dir: "/wt".into(),
+            worktree_mode: WorktreeMode::InRepo,
+            ..Default::default()
+        };
+        assert!(managed("/src/app/.worktrees/feat", &in_repo));
+        assert!(managed("/src/app", &in_repo));
+        assert!(!managed("/wt/app/feat", &in_repo));
+        assert!(!managed("/src/app-wt/feat", &in_repo));
     }
 
     #[test]
