@@ -9,7 +9,8 @@
 //! popup is open, which is also the only time the sampler runs.
 
 use thegn_core::cpu_attrib::{
-    self, AttribInputs, AttribRow, Owner, PaneUsage, RowKind, SelfUsage, SortKey, TopProc, Usage,
+    self, AttribInputs, AttribRow, Owner, PaneUsage, RowKind, ScopeUsage, SelfUsage, SortKey,
+    TopProc, Usage,
 };
 use thegn_core::theme::Hue;
 
@@ -54,6 +55,24 @@ fn usage(cpu: Option<f32>, rss: Option<u64>) -> Usage {
 
 fn totals_usage(t: &thegn_metrics::ProcOwnerTotals) -> Usage {
     usage(t.cpu_pct.map(|c| c as f32), t.rss_bytes)
+}
+
+/// Map the sampler's `thegn.slice` scopes onto the builder's input: a named
+/// `thegn-<kind>-<slug>-…` unit carries its kind and worktree slug; the
+/// unnamed sum (and any name thegn did not mint) carries neither.
+fn scope_usage(scopes: &[thegn_metrics::ScopeTotals]) -> Vec<ScopeUsage> {
+    scopes
+        .iter()
+        .map(|scope| {
+            let parsed = thegn_core::sandbox_cpucap::parse_scope_unit(&scope.unit);
+            ScopeUsage {
+                kind: parsed.as_ref().map(|(kind, _)| *kind),
+                worktree: parsed.map(|(_, slug)| slug),
+                cpu_pct: scope.cpu_pct,
+                rss: scope.rss,
+            }
+        })
+        .collect()
 }
 
 /// Map the frame model onto the core builder's inputs and build the tree.
@@ -107,6 +126,7 @@ fn tree(model: &FrameModel, sort: SortKey) -> cpu_attrib::AttribTree {
             .mem_gib
             .map(|(used, _)| (f64::from(used.max(0.0)) * GIB) as u64),
     );
+    let scopes = summary.map(|s| scope_usage(&s.scopes)).unwrap_or_default();
     cpu_attrib::build(
         &AttribInputs {
             owners: &model.pane_owners,
@@ -115,6 +135,7 @@ fn tree(model: &FrameModel, sort: SortKey) -> cpu_attrib::AttribTree {
             thegn,
             system,
             cores: stats.cpu_cores.len(),
+            scopes: &scopes,
         },
         sort,
         cpu_attrib::TOP_PER_PANE,
@@ -144,7 +165,7 @@ fn status_note(model: &FrameModel, tree: &cpu_attrib::AttribTree) -> String {
 fn label_tone(kind: RowKind) -> Tok {
     match kind {
         RowKind::Workspace | RowKind::Worktree | RowKind::Pane => Tok::Slot(S::Text),
-        RowKind::Thegn => Tok::Hue(Hue::Green),
+        RowKind::Thegn | RowKind::Job => Tok::Hue(Hue::Green),
         RowKind::Proc | RowKind::Outside | RowKind::More => Tok::Slot(S::Dim),
     }
 }
@@ -244,6 +265,7 @@ mod tests {
             pane_id: id,
             workspace: ws.into(),
             worktree: wt.into(),
+            worktree_path: Some(format!("/wt/{}", wt.replace('/', "-"))),
             tab: "1".into(),
             program: Some("claude".into()),
         };
@@ -351,6 +373,38 @@ mod tests {
         let beta = mem.iter().position(|l| l.starts_with("beta|")).unwrap();
         let alpha = mem.iter().position(|l| l.starts_with("alpha|")).unwrap();
         assert!(beta < alpha);
+    }
+
+    #[test]
+    fn slice_scopes_render_under_their_worktree_and_thegn() {
+        let mut m = model();
+        let scope = |unit: &str, cpu: f32| thegn_metrics::ScopeTotals {
+            unit: unit.into(),
+            cpu_pct: Some(cpu),
+            rss: Some(1 << 20),
+        };
+        if let Some(summary) = m.procs.summary.as_mut() {
+            summary.scopes = vec![
+                scope("thegn-gate-alpha-main-42-0", 20.0),
+                scope("thegn-agent-elsewhere-42-1", 7.0),
+                scope(thegn_metrics::UNNAMED_SCOPES, 2.0),
+            ];
+        }
+        let lines = texts(&build_sections(&m, SortKey::Cpu));
+        let main = lines
+            .iter()
+            .position(|l| l.starts_with("alpha/main|60%"))
+            .unwrap_or_else(|| panic!("{lines:?}"));
+        assert!(lines[main + 1].starts_with("gate|20%"), "{lines:?}");
+        assert!(lines.iter().any(|l| l.starts_with("agent · elsewhere|7%")));
+        assert!(
+            lines
+                .iter()
+                .any(|l| l.starts_with("thegn jobs (unnamed)|2%")),
+            "{lines:?}"
+        );
+        // The thegn row stays UI + daemon.
+        assert!(lines.iter().any(|l| l.starts_with("thegn|4%")));
     }
 
     #[test]
