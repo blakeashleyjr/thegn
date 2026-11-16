@@ -99,14 +99,73 @@ impl KeptReport {
         let mut latch = kept_latch()
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let alert = latch_kept(&mut latch, kind, self.kept);
+        let notice = latch_kept_notice(&mut latch, kind, self.kept);
         drop(latch);
-        if let Some(message) = alert
-            && let Some(state) = crate::notify::global()
-        {
-            state.emit_toast(&message, thegn_core::notification::Priority::Alert);
+        if let Some(notice) = notice {
+            deliver_notice(&mut LiveSink, kind, &notice);
         }
     }
+}
+
+/// A changed kept set: the alert text plus the sorted, deduplicated resource names.
+struct KeptNotice {
+    message: String,
+    names: Vec<String>,
+}
+
+trait KeptSink {
+    fn toast(&mut self, message: &str);
+    fn record(&mut self, kind: &str, source_ref: &str, message: &str);
+}
+
+struct LiveSink;
+
+impl KeptSink for LiveSink {
+    fn toast(&mut self, message: &str) {
+        if let Some(state) = crate::notify::global() {
+            state.emit_toast(message, thegn_core::notification::Priority::Alert);
+        }
+    }
+
+    fn record(&mut self, kind: &str, source_ref: &str, message: &str) {
+        let db = match thegn_core::db::Db::open() {
+            Ok(db) => db,
+            Err(error) => {
+                tracing::debug!(target: "thegn::reaper", %error, "kept notice: db open failed");
+                return;
+            }
+        };
+        if let Err(error) = crate::automation_events::emit_once(
+            &db,
+            thegn_core::notification::NotificationKind::ResourceAlert.as_str(),
+            source_ref,
+            message,
+            "",
+        ) {
+            tracing::debug!(target: "thegn::reaper", %error, kind, "kept notice: record failed");
+        }
+    }
+}
+
+fn deliver_notice(sink: &mut dyn KeptSink, kind: &str, notice: &KeptNotice) {
+    sink.toast(&notice.message);
+    let source_ref = kept_source_ref(kind, &notice.names);
+    sink.record(kind, &source_ref, &notice.message);
+}
+
+/// Stable (FNV-1a) identity of one kept set, independent of name order.
+fn kept_source_ref(kind: &str, names: &[String]) -> String {
+    let mut sorted: Vec<&str> = names.iter().map(String::as_str).collect();
+    sorted.sort_unstable();
+    sorted.dedup();
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    for name in sorted {
+        for byte in name.bytes().chain(std::iter::once(0u8)) {
+            hash ^= u64::from(byte);
+            hash = hash.wrapping_mul(0x0100_0000_01b3);
+        }
+    }
+    format!("reaper-kept:{kind}:{hash:016x}")
 }
 
 fn kept_latch() -> &'static std::sync::Mutex<std::collections::BTreeMap<String, Vec<String>>> {
@@ -116,11 +175,11 @@ fn kept_latch() -> &'static std::sync::Mutex<std::collections::BTreeMap<String, 
     LATCH.get_or_init(|| std::sync::Mutex::new(std::collections::BTreeMap::new()))
 }
 
-fn latch_kept(
+fn latch_kept_notice(
     latch: &mut std::collections::BTreeMap<String, Vec<String>>,
     kind: &str,
     mut kept: Vec<(String, String)>,
-) -> Option<String> {
+) -> Option<KeptNotice> {
     kept.sort();
     if kept.is_empty() {
         latch.remove(kind);
@@ -137,7 +196,17 @@ fn latch_kept(
         return None;
     }
     latch.insert(kind.to_string(), names.clone());
-    Some(kept_alert_text(kind, names.len(), &kept[0].1))
+    let message = kept_alert_text(kind, names.len(), &kept[0].1);
+    Some(KeptNotice { message, names })
+}
+
+#[cfg(test)]
+fn latch_kept(
+    latch: &mut std::collections::BTreeMap<String, Vec<String>>,
+    kind: &str,
+    kept: Vec<(String, String)>,
+) -> Option<String> {
+    latch_kept_notice(latch, kind, kept).map(|notice| notice.message)
 }
 
 fn kept_alert_text(kind: &str, count: usize, first_message: &str) -> String {
@@ -154,6 +223,68 @@ fn kept_alert_text(kind: &str, count: usize, first_message: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[derive(Default)]
+    struct FakeSink {
+        toasts: usize,
+        records: Vec<String>,
+    }
+
+    impl KeptSink for FakeSink {
+        fn toast(&mut self, _message: &str) {
+            self.toasts += 1;
+        }
+        fn record(&mut self, _kind: &str, source_ref: &str, _message: &str) {
+            self.records.push(source_ref.to_string());
+        }
+    }
+
+    fn pass(
+        latch: &mut std::collections::BTreeMap<String, Vec<String>>,
+        sink: &mut FakeSink,
+        names: &[&str],
+    ) {
+        let kept = names
+            .iter()
+            .map(|n| (n.to_string(), format!("kept {n}")))
+            .collect();
+        if let Some(notice) = latch_kept_notice(latch, "fly", kept) {
+            deliver_notice(sink, "fly", &notice);
+        }
+    }
+
+    #[test]
+    fn kept_source_ref_is_stable_and_order_independent() {
+        let a = vec!["a".to_string(), "b".to_string()];
+        let b = vec!["b".to_string(), "a".to_string()];
+        assert_eq!(kept_source_ref("fly", &a), kept_source_ref("fly", &b));
+        assert!(kept_source_ref("fly", &a).starts_with("reaper-kept:fly:"));
+        assert_ne!(
+            kept_source_ref("fly", &a),
+            kept_source_ref("fly", &["a".to_string()])
+        );
+        assert_ne!(kept_source_ref("fly", &a), kept_source_ref("vps", &a));
+        assert_ne!(
+            kept_source_ref("fly", &["ab".to_string()]),
+            kept_source_ref("fly", &["a".to_string(), "b".to_string()])
+        );
+    }
+
+    #[test]
+    fn publish_records_one_notice_per_changed_set() {
+        let mut latch = std::collections::BTreeMap::new();
+        let mut sink = FakeSink::default();
+        pass(&mut latch, &mut sink, &["a"]);
+        assert_eq!(sink.records.len(), 1);
+        pass(&mut latch, &mut sink, &["a"]);
+        assert_eq!(sink.records.len(), 1, "same set records nothing");
+        pass(&mut latch, &mut sink, &["a", "b"]);
+        assert_eq!(sink.records.len(), 2);
+        assert_ne!(sink.records[0], sink.records[1]);
+        pass(&mut latch, &mut sink, &[]);
+        assert_eq!(sink.records.len(), 2, "cleared set records nothing");
+        assert_eq!(sink.toasts, 2);
+    }
 
     #[test]
     fn ambiguity_precedes_inventory_deletion_and_ledger_retirement() {
