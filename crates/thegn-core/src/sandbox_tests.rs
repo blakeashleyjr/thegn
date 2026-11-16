@@ -6462,20 +6462,14 @@ fn git_policy_main_checkout_gets_a_read_only_git_dir() {
 
 #[test]
 fn bwrap_bind_dest_table() {
-    // A fake filesystem: `/home/u/link` -> `/home/u/real`, `/alias/dir` ->
-    // `/srv/data` (an ancestor symlink rewrites children), `/home/u/self` ->
-    // `/home/u/src`, `/home/u/out` -> `/elsewhere`, `/dangling` unresolvable.
+    // A fake filesystem: `/home/u/link` -> `/home/u/real`, `/alias` -> `/srv`
+    // (an ancestor symlink), `/dangling` unresolvable.
     let resolve = |p: &std::path::Path| -> Option<PathBuf> {
         let s = p.to_string_lossy();
         if s == "/dangling" {
             return None;
         }
-        for (alias, target) in [
-            ("/home/u/link", "/home/u/real"),
-            ("/alias", "/srv"),
-            ("/home/u/self", "/home/u/src"),
-            ("/home/u/out", "/elsewhere"),
-        ] {
+        for (alias, target) in [("/home/u/link", "/home/u/real"), ("/alias", "/srv")] {
             if let Ok(rest) = p.strip_prefix(alias) {
                 return Some(std::path::Path::new(target).join(rest));
             }
@@ -6487,49 +6481,30 @@ fn bwrap_bind_dest_table() {
         PathBuf::from("/srv"),
         PathBuf::from("/alias"),
     ];
-    let src = std::path::Path::new("/home/u/src");
     let p = std::path::Path::new;
     // Plain dir: unchanged.
     assert_eq!(
-        bwrap_bind_dest(src, p("/home/u/plain"), &roots, &resolve),
+        bwrap_bind_dest(p("/home/u/plain"), &roots, &resolve),
         DestFix::Keep
     );
-    // Symlinked dest: bound at its target (under a visible root).
+    // Symlinked dest under a visible root: dropped, never followed.
     assert_eq!(
-        bwrap_bind_dest(src, p("/home/u/link"), &roots, &resolve),
-        DestFix::Rewrite(PathBuf::from("/home/u/real"))
+        bwrap_bind_dest(p("/home/u/link"), &roots, &resolve),
+        DestFix::Drop
     );
-    // Dest symlinked to its own source: one bind at the source path.
+    // Symlinked ancestor: dropped too.
     assert_eq!(
-        bwrap_bind_dest(src, p("/home/u/self"), &roots, &resolve),
-        DestFix::Rewrite(src.to_path_buf())
-    );
-    // Symlinked ancestor.
-    assert_eq!(
-        bwrap_bind_dest(src, p("/alias/dir/leaf"), &roots, &resolve),
-        DestFix::Rewrite(PathBuf::from("/srv/dir/leaf"))
+        bwrap_bind_dest(p("/alias/dir/leaf"), &roots, &resolve),
+        DestFix::Drop
     );
     // Unresolvable: unchanged (the launch reports it as before).
     assert_eq!(
-        bwrap_bind_dest(src, p("/dangling"), &roots, &resolve),
+        bwrap_bind_dest(p("/dangling"), &roots, &resolve),
         DestFix::Keep
-    );
-    // Resolves outside every visible root: dropped, never widened.
-    assert_eq!(
-        bwrap_bind_dest(src, p("/home/u/out"), &roots, &resolve),
-        DestFix::Drop
-    );
-    // `starts_with` is component-wise: `/home/uX` is not under `/home/u`.
-    let sibling = |p: &std::path::Path| -> Option<PathBuf> {
-        (p == std::path::Path::new("/home/u/a-link")).then(|| PathBuf::from("/home/uX"))
-    };
-    assert_eq!(
-        bwrap_bind_dest(src, p("/home/u/a-link"), &roots, &sibling),
-        DestFix::Drop
     );
     // Not under any visible root: bwrap creates it, alias kept.
     assert_eq!(
-        bwrap_bind_dest(src, p("/uncovered/link"), &roots, &|_: &std::path::Path| {
+        bwrap_bind_dest(p("/uncovered/link"), &roots, &|_: &std::path::Path| {
             Some(PathBuf::from("/elsewhere"))
         }),
         DestFix::Keep
@@ -6537,7 +6512,7 @@ fn bwrap_bind_dest_table() {
 }
 
 #[test]
-fn fix_bind_dests_keeps_uncovered_and_rewrites_covered() {
+fn fix_bind_dests_keeps_uncovered_and_drops_covered() {
     // A mount's own (aliased) destination is not a root for itself.
     let mut s = spec(Backend::Bwrap);
     s.mounts = vec![Mount {
@@ -6557,28 +6532,30 @@ fn fix_bind_dests_keeps_uncovered_and_rewrites_covered() {
     assert_eq!(s.mounts.len(), 1);
     assert_eq!(s.mounts[0].dest, "/link");
 
-    // Under the bwrap substrate: rewritten.
-    let mut s = spec(Backend::Bwrap);
-    s.mounts = vec![Mount {
-        host: "/src".into(),
-        dest: "/etc/link".into(),
-        ro: true,
-        cache: false,
-    }];
-    let into_etc = |p: &std::path::Path| -> Option<PathBuf> {
-        if p == std::path::Path::new("/etc/link") {
-            Some(PathBuf::from("/etc/target"))
-        } else {
-            Some(p.to_path_buf())
-        }
-    };
-    fix_bind_dests(&mut s, &into_etc);
-    assert_eq!(s.mounts[0].dest, "/etc/target");
+    // Under the bwrap substrate and symlinked: dropped, read-only or not.
+    for ro in [true, false] {
+        let mut s = spec(Backend::Bwrap);
+        s.mounts = vec![Mount {
+            host: "/src".into(),
+            dest: "/etc/link".into(),
+            ro,
+            cache: false,
+        }];
+        let into_etc = |p: &std::path::Path| -> Option<PathBuf> {
+            if p == std::path::Path::new("/etc/link") {
+                Some(PathBuf::from("/etc/target"))
+            } else {
+                Some(p.to_path_buf())
+            }
+        };
+        fix_bind_dests(&mut s, &into_etc);
+        assert!(s.mounts.is_empty(), "{:?}", s.mounts);
+    }
 }
 
 #[cfg(unix)]
 #[test]
-fn symlinked_dest_is_rewritten_to_its_target() {
+fn symlinked_writable_dest_is_skipped_not_followed() {
     use std::os::unix::fs::symlink;
 
     let td = private_tempdir();
@@ -6609,52 +6586,15 @@ fn symlinked_dest_is_rewritten_to_its_target() {
         },
     ];
 
-    let argv = enter_argv(&s, "true").expect("a symlinked destination is rewritten, not refused");
+    let argv = enter_argv(&s, "true").expect("a symlinked destination is skipped, not refused");
+    assert!(!argv.contains(&alias_s), "{argv:?}");
+    assert!(!argv.contains(&real_s), "{argv:?}");
     assert!(
-        argv.windows(3)
-            .any(|w| w[0] == "--bind" && w[1] == source_s && w[2] == real_s),
+        !argv
+            .windows(2)
+            .any(|w| w[0] == "--bind" && w[1] == source_s),
         "{argv:?}"
     );
-    assert!(!argv.contains(&alias_s), "{argv:?}");
-}
-
-#[cfg(unix)]
-#[test]
-fn dest_symlink_to_own_source_binds_once() {
-    use std::os::unix::fs::symlink;
-
-    let td = private_tempdir();
-    let base = td.path().canonicalize().unwrap();
-    let shared = base.join("shared/.claude/projects");
-    std::fs::create_dir_all(&shared).unwrap();
-    std::fs::create_dir_all(base.join("profile/.claude")).unwrap();
-    let alias = base.join("profile/.claude/projects");
-    symlink(&shared, &alias).unwrap();
-    let shared_s = shared.to_string_lossy().into_owned();
-    let alias_s = alias.to_string_lossy().into_owned();
-    let mut s = spec(Backend::Bwrap);
-    s.mounts = vec![
-        Mount {
-            host: base.join("profile").to_string_lossy().into_owned(),
-            dest: base.join("profile").to_string_lossy().into_owned(),
-            ro: true,
-            cache: false,
-        },
-        Mount {
-            host: alias_s.clone(),
-            dest: alias_s.clone(),
-            ro: false,
-            cache: false,
-        },
-    ];
-
-    let argv = enter_argv(&s, "true").expect("a self-aliased destination binds once");
-    assert!(
-        argv.windows(3)
-            .any(|w| w[0] == "--bind" && w[1] == shared_s && w[2] == shared_s),
-        "{argv:?}"
-    );
-    assert!(!argv.contains(&alias_s), "{argv:?}");
 }
 
 #[cfg(unix)]

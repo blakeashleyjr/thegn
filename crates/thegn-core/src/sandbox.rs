@@ -848,26 +848,24 @@ fn resolve_mount_source(host: &std::path::Path) -> std::io::Result<PathBuf> {
 /// What [`bwrap_bind_dest`] decided for one bind destination.
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum DestFix {
-    /// The destination resolves to itself (or cannot be resolved): unchanged.
+    /// The destination resolves to itself, cannot be resolved, or lies under
+    /// no visible root: unchanged.
     Keep,
-    /// The destination (or an ancestor) is a symlink: bind at this path.
-    Rewrite(PathBuf),
-    /// The resolved destination is outside every visible root: omit the bind.
+    /// The destination (or an ancestor) is a symlink under a visible root:
+    /// omit the bind. It is never re-pointed at the link's target.
     Drop,
 }
 
-/// Where a local bind of `host_canon` may land given its requested `dest`.
-/// `resolve` canonicalizes a path (absent leaves resolved through their
-/// existing ancestors). A destination that resolves to itself is kept, and so
-/// is one under no visible root: bwrap creates an absent mount point as real
+/// Whether a local bind may land at its requested `dest`. `resolve`
+/// canonicalizes a path (absent leaves resolved through their existing
+/// ancestors). A destination that resolves to itself is kept, and so is one
+/// under no visible root: bwrap creates an absent mount point as real
 /// directories in the new root, so the host's symlink is never met there and
 /// the path-visible alias (`--chdir`, `$PWD`, `$HOME`) keeps working. One under
-/// a visible root that resolves elsewhere is rewritten only to a path that does not widen the
-/// sandbox: its own source (`host_canon`, so the source is bound once, at its
-/// own path) or a path under one of `roots` (an already-visible bind or
-/// substrate). Anything else is dropped.
+/// a visible root that resolves elsewhere is dropped (fail closed): symlinked
+/// bind paths are skipped, never followed, so a link can never turn a bind into
+/// one over an arbitrary host tree.
 fn bwrap_bind_dest(
-    host_canon: &std::path::Path,
     dest: &std::path::Path,
     roots: &[PathBuf],
     resolve: &dyn Fn(&std::path::Path) -> Option<PathBuf>,
@@ -885,16 +883,14 @@ fn bwrap_bind_dest(
     if !roots.iter().any(|root| dest.starts_with(root)) {
         return DestFix::Keep;
     }
-    if resolved == host_canon || roots.iter().any(|root| resolved.starts_with(root)) {
-        DestFix::Rewrite(resolved)
-    } else {
-        DestFix::Drop
-    }
+    DestFix::Drop
 }
 
-/// Apply [`bwrap_bind_dest`] to every bind of a local bwrap/systemd view. The
-/// visible roots for one mount are every OTHER mount's destination, plus the
-/// bwrap substrate (bwrap) or the host root (systemd, which sees the host fs).
+/// Apply [`bwrap_bind_dest`] to every bind of a local bwrap/systemd view,
+/// dropping (never rewriting) a bind whose destination is symlinked under a
+/// visible root. The visible roots for one mount are every OTHER mount's
+/// destination, plus the bwrap substrate (bwrap) or the host root (systemd,
+/// which sees the host fs).
 fn fix_bind_dests(view: &mut SandboxSpec, resolve: &dyn Fn(&std::path::Path) -> Option<PathBuf>) {
     let base: Vec<PathBuf> = match view.backend.profile().family {
         BackendFamily::Systemd => vec![PathBuf::from("/")],
@@ -902,7 +898,7 @@ fn fix_bind_dests(view: &mut SandboxSpec, resolve: &dyn Fn(&std::path::Path) -> 
     };
     let dests: Vec<PathBuf> = view.mounts.iter().map(|m| PathBuf::from(&m.dest)).collect();
     let mut keep = vec![true; view.mounts.len()];
-    for (index, mount) in view.mounts.iter_mut().enumerate() {
+    for (index, mount) in view.mounts.iter().enumerate() {
         let roots: Vec<PathBuf> = base
             .iter()
             .cloned()
@@ -914,27 +910,13 @@ fn fix_bind_dests(view: &mut SandboxSpec, resolve: &dyn Fn(&std::path::Path) -> 
                     .map(|(_, d)| d.clone()),
             )
             .collect();
-        match bwrap_bind_dest(
-            std::path::Path::new(&mount.host),
-            std::path::Path::new(&mount.dest),
-            &roots,
-            resolve,
-        ) {
+        match bwrap_bind_dest(std::path::Path::new(&mount.dest), &roots, resolve) {
             DestFix::Keep => {}
-            DestFix::Rewrite(resolved) => {
-                tracing::debug!(
-                    target: "thegn::sandbox",
-                    dest = %mount.dest,
-                    resolved = %resolved.display(),
-                    "bind destination is a symlink; binding at its target"
-                );
-                mount.dest = resolved.to_string_lossy().into_owned();
-            }
             DestFix::Drop => {
                 warn_dropped_mount_once(
                     &mount.dest,
                     &mount.dest,
-                    "bind destination resolves outside every visible sandbox root",
+                    "symlinked path; not bound in the sandbox",
                 );
                 keep[index] = false;
             }
@@ -1065,9 +1047,10 @@ fn launchable_guarded<'a>(
     });
     // bwrap refuses a symlink destination ("Can't mount on symlink
     // destination"), so a local bwrap/systemd bind whose destination (or an
-    // ancestor) is a symlink is re-pointed at the resolved path, where the
-    // in-sandbox alias still lands because the host tree is mirrored. OCI
-    // destinations are container paths and are never rewritten.
+    // ancestor) is a symlink under a visible root is skipped with a warning
+    // instead of aborting the launch. It is never followed to its target (that
+    // could widen the sandbox). OCI destinations are container paths and are
+    // left alone.
     if spec.placement.is_local()
         && matches!(
             canonical_view.backend.profile().family,
