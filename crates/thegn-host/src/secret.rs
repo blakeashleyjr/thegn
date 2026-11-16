@@ -1788,13 +1788,19 @@ mod tests {
         std::fs::create_dir_all(acct.join(".s")).unwrap();
         std::fs::create_dir_all(env.join(".s")).unwrap();
         // Only the account home has it.
-        thegn_core::fsperm::write_owner_only_atomic(&acct.join(".s/tok"), b"acct-val").unwrap();
+        thegn_core::fsperm::ensure_private_dir_beneath(&acct, std::path::Path::new(".s"))
+            .unwrap()
+            .write_owner_only_atomic("tok", b"acct-val")
+            .unwrap();
         let (v, o) = resolve_file_ref("~/.s/tok", Some(&acct), &env);
         assert_eq!(v.as_deref(), Some("acct-val"));
         assert!(matches!(o, SecretOutcome::Resolved));
         // Account home misses; $HOME fallback hits.
         std::fs::remove_file(acct.join(".s/tok")).unwrap();
-        thegn_core::fsperm::write_owner_only_atomic(&env.join(".s/tok"), b"env-val").unwrap();
+        thegn_core::fsperm::ensure_private_dir_beneath(&env, std::path::Path::new(".s"))
+            .unwrap()
+            .write_owner_only_atomic("tok", b"env-val")
+            .unwrap();
         let (v, _) = resolve_file_ref("~/.s/tok", Some(&acct), &env);
         assert_eq!(v.as_deref(), Some("env-val"));
         // Neither: Missing.
