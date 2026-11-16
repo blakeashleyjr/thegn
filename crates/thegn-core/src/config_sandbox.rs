@@ -66,6 +66,10 @@ pub struct SandboxGitConfig {
     /// Ref globs never accepted back from a sandbox. The merge target branch
     /// is always denied in addition to this list.
     pub deny_refs: Vec<String>,
+    /// Private ssh key file used by `credential = "deploy-key"` (`~` is
+    /// expanded). Local placements only: bound read-only into the sandbox and
+    /// selected through `GIT_SSH_COMMAND`. Empty (the default) means unset.
+    pub deploy_key: String,
 }
 
 impl Default for SandboxGitConfig {
@@ -76,6 +80,7 @@ impl Default for SandboxGitConfig {
             credential: GitCredential::default(),
             push_refs: default_push_refs(),
             deny_refs: default_deny_refs(),
+            deploy_key: String::new(),
         }
     }
 }
@@ -92,6 +97,7 @@ pub struct SandboxGitOverlay {
     pub credential: Option<GitCredential>,
     pub push_refs: Option<Vec<String>>,
     pub deny_refs: Option<Vec<String>>,
+    pub deploy_key: Option<String>,
 }
 
 impl SandboxGitOverlay {
@@ -102,6 +108,7 @@ impl SandboxGitOverlay {
             && self.credential.is_none()
             && self.push_refs.is_none()
             && self.deny_refs.is_none()
+            && self.deploy_key.is_none()
     }
 }
 
@@ -151,7 +158,25 @@ impl SandboxGitConfig {
                 .deny_refs
                 .clone()
                 .unwrap_or_else(|| self.deny_refs.clone()),
+            deploy_key: overlay
+                .deploy_key
+                .clone()
+                .unwrap_or_else(|| self.deploy_key.clone()),
         }
+    }
+
+    /// Does this policy hand the sandbox a deploy key? `mode = "full"` with
+    /// `credential = "deploy-key"` and a non-empty [`Self::deploy_key`].
+    pub fn wants_deploy_key(&self) -> bool {
+        self.mode == SandboxGitMode::Full
+            && self.credential == GitCredential::DeployKey
+            && !self.deploy_key.trim().is_empty()
+    }
+
+    /// [`Self::deploy_key`] with `~` expanded, or `None` when unset.
+    pub fn deploy_key_path(&self) -> Option<std::path::PathBuf> {
+        let raw = self.deploy_key.trim();
+        (!raw.is_empty()).then(|| std::path::PathBuf::from(crate::util::expand_tilde(raw)))
     }
 }
 

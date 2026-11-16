@@ -632,8 +632,13 @@ though the default `[sandbox] env_passthrough` lists them (nor are
 `GL_TOKEN`), and provisioning
 does not install a git token credential helper. Only `mode = "full"` with
 `credential = "repo-token"` or `"user-token"` passes the host token through.
-`ANTHROPIC_API_KEY` and other agent credentials are unaffected. The other
-credential modes (`deploy-key`, `github-app`) are not implemented yet. Only
+`ANTHROPIC_API_KEY` and other agent credentials are unaffected.
+`credential = "deploy-key"` with `deploy_key = "~/.ssh/deploy"` (local
+placements only) binds that key read-only into the sandbox and sets
+`GIT_SSH_COMMAND` to use it; the key must be a regular file you own that is
+not group or world readable, otherwise the sandbox gets no credential and a
+warning is logged. A `GIT_SSH_COMMAND` you pass through wins. `github-app`
+is not implemented yet. Only
 environment variables are filtered: a `gh` or `glab` config (with its stored
 token) that reaches the sandbox through `[sandbox.home]` dotfiles is not.
 
