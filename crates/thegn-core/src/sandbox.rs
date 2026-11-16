@@ -2988,7 +2988,8 @@ pub(crate) fn expected_policy(spec: &SandboxSpec) -> String {
 /// EQUAL the required one — an extra bind could be `~/.ssh` — apart from the
 /// `/nix` bind `oci_create_opts` adds itself for devenv, and only when the
 /// current spec would still add it (`nix_expected`): a container created with
-/// devenv on is recreated once devenv is off.
+/// devenv on is recreated once devenv is off; and `/dev/null`, the source of the
+/// runtime-dir socket masks (it exposes nothing).
 fn mounts_match(
     required: &std::collections::HashSet<&str>,
     active: &std::collections::HashSet<&str>,
@@ -3001,7 +3002,7 @@ fn mounts_match(
     !sealed
         || active
             .iter()
-            .all(|a| required.contains(a) || (nix_expected && *a == "/nix"))
+            .all(|a| required.contains(a) || (nix_expected && *a == "/nix") || *a == "/dev/null")
 }
 
 /// Judge `inspect` output in thegn's probe format: line 1 `RUNNING` (or empty),
