@@ -457,6 +457,8 @@ impl DaytonaProvider {
     }
 
     /// Parse a complete list response (an array, or `{ "sandboxes": [...] }`).
+    /// Test-only since the typed inventory replaced its production caller.
+    #[cfg(test)]
     fn parse_list(v: &serde_json::Value) -> Result<Vec<String>> {
         Ok(Self::parse_infos(v)?
             .into_iter()
