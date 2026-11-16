@@ -62,6 +62,7 @@ mod config_source;
 mod config_startup;
 mod connectivity_gate;
 mod copymode;
+mod cpu_attrib_index;
 mod daemon;
 mod db_maintain;
 mod db_task;

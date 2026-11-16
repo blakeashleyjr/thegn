@@ -88,6 +88,7 @@ pub mod control;
 pub mod control_audit;
 pub mod control_error;
 pub mod control_wire;
+pub mod cpu_attrib;
 pub mod custom_cmd;
 pub mod db;
 mod db_account;
