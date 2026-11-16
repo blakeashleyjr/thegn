@@ -5,8 +5,9 @@
 //! ([`REFRESH_SOURCE`]), workspace-clone events ([`WORKSPACE_CLONE_SOURCE`]),
 //! merge-queue drive messages ([`MERGE_DRIVE_SOURCE`]), PR-queue messages
 //! ([`PR_QUEUE_SOURCE`]), worktree-creation progress
-//! ([`WIZARD_CREATE_SOURCE`]), share supervisor events ([`SHARE_SOURCE`]) and
-//! forward detector events ([`FORWARD_SOURCE`]), all through [`take_batch`].
+//! ([`WIZARD_CREATE_SOURCE`]), share supervisor events ([`SHARE_SOURCE`]),
+//! forward detector events ([`FORWARD_SOURCE`]) and host UI events
+//! ([`HOST_UI_SOURCE`]), all through [`take_batch`].
 //! A caller snapshots each
 //! source's readiness and work already consumed in this iteration, asks for a
 //! source turn, drains one bounded portion, updates the snapshot, and asks
@@ -64,6 +65,13 @@ pub const SHARE_SOURCE: SourceReady = SourceReady::new(
 pub const FORWARD_SOURCE: SourceReady = SourceReady::new(
     IngressClass::LosslessOrdered,
     SourceLimits::new(64, usize::MAX),
+);
+
+/// Host UI events (`ensure_ready` progress, install-consent asks, readiness):
+/// every event in order, at most 32 per drain.
+pub const HOST_UI_SOURCE: SourceReady = SourceReady::new(
+    IngressClass::LosslessOrdered,
+    SourceLimits::new(32, usize::MAX),
 );
 
 /// Delivery semantics for an ingress source.
@@ -713,5 +721,10 @@ mod tests {
     #[test]
     fn take_batch_forward_caps_at_64_then_drains_the_rest() {
         assert_cap_plus_one_drains_in_two_batches(FORWARD_SOURCE);
+    }
+
+    #[test]
+    fn take_batch_host_ui_caps_at_32_then_drains_the_rest() {
+        assert_cap_plus_one_drains_in_two_batches(HOST_UI_SOURCE);
     }
 }
