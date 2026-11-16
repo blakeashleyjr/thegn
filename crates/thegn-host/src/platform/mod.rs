@@ -741,6 +741,11 @@ impl InterruptGuard {
     pub fn fired(&self) -> bool {
         false
     }
+    /// A flag that is never set: no handler is installed here.
+    pub fn flag(&self) -> &'static std::sync::atomic::AtomicBool {
+        static NEVER: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+        &NEVER
+    }
 }
 
 #[cfg(test)]

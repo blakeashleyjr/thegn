@@ -1492,6 +1492,13 @@ impl InterruptGuard {
     pub fn fired(&self) -> bool {
         INTERRUPT_SEEN.load(std::sync::atomic::Ordering::SeqCst)
     }
+
+    /// The flag the handler sets, for supervisors that take a cancel
+    /// `&AtomicBool` (`thegn_proc::run*`). It reads the same state as
+    /// [`InterruptGuard::fired`].
+    pub fn flag(&self) -> &'static AtomicBool {
+        &INTERRUPT_SEEN
+    }
 }
 
 impl Drop for InterruptGuard {
@@ -1501,5 +1508,22 @@ impl Drop for InterruptGuard {
             // SAFETY: restoring the disposition captured at install.
             let _ = unsafe { sigaction(sig, &old) }; // best-effort: restore on teardown
         }
+    }
+}
+
+#[cfg(test)]
+mod interrupt_guard_tests {
+    use super::InterruptGuard;
+    use std::sync::atomic::Ordering;
+
+    // Never raises a real signal: the flag is stored directly.
+    #[test]
+    fn flag_reflects_fired() {
+        let guard = InterruptGuard::install();
+        assert!(!guard.fired());
+        guard.flag().store(true, Ordering::SeqCst);
+        assert!(guard.fired());
+        guard.flag().store(false, Ordering::SeqCst);
+        assert!(!guard.fired());
     }
 }
