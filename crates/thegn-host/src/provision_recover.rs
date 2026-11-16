@@ -106,11 +106,18 @@ pub(crate) fn stderr_gist(stderr: &str) -> String {
 /// Which provisioning steps are ESSENTIAL — a failure aborts creation — vs
 /// best-effort (warn + continue; the shell still opens and the step resolves
 /// lazily in the pane). Essentials: the worktree dir, git auth, the clone (or
-/// its credential-free replacement, the git-bundle seed). Everything else (nix install, devShell/direnv warm, personal tools, dotfiles,
-/// the home-parity closure, checkpoint) is best-effort, so one flaky `nix
-/// develop` / unreachable cache can't kill an otherwise-usable sandbox.
+/// its credential-free replacement, the git-bundle seed), and `nix_verify` —
+/// planned only when the environment cannot work without Nix, so a failed
+/// install halts on "Verify Nix" with its cause instead of reporting the env
+/// "up" with no `nix` (THE-2045). Everything else (the nix install itself,
+/// devShell/direnv warm, personal tools, dotfiles, the home-parity closure,
+/// `git_exclude`, checkpoint) is best-effort, so one flaky `nix develop` /
+/// unreachable cache can't kill an otherwise-usable sandbox.
 pub(crate) fn step_is_fatal(step_id: &str) -> bool {
-    matches!(step_id, "workspace" | "git_auth" | "clone" | "bundle_seed")
+    matches!(
+        step_id,
+        "workspace" | "git_auth" | "clone" | "bundle_seed" | "nix_verify"
+    )
 }
 
 /// Which best-effort steps are pure PRE-WARMS whose only effect is to build the
@@ -217,6 +224,18 @@ mod tests {
         for id in ["dotfiles", "tools", "agents"] {
             assert!(!step_is_fatal(id) && !step_is_warm_only(id), "{id}");
         }
+    }
+
+    #[test]
+    fn nix_verify_is_fatal_and_git_exclude_is_best_effort() {
+        // THE-2045: a plan that needs Nix halts on "Verify Nix" instead of
+        // reporting up without it; the install step itself stays best-effort.
+        assert!(step_is_fatal("nix_verify"));
+        assert!(!step_is_warm_only("nix_verify"));
+        assert!(!step_is_fatal("nix"));
+        // THE-2043: hiding the marker from git never fails a provision.
+        assert!(!step_is_fatal("git_exclude"));
+        assert!(!step_is_warm_only("git_exclude"));
     }
 
     #[test]
