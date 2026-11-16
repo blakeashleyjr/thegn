@@ -2,13 +2,6 @@
 //! popup (THE-2025). The session has no single index from a pane id to where
 //! it lives, so this walks the active session and every parked workspace once:
 //! O(panes), no I/O, no locks. Built only while the popup is open.
-#![allow(
-    dead_code,
-    reason = "pane_owners is filled into FrameModel.pane_owners by the loop's \
-              stats-publication block (b140 lane 3 phase 2, run.rs) while the \
-              cpu/mem popup is open"
-)]
-
 use thegn_core::cpu_attrib::PaneOwner;
 
 use crate::panes::Panes;
