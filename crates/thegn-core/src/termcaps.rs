@@ -442,6 +442,15 @@ pub struct GlyphSet {
     pub now_marker: &'static str,     // ┊
     pub lock: &'static str,           // ⚿
     pub tree_pipe: &'static str,      // │
+
+    // Sidebar mode marks: the masthead hidden-sidebar chip, and the sidebar
+    // header chip and rail.
+    /// ▌ sidebar shown in full.
+    pub sidebar_mode_full: &'static str,
+    /// ▏ sidebar collapsed to its rail.
+    pub sidebar_mode_rail: &'static str,
+    /// ◌ sidebar hidden.
+    pub sidebar_mode_hidden: &'static str,
 }
 
 /// Full-Unicode / Nerd-Font glyphs — the current chrome look.
@@ -530,6 +539,11 @@ pub const UNICODE: GlyphSet = GlyphSet {
     now_marker: "\u{250a}",                                  // ┊
     lock: "\u{26bf}",                                        // ⚿
     tree_pipe: "\u{2502}",                                   // │
+
+    // ▌ / ▏ / ◌: sidebar full, rail, hidden.
+    sidebar_mode_full: "\u{258c}",
+    sidebar_mode_rail: "\u{258f}",
+    sidebar_mode_hidden: "\u{25cc}",
 };
 
 /// Basic Unicode preserves the chrome while using square corners for the
@@ -629,6 +643,9 @@ pub const ASCII: GlyphSet = GlyphSet {
     now_marker: "|",
     lock: "x",
     tree_pipe: "|",
+    sidebar_mode_full: "[",
+    sidebar_mode_rail: "|",
+    sidebar_mode_hidden: ".",
 };
 
 /// The glyph table for a given level. `Basic` uses square monitor corners;
@@ -734,6 +751,9 @@ pub enum Glyph {
     NowMarker,
     Lock,
     TreePipe,
+    SidebarModeFull,
+    SidebarModeRail,
+    SidebarModeHidden,
 }
 
 impl Glyph {
@@ -818,6 +838,9 @@ impl Glyph {
         Glyph::NowMarker,
         Glyph::Lock,
         Glyph::TreePipe,
+        Glyph::SidebarModeFull,
+        Glyph::SidebarModeRail,
+        Glyph::SidebarModeHidden,
     ];
 
     /// Resolve this token to its glyph in `set` — the single-cell `&'static str`
@@ -903,6 +926,9 @@ impl Glyph {
             Glyph::NowMarker => set.now_marker,
             Glyph::Lock => set.lock,
             Glyph::TreePipe => set.tree_pipe,
+            Glyph::SidebarModeFull => set.sidebar_mode_full,
+            Glyph::SidebarModeRail => set.sidebar_mode_rail,
+            Glyph::SidebarModeHidden => set.sidebar_mode_hidden,
         }
     }
 }
@@ -1476,6 +1502,32 @@ mod tests {
     }
 
     #[test]
+    fn sidebar_mode_glyphs_are_single_cell_in_every_set() {
+        // The masthead hidden-sidebar chip and the sidebar header/rail chips
+        // reserve exactly one column for the mode glyph.
+        for set in [&UNICODE, &BASIC, &ASCII] {
+            for g in [
+                set.sidebar_mode_full,
+                set.sidebar_mode_rail,
+                set.sidebar_mode_hidden,
+            ] {
+                assert_eq!(g.chars().count(), 1, "{g:?}");
+            }
+            // Distinct within a set, so the three modes never read the same.
+            assert_ne!(set.sidebar_mode_full, set.sidebar_mode_rail);
+            assert_ne!(set.sidebar_mode_rail, set.sidebar_mode_hidden);
+            assert_ne!(set.sidebar_mode_full, set.sidebar_mode_hidden);
+        }
+        assert_eq!(UNICODE.sidebar_mode_full, "\u{258c}");
+        assert_eq!(UNICODE.sidebar_mode_rail, "\u{258f}");
+        assert_eq!(UNICODE.sidebar_mode_hidden, "\u{25cc}");
+        assert_eq!(Glyph::SidebarModeFull.resolve(&ASCII), "[");
+        assert_eq!(Glyph::SidebarModeRail.resolve(&ASCII), "|");
+        assert_eq!(Glyph::SidebarModeHidden.resolve(&ASCII), ".");
+        assert_eq!(Glyph::SidebarModeHidden.resolve(&BASIC), "\u{25cc}");
+    }
+
+    #[test]
     fn ascii_glyphs_are_all_ascii() {
         let g = glyphs(UnicodeLevel::Ascii);
         for s in [
@@ -1560,6 +1612,9 @@ mod tests {
             g.now_marker,
             g.lock,
             g.tree_pipe,
+            g.sidebar_mode_full,
+            g.sidebar_mode_rail,
+            g.sidebar_mode_hidden,
         ]
         .into_iter()
         .chain(g.spin.iter().copied())
@@ -1659,6 +1714,9 @@ mod tests {
                 g.now_marker,
                 g.lock,
                 g.tree_pipe,
+                g.sidebar_mode_full,
+                g.sidebar_mode_rail,
+                g.sidebar_mode_hidden,
             ]
             .into_iter()
             .chain(g.spin.iter().copied())
@@ -1744,7 +1802,7 @@ mod tests {
         // token per single-string field. `spin` (the frame array) is the one
         // documented exclusion, so the count is the field total minus one.
         // (Kept as a concrete number so adding a field without a token trips it.)
-        assert_eq!(Glyph::ALL.len(), 77);
+        assert_eq!(Glyph::ALL.len(), 80);
     }
 
     #[test]
