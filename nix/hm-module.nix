@@ -346,6 +346,8 @@ self: {
     notifications.dnd.enabled = cfg.notificationsDndEnabled;
     notifications.dnd.allow_priority = cfg.notificationsDndAllowPriority;
     notifications.dnd.windows = cfg.notificationsDndWindows;
+    notifications.desktop_min_urgency = cfg.notificationsDesktopMinUrgency;
+    notifications.process_exit = cfg.notificationsProcessExit;
     notifications.sound.mode = cfg.notificationsSoundMode;
     notifications.sound.always_kinds = cfg.notificationsSoundAlwaysKinds;
     notifications.sound.mute = cfg.notificationsSoundMute;
@@ -1652,6 +1654,20 @@ in {
       default = null;
       example = lib.literalExpression ''[ "22:00-07:00" "sat,sun 00:00-08:00" ]'';
       description = "Do-not-disturb windows: \"HH:MM-HH:MM\" with optional leading weekdays (\"mon-fri 09:00-17:00\", \"sat,sun 00:00-08:00\"). Invalid entries are ignored with a load warning. Unset (null) = the binary's default.";
+    };
+
+    notificationsDesktopMinUrgency = lib.mkOption {
+      type = lib.types.nullOr lib.types.str;
+      default = null;
+      example = "critical";
+      description = "Minimum urgency for a desktop notification: low, normal or critical (case-insensitive). Unknown values fall back to normal with a load warning. Unset (null) = the binary's default.";
+    };
+
+    notificationsProcessExit = lib.mkOption {
+      type = lib.types.nullOr lib.types.str;
+      default = null;
+      example = "failures";
+      description = "How non-agent pane exits route into notifications: off, failures, failures_and_tasks or all (case-insensitive). Unknown values fall back to failures_and_tasks with a load warning. Unset (null) = the binary's default.";
     };
 
     usageProviders = lib.mkOption {

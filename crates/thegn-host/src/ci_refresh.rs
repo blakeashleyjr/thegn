@@ -1065,6 +1065,47 @@ fn sweep_one_background(
     }
 }
 
+/// Build the refresh's provider client bound to the refresh wall: every
+/// provider call clips its timeout to the time left on `budget.deadline`, so a
+/// call admitted just before the wall still ends by it (a clipped call fails
+/// like any other, and the cached row is kept).
+fn refresh_client(
+    loc: &thegn_core::remote::GitLoc,
+    cfg: &thegn_core::config::CiConfig,
+    cancel: Arc<AtomicBool>,
+    budget: &CallBudget,
+) -> Option<(thegn_svc::ci::CiClient, Option<String>)> {
+    thegn_svc::ci::provider_and_context_for_deadline(loc, cfg, cancel, budget.deadline)
+}
+
+/// Branch to filter the refresh's run list by. Outer `None` means skip the
+/// refresh (budget spent or cancelled); the remote read is cancellable.
+fn remote_branch_for_refresh(
+    loc: &thegn_core::remote::GitLoc,
+    budget: &CallBudget,
+    cancel: &std::sync::atomic::AtomicBool,
+) -> Option<Option<String>> {
+    if budget.exhausted() {
+        return None;
+    }
+    let branch = if loc.is_remote() {
+        match loc.git_text_cancellable(&["rev-parse", "--abbrev-ref", "HEAD"], cancel) {
+            Ok(branch) if !branch.is_empty() => Some(branch),
+            Ok(_) => None,
+            Err(error) => {
+                tracing::debug!(%error, "could not read remote worktree branch for CI refresh");
+                None
+            }
+        }
+    } else {
+        local_ci_cache_branch(loc)
+    };
+    if cancel.load(Ordering::Relaxed) {
+        return None;
+    }
+    Some(branch)
+}
+
 /// The blocking body of a CI cache refresh for one worktree location. Returns
 /// whether a fetch was actually attempted (`false` when skipped by the
 /// freshness/backoff guards or when no provider resolves).
@@ -1106,22 +1147,11 @@ fn refresh_ci_cache_for(
     if cancel.load(Ordering::Relaxed) {
         return false;
     }
-    let Some((client, context)) =
-        thegn_svc::ci::provider_and_context_for_cancellable(loc, cfg, Arc::clone(&cancel))
-    else {
+    let Some((client, context)) = refresh_client(loc, cfg, Arc::clone(&cancel), budget) else {
         return false;
     };
-    let branch = if loc.is_remote() {
-        match loc.git_text(&["rev-parse", "--abbrev-ref", "HEAD"]) {
-            Ok(branch) if !branch.is_empty() => Some(branch),
-            Ok(_) => None,
-            Err(error) => {
-                tracing::debug!(%error, "could not read remote worktree branch for CI refresh");
-                None
-            }
-        }
-    } else {
-        local_ci_cache_branch(loc)
+    let Some(branch) = remote_branch_for_refresh(loc, budget, &cancel) else {
+        return false;
     };
     if !budget.take() {
         return false;
@@ -1984,6 +2014,22 @@ mod tests {
     }
 
     #[test]
+    fn refresh_skips_the_remote_prelude_when_the_budget_is_spent() {
+        let loc = thegn_core::remote::GitLoc::Local(std::path::PathBuf::from("/nonexistent"));
+        let spent = CallBudget {
+            remaining: 0,
+            bytes_remaining: MAX_LOG_INGEST_BYTES,
+            deadline: None,
+        };
+        let cancel = std::sync::atomic::AtomicBool::new(false);
+        assert_eq!(remote_branch_for_refresh(&loc, &spent, &cancel), None);
+
+        let live = CallBudget::per_refresh();
+        let cancelled = std::sync::atomic::AtomicBool::new(true);
+        assert_eq!(remote_branch_for_refresh(&loc, &live, &cancelled), None);
+    }
+
+    #[test]
     fn refresh_budget_reports_exhausted_calls_bytes_and_deadline() {
         let calls = CallBudget {
             remaining: 0,
@@ -2248,6 +2294,52 @@ mod tests {
             cached.as_ref(),
             thegn_core::util::now()
         ));
+    }
+
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "test fixture: initialize an isolated Git repository"
+    )]
+    #[test]
+    fn refresh_call_admitted_near_the_wall_ends_by_the_wall() {
+        let temp = private_tempdir();
+        let worktree = temp.path().join("repo");
+        std::fs::create_dir(&worktree).expect("create fixture repo");
+        let status = thegn_core::util::git_cmd(&worktree)
+            .args(["init", "-q", "-b", "topic"])
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .status()
+            .expect("initialize fixture repo");
+        assert!(status.success(), "git init failed for fixture repo");
+        let status = thegn_core::util::git_cmd(&worktree)
+            .args(["remote", "add", "origin", "https://github.com/o/b.git"])
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .status()
+            .expect("add fixture origin");
+        assert!(status.success(), "adding fixture origin failed");
+        let loc = thegn_core::remote::GitLoc::for_worktree(&worktree);
+        let cfg = thegn_core::config::CiConfig::default();
+
+        // The wall has been reached by the time the provider call runs: the
+        // client carries the refresh's deadline, so the call ends at once with
+        // the deadline error instead of spawning `gh` for its full timeout.
+        let budget = CallBudget {
+            remaining: 1,
+            bytes_remaining: MAX_LOG_INGEST_BYTES,
+            deadline: Some(Instant::now()),
+        };
+        let (client, context) =
+            refresh_client(&loc, &cfg, Arc::new(AtomicBool::new(false)), &budget)
+                .expect("GitHub origin resolves a provider");
+        assert_eq!(context.as_deref(), Some("github:github.com/o/b"));
+        let error = client
+            .run_detail(&loc, "123")
+            .map(|_| ())
+            .expect_err("a spent wall fails the call");
+        assert_eq!(
+            error,
+            thegn_core::ci::CiError::Other("CI operation deadline reached".into())
+        );
     }
 
     #[test]
