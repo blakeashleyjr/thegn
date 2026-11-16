@@ -38,6 +38,7 @@ fn push_group(out: &mut Vec<PaneOwner>, workspace: &str, group: &WorktreeGroup, 
                 pane_id,
                 workspace: workspace.clone(),
                 worktree: group.name.clone(),
+                worktree_path: (!group.path.is_empty()).then(|| group.path.clone()),
                 tab: tab.title.clone(),
                 program,
             });
