@@ -991,6 +991,6 @@ fn physical_device_rows_paint_read_write_minicores_and_degrade_when_narrow() {
     assert!(row_text.contains("rd "), "read minicore row: {row_text:?}");
     assert!(row_text.contains("wr "), "write minicore row: {row_text:?}");
     for cols in [20_usize, 40, 60, 80] {
-        let _ = render(&model, cols, 30);
+        drop(render(&model, cols, 30));
     }
 }
