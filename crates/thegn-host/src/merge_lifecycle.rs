@@ -644,6 +644,22 @@ fn remove_landed_unaudited(
         audit_cleanup_outcome(worktree, landed, &refused);
         return refused;
     };
+    // A held row already completed its worktree collection (the sweep treats
+    // it the same way); only the branch is deliberately retained. Replaying
+    // the land is a no-op, not a fresh refusal against the vanished path.
+    if thegn_core::merge_sweep::CleanupHold::from_detail(selected.error_detail.as_deref()).is_some()
+    {
+        let replay = CleanupOutcome::Removed {
+            branch_deleted: false,
+            queue_removed: false,
+            discarded_build_state: false,
+            discarded_tool_state: false,
+            branch_held: true,
+            bookkeeping_errors: Vec::new(),
+        };
+        audit_cleanup_outcome(worktree, landed, &replay);
+        return replay;
+    }
     let cfg = crate::config_startup::cleanup_config();
     remove_landed_with_config(
         &cfg,
