@@ -155,8 +155,6 @@ pub fn rate_for(
     find("", None).map(bundled_rate)
 }
 
-const HOUR_MS: f64 = 3_600_000.0;
-
 /// Cost of running at `rate` from `created_ms` to `now_ms` (0 for skew,
 /// non-finite or non-positive rates). Same math as
 /// [`crate::db_compute::accrue_cost`].
