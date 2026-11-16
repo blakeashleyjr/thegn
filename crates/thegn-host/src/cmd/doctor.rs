@@ -3352,6 +3352,7 @@ fn reaper_hold_lines(holds: &[ReaperHold]) -> Vec<String> {
 
 /// Read recent reaper holds from the local inbox. No provider or network calls.
 fn reaper_holds() -> Vec<ReaperHold> {
+    use thegn_core::store::NotificationStore as _;
     let Some(db) = doctor_db().ready() else {
         return Vec::new();
     };
