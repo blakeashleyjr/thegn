@@ -14250,40 +14250,76 @@ async fn event_loop<T: Terminal>(
             model.config_banner = crate::config_startup::banner();
             match cfg_res {
                 Ok(new_cfg) => {
+                    // THE-2024: diff the old and new config into changed keys,
+                    // each classified Live (with the hook that applies it),
+                    // Restart or NextUse. Hooks whose keys did not change are
+                    // skipped; a capped/failed diff runs them all.
+                    use thegn_core::config::reload_class::{self, ReloadHook};
+                    let plan = reload_class::plan(&current_config, &new_cfg);
+                    if !plan.unclassified.is_empty() {
+                        tracing::debug!(
+                            target: "thegn::config",
+                            keys = ?plan.unclassified,
+                            "config reload: keys with no reload class"
+                        );
+                    }
                     // Reconcile app tabs by stable id. This is chrome state:
                     // the successful reload below forces a full relayout, and
                     // unchanged defaults preserve the user's current tab.
+                    // Unconditional: app tabs also follow plugin specs.
                     app_host.reconcile(&new_cfg);
                     let selected_app = app_host.active;
                     let _ =
                         ensure_app_loaded(&mut app_host, selected_app, &app_tx, &waker, &new_cfg)
                             .await;
+                    // Unconditional: the keymap carries the whole config
+                    // (`keymap.config()`), so it must follow every reload.
                     keymap = rebuild_keymap(&new_cfg, &session);
-                    sb.view.workspace_sort = new_cfg.ui.sidebar_workspace_sort;
-                    sb.view.terminals_section = new_cfg.ui.sidebar_terminals_section;
-                    crate::sidebar_freeze::set_enabled(
-                        &mut sb,
-                        new_cfg.ui.sidebar_freeze_sort,
-                        &model.sidebar_status,
+                    // Sidebar, bars/stats/usage/accent, weather and calendar
+                    // hooks (handlers/config_reload.rs), gated on the plan.
+                    let reload_outcome = crate::handlers::config_reload::apply(
+                        &plan,
+                        &mut crate::handlers::config_reload::ReloadCtx {
+                            model: &mut model,
+                            sb: &mut sb,
+                            session: &session,
+                            panel_ui: &mut panel_ui,
+                            bar_detail: &mut bar_detail,
+                            new_cfg: &new_cfg,
+                            locale: crate::calendar_docs::CalendarDocs::env_locale(),
+                        },
                     );
-                    sb.view.display = crate::sidebar_view::SidebarDisplay::from_ui(&new_cfg.ui);
-                    // `workspace_sort`/`terminals_section` are only read inside
-                    // `build_rows`, and nothing else on the reload path
-                    // rebuilds rows — without this, the edit sits invisible
-                    // until some unrelated hydration happens to rebuild (an
-                    // idle repo's fast path never does).
-                    sb.rebuild(&mut model, &session);
+                    bars_dirty |= reload_outcome.bars_dirty;
+                    dirty |= reload_outcome.dirty;
+                    if let Some(poll) = reload_outcome.weather_poll {
+                        // One-shot spawn_blocking, off the loop.
+                        crate::hydrate_weather::spawn_poll_with_generation(
+                            poll.cfg,
+                            poll.locale,
+                            refresh_tx.clone(),
+                            waker.clone(),
+                            None,
+                        );
+                    }
                     // Live fullscreen-bar reload: recompute the chrome now if the
                     // user is currently in full-window zoom so the kept/dropped
                     // bars apply immediately (the reload relayouts below anyway).
-                    zoom_keep_masthead = new_cfg.ui.fullscreen_keep_masthead;
-                    zoom_keep_statusbar = new_cfg.ui.fullscreen_keep_statusbar;
-                    if eff_zoom == Some(crate::focus::Zone::Center) {
-                        chrome = recompute_chrome!();
+                    if plan.runs(ReloadHook::Layout) {
+                        zoom_keep_masthead = new_cfg.ui.fullscreen_keep_masthead;
+                        zoom_keep_statusbar = new_cfg.ui.fullscreen_keep_statusbar;
+                        if eff_zoom == Some(crate::focus::Zone::Center) {
+                            chrome = recompute_chrome!();
+                        }
                     }
+                    // What applied live and what waits for a restart; a keymap
+                    // conflict still wins the status line.
                     model.status = keybind_conflict_summary(&new_cfg)
+                        .or_else(|| reload_class::summary(&plan))
                         .unwrap_or_else(|| "Config reloaded".into());
                     // Live theme reload: colors apply on the next repaint.
+                    // Unconditional: the palette, caps and colour depth read
+                    // `[theme]`, `[ui]` and the terminal environment together,
+                    // and every call here is a cheap in-memory swap.
                     crate::chrome::set_palette(
                         new_cfg.palette_with_user_themes(&new_cfg.theme.preset, &theme_users),
                     );
@@ -14315,33 +14351,9 @@ async fn event_loop<T: Terminal>(
                     crate::snapshot::set_scrollback_lines(
                         new_cfg.session.scrollback_lines as usize,
                     );
-                    model.accent = new_cfg.accent_rgb();
-                    model.bars = new_cfg.bars.clone();
-                    model.stats_icons = new_cfg.stats.clone();
-                    model.usage_cfg = new_cfg.usage.clone();
-                    // A moved provider/location/units leaves the old reading
-                    // on screen until the next scheduled poll (>= 10 min):
-                    // clear it and poll once now. One-shot spawn_blocking.
-                    let weather_locale = crate::calendar_docs::CalendarDocs::env_locale();
-                    if crate::hydrate_weather::reload_needs_poll(
-                        &model.weather_cfg,
-                        &new_cfg.weather,
-                        weather_locale.as_deref(),
-                    ) {
-                        model.weather = None;
-                        bars_dirty = true;
-                        dirty |= crate::detail::retick_open(&mut bar_detail, None);
-                        crate::hydrate_weather::spawn_poll_with_generation(
-                            new_cfg.weather.clone(),
-                            weather_locale,
-                            refresh_tx.clone(),
-                            waker.clone(),
-                            None,
-                        );
-                    }
-                    model.weather_cfg = new_cfg.weather.clone();
                     // Live `[panel] sections` reload: reorder/hide accordions;
                     // the keys section's cheatsheet follows the new keymap.
+                    // Unconditional: the panel and cheatsheet read the keymap.
                     panel_ui.apply_config(&new_cfg);
                     layout::set_panel_width_cfg(
                         panel_cols_pref.or(new_cfg.panel.width),
@@ -14356,48 +14368,39 @@ async fn event_loop<T: Terminal>(
                     );
                     sidebar_cols = sb.effective_cols(cols);
                     panel_ui.docs.cfg_keys = crate::keyhint::cheatsheet_groups(&new_cfg);
-                    // Live `[calendar]` reload: new clocks/zones/week start take
-                    // effect on the next open. Cached events are carried over —
-                    // they are keyed by date, not by config.
-                    let prev_cal = std::mem::take(&mut panel_ui.docs.calendar);
-                    panel_ui.docs.calendar = crate::calendar_docs::CalendarDocs::from_config(
-                        &new_cfg.calendar,
-                        crate::calendar_docs::CalendarDocs::env_locale().as_deref(),
-                    );
-                    if panel_ui.docs.calendar.home == prev_cal.home {
-                        panel_ui.docs.calendar.events = prev_cal.events;
-                        panel_ui.docs.calendar.loaded = prev_cal.loaded;
-                        panel_ui.docs.calendar.errors = prev_cal.errors;
-                    }
                     // The help registry embeds the effective keymap page.
                     help_registry =
                         std::sync::Arc::new(crate::help::pages::registry_logged(&new_cfg));
                     panel_ui.help.reg = Some(help_registry.clone());
-                    crate::handlers::voice::reconfigure(
-                        &mut voice,
-                        new_cfg.voice.clone(),
-                        &mut model,
-                        &waker,
-                    );
+                    if plan.runs(ReloadHook::Voice) {
+                        crate::handlers::voice::reconfigure(
+                            &mut voice,
+                            new_cfg.voice.clone(),
+                            &mut model,
+                            &waker,
+                        );
+                    }
                     if let Some(picker) = workspace_picker.as_mut() {
                         picker.config_reloaded(new_cfg.clone(), waker.clone());
                     }
-                    lsp_config_epoch += 1;
-                    let epoch = lsp_config_epoch;
-                    let (enabled, servers) = (new_cfg.lsp.enabled, new_cfg.lsp.servers.clone());
-                    let require_containment = new_cfg.lsp.require_containment;
-                    let lsp = lsp_supervisor.handle();
-                    tokio::task::spawn_blocking(move || {
-                        let released = lsp.reconfigure(epoch, enabled, &servers);
-                        lsp.set_require_containment(epoch, require_containment);
-                        if released > 0 {
-                            tracing::debug!(
-                                target: "thegn::lsp",
-                                released,
-                                "reconciled LSP servers after config reload"
-                            );
-                        }
-                    });
+                    if plan.runs(ReloadHook::Lsp) {
+                        lsp_config_epoch += 1;
+                        let epoch = lsp_config_epoch;
+                        let (enabled, servers) = (new_cfg.lsp.enabled, new_cfg.lsp.servers.clone());
+                        let require_containment = new_cfg.lsp.require_containment;
+                        let lsp = lsp_supervisor.handle();
+                        tokio::task::spawn_blocking(move || {
+                            let released = lsp.reconfigure(epoch, enabled, &servers);
+                            lsp.set_require_containment(epoch, require_containment);
+                            if released > 0 {
+                                tracing::debug!(
+                                    target: "thegn::lsp",
+                                    released,
+                                    "reconciled LSP servers after config reload"
+                                );
+                            }
+                        });
+                    }
                     current_config = new_cfg;
                     // Rebuild only the effective hydration schedule. This is
                     // intentionally after successful config admission; the
