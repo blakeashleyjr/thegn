@@ -6,7 +6,7 @@
 //! never a second preview source of truth.
 
 use std::collections::{BTreeMap, HashMap};
-use std::sync::{Mutex, OnceLock};
+use std::sync::{Arc, Mutex, MutexGuard, OnceLock, PoisonError};
 
 use thegn_core::preview::{
     PortHint, PortHintSource, PreviewStatus, PreviewTarget, parse_pane_port_hints_wrapped,
@@ -19,14 +19,123 @@ use crate::chrome::PreviewView;
 /// maximum input so repeated output can never grow host memory without bound.
 const DIAGNOSTIC_TAIL_BYTES: usize = thegn_core::preview::MAX_PORT_HINT_CHARS;
 
+/// The retained buffer may grow to twice the diagnostic bound before it is
+/// front-trimmed back to [`DIAGNOSTIC_TAIL_BYTES`], so the trim memmove is
+/// amortized over at least `DIAGNOSTIC_TAIL_BYTES` of output instead of being
+/// paid on every chunk once the tail is full.
+const TAIL_TRIM_THRESHOLD: usize = 2 * DIAGNOSTIC_TAIL_BYTES;
+
+/// Minimum look-back before the line holding the first new byte. It keeps a
+/// soft-wrapped (or right-margin redrawn) previous row inside the parse window
+/// so a URL split across the wrap is still joined.
+const WRAP_OVERLAP_MIN_BYTES: usize = 1024;
+
+/// A single unbroken line longer than this is not re-parsed from its start on
+/// every chunk; the window falls back to the wrap overlap before the new bytes.
+const MAX_LINE_LOOKBACK_BYTES: usize = 8 * 1024;
+
+/// One pane's retained (ANSI-stripped) output. Shared with the same-process
+/// diagnostic snapshot so a published snapshot stays live as output arrives
+/// without re-copying the tail on every chunk.
+type SharedTail = Arc<Mutex<Vec<u8>>>;
+
+/// What the response snapshot serves for one worktree.
+#[derive(Debug, Clone)]
+enum DiagnosticSource {
+    Pane(SharedTail),
+    Manifest(String),
+}
+
+impl DiagnosticSource {
+    fn render(&self) -> String {
+        match self {
+            Self::Pane(tail) => {
+                String::from_utf8_lossy(bounded_tail(&lock_tail(tail))).into_owned()
+            }
+            Self::Manifest(text) => text.clone(),
+        }
+    }
+}
+
 /// Same-process response snapshot. A detached daemon legitimately has no
 /// compositor-side pane diagnostics and therefore leaves this empty.
-static DIAGNOSTIC_SNAPSHOTS: OnceLock<Mutex<HashMap<String, String>>> = OnceLock::new();
+static DIAGNOSTIC_SNAPSHOTS: OnceLock<Mutex<HashMap<String, DiagnosticSource>>> = OnceLock::new();
 
 pub(crate) fn diagnostic_snapshot(worktree: &str) -> Option<String> {
-    DIAGNOSTIC_SNAPSHOTS
+    let source = DIAGNOSTIC_SNAPSHOTS
         .get()
-        .and_then(|snapshots| snapshots.lock().ok()?.get(worktree).cloned())
+        .and_then(|snapshots| snapshots.lock().ok()?.get(worktree).cloned())?;
+    Some(source.render())
+}
+
+/// A poisoned tail only means a panic elsewhere while appending bytes; the
+/// buffer is still a valid byte vector, so keep serving it.
+fn lock_tail(tail: &Mutex<Vec<u8>>) -> MutexGuard<'_, Vec<u8>> {
+    tail.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
+/// First char boundary at or after `index` (skips at most three UTF-8
+/// continuation bytes, so invalid input cannot stall the scan).
+fn ceil_char_boundary(bytes: &[u8], index: usize) -> usize {
+    let mut index = index.min(bytes.len());
+    let mut skipped = 0;
+    while skipped < 3 && bytes.get(index).is_some_and(|byte| byte & 0xC0 == 0x80) {
+        index += 1;
+        skipped += 1;
+    }
+    index
+}
+
+/// The diagnostic view of a retained tail: at most [`DIAGNOSTIC_TAIL_BYTES`],
+/// starting on a char boundary.
+fn bounded_tail(tail: &[u8]) -> &[u8] {
+    let start = ceil_char_boundary(tail, tail.len().saturating_sub(DIAGNOSTIC_TAIL_BYTES));
+    &tail[start..]
+}
+
+fn is_line_break(byte: u8) -> bool {
+    byte == b'\n' || byte == b'\r'
+}
+
+/// Start of the slice of `tail` that must be re-parsed after its last
+/// `new_len` bytes arrived.
+///
+/// The window opens at the start of the line holding the first new byte,
+/// extended back by the wrap overlap (`max(2 * cols, 1024)` bytes) and snapped
+/// forward to the first line start inside that overlap. Hints wholly before
+/// the window were already found by an earlier chunk; a hint that was still
+/// incomplete at the previous tail end lies on the line of the first new byte
+/// and is therefore re-parsed. A single line longer than
+/// `MAX_LINE_LOOKBACK_BYTES` instead starts the overlap before the new bytes,
+/// on a char boundary. The window never exceeds [`DIAGNOSTIC_TAIL_BYTES`].
+fn parse_window_start(tail: &[u8], new_len: usize, cols: Option<u16>) -> usize {
+    let first_new = tail.len().saturating_sub(new_len);
+    let overlap = cols
+        .map_or(0, |columns| 2 * usize::from(columns))
+        .max(WRAP_OVERLAP_MIN_BYTES);
+    let line_start = tail[..first_new]
+        .iter()
+        .rposition(|byte| is_line_break(*byte))
+        .map_or(0, |index| index + 1);
+    let start = if first_new - line_start > MAX_LINE_LOOKBACK_BYTES {
+        ceil_char_boundary(tail, first_new.saturating_sub(overlap))
+    } else {
+        let cut = line_start.saturating_sub(overlap);
+        if cut == 0 {
+            0
+        } else {
+            // A break at `cut - 1` makes `cut` itself a line start. A line
+            // start follows an ASCII byte, so it is always a char boundary.
+            tail[cut - 1..line_start]
+                .iter()
+                .position(|byte| is_line_break(*byte))
+                .map_or(line_start, |index| cut + index)
+        }
+    };
+    start.max(ceil_char_boundary(
+        tail,
+        tail.len().saturating_sub(DIAGNOSTIC_TAIL_BYTES),
+    ))
 }
 
 #[derive(Debug, Default)]
@@ -118,12 +227,15 @@ pub(crate) struct ProbeResult {
 pub(crate) struct PreviewSupervisor {
     enabled: bool,
     candidates: BTreeMap<(String, u16), Candidate>,
-    pane_tails: HashMap<u32, Vec<u8>>,
+    pane_tails: HashMap<u32, SharedTail>,
     pane_strippers: HashMap<u32, thegn_core::history::AnsiStripper>,
     pane_worktrees: HashMap<u32, String>,
     latest_scan_generation: u64,
     diagnostics: HashMap<String, String>,
     last_probe_worktree: Option<String>,
+    /// Test hook: how many times `publish_diagnostic` ran.
+    #[cfg(test)]
+    publishes: std::sync::atomic::AtomicUsize,
 }
 
 impl PreviewSupervisor {
@@ -193,10 +305,13 @@ impl PreviewSupervisor {
         before != self.view(&scan.worktree)
     }
 
-    /// Feed one pane's bounded output tail to the pure core parser. Pane facts
-    /// persist after their URL scrolls out of the tail and are removed only
-    /// when a longer digit-prefix hint from that pane supersedes them. Returns
-    /// true only when the selected render projection changed.
+    /// Feed one pane's output to the pure core parser. The pane keeps a
+    /// bounded diagnostic tail, but each chunk re-parses only the window that
+    /// can hold a new or newly-completed hint (see `parse_window_start`).
+    /// Pane facts persist after their URL leaves the window or the tail and
+    /// are removed only when a longer digit-prefix hint from that pane
+    /// supersedes them. Returns true only when the selected render projection
+    /// changed; a chunk that changes no candidate does no view work.
     pub(crate) fn pane_output(
         &mut self,
         pane_id: u32,
@@ -208,7 +323,6 @@ impl PreviewSupervisor {
         if !self.enabled {
             return false;
         }
-        let before = self.view(worktree);
         // Strip incrementally before retaining the bounded tail. Keeping the
         // stripper state per pane matters when an OSC/DCS sequence spans chunks
         // or exceeds the tail bound: once the opener is evicted, hidden payload
@@ -218,43 +332,76 @@ impl PreviewSupervisor {
             .entry(pane_id)
             .or_default()
             .strip_into(bytes, &mut visible);
-        let tail = self.pane_tails.entry(pane_id).or_default();
-        tail.extend_from_slice(&visible);
-        if tail.len() > DIAGNOSTIC_TAIL_BYTES {
-            tail.drain(..tail.len() - DIAGNOSTIC_TAIL_BYTES);
+        if self.pane_worktrees.get(&pane_id).map(String::as_str) != Some(worktree) {
+            self.pane_worktrees.insert(pane_id, worktree.to_string());
         }
-        self.pane_worktrees.insert(pane_id, worktree.to_string());
-        let text = String::from_utf8_lossy(tail);
-        let hints = parse_pane_port_hints_wrapped(&text, cols);
+        if visible.is_empty() {
+            // Nothing parser-visible arrived, so no hint can have appeared or
+            // been completed.
+            return false;
+        }
+        let window = {
+            let mut tail = lock_tail(self.pane_tails.entry(pane_id).or_default());
+            tail.extend_from_slice(&visible);
+            if tail.len() > TAIL_TRIM_THRESHOLD {
+                let excess = tail.len() - DIAGNOSTIC_TAIL_BYTES;
+                tail.drain(..excess);
+            }
+            let start = parse_window_start(&tail, visible.len(), cols);
+            String::from_utf8_lossy(&tail[start..]).into_owned()
+        };
+        let hints = parse_pane_port_hints_wrapped(&window, cols);
+        if hints.is_empty() {
+            // No new port means nothing to insert and nothing to supersede.
+            return false;
+        }
         let new_ports: std::collections::BTreeSet<u16> =
             hints.iter().map(|hint| hint.port).collect();
-        let old_ports: Vec<u16> = self
+        // Keep pane facts after their URL scrolls out of the window. A new
+        // hint only supersedes an old one when it extends that old port's
+        // digits (for example, an echoed `:87` becoming `:8765`).
+        let superseded: Vec<u16> = self
             .candidates
             .iter()
             .filter(|((candidate_worktree, _), candidate)| {
                 candidate_worktree == worktree && candidate.panes.contains_key(&pane_id)
             })
             .map(|((_, port), _)| *port)
+            .filter(|old| {
+                !new_ports.contains(old)
+                    && new_ports
+                        .iter()
+                        .any(|new| new != old && new.to_string().starts_with(&old.to_string()))
+            })
             .collect();
-        // Keep pane facts after their URL scrolls out of the bounded tail. A
-        // new hint only supersedes an old one when it extends that old port's
-        // digits (for example, an echoed `:87` becoming `:8765`).
-        for port in old_ports.into_iter().filter(|old| {
-            !new_ports.contains(old)
-                && new_ports
-                    .iter()
-                    .any(|new| new != old && new.to_string().starts_with(&old.to_string()))
-        }) {
-            if let Some(candidate) = self.candidates.get_mut(&(worktree.to_string(), port)) {
+        let key = |port: u16| (worktree.to_string(), port);
+        let inserts_change = hints.iter().any(|hint| {
+            self.candidates
+                .get(&key(hint.port))
+                .is_none_or(|candidate| {
+                    !candidate.ended_panes.is_empty()
+                        || candidate
+                            .panes
+                            .get(&pane_id)
+                            .is_none_or(|(old_hint, old_session)| {
+                                old_hint != hint || old_session != &session
+                            })
+                })
+        });
+        if superseded.is_empty() && !inserts_change {
+            // Re-inserting unchanged hints is a no-op: skip the view
+            // projection and the diagnostic publish entirely.
+            return false;
+        }
+        let before = self.view(worktree);
+        for port in superseded {
+            if let Some(candidate) = self.candidates.get_mut(&key(port)) {
                 candidate.panes.remove(&pane_id);
                 Self::rearm(candidate);
             }
         }
         for hint in hints {
-            let candidate = self
-                .candidates
-                .entry((worktree.to_string(), hint.port))
-                .or_default();
+            let candidate = self.candidates.entry(key(hint.port)).or_default();
             // A new live watcher supersedes ended evidence for this target;
             // keep exit history bounded by the concurrently-observed panes.
             candidate.ended_panes.clear();
@@ -484,22 +631,46 @@ impl PreviewSupervisor {
     /// consumed by the response/fetch layer without exposing emulator state.
     #[allow(dead_code)] // chunk 3 consumes this response-context seam
     pub(crate) fn diagnostic(&self, worktree: &str) -> Option<String> {
+        self.diagnostic_source(worktree)
+            .map(|source| source.render())
+    }
+
+    fn diagnostic_source(&self, worktree: &str) -> Option<DiagnosticSource> {
         let pane_tail = self.view(worktree).and_then(|view| {
             self.candidates
                 .get(&(worktree.to_string(), view.port))
                 .and_then(|candidate| candidate.panes.keys().next())
                 .and_then(|pane| self.pane_tails.get(pane))
-                .map(|tail| String::from_utf8_lossy(tail).into_owned())
+                .map(|tail| DiagnosticSource::Pane(Arc::clone(tail)))
         });
-        pane_tail.or_else(|| self.diagnostics.get(worktree).cloned())
+        pane_tail.or_else(|| {
+            self.diagnostics
+                .get(worktree)
+                .map(|text| DiagnosticSource::Manifest(text.clone()))
+        })
     }
 
+    /// Bounded diagnostic length of one pane's retained tail.
+    #[cfg(test)]
+    fn pane_tail_len(&self, pane_id: u32) -> usize {
+        self.pane_tails
+            .get(&pane_id)
+            .map_or(0, |tail| bounded_tail(&lock_tail(tail)).len())
+    }
+
+    /// Point the response snapshot at this worktree's current diagnostic
+    /// source. A pane source shares the live tail, so this only needs to run
+    /// when the selected candidate (or the manifest diagnostic) can change,
+    /// not on every output chunk.
     fn publish_diagnostic(&self, worktree: &str) {
+        #[cfg(test)]
+        self.publishes
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let snapshots = DIAGNOSTIC_SNAPSHOTS.get_or_init(|| Mutex::new(HashMap::new()));
         let Ok(mut snapshots) = snapshots.lock() else {
             return;
         };
-        match self.diagnostic(worktree) {
+        match self.diagnostic_source(worktree) {
             Some(diagnostic) => {
                 snapshots.insert(worktree.to_string(), diagnostic);
             }
@@ -569,7 +740,7 @@ mod tests {
         assert_eq!(view.port, 5173);
         assert_eq!(view.status, PreviewStatus::Seen);
         assert_eq!(view.source, thegn_core::preview::PortHintSource::PaneOutput);
-        assert!(sup.pane_tails[&7].len() <= DIAGNOSTIC_TAIL_BYTES);
+        assert!(sup.pane_tail_len(7) <= DIAGNOSTIC_TAIL_BYTES);
         assert!(sup.diagnostic("/repo").unwrap().contains("localhost:5173"));
 
         assert!(sup.pane_exit(7));
@@ -774,5 +945,182 @@ mod tests {
             ok: false
         }));
         assert!(sup.probe_requests("/repo").is_empty());
+    }
+
+    fn pane_ports(sup: &PreviewSupervisor) -> Vec<u16> {
+        sup.candidates
+            .iter()
+            .filter(|(_, candidate)| !candidate.panes.is_empty())
+            .map(|((_, port), _)| *port)
+            .collect::<Vec<_>>()
+    }
+
+    #[test]
+    fn url_split_across_two_chunks_is_found() {
+        let mut sup = PreviewSupervisor::new();
+        sup.set_enabled(true);
+        assert!(!sup.pane_output(3, "/repo", None, b"server at http://local", Some(80)));
+        assert!(sup.pane_output(3, "/repo", None, b"host:5173/ ready\n", Some(80)));
+        assert_eq!(pane_ports(&sup), vec![5173]);
+    }
+
+    #[test]
+    fn url_split_across_a_soft_wrap_is_found_with_a_full_tail() {
+        let mut sup = PreviewSupervisor::new();
+        sup.set_enabled(true);
+        // Fill the tail so the windowed parse (not the whole tail) is in play.
+        let mut filler = Vec::new();
+        while filler.len() < DIAGNOSTIC_TAIL_BYTES {
+            filler.extend_from_slice(b"compiling crate foo v1.2.3\r\n");
+        }
+        sup.pane_output(4, "/repo", None, &filler, Some(20));
+        // A 20-column row that ends exactly at the margin, then a separate
+        // chunk carrying the rest of the URL on the next visual row.
+        assert!(!sup.pane_output(4, "/repo", None, b"http://localhost:876\r\n", Some(20)));
+        assert!(sup.pane_output(4, "/repo", None, b"5/ ready\r\n", Some(20)));
+        assert_eq!(pane_ports(&sup), vec![8765]);
+    }
+
+    #[test]
+    fn port_digits_in_two_chunks_resolve_and_supersede_the_prefix() {
+        let mut sup = PreviewSupervisor::new();
+        sup.set_enabled(true);
+        // A trailing port stays incomplete until terminated.
+        assert!(!sup.pane_output(5, "/repo", None, b"http://localhost:87", Some(80)));
+        assert!(sup.view("/repo").is_none());
+        assert!(sup.pane_output(5, "/repo", None, b"65/\n", Some(80)));
+        assert_eq!(pane_ports(&sup), vec![8765]);
+
+        // An already-recorded prefix port is superseded by its extension.
+        let mut sup = PreviewSupervisor::new();
+        sup.set_enabled(true);
+        assert!(sup.pane_output(6, "/repo", None, b"http://localhost:87 \n", Some(80)));
+        assert_eq!(pane_ports(&sup), vec![87]);
+        // While the prefix is still inside the parse window both are distinct
+        // live ports, exactly as with a whole-tail parse; once it is older
+        // than the window, the extension supersedes it.
+        let logs = format!("{}\n", "w".repeat(60)).repeat(30);
+        assert!(!sup.pane_output(6, "/repo", None, logs.as_bytes(), Some(80)));
+        assert!(sup.pane_output(6, "/repo", None, b"http://localhost:8765/\n", Some(80)));
+        assert_eq!(pane_ports(&sup), vec![8765]);
+    }
+
+    #[test]
+    fn hint_older_than_the_window_is_retained() {
+        let mut sup = PreviewSupervisor::new();
+        sup.set_enabled(true);
+        assert!(sup.pane_output(8, "/repo", None, b"http://localhost:5173/\n", Some(80)));
+        for index in 0..200 {
+            let line = format!("log line {index:04} {}\n", "y".repeat(60));
+            sup.pane_output(8, "/repo", None, line.as_bytes(), Some(80));
+        }
+        assert!(sup.pane_tail_len(8) <= DIAGNOSTIC_TAIL_BYTES);
+        assert_eq!(pane_ports(&sup), vec![5173]);
+        assert_eq!(sup.view("/repo").unwrap().port, 5173);
+    }
+
+    #[test]
+    fn chunk_without_hint_change_does_not_publish() {
+        let mut sup = PreviewSupervisor::new();
+        sup.set_enabled(true);
+        assert!(sup.pane_output(10, "/repo", None, b"http://localhost:5173/\n", Some(80)));
+        let published = sup.publishes.load(std::sync::atomic::Ordering::Relaxed);
+        assert!(published >= 1);
+        // Spinner frames with no hint text.
+        for second in 0..50 {
+            let frame = format!("\r\u{280b} building\u{2026} {second}s");
+            assert!(!sup.pane_output(10, "/repo", None, frame.as_bytes(), Some(80)));
+        }
+        // A frame whose window still contains the unchanged URL is a no-op.
+        assert!(!sup.pane_output(10, "/repo", None, b"\r", Some(80)));
+        assert_eq!(
+            sup.publishes.load(std::sync::atomic::Ordering::Relaxed),
+            published
+        );
+        // The published diagnostic is the live tail, not a stale copy.
+        assert!(sup.diagnostic("/repo").unwrap().contains("49s"));
+    }
+
+    #[test]
+    fn tail_trim_is_amortized_but_the_view_stays_bounded() {
+        let mut sup = PreviewSupervisor::new();
+        sup.set_enabled(true);
+        let chunk = vec![b'z'; 4096];
+        for _ in 0..40 {
+            sup.pane_output(11, "/repo", None, &chunk, Some(80));
+            let retained = lock_tail(&sup.pane_tails[&11]).len();
+            assert!(retained <= TAIL_TRIM_THRESHOLD);
+            assert!(sup.pane_tail_len(11) <= DIAGNOSTIC_TAIL_BYTES);
+        }
+        assert_eq!(sup.pane_tail_len(11), DIAGNOSTIC_TAIL_BYTES);
+    }
+
+    #[test]
+    fn parse_window_start_table() {
+        // (tail, new_len, cols, expected start)
+        let long_prefix = format!("{}\nab", "p".repeat(3000));
+        let long_line = "q".repeat(MAX_LINE_LOOKBACK_BYTES + 100);
+        // A multibyte char straddling the overlap cut on a long line.
+        let wide_line = "\u{4e16}".repeat(MAX_LINE_LOOKBACK_BYTES);
+        let cases: [(&[u8], usize, Option<u16>, usize); 8] = [
+            // Empty tail and whole-tail chunks start at 0.
+            (b"", 0, None, 0),
+            (b"hello", 5, Some(80), 0),
+            // Short history: the overlap reaches the tail start.
+            (b"one\ntwo\nthree", 2, None, 0),
+            (b"one\ntwo\nthree", 2, Some(80), 0),
+            // Long history: start at the first line start inside the overlap
+            // before the new byte's line (`p...p\n` is 3001 bytes; the line
+            // holding `b` starts at 3001; the overlap cut is 1977 and the first
+            // line start at/after it is 3001 itself).
+            (long_prefix.as_bytes(), 1, None, 3001),
+            (long_prefix.as_bytes(), 1, Some(1600), 0),
+            // An unbroken line longer than the look-back starts one overlap
+            // before the new bytes.
+            (long_line.as_bytes(), 10, None, long_line.len() - 10 - 1024),
+            (
+                long_line.as_bytes(),
+                10,
+                Some(1000),
+                long_line.len() - 10 - 2000,
+            ),
+        ];
+        for (tail, new_len, cols, expected) in cases {
+            assert_eq!(
+                parse_window_start(tail, new_len, cols),
+                expected,
+                "tail len {} new {new_len} cols {cols:?}",
+                tail.len()
+            );
+        }
+        // Char boundary: the cut lands mid-char and moves forward to the next
+        // char start.
+        let wide = wide_line.as_bytes();
+        let start = parse_window_start(wide, 3, None);
+        assert!(wide_line.is_char_boundary(start));
+        assert!(start >= wide.len() - 3 - 1024);
+        assert!(start <= wide.len() - 3 - 1024 + 2);
+        // A new byte that is itself a line break keeps the previous line (a
+        // trailing port may still be incomplete there).
+        let tail = format!("{}\nhttp://localhost:87\n", "r".repeat(4000));
+        assert_eq!(parse_window_start(tail.as_bytes(), 1, None), 4001);
+        // The window never exceeds the diagnostic bound.
+        let huge = vec![b'x'; TAIL_TRIM_THRESHOLD];
+        assert_eq!(
+            parse_window_start(&huge, huge.len(), None),
+            huge.len() - DIAGNOSTIC_TAIL_BYTES
+        );
+    }
+
+    #[test]
+    fn ceil_char_boundary_skips_continuation_bytes_only() {
+        let text = "a\u{4e16}b".as_bytes();
+        assert_eq!(ceil_char_boundary(text, 0), 0);
+        assert_eq!(ceil_char_boundary(text, 2), 4);
+        assert_eq!(ceil_char_boundary(text, 3), 4);
+        assert_eq!(ceil_char_boundary(text, 4), 4);
+        assert_eq!(ceil_char_boundary(text, 99), text.len());
+        // Invalid runs of continuation bytes are bounded to three skips.
+        assert_eq!(ceil_char_boundary(&[0x80; 8], 0), 3);
     }
 }
