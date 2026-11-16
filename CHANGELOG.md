@@ -7,6 +7,25 @@ All notable changes to **thegn** are documented here. The format follows
 
 ## [Unreleased]
 
+### Added
+
+- The MCP server gains `sessions_resize` and `worktrees_open`, both needing the `write` scope. (THE-203)
+- `media.backend`, `notifications.sound.mode`, and `notifications.sound.always_kinds` are now Home Manager options. (THE-428)
+- `thegn plugin status` gains `skipped` and `deferred` columns for scheduler ticks that were skipped or pushed back. (THE-537)
+- On hybrid Linux CPUs, the CPU Frequency summary shows the mean frequency of the performance and efficiency cores. (THE-844)
+
+### Changed
+
+- The CPU usage panel's `io` and `st` rows now show the latest percent beside the sparkline. (THE-842)
+- Internal: a `run_consuming_streams` entry point and an `idle_output` limit on `thegn_proc`; strict and byte-exact git output helpers; control-byte tests for the git list parsers; per-drain budgets for worktree-creation, share, forward, and host UI events; and tests for each. (THE-729, THE-368, THE-383, THE-657)
+
+### Fixed
+
+- PTY open, attach, and resize now refuse sizes over 1000x1000 on every surface, instead of allocating a huge terminal grid.
+- When `thegn share` cannot verify a Tailscale teardown, it records the port as pending and tells you to retry with `thegn share stop <local port>`. (THE-330)
+- Worktree listings now fail with an error on a non-UTF-8 path instead of showing a replacement-character path. (THE-368, THE-376)
+- The VPS reaper re-reads its ledger before destroying an instance and keeps any record that changed in the meantime. (THE-529)
+
 ## [0.1.0-alpha.85] — 2026-11-15
 
 ### Added

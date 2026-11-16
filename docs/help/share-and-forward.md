@@ -53,6 +53,8 @@ so an interrupted stop stays `stopping` and stopping it again retries. The
 or `(needs teardown)` when a row needs recovery; `--json` carries a `recovery`
 field. A missing owner is treated as unverified, so a healthy host-supervised
 share or a pre-v101 row can also receive a recovery hint.
+When a Tailscale teardown cannot be verified, the port is kept as pending on the
+sidecar record and the error tells you to retry with `thegn share stop <local port>`.
 When thegn opens, a saved `starting` share whose `thegn share start` process has
 exited is recorded as `failed` (stop it to retry the teardown), and an `up`
 share thegn could not restart is recorded as `unknown`, which `thegn share list`
