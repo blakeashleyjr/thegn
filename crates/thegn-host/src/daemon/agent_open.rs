@@ -181,6 +181,8 @@ fn resolve_inner(
     // registries on the boot snapshot, and falls back to that snapshot when the
     // file no longer loads. An `[[agents]]` entry added after daemon start is
     // honoured without changing unrelated boot-fixed policy.
+    // The payload budget comes before any rendering or prompt-file write.
+    crate::agent_run::check_agent_payload(&launch.prompt).map_err(anyhow::Error::msg)?;
     let worktree = spec
         .worktree
         .clone()
@@ -211,6 +213,7 @@ fn resolve_inner(
     }
     let fresh =
         !launch.fork && launch.resume.as_deref().is_none_or(str::is_empty) && !launch.continue_last;
+    let mut prompt_file = None;
     let cmd = if launch.fork {
         let native_id = launch
             .native_session_id
@@ -247,7 +250,7 @@ fn resolve_inner(
             )?
         )
     } else {
-        command_for_with(
+        let rendered = command_for_with(
             cfg,
             agent,
             &launch.prompt,
@@ -257,7 +260,13 @@ fn resolve_inner(
             stage,
             &launch.permissions,
             launch.widen_permissions,
-        )?
+            Some(PromptFileHost {
+                db,
+                worktree: &worktree,
+            }),
+        )?;
+        prompt_file = rendered.prompt_file;
+        rendered.cmd
     };
 
     // A fresh launch whose native session id the daemon assigned
@@ -276,6 +285,16 @@ fn resolve_inner(
     // Agent context follows live Git HEAD (read by the caller); an unavailable
     // or detached HEAD intentionally supplies no branch context.
 
+    // THEGN_PROMPT carries the same bound as the queue runner's environment
+    // copies; a `{prompt_file}` launch keeps the prompt out of the environment
+    // entirely (the file is the transport), mirroring `agent_run::prompt_env`.
+    let env_prompt = (prompt_file.is_none() && !launch.prompt.is_empty()).then(|| {
+        thegn_core::agent_task::bound_text(
+            &launch.prompt,
+            crate::agent_run::MAX_RENDERED_COMMAND_BYTES,
+        )
+    });
+
     // The one call that does everything: sandbox preparation, bundle/identity
     // env, credential directories, build-cache mounts, the CPU cap, and the
     // `worktrees.agent` record.
@@ -289,13 +308,20 @@ fn resolve_inner(
         true,
         LaunchExtras {
             cmd_override: Some(&cmd),
-            prompt: Some(launch.prompt.as_str()).filter(|p| !p.is_empty()),
+            prompt: env_prompt.as_deref(),
             stage,
             permissions: &launch.permissions,
             widen_permissions: launch.widen_permissions,
             ..LaunchExtras::default()
         },
     )?;
+    // The launch is committed: the daemon-owned session outlives this call, so
+    // the prompt file stays until the age sweep in `prompt_file_dir` removes it.
+    // Any refusal above dropped the still-armed file instead.
+    if let Some(file) = prompt_file {
+        let path = file.persist();
+        tracing::debug!(target: "thegn::daemon", path = %path.display(), "prompt file handed to the session");
+    }
 
     if launch.bind_worktree {
         // Not just bookkeeping: this is what tells the sidebar's activity model
@@ -420,7 +446,57 @@ pub(crate) fn command_for(
         stage,
         &[],
         false,
+        None,
     )
+    .map(|rendered| rendered.cmd)
+}
+
+/// Where a fresh headless `{prompt_file}` launch may write its prompt file.
+struct PromptFileHost<'a> {
+    db: &'a Db,
+    worktree: &'a str,
+}
+
+/// A rendered launch command plus the (still armed) prompt file it names.
+struct RenderedCommand {
+    cmd: String,
+    prompt_file: Option<crate::agent_run::PromptFile>,
+}
+
+impl From<String> for RenderedCommand {
+    fn from(cmd: String) -> Self {
+        Self {
+            cmd,
+            prompt_file: None,
+        }
+    }
+}
+
+/// Refuse a `{prompt_file}` launch unless the worktree's effective placement is
+/// local: the same env resolution the launch itself goes through, so a file
+/// written here is one the agent can read.
+fn ensure_local_prompt_file_placement(cfg: &Config, db: &Db, worktree: &str) -> Result<()> {
+    let path = std::path::Path::new(worktree);
+    let location = thegn_core::remote::GitLoc::for_worktree_op(path, "prompt file")
+        .map_err(|error| anyhow::anyhow!("{{prompt_file}}: {error}"))?;
+    if location.is_remote() {
+        bail!(crate::agent_run::PROMPT_FILE_REMOTE_REFUSAL);
+    }
+    let repo_root = thegn_core::db::retry_transient(|| db.repo_root_for(worktree))
+        .context("{prompt_file}: this worktree's repository root could not be read")?
+        .filter(|root| !root.is_empty())
+        .map(std::path::PathBuf::from)
+        .or_else(|| thegn_core::repo::main_worktree(path))
+        .unwrap_or_else(|| path.to_path_buf());
+    let selected = thegn_core::db::retry_transient(|| {
+        db.effective_env_selection(worktree, &repo_root.to_string_lossy())
+    })
+    .context("{prompt_file}: this worktree's selected execution environment could not be read")?;
+    let environment = cfg.resolve_env(&repo_root, &location, path, &selected);
+    if environment.unresolved_selection || environment.is_remote() {
+        bail!(crate::agent_run::PROMPT_FILE_REMOTE_REFUSAL);
+    }
+    Ok(())
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -434,7 +510,8 @@ fn command_for_with(
     stage: Option<&str>,
     launch_permissions: &[String],
     widen_permissions: bool,
-) -> Result<String> {
+    prompt_file_host: Option<PromptFileHost<'_>>,
+) -> Result<RenderedCommand> {
     use thegn_core::agent_task::{TaskVars, effective_agent_with, substitute_command};
 
     // Resume takes precedence over the normal launch form: the id is untrusted
@@ -462,7 +539,8 @@ fn command_for_with(
             return Ok(format!(
                 "{cmd}{}",
                 session_grant_with(cfg, agent, stage, launch_permissions, widen_permissions,)?
-            ));
+            )
+            .into());
         }
         let cmd = harness
             .resume_command(id)
@@ -486,9 +564,9 @@ fn command_for_with(
         // A prompt alongside resume is handed over as an opening message, the
         // same way an interactive launch-with-task does.
         if prompt.trim().is_empty() {
-            return Ok(cmd);
+            return Ok(cmd.into());
         }
-        return Ok(format!("{cmd} {}", thegn_core::util::sh_quote(prompt)));
+        return Ok(format!("{cmd} {}", thegn_core::util::sh_quote(prompt)).into());
     }
 
     // The continue form is the transport-retry relaunch (THE-86): same shape
@@ -517,9 +595,9 @@ fn command_for_with(
             session_grant_with(cfg, agent, stage, launch_permissions, widen_permissions,)?
         );
         if prompt.trim().is_empty() {
-            return Ok(cmd);
+            return Ok(cmd.into());
         }
-        return Ok(format!("{cmd} {}", thegn_core::util::sh_quote(prompt)));
+        return Ok(format!("{cmd} {}", thegn_core::util::sh_quote(prompt)).into());
     }
 
     // The entry (or bare harness id) with the stage's model/env/permissions
@@ -528,6 +606,11 @@ fn command_for_with(
         .map_err(|e| anyhow::anyhow!("{e}"))?;
 
     if !headless {
+        if !prompt.trim().is_empty() && crate::agent_run::uses_prompt_file(&eff.command) {
+            bail!(
+                "agent `{agent}` takes its task by {{prompt_file}}: launch it headless to hand it a prompt"
+            );
+        }
         let cmd =
             thegn_core::agent_task::with_model(&eff.command, &eff.harness, eff.model.as_deref())
                 .map_err(|e| anyhow::anyhow!("{e}"))?;
@@ -541,17 +624,38 @@ fn command_for_with(
             eff.permission_args().map_err(|e| anyhow::anyhow!("{e}"))?
         );
         if prompt.trim().is_empty() {
-            return Ok(cmd);
+            return Ok(cmd.into());
         }
         // Interactive *with* a task: hand it over as a final argument, which is
         // how every agent CLI accepts an opening message.
-        return Ok(format!("{cmd} {}", thegn_core::util::sh_quote(prompt)));
+        return Ok(format!("{cmd} {}", thegn_core::util::sh_quote(prompt)).into());
     }
 
     let template = eff
         .headless_template()
         .map_err(|e| anyhow::anyhow!("no headless form for agent `{agent}`: {e}"))?;
+    if crate::agent_run::uses_prompt_file(&template) {
+        // A fresh headless `{prompt_file}` launch: the prompt rides an
+        // owner-only file under the local worktree's git dir instead of argv.
+        let host = prompt_file_host
+            .context("{prompt_file} needs a worktree-bound launch to hold the prompt file")?;
+        ensure_local_prompt_file_placement(cfg, host.db, host.worktree)?;
+        let file = crate::agent_run::write_session_prompt_file(host.worktree, prompt)
+            .map_err(anyhow::Error::msg)?;
+        let path = file
+            .path()
+            .to_str()
+            .context("{prompt_file}: prompt file path is not valid UTF-8")?
+            .to_owned();
+        let cmd = substitute_command(&template, prompt, &TaskVars::new().set("prompt_file", path))
+            .map_err(|e| anyhow::anyhow!("agent command template is invalid: {e}"))?;
+        return Ok(RenderedCommand {
+            cmd,
+            prompt_file: Some(file),
+        });
+    }
     substitute_command(&template, prompt, &TaskVars::new())
+        .map(RenderedCommand::from)
         .map_err(|e| anyhow::anyhow!("agent command template is invalid: {e}"))
 }
 
@@ -1545,5 +1649,249 @@ mod tests {
             Some("claude"),
             "the small prompt still binds the selected agent"
         );
+    }
+
+    /// A real git worktree on a `tg/` branch (signing off) for prompt-file tests.
+    #[expect(clippy::disallowed_methods, reason = "isolated Git fixture subprocess")]
+    fn prompt_file_worktree() -> tempfile::TempDir {
+        let dir = tempfile::tempdir().expect("isolated worktree");
+        let steps: [&[&str]; 2] = [
+            &["init", "-q", "-b", "tg/prompt-file"],
+            &[
+                "-c",
+                "commit.gpgsign=false",
+                "-c",
+                "user.name=thegn",
+                "-c",
+                "user.email=thegn@example.invalid",
+                "commit",
+                "-q",
+                "--allow-empty",
+                "-m",
+                "init",
+            ],
+        ];
+        for args in steps {
+            let out = thegn_core::util::git_cmd(dir.path())
+                .args(args)
+                .output()
+                .expect("git runs");
+            assert!(
+                out.status.success(),
+                "git {args:?}: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+        }
+        dir
+    }
+
+    fn prompt_file_fixture(
+        worktree: &std::path::Path,
+        prompt: String,
+    ) -> (Db, Config, OpenSpec, AgentLaunch) {
+        let db = Db::open_memory().expect("in-memory db");
+        let worktree_path = worktree.to_string_lossy().into_owned();
+        db.put_workspace(&worktree_path, "test", "dir")
+            .expect("register workspace");
+        db.put_worktree(
+            "test/tg/prompt-file",
+            &worktree_path,
+            &worktree_path,
+            "tg/prompt-file",
+            None,
+            None,
+        )
+        .expect("register worktree");
+        let mut config = Config {
+            sandbox: thegn_core::config::SandboxConfig {
+                enabled: false,
+                ..Default::default()
+            },
+            ..cfg()
+        };
+        config
+            .agents
+            .push(named("filer", "filer-agent --prompt-file {prompt_file}"));
+        let spec = OpenSpec {
+            cwd: Some(worktree_path.clone()),
+            worktree: Some(worktree_path),
+            ..OpenSpec::default()
+        };
+        let launch = AgentLaunch {
+            agent: "filer".into(),
+            prompt,
+            headless: Some(true),
+            bind_worktree: false,
+            resume: None,
+            continue_last: false,
+            stage: None,
+            permissions: Vec::new(),
+            widen_permissions: false,
+            fork: false,
+            native_session_id: None,
+        };
+        (db, config, spec, launch)
+    }
+
+    fn prompt_files(worktree: &std::path::Path) -> Vec<std::path::PathBuf> {
+        match std::fs::read_dir(worktree.join(".git/thegn-task")) {
+            Ok(entries) => entries
+                .map(|entry| entry.expect("task dir entry").path())
+                .collect(),
+            Err(_) => Vec::new(),
+        }
+    }
+
+    #[test]
+    fn headless_prompt_file_launch_persists_an_owner_only_file_and_no_env_copy() {
+        let _state = crate::testenv::IsolatedState::new();
+        let worktree = prompt_file_worktree();
+        let prompt = "SECRET-PROMPT-THE-1986".to_string();
+        let (db, config, spec, launch) = prompt_file_fixture(worktree.path(), prompt.clone());
+
+        let result = resolve(&config, &db, &spec, &launch, None);
+        if crate::agent_run::headless_unsupported().is_some() {
+            let message = format!("{:#}", result.err().expect("no prompt file off unix"));
+            assert!(message.contains("{prompt_file}"), "got {message}");
+            assert!(prompt_files(worktree.path()).is_empty());
+            return;
+        }
+        let resolved = result.expect("prompt-file launch resolves");
+        let files = prompt_files(worktree.path());
+        assert_eq!(files.len(), 1, "exactly one prompt file: {files:?}");
+        let path = &files[0];
+        assert_eq!(std::fs::read_to_string(path).expect("read prompt"), prompt);
+        if let Some(mode) = thegn_core::fsperm::mode_bits(path).expect("prompt file mode") {
+            assert_eq!(mode, 0o600, "prompt file must be owner-only");
+        }
+        let argv = resolved.argv.join(" ");
+        assert!(
+            argv.contains(path.to_str().expect("utf-8 path")),
+            "the command names the prompt file: {argv}"
+        );
+        assert!(
+            !argv.contains(&prompt),
+            "a prompt-file launch keeps the prompt out of argv: {argv}"
+        );
+        assert!(
+            resolved.env.iter().all(|(key, _)| key != "THEGN_PROMPT"),
+            "a prompt-file launch keeps the prompt out of the environment"
+        );
+        assert!(
+            resolved
+                .env
+                .iter()
+                .all(|(_, value)| !value.contains(&prompt)),
+            "no environment value carries the prompt"
+        );
+    }
+
+    #[test]
+    fn oversized_payload_is_refused_before_any_prompt_file_write() {
+        let _state = crate::testenv::IsolatedState::new();
+        let worktree = prompt_file_worktree();
+        let prompt = "x".repeat(2 * 1024 * 1024);
+        let (db, config, spec, launch) = prompt_file_fixture(worktree.path(), prompt);
+
+        let message = match resolve(&config, &db, &spec, &launch, None) {
+            Ok(_) => panic!("a 2 MiB payload must be refused"),
+            Err(error) => format!("{error:#}"),
+        };
+        assert!(
+            message.contains(&format!(
+                "{} bytes, over the {} byte payload limit",
+                2 * 1024 * 1024,
+                crate::agent_run::MAX_AGENT_PAYLOAD_BYTES
+            )),
+            "the refusal names both sizes: {message}"
+        );
+        assert!(
+            prompt_files(worktree.path()).is_empty(),
+            "no prompt file is written for a refused payload"
+        );
+    }
+
+    #[test]
+    fn prompt_file_template_without_a_worktree_host_is_refused() {
+        let mut config = cfg();
+        config
+            .agents
+            .push(named("filer", "filer-agent --prompt-file {prompt_file}"));
+        let message = format!(
+            "{:#}",
+            command_for(&config, "filer", "do it", true, None, false, None)
+                .expect_err("no host to hold the prompt file")
+        );
+        assert!(message.contains("{prompt_file}"), "got {message}");
+    }
+
+    #[test]
+    fn interactive_prompt_to_a_prompt_file_template_is_refused() {
+        let mut config = cfg();
+        config
+            .agents
+            .push(named("filer", "filer-agent --prompt-file {prompt_file}"));
+        let message = format!(
+            "{:#}",
+            command_for(&config, "filer", "do it", false, None, false, None)
+                .expect_err("an interactive open cannot fill {prompt_file}")
+        );
+        assert!(message.contains("{prompt_file}"), "got {message}");
+    }
+
+    #[test]
+    fn env_prompt_copy_is_bounded_like_the_queue_runner() {
+        // A fork does not render the prompt into argv, so the THEGN_PROMPT
+        // copy is the only place a large (under-budget) prompt lands.
+        let worktree = tempfile::tempdir().expect("isolated worktree");
+        let _state = crate::testenv::IsolatedState::new();
+        let mut c = cfg();
+        c.sandbox.enabled = false;
+        c.agents.push(thegn_core::config::NamedCommand {
+            provider: Some("codex".into()),
+            ..named("worker", "codex")
+        });
+        let db = Db::open_memory().expect("in-memory db");
+        let spec = OpenSpec {
+            cwd: Some(worktree.path().to_string_lossy().into_owned()),
+            worktree: Some(worktree.path().to_string_lossy().into_owned()),
+            ..Default::default()
+        };
+        let limit = crate::agent_run::MAX_RENDERED_COMMAND_BYTES;
+        let launch = AgentLaunch {
+            agent: "worker".into(),
+            prompt: "y".repeat(limit * 3),
+            headless: Some(false),
+            bind_worktree: false,
+            resume: None,
+            continue_last: false,
+            stage: None,
+            permissions: Vec::new(),
+            widen_permissions: false,
+            fork: true,
+            native_session_id: Some("native-codex".into()),
+        };
+        let resolved = resolve_fork(
+            &c,
+            &db,
+            &spec,
+            &launch,
+            "codex",
+            "source-harness-command --native native-codex",
+            None,
+        )
+        .expect("fork resolves");
+        let copy = resolved
+            .env
+            .iter()
+            .find(|(key, _)| key == "THEGN_PROMPT")
+            .map(|(_, value)| value)
+            .expect("the prompt is still exported");
+        assert!(
+            copy.len() <= limit,
+            "THEGN_PROMPT is bounded: {} > {limit}",
+            copy.len()
+        );
+        assert!(copy.contains("task data omitted"));
     }
 }
