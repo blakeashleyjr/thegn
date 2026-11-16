@@ -399,7 +399,9 @@ for the first request, then use its cached log instead of starting another
 provider call. With caching off, a waiting caller fetches after the first
 request finishes. A wait that reaches 120 seconds is refused as unavailable
 (HTTP 503 or gRPC `unavailable`) with a message asking you to retry shortly.
-Different jobs do not wait on one another.
+Different jobs do not wait on one another. The daemon also runs at most two
+provider log fetches at once; a cache-missing request waits up to 30 seconds
+for a slot and is then refused as busy (`unavailable`).
 
 When a GitLab job list reaches its page, row, byte or time budget (one minute
 for the whole run detail), `thegn ci view` and `ci logs` warn that the list is
