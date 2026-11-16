@@ -70,14 +70,6 @@ const OMITTED: &[(&str, &str)] = &[
         "disk.shared_target_dir",
         "path-valued shared target directory is deliberately opt-in and is not exposed",
     ),
-    (
-        "notifications.agent_error_signatures",
-        "bounded validated signature list is not exposed",
-    ),
-    (
-        "notifications.priority",
-        "per-kind priority map is not exposed",
-    ),
     ("notifications.rules", "routing rules are not exposed"),
     (
         "notifications.sound.command",
@@ -88,10 +80,6 @@ const OMITTED: &[(&str, &str)] = &[
         "per-priority map holds legacy command-mode shell commands (executable-bearing) and is not exposed yet",
     ),
     ("notifications.modes", "notification modes are not exposed"),
-    (
-        "notifications.active_mode",
-        "active mode selection is not exposed",
-    ),
     (
         "notifications.push",
         "push sinks carry credentials and are not exposed",
@@ -1154,13 +1142,17 @@ fn hm_notifications_and_activity_families_are_rendered() {
         assert!(rendered.contains(path), "Home Manager must render {path}");
     }
     for path in [
-        "notifications.agent_error_signatures",
         "notifications.priority",
+        "notifications.active_mode",
+        "notifications.agent_error_signatures",
+    ] {
+        assert!(rendered.contains(path), "Home Manager must render {path}");
+    }
+    for path in [
         "notifications.rules",
         "notifications.sound.command",
         "notifications.sound.per_priority",
         "notifications.modes",
-        "notifications.active_mode",
         "notifications.push",
     ] {
         assert!(schema_has_path(path), "omission must stay pinned: {path}");
