@@ -10,6 +10,7 @@
 //! the default when no subcommand is given.
 
 pub mod agent;
+pub mod agent_spawn;
 pub mod api;
 pub mod attach;
 pub mod automations;
