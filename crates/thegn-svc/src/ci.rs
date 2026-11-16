@@ -33,6 +33,26 @@ use std::time::{Duration, Instant};
 /// are applied again by the cache-facing read paths).
 pub(crate) const PROVIDER_LOG_MAX_LINES: usize = 2_000;
 pub(crate) const PROVIDER_LOG_MAX_BYTES: usize = 1024 * 1024;
+
+/// Bytes one `LogCollector` retains between `feed` calls (what `held_bytes`
+/// measures). Terms, from `feed`:
+/// - retained lines: `push_log_line` evicts until `kept_bytes <=
+///   PROVIDER_LOG_MAX_BYTES`, and an unmatched-END redaction rewrites each of
+///   at most `PROVIDER_LOG_MAX_LINES` lines to the marker plus its line ending,
+///   which is still under that cap;
+/// - the partial line `line`: `feed` clears it once it reaches
+///   `PROVIDER_LOG_MAX_BYTES`;
+/// - the PEM marker tail: at most `"-----BEGIN ".len()` bytes.
+///
+/// Not included: the transient working set while one completed line (at most
+/// `PROVIDER_LOG_MAX_BYTES` of input) is redacted and pushed. `ci_log::redact`
+/// builds intermediate strings and can expand matched secrets, so that working
+/// set is a small multiple of one line and is freed before `feed` returns.
+/// `finish` returns the retained lines only, so its text is at most
+/// `PROVIDER_LOG_MAX_BYTES`.
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) const LOG_COLLECTOR_PEAK_BYTES: usize =
+    2 * PROVIDER_LOG_MAX_BYTES + b"-----BEGIN ".len();
 const GITLAB_JOBS_PAGE_SIZE: usize = 100;
 const GITLAB_JOBS_MAX_PAGES: usize = 50;
 const GITLAB_JOBS_MAX_ROWS: usize = GITLAB_JOBS_PAGE_SIZE * GITLAB_JOBS_MAX_PAGES;
@@ -879,6 +899,12 @@ impl LogCollector {
             unmatched_end_redacted: false,
             marker_tail: Vec::with_capacity(b"-----BEGIN ".len()),
         }
+    }
+
+    /// Bytes currently held: retained lines, the partial line and the marker tail.
+    #[cfg(test)]
+    fn held_bytes(&self) -> usize {
+        self.lines.iter().map(String::len).sum::<usize>() + self.line.len() + self.marker_tail.len()
     }
 
     fn redact_retained_lines_once(&mut self) {
@@ -3205,6 +3231,84 @@ mod tests {
         assert!(matches!(result, Err(CiError::Other(message)) if message
                 .strip_prefix("CI provider command failed: ")
                 .is_some_and(|detail| !detail.is_empty())));
+    }
+
+    /// Fixed-seed LCG so adversarial chunking is reproducible without a dependency.
+    struct Lcg(u64);
+    impl Lcg {
+        fn next(&mut self) -> u64 {
+            self.0 = self
+                .0
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            self.0 >> 33
+        }
+    }
+
+    fn feed_chunked_checked(input: &[u8], seed: u64) -> String {
+        let mut rng = Lcg(seed);
+        let mut collector = LogCollector::new();
+        let mut rest = input;
+        while !rest.is_empty() {
+            let take = (1 + (rng.next() as usize) % 70_000).min(rest.len());
+            let (chunk, tail) = rest.split_at(take);
+            collector.feed(chunk);
+            assert!(
+                collector.held_bytes() <= LOG_COLLECTOR_PEAK_BYTES,
+                "held {} > peak {}",
+                collector.held_bytes(),
+                LOG_COLLECTOR_PEAK_BYTES
+            );
+            rest = tail;
+        }
+        let (text, _truncated) = collector.finish();
+        let allowance = thegn_core::ci_log::REDACTION_MARKER.len() + 2;
+        assert!(
+            text.len() <= PROVIDER_LOG_MAX_BYTES + allowance,
+            "finished text {} too large",
+            text.len()
+        );
+        text
+    }
+
+    #[test]
+    fn collector_peak_holds_for_many_max_length_lines() {
+        let mut line = vec![b'a'; PROVIDER_LOG_MAX_BYTES - 1];
+        line.push(b'\n');
+        let input: Vec<u8> = line.repeat(6);
+        assert!(input.len() > PROVIDER_LOG_MAX_BYTES * 5);
+        feed_chunked_checked(&input, 1);
+    }
+
+    #[test]
+    fn collector_peak_holds_for_ten_mib_line_without_newline() {
+        let input = vec![b'z'; 10 * 1024 * 1024];
+        feed_chunked_checked(&input, 2);
+    }
+
+    #[test]
+    fn collector_peak_holds_for_alternating_pem_markers() {
+        let unit = concat!("-----BEGIN ", "KEY-----\nabc\n", "-----END ", "KEY-----\n");
+        let input = unit.repeat(PROVIDER_LOG_MAX_LINES * 2);
+        assert!(input.lines().count() > PROVIDER_LOG_MAX_LINES);
+        feed_chunked_checked(input.as_bytes(), 3);
+    }
+
+    #[test]
+    fn collector_peak_holds_for_end_without_begin_after_many_lines() {
+        let mut input = "\n".repeat(PROVIDER_LOG_MAX_LINES - 1);
+        input.push_str(concat!("-----END ", "KEY-----\n"));
+        input.push_str(&"tail line\n".repeat(PROVIDER_LOG_MAX_LINES));
+        feed_chunked_checked(input.as_bytes(), 4);
+    }
+
+    #[test]
+    fn collector_peak_holds_for_crlf_lines() {
+        let mut input = b"crlf line of text\r\n".repeat(PROVIDER_LOG_MAX_LINES * 3);
+        let mut line = vec![b'c'; PROVIDER_LOG_MAX_BYTES / 2];
+        line.extend_from_slice(b"\r\n");
+        input.extend_from_slice(&line.repeat(5));
+        feed_chunked_checked(&input, 5);
     }
 
     #[test]
