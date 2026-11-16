@@ -966,3 +966,31 @@ fn per_device_mirrored_read_write_histories_reach_the_right_inner_column() {
         assert_ne!(cell.str(), " ");
     }
 }
+
+#[test]
+fn physical_device_rows_paint_read_write_minicores_and_degrade_when_narrow() {
+    let mut model = DiskModel::default();
+    let mut frame = frame_fixture();
+    for tick in 0_u16..32 {
+        for (index, device) in frame.parts.diskstats.devices.iter_mut().enumerate() {
+            device.read_bps = Some(1_000_000.0 + f64::from(tick) * (index as f64 + 1.0));
+            device.write_bps = Some(200_000.0 + f64::from(tick) * (index as f64 + 2.0));
+        }
+        model.absorb_frame(&frame);
+    }
+    let (surface, placed, _) = render(&model, 240, 60);
+    let devices = placed
+        .iter()
+        .find(|panel| panel.id == PanelId("disk.devices"))
+        .expect("device panel placed");
+    let lines = surface.screen_lines();
+    let row_text: String = lines[devices.rect.y + 3]
+        .visible_cells()
+        .map(|cell| cell.str().to_owned())
+        .collect();
+    assert!(row_text.contains("rd "), "read minicore row: {row_text:?}");
+    assert!(row_text.contains("wr "), "write minicore row: {row_text:?}");
+    for cols in [20_usize, 40, 60, 80] {
+        drop(render(&model, cols, 30));
+    }
+}
