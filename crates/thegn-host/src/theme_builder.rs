@@ -1621,8 +1621,8 @@ mod tests {
             let layout = layout_for(inner);
             assert!(layout.apply.rows > 0);
             for rect in [layout.catalog, layout.editor, layout.preview, layout.apply] {
-                assert!(rect.y + rect.rows <= outer.y + outer.rows - 1, "{screen:?}");
-                assert!(rect.x + rect.cols <= outer.x + outer.cols - 1, "{screen:?}");
+                assert!(rect.y + rect.rows < outer.y + outer.rows, "{screen:?}");
+                assert!(rect.x + rect.cols < outer.x + outer.cols, "{screen:?}");
             }
             assert!(layout.editor.y + layout.editor.rows <= layout.apply.y);
 
