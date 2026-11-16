@@ -625,6 +625,38 @@ fn provider_target(
     Ok((provider, id, workdir))
 }
 
+/// The explicit merge target for the repo whose main checkout is `repo_root`,
+/// resolved as [`pull_back`] does (per-repo workspace overlay over the global
+/// `merge_queue.target_branch`). `refs/heads/` is stripped; `auto`/empty is
+/// `None` so the sandbox mount plan falls back to the default-branch rule.
+fn explicit_merge_target(cfg: &Config, repo_root: &Path) -> Option<String> {
+    let target = cfg.repo_merge_queue(repo_root).target_branch;
+    let target = target.trim();
+    let target = target.strip_prefix("refs/heads/").unwrap_or(target);
+    (!target.is_empty() && target != "auto").then(|| target.to_string())
+}
+
+/// The `[sandbox.git]` merge-target lookup for this process. Reads the
+/// currently published admitted config (hot reloads included) and falls back
+/// to `boot` when the process has no admission store. Non-blocking: a short
+/// store lock plus a lexical overlay match, no file or DB I/O.
+pub(crate) fn merge_target_lookup(boot: &Config) -> thegn_core::sandbox::MergeTargetLookup {
+    let snapshot = boot.clone();
+    Box::new(move |repo_root: &Path| {
+        let current = crate::config_startup::display();
+        let cfg = current
+            .as_deref()
+            .map_or(&snapshot, |admitted| admitted.config());
+        explicit_merge_target(cfg, repo_root)
+    })
+}
+
+/// Register [`merge_target_lookup`] with core once, at process start, so every
+/// entry point that resolves sandboxes protects an explicit merge target.
+pub(crate) fn install_merge_target_lookup(boot: &Config) {
+    thegn_core::sandbox::set_merge_target_lookup(merge_target_lookup(boot));
+}
+
 /// Fetch the commits made inside the worktree's provider sandbox back into its
 /// branch (fast-forward only). The caller has already established that the
 /// worktree's env is a provider env named `env_name`.
@@ -780,6 +812,40 @@ mod tests {
     use thegn_core::config::{SandboxGitConfig, SandboxGitMode};
 
     const A: &str = "1111111111111111111111111111111111111111";
+
+    #[test]
+    fn merge_target_lookup_returns_the_per_repo_target() {
+        use thegn_core::config::{
+            Config, MergeQueueConfig, MergeQueueOverlay, WorkspaceConfig, workspace_slug,
+        };
+        let dir = std::env::temp_dir().join(format!("thegn-mtl-{}", std::process::id()));
+        let repo = dir.join("Repo");
+        let other = dir.join("Other");
+        std::fs::create_dir_all(&repo).unwrap();
+        std::fs::create_dir_all(&other).unwrap();
+        let mut cfg = Config {
+            merge_queue: MergeQueueConfig {
+                target_branch: "auto".into(),
+                ..MergeQueueConfig::default()
+            },
+            ..Config::default()
+        };
+        cfg.workspace.insert(
+            workspace_slug(&repo),
+            WorkspaceConfig {
+                merge_queue: MergeQueueOverlay {
+                    target_branch: Some("refs/heads/tg/b139-integration".into()),
+                    ..MergeQueueOverlay::default()
+                },
+                ..WorkspaceConfig::default()
+            },
+        );
+        let lookup = super::merge_target_lookup(&cfg);
+        assert_eq!(lookup(&repo).as_deref(), Some("tg/b139-integration"));
+        // `auto` defers to the default-branch rule.
+        assert_eq!(lookup(&other), None);
+        let _ = std::fs::remove_dir_all(&dir); // best-effort: temp cleanup
+    }
 
     #[test]
     fn protected_branches_are_never_pull_targets() {
