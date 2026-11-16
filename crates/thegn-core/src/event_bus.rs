@@ -41,10 +41,16 @@ impl NotificationUrgency {
     /// Parse an urgency from a config string (`"low"`, `"normal"`, `"critical"`).
     /// Unknown values fall back to `Normal`.
     pub fn parse(s: &str) -> Self {
+        Self::parse_known(s).unwrap_or(Self::Normal)
+    }
+
+    /// Parse an urgency, case-insensitively; `None` for an unknown value.
+    pub fn parse_known(s: &str) -> Option<Self> {
         match s.to_ascii_lowercase().as_str() {
-            "low" => Self::Low,
-            "critical" => Self::Critical,
-            _ => Self::Normal,
+            "low" => Some(Self::Low),
+            "normal" => Some(Self::Normal),
+            "critical" => Some(Self::Critical),
+            _ => None,
         }
     }
 
@@ -119,11 +125,17 @@ impl ProcessExitPolicy {
     /// Parse the config string; unknown values fall back to the default
     /// `FailuresAndTasks`.
     pub fn parse(s: &str) -> Self {
+        Self::parse_known(s).unwrap_or(Self::FailuresAndTasks)
+    }
+
+    /// Parse the config string, case-insensitively; `None` for an unknown value.
+    pub fn parse_known(s: &str) -> Option<Self> {
         match s.to_ascii_lowercase().as_str() {
-            "off" => Self::Off,
-            "failures" | "failures_only" => Self::FailuresOnly,
-            "all" => Self::All,
-            _ => Self::FailuresAndTasks,
+            "off" => Some(Self::Off),
+            "failures" | "failures_only" => Some(Self::FailuresOnly),
+            "failures_and_tasks" => Some(Self::FailuresAndTasks),
+            "all" => Some(Self::All),
+            _ => None,
         }
     }
 }
@@ -556,6 +568,52 @@ impl Default for EventBus {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn parse_known_accepts_documented_values_and_rejects_others() {
+        assert_eq!(
+            NotificationUrgency::parse_known("LOW"),
+            Some(NotificationUrgency::Low)
+        );
+        assert_eq!(
+            NotificationUrgency::parse_known("Normal"),
+            Some(NotificationUrgency::Normal)
+        );
+        assert_eq!(
+            NotificationUrgency::parse_known("critical"),
+            Some(NotificationUrgency::Critical)
+        );
+        assert_eq!(NotificationUrgency::parse_known("urgent"), None);
+        assert_eq!(
+            NotificationUrgency::parse("urgent"),
+            NotificationUrgency::Normal
+        );
+        assert_eq!(
+            ProcessExitPolicy::parse_known("off"),
+            Some(ProcessExitPolicy::Off)
+        );
+        assert_eq!(
+            ProcessExitPolicy::parse_known("Failures"),
+            Some(ProcessExitPolicy::FailuresOnly)
+        );
+        assert_eq!(
+            ProcessExitPolicy::parse_known("failures_only"),
+            Some(ProcessExitPolicy::FailuresOnly)
+        );
+        assert_eq!(
+            ProcessExitPolicy::parse_known("FAILURES_AND_TASKS"),
+            Some(ProcessExitPolicy::FailuresAndTasks)
+        );
+        assert_eq!(
+            ProcessExitPolicy::parse_known("ALL"),
+            Some(ProcessExitPolicy::All)
+        );
+        assert_eq!(ProcessExitPolicy::parse_known("sometimes"), None);
+        assert_eq!(
+            ProcessExitPolicy::parse("sometimes"),
+            ProcessExitPolicy::FailuresAndTasks
+        );
+    }
 
     #[test]
     fn event_worktree_extraction() {

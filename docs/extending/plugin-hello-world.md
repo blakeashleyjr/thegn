@@ -30,7 +30,7 @@ the manifest and the command does not need a `../` path.
 id = "hello-world"
 name = "Hello world"
 version = "0.1.0"
-api = "0.5.0"
+api = "0.6.0"
 capabilities = ["surface:statusbar"]
 command = ["sh", "hello.sh"]
 mode = "one_shot"

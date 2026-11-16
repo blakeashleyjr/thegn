@@ -297,6 +297,7 @@ until its scope is granted.
 | `leases_list`               | `read`        | relay lease state per session                                          |
 | `me`                        | `read`        | the caller's pairing id, label, granted scopes                         |
 | `sessions_wait`             | `read`        | block until a session reaches a state (exited/idle/blocked/done/regex) |
+| `sessions_snapshot`         | `read`        | a live session's current emulator screen (`session`)                   |
 | `semantic_map`              | `read`        | ranked, budgeted repo map of a worktree's indexed entities             |
 | `semantic_blast_radius`     | `read`        | a worktree's blast-radius: changed entities, callers, untested, risk   |
 | `git_status`                | `read`        | list changed files in a worktree                                       |
@@ -312,6 +313,7 @@ until its scope is granted.
 | `sessions_open`             | `write`       | open a session — raw `argv`, or a configured agent by name             |
 | `sessions_kill`             | `write`       | kill a session's process (idempotent)                                  |
 | `sessions_resize`           | `write`       | resize a live session's PTY (`session`, `rows`, `cols`)                |
+| `sessions_split`            | `write`       | split a session: sibling pane (`session`, `dir`, `argv`, `cwd`, `env`) |
 | `worktrees_open`            | `write`       | focus a workspace in the running instance (`repo`, optional `branch`)  |
 | `sessions_input`            | `write` **+** | send raw terminal input/control characters to a live session           |
 
@@ -337,10 +339,10 @@ launch environment values are replaced by a size descriptor, never logged
 verbatim.
 
 Every tool in `tools/list` carries MCP `annotations`: the docs tools and the
-`read`-scope state tools are `readOnlyHint: true`; `sessions_kill`,
+`read`-scope state tools (including `sessions_snapshot`) are `readOnlyHint: true`; `sessions_kill`,
 `sessions_input` and `tools_run` are `destructiveHint: true`; `folders_assign`,
 `editor_open`, `merge_add`, `notify_push`, `sessions_open`, `sessions_fork`,
-`sessions_resize` and `worktrees_open` are write tools marked `destructiveHint: false`. A new write tool is marked destructive until it is
+`sessions_resize`, `sessions_split` and `worktrees_open` are write tools marked `destructiveHint: false`. A new write tool is marked destructive until it is
 reviewed. The hints help clients ask before acting; the scopes above are what
 thegn enforces.
 

@@ -750,19 +750,21 @@ impl GitLoc {
     }
 
     fn resolve_git_common_dir(&self) -> std::io::Result<PathBuf> {
-        let common_dir = self
-            .git_text(&["rev-parse", "--git-common-dir"])
-            .map_err(|error| {
-                std::io::Error::other(format!("git rev-parse --git-common-dir failed: {error}"))
-            })?;
-        if common_dir.is_empty() {
-            return Err(std::io::Error::other(
-                "git rev-parse --git-common-dir returned no path",
-            ));
-        }
-        let common_dir = Path::new(&common_dir);
+        let common_dir = match self.git_out_path(&["rev-parse", "--git-common-dir"]) {
+            Ok(path) => path,
+            Err(util::GitPathError::Empty) => {
+                return Err(std::io::Error::other(
+                    "git rev-parse --git-common-dir returned no path",
+                ));
+            }
+            Err(error) => {
+                return Err(std::io::Error::other(format!(
+                    "git rev-parse --git-common-dir failed: {error}"
+                )));
+            }
+        };
         Ok(if common_dir.is_absolute() {
-            common_dir.to_path_buf()
+            common_dir
         } else {
             Path::new(&self.path()).join(common_dir)
         })
@@ -1128,13 +1130,45 @@ impl GitLoc {
     /// success is `Ok("")`, while command and decoding failures remain typed.
     pub fn git_text(&self, args: &[&str]) -> Result<String, crate::git_run::GitTextError> {
         let cancel = std::sync::atomic::AtomicBool::new(false);
+        self.git_text_cancellable(args, &cancel)
+    }
+
+    /// [`Self::git_text`] that also observes `cancel`: a set flag stops the
+    /// command and reports [`crate::git_run::GitOutcome::Cancelled`].
+    pub fn git_text_cancellable(
+        &self,
+        args: &[&str],
+        cancel: &std::sync::atomic::AtomicBool,
+    ) -> Result<String, crate::git_run::GitTextError> {
         self.git_run(
             args,
             &crate::git_run::GitPolicy::read(GITLOC_READ_DEADLINE),
-            &cancel,
+            cancel,
         )
         .into_text()
         .map(|text| text.trim().to_string())
+    }
+
+    /// Run a git command that prints exactly one path and return it without
+    /// trimming beyond the single line terminator. A local location reads the
+    /// bytes losslessly ([`util::git_out_path`]); a remote or provider path
+    /// must be UTF-8, because it is passed back over the transport as text.
+    pub fn git_out_path(&self, args: &[&str]) -> Result<PathBuf, util::GitPathError> {
+        match self {
+            GitLoc::Local(p) => util::git_out_path(p, args),
+            _ => {
+                let cancel = std::sync::atomic::AtomicBool::new(false);
+                match self.git_run(
+                    args,
+                    &crate::git_run::GitPolicy::read(GITLOC_READ_DEADLINE),
+                    &cancel,
+                ) {
+                    crate::git_run::GitOutcome::Ok(bytes) => remote_path_from_bytes(&bytes),
+                    crate::git_run::GitOutcome::EmptyOk => Err(util::GitPathError::Empty),
+                    other => Err(util::GitPathError::Git(other)),
+                }
+            }
+        }
     }
 
     /// `git remote get-url origin`, trimmed; `None` when unset or unreadable.
@@ -1145,22 +1179,48 @@ impl GitLoc {
         const ARGS: &[&str] = &["remote", "get-url", "origin"];
         match self {
             GitLoc::Local(p) => crate::git_memo::origin_url(p, || {
-                crate::util::note_core_git_spawn();
-                match self.git_command(ARGS).output() {
-                    // Could not even spawn git: transient, never memoised.
-                    Err(_) => (None, false),
-                    Ok(out) => {
-                        let url = String::from_utf8_lossy(&out.stdout).trim().to_string();
-                        (
-                            (out.status.success() && !url.is_empty()).then_some(url),
-                            true,
-                        )
-                    }
-                }
+                let cancel = std::sync::atomic::AtomicBool::new(false);
+                origin_url_from_outcome(self.git_run(
+                    ARGS,
+                    &crate::git_run::GitPolicy::read(GITLOC_READ_DEADLINE),
+                    &cancel,
+                ))
             }),
             _ => self.git_out(ARGS),
         }
     }
+}
+
+/// Map a bounded `git remote get-url origin` outcome to the memo contract of
+/// [`crate::git_memo::origin_url`]: `(url, cacheable)`. A spawn, supervision,
+/// timeout or cancellation failure is transient and never memoised, so the
+/// next call retries; a git answer (including "no such remote") is memoised.
+fn origin_url_from_outcome(outcome: crate::git_run::GitOutcome) -> (Option<String>, bool) {
+    use crate::git_run::GitOutcome;
+    match outcome {
+        GitOutcome::Ok(bytes) => {
+            let url = String::from_utf8_lossy(&bytes).trim().to_string();
+            ((!url.is_empty()).then_some(url), true)
+        }
+        GitOutcome::Spawn(_)
+        | GitOutcome::Supervise(_)
+        | GitOutcome::Timeout
+        | GitOutcome::Cancelled => (None, false),
+        GitOutcome::EmptyOk
+        | GitOutcome::EmptyRefused
+        | GitOutcome::Exit { .. }
+        | GitOutcome::OutputLimit(_) => (None, true),
+    }
+}
+
+/// Decode one path printed by git on a remote or provider location: exactly
+/// one line terminator is stripped, and the rest must be valid UTF-8 because
+/// it is passed back over the transport as text.
+fn remote_path_from_bytes(bytes: &[u8]) -> Result<PathBuf, util::GitPathError> {
+    let body = util::path_bytes_from_output(bytes)?;
+    std::str::from_utf8(body)
+        .map(PathBuf::from)
+        .map_err(|_| util::GitPathError::UnsupportedRemotePath)
 }
 
 fn checked_ssh_destination(host: &str) -> Result<&str, String> {
@@ -2426,5 +2486,158 @@ mod tests {
         let error = loc.resolve_git_common_dir().unwrap_err();
         assert!(error.to_string().contains("git rev-parse --git-common-dir"));
         assert!(error.to_string().contains("Git"));
+    }
+
+    fn init_gitloc_fixture(path: &std::path::Path) {
+        std::fs::create_dir_all(path).unwrap();
+        assert!(
+            util::git_cmd(path)
+                .args(["-c", "commit.gpgsign=false", "init", "-q"])
+                .status()
+                .unwrap()
+                .success()
+        );
+    }
+
+    #[test]
+    fn git_text_cancellable_observes_a_preset_cancel() {
+        let dir = tempfile::tempdir().unwrap();
+        init_gitloc_fixture(dir.path());
+        let loc = GitLoc::Local(dir.path().to_path_buf());
+        let cancelled = std::sync::atomic::AtomicBool::new(true);
+        assert!(matches!(
+            loc.git_text_cancellable(&["rev-parse", "--git-dir"], &cancelled),
+            Err(crate::git_run::GitTextError::Failed(
+                crate::git_run::GitOutcome::Cancelled
+            ))
+        ));
+        let live = std::sync::atomic::AtomicBool::new(false);
+        assert_eq!(
+            loc.git_text_cancellable(&["rev-parse", "--git-dir"], &live)
+                .unwrap(),
+            ".git"
+        );
+    }
+
+    #[test]
+    fn local_origin_url_is_deadline_bounded() {
+        let with_origin = tempfile::tempdir().unwrap();
+        init_gitloc_fixture(with_origin.path());
+        assert!(
+            util::git_cmd(with_origin.path())
+                .args([
+                    "remote",
+                    "add",
+                    "origin",
+                    "https://example.invalid/thegn-538.git"
+                ])
+                .status()
+                .unwrap()
+                .success()
+        );
+        let loc = GitLoc::Local(with_origin.path().to_path_buf());
+        assert_eq!(
+            loc.origin_url().as_deref(),
+            Some("https://example.invalid/thegn-538.git")
+        );
+
+        let without = tempfile::tempdir().unwrap();
+        init_gitloc_fixture(without.path());
+        assert_eq!(
+            GitLoc::Local(without.path().to_path_buf()).origin_url(),
+            None
+        );
+    }
+
+    #[test]
+    fn origin_url_outcome_memoises_answers_but_not_transient_failures() {
+        use crate::git_run::GitOutcome;
+        assert_eq!(
+            origin_url_from_outcome(GitOutcome::Ok(b" git@h:o/r.git\n".to_vec())),
+            (Some("git@h:o/r.git".to_string()), true)
+        );
+        assert_eq!(
+            origin_url_from_outcome(GitOutcome::Ok(b" \n".to_vec())),
+            (None, true)
+        );
+        for answer in [
+            GitOutcome::EmptyOk,
+            GitOutcome::EmptyRefused,
+            GitOutcome::Exit {
+                code: Some(2),
+                stderr_tail: "error: No such remote 'origin'".into(),
+            },
+            GitOutcome::OutputLimit(thegn_proc::Which::Stdout),
+        ] {
+            assert_eq!(origin_url_from_outcome(answer), (None, true));
+        }
+        for transient in [
+            GitOutcome::Spawn(std::io::Error::from(std::io::ErrorKind::NotFound)),
+            GitOutcome::Supervise("lost".into()),
+            GitOutcome::Timeout,
+            GitOutcome::Cancelled,
+        ] {
+            assert_eq!(origin_url_from_outcome(transient), (None, false));
+        }
+    }
+
+    #[test]
+    fn gitloc_git_out_path_keeps_trailing_space() {
+        let dir = tempfile::tempdir().unwrap();
+        let spaced = dir.path().join("wt ");
+        init_gitloc_fixture(&spaced);
+        let loc = GitLoc::Local(spaced.clone());
+        let top = loc.git_out_path(&["rev-parse", "--show-toplevel"]).unwrap();
+        assert_eq!(top, std::fs::canonicalize(&spaced).unwrap());
+        assert!(top.to_string_lossy().ends_with("wt "));
+
+        // `--git-common-dir` prints a relative `.git` here; it joins onto the
+        // location path and keeps the trailing space.
+        let common = loc.resolve_git_common_dir().unwrap();
+        assert_eq!(common, spaced.join(".git"));
+        assert!(matches!(
+            loc.git_out_path(&["status", "--porcelain"]),
+            Err(util::GitPathError::Empty)
+        ));
+    }
+
+    #[test]
+    fn remote_path_rejects_non_utf8() {
+        assert_eq!(
+            remote_path_from_bytes(b"/srv/wt \n").unwrap(),
+            PathBuf::from("/srv/wt ")
+        );
+        assert!(matches!(
+            remote_path_from_bytes(b"/a\xff\n"),
+            Err(util::GitPathError::UnsupportedRemotePath)
+        ));
+        assert!(matches!(
+            remote_path_from_bytes(b"\n"),
+            Err(util::GitPathError::Empty)
+        ));
+        assert!(matches!(
+            remote_path_from_bytes(b"/a\nb\n"),
+            Err(util::GitPathError::Malformed)
+        ));
+    }
+
+    #[test]
+    fn remote_git_out_path_reports_an_unreachable_transport() {
+        let provider = GitLoc::Provider {
+            control_prefix: vec!["thegn-no-such-provider-368c".into()],
+            path: "/workspace".into(),
+        };
+        assert!(matches!(
+            provider.git_out_path(&["rev-parse", "--show-toplevel"]),
+            Err(util::GitPathError::Git(crate::git_run::GitOutcome::Spawn(
+                _
+            )))
+        ));
+        let error = provider.resolve_git_common_dir().unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .starts_with("git rev-parse --git-common-dir failed: ")
+        );
     }
 }
