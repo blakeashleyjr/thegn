@@ -131,6 +131,29 @@ pub(super) async fn check_daemon_scope(client: &ControlClient, expected: &[Strin
     check
 }
 
+/// The release channel a `/daemon/scope` reply reports: its string `channel`
+/// field, else `None` (a daemon that predates the field, or a malformed reply).
+fn channel_from_scope_reply(value: &Value) -> Option<String> {
+    value
+        .get("channel")
+        .and_then(Value::as_str)
+        .map(str::to_owned)
+}
+
+/// Ask a running daemon which release channel it runs on. `None` covers a
+/// legacy daemon without the field or the route, a timeout and any error; it
+/// never spawns anything (callers pass a client they already found).
+pub(crate) async fn daemon_channel(client: &ControlClient) -> Option<String> {
+    let reply = tokio::time::timeout(
+        SCOPE_PROBE_TIMEOUT,
+        client.call_raw("GET", super::SCOPE_PATH, None),
+    )
+    .await
+    .ok()?
+    .ok()?;
+    channel_from_scope_reply(&reply)
+}
+
 fn client_socket_label(client: &ControlClient) -> String {
     addr_label(client.addr())
 }
@@ -1499,6 +1522,22 @@ mod tests {
                 Some(ExecFrame::Stdout(vec![b'x'; frame_size]))
             );
         }
+    }
+
+    #[test]
+    fn channel_from_scope_reply_reads_only_a_string_channel_field() {
+        assert_eq!(
+            channel_from_scope_reply(&serde_json::json!({ "scope": "v1-a", "channel": "dev" })),
+            Some("dev".to_owned())
+        );
+        assert_eq!(
+            channel_from_scope_reply(&serde_json::json!({ "scope": "v1-a" })),
+            None
+        );
+        assert_eq!(
+            channel_from_scope_reply(&serde_json::json!({ "scope": "v1-a", "channel": 7 })),
+            None
+        );
     }
 
     #[test]
