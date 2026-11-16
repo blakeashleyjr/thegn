@@ -2806,6 +2806,10 @@ pub fn provision_provider_env_named(
         None
     };
 
+    // THE-2020: a provider at its `[placement.fleet_budget] max_hourly` refuses
+    // a NEW sandbox before anything billable is created (resume never refused).
+    crate::fleet_read::admit_new_sandbox(cfg, env_name, &id).map_err(anyhow::Error::msg)?;
+
     // Recreate-if-missing: the sandbox may have been cleaned up out-of-band (TTL,
     // manual delete, provider GC). `ensure_exists` recreates it before we read the
     // marker / run any exec, so provisioning can't fail against a dead sandbox.
