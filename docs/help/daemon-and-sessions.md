@@ -202,12 +202,13 @@ in the target database is best effort; failure is reported as a warning.
 
 `thegn session close <id>` terminates a session's PTY child. The daemon
 keeps a tombstone, so `session list` still shows how it ended
-(`exited(?,idle)` for a closed session) and `session wait` still answers —
+(`exited(?)  last:idle` for a closed session) and `session wait` still answers —
 the dedicated verb for what `sessions.kill` reaches generically.
 
 `session list` marks each row with a **liveness token** in the second
 column: `live`, or `exited(<code>)` — `exited(?)` when the exit code is
-unreapable, suffixed with the final state word (`exited(0,done)`). A
+unreapable, with `,done` appended for a finished worker (`exited(0,done)`);
+any other final state is a trailing `last:<state>` field. A
 supervisor greps a fixed column instead of parsing the whole line;
 `--live` filters to non-exited rows before serialization, so a `--live
 --json` caller never re-filters.
