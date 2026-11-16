@@ -27,6 +27,14 @@ impl<R: std::io::Read + std::os::fd::AsRawFd> super::GatePipe for R {
 
 // Run the vendored dependency's real PTY regressions in the normal host test
 // target too: Cargo cannot select a patched non-workspace dependency's tests.
+/// Passwd-database home of the current uid (not `$HOME`).
+pub(crate) fn account_home() -> Option<std::path::PathBuf> {
+    nix::unistd::User::from_uid(nix::unistd::getuid())
+        .ok()
+        .flatten()
+        .map(|u| u.dir)
+}
+
 #[cfg(test)]
 mod termwiz_regression {
     use std::os::fd::AsRawFd;

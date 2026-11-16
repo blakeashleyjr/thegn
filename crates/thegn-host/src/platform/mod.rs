@@ -52,6 +52,18 @@ pub(crate) fn pty_group(_child: &dyn portable_pty::Child) -> Option<GroupHandle>
     None
 }
 
+/// The account (passwd) home directory, independent of `$HOME` (which agent
+/// shells repoint at a profile dir). `None` where unavailable.
+#[cfg(unix)]
+pub(crate) fn account_home() -> Option<std::path::PathBuf> {
+    unix::account_home()
+}
+
+#[cfg(not(unix))]
+pub(crate) fn account_home() -> Option<std::path::PathBuf> {
+    None
+}
+
 /// Shared bounded grace interval after a PTY group receives its termination
 /// request. Windows uses an immediate Job Object terminate and needs no wait.
 #[cfg(unix)]
