@@ -603,6 +603,15 @@ pub fn pending_teardowns(container: &str) -> Result<Vec<u16>> {
     Ok(read_validated_sidecar_record(container, None, None)?.pending_teardown)
 }
 
+/// Like [`pending_teardowns`], but a container with no sidecar record has nothing pending.
+pub fn pending_teardowns_if_recorded(container: &str) -> Result<Vec<u16>> {
+    validate_container_name(container)?;
+    if read_sidecar_record_if_present(container)?.is_none() {
+        return Ok(Vec::new());
+    }
+    pending_teardowns(container)
+}
+
 fn update_pending_teardown(
     container: &str,
     worktree: &Path,
@@ -674,19 +683,23 @@ fn read_validated_sidecar_record(
 }
 
 fn read_sidecar_record(container: &str) -> Result<SidecarRecord> {
+    read_sidecar_record_if_present(container)?.ok_or_else(|| {
+        anyhow::anyhow!(
+            "vpn: no recorded runtime for VPN sidecar {container}; restart this worktree's sandbox so thegn records which runtime started it"
+        )
+    })
+}
+
+fn read_sidecar_record_if_present(container: &str) -> Result<Option<SidecarRecord>> {
     let name = sidecar_record_name(container);
     let dir = match sidecar_record_dir_existing()? {
         Some(dir) => dir,
-        None => bail!(
-            "vpn: no recorded runtime for VPN sidecar {container}; restart this worktree's sandbox so thegn records which runtime started it"
-        ),
+        None => return Ok(None),
     };
     let file = match dir.open_regular_nofollow(&name) {
         Ok(file) => file,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            bail!(
-                "vpn: no recorded runtime for VPN sidecar {container}; restart this worktree's sandbox so thegn records which runtime started it"
-            )
+            return Ok(None);
         }
         Err(error) => {
             return Err(error)
@@ -701,6 +714,7 @@ fn read_sidecar_record(container: &str) -> Result<SidecarRecord> {
         bail!("vpn: malformed runtime record for sidecar {container}");
     }
     serde_json::from_slice(&bytes)
+        .map(Some)
         .with_context(|| format!("vpn: malformed runtime record for sidecar {container}"))
 }
 
