@@ -4016,6 +4016,24 @@ fn fleet_widget_text_and_tone() {
             id: "tg-gone".into(),
         });
     assert_eq!(fleet_widget(&missing).map(|(_, w)| w), Some(true));
+    // A budget breach warns; the text is unchanged apart from the warn mark.
+    let mut over = fleet_snap(2, 3.2, 0, 0);
+    assert_eq!(fleet_widget(&over), Some(("$3.20/h".to_string(), false)));
+    over.cost
+        .budget
+        .push(thegn_core::placement::fleet_cost::BudgetBreach {
+            provider: "fly".into(),
+            level: thegn_core::placement::fleet_cost::BudgetLevel::Warn,
+            hourly: 3.2,
+            limit: 3.0,
+        });
+    assert_eq!(
+        fleet_widget(&over),
+        Some((
+            format!("$3.20/h {}", crate::caps::active_glyphs().warn),
+            true
+        ))
+    );
 
     // Through the masthead arm: dim normally, amber on a warning.
     let mut model = FrameModel {
