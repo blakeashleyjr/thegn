@@ -300,18 +300,6 @@ mod tests {
         })
     }
 
-    /// Re-point HOME + THEGN_DIR at `root` (a second "process" from another
-    /// profile shell) while keeping XDG_STATE_HOME. Only call while an
-    /// `IsolatedState` is alive: it holds ENV_LOCK and restores both on drop.
-    fn switch_home(root: &std::path::Path) {
-        // SAFETY: the caller's IsolatedState holds ENV_LOCK for the whole test and
-        // restores HOME/THEGN_DIR on drop.
-        unsafe {
-            std::env::set_var("HOME", root);
-            std::env::set_var("THEGN_DIR", root.join(".thegn"));
-        }
-    }
-
     #[test]
     fn default_workdir_joins_under_home() {
         assert_eq!(default_workdir("/home/nix"), "/home/nix/workspace");
@@ -423,10 +411,13 @@ mod tests {
         cache_home(id, "/home/sprite");
         // "Process" B: a Claude profile shell with a different HOME/THEGN_DIR but
         // the same instance state home.
-        let home_b = state.root().join("profile-b");
-        std::fs::create_dir_all(&home_b).expect("profile home");
-        switch_home(&home_b);
-        assert_eq!(thegn_core::util::thegn_dir(), home_b.join(".thegn"));
+        // A profile shell differs only in HOME/THEGN_DIR; no marker may live
+        // under the HOME-relative thegn_dir(), and wiping it changes nothing.
+        let thegn_dir = thegn_core::util::thegn_dir();
+        assert_eq!(thegn_dir, state.thegn_dir());
+        assert!(!provisioned_dir().starts_with(&thegn_dir));
+        assert!(!super::cache_file(id).starts_with(&thegn_dir));
+        let _ = std::fs::remove_dir_all(&thegn_dir); // best-effort: cleanup: the dir may not exist; the asserts below are the check
         assert!(is_provisioned_locally(id), "marker visible across HOMEs");
         assert_eq!(cached_home(id).as_deref(), Some("/home/sprite"));
         assert_eq!(resolve(&pc("sprites", ""), id), "/home/sprite/workspace");
