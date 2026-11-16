@@ -275,20 +275,32 @@ impl XdgOmission {
     }
 }
 
-/// System trees a symlinked writable `$HOME` carve may never resolve into.
-const CARVE_SYSTEM_ROOTS: &[&str] = &[
-    "/bin", "/boot", "/dev", "/etc", "/lib", "/lib64", "/nix", "/opt", "/proc", "/run", "/sbin",
-    "/srv", "/sys", "/usr", "/var",
-];
+/// Whether `path` names itself with no symlink in ANY component: its
+/// canonical form is exactly `path`. A carve that fails this is skipped, never
+/// followed: binding a link's target writable would widen the sandbox to an
+/// arbitrary host tree, and bwrap refuses a symlink destination.
+fn carve_path_is_link_free(path: &Path) -> bool {
+    path.canonicalize().is_ok_and(|canon| canon == path)
+}
 
-/// Whether a resolved carve target is `/` or inside a system tree.
-fn carve_target_is_system(p: &Path) -> bool {
-    p == Path::new("/") || CARVE_SYSTEM_ROOTS.iter().any(|root| p.starts_with(root))
+/// Log a writable carve skipped because a component of its path is a symlink.
+fn warn_symlinked_carve(path: &Path) {
+    tracing::warn!(
+        target: "thegn::sandbox",
+        path = %path.display(),
+        "symlinked path; not bound in the sandbox"
+    );
 }
 
 /// Return approved writable XDG mounts together with every observable
 /// omission. Defaults absent from disk are ordinary and are not reported;
 /// explicitly configured roots that are unavailable are reported.
+///
+/// Fail closed on symlinks: a carve (or XDG root/leaf, or agent config dir)
+/// whose path has a symlink in ANY component — including `$HOME` itself being
+/// reached through a link — is skipped with a warning, never followed, so the
+/// launch proceeds without it instead of binding an arbitrary host tree
+/// writable.
 pub fn xdg_carveout_report_at(
     profile: SandboxProfile,
     home: &Path,
@@ -326,36 +338,23 @@ pub fn xdg_carveout_report_at(
         rels.push(".claude-profiles");
         rels.push(".claude/projects");
     }
+    // `$HOME` reached through a link (configured path != canonical path) makes
+    // every carve below it unsafe.
+    let home_canon = home.canonicalize().ok().filter(|canon| canon == home);
     let mut mounts: Vec<Mount> = rels
         .iter()
         .filter_map(|rel| {
-            let mut p = home.join(rel);
-            // A symlinked carve is skipped, except a HOME-swapped profile's
-            // `.claude/projects` -> `<ancestor of $HOME>/.claude/projects`, which
-            // is bound at its canonical target for BOTH ends: bwrap refuses a
-            // symlink destination, and inside the sandbox the alias still
-            // resolves through the bind because local placements mirror the host
-            // tree. An unresolvable link is skipped.
-            if std::fs::symlink_metadata(&p).is_ok_and(|m| m.file_type().is_symlink()) {
-                // Only a HOME-swapped profile's `.claude/projects` link is followed, and only
-                // to the shared `<ancestor of $HOME>/.claude/projects`: a planted link
-                // (`~/tmp -> ~/.ssh`, `.zsh_history -> ~/.ssh/authorized_keys`) must never
-                // become a writable bind.
-                if *rel != ".claude/projects" {
-                    return None;
-                }
-                p = p.canonicalize().ok()?;
-                let home_canon = home.canonicalize().ok()?;
-                let shared = p.ends_with(".claude/projects")
-                    && p.parent()
-                        .and_then(Path::parent)
-                        .is_some_and(|base| home_canon.starts_with(base));
-                if !shared || carve_target_is_system(&p) {
-                    return None;
-                }
+            let p = home.join(rel);
+            // Absent defaults are ordinary: skipped silently.
+            std::fs::symlink_metadata(&p).ok()?;
+            let link_free = home_canon
+                .as_ref()
+                .is_some_and(|canon| p.canonicalize().is_ok_and(|c| c == canon.join(rel)));
+            if !link_free {
+                warn_symlinked_carve(&p);
+                return None;
             }
-            // Dir or file — but must exist so bwrap overmounts an existing
-            // inode (skips dangling symlinks, which `is_dir`/`is_file` reject).
+            // Dir or file — but must exist so bwrap overmounts an existing inode.
             (p.is_dir() || p.is_file()).then(|| {
                 let s = p.to_string_lossy().into_owned();
                 Mount {
@@ -449,6 +448,12 @@ pub fn xdg_carveout_report_at(
                         });
                         continue;
                     }
+                    // A leaf that is itself a link (even one inside its root)
+                    // is skipped, never followed.
+                    if source != destination {
+                        warn_symlinked_carve(&destination);
+                        continue;
+                    }
                     mounts.push(Mount {
                         host: source.to_string_lossy().into_owned(),
                         dest: destination.to_string_lossy().into_owned(),
@@ -475,6 +480,10 @@ pub fn xdg_carveout_report_at(
     ) {
         for p in crate::account::providers() {
             if let Some(dir) = crate::account::effective_config_dir(p) {
+                if !carve_path_is_link_free(Path::new(&dir)) {
+                    warn_symlinked_carve(Path::new(&dir));
+                    continue;
+                }
                 mounts.push(Mount {
                     host: dir.clone(),
                     dest: dir,
@@ -578,6 +587,15 @@ fn xdg_mount_root(
         omissions.push(XdgOmissionEntry {
             path: root,
             reason: XdgOmission::UnresolvableRoot,
+        });
+        None
+    } else if canonical != root {
+        // A symlink in an intermediate component (`~/.local -> X`, or `$HOME`
+        // itself reached through a link): skipped, never followed.
+        warn_symlinked_carve(&root);
+        omissions.push(XdgOmissionEntry {
+            path: root,
+            reason: XdgOmission::SymlinkedRoot,
         });
         None
     } else {
@@ -1779,6 +1797,7 @@ mod tests {
         let mounts = default_writable_carveouts_at(SandboxProfile::Hardened, &home, &env);
         assert!(mounts.iter().all(|mount| !mount.dest.ends_with("/bash")));
 
+        // `$HOME` reached through a link: skipped, never followed.
         let real_home = td.path().join("real-home");
         let namespace_home = td.path().join("home-alias");
         std::fs::create_dir_all(real_home.join(".local/state/bash")).unwrap();
@@ -1786,12 +1805,12 @@ mod tests {
         let no_overrides = |_key: &str| None;
         let alias_mounts =
             default_writable_carveouts_at(SandboxProfile::Hardened, &namespace_home, &no_overrides);
-        let alias_dest = namespace_home.join(".local/state/bash");
-        let alias_source = real_home.join(".local/state/bash");
-        assert!(alias_mounts.iter().any(|mount| {
-            mount.dest == alias_dest.to_string_lossy().as_ref()
-                && mount.host == alias_source.to_string_lossy().as_ref()
-        }));
+        assert!(
+            alias_mounts
+                .iter()
+                .all(|mount| !mount.dest.ends_with("/bash")),
+            "{alias_mounts:?}"
+        );
     }
 
     #[test]
@@ -1954,10 +1973,13 @@ mod tests {
         // be writable so the agent's `session-env` mkdir doesn't EROFS — but NOT
         // for the sealed agent. Only meaningful when the dir exists on this host.
         let home = std::env::var("HOME").unwrap_or_default();
+        // Symlinked carve paths are skipped (never followed), so only a
+        // link-free dir on this host is expected to be carved.
         if home.is_empty()
             || !std::path::Path::new(&home)
                 .join(".claude-profiles")
                 .is_dir()
+            || !carve_path_is_link_free(&std::path::Path::new(&home).join(".claude-profiles"))
         {
             return;
         }
@@ -1988,10 +2010,13 @@ mod tests {
         // but NOT for the sealed agent (which must stay out of the shared store).
         // Only meaningful when the dir exists on this host.
         let home = std::env::var("HOME").unwrap_or_default();
+        // Symlinked carve paths are skipped (never followed), so only a
+        // link-free dir on this host is expected to be carved.
         if home.is_empty()
             || !std::path::Path::new(&home)
                 .join(".claude/projects")
                 .is_dir()
+            || !carve_path_is_link_free(&std::path::Path::new(&home).join(".claude/projects"))
         {
             return;
         }
@@ -2016,88 +2041,78 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn profile_home_symlinked_projects_carve_uses_canonical_path() {
-        // A HOME-swapped profile (`~/.claude-profiles/<name>`) symlinks its
-        // `.claude/projects` into the shared `~/.claude/projects`. bwrap refuses
-        // a symlink destination, so the carve binds the canonical target at the
-        // canonical path; a dangling link is skipped.
+    fn symlinked_carve_paths_are_skipped_never_followed() {
+        use std::os::unix::fs::symlink;
+
         let td = private_tempdir();
-        // A TMPDIR inside a system tree (e.g. `/run/user/..`) is itself refused
-        // as a carve target; then only the refusal is asserted.
-        let system_tmp = carve_target_is_system(&td.path().canonicalize().unwrap());
-        let shared = td.path().join("real-home/.claude/projects");
-        std::fs::create_dir_all(&shared).unwrap();
-        let home = td.path().join("real-home/.claude-profiles/p");
-        std::fs::create_dir_all(home.join(".claude")).unwrap();
-        std::os::unix::fs::symlink(&shared, home.join(".claude/projects")).unwrap();
+        let base = td.path().canonicalize().unwrap();
         let no_env = |_: &str| None;
+        let secret = base.join("secret");
+        let elsewhere = base.join("elsewhere");
+        std::fs::create_dir_all(&secret).unwrap();
+        std::fs::create_dir_all(elsewhere.join("projects")).unwrap();
+        std::fs::create_dir_all(elsewhere.join("state/bash")).unwrap();
+        let under = |mounts: &[Mount], root: &Path| {
+            mounts.iter().any(|m| {
+                Path::new(&m.host).starts_with(root) || Path::new(&m.dest).starts_with(root)
+            })
+        };
+
+        // A normal, link-free carve is still bound read-write at its own path.
+        let home = base.join("home");
+        std::fs::create_dir_all(home.join("tmp")).unwrap();
+        std::fs::create_dir_all(home.join(".local/state/zsh")).unwrap();
         let (mounts, _) = xdg_carveout_report_at(SandboxProfile::Hardened, &home, &no_env);
-        let canon = shared
-            .canonicalize()
-            .unwrap()
-            .to_string_lossy()
-            .into_owned();
-        if system_tmp {
-            assert!(!mounts.iter().any(|m| m.host == canon));
-            return;
-        }
-        let carve = mounts
-            .iter()
-            .find(|m| m.host.ends_with("/.claude/projects"))
-            .expect("projects carve present");
-        assert_eq!(carve.host, canon);
-        assert_eq!(carve.dest, canon);
-        assert!(!carve.ro);
+        let tmp = home.join("tmp").to_string_lossy().into_owned();
         assert!(
-            !mounts
+            mounts
                 .iter()
-                .any(|m| m.dest == home.join(".claude/projects").to_string_lossy()),
-            "the symlink path itself must never be a bind destination"
+                .any(|m| m.host == tmp && m.dest == tmp && !m.ro),
+            "{mounts:?}"
         );
-
-        // A link into a system tree is never carved writable.
-        assert!(carve_target_is_system(Path::new("/etc/x")));
-        assert!(carve_target_is_system(Path::new("/")));
-        assert!(!carve_target_is_system(Path::new(
-            "/home/u/.claude/projects"
-        )));
-        assert!(!carve_target_is_system(Path::new("/etcetera")));
-
-        // A planted non-projects link is never followed.
-        std::fs::create_dir_all(td.path().join("secret")).unwrap();
-        std::os::unix::fs::symlink(td.path().join("secret"), home.join("tmp")).unwrap();
-        let (mounts, _) = xdg_carveout_report_at(SandboxProfile::Hardened, &home, &no_env);
-        let secret = td
-            .path()
-            .join("secret")
-            .canonicalize()
-            .unwrap()
-            .to_string_lossy()
-            .into_owned();
-        assert!(!mounts.iter().any(|m| m.host == secret), "{mounts:?}");
-
-        // A projects link to anything but `<ancestor of $HOME>/.claude/projects`
-        // is never followed.
-        std::fs::remove_file(home.join(".claude/projects")).unwrap();
-        std::fs::create_dir_all(td.path().join("elsewhere/projects")).unwrap();
-        std::os::unix::fs::symlink(
-            td.path().join("elsewhere/projects"),
-            home.join(".claude/projects"),
-        )
-        .unwrap();
-        let (mounts, _) = xdg_carveout_report_at(SandboxProfile::Hardened, &home, &no_env);
+        let zsh = home.join(".local/state/zsh").to_string_lossy().into_owned();
         assert!(
-            !mounts
+            mounts
                 .iter()
-                .any(|m| m.host.ends_with("/elsewhere/projects")),
+                .any(|m| m.host == zsh && m.dest == zsh && !m.ro),
             "{mounts:?}"
         );
 
-        // Dangling link: skipped, never emitted.
-        std::fs::remove_file(home.join(".claude/projects")).unwrap();
-        std::os::unix::fs::symlink(td.path().join("gone"), home.join(".claude/projects")).unwrap();
+        // Final-component link (`tmp -> secret`): skipped.
+        let home = base.join("home-final");
+        std::fs::create_dir_all(&home).unwrap();
+        symlink(&secret, home.join("tmp")).unwrap();
         let (mounts, _) = xdg_carveout_report_at(SandboxProfile::Hardened, &home, &no_env);
-        assert!(!mounts.iter().any(|m| m.host.ends_with("projects")));
+        assert!(!under(&mounts, &secret), "{mounts:?}");
+        assert!(!under(&mounts, &home.join("tmp")), "{mounts:?}");
+
+        // Intermediate link (`.claude -> elsewhere`, real `projects` under it):
+        // skipped, no mount for it at either path.
+        let home = base.join("home-mid");
+        std::fs::create_dir_all(&home).unwrap();
+        symlink(&elsewhere, home.join(".claude")).unwrap();
+        let (mounts, _) = xdg_carveout_report_at(SandboxProfile::Hardened, &home, &no_env);
+        assert!(!under(&mounts, &elsewhere), "{mounts:?}");
+        assert!(!under(&mounts, &home.join(".claude")), "{mounts:?}");
+
+        // `.local -> elsewhere`: no XDG binds.
+        let home = base.join("home-local");
+        std::fs::create_dir_all(&home).unwrap();
+        symlink(&elsewhere, home.join(".local")).unwrap();
+        let (mounts, _) = xdg_carveout_report_at(SandboxProfile::Hardened, &home, &no_env);
+        assert!(!under(&mounts, &elsewhere), "{mounts:?}");
+        assert!(!under(&mounts, &home.join(".local")), "{mounts:?}");
+
+        // Profile home reached via a link: no carves bound at all.
+        let real_home = base.join("real-profile");
+        std::fs::create_dir_all(real_home.join("tmp")).unwrap();
+        std::fs::create_dir_all(real_home.join(".claude/projects")).unwrap();
+        std::fs::create_dir_all(real_home.join(".local/state/bash")).unwrap();
+        let home = base.join("profile-link");
+        symlink(&real_home, &home).unwrap();
+        let (mounts, _) = xdg_carveout_report_at(SandboxProfile::Hardened, &home, &no_env);
+        assert!(!under(&mounts, &real_home), "{mounts:?}");
+        assert!(!under(&mounts, &home), "{mounts:?}");
     }
 
     #[test]
@@ -2107,8 +2122,9 @@ mod tests {
             return;
         }
         let hist = std::path::Path::new(&home).join(".zsh_history");
-        // Only assert when the file exists (carve-outs skip absent paths).
-        if !hist.is_file() {
+        // Only assert when the file exists (carve-outs skip absent paths) and
+        // is reached link-free (symlinked carve paths are skipped).
+        if !hist.is_file() || !carve_path_is_link_free(&hist) {
             return;
         }
         for profile in [
@@ -2133,7 +2149,11 @@ mod tests {
         // non-existent dir must never be carved (existence check refuses to
         // fabricate one). Mutates only `CLAUDE_CONFIG_DIR` (targeted, restored) —
         // no `HOME` churn, matching `bundle.rs`'s unmanaged-agent test.
-        let base = std::env::temp_dir().join(format!("tg-agentcfg-{}", crate::util::now()));
+        // Canonical: a symlinked config dir path is skipped, never carved.
+        let base = std::env::temp_dir()
+            .canonicalize()
+            .unwrap()
+            .join(format!("tg-agentcfg-{}", crate::util::now()));
         let present = base.join("present");
         let absent = base.join("absent"); // deliberately not created
         std::fs::create_dir_all(&present).unwrap();
