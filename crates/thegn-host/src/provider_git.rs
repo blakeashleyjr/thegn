@@ -814,6 +814,11 @@ pub(crate) fn pull_back_if_provider(
     if !env.placement.is_provider() {
         return Ok(None);
     }
+    // `read-only`: the owner chose not to pull from this sandbox. Nothing to
+    // pull and nothing to report on every session exit.
+    if env_git_policy(cfg, &env.name).mode == SandboxGitMode::ReadOnly {
+        return Ok(None);
+    }
     pull_back(cfg, worktree, &env.name).map(Some)
 }
 
