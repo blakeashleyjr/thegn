@@ -131,20 +131,9 @@ fn resolve_ref_for_outcome_with(
             None => (None, SecretOutcome::Missing),
         },
         SecretRef::File { path } => {
-            let p = thegn_core::util::expand_tilde(path);
-            match thegn_core::fsperm::read_owner_only_secret_file(
-                std::path::Path::new(&p),
-                MAX_SECRET_BYTES,
-            ) {
-                Ok(value) if !value.is_empty() => (Some(value), SecretOutcome::Resolved),
-                Ok(_) | Err(thegn_core::fsperm::SecretFileError::NotFound) => {
-                    (None, SecretOutcome::Missing)
-                }
-                Err(thegn_core::fsperm::SecretFileError::Refused(reason)) => {
-                    tracing::warn!(target: "thegn::secret", %reason, "file secret refused");
-                    (None, SecretOutcome::Denied)
-                }
-            }
+            let account = crate::platform::account_home();
+            let env_home = thegn_core::util::home();
+            resolve_file_ref(path, account.as_deref(), &env_home)
         }
         SecretRef::Literal(_) => match r.expose_literal().filter(|s| !s.trim().is_empty()) {
             Some(v) => (Some(v.to_string()), SecretOutcome::Resolved),
@@ -158,6 +147,43 @@ fn resolve_ref_for_outcome_with(
         SecretOutcome::Unavailable => Err(SecretResolveFailure::Unavailable),
         SecretOutcome::Denied => Err(SecretResolveFailure::Denied),
     }
+}
+
+/// `file:` ref resolution. A `~` path tries the account (passwd) home first,
+/// then `$HOME` when it differs (agent shells repoint `$HOME`). Paths only are
+/// logged, never contents.
+fn resolve_file_ref(
+    path: &str,
+    account_home: Option<&std::path::Path>,
+    env_home: &std::path::Path,
+) -> (Option<String>, SecretOutcome) {
+    let mut candidates: Vec<String> = Vec::new();
+    if path.starts_with('~') {
+        if let Some(acct) = account_home {
+            candidates.push(thegn_core::util::expand_tilde_in(path, acct));
+        }
+        let env_path = thegn_core::util::expand_tilde_in(path, env_home);
+        if !candidates.contains(&env_path) {
+            candidates.push(env_path);
+        }
+    } else {
+        candidates.push(path.to_string());
+    }
+    for p in &candidates {
+        match thegn_core::fsperm::read_owner_only_secret_file(
+            std::path::Path::new(p),
+            MAX_SECRET_BYTES,
+        ) {
+            Ok(value) if !value.is_empty() => return (Some(value), SecretOutcome::Resolved),
+            Ok(_) | Err(thegn_core::fsperm::SecretFileError::NotFound) => {}
+            Err(thegn_core::fsperm::SecretFileError::Refused(reason)) => {
+                tracing::warn!(target: "thegn::secret", %reason, path = %p, "file secret refused");
+                return (None, SecretOutcome::Denied);
+            }
+        }
+    }
+    tracing::warn!(target: "thegn::secret", tried = ?candidates, "file secret not found");
+    (None, SecretOutcome::Missing)
 }
 
 /// TTL-memoized PRESENCE check for the hydration path: `env_snapshots` asks
@@ -1753,6 +1779,29 @@ mod tests {
         fn flush(&mut self) -> std::io::Result<()> {
             Ok(())
         }
+    }
+
+    #[test]
+    fn file_ref_prefers_account_home_then_env_home() {
+        let t = tempfile::tempdir().unwrap();
+        let (acct, env) = (t.path().join("acct"), t.path().join("env"));
+        std::fs::create_dir_all(acct.join(".s")).unwrap();
+        std::fs::create_dir_all(env.join(".s")).unwrap();
+        // Only the account home has it.
+        thegn_core::fsperm::write_owner_only_atomic(&acct.join(".s/tok"), b"acct-val").unwrap();
+        let (v, o) = resolve_file_ref("~/.s/tok", Some(&acct), &env);
+        assert_eq!(v.as_deref(), Some("acct-val"));
+        assert!(matches!(o, SecretOutcome::Resolved));
+        // Account home misses; $HOME fallback hits.
+        std::fs::remove_file(acct.join(".s/tok")).unwrap();
+        thegn_core::fsperm::write_owner_only_atomic(&env.join(".s/tok"), b"env-val").unwrap();
+        let (v, _) = resolve_file_ref("~/.s/tok", Some(&acct), &env);
+        assert_eq!(v.as_deref(), Some("env-val"));
+        // Neither: Missing.
+        std::fs::remove_file(env.join(".s/tok")).unwrap();
+        let (v, o) = resolve_file_ref("~/.s/tok", Some(&acct), &env);
+        assert!(v.is_none());
+        assert!(matches!(o, SecretOutcome::Missing));
     }
 
     #[test]
