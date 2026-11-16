@@ -124,7 +124,8 @@ pub enum Action {
         /// `agent_sessions`, `sessions_wait`, `sessions_snapshot`, `semantic_map`,
         /// `semantic_blast_radius`); the mutating tools (`sessions_open`,
         /// `sessions_input`, `sessions_kill`, `sessions_resize`, `sessions_split`,
-        /// `worktrees_open`, `notify_push`) additionally need
+        /// `worktrees_open`, `notify_push`, `dispatches_put`,
+        /// `dispatches_set_status`) additionally need
         /// `write`, `folders_assign` needs `git`, and `merge_add` needs
         /// `git`. Pass
         /// `none` (or any empty/unknown set) to serve docs tools only.
@@ -461,7 +462,11 @@ const NO_DAEMON: &str = "daemon not reachable — start thegn or `thegn daemon`"
 /// (`MAX_PTY_ROWS` x `MAX_PTY_COLS`, which the daemon enforces too) before any
 /// daemon round-trip; split also checks `dir` against `SplitDir` and turns the
 /// `env` object into the body's `[name, value]` pairs. `worktrees.open` passes
-/// `OpenWorktreeBody`'s `repo`/`branch` through unchanged. Pure.
+/// `OpenWorktreeBody`'s `repo`/`branch` through unchanged.
+/// `dispatches.set_status` fills the route's `{id}` path parameter from the MCP
+/// `id` argument, which must be a positive integer; its `status`/`lead` body
+/// passes through (the daemon owns the closed status set), as does
+/// `dispatches.put`'s `DispatchPutReq` body. Pure.
 fn routed_params(
     cap: &str,
     args: &serde_json::Value,
@@ -488,6 +493,12 @@ fn routed_params(
             if !fits {
                 return Err(format!("`{key}` must be an integer from 0 to {max}"));
             }
+        }
+    }
+    if cap == "dispatches.set_status" {
+        let id = params.get("id").ok_or("missing `id`")?;
+        if !id.as_i64().is_some_and(|n| n > 0) {
+            return Err("`id` must be a positive integer".into());
         }
     }
     if cap == "sessions.split" {
@@ -791,7 +802,14 @@ async fn fetch_state(
         // under the same `write` scope the HTTP and plugin paths require (no
         // extra interlock: neither sends input nor creates anything on disk).
         // `sessions.snapshot` is a read: same `read` scope as HTTP and plugins.
-        "sessions.resize" | "sessions.snapshot" | "sessions.split" | "worktrees.open" => {
+        // The dispatch-roster writes need `write`, as `POST /v1/dispatches`
+        // and `POST /v1/dispatches/{id}/status` do; no extra interlock.
+        "sessions.resize"
+        | "sessions.snapshot"
+        | "sessions.split"
+        | "worktrees.open"
+        | "dispatches.put"
+        | "dispatches.set_status" => {
             let params = routed_params(cap, args)?;
             let c = client.map_err(|_| NO_DAEMON.to_string())?;
             let (method, path, body) = thegn_svc::control::routes::build_call(cap, params)?;
@@ -1304,6 +1322,86 @@ mod tests {
         ] {
             assert!(routed_params("sessions.split", &bad).is_err(), "{bad}");
         }
+    }
+
+    #[test]
+    fn dispatches_put_and_set_status_need_write_like_http() {
+        for cap in ["dispatches.put", "dispatches.set_status"] {
+            assert!(!READ_CAPS.contains(&cap), "{cap} must not be read-scoped");
+            for scopes in ["none", "read", "git", "merge_add", "read,git", "exec"] {
+                assert!(
+                    !allowed_state_caps(ScopeSet::parse(scopes), true).contains(&cap),
+                    "--scopes {scopes} must not grant {cap}"
+                );
+            }
+            // Write alone grants both; no MCP-only interlock.
+            for (scopes, flag) in [("write", false), ("read,write", true)] {
+                assert!(
+                    allowed_state_caps(ScopeSet::parse(scopes), flag).contains(&cap),
+                    "--scopes {scopes} must grant {cap}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn dispatch_params_fill_the_route_path_and_pass_the_body_through() {
+        let args = serde_json::json!({
+            "issue_id": "THE-203", "worktree_path": "/w", "agent_name": "coder",
+            "stage": "code", "parent_id": 7
+        });
+        let params = routed_params("dispatches.put", &args).unwrap();
+        let (method, path, body) =
+            thegn_svc::control::routes::build_call("dispatches.put", params).unwrap();
+        assert_eq!(method, "POST");
+        assert_eq!(path, "/v1/dispatches");
+        assert_eq!(body.unwrap(), args);
+
+        let lead = serde_json::json!({ "lease": "pipeline", "owner": "lead-1", "lease_gen": 3 });
+        let args = serde_json::json!({ "id": 42, "status": "done", "lead": lead });
+        let params = routed_params("dispatches.set_status", &args).unwrap();
+        let (method, path, body) =
+            thegn_svc::control::routes::build_call("dispatches.set_status", params).unwrap();
+        assert_eq!(method, "POST");
+        assert_eq!(path, "/v1/dispatches/42/status");
+        assert_eq!(
+            body.unwrap(),
+            serde_json::json!({ "status": "done", "lead": lead })
+        );
+        // `lead` is optional; an unknown status passes through to the daemon.
+        let params = routed_params(
+            "dispatches.set_status",
+            &serde_json::json!({ "id": 42, "status": "no_such_status" }),
+        )
+        .unwrap();
+        let (_, path, body) =
+            thegn_svc::control::routes::build_call("dispatches.set_status", params).unwrap();
+        assert_eq!(path, "/v1/dispatches/42/status");
+        assert_eq!(
+            body.unwrap(),
+            serde_json::json!({ "status": "no_such_status" })
+        );
+
+        for bad in [
+            serde_json::json!({}),
+            serde_json::json!({ "status": "done" }),
+            serde_json::json!({ "id": 0, "status": "done" }),
+            serde_json::json!({ "id": -1, "status": "done" }),
+            serde_json::json!({ "id": "x", "status": "done" }),
+        ] {
+            assert!(
+                routed_params("dispatches.set_status", &bad).is_err(),
+                "{bad}"
+            );
+        }
+        assert_eq!(
+            routed_params(
+                "dispatches.set_status",
+                &serde_json::json!({ "id": 0, "status": "done" })
+            )
+            .unwrap_err(),
+            "`id` must be a positive integer"
+        );
     }
 
     #[test]
