@@ -355,11 +355,21 @@ pub enum SessionAction {
 /// fixed column: `live`, or `exited(<code>)` — `exited(?)` when the child could
 /// not be reaped — with `,done` appended when the final state is `done`
 /// (`exited(0,done)`). Any other final state rides as a trailing `last:<state>`
-/// field, so the token grammar stays `live | exited(<code>|?)[,done]`. JSON
-/// output is unchanged. The wire has carried this data all along
-/// (`SessionInfo::exited_at_ms`); printing it is what makes the listing
-/// truthful about a worker that already finished.
+/// field, so the token grammar stays `live | exited(<code>|?)[,done]`. The wire
+/// has carried this data all along (`SessionInfo::exited_at_ms`); printing it is
+/// what makes the listing truthful about a worker that already finished.
+///
+/// Exit code 75 ([`crate::sprite_bridge::EXIT_REMOTE_LOST`]) additionally gains a
+/// trailing `cause:remote-exec-lost` field (same grammar as `last:<state>`): the
+/// remote exec stream was lost and could not be reattached, so the remote
+/// process did not survive (e.g. the sprite suspended). It is keyed on the code
+/// alone, regardless of placement — a local child exiting 75 (`EX_TEMPFAIL`)
+/// reads the same — and JSON gains `"cause": "remote-exec-lost"` only then
+/// (see [`exit_cause`]).
 pub(crate) fn session_line(s: &thegn_svc::control::SessionInfo) -> String {
+    let cause = exit_cause(s)
+        .map(|c| format!("  cause:{c}"))
+        .unwrap_or_default();
     let mut last = String::new();
     let state = match s.exited_at_ms {
         None => "live".to_string(),
@@ -387,7 +397,7 @@ pub(crate) fn session_line(s: &thegn_svc::control::SessionInfo) -> String {
         .map(|source| format!("  ← forked from {}", display_cell(source)))
         .unwrap_or_default();
     format!(
-        "{}  {}  {}x{}  {} client(s)  {}{}{}{}{}",
+        "{}  {}  {}x{}  {} client(s)  {}{}{}{}{}{}",
         display_cell(&s.id),
         state,
         s.cols,
@@ -400,8 +410,31 @@ pub(crate) fn session_line(s: &thegn_svc::control::SessionInfo) -> String {
             .unwrap_or_default(),
         lease,
         lineage,
-        last
+        last,
+        cause
     )
+}
+
+/// The `cause:` of an exited session, if its exit code carries one: code 75
+/// ([`crate::sprite_bridge::EXIT_REMOTE_LOST`]) ⇒ `remote-exec-lost`, regardless
+/// of placement. `None` while live or for any other code.
+pub(crate) fn exit_cause(s: &thegn_svc::control::SessionInfo) -> Option<&'static str> {
+    (s.exited_at_ms.is_some() && s.exit_code == Some(crate::sprite_bridge::EXIT_REMOTE_LOST))
+        .then_some("remote-exec-lost")
+}
+
+/// `session list --json`: each `SessionInfo` as-is, plus `"cause"` only on the
+/// rows [`exit_cause`] classifies.
+fn sessions_json(sessions: &[thegn_svc::control::SessionInfo]) -> Result<serde_json::Value> {
+    let mut rows = Vec::with_capacity(sessions.len());
+    for s in sessions {
+        let mut value = serde_json::to_value(s)?;
+        if let (Some(cause), Some(obj)) = (exit_cause(s), value.as_object_mut()) {
+            obj.insert("cause".into(), serde_json::Value::from(cause));
+        }
+        rows.push(value);
+    }
+    Ok(serde_json::Value::Array(rows))
 }
 
 /// Serde's pretty output uses raw newlines only for structural line breaks;
@@ -554,7 +587,7 @@ async fn run_async(cfg: &Config, action: SessionAction) -> Result<()> {
                 sessions.retain(|s| s.exited_at_ms.is_none());
             }
             if json {
-                outln!("{}", terminal_safe_pretty_json(&sessions)?);
+                outln!("{}", terminal_safe_pretty_json(&sessions_json(&sessions)?)?);
             } else if sessions.is_empty() {
                 outln!("no live sessions");
             } else {
@@ -2295,7 +2328,7 @@ mod snapshot_text_tests {
 
 #[cfg(test)]
 mod session_line_tests {
-    use super::session_line;
+    use super::{exit_cause, session_line, sessions_json};
     use thegn_svc::control::SessionInfo;
 
     /// The liveness token is the line's **second column** (immediately after
@@ -2365,6 +2398,45 @@ mod session_line_tests {
         assert!(!session_line(&info(Some(1), Some(0), Some("done"))).contains("last:"));
         assert!(!session_line(&info(Some(1), Some(0), Some(""))).contains("last:"));
         assert!(!session_line(&info(None, None, Some("idle"))).contains("last:"));
+    }
+
+    #[test]
+    fn exit_75_gains_a_remote_exec_lost_cause_field() {
+        let lost = info(Some(1), Some(75), None);
+        let line = session_line(&lost);
+        assert_eq!(token(&line), "exited(75)");
+        assert!(line.ends_with("  cause:remote-exec-lost"), "{line}");
+        assert_eq!(exit_cause(&lost), Some("remote-exec-lost"));
+        // Rides after a `last:` field, never inside the token.
+        let line = session_line(&info(Some(1), Some(75), Some("working")));
+        assert_eq!(token(&line), "exited(75)");
+        assert!(
+            line.ends_with("  last:working  cause:remote-exec-lost"),
+            "{line}"
+        );
+        // Code 1 and a clean `done` exit carry no cause.
+        let line = session_line(&info(Some(1), Some(1), None));
+        assert_eq!(token(&line), "exited(1)");
+        assert!(!line.contains("cause:"), "{line}");
+        let line = session_line(&info(Some(1), Some(0), Some("done")));
+        assert_eq!(token(&line), "exited(0,done)");
+        assert!(!line.contains("cause:"), "{line}");
+        // A live session never has a cause.
+        assert_eq!(exit_cause(&info(None, Some(75), None)), None);
+    }
+
+    #[test]
+    fn session_list_json_adds_cause_only_when_it_applies() {
+        let rows = sessions_json(&[
+            info(Some(1), Some(75), None),
+            info(Some(1), Some(1), None),
+            info(Some(1), Some(0), Some("done")),
+        ])
+        .unwrap();
+        assert_eq!(rows[0]["cause"], "remote-exec-lost");
+        assert_eq!(rows[0]["exit_code"], 75);
+        assert!(rows[1].get("cause").is_none());
+        assert!(rows[2].get("cause").is_none());
     }
 
     #[test]
