@@ -398,9 +398,6 @@ pub(crate) fn new_core(
     ))
 }
 
-/// `--exact-branch`: `name` verbatim as the branch, no prefix/numbering.
-/// Unlike the plain-name path (which dedupes with a `-N` suffix), an existing
-/// branch is refused rather than attached or renamed.
 /// Whether the stable channel's config clamp drops `[env.<name>]` — the same
 /// `Config::clamp_to_channel` the daemon applies at load, run over a copy of
 /// just the env table, so the classifier cannot drift from the real clamp.
@@ -455,6 +452,9 @@ fn refuse_dev_env_on_stable_daemon(cfg: &Config, env: Option<&str>) -> Result<()
     dev_env_daemon_refusal(e, cli_allows, needs_dev, daemon.as_deref()).map_err(anyhow::Error::msg)
 }
 
+/// `--exact-branch`: `name` verbatim as the branch, no prefix/numbering.
+/// Unlike the plain-name path (which dedupes with a `-N` suffix), an existing
+/// branch is refused rather than attached or renamed.
 pub(crate) fn exact_branch_name(
     name: Option<&str>,
     taken: impl Fn(&str) -> bool,

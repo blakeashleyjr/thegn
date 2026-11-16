@@ -1672,16 +1672,27 @@ fn daemon_channel_line(cli: thegn_core::channel::Channel, daemon: Option<Option<
     }
 }
 
-/// Probe an already-running daemon for its channel: connect-only (never
-/// spawns), each request bounded by the scope-probe timeout.
+/// Probe an already-running daemon for its channel: probes this state dir's
+/// unix socket only; never opens the state DB or spawns.
 fn probe_daemon_channel(cfg: &Config) -> Option<Option<String>> {
+    use crate::daemon::client::{StopProbe, daemon_channel, probe_stop_target};
+    use thegn_svc::control::client::{ControlAddr, ControlClient};
+    let socket = crate::daemon::socket_path(&cfg.daemon);
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
         .ok()?;
     rt.block_on(async {
-        let client = crate::daemon::client::connect_daemon(&cfg.daemon).await?;
-        Some(crate::daemon::client::daemon_channel(&client).await)
+        let client = ControlClient::new(ControlAddr::Unix(socket));
+        let probe = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            probe_stop_target(&client, &crate::daemon::scope_aliases()),
+        )
+        .await;
+        match probe {
+            Ok(StopProbe::Ours) => Some(daemon_channel(&client).await),
+            _ => None,
+        }
     })
 }
 
