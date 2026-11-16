@@ -665,6 +665,19 @@ pub fn confirm_menu(
     .with_body(body)
 }
 
+/// [`confirm_menu`] (always `danger`) with the cursor pre-set on `cancel`, so
+/// Enter alone does nothing: the user must move to `confirm` (or press `y`).
+pub fn confirm_menu_default_cancel(
+    title: impl Into<String>,
+    body: impl Into<String>,
+    tag: &'static str,
+    arg: String,
+) -> MenuOverlay {
+    let mut m = confirm_menu(title, body, tag, arg, true);
+    m.selected = 1;
+    m
+}
+
 /// Choose a merge method after reviewing the cached blockers.
 pub fn pr_merge_menu(number: u64, blockers: &[String]) -> MenuOverlay {
     let danger = !blockers.is_empty();

@@ -128,6 +128,7 @@ impl DetailOverlay {
     /// dropped.
     pub(crate) fn enter_ci_view(&mut self, run: &thegn_core::ci::CiRun) {
         self.content = DetailContent::Sections(SectionsDetail {
+            cursor: None,
             sections: vec![
                 ci_header_section(run),
                 Section::Heading {
@@ -288,7 +289,7 @@ impl DetailOverlay {
             }));
         }
         self.title = ci_drill_title(run);
-        self.content = DetailContent::Sections(SectionsDetail { sections: secs });
+        self.content = DetailContent::Sections(SectionsDetail::plain(secs));
         self.rows = self.content_rows().clamp(3, 22);
         // A live re-fill of the same in-flight run keeps the user's scroll
         // position; a fresh drill starts at the top.
