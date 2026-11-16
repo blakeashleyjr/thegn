@@ -625,6 +625,7 @@ fn run_inner(
                     stdout: Capture::default(),
                     stderr: Capture::default(),
                     containment: Containment::ProcessGroup,
+                    idle_expired: false,
                 },
                 InputFeed::default(),
             );
@@ -693,6 +694,7 @@ fn run_inner(
                 stdout: Capture::default(),
                 stderr: Capture::default(),
                 containment: Containment::ProcessGroup,
+                idle_expired: false,
             },
             pipes.feed.state,
         );
@@ -714,6 +716,9 @@ fn run_inner(
     let mut backoff = POLL_INTERVAL;
     let mut liveness = LivenessScan::default();
     let mut leader_first = false;
+    // Idle-output clock: starts at spawn, reset by every chunk read before the leader exits.
+    let mut last_output = start;
+    let mut idle_expired = false;
     let mut end = loop {
         if cancel.load(Ordering::Acquire) {
             break End::Cancelled;
@@ -766,8 +771,20 @@ fn run_inner(
         }
         if out.capture.total.saturating_add(err.capture.total) > before {
             backoff = POLL_INTERVAL;
+            last_output = Instant::now();
         }
-        let remaining = deadline.saturating_duration_since(Instant::now());
+        // Checked after the drain, so output that arrived during the last nap resets the clock
+        // before it can expire.
+        let idle_deadline = limits
+            .idle_output
+            .and_then(|span| last_output.checked_add(span));
+        if idle_deadline.is_some_and(|idle| Instant::now() >= idle) {
+            idle_expired = true;
+            break End::TimedOut;
+        }
+        // The nap wakes for whichever bound comes first; the timeout check above still runs first.
+        let wake = idle_deadline.map_or(deadline, |idle| deadline.min(idle));
+        let remaining = wake.saturating_duration_since(Instant::now());
         if let Err(_error) = nap(&mut pipes, backoff.min(remaining)) {}
         backoff = crate::next_backoff(backoff, remaining);
     };
@@ -872,6 +889,8 @@ fn run_inner(
         Ok(None) => {}
         Err(_error) => {}
     }
+    // A reader-grace OutputLimit overrides the end; the flag only ever accompanies TimedOut.
+    let idle_expired = idle_expired && matches!(&end, End::TimedOut);
     let mut run = Run {
         end,
         group,
@@ -880,6 +899,7 @@ fn run_inner(
         stdout: out.capture,
         stderr: err.capture,
         containment: Containment::ProcessGroup,
+        idle_expired,
     };
     aggregate_fit(
         &mut run.stdout,
@@ -1933,5 +1953,126 @@ mod tests {
         );
         assert!(run.success());
         assert!(run.stdout.bytes.is_empty());
+    }
+
+    fn idle_limits(timeout: Duration, idle: Option<Duration>) -> Limits {
+        Limits {
+            idle_output: idle,
+            ..limits(timeout)
+        }
+    }
+
+    #[test]
+    fn idle_output_ends_a_silent_child_long_before_the_timeout() {
+        let scripts = Scripts::new();
+        let script = scripts.write("idle-silent.sh", "printf x\nsleep 30\n");
+        let started = Instant::now();
+        let run = run(
+            &mut command(&script),
+            &idle_limits(Duration::from_secs(20), Some(Duration::from_millis(300))),
+            &AtomicBool::new(false),
+        );
+        assert!(matches!(&run.end, End::TimedOut), "{:?}", run.end);
+        assert!(run.idle_expired);
+        assert_eq!(run.group, GroupState::Terminated);
+        assert!(matches!(run.leader, Leader::Reaped(_)));
+        assert_eq!(run.stdout.bytes, b"x");
+        assert!(started.elapsed() < Duration::from_secs(10));
+    }
+
+    #[test]
+    fn idle_output_expires_a_child_with_no_pipes_that_never_writes() {
+        let scripts = Scripts::new();
+        let script = scripts.write("idle-null.sh", "sleep 30\n");
+        let limits = Limits {
+            idle_output: Some(Duration::from_millis(300)),
+            ..Limits::silent(Duration::from_secs(20))
+        };
+        let started = Instant::now();
+        let run = run(&mut command(&script), &limits, &AtomicBool::new(false));
+        assert!(matches!(&run.end, End::TimedOut), "{:?}", run.end);
+        assert!(run.idle_expired);
+        assert!(started.elapsed() < Duration::from_secs(10));
+    }
+
+    #[test]
+    fn steady_stdout_resets_the_idle_clock() {
+        let scripts = Scripts::new();
+        // 20 writes 100 ms apart: about 2 s of output, twice the idle bound.
+        let script = scripts.write(
+            "idle-steady.sh",
+            "i=0\nwhile [ $i -lt 20 ]; do printf x; sleep 0.1; i=$((i+1)); done\n",
+        );
+        let started = Instant::now();
+        let run = run(
+            &mut command(&script),
+            &idle_limits(Duration::from_secs(20), Some(Duration::from_secs(1))),
+            &AtomicBool::new(false),
+        );
+        assert!(matches!(&run.end, End::LeaderExited), "{:?}", run.end);
+        assert!(!run.idle_expired);
+        assert!(run.success());
+        assert_eq!(run.stdout.total, 20);
+        assert!(started.elapsed() > Duration::from_secs(1));
+    }
+
+    #[test]
+    fn stderr_only_consume_output_resets_the_idle_clock() {
+        let scripts = Scripts::new();
+        let script = scripts.write(
+            "idle-stderr.sh",
+            "i=0\nwhile [ $i -lt 20 ]; do printf e >&2; sleep 0.1; i=$((i+1)); done\n",
+        );
+        let limits = Limits {
+            stdout: Stream::Tail { cap: 64 },
+            stderr: Stream::Consume,
+            idle_output: Some(Duration::from_secs(1)),
+            ..Limits::silent(Duration::from_secs(20))
+        };
+        let mut seen = Vec::new();
+        let run = run_consuming_streams(
+            &mut command(&script),
+            &limits,
+            &AtomicBool::new(false),
+            &mut |which: Which, bytes: &[u8]| {
+                if which == Which::Stderr {
+                    seen.extend_from_slice(bytes);
+                }
+            },
+        );
+        assert!(matches!(&run.end, End::LeaderExited), "{:?}", run.end);
+        assert!(!run.idle_expired);
+        assert!(run.success());
+        assert_eq!(seen.len(), 20);
+        assert_eq!(run.stdout.total, 0);
+    }
+
+    #[test]
+    fn no_idle_bound_lets_a_quiet_child_finish() {
+        let scripts = Scripts::new();
+        let script = scripts.write("idle-none.sh", "printf a\nsleep 1\nprintf b\n");
+        let run = run(
+            &mut command(&script),
+            &idle_limits(Duration::from_secs(20), None),
+            &AtomicBool::new(false),
+        );
+        assert!(run.success());
+        assert!(!run.idle_expired);
+        assert_eq!(run.stdout.bytes, b"ab");
+    }
+
+    #[test]
+    fn shorter_timeout_wins_over_idle_output() {
+        let scripts = Scripts::new();
+        let script = scripts.write("idle-timeout.sh", "sleep 30\n");
+        let started = Instant::now();
+        let run = run(
+            &mut command(&script),
+            &idle_limits(Duration::from_millis(300), Some(Duration::from_secs(15))),
+            &AtomicBool::new(false),
+        );
+        assert!(matches!(&run.end, End::TimedOut), "{:?}", run.end);
+        assert!(!run.idle_expired);
+        assert!(started.elapsed() < Duration::from_secs(10));
     }
 }
