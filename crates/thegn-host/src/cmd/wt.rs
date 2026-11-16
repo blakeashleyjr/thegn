@@ -1485,6 +1485,29 @@ fn unregistered_live_branch(worktree: &std::path::Path, delete_branch: bool) -> 
     }
 }
 
+/// Which branch `--delete-branch` acts on when Git gave no live branch.
+#[derive(Debug, PartialEq, Eq)]
+enum BranchChoice {
+    Live(String),
+    Recorded,
+    Skip,
+}
+
+/// A live branch wins; for a remote/in-env row with no live branch the recorded one is used only
+/// when it exists as a local ref; otherwise skip the branch step (teardown still proceeds).
+fn branch_for_delete(
+    live: Option<&str>,
+    recorded: &str,
+    remote: bool,
+    local_ref_exists: bool,
+) -> BranchChoice {
+    match live {
+        Some(b) => BranchChoice::Live(b.to_string()),
+        None if remote && !recorded.is_empty() && local_ref_exists => BranchChoice::Recorded,
+        None => BranchChoice::Skip,
+    }
+}
+
 /// `wt rm` — the TUI's `delete_groups` pipeline, synchronous: resolve →
 /// confirm → provider/sandbox teardown → `git worktree remove` → DB cleanup.
 pub(super) fn rm(cfg: &Config, target: &str, delete_branch: bool, force: bool) -> Result<()> {
@@ -1496,7 +1519,7 @@ pub(super) fn rm(cfg: &Config, target: &str, delete_branch: bool, force: bool) -
 pub(super) fn rm_with(
     cfg: &Config,
     target: &str,
-    delete_branch: bool,
+    mut delete_branch: bool,
     force: bool,
     announce: bool,
 ) -> Result<()> {
@@ -1590,11 +1613,33 @@ pub(super) fn rm_with(
     // (path, live branch, repo root, the matched row's own tab, recorded branch)
     let (path, branch, repo_root, row_tab, recorded_branch) = match matches.as_slice() {
         [w] => {
-            let branch = live_branch(w);
+            let mut branch = live_branch(w);
             if delete_branch && branch.is_none() {
-                anyhow::bail!(
-                    "cannot delete branch for {target_path}: Git did not provide a live branch"
-                );
+                let remote = is_remote(w);
+                let exists = remote
+                    && !w.branch.is_empty()
+                    && !w.repo_root.is_empty()
+                    && base_has_commits(
+                        std::path::Path::new(&w.repo_root),
+                        &format!("refs/heads/{}", w.branch),
+                    )
+                    .unwrap_or(false);
+                match branch_for_delete(None, &w.branch, remote, exists) {
+                    BranchChoice::Recorded => branch = Some(w.branch.clone()),
+                    BranchChoice::Live(b) => branch = Some(b),
+                    BranchChoice::Skip => {
+                        if remote {
+                            msg::warn(&format!(
+                                "branch unknown for {target_path}; sandbox torn down, branch kept"
+                            ));
+                            delete_branch = false;
+                        } else {
+                            anyhow::bail!(
+                                "cannot delete branch for {target_path}: Git did not provide a live branch"
+                            );
+                        }
+                    }
+                }
             }
             (
                 w.worktree.clone(),
@@ -1841,6 +1886,31 @@ mod rm_tests {
             None,
             "a detached main worktree has no checked-out branch"
         );
+    }
+
+    #[test]
+    fn branch_for_delete_table() {
+        use BranchChoice::*;
+        assert_eq!(
+            branch_for_delete(Some("a"), "b", true, true),
+            Live("a".into())
+        );
+        assert_eq!(branch_for_delete(None, "b", true, true), Recorded);
+        assert_eq!(branch_for_delete(None, "b", true, false), Skip);
+        assert_eq!(branch_for_delete(None, "", true, true), Skip);
+        assert_eq!(branch_for_delete(None, "b", false, true), Skip);
+    }
+
+    #[test]
+    fn recorded_branch_local_ref_probe() {
+        let dir = tempfile::tempdir_in("/tmp").unwrap();
+        guard_repo(dir.path());
+        assert!(thegn_core::util::git_ok(
+            dir.path(),
+            &["-c", "commit.gpgsign=false", "branch", "tg/x"]
+        ));
+        assert!(base_has_commits(dir.path(), "refs/heads/tg/x").unwrap());
+        assert!(!base_has_commits(dir.path(), "refs/heads/tg/nope").unwrap());
     }
 
     #[test]
