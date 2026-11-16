@@ -7,6 +7,23 @@ All notable changes to **thegn** are documented here. The format follows
 
 ## [Unreleased]
 
+### Added
+
+- The fleet popup gains row actions to stop or destroy a VM (with confirmation), and the cpu/mem popup can jump to a row's worktree or pane. (THE-2020, THE-2025)
+- `[placement.fleet_budget.<provider>]` sets `warn_hourly`/`max_hourly` caps; `thegn fleet cost` lists breaches, and new provider sandboxes are refused at the cap. (THE-2020)
+- `thegn agent run` opens a headless agent in a worktree, optionally waits for it, and prints its output tail. (THE-2005)
+
+### Changed
+
+- The monitor containers tab shows minicore rows and a cpu/memory scatter. (THE-842)
+
+### Fixed
+
+- Daemon agent launches honour `{prompt_file}`, and agent payloads are capped at 1 MiB. (THE-1986)
+- The loading splash no longer reopens the database on every step. (THE-2001)
+- Quitting cancels a hung sshfs/rsync projection mount. (THE-251)
+- Disk reclaim prunes orphaned build artifacts and stale live-build dirs. (THE-1997)
+
 ## [0.1.0-alpha.89] — 2026-11-16
 
 ### Added
