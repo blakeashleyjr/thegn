@@ -208,6 +208,15 @@ pub enum DetailAction {
         path: String,
         action: crate::handlers::merge_queue::SidebarMq,
     },
+    /// Stop (`stop: true`) or destroy a provider VM bound to `worktree` — the
+    /// fleet popup's `s`/`d`. The loop asks for confirmation, then runs
+    /// `thegn env down [--stop] <worktree>` in a visible tab (never `--force`).
+    /// `label` names the VM in the confirm title.
+    FleetDown {
+        worktree: String,
+        label: String,
+        stop: bool,
+    },
 }
 
 impl DetailAction {
@@ -364,6 +373,36 @@ impl LogDetail {
 /// stacked height exceeds the box.
 pub struct SectionsDetail {
     pub sections: Vec<Section>,
+    /// A row cursor over one of the tables, when the popup's rows are
+    /// actionable. `None` keeps the popup scroll-only, exactly as before.
+    pub cursor: Option<SectionsCursor>,
+}
+
+impl SectionsDetail {
+    /// A scroll-only stack (no row cursor).
+    pub fn plain(sections: Vec<Section>) -> SectionsDetail {
+        SectionsDetail {
+            sections,
+            cursor: None,
+        }
+    }
+}
+
+/// A row cursor over `sections[table]` (a [`Section::Table`]): one
+/// [`RowActs`] per body row of that table. The overlay's `sel` is the row
+/// index; the table's own [`TableSection::sel`] mirrors it for painting.
+pub struct SectionsCursor {
+    pub table: usize,
+    pub rows: Vec<RowActs>,
+}
+
+/// What one cursor row does: `enter` on Enter, each `(char, action)` on that
+/// key. `id` is the row's identity (a fleet VM's `provider/id`, a cpu row's
+/// path or pid) so a rebuild keeps the cursor on the same row.
+pub struct RowActs {
+    pub id: String,
+    pub enter: Option<DetailAction>,
+    pub keys: Vec<(char, DetailAction)>,
 }
 
 // The block vocabulary now lives in `crate::sections`, shared with the
@@ -534,12 +573,27 @@ impl DetailOverlay {
     /// A list is actionable (row-cursor, not just scroll) when any row carries an
     /// `enter` or char-keyed action. Non-actionable lists keep pure scroll.
     fn actionable(&self) -> bool {
-        matches!(&self.content, DetailContent::List(l)
-            if l.rows.iter().any(|r| r.enter.is_some() || !r.actions.is_empty()))
+        match &self.content {
+            DetailContent::List(l) => l
+                .rows
+                .iter()
+                .any(|r| r.enter.is_some() || !r.actions.is_empty()),
+            DetailContent::Sections(d) => d.cursor.as_ref().is_some_and(|c| !c.rows.is_empty()),
+            _ => false,
+        }
+    }
+
+    /// The Sections cursor, when this is a Sections popup carrying one.
+    fn sections_cursor(&self) -> Option<&SectionsCursor> {
+        match &self.content {
+            DetailContent::Sections(d) => d.cursor.as_ref(),
+            _ => None,
+        }
     }
 
     /// Row indices the cursor may land on — every list row except dim group
-    /// [`DetailRow::header`]s. Empty for non-list content.
+    /// [`DetailRow::header`]s, or every row of a Sections cursor table. Empty
+    /// otherwise.
     fn selectable_indices(&self) -> Vec<usize> {
         match &self.content {
             DetailContent::List(l) => l
@@ -549,8 +603,70 @@ impl DetailOverlay {
                 .filter(|(_, r)| !r.header)
                 .map(|(i, _)| i)
                 .collect(),
+            DetailContent::Sections(d) => d
+                .cursor
+                .as_ref()
+                .map_or_else(Vec::new, |c| (0..c.rows.len()).collect()),
             _ => Vec::new(),
         }
+    }
+
+    /// Mirror `sel` into the cursor table's [`TableSection::sel`] (which paints
+    /// the cursor row), clamping `sel` to the table first.
+    fn sync_sections_sel(&mut self) {
+        let DetailContent::Sections(d) = &mut self.content else {
+            return;
+        };
+        let Some(c) = &d.cursor else {
+            return;
+        };
+        self.sel = self.sel.min(c.rows.len().saturating_sub(1));
+        let sel = (!c.rows.is_empty()).then_some(self.sel);
+        if let Some(Section::Table(t) | Section::FixedTable { table: t, .. }) =
+            d.sections.get_mut(c.table)
+        {
+            t.sel = sel;
+        }
+    }
+
+    /// The stacked row offset of the Sections cursor row (the heights of every
+    /// section above the table, its header row, then `sel`).
+    fn sections_sel_offset(&self) -> Option<usize> {
+        let DetailContent::Sections(d) = &self.content else {
+            return None;
+        };
+        let c = d.cursor.as_ref()?;
+        let above: usize = d.sections.iter().take(c.table).map(Section::height).sum();
+        let header = match d.sections.get(c.table) {
+            Some(Section::Table(t) | Section::FixedTable { table: t, .. }) => {
+                usize::from(!t.header.is_empty())
+            }
+            _ => 0,
+        };
+        Some(above + header + self.sel)
+    }
+
+    /// Replace a Sections popup's content, keeping the cursor on the row with
+    /// the same [`RowActs::id`] (or clamping it when that row is gone), then
+    /// keep the scroll inside range and the cursor row in view. The caller
+    /// sets `rows` first.
+    pub(crate) fn set_sections(&mut self, detail: SectionsDetail) {
+        let old_id = self
+            .sections_cursor()
+            .and_then(|c| c.rows.get(self.sel))
+            .map(|r| r.id.clone());
+        if let (Some(id), Some(c)) = (old_id, detail.cursor.as_ref())
+            && let Some(i) = c.rows.iter().position(|r| r.id == id)
+        {
+            self.sel = i;
+        }
+        if detail.cursor.is_none() {
+            self.sel = 0;
+        }
+        self.content = DetailContent::Sections(detail);
+        self.sync_sections_sel();
+        self.scroll = self.scroll.min(self.scroll_max());
+        self.scroll_to_sel();
     }
 
     /// Move the row cursor by `delta` *selectable* rows (skipping headers),
@@ -562,7 +678,16 @@ impl DetailOverlay {
         }
         let cur = idx.iter().position(|&i| i == self.sel).unwrap_or(0) as i32;
         let next = (cur + delta).clamp(0, idx.len() as i32 - 1) as usize;
+        let parked = idx[next] == self.sel;
         self.sel = idx[next];
+        self.sync_sections_sel();
+        // A Sections cursor already on its last row keeps scrolling the stack
+        // down, so sections below the cursor table (fleet totals, key hints)
+        // stay reachable. Moving up brings the cursor row back into view.
+        if parked && delta > 0 && self.sections_cursor().is_some() {
+            self.scroll = (self.scroll + delta.unsigned_abs() as usize).min(self.scroll_max());
+            return;
+        }
         self.scroll_to_sel();
     }
 
@@ -575,6 +700,21 @@ impl DetailOverlay {
 
     /// Keep the selected row inside the scroll window.
     fn scroll_to_sel(&mut self) {
+        // A Sections cursor scrolls the whole stack: follow the cursor row's
+        // stacked offset, never past the overflow.
+        if let Some(row) = self.sections_sel_offset() {
+            let vis = self.rows.max(1);
+            if row < self.scroll {
+                self.scroll = row;
+            } else if row >= self.scroll + vis {
+                self.scroll = row + 1 - vis;
+            }
+            self.scroll = self.scroll.min(self.scroll_max());
+            return;
+        }
+        if matches!(self.content, DetailContent::Sections(_)) {
+            return;
+        }
         let vis = self.visible_rows().max(1);
         if self.sel < self.scroll {
             self.scroll = self.sel;
@@ -585,6 +725,14 @@ impl DetailOverlay {
 
     /// The action bound to `key` on the selected row (if any).
     fn action_for(&self, key: char) -> Option<DetailAction> {
+        if let Some(c) = self.sections_cursor() {
+            return c.rows.get(self.sel).and_then(|r| {
+                r.keys
+                    .iter()
+                    .find(|(k, _)| *k == key)
+                    .map(|(_, a)| a.clone())
+            });
+        }
         let DetailContent::List(l) = &self.content else {
             return None;
         };
@@ -667,6 +815,13 @@ impl DetailOverlay {
                             DetailOutcome::Act(DetailAction::DrillCiRun { run })
                         }
                         Some(a) => DetailOutcome::Act(a),
+                        // A Sections cursor row with no Enter action falls
+                        // through to the popup's plain Enter (expand into the
+                        // monitor, or close).
+                        None if self.sections_cursor().is_some() => match self.monitor_tab {
+                            Some(tab) => DetailOutcome::Act(DetailAction::OpenMonitor { tab }),
+                            None => DetailOutcome::Close,
+                        },
                         None => DetailOutcome::Pending,
                     }
                 } else if let Some(tab) = self.monitor_tab {
@@ -728,6 +883,9 @@ impl DetailOverlay {
 
     /// The Enter action for the selected row (if any).
     fn selected_enter(&self) -> Option<DetailAction> {
+        if let Some(c) = self.sections_cursor() {
+            return c.rows.get(self.sel).and_then(|r| r.enter.clone());
+        }
         let DetailContent::List(l) = &self.content else {
             return None;
         };
@@ -1519,10 +1677,27 @@ fn sections(
     placement: Placement,
     screen: Rect,
 ) -> DetailOverlay {
-    let content = secs.iter().map(Section::height).sum::<usize>().max(1);
+    sections_detail(title, cols, SectionsDetail::plain(secs), placement, screen)
+}
+
+/// [`sections`] for a stack that may carry a row cursor: the cursor starts on
+/// the first row, painted, with the scroll following it.
+fn sections_detail(
+    title: &str,
+    cols: usize,
+    detail: SectionsDetail,
+    placement: Placement,
+    screen: Rect,
+) -> DetailOverlay {
+    let content = detail
+        .sections
+        .iter()
+        .map(Section::height)
+        .sum::<usize>()
+        .max(1);
     let mut ov = DetailOverlay {
         title: title.to_string(),
-        content: DetailContent::Sections(SectionsDetail { sections: secs }),
+        content: DetailContent::Sections(SectionsDetail::plain(Vec::new())),
         cols,
         rows: content,
         placement,
@@ -1535,6 +1710,7 @@ fn sections(
         ci_autofix: None,
     };
     fit_to_screen(&mut ov, screen);
+    ov.set_sections(detail);
     ov
 }
 
@@ -1602,7 +1778,7 @@ fn widget_detail_inner(
                 mx * 100.0
             );
             // The history graph, then who is using it (heaviest CPU first).
-            let mut secs = vec![Section::Graph(GraphSection {
+            let secs = vec![Section::Graph(GraphSection {
                 label: "CPU".into(),
                 cur,
                 footer: Some(footer),
@@ -1612,14 +1788,9 @@ fn widget_detail_inner(
                 series2: None,
                 ..Default::default()
             })];
-            secs.extend(cpu_attrib::sections_for(model, cpu_attrib::TITLE).unwrap_or_default());
-            Some(sections(
-                cpu_attrib::TITLE,
-                cpu_attrib::COLS,
-                secs,
-                near,
-                ctx.screen,
-            ))
+            let mut ov = sections(cpu_attrib::TITLE, cpu_attrib::COLS, secs, near, ctx.screen);
+            cpu_attrib::install(&mut ov, model, ctx.screen);
+            Some(ov)
         }
         "mem" => {
             let series = hist.mem_series(n);
@@ -1673,14 +1844,15 @@ fn widget_detail_inner(
                 });
             }
             // Who holds it, heaviest resident set first.
-            secs.extend(cpu_attrib::sections_for(model, cpu_attrib::MEM_TITLE).unwrap_or_default());
-            Some(sections(
+            let mut ov = sections(
                 cpu_attrib::MEM_TITLE,
                 cpu_attrib::COLS,
                 secs,
                 near,
                 ctx.screen,
-            ))
+            );
+            cpu_attrib::install(&mut ov, model, ctx.screen);
+            Some(ov)
         }
         "temp" => {
             s.cpu_temp_c?;
