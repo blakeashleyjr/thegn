@@ -706,8 +706,7 @@ mod tests {
 
     #[test]
     fn inventory_provider_needs_only_a_token() {
-        let _state = thegn_core::testenv::IsolatedState::new();
-        let _env = thegn_core::testenv::EnvGuard::set(&[("TG_TEST_INV_TOKEN", "tok")]);
+        let _state = crate::testenv::IsolatedState::with_env(&[("TG_TEST_INV_TOKEN", "tok")]);
         for kind in ["fly", "hetzner", "machine0"] {
             let pc = thegn_core::config::EnvProviderConfig {
                 provider: kind.into(),
@@ -720,7 +719,7 @@ mod tests {
 
     #[test]
     fn inventory_provider_error_names_the_cause() {
-        let _state = thegn_core::testenv::IsolatedState::new();
+        let _state = crate::testenv::IsolatedState::new();
         let pc = thegn_core::config::EnvProviderConfig {
             provider: "fly".into(),
             api_key_env: "TG_TEST_INV_NO_SUCH_TOKEN".into(),
