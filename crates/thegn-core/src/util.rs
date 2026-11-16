@@ -1775,6 +1775,9 @@ pub enum GitPathError {
     /// The output was not exactly one path (embedded newline or NUL, or not
     /// representable as a native path).
     Malformed,
+    /// A remote or provider location printed a path that is not valid UTF-8,
+    /// so it cannot be passed back over the transport as a command argument.
+    UnsupportedRemotePath,
 }
 
 impl std::fmt::Display for GitPathError {
@@ -1783,6 +1786,9 @@ impl std::fmt::Display for GitPathError {
             Self::Git(outcome) => write!(f, "{outcome}"),
             Self::Empty => f.write_str("git printed no path"),
             Self::Malformed => f.write_str("git printed a malformed path"),
+            Self::UnsupportedRemotePath => f.write_str(
+                "the remote path is not valid UTF-8 and cannot be passed back over the transport",
+            ),
         }
     }
 }
@@ -1792,7 +1798,7 @@ impl std::error::Error for GitPathError {}
 /// Strip exactly one trailing line terminator (`\n`, optionally preceded by a
 /// `\r` for Git for Windows) and validate that what remains is one path.
 /// Nothing else is trimmed: a path may legitimately end in whitespace.
-fn path_bytes_from_output(bytes: &[u8]) -> Result<&[u8], GitPathError> {
+pub(crate) fn path_bytes_from_output(bytes: &[u8]) -> Result<&[u8], GitPathError> {
     let body = bytes.strip_suffix(b"\n").unwrap_or(bytes);
     let body = if body.len() != bytes.len() {
         body.strip_suffix(b"\r").unwrap_or(body)
@@ -3270,6 +3276,11 @@ mod tests {
         assert_eq!(
             GitPathError::Malformed.to_string(),
             "git printed a malformed path"
+        );
+        assert!(
+            GitPathError::UnsupportedRemotePath
+                .to_string()
+                .contains("not valid UTF-8")
         );
         assert!(
             !GitPathError::Git(GitOutcome::EmptyRefused)

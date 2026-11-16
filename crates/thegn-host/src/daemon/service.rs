@@ -145,6 +145,11 @@ pub(crate) static CI_LOG_FLIGHTS: CiLogFlights = CiLogFlights::new();
 /// `MAX_CONCURRENT_CI_LOG_FETCHES x LOG_COLLECTOR_PEAK_BYTES` of streamed provider log at once, however many clients call.
 pub(crate) const MAX_CONCURRENT_CI_LOG_FETCHES: usize = 2;
 
+/// One run-detail call plus one log call share this deadline; each provider
+/// call's own timeout is clipped to what is left. Permit queue wait is not counted.
+pub(crate) const CI_LOGS_OPERATION_DEADLINE: std::time::Duration =
+    std::time::Duration::from_secs(90);
+
 /// How long a cache-missing `ci.logs` request waits for a fetch slot before a typed busy refusal (well under the ingest wall).
 pub(crate) const CI_LOG_FETCH_PERMIT_WAIT: std::time::Duration = std::time::Duration::from_secs(30);
 
@@ -163,6 +168,35 @@ pub(crate) async fn acquire_fetch_permit(
     match tokio::time::timeout(wait, sem.acquire()).await {
         Ok(Ok(permit)) => Ok(permit),
         Ok(Err(_)) | Err(_) => Err(CiLogFetchBusy),
+    }
+}
+
+/// Bound on concurrent daemon `ci.runs` provider listings: at most
+/// `MAX_CONCURRENT_CI_RUNS_FETCHES x` the 8 MiB runs stdout cap (plus its parsed JSON tree) is held at once,
+/// however many clients call.
+pub(crate) const MAX_CONCURRENT_CI_RUNS_FETCHES: usize = 2;
+
+/// How long a cache-missing `ci.runs` request waits for a listing slot before a typed busy refusal.
+pub(crate) const CI_RUNS_FETCH_PERMIT_WAIT: std::time::Duration =
+    std::time::Duration::from_secs(30);
+
+pub(crate) static CI_RUNS_FETCH_PERMITS: tokio::sync::Semaphore =
+    tokio::sync::Semaphore::const_new(MAX_CONCURRENT_CI_RUNS_FETCHES);
+
+/// The typed refusal for a `ci.runs` request that found no listing slot in time.
+fn runs_busy_error() -> ControlError {
+    ControlError::Unavailable(format!(
+        "{MAX_CONCURRENT_CI_RUNS_FETCHES} CI run listings are already running; retry ci.runs shortly"
+    ))
+}
+
+/// Sets the shared cancel flag when dropped, so a dropped request future cancels the provider child
+/// its blocking task is running. Held by the async fn, never moved into the blocking closure.
+struct CancelOnDrop(Arc<std::sync::atomic::AtomicBool>);
+
+impl Drop for CancelOnDrop {
+    fn drop(&mut self) {
+        self.0.store(true, std::sync::atomic::Ordering::Release);
     }
 }
 
@@ -2312,9 +2346,16 @@ impl ControlApi for DaemonService {
             let cfg = self.config.ci.clone();
             let provider_path = path.clone();
             let provider_branch = branch.clone();
+            let runs_permit =
+                acquire_fetch_permit(&CI_RUNS_FETCH_PERMITS, CI_RUNS_FETCH_PERMIT_WAIT)
+                    .await
+                    .map_err(|CiLogFetchBusy| runs_busy_error())?;
+            let cancel = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let _cancel_on_drop = CancelOnDrop(cancel.clone());
             let fetched = tokio::task::spawn_blocking(move || {
+                let _runs_permit = runs_permit;
                 let loc = thegn_core::remote::GitLoc::for_worktree(&provider_path);
-                match thegn_svc::ci::provider_and_context_for(&loc, &cfg) {
+                match thegn_svc::ci::provider_and_context_for_cancellable(&loc, &cfg, cancel) {
                     Some((client, context)) => (
                         Some(
                             client
@@ -2498,12 +2539,19 @@ impl ControlApi for DaemonService {
             let run_for_provider = run_id_owned.clone();
             let job_for_provider = job_id_owned.clone();
             let flight_for_provider = flight;
+            let cancel = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let _cancel_on_drop = CancelOnDrop(cancel.clone());
             let (mut entry, warnings, _flight, _permit) = tokio::task::spawn_blocking(move || {
                 let flight = flight_for_provider;
+                let deadline = std::time::Instant::now() + CI_LOGS_OPERATION_DEADLINE;
                 let permit = permit;
                 let loc = thegn_core::remote::GitLoc::for_worktree(&provider_path);
-                let Some((client, context)) = thegn_svc::ci::provider_and_context_for(&loc, &cfg)
-                else {
+                let Some((client, context)) = thegn_svc::ci::provider_and_context_for_deadline(
+                    &loc,
+                    &cfg,
+                    cancel,
+                    Some(deadline),
+                ) else {
                     return Ok(None);
                 };
                 let detail = client
@@ -4744,6 +4792,14 @@ mod tests {
         }
     }
 
+    #[test]
+    fn ci_logs_operation_deadline_is_ninety_seconds() {
+        assert_eq!(
+            CI_LOGS_OPERATION_DEADLINE,
+            std::time::Duration::from_secs(90)
+        );
+    }
+
     #[tokio::test]
     async fn ci_logs_rejects_malformed_ids_before_cache_or_provider_access() {
         let (service, _) = service(0);
@@ -4943,6 +4999,51 @@ mod tests {
         );
         drop(a);
         assert!(acquire_fetch_permit(&TEST_SEM, wait).await.is_ok());
+    }
+
+    #[test]
+    fn cancel_on_drop_sets_the_flag() {
+        let flag = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let guard = CancelOnDrop(flag.clone());
+        assert!(!flag.load(std::sync::atomic::Ordering::Acquire));
+        drop(guard);
+        assert!(flag.load(std::sync::atomic::Ordering::Acquire));
+    }
+
+    #[tokio::test]
+    async fn ci_runs_dropped_request_cancels_the_provider() {
+        // Mirrors the ci_runs wiring: guard held by the async fn, flag shared with the blocking closure.
+        let cancel = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let seen = cancel.clone();
+        let request = async move {
+            let _cancel_on_drop = CancelOnDrop(cancel);
+            std::future::pending::<()>().await;
+        };
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(50), request)
+                .await
+                .is_err()
+        );
+        assert!(seen.load(std::sync::atomic::Ordering::Acquire));
+    }
+
+    #[tokio::test]
+    async fn ci_runs_provider_fetch_concurrency_is_capped() {
+        static TEST_SEM: tokio::sync::Semaphore =
+            tokio::sync::Semaphore::const_new(MAX_CONCURRENT_CI_RUNS_FETCHES);
+        let wait = std::time::Duration::from_millis(50);
+        let _a = acquire_fetch_permit(&TEST_SEM, wait).await.expect("first");
+        let _b = acquire_fetch_permit(&TEST_SEM, wait).await.expect("second");
+        let busy = acquire_fetch_permit(&TEST_SEM, wait)
+            .await
+            .map_err(|CiLogFetchBusy| runs_busy_error());
+        match busy {
+            Err(ControlError::Unavailable(message)) => assert!(
+                message.contains("2 CI run listings are already running"),
+                "{message}"
+            ),
+            other => panic!("expected Unavailable, got {:?}", other.map(|_| ())),
+        }
     }
 
     #[tokio::test]

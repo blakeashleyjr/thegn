@@ -684,6 +684,69 @@ pub const STATE_TOOLS: &[StateToolSpec] = &[
         ],
     },
     StateToolSpec {
+        cap: "sessions.snapshot",
+        description: "The current emulator screen of a live session (the wire mirror of \
+                      `GET /v1/sessions/{s}/snapshot`): `{session, seq, cols, rows, \
+                      ansi_b64}`. Read-scoped; requires a running daemon.",
+        args: &[ArgSpec {
+            name: "session",
+            kind: ArgKind::String,
+            required: true,
+            description: "Target session id (see sessions_list)",
+        }],
+    },
+    StateToolSpec {
+        cap: "sessions.split",
+        description: "Create a sibling pane/session next to an existing one (the wire \
+                      mirror of `POST /v1/sessions/{s}/split`). It launches `argv` (a login \
+                      shell when empty) but never sends input to the target. Write-scoped \
+                      (`--scopes write`); requires a running daemon.",
+        args: &[
+            ArgSpec {
+                name: "session",
+                kind: ArgKind::String,
+                required: true,
+                description: "Existing session to split beside (see sessions_list)",
+            },
+            ArgSpec {
+                name: "dir",
+                kind: ArgKind::String,
+                required: false,
+                description: "Split direction: `right` (default) or `down`",
+            },
+            ArgSpec {
+                name: "argv",
+                kind: ArgKind::StringArray,
+                required: false,
+                description: "Program + args for the new pane (a login shell when empty)",
+            },
+            ArgSpec {
+                name: "cwd",
+                kind: ArgKind::String,
+                required: false,
+                description: "Working directory (inherits the target's when omitted)",
+            },
+            ArgSpec {
+                name: "env",
+                kind: ArgKind::Object,
+                required: false,
+                description: "Extra environment variables (var → value, both strings)",
+            },
+            ArgSpec {
+                name: "rows",
+                kind: ArgKind::Integer,
+                required: false,
+                description: "PTY rows (0 or omitted inherits the target's; at most 1000)",
+            },
+            ArgSpec {
+                name: "cols",
+                kind: ArgKind::Integer,
+                required: false,
+                description: "PTY columns (0 or omitted inherits the target's; at most 1000)",
+            },
+        ],
+    },
+    StateToolSpec {
         cap: "worktrees.open",
         description: "Open/focus a workspace in the running thegn instance (the wire mirror \
                       of `thegn open`): queues a focus request the compositor claims within \
@@ -864,6 +927,8 @@ pub const MCP_STATE_CAPS: &[&str] = &[
     "sessions.input",
     "sessions.kill",
     "sessions.resize",
+    "sessions.snapshot",
+    "sessions.split",
     "worktrees.open",
     "semantic.map",
     "semantic.blast_radius",
@@ -1007,6 +1072,7 @@ const NON_DESTRUCTIVE_WRITE_CAPS: &[&str] = &[
     "sessions.open",
     "sessions.fork",
     "sessions.resize",
+    "sessions.split",
     "worktrees.open",
 ];
 
@@ -1091,7 +1157,7 @@ pub fn redact_for_audit(cap: &str, args: &Value) -> Value {
                 }
             }
         }
-        "sessions.open" => {
+        "sessions.open" | "sessions.split" => {
             if let Some(Value::Object(env)) = out.get("env") {
                 let n = env.len();
                 out.insert("env".to_string(), json!(format!("<{n} vars>")));
@@ -1506,6 +1572,142 @@ mod tests {
     }
 
     #[test]
+    fn sessions_snapshot_and_split_are_advertised_only_when_allowed() {
+        let r = StateRouter::new(vec!["sessions.list", "worktrees.list"], |_, _| {
+            Ok(json!(null))
+        });
+        let names: Vec<String> = r
+            .tool_entries()
+            .iter()
+            .map(|t| t["name"].as_str().unwrap().to_string())
+            .collect();
+        assert!(
+            !names
+                .iter()
+                .any(|n| n == "sessions_snapshot" || n == "sessions_split")
+        );
+        let denied = StateRouter::new(vec!["sessions.list"], |_, _| -> Result<Value, String> {
+            panic!("a denied tool must not reach fetch")
+        });
+        for (tool, args, cap) in [
+            (
+                "sessions_snapshot",
+                json!({ "session": "s1" }),
+                "sessions.snapshot",
+            ),
+            (
+                "sessions_split",
+                json!({ "session": "s1" }),
+                "sessions.split",
+            ),
+        ] {
+            let (code, msg) = denied.call(tool, &args).unwrap().unwrap_err();
+            assert_eq!(code, -32001);
+            let scope = scope_of(lookup(cap).unwrap()).as_str();
+            assert!(msg.contains(&format!("--scopes {scope}")), "{msg}");
+            let spec = STATE_TOOLS.iter().find(|t| t.cap == cap).unwrap();
+            let stated = if scope == "read" {
+                "Read-scoped".to_string()
+            } else {
+                format!("`--scopes {scope}`")
+            };
+            assert!(
+                spec.description.contains(&stated),
+                "{cap}: {}",
+                spec.description
+            );
+        }
+
+        let r = StateRouter::new(vec!["sessions.snapshot", "sessions.split"], |_, _| {
+            Ok(json!(null))
+        });
+        let entries = r.tool_entries();
+        let names: Vec<&str> = entries
+            .iter()
+            .map(|e| e["name"].as_str().unwrap())
+            .collect();
+        assert_eq!(names, ["sessions_snapshot", "sessions_split"]);
+        let snap = &entries[0]["inputSchema"];
+        assert_eq!(snap["required"], json!(["session"]));
+        assert_eq!(snap["properties"].as_object().unwrap().len(), 1);
+        // Mirrors SplitBody (dir/argv/cwd/env/rows/cols) + the `{s}` path param.
+        let split = &entries[1]["inputSchema"];
+        assert_eq!(split["required"], json!(["session"]));
+        assert_eq!(split["properties"]["session"]["type"], "string");
+        assert_eq!(split["properties"]["dir"]["type"], "string");
+        assert_eq!(split["properties"]["argv"]["type"], "array");
+        assert_eq!(split["properties"]["cwd"]["type"], "string");
+        assert_eq!(split["properties"]["env"]["type"], "object");
+        assert_eq!(split["properties"]["rows"]["type"], "integer");
+        assert_eq!(split["properties"]["cols"]["type"], "integer");
+        assert_eq!(split["properties"].as_object().unwrap().len(), 7);
+    }
+
+    #[test]
+    fn sessions_snapshot_and_split_reject_wrong_typed_args_before_fetch() {
+        let r = StateRouter::new(
+            vec!["sessions.snapshot", "sessions.split"],
+            |_, _| -> Result<Value, String> { panic!("invalid args must not reach fetch") },
+        );
+        for (tool, bad) in [
+            ("sessions_snapshot", json!({})),
+            ("sessions_snapshot", json!({ "session": 7 })),
+            ("sessions_snapshot", json!({ "session": "s1", "extra": 1 })),
+            ("sessions_split", json!({})),
+            ("sessions_split", json!({ "session": 7 })),
+            ("sessions_split", json!({ "session": "s1", "dir": 1 })),
+            ("sessions_split", json!({ "session": "s1", "argv": "sh" })),
+            ("sessions_split", json!({ "session": "s1", "argv": [1] })),
+            ("sessions_split", json!({ "session": "s1", "cwd": false })),
+            ("sessions_split", json!({ "session": "s1", "env": ["A"] })),
+            ("sessions_split", json!({ "session": "s1", "rows": "24" })),
+            ("sessions_split", json!({ "session": "s1", "cols": 1.5 })),
+            ("sessions_split", json!({ "session": "s1", "bogus": true })),
+        ] {
+            let (code, _) = r.call(tool, &bad).unwrap().unwrap_err();
+            assert_eq!(code, -32602, "{tool} {bad}");
+        }
+    }
+
+    #[test]
+    fn sessions_snapshot_and_split_route_their_cap_ids_to_fetch() {
+        let r = StateRouter::new(vec!["sessions.snapshot", "sessions.split"], |cap, args| {
+            Ok(json!({ "cap": cap, "args": args }))
+        });
+        let snap = r
+            .call("sessions_snapshot", &json!({ "session": "s1" }))
+            .unwrap()
+            .unwrap();
+        let text = snap["content"][0]["text"].as_str().unwrap();
+        assert!(text.contains("sessions.snapshot"), "{text}");
+        let split = r
+            .call(
+                "sessions_split",
+                &json!({ "session": "s1", "dir": "down", "argv": ["sh"] }),
+            )
+            .unwrap()
+            .unwrap();
+        let text = split["content"][0]["text"].as_str().unwrap();
+        assert!(text.contains("sessions.split"), "{text}");
+        assert!(text.contains("down"), "{text}");
+        // Only `session` is required.
+        assert!(
+            r.call("sessions_split", &json!({ "session": "s1" }))
+                .unwrap()
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn redact_for_audit_hides_session_split_env_values() {
+        let args = json!({ "session": "s1", "env": {"API_KEY": "sk-verysecret"} });
+        let red = redact_for_audit("sessions.split", &args);
+        let env = red["env"].as_str().unwrap();
+        assert!(!env.contains("sk-verysecret"), "{env}");
+        assert!(env.contains("1 vars"), "{env}");
+    }
+
+    #[test]
     fn tool_entries_string_array_declares_items() {
         let r = StateRouter::new(vec!["sessions.open"], |_, _| Ok(json!(null)));
         let entries = r.tool_entries();
@@ -1641,6 +1843,7 @@ mod tests {
             "dispatches.list",
             "agent.sessions",
             "sessions.wait",
+            "sessions.snapshot",
             "semantic.map",
             "semantic.blast_radius",
             "automations.list",
@@ -1654,6 +1857,7 @@ mod tests {
             "sessions.input",
             "sessions.kill",
             "sessions.resize",
+            "sessions.split",
             "worktrees.open",
         ];
         // Folder assignment is a repo-local worktree metadata mutation: Git.
@@ -1843,6 +2047,8 @@ mod tests {
             ("sessions_open", false, false),
             ("sessions_fork", false, false),
             ("sessions_resize", false, false),
+            ("sessions_snapshot", true, false),
+            ("sessions_split", false, false),
             ("worktrees_open", false, false),
         ] {
             let entry = entries

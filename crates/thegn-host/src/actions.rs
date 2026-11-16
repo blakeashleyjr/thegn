@@ -623,6 +623,122 @@ fn ci_detail_flight_key(
     }
 }
 
+/// Wall-clock budget for one run-detail drill's provider log fetches: the same
+/// as the refresh ingest wall (`crate::ci_refresh::MAX_LOG_INGEST_WALL`). Past
+/// it no further `logs` call starts; cached entries are still served.
+const CI_DETAIL_WALL: std::time::Duration = std::time::Duration::from_secs(120);
+
+/// A provider can report a very large matrix. Keep detail responsive and
+/// predictable by inspecting only a bounded failed-job batch.
+const CI_DETAIL_MAX_LOG_JOBS: usize = 16;
+
+/// Cache lookup for one failed job: `Some` only for an entry that is current
+/// evidence for this run (sha, finish time, provider context, attempt).
+type DrillCachedLog<'a> =
+    dyn Fn(&thegn_core::ci::CiJob) -> Option<thegn_core::ci_log::CiLogEntry> + 'a;
+
+/// Turns a freshly fetched provider log into a bounded, redacted entry (and
+/// writes it back to the cache when that is allowed).
+type DrillFreshLog<'a> =
+    dyn Fn(&thegn_core::ci::CiJob, thegn_core::ci::CiLog) -> thegn_core::ci_log::CiLogEntry + 'a;
+
+struct DrillLogParams<'a> {
+    client: Option<&'a dyn thegn_svc::ci::CiProvider>,
+    loc: &'a thegn_core::remote::GitLoc,
+    run_id: &'a str,
+    jobs: &'a [&'a thegn_core::ci::CiJob],
+    cached: &'a DrillCachedLog<'a>,
+    fresh: &'a DrillFreshLog<'a>,
+    deadline: std::time::Instant,
+    cancel: &'a std::sync::atomic::AtomicBool,
+    log_tail_lines: usize,
+    log_max_bytes: usize,
+}
+
+#[derive(Default)]
+struct DrillLogs {
+    log_tail: Vec<String>,
+    log_entries: Vec<thegn_core::ci_log::CiLogEntry>,
+    /// The flight token was cancelled between jobs; deliver nothing.
+    cancelled: bool,
+}
+
+/// Gather the failed jobs' log tails for the drill. Cached entries are served
+/// first and at any time; a provider `logs` call starts only before
+/// `deadline` and while the flight is not cancelled. Jobs skipped by the wall
+/// are reported by one cut line at the end of `log_tail`.
+fn collect_drill_logs(params: &DrillLogParams<'_>) -> DrillLogs {
+    use std::sync::atomic::Ordering;
+    let total = params.jobs.len();
+    let mut out = DrillLogs::default();
+    let mut cut_at: Option<usize> = None;
+    for (index, &job) in params.jobs.iter().enumerate() {
+        if params.cancel.load(Ordering::Relaxed) {
+            out.cancelled = true;
+            return out;
+        }
+        let entry = match (params.cached)(job) {
+            Some(entry) => Some(entry),
+            None if std::time::Instant::now() >= params.deadline => {
+                if cut_at.is_none() {
+                    cut_at = Some(index);
+                }
+                None
+            }
+            None => params.client.and_then(|client| {
+                let log = client.logs(params.loc, params.run_id, &job.id).ok()?;
+                Some((params.fresh)(job, log))
+            }),
+        };
+        if let Some(mut entry) = entry {
+            let (text, truncated) = thegn_core::ci_log::served_window(
+                &entry.text,
+                None,
+                params.log_tail_lines,
+                params.log_max_bytes,
+            );
+            entry.text = text;
+            entry.truncated |= truncated;
+            entry.redacted = true;
+            out.log_tail.push(format!(
+                "\u{2500}\u{2500} {} \u{2500}\u{2500}",
+                entry.job_name
+            ));
+            out.log_tail.extend(entry.text.lines().map(str::to_string));
+            out.log_entries.push(entry);
+        }
+    }
+    if let Some(done) = cut_at {
+        out.log_tail.push(format!(
+            "\u{2500}\u{2500} log fetch stopped after {done} of {total} failed jobs (time limit) \u{2500}\u{2500}"
+        ));
+    }
+    out
+}
+
+/// Quit path (`crate::quit_cancel::signal_all`): cancel the running and the
+/// queued run-detail drill so their provider children are killed, and drop
+/// the queued request so no further drill starts. No wait: the drill holds no
+/// quit latch, and quit detaches after its own grace.
+pub(crate) fn cancel_ci_detail_for_shutdown() {
+    use std::sync::atomic::Ordering;
+    let mut coordinator = CI_DETAIL_FLIGHT
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    for token in coordinator
+        .flight
+        .running
+        .iter()
+        .chain(coordinator.flight.queued.iter())
+    {
+        token.cancel.store(true, Ordering::Relaxed);
+    }
+    if let Some(queued) = coordinator.queued.take() {
+        queued.token.cancel.store(true, Ordering::Relaxed);
+    }
+    coordinator.flight.queued = None;
+}
+
 /// Fetch a CI run's full detail (jobs/steps) + the failing jobs' log tails off
 /// the loop, then deliver them into the live modal overlay via a
 /// `RefreshKind::CiDetail` on the refresh channel (applied by
@@ -671,12 +787,20 @@ fn run_ci_detail_request(request: &CiDetailRequest) {
     {
         return;
     }
+    let deadline = std::time::Instant::now() + CI_DETAIL_WALL;
     let loc = thegn_core::remote::GitLoc::for_worktree(wt.as_path());
     let key = thegn_core::remote::GitLoc::worktree_cache_key(wt.as_path());
     let db = thegn_core::db::Db::open().ok();
-    let (client, context) = thegn_svc::ci::provider_and_context_for(&loc, cfg)
-        .map(|(client, context)| (Some(client), context))
-        .unwrap_or((None, None));
+    // The cancellable constructor wires the flight token into every provider
+    // subprocess, so a superseding drill or quit kills the in-flight child
+    // within one poll instead of waiting for its own timeout.
+    let (client, context) = thegn_svc::ci::provider_and_context_for_cancellable(
+        &loc,
+        cfg,
+        std::sync::Arc::clone(&request.token.cancel),
+    )
+    .map(|(client, context)| (Some(client), context))
+    .unwrap_or((None, None));
     // Full run (jobs/steps); on error keep the cached run so the header stays.
     let (detail, discarded_jobs, incomplete, detail_error) = match client.as_ref() {
         Some(c) => match c.run_detail(&loc, &run.id) {
@@ -724,84 +848,71 @@ fn run_ci_detail_request(request: &CiDetailRequest) {
         .jobs
         .iter()
         .filter(|j| j.state == CiState::Fail)
+        .take(CI_DETAIL_MAX_LOG_JOBS)
         .collect();
-    let mut log_tail: Vec<String> = Vec::new();
-    let mut log_entries = Vec::new();
-    // A provider can report a very large matrix. Keep detail responsive and
-    // predictable by inspecting only a bounded failed-job batch.
-    for job in failing.into_iter().take(16) {
-        if request
-            .token
-            .cancel
-            .load(std::sync::atomic::Ordering::Relaxed)
+    let detail_id = detail.id.clone();
+    let detail_sha = detail.sha.clone();
+    let detail_attempt = detail.attempt;
+    let cached = |job: &thegn_core::ci::CiJob| -> Option<thegn_core::ci_log::CiLogEntry> {
+        if cfg.log_cache_runs == 0 {
+            return None;
+        }
+        let db = db.as_ref()?;
+        let entry = db.get_ci_log(&key, &detail_id, &job.id).ok().flatten()?;
+        (thegn_core::ci_log::cached_log_is_evidence_for(
+            &entry,
+            &detail_sha,
+            job.finished_at.as_deref(),
+        ) && crate::ci_refresh::context_row_current(&entry.context, context.as_deref())
+            && thegn_core::ci_log::cached_log_attempt_matches(&entry, detail_attempt))
+        .then_some(entry)
+    };
+    let fresh = |job: &thegn_core::ci::CiJob,
+                 log: thegn_core::ci::CiLog|
+     -> thegn_core::ci_log::CiLogEntry {
+        let mut entry = thegn_core::ci_log::CiLogEntry::new(
+            &key,
+            &detail_id,
+            &job.id,
+            &job.name,
+            &log.text,
+            cfg.log_tail_lines
+                .min(thegn_core::ci_log::HARD_MAX_LOG_LINES),
+            cfg.log_max_bytes
+                .min(thegn_core::ci_log::HARD_MAX_LOG_BYTES),
+            thegn_core::util::now(),
+        );
+        entry.truncated |= log.truncated;
+        entry.head_sha = detail_sha.clone();
+        entry.attempt = detail_attempt;
+        entry.context = context.clone().unwrap_or_default();
+        if cfg.log_cache_runs > 0
+            && thegn_core::ci_log::cacheable_log_entry(&entry)
+            && let Some(db) = db.as_ref()
+            && crate::hydrate_schedule::generation_is_current(generation.as_ref())
         {
-            return;
+            let _ = db.put_ci_log(&entry); // best-effort: the DB is a log cache; the drill still serves the fetched entry
         }
-        let cached = (cfg.log_cache_runs > 0)
-            .then(|| {
-                db.as_ref().and_then(|db| {
-                    use thegn_core::store::CacheStore;
-                    db.get_ci_log(&key, &detail.id, &job.id).ok().flatten()
-                })
-            })
-            .flatten();
-        let entry = if cached.as_ref().is_some_and(|e| {
-            thegn_core::ci_log::cached_log_is_evidence_for(
-                e,
-                &detail.sha,
-                job.finished_at.as_deref(),
-            ) && crate::ci_refresh::context_row_current(&e.context, context.as_deref())
-                && thegn_core::ci_log::cached_log_attempt_matches(e, detail.attempt)
-        }) {
-            cached
-        } else {
-            client.as_ref().and_then(|c| {
-                let log = c.logs(&loc, &detail.id, &job.id).ok()?;
-                let mut entry = thegn_core::ci_log::CiLogEntry::new(
-                    &key,
-                    &detail.id,
-                    &job.id,
-                    &job.name,
-                    &log.text,
-                    cfg.log_tail_lines
-                        .min(thegn_core::ci_log::HARD_MAX_LOG_LINES),
-                    cfg.log_max_bytes
-                        .min(thegn_core::ci_log::HARD_MAX_LOG_BYTES),
-                    thegn_core::util::now(),
-                );
-                entry.truncated |= log.truncated;
-                entry.head_sha = detail.sha.clone();
-                entry.attempt = detail.attempt;
-                entry.context = context.clone().unwrap_or_default();
-                if cfg.log_cache_runs > 0
-                    && thegn_core::ci_log::cacheable_log_entry(&entry)
-                    && let Some(db) = db.as_ref()
-                {
-                    use thegn_core::store::CacheStore;
-                    if crate::hydrate_schedule::generation_is_current(generation.as_ref()) {
-                        let _ = db.put_ci_log(&entry);
-                    }
-                }
-                Some(entry)
-            })
-        };
-        if let Some(mut entry) = entry {
-            let (text, truncated) = thegn_core::ci_log::served_window(
-                &entry.text,
-                None,
-                cfg.log_tail_lines,
-                cfg.log_max_bytes,
-            );
-            entry.text = text;
-            entry.truncated |= truncated;
-            entry.redacted = true;
-            log_tail.push(format!(
-                "\u{2500}\u{2500} {} \u{2500}\u{2500}",
-                entry.job_name
-            ));
-            log_tail.extend(entry.text.lines().map(str::to_string));
-            log_entries.push(entry);
-        }
+        entry
+    };
+    let DrillLogs {
+        log_tail,
+        log_entries,
+        cancelled,
+    } = collect_drill_logs(&DrillLogParams {
+        client: client.as_deref(),
+        loc: &loc,
+        run_id: &detail_id,
+        jobs: &failing,
+        cached: &cached,
+        fresh: &fresh,
+        deadline,
+        cancel: &request.token.cancel,
+        log_tail_lines: cfg.log_tail_lines,
+        log_max_bytes: cfg.log_max_bytes,
+    });
+    if cancelled {
+        return;
     }
     let payload = crate::detail::CiDetailPayload {
         run: detail,
@@ -3087,5 +3198,296 @@ mod tests {
             flight.finish().expect("queued run").key.run_id.as_deref(),
             Some("run-1")
         );
+    }
+
+    /// Minimal `CiProvider` for the drill log loop (shape copied from
+    /// `ci_refresh`'s private `FakeCi`). Counts `logs` calls and can set the
+    /// drill's cancel flag from inside its first call.
+    struct DrillFakeCi {
+        log_calls: std::sync::atomic::AtomicUsize,
+        cancel_on_logs: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
+    }
+
+    impl DrillFakeCi {
+        fn new() -> Self {
+            Self {
+                log_calls: std::sync::atomic::AtomicUsize::new(0),
+                cancel_on_logs: None,
+            }
+        }
+
+        fn calls(&self) -> usize {
+            self.log_calls.load(std::sync::atomic::Ordering::Relaxed)
+        }
+    }
+
+    impl thegn_svc::ci::CiProvider for DrillFakeCi {
+        fn system(&self) -> thegn_core::ci::CiSystem {
+            thegn_core::ci::CiSystem::GithubActions
+        }
+
+        fn runs(
+            &self,
+            _: &thegn_core::remote::GitLoc,
+            _: Option<&str>,
+            _: usize,
+        ) -> Result<thegn_svc::ci::CiRunList, thegn_core::ci::CiError> {
+            Ok(thegn_svc::ci::CiRunList {
+                runs: Vec::new(),
+                discarded_rows: 0,
+            })
+        }
+
+        fn run_detail(
+            &self,
+            _: &thegn_core::remote::GitLoc,
+            _: &str,
+        ) -> Result<thegn_svc::ci::CiRunDetail, thegn_core::ci::CiError> {
+            Err(thegn_core::ci::CiError::NotFound)
+        }
+
+        fn logs(
+            &self,
+            _: &thegn_core::remote::GitLoc,
+            _: &str,
+            job_id: &str,
+        ) -> Result<thegn_core::ci::CiLog, thegn_core::ci::CiError> {
+            self.log_calls
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            if let Some(cancel) = self.cancel_on_logs.as_ref() {
+                cancel.store(true, std::sync::atomic::Ordering::Relaxed);
+            }
+            Ok(thegn_core::ci::CiLog {
+                text: format!("fetched {job_id}\n"),
+                truncated: false,
+            })
+        }
+
+        fn workflows(
+            &self,
+            _: &thegn_core::remote::GitLoc,
+        ) -> Result<Vec<thegn_core::ci::CiWorkflow>, thegn_core::ci::CiError> {
+            Ok(Vec::new())
+        }
+
+        fn trigger(
+            &self,
+            _: &thegn_core::remote::GitLoc,
+            _: &str,
+            _: &[(String, String)],
+        ) -> Result<(), thegn_core::ci::CiError> {
+            Err(thegn_core::ci::CiError::NotConfigured)
+        }
+
+        fn rerun(
+            &self,
+            _: &thegn_core::remote::GitLoc,
+            _: &str,
+            _: thegn_core::ci::RerunScope,
+        ) -> Result<(), thegn_core::ci::CiError> {
+            Err(thegn_core::ci::CiError::NotConfigured)
+        }
+
+        fn cancel(
+            &self,
+            _: &thegn_core::remote::GitLoc,
+            _: &str,
+        ) -> Result<(), thegn_core::ci::CiError> {
+            Err(thegn_core::ci::CiError::NotConfigured)
+        }
+
+        fn caps(&self) -> thegn_core::ci::CiCaps {
+            thegn_core::ci::CiCaps::default()
+        }
+    }
+
+    impl thegn_core::seam::Probe for DrillFakeCi {
+        fn probe(&self) -> thegn_core::seam::ProbeReport {
+            thegn_core::seam::ProbeReport::new("ci", "fake", thegn_core::seam::Availability::Ready)
+                .with_caps(&thegn_core::ci::CiCaps::default())
+        }
+    }
+
+    fn drill_job(id: &str) -> thegn_core::ci::CiJob {
+        thegn_core::ci::CiJob {
+            id: id.to_string(),
+            name: format!("{id} name"),
+            state: thegn_core::ci::CiState::Fail,
+            ..thegn_core::ci::CiJob::default()
+        }
+    }
+
+    fn drill_entry(job: &thegn_core::ci::CiJob, text: &str) -> thegn_core::ci_log::CiLogEntry {
+        thegn_core::ci_log::CiLogEntry::new(
+            "/wt-drill",
+            "run-drill",
+            &job.id,
+            &job.name,
+            text,
+            50,
+            8192,
+            0,
+        )
+    }
+
+    fn drill_fresh(
+        job: &thegn_core::ci::CiJob,
+        log: thegn_core::ci::CiLog,
+    ) -> thegn_core::ci_log::CiLogEntry {
+        drill_entry(job, &log.text)
+    }
+
+    fn no_cache(_: &thegn_core::ci::CiJob) -> Option<thegn_core::ci_log::CiLogEntry> {
+        None
+    }
+
+    fn drill_params<'a>(
+        client: &'a DrillFakeCi,
+        loc: &'a thegn_core::remote::GitLoc,
+        jobs: &'a [&'a thegn_core::ci::CiJob],
+        cached: &'a DrillCachedLog<'a>,
+        deadline: std::time::Instant,
+        cancel: &'a std::sync::atomic::AtomicBool,
+    ) -> DrillLogParams<'a> {
+        DrillLogParams {
+            client: Some(client),
+            loc,
+            run_id: "run-drill",
+            jobs,
+            cached,
+            fresh: &drill_fresh,
+            deadline,
+            cancel,
+            log_tail_lines: 50,
+            log_max_bytes: 8192,
+        }
+    }
+
+    #[test]
+    fn ci_detail_drill_stops_fetching_logs_after_wall() {
+        let fake = DrillFakeCi::new();
+        let loc = thegn_core::remote::GitLoc::Local("/wt-drill".into());
+        let (a, b) = (drill_job("a"), drill_job("b"));
+        let jobs = [&a, &b];
+        let cancel = std::sync::atomic::AtomicBool::new(false);
+        let past = std::time::Instant::now() - std::time::Duration::from_secs(1);
+        let logs = collect_drill_logs(&drill_params(&fake, &loc, &jobs, &no_cache, past, &cancel));
+        assert_eq!(fake.calls(), 0, "no provider log fetch after the wall");
+        assert!(!logs.cancelled);
+        assert!(logs.log_entries.is_empty());
+        assert_eq!(
+            logs.log_tail
+                .iter()
+                .map(String::as_str)
+                .collect::<Vec<&str>>(),
+            [
+                "\u{2500}\u{2500} log fetch stopped after 0 of 2 failed jobs (time limit) \u{2500}\u{2500}"
+            ]
+        );
+    }
+
+    #[test]
+    fn ci_detail_drill_serves_cache_after_wall() {
+        let fake = DrillFakeCi::new();
+        let loc = thegn_core::remote::GitLoc::Local("/wt-drill".into());
+        let (a, b) = (drill_job("a"), drill_job("b"));
+        let jobs = [&a, &b];
+        let cancel = std::sync::atomic::AtomicBool::new(false);
+        let past = std::time::Instant::now() - std::time::Duration::from_secs(1);
+        let cached = |job: &thegn_core::ci::CiJob| {
+            (job.id == "b").then(|| drill_entry(job, "cached tail\n"))
+        };
+        let logs = collect_drill_logs(&drill_params(&fake, &loc, &jobs, &cached, past, &cancel));
+        assert_eq!(fake.calls(), 0);
+        assert_eq!(
+            logs.log_entries
+                .iter()
+                .map(|entry| entry.job_id.as_str())
+                .collect::<Vec<&str>>(),
+            ["b"]
+        );
+        assert!(logs.log_tail.iter().any(|line| line == "cached tail"));
+        assert_eq!(
+            logs.log_tail.last().map(String::as_str),
+            Some(
+                "\u{2500}\u{2500} log fetch stopped after 0 of 2 failed jobs (time limit) \u{2500}\u{2500}"
+            )
+        );
+    }
+
+    #[test]
+    fn ci_detail_drill_fetches_every_job_before_wall() {
+        let fake = DrillFakeCi::new();
+        let loc = thegn_core::remote::GitLoc::Local("/wt-drill".into());
+        let (a, b) = (drill_job("a"), drill_job("b"));
+        let jobs = [&a, &b];
+        let cancel = std::sync::atomic::AtomicBool::new(false);
+        let future = std::time::Instant::now() + CI_DETAIL_WALL;
+        let logs = collect_drill_logs(&drill_params(
+            &fake, &loc, &jobs, &no_cache, future, &cancel,
+        ));
+        assert_eq!(fake.calls(), 2);
+        assert_eq!(logs.log_entries.len(), 2);
+        assert!(!logs.log_tail.iter().any(|line| line.contains("time limit")));
+    }
+
+    #[test]
+    fn ci_detail_cancel_stops_before_next_job() {
+        let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let fake = DrillFakeCi {
+            cancel_on_logs: Some(std::sync::Arc::clone(&cancel)),
+            ..DrillFakeCi::new()
+        };
+        let loc = thegn_core::remote::GitLoc::Local("/wt-drill".into());
+        let (a, b) = (drill_job("a"), drill_job("b"));
+        let jobs = [&a, &b];
+        let future = std::time::Instant::now() + CI_DETAIL_WALL;
+        let logs = collect_drill_logs(&drill_params(
+            &fake, &loc, &jobs, &no_cache, future, &cancel,
+        ));
+        assert_eq!(
+            fake.calls(),
+            1,
+            "cancel during the first fetch stops the second"
+        );
+        assert!(logs.cancelled);
+    }
+
+    /// Clears `CI_DETAIL_FLIGHT` on drop so a failing assertion cannot leak
+    /// tokens into other tests sharing the static.
+    struct CiDetailFlightReset;
+
+    impl Drop for CiDetailFlightReset {
+        fn drop(&mut self) {
+            let mut coordinator = CI_DETAIL_FLIGHT
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            coordinator.flight.clear();
+            coordinator.queued = None;
+        }
+    }
+
+    #[test]
+    fn quit_signal_cancels_the_ci_detail_flight() {
+        let _reset = CiDetailFlightReset;
+        let running = ci_detail_token("/wt-quit-cancel", "run-running");
+        let queued = ci_detail_token("/wt-quit-cancel", "run-queued");
+        let running_cancel = std::sync::Arc::clone(&running.cancel);
+        let queued_cancel = std::sync::Arc::clone(&queued.cancel);
+        {
+            let mut coordinator = CI_DETAIL_FLIGHT
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            coordinator.flight.running = Some(running);
+            coordinator.flight.queued = Some(queued);
+        }
+        cancel_ci_detail_for_shutdown();
+        assert!(running_cancel.load(std::sync::atomic::Ordering::Relaxed));
+        assert!(queued_cancel.load(std::sync::atomic::Ordering::Relaxed));
+        let coordinator = CI_DETAIL_FLIGHT
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        assert!(coordinator.queued.is_none());
+        assert!(coordinator.flight.queued.is_none());
     }
 }
