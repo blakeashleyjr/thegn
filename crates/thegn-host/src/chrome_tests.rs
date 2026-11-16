@@ -943,11 +943,16 @@ fn sidebar_rail_keeps_workspace_and_terminal_identity() {
     draw_sidebar(&mut s, rect, &model);
     let text = s.screen_chars_to_string();
     let lines: Vec<&str> = text.lines().collect();
-    assert!(lines[0].contains('a'), "workspace initial: {lines:?}");
-    assert!(lines[1].contains('f'), "worktree initial: {lines:?}");
-    assert!(lines[3].contains('z'), "terminal initial: {lines:?}");
+    // Row 0 is the rail-mode glyph; the rows start one row lower.
     assert!(
-        lines[4].trim().is_empty(),
+        lines[0].contains(crate::caps::active_glyphs().sidebar_mode_rail),
+        "rail mode glyph: {lines:?}"
+    );
+    assert!(lines[1].contains('a'), "workspace initial: {lines:?}");
+    assert!(lines[2].contains('f'), "worktree initial: {lines:?}");
+    assert!(lines[4].contains('z'), "terminal initial: {lines:?}");
+    assert!(
+        lines[5].trim().is_empty(),
         "EmptyHint renders nothing in rail: {lines:?}"
     );
 }
