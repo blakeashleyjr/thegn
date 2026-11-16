@@ -79,7 +79,9 @@ pub(crate) fn runs(rows: &[SidebarRow], slug: &str) -> Vec<Run> {
 
     for r in rows.iter().filter(|r| r.workspace_slug == slug) {
         match r.kind {
-            RowKind::Workspace => cur = None,
+            // The derived "Other" group's depth-2 rows are unfiled (an
+            // external worktree has no folder), so they join the loose run.
+            RowKind::Workspace | RowKind::OtherGroup => cur = None,
             RowKind::Folder => {
                 cur = r.folder_id;
                 if let Some(fid) = r.folder_id

@@ -137,6 +137,44 @@ gesture below has a keyboard equivalent.
   tail below the list puts the row at the end — and a release outside the
   sidebar cancels. `Esc` abandons a drag without moving anything.
 
+## External worktrees: the Other group
+
+A project's worktrees include every git worktree of the repository, so ones
+another tool made (an agent harness, a script, plain `git worktree add`) show
+up too. A worktree is **external** when it sits outside thegn's own checkout
+layout (`<worktrees_dir>/<repo>/…`, or `.worktrees` inside the repository),
+outside every `worktree_roots` entry of its project, and has not been filed
+into a folder — filing one adopts it. The home checkout is never external.
+
+By default each project gathers its external worktrees under one collapsible
+row after its folders:
+
+```
+▾ app
+    home
+    feature-a
+  ▸ Other (4)
+```
+
+`↵`, `←`/`→`, a click on the row or on its caret folds and unfolds it, and the
+choice is remembered per project. Like the `Pipelines` folder it is derived:
+it cannot be renamed, pinned, marked, dragged or filed into. The worktree you
+are in is never hidden — while it is external, its Other group stays open.
+
+Three `[ui]` settings in [[config-reference]] shape it:
+
+- `sidebar_external_worktrees` — `group` (the default) gathers them under the
+  Other row; `show` lists them among the project's own worktrees; `hide`
+  leaves them out of the tree (and the flat list) entirely, except the active
+  one.
+- `sidebar_other_group_label` — the row's label (default `Other`); it reads
+  `Other (N)`.
+- `sidebar_other_group_collapsed` — whether the row starts collapsed (default
+  `true`) until you toggle it.
+
+To count a directory's worktrees as the project's own, list it under the
+project: `[project.<slug>] worktree_roots = ["~/agent-worktrees"]`.
+
 ## Pipeline lanes
 
 Inside every project whose worktrees a pipeline has spawned, the tree grows a
@@ -260,8 +298,10 @@ badge caps at `999+`. Valid field names are `branch`, `commits`, `dirty`,
 `sandbox`, `devcontainer`, `hibernated`, `mq`, `unread`, `disk`, `author`,
 `stash`, `ci`, and `issue`.
 The default field order is `branch`, `commits`, `dirty`, `branch_stat`, `pr`,
-`subject`, `age`, `env`, `sandbox`, `devcontainer`, `hibernated`, `mq`, `unread`,
-`disk`; `upstream`, `stage`, `activity`, `author`, `stash`, `ci`, and `issue` are opt-in. The legacy
+`ci`, `issue`, `author`, `stash`, `subject`, `age`, `upstream`, `env`,
+`sandbox`, `devcontainer`, `hibernated`, `mq`, `unread`, `disk`; only `stage`
+and `activity` are opt-in. Every default field is hidden while it has nothing
+to show, so a row with no CI run, linked issue or stash looks as before. The legacy
 `sidebar_detail_branch`, `sidebar_detail_branch_stat`, and `sidebar_detail_pr`
 toggles remain AND gates; prefer `sidebar_detail_fields` for membership and
 order. An entry can also be `plugin:<plugin>/<field>`; plugin IDs use
