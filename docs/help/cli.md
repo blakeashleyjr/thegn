@@ -493,8 +493,15 @@ out (20 s), is shown as unavailable instead of failing the command.
 the month's spend so far, and 24 h / 30 d projections. Costs are estimates:
 `[placement.price]` rates win over the bundled price table, a size with no
 known price shows `?` and is counted as unpriced, and accrued cost assumes the
-sandbox ran since it was created. Only Fly reports sizes today; other providers
-list ids only. Nothing is stopped or destroyed.
+sandbox ran since it was created. Every provider fills in what its listing
+reports: Hetzner and DigitalOcean give the server size and region, machine0,
+Sprites and Daytona give whatever state, size, region and creation time their
+listing carries, and a field a provider leaves out shows as unknown. Hetzner
+and machine0 have no bundled prices, so their sizes count as unpriced unless
+`[placement.price]` names them. Fly also lists the org's apps and shows a
+thegn-named app the host has no record of as a row (an `ORPHAN` unless a
+worktree records it); if that app listing fails, Fly shows the recorded
+sandboxes only and is marked partial. Nothing is stopped or destroyed.
 
 `thegn map` prints a **repo map**: the worktree's tree-sitter-indexed
 entities (functions, types, …) grouped by file, ranked by caller
