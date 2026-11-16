@@ -586,7 +586,6 @@ async fn run_async(cfg: &Config, action: SessionAction) -> Result<()> {
             resume_work: resume_row,
             json,
         } => {
-            use thegn_svc::control::{AgentLaunch, OpenSpec};
             if lease.is_some() && resume_row.is_none() && (stage.is_none() || issue.is_none()) {
                 anyhow::bail!(
                     "--lease applies to a stage dispatch (--stage --issue) or --resume-work"
@@ -656,82 +655,27 @@ async fn run_async(cfg: &Config, action: SessionAction) -> Result<()> {
                 )
                 .await?;
             } else {
-                // A plain open (THE-57) — optionally with a stage layered over
-                // the agent: `--stage` without `--issue` applies that stage's
-                // `model`/`env`/`permissions` (THE-83) and defaults the agent
-                // to the stage's configured one. A promptless open stays an
-                // interactive launch.
-                let agent = match agent {
-                    Some(a) => a,
-                    None => {
-                        let name = stage
-                            .as_deref()
-                            .expect("clap requires --agent without --stage");
-                        cfg.pipeline
-                            .stage(name)
-                            .map(|s| s.agent.clone())
-                            .expect("open_preflight checked the stage exists")
-                    }
-                };
-                // Resolve the worktree to an absolute path (the agent launches
-                // here; the daemon resolves the sandbox/env from it).
-                let wt = crate::cmd::resolve_worktree(worktree)
-                    .to_string_lossy()
-                    .into_owned();
-                // The launch prompt is final here (a --brief-file brief is already
-                // read and rendered), so the private-/tmp warning sees what the
-                // agent will see (THE-1979).
+                // A plain open (THE-57) — the body is `open_plain`, shared with
+                // `thegn agent run` (THE-2005).
                 let launch_prompt =
                     resolved_open_prompt.expect("plain open prompt was resolved before connect");
-                crate::cmd::session_tmp_warn::warn_if_private_tmp(cfg, &wt, &launch_prompt);
-                let spec = OpenSpec {
-                    automation_origin: None,
-                    argv: Vec::new(),
-                    cwd: None,
-                    env: Vec::new(),
-                    rows: 24,
-                    cols: 80,
-                    worktree: Some(wt.clone()),
-                    agent: Some(AgentLaunch {
-                        agent: agent.clone(),
-                        prompt: launch_prompt,
-                        // A plain `--headless` forces headless; absent leaves the
-                        // default (headless exactly when a prompt was given).
-                        headless: headless.then_some(true),
-                        bind_worktree: bind,
-                        // No `--resume` on this CLI path: launch cold.
-                        resume: None,
-                        // A fresh launch never continues a dead session.
-                        continue_last: false,
-                        // `--stage` without `--issue` layers the stage's
-                        // model/env/permissions over the agent; None on a
-                        // plain open.
+                let (info, tracked_row) = open_plain(
+                    cfg,
+                    &client,
+                    PlainOpen {
+                        agent,
                         stage,
+                        worktree,
+                        prompt: launch_prompt,
+                        headless,
+                        bind,
+                        adopt,
+                        track: track.as_deref(),
                         permissions,
                         widen_permissions,
-                        fork: false,
-                        native_session_id: None,
-                    }),
-                    // Default false: a fan-out that spawns eight agents should not
-                    // yank eight panes into the user's session unasked. `--adopt`
-                    // is the opt-in the pipeline skill always passes.
-                    adopt,
-                    already_capped: false,
-                };
-                let info = client.open(&spec).await?;
-                let tracked_row = match track.as_deref() {
-                    Some(track_issue) => Some(
-                        crate::cmd::session_track::track_opened(
-                            &client,
-                            track_issue,
-                            &wt,
-                            &agent,
-                            &info.id,
-                        )
-                        .await?,
-                    ),
-                    None => None,
-                };
+                    },
+                )
+                .await?;
                 if json {
                     if let Some(row) = tracked_row {
                         let mut value = serde_json::to_value(&info)?;
@@ -1066,6 +1010,120 @@ pub(crate) fn policy_admission(cfg: &Config, agent: &str, stage: &str) -> Result
         .map_err(|why| anyhow::anyhow!("stage `{stage}` (agent `{agent}`) not dispatched: {why}"))
 }
 
+/// The inputs of one plain (non-stage-dispatch, non-resume) open — the
+/// `session open` fields `open_plain` consumes, as a struct so the call stays
+/// readable (and clippy's `too_many_arguments` stays quiet).
+pub(crate) struct PlainOpen<'a> {
+    /// `--agent`; `None` defaults to `stage`'s configured agent.
+    pub agent: Option<String>,
+    /// `--stage` without `--issue`: layers the stage's model/env/permissions.
+    pub stage: Option<String>,
+    /// `--worktree` (resolved to an absolute path here).
+    pub worktree: Option<String>,
+    /// The final launch prompt (a `--brief-file` brief already rendered).
+    pub prompt: String,
+    /// Force headless; `false` leaves the daemon default (headless exactly
+    /// when a prompt is given).
+    pub headless: bool,
+    pub bind: bool,
+    pub adopt: bool,
+    /// `--track <issue>`: write a dispatch row for the opened session.
+    pub track: Option<&'a str>,
+    pub permissions: Vec<String>,
+    pub widen_permissions: bool,
+}
+
+/// A plain open (THE-57) — optionally with a stage layered over the agent:
+/// `--stage` without `--issue` applies that stage's `model`/`env`/
+/// `permissions` (THE-83) and defaults the agent to the stage's configured
+/// one. A promptless open stays an interactive launch. Returns the opened
+/// session and, with `track`, the dispatch row written for it. Shared by
+/// `session open` and `agent run` (THE-2005); prints nothing itself beyond
+/// the private-/tmp warning, so each caller owns its output shape.
+pub(crate) async fn open_plain(
+    cfg: &Config,
+    client: &ControlClient,
+    open: PlainOpen<'_>,
+) -> Result<(thegn_svc::control::SessionInfo, Option<i64>)> {
+    use thegn_svc::control::{AgentLaunch, OpenSpec};
+    let PlainOpen {
+        agent,
+        stage,
+        worktree,
+        prompt: launch_prompt,
+        headless,
+        bind,
+        adopt,
+        track,
+        permissions,
+        widen_permissions,
+    } = open;
+    let agent = match agent {
+        Some(a) => a,
+        None => {
+            let name = stage
+                .as_deref()
+                .expect("clap requires --agent without --stage");
+            cfg.pipeline
+                .stage(name)
+                .map(|s| s.agent.clone())
+                .expect("open_preflight checked the stage exists")
+        }
+    };
+    // Resolve the worktree to an absolute path (the agent launches
+    // here; the daemon resolves the sandbox/env from it).
+    let wt = crate::cmd::resolve_worktree(worktree)
+        .to_string_lossy()
+        .into_owned();
+    // The launch prompt is final here (a --brief-file brief is already
+    // read and rendered), so the private-/tmp warning sees what the
+    // agent will see (THE-1979).
+    crate::cmd::session_tmp_warn::warn_if_private_tmp(cfg, &wt, &launch_prompt);
+    let spec = OpenSpec {
+        automation_origin: None,
+        argv: Vec::new(),
+        cwd: None,
+        env: Vec::new(),
+        rows: 24,
+        cols: 80,
+        worktree: Some(wt.clone()),
+        agent: Some(AgentLaunch {
+            agent: agent.clone(),
+            prompt: launch_prompt,
+            // A plain `--headless` forces headless; absent leaves the
+            // default (headless exactly when a prompt was given).
+            headless: headless.then_some(true),
+            bind_worktree: bind,
+            // No `--resume` on this CLI path: launch cold.
+            resume: None,
+            // A fresh launch never continues a dead session.
+            continue_last: false,
+            // `--stage` without `--issue` layers the stage's
+            // model/env/permissions over the agent; None on a
+            // plain open.
+            stage,
+            permissions,
+            widen_permissions,
+            fork: false,
+            native_session_id: None,
+        }),
+        // Default false: a fan-out that spawns eight agents should not
+        // yank eight panes into the user's session unasked. `--adopt`
+        // is the opt-in the pipeline skill always passes.
+        adopt,
+        already_capped: false,
+    };
+    let info = client.open(&spec).await?;
+    let tracked_row = match track {
+        Some(track_issue) => Some(
+            crate::cmd::session_track::track_opened(client, track_issue, &wt, &agent, &info.id)
+                .await?,
+        ),
+        None => None,
+    };
+    Ok((info, tracked_row))
+}
+
 /// The `session open` refusals that are answerable before `connect` — both are
 /// caller mistakes, not daemon problems:
 ///
@@ -1079,7 +1137,7 @@ pub(crate) fn policy_admission(cfg: &Config, agent: &str, stage: &str) -> Result
 /// `--resume-work` runs its own offline row checks in this same pre-`connect`
 /// slot — `resume_preflight`: unknown row, non-pipeline row, unknown stage —
 /// so its refusals are answerable without a daemon either.
-fn open_preflight(
+pub(crate) fn open_preflight(
     cfg: &Config,
     stage: Option<&str>,
     issue: Option<&str>,
