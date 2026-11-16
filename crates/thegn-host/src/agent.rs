@@ -2998,9 +2998,11 @@ pub fn provision_provider_env_named(
     // is a git worktree on a branch is seeded from a host-side `git bundle`
     // uploaded over the files API, instead of cloning origin inside the sandbox
     // (which needs an ssh key or token there). A SPARE (branch `None`) keeps the
-    // origin clone: it is generic until a claim rebranches it.
+    // origin clone: it is generic until a claim rebranches it. `[sandbox.git]
+    // transport = "clone"` (per env) opts out of the bundle seed.
     let bundle_seed = branch
         .as_ref()
+        .filter(|_| resolved.sandbox.git.transport == thegn_core::config::GitTransport::Bundle)
         .filter(|_| name_override.is_none() && Path::new(worktree).join(".git").exists())
         .map(|b| envplan::BundleSeed {
             worktree: worktree.to_string(),
