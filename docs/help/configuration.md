@@ -151,6 +151,15 @@ thegn cannot tell whether a running instance re-reads a key, it says restart.
   conditional creation by default; set `server_side_encryption = false` or
   `conditional_create = false` only for a compatible store that rejects that
   request header.
+- `[placement.fleet_budget.<provider>]` — hourly burn budgets per provider
+  (`fly`, `sprites`, `daytona`, `hetzner`, `digitalocean`, `machine0`),
+  checked against the `thegn fleet cost` estimate. `warn_hourly` turns the
+  masthead fleet badge amber; `max_hourly` refuses a new sandbox on that
+  provider (resuming or reusing one is never refused). `0` turns a limit off.
+  With a cap set, provisioning reads the provider's fleet first and refuses
+  when it cannot read it completely. `thegn config validate` refuses a
+  negative or non-finite limit and warns on an unknown provider key or a
+  `warn_hourly` above `max_hourly`.
 
 ### Issue autopilot
 

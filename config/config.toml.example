@@ -4213,6 +4213,17 @@ enabled = false
 # "hetzner:cx33" = 0.0154     #   autoscaled hosts ("provider:size", fallback
 # "hetzner" = 0.008           #   "provider"); unpriced resources meter at $0
 #                             #   with a one-time warning
+# [placement.fleet_budget.fly] # hourly burn budget for one provider's sandboxes,
+#                             #   keyed by the env provider name (fly, sprites,
+#                             #   daytona, hetzner, digitalocean, machine0) and
+#                             #   compared to the `thegn fleet cost` estimate
+# warn_hourly = 0.0           #   USD/h at which the masthead fleet badge turns
+#                             #   amber and `fleet cost` prints a budget line
+#                             #   (0 = off)
+# max_hourly = 0.0            #   USD/h at which a NEW sandbox on this provider
+#                             #   is refused (resume/reuse never is; 0 = off).
+#                             #   With a cap set, provisioning reads the fleet
+#                             #   first and refuses if it cannot read it.
 # [placement.default_resources] # fallback ask when an env declares none
 # cpu = "1"                   #   cpu floor ("2", "0.5", "500m")
 # memory = "2g"               #   memory floor ("4g", "512m", bare = MiB)
