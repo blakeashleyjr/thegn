@@ -646,12 +646,51 @@ pub struct EnvPlan {
     pub tier: Tier,
 }
 
+/// Basename of the provision marker [`EnvPlan::marker_path`] drops in the
+/// workdir. The `git_exclude` step hides it from `git status` (THE-2043).
+pub const PROVISION_MARKER: &str = ".thegn-provisioned";
+
 impl EnvPlan {
     /// Sentinel file the applier drops after a full successful run so a later
-    /// open skips re-provisioning. Lives under the workdir's parent so a repo
-    /// re-clone doesn't wipe it.
+    /// open skips re-provisioning. Lives directly in the workdir (the repo
+    /// checkout root), so the `git_exclude` provisioning step lists it in the
+    /// checkout's `.git/info/exclude` to keep it out of `git status`.
     pub fn marker_path(workdir: &str) -> String {
-        format!("{}/.thegn-provisioned", workdir.trim_end_matches('/'))
+        format!("{}/{PROVISION_MARKER}", workdir.trim_end_matches('/'))
+    }
+}
+
+/// Whether this plan cannot be usable without Nix, so a failed install must
+/// halt provisioning (the `nix_verify` step) instead of reporting "up" with no
+/// `nix`: the repo declares a Nix dev environment (flake devShell, `use flake`,
+/// devenv), or the options ask for a devShell push / the host Nix cache.
+fn nix_required(req: &EnvRequirements, opts: &PlanOpts) -> bool {
+    let host_cache = opts
+        .host_cache_url
+        .as_deref()
+        .is_some_and(|u| !u.trim().is_empty());
+    opts.push_devshell
+        || host_cache
+        || req.nix_flake_devshell
+        || req.direnv_uses_flake
+        || req.devenv
+}
+
+/// The fatal post-install check: `nix` resolves on `PATH` after sourcing the
+/// same profile hooks the install step sources, else the step fails with the
+/// cause instead of letting the plan finish without Nix (THE-2045).
+fn nix_verify_step() -> ProvisionStep {
+    ProvisionStep {
+        id: "nix_verify".into(),
+        label: "Verify Nix".into(),
+        kind: StepKind::Exec(
+            "export HOME=${HOME:-/root}; \
+             [ -r \"$HOME/.nix-profile/etc/profile.d/nix.sh\" ] && . \"$HOME/.nix-profile/etc/profile.d/nix.sh\" 2>/dev/null || true; \
+             [ -r /nix/var/nix/profiles/default/etc/profile.d/nix-daemon.sh ] && . /nix/var/nix/profiles/default/etc/profile.d/nix-daemon.sh 2>/dev/null || true; \
+             export PATH=\"$HOME/.nix-profile/bin:/nix/var/nix/profiles/default/bin:$PATH\"; \
+             command -v nix >/dev/null 2>&1 || { echo \"nix is not installed: the Install Nix step failed (see its output above)\"; exit 1; }"
+                .into(),
+        ),
     }
 }
 
@@ -674,6 +713,7 @@ pub fn plan(req: &EnvRequirements, opts: &PlanOpts) -> EnvPlan {
         t => t,
     };
     let mut steps = Vec::new();
+    let needs_nix = nix_required(req, opts);
 
     // 1. Workspace dir.
     steps.push(ProvisionStep {
@@ -720,6 +760,14 @@ pub fn plan(req: &EnvRequirements, opts: &PlanOpts) -> EnvPlan {
     };
     if let Some(repo_step) = repo_step {
         steps.push(repo_step);
+        // Hide the provision marker (dropped in the checkout root) from `git
+        // status` (THE-2043). Idempotent (`grep -qxF`) and best-effort: a
+        // checkout without a `.git` dir, or an unwritable one, is skipped.
+        steps.push(ProvisionStep {
+            id: "git_exclude".into(),
+            label: "Hide thegn marker from git".into(),
+            kind: StepKind::Exec(git_exclude_script(&wd)),
+        });
         // Bring the clone to full parity with the local worktree (unpushed
         // commits + uncommitted + untracked). Runs before the toolchain tier so
         // a locally-modified flake.lock / .envrc drives the devShell build. Only
@@ -767,6 +815,9 @@ pub fn plan(req: &EnvRequirements, opts: &PlanOpts) -> EnvPlan {
                         opts.host_cache_key.as_deref(),
                     )),
                 });
+                if needs_nix {
+                    steps.push(nix_verify_step());
+                }
                 if req.direnv {
                     steps.push(ProvisionStep {
                         id: "direnv".into(),
@@ -820,6 +871,9 @@ pub fn plan(req: &EnvRequirements, opts: &PlanOpts) -> EnvPlan {
                     opts.host_cache_key.as_deref(),
                 )),
             });
+            if needs_nix {
+                steps.push(nix_verify_step());
+            }
             let packages = crate::toolchain::packages_for(&req.languages, &opts.toolchain);
             steps.push(ProvisionStep {
                 id: "toolchain".into(),
@@ -922,6 +976,9 @@ pub fn plan(req: &EnvRequirements, opts: &PlanOpts) -> EnvPlan {
                     opts.host_cache_key.as_deref(),
                 )),
             });
+            if needs_nix {
+                steps.push(nix_verify_step());
+            }
         }
         if opts.home_closure_p2p {
             // P2P: the host pushes its store straight into the sandbox (host-side,
@@ -978,6 +1035,15 @@ pub fn plan(req: &EnvRequirements, opts: &PlanOpts) -> EnvPlan {
     }
 
     EnvPlan { steps, tier }
+}
+
+/// The `git_exclude` step script for the (already shell-quoted) workdir `wd`:
+/// append `/<marker>` to the checkout's `.git/info/exclude` unless the exact
+/// line is already there. Ends `|| true`, so it never fails provisioning.
+fn git_exclude_script(wd: &str) -> String {
+    format!(
+        "cd {wd} && [ -d .git ] && mkdir -p .git/info && {{ grep -qxF '/{PROVISION_MARKER}' .git/info/exclude 2>/dev/null || printf '%s\\n' '/{PROVISION_MARKER}' >> .git/info/exclude; }} || true"
+    )
 }
 
 /// Escape a value for embedding in the **single-quoted `printf` format string**
@@ -1114,13 +1180,17 @@ fn nix_install_script(
     // shell "command not found" (exit 127) AFTER printing "downloading Nix …
     // binary tarball" — the exact false failure seen on fresh sprites. Best-effort
     // install the prerequisites via whatever package manager is present (needs
-    // passwordless sudo when non-root; a no-op otherwise). `do_install` +
+    // passwordless sudo when non-root; a no-op otherwise), then re-check each
+    // tool and name what is still missing (THE-2045) so a failed install says
+    // why. The caller keeps `ensure_tools || true`: the install still runs (a
+    // probe can be wrong), and the fatal `nix_verify` step reports the outcome.
+    // `do_install` +
     // `{wait}` are wrapped in a bounded retry so a transient network/DNS flap on a
     // cold sandbox doesn't red-X the step; each attempt re-checks `command -v nix`
     // so a partial prior attempt that actually landed short-circuits.
     format!(
         "claim_store() {{ if [ \"$(id -u)\" != 0 ] && [ -d /nix/var/nix/db ] && [ \"$(stat -c %u /nix/var/nix/db 2>/dev/null)\" != \"$(id -u)\" ] && [ ! -S /nix/var/nix/daemon-socket/socket ] && command -v sudo >/dev/null 2>&1 && sudo -n true 2>/dev/null; then sudo chown -R \"$(id -u):$(id -g)\" /nix 2>/dev/null || true; fi; }}; \
-         ensure_tools() {{ miss=; for t in xz tar curl; do command -v \"$t\" >/dev/null 2>&1 || miss=\"$miss $t\"; done; [ -z \"$miss\" ] && return 0; echo \"nix: installing missing prerequisites:$miss\"; if command -v sudo >/dev/null 2>&1 && sudo -n true 2>/dev/null; then S='sudo -n'; else S=; fi; if command -v apt-get >/dev/null 2>&1; then $S apt-get update -y && $S apt-get install -y xz-utils tar curl ca-certificates; elif command -v apk >/dev/null 2>&1; then $S apk add --no-cache xz tar curl ca-certificates; elif command -v dnf >/dev/null 2>&1; then $S dnf install -y xz tar curl ca-certificates; elif command -v yum >/dev/null 2>&1; then $S yum install -y xz tar curl ca-certificates; fi; }}; \
+         ensure_tools() {{ miss=; for t in xz tar curl; do command -v \"$t\" >/dev/null 2>&1 || miss=\"$miss $t\"; done; [ -z \"$miss\" ] && return 0; echo \"nix: installing missing prerequisites:$miss\"; if command -v sudo >/dev/null 2>&1 && sudo -n true 2>/dev/null; then S='sudo -n'; else S=; fi; if command -v apt-get >/dev/null 2>&1; then $S apt-get update -y && $S apt-get install -y xz-utils tar curl ca-certificates; elif command -v apk >/dev/null 2>&1; then $S apk add --no-cache xz tar curl ca-certificates; elif command -v dnf >/dev/null 2>&1; then $S dnf install -y xz tar curl ca-certificates; elif command -v yum >/dev/null 2>&1; then $S yum install -y xz tar curl ca-certificates; fi; miss=; for t in xz tar curl; do command -v \"$t\" >/dev/null 2>&1 || miss=\"$miss $t\"; done; [ -z \"$miss\" ] && return 0; echo \"nix: prerequisites still missing:$miss (no usable package manager or no root/sudo)\"; return 1; }}; \
          do_install() {{ {install}; [ -r \"$HOME/.nix-profile/etc/profile.d/nix.sh\" ] && . \"$HOME/.nix-profile/etc/profile.d/nix.sh\" 2>/dev/null || true; [ -r /nix/var/nix/profiles/default/etc/profile.d/nix-daemon.sh ] && . /nix/var/nix/profiles/default/etc/profile.d/nix-daemon.sh 2>/dev/null || true; export PATH=\"$HOME/.nix-profile/bin:/nix/var/nix/profiles/default/bin:$PATH\"; claim_store; command -v nix >/dev/null 2>&1; }}; \
          export HOME=${{HOME:-/root}}; \
          claim_store; \
@@ -1134,7 +1204,37 @@ fn nix_install_script(
     )
 }
 
-/// An sh prelude for any step that runs `nix` builds. Two jobs:
+/// The healing half of [`nix_runtime_prelude`]: the `nix_idle` and
+/// `nix_store_heal` functions, then the guarded `/homeless-shelter` purge and
+/// store heal. A macro (not a `const`) so `concat!` can splice it into both the
+/// prelude and [`DIRENV_HEAL_LIB`]. Contains NO single quote, because the
+/// direnv install writes it inside a single-quoted `printf` argument, and is
+/// safe under `set -eu` (direnv evaluates its libs with errexit).
+macro_rules! nix_heal_sh {
+    () => {
+        "nix_idle() { ! pgrep -x \"nix|nix-build|nix-shell|nix-store|nix-instantiate|nix-daemon\" >/dev/null 2>&1; }; \
+         nix_store_heal() ( \
+           PATH=\"$HOME/.nix-profile/bin:/nix/var/nix/profiles/default/bin:$PATH\"; \
+           empty=$(find /nix/store -maxdepth 1 -name \"*.drv\" -size 0 2>/dev/null) || empty=; \
+           [ -n \"$empty\" ] || exit 0; \
+           n=0; \
+           for d in $empty; do \
+             refs=$(nix-store --query --referrers-closure \"$d\" 2>/dev/null) || refs=; \
+             nix-store --delete --ignore-liveness ${refs:-$d} >/dev/null 2>&1 || true; \
+             n=$((n+1)); \
+           done; \
+           echo \"nix: healed $n empty .drv file(s) in /nix/store\" >&2; \
+           exit 0 \
+         ); \
+         if nix_idle; then \
+           sudo -n rm -rf /homeless-shelter 2>/dev/null || true; \
+           rm -rf /homeless-shelter 2>/dev/null || true; \
+           nix_store_heal; \
+         fi; "
+    };
+}
+
+/// An sh prelude for any step that runs `nix` builds. Three jobs:
 ///
 /// 1. **Private flake inputs**: export `NIX_CONFIG` with a GitHub `access-tokens`
 ///    line from the env token (GH_TOKEN, else GITHUB_TOKEN). nix's flake-input
@@ -1148,15 +1248,35 @@ fn nix_install_script(
 ///    by the sprite suspending on idle leaves it behind, wedging every later nix
 ///    build. Remove it up front — `sudo` first (a leftover from the pre-`claim_store`
 ///    root era is root-owned and a plain `rm` can't touch it), then a plain `rm`.
+/// 3. **Empty `.drv` heal** (`nix_store_heal`): the same interruption can leave
+///    a zero-byte `.drv` registered in the store, after which every evaluation
+///    that touches it fails `file is empty`. Delete those paths (and only their
+///    referrers) so nix regenerates them.
+///
+/// 2 and 3 run only when no nix process is alive (THE-2046): a running build
+/// owns `/homeless-shelter`, and a `.drv` mid-write is briefly empty. The guard
+/// matches process NAMES (`pgrep -x`), never full command lines: a step
+/// script's own `sh -c` argv names `nix develop`, so `pgrep -f` would always
+/// find the script itself and the purge would never run.
 ///
 /// Trailing `;` so it composes as a prefix; a no-op for the token half when no
 /// token is present.
 pub(crate) fn nix_runtime_prelude() -> &'static str {
-    "tok=\"${GH_TOKEN:-${GITHUB_TOKEN:-}}\"; \
-     if [ -n \"$tok\" ]; then export NIX_CONFIG=\"access-tokens = github.com=$tok\"; fi; \
-     sudo -n rm -rf /homeless-shelter 2>/dev/null || true; \
-     rm -rf /homeless-shelter 2>/dev/null || true; "
+    concat!(
+        "tok=\"${GH_TOKEN:-${GITHUB_TOKEN:-}}\"; \
+         if [ -n \"$tok\" ]; then export NIX_CONFIG=\"access-tokens = github.com=$tok\"; fi; ",
+        nix_heal_sh!(),
+    )
 }
+
+/// The direnv library hook the `direnv` step installs as
+/// `~/.config/direnv/lib/thegn-nix-heal.sh`. direnv sources `lib/*.sh` before
+/// every `.envrc`, so an in-pane `use flake` after an interrupted build heals
+/// the store and `/homeless-shelter` exactly like a provisioning step does.
+const DIRENV_HEAL_LIB: &str = concat!(
+    "# thegn: heal a wedged single-user Nix before direnv builds (THE-2046).\n",
+    nix_heal_sh!(),
+);
 
 /// Install direnv + hook it into the login shells, so entering the workdir
 /// activates the flake devShell exactly like local. Idempotent.
@@ -1183,8 +1303,11 @@ fn direnv_install_script() -> String {
            grep -q 'direnv hook' \"$rc\" 2>/dev/null || \
              printf '\\neval \"$(direnv hook %s)\"\\n' \"$sh\" >> \"$rc\" 2>/dev/null || true; \
          done; \
+         lib=\"${{XDG_CONFIG_HOME:-$HOME/.config}}/direnv/lib\"; \
+         mkdir -p \"$lib\" 2>/dev/null && printf '%s\\n' '{lib}' > \"$lib/thegn-nix-heal.sh\" 2>/dev/null || true; \
          true",
         nix_runtime_prelude(),
+        lib = DIRENV_HEAL_LIB,
     )
 }
 
@@ -1226,11 +1349,12 @@ fn devshell_warm_script(workdir: &str, req: &EnvRequirements) -> String {
          [ -r /nix/var/nix/profiles/default/etc/profile.d/nix-daemon.sh ] && . /nix/var/nix/profiles/default/etc/profile.d/nix-daemon.sh 2>/dev/null || true; \
          export PATH=\"$HOME/.nix-profile/bin:/nix/var/nix/profiles/default/bin:$PATH\""
     );
-    let nixsh = nixsh.as_str();
-    if req.direnv && req.direnv_uses_flake {
-        format!(
-            "{nixsh}; cd {wd} 2>/dev/null && direnv exec . true 2>/dev/null || nix develop --command true 2>/dev/null || true; true"
-        )
+    // Each arm picks the warm command (its real exit status kept). The shared
+    // tail runs it with output captured; on `file is empty` (a zero-byte `.drv`
+    // left by an interrupted build) it heals the store and retries once
+    // (THE-2046). The step still always ends `true`.
+    let warm = if req.direnv && req.direnv_uses_flake {
+        "direnv exec . true || nix develop --command true"
     } else if req.devenv && !req.nix_flake_devshell {
         // Pure-devenv (no flake devShell to fall back on): the `devenv` CLI is the
         // only entry, so install it if absent. NOTE this `nix profile install` is
@@ -1239,18 +1363,20 @@ fn devshell_warm_script(workdir: &str, req: &EnvRequirements) -> String {
         // for devenv's closure, whose from-source realise can OOM-kill — exit 137,
         // which restarts the VM — or time out a pooled provider microVM and paint
         // a spurious "Build dev shell" failure on the loading screen).
-        format!(
-            "{nixsh}; cd {wd} 2>/dev/null && (command -v devenv >/dev/null 2>&1 || nix profile install nixpkgs#devenv 2>/dev/null) || true; devenv shell true 2>/dev/null || true; true"
-        )
+        "{ command -v devenv >/dev/null 2>&1 || nix profile install nixpkgs#devenv; }; devenv shell true"
     } else if req.nix_classic {
         // Classic (non-flake) nix: `shell.nix`/`default.nix` — warm with
         // `nix-shell`, which evaluates exactly what an interactive shell will.
-        format!("{nixsh}; cd {wd} 2>/dev/null && nix-shell --run true 2>/dev/null || true; true")
+        "nix-shell --run true"
     } else {
-        format!(
-            "{nixsh}; cd {wd} 2>/dev/null && nix develop --command true 2>/dev/null || true; true"
-        )
-    }
+        "nix develop --command true"
+    };
+    format!(
+        "{nixsh}; cd {wd} 2>/dev/null || true; \
+         thegn_warm() {{ {warm}; }}; \
+         out=$(thegn_warm 2>&1) || {{ printf '%s\\n' \"$out\" | grep -q 'file is empty' && nix_idle && nix_store_heal && thegn_warm >/dev/null 2>&1; }}; \
+         true"
+    )
 }
 
 /// Push the project's built devShell closure to a binary cache so later sandboxes
@@ -2030,7 +2156,9 @@ mod tests {
                 "workspace",
                 "git_auth",
                 "clone",
+                "git_exclude",
                 "nix",
+                "nix_verify",
                 "direnv",
                 "devshell",
                 "checkpoint"
@@ -2131,7 +2259,9 @@ mod tests {
                 "workspace",
                 "git_auth",
                 "clone",
+                "git_exclude",
                 "nix",
+                "nix_verify",
                 "direnv",
                 "devshell",
                 "tools",
@@ -2397,7 +2527,12 @@ mod tests {
             .iter()
             .position(|i| *i == "local_parity")
             .expect("local_parity step");
-        assert_eq!(parity, clone + 1, "parity immediately after clone: {ids:?}");
+        assert_eq!(
+            ids[clone + 1],
+            "git_exclude",
+            "the marker exclude follows the clone: {ids:?}"
+        );
+        assert_eq!(parity, clone + 2, "parity right after the exclude: {ids:?}");
         let StepKind::LocalParity { worktree, workdir } = &p
             .steps
             .iter()
@@ -2434,7 +2569,12 @@ mod tests {
             .expect("bundle_seed step");
         assert_eq!(seed, auth + 1, "seed right after git_auth: {ids:?}");
         let parity = ids.iter().position(|i| *i == "local_parity").unwrap();
-        assert_eq!(parity, seed + 1, "parity follows the seed: {ids:?}");
+        assert_eq!(
+            ids[seed + 1],
+            "git_exclude",
+            "exclude follows the seed: {ids:?}"
+        );
+        assert_eq!(parity, seed + 2, "parity follows the exclude: {ids:?}");
         let step = &p.steps[seed];
         assert_eq!(step.label, "Seed repository (git bundle)");
         let StepKind::BundleSeed {
@@ -3167,6 +3307,278 @@ mod tests {
             EnvPlan::marker_path("/workspace/"),
             "/workspace/.thegn-provisioned"
         );
+    }
+
+    #[test]
+    fn marker_path_uses_the_marker_const() {
+        assert_eq!(EnvPlan::marker_path("/w"), format!("/w/{PROVISION_MARKER}"));
+        assert_eq!(PROVISION_MARKER, ".thegn-provisioned");
+    }
+
+    fn exec_script<'a>(p: &'a EnvPlan, id: &str) -> &'a str {
+        match &p.steps.iter().find(|s| s.id == id).expect(id).kind {
+            StepKind::Exec(s) => s,
+            other => panic!("{id} is not Exec: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn git_exclude_follows_clone_and_bundle_seed_and_is_idempotent() {
+        // THE-2043: the provision marker sits in the checkout root, so the step
+        // right after the repo step lists it in `.git/info/exclude`.
+        let cloned = plan(
+            &EnvRequirements::default(),
+            &PlanOpts {
+                origin: Some("https://example.com/r.git".into()),
+                ..Default::default()
+            },
+        );
+        let seeded = plan(
+            &EnvRequirements::default(),
+            &PlanOpts {
+                bundle_seed: Some(BundleSeed {
+                    worktree: "/home/u/wt".into(),
+                    branch: "feat".into(),
+                }),
+                ..Default::default()
+            },
+        );
+        for (p, repo) in [(&cloned, "clone"), (&seeded, "bundle_seed")] {
+            let ids: Vec<&str> = p.steps.iter().map(|s| s.id.as_str()).collect();
+            let at = ids.iter().position(|i| *i == repo).expect(repo);
+            assert_eq!(ids[at + 1], "git_exclude", "{ids:?}");
+            let step = &p.steps[at + 1];
+            assert_eq!(step.label, "Hide thegn marker from git");
+            let s = exec_script(p, "git_exclude");
+            assert!(s.starts_with("cd /workspace && [ -d .git ]"), "{s}");
+            assert!(
+                s.contains("grep -qxF '/.thegn-provisioned' .git/info/exclude"),
+                "idempotent exact-line check: {s}"
+            );
+            assert!(
+                s.contains("printf '%s\\n' '/.thegn-provisioned' >> .git/info/exclude"),
+                "{s}"
+            );
+            assert!(s.ends_with("|| true"), "best-effort: {s}");
+        }
+        // No repo step, no exclude.
+        let bare = plan(&EnvRequirements::default(), &PlanOpts::default());
+        assert!(!bare.steps.iter().any(|s| s.id == "git_exclude"));
+        // The image bake never carries per-checkout steps.
+        let baked = bake_scripts(crate::config::NixInstaller::Official, None);
+        assert!(baked.iter().all(|(id, _)| *id != "git_exclude"));
+    }
+
+    #[test]
+    fn nix_verify_present_iff_nix_required() {
+        // THE-2045: an env that needs Nix halts on "Verify Nix" instead of
+        // reporting up without it; one that merely benefits gets no fatal check.
+        let flake = EnvRequirements {
+            nix_flake_devshell: true,
+            ..Default::default()
+        };
+        let classic = EnvRequirements {
+            nix_classic: true,
+            ..Default::default()
+        };
+        let langs = EnvRequirements {
+            languages: vec![Language::Python],
+            ..Default::default()
+        };
+        let host_cache = PlanOpts {
+            host_cache_url: Some("http://127.0.0.1:8484".into()),
+            ..Default::default()
+        };
+        let push = PlanOpts {
+            push_devshell: true,
+            ..Default::default()
+        };
+        let parity = PlanOpts {
+            strategy: crate::config::ShellStrategy::HostParity,
+            home_store_roots: vec!["/nix/store/abc-zsh".into()],
+            host_cache_url: Some("http://127.0.0.1:8484".into()),
+            ..Default::default()
+        };
+        let devenv = EnvRequirements {
+            devenv: true,
+            ..Default::default()
+        };
+        let use_flake = EnvRequirements {
+            nix_classic: true,
+            direnv: true,
+            direnv_uses_flake: true,
+            ..Default::default()
+        };
+        let default = PlanOpts::default();
+        let cases: [(&EnvRequirements, &PlanOpts); 9] = [
+            (&flake, &default),
+            (&devenv, &default),
+            (&use_flake, &default),
+            (&classic, &default),
+            (&classic, &host_cache),
+            (&classic, &push),
+            (&langs, &default),
+            (&langs, &host_cache),
+            (&EnvRequirements::default(), &parity),
+        ];
+        for (req, opts) in cases {
+            let p = plan(req, opts);
+            let ids: Vec<&str> = p.steps.iter().map(|s| s.id.as_str()).collect();
+            let has_nix = ids.contains(&"nix");
+            assert!(has_nix, "every case installs nix: {ids:?}");
+            let required = nix_required(req, opts);
+            assert_eq!(
+                ids.contains(&"nix_verify"),
+                required,
+                "nix_verify iff nix_required ({required}): {ids:?}"
+            );
+            if required {
+                let at = ids.iter().position(|i| *i == "nix").unwrap();
+                assert_eq!(ids[at + 1], "nix_verify", "right after nix: {ids:?}");
+                assert_eq!(p.steps[at + 1].label, "Verify Nix");
+                let s = exec_script(&p, "nix_verify");
+                assert!(s.contains("command -v nix"), "{s}");
+                assert!(s.contains(". \"$HOME/.nix-profile/etc/profile.d/nix.sh\""));
+                assert!(
+                    s.contains(
+                        "nix is not installed: the Install Nix step failed (see its output above)"
+                    ),
+                    "{s}"
+                );
+                assert!(s.trim_end().ends_with("exit 1; }"), "fails closed: {s}");
+            }
+        }
+        assert!(nix_required(&flake, &default));
+        assert!(nix_required(&devenv, &default));
+        assert!(nix_required(&classic, &host_cache));
+        assert!(nix_required(&classic, &push));
+        assert!(!nix_required(&classic, &default));
+        assert!(!nix_required(&langs, &default));
+        // A blank host-cache URL is not a host cache.
+        let blank = PlanOpts {
+            host_cache_url: Some("  ".into()),
+            ..Default::default()
+        };
+        assert!(!nix_required(&langs, &blank));
+        // Nix disallowed: no install, so no verify even when required.
+        let no_nix = plan(
+            &flake,
+            &PlanOpts {
+                allow_nix: false,
+                ..Default::default()
+            },
+        );
+        assert!(!no_nix.steps.iter().any(|s| s.id == "nix_verify"));
+    }
+
+    #[test]
+    fn ensure_tools_reports_prerequisites_still_missing() {
+        // THE-2045: after the package-manager attempt, re-check and name what
+        // is still missing (exit 1), while the caller keeps `|| true`.
+        let s = nix_install_script(
+            crate::config::NixInstaller::Official,
+            None,
+            None,
+            None,
+            None,
+        );
+        assert!(
+            s.contains(
+                "echo \"nix: prerequisites still missing:$miss (no usable package manager or no root/sudo)\"; return 1;"
+            ),
+            "{s}"
+        );
+        assert!(s.contains("ensure_tools || true;"), "{s}");
+        let post = s.find("prerequisites still missing").unwrap();
+        let yum = s.find("yum install -y xz tar curl").unwrap();
+        assert!(yum < post, "re-check runs after the install attempt");
+    }
+
+    #[test]
+    fn nix_prelude_guards_the_purge_and_heals_empty_drvs() {
+        // THE-2046: never purge /homeless-shelter or delete a `.drv` while a nix
+        // process is alive; heal only zero-byte `.drv`s and their referrers.
+        let p = nix_runtime_prelude();
+        assert!(p.contains("nix_idle() { ! pgrep -x \"nix|"), "{p}");
+        assert!(
+            !p.contains("pgrep -f"),
+            "a -f guard matches the script itself: {p}"
+        );
+        assert!(p.contains("if nix_idle; then"), "{p}");
+        let guard = p.find("if nix_idle; then").unwrap();
+        let purge = p.find("rm -rf /homeless-shelter").unwrap();
+        let heal_call = p.rfind("nix_store_heal;").unwrap();
+        assert!(guard < purge && purge < heal_call, "{p}");
+        assert!(
+            p.contains("find /nix/store -maxdepth 1 -name \"*.drv\" -size 0"),
+            "only empty .drv files: {p}"
+        );
+        assert!(
+            p.contains("nix-store --query --referrers-closure \"$d\""),
+            "{p}"
+        );
+        assert!(p.contains("nix-store --delete --ignore-liveness"), "{p}");
+        assert!(p.contains("healed $n empty .drv file(s)"), "{p}");
+        assert!(p.trim_end().ends_with(';'), "composes as a prefix: {p}");
+        // Carried by every nix-building step.
+        let warm = devshell_warm_script("/workspace", &EnvRequirements::default());
+        assert!(warm.contains("nix_store_heal"), "{warm}");
+    }
+
+    #[test]
+    fn devshell_warm_heals_and_retries_once_on_file_is_empty() {
+        for req in [
+            EnvRequirements::default(),
+            EnvRequirements {
+                direnv: true,
+                direnv_uses_flake: true,
+                ..Default::default()
+            },
+            EnvRequirements {
+                nix_classic: true,
+                ..Default::default()
+            },
+            EnvRequirements {
+                devenv: true,
+                ..Default::default()
+            },
+        ] {
+            let s = devshell_warm_script("/workspace", &req);
+            assert!(
+                s.contains(
+                    "out=$(thegn_warm 2>&1) || { printf '%s\\n' \"$out\" | grep -q 'file is empty' && nix_idle && nix_store_heal && thegn_warm >/dev/null 2>&1; }"
+                ),
+                "{s}"
+            );
+            assert_eq!(
+                s.matches("thegn_warm >/dev/null").count(),
+                1,
+                "one retry: {s}"
+            );
+            assert!(
+                s.trim_end().ends_with("true"),
+                "warm stays best-effort: {s}"
+            );
+        }
+    }
+
+    #[test]
+    fn direnv_install_writes_the_heal_lib_hook() {
+        // THE-2046: direnv sources lib/*.sh before each .envrc, so an in-pane
+        // `use flake` heals like a provisioning step.
+        let s = direnv_install_script();
+        assert!(
+            s.contains("lib=\"${XDG_CONFIG_HOME:-$HOME/.config}/direnv/lib\"; mkdir -p \"$lib\""),
+            "{s}"
+        );
+        assert!(s.contains("> \"$lib/thegn-nix-heal.sh\""), "{s}");
+        assert!(s.contains(DIRENV_HEAL_LIB), "{s}");
+        // Written inside a single-quoted printf argument: no quote may escape it.
+        assert!(!DIRENV_HEAL_LIB.contains('\''), "{DIRENV_HEAL_LIB}");
+        assert!(DIRENV_HEAL_LIB.contains("if nix_idle; then"));
+        assert!(DIRENV_HEAL_LIB.contains("rm -rf /homeless-shelter"));
+        assert!(DIRENV_HEAL_LIB.contains("nix_store_heal;"));
+        assert!(s.trim_end().ends_with("true"), "{s}");
     }
 
     #[test]
