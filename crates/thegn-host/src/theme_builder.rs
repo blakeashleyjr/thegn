@@ -15,56 +15,26 @@ use crate::layer::{Anchor, LayerSpec, box_rect, open_layer};
 use crate::seg::{self, Line, Seg, Tok, seg, sp};
 use crate::theme_store::ThemeOverrides;
 
+mod elements;
+mod picker;
+
+use elements::{ColorRole, ELEMENT_GROUPS, ElementRow, ROLES, element_rows, role_name, row_role};
+use picker::{GridLine, Move, PickerSection, PickerState};
+
 const CATALOG_COLS: usize = 27;
-const TOKEN_ROWS: usize = 20;
+const TOKEN_ROWS: usize = ROLES.len();
 const ACTION_ROW: usize = TOKEN_ROWS;
+/// Preview-column row of the selected role's contrast line (under the six
+/// sample rows).
+const CONTRAST_ROW: usize = 7;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-enum ColorRole {
-    Bg0,
-    Bg1,
-    Panel,
-    Panel2,
-    Raise,
-    Border,
-    Text,
-    Dim,
-    Faint,
-    Ghost,
-    Accent,
-    Focus,
-    Teal,
-    Magenta,
-    Purple,
-    Green,
-    Amber,
-    Red,
-    Blue,
-    Orange,
+/// What the editor column lists: the raw palette tokens, or the UI elements
+/// each token paints. `v` toggles it when no field is being edited.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum EditorView {
+    Tokens,
+    Elements,
 }
-
-const ROLES: [(ColorRole, &str); TOKEN_ROWS] = [
-    (ColorRole::Bg0, "bg0"),
-    (ColorRole::Bg1, "bg1"),
-    (ColorRole::Panel, "panel"),
-    (ColorRole::Panel2, "panel2"),
-    (ColorRole::Raise, "raise"),
-    (ColorRole::Border, "border"),
-    (ColorRole::Text, "text"),
-    (ColorRole::Dim, "dim"),
-    (ColorRole::Faint, "faint"),
-    (ColorRole::Ghost, "ghost"),
-    (ColorRole::Accent, "accent"),
-    (ColorRole::Focus, "focus"),
-    (ColorRole::Teal, "teal"),
-    (ColorRole::Magenta, "magenta"),
-    (ColorRole::Purple, "purple"),
-    (ColorRole::Green, "green"),
-    (ColorRole::Amber, "amber"),
-    (ColorRole::Red, "red"),
-    (ColorRole::Blue, "blue"),
-    (ColorRole::Orange, "orange"),
-];
 
 #[derive(Debug, Clone)]
 pub(crate) struct CatalogItem {
@@ -110,6 +80,19 @@ pub(crate) struct ThemeBuilder {
     pending: bool,
     requires_save: bool,
     edited: Vec<ColorRole>,
+    view: EditorView,
+    /// Per-group collapsed flags of the element view (missing = expanded).
+    collapsed: Vec<bool>,
+    /// Element-view cursor: an index into `element_rows(&collapsed)`, or one
+    /// past the end for the Apply row.
+    elem_cursor: usize,
+    /// Wheel scroll offsets; `None` follows the list's cursor.
+    elem_scroll: Option<usize>,
+    catalog_scroll: Option<usize>,
+    picker: Option<PickerState>,
+    /// The picker's cells, captured when it opened so the "theme" section
+    /// does not reshuffle while its own moves preview new values.
+    picker_cells: Vec<PickerSection>,
 }
 
 impl ThemeBuilder {
@@ -137,6 +120,13 @@ impl ThemeBuilder {
             pending: false,
             requires_save: false,
             edited: Vec::new(),
+            view: EditorView::Tokens,
+            collapsed: vec![false; ELEMENT_GROUPS.len()],
+            elem_cursor: 0,
+            elem_scroll: None,
+            catalog_scroll: None,
+            picker: None,
+            picker_cells: Vec::new(),
         }
     }
 
@@ -203,9 +193,6 @@ impl ThemeBuilder {
             }
             return BuilderEvent::None;
         }
-        if !press {
-            return BuilderEvent::None;
-        }
         let inner = Rect {
             x: outer.x + 2,
             y: outer.y + 1,
@@ -213,22 +200,307 @@ impl ThemeBuilder {
             rows: outer.rows.saturating_sub(2),
         };
         let layout = layout_for(inner);
+        // The loop forwards every mouse event; the reducer decides what a
+        // wheel tick means: it scrolls whichever list sits under the pointer.
+        if event.mouse_buttons.contains(MouseButtons::VERT_WHEEL) {
+            let down = !event.mouse_buttons.contains(MouseButtons::WHEEL_POSITIVE);
+            self.scroll_at(layout, mx, my, down);
+            return BuilderEvent::None;
+        }
+        if !press {
+            return BuilderEvent::None;
+        }
+        if self.picker.is_some() {
+            // The picker is a sub-modal: only its own cells take clicks, so a
+            // stray click cannot swap the theme under an open preview.
+            if let Some(cursor) = self.picker_hit(layout.editor, mx, my) {
+                self.click_picker_cell(cursor);
+            }
+            return BuilderEvent::None;
+        }
         if layout.catalog.contains(mx, my) {
-            let index = catalog_start(self.selected, layout.catalog.rows)
-                .saturating_add(my.saturating_sub(inner.y));
+            let start = list_start(
+                self.catalog_scroll,
+                self.selected,
+                layout.catalog.rows,
+                self.catalog.len(),
+            );
+            let index = start.saturating_add(my.saturating_sub(layout.catalog.y));
             if index < self.catalog.len() {
                 self.select(index);
             }
         } else if layout.editor.contains(mx, my) {
-            let row = my.saturating_sub(inner.y);
-            if row < TOKEN_ROWS {
-                self.focus = row;
-                self.editing = None;
+            let row = my.saturating_sub(layout.editor.y);
+            match self.view {
+                EditorView::Tokens => {
+                    if row < TOKEN_ROWS {
+                        self.focus = row;
+                        self.editing = None;
+                    }
+                }
+                EditorView::Elements => self.click_element(layout.editor, row, mx),
             }
         } else if layout.apply.contains(mx, my) {
             return self.apply_event();
         }
         BuilderEvent::None
+    }
+
+    /// One wheel tick over the catalog, the element list, or the open picker.
+    fn scroll_at(&mut self, layout: BuilderLayout, mx: usize, my: usize, down: bool) {
+        if layout.catalog.contains(mx, my) {
+            let (rows, len) = (layout.catalog.rows, self.catalog.len());
+            let start = list_start(self.catalog_scroll, self.selected, rows, len);
+            self.catalog_scroll = Some(wheel_step(start, down, len, rows));
+        } else if layout.editor.contains(mx, my)
+            && let Some(state) = &self.picker
+        {
+            let lines = picker::grid_lines(&self.picker_cells);
+            let visible = picker_rows(layout.editor);
+            let cursor = picker::cursor_line(&lines, &self.picker_cells, state.cursor);
+            let start = list_start(state.scroll, cursor, visible, lines.len());
+            let next = wheel_step(start, down, lines.len(), visible);
+            if let Some(state) = self.picker.as_mut() {
+                state.scroll = Some(next);
+            }
+        } else if layout.editor.contains(mx, my) && self.view == EditorView::Elements {
+            let rows = element_rows(&self.collapsed);
+            let start = self.elements_start(rows.len(), layout.editor.rows);
+            self.elem_scroll = Some(wheel_step(start, down, rows.len(), layout.editor.rows));
+        }
+    }
+
+    fn elements_start(&self, len: usize, visible: usize) -> usize {
+        list_start(
+            self.elem_scroll,
+            self.elem_cursor.min(len.saturating_sub(1)),
+            visible,
+            len,
+        )
+    }
+
+    fn click_element(&mut self, editor: Rect, row: usize, mx: usize) {
+        let rows = element_rows(&self.collapsed);
+        let index = self.elements_start(rows.len(), editor.rows) + row;
+        let Some(hit) = rows.get(index).copied() else {
+            return;
+        };
+        self.editing = None;
+        match hit {
+            ElementRow::Group(group) => self.toggle_group(group, None),
+            ElementRow::Element(..) => {
+                self.elem_cursor = index;
+                // Columns 2..4 hold the two-cell swatch (after the marker).
+                let on_swatch = mx >= editor.x + 2 && mx < editor.x + 4;
+                if on_swatch && let Some(role) = row_role(hit) {
+                    self.open_picker(role);
+                }
+            }
+        }
+    }
+
+    /// Collapse (`Some(false)`), expand (`Some(true)`) or toggle (`None`) a
+    /// group; the cursor lands on its header.
+    fn toggle_group(&mut self, group: usize, expand: Option<bool>) {
+        if self.collapsed.len() < ELEMENT_GROUPS.len() {
+            self.collapsed.resize(ELEMENT_GROUPS.len(), false);
+        }
+        let Some(flag) = self.collapsed.get_mut(group) else {
+            return;
+        };
+        *flag = expand.map_or(!*flag, |expand| !expand);
+        self.elem_cursor = element_rows(&self.collapsed)
+            .iter()
+            .position(|row| *row == ElementRow::Group(group))
+            .unwrap_or(0);
+    }
+
+    /// The picker cell under the pointer, if any.
+    fn picker_hit(&self, editor: Rect, mx: usize, my: usize) -> Option<(usize, usize)> {
+        let state = self.picker.as_ref()?;
+        if !editor.contains(mx, my) || my == editor.y {
+            return None;
+        }
+        let lines = picker::grid_lines(&self.picker_cells);
+        let visible = picker_rows(editor);
+        let cursor = picker::cursor_line(&lines, &self.picker_cells, state.cursor);
+        let start = list_start(state.scroll, cursor, visible, lines.len());
+        let GridLine::Cells { section, row } = *lines.get(start + (my - editor.y - 1))? else {
+            return None;
+        };
+        let block = self.picker_cells.get(section)?;
+        let column = (mx - editor.x) / picker_cell_width(editor.cols);
+        if column >= block.cols {
+            return None;
+        }
+        let index = row * block.cols + column;
+        (index < block.cells.len()).then_some((section, index))
+    }
+
+    /// A first click previews a cell; a second click on the previewed cell
+    /// keeps it (the mouse twin of Enter).
+    fn click_picker_cell(&mut self, cursor: (usize, usize)) {
+        let Some(state) = self.picker.as_ref() else {
+            return;
+        };
+        let previewed = state.cursor == cursor
+            && picker::cell(&self.picker_cells, cursor).is_some_and(|cell| {
+                cell.eq_ignore_ascii_case(&role_value(&self.draft, state.role))
+            });
+        if previewed {
+            self.picker = None;
+        } else {
+            self.move_picker_to(cursor, false);
+        }
+    }
+
+    /// Move the picker cursor and preview its value live: the role is written
+    /// into the draft and recorded as an intentional edit, exactly as typing a
+    /// hex value does. `follow` re-pins the scroll to the cursor (keys do;
+    /// clicks keep the wheel position).
+    fn move_picker_to(&mut self, cursor: (usize, usize), follow: bool) {
+        let Some(value) = picker::cell(&self.picker_cells, cursor).map(str::to_owned) else {
+            return;
+        };
+        let Some(state) = self.picker.as_mut() else {
+            return;
+        };
+        state.cursor = cursor;
+        if follow {
+            state.scroll = None;
+        }
+        let role = state.role;
+        set_role(&mut self.draft, role, value);
+        remember_edit(&mut self.edited, role);
+        self.refresh_candidate();
+    }
+
+    fn open_picker(&mut self, role: ColorRole) {
+        let value = role_value(&self.draft, role);
+        self.picker_cells = picker::palette_cells(&self.candidate);
+        let cursor = picker::locate(&self.picker_cells, &value).unwrap_or((0, 0));
+        self.picker = Some(PickerState {
+            role,
+            was_edited: self.edited.contains(&role),
+            original: value,
+            cursor,
+            scroll: None,
+        });
+        self.editing = None;
+        self.status = None;
+    }
+
+    /// Undo an in-progress edit of `role`: the hex editor's and the picker's
+    /// shared Esc path.
+    fn restore_role(&mut self, role: ColorRole, original: String, was_edited: bool) {
+        set_role(&mut self.draft, role, original);
+        if !was_edited {
+            self.edited.retain(|edited| *edited != role);
+        }
+        self.refresh_candidate();
+    }
+
+    fn picker_key(&mut self, key: &KeyCode) {
+        let Some(state) = self.picker.as_ref() else {
+            return;
+        };
+        let (role, cursor) = (state.role, state.cursor);
+        let dir = match key {
+            KeyCode::Escape => {
+                if let Some(state) = self.picker.take() {
+                    self.restore_role(role, state.original, state.was_edited);
+                }
+                return;
+            }
+            KeyCode::Enter => {
+                self.picker = None;
+                return;
+            }
+            KeyCode::Char('#') => {
+                if let Some(state) = self.picker.take() {
+                    let len = role_value(&self.draft, role).len();
+                    self.editing = Some((role, state.original, len, state.was_edited));
+                }
+                return;
+            }
+            KeyCode::LeftArrow | KeyCode::Char('h') => Move::Left,
+            KeyCode::RightArrow | KeyCode::Char('l') => Move::Right,
+            KeyCode::UpArrow | KeyCode::Char('k') => Move::Up,
+            KeyCode::DownArrow | KeyCode::Char('j') => Move::Down,
+            _ => return,
+        };
+        let next = picker::step(&self.picker_cells, cursor, dir);
+        if next != cursor {
+            self.move_picker_to(next, true);
+        }
+    }
+
+    /// Element-view keys; `None` falls through to the shared top-level keys
+    /// (catalog arrows, Esc, `i`).
+    fn element_key(&mut self, key: &KeyCode, mods: Modifiers) -> Option<BuilderEvent> {
+        let rows = element_rows(&self.collapsed);
+        let apply = rows.len();
+        self.elem_cursor = self.elem_cursor.min(apply);
+        let current = rows.get(self.elem_cursor).copied();
+        match key {
+            KeyCode::Tab => {
+                self.elem_cursor = if !mods.contains(Modifiers::SHIFT) {
+                    (self.elem_cursor + 1).min(apply)
+                } else if self.elem_cursor == 0 {
+                    apply
+                } else {
+                    self.elem_cursor - 1
+                };
+                self.elem_scroll = None;
+            }
+            KeyCode::Enter if current.is_none() => return Some(self.apply_event()),
+            KeyCode::Enter | KeyCode::Char(' ') => match current {
+                Some(ElementRow::Group(group)) => self.toggle_group(group, None),
+                Some(row) => {
+                    if let Some(role) = row_role(row) {
+                        self.open_picker(role);
+                    }
+                }
+                None => {}
+            },
+            KeyCode::LeftArrow => {
+                if let Some(ElementRow::Group(group) | ElementRow::Element(group, _)) = current {
+                    self.toggle_group(group, Some(false));
+                }
+            }
+            KeyCode::RightArrow => {
+                if let Some(ElementRow::Group(group)) = current {
+                    self.toggle_group(group, Some(true));
+                }
+            }
+            _ => return None,
+        }
+        Some(BuilderEvent::None)
+    }
+
+    fn apply_focused(&self) -> bool {
+        match self.view {
+            EditorView::Tokens => self.focus == ACTION_ROW,
+            EditorView::Elements => self.elem_cursor >= element_rows(&self.collapsed).len(),
+        }
+    }
+
+    /// The role the contrast line describes: the one being picked or typed,
+    /// else the focused token/element.
+    fn selected_role(&self) -> Option<ColorRole> {
+        if let Some(state) = &self.picker {
+            return Some(state.role);
+        }
+        if let Some((role, ..)) = &self.editing {
+            return Some(*role);
+        }
+        match self.view {
+            EditorView::Tokens => ROLES.get(self.focus).map(|(role, _)| *role),
+            EditorView::Elements => element_rows(&self.collapsed)
+                .get(self.elem_cursor)
+                .copied()
+                .and_then(row_role),
+        }
     }
 
     pub(crate) fn handle_key(&mut self, key: &KeyCode, mods: Modifiers) -> BuilderEvent {
@@ -283,12 +555,9 @@ impl ThemeBuilder {
         if let Some((role, original, cursor, was_edited)) = &mut self.editing {
             match key {
                 KeyCode::Escape => {
-                    set_role(&mut self.draft, *role, original.clone());
-                    if !*was_edited {
-                        self.edited.retain(|edited| edited != role);
-                    }
-                    self.refresh_candidate();
+                    let (role, original, was_edited) = (*role, original.clone(), *was_edited);
                     self.editing = None;
+                    self.restore_role(role, original, was_edited);
                 }
                 KeyCode::LeftArrow => *cursor = cursor.saturating_sub(1),
                 KeyCode::RightArrow => {
@@ -324,10 +593,28 @@ impl ThemeBuilder {
             return BuilderEvent::None;
         }
 
+        if self.picker.is_some() {
+            self.picker_key(key);
+            return BuilderEvent::None;
+        }
+
         if mods.contains(Modifiers::CTRL) && matches!(key, KeyCode::Char('s' | 'S')) {
             self.input = Some((InputMode::SaveName, self.draft.meta.name.clone()));
             self.status = None;
             return BuilderEvent::None;
+        }
+        if mods.is_empty() && matches!(key, KeyCode::Char('v')) {
+            self.view = match self.view {
+                EditorView::Tokens => EditorView::Elements,
+                EditorView::Elements => EditorView::Tokens,
+            };
+            self.elem_scroll = None;
+            return BuilderEvent::None;
+        }
+        if self.view == EditorView::Elements
+            && let Some(event) = self.element_key(key, mods)
+        {
+            return event;
         }
         match key {
             KeyCode::Escape => BuilderEvent::Close,
@@ -363,13 +650,7 @@ impl ThemeBuilder {
             KeyCode::Enter if self.focus == ACTION_ROW => self.apply_event(),
             KeyCode::Enter => {
                 let (role, _) = ROLES[self.focus.min(TOKEN_ROWS - 1)];
-                let value = role_value(&self.draft, role);
-                self.editing = Some((
-                    role,
-                    value.clone(),
-                    value.len(),
-                    self.edited.contains(&role),
-                ));
+                self.open_picker(role);
                 BuilderEvent::None
             }
             _ => BuilderEvent::None,
@@ -402,6 +683,7 @@ impl ThemeBuilder {
             return;
         };
         self.selected = index;
+        self.catalog_scroll = None;
         self.active_name = item.name.clone();
         let palette = self
             .config
@@ -767,11 +1049,13 @@ fn layout_for(inner: Rect) -> BuilderLayout {
             cols: preview_cols,
             rows: content_rows,
         },
+        // The Apply row sits directly under the content, so a short screen
+        // that clips the token list still keeps the explicit Apply action.
         apply: Rect {
             x: right_x,
-            y: inner.y + ACTION_ROW,
+            y: inner.y + content_rows,
             cols: right_cols,
-            rows: inner.rows.saturating_sub(ACTION_ROW).min(1),
+            rows: inner.rows.saturating_sub(content_rows).min(1),
         },
     }
 }
@@ -782,6 +1066,107 @@ fn catalog_start(selected: usize, visible_rows: usize) -> usize {
     } else {
         selected.saturating_add(1).saturating_sub(visible_rows)
     }
+}
+
+/// The first visible index of a `len`-row list showing `visible` rows: the
+/// wheel offset when one is set, else the `catalog_start` follow-the-cursor
+/// position, clamped so the list never scrolls past its end.
+fn list_start(scroll: Option<usize>, cursor: usize, visible: usize, len: usize) -> usize {
+    scroll
+        .unwrap_or_else(|| catalog_start(cursor, visible))
+        .min(len.saturating_sub(visible))
+}
+
+fn wheel_step(start: usize, down: bool, len: usize, visible: usize) -> usize {
+    if down {
+        start.saturating_add(1).min(len.saturating_sub(visible))
+    } else {
+        start.saturating_sub(1)
+    }
+}
+
+/// Grid lines the picker shows: the editor column minus its title row.
+fn picker_rows(editor: Rect) -> usize {
+    editor.rows.saturating_sub(1)
+}
+
+/// Columns per picker cell: a two-cell swatch plus a gap when the column is
+/// wide enough for twelve of them, a single cell on a narrow popup.
+fn picker_cell_width(cols: usize) -> usize {
+    (cols / picker::MAX_COLS).clamp(1, 3)
+}
+
+fn palette_value(p: &Palette, role: ColorRole) -> &str {
+    match role {
+        ColorRole::Bg0 => &p.bg0,
+        ColorRole::Bg1 => &p.bg1,
+        ColorRole::Panel => &p.panel,
+        ColorRole::Panel2 => &p.panel2,
+        ColorRole::Raise => &p.raise,
+        ColorRole::Border => &p.border,
+        ColorRole::Text => &p.text,
+        ColorRole::Dim => &p.dim,
+        ColorRole::Faint => &p.faint,
+        ColorRole::Ghost => &p.ghost,
+        ColorRole::Accent => &p.accent,
+        ColorRole::Focus => &p.focus,
+        ColorRole::Teal => &p.hues.teal,
+        ColorRole::Magenta => &p.hues.magenta,
+        ColorRole::Purple => &p.hues.purple,
+        ColorRole::Green => &p.hues.green,
+        ColorRole::Amber => &p.hues.amber,
+        ColorRole::Red => &p.hues.red,
+        ColorRole::Blue => &p.hues.blue,
+        ColorRole::Orange => &p.hues.orange,
+    }
+}
+
+/// The selected role's contrast as two short lines plus their token: the
+/// worst failing contract pair that involves the role (amber, red below 3:1),
+/// else its plain ratio against the surface it is read on (text for a
+/// surface role, bg0 for everything else).
+fn role_contrast(
+    p: &Palette,
+    role: ColorRole,
+    findings: &[theme_contrast::ContrastFinding],
+) -> (String, String, Tok) {
+    let name = role_name(role);
+    let worst = findings
+        .iter()
+        .filter(|finding| finding.fg == name || finding.bg == name)
+        .min_by(|a, b| a.ratio.total_cmp(&b.ratio));
+    if let Some(finding) = worst {
+        let other = if finding.fg == name {
+            finding.bg
+        } else {
+            finding.fg
+        };
+        let tok = if finding.ratio < 3.0 {
+            Tok::Hue(Hue::Red)
+        } else {
+            Tok::Hue(Hue::Amber)
+        };
+        return (
+            format!("{name} contrast {:.1}:1", finding.ratio),
+            format!("against {other}, below {:.1}:1", finding.min),
+            tok,
+        );
+    }
+    let value = palette_value(p, role);
+    let surface = matches!(
+        role,
+        ColorRole::Bg0 | ColorRole::Bg1 | ColorRole::Panel | ColorRole::Panel2 | ColorRole::Raise
+    );
+    let (other, ratio) = if surface {
+        ("text", thegn_core::theme::contrast_ratio(&p.text, value))
+    } else {
+        ("bg0", thegn_core::theme::contrast_ratio(value, &p.bg0))
+    };
+    (
+        format!("{name} contrast {ratio:.1}:1"),
+        format!("against {other}, ok"),
+        Tok::Slot(S::Dim),
+    )
 }
 
 impl ThemeBuilder {
@@ -806,7 +1191,12 @@ impl ThemeBuilder {
             format!("contrast warning ({})", findings.len())
         };
         let layout = layout_for(inner);
-        let catalog_start = catalog_start(self.selected, layout.catalog.rows);
+        let catalog_start = list_start(
+            self.catalog_scroll,
+            self.selected,
+            layout.catalog.rows,
+            self.catalog.len(),
+        );
         for (row, item) in self
             .catalog
             .iter()
@@ -841,42 +1231,15 @@ impl ThemeBuilder {
                 bg,
             );
         }
-        for (row, (role, name)) in ROLES.iter().enumerate() {
-            let y = layout.editor.y + row;
-            if y >= layout.editor.y + layout.editor.rows {
-                break;
-            }
-            let focused = self.focus == row;
-            let bg = if focused {
-                Tok::Sel(Hue::Blue, 28)
-            } else {
-                panel
-            };
-            let value = role_value(&self.draft, *role);
-            let fg = if focused {
-                Tok::Slot(S::Text)
-            } else {
-                role_token(*role)
-            };
-            let prefix = if focused {
-                format!("{} ", crate::caps::glyph(crate::caps::Glyph::ArrowRight))
-            } else {
-                "  ".to_string()
-            };
-            seg::draw_line(
-                surface,
-                layout.editor.x,
-                y,
-                layout.editor.cols,
-                &Line::segs(vec![
-                    seg(fg, format!("{prefix}{name:<8}")),
-                    seg(role_token(*role), value),
-                ]),
-                bg,
-            );
+        if self.picker.is_some() {
+            self.render_picker(surface, layout.editor, panel);
+        } else if self.view == EditorView::Elements {
+            self.render_elements(surface, layout.editor, panel);
+        } else {
+            self.render_tokens(surface, layout.editor, panel);
         }
         if layout.apply.rows > 0 {
-            let bg = if self.focus == ACTION_ROW {
+            let bg = if self.apply_focused() {
                 Tok::SelAccent
             } else {
                 panel
@@ -900,12 +1263,29 @@ impl ThemeBuilder {
                         contrast,
                     ),
                     sp(2),
-                    seg(Tok::Slot(S::Dim), "Ctrl+S save as · i import"),
+                    seg(Tok::Slot(S::Dim), "Ctrl+S save as · i import · v view"),
                 ]),
                 bg,
             );
         }
         render_preview(surface, layout.preview, panel);
+        // The selected role's own contrast, under the preview sample; the
+        // status/input line keeps the column's last row.
+        if let Some(role) = self.selected_role()
+            && layout.preview.rows > CONTRAST_ROW + 2
+        {
+            let (headline, detail, tok) = role_contrast(&self.candidate, role, &findings);
+            for (offset, text) in [headline, detail].into_iter().enumerate() {
+                seg::draw_line(
+                    surface,
+                    layout.preview.x,
+                    layout.preview.y + CONTRAST_ROW + offset,
+                    layout.preview.cols,
+                    &Line::segs(vec![seg(tok, text)]),
+                    panel,
+                );
+            }
+        }
         if let Some((mode, value)) = &self.input {
             let label = match mode {
                 InputMode::SaveName => "save as name",
@@ -937,6 +1317,174 @@ impl ThemeBuilder {
                     panel,
                 );
             }
+        }
+    }
+
+    fn render_tokens(&self, surface: &mut Surface, editor: Rect, panel: Tok) {
+        for (row, (role, name)) in ROLES.iter().enumerate() {
+            let y = editor.y + row;
+            if y >= editor.y + editor.rows {
+                break;
+            }
+            let focused = self.focus == row;
+            let bg = if focused {
+                Tok::Sel(Hue::Blue, 28)
+            } else {
+                panel
+            };
+            let value = role_value(&self.draft, *role);
+            let fg = if focused {
+                Tok::Slot(S::Text)
+            } else {
+                role_token(*role)
+            };
+            let prefix = if focused {
+                format!("{} ", crate::caps::glyph(crate::caps::Glyph::ArrowRight))
+            } else {
+                "  ".to_string()
+            };
+            seg::draw_line(
+                surface,
+                editor.x,
+                y,
+                editor.cols,
+                &Line::segs(vec![
+                    seg(fg, format!("{prefix}{name:<8}")),
+                    seg(role_token(*role), value),
+                ]),
+                bg,
+            );
+        }
+    }
+
+    fn render_elements(&self, surface: &mut Surface, editor: Rect, panel: Tok) {
+        let rows = element_rows(&self.collapsed);
+        let start = self.elements_start(rows.len(), editor.rows);
+        for (index, row) in rows.iter().enumerate().skip(start).take(editor.rows) {
+            let y = editor.y + index - start;
+            let focused = index == self.elem_cursor;
+            let bg = if focused {
+                Tok::Sel(Hue::Blue, 28)
+            } else {
+                panel
+            };
+            let marker = if focused {
+                format!("{} ", crate::caps::glyph(crate::caps::Glyph::ArrowRight))
+            } else {
+                "  ".to_string()
+            };
+            let line = match *row {
+                ElementRow::Group(group) => {
+                    let caret = if self.collapsed.get(group).copied().unwrap_or(false) {
+                        crate::caps::Glyph::CaretClosed
+                    } else {
+                        crate::caps::Glyph::CaretOpen
+                    };
+                    Line::segs(vec![
+                        seg(Tok::Slot(S::Text), marker),
+                        seg(
+                            Tok::Slot(S::Accent),
+                            format!("{} {}", crate::caps::glyph(caret), ELEMENT_GROUPS[group].0),
+                        )
+                        .bold(),
+                    ])
+                }
+                ElementRow::Element(group, element) => {
+                    let (label, role) = ELEMENT_GROUPS[group].1[element];
+                    let swatch = role_token(role);
+                    let fg = if focused {
+                        Tok::Slot(S::Text)
+                    } else {
+                        Tok::Slot(S::Dim)
+                    };
+                    Line::segs(vec![
+                        seg(Tok::Slot(S::Text), marker),
+                        seg(swatch, "  ").bg(swatch),
+                        sp(1),
+                        seg(fg, format!("{label:<14}")),
+                        seg(swatch, role_name(role)),
+                    ])
+                }
+            };
+            seg::draw_line(surface, editor.x, y, editor.cols, &line, bg);
+        }
+    }
+
+    fn render_picker(&self, surface: &mut Surface, editor: Rect, panel: Tok) {
+        let Some(state) = &self.picker else {
+            return;
+        };
+        if editor.rows == 0 {
+            return;
+        }
+        let swatch = role_token(state.role);
+        seg::draw_line(
+            surface,
+            editor.x,
+            editor.y,
+            editor.cols,
+            &Line::segs(vec![
+                seg(Tok::Slot(S::Accent), format!("{} ", role_name(state.role))).bold(),
+                seg(swatch, "  ").bg(swatch),
+                sp(1),
+                seg(Tok::Slot(S::Text), role_value(&self.draft, state.role)),
+                sp(2),
+                seg(Tok::Slot(S::Dim), "Enter keep · Esc revert · # hex"),
+            ]),
+            panel,
+        );
+        let lines = picker::grid_lines(&self.picker_cells);
+        let visible = picker_rows(editor);
+        let cursor_line = picker::cursor_line(&lines, &self.picker_cells, state.cursor);
+        let start = list_start(state.scroll, cursor_line, visible, lines.len());
+        let width = picker_cell_width(editor.cols);
+        let swatch_width = if width >= 3 { 2 } else { width };
+        let mark = crate::caps::glyph(crate::caps::Glyph::DotFilled);
+        for (offset, line) in lines.iter().skip(start).take(visible).enumerate() {
+            let y = editor.y + 1 + offset;
+            let rendered = match *line {
+                GridLine::Header(section) => Line::segs(vec![seg(
+                    Tok::Slot(S::Faint),
+                    self.picker_cells[section].name,
+                )]),
+                GridLine::Cells { section, row } => {
+                    let block = &self.picker_cells[section];
+                    let mut segs = Vec::with_capacity(block.cols * 2);
+                    for (index, value) in block
+                        .cells
+                        .iter()
+                        .enumerate()
+                        .skip(row * block.cols)
+                        .take(block.cols)
+                    {
+                        let Some((r, g, b)) = picker::parse_hex(value) else {
+                            continue;
+                        };
+                        let fill = Tok::Rgb(r, g, b);
+                        let text = if (section, index) == state.cursor {
+                            format!("{mark:<swatch_width$}")
+                        } else {
+                            " ".repeat(swatch_width)
+                        };
+                        // The cursor mark takes whichever theme token reads
+                        // better on this cell.
+                        let frag = format!("{r};{g};{b}");
+                        let ink = if thegn_core::theme::contrast_ratio(&frag, &self.candidate.text)
+                            >= thegn_core::theme::contrast_ratio(&frag, &self.candidate.bg0)
+                        {
+                            Tok::Slot(S::Text)
+                        } else {
+                            Tok::Slot(S::Bg0)
+                        };
+                        segs.push(seg(ink, text).bg(fill).bold());
+                        if width > swatch_width {
+                            segs.push(sp(width - swatch_width));
+                        }
+                    }
+                    Line::segs(segs)
+                }
+            };
+            seg::draw_line(surface, editor.x, y, editor.cols, &rendered, panel);
         }
     }
 }
@@ -1062,7 +1610,7 @@ mod tests {
 
     #[test]
     fn layout_keeps_apply_and_preview_inside_the_popup_without_overlap() {
-        for screen in [Rect::full(80, 24), Rect::full(140, 40)] {
+        for screen in [Rect::full(80, 24), Rect::full(106, 21), Rect::full(140, 40)] {
             let outer = box_rect(&layer_spec(), screen).expect("popup fits");
             let inner = Rect {
                 x: outer.x + 2,
@@ -1072,6 +1620,23 @@ mod tests {
             };
             let layout = layout_for(inner);
             assert!(layout.apply.rows > 0);
+            for rect in [layout.catalog, layout.editor, layout.preview, layout.apply] {
+                assert!(rect.y + rect.rows < outer.y + outer.rows, "{screen:?}");
+                assert!(rect.x + rect.cols < outer.x + outer.cols, "{screen:?}");
+            }
+            assert!(layout.editor.y + layout.editor.rows <= layout.apply.y);
+
+            // Every editor mode, the picker included, renders inside the box
+            // and keeps the selected role's contrast line visible.
+            let mut b = builder();
+            b.handle_key(&KeyCode::Char('v'), Modifiers::NONE);
+            b.render_inside(screen, outer);
+            b.handle_key(&KeyCode::Tab, Modifiers::NONE);
+            b.handle_key(&KeyCode::Enter, Modifiers::NONE);
+            assert!(b.picker.is_some());
+            let text = b.render_inside(screen, outer);
+            assert!(text.contains("ANSI 16"), "{screen:?}");
+            assert!(text.contains("contrast"), "{screen:?}");
             assert!(outer.contains(layout.apply.x, layout.apply.y));
             assert!(outer.contains(
                 layout.preview.x + layout.preview.cols.saturating_sub(1),
@@ -1175,6 +1740,13 @@ mod tests {
             b.handle_key(&KeyCode::Enter, Modifiers::NONE),
             BuilderEvent::None
         );
+        // Enter opens the picker; `#` switches it to the typed hex editor.
+        assert!(b.picker.is_some());
+        assert_eq!(
+            b.handle_key(&KeyCode::Char('#'), Modifiers::NONE),
+            BuilderEvent::None
+        );
+        assert!(b.picker.is_none());
 
         // A multi-byte character used to advance the cursor by one byte and
         // leave it inside the code point, so the following insertion panicked.
@@ -1345,6 +1917,290 @@ mod tests {
         );
     }
 
+    fn press(x: usize, y: usize) -> MouseEvent {
+        MouseEvent {
+            x: x as u16,
+            y: y as u16,
+            mouse_buttons: MouseButtons::LEFT,
+            modifiers: Modifiers::NONE,
+        }
+    }
+
+    fn wheel(down: bool) -> MouseEvent {
+        MouseEvent {
+            x: 0,
+            y: 0,
+            mouse_buttons: if down {
+                MouseButtons::VERT_WHEEL
+            } else {
+                MouseButtons::VERT_WHEEL | MouseButtons::WHEEL_POSITIVE
+            },
+            modifiers: Modifiers::NONE,
+        }
+    }
+
+    fn layout_at(screen: Rect) -> (Rect, BuilderLayout) {
+        let outer = box_rect(&layer_spec(), screen).expect("popup fits");
+        let inner = Rect {
+            x: outer.x + 2,
+            y: outer.y + 1,
+            cols: outer.cols - 4,
+            rows: outer.rows - 2,
+        };
+        (outer, layout_for(inner))
+    }
+
+    fn open_picker_on(b: &mut ThemeBuilder, role: ColorRole) {
+        b.focus = ROLES.iter().position(|(r, _)| *r == role).unwrap();
+        assert_eq!(
+            b.handle_key(&KeyCode::Enter, Modifiers::NONE),
+            BuilderEvent::None
+        );
+        assert_eq!(b.picker.as_ref().map(|state| state.role), Some(role));
+    }
+
+    #[test]
+    fn picker_moves_preview_live_and_esc_restores_the_snapshot_exactly() {
+        let mut b = builder();
+        let original = role_value(&b.draft, ColorRole::Bg0);
+        open_picker_on(&mut b, ColorRole::Bg0);
+        assert_eq!(*b.candidate(), b.snapshot, "opening alone previews nothing");
+        for key in [KeyCode::RightArrow, KeyCode::Char('j'), KeyCode::Char('l')] {
+            let before = b.candidate().clone();
+            b.handle_key(&key, Modifiers::NONE);
+            assert_ne!(*b.candidate(), before, "{key:?} must preview live");
+        }
+        assert!(b.is_dirty());
+        assert_eq!(b.edited, vec![ColorRole::Bg0]);
+        assert_eq!(
+            b.handle_key(&KeyCode::Escape, Modifiers::NONE),
+            BuilderEvent::None,
+            "Esc closes the picker, not the builder"
+        );
+        assert!(b.picker.is_none());
+        assert_eq!(*b.candidate(), b.snapshot);
+        assert_eq!(role_value(&b.draft, ColorRole::Bg0), original);
+        assert!(b.edited.is_empty());
+        assert!(!b.is_dirty());
+    }
+
+    #[test]
+    fn picker_enter_keeps_like_a_typed_edit_until_apply() {
+        let mut b = builder();
+        open_picker_on(&mut b, ColorRole::Accent);
+        b.handle_key(&KeyCode::DownArrow, Modifiers::NONE);
+        let kept = role_value(&b.draft, ColorRole::Accent);
+        b.handle_key(&KeyCode::Enter, Modifiers::NONE);
+        assert!(b.picker.is_none());
+        assert_eq!(b.edited, vec![ColorRole::Accent]);
+        assert_eq!(
+            b.edited_overrides().and_then(|o| o.accent),
+            Some(kept.clone())
+        );
+        assert!(b.is_dirty());
+        // Builder Esc still discards the transient edit, exactly as a typed
+        // hex edit: the handler reinstalls the snapshot palette.
+        assert_eq!(
+            b.handle_key(&KeyCode::Escape, Modifiers::NONE),
+            BuilderEvent::Close
+        );
+        assert_eq!(b.cancel_palette(), b.snapshot);
+        // A second picker session on a kept role reverts to the kept value
+        // and leaves the role an intentional edit.
+        let mut b2 = builder();
+        open_picker_on(&mut b2, ColorRole::Accent);
+        b2.handle_key(&KeyCode::RightArrow, Modifiers::NONE);
+        b2.handle_key(&KeyCode::Enter, Modifiers::NONE);
+        let kept = role_value(&b2.draft, ColorRole::Accent);
+        b2.handle_key(&KeyCode::Enter, Modifiers::NONE);
+        b2.handle_key(&KeyCode::RightArrow, Modifiers::NONE);
+        b2.handle_key(&KeyCode::Escape, Modifiers::NONE);
+        assert_eq!(role_value(&b2.draft, ColorRole::Accent), kept);
+        assert_eq!(b2.edited, vec![ColorRole::Accent]);
+    }
+
+    #[test]
+    fn picker_hash_switches_to_hex_and_its_esc_restores_the_pre_picker_value() {
+        let mut b = builder();
+        let original = role_value(&b.draft, ColorRole::Text);
+        open_picker_on(&mut b, ColorRole::Text);
+        b.handle_key(&KeyCode::RightArrow, Modifiers::NONE);
+        b.handle_key(&KeyCode::Char('#'), Modifiers::NONE);
+        assert!(b.picker.is_none());
+        assert!(matches!(b.editing, Some((ColorRole::Text, ..))));
+        b.handle_key(&KeyCode::Escape, Modifiers::NONE);
+        assert_eq!(role_value(&b.draft, ColorRole::Text), original);
+        assert!(b.edited.is_empty());
+        assert_eq!(*b.candidate(), b.snapshot);
+    }
+
+    #[test]
+    fn v_toggles_the_element_view_and_groups_collapse() {
+        let mut b = builder();
+        b.handle_key(&KeyCode::Char('v'), Modifiers::NONE);
+        assert_eq!(b.view, EditorView::Elements);
+        let full = element_rows(&b.collapsed).len();
+        // Cursor starts on the first group header: Enter collapses it.
+        b.handle_key(&KeyCode::Enter, Modifiers::NONE);
+        assert_eq!(
+            element_rows(&b.collapsed).len(),
+            full - ELEMENT_GROUPS[0].1.len()
+        );
+        b.handle_key(&KeyCode::RightArrow, Modifiers::NONE);
+        assert_eq!(element_rows(&b.collapsed).len(), full);
+        b.handle_key(&KeyCode::LeftArrow, Modifiers::NONE);
+        b.handle_key(&KeyCode::Char(' '), Modifiers::NONE);
+        assert_eq!(element_rows(&b.collapsed).len(), full);
+        // Tab to the first element, Enter opens the picker for its role.
+        b.handle_key(&KeyCode::Tab, Modifiers::NONE);
+        b.handle_key(&KeyCode::Enter, Modifiers::NONE);
+        assert_eq!(
+            b.picker.as_ref().map(|state| state.role),
+            Some(ELEMENT_GROUPS[0].1[0].1)
+        );
+        assert_eq!(b.selected_role(), Some(ELEMENT_GROUPS[0].1[0].1));
+        b.handle_key(&KeyCode::Escape, Modifiers::NONE);
+        assert!(b.picker.is_none());
+        b.handle_key(&KeyCode::Char('v'), Modifiers::NONE);
+        assert_eq!(b.view, EditorView::Tokens);
+        b.handle_key(&KeyCode::Char('v'), Modifiers::NONE);
+        assert_eq!(b.view, EditorView::Elements);
+        // Shift-Tab from the top wraps to the Apply row.
+        b.elem_cursor = 0;
+        b.handle_key(&KeyCode::Tab, Modifiers::SHIFT);
+        assert!(b.apply_focused());
+        assert!(matches!(
+            b.handle_key(&KeyCode::Enter, Modifiers::NONE),
+            BuilderEvent::Apply { .. }
+        ));
+    }
+
+    #[test]
+    fn wheel_scrolls_the_element_list_and_the_catalog_without_selecting() {
+        let screen = Rect::full(80, 24);
+        let (_, layout) = layout_at(screen);
+        let mut b = builder();
+        b.handle_key(&KeyCode::Char('v'), Modifiers::NONE);
+        let mut left_down = false;
+        let (ex, ey) = (layout.editor.x + 3, layout.editor.y + 1);
+        assert_eq!(b.elements_start(element_rows(&b.collapsed).len(), 20), 0);
+        for _ in 0..3 {
+            b.handle_mouse(&wheel(true), ex, ey, screen, true, &mut left_down);
+        }
+        assert_eq!(b.elem_scroll, Some(3));
+        let text = b.render_inside(screen, box_rect(&layer_spec(), screen).unwrap());
+        assert!(
+            !text.contains(ELEMENT_GROUPS[0].0),
+            "first group scrolled off"
+        );
+        b.handle_mouse(&wheel(false), ex, ey, screen, true, &mut left_down);
+        assert_eq!(b.elem_scroll, Some(2));
+        assert_eq!(b.elem_cursor, 0, "the wheel scrolls, it does not move");
+
+        let selected = b.selected;
+        let (cx, cy) = (layout.catalog.x + 1, layout.catalog.y + 1);
+        b.handle_mouse(&wheel(true), cx, cy, screen, true, &mut left_down);
+        assert_eq!(b.selected, selected);
+        // A clicked catalog row maps through the scrolled offset.
+        let start = list_start(
+            b.catalog_scroll,
+            b.selected,
+            layout.catalog.rows,
+            b.catalog.len(),
+        );
+        b.handle_mouse(&press(cx, cy), cx, cy, screen, true, &mut left_down);
+        assert_eq!(b.selected, (start + 1).min(b.catalog.len() - 1));
+    }
+
+    #[test]
+    fn clicking_a_picker_cell_previews_then_keeps_and_outside_rules_hold() {
+        let screen = Rect::full(106, 30);
+        let (outer, layout) = layout_at(screen);
+        let mut b = builder();
+        open_picker_on(&mut b, ColorRole::Bg0);
+        let mut left_down = false;
+        // Line 0 is the title, line 1 the "theme" header, line 2 its first
+        // row of cells; the second cell sits one cell-width right.
+        let x = layout.editor.x + picker_cell_width(layout.editor.cols);
+        let y = layout.editor.y + 2;
+        assert_eq!(b.picker_hit(layout.editor, x, y), Some((0, 1)));
+        b.handle_mouse(&press(x, y), x, y, screen, true, &mut left_down);
+        left_down = false;
+        assert!(b.picker.is_some());
+        assert_eq!(
+            role_value(&b.draft, ColorRole::Bg0),
+            b.picker_cells[0].cells[1]
+        );
+        assert!(b.is_dirty());
+        b.handle_mouse(&press(x, y), x, y, screen, true, &mut left_down);
+        left_down = false;
+        assert!(b.picker.is_none(), "a second click keeps");
+        assert_eq!(b.edited, vec![ColorRole::Bg0]);
+
+        // Dirty: an outside click must not dismiss; clean: it does.
+        let (ox, oy) = (outer.x.saturating_sub(1), outer.y.saturating_sub(1));
+        assert_eq!(
+            b.handle_mouse(&press(ox, oy), ox, oy, screen, true, &mut left_down),
+            BuilderEvent::None
+        );
+        left_down = false;
+        let mut clean = builder();
+        assert_eq!(
+            clean.handle_mouse(&press(ox, oy), ox, oy, screen, true, &mut left_down),
+            BuilderEvent::Close
+        );
+        left_down = false;
+        assert_eq!(
+            clean.handle_mouse(&press(ox, oy), ox, oy, screen, false, &mut left_down),
+            BuilderEvent::None
+        );
+    }
+
+    #[test]
+    fn clicking_an_element_swatch_opens_the_picker_and_a_label_only_focuses() {
+        let screen = Rect::full(106, 30);
+        let (_, layout) = layout_at(screen);
+        let mut b = builder();
+        b.handle_key(&KeyCode::Char('v'), Modifiers::NONE);
+        let mut left_down = false;
+        let y = layout.editor.y + 1; // first element of the first group
+        let label_x = layout.editor.x + 8;
+        b.handle_mouse(&press(label_x, y), label_x, y, screen, true, &mut left_down);
+        left_down = false;
+        assert_eq!(b.elem_cursor, 1);
+        assert!(b.picker.is_none());
+        let swatch_x = layout.editor.x + 2;
+        b.handle_mouse(
+            &press(swatch_x, y),
+            swatch_x,
+            y,
+            screen,
+            true,
+            &mut left_down,
+        );
+        assert_eq!(
+            b.picker.as_ref().map(|state| state.role),
+            Some(ELEMENT_GROUPS[0].1[0].1)
+        );
+    }
+
+    #[test]
+    fn contrast_line_names_a_failing_pair_for_the_selected_role() {
+        let mut b = builder();
+        let bg0 = role_value(&b.draft, ColorRole::Bg0);
+        b.set_role_for_test(ColorRole::Text, &bg0);
+        remember_edit(&mut b.edited, ColorRole::Text);
+        b.refresh_candidate();
+        b.focus = ROLES
+            .iter()
+            .position(|(role, _)| *role == ColorRole::Text)
+            .unwrap();
+        let screen = Rect::full(80, 24);
+        let text = b.render_inside(screen, box_rect(&layer_spec(), screen).unwrap());
+        assert!(text.contains("text contrast 1.0:1"), "{text}");
+        assert!(text.contains("below"), "{text}");
+    }
+
     impl ThemeBuilder {
         fn input_value_for_test(&self) -> Option<&str> {
             self.input.as_ref().map(|(_, value)| value.as_str())
@@ -1352,6 +2208,21 @@ mod tests {
 
         fn set_role_for_test(&mut self, role: ColorRole, value: &str) {
             set_role(&mut self.draft, role, value.into());
+        }
+
+        /// Render at `screen`, assert nothing paints outside `outer`, and
+        /// return the screen text.
+        fn render_inside(&self, screen: Rect, outer: Rect) -> String {
+            let mut surface = Surface::new(screen.cols, screen.rows);
+            self.render(&mut surface, screen);
+            for (y, row) in surface.screen_cells().iter().enumerate() {
+                for (x, cell) in row.iter().enumerate() {
+                    if !outer.contains(x, y) {
+                        assert_eq!(cell.str(), " ", "painted outside at {x},{y}");
+                    }
+                }
+            }
+            surface.screen_chars_to_string()
         }
     }
 }

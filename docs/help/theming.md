@@ -15,21 +15,55 @@ activity indicators.
 
 ## Theme Builder keys
 
+The command palette also lists it as **Open theme builder**.
+
 - `↑` / `↓` selects a built-in or user theme in the catalog.
-- `Tab` / `Shift-Tab` moves focus through the editable tokens and the Apply row.
-- `Enter` edits the focused token, or applies the draft from the Apply row.
-- `←` / `→` moves within an editing value; `Backspace` deletes; `#rgb` and
-  `#rrggbb` are accepted color values.
-- `Esc` cancels the active field, reverts a token edit, or closes the popup and
-  restores the palette captured when it opened.
+- `v` switches the editor column between the **token view** (the twenty
+  palette tokens) and the **element view**, which groups the UI by what each
+  token paints: sidebar, tabs and masthead, status bar, panes, diff, activity
+  dots, git graph, and popups. Each element row shows a live swatch, the
+  element, and the token behind it; a token can appear under several elements.
+- `Tab` / `Shift-Tab` moves focus through the rows and the Apply row.
+- In the element view, `Enter` or `Space` on a group header collapses or
+  expands it, and `←` / `→` collapse or expand the group under the cursor.
+- `Enter` on a token or element opens the **palette picker** for that token,
+  or applies the draft from the Apply row.
+- `Esc` cancels the active field or picker, or closes the popup and restores
+  the palette captured when it opened.
 - `Ctrl-S` opens **Save as**; enter a name and press `Enter` to save it.
 - `i` opens a local-path import field; press `Enter` to preview a Gogh YAML or
   JSON theme. Bracketed paste is inserted as field data, never run as a
   command.
 
-Mouse clicks use the same popup rectangle as painting. A click outside follows
-the modal dismissal setting and cannot discard dirty edits. Apply failures stay
-visible in the popup; the theme closes only after a successful write.
+## Palette picker
+
+The picker lists three blocks of swatches: the theme's own token colors, the
+ANSI 16, and a 12-hue by 7-lightness ramp.
+
+- Arrow keys or `h` `j` `k` `l` move the cursor. Every move previews the color
+  live across the workspace.
+- `Enter` keeps the color. Like a typed edit, it stays transient until you
+  apply or save the draft.
+- `Esc` reverts the token to the value it had when the picker opened.
+- `#` switches to typed hex input for the same token: `←` / `→` move within the
+  value, `Backspace` deletes, and `#rgb` and `#rrggbb` are accepted. `Enter`
+  keeps the value and `Esc` reverts it.
+
+Under the preview, a contrast line reports the selected token's worst
+contrast pair, for example `text contrast 2.1:1` and
+`against bg0, below 4.5:1`. Amber marks a pair below its floor, red a pair
+below 3:1.
+
+## Mouse
+
+Mouse clicks use the same popup rectangle as painting. Click a catalog row to
+select a theme, a token or element row to focus it, a group header to collapse
+or expand it, and an element's swatch to open the picker. In the picker, the
+first click on a swatch previews it and a second click keeps it. The scroll
+wheel scrolls the list under the pointer: the catalog, the element view, or
+the picker. A click outside follows the modal dismissal setting and cannot
+discard dirty edits. Apply failures stay visible in the popup; the theme
+closes only after a successful write.
 
 ## CLI
 
