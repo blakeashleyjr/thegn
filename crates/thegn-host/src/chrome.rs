@@ -674,6 +674,10 @@ pub struct FrameModel {
     /// unless that tab is open — enumerating processes is gated, so this is
     /// deliberately absent the rest of the time rather than stale.
     pub procs: thegn_metrics::ProcSnapshot,
+    /// Where each pane lives (workspace → worktree → tab → program), for the
+    /// `cpu`/`mem` popup's attribution tree. Empty by default; the loop fills it
+    /// only while that popup is open (`cpu_attrib_index::pane_owners`).
+    pub pane_owners: std::sync::Arc<[thegn_core::cpu_attrib::PaneOwner]>,
     /// Monotonic accepted process publication; preserved across hydration.
     pub process_revision: u64,
     /// Whether the process snapshot is current, awaiting a new visibility
