@@ -3241,9 +3241,12 @@ on_floor_miss = "fail"
 # pip-cache      = "/root/.cache/pip"
 
 # ── Git write policy ──────────────────────────────────────────────────────────
-# What a sandboxed pane may write in the repository's git common dir. Policy
-# only for now: the bwrap mount wiring lands separately, so these keys are
-# accepted and validated but do not yet change the sandbox's mounts.
+# What a sandboxed pane may write in the repository's git common dir (bwrap
+# mounts, `thegn env pull` and push-lane pushes all apply it). A top-level
+# branch, the main checkout or an unknown merge target fall back to a
+# read-only git dir unless mode = "full". GH_TOKEN/GITHUB_TOKEN (and GitLab /
+# GitHub Enterprise tokens) are withheld unless mode = "full" and credential
+# passes them. See docs/sandboxing.md.
 #   read-only   — the git dir and the worktree are read-only.
 #   commit-only — (default) the git dir is read-only except the object store,
 #                 the worktree's own admin dir and the lane branch's ref
