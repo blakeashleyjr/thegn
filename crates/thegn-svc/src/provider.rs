@@ -456,8 +456,16 @@ impl DaytonaProvider {
             .map(str::to_string)
     }
 
-    /// Parse a complete list response (an array, or `{ "sandboxes": [...] }`)
-    /// with the same envelope and id refusals: optional `status|state`, `created_at|createdAt`,
+    /// Parse a complete list response (an array, or `{ "sandboxes": [...] }`).
+    fn parse_list(v: &serde_json::Value) -> Result<Vec<String>> {
+        Ok(Self::parse_infos(v)?
+            .into_iter()
+            .map(|row| row.id)
+            .collect())
+    }
+
+    /// The typed sibling of [`Self::parse_list`] (same envelope and id
+    /// refusals): optional `status|state`, `created_at|createdAt`,
     /// `class|size` and `region|target` are read tolerantly (absent or
     /// wrong-typed ⇒ `None`).
     fn parse_infos(v: &serde_json::Value) -> Result<Vec<SandboxInfo>> {
