@@ -719,7 +719,12 @@ fn bring_up(
         .with_context(|| format!("env up failed: provisioning {worktree} (env {})", env.name))?;
     anyhow::ensure!(
         provisioned,
-        "env up failed: {worktree} no longer resolves to the provider env {}; nothing was provisioned",
+        concat!(
+            "env up failed: nothing was provisioned for {} (env {}): the provider could not ",
+            "be driven (an unresolved API token, a managed ssh key failure, or no files API; ",
+            "see the warning above), or the worktree no longer resolves to a provider env"
+        ),
+        worktree,
         env.name
     );
     Ok(())

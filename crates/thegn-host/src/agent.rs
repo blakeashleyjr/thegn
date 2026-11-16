@@ -2701,13 +2701,14 @@ mod env_selection_tests {
 /// suspended sandbox, a lost exit frame) into a clear step failure.
 pub(crate) fn provision_step_timeout(step_id: &str) -> std::time::Duration {
     use std::time::Duration;
-    // Only `workspace` (mkdir) and `git_auth` (git config) are truly instant — a
-    // stall there is the suspended-sandbox hang we want to catch fast. Everything
-    // else can legitimately run for minutes (clone, package installs incl. the
-    // openssh the ssh transport needs, npm agents, the nix devshell build, closure
-    // substitution), so give it a generous ceiling that still bounds an infinite
-    // hang rather than risk a false failure mid-build.
-    let instant = matches!(step_id, "workspace" | "git_auth");
+    // Only `workspace` (mkdir) is truly instant — a stall there is the
+    // suspended-sandbox hang we want to catch fast. Everything else can
+    // legitimately run for minutes (`git_auth` installs git on an image that
+    // lacks it, clone, package installs incl. the openssh the ssh transport
+    // needs, npm agents, the nix devshell build, closure substitution), so give
+    // it a generous ceiling that still bounds an infinite hang rather than risk
+    // a false failure mid-build.
+    let instant = matches!(step_id, "workspace");
     if instant {
         Duration::from_secs(120) // 2 min — catches the suspended-sandbox hang fast
     } else {

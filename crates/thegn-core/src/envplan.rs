@@ -1480,7 +1480,8 @@ fn git_auth_script() -> String {
             &crate::hostkey::HostKeyContext::default(),
         )
     );
-    let mut s = String::from(
+    let mut s = ensure_git_script();
+    s.push_str(
         "tok=\"${GH_TOKEN:-${GITHUB_TOKEN:-}}\"; \
          git config --global --add safe.directory '*' 2>/dev/null || true; \
          git config --global core.sshCommand '",
@@ -1499,6 +1500,31 @@ fn git_auth_script() -> String {
          fi; true",
     );
     s
+}
+
+/// Install git (plus CA certificates and an ssh client) when the sandbox image
+/// lacks it, through whichever native package manager exists (as root, or via
+/// passwordless sudo). A stock provider image (fly's default `ubuntu:24.04`)
+/// ships without git, and every `git config` in [`git_auth_script`] is
+/// best-effort, so without this the credentials step silently configured
+/// nothing and the clone died `git: not found` (exit 127). Fatal, with a
+/// message naming the cause, when git is still missing afterwards.
+fn ensure_git_script() -> String {
+    "if ! command -v git >/dev/null 2>&1; then \
+       if [ \"$(id -u)\" = 0 ]; then S=; \
+       elif command -v sudo >/dev/null 2>&1 && sudo -n true 2>/dev/null; then S='sudo -n'; \
+       else S=; fi; \
+       echo 'thegn: git is not installed in the sandbox; installing it' >&2; \
+       if command -v apt-get >/dev/null 2>&1; then \
+         $S env DEBIAN_FRONTEND=noninteractive apt-get update -y >/dev/null \
+           && $S env DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends git ca-certificates openssh-client >/dev/null; \
+       elif command -v apk >/dev/null 2>&1; then $S apk add --no-cache git ca-certificates openssh-client >/dev/null; \
+       elif command -v dnf >/dev/null 2>&1; then $S dnf install -y git ca-certificates openssh-clients >/dev/null; \
+       elif command -v yum >/dev/null 2>&1; then $S yum install -y git ca-certificates openssh-clients >/dev/null; \
+       fi; \
+       command -v git >/dev/null 2>&1 || { echo 'thegn: git is missing in the sandbox and no package manager could install it' >&2; exit 1; }; \
+     fi; "
+        .to_string()
 }
 
 /// Clone a dotfiles repo into `~/.dotfiles` (idempotent) and run its bootstrap
@@ -2886,6 +2912,26 @@ mod tests {
             None,
         );
         assert!(hc.contains("http://h/%%41"));
+    }
+
+    #[test]
+    fn git_auth_installs_git_first_when_the_image_lacks_it() {
+        let s = git_auth_script();
+        let ensure = s
+            .find("command -v git")
+            .expect("probes for git before configuring it");
+        let first_config = s.find("git config").expect("configures git");
+        assert!(
+            ensure < first_config,
+            "git is ensured before any git config"
+        );
+        assert!(s.contains("apt-get install -y --no-install-recommends git"));
+        assert!(s.contains("apk add --no-cache git"));
+        assert!(s.contains("dnf install -y git"));
+        assert!(
+            s.contains("no package manager could install it' >&2; exit 1"),
+            "a still-missing git fails the step with a named cause"
+        );
     }
 
     #[test]
