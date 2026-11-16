@@ -2640,6 +2640,13 @@ pub struct WorkspaceConfig {
     /// the operator granted. See [`crate::control::resolve_serve_scopes`].
     #[serde(skip_serializing_if = "McpServeConfig::is_default")]
     pub mcp_serve: McpServeConfig,
+    /// Extra directories whose worktrees count as this project's own in the
+    /// sidebar (`[project.<slug>] worktree_roots = ["~/wt/app"]`; `~` is
+    /// expanded). A git worktree outside thegn's checkout layout and outside
+    /// every root here is "external" and follows `[ui]
+    /// sidebar_external_worktrees` (grouped under "Other" by default).
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub worktree_roots: Vec<String>,
 }
 
 /// A named **environment bundle** (`[bundle.<name>]`) — a composable unit of env
