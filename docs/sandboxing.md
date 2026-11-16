@@ -31,8 +31,21 @@ warning) instead of a writable one:
 
 `GH_TOKEN`, `GITHUB_TOKEN` (and GitLab / GitHub Enterprise token variables) are
 withheld from sandboxes and provider VMs by default. Only `mode = "full"` with
-`credential = "repo-token"` or `"user-token"` passes them. `deploy-key` and
-`github-app` parse but are not wired yet.
+`credential = "repo-token"` or `"user-token"` passes them.
+
+`credential = "deploy-key"` with `deploy_key = "~/.ssh/deploy"` is opt-in and
+for local placements only. The key is a path, mounted read-only into the
+sandbox, and `GIT_SSH_COMMAND` is set to use it. It must be a regular file you
+own and not group or world readable; otherwise the sandbox gets no credential
+and a warning is logged. The default remains no credential. `github-app`
+parses but is not wired yet.
+
+### OCI runtime masks
+
+Local podman/docker sandboxes mask the user D-Bus socket and the runtime
+sockets under `$XDG_RUNTIME_DIR`, matching bwrap. The policy fingerprint
+changed, so existing local OCI sandbox containers are recreated once after
+upgrading.
 
 ### Bind destinations and identity
 
