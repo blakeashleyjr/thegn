@@ -402,6 +402,90 @@ pub const STATE_TOOLS: &[StateToolSpec] = &[
         ],
     },
     StateToolSpec {
+        cap: "issues.update",
+        description: "Patch one tracker issue (the wire mirror of `POST /v1/issues/{id}`); \
+                      send at least one of `status`, `assignee`, `priority`, `title`. \
+                      Returns the updated issue. Changes shared tracker state. \
+                      Write-scoped (`--scopes write`); requires a running daemon.",
+        args: &[
+            ArgSpec {
+                name: "id",
+                kind: ArgKind::String,
+                required: true,
+                description: "Tracker issue id (see issues_list)",
+            },
+            ArgSpec {
+                name: "status",
+                kind: ArgKind::String,
+                required: false,
+                description: "New status: backlog, todo, in_progress, done or cancelled",
+            },
+            ArgSpec {
+                name: "assignee",
+                kind: ArgKind::String,
+                required: false,
+                description: "`me` assigns the caller, `none` unassigns the caller",
+            },
+            ArgSpec {
+                name: "priority",
+                kind: ArgKind::Integer,
+                required: false,
+                description: "Priority 0-4 (0 none, 1 urgent, 2 high, 3 medium, 4 low)",
+            },
+            ArgSpec {
+                name: "title",
+                kind: ArgKind::String,
+                required: false,
+                description: "New title (non-empty)",
+            },
+            ArgSpec {
+                name: "repo",
+                kind: ArgKind::String,
+                required: false,
+                description: "Repository path for its issues configuration overlay",
+            },
+            ArgSpec {
+                name: "account",
+                kind: ArgKind::String,
+                required: false,
+                description: "Configured tracker account that owns the issue",
+            },
+        ],
+    },
+    StateToolSpec {
+        cap: "issues.comment",
+        description: "Post a comment on a tracker issue (the wire mirror of \
+                      `POST /v1/issues/{id}/comment`). `body` is non-empty and at most \
+                      64 KiB. Appends only. Write-scoped (`--scopes write`); requires a \
+                      running daemon.",
+        args: &[
+            ArgSpec {
+                name: "id",
+                kind: ArgKind::String,
+                required: true,
+                description: "Tracker issue id (see issues_list)",
+            },
+            ArgSpec {
+                name: "body",
+                kind: ArgKind::String,
+                required: true,
+                description: "Comment text (non-empty, at most 65536 bytes)",
+            },
+            ArgSpec {
+                name: "repo",
+                kind: ArgKind::String,
+                required: false,
+                description: "Repository path for its issues configuration overlay",
+            },
+            ArgSpec {
+                name: "account",
+                kind: ArgKind::String,
+                required: false,
+                description: "Configured tracker account that owns the issue",
+            },
+        ],
+    },
+    StateToolSpec {
         cap: "dispatches.list",
         description: "List the agent-dispatch roster newest-first, with optional keyset \
                       pagination. Read-only; requires a running daemon.",
@@ -1004,6 +1088,8 @@ pub const MCP_STATE_CAPS: &[&str] = &[
     "calendar.clocks",
     "issues.list",
     "issues.get",
+    "issues.update",
+    "issues.comment",
     "dispatches.list",
     "dispatches.put",
     "dispatches.set_status",
@@ -1089,7 +1175,9 @@ impl<'a> StateRouter<'a> {
                 ),
             )));
         }
-        if let Err(msg) = validate_args(spec.args, args) {
+        if let Err(msg) =
+            validate_args(spec.args, args).and_then(|()| validate_semantics(spec.cap, args))
+        {
             return Some(Err((-32602, msg)));
         }
         let mutating = lookup(spec.cap).is_some_and(|c| scope_of(c) != Scope::Read);
@@ -1152,6 +1240,7 @@ fn input_schema(args: &[ArgSpec]) -> Value {
 /// destructive (fail closed), so a new write tool is destructive until it is
 /// deliberately listed here.
 const NON_DESTRUCTIVE_WRITE_CAPS: &[&str] = &[
+    "issues.comment",
     "dispatches.put",
     "folders.assign",
     "editor.open",
@@ -1225,6 +1314,76 @@ fn type_name(v: &Value) -> &'static str {
     }
 }
 
+/// Longest `issues_comment` body, in bytes. The control route has no body cap
+/// of its own beyond the transport limit, so the MCP door fixes one.
+pub const MAX_ISSUE_COMMENT_BYTES: usize = 64 * 1024;
+
+/// Cap-specific argument checks that a type check cannot express, run after
+/// [`validate_args`] and before any fetch. Pure.
+fn validate_semantics(cap: &str, args: &Value) -> Result<(), String> {
+    let non_empty = |key: &str| {
+        args.get(key)
+            .and_then(Value::as_str)
+            .is_some_and(|v| !v.trim().is_empty())
+    };
+    match cap {
+        "issues.update" => {
+            if !non_empty("id") {
+                return Err("`id` must be a non-empty string".into());
+            }
+            if !["status", "assignee", "priority", "title"]
+                .iter()
+                .any(|k| args.get(*k).is_some())
+            {
+                return Err(
+                    "send at least one of `status`, `assignee`, `priority`, `title`".into(),
+                );
+            }
+            if let Some(p) = args.get("priority")
+                && !p.as_i64().is_some_and(|n| (0..=4).contains(&n))
+            {
+                return Err("`priority` must be an integer from 0 to 4".into());
+            }
+            if let Some(a) = args.get("assignee")
+                && !matches!(a.as_str(), Some("me" | "none"))
+            {
+                return Err("`assignee` must be `me` or `none`".into());
+            }
+            if args.get("title").is_some() && !non_empty("title") {
+                return Err("`title` must not be empty".into());
+            }
+            if args.get("status").is_some() && !non_empty("status") {
+                return Err("`status` must not be empty".into());
+            }
+        }
+        "issues.comment" => {
+            if !non_empty("id") {
+                return Err("`id` must be a non-empty string".into());
+            }
+            if !non_empty("body") {
+                return Err("`body` must not be empty".into());
+            }
+            let n = args["body"].as_str().map_or(0, str::len);
+            if n > MAX_ISSUE_COMMENT_BYTES {
+                return Err(format!(
+                    "`body` is {n} bytes; the limit is {MAX_ISSUE_COMMENT_BYTES}"
+                ));
+            }
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
+/// A free-text value's audit stand-in: its length and a short SHA-256 prefix,
+/// never the text.
+fn text_digest(text: &str) -> String {
+    use sha2::{Digest, Sha256};
+    let hash = Sha256::digest(text.as_bytes());
+    let hex: String = hash.iter().take(6).map(|b| format!("{b:02x}")).collect();
+    format!("<{} bytes sha256:{hex}>", text.len())
+}
+
 /// Redact a mutating tool call's arguments for the audit log: any value that
 /// can carry a secret (terminal input bytes, launch environment variables)
 /// becomes a non-reversible size descriptor rather than being omitted — the
@@ -1243,6 +1402,12 @@ pub fn redact_for_audit(cap: &str, args: &Value) -> Value {
                     let n = v.len();
                     out.insert(key.to_string(), json!(format!("<{n} bytes>")));
                 }
+            }
+        }
+        "issues.comment" => {
+            if let Some(v) = out.get("body").and_then(Value::as_str) {
+                let digest = text_digest(v);
+                out.insert("body".to_string(), json!(digest));
             }
         }
         "sessions.open" | "sessions.split" => {
@@ -1956,6 +2121,165 @@ mod tests {
     }
 
     #[test]
+    fn issues_update_and_comment_are_write_scoped_and_advertised_only_when_allowed() {
+        let r = StateRouter::new(vec!["issues.list"], |_, _| Ok(json!(null)));
+        let names: Vec<String> = r
+            .tool_entries()
+            .iter()
+            .map(|t| t["name"].as_str().unwrap().to_string())
+            .collect();
+        assert_eq!(names, ["issues_list"]);
+        let denied = StateRouter::new(vec!["issues.list"], |_, _| -> Result<Value, String> {
+            panic!("a denied tool must not reach fetch")
+        });
+        for (tool, args, cap) in [
+            (
+                "issues_update",
+                json!({ "id": "linear:T-1", "status": "done" }),
+                "issues.update",
+            ),
+            (
+                "issues_comment",
+                json!({ "id": "linear:T-1", "body": "hi" }),
+                "issues.comment",
+            ),
+        ] {
+            let (code, msg) = denied.call(tool, &args).unwrap().unwrap_err();
+            assert_eq!(code, -32001);
+            assert_eq!(scope_of(lookup(cap).unwrap()), Scope::Write, "{cap}");
+            assert!(msg.contains("--scopes write"), "{msg}");
+            let spec = STATE_TOOLS.iter().find(|t| t.cap == cap).unwrap();
+            assert!(spec.description.contains("`--scopes write`"), "{cap}");
+        }
+        let r = StateRouter::new(vec!["issues.update", "issues.comment"], |_, _| {
+            Ok(json!(null))
+        });
+        let entries = r.tool_entries();
+        let names: Vec<&str> = entries
+            .iter()
+            .map(|e| e["name"].as_str().unwrap())
+            .collect();
+        assert_eq!(names, ["issues_update", "issues_comment"]);
+        let upd = &entries[0]["inputSchema"];
+        assert_eq!(upd["required"], json!(["id"]));
+        for (key, ty) in [
+            ("id", "string"),
+            ("status", "string"),
+            ("assignee", "string"),
+            ("priority", "integer"),
+            ("title", "string"),
+            ("repo", "string"),
+            ("account", "string"),
+        ] {
+            assert_eq!(upd["properties"][key]["type"], ty, "{key}");
+        }
+        assert_eq!(upd["properties"].as_object().unwrap().len(), 7);
+        let com = &entries[1]["inputSchema"];
+        assert_eq!(com["required"], json!(["id", "body"]));
+        assert_eq!(com["properties"].as_object().unwrap().len(), 4);
+    }
+
+    #[test]
+    fn issues_update_and_comment_reject_bad_args_before_fetch() {
+        let r = StateRouter::new(
+            vec!["issues.update", "issues.comment"],
+            |_, _| -> Result<Value, String> { panic!("invalid args must not reach fetch") },
+        );
+        let oversize = "x".repeat(MAX_ISSUE_COMMENT_BYTES + 1);
+        for (tool, bad) in [
+            ("issues_update", json!({})),
+            ("issues_update", json!({ "status": "done" })),
+            ("issues_update", json!({ "id": 7, "status": "done" })),
+            ("issues_update", json!({ "id": "" , "status": "done" })),
+            ("issues_update", json!({ "id": "linear:T-1" })),
+            (
+                "issues_update",
+                json!({ "id": "linear:T-1", "account": "w" }),
+            ),
+            (
+                "issues_update",
+                json!({ "id": "linear:T-1", "priority": 5 }),
+            ),
+            (
+                "issues_update",
+                json!({ "id": "linear:T-1", "priority": -1 }),
+            ),
+            (
+                "issues_update",
+                json!({ "id": "linear:T-1", "priority": "2" }),
+            ),
+            (
+                "issues_update",
+                json!({ "id": "linear:T-1", "assignee": "bob" }),
+            ),
+            (
+                "issues_update",
+                json!({ "id": "linear:T-1", "title": "  " }),
+            ),
+            ("issues_update", json!({ "id": "linear:T-1", "bogus": 1 })),
+            ("issues_comment", json!({})),
+            ("issues_comment", json!({ "body": "hi" })),
+            ("issues_comment", json!({ "id": "linear:T-1" })),
+            ("issues_comment", json!({ "id": "linear:T-1", "body": "" })),
+            (
+                "issues_comment",
+                json!({ "id": "linear:T-1", "body": "  \n" }),
+            ),
+            ("issues_comment", json!({ "id": "linear:T-1", "body": 3 })),
+            (
+                "issues_comment",
+                json!({ "id": "linear:T-1", "body": oversize }),
+            ),
+        ] {
+            let (code, _) = r.call(tool, &bad).unwrap().unwrap_err();
+            assert_eq!(code, -32602, "{tool} {bad}");
+        }
+    }
+
+    #[test]
+    fn issues_update_and_comment_route_their_cap_ids_and_accept_the_limit() {
+        let r = StateRouter::new(vec!["issues.update", "issues.comment"], |cap, _| {
+            Ok(json!({ "cap": cap }))
+        });
+        for (tool, args, cap) in [
+            (
+                "issues_update",
+                json!({ "id": "linear:T-1", "priority": 0, "assignee": "none" }),
+                "issues.update",
+            ),
+            (
+                "issues_comment",
+                json!({ "id": "linear:T-1", "body": "x".repeat(MAX_ISSUE_COMMENT_BYTES) }),
+                "issues.comment",
+            ),
+        ] {
+            let res = r.call(tool, &args).unwrap().unwrap();
+            let text = res["content"][0]["text"].as_str().unwrap();
+            assert!(text.contains(cap), "{text}");
+        }
+    }
+
+    #[test]
+    fn redact_for_audit_hides_the_comment_body_but_keeps_its_size() {
+        let secret = "token sk-live-12345 in a comment";
+        let args = json!({ "id": "linear:T-1", "body": secret, "account": "w" });
+        let red = redact_for_audit("issues.comment", &args);
+        assert_eq!(red["id"], "linear:T-1");
+        assert_eq!(red["account"], "w");
+        let body = red["body"].as_str().unwrap();
+        assert!(!body.contains("sk-live"), "{body}");
+        assert!(body.contains(&format!("{} bytes", secret.len())), "{body}");
+        assert!(body.contains("sha256:"), "{body}");
+        assert!(!red.to_string().contains(secret));
+        // Deterministic, and distinct bodies hash differently.
+        assert_eq!(body, text_digest(secret));
+        assert_ne!(text_digest("a"), text_digest("b"));
+        // An update carries no free-text body: unchanged.
+        let upd = json!({ "id": "linear:T-1", "status": "done" });
+        assert_eq!(redact_for_audit("issues.update", &upd), upd);
+    }
+
+    #[test]
     fn tool_entries_string_array_declares_items() {
         let r = StateRouter::new(vec!["sessions.open"], |_, _| Ok(json!(null)));
         let entries = r.tool_entries();
@@ -2109,6 +2433,8 @@ mod tests {
             "worktrees.open",
             "dispatches.put",
             "dispatches.set_status",
+            "issues.update",
+            "issues.comment",
         ];
         // Folder assignment is a repo-local worktree metadata mutation: Git.
         let git = ["folders.assign"];
@@ -2302,6 +2628,8 @@ mod tests {
             ("worktrees_open", false, false),
             ("dispatches_put", false, false),
             ("dispatches_set_status", false, true),
+            ("issues_update", false, true),
+            ("issues_comment", false, false),
         ] {
             let entry = entries
                 .iter()
