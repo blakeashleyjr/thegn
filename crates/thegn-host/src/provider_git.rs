@@ -739,6 +739,84 @@ pub(crate) fn pull_back(
     })
 }
 
+/// Whether a stored `location` value is a managed-provider location. Ssh
+/// locations are not: their worktree path lives on the remote, so there is no
+/// local checkout to fall back to.
+pub(crate) fn is_provider_location(wt: &str, location: Option<&str>) -> bool {
+    matches!(
+        thegn_core::remote::GitLoc::from_db(wt, location),
+        thegn_core::remote::GitLoc::Provider { .. }
+    )
+}
+
+/// Should a session exit trigger the automatic pull-back (THE-2021)? Only for
+/// a provider-located worktree, only when it was the worktree's last live
+/// session, and never while a pull for it is already running. Pure.
+pub(crate) fn should_pull_on_exit(
+    location_is_provider: bool,
+    other_live_sessions: usize,
+    in_flight: bool,
+) -> bool {
+    location_is_provider && other_live_sessions == 0 && !in_flight
+}
+
+/// Worktrees with an automatic pull-back running in this process.
+fn pulls_in_flight() -> &'static std::sync::Mutex<std::collections::HashSet<String>> {
+    static IN_FLIGHT: std::sync::OnceLock<std::sync::Mutex<std::collections::HashSet<String>>> =
+        std::sync::OnceLock::new();
+    IN_FLIGHT.get_or_init(Default::default)
+}
+
+/// The single-flight claim on one worktree's automatic pull-back; released
+/// when dropped.
+#[derive(Debug)]
+pub(crate) struct PullFlight {
+    worktree: String,
+}
+
+impl Drop for PullFlight {
+    fn drop(&mut self) {
+        pulls_in_flight()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(&self.worktree);
+    }
+}
+
+/// Claim `worktree`'s pull-back; `None` when one is already running.
+pub(crate) fn try_begin_pull(worktree: &str) -> Option<PullFlight> {
+    pulls_in_flight()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .insert(worktree.to_string())
+        .then(|| PullFlight {
+            worktree: worktree.to_string(),
+        })
+}
+
+/// [`pull_back`] for a worktree whose recorded location is a provider
+/// location and whose env resolves to a provider placement; `Ok(None)` for
+/// anything else (nothing to pull). Blocks on the DB, git and the provider:
+/// the daemon runs it on the blocking pool after the last session exits.
+// off-loop: daemon `spawn_blocking` on session exit.
+pub(crate) fn pull_back_if_provider(
+    cfg: &Config,
+    worktree: &str,
+) -> anyhow::Result<Option<PullReport>> {
+    use thegn_core::store::WorkspaceStore;
+    let stored = thegn_core::db::Db::open()
+        .and_then(|db| db.location_for(worktree))
+        .with_context(|| format!("read the stored location of {worktree}"))?;
+    if !is_provider_location(worktree, stored.as_deref()) {
+        return Ok(None);
+    }
+    let env = crate::cmd::env::resolve_for(cfg, Some(worktree.to_string()))?;
+    if !env.placement.is_provider() {
+        return Ok(None);
+    }
+    pull_back(cfg, worktree, &env.name).map(Some)
+}
+
 fn pull_from_sandbox(
     provider: &Provider,
     id: &str,
@@ -806,7 +884,7 @@ mod tests {
         MAX_SEED_BUNDLE_BYTES, PULL_REF_PREFIX, PullOutcome, PullReport, apply_pulled_bundle,
         branch_tip, bundle_branch, check_pull_policy, check_pull_target, classify_pull,
         is_protected_branch, no_exec_channel_message, pull_ref_for, push_decision,
-        seed_cap_message,
+        seed_cap_message, should_pull_on_exit, try_begin_pull,
     };
     use std::path::Path;
     use thegn_core::config::{SandboxGitConfig, SandboxGitMode};
@@ -1000,6 +1078,35 @@ mod tests {
             msg,
             "the repository bundle is 513 MiB, over the 512 MiB seed cap; set `[sandbox.git] transport = \"clone\"` (and a credential) for this env"
         );
+    }
+
+    #[test]
+    fn session_exit_pulls_only_after_the_last_provider_session() {
+        for (provider, others, in_flight, expected) in [
+            (true, 0, false, true),
+            (true, 1, false, false),
+            (true, 0, true, false),
+            (false, 0, false, false),
+            (false, 2, true, false),
+        ] {
+            assert_eq!(
+                should_pull_on_exit(provider, others, in_flight),
+                expected,
+                "provider={provider} others={others} in_flight={in_flight}"
+            );
+        }
+    }
+
+    #[test]
+    fn pull_flight_is_single_flight_per_worktree() {
+        let wt = "/wt/single-flight-test-a";
+        let first = try_begin_pull(wt).expect("first claim");
+        assert!(try_begin_pull(wt).is_none(), "a second claim must wait");
+        let other = try_begin_pull("/wt/single-flight-test-b").expect("another worktree");
+        drop(first);
+        let again = try_begin_pull(wt).expect("released on drop");
+        drop(again);
+        drop(other);
     }
 
     #[test]
