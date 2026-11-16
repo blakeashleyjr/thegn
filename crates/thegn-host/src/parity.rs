@@ -16,6 +16,26 @@ use crate::agent::block_on_provider;
 
 const DEGRADED_SCOPE: &str = "parity_degraded";
 
+/// Which parts of the local worktree [`apply_local_parity_mode`] carries.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ParityMode {
+    /// The origin-clone transport: unpushed commits ride a thin bundle (its
+    /// prerequisites are the remote-tracking tips the clone already has), plus
+    /// the patch and the untracked tar.
+    Full,
+    /// The bundle-seed transport: the sandbox was seeded with the branch tip
+    /// itself, so only the uncommitted patch and the untracked tar are carried.
+    /// A thin bundle would be wrong here: a bundle-seeded repository has no
+    /// remote-tracking refs to satisfy its prerequisites.
+    WorkingTreeOnly,
+}
+
+impl ParityMode {
+    fn carries_commits(self) -> bool {
+        matches!(self, ParityMode::Full)
+    }
+}
+
 fn record_outcome_in(db: &Db, worktree: &str, result: &anyhow::Result<()>) {
     let stored = match result {
         Ok(()) => db.del_ui_state(DEGRADED_SCOPE, worktree),
@@ -197,7 +217,7 @@ where
 }
 
 #[expect(clippy::disallowed_methods, reason = "off-loop provisioning path")]
-fn capture(wt: &Path, tmp: &Path) -> anyhow::Result<Capture> {
+fn capture(wt: &Path, tmp: &Path, mode: ParityMode) -> anyhow::Result<Capture> {
     use thegn_core::util::git_cmd;
 
     let host_head = git_cmd(wt)
@@ -222,14 +242,16 @@ fn capture(wt: &Path, tmp: &Path) -> anyhow::Result<Capture> {
 
     // 1. Unpushed commits -> a thin bundle (prerequisites = the remote-tracking
     //    tips the sandbox clone already has). An empty bundle (nothing unpushed)
-    //    exits non-zero; treat that as "no commits to carry".
-    let has_bundle = git_cmd(wt)
-        .args(["bundle", "create"])
-        .arg(bundle_file.path())
-        .args(["HEAD", "--not", "--remotes"])
-        .output()
-        .map(|output| output.status.success())
-        .unwrap_or(false)
+    //    exits non-zero; treat that as "no commits to carry". The bundle-seed
+    //    transport skips this: the sandbox already has the branch tip.
+    let has_bundle = mode.carries_commits()
+        && git_cmd(wt)
+            .args(["bundle", "create"])
+            .arg(bundle_file.path())
+            .args(["HEAD", "--not", "--remotes"])
+            .output()
+            .map(|output| output.status.success())
+            .unwrap_or(false)
         && nonempty(bundle_file.path());
     // 2. Uncommitted tracked changes (staged + unstaged vs HEAD), incl. deletions.
     let patch = git_cmd(wt)
@@ -316,6 +338,20 @@ pub(crate) fn apply_local_parity(
     workdir: &str,
     exec_env: &[(String, String)],
 ) -> anyhow::Result<()> {
+    apply_local_parity_mode(provider, id, wt_host, workdir, exec_env, ParityMode::Full)
+}
+
+/// [`apply_local_parity`] with an explicit [`ParityMode`]: a bundle-seeded
+/// sandbox passes [`ParityMode::WorkingTreeOnly`].
+// off-loop: provisioning path — reached only via spawn_blocking / the pool thread / CLI.
+pub(crate) fn apply_local_parity_mode(
+    provider: &thegn_svc::provider::Provider,
+    id: &str,
+    wt_host: &str,
+    workdir: &str,
+    exec_env: &[(String, String)],
+    mode: ParityMode,
+) -> anyhow::Result<()> {
     use thegn_core::syncstate::{replay_script_verified, stage_dir_script, staged_artifact_path};
     let wt = Path::new(wt_host);
     if !wt.join(".git").exists() {
@@ -323,7 +359,7 @@ pub(crate) fn apply_local_parity(
         return Ok(());
     }
     let tmp = tempfile::Builder::new().prefix("tg-parity-").tempdir()?;
-    let captured = capture_coherent(|| fingerprint(wt), || capture(wt, tmp.path()))?;
+    let captured = capture_coherent(|| fingerprint(wt), || capture(wt, tmp.path(), mode))?;
     if !captured.has_bundle && captured.patch.is_none() && !captured.has_tar {
         // Clean working tree with nothing unpushed — the origin clone is parity.
         return Ok(());
@@ -681,6 +717,50 @@ mod tests {
             .success()
         );
         assert!(nonempty(bundle.path()));
+    }
+
+    #[test]
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "test fixture invokes git to exercise the parity capture modes"
+    )]
+    fn working_tree_only_capture_skips_the_commit_bundle() {
+        use super::{ParityMode, capture};
+        let repo = tempfile::tempdir().unwrap();
+        let run_git = |args: &[&str]| {
+            thegn_core::util::git_cmd(repo.path())
+                .arg("-c")
+                .arg("commit.gpgsign=false")
+                .env("GIT_CONFIG_GLOBAL", "/dev/null")
+                .args(args)
+                .output()
+                .unwrap()
+        };
+        assert!(run_git(&["init", "-q"]).status.success());
+        assert!(
+            run_git(&["config", "user.name", "Parity Test"])
+                .status
+                .success()
+        );
+        assert!(
+            run_git(&["config", "user.email", "parity@example.invalid"])
+                .status
+                .success()
+        );
+        std::fs::write(repo.path().join("tracked.txt"), "one\n").unwrap();
+        assert!(run_git(&["add", "tracked.txt"]).status.success());
+        assert!(run_git(&["commit", "-m", "initial"]).status.success());
+        std::fs::write(repo.path().join("tracked.txt"), "two\n").unwrap();
+
+        let tmp = tempfile::tempdir().unwrap();
+        let full = capture(repo.path(), tmp.path(), ParityMode::Full).unwrap();
+        assert!(full.has_bundle, "an unpushed commit rides the thin bundle");
+        assert!(full.patch.is_some());
+
+        let seeded = capture(repo.path(), tmp.path(), ParityMode::WorkingTreeOnly).unwrap();
+        assert!(!seeded.has_bundle, "a bundle-seeded sandbox has the tip");
+        assert!(seeded.patch.is_some(), "the patch still rides");
+        assert!(seeded.artifacts.iter().all(|(name, _)| name != "bundle"));
     }
 
     #[test]
