@@ -120,8 +120,7 @@ const OMITTED: &[(&str, &str)] = &[
     ("autopilot", "autopilot policy is not exposed"),
     ("pipeline", "pipeline definitions are not exposed"),
     ("skills", "skill configuration is not exposed"),
-    ("media.mpv", "mpv backend table is not exposed"),
-    ("media.mpd", "mpd backend table is not exposed"),
+    ("media.mpd.password", "credentials are not exposed"),
     ("voice", "voice input is not exposed"),
     (
         "usage.allow_network",
