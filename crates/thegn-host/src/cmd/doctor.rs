@@ -350,7 +350,7 @@ fn worker_readiness_line(
             readiness.as_str()
         ),
         WorkerReadiness::CannotWriteGitMetadata => format!(
-            "  NOT READY     stage worker: {} \u{2014} the git common dir is not a writable mount",
+            "  NOT READY     stage worker: {} \u{2014} the git object store is not a writable mount (a branch outside the lane namespace gets a read-only .git)",
             readiness.as_str()
         ),
         WorkerReadiness::CallbackUnavailable => format!(

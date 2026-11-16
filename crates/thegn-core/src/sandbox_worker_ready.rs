@@ -71,9 +71,15 @@ pub fn classify_worker(facts: &WorkerFacts<'_>) -> WorkerReadiness {
     if !writable(facts.mounts, facts.worktree) {
         return WorkerReadiness::CannotWriteWorktree;
     }
+    // `[sandbox.git]` mounts the common dir read-only and carves out only what
+    // a lane commit writes (objects, the worktree admin dir, the lane's
+    // refs/heads namespace and its logs). The planner grants those carve-outs
+    // together or not at all, so a writable object store is the commit
+    // signal; a read-only fallback (main checkout, top-level branch) leaves it
+    // read-only and the worker is correctly held.
     if facts
         .git_common_dir
-        .is_some_and(|git_common_dir| !writable(facts.mounts, git_common_dir))
+        .is_some_and(|git_common_dir| !writable(facts.mounts, &git_common_dir.join("objects")))
     {
         return WorkerReadiness::CannotWriteGitMetadata;
     }
@@ -102,7 +108,7 @@ pub fn launch_hold_reason(readiness: WorkerReadiness) -> Option<&'static str> {
             Some("the worktree is not a writable mount in the composed sandbox")
         }
         WorkerReadiness::CannotWriteGitMetadata => Some(
-            "the git common dir is not a writable mount in the composed sandbox, so the agent could not commit",
+            "the git object store is not a writable mount in the composed sandbox, so the agent could not commit",
         ),
         WorkerReadiness::CallbackUnavailable => {
             Some("the thegn binary was replaced or removed since launch")
@@ -319,6 +325,35 @@ mod tests {
                 WorkerReadiness::CannotWriteGitMetadata
             );
         }
+    }
+
+    #[test]
+    fn classify_ready_when_git_policy_carves_the_commit_paths_out_of_a_ro_common_dir() {
+        let worktree = Path::new("/work/tree");
+        let carved = [
+            m("/work/tree", false),
+            m("/git/common", true),
+            m("/git/common/objects", false),
+            m("/git/common/worktrees/tree", false),
+            m("/git/common/refs/heads/tg", false),
+            m("/git/common/logs/refs/heads/tg", false),
+        ];
+        let facts = WorkerFacts {
+            git_common_dir: Some(Path::new("/git/common")),
+            ..facts(&carved, worktree)
+        };
+        assert_eq!(classify_worker(&facts), WorkerReadiness::Ready);
+
+        // The read-only fallback (no carve-outs) still holds the worker.
+        let fallback = [m("/work/tree", false), m("/git/common", true)];
+        let facts = WorkerFacts {
+            git_common_dir: Some(Path::new("/git/common")),
+            ..facts(&fallback, worktree)
+        };
+        assert_eq!(
+            classify_worker(&facts),
+            WorkerReadiness::CannotWriteGitMetadata
+        );
     }
 
     #[test]
