@@ -5995,3 +5995,60 @@ fn control_socket_systemd_makes_the_protected_dir_inaccessible() {
 
 #[path = "sandbox_evidence_tests.rs"]
 mod evidence;
+
+#[expect(clippy::disallowed_methods, reason = "initialize a local git fixture")]
+fn common_dir_mount_hosts(dir: &std::path::Path, init: bool) -> (Vec<String>, std::path::PathBuf) {
+    if init {
+        let ok = crate::util::git_cmd(dir)
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .args(["init", "--quiet"])
+            .status()
+            .unwrap()
+            .success();
+        assert!(ok);
+    }
+    let loc = crate::remote::GitLoc::Local(dir.to_path_buf());
+    let want = loc
+        .git_out_path(&["rev-parse", "--path-format=absolute", "--git-common-dir"])
+        .unwrap_or_default();
+    let cfg = crate::config::SandboxConfig {
+        enabled: true,
+        backend: crate::config::SandboxBackend::None,
+        isolation_floor: Some(crate::config::IsolationFloor::Off),
+        on_floor_miss: crate::config::OnFloorMiss::Degrade,
+        ..Default::default()
+    };
+    let spec = resolve_placed_exact(
+        &cfg,
+        &loc,
+        "test",
+        SandboxProfile::Hardened,
+        Placement::Ssh(SshPlacement::plain(
+            "host".into(),
+            22,
+            false,
+            TransportKind::Ssh,
+        )),
+    )
+    .expect("explicit remote host backend should resolve without probing");
+    (spec.mounts.into_iter().map(|m| m.host).collect(), want)
+}
+
+#[test]
+fn git_common_mount_uses_the_lossless_common_dir() {
+    let dir = tempfile::tempdir().unwrap();
+    let (hosts, want) = common_dir_mount_hosts(dir.path(), true);
+    assert!(!want.as_os_str().is_empty());
+    assert!(
+        hosts.iter().any(|h| std::path::Path::new(h) == want),
+        "{hosts:?} lacks {want:?}"
+    );
+}
+
+#[test]
+fn git_common_mount_is_omitted_outside_a_repo() {
+    let dir = tempfile::tempdir().unwrap();
+    let (hosts, want) = common_dir_mount_hosts(dir.path(), false);
+    assert!(want.as_os_str().is_empty());
+    assert!(!hosts.iter().any(|h| h.ends_with("/.git")), "{hosts:?}");
+}
