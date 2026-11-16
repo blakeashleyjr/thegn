@@ -7,7 +7,7 @@
 
 use anyhow::Result;
 use thegn_core::capabilities::{Capabilities, IsolationClass};
-use thegn_core::config::{Config, EnvProviderKind, FileAccess, SandboxProfile};
+use thegn_core::config::{Config, EnvProviderKind, FileAccess, SandboxGitMode, SandboxProfile};
 use thegn_core::db::Db;
 use thegn_core::hooks::HookEvent;
 use thegn_core::managed_tool::{ManagedTool, Resolution};
@@ -151,7 +151,8 @@ fn sandbox_json(cfg: &Config) -> serde_json::Value {
     let report = local_backend_report(cfg);
     let (backend, actual) = effective_first_ready(cfg, &report);
     let mut value = sandbox_json_with(cfg, backend, actual);
-    value["git_metadata"] = git_metadata_json(&git_metadata_for_config(cfg, backend));
+    value["git_metadata"] =
+        git_metadata_json(&git_metadata_for_config(cfg, backend), cfg.sandbox.git.mode);
     value
 }
 
@@ -349,7 +350,7 @@ fn worker_readiness_line(
             readiness.as_str()
         ),
         WorkerReadiness::CannotWriteGitMetadata => format!(
-            "  NOT READY     stage worker: {} \u{2014} the git common dir is not a writable mount",
+            "  NOT READY     stage worker: {} \u{2014} the git object store is not a writable mount (a branch outside the lane namespace gets a read-only .git)",
             readiness.as_str()
         ),
         WorkerReadiness::CallbackUnavailable => format!(
@@ -4917,7 +4918,10 @@ fn sandbox_report(cfg: &Config) {
     );
     let (backend, _) = effective_first_ready(cfg, &report);
     let exposure = git_metadata_for_config(cfg, backend);
-    outln!("  git metadata  {}", git_metadata_line(&exposure));
+    outln!(
+        "  git metadata  {}",
+        git_metadata_line(&exposure, cfg.sandbox.git.mode)
+    );
     cpu_cap_report(cfg);
     if all_weak {
         outln!("  note          even the strongest preset here shares the host kernel; for a");
@@ -5234,12 +5238,24 @@ fn git_metadata_for_config(cfg: &Config, backend: Backend) -> GitMetadataExposur
     )
 }
 
-fn git_metadata_line(exposure: &GitMetadataExposure) -> String {
+/// `mode` is the resolved `[sandbox.git]` mode, which decides how the shared
+/// `.git` of a linked worktree is actually mounted.
+fn git_metadata_line(exposure: &GitMetadataExposure, mode: SandboxGitMode) -> String {
     match exposure {
-        GitMetadataExposure::SharedReadWrite { common_dir } => format!(
-            "shared git dir {} is mounted read-write into sandboxed panes (hooks and refs writable; .git/config pinned read-only); no fenced commit path yet",
-            common_dir.display()
-        ),
+        GitMetadataExposure::SharedReadWrite { common_dir } => match mode {
+            SandboxGitMode::Full => format!(
+                "shared git dir {} is mounted read-write into sandboxed panes ([sandbox.git] mode = \"full\": hooks and refs writable; .git/config pinned read-only)",
+                common_dir.display()
+            ),
+            SandboxGitMode::ReadOnly => format!(
+                "shared git dir {} is mounted read-only into sandboxed panes ([sandbox.git] mode = \"read-only\"; the worktree is read-only too)",
+                common_dir.display()
+            ),
+            SandboxGitMode::CommitOnly | SandboxGitMode::PushLane => format!(
+                "shared git dir {} is mounted into sandboxed panes as [sandbox.git] mode = \"{mode}\": shared .git read-only except the lane's refs/objects/worktree metadata (fully read-only when the worktree is not a namespaced lane branch)",
+                common_dir.display()
+            ),
+        },
         GitMetadataExposure::InsideWorktree => {
             "git dir is inside the worktree and shares its read-write mount (hooks writable)"
                 .to_string()
@@ -5256,7 +5272,7 @@ fn git_metadata_line(exposure: &GitMetadataExposure) -> String {
     }
 }
 
-fn git_metadata_json(exposure: &GitMetadataExposure) -> serde_json::Value {
+fn git_metadata_json(exposure: &GitMetadataExposure, mode: SandboxGitMode) -> serde_json::Value {
     let (kind, path) = match exposure {
         GitMetadataExposure::SharedReadWrite { common_dir } => {
             ("shared_read_write", Some(common_dir.display().to_string()))
@@ -5270,7 +5286,7 @@ fn git_metadata_json(exposure: &GitMetadataExposure) -> serde_json::Value {
     serde_json::json!({
         "exposure": kind,
         "path": path,
-        "detail": git_metadata_line(exposure),
+        "detail": git_metadata_line(exposure, mode),
     })
 }
 
@@ -7482,9 +7498,12 @@ args = ["--verbose"]
                     common_dir: common.to_path_buf(),
                 }
             );
-            let line = git_metadata_line(&exposure);
+            let line = git_metadata_line(&exposure, SandboxGitMode::Full);
             assert!(line.contains("read-write"));
             assert!(line.contains("hooks"));
+            let line = git_metadata_line(&exposure, SandboxGitMode::CommitOnly);
+            assert!(line.contains("read-only except the lane's refs/objects/worktree metadata"));
+            assert!(!line.contains("read-write"));
         }
     }
 
@@ -7519,7 +7538,11 @@ args = ["--verbose"]
             );
         }
         assert!(
-            git_metadata_line(&GitMetadataExposure::HostFilesystem).contains("host filesystem")
+            git_metadata_line(
+                &GitMetadataExposure::HostFilesystem,
+                SandboxGitMode::default()
+            )
+            .contains("host filesystem")
         );
     }
 
@@ -7553,9 +7576,12 @@ args = ["--verbose"]
             git_metadata_exposure(Backend::Bwrap, FileAccess::Worktree, Some(worktree), None),
             GitMetadataExposure::NotInRepository
         );
-        let json = git_metadata_json(&GitMetadataExposure::SharedReadWrite {
-            common_dir: common.to_path_buf(),
-        });
+        let json = git_metadata_json(
+            &GitMetadataExposure::SharedReadWrite {
+                common_dir: common.to_path_buf(),
+            },
+            SandboxGitMode::Full,
+        );
         assert_eq!(json["exposure"], "shared_read_write");
         assert_eq!(json["path"], "/repo/.git");
         assert!(
