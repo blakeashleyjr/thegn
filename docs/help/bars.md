@@ -36,6 +36,15 @@ and `clock` among the last to go — so the
 calendar stays reachable from the bar even on a cramped terminal; the brand
 and the active app chip always keep their cells.
 
+Clicking `cpu` or `mem` opens its history graph with a **breakdown** beneath
+it: who is using the machine, as a tree of workspace → worktree → pane (tab
+and program) → the heaviest processes in that pane, then thegn itself (UI and
+daemon) and "outside thegn" — everything else. `cpu` orders the tree by CPU
+(percent of one core, like `top`, with each row's share of the masthead total
+beside it); `mem` orders it by resident memory. Panes of parked workspaces are
+included. A second click on the same stat still opens the full system monitor
+on that tab. See [[system-monitor]] for how the attribution works.
+
 The app-tab chips are buttons: the active app sits on the focus pill and the
 others on a faint pill. Clicking a chip switches to that app, exactly like its
 `Alt-1`.. keyboard chord; an app that failed to load stays put and says why on
