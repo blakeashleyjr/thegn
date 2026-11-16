@@ -1554,7 +1554,11 @@ fn every_rendered_key_exists_in_the_schema() {
                 // (section, key) pairs under a `*` / array pattern; accept the
                 // table name itself when any schema path starts with it.
                 || schema_paths.iter().any(|s| s.starts_with(&format!("{p}.")))
-                || (!p.contains('.') && root_props.contains(p)))
+                || (!p.contains('.') && root_props.contains(p))
+                // Nested maps of scalars (`notifications.sound.per_kind`) own
+                // no documented keys either, so the walker never lists them;
+                // accept any path the schema itself has.
+                || schema_has_path(p))
         })
         .collect();
     assert!(
