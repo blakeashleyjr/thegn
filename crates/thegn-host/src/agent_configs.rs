@@ -247,7 +247,7 @@ fn phase2_allowed(agent: &str, rel: &str) -> bool {
             t => !nested && t.starts_with("statusline"),
         },
         "codex" => match top {
-            "config.toml" | "config.json" | "AGENTS.md" => !nested,
+            "auth.json" | "config.toml" | "config.json" | "AGENTS.md" => !nested,
             "prompts" => nested,
             _ => false,
         },
@@ -1249,6 +1249,7 @@ mod tests {
         assert!(phase2_allowed("codex", "config.toml"));
         assert!(phase2_allowed("codex", "prompts/a.md"));
         assert!(phase2_allowed("codex", "AGENTS.md"));
+        assert!(phase2_allowed("codex", "auth.json"));
         assert!(!phase2_allowed("codex", "sessions/a.jsonl"));
         assert!(!phase2_allowed("codex", "log/x"));
         assert!(phase2_allowed("pi", "agent/skills/a/SKILL.md"));
