@@ -23,7 +23,7 @@ use thegn_svc::control::{
     AttachKind, AttachReply, ControlApi, ControlError, ControlResult, DispatchPage, ForkSpec,
     GitFileStatus, IssueListGap, IssueListing, OpenSpec, PreviewFetchReply, PreviewFetchRequest,
     RecordSpec, RecordStatus, SessionActivityEvent, SessionInfo, ToolRunRequest, WaitCondition,
-    WaitOutcome,
+    WaitOutcome, check_pty_size,
 };
 use thegn_svc::git::{CliGit, GitBackend};
 
@@ -1270,6 +1270,9 @@ impl ControlApi for DaemonService {
 
     fn open(&self, spec: OpenSpec) -> BoxFuture<'_, ControlResult<SessionInfo>> {
         Box::pin(async move {
+            // Refuse an oversized geometry before any fence or registry work:
+            // the emulator allocates rows x cols cells.
+            check_pty_size(spec.rows, spec.cols)?;
             if !self.accepting.load(std::sync::atomic::Ordering::Acquire) {
                 return Err(ControlError::Conflict("daemon is shutting down".into()));
             }
@@ -1596,6 +1599,7 @@ impl ControlApi for DaemonService {
         history: bool,
     ) -> BoxFuture<'a, ControlResult<AttachReply>> {
         Box::pin(async move {
+            check_pty_size(rows, cols)?;
             let tx = self.live_tx(session).await?;
             let (reply_tx, reply_rx) = oneshot::channel();
             tx.send(SessionMsg::Attach {
@@ -1659,6 +1663,7 @@ impl ControlApi for DaemonService {
         cols: u16,
     ) -> BoxFuture<'a, ControlResult<()>> {
         Box::pin(async move {
+            check_pty_size(rows, cols)?;
             let tx = self.live_tx(session).await?;
             tx.send(SessionMsg::Resize { rows, cols })
                 .await
@@ -8203,6 +8208,59 @@ mod tests {
             leases(&svc).is_empty(),
             "an interactive attach cancels the relay grace"
         );
+    }
+
+    /// An oversized geometry is refused at the service seam: `resize` and
+    /// `attach` never reach the actor and leave the recorded size alone.
+    #[tokio::test]
+    async fn oversized_resize_and_attach_are_refused_before_the_actor() {
+        let (svc, _rx) = service(0);
+        let (msg_tx, mut msg_rx) = mpsc::channel(8);
+        let entry = shutdown_test_entry(msg_tx);
+        let live = Arc::clone(&entry.live);
+        svc.sessions.lock().await.insert("s1".into(), entry);
+
+        match svc.resize("s1", 24, 65535).await {
+            Err(ControlError::InvalidArgument(msg)) => assert!(msg.contains("limit"), "{msg}"),
+            other => panic!("oversized resize gave {other:?}"),
+        }
+        match svc
+            .attach("c1", "s1", AttachKind::Interactive, 24, 65535, false)
+            .await
+        {
+            Err(ControlError::InvalidArgument(msg)) => assert!(msg.contains("limit"), "{msg}"),
+            Err(other) => panic!("oversized attach gave {other:?}"),
+            Ok(_) => panic!("oversized attach was accepted"),
+        }
+        assert!(
+            msg_rx.try_recv().is_err(),
+            "no message reached the session actor"
+        );
+        let size = {
+            let guard = live.lock().unwrap();
+            (guard.rows, guard.cols)
+        };
+        assert_eq!(size, (24, 80), "recorded geometry unchanged");
+    }
+
+    /// `open` refuses an oversized geometry before registering anything.
+    #[tokio::test]
+    async fn oversized_open_is_refused_before_registration() {
+        let _state = crate::testenv::IsolatedState::new();
+        let (svc, _rx) = service(0);
+        let result = svc
+            .open(OpenSpec {
+                argv: vec!["sh".into()],
+                rows: 2000,
+                cols: 80,
+                ..Default::default()
+            })
+            .await;
+        match result {
+            Err(ControlError::InvalidArgument(msg)) => assert!(msg.contains("limit"), "{msg}"),
+            other => panic!("oversized open gave {other:?}"),
+        }
+        assert!(svc.sessions.lock().await.is_empty(), "nothing registered");
     }
 
     /// `publish_pairing` lands on the broadcast feed — the producer half of
