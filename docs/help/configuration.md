@@ -600,7 +600,7 @@ Recording, media and the monitor process table are also exposed:
 `mediaDefaultAction`, `mediaOverlayOnBadgeClick`, `mediaSeekStepSecs`,
 `mediaSeekStepVideoSecs`, `mediaPollIntervalSecs`, `mediaPlayersPriority`,
 `monitorProcRows`, `monitorProcesses` and `monitorProcessIo`, plus
-`mediaVolumeStep` (0.0 through 1.0). The `mpv`/`mpd` backend tables are not exposed. This
+`mediaVolumeStep` (0.0 through 1.0). The `mpv`/`mpd` socket paths are exposed as `mediaMpvSocket` and `mediaMpdSocket`; `media.mpd.password` (a credential) is not exposed. This
 exposes the existing default-action setting only; it adds no action ids.
 
 The `[limits]` and `[diagnostics]` tables are exposed as `limitsTestCpuQuota`,
