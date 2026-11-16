@@ -4543,6 +4543,9 @@ impl Default for SandboxConfig {
             volume_owners: std::collections::BTreeMap::new(),
             env_passthrough: [
                 "SSH_AUTH_SOCK",
+                // Withheld unless `[sandbox.git]` mode = "full" with
+                // credential = "repo-token" | "user-token" (see
+                // `SandboxGitConfig::admits_git_token`).
                 "GH_TOKEN",
                 "GITHUB_TOKEN",
                 "ANTHROPIC_API_KEY",
@@ -4612,6 +4615,7 @@ impl SandboxConfig {
         self.env_passthrough
             .iter()
             .filter(|key| firewall.admits(key))
+            .filter(|key| self.git.admits_env(key))
             .filter_map(|k| std::env::var(k).ok().map(|v| (k.clone(), v)))
             .collect()
     }

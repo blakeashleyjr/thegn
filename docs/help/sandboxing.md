@@ -618,8 +618,16 @@ read-only), `push-lane` or `full`. `push_refs` and `deny_refs` take ref globs
 with a trailing `/*` (one level) or `/**` (any depth), and the merge target
 branch is always denied. Set it globally or per `[env.<name>.sandbox.git]`; a
 repository's `.thegn.toml` cannot set it. The keys are validated today; the
-sandbox mounts that enforce them arrive in a later release, and git
-credential modes other than `none` are not implemented yet.
+sandbox mounts that enforce them arrive in a later release.
+
+Sandboxed and remote agents get no GitHub token by default: credentials stay
+with thegn. With the default `credential = "none"`, `GH_TOKEN` and
+`GITHUB_TOKEN` are not passed into sandboxes or provider provisioning even
+though the default `[sandbox] env_passthrough` lists them, and provisioning
+does not install a git token credential helper. Only `mode = "full"` with
+`credential = "repo-token"` or `"user-token"` passes the host token through.
+`ANTHROPIC_API_KEY` and other agent credentials are unaffected. The other
+credential modes (`deploy-key`, `github-app`) are not implemented yet.
 
 ## Choosing per worktree
 

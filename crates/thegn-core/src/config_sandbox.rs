@@ -28,8 +28,9 @@ config_enum! {
 }
 
 config_enum! {
-    /// Which git credential a `mode = "full"` sandbox receives. Only `none`
-    /// is implemented; the others parse so configs can be written ahead.
+    /// Which git credential a `mode = "full"` sandbox receives. `none` (the
+    /// default) withholds the host GitHub token; `repo-token`/`user-token`
+    /// pass it through. The others parse so configs can be written ahead.
     pub enum GitCredential : "sandbox git credential" {
         None      = "none" | "off",
         DeployKey = "deploy-key" | "deploy_key",
@@ -57,7 +58,8 @@ pub struct SandboxGitConfig {
     pub mode: SandboxGitMode,
     /// `bundle` (default) or `clone`: how commits come back to the host.
     pub transport: GitTransport,
-    /// Credential handed to a `full` sandbox. Only `none` is implemented.
+    /// Credential handed to a `full` sandbox. `none` (default) withholds
+    /// GH_TOKEN/GITHUB_TOKEN; `repo-token`/`user-token` pass them through.
     pub credential: GitCredential,
     /// Ref globs a `push-lane` sandbox may push (`refs/heads/tg/*`).
     pub push_refs: Vec<String>,
@@ -103,7 +105,28 @@ impl SandboxGitOverlay {
     }
 }
 
+/// Host env vars carrying a GitHub token. Withheld from sandboxes and
+/// provider provisioning unless [`SandboxGitConfig::admits_git_token`].
+pub const GIT_TOKEN_ENV: &[&str] = &["GH_TOKEN", "GITHUB_TOKEN"];
+
 impl SandboxGitConfig {
+    /// Does this policy hand the host GitHub token to the sandbox? Only
+    /// `mode = "full"` with `credential = "repo-token" | "user-token"`; the
+    /// default (`credential = "none"`) keeps credentials with thegn.
+    pub fn admits_git_token(&self) -> bool {
+        self.mode == SandboxGitMode::Full
+            && matches!(
+                self.credential,
+                GitCredential::RepoToken | GitCredential::UserToken
+            )
+    }
+
+    /// May the env var `key` be passed into a sandbox under this policy?
+    /// False only for a [`GIT_TOKEN_ENV`] name when the token is withheld.
+    pub fn admits_env(&self, key: &str) -> bool {
+        self.admits_git_token() || !GIT_TOKEN_ENV.contains(&key)
+    }
+
     /// `self` with every key present in `overlay` replaced (lists replace
     /// wholesale, they do not append).
     pub fn merged(&self, overlay: &SandboxGitOverlay) -> SandboxGitConfig {

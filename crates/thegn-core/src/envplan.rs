@@ -506,6 +506,11 @@ pub struct PlanOpts {
     /// overrides). The default (`mode = "auto"`) keeps SynthNix; `mise`/`off`
     /// downgrade it (see [`plan`]).
     pub toolchain: crate::toolchain::ToolchainConfig,
+    /// Install the GitHub token credential helper in the `git_auth` step.
+    /// False (the default) unless `[sandbox.git]` grants a token
+    /// ([`crate::config::SandboxGitConfig::admits_git_token`]): credentials stay
+    /// with thegn, and the step configures no token helper or https rewrite.
+    pub git_token: bool,
 }
 
 /// A Nix binary-cache substituter (and optional push) for fast devShells.
@@ -548,6 +553,7 @@ impl Default for PlanOpts {
             host_cache_key: None,
             host_cache_url: None,
             toolchain: crate::toolchain::ToolchainConfig::default(),
+            git_token: false,
         }
     }
 }
@@ -651,7 +657,8 @@ pub fn plan(req: &EnvRequirements, opts: &PlanOpts) -> EnvPlan {
         kind: StepKind::Exec(format!("mkdir -p {wd}")),
     });
 
-    // 2. Git auth + clone. The auth step is a runtime-conditional credential
+    // 2. Git auth + clone. Only when `opts.git_token` (`[sandbox.git]` grants a
+    // token) does the auth step install a runtime-conditional credential
     // helper: if a GitHub token is present in the exec env (carried from the host
     // via `passthrough_env_remote` — GH_TOKEN/GITHUB_TOKEN), configure git to use
     // it for HTTPS clone/push; a no-op without a token. Persisted in ~/.gitconfig
@@ -660,7 +667,7 @@ pub fn plan(req: &EnvRequirements, opts: &PlanOpts) -> EnvPlan {
         steps.push(ProvisionStep {
             id: "git_auth".into(),
             label: "Configure git credentials".into(),
-            kind: StepKind::Exec(git_auth_script()),
+            kind: StepKind::Exec(git_auth_script(opts.git_token)),
         });
     }
     // Clone the repo into the workdir (idempotent — skips if already a repo).
@@ -1469,7 +1476,10 @@ fn agents_install_script(agents: &[String]) -> String {
 /// Without a token the origin is left untouched (public HTTPS / agent-forwarded
 /// SSH still work). All persisted to `~/.gitconfig` so later pushes/pulls from
 /// the shell work too.
-fn git_auth_script() -> String {
+///
+/// `git_token = false` (the default policy) omits the token helper and the
+/// https rewrite entirely: the sandbox gets no git credential from thegn.
+fn git_auth_script(git_token: bool) -> String {
     // The in-sandbox `core.sshCommand` host-key policy comes from the one
     // chokepoint (`SandboxBootstrap` class), never a literal here — see
     // `crate::hostkey` and the host-key ratchet.
@@ -1481,24 +1491,31 @@ fn git_auth_script() -> String {
         )
     );
     let mut s = ensure_git_script();
+    if git_token {
+        s.push_str("tok=\"${GH_TOKEN:-${GITHUB_TOKEN:-}}\"; ");
+    }
     s.push_str(
-        "tok=\"${GH_TOKEN:-${GITHUB_TOKEN:-}}\"; \
-         git config --global --add safe.directory '*' 2>/dev/null || true; \
+        "git config --global --add safe.directory '*' 2>/dev/null || true; \
          git config --global core.sshCommand '",
     );
     s.push_str(&ssh_cmd);
     s.push_str(
         "' 2>/dev/null || true; \
          [ -n \"${THEGN_GIT_NAME:-}\" ] && git config --global user.name \"$THEGN_GIT_NAME\" 2>/dev/null || true; \
-         [ -n \"${THEGN_GIT_EMAIL:-}\" ] && git config --global user.email \"$THEGN_GIT_EMAIL\" 2>/dev/null || true; \
-         if [ -n \"$tok\" ]; then \
+         [ -n \"${THEGN_GIT_EMAIL:-}\" ] && git config --global user.email \"$THEGN_GIT_EMAIL\" 2>/dev/null || true; ",
+    );
+    if git_token {
+        s.push_str(
+            "if [ -n \"$tok\" ]; then \
            git config --global credential.helper \
              '!f() { test \"$1\" = get && printf \"username=x-access-token\\npassword=%s\\n\" \"${GH_TOKEN:-$GITHUB_TOKEN}\"; }; f'; \
            git config --global --unset-all url.'https://github.com/'.insteadOf 2>/dev/null || true; \
            git config --global --add url.'https://github.com/'.insteadOf 'git@github.com:' 2>/dev/null || true; \
            git config --global --add url.'https://github.com/'.insteadOf 'ssh://git@github.com/' 2>/dev/null || true; \
-         fi; true",
-    );
+         fi; ",
+        );
+    }
+    s.push_str("true");
     s
 }
 
@@ -2916,7 +2933,7 @@ mod tests {
 
     #[test]
     fn git_auth_installs_git_first_when_the_image_lacks_it() {
-        let s = git_auth_script();
+        let s = git_auth_script(false);
         let ensure = s
             .find("command -v git")
             .expect("probes for git before configuring it");
@@ -2935,8 +2952,43 @@ mod tests {
     }
 
     #[test]
+    fn git_auth_withholds_token_helper_by_default() {
+        let s = git_auth_script(false);
+        assert!(
+            !s.contains("GH_TOKEN") && !s.contains("GITHUB_TOKEN"),
+            "{s}"
+        );
+        assert!(!s.contains("credential.helper"), "{s}");
+        assert!(!s.contains("insteadOf"), "{s}");
+        assert!(s.contains("safe.directory") && s.ends_with("true"), "{s}");
+        // Plan level: the default PlanOpts keep credentials with thegn.
+        let req = EnvRequirements::default();
+        let step_script = |opts: &PlanOpts| {
+            plan(&req, opts)
+                .steps
+                .into_iter()
+                .find(|step| step.id == "git_auth")
+                .and_then(|step| match step.kind {
+                    StepKind::Exec(script) => Some(script),
+                    _ => None,
+                })
+                .expect("git_auth step")
+        };
+        let base = PlanOpts {
+            origin: Some("https://github.com/o/r".into()),
+            ..PlanOpts::default()
+        };
+        assert!(!step_script(&base).contains("credential.helper"));
+        let granted = PlanOpts {
+            git_token: true,
+            ..base
+        };
+        assert!(step_script(&granted).contains("credential.helper"));
+    }
+
+    #[test]
     fn git_auth_is_runtime_conditional_on_token() {
-        let s = git_auth_script();
+        let s = git_auth_script(true);
         assert!(
             s.contains("GH_TOKEN") && s.contains("GITHUB_TOKEN"),
             "reads both token vars"

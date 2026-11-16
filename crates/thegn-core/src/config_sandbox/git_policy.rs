@@ -86,7 +86,12 @@ pub fn check_pull_ref(
     refname: &str,
     target_branch: Option<&str>,
 ) -> Result<(), String> {
-    if refname.is_empty() || refname.contains("..") || !refname.starts_with("refs/") {
+    if refname.is_empty()
+        || refname.contains("..")
+        || !refname.starts_with("refs/")
+        || refname.split('/').any(str::is_empty)
+        || refname.ends_with(".lock")
+    {
         return Err(format!("refusing malformed ref {refname:?}"));
     }
     if let Some(target) = target_branch.map(str::trim).filter(|t| !t.is_empty())
@@ -143,7 +148,8 @@ pub fn check_push_ref(
 ///
 /// Apply in order: every `ro` bind, then every `rw` carve-out, then every
 /// `ro_after` re-pin (bwrap applies binds in argument order, so a later bind
-/// over a subpath wins). Before launch the host creates each `mkdirs` entry
+/// over a subpath wins). `ro_after` must be applied after the worktree's own
+/// bind (it re-pins `<worktree>/.git` over it). Before launch the host creates each `mkdirs` entry
 /// (a bind target must exist) and must create any missing `ro_after` file
 /// empty, so the re-pin always applies and the sandbox cannot create it.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -154,8 +160,9 @@ pub struct GitMountPlan {
     pub mkdirs: Vec<PathBuf>,
     /// The caller must also bind the worktree itself read-only.
     pub worktree_ro: bool,
-    /// The mode wants a git credential (`full`); credential modes are not
-    /// implemented yet, so callers currently hand over none.
+    /// The mode wants a git credential (`full`). Only `repo-token` /
+    /// `user-token` hand one over today (the host GitHub token, see
+    /// [`SandboxGitConfig::admits_git_token`]); other credentials hand none.
     pub credential_wanted: bool,
 }
 
@@ -178,7 +185,33 @@ fn branch_parent(branch: &str) -> Result<&str, String> {
     }
 }
 
-/// Plan the git common-dir binds for `mode`.
+/// Does the writable `carve` (`refs/heads/<parent>`) also contain the merge
+/// target or anything a `deny_refs` entry protects? Returns what it exposes.
+fn carve_out_conflict(
+    cfg: &SandboxGitConfig,
+    carve: &str,
+    target_branch: Option<&str>,
+) -> Option<String> {
+    let dir = format!("{carve}/");
+    if let Some(target) = target_branch.map(str::trim).filter(|t| !t.is_empty()) {
+        let target = target_ref(target);
+        if target.starts_with(&dir) {
+            return Some(format!("the merge target {target}"));
+        }
+    }
+    cfg.deny_refs.iter().find_map(|p| {
+        let conflict = if let Some(s) = p.strip_suffix("/**") {
+            s == carve || s.starts_with(&dir) || carve.starts_with(&format!("{s}/"))
+        } else if let Some(s) = p.strip_suffix("/*") {
+            s == carve || s.starts_with(&dir)
+        } else {
+            p.starts_with(&dir)
+        };
+        conflict.then(|| format!("sandbox.git.deny_refs entry {p:?}"))
+    })
+}
+
+/// Plan the git common-dir binds for `cfg.mode`.
 ///
 /// - `read-only`: the common dir read-only and `worktree_ro` set.
 /// - `commit-only`: the common dir read-only, then read-write `objects/`,
@@ -199,25 +232,53 @@ fn branch_parent(branch: &str) -> Result<&str, String> {
 ///   that later updates a lane ref must not dereference symrefs;
 /// - the object store is shared and writable, so ref protection is not
 ///   content integrity for objects the host later reads;
-/// - deleting a branch whose ref is packed fails (`packed-refs` is read-only).
+/// - deleting a branch whose ref is packed fails (`packed-refs` is read-only);
+/// - `admin_dir/HEAD` is writable, so the sandbox can make it a symref to
+///   `refs/heads/main`; host code that later commits, merges or fast-forwards
+///   in that worktree must verify `HEAD` is the lane branch first;
+/// - the rw index plus the rw worktree let the sandbox plant a gitlink plus
+///   `<sub>/.git` pointing at its own git dir; host `git status` recurses into
+///   populated submodules and would run that dir's `core.fsmonitor`, so host
+///   git in a sandboxed worktree must run with `--ignore-submodules` and
+///   `-c core.fsmonitor=false` (or equivalent);
+/// - the object store is rw, so existing object files (including main's
+///   blobs) can be rewritten in place.
+///
+/// Every mode re-pins `<worktree>/.git` read-only first in `ro_after`: a
+/// writable gitfile could be pointed at a planted git dir whose `config` runs
+/// `core.fsmonitor`/`core.hooksPath` on the next host `git -C <worktree>`.
 ///
 /// A top-level branch (no `/`) is refused: its loose ref lives directly in
 /// `refs/heads/`, so the carve-out would expose every top-level branch. The
 /// caller warns and keeps today's read-write common dir.
+///
+/// The writable `refs/heads/<parent>/` carve-out is also refused when it would
+/// contain the merge target or a `deny_refs` entry. For that error the caller
+/// must fall back to read-only git, not read-write.
 pub fn plan_git_mounts(
-    mode: SandboxGitMode,
+    cfg: &SandboxGitConfig,
     common_dir: &Path,
     admin_dir: &Path,
+    worktree: &Path,
     branch: &str,
+    target_branch: Option<&str>,
 ) -> Result<GitMountPlan, String> {
-    if mode == SandboxGitMode::ReadOnly {
+    let gitfile = worktree.join(".git");
+    if cfg.mode == SandboxGitMode::ReadOnly {
         return Ok(GitMountPlan {
             ro: vec![common_dir.to_path_buf()],
+            ro_after: vec![gitfile],
             worktree_ro: true,
             ..GitMountPlan::default()
         });
     }
     let parent = branch_parent(branch)?;
+    let carve = format!("refs/heads/{parent}");
+    if let Some(what) = carve_out_conflict(cfg, &carve, target_branch) {
+        return Err(format!(
+            "commit-only cannot confine {branch}: the writable {carve}/ would also expose {what}"
+        ));
+    }
     let heads = common_dir.join("refs/heads").join(parent);
     let logs = common_dir.join("logs/refs/heads").join(parent);
     Ok(GitMountPlan {
@@ -228,13 +289,16 @@ pub fn plan_git_mounts(
             heads.clone(),
             logs.clone(),
         ],
-        ro_after: ["commondir", "gitdir", "config.worktree"]
-            .iter()
-            .map(|name| admin_dir.join(name))
+        ro_after: std::iter::once(gitfile)
+            .chain(
+                ["commondir", "gitdir", "config.worktree"]
+                    .iter()
+                    .map(|name| admin_dir.join(name)),
+            )
             .collect(),
         mkdirs: vec![heads, logs],
         worktree_ro: false,
-        credential_wanted: mode == SandboxGitMode::Full,
+        credential_wanted: cfg.mode == SandboxGitMode::Full,
     })
 }
 
@@ -249,10 +313,15 @@ pub fn validate(cfg: &SandboxGitConfig) -> Vec<String> {
                 cfg.credential
             ));
         }
-        out.push(
-            "sandbox.git.credential modes are not implemented yet; the sandbox gets no git credential"
-                .to_string(),
-        );
+        if !matches!(
+            cfg.credential,
+            GitCredential::RepoToken | GitCredential::UserToken
+        ) {
+            out.push(
+                "sandbox.git.credential modes are not implemented yet; the sandbox gets no git credential"
+                    .to_string(),
+            );
+        }
     }
     for (key, list) in [("push_refs", &cfg.push_refs), ("deny_refs", &cfg.deny_refs)] {
         out.extend(
@@ -338,7 +407,13 @@ mod tests {
         assert!(err.contains("deny_refs"), "{err}");
         assert!(check_pull_ref(&cfg, "refs/tags/v1", None).is_err());
         // Malformed refs.
-        for bad in ["", "heads/x", "refs/heads/../main"] {
+        for bad in [
+            "",
+            "heads/x",
+            "refs/heads/../main",
+            "refs/heads//main",
+            "refs/heads/tg/a.lock",
+        ] {
             assert!(check_pull_ref(&cfg, bad, None).is_err(), "{bad:?}");
         }
     }
@@ -370,14 +445,30 @@ mod tests {
         (common, admin)
     }
 
+    fn mode_cfg(mode: SandboxGitMode) -> SandboxGitConfig {
+        SandboxGitConfig {
+            mode,
+            ..SandboxGitConfig::default()
+        }
+    }
+
+    fn plan_for(
+        cfg: &SandboxGitConfig,
+        branch: &str,
+        target: Option<&str>,
+    ) -> Result<GitMountPlan, String> {
+        let (common, admin) = fixture();
+        plan_git_mounts(cfg, &common, &admin, Path::new("/wt"), branch, target)
+    }
+
     #[test]
     fn read_only_plan() {
-        let (common, admin) = fixture();
+        let (common, _) = fixture();
         let plan =
-            plan_git_mounts(SandboxGitMode::ReadOnly, &common, &admin, "main").expect("plan");
+            plan_for(&mode_cfg(SandboxGitMode::ReadOnly), "main", Some("main")).expect("plan");
         assert_eq!(plan.ro, [common]);
         assert!(plan.rw.is_empty());
-        assert!(plan.ro_after.is_empty());
+        assert_eq!(plan.ro_after, [PathBuf::from("/wt/.git")]);
         assert!(plan.mkdirs.is_empty());
         assert!(plan.worktree_ro);
         assert!(!plan.credential_wanted);
@@ -391,7 +482,7 @@ mod tests {
             SandboxGitMode::PushLane,
             SandboxGitMode::Full,
         ] {
-            let plan = plan_git_mounts(mode, &common, &admin, "tg/lane").expect("plan");
+            let plan = plan_for(&mode_cfg(mode), "tg/lane", Some("main")).expect("plan");
             // The common dir is bound read-only first; carve-outs come after.
             assert_eq!(plan.ro, [common.clone()], "{mode}");
             assert_eq!(
@@ -411,6 +502,7 @@ mod tests {
             assert_eq!(
                 plan.ro_after,
                 [
+                    PathBuf::from("/wt/.git"),
                     admin.join("commondir"),
                     admin.join("gitdir"),
                     admin.join("config.worktree"),
@@ -439,12 +531,10 @@ mod tests {
 
     #[test]
     fn nested_and_qualified_branches_use_their_parent_dir() {
-        let (common, admin) = fixture();
-        let plan = plan_git_mounts(
-            SandboxGitMode::CommitOnly,
-            &common,
-            &admin,
+        let plan = plan_for(
+            &mode_cfg(SandboxGitMode::CommitOnly),
             "refs/heads/tg/b139/lane",
+            Some("main"),
         )
         .expect("plan");
         assert_eq!(
@@ -455,18 +545,36 @@ mod tests {
 
     #[test]
     fn top_level_and_malformed_branches_are_refused() {
-        let (common, admin) = fixture();
-        let err = plan_git_mounts(SandboxGitMode::CommitOnly, &common, &admin, "main").unwrap_err();
+        let err =
+            plan_for(&mode_cfg(SandboxGitMode::CommitOnly), "main", Some("main")).unwrap_err();
         assert_eq!(
             err,
             "commit-only needs a namespaced lane branch (e.g. tg/<name>); main would expose every top-level branch"
         );
         for bad in ["", "tg//x", "tg/../main", "tg/*", "/tg/x", "tg/x/"] {
             assert!(
-                plan_git_mounts(SandboxGitMode::PushLane, &common, &admin, bad).is_err(),
+                plan_for(&mode_cfg(SandboxGitMode::PushLane), bad, Some("main")).is_err(),
                 "{bad:?}"
             );
         }
+    }
+
+    #[test]
+    fn carve_out_refuses_merge_target_and_deny_refs() {
+        let cfg = SandboxGitConfig::default();
+        assert!(plan_for(&cfg, "tg/lane", Some("main")).is_ok());
+        let err = plan_for(&cfg, "tg/lane", Some("tg/b139-integration")).unwrap_err();
+        assert!(err.contains("merge target"), "{err}");
+        let deny = |refs: &[&str]| SandboxGitConfig {
+            deny_refs: refs.iter().map(|r| (*r).to_string()).collect(),
+            ..SandboxGitConfig::default()
+        };
+        for refused in ["refs/heads/tg/release", "refs/heads/**", "refs/heads/tg/*"] {
+            let err = plan_for(&deny(&[refused]), "tg/lane", Some("main")).unwrap_err();
+            assert!(err.contains("deny_refs"), "{refused}: {err}");
+        }
+        // One level below refs/heads never reaches refs/heads/tg/x.
+        assert!(plan_for(&deny(&["refs/heads/*"]), "tg/lane", Some("main")).is_ok());
     }
 
     #[test]
@@ -489,6 +597,79 @@ mod tests {
         assert_eq!(warns.len(), 3, "{warns:?}");
         assert!(warns[1].starts_with("sandbox.git.push_refs:"));
         assert!(warns[2].starts_with("sandbox.git.deny_refs:"));
+        assert!(
+            validate(&SandboxGitConfig {
+                mode: SandboxGitMode::Full,
+                credential: GitCredential::RepoToken,
+                ..SandboxGitConfig::default()
+            })
+            .is_empty()
+        );
+    }
+
+    #[test]
+    fn git_token_withheld_unless_full_with_token_credential() {
+        let default = SandboxGitConfig::default();
+        assert!(!default.admits_git_token());
+        assert!(!default.admits_env("GH_TOKEN") && !default.admits_env("GITHUB_TOKEN"));
+        assert!(default.admits_env("ANTHROPIC_API_KEY") && default.admits_env("TERM"));
+        // A token credential outside `full`, or `full` without one, still withholds.
+        for (mode, credential) in [
+            (SandboxGitMode::PushLane, GitCredential::RepoToken),
+            (SandboxGitMode::Full, GitCredential::None),
+            (SandboxGitMode::Full, GitCredential::DeployKey),
+            (SandboxGitMode::Full, GitCredential::GithubApp),
+        ] {
+            let cfg = SandboxGitConfig {
+                mode,
+                credential,
+                ..SandboxGitConfig::default()
+            };
+            assert!(!cfg.admits_env("GH_TOKEN"), "{mode} {credential}");
+        }
+        for credential in [GitCredential::RepoToken, GitCredential::UserToken] {
+            let cfg = SandboxGitConfig {
+                mode: SandboxGitMode::Full,
+                credential,
+                ..SandboxGitConfig::default()
+            };
+            assert!(cfg.admits_git_token(), "{credential}");
+            assert!(cfg.admits_env("GH_TOKEN") && cfg.admits_env("GITHUB_TOKEN"));
+        }
+    }
+
+    #[test]
+    fn passthrough_env_drops_github_token_by_default() {
+        let _env = crate::testenv::EnvGuard::set(&[
+            ("GH_TOKEN", "gh-secret"),
+            ("GITHUB_TOKEN", "github-secret"),
+            ("ANTHROPIC_API_KEY", "agent-key"),
+        ]);
+        let firewall = crate::profile::CredentialFirewall::inactive();
+        let keys = |sb: &SandboxConfig| -> Vec<String> {
+            sb.passthrough_env_for(&firewall)
+                .into_iter()
+                .map(|(k, _)| k)
+                .collect()
+        };
+        // Default `[sandbox.git] credential = "none"`: no GitHub token, even
+        // though the default env_passthrough lists both names.
+        let default = SandboxConfig::default();
+        assert!(default.env_passthrough.iter().any(|k| k == "GH_TOKEN"));
+        let got = keys(&default);
+        assert!(
+            !got.iter().any(|k| k == "GH_TOKEN" || k == "GITHUB_TOKEN"),
+            "{got:?}"
+        );
+        assert!(got.iter().any(|k| k == "ANTHROPIC_API_KEY"), "{got:?}");
+        // `full` + `repo-token` re-enables them.
+        let mut granted = SandboxConfig::default();
+        granted.git.mode = SandboxGitMode::Full;
+        granted.git.credential = GitCredential::RepoToken;
+        let got = keys(&granted);
+        assert!(got.iter().any(|k| k == "GH_TOKEN"), "{got:?}");
+        assert!(got.iter().any(|k| k == "GITHUB_TOKEN"), "{got:?}");
+        assert!(got.iter().any(|k| k == "ANTHROPIC_API_KEY"), "{got:?}");
     }
 
     #[test]
