@@ -166,34 +166,25 @@ pub(super) fn paint_view(
                 (&scratch.steal, graph_rect.rows.saturating_sub(1)),
             ] {
                 if !values.is_empty() && graph_rect.rows >= 2 {
-                    scratch.aux_grid.resize(3, 1);
-                    scratch.aux_grid.clear();
                     let name = if offset == graph_rect.rows.saturating_sub(2) {
                         "io"
                     } else {
                         "st"
                     };
-                    scratch.aux_grid.view(Rect::full(3, 1)).put_str(
-                        0,
-                        0,
+                    let pct = values
+                        .iter()
+                        .rev()
+                        .find(|v| v.is_finite())
+                        .map_or(0.0, |v| f64::from(*v) * 100.0);
+                    crate::monitor::graphs::paint_minicore_row(
                         name,
-                        CellStyle::default(),
-                    );
-                    scratch.emitter.emit(
-                        &scratch.aux_grid,
-                        Rect::full(3, 1),
-                        surface,
-                        graph_rect.x,
-                        graph_rect.y + offset,
-                    );
-                    crate::monitor::graphs::paint_sparkline(
                         values,
-                        graph_rect.cols.saturating_sub(4),
+                        pct,
                         RampId::Util,
                         Rect {
-                            x: graph_rect.x + 4,
+                            x: graph_rect.x,
                             y: graph_rect.y + offset,
-                            cols: graph_rect.cols.saturating_sub(4),
+                            cols: graph_rect.cols,
                             rows: 1,
                         },
                         surface,
@@ -955,7 +946,17 @@ pub(super) fn paint_freq(grid: &mut CellGrid, rect: Rect, part: &CpuFreqPart, he
     let mut profile_line = format!("profile {profile}");
     let (perf, eff) = part.core_class_counts();
     if perf > 0 && eff > 0 {
-        write!(profile_line, " hybrid {perf}P/{eff}E").expect("write to String");
+        let class_mhz = |class| {
+            part.class_mean_cur_mhz(class)
+                .map_or_else(|| mark(missing).to_owned(), |mhz| format!("{mhz}MHz"))
+        };
+        write!(
+            profile_line,
+            " hybrid {perf}P {} / {eff}E {}",
+            class_mhz(CoreClass::Performance),
+            class_mhz(CoreClass::Efficiency)
+        )
+        .expect("write to String");
     }
     if part.power.itmt == Some(true) {
         profile_line.push_str(" itmt");

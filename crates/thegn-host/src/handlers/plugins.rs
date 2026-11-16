@@ -781,6 +781,7 @@ fn flush_alerts_with(state: &mut PluginsState, submit: impl FnOnce(Vec<(String, 
     }
     let live: std::collections::BTreeSet<&str> = state.plugins.keys().map(String::as_str).collect();
     state.counters.retain(|plugin| live.contains(plugin));
+    crate::plugin_stats::retain_sched(|plugin| live.contains(plugin));
     let in_flight = state
         .dispatcher
         .as_ref()
@@ -795,9 +796,8 @@ fn flush_alerts_with(state: &mut PluginsState, submit: impl FnOnce(Vec<(String, 
                 .map(|bridge| (id.clone(), bridge.stats()))
         })
         .collect();
-    crate::plugin_stats::publish(crate::plugin_stats::merge_bridge(
-        state.counters.rows(&in_flight),
-        &bridge,
+    crate::plugin_stats::publish(crate::plugin_stats::merge_sched(
+        crate::plugin_stats::merge_bridge(state.counters.rows(&in_flight), &bridge),
     ));
     let alerts = std::mem::take(&mut state.pending_alerts);
     state.pending_alert_bytes = 0;
@@ -2805,6 +2805,34 @@ mod tests {
             !crate::plugin_stats::snapshot()
                 .iter()
                 .any(|row| row.plugin == "cnt-c")
+        );
+        crate::plugin_stats::publish(Vec::new());
+    }
+
+    #[test]
+    fn plugin_counters_flush_publishes_and_prunes_scheduler_counts() {
+        let _guard = crate::plugin_stats::TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut state = state_with(vec![seg_spec("cnt-sched")]);
+        crate::plugin_stats::record_sched("cnt-sched", 3, 2);
+
+        flush_alerts_with(&mut state, |_| {});
+        assert!(
+            crate::plugin_stats::snapshot()
+                .iter()
+                .any(|row| row.plugin == "cnt-sched"
+                    && row.sched_skipped == 3
+                    && row.sched_overloaded == 2)
+        );
+
+        state.plugins.remove("cnt-sched");
+        flush_alerts_with(&mut state, |_| {});
+        assert_eq!(crate::plugin_stats::sched_counts("cnt-sched"), None);
+        assert!(
+            !crate::plugin_stats::snapshot()
+                .iter()
+                .any(|row| row.plugin == "cnt-sched")
         );
         crate::plugin_stats::publish(Vec::new());
     }

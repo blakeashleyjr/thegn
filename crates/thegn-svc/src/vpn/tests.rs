@@ -1147,6 +1147,7 @@ fn hand_run(end: End, leader: Leader) -> Run {
         group: GroupState::Terminated,
         leader,
         leader_exited_first: true,
+        idle_expired: false,
         stdout: captured(b"", false),
         stderr: captured(b"", false),
         containment: thegn_proc::Containment::ProcessGroup,
@@ -1278,4 +1279,174 @@ fn filter_only_dns_suppresses_magicdns() {
     // ...and TS_ACCEPT_DNS is off so the overlay doesn't override the filter.
     let plan = for_provider(&s).sidecar_plan("c-tgvpn").unwrap();
     assert_eq!(env_val(&plan.env, "TS_ACCEPT_DNS"), Some("false"));
+}
+
+// ── pending share teardown (THE-330) ─────────────────────────────────────────
+
+fn pending_fixture_worktree() -> tempfile::TempDir {
+    tempfile::tempdir().unwrap()
+}
+
+#[test]
+fn sidecar_record_without_pending_teardown_parses_empty() {
+    let _state = thegn_core::testenv::IsolatedState::new();
+    let dir = sidecar_record_dir().unwrap();
+    dir.write_owner_only_atomic(
+        &sidecar_record_name("c-tgvpn"),
+        br#"{"version":1,"container":"c-tgvpn","prefix":["podman"],"id":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","worktree":"/w","generation":3,"placement":"local"}"#,
+    )
+    .unwrap();
+
+    assert_eq!(pending_teardowns("c-tgvpn").unwrap(), Vec::<u16>::new());
+    let parsed = read_sidecar_record("c-tgvpn").unwrap();
+    let encoded = String::from_utf8(serde_json::to_vec(&parsed).unwrap()).unwrap();
+    assert!(!encoded.contains("pending_teardown"), "{encoded}");
+}
+
+#[test]
+fn pending_teardown_mark_then_clear_round_trips_and_keeps_generation() {
+    let _state = thegn_core::testenv::IsolatedState::new();
+    let worktree = pending_fixture_worktree();
+    write_sidecar_record_for_test("c-tgvpn", worktree.path(), &"a".repeat(64), 7, Vec::new())
+        .unwrap();
+
+    mark_teardown_pending("c-tgvpn", worktree.path(), 8443).unwrap();
+    mark_teardown_pending("c-tgvpn", worktree.path(), 443).unwrap();
+    assert_eq!(pending_teardowns("c-tgvpn").unwrap(), vec![443, 8443]);
+    assert_eq!(read_sidecar_record("c-tgvpn").unwrap().generation, Some(7));
+
+    clear_teardown_pending("c-tgvpn", worktree.path(), 8443).unwrap();
+    assert_eq!(pending_teardowns("c-tgvpn").unwrap(), vec![443]);
+    clear_teardown_pending("c-tgvpn", worktree.path(), 9999).unwrap();
+    assert_eq!(pending_teardowns("c-tgvpn").unwrap(), vec![443]);
+    clear_teardown_pending("c-tgvpn", worktree.path(), 443).unwrap();
+    assert_eq!(pending_teardowns("c-tgvpn").unwrap(), Vec::<u16>::new());
+    assert_eq!(read_sidecar_record("c-tgvpn").unwrap().generation, Some(7));
+    assert!(recorded_sidecar_for_worktree("c-tgvpn", worktree.path(), Some(7)).is_ok());
+}
+
+#[test]
+fn pending_teardown_duplicate_mark_is_idempotent() {
+    let _state = thegn_core::testenv::IsolatedState::new();
+    let worktree = pending_fixture_worktree();
+    write_sidecar_record_for_test("c-tgvpn", worktree.path(), &"a".repeat(64), 1, Vec::new())
+        .unwrap();
+
+    mark_teardown_pending("c-tgvpn", worktree.path(), 3000).unwrap();
+    mark_teardown_pending("c-tgvpn", worktree.path(), 3000).unwrap();
+    assert_eq!(pending_teardowns("c-tgvpn").unwrap(), vec![3000]);
+}
+
+#[test]
+fn pending_teardown_mark_past_the_cap_errors() {
+    let _state = thegn_core::testenv::IsolatedState::new();
+    let worktree = pending_fixture_worktree();
+    let full: Vec<u16> = (1..=MAX_PENDING_TEARDOWN as u16).collect();
+    write_sidecar_record_for_test("c-tgvpn", worktree.path(), &"a".repeat(64), 1, full.clone())
+        .unwrap();
+
+    // An already-pending port is still accepted at the cap (no growth).
+    mark_teardown_pending("c-tgvpn", worktree.path(), 1).unwrap();
+    let error = mark_teardown_pending("c-tgvpn", worktree.path(), 65535)
+        .expect_err("a 17th pending port must be refused");
+    assert!(
+        error.to_string().contains("16 pending share teardowns"),
+        "{error:#}"
+    );
+    assert_eq!(pending_teardowns("c-tgvpn").unwrap(), full);
+}
+
+#[test]
+fn pending_teardown_malformed_lists_are_refused() {
+    let _state = thegn_core::testenv::IsolatedState::new();
+    let dir = sidecar_record_dir().unwrap();
+    let over_cap: Vec<String> = (1..=17).map(|port: u16| port.to_string()).collect();
+    let over_cap = format!("[{}]", over_cap.join(","));
+    for list in ["[443,80]", "[80,80]", over_cap.as_str()] {
+        let json = format!(
+            r#"{{"version":1,"container":"c-tgvpn","prefix":["podman"],"id":"{}","worktree":"/w","generation":1,"placement":"local","pending_teardown":{list}}}"#,
+            "a".repeat(64)
+        );
+        dir.write_owner_only_atomic(&sidecar_record_name("c-tgvpn"), json.as_bytes())
+            .unwrap();
+        let error = recorded_sidecar("c-tgvpn").expect_err(list);
+        assert!(error.to_string().contains("malformed"), "{list}: {error:#}");
+        assert!(pending_teardowns("c-tgvpn").is_err(), "{list}");
+    }
+}
+
+#[test]
+fn pending_teardown_refuses_a_record_bound_to_another_worktree() {
+    let _state = thegn_core::testenv::IsolatedState::new();
+    let owner = pending_fixture_worktree();
+    let other = pending_fixture_worktree();
+    write_sidecar_record_for_test("c-tgvpn", owner.path(), &"a".repeat(64), 1, vec![443]).unwrap();
+
+    let mark = mark_teardown_pending("c-tgvpn", other.path(), 3000).expect_err("mark");
+    assert!(mark.downcast_ref::<SidecarWorktreeMismatch>().is_some());
+    let clear = clear_teardown_pending("c-tgvpn", other.path(), 443).expect_err("clear");
+    assert!(clear.downcast_ref::<SidecarWorktreeMismatch>().is_some());
+    assert_eq!(pending_teardowns("c-tgvpn").unwrap(), vec![443]);
+}
+
+#[test]
+fn pending_teardown_carries_forward_only_for_the_same_container_id() {
+    let previous = SidecarRecord {
+        version: 1,
+        container: "c-tgvpn".into(),
+        prefix: vec![String::from("podman")],
+        id: "a".repeat(64),
+        worktree: Some("/w".into()),
+        generation: Some(4),
+        placement: Some("local".into()),
+        pending_teardown: vec![443, 8443],
+    };
+    assert_eq!(
+        carried_pending_teardown(Some(&previous), &"a".repeat(64)),
+        vec![443, 8443]
+    );
+    assert_eq!(
+        carried_pending_teardown(Some(&previous), &"b".repeat(64)),
+        Vec::<u16>::new()
+    );
+    assert_eq!(
+        carried_pending_teardown(None, &"a".repeat(64)),
+        Vec::<u16>::new()
+    );
+}
+
+#[test]
+fn pending_teardown_cap_fits_the_record_size_limit() {
+    let record = SidecarRecord {
+        version: 1,
+        container: "c".repeat(200),
+        prefix: vec![String::from("podman")],
+        id: "a".repeat(64),
+        worktree: Some("/w".repeat(512)),
+        generation: Some(u64::MAX),
+        placement: Some("local".into()),
+        pending_teardown: (65535 - MAX_PENDING_TEARDOWN as u16 + 1..=65535).collect(),
+    };
+    assert!(serde_json::to_vec(&record).unwrap().len() < SIDECAR_RECORD_MAX_BYTES);
+}
+
+#[test]
+fn pending_teardown_updates_under_the_record_lock_keep_both_ports() {
+    let _state = thegn_core::testenv::IsolatedState::new();
+    let worktree = pending_fixture_worktree();
+    write_sidecar_record_for_test("c-tgvpn", worktree.path(), &"a".repeat(64), 4, Vec::new())
+        .unwrap();
+
+    mark_teardown_pending("c-tgvpn", worktree.path(), 443).unwrap();
+    mark_teardown_pending("c-tgvpn", worktree.path(), 8443).unwrap();
+    clear_teardown_pending("c-tgvpn", worktree.path(), 9999).unwrap();
+    assert_eq!(pending_teardowns("c-tgvpn").unwrap(), vec![443, 8443]);
+    assert_eq!(read_sidecar_record("c-tgvpn").unwrap().generation, Some(4));
+
+    let dir = sidecar_record_dir().unwrap();
+    assert!(dir.path().join("c-tgvpn.lock").is_file());
+    assert!(dir.path().join("c-tgvpn.json").is_file());
+    // Every update released the lock on return.
+    let held = lock_sidecar_record(&dir, "c-tgvpn").unwrap();
+    drop(held);
 }

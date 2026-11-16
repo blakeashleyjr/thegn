@@ -4,12 +4,14 @@
 //! parked driver. Everything here runs ON the loop and is I/O-free.
 
 use std::collections::{HashMap, VecDeque};
+use std::time::Instant;
 
 use thegn_core::host::HostFailure;
 use thegn_core::store::HostStore;
 
 use crate::agent::ProvisionStepView;
 use crate::host_flow::{HostUiEvent, failure_reason, resolve_consent};
+use crate::ingress_budget::{HOST_UI_SOURCE, IterationBudget, take_batch};
 use crate::menu::{self, MenuChoice, MenuOverlay};
 
 /// The loop's live view of one host (UI-facing; the DB row is the durable one).
@@ -31,6 +33,9 @@ pub(crate) struct HostDrainOutcome {
     /// A host just reached Ready: clear failed-materialize marks so blocked
     /// tabs re-probe on the next turn.
     pub any_ready: bool,
+    /// The per-drain cap left events queued: the loop re-arms its one shared
+    /// wake so the rest are applied next turn (lossless, never dropped).
+    pub more: bool,
 }
 
 pub(crate) struct HostRuntime {
@@ -49,11 +54,23 @@ impl HostRuntime {
         }
     }
 
-    /// Drain all pending events. `overlay_open` gates whether a queued consent
-    /// modal may be handed to the loop this turn.
-    pub(crate) fn drain(&mut self, overlay_open: bool) -> HostDrainOutcome {
+    /// Drain one budgeted batch of pending events ([`HOST_UI_SOURCE`]: at most
+    /// 32, in order, under the iteration's shared deadline). Every event is
+    /// still delivered: leftovers are reported via [`HostDrainOutcome::more`]
+    /// and applied on the next turn. `overlay_open` gates whether a queued
+    /// consent modal may be handed to the loop this turn; the hand-off runs on
+    /// every call, so a parked consent is raised on a later turn.
+    pub(crate) fn drain(
+        &mut self,
+        overlay_open: bool,
+        budget: &mut IterationBudget,
+        rotation: &mut usize,
+    ) -> HostDrainOutcome {
         let mut out = HostDrainOutcome::default();
-        while let Ok(ev) = self.rx.try_recv() {
+        let (batch, more) =
+            take_batch(&mut self.rx, HOST_UI_SOURCE, budget, rotation, Instant::now);
+        out.more = more;
+        for ev in batch {
             out.dirty = true;
             match ev {
                 HostUiEvent::Progress { host, steps } => {
@@ -89,6 +106,31 @@ impl HostRuntime {
             out.dirty = true;
         }
         out
+    }
+
+    /// Test convenience: drain everything queued (one budgeted batch at a time,
+    /// consent held until the last pass), merging the outcomes.
+    #[cfg(test)]
+    pub(crate) fn drain_all(&mut self, overlay_open: bool) -> HostDrainOutcome {
+        let mut rotation = 0;
+        let mut merged = HostDrainOutcome::default();
+        loop {
+            let mut budget =
+                IterationBudget::new(Instant::now(), std::time::Duration::from_secs(60), false);
+            let out = self.drain(true, &mut budget, &mut rotation);
+            merged.dirty |= out.dirty;
+            merged.any_ready |= out.any_ready;
+            if !out.more {
+                break;
+            }
+        }
+        let mut budget =
+            IterationBudget::new(Instant::now(), std::time::Duration::from_secs(60), false);
+        let last = self.drain(overlay_open, &mut budget, &mut rotation);
+        merged.dirty |= last.dirty;
+        merged.any_ready |= last.any_ready;
+        merged.consent = last.consent;
+        merged
     }
 
     /// One-line status for a host (panel rows / sidebar note) — merged onto
@@ -495,7 +537,7 @@ mod tests {
                 }),
             },
         ]);
-        let out = rt.drain(false);
+        let out = rt.drain_all(false);
         assert!(out.dirty);
         assert!(out.any_ready);
         assert!(rt.state["host:a"].ready);
@@ -511,14 +553,14 @@ mod tests {
             host: "host:a".into(),
             runtime: "podman".into(),
         }]);
-        let out = rt.drain(true);
+        let out = rt.drain_all(true);
         assert!(out.consent.is_none(), "held while an overlay is up");
-        let out = rt.drain(false);
+        let out = rt.drain_all(false);
         let (menu, host) = out.consent.expect("released when clear");
         assert_eq!(host, "host:a");
         assert!(menu.title.contains("podman"));
         // Drained queue: no duplicate modal next turn.
-        assert!(rt.drain(false).consent.is_none());
+        assert!(rt.drain_all(false).consent.is_none());
     }
 
     #[test]
@@ -583,7 +625,7 @@ mod tests {
                 },
             ],
         }]);
-        rt.drain(false);
+        rt.drain_all(false);
         assert_eq!(
             rt.status_line("host:a").as_deref(),
             Some("transfer image — 412 MiB / 1.9 GiB")
@@ -657,5 +699,64 @@ mod tests {
                 .unwrap()
                 .is_empty()
         );
+    }
+
+    /// A budget wide enough that only the per-drain message cap can bind:
+    /// the drain reads the real clock, so a 4 ms deadline would make the
+    /// count assertions depend on machine load.
+    fn wide_budget() -> IterationBudget {
+        IterationBudget::new(Instant::now(), std::time::Duration::from_secs(60), false)
+    }
+
+    fn progress(host: &str) -> HostUiEvent {
+        HostUiEvent::Progress {
+            host: host.to_string(),
+            steps: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn host_ui_drain_caps_at_32_then_applies_the_rest() {
+        let cap = crate::ingress_budget::HOST_UI_SOURCE.limits.max_msgs;
+        assert_eq!(cap, 32);
+        let (mut rt, _tx) = runtime_with((0..33).map(|i| progress(&format!("host:{i}"))).collect());
+        let mut rotation = 0;
+        let out = rt.drain(false, &mut wide_budget(), &mut rotation);
+        assert!(out.dirty);
+        assert!(out.more, "33rd event left queued");
+        assert_eq!(rt.state.len(), 32);
+        assert!(!rt.state.contains_key("host:32"));
+        let out = rt.drain(false, &mut wide_budget(), &mut rotation);
+        assert!(out.dirty);
+        assert!(!out.more);
+        assert_eq!(rt.state.len(), 33);
+        for i in 0..33 {
+            assert!(rt.state[&format!("host:{i}")].provisioning, "host:{i}");
+        }
+    }
+
+    #[test]
+    fn host_ui_consent_behind_a_flood_is_raised_never_dropped() {
+        let mut events = (0..40)
+            .map(|i| progress(&format!("host:{i}")))
+            .collect::<Vec<HostUiEvent>>();
+        events.push(HostUiEvent::NeedsConsent {
+            host: "host:late".into(),
+            runtime: "podman".into(),
+        });
+        let (mut rt, _tx) = runtime_with(events);
+        let mut rotation = 0;
+        let out = rt.drain(false, &mut wide_budget(), &mut rotation);
+        assert!(out.more);
+        assert!(out.consent.is_none(), "consent not reached yet");
+        let out = rt.drain(false, &mut wide_budget(), &mut rotation);
+        assert!(!out.more);
+        let (menu, host) = out.consent.expect("consent raised once reached");
+        assert_eq!(host, "host:late");
+        assert!(menu.title.contains("podman"));
+        assert_eq!(rt.state.len(), 40);
+        let out = rt.drain(false, &mut wide_budget(), &mut rotation);
+        assert!(out.consent.is_none(), "raised exactly once");
+        assert!(!out.dirty);
     }
 }

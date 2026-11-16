@@ -206,6 +206,27 @@ pub struct OpenSpec {
     pub automation_origin: Option<AutomationOrigin>,
 }
 
+/// Largest PTY row count the daemon accepts: an upper bound on any PTY
+/// geometry the daemon accepts; the emulator allocates rows x cols cells.
+pub const MAX_PTY_ROWS: u16 = 1000;
+
+/// Largest PTY column count the daemon accepts: an upper bound on any PTY
+/// geometry the daemon accepts; the emulator allocates rows x cols cells.
+pub const MAX_PTY_COLS: u16 = 1000;
+
+/// Refuse a PTY geometry over [`MAX_PTY_ROWS`] x [`MAX_PTY_COLS`].
+///
+/// Only the upper end is bounded: zero keeps its existing meaning (`open`
+/// raises it to 1; `attach` treats it as "no size").
+pub fn check_pty_size(rows: u16, cols: u16) -> Result<(), ControlError> {
+    if rows > MAX_PTY_ROWS || cols > MAX_PTY_COLS {
+        return Err(ControlError::InvalidArgument(format!(
+            "terminal size {cols}x{rows} exceeds the {MAX_PTY_COLS}x{MAX_PTY_ROWS} limit"
+        )));
+    }
+    Ok(())
+}
+
 /// Launch a configured agent in a worktree.
 ///
 /// The point of this type is that a supervisor should say *what it wants*, not
@@ -1560,5 +1581,30 @@ mod editor_open_request_tests {
         );
         assert_eq!(target.line(), Some(12));
         assert_eq!(target.col(), Some(4));
+    }
+}
+
+#[cfg(test)]
+mod pty_size_tests {
+    use super::{ControlError, MAX_PTY_COLS, MAX_PTY_ROWS, check_pty_size};
+
+    #[test]
+    fn the_bound_itself_is_accepted() {
+        assert!(check_pty_size(MAX_PTY_ROWS, MAX_PTY_COLS).is_ok());
+        assert!(check_pty_size(1000, 1000).is_ok());
+        assert!(check_pty_size(0, 0).is_ok());
+    }
+
+    #[test]
+    fn over_the_bound_is_invalid_argument_naming_the_limit() {
+        for (rows, cols) in [(1001, 80), (24, 1001), (65535, 65535)] {
+            match check_pty_size(rows, cols) {
+                Err(ControlError::InvalidArgument(msg)) => {
+                    assert!(msg.contains("1000x1000 limit"), "{msg}");
+                    assert!(msg.contains(&format!("{cols}x{rows}")), "{msg}");
+                }
+                other => panic!("({rows}, {cols}) gave {other:?}"),
+            }
+        }
     }
 }

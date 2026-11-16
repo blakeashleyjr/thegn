@@ -97,16 +97,8 @@ const OMITTED: &[(&str, &str)] = &[
         "priority string has no pinned destination enum here",
     ),
     (
-        "notifications.sound.mode",
-        "sound mode enum is not exposed yet",
-    ),
-    (
         "notifications.sound.min_priority",
         "sound priority string has no pinned destination enum here",
-    ),
-    (
-        "notifications.sound.always_kinds",
-        "sound kind list is not exposed yet",
     ),
     (
         "notifications.sound.pack",
@@ -161,10 +153,6 @@ const OMITTED: &[(&str, &str)] = &[
     ("autopilot", "autopilot policy is not exposed"),
     ("pipeline", "pipeline definitions are not exposed"),
     ("skills", "skill configuration is not exposed"),
-    (
-        "media.backend",
-        "media backend enum needs destination pinning and is not exposed",
-    ),
     ("media.mpv", "mpv backend table is not exposed"),
     ("media.mpd", "mpd backend table is not exposed"),
     ("voice", "voice input is not exposed"),
@@ -931,6 +919,7 @@ fn hm_network_media_enum_options_offer_only_canonical_spellings() {
     let expected = [
         ("networkMode", "network.mode"),
         ("mediaDefaultAction", "media.default_action"),
+        ("notificationsSoundMode", "notifications.sound.mode"),
     ];
     let enums = enum_lists(&module_src());
     for (option, path) in expected {
@@ -952,6 +941,41 @@ fn hm_network_media_enum_options_offer_only_canonical_spellings() {
             "Home Manager enum option `{option}` must expose exactly canonical values for `{path}`"
         );
     }
+}
+
+#[test]
+fn hm_media_backend_offers_only_implemented_spellings() {
+    let enums = enum_lists(&module_src());
+    let values = enums
+        .iter()
+        .find(|(name, _)| name == "mediaBackend")
+        .map(|(_, values)| values)
+        .unwrap_or_else(|| panic!("Home Manager enum option `mediaBackend` is missing"));
+    let actual: BTreeSet<&str> = values.iter().map(String::as_str).collect();
+    let schema = schema_field("media.backend");
+    let mut implemented: BTreeSet<&str> = schema["enum"]
+        .as_array()
+        .unwrap_or_else(|| panic!("destination `media.backend` has no enum"))
+        .iter()
+        .filter_map(Value::as_str)
+        .collect();
+    // Reserved spellings (spotify, jellyfin) parse but have no backend, so HM
+    // must not offer them.
+    if let Some(marker) = schema.get(thegn_core::config_validate::ENUM_MARKER) {
+        for reserved in marker["reserved"].as_array().into_iter().flatten() {
+            if let Some(spelling) = reserved.as_str() {
+                implemented.remove(spelling);
+            }
+        }
+    }
+    assert!(
+        !implemented.is_empty(),
+        "media.backend must retain implemented spellings"
+    );
+    assert_eq!(
+        actual, implemented,
+        "Home Manager mediaBackend must offer exactly the implemented spellings"
+    );
 }
 
 #[test]
@@ -1135,9 +1159,7 @@ fn hm_notifications_and_activity_families_are_rendered() {
         "notifications.rules",
         "notifications.dnd.windows",
         "notifications.dnd.allow_priority",
-        "notifications.sound.mode",
         "notifications.sound.min_priority",
-        "notifications.sound.always_kinds",
         "notifications.sound.pack",
         "notifications.sound.chime_file",
         "notifications.sound.command",
@@ -2092,6 +2114,8 @@ fn every_nix_enum_matches_its_destination_enum() {
         ("gitSubmodules", "git.submodules"),
         ("networkMode", "network.mode"),
         ("mediaDefaultAction", "media.default_action"),
+        ("mediaBackend", "media.backend"),
+        ("notificationsSoundMode", "notifications.sound.mode"),
     ];
     let enums = enum_lists(&module_src());
     let actual_names: BTreeSet<&str> = enums.iter().map(|(name, _)| name.as_str()).collect();

@@ -191,7 +191,7 @@ mod tests {
             tx.send(e).unwrap();
         }
         let mut rt = HostRuntime::new(rx);
-        rt.drain(false);
+        rt.drain_all(false);
         rt
     }
 

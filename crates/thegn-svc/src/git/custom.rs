@@ -325,6 +325,7 @@ mod tests {
             group: GroupState::Survivors,
             leader: Leader::Detached,
             leader_exited_first: false,
+            idle_expired: false,
             stdout: empty.clone(),
             stderr: empty.clone(),
             containment: thegn_proc::Containment::ProcessGroup,
@@ -339,6 +340,7 @@ mod tests {
             group: GroupState::Unknown,
             leader: Leader::NotSpawned,
             leader_exited_first: false,
+            idle_expired: false,
             stdout: empty.clone(),
             stderr: empty.clone(),
             containment: thegn_proc::Containment::ProcessGroup,
@@ -353,6 +355,7 @@ mod tests {
             group: GroupState::Terminated,
             leader: Leader::NotSpawned,
             leader_exited_first: false,
+            idle_expired: false,
             stdout: empty.clone(),
             stderr: empty.clone(),
             containment: thegn_proc::Containment::ProcessGroup,
@@ -379,6 +382,7 @@ mod tests {
             group: GroupState::Drained,
             leader: Leader::Reaped(status),
             leader_exited_first: true,
+            idle_expired: false,
             stdout: thegn_proc::Capture {
                 eof: false,
                 ..empty.clone()

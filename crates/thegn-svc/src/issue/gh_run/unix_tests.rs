@@ -16,6 +16,7 @@ fn proc_run(
         group,
         leader,
         leader_exited_first: true,
+        idle_expired: false,
         stdout,
         stderr,
         containment: thegn_proc::Containment::ProcessGroup,

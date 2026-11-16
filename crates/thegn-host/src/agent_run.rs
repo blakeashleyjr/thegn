@@ -1627,6 +1627,7 @@ pub(crate) mod bounded {
                     group,
                     leader,
                     leader_exited_first: false,
+                    idle_expired: false,
                     stdout: Capture::default(),
                     stderr: Capture::default(),
                     containment: Containment::ProcessGroup,
