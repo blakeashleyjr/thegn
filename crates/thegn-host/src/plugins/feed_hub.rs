@@ -1,4 +1,9 @@
 //! One shared owner for resident plugin subscriptions to the daemon event feed.
+//!
+//! Only daemon control-feed frames belong here. Host-originated events such as
+//! `thegn.worktree_scanned` are admitted straight to the plugin's writer
+//! (`handlers::plugins::emit_changed_scans`) and must not be routed through
+//! this hub.
 
 use std::any::Any;
 use std::collections::BTreeMap;

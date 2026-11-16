@@ -6,7 +6,6 @@
 //! while avoiding a daemon or polling thread.
 
 use std::collections::{HashMap, HashSet};
-use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -267,13 +266,12 @@ pub fn wrap_capped(argv: &[String], limits: &LimitsConfig, backend: CapBackend) 
 
 /// Live child registry for single-flight + real cancellation. Keyed by a logical
 /// slot (`"<worktree>:test"`, `"<worktree>:disc"`, or
-/// `"<worktree>:job:<name>"`); the value is `(generation, group handle)` — a
-/// pgid on unix, a kill-on-close Job Object on Windows.
-/// Starting a newer job in the same slot kills the older group so a superseded
-/// `cargo test` stops burning CPU immediately.
-fn registry() -> &'static Mutex<HashMap<String, (u64, crate::platform::GroupHandle)>> {
-    static R: OnceLock<Mutex<HashMap<String, (u64, crate::platform::GroupHandle)>>> =
-        OnceLock::new();
+/// `"<worktree>:job:<name>"`); the value is `(generation, cancel flag)`. The
+/// run's `thegn_proc` supervisor polls the flag and terminates its whole
+/// process group when it is set. Starting a newer job in the same slot sets the
+/// older run's flag so a superseded `cargo test` stops burning CPU promptly.
+fn registry() -> &'static Mutex<HashMap<String, (u64, Arc<AtomicBool>)>> {
+    static R: OnceLock<Mutex<HashMap<String, (u64, Arc<AtomicBool>)>>> = OnceLock::new();
     R.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
@@ -281,9 +279,9 @@ fn registry() -> &'static Mutex<HashMap<String, (u64, crate::platform::GroupHand
 /// supersedes an in-flight one). Public for the supersede path in `run.rs`.
 pub fn cancel_slot(slot: &str) {
     if let Ok(mut map) = registry().lock()
-        && let Some((_, group)) = map.remove(slot)
+        && let Some((_, cancel)) = map.remove(slot)
     {
-        group.terminate();
+        cancel.store(true, Ordering::Release);
     }
 }
 
@@ -320,12 +318,12 @@ pub(crate) use crate::panel::confirm::TwoPress as RestartArm;
 pub fn cancel_job(worktree: &Path, name: &str) {
     let slot = job_slot(worktree, name);
     if let Ok(map) = registry().lock()
-        && let Some((generation, group)) = map.get(&slot)
+        && let Some((generation, cancel)) = map.get(&slot)
     {
         if let Ok(mut stopped) = stopped_runs().lock() {
             stopped.insert((slot.clone(), *generation));
         }
-        group.terminate();
+        cancel.store(true, Ordering::Release);
     }
 }
 
@@ -338,7 +336,7 @@ fn stopped_runs() -> &'static Mutex<HashSet<(String, u64)>> {
 struct CapOutput {
     exit_code: Option<i32>,
     truncated: bool,
-    /// True iff the watchdog killed the process group at the deadline.
+    /// True iff the deadline ended the run (its process group was terminated).
     timed_out: bool,
     /// True iff this exact slot generation was cancelled by the user.
     stopped: bool,
@@ -356,8 +354,8 @@ fn isolated_cargo_target(worktree: &Path, limits: &LimitsConfig) -> Option<PathB
 
 /// Run `command` in `worktree` under a CPU/mem cap and a single-flight `slot`,
 /// capturing bounded combined stdout+stderr. Kills any older job in the slot
-/// first. A non-zero `timeout` arms a watchdog that kills the process group at
-/// the deadline (so a run wedged on a build lock can't hang the panel forever).
+/// first. A non-zero `timeout` terminates the process group at the deadline
+/// (so a run wedged on a build lock can't hang the panel forever).
 fn run_capped(
     command: &str,
     loc: &GitLoc,
@@ -426,12 +424,103 @@ fn task_command(loc: &GitLoc, inner: &[String], worktree: &Path, limits: &Limits
     )
 }
 
+/// Stand-in for "no timeout": `thegn_proc` needs a finite deadline, and a week
+/// is effectively none for a task, test or job run.
+const TASK_UNBOUNDED_TIMEOUT: Duration = Duration::from_secs(7 * 24 * 3600);
+
+/// Appended to a run's text when signalling its process group did not empty it.
+const GROUP_DID_NOT_EXIT: &str = "task process group did not exit";
+
+/// The supervised run's end without its `io::Error` payloads, so the outcome
+/// mapping stays a pure, comparable function.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum EndClass {
+    Exited,
+    TimedOut,
+    Cancelled,
+    OutputLimit,
+    Spawn(String),
+    Supervise(String),
+}
+
+impl EndClass {
+    fn of(end: &thegn_proc::End) -> Self {
+        match end {
+            thegn_proc::End::LeaderExited => Self::Exited,
+            thegn_proc::End::TimedOut => Self::TimedOut,
+            thegn_proc::End::Cancelled => Self::Cancelled,
+            thegn_proc::End::OutputLimit(_) => Self::OutputLimit,
+            thegn_proc::End::Spawn(error) => Self::Spawn(error.to_string()),
+            thegn_proc::End::Supervise(error) => Self::Supervise(error.to_string()),
+        }
+    }
+}
+
+/// What a supervised run's end means for the task record.
+#[derive(Debug, Default, PartialEq, Eq)]
+struct CapOutcome {
+    /// The deadline ended the run (the group was terminated).
+    timed_out: bool,
+    /// The whole record text when nothing ran.
+    spawn_error: Option<String>,
+    /// A line appended to the captured output.
+    note: Option<String>,
+}
+
+/// Map a run's end and group state to the task record. A cancelled run is
+/// reported through `finish_slot` (which knows whether the user stopped this
+/// generation); a group the leader left running (`GroupState::Detached`) is the
+/// intended outcome for a task that backgrounds a server, never an error.
+fn cap_outcome(end: &EndClass, group: thegn_proc::GroupState) -> CapOutcome {
+    let mut outcome = CapOutcome {
+        timed_out: matches!(end, EndClass::TimedOut),
+        ..CapOutcome::default()
+    };
+    match end {
+        EndClass::Spawn(error) => {
+            outcome.spawn_error = Some(format!("failed to spawn task: {error}"));
+        }
+        EndClass::Supervise(error) => {
+            outcome.note = Some(format!("lost track of the task process: {error}"));
+        }
+        EndClass::Exited | EndClass::TimedOut | EndClass::Cancelled | EndClass::OutputLimit => {}
+    }
+    // Survivors is only ever reported after the group was signalled (timeout,
+    // cancel or output limit): fail closed by saying so in the record.
+    if group == thegn_proc::GroupState::Survivors {
+        outcome.note = Some(GROUP_DID_NOT_EXIT.to_string());
+    }
+    outcome
+}
+
+/// The supervision limits for a task run. Backgrounded children (a dev server a
+/// task starts) keep running after the leader exits, as they always have; only
+/// the deadline or a cancel terminates the group. Their output is captured for
+/// `reader_grace` after the leader exits and discarded after that (the pipes
+/// stay drained, so a survivor that keeps logging is not killed by SIGPIPE),
+/// so the task completes instead of waiting on output it may never stop
+/// producing.
+fn task_proc_limits(timeout: Option<Duration>) -> thegn_proc::Limits {
+    thegn_proc::Limits {
+        stdout: thegn_proc::Stream::Consume,
+        stderr: thegn_proc::Stream::Consume,
+        leader_exit: thegn_proc::LeaderExit::Detach,
+        term_grace: Duration::from_secs(2),
+        kill_settle: Duration::from_secs(2),
+        reader_grace: Duration::from_millis(500),
+        ..thegn_proc::Limits::silent(
+            timeout
+                .filter(|deadline| !deadline.is_zero())
+                .unwrap_or(TASK_UNBOUNDED_TIMEOUT),
+        )
+    }
+}
+
 /// Like [`run_capped`] but runs a prebuilt argv directly (no shell), so callers
 /// passing user/pattern data — e.g. the ripgrep source scan — never have to
 /// shell-quote. `inner[0]` is the program; the cap wrapper is prepended.
-// off-loop: only reached via run_task/discover_tests, which the loop always
-// dispatches on spawn_blocking (spawn_test_run_task / spawn_test_discovery).
-#[expect(clippy::disallowed_methods)]
+// off-loop: only reached via run_task/discover_tests/run_job, which the loop
+// always dispatches on spawn_blocking (spawn_test_run_task / spawn_test_discovery).
 fn run_capped_argv(
     inner: &[String],
     loc: &GitLoc,
@@ -442,75 +531,19 @@ fn run_capped_argv(
     // Supersede any older job in this slot.
     cancel_slot(&run.slot);
     let keep_end = run.keep_end;
+    let live = run.live.is_some();
+    let with_tail = live || keep_end;
 
     let mut cmd = task_command(loc, inner, worktree, limits);
-
-    // Own group/job so cancellation reaps the whole tree, not just the runner.
-    let (mut child, group) = match crate::platform::spawn_grouped(&mut cmd) {
-        Ok(c) => c,
-        Err(e) => {
-            return CapOutput {
-                exit_code: None,
-                truncated: false,
-                timed_out: false,
-                stopped: false,
-                text: format!("failed to spawn task: {e}"),
-            };
-        }
-    };
+    let cancel = Arc::new(AtomicBool::new(false));
     if let Ok(mut map) = registry().lock() {
-        map.insert(run.slot.clone(), (run.generation, group.clone()));
+        map.insert(run.slot.clone(), (run.generation, Arc::clone(&cancel)));
     }
 
-    // Watchdog: kill the whole process group if the deadline passes before the
-    // child exits. `done` lets the main thread retire the watchdog promptly.
-    let done = Arc::new(AtomicBool::new(false));
-    let timed_out = Arc::new(AtomicBool::new(false));
-    let watchdog = run.timeout.filter(|d| !d.is_zero()).map(|deadline| {
-        let done = done.clone();
-        let timed_out = timed_out.clone();
-        let group = group.clone();
-        thegn_core::thread_name::spawn_named("thegn-task-wdog", move || {
-            crate::platform::qos::set_self(crate::platform::qos::Qos::Background);
-            let end = Instant::now() + deadline;
-            while Instant::now() < end {
-                if done.load(Ordering::Relaxed) {
-                    return;
-                }
-                std::thread::sleep(Duration::from_millis(100));
-            }
-            if !done.load(Ordering::Relaxed) {
-                timed_out.store(true, Ordering::Relaxed);
-                group.terminate();
-            }
-        })
-    });
-
-    // Read both streams concurrently to EOF: dropping either pipe at the
-    // capture limit would SIGPIPE a chatty child. Retained capture and live
-    // tail stay bounded even while every byte is drained.
-    let stdout = child.stdout.take();
-    let stderr = child.stderr.take();
+    // Retained capture and live tail stay bounded even while every byte is
+    // drained (dropping a pipe at the capture limit would SIGPIPE a chatty child).
     let state = Arc::new(Mutex::new(ReaderState::default()));
     let (signal_tx, signal_rx) = std::sync::mpsc::sync_channel::<()>(1);
-    let out_h = spawn_output_reader(
-        stdout,
-        state.clone(),
-        signal_tx.clone(),
-        run.live.is_some() || keep_end,
-        run.live.is_some(),
-        true,
-        "stdout",
-    );
-    let err_h = spawn_output_reader(
-        stderr,
-        state.clone(),
-        signal_tx,
-        run.live.is_some() || keep_end,
-        run.live.is_some(),
-        false,
-        "stderr",
-    );
     let forwarder = run.live.and_then(|sink| {
         let state = state.clone();
         let label = run.label.clone();
@@ -546,25 +579,54 @@ fn run_capped_argv(
                 }
             }
     });
-    let status = child.wait();
-    done.store(true, Ordering::Relaxed);
-    if let Some(w) = watchdog {
-        let _ = w.join(); // best-effort: thread join: a panicked helper loses its output, not the caller
-    }
-    let out_ok = out_h.join();
-    let err_ok = err_h.join();
+
+    // Own process group, reaped to a bounded end: the deadline and a cancel
+    // terminate the whole group; a leader that exits on its own leaves anything
+    // it backgrounded running.
+    let proc_limits = task_proc_limits(run.timeout);
+    let result = thegn_proc::run_consuming_streams(
+        &mut cmd,
+        &proc_limits,
+        &cancel,
+        &mut |which: thegn_proc::Which, bytes: &[u8]| {
+            if let Ok(mut state) = state.lock() {
+                state.push(bytes, with_tail, which == thegn_proc::Which::Stdout);
+            }
+            if live {
+                match signal_tx.try_send(()) {
+                    Ok(()) | Err(std::sync::mpsc::TrySendError::Full(())) => {}
+                    Err(std::sync::mpsc::TrySendError::Disconnected(())) => {}
+                }
+            }
+        },
+    );
+    // Closing the signal channel retires the forwarder.
+    drop(signal_tx);
     if let Some(forwarder) = forwarder
         && let Err(error) = forwarder.join()
     {
         tracing::debug!(target: "thegn::tasks", ?error, "job live forwarder panicked");
     }
-    if let Err(error) = out_ok {
-        tracing::debug!(target: "thegn::tasks", ?error, "stdout reader panicked");
+
+    let outcome = cap_outcome(&EndClass::of(&result.end), result.group);
+    if result.group == thegn_proc::GroupState::Detached {
+        tracing::debug!(target: "thegn::tasks", slot = %run.slot, "task left background processes running");
     }
-    if let Err(error) = err_ok {
-        tracing::debug!(target: "thegn::tasks", ?error, "stderr reader panicked");
+    if let thegn_proc::Leader::ReapFailed(error) = &result.leader {
+        tracing::debug!(target: "thegn::tasks", %error, "child wait failed");
     }
-    let (buf, truncated) = match state.lock() {
+    let stopped = finish_slot(&run.slot, run.generation);
+    if let Some(text) = outcome.spawn_error {
+        return CapOutput {
+            exit_code: None,
+            truncated: false,
+            timed_out: false,
+            stopped,
+            text,
+        };
+    }
+
+    let (mut buf, truncated) = match state.lock() {
         Ok(state) => {
             let mut capture = state.stdout_capture.clone();
             let remaining = MAX_CAPTURE_BYTES.saturating_sub(capture.len());
@@ -584,59 +646,17 @@ fn run_capped_argv(
             (Vec::new(), false)
         }
     };
-
-    let stopped = finish_slot(&run.slot, run.generation);
+    if let Some(note) = &outcome.note {
+        buf.extend_from_slice(format!("\n[{note}]\n").as_bytes());
+    }
 
     CapOutput {
-        exit_code: match status {
-            Ok(status) => status.code(),
-            Err(error) => {
-                tracing::debug!(target: "thegn::tasks", %error, "child wait failed");
-                None
-            }
-        },
+        exit_code: result.exit_status().and_then(|status| status.code()),
         truncated,
-        timed_out: timed_out.load(Ordering::Relaxed),
+        timed_out: outcome.timed_out,
         stopped,
         text: String::from_utf8_lossy(&buf).into_owned(),
     }
-}
-
-fn spawn_output_reader(
-    stream: Option<impl Read + Send + 'static>,
-    state: Arc<Mutex<ReaderState>>,
-    signal: std::sync::mpsc::SyncSender<()>,
-    with_tail: bool,
-    live: bool,
-    stdout: bool,
-    label: &'static str,
-) -> std::thread::JoinHandle<()> {
-    thegn_core::thread_name::spawn_named("thegn-task-pipe", move || {
-        crate::platform::qos::set_self(crate::platform::qos::Qos::Utility);
-        let Some(mut stream) = stream else { return };
-        let mut bytes = [0_u8; 8 * 1024];
-        loop {
-            match stream.read(&mut bytes) {
-                Ok(0) => break,
-                Ok(count) => {
-                    if let Ok(mut state) = state.lock() {
-                        state.push(&bytes[..count], with_tail, stdout);
-                    }
-                    if live {
-                        match signal.try_send(()) {
-                            Ok(()) | Err(std::sync::mpsc::TrySendError::Full(())) => {}
-                            Err(std::sync::mpsc::TrySendError::Disconnected(())) => {}
-                        }
-                    }
-                }
-                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
-                Err(error) => {
-                    tracing::debug!(target: "thegn::tasks", %error, stream = label, "job output read failed");
-                    break;
-                }
-            }
-        }
-    })
 }
 
 /// Consume this run's stop mark while holding the registry lock used to decide
@@ -664,7 +684,7 @@ fn finish_slot(slot: &str, generation: u64) -> bool {
 }
 
 /// Translate a `LimitsConfig` timeout knob (seconds, 0 = disabled) to a
-/// `Duration` the watchdog understands.
+/// `Duration` the run supervisor understands.
 fn secs_to_timeout(secs: u64) -> Option<Duration> {
     (secs > 0).then(|| Duration::from_secs(secs))
 }
@@ -2386,6 +2406,226 @@ mod tests {
         assert!(!out.timed_out, "this run was cancelled, not timed out");
     }
 
+    fn plain_cap_run(slot: String, generation: u64, timeout: Option<Duration>) -> CapRun {
+        CapRun {
+            slot,
+            generation,
+            timeout,
+            live: None,
+            keep_end: false,
+            label: (String::new(), String::new()),
+        }
+    }
+
+    /// A newer run in the same slot cancels the older one through its flag;
+    /// the older run's supervisor terminates the group and returns promptly.
+    #[test]
+    fn superseded_run_returns_within_five_seconds() {
+        let dir = private_temp_dir();
+        let wt = dir.path().to_path_buf();
+        let slot = format!("{}:supersede", wt.display());
+        let (wt_thread, slot_thread) = (wt.clone(), slot.clone());
+        let old = std::thread::spawn(move || {
+            let started = Instant::now();
+            let out = run_capped(
+                "sleep 30",
+                &GitLoc::Local(wt_thread.clone()),
+                &wt_thread,
+                &uncapped(),
+                plain_cap_run(slot_thread, 1, None),
+            );
+            (out, started.elapsed())
+        });
+        let mut waited = 0;
+        while registry().lock().unwrap().get(&slot).is_none() && waited < 500 {
+            std::thread::sleep(Duration::from_millis(20));
+            waited += 1;
+        }
+        assert!(
+            registry().lock().unwrap().contains_key(&slot),
+            "old run never registered"
+        );
+        let newer = run_capped(
+            "true",
+            &GitLoc::Local(wt.clone()),
+            &wt,
+            &uncapped(),
+            plain_cap_run(slot.clone(), 2, None),
+        );
+        let (old_out, old_elapsed) = old.join().unwrap();
+        assert_eq!(newer.exit_code, Some(0));
+        assert!(
+            old_elapsed < Duration::from_secs(5),
+            "superseded run took {old_elapsed:?}"
+        );
+        assert!(!old_out.timed_out);
+        assert!(!old_out.stopped, "a supersede is not a user stop");
+        assert_ne!(old_out.exit_code, Some(0));
+        assert!(!registry().lock().unwrap().contains_key(&slot));
+    }
+
+    /// A task that backgrounds a long-lived child (a dev server) completes as
+    /// soon as its shell exits; the child keeps running.
+    #[test]
+    fn task_background_child_survives_and_task_completes() {
+        let dir = private_temp_dir();
+        let wt = dir.path().to_path_buf();
+        let slot = format!("{}:background", wt.display());
+        let argv = vec![
+            "sh".to_string(),
+            "-c".to_string(),
+            "sleep 30 & echo \"started $$\"".to_string(),
+        ];
+        let started = Instant::now();
+        let out = run_capped_argv(
+            &argv,
+            &GitLoc::Local(wt.clone()),
+            &wt,
+            &uncapped(),
+            plain_cap_run(slot.clone(), 1, None),
+        );
+        let elapsed = started.elapsed();
+        let pgid: Option<i32> = out
+            .text
+            .lines()
+            .find_map(|line| line.trim().strip_prefix("started "))
+            .and_then(|pid| pid.parse().ok());
+        let survivor = pgid.is_some_and(|pgid| thegn_proc::group_has_live_members(pgid as u32));
+        if let Some(pgid) = pgid {
+            crate::platform::GroupHandle::from_pid(pgid).kill();
+        }
+        assert!(elapsed < Duration::from_secs(5), "task took {elapsed:?}");
+        assert_eq!(out.exit_code, Some(0), "{}", out.text);
+        assert!(out.text.contains("started"), "{}", out.text);
+        assert!(!out.timed_out);
+        assert!(!out.stopped);
+        assert!(pgid.is_some(), "no pgid in {:?}", out.text);
+        assert!(survivor, "the backgrounded child must keep running");
+        assert!(!registry().lock().unwrap().contains_key(&slot));
+    }
+
+    #[test]
+    fn cap_outcome_maps_each_end_and_group_state() {
+        use thegn_proc::GroupState;
+        let clean = CapOutcome::default();
+        assert_eq!(cap_outcome(&EndClass::Exited, GroupState::Drained), clean);
+        assert_eq!(
+            cap_outcome(&EndClass::Exited, GroupState::Detached),
+            clean,
+            "a detached background child is not an error"
+        );
+        assert_eq!(
+            cap_outcome(&EndClass::TimedOut, GroupState::Terminated),
+            CapOutcome {
+                timed_out: true,
+                ..CapOutcome::default()
+            }
+        );
+        assert_eq!(
+            cap_outcome(&EndClass::TimedOut, GroupState::Survivors),
+            CapOutcome {
+                timed_out: true,
+                note: Some(GROUP_DID_NOT_EXIT.to_string()),
+                ..CapOutcome::default()
+            }
+        );
+        assert_eq!(
+            cap_outcome(&EndClass::Cancelled, GroupState::Terminated),
+            clean
+        );
+        assert_eq!(
+            cap_outcome(&EndClass::Cancelled, GroupState::Survivors),
+            CapOutcome {
+                note: Some(GROUP_DID_NOT_EXIT.to_string()),
+                ..CapOutcome::default()
+            }
+        );
+        assert_eq!(
+            cap_outcome(&EndClass::OutputLimit, GroupState::Terminated),
+            clean
+        );
+        assert_eq!(
+            cap_outcome(&EndClass::Spawn("no such file".into()), GroupState::Unknown),
+            CapOutcome {
+                spawn_error: Some("failed to spawn task: no such file".to_string()),
+                ..CapOutcome::default()
+            }
+        );
+        assert_eq!(
+            cap_outcome(&EndClass::Supervise("ECHILD".into()), GroupState::Unknown),
+            CapOutcome {
+                note: Some("lost track of the task process: ECHILD".to_string()),
+                ..CapOutcome::default()
+            }
+        );
+    }
+
+    #[test]
+    fn end_class_strips_error_payloads() {
+        let error = || std::io::Error::new(std::io::ErrorKind::NotFound, "gone");
+        assert_eq!(
+            EndClass::of(&thegn_proc::End::LeaderExited),
+            EndClass::Exited
+        );
+        assert_eq!(EndClass::of(&thegn_proc::End::TimedOut), EndClass::TimedOut);
+        assert_eq!(
+            EndClass::of(&thegn_proc::End::Cancelled),
+            EndClass::Cancelled
+        );
+        assert_eq!(
+            EndClass::of(&thegn_proc::End::OutputLimit(thegn_proc::Which::Stderr)),
+            EndClass::OutputLimit
+        );
+        assert_eq!(
+            EndClass::of(&thegn_proc::End::Spawn(error())),
+            EndClass::Spawn("gone".to_string())
+        );
+        assert_eq!(
+            EndClass::of(&thegn_proc::End::Supervise(error())),
+            EndClass::Supervise("gone".to_string())
+        );
+    }
+
+    #[test]
+    fn task_proc_limits_detach_and_default_to_an_effectively_unbounded_deadline() {
+        let limits = task_proc_limits(None);
+        assert_eq!(limits.timeout, TASK_UNBOUNDED_TIMEOUT);
+        assert_eq!(limits.leader_exit, thegn_proc::LeaderExit::Detach);
+        assert_eq!(limits.stdout, thegn_proc::Stream::Consume);
+        assert_eq!(limits.stderr, thegn_proc::Stream::Consume);
+        assert_eq!(limits.reader_grace, Duration::from_millis(500));
+        assert_eq!(
+            task_proc_limits(Some(Duration::ZERO)).timeout,
+            TASK_UNBOUNDED_TIMEOUT
+        );
+        assert_eq!(
+            task_proc_limits(Some(Duration::from_secs(3))).timeout,
+            Duration::from_secs(3)
+        );
+    }
+
+    #[test]
+    fn reader_state_push_is_the_same_chunked_or_whole() {
+        let mut bytes = Vec::new();
+        for line in 0..30000 {
+            bytes.extend_from_slice(format!("line {line} é\n").as_bytes());
+        }
+        for (with_live, stdout) in [(true, true), (true, false), (false, true)] {
+            let mut whole = ReaderState::default();
+            whole.push(&bytes, with_live, stdout);
+            let mut chunked = ReaderState::default();
+            for chunk in bytes.chunks(777) {
+                chunked.push(chunk, with_live, stdout);
+            }
+            assert_eq!(chunked.produced, whole.produced);
+            assert_eq!(chunked.produced, bytes.len());
+            assert_eq!(chunked.stdout_capture, whole.stdout_capture);
+            assert_eq!(chunked.stderr_capture, whole.stderr_capture);
+            assert_eq!(chunked.tail(), whole.tail());
+            assert!(chunked.tail().ends_with("line 29999 é\n"));
+        }
+    }
+
     #[test]
     fn jobs_have_independent_slots_and_tests_never_kill_a_job() {
         let _dir = private_temp_dir();
@@ -2488,31 +2728,31 @@ mod tests {
         let wt = _dir.path().join("wt");
         let sibling = PathBuf::from(format!("{}c", wt.display()));
         let key = job_slot(&wt, "x");
-        registry().lock().unwrap().insert(
-            key.clone(),
-            (1, crate::platform::GroupHandle::from_pid(4242)),
-        );
+        registry()
+            .lock()
+            .unwrap()
+            .insert(key.clone(), (1, Arc::new(AtomicBool::new(false))));
         assert!(slot_active(&wt));
         registry().lock().unwrap().remove(&key);
         let sibling_key = job_slot(&sibling, "x");
-        registry().lock().unwrap().insert(
-            sibling_key.clone(),
-            (1, crate::platform::GroupHandle::from_pid(4242)),
-        );
+        registry()
+            .lock()
+            .unwrap()
+            .insert(sibling_key.clone(), (1, Arc::new(AtomicBool::new(false))));
         assert!(!slot_active(&wt));
         registry().lock().unwrap().remove(&sibling_key);
         let key = format!("{}:disc", wt.display());
-        registry().lock().unwrap().insert(
-            key.clone(),
-            (1, crate::platform::GroupHandle::from_pid(4242)),
-        );
+        registry()
+            .lock()
+            .unwrap()
+            .insert(key.clone(), (1, Arc::new(AtomicBool::new(false))));
         assert!(slot_active(&wt));
         registry().lock().unwrap().remove(&key);
         let key = test_slot(&wt);
-        registry().lock().unwrap().insert(
-            key.clone(),
-            (1, crate::platform::GroupHandle::from_pid(4242)),
-        );
+        registry()
+            .lock()
+            .unwrap()
+            .insert(key.clone(), (1, Arc::new(AtomicBool::new(false))));
         assert!(slot_active(&wt));
         assert!(!slot_active(&sibling));
         registry().lock().unwrap().remove(&key);
@@ -2563,7 +2803,7 @@ mod tests {
         );
     }
 
-    /// The watchdog kills a run that overruns its deadline and flags it as a
+    /// The supervisor kills a run that overruns its deadline and flags it as a
     /// timeout — the no-hang-forever guarantee.
     #[test]
     fn run_capped_timeout_kills_and_flags() {
@@ -3133,10 +3373,10 @@ mod tests {
     fn finishing_superseded_generation_clears_its_stop_mark_without_stopping_newer_run() {
         let dir = private_temp_dir();
         let slot = job_slot(dir.path(), "slow");
-        registry().lock().unwrap().insert(
-            slot.clone(),
-            (73, crate::platform::GroupHandle::from_pid(4242)),
-        );
+        registry()
+            .lock()
+            .unwrap()
+            .insert(slot.clone(), (73, Arc::new(AtomicBool::new(false))));
         stopped_runs().lock().unwrap().insert((slot.clone(), 72));
 
         assert!(!finish_slot(&slot, 72));
@@ -3942,10 +4182,10 @@ mod discovery_tests {
         let wt = temp_dir2("slot");
         assert!(!slot_active(&wt), "no slot registered yet");
         let slot = test_slot(&wt);
-        registry().lock().unwrap().insert(
-            slot.clone(),
-            (1, crate::platform::GroupHandle::from_pid(4242)),
-        );
+        registry()
+            .lock()
+            .unwrap()
+            .insert(slot.clone(), (1, Arc::new(AtomicBool::new(false))));
         assert!(slot_active(&wt), "active while a test slot is registered");
         registry().lock().unwrap().remove(&slot);
         assert!(!slot_active(&wt), "inactive after the slot clears");

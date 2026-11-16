@@ -55,11 +55,15 @@ enqueues a worktree's branch on the merge queue (`worktree` optional,
 defaulting to the server's resolved worktree; needs `--scopes git`), and `notify_push` pushes a tray notification
 (`title`, plus optional `body`, `urgency` and `source`; needs `--scopes
 write`). Clearing the merge queue stays off MCP.
-Two reversible write tools need `--scopes write`, the same scope HTTP and
+Three reversible write tools need `--scopes write`, the same scope HTTP and
 plugin `host.call` require, with no extra flag: `sessions_resize` resizes a
 live session's PTY (`session`, `rows`, `cols`; sizes over 1000x1000 are refused, as on every other surface), and `worktrees_open` focuses a
 workspace in the running instance (`repo`, optional `branch`), like `thegn
-open`. It never creates a worktree on disk.
+open`. It never creates a worktree on disk. `sessions_split` (also `write`,
+no extra flag) creates a sibling pane next to a session (`session`, optional
+`dir` of `right` or `down`, `argv`, `cwd`, `env`, `rows`, `cols`); it sends
+no input to the target. `sessions_snapshot` returns a session's current
+screen and needs only `--scopes read`.
 A worktree's sandbox profile pin is readable with `worktrees.sandbox_profile`
 (`api call`, HTTP, or MCP `worktrees_sandbox_profile`); changing it with
 `worktrees.sandbox_profile_set` (`profile`, or `clear: true`) needs admin scope

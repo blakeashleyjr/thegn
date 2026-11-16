@@ -12503,6 +12503,15 @@ async fn event_loop<T: Terminal>(
                 dirty = true;
                 continue;
             }
+            // THE-2003: tell row-field plugins which worktrees' glyphs changed.
+            // Rides this Model wake; no timer, thread or deadline.
+            if crate::handlers::plugins::has_scan_subscriber(&plugins_state) {
+                crate::handlers::plugins::emit_changed_scans(
+                    &mut plugins_state,
+                    &model,
+                    &next_model,
+                );
+            }
             // A review snapshot may be fetched after the Changes modal opens.
             // Deliver the accepted model's compatible snapshot directly to
             // that view; its worktree diff must remain intact while only the
@@ -14525,12 +14534,17 @@ async fn event_loop<T: Terminal>(
         // Plugin runtime messages: apply verbs to the per-plugin runtimes and
         // map the aggregate plugin damage to the narrowest compositor channel.
         // Raised alerts are recorded to the inbox off-loop by `flush_alerts`.
-        let plugin_damage = crate::handlers::plugins::drain(
+        let mut plugin_damage = crate::handlers::plugins::drain(
             &mut plugin_rx,
             &mut plugins_state,
             &mut model,
             plugins_host.as_ref(),
         );
+        // API 0.6 `ttl_secs`: drop due row values. Their one-shot deadline is
+        // folded into the single poll site below, so the expiry wakes here.
+        if plugins_state.expire_rows(std::time::Instant::now()) {
+            plugin_damage.merge(crate::plugin_damage::PluginDamage::SidebarContent);
+        }
         match plugin_damage {
             crate::plugin_damage::PluginDamage::None => {}
             crate::plugin_damage::PluginDamage::StatusbarContent => {
@@ -17201,7 +17215,7 @@ async fn event_loop<T: Terminal>(
         );
         let timeout = crate::idle_poll::fold_deadline(
             timeout,
-            plugins_state.next_app_deadline(),
+            plugins_state.next_loop_deadline(),
             std::time::Instant::now(),
         );
         let polled = match pending_input.pop_front() {

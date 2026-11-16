@@ -307,6 +307,21 @@ pub fn validate_diagnostics_with_policy(
                 message,
             }
         }));
+        diagnostics.extend(list_value_warnings(&cfg).into_iter().map(|message| {
+            ValidationDiagnostic {
+                severity: ValidationSeverity::Warning,
+                message,
+            }
+        }));
+        diagnostics.extend(
+            enum_value_warnings(&cfg)
+                .into_iter()
+                .chain(alert_order_warnings(&cfg))
+                .map(|message| ValidationDiagnostic {
+                    severity: ValidationSeverity::Warning,
+                    message,
+                }),
+        );
         if cfg.voice.kind == crate::config::VoiceKind::Http
             && let Err(message) = cfg.voice.validate_credential_transport()
         {
@@ -647,6 +662,85 @@ fn sidebar_detail_warnings(cfg: &Config) -> Vec<String> {
         if !badge.contains("{n}") {
             warnings.push(format!(
                 "{key}: badge template must contain {{n}}; the default will be used"
+            ));
+        }
+    }
+    warnings
+}
+
+/// List entries the loader silently skips: DND windows and usage provider ids.
+/// Warnings only (never errors); values are echoed with `{:?}` so control
+/// characters in user text are escaped.
+fn list_value_warnings(cfg: &Config) -> Vec<String> {
+    let mut warnings = Vec::new();
+    for (i, value) in cfg.notifications.dnd.windows.iter().enumerate() {
+        if crate::notification_route::parse_window(value).is_none() {
+            warnings.push(format!(
+                "notifications.dnd.windows[{i}] = {value:?} is not a window (\"HH:MM-HH:MM\" with optional weekdays); it is ignored"
+            ));
+        }
+    }
+    for (i, id) in cfg.usage.providers.iter().enumerate() {
+        if id != "antigravity" && crate::account::provider(id).is_none() {
+            warnings.push(format!(
+                "usage.providers[{i}] = {id:?} is not a known usage provider; it is ignored"
+            ));
+        }
+    }
+    warnings
+}
+
+/// Notification string settings whose unknown values silently fall back to a
+/// default. Warnings only; values are echoed with `{:?}`.
+fn enum_value_warnings(cfg: &Config) -> Vec<String> {
+    let mut warnings = Vec::new();
+    let exit = &cfg.notifications.process_exit;
+    if crate::event_bus::ProcessExitPolicy::parse_known(exit).is_none() {
+        warnings.push(format!(
+            "notifications.process_exit = {exit:?} is not one of off, failures, failures_and_tasks, all; the default is used"
+        ));
+    }
+    let urgency = &cfg.notifications.desktop_min_urgency;
+    if crate::event_bus::NotificationUrgency::parse_known(urgency).is_none() {
+        warnings.push(format!(
+            "notifications.desktop_min_urgency = {urgency:?} is not one of low, normal, critical; the default is used"
+        ));
+    }
+    warnings
+}
+
+/// Alert rules whose warn level can never fire before critical. Both levels
+/// must be enabled (> 0); equal values warn. Warnings only.
+fn alert_order_warnings(cfg: &Config) -> Vec<String> {
+    let a = &cfg.stats.alerts;
+    let above = [
+        ("cpu", &a.cpu),
+        ("mem", &a.mem),
+        ("swap", &a.swap),
+        ("gpu", &a.gpu),
+        ("temp", &a.temp),
+        ("load", &a.load),
+        ("reclaim", &a.reclaim),
+    ];
+    let below = [
+        ("disk_free", &a.disk_free),
+        ("battery", &a.battery),
+        ("disk_eta", &a.disk_eta),
+    ];
+    let mut warnings = Vec::new();
+    for (name, rule) in above {
+        if rule.warn > 0.0 && rule.critical > 0.0 && rule.warn >= rule.critical {
+            warnings.push(format!(
+                "stats.alerts.{name}: warn {} is not below critical {}; the warn level never fires first",
+                rule.warn, rule.critical
+            ));
+        }
+    }
+    for (name, rule) in below {
+        if rule.warn > 0.0 && rule.critical > 0.0 && rule.warn <= rule.critical {
+            warnings.push(format!(
+                "stats.alerts.{name}: warn {} is not above critical {}; the warn level never fires first",
+                rule.warn, rule.critical
             ));
         }
     }
@@ -1941,6 +2035,117 @@ template = "image:registry.example/dev:1"
     #[should_panic(expected = "unknown float key")]
     fn float_config_rejects_an_unpinned_key() {
         float_config("media.unknown", 0.0);
+    }
+
+    fn list_config(toml_src: &str) -> Config {
+        toml::from_str::<Config>(toml_src).expect("list config parses")
+    }
+
+    #[test]
+    fn enum_value_warnings_flag_unknown_urgency_and_exit_policy() {
+        assert!(enum_value_warnings(&Config::default()).is_empty());
+        let mut cfg = Config::default();
+        cfg.notifications.process_exit = "ALL".into();
+        cfg.notifications.desktop_min_urgency = "CRITICAL".into();
+        assert!(enum_value_warnings(&cfg).is_empty());
+        cfg.notifications.process_exit = "sometimes".into();
+        cfg.notifications.desktop_min_urgency = "urgent".into();
+        let warnings = enum_value_warnings(&cfg);
+        assert_eq!(warnings.len(), 2);
+        assert!(warnings[0].contains("notifications.process_exit"));
+        assert!(warnings[1].contains("notifications.desktop_min_urgency"));
+    }
+
+    #[test]
+    fn alert_order_warnings_flag_inverted_pairs() {
+        assert!(alert_order_warnings(&Config::default()).is_empty());
+        let mut cfg = Config::default();
+        cfg.stats.alerts.cpu.warn = 90.0;
+        cfg.stats.alerts.cpu.critical = 80.0;
+        let warnings = alert_order_warnings(&cfg);
+        assert_eq!(warnings.len(), 1);
+        assert!(warnings[0].starts_with("stats.alerts.cpu:"));
+        let mut cfg = Config::default();
+        cfg.stats.alerts.battery.warn = 10.0;
+        cfg.stats.alerts.battery.critical = 20.0;
+        let warnings = alert_order_warnings(&cfg);
+        assert_eq!(warnings.len(), 1);
+        assert!(warnings[0].starts_with("stats.alerts.battery:"));
+        let mut cfg = Config::default();
+        cfg.stats.alerts.mem.warn = 70.0;
+        cfg.stats.alerts.mem.critical = 70.0;
+        assert_eq!(alert_order_warnings(&cfg).len(), 1);
+        let mut cfg = Config::default();
+        cfg.stats.alerts.cpu.warn = 0.0;
+        cfg.stats.alerts.cpu.critical = 80.0;
+        cfg.stats.alerts.battery.warn = 10.0;
+        cfg.stats.alerts.battery.critical = 0.0;
+        assert!(alert_order_warnings(&cfg).is_empty());
+    }
+
+    #[test]
+    fn enum_and_alert_warnings_are_ignorable_diagnostics() {
+        let body = "[notifications]\nprocess_exit = \"sometimes\"\n[stats.alerts.cpu]\nwarn = 90.0\ncritical = 80.0\n";
+        let diagnostics = validate_diagnostics(body);
+        let warnings: Vec<_> = diagnostics
+            .iter()
+            .filter(|d| d.severity == ValidationSeverity::Warning)
+            .collect();
+        assert!(warnings.iter().any(|d| d.message.contains("process_exit")));
+        assert!(
+            warnings
+                .iter()
+                .any(|d| d.message.contains("stats.alerts.cpu"))
+        );
+        assert!(
+            diagnostics
+                .iter()
+                .all(|d| d.severity != ValidationSeverity::Error)
+        );
+    }
+
+    #[test]
+    fn list_value_warnings_flag_bad_dnd_windows_and_unknown_providers() {
+        assert!(list_value_warnings(&Config::default()).is_empty());
+        let good = list_config(
+            "[notifications.dnd]\nwindows = [\"22:00-07:00\", \"mon-fri 09:00-17:00\", \"sat,sun 00:00-08:00\"]\n\
+             [usage]\nproviders = [\"codex\", \"claude\", \"antigravity\"]\n",
+        );
+        assert!(list_value_warnings(&good).is_empty());
+        let empty = list_config("[notifications.dnd]\nwindows = []\n[usage]\nproviders = []\n");
+        assert!(list_value_warnings(&empty).is_empty());
+        for bad in ["25:00-01:00", "nonsense", ""] {
+            let cfg = list_config(&format!(
+                "[notifications.dnd]\nwindows = [\"22:00-07:00\", {bad:?}]\n"
+            ));
+            let warnings = list_value_warnings(&cfg);
+            assert_eq!(warnings.len(), 1, "{bad:?}: {warnings:?}");
+            assert!(
+                warnings[0].contains("notifications.dnd.windows[1]"),
+                "{warnings:?}"
+            );
+        }
+        let cfg = list_config("[usage]\nproviders = [\"codex\", \"frobnicate\"]\n");
+        let warnings = list_value_warnings(&cfg);
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
+        assert!(warnings[0].contains("usage.providers[1]"), "{warnings:?}");
+        assert!(warnings[0].contains("frobnicate"), "{warnings:?}");
+    }
+
+    #[test]
+    fn bad_dnd_window_is_an_ignorable_warning_not_an_error() {
+        let diagnostics = validate_diagnostics("[notifications.dnd]\nwindows = [\"nonsense\"]\n");
+        let hit = diagnostics
+            .iter()
+            .find(|d| d.message.contains("notifications.dnd.windows[0]"))
+            .expect("bad window diagnostic");
+        assert_eq!(hit.severity, ValidationSeverity::Warning);
+        assert!(
+            diagnostics
+                .iter()
+                .all(|d| d.severity != ValidationSeverity::Error),
+            "{diagnostics:?}"
+        );
     }
 
     #[test]
