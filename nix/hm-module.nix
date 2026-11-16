@@ -345,6 +345,7 @@ self: {
     notifications.merge_queue_hold_desktop = cfg.notificationsMergeQueueHoldDesktop;
     notifications.dnd.enabled = cfg.notificationsDndEnabled;
     notifications.dnd.allow_priority = cfg.notificationsDndAllowPriority;
+    notifications.dnd.windows = cfg.notificationsDndWindows;
     notifications.sound.mode = cfg.notificationsSoundMode;
     notifications.sound.always_kinds = cfg.notificationsSoundAlwaysKinds;
     notifications.sound.mute = cfg.notificationsSoundMute;
@@ -421,6 +422,8 @@ self: {
     usage.poll_interval_secs = cfg.usagePollIntervalSecs;
     usage.warn_percent = cfg.usageWarnPercent;
     usage.crit_percent = cfg.usageCritPercent;
+    usage.providers = cfg.usageProviders;
+    usage.profile_roots = cfg.usageProfileRoots;
     lsp.enabled = cfg.lspEnabled;
     lsp.hover = cfg.lspHover;
     lsp.require_containment = cfg.lspRequireContainment;
@@ -1642,6 +1645,27 @@ in {
       type = lib.types.nullOr (lib.types.ints.between 1 16777216);
       default = null;
       description = "Maximum response bytes retained by one preview fetch. Unset (null) = the binary's default.";
+    };
+
+    notificationsDndWindows = lib.mkOption {
+      type = lib.types.nullOr (lib.types.listOf lib.types.str);
+      default = null;
+      example = lib.literalExpression ''[ "22:00-07:00" "sat,sun 00:00-08:00" ]'';
+      description = "Do-not-disturb windows: \"HH:MM-HH:MM\" with optional leading weekdays (\"mon-fri 09:00-17:00\", \"sat,sun 00:00-08:00\"). Invalid entries are ignored with a load warning. Unset (null) = the binary's default.";
+    };
+
+    usageProviders = lib.mkOption {
+      type = lib.types.nullOr (lib.types.listOf lib.types.str);
+      default = null;
+      example = lib.literalExpression ''[ "codex" "claude" "antigravity" ]'';
+      description = "Provider ids the usage tracker polls (codex, claude, antigravity). Unknown ids are ignored with a load warning. Unset (null) = the binary's default.";
+    };
+
+    usageProfileRoots = lib.mkOption {
+      type = lib.types.nullOr (lib.types.listOf lib.types.str);
+      default = null;
+      example = lib.literalExpression ''[ "/home/you/.claude-profiles" ]'';
+      description = "Directories scanned for extra AI-account profiles by the usage tracker. Unset (null) = the binary's default.";
     };
 
     usageEnabled = lib.mkOption {
