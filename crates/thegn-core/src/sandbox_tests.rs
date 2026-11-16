@@ -6294,6 +6294,7 @@ fn git_probe(fx: &GitFixture, branch: &str, target: Option<&str>) -> GitProbe {
         branch: Some(branch.to_string()),
         target: target.map(str::to_string),
         default: Some("main".to_string()),
+        identity: Default::default(),
     }
 }
 
@@ -6445,6 +6446,7 @@ fn git_policy_main_checkout_gets_a_read_only_git_dir() {
         branch: Some("main".into()),
         target: Some("main".into()),
         default: Some("main".into()),
+        identity: Default::default(),
     };
     let (mounts, warning) = git_policy_mounts(&git_cfg(SandboxGitMode::CommitOnly), &main, &probe);
     assert!(warning.expect("warns").contains("main checkout"));
@@ -6456,4 +6458,263 @@ fn git_policy_main_checkout_gets_a_read_only_git_dir() {
         "{mounts:?}"
     );
     assert!(mounts[1..].iter().all(|m| m.ro), "{mounts:?}");
+}
+
+#[test]
+fn bwrap_bind_dest_table() {
+    // A fake filesystem: `/home/u/link` -> `/home/u/real`, `/alias` -> `/srv`
+    // (an ancestor symlink), `/dangling` unresolvable.
+    let resolve = |p: &std::path::Path| -> Option<PathBuf> {
+        let s = p.to_string_lossy();
+        if s == "/dangling" {
+            return None;
+        }
+        for (alias, target) in [("/home/u/link", "/home/u/real"), ("/alias", "/srv")] {
+            if let Ok(rest) = p.strip_prefix(alias) {
+                return Some(std::path::Path::new(target).join(rest));
+            }
+        }
+        Some(p.to_path_buf())
+    };
+    let roots = [
+        PathBuf::from("/home/u"),
+        PathBuf::from("/srv"),
+        PathBuf::from("/alias"),
+    ];
+    let p = std::path::Path::new;
+    // Plain dir: unchanged.
+    assert_eq!(
+        bwrap_bind_dest(p("/home/u/plain"), &roots, &resolve),
+        DestFix::Keep
+    );
+    // Symlinked dest under a visible root: dropped, never followed.
+    assert_eq!(
+        bwrap_bind_dest(p("/home/u/link"), &roots, &resolve),
+        DestFix::Drop
+    );
+    // Symlinked ancestor below the root: dropped too.
+    assert_eq!(
+        bwrap_bind_dest(p("/home/u/link/dir/leaf"), &roots, &resolve),
+        DestFix::Drop
+    );
+    // The covering root is itself an alias (`/alias -> /srv`, like
+    // `/home -> /var/home`), nothing below it is a link: kept.
+    assert_eq!(
+        bwrap_bind_dest(p("/alias/dir/leaf"), &roots, &resolve),
+        DestFix::Keep
+    );
+    // Unresolvable: unchanged (the launch reports it as before).
+    assert_eq!(
+        bwrap_bind_dest(p("/dangling"), &roots, &resolve),
+        DestFix::Keep
+    );
+    // Not under any visible root: bwrap creates it, alias kept.
+    assert_eq!(
+        bwrap_bind_dest(p("/uncovered/link"), &roots, &|_: &std::path::Path| {
+            Some(PathBuf::from("/elsewhere"))
+        }),
+        DestFix::Keep
+    );
+}
+
+#[test]
+fn fix_bind_dests_keeps_uncovered_and_drops_covered() {
+    // A mount's own (aliased) destination is not a root for itself.
+    let mut s = spec(Backend::Bwrap);
+    s.mounts = vec![Mount {
+        host: "/src".into(),
+        dest: "/link".into(),
+        ro: false,
+        cache: false,
+    }];
+    let resolve = |p: &std::path::Path| -> Option<PathBuf> {
+        if p == std::path::Path::new("/link") {
+            Some(PathBuf::from("/link/../target"))
+        } else {
+            Some(p.to_path_buf())
+        }
+    };
+    fix_bind_dests(&mut s, &resolve);
+    assert_eq!(s.mounts.len(), 1);
+    assert_eq!(s.mounts[0].dest, "/link");
+
+    // Under the bwrap substrate and symlinked: dropped, read-only or not.
+    for ro in [true, false] {
+        let mut s = spec(Backend::Bwrap);
+        s.mounts = vec![Mount {
+            host: "/src".into(),
+            dest: "/etc/link".into(),
+            ro,
+            cache: false,
+        }];
+        let into_etc = |p: &std::path::Path| -> Option<PathBuf> {
+            if p == std::path::Path::new("/etc/link") {
+                Some(PathBuf::from("/etc/target"))
+            } else {
+                Some(p.to_path_buf())
+            }
+        };
+        fix_bind_dests(&mut s, &into_etc);
+        assert!(s.mounts.is_empty(), "{:?}", s.mounts);
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn symlinked_writable_dest_is_skipped_not_followed() {
+    use std::os::unix::fs::symlink;
+
+    let td = private_tempdir();
+    let base = td.path().canonicalize().unwrap();
+    let source = base.join("source");
+    let real = base.join("real");
+    std::fs::create_dir(&source).unwrap();
+    std::fs::create_dir(&real).unwrap();
+    let alias = base.join("alias");
+    symlink(&real, &alias).unwrap();
+    let base_s = base.to_string_lossy().into_owned();
+    let source_s = source.to_string_lossy().into_owned();
+    let real_s = real.to_string_lossy().into_owned();
+    let alias_s = alias.to_string_lossy().into_owned();
+    let mut s = spec(Backend::Bwrap);
+    s.mounts = vec![
+        Mount {
+            host: base_s.clone(),
+            dest: base_s.clone(),
+            ro: true,
+            cache: false,
+        },
+        Mount {
+            host: source_s.clone(),
+            dest: alias_s.clone(),
+            ro: false,
+            cache: false,
+        },
+    ];
+
+    let argv = enter_argv(&s, "true").expect("a symlinked destination is skipped, not refused");
+    assert!(!argv.contains(&alias_s), "{argv:?}");
+    assert!(!argv.contains(&real_s), "{argv:?}");
+    assert!(
+        !argv
+            .windows(2)
+            .any(|w| w[0] == "--bind" && w[1] == source_s),
+        "{argv:?}"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn aliased_home_keeps_worktree_bind_and_drops_link_below_it() {
+    // `$HOME` reached through a system symlink (`/home -> /var/home`): the
+    // read-only home mount and a writable worktree under it keep their path;
+    // a link planted BELOW the home still drops its bind.
+    use std::os::unix::fs::symlink;
+
+    let td = private_tempdir();
+    let base = td.path().canonicalize().unwrap();
+    std::fs::create_dir_all(base.join("real/home/wt")).unwrap();
+    std::fs::create_dir_all(base.join("secret")).unwrap();
+    symlink(base.join("real"), base.join("alias")).unwrap();
+    let home = base.join("alias/home");
+    symlink(base.join("secret"), home.join("tmp")).unwrap();
+    let home_s = home.to_string_lossy().into_owned();
+    let wt_s = home.join("wt").to_string_lossy().into_owned();
+    let tmp_s = home.join("tmp").to_string_lossy().into_owned();
+    let mut s = spec(Backend::Bwrap);
+    s.mounts = vec![
+        Mount {
+            host: home_s.clone(),
+            dest: home_s.clone(),
+            ro: true,
+            cache: false,
+        },
+        Mount {
+            host: wt_s.clone(),
+            dest: wt_s.clone(),
+            ro: false,
+            cache: false,
+        },
+        Mount {
+            host: base.join("real/home/wt").to_string_lossy().into_owned(),
+            dest: tmp_s.clone(),
+            ro: false,
+            cache: false,
+        },
+    ];
+
+    let argv = enter_argv(&s, "true").expect("aliased home launches");
+    assert!(argv.contains(&home_s), "{argv:?}");
+    assert!(
+        argv.windows(3).any(|w| w[0] == "--bind" && w[2] == wt_s),
+        "worktree under the aliased home stays writable: {argv:?}"
+    );
+    assert!(!argv.contains(&tmp_s), "{argv:?}");
+}
+
+#[cfg(unix)]
+#[test]
+fn oci_symlinked_dest_is_not_rewritten() {
+    use std::os::unix::fs::symlink;
+
+    let td = private_tempdir();
+    let base = td.path().canonicalize().unwrap();
+    let real = base.join("real");
+    std::fs::create_dir(&real).unwrap();
+    let alias = base.join("alias");
+    symlink(&real, &alias).unwrap();
+    let alias_s = alias.to_string_lossy().into_owned();
+    let mut s = spec(Backend::Docker);
+    s.mounts.push(Mount {
+        host: real.to_string_lossy().into_owned(),
+        dest: alias_s.clone(),
+        ro: false,
+        cache: false,
+    });
+    let planned = launchable(&s).unwrap();
+    assert!(planned.mounts.iter().any(|m| m.dest == alias_s));
+}
+
+#[test]
+fn local_bwrap_argv_carries_the_git_identity() {
+    // The value is unique, so it never equals the test process's own env (the
+    // bwrap emitter omits a pair the launcher already exports).
+    let id = crate::git_identity::GitIdentity {
+        name: Some("Thegn Identity Probe 7f3c".into()),
+        email: Some("probe-7f3c@example.invalid".into()),
+    };
+    let mut s = spec(Backend::Bwrap);
+    let extra = crate::git_identity::identity_env(&id, &s.env, &|_| None);
+    s.env.extend(extra);
+    let argv = enter_argv(&s, "true").unwrap();
+    for (k, v) in [
+        ("GIT_AUTHOR_NAME", "Thegn Identity Probe 7f3c"),
+        ("GIT_COMMITTER_NAME", "Thegn Identity Probe 7f3c"),
+        ("GIT_AUTHOR_EMAIL", "probe-7f3c@example.invalid"),
+        ("GIT_COMMITTER_EMAIL", "probe-7f3c@example.invalid"),
+    ] {
+        assert!(
+            argv.windows(3)
+                .any(|w| w[0] == "--setenv" && w[1] == k && w[2] == v),
+            "{k} missing from {argv:?}"
+        );
+    }
+}
+
+#[test]
+fn cached_git_identity_reuses_a_fresh_entry() {
+    let calls = std::sync::atomic::AtomicUsize::new(0);
+    let read = |args: &[&str]| -> Option<String> {
+        calls.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        match args {
+            ["config", "--get", "user.name"] => Some("Cache Probe".into()),
+            _ => None,
+        }
+    };
+    let root = std::path::Path::new("/thegn-test/identity-cache-repo");
+    let first = cached_git_identity(root, &read);
+    let second = cached_git_identity(root, &read);
+    assert_eq!(first.name.as_deref(), Some("Cache Probe"));
+    assert_eq!(first, second);
+    assert_eq!(calls.load(std::sync::atomic::Ordering::Relaxed), 2);
 }
