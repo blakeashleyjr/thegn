@@ -588,3 +588,64 @@ fn odd_index_history_run_keeps_its_braille_half_cell_alignment() {
         "a finite run after the odd-index gap shifted half a braille cell"
     );
 }
+
+fn paint_text(model: &ContainersModel, cols: usize, rows: usize) -> String {
+    let inventory = inventory();
+    let view = ContainersView::new(model, &inventory, None, 0);
+    let area = Rect::full(cols, rows);
+    let mut surface = Surface::new(cols, rows);
+    caps::test_override::with_unicode(UnicodeLevel::Full, || {
+        Board::default().paint(&view, &mut surface, area, 0, &[])
+    });
+    text(&surface)
+}
+
+fn two_container_model() -> ContainersModel {
+    let mut model = ContainersModel::default();
+    for tick in 0..30 {
+        model.absorb_frame(&frame(tick, &["alpha-ctr", "bravo-ctr"]));
+    }
+    model
+}
+
+#[test]
+fn scatter_rule_needs_two_containers_and_a_20x6_area() {
+    let big = Rect::full(40, 14);
+    assert_eq!(super::scatter_rows(1, big), 0);
+    assert_eq!(super::scatter_rows(2, big), 7);
+    assert_eq!(super::scatter_rows(2, Rect::full(19, 14)), 0);
+    assert_eq!(super::scatter_rows(2, Rect::full(40, 11)), 0);
+}
+
+#[test]
+fn scatter_legend_and_minicore_rows_appear_when_wide_and_are_omitted_when_narrow() {
+    let model = two_container_model();
+    let wide = paint_text(&model, 240, 80);
+    assert!(wide.contains("cpu → · mem ↑"), "scatter legend: {wide}");
+    assert_eq!(
+        wide.matches("alpha-ct").count() >= 2 && wide.matches("bravo-ct").count() >= 2,
+        true,
+        "minicore rows per container: {wide}"
+    );
+    let narrow = paint_text(&model, 60, 20);
+    assert!(
+        !narrow.contains("cpu → · mem ↑"),
+        "scatter omitted: {narrow}"
+    );
+}
+
+#[test]
+fn scatter_is_omitted_for_a_single_container() {
+    let mut model = ContainersModel::default();
+    for tick in 0..30 {
+        model.absorb_frame(&frame(tick, &["solo-ctr"]));
+    }
+    assert!(!paint_text(&model, 240, 80).contains("cpu → · mem ↑"));
+}
+
+#[test]
+fn containers_view_source_has_no_colour_literals() {
+    let src = include_str!("view.rs");
+    assert!(!src.contains("Color::"), "no raw colour tokens");
+    assert!(!src.contains("RgbColor"), "no raw colour tokens");
+}
