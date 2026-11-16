@@ -27,8 +27,8 @@ tree. `q` or `Esc` returns to the terminal.
 
 While the sidebar is hidden, the masthead shows a `◌ sidebar hidden` chip
 (`◌` alone on a narrow terminal, `.` under ASCII glyphs) after the brand, so a
-hidden sidebar is never invisible. Clicking it cycles the sidebar back, the same
-as `Ctrl-Alt-s`.
+hidden sidebar is never invisible. Clicking it cycles the sidebar back to the
+full tree, the same as `Ctrl-Alt-s`.
 
 ## Reading the tree
 
