@@ -1550,7 +1550,19 @@ fn apply_row_limits(rows: &mut Vec<SidebarRow>, view: &ViewState) {
                 }
             }
         }
-        let at = blocks.last().map_or(h + 1, |b| b.1);
+        // Right after the last entry the group still shows (so the toggle
+        // never drifts past following folders/sub-groups); when expanded,
+        // after the last entry.
+        let at = if open {
+            blocks.last().map_or(h + 1, |b| b.1)
+        } else {
+            blocks
+                .iter()
+                .zip(&hide)
+                .rev()
+                .find(|(_, h)| !**h)
+                .map_or(h + 1, |(b, _)| b.1)
+        };
         let slug = rows[h].workspace_slug.clone();
         rows.insert(
             at,
@@ -5725,8 +5737,9 @@ mod tests {
         assert!(more.tab_target.is_none());
         assert!(!more.is_pinnable() && !more.is_markable());
         assert!(!RowKind::ShowMore.is_collapsible());
-        // It closes the group: right after the folder's last entry.
-        assert_eq!(rows.last().map(|r| r.kind), Some(RowKind::ShowMore));
+        // It sits right after the last shown entry.
+        let at = rows.iter().position(|r| r.kind == RowKind::ShowMore);
+        assert_eq!(at.map(|i| rows[i - 1].label.as_str()), Some("wt14"));
         assert_eq!(
             crate::sidebar_view::show_more_text(more),
             format!("{} show 5 more", crate::caps::active_glyphs().ellipsis)
@@ -5816,6 +5829,33 @@ mod tests {
         apply_row_limits(&mut rows, &view);
         assert_eq!(shown_worktrees(&rows).len(), 20);
         assert!(show_more_rows(&rows).is_empty());
+    }
+
+    #[test]
+    fn row_limit_toggle_sits_before_following_folder() {
+        let mut rows = vec![SidebarRow {
+            pin_key: "app".into(),
+            ..SidebarRow::base(RowKind::Workspace, 0, "app", "app")
+        }];
+        for i in 0..20 {
+            rows.push(SidebarRow {
+                pin_key: format!("app/wt{i}"),
+                ..SidebarRow::base(RowKind::Worktree, 1, format!("wt{i}"), "app")
+            });
+        }
+        rows.push(SidebarRow {
+            pin_key: "app/folder:1".into(),
+            folder_id: Some(1),
+            ..SidebarRow::base(RowKind::Folder, 1, "wip", "app")
+        });
+        apply_row_limits(&mut rows, &limit_view(15));
+        let at = rows
+            .iter()
+            .position(|r| r.kind == RowKind::ShowMore)
+            .expect("show more row");
+        assert_eq!(rows[at - 1].label, "wt14");
+        let folder = rows.iter().position(|r| r.kind == RowKind::Folder);
+        assert!(folder > Some(at));
     }
 
     #[test]
