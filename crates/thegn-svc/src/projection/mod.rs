@@ -404,6 +404,7 @@ fn run_sshfs_mount(argv: &[String], mountpoint: &str) -> Result<()> {
     })
 }
 
+#[cfg(test)]
 fn run_mount_bounded(
     argv: &[String],
     timeout: std::time::Duration,
