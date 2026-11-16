@@ -1951,6 +1951,64 @@ fn runtime_escape_bwrap_masks_bus_podman_and_unsets_the_control_socket() {
 }
 
 #[test]
+fn runtime_escape_bwrap_unsets_the_control_socket_the_daemon_injects_later() {
+    let (_temp, runtime, sandbox) = runtime_escape_fixture();
+    let argv = backend_enter_argv_with_env(
+        &sandbox,
+        "true",
+        SandboxArgvEnv {
+            resolver_dir: None,
+            runtime_dir: Some(runtime.clone()),
+            control_dirs: vec![runtime.join("thegn")],
+            protected_dirs: Vec::new(),
+        },
+    )
+    .unwrap();
+    assert!(
+        argv.windows(2)
+            .any(|pair| pair == ["--unsetenv", "THEGN_CONTROL_SOCKET"]),
+        "the daemon-injected control socket is unset: {argv:?}"
+    );
+}
+
+#[test]
+fn runtime_escape_bwrap_sees_through_a_non_canonical_mount_source() {
+    let temp = tempfile::tempdir_in("/tmp").unwrap();
+    let runtime = temp.path().join("rt");
+    std::fs::create_dir_all(runtime.join("podman")).unwrap();
+    std::fs::create_dir_all(runtime.join("thegn/abc")).unwrap();
+    std::fs::write(runtime.join("bus"), b"").unwrap();
+    let mut sandbox = spec(Backend::Bwrap);
+    sandbox.mounts.push(Mount {
+        host: format!("{}/podman/..", runtime.display()),
+        dest: runtime.display().to_string(),
+        ro: false,
+        cache: false,
+    });
+    let argv = backend_enter_argv_with_env(
+        &sandbox,
+        "true",
+        SandboxArgvEnv {
+            runtime_dir: Some(runtime.clone()),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    let podman = format!("{}/podman", runtime.display());
+    let bus = format!("{}/bus", runtime.display());
+    assert!(
+        argv.windows(3)
+            .any(|triple| triple == ["--ro-bind", "/dev/null", bus.as_str()]),
+        "bus socket is masked through a `..` source: {argv:?}"
+    );
+    assert!(
+        argv.windows(2)
+            .any(|pair| pair == ["--tmpfs", podman.as_str()]),
+        "podman dir is masked through a `..` source: {argv:?}"
+    );
+}
+
+#[test]
 fn runtime_escape_bwrap_honours_an_explicit_podman_socket_mount() {
     let (_temp, runtime, mut sandbox) = runtime_escape_fixture();
     let socket = runtime.join("podman/podman.sock");
