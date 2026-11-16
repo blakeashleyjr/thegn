@@ -770,6 +770,74 @@ pub fn sparkline_width(vals: &[f32], w: usize, table: &RasterTable, buf: &mut Ce
     }
 }
 
+/// Plots `(x, y)` points over the already-sized `buf`, both axes in `[0, 1]`
+/// (out-of-range values clamp to the edge; non-finite points are skipped).
+/// `y = 1.0` is the top row. Braille tables place one dot per point on a 2x4
+/// dot grid per cell; other tables use half blocks (two rows per cell).
+/// Empty input leaves a blank buffer.
+pub fn scatter(points: &[(f32, f32)], table: &RasterTable, buf: &mut CellBuf) {
+    let (w, h) = (buf.w, buf.h);
+    buf.reset(w, h);
+    let blank = if table.braille {
+        table.blank
+    } else {
+        table.cell_blank
+    };
+    buf.cells.fill(RCell::blank(blank));
+    if w == 0 || h == 0 {
+        return;
+    }
+    for &(x, y) in points {
+        if !x.is_finite() || !y.is_finite() {
+            continue;
+        }
+        let (x, y) = (clamp01(x), clamp01(y));
+        if table.braille {
+            let dx = ((x * (w * 2 - 1) as f32).round() as usize).min(w * 2 - 1);
+            let dy = (((1.0 - y) * (h * 4 - 1) as f32).round() as usize).min(h * 4 - 1);
+            let (col, row) = (dx / 2, dy / 4);
+            let bit = BRDOTS[dx % 2][dy % 4];
+            let prev = buf
+                .get(col, row)
+                .and_then(|cell| u32::from(cell.ch).checked_sub(0x2800))
+                .filter(|bits| *bits <= 0xFF)
+                .unwrap_or(0) as u8;
+            let bits = prev | bit;
+            buf.put(
+                col,
+                row,
+                RCell {
+                    ch: char::from_u32(0x2800 + u32::from(bits)).unwrap_or(table.blank),
+                    fg: (bits.count_ones() as u8).min(8).saturating_sub(1),
+                    bg: None,
+                },
+            );
+        } else {
+            let hy = (((1.0 - y) * (h * 2 - 1) as f32).round() as usize).min(h * 2 - 1);
+            let col = ((x * (w - 1) as f32).round() as usize).min(w - 1);
+            let row = hy / 2;
+            let upper = hy.is_multiple_of(2);
+            let prev = buf.get(col, row).map(|cell| cell.ch);
+            let ch = match prev {
+                Some(c) if c == table.ramp8[7] => c,
+                Some(c) if upper && c == table.half_lower => table.ramp8[7],
+                Some(c) if !upper && c == table.half_upper => table.ramp8[7],
+                _ if upper => table.half_upper,
+                _ => table.half_lower,
+            };
+            buf.put(
+                col,
+                row,
+                RCell {
+                    ch,
+                    fg: 7,
+                    bg: None,
+                },
+            );
+        }
+    }
+}
+
 /// Draws a filled meter and track in one row, retaining fractional eighths.
 pub fn meter(frac: f32, w: usize, table: &RasterTable, buf: &mut CellBuf) {
     buf.reset(w, 1);
@@ -818,6 +886,84 @@ mod tests {
             .chain(table.cols.iter().copied())
             .chain(table.heat.iter().copied())
             .chain(table.spark.iter().copied())
+    }
+
+    #[test]
+    fn scatter_braille_golden_and_corners() {
+        let mut b = CellBuf::new();
+        b.reset(2, 1);
+        scatter(&[(0.0, 0.0), (1.0, 1.0)], &RasterTable::FULL, &mut b);
+        // bottom-left dot of cell 0, top-right dot of cell 1.
+        assert_eq!(chars(&b), vec!["\u{2840}\u{2808}".to_string()]);
+    }
+
+    #[test]
+    fn scatter_ors_dots_into_one_cell() {
+        let mut b = CellBuf::new();
+        b.reset(1, 1);
+        scatter(&[(0.0, 1.0), (1.0, 0.0)], &RasterTable::FULL, &mut b);
+        assert_eq!(chars(&b), vec!["\u{2881}".to_string()]);
+    }
+
+    #[test]
+    fn scatter_ascii_uses_half_blocks() {
+        let mut b = CellBuf::new();
+        b.reset(3, 1);
+        scatter(
+            &[(0.0, 1.0), (0.5, 0.0), (1.0, 1.0), (1.0, 0.0)],
+            &RasterTable::ASCII,
+            &mut b,
+        );
+        assert_eq!(chars(&b), vec!["###".to_string()]);
+        b.reset(3, 1);
+        scatter(&[(0.0, 1.0)], &RasterTable::ASCII, &mut b);
+        assert_eq!(chars(&b), vec!["#  ".to_string()]);
+    }
+
+    #[test]
+    fn scatter_clamps_out_of_range_and_skips_non_finite() {
+        let mut clamped = CellBuf::new();
+        clamped.reset(4, 2);
+        scatter(
+            &[(-5.0, 9.0), (7.0, -3.0)],
+            &RasterTable::FULL,
+            &mut clamped,
+        );
+        let mut edge = CellBuf::new();
+        edge.reset(4, 2);
+        scatter(&[(0.0, 1.0), (1.0, 0.0)], &RasterTable::FULL, &mut edge);
+        assert_eq!(chars(&clamped), chars(&edge));
+        let mut nan = CellBuf::new();
+        nan.reset(4, 2);
+        scatter(
+            &[(f32::NAN, 0.5), (0.5, f32::INFINITY)],
+            &RasterTable::FULL,
+            &mut nan,
+        );
+        assert!(
+            chars(&nan)
+                .iter()
+                .all(|row| row.chars().all(|c| c == '\u{2800}'))
+        );
+    }
+
+    #[test]
+    fn scatter_empty_input_and_zero_size_are_blank() {
+        for table in [&RasterTable::FULL, &RasterTable::BASIC, &RasterTable::ASCII] {
+            let mut b = CellBuf::new();
+            b.reset(3, 2);
+            scatter(&[], table, &mut b);
+            let blank = if table.braille {
+                table.blank
+            } else {
+                table.cell_blank
+            };
+            assert!(chars(&b).iter().all(|row| row.chars().all(|c| c == blank)));
+            let mut zero = CellBuf::new();
+            zero.reset(0, 0);
+            scatter(&[(0.5, 0.5)], table, &mut zero);
+            assert_eq!(zero.width(), 0);
+        }
     }
 
     #[test]
