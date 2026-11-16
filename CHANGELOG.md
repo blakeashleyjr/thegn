@@ -15,10 +15,18 @@ All notable changes to **thegn** are documented here. The format follows
 
 ### Changed
 
+- Route-to-host merge mode no longer blocks provisioning without `thegn serve`; the in-env `merge add` refuses with the fix instead. (THE-2037)
+- Agent-login sync uploads only an allowlist of config files, not telemetry or caches. (THE-2039)
 - The monitor containers tab shows minicore rows and a cpu/memory scatter. (THE-842)
 
 ### Fixed
 
+- Security: a provider env with no remote transport (e.g. fly before this fix) no longer runs sessions on the host; it halts before provisioning. Fly sessions now run on the Fly machine over thegn's ssh bridge. (THE-2044)
+- Headless sessions on sprites no longer need the `sprite` CLI with `exec = "auto"`; `interactive_command` is used only with `exec = "cli"`. They start in the provisioned checkout, reattach after a dropped connection, and `session list` shows `cause:remote-exec-lost` when the sprite suspended. (THE-2041, THE-2042, THE-2047)
+- The provider "provisioned" marker and cached sandbox home live in the state dir, so CLI and daemon agree. (THE-2040)
+- `.thegn-provisioned` is excluded from git in remote checkouts (THE-2043); provisioning fails clearly when Nix is required but did not install, and the fly image installs xz (THE-2045); interrupted Nix builds no longer leave the store broken. (THE-2046)
+- `thegn fleet` lists fly and machine0 inventories and names the real cause when it cannot. (THE-2038)
+- `wt rm --delete-branch` works for remote worktrees and never blocks sandbox teardown. (THE-2048)
 - Daemon agent launches honour `{prompt_file}`, and agent payloads are capped at 1 MiB. (THE-1986)
 - The loading splash no longer reopens the database on every step. (THE-2001)
 - Quitting cancels a hung sshfs/rsync projection mount. (THE-251)
