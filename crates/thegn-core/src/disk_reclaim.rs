@@ -278,6 +278,78 @@ fn sort_generations_newest_first(generations: &mut [&Generation]) {
     });
 }
 
+/// A Cargo output (`deps/` file, `incremental/` or `build/` directory) whose
+/// 16-hex unit hash names no live `.fingerprint/` record. Cargo rebuilds any
+/// unit whose fingerprint is gone, so such an artifact can never be reused.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Orphan {
+    pub hash: String,
+    pub mtime_secs: u64,
+    pub bytes: u64,
+}
+
+/// Whether `stem` ends in `-<16 lowercase hex>` (Cargo's unit-hash suffix),
+/// returning that hash. A bare hash with no name before the dash is rejected.
+pub fn cargo_unit_hash(stem: &str) -> Option<&str> {
+    let (name, hash) = stem.rsplit_once('-')?;
+    (!name.is_empty()
+        && hash.len() == 16
+        && hash.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f')))
+    .then_some(hash)
+}
+
+/// Indices of orphan artifacts old enough to remove: at least the generation
+/// age floor (the shorter of `min_age_secs` and the three-day safety floor
+/// [`plan_generations`] uses). A future mtime counts as age zero.
+pub fn plan_orphan_artifacts(entries: &[Orphan], now_secs: u64, min_age_secs: u64) -> Vec<usize> {
+    let age_floor = min_age_secs.min(GENERATION_SAFETY_FLOOR_SECS);
+    entries
+        .iter()
+        .enumerate()
+        .filter(|(_, orphan)| now_secs.saturating_sub(orphan.mtime_secs) >= age_floor)
+        .map(|(index, _)| index)
+        .collect()
+}
+
+/// Earliest time a still-young orphan meets the age floor, or `None` when
+/// every orphan is already removable (or there are none). Lets the host's
+/// no-op memo wake up for an orphan that ages in without any new build.
+pub fn orphan_recheck_after(entries: &[Orphan], now_secs: u64, min_age_secs: u64) -> Option<u64> {
+    let age_floor = min_age_secs.min(GENERATION_SAFETY_FLOOR_SECS);
+    entries
+        .iter()
+        .filter(|orphan| now_secs.saturating_sub(orphan.mtime_secs) < age_floor)
+        .map(|orphan| orphan.mtime_secs.saturating_add(age_floor))
+        .min()
+}
+
+/// One `target/.thegn-live-build-*` staging directory left by `just live`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LiveBuild {
+    /// Newest mtime anywhere in the stage tree.
+    pub newest_mtime_secs: u64,
+    /// Another process holds one of the stage's locks (a build in flight).
+    pub lock_held: bool,
+}
+
+/// Indices of live-build stages to remove: untouched for at least `idle_days`
+/// and not locked. `idle_days == 0` turns the rule off, matching
+/// `[disk] idle_clean_days`.
+pub fn plan_stale_live_builds(entries: &[LiveBuild], now_secs: u64, idle_days: u32) -> Vec<usize> {
+    if idle_days == 0 {
+        return Vec::new();
+    }
+    let threshold = u64::from(idle_days).saturating_mul(86_400);
+    entries
+        .iter()
+        .enumerate()
+        .filter(|(_, stage)| {
+            !stage.lock_held && now_secs.saturating_sub(stage.newest_mtime_secs) >= threshold
+        })
+        .map(|(index, _)| index)
+        .collect()
+}
+
 /// Below this a `target/` is not worth a cold rebuild: an empty or barely-warm
 /// build tree buys nothing and the reclaim is pure downside. 256 MiB is roughly
 /// "one crate graph's dependencies have not even finished compiling yet".
@@ -815,5 +887,90 @@ mod tests {
         );
         assert_eq!(generation_recheck_after(&rows[3..], policy), None);
         assert_eq!(generation_recheck_after(&[], policy), None);
+    }
+    fn orphan(mtime_secs: u64) -> Orphan {
+        Orphan {
+            hash: "0123456789abcdef".into(),
+            mtime_secs,
+            bytes: 1,
+        }
+    }
+
+    #[test]
+    fn cargo_unit_hash_accepts_only_sixteen_lowercase_hex() {
+        assert_eq!(
+            cargo_unit_hash("libserde-0123456789abcdef"),
+            Some("0123456789abcdef")
+        );
+        assert_eq!(
+            cargo_unit_hash("my-pkg-0123456789abcdef"),
+            Some("0123456789abcdef")
+        );
+        assert_eq!(cargo_unit_hash("pkg-0123456789ABCDEF"), None);
+        assert_eq!(cargo_unit_hash("pkg-0123456789abcde"), None);
+        assert_eq!(cargo_unit_hash("pkg-0123456789abcdef0"), None);
+        assert_eq!(cargo_unit_hash("pkg-0123456789abcdeg"), None);
+        assert_eq!(cargo_unit_hash("-0123456789abcdef"), None);
+        assert_eq!(cargo_unit_hash("0123456789abcdef"), None);
+        assert_eq!(cargo_unit_hash("thegn_core-1x3k9l2q3abc0"), None);
+    }
+
+    #[test]
+    fn orphan_plan_honours_the_age_floor_boundary_and_future_mtimes() {
+        let day = 86_400;
+        let now = 10 * day;
+        let rows = [
+            orphan(now - 3 * day),     // exactly on the safety floor: removed
+            orphan(now - 3 * day + 1), // one second short: kept
+            orphan(now + 50),          // future mtime: age zero, kept
+            orphan(0),                 // ancient: removed
+        ];
+        // A 14-day config is capped at the three-day safety floor.
+        assert_eq!(plan_orphan_artifacts(&rows, now, 14 * day), vec![0, 3]);
+        // A shorter configured floor wins.
+        assert_eq!(plan_orphan_artifacts(&rows, now, 10), vec![0, 1, 3]);
+        assert_eq!(plan_orphan_artifacts(&rows, now, 0), vec![0, 1, 2, 3]);
+        assert!(plan_orphan_artifacts(&[], now, day).is_empty());
+    }
+
+    #[test]
+    fn orphan_recheck_names_the_youngest_wait() {
+        let day = 86_400;
+        let now = 10 * day;
+        let rows = [orphan(now - day), orphan(now - 2 * day), orphan(0)];
+        assert_eq!(orphan_recheck_after(&rows, now, 14 * day), Some(now + day));
+        assert_eq!(orphan_recheck_after(&rows[2..], now, 14 * day), None);
+        assert_eq!(orphan_recheck_after(&[], now, day), None);
+        assert_eq!(
+            orphan_recheck_after(&[orphan(now + 5)], now, 10),
+            Some(now + 15)
+        );
+    }
+
+    #[test]
+    fn stale_live_build_plan_needs_age_and_no_lock() {
+        let day = 86_400;
+        let now = 100 * day;
+        let rows = [
+            LiveBuild {
+                newest_mtime_secs: now - 14 * day,
+                lock_held: false,
+            },
+            LiveBuild {
+                newest_mtime_secs: now - 14 * day + 1,
+                lock_held: false,
+            },
+            LiveBuild {
+                newest_mtime_secs: 0,
+                lock_held: true,
+            },
+            LiveBuild {
+                newest_mtime_secs: now + 10,
+                lock_held: false,
+            },
+        ];
+        assert_eq!(plan_stale_live_builds(&rows, now, 14), vec![0]);
+        assert!(plan_stale_live_builds(&rows, now, 0).is_empty());
+        assert!(plan_stale_live_builds(&[], now, 14).is_empty());
     }
 }
