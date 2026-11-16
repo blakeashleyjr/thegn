@@ -2455,6 +2455,9 @@ impl CiActionCtx<'_> {
             // Intercepted by the loop's Act arm (it owns the fold/drive locals
             // that `CiActionCtx` lacks); unreachable here.
             DetailAction::MergeQueueAction { .. } => {}
+            // Intercepted by the loop's Act arm (it owns the confirm-menu
+            // slot); unreachable here.
+            DetailAction::FleetDown { .. } => {}
         }
         // Retain the overlay only for the in-place actions (CI drill, per-row
         // `x`); every other action has done its side effect and the modal closes.

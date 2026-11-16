@@ -365,6 +365,13 @@ processes are trimmed first, then panes, behind a "+N more" row; workspaces
 and worktrees always show. Like the Processes tab, sampling happens only while
 the popup is open.
 
+`↑`/`↓` (or `j`/`k`) move a cursor through the tree. `↵` on a workspace,
+worktree or pane row jumps to that worktree (a workspace jumps to its heaviest
+worktree). `↵` on a process row opens the monitor's Processes tab, where kill
+and renice live behind their confirmation. The `thegn` and `outside thegn`
+rows have no jump of their own, so `↵` there opens the monitor, like `M` does
+from any row.
+
 #### Gate and agent jobs
 
 thegn runs its merge-queue gate and queued agent handoffs in named transient
