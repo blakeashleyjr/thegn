@@ -478,3 +478,42 @@ fn native_summary_splits_the_pane_bucket_per_pane() {
     assert!((summary.pane_totals[0].1.cpu_pct.unwrap_or(0.0) - 10.0).abs() < 0.1);
     assert!((summary.pane_totals[1].1.cpu_pct.unwrap_or(0.0) - 5.0).abs() < 0.1);
 }
+
+#[test]
+fn native_summary_carries_slice_scopes_from_the_injected_slice() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let scope = tmp.path().join("thegn.slice/thegn-gate-main-1-0.scope");
+    std::fs::create_dir_all(&scope).expect("scope");
+    std::fs::write(scope.join("cpu.stat"), "usage_usec 0\n").expect("cpu.stat");
+    std::fs::write(scope.join("memory.current"), "4096\n").expect("memory.current");
+    let mut fs = FakeProcFs::new();
+    fs.insert(1, process(1, 0, 10, 250));
+    let mut native = NativeBackend::with(fs, 8, None, Some(100), Some(4096)).with_scopes(
+        super::super::slice_scopes::SliceScopes::at(tmp.path().join("thegn.slice")),
+    );
+    let mut primed = false;
+    let (snapshot, _) = sample_with(
+        &mut native,
+        request(&[], 20),
+        Instant::now(),
+        10,
+        &mut primed,
+    );
+    let scopes = &snapshot.summary.expect("summary").scopes;
+    assert_eq!(scopes.len(), 1);
+    assert_eq!(scopes[0].unit, "thegn-gate-main-1-0");
+    assert_eq!(scopes[0].rss, Some(4096));
+
+    // The default (fixture) backend never reads the host's cgroups.
+    let mut fs = FakeProcFs::new();
+    fs.insert(1, process(1, 0, 10, 250));
+    let mut plain = NativeBackend::with(fs, 8, None, Some(100), Some(4096));
+    let (snapshot, _) = sample_with(
+        &mut plain,
+        request(&[], 20),
+        Instant::now(),
+        10,
+        &mut primed,
+    );
+    assert!(snapshot.summary.expect("summary").scopes.is_empty());
+}

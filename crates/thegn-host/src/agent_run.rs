@@ -1064,7 +1064,13 @@ pub(crate) fn run_outcome_cancellable(
         ),
     };
     // Keep a secret env-file until the bounded runner has waited for the child.
-    let argv = thegn_core::sandbox_cpucap::wrap_background_argv(inner_argv);
+    let argv = thegn_core::sandbox_cpucap::wrap_background_argv_tagged(
+        inner_argv,
+        &thegn_core::sandbox_cpucap::ScopeTag {
+            kind: thegn_core::sandbox_cpucap::ScopeKind::Agent,
+            worktree: task.worktree.to_string(),
+        },
+    );
 
     let mut cmd = Command::new(&argv[0]);
     cmd.args(&argv[1..])

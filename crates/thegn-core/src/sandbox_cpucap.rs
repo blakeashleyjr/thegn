@@ -939,19 +939,156 @@ pub fn wrap_control_argv_reporting(
     argv: Vec<String>,
     already_capped: bool,
 ) -> (Vec<String>, BackgroundWrap) {
+    wrap_reporting_inner(argv, already_capped, None)
+}
+
+/// What a named background scope runs — the attribution popup groups the
+/// slice's CPU by this. Only the two heaviest jobs are named; everything else
+/// thegn wraps stays an anonymous `run-*.scope`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum ScopeKind {
+    /// A merge-queue / land gate run.
+    Gate,
+    /// A queued agent handoff.
+    Agent,
+}
+
+impl ScopeKind {
+    /// The word used in the unit name and as the attribution row label.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ScopeKind::Gate => "gate",
+            ScopeKind::Agent => "agent",
+        }
+    }
+
+    fn parse(word: &str) -> Option<Self> {
+        match word {
+            "gate" => Some(ScopeKind::Gate),
+            "agent" => Some(ScopeKind::Agent),
+            _ => None,
+        }
+    }
+}
+
+/// Names a background job's transient scope so its CPU can be attributed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ScopeTag {
+    pub kind: ScopeKind,
+    /// The worktree the job belongs to (a path; only its basename is used).
+    pub worktree: String,
+}
+
+/// Every named scope starts with this; the metrics reader filters on it.
+pub const SCOPE_UNIT_PREFIX: &str = "thegn-";
+
+/// Longest slug carried in a unit name (bytes; the slug is ASCII).
+pub const SCOPE_SLUG_MAX: usize = 40;
+
+/// The unit-name slug for a worktree: its basename, lowercased, every byte
+/// outside `[a-z0-9-]` mapped to `-`, edge dashes trimmed, at most
+/// [`SCOPE_SLUG_MAX`] bytes, and never empty (`wt`). Attribution matches a
+/// scope back to a worktree by comparing this slug, so both sides use it.
+pub fn scope_slug(worktree: &str) -> String {
+    let trimmed = worktree.trim_end_matches(['/', '\\']);
+    let base = trimmed.rsplit(['/', '\\']).next().unwrap_or(trimmed);
+    let mapped: String = base
+        .chars()
+        .map(|c| {
+            let c = c.to_ascii_lowercase();
+            if c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-' {
+                c
+            } else {
+                '-'
+            }
+        })
+        .collect();
+    let mut slug = mapped.trim_matches('-').to_string();
+    slug.truncate(SCOPE_SLUG_MAX);
+    let slug = slug.trim_end_matches('-');
+    if slug.is_empty() {
+        "wt".to_string()
+    } else {
+        slug.to_string()
+    }
+}
+
+/// The transient unit name for a tagged background job:
+/// `thegn-<kind>-<slug>-<pid>-<seq>`. `pid` + a process-local `seq` make it
+/// unique — `systemd-run --unit` refuses a name that is already loaded, and a
+/// refused wrapper would read as the job failing.
+pub fn scope_unit_name(tag: &ScopeTag, pid: u32, seq: u64) -> String {
+    format!(
+        "{SCOPE_UNIT_PREFIX}{}-{}-{pid}-{seq}",
+        tag.kind.as_str(),
+        scope_slug(&tag.worktree)
+    )
+}
+
+/// Inverse of [`scope_unit_name`]: the kind and slug of a named scope (with or
+/// without the `.scope` suffix). `None` for anything thegn did not name.
+pub fn parse_scope_unit(name: &str) -> Option<(ScopeKind, String)> {
+    let name = name.strip_suffix(".scope").unwrap_or(name);
+    let rest = name.strip_prefix(SCOPE_UNIT_PREFIX)?;
+    let (kind, rest) = rest.split_once('-')?;
+    let kind = ScopeKind::parse(kind)?;
+    let (rest, seq) = rest.rsplit_once('-')?;
+    let (slug, pid) = rest.rsplit_once('-')?;
+    let numeric = |s: &str| !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit());
+    if !numeric(seq) || !numeric(pid) || slug.is_empty() {
+        return None;
+    }
+    Some((kind, slug.to_string()))
+}
+
+static SCOPE_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+fn next_scope_unit(tag: &ScopeTag) -> String {
+    let seq = SCOPE_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    scope_unit_name(tag, std::process::id(), seq)
+}
+
+/// Like [`wrap_background_argv`], and name the hard-cap scope after `tag` so
+/// the attribution popup can say which worktree's gate or agent is burning the
+/// slice. The soft `nice` path and the no-policy path are unchanged.
+///
+/// Callers must be off the event loop — the probe spawns.
+pub fn wrap_background_argv_tagged(argv: Vec<String>, tag: &ScopeTag) -> Vec<String> {
+    wrap_background_argv_tagged_reporting(argv, tag).0
+}
+
+/// Like [`wrap_background_argv_tagged`], and report whether the cap applied.
+pub fn wrap_background_argv_tagged_reporting(
+    argv: Vec<String>,
+    tag: &ScopeTag,
+) -> (Vec<String>, BackgroundWrap) {
+    wrap_reporting_inner(argv, false, Some(tag))
+}
+
+fn wrap_reporting_inner(
+    argv: Vec<String>,
+    already_capped: bool,
+    tag: Option<&ScopeTag>,
+) -> (Vec<String>, BackgroundWrap) {
     if already_capped {
         return (argv, background_wrap_outcome(true, false, false, false));
     }
     let Some(limits) = BACKGROUND_LIMITS.get() else {
         return (argv, background_wrap_outcome(false, false, false, false));
     };
-    let wrapped = cap_prefix(
+    let mech = detect_cpu_cap();
+    // Only spend a sequence number when the name can actually be used.
+    let unit = tag
+        .filter(|_| mech == CpuCap::ScopeHard)
+        .map(next_scope_unit);
+    let wrapped = cap_prefix_named(
         Backend::None,
         true,
         limits,
         argv.clone(),
-        detect_cpu_cap(),
+        mech,
         CapRole::Background,
+        unit.as_deref(),
     );
     // Only the scope path can break the inner command; `nice` cannot.
     let wraps_with_scope = wrapped.first().map(String::as_str) == Some("systemd-run");
@@ -1022,6 +1159,20 @@ fn cap_prefix(
     mech: CpuCap,
     role: CapRole,
 ) -> Vec<String> {
+    cap_prefix_named(backend, is_local, limits, argv, mech, role, None)
+}
+
+/// [`cap_prefix`] with an optional transient unit name. The name lands only on
+/// the [`CpuCap::ScopeHard`] prefix (`--unit=<name>`); `nice` has no unit.
+fn cap_prefix_named(
+    backend: Backend,
+    is_local: bool,
+    limits: &SandboxLimits,
+    argv: Vec<String>,
+    mech: CpuCap,
+    role: CapRole,
+    unit: Option<&str>,
+) -> Vec<String> {
     // OCI carries `--cpus`; Systemd caps inline; remote host-toolchain capping is
     // deferred (needs a remote cgroup probe).
     if !matches!(backend, Backend::Bwrap | Backend::None)
@@ -1049,6 +1200,9 @@ fn cap_prefix(
                 "--quiet".into(),
                 "--collect".into(),
             ];
+            if let Some(unit) = unit {
+                v.push(format!("--unit={unit}"));
+            }
             if use_slice {
                 v.push(format!("--slice={CPU_SLICE}"));
             }
@@ -1226,6 +1380,145 @@ mod tests {
             argv.as_slice(),
             "the shell survives intact"
         );
+    }
+
+    #[test]
+    fn scope_unit_name_round_trips_through_parse() {
+        let tag = ScopeTag {
+            kind: ScopeKind::Gate,
+            worktree: "/home/u/wt/tg-b141-cpu".into(),
+        };
+        let name = scope_unit_name(&tag, 4242, 7);
+        assert_eq!(name, "thegn-gate-tg-b141-cpu-4242-7");
+        assert_eq!(
+            parse_scope_unit(&name),
+            Some((ScopeKind::Gate, "tg-b141-cpu".to_string()))
+        );
+        assert_eq!(
+            parse_scope_unit(&format!("{name}.scope")),
+            Some((ScopeKind::Gate, "tg-b141-cpu".to_string()))
+        );
+        let agent = ScopeTag {
+            kind: ScopeKind::Agent,
+            worktree: "feature".into(),
+        };
+        assert_eq!(
+            parse_scope_unit(&scope_unit_name(&agent, 1, 0)),
+            Some((ScopeKind::Agent, "feature".to_string()))
+        );
+        assert_eq!(ScopeKind::Agent.as_str(), "agent");
+        // Anything thegn did not name is not a tagged scope.
+        for junk in [
+            "run-u123.scope",
+            "thegn-lsp-x-1-2.scope",
+            "thegn-gate-x-1.scope",
+            "thegn-gate-x-a-2",
+            "thegn-gate--1-2",
+            "thegn-gate-x-1-",
+            "thegn-gate",
+            "thegn.slice",
+        ] {
+            assert_eq!(parse_scope_unit(junk), None, "{junk}");
+        }
+    }
+
+    #[test]
+    fn scope_slug_sanitises_bounds_and_never_empties() {
+        assert_eq!(scope_slug("/a/b/My_Tree.v2/"), "my-tree-v2");
+        assert_eq!(scope_slug("C:\\x\\Work Tree"), "work-tree");
+        assert_eq!(scope_slug("--odd--"), "odd");
+        assert_eq!(scope_slug(""), "wt");
+        assert_eq!(scope_slug("/"), "wt");
+        assert_eq!(scope_slug("ünï"), "n");
+        let long = "a".repeat(39) + "-" + &"b".repeat(30);
+        let slug = scope_slug(&long);
+        assert!(slug.len() <= SCOPE_SLUG_MAX);
+        // Truncation never leaves a trailing dash.
+        assert_eq!(slug, "a".repeat(39));
+        let hashy = "tg-b141-cpu-scope-attrib--21717623bfd89be42b208cee4e40b9aa05905a85e6";
+        assert_eq!(scope_slug(hashy).len(), SCOPE_SLUG_MAX);
+        // A slug full of dashes still parses back out of the unit name.
+        let tag = ScopeTag {
+            kind: ScopeKind::Agent,
+            worktree: hashy.into(),
+        };
+        assert_eq!(
+            parse_scope_unit(&scope_unit_name(&tag, 9, 99)).map(|(_, s)| s),
+            Some(scope_slug(hashy))
+        );
+    }
+
+    #[test]
+    fn scope_unit_names_are_never_reused() {
+        let tag = ScopeTag {
+            kind: ScopeKind::Gate,
+            worktree: "w".into(),
+        };
+        let a = next_scope_unit(&tag);
+        let b = next_scope_unit(&tag);
+        assert_ne!(a, b);
+        assert!(a.starts_with(&format!("thegn-gate-w-{}-", std::process::id())));
+    }
+
+    #[test]
+    fn only_the_hard_scope_carries_the_unit_name() {
+        let l = limits(None, Some("4g"), Some("16"));
+        let argv = vec!["cargo".to_string(), "test".into()];
+        let hard = cap_prefix_named(
+            Backend::None,
+            true,
+            &l,
+            argv.clone(),
+            CpuCap::ScopeHard,
+            CapRole::Background,
+            Some("thegn-gate-w-1-0"),
+        );
+        assert_eq!(hard[0], "systemd-run");
+        let sep = hard.iter().position(|a| a == "--").unwrap();
+        assert!(hard[..sep].iter().any(|a| a == "--unit=thegn-gate-w-1-0"));
+        assert_eq!(&hard[sep + 1..], argv.as_slice());
+        // The pane-cap stripper still sees through a named scope.
+        assert_eq!(strip_cap(&hard), argv.as_slice());
+
+        let soft = cap_prefix_named(
+            Backend::None,
+            true,
+            &l,
+            argv.clone(),
+            CpuCap::NiceSoft,
+            CapRole::Background,
+            Some("thegn-gate-w-1-0"),
+        );
+        assert!(!soft.iter().any(|a| a.starts_with("--unit")));
+        assert_eq!(strip_cap(&soft), argv.as_slice());
+
+        // Unnamed callers are unchanged.
+        let plain = cap_prefix(
+            Backend::None,
+            true,
+            &l,
+            argv.clone(),
+            CpuCap::ScopeHard,
+            CapRole::Background,
+        );
+        assert!(!plain.iter().any(|a| a.starts_with("--unit")));
+    }
+
+    #[test]
+    fn tagged_wrap_without_a_published_policy_is_a_no_op() {
+        // Unit tests never publish background limits, so the tagged path must
+        // leave the argv exactly as the untagged one does.
+        let argv = vec!["true".to_string()];
+        let tag = ScopeTag {
+            kind: ScopeKind::Agent,
+            worktree: "w".into(),
+        };
+        if BACKGROUND_LIMITS.get().is_none() {
+            let (out, wrap) = wrap_background_argv_tagged_reporting(argv.clone(), &tag);
+            assert_eq!(out, argv);
+            assert_eq!(wrap, BackgroundWrap::NoPolicy);
+            assert_eq!(wrap_background_argv_tagged(argv.clone(), &tag), argv);
+        }
     }
 
     #[test]
