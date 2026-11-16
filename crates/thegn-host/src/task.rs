@@ -270,8 +270,10 @@ pub fn wrap_capped(argv: &[String], limits: &LimitsConfig, backend: CapBackend) 
 /// run's `thegn_proc` supervisor polls the flag and terminates its whole
 /// process group when it is set. Starting a newer job in the same slot sets the
 /// older run's flag so a superseded `cargo test` stops burning CPU promptly.
-fn registry() -> &'static Mutex<HashMap<String, (u64, Arc<AtomicBool>)>> {
-    static R: OnceLock<Mutex<HashMap<String, (u64, Arc<AtomicBool>)>>> = OnceLock::new();
+type Registry = Mutex<HashMap<String, (u64, Arc<AtomicBool>)>>;
+
+fn registry() -> &'static Registry {
+    static R: OnceLock<Registry> = OnceLock::new();
     R.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
