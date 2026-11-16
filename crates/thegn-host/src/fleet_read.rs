@@ -129,7 +129,7 @@ fn admit_with(
 struct Slot {
     env: String,
     provider_name: String,
-    provider: Option<Provider>,
+    provider: Result<Provider, String>,
 }
 
 pub(crate) fn gather(cfg: &Config, only_env: Option<&str>) -> Result<FleetView> {
@@ -155,22 +155,17 @@ fn gather_where(
         .map(|(name, envc)| Slot {
             env: name.clone(),
             provider_name: envc.provider.provider.clone(),
-            provider: crate::provider_factory::provider_for_named(
-                &envc.provider,
-                &envc.provider.id,
-            ),
+            provider: crate::provider_factory::provider_for_inventory(&envc.provider),
         })
         .collect();
     let reads = crate::agent::block_on_provider(|| async {
         let reads = slots.iter().map(|slot| async move {
             match &slot.provider {
-                Some(provider) => Some(
-                    tokio::time::timeout(INVENTORY_TIMEOUT, provider.inventory())
-                        .await
-                        .map_err(|_| format!("timed out after {}s", INVENTORY_TIMEOUT.as_secs()))
-                        .and_then(|read| read.map_err(|error| format!("{error:#}"))),
-                ),
-                None => None,
+                Ok(provider) => tokio::time::timeout(INVENTORY_TIMEOUT, provider.inventory())
+                    .await
+                    .map_err(|_| format!("timed out after {}s", INVENTORY_TIMEOUT.as_secs()))
+                    .and_then(|read| read.map_err(|error| format!("{error:#}"))),
+                Err(reason) => Err(reason.clone()),
             }
         });
         Ok(futures::future::join_all(reads).await)
@@ -183,11 +178,11 @@ fn gather_where(
     Ok(fleet_cost::join(inventories, recorded_sandboxes(cfg)))
 }
 
-/// Shape one env's read. `None` = the provider could not be built.
+/// Shape one env's read. `Err` carries the reason (build or read failure).
 fn env_inventory(
     env: &str,
     provider: &str,
-    read: Option<std::result::Result<InventoryReport, String>>,
+    read: std::result::Result<InventoryReport, String>,
 ) -> EnvInventory {
     let to_rows = |rows: Vec<SandboxInfo>| -> Vec<SandboxRow> {
         rows.into_iter()
@@ -204,18 +199,12 @@ fn env_inventory(
             .collect()
     };
     let (completeness, rows) = match read {
-        None => (
-            Completeness::Unavailable(
-                "unavailable: no API provider or its token could not be resolved".into(),
-            ),
-            Vec::new(),
-        ),
-        Some(Err(reason)) => (
+        Err(reason) => (
             Completeness::Unavailable(format!("unavailable: {reason}")),
             Vec::new(),
         ),
-        Some(Ok(InventoryReport::Complete(rows))) => (Completeness::Complete, to_rows(rows)),
-        Some(Ok(InventoryReport::Partial { rows, reason })) => (
+        Ok(InventoryReport::Complete(rows)) => (Completeness::Complete, to_rows(rows)),
+        Ok(InventoryReport::Partial { rows, reason }) => (
             Completeness::Partial(format!("partial: {reason}")),
             to_rows(rows),
         ),
@@ -287,7 +276,7 @@ mod tests {
         let complete = env_inventory(
             "e",
             "fly",
-            Some(Ok(InventoryReport::Complete(vec![info.clone()]))),
+            Ok(InventoryReport::Complete(vec![info.clone()])),
         );
         assert_eq!(complete.completeness, Completeness::Complete);
         assert_eq!(complete.rows[0].provider, "fly");
@@ -296,24 +285,29 @@ mod tests {
         let partial = env_inventory(
             "e",
             "fly",
-            Some(Ok(InventoryReport::Partial {
+            Ok(InventoryReport::Partial {
                 rows: vec![info],
                 reason: "x".into(),
-            })),
+            }),
         );
         assert_eq!(
             partial.completeness,
             Completeness::Partial("partial: x".into())
         );
         assert_eq!(partial.rows.len(), 1);
-        let failed = env_inventory("e", "fly", Some(Err("boom".into())));
+        let failed = env_inventory("e", "fly", Err("boom".into()));
         assert_eq!(
             failed.completeness,
             Completeness::Unavailable("unavailable: boom".into())
         );
-        let unbuilt = env_inventory("e", "fly", None);
-        assert!(
-            matches!(unbuilt.completeness, Completeness::Unavailable(r) if r.contains("token"))
+        let unbuilt = env_inventory(
+            "e",
+            "fly",
+            Err("API token FLY_X could not be resolved".into()),
+        );
+        assert_eq!(
+            unbuilt.completeness,
+            Completeness::Unavailable("unavailable: API token FLY_X could not be resolved".into())
         );
     }
 
