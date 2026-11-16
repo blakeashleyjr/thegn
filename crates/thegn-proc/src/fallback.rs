@@ -1,6 +1,6 @@
 use crate::{
     Capture, Containment, End, GroupState, InputFeed, Leader, LeaderExit, Limits, POLL_INTERVAL,
-    Run, Stream, StreamConsumer, Which, aggregate_fit,
+    Run, StdinHandoff, Stream, StreamConsumer, Which, aggregate_fit,
 };
 use std::{
     io::{self, Read, Write},
@@ -191,7 +191,17 @@ pub(super) fn run_consuming_streams(
     cancel: &AtomicBool,
     consume: StreamConsumer<'_>,
 ) -> Run {
-    run_inner_wrapped(cmd, limits, cancel, consume, None).0
+    run_inner_wrapped(cmd, limits, cancel, consume, None, None).0
+}
+
+pub(super) fn run_consuming_streams_with_stdin(
+    cmd: &mut Command,
+    limits: &Limits,
+    cancel: &AtomicBool,
+    on_stdin: StdinHandoff<'_>,
+    consume: StreamConsumer<'_>,
+) -> Run {
+    run_inner_wrapped(cmd, limits, cancel, consume, None, Some(on_stdin)).0
 }
 
 pub(super) fn run_with_input(
@@ -206,6 +216,7 @@ pub(super) fn run_with_input(
         cancel,
         &mut |_which: Which, _bytes: &[u8]| {},
         Some(input),
+        None,
     )
 }
 
@@ -215,6 +226,7 @@ fn run_inner_wrapped(
     cancel: &AtomicBool,
     consume: StreamConsumer<'_>,
     input: Option<&[u8]>,
+    handoff: Option<StdinHandoff<'_>>,
 ) -> (Run, InputFeed) {
     // Without the Unix Guard, contain consumer panics until the child is drained and reaped.
     let mut panic_payload = None;
@@ -226,21 +238,24 @@ fn run_inner_wrapped(
             panic_payload = Some(payload);
         }
     };
-    let result = run_inner(cmd, limits, cancel, &mut guarded_consume, input);
+    let result = run_inner(cmd, limits, cancel, &mut guarded_consume, input, handoff);
     if let Some(payload) = panic_payload {
         std::panic::resume_unwind(payload);
     }
     result
 }
 
+/// `input` (a payload a feeder thread writes) and `handoff` (the caller takes the pipe) are never
+/// both set by the public entry points; either one makes stdin a pipe.
 fn run_inner(
     cmd: &mut Command,
     limits: &Limits,
     cancel: &AtomicBool,
     consume: StreamConsumer<'_>,
     input: Option<&[u8]>,
+    handoff: Option<StdinHandoff<'_>>,
 ) -> (Run, InputFeed) {
-    cmd.stdin(if input.is_some() {
+    cmd.stdin(if input.is_some() || handoff.is_some() {
         Stdio::piped()
     } else {
         Stdio::null()
@@ -271,6 +286,20 @@ fn run_inner(
             );
         }
     };
+    if let Some(handoff) = handoff
+        && let Some(pipe) = child.stdin.take()
+        && let Err(payload) =
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| handoff(pipe)))
+    {
+        // Without the Unix Guard, kill and reap the direct child before re-raising.
+        if let Err(_kill_error) = child.kill() {
+            // The child may already have exited; wait still reaps it.
+        }
+        if let Err(_wait_error) = child.wait() {
+            // Nothing left to clean up; the panic is re-raised either way.
+        }
+        std::panic::resume_unwind(payload);
+    }
     let mut feed_error = None;
     let feed_rx = if let Some(input) = input {
         let stdin = child.stdin.take();
@@ -563,5 +592,67 @@ mod tests {
         assert!(matches!(&result.end, End::TimedOut), "{:?}", result.end);
         assert!(result.idle_expired);
         assert!(started.elapsed() < Duration::from_secs(20));
+    }
+
+    #[test]
+    fn stdin_handoff_writer_reaches_the_child_and_the_run_succeeds() {
+        // findstr echoes every stdin line until EOF, like cat.
+        let mut cmd = Command::new("cmd.exe");
+        cmd.args(["/C", "findstr /R \"^\""]);
+        let limits = Limits {
+            stdout: Stream::Consume,
+            stderr: Stream::Tail { cap: 4096 },
+            ..Limits::silent(Duration::from_secs(20))
+        };
+        let mut writer = None;
+        let mut seen = Vec::new();
+        let result = crate::run_consuming_streams_with_stdin(
+            &mut cmd,
+            &limits,
+            &AtomicBool::new(false),
+            &mut |mut stdin: std::process::ChildStdin| {
+                writer = Some(thread::spawn(move || {
+                    let written = stdin.write_all(b"hello\n");
+                    drop(stdin);
+                    written
+                }));
+            },
+            &mut |which: Which, bytes: &[u8]| {
+                if which == Which::Stdout {
+                    seen.extend_from_slice(bytes);
+                }
+            },
+        );
+        assert!(result.success(), "{:?}", result.end);
+        assert!(String::from_utf8_lossy(&seen).contains("hello"), "{seen:?}");
+        writer
+            .expect("on_stdin was called")
+            .join()
+            .unwrap()
+            .unwrap();
+    }
+
+    #[test]
+    fn stdin_handoff_spawn_failure_skips_the_handoff_and_matches_run() {
+        let program = "thegn-proc-no-such-program.exe";
+        let mut called = false;
+        let handoff_run = crate::run_consuming_streams_with_stdin(
+            &mut Command::new(program),
+            &Limits::silent(Duration::from_secs(1)),
+            &AtomicBool::new(false),
+            &mut |_stdin: std::process::ChildStdin| called = true,
+            &mut |_which: Which, _bytes: &[u8]| {},
+        );
+        let plain = run(
+            &mut Command::new(program),
+            &Limits::silent(Duration::from_secs(1)),
+            &AtomicBool::new(false),
+        );
+        assert!(!called, "on_stdin must not run when spawn fails");
+        assert_eq!(handoff_run.error(), plain.error());
+        assert!(matches!(
+            handoff_run.error(),
+            Some(crate::ProcError::Spawn { .. })
+        ));
     }
 }
