@@ -131,10 +131,6 @@ impl WorkspacePool {
 
     /// Like [`resident_groups`](Self::resident_groups) but keeps the repo key
     /// each group is parked under, for the CPU/memory attribution index.
-    #[allow(
-        dead_code,
-        reason = "read by cpu_attrib_index::pane_owners, wired by b140 lane 3 phase 2"
-    )]
     pub(crate) fn parked_groups(
         &self,
     ) -> impl Iterator<Item = (&str, &crate::session::WorktreeGroup)> {
