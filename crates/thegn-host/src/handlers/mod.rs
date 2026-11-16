@@ -9,6 +9,7 @@ pub(crate) mod attention;
 pub(crate) mod calendar;
 pub(crate) mod cast_export;
 pub(crate) mod close;
+pub(crate) mod config_reload;
 pub(crate) mod crash;
 pub(crate) mod creating;
 pub(crate) mod daemon_lifecycle;

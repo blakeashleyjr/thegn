@@ -62,16 +62,9 @@ pub enum SlotState {
     /// Live and drivable.
     Running(Box<dyn AppTile>),
     /// Construction or the connection failed; carries a user-facing reason.
-    Failed(
-        #[cfg_attr(
-            not(test),
-            expect(
-                dead_code,
-                reason = "cause is logged at build time; the stored copy is only read by tests"
-            )
-        )]
-        String,
-    ),
+    /// The cause is logged at build time and shown on a masthead chip click
+    /// (`AppHost::tab_failure_status`).
+    Failed(String),
 }
 
 impl SlotState {
@@ -485,6 +478,20 @@ impl AppHost {
 
     pub fn tab_target(&self, index: usize) -> Option<ActiveApp> {
         self.tab_order.get(index).copied()
+    }
+
+    /// The status line for a tab whose tile failed to build, or `None` when the
+    /// target is `work` or a tile that is not in the failed state. The chip only
+    /// has room for "(failed)"; a click on it surfaces the reason here.
+    pub(crate) fn tab_failure_status(&self, target: ActiveApp) -> Option<String> {
+        let ActiveApp::Tile(i) = target else {
+            return None;
+        };
+        let slot = self.slots.get(i)?;
+        match &slot.state {
+            SlotState::Failed(reason) => Some(format!("{} failed to load: {reason}", slot.label)),
+            _ => None,
+        }
     }
 
     /// How many app tabs exist (Work + enabled tiles). With just one, the
@@ -1448,6 +1455,27 @@ mod tests {
         assert_eq!(host.tab_labels(), vec!["work", "Observe"]);
         assert_eq!(host.active_id(), Some("observe"));
         assert_eq!(host.active_tab_index(), 1);
+    }
+
+    #[test]
+    fn tab_failure_status_names_the_failed_tile_reason_only() {
+        let mut cfg = thegn_core::config::Config::default();
+        cfg.observe.enabled = true;
+        cfg.apps.tab_order = vec!["work".into(), "observe".into()];
+        let mut host = AppHost::from_config(&cfg);
+        let observe = host.tab_target(1).expect("observe tab");
+        assert_eq!(host.tab_failure_status(ActiveApp::Work), None);
+        assert_eq!(
+            host.tab_failure_status(observe),
+            None,
+            "unloaded is not failed"
+        );
+        host.slots[0].state = SlotState::Failed("daemon unreachable".into());
+        assert_eq!(
+            host.tab_failure_status(observe).as_deref(),
+            Some("Observe failed to load: daemon unreachable")
+        );
+        assert_eq!(host.tab_failure_status(ActiveApp::Tile(99)), None);
     }
 
     #[test]
