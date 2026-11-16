@@ -850,10 +850,13 @@ pub enum Command {
         cmd: Vec<String>,
     },
     /// Hidden: the sprites exec bridge (`sprite-exec <id> -- cmd…`) — the
-    /// control-plane prefix a sprites (WSS-native) env's chrome git/gh/fs reads
-    /// and persisted worktree location run through. Runs the command over the
-    /// sprite's native exec API and relays its stdout. Panes attach over the
-    /// exec API directly (not this bridge). Not for interactive use.
+    /// sprites (WSS-native) exec prefix, with no vendor `sprite` CLI. With a
+    /// non-tty stdin it is the control-plane prefix (chrome git/gh/fs reads,
+    /// the persisted worktree location): runs the command over the sprite's
+    /// native exec API and relays its stdout. With a tty stdin it streams a
+    /// PTY session (raw mode, resize, reattach across network drops) and exits
+    /// with the remote code — or 75 when the stream is lost for good
+    /// (`session list`: `cause:remote-exec-lost`).
     #[command(hide = true)]
     SpriteExec {
         /// The sprite sandbox id (the resolved provider id).
