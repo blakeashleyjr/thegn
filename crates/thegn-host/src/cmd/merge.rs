@@ -202,8 +202,7 @@ fn conflicts(issue: &str, summary: bool, json: bool, decision_args: &[String]) -
     // The CURRENT worktree, not `repo_root()`: that resolves the main checkout,
     // and a reconcile is always in flight in the lane's own linked worktree.
     let cwd = std::env::current_dir().context("`merge conflicts` needs a working directory")?;
-    let root = thegn_core::util::git_out(&cwd, &["rev-parse", "--show-toplevel"])
-        .map(|s| PathBuf::from(s.trim()))
+    let root = thegn_core::util::git_out_path(&cwd, &["rev-parse", "--show-toplevel"])
         .context("`merge conflicts` must run inside a git worktree")?;
     let paths = conflicted_paths(&root)?;
     if paths.is_empty() {

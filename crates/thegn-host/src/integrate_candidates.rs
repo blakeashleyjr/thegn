@@ -26,15 +26,10 @@ pub(crate) struct LocalIdentity {
 }
 
 fn git_path(path: &Path, flag: &str) -> Result<PathBuf> {
-    let value = GitLoc::Local(path.to_path_buf())
-        .git_text(&["rev-parse", "--path-format=absolute", flag])
-        .map_err(|error| anyhow::anyhow!("{error}"))
-        .with_context(|| format!("cannot inspect local Git {flag}"))?;
-    ensure!(
-        !value.is_empty(),
-        "cannot inspect local Git {flag}: empty output"
-    );
-    std::fs::canonicalize(value.trim()).context("cannot canonicalize local Git identity")
+    let value =
+        thegn_core::util::git_out_path(path, &["rev-parse", "--path-format=absolute", flag])
+            .with_context(|| format!("cannot inspect local Git {flag}"))?;
+    std::fs::canonicalize(value).context("cannot canonicalize local Git identity")
 }
 
 impl LocalIdentity {
