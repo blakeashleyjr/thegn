@@ -254,6 +254,39 @@ is refused before launch when its rendered command exceeds 100 KiB. The error
 names the command size and limit and asks you to shorten the task prompt; the
 prompt is never truncated.
 
+## Running an agent in one command
+
+`thegn agent run` is the spawn-wait-read recipe as one command: open a
+headless agent in a worktree, optionally block until it exits, and print what
+it said.
+
+```sh
+thegn agent run --agent codex --worktree ~/wt/fix-login \
+  --brief-file brief.md --var issue=THE-42 --track linear:THE-42 --wait
+```
+
+- The task comes from `--prompt <text>` or `--brief-file <path>` (exactly
+  one; repeat `--var key=value` to render the file's bindings). An empty task
+  is refused before the daemon is contacted, as are the `session open`
+  preflight refusals (for example a malformed `--track` id).
+- The session opens headless and bound to the worktree, through the same path
+  as a plain `session open`. It runs in whatever environment and sandbox the
+  worktree is bound to; it is not adopted into a pane.
+- `--track <issue-id>` writes the plain dispatch row described above, so
+  `dispatch list` and the sidebar see the run. It is optional: ad-hoc runs
+  have no issue.
+- Without `--wait`, the command prints the session id (and
+  `dispatch <row> tracked`) and returns; `--json` prints `{session, row}`.
+- With `--wait`, it attaches as an observer and keeps the last 256 KiB of
+  output until the session exits. It then prints the tail with escape
+  sequences and carriage returns removed: the last 200 non-blank lines. The
+  exit code is 0 when the agent exited 0, 1 for any other exit code, and 2
+  when `--timeout <secs>` (default 3600) elapses first. On a timeout the
+  session is **left running**; the message names it so you can
+  `session wait` on it again or `session close` it. `--json` prints
+  `{session, row, status, exit_code, output_tail, duration_ms}`, where
+  `status` is `exited` or `timeout`.
+
 ## Serving thin clients
 
 ### Watching the event feed
