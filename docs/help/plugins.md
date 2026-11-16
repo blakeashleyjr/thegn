@@ -17,7 +17,7 @@ statusbar segment.
 Two equivalent homes:
 
 - A `[[plugins]]` entry in your config (the full spec: id, name, version,
-  `api = "0.5.0"`, `command = ["…"]`, contributions).
+  `api = "0.6.0"`, `command = ["…"]`, contributions).
 - A directory: `<config dir>/plugins/<name>/plugin.toml` with the same
   fields. Its `cwd` defaults to that directory.
 
