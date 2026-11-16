@@ -456,6 +456,21 @@ pub fn prepare_sandbox_env_with_selection(
     let failover_mode = cfg.env_failover_mode(repo_root, &env_name);
     let ask = matches!(failover_mode, thegn_core::config::FailoverMode::Ask);
     let placement_label = placement.label();
+    // A provider placement with no remote exec transport (daytona/custom with no
+    // `exec_command`) would wrap every argv as a bare `/bin/sh -lc …` — a HOST
+    // shell. Fail closed BEFORE any provisioning or billing, regardless of
+    // `failover`: a provider placement is never a request for the host.
+    if let Some(reason) = placement.transport_refusal() {
+        return Err(SandboxHalt {
+            env_name: env_name.clone(),
+            placement: placement_label.clone(),
+            reason,
+            ask: false,
+            dormant: None,
+            sealed_home: false,
+        }
+        .into());
+    }
     // For a managed-provider env, persist a `GitLoc::Provider` location so the
     // chrome's git/fs reads route into the sandbox via the control-plane exec
     // prefix. `None` for local/ssh/k8s (their data plane is unchanged). The
@@ -769,6 +784,16 @@ pub fn prepare_sandbox_env_with_selection(
     // Same, for a sealed profile whose `$HOME` confidentiality no candidate met.
     let mut home_miss: Option<String> = None;
     let mut compose_miss: Option<String> = None;
+    // A provider placement resolves against its OWN location blob: a stale
+    // Local `loc` (a DB row written while the provider had no transport) would
+    // otherwise `cd` into the HOST worktree path on the remote.
+    let provider_loc = match (&placement, &location, loc) {
+        (thegn_core::placement::Placement::Provider(_), Some(blob), GitLoc::Local(_)) => {
+            Some(GitLoc::from_db(worktree, Some(blob)))
+        }
+        _ => None,
+    };
+    let loc = provider_loc.as_ref().unwrap_or(loc);
     for candidate in sandbox_candidates(&sb) {
         // `resolve_placed_exact`, not `resolve_placed`: `sandbox_candidates` has
         // ALREADY expanded the chain into one explicit candidate per entry, so a
@@ -4364,6 +4389,43 @@ pub struct LaunchExtras<'a> {
     pub widen_permissions: bool,
 }
 
+/// Why a settled sandbox must NOT compose an argv, if it can't reach its
+/// target (defense in depth behind the `prepare_sandbox_env_with_selection`
+/// halt — THE-2044):
+/// - a spec whose provider placement has no remote exec transport (wrapping
+///   would yield a bare `/bin/sh -lc …` on the HOST);
+/// - no spec at all while the outcome still claims a remote/provider env
+///   (`is_remote` or a persisted provider `location`) — the host-shell arm
+///   would silently run a provider/remote env on the host.
+pub(crate) fn host_argv_refusal(sb: &SandboxOutcome) -> Option<String> {
+    match &sb.spec {
+        Some(spec) => spec.placement.transport_refusal(),
+        None if sb.is_remote || sb.location.is_some() => {
+            Some("refusing to run a provider/remote env on the host".to_string())
+        }
+        None => None,
+    }
+}
+
+/// The [`SandboxHalt`] for a [`host_argv_refusal`]. `compose_spec` never
+/// re-resolves the env (no new env-resolution site), so the env name is the
+/// placement family — the provider kind for a provider spec.
+fn host_argv_halt(sb: &SandboxOutcome, reason: String) -> anyhow::Error {
+    let (env_name, placement) = sb.spec.as_ref().map_or_else(
+        || ("remote".to_string(), sb.backend_label.clone()),
+        |s| (s.placement.kind(), s.placement.label()),
+    );
+    SandboxHalt {
+        env_name,
+        placement,
+        reason,
+        ask: false,
+        dormant: None,
+        sealed_home: false,
+    }
+    .into()
+}
+
 /// Pure composition of the final [`LaunchSpec`] from a settled sandbox: argv
 /// (sandbox-wrapped, or a bare login shell on the host fallback), cwd, env,
 /// plus the effective backend label and any fallback warnings.
@@ -4534,6 +4596,9 @@ pub fn compose_spec(
             }
         },
         (Some(spec), _) => {
+            if let Some(reason) = host_argv_refusal(sb) {
+                return Err(host_argv_halt(sb, reason));
+            }
             let entered = sandbox::enter_argv_guarded(spec, &cmd).map_err(|error| {
                 let hint = error.remediation_hint();
                 anyhow::Error::new(error).context(hint)
@@ -4545,6 +4610,10 @@ pub fn compose_spec(
             entered.into_spawned()
         }
         (None, None) => {
+            // Never the host for an env that claims to be remote/provider.
+            if let Some(reason) = host_argv_refusal(sb) {
+                return Err(host_argv_halt(sb, reason));
+            }
             // Host fallback: a login shell so PATH/env expand — still CAPPED. There
             // is no sandbox spec here (no container runtime, or one turned off), but
             // capping is not sandboxing: this pane runs the same builds as any other

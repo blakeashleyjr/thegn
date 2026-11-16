@@ -378,6 +378,13 @@ pub struct ProviderPlacement {
 }
 
 impl ProviderPlacement {
+    /// Whether this placement can actually reach its sandbox: BOTH the
+    /// interactive and control prefixes are non-empty. An empty prefix would
+    /// make [`Self::wrap`] produce a bare `/bin/sh -lc …` — a HOST shell.
+    pub fn has_transport(&self) -> bool {
+        !self.interactive_prefix.is_empty() && !self.control_prefix.is_empty()
+    }
+
     fn wrap(prefix: &[String], argv: &[String]) -> Vec<String> {
         let mut v = prefix.to_vec();
         v.push("/bin/sh".into());
@@ -414,6 +421,21 @@ impl Placement {
     /// command running on the placement.
     pub fn control_forwards_stdin(&self) -> bool {
         matches!(self, Placement::Ssh(_) | Placement::K8s(_))
+    }
+
+    /// Why this placement must not launch anything, if it can't reach its
+    /// target: a provider placement with no remote exec transport (empty
+    /// interactive or control prefix — `daytona`/`custom` with no
+    /// `exec_command`). Wrapping argv for it would run `/bin/sh` on the HOST,
+    /// so callers fail closed on `Some`. `None` for every other placement.
+    pub fn transport_refusal(&self) -> Option<String> {
+        match self {
+            Placement::Provider(p) if !p.has_transport() => Some(format!(
+                "provider env `{}:{}` has no remote exec transport (no exec_command and no built-in bridge)",
+                p.provider, p.id
+            )),
+            _ => None,
+        }
     }
 
     /// The transport/provider *family* only — no host/id — for terse chrome
@@ -606,6 +628,91 @@ pub use crate::retry::ReconnectPolicy;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Regression pin (THE-2044): EVERY provider kind, with default config
+    /// (no exec_command), either reaches its sandbox through a non-host
+    /// prefix or is refused. No provider placement may yield an argv whose
+    /// first element is `/bin/sh` (a host shell). Iterates `Kind::ALL`, so a
+    /// new kind is covered automatically.
+    #[test]
+    fn every_provider_kind_has_a_transport_or_a_refusal() {
+        use crate::config::{EnvConfig, EnvProviderConfig, EnvProviderKind, PlacementMode};
+        use crate::seam::Kind;
+        let sb = crate::config::SandboxConfig::default();
+        let wt = std::path::Path::new("/home/u/code/repo/worktrees/repo/dev");
+        let loc = crate::remote::GitLoc::Local(wt.to_path_buf());
+        for kind in EnvProviderKind::ALL {
+            let envc = EnvConfig {
+                placement: PlacementMode::Provider,
+                provider: EnvProviderConfig {
+                    provider: kind.as_str().into(),
+                    ..Default::default()
+                },
+                ..Default::default()
+            };
+            let p = crate::envbuild::build_env_placement(
+                &envc,
+                &sb,
+                &loc,
+                wt,
+                std::path::Path::new("/home/u/code/repo"),
+            );
+            assert!(p.is_provider(), "{kind}: provider placement expected");
+            if let Some(reason) = p.transport_refusal() {
+                assert!(
+                    reason.contains("no remote exec transport"),
+                    "{kind}: {reason}"
+                );
+                continue;
+            }
+            let argv = vec!["claude".to_string()];
+            for wrapped in [p.interactive_argv(&argv), p.control_argv(&argv)] {
+                assert_ne!(
+                    wrapped.first().map(String::as_str),
+                    Some("/bin/sh"),
+                    "{kind}: provider argv must never be a bare host shell: {wrapped:?}"
+                );
+            }
+        }
+    }
+
+    fn provider(interactive: &[&str], control: &[&str]) -> Placement {
+        let v = |xs: &[&str]| xs.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        Placement::Provider(ProviderPlacement {
+            provider: "daytona".into(),
+            id: "dev".into(),
+            interactive_prefix: v(interactive),
+            control_prefix: v(control),
+            up_command: Vec::new(),
+            down_command: Vec::new(),
+        })
+    }
+
+    #[test]
+    fn transport_refusal_requires_both_prefixes() {
+        assert!(
+            provider(&["x", "--"], &["x", "--"])
+                .transport_refusal()
+                .is_none()
+        );
+        let r = provider(&[], &["x", "--"])
+            .transport_refusal()
+            .expect("empty interactive");
+        assert!(r.contains("`daytona:dev`"), "{r}");
+        assert!(provider(&["x", "--"], &[]).transport_refusal().is_some());
+        assert!(provider(&[], &[]).transport_refusal().is_some());
+        assert!(Placement::Local.transport_refusal().is_none());
+        assert!(
+            Placement::Ssh(SshPlacement::plain(
+                "h".into(),
+                22,
+                false,
+                TransportKind::Ssh
+            ))
+            .transport_refusal()
+            .is_none()
+        );
+    }
 
     #[test]
     fn classify_probe_three_states() {

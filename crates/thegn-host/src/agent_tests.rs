@@ -3876,3 +3876,112 @@ fn spawn_failure_message_names_the_missing_program() {
     let text = spawn_failure_message("x", std::ffi::OsStr::new("fly"), &denied);
     assert!(text.contains("could not run `fly`"), "{text}");
 }
+
+fn empty_provider_placement() -> thegn_core::placement::Placement {
+    thegn_core::placement::Placement::Provider(thegn_core::placement::ProviderPlacement {
+        provider: "daytona".into(),
+        id: "dev".into(),
+        interactive_prefix: Vec::new(),
+        control_prefix: Vec::new(),
+        up_command: Vec::new(),
+        down_command: Vec::new(),
+    })
+}
+
+fn outcome_for(
+    spec: Option<thegn_core::sandbox::SandboxSpec>,
+    is_remote: bool,
+    location: Option<String>,
+) -> SandboxOutcome {
+    SandboxOutcome {
+        spec,
+        backend_label: "none".into(),
+        warnings: Vec::new(),
+        shell: String::new(),
+        is_remote,
+        cwd_override: None,
+        location,
+        degraded_from_provider: false,
+        route_ssh_target: None,
+        admission: crate::sandbox_admission::Admission::for_test(
+            thegn_core::capabilities::IsolationClass::HostProcess,
+        ),
+    }
+}
+
+fn provider_spec_without_transport() -> thegn_core::sandbox::SandboxSpec {
+    let mut spec = sandbox_with_invalid_volume();
+    spec.backend = thegn_core::sandbox::Backend::None;
+    spec.placement = empty_provider_placement();
+    spec.volumes = Vec::new();
+    spec
+}
+
+/// THE-2044: no settled outcome that claims a remote/provider env may compose
+/// a host argv, and a provider spec with no transport is refused.
+#[test]
+fn host_argv_refusal_blocks_remote_host_shells() {
+    // `(None, None)` while the outcome claims a remote env → refused.
+    let r = host_argv_refusal(&outcome_for(None, true, None)).expect("is_remote host shell");
+    assert!(r.contains("on the host"), "{r}");
+    // …or a persisted provider location → refused.
+    let blob = GitLoc::provider_db_string(&["x".to_string(), "--".to_string()], "/workspace");
+    assert!(host_argv_refusal(&outcome_for(None, false, Some(blob))).is_some());
+    // A provider spec with empty prefixes → refused.
+    let r = host_argv_refusal(&outcome_for(
+        Some(provider_spec_without_transport()),
+        true,
+        None,
+    ))
+    .expect("provider spec with no transport");
+    assert!(r.contains("no remote exec transport"), "{r}");
+    // A genuinely local outcome (host or local spec) → allowed.
+    assert!(host_argv_refusal(&outcome_for(None, false, None)).is_none());
+    assert!(
+        host_argv_refusal(&outcome_for(
+            Some(sandbox_with_invalid_volume()),
+            false,
+            None
+        ))
+        .is_none()
+    );
+}
+
+#[test]
+fn compose_spec_refuses_provider_spec_without_transport() {
+    let cfg = Config::default();
+    let loc = GitLoc::from_db("/wt/x", None);
+    let outcome = outcome_for(Some(provider_spec_without_transport()), true, None);
+    let error = compose_spec(
+        &cfg,
+        "/wt/x",
+        None,
+        "shell",
+        &loc,
+        &outcome,
+        LaunchExtras::default(),
+    )
+    .expect_err("a provider spec with no transport must never compose a host argv");
+    let halt = error
+        .downcast_ref::<SandboxHalt>()
+        .expect("refusal is a SandboxHalt");
+    assert!(
+        halt.reason.contains("no remote exec transport"),
+        "{}",
+        halt.reason
+    );
+    assert_eq!(halt.placement, "daytona:dev");
+
+    // The spec-less remote outcome is refused the same way.
+    let error = compose_spec(
+        &cfg,
+        "/wt/x",
+        None,
+        "shell",
+        &loc,
+        &outcome_for(None, true, None),
+        LaunchExtras::default(),
+    )
+    .expect_err("a remote env must never fall back to a host shell here");
+    assert!(error.downcast_ref::<SandboxHalt>().is_some());
+}
