@@ -9,6 +9,7 @@ use crate::egress_admit::EgressSteps;
 use crate::egress_admit::admit_egress;
 use anyhow::{Context, Result};
 use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
 use thegn_core::config::Config;
 use thegn_core::db::Db;
 use thegn_core::remote::GitLoc;
@@ -689,13 +690,103 @@ fn lifecycle(cfg: &Config, worktree: Option<String>, action: Lifecycle) -> Resul
         Lifecycle::Down => {
             outln!("tearing down env {} ({})…", env.name, env.placement.label());
             sshfs(&env, false)?;
+            // Runs a configured `down_command`; for a provider env without one
+            // this is a no-op, so the sandbox itself is destroyed below.
             env.placement
                 .teardown()
                 .map_err(|e| anyhow::anyhow!("env down failed: {e}"))?;
+            if let thegn_core::placement::Placement::Provider(p) = &env.placement {
+                let wt = super::resolve_worktree(worktree)
+                    .to_string_lossy()
+                    .into_owned();
+                return destroy_provider_sandbox(cfg, &env.name, &p.id, &wt);
+            }
             outln!("env {} is down", env.name);
         }
     }
     Ok(())
+}
+
+/// How long `env down` waits for the provider to stop listing a destroyed
+/// sandbox, and how often it asks.
+const DOWN_VERIFY_TIMEOUT: Duration = Duration::from_secs(60);
+const DOWN_VERIFY_POLL: Duration = Duration::from_secs(2);
+
+/// `env down` for a provider env: revoke the sandbox's route-to-host
+/// credential, destroy it through the provider API, and verify the provider no
+/// longer lists it before reporting it down (THE-2019). Only after
+/// verification are the local provisioned marker and the worktree's provider
+/// location cleared.
+fn destroy_provider_sandbox(cfg: &Config, env_name: &str, id: &str, wt: &str) -> Result<()> {
+    if id.is_empty() {
+        outln!("env {env_name} has no recorded sandbox for {wt}; nothing to tear down");
+        return Ok(());
+    }
+    let provider_config = cfg
+        .env
+        .get(env_name)
+        .ok_or_else(|| anyhow::anyhow!("env down failed: no [env.{env_name}] defined"))?
+        .provider
+        .clone();
+    let provider = api_provider(cfg, Some(wt.to_string()))?;
+    msg::warn(&format!(
+        "destroying sandbox {id}: commits made inside it that were not pulled back are lost (`thegn env pull` first)"
+    ));
+    crate::remote_enqueue_auth::revoke_for_sandbox(&provider_config, id, Some(wt))
+        .context("route-to-host credential revocation failed; sandbox left intact")?;
+    crate::agent::block_on_provider(|| async { provider.destroy(id).await })
+        .map_err(|e| anyhow::anyhow!("env down failed: destroy {id} failed: {e}"))?;
+    // A deadline of its own: never shared with any other wait.
+    let deadline = Instant::now() + DOWN_VERIFY_TIMEOUT;
+    let mut list = || crate::agent::block_on_provider(|| async { provider.list().await });
+    let mut sleep = std::thread::sleep;
+    wait_until_gone(&mut list, id, deadline, &mut sleep)?;
+    crate::provider_workdir::clear_provisioned(id);
+    match Db::open() {
+        Ok(db) => {
+            if let Err(e) = db.set_worktree_location(wt, "") {
+                msg::warn(&format!(
+                    "sandbox {id} destroyed, but the provider location for {wt} could not be cleared: {e:#}"
+                ));
+            }
+        }
+        Err(e) => msg::warn(&format!(
+            "sandbox {id} destroyed, but the provider location for {wt} could not be cleared: {e:#}"
+        )),
+    }
+    outln!("env {env_name} is down (sandbox {id} destroyed and verified)");
+    Ok(())
+}
+
+/// Poll `list` until it no longer reports `id`, sleeping [`DOWN_VERIFY_POLL`]
+/// (capped at the time left) between asks. A `list` error before `deadline` is
+/// retried; at the deadline a still-listed id, or a failing list, is an error.
+fn wait_until_gone(
+    list: &mut dyn FnMut() -> anyhow::Result<Vec<String>>,
+    id: &str,
+    deadline: Instant,
+    sleep: &mut dyn FnMut(Duration),
+) -> anyhow::Result<()> {
+    loop {
+        let listed = list();
+        if let Ok(ids) = &listed
+            && !ids.iter().any(|listed_id| listed_id == id)
+        {
+            return Ok(());
+        }
+        let now = Instant::now();
+        if now >= deadline {
+            return match listed {
+                Ok(_) => Err(anyhow::anyhow!(
+                    "env down failed: sandbox {id} still exists after destroy (the provider still lists it); retry, or `thegn env deprovision {id}`"
+                )),
+                Err(e) => Err(anyhow::anyhow!(
+                    "env down: destroy was sent but could not be verified: {e:#}"
+                )),
+            };
+        }
+        sleep(DOWN_VERIFY_POLL.min(deadline.saturating_duration_since(now)));
+    }
 }
 
 /// The `env up` placement step. A **provider** env is provisioned in this
@@ -1110,15 +1201,116 @@ fn set(cfg: &Config, name: &str, worktree: Option<String>, workspace: bool) -> R
         } else {
             outln!("project {repo_s} → env {name}");
         }
+        warn_provider_rows_in_workspace(&db, &repo_s);
     } else {
+        // The env the worktree resolved to before the switch, for the id of a
+        // provider sandbox it may leave behind. Unresolvable is not fatal here.
+        let old_env = resolve_for(cfg, Some(wt.clone()));
         db.set_worktree_env(&wt, name)?;
         if name.is_empty() {
             outln!("cleared env for {wt}");
         } else {
             outln!("worktree {wt} → env {name}");
         }
+        reconcile_location_after_set(cfg, &db, &wt, old_env.as_ref().ok())?;
     }
     Ok(())
+}
+
+/// What `env set` does with a worktree's stored location after the switch.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LocationAction {
+    /// Leave the stored location as it is.
+    Keep,
+    /// Clear it: the worktree now runs from its local checkout.
+    ClearToLocal,
+}
+
+/// A provider location left behind by a switch to a local env would make the
+/// next launch bind the sandbox path (e.g. `/workspace`) on the host (D13).
+fn location_action(old_location_is_remote: bool, new_env_is_local: bool) -> LocationAction {
+    if old_location_is_remote && new_env_is_local {
+        LocationAction::ClearToLocal
+    } else {
+        LocationAction::Keep
+    }
+}
+
+/// Whether a stored `location` value is a managed-provider location. Ssh
+/// locations are not: their worktree path lives on the remote, so there is no
+/// local checkout to fall back to.
+fn is_provider_location(wt: &str, location: Option<&str>) -> bool {
+    matches!(GitLoc::from_db(wt, location), GitLoc::Provider { .. })
+}
+
+/// After `env set` on a worktree: clear a stale provider location when the new
+/// env runs locally. The old sandbox is never destroyed here; its id is named
+/// so the user can deprovision it.
+fn reconcile_location_after_set(
+    cfg: &Config,
+    db: &Db,
+    wt: &str,
+    old_env: Option<&thegn_core::env::Environment>,
+) -> Result<()> {
+    let stored = db
+        .location_for(wt)
+        .with_context(|| format!("read the stored location of {wt}"))?;
+    let old_location_is_remote = is_provider_location(wt, stored.as_deref());
+    if !old_location_is_remote {
+        return Ok(());
+    }
+    // Resolve the new selection as if the worktree were local, so the stale
+    // provider location cannot itself make the default env look remote.
+    let repo_root = repo_root_for(wt);
+    let selection = db.effective_env_checked(wt, &repo_root.to_string_lossy());
+    let local = GitLoc::Local(PathBuf::from(wt));
+    let new_env = resolve_with_selection(cfg, wt, &repo_root, &local, selection)?;
+    if location_action(old_location_is_remote, new_env.placement.is_local()) == LocationAction::Keep
+    {
+        return Ok(());
+    }
+    db.set_worktree_location(wt, "")
+        .with_context(|| format!("clear the provider location of {wt}"))?;
+    outln!(
+        "{wt} now runs locally (env {}); its provider location was cleared",
+        new_env.name
+    );
+    if let Some(old) = old_env
+        && let thegn_core::placement::Placement::Provider(p) = &old.placement
+        && !p.id.is_empty()
+    {
+        msg::warn(&format!(
+            "the previous provider sandbox {} is still running; destroy it with `thegn env deprovision --env {} {}`",
+            p.id, old.name, p.id
+        ));
+    }
+    Ok(())
+}
+
+/// After `env set --workspace`: rows are not rewritten, but a worktree still
+/// carrying a provider location keeps binding its sandbox path. Warn once.
+fn warn_provider_rows_in_workspace(db: &Db, repo_root: &str) {
+    let rows = match db.worktrees() {
+        Ok(rows) => rows,
+        Err(e) => {
+            msg::warn(&format!(
+                "could not check {repo_root}'s worktrees for provider locations: {e:#}"
+            ));
+            return;
+        }
+    };
+    let provider_rows: Vec<&str> = rows
+        .iter()
+        .filter(|row| row.repo_root == repo_root)
+        .filter(|row| is_provider_location(&row.worktree, Some(&row.location)))
+        .map(|row| row.worktree.as_str())
+        .collect();
+    if let Some(first) = provider_rows.first() {
+        msg::warn(&format!(
+            "{} worktree(s) of {repo_root} still carry a provider location (e.g. {first}); the project env does not rebind them: run `thegn env set <env>` on each",
+            provider_rows.len()
+        ));
+    }
 }
 
 fn repo_root_for(wt: &str) -> PathBuf {
@@ -1530,5 +1722,184 @@ mod up_tests {
         let wt = dir.path().to_string_lossy().into_owned();
         provision_headless_blocking(Config::default(), wt, std::time::Duration::from_secs(5))
             .expect("a local worktree needs no provisioning");
+    }
+}
+
+#[cfg(test)]
+mod down_tests {
+    use super::{LocationAction, is_provider_location, location_action, wait_until_gone};
+    use std::cell::RefCell;
+    use std::time::{Duration, Instant};
+
+    type ListAnswer = anyhow::Result<Vec<String>>;
+
+    /// A scripted `provider.list()`: each call pops the next answer.
+    fn scripted(mut answers: Vec<ListAnswer>) -> RefCell<Vec<ListAnswer>> {
+        answers.reverse();
+        RefCell::new(answers)
+    }
+
+    fn far() -> Instant {
+        Instant::now() + Duration::from_secs(3600)
+    }
+
+    #[test]
+    fn gone_on_the_first_list_never_sleeps() {
+        let answers = scripted(vec![Ok(vec!["other".into()])]);
+        let mut list = || answers.borrow_mut().pop().expect("one list call");
+        let mut sleeps: Vec<Duration> = Vec::new();
+        let mut sleep = |d: Duration| sleeps.push(d);
+        wait_until_gone(&mut list, "sbx-1", far(), &mut sleep).expect("gone");
+        assert!(sleeps.is_empty(), "{sleeps:?}");
+        assert!(answers.borrow().is_empty());
+    }
+
+    #[test]
+    fn gone_after_two_polls_sleeps_twice() {
+        let answers = scripted(vec![
+            Ok(vec!["sbx-1".into()]),
+            Err(anyhow::anyhow!("transient 503")),
+            Ok(Vec::new()),
+        ]);
+        let mut list = || answers.borrow_mut().pop().expect("three list calls");
+        let mut sleeps: Vec<Duration> = Vec::new();
+        let mut sleep = |d: Duration| sleeps.push(d);
+        wait_until_gone(&mut list, "sbx-1", far(), &mut sleep).expect("gone after polls");
+        assert_eq!(sleeps, [Duration::from_secs(2), Duration::from_secs(2)]);
+        assert!(answers.borrow().is_empty());
+    }
+
+    #[test]
+    fn still_listed_at_the_deadline_is_an_error() {
+        let answers = scripted(vec![Ok(vec!["sbx-1".into(), "other".into()])]);
+        let mut list = || answers.borrow_mut().pop().expect("one list call");
+        let mut sleeps: Vec<Duration> = Vec::new();
+        let mut sleep = |d: Duration| sleeps.push(d);
+        let error = wait_until_gone(&mut list, "sbx-1", Instant::now(), &mut sleep)
+            .expect_err("a still-listed sandbox fails");
+        let error = format!("{error:#}");
+        assert!(
+            error.contains("env down failed: sandbox sbx-1 still exists after destroy"),
+            "{error}"
+        );
+        assert!(error.contains("thegn env deprovision sbx-1"), "{error}");
+        assert!(sleeps.is_empty(), "{sleeps:?}");
+    }
+
+    #[test]
+    fn a_list_error_at_the_deadline_is_unverified() {
+        let answers = scripted(vec![Err(anyhow::anyhow!("401 unauthorized"))]);
+        let mut list = || answers.borrow_mut().pop().expect("one list call");
+        let mut sleeps: Vec<Duration> = Vec::new();
+        let mut sleep = |d: Duration| sleeps.push(d);
+        let error = wait_until_gone(&mut list, "sbx-1", Instant::now(), &mut sleep)
+            .expect_err("an unverifiable destroy fails");
+        let error = format!("{error:#}");
+        assert!(
+            error.contains("env down: destroy was sent but could not be verified"),
+            "{error}"
+        );
+        assert!(error.contains("401 unauthorized"), "{error}");
+        assert!(sleeps.is_empty(), "{sleeps:?}");
+    }
+
+    #[test]
+    fn location_action_clears_only_a_remote_location_under_a_local_env() {
+        let table = [
+            (true, true, LocationAction::ClearToLocal),
+            (true, false, LocationAction::Keep),
+            (false, true, LocationAction::Keep),
+            (false, false, LocationAction::Keep),
+        ];
+        for (old_remote, new_local, expected) in table {
+            assert_eq!(
+                location_action(old_remote, new_local),
+                expected,
+                "old_remote={old_remote} new_local={new_local}"
+            );
+        }
+    }
+
+    #[test]
+    fn only_a_provider_location_counts_as_a_stale_provider_location() {
+        let provider = thegn_core::remote::GitLoc::provider_db_string(
+            &["sprite".into(), "exec".into(), "--".into()],
+            "/workspace",
+        );
+        let ssh = thegn_core::remote::GitLoc::remote_db_string("box.invalid", 22, false, "/srv/wt");
+        assert!(is_provider_location("/wt", Some(&provider)));
+        assert!(!is_provider_location("/wt", Some(&ssh)));
+        assert!(!is_provider_location("/wt", Some("")));
+        assert!(!is_provider_location("/wt", None));
+    }
+}
+
+#[cfg(test)]
+mod set_location_tests {
+    use super::*;
+    use thegn_core::config::{EnvConfig, PlacementMode};
+
+    fn provider_location() -> String {
+        GitLoc::provider_db_string(
+            &[
+                "sprite".into(),
+                "exec".into(),
+                "-s".into(),
+                "x".into(),
+                "--".into(),
+            ],
+            "/workspace",
+        )
+    }
+
+    fn registered(location: Option<&str>) -> (tempfile::TempDir, String, Db) {
+        let dir = tempfile::tempdir().expect("temporary worktree");
+        let wt = dir.path().to_string_lossy().into_owned();
+        let db = Db::open().expect("isolated db");
+        db.put_worktree("repo/env", &wt, &wt, "feature", location, None)
+            .expect("register worktree");
+        (dir, wt, db)
+    }
+
+    #[test]
+    fn switching_a_provider_row_to_the_local_default_clears_its_location() {
+        let _state = crate::testenv::IsolatedState::new();
+        let (_dir, wt, db) = registered(Some(&provider_location()));
+        db.set_worktree_env(&wt, "").expect("clear env");
+        reconcile_location_after_set(&Config::default(), &db, &wt, None)
+            .expect("reconcile succeeds");
+        let stored = db.location_for(&wt).expect("read location");
+        assert!(!is_provider_location(&wt, stored.as_deref()), "{stored:?}");
+    }
+
+    #[test]
+    fn a_provider_row_switched_to_a_provider_env_keeps_its_location() {
+        let _state = crate::testenv::IsolatedState::new();
+        let location = provider_location();
+        let (_dir, wt, db) = registered(Some(&location));
+        let mut cfg = Config::default();
+        cfg.env.insert(
+            "fly".into(),
+            EnvConfig {
+                placement: PlacementMode::Provider,
+                ..Default::default()
+            },
+        );
+        db.set_worktree_env(&wt, "fly").expect("select env");
+        reconcile_location_after_set(&cfg, &db, &wt, None).expect("reconcile succeeds");
+        assert_eq!(
+            db.location_for(&wt).expect("read location").as_deref(),
+            Some(location.as_str())
+        );
+    }
+
+    #[test]
+    fn a_local_row_is_left_alone() {
+        let _state = crate::testenv::IsolatedState::new();
+        let (_dir, wt, db) = registered(None);
+        reconcile_location_after_set(&Config::default(), &db, &wt, None)
+            .expect("reconcile succeeds");
+        let stored = db.location_for(&wt).expect("read location");
+        assert!(stored.as_deref().unwrap_or("").is_empty(), "{stored:?}");
     }
 }
