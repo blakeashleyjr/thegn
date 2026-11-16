@@ -14,6 +14,7 @@
 //! [`LoadingTracker::rename`] (no `DerefMut`), which is what makes the
 //! timing guarantee hold.
 
+use std::cell::RefCell;
 use std::collections::HashMap;
 use std::time::Instant;
 
@@ -31,7 +32,16 @@ pub(crate) struct LoadingTracker {
     /// `effective_env` lookup, so a local pick against a provider ambient
     /// default doesn't briefly show the provider. Cleared with the steps.
     env: HashMap<Key, String>,
+    /// Splash-context memo keyed by `(worktree, selected env)`; see
+    /// [`LoadingTracker::load_context`]. Loop-owned (never sent across threads).
+    ctx_memo: RefCell<HashMap<CtxKey, Vec<(String, String)>>>,
 }
+
+/// `(worktree, wizard-selected env)` — the inputs `loading_context` varies on.
+type CtxKey = (String, Option<String>);
+
+/// Most memo entries kept before the memo is cleared wholesale.
+const CTX_MEMO_MAX: usize = 32;
 
 impl std::ops::Deref for LoadingTracker {
     type Target = HashMap<Key, Vec<LoadStep>>;
@@ -96,6 +106,7 @@ impl LoadingTracker {
     }
 
     pub(crate) fn remove(&mut self, key: &Key) -> Option<Vec<LoadStep>> {
+        self.ctx_memo.get_mut().clear();
         self.env.remove(key);
         self.map.remove(key)
     }
@@ -103,6 +114,7 @@ impl LoadingTracker {
     /// Move an entry to a new key verbatim (worktree-creation settles its
     /// optimistic name); stamps ride along untouched.
     pub(crate) fn rename(&mut self, old: &Key, new: Key) {
+        self.ctx_memo.get_mut().clear();
         if let Some(env) = self.env.remove(old) {
             self.env.insert(new.clone(), env);
         }
@@ -129,6 +141,7 @@ impl LoadingTracker {
                 })
                 .collect();
         }
+        self.ctx_memo.get_mut().clear();
         rekey(&mut self.map, group, closed);
         rekey(&mut self.env, group, closed);
     }
@@ -137,6 +150,7 @@ impl LoadingTracker {
     /// context block reflects the actual pick before the DB row exists. Empty
     /// is a no-op (no override → fall back to the DB lookup).
     pub(crate) fn set_env(&mut self, key: Key, env: &str) {
+        self.ctx_memo.get_mut().clear();
         if env.trim().is_empty() {
             return;
         }
@@ -155,6 +169,11 @@ impl LoadingTracker {
     /// worker's Register step, so a local pick against a provider ambient default
     /// would otherwise briefly show the provider. Called from the event loop; the
     /// resolution lives here (not inline in run.rs) to keep that god-file flat.
+    ///
+    /// Memoised per `(worktree, selected env)` so the per-frame call does not
+    /// reopen the DB: a config or DB change mid-splash shows on the next splash
+    /// (the memo entry is dropped when the steps empty, and the whole memo on
+    /// `set_env`/`remove`/`rename`/`on_tab_closed`).
     pub(crate) fn load_context(
         &self,
         steps: &[LoadStep],
@@ -162,11 +181,36 @@ impl LoadingTracker {
         cfg: &thegn_core::config::Config,
         akey: Option<&Key>,
     ) -> Vec<(String, String)> {
-        if steps.is_empty() {
+        let selected = akey.and_then(|k| self.env_for(k));
+        self.memoised_context(steps.is_empty(), worktree, selected, || {
+            loading_context(cfg, worktree, selected)
+        })
+    }
+
+    /// The memo logic behind [`Self::load_context`], with the compute step
+    /// injected so it is testable without a DB.
+    fn memoised_context(
+        &self,
+        steps_empty: bool,
+        worktree: &str,
+        selected: Option<&str>,
+        compute: impl FnOnce() -> Vec<(String, String)>,
+    ) -> Vec<(String, String)> {
+        let mut memo = self.ctx_memo.borrow_mut();
+        if steps_empty {
+            memo.retain(|(w, _), _| w != worktree);
             return Vec::new();
         }
-        let selected = akey.and_then(|k| self.env_for(k));
-        loading_context(cfg, worktree, selected)
+        let key: CtxKey = (worktree.to_string(), selected.map(str::to_string));
+        if let Some(hit) = memo.get(&key) {
+            return hit.clone();
+        }
+        let out = compute();
+        if memo.len() >= CTX_MEMO_MAX {
+            memo.clear();
+        }
+        memo.insert(key, out.clone());
+        out
     }
 
     /// Provisioning finished; only the shell attach remains. Advance the
@@ -248,7 +292,9 @@ pub(crate) fn loading_context(
     use thegn_core::repo;
     use thegn_core::store::WorkspaceStore;
     let loc = GitLoc::for_worktree(Path::new(worktree));
-    let repo_root: PathBuf = Db::open()
+    let db = Db::open();
+    let repo_root: PathBuf = db
+        .as_ref()
         .ok()
         .and_then(|db| db.repo_root_for(worktree).ok().flatten())
         .filter(|s| !s.is_empty())
@@ -260,7 +306,7 @@ pub(crate) fn loading_context(
     // selection is shown as such, never as the default environment.
     let selected = match selected {
         Some(selected) => Some(selected.to_owned()),
-        None => match Db::open()
+        None => match db
             .and_then(|db| db.effective_env_checked(worktree, &repo_root.to_string_lossy()))
         {
             Ok(selected) => selected,
@@ -345,6 +391,72 @@ mod tests {
 
     fn key() -> Key {
         ("wt".to_string(), 0)
+    }
+
+    fn ctx(v: &str) -> Vec<(String, String)> {
+        vec![("env".to_string(), v.to_string())]
+    }
+
+    #[test]
+    fn ctx_memo_hit_and_miss() {
+        let t = LoadingTracker::default();
+        let calls = std::cell::Cell::new(0);
+        let run = |sel: Option<&str>| {
+            t.memoised_context(false, "wt", sel, || {
+                calls.set(calls.get() + 1);
+                ctx("a")
+            })
+        };
+        assert_eq!(run(None), ctx("a"));
+        assert_eq!(run(None), ctx("a"));
+        assert_eq!(calls.get(), 1, "second call is a memo hit");
+        run(Some("x"));
+        assert_eq!(calls.get(), 2, "different selection misses");
+    }
+
+    #[test]
+    fn ctx_memo_empty_steps_clears_worktree_entry() {
+        let t = LoadingTracker::default();
+        t.memoised_context(false, "wt", None, || ctx("a"));
+        t.memoised_context(false, "other", None, || ctx("b"));
+        assert!(
+            t.memoised_context(true, "wt", None, || ctx("zzz"))
+                .is_empty()
+        );
+        assert_eq!(t.ctx_memo.borrow().len(), 1, "only wt's entry dropped");
+        let out = t.memoised_context(false, "wt", None, || ctx("c"));
+        assert_eq!(out, ctx("c"), "recomputed after clear");
+    }
+
+    #[test]
+    fn ctx_memo_invalidated_by_mutators() {
+        let seed = |t: &LoadingTracker| {
+            t.memoised_context(false, "wt", None, || ctx("a"));
+            assert_eq!(t.ctx_memo.borrow().len(), 1);
+        };
+        let mut t = LoadingTracker::default();
+        seed(&t);
+        t.set_env(key(), "local");
+        assert!(t.ctx_memo.borrow().is_empty(), "set_env");
+        seed(&t);
+        t.remove(&key());
+        assert!(t.ctx_memo.borrow().is_empty(), "remove");
+        seed(&t);
+        t.rename(&key(), ("wt2".to_string(), 0));
+        assert!(t.ctx_memo.borrow().is_empty(), "rename");
+        seed(&t);
+        t.on_tab_closed("wt", 0);
+        assert!(t.ctx_memo.borrow().is_empty(), "on_tab_closed");
+    }
+
+    #[test]
+    fn ctx_memo_is_bounded() {
+        let t = LoadingTracker::default();
+        for i in 0..100 {
+            t.memoised_context(false, &format!("wt{i}"), None, || ctx("a"));
+            assert!(t.ctx_memo.borrow().len() <= CTX_MEMO_MAX);
+        }
+        assert_eq!(t.ctx_memo.borrow().len(), 100 - CTX_MEMO_MAX * 3);
     }
 
     #[test]
