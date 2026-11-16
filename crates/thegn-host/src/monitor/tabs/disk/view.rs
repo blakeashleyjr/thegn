@@ -783,6 +783,18 @@ impl TabView for DiskView<'_> {
                         let (read_len, read_peak) = history.read.copy_normalized(&mut read);
                         let mut write = [0.0; HISTORY];
                         let (write_len, write_peak) = history.write.copy_normalized(&mut write);
+                        paint_device_minicores(
+                            surface,
+                            Rect {
+                                x: rect.x + 1,
+                                // Third body row: left of the mirrored plot, below the peaks label.
+                                y: rect.y + row * 3 + 3,
+                                cols: rect.cols.min(37).saturating_sub(1),
+                                rows: 1,
+                            },
+                            &read[..read_len],
+                            &write[..write_len],
+                        );
                         if rect.cols > 39 {
                             let plot = Rect {
                                 x: rect.x + 38,
@@ -843,6 +855,46 @@ impl TabView for DiskView<'_> {
                 }
             }
         }
+    }
+}
+
+/// Narrowest half-row that still reads as `label spark pct`.
+const MINICORE_MIN_COLS: usize = 8;
+
+/// Paint `rd`/`wr` minicore rows side by side in one row of `area`.
+/// Values are peak-normalised, so the percentage is relative to the peak.
+fn paint_device_minicores(surface: &mut Surface, area: Rect, read: &[f32], write: &[f32]) {
+    let half = area.cols / 2;
+    if half < MINICORE_MIN_COLS || area.rows == 0 {
+        return;
+    }
+    let last_pct = |values: &[f32]| {
+        values
+            .iter()
+            .rev()
+            .find(|value| value.is_finite())
+            .map_or(0.0, |value| f64::from(*value) * 100.0)
+    };
+    for (index, (label, values, ramp)) in [("rd", read, RampId::Read), ("wr", write, RampId::Write)]
+        .into_iter()
+        .enumerate()
+    {
+        if values.is_empty() {
+            continue;
+        }
+        crate::monitor::graphs::paint_minicore_row(
+            label,
+            values,
+            last_pct(values),
+            ramp,
+            Rect {
+                x: area.x + index * half,
+                y: area.y,
+                cols: half,
+                rows: 1,
+            },
+            surface,
+        );
     }
 }
 
