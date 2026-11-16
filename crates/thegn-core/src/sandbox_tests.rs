@@ -4623,6 +4623,16 @@ fn sealed_container_reuse_requires_exact_mounts_and_a_matching_seal_label() {
         judge_inspect(exact, &required, true, false, "fp"),
         (true, true)
     );
+    assert_eq!(
+        judge_inspect(
+            "RUNNING\n1\nfp\n/wt\n/nix/store\n/dev/null\n",
+            &required,
+            true,
+            false,
+            "fp"
+        ),
+        (true, true)
+    );
     // (a) a superset (a hardened container that also binds ~/.gnupg) is refused
     // for a sealed spec, though it is fine for a non-sealed one.
     let superset = "RUNNING\n1\nfp\n/wt\n/nix/store\n/home/u/.gnupg\n";
