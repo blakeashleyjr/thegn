@@ -365,6 +365,29 @@ processes are trimmed first, then panes, behind a "+N more" row; workspaces
 and worktrees always show. Like the Processes tab, sampling happens only while
 the popup is open.
 
+#### Gate and agent jobs
+
+thegn runs its merge-queue gate and queued agent handoffs in named transient
+scopes inside `thegn.slice` (`thegn-gate-<worktree>-…`,
+`thegn-agent-<worktree>-…`). The popup reads each scope's CPU and memory
+straight from its cgroup and lists it as a `gate` or `agent` row under the
+worktree it belongs to, adding to that worktree's total. A job whose worktree
+has no pane open lists under the `thegn` group as `gate · <worktree>`. Every
+other job thegn caps (language servers, hooks, voice, capped panes) runs in an
+anonymous scope, and their sum is one `thegn jobs (unnamed)` row under
+`thegn`.
+
+The scopes and the process tree overlap: a capped pane's shell runs inside an
+anonymous scope, and a gate is usually a child of the UI. So the job rows are
+a breakdown, not an addend. The `thegn` row stays UI plus daemon, and
+`outside thegn` subtracts whichever is larger, the process-tree total or the
+scope total. When that comes out negative it is clamped, as above.
+
+Job rows need cgroup v2 with the user's `thegn.slice` present (a systemd user
+session with CPU delegation). Without either, or when jobs fall back to the
+soft `nice` cap, no job rows appear and the rest of the tree is unchanged.
+CPU for a job shows `—` until its second reading.
+
 ## Containers
 
 The Containers tab lists every container on the machine across the detected
