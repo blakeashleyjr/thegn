@@ -330,16 +330,27 @@ pub fn xdg_carveout_report_at(
         .iter()
         .filter_map(|rel| {
             let mut p = home.join(rel);
-            // A symlinked carve (a HOME-swapped profile's `.claude/projects` ->
-            // `~/.claude/projects`) is bound at its canonical target for BOTH
-            // ends: bwrap refuses a symlink destination, and inside the sandbox
-            // the alias still resolves through the bind because local placements
-            // mirror the host tree. An unresolvable link is skipped.
+            // A symlinked carve is skipped, except a HOME-swapped profile's
+            // `.claude/projects` -> `<ancestor of $HOME>/.claude/projects`, which
+            // is bound at its canonical target for BOTH ends: bwrap refuses a
+            // symlink destination, and inside the sandbox the alias still
+            // resolves through the bind because local placements mirror the host
+            // tree. An unresolvable link is skipped.
             if std::fs::symlink_metadata(&p).is_ok_and(|m| m.file_type().is_symlink()) {
+                // Only a HOME-swapped profile's `.claude/projects` link is followed, and only
+                // to the shared `<ancestor of $HOME>/.claude/projects`: a planted link
+                // (`~/tmp -> ~/.ssh`, `.zsh_history -> ~/.ssh/authorized_keys`) must never
+                // become a writable bind.
+                if *rel != ".claude/projects" {
+                    return None;
+                }
                 p = p.canonicalize().ok()?;
-                // A writable carve must never land on a system tree through a
-                // planted link (`~/.keychain -> /etc`).
-                if carve_target_is_system(&p) {
+                let home_canon = home.canonicalize().ok()?;
+                let shared = p.ends_with(".claude/projects")
+                    && p.parent()
+                        .and_then(Path::parent)
+                        .is_some_and(|base| home_canon.starts_with(base));
+                if !shared || carve_target_is_system(&p) {
                     return None;
                 }
             }
@@ -2016,7 +2027,7 @@ mod tests {
         let system_tmp = carve_target_is_system(&td.path().canonicalize().unwrap());
         let shared = td.path().join("real-home/.claude/projects");
         std::fs::create_dir_all(&shared).unwrap();
-        let home = td.path().join("profile-home");
+        let home = td.path().join("real-home/.claude-profiles/p");
         std::fs::create_dir_all(home.join(".claude")).unwrap();
         std::os::unix::fs::symlink(&shared, home.join(".claude/projects")).unwrap();
         let no_env = |_: &str| None;
@@ -2051,6 +2062,36 @@ mod tests {
             "/home/u/.claude/projects"
         )));
         assert!(!carve_target_is_system(Path::new("/etcetera")));
+
+        // A planted non-projects link is never followed.
+        std::fs::create_dir_all(td.path().join("secret")).unwrap();
+        std::os::unix::fs::symlink(td.path().join("secret"), home.join("tmp")).unwrap();
+        let (mounts, _) = xdg_carveout_report_at(SandboxProfile::Hardened, &home, &no_env);
+        let secret = td
+            .path()
+            .join("secret")
+            .canonicalize()
+            .unwrap()
+            .to_string_lossy()
+            .into_owned();
+        assert!(!mounts.iter().any(|m| m.host == secret), "{mounts:?}");
+
+        // A projects link to anything but `<ancestor of $HOME>/.claude/projects`
+        // is never followed.
+        std::fs::remove_file(home.join(".claude/projects")).unwrap();
+        std::fs::create_dir_all(td.path().join("elsewhere/projects")).unwrap();
+        std::os::unix::fs::symlink(
+            td.path().join("elsewhere/projects"),
+            home.join(".claude/projects"),
+        )
+        .unwrap();
+        let (mounts, _) = xdg_carveout_report_at(SandboxProfile::Hardened, &home, &no_env);
+        assert!(
+            !mounts
+                .iter()
+                .any(|m| m.host.ends_with("/elsewhere/projects")),
+            "{mounts:?}"
+        );
 
         // Dangling link: skipped, never emitted.
         std::fs::remove_file(home.join(".claude/projects")).unwrap();

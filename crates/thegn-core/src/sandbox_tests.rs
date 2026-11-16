@@ -6482,7 +6482,11 @@ fn bwrap_bind_dest_table() {
         }
         Some(p.to_path_buf())
     };
-    let roots = vec![PathBuf::from("/home/u"), PathBuf::from("/srv")];
+    let roots = [
+        PathBuf::from("/home/u"),
+        PathBuf::from("/srv"),
+        PathBuf::from("/alias"),
+    ];
     let src = std::path::Path::new("/home/u/src");
     let p = std::path::Path::new;
     // Plain dir: unchanged.
@@ -6495,10 +6499,9 @@ fn bwrap_bind_dest_table() {
         bwrap_bind_dest(src, p("/home/u/link"), &roots, &resolve),
         DestFix::Rewrite(PathBuf::from("/home/u/real"))
     );
-    // Dest symlinked to its own source: one bind at the source path, even with
-    // no root covering it.
+    // Dest symlinked to its own source: one bind at the source path.
     assert_eq!(
-        bwrap_bind_dest(src, p("/home/u/self"), &[], &resolve),
+        bwrap_bind_dest(src, p("/home/u/self"), &roots, &resolve),
         DestFix::Rewrite(src.to_path_buf())
     );
     // Symlinked ancestor.
@@ -6518,16 +6521,23 @@ fn bwrap_bind_dest_table() {
     );
     // `starts_with` is component-wise: `/home/uX` is not under `/home/u`.
     let sibling = |p: &std::path::Path| -> Option<PathBuf> {
-        (p == std::path::Path::new("/a/link")).then(|| PathBuf::from("/home/uX"))
+        (p == std::path::Path::new("/home/u/a-link")).then(|| PathBuf::from("/home/uX"))
     };
     assert_eq!(
-        bwrap_bind_dest(src, p("/a/link"), &roots, &sibling),
+        bwrap_bind_dest(src, p("/home/u/a-link"), &roots, &sibling),
         DestFix::Drop
+    );
+    // Not under any visible root: bwrap creates it, alias kept.
+    assert_eq!(
+        bwrap_bind_dest(src, p("/uncovered/link"), &roots, &|_: &std::path::Path| {
+            Some(PathBuf::from("/elsewhere"))
+        }),
+        DestFix::Keep
     );
 }
 
 #[test]
-fn fix_bind_dests_never_rewrites_against_its_own_dest() {
+fn fix_bind_dests_keeps_uncovered_and_rewrites_covered() {
     // A mount's own (aliased) destination is not a root for itself.
     let mut s = spec(Backend::Bwrap);
     s.mounts = vec![Mount {
@@ -6544,18 +6554,19 @@ fn fix_bind_dests_never_rewrites_against_its_own_dest() {
         }
     };
     fix_bind_dests(&mut s, &resolve);
-    assert!(s.mounts.is_empty(), "{:?}", s.mounts);
+    assert_eq!(s.mounts.len(), 1);
+    assert_eq!(s.mounts[0].dest, "/link");
 
     // Under the bwrap substrate: rewritten.
     let mut s = spec(Backend::Bwrap);
     s.mounts = vec![Mount {
         host: "/src".into(),
-        dest: "/link".into(),
+        dest: "/etc/link".into(),
         ro: true,
         cache: false,
     }];
     let into_etc = |p: &std::path::Path| -> Option<PathBuf> {
-        if p == std::path::Path::new("/link") {
+        if p == std::path::Path::new("/etc/link") {
             Some(PathBuf::from("/etc/target"))
         } else {
             Some(p.to_path_buf())
@@ -6622,12 +6633,20 @@ fn dest_symlink_to_own_source_binds_once() {
     let shared_s = shared.to_string_lossy().into_owned();
     let alias_s = alias.to_string_lossy().into_owned();
     let mut s = spec(Backend::Bwrap);
-    s.mounts = vec![Mount {
-        host: alias_s.clone(),
-        dest: alias_s.clone(),
-        ro: false,
-        cache: false,
-    }];
+    s.mounts = vec![
+        Mount {
+            host: base.join("profile").to_string_lossy().into_owned(),
+            dest: base.join("profile").to_string_lossy().into_owned(),
+            ro: true,
+            cache: false,
+        },
+        Mount {
+            host: alias_s.clone(),
+            dest: alias_s.clone(),
+            ro: false,
+            cache: false,
+        },
+    ];
 
     let argv = enter_argv(&s, "true").expect("a self-aliased destination binds once");
     assert!(
