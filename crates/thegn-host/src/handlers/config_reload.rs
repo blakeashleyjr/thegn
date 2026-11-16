@@ -538,6 +538,12 @@ mod tests {
                 "{edit:?} must classify under {hook:?}: {plan:?}"
             );
             let mut fx = Fixture::new(&old);
+            // Seed from the old config as the live panel does: the default
+            // docs carry a UTC home, which differs from the effective (local)
+            // home zone on any non-UTC machine and would make the calendar
+            // edit a home change that drops the loaded months.
+            fx.panel_ui.docs.calendar =
+                crate::calendar_docs::CalendarDocs::from_config(&old.calendar, None);
             fx.panel_ui.docs.calendar.loaded.insert((2026, 11));
             let help_before = Arc::clone(&fx.help_registry);
             let out = fx.apply_plan(&plan, &new);
