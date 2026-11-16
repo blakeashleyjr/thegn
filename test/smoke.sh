@@ -18,6 +18,9 @@ SZ="$(cd "$(dirname "$SZ")" && pwd)/$(basename "$SZ")"
   exit 1
 }
 
+# shellcheck source=test/lib/podman_pause.sh disable=SC1091
+source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/lib/podman_pause.sh"
+
 TMP="$(mktemp -d)"
 SMOKE_RUNTIME_DIR=""
 FIXTURE_DAEMON_PIDS=()
@@ -96,10 +99,7 @@ cleanup() {
   # Cleanup must stay inside this test's runtime root even if a signal arrives
   # before the isolated XDG_RUNTIME_DIR export below.
   if [[ -n $SMOKE_RUNTIME_DIR ]]; then
-    local pause_pid_file="$SMOKE_RUNTIME_DIR/libpod/tmp/pause.pid"
-    if [[ -f $pause_pid_file ]]; then
-      kill "$(cat "$pause_pid_file" 2>/dev/null)" 2>/dev/null || true
-    fi
+    podman_pause_reap "$SMOKE_RUNTIME_DIR"
   fi
   if [[ -n $SMOKE_RUNTIME_DIR && -d $SMOKE_RUNTIME_DIR ]]; then
     rm -rf "$SMOKE_RUNTIME_DIR" 2>/dev/null || true
