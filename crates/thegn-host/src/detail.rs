@@ -236,6 +236,10 @@ pub use ci_drill::{CiDetailPayload, apply_ci_detail};
 /// private fields, and lives outside `detail.rs` to keep it under the cap.
 pub(crate) mod calendar;
 pub use calendar::{CalendarPayload, apply_calendar, retick_open};
+/// The `cpu`/`mem` popups' workspace → worktree → pane attribution tree.
+pub(crate) mod cpu_attrib;
+/// The masthead `fleet` widget's provider-VM cost popup.
+pub(crate) mod fleet;
 mod usage_dash;
 use ci_drill::{ci_fmt_secs, ci_glyph_marker, ci_state_word};
 pub use usage_dash::{
@@ -1597,14 +1601,24 @@ fn widget_detail_inner(
                 av * 100.0,
                 mx * 100.0
             );
-            Some(graph(
-                "CPU history",
-                "CPU",
+            // The history graph, then who is using it (heaviest CPU first).
+            let mut secs = vec![Section::Graph(GraphSection {
+                label: "CPU".into(),
                 cur,
-                footer,
+                footer: Some(footer),
                 series,
-                Tok::Hue(Hue::Teal),
+                tone: Tok::Hue(Hue::Teal),
+                height: 5,
+                series2: None,
+                ..Default::default()
+            })];
+            secs.extend(cpu_attrib::sections_for(model, cpu_attrib::TITLE).unwrap_or_default());
+            Some(sections(
+                cpu_attrib::TITLE,
+                cpu_attrib::COLS,
+                secs,
                 near,
+                ctx.screen,
             ))
         }
         "mem" => {
@@ -1658,7 +1672,15 @@ fn widget_detail_inner(
                     tone: Tok::Hue(Hue::Blue),
                 });
             }
-            Some(sections("Memory", 40, secs, near, ctx.screen))
+            // Who holds it, heaviest resident set first.
+            secs.extend(cpu_attrib::sections_for(model, cpu_attrib::MEM_TITLE).unwrap_or_default());
+            Some(sections(
+                cpu_attrib::MEM_TITLE,
+                cpu_attrib::COLS,
+                secs,
+                near,
+                ctx.screen,
+            ))
         }
         "temp" => {
             s.cpu_temp_c?;
@@ -1981,6 +2003,7 @@ fn widget_detail_inner(
         // existing path rather than earning a popup of its own — the reading it
         // would show in full is already a block in this one.
         "date" | "clock" | "weather" => calendar::open(ctx, near, model),
+        "fleet" => fleet::open(model, ctx, near),
         // The opt-in queue widget is only a door to the existing unified
         // surface; it must not grow a second queue-row implementation here.
         "mq" => unified_detail(model, ctx.screen),

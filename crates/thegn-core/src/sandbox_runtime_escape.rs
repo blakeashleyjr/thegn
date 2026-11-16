@@ -3,10 +3,11 @@
 //! A sandbox mount that exposes the user runtime directory (for example
 //! `/run/user`) also exposes the user bus, the podman/docker sockets and the
 //! systemd user manager: any of them runs code outside the sandbox
-//! (`systemd-run --user`, `podman run`). bwrap masks these entries after every
-//! bind; the systemd backend makes them inaccessible. This module is pure: the
-//! filesystem probe is injected, and `config validate` passes the runtime dir
-//! and home from its call site.
+//! (`systemd-run --user`, `podman run`). bwrap and local podman/docker mask
+//! these entries after every bind; the systemd backend makes them
+//! inaccessible. The planner is pure (the filesystem probe is injected);
+//! [`host_runtime_escape_masks`] is the one wrapper that reads the host, and
+//! `config validate` passes the runtime dir and home from its call site.
 
 use std::path::{Path, PathBuf};
 
@@ -113,6 +114,69 @@ pub(crate) fn mounts_expose(runtime_dir: &Path, mounts: &[(&Path, &Path)]) -> bo
     mounts.iter().any(|(host, _)| runtime_dir.starts_with(host))
 }
 
+/// The masks a sandbox needs when its binds are `mounts` (`(host, dest)`
+/// pairs, host paths already canonical) and the host runtime dir is
+/// `runtime_dir` (canonical). Empty when no mount exposes the runtime dir.
+/// Shared by the bwrap argv and the local OCI argv.
+pub(crate) fn runtime_escape_masks(
+    runtime_dir: &Path,
+    mounts: &[(&Path, &Path)],
+    explicit_dests: &[&Path],
+    kind_of: &dyn Fn(&Path) -> Option<EscapeKind>,
+) -> Vec<EscapeMask> {
+    if !mounts_expose(runtime_dir, mounts) {
+        return Vec::new();
+    }
+    let escapes = host_escape_paths(runtime_dir, kind_of);
+    plan_escape_masks(&escapes, mounts, explicit_dests)
+}
+
+/// [`runtime_escape_masks`] against the real host: canonicalizes the runtime
+/// dir and every mount host (a symlinked or `..` source such as `/var/run`
+/// exposes the runtime dir too) and reads entry kinds with
+/// `symlink_metadata`. No runtime dir, or the bare `/run/user` fallback,
+/// yields no masks.
+pub(crate) fn host_runtime_escape_masks(
+    raw_runtime_dir: Option<&Path>,
+    mounts: &[(&Path, &Path)],
+    explicit_dests: &[&Path],
+) -> Vec<EscapeMask> {
+    let Some(raw_runtime_dir) = raw_runtime_dir.filter(|dir| *dir != Path::new("/run/user")) else {
+        return Vec::new();
+    };
+    let runtime_dir =
+        std::fs::canonicalize(raw_runtime_dir).unwrap_or_else(|_| raw_runtime_dir.to_path_buf());
+    let canonical_hosts: Vec<PathBuf> = mounts
+        .iter()
+        .map(|(host, _)| std::fs::canonicalize(host).unwrap_or_else(|_| host.to_path_buf()))
+        .collect();
+    let canonical_refs: Vec<(&Path, &Path)> = canonical_hosts
+        .iter()
+        .zip(mounts)
+        .map(|(host, (_, dest))| (host.as_path(), *dest))
+        .collect();
+    runtime_escape_masks(&runtime_dir, &canonical_refs, explicit_dests, &|path| {
+        kind_from_metadata(std::fs::symlink_metadata(path).ok().as_ref())
+    })
+}
+
+/// The podman/docker spelling of `masks`: a tmpfs per directory and a
+/// read-only `/dev/null` bind per socket.
+pub(crate) fn oci_mask_args(masks: &[EscapeMask]) -> Vec<String> {
+    let mut args = Vec::new();
+    for mask in masks {
+        match mask {
+            EscapeMask::Tmpfs(dest) => {
+                args.extend(["--tmpfs".to_string(), dest.display().to_string()]);
+            }
+            EscapeMask::NullBind(dest) => {
+                args.extend(["-v".to_string(), format!("/dev/null:{}:ro", dest.display())]);
+            }
+        }
+    }
+    args
+}
+
 /// `config validate` warnings for mounts that expose `$XDG_RUNTIME_DIR` or make
 /// `~/.claude-profiles` writable. `mounts` pairs a config path label with the raw
 /// spec. Unparseable specs are skipped (the parser warning already covers them).
@@ -167,7 +231,8 @@ fn covers_a_uid_runtime_dir(host: &Path) -> bool {
 mod tests {
     use super::{
         ESCAPE_ENTRIES, EscapeKind, EscapeMask, exposure_warnings, host_escape_paths,
-        kind_from_metadata, mounts_expose, plan_escape_masks,
+        host_runtime_escape_masks, kind_from_metadata, mounts_expose, oci_mask_args,
+        plan_escape_masks, runtime_escape_masks,
     };
     use std::path::{Path, PathBuf};
 
@@ -314,6 +379,83 @@ mod tests {
             plan_escape_masks(&escapes, &[(run_user, run_user), (run_user, run_user)], &[]),
             vec![EscapeMask::NullBind(rt().join("bus"))]
         );
+    }
+
+    #[test]
+    fn runtime_escape_masks_needs_an_exposing_mount() {
+        let run_user = Path::new("/run/user");
+        let masks = runtime_escape_masks(&rt(), &[(run_user, run_user)], &[run_user], &all_present);
+        assert_eq!(masks.len(), 5);
+        assert_eq!(
+            masks,
+            plan_escape_masks(
+                &host_escape_paths(&rt(), &all_present),
+                &[(run_user, run_user)],
+                &[run_user]
+            )
+        );
+        let gnupg = rt().join("gnupg");
+        assert!(
+            runtime_escape_masks(
+                &rt(),
+                &[(gnupg.as_path(), gnupg.as_path())],
+                &[],
+                &all_present
+            )
+            .is_empty()
+        );
+        assert!(runtime_escape_masks(&rt(), &[], &[], &all_present).is_empty());
+        // An ancestor mount listed as explicit never suppresses a mask.
+        let masks = runtime_escape_masks(
+            &rt(),
+            &[(run_user, run_user)],
+            &[run_user, Path::new("/run"), Path::new("/")],
+            &all_present,
+        );
+        assert_eq!(masks.len(), 5);
+    }
+
+    #[test]
+    fn host_runtime_escape_masks_probes_real_entries() {
+        let temp = tempfile::tempdir().unwrap();
+        let base = std::fs::canonicalize(temp.path()).unwrap();
+        let runtime = base.join("rt");
+        std::fs::create_dir_all(runtime.join("systemd")).unwrap();
+        std::fs::write(runtime.join("bus"), b"").unwrap();
+        let masks = host_runtime_escape_masks(Some(&runtime), &[(&base, &base)], &[&base]);
+        assert_eq!(
+            masks,
+            vec![
+                EscapeMask::NullBind(runtime.join("bus")),
+                EscapeMask::Tmpfs(runtime.join("systemd")),
+            ]
+        );
+        // A non-canonical mount source still counts.
+        let dotted = base.join("rt/..");
+        assert_eq!(
+            host_runtime_escape_masks(Some(&runtime), &[(&dotted, &base)], &[]).len(),
+            2
+        );
+        assert!(host_runtime_escape_masks(None, &[(&base, &base)], &[]).is_empty());
+        let fallback = Path::new("/run/user");
+        assert!(host_runtime_escape_masks(Some(fallback), &[(fallback, fallback)], &[]).is_empty());
+    }
+
+    #[test]
+    fn oci_mask_args_spell_tmpfs_and_null_binds() {
+        assert_eq!(
+            oci_mask_args(&[
+                EscapeMask::Tmpfs(rt().join("systemd")),
+                EscapeMask::NullBind(rt().join("bus")),
+            ]),
+            [
+                "--tmpfs",
+                "/run/user/1000/systemd",
+                "-v",
+                "/dev/null:/run/user/1000/bus:ro",
+            ]
+        );
+        assert!(oci_mask_args(&[]).is_empty());
     }
 
     fn warn(spec: &str, runtime_dir: Option<&Path>) -> Vec<String> {

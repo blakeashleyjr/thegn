@@ -2044,6 +2044,392 @@ fn runtime_escape_bwrap_honours_an_explicit_podman_socket_mount() {
     );
 }
 
+/// The OCI twin of [`runtime_escape_fixture`]: a temp runtime dir with a bus
+/// stand-in, `podman/` and `systemd/`, and a spec binding its parent (the
+/// `/run/user` shape).
+fn oci_runtime_escape_fixture(backend: Backend) -> (tempfile::TempDir, PathBuf, SandboxSpec) {
+    let temp = tempfile::tempdir_in("/tmp").unwrap();
+    let base = std::fs::canonicalize(temp.path()).unwrap();
+    let runtime = base.join("1000");
+    std::fs::create_dir_all(runtime.join("podman")).unwrap();
+    std::fs::create_dir_all(runtime.join("systemd")).unwrap();
+    std::fs::write(runtime.join("bus"), b"").unwrap();
+    let mut sandbox = spec(backend);
+    sandbox.mounts.push(Mount {
+        host: base.display().to_string(),
+        dest: base.display().to_string(),
+        ro: false,
+        cache: false,
+    });
+    (temp, runtime, sandbox)
+}
+
+#[test]
+fn runtime_escape_oci_masks_a_local_run_user_mount() {
+    let (_temp, runtime, sandbox) = oci_runtime_escape_fixture(Backend::Podman);
+    let argv = oci_create_opts_in(&sandbox, &[], Some(&runtime)).unwrap();
+    let rt = runtime.display().to_string();
+    let base = runtime.parent().unwrap().display().to_string();
+    let bind_arg = format!("{base}:{base}");
+    let systemd_arg = format!("{rt}/systemd");
+    let podman_arg = format!("{rt}/podman");
+    let bus_arg = format!("/dev/null:{rt}/bus:ro");
+    let bind = argv
+        .windows(2)
+        .position(|pair| pair == ["-v", bind_arg.as_str()])
+        .expect("runtime parent is bound");
+    let systemd = argv
+        .windows(2)
+        .position(|pair| pair == ["--tmpfs", systemd_arg.as_str()])
+        .expect("systemd dir is masked with a tmpfs");
+    let podman = argv
+        .windows(2)
+        .position(|pair| pair == ["--tmpfs", podman_arg.as_str()])
+        .expect("podman dir is masked with a tmpfs");
+    let bus = argv
+        .windows(2)
+        .position(|pair| pair == ["-v", bus_arg.as_str()])
+        .expect("bus socket is masked with /dev/null");
+    assert!(bind < systemd && bind < podman && bind < bus, "{argv:?}");
+    let docker = format!("{rt}/docker");
+    assert!(
+        !argv.iter().any(|arg| arg.contains(&docker)),
+        "absent entries are not masked: {argv:?}"
+    );
+    // Docker and rootful podman take the same flags.
+    for backend in [Backend::Docker, Backend::PodmanRootful] {
+        let (_temp, runtime, sandbox) = oci_runtime_escape_fixture(backend);
+        let argv = oci_create_opts_in(&sandbox, &[], Some(&runtime)).unwrap();
+        let bus = format!("/dev/null:{}/bus:ro", runtime.display());
+        assert!(argv.contains(&bus), "{backend:?}: {argv:?}");
+    }
+}
+
+#[test]
+fn runtime_escape_oci_honours_an_explicit_podman_socket_mount() {
+    let (_temp, runtime, mut sandbox) = oci_runtime_escape_fixture(Backend::Podman);
+    let socket = runtime.join("podman/podman.sock");
+    std::fs::write(&socket, b"").unwrap();
+    sandbox.mounts.push(Mount {
+        host: socket.display().to_string(),
+        dest: socket.display().to_string(),
+        ro: false,
+        cache: false,
+    });
+    let argv = oci_create_opts_in(&sandbox, &[], Some(&runtime)).unwrap();
+    let rt = runtime.display().to_string();
+    let podman_arg = format!("{rt}/podman");
+    let systemd_arg = format!("{rt}/systemd");
+    let bus_arg = format!("/dev/null:{rt}/bus:ro");
+    assert!(
+        !argv
+            .windows(2)
+            .any(|pair| pair == ["--tmpfs", podman_arg.as_str()]),
+        "an explicit socket mount is honoured: {argv:?}"
+    );
+    assert!(
+        argv.windows(2)
+            .any(|pair| pair == ["--tmpfs", systemd_arg.as_str()]),
+        "{argv:?}"
+    );
+    assert!(argv.contains(&bus_arg), "{argv:?}");
+}
+
+#[test]
+fn runtime_escape_oci_skips_remote_and_unexposed_specs() {
+    let (_temp, runtime, mut remote) = oci_runtime_escape_fixture(Backend::Podman);
+    remote.placement = remote_placement();
+    let rt = format!("{}/", runtime.display());
+    let masked = |argv: &[String]| {
+        argv.iter()
+            .any(|arg| arg.starts_with(&rt) || arg.starts_with("/dev/null:"))
+    };
+    let argv = oci_create_opts_in(&remote, &[], Some(&runtime)).unwrap();
+    assert!(!masked(&argv), "remote OCI is unchanged: {argv:?}");
+    let plain = spec(Backend::Podman);
+    let argv = oci_create_opts_in(&plain, &[], Some(&runtime)).unwrap();
+    assert!(!masked(&argv), "no mask without an exposing bind: {argv:?}");
+    let (_temp2, runtime2, apple) = oci_runtime_escape_fixture(Backend::Apple);
+    assert!(oci_runtime_escape_args(&apple, Some(&runtime2)).is_empty());
+    let (_temp3, runtime3, local) = oci_runtime_escape_fixture(Backend::Podman);
+    // bus null bind (2 args) + systemd and podman tmpfs (2 args each).
+    assert_eq!(oci_runtime_escape_args(&local, Some(&runtime3)).len(), 6);
+    assert!(oci_runtime_escape_args(&local, None).is_empty());
+}
+
+fn remote_placement() -> Placement {
+    Placement::Ssh(SshPlacement::plain(
+        "box".into(),
+        22,
+        false,
+        TransportKind::Ssh,
+    ))
+}
+
+fn deploy_git(key: &str) -> crate::config::SandboxGitConfig {
+    crate::config::SandboxGitConfig {
+        mode: crate::config::SandboxGitMode::Full,
+        credential: crate::config::GitCredential::DeployKey,
+        deploy_key: key.to_string(),
+        ..Default::default()
+    }
+}
+
+fn good_key_facts(
+    _: &std::path::Path,
+) -> Option<crate::config_sandbox::git_policy::DeployKeyFacts> {
+    Some(crate::config_sandbox::git_policy::DeployKeyFacts {
+        regular: true,
+        symlink: false,
+        owned_by_user: true,
+        mode: Some(0o600),
+    })
+}
+
+fn deploy_cx<'a>(
+    placement: &'a Placement,
+    backend: Backend,
+    mounts: &'a [Mount],
+    env: &'a [(String, String)],
+) -> DeployKeyContext<'a> {
+    DeployKeyContext {
+        placement,
+        backend,
+        file_access: FileAccess::default(),
+        seal_home: None,
+        mounts,
+        env,
+    }
+}
+
+fn deploy_plan(
+    git: &crate::config::SandboxGitConfig,
+    placement: &Placement,
+    backend: Backend,
+    mounts: &[Mount],
+    env: &[(String, String)],
+) -> DeployKeyPlan {
+    plan_deploy_key(
+        git,
+        &deploy_cx(placement, backend, mounts, env),
+        &good_key_facts,
+    )
+}
+
+#[test]
+fn deploy_key_plan_binds_read_only_at_the_fixed_path() {
+    let git = deploy_git("/keys/deploy");
+    for backend in [Backend::Bwrap, Backend::Podman, Backend::Docker] {
+        let plan = deploy_plan(&git, &Placement::Local, backend, &[], &[]);
+        assert_eq!(
+            plan,
+            DeployKeyPlan::Grant {
+                mount: Some(Mount {
+                    host: "/keys/deploy".into(),
+                    dest: "/run/thegn-deploy-key".into(),
+                    ro: true,
+                    cache: false,
+                }),
+                ssh_command: "ssh -i /run/thegn-deploy-key -o IdentitiesOnly=yes".into(),
+            },
+            "{backend:?}"
+        );
+    }
+    // systemd shares the host tree: a path-preserving read-only mount.
+    let DeployKeyPlan::Grant { mount, ssh_command } =
+        deploy_plan(&git, &Placement::Local, Backend::Systemd, &[], &[])
+    else {
+        panic!("systemd grants");
+    };
+    let mount = mount.expect("systemd mount");
+    assert!(mount.ro && mount.dest == "/keys/deploy" && mount.host == "/keys/deploy");
+    assert_eq!(ssh_command, "ssh -i /keys/deploy -o IdentitiesOnly=yes");
+    // bwrap with the host tree bound needs no extra mount.
+    let mut cx = deploy_cx(&Placement::Local, Backend::Bwrap, &[], &[]);
+    cx.file_access = FileAccess::Host;
+    assert_eq!(
+        plan_deploy_key(&git, &cx, &good_key_facts),
+        DeployKeyPlan::Grant {
+            mount: None,
+            ssh_command: "ssh -i /keys/deploy -o IdentitiesOnly=yes".into(),
+        }
+    );
+}
+
+#[test]
+fn deploy_key_plan_off_unless_full_deploy_key() {
+    let mut git = deploy_git("/keys/deploy");
+    git.mode = crate::config::SandboxGitMode::PushLane;
+    assert_eq!(
+        deploy_plan(&git, &Placement::Local, Backend::Bwrap, &[], &[]),
+        DeployKeyPlan::Off
+    );
+    let mut git = deploy_git("/keys/deploy");
+    git.credential = crate::config::GitCredential::RepoToken;
+    assert_eq!(
+        deploy_plan(&git, &Placement::Local, Backend::Bwrap, &[], &[]),
+        DeployKeyPlan::Off
+    );
+}
+
+fn withheld_reason(plan: DeployKeyPlan) -> String {
+    match plan {
+        DeployKeyPlan::Withheld(reason) => reason,
+        other => panic!("expected withheld, got {other:?}"),
+    }
+}
+
+#[test]
+fn deploy_key_plan_withholds_and_says_why() {
+    let git = deploy_git("/keys/deploy");
+    let local = Placement::Local;
+    let writable = [Mount {
+        host: "/keys".into(),
+        dest: "/keys".into(),
+        ro: false,
+        cache: false,
+    }];
+    let run = [Mount {
+        host: "/run".into(),
+        dest: "/run".into(),
+        ro: true,
+        cache: false,
+    }];
+    let user_ssh = [("GIT_SSH_COMMAND".to_string(), "ssh -i /mine".to_string())];
+    let cases: Vec<(DeployKeyPlan, &str)> = vec![
+        (
+            deploy_plan(&deploy_git(""), &local, Backend::Bwrap, &[], &[]),
+            "deploy_key is empty",
+        ),
+        (
+            deploy_plan(&git, &remote_placement(), Backend::Podman, &[], &[]),
+            "local-only",
+        ),
+        (
+            deploy_plan(&git, &local, Backend::Bwrap, &[], &user_ssh),
+            "GIT_SSH_COMMAND from [sandbox] env_passthrough wins",
+        ),
+        (
+            deploy_plan(
+                &deploy_git("/keys/my key"),
+                &local,
+                Backend::Podman,
+                &[],
+                &[],
+            ),
+            "the key path contains whitespace",
+        ),
+        (
+            deploy_plan(&git, &local, Backend::Apple, &[], &[]),
+            "not supported",
+        ),
+        (
+            deploy_plan(&git, &local, Backend::Bwrap, &writable, &[]),
+            "inside a writable sandbox mount",
+        ),
+        (
+            deploy_plan(&git, &local, Backend::Podman, &run, &[]),
+            "covers /run/thegn-deploy-key",
+        ),
+        (
+            plan_deploy_key(&git, &deploy_cx(&local, Backend::Bwrap, &[], &[]), &|_| {
+                None
+            }),
+            "does not exist",
+        ),
+    ];
+    for (plan, want) in cases {
+        let reason = withheld_reason(plan);
+        assert!(reason.contains(want), "{want}: {reason}");
+    }
+    // A sealed tier keeps its credential deny list: a key under ~/.ssh stays out.
+    let mut sealed = deploy_cx(&local, Backend::Bwrap, &[], &[]);
+    sealed.seal_home = Some("/sealed-home");
+    let reason = withheld_reason(plan_deploy_key(
+        &deploy_git("/sealed-home/.ssh/deploy"),
+        &sealed,
+        &good_key_facts,
+    ));
+    assert!(reason.contains("sealed tier"), "{reason}");
+    assert!(matches!(
+        plan_deploy_key(&deploy_git("/srv/keys/deploy"), &sealed, &good_key_facts),
+        DeployKeyPlan::Grant { .. }
+    ));
+}
+
+#[test]
+fn deploy_key_plan_probes_the_real_key_file() {
+    let temp = tempfile::tempdir().unwrap();
+    let key = temp.path().join("deploy");
+    std::fs::write(&key, b"dummy key bytes\n").unwrap();
+    let local = Placement::Local;
+    let plan_for = |path: &std::path::Path| {
+        plan_deploy_key(
+            &deploy_git(&path.display().to_string()),
+            &deploy_cx(&local, Backend::Bwrap, &[], &[]),
+            &deploy_key_facts,
+        )
+    };
+    if crate::fsperm::set_mode_for_test(&key, 0o600).is_ok() {
+        assert!(matches!(plan_for(&key), DeployKeyPlan::Grant { .. }));
+        crate::fsperm::set_mode_for_test(&key, 0o644).unwrap();
+        assert!(withheld_reason(plan_for(&key)).contains("group/world"));
+        crate::fsperm::set_mode_for_test(&key, 0o600).unwrap();
+    }
+    assert!(withheld_reason(plan_for(&temp.path().join("missing"))).contains("does not exist"));
+    assert!(withheld_reason(plan_for(temp.path())).contains("not a regular file"));
+    let link = temp.path().join("link");
+    if crate::fsperm::create_symlink(&key, &link, false).is_ok() {
+        assert!(withheld_reason(plan_for(&link)).contains("symlink"));
+    }
+}
+
+#[test]
+fn deploy_key_grant_reaches_the_oci_and_bwrap_argv() {
+    let _env = crate::testenv::EnvGuard::unset(&["GIT_SSH_COMMAND"]);
+    let DeployKeyPlan::Grant { mount, ssh_command } = deploy_plan(
+        &deploy_git("/keys/deploy"),
+        &Placement::Local,
+        Backend::Podman,
+        &[],
+        &[],
+    ) else {
+        panic!("grant");
+    };
+    let mut oci = spec(Backend::Podman);
+    oci.mounts.extend(mount.clone());
+    oci.env
+        .push(("GIT_SSH_COMMAND".into(), ssh_command.clone()));
+    let argv = oci_create_opts_in(&oci, &[], None).unwrap();
+    assert!(
+        argv.windows(2)
+            .any(|pair| pair == ["-v", "/keys/deploy:/run/thegn-deploy-key:ro"]),
+        "{argv:?}"
+    );
+    assert!(
+        argv.windows(2).any(|pair| pair
+            == [
+                "-e",
+                "GIT_SSH_COMMAND=ssh -i /run/thegn-deploy-key -o IdentitiesOnly=yes"
+            ]),
+        "{argv:?}"
+    );
+    let mut bwrap = spec(Backend::Bwrap);
+    bwrap.mounts.extend(mount);
+    bwrap.env.push(("GIT_SSH_COMMAND".into(), ssh_command));
+    let argv = backend_enter_argv_with_env(&bwrap, "true", SandboxArgvEnv::default()).unwrap();
+    assert!(
+        argv.windows(3)
+            .any(|triple| triple == ["--ro-bind", "/keys/deploy", "/run/thegn-deploy-key"]),
+        "{argv:?}"
+    );
+    assert!(
+        argv.iter()
+            .any(|arg| arg == "ssh -i /run/thegn-deploy-key -o IdentitiesOnly=yes"),
+        "{argv:?}"
+    );
+}
+
 #[test]
 fn runtime_escape_bwrap_adds_nothing_without_a_runtime_dir_mount() {
     let (_temp, runtime, _) = runtime_escape_fixture();
@@ -4237,6 +4623,16 @@ fn sealed_container_reuse_requires_exact_mounts_and_a_matching_seal_label() {
         judge_inspect(exact, &required, true, false, "fp"),
         (true, true)
     );
+    assert_eq!(
+        judge_inspect(
+            "RUNNING\n1\nfp\n/wt\n/nix/store\n/dev/null\n",
+            &required,
+            true,
+            false,
+            "fp"
+        ),
+        (true, true)
+    );
     // (a) a superset (a hardened container that also binds ~/.gnupg) is refused
     // for a sealed spec, though it is fine for a non-sealed one.
     let superset = "RUNNING\n1\nfp\n/wt\n/nix/store\n/home/u/.gnupg\n";
@@ -6294,6 +6690,7 @@ fn git_probe(fx: &GitFixture, branch: &str, target: Option<&str>) -> GitProbe {
         branch: Some(branch.to_string()),
         target: target.map(str::to_string),
         default: Some("main".to_string()),
+        identity: Default::default(),
     }
 }
 
@@ -6445,6 +6842,7 @@ fn git_policy_main_checkout_gets_a_read_only_git_dir() {
         branch: Some("main".into()),
         target: Some("main".into()),
         default: Some("main".into()),
+        identity: Default::default(),
     };
     let (mounts, warning) = git_policy_mounts(&git_cfg(SandboxGitMode::CommitOnly), &main, &probe);
     assert!(warning.expect("warns").contains("main checkout"));
@@ -6456,4 +6854,263 @@ fn git_policy_main_checkout_gets_a_read_only_git_dir() {
         "{mounts:?}"
     );
     assert!(mounts[1..].iter().all(|m| m.ro), "{mounts:?}");
+}
+
+#[test]
+fn bwrap_bind_dest_table() {
+    // A fake filesystem: `/home/u/link` -> `/home/u/real`, `/alias` -> `/srv`
+    // (an ancestor symlink), `/dangling` unresolvable.
+    let resolve = |p: &std::path::Path| -> Option<PathBuf> {
+        let s = p.to_string_lossy();
+        if s == "/dangling" {
+            return None;
+        }
+        for (alias, target) in [("/home/u/link", "/home/u/real"), ("/alias", "/srv")] {
+            if let Ok(rest) = p.strip_prefix(alias) {
+                return Some(std::path::Path::new(target).join(rest));
+            }
+        }
+        Some(p.to_path_buf())
+    };
+    let roots = [
+        PathBuf::from("/home/u"),
+        PathBuf::from("/srv"),
+        PathBuf::from("/alias"),
+    ];
+    let p = std::path::Path::new;
+    // Plain dir: unchanged.
+    assert_eq!(
+        bwrap_bind_dest(p("/home/u/plain"), &roots, &resolve),
+        DestFix::Keep
+    );
+    // Symlinked dest under a visible root: dropped, never followed.
+    assert_eq!(
+        bwrap_bind_dest(p("/home/u/link"), &roots, &resolve),
+        DestFix::Drop
+    );
+    // Symlinked ancestor below the root: dropped too.
+    assert_eq!(
+        bwrap_bind_dest(p("/home/u/link/dir/leaf"), &roots, &resolve),
+        DestFix::Drop
+    );
+    // The covering root is itself an alias (`/alias -> /srv`, like
+    // `/home -> /var/home`), nothing below it is a link: kept.
+    assert_eq!(
+        bwrap_bind_dest(p("/alias/dir/leaf"), &roots, &resolve),
+        DestFix::Keep
+    );
+    // Unresolvable: unchanged (the launch reports it as before).
+    assert_eq!(
+        bwrap_bind_dest(p("/dangling"), &roots, &resolve),
+        DestFix::Keep
+    );
+    // Not under any visible root: bwrap creates it, alias kept.
+    assert_eq!(
+        bwrap_bind_dest(p("/uncovered/link"), &roots, &|_: &std::path::Path| {
+            Some(PathBuf::from("/elsewhere"))
+        }),
+        DestFix::Keep
+    );
+}
+
+#[test]
+fn fix_bind_dests_keeps_uncovered_and_drops_covered() {
+    // A mount's own (aliased) destination is not a root for itself.
+    let mut s = spec(Backend::Bwrap);
+    s.mounts = vec![Mount {
+        host: "/src".into(),
+        dest: "/link".into(),
+        ro: false,
+        cache: false,
+    }];
+    let resolve = |p: &std::path::Path| -> Option<PathBuf> {
+        if p == std::path::Path::new("/link") {
+            Some(PathBuf::from("/link/../target"))
+        } else {
+            Some(p.to_path_buf())
+        }
+    };
+    fix_bind_dests(&mut s, &resolve);
+    assert_eq!(s.mounts.len(), 1);
+    assert_eq!(s.mounts[0].dest, "/link");
+
+    // Under the bwrap substrate and symlinked: dropped, read-only or not.
+    for ro in [true, false] {
+        let mut s = spec(Backend::Bwrap);
+        s.mounts = vec![Mount {
+            host: "/src".into(),
+            dest: "/etc/link".into(),
+            ro,
+            cache: false,
+        }];
+        let into_etc = |p: &std::path::Path| -> Option<PathBuf> {
+            if p == std::path::Path::new("/etc/link") {
+                Some(PathBuf::from("/etc/target"))
+            } else {
+                Some(p.to_path_buf())
+            }
+        };
+        fix_bind_dests(&mut s, &into_etc);
+        assert!(s.mounts.is_empty(), "{:?}", s.mounts);
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn symlinked_writable_dest_is_skipped_not_followed() {
+    use std::os::unix::fs::symlink;
+
+    let td = private_tempdir();
+    let base = td.path().canonicalize().unwrap();
+    let source = base.join("source");
+    let real = base.join("real");
+    std::fs::create_dir(&source).unwrap();
+    std::fs::create_dir(&real).unwrap();
+    let alias = base.join("alias");
+    symlink(&real, &alias).unwrap();
+    let base_s = base.to_string_lossy().into_owned();
+    let source_s = source.to_string_lossy().into_owned();
+    let real_s = real.to_string_lossy().into_owned();
+    let alias_s = alias.to_string_lossy().into_owned();
+    let mut s = spec(Backend::Bwrap);
+    s.mounts = vec![
+        Mount {
+            host: base_s.clone(),
+            dest: base_s.clone(),
+            ro: true,
+            cache: false,
+        },
+        Mount {
+            host: source_s.clone(),
+            dest: alias_s.clone(),
+            ro: false,
+            cache: false,
+        },
+    ];
+
+    let argv = enter_argv(&s, "true").expect("a symlinked destination is skipped, not refused");
+    assert!(!argv.contains(&alias_s), "{argv:?}");
+    assert!(!argv.contains(&real_s), "{argv:?}");
+    assert!(
+        !argv
+            .windows(2)
+            .any(|w| w[0] == "--bind" && w[1] == source_s),
+        "{argv:?}"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn aliased_home_keeps_worktree_bind_and_drops_link_below_it() {
+    // `$HOME` reached through a system symlink (`/home -> /var/home`): the
+    // read-only home mount and a writable worktree under it keep their path;
+    // a link planted BELOW the home still drops its bind.
+    use std::os::unix::fs::symlink;
+
+    let td = private_tempdir();
+    let base = td.path().canonicalize().unwrap();
+    std::fs::create_dir_all(base.join("real/home/wt")).unwrap();
+    std::fs::create_dir_all(base.join("secret")).unwrap();
+    symlink(base.join("real"), base.join("alias")).unwrap();
+    let home = base.join("alias/home");
+    symlink(base.join("secret"), home.join("tmp")).unwrap();
+    let home_s = home.to_string_lossy().into_owned();
+    let wt_s = home.join("wt").to_string_lossy().into_owned();
+    let tmp_s = home.join("tmp").to_string_lossy().into_owned();
+    let mut s = spec(Backend::Bwrap);
+    s.mounts = vec![
+        Mount {
+            host: home_s.clone(),
+            dest: home_s.clone(),
+            ro: true,
+            cache: false,
+        },
+        Mount {
+            host: wt_s.clone(),
+            dest: wt_s.clone(),
+            ro: false,
+            cache: false,
+        },
+        Mount {
+            host: base.join("real/home/wt").to_string_lossy().into_owned(),
+            dest: tmp_s.clone(),
+            ro: false,
+            cache: false,
+        },
+    ];
+
+    let argv = enter_argv(&s, "true").expect("aliased home launches");
+    assert!(argv.contains(&home_s), "{argv:?}");
+    assert!(
+        argv.windows(3).any(|w| w[0] == "--bind" && w[2] == wt_s),
+        "worktree under the aliased home stays writable: {argv:?}"
+    );
+    assert!(!argv.contains(&tmp_s), "{argv:?}");
+}
+
+#[cfg(unix)]
+#[test]
+fn oci_symlinked_dest_is_not_rewritten() {
+    use std::os::unix::fs::symlink;
+
+    let td = private_tempdir();
+    let base = td.path().canonicalize().unwrap();
+    let real = base.join("real");
+    std::fs::create_dir(&real).unwrap();
+    let alias = base.join("alias");
+    symlink(&real, &alias).unwrap();
+    let alias_s = alias.to_string_lossy().into_owned();
+    let mut s = spec(Backend::Docker);
+    s.mounts.push(Mount {
+        host: real.to_string_lossy().into_owned(),
+        dest: alias_s.clone(),
+        ro: false,
+        cache: false,
+    });
+    let planned = launchable(&s).unwrap();
+    assert!(planned.mounts.iter().any(|m| m.dest == alias_s));
+}
+
+#[test]
+fn local_bwrap_argv_carries_the_git_identity() {
+    // The value is unique, so it never equals the test process's own env (the
+    // bwrap emitter omits a pair the launcher already exports).
+    let id = crate::git_identity::GitIdentity {
+        name: Some("Thegn Identity Probe 7f3c".into()),
+        email: Some("probe-7f3c@example.invalid".into()),
+    };
+    let mut s = spec(Backend::Bwrap);
+    let extra = crate::git_identity::identity_env(&id, &s.env, &|_| None);
+    s.env.extend(extra);
+    let argv = enter_argv(&s, "true").unwrap();
+    for (k, v) in [
+        ("GIT_AUTHOR_NAME", "Thegn Identity Probe 7f3c"),
+        ("GIT_COMMITTER_NAME", "Thegn Identity Probe 7f3c"),
+        ("GIT_AUTHOR_EMAIL", "probe-7f3c@example.invalid"),
+        ("GIT_COMMITTER_EMAIL", "probe-7f3c@example.invalid"),
+    ] {
+        assert!(
+            argv.windows(3)
+                .any(|w| w[0] == "--setenv" && w[1] == k && w[2] == v),
+            "{k} missing from {argv:?}"
+        );
+    }
+}
+
+#[test]
+fn cached_git_identity_reuses_a_fresh_entry() {
+    let calls = std::sync::atomic::AtomicUsize::new(0);
+    let read = |args: &[&str]| -> Option<String> {
+        calls.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        match args {
+            ["config", "--get", "user.name"] => Some("Cache Probe".into()),
+            _ => None,
+        }
+    };
+    let root = std::path::Path::new("/thegn-test/identity-cache-repo");
+    let first = cached_git_identity(root, &read);
+    let second = cached_git_identity(root, &read);
+    assert_eq!(first.name.as_deref(), Some("Cache Probe"));
+    assert_eq!(first, second);
+    assert_eq!(calls.load(std::sync::atomic::Ordering::Relaxed), 2);
 }

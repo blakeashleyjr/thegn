@@ -201,7 +201,13 @@ pub fn month_to_date_usd(rate: f64, created_ms: Option<i64>, now_ms: i64) -> f64
 
 /// Projected spend over `hours` at the summed hourly `rates`.
 pub fn projected_usd(rates: &[f64], hours: f64) -> f64 {
-    rates.iter().filter(|r| usable(**r)).sum::<f64>() * hours.max(0.0)
+    sum_usd(rates.iter().copied().filter(|r| usable(*r))) * hours.max(0.0)
+}
+
+/// Sum from `+0.0`. `Iterator::sum` for floats starts at `-0.0`, so an empty
+/// fleet would otherwise total `-0.0` and render as `$-0.0000`.
+fn sum_usd(values: impl Iterator<Item = f64>) -> f64 {
+    values.fold(0.0, |total, value| total + value)
 }
 
 /// One sandbox a provider listed for one env.
@@ -441,7 +447,7 @@ pub fn fleet_cost(
             mtd_usd: Some(mtd),
         });
     }
-    cost.total_hourly = burns.iter().sum::<f64>();
+    cost.total_hourly = sum_usd(burns.iter().copied());
     cost.projected_24h = projected_usd(&burns, 24.0);
     cost.projected_30d = projected_usd(&burns, 24.0 * 30.0);
     cost
@@ -796,5 +802,14 @@ mod tests {
         assert_eq!(src, "config");
         let c = serde_json::to_value(Completeness::Partial("x".into())).unwrap();
         assert_eq!(c["kind"], "partial");
+    }
+
+    #[test]
+    fn an_empty_fleet_totals_positive_zero() {
+        let cost = fleet_cost(&FleetView::default(), TABLE, &BTreeMap::new(), 3_600_000);
+        for total in [cost.total_hourly, cost.projected_24h, cost.projected_30d] {
+            assert!(total == 0.0 && total.is_sign_positive(), "{total:?}");
+        }
+        assert_eq!(format!("{:.4}", cost.total_hourly), "0.0000");
     }
 }

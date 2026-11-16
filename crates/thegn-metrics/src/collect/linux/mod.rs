@@ -31,6 +31,7 @@ pub mod powercap;
 pub(crate) mod proc_backend;
 pub mod procfile;
 pub mod psi;
+pub(crate) mod slice_scopes;
 pub mod sock_diag;
 pub mod swap_zram;
 pub mod thermal_zones;

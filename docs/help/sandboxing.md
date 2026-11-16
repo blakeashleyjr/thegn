@@ -225,7 +225,10 @@ caches, `/tmp`, and a narrow set of shell-state paths (`~/tmp`,
 relative, symlinked, non-UTF-8, or overlapping roots are omitted. Agent config
 dirs (`CLAUDE_CONFIG_DIR` / `CODEX_HOME`, or the `~/.claude` / `~/.codex` defaults) are writable for
 every non-sealed pane, so an agent CLI you run by hand can persist its
-state instead of dying on a read-only filesystem.
+state instead of dying on a read-only filesystem. A carve-out whose path
+has a symlink in any component below `$HOME` is skipped with a warning, never
+followed; the pane launches without it. `$HOME` itself may be reached through
+a system link (`/home -> /var/home`).
 
 > `~/.keychain` is carved writable for `standard` panes but **not** for
 > `sealed` ones: it holds scripts your host login shells later _source_,
@@ -629,8 +632,13 @@ though the default `[sandbox] env_passthrough` lists them (nor are
 `GL_TOKEN`), and provisioning
 does not install a git token credential helper. Only `mode = "full"` with
 `credential = "repo-token"` or `"user-token"` passes the host token through.
-`ANTHROPIC_API_KEY` and other agent credentials are unaffected. The other
-credential modes (`deploy-key`, `github-app`) are not implemented yet. Only
+`ANTHROPIC_API_KEY` and other agent credentials are unaffected.
+`credential = "deploy-key"` with `deploy_key = "~/.ssh/deploy"` (local
+placements only) binds that key read-only into the sandbox and sets
+`GIT_SSH_COMMAND` to use it; the key must be a regular file you own that is
+not group or world readable, otherwise the sandbox gets no credential and a
+warning is logged. A `GIT_SSH_COMMAND` you pass through wins. `github-app`
+is not implemented yet. Only
 environment variables are filtered: a `gh` or `glab` config (with its stored
 token) that reaches the sandbox through `[sandbox.home]` dotfiles is not.
 

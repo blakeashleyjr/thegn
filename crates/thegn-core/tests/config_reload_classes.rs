@@ -5,13 +5,16 @@
 //! every `(section, key)` a user can write, so a new key cannot silently wait
 //! for a restart while the reload toast claims it applied. The reverse check
 //! keeps `RELOAD_CLASSES` from rotting: every row must match at least one
-//! schema path.
+//! schema path. A third gate requires every `Live` row to name the hook that
+//! applies it, so a new live key cannot silently have no applier.
 
 mod common;
 use common::{Required, walk};
 use serde_json::Value;
 use std::collections::BTreeSet;
-use thegn_core::config::reload_class::{RELOAD_CLASSES, class_for, pattern_matches};
+use thegn_core::config::reload_class::{
+    RELOAD_CLASSES, ReloadClass, ReloadHook, class_for, pattern_matches,
+};
 
 fn schema_walk() -> (Required, BTreeSet<String>) {
     let schema = schemars::schema_for!(thegn_core::config::Config);
@@ -89,5 +92,69 @@ fn no_reload_class_row_is_dead() {
         "RELOAD_CLASSES rows match no Config schema key (renamed or removed?); \
          drop or fix them in crates/thegn-core/src/config/reload_class.rs:\n  {}",
         dead.join("\n  ")
+    );
+}
+
+/// `Live` rows allowed to name [`ReloadHook::None`], each with the reason no
+/// hook gates it. Everything here is applied by an unconditional swap in the
+/// reload handler (run.rs), so it cannot be skipped by the plan.
+const LIVE_WITHOUT_HOOK: &[(&str, &str)] = &[
+    (
+        "session.scrollback_lines",
+        "one unconditional atomic store (snapshot::set_scrollback_lines) on every reload",
+    ),
+    (
+        "session.resident_pool_limit",
+        "one unconditional store (workspace_pool.set_limit), applied on the next park",
+    ),
+    (
+        "model_proxy.*",
+        "the model-proxy supervisor re-reads its section on every reload (spawn_supervisor)",
+    ),
+];
+
+#[test]
+fn every_live_row_names_a_hook() {
+    let unhooked: Vec<&str> = RELOAD_CLASSES
+        .iter()
+        .filter(|(_, class, hook)| *class == ReloadClass::Live && *hook == ReloadHook::None)
+        .map(|(pattern, _, _)| *pattern)
+        .filter(|pattern| {
+            !LIVE_WITHOUT_HOOK
+                .iter()
+                .any(|(allowed, _)| allowed == pattern)
+        })
+        .collect();
+    assert!(
+        unhooked.is_empty(),
+        "Live RELOAD_CLASSES rows with no applying hook; name the ReloadHook \
+         that applies them (crates/thegn-core/src/config/reload_class.rs) or add \
+         them to LIVE_WITHOUT_HOOK with the reason:\n  {}",
+        unhooked.join("\n  ")
+    );
+    // The allowlist cannot rot either: each entry is a real Live/None row.
+    for (pattern, reason) in LIVE_WITHOUT_HOOK {
+        assert!(!reason.is_empty());
+        assert!(
+            RELOAD_CLASSES
+                .iter()
+                .any(|row| row == &(*pattern, ReloadClass::Live, ReloadHook::None)),
+            "stale LIVE_WITHOUT_HOOK entry {pattern}"
+        );
+    }
+}
+
+/// `[watch] pr_interval_secs` drives the host's PR refresh cadence
+/// (`ScheduleConfig::pr_every_slots`), so it reloads live through the
+/// Schedule hook; the rest of `[watch]` still needs a restart.
+#[test]
+fn watch_pr_interval_is_live_on_the_schedule_hook() {
+    assert_eq!(
+        class_for("watch.pr_interval_secs"),
+        Some((ReloadClass::Live, ReloadHook::Schedule))
+    );
+    assert_eq!(
+        class_for("watch"),
+        Some((ReloadClass::Restart, ReloadHook::None))
     );
 }

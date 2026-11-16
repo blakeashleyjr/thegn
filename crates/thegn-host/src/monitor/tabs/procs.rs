@@ -1009,6 +1009,8 @@ mod tests {
                 },
                 ..thegn_metrics::ProcOwnerSummary::default()
             },
+            pane_totals: Vec::new(),
+            scopes: Vec::new(),
         };
         let sections = summary_sections(&summary);
         assert_eq!(crate::sections::stack_height(&sections), 8);

@@ -110,6 +110,36 @@ pub struct ProcSummary {
     /// Unknown on the first pass, before an identity baseline exists.
     pub exited: Option<usize>,
     pub owners: ProcOwnerSummary,
+    /// The `owners.panes` bucket split per pane: `(pane id, totals)`, sorted by
+    /// pane id, one entry per pane that owned at least one process. Bounded by
+    /// the pane count; the entries sum to `owners.panes`.
+    pub pane_totals: Vec<(u32, ProcOwnerTotals)>,
+    /// Per-scope usage inside `thegn.slice`, read from cgroup v2: one entry per
+    /// named `thegn-*.scope` (gate/agent jobs), plus one [`UNNAMED_SCOPES`]
+    /// entry summing the anonymous `run-*.scope`s. Sorted by unit, the unnamed
+    /// sum last; at most [`MAX_SCOPES`] entries. Empty without cgroup v2 or
+    /// without the slice.
+    pub scopes: Vec<ScopeTotals>,
+}
+
+/// The unit name of the entry that sums every anonymous `run-*.scope`.
+pub const UNNAMED_SCOPES: &str = "unnamed";
+
+/// Upper bound on [`ProcSummary::scopes`] (named overflow folds into the
+/// unnamed sum).
+pub const MAX_SCOPES: usize = 64;
+
+/// One transient scope's usage inside `thegn.slice`.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct ScopeTotals {
+    /// The unit name without `.scope` (`thegn-gate-<slug>-<pid>-<seq>`), or
+    /// [`UNNAMED_SCOPES`].
+    pub unit: String,
+    /// Per-core sum over the last pass (above 100% when several cores are
+    /// busy); `None` until a second reading exists.
+    pub cpu_pct: Option<f32>,
+    /// `memory.current`; `None` when unreadable.
+    pub rss: Option<u64>,
 }
 
 /// CPU and resident memory totals grouped by owner class.

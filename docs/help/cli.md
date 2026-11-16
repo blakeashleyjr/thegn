@@ -70,6 +70,11 @@ write` as `POST /v1/dispatches` and its status route, with no extra flag:
 optional `stage`, `parent_id`, `session_id`, `artifact_path`, `lead`), and
 `dispatches_set_status` sets row `id` to `status` (optional `lead` proof).
 The daemon checks the status name.
+Tracker writes are MCP tools under the same `--scopes write`: `issues_update`
+patches issue `id` (at least one of `status`, `assignee` as `me` or `none`,
+`priority` 0-4, `title`) and `issues_comment` appends `body` (non-empty, up to
+64 KiB); both take optional `repo` and `account`. The audit log records a
+comment's length and a hash, never its text.
 A worktree's sandbox profile pin is readable with `worktrees.sandbox_profile`
 (`api call`, HTTP, or MCP `worktrees_sandbox_profile`); changing it with
 `worktrees.sandbox_profile_set` (`profile`, or `clear: true`) needs admin scope
@@ -488,8 +493,15 @@ out (20 s), is shown as unavailable instead of failing the command.
 the month's spend so far, and 24 h / 30 d projections. Costs are estimates:
 `[placement.price]` rates win over the bundled price table, a size with no
 known price shows `?` and is counted as unpriced, and accrued cost assumes the
-sandbox ran since it was created. Only Fly reports sizes today; other providers
-list ids only. Nothing is stopped or destroyed.
+sandbox ran since it was created. Every provider fills in what its listing
+reports: Hetzner and DigitalOcean give the server size and region, machine0,
+Sprites and Daytona give whatever state, size, region and creation time their
+listing carries, and a field a provider leaves out shows as unknown. Hetzner
+and machine0 have no bundled prices, so their sizes count as unpriced unless
+`[placement.price]` names them. Fly also lists the org's apps and shows a
+thegn-named app the host has no record of as a row (an `ORPHAN` unless a
+worktree records it); if that app listing fails, Fly shows the recorded
+sandboxes only and is marked partial. Nothing is stopped or destroyed.
 
 `thegn map` prints a **repo map**: the worktree's tree-sitter-indexed
 entities (functions, types, …) grouped by file, ranked by caller

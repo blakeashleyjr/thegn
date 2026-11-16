@@ -31,8 +31,33 @@ warning) instead of a writable one:
 
 `GH_TOKEN`, `GITHUB_TOKEN` (and GitLab / GitHub Enterprise token variables) are
 withheld from sandboxes and provider VMs by default. Only `mode = "full"` with
-`credential = "repo-token"` or `"user-token"` passes them. `deploy-key` and
-`github-app` parse but are not wired yet.
+`credential = "repo-token"` or `"user-token"` passes them.
+
+`credential = "deploy-key"` with `deploy_key = "~/.ssh/deploy"` is opt-in and
+for local placements only. The key is a path, mounted read-only into the
+sandbox, and `GIT_SSH_COMMAND` is set to use it. It must be a regular file you
+own and not group or world readable; otherwise the sandbox gets no credential
+and a warning is logged. The default remains no credential. `github-app`
+parses but is not wired yet.
+
+### OCI runtime masks
+
+Local podman/docker sandboxes mask the user D-Bus socket and the runtime
+sockets under `$XDG_RUNTIME_DIR`, matching bwrap. The policy fingerprint
+changed, so existing local OCI sandbox containers are recreated once after
+upgrading.
+
+### Bind destinations and identity
+
+Binds are kept or dropped fail-closed. A symlinked destination is never
+rewritten. A bind whose destination path has a symlink below `$HOME` is
+dropped with a warning, and the sandbox launches without it. `$HOME` itself
+may be reached through a system link.
+
+Sandboxed commits carry the host's git identity, passed as `GIT_AUTHOR_NAME`,
+`GIT_AUTHOR_EMAIL`, `GIT_COMMITTER_NAME` and `GIT_COMMITTER_EMAIL`. Identity
+is not a credential. A value already exported on the host or set in the
+sandbox env wins.
 
 ### Provider worktrees: bundle transport
 
@@ -46,8 +71,12 @@ thegn env pull
 
 Pull-back refuses `main`, the default branch and the merge target, applies
 `deny_refs`, and fails closed when the default branch is unknown.
-`thegn env down` destroys the provider sandbox and verifies it is gone before
-reporting "down".
+`thegn env down` pulls back first, then destroys the provider sandbox and
+verifies it is gone before reporting "down". If the pull-back fails it
+refuses; `--force` destroys anyway and unpulled commits are lost.
+`thegn env down --stop` pulls back and parks the sandbox (stop or suspend)
+instead of destroying it. When the last session for a provider worktree
+exits, the daemon pulls back once in the background.
 
 ### Residuals
 

@@ -2,7 +2,8 @@
 //!
 //! This hashes spec inputs rather than derived runtime flags. If an unchanged
 //! input is lowered differently into create options (for example, a changed
-//! `--dns` flag form), bump the `v1` prefix before shipping that lowering change.
+//! `--dns` flag form), bump the version prefix (v2: THE-2009 OCI runtime-dir masks)
+//! before shipping that lowering change.
 //! The encoding is pure, length-prefixed, and independent of process state.
 
 use sha2::{Digest, Sha256};
@@ -12,7 +13,7 @@ use crate::sandbox::SandboxSpec;
 /// Return the lowercase SHA-256 fingerprint for the effective sandbox policy.
 pub fn policy_fingerprint(spec: &SandboxSpec, vpn_join: bool) -> String {
     let mut encoded = Vec::new();
-    encoded.extend_from_slice(b"v1\0");
+    encoded.extend_from_slice(b"v2\0");
 
     fn field(encoded: &mut Vec<u8>, name: &str, value: &str) {
         encoded.extend_from_slice(name.as_bytes());

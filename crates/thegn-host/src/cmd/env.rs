@@ -7,6 +7,7 @@
 use crate::agent::{ProvisionState, ProvisionStepView};
 use crate::egress_admit::EgressSteps;
 use crate::egress_admit::admit_egress;
+use crate::provider_git::is_provider_location;
 use anyhow::{Context, Result};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
@@ -57,8 +58,17 @@ pub enum Action {
         #[command(flatten)]
         target: super::target::WorktreeTarget,
     },
-    /// Tear a worktree's environment down (k8s: delete the pod/manifest).
+    /// Tear a worktree's environment down (k8s: delete the pod/manifest;
+    /// provider: pull the sandbox's commits back, then destroy the sandbox).
     Down {
+        /// Provider envs: park the sandbox (fly stop, machine0 suspend) instead
+        /// of destroying it; `thegn env up` resumes it.
+        #[arg(long)]
+        stop: bool,
+        /// Provider envs: destroy even when the pull-back fails (commits made
+        /// inside the sandbox that were not pulled back are lost).
+        #[arg(long)]
+        force: bool,
         #[command(flatten)]
         target: super::target::WorktreeTarget,
     },
@@ -181,7 +191,22 @@ pub fn run(cfg: &Config, action: Action) -> Result<()> {
         } => set(cfg, &name, target.get(), workspace),
         Action::Clear { workspace, target } => set(cfg, "", target.get(), workspace),
         Action::Up { target } => lifecycle(cfg, target.get(), Lifecycle::Up),
-        Action::Down { target } => lifecycle(cfg, target.get(), Lifecycle::Down),
+        Action::Down {
+            stop,
+            force,
+            target,
+        } => lifecycle(
+            cfg,
+            target.get(),
+            Lifecycle::Down(DownOpts {
+                mode: if stop {
+                    DownMode::Stop
+                } else {
+                    DownMode::Destroy
+                },
+                force,
+            }),
+        ),
         Action::Forward { spec, target } => forward(cfg, target.get(), &spec),
         Action::Provision { target } => provision(cfg, target.get()),
         Action::Deprovision {
@@ -675,9 +700,60 @@ fn restore(cfg: &Config, worktree: Option<String>, cp: &str) -> Result<()> {
     Ok(())
 }
 
+/// How `env down` leaves a provider sandbox.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DownMode {
+    /// Revoke, destroy and verify the sandbox (the default).
+    Destroy,
+    /// Park it (`--stop`): fly stop / machine0 suspend; marker and location kept.
+    Stop,
+}
+
+/// `env down` flags.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct DownOpts {
+    mode: DownMode,
+    /// Destroy even when the pull-back failed.
+    force: bool,
+}
+
 enum Lifecycle {
     Up,
-    Down,
+    Down(DownOpts),
+}
+
+/// How long `env up` waits for a parked sandbox to resume.
+const UP_RESUME_TIMEOUT: Duration = Duration::from_secs(180);
+
+/// Provider kinds whose `Provider::suspend` actually parks the sandbox
+/// (`fly` stop, `machine0` suspend); every other kind's suspend is a no-op.
+fn provider_has_stop(kind: &str) -> bool {
+    matches!(kind.trim(), "fly" | "machine0")
+}
+
+/// The `env down --stop` refusal for a provider without a stop.
+fn no_stop_message(kind: &str) -> String {
+    let kind = if kind.trim().is_empty() {
+        "this provider"
+    } else {
+        kind.trim()
+    };
+    format!("{kind} has no stop; the sandbox keeps running. Use `thegn env down` to destroy it")
+}
+
+/// Whether `env up` resumes a recorded sandbox first: only a stop-capable
+/// provider whose sandbox this machine provisioned (the marker `env down
+/// --stop` keeps), so a never-created sandbox is not asked to start. Pure.
+fn resume_on_up(kind: &str, id: &str, provisioned_here: bool) -> bool {
+    provider_has_stop(kind) && !id.trim().is_empty() && provisioned_here
+}
+
+/// The configured provider kind (`[env.<name>.provider] provider`).
+fn provider_kind(cfg: &Config, env_name: &str) -> String {
+    cfg.env
+        .get(env_name)
+        .map(|e| e.provider.provider.trim().to_string())
+        .unwrap_or_default()
 }
 
 /// Resolve a worktree's environment and bring it up / tear it down.
@@ -689,46 +765,97 @@ fn lifecycle(cfg: &Config, worktree: Option<String>, action: Lifecycle) -> Resul
             let wt = super::resolve_worktree(worktree)
                 .to_string_lossy()
                 .into_owned();
+            resume_parked_sandbox(cfg, &env, &wt);
             bring_up(&env, &wt, |progress| {
                 crate::agent::provision_worktree(cfg, &wt, progress)
             })?;
             sshfs(&env, true)?;
             outln!("env {} is up", env.name);
         }
-        Lifecycle::Down => {
+        Lifecycle::Down(opts) => {
             outln!("tearing down env {} ({})…", env.name, env.placement.label());
             sshfs(&env, false)?;
-            // Runs a configured `down_command`; for a provider env without one
-            // this is a no-op, so the sandbox itself is destroyed below.
-            env.placement
-                .teardown()
-                .map_err(|e| anyhow::anyhow!("env down failed: {e}"))?;
             if let thegn_core::placement::Placement::Provider(p) = &env.placement {
                 let wt = super::resolve_worktree(worktree)
                     .to_string_lossy()
                     .into_owned();
-                return destroy_provider_sandbox(cfg, &env.name, &p.id, &wt);
+                return down_provider(cfg, &env, &p.id, &wt, opts);
             }
+            if opts.mode == DownMode::Stop {
+                anyhow::bail!(
+                    "env down --stop parks provider sandboxes; {} is {}",
+                    env.name,
+                    env.placement.label()
+                );
+            }
+            env.placement
+                .teardown()
+                .map_err(|e| anyhow::anyhow!("env down failed: {e}"))?;
             outln!("env {} is down", env.name);
         }
     }
     Ok(())
 }
 
-/// How long `env down` waits for the provider to stop listing a destroyed
-/// sandbox, and how often it asks.
-const DOWN_VERIFY_TIMEOUT: Duration = Duration::from_secs(60);
-const DOWN_VERIFY_POLL: Duration = Duration::from_secs(2);
+/// `env up` on a sandbox `env down --stop` parked: resume it before the
+/// provision path probes it. Best-effort and bounded: a failed resume is
+/// reported and provisioning continues (it surfaces an unreachable sandbox).
+fn resume_parked_sandbox(cfg: &Config, env: &thegn_core::env::Environment, wt: &str) {
+    let thegn_core::placement::Placement::Provider(p) = &env.placement else {
+        return;
+    };
+    let kind = provider_kind(cfg, &env.name);
+    let id = p.id.as_str();
+    if !resume_on_up(
+        &kind,
+        id,
+        !id.trim().is_empty() && crate::provider_workdir::is_provisioned_locally(id),
+    ) {
+        return;
+    }
+    let provider = match api_provider(cfg, Some(wt.to_string())) {
+        Ok(provider) => provider,
+        Err(e) => {
+            msg::warn(&format!("could not resume sandbox {id}: {e:#}"));
+            return;
+        }
+    };
+    msg::info(&format!("resuming sandbox {id}…"));
+    let resumed = crate::agent::block_on_provider(|| async {
+        tokio::time::timeout(UP_RESUME_TIMEOUT, provider.resume(id))
+            .await
+            .map_err(|_| anyhow::anyhow!("timed out after {}s", UP_RESUME_TIMEOUT.as_secs()))?
+    });
+    if let Err(e) = resumed {
+        msg::warn(&format!(
+            "could not resume sandbox {id}: {e:#}; provisioning continues"
+        ));
+    }
+}
 
-/// `env down` for a provider env: revoke the sandbox's route-to-host
-/// credential, destroy it through the provider API, and verify the provider no
-/// longer lists it before reporting it down (THE-2019). Only after
-/// verification are the local provisioned marker and the worktree's provider
-/// location cleared.
-fn destroy_provider_sandbox(cfg: &Config, env_name: &str, id: &str, wt: &str) -> Result<()> {
+/// `env down` for a provider env: build the real steps and run
+/// [`destroy_provider_sandbox`].
+fn down_provider(
+    cfg: &Config,
+    env: &thegn_core::env::Environment,
+    id: &str,
+    wt: &str,
+    opts: DownOpts,
+) -> Result<()> {
+    let env_name = env.name.as_str();
     if id.is_empty() {
+        if opts.mode == DownMode::Stop {
+            anyhow::bail!("env {env_name} has no recorded sandbox for {wt}; nothing to stop");
+        }
+        env.placement
+            .teardown()
+            .map_err(|e| anyhow::anyhow!("env down failed: {e}"))?;
         outln!("env {env_name} has no recorded sandbox for {wt}; nothing to tear down");
         return Ok(());
+    }
+    let kind = provider_kind(cfg, env_name);
+    if opts.mode == DownMode::Stop && !provider_has_stop(&kind) {
+        anyhow::bail!(no_stop_message(&kind));
     }
     let provider_config = cfg
         .env
@@ -737,18 +864,49 @@ fn destroy_provider_sandbox(cfg: &Config, env_name: &str, id: &str, wt: &str) ->
         .provider
         .clone();
     let provider = api_provider(cfg, Some(wt.to_string()))?;
-    msg::warn(&format!(
-        "destroying sandbox {id}: commits made inside it that were not pulled back are lost (`thegn env pull` first)"
-    ));
-    crate::remote_enqueue_auth::revoke_for_sandbox(&provider_config, id, Some(wt))
-        .context("route-to-host credential revocation failed; sandbox left intact")?;
-    crate::agent::block_on_provider(|| async { provider.destroy(id).await })
-        .map_err(|e| anyhow::anyhow!("env down failed: destroy {id} failed: {e}"))?;
-    // A deadline of its own: never shared with any other wait.
-    let deadline = Instant::now() + DOWN_VERIFY_TIMEOUT;
+    let provider = &provider;
+    let mut pull = || crate::provider_git::pull_back(cfg, wt, env_name);
+    let mut teardown = || {
+        env.placement
+            .teardown()
+            .map_err(|e| anyhow::anyhow!("env down failed: {e}"))
+    };
+    let mut suspend = || {
+        crate::agent::block_on_provider(|| async { provider.suspend(id).await })
+            .map_err(|e| anyhow::anyhow!("env down failed: stop {id} failed: {e:#}"))
+    };
+    let mut revoke = || {
+        crate::remote_enqueue_auth::revoke_for_sandbox(&provider_config, id, Some(wt))
+            .map(|_| ())
+            .context("route-to-host credential revocation failed; sandbox left intact")
+    };
+    let mut destroy = || {
+        crate::agent::block_on_provider(|| async { provider.destroy(id).await })
+            .map_err(|e| anyhow::anyhow!("env down failed: destroy {id} failed: {e}"))
+    };
     let mut list = || crate::agent::block_on_provider(|| async { provider.list().await });
     let mut sleep = std::thread::sleep;
-    wait_until_gone(&mut list, id, deadline, &mut sleep)?;
+    let mut forget = || forget_destroyed_sandbox(id, wt);
+    destroy_provider_sandbox(
+        env_name,
+        id,
+        opts,
+        DownSteps {
+            pull: &mut pull,
+            teardown: &mut teardown,
+            suspend: &mut suspend,
+            revoke: &mut revoke,
+            destroy: &mut destroy,
+            list: &mut list,
+            sleep: &mut sleep,
+            forget: &mut forget,
+        },
+    )
+}
+
+/// Clear the local provisioned marker and the worktree's provider location
+/// after a verified destroy. Failures warn: the sandbox is already gone.
+fn forget_destroyed_sandbox(id: &str, wt: &str) {
     crate::provider_workdir::clear_provisioned(id);
     match Db::open() {
         Ok(db) => {
@@ -762,6 +920,98 @@ fn destroy_provider_sandbox(cfg: &Config, env_name: &str, id: &str, wt: &str) ->
             "sandbox {id} destroyed, but the provider location for {wt} could not be cleared: {e:#}"
         )),
     }
+}
+
+/// How long `env down` waits for the provider to stop listing a destroyed
+/// sandbox, and how often it asks.
+const DOWN_VERIFY_TIMEOUT: Duration = Duration::from_secs(60);
+const DOWN_VERIFY_POLL: Duration = Duration::from_secs(2);
+
+/// The pull-back step `env down` runs first.
+type PullStep<'a> = &'a mut dyn FnMut() -> Result<crate::provider_git::PullReport>;
+/// A fallible provider/side-effect step.
+type DownStep<'a> = &'a mut dyn FnMut() -> Result<()>;
+/// The provider `list()` the destroy verification polls.
+type ListStep<'a> = &'a mut dyn FnMut() -> Result<Vec<String>>;
+
+/// The side effects of a provider `env down`, injected so tests drive the
+/// ordering with fakes.
+struct DownSteps<'a> {
+    /// Pull the sandbox's commits back ([`crate::provider_git::pull_back`]).
+    pull: PullStep<'a>,
+    /// The placement's configured `down_command` (no-op without one).
+    teardown: DownStep<'a>,
+    /// Park the sandbox (`--stop`).
+    suspend: DownStep<'a>,
+    /// Revoke the sandbox's route-to-host credential.
+    revoke: DownStep<'a>,
+    /// Destroy the sandbox through the provider API.
+    destroy: DownStep<'a>,
+    list: ListStep<'a>,
+    sleep: &'a mut dyn FnMut(Duration),
+    /// Clear the provisioned marker and provider location (after verify).
+    forget: &'a mut dyn FnMut(),
+}
+
+/// The kept ref of a pull-back that could not fast-forward.
+fn kept_ref(outcome: &crate::provider_git::PullOutcome) -> Option<&str> {
+    use crate::provider_git::PullOutcome;
+    match outcome {
+        PullOutcome::Diverged { kept_ref, .. } | PullOutcome::LocalDirty { kept_ref } => {
+            Some(kept_ref)
+        }
+        PullOutcome::UpToDate | PullOutcome::FastForwarded { .. } => None,
+    }
+}
+
+/// The `env down` refusal when the pull-back failed and `--force` is absent.
+fn pull_failed_refusal(id: &str, error: &anyhow::Error) -> String {
+    format!(
+        "env down: could not pull back from sandbox {id}: {error:#}; nothing was destroyed. Re-run with --force to destroy anyway"
+    )
+}
+
+/// `env down` for a provider env (THE-2019). First the sandbox's commits are
+/// pulled back: up to date / fast-forwarded continues, a diverged or
+/// locally-dirty result keeps the VM head in a host ref and continues, and a
+/// failed pull refuses unless `--force` (`--stop` only warns: parking loses
+/// nothing). Then `--stop` parks the sandbox (marker and location kept), or the
+/// default revokes the route-to-host credential, destroys the sandbox and
+/// verifies the provider no longer lists it; only after verification are the
+/// local provisioned marker and the worktree's provider location cleared.
+fn destroy_provider_sandbox(
+    env_name: &str,
+    id: &str,
+    opts: DownOpts,
+    steps: DownSteps<'_>,
+) -> Result<()> {
+    match (steps.pull)() {
+        Ok(report) => {
+            outln!("pull-back: {}", report.summary());
+            if let Some(kept) = kept_ref(&report.outcome) {
+                outln!("VM commits kept at {kept}; merge them yourself");
+            }
+        }
+        Err(e) if opts.mode == DownMode::Stop => msg::warn(&format!(
+            "could not pull back from sandbox {id}: {e:#}; its commits stay in the parked sandbox"
+        )),
+        Err(e) if !opts.force => anyhow::bail!(pull_failed_refusal(id, &e)),
+        Err(e) => msg::warn(&format!(
+            "could not pull back from sandbox {id}: {e:#}; destroying it anyway (--force): commits made inside it that were not pulled back are lost"
+        )),
+    }
+    if opts.mode == DownMode::Stop {
+        (steps.suspend)()?;
+        outln!("env {env_name} is stopped (sandbox {id} parked; `thegn env up` resumes it)");
+        return Ok(());
+    }
+    (steps.teardown)()?;
+    (steps.revoke)()?;
+    (steps.destroy)()?;
+    // A deadline of its own: never shared with any other wait.
+    let deadline = Instant::now() + DOWN_VERIFY_TIMEOUT;
+    wait_until_gone(steps.list, id, deadline, steps.sleep)?;
+    (steps.forget)();
     outln!("env {env_name} is down (sandbox {id} destroyed and verified)");
     Ok(())
 }
@@ -1177,7 +1427,75 @@ fn show(cfg: &Config, worktree: Option<String>) -> Result<()> {
         Some(class) => outln!("isolation: {class} — {}", class.escape_note()),
         None => outln!("isolation: resolved at spawn from backend_chain"),
     }
+    let location = match Db::open().and_then(|db| db.location_for(&wt)) {
+        Ok(stored) => location_label(stored.as_deref()),
+        Err(e) => format!("unreadable ({e:#})"),
+    };
+    // No network call: "provisioned" is this machine's local marker.
+    let provisioned = match &env.placement {
+        thegn_core::placement::Placement::Provider(p) if !p.id.trim().is_empty() => {
+            Some(crate::provider_workdir::is_provisioned_locally(&p.id))
+        }
+        _ => None,
+    };
+    for line in show_lines(&env, &location, provisioned, &env.sandbox.git) {
+        outln!("{line}");
+    }
     Ok(())
+}
+
+/// The `location:` value: the stored location, or `local` when none is stored.
+fn location_label(stored: Option<&str>) -> String {
+    match stored.map(str::trim) {
+        Some(s) if !s.is_empty() => s.to_string(),
+        _ => "local".to_string(),
+    }
+}
+
+/// What a sandbox may write in the repository's git directory under `mode`.
+fn git_write_scope(mode: thegn_core::config::SandboxGitMode) -> &'static str {
+    use thegn_core::config::SandboxGitMode;
+    match mode {
+        SandboxGitMode::ReadOnly => {
+            "read-only: the sandbox writes nothing in the git directory; there is nothing to pull back"
+        }
+        SandboxGitMode::CommitOnly => {
+            "commit-only: objects, this worktree's HEAD/index, refs/heads/<lane dir>/; main, tags, hooks and config are read-only"
+        }
+        SandboxGitMode::PushLane => {
+            "push-lane: as commit-only, and a fast-forwarded pull-back pushes the lane branch (push_refs) to origin from the host"
+        }
+        SandboxGitMode::Full => "full: the whole git directory is writable",
+    }
+}
+
+/// The `env show` lines after `isolation:` (THE-2007/THE-2009): the stored
+/// location, the recorded sandbox and whether this machine provisioned it
+/// (`provisioned` is `None` without a provider sandbox id), and the effective
+/// `[sandbox.git]` policy. Pure.
+fn show_lines(
+    env: &thegn_core::env::Environment,
+    location: &str,
+    provisioned: Option<bool>,
+    git: &thegn_core::config::SandboxGitConfig,
+) -> Vec<String> {
+    let mut lines = vec![format!("location:  {location}")];
+    if let thegn_core::placement::Placement::Provider(p) = &env.placement {
+        let sandbox = match provisioned {
+            _ if p.id.trim().is_empty() => "none".to_string(),
+            Some(true) => format!("{} (provisioned here)", p.id),
+            Some(false) | None => {
+                format!("{} (recorded, not provisioned on this machine)", p.id)
+            }
+        };
+        lines.push(format!("sandbox:   {sandbox}"));
+    }
+    lines.push(format!(
+        "git:       mode={} transport={} credential={}",
+        git.mode, git.transport, git.credential
+    ));
+    lines.push(format!("           {}", git_write_scope(git.mode)));
+    lines
 }
 
 /// The honest boundary class the resolved environment provides, or `None` when
@@ -1221,6 +1539,9 @@ fn set(cfg: &Config, name: &str, worktree: Option<String>, workspace: bool) -> R
             "environment {name:?} is not defined under [env.{name}]; it will resolve to the default until you add it"
         ));
     }
+    // THE-2007: a stable-channel daemon would drop a dev-only env and refuse
+    // every later session. Both the worktree and the `--workspace` selection.
+    super::wt::refuse_dev_env_on_stable_daemon(cfg, Some(name))?;
     let wt = super::resolve_worktree(worktree)
         .to_string_lossy()
         .into_owned();
@@ -1267,13 +1588,6 @@ fn location_action(old_location_is_remote: bool, new_env_is_local: bool) -> Loca
     } else {
         LocationAction::Keep
     }
-}
-
-/// Whether a stored `location` value is a managed-provider location. Ssh
-/// locations are not: their worktree path lives on the remote, so there is no
-/// local checkout to fall back to.
-fn is_provider_location(wt: &str, location: Option<&str>) -> bool {
-    matches!(GitLoc::from_db(wt, location), GitLoc::Provider { .. })
 }
 
 /// After `env set` on a worktree: clear a stale provider location when the new
@@ -1749,6 +2063,71 @@ mod up_tests {
     }
 
     #[test]
+    fn show_lines_report_location_sandbox_and_git_policy() {
+        use thegn_core::config::{SandboxGitConfig, SandboxGitMode};
+        let git = SandboxGitConfig::default();
+        let env = provider_env();
+        assert_eq!(
+            show_lines(&env, "provider:…", Some(true), &git),
+            vec![
+                "location:  provider:…".to_string(),
+                "sandbox:   fake-sandbox (provisioned here)".to_string(),
+                "git:       mode=commit-only transport=bundle credential=none".to_string(),
+                "           commit-only: objects, this worktree's HEAD/index, refs/heads/<lane dir>/; main, tags, hooks and config are read-only".to_string(),
+            ]
+        );
+        let recorded = show_lines(&env, "local", Some(false), &git);
+        assert_eq!(
+            recorded[1],
+            "sandbox:   fake-sandbox (recorded, not provisioned on this machine)"
+        );
+        let mut no_id = provider_env();
+        if let Placement::Provider(p) = &mut no_id.placement {
+            p.id.clear();
+        }
+        assert_eq!(
+            show_lines(&no_id, "local", None, &git)[1],
+            "sandbox:   none"
+        );
+        let local = thegn_core::env::Environment {
+            placement: Placement::Local,
+            ..provider_env()
+        };
+        let read_only = SandboxGitConfig {
+            mode: SandboxGitMode::ReadOnly,
+            ..SandboxGitConfig::default()
+        };
+        let lines = show_lines(&local, "local", None, &read_only);
+        assert_eq!(lines.len(), 3, "no sandbox line off a provider: {lines:?}");
+        assert_eq!(lines[0], "location:  local");
+        assert!(
+            lines[1].starts_with("git:       mode=read-only "),
+            "{lines:?}"
+        );
+        assert!(lines[2].contains("nothing to pull back"), "{lines:?}");
+    }
+
+    #[test]
+    fn location_label_defaults_to_local() {
+        assert_eq!(location_label(None), "local");
+        assert_eq!(location_label(Some("  ")), "local");
+        assert_eq!(location_label(Some("ssh://box/wt")), "ssh://box/wt");
+    }
+
+    #[test]
+    fn every_git_mode_names_its_write_scope() {
+        use thegn_core::config::SandboxGitMode;
+        for (mode, prefix) in [
+            (SandboxGitMode::ReadOnly, "read-only:"),
+            (SandboxGitMode::CommitOnly, "commit-only:"),
+            (SandboxGitMode::PushLane, "push-lane:"),
+            (SandboxGitMode::Full, "full:"),
+        ] {
+            assert!(git_write_scope(mode).starts_with(prefix), "{mode:?}");
+        }
+    }
+
+    #[test]
     fn headless_open_skips_a_local_worktree() {
         let _state = crate::testenv::IsolatedState::new();
         let dir = tempfile::tempdir().unwrap();
@@ -1760,11 +2139,221 @@ mod up_tests {
 
 #[cfg(test)]
 mod down_tests {
-    use super::{LocationAction, is_provider_location, location_action, wait_until_gone};
+    use super::{
+        DownMode, DownOpts, DownSteps, LocationAction, destroy_provider_sandbox,
+        is_provider_location, kept_ref, location_action, no_stop_message, provider_has_stop,
+        pull_failed_refusal, resume_on_up, wait_until_gone,
+    };
+    use crate::provider_git::{PullOutcome, PullReport};
     use std::cell::RefCell;
     use std::time::{Duration, Instant};
 
     type ListAnswer = anyhow::Result<Vec<String>>;
+
+    fn report(outcome: PullOutcome) -> PullReport {
+        PullReport {
+            branch: "tg/lane".into(),
+            outcome,
+            push: None,
+        }
+    }
+
+    fn destroy() -> DownOpts {
+        DownOpts {
+            mode: DownMode::Destroy,
+            force: false,
+        }
+    }
+
+    /// Run `env down` against recording fakes; returns the result and the
+    /// order the steps ran in.
+    fn run_down(
+        answer: anyhow::Result<PullReport>,
+        opts: DownOpts,
+    ) -> (anyhow::Result<()>, Vec<&'static str>) {
+        let calls = RefCell::new(Vec::new());
+        let mut answer = Some(answer);
+        let mut pull = || {
+            calls.borrow_mut().push("pull");
+            answer.take().expect("one pull")
+        };
+        let mut teardown = || -> anyhow::Result<()> {
+            calls.borrow_mut().push("teardown");
+            Ok(())
+        };
+        let mut suspend = || -> anyhow::Result<()> {
+            calls.borrow_mut().push("suspend");
+            Ok(())
+        };
+        let mut revoke = || -> anyhow::Result<()> {
+            calls.borrow_mut().push("revoke");
+            Ok(())
+        };
+        let mut destroy = || -> anyhow::Result<()> {
+            calls.borrow_mut().push("destroy");
+            Ok(())
+        };
+        let mut list = || -> anyhow::Result<Vec<String>> {
+            calls.borrow_mut().push("list");
+            Ok(Vec::new())
+        };
+        let mut sleep = |_: Duration| calls.borrow_mut().push("sleep");
+        let mut forget = || calls.borrow_mut().push("forget");
+        let result = destroy_provider_sandbox(
+            "fly-dev",
+            "sbx-1",
+            opts,
+            DownSteps {
+                pull: &mut pull,
+                teardown: &mut teardown,
+                suspend: &mut suspend,
+                revoke: &mut revoke,
+                destroy: &mut destroy,
+                list: &mut list,
+                sleep: &mut sleep,
+                forget: &mut forget,
+            },
+        );
+        let calls = calls.borrow().clone();
+        (result, calls)
+    }
+
+    const DESTROYED: [&str; 6] = ["pull", "teardown", "revoke", "destroy", "list", "forget"];
+
+    #[test]
+    fn an_up_to_date_pull_destroys_and_forgets_the_sandbox() {
+        let (result, calls) = run_down(Ok(report(PullOutcome::UpToDate)), destroy());
+        result.expect("env down succeeds");
+        assert_eq!(calls, DESTROYED);
+    }
+
+    #[test]
+    fn a_fast_forwarded_pull_destroys() {
+        let outcome = PullOutcome::FastForwarded {
+            from: "a".repeat(40),
+            to: "b".repeat(40),
+            commits: 2,
+        };
+        let (result, calls) = run_down(Ok(report(outcome)), destroy());
+        result.expect("env down succeeds");
+        assert_eq!(calls, DESTROYED);
+    }
+
+    #[test]
+    fn a_diverged_pull_keeps_the_ref_and_destroys() {
+        let outcome = PullOutcome::Diverged {
+            kept_ref: "refs/thegn/pull/lane-abc".into(),
+            vm_head: "c".repeat(40),
+        };
+        assert_eq!(kept_ref(&outcome), Some("refs/thegn/pull/lane-abc"));
+        let (result, calls) = run_down(Ok(report(outcome)), destroy());
+        result.expect("nothing is lost: env down continues");
+        assert_eq!(calls, DESTROYED);
+    }
+
+    #[test]
+    fn a_locally_dirty_pull_keeps_the_ref_and_destroys() {
+        let outcome = PullOutcome::LocalDirty {
+            kept_ref: "refs/thegn/pull/lane-abc".into(),
+        };
+        assert_eq!(kept_ref(&outcome), Some("refs/thegn/pull/lane-abc"));
+        assert_eq!(kept_ref(&PullOutcome::UpToDate), None);
+        let (result, calls) = run_down(Ok(report(outcome)), destroy());
+        result.expect("env down continues");
+        assert_eq!(calls, DESTROYED);
+    }
+
+    #[test]
+    fn a_failed_pull_refuses_without_force_and_destroys_nothing() {
+        let (result, calls) = run_down(Err(anyhow::anyhow!("sandbox unreachable")), destroy());
+        let error = format!("{:#}", result.expect_err("a failed pull refuses"));
+        assert_eq!(calls, ["pull"]);
+        assert!(
+            error.contains("could not pull back from sandbox sbx-1: sandbox unreachable"),
+            "{error}"
+        );
+        assert!(error.contains("nothing was destroyed"), "{error}");
+        assert!(error.contains("--force"), "{error}");
+    }
+
+    #[test]
+    fn a_failed_pull_with_force_destroys_anyway() {
+        let opts = DownOpts {
+            mode: DownMode::Destroy,
+            force: true,
+        };
+        let (result, calls) = run_down(Err(anyhow::anyhow!("sandbox unreachable")), opts);
+        result.expect("--force destroys");
+        assert_eq!(calls, DESTROYED);
+    }
+
+    #[test]
+    fn stop_suspends_and_keeps_the_marker() {
+        let opts = DownOpts {
+            mode: DownMode::Stop,
+            force: false,
+        };
+        let (result, calls) = run_down(Ok(report(PullOutcome::UpToDate)), opts);
+        result.expect("stop succeeds");
+        assert_eq!(calls, ["pull", "suspend"]);
+    }
+
+    #[test]
+    fn stop_after_a_failed_pull_still_parks() {
+        let opts = DownOpts {
+            mode: DownMode::Stop,
+            force: false,
+        };
+        let (result, calls) = run_down(Err(anyhow::anyhow!("no exec channel")), opts);
+        result.expect("parking loses nothing");
+        assert_eq!(calls, ["pull", "suspend"]);
+    }
+
+    #[test]
+    fn pull_refusal_names_the_sandbox_and_the_escape_hatch() {
+        let text = pull_failed_refusal("sbx-9", &anyhow::anyhow!("boom"));
+        assert_eq!(
+            text,
+            "env down: could not pull back from sandbox sbx-9: boom; nothing was destroyed. Re-run with --force to destroy anyway"
+        );
+    }
+
+    #[test]
+    fn only_fly_and_machine0_can_stop() {
+        for (kind, expected) in [
+            ("fly", true),
+            ("machine0", true),
+            (" fly ", true),
+            ("sprites", false),
+            ("daytona", false),
+            ("hetzner", false),
+            ("", false),
+        ] {
+            assert_eq!(provider_has_stop(kind), expected, "{kind:?}");
+        }
+        assert_eq!(
+            no_stop_message("sprites"),
+            "sprites has no stop; the sandbox keeps running. Use `thegn env down` to destroy it"
+        );
+        assert!(no_stop_message("").starts_with("this provider has no stop"));
+    }
+
+    #[test]
+    fn env_up_resumes_only_a_parked_stop_capable_sandbox() {
+        for (kind, id, provisioned, expected) in [
+            ("fly", "sbx-1", true, true),
+            ("machine0", "vm-1", true, true),
+            ("fly", "sbx-1", false, false),
+            ("fly", "", true, false),
+            ("sprites", "sbx-1", true, false),
+        ] {
+            assert_eq!(
+                resume_on_up(kind, id, provisioned),
+                expected,
+                "{kind} {id:?} provisioned={provisioned}"
+            );
+        }
+    }
 
     /// A scripted `provider.list()`: each call pops the next answer.
     fn scripted(mut answers: Vec<ListAnswer>) -> RefCell<Vec<ListAnswer>> {

@@ -77,6 +77,49 @@ pub(crate) struct ScheduleConfig {
     pub(crate) loc_every_slots: Option<u64>,
     pub(crate) usage_every_slots: Option<u64>,
     pub(crate) weather_every_slots: Option<u64>,
+    /// Masthead `fleet` badge reads. `None` (no slot at all — the 0%-idle
+    /// contract) unless `fleet` is placed in a bar AND at least one `[env.*]`
+    /// names an API provider. See [`fleet_every_slots`].
+    pub(crate) fleet_every_slots: Option<u64>,
+    /// PR refresh cadence from `[watch] pr_interval_secs`, floored at
+    /// [`PR_FLOOR_SECS`]. Also the main-checkout self-heal backstop.
+    pub(crate) pr_every_slots: u64,
+}
+
+/// Fleet poll cadence (seconds) while the slot is armed. The loop thins it
+/// further to 30 min while nothing runs (`hydrate_fleet::should_poll`).
+pub(crate) const FLEET_POLL_SECS: u64 = 300;
+
+/// Floor under `[watch] pr_interval_secs`, so a misconfigured 0 cannot spin
+/// the forge. Five seconds is still a whole multiple of the 500 ms base.
+pub(crate) const PR_FLOOR_SECS: u64 = 5;
+
+/// Whether `id` is placed in any `[bars]` list.
+fn bars_place(bars: &thegn_core::config::BarsConfig, id: &str) -> bool {
+    [
+        &bars.top_left,
+        &bars.top_right,
+        &bars.bottom_left,
+        &bars.bottom_right,
+    ]
+    .into_iter()
+    .flatten()
+    .any(|placed| placed == id)
+}
+
+/// The fleet slot: armed only when the widget is placed somewhere and at
+/// least one `[env.*]` has a non-custom (API) provider, since a custom env
+/// has nothing to inventory.
+fn fleet_every_slots(cfg: &Config) -> Option<u64> {
+    use thegn_core::config::EnvProviderKind;
+    let provider_env = cfg.env.values().any(|envc| {
+        !matches!(
+            EnvProviderKind::of(&envc.provider.provider),
+            EnvProviderKind::Custom
+        )
+    });
+    (provider_env && bars_place(&cfg.bars, "fleet"))
+        .then(|| thegn_core::time_policy::cadence_slots(FLEET_POLL_SECS, 60, 500).get())
 }
 
 impl ScheduleConfig {
@@ -131,6 +174,13 @@ impl ScheduleConfig {
                 )
                 .get()
             }),
+            fleet_every_slots: fleet_every_slots(cfg),
+            pr_every_slots: thegn_core::time_policy::cadence_slots(
+                cfg.watch.pr_interval_secs,
+                PR_FLOOR_SECS,
+                500,
+            )
+            .get(),
         }
     }
 
@@ -154,6 +204,8 @@ impl ScheduleConfig {
         slot!("loc", loc_every_slots);
         slot!("usage", usage_every_slots);
         slot!("weather", weather_every_slots);
+        slot!("fleet", fleet_every_slots);
+        slot!("pr", pr_every_slots);
         changed
     }
 }
@@ -317,6 +369,8 @@ mod tests {
         next.loc_every_slots = Some(1);
         next.usage_every_slots = Some(1);
         next.weather_every_slots = Some(1);
+        next.fleet_every_slots = Some(1);
+        next.pr_every_slots += 1;
 
         assert_eq!(
             base.changed_slots(&next),
@@ -331,6 +385,8 @@ mod tests {
                 "loc",
                 "usage",
                 "weather",
+                "fleet",
+                "pr",
             ]
         );
     }
@@ -350,6 +406,8 @@ mod tests {
             projected.loc_every_slots,
             projected.usage_every_slots,
             projected.weather_every_slots,
+            projected.fleet_every_slots,
+            projected.pr_every_slots,
         );
     }
 
@@ -472,6 +530,92 @@ mod tests {
             ScheduleConfig::from_config(&low),
             ScheduleConfig::from_config(&high),
             "projection must compare effective cadence, not raw LOC TTL"
+        );
+    }
+
+    fn fly_env() -> thegn_core::config::EnvConfig {
+        thegn_core::config::EnvConfig {
+            provider: thegn_core::config::EnvProviderConfig {
+                provider: "fly".into(),
+                ..Default::default()
+            },
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn fleet_slot_is_armed_only_with_the_widget_and_a_provider_env() {
+        // The shipped bars place `fleet`; no env means nothing to read.
+        let none = Config::default();
+        assert!(bars_place(&none.bars, "fleet"));
+        assert_eq!(ScheduleConfig::from_config(&none).fleet_every_slots, None);
+
+        // A custom-provider env (the default "") has no API inventory.
+        let mut custom = Config::default();
+        custom
+            .env
+            .insert("local".into(), thegn_core::config::EnvConfig::default());
+        assert_eq!(ScheduleConfig::from_config(&custom).fleet_every_slots, None);
+
+        // A fly env arms the five-minute slot.
+        let mut fly = Config::default();
+        fly.env.insert("fly-dev".into(), fly_env());
+        assert_eq!(
+            ScheduleConfig::from_config(&fly).fleet_every_slots,
+            Some(FLEET_POLL_SECS * 2)
+        );
+
+        // Removing the widget from every bar disarms it again.
+        let mut removed = fly.clone();
+        removed.bars.top_right.retain(|id| id != "fleet");
+        assert!(!bars_place(&removed.bars, "fleet"));
+        assert_eq!(
+            ScheduleConfig::from_config(&removed).fleet_every_slots,
+            None
+        );
+        assert_eq!(
+            ScheduleConfig::from_config(&fly).changed_slots(&ScheduleConfig::from_config(&removed)),
+            ["fleet"]
+        );
+
+        // Placed in the bottom bar instead still counts.
+        let mut bottom = removed;
+        bottom.bars.bottom_right.push("fleet".into());
+        assert!(
+            ScheduleConfig::from_config(&bottom)
+                .fleet_every_slots
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn pr_cadence_follows_watch_interval_with_a_floor() {
+        let default = Config::default();
+        assert_eq!(default.watch.pr_interval_secs, 20);
+        assert_eq!(ScheduleConfig::from_config(&default).pr_every_slots, 40);
+
+        let mut zero = Config::default();
+        zero.watch.pr_interval_secs = 0;
+        assert_eq!(
+            ScheduleConfig::from_config(&zero).pr_every_slots,
+            PR_FLOOR_SECS * 2
+        );
+
+        let mut slow = Config::default();
+        slow.watch.pr_interval_secs = 90;
+        assert_eq!(ScheduleConfig::from_config(&slow).pr_every_slots, 180);
+        assert_eq!(
+            ScheduleConfig::from_config(&default)
+                .changed_slots(&ScheduleConfig::from_config(&slow)),
+            ["pr"]
+        );
+
+        // Floored values select the same cadence and do not restart.
+        let mut one = Config::default();
+        one.watch.pr_interval_secs = 1;
+        assert_eq!(
+            ScheduleConfig::from_config(&zero),
+            ScheduleConfig::from_config(&one)
         );
     }
 
