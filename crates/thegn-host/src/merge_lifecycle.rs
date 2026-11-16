@@ -230,6 +230,13 @@ pub(crate) fn apply_landed(
     // A retained worktree must leave a durable trace: this path runs from the
     // CLI/daemon, where the terminal warning above is easily lost.
     if let Some(text) = hold_notice(&notes) {
+        tracing::info!(
+            target: "thegn::git_audit",
+            worktree = %worktree,
+            commit = %commit,
+            class = "hold",
+            "landed cleanup hold recorded"
+        );
         let source_ref = format!("merge-cleanup:{commit}:{worktree}");
         if let Err(error) = crate::automation_events::emit_once(
             db,
@@ -571,13 +578,56 @@ pub(crate) fn remove_landed(
     landed: Option<&str>,
     delete_branch: bool,
 ) -> CleanupOutcome {
+    remove_landed_unaudited(
+        db,
+        repo_root,
+        worktree,
+        branch,
+        target,
+        landed,
+        delete_branch,
+    )
+}
+
+/// One `thegn::git_audit` line per cleanup attempt: worktree, commit and the
+/// outcome class only (no further paths, no free-form refusal text).
+fn audit_cleanup_outcome(worktree: &str, landed: Option<&str>, outcome: &CleanupOutcome) {
+    let class = match outcome {
+        CleanupOutcome::Removed {
+            branch_held: true, ..
+        } => "removed_branch_held",
+        CleanupOutcome::Removed { .. } => "removed",
+        CleanupOutcome::KeptDirty => "kept_dirty",
+        CleanupOutcome::KeptChanged => "kept_changed",
+        CleanupOutcome::Refused { class, .. } => class.id(),
+    };
+    tracing::info!(
+        target: "thegn::git_audit",
+        worktree = %worktree,
+        commit = %landed.unwrap_or(""),
+        class,
+        "landed cleanup attempt"
+    );
+}
+
+fn remove_landed_unaudited(
+    db: &Db,
+    repo_root: &Path,
+    worktree: &str,
+    branch: &str,
+    target: &str,
+    landed: Option<&str>,
+    delete_branch: bool,
+) -> CleanupOutcome {
     let selected = match db.list_merge_queue() {
         Ok(rows) => rows.into_iter().find(|row| row.worktree == worktree),
         Err(error) => {
-            return CleanupOutcome::Refused {
+            let refused = CleanupOutcome::Refused {
                 class: CleanupRefusal::Database,
                 reason: format!("queue identity unavailable: {error}"),
             };
+            audit_cleanup_outcome(worktree, landed, &refused);
+            return refused;
         }
     };
     let Some(selected) = selected.filter(|row| {
@@ -587,11 +637,29 @@ pub(crate) fn remove_landed(
             && landed.is_some()
             && row.result_oid.as_deref() == landed
     }) else {
-        return CleanupOutcome::Refused {
+        let refused = CleanupOutcome::Refused {
             class: CleanupRefusal::Identity,
             reason: "committed outcome does not match a current landed queue row".into(),
         };
+        audit_cleanup_outcome(worktree, landed, &refused);
+        return refused;
     };
+    // A held row already completed its worktree collection (the sweep treats
+    // it the same way); only the branch is deliberately retained. Replaying
+    // the land is a no-op, not a fresh refusal against the vanished path.
+    if thegn_core::merge_sweep::CleanupHold::from_detail(selected.error_detail.as_deref()).is_some()
+    {
+        let replay = CleanupOutcome::Removed {
+            branch_deleted: false,
+            queue_removed: false,
+            discarded_build_state: false,
+            discarded_tool_state: false,
+            branch_held: true,
+            bookkeeping_errors: Vec::new(),
+        };
+        audit_cleanup_outcome(worktree, landed, &replay);
+        return replay;
+    }
     let cfg = crate::config_startup::cleanup_config();
     remove_landed_with_config(
         &cfg,
@@ -608,6 +676,33 @@ pub(crate) fn remove_landed(
 
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn remove_landed_with_config(
+    cfg: &thegn_core::config::Config,
+    db: &Db,
+    repo_root: &Path,
+    worktree: &str,
+    branch: &str,
+    target: &str,
+    landed: Option<&str>,
+    expected_queue: &thegn_core::db::MergeQueueRow,
+    delete_branch: bool,
+) -> CleanupOutcome {
+    let outcome = remove_landed_with_config_unaudited(
+        cfg,
+        db,
+        repo_root,
+        worktree,
+        branch,
+        target,
+        landed,
+        expected_queue,
+        delete_branch,
+    );
+    audit_cleanup_outcome(worktree, landed, &outcome);
+    outcome
+}
+
+#[allow(clippy::too_many_arguments)]
+fn remove_landed_with_config_unaudited(
     cfg: &thegn_core::config::Config,
     db: &Db,
     repo_root: &Path,
@@ -1838,6 +1933,114 @@ mod tests {
                     .is_some()
         }));
         let _ = std::fs::remove_dir_all(&root); // best-effort: cleanup: the target may already be gone; a failed removal never fails the caller
+    }
+
+    /// Crash after the worktree was removed but before the queue row moved:
+    /// re-running cleanup must not panic, must not resurrect anything, must
+    /// leave the row for a later reconcile, and must be idempotent.
+    #[test]
+    fn crash_after_worktree_removal_before_row_update_is_idempotent() {
+        let _isolation = TestIsolation::new();
+        let db = Db::open_memory().unwrap();
+        let (root, feat) = repo_with_feat(&db, "crash-a");
+        let feat_s = feat.to_string_lossy().to_string();
+        let commit = record_private_land(&db, &root, &feat_s, "feat");
+        // The "crash": git removed the checkout, the DB write never happened.
+        git(
+            &root,
+            &["worktree", "remove", "--force", feat.to_str().unwrap()],
+        );
+        let rows_before = db.list_merge_queue().unwrap();
+        for _ in 0..2 {
+            let outcome = remove_landed(&db, &root, &feat_s, "feat", "main", Some(&commit), true);
+            assert!(
+                !matches!(outcome, CleanupOutcome::Removed { .. }),
+                "nothing left to remove: {outcome:?}"
+            );
+            assert!(!feat.exists(), "worktree stays gone");
+            assert_eq!(db.list_merge_queue().unwrap(), rows_before, "row untouched");
+        }
+        assert!(
+            util::git_ok(
+                &root,
+                &["rev-parse", "--verify", "--quiet", "refs/heads/feat"]
+            ),
+            "branch kept"
+        );
+        let _ = std::fs::remove_dir_all(&root); // best-effort: cleanup: the target may already be gone; a failed removal never fails the caller
+    }
+
+    /// Reverse order: the queue row was retired but the worktree survived the
+    /// crash. Cleanup refuses on identity and touches neither.
+    #[test]
+    fn crash_after_row_retired_before_worktree_removal_keeps_worktree() {
+        let _isolation = TestIsolation::new();
+        let db = Db::open_memory().unwrap();
+        let (root, feat) = repo_with_feat(&db, "crash-b");
+        let feat_s = feat.to_string_lossy().to_string();
+        let commit = record_private_land(&db, &root, &feat_s, "feat");
+        db.remove_merge_entry_as(&feat_s, "thegn close").unwrap();
+        for _ in 0..2 {
+            let outcome = remove_landed(&db, &root, &feat_s, "feat", "main", Some(&commit), false);
+            assert!(
+                matches!(
+                    outcome,
+                    CleanupOutcome::Refused {
+                        class: CleanupRefusal::Identity,
+                        ..
+                    }
+                ),
+                "{outcome:?}"
+            );
+            assert!(feat.is_dir(), "worktree kept");
+            assert!(db.list_merge_queue().unwrap().is_empty());
+        }
+        let _ = std::fs::remove_dir_all(&root); // best-effort: cleanup: the target may already be gone; a failed removal never fails the caller
+    }
+
+    /// A completed hold re-run (crash recovery of the notice path) converges
+    /// on one hold row and exactly one inbox notice.
+    #[test]
+    fn rerunning_a_held_landed_cleanup_records_one_notice() {
+        let _isolation = TestIsolation::new();
+        let db = Db::open_memory().unwrap();
+        let (root, feat) = repo_with_feat(&db, "crash-c");
+        let feat_s = feat.to_string_lossy().to_string();
+        let commit = record_private_land(&db, &root, &feat_s, "feat");
+        apply_landed(&cfg(OnLanded::Remove), &db, &root, &feat_s, "feat", &commit);
+        assert!(!feat.exists());
+        let notices = db.get_unread_notifications().unwrap().len();
+        let rows = db.list_merge_queue().unwrap();
+        apply_landed(&cfg(OnLanded::Remove), &db, &root, &feat_s, "feat", &commit);
+        assert_eq!(
+            db.get_unread_notifications().unwrap().len(),
+            notices,
+            "no double notice"
+        );
+        assert_eq!(db.list_merge_queue().unwrap(), rows, "hold row unchanged");
+        let _ = std::fs::remove_dir_all(&root); // best-effort: cleanup: the target may already be gone; a failed removal never fails the caller
+    }
+
+    #[test]
+    fn audit_cleanup_outcome_covers_every_class() {
+        for outcome in [
+            CleanupOutcome::KeptDirty,
+            CleanupOutcome::KeptChanged,
+            CleanupOutcome::Refused {
+                class: CleanupRefusal::Identity,
+                reason: "x".into(),
+            },
+            CleanupOutcome::Removed {
+                branch_deleted: false,
+                queue_removed: true,
+                discarded_build_state: false,
+                discarded_tool_state: false,
+                branch_held: false,
+                bookkeeping_errors: Vec::new(),
+            },
+        ] {
+            audit_cleanup_outcome("/wt", Some("abc"), &outcome);
+        }
     }
 
     #[test]
