@@ -12553,6 +12553,9 @@ async fn event_loop<T: Terminal>(
             // render at all. (`weather_cfg` is re-applied from the config after
             // the swap, below, so only the snapshot is carried here.)
             next_model.weather = model.weather.take();
+            // The fleet read is loop-owned the same way (pushed by
+            // `hydrate_fleet`, minutes apart).
+            next_model.fleet = model.fleet.take();
             // Typed gitlink reads arrive independently of hydration. Carry the
             // last-known payload across an ordinary model refresh so a failed
             // scan cannot make a submodule row appear clean or textual.
@@ -14542,6 +14545,7 @@ async fn event_loop<T: Terminal>(
         let mut scheduled_loc_generation = RefreshGeneration::default();
         let mut scheduled_usage_generation = RefreshGeneration::default();
         let mut scheduled_weather_generation = RefreshGeneration::default();
+        let mut scheduled_fleet_generation = RefreshGeneration::default();
         // Fold-actor results (batch fold + agent-driven drain): toast outcomes,
         // patch queue rows in place, route settled transitions to the inbox, and
         // re-hydrate so the advanced tip and cleared dots show immediately.
@@ -14725,6 +14729,7 @@ async fn event_loop<T: Terminal>(
                         RefreshKind::WeatherPoll => {
                             scheduled_weather_generation.scheduled(generation)
                         }
+                        RefreshKind::FleetPoll => scheduled_fleet_generation.scheduled(generation),
                         _ => {}
                     }
                     *kind
@@ -14738,6 +14743,7 @@ async fn event_loop<T: Terminal>(
                         RefreshKind::Loc { .. } => scheduled_loc_generation.untagged(),
                         RefreshKind::UsagePoll => scheduled_usage_generation.untagged(),
                         RefreshKind::WeatherPoll => scheduled_weather_generation.untagged(),
+                        RefreshKind::FleetPoll => scheduled_fleet_generation.untagged(),
                         _ => {}
                     }
                     kind
@@ -15009,6 +15015,58 @@ async fn event_loop<T: Terminal>(
                         // can never disagree.
                         dirty |=
                             crate::detail::retick_open(&mut bar_detail, model.weather.as_ref());
+                    }
+                }
+                // Consider a fleet read for the `fleet` burn badge. The slot
+                // exists only while the widget is placed and a provider env is
+                // configured; `should_poll` thins it to 30 min while nothing
+                // runs and the popup is closed. The read is a blocking pass
+                // (provider APIs + the worktree join) in the blocking pool.
+                RefreshKind::FleetPoll => {
+                    // Offline: every env would time out into "unavailable"
+                    // and overwrite the last good read; keep it instead.
+                    if thegn_core::connectivity::current()
+                        != thegn_core::connectivity::Connectivity::Offline
+                    {
+                        crate::hydrate_fleet::spawn_poll(crate::hydrate_fleet::PollParams {
+                            cfg: current_config.clone(),
+                            tx: refresh_tx.clone(),
+                            waker: waker.clone(),
+                            generation: scheduled_fleet_generation
+                                .generation()
+                                .map(|generation| (schedule.fence(), generation)),
+                            last: model
+                                .fleet
+                                .as_deref()
+                                .map(crate::hydrate_fleet::LastRead::of),
+                            popup_open: crate::detail::fleet::is_open(&bar_detail),
+                            now_ms: thegn_core::util::now_ms(),
+                        });
+                    }
+                }
+                RefreshKind::Fleet(snap) => {
+                    // A re-read that changed nothing repaints nothing.
+                    let changed = model.fleet.as_deref().is_none_or(|old| {
+                        old.view != snap.view
+                            || old.cost.total_hourly.to_bits() != snap.cost.total_hourly.to_bits()
+                            || old.cost.unpriced != snap.cost.unpriced
+                    });
+                    model.fleet = Some(std::sync::Arc::new(*snap));
+                    if changed {
+                        // The badge is the bars' damage class, like weather.
+                        bars_dirty = true;
+                    }
+                    if crate::detail::fleet::is_open(&bar_detail) {
+                        dirty |= crate::detail::fleet::refresh_open(
+                            &mut bar_detail,
+                            &model,
+                            &crate::detail::StatusCtx::new(
+                                &panel_ui.docs,
+                                start.elapsed().as_secs(),
+                                Rect::full(cols, rows),
+                                &current_config.daemon,
+                            ),
+                        );
                     }
                 }
                 RefreshKind::UsageTokens(t) => {

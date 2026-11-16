@@ -143,3 +143,18 @@ fn every_live_row_names_a_hook() {
         );
     }
 }
+
+/// `[watch] pr_interval_secs` drives the host's PR refresh cadence
+/// (`ScheduleConfig::pr_every_slots`), so it reloads live through the
+/// Schedule hook; the rest of `[watch]` still needs a restart.
+#[test]
+fn watch_pr_interval_is_live_on_the_schedule_hook() {
+    assert_eq!(
+        class_for("watch.pr_interval_secs"),
+        Some((ReloadClass::Live, ReloadHook::Schedule))
+    );
+    assert_eq!(
+        class_for("watch"),
+        Some((ReloadClass::Restart, ReloadHook::None))
+    );
+}
