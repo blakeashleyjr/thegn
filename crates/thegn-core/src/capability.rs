@@ -1109,16 +1109,6 @@ pub const SURFACE_GAPS: &[(&str, Surface, &str)] = &[
         Surface::Mcp,
         "MCP state tools land in the client-API phase",
     ),
-    (
-        "dispatches.put",
-        Surface::Mcp,
-        "MCP state tools land in the client-API phase",
-    ),
-    (
-        "dispatches.set_status",
-        Surface::Mcp,
-        "MCP state tools land in the client-API phase",
-    ),
 ];
 
 /// Why a SURFACE_GAPS row is excused (THE-201). Every row has exactly one, in [`GAP_DISPOSITIONS`].
@@ -1330,16 +1320,6 @@ pub const GAP_DISPOSITIONS: &[(&str, Surface, GapDisposition)] = &[
     ),
     (
         "issues.comment",
-        Surface::Mcp,
-        GapDisposition::Deferred { review: "THE-203" },
-    ),
-    (
-        "dispatches.put",
-        Surface::Mcp,
-        GapDisposition::Deferred { review: "THE-203" },
-    ),
-    (
-        "dispatches.set_status",
         Surface::Mcp,
         GapDisposition::Deferred { review: "THE-203" },
     ),
