@@ -234,6 +234,7 @@ mod proc_workload;
 mod proc_workload_alloc;
 mod profile;
 mod provider_factory;
+mod provider_git;
 mod provider_workdir;
 mod provision_gate;
 mod provision_recover;
