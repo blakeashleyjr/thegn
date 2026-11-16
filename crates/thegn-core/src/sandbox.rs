@@ -858,8 +858,11 @@ enum DestFix {
 
 /// Where a local bind of `host_canon` may land given its requested `dest`.
 /// `resolve` canonicalizes a path (absent leaves resolved through their
-/// existing ancestors). A destination that resolves to itself is kept. One
-/// that resolves elsewhere is rewritten only to a path that does not widen the
+/// existing ancestors). A destination that resolves to itself is kept, and so
+/// is one under no visible root: bwrap creates an absent mount point as real
+/// directories in the new root, so the host's symlink is never met there and
+/// the path-visible alias (`--chdir`, `$PWD`, `$HOME`) keeps working. One under
+/// a visible root that resolves elsewhere is rewritten only to a path that does not widen the
 /// sandbox: its own source (`host_canon`, so the source is bound once, at its
 /// own path) or a path under one of `roots` (an already-visible bind or
 /// substrate). Anything else is dropped.
@@ -873,6 +876,13 @@ fn bwrap_bind_dest(
         return DestFix::Keep;
     };
     if resolved == dest {
+        return DestFix::Keep;
+    }
+    // bwrap creates an absent mount point as real directories in the new root,
+    // so only a destination under an already-visible root can meet the host's
+    // symlink there. Anything else keeps its path-visible alias (`--chdir`,
+    // `$PWD` and `$HOME` name the alias).
+    if !roots.iter().any(|root| dest.starts_with(root)) {
         return DestFix::Keep;
     }
     if resolved == host_canon || roots.iter().any(|root| resolved.starts_with(root)) {

@@ -179,7 +179,7 @@ mod tests {
     #[test]
     fn existing_env_value_wins() {
         let id = resolve(&reader(Some("Ada"), Some("ada@example.org")));
-        let existing = vec![("GIT_COMMITTER_EMAIL".to_string(), "x@y".to_string())];
+        let existing = [("GIT_COMMITTER_EMAIL".to_string(), "x@y".to_string())];
         let env = identity_env(&id, &existing, &no_host);
         assert_eq!(
             keys(&env),
