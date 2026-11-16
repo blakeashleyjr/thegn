@@ -26,7 +26,7 @@ All notable changes to **thegn** are documented here. The format follows
 - Masthead app chips are clickable buttons, and a failed app shows why. (THE-2022)
 - The sidebar detail line shows more by default.
 - Task runs, voice capture and process helpers now supervise through the shared process supervisor, which detaches at leader exit and can hand the caller a live stdin pipe. (THE-729)
-- `ci.logs` uses one 90 second deadline, provider calls clip to the refresh deadline, and `ci.runs` listings are capped; dropped requests cancel their provider children. (THE-538)
+- `ci.logs` uses one 90 second deadline, provider calls clip to the refresh deadline, the remote refresh prelude is cancellable, the run-detail drill has a 120 second wall and is cancelled on quit, and `ci.runs` listings are capped; dropped requests cancel their provider children. (THE-538)
 - Internal: typed git reads, strict git decoding on ssh/exec, a typed Fly machine inventory, and a refreshed host event ingress audit. (THE-368, THE-376, THE-383, THE-530, THE-661)
 
 ### Fixed
