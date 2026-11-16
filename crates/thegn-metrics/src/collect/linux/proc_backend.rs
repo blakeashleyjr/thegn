@@ -184,6 +184,9 @@ fn project_native_table<F: ProcFs>(
         other: owner_totals(native.page_size),
     };
     let mut cpu_samples = [0_usize; 4];
+    // Per-pane split of the `panes` bucket: (pane id, totals, cpu sample count),
+    // kept sorted by pane id. Bounded by the pane count.
+    let mut per_pane: Vec<(u32, ProcOwnerTotals, usize)> = Vec::new();
     for entry in table.entries().iter().filter(|entry| !entry.ghost) {
         let stat = &entry.stat;
         native.current_ids.push((entry.id.pid, stat.starttime));
@@ -211,21 +214,23 @@ fn project_native_table<F: ProcFs>(
             ProcOwner::Pane(_) => (&mut owners.panes, &mut cpu_samples[2]),
             ProcOwner::Other => (&mut owners.other, &mut cpu_samples[3]),
         };
-        totals.count += 1;
-        if let Some(cpu) = entry.cpu_delta.and_then(|delta| delta.percent) {
-            totals.cpu_pct = totals.cpu_pct.map(|total| total + cpu);
-            *cpu_sample_count += 1;
-        }
-        if let Some(rss) = native.page_size.and_then(|page_size| {
+        let cpu = entry.cpu_delta.and_then(|delta| delta.percent);
+        let rss = native.page_size.and_then(|page_size| {
             u64::try_from(stat.rss_pages.max(0))
                 .ok()
                 .and_then(|pages| pages.checked_mul(page_size))
-        }) {
-            if let Some(total) = &mut totals.rss_bytes {
-                *total = total.saturating_add(rss);
-            }
-        } else {
-            totals.rss_bytes = None;
+        });
+        fold_owner_totals(totals, cpu_sample_count, cpu, rss);
+        if let ProcOwner::Pane(pane) = owner {
+            let slot = match per_pane.binary_search_by_key(&pane, |row| row.0) {
+                Ok(index) => index,
+                Err(index) => {
+                    per_pane.insert(index, (pane, owner_totals(native.page_size), 0));
+                    index
+                }
+            };
+            let (_, pane_totals, pane_samples) = &mut per_pane[slot];
+            fold_owner_totals(pane_totals, pane_samples, cpu, rss);
         }
     }
     native.current_ids.sort_unstable();
@@ -260,6 +265,15 @@ fn project_native_table<F: ProcFs>(
         owners.other.cpu_pct = None;
     }
     summary.owners = owners;
+    summary.pane_totals = per_pane
+        .into_iter()
+        .map(|(pane, mut totals, samples)| {
+            if samples == 0 {
+                totals.cpu_pct = None;
+            }
+            (pane, totals)
+        })
+        .collect();
     native.scratch.clear();
     native.scratch.reserve(live);
     for entry in table.entries().iter().filter(|entry| !entry.ghost) {
@@ -340,6 +354,28 @@ fn project_native_table<F: ProcFs>(
         },
         chosen,
     )
+}
+
+/// Fold one process into an owner bucket. CPU counts only when a delta
+/// exists; one unreadable RSS makes the bucket's RSS unknown.
+fn fold_owner_totals(
+    totals: &mut ProcOwnerTotals,
+    cpu_sample_count: &mut usize,
+    cpu: Option<f64>,
+    rss: Option<u64>,
+) {
+    totals.count += 1;
+    if let Some(cpu) = cpu {
+        totals.cpu_pct = totals.cpu_pct.map(|total| total + cpu);
+        *cpu_sample_count += 1;
+    }
+    if let Some(rss) = rss {
+        if let Some(total) = &mut totals.rss_bytes {
+            *total = total.saturating_add(rss);
+        }
+    } else {
+        totals.rss_bytes = None;
+    }
 }
 
 fn owner_totals(page_size: Option<u64>) -> ProcOwnerTotals {
