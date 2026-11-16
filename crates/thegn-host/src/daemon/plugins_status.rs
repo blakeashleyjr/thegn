@@ -71,6 +71,8 @@ mod tests {
                 queue_drops: 6,
                 coalesced: 7,
                 bridge: Default::default(),
+                sched_skipped: 8,
+                sched_overloaded: 9,
             }],
         }
     }
