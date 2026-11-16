@@ -3420,6 +3420,51 @@ async fn drive_exec<S>(
     }
 }
 
+/// One sandbox as a provider's inventory reports it (`thegn fleet`). `id` is
+/// the thegn sandbox id — what [`Provider::list`] returns and what a
+/// worktree's binding records. The remaining fields are `None` when the
+/// provider has no typed inventory yet (the id-only fallback).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SandboxInfo {
+    pub id: String,
+    /// The provider's own handle for the resource (Fly: the machine id).
+    pub name: Option<String>,
+    pub state: Option<String>,
+    /// The size key the bundled price table uses (Fly:
+    /// `shared-cpu-1x:256MB`; VPS: the vendor slug).
+    pub size: Option<String>,
+    pub region: Option<String>,
+    pub created_at_ms: Option<i64>,
+}
+
+impl SandboxInfo {
+    /// A row with only its id known.
+    pub fn id_only(id: impl Into<String>) -> Self {
+        SandboxInfo {
+            id: id.into(),
+            ..SandboxInfo::default()
+        }
+    }
+}
+
+/// A typed inventory with its completeness explicit (mirrors
+/// [`crate::vps::Inventory`]): only `Complete` may support an absence claim.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum InventoryReport {
+    Complete(Vec<SandboxInfo>),
+    Partial {
+        rows: Vec<SandboxInfo>,
+        reason: String,
+    },
+}
+
+impl InventoryReport {
+    /// The id-only fallback for a provider without a typed inventory.
+    pub fn from_ids(ids: Vec<String>) -> Self {
+        InventoryReport::Complete(ids.into_iter().map(SandboxInfo::id_only).collect())
+    }
+}
+
 /// The generic managed-sandbox provider dispatcher. Lifecycle methods delegate to
 /// the variant's [`RemoteProvider`]; axis methods delegate to the variant's
 /// sub-trait impl or return a clear "unsupported" error (gate on `caps`).
@@ -3530,6 +3575,18 @@ impl Provider {
             Some(p) => p.list().await,
             // Exec-only: listing belongs to the sandbox's underlying provider.
             None => Err(iroh_exec_only("list")),
+        }
+    }
+
+    /// The provider's sandboxes with whatever detail it can type (`thegn
+    /// fleet`). Fly maps its machines (size, region, state, creation time);
+    /// the other providers fall back to [`Self::list`] ids with unknown fields.
+    /// The exec-only iroh reach refuses, like `list`.
+    pub async fn inventory(&self) -> Result<InventoryReport> {
+        match self {
+            Provider::Fly(p) => p.sandbox_inventory().await,
+            Provider::Iroh { .. } => Err(iroh_exec_only("inventory")),
+            _ => Ok(InventoryReport::from_ids(self.list().await?)),
         }
     }
 
@@ -7828,5 +7885,22 @@ mod tests {
 
         assert!(!ignore.is_ignored("out/keep", false).unwrap());
         assert!(ignore.is_ignored("out/other", false).unwrap());
+    }
+
+    #[test]
+    fn inventory_report_from_ids_is_complete_and_id_only() {
+        let report = InventoryReport::from_ids(vec!["a".into(), "b".into()]);
+        assert_eq!(
+            report,
+            InventoryReport::Complete(vec![SandboxInfo::id_only("a"), SandboxInfo::id_only("b")])
+        );
+        let InventoryReport::Complete(rows) = report else {
+            unreachable!()
+        };
+        assert!(
+            rows.iter().all(|row| row.size.is_none()
+                && row.state.is_none()
+                && row.created_at_ms.is_none())
+        );
     }
 }
