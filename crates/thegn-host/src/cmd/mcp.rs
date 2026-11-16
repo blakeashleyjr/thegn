@@ -455,8 +455,9 @@ const NO_DAEMON: &str = "daemon not reachable — start thegn or `thegn daemon`"
 
 /// Control-route params for `sessions.resize` / `worktrees.open` from the
 /// already-validated MCP arguments. Resize renames the MCP `session` argument
-/// to the route's `{s}` path parameter and refuses a dimension that cannot fit
-/// `ResizeBody`'s `u16` before any daemon round-trip; `worktrees.open` passes
+/// to the route's `{s}` path parameter and refuses a dimension over the
+/// daemon's shared PTY bound (`MAX_PTY_ROWS` x `MAX_PTY_COLS`, which the daemon
+/// enforces too) before any daemon round-trip; `worktrees.open` passes
 /// `OpenWorktreeBody`'s `repo`/`branch` through unchanged. Pure.
 fn resize_open_params(
     cap: &str,
@@ -465,13 +466,14 @@ fn resize_open_params(
     let mut params = args.as_object().cloned().unwrap_or_default();
     if cap == "sessions.resize" {
         let session = params.remove("session").ok_or("missing `session`")?;
-        for key in ["rows", "cols"] {
+        use thegn_svc::control::{MAX_PTY_COLS, MAX_PTY_ROWS};
+        for (key, max) in [("rows", MAX_PTY_ROWS), ("cols", MAX_PTY_COLS)] {
             let fits = params
                 .get(key)
                 .and_then(serde_json::Value::as_u64)
-                .is_some_and(|n| u16::try_from(n).is_ok());
+                .is_some_and(|n| n <= u64::from(max));
             if !fits {
-                return Err(format!("`{key}` must be an integer from 0 to 65535"));
+                return Err(format!("`{key}` must be an integer from 0 to {max}"));
             }
         }
         params.insert("s".into(), session);
@@ -1222,6 +1224,8 @@ mod tests {
         for bad in [
             serde_json::json!({ "session": "s", "rows": 65_536, "cols": 80 }),
             serde_json::json!({ "session": "s", "rows": 24, "cols": -1 }),
+            serde_json::json!({ "session": "s", "rows": 24, "cols": 1001 }),
+            serde_json::json!({ "session": "s", "rows": 1001, "cols": 80 }),
             serde_json::json!({ "rows": 24, "cols": 80 }),
         ] {
             assert!(
@@ -1229,6 +1233,15 @@ mod tests {
                 "{bad}"
             );
         }
+
+        let at_bound = serde_json::json!({ "session": "s", "rows": 1000, "cols": 1000 });
+        assert!(resize_open_params("sessions.resize", &at_bound).is_ok());
+        let err = resize_open_params(
+            "sessions.resize",
+            &serde_json::json!({ "session": "s", "rows": 24, "cols": 1001 }),
+        )
+        .unwrap_err();
+        assert_eq!(err, "`cols` must be an integer from 0 to 1000");
 
         let args = serde_json::json!({ "repo": "/repo", "branch": "main" });
         let params = resize_open_params("worktrees.open", &args).unwrap();
