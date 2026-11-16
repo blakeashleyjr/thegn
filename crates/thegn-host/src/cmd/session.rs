@@ -353,11 +353,14 @@ pub enum SessionAction {
 ///
 /// The liveness token sits immediately after the id so a supervisor can grep a
 /// fixed column: `live`, or `exited(<code>)` — `exited(?)` when the child could
-/// not be reaped — suffixed with the `final_state` word when the daemon has
-/// one, e.g. `exited(0,done)`. The wire has carried this data all along
+/// not be reaped — with `,done` appended when the final state is `done`
+/// (`exited(0,done)`). Any other final state rides as a trailing `last:<state>`
+/// field, so the token grammar stays `live | exited(<code>|?)[,done]`. JSON
+/// output is unchanged. The wire has carried this data all along
 /// (`SessionInfo::exited_at_ms`); printing it is what makes the listing
 /// truthful about a worker that already finished.
 pub(crate) fn session_line(s: &thegn_svc::control::SessionInfo) -> String {
+    let mut last = String::new();
     let state = match s.exited_at_ms {
         None => "live".to_string(),
         Some(_) => {
@@ -365,7 +368,11 @@ pub(crate) fn session_line(s: &thegn_svc::control::SessionInfo) -> String {
                 .exit_code
                 .map_or_else(|| "?".to_string(), |c| c.to_string());
             match s.final_state.as_deref() {
-                Some(w) if !w.is_empty() => format!("exited({code},{})", display_cell(w)),
+                Some("done") => format!("exited({code},done)"),
+                Some(w) if !w.is_empty() => {
+                    last = format!("  last:{}", display_cell(w));
+                    format!("exited({code})")
+                }
                 _ => format!("exited({code})"),
             }
         }
@@ -380,7 +387,7 @@ pub(crate) fn session_line(s: &thegn_svc::control::SessionInfo) -> String {
         .map(|source| format!("  ← forked from {}", display_cell(source)))
         .unwrap_or_default();
     format!(
-        "{}  {}  {}x{}  {} client(s)  {}{}{}{}",
+        "{}  {}  {}x{}  {} client(s)  {}{}{}{}{}",
         display_cell(&s.id),
         state,
         s.cols,
@@ -392,7 +399,8 @@ pub(crate) fn session_line(s: &thegn_svc::control::SessionInfo) -> String {
             .map(|w| format!("  [{}]", display_cell(w)))
             .unwrap_or_default(),
         lease,
-        lineage
+        lineage,
+        last
     )
 }
 
@@ -2288,6 +2296,20 @@ mod session_line_tests {
     }
 
     #[test]
+    fn other_final_states_ride_as_a_trailing_last_field() {
+        let line = session_line(&info(Some(1), Some(0), Some("idle")));
+        assert_eq!(token(&line), "exited(0)");
+        assert!(line.ends_with("  last:idle"), "{line}");
+        let line = session_line(&info(Some(1), None, Some("blocked")));
+        assert_eq!(token(&line), "exited(?)");
+        assert!(line.ends_with("  last:blocked"), "{line}");
+        // done and empty never produce a `last:` field.
+        assert!(!session_line(&info(Some(1), Some(0), Some("done"))).contains("last:"));
+        assert!(!session_line(&info(Some(1), Some(0), Some(""))).contains("last:"));
+        assert!(!session_line(&info(None, None, Some("idle"))).contains("last:"));
+    }
+
+    #[test]
     fn hostile_daemon_fields_render_as_one_safe_line() {
         let info = SessionInfo {
             id: "sess\x1b[2J".into(),
@@ -2306,7 +2328,8 @@ mod session_line_tests {
                 .any(|c| { c.is_control() || thegn_core::pipeline_report::is_format_control(c) })
         );
         assert!(line.contains('\u{fffd}'));
-        assert_eq!(token(&line), "exited(0,done\u{fffd})");
+        assert_eq!(token(&line), "exited(0)");
+        assert!(line.ends_with("  last:done\u{fffd}"));
     }
 }
 
