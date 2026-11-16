@@ -24,6 +24,8 @@ use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
+pub mod reload_class;
+
 /// Captured inputs used by pure configuration normalization.  Admission must
 /// never reopen HOME (or another ambient source) while it is composing a
 /// candidate; legacy effectful callers capture this once at their own edge.
