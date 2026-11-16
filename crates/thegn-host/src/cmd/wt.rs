@@ -432,7 +432,7 @@ fn dev_env_daemon_refusal(
 /// channel: it would strip the env at load and refuse every later session.
 /// Probes only an already-running daemon (never spawns) and only for a
 /// dev-only env.
-fn refuse_dev_env_on_stable_daemon(cfg: &Config, env: Option<&str>) -> Result<()> {
+pub(crate) fn refuse_dev_env_on_stable_daemon(cfg: &Config, env: Option<&str>) -> Result<()> {
     let Some(e) = env.filter(|e| *e != "default") else {
         return Ok(());
     };
