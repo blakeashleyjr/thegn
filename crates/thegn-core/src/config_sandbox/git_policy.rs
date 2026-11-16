@@ -593,7 +593,7 @@ mod tests {
         ] {
             let plan = plan_for(&mode_cfg(mode), "tg/lane", Some("main")).expect("plan");
             // The common dir is bound read-only first; carve-outs come after.
-            assert_eq!(plan.ro, [common.clone()], "{mode}");
+            assert_eq!(plan.ro, std::slice::from_ref(&common), "{mode}");
             assert_eq!(
                 plan.rw,
                 [
