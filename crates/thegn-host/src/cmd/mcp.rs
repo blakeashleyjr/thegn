@@ -125,7 +125,7 @@ pub enum Action {
         /// `semantic_blast_radius`); the mutating tools (`sessions_open`,
         /// `sessions_input`, `sessions_kill`, `sessions_resize`, `sessions_split`,
         /// `worktrees_open`, `notify_push`, `dispatches_put`,
-        /// `dispatches_set_status`) additionally need
+        /// `dispatches_set_status`, `issues_update`, `issues_comment`) additionally need
         /// `write`, `folders_assign` needs `git`, and `merge_add` needs
         /// `git`. Pass
         /// `none` (or any empty/unknown set) to serve docs tools only.
@@ -451,6 +451,32 @@ fn allowed_state_caps(
         .collect()
 }
 
+/// The control call for an issue write. The route reads `repo` and `account`
+/// from the query string, not the body, so they are lifted out of the params
+/// before `build_call` turns the rest into the JSON body. Pure.
+fn issue_write_call(
+    cap: &str,
+    args: &serde_json::Value,
+) -> Result<(&'static str, String, Option<serde_json::Value>), String> {
+    let mut params = routed_params(cap, args)?;
+    let mut query = url::form_urlencoded::Serializer::new(String::new());
+    for key in ["repo", "account"] {
+        if let Some(v) = params.remove(key) {
+            let v = v
+                .as_str()
+                .ok_or_else(|| format!("`{key}` must be a string"))?;
+            query.append_pair(key, v);
+        }
+    }
+    let (method, mut path, body) = thegn_svc::control::routes::build_call(cap, params)?;
+    let query = query.finish();
+    if !query.is_empty() {
+        path.push('?');
+        path.push_str(&query);
+    }
+    Ok((method, path, body))
+}
+
 /// The state tools' clean no-daemon answer (the JSON-RPC error message).
 const NO_DAEMON: &str = "daemon not reachable — start thegn or `thegn daemon`";
 
@@ -466,7 +492,10 @@ const NO_DAEMON: &str = "daemon not reachable — start thegn or `thegn daemon`"
 /// `dispatches.set_status` fills the route's `{id}` path parameter from the MCP
 /// `id` argument, which must be a positive integer; its `status`/`lead` body
 /// passes through (the daemon owns the closed status set), as does
-/// `dispatches.put`'s `DispatchPutReq` body. Pure.
+/// `dispatches.put`'s `DispatchPutReq` body. `issues.update` renames the MCP
+/// `assignee` (`me`/`none`) to `IssuePatch.assignee_me` and the 0-4 `priority`
+/// to its snake_case name (Linear's numbering); `issues.comment` passes
+/// `{id, body}` through. Pure.
 fn routed_params(
     cap: &str,
     args: &serde_json::Value,
@@ -493,6 +522,27 @@ fn routed_params(
             if !fits {
                 return Err(format!("`{key}` must be an integer from 0 to {max}"));
             }
+        }
+    }
+    if cap == "issues.update" {
+        if let Some(a) = params.remove("assignee") {
+            let me = match a.as_str() {
+                Some("me") => true,
+                Some("none") => false,
+                _ => return Err("`assignee` must be `me` or `none`".into()),
+            };
+            params.insert("assignee_me".into(), serde_json::Value::Bool(me));
+        }
+        if let Some(p) = params.remove("priority") {
+            let name = match p.as_i64() {
+                Some(0) => "none",
+                Some(1) => "urgent",
+                Some(2) => "high",
+                Some(3) => "medium",
+                Some(4) => "low",
+                _ => return Err("`priority` must be an integer from 0 to 4".into()),
+            };
+            params.insert("priority".into(), serde_json::json!(name));
         }
     }
     if cap == "dispatches.set_status" {
@@ -813,6 +863,15 @@ async fn fetch_state(
             let params = routed_params(cap, args)?;
             let c = client.map_err(|_| NO_DAEMON.to_string())?;
             let (method, path, body) = thegn_svc::control::routes::build_call(cap, params)?;
+            c.call_raw(method, &path, body)
+                .await
+                .map_err(|e| e.to_string())
+        }
+        // Tracker writes: `write`, as `POST /v1/issues/{id}` and its comment
+        // route require. `account`/`repo` travel in the query string.
+        "issues.update" | "issues.comment" => {
+            let (method, path, body) = issue_write_call(cap, args)?;
+            let c = client.map_err(|_| NO_DAEMON.to_string())?;
             c.call_raw(method, &path, body)
                 .await
                 .map_err(|e| e.to_string())
@@ -1402,6 +1461,71 @@ mod tests {
             .unwrap_err(),
             "`id` must be a positive integer"
         );
+    }
+
+    #[test]
+    fn issue_writes_need_write_like_http() {
+        for cap in ["issues.update", "issues.comment"] {
+            assert!(!READ_CAPS.contains(&cap), "{cap} must not be read-scoped");
+            for scopes in ["none", "read", "git", "merge_add", "read,git", "exec"] {
+                assert!(
+                    !allowed_state_caps(ScopeSet::parse(scopes), true).contains(&cap),
+                    "--scopes {scopes} must not grant {cap}"
+                );
+            }
+            for (scopes, flag) in [("write", false), ("read,write", true)] {
+                assert!(
+                    allowed_state_caps(ScopeSet::parse(scopes), flag).contains(&cap),
+                    "--scopes {scopes} must grant {cap}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn issue_update_maps_to_the_patch_body_and_lifts_account_into_the_query() {
+        let args = serde_json::json!({
+            "id": "linear:T-1", "status": "in_progress", "assignee": "me",
+            "priority": 1, "title": "New", "account": "work acct", "repo": "/r"
+        });
+        let (method, path, body) = issue_write_call("issues.update", &args).unwrap();
+        assert_eq!(method, "POST");
+        assert_eq!(path, "/v1/issues/linear%3AT-1?repo=%2Fr&account=work+acct");
+        assert_eq!(
+            body.unwrap(),
+            serde_json::json!({
+                "status": "in_progress", "assignee_me": true,
+                "priority": "urgent", "title": "New"
+            })
+        );
+        // The body deserializes as the daemon's IssuePatch.
+        let none = serde_json::json!({ "id": "x:1", "assignee": "none", "priority": 0 });
+        let (_, _, body) = issue_write_call("issues.update", &none).unwrap();
+        let patch: thegn_core::issue::IssuePatch = serde_json::from_value(body.unwrap()).unwrap();
+        assert_eq!(patch.assignee_me, Some(false));
+        assert_eq!(patch.priority, Some(thegn_core::issue::IssuePriority::None));
+        for (n, name) in [(2, "high"), (3, "medium"), (4, "low")] {
+            let args = serde_json::json!({ "id": "x:1", "priority": n });
+            let (_, _, body) = issue_write_call("issues.update", &args).unwrap();
+            assert_eq!(body.unwrap()["priority"], name);
+        }
+        let bad_priority = serde_json::json!({ "id": "x:1", "priority": 9 });
+        assert!(issue_write_call("issues.update", &bad_priority).is_err());
+        let bad_assignee = serde_json::json!({ "id": "x:1", "assignee": "bob" });
+        assert!(issue_write_call("issues.update", &bad_assignee).is_err());
+    }
+
+    #[test]
+    fn issue_comment_maps_to_the_comment_route() {
+        let args = serde_json::json!({ "id": "linear:T-1", "body": "hello" });
+        let (method, path, body) = issue_write_call("issues.comment", &args).unwrap();
+        assert_eq!(method, "POST");
+        assert_eq!(path, "/v1/issues/linear%3AT-1/comment");
+        assert_eq!(body.unwrap(), serde_json::json!({ "body": "hello" }));
+        let args = serde_json::json!({ "id": "linear:T-1", "body": "b", "account": "w" });
+        let (_, path, body) = issue_write_call("issues.comment", &args).unwrap();
+        assert_eq!(path, "/v1/issues/linear%3AT-1/comment?account=w");
+        assert_eq!(body.unwrap(), serde_json::json!({ "body": "b" }));
     }
 
     #[test]
