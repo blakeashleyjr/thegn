@@ -439,13 +439,13 @@ fn path_is_secret(key: &str) -> bool {
         || thegn_core::redact::is_sensitive_path(&key.split('.').collect::<Vec<_>>())
 }
 
-/// A value for echoing back to the user, masked when `key` is secret-bearing.
 /// What setting `key` means for a running thegn: applies live, after a
 /// restart, or at its next use. `None` for a key no reload class covers.
 fn reload_note(key: &str) -> Option<&'static str> {
     thegn_core::config::reload_class::class_for(key).map(|(class, _)| class.describe())
 }
 
+/// A value for echoing back to the user, masked when `key` is secret-bearing.
 fn shown_value(key: &str, value: &str) -> String {
     if path_is_secret(key) {
         thegn_core::redact::PLACEHOLDER.to_string()
