@@ -593,6 +593,22 @@ async fn run_async(cfg: &Config, action: SessionAction) -> Result<()> {
                 (Some(name), Some(owner), None) => LeadProof::Lease { name, owner },
                 _ => LeadProof::Unbound,
             };
+            // A headless open (`--headless`, a prompted open — headless by the
+            // daemon's default — or a stage dispatch, always headless) onto an
+            // unprovisioned provider worktree: provision it here first. Only the
+            // TUI loading screen provisions on open, so without this the
+            // daemon's attach gate refuses every retry.
+            let prompted = resolved_open_prompt
+                .as_deref()
+                .is_some_and(|prompt| !prompt.trim().is_empty());
+            if resume_row.is_none()
+                && (headless || prompted || (stage.is_some() && issue.is_some()))
+            {
+                let wt = crate::cmd::resolve_worktree(worktree.clone())
+                    .to_string_lossy()
+                    .into_owned();
+                crate::cmd::env::provision_for_headless_open(cfg, wt).await?;
+            }
             if let Some(row_id) = resume_row {
                 // The resume-of-a-failed-row composition (THE-86): the
                 // offline row checks already ran pre-`connect`; this renders

@@ -313,6 +313,21 @@ pub(crate) fn guard_unprovisioned_attach(
     if !has_provider_location || choice == "clean-shell" {
         return Ok(());
     }
+    match unprovisioned_provider_env(cfg, worktree)? {
+        Some(env_name) => Err(unprovisioned_halt(env_name, worktree).into()),
+        None => Ok(()),
+    }
+}
+
+/// The env name when `worktree` resolves to a provider env whose sandbox has NOT
+/// finished provisioning on this host (no LOCAL marker); `None` for a non-provider
+/// env or an already-provisioned sandbox. Cheap (local stat + config resolve, no
+/// network). Shared by the attach gate and the headless `session open` path,
+/// which provisions instead of refusing.
+pub(crate) fn unprovisioned_provider_env(
+    cfg: &thegn_core::config::Config,
+    worktree: &str,
+) -> anyhow::Result<Option<String>> {
     let loc = thegn_core::remote::GitLoc::for_worktree_op(
         std::path::Path::new(worktree),
         "provider attach",
@@ -334,20 +349,30 @@ pub(crate) fn guard_unprovisioned_attach(
         .resolve_env(&repo_root, &loc, std::path::Path::new(worktree), &selection)
         .name;
     let Some(id) = crate::agent::provider_sandbox_name(cfg, worktree, &env_name) else {
-        return Ok(());
+        return Ok(None);
     };
     if crate::provider_workdir::is_provisioned_locally(&id) {
-        return Ok(());
+        return Ok(None);
     }
-    Err(crate::agent::SandboxHalt {
+    Ok(Some(env_name))
+}
+
+/// The refusal for an attach onto an unprovisioned provider sandbox. Names the
+/// headless way out (`thegn env up --worktree <path>`): only the TUI loading
+/// screen provisions on open, so a CLI/daemon caller retrying alone never
+/// succeeds.
+pub(crate) fn unprovisioned_halt(env_name: String, worktree: &str) -> crate::agent::SandboxHalt {
+    crate::agent::SandboxHalt {
         env_name,
         placement: "provider".into(),
-        reason: "sandbox is still provisioning — retry once setup finishes".into(),
+        reason: format!(
+            "the sandbox is not provisioned yet — run `thegn env up --worktree {worktree}` \
+             (or wait for the TUI's setup screen to finish), then retry"
+        ),
         ask: false,
         dormant: None,
         sealed_home: false,
     }
-    .into())
 }
 
 fn claim_selection(worktree: &str, read: anyhow::Result<Option<String>>) -> Option<Option<String>> {
@@ -1426,6 +1451,24 @@ mod tests {
         assert!(
             matches!(result, Err(error) if error.to_string().contains("provider attach refused"))
         );
+    }
+
+    #[test]
+    fn unprovisioned_halt_names_thegn_env_up_for_the_worktree() {
+        let halt = unprovisioned_halt("sprites".into(), "/wt/app");
+        let text = anyhow::Error::from(halt).to_string();
+        assert!(text.contains("thegn env up --worktree /wt/app"), "{text}");
+        assert!(text.contains("'sprites'"), "{text}");
+        assert!(!text.contains("still provisioning"), "{text}");
+    }
+
+    #[test]
+    fn unprovisioned_provider_env_is_none_for_a_local_worktree() {
+        let _state = thegn_core::testenv::IsolatedState::new();
+        let dir = tempfile::tempdir().unwrap();
+        let wt = dir.path().to_string_lossy().into_owned();
+        let result = unprovisioned_provider_env(&thegn_core::config::Config::default(), &wt);
+        assert!(matches!(result, Ok(None)), "{result:?}");
     }
 
     struct ScriptedClaimEgress {
