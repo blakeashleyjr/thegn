@@ -929,10 +929,12 @@ mod tests {
             .collect()
     }
 
+    /// (burn, warn, max) → expected (level, limit).
+    type BudgetCase = (f64, f64, f64, Option<(BudgetLevel, f64)>);
+
     #[test]
     fn apply_budgets_table() {
-        // (burn, warn, max) → expected (level, limit)
-        let cases: &[(f64, f64, f64, Option<(BudgetLevel, f64)>)] = &[
+        let cases: &[BudgetCase] = &[
             (5.0, 0.0, 0.0, None),
             (1.0, 2.0, 3.0, None),
             (2.0, 2.0, 3.0, Some((BudgetLevel::Warn, 2.0))),
