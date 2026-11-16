@@ -138,8 +138,9 @@ pub fn emit_json<T: serde::Serialize>(value: &T) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Resolve the worktree a command targets: explicit arg, else `$THEGN_WORKTREE`,
-/// else the git toplevel of the cwd, else the cwd.
+/// Resolve the worktree a command targets: explicit arg; else the cwd's git
+/// toplevel when it is a different repo than `$THEGN_WORKTREE`; else
+/// `$THEGN_WORKTREE`; else the cwd toplevel; else the cwd.
 ///
 /// `$THEGN_WORKTREE` is the **host-canonical** path the parent thegn injects. In
 /// a local sandbox the worktree is bind-mounted at that same real path, so it
@@ -159,10 +160,25 @@ pub fn resolve_worktree(arg: Option<String>) -> PathBuf {
 /// unit-testable. A `$THEGN_WORKTREE` that doesn't exist locally (a remote
 /// sprite's host path) is skipped in favor of the cwd's git toplevel.
 fn resolve_worktree_from(arg: Option<String>, env_wt: Option<String>, cwd: &Path) -> PathBuf {
-    arg.map(PathBuf::from)
-        .or_else(|| env_wt.map(PathBuf::from).filter(|p| p.exists()))
-        .or_else(|| thegn_core::repo::toplevel(cwd))
-        .unwrap_or_else(|| cwd.to_path_buf())
+    if let Some(arg) = arg {
+        return PathBuf::from(arg);
+    }
+    let env_wt = env_wt.map(PathBuf::from).filter(|p| p.exists());
+    let top = thegn_core::repo::toplevel(cwd);
+    match (top, env_wt) {
+        // An inherited `$THEGN_WORKTREE` from a *different* repo must not beat
+        // the repo the user `cd`'d into (it names the pane's own checkout).
+        (Some(top), Some(env)) => {
+            if top.starts_with(&env) || env.starts_with(&top) {
+                env
+            } else {
+                top
+            }
+        }
+        (Some(top), None) => top,
+        (None, Some(env)) => env,
+        (None, None) => cwd.to_path_buf(),
+    }
 }
 
 /// Yes/no confirmation (gum if present, else a y/N stdin prompt).
@@ -200,6 +216,47 @@ mod resolve_worktree_tests {
             Path::new("/cwd"),
         );
         assert_eq!(got, PathBuf::from("/some/arg"));
+    }
+
+    fn git_repo(dir: &Path) {
+        std::fs::create_dir_all(dir).unwrap();
+        let st = thegn_core::util::git_cmd(dir)
+            .args(["-c", "commit.gpgsign=false", "init", "-q"])
+            .status()
+            .unwrap();
+        assert!(st.success());
+    }
+
+    #[test]
+    fn env_worktree_same_repo_wins_over_subdir_cwd() {
+        let t = tempfile::tempdir().unwrap();
+        let repo = t.path().join("r");
+        git_repo(&repo);
+        let sub = repo.join("sub");
+        std::fs::create_dir_all(&sub).unwrap();
+        let got = resolve_worktree_from(None, Some(repo.to_string_lossy().into()), &sub);
+        assert_eq!(got, repo);
+    }
+
+    #[test]
+    fn cwd_repo_beats_env_worktree_of_other_repo() {
+        let t = tempfile::tempdir().unwrap();
+        let (a, b) = (t.path().join("a"), t.path().join("b"));
+        git_repo(&a);
+        git_repo(&b);
+        let got = resolve_worktree_from(None, Some(a.to_string_lossy().into()), &b);
+        assert_eq!(got.canonicalize().unwrap(), b.canonicalize().unwrap());
+    }
+
+    #[test]
+    fn env_worktree_used_when_cwd_not_a_repo() {
+        let t = tempfile::tempdir().unwrap();
+        let a = t.path().join("a");
+        git_repo(&a);
+        let plain = t.path().join("plain");
+        std::fs::create_dir_all(&plain).unwrap();
+        let got = resolve_worktree_from(None, Some(a.to_string_lossy().into()), &plain);
+        assert_eq!(got, a);
     }
 
     #[test]
