@@ -1765,6 +1765,59 @@ pub fn git_out_raw(dir: &Path, args: &[&str]) -> Result<Vec<u8>, crate::git_run:
     }
 }
 
+/// Why [`git_out_path`] could not produce a path.
+#[derive(Debug)]
+pub enum GitPathError {
+    /// The Git command failed, timed out, or could not be run.
+    Git(crate::git_run::GitOutcome),
+    /// Git succeeded but printed no path.
+    Empty,
+    /// The output was not exactly one path (embedded newline or NUL, or not
+    /// representable as a native path).
+    Malformed,
+}
+
+impl std::fmt::Display for GitPathError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Git(outcome) => write!(f, "{outcome}"),
+            Self::Empty => f.write_str("git printed no path"),
+            Self::Malformed => f.write_str("git printed a malformed path"),
+        }
+    }
+}
+
+impl std::error::Error for GitPathError {}
+
+/// Strip exactly one trailing line terminator (`\n`, optionally preceded by a
+/// `\r` for Git for Windows) and validate that what remains is one path.
+/// Nothing else is trimmed: a path may legitimately end in whitespace.
+fn path_bytes_from_output(bytes: &[u8]) -> Result<&[u8], GitPathError> {
+    let body = bytes.strip_suffix(b"\n").unwrap_or(bytes);
+    let body = if body.len() != bytes.len() {
+        body.strip_suffix(b"\r").unwrap_or(body)
+    } else {
+        body
+    };
+    if body.is_empty() {
+        return Err(GitPathError::Empty);
+    }
+    if body.iter().any(|b| *b == b'\n' || *b == 0) {
+        return Err(GitPathError::Malformed);
+    }
+    Ok(body)
+}
+
+/// Run `git -C <dir> <args...>` for a command that prints exactly one path
+/// (`rev-parse --show-toplevel`, `--git-common-dir`, ...) and return it
+/// losslessly: no trimming beyond the single line terminator, no lossy UTF-8
+/// decode.
+pub fn git_out_path(dir: &Path, args: &[&str]) -> Result<PathBuf, GitPathError> {
+    let bytes = git_out_raw(dir, args).map_err(GitPathError::Git)?;
+    let body = path_bytes_from_output(&bytes)?;
+    path_from_git_bytes(body).ok_or(GitPathError::Malformed)
+}
+
 /// Run `git -C <dir> <args...>` and decode stdout strictly as UTF-8.
 ///
 /// For NUL-framed or byte-exact output; callers that want a trimmed single
@@ -3183,6 +3236,94 @@ mod tests {
         let plain = tempfile::tempdir().unwrap();
         assert_eq!(git_out(plain.path(), &["status", "--porcelain"]), None);
         assert_eq!(git_out_allow_empty(plain.path(), &["status"]), None);
+    }
+
+    #[test]
+    fn path_bytes_from_output_strips_one_terminator_and_validates() {
+        assert_eq!(path_bytes_from_output(b"/a\n").unwrap(), b"/a");
+        assert_eq!(path_bytes_from_output(b"/a\r\n").unwrap(), b"/a");
+        assert_eq!(path_bytes_from_output(b"/a ").unwrap(), b"/a ");
+        assert_eq!(path_bytes_from_output(b"/a \n").unwrap(), b"/a ");
+        assert!(matches!(
+            path_bytes_from_output(b""),
+            Err(GitPathError::Empty)
+        ));
+        assert!(matches!(
+            path_bytes_from_output(b"\n"),
+            Err(GitPathError::Empty)
+        ));
+        assert!(matches!(
+            path_bytes_from_output(b"/a\n/b\n"),
+            Err(GitPathError::Malformed)
+        ));
+        assert!(matches!(
+            path_bytes_from_output(b"/a\0\n"),
+            Err(GitPathError::Malformed)
+        ));
+    }
+
+    #[test]
+    fn git_path_error_displays_and_is_an_error() {
+        use crate::git_run::GitOutcome;
+        let err: Box<dyn std::error::Error> = Box::new(GitPathError::Empty);
+        assert_eq!(err.to_string(), "git printed no path");
+        assert_eq!(
+            GitPathError::Malformed.to_string(),
+            "git printed a malformed path"
+        );
+        assert!(
+            !GitPathError::Git(GitOutcome::EmptyRefused)
+                .to_string()
+                .is_empty()
+        );
+    }
+
+    fn init_repo_at(path: &Path) {
+        std::fs::create_dir_all(path).unwrap();
+        assert!(
+            git_cmd(path)
+                .args(["-c", "commit.gpgsign=false", "init", "-q"])
+                .status()
+                .unwrap()
+                .success()
+        );
+    }
+
+    #[test]
+    fn git_out_path_reads_toplevel_losslessly() {
+        let dir = bounded_git_fixture();
+        let canon = std::fs::canonicalize(dir.path()).unwrap();
+        let top = git_out_path(dir.path(), &["rev-parse", "--show-toplevel"]).unwrap();
+        assert_eq!(std::fs::canonicalize(top).unwrap(), canon);
+
+        let spaced = dir.path().join("repo ");
+        init_repo_at(&spaced);
+        let top = git_out_path(&spaced, &["rev-parse", "--show-toplevel"]).unwrap();
+        assert_eq!(top, std::fs::canonicalize(&spaced).unwrap());
+        assert!(top.to_string_lossy().ends_with("repo "));
+
+        if let Some(name) = path_from_git_bytes(b"bad\xffdir") {
+            let odd = dir.path().join(name);
+            if std::fs::create_dir_all(&odd).is_ok() {
+                init_repo_at(&odd);
+                let top = git_out_path(&odd, &["rev-parse", "--show-toplevel"]).unwrap();
+                assert_eq!(top, std::fs::canonicalize(&odd).unwrap());
+            }
+        }
+    }
+
+    #[test]
+    fn git_out_path_reports_failure_and_empty_output() {
+        let plain = tempfile::tempdir().unwrap();
+        assert!(matches!(
+            git_out_path(plain.path(), &["rev-parse", "--show-toplevel"]),
+            Err(GitPathError::Git(_))
+        ));
+        let dir = bounded_git_fixture();
+        assert!(matches!(
+            git_out_path(dir.path(), &["status", "--porcelain"]),
+            Err(GitPathError::Empty)
+        ));
     }
 
     #[test]

@@ -7,6 +7,24 @@ All notable changes to **thegn** are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.1.0-alpha.87] — 2026-11-15
+
+### Added
+
+- `thegn share list` now shows Tailscale serve ports whose teardown is still pending, and `--json` rows carry `teardown_pending`. (THE-330)
+- Plugins that provide a worktree row field can subscribe to `thegn.worktree_scanned`, which is sent when a worktree's git glyphs change. (THE-2003)
+- Home Manager gains `sound.min_priority`, `dnd.allow_priority`, `sound.per_kind`, `dnd.windows`, `usage.providers` and `usage.profile_roots`. (THE-428)
+
+### Changed
+
+- The daemon `ci.logs` now runs at most 2 provider log fetches at once; a cache-missing request waits up to 30 seconds, then gets a busy error. (THE-544)
+- Internal: workspace clone, setup runs and VPN/preview capture now run under the shared process supervisor, the Fly reaper re-reads its ledger before destroying, and CI log collector bounds are tested. (THE-729, THE-529)
+
+### Fixed
+
+- Invalid `dnd.windows` entries and unknown `usage.providers` now warn at config load. (THE-428)
+- Worktree paths with trailing spaces or non-UTF-8 bytes are now read exactly by several commands, including the merge fixer checkout. (THE-368, THE-376)
+
 ## [0.1.0-alpha.86] — 2026-11-15
 
 ### Added
@@ -3586,7 +3604,8 @@ launcher picker and the merge queue's `agent_command` hook remain — they run
 whatever commands you configure. Leftover `[llm_proxy]` config sections and
 `proxy_*` tables in existing state databases are ignored harmlessly.
 
-[Unreleased]: https://github.com/blakeashleyjr/thegn/compare/v0.1.0-alpha.86...HEAD
+[Unreleased]: https://github.com/blakeashleyjr/thegn/compare/v0.1.0-alpha.87...HEAD
+[0.1.0-alpha.87]: https://github.com/blakeashleyjr/thegn/compare/v0.1.0-alpha.86...v0.1.0-alpha.87
 [0.1.0-alpha.86]: https://github.com/blakeashleyjr/thegn/compare/v0.1.0-alpha.85...v0.1.0-alpha.86
 [0.1.0-alpha.85]: https://github.com/blakeashleyjr/thegn/compare/v0.1.0-alpha.84...v0.1.0-alpha.85
 [0.1.0-alpha.84]: https://github.com/blakeashleyjr/thegn/compare/v0.1.0-alpha.83...v0.1.0-alpha.84

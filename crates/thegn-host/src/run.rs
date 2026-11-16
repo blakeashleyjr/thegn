@@ -12503,6 +12503,11 @@ async fn event_loop<T: Terminal>(
                 dirty = true;
                 continue;
             }
+            // THE-2003: tell row-field plugins which worktrees' glyphs changed.
+            // Rides this Model wake; no timer, thread or deadline.
+            if crate::handlers::plugins::has_scan_subscriber(&plugins_state) {
+                crate::handlers::plugins::emit_changed_scans(&plugins_state, &model, &next_model);
+            }
             // A review snapshot may be fetched after the Changes modal opens.
             // Deliver the accepted model's compatible snapshot directly to
             // that view; its worktree diff must remain intact while only the

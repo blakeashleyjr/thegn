@@ -53,3 +53,46 @@ field and preserve its configured position. Badge entries also need that list
 entry. Values are resident-only and disappear when the plugin exits. A plugin
 should push its initial snapshot after `activate`, then wait on stdin; it must
 not spawn an idle timer.
+
+## Refreshing on git changes
+
+A value that depends on git state (unpushed commits, a rebase in progress)
+goes stale when the user commits. Instead of polling, subscribe to the
+host-originated `thegn.worktree_scanned` event:
+
+```json
+{ "method": "subscribe", "params": { "events": ["thegn.worktree_scanned"] } }
+```
+
+The host then sends an `on_event` notification for each worktree whose git
+glyph scan (dirty, ahead/behind, line counts) landed with a changed result:
+
+```json
+{
+  "method": "on_event",
+  "params": {
+    "kind": "thegn.worktree_scanned",
+    "payload": { "path": "/repo/wt", "branch": "feat/x" }
+  }
+}
+```
+
+`branch` is the worktree's live `HEAD` branch, or `null` for a detached HEAD.
+Recompute the value for that worktree and push a fresh `update`.
+
+- **Eligibility.** Only a plugin with an accepted `WorktreeField` contribution
+  that has subscribed, and is running, receives the event. A subscription
+  alone, without a row field, gets nothing; this is not a general git-watch
+  API.
+- **Changed results only.** The event fires when a scan's result differs from
+  the one on screen, or a worktree appears for the first time (including every
+  row after a workspace switch). An unchanged scan, a failed hydration, and a
+  stale scan superseded by a newer one send nothing.
+- **Coalescing.** At most one event per worktree is pending for a plugin; a
+  newer scan of the same worktree replaces it in place, so you always see the
+  latest. Under backpressure (your stdin queue is full) an event may be
+  dropped without retry; the next changed scan of that worktree self-heals it.
+
+The event rides the host's existing hydration wake, so it costs nothing while
+the user is idle. The rule above still holds: do not add an idle timer of your
+own.

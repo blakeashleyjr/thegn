@@ -91,15 +91,6 @@ const OMITTED: &[(&str, &str)] = &[
         "per-kind priority map is not exposed",
     ),
     ("notifications.rules", "routing rules are not exposed"),
-    ("notifications.dnd.windows", "window list is not exposed"),
-    (
-        "notifications.dnd.allow_priority",
-        "priority string has no pinned destination enum here",
-    ),
-    (
-        "notifications.sound.min_priority",
-        "sound priority string has no pinned destination enum here",
-    ),
     (
         "notifications.sound.pack",
         "sound pack path is not exposed yet",
@@ -114,11 +105,7 @@ const OMITTED: &[(&str, &str)] = &[
     ),
     (
         "notifications.sound.per_priority",
-        "per-priority sound map is not exposed yet",
-    ),
-    (
-        "notifications.sound.per_kind",
-        "per-kind sound map is not exposed yet",
+        "per-priority map holds legacy command-mode shell commands (executable-bearing) and is not exposed yet",
     ),
     ("notifications.modes", "notification modes are not exposed"),
     (
@@ -160,8 +147,6 @@ const OMITTED: &[(&str, &str)] = &[
         "usage.allow_network",
         "network opt-in awaits an owner decision",
     ),
-    ("usage.providers", "provider selection list is not exposed"),
-    ("usage.profile_roots", "path list is not exposed"),
     (
         "usage.accounts",
         "usage account credentials and paths are not exposed",
@@ -549,6 +534,22 @@ fn rendered_paths(src: &str) -> BTreeSet<String> {
         "conditional assignments and list item keys must remain visible: {out:?}"
     );
     out
+}
+
+/// Nix enum options whose destination is a `String` validated by
+/// `Priority::parse` (no schema enum exists for them).
+const PRIORITY_ENUM_OPTIONS: &[&str] = &[
+    "notificationsDndAllowPriority",
+    "notificationsSoundMinPriority",
+];
+
+/// The priority spellings, from the Rust type (the single source of truth).
+fn priority_spellings() -> Vec<&'static str> {
+    use thegn_core::notification::Priority;
+    [Priority::Info, Priority::Notice, Priority::Alert]
+        .into_iter()
+        .map(Priority::as_str)
+        .collect()
 }
 
 /// `lib.types.enum ["a" "b"]` value lists, with the option name they belong to.
@@ -1157,14 +1158,10 @@ fn hm_notifications_and_activity_families_are_rendered() {
         "notifications.agent_error_signatures",
         "notifications.priority",
         "notifications.rules",
-        "notifications.dnd.windows",
-        "notifications.dnd.allow_priority",
-        "notifications.sound.min_priority",
         "notifications.sound.pack",
         "notifications.sound.chime_file",
         "notifications.sound.command",
         "notifications.sound.per_priority",
-        "notifications.sound.per_kind",
         "notifications.modes",
         "notifications.active_mode",
         "notifications.push",
@@ -1181,6 +1178,10 @@ fn hm_notifications_dnd_and_sound_bools_are_rendered_and_rest_dispositioned() {
         "notifications.sound.mute",
         "notifications.sound.suppress_focused",
         "notifications.sound.volume",
+        "notifications.dnd.allow_priority",
+        "notifications.dnd.windows",
+        "notifications.sound.min_priority",
+        "notifications.sound.per_kind",
     ] {
         assert!(rendered.contains(path), "Home Manager must render {path}");
     }
@@ -1199,6 +1200,21 @@ fn hm_notifications_dnd_and_sound_bools_are_rendered_and_rest_dispositioned() {
             );
         }
     }
+}
+
+#[test]
+fn hm_priority_enum_options_match_the_priority_type() {
+    let enums = enum_lists(&module_src());
+    for option in PRIORITY_ENUM_OPTIONS {
+        let values = enums
+            .iter()
+            .find(|(name, _)| name == option)
+            .map(|(_, values)| values.iter().map(String::as_str).collect::<Vec<&str>>())
+            .unwrap_or_else(|| panic!("Home Manager enum option `{option}` is missing"));
+        assert_eq!(values, priority_spellings(), "{option}");
+    }
+    let rendered = rendered_paths(&module_src());
+    assert!(rendered.contains("notifications.sound.per_kind"));
 }
 
 #[test]
@@ -1372,6 +1388,8 @@ fn hm_usage_and_tailnet_keys_are_rendered_and_rest_dispositioned() {
         "usage.poll_interval_secs",
         "usage.warn_percent",
         "usage.crit_percent",
+        "usage.providers",
+        "usage.profile_roots",
         "host_discovery.tailnet.enabled",
         "host_discovery.tailnet.online_only",
     ] {
@@ -1535,7 +1553,11 @@ fn every_rendered_key_exists_in_the_schema() {
                 // (section, key) pairs under a `*` / array pattern; accept the
                 // table name itself when any schema path starts with it.
                 || schema_paths.iter().any(|s| s.starts_with(&format!("{p}.")))
-                || (!p.contains('.') && root_props.contains(p)))
+                || (!p.contains('.') && root_props.contains(p))
+                // Nested maps of scalars (`notifications.sound.per_kind`) own
+                // no documented keys either, so the walker never lists them;
+                // accept any path the schema itself has.
+                || schema_has_path(p))
         })
         .collect();
     assert!(
@@ -1549,6 +1571,15 @@ fn every_nix_enum_is_a_subset_of_a_config_enum() {
     let enums = schema_enums();
     let mut bad = Vec::new();
     for (opt, vals) in enum_lists(&module_src()) {
+        if PRIORITY_ENUM_OPTIONS.contains(&opt.as_str()) {
+            // String-typed destinations validated by `Priority::parse`.
+            let canonical = priority_spellings();
+            assert!(
+                vals.iter().all(|v| canonical.contains(&v.as_str())),
+                "`{opt}` offers non-priority values: {vals:?}"
+            );
+            continue;
+        }
         let ok = enums
             .iter()
             .any(|(_, set)| vals.iter().all(|v| set.contains(v)));
@@ -2116,6 +2147,14 @@ fn every_nix_enum_matches_its_destination_enum() {
         ("mediaDefaultAction", "media.default_action"),
         ("mediaBackend", "media.backend"),
         ("notificationsSoundMode", "notifications.sound.mode"),
+        (
+            "notificationsDndAllowPriority",
+            "notifications.dnd.allow_priority",
+        ),
+        (
+            "notificationsSoundMinPriority",
+            "notifications.sound.min_priority",
+        ),
     ];
     let enums = enum_lists(&module_src());
     let actual_names: BTreeSet<&str> = enums.iter().map(|(name, _)| name.as_str()).collect();
@@ -2130,6 +2169,17 @@ fn every_nix_enum_matches_its_destination_enum() {
             .iter()
             .find_map(|(option, path)| (*option == name).then_some(*path))
             .expect("enum option destination");
+        if PRIORITY_ENUM_OPTIONS.contains(&name.as_str()) {
+            // The destination is a plain `String` validated by `Priority::parse`,
+            // so the schema carries no enum; compare against the Rust type.
+            let values: Vec<&str> = values.iter().map(String::as_str).collect();
+            assert_eq!(
+                values,
+                priority_spellings(),
+                "`{name}` must offer `{path}` priorities"
+            );
+            continue;
+        }
         let schema = schema_field(path);
         let mut accepted: BTreeSet<String> = schema["enum"]
             .as_array()
