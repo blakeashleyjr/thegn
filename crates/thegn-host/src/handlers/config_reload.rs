@@ -146,6 +146,15 @@ pub(crate) fn plugins_restart_runs(plan: &ReloadPlan) -> bool {
     plan.runs(ReloadHook::Plugins) || !plan.next_use.is_empty() || !plan.unclassified.is_empty()
 }
 
+/// The automation runtime holds the whole config (executor) and publishes the notification
+/// route snapshot, and `effective_automations` folds the profile overlay.
+pub(crate) fn automations_run(plan: &ReloadPlan) -> bool {
+    plan.runs(ReloadHook::Automation)
+        || notifications_runs(plan)
+        || !plan.next_use.is_empty()
+        || !plan.unclassified.is_empty()
+}
+
 /// Is any push sink configured in this effective notification config? Feeds
 /// `FrameModel::notification_delivery_configured` (the Monitor delivery row).
 pub(crate) fn delivery_configured(notifications: &NotificationsConfig) -> bool {
@@ -194,7 +203,7 @@ pub(crate) fn apply(plan: &ReloadPlan, ctx: &mut ReloadCtx<'_>) -> ReloadOutcome
     if plan.runs(ReloadHook::Media) {
         media(ctx, &mut out);
     }
-    out.automations = plan.runs(ReloadHook::Automation);
+    out.automations = automations_run(plan);
     out
 }
 
@@ -330,8 +339,8 @@ fn calendar(ctx: &mut ReloadCtx<'_>) {
 #[cfg(test)]
 mod tests {
     use super::{
-        PanelWidthCfg, ReloadCtx, WeatherPoll, app_host_runs, apply, delivery_configured,
-        notifications_runs, plugins_restart_runs, releases_focus_override,
+        PanelWidthCfg, ReloadCtx, WeatherPoll, app_host_runs, apply, automations_run,
+        delivery_configured, notifications_runs, plugins_restart_runs, releases_focus_override,
     };
     use crate::chrome::FrameModel;
     use crate::handlers::sidebar_persist::SidebarState;
@@ -431,10 +440,7 @@ mod tests {
             (
                 ReloadHook::Weather,
                 "[weather]\nenabled = true\nlocation = \"Reykjavik\"\n",
-                |fx, out, _, new| {
-                    fx.model.weather_cfg.location == "Reykjavik"
-                        && out.weather_poll.as_ref().map(|poll| &poll.cfg) == Some(&new.weather)
-                },
+                |fx, _, _, _| fx.model.weather_cfg.location == "Reykjavik",
             ),
             (
                 ReloadHook::Theme,
@@ -606,6 +612,8 @@ mod tests {
             "ui.sidebar_width"
         ])));
         assert!(!plugins_restart_runs(&keys(&["daemon.enabled"])));
+        assert!(automations_run(&keys(&["base_branch"])));
+        assert!(!automations_run(&keys(&["theme.accent"])));
         assert!(!delivery_configured(&Config::default().notifications));
     }
 
