@@ -553,6 +553,7 @@ pub const CATALOG: &[Slot] = &[
     slot("env rm", "name", SourceKind::Env),
     slot("env set", "name", SourceKind::Env),
     slot("env test", "name", SourceKind::Env),
+    slot("fleet list", "env", SourceKind::Env),
     slot("wt new", "env", SourceKind::Env),
     // --- profile (`[profiles.<name>]`) -------------------------------------
     // A `global = true` arg: classified once at the root, and clap propagates

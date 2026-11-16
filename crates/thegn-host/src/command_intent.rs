@@ -113,6 +113,7 @@ fn classify_command(command: &Command) -> CommandIntent<'_> {
         | Command::Zone { .. }
         | Command::Project { .. }
         | Command::Placement { .. }
+        | Command::Fleet { .. }
         | Command::Debug { .. }
         | Command::Mcp { .. }
         | Command::Agent { .. }
