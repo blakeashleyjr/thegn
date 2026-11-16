@@ -68,37 +68,75 @@ pub fn ref_glob_error(pattern: &str) -> Option<String> {
     None
 }
 
-/// The fully-qualified ref of the merge target: a bare branch name becomes
-/// `refs/heads/<name>`; an already-qualified `refs/...` is kept.
-fn target_ref(target_branch: &str) -> String {
-    if target_branch.starts_with("refs/") {
-        target_branch.to_string()
-    } else {
-        format!("refs/heads/{target_branch}")
-    }
+/// The fully-qualified branch ref of a merge target / default branch: a
+/// leading `refs/heads/` is normalised away, then `refs/heads/<name>` is
+/// rebuilt. Blank names yield `None` (unknown).
+fn branch_ref(branch: Option<&str>) -> Option<String> {
+    let name = branch.map(str::trim).filter(|b| !b.is_empty())?;
+    let name = name.strip_prefix("refs/heads/").unwrap_or(name);
+    (!name.is_empty()).then(|| format!("refs/heads/{name}"))
 }
 
-/// May `refname` be accepted back from a sandbox? Refuses a malformed ref, the
-/// merge target (`refs/heads/<target>`, an implicit deny regardless of
-/// `deny_refs`) and anything matching a `deny_refs` glob.
+/// The implicitly protected branch refs: the merge target and the default
+/// branch (each when known), labelled for error messages.
+fn protected_refs(
+    target_branch: Option<&str>,
+    default_branch: Option<&str>,
+) -> Vec<(&'static str, String)> {
+    let mut out = Vec::new();
+    if let Some(target) = branch_ref(target_branch) {
+        out.push(("merge target", target));
+    }
+    if let Some(default) = branch_ref(default_branch)
+        && !out.iter().any(|(_, r)| *r == default)
+    {
+        out.push(("default branch", default));
+    }
+    out
+}
+
+/// Is `refname` a well-formed `refs/heads/<branch>` ref? Applies git's
+/// `check-ref-format` rules: no empty component, no component starting with
+/// `.` or ending in `.lock`, no `..`, `@{`, control characters or any of
+/// `` ~^:?*[\`` and space, and no trailing `.` or `/`.
+fn is_branch_ref(refname: &str) -> bool {
+    let Some(branch) = refname.strip_prefix("refs/heads/") else {
+        return false;
+    };
+    !branch.is_empty()
+        && !refname.contains("..")
+        && !refname.contains("@{")
+        && !refname.ends_with('.')
+        && !refname.ends_with('/')
+        && !refname.chars().any(|c| {
+            c.is_ascii_control() || matches!(c, ' ' | '~' | '^' | ':' | '?' | '*' | '[' | '\\')
+        })
+        && refname
+            .split('/')
+            .all(|part| !part.is_empty() && !part.starts_with('.') && !part.ends_with(".lock"))
+}
+
+/// May `refname` be accepted back from a sandbox? Only a well-formed
+/// `refs/heads/` branch is; the merge target and the default branch are an
+/// implicit deny regardless of `deny_refs`, and anything matching a
+/// `deny_refs` glob is refused.
 pub fn check_pull_ref(
     cfg: &SandboxGitConfig,
     refname: &str,
     target_branch: Option<&str>,
+    default_branch: Option<&str>,
 ) -> Result<(), String> {
-    if refname.is_empty()
-        || refname.contains("..")
-        || !refname.starts_with("refs/")
-        || refname.split('/').any(str::is_empty)
-        || refname.ends_with(".lock")
-    {
-        return Err(format!("refusing malformed ref {refname:?}"));
+    if !is_branch_ref(refname) {
+        return Err(format!(
+            "refusing ref {refname:?}: only well-formed refs/heads/ branches are accepted from a sandbox"
+        ));
     }
-    if let Some(target) = target_branch.map(str::trim).filter(|t| !t.is_empty())
-        && target_ref(target) == refname
+    if let Some((what, _)) = protected_refs(target_branch, default_branch)
+        .into_iter()
+        .find(|(_, r)| r == refname)
     {
         return Err(format!(
-            "refusing {refname}: it is the merge target; sandbox work lands through the queue"
+            "refusing {refname}: it is the {what}; sandbox work lands through the queue"
         ));
     }
     if let Some(pattern) = cfg
@@ -120,8 +158,9 @@ pub fn check_push_ref(
     cfg: &SandboxGitConfig,
     refname: &str,
     target_branch: Option<&str>,
+    default_branch: Option<&str>,
 ) -> Result<(), String> {
-    check_pull_ref(cfg, refname, target_branch)?;
+    check_pull_ref(cfg, refname, target_branch, default_branch)?;
     match cfg.mode {
         SandboxGitMode::ReadOnly | SandboxGitMode::CommitOnly => Err(format!(
             "refusing push of {refname}: sandbox.git.mode = \"{}\" does not push",
@@ -186,18 +225,24 @@ fn branch_parent(branch: &str) -> Result<&str, String> {
 }
 
 /// Does the writable `carve` (`refs/heads/<parent>`) also contain the merge
-/// target or anything a `deny_refs` entry protects? Returns what it exposes.
+/// target, the default branch or anything a `deny_refs` entry protects?
+/// Returns what it exposes. An unknown merge target fails closed: the carve-out
+/// cannot be shown not to contain it.
 fn carve_out_conflict(
     cfg: &SandboxGitConfig,
     carve: &str,
     target_branch: Option<&str>,
+    default_branch: Option<&str>,
 ) -> Option<String> {
     let dir = format!("{carve}/");
-    if let Some(target) = target_branch.map(str::trim).filter(|t| !t.is_empty()) {
-        let target = target_ref(target);
-        if target.starts_with(&dir) {
-            return Some(format!("the merge target {target}"));
-        }
+    if branch_ref(target_branch).is_none() {
+        return Some("an unknown merge target".to_string());
+    }
+    if let Some((what, r)) = protected_refs(target_branch, default_branch)
+        .into_iter()
+        .find(|(_, r)| r.starts_with(&dir))
+    {
+        return Some(format!("the {what} {r}"));
     }
     cfg.deny_refs.iter().find_map(|p| {
         let conflict = if let Some(s) = p.strip_suffix("/**") {
@@ -253,8 +298,9 @@ fn carve_out_conflict(
 /// caller warns and keeps today's read-write common dir.
 ///
 /// The writable `refs/heads/<parent>/` carve-out is also refused when it would
-/// contain the merge target or a `deny_refs` entry. For that error the caller
-/// must fall back to read-only git, not read-write.
+/// contain the merge target, the default branch or a `deny_refs` entry, and
+/// when `target_branch` is unknown (`None` or blank: fail closed). For that
+/// error the caller must fall back to read-only git, not read-write.
 pub fn plan_git_mounts(
     cfg: &SandboxGitConfig,
     common_dir: &Path,
@@ -262,6 +308,7 @@ pub fn plan_git_mounts(
     worktree: &Path,
     branch: &str,
     target_branch: Option<&str>,
+    default_branch: Option<&str>,
 ) -> Result<GitMountPlan, String> {
     let gitfile = worktree.join(".git");
     if cfg.mode == SandboxGitMode::ReadOnly {
@@ -274,7 +321,7 @@ pub fn plan_git_mounts(
     }
     let parent = branch_parent(branch)?;
     let carve = format!("refs/heads/{parent}");
-    if let Some(what) = carve_out_conflict(cfg, &carve, target_branch) {
+    if let Some(what) = carve_out_conflict(cfg, &carve, target_branch, default_branch) {
         return Err(format!(
             "commit-only cannot confine {branch}: the writable {carve}/ would also expose {what}"
         ));
@@ -391,21 +438,29 @@ mod tests {
     #[test]
     fn pull_denies_implicit_target_and_deny_list() {
         let cfg = SandboxGitConfig::default();
-        assert!(check_pull_ref(&cfg, "refs/heads/tg/lane", Some("main")).is_ok());
-        assert!(check_pull_ref(&cfg, "refs/heads/tg/lane", None).is_ok());
+        assert!(check_pull_ref(&cfg, "refs/heads/tg/lane", Some("main"), None).is_ok());
+        assert!(check_pull_ref(&cfg, "refs/heads/tg/lane", None, None).is_ok());
         // Implicit target deny, even when the deny list is empty.
         let open = SandboxGitConfig {
             deny_refs: Vec::new(),
             ..SandboxGitConfig::default()
         };
-        let err = check_pull_ref(&open, "refs/heads/develop", Some("develop")).unwrap_err();
+        let err = check_pull_ref(&open, "refs/heads/develop", Some("develop"), None).unwrap_err();
         assert!(err.contains("merge target"), "{err}");
-        assert!(check_pull_ref(&open, "refs/heads/develop", Some("refs/heads/develop")).is_err());
-        assert!(check_pull_ref(&open, "refs/heads/develop", Some("  ")).is_ok());
+        assert!(
+            check_pull_ref(
+                &open,
+                "refs/heads/develop",
+                Some("refs/heads/develop"),
+                None
+            )
+            .is_err()
+        );
+        assert!(check_pull_ref(&open, "refs/heads/develop", Some("  "), None).is_ok());
         // Default deny list.
-        let err = check_pull_ref(&cfg, "refs/heads/main", None).unwrap_err();
+        let err = check_pull_ref(&cfg, "refs/heads/main", None, None).unwrap_err();
         assert!(err.contains("deny_refs"), "{err}");
-        assert!(check_pull_ref(&cfg, "refs/tags/v1", None).is_err());
+        assert!(check_pull_ref(&cfg, "refs/tags/v1", None, None).is_err());
         // Malformed refs.
         for bad in [
             "",
@@ -413,9 +468,62 @@ mod tests {
             "refs/heads/../main",
             "refs/heads//main",
             "refs/heads/tg/a.lock",
+            "refs/heads/",
+            "refs/remotes/origin/x",
+            "refs/replace/x",
+            "refs/notes/x",
+            "refs/stash",
+            "refs/tags/x",
+            "refs/heads/a b",
+            "refs/heads/a~1",
+            "refs/heads/a^",
+            "refs/heads/a:b",
+            "refs/heads/a?",
+            "refs/heads/a*",
+            "refs/heads/a[b",
+            "refs/heads/a\\b",
+            "refs/heads/a\tb",
+            "refs/heads/a\u{7f}",
+            "refs/heads/a@{1}",
+            "refs/heads/a.",
+            "refs/heads/a/",
+            "refs/heads/.hidden",
+            "refs/heads/tg/.x",
         ] {
-            assert!(check_pull_ref(&cfg, bad, None).is_err(), "{bad:?}");
+            assert!(check_pull_ref(&cfg, bad, None, None).is_err(), "{bad:?}");
         }
+        assert!(check_pull_ref(&open, "refs/heads/tg/a.b@c", None, None).is_ok());
+    }
+
+    #[test]
+    fn pull_denies_default_branch_distinct_from_target() {
+        let open = SandboxGitConfig {
+            deny_refs: Vec::new(),
+            ..SandboxGitConfig::default()
+        };
+        let err =
+            check_pull_ref(&open, "refs/heads/trunk", Some("develop"), Some("trunk")).unwrap_err();
+        assert!(err.contains("default branch"), "{err}");
+        // A `refs/heads/` prefix on either name is normalised.
+        assert!(check_pull_ref(&open, "refs/heads/trunk", None, Some("refs/heads/trunk")).is_err());
+        assert!(
+            check_pull_ref(
+                &open,
+                "refs/heads/develop",
+                Some("refs/heads/develop"),
+                Some("trunk")
+            )
+            .is_err()
+        );
+        assert!(check_pull_ref(&open, "refs/heads/tg/a", Some("develop"), Some("trunk")).is_ok());
+        let lane = SandboxGitConfig {
+            mode: SandboxGitMode::PushLane,
+            push_refs: vec!["refs/heads/*".into()],
+            deny_refs: Vec::new(),
+            ..SandboxGitConfig::default()
+        };
+        assert!(check_push_ref(&lane, "refs/heads/trunk", Some("develop"), Some("trunk")).is_err());
+        assert!(check_push_ref(&lane, "refs/heads/other", Some("develop"), Some("trunk")).is_ok());
     }
 
     #[test]
@@ -425,18 +533,19 @@ mod tests {
             ..SandboxGitConfig::default()
         };
         for mode in [SandboxGitMode::ReadOnly, SandboxGitMode::CommitOnly] {
-            let err = check_push_ref(&with(mode), "refs/heads/tg/a", Some("main")).unwrap_err();
+            let err =
+                check_push_ref(&with(mode), "refs/heads/tg/a", Some("main"), None).unwrap_err();
             assert!(err.contains("does not push"), "{err}");
         }
         let lane = with(SandboxGitMode::PushLane);
-        assert!(check_push_ref(&lane, "refs/heads/tg/a", Some("main")).is_ok());
-        let err = check_push_ref(&lane, "refs/heads/feature", Some("main")).unwrap_err();
+        assert!(check_push_ref(&lane, "refs/heads/tg/a", Some("main"), None).is_ok());
+        let err = check_push_ref(&lane, "refs/heads/feature", Some("main"), None).unwrap_err();
         assert!(err.contains("push_refs"), "{err}");
-        assert!(check_push_ref(&lane, "refs/heads/main", Some("main")).is_err());
+        assert!(check_push_ref(&lane, "refs/heads/main", Some("main"), None).is_err());
         let full = with(SandboxGitMode::Full);
-        assert!(check_push_ref(&full, "refs/heads/feature", Some("main")).is_ok());
-        assert!(check_push_ref(&full, "refs/tags/v1", Some("main")).is_err());
-        assert!(check_push_ref(&full, "refs/heads/main", None).is_err());
+        assert!(check_push_ref(&full, "refs/heads/feature", Some("main"), None).is_ok());
+        assert!(check_push_ref(&full, "refs/tags/v1", Some("main"), None).is_err());
+        assert!(check_push_ref(&full, "refs/heads/main", None, None).is_err());
     }
 
     fn fixture() -> (PathBuf, PathBuf) {
@@ -458,7 +567,7 @@ mod tests {
         target: Option<&str>,
     ) -> Result<GitMountPlan, String> {
         let (common, admin) = fixture();
-        plan_git_mounts(cfg, &common, &admin, Path::new("/wt"), branch, target)
+        plan_git_mounts(cfg, &common, &admin, Path::new("/wt"), branch, target, None)
     }
 
     #[test]
@@ -575,6 +684,65 @@ mod tests {
         }
         // One level below refs/heads never reaches refs/heads/tg/x.
         assert!(plan_for(&deny(&["refs/heads/*"]), "tg/lane", Some("main")).is_ok());
+    }
+
+    #[test]
+    fn carve_out_fails_closed_on_unknown_target() {
+        for mode in [
+            SandboxGitMode::CommitOnly,
+            SandboxGitMode::PushLane,
+            SandboxGitMode::Full,
+        ] {
+            for target in [None, Some(""), Some("  ")] {
+                let err = plan_for(&mode_cfg(mode), "tg/lane", target).unwrap_err();
+                assert!(
+                    err.contains("unknown merge target"),
+                    "{mode} {target:?}: {err}"
+                );
+            }
+        }
+        // read-only makes nothing writable, so an unknown target is fine.
+        assert!(plan_for(&mode_cfg(SandboxGitMode::ReadOnly), "tg/lane", None).is_ok());
+    }
+
+    #[test]
+    fn carve_out_refuses_default_branch() {
+        let (common, admin) = fixture();
+        let open = SandboxGitConfig {
+            deny_refs: Vec::new(),
+            ..SandboxGitConfig::default()
+        };
+        let plan = |default| {
+            plan_git_mounts(
+                &open,
+                &common,
+                &admin,
+                Path::new("/wt"),
+                "tg/lane",
+                Some("main"),
+                default,
+            )
+        };
+        assert!(plan(Some("trunk")).is_ok());
+        let err = plan(Some("tg/release")).unwrap_err();
+        assert!(
+            err.contains("default branch refs/heads/tg/release"),
+            "{err}"
+        );
+        assert!(plan(Some("refs/heads/tg/release")).is_err());
+        // A qualified merge target is normalised the same way.
+        assert!(
+            plan_git_mounts(
+                &open,
+                &common,
+                &admin,
+                Path::new("/wt"),
+                "tg/lane",
+                Some("refs/heads/tg/b139-integration"),
+                None,
+            )
+            .is_err()
+        );
     }
 
     #[test]
