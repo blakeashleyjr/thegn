@@ -272,24 +272,25 @@ fn relocated_source(rel: &str, env: &dyn Fn(&str) -> Option<String>) -> Option<s
 /// values) into a provider sandbox's provisioning exec env as
 /// `THEGN_GIT_NAME`/`THEGN_GIT_EMAIL`, so `git_auth_script` can persist them to
 /// the sandbox `~/.gitconfig` — otherwise in-sandbox commits are authored as the
-/// provider default (`Sprite <noreply@sprites.dev>`). No-op for an unset key.
+/// provider default (`Sprite <noreply@sprites.dev>`). No-op for an unset key;
+/// values with control characters or over the length cap are dropped
+/// ([`thegn_core::git_identity::resolve`]).
 // off-loop by contract: only called from the blocking provisioning path.
 #[expect(clippy::disallowed_methods)]
 pub(crate) fn push_host_git_identity(repo_root: &Path, exec_env: &mut Vec<(String, String)>) {
-    for (var, key) in [
-        ("THEGN_GIT_NAME", "user.name"),
-        ("THEGN_GIT_EMAIL", "user.email"),
-    ] {
-        let out = thegn_core::util::git_cmd(repo_root)
-            .args(["config", "--get", key])
-            .output();
-        if let Ok(o) = out
-            && o.status.success()
-        {
-            let v = String::from_utf8_lossy(&o.stdout).trim().to_string();
-            if !v.is_empty() {
-                exec_env.push((var.to_string(), v));
-            }
+    let read = |args: &[&str]| -> Option<String> {
+        let o = thegn_core::util::git_cmd(repo_root)
+            .args(args)
+            .output()
+            .ok()?;
+        o.status
+            .success()
+            .then(|| String::from_utf8_lossy(&o.stdout).trim().to_string())
+    };
+    let id = thegn_core::git_identity::resolve(&read);
+    for (var, value) in [("THEGN_GIT_NAME", id.name), ("THEGN_GIT_EMAIL", id.email)] {
+        if let Some(v) = value {
+            exec_env.push((var.to_string(), v));
         }
     }
 }

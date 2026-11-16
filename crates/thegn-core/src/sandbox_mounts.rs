@@ -275,6 +275,17 @@ impl XdgOmission {
     }
 }
 
+/// System trees a symlinked writable `$HOME` carve may never resolve into.
+const CARVE_SYSTEM_ROOTS: &[&str] = &[
+    "/bin", "/boot", "/dev", "/etc", "/lib", "/lib64", "/nix", "/opt", "/proc", "/run", "/sbin",
+    "/srv", "/sys", "/usr", "/var",
+];
+
+/// Whether a resolved carve target is `/` or inside a system tree.
+fn carve_target_is_system(p: &Path) -> bool {
+    p == Path::new("/") || CARVE_SYSTEM_ROOTS.iter().any(|root| p.starts_with(root))
+}
+
 /// Return approved writable XDG mounts together with every observable
 /// omission. Defaults absent from disk are ordinary and are not reported;
 /// explicitly configured roots that are unavailable are reported.
@@ -318,7 +329,20 @@ pub fn xdg_carveout_report_at(
     let mut mounts: Vec<Mount> = rels
         .iter()
         .filter_map(|rel| {
-            let p = home.join(rel);
+            let mut p = home.join(rel);
+            // A symlinked carve (a HOME-swapped profile's `.claude/projects` ->
+            // `~/.claude/projects`) is bound at its canonical target for BOTH
+            // ends: bwrap refuses a symlink destination, and inside the sandbox
+            // the alias still resolves through the bind because local placements
+            // mirror the host tree. An unresolvable link is skipped.
+            if std::fs::symlink_metadata(&p).is_ok_and(|m| m.file_type().is_symlink()) {
+                p = p.canonicalize().ok()?;
+                // A writable carve must never land on a system tree through a
+                // planted link (`~/.keychain -> /etc`).
+                if carve_target_is_system(&p) {
+                    return None;
+                }
+            }
             // Dir or file — but must exist so bwrap overmounts an existing
             // inode (skips dangling symlinks, which `is_dir`/`is_file` reject).
             (p.is_dir() || p.is_file()).then(|| {
@@ -1977,6 +2001,62 @@ mod tests {
             !has(SandboxProfile::SealedTunnel),
             "sealed-tunnel profile must NOT carve ~/.claude/projects"
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn profile_home_symlinked_projects_carve_uses_canonical_path() {
+        // A HOME-swapped profile (`~/.claude-profiles/<name>`) symlinks its
+        // `.claude/projects` into the shared `~/.claude/projects`. bwrap refuses
+        // a symlink destination, so the carve binds the canonical target at the
+        // canonical path; a dangling link is skipped.
+        let td = private_tempdir();
+        // A TMPDIR inside a system tree (e.g. `/run/user/..`) is itself refused
+        // as a carve target; then only the refusal is asserted.
+        let system_tmp = carve_target_is_system(&td.path().canonicalize().unwrap());
+        let shared = td.path().join("real-home/.claude/projects");
+        std::fs::create_dir_all(&shared).unwrap();
+        let home = td.path().join("profile-home");
+        std::fs::create_dir_all(home.join(".claude")).unwrap();
+        std::os::unix::fs::symlink(&shared, home.join(".claude/projects")).unwrap();
+        let no_env = |_: &str| None;
+        let (mounts, _) = xdg_carveout_report_at(SandboxProfile::Hardened, &home, &no_env);
+        let canon = shared
+            .canonicalize()
+            .unwrap()
+            .to_string_lossy()
+            .into_owned();
+        if system_tmp {
+            assert!(!mounts.iter().any(|m| m.host == canon));
+            return;
+        }
+        let carve = mounts
+            .iter()
+            .find(|m| m.host.ends_with("/.claude/projects"))
+            .expect("projects carve present");
+        assert_eq!(carve.host, canon);
+        assert_eq!(carve.dest, canon);
+        assert!(!carve.ro);
+        assert!(
+            !mounts
+                .iter()
+                .any(|m| m.dest == home.join(".claude/projects").to_string_lossy()),
+            "the symlink path itself must never be a bind destination"
+        );
+
+        // A link into a system tree is never carved writable.
+        assert!(carve_target_is_system(Path::new("/etc/x")));
+        assert!(carve_target_is_system(Path::new("/")));
+        assert!(!carve_target_is_system(Path::new(
+            "/home/u/.claude/projects"
+        )));
+        assert!(!carve_target_is_system(Path::new("/etcetera")));
+
+        // Dangling link: skipped, never emitted.
+        std::fs::remove_file(home.join(".claude/projects")).unwrap();
+        std::os::unix::fs::symlink(td.path().join("gone"), home.join(".claude/projects")).unwrap();
+        let (mounts, _) = xdg_carveout_report_at(SandboxProfile::Hardened, &home, &no_env);
+        assert!(!mounts.iter().any(|m| m.host.ends_with("projects")));
     }
 
     #[test]

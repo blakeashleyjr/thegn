@@ -845,6 +845,99 @@ fn resolve_mount_source(host: &std::path::Path) -> std::io::Result<PathBuf> {
     }
 }
 
+/// What [`bwrap_bind_dest`] decided for one bind destination.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum DestFix {
+    /// The destination resolves to itself (or cannot be resolved): unchanged.
+    Keep,
+    /// The destination (or an ancestor) is a symlink: bind at this path.
+    Rewrite(PathBuf),
+    /// The resolved destination is outside every visible root: omit the bind.
+    Drop,
+}
+
+/// Where a local bind of `host_canon` may land given its requested `dest`.
+/// `resolve` canonicalizes a path (absent leaves resolved through their
+/// existing ancestors). A destination that resolves to itself is kept. One
+/// that resolves elsewhere is rewritten only to a path that does not widen the
+/// sandbox: its own source (`host_canon`, so the source is bound once, at its
+/// own path) or a path under one of `roots` (an already-visible bind or
+/// substrate). Anything else is dropped.
+fn bwrap_bind_dest(
+    host_canon: &std::path::Path,
+    dest: &std::path::Path,
+    roots: &[PathBuf],
+    resolve: &dyn Fn(&std::path::Path) -> Option<PathBuf>,
+) -> DestFix {
+    let Some(resolved) = resolve(dest) else {
+        return DestFix::Keep;
+    };
+    if resolved == dest {
+        return DestFix::Keep;
+    }
+    if resolved == host_canon || roots.iter().any(|root| resolved.starts_with(root)) {
+        DestFix::Rewrite(resolved)
+    } else {
+        DestFix::Drop
+    }
+}
+
+/// Apply [`bwrap_bind_dest`] to every bind of a local bwrap/systemd view. The
+/// visible roots for one mount are every OTHER mount's destination, plus the
+/// bwrap substrate (bwrap) or the host root (systemd, which sees the host fs).
+fn fix_bind_dests(view: &mut SandboxSpec, resolve: &dyn Fn(&std::path::Path) -> Option<PathBuf>) {
+    let base: Vec<PathBuf> = match view.backend.profile().family {
+        BackendFamily::Systemd => vec![PathBuf::from("/")],
+        _ => BWRAP_SUBSTRATE.iter().map(PathBuf::from).collect(),
+    };
+    let dests: Vec<PathBuf> = view.mounts.iter().map(|m| PathBuf::from(&m.dest)).collect();
+    let mut keep = vec![true; view.mounts.len()];
+    for (index, mount) in view.mounts.iter_mut().enumerate() {
+        let roots: Vec<PathBuf> = base
+            .iter()
+            .cloned()
+            .chain(
+                dests
+                    .iter()
+                    .enumerate()
+                    .filter(|(other, _)| *other != index)
+                    .map(|(_, d)| d.clone()),
+            )
+            .collect();
+        match bwrap_bind_dest(
+            std::path::Path::new(&mount.host),
+            std::path::Path::new(&mount.dest),
+            &roots,
+            resolve,
+        ) {
+            DestFix::Keep => {}
+            DestFix::Rewrite(resolved) => {
+                tracing::debug!(
+                    target: "thegn::sandbox",
+                    dest = %mount.dest,
+                    resolved = %resolved.display(),
+                    "bind destination is a symlink; binding at its target"
+                );
+                mount.dest = resolved.to_string_lossy().into_owned();
+            }
+            DestFix::Drop => {
+                warn_dropped_mount_once(
+                    &mount.dest,
+                    &mount.dest,
+                    "bind destination resolves outside every visible sandbox root",
+                );
+                keep[index] = false;
+            }
+        }
+    }
+    let mut index = 0;
+    view.mounts.retain(|_| {
+        let k = keep[index];
+        index += 1;
+        k
+    });
+}
+
 /// The spec as it will actually be launched. For a sealed spec this drops every
 /// mount whose host path or destination lies inside the credential deny list
 /// (or whose allowlist target was retargeted since resolution) — whoever added
@@ -960,6 +1053,19 @@ fn launchable_guarded<'a>(
         index += 1;
         keep
     });
+    // bwrap refuses a symlink destination ("Can't mount on symlink
+    // destination"), so a local bwrap/systemd bind whose destination (or an
+    // ancestor) is a symlink is re-pointed at the resolved path, where the
+    // in-sandbox alias still lands because the host tree is mirrored. OCI
+    // destinations are container paths and are never rewritten.
+    if spec.placement.is_local()
+        && matches!(
+            canonical_view.backend.profile().family,
+            BackendFamily::Bwrap | BackendFamily::Systemd
+        )
+    {
+        fix_bind_dests(&mut canonical_view, &|p| resolve_mount_source(p).ok());
+    }
     view = std::borrow::Cow::Owned(canonical_view);
     if let Some(m) = crate::sandbox_floor::home_gate(&view) {
         return Err(refusal(
@@ -1477,6 +1583,42 @@ struct GitProbe {
     target: Option<String>,
     /// The repository's default branch, when known (never `HEAD`).
     default: Option<String>,
+    /// The host's effective commit identity for this repo (validated), handed
+    /// to the sandbox as `GIT_AUTHOR_*`/`GIT_COMMITTER_*`: the shared
+    /// `.git/config` is read-only under `[sandbox.git]` and the global
+    /// gitconfig may be unreachable from the sandbox `$HOME`.
+    identity: crate::git_identity::GitIdentity,
+}
+
+/// How long a resolved per-repo identity is reused before git is asked again.
+const GIT_IDENTITY_TTL: std::time::Duration = std::time::Duration::from_secs(60);
+
+type GitIdentityCache = std::sync::Mutex<
+    std::collections::HashMap<PathBuf, (std::time::Instant, crate::git_identity::GitIdentity)>,
+>;
+
+static GIT_IDENTITY_CACHE: std::sync::OnceLock<GitIdentityCache> = std::sync::OnceLock::new();
+
+/// The host's commit identity for `repo_root`, cached per repo for
+/// [`GIT_IDENTITY_TTL`] so a burst of pane launches costs one git pair.
+fn cached_git_identity(
+    repo_root: &std::path::Path,
+    read: &dyn Fn(&[&str]) -> Option<String>,
+) -> crate::git_identity::GitIdentity {
+    let cache = GIT_IDENTITY_CACHE.get_or_init(Default::default);
+    let now = std::time::Instant::now();
+    if let Some(hit) = cache.lock().ok().and_then(|map| {
+        map.get(repo_root)
+            .filter(|(at, _)| now.saturating_duration_since(*at) < GIT_IDENTITY_TTL)
+            .map(|(_, id)| id.clone())
+    }) {
+        return hit;
+    }
+    let id = crate::git_identity::resolve(read);
+    if let Ok(mut map) = cache.lock() {
+        map.insert(repo_root.to_path_buf(), (now, id.clone()));
+    }
+    id
 }
 
 /// Probe a local worktree for [`git_policy_mounts`].
@@ -1502,12 +1644,14 @@ fn probe_git(loc: &GitLoc, worktree: &std::path::Path, common: &std::path::Path)
         .map(|t| t.trim().to_string())
         .filter(|t| !t.is_empty() && t != "auto")
         .or_else(|| default.clone());
+    let identity = cached_git_identity(repo_root, &|args| loc.git_out(args));
     GitProbe {
         common: common.to_path_buf(),
         admin,
         branch,
         target,
         default,
+        identity,
     }
 }
 
@@ -1734,9 +1878,13 @@ fn resolve_placed_with(
     // writable `.git` (emitted AFTER the parent bind so the sub-path override
     // wins: bwrap `--ro-bind`, OCI file-level `:ro`).
     let git_policy_applies = placement.is_local() && !loc.is_remote();
+    // The probe's host commit identity, carried to the env assembly below.
+    let probed_identity: std::cell::RefCell<Option<crate::git_identity::GitIdentity>> =
+        std::cell::RefCell::new(None);
     let add_worktree_mounts = |mounts: &mut Vec<Mount>| match &git_common {
         Some(gc) if git_policy_applies => {
             let probe = probe_git(loc, &worktree, gc);
+            probed_identity.replace(Some(probe.identity.clone()));
             let (git_mounts, warning) = git_policy_mounts(&cfg.git, &worktree, &probe);
             if let Some(reason) = warning {
                 warn_git_fallback_once(&loc.path(), &reason);
@@ -1935,6 +2083,15 @@ fn resolve_placed_with(
         // waste a connect on it (and `AddKeysToAgent` errors per connection).
         .filter(|(k, v)| k != "SSH_AUTH_SOCK" || crate::ssh_creds::unix_socket_alive(v))
         .collect();
+
+    // The host's commit identity for a local git worktree (remote placements
+    // keep the provider path, which writes the sandbox gitconfig). An explicit
+    // host `GIT_AUTHOR_*`/`GIT_COMMITTER_*`, or one the passthrough already
+    // carries, wins. Not a credential: the firewall above does not apply.
+    if let Some(id) = probed_identity.borrow().as_ref() {
+        let extra = crate::git_identity::identity_env(id, &env, &|k| std::env::var(k).ok());
+        env.extend(extra);
+    }
 
     // Marker so a pane's shell rc / tooling can tell it's running inside a
     // thegn sandbox (e.g. to skip a redundant in-sandbox `direnv` hook).
