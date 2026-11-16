@@ -105,12 +105,12 @@ pub(crate) fn stderr_gist(stderr: &str) -> String {
 
 /// Which provisioning steps are ESSENTIAL — a failure aborts creation — vs
 /// best-effort (warn + continue; the shell still opens and the step resolves
-/// lazily in the pane). Essentials: the worktree dir, git auth, the clone.
-/// Everything else (nix install, devShell/direnv warm, personal tools, dotfiles,
+/// lazily in the pane). Essentials: the worktree dir, git auth, the clone (or
+/// its credential-free replacement, the git-bundle seed). Everything else (nix install, devShell/direnv warm, personal tools, dotfiles,
 /// the home-parity closure, checkpoint) is best-effort, so one flaky `nix
 /// develop` / unreachable cache can't kill an otherwise-usable sandbox.
 pub(crate) fn step_is_fatal(step_id: &str) -> bool {
-    matches!(step_id, "workspace" | "git_auth" | "clone")
+    matches!(step_id, "workspace" | "git_auth" | "clone" | "bundle_seed")
 }
 
 /// Which best-effort steps are pure PRE-WARMS whose only effect is to build the
@@ -204,7 +204,7 @@ mod tests {
     fn warm_only_and_fatal_step_classifiers_partition_the_pipeline() {
         // Essentials abort creation; pure pre-warms de-alarm to a hint; the rest
         // keep the visible best-effort failure. The three sets must not overlap.
-        for id in ["workspace", "git_auth", "clone"] {
+        for id in ["workspace", "git_auth", "clone", "bundle_seed"] {
             assert!(step_is_fatal(id), "{id} is fatal");
             assert!(!step_is_warm_only(id), "{id} is not a warm-only");
         }
