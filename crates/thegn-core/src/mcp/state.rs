@@ -657,6 +657,55 @@ pub const STATE_TOOLS: &[StateToolSpec] = &[
         }],
     },
     StateToolSpec {
+        cap: "sessions.resize",
+        description: "Resize a live session's PTY to `rows` x `cols` (the wire mirror of \
+                      `POST /v1/sessions/{s}/resize`). Reversible: it never sends input or \
+                      ends the session. Write-scoped (`--scopes write`); requires a \
+                      running daemon.",
+        args: &[
+            ArgSpec {
+                name: "session",
+                kind: ArgKind::String,
+                required: true,
+                description: "Target session id (see sessions_list)",
+            },
+            ArgSpec {
+                name: "rows",
+                kind: ArgKind::Integer,
+                required: true,
+                description: "New terminal height in rows (at most 65535)",
+            },
+            ArgSpec {
+                name: "cols",
+                kind: ArgKind::Integer,
+                required: true,
+                description: "New terminal width in columns (at most 65535)",
+            },
+        ],
+    },
+    StateToolSpec {
+        cap: "worktrees.open",
+        description: "Open/focus a workspace in the running thegn instance (the wire mirror \
+                      of `thegn open`): queues a focus request the compositor claims within \
+                      about a second. It never creates a worktree or repository on disk. \
+                      Write-scoped (`--scopes write`); requires a running daemon.",
+        args: &[
+            ArgSpec {
+                name: "repo",
+                kind: ArgKind::String,
+                required: true,
+                description: "Repository root path of the workspace to focus",
+            },
+            ArgSpec {
+                name: "branch",
+                kind: ArgKind::String,
+                required: false,
+                description: "Branch hint, accepted for parity with the HTTP body; \
+                              branch selection stays a compositor concern",
+            },
+        ],
+    },
+    StateToolSpec {
         cap: "semantic.map",
         description: "A ranked, line-budgeted repo map of a worktree: its \
                       tree-sitter-indexed entities (functions, types, …) grouped by \
@@ -814,6 +863,8 @@ pub const MCP_STATE_CAPS: &[&str] = &[
     "sessions.fork",
     "sessions.input",
     "sessions.kill",
+    "sessions.resize",
+    "worktrees.open",
     "semantic.map",
     "semantic.blast_radius",
     "notify.push",
@@ -943,7 +994,8 @@ fn input_schema(args: &[ArgSpec]) -> Value {
 }
 
 /// Write-class MCP tools whose effect is additive or reversible (open/fork a
-/// session, open an editor, assign a folder): advertised with
+/// session, open an editor, assign a folder, resize a PTY, focus a
+/// workspace): advertised with
 /// `destructiveHint: false`. Every other non-read tool is advertised
 /// destructive (fail closed), so a new write tool is destructive until it is
 /// deliberately listed here.
@@ -954,6 +1006,8 @@ const NON_DESTRUCTIVE_WRITE_CAPS: &[&str] = &[
     "notify.push",
     "sessions.open",
     "sessions.fork",
+    "sessions.resize",
+    "worktrees.open",
 ];
 
 /// MCP `annotations` for a state tool, derived from the catalog scope. Hints
@@ -1321,6 +1375,137 @@ mod tests {
     }
 
     #[test]
+    fn sessions_resize_and_worktrees_open_are_advertised_only_when_allowed() {
+        let r = StateRouter::new(vec!["sessions.list", "worktrees.list"], |_, _| {
+            Ok(json!(null))
+        });
+        let names: Vec<String> = r
+            .tool_entries()
+            .iter()
+            .map(|t| t["name"].as_str().unwrap().to_string())
+            .collect();
+        assert!(
+            !names
+                .iter()
+                .any(|n| n == "sessions_resize" || n == "worktrees_open")
+        );
+        // A disallowed call names the catalog scope and never reaches fetch.
+        let denied = StateRouter::new(vec!["sessions.list"], |_, _| -> Result<Value, String> {
+            panic!("a denied tool must not reach fetch")
+        });
+        for (tool, args, cap) in [
+            (
+                "sessions_resize",
+                json!({ "session": "s1", "rows": 24, "cols": 80 }),
+                "sessions.resize",
+            ),
+            (
+                "worktrees_open",
+                json!({ "repo": "/repo" }),
+                "worktrees.open",
+            ),
+        ] {
+            let (code, msg) = denied.call(tool, &args).unwrap().unwrap_err();
+            assert_eq!(code, -32001);
+            let scope = scope_of(lookup(cap).unwrap()).as_str();
+            assert!(msg.contains(&format!("--scopes {scope}")), "{msg}");
+            // The description states the scope the catalog assigns.
+            let spec = STATE_TOOLS.iter().find(|t| t.cap == cap).unwrap();
+            assert!(
+                spec.description.contains(&format!("`--scopes {scope}`")),
+                "{cap}: {}",
+                spec.description
+            );
+        }
+
+        let r = StateRouter::new(vec!["sessions.resize", "worktrees.open"], |_, _| {
+            Ok(json!(null))
+        });
+        let entries = r.tool_entries();
+        let names: Vec<&str> = entries
+            .iter()
+            .map(|e| e["name"].as_str().unwrap())
+            .collect();
+        assert_eq!(names, ["sessions_resize", "worktrees_open"]);
+        // Field-for-field mirrors of ResizeBody (+ the `{s}` path param) and
+        // OpenWorktreeBody.
+        let resize = &entries[0]["inputSchema"];
+        assert_eq!(resize["required"], json!(["session", "rows", "cols"]));
+        assert_eq!(resize["properties"]["session"]["type"], "string");
+        assert_eq!(resize["properties"]["rows"]["type"], "integer");
+        assert_eq!(resize["properties"]["cols"]["type"], "integer");
+        assert_eq!(resize["properties"].as_object().unwrap().len(), 3);
+        let open = &entries[1]["inputSchema"];
+        assert_eq!(open["required"], json!(["repo"]));
+        assert_eq!(open["properties"]["repo"]["type"], "string");
+        assert_eq!(open["properties"]["branch"]["type"], "string");
+        assert_eq!(open["properties"].as_object().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn sessions_resize_and_worktrees_open_reject_wrong_typed_args_before_fetch() {
+        let r = StateRouter::new(
+            vec!["sessions.resize", "worktrees.open"],
+            |_, _| -> Result<Value, String> { panic!("invalid args must not reach fetch") },
+        );
+        for (tool, bad) in [
+            (
+                "sessions_resize",
+                json!({ "session": "s1", "rows": "24", "cols": 80 }),
+            ),
+            (
+                "sessions_resize",
+                json!({ "session": "s1", "rows": 24, "cols": 1.5 }),
+            ),
+            (
+                "sessions_resize",
+                json!({ "session": 7, "rows": 24, "cols": 80 }),
+            ),
+            ("sessions_resize", json!({ "session": "s1", "rows": 24 })),
+            ("worktrees_open", json!({})),
+            ("worktrees_open", json!({ "repo": 1 })),
+            ("worktrees_open", json!({ "repo": "/r", "branch": false })),
+            ("worktrees_open", json!({ "repo": "/r", "create": true })),
+        ] {
+            let (code, _) = r.call(tool, &bad).unwrap().unwrap_err();
+            assert_eq!(code, -32602, "{tool} {bad}");
+        }
+    }
+
+    #[test]
+    fn sessions_resize_and_worktrees_open_route_their_cap_ids_to_fetch() {
+        let r = StateRouter::new(vec!["sessions.resize", "worktrees.open"], |cap, args| {
+            Ok(json!({ "cap": cap, "args": args }))
+        });
+        let resized = r
+            .call(
+                "sessions_resize",
+                &json!({ "session": "s1", "rows": 40, "cols": 120 }),
+            )
+            .unwrap()
+            .unwrap();
+        let text = resized["content"][0]["text"].as_str().unwrap();
+        assert!(text.contains("sessions.resize"), "{text}");
+        assert!(text.contains("120"), "{text}");
+        let opened = r
+            .call(
+                "worktrees_open",
+                &json!({ "repo": "/repo", "branch": "main" }),
+            )
+            .unwrap()
+            .unwrap();
+        let text = opened["content"][0]["text"].as_str().unwrap();
+        assert!(text.contains("worktrees.open"), "{text}");
+        assert!(text.contains("/repo"), "{text}");
+        // `branch` is optional.
+        assert!(
+            r.call("worktrees_open", &json!({ "repo": "/repo" }))
+                .unwrap()
+                .is_ok()
+        );
+    }
+
+    #[test]
     fn tool_entries_string_array_declares_items() {
         let r = StateRouter::new(vec!["sessions.open"], |_, _| Ok(json!(null)));
         let entries = r.tool_entries();
@@ -1468,6 +1653,8 @@ mod tests {
             "sessions.fork",
             "sessions.input",
             "sessions.kill",
+            "sessions.resize",
+            "worktrees.open",
         ];
         // Folder assignment is a repo-local worktree metadata mutation: Git.
         let git = ["folders.assign"];
@@ -1655,6 +1842,8 @@ mod tests {
             ("editor_open", false, false),
             ("sessions_open", false, false),
             ("sessions_fork", false, false),
+            ("sessions_resize", false, false),
+            ("worktrees_open", false, false),
         ] {
             let entry = entries
                 .iter()
