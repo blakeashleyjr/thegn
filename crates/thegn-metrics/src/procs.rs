@@ -110,6 +110,10 @@ pub struct ProcSummary {
     /// Unknown on the first pass, before an identity baseline exists.
     pub exited: Option<usize>,
     pub owners: ProcOwnerSummary,
+    /// The `owners.panes` bucket split per pane: `(pane id, totals)`, sorted by
+    /// pane id, one entry per pane that owned at least one process. Bounded by
+    /// the pane count; the entries sum to `owners.panes`.
+    pub pane_totals: Vec<(u32, ProcOwnerTotals)>,
 }
 
 /// CPU and resident memory totals grouped by owner class.
