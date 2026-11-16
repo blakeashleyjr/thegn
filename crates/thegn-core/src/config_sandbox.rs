@@ -105,9 +105,18 @@ impl SandboxGitOverlay {
     }
 }
 
-/// Host env vars carrying a GitHub token. Withheld from sandboxes and
-/// provider provisioning unless [`SandboxGitConfig::admits_git_token`].
-pub const GIT_TOKEN_ENV: &[&str] = &["GH_TOKEN", "GITHUB_TOKEN"];
+/// Host env vars carrying a forge (GitHub / GitLab) token. Withheld from
+/// sandboxes and provider provisioning unless
+/// [`SandboxGitConfig::admits_git_token`]. A token stored in a `gh`/`glab`
+/// config that arrives via `[sandbox.home]` dotfiles is not filtered.
+pub const GIT_TOKEN_ENV: &[&str] = &[
+    "GH_TOKEN",
+    "GITHUB_TOKEN",
+    "GH_ENTERPRISE_TOKEN",
+    "GITHUB_ENTERPRISE_TOKEN",
+    "GITLAB_TOKEN",
+    "GL_TOKEN",
+];
 
 impl SandboxGitConfig {
     /// Does this policy hand the host GitHub token to the sandbox? Only
