@@ -1445,6 +1445,239 @@ fn warn_dropped_mount_once(raw: &str, host: &str, reason: &str) {
     }
 }
 
+/// Per-repo merge-target lookup for the `[sandbox.git]` mount plan: given the
+/// repo's main checkout, the configured `merge_queue.target_branch` (per-repo
+/// overlay applied). Core has no [`crate::config::Config`] here, so the host
+/// registers one via [`set_merge_target_lookup`]; until then the target is
+/// treated as `auto` (the repository's default branch).
+pub type MergeTargetLookup = Box<dyn Fn(&std::path::Path) -> Option<String> + Send + Sync>;
+
+static MERGE_TARGET_LOOKUP: std::sync::OnceLock<MergeTargetLookup> = std::sync::OnceLock::new();
+
+/// Register the per-repo merge-target lookup (first registration wins).
+pub fn set_merge_target_lookup(lookup: MergeTargetLookup) {
+    if MERGE_TARGET_LOOKUP.set(lookup).is_err() {
+        tracing::debug!(
+            target: "thegn::sandbox",
+            "merge-target lookup already registered; keeping the first"
+        );
+    }
+}
+
+/// What the git mount plan needs to know about a local linked worktree.
+#[derive(Debug, Clone, Default)]
+struct GitProbe {
+    /// The git common dir (`<repo>/.git`).
+    common: PathBuf,
+    /// The worktree's own git dir (`<common>/worktrees/<name>`), when linked.
+    admin: Option<PathBuf>,
+    /// The checked-out branch (`None` when detached).
+    branch: Option<String>,
+    /// The merge target (`auto` resolved to the default branch), when known.
+    target: Option<String>,
+    /// The repository's default branch, when known (never `HEAD`).
+    default: Option<String>,
+}
+
+/// Probe a local worktree for [`git_policy_mounts`].
+fn probe_git(loc: &GitLoc, worktree: &std::path::Path, common: &std::path::Path) -> GitProbe {
+    let admin = loc
+        .git_out_path(&["rev-parse", "--path-format=absolute", "--git-dir"])
+        .ok()
+        .filter(|p| p.as_path() != common);
+    let branch = loc
+        .git_out(&["symbolic-ref", "--short", "-q", "HEAD"])
+        .filter(|b| !b.is_empty());
+    let default = crate::worktree::default_branch_checked(worktree)
+        .ok()
+        .filter(|b| !b.is_empty() && b != "HEAD");
+    let repo_root = if common.file_name().is_some_and(|n| n == ".git") {
+        common.parent().unwrap_or(common)
+    } else {
+        common
+    };
+    let target = MERGE_TARGET_LOOKUP
+        .get()
+        .and_then(|lookup| lookup(repo_root))
+        .map(|t| t.trim().to_string())
+        .filter(|t| !t.is_empty() && t != "auto")
+        .or_else(|| default.clone());
+    GitProbe {
+        common: common.to_path_buf(),
+        admin,
+        branch,
+        target,
+        default,
+    }
+}
+
+/// Warn once per (worktree, reason) about a `[sandbox.git]` fallback.
+fn warn_git_fallback_once(worktree: &str, reason: &str) {
+    use std::sync::{Mutex, OnceLock};
+    static SEEN: OnceLock<Mutex<std::collections::HashSet<String>>> = OnceLock::new();
+    let first = SEEN
+        .get_or_init(Default::default)
+        .lock()
+        .map(|mut s| s.insert(format!("{worktree}\0{reason}")))
+        .unwrap_or(false);
+    if first {
+        tracing::warn!(target: "thegn::sandbox", worktree, reason, "[sandbox.git] fallback");
+    }
+}
+
+fn path_mount(path: &std::path::Path, ro: bool) -> Mount {
+    let p = path.to_string_lossy().into_owned();
+    Mount {
+        host: p.clone(),
+        dest: p,
+        ro,
+        cache: false,
+    }
+}
+
+/// Today's (pre-THE-2009) binds: the worktree and the common dir read-write,
+/// with the shared `.git/config` pinned read-only on top.
+fn legacy_git_mounts(worktree: &std::path::Path, common: Option<&std::path::Path>) -> Vec<Mount> {
+    let mut mounts = vec![path_mount(worktree, false)];
+    if let Some(gc) = common {
+        mounts.push(path_mount(gc, false));
+        let config = gc.join("config");
+        if config.exists() {
+            mounts.push(path_mount(&config, true));
+        }
+    }
+    mounts
+}
+
+/// The worktree + git common-dir binds for a LOCAL worktree under `git`
+/// (THE-2009/THE-2021), plus the warning to log when the plan fell back.
+///
+/// Order: the worktree, the common dir read-only, the writable carve-outs, the
+/// shared `config` pin, then the `ro_after` re-pins (bwrap applies binds in
+/// argument order). Missing carve-out dirs are created first (best-effort);
+/// a carve-out or re-pin whose source still does not exist is dropped (a
+/// dropped carve-out only removes write access). When the branch cannot be
+/// confined (main checkout, top-level or detached branch) `full` keeps today's
+/// read-write mounts; every other mode, and any other plan refusal (unknown
+/// merge target, a carve-out exposing a protected ref), gets a read-only
+/// shared `.git` with a writable worktree.
+fn git_policy_mounts(
+    git: &crate::config::SandboxGitConfig,
+    worktree: &std::path::Path,
+    probe: &GitProbe,
+) -> (Vec<Mount>, Option<String>) {
+    use crate::config::SandboxGitMode;
+    use crate::config_sandbox::git_policy::plan_git_mounts;
+    let common = probe.common.as_path();
+    let main_checkout = common.starts_with(worktree);
+    let structural = if main_checkout {
+        Some(
+            "the worktree is the main checkout (its .git is not shared through a lane)".to_string(),
+        )
+    } else {
+        match (&probe.admin, &probe.branch) {
+            (None, _) => Some("the worktree's own git dir could not be read".to_string()),
+            (_, None) => Some("HEAD is detached (no lane branch to confine)".to_string()),
+            (_, Some(b)) if !b.trim_start_matches("refs/heads/").contains('/') => Some(format!(
+                "branch {b} is top-level (its ref would share refs/heads/ with every other branch)"
+            )),
+            _ => None,
+        }
+    };
+    let plan = match (&structural, &probe.admin, &probe.branch) {
+        // `read-only` confines nothing per lane, so any worktree qualifies.
+        _ if git.mode == SandboxGitMode::ReadOnly => {
+            plan_git_mounts(git, common, common, worktree, "", None, None)
+        }
+        (None, Some(admin), Some(branch)) => plan_git_mounts(
+            git,
+            common,
+            admin,
+            worktree,
+            branch,
+            probe.target.as_deref(),
+            probe.default.as_deref(),
+        ),
+        (Some(reason), ..) => Err(reason.clone()),
+        _ => Err("the lane branch could not be read".to_string()),
+    };
+    let (plan, warning) = match plan {
+        Ok(plan) => (plan, None),
+        Err(reason) if structural.is_some() && git.mode == SandboxGitMode::Full => {
+            return (
+                legacy_git_mounts(worktree, Some(common)),
+                Some(format!(
+                    "{reason}; mode = \"full\" keeps the shared .git read-write"
+                )),
+            );
+        }
+        Err(reason) => {
+            let mut ro_git = git.clone();
+            ro_git.mode = SandboxGitMode::ReadOnly;
+            let mut plan = plan_git_mounts(&ro_git, common, common, worktree, "", None, None)
+                .unwrap_or_default();
+            // Read-only git for the SHARED .git only: the worktree stays
+            // writable unless the configured mode is itself `read-only`.
+            plan.worktree_ro = git.mode == SandboxGitMode::ReadOnly;
+            let fix = if structural.is_some() {
+                "; work on a namespaced lane branch (e.g. tg/<name>) in a linked worktree to commit"
+            } else {
+                ""
+            };
+            (
+                plan,
+                Some(format!(
+                    "{reason}; the shared .git is read-only for this sandbox (mode = \"{}\"){fix}",
+                    git.mode
+                )),
+            )
+        }
+    };
+    for dir in &plan.mkdirs {
+        if let Err(error) = std::fs::create_dir_all(dir) {
+            tracing::warn!(
+                target: "thegn::sandbox",
+                path = %dir.display(),
+                %error,
+                "could not create a [sandbox.git] carve-out directory"
+            );
+        }
+    }
+    let mut mounts = vec![path_mount(worktree, plan.worktree_ro)];
+    mounts.extend(plan.ro.iter().map(|p| path_mount(p, true)));
+    mounts.extend(
+        plan.rw
+            .iter()
+            .filter(|p| p.exists())
+            .map(|p| path_mount(p, false)),
+    );
+    let config = common.join("config");
+    if config.exists() {
+        mounts.push(path_mount(&config, true));
+    }
+    for path in &plan.ro_after {
+        if !path.exists()
+            && let Err(error) = std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(path)
+        {
+            tracing::warn!(
+                target: "thegn::sandbox",
+                path = %path.display(),
+                %error,
+                "could not create a [sandbox.git] read-only pin target"
+            );
+        }
+        // A main checkout's `<worktree>/.git` IS the common dir, already
+        // bound read-only above.
+        if path.exists() && path.as_path() != common {
+            mounts.push(path_mount(path, true));
+        }
+    }
+    (mounts, warning)
+}
+
 fn resolve_placed_with(
     cfg: &SandboxConfig,
     loc: &GitLoc,
@@ -1493,38 +1726,24 @@ fn resolve_placed_with(
         .filter(|p| p.as_path() != worktree && !worktree.starts_with(p));
 
     let mut mounts = vec![];
-    let add_worktree_mounts = |mounts: &mut Vec<Mount>| {
-        mounts.push(Mount {
-            host: loc.path(),
-            dest: loc.path(),
-            ro: false,
-            cache: false,
-        });
-        if let Some(gc) = &git_common {
-            let g = gc.to_string_lossy().into_owned();
-            mounts.push(Mount {
-                host: g.clone(),
-                dest: g.clone(),
-                ro: false,
-                cache: false,
-            });
-            // Pin the SHARED `.git/config` read-only on top of the writable
-            // `.git`: objects/refs/index (and per-worktree config under
-            // `worktrees/<name>/`) stay writable so commits work, but no
-            // sandboxed process can write a stray `core.worktree`/`user.*` into
-            // the shared config — the structural fix for the pollution class.
-            // Emitted AFTER the parent bind so the sub-path override wins
-            // (bwrap `--ro-bind`, OCI file-level `:ro`).
-            let cfg = format!("{g}/config");
-            if std::path::Path::new(&cfg).exists() {
-                mounts.push(Mount {
-                    host: cfg.clone(),
-                    dest: cfg,
-                    ro: true,
-                    cache: false,
-                });
+    // THE-2009/THE-2021: a LOCAL worktree's shared `.git` follows
+    // `[sandbox.git]` (read-only common dir + per-lane carve-outs, see
+    // `git_policy_mounts`). Remote placements keep today's binds: the paths
+    // are the remote host's and the plan's host-side mkdirs cannot run there.
+    // Today's binds pin the SHARED `.git/config` read-only on top of the
+    // writable `.git` (emitted AFTER the parent bind so the sub-path override
+    // wins: bwrap `--ro-bind`, OCI file-level `:ro`).
+    let git_policy_applies = placement.is_local() && !loc.is_remote();
+    let add_worktree_mounts = |mounts: &mut Vec<Mount>| match &git_common {
+        Some(gc) if git_policy_applies => {
+            let probe = probe_git(loc, &worktree, gc);
+            let (git_mounts, warning) = git_policy_mounts(&cfg.git, &worktree, &probe);
+            if let Some(reason) = warning {
+                warn_git_fallback_once(&loc.path(), &reason);
             }
+            mounts.extend(git_mounts);
         }
+        gc => mounts.extend(legacy_git_mounts(&worktree, gc.as_deref())),
     };
     // Inject host toolchain paths (dotfiles, $HOME, /nix/store, etc.) so the
     // user's real shell, starship, and configs work identically in the sandbox.

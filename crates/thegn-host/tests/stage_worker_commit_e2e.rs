@@ -306,7 +306,9 @@ impl Fixture {
                 "--env",
                 "pipeline",
                 "--exact-branch",
-                "worker",
+                // A lane-namespace branch: `[sandbox.git]` only carves commit
+                // paths out of the read-only common dir for `<ns>/<name>`.
+                "tg/worker",
                 "--json",
             ])
             .envs(state_env_all(state.root()))
