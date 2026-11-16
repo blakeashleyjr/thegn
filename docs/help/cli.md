@@ -64,6 +64,12 @@ no extra flag) creates a sibling pane next to a session (`session`, optional
 `dir` of `right` or `down`, `argv`, `cwd`, `env`, `rows`, `cols`); it sends
 no input to the target. `sessions_snapshot` returns a session's current
 screen and needs only `--scopes read`.
+The dispatch roster's writes are MCP tools too, under the same `--scopes
+write` as `POST /v1/dispatches` and its status route, with no extra flag:
+`dispatches_put` appends a row (`issue_id`, `worktree_path`, `agent_name`,
+optional `stage`, `parent_id`, `session_id`, `artifact_path`, `lead`), and
+`dispatches_set_status` sets row `id` to `status` (optional `lead` proof).
+The daemon checks the status name.
 A worktree's sandbox profile pin is readable with `worktrees.sandbox_profile`
 (`api call`, HTTP, or MCP `worktrees_sandbox_profile`); changing it with
 `worktrees.sandbox_profile_set` (`profile`, or `clear: true`) needs admin scope

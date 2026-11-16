@@ -28,8 +28,6 @@
 #             local custody today; a remote-operator route is future work.
 
 calendar.ingest	mcp	MCP state tools land in the client-API phase
-dispatches.put	mcp	MCP state tools land in the client-API phase
-dispatches.set_status	mcp	MCP state tools land in the client-API phase
 git.commit	mcp	MCP state tools land in the client-API phase
 git.stage	mcp	MCP state tools land in the client-API phase
 issues.comment	mcp	MCP state tools land in the client-API phase
