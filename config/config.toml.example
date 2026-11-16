@@ -3264,9 +3264,15 @@ on_floor_miss = "fail"
 # credential = "none"          # none: no GitHub token in the sandbox (default).
 #                              # repo-token | user-token (mode = "full" only):
 #                              # pass the host GH_TOKEN/GITHUB_TOKEN through.
-#                              # deploy-key, github-app: accepted, not implemented
+#                              # deploy-key (mode = "full", local placements only):
+#                              # bind deploy_key read-only and set GIT_SSH_COMMAND;
+#                              # the host token stays withheld.
+#                              # github-app: accepted, not implemented
 # push_refs  = ["refs/heads/tg/*"]                  # trailing /* = one level, /** = any depth
 # deny_refs  = ["refs/heads/main", "refs/tags/*"]   # the merge target is always denied too
+# deploy_key = ""              # private key path for credential = "deploy-key" (~ ok);
+#                              # must be a regular file you own, not group/world
+#                              # readable, else no credential is passed (warned)
 
 # ── Remote transport tuning ───────────────────────────────────────────────────
 # Hardening for EVERY control-plane ssh connection (host bring-up, remote git
