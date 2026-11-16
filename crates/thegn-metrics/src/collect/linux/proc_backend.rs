@@ -67,6 +67,7 @@ pub(crate) struct NativeBackend<F: ProcFs> {
     pass_time: Duration,
     last_sample: Option<Instant>,
     scratch: Vec<(Pid, f32, u64)>,
+    scopes: super::slice_scopes::SliceScopes,
 }
 
 impl NativeBackend<RealProcFs> {
@@ -78,6 +79,7 @@ impl NativeBackend<RealProcFs> {
             clock_ticks_per_second(),
             page_size(),
         )
+        .with_scopes(super::slice_scopes::SliceScopes::system())
     }
 }
 
@@ -107,7 +109,14 @@ impl<F: ProcFs> NativeBackend<F> {
             pass_time: Duration::ZERO,
             last_sample: None,
             scratch: Vec::new(),
+            // Fixtures never read the host's cgroups; the live backend opts in.
+            scopes: super::slice_scopes::SliceScopes::disabled(),
         }
+    }
+
+    fn with_scopes(mut self, scopes: super::slice_scopes::SliceScopes) -> Self {
+        self.scopes = scopes;
+        self
     }
 
     /// Releases all per-process descriptors and clears CPU sampling state.
@@ -121,6 +130,7 @@ impl<F: ProcFs> NativeBackend<F> {
         self.pass_time = Duration::ZERO;
         self.last_sample = None;
         self.scratch.clear();
+        self.scopes.reset();
     }
 }
 
@@ -157,7 +167,12 @@ fn sample_with<F: ProcFs>(
         );
     }
     request.primed = *primed;
-    let snapshot = project_native_table(native, request, uptime_secs).0;
+    let mut snapshot = project_native_table(native, request, uptime_secs).0;
+    // Same popup-gated pass: one read_dir of thegn.slice plus two small reads
+    // per scope.
+    if let Some(summary) = snapshot.summary.as_mut() {
+        summary.scopes = native.scopes.sample(now);
+    }
     *primed = true;
     (snapshot, true)
 }
