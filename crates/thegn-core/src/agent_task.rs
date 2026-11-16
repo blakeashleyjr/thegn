@@ -718,6 +718,11 @@ pub fn headless_command(provider: &str, command: &str) -> String {
     if let Some(template) = crate::harness::harness(provider).and_then(|h| h.headless_template()) {
         return template.to_string();
     }
+    // A command that already names `{prompt_file}` carries the prompt by file;
+    // appending `{prompt}` would put the same payload back in argv (THE-1986).
+    if template_vars(command).is_ok_and(|vars| vars.iter().any(|name| name == "prompt_file")) {
+        return command.to_string();
+    }
     crate::config::config_warn(&format!(
         "agent {provider:?}: no known headless invocation; running `{command} <prompt>`. \
          Set `agent_command` if that is wrong."
@@ -2112,6 +2117,14 @@ mod tests {
         assert_eq!(
             headless_command("mystery", "mystery --go"),
             "mystery --go {prompt}"
+        );
+    }
+
+    #[test]
+    fn a_prompt_file_command_is_not_given_an_argv_prompt() {
+        assert_eq!(
+            headless_command("filer-agent", "filer-agent --prompt-file {prompt_file}"),
+            "filer-agent --prompt-file {prompt_file}"
         );
     }
 
