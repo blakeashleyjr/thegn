@@ -25,7 +25,7 @@ worktree):
 | Program       | `program list/create/rename/rm/assign` · `wt new --program`                                                                                   |
 | Forge         | `pr` · `issue` · `ci` · `kaneo`                                                                                                               |
 | Automation    | `autopilot status [--repo PATH] [--json]`                                                                                                     |
-| Environments  | `env` · `zone` · `host` · `placement` · `debug` · `mcp` · `plugin`                                                                            |
+| Environments  | `env` · `zone` · `host` · `placement` · `fleet` · `debug` · `mcp` · `plugin`                                                                  |
 | Session       | `session list\|open\|snapshot\|attach\|wait` · `notify` · `logs` · `share` · `forward`                                                        |
 | Control plane | `serve` · `session` · `events` · `attach` · `pair` · `api`                                                                                    |
 | Meta          | `config` · `keys` · `theme` · `doctor` · `db` · `setup` · `completions`                                                                       |
@@ -474,6 +474,20 @@ provider and saying the host keeps running and billing.
 On the dev channel, scale-down also keeps and warns by name about an engine
 host whose tenant count or last use cannot be read, or whose creation time and
 use are both unrecorded; it never treats that missing age as idle.
+
+On the dev channel, `thegn fleet list [--env <name>] [--json]` lists every
+sandbox the configured `[env.<name>]` providers report, one row per sandbox
+with its state, size, region, age, hourly rate, accrued cost and owning
+worktree. A sandbox no worktree records is marked `ORPHAN`; a sandbox a
+worktree records but the provider no longer lists appears under "Recorded, not
+listed". An env whose token does not resolve, or whose listing fails or times
+out (20 s), is shown as unavailable instead of failing the command.
+`thegn fleet cost [--json]` prints the hourly burn per provider, today's and
+the month's spend so far, and 24 h / 30 d projections. Costs are estimates:
+`[placement.price]` rates win over the bundled price table, a size with no
+known price shows `?` and is counted as unpriced, and accrued cost assumes the
+sandbox ran since it was created. Only Fly reports sizes today; other providers
+list ids only. Nothing is stopped or destroyed.
 
 `thegn map` prints a **repo map**: the worktree's tree-sitter-indexed
 entities (functions, types, …) grouped by file, ranked by caller

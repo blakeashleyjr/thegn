@@ -19,6 +19,8 @@ use crate::remote::ssh_base;
 use crate::util;
 use sha2::{Digest, Sha256};
 
+pub mod fleet_cost;
+
 /// Compute a host-side dtach session id from the SSH destination and exact
 /// backend command. It is never derived from a remote environment variable;
 /// distinct worktrees and commands get distinct masters, while identical
