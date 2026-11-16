@@ -249,6 +249,7 @@ fn run_inner(
                     stdout: Capture::default(),
                     stderr: Capture::default(),
                     containment: Containment::DirectChildOnly,
+                    idle_expired: false,
                 },
                 InputFeed::default(),
             );
@@ -302,13 +303,20 @@ fn run_inner(
         stdout: Capture::default(),
         stderr: Capture::default(),
         containment: Containment::DirectChildOnly,
+        idle_expired: false,
     };
     let mut status = None;
     let mut leader_exit_at: Option<Instant> = None;
+    // Idle-output clock: starts at spawn, reset by every chunk read before the leader exits.
+    let mut last_output = start;
     loop {
+        let before = run.stdout.total.saturating_add(run.stderr.total);
         if let Some(which) = drain(&rx, &mut run, limits, consume) {
             run.end = End::OutputLimit(which);
             break;
+        }
+        if run.stdout.total.saturating_add(run.stderr.total) > before {
+            last_output = Instant::now();
         }
         if status.is_some() {
             run.leader_exited_first = true;
@@ -334,6 +342,13 @@ fn run_inner(
             break;
         } else if start.elapsed() >= limits.timeout {
             run.end = End::TimedOut;
+            break;
+        } else if limits
+            .idle_output
+            .is_some_and(|idle| last_output.elapsed() >= idle)
+        {
+            run.end = End::TimedOut;
+            run.idle_expired = true;
             break;
         } else {
             match child
@@ -422,6 +437,8 @@ fn run_inner(
     if let Some(which) = drain(&rx, &mut run, limits, consume) {
         run.end = End::OutputLimit(which);
     }
+    // A reader-grace OutputLimit overrides the end; the flag only ever accompanies TimedOut.
+    run.idle_expired = run.idle_expired && matches!(&run.end, End::TimedOut);
     aggregate_fit(
         &mut run.stdout,
         &mut run.stderr,
@@ -496,5 +513,27 @@ mod tests {
         assert!(result.stdout.eof);
         assert!(result.stderr.eof);
         assert!(started.elapsed() < Duration::from_secs(2));
+    }
+
+    #[test]
+    fn silent_child_is_ended_by_idle_output_before_the_timeout() {
+        let mut cmd = Command::new("powershell.exe");
+        cmd.args([
+            "-NoProfile",
+            "-Command",
+            "Write-Output x; Start-Sleep -Seconds 30",
+        ]);
+        let limits = Limits {
+            stdout: Stream::Tail { cap: 64 },
+            stderr: Stream::Tail { cap: 64 },
+            kill_settle: Duration::from_secs(2),
+            idle_output: Some(Duration::from_secs(3)),
+            ..Limits::silent(Duration::from_secs(25))
+        };
+        let started = Instant::now();
+        let result = run(&mut cmd, &limits, &AtomicBool::new(false));
+        assert!(matches!(&result.end, End::TimedOut), "{:?}", result.end);
+        assert!(result.idle_expired);
+        assert!(started.elapsed() < Duration::from_secs(20));
     }
 }

@@ -2424,6 +2424,7 @@ mod tests {
             group,
             leader,
             leader_exited_first: true,
+            idle_expired: false,
             stdout: thegn_proc::Capture {
                 bytes: b"abc".to_vec(),
                 total: 3,
