@@ -510,7 +510,9 @@ fn copy_bounded(
 
 /// Kill `child`'s whole process group, then reap the leader. Only call while
 /// the leader is unreaped: its zombie pins the pgid, so the group signal can
-/// never reach a recycled, unrelated group.
+/// never reach a recycled, unrelated group. `wait_producer_then_copier` also
+/// signals a reaped leader's group, which is safe only while a member still
+/// holds the stream (it pins the pgid).
 fn stop_group(child: &mut std::process::Child, side: &'static str) {
     crate::plugin::proc::kill_group(child.id());
     if let Err(error) = child.kill() {
@@ -518,6 +520,20 @@ fn stop_group(child: &mut std::process::Child, side: &'static str) {
     }
     if let Err(error) = child.wait() {
         tracing::debug!(target: "thegn::host::pipe", %error, side, "failed to reap pipe side");
+    }
+}
+
+/// The host command's captured stderr, waiting at most 2 s for the reader
+/// (a leftover descendant may hold the pipe open).
+fn join_stderr(err_reader: std::thread::JoinHandle<String>) -> String {
+    let until = Instant::now() + Duration::from_secs(2);
+    while !err_reader.is_finished() && Instant::now() < until {
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    if err_reader.is_finished() {
+        err_reader.join().unwrap_or_default()
+    } else {
+        String::new()
     }
 }
 
@@ -690,7 +706,7 @@ fn pipe_argv_bounded(
                 {
                     return Err(PipeError::Budget { limit: max_bytes });
                 }
-                let err = err_reader.join().unwrap_or_default();
+                let err = join_stderr(err_reader);
                 return Err(PipeError::Exit(describe_exec_failure(
                     "pipe: host cmd",
                     status.code(),
@@ -742,7 +758,7 @@ fn finish_after_copy(
     };
     if !consumer_status.success() {
         stop_group(producer, "producer");
-        let err = err_reader.join().unwrap_or_default();
+        let err = join_stderr(err_reader);
         return Err(PipeError::Exit(describe_exec_failure(
             "pipe: host cmd",
             consumer_status.code(),
@@ -782,6 +798,7 @@ fn wait_producer_then_copier(
     // copier reading; never wait past the deadline for it.
     while !copier.is_finished() {
         if Instant::now() >= deadline {
+            crate::plugin::proc::kill_group(producer.id());
             return Err(timed_out);
         }
         std::thread::sleep(Duration::from_millis(25));
