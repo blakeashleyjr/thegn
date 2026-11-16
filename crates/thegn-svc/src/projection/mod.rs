@@ -349,20 +349,38 @@ impl std::fmt::Display for TransportError {
 
 impl std::error::Error for TransportError {}
 
-fn run_bounded(argv: &[String], timeout: std::time::Duration) -> Result<()> {
-    use std::sync::atomic::AtomicBool;
+/// Process-global quit latch: set once by the host at shutdown so in-flight mount and
+/// refresh transports stop promptly. Unmount and rollback never observe it.
+static PROJECTION_SHUTDOWN: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
 
+/// Cancel every in-flight mount/refresh transport (quit only; never reset).
+pub fn cancel_for_shutdown() {
+    PROJECTION_SHUTDOWN.store(true, std::sync::atomic::Ordering::Release);
+}
+
+/// Never-cancel run, used by unmount and rollback so a security-sensitive teardown
+/// finishes within its own deadline.
+fn run_bounded(argv: &[String], timeout: std::time::Duration) -> Result<()> {
+    let never = std::sync::atomic::AtomicBool::new(false);
+    run_bounded_with(argv, timeout, &never)
+}
+
+fn run_bounded_with(
+    argv: &[String],
+    timeout: std::time::Duration,
+    cancelled: &std::sync::atomic::AtomicBool,
+) -> Result<()> {
     if argv.is_empty() {
         bail!("empty projection argv");
     }
     let mut command = std::process::Command::new(&argv[0]);
     command.args(&argv[1..]);
-    let cancelled = AtomicBool::new(false);
     let limits = thegn_proc::Limits {
         stderr: thegn_proc::Stream::Tail { cap: 4096 },
         ..thegn_proc::Limits::silent(timeout)
     };
-    let run = thegn_proc::run(&mut command, &limits, &cancelled);
+    let run = thegn_proc::run(&mut command, &limits, cancelled);
     let Some(error) = run.error() else {
         return Ok(());
     };
@@ -381,7 +399,7 @@ fn run_bounded(argv: &[String], timeout: std::time::Duration) -> Result<()> {
 const SSHFS_MOUNT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
 
 fn run_sshfs_mount(argv: &[String], mountpoint: &str) -> Result<()> {
-    run_mount_bounded(argv, SSHFS_MOUNT_TIMEOUT, || {
+    run_mount_bounded_with(argv, SSHFS_MOUNT_TIMEOUT, &PROJECTION_SHUTDOWN, || {
         run_unmount_bounded(&SshPlacement::sshfs_unmount_argv(mountpoint))
     })
 }
@@ -389,6 +407,16 @@ fn run_sshfs_mount(argv: &[String], mountpoint: &str) -> Result<()> {
 fn run_mount_bounded(
     argv: &[String],
     timeout: std::time::Duration,
+    rollback: impl FnOnce() -> Result<()>,
+) -> Result<()> {
+    let never = std::sync::atomic::AtomicBool::new(false);
+    run_mount_bounded_with(argv, timeout, &never, rollback)
+}
+
+fn run_mount_bounded_with(
+    argv: &[String],
+    timeout: std::time::Duration,
+    cancel: &std::sync::atomic::AtomicBool,
     rollback: impl FnOnce() -> Result<()>,
 ) -> Result<()> {
     if argv.is_empty() {
@@ -420,8 +448,13 @@ fn run_mount_bounded(
         .map_err(|error| anyhow::anyhow!("{} failed: could not run: {error}", argv[0]))?;
     let deadline = started + timeout;
     let mut interval = thegn_proc::POLL_INTERVAL;
+    let mut cancelled = false;
 
     loop {
+        if cancel.load(std::sync::atomic::Ordering::Acquire) {
+            cancelled = true;
+            break;
+        }
         match child.try_wait() {
             Ok(Some(status)) if status.success() => return Ok(()),
             Ok(Some(status)) => {
@@ -467,6 +500,16 @@ fn run_mount_bounded(
         Err(error) => Some(error),
     };
     let wait_result = child.wait();
+    if cancelled {
+        // Roll back (never-cancel unmount) so a half-made mount does not linger.
+        let _ = rollback();
+        return Err(anyhow::Error::new(TransportError {
+            program: argv[0].clone(),
+            error: thegn_proc::ProcError::Cancelled,
+            timeout,
+            stderr_tail: stderr_tail(stderr_reader).unwrap_or_default(),
+        }));
+    }
     let mut message = format!(
         "{} failed: timed out after {}s",
         argv[0],
@@ -538,11 +581,11 @@ const RSYNC_PULL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3
 const RSYNC_PUSH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30 * 60);
 
 fn run_rsync_pull(argv: &[String]) -> Result<()> {
-    run_bounded(argv, RSYNC_PULL_TIMEOUT)
+    run_bounded_with(argv, RSYNC_PULL_TIMEOUT, &PROJECTION_SHUTDOWN)
 }
 
 fn run_rsync_push(argv: &[String]) -> Result<()> {
-    run_bounded(argv, RSYNC_PUSH_TIMEOUT)
+    run_bounded_with(argv, RSYNC_PUSH_TIMEOUT, &PROJECTION_SHUTDOWN)
 }
 
 /// `rsync -e` transport flag carrying the placement's ssh knobs.
@@ -1327,6 +1370,110 @@ mod tests {
         );
 
         assert!(result.unwrap_err().to_string().contains("could not run"));
+    }
+
+    #[test]
+    fn bounded_with_cancel_flag_returns_cancelled_quickly() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let flag = std::sync::Arc::new(AtomicBool::new(false));
+        let setter = std::sync::Arc::clone(&flag);
+        let handle = std::thread::Builder::new()
+            .name("thegn-pcancel".into())
+            .spawn(move || {
+                std::thread::sleep(std::time::Duration::from_millis(200));
+                setter.store(true, Ordering::Release);
+            })
+            .expect("spawn canceller");
+        let started = std::time::Instant::now();
+        let result = run_bounded_with(
+            &["sleep".into(), "30".into()],
+            std::time::Duration::from_secs(30),
+            &flag,
+        );
+        handle.join().expect("canceller joins");
+        let error = result.expect_err("cancelled run fails");
+        let transport = error
+            .downcast_ref::<TransportError>()
+            .expect("typed transport error");
+        assert!(matches!(transport.error, thegn_proc::ProcError::Cancelled));
+        assert!(started.elapsed() < std::time::Duration::from_secs(1));
+    }
+
+    #[test]
+    fn bounded_with_cancel_leaves_no_descendant() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let dir = tempfile::tempdir().expect("tempdir");
+        let pid_file = dir.path().join("descendant.pid");
+        let script = format!("sleep 30 & echo $! > {}; wait", pid_file.display());
+        let flag = std::sync::Arc::new(AtomicBool::new(false));
+        let setter = std::sync::Arc::clone(&flag);
+        let watch = pid_file.clone();
+        let handle = std::thread::Builder::new()
+            .name("thegn-pcancel".into())
+            .spawn(move || {
+                for _ in 0..200 {
+                    if watch.exists() {
+                        break;
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(10));
+                }
+                std::thread::sleep(std::time::Duration::from_millis(100));
+                setter.store(true, Ordering::Release);
+            })
+            .expect("spawn canceller");
+        let result = run_bounded_with(
+            &["sh".into(), "-c".into(), script],
+            std::time::Duration::from_secs(30),
+            &flag,
+        );
+        handle.join().expect("canceller joins");
+        assert!(result.is_err());
+        let pid: u32 = std::fs::read_to_string(&pid_file)
+            .expect("pid recorded")
+            .trim()
+            .parse()
+            .expect("numeric pid");
+        let mut gone = false;
+        for _ in 0..100 {
+            if transport_error_descendant_gone_or_zombie(pid) {
+                gone = true;
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        assert!(gone, "a cancelled run must not leave its descendant");
+    }
+
+    #[test]
+    fn bounded_with_unset_flag_still_times_out() {
+        let never = std::sync::atomic::AtomicBool::new(false);
+        let result = run_bounded_with(
+            &["sleep".into(), "30".into()],
+            std::time::Duration::from_millis(300),
+            &never,
+        );
+        assert!(result.unwrap_err().to_string().contains("timed out"));
+    }
+
+    #[test]
+    fn mount_with_cancel_flag_kills_rolls_back_and_reports_cancelled() {
+        let flag = std::sync::atomic::AtomicBool::new(true);
+        let rolled = std::cell::Cell::new(false);
+        let result = run_mount_bounded_with(
+            &["sleep".into(), "30".into()],
+            std::time::Duration::from_secs(30),
+            &flag,
+            || {
+                rolled.set(true);
+                Ok(())
+            },
+        );
+        let error = result.expect_err("cancelled mount fails");
+        assert!(matches!(
+            error.downcast_ref::<TransportError>().map(|e| &e.error),
+            Some(thegn_proc::ProcError::Cancelled)
+        ));
+        assert!(rolled.get());
     }
 
     #[test]

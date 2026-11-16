@@ -95,6 +95,7 @@ pub(crate) fn signal_all() {
     custom_git().signal();
     crate::ci_refresh::cancel_for_shutdown();
     crate::actions::cancel_ci_detail_for_shutdown();
+    thegn_svc::projection::cancel_for_shutdown();
 }
 
 pub(crate) fn wait_or_detach(deadline: Instant) -> QuitSettlement {
