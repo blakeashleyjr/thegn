@@ -647,6 +647,8 @@ mod tests {
             running: true,
             created: Some(created),
             labels,
+            size: None,
+            region: None,
         }
     }
 

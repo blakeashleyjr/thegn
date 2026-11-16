@@ -256,6 +256,8 @@ mod tests {
             running: true,
             created: None,
             labels: Default::default(),
+            size: None,
+            region: None,
         }
     }
 
