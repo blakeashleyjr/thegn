@@ -558,7 +558,7 @@ fn chip_at_hits_misses_and_edges() {
         cols,
         rows: 1,
     };
-    let spans = vec![(0usize, r(2, 4)), (2usize, r(7, 3))];
+    let spans = [(0usize, r(2, 4)), (2usize, r(7, 3))];
     assert_eq!(
         crate::masthead::chip_at(&spans, 1, 0),
         None,
