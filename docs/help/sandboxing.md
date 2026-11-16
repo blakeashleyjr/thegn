@@ -608,6 +608,32 @@ mount. With `agent_sandbox` on, a queue agent whose sandbox cannot be
 established is held; it never falls back to the host. Interactive panes are
 unchanged.
 
+### Git write policy
+
+`[sandbox.git] mode` describes what a sandboxed pane may write in the
+repository's git directory: `read-only`, `commit-only` (the default: the
+object store, the worktree's own metadata and the lane branch's ref directory
+such as `refs/heads/tg/`, with `main`, tags, hooks and config kept
+read-only), `push-lane` or `full`. `push_refs` and `deny_refs` take ref globs
+with a trailing `/*` (one level) or `/**` (any depth), and the merge target
+and default branches are always denied. Only `refs/heads/` branches are
+accepted back from a sandbox. Set it globally or per `[env.<name>.sandbox.git]`; a
+repository's `.thegn.toml` cannot set it. The keys are validated today; the
+sandbox mounts that enforce them arrive in a later release.
+
+Sandboxed and remote agents get no GitHub token by default: credentials stay
+with thegn. With the default `credential = "none"`, `GH_TOKEN` and
+`GITHUB_TOKEN` are not passed into sandboxes or provider provisioning even
+though the default `[sandbox] env_passthrough` lists them (nor are
+`GH_ENTERPRISE_TOKEN`, `GITHUB_ENTERPRISE_TOKEN`, `GITLAB_TOKEN` and
+`GL_TOKEN`), and provisioning
+does not install a git token credential helper. Only `mode = "full"` with
+`credential = "repo-token"` or `"user-token"` passes the host token through.
+`ANTHROPIC_API_KEY` and other agent credentials are unaffected. The other
+credential modes (`deploy-key`, `github-app`) are not implemented yet. Only
+environment variables are filtered: a `gh` or `glab` config (with its stored
+token) that reaches the sandbox through `[sandbox.home]` dotfiles is not.
+
 ## Choosing per worktree
 
 The `Alt-w` "what to run" picker offers the sandbox choice when
