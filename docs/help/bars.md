@@ -26,13 +26,13 @@ first); `Esc` returns to the center.
 
 The brand block and the app-tab chips on the left, and the
 **stats cluster** on the right: the `[bars] top_right` widgets — by default
-`cpu`, `mem`, `disk`, `gpu`, `temp`, `net`, `battery`, `weather`, `date`,
-`clock`. With
+`cpu`, `mem`, `disk`, `gpu`, `temp`, `net`, `battery`, `weather`, `fleet`,
+`date`, `clock`. With
 the bar focused, `←/→` walks the stats and `↵` opens the stat's history popup
 — `Esc`, `q`, or a click outside dismisses it. Clicking the empty right half
 of the bar cycles the `[stats] refresh_rates` cadence. The cluster sheds
 stats softest-first as the terminal narrows, `date` first, then `weather`,
-and `clock` among the last to go — so the
+then `fleet`, and `clock` among the last to go — so the
 calendar stays reachable from the bar even on a cramped terminal; the brand
 and the active app chip always keep their cells.
 
@@ -67,6 +67,25 @@ a `WEATHER` block carries the full reading. A reading past
 caveat, not an alert — and past `hard_expiry_secs` the widget disappears
 entirely rather than show yesterday's sky. See
 [the calendar page](calendar.md) for the popup block.
+
+The `fleet` widget shows the estimated hourly burn of your provider VMs
+(`$0.46/h`), from the same read as `thegn fleet list`: every API-provider
+`[env.*]` (fly, sprites, hetzner, digitalocean, daytona, machine0) is
+inventoried and each VM is priced from the bundled price table or your
+`[placement.price]` overrides. `+N` counts VMs with no known price. It turns
+amber with a warning mark when a VM has no worktree (an orphan) or a
+worktree's recorded VM is no longer listed by its provider. Clicking it opens
+the **fleet** popup: each VM's provider and env, id, state, size, `$/h`,
+accrued cost, worktree (or `ORPHAN`) and age, then the totals (per-provider
+hourly, today, month to date, and the next 24 h / 30 d at the current burn),
+any env that could not be read, and the CLI commands to stop
+(`thegn env down --stop <worktree>`) or destroy (`thegn env down <worktree>`)
+one. Every amount is an estimate, not a bill. The widget is read-only and
+inert by default: it costs nothing and draws nothing until an API-provider env
+exists and `fleet` is in a bar. Then it reads 15 seconds after launch and
+every 5 minutes while a VM runs or the popup is open, and every 30 minutes
+otherwise. Adding your first provider env takes effect at the next bars
+reload or restart.
 
 Their format strings are `[bars] date_format` and `clock_format` (chrono
 strftime). Both are checked when config loads, so a typo warns and falls back to
