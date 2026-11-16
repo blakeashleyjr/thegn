@@ -18,6 +18,15 @@ use crate::sidebar::{PluginFieldValue, RowKind, SidebarRow};
 /// `(plugin, field)` to the slot its `WorktreeField` contribution declared.
 pub(crate) type FieldSlots = BTreeMap<(String, String), RowFieldSlot>;
 
+/// The row-store keys a worktree's values may be stored under, in lookup
+/// order: its absolute path first, then its branch name (absent for a
+/// detached HEAD or an empty name). Shared by the sidebar projection and the
+/// `until_scan` drop so the two cannot disagree about which values belong to
+/// a worktree.
+pub(crate) fn row_store_keys<'a>(path: &'a str, branch: Option<&'a str>) -> [Option<&'a str>; 2] {
+    [Some(path), branch.filter(|branch| !branch.is_empty())]
+}
+
 /// Resolve every worktree row's plugin values, write them onto
 /// `row.plugin_fields` (clearing stale values on rows with none), and return
 /// the path-keyed map stored as `SidebarStatus::plugin_fields`.
@@ -40,9 +49,10 @@ pub(crate) fn project_plugin_fields(
             .as_deref()
             .filter(|branch| !branch.is_empty())
             .unwrap_or(&row.label);
+        let keys = row_store_keys(path, Some(branch));
         let mut values = Vec::new();
         for ((plugin, field), worktrees) in snapshot {
-            let Some(value) = worktrees.get(path).or_else(|| worktrees.get(branch)) else {
+            let Some(value) = keys.iter().flatten().find_map(|key| worktrees.get(*key)) else {
                 continue;
             };
             let Some(slot) = slots.get(&(plugin.clone(), field.clone())).copied() else {
@@ -88,6 +98,8 @@ mod tests {
         RowValue {
             text: text.to_string(),
             role: RowRole::Good,
+            expires_at: None,
+            until_scan: false,
         }
     }
 
@@ -158,6 +170,16 @@ mod tests {
         let projected = project_plugin_fields(&mut rows, &snap, &slots);
         assert!(!projected.contains_key("feat/a"));
         assert_eq!(texts(&projected["/wt/a"]), vec!["passing"]);
+    }
+
+    #[test]
+    fn row_store_keys_are_path_then_nonempty_branch() {
+        assert_eq!(
+            row_store_keys("/wt/a", Some("feat/a")),
+            [Some("/wt/a"), Some("feat/a")]
+        );
+        assert_eq!(row_store_keys("/wt/a", Some("")), [Some("/wt/a"), None]);
+        assert_eq!(row_store_keys("/wt/a", None), [Some("/wt/a"), None]);
     }
 
     #[test]

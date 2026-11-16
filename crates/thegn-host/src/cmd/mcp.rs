@@ -121,10 +121,10 @@ pub enum Action {
         /// The default `read` enables only the listing/observing tools
         /// (`sessions_list`, `worktrees_list`, `worktrees_sandbox_profile`, `git_status`,
         /// `merge_list`, `pr_status`, `leases_list`, `me`,
-        /// `agent_sessions`, `sessions_wait`, `semantic_map`,
+        /// `agent_sessions`, `sessions_wait`, `sessions_snapshot`, `semantic_map`,
         /// `semantic_blast_radius`); the mutating tools (`sessions_open`,
-        /// `sessions_input`, `sessions_kill`, `sessions_resize`, `worktrees_open`,
-        /// `notify_push`) additionally need
+        /// `sessions_input`, `sessions_kill`, `sessions_resize`, `sessions_split`,
+        /// `worktrees_open`, `notify_push`) additionally need
         /// `write`, `folders_assign` needs `git`, and `merge_add` needs
         /// `git`. Pass
         /// `none` (or any empty/unknown set) to serve docs tools only.
@@ -453,30 +453,60 @@ fn allowed_state_caps(
 /// The state tools' clean no-daemon answer (the JSON-RPC error message).
 const NO_DAEMON: &str = "daemon not reachable — start thegn or `thegn daemon`";
 
-/// Control-route params for `sessions.resize` / `worktrees.open` from the
-/// already-validated MCP arguments. Resize renames the MCP `session` argument
-/// to the route's `{s}` path parameter and refuses a dimension over the
-/// daemon's shared PTY bound (`MAX_PTY_ROWS` x `MAX_PTY_COLS`, which the daemon
-/// enforces too) before any daemon round-trip; `worktrees.open` passes
+/// Control-route params for the routed state tools (`sessions.resize`,
+/// `sessions.snapshot`, `sessions.split`, `worktrees.open`) from the
+/// already-validated MCP arguments. The session tools rename the MCP `session`
+/// argument to the route's `{s}` path parameter. Resize (and split's optional
+/// `rows`/`cols`) refuse a dimension over the daemon's shared PTY bound
+/// (`MAX_PTY_ROWS` x `MAX_PTY_COLS`, which the daemon enforces too) before any
+/// daemon round-trip; split also checks `dir` against `SplitDir` and turns the
+/// `env` object into the body's `[name, value]` pairs. `worktrees.open` passes
 /// `OpenWorktreeBody`'s `repo`/`branch` through unchanged. Pure.
-fn resize_open_params(
+fn routed_params(
     cap: &str,
     args: &serde_json::Value,
 ) -> Result<serde_json::Map<String, serde_json::Value>, String> {
+    use thegn_svc::control::{MAX_PTY_COLS, MAX_PTY_ROWS};
     let mut params = args.as_object().cloned().unwrap_or_default();
-    if cap == "sessions.resize" {
+    if matches!(
+        cap,
+        "sessions.resize" | "sessions.snapshot" | "sessions.split"
+    ) {
         let session = params.remove("session").ok_or("missing `session`")?;
-        use thegn_svc::control::{MAX_PTY_COLS, MAX_PTY_ROWS};
+        params.insert("s".into(), session);
+    }
+    if matches!(cap, "sessions.resize" | "sessions.split") {
         for (key, max) in [("rows", MAX_PTY_ROWS), ("cols", MAX_PTY_COLS)] {
-            let fits = params
-                .get(key)
+            let present = params.get(key);
+            // Resize requires both; split's are optional (0 inherits).
+            if present.is_none() && cap == "sessions.split" {
+                continue;
+            }
+            let fits = present
                 .and_then(serde_json::Value::as_u64)
                 .is_some_and(|n| n <= u64::from(max));
             if !fits {
                 return Err(format!("`{key}` must be an integer from 0 to {max}"));
             }
         }
-        params.insert("s".into(), session);
+    }
+    if cap == "sessions.split" {
+        if let Some(dir) = params.get("dir")
+            && !matches!(dir.as_str(), Some("right" | "down"))
+        {
+            return Err("`dir` must be `right` or `down`".into());
+        }
+        if let Some(env) = params.get("env") {
+            let map = env.as_object().ok_or("`env` must be an object")?;
+            let mut pairs = Vec::with_capacity(map.len());
+            for (k, v) in map {
+                let v = v
+                    .as_str()
+                    .ok_or_else(|| format!("env value for `{k}` must be a string"))?;
+                pairs.push(serde_json::json!([k, v]));
+            }
+            params.insert("env".into(), serde_json::Value::Array(pairs));
+        }
     }
     Ok(params)
 }
@@ -760,8 +790,9 @@ async fn fetch_state(
         // Reversible writes routed generically through the control catalog,
         // under the same `write` scope the HTTP and plugin paths require (no
         // extra interlock: neither sends input nor creates anything on disk).
-        "sessions.resize" | "worktrees.open" => {
-            let params = resize_open_params(cap, args)?;
+        // `sessions.snapshot` is a read: same `read` scope as HTTP and plugins.
+        "sessions.resize" | "sessions.snapshot" | "sessions.split" | "worktrees.open" => {
+            let params = routed_params(cap, args)?;
             let c = client.map_err(|_| NO_DAEMON.to_string())?;
             let (method, path, body) = thegn_svc::control::routes::build_call(cap, params)?;
             c.call_raw(method, &path, body)
@@ -1070,7 +1101,7 @@ mod tests {
     use super::allowed_state_caps;
     use super::explain_key;
     use super::host_install_choice;
-    use super::resize_open_params;
+    use super::routed_params;
     use thegn_core::control::ScopeSet;
 
     const READ_CAPS: &[&str] = &[
@@ -1092,6 +1123,7 @@ mod tests {
         "dispatches.list",
         "agent.sessions",
         "sessions.wait",
+        "sessions.snapshot",
         "semantic.map",
         "semantic.blast_radius",
         "automations.list",
@@ -1134,7 +1166,7 @@ mod tests {
             sorted(READ_CAPS.to_vec()),
             "--scopes read"
         );
-        assert_eq!(READ_CAPS.len(), 22);
+        assert_eq!(READ_CAPS.len(), 23);
     }
 
     #[test]
@@ -1209,9 +1241,75 @@ mod tests {
     }
 
     #[test]
+    fn sessions_snapshot_is_read_and_split_needs_write() {
+        assert!(READ_CAPS.contains(&"sessions.snapshot"));
+        assert!(!READ_CAPS.contains(&"sessions.split"));
+        // Snapshot: read alone grants it, with or without the input interlock.
+        for flag in [false, true] {
+            assert!(
+                allowed_state_caps(ScopeSet::parse("read"), flag).contains(&"sessions.snapshot")
+            );
+        }
+        assert!(!allowed_state_caps(ScopeSet::parse("none"), false).contains(&"sessions.snapshot"));
+        // Split: write only, no MCP-only interlock (it sends no input).
+        for scopes in ["read", "git", "merge_add", "read,git", "exec"] {
+            assert!(
+                !allowed_state_caps(ScopeSet::parse(scopes), true).contains(&"sessions.split"),
+                "--scopes {scopes} must not grant sessions.split"
+            );
+        }
+        for (scopes, flag) in [("write", false), ("read,write", true)] {
+            assert!(allowed_state_caps(ScopeSet::parse(scopes), flag).contains(&"sessions.split"));
+        }
+    }
+
+    #[test]
+    fn snapshot_and_split_params_fill_the_route_path_and_validate_the_body() {
+        let params = routed_params(
+            "sessions.snapshot",
+            &serde_json::json!({ "session": "a/b" }),
+        )
+        .unwrap();
+        let (method, path, body) =
+            thegn_svc::control::routes::build_call("sessions.snapshot", params).unwrap();
+        assert_eq!(method, "GET");
+        assert_eq!(path, "/v1/sessions/a%2Fb/snapshot");
+        assert!(body.is_none());
+        assert!(routed_params("sessions.snapshot", &serde_json::json!({})).is_err());
+
+        let args = serde_json::json!({
+            "session": "s1", "dir": "down", "argv": ["sh"], "cwd": "/w",
+            "env": { "A": "1" }, "rows": 30, "cols": 100
+        });
+        let params = routed_params("sessions.split", &args).unwrap();
+        let (method, path, body) =
+            thegn_svc::control::routes::build_call("sessions.split", params).unwrap();
+        assert_eq!(method, "POST");
+        assert_eq!(path, "/v1/sessions/s1/split");
+        assert_eq!(
+            body.unwrap(),
+            serde_json::json!({
+                "dir": "down", "argv": ["sh"], "cwd": "/w",
+                "env": [["A", "1"]], "rows": 30, "cols": 100
+            })
+        );
+        // Only `session` is required.
+        assert!(routed_params("sessions.split", &serde_json::json!({ "session": "s" })).is_ok());
+        for bad in [
+            serde_json::json!({ "session": "s", "dir": "left" }),
+            serde_json::json!({ "session": "s", "rows": 1001 }),
+            serde_json::json!({ "session": "s", "cols": -1 }),
+            serde_json::json!({ "session": "s", "env": { "A": 1 } }),
+            serde_json::json!({ "dir": "down" }),
+        ] {
+            assert!(routed_params("sessions.split", &bad).is_err(), "{bad}");
+        }
+    }
+
+    #[test]
     fn resize_params_fill_the_route_path_and_open_params_mirror_the_body() {
         let args = serde_json::json!({ "session": "a/b", "rows": 40, "cols": 120 });
-        let params = resize_open_params("sessions.resize", &args).unwrap();
+        let params = routed_params("sessions.resize", &args).unwrap();
         let (method, path, body) =
             thegn_svc::control::routes::build_call("sessions.resize", params).unwrap();
         assert_eq!(method, "POST");
@@ -1228,15 +1326,12 @@ mod tests {
             serde_json::json!({ "session": "s", "rows": 1001, "cols": 80 }),
             serde_json::json!({ "rows": 24, "cols": 80 }),
         ] {
-            assert!(
-                resize_open_params("sessions.resize", &bad).is_err(),
-                "{bad}"
-            );
+            assert!(routed_params("sessions.resize", &bad).is_err(), "{bad}");
         }
 
         let at_bound = serde_json::json!({ "session": "s", "rows": 1000, "cols": 1000 });
-        assert!(resize_open_params("sessions.resize", &at_bound).is_ok());
-        let err = resize_open_params(
+        assert!(routed_params("sessions.resize", &at_bound).is_ok());
+        let err = routed_params(
             "sessions.resize",
             &serde_json::json!({ "session": "s", "rows": 24, "cols": 1001 }),
         )
@@ -1244,7 +1339,7 @@ mod tests {
         assert_eq!(err, "`cols` must be an integer from 0 to 1000");
 
         let args = serde_json::json!({ "repo": "/repo", "branch": "main" });
-        let params = resize_open_params("worktrees.open", &args).unwrap();
+        let params = routed_params("worktrees.open", &args).unwrap();
         let (method, path, body) =
             thegn_svc::control::routes::build_call("worktrees.open", params).unwrap();
         assert_eq!(method, "POST");
