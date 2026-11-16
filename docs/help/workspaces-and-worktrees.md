@@ -136,6 +136,34 @@ closes. Both are asynchronous and never delay pane creation or tab close. See
 [[configuration]] for the event lists, working directories, environment, and
 repo trust behavior.
 
+### Provider sandboxes
+
+`thegn env down` on a provider environment first pulls the sandbox's commits
+back, as `thegn env pull` does. If the branch fast-forwards or is already up to
+date, the sandbox is destroyed. If the sandbox head diverged, or the local
+checkout has uncommitted changes, the sandbox head is kept in
+`refs/thegn/pull/<worktree>` for you to merge, and the sandbox is still
+destroyed. If the pull-back fails (the sandbox is unreachable, the worktree is
+not on a branch, or the `[sandbox.git]` policy refuses it), nothing is
+destroyed; `--force` destroys anyway, and commits that were not pulled back are
+lost.
+
+`thegn env down --stop` pulls back the same way, then parks the sandbox
+instead of destroying it: `fly` stops the machine and `machine0` suspends the
+VM. The worktree keeps its sandbox, and `thegn env up` resumes it. Other
+providers have no stop, so `--stop` refuses and the sandbox keeps running.
+
+When the daemon's last session for a provider worktree exits, the daemon pulls
+the sandbox's commits back once in the background. A kept ref or a failed
+pull-back is reported as an automation event.
+
+`thegn env show` reports the worktree's stored location, its recorded sandbox
+and whether this machine provisioned it (a local marker, no network call), and
+the effective `[sandbox.git]` mode, transport and credential with what the
+sandbox may write under that mode. `thegn env set` refuses an environment that
+only the dev channel defines while the running daemon is on the stable
+channel.
+
 ## Switching
 
 - `Alt-↑/↓` — move to the pane above/below; at the top/bottom pane, with no
