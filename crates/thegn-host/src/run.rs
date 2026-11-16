@@ -12281,7 +12281,15 @@ async fn event_loop<T: Terminal>(
             dirty = true;
         }
         // Host-level events: view map for the Hosts UI + the consent modal.
-        let hout = host_runtime.drain(active_menu.is_some());
+        // THE-657: budgeted (HOST_UI_SOURCE, 32 per drain, lossless); leftovers
+        // re-arm the one shared wake below.
+        let mut host_budget = drain_budget(std::time::Instant::now(), !pending_input.is_empty());
+        let hout = host_runtime.drain(
+            active_menu.is_some(),
+            &mut host_budget,
+            &mut ingress_rotation,
+        );
+        let host_more = hout.more;
         if hout.dirty {
             crate::host_ui::merge_live(&mut model.panel.hosts, &host_runtime);
             dirty = true;
@@ -15889,7 +15897,8 @@ async fn event_loop<T: Terminal>(
             || prq_more
             || create_more
             || share_more
-            || forward_more)
+            || forward_more
+            || host_more)
             && let Err(e) = waker.wake()
         {
             tracing::debug!(target: "thegn::ingress", "ingress re-arm waker pulse failed: {e}");
