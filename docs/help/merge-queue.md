@@ -375,10 +375,23 @@ An installed route credential is reused only while it has at least seven days
 remaining; otherwise it is rotated. SSH reads are capped and time-limited, and
 oversized or malformed credential files are refused.
 
-Route mode requires a live `thegn serve` TCP registration and a declared
+Route-to-host merges need a live `thegn serve` TCP registration and a declared
 confidential topology: `[serve] topology = "tls-terminated"` behind a loopback
 TLS proxy, or `"tunnel"` for a trusted encrypted tunnel, with a reachable
 `advertise_host`/`advertise_port`. Plaintext direct exposure is not eligible.
+
+A missing endpoint does not block provisioning. When no live serving daemon
+exists, or the topology is plaintext, thegn finishes provisioning the
+environment without a credential. It revokes any old grant for the worktree,
+removes any stale credential file, and shows one notice per worktree. Inside
+that environment, `thegn merge add` then refuses with an error. The error tells
+you to start `thegn serve` on the host and reopen the worktree. No token is ever
+minted without a verified secure origin. The next open or reattach after
+`thegn serve` is live installs the credential.
+
+Two live daemons that advertise different origins, or an invalid `[serve]`
+config, still stop provisioning with an error.
+
 After changing the endpoint, reprovision or reattach/open the environment to
 rotate the credential. A missing endpoint/token, invalid scope, unknown
 worktree, stale registered location/branch, or failed remote branch lookup is
