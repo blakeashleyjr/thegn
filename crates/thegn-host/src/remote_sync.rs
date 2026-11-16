@@ -1156,7 +1156,7 @@ mod tests {
                 assert!(message.contains(".gitignore"), "{message}");
             }
         }
-        assert!(UNTRACKED_STREAM_LIMIT > MAX_SYNC_BYTES);
+        const { assert!(UNTRACKED_STREAM_LIMIT > MAX_SYNC_BYTES) };
     }
 
     #[test]
