@@ -1,5 +1,10 @@
 pub use std::process::ExitStatus;
-use std::{io, process::Command, sync::atomic::AtomicBool, time::Duration};
+use std::{
+    io,
+    process::{ChildStdin, Command},
+    sync::atomic::AtomicBool,
+    time::Duration,
+};
 
 #[cfg(not(unix))]
 mod fallback;
@@ -349,6 +354,40 @@ pub fn run_consuming_streams(
     #[cfg(not(unix))]
     {
         fallback::run_consuming_streams(cmd, limits, cancel, consume)
+    }
+}
+
+/// Receives a run's live stdin pipe once, right after spawn. See
+/// [`run_consuming_streams_with_stdin`].
+pub type StdinHandoff<'a> = &'a mut dyn FnMut(ChildStdin);
+
+/// Like [`run_consuming_streams`], but stdin is a pipe handed to the caller instead of null.
+///
+/// Right after a successful spawn (Unix: with the process group already set up) the runner calls
+/// `on_stdin(stdin)` exactly once on the calling thread and keeps no handle of its own. On spawn
+/// failure `on_stdin` is never called and the run ends exactly as [`run`] would. The runner then
+/// supervises exactly like [`run_consuming_streams`]: same limits, cancel, kill escalation, reap
+/// and wall-time bound (timeout + term_grace + 2 * kill_settle + reader_grace + one BACKOFF_CAP).
+///
+/// The caller owns stdin and its lifetime. `on_stdin` must return promptly (move the pipe into a
+/// writer thread, or write a payload small enough for the pipe buffer): output is only drained
+/// once it returns. The runner never waits for stdin to close, so holding it open past the run is
+/// harmless. A writer must expect `BrokenPipe` (EPIPE) once the child closes stdin or the group is
+/// signalled; this relies on SIGPIPE being ignored, which Rust's std main does.
+pub fn run_consuming_streams_with_stdin(
+    cmd: &mut Command,
+    limits: &Limits,
+    cancel: &AtomicBool,
+    on_stdin: StdinHandoff<'_>,
+    consume: StreamConsumer<'_>,
+) -> Run {
+    #[cfg(unix)]
+    {
+        unix::run_consuming_streams_with_stdin(cmd, limits, cancel, on_stdin, consume)
+    }
+    #[cfg(not(unix))]
+    {
+        fallback::run_consuming_streams_with_stdin(cmd, limits, cancel, on_stdin, consume)
     }
 }
 
