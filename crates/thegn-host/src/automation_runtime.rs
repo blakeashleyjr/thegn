@@ -429,6 +429,65 @@ fn enrich_event(db: &thegn_core::db::Db, event: &mut AutomationEvent) {
     }
 }
 
+/// THE-2021: after the last daemon session of a provider-located worktree
+/// exits, pull the sandbox's commits back once, on the blocking pool (never
+/// the event task). Single-flight per worktree. The summary goes to
+/// `thegn::git_audit`; a kept ref or a failure is also submitted as one
+/// automation fact.
+fn spawn_exit_pull_back(boot: &Arc<Config>, worktree: &str, other_live_sessions: usize) {
+    if other_live_sessions > 0 {
+        return;
+    }
+    let boot = Arc::clone(boot);
+    let worktree = worktree.to_string();
+    tokio::task::spawn_blocking(move || {
+        use thegn_core::store::WorkspaceStore;
+        let flight = crate::provider_git::try_begin_pull(&worktree);
+        let location_is_provider = thegn_core::db::Db::open()
+            .and_then(|db| db.location_for(&worktree))
+            .is_ok_and(|stored| {
+                crate::provider_git::is_provider_location(&worktree, stored.as_deref())
+            });
+        if !crate::provider_git::should_pull_on_exit(
+            location_is_provider,
+            other_live_sessions,
+            flight.is_none(),
+        ) {
+            return;
+        }
+        // The currently admitted config (hot reloads included), else boot.
+        let admitted = crate::config_startup::display();
+        let cfg = admitted.as_deref().map_or(boot.as_ref(), |a| a.config());
+        let notice = match crate::provider_git::pull_back_if_provider(cfg, &worktree) {
+            Ok(None) => None,
+            Ok(Some(report)) => {
+                tracing::info!(target: "thegn::git_audit", worktree = %worktree, summary = %report.summary(), "session-exit pull-back");
+                match &report.outcome {
+                    crate::provider_git::PullOutcome::Diverged { kept_ref, .. }
+                    | crate::provider_git::PullOutcome::LocalDirty { kept_ref } => {
+                        Some(format!("pull-back kept {kept_ref}: {}", report.summary()))
+                    }
+                    _ => None,
+                }
+            }
+            Err(error) => {
+                tracing::warn!(target: "thegn::git_audit", worktree = %worktree, error = %format!("{error:#}"), "session-exit pull-back failed");
+                Some(format!("pull-back failed: {error:#}"))
+            }
+        };
+        drop(flight);
+        if let Some(notice) = notice {
+            crate::automation_events::submit_fact(
+                thegn_core::automation::AutomationEventKind::Notification,
+                format!("worktree:{worktree}:pull-back"),
+                Some(worktree.clone()),
+                Some(bounded(&notice)),
+                crate::automation_events::EventFacts::default(),
+            );
+        }
+    });
+}
+
 /// Subscribe once at the daemon service edge. Activity transitions are already
 /// coalesced by `SessionActor`; this adapter never inspects PTY text.
 pub fn subscribe_daemon_events(
@@ -447,6 +506,7 @@ pub fn subscribe_daemon_events(
         .filter(|rule| rule.enabled && rule.event == AutomationEventKind::WorktreeIdle)
         .filter_map(|rule| rule.idle_secs.map(|after| (rule.id, after)))
         .collect();
+    let boot = Arc::new(cfg.clone());
     tokio::spawn(async move {
         let mut sessions = BTreeMap::<String, (Option<String>, bool, String)>::new();
         let mut idle_deadlines = BTreeMap::<
@@ -499,6 +559,10 @@ pub fn subscribe_daemon_events(
                             let (worktree, error_was_active, final_state) = sessions
                                 .remove(session)
                                 .map_or((None, false, String::new()), |(worktree, error, state)| (worktree, error, state));
+                            if let Some(wt) = worktree.as_deref() {
+                                let others = sessions.values().filter(|(other, _, _)| other.as_deref() == Some(wt)).count();
+                                spawn_exit_pull_back(&boot, wt, others);
+                            }
                             let origin = take_session_origin(session);
                             let succeeded = code.unwrap_or(1) == 0;
                             if !((succeeded && final_state == "done") || (!succeeded && error_was_active)) {

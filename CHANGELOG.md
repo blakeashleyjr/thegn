@@ -7,6 +7,39 @@ All notable changes to **thegn** are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.1.0-alpha.89] — 2026-11-16
+
+### Added
+
+- Theme Builder gains an element view and a live palette picker. (THE-2023)
+- Clicking the masthead `cpu`/`mem` widget shows CPU and memory by project, worktree and pane. (THE-2025)
+- The MCP server gains `issues_update` and `issues_comment`. (THE-203)
+- A masthead `fleet` widget shows the estimated hourly burn of provider VMs; clicking it opens a fleet popup with per-VM cost estimates. (THE-2020)
+- The CPU breakdown attributes merge-queue gate and agent handoff work to the worktree that owns it. (THE-2036)
+- The Theme Builder preview highlights the samples a selected color paints, and catalog rows carry palette swatches. (THE-2023)
+- `[sandbox.git] credential = "deploy-key"` with `deploy_key = "<path>"` mounts that key read-only into local sandboxes; the default stays no credential. (THE-2021)
+
+### Changed
+
+- Config reloads apply refresh cadences, notification routing, panel/help/media and automation changes through named hooks and say so; cadence keys no longer report "restart required". (THE-2024)
+- `thegn env down` pulls commits back first and refuses on a failed pull unless `--force`; `--stop` parks the sandbox instead of destroying it. (THE-2019, THE-2021)
+- Provider sessions pull their commits back automatically when the last session exits. (THE-2021)
+- `thegn env set` refuses a dev-only env against a stable daemon, and `thegn env show` reports the sandbox, location and git policy. (THE-2007, THE-2009)
+- The voice worker runs under thegn-proc supervision. (THE-729)
+- `thegn session list` prints `exited(<code>)` and `last:<state>` unless the final state was `done`; scripts that parse it should expect the extra fields. (THE-2012)
+- `thegn doctor` lists provider reaper holds, and notification priority/mode warnings and Home Manager options were added. (THE-530, THE-428)
+- `thegn fleet` lists typed size, region and state for every provider and finds Fly apps missing from the ledger. (THE-2020)
+- `watch.pr_interval_secs` now sets the PR refresh cadence and applies live. (THE-2035)
+- The monitor's disk and gpu rows use the minicore layout and stay inside the devices panel. (THE-842)
+- Local podman/docker sandbox policy changed, so existing local OCI sandbox containers are recreated once after upgrading.
+
+### Fixed
+
+- Pane output no longer re-parses a 64 KiB tail per chunk for preview port hints. (THE-2000)
+- A sandbox bind whose destination is a symlink (such as a HOME-swapped `~/.claude/projects`) no longer stops bwrap; sandboxed commits carry the host's git identity.
+- Local podman/docker sandboxes mask the user bus and runtime sockets like bwrap does. (THE-2009)
+- Remote OCI sync has time budgets and kills the whole process group when the copier overruns. (THE-1994)
+
 ## [0.1.0-alpha.88] — 2026-11-16
 
 ### Added
@@ -3645,7 +3678,8 @@ launcher picker and the merge queue's `agent_command` hook remain — they run
 whatever commands you configure. Leftover `[llm_proxy]` config sections and
 `proxy_*` tables in existing state databases are ignored harmlessly.
 
-[Unreleased]: https://github.com/blakeashleyjr/thegn/compare/v0.1.0-alpha.88...HEAD
+[Unreleased]: https://github.com/blakeashleyjr/thegn/compare/v0.1.0-alpha.89...HEAD
+[0.1.0-alpha.89]: https://github.com/blakeashleyjr/thegn/compare/v0.1.0-alpha.88...v0.1.0-alpha.89
 [0.1.0-alpha.88]: https://github.com/blakeashleyjr/thegn/compare/v0.1.0-alpha.87...v0.1.0-alpha.88
 [0.1.0-alpha.87]: https://github.com/blakeashleyjr/thegn/compare/v0.1.0-alpha.86...v0.1.0-alpha.87
 [0.1.0-alpha.86]: https://github.com/blakeashleyjr/thegn/compare/v0.1.0-alpha.85...v0.1.0-alpha.86

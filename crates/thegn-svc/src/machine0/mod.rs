@@ -1259,6 +1259,17 @@ impl RemoteProvider for Machine0Provider {
     }
 }
 
+impl Machine0Provider {
+    /// The typed `thegn fleet` inventory: one unpaged `vm_list` call, parsed
+    /// by [`parse_vm_infos`] (complete or an error, like [`RemoteProvider::list`]).
+    pub async fn sandbox_inventory(&self) -> Result<crate::provider::InventoryReport> {
+        let v = self.call(tool::VM_LIST, json!({})).await?;
+        Ok(crate::provider::InventoryReport::Complete(parse_vm_infos(
+            &v,
+        )?))
+    }
+}
+
 impl ProviderFiles for Machine0Provider {
     fn read<'a>(&'a self, id: &'a str, path: &'a str) -> BoxFuture<'a, Result<Vec<u8>>> {
         Box::pin(async move { self.shim(id).await?.read(path).await })
@@ -1586,6 +1597,17 @@ fn vm_for_destroy_response(v: &Value, name: &str) -> Result<Option<Machine0Vm>> 
 /// Parse a `vm_list` response (array, or `{machines|vms|items: [...]}`) into
 /// names (falling back to ids). Refuses unknown shapes and unidentifiable rows.
 pub fn parse_vm_list(v: &Value) -> Result<Vec<String>> {
+    Ok(parse_vm_infos(v)?.into_iter().map(|row| row.id).collect())
+}
+
+/// The typed `vm_list` view for `thegn fleet`: the same envelope and row
+/// refusals as [`parse_vm_list`] (whose ids these rows carry), plus the
+/// optional `status|state`, `size|plan|type`, `region|location` and
+/// `created_at|createdAt` (RFC 3339 or epoch) read tolerantly — an absent or
+/// wrong-typed optional field is `None`, never an error. `name` is the VM's
+/// machine0 id when it reports one.
+pub fn parse_vm_infos(v: &Value) -> Result<Vec<crate::provider::SandboxInfo>> {
+    use crate::provider::{SandboxInfo, inventory_text, inventory_time_ms};
     let rows = strict_array_field(v, &["machines", "vms", "items"]).map_err(|_| {
         anyhow!("machine0: vm_list returned an unrecognised response shape; refusing to treat it as an empty VM list")
     })?;
@@ -1610,7 +1632,14 @@ pub fn parse_vm_list(v: &Value) -> Result<Vec<String>> {
                 names.insert(name.clone()),
                 "machine0: vm_list names {name} twice"
             );
-            Ok(name)
+            Ok(SandboxInfo {
+                id: name,
+                name: id.map(str::to_string),
+                state: inventory_text(obj, &["status", "state"]),
+                size: inventory_text(obj, &["size", "plan", "type"]),
+                region: inventory_text(obj, &["region", "location"]),
+                created_at_ms: inventory_time_ms(obj, &["created_at", "createdAt"]),
+            })
         })
         .collect()
 }
@@ -2645,6 +2674,83 @@ mod tests {
             let result = parse_vm_list(&response);
             assert!(result.is_err(), "accepted response shape: {response}");
             let error = result.expect_err("response should have been rejected");
+            assert!(
+                !error.to_string().contains(&response.to_string()),
+                "error exposed response body: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn parse_vm_infos_reads_optional_fields_tolerantly() {
+        use crate::provider::SandboxInfo;
+        let rows = parse_vm_infos(&json!({ "machines": [
+            {
+                "name": "tg-full",
+                "id": "vm-1",
+                "status": "running",
+                "size": "small",
+                "region": "us-east",
+                "created_at": "2026-11-16T10:00:00Z"
+            },
+            { "vm": { "name": "tg-alt", "state": "suspended", "plan": "large",
+                      "location": "eu", "createdAt": 1_700_000_000 } },
+            { "name": "tg-ms", "type": "tiny", "created_at": 1_700_000_000_123_i64 },
+            { "name": "tg-bare" },
+            { "name": "tg-wrong", "id": 7, "status": 3, "size": ["x"],
+              "region": { "slug": "eu" }, "created_at": "yesterday" }
+        ] }))
+        .unwrap();
+        let expected_ms = chrono::DateTime::parse_from_rfc3339("2026-11-16T10:00:00Z")
+            .unwrap()
+            .timestamp_millis();
+        assert_eq!(
+            rows,
+            vec![
+                SandboxInfo {
+                    id: "tg-full".into(),
+                    name: Some("vm-1".into()),
+                    state: Some("running".into()),
+                    size: Some("small".into()),
+                    region: Some("us-east".into()),
+                    created_at_ms: Some(expected_ms),
+                },
+                SandboxInfo {
+                    id: "tg-alt".into(),
+                    state: Some("suspended".into()),
+                    size: Some("large".into()),
+                    region: Some("eu".into()),
+                    created_at_ms: Some(1_700_000_000_000),
+                    ..SandboxInfo::default()
+                },
+                SandboxInfo {
+                    id: "tg-ms".into(),
+                    size: Some("tiny".into()),
+                    created_at_ms: Some(1_700_000_000_123),
+                    ..SandboxInfo::default()
+                },
+                SandboxInfo::id_only("tg-bare"),
+                SandboxInfo::id_only("tg-wrong"),
+            ]
+        );
+        // `parse_vm_list` is the id projection of the same rows.
+        assert_eq!(
+            parse_vm_list(&json!([{ "name": "a", "status": 1 }, { "id": "b" }])).unwrap(),
+            vec!["a", "b"]
+        );
+    }
+
+    #[test]
+    fn parse_vm_infos_keeps_the_strict_refusals() {
+        for response in [
+            json!({}),
+            json!({ "data": [{ "name": "a" }] }),
+            json!({ "machines": [], "vms": [] }),
+            json!([{ "status": "running" }]),
+            json!([{ "name": "" }]),
+            json!([{ "name": "a" }, { "name": "a" }]),
+        ] {
+            let error = parse_vm_infos(&response).expect_err("response should be refused");
             assert!(
                 !error.to_string().contains(&response.to_string()),
                 "error exposed response body: {error}"

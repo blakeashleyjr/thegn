@@ -317,6 +317,7 @@ pub fn validate_diagnostics_with_policy(
             enum_value_warnings(&cfg)
                 .into_iter()
                 .chain(alert_order_warnings(&cfg))
+                .chain(notification_value_warnings(&cfg))
                 .map(|message| ValidationDiagnostic {
                     severity: ValidationSeverity::Warning,
                     message,
@@ -789,6 +790,41 @@ fn enum_value_warnings(cfg: &Config) -> Vec<String> {
         warnings.push(format!(
             "notifications.desktop_min_urgency = {urgency:?} is not one of low, normal, critical; the default is used"
         ));
+    }
+    warnings
+}
+
+/// `notifications.priority` keys/values, `active_mode` naming an undefined mode,
+/// and empty `agent_error_signatures` entries. Warnings only.
+fn notification_value_warnings(cfg: &Config) -> Vec<String> {
+    let n = &cfg.notifications;
+    let mut warnings = Vec::new();
+    for (kind, word) in &n.priority {
+        if !crate::notification::NotificationKind::ALL
+            .iter()
+            .any(|k| k.as_str() == kind)
+        {
+            warnings.push(format!(
+                "notifications.priority.{kind} is not a known notification kind; the entry is ignored"
+            ));
+        }
+        if crate::notification::Priority::parse(word).is_none() {
+            warnings.push(format!(
+                "notifications.priority.{kind} = {word:?} is not one of info, notice, alert; the kind's default is used"
+            ));
+        }
+    }
+    if !n.active_mode.is_empty() && !n.modes.contains_key(&n.active_mode) {
+        warnings.push(format!(
+            "notifications.active_mode = {:?} does not name a key of notifications.modes",
+            n.active_mode
+        ));
+    }
+    if n.agent_error_signatures.iter().any(|s| s.trim().is_empty()) {
+        warnings.push(
+            "notifications.agent_error_signatures has an empty entry; it matches every line"
+                .to_string(),
+        );
     }
     warnings
 }
@@ -2174,6 +2210,58 @@ template = "image:registry.example/dev:1"
         cfg.stats.alerts.battery.warn = 10.0;
         cfg.stats.alerts.battery.critical = 0.0;
         assert!(alert_order_warnings(&cfg).is_empty());
+    }
+
+    #[test]
+    fn notification_value_warnings_table() {
+        assert!(notification_value_warnings(&Config::default()).is_empty());
+        let cases: [(&str, usize, &str); 5] = [
+            ("[notifications.priority]\nagent_done = \"alert\"\n", 0, ""),
+            (
+                "[notifications.priority]\nbogus_kind = \"alert\"\n",
+                1,
+                "bogus_kind",
+            ),
+            (
+                "[notifications.priority]\nagent_done = \"loud\"\n",
+                1,
+                "loud",
+            ),
+            (
+                "[notifications]\nactive_mode = \"focus\"\n",
+                1,
+                "active_mode",
+            ),
+            (
+                "[notifications]\nagent_error_signatures = [\"\", \"boom\"]\n",
+                1,
+                "agent_error_signatures",
+            ),
+        ];
+        for (body, count, needle) in cases {
+            let cfg: Config = toml::from_str(body).expect("parse pretty");
+            let w = notification_value_warnings(&cfg);
+            assert_eq!(w.len(), count, "{body}: {w:?}");
+            assert!(w.iter().all(|m| m.contains(needle)), "{w:?}");
+            // Minified form parses to the same result.
+            let mini = body.replace(" = ", "=").replace(", ", ",");
+            let cfg: Config = toml::from_str(&mini).expect("parse minified");
+            assert_eq!(notification_value_warnings(&cfg).len(), count, "{mini}");
+        }
+    }
+
+    #[test]
+    fn notification_value_warnings_reach_diagnostics_as_warnings() {
+        let body = "[notifications]\nactive_mode = \"focus\"\n[notifications.priority]\nnope = \"alert\"\n";
+        let diagnostics = validate_diagnostics(body);
+        assert!(diagnostics.iter().any(
+            |d| d.severity == ValidationSeverity::Warning && d.message.contains("active_mode")
+        ));
+        assert!(
+            diagnostics
+                .iter()
+                .all(|d| d.severity != ValidationSeverity::Error)
+        );
     }
 
     #[test]

@@ -18,7 +18,7 @@ use std::collections::HashMap;
 use std::sync::{Arc, LazyLock, Mutex};
 use std::time::Duration;
 
-use thegn_svc::host::OciRunner;
+use thegn_svc::host::{OciRunner, PipeError};
 
 /// Container-internal mountpoint for a worktree materialized on a remote host.
 /// The base sandbox image creates `/workspace`, so the container path is fixed
@@ -149,6 +149,81 @@ pub(crate) fn no_backend_reason(reachable: bool, warnings: &[String]) -> String 
         "no usable backend produced a runnable sandbox".to_string()
     } else {
         warnings.join("; ")
+    }
+}
+
+/// Most untracked files one remote sync streams; past this the sync refuses.
+const MAX_SYNC_FILES: u64 = 50_000;
+/// Most bytes of untracked files, and separately of tracked diff, one remote
+/// sync streams.
+const MAX_SYNC_BYTES: u64 = 2 * 1024 * 1024 * 1024;
+/// Tar framing allowance per file (header, long-name extension, padding).
+const TAR_OVERHEAD_PER_FILE: u64 = 4096;
+/// Byte cap on the untracked-file tar stream: the scanned budget plus framing.
+/// The pre-stream scan is the refusal users see; this backstop catches files
+/// that grow between the scan and the stream.
+const UNTRACKED_STREAM_LIMIT: u64 =
+    MAX_SYNC_BYTES + MAX_SYNC_FILES * TAR_OVERHEAD_PER_FILE + 1024 * 1024;
+
+/// Untracked (not ignored) files in a local worktree and their total size.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct UntrackedSize {
+    files: u64,
+    bytes: u64,
+}
+
+/// Refuse an untracked set over [`MAX_SYNC_FILES`] or [`MAX_SYNC_BYTES`],
+/// naming the counts and the fix.
+fn untracked_budget(size: UntrackedSize) -> Result<(), String> {
+    if size.files <= MAX_SYNC_FILES && size.bytes <= MAX_SYNC_BYTES {
+        return Ok(());
+    }
+    Err(format!(
+        "remote sync refused: {} untracked files totalling {} bytes exceed the limit of {MAX_SYNC_FILES} files and {MAX_SYNC_BYTES} bytes; add build outputs and other large untracked paths to .gitignore",
+        size.files, size.bytes
+    ))
+}
+
+/// Count the worktree's untracked, non-ignored files and sum their sizes
+/// without following symlinks. Entries that vanish (or whose names are not
+/// UTF-8) count as files of size zero; the stream cap still bounds them.
+fn untracked_size(worktree: &str) -> Result<UntrackedSize, String> {
+    // off-loop: the sandbox-prepare path runs on spawn_blocking, never the loop.
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "list the local untracked files before streaming them"
+    )]
+    let out = thegn_core::util::git_cmd(std::path::Path::new(worktree))
+        .args(["ls-files", "--others", "--exclude-standard", "-z"])
+        .output()
+        .map_err(|e| format!("could not list local untracked files: {e}"))?;
+    if !out.status.success() {
+        return Err(format!(
+            "could not list local untracked files: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        ));
+    }
+    let root = std::path::Path::new(worktree);
+    let mut size = UntrackedSize::default();
+    for entry in out.stdout.split(|b| *b == 0).filter(|e| !e.is_empty()) {
+        size.files += 1;
+        if let Ok(name) = std::str::from_utf8(entry)
+            && let Ok(meta) = std::fs::symlink_metadata(root.join(name))
+        {
+            size.bytes = size.bytes.saturating_add(meta.len());
+        }
+    }
+    Ok(size)
+}
+
+/// Describe a failed working-state stream; a budget overflow names the cap
+/// and the fix.
+fn pipe_step_error(step: &str, fix: &str, error: PipeError) -> String {
+    match error {
+        PipeError::Budget { limit } => format!(
+            "{step} exceeded the remote sync budget of {limit} bytes and was aborted; {fix}"
+        ),
+        other => format!("{step}: {other}"),
     }
 }
 
@@ -443,6 +518,9 @@ fn sync_worktree_uncached(
     recursive_submodules: bool,
     warnings: &mut Vec<String>,
 ) -> Result<String, String> {
+    // 0. Refuse an oversized untracked set before touching the remote host.
+    untracked_budget(untracked_size(worktree)?)?;
+
     // 1. Claim the destination atomically. Never follow or remove an existing
     //    checkout, symlink, or interrupted attempt; those require reconciliation.
     let prep = claim_command(slug);
@@ -524,33 +602,51 @@ fn sync_worktree_uncached(
 
     // 3. Apply working state: tracked diff, then untracked files.
     if should_apply_tracked_diff(worktree)? {
-        runner.pipe_local_to_host(
-            &[
-                "git".into(),
-                "-C".into(),
-                worktree.into(),
-                "diff".into(),
-                "--binary".into(),
-                "HEAD".into(),
-            ],
-            &apply_diff_command(materialized_dir),
-            secs(180),
-        )?;
+        runner
+            .pipe_local_to_host_bounded(
+                &[
+                    "git".into(),
+                    "-C".into(),
+                    worktree.into(),
+                    "diff".into(),
+                    "--binary".into(),
+                    "HEAD".into(),
+                ],
+                &apply_diff_command(materialized_dir),
+                secs(180),
+                MAX_SYNC_BYTES,
+            )
+            .map_err(|e| {
+                pipe_step_error(
+                    "tracked diff",
+                    "commit or revert large tracked changes, then retry",
+                    e,
+                )
+            })?;
     }
-    runner.pipe_local_to_host(
-        &[
-            "bash".into(),
-            "-o".into(),
-            "pipefail".into(),
-            "-c".into(),
-            format!(
-                "git -C {wt} ls-files --others --exclude-standard -z | tar -C {wt} --null -T - -cf -",
-                wt = q(worktree),
-            ),
-        ],
-        &format!("tar -C {d} -xf -", d = q(materialized_dir)),
-        secs(180),
-    )?;
+    runner
+        .pipe_local_to_host_bounded(
+            &[
+                "bash".into(),
+                "-o".into(),
+                "pipefail".into(),
+                "-c".into(),
+                format!(
+                    "git -C {wt} ls-files --others --exclude-standard -z | tar -C {wt} --null -T - -cf -",
+                    wt = q(worktree),
+                ),
+            ],
+            &format!("tar -C {d} -xf -", d = q(materialized_dir)),
+            secs(180),
+            UNTRACKED_STREAM_LIMIT,
+        )
+        .map_err(|e| {
+            pipe_step_error(
+                "untracked files",
+                "add build outputs and other large untracked paths to .gitignore, then retry",
+                e,
+            )
+        })?;
     if !reused {
         let (ok, _out, err) = runner.host_exec(&promote_command(&staging, &dir), secs(60))?;
         if !ok {
@@ -590,9 +686,11 @@ fn sync_worktree_uncached(
 #[cfg(test)]
 mod tests {
     use super::{
-        SyncCache, apply_diff_command, apply_remote_sync_with, claim_command,
+        MAX_SYNC_BYTES, MAX_SYNC_FILES, SyncCache, UNTRACKED_STREAM_LIMIT, UntrackedSize,
+        apply_diff_command, apply_remote_sync_with, claim_command, pipe_step_error,
         plan_spec_before_ensure, promote_command, record_command, refresh_command, restore_command,
-        should_apply_tracked_diff, ssh_none_guard, sync_key, sync_once,
+        should_apply_tracked_diff, ssh_none_guard, sync_key, sync_once, untracked_budget,
+        untracked_size,
     };
     use std::process::Command;
     use std::sync::{
@@ -1037,6 +1135,80 @@ mod tests {
         std::fs::write(&tracked, "changed\n").unwrap();
         assert!(should_apply_tracked_diff(home.to_str().unwrap()).unwrap());
         std::fs::remove_dir_all(home).unwrap();
+    }
+
+    #[test]
+    fn untracked_budget_table() {
+        let size = |files, bytes| UntrackedSize { files, bytes };
+        let cases = [
+            (size(0, 0), true),
+            (size(MAX_SYNC_FILES, MAX_SYNC_BYTES), true),
+            (size(MAX_SYNC_FILES + 1, 0), false),
+            (size(1, MAX_SYNC_BYTES + 1), false),
+            (size(u64::MAX, u64::MAX), false),
+        ];
+        for (input, allowed) in cases {
+            let result = untracked_budget(input);
+            assert_eq!(result.is_ok(), allowed, "{input:?}");
+            if let Err(message) = result {
+                assert!(message.contains(&input.files.to_string()), "{message}");
+                assert!(message.contains(&input.bytes.to_string()), "{message}");
+                assert!(message.contains(".gitignore"), "{message}");
+            }
+        }
+        const { assert!(UNTRACKED_STREAM_LIMIT > MAX_SYNC_BYTES) };
+    }
+
+    #[test]
+    fn untracked_size_counts_unignored_files_without_following_symlinks() {
+        let home = temp_home("untracked-size");
+        run_git(&home, &["init", "-q"]);
+        std::fs::write(home.join(".gitignore"), "ignored.bin\n").unwrap();
+        std::fs::write(home.join("ignored.bin"), vec![0u8; 4096]).unwrap();
+        std::fs::create_dir_all(home.join("sub")).unwrap();
+        std::fs::write(home.join("sub/a.txt"), b"12345").unwrap();
+        let big = temp_home("untracked-size-target");
+        std::fs::write(big.join("big.bin"), vec![0u8; 8192]).unwrap();
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "symlink fixture for the no-follow size check"
+        )]
+        let linked = std::process::Command::new("ln")
+            .arg("-s")
+            .arg(big.join("big.bin"))
+            .arg(home.join("link"))
+            .status()
+            .unwrap();
+        assert!(linked.success());
+        let link_len = std::fs::symlink_metadata(home.join("link")).unwrap().len();
+
+        let size = untracked_size(home.to_str().unwrap()).unwrap();
+
+        // .gitignore + sub/a.txt + link; ignored.bin is excluded.
+        assert_eq!(size.files, 3, "{size:?}");
+        let gitignore_len = "ignored.bin\n".len() as u64;
+        assert_eq!(size.bytes, gitignore_len + 5 + link_len, "{size:?}");
+        assert!(size.bytes < 8192, "the symlink target must not be counted");
+        std::fs::remove_dir_all(home).unwrap();
+        std::fs::remove_dir_all(big).unwrap();
+    }
+
+    #[test]
+    fn pipe_budget_errors_name_the_cap_and_the_fix() {
+        let budget = pipe_step_error(
+            "tracked diff",
+            "commit or revert large tracked changes, then retry",
+            thegn_svc::host::PipeError::Budget { limit: 42 },
+        );
+        assert!(budget.contains("tracked diff"), "{budget}");
+        assert!(budget.contains("42 bytes"), "{budget}");
+        assert!(budget.contains("commit or revert"), "{budget}");
+        let timeout = pipe_step_error(
+            "untracked files",
+            "unused",
+            thegn_svc::host::PipeError::Timeout { secs: 7 },
+        );
+        assert_eq!(timeout, "untracked files: pipe: timed out after 7s");
     }
 
     #[test]

@@ -694,7 +694,8 @@ fn bars_config_defaults() {
     assert_eq!(
         b.top_right,
         vec![
-            "cpu", "mem", "disk", "gpu", "temp", "net", "battery", "weather", "date", "clock"
+            "cpu", "mem", "disk", "gpu", "temp", "net", "battery", "weather", "fleet", "date",
+            "clock"
         ]
     );
     // "help" is the clickable `?` chip, first so it is never trimmed away.

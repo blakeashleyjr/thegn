@@ -64,14 +64,24 @@ project spellings. Tracker-owned `workspace_id`, `workspace_slug`, and
 
 The file is watched, and every key has a reload class. Most display
 settings apply live: the sidebar, theme, bars, weather, calendar, panel,
-keys, voice and LSP. Some keys are read afresh each time they are used,
-such as `[sandbox]`, `[env.*]`, `[project.*]`, `[git]` and the queues, so
-the next worktree, launch or queue run picks them up. A few are read only at
-launch, such as `[daemon]`, `[serve]`, `[mcp]` and `[network]`, and need a
-restart. After a save, the status line says what changed, for example
+keys, voice and LSP. Notification routing and push sinks, `[[plugins]]`
+and `[media]` apply live too. Refresh cadences also apply live: the clock
+and date formats, `ci.poll_interval_secs`, `pr_queue.enabled` and its poll
+interval, `git.auto_fetch` and its interval, `disk.scan_interval_secs`,
+`loc.enabled`, `loc.scan_interval_secs` and `watch.pr_interval_secs` (the
+PR refresh cadence, floored at 5 seconds; the rest of `[watch]` still needs
+a restart). The status line lists them as "refresh cadences". Some keys are read afresh each time they are used,
+such as `[sandbox]`, `[env.*]`, `[project.*]`, the rest of `[git]` and the
+queues, so the next worktree, launch or queue run picks them up. A few are
+read only at launch, such as `[daemon]`, `[serve]`, `[mcp]` and `[network]`,
+and need a restart. After a save, the status line says what changed, for
+example
 `Config reloaded · live: sidebar, weather · restart required: daemon.enabled`.
-`thegn config set` prints the same class for the key it wrote. Where thegn
-cannot tell whether a running instance re-reads a key, it says restart.
+A reload runs only the parts whose keys changed, so editing the theme no
+longer restarts your plugins. Plugins restart when `[[plugins]]` changes,
+or when a key read afresh on use changes, because plugin actions read the
+config. `thegn config set` prints the same class for the key it wrote. Where
+thegn cannot tell whether a running instance re-reads a key, it says restart.
 
 ## Highlights
 

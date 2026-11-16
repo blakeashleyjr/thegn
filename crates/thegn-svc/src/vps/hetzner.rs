@@ -143,6 +143,12 @@ pub fn parse_server(v: &serde_json::Value) -> Option<VpsInstance> {
                 .collect()
         })
         .unwrap_or_default();
+    let text_at = |pointer: &str| {
+        v.pointer(pointer)
+            .and_then(|s| s.as_str())
+            .filter(|s| !s.is_empty())
+            .map(str::to_string)
+    };
     Some(VpsInstance {
         id: id.to_string(),
         name,
@@ -150,6 +156,8 @@ pub fn parse_server(v: &serde_json::Value) -> Option<VpsInstance> {
         running,
         created,
         labels,
+        size: text_at("/server_type/name"),
+        region: text_at("/datacenter/location/name"),
     })
 }
 
@@ -313,6 +321,39 @@ pub fn image_belongs_to_server(created_from: Option<i64>, server_id: &str) -> bo
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn parse_server_reads_size_and_region_tolerantly() {
+        let full = serde_json::json!({
+            "id": 7,
+            "name": "tg-a",
+            "status": "running",
+            "server_type": {"name": "cx22"},
+            "datacenter": {"location": {"name": "fsn1"}}
+        });
+        let row = parse_server(&full).unwrap();
+        assert_eq!(row.size.as_deref(), Some("cx22"));
+        assert_eq!(row.region.as_deref(), Some("fsn1"));
+
+        let missing = parse_server(&serde_json::json!({"id": 7, "name": "tg-a"})).unwrap();
+        assert_eq!((missing.size, missing.region), (None, None));
+
+        let wrong = parse_server(&serde_json::json!({
+            "id": 7,
+            "name": "tg-a",
+            "server_type": {"name": 22},
+            "datacenter": {"location": "fsn1"}
+        }))
+        .unwrap();
+        assert_eq!((wrong.size, wrong.region), (None, None));
+
+        // The strict identity rules still refuse.
+        assert!(
+            parse_server(&serde_json::json!({"name": "tg-a", "server_type": {"name": "cx22"}}))
+                .is_none()
+        );
+        assert!(parse_server(&serde_json::json!({"id": "7", "name": "tg-a"})).is_none());
+    }
 
     fn server_page(
         rows: serde_json::Value,

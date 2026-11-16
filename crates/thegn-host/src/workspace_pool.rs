@@ -129,6 +129,16 @@ impl WorkspacePool {
         self.parked.iter().flat_map(|(_, rw)| rw.worktrees.iter())
     }
 
+    /// Like [`resident_groups`](Self::resident_groups) but keeps the repo key
+    /// each group is parked under, for the CPU/memory attribution index.
+    pub(crate) fn parked_groups(
+        &self,
+    ) -> impl Iterator<Item = (&str, &crate::session::WorktreeGroup)> {
+        self.parked
+            .iter()
+            .flat_map(|(repo, rw)| rw.worktrees.iter().map(move |g| (repo.as_str(), g)))
+    }
+
     /// Drop persisted worktree groups for a removed workspace from every
     /// parked session so a later warm switch cannot save them again.
     pub(crate) fn retain_groups_for_removed_workspace(&mut self, slug: &str) -> Vec<String> {
