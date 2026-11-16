@@ -65,6 +65,15 @@ pub enum RowKind {
     /// `folder_id` and no `tab_target`, and is not markable, pinnable,
     /// fileable or draggable: there is no `folders` row behind it.
     OtherGroup,
+    /// A **derived** "… show N more" / "show fewer" toggle closing a group
+    /// whose entries exceed `[ui] sidebar_group_row_limit` (or its
+    /// `sidebar_group_row_limits` override; see `apply_row_limits`). Sits at
+    /// the group's child depth. Its `pin_key` is [`show_more_key`] of the
+    /// group key (identity anchor only: it is never pinnable, markable,
+    /// draggable or a tab target), `child_count` is how many entries the
+    /// limit hides, and `collapsed` is `true` while they are hidden. Enter,
+    /// Space and a click flip the group's `more_open:{group key}` state.
+    ShowMore,
 }
 
 impl RowKind {
@@ -418,6 +427,7 @@ impl SidebarRow {
                     | RowKind::PipelineLane
                     | RowKind::PipelineWorktree
                     | RowKind::OtherGroup
+                    | RowKind::ShowMore
             )
     }
 
@@ -573,6 +583,10 @@ pub struct ViewState {
     /// `[ui] sidebar_other_group_collapsed` (`display.other_group_collapsed`).
     /// Persisted as `other_open:{slug}` (`"1"`/`"0"`) in `ui_state`.
     pub other_open: std::collections::HashMap<String, bool>,
+    /// Groups the user expanded past their row limit ("show more"), keyed by
+    /// the group head's [`SidebarRow::collapse_key`]. Absent = truncated.
+    /// Persisted as `more_open:{group key}` (`"1"`) in `ui_state`.
+    pub more_open: HashSet<String>,
     /// Frozen sort keys, armed while the user is navigating the bar (see
     /// [`crate::sidebar_freeze`]). While `Some`, the computed sorts read this
     /// snapshot instead of the live [`SidebarStatus`] maps, so rows cannot move
@@ -1389,8 +1403,166 @@ pub fn build_rows(
     }
 
     apply_pins(&mut rows, &view.pins);
+    apply_row_limits(&mut rows, view);
     apply_filter(&mut rows, &view.filter);
     rows
+}
+
+/// The `pin_key` of the [`RowKind::ShowMore`] row closing the group whose
+/// collapse key is `group_key`.
+pub fn show_more_key(group_key: &str) -> String {
+    format!("more:{group_key}")
+}
+
+/// The group key a [`RowKind::ShowMore`] row toggles (`None` for any other
+/// row).
+pub fn show_more_group(row: &SidebarRow) -> Option<&str> {
+    if row.kind == RowKind::ShowMore {
+        row.pin_key.strip_prefix("more:")
+    } else {
+        None
+    }
+}
+
+/// Whether rows of this kind head a group the row limit applies to: a
+/// workspace (its loose rows), a user folder, the derived "Other" group, and
+/// the derived pipeline group and lane folders.
+fn is_limited_group(kind: RowKind) -> bool {
+    matches!(
+        kind,
+        RowKind::Workspace
+            | RowKind::Folder
+            | RowKind::OtherGroup
+            | RowKind::PipelineGroup
+            | RowKind::PipelineLane
+    )
+}
+
+/// Whether a direct child of a limited group is an *entry* that counts toward
+/// (and can be hidden by) the limit. Nested group heads (folders, "Other",
+/// `Pipelines`) are structure, not entries: they always show and carry their
+/// own limit.
+fn counts_toward_limit(kind: RowKind) -> bool {
+    !matches!(
+        kind,
+        RowKind::Folder
+            | RowKind::OtherGroup
+            | RowKind::PipelineGroup
+            | RowKind::SectionHeading
+            | RowKind::EmptyHint
+            | RowKind::ShowMore
+    )
+}
+
+/// The row-limit pass (`[ui] sidebar_group_row_limit` /
+/// `sidebar_group_row_limits`), run on the final order (after sorts and
+/// pins). For every group with more entries than its limit, entries past the
+/// limit are hidden (`visible = false`, their subtrees with them) and one
+/// [`RowKind::ShowMore`] row is inserted after the group's last entry. While
+/// the group is expanded (`ViewState::more_open`) every entry shows and the
+/// same row reads "show fewer".
+///
+/// - The limit is the group label's entry in `group_row_limits`, else
+///   `group_row_limit`; `0` disables it.
+/// - Pinned entries and the entry holding the active row are never hidden.
+///   They count toward the limit: a protected entry past it takes the slot of
+///   the last unprotected one, so the group still shows `limit` entries.
+/// - A non-empty filter disables the pass: every match shows.
+///
+/// Pure string/flag work over rows already built; no I/O.
+fn apply_row_limits(rows: &mut Vec<SidebarRow>, view: &ViewState) {
+    let disp = &view.display;
+    if !view.filter.trim().is_empty() {
+        return;
+    }
+    if disp.group_row_limit == 0 && disp.group_row_limits.values().all(|l| *l == 0) {
+        return;
+    }
+    let heads: Vec<usize> = (0..rows.len())
+        .filter(|&i| is_limited_group(rows[i].kind))
+        .collect();
+    // Back to front: an insertion only shifts rows after it, which are
+    // already processed, and a nested group's toggle row then sits inside its
+    // parent's entry block (so hiding the entry hides it too).
+    for &h in heads.iter().rev() {
+        let limit = disp
+            .group_row_limits
+            .get(rows[h].label.as_str())
+            .copied()
+            .unwrap_or(disp.group_row_limit);
+        if limit == 0 {
+            continue;
+        }
+        let depth = rows[h].depth;
+        // Direct-child entry blocks as half-open `(start, end)` ranges.
+        let mut blocks: Vec<(usize, usize)> = Vec::new();
+        let mut j = h + 1;
+        while j < rows.len() && rows[j].depth > depth {
+            let start = j;
+            j += 1;
+            while j < rows.len() && rows[j].depth > rows[start].depth {
+                j += 1;
+            }
+            if counts_toward_limit(rows[start].kind) {
+                blocks.push((start, j));
+            }
+        }
+        if blocks.len() <= limit {
+            continue;
+        }
+        let protected: Vec<bool> = blocks
+            .iter()
+            .map(|&(s, e)| {
+                (!rows[s].pin_key.is_empty() && view.pins.contains(&rows[s].pin_key))
+                    || rows[s..e].iter().any(|r| r.active)
+            })
+            .collect();
+        let mut budget = limit.saturating_sub(protected.iter().filter(|p| **p).count());
+        let mut hide: Vec<bool> = Vec::with_capacity(blocks.len());
+        for &p in &protected {
+            let shown = if p {
+                true
+            } else if budget > 0 {
+                budget -= 1;
+                true
+            } else {
+                false
+            };
+            hide.push(!shown);
+        }
+        let hidden = hide.iter().filter(|h| **h).count();
+        if hidden == 0 {
+            continue;
+        }
+        // The toggle shows exactly when the group's shown entries do (a
+        // collapsed ancestor hides both).
+        let visible = blocks
+            .iter()
+            .zip(&hide)
+            .find(|(_, h)| !**h)
+            .is_some_and(|(&(s, _), _)| rows[s].visible);
+        let key = rows[h].collapse_key().to_string();
+        let open = view.more_open.contains(&key);
+        if !open {
+            for (&(s, e), _) in blocks.iter().zip(&hide).filter(|(_, h)| **h) {
+                for r in &mut rows[s..e] {
+                    r.visible = false;
+                }
+            }
+        }
+        let at = blocks.last().map_or(h + 1, |b| b.1);
+        let slug = rows[h].workspace_slug.clone();
+        rows.insert(
+            at,
+            SidebarRow {
+                pin_key: show_more_key(&key),
+                collapsed: !open,
+                child_count: hidden,
+                visible,
+                ..SidebarRow::base(RowKind::ShowMore, depth + 1, String::new(), slug)
+            },
+        );
+    }
 }
 
 /// Emit a workspace's derived "Other (N)" group and its external worktree
@@ -2127,7 +2299,7 @@ fn apply_filter(rows: &mut [SidebarRow], filter: &str) {
                     }
                 }
             }
-            RowKind::EmptyHint => {}
+            RowKind::EmptyHint | RowKind::ShowMore => {}
         }
     }
     // Reveal children only for headers/groups that matched on their own label.
@@ -2192,7 +2364,7 @@ fn apply_filter(rows: &mut [SidebarRow], filter: &str) {
                     keep[i] = true;
                 }
             }
-            RowKind::EmptyHint => {}
+            RowKind::EmptyHint | RowKind::ShowMore => {}
         }
     }
     for (i, r) in rows.iter_mut().enumerate() {
@@ -5486,5 +5658,206 @@ mod tests {
             "{text:?}"
         );
         assert!(text.contains('�'), "{text:?}");
+    }
+
+    // --- row limits: the derived "show more" row --------------------------
+
+    /// A workspace `app` holding one folder `wip` of `n` worktrees (depth 2),
+    /// in final display order — the shape `apply_row_limits` runs on.
+    fn folder_of(n: usize) -> Vec<SidebarRow> {
+        let mut rows = vec![
+            SidebarRow {
+                pin_key: "app".into(),
+                ..SidebarRow::base(RowKind::Workspace, 0, "app", "app")
+            },
+            SidebarRow {
+                pin_key: "app/folder:1".into(),
+                folder_id: Some(1),
+                child_count: n,
+                ..SidebarRow::base(RowKind::Folder, 1, "wip", "app")
+            },
+        ];
+        for i in 0..n {
+            rows.push(SidebarRow {
+                pin_key: format!("app/wt{i}"),
+                ..SidebarRow::base(RowKind::Worktree, 2, format!("wt{i}"), "app")
+            });
+        }
+        rows
+    }
+
+    fn limit_view(limit: usize) -> ViewState {
+        let mut view = ViewState::default();
+        view.display.group_row_limit = limit;
+        view
+    }
+
+    fn shown_worktrees(rows: &[SidebarRow]) -> Vec<String> {
+        rows.iter()
+            .filter(|r| r.visible && r.kind == RowKind::Worktree)
+            .map(|r| r.label.clone())
+            .collect()
+    }
+
+    fn show_more_rows(rows: &[SidebarRow]) -> Vec<&SidebarRow> {
+        rows.iter()
+            .filter(|r| r.kind == RowKind::ShowMore)
+            .collect()
+    }
+
+    #[test]
+    fn row_limit_truncates_a_folder_and_adds_show_more() {
+        let mut rows = folder_of(20);
+        apply_row_limits(&mut rows, &limit_view(15));
+        let shown = shown_worktrees(&rows);
+        assert_eq!(shown.len(), 15);
+        assert_eq!(shown.first().map(String::as_str), Some("wt0"));
+        assert_eq!(shown.last().map(String::as_str), Some("wt14"));
+        let more = show_more_rows(&rows);
+        assert_eq!(more.len(), 1);
+        let more = more[0];
+        assert_eq!(more.child_count, 5);
+        assert!(more.collapsed, "truncated reads `show N more`");
+        assert!(more.visible);
+        assert_eq!(more.depth, 2, "indented at the folder's child depth");
+        assert_eq!(more.pin_key, show_more_key("app/folder:1"));
+        assert_eq!(show_more_group(more), Some("app/folder:1"));
+        assert!(more.tab_target.is_none());
+        assert!(!more.is_pinnable() && !more.is_markable());
+        assert!(!RowKind::ShowMore.is_collapsible());
+        // It closes the group: right after the folder's last entry.
+        assert_eq!(rows.last().map(|r| r.kind), Some(RowKind::ShowMore));
+        assert_eq!(
+            crate::sidebar_view::show_more_text(more),
+            format!("{} show 5 more", crate::caps::active_glyphs().ellipsis)
+        );
+    }
+
+    #[test]
+    fn row_limit_expanded_group_shows_all_then_show_fewer() {
+        let mut rows = folder_of(20);
+        let mut view = limit_view(15);
+        view.more_open.insert("app/folder:1".into());
+        apply_row_limits(&mut rows, &view);
+        assert_eq!(shown_worktrees(&rows).len(), 20);
+        let more = show_more_rows(&rows);
+        assert_eq!(more.len(), 1);
+        assert!(!more[0].collapsed);
+        assert!(more[0].visible);
+        assert_eq!(crate::sidebar_view::show_more_text(more[0]), "show fewer");
+        assert_eq!(rows.last().map(|r| r.kind), Some(RowKind::ShowMore));
+    }
+
+    #[test]
+    fn row_limit_zero_disables_truncation() {
+        let mut rows = folder_of(20);
+        apply_row_limits(&mut rows, &limit_view(0));
+        assert_eq!(shown_worktrees(&rows).len(), 20);
+        assert!(show_more_rows(&rows).is_empty());
+        // At or under the limit: nothing to hide, no extra row.
+        let mut rows = folder_of(15);
+        apply_row_limits(&mut rows, &limit_view(15));
+        assert_eq!(shown_worktrees(&rows).len(), 15);
+        assert!(show_more_rows(&rows).is_empty());
+    }
+
+    #[test]
+    fn row_limit_per_group_override_wins_by_label() {
+        let mut rows = folder_of(20);
+        let mut view = limit_view(15);
+        view.display.group_row_limits.insert("wip".into(), 5);
+        apply_row_limits(&mut rows, &view);
+        assert_eq!(shown_worktrees(&rows).len(), 5);
+        assert_eq!(show_more_rows(&rows)[0].child_count, 15);
+        // An override of 0 lifts the limit for that group alone, even when
+        // the default is 0 elsewhere.
+        let mut rows = folder_of(20);
+        let mut view = limit_view(15);
+        view.display.group_row_limits.insert("wip".into(), 0);
+        apply_row_limits(&mut rows, &view);
+        assert_eq!(shown_worktrees(&rows).len(), 20);
+        let mut rows = folder_of(20);
+        let mut view = limit_view(0);
+        view.display.group_row_limits.insert("wip".into(), 3);
+        apply_row_limits(&mut rows, &view);
+        assert_eq!(shown_worktrees(&rows).len(), 3);
+    }
+
+    #[test]
+    fn row_limit_never_hides_the_active_row() {
+        let mut rows = folder_of(20);
+        rows[2 + 18].active = true; // wt18
+        apply_row_limits(&mut rows, &limit_view(15));
+        let shown = shown_worktrees(&rows);
+        assert!(shown.contains(&"wt18".to_string()), "{shown:?}");
+        // Promoted into the slice: the group still shows `limit` entries.
+        assert_eq!(shown.len(), 15);
+        assert!(!shown.contains(&"wt14".to_string()));
+        assert_eq!(show_more_rows(&rows)[0].child_count, 5);
+    }
+
+    #[test]
+    fn row_limit_never_hides_pinned_rows() {
+        let mut rows = folder_of(20);
+        let mut view = limit_view(15);
+        view.pins = vec!["app/wt17".into(), "app/wt19".into()];
+        apply_row_limits(&mut rows, &view);
+        let shown = shown_worktrees(&rows);
+        assert!(shown.contains(&"wt17".to_string()));
+        assert!(shown.contains(&"wt19".to_string()));
+        assert_eq!(shown.len(), 15);
+    }
+
+    #[test]
+    fn row_limit_is_off_while_filtering() {
+        let mut rows = folder_of(20);
+        let mut view = limit_view(15);
+        view.filter = "wt".into();
+        apply_row_limits(&mut rows, &view);
+        assert_eq!(shown_worktrees(&rows).len(), 20);
+        assert!(show_more_rows(&rows).is_empty());
+    }
+
+    #[test]
+    fn row_limit_toggle_follows_a_collapsed_parent() {
+        let mut rows = folder_of(20);
+        for r in rows.iter_mut().skip(2) {
+            r.visible = false; // the folder is collapsed
+        }
+        apply_row_limits(&mut rows, &limit_view(15));
+        let more = show_more_rows(&rows);
+        assert_eq!(more.len(), 1);
+        assert!(!more[0].visible, "a collapsed group hides its toggle too");
+    }
+
+    /// End to end through `build_rows`: a dormant workspace's loose rows
+    /// (home + 20) are a limited group keyed by the workspace slug, and the
+    /// filter lifts the limit.
+    #[test]
+    fn build_rows_applies_the_row_limit_to_loose_worktrees() {
+        let ws = vec![(
+            "app".to_string(),
+            "app".to_string(),
+            "repo".to_string(),
+            "/repos/app".to_string(),
+        )];
+        let dbw: Vec<DbWorktree> = (0..20)
+            .map(|i| db_row("app", &format!("b{i:02}")))
+            .collect();
+        let s = session(vec![], 0);
+        let view = limit_view(15);
+        let rows = build_rows(&s, &ws, &view, &no_activity(), &dbw, &[], &[]);
+        assert_eq!(shown_worktrees(&rows).len(), 15);
+        let more = show_more_rows(&rows);
+        assert_eq!(more.len(), 1);
+        assert_eq!(more[0].pin_key, show_more_key("app"));
+        assert_eq!(more[0].child_count, 6, "home + 20 = 21 entries");
+        assert_eq!(more[0].depth, 1);
+
+        let mut filtered = limit_view(15);
+        filtered.filter = "b".into();
+        let rows = build_rows(&s, &ws, &filtered, &no_activity(), &dbw, &[], &[]);
+        assert!(show_more_rows(&rows).is_empty());
+        assert!(shown_worktrees(&rows).len() >= 20);
     }
 }
