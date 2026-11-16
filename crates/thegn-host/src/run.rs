@@ -9410,7 +9410,9 @@ async fn event_loop<T: Terminal>(
         // Input handlers may continue early after closing/pausing the view.
         // Revoke first, before unrelated hydration work; positive admission
         // below happens only after publishing the latest attribution inputs.
-        if !crate::monitor::wants_process_scan(monitor.as_ref(), current_config.monitor.processes)
+        if !(crate::monitor::wants_process_scan(monitor.as_ref(), current_config.monitor.processes)
+            || (current_config.monitor.processes
+                && crate::detail::cpu_attrib::is_open(&bar_detail)))
             && let Some(control) = &process_control
         {
             control.set_enabled(false);
@@ -13256,8 +13258,11 @@ async fn event_loop<T: Terminal>(
 
         // Revoke old publication rights before the final take. One latest
         // snapshot replaces the former unbounded channel; hydration preserves it.
+        // The cpu/mem popup's attribution tree samples only while it is open.
+        let attrib_open = crate::detail::cpu_attrib::is_open(&bar_detail);
         let processes_live =
-            crate::monitor::wants_process_scan(monitor.as_ref(), current_config.monitor.processes);
+            crate::monitor::wants_process_scan(monitor.as_ref(), current_config.monitor.processes)
+                || (current_config.monitor.processes && attrib_open);
         daemon_pid_atomic.store(
             panel_ui.docs.daemon.pid.unwrap_or(0),
             std::sync::atomic::Ordering::Relaxed,
@@ -13280,6 +13285,19 @@ async fn event_loop<T: Terminal>(
         if let Some(control) = &process_control {
             if model.take_process_publication(control, processes_live) {
                 loop_perf.tick(crate::perf::WakeSource::Stats);
+                if attrib_open {
+                    model.pane_owners =
+                        crate::cpu_attrib_index::pane_owners(&session, &workspace_pool, &panes)
+                            .into();
+                    let sctx = crate::detail::StatusCtx::new(
+                        &panel_ui.docs,
+                        start.elapsed().as_secs(),
+                        Rect::full(cols, rows),
+                        &current_config.daemon,
+                    );
+                    dirty |=
+                        crate::detail::cpu_attrib::refresh_open(&mut bar_detail, &model, &sctx);
+                }
                 if monitor.is_some() {
                     dirty = true;
                     status_data_moved = true;
