@@ -307,6 +307,12 @@ pub fn validate_diagnostics_with_policy(
                 message,
             }
         }));
+        diagnostics.extend(list_value_warnings(&cfg).into_iter().map(|message| {
+            ValidationDiagnostic {
+                severity: ValidationSeverity::Warning,
+                message,
+            }
+        }));
         if cfg.voice.kind == crate::config::VoiceKind::Http
             && let Err(message) = cfg.voice.validate_credential_transport()
         {
@@ -647,6 +653,28 @@ fn sidebar_detail_warnings(cfg: &Config) -> Vec<String> {
         if !badge.contains("{n}") {
             warnings.push(format!(
                 "{key}: badge template must contain {{n}}; the default will be used"
+            ));
+        }
+    }
+    warnings
+}
+
+/// List entries the loader silently skips: DND windows and usage provider ids.
+/// Warnings only (never errors); values are echoed with `{:?}` so control
+/// characters in user text are escaped.
+fn list_value_warnings(cfg: &Config) -> Vec<String> {
+    let mut warnings = Vec::new();
+    for (i, value) in cfg.notifications.dnd.windows.iter().enumerate() {
+        if crate::notification_route::parse_window(value).is_none() {
+            warnings.push(format!(
+                "notifications.dnd.windows[{i}] = {value:?} is not a window (\"HH:MM-HH:MM\" with optional weekdays); it is ignored"
+            ));
+        }
+    }
+    for (i, id) in cfg.usage.providers.iter().enumerate() {
+        if id != "antigravity" && crate::account::provider(id).is_none() {
+            warnings.push(format!(
+                "usage.providers[{i}] = {id:?} is not a known usage provider; it is ignored"
             ));
         }
     }
@@ -1941,6 +1969,54 @@ template = "image:registry.example/dev:1"
     #[should_panic(expected = "unknown float key")]
     fn float_config_rejects_an_unpinned_key() {
         float_config("media.unknown", 0.0);
+    }
+
+    fn list_config(toml_src: &str) -> Config {
+        toml::from_str::<Config>(toml_src).expect("list config parses")
+    }
+
+    #[test]
+    fn list_value_warnings_flag_bad_dnd_windows_and_unknown_providers() {
+        assert!(list_value_warnings(&Config::default()).is_empty());
+        let good = list_config(
+            "[notifications.dnd]\nwindows = [\"22:00-07:00\", \"mon-fri 09:00-17:00\", \"sat,sun 00:00-08:00\"]\n\
+             [usage]\nproviders = [\"codex\", \"claude\", \"antigravity\"]\n",
+        );
+        assert!(list_value_warnings(&good).is_empty());
+        let empty = list_config("[notifications.dnd]\nwindows = []\n[usage]\nproviders = []\n");
+        assert!(list_value_warnings(&empty).is_empty());
+        for bad in ["25:00-01:00", "nonsense", ""] {
+            let cfg = list_config(&format!(
+                "[notifications.dnd]\nwindows = [\"22:00-07:00\", {bad:?}]\n"
+            ));
+            let warnings = list_value_warnings(&cfg);
+            assert_eq!(warnings.len(), 1, "{bad:?}: {warnings:?}");
+            assert!(
+                warnings[0].contains("notifications.dnd.windows[1]"),
+                "{warnings:?}"
+            );
+        }
+        let cfg = list_config("[usage]\nproviders = [\"codex\", \"frobnicate\"]\n");
+        let warnings = list_value_warnings(&cfg);
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
+        assert!(warnings[0].contains("usage.providers[1]"), "{warnings:?}");
+        assert!(warnings[0].contains("frobnicate"), "{warnings:?}");
+    }
+
+    #[test]
+    fn bad_dnd_window_is_an_ignorable_warning_not_an_error() {
+        let diagnostics = validate_diagnostics("[notifications.dnd]\nwindows = [\"nonsense\"]\n");
+        let hit = diagnostics
+            .iter()
+            .find(|d| d.message.contains("notifications.dnd.windows[0]"))
+            .expect("bad window diagnostic");
+        assert_eq!(hit.severity, ValidationSeverity::Warning);
+        assert!(
+            diagnostics
+                .iter()
+                .all(|d| d.severity != ValidationSeverity::Error),
+            "{diagnostics:?}"
+        );
     }
 
     #[test]

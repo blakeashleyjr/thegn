@@ -91,7 +91,6 @@ const OMITTED: &[(&str, &str)] = &[
         "per-kind priority map is not exposed",
     ),
     ("notifications.rules", "routing rules are not exposed"),
-    ("notifications.dnd.windows", "window list is not exposed"),
     (
         "notifications.sound.pack",
         "sound pack path is not exposed yet",
@@ -148,8 +147,6 @@ const OMITTED: &[(&str, &str)] = &[
         "usage.allow_network",
         "network opt-in awaits an owner decision",
     ),
-    ("usage.providers", "provider selection list is not exposed"),
-    ("usage.profile_roots", "path list is not exposed"),
     (
         "usage.accounts",
         "usage account credentials and paths are not exposed",
@@ -1161,7 +1158,6 @@ fn hm_notifications_and_activity_families_are_rendered() {
         "notifications.agent_error_signatures",
         "notifications.priority",
         "notifications.rules",
-        "notifications.dnd.windows",
         "notifications.sound.pack",
         "notifications.sound.chime_file",
         "notifications.sound.command",
@@ -1183,6 +1179,7 @@ fn hm_notifications_dnd_and_sound_bools_are_rendered_and_rest_dispositioned() {
         "notifications.sound.suppress_focused",
         "notifications.sound.volume",
         "notifications.dnd.allow_priority",
+        "notifications.dnd.windows",
         "notifications.sound.min_priority",
         "notifications.sound.per_kind",
     ] {
@@ -1391,6 +1388,8 @@ fn hm_usage_and_tailnet_keys_are_rendered_and_rest_dispositioned() {
         "usage.poll_interval_secs",
         "usage.warn_percent",
         "usage.crit_percent",
+        "usage.providers",
+        "usage.profile_roots",
         "host_discovery.tailnet.enabled",
         "host_discovery.tailnet.online_only",
     ] {
