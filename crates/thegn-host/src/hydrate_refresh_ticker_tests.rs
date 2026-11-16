@@ -181,6 +181,7 @@ impl Fixture {
                     RefreshKind::CalendarReminderResult { .. } => "reminder-result",
                     RefreshKind::UsagePoll => "usage",
                     RefreshKind::WeatherPoll => "weather",
+                    RefreshKind::FleetPoll => "fleet",
                     RefreshKind::AutoFetch { sweep: false } => "fetch-startup",
                     RefreshKind::AutoFetch { sweep: true } => "fetch",
                     RefreshKind::Disk => "disk",
@@ -554,6 +555,7 @@ fn disabled_optional_cadences_remain_silent_in_the_running_shared_ticker() {
         "reminder",
         "usage",
         "weather",
+        "fleet",
         "fetch",
         "fetch-startup",
         "loc",
@@ -599,6 +601,7 @@ fn scheduled_name(kind: &RefreshKind) -> Option<&'static str> {
         RefreshKind::Loc { .. } => Some("loc"),
         RefreshKind::UsagePoll => Some("usage"),
         RefreshKind::WeatherPoll => Some("weather"),
+        RefreshKind::FleetPoll => Some("fleet"),
         _ => None,
     }
 }
@@ -616,6 +619,8 @@ fn live_owner_reloads_every_ticker_class_through_the_event_envelope() {
         loc_every_slots: Some(7),
         usage_every_slots: Some(8),
         weather_every_slots: Some(9),
+        fleet_every_slots: Some(10),
+        pr_every_slots: 40,
     };
     let middle = ScheduleConfig {
         ci_every_slots: 3,
@@ -633,6 +638,8 @@ fn live_owner_reloads_every_ticker_class_through_the_event_envelope() {
         loc_every_slots: Some(9),
         usage_every_slots: Some(10),
         weather_every_slots: Some(11),
+        fleet_every_slots: Some(12),
+        pr_every_slots: 20,
     };
 
     let (permits, clock) = mpsc::sync_channel(1);
@@ -714,6 +721,7 @@ fn live_owner_reloads_every_ticker_class_through_the_event_envelope() {
             "pr_queue",
             "usage",
             "weather",
+            "fleet",
         ]
         .into_iter()
         .collect()
@@ -737,6 +745,8 @@ fn live_owner_reloads_every_ticker_class_through_the_event_envelope() {
         loc_every_slots: None,
         usage_every_slots: None,
         weather_every_slots: None,
+        fleet_every_slots: None,
+        pr_every_slots: 40,
     });
     let mut disabled = std::collections::BTreeSet::new();
     for tick in 101..=140 {
@@ -759,6 +769,7 @@ fn live_owner_reloads_every_ticker_class_through_the_event_envelope() {
         "loc",
         "usage",
         "weather",
+        "fleet",
     ] {
         assert!(!disabled.contains(name), "disabled {name} still emitted");
     }
@@ -917,4 +928,126 @@ fn container_refresh_bytes_scales_with_listing() {
     let large = container_refresh(&["a", "b", "c"], None);
     assert!(container_refresh_bytes(&large) > container_refresh_bytes(&small));
     assert!(container_refresh_bytes(&large) < CONTAINER_SLOT_MAX_BYTES);
+}
+
+fn fly_env() -> thegn_core::config::EnvConfig {
+    thegn_core::config::EnvConfig {
+        provider: thegn_core::config::EnvProviderConfig {
+            provider: "fly".into(),
+            ..Default::default()
+        },
+        ..Default::default()
+    }
+}
+
+#[test]
+fn fleet_poll_fires_at_its_first_slot_then_on_cadence_only_when_armed() {
+    // Default bars place `fleet`, but with no provider env there is no slot.
+    let mut ticker = Fixture::start(&configured());
+    ticker.advance_to(80);
+    assert!(ticker.ticks("fleet").is_empty());
+    ticker.finish();
+
+    let mut cfg = configured();
+    cfg.env.insert("fly-dev".into(), fly_env());
+    let mut ticker = Fixture::start(&cfg);
+    ticker.advance_to(600);
+    // 15 s first slot, then the five-minute (600-slot) cadence.
+    assert_eq!(ticker.ticks("fleet"), [FLEET_FIRST_SLOT, 600]);
+    ticker.finish();
+}
+
+#[test]
+fn pr_cadence_follows_the_watch_interval() {
+    let mut cfg = configured();
+    cfg.watch.pr_interval_secs = 10;
+    let mut ticker = Fixture::start(&cfg);
+    ticker.advance_to(80);
+    assert_eq!(ticker.ticks("pr"), [20, 40, 60, 80]);
+    assert_eq!(ticker.ticks("main-ref"), [20, 40, 60, 80]);
+    ticker.finish();
+}
+
+#[test]
+fn fleet_and_pr_slots_follow_a_live_reconfigure() {
+    let base = ScheduleConfig::from_config(&configured());
+    let armed = ScheduleConfig {
+        fleet_every_slots: Some(4),
+        pr_every_slots: 40,
+        ..base.clone()
+    };
+    let (permits, clock) = mpsc::sync_channel(1);
+    let (ack, receipts) = mpsc::sync_channel(1);
+    let (finished, completion) = mpsc::sync_channel(1);
+    let (tx, mut refresh) = tokio_mpsc::unbounded_channel();
+    let commands = Arc::new(Mutex::new(None));
+    let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let worker = spawn_worker_with_commands(
+        Cadences::from_schedule(&armed),
+        Arc::new(AtomicU64::new(1)),
+        commands.clone(),
+        stop.clone(),
+        tx,
+        FixtureIo {
+            permits: clock,
+            ack,
+            finished,
+            observed: Arc::new(Mutex::new(Observations::default())),
+            demand: Arc::new(std::sync::atomic::AtomicU8::new(0)),
+            container_changed: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            tick: 0,
+        },
+        || {},
+    );
+    let mut ticker = RefreshTicker {
+        command: commands,
+        stop,
+        worker: Some(worker),
+    };
+    let mut drive = |range: std::ops::RangeInclusive<u64>| {
+        let mut seen: Vec<(u64, &'static str)> = Vec::new();
+        for tick in range {
+            permits.send(()).unwrap();
+            assert_eq!(receipts.recv_timeout(LIMIT).unwrap(), tick);
+            while let Ok(event) = refresh.try_recv() {
+                let kind = match event {
+                    RefreshKind::Scheduled { kind, .. } => *kind,
+                    other => other,
+                };
+                match kind {
+                    RefreshKind::FleetPoll => seen.push((tick, "fleet")),
+                    RefreshKind::Pr => seen.push((tick, "pr")),
+                    _ => {}
+                }
+            }
+        }
+        seen
+    };
+    let ticks = |seen: &[(u64, &'static str)], name: &str| -> Vec<u64> {
+        seen.iter()
+            .filter_map(|(tick, found)| (*found == name).then_some(*tick))
+            .collect()
+    };
+    let first = drive(1..=40);
+    assert_eq!(
+        ticks(&first, "fleet"),
+        [4, 8, 12, 16, 20, 24, 28, 30, 32, 36, 40]
+    );
+    assert_eq!(ticks(&first, "pr"), [40]);
+
+    // Disarm fleet and halve the PR cadence on the running worker.
+    ticker.reconfigure(
+        ScheduleConfig {
+            fleet_every_slots: None,
+            pr_every_slots: 20,
+            ..base
+        },
+        2,
+    );
+    let second = drive(41..=120);
+    assert!(ticks(&second, "fleet").is_empty(), "{second:?}");
+    assert_eq!(ticks(&second, "pr"), [60, 80, 100, 120]);
+    drop(permits);
+    ticker.shutdown();
+    completion.recv_timeout(LIMIT).unwrap();
 }
