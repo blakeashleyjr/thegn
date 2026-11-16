@@ -1,6 +1,6 @@
 use crate::{
     BACKOFF_CAP, Capture, Containment, End, GroupState, InputFeed, Leader, LeaderExit, Limits,
-    POLL_INTERVAL, Run, Stream, StreamConsumer, Which, aggregate_fit,
+    POLL_INTERVAL, Run, StdinHandoff, Stream, StreamConsumer, Which, aggregate_fit,
 };
 use nix::{
     errno::Errno,
@@ -605,7 +605,17 @@ pub(super) fn run_consuming_streams(
     cancel: &AtomicBool,
     consume: StreamConsumer<'_>,
 ) -> Run {
-    run_inner(cmd, limits, cancel, consume, None).0
+    run_inner(cmd, limits, cancel, consume, None, None).0
+}
+
+pub(super) fn run_consuming_streams_with_stdin(
+    cmd: &mut Command,
+    limits: &Limits,
+    cancel: &AtomicBool,
+    on_stdin: StdinHandoff<'_>,
+    consume: StreamConsumer<'_>,
+) -> Run {
+    run_inner(cmd, limits, cancel, consume, None, Some(on_stdin)).0
 }
 
 pub(super) fn run_with_input(
@@ -620,17 +630,21 @@ pub(super) fn run_with_input(
         cancel,
         &mut |_which: Which, _bytes: &[u8]| {},
         Some(input),
+        None,
     )
 }
 
+/// `input` (a payload the poll loop feeds) and `handoff` (the caller takes the pipe) are never both
+/// set by the public entry points; either one makes stdin a pipe.
 fn run_inner(
     cmd: &mut Command,
     limits: &Limits,
     cancel: &AtomicBool,
     consume: StreamConsumer<'_>,
     input: Option<&[u8]>,
+    handoff: Option<StdinHandoff<'_>>,
 ) -> (Run, InputFeed) {
-    cmd.stdin(if input.is_some() {
+    cmd.stdin(if input.is_some() || handoff.is_some() {
         Stdio::piped()
     } else {
         Stdio::null()
@@ -676,7 +690,15 @@ fn run_inner(
         // SAFETY: ownership of this raw descriptor is transferred from ChildStderr to File.
         unsafe { File::from_raw_fd(fd) }
     });
-    let stdin = child.stdin.take().map(|pipe| {
+    let mut stdin = child.stdin.take();
+    if let Some(handoff) = handoff
+        && let Some(pipe) = stdin.take()
+    {
+        // The group exists and the Guard is armed, so a panicking handoff still kills and reaps.
+        // The pipe stays blocking: it is the caller's from here on.
+        handoff(pipe);
+    }
+    let stdin = stdin.map(|pipe| {
         let fd = pipe.into_raw_fd();
         // SAFETY: ownership of this raw descriptor is transferred from ChildStdin to File.
         unsafe { File::from_raw_fd(fd) }
@@ -976,9 +998,11 @@ mod tests {
     use super::*;
     use std::{
         fs,
+        io::Write,
         os::unix::fs::PermissionsExt,
         path::{Path, PathBuf},
-        sync::{Arc, atomic::AtomicBool},
+        process::ChildStdin,
+        sync::{Arc, atomic::AtomicBool, mpsc},
         thread,
     };
 
@@ -2107,6 +2131,183 @@ mod tests {
         assert_eq!(run.group, GroupState::Terminated);
         assert!(matches!(run.leader, Leader::Reaped(_)));
         assert!(!feed.complete);
+    }
+
+    /// A release sender, and the holder reporting (released before its 30 s cap, late write).
+    type StdinHolder = (mpsc::Sender<()>, thread::JoinHandle<(bool, io::Result<()>)>);
+
+    /// Moves a handed-off stdin into a thread that holds it until released, then writes once more
+    /// and reports that write's result.
+    fn hold_stdin(stdin: ChildStdin) -> StdinHolder {
+        let (release, released) = mpsc::channel();
+        let holder = thread::spawn(move || {
+            let mut stdin = stdin;
+            let on_time = released.recv_timeout(Duration::from_secs(30)).is_ok();
+            let write = stdin.write_all(b"late\n");
+            (on_time, write)
+        });
+        (release, holder)
+    }
+
+    #[test]
+    fn stdin_handoff_writer_reaches_cat_and_the_run_succeeds() {
+        let scripts = Scripts::new();
+        let script = scripts.write("handoff-cat.sh", "cat\n");
+        let mut writer = None;
+        let mut handoffs = 0_u32;
+        let mut seen = Vec::new();
+        let run = crate::run_consuming_streams_with_stdin(
+            &mut command(&script),
+            &Limits {
+                stdout: Stream::Consume,
+                ..limits(Duration::from_secs(5))
+            },
+            &AtomicBool::new(false),
+            &mut |mut stdin: ChildStdin| {
+                handoffs = handoffs.saturating_add(1);
+                writer = Some(thread::spawn(move || {
+                    let written = stdin.write_all(b"hello\n");
+                    drop(stdin);
+                    written
+                }));
+            },
+            &mut |which: Which, bytes: &[u8]| {
+                if which == Which::Stdout {
+                    seen.extend_from_slice(bytes);
+                }
+            },
+        );
+        assert!(run.success(), "{:?}", run.end);
+        assert_eq!(handoffs, 1);
+        assert_eq!(seen, b"hello\n");
+        assert!(run.stdout.bytes.is_empty(), "Consume retains nothing");
+        writer
+            .expect("on_stdin was called")
+            .join()
+            .unwrap()
+            .unwrap();
+    }
+
+    #[test]
+    fn stdin_held_open_by_the_caller_still_times_out_killed_and_reaped() {
+        let scripts = Scripts::new();
+        // cat never sees EOF while the caller holds stdin, so only the deadline can end it.
+        let script = scripts.write("handoff-held.sh", "cat\n");
+        let configured = limits(Duration::from_millis(300));
+        let bound = configured.timeout
+            + configured.term_grace
+            + configured.kill_settle * 2
+            + configured.reader_grace
+            + BACKOFF_CAP;
+        let mut held = None;
+        let started = Instant::now();
+        let run = crate::run_consuming_streams_with_stdin(
+            &mut command(&script),
+            &configured,
+            &AtomicBool::new(false),
+            &mut |stdin: ChildStdin| held = Some(hold_stdin(stdin)),
+            &mut |_which: Which, _bytes: &[u8]| {},
+        );
+        let elapsed = started.elapsed();
+        assert!(matches!(&run.end, End::TimedOut), "{:?}", run.end);
+        assert_eq!(run.error(), Some(crate::ProcError::TimedOut));
+        assert_eq!(run.group, GroupState::Terminated);
+        assert!(matches!(run.leader, Leader::Reaped(_)));
+        assert!(elapsed <= bound, "{elapsed:?} > documented bound {bound:?}");
+        let (release, holder) = held.expect("on_stdin was called");
+        release.send(()).unwrap();
+        let (on_time, late_write) = holder.join().unwrap();
+        assert!(on_time, "the caller still held stdin when the run ended");
+        // The group is gone, so the caller's writer sees EPIPE rather than a signal.
+        assert_eq!(late_write.unwrap_err().kind(), io::ErrorKind::BrokenPipe);
+    }
+
+    #[test]
+    fn cancel_while_the_caller_holds_stdin_ends_and_reaps_the_run() {
+        let scripts = Scripts::new();
+        let script = scripts.write("handoff-cancel.sh", "cat\n");
+        let cancel = Arc::new(AtomicBool::new(false));
+        let canceller_flag = Arc::clone(&cancel);
+        let canceller = thread::spawn(move || {
+            thread::sleep(Duration::from_millis(100));
+            canceller_flag.store(true, Ordering::Release);
+        });
+        let mut held = None;
+        let started = Instant::now();
+        let run = crate::run_consuming_streams_with_stdin(
+            &mut command(&script),
+            &limits(Duration::from_secs(10)),
+            &cancel,
+            &mut |stdin: ChildStdin| held = Some(hold_stdin(stdin)),
+            &mut |_which: Which, _bytes: &[u8]| {},
+        );
+        canceller.join().unwrap();
+        assert!(matches!(&run.end, End::Cancelled), "{:?}", run.end);
+        assert_eq!(run.error(), Some(crate::ProcError::Cancelled));
+        assert_eq!(run.group, GroupState::Terminated);
+        assert!(matches!(run.leader, Leader::Reaped(_)));
+        assert!(started.elapsed() < Duration::from_secs(5));
+        let (release, holder) = held.expect("on_stdin was called");
+        release.send(()).unwrap();
+        let (on_time, _late_write) = holder.join().unwrap();
+        assert!(on_time);
+    }
+
+    #[test]
+    fn child_closing_stdin_early_gives_the_writer_broken_pipe_and_still_succeeds() {
+        let scripts = Scripts::new();
+        let script = scripts.write("handoff-closed.sh", "exec 0<&-; sleep 0.1\n");
+        let mut writer = None;
+        let run = crate::run_consuming_streams_with_stdin(
+            &mut command(&script),
+            &limits(Duration::from_secs(5)),
+            &AtomicBool::new(false),
+            &mut |mut stdin: ChildStdin| {
+                writer = Some(thread::spawn(move || {
+                    let chunk = [b'x'; 4096];
+                    // Writes succeed into the pipe buffer until the child's close; a blocked
+                    // writer is woken with EPIPE once the last reader is gone.
+                    loop {
+                        if let Err(error) = stdin.write_all(&chunk) {
+                            return error.kind();
+                        }
+                    }
+                }));
+            },
+            &mut |_which: Which, _bytes: &[u8]| {},
+        );
+        assert!(run.success(), "{:?}", run.end);
+        let kind = writer.expect("on_stdin was called").join().unwrap();
+        assert_eq!(kind, io::ErrorKind::BrokenPipe);
+    }
+
+    #[test]
+    fn stdin_handoff_spawn_failure_skips_the_handoff_and_matches_run() {
+        let program = "/no/such/thegn-proc-program";
+        let mut called = false;
+        let handoff_run = crate::run_consuming_streams_with_stdin(
+            &mut Command::new(program),
+            &Limits::silent(Duration::from_secs(1)),
+            &AtomicBool::new(false),
+            &mut |_stdin: ChildStdin| called = true,
+            &mut |_which: Which, _bytes: &[u8]| {},
+        );
+        let plain = run(
+            &mut Command::new(program),
+            &Limits::silent(Duration::from_secs(1)),
+            &AtomicBool::new(false),
+        );
+        assert!(!called, "on_stdin must not run when spawn fails");
+        assert_eq!(handoff_run.error(), plain.error());
+        assert!(matches!(
+            handoff_run.error(),
+            Some(crate::ProcError::Spawn {
+                kind: io::ErrorKind::NotFound,
+                ..
+            })
+        ));
+        assert_eq!(handoff_run.group, GroupState::Unknown);
+        assert!(matches!(handoff_run.leader, Leader::NotSpawned));
     }
 
     #[test]
