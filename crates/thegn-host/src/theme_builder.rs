@@ -1561,8 +1561,8 @@ fn swatch_strip(p: &Palette) -> [Tok; STRIP_CELLS] {
         palette_fill(&p.panel),
         palette_fill(&p.accent),
         palette_fill(&p.focus),
-        palette_fill(&p.green),
-        palette_fill(&p.red),
+        palette_fill(&p.hues.green),
+        palette_fill(&p.hues.red),
     ]
 }
 
@@ -1826,7 +1826,7 @@ mod tests {
         assert!(text.contains("highlighted: "), "{text}");
         let underlined = surface
             .screen_cells()
-            .iter()
+            .into_iter()
             .flatten()
             .filter(|cell| cell.attrs().underline() != termwiz::cell::Underline::None)
             .count();
