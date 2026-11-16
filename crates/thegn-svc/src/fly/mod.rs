@@ -404,26 +404,38 @@ impl FlyProvider {
     }
 
     /// Typed inventory for `thegn fleet`: one row per ledger sandbox, mapped
-    /// from its app's live managed machine. An app with no live managed machine
-    /// is omitted (the sandbox is gone); a failed or malformed read keeps an
-    /// id-only row and makes the report `Partial`.
+    /// from its app's live managed machine, plus one row per thegn-named app
+    /// in the org listing that the ledger lacks (its id is the app name, so
+    /// it joins as an orphan). A ledger sandbox with no live managed machine
+    /// is omitted (the sandbox is gone); an unledgered app is kept even then
+    /// (it still exists, and may hold a billed IPv4). A failed or malformed
+    /// read keeps an id-only row and makes the report `Partial`; a failed
+    /// app listing leaves the ledger rows and makes the report `Partial`.
     pub async fn sandbox_inventory(&self) -> Result<crate::provider::InventoryReport> {
         use crate::provider::{InventoryReport, SandboxInfo};
         let base = self.spec.api_base()?;
         let mut rows = Vec::new();
         let mut failed = Vec::new();
-        for name in self.ledger_names() {
+        let listed = match self.list_org_apps(&base).await {
+            Ok(apps) => apps,
+            Err(reason) => {
+                failed.push(format!("app listing: {reason}"));
+                Vec::new()
+            }
+        };
+        for target in fleet_targets(self.ledger_names(), &listed) {
             let read = self
-                .get_json(&machines::machines_url(&base, &app_name(&name)))
+                .get_json(&machines::machines_url(&base, &target.app))
                 .await
                 .map_err(|error| format!("{error:#}"))
-                .and_then(|body| sandbox_info_from_machines(&name, &body));
+                .and_then(|body| sandbox_info_from_machines(&target.id, &body));
             match read {
                 Ok(Some(info)) => rows.push(info),
-                Ok(None) => {}
+                Ok(None) if target.ledgered => {}
+                Ok(None) => rows.push(SandboxInfo::id_only(target.id)),
                 Err(reason) => {
-                    failed.push(format!("{name}: {reason}"));
-                    rows.push(SandboxInfo::id_only(name));
+                    failed.push(format!("{}: {reason}", target.id));
+                    rows.push(SandboxInfo::id_only(target.id));
                 }
             }
         }
@@ -435,6 +447,22 @@ impl FlyProvider {
                 reason: failed.join("; "),
             }
         })
+    }
+
+    /// The org's thegn-named apps (one gated `GET /apps?org_slug=`; Fly does
+    /// not page it, and a `total_apps` mismatch is refused as incomplete).
+    async fn list_org_apps(&self, base: &str) -> std::result::Result<Vec<String>, String> {
+        let url = machines::org_apps_url(base, &self.spec.org_slug)
+            .ok_or_else(|| "the org slug is not a plain slug".to_string())?;
+        let body = self
+            .get_json(&url)
+            .await
+            .map_err(|error| format!("{error:#}"))?;
+        let names = machines::parse_org_app_names(&body).map_err(str::to_string)?;
+        Ok(names
+            .into_iter()
+            .filter(|name| machines::is_thegn_app_name(name))
+            .collect())
     }
 
     /// All thegn-managed Fly sandboxes this host created (ledger view).
@@ -961,6 +989,43 @@ pub(crate) fn fly_size_key(cpu_kind: &str, cpus: u64, memory_mb: u64) -> String 
     }
 }
 
+/// One app whose machines `thegn fleet` reads: `id` is the row's sandbox id
+/// (the ledger name, or the app name for an app the ledger lacks).
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct FleetTarget {
+    id: String,
+    app: String,
+    ledgered: bool,
+}
+
+/// Union the ledger with the listed apps: every ledger sandbox (its app is
+/// [`app_name`]), then each thegn-named listed app no ledger sandbox maps to,
+/// once. Listed names that are not thegn-shaped are dropped.
+fn fleet_targets(ledger: Vec<String>, listed: &[String]) -> Vec<FleetTarget> {
+    let mut seen_apps = std::collections::HashSet::new();
+    let mut targets = Vec::with_capacity(ledger.len() + listed.len());
+    for name in ledger {
+        let app = app_name(&name);
+        if seen_apps.insert(app.clone()) {
+            targets.push(FleetTarget {
+                id: name,
+                app,
+                ledgered: true,
+            });
+        }
+    }
+    for app in listed {
+        if machines::is_thegn_app_name(app) && seen_apps.insert(app.clone()) {
+            targets.push(FleetTarget {
+                id: app.clone(),
+                app: app.clone(),
+                ledgered: false,
+            });
+        }
+    }
+    targets
+}
+
 /// Map an app's machine list (`GET /apps/<app>/machines`) to the sandbox's
 /// inventory row: the sole live thegn-managed machine's size, region, state
 /// and `created_at`. `Ok(None)` when no live managed machine exists.
@@ -1004,6 +1069,45 @@ pub(crate) fn sandbox_info_from_machines(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn fleet_targets_union_ledger_with_thegn_named_apps_once() {
+        let ledger_app = app_name("tg-sbx");
+        assert!(machines::is_thegn_app_name(&ledger_app));
+        let orphan = "tg-0123456789ab".to_string();
+        assert_ne!(orphan, ledger_app);
+        let listed = [
+            ledger_app.clone(),
+            "not-ours".to_string(),
+            orphan.clone(),
+            orphan.clone(),
+            "tg-short".to_string(),
+        ];
+        let targets = fleet_targets(vec!["tg-sbx".into(), "tg-sbx".into()], &listed);
+        assert_eq!(
+            targets,
+            vec![
+                FleetTarget {
+                    id: "tg-sbx".into(),
+                    app: ledger_app,
+                    ledgered: true,
+                },
+                FleetTarget {
+                    id: orphan.clone(),
+                    app: orphan,
+                    ledgered: false,
+                },
+            ]
+        );
+        // A failed listing (no apps) leaves exactly the ledger rows.
+        assert_eq!(
+            fleet_targets(vec!["tg-sbx".into()], &[])
+                .into_iter()
+                .map(|target| target.id)
+                .collect::<Vec<_>>(),
+            vec!["tg-sbx"]
+        );
+    }
 
     #[tokio::test]
     async fn invalid_names_are_rejected_before_fly_http_or_cached_ip() {
