@@ -2101,7 +2101,7 @@ fn runtime_escape_oci_masks_a_local_run_user_mount() {
         let (_temp, runtime, sandbox) = oci_runtime_escape_fixture(backend);
         let argv = oci_create_opts_in(&sandbox, &[], Some(&runtime)).unwrap();
         let bus = format!("/dev/null:{}/bus:ro", runtime.display());
-        assert!(argv.iter().any(|arg| *arg == bus), "{backend:?}: {argv:?}");
+        assert!(argv.contains(&bus), "{backend:?}: {argv:?}");
     }
 }
 
@@ -2132,7 +2132,7 @@ fn runtime_escape_oci_honours_an_explicit_podman_socket_mount() {
             .any(|pair| pair == ["--tmpfs", systemd_arg.as_str()]),
         "{argv:?}"
     );
-    assert!(argv.iter().any(|arg| *arg == bus_arg), "{argv:?}");
+    assert!(argv.contains(&bus_arg), "{argv:?}");
 }
 
 #[test]
