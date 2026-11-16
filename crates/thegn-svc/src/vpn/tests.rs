@@ -1147,6 +1147,7 @@ fn hand_run(end: End, leader: Leader) -> Run {
         group: GroupState::Terminated,
         leader,
         leader_exited_first: true,
+        idle_expired: false,
         stdout: captured(b"", false),
         stderr: captured(b"", false),
         containment: thegn_proc::Containment::ProcessGroup,
