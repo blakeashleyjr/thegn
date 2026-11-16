@@ -946,7 +946,17 @@ pub(super) fn paint_freq(grid: &mut CellGrid, rect: Rect, part: &CpuFreqPart, he
     let mut profile_line = format!("profile {profile}");
     let (perf, eff) = part.core_class_counts();
     if perf > 0 && eff > 0 {
-        write!(profile_line, " hybrid {perf}P/{eff}E").expect("write to String");
+        let class_mhz = |class| {
+            part.class_mean_cur_mhz(class)
+                .map_or_else(|| mark(missing).to_owned(), |mhz| format!("{mhz}MHz"))
+        };
+        write!(
+            profile_line,
+            " hybrid {perf}P {} / {eff}E {}",
+            class_mhz(CoreClass::Performance),
+            class_mhz(CoreClass::Efficiency)
+        )
+        .expect("write to String");
     }
     if part.power.itmt == Some(true) {
         profile_line.push_str(" itmt");
