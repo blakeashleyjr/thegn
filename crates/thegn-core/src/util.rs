@@ -78,12 +78,33 @@ pub fn thegn_dir() -> PathBuf {
 
 /// Expand a leading `~` to `$HOME` (config values may contain it literally).
 pub fn expand_tilde(p: &str) -> String {
+    expand_tilde_in(p, &home())
+}
+
+/// Pure form of [`expand_tilde`]: expand a leading `~` / `~/` against `home`.
+/// `~user/x` and absolute paths are returned unchanged.
+pub fn expand_tilde_in(p: &str, home: &Path) -> String {
     if p == "~" {
-        home().to_string_lossy().into_owned()
+        home.to_string_lossy().into_owned()
     } else if let Some(rest) = p.strip_prefix("~/") {
-        home().join(rest).to_string_lossy().into_owned()
+        home.join(rest).to_string_lossy().into_owned()
     } else {
         p.to_string()
+    }
+}
+
+#[cfg(test)]
+mod expand_tilde_in_tests {
+    use super::expand_tilde_in;
+    use std::path::Path;
+
+    #[test]
+    fn expands_bare_and_slash_forms_only() {
+        let h = Path::new("/acct");
+        assert_eq!(expand_tilde_in("~", h), "/acct");
+        assert_eq!(expand_tilde_in("~/x/y", h), "/acct/x/y");
+        assert_eq!(expand_tilde_in("~user/x", h), "~user/x");
+        assert_eq!(expand_tilde_in("/abs/~/x", h), "/abs/~/x");
     }
 }
 
