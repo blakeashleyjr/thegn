@@ -6249,3 +6249,211 @@ fn git_common_mount_is_omitted_outside_a_repo() {
     assert!(want.as_os_str().is_empty());
     assert!(!hosts.iter().any(|h| h.ends_with("/.git")), "{hosts:?}");
 }
+
+/// A fake linked worktree on disk for `git_policy_mounts`: `<td>/repo/.git`
+/// (common dir with objects, refs, logs, config and `worktrees/lane`) and
+/// `<td>/wt` (the worktree, with its `.git` gitfile).
+struct GitFixture {
+    _td: tempfile::TempDir,
+    common: std::path::PathBuf,
+    admin: std::path::PathBuf,
+    wt: std::path::PathBuf,
+}
+
+fn git_fixture() -> GitFixture {
+    let td = tempfile::tempdir().unwrap();
+    let common = td.path().join("repo/.git");
+    let admin = common.join("worktrees/lane");
+    let wt = td.path().join("wt");
+    for dir in [
+        common.join("objects"),
+        common.join("refs/heads"),
+        common.join("hooks"),
+        admin.clone(),
+        wt.clone(),
+    ] {
+        std::fs::create_dir_all(dir).unwrap();
+    }
+    std::fs::write(common.join("config"), "[core]\n").unwrap();
+    std::fs::write(common.join("refs/heads/main"), "0\n").unwrap();
+    std::fs::write(admin.join("commondir"), "../..\n").unwrap();
+    std::fs::write(admin.join("gitdir"), "x\n").unwrap();
+    std::fs::write(wt.join(".git"), "gitdir: x\n").unwrap();
+    GitFixture {
+        _td: td,
+        common,
+        admin,
+        wt,
+    }
+}
+
+fn git_probe(fx: &GitFixture, branch: &str, target: Option<&str>) -> GitProbe {
+    GitProbe {
+        common: fx.common.clone(),
+        admin: Some(fx.admin.clone()),
+        branch: Some(branch.to_string()),
+        target: target.map(str::to_string),
+        default: Some("main".to_string()),
+    }
+}
+
+fn git_cfg(mode: crate::config::SandboxGitMode) -> crate::config::SandboxGitConfig {
+    crate::config::SandboxGitConfig {
+        mode,
+        ..Default::default()
+    }
+}
+
+fn bwrap_git_argv(fx: &GitFixture, mounts: Vec<Mount>) -> Vec<String> {
+    let mut s = spec(Backend::Bwrap);
+    s.worktree = fx.wt.clone();
+    s.mounts = mounts;
+    backend_enter_argv_with_env(&s, "true", SandboxArgvEnv::default()).unwrap()
+}
+
+fn triple_at(argv: &[String], flag: &str, path: &std::path::Path) -> Option<usize> {
+    let p = path.display().to_string();
+    argv.windows(3)
+        .position(|t| t == [flag, p.as_str(), p.as_str()])
+}
+
+#[test]
+fn git_policy_commit_only_binds_common_ro_then_lane_carve_outs() {
+    use crate::config::SandboxGitMode;
+    let fx = git_fixture();
+    let (mounts, warning) = git_policy_mounts(
+        &git_cfg(SandboxGitMode::CommitOnly),
+        &fx.wt,
+        &git_probe(&fx, "tg/lane", Some("main")),
+    );
+    assert_eq!(warning, None);
+    // The plan's mkdirs ran on the host.
+    assert!(fx.common.join("refs/heads/tg").is_dir());
+    assert!(fx.common.join("logs/refs/heads/tg").is_dir());
+    let argv = bwrap_git_argv(&fx, mounts.clone());
+    let wt = triple_at(&argv, "--bind", &fx.wt).expect("worktree rw");
+    let common_ro = triple_at(&argv, "--ro-bind", &fx.common).expect("common dir ro");
+    let objects = triple_at(&argv, "--bind", &fx.common.join("objects")).expect("objects rw");
+    let admin = triple_at(&argv, "--bind", &fx.admin).expect("admin dir rw");
+    let heads = triple_at(&argv, "--bind", &fx.common.join("refs/heads/tg")).expect("lane refs rw");
+    let config = triple_at(&argv, "--ro-bind", &fx.common.join("config")).expect("config pin");
+    let gitfile = triple_at(&argv, "--ro-bind", &fx.wt.join(".git")).expect("gitfile pin");
+    let commondir =
+        triple_at(&argv, "--ro-bind", &fx.admin.join("commondir")).expect("commondir pin");
+    assert!(wt < common_ro && common_ro < objects, "{argv:?}");
+    assert!(
+        objects < config && admin < config && heads < config,
+        "{argv:?}"
+    );
+    assert!(config < gitfile && admin < commondir, "{argv:?}");
+    // The missing config.worktree was created so its re-pin applies.
+    assert!(fx.admin.join("config.worktree").exists());
+    assert!(triple_at(&argv, "--bind", &fx.common).is_none(), "{argv:?}");
+    // Nothing writable covers main's ref, hooks or the shared config.
+    for protected in [
+        "refs/heads/main",
+        "hooks/pre-commit",
+        "config",
+        "packed-refs",
+    ] {
+        let path = fx.common.join(protected);
+        assert!(
+            !mounts
+                .iter()
+                .any(|m| !m.ro && path.starts_with(std::path::Path::new(&m.dest))),
+            "{protected} is under a rw bind: {mounts:?}"
+        );
+    }
+}
+
+#[test]
+fn git_policy_read_only_makes_the_worktree_ro() {
+    use crate::config::SandboxGitMode;
+    let fx = git_fixture();
+    let (mounts, warning) = git_policy_mounts(
+        &git_cfg(SandboxGitMode::ReadOnly),
+        &fx.wt,
+        &git_probe(&fx, "tg/lane", Some("main")),
+    );
+    assert_eq!(warning, None);
+    assert!(mounts.iter().all(|m| m.ro), "{mounts:?}");
+    let argv = bwrap_git_argv(&fx, mounts);
+    assert!(triple_at(&argv, "--ro-bind", &fx.wt).is_some(), "{argv:?}");
+    assert!(
+        triple_at(&argv, "--ro-bind", &fx.common).is_some(),
+        "{argv:?}"
+    );
+}
+
+#[test]
+fn git_policy_top_level_branch_falls_back_to_read_only_git_with_a_warning() {
+    use crate::config::SandboxGitMode;
+    let fx = git_fixture();
+    let (mounts, warning) = git_policy_mounts(
+        &git_cfg(SandboxGitMode::CommitOnly),
+        &fx.wt,
+        &git_probe(&fx, "feature", Some("main")),
+    );
+    let warning = warning.expect("fallback warns");
+    assert!(warning.contains("top-level"), "{warning}");
+    assert!(warning.contains("tg/<name>"), "{warning}");
+    // The worktree stays writable; every git bind is read-only.
+    assert_eq!(mounts[0].dest, fx.wt.to_string_lossy());
+    assert!(!mounts[0].ro);
+    assert!(mounts[1..].iter().all(|m| m.ro), "{mounts:?}");
+    assert!(
+        mounts
+            .iter()
+            .any(|m| m.ro && std::path::Path::new(&m.dest) == fx.common)
+    );
+
+    // mode = "full" keeps today's read-write common dir for the same branch.
+    let (full, warning) = git_policy_mounts(
+        &git_cfg(SandboxGitMode::Full),
+        &fx.wt,
+        &git_probe(&fx, "feature", Some("main")),
+    );
+    assert!(warning.is_some());
+    assert!(
+        full.iter()
+            .any(|m| !m.ro && std::path::Path::new(&m.dest) == fx.common),
+        "{full:?}"
+    );
+}
+
+#[test]
+fn git_policy_unknown_target_fails_closed_even_for_full() {
+    use crate::config::SandboxGitMode;
+    let fx = git_fixture();
+    for mode in [SandboxGitMode::CommitOnly, SandboxGitMode::Full] {
+        let (mounts, warning) =
+            git_policy_mounts(&git_cfg(mode), &fx.wt, &git_probe(&fx, "tg/lane", None));
+        assert!(warning.is_some(), "{mode}");
+        assert!(!mounts[0].ro, "{mode}: worktree stays writable");
+        assert!(mounts[1..].iter().all(|m| m.ro), "{mode}: {mounts:?}");
+    }
+}
+
+#[test]
+fn git_policy_main_checkout_gets_a_read_only_git_dir() {
+    use crate::config::SandboxGitMode;
+    let fx = git_fixture();
+    let main = fx.common.parent().unwrap().to_path_buf();
+    let probe = GitProbe {
+        common: fx.common.clone(),
+        admin: None,
+        branch: Some("main".into()),
+        target: Some("main".into()),
+        default: Some("main".into()),
+    };
+    let (mounts, warning) = git_policy_mounts(&git_cfg(SandboxGitMode::CommitOnly), &main, &probe);
+    assert!(warning.expect("warns").contains("main checkout"));
+    assert!(!mounts[0].ro);
+    assert!(
+        mounts
+            .iter()
+            .any(|m| m.ro && std::path::Path::new(&m.dest) == fx.common),
+        "{mounts:?}"
+    );
+    assert!(mounts[1..].iter().all(|m| m.ro), "{mounts:?}");
+}

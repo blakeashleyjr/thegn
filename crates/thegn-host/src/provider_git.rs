@@ -20,7 +20,8 @@ use std::ffi::OsStr;
 use std::path::Path;
 
 use anyhow::Context;
-use thegn_core::config::Config;
+use thegn_core::config::{Config, SandboxGitConfig, SandboxGitMode};
+use thegn_core::config_sandbox::git_policy;
 use thegn_core::syncstate;
 use thegn_svc::provider::Provider;
 
@@ -89,6 +90,9 @@ impl PullOutcome {
 pub(crate) struct PullReport {
     pub branch: String,
     pub outcome: PullOutcome,
+    /// `push-lane` only: what happened to the push of the fast-forwarded
+    /// branch to `origin` (`None` when no push was due).
+    pub push: Option<String>,
 }
 
 fn short(oid: &str) -> &str {
@@ -98,6 +102,13 @@ fn short(oid: &str) -> &str {
 impl PullReport {
     /// The one-line CLI summary.
     pub(crate) fn summary(&self) -> String {
+        match &self.push {
+            Some(push) => format!("{}; {push}", self.outcome_summary()),
+            None => self.outcome_summary(),
+        }
+    }
+
+    fn outcome_summary(&self) -> String {
         let branch = &self.branch;
         match &self.outcome {
             PullOutcome::UpToDate => "up to date".to_string(),
@@ -199,6 +210,85 @@ pub(crate) fn check_pull_target(
         ));
     }
     Ok(())
+}
+
+/// The merge target as the `[sandbox.git]` policy checks see it: `auto` (or
+/// blank) is the default branch, `None` when that is unknown too.
+fn policy_target<'a>(merge_target: &'a str, default_branch: Option<&'a str>) -> Option<&'a str> {
+    let target = merge_target.trim();
+    if target.is_empty() || target == "auto" {
+        default_branch
+    } else {
+        Some(target)
+    }
+}
+
+/// The `[sandbox.git]` gate on a pull-back into `branch` (THE-2021): a
+/// `read-only` sandbox has nothing to pull, and the ref must pass
+/// [`git_policy::check_pull_ref`] (merge target, default branch, `deny_refs`).
+/// `default_branch` is `None` when unknown. Pure.
+pub(crate) fn check_pull_policy(
+    git: &SandboxGitConfig,
+    branch: &str,
+    default_branch: Option<&str>,
+    merge_target: &str,
+) -> Result<(), String> {
+    if git.mode == SandboxGitMode::ReadOnly {
+        return Err("mode = read-only: the sandbox cannot produce commits to pull".to_string());
+    }
+    git_policy::check_pull_ref(
+        git,
+        &format!("refs/heads/{}", short_branch(branch)),
+        policy_target(merge_target, default_branch),
+        default_branch,
+    )
+}
+
+/// Should a pull-back that fast-forwarded `branch` push it to `origin`?
+/// `None` outside `push-lane`; otherwise [`git_policy::check_push_ref`]'s
+/// verdict (`push_refs` match, never the merge target / default branch /
+/// `deny_refs`). Pure.
+pub(crate) fn push_decision(
+    git: &SandboxGitConfig,
+    branch: &str,
+    default_branch: Option<&str>,
+    merge_target: &str,
+) -> Option<Result<(), String>> {
+    (git.mode == SandboxGitMode::PushLane).then(|| {
+        git_policy::check_push_ref(
+            git,
+            &format!("refs/heads/{}", short_branch(branch)),
+            policy_target(merge_target, default_branch),
+            default_branch,
+        )
+    })
+}
+
+/// The worktree env's effective `[sandbox.git]`: the global table with the
+/// `[env.<name>.sandbox.git]` overlay applied.
+fn env_git_policy(cfg: &Config, env_name: &str) -> SandboxGitConfig {
+    match cfg
+        .env
+        .get(env_name)
+        .and_then(|env| env.sandbox.git.as_ref())
+    {
+        Some(overlay) => cfg.sandbox.git.merged(overlay),
+        None => cfg.sandbox.git.clone(),
+    }
+}
+
+/// `git push origin refs/heads/<branch>:refs/heads/<branch>` from the host
+/// (`push-lane`, after a fast-forward); the one-line result for the report.
+fn push_lane_branch(worktree: &Path, branch: &str) -> String {
+    let refspec = format!("refs/heads/{branch}:refs/heads/{branch}");
+    match git_write(
+        worktree,
+        ["push", "--porcelain", "origin", refspec.as_str()],
+        &format!("git push origin {branch}"),
+    ) {
+        Ok(_) => format!("pushed {branch} to origin"),
+        Err(error) => format!("push of {branch} to origin failed: {error:#}"),
+    }
 }
 
 /// The scratch ref a worktree's pull-back fetches into: the worktree's
@@ -561,6 +651,10 @@ pub(crate) fn pull_back(
         &merge_target,
     )
     .map_err(anyhow::Error::msg)?;
+    // check_pull_target has failed closed on an unknown default branch.
+    let known_default = default_branch.as_deref().ok();
+    let git = env_git_policy(cfg, env_name);
+    check_pull_policy(&git, &branch, known_default, &merge_target).map_err(anyhow::Error::msg)?;
     let local_tip = branch_tip(wt, &branch)?;
     let (provider, id, workdir) = provider_target(cfg, worktree, env_name)?;
 
@@ -585,7 +679,32 @@ pub(crate) fn pull_back(
         outcome = outcome_label,
         "env pull"
     );
-    result.map(|outcome| PullReport { branch, outcome })
+    let outcome = result?;
+    let push = match (
+        &outcome,
+        push_decision(&git, &branch, known_default, &merge_target),
+    ) {
+        (PullOutcome::FastForwarded { .. }, Some(Ok(()))) => {
+            let push = push_lane_branch(wt, &branch);
+            tracing::info!(
+                target: "thegn::git_audit",
+                worktree,
+                branch = %branch,
+                result = %push,
+                "env pull push-lane"
+            );
+            Some(push)
+        }
+        (PullOutcome::FastForwarded { .. }, Some(Err(refusal))) => {
+            Some(format!("not pushed: {refusal}"))
+        }
+        _ => None,
+    };
+    Ok(PullReport {
+        branch,
+        outcome,
+        push,
+    })
 }
 
 fn pull_from_sandbox(
@@ -653,10 +772,12 @@ fn download_and_apply(
 mod tests {
     use super::{
         MAX_SEED_BUNDLE_BYTES, PULL_REF_PREFIX, PullOutcome, PullReport, apply_pulled_bundle,
-        branch_tip, bundle_branch, check_pull_target, classify_pull, is_protected_branch,
-        no_exec_channel_message, pull_ref_for, seed_cap_message,
+        branch_tip, bundle_branch, check_pull_policy, check_pull_target, classify_pull,
+        is_protected_branch, no_exec_channel_message, pull_ref_for, push_decision,
+        seed_cap_message,
     };
     use std::path::Path;
+    use thegn_core::config::{SandboxGitConfig, SandboxGitMode};
 
     const A: &str = "1111111111111111111111111111111111111111";
 
@@ -697,6 +818,54 @@ mod tests {
     const B: &str = "2222222222222222222222222222222222222222";
 
     #[test]
+    fn pull_policy_denies_main_and_read_only_mode() {
+        let git = SandboxGitConfig::default();
+        let main = check_pull_policy(&git, "main", Some("main"), "auto").unwrap_err();
+        assert!(main.contains("refs/heads/main"), "{main}");
+        // An explicit merge target is denied even when it is not the default.
+        assert!(check_pull_policy(&git, "release", Some("main"), "release").is_err());
+        assert!(check_pull_policy(&git, "refs/heads/main", Some("main"), "auto").is_err());
+        assert_eq!(
+            check_pull_policy(&git, "tg/lane", Some("main"), "auto"),
+            Ok(())
+        );
+        let read_only = SandboxGitConfig {
+            mode: SandboxGitMode::ReadOnly,
+            ..SandboxGitConfig::default()
+        };
+        assert_eq!(
+            check_pull_policy(&read_only, "tg/lane", Some("main"), "auto"),
+            Err("mode = read-only: the sandbox cannot produce commits to pull".to_string())
+        );
+    }
+
+    #[test]
+    fn push_lane_pushes_only_tg_lanes() {
+        let commit_only = SandboxGitConfig::default();
+        assert_eq!(
+            push_decision(&commit_only, "tg/lane", Some("main"), "auto"),
+            None
+        );
+        let push_lane = SandboxGitConfig {
+            mode: SandboxGitMode::PushLane,
+            push_refs: vec!["refs/heads/tg/*".into()],
+            ..SandboxGitConfig::default()
+        };
+        assert_eq!(
+            push_decision(&push_lane, "tg/lane", Some("main"), "auto"),
+            Some(Ok(()))
+        );
+        assert!(matches!(
+            push_decision(&push_lane, "feat/x", Some("main"), "auto"),
+            Some(Err(_))
+        ));
+        assert!(matches!(
+            push_decision(&push_lane, "main", Some("main"), "auto"),
+            Some(Err(_))
+        ));
+    }
+
+    #[test]
     fn classifier_covers_every_outcome() {
         let r = "refs/thegn/pull/wt";
         assert_eq!(
@@ -731,6 +900,7 @@ mod tests {
         let report = |outcome| PullReport {
             branch: "feat".into(),
             outcome,
+            push: None,
         };
         assert_eq!(report(PullOutcome::UpToDate).summary(), "up to date");
         assert_eq!(
