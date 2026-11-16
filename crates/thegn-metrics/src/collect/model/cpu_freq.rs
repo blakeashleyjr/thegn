@@ -28,7 +28,7 @@ impl CpuFreqPart {
             .fold((0_u64, 0_u64), |(sum, count), value| {
                 (sum + value, count + 1)
             });
-        (count > 0).then_some(sum / count / 1000)
+        (count > 0).then(|| sum / count / 1000)
     }
     /// Mean current frequency (MHz) over the policies of `class` that report
     /// one; `None` when no such policy has a current value.
@@ -41,7 +41,7 @@ impl CpuFreqPart {
             .fold((0_u64, 0_u64), |(sum, count), value| {
                 (sum.saturating_add(value), count + 1)
             });
-        (count > 0).then_some(sum / count / 1000)
+        (count > 0).then(|| sum / count / 1000)
     }
     pub fn max_cur_khz(&self) -> Option<u64> {
         self.policies.iter().filter_map(|p| p.cur_khz).max()

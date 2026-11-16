@@ -1405,7 +1405,7 @@ fn pending_teardown_carries_forward_only_for_the_same_container_id() {
     let previous = SidecarRecord {
         version: 1,
         container: "c-tgvpn".into(),
-        prefix: vec!["podman".into()],
+        prefix: vec![String::from("podman")],
         id: "a".repeat(64),
         worktree: Some("/w".into()),
         generation: Some(4),
@@ -1431,7 +1431,7 @@ fn pending_teardown_cap_fits_the_record_size_limit() {
     let record = SidecarRecord {
         version: 1,
         container: "c".repeat(200),
-        prefix: vec!["podman".into()],
+        prefix: vec![String::from("podman")],
         id: "a".repeat(64),
         worktree: Some("/w".repeat(512)),
         generation: Some(u64::MAX),
