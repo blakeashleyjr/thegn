@@ -190,6 +190,156 @@ self: {
     };
   };
 
+  # Threshold pair shared by `stats.alerts.<metric>` and `usage.alerts.used`.
+  # Option names are the TOML keys, so the rendered attrset maps 1:1.
+  alertRuleSubmodule = lib.types.submodule {
+    options = {
+      warn = lib.mkOption {
+        type = lib.types.nullOr lib.types.number;
+        default = null;
+        description = "Warn threshold. 0 disables this level. Unset (null) = the binary's default.";
+      };
+      critical = lib.mkOption {
+        type = lib.types.nullOr lib.types.number;
+        default = null;
+        description = "Critical threshold. 0 disables this level. Unset (null) = the binary's default.";
+      };
+    };
+  };
+
+  # Whole-second counts inside the alert submodules (u32 in the Rust schema).
+  alertSecs = lib.types.nullOr lib.types.ints.u32;
+
+  statsAlertsSubmodule = lib.types.submodule {
+    options = {
+      enabled = lib.mkOption {
+        type = lib.types.nullOr lib.types.bool;
+        default = null;
+        description = "Master switch for these alerts. Unset (null) = the binary's default.";
+      };
+      toast = lib.mkOption {
+        type = lib.types.nullOr lib.types.bool;
+        default = null;
+        description = "Pop a transient in-app toast when an alert fires. Unset (null) = the binary's default.";
+      };
+      notify = lib.mkOption {
+        type = lib.types.nullOr lib.types.bool;
+        default = null;
+        description = "Also record alerts to the notification inbox. Unset (null) = the binary's default.";
+      };
+      sustain_secs = lib.mkOption {
+        type = alertSecs;
+        default = null;
+        description = "Seconds past a threshold before an alert fires. Unset (null) = the binary's default.";
+      };
+      repeat_secs = lib.mkOption {
+        type = alertSecs;
+        default = null;
+        description = "Minimum seconds between repeats of a standing alert. Unset (null) = the binary's default.";
+      };
+      clear_margin = lib.mkOption {
+        type = lib.types.nullOr lib.types.number;
+        default = null;
+        description = "Fractional retreat past the threshold required before an alert clears. Unset (null) = the binary's default.";
+      };
+      notify_clear = lib.mkOption {
+        type = lib.types.nullOr lib.types.bool;
+        default = null;
+        description = "Emit an event when an alert clears. Unset (null) = the binary's default.";
+      };
+      cpu = lib.mkOption {
+        type = lib.types.nullOr alertRuleSubmodule;
+        default = null;
+        description = "Warn/critical thresholds for cpu. Unset (null) = the binary's default.";
+      };
+      mem = lib.mkOption {
+        type = lib.types.nullOr alertRuleSubmodule;
+        default = null;
+        description = "Warn/critical thresholds for mem. Unset (null) = the binary's default.";
+      };
+      swap = lib.mkOption {
+        type = lib.types.nullOr alertRuleSubmodule;
+        default = null;
+        description = "Warn/critical thresholds for swap. Unset (null) = the binary's default.";
+      };
+      gpu = lib.mkOption {
+        type = lib.types.nullOr alertRuleSubmodule;
+        default = null;
+        description = "Warn/critical thresholds for gpu. Unset (null) = the binary's default.";
+      };
+      temp = lib.mkOption {
+        type = lib.types.nullOr alertRuleSubmodule;
+        default = null;
+        description = "Warn/critical thresholds for temp. Unset (null) = the binary's default.";
+      };
+      load = lib.mkOption {
+        type = lib.types.nullOr alertRuleSubmodule;
+        default = null;
+        description = "Warn/critical thresholds for load. Unset (null) = the binary's default.";
+      };
+      disk_free = lib.mkOption {
+        type = lib.types.nullOr alertRuleSubmodule;
+        default = null;
+        description = "Warn/critical thresholds for disk_free. Unset (null) = the binary's default.";
+      };
+      battery = lib.mkOption {
+        type = lib.types.nullOr alertRuleSubmodule;
+        default = null;
+        description = "Warn/critical thresholds for battery. Unset (null) = the binary's default.";
+      };
+      reclaim = lib.mkOption {
+        type = lib.types.nullOr alertRuleSubmodule;
+        default = null;
+        description = "Warn/critical thresholds for reclaim. Unset (null) = the binary's default.";
+      };
+      disk_eta = lib.mkOption {
+        type = lib.types.nullOr alertRuleSubmodule;
+        default = null;
+        description = "Warn/critical thresholds for disk_eta. Unset (null) = the binary's default.";
+      };
+    };
+  };
+
+  usageAlertsSubmodule = lib.types.submodule {
+    options = {
+      enabled = lib.mkOption {
+        type = lib.types.nullOr lib.types.bool;
+        default = null;
+        description = "Master switch for these alerts. Unset (null) = the binary's default.";
+      };
+      notify = lib.mkOption {
+        type = lib.types.nullOr lib.types.bool;
+        default = null;
+        description = "Also record alerts to the notification inbox. Unset (null) = the binary's default.";
+      };
+      sustain_secs = lib.mkOption {
+        type = alertSecs;
+        default = null;
+        description = "Seconds past a threshold before an alert fires. Unset (null) = the binary's default.";
+      };
+      repeat_secs = lib.mkOption {
+        type = alertSecs;
+        default = null;
+        description = "Minimum seconds between repeats of a standing alert. Unset (null) = the binary's default.";
+      };
+      clear_margin = lib.mkOption {
+        type = lib.types.nullOr lib.types.number;
+        default = null;
+        description = "Fractional retreat past the threshold required before an alert clears. Unset (null) = the binary's default.";
+      };
+      notify_clear = lib.mkOption {
+        type = lib.types.nullOr lib.types.bool;
+        default = null;
+        description = "Emit an event when an alert clears. Unset (null) = the binary's default.";
+      };
+      used = lib.mkOption {
+        type = lib.types.nullOr alertRuleSubmodule;
+        default = null;
+        description = "Warn/critical thresholds for used. Unset (null) = the binary's default.";
+      };
+    };
+  };
+
   tomlFormat = pkgs.formats.toml {};
 
   pruneNulls = lib.filterAttrsRecursive (_: v: v != null);
@@ -270,6 +420,11 @@ self: {
     ui.sidebar_icon_ahead = cfg.uiSidebarIconAhead;
     ui.sidebar_icon_behind = cfg.uiSidebarIconBehind;
     ui.sidebar_icon_status = cfg.uiSidebarIconStatus;
+    ui.sidebar_external_worktrees = cfg.uiSidebarExternalWorktrees;
+    ui.sidebar_other_group_label = cfg.uiSidebarOtherGroupLabel;
+    ui.sidebar_other_group_collapsed = cfg.uiSidebarOtherGroupCollapsed;
+    ui.sidebar_group_row_limit = cfg.uiSidebarGroupRowLimit;
+    ui.sidebar_group_row_limits = cfg.uiSidebarGroupRowLimits;
     search.max_results = cfg.searchMaxResults;
     search.respect_gitignore = cfg.searchRespectGitignore;
     search.include_hidden = cfg.searchIncludeHidden;
@@ -338,6 +493,55 @@ self: {
     stats.disk_free_warn = cfg.statsDiskFreeWarn;
     stats.disk_free_critical = cfg.statsDiskFreeCritical;
     stats.disk_path = cfg.statsDiskPath;
+    stats.alerts = {
+      enabled = cfg.statsAlerts.enabled or null;
+      toast = cfg.statsAlerts.toast or null;
+      notify = cfg.statsAlerts.notify or null;
+      sustain_secs = cfg.statsAlerts.sustain_secs or null;
+      repeat_secs = cfg.statsAlerts.repeat_secs or null;
+      clear_margin = cfg.statsAlerts.clear_margin or null;
+      notify_clear = cfg.statsAlerts.notify_clear or null;
+      cpu = {
+        warn = cfg.statsAlerts.cpu.warn or null;
+        critical = cfg.statsAlerts.cpu.critical or null;
+      };
+      mem = {
+        warn = cfg.statsAlerts.mem.warn or null;
+        critical = cfg.statsAlerts.mem.critical or null;
+      };
+      swap = {
+        warn = cfg.statsAlerts.swap.warn or null;
+        critical = cfg.statsAlerts.swap.critical or null;
+      };
+      gpu = {
+        warn = cfg.statsAlerts.gpu.warn or null;
+        critical = cfg.statsAlerts.gpu.critical or null;
+      };
+      temp = {
+        warn = cfg.statsAlerts.temp.warn or null;
+        critical = cfg.statsAlerts.temp.critical or null;
+      };
+      load = {
+        warn = cfg.statsAlerts.load.warn or null;
+        critical = cfg.statsAlerts.load.critical or null;
+      };
+      disk_free = {
+        warn = cfg.statsAlerts.disk_free.warn or null;
+        critical = cfg.statsAlerts.disk_free.critical or null;
+      };
+      battery = {
+        warn = cfg.statsAlerts.battery.warn or null;
+        critical = cfg.statsAlerts.battery.critical or null;
+      };
+      reclaim = {
+        warn = cfg.statsAlerts.reclaim.warn or null;
+        critical = cfg.statsAlerts.reclaim.critical or null;
+      };
+      disk_eta = {
+        warn = cfg.statsAlerts.disk_eta.warn or null;
+        critical = cfg.statsAlerts.disk_eta.critical or null;
+      };
+    };
     notifications.desktop = cfg.notificationsDesktop;
     notifications.surface_self_log_errors = cfg.notificationsSurfaceSelfLogErrors;
     notifications.github_mentions = cfg.notificationsGithubMentions;
@@ -346,6 +550,8 @@ self: {
     notifications.dnd.enabled = cfg.notificationsDndEnabled;
     notifications.dnd.allow_priority = cfg.notificationsDndAllowPriority;
     notifications.dnd.windows = cfg.notificationsDndWindows;
+    notifications.desktop_min_urgency = cfg.notificationsDesktopMinUrgency;
+    notifications.process_exit = cfg.notificationsProcessExit;
     notifications.sound.mode = cfg.notificationsSoundMode;
     notifications.sound.always_kinds = cfg.notificationsSoundAlwaysKinds;
     notifications.sound.mute = cfg.notificationsSoundMute;
@@ -353,6 +559,8 @@ self: {
     notifications.sound.volume = cfg.notificationsSoundVolume;
     notifications.sound.min_priority = cfg.notificationsSoundMinPriority;
     notifications.sound.per_kind = cfg.notificationsSoundPerKind;
+    notifications.sound.pack = cfg.notificationsSoundPack;
+    notifications.sound.chime_file = cfg.notificationsSoundChimeFile;
     activity.enabled = cfg.activityEnabled;
     activity.red_requires_agent = cfg.activityRedRequiresAgent;
     activity.agent_programs = cfg.activityAgentPrograms;
@@ -376,6 +584,8 @@ self: {
     media.poll_interval_secs = cfg.mediaPollIntervalSecs;
     media.players_priority = cfg.mediaPlayersPriority;
     media.volume_step = cfg.mediaVolumeStep;
+    media.mpv.socket = cfg.mediaMpvSocket;
+    media.mpd.socket = cfg.mediaMpdSocket;
     monitor = {
       system = cfg.monitorSystem;
       gpu = cfg.monitorGpu;
@@ -424,6 +634,18 @@ self: {
     usage.crit_percent = cfg.usageCritPercent;
     usage.providers = cfg.usageProviders;
     usage.profile_roots = cfg.usageProfileRoots;
+    usage.alerts = {
+      enabled = cfg.usageAlerts.enabled or null;
+      notify = cfg.usageAlerts.notify or null;
+      sustain_secs = cfg.usageAlerts.sustain_secs or null;
+      repeat_secs = cfg.usageAlerts.repeat_secs or null;
+      clear_margin = cfg.usageAlerts.clear_margin or null;
+      notify_clear = cfg.usageAlerts.notify_clear or null;
+      used = {
+        warn = cfg.usageAlerts.used.warn or null;
+        critical = cfg.usageAlerts.used.critical or null;
+      };
+    };
     lsp.enabled = cfg.lspEnabled;
     lsp.hover = cfg.lspHover;
     lsp.require_containment = cfg.lspRequireContainment;
@@ -717,7 +939,7 @@ in {
 
     uiSidebarDetailFields = lib.mkOption {
       type = lib.types.nullOr (lib.types.listOf lib.types.str);
-      default = ["branch" "commits" "dirty" "branch_stat" "pr" "subject" "age" "env" "sandbox" "devcontainer" "hibernated" "mq" "unread" "disk"];
+      default = ["branch" "commits" "dirty" "branch_stat" "pr" "ci" "issue" "author" "stash" "subject" "age" "upstream" "env" "sandbox" "devcontainer" "hibernated" "mq" "unread" "disk"];
       description = "Ordered sidebar detail field names. The default matches the binary's default.";
     };
 
@@ -786,6 +1008,37 @@ in {
       type = lib.types.nullOr (lib.types.str);
       default = null;
       description = "Override glyph for the dirty status marker; empty uses the built-in glyph. Unset (null) = the binary's default.";
+    };
+
+    uiSidebarExternalWorktrees = lib.mkOption {
+      type = lib.types.nullOr (lib.types.enum ["show" "group" "hide"]);
+      default = null;
+      description = "Where a project's external worktrees (git worktrees thegn did not create) go: group under one collapsible Other row, show inline, or hide. Unset (null) = the binary's default.";
+    };
+
+    uiSidebarOtherGroupLabel = lib.mkOption {
+      type = lib.types.nullOr (lib.types.str);
+      default = null;
+      description = "Label of the sidebar group row holding external worktrees. Unset (null) = the binary's default.";
+    };
+
+    uiSidebarOtherGroupCollapsed = lib.mkOption {
+      type = lib.types.nullOr (lib.types.bool);
+      default = null;
+      description = "Whether the external-worktree group starts collapsed. Unset (null) = the binary's default.";
+    };
+
+    uiSidebarGroupRowLimit = lib.mkOption {
+      type = lib.types.nullOr (lib.types.ints.unsigned);
+      default = null;
+      description = "Rows a sidebar group shows before show-more; 0 means no limit. Unset (null) = the binary's default.";
+    };
+
+    uiSidebarGroupRowLimits = lib.mkOption {
+      type = lib.types.nullOr (lib.types.attrsOf lib.types.ints.unsigned);
+      default = null;
+      example = lib.literalExpression "{ Other = 5; }";
+      description = "Per-group overrides of the sidebar group row limit, keyed by the folder or group label; 0 means no limit. Unset (null) = the binary's default.";
     };
 
     searchMaxResults = lib.mkOption {
@@ -1443,6 +1696,18 @@ in {
       description = "Volume step (0.0 through 1.0) applied by the media volume actions. Unset (null) = the binary's default.";
     };
 
+    mediaMpvSocket = lib.mkOption {
+      type = lib.types.nullOr lib.types.str;
+      default = null;
+      description = "mpv JSON-IPC socket path (the --input-ipc-server path; absolute, ~ is not expanded). Unset (null) = the binary's default (/tmp/mpvsocket).";
+    };
+
+    mediaMpdSocket = lib.mkOption {
+      type = lib.types.nullOr lib.types.str;
+      default = null;
+      description = "MPD address: host:port or an absolute unix-socket path (~ is not expanded). Unset (null) = the binary's default (127.0.0.1:6600; $MPD_HOST/$MPD_PORT apply then).";
+    };
+
     monitorProcRows = lib.mkOption {
       type = lib.types.nullOr (lib.types.ints.unsigned);
       default = null;
@@ -1647,11 +1912,53 @@ in {
       description = "Maximum response bytes retained by one preview fetch. Unset (null) = the binary's default.";
     };
 
+    statsAlerts = lib.mkOption {
+      type = lib.types.nullOr statsAlertsSubmodule;
+      default = null;
+      example = lib.literalExpression ''{ cpu = { warn = 85; critical = 95; }; sustain_secs = 30; }'';
+      description = "Resource threshold alerts ([stats.alerts]). Option names are the TOML keys; each metric takes a warn/critical pair where 0 disables that level. Inverted pairs are ignored with a load warning. Unset (null) = the binary's default.";
+    };
+
+    usageAlerts = lib.mkOption {
+      type = lib.types.nullOr usageAlertsSubmodule;
+      default = null;
+      example = lib.literalExpression ''{ used = { warn = 80; critical = 95; }; }'';
+      description = "Usage quota alerts ([usage.alerts]). Option names are the TOML keys. Unset (null) = the binary's default.";
+    };
+
+    notificationsSoundPack = lib.mkOption {
+      type = lib.types.nullOr lib.types.str;
+      default = null;
+      example = "~/.config/thegn/sounds";
+      description = "Sound pack directory: a file path as text; ~ is expanded by thegn. Kept as a string so Nix never copies it into the store. Unset (null) = the binary's default.";
+    };
+
+    notificationsSoundChimeFile = lib.mkOption {
+      type = lib.types.nullOr lib.types.str;
+      default = null;
+      example = "~/.config/thegn/chime.ogg";
+      description = "Chime sound file: a file path as text; ~ is expanded by thegn. Kept as a string so Nix never copies it into the store. Unset (null) = the binary's default.";
+    };
+
     notificationsDndWindows = lib.mkOption {
       type = lib.types.nullOr (lib.types.listOf lib.types.str);
       default = null;
       example = lib.literalExpression ''[ "22:00-07:00" "sat,sun 00:00-08:00" ]'';
       description = "Do-not-disturb windows: \"HH:MM-HH:MM\" with optional leading weekdays (\"mon-fri 09:00-17:00\", \"sat,sun 00:00-08:00\"). Invalid entries are ignored with a load warning. Unset (null) = the binary's default.";
+    };
+
+    notificationsDesktopMinUrgency = lib.mkOption {
+      type = lib.types.nullOr lib.types.str;
+      default = null;
+      example = "critical";
+      description = "Minimum urgency for a desktop notification: low, normal or critical (case-insensitive). Unknown values fall back to normal with a load warning. Unset (null) = the binary's default.";
+    };
+
+    notificationsProcessExit = lib.mkOption {
+      type = lib.types.nullOr lib.types.str;
+      default = null;
+      example = "failures";
+      description = "How non-agent pane exits route into notifications: off, failures, failures_and_tasks or all (case-insensitive). Unknown values fall back to failures_and_tasks with a load warning. Unset (null) = the binary's default.";
     };
 
     usageProviders = lib.mkOption {

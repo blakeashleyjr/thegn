@@ -516,12 +516,16 @@ ui.sidebar_detail_fields
 ui.sidebar_detail_pr
 ui.sidebar_detail_when
 ui.sidebar_dividers
+ui.sidebar_external_worktrees
 ui.sidebar_focus_detail
 ui.sidebar_freeze_sort
+ui.sidebar_group_row_limit
 ui.sidebar_icon_ahead
 ui.sidebar_icon_behind
 ui.sidebar_icon_status
 ui.sidebar_nav_skips_collapsed
+ui.sidebar_other_group_collapsed
+ui.sidebar_other_group_label
 ui.sidebar_project_sort
 ui.sidebar_show_ahead_behind
 ui.sidebar_show_behind_base

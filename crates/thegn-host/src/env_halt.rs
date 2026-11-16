@@ -117,11 +117,7 @@ pub fn env_halt_reason(cfg: &Config, worktree: &str) -> Option<SandboxHalt> {
             return Some(SandboxHalt {
                 env_name: environment.name.clone(),
                 placement: format!("env {}", environment.name),
-                reason: unresolved_env_reason(
-                    &environment.name,
-                    crate::channel_state::clamped(Feature::Remote)
-                        || crate::channel_state::clamped(Feature::Providers),
-                ),
+                reason: unresolved_env_reason(&environment.name, remote_features_clamped()),
                 ask: matches!(mode, thegn_core::config::FailoverMode::Ask),
                 dormant: None,
                 sealed_home: false,
@@ -225,7 +221,13 @@ fn unreadable_selection_halt(worktree: &str, error: &anyhow::Error) -> SandboxHa
     }
 }
 
-fn unresolved_env_reason(name: &str, channel_clamped: bool) -> String {
+/// True when the release channel clamps the remote/provider features.
+pub(crate) fn remote_features_clamped() -> bool {
+    crate::channel_state::clamped(Feature::Remote)
+        || crate::channel_state::clamped(Feature::Providers)
+}
+
+pub(crate) fn unresolved_env_reason(name: &str, channel_clamped: bool) -> String {
     if channel_clamped {
         format!(
             "env '{name}' is not available on the stable channel (ssh and provider environments are dev-only: set THEGN_CHANNEL=dev), or [env.{name}] is missing; its selection was dropped"
@@ -235,9 +237,160 @@ fn unresolved_env_reason(name: &str, channel_clamped: bool) -> String {
     }
 }
 
+/// Which kind of fix a non-local halt needs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum HaltClass {
+    ProviderAuth,
+    ProviderFunds,
+    Unprovisioned,
+    Remote,
+    LocalRuntime,
+}
+
+pub(crate) fn classify_halt(placement: &str, reason: &str) -> HaltClass {
+    let placement = placement.to_ascii_lowercase();
+    // `Placement::label()` shapes: `local`, `ssh:<host>`, `mosh:<host>`,
+    // `k8s:<pod>`, `<provider>:<id>`; some gates use a bare `provider`/`ssh`/`k8s`.
+    let scheme = placement
+        .split_once(':')
+        .map_or(placement.as_str(), |(scheme, _)| scheme);
+    if matches!(scheme, "ssh" | "mosh" | "k8s") {
+        return HaltClass::Remote;
+    }
+    let provider = scheme == "provider"
+        || (placement.contains(':')
+            && scheme != "local"
+            && scheme.len() > 1
+            && scheme
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_'));
+    if !provider {
+        return HaltClass::LocalRuntime;
+    }
+    let r = reason.to_ascii_lowercase();
+    let has = |keys: &[&str]| keys.iter().any(|k| r.contains(k));
+    if has(&["insufficient_funds", "available: $", "balance"]) {
+        HaltClass::ProviderFunds
+    } else if has(&["token", "401", "403", "unauthorized", "forbidden"]) {
+        HaltClass::ProviderAuth
+    } else if has(&["never been provisioned", "not provisioned", "provisioning"]) {
+        HaltClass::Unprovisioned
+    } else {
+        HaltClass::Remote
+    }
+}
+
+pub(crate) fn remedy_text(class: HaltClass, env_name: &str) -> String {
+    match class {
+        HaltClass::ProviderFunds => format!(
+            "top up the provider account, then retry (`thegn env test {env_name}` shows the provider's answer)"
+        ),
+        HaltClass::ProviderAuth => format!(
+            "check the provider token (`thegn env test {env_name}`; `api_key_env` in [env.{env_name}.provider])"
+        ),
+        HaltClass::Unprovisioned => {
+            "provision it first: `thegn env up` (headless) or open it once in the TUI".to_string()
+        }
+        HaltClass::Remote => format!(
+            "check that the host is reachable (`thegn env test {env_name}`), or choose another env (`thegn env set`)"
+        ),
+        HaltClass::LocalRuntime => {
+            "install/start a container runtime (`thegn doctor` shows which)".to_string()
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{unreadable_selection_halt, unresolved_env_reason};
+    use super::{
+        HaltClass, classify_halt, remedy_text, unreadable_selection_halt, unresolved_env_reason,
+    };
+    use crate::agent::SandboxHalt;
+
+    fn halt(placement: &str, reason: &str, ask: bool) -> SandboxHalt {
+        SandboxHalt {
+            env_name: "box".into(),
+            placement: placement.into(),
+            reason: reason.into(),
+            ask,
+            dormant: None,
+            sealed_home: false,
+        }
+    }
+
+    #[test]
+    fn classify_halt_table() {
+        use HaltClass::*;
+        let cases = [
+            ("provider:sprites", "INSUFFICIENT_FUNDS", ProviderFunds),
+            ("provider:sprites", "available: $0.00", ProviderFunds),
+            ("provider:sprites", "Account Balance too low", ProviderFunds),
+            ("provider:sprites", "API Token missing", ProviderAuth),
+            ("provider:sprites", "HTTP 401", ProviderAuth),
+            ("provider:sprites", "got 403", ProviderAuth),
+            ("provider:sprites", "Unauthorized", ProviderAuth),
+            ("provider:sprites", "FORBIDDEN", ProviderAuth),
+            (
+                "provider:sprites",
+                "has never been provisioned",
+                Unprovisioned,
+            ),
+            ("provider:sprites", "provisioning failed", Unprovisioned),
+            ("provider:sprites", "timeout", Remote),
+            ("PROVIDER:fly", "timeout", Remote),
+            ("ssh", "refused", Remote),
+            ("k8s", "refused", Remote),
+            ("local", "no runtime", LocalRuntime),
+            ("env box", "no runtime", LocalRuntime),
+            ("sprites:sb-1", "INSUFFICIENT_FUNDS", ProviderFunds),
+            ("fly:app-1", "HTTP 401", ProviderAuth),
+            ("machine0:m1", "timeout", Remote),
+            (
+                "provider",
+                "the sandbox is not provisioned yet",
+                Unprovisioned,
+            ),
+            ("ssh:box.example", "refused", Remote),
+            ("mosh:box.example", "refused", Remote),
+            ("k8s:ns/pod", "refused", Remote),
+            ("/home/u/wt", "x", LocalRuntime),
+            ("c:\\wt", "x", LocalRuntime),
+        ];
+        for (placement, reason, want) in cases {
+            assert_eq!(
+                classify_halt(placement, reason),
+                want,
+                "{placement} {reason}"
+            );
+        }
+    }
+
+    #[test]
+    fn provider_funds_halt_display_has_no_container_runtime() {
+        let text = halt("sprites:sb-1", "INSUFFICIENT_FUNDS", false).to_string();
+        assert!(!text.contains("container runtime"), "{text}");
+        assert!(text.contains("top up the provider account"));
+        assert!(!text.contains("backend = \"none\""));
+    }
+
+    #[test]
+    fn local_halt_display_keeps_legacy_text() {
+        let text = halt("local", "no runtime", false).to_string();
+        assert_eq!(
+            text,
+            "environment 'box' (local) could not be brought up: no runtime — thegn will not \
+             silently fall back to the host. Fix the env, retry, explicitly select host execution (`backend = \"none\"`, disable sandboxing, \
+             set `isolation_floor = \"off\"`, or choose \"run on host\"), \
+             or install/start a container runtime (`thegn doctor` shows which) ([sandbox] or \
+             [env.box]) to allow it."
+        );
+    }
+
+    #[test]
+    fn remedy_text_names_env() {
+        assert!(remedy_text(HaltClass::Remote, "box").contains("`thegn env test box`"));
+        assert!(remedy_text(HaltClass::Unprovisioned, "box").contains("thegn env up"));
+    }
 
     #[test]
     fn unreadable_selection_is_a_typed_halt_even_for_local_worktrees() {

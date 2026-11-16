@@ -1,5 +1,10 @@
 pub use std::process::ExitStatus;
-use std::{io, process::Command, sync::atomic::AtomicBool, time::Duration};
+use std::{
+    io,
+    process::{ChildStdin, Command},
+    sync::atomic::AtomicBool,
+    time::Duration,
+};
 
 #[cfg(not(unix))]
 mod fallback;
@@ -53,6 +58,22 @@ pub enum Which {
     Stderr,
 }
 
+/// What happens to the rest of the process group when the leader exits on its own.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum LeaderExit {
+    /// Wait out `Limits::quiesce_after_leader` (or the timeout) for the other members, then
+    /// terminate whoever is left.
+    #[default]
+    Quiesce,
+    /// When the leader exits on its own, the group is not signalled. The leader is reaped,
+    /// still-open pipes get `reader_grace`; after it their output is read and discarded until
+    /// EOF by a `thegn-proc-sink` thread, so survivors can keep writing, and `group` is
+    /// [`GroupState::Detached`] if members remain ([`GroupState::Drained`] if none). Timeout,
+    /// cancel and output-limit ends seen while the leader runs still terminate the group (fail
+    /// closed). `quiesce_after_leader` is ignored.
+    Detach,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Limits {
     /// Execution deadline measured from spawn. A leader still running at it => End::TimedOut.
@@ -60,6 +81,8 @@ pub struct Limits {
     /// After the leader exits (left unreaped): how long other group members may keep running before
     /// the group is terminated. None = until `timeout`; Some(Duration::ZERO) = terminate at once.
     pub quiesce_after_leader: Option<Duration>,
+    /// Quiesce (default) or leave the remaining group members running; see [`LeaderExit`].
+    pub leader_exit: LeaderExit,
     /// SIGTERM -> SIGKILL grace when terminating. Duration::ZERO = SIGKILL straight away.
     pub term_grace: Duration,
     /// After SIGKILL: bound for the group to empty, and (separately) for the leader to become reapable.
@@ -78,13 +101,14 @@ pub struct Limits {
     pub idle_output: Option<Duration>,
 }
 impl Limits {
-    /// No pipes: timeout = `timeout`, quiesce None, term_grace ZERO, kill_settle 250 ms,
+    /// No pipes: timeout = `timeout`, quiesce None, leader_exit Quiesce, term_grace ZERO, kill_settle 250 ms,
     /// reader_grace ZERO, stdout/stderr Null, aggregate None, idle_output None. Callers adjust with
     /// `Limits { field: v, ..Limits::silent(t) }` (never assign fields after construction).
     pub fn silent(timeout: Duration) -> Self {
         Self {
             timeout,
             quiesce_after_leader: None,
+            leader_exit: LeaderExit::Quiesce,
             term_grace: Duration::ZERO,
             kill_settle: Duration::from_millis(250),
             reader_grace: Duration::ZERO,
@@ -121,6 +145,9 @@ pub enum GroupState {
     Survivors,
     /// Not observed and not signalled (End::Spawn or End::Supervise).
     Unknown,
+    /// The leader exited and other members were deliberately left running; not signalled
+    /// ([`LeaderExit::Detach`]).
+    Detached,
 }
 
 #[derive(Debug)]
@@ -327,6 +354,40 @@ pub fn run_consuming_streams(
     #[cfg(not(unix))]
     {
         fallback::run_consuming_streams(cmd, limits, cancel, consume)
+    }
+}
+
+/// Receives a run's live stdin pipe once, right after spawn. See
+/// [`run_consuming_streams_with_stdin`].
+pub type StdinHandoff<'a> = &'a mut dyn FnMut(ChildStdin);
+
+/// Like [`run_consuming_streams`], but stdin is a pipe handed to the caller instead of null.
+///
+/// Right after a successful spawn (Unix: with the process group already set up) the runner calls
+/// `on_stdin(stdin)` exactly once on the calling thread and keeps no handle of its own. On spawn
+/// failure `on_stdin` is never called and the run ends exactly as [`run`] would. The runner then
+/// supervises exactly like [`run_consuming_streams`]: same limits, cancel, kill escalation, reap
+/// and wall-time bound (timeout + term_grace + 2 * kill_settle + reader_grace + one BACKOFF_CAP).
+///
+/// The caller owns stdin and its lifetime. `on_stdin` must return promptly (move the pipe into a
+/// writer thread, or write a payload small enough for the pipe buffer): output is only drained
+/// once it returns. The runner never waits for stdin to close, so holding it open past the run is
+/// harmless. A writer must expect `BrokenPipe` (EPIPE) once the child closes stdin or the group is
+/// signalled; this relies on SIGPIPE being ignored, which Rust's std main does.
+pub fn run_consuming_streams_with_stdin(
+    cmd: &mut Command,
+    limits: &Limits,
+    cancel: &AtomicBool,
+    on_stdin: StdinHandoff<'_>,
+    consume: StreamConsumer<'_>,
+) -> Run {
+    #[cfg(unix)]
+    {
+        unix::run_consuming_streams_with_stdin(cmd, limits, cancel, on_stdin, consume)
+    }
+    #[cfg(not(unix))]
+    {
+        fallback::run_consuming_streams_with_stdin(cmd, limits, cancel, on_stdin, consume)
     }
 }
 

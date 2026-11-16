@@ -18,6 +18,9 @@ SZ="$(cd "$(dirname "$SZ")" && pwd)/$(basename "$SZ")"
   exit 1
 }
 
+# shellcheck source=test/lib/podman_pause.sh disable=SC1091
+source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/lib/podman_pause.sh"
+
 TMP="$(mktemp -d)"
 SMOKE_RUNTIME_DIR=""
 FIXTURE_DAEMON_PIDS=()
@@ -96,10 +99,7 @@ cleanup() {
   # Cleanup must stay inside this test's runtime root even if a signal arrives
   # before the isolated XDG_RUNTIME_DIR export below.
   if [[ -n $SMOKE_RUNTIME_DIR ]]; then
-    local pause_pid_file="$SMOKE_RUNTIME_DIR/libpod/tmp/pause.pid"
-    if [[ -f $pause_pid_file ]]; then
-      kill "$(cat "$pause_pid_file" 2>/dev/null)" 2>/dev/null || true
-    fi
+    podman_pause_reap "$SMOKE_RUNTIME_DIR"
   fi
   if [[ -n $SMOKE_RUNTIME_DIR && -d $SMOKE_RUNTIME_DIR ]]; then
     rm -rf "$SMOKE_RUNTIME_DIR" 2>/dev/null || true
@@ -2287,7 +2287,9 @@ if command -v curl >/dev/null 2>&1; then
     --set sandbox.limits.cpu_total=off daemon --socket "$DSOCK" &
   DPID=$!
   track_daemon "$DPID" "$DSOCK"
-  for _ in $(seq 1 40); do
+  # 30 s: a debug daemon on a loaded machine (the pre-push hook runs this while
+  # other builds compete for CPU) took over 4 s to bind and failed a push.
+  for _ in $(seq 1 300); do
     [[ -S $DSOCK ]] && break
     sleep 0.1
   done

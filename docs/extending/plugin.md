@@ -6,7 +6,7 @@ a POSIX shell script with `printf` is enough.
 
 1. **Manifest**: declared, not printed — a `[[plugins]]` entry or a
    `<config_dir>/plugins/<name>/plugin.toml` with `id`, `name`, `version`,
-   `api` (the contract version, currently `"0.5.0"`), `capabilities`
+   `api` (the contract version, currently `"0.6.0"`), `capabilities`
    (`surface:statusbar`, …), `contributions` (extension point + label +
    surface + cadence), `command = ["…"]`, and optional `scopes`, `mode`
    (`one_shot`/`resident`), `timeout_secs` (clamped to 1–3600 seconds with a
@@ -44,7 +44,7 @@ a POSIX shell script with `printf` is enough.
    `label` becomes the account name in the panel. See the complete
    [tracker-provider recipe](tracker-provider.md).
 
-## Current host support (API 0.5)
+## Current host support (API 0.6)
 
 The checked-in JSON schema carries this same table as
 `x-thegn-extension-support`; `thegn plugin check` applies it without launching

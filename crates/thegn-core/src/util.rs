@@ -78,12 +78,33 @@ pub fn thegn_dir() -> PathBuf {
 
 /// Expand a leading `~` to `$HOME` (config values may contain it literally).
 pub fn expand_tilde(p: &str) -> String {
+    expand_tilde_in(p, &home())
+}
+
+/// Pure form of [`expand_tilde`]: expand a leading `~` / `~/` against `home`.
+/// `~user/x` and absolute paths are returned unchanged.
+pub fn expand_tilde_in(p: &str, home: &Path) -> String {
     if p == "~" {
-        home().to_string_lossy().into_owned()
+        home.to_string_lossy().into_owned()
     } else if let Some(rest) = p.strip_prefix("~/") {
-        home().join(rest).to_string_lossy().into_owned()
+        home.join(rest).to_string_lossy().into_owned()
     } else {
         p.to_string()
+    }
+}
+
+#[cfg(test)]
+mod expand_tilde_in_tests {
+    use super::expand_tilde_in;
+    use std::path::Path;
+
+    #[test]
+    fn expands_bare_and_slash_forms_only() {
+        let h = Path::new("/acct");
+        assert_eq!(expand_tilde_in("~", h), "/acct");
+        assert_eq!(expand_tilde_in("~/x/y", h), "/acct/x/y");
+        assert_eq!(expand_tilde_in("~user/x", h), "~user/x");
+        assert_eq!(expand_tilde_in("/abs/~/x", h), "/abs/~/x");
     }
 }
 
@@ -1765,6 +1786,16 @@ pub fn git_out_raw(dir: &Path, args: &[&str]) -> Result<Vec<u8>, crate::git_run:
     }
 }
 
+/// `git -C <dir> <args...>` on the bounded read policy: trimmed stdout
+/// (lossy UTF-8, like [`git_out_allow_empty`]) on success, empty included;
+/// the typed [`GitOutcome`](crate::git_run::GitOutcome) on every failure, so a
+/// caller can tell "git said no" (`Exit`) from "git could not answer"
+/// (`Timeout`, `Spawn`, ...).
+pub fn git_out_result(dir: &Path, args: &[&str]) -> Result<String, crate::git_run::GitOutcome> {
+    let bytes = git_out_raw(dir, args)?;
+    Ok(String::from_utf8_lossy(&bytes).trim().to_string())
+}
+
 /// Why [`git_out_path`] could not produce a path.
 #[derive(Debug)]
 pub enum GitPathError {
@@ -1775,6 +1806,9 @@ pub enum GitPathError {
     /// The output was not exactly one path (embedded newline or NUL, or not
     /// representable as a native path).
     Malformed,
+    /// A remote or provider location printed a path that is not valid UTF-8,
+    /// so it cannot be passed back over the transport as a command argument.
+    UnsupportedRemotePath,
 }
 
 impl std::fmt::Display for GitPathError {
@@ -1783,6 +1817,9 @@ impl std::fmt::Display for GitPathError {
             Self::Git(outcome) => write!(f, "{outcome}"),
             Self::Empty => f.write_str("git printed no path"),
             Self::Malformed => f.write_str("git printed a malformed path"),
+            Self::UnsupportedRemotePath => f.write_str(
+                "the remote path is not valid UTF-8 and cannot be passed back over the transport",
+            ),
         }
     }
 }
@@ -1792,7 +1829,7 @@ impl std::error::Error for GitPathError {}
 /// Strip exactly one trailing line terminator (`\n`, optionally preceded by a
 /// `\r` for Git for Windows) and validate that what remains is one path.
 /// Nothing else is trimmed: a path may legitimately end in whitespace.
-fn path_bytes_from_output(bytes: &[u8]) -> Result<&[u8], GitPathError> {
+pub(crate) fn path_bytes_from_output(bytes: &[u8]) -> Result<&[u8], GitPathError> {
     let body = bytes.strip_suffix(b"\n").unwrap_or(bytes);
     let body = if body.len() != bytes.len() {
         body.strip_suffix(b"\r").unwrap_or(body)
@@ -3272,6 +3309,11 @@ mod tests {
             "git printed a malformed path"
         );
         assert!(
+            GitPathError::UnsupportedRemotePath
+                .to_string()
+                .contains("not valid UTF-8")
+        );
+        assert!(
             !GitPathError::Git(GitOutcome::EmptyRefused)
                 .to_string()
                 .is_empty()
@@ -3324,6 +3366,65 @@ mod tests {
             git_out_path(dir.path(), &["status", "--porcelain"]),
             Err(GitPathError::Empty)
         ));
+    }
+
+    #[test]
+    fn git_out_result_returns_trimmed_text_and_empty() {
+        let dir = bounded_git_fixture();
+        assert!(
+            git_cmd(dir.path())
+                .args(["-c", "commit.gpgsign=false", "-c", "user.name=t"])
+                .args(["-c", "user.email=t@example.invalid"])
+                .args(["commit", "-q", "--allow-empty", "-m", "init"])
+                .status()
+                .unwrap()
+                .success()
+        );
+        let head = git_out_result(dir.path(), &["rev-parse", "HEAD"]).unwrap();
+        assert_eq!(head.len(), 40, "{head:?}");
+        assert!(head.chars().all(|c| c.is_ascii_hexdigit()), "{head:?}");
+        assert_eq!(
+            git_out_result(dir.path(), &["diff", "--name-only"]).unwrap(),
+            ""
+        );
+    }
+
+    #[test]
+    fn git_out_result_types_a_missing_ref_as_exit_1() {
+        use crate::git_run::GitOutcome;
+        let dir = bounded_git_fixture();
+        let read = git_out_result(
+            dir.path(),
+            &["rev-parse", "--verify", "--quiet", "refs/heads/nope"],
+        );
+        assert!(
+            matches!(read, Err(GitOutcome::Exit { code: Some(1), .. })),
+            "{read:?}"
+        );
+    }
+
+    #[test]
+    fn git_out_result_types_a_missing_dir_as_failure() {
+        let parent = tempfile::tempdir().unwrap();
+        let missing = parent.path().join("does-not-exist");
+        let err = git_out_result(&missing, &["rev-parse", "HEAD"]).unwrap_err();
+        assert!(!err.is_success(), "{err:?}");
+    }
+
+    #[test]
+    fn git_text_error_is_a_std_error() {
+        use crate::git_run::{GitOutcome, GitTextError};
+        fn takes(_: &dyn std::error::Error) {}
+        takes(&GitTextError::InvalidUtf8);
+        takes(&GitOutcome::Timeout);
+        assert_eq!(
+            anyhow::Error::from(GitTextError::InvalidUtf8).to_string(),
+            GitTextError::InvalidUtf8.to_string()
+        );
+        assert_eq!(
+            anyhow::Error::from(GitOutcome::Timeout).to_string(),
+            GitOutcome::Timeout.to_string()
+        );
     }
 
     #[test]

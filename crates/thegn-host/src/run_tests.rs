@@ -1880,6 +1880,22 @@ fn effective_cols_per_sidebar_mode() {
 }
 
 #[test]
+fn sidebar_sync_mirrors_mode_for_the_masthead_hidden_chip() {
+    // THE-2032: the masthead's hidden-sidebar chip reads `model.sidebar_mode`,
+    // so `sync` must carry every leg of the cycle (not only the rail flag).
+    use crate::layout::SidebarMode;
+    let session = one_tab_session();
+    let mut model = build_initial_model(&session, None);
+    let mut sb = SidebarState::default();
+    for mode in [SidebarMode::Rail, SidebarMode::Hidden, SidebarMode::Full] {
+        sb.mode = mode;
+        sb.sync(&mut model);
+        assert_eq!(model.sidebar_mode, mode);
+        assert_eq!(model.sidebar_rail, mode == SidebarMode::Rail);
+    }
+}
+
+#[test]
 fn sidebar_e_toggles_wide_expand_and_persists() {
     let _env = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     // Persisting the flag opens the global DB; redirect it to a temp dir.
@@ -2328,6 +2344,7 @@ fn removing_workspace_drops_its_rows_without_a_hydration() {
         env_name: None,
         env_degraded: false,
         sandbox_profile: None,
+        external: false,
     }];
 
     // The synchronous prune the RemoveWorkspace handler performs (same code).

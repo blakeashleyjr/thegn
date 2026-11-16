@@ -259,12 +259,31 @@ impl std::fmt::Display for SandboxHalt {
                 self.env_name, self.placement, self.reason, fix
             );
         }
-        let allow = if self.ask {
-            "choose \"run on host\", set `backend = \"none\"`, disable sandboxing, or set `isolation_floor = \"off\"`; otherwise install/start a container runtime (`thegn doctor` shows which)"
+        use crate::env_halt::{HaltClass, classify_halt, remedy_text};
+        let class = classify_halt(&self.placement, &self.reason);
+        if class != HaltClass::LocalRuntime && !self.ask {
+            return write!(
+                f,
+                "environment '{}' ({}) could not be brought up: {} — thegn will not \
+                 silently fall back to the host. Fix the env, retry, or {}.",
+                self.env_name,
+                self.placement,
+                self.reason,
+                remedy_text(class, &self.env_name)
+            );
+        }
+        let allow = if class != HaltClass::LocalRuntime {
+            format!(
+                "choose \"run on host\", set `backend = \"none\"`, disable sandboxing, or set `isolation_floor = \"off\"`; otherwise {}",
+                remedy_text(class, &self.env_name)
+            )
+        } else if self.ask {
+            "choose \"run on host\", set `backend = \"none\"`, disable sandboxing, or set `isolation_floor = \"off\"`; otherwise install/start a container runtime (`thegn doctor` shows which)".to_string()
         } else {
             "explicitly select host execution (`backend = \"none\"`, disable sandboxing, \
              set `isolation_floor = \"off\"`, or choose \"run on host\"), \
              or install/start a container runtime (`thegn doctor` shows which)"
+                .to_string()
         };
         write!(
             f,
@@ -610,8 +629,9 @@ pub fn prepare_sandbox_env_with_selection(
             return Err(SandboxHalt {
                 env_name: env_name.clone(),
                 placement: format!("env {env_name}"),
-                reason: format!(
-                    "env '{env_name}' is not defined ([env.{env_name}] missing); its selection was dropped"
+                reason: crate::env_halt::unresolved_env_reason(
+                    &env_name,
+                    crate::env_halt::remote_features_clamped(),
                 ),
                 ask,
                 dormant: None,
@@ -2701,13 +2721,14 @@ mod env_selection_tests {
 /// suspended sandbox, a lost exit frame) into a clear step failure.
 pub(crate) fn provision_step_timeout(step_id: &str) -> std::time::Duration {
     use std::time::Duration;
-    // Only `workspace` (mkdir) and `git_auth` (git config) are truly instant — a
-    // stall there is the suspended-sandbox hang we want to catch fast. Everything
-    // else can legitimately run for minutes (clone, package installs incl. the
-    // openssh the ssh transport needs, npm agents, the nix devshell build, closure
-    // substitution), so give it a generous ceiling that still bounds an infinite
-    // hang rather than risk a false failure mid-build.
-    let instant = matches!(step_id, "workspace" | "git_auth");
+    // Only `workspace` (mkdir) is truly instant — a stall there is the
+    // suspended-sandbox hang we want to catch fast. Everything else can
+    // legitimately run for minutes (`git_auth` installs git on an image that
+    // lacks it, clone, package installs incl. the openssh the ssh transport
+    // needs, npm agents, the nix devshell build, closure substitution), so give
+    // it a generous ceiling that still bounds an infinite hang rather than risk
+    // a false failure mid-build.
+    let instant = matches!(step_id, "workspace");
     if instant {
         Duration::from_secs(120) // 2 min — catches the suspended-sandbox hang fast
     } else {
@@ -2904,10 +2925,14 @@ pub fn provision_provider_env_named(
 
     // Resolve the repo origin so the sprite can clone it.
     let req = envplan::detect(Path::new(worktree));
-    // Host secrets (GH_TOKEN, ANTHROPIC_API_KEY, …) carried into every provisioning
-    // command so the clone authenticates against private repos and setup steps can
-    // reach the network/model. Remote-safe (no host-local socket vars).
-    let mut exec_env = cfg.repo_sandbox(&repo_root).passthrough_env_remote();
+    // Host secrets (ANTHROPIC_API_KEY, …) carried into every provisioning
+    // command so setup steps can reach the network/model. GH_TOKEN/GITHUB_TOKEN
+    // ride along only when `[sandbox.git]` grants a token (mode = "full" with
+    // credential = "repo-token" | "user-token"); by default credentials stay
+    // with thegn. Remote-safe (no host-local socket vars).
+    let repo_sandbox = cfg.repo_sandbox(&repo_root);
+    let git_token = repo_sandbox.git.admits_git_token();
+    let mut exec_env = repo_sandbox.passthrough_env_remote();
     crate::agent_configs::push_host_git_identity(&repo_root, &mut exec_env);
     // The generic, declarative personal layer ([sandbox.home]) — applied to every
     // sandbox so it feels like local. Resolve it PER-ENV (the env overlay may set a
@@ -2989,6 +3014,20 @@ pub fn provision_provider_env_named(
     if snapshot_restore.is_some() {
         crate::hibernator::mark_restoring(worktree);
     }
+    // Credential-free transport (THE-2021): a real worktree whose local checkout
+    // is a git worktree on a branch is seeded from a host-side `git bundle`
+    // uploaded over the files API, instead of cloning origin inside the sandbox
+    // (which needs an ssh key or token there). A SPARE (branch `None`) keeps the
+    // origin clone: it is generic until a claim rebranches it. `[sandbox.git]
+    // transport = "clone"` (per env) opts out of the bundle seed.
+    let bundle_seed = branch
+        .as_ref()
+        .filter(|_| resolved.sandbox.git.transport == thegn_core::config::GitTransport::Bundle)
+        .filter(|_| name_override.is_none() && Path::new(worktree).join(".git").exists())
+        .map(|b| envplan::BundleSeed {
+            worktree: worktree.to_string(),
+            branch: b.clone(),
+        });
     let opts = PlanOpts {
         workdir: workdir.clone(),
         origin: local_origin(&repo_root),
@@ -3081,6 +3120,9 @@ pub fn provision_provider_env_named(
             None
         },
         toolchain: cfg.toolchain.clone(),
+        // No token credential helper unless `[sandbox.git]` grants a token.
+        git_token,
+        bundle_seed,
     };
     let plan = envplan::plan(&req, &opts);
 
@@ -3197,8 +3239,16 @@ pub fn provision_provider_env_named(
             } => {
                 // Host-executed: capture the local worktree's unpushed commits +
                 // uncommitted + untracked state and replay it over the clone.
-                // Best-effort — the failure note reflects the replay stage.
-                let result = crate::parity::apply_local_parity(&provider, &id, wt, wd, &exec_env);
+                // Best-effort — the failure note reflects the replay stage. A
+                // bundle-seeded sandbox already has the branch tip, so only the
+                // working-tree state rides (no thin commit bundle).
+                let mode = if opts.bundle_seed.is_some() {
+                    crate::parity::ParityMode::WorkingTreeOnly
+                } else {
+                    crate::parity::ParityMode::Full
+                };
+                let result =
+                    crate::parity::apply_local_parity_mode(&provider, &id, wt, wd, &exec_env, mode);
                 crate::parity::record_outcome(wt, &result);
                 if let Err(e) = &result {
                     thegn_core::msg::warn(&format!(
@@ -3218,6 +3268,15 @@ pub fn provision_provider_env_named(
                 crate::hibernator::apply_snapshot_restore(
                     &provider, &id, cfg, wt, wd, snap, &exec_env,
                 )
+            }
+            StepKind::BundleSeed {
+                worktree: wt,
+                workdir: wd,
+                branch: b,
+            } => {
+                // Host-executed, NOT best-effort (fatal like `clone`): without it
+                // the sandbox has no repository.
+                crate::provider_git::seed_from_bundle(&provider, &id, wt, wd, b, &exec_env)
             }
             StepKind::Checkpoint => {
                 with_provision_timeout("checkpoint", std::time::Duration::from_secs(600), || {
@@ -3928,30 +3987,50 @@ fn auto_provision_sandbox(
 }
 
 /// Provision a fresh provider env's repo on open (8-A.3): clone the local repo's
-/// `origin` into the worktree dir *inside the env* via the control-plane exec
-/// (`GitLoc::sh_command`, which `cd`s into the workdir). Idempotent — the script
-/// no-ops once the dir is a git repo, including after a `data=sync` upload (which
-/// already lands a `.git`). Best-effort + blocking on the off-loop launch path:
-/// the clone is the inherent first-open cost; a failure warns and leaves the env
-/// as-is (the chrome just shows an empty tree until it succeeds). No-op when the
-/// local repo has no `origin`.
+/// `origin` into the worktree dir *inside the env*. A no-op when the plan already
+/// provisioned the sandbox (its local marker is set: the plan seeded the repo
+/// from a git bundle or cloned it), or when the local repo has no `origin`.
+/// Prefers the resident bridge; otherwise runs the clone over the provider API
+/// exec (the same channel provisioning uses), never the vendor CLI (THE-2014).
+/// When neither channel is available the open fails with
+/// [`no_exec_channel_message`](crate::provider_git::no_exec_channel_message)
+/// instead of continuing onto an empty sandbox. A clone that runs and fails
+/// warns and leaves the env as-is.
 // off-loop by contract: runs inside launch_spec_with_key, which is documented
 // blocking and must be called off the event loop (materialize spawn_blocking /
 // CLI). NOTE: some direct pane-spawn helpers still call launch_spec on the
 // loop — see the sweep report; the fix belongs at those callers.
-#[expect(clippy::disallowed_methods)]
-fn provision_provider_repo(cfg: &Config, repo_root: &Path, loc: &GitLoc, branch: Option<&str>) {
+fn provision_provider_repo(
+    cfg: &Config,
+    repo_root: &Path,
+    worktree: &str,
+    env_name: &str,
+    loc: &GitLoc,
+    branch: Option<&str>,
+) -> anyhow::Result<()> {
+    let id = match crate::provider_factory::provider_sandbox_name_checked(cfg, worktree, env_name) {
+        Ok(id) => id.filter(|id| !id.is_empty()),
+        Err(error) => {
+            tracing::debug!(target: "thegn::provider", error = %format!("{error:#}"), worktree, "provider sandbox id unreadable");
+            None
+        }
+    };
+    if id
+        .as_deref()
+        .is_some_and(crate::provider_workdir::is_provisioned_locally)
+    {
+        return Ok(());
+    }
     let Some(origin) = local_origin(repo_root) else {
-        return;
+        return Ok(());
     };
     let script = thegn_core::remote::provision_repo_script(&origin, branch);
-    // Prefer the resident bridge (CLI-free) when it's already up for this loc;
-    // else fall back to the per-op CLI control prefix.
+    // Prefer the resident bridge (CLI-free) when it's already up for this loc.
     if let Some(b) = thegn_svc::bridge::for_loc(loc) {
         match b.exec(&["/bin/sh", "-lc", &script], Some(&loc.path()), &[]) {
             Ok(r) if r.exit == 0 => {
                 initialize_provider_submodules(cfg, repo_root, loc);
-                return;
+                return Ok(());
             }
             Ok(r) => {
                 thegn_core::msg::warn(&format!(
@@ -3959,20 +4038,67 @@ fn provision_provider_repo(cfg: &Config, repo_root: &Path, loc: &GitLoc, branch:
                     r.exit,
                     crate::provision_recover::stderr_gist(&r.stderr)
                 ));
-                return;
+                return Ok(());
             }
-            // Bridge hiccup — fall through to the CLI path below.
+            // Bridge hiccup — fall through to the provider API exec below.
             Err(e) => thegn_core::msg::warn(&format!("provider repo provision via bridge: {e}")),
         }
     }
-    match loc.sh_command(&script).output() {
-        Ok(o) if o.status.success() => initialize_provider_submodules(cfg, repo_root, loc),
-        Ok(o) => thegn_core::msg::warn(&format!(
-            "provider repo provision failed ({}): {}",
-            o.status,
-            crate::provision_recover::stderr_gist(&String::from_utf8_lossy(&o.stderr))
+    let cli = match loc {
+        GitLoc::Provider { control_prefix, .. } => control_prefix
+            .first()
+            .cloned()
+            .unwrap_or_else(|| "provider".to_string()),
+        _ => "provider".to_string(),
+    };
+    let provider = id.as_deref().and_then(|id| {
+        let pc = &cfg.env.get(env_name)?.provider;
+        let owner = crate::provider_factory::provider_sandbox_owner(cfg, worktree, env_name);
+        crate::provider_factory::provider_for_named_owned(pc, id, owner.as_deref())
+            .map(|provider| (provider, id.to_string()))
+    });
+    let Some((provider, id)) = provider else {
+        return Err(anyhow::anyhow!(
+            crate::provider_git::no_exec_channel_message(&cli)
+        ));
+    };
+    let wd = thegn_core::util::sh_quote(&loc.path());
+    let argv =
+        crate::provision_recover::exec_login_argv(&format!("mkdir -p {wd} && cd {wd} && {script}"));
+    let exec_env = cfg.repo_sandbox(repo_root).passthrough_env_remote();
+    match block_on_provider(|| async { provider.run_exec(&id, &argv, None, &exec_env).await }) {
+        Ok((0, _)) => initialize_provider_submodules(cfg, repo_root, loc),
+        Ok((code, out)) => thegn_core::msg::warn(&format!(
+            "provider repo provision failed (exit {code}): {}",
+            crate::provision_recover::stderr_gist(&out)
         )),
-        Err(e) => thegn_core::msg::warn(&format!("provider repo provision spawn failed: {e}")),
+        Err(error) => {
+            return Err(anyhow::anyhow!(
+                "{} (provider API exec failed: {error:#})",
+                crate::provider_git::no_exec_channel_message(&cli)
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// A spawn failure naming the program that could not be started: a bare
+/// `No such file or directory` from a daemon whose PATH lacks the provider CLI
+/// is otherwise undiagnosable.
+// Test-only since THE-2014 removed the open path's vendor-CLI fallback.
+#[cfg(test)]
+pub(crate) fn spawn_failure_message(
+    what: &str,
+    program: &std::ffi::OsStr,
+    error: &std::io::Error,
+) -> String {
+    let program = program.to_string_lossy();
+    if error.kind() == std::io::ErrorKind::NotFound {
+        format!(
+            "{what} spawn failed: `{program}` not found ({error}) — is it installed and on this process's PATH?"
+        )
+    } else {
+        format!("{what} spawn failed: could not run `{program}`: {error}")
     }
 }
 
@@ -4735,7 +4861,20 @@ pub fn launch_spec_full(
     if let Some(blob) = outcome.location.as_deref() {
         let fresh = crate::provision_gate::rebind_resolved_location(db.as_ref(), worktree, blob);
         if fresh.is_remote() {
-            provision_provider_repo(cfg, &repo_root, &fresh, branch);
+            // A sandbox whose repository cannot be provisioned ends the open
+            // here (THE-2014) instead of falling into the unprovisioned halt.
+            let env_name = cfg
+                .resolve_env(
+                    &repo_root,
+                    &loc,
+                    Path::new(worktree),
+                    &thegn_core::sandbox_pin::EnvSelection {
+                        name: selected_env.clone(),
+                        profile: None,
+                    },
+                )
+                .name;
+            provision_provider_repo(cfg, &repo_root, worktree, &env_name, &fresh, branch)?;
         }
     } else if let Some(db) = db.as_ref()
         && should_heal_degraded_location(

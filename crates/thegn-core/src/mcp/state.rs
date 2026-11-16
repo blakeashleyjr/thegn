@@ -421,6 +421,91 @@ pub const STATE_TOOLS: &[StateToolSpec] = &[
         ],
     },
     StateToolSpec {
+        cap: "dispatches.put",
+        description: "Append one row to the agent-dispatch roster (the wire mirror of \
+                      `POST /v1/dispatches`); returns the stored row. A lease-bound row \
+                      needs a `lead` proof. Write-scoped (`--scopes write`); requires a \
+                      running daemon.",
+        args: &[
+            ArgSpec {
+                name: "issue_id",
+                kind: ArgKind::String,
+                required: true,
+                description: "Tracker issue id the dispatch works on",
+            },
+            ArgSpec {
+                name: "worktree_path",
+                kind: ArgKind::String,
+                required: true,
+                description: "Absolute path of the worktree the agent runs in",
+            },
+            ArgSpec {
+                name: "agent_name",
+                kind: ArgKind::String,
+                required: true,
+                description: "Roster agent name (e.g. a `[[pipeline.stages]]` agent)",
+            },
+            ArgSpec {
+                name: "stage",
+                kind: ArgKind::String,
+                required: false,
+                description: "Pipeline stage this row is (stored and grouped by only)",
+            },
+            ArgSpec {
+                name: "parent_id",
+                kind: ArgKind::Integer,
+                required: false,
+                description: "Roster row this one was chunked out of",
+            },
+            ArgSpec {
+                name: "session_id",
+                kind: ArgKind::String,
+                required: false,
+                description: "Daemon session running this dispatch",
+            },
+            ArgSpec {
+                name: "artifact_path",
+                kind: ArgKind::String,
+                required: false,
+                description: "Path to the handoff artifact committed in the worktree",
+            },
+            ArgSpec {
+                name: "lead",
+                kind: ArgKind::Object,
+                required: false,
+                description: "Lead-lease proof `{lease, owner, lease_gen?}`",
+            },
+        ],
+    },
+    StateToolSpec {
+        cap: "dispatches.set_status",
+        description: "Set one dispatch row's status (the wire mirror of \
+                      `POST /v1/dispatches/{id}/status`). `status` is a member of the \
+                      closed snake_case dispatch-status set, checked by the daemon. A \
+                      lease-bound row needs a `lead` proof. Write-scoped \
+                      (`--scopes write`); requires a running daemon.",
+        args: &[
+            ArgSpec {
+                name: "id",
+                kind: ArgKind::Integer,
+                required: true,
+                description: "Dispatch row id (see dispatches_list)",
+            },
+            ArgSpec {
+                name: "status",
+                kind: ArgKind::String,
+                required: true,
+                description: "New status (snake_case dispatch-status name)",
+            },
+            ArgSpec {
+                name: "lead",
+                kind: ArgKind::Object,
+                required: false,
+                description: "Lead-lease proof `{lease, owner, lease_gen?}`",
+            },
+        ],
+    },
+    StateToolSpec {
         cap: "agent.sessions",
         description: "List discovered coding-agent sessions from each harness's local \
                       transcript store: harness, session id, worktree/project, last-modified \
@@ -684,6 +769,69 @@ pub const STATE_TOOLS: &[StateToolSpec] = &[
         ],
     },
     StateToolSpec {
+        cap: "sessions.snapshot",
+        description: "The current emulator screen of a live session (the wire mirror of \
+                      `GET /v1/sessions/{s}/snapshot`): `{session, seq, cols, rows, \
+                      ansi_b64}`. Read-scoped; requires a running daemon.",
+        args: &[ArgSpec {
+            name: "session",
+            kind: ArgKind::String,
+            required: true,
+            description: "Target session id (see sessions_list)",
+        }],
+    },
+    StateToolSpec {
+        cap: "sessions.split",
+        description: "Create a sibling pane/session next to an existing one (the wire \
+                      mirror of `POST /v1/sessions/{s}/split`). It launches `argv` (a login \
+                      shell when empty) but never sends input to the target. Write-scoped \
+                      (`--scopes write`); requires a running daemon.",
+        args: &[
+            ArgSpec {
+                name: "session",
+                kind: ArgKind::String,
+                required: true,
+                description: "Existing session to split beside (see sessions_list)",
+            },
+            ArgSpec {
+                name: "dir",
+                kind: ArgKind::String,
+                required: false,
+                description: "Split direction: `right` (default) or `down`",
+            },
+            ArgSpec {
+                name: "argv",
+                kind: ArgKind::StringArray,
+                required: false,
+                description: "Program + args for the new pane (a login shell when empty)",
+            },
+            ArgSpec {
+                name: "cwd",
+                kind: ArgKind::String,
+                required: false,
+                description: "Working directory (inherits the target's when omitted)",
+            },
+            ArgSpec {
+                name: "env",
+                kind: ArgKind::Object,
+                required: false,
+                description: "Extra environment variables (var → value, both strings)",
+            },
+            ArgSpec {
+                name: "rows",
+                kind: ArgKind::Integer,
+                required: false,
+                description: "PTY rows (0 or omitted inherits the target's; at most 1000)",
+            },
+            ArgSpec {
+                name: "cols",
+                kind: ArgKind::Integer,
+                required: false,
+                description: "PTY columns (0 or omitted inherits the target's; at most 1000)",
+            },
+        ],
+    },
+    StateToolSpec {
         cap: "worktrees.open",
         description: "Open/focus a workspace in the running thegn instance (the wire mirror \
                       of `thegn open`): queues a focus request the compositor claims within \
@@ -857,6 +1005,8 @@ pub const MCP_STATE_CAPS: &[&str] = &[
     "issues.list",
     "issues.get",
     "dispatches.list",
+    "dispatches.put",
+    "dispatches.set_status",
     "agent.sessions",
     "sessions.wait",
     "sessions.open",
@@ -864,6 +1014,8 @@ pub const MCP_STATE_CAPS: &[&str] = &[
     "sessions.input",
     "sessions.kill",
     "sessions.resize",
+    "sessions.snapshot",
+    "sessions.split",
     "worktrees.open",
     "semantic.map",
     "semantic.blast_radius",
@@ -994,12 +1146,13 @@ fn input_schema(args: &[ArgSpec]) -> Value {
 }
 
 /// Write-class MCP tools whose effect is additive or reversible (open/fork a
-/// session, open an editor, assign a folder, resize a PTY, focus a
-/// workspace): advertised with
+/// session, open an editor, assign a folder, resize a PTY, append a dispatch
+/// row, focus a workspace): advertised with
 /// `destructiveHint: false`. Every other non-read tool is advertised
 /// destructive (fail closed), so a new write tool is destructive until it is
 /// deliberately listed here.
 const NON_DESTRUCTIVE_WRITE_CAPS: &[&str] = &[
+    "dispatches.put",
     "folders.assign",
     "editor.open",
     "merge.add",
@@ -1007,6 +1160,7 @@ const NON_DESTRUCTIVE_WRITE_CAPS: &[&str] = &[
     "sessions.open",
     "sessions.fork",
     "sessions.resize",
+    "sessions.split",
     "worktrees.open",
 ];
 
@@ -1091,7 +1245,7 @@ pub fn redact_for_audit(cap: &str, args: &Value) -> Value {
                 }
             }
         }
-        "sessions.open" => {
+        "sessions.open" | "sessions.split" => {
             if let Some(Value::Object(env)) = out.get("env") {
                 let n = env.len();
                 out.insert("env".to_string(), json!(format!("<{n} vars>")));
@@ -1506,6 +1660,302 @@ mod tests {
     }
 
     #[test]
+    fn sessions_snapshot_and_split_are_advertised_only_when_allowed() {
+        let r = StateRouter::new(vec!["sessions.list", "worktrees.list"], |_, _| {
+            Ok(json!(null))
+        });
+        let names: Vec<String> = r
+            .tool_entries()
+            .iter()
+            .map(|t| t["name"].as_str().unwrap().to_string())
+            .collect();
+        assert!(
+            !names
+                .iter()
+                .any(|n| n == "sessions_snapshot" || n == "sessions_split")
+        );
+        let denied = StateRouter::new(vec!["sessions.list"], |_, _| -> Result<Value, String> {
+            panic!("a denied tool must not reach fetch")
+        });
+        for (tool, args, cap) in [
+            (
+                "sessions_snapshot",
+                json!({ "session": "s1" }),
+                "sessions.snapshot",
+            ),
+            (
+                "sessions_split",
+                json!({ "session": "s1" }),
+                "sessions.split",
+            ),
+        ] {
+            let (code, msg) = denied.call(tool, &args).unwrap().unwrap_err();
+            assert_eq!(code, -32001);
+            let scope = scope_of(lookup(cap).unwrap()).as_str();
+            assert!(msg.contains(&format!("--scopes {scope}")), "{msg}");
+            let spec = STATE_TOOLS.iter().find(|t| t.cap == cap).unwrap();
+            let stated = if scope == "read" {
+                "Read-scoped".to_string()
+            } else {
+                format!("`--scopes {scope}`")
+            };
+            assert!(
+                spec.description.contains(&stated),
+                "{cap}: {}",
+                spec.description
+            );
+        }
+
+        let r = StateRouter::new(vec!["sessions.snapshot", "sessions.split"], |_, _| {
+            Ok(json!(null))
+        });
+        let entries = r.tool_entries();
+        let names: Vec<&str> = entries
+            .iter()
+            .map(|e| e["name"].as_str().unwrap())
+            .collect();
+        assert_eq!(names, ["sessions_snapshot", "sessions_split"]);
+        let snap = &entries[0]["inputSchema"];
+        assert_eq!(snap["required"], json!(["session"]));
+        assert_eq!(snap["properties"].as_object().unwrap().len(), 1);
+        // Mirrors SplitBody (dir/argv/cwd/env/rows/cols) + the `{s}` path param.
+        let split = &entries[1]["inputSchema"];
+        assert_eq!(split["required"], json!(["session"]));
+        assert_eq!(split["properties"]["session"]["type"], "string");
+        assert_eq!(split["properties"]["dir"]["type"], "string");
+        assert_eq!(split["properties"]["argv"]["type"], "array");
+        assert_eq!(split["properties"]["cwd"]["type"], "string");
+        assert_eq!(split["properties"]["env"]["type"], "object");
+        assert_eq!(split["properties"]["rows"]["type"], "integer");
+        assert_eq!(split["properties"]["cols"]["type"], "integer");
+        assert_eq!(split["properties"].as_object().unwrap().len(), 7);
+    }
+
+    #[test]
+    fn sessions_snapshot_and_split_reject_wrong_typed_args_before_fetch() {
+        let r = StateRouter::new(
+            vec!["sessions.snapshot", "sessions.split"],
+            |_, _| -> Result<Value, String> { panic!("invalid args must not reach fetch") },
+        );
+        for (tool, bad) in [
+            ("sessions_snapshot", json!({})),
+            ("sessions_snapshot", json!({ "session": 7 })),
+            ("sessions_snapshot", json!({ "session": "s1", "extra": 1 })),
+            ("sessions_split", json!({})),
+            ("sessions_split", json!({ "session": 7 })),
+            ("sessions_split", json!({ "session": "s1", "dir": 1 })),
+            ("sessions_split", json!({ "session": "s1", "argv": "sh" })),
+            ("sessions_split", json!({ "session": "s1", "argv": [1] })),
+            ("sessions_split", json!({ "session": "s1", "cwd": false })),
+            ("sessions_split", json!({ "session": "s1", "env": ["A"] })),
+            ("sessions_split", json!({ "session": "s1", "rows": "24" })),
+            ("sessions_split", json!({ "session": "s1", "cols": 1.5 })),
+            ("sessions_split", json!({ "session": "s1", "bogus": true })),
+        ] {
+            let (code, _) = r.call(tool, &bad).unwrap().unwrap_err();
+            assert_eq!(code, -32602, "{tool} {bad}");
+        }
+    }
+
+    #[test]
+    fn sessions_snapshot_and_split_route_their_cap_ids_to_fetch() {
+        let r = StateRouter::new(vec!["sessions.snapshot", "sessions.split"], |cap, args| {
+            Ok(json!({ "cap": cap, "args": args }))
+        });
+        let snap = r
+            .call("sessions_snapshot", &json!({ "session": "s1" }))
+            .unwrap()
+            .unwrap();
+        let text = snap["content"][0]["text"].as_str().unwrap();
+        assert!(text.contains("sessions.snapshot"), "{text}");
+        let split = r
+            .call(
+                "sessions_split",
+                &json!({ "session": "s1", "dir": "down", "argv": ["sh"] }),
+            )
+            .unwrap()
+            .unwrap();
+        let text = split["content"][0]["text"].as_str().unwrap();
+        assert!(text.contains("sessions.split"), "{text}");
+        assert!(text.contains("down"), "{text}");
+        // Only `session` is required.
+        assert!(
+            r.call("sessions_split", &json!({ "session": "s1" }))
+                .unwrap()
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn redact_for_audit_hides_session_split_env_values() {
+        let args = json!({ "session": "s1", "env": {"API_KEY": "sk-verysecret"} });
+        let red = redact_for_audit("sessions.split", &args);
+        let env = red["env"].as_str().unwrap();
+        assert!(!env.contains("sk-verysecret"), "{env}");
+        assert!(env.contains("1 vars"), "{env}");
+    }
+
+    #[test]
+    fn dispatches_put_and_set_status_are_write_scoped_and_advertised_only_when_allowed() {
+        let r = StateRouter::new(vec!["dispatches.list"], |_, _| Ok(json!(null)));
+        let names: Vec<String> = r
+            .tool_entries()
+            .iter()
+            .map(|t| t["name"].as_str().unwrap().to_string())
+            .collect();
+        assert_eq!(names, ["dispatches_list"]);
+        let denied = StateRouter::new(vec!["dispatches.list"], |_, _| -> Result<Value, String> {
+            panic!("a denied tool must not reach fetch")
+        });
+        for (tool, args, cap) in [
+            (
+                "dispatches_put",
+                json!({ "issue_id": "THE-1", "worktree_path": "/w", "agent_name": "a" }),
+                "dispatches.put",
+            ),
+            (
+                "dispatches_set_status",
+                json!({ "id": 42, "status": "running" }),
+                "dispatches.set_status",
+            ),
+        ] {
+            let (code, msg) = denied.call(tool, &args).unwrap().unwrap_err();
+            assert_eq!(code, -32001);
+            assert_eq!(scope_of(lookup(cap).unwrap()), Scope::Write, "{cap}");
+            assert!(msg.contains("--scopes write"), "{msg}");
+            let spec = STATE_TOOLS.iter().find(|t| t.cap == cap).unwrap();
+            assert!(
+                spec.description.contains("`--scopes write`"),
+                "{cap}: {}",
+                spec.description
+            );
+        }
+
+        let r = StateRouter::new(vec!["dispatches.put", "dispatches.set_status"], |_, _| {
+            Ok(json!(null))
+        });
+        let entries = r.tool_entries();
+        let names: Vec<&str> = entries
+            .iter()
+            .map(|e| e["name"].as_str().unwrap())
+            .collect();
+        assert_eq!(names, ["dispatches_put", "dispatches_set_status"]);
+        // Mirrors DispatchPutReq.
+        let put = &entries[0]["inputSchema"];
+        assert_eq!(
+            put["required"],
+            json!(["issue_id", "worktree_path", "agent_name"])
+        );
+        for (key, ty) in [
+            ("issue_id", "string"),
+            ("worktree_path", "string"),
+            ("agent_name", "string"),
+            ("stage", "string"),
+            ("parent_id", "integer"),
+            ("session_id", "string"),
+            ("artifact_path", "string"),
+            ("lead", "object"),
+        ] {
+            assert_eq!(put["properties"][key]["type"], ty, "{key}");
+        }
+        assert_eq!(put["properties"].as_object().unwrap().len(), 8);
+        // Mirrors DispatchStatusBody + the `{id}` path param.
+        let set = &entries[1]["inputSchema"];
+        assert_eq!(set["required"], json!(["id", "status"]));
+        assert_eq!(set["properties"]["id"]["type"], "integer");
+        assert_eq!(set["properties"]["status"]["type"], "string");
+        assert_eq!(set["properties"]["lead"]["type"], "object");
+        assert_eq!(set["properties"].as_object().unwrap().len(), 3);
+    }
+
+    #[test]
+    fn dispatches_put_and_set_status_reject_wrong_typed_args_before_fetch() {
+        let r = StateRouter::new(
+            vec!["dispatches.put", "dispatches.set_status"],
+            |_, _| -> Result<Value, String> { panic!("invalid args must not reach fetch") },
+        );
+        let put_ok = json!({ "issue_id": "THE-1", "worktree_path": "/w", "agent_name": "a" });
+        let mut put_extra = put_ok.clone();
+        put_extra["bogus"] = json!(true);
+        let mut put_lead = put_ok.clone();
+        put_lead["lead"] = json!("lease");
+        let mut put_parent = put_ok.clone();
+        put_parent["parent_id"] = json!("7");
+        for (tool, bad) in [
+            ("dispatches_put", json!({})),
+            (
+                "dispatches_put",
+                json!({ "issue_id": "THE-1", "worktree_path": "/w" }),
+            ),
+            (
+                "dispatches_put",
+                json!({ "issue_id": 1, "worktree_path": "/w", "agent_name": "a" }),
+            ),
+            ("dispatches_put", put_extra),
+            ("dispatches_put", put_lead),
+            ("dispatches_put", put_parent),
+            ("dispatches_set_status", json!({})),
+            ("dispatches_set_status", json!({ "id": 42 })),
+            ("dispatches_set_status", json!({ "status": "done" })),
+            (
+                "dispatches_set_status",
+                json!({ "id": "x", "status": "done" }),
+            ),
+            (
+                "dispatches_set_status",
+                json!({ "id": 1.5, "status": "done" }),
+            ),
+            ("dispatches_set_status", json!({ "id": 42, "status": 3 })),
+            (
+                "dispatches_set_status",
+                json!({ "id": 42, "status": "done", "lead": [] }),
+            ),
+            (
+                "dispatches_set_status",
+                json!({ "id": 42, "status": "done", "note": "x" }),
+            ),
+        ] {
+            let (code, _) = r.call(tool, &bad).unwrap().unwrap_err();
+            assert_eq!(code, -32602, "{tool} {bad}");
+        }
+    }
+
+    #[test]
+    fn dispatches_put_and_set_status_route_their_cap_ids_to_fetch() {
+        let r = StateRouter::new(
+            vec!["dispatches.put", "dispatches.set_status"],
+            |cap, args| Ok(json!({ "cap": cap, "args": args })),
+        );
+        let put = r
+            .call(
+                "dispatches_put",
+                &json!({ "issue_id": "THE-1", "worktree_path": "/w", "agent_name": "a" }),
+            )
+            .unwrap()
+            .unwrap();
+        let text = put["content"][0]["text"].as_str().unwrap();
+        assert!(text.contains("dispatches.put"), "{text}");
+        // An unknown status passes the router; the daemon owns the closed set.
+        let set = r
+            .call(
+                "dispatches_set_status",
+                &json!({ "id": 42, "status": "no_such_status" }),
+            )
+            .unwrap()
+            .unwrap();
+        let text = set["content"][0]["text"].as_str().unwrap();
+        assert!(text.contains("dispatches.set_status"), "{text}");
+        assert!(text.contains("no_such_status"), "{text}");
+    }
+
+    #[test]
+    fn redact_for_audit_keeps_dispatch_fields() {
+        // Roster rows carry identifiers and paths, never free text or secrets.
+        let args = json!({ "id": 42, "status": "done", "lead": { "lease": "l", "owner": "o" } });
+        assert_eq!(redact_for_audit("dispatches.set_status", &args), args);
+    }
+
+    #[test]
     fn tool_entries_string_array_declares_items() {
         let r = StateRouter::new(vec!["sessions.open"], |_, _| Ok(json!(null)));
         let entries = r.tool_entries();
@@ -1641,6 +2091,7 @@ mod tests {
             "dispatches.list",
             "agent.sessions",
             "sessions.wait",
+            "sessions.snapshot",
             "semantic.map",
             "semantic.blast_radius",
             "automations.list",
@@ -1654,7 +2105,10 @@ mod tests {
             "sessions.input",
             "sessions.kill",
             "sessions.resize",
+            "sessions.split",
             "worktrees.open",
+            "dispatches.put",
+            "dispatches.set_status",
         ];
         // Folder assignment is a repo-local worktree metadata mutation: Git.
         let git = ["folders.assign"];
@@ -1843,7 +2297,11 @@ mod tests {
             ("sessions_open", false, false),
             ("sessions_fork", false, false),
             ("sessions_resize", false, false),
+            ("sessions_snapshot", true, false),
+            ("sessions_split", false, false),
             ("worktrees_open", false, false),
+            ("dispatches_put", false, false),
+            ("dispatches_set_status", false, true),
         ] {
             let entry = entries
                 .iter()

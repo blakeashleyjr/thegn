@@ -817,6 +817,8 @@ fn run(loc: &GitLoc, args: &[&str]) -> Result<String> {
 
 /// Decode git stdout strictly: a non-UTF-8 byte (for example a non-UTF-8 path
 /// in a `-z` NUL-framed read) is an error, never a silent U+FFFD substitution.
+/// Applies to local, SSH and provider-exec reads; only the persistent bridge
+/// still decodes remotely.
 fn decode_strict(bytes: Vec<u8>, args: &[&str]) -> Result<String> {
     String::from_utf8(bytes).map_err(|_| {
         anyhow::anyhow!(
@@ -826,11 +828,13 @@ fn decode_strict(bytes: Vec<u8>, args: &[&str]) -> Result<String> {
     })
 }
 
-/// Like [`run`], but refuses a lossy UTF-8 decode of local stdout. For
-/// NUL-framed reads where a replaced byte would mismatch the real path.
-/// Non-local locations fall back to [`run`] (the bridge decodes remotely).
+/// Like [`run`], but refuses a lossy UTF-8 decode of stdout. For NUL-framed
+/// reads where a replaced byte would mismatch the real path. Non-UTF-8 output
+/// from a local, SSH or provider-exec git read is an error; only the persistent
+/// bridge still decodes remotely (lossily), so a bridged location falls back to
+/// [`run`] until the bridge grows a bytes protocol.
 pub(super) fn run_text_strict(loc: &GitLoc, args: &[&str]) -> Result<String> {
-    if !local_cli(loc) {
+    if strict_route(!byte_exact_transport(loc)) == StrictRoute::BridgeLossy {
         return run(loc, args);
     }
     let out = run_status_bytes(loc, args, true)?;
@@ -883,6 +887,32 @@ fn run_status_bytes(
 
 fn local_cli(loc: &GitLoc) -> bool {
     !loc.is_remote() && crate::bridge::for_loc(loc).is_none()
+}
+
+/// Whether `loc`'s transport hands back git's stdout byte-for-byte: every
+/// non-bridged one does (local CLI, SSH and provider exec all spawn
+/// [`GitLoc::git_command`] through [`output_bounded`]); the persistent bridge
+/// decodes remotely.
+fn byte_exact_transport(loc: &GitLoc) -> bool {
+    crate::bridge::for_loc(loc).is_none()
+}
+
+/// How [`run_text_strict`] reads a location's output.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StrictRoute {
+    /// Raw stdout bytes, strictly decoded (local, SSH, provider exec).
+    Bytes,
+    /// The persistent bridge's remote (lossy) decode.
+    BridgeLossy,
+}
+
+/// Route a strict read by whether a persistent bridge serves the location.
+fn strict_route(has_bridge: bool) -> StrictRoute {
+    if has_bridge {
+        StrictRoute::BridgeLossy
+    } else {
+        StrictRoute::Bytes
+    }
 }
 
 /// Probe whether a rebase is in progress over the persistent bridge, for the
@@ -1028,7 +1058,8 @@ const GIT_WRITE_LOCAL_TIMEOUT: std::time::Duration = std::time::Duration::from_s
 /// stalled push, a hook waiting on a terminal, a lock held by a crashed
 /// process — can't pin the mutation thread forever. Network verbs
 /// ([`GIT_NETWORK_VERBS`]) get one hour, every other write fifteen minutes.
-/// `THEGN_GIT_WRITE_TIMEOUT_SECS` overrides both; `0` disables the bound.
+/// `THEGN_GIT_WRITE_TIMEOUT_SECS` overrides both; `0` disables the deadline
+/// (the output caps in [`output_bounded_with_input`] still apply).
 /// `run_stdin` is covered too (see its doc).
 fn git_write_timeout(args: &[&str]) -> Option<std::time::Duration> {
     let env = std::env::var("THEGN_GIT_WRITE_TIMEOUT_SECS");
@@ -1112,14 +1143,18 @@ const GIT_STDOUT_CAP: usize = 256 * 1024 * 1024;
 /// Captured-stderr ceiling for a bounded svc git child: 8 MiB.
 const GIT_STDERR_CAP: usize = 8 * 1024 * 1024;
 
+/// Deadline for a run whose timeout was opted out (`None`): effectively none;
+/// thegn_proc needs a finite timeout. The output caps still apply.
+const GIT_OPT_OUT_CEILING: std::time::Duration = std::time::Duration::from_secs(7 * 24 * 3600);
+
 /// [`output_bounded_with`] with an optional stdin payload. The same bounded
 /// child lifecycle and spawn accounting apply to ref transactions and reads.
 ///
-/// With a timeout, stdout is capped at [`GIT_STDOUT_CAP`] and stderr at
+/// Stdout is always capped at [`GIT_STDOUT_CAP`] and stderr at
 /// [`GIT_STDERR_CAP`]: more than that ends the run, kills the process group and
 /// returns a named "output exceeded" error. `timeout == None` (the explicit
-/// `THEGN_GIT_WRITE_TIMEOUT_SECS=0` opt-out) stays unbounded in both time and
-/// output size by design.
+/// `THEGN_GIT_WRITE_TIMEOUT_SECS=0` opt-out) removes the deadline only — it
+/// runs under [`GIT_OPT_OUT_CEILING`] — and the output caps still apply.
 pub(super) fn output_bounded_with_input(
     cmd: std::process::Command,
     args: &[&str],
@@ -1142,8 +1177,9 @@ fn describe_output_cap(cap: usize) -> String {
 
 /// [`output_bounded_with_input`] with the stream caps injected — the seam the
 /// unit tests drive with small caps. A stream producing more than its cap ends
-/// the run (the cap itself is allowed). The caps apply only when `timeout` is
-/// `Some`; the unbounded `None` path ignores them.
+/// the run (the cap itself is allowed). The caps apply whether or not a
+/// `timeout` is given; `None` only swaps the deadline for
+/// [`GIT_OPT_OUT_CEILING`].
 fn output_bounded_with_input_caps(
     mut cmd: std::process::Command,
     args: &[&str],
@@ -1152,29 +1188,10 @@ fn output_bounded_with_input_caps(
     stdout_cap: usize,
     stderr_cap: usize,
 ) -> Result<std::process::Output> {
-    use std::process::Stdio;
     use std::time::Duration;
 
     GIT_SPAWNS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    let Some(timeout) = timeout else {
-        if let Some(input) = input {
-            use std::io::Write;
-
-            let mut child = cmd
-                .stdin(Stdio::piped())
-                .stdout(Stdio::piped())
-                .stderr(Stdio::piped())
-                .spawn()?;
-            if let Some(mut stdin) = child.stdin.take()
-                && let Err(error) = stdin.write_all(input)
-            {
-                stop_bounded_child(&mut child);
-                return Err(error.into());
-            }
-            return Ok(child.wait_with_output()?);
-        }
-        return Ok(cmd.output()?);
-    };
+    let timeout = timeout.unwrap_or(GIT_OPT_OUT_CEILING);
 
     let cancel = std::sync::atomic::AtomicBool::new(false);
     let limits = thegn_proc::Limits {
@@ -1234,15 +1251,6 @@ fn output_bounded_with_input_caps(
                 leader => anyhow::bail!("git {} was not reaped: {leader:?}", args.join(" ")),
             }
         }
-    }
-}
-
-fn stop_bounded_child(child: &mut std::process::Child) {
-    if let Err(error) = child.kill() {
-        tracing::debug!(%error, "failed to stop git child after stdin write error");
-    }
-    if let Err(error) = child.wait() {
-        tracing::debug!(%error, "failed to reap git child after stdin write error");
     }
 }
 
@@ -2604,7 +2612,7 @@ fn run_w_unlocked(loc: &GitLoc, envs: &[(&str, &str)], args: &[&str]) -> Result<
 
 /// [`run_w_unlocked`] with the timeout injected — the test seam. On expiry the
 /// child's whole process group is killed (via [`output_bounded_with`]) and the
-/// error names the timeout; `None` runs unbounded.
+/// error names the timeout; `None` lifts the deadline (the output caps stay).
 fn run_w_unlocked_with(
     loc: &GitLoc,
     envs: &[(&str, &str)],
@@ -2670,8 +2678,8 @@ pub(crate) fn run_w_locked(
 /// Bounded like the other write runners: [`git_write_timeout`] is the deadline
 /// (the process group is killed on expiry) and the 256 MiB / 8 MiB output caps
 /// of [`output_bounded_with_input`] apply. `THEGN_GIT_WRITE_TIMEOUT_SECS=0`
-/// keeps the explicit unbounded opt-out. Automated commit creation uses
-/// [`run_background_commit_stdin`] instead.
+/// lifts the deadline only; the output caps always apply. Automated commit
+/// creation uses [`run_background_commit_stdin`] instead.
 pub(crate) fn run_stdin(
     loc: &GitLoc,
     envs: &[(&str, &str)],
@@ -4062,6 +4070,50 @@ mod tests {
         assert!(out.status.success());
         assert_eq!(out.stdout, b"small\0run");
         assert!(out.stderr.is_empty());
+    }
+
+    #[test]
+    fn opt_out_without_timeout_still_caps_stdout() {
+        let mut c = std::process::Command::new("sh");
+        c.args(["-c", "head -c 2048 /dev/zero"]);
+        let error = output_bounded_with_input_caps(c, &["sh"], None, None, 1024, 1024)
+            .expect_err("the opt-out must keep the stdout cap")
+            .to_string();
+        assert!(
+            error.contains("output exceeded 1024 bytes on stdout"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn opt_out_without_timeout_returns_output_under_the_cap() {
+        let mut c = std::process::Command::new("printf");
+        c.arg("opt\\0out");
+        let out = output_bounded_with_input_caps(c, &["printf"], None, None, 1024, 1024).unwrap();
+        assert!(out.status.success());
+        assert_eq!(out.stdout, b"opt\0out");
+        assert!(out.stderr.is_empty());
+    }
+
+    #[test]
+    fn opt_out_with_stdin_still_caps() {
+        let mut c = std::process::Command::new("sh");
+        c.args(["-c", "cat; head -c 2048 /dev/zero"]);
+        let error = output_bounded_with_input_caps(c, &["sh"], Some(b"in"), None, 1024, 1024)
+            .expect_err("the opt-out with stdin must keep the stdout cap")
+            .to_string();
+        assert!(
+            error.contains("output exceeded 1024 bytes on stdout"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn opt_out_with_stdin_round_trips_under_the_cap() {
+        let c = std::process::Command::new("cat");
+        let out = output_bounded_with_input_caps(c, &["cat"], Some(b"a\0\xff"), None, 1024, 1024)
+            .unwrap();
+        assert_eq!(out.stdout, b"a\0\xff");
     }
 
     #[test]
@@ -6033,8 +6085,18 @@ mod backend_kind_tests {
 
 #[cfg(test)]
 mod strict_text_tests {
-    use super::{decode_strict, run, run_text_strict};
+    use super::{
+        StrictRoute, byte_exact_transport, decode_strict, run, run_text_strict, strict_route,
+    };
     use crate::git::testutil::TestRepo;
+
+    #[test]
+    fn strict_route_uses_bytes_without_a_bridge() {
+        let repo = TestRepo::new("strict-route-local");
+        assert!(byte_exact_transport(&repo.loc()));
+        assert_eq!(strict_route(false), StrictRoute::Bytes);
+        assert_eq!(strict_route(true), StrictRoute::BridgeLossy);
+    }
 
     #[test]
     fn strict_matches_run_on_valid_utf8() {

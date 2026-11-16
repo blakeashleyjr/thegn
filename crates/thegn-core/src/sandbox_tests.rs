@@ -1835,6 +1835,10 @@ fn user_bus_hardened_systemd_pane_hides_the_user_bus() {
         "InaccessiblePaths=-/run/user/42/bus",
         "InaccessiblePaths=-/run/user/42/systemd/private",
         "InaccessiblePaths=-/run/user/42/thegn",
+        "InaccessiblePaths=-/run/user/42/podman",
+        "InaccessiblePaths=-/run/user/42/docker",
+        "InaccessiblePaths=-/run/user/42/docker.sock",
+        "UnsetEnvironment=THEGN_CONTROL_SOCKET",
     ] {
         assert!(
             argv.windows(2)
@@ -1870,6 +1874,200 @@ fn user_bus_systemd_run_user_fallback_adds_no_bus_paths() {
                 || arg == "InaccessiblePaths=-/run/user/systemd"
         }),
         "fallback runtime is already inaccessible as a whole: {argv:?}"
+    );
+    assert!(
+        !argv.iter().any(|arg| arg.contains("/run/user/podman")),
+        "fallback runtime adds no per-entry container paths: {argv:?}"
+    );
+}
+
+/// A temp runtime dir holding a stand-in bus (plain file), `podman/` and the
+/// thegn control dir, plus a bwrap spec that binds the whole runtime dir.
+fn runtime_escape_fixture() -> (tempfile::TempDir, PathBuf, SandboxSpec) {
+    let temp = tempfile::tempdir_in("/tmp").unwrap();
+    let runtime = temp.path().join("rt");
+    std::fs::create_dir_all(runtime.join("podman")).unwrap();
+    std::fs::create_dir_all(runtime.join("thegn/abc")).unwrap();
+    std::fs::write(runtime.join("bus"), b"").unwrap();
+    let mut sandbox = spec(Backend::Bwrap);
+    sandbox.mounts.push(Mount {
+        host: runtime.display().to_string(),
+        dest: runtime.display().to_string(),
+        ro: false,
+        cache: false,
+    });
+    (temp, runtime, sandbox)
+}
+
+#[test]
+fn runtime_escape_bwrap_masks_bus_podman_and_unsets_the_control_socket() {
+    let (_temp, runtime, mut sandbox) = runtime_escape_fixture();
+    let control_dir = runtime.join("thegn");
+    let socket = control_dir.join("abc/daemon.sock");
+    sandbox
+        .env
+        .push(("THEGN_CONTROL_SOCKET".into(), socket.display().to_string()));
+    let argv = backend_enter_argv_with_env(
+        &sandbox,
+        "true",
+        SandboxArgvEnv {
+            resolver_dir: None,
+            runtime_dir: Some(runtime.clone()),
+            control_dirs: vec![control_dir],
+            protected_dirs: Vec::new(),
+        },
+    )
+    .unwrap();
+    let rt = runtime.display().to_string();
+    let bind = argv
+        .windows(3)
+        .position(|triple| triple == ["--bind", rt.as_str(), rt.as_str()])
+        .expect("runtime dir is bound");
+    let podman = format!("{rt}/podman");
+    let bus = format!("{rt}/bus");
+    let tmpfs = argv
+        .windows(2)
+        .position(|pair| pair == ["--tmpfs", podman.as_str()])
+        .expect("podman dir is masked with a tmpfs");
+    let null = argv
+        .windows(3)
+        .position(|triple| triple == ["--ro-bind", "/dev/null", bus.as_str()])
+        .expect("bus socket is masked with /dev/null");
+    let unset = argv
+        .windows(2)
+        .position(|pair| pair == ["--unsetenv", "THEGN_CONTROL_SOCKET"])
+        .expect("dangling control socket is unset");
+    let command = argv.iter().position(|arg| arg == "--").unwrap();
+    assert!(bind < tmpfs && bind < null && bind < unset, "{argv:?}");
+    assert!(tmpfs < command && null < command && unset < command);
+    assert!(
+        !argv[unset + 2..command].iter().any(|arg| arg == "--setenv"),
+        "unset follows every explicit setenv: {argv:?}"
+    );
+    assert!(
+        !argv.iter().any(|arg| *arg == format!("{rt}/systemd")),
+        "absent entries are not masked: {argv:?}"
+    );
+}
+
+#[test]
+fn runtime_escape_bwrap_unsets_the_control_socket_the_daemon_injects_later() {
+    let (_temp, runtime, sandbox) = runtime_escape_fixture();
+    let argv = backend_enter_argv_with_env(
+        &sandbox,
+        "true",
+        SandboxArgvEnv {
+            resolver_dir: None,
+            runtime_dir: Some(runtime.clone()),
+            control_dirs: vec![runtime.join("thegn")],
+            protected_dirs: Vec::new(),
+        },
+    )
+    .unwrap();
+    assert!(
+        argv.windows(2)
+            .any(|pair| pair == ["--unsetenv", "THEGN_CONTROL_SOCKET"]),
+        "the daemon-injected control socket is unset: {argv:?}"
+    );
+}
+
+#[test]
+fn runtime_escape_bwrap_sees_through_a_non_canonical_mount_source() {
+    let temp = tempfile::tempdir_in("/tmp").unwrap();
+    let runtime = temp.path().join("rt");
+    std::fs::create_dir_all(runtime.join("podman")).unwrap();
+    std::fs::create_dir_all(runtime.join("thegn/abc")).unwrap();
+    std::fs::write(runtime.join("bus"), b"").unwrap();
+    let mut sandbox = spec(Backend::Bwrap);
+    sandbox.mounts.push(Mount {
+        host: format!("{}/podman/..", runtime.display()),
+        dest: runtime.display().to_string(),
+        ro: false,
+        cache: false,
+    });
+    let argv = backend_enter_argv_with_env(
+        &sandbox,
+        "true",
+        SandboxArgvEnv {
+            runtime_dir: Some(runtime.clone()),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    let podman = format!("{}/podman", runtime.display());
+    let bus = format!("{}/bus", runtime.display());
+    assert!(
+        argv.windows(3)
+            .any(|triple| triple == ["--ro-bind", "/dev/null", bus.as_str()]),
+        "bus socket is masked through a `..` source: {argv:?}"
+    );
+    assert!(
+        argv.windows(2)
+            .any(|pair| pair == ["--tmpfs", podman.as_str()]),
+        "podman dir is masked through a `..` source: {argv:?}"
+    );
+}
+
+#[test]
+fn runtime_escape_bwrap_honours_an_explicit_podman_socket_mount() {
+    let (_temp, runtime, mut sandbox) = runtime_escape_fixture();
+    let socket = runtime.join("podman/podman.sock");
+    std::fs::write(&socket, b"").unwrap();
+    sandbox.mounts.push(Mount {
+        host: socket.display().to_string(),
+        dest: socket.display().to_string(),
+        ro: false,
+        cache: false,
+    });
+    let argv = backend_enter_argv_with_env(
+        &sandbox,
+        "true",
+        SandboxArgvEnv {
+            resolver_dir: None,
+            runtime_dir: Some(runtime.clone()),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    let podman = format!("{}/podman", runtime.display());
+    let bus = format!("{}/bus", runtime.display());
+    assert!(
+        !argv
+            .windows(2)
+            .any(|pair| pair == ["--tmpfs", podman.as_str()]),
+        "an explicit socket mount is honoured: {argv:?}"
+    );
+    assert!(
+        argv.windows(3)
+            .any(|triple| triple == ["--ro-bind", "/dev/null", bus.as_str()]),
+        "{argv:?}"
+    );
+}
+
+#[test]
+fn runtime_escape_bwrap_adds_nothing_without_a_runtime_dir_mount() {
+    let (_temp, runtime, _) = runtime_escape_fixture();
+    let sandbox = spec(Backend::Bwrap);
+    let argv = backend_enter_argv_with_env(
+        &sandbox,
+        "true",
+        SandboxArgvEnv {
+            resolver_dir: None,
+            runtime_dir: Some(runtime.clone()),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    let rt = runtime.display().to_string();
+    assert!(
+        !argv.iter().any(|arg| arg.starts_with(&rt)),
+        "no mask without an exposing bind: {argv:?}"
+    );
+    assert!(
+        !argv
+            .windows(2)
+            .any(|pair| pair == ["--unsetenv", "THEGN_CONTROL_SOCKET"]),
+        "{argv:?}"
     );
 }
 
@@ -5995,3 +6193,267 @@ fn control_socket_systemd_makes_the_protected_dir_inaccessible() {
 
 #[path = "sandbox_evidence_tests.rs"]
 mod evidence;
+
+fn common_dir_mount_hosts(dir: &std::path::Path, init: bool) -> (Vec<String>, std::path::PathBuf) {
+    if init {
+        let ok = crate::util::git_cmd(dir)
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .args(["init", "--quiet"])
+            .status()
+            .unwrap()
+            .success();
+        assert!(ok);
+    }
+    let loc = crate::remote::GitLoc::Local(dir.to_path_buf());
+    let want = loc
+        .git_out_path(&["rev-parse", "--path-format=absolute", "--git-common-dir"])
+        .unwrap_or_default();
+    let cfg = crate::config::SandboxConfig {
+        enabled: true,
+        backend: crate::config::SandboxBackend::None,
+        isolation_floor: Some(crate::config::IsolationFloor::Off),
+        on_floor_miss: crate::config::OnFloorMiss::Degrade,
+        ..Default::default()
+    };
+    let spec = resolve_placed_exact(
+        &cfg,
+        &loc,
+        "test",
+        SandboxProfile::Hardened,
+        Placement::Ssh(SshPlacement::plain(
+            "host".into(),
+            22,
+            false,
+            TransportKind::Ssh,
+        )),
+    )
+    .expect("explicit remote host backend should resolve without probing");
+    (spec.mounts.into_iter().map(|m| m.host).collect(), want)
+}
+
+#[test]
+fn git_common_mount_uses_the_lossless_common_dir() {
+    let dir = tempfile::tempdir().unwrap();
+    let (hosts, want) = common_dir_mount_hosts(dir.path(), true);
+    assert!(!want.as_os_str().is_empty());
+    assert!(
+        hosts.iter().any(|h| std::path::Path::new(h) == want),
+        "{hosts:?} lacks {want:?}"
+    );
+}
+
+#[test]
+fn git_common_mount_is_omitted_outside_a_repo() {
+    let dir = tempfile::tempdir().unwrap();
+    let (hosts, want) = common_dir_mount_hosts(dir.path(), false);
+    assert!(want.as_os_str().is_empty());
+    assert!(!hosts.iter().any(|h| h.ends_with("/.git")), "{hosts:?}");
+}
+
+/// A fake linked worktree on disk for `git_policy_mounts`: `<td>/repo/.git`
+/// (common dir with objects, refs, logs, config and `worktrees/lane`) and
+/// `<td>/wt` (the worktree, with its `.git` gitfile).
+struct GitFixture {
+    _td: tempfile::TempDir,
+    common: std::path::PathBuf,
+    admin: std::path::PathBuf,
+    wt: std::path::PathBuf,
+}
+
+fn git_fixture() -> GitFixture {
+    let td = tempfile::tempdir().unwrap();
+    let common = td.path().join("repo/.git");
+    let admin = common.join("worktrees/lane");
+    let wt = td.path().join("wt");
+    for dir in [
+        common.join("objects"),
+        common.join("refs/heads"),
+        common.join("hooks"),
+        admin.clone(),
+        wt.clone(),
+    ] {
+        std::fs::create_dir_all(dir).unwrap();
+    }
+    std::fs::write(common.join("config"), "[core]\n").unwrap();
+    std::fs::write(common.join("refs/heads/main"), "0\n").unwrap();
+    std::fs::write(admin.join("commondir"), "../..\n").unwrap();
+    std::fs::write(admin.join("gitdir"), "x\n").unwrap();
+    std::fs::write(wt.join(".git"), "gitdir: x\n").unwrap();
+    GitFixture {
+        _td: td,
+        common,
+        admin,
+        wt,
+    }
+}
+
+fn git_probe(fx: &GitFixture, branch: &str, target: Option<&str>) -> GitProbe {
+    GitProbe {
+        common: fx.common.clone(),
+        admin: Some(fx.admin.clone()),
+        branch: Some(branch.to_string()),
+        target: target.map(str::to_string),
+        default: Some("main".to_string()),
+    }
+}
+
+fn git_cfg(mode: crate::config::SandboxGitMode) -> crate::config::SandboxGitConfig {
+    crate::config::SandboxGitConfig {
+        mode,
+        ..Default::default()
+    }
+}
+
+fn bwrap_git_argv(fx: &GitFixture, mounts: Vec<Mount>) -> Vec<String> {
+    let mut s = spec(Backend::Bwrap);
+    s.worktree = fx.wt.clone();
+    s.mounts = mounts;
+    backend_enter_argv_with_env(&s, "true", SandboxArgvEnv::default()).unwrap()
+}
+
+fn triple_at(argv: &[String], flag: &str, path: &std::path::Path) -> Option<usize> {
+    let p = path.display().to_string();
+    argv.windows(3)
+        .position(|t| t == [flag, p.as_str(), p.as_str()])
+}
+
+#[test]
+fn git_policy_commit_only_binds_common_ro_then_lane_carve_outs() {
+    use crate::config::SandboxGitMode;
+    let fx = git_fixture();
+    let (mounts, warning) = git_policy_mounts(
+        &git_cfg(SandboxGitMode::CommitOnly),
+        &fx.wt,
+        &git_probe(&fx, "tg/lane", Some("main")),
+    );
+    assert_eq!(warning, None);
+    // The plan's mkdirs ran on the host.
+    assert!(fx.common.join("refs/heads/tg").is_dir());
+    assert!(fx.common.join("logs/refs/heads/tg").is_dir());
+    let argv = bwrap_git_argv(&fx, mounts.clone());
+    let wt = triple_at(&argv, "--bind", &fx.wt).expect("worktree rw");
+    let common_ro = triple_at(&argv, "--ro-bind", &fx.common).expect("common dir ro");
+    let objects = triple_at(&argv, "--bind", &fx.common.join("objects")).expect("objects rw");
+    let admin = triple_at(&argv, "--bind", &fx.admin).expect("admin dir rw");
+    let heads = triple_at(&argv, "--bind", &fx.common.join("refs/heads/tg")).expect("lane refs rw");
+    let config = triple_at(&argv, "--ro-bind", &fx.common.join("config")).expect("config pin");
+    let gitfile = triple_at(&argv, "--ro-bind", &fx.wt.join(".git")).expect("gitfile pin");
+    let commondir =
+        triple_at(&argv, "--ro-bind", &fx.admin.join("commondir")).expect("commondir pin");
+    assert!(wt < common_ro && common_ro < objects, "{argv:?}");
+    assert!(
+        objects < config && admin < config && heads < config,
+        "{argv:?}"
+    );
+    assert!(config < gitfile && admin < commondir, "{argv:?}");
+    // The missing config.worktree was created so its re-pin applies.
+    assert!(fx.admin.join("config.worktree").exists());
+    assert!(triple_at(&argv, "--bind", &fx.common).is_none(), "{argv:?}");
+    // Nothing writable covers main's ref, hooks or the shared config.
+    for protected in [
+        "refs/heads/main",
+        "hooks/pre-commit",
+        "config",
+        "packed-refs",
+    ] {
+        let path = fx.common.join(protected);
+        assert!(
+            !mounts
+                .iter()
+                .any(|m| !m.ro && path.starts_with(std::path::Path::new(&m.dest))),
+            "{protected} is under a rw bind: {mounts:?}"
+        );
+    }
+}
+
+#[test]
+fn git_policy_read_only_makes_the_worktree_ro() {
+    use crate::config::SandboxGitMode;
+    let fx = git_fixture();
+    let (mounts, warning) = git_policy_mounts(
+        &git_cfg(SandboxGitMode::ReadOnly),
+        &fx.wt,
+        &git_probe(&fx, "tg/lane", Some("main")),
+    );
+    assert_eq!(warning, None);
+    assert!(mounts.iter().all(|m| m.ro), "{mounts:?}");
+    let argv = bwrap_git_argv(&fx, mounts);
+    assert!(triple_at(&argv, "--ro-bind", &fx.wt).is_some(), "{argv:?}");
+    assert!(
+        triple_at(&argv, "--ro-bind", &fx.common).is_some(),
+        "{argv:?}"
+    );
+}
+
+#[test]
+fn git_policy_top_level_branch_falls_back_to_read_only_git_with_a_warning() {
+    use crate::config::SandboxGitMode;
+    let fx = git_fixture();
+    let (mounts, warning) = git_policy_mounts(
+        &git_cfg(SandboxGitMode::CommitOnly),
+        &fx.wt,
+        &git_probe(&fx, "feature", Some("main")),
+    );
+    let warning = warning.expect("fallback warns");
+    assert!(warning.contains("top-level"), "{warning}");
+    assert!(warning.contains("tg/<name>"), "{warning}");
+    // The worktree stays writable; every git bind is read-only.
+    assert_eq!(mounts[0].dest, fx.wt.to_string_lossy());
+    assert!(!mounts[0].ro);
+    assert!(mounts[1..].iter().all(|m| m.ro), "{mounts:?}");
+    assert!(
+        mounts
+            .iter()
+            .any(|m| m.ro && std::path::Path::new(&m.dest) == fx.common)
+    );
+
+    // mode = "full" keeps today's read-write common dir for the same branch.
+    let (full, warning) = git_policy_mounts(
+        &git_cfg(SandboxGitMode::Full),
+        &fx.wt,
+        &git_probe(&fx, "feature", Some("main")),
+    );
+    assert!(warning.is_some());
+    assert!(
+        full.iter()
+            .any(|m| !m.ro && std::path::Path::new(&m.dest) == fx.common),
+        "{full:?}"
+    );
+}
+
+#[test]
+fn git_policy_unknown_target_fails_closed_even_for_full() {
+    use crate::config::SandboxGitMode;
+    let fx = git_fixture();
+    for mode in [SandboxGitMode::CommitOnly, SandboxGitMode::Full] {
+        let (mounts, warning) =
+            git_policy_mounts(&git_cfg(mode), &fx.wt, &git_probe(&fx, "tg/lane", None));
+        assert!(warning.is_some(), "{mode}");
+        assert!(!mounts[0].ro, "{mode}: worktree stays writable");
+        assert!(mounts[1..].iter().all(|m| m.ro), "{mode}: {mounts:?}");
+    }
+}
+
+#[test]
+fn git_policy_main_checkout_gets_a_read_only_git_dir() {
+    use crate::config::SandboxGitMode;
+    let fx = git_fixture();
+    let main = fx.common.parent().unwrap().to_path_buf();
+    let probe = GitProbe {
+        common: fx.common.clone(),
+        admin: None,
+        branch: Some("main".into()),
+        target: Some("main".into()),
+        default: Some("main".into()),
+    };
+    let (mounts, warning) = git_policy_mounts(&git_cfg(SandboxGitMode::CommitOnly), &main, &probe);
+    assert!(warning.expect("warns").contains("main checkout"));
+    assert!(!mounts[0].ro);
+    assert!(
+        mounts
+            .iter()
+            .any(|m| m.ro && std::path::Path::new(&m.dest) == fx.common),
+        "{mounts:?}"
+    );
+    assert!(mounts[1..].iter().all(|m| m.ro), "{mounts:?}");
+}

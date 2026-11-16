@@ -506,6 +506,26 @@ pub struct PlanOpts {
     /// overrides). The default (`mode = "auto"`) keeps SynthNix; `mise`/`off`
     /// downgrade it (see [`plan`]).
     pub toolchain: crate::toolchain::ToolchainConfig,
+    /// Install the GitHub token credential helper in the `git_auth` step.
+    /// False (the default) unless `[sandbox.git]` grants a token
+    /// ([`crate::config::SandboxGitConfig::admits_git_token`]): credentials stay
+    /// with thegn, and the step configures no token helper or https rewrite.
+    pub git_token: bool,
+    /// Seed the sandbox repository from a host-side `git bundle` of the local
+    /// branch instead of cloning `origin` inside the sandbox (THE-2021): the
+    /// sandbox needs no network credential to get the code. `None` ⇒ the
+    /// in-sandbox clone (pool spares, and the `clone` transport). Emits a
+    /// host-executed [`StepKind::BundleSeed`] in place of the `clone` step.
+    pub bundle_seed: Option<BundleSeed>,
+}
+
+/// Where a [`StepKind::BundleSeed`] step reads the repository from on the host.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BundleSeed {
+    /// Host path of the local checkout (a git worktree) to bundle.
+    pub worktree: String,
+    /// Local branch to bundle and check out in the sandbox.
+    pub branch: String,
 }
 
 /// A Nix binary-cache substituter (and optional push) for fast devShells.
@@ -548,6 +568,8 @@ impl Default for PlanOpts {
             host_cache_key: None,
             host_cache_url: None,
             toolchain: crate::toolchain::ToolchainConfig::default(),
+            git_token: false,
+            bundle_seed: None,
         }
     }
 }
@@ -605,6 +627,15 @@ pub enum StepKind {
         workdir: String,
         snapshot_id: String,
     },
+    /// Host-executed: seed the sandbox repository from a `git bundle` of the
+    /// local `branch` in `worktree` (uploaded over the provider files API and
+    /// cloned into `workdir`), in place of the in-sandbox origin clone. NOT
+    /// best-effort: without it the sandbox has no repository.
+    BundleSeed {
+        worktree: String,
+        workdir: String,
+        branch: String,
+    },
 }
 
 /// The compiled, backend-agnostic provisioning plan.
@@ -651,26 +682,44 @@ pub fn plan(req: &EnvRequirements, opts: &PlanOpts) -> EnvPlan {
         kind: StepKind::Exec(format!("mkdir -p {wd}")),
     });
 
-    // 2. Git auth + clone. The auth step is a runtime-conditional credential
+    // 2. Git auth + clone. Only when `opts.git_token` (`[sandbox.git]` grants a
+    // token) does the auth step install a runtime-conditional credential
     // helper: if a GitHub token is present in the exec env (carried from the host
     // via `passthrough_env_remote` — GH_TOKEN/GITHUB_TOKEN), configure git to use
     // it for HTTPS clone/push; a no-op without a token. Persisted in ~/.gitconfig
     // so it survives the checkpoint and works for later pushes from the shell.
-    if opts.origin.is_some() {
+    let seeded = opts.bundle_seed.as_ref();
+    if opts.origin.is_some() || seeded.is_some() {
         steps.push(ProvisionStep {
             id: "git_auth".into(),
             label: "Configure git credentials".into(),
-            kind: StepKind::Exec(git_auth_script()),
+            kind: StepKind::Exec(git_auth_script(opts.git_token)),
         });
     }
-    // Clone the repo into the workdir (idempotent — skips if already a repo).
-    if let Some(origin) = opts.origin.as_deref() {
-        let clone = crate::remote::provision_repo_script(origin, opts.branch.as_deref());
-        steps.push(ProvisionStep {
-            id: "clone".into(),
-            label: "Clone repository".into(),
-            kind: StepKind::Exec(format!("cd {wd} && {clone}")),
-        });
+    // Seed the repo from a host-side bundle (no in-sandbox credential needed),
+    // or clone it into the workdir (idempotent — skips if already a repo).
+    let repo_step = match (seeded, opts.origin.as_deref()) {
+        (Some(seed), _) => Some(ProvisionStep {
+            id: "bundle_seed".into(),
+            label: "Seed repository (git bundle)".into(),
+            kind: StepKind::BundleSeed {
+                worktree: seed.worktree.clone(),
+                workdir: opts.workdir.clone(),
+                branch: seed.branch.clone(),
+            },
+        }),
+        (None, Some(origin)) => {
+            let clone = crate::remote::provision_repo_script(origin, opts.branch.as_deref());
+            Some(ProvisionStep {
+                id: "clone".into(),
+                label: "Clone repository".into(),
+                kind: StepKind::Exec(format!("cd {wd} && {clone}")),
+            })
+        }
+        (None, None) => None,
+    };
+    if let Some(repo_step) = repo_step {
+        steps.push(repo_step);
         // Bring the clone to full parity with the local worktree (unpushed
         // commits + uncommitted + untracked). Runs before the toolchain tier so
         // a locally-modified flake.lock / .envrc drives the devShell build. Only
@@ -1469,7 +1518,10 @@ fn agents_install_script(agents: &[String]) -> String {
 /// Without a token the origin is left untouched (public HTTPS / agent-forwarded
 /// SSH still work). All persisted to `~/.gitconfig` so later pushes/pulls from
 /// the shell work too.
-fn git_auth_script() -> String {
+///
+/// `git_token = false` (the default policy) omits the token helper and the
+/// https rewrite entirely: the sandbox gets no git credential from thegn.
+fn git_auth_script(git_token: bool) -> String {
     // The in-sandbox `core.sshCommand` host-key policy comes from the one
     // chokepoint (`SandboxBootstrap` class), never a literal here — see
     // `crate::hostkey` and the host-key ratchet.
@@ -1480,25 +1532,58 @@ fn git_auth_script() -> String {
             &crate::hostkey::HostKeyContext::default(),
         )
     );
-    let mut s = String::from(
-        "tok=\"${GH_TOKEN:-${GITHUB_TOKEN:-}}\"; \
-         git config --global --add safe.directory '*' 2>/dev/null || true; \
+    let mut s = ensure_git_script();
+    if git_token {
+        s.push_str("tok=\"${GH_TOKEN:-${GITHUB_TOKEN:-}}\"; ");
+    }
+    s.push_str(
+        "git config --global --add safe.directory '*' 2>/dev/null || true; \
          git config --global core.sshCommand '",
     );
     s.push_str(&ssh_cmd);
     s.push_str(
         "' 2>/dev/null || true; \
          [ -n \"${THEGN_GIT_NAME:-}\" ] && git config --global user.name \"$THEGN_GIT_NAME\" 2>/dev/null || true; \
-         [ -n \"${THEGN_GIT_EMAIL:-}\" ] && git config --global user.email \"$THEGN_GIT_EMAIL\" 2>/dev/null || true; \
-         if [ -n \"$tok\" ]; then \
+         [ -n \"${THEGN_GIT_EMAIL:-}\" ] && git config --global user.email \"$THEGN_GIT_EMAIL\" 2>/dev/null || true; ",
+    );
+    if git_token {
+        s.push_str(
+            "if [ -n \"$tok\" ]; then \
            git config --global credential.helper \
              '!f() { test \"$1\" = get && printf \"username=x-access-token\\npassword=%s\\n\" \"${GH_TOKEN:-$GITHUB_TOKEN}\"; }; f'; \
            git config --global --unset-all url.'https://github.com/'.insteadOf 2>/dev/null || true; \
            git config --global --add url.'https://github.com/'.insteadOf 'git@github.com:' 2>/dev/null || true; \
            git config --global --add url.'https://github.com/'.insteadOf 'ssh://git@github.com/' 2>/dev/null || true; \
-         fi; true",
-    );
+         fi; ",
+        );
+    }
+    s.push_str("true");
     s
+}
+
+/// Install git (plus CA certificates and an ssh client) when the sandbox image
+/// lacks it, through whichever native package manager exists (as root, or via
+/// passwordless sudo). A stock provider image (fly's default `ubuntu:24.04`)
+/// ships without git, and every `git config` in [`git_auth_script`] is
+/// best-effort, so without this the credentials step silently configured
+/// nothing and the clone died `git: not found` (exit 127). Fatal, with a
+/// message naming the cause, when git is still missing afterwards.
+fn ensure_git_script() -> String {
+    "if ! command -v git >/dev/null 2>&1; then \
+       if [ \"$(id -u)\" = 0 ]; then S=; \
+       elif command -v sudo >/dev/null 2>&1 && sudo -n true 2>/dev/null; then S='sudo -n'; \
+       else S=; fi; \
+       echo 'thegn: git is not installed in the sandbox; installing it' >&2; \
+       if command -v apt-get >/dev/null 2>&1; then \
+         $S env DEBIAN_FRONTEND=noninteractive apt-get update -y >/dev/null \
+           && $S env DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends git ca-certificates openssh-client >/dev/null; \
+       elif command -v apk >/dev/null 2>&1; then $S apk add --no-cache git ca-certificates openssh-client >/dev/null; \
+       elif command -v dnf >/dev/null 2>&1; then $S dnf install -y git ca-certificates openssh-clients >/dev/null; \
+       elif command -v yum >/dev/null 2>&1; then $S yum install -y git ca-certificates openssh-clients >/dev/null; \
+       fi; \
+       command -v git >/dev/null 2>&1 || { echo 'thegn: git is missing in the sandbox and no package manager could install it' >&2; exit 1; }; \
+     fi; "
+        .to_string()
 }
 
 /// Clone a dotfiles repo into `~/.dotfiles` (idempotent) and run its bootstrap
@@ -2327,6 +2412,77 @@ mod tests {
     }
 
     #[test]
+    fn plan_bundle_seed_replaces_clone_after_git_auth() {
+        let opts = PlanOpts {
+            origin: Some("https://example.com/r.git".into()),
+            branch: Some("feat".into()),
+            local_parity: Some("/home/u/wt".into()),
+            bundle_seed: Some(BundleSeed {
+                worktree: "/home/u/wt".into(),
+                branch: "feat".into(),
+            }),
+            checkpoint: false,
+            ..Default::default()
+        };
+        let p = plan(&EnvRequirements::default(), &opts);
+        let ids: Vec<&str> = p.steps.iter().map(|s| s.id.as_str()).collect();
+        assert!(!ids.contains(&"clone"), "no in-sandbox clone: {ids:?}");
+        let auth = ids.iter().position(|i| *i == "git_auth").expect("git_auth");
+        let seed = ids
+            .iter()
+            .position(|i| *i == "bundle_seed")
+            .expect("bundle_seed step");
+        assert_eq!(seed, auth + 1, "seed right after git_auth: {ids:?}");
+        let parity = ids.iter().position(|i| *i == "local_parity").unwrap();
+        assert_eq!(parity, seed + 1, "parity follows the seed: {ids:?}");
+        let step = &p.steps[seed];
+        assert_eq!(step.label, "Seed repository (git bundle)");
+        let StepKind::BundleSeed {
+            worktree,
+            workdir,
+            branch,
+        } = &step.kind
+        else {
+            panic!("bundle_seed must be a BundleSeed step");
+        };
+        assert_eq!(worktree, "/home/u/wt");
+        assert_eq!(workdir, "/workspace");
+        assert_eq!(branch, "feat");
+    }
+
+    #[test]
+    fn plan_bundle_seed_without_origin_still_seeds() {
+        let opts = PlanOpts {
+            bundle_seed: Some(BundleSeed {
+                worktree: "/w".into(),
+                branch: "b".into(),
+            }),
+            snapshot_restore: Some("snap".into()),
+            checkpoint: false,
+            ..Default::default()
+        };
+        let p = plan(&EnvRequirements::default(), &opts);
+        let ids: Vec<&str> = p.steps.iter().map(|s| s.id.as_str()).collect();
+        assert!(ids.contains(&"git_auth"), "{ids:?}");
+        assert!(ids.contains(&"bundle_seed"), "{ids:?}");
+        assert!(ids.contains(&"snapshot_restore"), "{ids:?}");
+        assert!(!ids.contains(&"clone"), "{ids:?}");
+    }
+
+    #[test]
+    fn plan_without_bundle_seed_keeps_clone() {
+        let opts = PlanOpts {
+            origin: Some("https://example.com/r.git".into()),
+            checkpoint: false,
+            ..Default::default()
+        };
+        let p = plan(&EnvRequirements::default(), &opts);
+        let ids: Vec<&str> = p.steps.iter().map(|s| s.id.as_str()).collect();
+        assert!(ids.contains(&"clone"), "{ids:?}");
+        assert!(!ids.contains(&"bundle_seed"), "{ids:?}");
+    }
+
+    #[test]
     fn plan_snapshot_restore_follows_local_parity() {
         let opts = PlanOpts {
             origin: Some("https://example.com/r.git".into()),
@@ -2889,8 +3045,63 @@ mod tests {
     }
 
     #[test]
+    fn git_auth_installs_git_first_when_the_image_lacks_it() {
+        let s = git_auth_script(false);
+        let ensure = s
+            .find("command -v git")
+            .expect("probes for git before configuring it");
+        let first_config = s.find("git config").expect("configures git");
+        assert!(
+            ensure < first_config,
+            "git is ensured before any git config"
+        );
+        assert!(s.contains("apt-get install -y --no-install-recommends git"));
+        assert!(s.contains("apk add --no-cache git"));
+        assert!(s.contains("dnf install -y git"));
+        assert!(
+            s.contains("no package manager could install it' >&2; exit 1"),
+            "a still-missing git fails the step with a named cause"
+        );
+    }
+
+    #[test]
+    fn git_auth_withholds_token_helper_by_default() {
+        let s = git_auth_script(false);
+        assert!(
+            !s.contains("GH_TOKEN") && !s.contains("GITHUB_TOKEN"),
+            "{s}"
+        );
+        assert!(!s.contains("credential.helper"), "{s}");
+        assert!(!s.contains("insteadOf"), "{s}");
+        assert!(s.contains("safe.directory") && s.ends_with("true"), "{s}");
+        // Plan level: the default PlanOpts keep credentials with thegn.
+        let req = EnvRequirements::default();
+        let step_script = |opts: &PlanOpts| {
+            plan(&req, opts)
+                .steps
+                .into_iter()
+                .find(|step| step.id == "git_auth")
+                .and_then(|step| match step.kind {
+                    StepKind::Exec(script) => Some(script),
+                    _ => None,
+                })
+                .expect("git_auth step")
+        };
+        let base = PlanOpts {
+            origin: Some("https://github.com/o/r".into()),
+            ..PlanOpts::default()
+        };
+        assert!(!step_script(&base).contains("credential.helper"));
+        let granted = PlanOpts {
+            git_token: true,
+            ..base
+        };
+        assert!(step_script(&granted).contains("credential.helper"));
+    }
+
+    #[test]
     fn git_auth_is_runtime_conditional_on_token() {
-        let s = git_auth_script();
+        let s = git_auth_script(true);
         assert!(
             s.contains("GH_TOKEN") && s.contains("GITHUB_TOKEN"),
             "reads both token vars"

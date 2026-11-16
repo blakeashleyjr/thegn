@@ -975,4 +975,52 @@ mod tests {
         let input = reflog_records(1000).concat();
         assert_eq!(parse_reflog(&input).unwrap().len(), 1000);
     }
+
+    /// NUL-terminate every field and decode the bytes the way the svc runner
+    /// does (`String::from_utf8_lossy`), so invalid UTF-8 reaches the parser.
+    fn lossy_z(fields: &[&[u8]]) -> String {
+        let mut bytes = Vec::new();
+        for field in fields {
+            bytes.extend_from_slice(field);
+            bytes.push(0);
+        }
+        String::from_utf8_lossy(&bytes).into_owned()
+    }
+
+    #[test]
+    fn lossy_invalid_utf8_in_reflog_message_keeps_alignment() {
+        let a = "a".repeat(40);
+        let b = "b".repeat(40);
+        let out = lossy_z(&[
+            a.as_bytes(),
+            b"HEAD@{0}",
+            b"1700000000",
+            b"commit: \xff\xfe subject",
+            b.as_bytes(),
+            b"HEAD@{1}",
+            b"1600000000",
+            b"reset: moving to main",
+        ]);
+        let entries = parse_reflog(&out).unwrap();
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0].sha, a);
+        assert_eq!(entries[0].selector, "HEAD@{0}");
+        assert_eq!(entries[0].date, 1_700_000_000);
+        assert_eq!(entries[0].action, ReflogAction::Commit);
+        assert!(entries[0].raw.contains('\u{FFFD}'));
+        assert_eq!(entries[1].sha, b);
+        assert_eq!(entries[1].selector, "HEAD@{1}");
+        assert_eq!(entries[1].date, 1_600_000_000);
+        assert_eq!(entries[1].action, ReflogAction::Reset { to: "main".into() });
+    }
+
+    #[test]
+    fn lossy_invalid_utf8_in_a_reflog_fixed_field_is_an_error() {
+        let a = "a".repeat(40);
+        let mut bad_sha = a.clone().into_bytes();
+        bad_sha[10] = 0xff;
+        let record = |sha: &[u8], date: &[u8]| lossy_z(&[sha, b"HEAD@{0}", date, b"commit: x"]);
+        assert!(parse_reflog(&record(&bad_sha, b"1700000000")).is_err());
+        assert!(parse_reflog(&record(a.as_bytes(), b"17000\xff0000")).is_err());
+    }
 }

@@ -1074,16 +1074,6 @@ pub const SURFACE_GAPS: &[(&str, Surface, &str)] = &[
         "MCP state tools land in the client-API phase",
     ),
     (
-        "sessions.snapshot",
-        Surface::Mcp,
-        "MCP state tools land in the client-API phase",
-    ),
-    (
-        "sessions.split",
-        Surface::Mcp,
-        "MCP state tools land in the client-API phase",
-    ),
-    (
         "git.stage",
         Surface::Mcp,
         "MCP state tools land in the client-API phase",
@@ -1116,16 +1106,6 @@ pub const SURFACE_GAPS: &[(&str, Surface, &str)] = &[
     ),
     (
         "issues.comment",
-        Surface::Mcp,
-        "MCP state tools land in the client-API phase",
-    ),
-    (
-        "dispatches.put",
-        Surface::Mcp,
-        "MCP state tools land in the client-API phase",
-    ),
-    (
-        "dispatches.set_status",
         Surface::Mcp,
         "MCP state tools land in the client-API phase",
     ),
@@ -1314,16 +1294,6 @@ pub const GAP_DISPOSITIONS: &[(&str, Surface, GapDisposition)] = &[
         GapDisposition::Deferred { review: "THE-203" },
     ),
     (
-        "sessions.snapshot",
-        Surface::Mcp,
-        GapDisposition::Deferred { review: "THE-203" },
-    ),
-    (
-        "sessions.split",
-        Surface::Mcp,
-        GapDisposition::Deferred { review: "THE-203" },
-    ),
-    (
         "git.stage",
         Surface::Mcp,
         GapDisposition::Deferred { review: "THE-203" },
@@ -1350,16 +1320,6 @@ pub const GAP_DISPOSITIONS: &[(&str, Surface, GapDisposition)] = &[
     ),
     (
         "issues.comment",
-        Surface::Mcp,
-        GapDisposition::Deferred { review: "THE-203" },
-    ),
-    (
-        "dispatches.put",
-        Surface::Mcp,
-        GapDisposition::Deferred { review: "THE-203" },
-    ),
-    (
-        "dispatches.set_status",
         Surface::Mcp,
         GapDisposition::Deferred { review: "THE-203" },
     ),

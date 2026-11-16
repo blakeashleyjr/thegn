@@ -11,6 +11,7 @@
 use std::collections::HashSet;
 
 use crate::session::Session;
+use thegn_core::config_ui::ExternalWorktrees;
 use thegn_svc::git::{BranchMeta, DiffCount};
 
 /// Which level of the tree a row sits at.
@@ -55,6 +56,24 @@ pub enum RowKind {
     /// keyless row instead. A mirrored [`RowKind::Worktree`] would also make
     /// the board's "jump to this worktree" depend on emission order.
     PipelineWorktree,
+    /// A **derived** "Other (N)" group under a workspace holding its
+    /// *external* worktrees — git worktrees thegn did not create (see
+    /// [`is_external`]) — when `[ui] sidebar_external_worktrees = "group"`.
+    /// Keyed `other:{slug}`; collapsible (collapsed by default, per `[ui]
+    /// sidebar_other_group_collapsed`, remembered per project as
+    /// `other_open:{slug}`). Like [`RowKind::PipelineGroup`] it carries no
+    /// `folder_id` and no `tab_target`, and is not markable, pinnable,
+    /// fileable or draggable: there is no `folders` row behind it.
+    OtherGroup,
+    /// A **derived** "… show N more" / "show fewer" toggle closing a group
+    /// whose entries exceed `[ui] sidebar_group_row_limit` (or its
+    /// `sidebar_group_row_limits` override; see `apply_row_limits`). Sits at
+    /// the group's child depth. Its `pin_key` is [`show_more_key`] of the
+    /// group key (identity anchor only: it is never pinnable, markable,
+    /// draggable or a tab target), `child_count` is how many entries the
+    /// limit hides, and `collapsed` is `true` while they are hidden. Enter,
+    /// Space and a click flip the group's `more_open:{group key}` state.
+    ShowMore,
 }
 
 impl RowKind {
@@ -70,6 +89,7 @@ impl RowKind {
                 | RowKind::TerminalHost
                 | RowKind::PipelineGroup
                 | RowKind::PipelineLane
+                | RowKind::OtherGroup
         )
     }
 }
@@ -403,7 +423,11 @@ impl SidebarRow {
         !self.pin_key.is_empty()
             && !matches!(
                 self.kind,
-                RowKind::PipelineGroup | RowKind::PipelineLane | RowKind::PipelineWorktree
+                RowKind::PipelineGroup
+                    | RowKind::PipelineLane
+                    | RowKind::PipelineWorktree
+                    | RowKind::OtherGroup
+                    | RowKind::ShowMore
             )
     }
 
@@ -416,7 +440,10 @@ impl SidebarRow {
     /// TerminalHost) keys on its `workspace_slug`. Meaningless for leaves.
     pub fn collapse_key(&self) -> &str {
         match self.kind {
-            RowKind::Folder | RowKind::PipelineGroup | RowKind::PipelineLane => &self.pin_key,
+            RowKind::Folder
+            | RowKind::PipelineGroup
+            | RowKind::PipelineLane
+            | RowKind::OtherGroup => &self.pin_key,
             _ => &self.workspace_slug,
         }
     }
@@ -551,6 +578,15 @@ pub struct ViewState {
     /// startup/reload like `workspace_sort`). Which right-cluster fields show,
     /// the focused-detail policy, and glyph overrides.
     pub display: crate::sidebar_view::SidebarDisplay,
+    /// Per-project expansion override of the derived "Other" group, keyed by
+    /// workspace slug: `true` = open, `false` = collapsed. Absent = follow
+    /// `[ui] sidebar_other_group_collapsed` (`display.other_group_collapsed`).
+    /// Persisted as `other_open:{slug}` (`"1"`/`"0"`) in `ui_state`.
+    pub other_open: std::collections::HashMap<String, bool>,
+    /// Groups the user expanded past their row limit ("show more"), keyed by
+    /// the group head's [`SidebarRow::collapse_key`]. Absent = truncated.
+    /// Persisted as `more_open:{group key}` (`"1"`) in `ui_state`.
+    pub more_open: HashSet<String>,
     /// Frozen sort keys, armed while the user is navigating the bar (see
     /// [`crate::sidebar_freeze`]). While `Some`, the computed sorts read this
     /// snapshot instead of the live [`SidebarStatus`] maps, so rows cannot move
@@ -600,6 +636,47 @@ pub struct DbWorktree {
     /// (degraded to the host / never provisioned) — renders the `«env»` badge as
     /// `«env ✗»`. Computed in `hydrate::db_worktree_list_with_snapshot`.
     pub env_degraded: bool,
+    /// A worktree thegn did not create (see [`is_external`]): placed per
+    /// `[ui] sidebar_external_worktrees`. Computed in
+    /// `hydrate::db_worktree_list_with_snapshot`.
+    pub external: bool,
+}
+
+/// The `ViewState::collapsed`-style key of a workspace's derived "Other"
+/// group (also its `pin_key`).
+pub fn other_group_key(slug: &str) -> String {
+    format!("other:{slug}")
+}
+
+/// Inputs to [`is_external`]: one registered worktree row and the
+/// workspace context it is classified against.
+pub struct ExternalCheck<'a> {
+    /// The workspace's repo root (its home checkout).
+    pub root: &'a std::path::Path,
+    /// The readable per-repo directory name thegn files checkouts under.
+    pub repo_dir_name: &'a str,
+    /// `[project.<slug>] worktree_roots`, already tilde-expanded.
+    pub roots: &'a [std::path::PathBuf],
+    pub cfg: &'a thegn_core::config::Config,
+}
+
+/// Whether a registered worktree at `path` (filed into `folder_id`) is
+/// **external**: outside thegn's own checkout layout
+/// ([`thegn_core::worktree::is_managed_checkout`]), outside every
+/// `worktree_roots` entry, not filed into a folder (a row the user filed is
+/// adopted), and not the repo's home checkout. Pure string/path-component
+/// comparison — no canonicalisation, no I/O — so hydration stays cheap.
+pub fn is_external(path: &str, folder_id: Option<i64>, ctx: &ExternalCheck<'_>) -> bool {
+    if path.is_empty() || folder_id.is_some() {
+        return false;
+    }
+    let path = std::path::Path::new(path);
+    if path == ctx.root
+        || thegn_core::worktree::is_managed_checkout(ctx.root, ctx.repo_dir_name, path, ctx.cfg)
+    {
+        return false;
+    }
+    !ctx.roots.iter().any(|r| path.starts_with(r))
 }
 
 /// Split a `{repo}/{branch}` group name into its parts.
@@ -619,12 +696,16 @@ pub fn active_reveal_keys(active_name: &str, db_worktrees: &[DbWorktree]) -> Vec
         return Vec::new();
     };
     let mut keys = vec![slug.clone()];
-    if let Some(fid) = db_worktrees
-        .iter()
-        .find(|w| w.tab_name == active_name)
-        .and_then(|w| w.folder_id)
-    {
+    let row = db_worktrees.iter().find(|w| w.tab_name == active_name);
+    if let Some(fid) = row.and_then(|w| w.folder_id) {
         keys.push(format!("{slug}/folder:{fid}"));
+    }
+    // An external worktree lives under the derived "Other" group, which
+    // `build_rows` already renders open while it holds the active row; the
+    // key is reported so callers that clear collapse state see the whole
+    // ancestry.
+    if row.is_some_and(|w| w.external) {
+        keys.push(other_group_key(&slug));
     }
     keys
 }
@@ -725,6 +806,9 @@ struct Group {
     /// the env badge. See [`DbWorktree::env_degraded`].
     env_degraded: bool,
     folder_id: Option<i64>,
+    /// A worktree thegn did not create ([`DbWorktree::external`]); placed per
+    /// `[ui] sidebar_external_worktrees`.
+    external: bool,
     /// What activating this group's row does: focus the live `(gi, tab)` for a
     /// loaded workspace, or switch to the workspace (landing on this group's
     /// `{slug}/{branch}` name) for a dormant one.
@@ -1003,6 +1087,17 @@ pub fn build_rows(
             worktree_row(gr, status, repo_slug, depth, pin_key, !collapsed, None)
         };
 
+        // External worktrees (`[ui] sidebar_external_worktrees`): `show` keeps
+        // them among the loose rows, `group` moves them under the derived
+        // "Other" row emitted after the folders, `hide` drops them. The active
+        // worktree is never hidden: under `hide` it stays inline.
+        let external_mode = view.display.external_worktrees;
+        let inline = |g: &Group| match external_mode {
+            ExternalWorktrees::Show => true,
+            ExternalWorktrees::Group => !g.external,
+            ExternalWorktrees::Hide => !g.external || g.active,
+        };
+
         // Folders section: home → loose → folders by `position`. Filed
         // worktrees render at depth 2 under their folder header, in the order
         // the user arranged them: this emission order defines the **sibling
@@ -1033,6 +1128,7 @@ pub fn build_rows(
         for gr in groups.iter().filter(|g| {
             g.folder_id
                 .is_none_or(|fid| !rendered_folder_ids.contains(&fid))
+                && inline(g)
         }) {
             let pin_key = format!("{repo_slug}/{}", gr.label);
             rows.push(mk_row(gr, 1, pin_key));
@@ -1106,6 +1202,10 @@ pub fn build_rows(
                 row.visible = !collapsed && !folder_collapsed;
                 rows.push(row);
             }
+        }
+
+        if external_mode == ExternalWorktrees::Group {
+            push_other_group(&mut rows, &groups, repo_slug, collapsed, view, &mk_row);
         }
 
         // The workspace's derived `Pipelines` folder (THE-74), at the tail
@@ -1303,8 +1403,223 @@ pub fn build_rows(
     }
 
     apply_pins(&mut rows, &view.pins);
+    apply_row_limits(&mut rows, view);
     apply_filter(&mut rows, &view.filter);
     rows
+}
+
+/// The `pin_key` of the [`RowKind::ShowMore`] row closing the group whose
+/// collapse key is `group_key`.
+pub fn show_more_key(group_key: &str) -> String {
+    format!("more:{group_key}")
+}
+
+/// The group key a [`RowKind::ShowMore`] row toggles (`None` for any other
+/// row).
+pub fn show_more_group(row: &SidebarRow) -> Option<&str> {
+    if row.kind == RowKind::ShowMore {
+        row.pin_key.strip_prefix("more:")
+    } else {
+        None
+    }
+}
+
+/// Whether rows of this kind head a group the row limit applies to: a
+/// workspace (its loose rows), a user folder, the derived "Other" group, and
+/// the derived pipeline group and lane folders.
+fn is_limited_group(kind: RowKind) -> bool {
+    matches!(
+        kind,
+        RowKind::Workspace
+            | RowKind::Folder
+            | RowKind::OtherGroup
+            | RowKind::PipelineGroup
+            | RowKind::PipelineLane
+    )
+}
+
+/// Whether a direct child of a limited group is an *entry* that counts toward
+/// (and can be hidden by) the limit. Nested group heads (folders, "Other",
+/// `Pipelines`) are structure, not entries: they always show and carry their
+/// own limit.
+fn counts_toward_limit(kind: RowKind) -> bool {
+    !matches!(
+        kind,
+        RowKind::Folder
+            | RowKind::OtherGroup
+            | RowKind::PipelineGroup
+            | RowKind::SectionHeading
+            | RowKind::EmptyHint
+            | RowKind::ShowMore
+    )
+}
+
+/// The row-limit pass (`[ui] sidebar_group_row_limit` /
+/// `sidebar_group_row_limits`), run on the final order (after sorts and
+/// pins). For every group with more entries than its limit, entries past the
+/// limit are hidden (`visible = false`, their subtrees with them) and one
+/// [`RowKind::ShowMore`] row is inserted after the group's last entry. While
+/// the group is expanded (`ViewState::more_open`) every entry shows and the
+/// same row reads "show fewer".
+///
+/// - The limit is the group label's entry in `group_row_limits`, else
+///   `group_row_limit`; `0` disables it.
+/// - Pinned entries and the entry holding the active row are never hidden.
+///   They count toward the limit: a protected entry past it takes the slot of
+///   the last unprotected one, so the group still shows `limit` entries.
+/// - A non-empty filter disables the pass: every match shows.
+///
+/// Pure string/flag work over rows already built; no I/O.
+fn apply_row_limits(rows: &mut Vec<SidebarRow>, view: &ViewState) {
+    let disp = &view.display;
+    if !view.filter.trim().is_empty() {
+        return;
+    }
+    if disp.group_row_limit == 0 && disp.group_row_limits.values().all(|l| *l == 0) {
+        return;
+    }
+    let heads: Vec<usize> = (0..rows.len())
+        .filter(|&i| is_limited_group(rows[i].kind))
+        .collect();
+    // Back to front: an insertion only shifts rows after it, which are
+    // already processed, and a nested group's toggle row then sits inside its
+    // parent's entry block (so hiding the entry hides it too).
+    for &h in heads.iter().rev() {
+        let limit = disp
+            .group_row_limits
+            .get(rows[h].label.as_str())
+            .copied()
+            .unwrap_or(disp.group_row_limit);
+        if limit == 0 {
+            continue;
+        }
+        let depth = rows[h].depth;
+        // Direct-child entry blocks as half-open `(start, end)` ranges.
+        let mut blocks: Vec<(usize, usize)> = Vec::new();
+        let mut j = h + 1;
+        while j < rows.len() && rows[j].depth > depth {
+            let start = j;
+            j += 1;
+            while j < rows.len() && rows[j].depth > rows[start].depth {
+                j += 1;
+            }
+            if counts_toward_limit(rows[start].kind) {
+                blocks.push((start, j));
+            }
+        }
+        if blocks.len() <= limit {
+            continue;
+        }
+        let protected: Vec<bool> = blocks
+            .iter()
+            .map(|&(s, e)| {
+                (!rows[s].pin_key.is_empty() && view.pins.contains(&rows[s].pin_key))
+                    || rows[s..e].iter().any(|r| r.active)
+            })
+            .collect();
+        let mut budget = limit.saturating_sub(protected.iter().filter(|p| **p).count());
+        let mut hide: Vec<bool> = Vec::with_capacity(blocks.len());
+        for &p in &protected {
+            let shown = if p {
+                true
+            } else if budget > 0 {
+                budget -= 1;
+                true
+            } else {
+                false
+            };
+            hide.push(!shown);
+        }
+        let hidden = hide.iter().filter(|h| **h).count();
+        if hidden == 0 {
+            continue;
+        }
+        // The toggle shows exactly when the group's shown entries do (a
+        // collapsed ancestor hides both).
+        let visible = blocks
+            .iter()
+            .zip(&hide)
+            .find(|(_, h)| !**h)
+            .is_some_and(|(&(s, _), _)| rows[s].visible);
+        let key = rows[h].collapse_key().to_string();
+        let open = view.more_open.contains(&key);
+        if !open {
+            for (&(s, e), _) in blocks.iter().zip(&hide).filter(|(_, h)| **h) {
+                for r in &mut rows[s..e] {
+                    r.visible = false;
+                }
+            }
+        }
+        // Right after the last entry the group still shows (so the toggle
+        // never drifts past following folders/sub-groups); when expanded,
+        // after the last entry.
+        let at = if open {
+            blocks.last().map_or(h + 1, |b| b.1)
+        } else {
+            blocks
+                .iter()
+                .zip(&hide)
+                .rev()
+                .find(|(_, h)| !**h)
+                .map_or(h + 1, |(b, _)| b.1)
+        };
+        let slug = rows[h].workspace_slug.clone();
+        rows.insert(
+            at,
+            SidebarRow {
+                pin_key: show_more_key(&key),
+                collapsed: !open,
+                child_count: hidden,
+                visible,
+                ..SidebarRow::base(RowKind::ShowMore, depth + 1, String::new(), slug)
+            },
+        );
+    }
+}
+
+/// Emit a workspace's derived "Other (N)" group and its external worktree
+/// rows (in the workspace's sort order, at depth 2). Nothing when the
+/// workspace has no external worktree. Collapsed per the persisted override
+/// (`ViewState::other_open`), else `[ui] sidebar_other_group_collapsed` — but
+/// rendered open for this frame while it holds the active worktree, so the
+/// active row is never hidden. Children are always emitted (the folder
+/// precedent) so the filter can reveal one inside the collapsed group.
+fn push_other_group(
+    rows: &mut Vec<SidebarRow>,
+    groups: &[Group],
+    repo_slug: &str,
+    parent_collapsed: bool,
+    view: &ViewState,
+    mk_row: &dyn Fn(&Group, u8, String) -> SidebarRow,
+) {
+    let others: Vec<&Group> = groups.iter().filter(|g| g.external).collect();
+    if others.is_empty() {
+        return;
+    }
+    let holds_active = others.iter().any(|g| g.active);
+    let open = view
+        .other_open
+        .get(repo_slug)
+        .copied()
+        .unwrap_or(!view.display.other_group_collapsed);
+    let group_collapsed = !open && !holds_active;
+    rows.push(SidebarRow {
+        pin_key: other_group_key(repo_slug),
+        visible: !parent_collapsed,
+        collapsed: group_collapsed,
+        child_count: others.len(),
+        ..SidebarRow::base(
+            RowKind::OtherGroup,
+            1,
+            view.display.other_group_label.clone(),
+            repo_slug,
+        )
+    });
+    for gr in others {
+        let mut row = mk_row(gr, 2, format!("{repo_slug}/{}", gr.label));
+        row.visible = !parent_collapsed && !group_collapsed;
+        rows.push(row);
+    }
 }
 
 /// Emit one derived `Pipelines` group: the folder head, each lane folder
@@ -1456,6 +1771,7 @@ fn gather_groups(
             env_degraded: dbw.is_some_and(|w| w.env_degraded),
             activity: activity.get(&g.name).copied().unwrap_or_default(),
             folder_id: dbw.and_then(|w| w.folder_id),
+            external: dbw.is_some_and(|w| w.external),
             target: RowTarget::Tab(gi, g.active_tab),
             active: gi == session.active,
         });
@@ -1498,6 +1814,8 @@ fn gather_groups(
                 // workspace you switched away from keeps its activity dot.
                 activity: activity.get(home_tab.as_str()).copied().unwrap_or_default(),
                 folder_id: db_home.and_then(|w| w.folder_id),
+                // The home checkout is never external.
+                external: false,
                 target: RowTarget::Workspace {
                     repo_path: repo_path.to_string(),
                     group: Some(home_tab.clone()),
@@ -1533,6 +1851,7 @@ fn gather_groups(
                     .copied()
                     .unwrap_or_default(),
                 folder_id: w.folder_id,
+                external: w.external,
                 target: RowTarget::Workspace {
                     repo_path: repo_path.to_string(),
                     group: Some(w.tab_name.clone()),
@@ -1686,7 +2005,13 @@ fn build_rows_flat(
         if view.sort == SortMode::Manual {
             sort_groups(&mut gs, view.sort, keys);
         }
+        // `hide` drops external worktrees here too (the active one stays);
+        // `show` and `group` both list them, tagged with their repo as usual.
+        let hide = view.display.external_worktrees == ExternalWorktrees::Hide;
         for g in gs {
+            if hide && g.external && !g.active {
+                continue;
+            }
             pool.push((slug.clone(), display.clone(), g));
         }
     }
@@ -1907,7 +2232,9 @@ fn apply_filter(rows: &mut [SidebarRow], filter: &str) {
                 last_folder = None; // folders don't span workspaces
                 last_group = None;
             }
-            RowKind::Folder => {
+            // The derived "Other" group nests its rows at depth 2 exactly like
+            // a folder, so the filter surfaces and reveals it the same way.
+            RowKind::Folder | RowKind::OtherGroup => {
                 last_folder = Some(i);
                 // A folder that matches on its own label surfaces its parent
                 // workspace header, so it never floats orphaned at depth 1.
@@ -1984,7 +2311,7 @@ fn apply_filter(rows: &mut [SidebarRow], filter: &str) {
                     }
                 }
             }
-            RowKind::EmptyHint => {}
+            RowKind::EmptyHint | RowKind::ShowMore => {}
         }
     }
     // Reveal children only for headers/groups that matched on their own label.
@@ -2001,7 +2328,7 @@ fn apply_filter(rows: &mut [SidebarRow], filter: &str) {
                 reveal_folder = false; // folders don't span workspaces
                 reveal_group = false;
             }
-            RowKind::Folder => {
+            RowKind::Folder | RowKind::OtherGroup => {
                 // A folder that matched on its own label reveals its children,
                 // and (like any surfaced folder) is itself surfaced above.
                 reveal_folder = self_match[i] || reveal_ws;
@@ -2049,7 +2376,7 @@ fn apply_filter(rows: &mut [SidebarRow], filter: &str) {
                     keep[i] = true;
                 }
             }
-            RowKind::EmptyHint => {}
+            RowKind::EmptyHint | RowKind::ShowMore => {}
         }
     }
     for (i, r) in rows.iter_mut().enumerate() {
@@ -2566,6 +2893,7 @@ mod tests {
             env_name: Some("company-k8s".into()),
             sandbox_profile: None,
             env_degraded: false,
+            external: false,
         }];
         let rows = build_rows(
             &s,
@@ -2884,6 +3212,7 @@ mod tests {
             env_name: None,
             env_degraded: false,
             sandbox_profile: None,
+            external: false,
         }
     }
 
@@ -3569,6 +3898,7 @@ mod tests {
                 env_name: None,
                 sandbox_profile: None,
                 env_degraded: false,
+                external: false,
             },
             DbWorktree {
                 slug: "app".into(),
@@ -3581,6 +3911,7 @@ mod tests {
                 env_name: None,
                 sandbox_profile: None,
                 env_degraded: false,
+                external: false,
             },
         ];
         let rows = build_rows(
@@ -3841,6 +4172,7 @@ mod tests {
             env_name: None,
             sandbox_profile: None,
             env_degraded: false,
+            external: false,
         }];
         let folders = vec![thegn_core::models::FolderRow {
             folder_id: 1,
@@ -4021,6 +4353,7 @@ mod tests {
             env_name: None,
             env_degraded: false,
             sandbox_profile: None,
+            external: false,
         };
         let live = session(
             vec![
@@ -4088,6 +4421,7 @@ mod tests {
             env_name: None,
             sandbox_profile: None,
             env_degraded: false,
+            external: false,
         }];
         (ws, dbw, FOREIGN)
     }
@@ -4321,6 +4655,7 @@ mod tests {
             env_name: None,
             env_degraded: false,
             sandbox_profile: None,
+            external: false,
         };
         let dbw = vec![mk("zebra", "/wt/zebra"), mk("alpha", "/wt/alpha")];
         let view = ViewState {
@@ -4344,6 +4679,250 @@ mod tests {
         assert_eq!(labels, vec!["home", "alpha", "zebra"]);
     }
 
+    // --- external worktrees: the derived "Other" group ---------------------
+
+    /// A dormant `app` workspace with home + 2 internal + 4 external rows.
+    fn external_fixture() -> (WorkspaceFixtureRows, Vec<DbWorktree>) {
+        let ws = vec![(
+            "app".to_string(),
+            "app".to_string(),
+            "repo".to_string(),
+            "/repos/app".to_string(),
+        )];
+        let mut dbw = vec![db_row("app", "int-a"), db_row("app", "int-b")];
+        for b in ["ext-1", "ext-2", "ext-3", "ext-4"] {
+            dbw.push(DbWorktree {
+                external: true,
+                ..db_row("app", b)
+            });
+        }
+        (ws, dbw)
+    }
+
+    fn app_rows(rows: &[SidebarRow]) -> Vec<&SidebarRow> {
+        rows.iter().filter(|r| r.workspace_slug == "app").collect()
+    }
+
+    fn view_with(mode: ExternalWorktrees) -> ViewState {
+        let mut view = ViewState::default();
+        view.display.external_worktrees = mode;
+        view
+    }
+
+    #[test]
+    fn other_group_collapsed_shows_one_header_with_the_count() {
+        let (ws, dbw) = external_fixture();
+        let s = session(vec![], 0);
+        let view = view_with(ExternalWorktrees::Group);
+        let rows = build_rows(&s, &ws, &view, &no_activity(), &dbw, &[], &[]);
+        let app = app_rows(&rows);
+        let groups: Vec<&&SidebarRow> = app
+            .iter()
+            .filter(|r| r.kind == RowKind::OtherGroup)
+            .collect();
+        assert_eq!(groups.len(), 1);
+        let group = groups[0];
+        assert_eq!(group.label, "Other");
+        assert_eq!(group.child_count, 4);
+        assert_eq!(group.pin_key, "other:app");
+        assert_eq!(group.collapse_key(), "other:app");
+        assert!(group.collapsed, "collapsed by default");
+        assert!(group.visible);
+        assert!(!group.is_pinnable() && !group.is_markable());
+        assert!(RowKind::OtherGroup.is_collapsible());
+        // Visible: the workspace, 3 internal rows, the header — no external.
+        let visible: Vec<(&str, u8)> = app
+            .iter()
+            .filter(|r| r.visible)
+            .map(|r| (r.label.as_str(), r.depth))
+            .collect();
+        assert_eq!(
+            visible,
+            vec![
+                ("app", 0),
+                ("home", 1),
+                ("int-a", 1),
+                ("int-b", 1),
+                ("Other", 1)
+            ]
+        );
+        // The four external rows are still emitted (hidden) under the header,
+        // so the filter can find them.
+        let hidden: Vec<(&str, u8)> = app
+            .iter()
+            .filter(|r| !r.visible && r.kind == RowKind::Worktree)
+            .map(|r| (r.label.as_str(), r.depth))
+            .collect();
+        assert_eq!(
+            hidden,
+            vec![("ext-1", 2), ("ext-2", 2), ("ext-3", 2), ("ext-4", 2)]
+        );
+    }
+
+    #[test]
+    fn other_group_expanded_by_override_or_config() {
+        let (ws, dbw) = external_fixture();
+        let s = session(vec![], 0);
+        let mut view = view_with(ExternalWorktrees::Group);
+        view.other_open.insert("app".into(), true);
+        let rows = build_rows(&s, &ws, &view, &no_activity(), &dbw, &[], &[]);
+        let shown: Vec<&str> = app_rows(&rows)
+            .iter()
+            .filter(|r| r.visible && r.depth == 2)
+            .map(|r| r.label.as_str())
+            .collect();
+        assert_eq!(shown, vec!["ext-1", "ext-2", "ext-3", "ext-4"]);
+
+        // Config default open, no override: expanded too; an explicit
+        // collapse override wins over it.
+        let mut view = view_with(ExternalWorktrees::Group);
+        view.display.other_group_collapsed = false;
+        view.display.other_group_label = "Elsewhere".into();
+        let rows = build_rows(&s, &ws, &view, &no_activity(), &dbw, &[], &[]);
+        let group = rows.iter().find(|r| r.kind == RowKind::OtherGroup).unwrap();
+        assert!(!group.collapsed);
+        assert_eq!(group.label, "Elsewhere");
+        view.other_open.insert("app".into(), false);
+        let rows = build_rows(&s, &ws, &view, &no_activity(), &dbw, &[], &[]);
+        let group = rows.iter().find(|r| r.kind == RowKind::OtherGroup).unwrap();
+        assert!(group.collapsed);
+    }
+
+    #[test]
+    fn external_hide_and_show_modes() {
+        let (ws, dbw) = external_fixture();
+        let s = session(vec![], 0);
+        let worktrees = |mode| {
+            let rows = build_rows(&s, &ws, &view_with(mode), &no_activity(), &dbw, &[], &[]);
+            assert!(!rows.iter().any(|r| r.kind == RowKind::OtherGroup));
+            rows.iter()
+                .filter(|r| r.kind == RowKind::Worktree && r.workspace_slug == "app")
+                .map(|r| (r.label.clone(), r.depth))
+                .collect::<Vec<_>>()
+        };
+        let hide = worktrees(ExternalWorktrees::Hide);
+        assert_eq!(
+            hide,
+            vec![
+                ("home".to_string(), 1),
+                ("int-a".to_string(), 1),
+                ("int-b".to_string(), 1)
+            ]
+        );
+        let show = worktrees(ExternalWorktrees::Show);
+        assert_eq!(show.len(), 7);
+        assert!(show.iter().all(|(_, depth)| *depth == 1));
+    }
+
+    #[test]
+    fn active_external_row_reveals_its_group_and_survives_hide() {
+        let (ws, dbw) = external_fixture();
+        // ext-2 is live and active; the group is persisted closed.
+        let s = session(vec![tab("app/ext-2", "/wt/ext-2")], 0);
+        let mut view = view_with(ExternalWorktrees::Group);
+        view.other_open.insert("app".into(), false);
+        let rows = build_rows(&s, &ws, &view, &no_activity(), &dbw, &[], &[]);
+        let group = rows.iter().find(|r| r.kind == RowKind::OtherGroup).unwrap();
+        assert!(!group.collapsed, "the active row's group renders open");
+        assert_eq!(group.child_count, 4);
+        let active = rows.iter().find(|r| r.active).unwrap();
+        assert_eq!((active.label.as_str(), active.depth), ("ext-2", 2));
+        assert!(active.visible);
+        // The reveal keys name the group too.
+        assert!(active_reveal_keys("app/ext-2", &dbw).contains(&other_group_key("app")));
+
+        // `hide` never hides the active worktree: it stays, inline.
+        let rows = build_rows(
+            &s,
+            &ws,
+            &view_with(ExternalWorktrees::Hide),
+            &no_activity(),
+            &dbw,
+            &[],
+            &[],
+        );
+        let ext: Vec<(&str, u8)> = rows
+            .iter()
+            .filter(|r| r.label.starts_with("ext-"))
+            .map(|r| (r.label.as_str(), r.depth))
+            .collect();
+        assert_eq!(ext, vec![("ext-2", 1)]);
+    }
+
+    #[test]
+    fn flat_mode_hide_drops_external_rows() {
+        let (ws, dbw) = external_fixture();
+        let s = session(vec![], 0);
+        let count = |mode| {
+            let mut view = view_with(mode);
+            view.flat = true;
+            build_rows(&s, &ws, &view, &no_activity(), &dbw, &[], &[])
+                .iter()
+                .filter(|r| r.kind == RowKind::Worktree)
+                .count()
+        };
+        assert_eq!(count(ExternalWorktrees::Hide), 3);
+        assert_eq!(count(ExternalWorktrees::Group), 7);
+        assert_eq!(count(ExternalWorktrees::Show), 7);
+    }
+
+    #[test]
+    fn filter_surfaces_the_other_group_for_a_matching_external_row() {
+        let (ws, dbw) = external_fixture();
+        let s = session(vec![], 0);
+        let mut view = view_with(ExternalWorktrees::Group);
+        view.filter = "ext-3".into();
+        let rows = build_rows(&s, &ws, &view, &no_activity(), &dbw, &[], &[]);
+        let visible: Vec<&str> = rows
+            .iter()
+            .filter(|r| r.visible)
+            .map(|r| r.label.as_str())
+            .collect();
+        assert!(visible.contains(&"Other"), "{visible:?}");
+        assert!(visible.contains(&"ext-3"), "{visible:?}");
+        assert!(!visible.contains(&"ext-1"), "{visible:?}");
+    }
+
+    #[test]
+    fn is_external_table() {
+        let cfg = thegn_core::config::Config {
+            worktrees_dir: "/wt".into(),
+            worktree_mode: thegn_core::config::WorktreeMode::Global,
+            ..Default::default()
+        };
+        let roots = vec![std::path::PathBuf::from("/home/u/agents")];
+        let ctx = ExternalCheck {
+            root: std::path::Path::new("/src/app"),
+            repo_dir_name: "app",
+            roots: &roots,
+            cfg: &cfg,
+        };
+        let cases: [(&str, Option<i64>, bool); 9] = [
+            // thegn's own layout.
+            ("/wt/app/feat--abc", None, false),
+            // Under the repo root (in-repo `.worktrees`, or any nested dir).
+            ("/src/app/.worktrees/x", None, false),
+            // The home checkout itself.
+            ("/src/app", None, false),
+            // Under a `worktree_roots` entry.
+            ("/home/u/agents/p1/x", None, false),
+            // Filed into a folder: adopted.
+            ("/home/u/.other/x", Some(3), false),
+            // Another tool's worktrees.
+            ("/home/u/.other/x", None, true),
+            ("/wt/ms2-feature", None, true),
+            // Component-wise prefixes: `/home/u/agents` never claims
+            // `/home/u/agents2`, nor `/wt/app` claims `/wt/apple`.
+            ("/home/u/agents2/x", None, true),
+            ("/wt/apple/x", None, true),
+        ];
+        for (path, folder, want) in cases {
+            assert_eq!(is_external(path, folder, &ctx), want, "{path} {folder:?}");
+        }
+        // An empty path (a pathless row) is never classified external.
+        assert!(!is_external("", None, &ctx));
+    }
+
     #[test]
     fn active_reveal_keys_covers_workspace_and_folder() {
         let dbw = vec![DbWorktree {
@@ -4357,6 +4936,7 @@ mod tests {
             env_name: None,
             sandbox_profile: None,
             env_degraded: false,
+            external: false,
         }];
         // Filed worktree → both its workspace and its folder key.
         assert_eq!(
@@ -5090,5 +5670,234 @@ mod tests {
             "{text:?}"
         );
         assert!(text.contains('�'), "{text:?}");
+    }
+
+    // --- row limits: the derived "show more" row --------------------------
+
+    /// A workspace `app` holding one folder `wip` of `n` worktrees (depth 2),
+    /// in final display order — the shape `apply_row_limits` runs on.
+    fn folder_of(n: usize) -> Vec<SidebarRow> {
+        let mut rows = vec![
+            SidebarRow {
+                pin_key: "app".into(),
+                ..SidebarRow::base(RowKind::Workspace, 0, "app", "app")
+            },
+            SidebarRow {
+                pin_key: "app/folder:1".into(),
+                folder_id: Some(1),
+                child_count: n,
+                ..SidebarRow::base(RowKind::Folder, 1, "wip", "app")
+            },
+        ];
+        for i in 0..n {
+            rows.push(SidebarRow {
+                pin_key: format!("app/wt{i}"),
+                ..SidebarRow::base(RowKind::Worktree, 2, format!("wt{i}"), "app")
+            });
+        }
+        rows
+    }
+
+    fn limit_view(limit: usize) -> ViewState {
+        let mut view = ViewState::default();
+        view.display.group_row_limit = limit;
+        view
+    }
+
+    fn shown_worktrees(rows: &[SidebarRow]) -> Vec<String> {
+        rows.iter()
+            .filter(|r| r.visible && r.kind == RowKind::Worktree)
+            .map(|r| r.label.clone())
+            .collect()
+    }
+
+    fn show_more_rows(rows: &[SidebarRow]) -> Vec<&SidebarRow> {
+        rows.iter()
+            .filter(|r| r.kind == RowKind::ShowMore)
+            .collect()
+    }
+
+    #[test]
+    fn row_limit_truncates_a_folder_and_adds_show_more() {
+        let mut rows = folder_of(20);
+        apply_row_limits(&mut rows, &limit_view(15));
+        let shown = shown_worktrees(&rows);
+        assert_eq!(shown.len(), 15);
+        assert_eq!(shown.first().map(String::as_str), Some("wt0"));
+        assert_eq!(shown.last().map(String::as_str), Some("wt14"));
+        let more = show_more_rows(&rows);
+        assert_eq!(more.len(), 1);
+        let more = more[0];
+        assert_eq!(more.child_count, 5);
+        assert!(more.collapsed, "truncated reads `show N more`");
+        assert!(more.visible);
+        assert_eq!(more.depth, 2, "indented at the folder's child depth");
+        assert_eq!(more.pin_key, show_more_key("app/folder:1"));
+        assert_eq!(show_more_group(more), Some("app/folder:1"));
+        assert!(more.tab_target.is_none());
+        assert!(!more.is_pinnable() && !more.is_markable());
+        assert!(!RowKind::ShowMore.is_collapsible());
+        // It sits right after the last shown entry.
+        let at = rows.iter().position(|r| r.kind == RowKind::ShowMore);
+        assert_eq!(at.map(|i| rows[i - 1].label.as_str()), Some("wt14"));
+        assert_eq!(
+            crate::sidebar_view::show_more_text(more),
+            format!("{} show 5 more", crate::caps::active_glyphs().ellipsis)
+        );
+    }
+
+    #[test]
+    fn row_limit_expanded_group_shows_all_then_show_fewer() {
+        let mut rows = folder_of(20);
+        let mut view = limit_view(15);
+        view.more_open.insert("app/folder:1".into());
+        apply_row_limits(&mut rows, &view);
+        assert_eq!(shown_worktrees(&rows).len(), 20);
+        let more = show_more_rows(&rows);
+        assert_eq!(more.len(), 1);
+        assert!(!more[0].collapsed);
+        assert!(more[0].visible);
+        assert_eq!(crate::sidebar_view::show_more_text(more[0]), "show fewer");
+        assert_eq!(rows.last().map(|r| r.kind), Some(RowKind::ShowMore));
+    }
+
+    #[test]
+    fn row_limit_zero_disables_truncation() {
+        let mut rows = folder_of(20);
+        apply_row_limits(&mut rows, &limit_view(0));
+        assert_eq!(shown_worktrees(&rows).len(), 20);
+        assert!(show_more_rows(&rows).is_empty());
+        // At or under the limit: nothing to hide, no extra row.
+        let mut rows = folder_of(15);
+        apply_row_limits(&mut rows, &limit_view(15));
+        assert_eq!(shown_worktrees(&rows).len(), 15);
+        assert!(show_more_rows(&rows).is_empty());
+    }
+
+    #[test]
+    fn row_limit_per_group_override_wins_by_label() {
+        let mut rows = folder_of(20);
+        let mut view = limit_view(15);
+        view.display.group_row_limits.insert("wip".into(), 5);
+        apply_row_limits(&mut rows, &view);
+        assert_eq!(shown_worktrees(&rows).len(), 5);
+        assert_eq!(show_more_rows(&rows)[0].child_count, 15);
+        // An override of 0 lifts the limit for that group alone, even when
+        // the default is 0 elsewhere.
+        let mut rows = folder_of(20);
+        let mut view = limit_view(15);
+        view.display.group_row_limits.insert("wip".into(), 0);
+        apply_row_limits(&mut rows, &view);
+        assert_eq!(shown_worktrees(&rows).len(), 20);
+        let mut rows = folder_of(20);
+        let mut view = limit_view(0);
+        view.display.group_row_limits.insert("wip".into(), 3);
+        apply_row_limits(&mut rows, &view);
+        assert_eq!(shown_worktrees(&rows).len(), 3);
+    }
+
+    #[test]
+    fn row_limit_never_hides_the_active_row() {
+        let mut rows = folder_of(20);
+        rows[2 + 18].active = true; // wt18
+        apply_row_limits(&mut rows, &limit_view(15));
+        let shown = shown_worktrees(&rows);
+        assert!(shown.contains(&"wt18".to_string()), "{shown:?}");
+        // Promoted into the slice: the group still shows `limit` entries.
+        assert_eq!(shown.len(), 15);
+        assert!(!shown.contains(&"wt14".to_string()));
+        assert_eq!(show_more_rows(&rows)[0].child_count, 5);
+    }
+
+    #[test]
+    fn row_limit_never_hides_pinned_rows() {
+        let mut rows = folder_of(20);
+        let mut view = limit_view(15);
+        view.pins = vec!["app/wt17".into(), "app/wt19".into()];
+        apply_row_limits(&mut rows, &view);
+        let shown = shown_worktrees(&rows);
+        assert!(shown.contains(&"wt17".to_string()));
+        assert!(shown.contains(&"wt19".to_string()));
+        assert_eq!(shown.len(), 15);
+    }
+
+    #[test]
+    fn row_limit_is_off_while_filtering() {
+        let mut rows = folder_of(20);
+        let mut view = limit_view(15);
+        view.filter = "wt".into();
+        apply_row_limits(&mut rows, &view);
+        assert_eq!(shown_worktrees(&rows).len(), 20);
+        assert!(show_more_rows(&rows).is_empty());
+    }
+
+    #[test]
+    fn row_limit_toggle_sits_before_following_folder() {
+        let mut rows = vec![SidebarRow {
+            pin_key: "app".into(),
+            ..SidebarRow::base(RowKind::Workspace, 0, "app", "app")
+        }];
+        for i in 0..20 {
+            rows.push(SidebarRow {
+                pin_key: format!("app/wt{i}"),
+                ..SidebarRow::base(RowKind::Worktree, 1, format!("wt{i}"), "app")
+            });
+        }
+        rows.push(SidebarRow {
+            pin_key: "app/folder:1".into(),
+            folder_id: Some(1),
+            ..SidebarRow::base(RowKind::Folder, 1, "wip", "app")
+        });
+        apply_row_limits(&mut rows, &limit_view(15));
+        let at = rows
+            .iter()
+            .position(|r| r.kind == RowKind::ShowMore)
+            .expect("show more row");
+        assert_eq!(rows[at - 1].label, "wt14");
+        let folder = rows.iter().position(|r| r.kind == RowKind::Folder);
+        assert!(folder > Some(at));
+    }
+
+    #[test]
+    fn row_limit_toggle_follows_a_collapsed_parent() {
+        let mut rows = folder_of(20);
+        for r in rows.iter_mut().skip(2) {
+            r.visible = false; // the folder is collapsed
+        }
+        apply_row_limits(&mut rows, &limit_view(15));
+        let more = show_more_rows(&rows);
+        assert_eq!(more.len(), 1);
+        assert!(!more[0].visible, "a collapsed group hides its toggle too");
+    }
+
+    /// End to end through `build_rows`: a dormant workspace's loose rows
+    /// (home + 20) are a limited group keyed by the workspace slug, and the
+    /// filter lifts the limit.
+    #[test]
+    fn build_rows_applies_the_row_limit_to_loose_worktrees() {
+        let ws = vec![(
+            "app".to_string(),
+            "app".to_string(),
+            "repo".to_string(),
+            "/repos/app".to_string(),
+        )];
+        let dbw: Vec<DbWorktree> = (0..20)
+            .map(|i| db_row("app", &format!("b{i:02}")))
+            .collect();
+        let s = session(vec![], 0);
+        let view = limit_view(15);
+        let rows = build_rows(&s, &ws, &view, &no_activity(), &dbw, &[], &[]);
+        assert_eq!(shown_worktrees(&rows).len(), 15);
+        let more = show_more_rows(&rows);
+        assert_eq!(more.len(), 1);
+        assert_eq!(more[0].pin_key, show_more_key("app"));
+        assert_eq!(more[0].child_count, 6, "home + 20 = 21 entries");
+        assert_eq!(more[0].depth, 1);
+
+        let mut filtered = limit_view(15);
+        filtered.filter = "b".into();
+        let rows = build_rows(&s, &ws, &filtered, &no_activity(), &dbw, &[], &[]);
+        assert!(show_more_rows(&rows).is_empty());
+        assert!(shown_worktrees(&rows).len() >= 20);
     }
 }

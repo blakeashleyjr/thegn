@@ -30,6 +30,12 @@ impl schemars::JsonSchema for ApiVersion {
 
 /// Current Plugin API contract version implemented by this crate.
 ///
+/// v0.6 (additive over v0.5): [`RowUpdate`] gains the optional transient-value fields
+/// `ttl_secs` (dropped after 1..=86400 seconds) and `until_scan` (dropped on the worktree's
+/// next changed [`WORKTREE_SCANNED_EVENT`]). A v0.5 manifest negotiates unchanged; a plugin
+/// that uses the fields declares 0.6.0 so an older host refuses it instead of keeping the
+/// value forever.
+///
 /// v0.5 (additive over v0.4): the [`ExtensionPoint::WorktreeField`] extension point with
 /// resident row-field producers. A v0.4 manifest negotiates unchanged.
 ///
@@ -48,9 +54,17 @@ impl schemars::JsonSchema for ApiVersion {
 /// manifest projects. Older plugins keep negotiating; nothing was removed.
 pub const API_VERSION: ApiVersion = ApiVersion {
     major: 0,
-    minor: 5,
+    minor: 6,
     patch: 0,
 };
+
+/// Host-originated `on_event` kind sent when a worktree's git glyph scan lands with a
+/// changed result. Payload: `{"path": <worktree path>, "branch": <branch or null>}`.
+pub const WORKTREE_SCANNED_EVENT: &str = "thegn.worktree_scanned";
+
+/// Largest accepted [`RowUpdate::ttl_secs`] (one day). `0` is rejected too, so a zero can
+/// never be read as "never expires".
+pub const MAX_ROW_TTL_SECS: u32 = 86_400;
 
 impl std::fmt::Display for ApiVersion {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -301,6 +315,14 @@ pub struct RowUpdate {
     pub worktree: String,
     pub text: String,
     pub role: RowRole,
+    /// API 0.6: drop the value this many seconds after the host admitted it
+    /// (`1..=MAX_ROW_TTL_SECS`). Absent: the value persists until replaced.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ttl_secs: Option<u32>,
+    /// API 0.6: drop the value on this worktree's next changed
+    /// [`WORKTREE_SCANNED_EVENT`], whether or not the plugin subscribed to it.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub until_scan: bool,
 }
 
 /// The manifest capability payload for a `WorktreeField` contribution.
@@ -2720,9 +2742,10 @@ mod wire_tests {
 
     #[test]
     fn current_version_and_panel_section_capability() {
-        // The bump is 0.5.0; app, row-field, and panel rendering surfaces map to their capabilities.
+        // The bump is 0.6.0 (transient row values); app, row-field, and panel rendering
+        // surfaces map to their capabilities.
         // surface capability beside statusbar — covering the new match arm.
-        assert_eq!(API_VERSION, ApiVersion::new(0, 5, 0));
+        assert_eq!(API_VERSION, ApiVersion::new(0, 6, 0));
         assert_eq!(
             surface_capability_for(&ExtensionPoint::AppTab),
             Some(Capability::new("surface", "app"))
@@ -4320,9 +4343,54 @@ timeout_secs = 5
             worktree: "/tmp/a".into(),
             text: String::new(),
             role: RowRole::Dim,
+            ttl_secs: None,
+            until_scan: false,
         })
         .unwrap();
         assert_eq!(empty["text"], "");
+    }
+
+    #[test]
+    fn row_update_transient_fields_round_trip_and_default() {
+        // Defaults are omitted on the wire, so a 0.6 host emits 0.5-shaped JSON.
+        let plain = RowUpdate {
+            worktree: "/tmp/a".into(),
+            text: "ok".into(),
+            role: RowRole::Good,
+            ttl_secs: None,
+            until_scan: false,
+        };
+        let encoded = serde_json::to_value(&plain).unwrap();
+        assert_eq!(
+            encoded,
+            serde_json::json!({"worktree": "/tmp/a", "text": "ok", "role": "Good"})
+        );
+        assert_eq!(serde_json::from_value::<RowUpdate>(encoded).unwrap(), plain);
+
+        // Old-shape (0.5) JSON still deserializes, with both fields defaulted.
+        let old: RowUpdate = serde_json::from_value(
+            serde_json::json!({"worktree": "main", "text": "w", "role": "Warn"}),
+        )
+        .unwrap();
+        assert_eq!(old.ttl_secs, None);
+        assert!(!old.until_scan);
+
+        let transient = RowUpdate {
+            worktree: "/tmp/a".into(),
+            text: "rebasing".into(),
+            role: RowRole::Accent,
+            ttl_secs: Some(30),
+            until_scan: true,
+        };
+        let encoded = serde_json::to_value(&transient).unwrap();
+        assert_eq!(encoded["ttl_secs"], 30);
+        assert_eq!(encoded["until_scan"], true);
+        assert_eq!(
+            serde_json::from_value::<RowUpdate>(encoded).unwrap(),
+            transient
+        );
+        assert_eq!(WORKTREE_SCANNED_EVENT, "thegn.worktree_scanned");
+        assert_eq!(MAX_ROW_TTL_SECS, 86_400);
     }
 
     #[test]

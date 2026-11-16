@@ -15,6 +15,8 @@
 //! | `sidebar_mode`       | `SidebarMode::as_key()` | ToggleSidebar cycle            |
 //! | `sidebar_flat`       | `"1"` (absent=grouped) | toggle_flat (`g`)               |
 //! | `sidebar_focus_detail` | `FocusDetail::as_str()` (absent=`[ui]` config) | cycle_focus_detail (`i`) |
+//! | `other_open:<slug>`  | `"1"` open / `"0"` collapsed (absent=`[ui] sidebar_other_group_collapsed`) | toggle_collapse on the "Other" group |
+//! | `more_open:<key>`    | `"1"` (absent=truncated to the row limit) | toggle_show_more ("show more"/"show fewer") |
 //!
 //! `<key>` is the row's stable identity: a workspace slug, `{slug}/{branch}`
 //! for worktrees, `{slug}/folder:{id}` for folders, `terminals/host:{key}` for
@@ -171,7 +173,52 @@ impl SidebarState {
                     thegn_core::config::FocusDetail::from_str_validated(&value).ok();
             } else if key == "sidebar_mode" {
                 self.mode = crate::layout::SidebarMode::from_key(&value);
+            } else if let Some(group) = key.strip_prefix("more_open:") {
+                if value == "1" {
+                    self.view.more_open.insert(group.to_string());
+                } else {
+                    // best-effort: lazy sweep of a legacy tombstone row
+                    let _ = db.del_ui_state(scope, &key);
+                }
+            } else if let Some(slug) = key.strip_prefix("other_open:") {
+                // Both values are real overrides of the config default, so
+                // neither is a tombstone; anything else is junk and is swept.
+                match value.as_str() {
+                    "1" => {
+                        self.view.other_open.insert(slug.to_string(), true);
+                    }
+                    "0" => {
+                        self.view.other_open.insert(slug.to_string(), false);
+                    }
+                    _ => {
+                        // best-effort: lazy sweep of an unreadable row
+                        let _ = db.del_ui_state(scope, &key);
+                    }
+                }
             }
+        }
+    }
+
+    /// Record (and persist) whether a project's derived "Other" group is
+    /// open. Stored explicitly in both directions: the default it overrides
+    /// is `[ui] sidebar_other_group_collapsed`, which a config edit can flip,
+    /// so "absent" cannot stand for either state.
+    pub(crate) fn set_other_open(&mut self, slug: &str, open: bool) {
+        self.view.other_open.insert(slug.to_string(), open);
+        self.persist(&format!("other_open:{slug}"), if open { "1" } else { "0" });
+    }
+
+    /// Record (and persist) whether a row-limited group is expanded past its
+    /// limit. `group` is the group head's collapse key. Truncated is the
+    /// default, so collapsing deletes the key rather than tombstoning it.
+    pub(crate) fn set_more_open(&mut self, group: &str, open: bool) {
+        let key = format!("more_open:{group}");
+        if open {
+            self.view.more_open.insert(group.to_string());
+            self.persist(&key, "1");
+        } else {
+            self.view.more_open.remove(group);
+            self.unpersist(&key);
         }
     }
 
@@ -299,6 +346,88 @@ mod tests {
         let mut sb2 = SidebarState::default();
         sb2.load(&db2, SIDEBAR_SCOPE);
         assert!(!sb2.view.flat);
+    }
+
+    /// The "Other" group's per-project open state round-trips through
+    /// `ui_state`: written by `set_other_open`, read back by `load`, with
+    /// junk values swept rather than misread.
+    #[test]
+    fn other_open_round_trips_through_ui_state() {
+        let _state = crate::testenv::IsolatedState::new();
+        let db = thegn_core::db::Db::open().unwrap();
+        drop(db);
+
+        let mut sidebar = SidebarState::default();
+        sidebar.set_other_open("app", true);
+        sidebar.set_other_open("lib", false);
+        assert_eq!(sidebar.view.other_open.get("app"), Some(&true));
+        let rows = read_sidebar_state_from_writer().unwrap();
+        assert!(
+            rows.iter()
+                .any(|(key, value)| key == "other_open:app" && value == "1")
+        );
+        assert!(
+            rows.iter()
+                .any(|(key, value)| key == "other_open:lib" && value == "0")
+        );
+
+        let db = thegn_core::db::Db::open_memory().unwrap();
+        for (key, value) in rows {
+            db.set_ui_state(SIDEBAR_SCOPE, &key, &value).unwrap();
+        }
+        db.set_ui_state(SIDEBAR_SCOPE, "other_open:junk", "maybe")
+            .unwrap();
+        let mut loaded = SidebarState::default();
+        loaded.load(&db, SIDEBAR_SCOPE);
+        assert_eq!(loaded.view.other_open.get("app"), Some(&true));
+        assert_eq!(loaded.view.other_open.get("lib"), Some(&false));
+        assert_eq!(loaded.view.other_open.get("junk"), None);
+        assert!(
+            !db.ui_state_in_scope(SIDEBAR_SCOPE)
+                .unwrap()
+                .iter()
+                .any(|(key, _)| key == "other_open:junk")
+        );
+    }
+
+    /// A group's "show more" expansion round-trips through `ui_state`:
+    /// `set_more_open(true)` writes `more_open:<key>`, `load` restores it, and
+    /// collapsing again deletes the key (truncated is the default).
+    #[test]
+    fn more_open_round_trips_through_ui_state() {
+        let _state = crate::testenv::IsolatedState::new();
+        let db = thegn_core::db::Db::open().unwrap();
+        drop(db);
+
+        let mut sidebar = SidebarState::default();
+        sidebar.set_more_open("app/folder:3", true);
+        sidebar.set_more_open("other:lib", true);
+        sidebar.set_more_open("other:lib", false);
+        assert!(sidebar.view.more_open.contains("app/folder:3"));
+        assert!(!sidebar.view.more_open.contains("other:lib"));
+        let rows = read_sidebar_state_from_writer().unwrap();
+        assert!(
+            rows.iter()
+                .any(|(key, value)| key == "more_open:app/folder:3" && value == "1")
+        );
+        assert!(!rows.iter().any(|(key, _)| key == "more_open:other:lib"));
+
+        let db = thegn_core::db::Db::open_memory().unwrap();
+        for (key, value) in rows {
+            db.set_ui_state(SIDEBAR_SCOPE, &key, &value).unwrap();
+        }
+        db.set_ui_state(SIDEBAR_SCOPE, "more_open:stale", "0")
+            .unwrap();
+        let mut loaded = SidebarState::default();
+        loaded.load(&db, SIDEBAR_SCOPE);
+        assert!(loaded.view.more_open.contains("app/folder:3"));
+        assert!(!loaded.view.more_open.contains("stale"));
+        assert!(
+            !db.ui_state_in_scope(SIDEBAR_SCOPE)
+                .unwrap()
+                .iter()
+                .any(|(key, _)| key == "more_open:stale")
+        );
     }
 
     #[test]
