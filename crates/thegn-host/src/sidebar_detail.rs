@@ -1023,16 +1023,16 @@ mod tests {
     }
 
     #[test]
-    fn stash_field_is_opt_in_and_parses_from_config() {
+    fn stash_field_is_on_by_default_and_parses_from_config() {
         let row = with_stash(Some(2));
         let defaults = SidebarDisplay::default();
         assert!(
-            !defaults
+            defaults
                 .detail_fields
                 .contains(&builtin(DetailField::Stash))
         );
         assert!(
-            !detail_fields(&row, &defaults, 2_000)
+            detail_fields(&row, &defaults, 2_000)
                 .iter()
                 .any(|field| field.id == FieldId::Stash)
         );
@@ -1113,12 +1113,12 @@ mod tests {
     }
 
     #[test]
-    fn ci_field_is_opt_in_and_parses_from_config() {
+    fn ci_field_is_on_by_default_and_parses_from_config() {
         let row = with_ci(Some(CiBadge::Fail));
         let defaults = SidebarDisplay::default();
-        assert!(!defaults.detail_fields.contains(&builtin(DetailField::Ci)));
+        assert!(defaults.detail_fields.contains(&builtin(DetailField::Ci)));
         assert!(
-            !detail_fields(&row, &defaults, 2_000)
+            detail_fields(&row, &defaults, 2_000)
                 .iter()
                 .any(|field| field.id == FieldId::Ci)
         );
@@ -1228,16 +1228,16 @@ mod tests {
     }
 
     #[test]
-    fn issue_field_is_opt_in_and_parses_from_config() {
+    fn issue_field_is_on_by_default_and_parses_from_config() {
         let row = with_issue(Some(("ABC-9", 1)));
         let defaults = SidebarDisplay::default();
         assert!(
-            !defaults
+            defaults
                 .detail_fields
                 .contains(&builtin(DetailField::Issue))
         );
         assert!(
-            !detail_fields(&row, &defaults, 2_000)
+            detail_fields(&row, &defaults, 2_000)
                 .iter()
                 .any(|field| field.id == FieldId::Issue)
         );

@@ -420,6 +420,11 @@ self: {
     ui.sidebar_icon_ahead = cfg.uiSidebarIconAhead;
     ui.sidebar_icon_behind = cfg.uiSidebarIconBehind;
     ui.sidebar_icon_status = cfg.uiSidebarIconStatus;
+    ui.sidebar_external_worktrees = cfg.uiSidebarExternalWorktrees;
+    ui.sidebar_other_group_label = cfg.uiSidebarOtherGroupLabel;
+    ui.sidebar_other_group_collapsed = cfg.uiSidebarOtherGroupCollapsed;
+    ui.sidebar_group_row_limit = cfg.uiSidebarGroupRowLimit;
+    ui.sidebar_group_row_limits = cfg.uiSidebarGroupRowLimits;
     search.max_results = cfg.searchMaxResults;
     search.respect_gitignore = cfg.searchRespectGitignore;
     search.include_hidden = cfg.searchIncludeHidden;
@@ -934,7 +939,7 @@ in {
 
     uiSidebarDetailFields = lib.mkOption {
       type = lib.types.nullOr (lib.types.listOf lib.types.str);
-      default = ["branch" "commits" "dirty" "branch_stat" "pr" "subject" "age" "env" "sandbox" "devcontainer" "hibernated" "mq" "unread" "disk"];
+      default = ["branch" "commits" "dirty" "branch_stat" "pr" "ci" "issue" "author" "stash" "subject" "age" "upstream" "env" "sandbox" "devcontainer" "hibernated" "mq" "unread" "disk"];
       description = "Ordered sidebar detail field names. The default matches the binary's default.";
     };
 
@@ -1003,6 +1008,37 @@ in {
       type = lib.types.nullOr (lib.types.str);
       default = null;
       description = "Override glyph for the dirty status marker; empty uses the built-in glyph. Unset (null) = the binary's default.";
+    };
+
+    uiSidebarExternalWorktrees = lib.mkOption {
+      type = lib.types.nullOr (lib.types.enum ["show" "group" "hide"]);
+      default = null;
+      description = "Where a project's external worktrees (git worktrees thegn did not create) go: group under one collapsible Other row, show inline, or hide. Unset (null) = the binary's default.";
+    };
+
+    uiSidebarOtherGroupLabel = lib.mkOption {
+      type = lib.types.nullOr (lib.types.str);
+      default = null;
+      description = "Label of the sidebar group row holding external worktrees. Unset (null) = the binary's default.";
+    };
+
+    uiSidebarOtherGroupCollapsed = lib.mkOption {
+      type = lib.types.nullOr (lib.types.bool);
+      default = null;
+      description = "Whether the external-worktree group starts collapsed. Unset (null) = the binary's default.";
+    };
+
+    uiSidebarGroupRowLimit = lib.mkOption {
+      type = lib.types.nullOr (lib.types.ints.unsigned);
+      default = null;
+      description = "Rows a sidebar group shows before show-more; 0 means no limit. Unset (null) = the binary's default.";
+    };
+
+    uiSidebarGroupRowLimits = lib.mkOption {
+      type = lib.types.nullOr (lib.types.attrsOf lib.types.ints.unsigned);
+      default = null;
+      example = lib.literalExpression "{ Other = 5; }";
+      description = "Per-group overrides of the sidebar group row limit, keyed by the folder or group label; 0 means no limit. Unset (null) = the binary's default.";
     };
 
     searchMaxResults = lib.mkOption {
