@@ -7,6 +7,8 @@ All notable changes to **thegn** are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.1.0-alpha.87] — 2026-11-15
+
 ### Added
 
 - `thegn share list` now shows Tailscale serve ports whose teardown is still pending, and `--json` rows carry `teardown_pending`. (THE-330)
@@ -3602,7 +3604,8 @@ launcher picker and the merge queue's `agent_command` hook remain — they run
 whatever commands you configure. Leftover `[llm_proxy]` config sections and
 `proxy_*` tables in existing state databases are ignored harmlessly.
 
-[Unreleased]: https://github.com/blakeashleyjr/thegn/compare/v0.1.0-alpha.86...HEAD
+[Unreleased]: https://github.com/blakeashleyjr/thegn/compare/v0.1.0-alpha.87...HEAD
+[0.1.0-alpha.87]: https://github.com/blakeashleyjr/thegn/compare/v0.1.0-alpha.86...v0.1.0-alpha.87
 [0.1.0-alpha.86]: https://github.com/blakeashleyjr/thegn/compare/v0.1.0-alpha.85...v0.1.0-alpha.86
 [0.1.0-alpha.85]: https://github.com/blakeashleyjr/thegn/compare/v0.1.0-alpha.84...v0.1.0-alpha.85
 [0.1.0-alpha.84]: https://github.com/blakeashleyjr/thegn/compare/v0.1.0-alpha.83...v0.1.0-alpha.84
