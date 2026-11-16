@@ -721,6 +721,22 @@ fn recover_pending<R: RotationRemote>(
             canonical_fingerprint,
             key_path.display()
         );
+        // Spread the forward decision to every pending row before clearing
+        // any: a cleared row no longer proves retirement completed, so a crash
+        // between clears would otherwise leave the survivors (with
+        // retiring_completed unset) to roll the scope back while the cleared
+        // rows already name the replacement.
+        for &index in &pending {
+            let mut state = records[index]
+                .rotation_recovery
+                .clone()
+                .expect("pending index has recovery state");
+            if !state.retiring_completed {
+                state.retiring_completed = true;
+                update_recovery(&mut records[index], state)
+                    .context("record completed remote retirement boundary during recovery")?;
+            }
+        }
         for &index in &pending {
             let expected = records[index].clone();
             thegn_core::managed_ssh::record_rotation_completed(
