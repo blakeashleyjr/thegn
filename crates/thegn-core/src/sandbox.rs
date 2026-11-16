@@ -862,7 +862,8 @@ enum DestFix {
 /// under no visible root: bwrap creates an absent mount point as real
 /// directories in the new root, so the host's symlink is never met there and
 /// the path-visible alias (`--chdir`, `$PWD`, `$HOME`) keeps working. One under
-/// a visible root that resolves elsewhere is dropped (fail closed): symlinked
+/// the tightest visible root that resolves elsewhere than the root's own
+/// resolution joined with the remainder is dropped (fail closed): symlinked
 /// bind paths are skipped, never followed, so a link can never turn a bind into
 /// one over an arbitrary host tree.
 fn bwrap_bind_dest(
@@ -880,7 +881,21 @@ fn bwrap_bind_dest(
     // so only a destination under an already-visible root can meet the host's
     // symlink there. Anything else keeps its path-visible alias (`--chdir`,
     // `$PWD` and `$HOME` name the alias).
-    if !roots.iter().any(|root| dest.starts_with(root)) {
+    let Some(root) = roots
+        .iter()
+        .filter(|root| dest.starts_with(root))
+        .max_by_key(|root| root.components().count())
+    else {
+        return DestFix::Keep;
+    };
+    // Only a symlink BELOW the covering root drops the bind: a root that is
+    // itself reached through a link (`/home -> /var/home`) is judged as its
+    // own mount, and a dest under it keeps its path when it resolves to the
+    // same place under the root's canonical form.
+    let below_root_link_free = dest.strip_prefix(root).is_ok_and(|rel| {
+        resolve(root).is_some_and(|root_resolved| resolved == root_resolved.join(rel))
+    });
+    if below_root_link_free {
         return DestFix::Keep;
     }
     DestFix::Drop

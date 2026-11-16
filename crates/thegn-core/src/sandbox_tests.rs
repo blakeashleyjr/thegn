@@ -6492,10 +6492,16 @@ fn bwrap_bind_dest_table() {
         bwrap_bind_dest(p("/home/u/link"), &roots, &resolve),
         DestFix::Drop
     );
-    // Symlinked ancestor: dropped too.
+    // Symlinked ancestor below the root: dropped too.
+    assert_eq!(
+        bwrap_bind_dest(p("/home/u/link/dir/leaf"), &roots, &resolve),
+        DestFix::Drop
+    );
+    // The covering root is itself an alias (`/alias -> /srv`, like
+    // `/home -> /var/home`), nothing below it is a link: kept.
     assert_eq!(
         bwrap_bind_dest(p("/alias/dir/leaf"), &roots, &resolve),
-        DestFix::Drop
+        DestFix::Keep
     );
     // Unresolvable: unchanged (the launch reports it as before).
     assert_eq!(
@@ -6595,6 +6601,55 @@ fn symlinked_writable_dest_is_skipped_not_followed() {
             .any(|w| w[0] == "--bind" && w[1] == source_s),
         "{argv:?}"
     );
+}
+
+#[cfg(unix)]
+#[test]
+fn aliased_home_keeps_worktree_bind_and_drops_link_below_it() {
+    // `$HOME` reached through a system symlink (`/home -> /var/home`): the
+    // read-only home mount and a writable worktree under it keep their path;
+    // a link planted BELOW the home still drops its bind.
+    use std::os::unix::fs::symlink;
+
+    let td = private_tempdir();
+    let base = td.path().canonicalize().unwrap();
+    std::fs::create_dir_all(base.join("real/home/wt")).unwrap();
+    std::fs::create_dir_all(base.join("secret")).unwrap();
+    symlink(base.join("real"), base.join("alias")).unwrap();
+    let home = base.join("alias/home");
+    symlink(base.join("secret"), home.join("tmp")).unwrap();
+    let home_s = home.to_string_lossy().into_owned();
+    let wt_s = home.join("wt").to_string_lossy().into_owned();
+    let tmp_s = home.join("tmp").to_string_lossy().into_owned();
+    let mut s = spec(Backend::Bwrap);
+    s.mounts = vec![
+        Mount {
+            host: home_s.clone(),
+            dest: home_s.clone(),
+            ro: true,
+            cache: false,
+        },
+        Mount {
+            host: wt_s.clone(),
+            dest: wt_s.clone(),
+            ro: false,
+            cache: false,
+        },
+        Mount {
+            host: base.join("real/home/wt").to_string_lossy().into_owned(),
+            dest: tmp_s.clone(),
+            ro: false,
+            cache: false,
+        },
+    ];
+
+    let argv = enter_argv(&s, "true").expect("aliased home launches");
+    assert!(argv.contains(&home_s), "{argv:?}");
+    assert!(
+        argv.windows(3).any(|w| w[0] == "--bind" && w[2] == wt_s),
+        "worktree under the aliased home stays writable: {argv:?}"
+    );
+    assert!(!argv.contains(&tmp_s), "{argv:?}");
 }
 
 #[cfg(unix)]
