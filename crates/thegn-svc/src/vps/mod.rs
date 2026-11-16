@@ -110,6 +110,18 @@ impl<T> Inventory<T> {
         matches!(self, Inventory::Complete(_))
     }
 
+    /// Map every row, keeping the completeness (and any reason) unchanged.
+    pub fn map_rows<U>(self, f: impl FnMut(T) -> U) -> Inventory<U> {
+        match self {
+            Inventory::Complete(rows) => Inventory::Complete(rows.into_iter().map(f).collect()),
+            Inventory::Partial { rows, reason } => Inventory::Partial {
+                rows: rows.into_iter().map(f).collect(),
+                reason,
+            },
+            Inventory::Unknown(reason) => Inventory::Unknown(reason),
+        }
+    }
+
     /// Collapse to the legacy complete-or-error shape (same error strings).
     pub fn into_complete(self) -> Result<Vec<T>> {
         match self {
@@ -490,7 +502,7 @@ pub fn host_label() -> String {
 }
 
 /// One provider instance as parsed from the vendor API.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct VpsInstance {
     /// The vendor's instance id (numeric for Hetzner, stringified).
     pub id: String,
@@ -500,6 +512,30 @@ pub struct VpsInstance {
     /// Creation time (unix seconds) — the reaper's age input.
     pub created: Option<i64>,
     pub labels: BTreeMap<String, String>,
+    /// The vendor size slug (Hetzner `server_type.name`, DigitalOcean
+    /// `size_slug`) — the `thegn fleet` price key. `None` when absent.
+    pub size: Option<String>,
+    /// The vendor region (Hetzner `datacenter.location.name`, DigitalOcean
+    /// `region.slug`). `None` when absent.
+    pub region: Option<String>,
+}
+
+/// Map a typed VPS listing onto the `thegn fleet` report. The row id is the
+/// instance **name** (the thegn sandbox id [`RemoteProvider::list`] returns);
+/// `name` carries the vendor id. `Unknown` is an error: nothing is known.
+pub(crate) fn vps_inventory_report(
+    inventory: Inventory<VpsInstance>,
+) -> Result<crate::provider::InventoryReport> {
+    crate::provider::InventoryReport::from_inventory(inventory.map_rows(|inst| {
+        crate::provider::SandboxInfo {
+            id: inst.name,
+            name: Some(inst.id),
+            state: Some(if inst.running { "running" } else { "off" }.to_string()),
+            size: inst.size,
+            region: inst.region,
+            created_at_ms: inst.created.and_then(|secs| secs.checked_mul(1000)),
+        }
+    }))
 }
 
 /// Everything needed to drive one named instance (resolved host-side from
@@ -817,6 +853,11 @@ impl VpsProvider {
 
     pub async fn list_detailed(&self) -> Result<Vec<VpsInstance>> {
         self.list_detailed_with(false).await
+    }
+
+    /// The typed `thegn fleet` inventory (mapped by `vps_inventory_report`).
+    pub async fn sandbox_inventory(&self) -> Result<crate::provider::InventoryReport> {
+        vps_inventory_report(self.list_detailed_inventory(false).await)
     }
 
     pub async fn list_detailed_priority(&self) -> Result<Vec<VpsInstance>> {
@@ -1678,6 +1719,106 @@ mod tests {
             "last_page": if has_next { page + 1 } else { page },
             "total_entries": total
         }}})
+    }
+
+    #[tokio::test]
+    async fn sandbox_inventory_report_maps_complete_rows() {
+        let page = serde_json::json!({"servers": [{
+            "id": 41,
+            "name": "tg-sbx",
+            "status": "running",
+            "created": "2026-11-16T10:00:00+00:00",
+            "server_type": {"name": "cx22"},
+            "datacenter": {"location": {"name": "fsn1"}}
+        }, {
+            "id": 42,
+            "name": "tg-off",
+            "status": "off"
+        }], "meta": {"pagination": {"page": 1, "next_page": null, "total_entries": 2}}});
+        let page = &page;
+        let inventory = collect_inventory(
+            |_| Box::pin(async move { Ok(page.clone()) }),
+            hetzner::parse_server_page,
+            |row: &VpsInstance| row.id.clone(),
+        )
+        .await;
+        let report = vps_inventory_report(inventory).unwrap();
+        let crate::provider::InventoryReport::Complete(rows) = report else {
+            panic!("expected a complete report, got {report:?}");
+        };
+        let expected_ms = chrono::DateTime::parse_from_rfc3339("2026-11-16T10:00:00+00:00")
+            .unwrap()
+            .timestamp_millis();
+        assert_eq!(
+            rows,
+            vec![
+                crate::provider::SandboxInfo {
+                    id: "tg-sbx".into(),
+                    name: Some("41".into()),
+                    state: Some("running".into()),
+                    size: Some("cx22".into()),
+                    region: Some("fsn1".into()),
+                    created_at_ms: Some(expected_ms),
+                },
+                crate::provider::SandboxInfo {
+                    id: "tg-off".into(),
+                    name: Some("42".into()),
+                    state: Some("off".into()),
+                    ..crate::provider::SandboxInfo::default()
+                },
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn sandbox_inventory_report_keeps_partial_rows_and_refuses_unknown() {
+        let pages = vec![
+            hetzner_page(&[1], 1, true, 2),
+            hetzner_page(&[1], 2, false, 2),
+        ];
+        let pages = &pages;
+        let partial = collect_inventory(
+            |page| Box::pin(async move { Ok(pages[(page - 1) as usize].clone()) }),
+            hetzner::parse_server_page,
+            |row: &VpsInstance| row.id.clone(),
+        )
+        .await;
+        match vps_inventory_report(partial).unwrap() {
+            crate::provider::InventoryReport::Partial { rows, reason } => {
+                assert_eq!(
+                    rows.iter().map(|row| row.id.as_str()).collect::<Vec<_>>(),
+                    vec!["server-1"]
+                );
+                assert_eq!(reason, PartialReason::DuplicateId.message());
+            }
+            other => panic!("expected a partial report, got {other:?}"),
+        }
+
+        let unknown = collect_inventory(
+            |_| Box::pin(async move { Err(anyhow!("fixture fetch failure")) }),
+            hetzner::parse_server_page,
+            |row: &VpsInstance| row.id.clone(),
+        )
+        .await;
+        let error = vps_inventory_report(unknown).unwrap_err();
+        assert!(error.to_string().contains("fixture fetch failure"));
+    }
+
+    #[test]
+    fn inventory_map_rows_keeps_completeness() {
+        let partial = Inventory::Partial {
+            rows: vec![1, 2],
+            reason: PartialReason::PageCap,
+        }
+        .map_rows(|n| n * 10);
+        assert!(matches!(
+            partial,
+            Inventory::Partial { ref rows, reason: PartialReason::PageCap } if rows.as_slice() == [10, 20]
+        ));
+        assert!(matches!(
+            Inventory::<i32>::Unknown("x".into()).map_rows(|n| n + 1),
+            Inventory::Unknown(ref reason) if reason == "x"
+        ));
     }
 
     #[tokio::test]

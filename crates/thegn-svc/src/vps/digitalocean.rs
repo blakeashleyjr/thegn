@@ -187,6 +187,12 @@ pub fn parse_droplet(v: &serde_json::Value) -> Option<VpsInstance> {
                 .collect()
         })
         .unwrap_or_default();
+    let text_at = |pointer: &str| {
+        v.pointer(pointer)
+            .and_then(|s| s.as_str())
+            .filter(|s| !s.is_empty())
+            .map(str::to_string)
+    };
     Some(VpsInstance {
         id: id.to_string(),
         name,
@@ -194,6 +200,8 @@ pub fn parse_droplet(v: &serde_json::Value) -> Option<VpsInstance> {
         running,
         created,
         labels: labels_from_tags(&tags),
+        size: text_at("/size_slug"),
+        region: text_at("/region/slug"),
     })
 }
 
@@ -423,6 +431,35 @@ pub fn new_snapshot_id(before: &[String], after: &[String]) -> Result<String, Sn
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn parse_droplet_reads_size_and_region_tolerantly() {
+        let full = serde_json::json!({
+            "id": 9,
+            "name": "tg-b",
+            "status": "active",
+            "size_slug": "s-1vcpu-1gb",
+            "region": {"slug": "nyc3", "name": "New York 3"}
+        });
+        let row = parse_droplet(&full).unwrap();
+        assert_eq!(row.size.as_deref(), Some("s-1vcpu-1gb"));
+        assert_eq!(row.region.as_deref(), Some("nyc3"));
+
+        let missing = parse_droplet(&serde_json::json!({"id": 9, "name": "tg-b"})).unwrap();
+        assert_eq!((missing.size, missing.region), (None, None));
+
+        let wrong = parse_droplet(&serde_json::json!({
+            "id": 9,
+            "name": "tg-b",
+            "size_slug": {"slug": "s-1vcpu-1gb"},
+            "region": "nyc3"
+        }))
+        .unwrap();
+        assert_eq!((wrong.size, wrong.region), (None, None));
+
+        assert!(parse_droplet(&serde_json::json!({"name": "tg-b", "size_slug": "s"})).is_none());
+        assert!(parse_droplet(&serde_json::json!({"id": 9, "size_slug": "s"})).is_none());
+    }
 
     fn droplet_page(rows: serde_json::Value, next: bool, total: u64) -> serde_json::Value {
         let mut value = serde_json::json!({"droplets": rows, "meta": {"total": total}});

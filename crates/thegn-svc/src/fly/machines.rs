@@ -33,6 +33,63 @@ pub fn apps_url(base: &str) -> String {
     format!("{}/apps", base.trim_end_matches('/'))
 }
 
+/// The org's app listing (`GET /apps?org_slug=<slug>`, `thegn fleet`). An
+/// empty slug is Fly's `personal` org. `None` when the slug is not a plain
+/// slug, so nothing unvalidated reaches the query string.
+pub fn org_apps_url(base: &str, org_slug: &str) -> Option<String> {
+    let org = if org_slug.is_empty() {
+        "personal"
+    } else {
+        org_slug
+    };
+    let plain = org.len() <= 128
+        && org
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_');
+    plain.then(|| format!("{}/apps?org_slug={org}", base.trim_end_matches('/')))
+}
+
+/// Parse the org app listing (`{ "total_apps": n, "apps": [{ "name" }] }`)
+/// into app names. Strict: an unrecognised envelope, a nameless row, more
+/// rows than the inventory cap, or a `total_apps` that disagrees with the
+/// rows (the listing did not return everything) is an error. Errors are
+/// fixed strings — no response content.
+pub fn parse_org_app_names(v: &serde_json::Value) -> Result<Vec<String>, &'static str> {
+    let rows = v
+        .get("apps")
+        .and_then(serde_json::Value::as_array)
+        .ok_or("app listing has an unrecognised envelope")?;
+    if rows.len() > crate::vps::MAX_INVENTORY_ROWS {
+        return Err("app listing exceeds the row cap");
+    }
+    let names = rows
+        .iter()
+        .map(|row| {
+            row.get("name")
+                .and_then(serde_json::Value::as_str)
+                .filter(|name| !name.is_empty())
+                .map(str::to_string)
+                .ok_or("app listing contains a nameless app")
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    match v.get("total_apps") {
+        None | Some(serde_json::Value::Null) => Ok(names),
+        Some(total) if total.as_u64() == u64::try_from(names.len()).ok() => Ok(names),
+        Some(_) => Err("app listing is incomplete (total_apps disagrees)"),
+    }
+}
+
+/// Whether an app name has thegn's per-sandbox shape (`super::app_name`:
+/// `tg-` + 12 lowercase base-36 characters). Only these count as fleet apps.
+pub fn is_thegn_app_name(name: &str) -> bool {
+    name.strip_prefix("tg-").is_some_and(|hash| {
+        hash.len() == 12
+            && hash
+                .bytes()
+                .all(|b| b.is_ascii_digit() || b.is_ascii_lowercase())
+    })
+}
+
 pub fn app_url(base: &str, app: &str) -> String {
     format!("{}/apps/{app}", base.trim_end_matches('/'))
 }
@@ -391,6 +448,80 @@ mod reaper_time_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn org_apps_url_defaults_and_refuses_unplain_slugs() {
+        assert_eq!(
+            org_apps_url("https://api.example/v1/", "").as_deref(),
+            Some("https://api.example/v1/apps?org_slug=personal")
+        );
+        assert_eq!(
+            org_apps_url(DEFAULT_API_BASE, "acme-co").as_deref(),
+            Some("https://api.machines.dev/v1/apps?org_slug=acme-co")
+        );
+        let long = "x".repeat(129);
+        for slug in ["a&token=x", "a b", "a/b", long.as_str()] {
+            assert_eq!(org_apps_url(DEFAULT_API_BASE, slug), None, "slug {slug}");
+        }
+    }
+
+    #[test]
+    fn parse_org_app_names_is_strict_about_the_listing() {
+        let ok = serde_json::json!({"total_apps": 2, "apps": [
+            {"id": "1", "name": "tg-0123456789ab", "machine_count": 1},
+            {"name": "other-app"}
+        ]});
+        assert_eq!(
+            parse_org_app_names(&ok).unwrap(),
+            vec!["tg-0123456789ab", "other-app"]
+        );
+        let no_total = serde_json::json!({"apps": []});
+        assert_eq!(
+            parse_org_app_names(&no_total).unwrap(),
+            Vec::<String>::new()
+        );
+        for (bad, needle) in [
+            (serde_json::json!({}), "envelope"),
+            (serde_json::json!([{"name": "tg-a"}]), "envelope"),
+            (
+                serde_json::json!({"apps": [{"id": "secret-row"}]}),
+                "nameless",
+            ),
+            (serde_json::json!({"apps": [{"name": ""}]}), "nameless"),
+            (
+                serde_json::json!({"total_apps": 3, "apps": [{"name": "secret-app"}]}),
+                "incomplete",
+            ),
+            (
+                serde_json::json!({"total_apps": "1", "apps": [{"name": "secret-app"}]}),
+                "incomplete",
+            ),
+        ] {
+            let error = parse_org_app_names(&bad).unwrap_err();
+            assert!(error.contains(needle), "{bad}: {error}");
+            assert!(
+                !error.contains("secret"),
+                "error exposed response body: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn thegn_app_names_are_recognised_by_shape() {
+        assert!(is_thegn_app_name("tg-0123456789ab"));
+        assert!(is_thegn_app_name("tg-zzzzzzzzzzzz"));
+        for other in [
+            "tg-0123456789a",
+            "tg-0123456789abc",
+            "tg-0123456789AB",
+            "tg-01234567-9ab",
+            "xtg-0123456789ab",
+            "my-app",
+            "",
+        ] {
+            assert!(!is_thegn_app_name(other), "{other}");
+        }
+    }
 
     #[test]
     fn urls_are_app_scoped() {
