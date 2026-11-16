@@ -10,6 +10,11 @@
 //!
 //! Blocking: callers on the event loop must run [`read`] off it (the widget
 //! poll rides `tokio::task::spawn_blocking`, see `hydrate_fleet`).
+//!
+//! [`admit_new_sandbox`] is the `[placement.fleet_budget] max_hourly` gate
+//! provisioning calls (off-loop) before it creates a sandbox. It reads the
+//! network only when that env's provider has a cap set, and fails closed:
+//! a fleet it cannot read is a new sandbox it refuses.
 
 use anyhow::Result;
 use std::path::Path;
@@ -36,17 +41,88 @@ pub(crate) struct FleetSnapshot {
 pub(crate) fn read(cfg: &Config) -> Result<FleetSnapshot> {
     let view = gather(cfg, None)?;
     let generated_ms = thegn_core::util::now_ms();
-    let cost = fleet_cost::fleet_cost(
-        &view,
-        fleet_cost::BUNDLED_PRICES,
-        &cfg.placement.price,
-        generated_ms,
-    );
+    let cost = priced(cfg, &view, generated_ms);
     Ok(FleetSnapshot {
         generated_ms,
         view,
         cost,
     })
+}
+
+/// Price a view at `now_ms` and record its `[placement.fleet_budget]`
+/// breaches.
+pub(crate) fn priced(cfg: &Config, view: &FleetView, now_ms: i64) -> FleetCost {
+    let mut cost = fleet_cost::fleet_cost(
+        view,
+        fleet_cost::BUNDLED_PRICES,
+        &cfg.placement.price,
+        now_ms,
+    );
+    fleet_cost::apply_budgets(&mut cost, &cfg.placement.fleet_budget);
+    cost
+}
+
+/// The `max_hourly` gate for a NEW provider sandbox `sandbox_id` in env
+/// `env_name`. `Ok` without any network read when the env's provider has no
+/// `max_hourly`; `Ok` when the provider already lists `sandbox_id` (resume
+/// and reuse are never refused); otherwise the provider's burn across every
+/// env using it must be under the cap. An inventory that cannot be read, or
+/// is incomplete, refuses ("cannot verify fleet budget"). Blocking.
+pub(crate) fn admit_new_sandbox(
+    cfg: &Config,
+    env_name: &str,
+    sandbox_id: &str,
+) -> std::result::Result<(), String> {
+    admit_with(cfg, env_name, sandbox_id, |provider| {
+        gather_where(cfg, |_, envc| envc.provider.provider == provider)
+    })
+}
+
+/// [`admit_new_sandbox`] over an injected inventory read (the test seam).
+fn admit_with(
+    cfg: &Config,
+    env_name: &str,
+    sandbox_id: &str,
+    inventory: impl FnOnce(&str) -> Result<FleetView>,
+) -> std::result::Result<(), String> {
+    let Some(envc) = cfg.env.get(env_name) else {
+        return Ok(());
+    };
+    let provider = envc.provider.provider.as_str();
+    let budgets = &cfg.placement.fleet_budget;
+    let capped = budgets
+        .get(provider)
+        .is_some_and(|b| b.max_hourly.is_finite() && b.max_hourly > 0.0);
+    if !capped {
+        return Ok(());
+    }
+    let refuse = |why: &str| {
+        format!(
+            "cannot verify fleet budget for {provider}: {why}; a new sandbox is refused while \
+             [placement.fleet_budget.{provider}] max_hourly is set"
+        )
+    };
+    let view = match inventory(provider) {
+        Ok(view) => view,
+        Err(error) => {
+            tracing::debug!(target: "thegn::fleet", provider, error = %format!("{error:#}"), "budget inventory read failed");
+            return Err(refuse("the fleet inventory read failed"));
+        }
+    };
+    if view.rows.iter().any(|row| {
+        row.provider == provider
+            && (row.id == sandbox_id || row.name.as_deref() == Some(sandbox_id))
+    }) {
+        return Ok(());
+    }
+    if let Some(partial) = view.partial.first() {
+        return Err(refuse(&format!(
+            "env {} could not be fully listed",
+            partial.env
+        )));
+    }
+    let cost = priced(cfg, &view, thegn_core::util::now_ms());
+    fleet_cost::admit_new(&cost, provider, budgets)
 }
 
 /// One env to inventory, in config order.
@@ -57,11 +133,19 @@ struct Slot {
 }
 
 pub(crate) fn gather(cfg: &Config, only_env: Option<&str>) -> Result<FleetView> {
+    gather_where(cfg, |name, _| only_env.is_none_or(|only| only == name))
+}
+
+/// [`gather`] over the API-provider envs `keep` selects.
+fn gather_where(
+    cfg: &Config,
+    keep: impl Fn(&str, &thegn_core::config::EnvConfig) -> bool,
+) -> Result<FleetView> {
     use thegn_core::config::EnvProviderKind;
     let slots: Vec<Slot> = cfg
         .env
         .iter()
-        .filter(|(name, _)| only_env.is_none_or(|only| only == name.as_str()))
+        .filter(|(name, envc)| keep(name.as_str(), envc))
         .filter(|(_, envc)| {
             !matches!(
                 EnvProviderKind::of(&envc.provider.provider),
@@ -231,5 +315,117 @@ mod tests {
         assert!(
             matches!(unbuilt.completeness, Completeness::Unavailable(r) if r.contains("token"))
         );
+    }
+
+    fn budget_cfg(max_hourly: f64) -> Config {
+        toml::from_str(&format!(
+            r#"
+            [env.e]
+            placement = "provider"
+            [env.e.provider]
+            provider = "fly"
+            [env.other]
+            placement = "provider"
+            [env.other.provider]
+            provider = "digitalocean"
+            [placement.price]
+            fly = 1.0
+            [placement.fleet_budget.fly]
+            warn_hourly = 1.0
+            max_hourly = {max_hourly:.1}
+            "#
+        ))
+        .expect("budget config parses")
+    }
+
+    fn running(ids: &[&str]) -> FleetView {
+        FleetView {
+            rows: ids
+                .iter()
+                .map(|id| fleet_cost::FleetRow {
+                    provider: "fly".into(),
+                    env: "e".into(),
+                    id: (*id).to_string(),
+                    state: Some("started".into()),
+                    ..fleet_cost::FleetRow::default()
+                })
+                .collect(),
+            ..FleetView::default()
+        }
+    }
+
+    #[test]
+    fn admit_skips_the_read_without_a_cap() {
+        let no_read = |_: &str| -> Result<FleetView> { panic!("no network without a cap") };
+        assert_eq!(admit_with(&budget_cfg(0.0), "e", "new", no_read), Ok(()));
+        assert_eq!(
+            admit_with(&budget_cfg(2.0), "other", "new", no_read),
+            Ok(()),
+            "a provider without a budget is never read"
+        );
+        assert_eq!(admit_with(&budget_cfg(2.0), "nope", "new", no_read), Ok(()));
+    }
+
+    #[test]
+    fn admit_reads_only_the_capped_provider() {
+        let mut asked = None;
+        let got = admit_with(&budget_cfg(2.0), "e", "new", |provider| {
+            asked = Some(provider.to_string());
+            Ok(running(&["a"]))
+        });
+        assert_eq!(got, Ok(()), "1.0/h is under a 2.0/h cap");
+        assert_eq!(asked.as_deref(), Some("fly"));
+    }
+
+    #[test]
+    fn admit_refuses_a_new_id_at_max_but_admits_an_existing_one() {
+        let cfg = budget_cfg(2.0);
+        let err = admit_with(&cfg, "e", "new", |_| Ok(running(&["a", "b"]))).unwrap_err();
+        assert!(err.contains("max_hourly $2.00/h"), "{err}");
+        assert_eq!(
+            admit_with(&cfg, "e", "b", |_| Ok(running(&["a", "b"]))),
+            Ok(()),
+            "resume of a listed sandbox is never refused"
+        );
+        let mut by_name = running(&["a", "machine-id"]);
+        by_name.rows[1].name = Some("named".into());
+        assert_eq!(admit_with(&cfg, "e", "named", |_| Ok(by_name)), Ok(()));
+        let mut stopped = running(&["a", "b"]);
+        stopped.rows[1].state = Some("stopped".into());
+        assert_eq!(
+            admit_with(&cfg, "e", "new", |_| Ok(stopped)),
+            Ok(()),
+            "a stopped sandbox does not burn"
+        );
+    }
+
+    #[test]
+    fn admit_fails_closed_on_an_unreadable_fleet() {
+        let cfg = budget_cfg(2.0);
+        let err = admit_with(&cfg, "e", "new", |_| {
+            Err(anyhow::anyhow!("401 body: token=hunter2"))
+        })
+        .unwrap_err();
+        assert!(err.contains("cannot verify fleet budget"), "{err}");
+        assert!(
+            !err.contains("hunter2"),
+            "no response body in the error: {err}"
+        );
+        let mut partial = running(&[]);
+        partial.partial.push(fleet_cost::PartialEnv {
+            env: "e".into(),
+            reason: "unavailable: secret body".into(),
+        });
+        let err = admit_with(&cfg, "e", "new", |_| Ok(partial)).unwrap_err();
+        assert!(err.contains("cannot verify fleet budget"), "{err}");
+        assert!(!err.contains("secret body"), "{err}");
+    }
+
+    #[test]
+    fn priced_applies_budgets() {
+        let cost = priced(&budget_cfg(5.0), &running(&["a", "b"]), 0);
+        assert_eq!(cost.budget.len(), 1);
+        assert_eq!(cost.budget[0].level, fleet_cost::BudgetLevel::Warn);
+        assert!((cost.budget[0].hourly - 2.0).abs() < 1e-9);
     }
 }
