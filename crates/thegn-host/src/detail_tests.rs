@@ -39,8 +39,12 @@ fn cpu_maps_to_a_graph_near_the_item() {
         &StatusCtx::new_for_test(&hist),
     )
     .expect("cpu has a detail view");
-    assert!(matches!(ov.content, DetailContent::Graph(_)));
-    assert_eq!((ov.cols, ov.rows), (40, 12));
+    // A history graph followed by the attribution tree (THE-2025).
+    let DetailContent::Sections(detail) = &ov.content else {
+        panic!("cpu popup should be sectioned");
+    };
+    assert!(matches!(detail.sections[0], Section::Graph(_)));
+    assert_eq!(ov.cols, cpu_attrib::COLS);
     // Item in the top half → drops below.
     assert!(matches!(ov.placement, Placement::NearBelow(_)));
 }

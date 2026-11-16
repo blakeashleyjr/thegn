@@ -342,6 +342,29 @@ the host cannot see it. `bwrap` panes attribute normally.
 Set `[monitor] processes = false` to disable the tab entirely, and
 `[monitor] proc_rows` to change how many rows it shows.
 
+### Per-workspace breakdown
+
+The masthead's `cpu` and `mem` popups show the same attribution as a tree:
+each workspace (parked ones too), its worktrees, each pane labelled by its tab
+and program, and up to three of the heaviest processes inside that pane. Below
+the tree, a `thegn` group splits the UI and the pane daemon, and
+`outside thegn` is the system total minus everything attributed above. It never
+goes below zero: if the per-process figures add up to more than the system
+reading (shared pages count once per process), it is clamped and the heading
+says so. CPU is percent of one core, like `top`, so a busy pane can read above
+100%; the share column is that row's fraction of the masthead total. Missing
+readings show `—`, never a made-up `0`.
+
+Attribution uses the same ancestry walk as the `owner` column: a process
+belongs to the pane whose shell it descends from. The per-pane totals come
+from the complete native process pass, which exists on Linux; elsewhere the
+heading reads "per-pane totals unavailable on this platform" and only the
+sampled processes are placed under their panes. Panes closed since the last
+sample fold into "unattributed panes". The list is capped at 64 rows —
+processes are trimmed first, then panes, behind a "+N more" row; workspaces
+and worktrees always show. Like the Processes tab, sampling happens only while
+the popup is open.
+
 ## Containers
 
 The Containers tab lists every container on the machine across the detected
