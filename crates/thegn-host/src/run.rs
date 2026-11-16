@@ -19435,6 +19435,26 @@ async fn event_loop<T: Terminal>(
                             }
                             sb.focus_active_row(&mut model);
                         }
+                        // The fleet popup's `s`/`d`: confirm first (the confirm
+                        // dispatch below runs `thegn env down` in a tab).
+                        crate::detail::DetailOutcome::Act(
+                            crate::detail::DetailAction::FleetDown {
+                                worktree,
+                                label,
+                                stop,
+                            },
+                        ) => {
+                            bar_detail = None;
+                            let (title, body) =
+                                crate::detail::fleet::confirm_text(&label, &worktree, stop);
+                            active_menu = Some(menu::confirm_menu(
+                                title,
+                                body,
+                                crate::detail::fleet::fleet_down_tag(stop),
+                                worktree,
+                                true,
+                            ));
+                        }
                         crate::detail::DetailOutcome::Act(
                             crate::detail::DetailAction::AckAllAttention,
                         ) => {
@@ -20449,6 +20469,47 @@ async fn event_loop<T: Terminal>(
                                     ) {
                                         Ok(status) => model.status = status,
                                         Err(error) => model.status = error.to_string(),
+                                    }
+                                }
+                                dirty = true;
+                                continue;
+                            }
+                            // The fleet popup's confirmed stop/destroy: run
+                            // `thegn env down [--stop] --worktree=<wt>` in a
+                            // visible tab, so the CLI's pull-back, refusals and
+                            // output are the user's to read. Never `--force`.
+                            // No wake source: the next fleet poll shows the result.
+                            if let menu::MenuChoice::Confirm { tag, arg } = &choice
+                                && let Some(stop) = crate::detail::fleet::stop_for_tag(tag)
+                            {
+                                match thegn_core::util::self_exe_path() {
+                                    Some(exe) => {
+                                        let argv = crate::detail::fleet::fleet_down_argv(
+                                            &exe.to_string_lossy(),
+                                            arg,
+                                            stop,
+                                        );
+                                        if crate::actions::open_argv_tab(
+                                            &mut session,
+                                            &mut panes,
+                                            &argv,
+                                            None,
+                                            chrome.center,
+                                        ) {
+                                            focus.zone = crate::focus::Zone::Center;
+                                            refresh_tab_model(&mut model, &session, &mut sb);
+                                            need_relayout = true;
+                                            model.status =
+                                                crate::detail::fleet::started_status(arg, stop);
+                                        } else {
+                                            model.status =
+                                                "fleet: could not open a tab for env down".into();
+                                        }
+                                    }
+                                    None => {
+                                        model.status =
+                                            "fleet: cannot locate the thegn binary to run env down"
+                                                .into();
                                     }
                                 }
                                 dirty = true;

@@ -4,19 +4,29 @@
 //! [`thegn_core::cpu_attrib::build`]; this module maps the frame model into its
 //! inputs and renders the rows as a [`TableSection`].
 //!
+//! The tree table carries a row cursor: Enter on a workspace, worktree or
+//! pane row focuses that worktree; Enter on a process row opens the monitor's
+//! process tab (kill/renice with confirmation live there); thegn's own rows
+//! and "outside thegn" fall through to the popup's plain Enter. `M` still
+//! expands into the monitor.
+//!
 //! Inert by itself: it reads the last published process snapshot and pane
 //! index. The loop refreshes it in place (like the status modal) only while the
 //! popup is open, which is also the only time the sampler runs.
 
 use thegn_core::cpu_attrib::{
-    self, AttribInputs, AttribRow, Owner, PaneUsage, RowKind, ScopeUsage, SelfUsage, SortKey,
-    TopProc, Usage,
+    self, AttribInputs, AttribRow, Owner, PaneOwner, PaneUsage, RowKind, ScopeUsage, SelfUsage,
+    SortKey, TopProc, Usage,
 };
 use thegn_core::theme::Hue;
 
 use super::status_modal::human_bytes;
-use super::{Cell, DetailContent, DetailOverlay, Section, SectionsDetail, TableSection, trunc};
+use super::{
+    Cell, DetailAction, DetailContent, DetailOverlay, RowActs, Section, SectionsCursor,
+    SectionsDetail, TableSection, trunc,
+};
 use crate::chrome::{FrameModel, S};
+use crate::compositor::Rect;
 use crate::seg::Tok;
 
 /// Title of the `cpu` popup.
@@ -194,12 +204,72 @@ fn render_row(r: &AttribRow) -> Vec<Cell> {
     ]
 }
 
-/// The attribution sections: a heading with the sampling status, then the
-/// tree as a table. `sort` is CPU for the `cpu` popup, RSS for `mem`.
-pub(crate) fn build_sections(model: &FrameModel, sort: SortKey) -> Vec<Section> {
+/// The worktree directory of the `workspace`/`worktree` pair, from the pane
+/// index (the tree rows carry labels, not paths).
+fn worktree_path(owners: &[PaneOwner], workspace: &str, worktree: &str) -> Option<String> {
+    owners
+        .iter()
+        .find(|o| o.workspace == workspace && o.worktree == worktree)
+        .and_then(|o| o.worktree_path.clone())
+}
+
+/// One [`RowActs`] per tree row. Workspace rows focus their first (heaviest)
+/// worktree; worktree and pane rows focus their worktree; process rows open
+/// the monitor's process tab; everything else has no Enter of its own. The id
+/// is kind + enclosing worktree path + label (a process label carries its
+/// pid), so a refresh keeps the cursor on the same row.
+fn row_acts(owners: &[PaneOwner], rows: &[AttribRow]) -> Vec<RowActs> {
+    let mut workspace: &str = "";
+    let mut wt_path: Option<String> = None;
+    let mut out = Vec::with_capacity(rows.len());
+    for (i, r) in rows.iter().enumerate() {
+        let path = match r.kind {
+            RowKind::Workspace => {
+                workspace = &r.label;
+                wt_path = None;
+                rows[i + 1..]
+                    .iter()
+                    .take_while(|n| n.depth > 0)
+                    .find(|n| n.kind == RowKind::Worktree)
+                    .and_then(|n| worktree_path(owners, &r.label, &n.label))
+            }
+            RowKind::Worktree => {
+                wt_path = worktree_path(owners, workspace, &r.label);
+                wt_path.clone()
+            }
+            RowKind::Pane | RowKind::Proc | RowKind::Job | RowKind::More => wt_path.clone(),
+            RowKind::Thegn | RowKind::Outside => {
+                workspace = "";
+                wt_path = None;
+                None
+            }
+        };
+        let enter = match r.kind {
+            RowKind::Workspace | RowKind::Worktree | RowKind::Pane => {
+                path.clone().map(DetailAction::FocusWorktree)
+            }
+            RowKind::Proc => Some(DetailAction::OpenMonitor {
+                tab: crate::monitor::MonitorTab::Procs,
+            }),
+            RowKind::Thegn | RowKind::Job | RowKind::Outside | RowKind::More => None,
+        };
+        out.push(RowActs {
+            id: format!("{:?}|{}|{}", r.kind, path.unwrap_or_default(), r.label),
+            enter,
+            keys: Vec::new(),
+        });
+    }
+    out
+}
+
+/// The attribution sections (a heading with the sampling status, then the
+/// tree as a table) and the tree table's row actions. `sort` is CPU for the
+/// `cpu` popup, RSS for `mem`.
+pub(crate) fn build_sections(model: &FrameModel, sort: SortKey) -> (Vec<Section>, Vec<RowActs>) {
     let tree = tree(model, sort);
     let header = vec!["where".into(), "cpu".into(), "share".into(), "mem".into()];
-    vec![
+    let acts = row_acts(&model.pane_owners, &tree.rows);
+    let secs = vec![
         Section::Heading {
             label: HEADING.into(),
             note: Some(status_note(model, &tree)),
@@ -209,12 +279,42 @@ pub(crate) fn build_sections(model: &FrameModel, sort: SortKey) -> Vec<Section> 
             rows: tree.rows.iter().map(render_row).collect(),
             sel: None,
         }),
-    ]
+    ];
+    (secs, acts)
 }
 
-/// The attribution sections for a popup title, or `None` for other popups.
-pub(crate) fn sections_for(model: &FrameModel, title: &str) -> Option<Vec<Section>> {
-    sort_for(title).map(|sort| build_sections(model, sort))
+/// (Re)build the attribution sections of a `cpu`/`mem` popup in place:
+/// everything from the [`HEADING`] down is replaced (appended when absent),
+/// the graphs above are left alone, and the tree table gets the row cursor,
+/// kept on the same row across rebuilds. `false` for any other popup.
+pub(crate) fn install(ov: &mut DetailOverlay, model: &FrameModel, screen: Rect) -> bool {
+    let Some(sort) = sort_for(&ov.title) else {
+        return false;
+    };
+    let DetailContent::Sections(detail) = &mut ov.content else {
+        return false;
+    };
+    let mut sections = std::mem::take(&mut detail.sections);
+    let start = sections
+        .iter()
+        .position(|s| matches!(s, Section::Heading { label, .. } if label == HEADING))
+        .unwrap_or(sections.len());
+    sections.truncate(start);
+    let (fresh, rows) = build_sections(model, sort);
+    sections.extend(fresh);
+    let content: usize = sections.iter().map(Section::height).sum();
+    ov.rows = content.min(screen.rows.saturating_sub(3)).max(1);
+    // No row with an Enter (thegn's own rows only): stay scroll-only.
+    let actionable = rows.iter().any(|r| r.enter.is_some());
+    ov.set_sections(SectionsDetail {
+        sections,
+        // The heading sits at `start`; the tree table right under it.
+        cursor: actionable.then_some(SectionsCursor {
+            table: start + 1,
+            rows,
+        }),
+    });
+    true
 }
 
 /// Rebuild the attribution sections in place iff the `cpu`/`mem` popup is
@@ -230,22 +330,7 @@ pub(crate) fn refresh_open(
     let Some(ov) = slot.as_mut() else {
         return false;
     };
-    let Some(fresh) = sections_for(model, &ov.title) else {
-        return false;
-    };
-    let DetailContent::Sections(SectionsDetail { sections }) = &mut ov.content else {
-        return false;
-    };
-    let start = sections
-        .iter()
-        .position(|s| matches!(s, Section::Heading { label, .. } if label == HEADING))
-        .unwrap_or(sections.len());
-    sections.truncate(start);
-    sections.extend(fresh);
-    let content: usize = sections.iter().map(Section::height).sum();
-    ov.rows = content.min(ctx.screen.rows.saturating_sub(3)).max(1);
-    ov.scroll = ov.scroll.min(ov.scroll_max());
-    true
+    install(ov, model, ctx.screen)
 }
 
 #[cfg(test)]
@@ -254,10 +339,12 @@ mod tests {
     use crate::chrome::{BarItemId, FrameModel};
     use crate::compositor::Rect;
     use crate::detail::{
-        Cell, DetailContent, Placement, Section, StatusCtx, keyval, open_detail_for,
+        Cell, DetailAction, DetailContent, DetailOutcome, Placement, Section, StatusCtx, keyval,
+        open_detail_for,
     };
     use crate::seg::Tok;
     use crate::telemetry::TelemetryHistory;
+    use termwiz::input::{KeyCode, Modifiers};
     use thegn_core::cpu_attrib::{PaneOwner, SortKey};
 
     fn model() -> FrameModel {
@@ -338,7 +425,7 @@ mod tests {
 
     #[test]
     fn build_sections_renders_the_tree_with_theme_tokens_only() {
-        let secs = build_sections(&model(), SortKey::Cpu);
+        let secs = build_sections(&model(), SortKey::Cpu).0;
         let lines = texts(&secs);
         assert_eq!(
             lines[0],
@@ -369,7 +456,7 @@ mod tests {
         }
 
         // Memory sorts by RSS: beta (8M) above alpha (2M).
-        let mem = texts(&build_sections(&model(), SortKey::Mem));
+        let mem = texts(&build_sections(&model(), SortKey::Mem).0);
         let beta = mem.iter().position(|l| l.starts_with("beta|")).unwrap();
         let alpha = mem.iter().position(|l| l.starts_with("alpha|")).unwrap();
         assert!(beta < alpha);
@@ -390,7 +477,7 @@ mod tests {
                 scope(thegn_metrics::UNNAMED_SCOPES, 2.0),
             ];
         }
-        let lines = texts(&build_sections(&m, SortKey::Cpu));
+        let lines = texts(&build_sections(&m, SortKey::Cpu).0);
         let main = lines
             .iter()
             .position(|l| l.starts_with("alpha/main|60%"))
@@ -408,8 +495,70 @@ mod tests {
     }
 
     #[test]
+    fn worktree_rows_focus_their_worktree_and_process_rows_open_the_monitor() {
+        let (secs, acts) = build_sections(&model(), SortKey::Cpu);
+        let lines = texts(&secs);
+        // Row i of the table is line i + 1 (line 0 is the heading).
+        assert_eq!(acts.len() + 1, lines.len());
+        let enter_of = |prefix: &str| {
+            let i = lines
+                .iter()
+                .position(|l| l.starts_with(prefix))
+                .unwrap_or_else(|| panic!("{prefix} in {lines:?}"));
+            acts[i - 1].enter.clone()
+        };
+        let focus = |p: &str| Some(DetailAction::FocusWorktree(p.into()));
+        assert_eq!(enter_of("alpha|"), focus("/wt/alpha-main"));
+        assert_eq!(enter_of("alpha/main|"), focus("/wt/alpha-main"));
+        assert_eq!(enter_of("1 · claude|"), focus("/wt/alpha-main"));
+        assert_eq!(enter_of("beta|"), focus("/wt/beta"));
+        assert_eq!(
+            enter_of("node (11)|"),
+            Some(DetailAction::OpenMonitor {
+                tab: crate::monitor::MonitorTab::Procs
+            })
+        );
+        assert_eq!(enter_of("thegn|"), None);
+        assert_eq!(enter_of("outside thegn|"), None);
+        assert!(acts.iter().all(|a| a.keys.is_empty()));
+        // Identities are distinct, so a refresh can find the same row again.
+        let ids: std::collections::BTreeSet<_> = acts.iter().map(|a| a.id.as_str()).collect();
+        assert_eq!(ids.len(), acts.len());
+    }
+
+    #[test]
+    fn the_popup_cursor_fires_focus_and_survives_a_refresh() {
+        let hist = TelemetryHistory::default();
+        let ctx = StatusCtx::new_for_test(&hist);
+        let item = Rect {
+            x: 80,
+            y: 0,
+            cols: 8,
+            rows: 1,
+        };
+        let mut slot = open_detail_for(&BarItemId::Widget("cpu".into()), item, &model(), &ctx);
+        let ov = slot.as_mut().expect("popup");
+        // Cursor starts on the heaviest workspace (alpha).
+        assert_eq!(
+            ov.handle_key(&KeyCode::Enter, Modifiers::NONE),
+            DetailOutcome::Act(DetailAction::FocusWorktree("/wt/alpha-main".into()))
+        );
+        ov.handle_key(&KeyCode::Char('j'), Modifiers::NONE);
+        let before = ov.sel;
+        assert!(refresh_open(&mut slot, &model(), &ctx));
+        let ov = slot.as_mut().expect("still open");
+        assert_eq!(ov.sel, before, "same row after a rebuild");
+        assert_eq!(
+            ov.handle_key(&KeyCode::Char('M'), Modifiers::NONE),
+            DetailOutcome::Act(DetailAction::OpenMonitor {
+                tab: crate::monitor::MonitorTab::Cpu
+            })
+        );
+    }
+
+    #[test]
     fn status_note_covers_unsampled_partial_and_warming() {
-        let empty = texts(&build_sections(&FrameModel::default(), SortKey::Cpu));
+        let empty = texts(&build_sections(&FrameModel::default(), SortKey::Cpu).0);
         assert_eq!(
             empty[0],
             "by workspace: open the breakdown to start sampling"
@@ -419,7 +568,7 @@ mod tests {
         let mut partial = model();
         partial.procs.summary = None;
         partial.procs.primed = false;
-        let lines = texts(&build_sections(&partial, SortKey::Cpu));
+        let lines = texts(&build_sections(&partial, SortKey::Cpu).0);
         assert_eq!(
             lines[0],
             "by workspace: per-pane totals unavailable on this platform · cpu warming up"
@@ -428,7 +577,7 @@ mod tests {
 
         let mut clamped = model();
         clamped.stats.cpu_pct = Some(1);
-        let lines = texts(&build_sections(&clamped, SortKey::Cpu));
+        let lines = texts(&build_sections(&clamped, SortKey::Cpu).0);
         assert!(lines[0].ends_with(" · outside clamped"), "{lines:?}");
     }
 
