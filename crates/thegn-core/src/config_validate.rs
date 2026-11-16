@@ -352,6 +352,17 @@ pub fn validate_diagnostics_with_policy(
                 }
             }
         }
+        let runtime_dir = std::env::var_os("XDG_RUNTIME_DIR")
+            .filter(|value| !value.is_empty())
+            .map(std::path::PathBuf::from);
+        diagnostics.extend(
+            mount_exposure_warnings(&cfg, runtime_dir.as_deref(), &crate::util::home())
+                .into_iter()
+                .map(|message| ValidationDiagnostic {
+                    severity: ValidationSeverity::Warning,
+                    message,
+                }),
+        );
         if let Some(message) = cfg.sandbox.warm_direnv.deprecation_warning() {
             diagnostics.push(ValidationDiagnostic {
                 severity: ValidationSeverity::Warning,
@@ -376,6 +387,43 @@ pub fn validate_diagnostics_with_policy(
         );
     }
     diagnostics
+}
+
+/// THE-2009: warn on sandbox mounts that expose `$XDG_RUNTIME_DIR` or make
+/// `~/.claude-profiles` writable, across every layer that declares mounts.
+/// The runtime dir and home are injected so tests never read the ambient env.
+fn mount_exposure_warnings(
+    cfg: &Config,
+    runtime_dir: Option<&std::path::Path>,
+    home: &std::path::Path,
+) -> Vec<String> {
+    let mut labelled: Vec<(String, String)> = Vec::new();
+    let mut add = |prefix: &str, mounts: &[String]| {
+        labelled.extend(
+            mounts
+                .iter()
+                .enumerate()
+                .map(|(index, mount)| (format!("{prefix}[{index}]"), mount.clone())),
+        );
+    };
+    add("sandbox.mounts", &cfg.sandbox.mounts);
+    for (name, profile) in &cfg.profiles {
+        if let Some(mounts) = &profile.sandbox.mounts {
+            add(&format!("profiles.{name}.sandbox.mounts"), mounts);
+        }
+    }
+    for (name, env) in &cfg.env {
+        if let Some(mounts) = &env.sandbox.mounts {
+            add(&format!("env.{name}.sandbox.mounts"), mounts);
+        }
+    }
+    for (slug, workspace) in &cfg.workspace {
+        add(
+            &format!("project.{slug}.sandbox_mounts"),
+            &workspace.sandbox_mounts,
+        );
+    }
+    crate::sandbox_runtime_escape::exposure_warnings(&labelled, runtime_dir, home)
 }
 
 fn validate_normalized(body: &str) -> Vec<String> {
@@ -2525,6 +2573,37 @@ sidebar_workspace_sort = "attention"
         );
         assert!(diagnostics[0].message.contains("relative"));
         assert!(validate_str(body).is_empty());
+    }
+
+    fn exposure_for(body: &str) -> Vec<String> {
+        let cfg: Config = toml::from_str(body).unwrap();
+        mount_exposure_warnings(
+            &cfg,
+            Some(std::path::Path::new("/run/user/1000")),
+            std::path::Path::new("/h"),
+        )
+    }
+
+    #[test]
+    fn env_mount_of_run_user_warns_about_runtime_dir_exposure() {
+        let warnings = exposure_for("[env.pipeline.sandbox]\nmounts = [\"/run/user\"]\n");
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
+        assert!(warnings[0].contains("env.pipeline.sandbox.mounts[0]"));
+        assert!(warnings[0].contains("exposes $XDG_RUNTIME_DIR"));
+    }
+
+    #[test]
+    fn mount_exposure_warnings_label_every_mount_layer() {
+        let body = "[sandbox]\nmounts = [\"/srv\", \"/run/user/1000\"]\n\
+                    [profiles.work.sandbox]\nmounts = [\"/h/.claude-profiles\"]\n\
+                    [project.repo]\nsandbox_mounts = [\"/run:ro\"]\n";
+        let warnings = exposure_for(body);
+        assert_eq!(warnings.len(), 3, "{warnings:?}");
+        assert!(warnings[0].contains("sandbox.mounts[1]"));
+        assert!(warnings[1].contains("profiles.work.sandbox.mounts[0]"));
+        assert!(warnings[1].contains("~/.claude-profiles"));
+        assert!(warnings[2].contains("project.repo.sandbox_mounts[0]"));
+        assert!(exposure_for("[sandbox]\nmounts = [\"/run/user/1000/gnupg\"]\n").is_empty());
     }
 
     #[test]
