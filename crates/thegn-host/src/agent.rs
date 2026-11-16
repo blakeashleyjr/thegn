@@ -2905,10 +2905,14 @@ pub fn provision_provider_env_named(
 
     // Resolve the repo origin so the sprite can clone it.
     let req = envplan::detect(Path::new(worktree));
-    // Host secrets (GH_TOKEN, ANTHROPIC_API_KEY, …) carried into every provisioning
-    // command so the clone authenticates against private repos and setup steps can
-    // reach the network/model. Remote-safe (no host-local socket vars).
-    let mut exec_env = cfg.repo_sandbox(&repo_root).passthrough_env_remote();
+    // Host secrets (ANTHROPIC_API_KEY, …) carried into every provisioning
+    // command so setup steps can reach the network/model. GH_TOKEN/GITHUB_TOKEN
+    // ride along only when `[sandbox.git]` grants a token (mode = "full" with
+    // credential = "repo-token" | "user-token"); by default credentials stay
+    // with thegn. Remote-safe (no host-local socket vars).
+    let repo_sandbox = cfg.repo_sandbox(&repo_root);
+    let git_token = repo_sandbox.git.admits_git_token();
+    let mut exec_env = repo_sandbox.passthrough_env_remote();
     crate::agent_configs::push_host_git_identity(&repo_root, &mut exec_env);
     // The generic, declarative personal layer ([sandbox.home]) — applied to every
     // sandbox so it feels like local. Resolve it PER-ENV (the env overlay may set a
@@ -3094,6 +3098,8 @@ pub fn provision_provider_env_named(
             None
         },
         toolchain: cfg.toolchain.clone(),
+        // No token credential helper unless `[sandbox.git]` grants a token.
+        git_token,
         bundle_seed,
     };
     let plan = envplan::plan(&req, &opts);

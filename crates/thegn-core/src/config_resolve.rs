@@ -431,6 +431,7 @@ pub fn classify_repo_overlay(
         network_audit,
         vpn,
         home,
+        git,
     } = req;
 
     // --- Forbidden: never applied from the repo layer. --------------------
@@ -513,6 +514,11 @@ pub fn classify_repo_overlay(
         home,
         "sandbox.home",
         "a repo may not set the personal HOME layer (its setup_script runs during provisioning)"
+    );
+    forbid!(
+        git,
+        "sandbox.git",
+        "a repo may not choose its own git write policy; set [sandbox.git] globally or in an [env.<name>.sandbox.git]"
     );
 
     // --- Floor: repo may only tighten along the lattice. ------------------
@@ -1633,6 +1639,7 @@ const HINT_FIELDS: &[(&str, HintRule)] = &[
     ("network_audit", HintRule::Neutral),
     ("vpn", HintRule::Opaque),
     ("home", HintRule::Opaque),
+    ("git", HintRule::Opaque),
 ];
 
 fn limit_is_not_raised(
@@ -1702,6 +1709,7 @@ fn hint_field_key(field: &str) -> &'static str {
         "network_audit" => "sandbox.network_audit",
         "vpn" => "sandbox.vpn",
         "home" => "sandbox.home",
+        "git" => "sandbox.git",
         _ => "sandbox",
     }
 }
@@ -1804,6 +1812,7 @@ fn repo_hint_weakens(
                 "remote" => serialized_field_changed(&base.remote, &hinted.remote),
                 "vpn" => serialized_field_changed(&base.vpn, &hinted.vpn),
                 "home" => serialized_field_changed(&base.home, &hinted.home),
+                "git" => serialized_field_changed(&base.git, &hinted.git),
                 _ => false,
             },
             HintRule::Neutral => false,
@@ -2679,11 +2688,21 @@ mod tests {
         o.vpn = Some(crate::config::VpnConfig::default());
         o.remote = Some(crate::config::RemoteOverlay::default());
         o.home = Some(crate::config::HomeOverlay::default());
+        o.git = Some(crate::config::SandboxGitOverlay {
+            mode: Some(crate::config::SandboxGitMode::Full),
+            ..Default::default()
+        });
         let r = classify_repo_overlay(o, &base(), &Approvals::deny_all());
         assert!(r.sanctioned.vpn.is_none());
         assert!(r.sanctioned.remote.is_none());
         assert!(r.sanctioned.home.is_none());
-        for k in ["sandbox.vpn", "sandbox.remote", "sandbox.home"] {
+        assert!(r.sanctioned.git.is_none());
+        for k in [
+            "sandbox.vpn",
+            "sandbox.remote",
+            "sandbox.home",
+            "sandbox.git",
+        ] {
             assert!(
                 r.events.iter().any(|e| e.key == k),
                 "missing denial for {k}"
@@ -3641,6 +3660,7 @@ mod tests {
             ("inject_devshell = true", "sandbox.inject_devshell"),
             ("vpn.provider = 'tailscale'", "sandbox.vpn"),
             ("home.tools = ['fd']", "sandbox.home"),
+            ("git.mode = 'full'", "sandbox.git"),
             ("remote.host = 'box'", "sandbox.remote"),
             ("auto_caches = true", "sandbox.auto_caches"),
             ("compiler_cache = 'auto'", "sandbox.compiler_cache"),
