@@ -3651,6 +3651,7 @@ fn backend_enter_argv_guarded_with_env(
             }
             let mut emitted_mounts = Vec::new();
             let mut writable_dests = Vec::new();
+            let mut unset_control_socket = false;
             for m in &spec.mounts {
                 // Skip mounts already covered by a hardcoded parent — bwrap
                 // cannot create a mount-point inside a read-only bind.
@@ -3849,6 +3850,80 @@ fn backend_enter_argv_guarded_with_env(
                         ));
                     }
                 }
+
+                // THE-2009: a bind exposing $XDG_RUNTIME_DIR also exposes the
+                // user bus, podman/docker and the systemd user manager, each a
+                // way to run code outside bwrap. Mask them after every bind.
+                if let Some(raw_runtime_dir) = env.runtime_dir.as_deref()
+                    && raw_runtime_dir != std::path::Path::new("/run/user")
+                {
+                    // Real paths, like the control guard: a symlinked or `..` mount source
+                    // (`/var/run` -> `/run`) exposes the runtime dir too.
+                    let runtime_dir = std::fs::canonicalize(raw_runtime_dir)
+                        .unwrap_or_else(|_| raw_runtime_dir.to_path_buf());
+                    let canonical_hosts: Vec<std::path::PathBuf> = mount_refs
+                        .iter()
+                        .map(|(host, _)| {
+                            std::fs::canonicalize(host).unwrap_or_else(|_| host.to_path_buf())
+                        })
+                        .collect();
+                    let canonical_refs: Vec<(&std::path::Path, &std::path::Path)> = canonical_hosts
+                        .iter()
+                        .zip(&mount_refs)
+                        .map(|(host, (_, dest))| (host.as_path(), *dest))
+                        .collect();
+                    if crate::sandbox_runtime_escape::mounts_expose(&runtime_dir, &canonical_refs) {
+                        let escapes = crate::sandbox_runtime_escape::host_escape_paths(
+                            &runtime_dir,
+                            &|path| {
+                                crate::sandbox_runtime_escape::kind_from_metadata(
+                                    std::fs::symlink_metadata(path).ok().as_ref(),
+                                )
+                            },
+                        );
+                        let mut explicit_dests: Vec<&std::path::Path> = spec
+                            .mounts
+                            .iter()
+                            .map(|mount| std::path::Path::new(&mount.dest))
+                            .collect();
+                        explicit_dests.push(&spec.worktree);
+                        for mask in crate::sandbox_runtime_escape::plan_escape_masks(
+                            &escapes,
+                            &canonical_refs,
+                            &explicit_dests,
+                        ) {
+                            match mask {
+                                crate::sandbox_runtime_escape::EscapeMask::Tmpfs(dest) => {
+                                    v.extend(["--tmpfs".into(), dest.display().to_string()]);
+                                }
+                                crate::sandbox_runtime_escape::EscapeMask::NullBind(dest) => {
+                                    v.extend([
+                                        "--ro-bind".into(),
+                                        "/dev/null".into(),
+                                        dest.display().to_string(),
+                                    ]);
+                                }
+                            }
+                        }
+                    }
+                }
+
+                // THE-2011: the daemon exports its control socket into every
+                // session, but the control dir is masked above, so the variable
+                // would dangle. Unset it (in-sandbox control is unsupported).
+                // The daemon injects THEGN_CONTROL_SOCKET at spawn, after this argv is
+                // built, and its socket always lives in a control dir. Unset it unless an
+                // explicit spec.env value points outside every control dir.
+                unset_control_socket = !env.control_dirs.is_empty()
+                    && spec
+                        .env
+                        .iter()
+                        .filter(|(key, _)| key == "THEGN_CONTROL_SOCKET")
+                        .all(|(_, value)| {
+                            env.control_dirs.iter().any(|control_dir| {
+                                std::path::Path::new(value).starts_with(control_dir)
+                            })
+                        });
             }
             v.push("--unshare-pid".into());
             // `--die-with-parent` kills the sandbox (bwrap is PID 1 of the
@@ -3895,6 +3970,10 @@ fn backend_enter_argv_guarded_with_env(
             // the outer CPU-cap systemd scope runs outside this sandbox.
             if spec.read_only_root {
                 v.extend(["--unsetenv".into(), "DBUS_SESSION_BUS_ADDRESS".into()]);
+            }
+            // THE-2011: same ordering rule for a control socket hidden above.
+            if unset_control_socket {
+                v.extend(["--unsetenv".into(), "THEGN_CONTROL_SOCKET".into()]);
             }
             v.extend([
                 "--".into(),
@@ -3953,7 +4032,16 @@ fn backend_enter_argv_guarded_with_env(
                             runtime_dir.join("systemd/private").display()
                         ),
                     ]);
+                    // THE-2009: the container sockets run code on the host too.
+                    for entry in ["podman", "docker", "docker.sock"] {
+                        v.extend([
+                            "-p".into(),
+                            format!("InaccessiblePaths=-{}", runtime_dir.join(entry).display()),
+                        ]);
+                    }
                 }
+                // THE-2011: a control socket made inaccessible would dangle.
+                let mut control_hidden = false;
                 if let Some(runtime_dir) = env.runtime_dir.as_deref() {
                     let control_dir = if runtime_dir == std::path::Path::new("/run/user") {
                         runtime_dir.to_path_buf()
@@ -3965,6 +4053,7 @@ fn backend_enter_argv_guarded_with_env(
                             "-p".into(),
                             format!("InaccessiblePaths=-{}", control_dir.display()),
                         ]);
+                        control_hidden = true;
                     }
                 }
                 for control_dir in &env.control_dirs {
@@ -3992,6 +4081,10 @@ fn backend_enter_argv_guarded_with_env(
                         "-p".into(),
                         format!("InaccessiblePaths=-{}", control_dir.display()),
                     ]);
+                    control_hidden = true;
+                }
+                if control_hidden {
+                    v.extend(["-p".into(), "UnsetEnvironment=THEGN_CONTROL_SOCKET".into()]);
                 }
                 for protected_dir in &env.protected_dirs {
                     let hides_worktree = protected_dir.starts_with(&spec.worktree)
