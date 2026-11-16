@@ -1178,6 +1178,7 @@ mod tests {
     use super::allowed_state_caps;
     use super::explain_key;
     use super::host_install_choice;
+    use super::issue_write_call;
     use super::routed_params;
     use thegn_core::control::ScopeSet;
 
