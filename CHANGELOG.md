@@ -7,6 +7,8 @@ All notable changes to **thegn** are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.1.0-alpha.88] — 2026-11-16
+
 ### Added
 
 - Provider worktrees are seeded from a git bundle over the provider files API, with no GitHub credential in the VM; `thegn env pull` brings VM commits back into the lane branch. Pull-back refuses main, the default branch and the merge target, and fails closed when the default branch is unknown. (THE-2021)
@@ -3643,7 +3645,8 @@ launcher picker and the merge queue's `agent_command` hook remain — they run
 whatever commands you configure. Leftover `[llm_proxy]` config sections and
 `proxy_*` tables in existing state databases are ignored harmlessly.
 
-[Unreleased]: https://github.com/blakeashleyjr/thegn/compare/v0.1.0-alpha.87...HEAD
+[Unreleased]: https://github.com/blakeashleyjr/thegn/compare/v0.1.0-alpha.88...HEAD
+[0.1.0-alpha.88]: https://github.com/blakeashleyjr/thegn/compare/v0.1.0-alpha.87...v0.1.0-alpha.88
 [0.1.0-alpha.87]: https://github.com/blakeashleyjr/thegn/compare/v0.1.0-alpha.86...v0.1.0-alpha.87
 [0.1.0-alpha.86]: https://github.com/blakeashleyjr/thegn/compare/v0.1.0-alpha.85...v0.1.0-alpha.86
 [0.1.0-alpha.85]: https://github.com/blakeashleyjr/thegn/compare/v0.1.0-alpha.84...v0.1.0-alpha.85
