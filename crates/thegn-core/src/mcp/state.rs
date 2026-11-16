@@ -421,6 +421,91 @@ pub const STATE_TOOLS: &[StateToolSpec] = &[
         ],
     },
     StateToolSpec {
+        cap: "dispatches.put",
+        description: "Append one row to the agent-dispatch roster (the wire mirror of \
+                      `POST /v1/dispatches`); returns the stored row. A lease-bound row \
+                      needs a `lead` proof. Write-scoped (`--scopes write`); requires a \
+                      running daemon.",
+        args: &[
+            ArgSpec {
+                name: "issue_id",
+                kind: ArgKind::String,
+                required: true,
+                description: "Tracker issue id the dispatch works on",
+            },
+            ArgSpec {
+                name: "worktree_path",
+                kind: ArgKind::String,
+                required: true,
+                description: "Absolute path of the worktree the agent runs in",
+            },
+            ArgSpec {
+                name: "agent_name",
+                kind: ArgKind::String,
+                required: true,
+                description: "Roster agent name (e.g. a `[[pipeline.stages]]` agent)",
+            },
+            ArgSpec {
+                name: "stage",
+                kind: ArgKind::String,
+                required: false,
+                description: "Pipeline stage this row is (stored and grouped by only)",
+            },
+            ArgSpec {
+                name: "parent_id",
+                kind: ArgKind::Integer,
+                required: false,
+                description: "Roster row this one was chunked out of",
+            },
+            ArgSpec {
+                name: "session_id",
+                kind: ArgKind::String,
+                required: false,
+                description: "Daemon session running this dispatch",
+            },
+            ArgSpec {
+                name: "artifact_path",
+                kind: ArgKind::String,
+                required: false,
+                description: "Path to the handoff artifact committed in the worktree",
+            },
+            ArgSpec {
+                name: "lead",
+                kind: ArgKind::Object,
+                required: false,
+                description: "Lead-lease proof `{lease, owner, lease_gen?}`",
+            },
+        ],
+    },
+    StateToolSpec {
+        cap: "dispatches.set_status",
+        description: "Set one dispatch row's status (the wire mirror of \
+                      `POST /v1/dispatches/{id}/status`). `status` is a member of the \
+                      closed snake_case dispatch-status set, checked by the daemon. A \
+                      lease-bound row needs a `lead` proof. Write-scoped \
+                      (`--scopes write`); requires a running daemon.",
+        args: &[
+            ArgSpec {
+                name: "id",
+                kind: ArgKind::Integer,
+                required: true,
+                description: "Dispatch row id (see dispatches_list)",
+            },
+            ArgSpec {
+                name: "status",
+                kind: ArgKind::String,
+                required: true,
+                description: "New status (snake_case dispatch-status name)",
+            },
+            ArgSpec {
+                name: "lead",
+                kind: ArgKind::Object,
+                required: false,
+                description: "Lead-lease proof `{lease, owner, lease_gen?}`",
+            },
+        ],
+    },
+    StateToolSpec {
         cap: "agent.sessions",
         description: "List discovered coding-agent sessions from each harness's local \
                       transcript store: harness, session id, worktree/project, last-modified \
@@ -920,6 +1005,8 @@ pub const MCP_STATE_CAPS: &[&str] = &[
     "issues.list",
     "issues.get",
     "dispatches.list",
+    "dispatches.put",
+    "dispatches.set_status",
     "agent.sessions",
     "sessions.wait",
     "sessions.open",
@@ -1059,12 +1146,13 @@ fn input_schema(args: &[ArgSpec]) -> Value {
 }
 
 /// Write-class MCP tools whose effect is additive or reversible (open/fork a
-/// session, open an editor, assign a folder, resize a PTY, focus a
-/// workspace): advertised with
+/// session, open an editor, assign a folder, resize a PTY, append a dispatch
+/// row, focus a workspace): advertised with
 /// `destructiveHint: false`. Every other non-read tool is advertised
 /// destructive (fail closed), so a new write tool is destructive until it is
 /// deliberately listed here.
 const NON_DESTRUCTIVE_WRITE_CAPS: &[&str] = &[
+    "dispatches.put",
     "folders.assign",
     "editor.open",
     "merge.add",
@@ -1708,6 +1796,166 @@ mod tests {
     }
 
     #[test]
+    fn dispatches_put_and_set_status_are_write_scoped_and_advertised_only_when_allowed() {
+        let r = StateRouter::new(vec!["dispatches.list"], |_, _| Ok(json!(null)));
+        let names: Vec<String> = r
+            .tool_entries()
+            .iter()
+            .map(|t| t["name"].as_str().unwrap().to_string())
+            .collect();
+        assert_eq!(names, ["dispatches_list"]);
+        let denied = StateRouter::new(vec!["dispatches.list"], |_, _| -> Result<Value, String> {
+            panic!("a denied tool must not reach fetch")
+        });
+        for (tool, args, cap) in [
+            (
+                "dispatches_put",
+                json!({ "issue_id": "THE-1", "worktree_path": "/w", "agent_name": "a" }),
+                "dispatches.put",
+            ),
+            (
+                "dispatches_set_status",
+                json!({ "id": 42, "status": "running" }),
+                "dispatches.set_status",
+            ),
+        ] {
+            let (code, msg) = denied.call(tool, &args).unwrap().unwrap_err();
+            assert_eq!(code, -32001);
+            assert_eq!(scope_of(lookup(cap).unwrap()), Scope::Write, "{cap}");
+            assert!(msg.contains("--scopes write"), "{msg}");
+            let spec = STATE_TOOLS.iter().find(|t| t.cap == cap).unwrap();
+            assert!(
+                spec.description.contains("`--scopes write`"),
+                "{cap}: {}",
+                spec.description
+            );
+        }
+
+        let r = StateRouter::new(vec!["dispatches.put", "dispatches.set_status"], |_, _| {
+            Ok(json!(null))
+        });
+        let entries = r.tool_entries();
+        let names: Vec<&str> = entries
+            .iter()
+            .map(|e| e["name"].as_str().unwrap())
+            .collect();
+        assert_eq!(names, ["dispatches_put", "dispatches_set_status"]);
+        // Mirrors DispatchPutReq.
+        let put = &entries[0]["inputSchema"];
+        assert_eq!(
+            put["required"],
+            json!(["issue_id", "worktree_path", "agent_name"])
+        );
+        for (key, ty) in [
+            ("issue_id", "string"),
+            ("worktree_path", "string"),
+            ("agent_name", "string"),
+            ("stage", "string"),
+            ("parent_id", "integer"),
+            ("session_id", "string"),
+            ("artifact_path", "string"),
+            ("lead", "object"),
+        ] {
+            assert_eq!(put["properties"][key]["type"], ty, "{key}");
+        }
+        assert_eq!(put["properties"].as_object().unwrap().len(), 8);
+        // Mirrors DispatchStatusBody + the `{id}` path param.
+        let set = &entries[1]["inputSchema"];
+        assert_eq!(set["required"], json!(["id", "status"]));
+        assert_eq!(set["properties"]["id"]["type"], "integer");
+        assert_eq!(set["properties"]["status"]["type"], "string");
+        assert_eq!(set["properties"]["lead"]["type"], "object");
+        assert_eq!(set["properties"].as_object().unwrap().len(), 3);
+    }
+
+    #[test]
+    fn dispatches_put_and_set_status_reject_wrong_typed_args_before_fetch() {
+        let r = StateRouter::new(
+            vec!["dispatches.put", "dispatches.set_status"],
+            |_, _| -> Result<Value, String> { panic!("invalid args must not reach fetch") },
+        );
+        let put_ok = json!({ "issue_id": "THE-1", "worktree_path": "/w", "agent_name": "a" });
+        let mut put_extra = put_ok.clone();
+        put_extra["bogus"] = json!(true);
+        let mut put_lead = put_ok.clone();
+        put_lead["lead"] = json!("lease");
+        let mut put_parent = put_ok.clone();
+        put_parent["parent_id"] = json!("7");
+        for (tool, bad) in [
+            ("dispatches_put", json!({})),
+            (
+                "dispatches_put",
+                json!({ "issue_id": "THE-1", "worktree_path": "/w" }),
+            ),
+            (
+                "dispatches_put",
+                json!({ "issue_id": 1, "worktree_path": "/w", "agent_name": "a" }),
+            ),
+            ("dispatches_put", put_extra),
+            ("dispatches_put", put_lead),
+            ("dispatches_put", put_parent),
+            ("dispatches_set_status", json!({})),
+            ("dispatches_set_status", json!({ "id": 42 })),
+            ("dispatches_set_status", json!({ "status": "done" })),
+            (
+                "dispatches_set_status",
+                json!({ "id": "x", "status": "done" }),
+            ),
+            (
+                "dispatches_set_status",
+                json!({ "id": 1.5, "status": "done" }),
+            ),
+            ("dispatches_set_status", json!({ "id": 42, "status": 3 })),
+            (
+                "dispatches_set_status",
+                json!({ "id": 42, "status": "done", "lead": [] }),
+            ),
+            (
+                "dispatches_set_status",
+                json!({ "id": 42, "status": "done", "note": "x" }),
+            ),
+        ] {
+            let (code, _) = r.call(tool, &bad).unwrap().unwrap_err();
+            assert_eq!(code, -32602, "{tool} {bad}");
+        }
+    }
+
+    #[test]
+    fn dispatches_put_and_set_status_route_their_cap_ids_to_fetch() {
+        let r = StateRouter::new(
+            vec!["dispatches.put", "dispatches.set_status"],
+            |cap, args| Ok(json!({ "cap": cap, "args": args })),
+        );
+        let put = r
+            .call(
+                "dispatches_put",
+                &json!({ "issue_id": "THE-1", "worktree_path": "/w", "agent_name": "a" }),
+            )
+            .unwrap()
+            .unwrap();
+        let text = put["content"][0]["text"].as_str().unwrap();
+        assert!(text.contains("dispatches.put"), "{text}");
+        // An unknown status passes the router; the daemon owns the closed set.
+        let set = r
+            .call(
+                "dispatches_set_status",
+                &json!({ "id": 42, "status": "no_such_status" }),
+            )
+            .unwrap()
+            .unwrap();
+        let text = set["content"][0]["text"].as_str().unwrap();
+        assert!(text.contains("dispatches.set_status"), "{text}");
+        assert!(text.contains("no_such_status"), "{text}");
+    }
+
+    #[test]
+    fn redact_for_audit_keeps_dispatch_fields() {
+        // Roster rows carry identifiers and paths, never free text or secrets.
+        let args = json!({ "id": 42, "status": "done", "lead": { "lease": "l", "owner": "o" } });
+        assert_eq!(redact_for_audit("dispatches.set_status", &args), args);
+    }
+
+    #[test]
     fn tool_entries_string_array_declares_items() {
         let r = StateRouter::new(vec!["sessions.open"], |_, _| Ok(json!(null)));
         let entries = r.tool_entries();
@@ -1859,6 +2107,8 @@ mod tests {
             "sessions.resize",
             "sessions.split",
             "worktrees.open",
+            "dispatches.put",
+            "dispatches.set_status",
         ];
         // Folder assignment is a repo-local worktree metadata mutation: Git.
         let git = ["folders.assign"];
@@ -2050,6 +2300,8 @@ mod tests {
             ("sessions_snapshot", true, false),
             ("sessions_split", false, false),
             ("worktrees_open", false, false),
+            ("dispatches_put", false, false),
+            ("dispatches_set_status", false, true),
         ] {
             let entry = entries
                 .iter()
