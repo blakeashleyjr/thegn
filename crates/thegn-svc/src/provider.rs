@@ -457,7 +457,20 @@ impl DaytonaProvider {
     }
 
     /// Parse a complete list response (an array, or `{ "sandboxes": [...] }`).
+    /// Test-only since the typed inventory replaced its production caller.
+    #[cfg(test)]
     fn parse_list(v: &serde_json::Value) -> Result<Vec<String>> {
+        Ok(Self::parse_infos(v)?
+            .into_iter()
+            .map(|row| row.id)
+            .collect())
+    }
+
+    /// The typed sibling of [`Self::parse_list`] (same envelope and id
+    /// refusals): optional `status|state`, `created_at|createdAt`,
+    /// `class|size` and `region|target` are read tolerantly (absent or
+    /// wrong-typed ⇒ `None`).
+    fn parse_infos(v: &serde_json::Value) -> Result<Vec<SandboxInfo>> {
         let arr = v
             .as_array()
             .or_else(|| v.get("sandboxes").and_then(serde_json::Value::as_array))
@@ -467,11 +480,23 @@ impl DaytonaProvider {
         arr.iter()
             .enumerate()
             .map(|(index, sandbox)| {
-                Self::parse_id(sandbox)
+                let id = Self::parse_id(sandbox)
                     .filter(|id| !id.is_empty())
                     .ok_or_else(|| {
                         anyhow!("daytona: GET /sandbox element {index} has no sandbox id")
-                    })
+                    })?;
+                let obj = sandbox
+                    .get("sandbox")
+                    .filter(|inner| inner.is_object())
+                    .unwrap_or(sandbox);
+                Ok(SandboxInfo {
+                    id,
+                    name: None,
+                    state: inventory_text(obj, &["status", "state"]),
+                    size: inventory_text(obj, &["class", "size"]),
+                    region: inventory_text(obj, &["region", "target"]),
+                    created_at_ms: inventory_time_ms(obj, &["created_at", "createdAt"]),
+                })
             })
             .collect()
     }
@@ -560,8 +585,19 @@ impl DaytonaProvider {
         self.list_inventory_detail().await.0
     }
 
-    /// The inventory plus, for `TotalMismatch`, the announced total.
+    /// The typed `thegn fleet` inventory (one unpaged `GET /sandbox`).
+    pub async fn sandbox_inventory(&self) -> Result<InventoryReport> {
+        InventoryReport::from_inventory(self.list_infos_detail().await.0)
+    }
+
+    /// The id inventory plus, for `TotalMismatch`, the announced total.
     async fn list_inventory_detail(&self) -> (crate::vps::Inventory<String>, Option<u64>) {
+        let (inventory, total) = self.list_infos_detail().await;
+        (inventory.map_rows(|row| row.id), total)
+    }
+
+    /// The typed inventory plus, for `TotalMismatch`, the announced total.
+    async fn list_infos_detail(&self) -> (crate::vps::Inventory<SandboxInfo>, Option<u64>) {
         use crate::vps::{Inventory, PartialReason};
         let fetched: Result<serde_json::Value> = async {
             let _permit = CONTROL_GATE.acquire(&self.authority()?).await?;
@@ -584,7 +620,7 @@ impl DaytonaProvider {
             Ok(body) => body,
             Err(error) => return (Inventory::Unknown(format!("{error:#}")), None),
         };
-        let ids = match Self::parse_list(&body) {
+        let ids = match Self::parse_infos(&body) {
             Ok(ids) => ids,
             Err(error) => return (Inventory::Unknown(format!("{error:#}")), None),
         };
@@ -627,7 +663,7 @@ pub struct SpritesProvider {
 
 #[derive(Debug, PartialEq, Eq)]
 struct SpritesListPage {
-    names: Vec<String>,
+    rows: Vec<SandboxInfo>,
     next: Option<String>,
 }
 
@@ -801,18 +837,32 @@ impl SpritesProvider {
             .ok_or_else(|| {
                 anyhow!("sprites: GET /sprites returned an unrecognised list envelope")
             })?;
-        let names = arr
+        let rows = arr
             .iter()
             .enumerate()
             .map(|(index, sprite)| {
-                Self::parse_name(sprite)
+                let name = Self::parse_name(sprite)
                     .filter(|name| !name.is_empty())
                     .ok_or_else(|| {
                         anyhow!("sprites: GET /sprites element {index} has no sprite name")
-                    })
+                    })?;
+                // Optional detail, read tolerantly (absent or wrong-typed ⇒
+                // `None`); only the name is strict.
+                let obj = sprite
+                    .get("sprite")
+                    .filter(|inner| inner.is_object())
+                    .unwrap_or(sprite);
+                Ok(SandboxInfo {
+                    id: name,
+                    name: inventory_text(obj, &["id"]),
+                    state: inventory_text(obj, &["status", "state"]),
+                    size: inventory_text(obj, &["class", "size"]),
+                    region: inventory_text(obj, &["region", "target"]),
+                    created_at_ms: inventory_time_ms(obj, &["created_at", "createdAt"]),
+                })
             })
             .collect::<Result<Vec<_>>>()?;
-        Ok(SpritesListPage { names, next })
+        Ok(SpritesListPage { rows, next })
     }
 
     async fn get_list_page(&self, url: &str, operation: &str) -> Result<serde_json::Value> {
@@ -1004,9 +1054,20 @@ impl SpritesProvider {
         self.list_inventory_detail().await.0
     }
 
-    /// The inventory plus, for `DuplicateId`, the offending name (so `list()`
-    /// can keep its legacy message).
+    /// The typed `thegn fleet` inventory (the same paged, bounded listing).
+    pub async fn sandbox_inventory(&self) -> Result<InventoryReport> {
+        InventoryReport::from_inventory(self.list_infos_detail().await.0)
+    }
+
+    /// The name inventory plus, for `DuplicateId`, the offending name (so
+    /// `list()` can keep its legacy message).
     async fn list_inventory_detail(&self) -> (crate::vps::Inventory<String>, Option<String>) {
+        let (inventory, duplicate) = self.list_infos_detail().await;
+        (inventory.map_rows(|row| row.id), duplicate)
+    }
+
+    /// The typed inventory plus, for `DuplicateId`, the offending name.
+    async fn list_infos_detail(&self) -> (crate::vps::Inventory<SandboxInfo>, Option<String>) {
         use crate::vps::{Inventory, PartialReason};
         let authority = match self.authority() {
             Ok(authority) => authority,
@@ -1017,7 +1078,7 @@ impl SpritesProvider {
             Err(error) => return (Inventory::Unknown(format!("{error:#}")), None),
         };
         let listing = async {
-            let mut names: Vec<String> = Vec::new();
+            let mut names: Vec<SandboxInfo> = Vec::new();
             let mut seen_names = std::collections::HashSet::new();
             let mut seen_tokens = std::collections::HashSet::new();
             let mut token: Option<String> = None;
@@ -1043,7 +1104,7 @@ impl SpritesProvider {
                     Ok(page) => page,
                     Err(error) => return (Inventory::Unknown(format!("{error:#}")), None),
                 };
-                if names.len().saturating_add(page.names.len()) > crate::vps::MAX_INVENTORY_ROWS {
+                if names.len().saturating_add(page.rows.len()) > crate::vps::MAX_INVENTORY_ROWS {
                     return (
                         Inventory::Partial {
                             rows: names,
@@ -1052,17 +1113,17 @@ impl SpritesProvider {
                         None,
                     );
                 }
-                for name in page.names {
-                    if !seen_names.insert(name.clone()) {
+                for row in page.rows {
+                    if !seen_names.insert(row.id.clone()) {
                         return (
                             Inventory::Partial {
                                 rows: names,
                                 reason: PartialReason::DuplicateId,
                             },
-                            Some(name),
+                            Some(row.id),
                         );
                     }
-                    names.push(name);
+                    names.push(row);
                 }
                 let Some(next) = page.next else {
                     return (Inventory::Complete(names), None);
@@ -3447,6 +3508,45 @@ impl SandboxInfo {
     }
 }
 
+/// The first non-empty string among `keys` on `obj` — the tolerant reader
+/// for optional inventory fields. A missing key or a wrong-typed value is
+/// `None`, never an error (only a row's identity is strict).
+pub(crate) fn inventory_text(obj: &serde_json::Value, keys: &[&str]) -> Option<String> {
+    keys.iter().find_map(|key| {
+        obj.get(*key)
+            .and_then(serde_json::Value::as_str)
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string)
+    })
+}
+
+/// A creation time as unix milliseconds from the first usable key: an
+/// RFC 3339 string, or an epoch number (seconds, or milliseconds when it is
+/// too large to be seconds — past year 5138). Anything else is `None`.
+pub(crate) fn inventory_time_ms(obj: &serde_json::Value, keys: &[&str]) -> Option<i64> {
+    // 1e11 seconds is ~year 5138; any real epoch above it is milliseconds.
+    const SECONDS_CEILING: i64 = 100_000_000_000;
+    let epoch = |n: i64| {
+        if n.abs() >= SECONDS_CEILING {
+            Some(n)
+        } else {
+            n.checked_mul(1000)
+        }
+    };
+    keys.iter().find_map(|key| match obj.get(*key)? {
+        serde_json::Value::String(s) => chrono::DateTime::parse_from_rfc3339(s.trim())
+            .ok()
+            .map(|t| t.timestamp_millis())
+            .or_else(|| s.trim().parse::<i64>().ok().and_then(epoch)),
+        serde_json::Value::Number(n) => n
+            .as_i64()
+            .or_else(|| n.as_f64().filter(|f| f.is_finite()).map(|f| f as i64))
+            .and_then(epoch),
+        _ => None,
+    })
+}
+
 /// A typed inventory with its completeness explicit (mirrors
 /// [`crate::vps::Inventory`]): only `Complete` may support an absence claim.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -3462,6 +3562,20 @@ impl InventoryReport {
     /// The id-only fallback for a provider without a typed inventory.
     pub fn from_ids(ids: Vec<String>) -> Self {
         InventoryReport::Complete(ids.into_iter().map(SandboxInfo::id_only).collect())
+    }
+
+    /// Lift a typed provider inventory: `Partial` keeps its rows with the
+    /// reason's text; `Unknown` (nothing is known) is an error.
+    pub fn from_inventory(inventory: crate::vps::Inventory<SandboxInfo>) -> Result<Self> {
+        use crate::vps::Inventory;
+        match inventory {
+            Inventory::Complete(rows) => Ok(InventoryReport::Complete(rows)),
+            Inventory::Partial { rows, reason } => Ok(InventoryReport::Partial {
+                rows,
+                reason: reason.message().to_string(),
+            }),
+            Inventory::Unknown(reason) => Err(anyhow!(reason)),
+        }
     }
 }
 
@@ -3579,14 +3693,17 @@ impl Provider {
     }
 
     /// The provider's sandboxes with whatever detail it can type (`thegn
-    /// fleet`). Fly maps its machines (size, region, state, creation time);
-    /// the other providers fall back to [`Self::list`] ids with unknown fields.
+    /// fleet`): every provider reads its own listing (size, region, state,
+    /// creation time where the vendor reports them; unknown fields `None`).
     /// The exec-only iroh reach refuses, like `list`.
     pub async fn inventory(&self) -> Result<InventoryReport> {
         match self {
             Provider::Fly(p) => p.sandbox_inventory().await,
+            Provider::Vps(p) => p.sandbox_inventory().await,
+            Provider::Machine0(p) => p.sandbox_inventory().await,
+            Provider::Sprites(p) => p.sandbox_inventory().await,
+            Provider::Daytona(p) => p.sandbox_inventory().await,
             Provider::Iroh { .. } => Err(iroh_exec_only("inventory")),
-            _ => Ok(InventoryReport::from_ids(self.list().await?)),
         }
     }
 
@@ -5039,15 +5156,19 @@ mod tests {
         );
     }
 
+    fn sprite_names(page: &SpritesListPage) -> Vec<&str> {
+        page.rows.iter().map(|row| row.id.as_str()).collect()
+    }
+
     #[test]
     fn sprites_parse_list_array_and_envelope() {
         let arr = serde_json::json!([{"name": "a"}, {"name": "b"}]);
         let parsed = SpritesProvider::parse_list_page(&arr).unwrap();
-        assert_eq!(parsed.names, vec!["a", "b"]);
+        assert_eq!(sprite_names(&parsed), vec!["a", "b"]);
         assert_eq!(parsed.next, None);
         let env = serde_json::json!({"sprites": [{"name": "c"}]});
         let parsed = SpritesProvider::parse_list_page(&env).unwrap();
-        assert_eq!(parsed.names, vec!["c"]);
+        assert_eq!(sprite_names(&parsed), vec!["c"]);
         assert_eq!(parsed.next, None);
         assert!(SpritesProvider::parse_list_page(&serde_json::json!([{"id": "no-name"}])).is_err());
         assert!(SpritesProvider::parse_list_page(&serde_json::json!({})).is_err());
@@ -5074,7 +5195,7 @@ mod tests {
             "has_more": false
         });
         assert_eq!(
-            SpritesProvider::parse_list_page(&real_shape).unwrap().names,
+            sprite_names(&SpritesProvider::parse_list_page(&real_shape).unwrap()),
             vec!["tgtest1"]
         );
         assert!(SpritesProvider::parse_list_page(&serde_json::json!([{"id": "no-name"}])).is_err());
@@ -7901,6 +8022,161 @@ mod tests {
             rows.iter().all(|row| row.size.is_none()
                 && row.state.is_none()
                 && row.created_at_ms.is_none())
+        );
+    }
+
+    #[test]
+    fn inventory_report_from_inventory_maps_each_completeness() {
+        use crate::vps::{Inventory, PartialReason};
+        assert_eq!(
+            InventoryReport::from_inventory(Inventory::Complete(vec![SandboxInfo::id_only("a")]))
+                .unwrap(),
+            InventoryReport::Complete(vec![SandboxInfo::id_only("a")])
+        );
+        assert_eq!(
+            InventoryReport::from_inventory(Inventory::Partial {
+                rows: vec![SandboxInfo::id_only("a")],
+                reason: PartialReason::RowCap,
+            })
+            .unwrap(),
+            InventoryReport::Partial {
+                rows: vec![SandboxInfo::id_only("a")],
+                reason: PartialReason::RowCap.message().to_string(),
+            }
+        );
+        let error =
+            InventoryReport::from_inventory(Inventory::Unknown("listing failed (500)".into()))
+                .unwrap_err();
+        assert_eq!(error.to_string(), "listing failed (500)");
+    }
+
+    #[test]
+    fn inventory_text_takes_the_first_usable_string() {
+        let row = serde_json::json!({"status": 3, "state": " ready ", "blank": "", "plan": "x"});
+        assert_eq!(
+            inventory_text(&row, &["status", "state"]),
+            Some("ready".into())
+        );
+        assert_eq!(inventory_text(&row, &["blank", "plan"]), Some("x".into()));
+        assert_eq!(inventory_text(&row, &["missing"]), None);
+        assert_eq!(inventory_text(&serde_json::json!("str"), &["status"]), None);
+    }
+
+    #[test]
+    fn inventory_time_ms_reads_rfc3339_and_epochs() {
+        let rfc = chrono::DateTime::parse_from_rfc3339("2026-11-16T10:00:00+02:00")
+            .unwrap()
+            .timestamp_millis();
+        for (value, expected) in [
+            (serde_json::json!("2026-11-16T10:00:00+02:00"), Some(rfc)),
+            (serde_json::json!(1_700_000_000), Some(1_700_000_000_000)),
+            (
+                serde_json::json!(1_700_000_000_456_i64),
+                Some(1_700_000_000_456),
+            ),
+            (serde_json::json!("1700000000"), Some(1_700_000_000_000)),
+            (serde_json::json!(1_700_000_000.9), Some(1_700_000_000_000)),
+            (serde_json::json!("not a time"), None),
+            (serde_json::json!(true), None),
+            (serde_json::json!({"seconds": 1}), None),
+            (serde_json::Value::Null, None),
+        ] {
+            let row = serde_json::json!({ "created_at": value.clone() });
+            assert_eq!(
+                inventory_time_ms(&row, &["created_at"]),
+                expected,
+                "value {value}"
+            );
+        }
+        // The first key holding a usable value wins; wrong types fall through.
+        let row = serde_json::json!({"created_at": [1], "createdAt": 1_700_000_000});
+        assert_eq!(
+            inventory_time_ms(&row, &["created_at", "createdAt"]),
+            Some(1_700_000_000_000)
+        );
+    }
+
+    #[test]
+    fn daytona_parse_infos_reads_optional_fields_tolerantly() {
+        let rows = DaytonaProvider::parse_infos(&serde_json::json!({"sandboxes": [
+            {"id": "a", "state": "started", "class": "small", "target": "eu",
+             "createdAt": "2026-11-16T10:00:00Z"},
+            {"sandbox": {"id": "b", "status": "stopped", "size": "large", "region": "us",
+                         "created_at": 1_700_000_000}},
+            {"id": "c"},
+            {"id": "d", "state": 1, "class": {"cpu": 2}, "target": ["eu"], "createdAt": "soon"}
+        ]}))
+        .unwrap();
+        let rfc = chrono::DateTime::parse_from_rfc3339("2026-11-16T10:00:00Z")
+            .unwrap()
+            .timestamp_millis();
+        assert_eq!(
+            rows,
+            vec![
+                SandboxInfo {
+                    id: "a".into(),
+                    name: None,
+                    state: Some("started".into()),
+                    size: Some("small".into()),
+                    region: Some("eu".into()),
+                    created_at_ms: Some(rfc),
+                },
+                SandboxInfo {
+                    id: "b".into(),
+                    name: None,
+                    state: Some("stopped".into()),
+                    size: Some("large".into()),
+                    region: Some("us".into()),
+                    created_at_ms: Some(1_700_000_000_000),
+                },
+                SandboxInfo::id_only("c"),
+                SandboxInfo::id_only("d"),
+            ]
+        );
+        // The strict id and envelope refusals are unchanged.
+        assert!(DaytonaProvider::parse_infos(&serde_json::json!([{"state": "started"}])).is_err());
+        assert!(DaytonaProvider::parse_infos(&serde_json::json!([{"id": ""}])).is_err());
+        assert!(DaytonaProvider::parse_infos(&serde_json::json!({"items": []})).is_err());
+        assert_eq!(
+            DaytonaProvider::parse_list(&serde_json::json!([{"id": "a", "state": 1}])).unwrap(),
+            vec!["a"]
+        );
+    }
+
+    #[test]
+    fn sprites_parse_list_page_reads_optional_fields_tolerantly() {
+        let page = SpritesProvider::parse_list_page(&serde_json::json!({
+            "sprites": [
+                {"id": "sprite-1", "name": "tg-a", "status": "warm", "class": "standard",
+                 "region": "ord", "created_at": "2026-11-16T10:00:00Z"},
+                {"name": "tg-b"},
+                {"name": "tg-c", "id": 5, "status": false, "region": {"code": "ord"},
+                 "created_at": "later"}
+            ],
+            "has_more": false
+        }))
+        .unwrap();
+        let rfc = chrono::DateTime::parse_from_rfc3339("2026-11-16T10:00:00Z")
+            .unwrap()
+            .timestamp_millis();
+        assert_eq!(
+            page.rows,
+            vec![
+                SandboxInfo {
+                    id: "tg-a".into(),
+                    name: Some("sprite-1".into()),
+                    state: Some("warm".into()),
+                    size: Some("standard".into()),
+                    region: Some("ord".into()),
+                    created_at_ms: Some(rfc),
+                },
+                SandboxInfo::id_only("tg-b"),
+                SandboxInfo::id_only("tg-c"),
+            ]
+        );
+        assert!(
+            SpritesProvider::parse_list_page(&serde_json::json!([{"id": "x", "status": "warm"}]))
+                .is_err()
         );
     }
 }
