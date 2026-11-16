@@ -1212,7 +1212,7 @@ fn nix_install_script(
 /// safe under `set -eu` (direnv evaluates its libs with errexit).
 macro_rules! nix_heal_sh {
     () => {
-        "nix_idle() { ! pgrep -x \"nix|nix-build|nix-shell|nix-store|nix-instantiate|nix-daemon\" >/dev/null 2>&1; }; \
+        "nix_idle() { if command -v pgrep >/dev/null 2>&1; then ! pgrep -x \"nix|nix-build|nix-shell|nix-store|nix-instantiate|nix-daemon\" >/dev/null 2>&1; else for c in /proc/[0-9]*/comm; do case \"$(cat \"$c\" 2>/dev/null)\" in nix|nix-build|nix-shell|nix-store|nix-instantiate|nix-daemon) return 1;; esac; done; return 0; fi; }; \
          nix_store_heal() ( \
            PATH=\"$HOME/.nix-profile/bin:/nix/var/nix/profiles/default/bin:$PATH\"; \
            empty=$(find /nix/store -maxdepth 1 -name \"*.drv\" -size 0 2>/dev/null) || empty=; \
@@ -3499,7 +3499,14 @@ mod tests {
         // THE-2046: never purge /homeless-shelter or delete a `.drv` while a nix
         // process is alive; heal only zero-byte `.drv`s and their referrers.
         let p = nix_runtime_prelude();
-        assert!(p.contains("nix_idle() { ! pgrep -x \"nix|"), "{p}");
+        assert!(
+            p.contains("nix_idle() { if command -v pgrep >/dev/null 2>&1; then ! pgrep -x \"nix|"),
+            "{p}"
+        );
+        assert!(
+            p.contains("for c in /proc/[0-9]*/comm; do"),
+            "pgrep-less fallback: {p}"
+        );
         assert!(
             !p.contains("pgrep -f"),
             "a -f guard matches the script itself: {p}"
