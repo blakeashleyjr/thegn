@@ -1530,6 +1530,240 @@ fn sections_popup_that_fits_does_not_scroll() {
     assert_eq!(ov.scroll_max(), 0);
 }
 
+/// A heading, a 20-row keyval, then a 30-row table with a row cursor: every
+/// row but #1 has an Enter action; every row has `x`.
+fn cursor_stack() -> SectionsDetail {
+    let rows = (0..30)
+        .map(|i| RowActs {
+            id: format!("r{i}"),
+            enter: (i != 1).then(|| DetailAction::OpenUrl(format!("u{i}"))),
+            keys: vec![('x', DetailAction::CopyLine(format!("c{i}")))],
+        })
+        .collect();
+    SectionsDetail {
+        sections: vec![
+            Section::Heading {
+                label: "top".into(),
+                note: None,
+            },
+            Section::KeyVal(
+                (0..20)
+                    .map(|i| (format!("k{i}"), format!("v{i}"), Tok::Slot(S::Text)))
+                    .collect(),
+            ),
+            Section::Table(TableSection {
+                header: vec!["name".into()],
+                rows: (0..30)
+                    .map(|i| vec![Cell::Text(format!("row{i}"), Tok::Slot(S::Text))])
+                    .collect(),
+                sel: None,
+            }),
+        ],
+        cursor: Some(SectionsCursor { table: 2, rows }),
+    }
+}
+
+fn cursor_table_sel(ov: &DetailOverlay) -> Option<usize> {
+    let DetailContent::Sections(d) = &ov.content else {
+        panic!("sectioned");
+    };
+    match &d.sections[2] {
+        Section::Table(t) => t.sel,
+        _ => panic!("table"),
+    }
+}
+
+/// The cursor row's stacked offset: heading 1 + keyval 20 + table header 1.
+fn cursor_row_offset(sel: usize) -> usize {
+    22 + sel
+}
+
+#[test]
+fn sections_cursor_moves_sets_sel_and_scroll_follows() {
+    let short = Rect::full(80, 13); // box height 10
+    let mut ov = sections_detail("Rows", 30, cursor_stack(), Placement::Center, short);
+    assert!(ov.actionable());
+    assert_eq!(ov.rows, 10);
+    // The gutter is horizontal: the stacked height is unchanged.
+    assert_eq!(ov.content_rows(), 1 + 20 + 1 + 30);
+    assert_eq!(cursor_table_sel(&ov), Some(0), "cursor painted from open");
+    // The first cursor row is scrolled into view on open.
+    let off = cursor_row_offset(0);
+    assert!(
+        ov.scroll <= off && off < ov.scroll + ov.rows,
+        "{}",
+        ov.scroll
+    );
+
+    for _ in 0..5 {
+        assert_eq!(
+            ov.handle_key(&KeyCode::Char('j'), Modifiers::NONE),
+            DetailOutcome::Pending
+        );
+    }
+    assert_eq!(ov.sel, 5);
+    assert_eq!(cursor_table_sel(&ov), Some(5));
+    let off = cursor_row_offset(5);
+    assert!(ov.scroll <= off && off < ov.scroll + ov.rows);
+
+    for _ in 0..100 {
+        ov.handle_key(&KeyCode::DownArrow, Modifiers::NONE);
+    }
+    assert_eq!(ov.sel, 29, "clamped to the last row");
+    assert_eq!(ov.scroll, ov.scroll_max(), "last row at the bottom edge");
+    for _ in 0..100 {
+        ov.handle_key(&KeyCode::UpArrow, Modifiers::NONE);
+    }
+    assert_eq!(ov.sel, 0);
+    assert_eq!(cursor_table_sel(&ov), Some(0));
+    let off = cursor_row_offset(0);
+    assert!(ov.scroll <= off && off < ov.scroll + ov.rows);
+    ov.handle_key(&KeyCode::PageDown, Modifiers::NONE);
+    assert_eq!(ov.sel, 8);
+}
+
+#[test]
+fn sections_cursor_on_its_last_row_scrolls_to_trailing_sections() {
+    let mut detail = cursor_stack();
+    detail.sections.push(Section::KeyVal(
+        (0..10)
+            .map(|i| (format!("t{i}"), format!("v{i}"), Tok::Slot(S::Text)))
+            .collect(),
+    ));
+    let mut ov = sections_detail("Rows", 30, detail, Placement::Center, Rect::full(80, 13));
+    for _ in 0..100 {
+        ov.handle_key(&KeyCode::DownArrow, Modifiers::NONE);
+    }
+    assert_eq!(ov.sel, 29);
+    assert_eq!(
+        ov.scroll,
+        ov.scroll_max(),
+        "the trailing keyval is reachable"
+    );
+    ov.handle_key(&KeyCode::UpArrow, Modifiers::NONE);
+    assert_eq!(ov.sel, 28);
+    let off = cursor_row_offset(28);
+    assert!(ov.scroll <= off && off < ov.scroll + ov.rows);
+}
+
+#[test]
+fn sections_cursor_enter_and_keys_fire_the_selected_row() {
+    let mut ov = sections_detail(
+        "Rows",
+        30,
+        cursor_stack(),
+        Placement::Center,
+        Rect::full(80, 40),
+    );
+    assert_eq!(
+        ov.handle_key(&KeyCode::Enter, Modifiers::NONE),
+        DetailOutcome::Act(DetailAction::OpenUrl("u0".into()))
+    );
+    ov.handle_key(&KeyCode::Char('j'), Modifiers::NONE);
+    ov.handle_key(&KeyCode::Char('j'), Modifiers::NONE);
+    assert_eq!(
+        ov.handle_key(&KeyCode::Char('x'), Modifiers::NONE),
+        DetailOutcome::Act(DetailAction::CopyLine("c2".into()))
+    );
+    assert_eq!(
+        ov.handle_key(&KeyCode::Char('z'), Modifiers::NONE),
+        DetailOutcome::Pending,
+        "an unbound char does nothing"
+    );
+    // Row 1 has no Enter: it falls through to the popup's plain Enter —
+    // close without a monitor tab, expand into it with one.
+    ov.handle_key(&KeyCode::Char('k'), Modifiers::NONE);
+    assert_eq!(ov.sel, 1);
+    assert_eq!(
+        ov.handle_key(&KeyCode::Enter, Modifiers::NONE),
+        DetailOutcome::Close
+    );
+    ov.monitor_tab = Some(crate::monitor::MonitorTab::Cpu);
+    assert_eq!(
+        ov.handle_key(&KeyCode::Enter, Modifiers::NONE),
+        DetailOutcome::Act(DetailAction::OpenMonitor {
+            tab: crate::monitor::MonitorTab::Cpu
+        })
+    );
+    // `M` still expands from any row.
+    ov.handle_key(&KeyCode::Char('j'), Modifiers::NONE);
+    assert_eq!(
+        ov.handle_key(&KeyCode::Char('M'), Modifiers::NONE),
+        DetailOutcome::Act(DetailAction::OpenMonitor {
+            tab: crate::monitor::MonitorTab::Cpu
+        })
+    );
+}
+
+#[test]
+fn sections_without_a_cursor_are_unchanged() {
+    let mut detail = cursor_stack();
+    detail.cursor = None;
+    let mut ov = sections_detail("Plain", 30, detail, Placement::Center, Rect::full(80, 13));
+    assert!(!ov.actionable());
+    assert_eq!(cursor_table_sel(&ov), None, "no gutter, no cursor row");
+    assert_eq!(ov.scroll, 0);
+    ov.handle_key(&KeyCode::DownArrow, Modifiers::NONE);
+    assert_eq!(ov.scroll, 1, "j scrolls the stack");
+    assert_eq!(ov.sel, 0);
+    assert_eq!(
+        ov.handle_key(&KeyCode::Char('x'), Modifiers::NONE),
+        DetailOutcome::Pending
+    );
+    assert_eq!(
+        ov.handle_key(&KeyCode::Enter, Modifiers::NONE),
+        DetailOutcome::Close
+    );
+}
+
+#[test]
+fn sections_cursor_keeps_row_identity_across_set_sections() {
+    let mut ov = sections_detail(
+        "Rows",
+        30,
+        cursor_stack(),
+        Placement::Center,
+        Rect::full(80, 40),
+    );
+    for _ in 0..4 {
+        ov.handle_key(&KeyCode::DownArrow, Modifiers::NONE);
+    }
+    // r0..r2 vanish: r4 is now index 1.
+    let mut fresh = cursor_stack();
+    if let Some(c) = fresh.cursor.as_mut() {
+        c.rows.drain(..3);
+    }
+    if let Section::Table(t) = &mut fresh.sections[2] {
+        t.rows.drain(..3);
+    }
+    ov.set_sections(fresh);
+    assert_eq!(ov.sel, 1);
+    assert_eq!(cursor_table_sel(&ov), Some(1));
+    // An unknown row id clamps into range.
+    ov.sel = 26;
+    let mut short = cursor_stack();
+    if let Some(c) = short.cursor.as_mut() {
+        c.rows.truncate(2);
+        c.rows.iter_mut().for_each(|r| r.id.push('!'));
+    }
+    if let Section::Table(t) = &mut short.sections[2] {
+        t.rows.truncate(2);
+    }
+    ov.set_sections(short);
+    assert_eq!(ov.sel, 1);
+    assert_eq!(cursor_table_sel(&ov), Some(1));
+}
+
+#[test]
+fn fleet_down_closes_the_overlay() {
+    let action = DetailAction::FleetDown {
+        worktree: "/wt/a".into(),
+        label: "fly/tg-a".into(),
+        stop: false,
+    };
+    assert!(!action.keeps_overlay());
+}
+
 #[test]
 fn grid_height_is_row_major_ceil() {
     let cells: Vec<_> = (0..8)
