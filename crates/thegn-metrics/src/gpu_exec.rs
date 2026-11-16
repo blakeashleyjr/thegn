@@ -136,6 +136,7 @@ mod tests {
             group: GroupState::Drained,
             leader,
             leader_exited_first: true,
+            idle_expired: false,
             stdout,
             stderr: Capture::default(),
             containment: Containment::ProcessGroup,
