@@ -173,13 +173,17 @@ fn git_success(root: &Path, args: &[&str]) -> Result<()> {
     }
 }
 
+fn release_root(cwd: &Path) -> Result<PathBuf> {
+    use thegn_core::util::GitPathError;
+    thegn_core::util::git_out_path(cwd, &["rev-parse", "--show-toplevel"]).map_err(|e| match e {
+        GitPathError::Empty => anyhow::anyhow!("not inside a git worktree"),
+        e => anyhow::Error::new(e).context("git rev-parse --show-toplevel"),
+    })
+}
+
 fn prepare(o: PrepareOpts) -> Result<()> {
     let cwd = std::env::current_dir().context("reading the current directory")?;
-    let root = git_text(&cwd, &["rev-parse", "--show-toplevel"])?;
-    if root.is_empty() {
-        bail!("not inside a git worktree");
-    }
-    let root = PathBuf::from(root);
+    let root = release_root(&cwd)?;
     let date = match o.date {
         Some(d) if valid_date(&d) => d,
         Some(d) => bail!("--date `{d}` is not YYYY-MM-DD"),
@@ -338,6 +342,16 @@ mod tests {
             "{err}"
         );
         assert!(!err.to_string().is_empty());
+    }
+
+    #[test]
+    fn release_root_errors_outside_a_repo() {
+        let t = tempfile::tempdir().unwrap();
+        let err = release_root(t.path()).unwrap_err();
+        assert!(
+            err.to_string().contains("git rev-parse --show-toplevel"),
+            "{err}"
+        );
     }
 
     #[test]
