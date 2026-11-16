@@ -2287,7 +2287,9 @@ if command -v curl >/dev/null 2>&1; then
     --set sandbox.limits.cpu_total=off daemon --socket "$DSOCK" &
   DPID=$!
   track_daemon "$DPID" "$DSOCK"
-  for _ in $(seq 1 40); do
+  # 30 s: a debug daemon on a loaded machine (the pre-push hook runs this while
+  # other builds compete for CPU) took over 4 s to bind and failed a push.
+  for _ in $(seq 1 300); do
     [[ -S $DSOCK ]] && break
     sleep 0.1
   done
