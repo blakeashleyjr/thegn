@@ -7,6 +7,22 @@ All notable changes to **thegn** are documented here. The format follows
 
 ## [Unreleased]
 
+### Added
+
+- `thegn share list` now shows Tailscale serve ports whose teardown is still pending, and `--json` rows carry `teardown_pending`. (THE-330)
+- Plugins that provide a worktree row field can subscribe to `thegn.worktree_scanned`, which is sent when a worktree's git glyphs change. (THE-2003)
+- Home Manager gains `sound.min_priority`, `dnd.allow_priority`, `sound.per_kind`, `dnd.windows`, `usage.providers` and `usage.profile_roots`. (THE-428)
+
+### Changed
+
+- The daemon `ci.logs` now runs at most 2 provider log fetches at once; a cache-missing request waits up to 30 seconds, then gets a busy error. (THE-544)
+- Internal: workspace clone, setup runs and VPN/preview capture now run under the shared process supervisor, the Fly reaper re-reads its ledger before destroying, and CI log collector bounds are tested. (THE-729, THE-529)
+
+### Fixed
+
+- Invalid `dnd.windows` entries and unknown `usage.providers` now warn at config load. (THE-428)
+- Worktree paths with trailing spaces or non-UTF-8 bytes are now read exactly by several commands, including the merge fixer checkout. (THE-368, THE-376)
+
 ## [0.1.0-alpha.86] — 2026-11-15
 
 ### Added
