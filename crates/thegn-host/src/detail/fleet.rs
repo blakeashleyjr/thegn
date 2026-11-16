@@ -1,8 +1,14 @@
 //! The masthead `fleet` widget's popup: every provider VM with its state,
 //! size, burn, accrued cost and owning worktree (or ORPHAN), the fleet totals
 //! (per-provider hourly, today, month to date, 24 h / 30 d projections), the
-//! envs that could not be read completely, and how to act on a row from the
-//! CLI. Read-only: no row actions yet.
+//! envs that could not be read completely, and the row keys.
+//!
+//! The rows table carries a cursor (`↑↓`). A row bound to a worktree takes
+//! `s` (stop: park the VM) and `d` (destroy: pull commits back, then delete),
+//! both as [`DetailAction::FleetDown`]; the loop confirms and then runs
+//! `thegn env down [--stop] --worktree=<wt>` ([`fleet_down_argv`]) in a
+//! visible tab, so the CLI's pull-back and refusals are reused and never
+//! forced. Orphan rows (no worktree) take no keys.
 //!
 //! Built from the loop-owned `FrameModel::fleet` snapshot only, so opening it
 //! costs no I/O; [`refresh_open`] rebuilds it in place when a new read lands
@@ -10,8 +16,8 @@
 //! module of `detail` so it reaches the private [`DetailOverlay`] fields.
 
 use super::{
-    Cell, DetailContent, DetailOverlay, Placement, Section, SectionsDetail, TableSection, spacer,
-    trunc,
+    Cell, DetailAction, DetailOverlay, Placement, RowActs, Section, SectionsCursor, SectionsDetail,
+    TableSection, spacer, trunc,
 };
 use crate::chrome::{FrameModel, S};
 use crate::fleet_read::FleetSnapshot;
@@ -39,7 +45,7 @@ pub(super) fn open(
     near: Placement,
 ) -> Option<DetailOverlay> {
     let snap = model.fleet.as_deref()?;
-    Some(super::sections(
+    Some(super::sections_detail(
         TITLE,
         WANT_COLS,
         build_sections(snap, ctx.now_ms),
@@ -64,12 +70,92 @@ pub(crate) fn refresh_open(
     let Some(snap) = model.fleet.as_deref() else {
         return false;
     };
-    let secs = build_sections(snap, ctx.now_ms);
-    let content: usize = secs.iter().map(Section::height).sum();
-    ov.content = DetailContent::Sections(SectionsDetail { sections: secs });
+    let detail = build_sections(snap, ctx.now_ms);
+    let content: usize = detail.sections.iter().map(Section::height).sum();
     ov.rows = content.min(ctx.screen.rows.saturating_sub(3)).max(1);
-    ov.scroll = ov.scroll.min(ov.scroll_max());
+    // Keeps the cursor on the same `(provider, id)` VM, or clamps it.
+    ov.set_sections(detail);
     true
+}
+
+/// The confirm-menu tag for a stop (`true`) or destroy.
+pub(crate) fn fleet_down_tag(stop: bool) -> &'static str {
+    if stop { "fleet-stop" } else { "fleet-destroy" }
+}
+
+/// The inverse of [`fleet_down_tag`]: `Some(stop)` for a fleet tag, `None`
+/// for any other confirm.
+pub(crate) fn stop_for_tag(tag: &str) -> Option<bool> {
+    match tag {
+        "fleet-stop" => Some(true),
+        "fleet-destroy" => Some(false),
+        _ => None,
+    }
+}
+
+/// The argv a confirmed stop/destroy runs: `thegn env down [--stop]
+/// --worktree=<wt>`. Structured argv (no shell); the worktree rides inside
+/// its `--worktree=` flag so a value starting with `-` can never parse as an
+/// option. Never `--force`: a failed pull-back refuses the destroy.
+pub(crate) fn fleet_down_argv(exe: &str, worktree: &str, stop: bool) -> Vec<String> {
+    let mut argv = vec![exe.to_string(), "env".into(), "down".into()];
+    if stop {
+        argv.push("--stop".into());
+    }
+    argv.push(format!("--worktree={worktree}"));
+    argv
+}
+
+/// The confirm menu's title and body for stopping/destroying `label` (bound
+/// to `worktree`).
+pub(crate) fn confirm_text(label: &str, worktree: &str, stop: bool) -> (String, String) {
+    let verb = if stop { "Stop" } else { "Destroy" };
+    let what = if stop {
+        "Stop parks the VM; `thegn env up` resumes it."
+    } else {
+        "Destroy pulls the VM's commits back first, then deletes the VM. \
+         If the pull-back fails it refuses and the VM stays."
+    };
+    (
+        format!("{verb} {label}?"),
+        format!(
+            "{what} Panes in that worktree end. Runs `thegn env down{}` for {worktree} in a new tab.",
+            if stop { " --stop" } else { "" }
+        ),
+    )
+}
+
+/// The status line once the `env down` tab is open.
+pub(crate) fn started_status(worktree: &str, stop: bool) -> String {
+    let verb = if stop { "stopping" } else { "destroying" };
+    format!("fleet: {verb} the VM for {worktree} in a new tab")
+}
+
+/// The keys of one listed VM: `s`/`d` when it is bound to a worktree, none for
+/// an orphan. The id is `provider/id`, the row identity a refresh keeps.
+fn row_acts(row: &fleet_cost::FleetRow) -> RowActs {
+    let label = format!("{}/{}", row.provider, row.id);
+    let keys = match &row.worktree {
+        Some(wt) => [('s', true), ('d', false)]
+            .into_iter()
+            .map(|(key, stop)| {
+                (
+                    key,
+                    DetailAction::FleetDown {
+                        worktree: wt.clone(),
+                        label: label.clone(),
+                        stop,
+                    },
+                )
+            })
+            .collect(),
+        None => Vec::new(),
+    };
+    RowActs {
+        id: label,
+        enter: None,
+        keys,
+    }
 }
 
 /// Whether the open overlay (if any) is this popup.
@@ -96,10 +182,12 @@ fn heading(label: impl Into<String>, note: Option<String>) -> Section {
     }
 }
 
-/// The section stack (pure; `now_ms` is injected for the age column).
-fn build_sections(snap: &FleetSnapshot, now_ms: i64) -> Vec<Section> {
+/// The section stack and its row cursor (pure; `now_ms` is injected for the
+/// age column).
+fn build_sections(snap: &FleetSnapshot, now_ms: i64) -> SectionsDetail {
     let (view, cost) = (&snap.view, &snap.cost);
     let mut secs = Vec::new();
+    let mut cursor = None;
     let age_note = crate::cmd::fleet::age(Some(snap.generated_ms), now_ms);
     secs.push(heading(
         "provider VMs",
@@ -115,7 +203,9 @@ fn build_sections(snap: &FleetSnapshot, now_ms: i64) -> Vec<Section> {
         secs.push(heading("No provider sandboxes listed.", None));
     } else {
         let mut rows = Vec::new();
+        let mut acts = Vec::new();
         for (index, row) in view.rows.iter().enumerate().take(MAX_ROWS) {
+            acts.push(row_acts(row));
             let priced = cost.per_row.get(index).filter(|c| c.id == row.id);
             let rate = priced
                 .and_then(|c| c.burn_usd_per_hour)
@@ -144,6 +234,10 @@ fn build_sections(snap: &FleetSnapshot, now_ms: i64) -> Vec<Section> {
                 text(crate::cmd::fleet::age(row.created_ms, now_ms), dim()),
             ]);
         }
+        cursor = Some(SectionsCursor {
+            table: secs.len(),
+            rows: acts,
+        });
         secs.push(Section::Table(TableSection {
             header: [
                 "provider/env",
@@ -236,15 +330,27 @@ fn build_sections(snap: &FleetSnapshot, now_ms: i64) -> Vec<Section> {
         None,
     ));
     secs.push(heading(
-        "stop: thegn env down --stop <worktree> · destroy: thegn env down <worktree>",
+        "↑↓ select · s stop · d destroy (pulls commits back first) · esc",
         None,
     ));
-    secs
+    if view.orphans > 0 {
+        secs.push(heading(
+            "orphan: not bound to a worktree; remove it with the provider's console",
+            None,
+        ));
+    }
+    SectionsDetail {
+        sections: secs,
+        cursor,
+    }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{Cell, MAX_ROWS, Section, Tok, build_sections};
+    use super::{
+        Cell, DetailAction, MAX_ROWS, Section, Tok, build_sections, confirm_text, fleet_down_argv,
+        fleet_down_tag, refresh_open, started_status, stop_for_tag,
+    };
     use crate::fleet_read::FleetSnapshot;
     use thegn_core::placement::fleet_cost::{
         self, FleetRow, FleetView, PartialEnv, PriceRow, RecordedSandbox,
@@ -354,7 +460,7 @@ mod tests {
                 reason: "unavailable: no token".into(),
             }],
         };
-        let secs = build_sections(&snap(view), NOW);
+        let secs = build_sections(&snap(view), NOW).sections;
         let lines = texts(&secs);
         assert_eq!(
             lines[0],
@@ -378,8 +484,11 @@ mod tests {
         assert!(
             lines
                 .iter()
-                .any(|l| l.contains("thegn env down --stop <worktree>"))
+                .any(|l| l == "↑↓ select · s stop · d destroy (pulls commits back first) · esc: ")
         );
+        assert!(lines.iter().any(|l| l.starts_with(
+            "orphan: not bound to a worktree; remove it with the provider's console"
+        )));
         assert_theme_tokens_only(&secs);
     }
 
@@ -394,7 +503,8 @@ mod tests {
                 ..FleetView::default()
             }),
             NOW,
-        );
+        )
+        .sections;
         let table = secs
             .iter()
             .find_map(|s| match s {
@@ -408,8 +518,147 @@ mod tests {
 
     #[test]
     fn an_empty_fleet_says_so() {
-        let lines = texts(&build_sections(&snap(FleetView::default()), NOW));
+        let detail = build_sections(&snap(FleetView::default()), NOW);
+        assert!(detail.cursor.is_none(), "no rows, no cursor");
+        let lines = texts(&detail.sections);
         assert!(lines.iter().any(|l| l == "No provider sandboxes listed.: "));
         assert!(lines.iter().any(|l| l == "burn=$0.0000/h"));
+        assert!(!lines.iter().any(|l| l.starts_with("orphan:")));
+    }
+
+    #[test]
+    fn a_bound_row_gets_stop_and_destroy_and_an_orphan_gets_none() {
+        let view = FleetView {
+            rows: vec![row("tg-a", Some("/wt/a")), row("tg-orphan", None)],
+            orphans: 1,
+            ..FleetView::default()
+        };
+        let detail = build_sections(&snap(view), NOW);
+        let cursor = detail.cursor.expect("rows table has a cursor");
+        assert!(
+            matches!(detail.sections[cursor.table], Section::Table(_)),
+            "the cursor points at the rows table"
+        );
+        assert_eq!(cursor.rows.len(), 2);
+        let bound = &cursor.rows[0];
+        assert_eq!(bound.id, "fly/tg-a");
+        assert_eq!(bound.enter, None);
+        assert_eq!(
+            bound.keys,
+            [
+                (
+                    's',
+                    DetailAction::FleetDown {
+                        worktree: "/wt/a".into(),
+                        label: "fly/tg-a".into(),
+                        stop: true,
+                    }
+                ),
+                (
+                    'd',
+                    DetailAction::FleetDown {
+                        worktree: "/wt/a".into(),
+                        label: "fly/tg-a".into(),
+                        stop: false,
+                    }
+                ),
+            ]
+        );
+        let orphan = &cursor.rows[1];
+        assert_eq!(orphan.id, "fly/tg-orphan");
+        assert!(orphan.keys.is_empty() && orphan.enter.is_none());
+    }
+
+    #[test]
+    fn confirm_tags_round_trip_to_the_env_down_argv() {
+        for stop in [true, false] {
+            let tag = fleet_down_tag(stop);
+            assert_eq!(stop_for_tag(tag), Some(stop));
+        }
+        assert_eq!(fleet_down_tag(true), "fleet-stop");
+        assert_eq!(fleet_down_tag(false), "fleet-destroy");
+        assert_eq!(stop_for_tag("git-op"), None);
+        assert_eq!(stop_for_tag(""), None);
+
+        let argv = |stop| fleet_down_argv("/bin/thegn", "/wt/a", stop);
+        assert_eq!(
+            argv(stop_for_tag("fleet-stop").unwrap()),
+            ["/bin/thegn", "env", "down", "--stop", "--worktree=/wt/a"]
+        );
+        assert_eq!(
+            argv(stop_for_tag("fleet-destroy").unwrap()),
+            ["/bin/thegn", "env", "down", "--worktree=/wt/a"]
+        );
+        // Never forced; a dash-leading worktree stays inside its flag.
+        for stop in [true, false] {
+            let a = fleet_down_argv("thegn", "-rf", stop);
+            assert!(!a.iter().any(|s| s == "--force"), "{a:?}");
+            assert_eq!(a.last().map(String::as_str), Some("--worktree=-rf"));
+        }
+    }
+
+    #[test]
+    fn confirm_text_names_the_vm_and_the_consequences() {
+        let (title, body) = confirm_text("fly/tg-a", "/wt/a", true);
+        assert_eq!(title, "Stop fly/tg-a?");
+        assert!(body.contains("`thegn env up` resumes it"), "{body}");
+        assert!(body.contains("Panes in that worktree end"), "{body}");
+        assert!(body.contains("env down --stop` for /wt/a"), "{body}");
+        let (title, body) = confirm_text("fly/tg-a", "/wt/a", false);
+        assert_eq!(title, "Destroy fly/tg-a?");
+        assert!(body.contains("pulls the VM's commits back first"), "{body}");
+        assert!(body.contains("If the pull-back fails it refuses"), "{body}");
+        assert!(!body.contains("--force"), "{body}");
+        assert!(started_status("/wt/a", false).contains("destroying"));
+    }
+
+    #[test]
+    fn cursor_identity_survives_refresh_open() {
+        use crate::chrome::FrameModel;
+        use crate::detail::{DetailOutcome, StatusCtx};
+        use crate::telemetry::TelemetryHistory;
+        use termwiz::input::{KeyCode, Modifiers};
+
+        let hist = TelemetryHistory::default();
+        let ctx = StatusCtx::new_for_test(&hist);
+        let three = FleetView {
+            rows: vec![
+                row("vm-a", Some("/wt/a")),
+                row("vm-b", Some("/wt/b")),
+                row("vm-c", Some("/wt/c")),
+            ],
+            ..FleetView::default()
+        };
+        let mut model = FrameModel {
+            fleet: Some(std::sync::Arc::new(snap(three))),
+            ..Default::default()
+        };
+        let mut slot = super::open(&model, &ctx, crate::detail::Placement::Center);
+        let ov = slot.as_mut().expect("popup");
+        ov.handle_key(&KeyCode::DownArrow, Modifiers::NONE);
+        ov.handle_key(&KeyCode::DownArrow, Modifiers::NONE);
+        assert_eq!(ov.sel, 2, "on vm-c");
+
+        // vm-a disappears: the cursor follows vm-c to its new index.
+        model.fleet = Some(std::sync::Arc::new(snap(FleetView {
+            rows: vec![row("vm-b", Some("/wt/b")), row("vm-c", Some("/wt/c"))],
+            ..FleetView::default()
+        })));
+        assert!(refresh_open(&mut slot, &model, &ctx));
+        let ov = slot.as_mut().expect("still open");
+        assert_eq!(ov.sel, 1);
+        assert!(matches!(
+            ov.handle_key(&KeyCode::Char('s'), Modifiers::NONE),
+            DetailOutcome::Act(DetailAction::FleetDown { ref worktree, stop: true, .. })
+                if worktree == "/wt/c"
+        ));
+
+        // vm-c disappears too: the cursor clamps onto the last row.
+        model.fleet = Some(std::sync::Arc::new(snap(FleetView {
+            rows: vec![row("vm-b", Some("/wt/b"))],
+            ..FleetView::default()
+        })));
+        assert!(refresh_open(&mut slot, &model, &ctx));
+        assert_eq!(slot.as_ref().map(|ov| ov.sel), Some(0));
     }
 }

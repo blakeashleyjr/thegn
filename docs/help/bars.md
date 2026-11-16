@@ -78,10 +78,19 @@ worktree's recorded VM is no longer listed by its provider. Clicking it opens
 the **fleet** popup: each VM's provider and env, id, state, size, `$/h`,
 accrued cost, worktree (or `ORPHAN`) and age, then the totals (per-provider
 hourly, today, month to date, and the next 24 h / 30 d at the current burn),
-any env that could not be read, and the CLI commands to stop
-(`thegn env down --stop <worktree>`) or destroy (`thegn env down <worktree>`)
-one. Every amount is an estimate, not a bill. The widget is read-only and
-inert by default: it costs nothing and draws nothing until an API-provider env
+and any env that could not be read. Every amount is an estimate, not a bill.
+
+In the popup, `↑`/`↓` (or `j`/`k`) select a VM. On a VM bound to a worktree,
+`s` stops it and `d` destroys it, each after a confirmation. Stop parks the VM
+(fly stop, machine0 suspend) and `thegn env up` resumes it. Destroy pulls the
+VM's commits back first, then deletes the VM; if the pull-back fails it
+refuses and the VM stays. Either way the panes in that worktree end. The
+confirmed action runs `thegn env down [--stop] --worktree=<worktree>` in a new
+tab, so its output stays visible, and it never passes `--force`. The popup
+shows the result at the next fleet read. An orphan VM (no worktree) takes no
+keys: remove it with the provider's console. `esc` closes the popup.
+
+The widget is inert by default: it costs nothing and draws nothing until an API-provider env
 exists and `fleet` is in a bar. Then it reads 15 seconds after launch and
 every 5 minutes while a VM runs or the popup is open, and every 30 minutes
 otherwise. Adding your first provider env takes effect at the next bars
