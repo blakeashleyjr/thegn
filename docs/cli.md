@@ -289,35 +289,37 @@ default `read`) gates a set of **state tools** that talk to a running pane
 daemon — default-deny: a tool neither appears in `tools/list` nor is callable
 until its scope is granted.
 
-| Tool                        | Scope         | What it does                                                           |
-| --------------------------- | ------------- | ---------------------------------------------------------------------- |
-| `sessions_list`             | `read`        | list the daemon's live sessions                                        |
-| `worktrees_list`            | `read`        | list registered worktrees (daemon, else DB cache)                      |
-| `worktrees_sandbox_profile` | `read`        | a worktree's pinned sandbox profile (null = inherit configured policy) |
-| `leases_list`               | `read`        | relay lease state per session                                          |
-| `me`                        | `read`        | the caller's pairing id, label, granted scopes                         |
-| `sessions_wait`             | `read`        | block until a session reaches a state (exited/idle/blocked/done/regex) |
-| `sessions_snapshot`         | `read`        | a live session's current emulator screen (`session`)                   |
-| `semantic_map`              | `read`        | ranked, budgeted repo map of a worktree's indexed entities             |
-| `semantic_blast_radius`     | `read`        | a worktree's blast-radius: changed entities, callers, untested, risk   |
-| `git_status`                | `read`        | list changed files in a worktree                                       |
-| `merge_list`                | `read`        | list the merge queue for a worktree's repository                       |
-| `pr_status`                 | `read`        | read cached pull-request status, one row per worktree                  |
-| `calendar_events`           | `read`        | merged calendar events in an inclusive ISO-date window                 |
-| `calendar_clocks`           | `read`        | resolved home and world clocks                                         |
-| `issues_list`               | `read`        | list tracker issues (status/limit/project/query, registered repo)      |
-| `issues_get`                | `read`        | one tracker issue with detail and comments                             |
-| `dispatches_list`           | `read`        | the agent-dispatch roster, newest first (limit/before paging)          |
-| `merge_add`                 | `git`         | enqueue a worktree's branch on the merge queue                         |
-| `notify_push`               | `write`       | push a tray notification (title, optional body/urgency/source)         |
-| `sessions_open`             | `write`       | open a session — raw `argv`, or a configured agent by name             |
-| `sessions_kill`             | `write`       | kill a session's process (idempotent)                                  |
-| `sessions_resize`           | `write`       | resize a live session's PTY (`session`, `rows`, `cols`)                |
-| `sessions_split`            | `write`       | split a session: sibling pane (`session`, `dir`, `argv`, `cwd`, `env`) |
-| `worktrees_open`            | `write`       | focus a workspace in the running instance (`repo`, optional `branch`)  |
-| `dispatches_put`            | `write`       | append a roster row (`issue_id`, `worktree_path`, `agent_name`, ...)   |
-| `dispatches_set_status`     | `write`       | set a roster row's status (`id`, `status`, optional `lead` proof)      |
-| `sessions_input`            | `write` **+** | send raw terminal input/control characters to a live session           |
+| Tool                        | Scope         | What it does                                                              |
+| --------------------------- | ------------- | ------------------------------------------------------------------------- |
+| `sessions_list`             | `read`        | list the daemon's live sessions                                           |
+| `worktrees_list`            | `read`        | list registered worktrees (daemon, else DB cache)                         |
+| `worktrees_sandbox_profile` | `read`        | a worktree's pinned sandbox profile (null = inherit configured policy)    |
+| `leases_list`               | `read`        | relay lease state per session                                             |
+| `me`                        | `read`        | the caller's pairing id, label, granted scopes                            |
+| `sessions_wait`             | `read`        | block until a session reaches a state (exited/idle/blocked/done/regex)    |
+| `sessions_snapshot`         | `read`        | a live session's current emulator screen (`session`)                      |
+| `semantic_map`              | `read`        | ranked, budgeted repo map of a worktree's indexed entities                |
+| `semantic_blast_radius`     | `read`        | a worktree's blast-radius: changed entities, callers, untested, risk      |
+| `git_status`                | `read`        | list changed files in a worktree                                          |
+| `merge_list`                | `read`        | list the merge queue for a worktree's repository                          |
+| `pr_status`                 | `read`        | read cached pull-request status, one row per worktree                     |
+| `calendar_events`           | `read`        | merged calendar events in an inclusive ISO-date window                    |
+| `calendar_clocks`           | `read`        | resolved home and world clocks                                            |
+| `issues_list`               | `read`        | list tracker issues (status/limit/project/query, registered repo)         |
+| `issues_get`                | `read`        | one tracker issue with detail and comments                                |
+| `dispatches_list`           | `read`        | the agent-dispatch roster, newest first (limit/before paging)             |
+| `merge_add`                 | `git`         | enqueue a worktree's branch on the merge queue                            |
+| `notify_push`               | `write`       | push a tray notification (title, optional body/urgency/source)            |
+| `sessions_open`             | `write`       | open a session — raw `argv`, or a configured agent by name                |
+| `sessions_kill`             | `write`       | kill a session's process (idempotent)                                     |
+| `sessions_resize`           | `write`       | resize a live session's PTY (`session`, `rows`, `cols`)                   |
+| `sessions_split`            | `write`       | split a session: sibling pane (`session`, `dir`, `argv`, `cwd`, `env`)    |
+| `worktrees_open`            | `write`       | focus a workspace in the running instance (`repo`, optional `branch`)     |
+| `dispatches_put`            | `write`       | append a roster row (`issue_id`, `worktree_path`, `agent_name`, ...)      |
+| `dispatches_set_status`     | `write`       | set a roster row's status (`id`, `status`, optional `lead` proof)         |
+| `issues_update`             | `write`       | patch an issue (`id`, optional `status`, `assignee`, `priority`, `title`) |
+| `issues_comment`            | `write`       | comment on an issue (`id`, `body` up to 64 KiB)                           |
+| `sessions_input`            | `write` **+** | send raw terminal input/control characters to a live session              |
 
 The two `semantic_*` read tools (default `--scopes read`) answer from the
 state DB + git listing directly — **no running daemon required** — and take a
@@ -342,9 +344,9 @@ verbatim.
 
 Every tool in `tools/list` carries MCP `annotations`: the docs tools and the
 `read`-scope state tools (including `sessions_snapshot`) are `readOnlyHint: true`; `sessions_kill`,
-`sessions_input`, `dispatches_set_status` and `tools_run` are `destructiveHint: true`; `folders_assign`,
+`sessions_input`, `dispatches_set_status`, `issues_update` and `tools_run` are `destructiveHint: true`; `folders_assign`,
 `editor_open`, `merge_add`, `notify_push`, `sessions_open`, `sessions_fork`,
-`sessions_resize`, `sessions_split`, `worktrees_open` and `dispatches_put` are write tools marked `destructiveHint: false`. A new write tool is marked destructive until it is
+`sessions_resize`, `sessions_split`, `worktrees_open`, `dispatches_put` and `issues_comment` are write tools marked `destructiveHint: false`. A new write tool is marked destructive until it is
 reviewed. The hints help clients ask before acting; the scopes above are what
 thegn enforces.
 
