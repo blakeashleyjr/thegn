@@ -11,6 +11,10 @@
 //! that never launches a harness, spends tokens, or reveals credential material.
 //! It answers locally without a running daemon — the same read-on-demand shape
 //! the MCP tool and the HTTP route serve.
+//!
+//! `run` spawns a headless agent into a worktree in one command and, with
+//! `--wait`, blocks until it exits and prints its output tail (THE-2005; the
+//! logic lives in [`super::agent_spawn`]).
 
 use anyhow::Result;
 use std::collections::HashSet;
@@ -38,6 +42,50 @@ pub enum Action {
         #[arg(long)]
         json: bool,
     },
+    /// Spawn a headless agent into a worktree in one command: the brief is
+    /// resolved, the session opens headless and bound to the worktree (the
+    /// worktree's own env/sandbox), and with `--wait` the command blocks
+    /// until the agent exits and prints the ANSI-stripped tail of its output
+    /// (last 200 non-blank lines). Exit 0 when the agent exits 0, 1 on any
+    /// other exit code, 2 on `--timeout` (the session is left running).
+    Run {
+        /// An `[[agents]]`/`[[tools]]` name, or a provider id (`claude`,
+        /// `codex`) when no entry is named that.
+        #[arg(long)]
+        agent: String,
+        /// The worktree to launch into (path). The agent runs here.
+        #[arg(long)]
+        worktree: String,
+        /// Read the task from this file (a template when `--var` is given).
+        #[arg(long, required_unless_present = "prompt", conflicts_with = "prompt")]
+        brief_file: Option<String>,
+        /// The task, inline.
+        #[arg(long)]
+        prompt: Option<String>,
+        /// Bind `KEY=VALUE` in `--brief-file` (repeatable).
+        #[arg(long, value_name = "KEY=VALUE", requires = "brief_file")]
+        var: Vec<String>,
+        /// Track the run in the dispatch roster under this issue id
+        /// (`linear:THE-2005`). Optional: ad-hoc runs have no issue.
+        #[arg(long, value_name = "ISSUE")]
+        track: Option<String>,
+        /// Block until the agent exits, then print its output tail.
+        #[arg(long)]
+        wait: bool,
+        /// Seconds `--wait` waits before giving up (exit 2; the session keeps
+        /// running).
+        #[arg(
+            long,
+            value_name = "SECS",
+            requires = "wait",
+            default_value_t = super::agent_spawn::DEFAULT_TIMEOUT_SECS
+        )]
+        timeout: u64,
+        /// Emit JSON: `{session, row}`, or with `--wait`
+        /// `{session, row, status, exit_code, output_tail, duration_ms}`.
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 pub fn run(cfg: &Config, action: Action) -> Result<()> {
@@ -48,6 +96,30 @@ pub fn run(cfg: &Config, action: Action) -> Result<()> {
             harness,
             json,
         } => sessions(cfg, worktree.as_deref(), harness.as_deref(), json),
+        Action::Run {
+            agent,
+            worktree,
+            brief_file,
+            prompt,
+            var,
+            track,
+            wait,
+            timeout,
+            json,
+        } => super::agent_spawn::run(
+            cfg,
+            super::agent_spawn::RunArgs {
+                agent,
+                worktree,
+                brief_file,
+                prompt,
+                vars: var,
+                track,
+                wait,
+                timeout_secs: timeout,
+                json,
+            },
+        ),
     }
 }
 
