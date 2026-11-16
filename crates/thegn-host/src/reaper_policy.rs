@@ -115,7 +115,8 @@ struct KeptNotice {
 
 trait KeptSink {
     fn toast(&mut self, message: &str);
-    fn record(&mut self, kind: &str, source_ref: &str, message: &str);
+    /// True when a new notice was recorded (its toast then went through notification routing).
+    fn record(&mut self, kind: &str, source_ref: &str, message: &str) -> bool;
 }
 
 struct LiveSink;
@@ -127,30 +128,36 @@ impl KeptSink for LiveSink {
         }
     }
 
-    fn record(&mut self, kind: &str, source_ref: &str, message: &str) {
+    fn record(&mut self, kind: &str, source_ref: &str, message: &str) -> bool {
         let db = match thegn_core::db::Db::open() {
             Ok(db) => db,
             Err(error) => {
                 tracing::debug!(target: "thegn::reaper", %error, "kept notice: db open failed");
-                return;
+                return false;
             }
         };
-        if let Err(error) = crate::automation_events::emit_once(
+        match crate::automation_events::emit_once(
             &db,
             thegn_core::notification::NotificationKind::ResourceAlert.as_str(),
             source_ref,
             message,
             "",
         ) {
-            tracing::debug!(target: "thegn::reaper", %error, kind, "kept notice: record failed");
+            Ok(inserted) => inserted,
+            Err(error) => {
+                tracing::debug!(target: "thegn::reaper", %error, kind, "kept notice: record failed");
+                false
+            }
         }
     }
 }
 
 fn deliver_notice(sink: &mut dyn KeptSink, kind: &str, notice: &KeptNotice) {
-    sink.toast(&notice.message);
     let source_ref = kept_source_ref(kind, &notice.names);
-    sink.record(kind, &source_ref, &notice.message);
+    if !sink.record(kind, &source_ref, &notice.message) {
+        // Not newly recorded (duplicate, no DB): routing raised no toast, so raise it directly.
+        sink.toast(&notice.message);
+    }
 }
 
 /// Stable (FNV-1a) identity of one kept set, independent of name order.
@@ -228,14 +235,16 @@ mod tests {
     struct FakeSink {
         toasts: usize,
         records: Vec<String>,
+        inserted: bool,
     }
 
     impl KeptSink for FakeSink {
         fn toast(&mut self, _message: &str) {
             self.toasts += 1;
         }
-        fn record(&mut self, _kind: &str, source_ref: &str, _message: &str) {
+        fn record(&mut self, _kind: &str, source_ref: &str, _message: &str) -> bool {
             self.records.push(source_ref.to_string());
+            self.inserted
         }
     }
 
@@ -284,6 +293,17 @@ mod tests {
         pass(&mut latch, &mut sink, &[]);
         assert_eq!(sink.records.len(), 2, "cleared set records nothing");
         assert_eq!(sink.toasts, 2);
+        let mut routed = FakeSink {
+            inserted: true,
+            ..FakeSink::default()
+        };
+        let mut fresh = std::collections::BTreeMap::new();
+        pass(&mut fresh, &mut routed, &["a"]);
+        assert_eq!(routed.records.len(), 1);
+        assert_eq!(
+            routed.toasts, 0,
+            "a newly recorded notice toasts through routing only"
+        );
     }
 
     #[test]
