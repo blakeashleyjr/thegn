@@ -789,7 +789,7 @@ impl TabView for DiskView<'_> {
                                 x: rect.x + 1,
                                 // Third body row: left of the mirrored plot, below the peaks label.
                                 y: rect.y + row * 3 + 3,
-                                cols: rect.cols.min(37).saturating_sub(1),
+                                cols: rect.cols.saturating_sub(2).min(36),
                                 rows: 1,
                             },
                             &read[..read_len],
