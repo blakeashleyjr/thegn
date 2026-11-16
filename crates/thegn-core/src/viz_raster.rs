@@ -816,7 +816,7 @@ pub fn scatter(points: &[(f32, f32)], table: &RasterTable, buf: &mut CellBuf) {
             let hy = (((1.0 - y) * (h * 2 - 1) as f32).round() as usize).min(h * 2 - 1);
             let col = ((x * (w - 1) as f32).round() as usize).min(w - 1);
             let row = hy / 2;
-            let upper = hy % 2 == 0;
+            let upper = hy.is_multiple_of(2);
             let prev = buf.get(col, row).map(|cell| cell.ch);
             let ch = match prev {
                 Some(c) if c == table.ramp8[7] => c,
