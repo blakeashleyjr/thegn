@@ -15,9 +15,9 @@ use std::collections::VecDeque;
 use std::ffi::{OsStr, OsString};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
-use std::process::{Command, ExitStatus, Stdio};
-use std::sync::mpsc;
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::process::{Command, ExitStatus};
+use std::sync::atomic::AtomicBool;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tempfile::{NamedTempFile, TempDir};
 use thegn_core::managed_tool::{Arch, ManagedTool, Os, Source};
 use thegn_core::{msg, util};
@@ -509,7 +509,6 @@ enum RunError {
         tail: String,
     },
     Wait(std::io::Error),
-    Read(std::io::Error),
     /// A process outside the owned group (it escaped via its own session)
     /// still holds an output pipe, so the reader could not reach EOF.
     PipeHeld {
@@ -517,6 +516,11 @@ enum RunError {
     },
     /// SIGINT/SIGTERM arrived (CLI): the group was stopped and reaped.
     Interrupted {
+        tail: String,
+    },
+    /// Members of the owned group outlived SIGKILL plus the settle bound
+    /// (uninterruptible sleep, or not observable): fail closed.
+    GroupSurvived {
         tail: String,
     },
 }
@@ -530,8 +534,11 @@ impl std::fmt::Display for RunError {
             }
             Self::Nonzero { status, tail } => write!(f, "exited with {status}{tail}"),
             Self::Wait(e) => write!(f, "wait/kill failed: {e}"),
-            Self::Read(e) => write!(f, "output reader failed: {e}"),
             Self::Interrupted { tail } => write!(f, "interrupted (process tree killed){tail}"),
+            Self::GroupSurvived { tail } => write!(
+                f,
+                "process-group members survived SIGKILL; the tree may still be running{tail}"
+            ),
             Self::PipeHeld { tail } => write!(
                 f,
                 "an escaped process kept the output pipe open; output truncated{tail}"
@@ -617,166 +624,179 @@ fn tail_text(out: &Capture, err: &Capture) -> String {
     }
 }
 
-type ReaderRx = mpsc::Receiver<std::io::Result<Capture>>;
+/// How a `thegn_proc` run ended, reduced to what decides the [`RunError`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum EndKind {
+    Spawn,
+    Supervise,
+    TimedOut,
+    Cancelled,
+    OutputLimit,
+    LeaderExited,
+}
 
-/// Read `pipe` to EOF on its own thread, retaining only a bounded head/tail.
-/// `tee` forwards the bytes live to this process's stderr for CLI presentation
-/// (never stdout, which carries machine data such as `--json`) — capture is
-/// identical either way, so output ownership never depends on the mode.
-fn spawn_reader(
-    name: &'static str,
-    mut pipe: impl Read + Send + 'static,
-    tee: bool,
-) -> std::io::Result<ReaderRx> {
-    let (tx, rx) = mpsc::sync_channel(1);
-    thegn_core::thread_name::try_spawn_named(name, move || {
-        crate::platform::qos::set_self(crate::platform::qos::Qos::Background);
-        let mut cap = Capture::default();
-        let mut buf = [0u8; 8192];
-        let result = loop {
-            match pipe.read(&mut buf) {
-                Ok(0) => break Ok(()),
-                Ok(n) => {
-                    cap.push(&buf[..n]);
-                    if tee {
-                        let _ = std::io::stderr().write_all(&buf[..n]); // best-effort: live echo; capture is authoritative
-                    }
-                }
-                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
-                Err(e) => break Err(e),
-            }
-        };
-        let _ = tx.send(result.map(|()| cap)); // best-effort: the receiver may have given up
-    })?;
-    Ok(rx)
+/// What became of the leader.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LeaderKind {
+    Succeeded,
+    Failed,
+    /// Reaping failed, or the leader was handed off unreaped.
+    Unreaped,
+}
+
+/// A failed run, before its payload (error, status, tail) is attached.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Failure {
+    Spawn,
+    /// The leader could not be observed (or an impossible output cap fired):
+    /// the group identity was not ours, so the outcome is unknown.
+    Unobserved,
+    TimedOut,
+    Interrupted,
+    GroupSurvived,
+    Unreaped,
+    PipeHeld,
+    Nonzero,
+}
+
+/// The outcome of one bounded run. `Ok(pipe_held)` on success. Precedence:
+/// spawn, observation, deadline, interrupt, survivors, reap, then the exit
+/// status — a pipe that never reached EOF turns a nonzero exit into
+/// [`Failure::PipeHeld`] and marks a clean exit `pipe_held`.
+fn verdict(end: EndKind, survivors: bool, leader: LeaderKind, eof: bool) -> Result<bool, Failure> {
+    match end {
+        EndKind::Spawn => return Err(Failure::Spawn),
+        EndKind::Supervise | EndKind::OutputLimit => return Err(Failure::Unobserved),
+        EndKind::TimedOut => return Err(Failure::TimedOut),
+        EndKind::Cancelled => return Err(Failure::Interrupted),
+        EndKind::LeaderExited => {}
+    }
+    if survivors {
+        return Err(Failure::GroupSurvived);
+    }
+    match (leader, eof) {
+        (LeaderKind::Unreaped, _) => Err(Failure::Unreaped),
+        (LeaderKind::Failed, false) => Err(Failure::PipeHeld),
+        (LeaderKind::Failed, true) => Err(Failure::Nonzero),
+        (LeaderKind::Succeeded, eof) => Ok(!eof),
+    }
+}
+
+fn end_kind(end: &thegn_proc::End) -> EndKind {
+    match end {
+        thegn_proc::End::Spawn(_) => EndKind::Spawn,
+        thegn_proc::End::Supervise(_) => EndKind::Supervise,
+        thegn_proc::End::TimedOut => EndKind::TimedOut,
+        thegn_proc::End::Cancelled => EndKind::Cancelled,
+        thegn_proc::End::OutputLimit(_) => EndKind::OutputLimit,
+        thegn_proc::End::LeaderExited => EndKind::LeaderExited,
+    }
+}
+
+fn leader_kind(leader: &thegn_proc::Leader) -> LeaderKind {
+    match leader {
+        thegn_proc::Leader::Reaped(status) if status.success() => LeaderKind::Succeeded,
+        thegn_proc::Leader::Reaped(_) => LeaderKind::Failed,
+        thegn_proc::Leader::ReapFailed(_)
+        | thegn_proc::Leader::Detached
+        | thegn_proc::Leader::NotSpawned => LeaderKind::Unreaped,
+    }
 }
 
 /// Run `cmd` to completion inside an owned process group / Job Object with one
-/// total deadline. Both pipes are drained to EOF (the child never blocks on a
-/// full pipe) while only a bounded head/tail is retained. The whole tree is
-/// killed on timeout, wait failure, and after the direct child exits (so a
-/// descendant holding a pipe cannot outlive the call). The direct child stays
-/// unreaped (`waitid(WNOWAIT)`) until the group is killed, so the group id
-/// cannot be reused under us. Every reader thread is joined before returning,
-/// except when a process that escaped the group still holds a pipe
-/// ([`RunError::PipeHeld`]).
-// Off-loop only (CLI / spawn_blocking): the terminal `wait` follows a group
-// SIGKILL, so it returns promptly.
-#[expect(clippy::disallowed_methods)]
+/// total deadline (`thegn_proc`). Both pipes are drained to EOF (the child
+/// never blocks on a full pipe) while only a bounded head/tail is retained;
+/// `tee` forwards the bytes live to this process's stderr for CLI presentation
+/// (never stdout, which carries machine data such as `--json`) — capture is
+/// identical either way. The whole tree is killed on timeout, interrupt, and
+/// right after the direct child exits (so a descendant holding a pipe cannot
+/// outlive the call). A process that escaped the group and still holds a pipe
+/// is cut off after `read_grace` ([`RunError::PipeHeld`], or
+/// [`Captured::pipe_held`] on a clean exit).
+// Off-loop only (CLI / spawn_blocking): `thegn_proc::run*` blocks.
 fn run_bounded(cmd: &mut Command, limits: Limits, tee: bool) -> Result<Captured, RunError> {
-    const POLL: Duration = Duration::from_millis(25);
-    cmd.stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
+    static NO_CANCEL: AtomicBool = AtomicBool::new(false);
     // CLI: the child lives in its own group, which the terminal's Ctrl-C no
     // longer reaches, so record SIGINT/SIGTERM and stop the group ourselves.
     let interrupt = tee.then(crate::platform::InterruptGuard::install);
-    let (mut child, group) = crate::platform::spawn_grouped(cmd).map_err(RunError::Spawn)?;
-    let deadline = Instant::now() + limits.timeout;
-    let out_pipe = child.stdout.take().expect("stdout was piped");
-    let err_pipe = child.stderr.take().expect("stderr was piped");
-    let readers = spawn_reader("thegn-setup-out", out_pipe, tee)
-        .and_then(|out| spawn_reader("thegn-setup-err", err_pipe, tee).map(|err| (out, err)));
-    let (out_rx, err_rx) = match readers {
-        Ok(pair) => pair,
-        Err(e) => {
-            // A reader that did start sees EOF once the group dies.
-            group.kill();
-            let _ = child.wait(); // best-effort: group was just killed; the spawn error is the outcome
-            return Err(RunError::Read(e));
-        }
-    };
+    let cancel = interrupt.as_ref().map_or(&NO_CANCEL, |g| g.flag());
+    run_bounded_with_cancel(cmd, limits, tee, cancel)
+}
 
-    let mut timed_out = false;
-    let mut interrupted = false;
-    let mut wait_err = None;
-    loop {
-        if interrupt.as_ref().is_some_and(|g| g.fired()) {
-            interrupted = true;
-            break;
-        }
-        match crate::platform::gate_child_exited(&mut child) {
-            Ok(true) => break,
-            Ok(false) => {}
-            Err(e) => {
-                wait_err = Some(e);
-                break;
-            }
-        }
-        if Instant::now() >= deadline {
-            timed_out = true;
-            break;
-        }
-        std::thread::sleep(POLL);
-    }
-    // If observing the leader failed (e.g. ECHILD) its pid may be reused, so
-    // the group identity is no longer ours: never signal it. Kill the direct
-    // child handle only.
-    let mut owned = wait_err.is_none();
-    if owned && (timed_out || interrupted) {
-        group.terminate();
-        let grace_end = Instant::now() + limits.term_grace;
-        loop {
-            match crate::platform::gate_child_exited(&mut child) {
-                Ok(true) => break,
-                Ok(false) if Instant::now() < grace_end => std::thread::sleep(POLL),
-                Ok(false) => break,
-                Err(e) => {
-                    wait_err = Some(e);
-                    owned = false;
-                    break;
-                }
-            }
-        }
-    }
-    if owned {
-        // The leader is still unreaped here, so the group identity is ours:
-        // kill every remaining member (compilers, package scripts, pipe holders).
-        group.kill();
-    } else {
-        let _ = child.kill(); // best-effort: group ownership uncertain; the leader may be gone
-    }
-    let status = child.wait();
-    drop(interrupt);
-
-    let join = |rx: ReaderRx| match rx.recv_timeout(limits.read_grace) {
-        Ok(Ok(cap)) => Ok(cap),
-        Ok(Err(e)) => Err(RunError::Read(e)),
-        Err(_) => Err(RunError::PipeHeld {
-            tail: String::new(),
-        }),
+/// [`run_bounded`] with an explicit cancel flag: setting it stops the group
+/// and yields [`RunError::Interrupted`].
+fn run_bounded_with_cancel(
+    cmd: &mut Command,
+    limits: Limits,
+    tee: bool,
+    cancel: &AtomicBool,
+) -> Result<Captured, RunError> {
+    let proc_limits = thegn_proc::Limits {
+        stdout: thegn_proc::Stream::Consume,
+        stderr: thegn_proc::Stream::Consume,
+        quiesce_after_leader: Some(Duration::ZERO),
+        term_grace: limits.term_grace,
+        kill_settle: Duration::from_secs(2),
+        reader_grace: limits.read_grace,
+        ..thegn_proc::Limits::silent(limits.timeout)
     };
-    let (out, err) = (join(out_rx), join(err_rx));
-    let (stdout, stderr, held) = match (out, err) {
-        (Ok(o), Ok(e)) => (o, e, false),
-        (Err(RunError::Read(e)), _) | (_, Err(RunError::Read(e))) => return Err(RunError::Read(e)),
-        (o, e) => (o.unwrap_or_default(), e.unwrap_or_default(), true),
+    let mut stdout = Capture::default();
+    let mut stderr = Capture::default();
+    let run = thegn_proc::run_consuming_streams(
+        cmd,
+        &proc_limits,
+        cancel,
+        &mut |which: thegn_proc::Which, bytes: &[u8]| {
+            match which {
+                thegn_proc::Which::Stdout => stdout.push(bytes),
+                thegn_proc::Which::Stderr => stderr.push(bytes),
+            }
+            if tee {
+                let _ = std::io::stderr().write_all(bytes); // best-effort: live echo; capture is authoritative
+            }
+        },
+    );
+    let outcome = verdict(
+        end_kind(&run.end),
+        run.group == thegn_proc::GroupState::Survivors,
+        leader_kind(&run.leader),
+        run.stdout.eof && run.stderr.eof,
+    );
+    let failure = match outcome {
+        Ok(pipe_held) => {
+            return Ok(Captured {
+                stdout,
+                stderr,
+                pipe_held,
+            });
+        }
+        Err(failure) => failure,
     };
+    let detail = run
+        .error()
+        .map_or_else(|| "bounded run failed".to_owned(), |e| e.to_string());
     let tail = tail_text(&stdout, &stderr);
-    if interrupted {
-        return Err(RunError::Interrupted { tail });
-    }
-    if timed_out {
-        return Err(RunError::Timeout {
+    Err(match failure {
+        Failure::Spawn | Failure::Unobserved => match run.end {
+            thegn_proc::End::Spawn(e) => RunError::Spawn(e),
+            thegn_proc::End::Supervise(e) => RunError::Wait(e),
+            _ => RunError::Wait(std::io::Error::other(detail)),
+        },
+        Failure::TimedOut => RunError::Timeout {
             secs: limits.timeout.as_secs(),
             tail,
-        });
-    }
-    if let Some(e) = wait_err {
-        return Err(RunError::Wait(e));
-    }
-    let status = status.map_err(RunError::Wait)?;
-    if !status.success() {
-        return Err(if held {
-            RunError::PipeHeld { tail }
-        } else {
-            RunError::Nonzero { status, tail }
-        });
-    }
-    Ok(Captured {
-        stdout,
-        stderr,
-        pipe_held: held,
+        },
+        Failure::Interrupted => RunError::Interrupted { tail },
+        Failure::GroupSurvived => RunError::GroupSurvived { tail },
+        Failure::Unreaped => match run.leader {
+            thegn_proc::Leader::ReapFailed(e) => RunError::Wait(e),
+            _ => RunError::Wait(std::io::Error::other(detail)),
+        },
+        Failure::PipeHeld => RunError::PipeHeld { tail },
+        Failure::Nonzero => match run.exit_status() {
+            Some(status) => RunError::Nonzero { status, tail },
+            None => RunError::Wait(std::io::Error::other(detail)),
+        },
     })
 }
 
@@ -1785,6 +1805,8 @@ mod tests {
     use super::*;
     use flate2::Compression;
     use std::net::TcpListener;
+    use std::sync::atomic::Ordering;
+    use std::time::Instant;
 
     fn tar_header(path: &str, size: usize, kind: u8) -> [u8; 512] {
         let mut header = [0_u8; 512];
@@ -2973,6 +2995,82 @@ mod tests {
             .err()
             .expect("spawn failure");
         assert!(matches!(e, RunError::Spawn(_)));
+    }
+
+    #[test]
+    fn interrupt_flag_cancels_setup() {
+        let cancel = AtomicBool::new(false);
+        let limits = Limits {
+            timeout: Duration::from_secs(60),
+            ..fast()
+        };
+        let t = Instant::now();
+        let result = std::thread::scope(|scope| {
+            scope.spawn(|| {
+                std::thread::sleep(Duration::from_millis(100));
+                cancel.store(true, Ordering::SeqCst);
+            });
+            run_bounded_with_cancel(&mut sh("echo started; sleep 60"), limits, false, &cancel)
+        });
+        assert!(
+            t.elapsed() < Duration::from_secs(5),
+            "cancel must stop the run"
+        );
+        let Err(RunError::Interrupted { .. }) = result else {
+            panic!("expected Interrupted");
+        };
+    }
+
+    #[test]
+    fn verdict_precedence_maps_every_end() {
+        use EndKind as E;
+        use LeaderKind as L;
+        // Spawn, observation, deadline and interrupt win over everything else.
+        assert_eq!(
+            verdict(E::Spawn, true, L::Unreaped, false),
+            Err(Failure::Spawn)
+        );
+        assert_eq!(
+            verdict(E::Supervise, false, L::Succeeded, true),
+            Err(Failure::Unobserved)
+        );
+        assert_eq!(
+            verdict(E::OutputLimit, false, L::Succeeded, true),
+            Err(Failure::Unobserved)
+        );
+        assert_eq!(
+            verdict(E::TimedOut, true, L::Failed, false),
+            Err(Failure::TimedOut)
+        );
+        assert_eq!(
+            verdict(E::Cancelled, true, L::Succeeded, true),
+            Err(Failure::Interrupted)
+        );
+        // Survivors fail closed even after a clean exit.
+        assert_eq!(
+            verdict(E::LeaderExited, true, L::Succeeded, true),
+            Err(Failure::GroupSurvived)
+        );
+        assert_eq!(
+            verdict(E::LeaderExited, false, L::Unreaped, true),
+            Err(Failure::Unreaped)
+        );
+        assert_eq!(
+            verdict(E::LeaderExited, false, L::Failed, false),
+            Err(Failure::PipeHeld)
+        );
+        assert_eq!(
+            verdict(E::LeaderExited, false, L::Failed, true),
+            Err(Failure::Nonzero)
+        );
+        assert_eq!(
+            verdict(E::LeaderExited, false, L::Succeeded, false),
+            Ok(true)
+        );
+        assert_eq!(
+            verdict(E::LeaderExited, false, L::Succeeded, true),
+            Ok(false)
+        );
     }
 
     #[test]

@@ -344,11 +344,17 @@ self: {
     notifications.agent_attention_inbox = cfg.notificationsAgentAttentionInbox;
     notifications.merge_queue_hold_desktop = cfg.notificationsMergeQueueHoldDesktop;
     notifications.dnd.enabled = cfg.notificationsDndEnabled;
+    notifications.dnd.allow_priority = cfg.notificationsDndAllowPriority;
+    notifications.dnd.windows = cfg.notificationsDndWindows;
+    notifications.desktop_min_urgency = cfg.notificationsDesktopMinUrgency;
+    notifications.process_exit = cfg.notificationsProcessExit;
     notifications.sound.mode = cfg.notificationsSoundMode;
     notifications.sound.always_kinds = cfg.notificationsSoundAlwaysKinds;
     notifications.sound.mute = cfg.notificationsSoundMute;
     notifications.sound.suppress_focused = cfg.notificationsSoundSuppressFocused;
     notifications.sound.volume = cfg.notificationsSoundVolume;
+    notifications.sound.min_priority = cfg.notificationsSoundMinPriority;
+    notifications.sound.per_kind = cfg.notificationsSoundPerKind;
     activity.enabled = cfg.activityEnabled;
     activity.red_requires_agent = cfg.activityRedRequiresAgent;
     activity.agent_programs = cfg.activityAgentPrograms;
@@ -418,6 +424,8 @@ self: {
     usage.poll_interval_secs = cfg.usagePollIntervalSecs;
     usage.warn_percent = cfg.usageWarnPercent;
     usage.crit_percent = cfg.usageCritPercent;
+    usage.providers = cfg.usageProviders;
+    usage.profile_roots = cfg.usageProfileRoots;
     lsp.enabled = cfg.lspEnabled;
     lsp.hover = cfg.lspHover;
     lsp.require_containment = cfg.lspRequireContainment;
@@ -1229,6 +1237,12 @@ in {
       description = "Enable do-not-disturb notification handling. Unset (null) = the binary's default.";
     };
 
+    notificationsDndAllowPriority = lib.mkOption {
+      type = lib.types.nullOr (lib.types.enum ["info" "notice" "alert"]);
+      default = null;
+      description = "Lowest notification priority that still gets through do-not-disturb. Unset (null) = the binary's default.";
+    };
+
     notificationsSoundMode = lib.mkOption {
       type = lib.types.nullOr (lib.types.enum ["off" "chime" "bell" "command"]);
       default = null;
@@ -1257,6 +1271,19 @@ in {
       type = lib.types.nullOr (lib.types.numbers.between 0 1);
       default = null;
       description = "Notification sound volume (0.0 through 1.0). Unset (null) = the binary's default.";
+    };
+
+    notificationsSoundMinPriority = lib.mkOption {
+      type = lib.types.nullOr (lib.types.enum ["info" "notice" "alert"]);
+      default = null;
+      description = "Lowest notification priority that plays a sound. Unset (null) = the binary's default.";
+    };
+
+    notificationsSoundPerKind = lib.mkOption {
+      type = lib.types.nullOr (lib.types.attrsOf lib.types.str);
+      default = null;
+      example = lib.literalExpression ''{ agent_blocked = "bell"; }'';
+      description = "Per-kind sound overrides. Keys are notification kind names, values are sound references; invalid entries are refused at load. Unset (null) = the binary's default.";
     };
 
     activityEnabled = lib.mkOption {
@@ -1620,6 +1647,41 @@ in {
       type = lib.types.nullOr (lib.types.ints.between 1 16777216);
       default = null;
       description = "Maximum response bytes retained by one preview fetch. Unset (null) = the binary's default.";
+    };
+
+    notificationsDndWindows = lib.mkOption {
+      type = lib.types.nullOr (lib.types.listOf lib.types.str);
+      default = null;
+      example = lib.literalExpression ''[ "22:00-07:00" "sat,sun 00:00-08:00" ]'';
+      description = "Do-not-disturb windows: \"HH:MM-HH:MM\" with optional leading weekdays (\"mon-fri 09:00-17:00\", \"sat,sun 00:00-08:00\"). Invalid entries are ignored with a load warning. Unset (null) = the binary's default.";
+    };
+
+    notificationsDesktopMinUrgency = lib.mkOption {
+      type = lib.types.nullOr lib.types.str;
+      default = null;
+      example = "critical";
+      description = "Minimum urgency for a desktop notification: low, normal or critical (case-insensitive). Unknown values fall back to normal with a load warning. Unset (null) = the binary's default.";
+    };
+
+    notificationsProcessExit = lib.mkOption {
+      type = lib.types.nullOr lib.types.str;
+      default = null;
+      example = "failures";
+      description = "How non-agent pane exits route into notifications: off, failures, failures_and_tasks or all (case-insensitive). Unknown values fall back to failures_and_tasks with a load warning. Unset (null) = the binary's default.";
+    };
+
+    usageProviders = lib.mkOption {
+      type = lib.types.nullOr (lib.types.listOf lib.types.str);
+      default = null;
+      example = lib.literalExpression ''[ "codex" "claude" "antigravity" ]'';
+      description = "Provider ids the usage tracker polls (codex, claude, antigravity). Unknown ids are ignored with a load warning. Unset (null) = the binary's default.";
+    };
+
+    usageProfileRoots = lib.mkOption {
+      type = lib.types.nullOr (lib.types.listOf lib.types.str);
+      default = null;
+      example = lib.literalExpression ''[ "/home/you/.claude-profiles" ]'';
+      description = "Directories scanned for extra AI-account profiles by the usage tracker. Unset (null) = the binary's default.";
     };
 
     usageEnabled = lib.mkOption {
