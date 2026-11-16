@@ -118,3 +118,46 @@ fn controlled_perf_workload() {
     }
     println!("{}", serde_json::to_string_pretty(&output).unwrap());
 }
+
+/// Per-chunk cost of `PreviewSupervisor::pane_output` for a spinner pane with
+/// a full diagnostic tail. Before windowed parsing every chunk re-parsed the
+/// whole 64 KiB tail (milliseconds); the windowed parse re-reads ~1 KiB
+/// (expected: tens of microseconds per chunk).
+#[test]
+#[ignore = "controlled performance investigation; machine-dependent, opt-in only"]
+#[allow(
+    clippy::disallowed_macros,
+    reason = "opt-in fixture emits measured artifact"
+)]
+fn preview_pane_output_spinner() {
+    const CHUNKS: usize = 1_000;
+    let mut sup = crate::preview::PreviewSupervisor::new();
+    sup.set_enabled(true);
+    let mut prefill = String::from("ready http://localhost:5173/\n");
+    let mut line = 0usize;
+    while prefill.len() < thegn_core::preview::MAX_PORT_HINT_CHARS {
+        prefill.push_str(&format!("[build] compiled module {line:05} in 3ms\n"));
+        line += 1;
+    }
+    sup.pane_output(1, "/bench", None, prefill.as_bytes(), Some(120));
+    let frames = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
+    let mut times = Vec::with_capacity(CHUNKS);
+    for second in 0..CHUNKS {
+        let mut chunk = format!("\r{} building… {second}s ", frames[second % frames.len()]);
+        while chunk.len() < 100 {
+            chunk.push('.');
+        }
+        let t = Instant::now();
+        std::hint::black_box(sup.pane_output(1, "/bench", None, chunk.as_bytes(), Some(120)));
+        times.push(t.elapsed().as_micros());
+    }
+    assert_eq!(sup.view("/bench").map(|view| view.port), Some(5173));
+    let output = serde_json::json!({
+        "workload": "preview_pane_output_spinner",
+        "chunks": CHUNKS, "chunk_bytes": 100,
+        "prefill_bytes": prefill.len(),
+        "median_us_per_chunk": median(times),
+        "scope": "PreviewSupervisor::pane_output only; excludes the PTY reader, emulator and render"
+    });
+    println!("{}", serde_json::to_string_pretty(&output).unwrap());
+}
