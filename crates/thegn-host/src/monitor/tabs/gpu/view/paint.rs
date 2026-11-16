@@ -387,8 +387,15 @@ impl GpuView<'_> {
                     cols: body.cols - 36,
                     rows: 1,
                 };
-                paint_sparkline_runs(
+                let pct = values[..len]
+                    .iter()
+                    .rev()
+                    .find(|value| value.is_finite())
+                    .map_or(0.0, |value| f64::from(*value) * 100.0);
+                crate::monitor::graphs::paint_minicore_row(
+                    "busy",
                     &values[..len],
+                    pct,
                     thegn_core::theme::RampId::Util,
                     graph_rect,
                     surface,

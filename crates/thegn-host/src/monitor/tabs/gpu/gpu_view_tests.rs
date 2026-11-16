@@ -877,3 +877,23 @@ fn activity_history_places_newest_sample_in_last_inner_column() {
         "newest activity sample was not right-aligned"
     );
 }
+
+#[test]
+fn multi_device_busy_row_paints_a_minicore_and_degrades_when_narrow() {
+    let mut model = GpuModel::default();
+    for tick in 0..24 {
+        model.absorb_frame(&two_device_fixture(tick));
+    }
+    for cols in [30_usize, 40, 60, 160] {
+        let rect = Rect::full(cols, 12);
+        let mut surface = Surface::new(cols, 12);
+        GpuView(&model).paint_busy_history(&mut surface, rect, rect);
+    }
+    let rect = Rect::full(160, 12);
+    let mut surface = Surface::new(160, 12);
+    GpuView(&model).paint_busy_history(&mut surface, rect, rect);
+    assert!(
+        surface.screen_chars_to_string().contains("busy"),
+        "busy minicore label painted"
+    );
+}
