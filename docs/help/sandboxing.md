@@ -608,6 +608,19 @@ mount. With `agent_sandbox` on, a queue agent whose sandbox cannot be
 established is held; it never falls back to the host. Interactive panes are
 unchanged.
 
+### Git write policy
+
+`[sandbox.git] mode` describes what a sandboxed pane may write in the
+repository's git directory: `read-only`, `commit-only` (the default: the
+object store, the worktree's own metadata and the lane branch's ref directory
+such as `refs/heads/tg/`, with `main`, tags, hooks and config kept
+read-only), `push-lane` or `full`. `push_refs` and `deny_refs` take ref globs
+with a trailing `/*` (one level) or `/**` (any depth), and the merge target
+branch is always denied. Set it globally or per `[env.<name>.sandbox.git]`; a
+repository's `.thegn.toml` cannot set it. The keys are validated today; the
+sandbox mounts that enforce them arrive in a later release, and git
+credential modes other than `none` are not implemented yet.
+
 ## Choosing per worktree
 
 The `Alt-w` "what to run" picker offers the sandbox choice when

@@ -4012,7 +4012,9 @@ pub enum FileAccess {
     None,
 }
 
-pub use crate::config_sandbox::SandboxLimits;
+pub use crate::config_sandbox::{
+    GitCredential, GitTransport, SandboxGitConfig, SandboxGitMode, SandboxGitOverlay, SandboxLimits,
+};
 
 // The `[sandbox.vpn]` config family lives in the `config_vpn` sibling module
 // (kept flat); re-exported so `crate::config::*` paths are unchanged.
@@ -4511,6 +4513,10 @@ pub struct SandboxConfig {
     /// reproduced in every sandbox/remote (CLI tools, dotfiles, bring-your-own
     /// setup) so a sandbox feels like local. See [`HomeConfig`].
     pub home: HomeConfig,
+    /// `[sandbox.git]` — what a sandboxed pane may write in the git common
+    /// dir (refs, objects, hooks) and how commits come back. Policy types and
+    /// the pure mount planner live in [`crate::config_sandbox::git_policy`].
+    pub git: SandboxGitConfig,
 }
 
 impl Default for SandboxConfig {
@@ -4586,6 +4592,7 @@ impl Default for SandboxConfig {
             network_audit: false,
             vpn: VpnConfig::default(),
             home: HomeConfig::default(),
+            git: SandboxGitConfig::default(),
         }
     }
 }
@@ -4899,6 +4906,9 @@ pub struct SandboxOverlay {
     /// Per-env personal layer (`[env.<name>.sandbox.home]`). Field-merged into the
     /// global `[sandbox.home]` (present keys win, absent inherit). See [`HomeOverlay`].
     pub home: Option<HomeOverlay>,
+    /// Per-env/profile `[env.<name>.sandbox.git]`: field-merged into the global
+    /// `[sandbox.git]` (present keys win). Forbidden from a repo overlay.
+    pub git: Option<SandboxGitOverlay>,
 }
 
 #[derive(Debug, Clone, Default, Deserialize, Serialize, schemars::JsonSchema)]

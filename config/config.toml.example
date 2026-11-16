@@ -3216,6 +3216,27 @@ on_floor_miss = "fail"
 # node-modules   = "/root/.npm"
 # pip-cache      = "/root/.cache/pip"
 
+# ── Git write policy ──────────────────────────────────────────────────────────
+# What a sandboxed pane may write in the repository's git common dir. Policy
+# only for now: the bwrap mount wiring lands separately, so these keys are
+# accepted and validated but do not yet change the sandbox's mounts.
+#   read-only   — the git dir and the worktree are read-only.
+#   commit-only — (default) the git dir is read-only except the object store,
+#                 the worktree's own admin dir and the lane branch's ref
+#                 directory (e.g. refs/heads/tg/). main, tags, hooks, config
+#                 and packed-refs stay read-only. Needs a namespaced branch.
+#   push-lane   — commit-only, plus pushes (through thegn) of push_refs.
+#   full        — push-lane bounded only by deny_refs, with a credential.
+# Per env/profile: [env.<name>.sandbox.git] overrides individual keys. A repo
+# `.thegn.toml` may not set [sandbox.git].
+# [sandbox.git]
+# mode       = "commit-only"   # read-only | commit-only | push-lane | full
+# transport  = "bundle"        # bundle | clone: how commits come back to the host
+# credential = "none"          # none (only none is implemented; deploy-key,
+#                              # repo-token, github-app, user-token are accepted)
+# push_refs  = ["refs/heads/tg/*"]                  # trailing /* = one level, /** = any depth
+# deny_refs  = ["refs/heads/main", "refs/tags/*"]   # the merge target is always denied too
+
 # ── Remote transport tuning ───────────────────────────────────────────────────
 # Hardening for EVERY control-plane ssh connection (host bring-up, remote git
 # reads, delivery, probes) against flaky links: keepalives detect a dead path
