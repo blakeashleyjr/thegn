@@ -3337,7 +3337,8 @@ impl Default for StatsConfig {
 /// an ordered widget-id list; unknown ids warn and are skipped. Built-ins:
 /// `brand` (thegn + version), `cpu`, `mem`, `gpu`, `temp` (CPU °C), `net`,
 /// `swap`, `freq` (CPU GHz), `load` (1-min load avg, unix), `uptime`, `disk`
-/// (free %), `battery`, `weather` (needs `[weather] enabled = true`), `date`,
+/// (free %), `battery`, `weather` (needs `[weather] enabled = true`), `fleet`
+/// (provider-VM burn estimate; needs an API-provider `[env.*]`), `date`,
 /// `clock` (top bar), `mq` (opt-in merge-queue summary) and `keyhints`
 /// (context-dependent keybinds), `pr` (forge + PR number/state), `status`
 /// (transient messages + the keybind-lock badge) for the bottom bar.
@@ -3372,6 +3373,10 @@ impl Default for BarsConfig {
                 // on a machine with no GPU. Don't "fix" this by removing it —
                 // it is what makes enabling `[weather]` a one-line change.
                 "weather".into(),
+                // Same arrangement: the provider-VM burn badge is INERT (no
+                // ticker slot, no columns) until an `[env.*]` names an API
+                // provider and a read lists something.
+                "fleet".into(),
                 "date".into(),
                 "clock".into(),
             ],

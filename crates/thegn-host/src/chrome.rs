@@ -709,6 +709,10 @@ pub struct FrameModel {
     /// `[weather]` mirrored into the model, so the widget and the popup row read
     /// thresholds/units without a config handle (the `usage_cfg` precedent).
     pub weather_cfg: thegn_core::config_weather::WeatherConfig,
+    /// Latest priced fleet read (the `fleet` widget and its popup). `None`
+    /// until the first read, and forever when the slot is not armed.
+    /// Loop-owned like `weather`: carried across model swaps.
+    pub fleet: Option<std::sync::Arc<crate::fleet_read::FleetSnapshot>>,
     /// Recent per-window history, keyed by `detail::history_key` — the Usage
     /// section's trend sparkline and the exhaustion forecast read it. Empty when
     /// `[usage] history_days = 0`.
@@ -1107,12 +1111,14 @@ pub(crate) fn cluster_width(parts: &[(String, usize)], kept: &[usize]) -> usize 
 ///
 /// `date` is the softest: the `clock` beside it carries the same information.
 /// `weather` is next — the user opted into it, so it outlives `uptime`/`load`/
-/// `freq`, but a datum that changes twice an hour is still not `cpu`.
+/// `freq`, but a datum that changes twice an hour is still not `cpu`. `fleet`
+/// follows: an estimate re-read every few minutes, with the popup one click
+/// away whenever there is room to show it.
 pub(crate) fn fit_stats_cluster(parts: &[(String, usize)], avail: usize) -> Vec<usize> {
     let mut kept: Vec<usize> = (0..parts.len()).collect();
     for victim in [
-        "date", "weather", "uptime", "load", "freq", "swap", "temp", "disk", "gpu", "battery",
-        "net", "clock", "mem", "cpu",
+        "date", "weather", "fleet", "uptime", "load", "freq", "swap", "temp", "disk", "gpu",
+        "battery", "net", "clock", "mem", "cpu",
     ] {
         if cluster_width(parts, &kept) <= avail {
             break;
@@ -1654,8 +1660,45 @@ pub(crate) fn masthead_widget(id: &str, model: &FrameModel) -> Option<MastheadWi
                 Freshness::Stale => Some(w(text, col(S::Ghost))),
             }
         }
+        // Provider VM burn (`$/h`, an estimate). Absent before the first
+        // read and on a fleet with nothing listed and nothing burning, so the
+        // default-listed id is inert on a machine without provider VMs.
+        "fleet" => model
+            .fleet
+            .as_deref()
+            .and_then(fleet_widget)
+            .map(|(text, warn)| {
+                let fg = if warn {
+                    level_color(Level::Warn)
+                } else {
+                    col(S::Dim)
+                };
+                w(text, fg)
+            }),
         _ => None,
     }
+}
+
+/// The `fleet` widget's text and whether it warrants the amber tone (an orphan
+/// VM, or a recorded VM the provider no longer lists). `None` hides it.
+pub(crate) fn fleet_widget(snap: &crate::fleet_read::FleetSnapshot) -> Option<(String, bool)> {
+    let (view, cost) = (&snap.view, &snap.cost);
+    let warn = view.orphans > 0 || !view.missing.is_empty();
+    if view.rows.is_empty() && cost.total_hourly <= 0.0 && !warn {
+        return None;
+    }
+    let mut text = if cost.total_hourly > 0.0 && cost.total_hourly < 0.01 {
+        "<$0.01/h".to_string()
+    } else {
+        format!("${:.2}/h", cost.total_hourly.max(0.0))
+    };
+    if cost.unpriced > 0 {
+        text.push_str(&format!(" +{}", cost.unpriced));
+    }
+    if warn {
+        text.push_str(&format!(" {}", crate::caps::active_glyphs().warn));
+    }
+    Some((text, warn))
 }
 
 /// `owner/repo` parsed from a forge PR/issue URL

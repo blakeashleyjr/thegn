@@ -68,8 +68,9 @@ keys, voice and LSP. Notification routing and push sinks, `[[plugins]]`
 and `[media]` apply live too. Refresh cadences also apply live: the clock
 and date formats, `ci.poll_interval_secs`, `pr_queue.enabled` and its poll
 interval, `git.auto_fetch` and its interval, `disk.scan_interval_secs`,
-`loc.enabled` and `loc.scan_interval_secs`. The status line lists them as
-"refresh cadences". Some keys are read afresh each time they are used,
+`loc.enabled`, `loc.scan_interval_secs` and `watch.pr_interval_secs` (the
+PR refresh cadence, floored at 5 seconds; the rest of `[watch]` still needs
+a restart). The status line lists them as "refresh cadences". Some keys are read afresh each time they are used,
 such as `[sandbox]`, `[env.*]`, `[project.*]`, the rest of `[git]` and the
 queues, so the next worktree, launch or queue run picks them up. A few are
 read only at launch, such as `[daemon]`, `[serve]`, `[mcp]` and `[network]`,
