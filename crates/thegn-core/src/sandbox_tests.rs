@@ -5996,7 +5996,6 @@ fn control_socket_systemd_makes_the_protected_dir_inaccessible() {
 #[path = "sandbox_evidence_tests.rs"]
 mod evidence;
 
-#[expect(clippy::disallowed_methods, reason = "initialize a local git fixture")]
 fn common_dir_mount_hosts(dir: &std::path::Path, init: bool) -> (Vec<String>, std::path::PathBuf) {
     if init {
         let ok = crate::util::git_cmd(dir)
