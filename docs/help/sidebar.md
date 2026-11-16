@@ -30,6 +30,16 @@ While the sidebar is hidden, the masthead shows a `◌ sidebar hidden` chip
 hidden sidebar is never invisible. Clicking it cycles the sidebar back, the same
 as `Ctrl-Alt-s`.
 
+The other two states say which one you are in, too. In the full tree the
+`WORKSPACES` header carries a **mode chip** left of the layout and sort words:
+`full·focus`, `full·always` or `full·never`, naming the full mode and where the
+row detail line shows (on the cursor row, on every row, or nowhere: the `i`
+toggle, else `[ui] sidebar_focus_detail`). It is the first thing on the header
+to give way in a narrow column: the word shrinks to the one-cell `▌` glyph
+(`[` under ASCII glyphs), then goes. The rail's top row shows the `▏` glyph
+(`|` under ASCII) above its entries. **Clicking** the chip or the rail glyph
+cycles the sidebar **full → rail → hidden**, exactly like `Ctrl-Alt-s`.
+
 ## Reading the tree
 
 The sidebar is tiered so a repo and its drawers never read the same. Each
@@ -121,6 +131,9 @@ gesture below has a keyboard equivalent.
   select); clicking the caret glyph folds or unfolds a header instead
 - **Double-click** moves keyboard focus into the pane (or folds a header)
 - **Ctrl-click** marks a row for bulk actions, like `Space`
+- **Click** a `… show N more` / `show fewer` row to expand or truncate its
+  group (see Long groups below); the header mode chip and
+  the rail's top glyph cycle the sidebar full → rail → hidden
 - **Right-click** opens that row's action menu, anchored under it; the menu
   then takes clicks and the wheel until you pick an entry or click away
 - **Wheel** scrolls the tree, walking the selection with it (and focuses
@@ -174,6 +187,40 @@ Three `[ui]` settings in [[config-reference]] shape it:
 
 To count a directory's worktrees as the project's own, list it under the
 project: `[project.<slug>] worktree_roots = ["~/agent-worktrees"]`.
+
+## Long groups: show more
+
+A group with many entries is cut to its first rows and closed by one
+highlighted toggle row at the group's indent:
+
+```
+  ▾ ▪ wip (20)
+      ├ feature-01
+      …
+      └ feature-15
+        … show 5 more
+```
+
+`↵`, `Space` or a click on that row expands the group, and the row then reads
+`show fewer`; the cursor stays on it either way. The choice is remembered per
+group across restarts. Groups are a project's own worktree rows, each folder,
+the Other group, the `Pipelines` folder and each pipeline lane.
+
+- Pinned rows and the worktree you are in are never hidden. They count toward
+  the limit, so a pinned or active row past it takes the place of the last
+  unpinned one.
+- While a `/` filter is active nothing is truncated: every match shows.
+- The toggle row cannot be pinned, marked, dragged or filed, and has no menu.
+
+Two `[ui]` settings in [[config-reference]] set the limit:
+
+- `sidebar_group_row_limit` — entries a group shows before the toggle
+  (default `15`); `0` turns truncation off.
+- `sidebar_group_row_limits` — per-group overrides keyed by the group's label
+  (a folder name, the Other label, a project name):
+  `sidebar_group_row_limits = { Other = 5, "agents wip" = 0 }`. `0` turns it
+  off for that group alone. Overrides match by group label across all
+  workspaces, so same-named folders in different workspaces share one.
 
 ## Pipeline lanes
 

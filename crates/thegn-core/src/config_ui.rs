@@ -376,6 +376,7 @@ pub struct UiConfig {
     pub sidebar_group_row_limit: usize,
     /// Per-group overrides of `sidebar_group_row_limit`, keyed by the folder
     /// or group label (`{ Other = 5 }`); `0` = no limit for that group.
+    /// Overrides match by group label across workspaces.
     pub sidebar_group_row_limits: std::collections::BTreeMap<String, usize>,
 }
 
