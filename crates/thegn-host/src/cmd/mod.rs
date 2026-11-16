@@ -222,6 +222,8 @@ mod resolve_worktree_tests {
 
     fn git_repo(dir: &Path) {
         std::fs::create_dir_all(dir).unwrap();
+        // Test fixture: a one-shot synchronous `git init`, no event loop.
+        #[expect(clippy::disallowed_methods)]
         let out = thegn_core::util::git_cmd(dir)
             .args(["-c", "commit.gpgsign=false", "init", "-q"])
             .output()
