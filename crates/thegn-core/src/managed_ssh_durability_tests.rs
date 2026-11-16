@@ -86,9 +86,10 @@ fn every_torn_prefix_of_every_custody_row_is_a_typed_error_on_both_read_paths() 
             let temp = tempfile::tempdir().unwrap();
             let dir = temp.path();
             crate::fsperm::restrict_dir_to_owner(dir).unwrap();
+            let private = crate::fsperm::open_private_dir(dir).unwrap();
             let path = dir.join(&name);
 
-            crate::fsperm::write_owner_only_atomic(&path, &bytes).unwrap();
+            private.write_owner_only_atomic(&name, &bytes).unwrap();
             let complete = read_at(dir, provider, account, instance)
                 .unwrap()
                 .expect("the complete row reads back");
@@ -104,7 +105,7 @@ fn every_torn_prefix_of_every_custody_row_is_a_typed_error_on_both_read_paths() 
 
             for len in 0..bytes.len() {
                 let torn = &bytes[..len];
-                crate::fsperm::write_owner_only_atomic(&path, torn).unwrap();
+                private.write_owner_only_atomic(&name, torn).unwrap();
                 let context = format!("{kind} {path_kind} row torn at {len}/{}", bytes.len());
 
                 let read = read_at(dir, provider, account, instance).expect_err(&context);
