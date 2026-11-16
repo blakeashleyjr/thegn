@@ -38,10 +38,11 @@ and the active app chip always keep their cells.
 
 The app-tab chips are buttons: the active app sits on the focus pill and the
 others on a faint pill. Clicking a chip switches to that app, exactly like its
-keyboard chord; an app that failed to load says why when you click it. When the
-sidebar is hidden, a `◌ sidebar hidden` chip leads the chips (just `◌` on a
-narrow terminal) so you can see where it went; clicking it cycles the sidebar
-like `Ctrl-Alt-s`. See [[sidebar]].
+`Alt-1`.. keyboard chord; an app that failed to load stays put and says why on
+the status line instead. When the sidebar is hidden, a `◌ sidebar hidden` chip
+leads the chips (just `◌` on a narrow terminal) so you can see where it went;
+clicking it cycles the sidebar like `Ctrl-Alt-s`, which brings back the full
+tree. See [[sidebar]].
 
 Activating the date or the clock opens the **calendar** — a month grid, the
 day's agenda, and your world clocks. `Alt-d` opens it from anywhere. See

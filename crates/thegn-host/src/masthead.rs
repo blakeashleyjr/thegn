@@ -35,22 +35,8 @@ pub(crate) struct MastheadLayout {
     pub right_spans: Vec<(BarItemId, usize, usize)>,
     /// `(app tab index, x offset, width)` for each placed app chip; the width
     /// covers the pill only, not its trailing gap space.
-    #[cfg_attr(
-        not(test),
-        allow(
-            dead_code,
-            reason = "read by the hit-test fns b139 lane 10 phase 2 wires"
-        )
-    )]
     pub chip_spans: Vec<(usize, usize, usize)>,
     /// `(x offset, width)` of the hidden-sidebar chip, when shown.
-    #[cfg_attr(
-        not(test),
-        allow(
-            dead_code,
-            reason = "read by the hit-test fns b139 lane 10 phase 2 wires"
-        )
-    )]
     pub sidebar_chip: Option<(usize, usize)>,
 }
 
@@ -334,7 +320,6 @@ pub fn masthead_item_spans(
 /// so paint and hit-test never disagree; a chip dropped for width has no span.
 /// The left cluster is left-aligned by `Line::split`, so offsets are relative
 /// to the masthead row's first cell.
-#[cfg_attr(not(test), expect(dead_code, reason = "wired by b139 lane 10 phase 2"))]
 pub(crate) fn masthead_chip_spans(
     model: &FrameModel,
     layout: &crate::layout::ChromeLayout,
@@ -362,7 +347,6 @@ pub(crate) fn masthead_chip_spans(
 
 /// The hidden-sidebar chip's absolute span, when the sidebar is `Hidden` and
 /// the masthead row is visible. Mirrors [`masthead_chip_spans`].
-#[cfg_attr(not(test), expect(dead_code, reason = "wired by b139 lane 10 phase 2"))]
 pub(crate) fn masthead_sidebar_chip_span(
     model: &FrameModel,
     layout: &crate::layout::ChromeLayout,
@@ -382,7 +366,6 @@ pub(crate) fn masthead_sidebar_chip_span(
 
 /// The app tab index whose chip span contains `(x, y)`, if any. Pure, so the
 /// click branch and tests share one hit rule.
-#[cfg_attr(not(test), expect(dead_code, reason = "wired by b139 lane 10 phase 2"))]
 pub(crate) fn chip_at(
     spans: &[(usize, crate::compositor::Rect)],
     x: usize,
