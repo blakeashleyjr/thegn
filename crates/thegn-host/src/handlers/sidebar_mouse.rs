@@ -215,6 +215,14 @@ pub(crate) fn on_left_press(
         if over(&chips.sort) {
             return PressOut::Outcome(SidebarOutcome::SortMenu);
         }
+        // The mode chip cycles the sidebar full → rail → hidden, exactly
+        // like the `ToggleSidebar` binding (the same synthesis as the
+        // EmptyHint's `NewTerminal` below).
+        if over(&chips.mode) {
+            return PressOut::Outcome(SidebarOutcome::Synthetic(
+                crate::keymap::Action::ToggleSidebar,
+            ));
+        }
         if over(&chips.layout) {
             return match sb.toggle_flat(model, session) {
                 SidebarOutcome::Redraw => PressOut::Consumed,
@@ -222,11 +230,28 @@ pub(crate) fn on_left_press(
             };
         }
     }
+    // The rail's row 0 is its mode glyph (`draw_sidebar_rail`); the rows
+    // start below it, so `row_at` never resolves it. A click there cycles the
+    // mode like the full sidebar's header chip.
+    if model.sidebar_rail && my == rect.y {
+        return PressOut::Outcome(SidebarOutcome::Synthetic(
+            crate::keymap::Action::ToggleSidebar,
+        ));
+    }
     let hits = hit_rows(model, rect);
     let Some(hit) = row_at(&hits, my).cloned() else {
         return PressOut::Consumed;
     };
     sb.cursor = hit.visible_index;
+
+    // The "show more" / "show fewer" row is a button: any click flips it
+    // (it carries no caret, mark, drag or activation of its own).
+    if hit.kind == RowKind::ShowMore {
+        return match sb.toggle_show_more(model, session) {
+            SidebarOutcome::Redraw => PressOut::Consumed,
+            out => PressOut::Outcome(out),
+        };
+    }
 
     // Caret cell: toggle collapse instead of activating (the affordance the
     // caret glyph promises). A header hit box may open with a separator-gap
@@ -2236,5 +2261,138 @@ mod tests {
             sb.view.collapsed.contains("lib"),
             "the caret cell on the header line toggles collapse"
         );
+    }
+
+    /// The header's mode chip cycles the sidebar mode: a click on any of its
+    /// painted cells synthesizes `ToggleSidebar` (full → rail → hidden), from
+    /// the same `header_chips` geometry the painter uses.
+    #[test]
+    fn clicking_the_header_mode_chip_toggles_the_sidebar() {
+        let (mut model, _) = fixture();
+        let rect = crate::compositor::Rect {
+            x: 0,
+            y: 0,
+            cols: 60,
+            rows: 20,
+        };
+        let mut sb = SidebarState::default();
+        let session = crate::session::Session::default();
+        let (label, mx, mcols) = crate::sidebar_view::header_chips(&model, rect)
+            .mode
+            .expect("the mode chip fits at 60 columns");
+        assert!(label.starts_with("full"), "{label:?}");
+        for x in [mx, mx + mcols - 1] {
+            let out = on_left_press(
+                &mut MouseUi::default(),
+                &mut sb,
+                &mut model,
+                &session,
+                rect,
+                x,
+                rect.y,
+                false,
+                Instant::now(),
+            );
+            assert!(
+                matches!(
+                    out,
+                    PressOut::Outcome(SidebarOutcome::Synthetic(
+                        crate::keymap::Action::ToggleSidebar
+                    ))
+                ),
+                "column {x} is on the mode chip"
+            );
+        }
+    }
+
+    /// The rail paints its mode glyph on row 0 and its rows one row lower; a
+    /// click on row 0 cycles the mode, and a click on row 1 still lands on the
+    /// first rail entry (the hit-test shifts with the paint).
+    #[test]
+    fn rail_row_zero_toggles_the_sidebar_and_row_one_hits_the_first_entry() {
+        let (mut model, _) = fixture();
+        model.sidebar_rail = true;
+        let rect = crate::compositor::Rect {
+            x: 0,
+            y: 0,
+            cols: crate::layout::RAIL_COLS,
+            rows: 20,
+        };
+        let mut sb = SidebarState::default();
+        let session = crate::session::Session::default();
+        let hits = hit_rows(&model, rect);
+        assert_eq!(hits[0].y, rect.y + 1, "rail rows start below the glyph");
+        assert_eq!(hits[0].visible_index, 0);
+
+        let out = on_left_press(
+            &mut MouseUi::default(),
+            &mut sb,
+            &mut model,
+            &session,
+            rect,
+            1,
+            rect.y,
+            false,
+            Instant::now(),
+        );
+        assert!(matches!(
+            out,
+            PressOut::Outcome(SidebarOutcome::Synthetic(
+                crate::keymap::Action::ToggleSidebar
+            ))
+        ));
+
+        sb.cursor = 3;
+        let out = on_left_press(
+            &mut MouseUi::default(),
+            &mut sb,
+            &mut model,
+            &session,
+            rect,
+            1,
+            rect.y + 1,
+            false,
+            Instant::now(),
+        );
+        assert!(!matches!(
+            out,
+            PressOut::Outcome(SidebarOutcome::Synthetic(
+                crate::keymap::Action::ToggleSidebar
+            ))
+        ));
+        assert_eq!(sb.cursor, 0, "row 1 is the first rail entry (app)");
+    }
+
+    /// A click on the "show more" row flips its group's expansion (and
+    /// persists it, so isolate `XDG_STATE_HOME`).
+    #[test]
+    fn clicking_show_more_toggles_its_group() {
+        let (mut model, rect) = fixture();
+        let _state = crate::testenv::IsolatedState::new();
+        model.sidebar_rows.insert(
+            4,
+            SidebarRow {
+                pin_key: crate::sidebar::show_more_key("app"),
+                collapsed: true,
+                child_count: 3,
+                ..SidebarRow::base(RowKind::ShowMore, 1, "", "app")
+            },
+        );
+        let y = y_of(&model, rect, &crate::sidebar::show_more_key("app"));
+        let mut sb = SidebarState::default();
+        let session = crate::session::Session::default();
+        let out = on_left_press(
+            &mut MouseUi::default(),
+            &mut sb,
+            &mut model,
+            &session,
+            rect,
+            8,
+            y,
+            false,
+            Instant::now(),
+        );
+        assert!(matches!(out, PressOut::Consumed));
+        assert!(sb.view.more_open.contains("app"));
     }
 }
