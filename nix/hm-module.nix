@@ -190,6 +190,156 @@ self: {
     };
   };
 
+  # Threshold pair shared by `stats.alerts.<metric>` and `usage.alerts.used`.
+  # Option names are the TOML keys, so the rendered attrset maps 1:1.
+  alertRuleSubmodule = lib.types.submodule {
+    options = {
+      warn = lib.mkOption {
+        type = lib.types.nullOr lib.types.number;
+        default = null;
+        description = "Warn threshold. 0 disables this level. Unset (null) = the binary's default.";
+      };
+      critical = lib.mkOption {
+        type = lib.types.nullOr lib.types.number;
+        default = null;
+        description = "Critical threshold. 0 disables this level. Unset (null) = the binary's default.";
+      };
+    };
+  };
+
+  # Whole-second counts inside the alert submodules (u32 in the Rust schema).
+  alertSecs = lib.types.nullOr lib.types.ints.u32;
+
+  statsAlertsSubmodule = lib.types.submodule {
+    options = {
+      enabled = lib.mkOption {
+        type = lib.types.nullOr lib.types.bool;
+        default = null;
+        description = "Master switch for these alerts. Unset (null) = the binary's default.";
+      };
+      toast = lib.mkOption {
+        type = lib.types.nullOr lib.types.bool;
+        default = null;
+        description = "Pop a transient in-app toast when an alert fires. Unset (null) = the binary's default.";
+      };
+      notify = lib.mkOption {
+        type = lib.types.nullOr lib.types.bool;
+        default = null;
+        description = "Also record alerts to the notification inbox. Unset (null) = the binary's default.";
+      };
+      sustain_secs = lib.mkOption {
+        type = alertSecs;
+        default = null;
+        description = "Seconds past a threshold before an alert fires. Unset (null) = the binary's default.";
+      };
+      repeat_secs = lib.mkOption {
+        type = alertSecs;
+        default = null;
+        description = "Minimum seconds between repeats of a standing alert. Unset (null) = the binary's default.";
+      };
+      clear_margin = lib.mkOption {
+        type = lib.types.nullOr lib.types.number;
+        default = null;
+        description = "Fractional retreat past the threshold required before an alert clears. Unset (null) = the binary's default.";
+      };
+      notify_clear = lib.mkOption {
+        type = lib.types.nullOr lib.types.bool;
+        default = null;
+        description = "Emit an event when an alert clears. Unset (null) = the binary's default.";
+      };
+      cpu = lib.mkOption {
+        type = lib.types.nullOr alertRuleSubmodule;
+        default = null;
+        description = "Warn/critical thresholds for cpu. Unset (null) = the binary's default.";
+      };
+      mem = lib.mkOption {
+        type = lib.types.nullOr alertRuleSubmodule;
+        default = null;
+        description = "Warn/critical thresholds for mem. Unset (null) = the binary's default.";
+      };
+      swap = lib.mkOption {
+        type = lib.types.nullOr alertRuleSubmodule;
+        default = null;
+        description = "Warn/critical thresholds for swap. Unset (null) = the binary's default.";
+      };
+      gpu = lib.mkOption {
+        type = lib.types.nullOr alertRuleSubmodule;
+        default = null;
+        description = "Warn/critical thresholds for gpu. Unset (null) = the binary's default.";
+      };
+      temp = lib.mkOption {
+        type = lib.types.nullOr alertRuleSubmodule;
+        default = null;
+        description = "Warn/critical thresholds for temp. Unset (null) = the binary's default.";
+      };
+      load = lib.mkOption {
+        type = lib.types.nullOr alertRuleSubmodule;
+        default = null;
+        description = "Warn/critical thresholds for load. Unset (null) = the binary's default.";
+      };
+      disk_free = lib.mkOption {
+        type = lib.types.nullOr alertRuleSubmodule;
+        default = null;
+        description = "Warn/critical thresholds for disk_free. Unset (null) = the binary's default.";
+      };
+      battery = lib.mkOption {
+        type = lib.types.nullOr alertRuleSubmodule;
+        default = null;
+        description = "Warn/critical thresholds for battery. Unset (null) = the binary's default.";
+      };
+      reclaim = lib.mkOption {
+        type = lib.types.nullOr alertRuleSubmodule;
+        default = null;
+        description = "Warn/critical thresholds for reclaim. Unset (null) = the binary's default.";
+      };
+      disk_eta = lib.mkOption {
+        type = lib.types.nullOr alertRuleSubmodule;
+        default = null;
+        description = "Warn/critical thresholds for disk_eta. Unset (null) = the binary's default.";
+      };
+    };
+  };
+
+  usageAlertsSubmodule = lib.types.submodule {
+    options = {
+      enabled = lib.mkOption {
+        type = lib.types.nullOr lib.types.bool;
+        default = null;
+        description = "Master switch for these alerts. Unset (null) = the binary's default.";
+      };
+      notify = lib.mkOption {
+        type = lib.types.nullOr lib.types.bool;
+        default = null;
+        description = "Also record alerts to the notification inbox. Unset (null) = the binary's default.";
+      };
+      sustain_secs = lib.mkOption {
+        type = alertSecs;
+        default = null;
+        description = "Seconds past a threshold before an alert fires. Unset (null) = the binary's default.";
+      };
+      repeat_secs = lib.mkOption {
+        type = alertSecs;
+        default = null;
+        description = "Minimum seconds between repeats of a standing alert. Unset (null) = the binary's default.";
+      };
+      clear_margin = lib.mkOption {
+        type = lib.types.nullOr lib.types.number;
+        default = null;
+        description = "Fractional retreat past the threshold required before an alert clears. Unset (null) = the binary's default.";
+      };
+      notify_clear = lib.mkOption {
+        type = lib.types.nullOr lib.types.bool;
+        default = null;
+        description = "Emit an event when an alert clears. Unset (null) = the binary's default.";
+      };
+      used = lib.mkOption {
+        type = lib.types.nullOr alertRuleSubmodule;
+        default = null;
+        description = "Warn/critical thresholds for used. Unset (null) = the binary's default.";
+      };
+    };
+  };
+
   tomlFormat = pkgs.formats.toml {};
 
   pruneNulls = lib.filterAttrsRecursive (_: v: v != null);
@@ -338,6 +488,55 @@ self: {
     stats.disk_free_warn = cfg.statsDiskFreeWarn;
     stats.disk_free_critical = cfg.statsDiskFreeCritical;
     stats.disk_path = cfg.statsDiskPath;
+    stats.alerts = {
+      enabled = cfg.statsAlerts.enabled or null;
+      toast = cfg.statsAlerts.toast or null;
+      notify = cfg.statsAlerts.notify or null;
+      sustain_secs = cfg.statsAlerts.sustain_secs or null;
+      repeat_secs = cfg.statsAlerts.repeat_secs or null;
+      clear_margin = cfg.statsAlerts.clear_margin or null;
+      notify_clear = cfg.statsAlerts.notify_clear or null;
+      cpu = {
+        warn = cfg.statsAlerts.cpu.warn or null;
+        critical = cfg.statsAlerts.cpu.critical or null;
+      };
+      mem = {
+        warn = cfg.statsAlerts.mem.warn or null;
+        critical = cfg.statsAlerts.mem.critical or null;
+      };
+      swap = {
+        warn = cfg.statsAlerts.swap.warn or null;
+        critical = cfg.statsAlerts.swap.critical or null;
+      };
+      gpu = {
+        warn = cfg.statsAlerts.gpu.warn or null;
+        critical = cfg.statsAlerts.gpu.critical or null;
+      };
+      temp = {
+        warn = cfg.statsAlerts.temp.warn or null;
+        critical = cfg.statsAlerts.temp.critical or null;
+      };
+      load = {
+        warn = cfg.statsAlerts.load.warn or null;
+        critical = cfg.statsAlerts.load.critical or null;
+      };
+      disk_free = {
+        warn = cfg.statsAlerts.disk_free.warn or null;
+        critical = cfg.statsAlerts.disk_free.critical or null;
+      };
+      battery = {
+        warn = cfg.statsAlerts.battery.warn or null;
+        critical = cfg.statsAlerts.battery.critical or null;
+      };
+      reclaim = {
+        warn = cfg.statsAlerts.reclaim.warn or null;
+        critical = cfg.statsAlerts.reclaim.critical or null;
+      };
+      disk_eta = {
+        warn = cfg.statsAlerts.disk_eta.warn or null;
+        critical = cfg.statsAlerts.disk_eta.critical or null;
+      };
+    };
     notifications.desktop = cfg.notificationsDesktop;
     notifications.surface_self_log_errors = cfg.notificationsSurfaceSelfLogErrors;
     notifications.github_mentions = cfg.notificationsGithubMentions;
@@ -355,6 +554,8 @@ self: {
     notifications.sound.volume = cfg.notificationsSoundVolume;
     notifications.sound.min_priority = cfg.notificationsSoundMinPriority;
     notifications.sound.per_kind = cfg.notificationsSoundPerKind;
+    notifications.sound.pack = cfg.notificationsSoundPack;
+    notifications.sound.chime_file = cfg.notificationsSoundChimeFile;
     activity.enabled = cfg.activityEnabled;
     activity.red_requires_agent = cfg.activityRedRequiresAgent;
     activity.agent_programs = cfg.activityAgentPrograms;
@@ -426,6 +627,18 @@ self: {
     usage.crit_percent = cfg.usageCritPercent;
     usage.providers = cfg.usageProviders;
     usage.profile_roots = cfg.usageProfileRoots;
+    usage.alerts = {
+      enabled = cfg.usageAlerts.enabled or null;
+      notify = cfg.usageAlerts.notify or null;
+      sustain_secs = cfg.usageAlerts.sustain_secs or null;
+      repeat_secs = cfg.usageAlerts.repeat_secs or null;
+      clear_margin = cfg.usageAlerts.clear_margin or null;
+      notify_clear = cfg.usageAlerts.notify_clear or null;
+      used = {
+        warn = cfg.usageAlerts.used.warn or null;
+        critical = cfg.usageAlerts.used.critical or null;
+      };
+    };
     lsp.enabled = cfg.lspEnabled;
     lsp.hover = cfg.lspHover;
     lsp.require_containment = cfg.lspRequireContainment;
@@ -1647,6 +1860,34 @@ in {
       type = lib.types.nullOr (lib.types.ints.between 1 16777216);
       default = null;
       description = "Maximum response bytes retained by one preview fetch. Unset (null) = the binary's default.";
+    };
+
+    statsAlerts = lib.mkOption {
+      type = lib.types.nullOr statsAlertsSubmodule;
+      default = null;
+      example = lib.literalExpression ''{ cpu = { warn = 85; critical = 95; }; sustain_secs = 30; }'';
+      description = "Resource threshold alerts ([stats.alerts]). Option names are the TOML keys; each metric takes a warn/critical pair where 0 disables that level. Inverted pairs are ignored with a load warning. Unset (null) = the binary's default.";
+    };
+
+    usageAlerts = lib.mkOption {
+      type = lib.types.nullOr usageAlertsSubmodule;
+      default = null;
+      example = lib.literalExpression ''{ used = { warn = 80; critical = 95; }; }'';
+      description = "Usage quota alerts ([usage.alerts]). Option names are the TOML keys. Unset (null) = the binary's default.";
+    };
+
+    notificationsSoundPack = lib.mkOption {
+      type = lib.types.nullOr lib.types.str;
+      default = null;
+      example = "~/.config/thegn/sounds";
+      description = "Sound pack directory: a file path as text; ~ is expanded by thegn. Kept as a string so Nix never copies it into the store. Unset (null) = the binary's default.";
+    };
+
+    notificationsSoundChimeFile = lib.mkOption {
+      type = lib.types.nullOr lib.types.str;
+      default = null;
+      example = "~/.config/thegn/chime.ogg";
+      description = "Chime sound file: a file path as text; ~ is expanded by thegn. Kept as a string so Nix never copies it into the store. Unset (null) = the binary's default.";
     };
 
     notificationsDndWindows = lib.mkOption {
