@@ -1659,9 +1659,12 @@ mod tests {
         // TLS-terminated, and tunnel-only control-plane deployments.
         // 101 → 102 (THE-2002): `[ui] sidebar_detail_when` (DetailWhen) —
         // whether the sidebar detail line needs sidebar focus.
+        // 102 → 103 (b139): `[ui] sidebar_external_worktrees`
+        // (ExternalWorktrees) — group/show/hide for worktrees thegn did not
+        // create.
         assert_eq!(
             defs.len(),
-            102,
+            103,
             "config_enum definitions in the Config schema changed; update the \
              pin (and the exclusion note) deliberately: {defs:?}"
         );

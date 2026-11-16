@@ -11,6 +11,7 @@
 use std::collections::HashSet;
 
 use crate::session::Session;
+use thegn_core::config_ui::ExternalWorktrees;
 use thegn_svc::git::{BranchMeta, DiffCount};
 
 /// Which level of the tree a row sits at.
@@ -55,6 +56,15 @@ pub enum RowKind {
     /// keyless row instead. A mirrored [`RowKind::Worktree`] would also make
     /// the board's "jump to this worktree" depend on emission order.
     PipelineWorktree,
+    /// A **derived** "Other (N)" group under a workspace holding its
+    /// *external* worktrees — git worktrees thegn did not create (see
+    /// [`is_external`]) — when `[ui] sidebar_external_worktrees = "group"`.
+    /// Keyed `other:{slug}`; collapsible (collapsed by default, per `[ui]
+    /// sidebar_other_group_collapsed`, remembered per project as
+    /// `other_open:{slug}`). Like [`RowKind::PipelineGroup`] it carries no
+    /// `folder_id` and no `tab_target`, and is not markable, pinnable,
+    /// fileable or draggable: there is no `folders` row behind it.
+    OtherGroup,
 }
 
 impl RowKind {
@@ -70,6 +80,7 @@ impl RowKind {
                 | RowKind::TerminalHost
                 | RowKind::PipelineGroup
                 | RowKind::PipelineLane
+                | RowKind::OtherGroup
         )
     }
 }
@@ -403,7 +414,10 @@ impl SidebarRow {
         !self.pin_key.is_empty()
             && !matches!(
                 self.kind,
-                RowKind::PipelineGroup | RowKind::PipelineLane | RowKind::PipelineWorktree
+                RowKind::PipelineGroup
+                    | RowKind::PipelineLane
+                    | RowKind::PipelineWorktree
+                    | RowKind::OtherGroup
             )
     }
 
@@ -416,7 +430,10 @@ impl SidebarRow {
     /// TerminalHost) keys on its `workspace_slug`. Meaningless for leaves.
     pub fn collapse_key(&self) -> &str {
         match self.kind {
-            RowKind::Folder | RowKind::PipelineGroup | RowKind::PipelineLane => &self.pin_key,
+            RowKind::Folder
+            | RowKind::PipelineGroup
+            | RowKind::PipelineLane
+            | RowKind::OtherGroup => &self.pin_key,
             _ => &self.workspace_slug,
         }
     }
@@ -551,6 +568,11 @@ pub struct ViewState {
     /// startup/reload like `workspace_sort`). Which right-cluster fields show,
     /// the focused-detail policy, and glyph overrides.
     pub display: crate::sidebar_view::SidebarDisplay,
+    /// Per-project expansion override of the derived "Other" group, keyed by
+    /// workspace slug: `true` = open, `false` = collapsed. Absent = follow
+    /// `[ui] sidebar_other_group_collapsed` (`display.other_group_collapsed`).
+    /// Persisted as `other_open:{slug}` (`"1"`/`"0"`) in `ui_state`.
+    pub other_open: std::collections::HashMap<String, bool>,
     /// Frozen sort keys, armed while the user is navigating the bar (see
     /// [`crate::sidebar_freeze`]). While `Some`, the computed sorts read this
     /// snapshot instead of the live [`SidebarStatus`] maps, so rows cannot move
@@ -600,6 +622,47 @@ pub struct DbWorktree {
     /// (degraded to the host / never provisioned) — renders the `«env»` badge as
     /// `«env ✗»`. Computed in `hydrate::db_worktree_list_with_snapshot`.
     pub env_degraded: bool,
+    /// A worktree thegn did not create (see [`is_external`]): placed per
+    /// `[ui] sidebar_external_worktrees`. Computed in
+    /// `hydrate::db_worktree_list_with_snapshot`.
+    pub external: bool,
+}
+
+/// The `ViewState::collapsed`-style key of a workspace's derived "Other"
+/// group (also its `pin_key`).
+pub fn other_group_key(slug: &str) -> String {
+    format!("other:{slug}")
+}
+
+/// Inputs to [`is_external`]: one registered worktree row and the
+/// workspace context it is classified against.
+pub struct ExternalCheck<'a> {
+    /// The workspace's repo root (its home checkout).
+    pub root: &'a std::path::Path,
+    /// The readable per-repo directory name thegn files checkouts under.
+    pub repo_dir_name: &'a str,
+    /// `[project.<slug>] worktree_roots`, already tilde-expanded.
+    pub roots: &'a [std::path::PathBuf],
+    pub cfg: &'a thegn_core::config::Config,
+}
+
+/// Whether a registered worktree at `path` (filed into `folder_id`) is
+/// **external**: outside thegn's own checkout layout
+/// ([`thegn_core::worktree::is_managed_checkout`]), outside every
+/// `worktree_roots` entry, not filed into a folder (a row the user filed is
+/// adopted), and not the repo's home checkout. Pure string/path-component
+/// comparison — no canonicalisation, no I/O — so hydration stays cheap.
+pub fn is_external(path: &str, folder_id: Option<i64>, ctx: &ExternalCheck<'_>) -> bool {
+    if path.is_empty() || folder_id.is_some() {
+        return false;
+    }
+    let path = std::path::Path::new(path);
+    if path == ctx.root
+        || thegn_core::worktree::is_managed_checkout(ctx.root, ctx.repo_dir_name, path, ctx.cfg)
+    {
+        return false;
+    }
+    !ctx.roots.iter().any(|r| path.starts_with(r))
 }
 
 /// Split a `{repo}/{branch}` group name into its parts.
@@ -619,12 +682,16 @@ pub fn active_reveal_keys(active_name: &str, db_worktrees: &[DbWorktree]) -> Vec
         return Vec::new();
     };
     let mut keys = vec![slug.clone()];
-    if let Some(fid) = db_worktrees
-        .iter()
-        .find(|w| w.tab_name == active_name)
-        .and_then(|w| w.folder_id)
-    {
+    let row = db_worktrees.iter().find(|w| w.tab_name == active_name);
+    if let Some(fid) = row.and_then(|w| w.folder_id) {
         keys.push(format!("{slug}/folder:{fid}"));
+    }
+    // An external worktree lives under the derived "Other" group, which
+    // `build_rows` already renders open while it holds the active row; the
+    // key is reported so callers that clear collapse state see the whole
+    // ancestry.
+    if row.is_some_and(|w| w.external) {
+        keys.push(other_group_key(&slug));
     }
     keys
 }
@@ -725,6 +792,9 @@ struct Group {
     /// the env badge. See [`DbWorktree::env_degraded`].
     env_degraded: bool,
     folder_id: Option<i64>,
+    /// A worktree thegn did not create ([`DbWorktree::external`]); placed per
+    /// `[ui] sidebar_external_worktrees`.
+    external: bool,
     /// What activating this group's row does: focus the live `(gi, tab)` for a
     /// loaded workspace, or switch to the workspace (landing on this group's
     /// `{slug}/{branch}` name) for a dormant one.
@@ -1003,6 +1073,17 @@ pub fn build_rows(
             worktree_row(gr, status, repo_slug, depth, pin_key, !collapsed, None)
         };
 
+        // External worktrees (`[ui] sidebar_external_worktrees`): `show` keeps
+        // them among the loose rows, `group` moves them under the derived
+        // "Other" row emitted after the folders, `hide` drops them. The active
+        // worktree is never hidden: under `hide` it stays inline.
+        let external_mode = view.display.external_worktrees;
+        let inline = |g: &Group| match external_mode {
+            ExternalWorktrees::Show => true,
+            ExternalWorktrees::Group => !g.external,
+            ExternalWorktrees::Hide => !g.external || g.active,
+        };
+
         // Folders section: home → loose → folders by `position`. Filed
         // worktrees render at depth 2 under their folder header, in the order
         // the user arranged them: this emission order defines the **sibling
@@ -1033,6 +1114,7 @@ pub fn build_rows(
         for gr in groups.iter().filter(|g| {
             g.folder_id
                 .is_none_or(|fid| !rendered_folder_ids.contains(&fid))
+                && inline(g)
         }) {
             let pin_key = format!("{repo_slug}/{}", gr.label);
             rows.push(mk_row(gr, 1, pin_key));
@@ -1106,6 +1188,10 @@ pub fn build_rows(
                 row.visible = !collapsed && !folder_collapsed;
                 rows.push(row);
             }
+        }
+
+        if external_mode == ExternalWorktrees::Group {
+            push_other_group(&mut rows, &groups, repo_slug, collapsed, view, &mk_row);
         }
 
         // The workspace's derived `Pipelines` folder (THE-74), at the tail
@@ -1307,6 +1393,51 @@ pub fn build_rows(
     rows
 }
 
+/// Emit a workspace's derived "Other (N)" group and its external worktree
+/// rows (in the workspace's sort order, at depth 2). Nothing when the
+/// workspace has no external worktree. Collapsed per the persisted override
+/// (`ViewState::other_open`), else `[ui] sidebar_other_group_collapsed` — but
+/// rendered open for this frame while it holds the active worktree, so the
+/// active row is never hidden. Children are always emitted (the folder
+/// precedent) so the filter can reveal one inside the collapsed group.
+fn push_other_group(
+    rows: &mut Vec<SidebarRow>,
+    groups: &[Group],
+    repo_slug: &str,
+    parent_collapsed: bool,
+    view: &ViewState,
+    mk_row: &dyn Fn(&Group, u8, String) -> SidebarRow,
+) {
+    let others: Vec<&Group> = groups.iter().filter(|g| g.external).collect();
+    if others.is_empty() {
+        return;
+    }
+    let holds_active = others.iter().any(|g| g.active);
+    let open = view
+        .other_open
+        .get(repo_slug)
+        .copied()
+        .unwrap_or(!view.display.other_group_collapsed);
+    let group_collapsed = !open && !holds_active;
+    rows.push(SidebarRow {
+        pin_key: other_group_key(repo_slug),
+        visible: !parent_collapsed,
+        collapsed: group_collapsed,
+        child_count: others.len(),
+        ..SidebarRow::base(
+            RowKind::OtherGroup,
+            1,
+            view.display.other_group_label.clone(),
+            repo_slug,
+        )
+    });
+    for gr in others {
+        let mut row = mk_row(gr, 2, format!("{repo_slug}/{}", gr.label));
+        row.visible = !parent_collapsed && !group_collapsed;
+        rows.push(row);
+    }
+}
+
 /// Emit one derived `Pipelines` group: the folder head, each lane folder
 /// named from the roster's issue id, and each lane's referenced worktrees as
 /// mirror leaves.
@@ -1456,6 +1587,7 @@ fn gather_groups(
             env_degraded: dbw.is_some_and(|w| w.env_degraded),
             activity: activity.get(&g.name).copied().unwrap_or_default(),
             folder_id: dbw.and_then(|w| w.folder_id),
+            external: dbw.is_some_and(|w| w.external),
             target: RowTarget::Tab(gi, g.active_tab),
             active: gi == session.active,
         });
@@ -1498,6 +1630,8 @@ fn gather_groups(
                 // workspace you switched away from keeps its activity dot.
                 activity: activity.get(home_tab.as_str()).copied().unwrap_or_default(),
                 folder_id: db_home.and_then(|w| w.folder_id),
+                // The home checkout is never external.
+                external: false,
                 target: RowTarget::Workspace {
                     repo_path: repo_path.to_string(),
                     group: Some(home_tab.clone()),
@@ -1533,6 +1667,7 @@ fn gather_groups(
                     .copied()
                     .unwrap_or_default(),
                 folder_id: w.folder_id,
+                external: w.external,
                 target: RowTarget::Workspace {
                     repo_path: repo_path.to_string(),
                     group: Some(w.tab_name.clone()),
@@ -1686,7 +1821,13 @@ fn build_rows_flat(
         if view.sort == SortMode::Manual {
             sort_groups(&mut gs, view.sort, keys);
         }
+        // `hide` drops external worktrees here too (the active one stays);
+        // `show` and `group` both list them, tagged with their repo as usual.
+        let hide = view.display.external_worktrees == ExternalWorktrees::Hide;
         for g in gs {
+            if hide && g.external && !g.active {
+                continue;
+            }
             pool.push((slug.clone(), display.clone(), g));
         }
     }
@@ -1907,7 +2048,9 @@ fn apply_filter(rows: &mut [SidebarRow], filter: &str) {
                 last_folder = None; // folders don't span workspaces
                 last_group = None;
             }
-            RowKind::Folder => {
+            // The derived "Other" group nests its rows at depth 2 exactly like
+            // a folder, so the filter surfaces and reveals it the same way.
+            RowKind::Folder | RowKind::OtherGroup => {
                 last_folder = Some(i);
                 // A folder that matches on its own label surfaces its parent
                 // workspace header, so it never floats orphaned at depth 1.
@@ -2001,7 +2144,7 @@ fn apply_filter(rows: &mut [SidebarRow], filter: &str) {
                 reveal_folder = false; // folders don't span workspaces
                 reveal_group = false;
             }
-            RowKind::Folder => {
+            RowKind::Folder | RowKind::OtherGroup => {
                 // A folder that matched on its own label reveals its children,
                 // and (like any surfaced folder) is itself surfaced above.
                 reveal_folder = self_match[i] || reveal_ws;
@@ -2566,6 +2709,7 @@ mod tests {
             env_name: Some("company-k8s".into()),
             sandbox_profile: None,
             env_degraded: false,
+            external: false,
         }];
         let rows = build_rows(
             &s,
@@ -2884,6 +3028,7 @@ mod tests {
             env_name: None,
             env_degraded: false,
             sandbox_profile: None,
+            external: false,
         }
     }
 
@@ -3569,6 +3714,7 @@ mod tests {
                 env_name: None,
                 sandbox_profile: None,
                 env_degraded: false,
+                external: false,
             },
             DbWorktree {
                 slug: "app".into(),
@@ -3581,6 +3727,7 @@ mod tests {
                 env_name: None,
                 sandbox_profile: None,
                 env_degraded: false,
+                external: false,
             },
         ];
         let rows = build_rows(
@@ -3841,6 +3988,7 @@ mod tests {
             env_name: None,
             sandbox_profile: None,
             env_degraded: false,
+            external: false,
         }];
         let folders = vec![thegn_core::models::FolderRow {
             folder_id: 1,
@@ -4021,6 +4169,7 @@ mod tests {
             env_name: None,
             env_degraded: false,
             sandbox_profile: None,
+            external: false,
         };
         let live = session(
             vec![
@@ -4088,6 +4237,7 @@ mod tests {
             env_name: None,
             sandbox_profile: None,
             env_degraded: false,
+            external: false,
         }];
         (ws, dbw, FOREIGN)
     }
@@ -4321,6 +4471,7 @@ mod tests {
             env_name: None,
             env_degraded: false,
             sandbox_profile: None,
+            external: false,
         };
         let dbw = vec![mk("zebra", "/wt/zebra"), mk("alpha", "/wt/alpha")];
         let view = ViewState {
@@ -4344,6 +4495,250 @@ mod tests {
         assert_eq!(labels, vec!["home", "alpha", "zebra"]);
     }
 
+    // --- external worktrees: the derived "Other" group ---------------------
+
+    /// A dormant `app` workspace with home + 2 internal + 4 external rows.
+    fn external_fixture() -> (WorkspaceFixtureRows, Vec<DbWorktree>) {
+        let ws = vec![(
+            "app".to_string(),
+            "app".to_string(),
+            "repo".to_string(),
+            "/repos/app".to_string(),
+        )];
+        let mut dbw = vec![db_row("app", "int-a"), db_row("app", "int-b")];
+        for b in ["ext-1", "ext-2", "ext-3", "ext-4"] {
+            dbw.push(DbWorktree {
+                external: true,
+                ..db_row("app", b)
+            });
+        }
+        (ws, dbw)
+    }
+
+    fn app_rows(rows: &[SidebarRow]) -> Vec<&SidebarRow> {
+        rows.iter().filter(|r| r.workspace_slug == "app").collect()
+    }
+
+    fn view_with(mode: ExternalWorktrees) -> ViewState {
+        let mut view = ViewState::default();
+        view.display.external_worktrees = mode;
+        view
+    }
+
+    #[test]
+    fn other_group_collapsed_shows_one_header_with_the_count() {
+        let (ws, dbw) = external_fixture();
+        let s = session(vec![], 0);
+        let view = view_with(ExternalWorktrees::Group);
+        let rows = build_rows(&s, &ws, &view, &no_activity(), &dbw, &[], &[]);
+        let app = app_rows(&rows);
+        let groups: Vec<&&SidebarRow> = app
+            .iter()
+            .filter(|r| r.kind == RowKind::OtherGroup)
+            .collect();
+        assert_eq!(groups.len(), 1);
+        let group = groups[0];
+        assert_eq!(group.label, "Other");
+        assert_eq!(group.child_count, 4);
+        assert_eq!(group.pin_key, "other:app");
+        assert_eq!(group.collapse_key(), "other:app");
+        assert!(group.collapsed, "collapsed by default");
+        assert!(group.visible);
+        assert!(!group.is_pinnable() && !group.is_markable());
+        assert!(RowKind::OtherGroup.is_collapsible());
+        // Visible: the workspace, 3 internal rows, the header — no external.
+        let visible: Vec<(&str, u8)> = app
+            .iter()
+            .filter(|r| r.visible)
+            .map(|r| (r.label.as_str(), r.depth))
+            .collect();
+        assert_eq!(
+            visible,
+            vec![
+                ("app", 0),
+                ("home", 1),
+                ("int-a", 1),
+                ("int-b", 1),
+                ("Other", 1)
+            ]
+        );
+        // The four external rows are still emitted (hidden) under the header,
+        // so the filter can find them.
+        let hidden: Vec<(&str, u8)> = app
+            .iter()
+            .filter(|r| !r.visible && r.kind == RowKind::Worktree)
+            .map(|r| (r.label.as_str(), r.depth))
+            .collect();
+        assert_eq!(
+            hidden,
+            vec![("ext-1", 2), ("ext-2", 2), ("ext-3", 2), ("ext-4", 2)]
+        );
+    }
+
+    #[test]
+    fn other_group_expanded_by_override_or_config() {
+        let (ws, dbw) = external_fixture();
+        let s = session(vec![], 0);
+        let mut view = view_with(ExternalWorktrees::Group);
+        view.other_open.insert("app".into(), true);
+        let rows = build_rows(&s, &ws, &view, &no_activity(), &dbw, &[], &[]);
+        let shown: Vec<&str> = app_rows(&rows)
+            .iter()
+            .filter(|r| r.visible && r.depth == 2)
+            .map(|r| r.label.as_str())
+            .collect();
+        assert_eq!(shown, vec!["ext-1", "ext-2", "ext-3", "ext-4"]);
+
+        // Config default open, no override: expanded too; an explicit
+        // collapse override wins over it.
+        let mut view = view_with(ExternalWorktrees::Group);
+        view.display.other_group_collapsed = false;
+        view.display.other_group_label = "Elsewhere".into();
+        let rows = build_rows(&s, &ws, &view, &no_activity(), &dbw, &[], &[]);
+        let group = rows.iter().find(|r| r.kind == RowKind::OtherGroup).unwrap();
+        assert!(!group.collapsed);
+        assert_eq!(group.label, "Elsewhere");
+        view.other_open.insert("app".into(), false);
+        let rows = build_rows(&s, &ws, &view, &no_activity(), &dbw, &[], &[]);
+        let group = rows.iter().find(|r| r.kind == RowKind::OtherGroup).unwrap();
+        assert!(group.collapsed);
+    }
+
+    #[test]
+    fn external_hide_and_show_modes() {
+        let (ws, dbw) = external_fixture();
+        let s = session(vec![], 0);
+        let worktrees = |mode| {
+            let rows = build_rows(&s, &ws, &view_with(mode), &no_activity(), &dbw, &[], &[]);
+            assert!(!rows.iter().any(|r| r.kind == RowKind::OtherGroup));
+            rows.iter()
+                .filter(|r| r.kind == RowKind::Worktree && r.workspace_slug == "app")
+                .map(|r| (r.label.clone(), r.depth))
+                .collect::<Vec<_>>()
+        };
+        let hide = worktrees(ExternalWorktrees::Hide);
+        assert_eq!(
+            hide,
+            vec![
+                ("home".to_string(), 1),
+                ("int-a".to_string(), 1),
+                ("int-b".to_string(), 1)
+            ]
+        );
+        let show = worktrees(ExternalWorktrees::Show);
+        assert_eq!(show.len(), 7);
+        assert!(show.iter().all(|(_, depth)| *depth == 1));
+    }
+
+    #[test]
+    fn active_external_row_reveals_its_group_and_survives_hide() {
+        let (ws, dbw) = external_fixture();
+        // ext-2 is live and active; the group is persisted closed.
+        let s = session(vec![tab("app/ext-2", "/wt/ext-2")], 0);
+        let mut view = view_with(ExternalWorktrees::Group);
+        view.other_open.insert("app".into(), false);
+        let rows = build_rows(&s, &ws, &view, &no_activity(), &dbw, &[], &[]);
+        let group = rows.iter().find(|r| r.kind == RowKind::OtherGroup).unwrap();
+        assert!(!group.collapsed, "the active row's group renders open");
+        assert_eq!(group.child_count, 4);
+        let active = rows.iter().find(|r| r.active).unwrap();
+        assert_eq!((active.label.as_str(), active.depth), ("ext-2", 2));
+        assert!(active.visible);
+        // The reveal keys name the group too.
+        assert!(active_reveal_keys("app/ext-2", &dbw).contains(&other_group_key("app")));
+
+        // `hide` never hides the active worktree: it stays, inline.
+        let rows = build_rows(
+            &s,
+            &ws,
+            &view_with(ExternalWorktrees::Hide),
+            &no_activity(),
+            &dbw,
+            &[],
+            &[],
+        );
+        let ext: Vec<(&str, u8)> = rows
+            .iter()
+            .filter(|r| r.label.starts_with("ext-"))
+            .map(|r| (r.label.as_str(), r.depth))
+            .collect();
+        assert_eq!(ext, vec![("ext-2", 1)]);
+    }
+
+    #[test]
+    fn flat_mode_hide_drops_external_rows() {
+        let (ws, dbw) = external_fixture();
+        let s = session(vec![], 0);
+        let count = |mode| {
+            let mut view = view_with(mode);
+            view.flat = true;
+            build_rows(&s, &ws, &view, &no_activity(), &dbw, &[], &[])
+                .iter()
+                .filter(|r| r.kind == RowKind::Worktree)
+                .count()
+        };
+        assert_eq!(count(ExternalWorktrees::Hide), 3);
+        assert_eq!(count(ExternalWorktrees::Group), 7);
+        assert_eq!(count(ExternalWorktrees::Show), 7);
+    }
+
+    #[test]
+    fn filter_surfaces_the_other_group_for_a_matching_external_row() {
+        let (ws, dbw) = external_fixture();
+        let s = session(vec![], 0);
+        let mut view = view_with(ExternalWorktrees::Group);
+        view.filter = "ext-3".into();
+        let rows = build_rows(&s, &ws, &view, &no_activity(), &dbw, &[], &[]);
+        let visible: Vec<&str> = rows
+            .iter()
+            .filter(|r| r.visible)
+            .map(|r| r.label.as_str())
+            .collect();
+        assert!(visible.contains(&"Other"), "{visible:?}");
+        assert!(visible.contains(&"ext-3"), "{visible:?}");
+        assert!(!visible.contains(&"ext-1"), "{visible:?}");
+    }
+
+    #[test]
+    fn is_external_table() {
+        let cfg = thegn_core::config::Config {
+            worktrees_dir: "/wt".into(),
+            worktree_mode: thegn_core::config::WorktreeMode::Global,
+            ..Default::default()
+        };
+        let roots = vec![std::path::PathBuf::from("/home/u/agents")];
+        let ctx = ExternalCheck {
+            root: std::path::Path::new("/src/app"),
+            repo_dir_name: "app",
+            roots: &roots,
+            cfg: &cfg,
+        };
+        let cases: [(&str, Option<i64>, bool); 9] = [
+            // thegn's own layout.
+            ("/wt/app/feat--abc", None, false),
+            // Under the repo root (in-repo `.worktrees`, or any nested dir).
+            ("/src/app/.worktrees/x", None, false),
+            // The home checkout itself.
+            ("/src/app", None, false),
+            // Under a `worktree_roots` entry.
+            ("/home/u/agents/p1/x", None, false),
+            // Filed into a folder: adopted.
+            ("/home/u/.other/x", Some(3), false),
+            // Another tool's worktrees.
+            ("/home/u/.other/x", None, true),
+            ("/wt/ms2-feature", None, true),
+            // Component-wise prefixes: `/home/u/agents` never claims
+            // `/home/u/agents2`, nor `/wt/app` claims `/wt/apple`.
+            ("/home/u/agents2/x", None, true),
+            ("/wt/apple/x", None, true),
+        ];
+        for (path, folder, want) in cases {
+            assert_eq!(is_external(path, folder, &ctx), want, "{path} {folder:?}");
+        }
+        // An empty path (a pathless row) is never classified external.
+        assert!(!is_external("", None, &ctx));
+    }
+
     #[test]
     fn active_reveal_keys_covers_workspace_and_folder() {
         let dbw = vec![DbWorktree {
@@ -4357,6 +4752,7 @@ mod tests {
             env_name: None,
             sandbox_profile: None,
             env_degraded: false,
+            external: false,
         }];
         // Filed worktree → both its workspace and its folder key.
         assert_eq!(
