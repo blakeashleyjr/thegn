@@ -219,7 +219,8 @@ Two `[ui]` settings in [[config-reference]] set the limit:
 - `sidebar_group_row_limits` — per-group overrides keyed by the group's label
   (a folder name, the Other label, a project name):
   `sidebar_group_row_limits = { Other = 5, "agents wip" = 0 }`. `0` turns it
-  off for that group alone.
+  off for that group alone. Overrides match by group label across all
+  workspaces, so same-named folders in different workspaces share one.
 
 ## Pipeline lanes
 
