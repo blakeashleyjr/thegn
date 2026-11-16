@@ -1707,6 +1707,9 @@ fn resolve_placed_with(
         .env_passthrough
         .iter()
         .filter(|k| firewall.admits(k))
+        // No GitHub token unless `[sandbox.git]` grants one (owner default:
+        // credentials stay with thegn).
+        .filter(|k| cfg.git.admits_env(k))
         .filter(|k| !(seal_agent && k.as_str() == "SSH_AUTH_SOCK"))
         .filter_map(|k| std::env::var(k).ok().map(|v| (k.clone(), v)))
         // A dead agent socket is worse than none: every in-sandbox ssh would

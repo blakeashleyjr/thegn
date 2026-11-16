@@ -1,7 +1,159 @@
-//! `[sandbox.limits]` config — CPU/memory ceilings for worktree panes.
+//! `[sandbox.limits]` config — CPU/memory ceilings for worktree panes — and
+//! `[sandbox.git]`, the git write policy for sandboxed panes.
 //!
 //! Extracted from the oversized `config.rs` (kept flat). Re-exported
 //! from `config` so the public path stays `crate::config::SandboxLimits`.
+
+pub mod git_policy;
+
+use crate::config::{config_enum, config_warn};
+
+config_enum! {
+    /// What a sandboxed pane may write in the git common dir. See
+    /// [`git_policy::plan_git_mounts`] for the exact mount plan of each mode.
+    pub enum SandboxGitMode : "sandbox git mode" {
+        ReadOnly   = "read-only" | "read_only" | "readonly",
+        CommitOnly = "commit-only" | "commit_only",
+        PushLane   = "push-lane" | "push_lane",
+        Full       = "full",
+    } default = CommitOnly;
+}
+
+config_enum! {
+    /// How sandbox commits travel back to the host repository.
+    pub enum GitTransport : "sandbox git transport" {
+        Bundle = "bundle",
+        Clone  = "clone",
+    } default = Bundle;
+}
+
+config_enum! {
+    /// Which git credential a `mode = "full"` sandbox receives. `none` (the
+    /// default) withholds the host GitHub token; `repo-token`/`user-token`
+    /// pass it through. The others parse so configs can be written ahead.
+    pub enum GitCredential : "sandbox git credential" {
+        None      = "none" | "off",
+        DeployKey = "deploy-key" | "deploy_key",
+        RepoToken = "repo-token" | "repo_token",
+        GithubApp = "github-app" | "github_app",
+        UserToken = "user-token" | "user_token",
+    } default = None;
+}
+
+fn default_push_refs() -> Vec<String> {
+    vec!["refs/heads/tg/*".to_string()]
+}
+
+fn default_deny_refs() -> Vec<String> {
+    vec!["refs/heads/main".to_string(), "refs/tags/*".to_string()]
+}
+
+/// `[sandbox.git]` — the git write policy for sandboxed panes.
+#[derive(
+    Debug, Clone, PartialEq, Eq, serde::Deserialize, serde::Serialize, schemars::JsonSchema,
+)]
+#[serde(default)]
+pub struct SandboxGitConfig {
+    /// `read-only`, `commit-only` (default), `push-lane` or `full`.
+    pub mode: SandboxGitMode,
+    /// `bundle` (default) or `clone`: how commits come back to the host.
+    pub transport: GitTransport,
+    /// Credential handed to a `full` sandbox. `none` (default) withholds
+    /// GH_TOKEN/GITHUB_TOKEN; `repo-token`/`user-token` pass them through.
+    pub credential: GitCredential,
+    /// Ref globs a `push-lane` sandbox may push (`refs/heads/tg/*`).
+    pub push_refs: Vec<String>,
+    /// Ref globs never accepted back from a sandbox. The merge target branch
+    /// is always denied in addition to this list.
+    pub deny_refs: Vec<String>,
+}
+
+impl Default for SandboxGitConfig {
+    fn default() -> Self {
+        SandboxGitConfig {
+            mode: SandboxGitMode::default(),
+            transport: GitTransport::default(),
+            credential: GitCredential::default(),
+            push_refs: default_push_refs(),
+            deny_refs: default_deny_refs(),
+        }
+    }
+}
+
+/// All-Option mirror of [`SandboxGitConfig`] for `[env.<n>.sandbox.git]` and
+/// `[profiles.<n>.sandbox.git]`. Present keys win; absent keys inherit.
+#[derive(
+    Debug, Clone, Default, PartialEq, Eq, serde::Deserialize, serde::Serialize, schemars::JsonSchema,
+)]
+#[serde(default)]
+pub struct SandboxGitOverlay {
+    pub mode: Option<SandboxGitMode>,
+    pub transport: Option<GitTransport>,
+    pub credential: Option<GitCredential>,
+    pub push_refs: Option<Vec<String>>,
+    pub deny_refs: Option<Vec<String>>,
+}
+
+impl SandboxGitOverlay {
+    /// True when no key is set (the overlay changes nothing).
+    pub fn is_empty(&self) -> bool {
+        self.mode.is_none()
+            && self.transport.is_none()
+            && self.credential.is_none()
+            && self.push_refs.is_none()
+            && self.deny_refs.is_none()
+    }
+}
+
+/// Host env vars carrying a forge (GitHub / GitLab) token. Withheld from
+/// sandboxes and provider provisioning unless
+/// [`SandboxGitConfig::admits_git_token`]. A token stored in a `gh`/`glab`
+/// config that arrives via `[sandbox.home]` dotfiles is not filtered.
+pub const GIT_TOKEN_ENV: &[&str] = &[
+    "GH_TOKEN",
+    "GITHUB_TOKEN",
+    "GH_ENTERPRISE_TOKEN",
+    "GITHUB_ENTERPRISE_TOKEN",
+    "GITLAB_TOKEN",
+    "GL_TOKEN",
+];
+
+impl SandboxGitConfig {
+    /// Does this policy hand the host GitHub token to the sandbox? Only
+    /// `mode = "full"` with `credential = "repo-token" | "user-token"`; the
+    /// default (`credential = "none"`) keeps credentials with thegn.
+    pub fn admits_git_token(&self) -> bool {
+        self.mode == SandboxGitMode::Full
+            && matches!(
+                self.credential,
+                GitCredential::RepoToken | GitCredential::UserToken
+            )
+    }
+
+    /// May the env var `key` be passed into a sandbox under this policy?
+    /// False only for a [`GIT_TOKEN_ENV`] name when the token is withheld.
+    pub fn admits_env(&self, key: &str) -> bool {
+        self.admits_git_token() || !GIT_TOKEN_ENV.contains(&key)
+    }
+
+    /// `self` with every key present in `overlay` replaced (lists replace
+    /// wholesale, they do not append).
+    pub fn merged(&self, overlay: &SandboxGitOverlay) -> SandboxGitConfig {
+        SandboxGitConfig {
+            mode: overlay.mode.unwrap_or(self.mode),
+            transport: overlay.transport.unwrap_or(self.transport),
+            credential: overlay.credential.unwrap_or(self.credential),
+            push_refs: overlay
+                .push_refs
+                .clone()
+                .unwrap_or_else(|| self.push_refs.clone()),
+            deny_refs: overlay
+                .deny_refs
+                .clone()
+                .unwrap_or_else(|| self.deny_refs.clone()),
+        }
+    }
+}
 
 /// Per-pane and aggregate resource ceilings. All optional strings so junk config
 /// degrades to "no cap" rather than a hard error; the values are handed to the
@@ -162,6 +314,9 @@ impl SandboxOverlay {
         if let Some(h) = self.home {
             h.apply(&mut base.home);
         }
+        if let Some(g) = self.git {
+            base.git = base.git.merged(&g);
+        }
     }
 
     pub(crate) fn is_empty(&self) -> bool {
@@ -206,5 +361,6 @@ impl SandboxOverlay {
             && self.network_audit.is_none()
             && self.vpn.is_none()
             && self.home.as_ref().is_none_or(|h| h.is_empty())
+            && self.git.as_ref().is_none_or(SandboxGitOverlay::is_empty)
     }
 }
