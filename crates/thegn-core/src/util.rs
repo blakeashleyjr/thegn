@@ -1765,6 +1765,16 @@ pub fn git_out_raw(dir: &Path, args: &[&str]) -> Result<Vec<u8>, crate::git_run:
     }
 }
 
+/// `git -C <dir> <args...>` on the bounded read policy: trimmed stdout
+/// (lossy UTF-8, like [`git_out_allow_empty`]) on success, empty included;
+/// the typed [`GitOutcome`](crate::git_run::GitOutcome) on every failure, so a
+/// caller can tell "git said no" (`Exit`) from "git could not answer"
+/// (`Timeout`, `Spawn`, ...).
+pub fn git_out_result(dir: &Path, args: &[&str]) -> Result<String, crate::git_run::GitOutcome> {
+    let bytes = git_out_raw(dir, args)?;
+    Ok(String::from_utf8_lossy(&bytes).trim().to_string())
+}
+
 /// Why [`git_out_path`] could not produce a path.
 #[derive(Debug)]
 pub enum GitPathError {
@@ -3335,6 +3345,65 @@ mod tests {
             git_out_path(dir.path(), &["status", "--porcelain"]),
             Err(GitPathError::Empty)
         ));
+    }
+
+    #[test]
+    fn git_out_result_returns_trimmed_text_and_empty() {
+        let dir = bounded_git_fixture();
+        assert!(
+            git_cmd(dir.path())
+                .args(["-c", "commit.gpgsign=false", "-c", "user.name=t"])
+                .args(["-c", "user.email=t@example.invalid"])
+                .args(["commit", "-q", "--allow-empty", "-m", "init"])
+                .status()
+                .unwrap()
+                .success()
+        );
+        let head = git_out_result(dir.path(), &["rev-parse", "HEAD"]).unwrap();
+        assert_eq!(head.len(), 40, "{head:?}");
+        assert!(head.chars().all(|c| c.is_ascii_hexdigit()), "{head:?}");
+        assert_eq!(
+            git_out_result(dir.path(), &["diff", "--name-only"]).unwrap(),
+            ""
+        );
+    }
+
+    #[test]
+    fn git_out_result_types_a_missing_ref_as_exit_1() {
+        use crate::git_run::GitOutcome;
+        let dir = bounded_git_fixture();
+        let read = git_out_result(
+            dir.path(),
+            &["rev-parse", "--verify", "--quiet", "refs/heads/nope"],
+        );
+        assert!(
+            matches!(read, Err(GitOutcome::Exit { code: Some(1), .. })),
+            "{read:?}"
+        );
+    }
+
+    #[test]
+    fn git_out_result_types_a_missing_dir_as_failure() {
+        let parent = tempfile::tempdir().unwrap();
+        let missing = parent.path().join("does-not-exist");
+        let err = git_out_result(&missing, &["rev-parse", "HEAD"]).unwrap_err();
+        assert!(!err.is_success(), "{err:?}");
+    }
+
+    #[test]
+    fn git_text_error_is_a_std_error() {
+        use crate::git_run::{GitOutcome, GitTextError};
+        fn takes(_: &dyn std::error::Error) {}
+        takes(&GitTextError::InvalidUtf8);
+        takes(&GitOutcome::Timeout);
+        assert_eq!(
+            anyhow::Error::from(GitTextError::InvalidUtf8).to_string(),
+            GitTextError::InvalidUtf8.to_string()
+        );
+        assert_eq!(
+            anyhow::Error::from(GitOutcome::Timeout).to_string(),
+            GitOutcome::Timeout.to_string()
+        );
     }
 
     #[test]
