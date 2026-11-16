@@ -296,6 +296,7 @@ crates/thegn-host/src/preview_gfx.rs
 crates/thegn-host/src/preview_pane.rs
 crates/thegn-host/src/probe.rs
 crates/thegn-host/src/profile.rs
+crates/thegn-host/src/provider_git.rs
 crates/thegn-host/src/provider_workdir.rs
 crates/thegn-host/src/provision_gate.rs
 crates/thegn-host/src/pty_drain.rs
