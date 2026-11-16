@@ -1778,7 +1778,7 @@ fn widget_detail_inner(
                 mx * 100.0
             );
             // The history graph, then who is using it (heaviest CPU first).
-            let mut secs = vec![Section::Graph(GraphSection {
+            let secs = vec![Section::Graph(GraphSection {
                 label: "CPU".into(),
                 cur,
                 footer: Some(footer),
