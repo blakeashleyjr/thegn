@@ -5,6 +5,22 @@
 # 365-day years, in each key's documented units. Existing zero/floor semantics
 # still apply. See docs/duration-policy.md for strict checks and runtime recovery.
 
+# ── [sandbox.git]: what a sandboxed pane may write in git ────────────────────
+# Also valid as [env.<n>.sandbox.git] and [profiles.<n>.sandbox.git] (present
+# keys win, absent keys inherit). See docs/sandboxing.md.
+# [sandbox.git]
+# mode       = "commit-only"   # read-only | commit-only | push-lane | full
+#                              #   commit-only: the shared .git is read-only except the
+#                              #   lane's refs, objects and worktree metadata. A top-level
+#                              #   branch, the main checkout or an unknown merge target
+#                              #   fall back to a read-only .git unless mode = "full".
+# transport  = "bundle"        # bundle | clone: how commits come back from a provider VM
+# credential = "none"          # none | repo-token | user-token (| deploy-key | github-app,
+#                              #   parsed, not yet wired). GH_TOKEN/GITHUB_TOKEN are withheld
+#                              #   unless mode = "full" and credential passes them.
+# push_refs  = ["refs/heads/tg/*"]                       # what a push-lane sandbox may push
+# deny_refs  = ["refs/heads/main", "refs/tags/*"]        # never accepted back (merge target always denied)
+
 # ── Release channel ───────────────────────────────────────────────────────────
 # thegn ships in two channels. The regular (stable) build runs the AI-free
 # workspace shell — git/worktrees/panes/sidebar/panel, the command palette,
