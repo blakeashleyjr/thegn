@@ -354,10 +354,12 @@ process_io = false         # also read per-process disk IO (one extra /proc read
 [bars]
 top_left = ["brand"]
 # Widgets: cpu, mem, disk (free %), gpu, temp (CPU °C), net, swap, freq (CPU
-# GHz), load (1-min load avg, unix only), uptime, battery, weather, date, clock.
-# "weather" ships in the list but draws nothing until [weather] enabled = true —
-# the same way "gpu" is inert on a machine without one.
-top_right = ["cpu", "mem", "disk", "gpu", "temp", "net", "battery", "weather", "date", "clock"]
+# GHz), load (1-min load avg, unix only), uptime, battery, weather, fleet, date,
+# clock. "weather" ships in the list but draws nothing until [weather] enabled =
+# true — the same way "gpu" is inert on a machine without one. "fleet" (the
+# estimated $/h of provider VMs; click for the per-VM popup) is likewise inert
+# until an [env.*] names an API provider (fly, sprites, hetzner, …).
+top_right = ["cpu", "mem", "disk", "gpu", "temp", "net", "battery", "weather", "fleet", "date", "clock"]
 # "help" is the clickable `?` chip that opens the built-in help (same as F1,
 # at the page for whatever has focus). Remove it to hide the button.
 bottom_left = ["help", "drawer", "keyhints"]
@@ -814,7 +816,7 @@ dashboard_path = ""           # "" = built-in host dashboard; else a dashboard T
 
 # The per-session daemon that pushes live diff/PR updates to the panel.
 [watch]
-pr_interval_secs = 20  # PR refresh cadence (THEGN_WATCH_PR_INTERVAL)
+pr_interval_secs = 20  # PR refresh cadence, floored at 5s; applies live (THEGN_WATCH_PR_INTERVAL)
 
 # Git write-operation knobs for the panel's lazygit-style features
 # (line staging, interactive rebase, cherry-pick, bisect, undo, …).

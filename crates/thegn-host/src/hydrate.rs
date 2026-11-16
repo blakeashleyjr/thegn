@@ -22,6 +22,9 @@ use thegn_core::store::{
     CacheStore, IntentStore, NotificationStore, WorkspaceStore, WorktreeAuxStore,
 };
 
+/// The shipped `[watch] pr_interval_secs` default; the live cadence is
+/// `ScheduleConfig::pr_every_slots`. Kept for the cadence-invariant test.
+#[cfg(test)]
 const PR_REFRESH_INTERVAL: Duration = Duration::from_secs(20);
 const ISSUE_REFRESH_INTERVAL: Duration = Duration::from_secs(60);
 
@@ -447,6 +450,15 @@ pub(crate) enum RefreshKind {
     /// whose key no longer matches the live `[weather]` config (a poll in flight
     /// across a reload, THE-2006).
     Weather(Box<thegn_core::weather::WeatherSnapshot>, String),
+    /// Time to consider a fleet read (the masthead `fleet` burn badge).
+    /// Emitted by the ticker at [`FLEET_FIRST_SLOT`] and then every five
+    /// minutes, only while `fleet` is placed in a bar AND a provider
+    /// `[env.*]` exists — otherwise no slot at all. The loop further thins
+    /// it with `hydrate_fleet::should_poll` (30 min while nothing runs).
+    FleetPoll,
+    /// A priced fleet read (`fleet_read::read`), errors folded into
+    /// `view.partial`. Boxed to keep `RefreshKind` small.
+    Fleet(Box<crate::fleet_read::FleetSnapshot>),
     /// The host-wide transcript token rollup. A separate slot from [`Self::Usage`]
     /// because the scan behind it reads thousands of files: sending them
     /// together meant the windows waited on the rollup, which is the whole
@@ -636,6 +648,11 @@ const USAGE_FIRST_SLOT: u64 = 8;
 /// network-shaped is ever on the launch→first-frame path.
 const WEATHER_FIRST_SLOT: u64 = 10;
 
+/// Ticker slot of the one-shot first fleet poll — 15s in. Later than weather:
+/// the read is a provider API round trip per env (20 s budget each), and
+/// nothing about a VM bill is urgent in the first seconds of a session.
+const FLEET_FIRST_SLOT: u64 = 30;
+
 /// Ticker slots between weather polls, or `None` when `[weather]` is inert — in
 /// which case no weather slot is emitted at all, which is the 0%-idle contract
 /// for this feature.
@@ -655,7 +672,7 @@ fn weather_every_slots(poll_secs: Option<u64>) -> Option<u64> {
 }
 
 /// Background ticker: emits a `Model` refresh every [`model_refresh_interval`]
-/// and a `Pr` refresh every `PR_REFRESH_INTERVAL`, pulsing the waker so an idle loop
+/// and a `Pr` refresh every `[watch] pr_interval_secs`, pulsing the waker so an idle loop
 /// wakes to service it. This is the staleness backstop; fs-watch + on-switch
 /// refresh handle the common, latency-sensitive cases.
 ///

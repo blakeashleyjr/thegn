@@ -3945,3 +3945,102 @@ fn statusbar_media_badge_fresh_has_no_stale_marker() {
         .collect();
     assert!(!text.contains("stale"), "fresh badge text: {text:?}");
 }
+
+fn fleet_snap(
+    rows: usize,
+    total_hourly: f64,
+    unpriced: usize,
+    orphans: usize,
+) -> crate::fleet_read::FleetSnapshot {
+    use thegn_core::placement::fleet_cost::{FleetCost, FleetRow, FleetView};
+    crate::fleet_read::FleetSnapshot {
+        generated_ms: 0,
+        view: FleetView {
+            rows: (0..rows)
+                .map(|i| FleetRow {
+                    id: format!("vm-{i}"),
+                    ..FleetRow::default()
+                })
+                .collect(),
+            orphans,
+            ..FleetView::default()
+        },
+        cost: FleetCost {
+            total_hourly,
+            unpriced,
+            ..FleetCost::default()
+        },
+    }
+}
+
+#[test]
+fn fleet_widget_text_and_tone() {
+    // No snapshot: absent (the default-listed id takes no columns).
+    assert!(masthead_widget("fleet", &FrameModel::default()).is_none());
+    // Nothing listed, nothing burning: absent.
+    assert_eq!(fleet_widget(&fleet_snap(0, 0.0, 0, 0)), None);
+    // Burn, two decimals, quiet tone.
+    assert_eq!(
+        fleet_widget(&fleet_snap(2, 0.456, 0, 0)),
+        Some(("$0.46/h".to_string(), false))
+    );
+    // Listed but all stopped still shows the (zero) burn.
+    assert_eq!(
+        fleet_widget(&fleet_snap(1, 0.0, 0, 0)),
+        Some(("$0.00/h".to_string(), false))
+    );
+    // Sub-cent floor.
+    assert_eq!(
+        fleet_widget(&fleet_snap(1, 0.004, 0, 0)).map(|(t, _)| t),
+        Some("<$0.01/h".to_string())
+    );
+    // Unpriced rows are counted after the burn.
+    assert_eq!(
+        fleet_widget(&fleet_snap(3, 1.0, 2, 0)).map(|(t, _)| t),
+        Some("$1.00/h +2".to_string())
+    );
+    // An orphan warns: amber tone plus the warn mark.
+    let (text, warn) = fleet_widget(&fleet_snap(1, 0.5, 0, 1)).unwrap();
+    assert!(warn);
+    assert!(text.starts_with("$0.50/h "), "{text}");
+    assert!(text.ends_with(crate::caps::active_glyphs().warn), "{text}");
+    // A recorded-but-missing VM warns even with nothing listed.
+    let mut missing = fleet_snap(0, 0.0, 0, 0);
+    missing
+        .view
+        .missing
+        .push(thegn_core::placement::fleet_cost::RecordedSandbox {
+            worktree: "/wt/gone".into(),
+            provider: "fly".into(),
+            env: "e".into(),
+            id: "tg-gone".into(),
+        });
+    assert_eq!(fleet_widget(&missing).map(|(_, w)| w), Some(true));
+
+    // Through the masthead arm: dim normally, amber on a warning.
+    let mut model = FrameModel {
+        fleet: Some(std::sync::Arc::new(fleet_snap(1, 0.5, 0, 0))),
+        ..FrameModel::default()
+    };
+    let quiet = masthead_widget("fleet", &model).unwrap();
+    assert_eq!(quiet.text, "$0.50/h");
+    assert_eq!(quiet.fg, col(S::Dim));
+    model.fleet = Some(std::sync::Arc::new(fleet_snap(1, 0.5, 0, 1)));
+    let loud = masthead_widget("fleet", &model).unwrap();
+    assert_eq!(loud.fg, level_color(Level::Warn));
+}
+
+#[test]
+fn fleet_sheds_after_weather_and_before_uptime() {
+    let parts: Vec<(String, usize)> = [("cpu", 7), ("uptime", 6), ("fleet", 8), ("weather", 6)]
+        .into_iter()
+        .map(|(id, w)| (id.to_string(), w))
+        .collect();
+    let all = fit_stats_cluster(&parts, 200);
+    let names =
+        |kept: &[usize]| -> Vec<String> { kept.iter().map(|&i| parts[i].0.clone()).collect() };
+    let no_weather = fit_stats_cluster(&parts, cluster_width(&parts, &all) - 1);
+    assert_eq!(names(&no_weather), ["cpu", "uptime", "fleet"]);
+    let no_fleet = fit_stats_cluster(&parts, cluster_width(&parts, &no_weather) - 1);
+    assert_eq!(names(&no_fleet), ["cpu", "uptime"]);
+}
