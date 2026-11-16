@@ -284,9 +284,13 @@ fn repo_key(host_path: &str, loc: &GitLoc) -> Option<String> {
     if let Some(k) = lock().repo_of.get(host_path) {
         return Some(k.clone());
     }
-    let common = match loc.git_text(&["rev-parse", "--path-format=absolute", "--git-common-dir"]) {
-        Ok(common) if !common.is_empty() => common,
-        Ok(_) => return None,
+    let common = match loc.git_out_path(&[
+        "rev-parse",
+        "--path-format=absolute",
+        "--git-common-dir",
+    ]) {
+        Ok(path) => common_dir_key(&path),
+        Err(thegn_core::util::GitPathError::Empty) => return None,
         Err(error) => {
             tracing::debug!(target: "thegn::git", worktree = %host_path, %error, "could not resolve the repo for auto-fetch");
             return None;
@@ -301,6 +305,15 @@ fn repo_key(host_path: &str, loc: &GitLoc) -> Option<String> {
     };
     lock().repo_of.insert(host_path.to_string(), key.clone());
     Some(key)
+}
+
+/// The key text for a common dir: the path itself when UTF-8, else (local
+/// only) its quoted `Debug` form, which cannot collide with a UTF-8 key.
+fn common_dir_key(path: &std::path::Path) -> String {
+    match path.to_str() {
+        Some(text) => text.to_string(),
+        None => format!("{:?}", path.as_os_str()),
+    }
 }
 
 // --- the fetch itself -------------------------------------------------------
@@ -754,6 +767,33 @@ fn next_sweep_target(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn repo_key_uses_the_lossless_common_dir() {
+        let dir = tempfile::tempdir().unwrap();
+        git(dir.path(), &["init", "-q", "-b", "main"]);
+        let loc = GitLoc::Local(dir.path().to_path_buf());
+        let host = dir.path().to_string_lossy().into_owned();
+        let key = repo_key(&host, &loc).expect("repo key");
+        let want = dir.path().canonicalize().unwrap().join(".git");
+        assert_eq!(std::path::Path::new(&key), want);
+    }
+
+    #[test]
+    fn repo_key_is_none_outside_a_repo() {
+        let dir = tempfile::tempdir().unwrap();
+        let loc = GitLoc::Local(dir.path().join("missing"));
+        let host = dir.path().join("missing").to_string_lossy().into_owned();
+        assert_eq!(repo_key(&host, &loc), None);
+    }
+
+    #[test]
+    fn common_dir_key_keeps_utf8_paths_verbatim() {
+        assert_eq!(
+            common_dir_key(std::path::Path::new("/r/with space /.git")),
+            "/r/with space /.git"
+        );
+    }
 
     #[test]
     fn remote_for_reports_an_unreadable_repo_as_an_error() {
