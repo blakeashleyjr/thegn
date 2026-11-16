@@ -102,6 +102,28 @@ pub(crate) fn headless_settings_warnings(cfg: &thegn_core::config::Config) -> Ve
 /// Ceiling for any rendered agent command, queue or daemon launch.
 pub(crate) const MAX_RENDERED_COMMAND_BYTES: usize = 100 * 1024;
 
+/// Ceiling for an agent's task payload (the prompt itself), checked before any
+/// rendering or prompt-file write. A `{prompt}` launch is already bounded by
+/// [`MAX_RENDERED_COMMAND_BYTES`]; this bounds the `{prompt_file}` transport,
+/// which carries the prompt outside argv and had no ceiling of its own.
+pub(crate) const MAX_AGENT_PAYLOAD_BYTES: usize = 1024 * 1024;
+
+/// Refuse a task prompt over [`MAX_AGENT_PAYLOAD_BYTES`], naming both sizes.
+pub(crate) fn check_agent_payload(prompt: &str) -> Result<(), String> {
+    if prompt.len() > MAX_AGENT_PAYLOAD_BYTES {
+        return Err(format!(
+            "agent task prompt is {} bytes, over the {} byte payload limit: shorten the task prompt",
+            prompt.len(),
+            MAX_AGENT_PAYLOAD_BYTES
+        ));
+    }
+    Ok(())
+}
+
+/// The refusal for a `{prompt_file}` launch whose placement is not local.
+pub(crate) const PROMPT_FILE_REMOTE_REFUSAL: &str =
+    "{prompt_file} needs a local sandbox: the prompt file cannot reach a remote placement";
+
 #[cfg(any(unix, test))]
 fn rendered_command_exceeds_limit(command: &str) -> bool {
     command.len() > MAX_RENDERED_COMMAND_BYTES
@@ -135,22 +157,18 @@ fn fit_command(
     }
 }
 
-#[cfg(any(unix, test))]
-fn uses_prompt_file(template: &str) -> bool {
+pub(crate) fn uses_prompt_file(template: &str) -> bool {
     thegn_core::agent_task::template_vars(template)
         .is_ok_and(|vars| vars.iter().any(|name| name == "prompt_file"))
 }
 
 #[cfg(unix)]
-fn prompt_file_dir(
+pub(crate) fn prompt_file_dir(
     worktree: &str,
     sandbox: Option<&thegn_core::sandbox::SandboxSpec>,
 ) -> Result<thegn_core::fsperm::PrivateDir, String> {
     if sandbox.is_some_and(|spec| !spec.placement.is_local()) {
-        return Err(
-            "{prompt_file} needs a local sandbox: the prompt file cannot reach a remote placement"
-                .into(),
-        );
+        return Err(PROMPT_FILE_REMOTE_REFUSAL.into());
     }
     let worktree = std::path::Path::new(worktree);
     let git_dir = thegn_core::git_memo::git_dir(worktree).ok_or_else(|| {
@@ -181,34 +199,92 @@ fn prompt_file_dir(
     Ok(directory)
 }
 
+/// An owner-only prompt file, removed on drop unless [`PromptFile::persist`]
+/// hands it to a longer-lived owner (a daemon session).
 #[cfg(unix)]
-struct PromptFile {
+pub(crate) struct PromptFile {
     directory: thegn_core::fsperm::PrivateDir,
     name: String,
     path: std::path::PathBuf,
+    armed: bool,
 }
 
 #[cfg(unix)]
 impl PromptFile {
-    fn path(&self) -> &std::path::Path {
+    pub(crate) fn path(&self) -> &std::path::Path {
         &self.path
+    }
+
+    /// Disarm the drop-time removal and return the path. The file then lives
+    /// until [`sweep_stale_prompt_files`] removes it once it is older than
+    /// `bounded::MAX_TIMEOUT` (on the next prepare in the same worktree).
+    pub(crate) fn persist(mut self) -> std::path::PathBuf {
+        self.armed = false;
+        std::mem::take(&mut self.path)
     }
 }
 
 #[cfg(unix)]
 impl Drop for PromptFile {
     fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
         if let Err(error) = self.directory.remove_file(&self.name) {
             tracing::debug!(%error, "unable to remove prompt file");
         }
     }
 }
 
+/// Non-unix hosts cannot hold a prompt file: the type is uninhabited so the
+/// daemon path compiles and [`write_session_prompt_file`] refuses instead.
+#[cfg(not(unix))]
+pub(crate) struct PromptFile {
+    never: std::convert::Infallible,
+}
+
+#[cfg(not(unix))]
+impl PromptFile {
+    pub(crate) fn path(&self) -> &std::path::Path {
+        match self.never {}
+    }
+
+    pub(crate) fn persist(self) -> std::path::PathBuf {
+        match self.never {}
+    }
+}
+
+/// Write `prompt` to an owner-only prompt file under the local worktree's git
+/// dir for a daemon-owned session. The caller has already checked that the
+/// worktree's placement is local. The returned file is still armed: the caller
+/// [`PromptFile::persist`]s it once the launch is committed, so a refused
+/// launch leaves nothing behind.
+#[cfg(unix)]
+pub(crate) fn write_session_prompt_file(
+    worktree: &str,
+    prompt: &str,
+) -> Result<PromptFile, String> {
+    check_agent_payload(prompt)?;
+    let directory = prompt_file_dir(worktree, None)?;
+    write_prompt_file(directory, prompt)
+}
+
+#[cfg(not(unix))]
+pub(crate) fn write_session_prompt_file(
+    _worktree: &str,
+    _prompt: &str,
+) -> Result<PromptFile, String> {
+    Err(
+        "{prompt_file} needs a unix host: this platform cannot hold an owner-only prompt file"
+            .into(),
+    )
+}
+
 /// Sweep crash-left prompt files older than `bounded::MAX_TIMEOUT`, the longest
 /// permitted agent deadline. Only regular `prompt-*` files are touched; links
 /// and other names are left alone. This runs in the agent worker, off the UI loop.
 #[cfg(unix)]
-fn sweep_stale_prompt_files(
+pub(crate) fn sweep_stale_prompt_files(
     directory: &thegn_core::fsperm::PrivateDir,
     now: std::time::SystemTime,
     max_age: std::time::Duration,
@@ -260,7 +336,7 @@ fn sweep_stale_prompt_files(
 }
 
 #[cfg(unix)]
-fn write_prompt_file(
+pub(crate) fn write_prompt_file(
     directory: thegn_core::fsperm::PrivateDir,
     prompt: &str,
 ) -> Result<PromptFile, String> {
@@ -276,6 +352,7 @@ fn write_prompt_file(
         directory,
         name,
         path,
+        armed: true,
     })
 }
 
@@ -952,6 +1029,10 @@ pub(crate) fn run_outcome_cancellable(
     use thegn_core::util;
 
     let prompt_file = if uses_prompt_file(task.command_template) {
+        if let Err(reason) = check_agent_payload(task.prompt) {
+            tracing::warn!(target: "thegn::agent", kind = %task.kind, %reason, "prompt over the payload budget; not dispatching");
+            return AgentRunVerdict::NotStarted(reason);
+        }
         let dir = match prompt_file_dir(task.worktree, task.sandbox.as_ref()) {
             Ok(dir) => dir,
             Err(reason) => {
@@ -2673,6 +2754,74 @@ mod tests {
         drop(file);
         assert_eq!(std::fs::read_dir(&moved_path).unwrap().count(), 0);
         assert_eq!(std::fs::read_dir(target.path()).unwrap().count(), 0);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn persist_disarms_the_prompt_file_drop() {
+        let worktree = tempfile::tempdir().unwrap();
+        std::fs::create_dir(worktree.path().join(".git")).unwrap();
+        let directory = prompt_file_dir(worktree.path().to_str().unwrap(), None).unwrap();
+        let file = write_prompt_file(directory, "KEPT-PROMPT").unwrap();
+        let expected = file.path().to_path_buf();
+        let path = file.persist();
+        assert_eq!(path, expected);
+        assert_eq!(std::fs::read(&path).unwrap(), b"KEPT-PROMPT");
+
+        // An armed file still removes itself on drop.
+        let directory = prompt_file_dir(worktree.path().to_str().unwrap(), None).unwrap();
+        let armed = write_prompt_file(directory, "DROPPED-PROMPT").unwrap();
+        let armed_path = armed.path().to_path_buf();
+        drop(armed);
+        assert!(!armed_path.exists());
+        assert!(path.exists(), "the persisted file outlives its guard");
+    }
+
+    #[test]
+    fn agent_payload_budget_table() {
+        assert!(check_agent_payload(&"x".repeat(MAX_AGENT_PAYLOAD_BYTES)).is_ok());
+        let error = check_agent_payload(&"x".repeat(MAX_AGENT_PAYLOAD_BYTES + 1)).unwrap_err();
+        assert!(
+            error.contains(&format!(
+                "{} bytes, over the {} byte payload limit",
+                MAX_AGENT_PAYLOAD_BYTES + 1,
+                MAX_AGENT_PAYLOAD_BYTES
+            )),
+            "got {error}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn oversized_prompt_file_payload_is_not_started_and_writes_nothing() {
+        let worktree = tempfile::tempdir().unwrap();
+        std::fs::create_dir(worktree.path().join(".git")).unwrap();
+        let prompt = "x".repeat(2 * 1024 * 1024);
+        let v = vars();
+        let t = AgentTaskRun {
+            worktree: worktree.path().to_str().unwrap(),
+            prompt: &prompt,
+            command_template: "cat {prompt_file} > got",
+            ..task(TaskKind::MergeConflict, &v)
+        };
+        match run_outcome(&t) {
+            AgentRunVerdict::NotStarted(reason) => {
+                assert!(reason.contains("byte payload limit"), "got {reason}")
+            }
+            other => panic!("a 2 MiB prompt file must not start: {other:?}"),
+        }
+        assert!(!worktree.path().join("got").exists());
+        assert!(!worktree.path().join(".git/thegn-task").exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn session_prompt_file_refuses_an_oversized_payload() {
+        let worktree = tempfile::tempdir().unwrap();
+        std::fs::create_dir(worktree.path().join(".git")).unwrap();
+        let prompt = "x".repeat(2 * 1024 * 1024);
+        assert!(write_session_prompt_file(worktree.path().to_str().unwrap(), &prompt).is_err());
+        assert!(!worktree.path().join(".git/thegn-task").exists());
     }
 
     #[cfg(unix)]
