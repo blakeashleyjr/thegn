@@ -1413,6 +1413,7 @@ mod tests {
                 env_name: None,
                 env_degraded: false,
                 sandbox_profile: None,
+                external: false,
             })
             .collect();
         m
