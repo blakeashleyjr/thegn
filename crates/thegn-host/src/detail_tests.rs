@@ -1623,6 +1623,30 @@ fn sections_cursor_moves_sets_sel_and_scroll_follows() {
 }
 
 #[test]
+fn sections_cursor_on_its_last_row_scrolls_to_trailing_sections() {
+    let mut detail = cursor_stack();
+    detail.sections.push(Section::KeyVal(
+        (0..10)
+            .map(|i| (format!("t{i}"), format!("v{i}"), Tok::Slot(S::Text)))
+            .collect(),
+    ));
+    let mut ov = sections_detail("Rows", 30, detail, Placement::Center, Rect::full(80, 13));
+    for _ in 0..100 {
+        ov.handle_key(&KeyCode::DownArrow, Modifiers::NONE);
+    }
+    assert_eq!(ov.sel, 29);
+    assert_eq!(
+        ov.scroll,
+        ov.scroll_max(),
+        "the trailing keyval is reachable"
+    );
+    ov.handle_key(&KeyCode::UpArrow, Modifiers::NONE);
+    assert_eq!(ov.sel, 28);
+    let off = cursor_row_offset(28);
+    assert!(ov.scroll <= off && off < ov.scroll + ov.rows);
+}
+
+#[test]
 fn sections_cursor_enter_and_keys_fire_the_selected_row() {
     let mut ov = sections_detail(
         "Rows",

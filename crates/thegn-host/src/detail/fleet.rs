@@ -125,6 +125,18 @@ pub(crate) fn confirm_text(label: &str, worktree: &str, stop: bool) -> (String, 
     )
 }
 
+/// The danger confirm for the `s`/`d` row actions. Stop keeps the plain
+/// confirm default; destroy pre-selects `cancel`, so `d` then Enter is a no-op.
+pub(crate) fn confirm_menu(label: &str, worktree: &str, stop: bool) -> crate::menu::MenuOverlay {
+    let (title, body) = confirm_text(label, worktree, stop);
+    let tag = fleet_down_tag(stop);
+    if stop {
+        crate::menu::confirm_menu(title, body, tag, worktree.to_string(), true)
+    } else {
+        crate::menu::confirm_menu_default_cancel(title, body, tag, worktree.to_string())
+    }
+}
+
 /// The status line once the `env down` tab is open.
 pub(crate) fn started_status(worktree: &str, stop: bool) -> String {
     let verb = if stop { "stopping" } else { "destroying" };
@@ -348,8 +360,8 @@ fn build_sections(snap: &FleetSnapshot, now_ms: i64) -> SectionsDetail {
 #[cfg(test)]
 mod tests {
     use super::{
-        Cell, DetailAction, MAX_ROWS, Section, Tok, build_sections, confirm_text, fleet_down_argv,
-        fleet_down_tag, refresh_open, started_status, stop_for_tag,
+        Cell, DetailAction, MAX_ROWS, Section, Tok, build_sections, confirm_menu, confirm_text,
+        fleet_down_argv, fleet_down_tag, refresh_open, started_status, stop_for_tag,
     };
     use crate::fleet_read::FleetSnapshot;
     use thegn_core::placement::fleet_cost::{
@@ -610,6 +622,28 @@ mod tests {
         assert!(body.contains("If the pull-back fails it refuses"), "{body}");
         assert!(!body.contains("--force"), "{body}");
         assert!(started_status("/wt/a", false).contains("destroying"));
+    }
+
+    #[test]
+    fn destroy_confirm_defaults_to_cancel() {
+        use crate::menu::{MenuChoice, MenuOutcome};
+        use termwiz::input::{KeyCode, Modifiers};
+
+        let mut destroy = confirm_menu("fly/tg-a", "/wt/a", false);
+        assert!(matches!(
+            destroy.items()[destroy.selected()].choice,
+            MenuChoice::Dismiss
+        ));
+        assert_eq!(
+            destroy.handle_key(&KeyCode::Enter, Modifiers::NONE),
+            MenuOutcome::Pick(MenuChoice::Dismiss),
+            "d then Enter must not destroy"
+        );
+        let stop = confirm_menu("fly/tg-a", "/wt/a", true);
+        assert!(matches!(
+            stop.items()[stop.selected()].choice,
+            MenuChoice::Confirm { .. }
+        ));
     }
 
     #[test]

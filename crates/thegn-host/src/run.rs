@@ -19445,15 +19445,8 @@ async fn event_loop<T: Terminal>(
                             },
                         ) => {
                             bar_detail = None;
-                            let (title, body) =
-                                crate::detail::fleet::confirm_text(&label, &worktree, stop);
-                            active_menu = Some(menu::confirm_menu(
-                                title,
-                                body,
-                                crate::detail::fleet::fleet_down_tag(stop),
-                                worktree,
-                                true,
-                            ));
+                            active_menu =
+                                Some(crate::detail::fleet::confirm_menu(&label, &worktree, stop));
                         }
                         crate::detail::DetailOutcome::Act(
                             crate::detail::DetailAction::AckAllAttention,
