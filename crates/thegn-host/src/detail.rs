@@ -238,6 +238,8 @@ pub(crate) mod calendar;
 pub use calendar::{CalendarPayload, apply_calendar, retick_open};
 /// The `cpu`/`mem` popups' workspace → worktree → pane attribution tree.
 pub(crate) mod cpu_attrib;
+/// The masthead `fleet` widget's provider-VM cost popup.
+pub(crate) mod fleet;
 mod usage_dash;
 use ci_drill::{ci_fmt_secs, ci_glyph_marker, ci_state_word};
 pub use usage_dash::{
@@ -2001,6 +2003,7 @@ fn widget_detail_inner(
         // existing path rather than earning a popup of its own — the reading it
         // would show in full is already a block in this one.
         "date" | "clock" | "weather" => calendar::open(ctx, near, model),
+        "fleet" => fleet::open(model, ctx, near),
         // The opt-in queue widget is only a door to the existing unified
         // surface; it must not grow a second queue-row implementation here.
         "mq" => unified_detail(model, ctx.screen),

@@ -2,10 +2,11 @@
 //! for the live host and the channel-clock integration fixture.
 use super::{
     CONTAINER_DF_EVERY_TICKS, CONTAINER_SLOT_MAX_BYTES, ContainerDemand, ContainerRefresh,
-    DAEMON_REFRESH_INTERVAL, ISSUE_REFRESH_INTERVAL, PR_REFRESH_INTERVAL, RefreshKind,
+    DAEMON_REFRESH_INTERVAL, FLEET_FIRST_SLOT, ISSUE_REFRESH_INTERVAL, RefreshKind,
     STARTUP_FETCH_SLOT, STARTUP_MEASURE_SLOT, StatsTick, USAGE_FIRST_SLOT, WEATHER_FIRST_SLOT,
 };
 use crate::hydrate_schedule::ScheduleConfig;
+use std::num::NonZeroU64;
 use std::sync::{
     Arc,
     atomic::{AtomicBool, AtomicU64, Ordering},
@@ -18,8 +19,9 @@ use tokio::sync::mpsc as tokio_mpsc;
 /// by the main loop blocking a runtime worker in `poll_input(None)` — true even
 /// on a single-core runtime. The thread sleeps in 500ms half-ticks: fine enough
 /// for the Telemetry section's live graphs (`stats_live` set while it's open)
-/// while the model/PR cadences (default 1s/20s, model tunable via
-/// `THEGN_MODEL_REFRESH_MS`) stay whole multiples of the half-tick.
+/// while the model/PR cadences (default 5s/20s, model tunable via
+/// `THEGN_MODEL_REFRESH_MS`, PR via `[watch] pr_interval_secs`) stay whole
+/// multiples of the half-tick.
 pub(crate) struct RefreshTicker {
     command: CommandSlot,
     stop: Arc<AtomicBool>,
@@ -144,6 +146,8 @@ struct Cadences {
     loc_every_slots: Option<u64>,
     usage_every_slots: Option<u64>,
     weather_every_slots: Option<u64>,
+    fleet_every_slots: Option<u64>,
+    pr_every_slots: u64,
 }
 
 impl Cadences {
@@ -159,6 +163,8 @@ impl Cadences {
             loc_every_slots: schedule.loc_every_slots,
             usage_every_slots: schedule.usage_every_slots,
             weather_every_slots: schedule.weather_every_slots,
+            fleet_every_slots: schedule.fleet_every_slots,
+            pr_every_slots: schedule.pr_every_slots,
         }
     }
 }
@@ -246,6 +252,8 @@ fn spawn_worker_inner(
             loc_every_slots,
             usage_every_slots,
             weather_every_slots,
+            fleet_every_slots,
+            pr_every_slots,
         } = cadences;
         let mut ci_every_slots = ci_every_slots;
         let mut prq_every_slots = prq_every_slots;
@@ -257,6 +265,7 @@ fn spawn_worker_inner(
         let mut loc_every_slots = loc_every_slots;
         let mut usage_every_slots = usage_every_slots;
         let mut weather_every_slots = weather_every_slots;
+        let mut fleet_every_slots = fleet_every_slots;
         // The 500ms refresh ticker: it only decides when to *ask* for work, and
         // every consumer is off the render path.
         io.background_qos();
@@ -265,8 +274,10 @@ fn spawn_worker_inner(
             io.model_refresh_interval().as_millis(),
             500,
         );
-        let pr_every =
-            thegn_core::time_policy::cadence_millis_slots(PR_REFRESH_INTERVAL.as_millis(), 500);
+        // `[watch] pr_interval_secs`, already floored by the projection; the
+        // `NonZeroU64` keeps a hand-built schedule from dividing by zero.
+        let pr_slots = |slots: u64| NonZeroU64::new(slots).unwrap_or(NonZeroU64::MIN);
+        let mut pr_every = pr_slots(pr_every_slots);
         let mut ci_every = ci_every_slots;
         let mut fetch_every = auto_fetch_every_slots;
         let issue_every =
@@ -288,6 +299,7 @@ fn spawn_worker_inner(
         // the one place that loops can't be made to spin from config.
         let mut usage_every = usage_every_slots;
         let mut weather_every = weather_every_slots;
+        let mut fleet_every = fleet_every_slots;
         let container_every = |demand: ContainerDemand| {
             thegn_core::time_policy::cadence_millis_slots(demand.interval().as_millis(), 500).get()
         };
@@ -307,6 +319,7 @@ fn spawn_worker_inner(
         let mut loc_after = 0;
         let mut usage_after = 0;
         let mut weather_after = 0;
+        let mut fleet_after = 0;
         let mut active_generation = generation;
         let mut last_container_demand = ContainerDemand::None;
         let mut container_last_sent = None;
@@ -343,6 +356,7 @@ fn spawn_worker_inner(
                     let loc_changed = loc_every_slots != next.loc_every_slots;
                     let usage_changed = usage_every_slots != next.usage_every_slots;
                     let weather_changed = weather_every_slots != next.weather_every_slots;
+                    let fleet_changed = fleet_every_slots != next.fleet_every_slots;
                     let rearm = |old: u64, new: u64, tick: u64| {
                         (old != new).then_some(tick.saturating_add(new))
                     };
@@ -377,6 +391,8 @@ fn spawn_worker_inner(
                         .unwrap_or(usage_after);
                     weather_after = rearm_opt(weather_every_slots, next.weather_every_slots, ticks)
                         .unwrap_or(weather_after);
+                    fleet_after = rearm_opt(fleet_every_slots, next.fleet_every_slots, ticks)
+                        .unwrap_or(fleet_after);
                     ci_every_slots = next.ci_every_slots;
                     prq_every_slots = next.prq_every_slots;
                     auto_fetch_every_slots = next.auto_fetch_every_slots;
@@ -389,6 +405,7 @@ fn spawn_worker_inner(
                     loc_every_slots = next.loc_every_slots;
                     usage_every_slots = next.usage_every_slots;
                     weather_every_slots = next.weather_every_slots;
+                    fleet_every_slots = next.fleet_every_slots;
                     ci_every = ci_every_slots;
                     fetch_every = auto_fetch_every_slots;
                     prq_every = prq_every_slots;
@@ -397,6 +414,10 @@ fn spawn_worker_inner(
                     loc_every = loc_every_slots;
                     usage_every = usage_every_slots;
                     weather_every = weather_every_slots;
+                    fleet_every = fleet_every_slots;
+                    // PR is phase-free (`tick % pr_every`), so a new cadence
+                    // simply takes over at its next multiple.
+                    pr_every = pr_slots(next.pr_every_slots);
                     if ci_changed {
                         ci_after = ticks.saturating_add(ci_every);
                     }
@@ -421,6 +442,9 @@ fn spawn_worker_inner(
                     }
                     if weather_changed {
                         weather_after = weather_every.map(|n| ticks.saturating_add(n)).unwrap_or(0);
+                    }
+                    if fleet_changed {
+                        fleet_after = fleet_every.map(|n| ticks.saturating_add(n)).unwrap_or(0);
                     }
                     last_clock_unit = clock_unit(&clock_period_secs, io.now_secs());
                     active_generation = generation;
@@ -518,6 +542,18 @@ fn spawn_worker_inner(
                 (weather_after == 0 && ticks == WEATHER_FIRST_SLOT) || due(ticks, n, weather_after)
             }) {
                 if send_tick(&tx, active_generation, RefreshKind::WeatherPoll).is_err() {
+                    break;
+                }
+                wake = true;
+            }
+            // Fleet burn badge, same shape: a one-shot startup slot, then the
+            // five-minute cadence. `fleet_every` is `None` unless `fleet` is
+            // placed in a bar and a provider env exists, so the common machine
+            // emits no slot and costs no idle wake.
+            if fleet_every.is_some_and(|n| {
+                (fleet_after == 0 && ticks == FLEET_FIRST_SLOT) || due(ticks, n, fleet_after)
+            }) {
+                if send_tick(&tx, active_generation, RefreshKind::FleetPoll).is_err() {
                     break;
                 }
                 wake = true;
