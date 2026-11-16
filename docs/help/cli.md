@@ -503,6 +503,17 @@ thegn-named app the host has no record of as a row (an `ORPHAN` unless a
 worktree records it); if that app listing fails, Fly shows the recorded
 sandboxes only and is marked partial. Nothing is stopped or destroyed.
 
+With `[placement.fleet_budget.<provider>]` set, `thegn fleet cost` prints one
+line per provider whose burn reached a limit, for example
+`budget: fly $3.20/h ≥ warn $3.00/h`, and `--json` lists them under
+`cost.budget` (`provider`, `level` `warn` or `max`, `hourly`, `limit`). A
+reached `warn_hourly` also turns the masthead fleet badge amber. A reached
+`max_hourly` refuses provisioning a new sandbox on that provider until its burn
+drops; resuming or reusing an existing sandbox is never refused. With a cap
+set, provisioning first reads that provider's fleet and refuses with "cannot
+verify fleet budget" when the read fails or is incomplete. `fleet list --env`
+reads one env only, so its JSON `cost.budget` is always empty.
+
 `thegn map` prints a **repo map**: the worktree's tree-sitter-indexed
 entities (functions, types, …) grouped by file, ranked by caller
 in-degree, under a line budget (`--budget`, default `[semantic]

@@ -24,6 +24,9 @@
 //! - `cost.per_provider_hourly`, `cost.total_hourly`, `cost.today`,
 //!   `cost.mtd`, `cost.projected_24h`, `cost.projected_30d`, `cost.unpriced`,
 //!   `cost.price_table_date`.
+//! - `cost.budget[]`: `provider`, `level` (`"warn"` | `"max"`), `hourly`,
+//!   `limit` — providers whose burn reached a `[placement.fleet_budget]`
+//!   limit (empty under `fleet list --env`, which reads only one env).
 //!
 //! All amounts are USD estimates from the bundled price table and
 //! `[placement.price]`.
@@ -72,12 +75,18 @@ pub fn run(cfg: &Config, action: Action) -> Result<()> {
     }
     let view = crate::fleet_read::gather(cfg, only_env.as_deref())?;
     let now_ms = thegn_core::util::now_ms();
-    let cost = fleet_cost::fleet_cost(
-        &view,
-        fleet_cost::BUNDLED_PRICES,
-        &cfg.placement.price,
-        now_ms,
-    );
+    // Budgets compare a provider's WHOLE burn: a one-env read cannot judge
+    // them, so `--env` reports none rather than an undercount.
+    let cost = if only_env.is_none() {
+        crate::fleet_read::priced(cfg, &view, now_ms)
+    } else {
+        fleet_cost::fleet_cost(
+            &view,
+            fleet_cost::BUNDLED_PRICES,
+            &cfg.placement.price,
+            now_ms,
+        )
+    };
     if json {
         return super::emit_json(&FleetReport {
             generated_ms: now_ms,
@@ -252,6 +261,15 @@ fn render_cost(view: &FleetView, cost: &FleetCost) -> String {
         rows.push(vec![provider.clone(), usd(*hourly, 4)]);
     }
     let mut out = vec![table(&rows)];
+    for breach in &cost.budget {
+        out.push(format!(
+            "budget: {} {}/h ≥ {} {}/h",
+            breach.provider,
+            usd(breach.hourly, 2),
+            breach.level.label(),
+            usd(breach.limit, 2),
+        ));
+    }
     partial_section(view, &mut out);
     out.push(String::new());
     out.push(footer(cost));
@@ -359,6 +377,48 @@ mod tests {
         );
         assert!(text.contains("burn $0.5000/h"), "{text}");
         assert!(text.contains("next 24h $12.00"), "{text}");
+        assert!(
+            !text.contains("budget:"),
+            "no budget, no breach line: {text}"
+        );
+    }
+
+    #[test]
+    fn cost_summary_prints_one_line_per_breach() {
+        use thegn_core::placement::fleet_cost::{BudgetBreach, BudgetLevel};
+        let view = view();
+        let mut cost = fleet_cost::fleet_cost(&view, TABLE, &Default::default(), NOW);
+        let plain = render_cost(&view, &cost);
+        cost.budget = vec![
+            BudgetBreach {
+                provider: "fly".into(),
+                level: BudgetLevel::Warn,
+                hourly: 3.2,
+                limit: 3.0,
+            },
+            BudgetBreach {
+                provider: "sprites".into(),
+                level: BudgetLevel::Max,
+                hourly: 5.0,
+                limit: 5.0,
+            },
+        ];
+        let text = render_cost(&view, &cost);
+        let breaches: Vec<&str> = text.lines().filter(|l| l.starts_with("budget:")).collect();
+        assert_eq!(
+            breaches,
+            [
+                "budget: fly $3.20/h ≥ warn $3.00/h",
+                "budget: sprites $5.00/h ≥ max $5.00/h"
+            ],
+            "{text}"
+        );
+        // Removing the breach lines leaves the existing output untouched.
+        let without: Vec<&str> = text.lines().filter(|l| !l.starts_with("budget:")).collect();
+        assert_eq!(without.join("\n"), plain);
+        let json = serde_json::to_value(&cost).unwrap();
+        assert_eq!(json["budget"][0]["level"], "warn");
+        assert_eq!(json["budget"][1]["provider"], "sprites");
     }
 
     #[test]
