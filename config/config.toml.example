@@ -2900,10 +2900,14 @@ mounts = ["~/.gitconfig:ro"]
 # variable with `[profiles.<name>.sandbox] env_passthrough`; that list replaces
 # this one for the profile, while infrastructure names such as TERM always pass.
 # `thegn doctor` shows denied/shared names. The share list is read at startup.
+# GH_TOKEN / GITHUB_TOKEN are withheld (from sandboxes and provider
+# provisioning) unless [sandbox.git] sets mode = "full" with
+# credential = "repo-token" | "user-token": by default credentials stay with
+# thegn. ANTHROPIC_API_KEY (agent auth) is unaffected.
 env_passthrough = [
   "SSH_AUTH_SOCK",      # agent socket (dropped on sealed tiers; needs /run/user mounted to work)
-  "GH_TOKEN",           # GitHub CLI auth
-  "GITHUB_TOKEN",       # GitHub Actions / API compat alias
+  "GH_TOKEN",           # GitHub CLI auth (only with [sandbox.git] credential = repo-/user-token)
+  "GITHUB_TOKEN",       # GitHub Actions / API compat alias (same gate)
   "ANTHROPIC_API_KEY",
   "TERM",
   "COLORTERM",
@@ -3232,8 +3236,10 @@ on_floor_miss = "fail"
 # [sandbox.git]
 # mode       = "commit-only"   # read-only | commit-only | push-lane | full
 # transport  = "bundle"        # bundle | clone: how commits come back to the host
-# credential = "none"          # none (only none is implemented; deploy-key,
-#                              # repo-token, github-app, user-token are accepted)
+# credential = "none"          # none: no GitHub token in the sandbox (default).
+#                              # repo-token | user-token (mode = "full" only):
+#                              # pass the host GH_TOKEN/GITHUB_TOKEN through.
+#                              # deploy-key, github-app: accepted, not implemented
 # push_refs  = ["refs/heads/tg/*"]                  # trailing /* = one level, /** = any depth
 # deny_refs  = ["refs/heads/main", "refs/tags/*"]   # the merge target is always denied too
 
