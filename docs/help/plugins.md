@@ -282,7 +282,7 @@ An enabled gated plugin is refused unless its user's `[[plugins]]` entry sets
 `gated_by` capabilities; its JSON report includes the same rows.
 
 Crashed resident plugins restart with backoff (three attempts, then disabled
-until config reload). A pending restart is cancelled when the plugin is
+until a config reload that changes `[[plugins]]` or a read-on-use key). A pending restart is cancelled when the plugin is
 disabled, on config reload and on shutdown; restarts wait on one background
 timer rather than a thread each. That crash/backoff state is process-lifetime
 supervisor state: it is not persisted across a daemon or compositor restart.
