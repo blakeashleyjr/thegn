@@ -393,3 +393,88 @@ fn native_summary_uses_every_live_entry_and_diffs_pid_start_identities() {
     assert!((summary.owners.panes.cpu_pct.unwrap_or(0.0) - 10.0).abs() < 0.1);
     assert!((summary.owners.other.cpu_pct.unwrap_or(0.0) - 10.0).abs() < 0.1);
 }
+
+#[test]
+fn native_summary_splits_the_pane_bucket_per_pane() {
+    // 99 = UI; panes 5 (root 77, child 20) and 6 (root 78); 31 = other.
+    let rows = [(99, 1, 1), (77, 1, 3), (20, 77, 4), (78, 1, 5), (31, 1, 6)];
+    let mut fs = FakeProcFs::new();
+    let insert = |fs: &mut FakeProcFs, utime: u64| {
+        for (pid, ppid, rss) in rows {
+            fs.insert(
+                pid,
+                summary_process(
+                    SummaryRow {
+                        pid,
+                        ppid,
+                        state: 'S',
+                        threads: 1,
+                        flags: 0,
+                        rss_pages: rss,
+                    },
+                    utime,
+                    250,
+                ),
+            );
+        }
+    };
+    insert(&mut fs, 10);
+    let mut native = NativeBackend::with(fs, 16, None, Some(100), Some(4096));
+    let mut primed = false;
+    let panes = [(77, 5), (78, 6)];
+    let req = || ProcSampleRequest {
+        rows: 1,
+        self_pid: 99,
+        daemon_pid: None,
+        pane_pids: &panes,
+        primed: false,
+    };
+    let (first, successful) = sample_with(&mut native, req(), Instant::now(), 20, &mut primed);
+    assert!(successful);
+    let summary = first.summary.as_ref().expect("native summary");
+    let ids = summary
+        .pane_totals
+        .iter()
+        .map(|(pane, _)| *pane)
+        .collect::<Vec<_>>();
+    assert_eq!(ids, vec![5, 6]);
+    assert_eq!(summary.pane_totals[0].1.count, 2);
+    assert_eq!(summary.pane_totals[0].1.rss_bytes, Some(7 * 4096));
+    assert_eq!(summary.pane_totals[1].1.count, 1);
+    assert_eq!(summary.pane_totals[1].1.rss_bytes, Some(5 * 4096));
+    // No CPU delta on the first pass: unknown, not zero.
+    assert!(summary.pane_totals.iter().all(|(_, t)| t.cpu_pct.is_none()));
+    let count_sum = summary
+        .pane_totals
+        .iter()
+        .map(|(_, t)| t.count)
+        .sum::<usize>();
+    assert_eq!(count_sum, summary.owners.panes.count);
+    let rss_sum = summary
+        .pane_totals
+        .iter()
+        .filter_map(|(_, t)| t.rss_bytes)
+        .sum::<u64>();
+    assert_eq!(Some(rss_sum), summary.owners.panes.rss_bytes);
+
+    insert(native.table.fs_mut(), 20);
+    let (second, successful) = sample_with(
+        &mut native,
+        req(),
+        Instant::now() + Duration::from_secs(2),
+        22,
+        &mut primed,
+    );
+    assert!(successful);
+    let summary = second.summary.as_ref().expect("native summary");
+    assert_eq!(summary.pane_totals.len(), 2);
+    let cpu_sum = summary
+        .pane_totals
+        .iter()
+        .filter_map(|(_, t)| t.cpu_pct)
+        .sum::<f64>();
+    let panes_cpu = summary.owners.panes.cpu_pct.expect("pane cpu");
+    assert!((cpu_sum - panes_cpu).abs() < 1e-6);
+    assert!((summary.pane_totals[0].1.cpu_pct.unwrap_or(0.0) - 10.0).abs() < 0.1);
+    assert!((summary.pane_totals[1].1.cpu_pct.unwrap_or(0.0) - 5.0).abs() < 0.1);
+}
