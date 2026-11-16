@@ -1088,7 +1088,13 @@ impl Workspace {
         let inner = direct
             .clone()
             .unwrap_or_else(|| thegn_core::shellinv::run_argv(&thegn_core::util::shell(), command));
-        let (argv, wrap) = thegn_core::sandbox_cpucap::wrap_background_argv_reporting(inner);
+        let (argv, wrap) = thegn_core::sandbox_cpucap::wrap_background_argv_tagged_reporting(
+            inner,
+            &thegn_core::sandbox_cpucap::ScopeTag {
+                kind: thegn_core::sandbox_cpucap::ScopeKind::Gate,
+                worktree: self.repo.root.path().to_string_lossy().into_owned(),
+            },
+        );
         let exec_confirmed =
             direct.is_some() && wrap != thegn_core::sandbox_cpucap::BackgroundWrap::Wrapped;
         let mut command = std::process::Command::new(&argv[0]);
@@ -1223,7 +1229,13 @@ impl NativeWorkspace {
         let inner = direct
             .clone()
             .unwrap_or_else(|| thegn_core::shellinv::run_argv(&thegn_core::util::shell(), command));
-        let (argv, wrap) = thegn_core::sandbox_cpucap::wrap_background_argv_reporting(inner);
+        let (argv, wrap) = thegn_core::sandbox_cpucap::wrap_background_argv_tagged_reporting(
+            inner,
+            &thegn_core::sandbox_cpucap::ScopeTag {
+                kind: thegn_core::sandbox_cpucap::ScopeKind::Gate,
+                worktree: self.repo.to_string_lossy().into_owned(),
+            },
+        );
         let exec_confirmed =
             direct.is_some() && wrap != thegn_core::sandbox_cpucap::BackgroundWrap::Wrapped;
         let mut command = std::process::Command::new(&argv[0]);
