@@ -54,6 +54,17 @@ contrast pair, for example `text contrast 2.1:1` and
 `against bg0, below 4.5:1`. Amber marks a pair below its floor, red a pair
 below 3:1.
 
+While a token, element or picker row is selected, the preview underlines each
+sample that uses that color and marks its line with a leading arrow. A
+`highlighted: …` legend under the preview lists the interface elements the
+color paints, or reads `not shown in preview` when the sample has no segment for
+it. The highlight lives in the builder's preview, not on the workspace behind
+the popup.
+
+Each catalog row ends with a six-cell swatch strip (bg0, panel, accent, focus,
+green, red) painted from that theme's own palette. The strip is dropped when the
+catalog column is too narrow to fit a name beside it.
+
 ## Mouse
 
 Mouse clicks use the same popup rectangle as painting. Click a catalog row to
