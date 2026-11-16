@@ -294,6 +294,8 @@ pub const CATALOG: &[Slot] = &[
     slot("env image-bake", "worktree_pos", SourceKind::Worktree),
     slot("env provision", "worktree", SourceKind::Worktree),
     slot("env provision", "worktree_pos", SourceKind::Worktree),
+    slot("env pull", "worktree", SourceKind::Worktree),
+    slot("env pull", "worktree_pos", SourceKind::Worktree),
     slot("env restore", "worktree", SourceKind::Worktree),
     slot("env restore", "worktree_pos", SourceKind::Worktree),
     slot("env set", "worktree", SourceKind::Worktree),

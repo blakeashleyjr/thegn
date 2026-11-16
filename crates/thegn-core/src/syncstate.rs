@@ -368,9 +368,248 @@ fn replay_script_builder(
     )
 }
 
+/// Build the sh script that seeds the sandbox repository at `workdir` from a
+/// staged `git bundle` of the host branch (THE-2021: no in-sandbox credential).
+///
+/// Idempotent: when `workdir` is already a repository whose `HEAD` is
+/// `expected_oid` or a descendant of it, the staged bundle is removed and the
+/// script exits 0. Otherwise an empty (or missing) workdir is cloned from the
+/// bundle (`git clone --no-checkout`, then `checkout`, then the bundle-path
+/// `origin` is removed); a non-empty workdir is `git init`ed if needed and the
+/// branch is fetched into a scratch ref and fast-forwarded (never forced, so a
+/// diverged sandbox branch fails instead of losing work). Every exit path
+/// verifies `HEAD` contains `expected_oid` and a failure prints a
+/// `TG-SEED-ERROR:<stage>` marker with exit 70.
+pub fn bundle_seed_script(
+    workdir: &str,
+    staged_bundle: &str,
+    branch: &str,
+    expected_oid: &str,
+) -> String {
+    let wd = sh_quote(workdir);
+    let bundle = sh_quote(staged_bundle);
+    let br = sh_quote(branch);
+    let oid = sh_quote(expected_oid);
+    let src = sh_quote(&format!("refs/heads/{branch}:{SEED_SCRATCH_REF}"));
+    let remote_ref = sh_quote(&format!("refs/remotes/origin/{branch}"));
+    let local_ref = sh_quote(&format!("refs/heads/{branch}"));
+    format!(
+        "fail() {{ printf 'TG-SEED-ERROR:%s\\n' \"$1\"; exit 70; }}; \
+         contains() {{ git -C {wd} merge-base --is-ancestor {oid} HEAD >/dev/null 2>&1; }}; \
+         cleanup() {{ rm -f -- {bundle} || fail cleanup; rmdir -- \"$(dirname -- {bundle})\" 2>/dev/null || :; }}; \
+         if [ -e {wd}/.git ] && contains; then cleanup; echo 'TG-SEED-OK present'; exit 0; fi; \
+         [ -s {bundle} ] || fail bundle; \
+         mkdir -p -- {wd} || fail workdir; \
+         if [ -z \"$(ls -A -- {wd} 2>/dev/null)\" ]; then \
+           git clone -q --no-checkout -- {bundle} {wd} 2>&1 || fail clone; \
+           git -C {wd} checkout -q -f -B {br} {remote_ref} -- 2>&1 || fail checkout; \
+           git -C {wd} remote remove origin 2>&1 || fail remote; \
+         else \
+           if [ ! -e {wd}/.git ]; then git -C {wd} init -q 2>&1 || fail init; fi; \
+           git -C {wd} fetch -q {bundle} {src} 2>&1 || fail fetch; \
+           if git -C {wd} rev-parse -q --verify {local_ref} >/dev/null 2>&1; then \
+             git -C {wd} checkout -q {br} -- 2>&1 || fail checkout; \
+           else \
+             git -C {wd} checkout -q -b {br} {SEED_SCRATCH_REF} -- 2>&1 || fail checkout; \
+           fi; \
+           git -C {wd} merge -q --ff-only {SEED_SCRATCH_REF} 2>&1 || fail diverged; \
+           git -C {wd} update-ref -d {SEED_SCRATCH_REF} 2>&1 || fail cleanup; \
+         fi; \
+         contains || fail verify; \
+         cleanup; \
+         echo 'TG-SEED-OK seeded'"
+    )
+}
+
+/// Scratch ref a non-empty sandbox workdir fetches the seed bundle into before
+/// fast-forwarding the branch.
+pub const SEED_SCRATCH_REF: &str = "refs/thegn/seed";
+
+/// Build the sh script that bundles the commits made inside the sandbox
+/// repository at `workdir` for the host to pull back. Prints:
+///
+/// ```text
+/// TG-PULL-HEAD <oid>
+/// TG-PULL-NONE              (HEAD is host_tip, or behind it: nothing new)
+/// TG-PULL-BUNDLE <bytes>    (a bundle of HEAD was written to out_path)
+/// ```
+///
+/// The bundle is thin (`HEAD ^<host_tip>`) when the sandbox has `host_tip`,
+/// otherwise a full `HEAD` bundle. Failures print `TG-PULL-ERROR:<stage>`.
+pub fn pull_back_script(workdir: &str, host_tip: &str, out_path: &str) -> String {
+    let wd = sh_quote(workdir);
+    let tip = sh_quote(host_tip);
+    let tip_commit = sh_quote(&format!("{host_tip}^{{commit}}"));
+    let exclude = sh_quote(&format!("^{host_tip}"));
+    let out = sh_quote(out_path);
+    format!(
+        "fail() {{ printf 'TG-PULL-ERROR:%s\\n' \"$1\"; exit 70; }}; \
+         cd {wd} || fail checkout; \
+         h=$(git rev-parse -q --verify HEAD) || fail head; \
+         echo \"TG-PULL-HEAD $h\"; \
+         if [ \"$h\" = {tip} ]; then echo TG-PULL-NONE; exit 0; fi; \
+         rm -f -- {out}; \
+         if git cat-file -e {tip_commit} 2>/dev/null; then \
+           if git merge-base --is-ancestor HEAD {tip} 2>/dev/null; then echo TG-PULL-NONE; exit 0; fi; \
+           git bundle create {out} HEAD {exclude} >/dev/null 2>&1 || fail bundle; \
+         else \
+           git bundle create {out} HEAD >/dev/null 2>&1 || fail bundle; \
+         fi; \
+         [ -s {out} ] || fail bundle; \
+         echo \"TG-PULL-BUNDLE $(wc -c < {out} | tr -d ' ')\""
+    )
+}
+
+/// What [`pull_back_script`] reported.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PullMarkers {
+    /// The sandbox `HEAD`.
+    pub head: String,
+    /// `Some(bytes)` when a bundle was written; `None` for `TG-PULL-NONE`.
+    pub bundle_bytes: Option<u64>,
+}
+
+/// Parse the `TG-PULL-*` markers printed by [`pull_back_script`]. Tolerates
+/// noise around the markers; a `TG-PULL-ERROR:<stage>`, a missing head, a
+/// malformed oid or size, or neither `NONE` nor `BUNDLE` is an error.
+pub fn parse_pull_markers(out: &str) -> Result<PullMarkers, String> {
+    let mut head = None;
+    let mut none = false;
+    let mut bytes = None;
+    for line in out.lines() {
+        let line = line.trim();
+        if let Some(stage) = line.strip_prefix("TG-PULL-ERROR:") {
+            return Err(format!(
+                "pull-back failed in the sandbox at {}",
+                stage.trim()
+            ));
+        } else if let Some(rest) = line.strip_prefix("TG-PULL-HEAD ") {
+            let oid = rest.trim();
+            if !is_hex_oid(oid) {
+                return Err(format!("bad sandbox HEAD in {line:?}"));
+            }
+            head = Some(oid.to_ascii_lowercase());
+        } else if line == "TG-PULL-NONE" {
+            none = true;
+        } else if let Some(rest) = line.strip_prefix("TG-PULL-BUNDLE ") {
+            let n: u64 = rest
+                .trim()
+                .parse()
+                .map_err(|_| format!("bad bundle size in {line:?}"))?;
+            bytes = Some(n);
+        }
+    }
+    let head = head.ok_or("pull-back report missing TG-PULL-HEAD")?;
+    match (none, bytes) {
+        (true, None) => Ok(PullMarkers {
+            head,
+            bundle_bytes: None,
+        }),
+        (false, Some(n)) => Ok(PullMarkers {
+            head,
+            bundle_bytes: Some(n),
+        }),
+        (true, Some(_)) => Err("pull-back report has both TG-PULL-NONE and TG-PULL-BUNDLE".into()),
+        (false, None) => Err("pull-back report has neither TG-PULL-NONE nor TG-PULL-BUNDLE".into()),
+    }
+}
+
+/// A full SHA-1 or SHA-256 hex object id.
+fn is_hex_oid(s: &str) -> bool {
+    matches!(s.len(), 40 | 64) && s.bytes().all(|b| b.is_ascii_hexdigit())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    const OID: &str = "0123456789abcdef0123456789abcdef01234567";
+
+    #[test]
+    fn bundle_seed_script_quotes_and_has_its_verbs() {
+        let s = bundle_seed_script("/work/it's here", "/tmp/st g/bundle", "feat/x", OID);
+        assert!(s.contains("'/work/it'\\''s here'"), "{s}");
+        assert!(s.contains("'/tmp/st g/bundle'"), "{s}");
+        // Idempotence guard first: present-and-contains exits 0 before any clone.
+        let guard = s.find("TG-SEED-OK present").expect("guard");
+        let clone = s.find("git clone -q --no-checkout").expect("clone");
+        assert!(guard < clone);
+        assert!(s.contains(&format!("merge-base --is-ancestor {OID} HEAD")));
+        assert!(s.contains("init -q"));
+        assert!(s.contains("fetch -q '/tmp/st g/bundle' refs/heads/feat/x:refs/thegn/seed"));
+        assert!(s.contains("checkout -q -f -B feat/x refs/remotes/origin/feat/x"));
+        assert!(s.contains("remote remove origin"));
+        assert!(s.contains("merge -q --ff-only refs/thegn/seed"));
+        assert!(s.contains("contains || fail verify"));
+        assert!(s.contains("rm -f -- '/tmp/st g/bundle'"));
+        assert!(
+            !s.contains("--force") && !s.contains("+refs/"),
+            "never forced"
+        );
+    }
+
+    #[test]
+    fn pull_back_script_quotes_excludes_and_falls_back() {
+        let s = pull_back_script("/work/it's here", OID, "/tmp/p d/out.bundle");
+        assert!(
+            s.contains("cd '/work/it'\\''s here' || fail checkout"),
+            "{s}"
+        );
+        assert!(s.contains("TG-PULL-HEAD"));
+        assert!(s.contains(&format!("\"$h\" = {OID}")));
+        assert!(s.contains("TG-PULL-NONE"));
+        assert!(
+            s.contains(&format!("git cat-file -e '{OID}^{{commit}}'")),
+            "{s}"
+        );
+        assert!(s.contains(&format!(
+            "git bundle create '/tmp/p d/out.bundle' HEAD '^{OID}'"
+        )));
+        assert!(
+            s.contains("else git bundle create '/tmp/p d/out.bundle' HEAD >/dev/null"),
+            "full-bundle fallback: {s}"
+        );
+        assert!(s.contains("TG-PULL-BUNDLE $(wc -c"));
+    }
+
+    #[test]
+    fn parse_pull_markers_pretty_and_noisy() {
+        let pretty = format!("TG-PULL-HEAD {OID}\nTG-PULL-BUNDLE 2048\n");
+        assert_eq!(
+            parse_pull_markers(&pretty).unwrap(),
+            PullMarkers {
+                head: OID.into(),
+                bundle_bytes: Some(2048)
+            }
+        );
+        let noisy = format!(
+            "Welcome to the box\r\n  TG-PULL-HEAD {}  \r\nwarning: x\n TG-PULL-NONE\n",
+            OID.to_ascii_uppercase()
+        );
+        assert_eq!(
+            parse_pull_markers(&noisy).unwrap(),
+            PullMarkers {
+                head: OID.into(),
+                bundle_bytes: None
+            }
+        );
+    }
+
+    #[test]
+    fn parse_pull_markers_rejects_bad_reports() {
+        assert!(parse_pull_markers("TG-PULL-NONE\n").is_err(), "no head");
+        assert!(parse_pull_markers(&format!("TG-PULL-HEAD {OID}\n")).is_err());
+        assert!(parse_pull_markers("TG-PULL-HEAD nothex\nTG-PULL-NONE\n").is_err());
+        assert!(parse_pull_markers(&format!("TG-PULL-HEAD {OID}\nTG-PULL-BUNDLE x\n")).is_err());
+        assert!(
+            parse_pull_markers(&format!(
+                "TG-PULL-HEAD {OID}\nTG-PULL-NONE\nTG-PULL-BUNDLE 1\n"
+            ))
+            .is_err()
+        );
+        let err = parse_pull_markers("TG-PULL-ERROR:bundle\n").unwrap_err();
+        assert!(err.contains("bundle"), "{err}");
+    }
 
     #[test]
     fn capture_script_stages_are_guarded_and_trailer_is_emitted() {
