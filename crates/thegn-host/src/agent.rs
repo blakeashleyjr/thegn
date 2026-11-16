@@ -2701,13 +2701,14 @@ mod env_selection_tests {
 /// suspended sandbox, a lost exit frame) into a clear step failure.
 pub(crate) fn provision_step_timeout(step_id: &str) -> std::time::Duration {
     use std::time::Duration;
-    // Only `workspace` (mkdir) and `git_auth` (git config) are truly instant — a
-    // stall there is the suspended-sandbox hang we want to catch fast. Everything
-    // else can legitimately run for minutes (clone, package installs incl. the
-    // openssh the ssh transport needs, npm agents, the nix devshell build, closure
-    // substitution), so give it a generous ceiling that still bounds an infinite
-    // hang rather than risk a false failure mid-build.
-    let instant = matches!(step_id, "workspace" | "git_auth");
+    // Only `workspace` (mkdir) is truly instant — a stall there is the
+    // suspended-sandbox hang we want to catch fast. Everything else can
+    // legitimately run for minutes (`git_auth` installs git on an image that
+    // lacks it, clone, package installs incl. the openssh the ssh transport
+    // needs, npm agents, the nix devshell build, closure substitution), so give
+    // it a generous ceiling that still bounds an infinite hang rather than risk
+    // a false failure mid-build.
+    let instant = matches!(step_id, "workspace");
     if instant {
         Duration::from_secs(120) // 2 min — catches the suspended-sandbox hang fast
     } else {
@@ -3965,14 +3966,37 @@ fn provision_provider_repo(cfg: &Config, repo_root: &Path, loc: &GitLoc, branch:
             Err(e) => thegn_core::msg::warn(&format!("provider repo provision via bridge: {e}")),
         }
     }
-    match loc.sh_command(&script).output() {
+    let mut command = loc.sh_command(&script);
+    match command.output() {
         Ok(o) if o.status.success() => initialize_provider_submodules(cfg, repo_root, loc),
         Ok(o) => thegn_core::msg::warn(&format!(
             "provider repo provision failed ({}): {}",
             o.status,
             crate::provision_recover::stderr_gist(&String::from_utf8_lossy(&o.stderr))
         )),
-        Err(e) => thegn_core::msg::warn(&format!("provider repo provision spawn failed: {e}")),
+        Err(e) => thegn_core::msg::warn(&spawn_failure_message(
+            "provider repo provision",
+            command.get_program(),
+            &e,
+        )),
+    }
+}
+
+/// A spawn failure naming the program that could not be started: a bare
+/// `No such file or directory` from a daemon whose PATH lacks the provider CLI
+/// is otherwise undiagnosable.
+pub(crate) fn spawn_failure_message(
+    what: &str,
+    program: &std::ffi::OsStr,
+    error: &std::io::Error,
+) -> String {
+    let program = program.to_string_lossy();
+    if error.kind() == std::io::ErrorKind::NotFound {
+        format!(
+            "{what} spawn failed: `{program}` not found ({error}) — is it installed and on this process's PATH?"
+        )
+    } else {
+        format!("{what} spawn failed: could not run `{program}`: {error}")
     }
 }
 
