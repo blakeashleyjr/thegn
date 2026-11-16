@@ -41,6 +41,9 @@ pub(crate) struct CatalogItem {
     pub name: String,
     pub theme: UserTheme,
     pub builtin: bool,
+    /// The theme's resolved palette, computed once when the catalog is built
+    /// so the swatch strip never re-derives it per frame.
+    pub palette: Palette,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -844,12 +847,14 @@ impl ThemeBuilder {
                     .position(|item| item.name == theme.meta.name)
                 {
                     if !self.catalog[index].builtin {
+                        self.catalog[index].palette = thegn_core::theme_user::to_palette(&theme);
                         self.catalog[index].theme = theme;
                         self.selected = index;
                     }
                 } else {
                     self.catalog.push(CatalogItem {
                         name: theme.meta.name.clone(),
+                        palette: thegn_core::theme_user::to_palette(&theme),
                         theme,
                         builtin: false,
                     });
@@ -877,10 +882,14 @@ impl ThemeBuilder {
 fn catalog(cfg: &thegn_core::config::Config, users: &[UserTheme]) -> Vec<CatalogItem> {
     let mut out = thegn_core::theme::PRESETS
         .iter()
-        .map(|name| CatalogItem {
-            name: (*name).into(),
-            theme: UserTheme::from_palette(*name, &cfg.palette_with_user_themes(name, users)),
-            builtin: true,
+        .map(|name| {
+            let palette = cfg.palette_with_user_themes(name, users);
+            CatalogItem {
+                name: (*name).into(),
+                theme: UserTheme::from_palette(*name, &palette),
+                builtin: true,
+                palette,
+            }
         })
         .collect::<Vec<_>>();
     for user in users {
@@ -889,6 +898,7 @@ fn catalog(cfg: &thegn_core::config::Config, users: &[UserTheme]) -> Vec<Catalog
                 name: user.meta.name.clone(),
                 theme: user.clone(),
                 builtin: false,
+                palette: thegn_core::theme_user::to_palette(user),
             });
         }
     }
@@ -1218,11 +1228,16 @@ impl ThemeBuilder {
                 " "
             };
             let kind = if item.builtin { "builtin" } else { "user" };
+            let strip = strip_width(layout.catalog.cols);
+            let name_cols = layout
+                .catalog
+                .cols
+                .saturating_sub(strip + usize::from(strip > 0));
             seg::draw_line(
                 surface,
                 inner.x,
                 y,
-                layout.catalog.cols,
+                name_cols,
                 &Line::segs(vec![
                     seg(fg, format!("{marker} {}", item.name)),
                     sp(1),
@@ -1230,6 +1245,20 @@ impl ThemeBuilder {
                 ]),
                 bg,
             );
+            if strip > 0 {
+                let cells = swatch_strip(&item.palette)
+                    .into_iter()
+                    .map(|fill| seg(Tok::Slot(S::Text), " ").bg(fill))
+                    .collect::<Vec<_>>();
+                seg::draw_line(
+                    surface,
+                    inner.x + layout.catalog.cols - strip,
+                    y,
+                    strip,
+                    &Line::segs(cells),
+                    bg,
+                );
+            }
         }
         if self.picker.is_some() {
             self.render_picker(surface, layout.editor, panel);
@@ -1268,7 +1297,20 @@ impl ThemeBuilder {
                 bg,
             );
         }
-        render_preview(surface, layout.preview, panel);
+        let highlight = self.selected_role();
+        render_preview(surface, layout.preview, panel, highlight);
+        if let Some(role) = highlight
+            && layout.preview.rows > CONTRAST_ROW + 2
+        {
+            seg::draw_line(
+                surface,
+                layout.preview.x,
+                layout.preview.y + CONTRAST_ROW - 1,
+                layout.preview.cols,
+                &Line::segs(vec![seg(Tok::Slot(S::Dim), preview_legend(role))]),
+                panel,
+            );
+        }
         // The selected role's own contrast, under the preview sample; the
         // status/input line keeps the column's last row.
         if let Some(role) = self.selected_role()
@@ -1489,63 +1531,153 @@ impl ThemeBuilder {
     }
 }
 
-fn render_preview(surface: &mut Surface, preview: Rect, panel: Tok) {
+/// Catalog swatch strip: bg0, panel, accent, focus, green, red.
+const STRIP_CELLS: usize = 6;
+/// Narrowest catalog column that still has room for a name beside the strip.
+const STRIP_MIN_COLS: usize = 24;
+
+/// Cells the swatch strip takes in a catalog column of `cols` (0 = dropped).
+fn strip_width(cols: usize) -> usize {
+    if cols >= STRIP_MIN_COLS {
+        STRIP_CELLS
+    } else {
+        0
+    }
+}
+
+/// A palette token string (`r;g;b`) as a fill; unparsable values fall back to
+/// the panel slot so a bad theme never drops a cell.
+fn palette_fill(value: &str) -> Tok {
+    let mut parts = value.split(';').map(|part| part.trim().parse::<u8>());
+    match (parts.next(), parts.next(), parts.next()) {
+        (Some(Ok(r)), Some(Ok(g)), Some(Ok(b))) => Tok::Rgb(r, g, b),
+        _ => Tok::Slot(S::Panel),
+    }
+}
+
+fn swatch_strip(p: &Palette) -> [Tok; STRIP_CELLS] {
+    [
+        palette_fill(&p.bg0),
+        palette_fill(&p.panel),
+        palette_fill(&p.accent),
+        palette_fill(&p.focus),
+        palette_fill(&p.hues.green),
+        palette_fill(&p.hues.red),
+    ]
+}
+
+/// One preview segment and the palette role it demonstrates (`None` for
+/// derived tokens that are not an editable role).
+type PreviewSeg = (Option<ColorRole>, Seg);
+
+fn pseg(role: Option<ColorRole>, fg: Tok, text: impl Into<String>) -> PreviewSeg {
+    (role, seg(fg, text))
+}
+
+fn preview_segs() -> Vec<Vec<PreviewSeg>> {
+    let dot = crate::caps::glyph(crate::caps::Glyph::DotFilled);
+    let gap = || (None, sp(1));
+    vec![
+        vec![
+            pseg(Some(ColorRole::Dim), Tok::Slot(S::Dim), format!("{dot} ")),
+            pseg(Some(ColorRole::Text), Tok::Slot(S::Text), "sidebar row"),
+            gap(),
+            pseg(Some(ColorRole::Teal), Tok::Hue(Hue::Teal), "active"),
+        ],
+        vec![
+            pseg(Some(ColorRole::Accent), Tok::Slot(S::Accent), " main "),
+            gap(),
+            pseg(Some(ColorRole::Focus), Tok::Slot(S::Focus), "focused tab"),
+            gap(),
+            pseg(Some(ColorRole::Purple), Tok::Hue(Hue::Purple), dot),
+        ],
+        vec![
+            pseg(None, Tok::Slot(S::ActivityActive), " status "),
+            gap(),
+            pseg(Some(ColorRole::Green), Tok::Hue(Hue::Green), "ready"),
+            gap(),
+            pseg(Some(ColorRole::Amber), Tok::Hue(Hue::Amber), "warning"),
+            gap(),
+            pseg(Some(ColorRole::Red), Tok::Hue(Hue::Red), "error"),
+        ],
+        vec![
+            pseg(Some(ColorRole::Green), Tok::Hue(Hue::Green), "+ added hunk"),
+            gap(),
+            pseg(Some(ColorRole::Red), Tok::Hue(Hue::Red), "- removed hunk"),
+            gap(),
+            pseg(Some(ColorRole::Blue), Tok::Sel(Hue::Blue, 35), "diff"),
+        ],
+        vec![
+            pseg(Some(ColorRole::Border), Tok::Slot(S::Border), " pane "),
+            gap(),
+            pseg(Some(ColorRole::Text), Tok::Slot(S::Text), "structural text"),
+            gap(),
+            pseg(None, Tok::Slot(S::Ghost3), format!("{dot}{dot}{dot}")),
+        ],
+        vec![
+            pseg(Some(ColorRole::Accent), Tok::SelAccent, " selected row "),
+            gap(),
+            pseg(None, Tok::Heat(4), "heat"),
+            gap(),
+            pseg(Some(ColorRole::Orange), Tok::Hue(Hue::Orange), "activity"),
+        ],
+    ]
+}
+
+/// Whether any preview segment demonstrates `role`.
+fn preview_shows(role: ColorRole) -> bool {
+    preview_segs()
+        .iter()
+        .flatten()
+        .any(|(candidate, _)| *candidate == Some(role))
+}
+
+/// The legend under the preview: the elements `ELEMENT_GROUPS` says the role
+/// paints, or a note that the mock does not show it.
+fn preview_legend(role: ColorRole) -> String {
+    if !preview_shows(role) {
+        return "not shown in preview".into();
+    }
+    let mut labels: Vec<&str> = Vec::new();
+    for (_, elements) in ELEMENT_GROUPS {
+        for (label, element_role) in *elements {
+            if *element_role == role && !labels.contains(label) {
+                labels.push(label);
+            }
+        }
+    }
+    format!("highlighted: {}", labels.join(", "))
+}
+
+fn render_preview(surface: &mut Surface, preview: Rect, panel: Tok, highlight: Option<ColorRole>) {
     if preview.rows == 0 || preview.cols == 0 {
         return;
     }
-    let x = preview.x;
-    let y = preview.y;
-    let dot = crate::caps::glyph(crate::caps::Glyph::DotFilled);
-    let rows = [
-        Line::segs(vec![
-            seg(Tok::Slot(S::Dim), format!("{dot} ")),
-            seg(Tok::Slot(S::Text), "sidebar row"),
-            sp(1),
-            seg(Tok::Hue(Hue::Teal), "active"),
-        ]),
-        Line::segs(vec![
-            seg(Tok::Slot(S::Accent), " main "),
-            sp(1),
-            seg(Tok::Slot(S::Focus), "focused tab"),
-            sp(1),
-            seg(Tok::Hue(Hue::Purple), dot),
-        ]),
-        Line::segs(vec![
-            seg(Tok::Slot(S::ActivityActive), " status "),
-            sp(1),
-            seg(Tok::Hue(Hue::Green), "ready"),
-            sp(1),
-            seg(Tok::Hue(Hue::Amber), "warning"),
-            sp(1),
-            seg(Tok::Hue(Hue::Red), "error"),
-        ]),
-        Line::segs(vec![
-            seg(Tok::Hue(Hue::Green), "+ added hunk"),
-            sp(1),
-            seg(Tok::Hue(Hue::Red), "- removed hunk"),
-            sp(1),
-            seg(Tok::Sel(Hue::Blue, 35), "diff"),
-        ]),
-        Line::segs(vec![
-            seg(Tok::Slot(S::Border), " pane "),
-            sp(1),
-            seg(Tok::Slot(S::Text), "structural text"),
-            sp(1),
-            seg(Tok::Slot(S::Ghost3), format!("{dot}{dot}{dot}")),
-        ]),
-        Line::segs(vec![
-            seg(Tok::SelAccent, " selected row "),
-            sp(1),
-            seg(Tok::Heat(4), "heat"),
-            sp(1),
-            seg(Tok::Hue(Hue::Orange), "activity"),
-        ]),
-    ];
-    for (row, line) in rows.iter().enumerate() {
-        if y + row >= preview.y + preview.rows {
+    let marker = crate::caps::active_glyphs().arrow_right;
+    for (row, segs) in preview_segs().into_iter().enumerate() {
+        if row >= preview.rows {
             break;
         }
-        seg::draw_line(surface, x, y + row, preview.cols, line, panel);
+        let mut out = Vec::with_capacity(segs.len() + 1);
+        let lit = highlight.is_some() && segs.iter().any(|(role, _)| *role == highlight);
+        if lit {
+            out.push(seg(Tok::Slot(S::Accent), marker));
+        }
+        for (role, s) in segs {
+            if highlight.is_some() && role == highlight {
+                out.push(s.under(seg::Under::Single));
+            } else {
+                out.push(s);
+            }
+        }
+        seg::draw_line(
+            surface,
+            preview.x,
+            preview.y + row,
+            preview.cols,
+            &Line::segs(out),
+            panel,
+        );
     }
 }
 
@@ -1663,6 +1795,54 @@ mod tests {
                 ),
                 BuilderEvent::Apply { .. }
             ));
+        }
+    }
+
+    #[test]
+    fn every_role_highlights_a_preview_segment_or_says_it_is_not_shown() {
+        for (role, _) in ROLES {
+            let legend = preview_legend(role);
+            if preview_shows(role) {
+                assert!(legend.starts_with("highlighted: "), "{legend}");
+                assert!(legend.len() > "highlighted: ".len(), "{legend}");
+            } else {
+                assert_eq!(legend, "not shown in preview");
+            }
+        }
+    }
+
+    #[test]
+    fn selected_role_underlines_its_preview_segments_and_shows_a_legend() {
+        let mut b = builder();
+        // Token view, focus on the first role (bg0) is not in the mock; move
+        // to `text`, which is.
+        b.focus = ROLES
+            .iter()
+            .position(|(r, _)| *r == ColorRole::Text)
+            .unwrap();
+        let mut surface = Surface::new(106, 30);
+        b.render(&mut surface, Rect::full(106, 30));
+        let text = surface.screen_chars_to_string();
+        assert!(text.contains("highlighted: "), "{text}");
+        let underlined = surface
+            .screen_cells()
+            .into_iter()
+            .flatten()
+            .filter(|cell| cell.attrs().underline() != termwiz::cell::Underline::None)
+            .count();
+        assert!(underlined > 0);
+    }
+
+    #[test]
+    fn swatch_strip_has_six_cells_and_drops_when_narrow() {
+        let p = thegn_core::config::Config::default().palette();
+        assert_eq!(swatch_strip(&p).len(), 6);
+        assert_eq!(strip_width(CATALOG_COLS), 6);
+        assert_eq!(strip_width(STRIP_MIN_COLS - 1), 0);
+        assert_eq!(palette_fill("1;2;3"), Tok::Rgb(1, 2, 3));
+        assert_eq!(palette_fill("nope"), Tok::Slot(S::Panel));
+        for item in builder().catalog.iter() {
+            assert_eq!(swatch_strip(&item.palette).len(), 6);
         }
     }
 
