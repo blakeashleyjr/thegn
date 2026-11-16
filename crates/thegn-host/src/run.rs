@@ -1689,6 +1689,8 @@ impl SidebarState {
         model.sidebar_menu = self.menu.clone();
         model.sidebar_scroll = self.scroll;
         model.sidebar_rail = self.mode == crate::layout::SidebarMode::Rail;
+        // The masthead's hidden-sidebar chip reads the full mode (THE-2032).
+        model.sidebar_mode = self.mode;
         model.sidebar_display = self.view.display.clone();
         // The `i` runtime override wins over the `[ui]` config value the
         // display struct carries (see `SidebarState::focus_detail`).
@@ -18016,6 +18018,56 @@ async fn event_loop<T: Terminal>(
                         );
                         mouse_sel = Some((id, crate::copymode::Selection::new(cell)));
                         mouse_selecting = true;
+                    } else if chrome.masthead_stats_row().contains(mx, my)
+                        && crate::masthead::masthead_sidebar_chip_span(&model, &chrome)
+                            .is_some_and(|r| r.contains(mx, my))
+                    {
+                        // THE-2032: the hidden-sidebar chip cycles the mode
+                        // exactly like Ctrl+Alt+s (`Action::ToggleSidebar`).
+                        sb.mode = sb.mode.cycle();
+                        want_sidebar = sb.mode != crate::layout::SidebarMode::Hidden;
+                        sidebar_cols = sb.effective_cols(cols);
+                        sb.persist("sidebar_mode", sb.mode.as_key());
+                        chrome = recompute_chrome!();
+                        if !want_sidebar && focus.sidebar() {
+                            focus.zone = crate::focus::Zone::Center;
+                            sb.focused = false;
+                        }
+                        sb.sync(&mut model);
+                        need_relayout = true;
+                        dirty = true;
+                    } else if let Some(target) = chrome
+                        .masthead_stats_row()
+                        .contains(mx, my)
+                        .then(|| {
+                            crate::masthead::chip_at(
+                                &crate::masthead::masthead_chip_spans(&model, &chrome),
+                                mx,
+                                my,
+                            )
+                        })
+                        .flatten()
+                        .and_then(|i| app_host.tab_target(i))
+                    {
+                        // THE-2022: an app-tab chip switches through the same
+                        // AppHost path as the Alt+N chords. A failed tile says
+                        // why instead of switching to an empty tab.
+                        if let Some(reason) = app_host.tab_failure_status(target) {
+                            model.status = reason;
+                        } else if ensure_app_loaded(
+                            &mut app_host,
+                            target,
+                            &app_tx,
+                            &waker,
+                            &current_config,
+                        )
+                        .await
+                        {
+                            app_host.set_active(target);
+                        } else if let Some(reason) = app_host.tab_failure_status(target) {
+                            model.status = reason;
+                        }
+                        dirty = true;
                     } else if chrome.masthead_stats_row().contains(mx, my) {
                         // Click a masthead stat item to focus it + open its
                         // detail view (CPU graph, etc.).
