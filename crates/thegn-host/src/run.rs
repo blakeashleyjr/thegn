@@ -14292,7 +14292,8 @@ async fn event_loop<T: Terminal>(
                         },
                     );
                     bars_dirty |= reload_outcome.bars_dirty;
-                    dirty |= reload_outcome.dirty;
+                    // `reload_outcome.dirty` is implied: every reload ends in
+                    // an unconditional `dirty = true` below.
                     if let Some(poll) = reload_outcome.weather_poll {
                         // One-shot spawn_blocking, off the loop.
                         crate::hydrate_weather::spawn_poll_with_generation(
@@ -18035,7 +18036,6 @@ async fn event_loop<T: Terminal>(
                         }
                         sb.sync(&mut model);
                         need_relayout = true;
-                        dirty = true;
                     } else if let Some(target) = chrome
                         .masthead_stats_row()
                         .contains(mx, my)
@@ -18067,7 +18067,6 @@ async fn event_loop<T: Terminal>(
                         } else if let Some(reason) = app_host.tab_failure_status(target) {
                             model.status = reason;
                         }
-                        dirty = true;
                     } else if chrome.masthead_stats_row().contains(mx, my) {
                         // Click a masthead stat item to focus it + open its
                         // detail view (CPU graph, etc.).
