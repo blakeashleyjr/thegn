@@ -436,6 +436,390 @@ fn exec_argv(argv: &[String], timeout: Duration) -> Result<ExecOut, ExecFail> {
     }
 }
 
+/// Why a local → host pipe failed. Every variant is reported only after both
+/// sides were stopped (or had exited) and were reaped.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PipeError {
+    /// The deadline passed; the producer and host command were killed.
+    Timeout { secs: u64 },
+    /// The producer emitted more than `limit` bytes. Both sides were killed
+    /// before the host command could see end-of-input on a truncated stream.
+    Budget { limit: u64 },
+    /// A side, or the plumbing between them, could not be started.
+    Spawn(String),
+    /// A side exited unsuccessfully, or could not be observed or read.
+    Exit(String),
+}
+
+impl std::fmt::Display for PipeError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            PipeError::Timeout { secs } => write!(f, "pipe: timed out after {secs}s"),
+            PipeError::Budget { limit } => {
+                write!(f, "pipe: stream exceeded its {limit}-byte budget")
+            }
+            PipeError::Spawn(msg) | PipeError::Exit(msg) => f.write_str(msg),
+        }
+    }
+}
+
+impl std::error::Error for PipeError {}
+
+/// How [`copy_bounded`] stopped.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum CopyEnd {
+    /// The reader hit end-of-file after forwarding this many bytes.
+    Eof(u64),
+    /// The next read would have pushed the total past the limit; the excess
+    /// was not forwarded.
+    Budget,
+    /// Reading the producer failed.
+    Read(String),
+    /// Writing to the consumer failed (it went away); exit statuses decide.
+    Write(String),
+}
+
+/// Copy `reader` into `writer`, never forwarding more than `max_bytes`.
+fn copy_bounded(
+    reader: &mut impl std::io::Read,
+    writer: &mut impl std::io::Write,
+    max_bytes: u64,
+) -> CopyEnd {
+    let mut buf = vec![0u8; 64 * 1024];
+    let mut total: u64 = 0;
+    loop {
+        let n = match reader.read(&mut buf) {
+            Ok(0) => break,
+            Ok(n) => n,
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(error) => return CopyEnd::Read(error.to_string()),
+        };
+        if total.saturating_add(n as u64) > max_bytes {
+            return CopyEnd::Budget;
+        }
+        if let Err(error) = writer.write_all(&buf[..n]) {
+            return CopyEnd::Write(error.to_string());
+        }
+        total += n as u64;
+    }
+    match writer.flush() {
+        Ok(()) => CopyEnd::Eof(total),
+        Err(error) => CopyEnd::Write(error.to_string()),
+    }
+}
+
+/// Kill `child`'s whole process group, then reap the leader. Only call while
+/// the leader is unreaped: its zombie pins the pgid, so the group signal can
+/// never reach a recycled, unrelated group.
+fn stop_group(child: &mut std::process::Child, side: &'static str) {
+    crate::plugin::proc::kill_group(child.id());
+    if let Err(error) = child.kill() {
+        tracing::debug!(target: "thegn::host::pipe", %error, side, "failed to stop pipe side");
+    }
+    if let Err(error) = child.wait() {
+        tracing::debug!(target: "thegn::host::pipe", %error, side, "failed to reap pipe side");
+    }
+}
+
+/// Describe a producer that exited unsuccessfully, from the last 4 KiB of its
+/// captured stderr.
+fn producer_failure(
+    status: std::process::ExitStatus,
+    stderr_file: &mut std::fs::File,
+) -> PipeError {
+    use std::io::{Read, Seek, SeekFrom};
+    let tail = (|| -> std::io::Result<String> {
+        let len = stderr_file.metadata()?.len();
+        stderr_file.seek(SeekFrom::Start(len.saturating_sub(4096)))?;
+        let mut bytes = Vec::new();
+        stderr_file.read_to_end(&mut bytes)?;
+        Ok(String::from_utf8_lossy(&bytes).into_owned())
+    })();
+    let stderr = match tail {
+        Ok(stderr) => stderr,
+        Err(error) => return PipeError::Exit(format!("pipe: producer stderr: {error}")),
+    };
+    if let Some(code) = status.code() {
+        return PipeError::Exit(describe_exec_failure(
+            "pipe: local producer",
+            Some(code),
+            false,
+            &stderr,
+        ));
+    }
+    let last = stderr
+        .lines()
+        .rev()
+        .find(|line| !line.trim().is_empty())
+        .map(str::trim)
+        .unwrap_or("");
+    PipeError::Exit(if last.is_empty() {
+        "pipe: local producer was killed by a signal".into()
+    } else {
+        format!("pipe: local producer was killed by a signal: {last}")
+    })
+}
+
+/// The copier's result plus, after a budget overflow, the consumer's stdin
+/// held open so the consumer is killed before it can see end-of-input.
+type CopyResult = (CopyEnd, Option<std::process::ChildStdin>);
+
+/// Spawn `producer_argv` and `consumer_argv`, each leading its own process
+/// group, and copy the producer's stdout into the consumer's stdin through a
+/// counter bounded by `max_bytes`. See [`OciRunner::pipe_local_to_host_bounded`].
+fn pipe_argv_bounded(
+    producer_argv: &[String],
+    consumer_argv: &[String],
+    timeout: Duration,
+    max_bytes: u64,
+) -> Result<u64, PipeError> {
+    use std::io::Read;
+    use std::process::{Command, Stdio};
+    let (Some(producer_bin), Some(consumer_bin)) = (producer_argv.first(), consumer_argv.first())
+    else {
+        return Err(PipeError::Spawn("pipe: empty command".into()));
+    };
+    let deadline = Instant::now() + timeout;
+    let mut producer_stderr = tempfile::tempfile()
+        .map_err(|e| PipeError::Spawn(format!("pipe: producer stderr: {e}")))?;
+    let producer_stderr_child = producer_stderr
+        .try_clone()
+        .map_err(|e| PipeError::Spawn(format!("pipe: producer stderr: {e}")))?;
+    let mut command = Command::new(producer_bin);
+    command
+        .args(&producer_argv[1..])
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::from(producer_stderr_child));
+    crate::plugin::proc::set_process_group(&mut command);
+    let mut producer = command
+        .spawn()
+        .map_err(|e| PipeError::Spawn(format!("pipe: spawn {producer_bin}: {e}")))?;
+    let Some(producer_out) = producer.stdout.take() else {
+        stop_group(&mut producer, "producer");
+        return Err(PipeError::Spawn("pipe: producer has no stdout".into()));
+    };
+    let mut command = Command::new(consumer_bin);
+    command
+        .args(&consumer_argv[1..])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped());
+    crate::plugin::proc::set_process_group(&mut command);
+    let mut consumer = match command.spawn() {
+        Ok(consumer) => consumer,
+        Err(error) => {
+            stop_group(&mut producer, "producer");
+            return Err(PipeError::Spawn(format!("pipe: spawn host cmd: {error}")));
+        }
+    };
+    let (Some(consumer_in), Some(consumer_err)) = (consumer.stdin.take(), consumer.stderr.take())
+    else {
+        stop_group(&mut consumer, "consumer");
+        stop_group(&mut producer, "producer");
+        return Err(PipeError::Spawn("pipe: host cmd has no stdio".into()));
+    };
+    let copier = thegn_core::thread_name::spawn_named("thegn-pipe-copy", move || -> CopyResult {
+        let mut reader = producer_out;
+        let mut writer = consumer_in;
+        let end = copy_bounded(&mut reader, &mut writer, max_bytes);
+        if end == CopyEnd::Budget {
+            (end, Some(writer))
+        } else {
+            (end, None)
+        }
+    });
+    // Drain the host command's stderr while it runs so a chatty host cannot
+    // block on a full pipe; keep at most 64 KiB of it.
+    let err_reader = thegn_core::thread_name::spawn_named("thegn-pipe-err", move || {
+        let mut reader = consumer_err;
+        let mut kept = Vec::new();
+        if let Err(error) = (&mut reader).take(64 * 1024).read_to_end(&mut kept) {
+            tracing::debug!(target: "thegn::host::pipe", %error, "host cmd stderr read failed");
+        }
+        if let Err(error) = std::io::copy(&mut reader, &mut std::io::sink()) {
+            tracing::debug!(target: "thegn::host::pipe", %error, "host cmd stderr drain failed");
+        }
+        String::from_utf8_lossy(&kept).into_owned()
+    });
+    let timed_out = || PipeError::Timeout {
+        secs: timeout.as_secs(),
+    };
+    loop {
+        // A budget overflow wins over every other outcome: the consumer's stdin
+        // is still held open, so the consumer is killed before seeing EOF.
+        if copier.is_finished() {
+            let (end, held_stdin) = copier
+                .join()
+                .unwrap_or_else(|_| (CopyEnd::Read("pipe copier panicked".into()), None));
+            if end == CopyEnd::Budget {
+                stop_group(&mut consumer, "consumer");
+                stop_group(&mut producer, "producer");
+                drop(held_stdin);
+                return Err(PipeError::Budget { limit: max_bytes });
+            }
+            return finish_after_copy(
+                end,
+                &mut producer,
+                &mut producer_stderr,
+                &mut consumer,
+                err_reader,
+                deadline,
+                timed_out(),
+            );
+        }
+        match consumer.try_wait() {
+            Ok(Some(status)) if status.success() => {
+                // The host command finished early (without reading to EOF);
+                // the producer still has to finish and succeed.
+                return wait_producer_then_copier(
+                    &mut producer,
+                    &mut producer_stderr,
+                    copier,
+                    deadline,
+                    timed_out(),
+                    max_bytes,
+                );
+            }
+            Ok(Some(status)) => {
+                // The transfer has failed; stop the producer now instead of
+                // spending the remaining deadline waiting.
+                stop_group(&mut producer, "producer");
+                if copier.is_finished()
+                    && let Ok((CopyEnd::Budget, _held)) = copier.join()
+                {
+                    return Err(PipeError::Budget { limit: max_bytes });
+                }
+                let err = err_reader.join().unwrap_or_default();
+                return Err(PipeError::Exit(describe_exec_failure(
+                    "pipe: host cmd",
+                    status.code(),
+                    false,
+                    &err,
+                )));
+            }
+            Ok(None) if Instant::now() >= deadline => {
+                stop_group(&mut consumer, "consumer");
+                stop_group(&mut producer, "producer");
+                return Err(timed_out());
+            }
+            Ok(None) => std::thread::sleep(Duration::from_millis(25)),
+            Err(error) => {
+                stop_group(&mut consumer, "consumer");
+                stop_group(&mut producer, "producer");
+                return Err(PipeError::Exit(format!("pipe: wait: {error}")));
+            }
+        }
+    }
+}
+
+/// The copier reached the end of the producer's stream (or failed): wait for
+/// the host command, then the producer, both bounded by `deadline`.
+fn finish_after_copy(
+    end: CopyEnd,
+    producer: &mut std::process::Child,
+    producer_stderr: &mut std::fs::File,
+    consumer: &mut std::process::Child,
+    err_reader: std::thread::JoinHandle<String>,
+    deadline: Instant,
+    timed_out: PipeError,
+) -> Result<u64, PipeError> {
+    let consumer_status = loop {
+        match consumer.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) if Instant::now() >= deadline => {
+                stop_group(consumer, "consumer");
+                stop_group(producer, "producer");
+                return Err(timed_out);
+            }
+            Ok(None) => std::thread::sleep(Duration::from_millis(25)),
+            Err(error) => {
+                stop_group(consumer, "consumer");
+                stop_group(producer, "producer");
+                return Err(PipeError::Exit(format!("pipe: wait: {error}")));
+            }
+        }
+    };
+    if !consumer_status.success() {
+        stop_group(producer, "producer");
+        let err = err_reader.join().unwrap_or_default();
+        return Err(PipeError::Exit(describe_exec_failure(
+            "pipe: host cmd",
+            consumer_status.code(),
+            false,
+            &err,
+        )));
+    }
+    let producer_status = wait_producer(producer, deadline, timed_out)?;
+    if !producer_status.success() {
+        return Err(producer_failure(producer_status, producer_stderr));
+    }
+    match end {
+        CopyEnd::Eof(bytes) => Ok(bytes),
+        // Both sides succeeded although the host command stopped reading
+        // early; nothing was lost that it asked for.
+        CopyEnd::Write(_) => Ok(0),
+        CopyEnd::Read(error) => Err(PipeError::Exit(format!("pipe: read producer: {error}"))),
+        CopyEnd::Budget => Err(PipeError::Exit("pipe: budget state lost".into())),
+    }
+}
+
+/// The host command already succeeded: wait for the producer, then for the
+/// copier to drain, both bounded by `deadline`.
+fn wait_producer_then_copier(
+    producer: &mut std::process::Child,
+    producer_stderr: &mut std::fs::File,
+    copier: std::thread::JoinHandle<CopyResult>,
+    deadline: Instant,
+    timed_out: PipeError,
+    max_bytes: u64,
+) -> Result<u64, PipeError> {
+    let producer_status = wait_producer(producer, deadline, timed_out.clone())?;
+    if !producer_status.success() {
+        return Err(producer_failure(producer_status, producer_stderr));
+    }
+    // A detached descendant still holding the producer's stdout keeps the
+    // copier reading; never wait past the deadline for it.
+    while !copier.is_finished() {
+        if Instant::now() >= deadline {
+            return Err(timed_out);
+        }
+        std::thread::sleep(Duration::from_millis(25));
+    }
+    match copier.join() {
+        Ok((CopyEnd::Eof(bytes), _)) => Ok(bytes),
+        Ok((CopyEnd::Write(_), _)) => Ok(0),
+        Ok((CopyEnd::Budget, _)) => Err(PipeError::Budget { limit: max_bytes }),
+        Ok((CopyEnd::Read(error), _)) => {
+            Err(PipeError::Exit(format!("pipe: read producer: {error}")))
+        }
+        Err(_) => Err(PipeError::Exit("pipe: copier panicked".into())),
+    }
+}
+
+/// Wait for the producer until `deadline`; on deadline kill its group and
+/// reap it.
+fn wait_producer(
+    producer: &mut std::process::Child,
+    deadline: Instant,
+    timed_out: PipeError,
+) -> Result<std::process::ExitStatus, PipeError> {
+    loop {
+        match producer.try_wait() {
+            Ok(Some(status)) => return Ok(status),
+            Ok(None) if Instant::now() >= deadline => {
+                stop_group(producer, "producer");
+                return Err(timed_out);
+            }
+            Ok(None) => std::thread::sleep(Duration::from_millis(25)),
+            Err(error) => {
+                stop_group(producer, "producer");
+                return Err(PipeError::Exit(format!("pipe: producer wait: {error}")));
+            }
+        }
+    }
+}
+
 /// The `containers-storage:[driver@graphroot+runroot]` prefix for the LOCAL
 /// rootless podman store, so skopeo reads a `just image-build`-loaded image (the
 /// bare `containers-storage:` transport hits the *root* store — "mkdir
@@ -562,171 +946,30 @@ impl OciRunner {
         host_cmd: &str,
         timeout: Duration,
     ) -> Result<(), String> {
-        use std::io::{Read, Seek, SeekFrom};
-        use std::process::{Command, Stdio};
-        let mut producer_stderr =
-            tempfile::tempfile().map_err(|e| format!("pipe: producer stderr: {e}"))?;
-        let producer_stderr_child = producer_stderr
-            .try_clone()
-            .map_err(|e| format!("pipe: producer stderr: {e}"))?;
-        let mut producer = Command::new(&local_argv[0])
-            .args(&local_argv[1..])
-            .stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::from(producer_stderr_child))
-            .spawn()
-            .map_err(|e| format!("pipe: spawn {}: {e}", local_argv[0]))?;
-        let out = match producer.stdout.take() {
-            Some(out) => out,
-            None => {
-                if let Err(error) = producer.kill() {
-                    tracing::debug!(target: "thegn::host::pipe", %error, "failed to stop producer without stdout");
-                }
-                if let Err(error) = producer.wait() {
-                    tracing::debug!(target: "thegn::host::pipe", %error, "failed to reap producer without stdout");
-                }
-                return Err("pipe: producer has no stdout".into());
-            }
-        };
-        let argv = self.control_shell_argv(host_cmd);
-        let consumer_spawn = Command::new(&argv[0])
-            .args(&argv[1..])
-            .stdin(Stdio::from(out))
-            .stdout(Stdio::null())
-            .stderr(Stdio::piped())
-            .spawn();
-        let mut consumer = match consumer_spawn {
-            Ok(consumer) => consumer,
-            Err(error) => {
-                if let Err(kill_error) = producer.kill() {
-                    tracing::debug!(target: "thegn::host::pipe", %kill_error, "failed to stop producer after host spawn failure");
-                }
-                if let Err(wait_error) = producer.wait() {
-                    tracing::debug!(target: "thegn::host::pipe", %wait_error, "failed to reap producer after host spawn failure");
-                }
-                return Err(format!("pipe: spawn host cmd: {error}"));
-            }
-        };
-        let deadline = Instant::now() + timeout;
-        loop {
-            match consumer.try_wait() {
-                Ok(Some(status)) => {
-                    if status.success() {
-                        loop {
-                            if Instant::now() >= deadline {
-                                if let Err(error) = producer.kill() {
-                                    tracing::debug!(target: "thegn::host::pipe", %error, "failed to stop producer after host command finished");
-                                }
-                                if let Err(error) = producer.wait() {
-                                    tracing::debug!(target: "thegn::host::pipe", %error, "failed to reap producer after host command finished");
-                                }
-                                return Err("pipe: local producer did not exit after the host command finished".into());
-                            }
-                            match producer.try_wait() {
-                                Ok(Some(producer_status)) => {
-                                    if producer_status.success() {
-                                        return Ok(());
-                                    }
-                                    let stderr_len = producer_stderr
-                                        .metadata()
-                                        .map_err(|e| format!("pipe: producer stderr: {e}"))?
-                                        .len();
-                                    producer_stderr
-                                        .seek(SeekFrom::Start(stderr_len.saturating_sub(4096)))
-                                        .map_err(|e| format!("pipe: producer stderr: {e}"))?;
-                                    let mut stderr = Vec::new();
-                                    producer_stderr
-                                        .read_to_end(&mut stderr)
-                                        .map_err(|e| format!("pipe: producer stderr: {e}"))?;
-                                    let stderr = String::from_utf8_lossy(&stderr);
-                                    if let Some(code) = producer_status.code() {
-                                        return Err(describe_exec_failure(
-                                            "pipe: local producer",
-                                            Some(code),
-                                            false,
-                                            &stderr,
-                                        ));
-                                    }
-                                    let tail = stderr
-                                        .lines()
-                                        .rev()
-                                        .find(|line| !line.trim().is_empty())
-                                        .map(str::trim)
-                                        .unwrap_or("");
-                                    return Err(if tail.is_empty() {
-                                        "pipe: local producer was killed by a signal".into()
-                                    } else {
-                                        format!(
-                                            "pipe: local producer was killed by a signal: {tail}"
-                                        )
-                                    });
-                                }
-                                Ok(None) => std::thread::sleep(Duration::from_millis(25)),
-                                Err(error) => {
-                                    if let Err(kill_error) = producer.kill() {
-                                        tracing::debug!(target: "thegn::host::pipe", %kill_error, "failed to stop producer after wait failure");
-                                    }
-                                    if let Err(wait_error) = producer.wait() {
-                                        tracing::debug!(target: "thegn::host::pipe", %wait_error, "failed to reap producer after wait failure");
-                                    }
-                                    return Err(format!("pipe: producer wait: {error}"));
-                                }
-                            }
-                        }
-                    }
-                    // The transfer has failed; stop the producer and reap it
-                    // now instead of spending the remaining deadline waiting.
-                    if let Err(error) = producer.kill() {
-                        tracing::debug!(target: "thegn::host::pipe", %error, "failed to stop producer after host command failure");
-                    }
-                    if let Err(error) = producer.wait() {
-                        tracing::debug!(target: "thegn::host::pipe", %error, "failed to reap producer after host command failure");
-                    }
-                    let mut err = String::new();
-                    if let Some(mut r) = consumer.stderr.take() {
-                        use std::io::Read;
-                        let _ = r.read_to_string(&mut err); // best-effort: read error just truncates captured output
-                    }
-                    return Err(describe_exec_failure(
-                        "pipe: host cmd",
-                        status.code(),
-                        false,
-                        &err,
-                    ));
-                }
-                Ok(None) if Instant::now() >= deadline => {
-                    if let Err(error) = consumer.kill() {
-                        tracing::debug!(target: "thegn::host::pipe", %error, "failed to stop consumer after timeout");
-                    }
-                    if let Err(error) = producer.kill() {
-                        tracing::debug!(target: "thegn::host::pipe", %error, "failed to stop producer after timeout");
-                    }
-                    if let Err(error) = consumer.wait() {
-                        tracing::debug!(target: "thegn::host::pipe", %error, "failed to reap consumer after timeout");
-                    }
-                    if let Err(error) = producer.wait() {
-                        tracing::debug!(target: "thegn::host::pipe", %error, "failed to reap producer after timeout");
-                    }
-                    return Err(format!("pipe: timed out after {}s", timeout.as_secs()));
-                }
-                Ok(None) => std::thread::sleep(Duration::from_millis(25)),
-                Err(error) => {
-                    if let Err(kill_error) = consumer.kill() {
-                        tracing::debug!(target: "thegn::host::pipe", %kill_error, "failed to stop consumer after wait failure");
-                    }
-                    if let Err(kill_error) = producer.kill() {
-                        tracing::debug!(target: "thegn::host::pipe", %kill_error, "failed to stop producer after wait failure");
-                    }
-                    if let Err(wait_error) = consumer.wait() {
-                        tracing::debug!(target: "thegn::host::pipe", %wait_error, "failed to reap consumer after wait failure");
-                    }
-                    if let Err(wait_error) = producer.wait() {
-                        tracing::debug!(target: "thegn::host::pipe", %wait_error, "failed to reap producer after wait failure");
-                    }
-                    return Err(format!("pipe: wait: {error}"));
-                }
-            }
-        }
+        self.pipe_local_to_host_bounded(local_argv, host_cmd, timeout, u64::MAX)
+            .map(drop)
+            .map_err(|error| error.to_string())
+    }
+
+    /// [`Self::pipe_local_to_host`] with a byte budget: the stream is copied
+    /// through a counter, and a producer that emits more than `max_bytes`
+    /// aborts the transfer before the host command sees end-of-input. Producer
+    /// and host command each lead their own process group; on deadline or
+    /// budget overflow both groups are killed and reaped. Returns the number of
+    /// bytes forwarded.
+    pub fn pipe_local_to_host_bounded(
+        &self,
+        local_argv: &[String],
+        host_cmd: &str,
+        timeout: Duration,
+        max_bytes: u64,
+    ) -> Result<u64, PipeError> {
+        pipe_argv_bounded(
+            local_argv,
+            &self.control_shell_argv(host_cmd),
+            timeout,
+            max_bytes,
+        )
     }
 
     /// Tar a local staging directory into `dest` inside a container on this
@@ -1439,6 +1682,171 @@ mod tests {
         runner
             .pipe_local_to_host(&producer, "cat >/dev/null", Duration::from_secs(10))
             .expect("producer stderr must not block a successful transfer");
+    }
+
+    #[test]
+    fn copy_bounded_stops_before_forwarding_past_the_limit() {
+        let cases: &[(usize, u64, Option<u64>)] = &[
+            // (input bytes, limit, Some(forwarded) on EOF / None on Budget)
+            (0, 0, Some(0)),
+            (10, 10, Some(10)),
+            (10, 9, None),
+            (200_000, 200_000, Some(200_000)),
+            (200_000, 100_000, None),
+        ];
+        for &(len, limit, want) in cases {
+            let input = vec![7u8; len];
+            let mut out = Vec::new();
+            let end = copy_bounded(&mut input.as_slice(), &mut out, limit);
+            match want {
+                Some(n) => {
+                    assert_eq!(end, CopyEnd::Eof(n), "len {len} limit {limit}");
+                    assert_eq!(out.len() as u64, n);
+                }
+                None => {
+                    assert_eq!(end, CopyEnd::Budget, "len {len} limit {limit}");
+                    assert!(out.len() as u64 <= limit, "forwarded past the limit");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn pipe_reports_forwarded_bytes_within_budget() {
+        let runner = OciRunner::new(Placement::Local);
+        let producer = vec![
+            "sh".to_string(),
+            "-c".to_string(),
+            "head -c 100000 /dev/zero".to_string(),
+        ];
+        let forwarded = runner
+            .pipe_local_to_host_bounded(
+                &producer,
+                "cat >/dev/null",
+                Duration::from_secs(10),
+                100_000,
+            )
+            .expect("a stream at the budget succeeds");
+        assert_eq!(forwarded, 100_000);
+    }
+
+    fn wait_pid_file(path: &std::path::Path) -> u32 {
+        let started = Instant::now();
+        loop {
+            if let Ok(text) = std::fs::read_to_string(path)
+                && let Ok(pid) = text.trim().parse::<u32>()
+            {
+                return pid;
+            }
+            assert!(
+                started.elapsed() < Duration::from_secs(10),
+                "pid file {path:?} never appeared"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    fn assert_group_gone(pgid: u32) {
+        // Only Linux has the /proc liveness probe; elsewhere it reports live.
+        if !cfg!(target_os = "linux") {
+            return;
+        }
+        let started = Instant::now();
+        while thegn_proc::group_has_live_members(pgid) {
+            assert!(
+                started.elapsed() < Duration::from_secs(5),
+                "process group {pgid} survived the pipe abort"
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+
+    #[test]
+    fn pipe_budget_overflow_kills_and_reaps_both_groups_before_consumer_eof() {
+        let dir = tempfile::tempdir().unwrap();
+        let producer_pid = dir.path().join("producer.pid");
+        let consumer_pid = dir.path().join("consumer.pid");
+        let consumer_saw_eof = dir.path().join("consumer-eof");
+        let runner = OciRunner::new(Placement::Local);
+        // The producer floods forever through a child (`yes`) in its group.
+        let producer = vec![
+            "sh".to_string(),
+            "-c".to_string(),
+            format!(
+                "echo $$ > {}; yes",
+                thegn_core::util::sh_quote(&producer_pid.to_string_lossy())
+            ),
+        ];
+        let host_cmd = format!(
+            "echo $$ > {}; cat >/dev/null; touch {}",
+            thegn_core::util::sh_quote(&consumer_pid.to_string_lossy()),
+            thegn_core::util::sh_quote(&consumer_saw_eof.to_string_lossy()),
+        );
+        let started = Instant::now();
+
+        let error = runner
+            .pipe_local_to_host_bounded(&producer, &host_cmd, Duration::from_secs(30), 1 << 20)
+            .expect_err("a flood past the budget must abort");
+
+        assert_eq!(error, PipeError::Budget { limit: 1 << 20 });
+        assert!(error.to_string().contains("budget"), "{error}");
+        assert!(
+            started.elapsed() < Duration::from_secs(15),
+            "the budget abort must not wait for the deadline"
+        );
+        assert_group_gone(wait_pid_file(&producer_pid));
+        assert_group_gone(wait_pid_file(&consumer_pid));
+        assert!(
+            !consumer_saw_eof.exists(),
+            "the consumer must be killed before it sees end-of-input on a truncated stream"
+        );
+    }
+
+    #[test]
+    fn pipe_deadline_kills_a_hanging_consumer_group() {
+        let dir = tempfile::tempdir().unwrap();
+        let consumer_pid = dir.path().join("consumer.pid");
+        let runner = OciRunner::new(Placement::Local);
+        let producer = vec!["printf".to_string(), "hi".to_string()];
+        // The consumer never reads and parks in a child process (`sleep`).
+        let host_cmd = format!(
+            "echo $$ > {}; sleep 30; true",
+            thegn_core::util::sh_quote(&consumer_pid.to_string_lossy()),
+        );
+        let started = Instant::now();
+
+        let error = runner
+            .pipe_local_to_host_bounded(&producer, &host_cmd, Duration::from_secs(1), u64::MAX)
+            .expect_err("a hanging consumer must hit the deadline");
+
+        assert_eq!(error, PipeError::Timeout { secs: 1 });
+        assert!(
+            started.elapsed() < Duration::from_secs(15),
+            "the deadline must end the transfer"
+        );
+        assert_group_gone(wait_pid_file(&consumer_pid));
+    }
+
+    #[test]
+    fn pipe_deadline_kills_a_hanging_producer_group() {
+        let dir = tempfile::tempdir().unwrap();
+        let producer_pid = dir.path().join("producer.pid");
+        let runner = OciRunner::new(Placement::Local);
+        let producer = vec![
+            "sh".to_string(),
+            "-c".to_string(),
+            format!(
+                "echo $$ > {}; sleep 30; true",
+                thegn_core::util::sh_quote(&producer_pid.to_string_lossy())
+            ),
+        ];
+
+        let error = runner
+            .pipe_local_to_host_bounded(&producer, "cat >/dev/null", Duration::from_secs(1), 1024)
+            .expect_err("a hanging producer must hit the deadline");
+
+        assert_eq!(error, PipeError::Timeout { secs: 1 });
+        assert_group_gone(wait_pid_file(&producer_pid));
     }
 
     #[test]
