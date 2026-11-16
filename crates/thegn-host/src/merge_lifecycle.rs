@@ -578,7 +578,7 @@ pub(crate) fn remove_landed(
     landed: Option<&str>,
     delete_branch: bool,
 ) -> CleanupOutcome {
-    let outcome = remove_landed_unaudited(
+    remove_landed_unaudited(
         db,
         repo_root,
         worktree,
@@ -586,9 +586,7 @@ pub(crate) fn remove_landed(
         target,
         landed,
         delete_branch,
-    );
-    audit_cleanup_outcome(worktree, landed, &outcome);
-    outcome
+    )
 }
 
 /// One `thegn::git_audit` line per cleanup attempt: worktree, commit and the
@@ -624,10 +622,12 @@ fn remove_landed_unaudited(
     let selected = match db.list_merge_queue() {
         Ok(rows) => rows.into_iter().find(|row| row.worktree == worktree),
         Err(error) => {
-            return CleanupOutcome::Refused {
+            let refused = CleanupOutcome::Refused {
                 class: CleanupRefusal::Database,
                 reason: format!("queue identity unavailable: {error}"),
             };
+            audit_cleanup_outcome(worktree, landed, &refused);
+            return refused;
         }
     };
     let Some(selected) = selected.filter(|row| {
@@ -637,10 +637,12 @@ fn remove_landed_unaudited(
             && landed.is_some()
             && row.result_oid.as_deref() == landed
     }) else {
-        return CleanupOutcome::Refused {
+        let refused = CleanupOutcome::Refused {
             class: CleanupRefusal::Identity,
             reason: "committed outcome does not match a current landed queue row".into(),
         };
+        audit_cleanup_outcome(worktree, landed, &refused);
+        return refused;
     };
     let cfg = crate::config_startup::cleanup_config();
     remove_landed_with_config(
@@ -658,6 +660,33 @@ fn remove_landed_unaudited(
 
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn remove_landed_with_config(
+    cfg: &thegn_core::config::Config,
+    db: &Db,
+    repo_root: &Path,
+    worktree: &str,
+    branch: &str,
+    target: &str,
+    landed: Option<&str>,
+    expected_queue: &thegn_core::db::MergeQueueRow,
+    delete_branch: bool,
+) -> CleanupOutcome {
+    let outcome = remove_landed_with_config_unaudited(
+        cfg,
+        db,
+        repo_root,
+        worktree,
+        branch,
+        target,
+        landed,
+        expected_queue,
+        delete_branch,
+    );
+    audit_cleanup_outcome(worktree, landed, &outcome);
+    outcome
+}
+
+#[allow(clippy::too_many_arguments)]
+fn remove_landed_with_config_unaudited(
     cfg: &thegn_core::config::Config,
     db: &Db,
     repo_root: &Path,
