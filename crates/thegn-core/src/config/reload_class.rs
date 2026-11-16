@@ -196,6 +196,9 @@ pub const RELOAD_CLASSES: &[(&str, ReloadClass, ReloadHook)] = &[
     // `ci_every_slots` in `ScheduleConfig::from_config`.
     ("ci.poll_interval_secs", Live, H::Schedule),
     ("watch.*", Restart, H::None),
+    // `pr_every_slots` in `ScheduleConfig::from_config` (the PR refresh and
+    // main-checkout heal cadence); the rest of `[watch]` stays Restart.
+    ("watch.pr_interval_secs", Live, H::Schedule),
     ("log.*", Restart, H::None),
     ("diagnostics.*", Restart, H::None),
     ("database.*", Restart, H::None),
@@ -582,9 +585,12 @@ mod tests {
             "disk.scan_interval_secs",
             "loc.enabled",
             "loc.scan_interval_secs",
+            "watch.pr_interval_secs",
         ] {
             assert_eq!(class_for(key), Some((Live, H::Schedule)), "{key}");
         }
+        // Only the PR cadence is live; the rest of `[watch]` restarts.
+        assert_eq!(class_for("watch.anything_else"), Some((Restart, H::None)));
         // Section defaults stay honest beside the cadence rows.
         assert_eq!(class_for("bars.top_left"), Some((Live, H::Bars)));
         assert_eq!(class_for("ci.ttl_secs"), Some((NextUse, H::None)));
