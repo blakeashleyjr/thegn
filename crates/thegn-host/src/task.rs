@@ -2624,7 +2624,12 @@ mod tests {
             assert_eq!(chunked.stdout_capture, whole.stdout_capture);
             assert_eq!(chunked.stderr_capture, whole.stderr_capture);
             assert_eq!(chunked.tail(), whole.tail());
-            assert!(chunked.tail().ends_with("line 29999 é\n"));
+            // Only a live reader keeps a tail; a capture-only push leaves it empty.
+            if with_live {
+                assert!(chunked.tail().ends_with("line 29999 é\n"));
+            } else {
+                assert!(chunked.tail().is_empty());
+            }
         }
     }
 
