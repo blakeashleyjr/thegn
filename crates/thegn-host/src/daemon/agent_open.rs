@@ -1647,6 +1647,7 @@ mod tests {
     }
 
     /// A real git worktree on a `tg/` branch (signing off) for prompt-file tests.
+    #[expect(clippy::disallowed_methods, reason = "isolated Git fixture subprocess")]
     fn prompt_file_worktree() -> tempfile::TempDir {
         let dir = tempfile::tempdir().expect("isolated worktree");
         let steps: [&[&str]; 2] = [
@@ -1762,6 +1763,10 @@ mod tests {
         assert!(
             argv.contains(path.to_str().expect("utf-8 path")),
             "the command names the prompt file: {argv}"
+        );
+        assert!(
+            !argv.contains(&prompt),
+            "a prompt-file launch keeps the prompt out of argv: {argv}"
         );
         assert!(
             resolved.env.iter().all(|(key, _)| key != "THEGN_PROMPT"),
