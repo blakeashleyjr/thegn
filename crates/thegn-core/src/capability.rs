@@ -1099,16 +1099,6 @@ pub const SURFACE_GAPS: &[(&str, Surface, &str)] = &[
     // gRPC mirroring and MCP state tools follow the same phased path as every
     // other state cap above — recorded, not built, here. Plugin dispatch is
     // generic and needs no excuse.
-    (
-        "issues.update",
-        Surface::Mcp,
-        "MCP state tools land in the client-API phase",
-    ),
-    (
-        "issues.comment",
-        Surface::Mcp,
-        "MCP state tools land in the client-API phase",
-    ),
 ];
 
 /// Why a SURFACE_GAPS row is excused (THE-201). Every row has exactly one, in [`GAP_DISPOSITIONS`].
@@ -1310,16 +1300,6 @@ pub const GAP_DISPOSITIONS: &[(&str, Surface, GapDisposition)] = &[
     ),
     (
         "calendar.ingest",
-        Surface::Mcp,
-        GapDisposition::Deferred { review: "THE-203" },
-    ),
-    (
-        "issues.update",
-        Surface::Mcp,
-        GapDisposition::Deferred { review: "THE-203" },
-    ),
-    (
-        "issues.comment",
         Surface::Mcp,
         GapDisposition::Deferred { review: "THE-203" },
     ),
@@ -1657,10 +1637,10 @@ mod tests {
         assert_eq!(p.len(), 1, "{p:?}");
         assert!(p[0].contains("sessions.list") && p[0].contains("not implemented"));
 
-        // Implementing an excused row ⇒ stale gap (issues.update is still
+        // Implementing an excused row ⇒ stale gap (git.commit is still
         // excused on MCP).
         let mut stale: Vec<&str> = required_for(Surface::Mcp).map(|c| c.id.0).collect();
-        stale.push("issues.update"); // excused on MCP
+        stale.push("git.commit"); // excused on MCP
         let p = coverage_problems(Surface::Mcp, &stale);
         assert_eq!(p.len(), 1, "{p:?}");
         assert!(p[0].contains("stale"));
@@ -1838,7 +1818,7 @@ mod tests {
         // MCP carries the remaining excuses; its ledger lists them.
         let mcp = ledger(Surface::Mcp, &["sessions.list"]);
         assert!(mcp.excused > 0);
-        assert!(mcp.gaps.iter().any(|(id, _)| *id == "issues.update"));
+        assert!(mcp.gaps.iter().any(|(id, _)| *id == "git.commit"));
     }
 
     #[test]
