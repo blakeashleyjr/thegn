@@ -346,6 +346,7 @@ pub(crate) fn new_core(
             known.join(", ")
         ))));
     }
+    refuse_dev_env_on_stable_daemon(cfg, env.as_deref())?;
 
     let branch = match issue_branch {
         Some(b) => b,
@@ -400,6 +401,60 @@ pub(crate) fn new_core(
 /// `--exact-branch`: `name` verbatim as the branch, no prefix/numbering.
 /// Unlike the plain-name path (which dedupes with a `-N` suffix), an existing
 /// branch is refused rather than attached or renamed.
+/// Whether the stable channel's config clamp drops `[env.<name>]` — the same
+/// `Config::clamp_to_channel` the daemon applies at load, run over a copy of
+/// just the env table, so the classifier cannot drift from the real clamp.
+fn env_dropped_by_channel(cfg: &Config, name: &str, channel: thegn_core::channel::Channel) -> bool {
+    let mut probe = Config {
+        env: cfg.env.clone(),
+        ..Config::default()
+    };
+    probe.clamp_to_channel(channel);
+    cfg.env.contains_key(name) && !probe.env.contains_key(name)
+}
+
+/// The THE-2007 refusal decision. `cli_allows`: this CLI's channel keeps the
+/// env; `needs_dev`: a stable clamp would drop it; `daemon`: the running
+/// daemon's reported channel (`None` = no daemon, a legacy daemon, or a failed
+/// probe — the daemon this CLI would spawn inherits its env, so no refusal).
+fn dev_env_daemon_refusal(
+    env: &str,
+    cli_allows: bool,
+    needs_dev: bool,
+    daemon: Option<&str>,
+) -> Result<(), String> {
+    if cli_allows && needs_dev && daemon == Some(thegn_core::channel::Channel::Stable.as_str()) {
+        return Err(format!(
+            "the running daemon is on the stable channel and drops [env.{env}]; restart it with THEGN_CHANNEL=dev (thegn daemon stop, then rerun)"
+        ));
+    }
+    Ok(())
+}
+
+/// Refuse `--env <dev-only env>` when the running daemon is on the stable
+/// channel: it would strip the env at load and refuse every later session.
+/// Probes only an already-running daemon (never spawns) and only for a
+/// dev-only env.
+fn refuse_dev_env_on_stable_daemon(cfg: &Config, env: Option<&str>) -> Result<()> {
+    let Some(e) = env.filter(|e| *e != "default") else {
+        return Ok(());
+    };
+    let current = crate::channel_state::current();
+    let cli_allows = cfg.env.contains_key(e) && !env_dropped_by_channel(cfg, e, current);
+    let needs_dev = env_dropped_by_channel(cfg, e, thegn_core::channel::Channel::Stable);
+    if !(cli_allows && needs_dev) {
+        return Ok(());
+    }
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()?;
+    let daemon = rt.block_on(async {
+        let client = crate::daemon::client::connect_daemon(&cfg.daemon).await?;
+        crate::daemon::client::daemon_channel(&client).await
+    });
+    dev_env_daemon_refusal(e, cli_allows, needs_dev, daemon.as_deref()).map_err(anyhow::Error::msg)
+}
+
 pub(crate) fn exact_branch_name(
     name: Option<&str>,
     taken: impl Fn(&str) -> bool,
@@ -1061,6 +1116,7 @@ fn new_batched(
             known.join(", ")
         ))));
     }
+    refuse_dev_env_on_stable_daemon(cfg, env.as_deref())?;
 
     let db = Db::open()?;
     let proj = db
@@ -1671,6 +1727,57 @@ pub(super) fn rm_with(
         outln!("removed {path}");
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod dev_env_daemon_tests {
+    use super::{Config, dev_env_daemon_refusal, env_dropped_by_channel};
+    use thegn_core::channel::Channel;
+
+    #[test]
+    fn dev_env_daemon_refusal_table() {
+        // (cli_allows, needs_dev, daemon, refuses)
+        let rows: [(bool, bool, Option<&str>, bool); 8] = [
+            (true, true, Some("stable"), true),
+            (true, true, Some("dev"), false),
+            (true, true, None, false),
+            (true, true, Some("future-channel"), false),
+            // A local env never needs dev, so it never refuses.
+            (true, false, Some("stable"), false),
+            (true, false, None, false),
+            // A stable CLI has already dropped the env itself.
+            (false, true, Some("stable"), false),
+            (false, false, Some("stable"), false),
+        ];
+        for (cli_allows, needs_dev, daemon, refuses) in rows {
+            let got = dev_env_daemon_refusal("m0", cli_allows, needs_dev, daemon);
+            assert_eq!(
+                got.is_err(),
+                refuses,
+                "{cli_allows} {needs_dev} {daemon:?}: {got:?}"
+            );
+            if let Err(msg) = got {
+                assert!(msg.contains("[env.m0]"), "{msg}");
+                assert!(msg.contains("THEGN_CHANNEL=dev"), "{msg}");
+                assert!(msg.contains("thegn daemon stop"), "{msg}");
+            }
+        }
+    }
+
+    #[test]
+    fn env_dropped_by_channel_matches_the_stable_clamp() {
+        let cfg: Config = toml::from_str(
+            "[env.box]\nplacement = \"ssh\"\n\n[env.m0]\nplacement = \"provider\"\n\n[env.here]\nplacement = \"local\"\n",
+        )
+        .expect("config parses");
+        assert!(env_dropped_by_channel(&cfg, "box", Channel::Stable));
+        assert!(env_dropped_by_channel(&cfg, "m0", Channel::Stable));
+        assert!(!env_dropped_by_channel(&cfg, "here", Channel::Stable));
+        assert!(!env_dropped_by_channel(&cfg, "missing", Channel::Stable));
+        for name in ["box", "m0", "here"] {
+            assert!(!env_dropped_by_channel(&cfg, name, Channel::Dev), "{name}");
+        }
+    }
 }
 
 #[cfg(test)]
