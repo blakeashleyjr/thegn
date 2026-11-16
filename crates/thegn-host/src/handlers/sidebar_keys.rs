@@ -559,7 +559,9 @@ impl SidebarState {
             // that is the whole of what it can do: it is derived from the
             // roster, so renaming, filing, pinning or deleting one has nothing
             // to write to.
-            RowKind::PipelineGroup | RowKind::PipelineLane => {
+            // The derived "Other" group of external worktrees is the same: a
+            // view-side grouping with no folder row to rename or delete.
+            RowKind::PipelineGroup | RowKind::PipelineLane | RowKind::OtherGroup => {
                 entries.push(e(
                     "toggle",
                     "Collapse / expand",
@@ -1070,6 +1072,15 @@ impl SidebarState {
         session: &crate::session::Session,
     ) -> SidebarOutcome {
         if let Some(row) = self.selected_row(model) {
+            // The derived "Other" group's open state is a per-project
+            // override of a config default, not a collapse key.
+            if row.kind == crate::sidebar::RowKind::OtherGroup {
+                let slug = row.workspace_slug.clone();
+                let open = row.collapsed;
+                self.set_other_open(&slug, open);
+                self.rebuild(model, session);
+                return SidebarOutcome::Redraw;
+            }
             // Per-kind collapse key: folders key on their `pin_key`
             // (`{slug}/folder:{id}`), everything else on `workspace_slug`.
             let slug = row.collapse_key().to_string();
@@ -1503,6 +1514,7 @@ mod tests {
                 env_name: None,
                 env_degraded: false,
                 sandbox_profile: None,
+                external: false,
             }],
             ..FrameModel::default()
         };
@@ -1738,6 +1750,7 @@ mod tests {
                     env_name: None,
                     env_degraded: false,
                     sandbox_profile: None,
+                    external: false,
                 })
                 .collect(),
             ..Default::default()

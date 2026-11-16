@@ -47,6 +47,13 @@ pub struct SidebarDisplay {
     /// (`[ui] sidebar_dividers`). Costs no layout rows — it replaced THE-64's
     /// blank separator row.
     pub dividers: bool,
+    /// Placement of external worktrees (`[ui] sidebar_external_worktrees`).
+    pub external_worktrees: thegn_core::config_ui::ExternalWorktrees,
+    /// Label of the derived "Other" group row (`[ui] sidebar_other_group_label`).
+    pub other_group_label: String,
+    /// Whether the "Other" group starts collapsed (`[ui]
+    /// sidebar_other_group_collapsed`) until the user toggles it.
+    pub other_group_collapsed: bool,
 }
 
 impl Default for SidebarDisplay {
@@ -75,6 +82,9 @@ impl Default for SidebarDisplay {
             icon_behind: String::new(),
             icon_status: String::new(),
             dividers: true,
+            external_worktrees: thegn_core::config_ui::ExternalWorktrees::Group,
+            other_group_label: "Other".into(),
+            other_group_collapsed: true,
         }
     }
 }
@@ -103,6 +113,13 @@ impl SidebarDisplay {
             icon_behind: ui.sidebar_icon_behind.clone(),
             icon_status: ui.sidebar_icon_status.clone(),
             dividers: ui.sidebar_dividers,
+            external_worktrees: ui.sidebar_external_worktrees,
+            // A blank label would leave a bare "(N)"; fall back to the default.
+            other_group_label: match ui.sidebar_other_group_label.trim() {
+                "" => "Other".into(),
+                label => label.to_string(),
+            },
+            other_group_collapsed: ui.sidebar_other_group_collapsed,
         }
     }
 
@@ -1458,7 +1475,7 @@ pub(crate) fn hit_rows(model: &FrameModel, rect: Rect) -> Vec<RowHit> {
                 // (`compose_row_lines` mirrors this), so the caret sits at a
                 // stable column regardless of focus.
                 RowKind::Workspace | RowKind::TerminalHost => Some(rect.x + 4),
-                RowKind::Folder | RowKind::PipelineGroup => Some(rect.x + 3),
+                RowKind::Folder | RowKind::PipelineGroup | RowKind::OtherGroup => Some(rect.x + 3),
                 // A lane sits one level in from its group's caret.
                 RowKind::PipelineLane => Some(rect.x + 5),
                 _ => None,
@@ -1906,6 +1923,18 @@ fn compose_row_lines(
             l.push(seg(tok, display_cell(&row.label)));
             vec![Line::Segs(l)]
         }
+        // The derived "Other" group of external worktrees: folder-shaped
+        // (caret + label + count) but toned one step quieter than a real
+        // folder and without the folder glyph — it is a holding area for
+        // worktrees another tool made, not something the user filed.
+        RowKind::OtherGroup => vec![Line::Segs(vec![
+            sp(1),
+            sp(2),
+            seg(Tok::Slot(S::Faint), caret(row.collapsed)),
+            sp(1),
+            seg(Tok::Slot(S::Dim), display_cell(&row.label)),
+            seg(Tok::Slot(S::Ghost), format!(" ({})", row.child_count)),
+        ])],
         RowKind::Folder => {
             // Label = bare folder name (rename/delete seed from it); the
             // filed-count decoration is render-only and rides one tier down,
@@ -3516,6 +3545,37 @@ mod tests {
         let painted = text(&wt);
         assert!(painted.contains(gl.tree_corner), "{painted:?}");
         assert!(painted.contains("tg-the-74"), "{painted:?}");
+
+        // The derived "Other" group of external worktrees: caret + label +
+        // count, folder-shaped, no folder glyph.
+        let mut other = SidebarRow::base(RowKind::OtherGroup, 1, "Other", "app");
+        other.child_count = 4;
+        other.collapsed = true;
+        let painted = text(&other);
+        assert!(painted.contains(gl.caret_closed), "{painted:?}");
+        assert!(painted.contains("Other (4)"), "{painted:?}");
+        assert!(!painted.contains(gl.folder), "{painted:?}");
+    }
+
+    /// The external-worktree keys ride `from_ui`, which run.rs re-runs on every
+    /// config reload — so they apply live. A blank label falls back.
+    #[test]
+    fn from_ui_carries_the_external_worktree_keys() {
+        use thegn_core::config_ui::ExternalWorktrees;
+        let d = SidebarDisplay::from_ui(&thegn_core::config::UiConfig::default());
+        assert_eq!(d.external_worktrees, ExternalWorktrees::Group);
+        assert_eq!(d.other_group_label, "Other");
+        assert!(d.other_group_collapsed);
+        let ui = thegn_core::config::UiConfig {
+            sidebar_external_worktrees: ExternalWorktrees::Hide,
+            sidebar_other_group_label: "  ".into(),
+            sidebar_other_group_collapsed: false,
+            ..Default::default()
+        };
+        let d = SidebarDisplay::from_ui(&ui);
+        assert_eq!(d.external_worktrees, ExternalWorktrees::Hide);
+        assert_eq!(d.other_group_label, "Other");
+        assert!(!d.other_group_collapsed);
     }
 
     // ─── THE-70: honest quick-jump digits ──────────────────────────────────
