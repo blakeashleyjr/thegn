@@ -232,7 +232,7 @@ impl PluginsState {
     pub(crate) fn drop_until_scan(&mut self, changed: &[ScannedWorktree<'_>]) -> bool {
         let keys: std::collections::BTreeSet<&str> = changed
             .iter()
-            .flat_map(|(path, branch)| crate::plugin_row_sync::row_store_keys(*path, *branch))
+            .flat_map(|(path, branch)| crate::plugin_row_sync::row_store_keys(path, *branch))
             .flatten()
             .collect();
         if keys.is_empty() {
