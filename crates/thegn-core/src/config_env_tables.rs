@@ -348,16 +348,23 @@ impl EnvProviderConfig {
     }
 
     /// The control-exec argv template (`{id}` unexpanded): the configured
-    /// `exec_command`, or — for VPS providers, which have no vendor CLI — the
-    /// thegn self-bridge (`thegn vps-ssh <name> --`), so panes, chrome
-    /// git/fs reads, and the persisted worktree location all route over the
-    /// same ssh transport with zero per-env config. The single source of truth
-    /// for both `envbuild` (placement prefixes) and the warm-pool claim rebind.
+    /// `exec_command`, or — for providers with no vendor CLI — a thegn
+    /// self-bridge: `thegn vps-ssh <name> --` for VPS kinds AND fly (the bridge
+    /// resolves a fly machine's IP through the fly provider), `machine0-ssh`
+    /// for machine0, `sprite-exec` for sprites. Panes, chrome git/fs reads, and
+    /// the persisted worktree location all route over that transport with zero
+    /// per-env config. The single source of truth for both `envbuild`
+    /// (placement prefixes) and the warm-pool claim rebind.
+    ///
+    /// `daytona` and `custom` have no built-in bridge: with no `exec_command`
+    /// this is EMPTY, and `Placement::transport_refusal` halts the launch
+    /// (never a host fallback).
     pub fn control_command_template(&self) -> Vec<String> {
         if !self.exec_command.is_empty() {
             return self.exec_command.clone();
         }
-        if vps_provider_kind(&self.provider) {
+        let kind = EnvProviderKind::of(&self.provider);
+        if kind.is_vps() || kind == EnvProviderKind::Fly {
             let exe = crate::util::self_exe_str();
             return vec![exe, "vps-ssh".into(), "{id}".into(), "--".into()];
         }
