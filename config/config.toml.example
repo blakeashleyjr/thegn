@@ -2890,6 +2890,12 @@ mounts = ["~/.gitconfig:ro"]
 # the session bus) and the agent socket are unreachable from inside a pane unless
 # you add `/run/user` back to `mounts` explicitly. `thegn doctor` lists exactly
 # what each tier exposes.
+# Mounting `/run/user` (or `$XDG_RUNTIME_DIR`) whole also exposes the user bus,
+# podman, docker and the systemd user manager, each of which runs code outside
+# the sandbox. bwrap masks those entries after the bind; the container and
+# remote backends do not, and `thegn config validate` warns on such a mount.
+# Prefer the narrow paths a pane needs: `/run/user/<uid>/gnupg` and the
+# ssh-agent socket path.
 # Named profiles do not receive ambient credentials from this list. Share a
 # variable with `[profiles.<name>.sandbox] env_passthrough`; that list replaces
 # this one for the profile, while infrastructure names such as TERM always pass.
