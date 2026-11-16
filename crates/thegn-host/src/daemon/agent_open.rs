@@ -1751,7 +1751,7 @@ mod tests {
 
         let result = resolve(&config, &db, &spec, &launch, None);
         if crate::agent_run::headless_unsupported().is_some() {
-            let message = format!("{:#}", result.err().expect("no prompt file off unix"));
+            let message = format!("{:#}", result.expect_err("no prompt file off unix"));
             assert!(message.contains("{prompt_file}"), "got {message}");
             assert!(prompt_files(worktree.path()).is_empty());
             return;
