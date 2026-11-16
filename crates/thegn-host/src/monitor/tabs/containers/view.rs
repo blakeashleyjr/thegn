@@ -36,6 +36,8 @@ const TABLE: PanelId = PanelId("containers.table");
 const INVENTORY: PanelId = PanelId("containers.inventory");
 const HISTORY_CAP: usize = 120;
 const SLOT_CAP: usize = 32;
+const MINICORE_MIN_ROWS: usize = 4;
+const SCATTER_MIN: (usize, usize) = (20, 6);
 const TABLE_ID: usize = 0;
 const TABLE_CPU: usize = 13;
 const TABLE_CPU_SPARK: usize = 20;
@@ -518,18 +520,22 @@ impl TabView for ContainersView<'_> {
             rect.y,
         );
         if matches!(placed.id, CPU | MEMORY | IO) && !absent {
-            self.paint_history(
-                surface,
-                placed.id,
-                Rect {
-                    x: rect.x + body.x,
-                    y: rect.y + body.y + 1,
-                    rows: body
-                        .rows
-                        .saturating_sub(if placed.id == IO { 2 } else { 1 }),
-                    ..body
-                },
-            );
+            let mut area = Rect {
+                x: rect.x + body.x,
+                y: rect.y + body.y + 1,
+                rows: body
+                    .rows
+                    .saturating_sub(if placed.id == IO { 2 } else { 1 }),
+                ..body
+            };
+            if placed.id == CPU {
+                area.rows = area
+                    .rows
+                    .saturating_sub(self.paint_minicore_rows(surface, area));
+            } else if placed.id == MEMORY {
+                area.rows = area.rows.saturating_sub(self.paint_scatter(surface, area));
+            }
+            self.paint_history(surface, placed.id, area);
         }
         if placed.id == TABLE {
             self.paint_table_sparks(surface, body, rect);
@@ -711,6 +717,101 @@ impl ContainersView<'_> {
             })
             .put_str(0, 0, &flags, Default::default());
         }
+    }
+
+    /// Per-container `id spark pct` rows pinned to the bottom of the CPU
+    /// panel; returns the rows consumed. History comes from the existing
+    /// rings (ordered into a stack buffer), no new sampling.
+    fn paint_minicore_rows(&self, surface: &mut Surface, area: Rect) -> usize {
+        if area.rows < MINICORE_MIN_ROWS || area.cols == 0 || self.model.order.is_empty() {
+            return 0;
+        }
+        let count = self.model.order.len().min(area.rows / 2);
+        let scale = max_slot_cpu(self.model).max(1.0);
+        let top = area.y + area.rows - count;
+        let mut history = [f32::NAN; HISTORY_CAP];
+        for (row, index) in self.model.order.iter().take(count).enumerate() {
+            let slot = &self.model.slots[*index];
+            let len = slot.cpu_history.ordered(&mut history);
+            for value in &mut history[..len] {
+                if value.is_finite() {
+                    *value = (*value / scale).clamp(0.0, 1.0);
+                }
+            }
+            let id = slot.id.as_deref().unwrap_or("");
+            let short = &id[..id.char_indices().nth(8).map_or(id.len(), |(pos, _)| pos)];
+            graphs::paint_minicore_row(
+                short,
+                &history[..len],
+                slot.cpu.unwrap_or(0.0),
+                RampId::Util,
+                Rect {
+                    y: top + row,
+                    rows: 1,
+                    ..area
+                },
+                surface,
+            );
+        }
+        count
+    }
+
+    /// CPU-vs-memory scatter (one point per container) at the bottom of the
+    /// memory panel, with a one-line legend. Returns rows consumed (0 when
+    /// there are < 2 containers or the area is under 20x6).
+    fn paint_scatter(&self, surface: &mut Surface, area: Rect) -> usize {
+        let total = scatter_rows(self.model.order.len(), area);
+        if total == 0 {
+            return 0;
+        }
+        let mem_max = self
+            .model
+            .order
+            .iter()
+            .filter_map(|index| self.model.slots[*index].memory)
+            .max()
+            .unwrap_or(0)
+            .max(1) as f32;
+        let points: Vec<(f32, f32)> = self
+            .model
+            .order
+            .iter()
+            .filter_map(|index| {
+                let slot = &self.model.slots[*index];
+                let cpu = slot.cpu? as f32;
+                let mem = slot.memory? as f32;
+                Some(((cpu / 100.0).clamp(0.0, 1.0), mem / mem_max))
+            })
+            .collect();
+        let rows = total - 1;
+        let top = area.y + area.rows - total;
+        let mut raster = thegn_core::viz_raster::CellBuf::new();
+        raster.reset(area.cols, rows);
+        thegn_core::viz_raster::scatter(&points, graphs::table(), &mut raster);
+        let mut grid = CellGrid::new(area.cols, total);
+        let mut view = grid.view(Rect::full(area.cols, total));
+        view.put_str(0, 0, scatter_legend(), Default::default());
+        for y in 0..rows {
+            for x in 0..area.cols {
+                if let Some(cell) = raster.get(x, y)
+                    && cell.ch != ' '
+                    && cell.ch != '\u{2800}'
+                {
+                    view.put(
+                        x,
+                        y + 1,
+                        CellStyle {
+                            ch: cell.ch,
+                            fg: StyleTok::from_tok(crate::seg::Tok::Ramp(RampId::Util, cell.fg))
+                                .unwrap_or(StyleTok::INHERIT),
+                            ..CellStyle::default()
+                        },
+                    );
+                }
+            }
+        }
+        Emitter::default().emit(&grid, Rect::full(area.cols, total), surface, area.x, top);
+        total
     }
 
     fn paint_history(&self, surface: &mut Surface, panel_id: PanelId, graph_area: Rect) {
@@ -1068,6 +1169,22 @@ fn paint_finite_spark_runs(values: &[f32], ramp: RampId, area: Rect, surface: &m
             );
         }
         start = end.max(start + 1);
+    }
+}
+
+/// Rows (legend + plot) the scatter takes from `area`, or 0 when omitted.
+fn scatter_rows(containers: usize, area: Rect) -> usize {
+    if containers < 2 || area.cols < SCATTER_MIN.0 || area.rows < SCATTER_MIN.1 * 2 {
+        return 0;
+    }
+    area.rows / 2
+}
+
+fn scatter_legend() -> &'static str {
+    if crate::caps::unicode_level() == thegn_core::termcaps::UnicodeLevel::Ascii {
+        "cpu -> | mem ^"
+    } else {
+        "cpu → · mem ↑"
     }
 }
 
