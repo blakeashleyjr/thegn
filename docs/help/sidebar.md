@@ -25,6 +25,11 @@ rail is a slim strip that keeps each row's activity dot and initial visible
 while reclaiming the columns; press `Alt-s` to grow it back into the full
 tree. `q` or `Esc` returns to the terminal.
 
+While the sidebar is hidden, the masthead shows a `◌ sidebar hidden` chip
+(`◌` alone on a narrow terminal, `.` under ASCII glyphs) after the brand, so a
+hidden sidebar is never invisible. Clicking it cycles the sidebar back, the same
+as `Ctrl-Alt-s`.
+
 ## Reading the tree
 
 The sidebar is tiered so a repo and its drawers never read the same. Each
