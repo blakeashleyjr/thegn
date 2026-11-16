@@ -11,6 +11,7 @@ use std::sync::{Condvar, Mutex, OnceLock};
 use thegn_core::config::Config;
 use thegn_core::config_resolve::Approvals;
 use thegn_core::db::Db;
+use thegn_core::git_run::GitOutcome;
 use thegn_core::hooks::{HookContext, HookEvent, HookExecutionMode, ResolvedHooks};
 use thegn_core::store::{RepoTrustStore, WorkspaceStore};
 
@@ -617,9 +618,22 @@ fn spawn_event_with_completion(
                 policy.pending.len()
             ));
         }
-        let actual_branch = if branch.is_empty() {
-            thegn_core::util::git_out(&worktree, &["symbolic-ref", "--quiet", "--short", "HEAD"])
-                .unwrap_or_default()
+        let actual_branch = if branch.is_empty() && !specs.is_empty() {
+            match head_branch(&worktree) {
+                Ok(read) => read,
+                Err(e) => {
+                    thegn_core::msg::warn(&format!(
+                        "lifecycle hooks skipped: could not read the worktree branch: {e}"
+                    ));
+                    if let Some(tx) = REFRESH_TX.get() {
+                        let _ = tx.send(crate::hydrate::RefreshKind::Model);
+                    }
+                    if let Some(waker) = waker {
+                        let _ = waker.wake();
+                    }
+                    return;
+                }
+            }
         } else {
             branch
         };
@@ -680,11 +694,15 @@ pub fn spawn_worktree_destroy(
         let db = Db::open().ok();
         let (success, message) = thegn_core::repo::main_worktree(&worktree)
             .map(|repo_root| {
-                let branch = thegn_core::util::git_out(
-                    &worktree,
-                    &["symbolic-ref", "--quiet", "--short", "HEAD"],
-                )
-                .unwrap_or_default();
+                let branch = match head_branch(&worktree) {
+                    Ok(branch) => branch,
+                    Err(e) => {
+                        return (
+                            false,
+                            format!("could not read the worktree branch: {e}; nothing was removed"),
+                        );
+                    }
+                };
                 let workspace = thegn_core::repo::repo_slug(&repo_root);
                 destroy_one(
                     &cfg,
@@ -753,11 +771,25 @@ pub fn spawn_workspace_destroy(
         let (paths, claim_failures) = claim_destroy_candidates(candidates);
         failed_paths.extend(claim_failures);
         for path in paths {
-            let branch = thegn_core::util::git_out(
-                Path::new(&path),
-                &["symbolic-ref", "--quiet", "--short", "HEAD"],
-            )
-            .unwrap_or_default();
+            let branch = match head_branch(Path::new(&path)) {
+                Ok(branch) => branch,
+                Err(e) => {
+                    let message = format!("could not read the worktree branch: {e}");
+                    failed_paths.push(format!("{path}: {message}"));
+                    // The completion releases the claim taken for this path.
+                    complete(
+                        LifecycleCompletion::WorkspaceDelete {
+                            repo_path: repo_root.to_string_lossy().into_owned(),
+                            slug: slug.clone(),
+                            path,
+                            success: false,
+                            message,
+                        },
+                        waker.clone(),
+                    );
+                    continue;
+                }
+            };
             let (success, message) = destroy_one(
                 &cfg,
                 &repo_root,
@@ -814,6 +846,22 @@ pub fn spawn_workspace_destroy(
         );
     })
     .map(drop)
+}
+
+/// Read the worktree's branch. A detached HEAD (`symbolic-ref --quiet` exits 1)
+/// is an empty branch; any other failure is returned rather than guessed.
+fn head_branch(worktree: &Path) -> Result<String, GitOutcome> {
+    classify_head_branch(thegn_core::util::git_out_result(
+        worktree,
+        &["symbolic-ref", "--quiet", "--short", "HEAD"],
+    ))
+}
+
+fn classify_head_branch(read: Result<String, GitOutcome>) -> Result<String, GitOutcome> {
+    match read {
+        Err(GitOutcome::Exit { code: Some(1), .. }) => Ok(String::new()),
+        other => other,
+    }
 }
 
 fn release_destroy_claim_on_spawn_failure(
@@ -2034,6 +2082,45 @@ mod tests {
             args.join(" "),
             String::from_utf8_lossy(&output.stderr)
         );
+    }
+
+    #[test]
+    fn classify_head_branch_arms() {
+        assert_eq!(classify_head_branch(Ok("main".into())).unwrap(), "main");
+        let exit = |code| GitOutcome::Exit {
+            code: Some(code),
+            stderr_tail: String::new(),
+        };
+        assert_eq!(classify_head_branch(Err(exit(1))).unwrap(), "");
+        assert!(classify_head_branch(Err(exit(128))).is_err());
+        assert!(classify_head_branch(Err(GitOutcome::Timeout)).is_err());
+        assert!(classify_head_branch(Err(GitOutcome::Spawn(std::io::Error::other("x")))).is_err());
+    }
+
+    #[test]
+    fn head_branch_reads_a_branch_and_a_detached_head() {
+        let dir = tempfile::tempdir().unwrap();
+        git(dir.path(), &["init", "-q", "-b", "main"]);
+        git(
+            dir.path(),
+            &[
+                "-c",
+                "commit.gpgsign=false",
+                "-c",
+                "user.name=t",
+                "-c",
+                "user.email=t@example.invalid",
+                "commit",
+                "-q",
+                "--allow-empty",
+                "-m",
+                "init",
+            ],
+        );
+        assert_eq!(head_branch(dir.path()).unwrap(), "main");
+        git(dir.path(), &["checkout", "-q", "--detach"]);
+        assert_eq!(head_branch(dir.path()).unwrap(), "");
+        assert!(head_branch(&dir.path().join("missing")).is_err());
     }
 
     #[test]
