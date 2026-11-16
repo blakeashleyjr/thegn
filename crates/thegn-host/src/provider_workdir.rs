@@ -15,13 +15,37 @@
 //! across the process and across restarts (the file persists). An explicit
 //! `[env.<name>.provider] workdir` always wins and short-circuits the cache.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use thegn_core::config::EnvProviderConfig;
 use thegn_svc::provider::Provider;
 
+/// The root of the per-sandbox provider state: `$XDG_STATE_HOME/thegn/provider`.
+/// This is the DB's own resolver (not `thegn_dir()`, which follows `$HOME`), so
+/// every process of one instance agrees on it — a session opened from a Claude
+/// profile shell (`HOME=~/.claude-profiles/x`) sees the markers the daemon wrote.
+fn state_root() -> PathBuf {
+    thegn_core::util::xdg_state_home().join("thegn/provider")
+}
+
 fn cache_dir() -> PathBuf {
+    state_root().join("sandbox-home")
+}
+
+/// The pre-THE-2040 location under `thegn_dir()` (`$HOME`-relative). Read-only:
+/// a hit is promoted into [`cache_dir`].
+fn legacy_cache_dir() -> PathBuf {
     thegn_core::util::thegn_dir().join("sandbox-home")
+}
+
+/// Create (owner-only) and hold `state_root()/<sub>`. The anchor is the
+/// instance's `$XDG_STATE_HOME/thegn` (the DB dir, trusted, may itself resolve
+/// through a symlink); `provider/<sub>` beneath it is walked without following
+/// links and pinned by the returned handle.
+fn private_state_dir(sub: &str) -> std::io::Result<thegn_core::fsperm::PrivateDir> {
+    let anchor = thegn_core::util::xdg_state_home().join("thegn");
+    std::fs::create_dir_all(&anchor)?;
+    thegn_core::fsperm::ensure_private_dir_beneath(&anchor, &Path::new("provider").join(sub))
 }
 
 fn cache_file(id: &str) -> PathBuf {
@@ -49,18 +73,29 @@ pub fn cache_home(id: &str, home: &str) {
         return;
     }
     // best-effort: cache write (a failure just costs a later re-probe)
-    let _ = std::fs::create_dir_all(cache_dir());
-    let _ = std::fs::write(cache_file(id), home); // best-effort: cache write: a miss just costs a later re-probe
+    let _ = private_state_dir("sandbox-home")
+        .and_then(|dir| dir.write_owner_only_atomic(id, home.as_bytes()));
 }
 
 /// The cached sandbox `$HOME`, if provisioning recorded one. Rejects a
 /// previously-poisoned value (interior whitespace) so a bad cache written by an
 /// older build self-heals to the bare default until the next provision re-probes.
+///
+/// Falls back to the legacy `thegn_dir()` location; a valid legacy value is
+/// promoted into the shared state dir (best-effort) and returned.
 pub fn cached_home(id: &str) -> Option<String> {
-    std::fs::read_to_string(cache_file(id))
-        .ok()
-        .map(|s| s.trim().to_string())
-        .filter(|s| is_valid_home(s))
+    let read = |path: PathBuf| {
+        std::fs::read_to_string(path)
+            .ok()
+            .map(|s| s.trim().to_string())
+            .filter(|s| is_valid_home(s))
+    };
+    if let Some(home) = read(cache_file(id)) {
+        return Some(home);
+    }
+    let home = read(legacy_cache_dir().join(id))?;
+    cache_home(id, &home);
+    Some(home)
 }
 
 /// The default workspace dir under a sandbox `$HOME` (the repo clone root).
@@ -73,7 +108,11 @@ pub fn default_workdir(home: &str) -> String {
 /// to the workspace (only the sprite native-exec path does), so `shell_inner`'s
 /// `direnv exec .` would run at `$HOME` (no `.envrc`) and never enter the devShell
 /// — the machine0 bare `sh` at `/home/nix`. No-op for `clean-shell` (the bare
-/// escape hatch), a non-provider placement, or before the home is cached.
+/// escape hatch) or a non-provider placement.
+///
+/// Before the home is cached locally (e.g. this host never ran the provision),
+/// the `cd` targets the REMOTE `$HOME/workspace` — `$HOME` is expanded by the
+/// provider's shell, not here — falling back to the bare `/workspace`.
 pub fn with_workdir_cd(
     choice: &str,
     placement: Option<&thegn_core::placement::Placement>,
@@ -86,7 +125,7 @@ pub fn with_workdir_cd(
         return cmd;
     };
     let Some(home) = cached_home(&p.id) else {
-        return cmd;
+        return format!("cd \"$HOME/workspace\" 2>/dev/null || cd /workspace 2>/dev/null; {cmd}");
     };
     let wd = thegn_core::util::sh_quote(&default_workdir(&home));
     format!("cd {wd} 2>/dev/null; {cmd}")
@@ -105,6 +144,11 @@ pub fn with_workdir_cd(
 // materialize provision, which re-sets it.
 
 fn provisioned_dir() -> PathBuf {
+    state_root().join("provisioned")
+}
+
+/// The pre-THE-2042 marker location under `thegn_dir()` (`$HOME`-relative).
+fn legacy_provisioned_dir() -> PathBuf {
     thegn_core::util::thegn_dir().join("provisioned")
 }
 
@@ -112,20 +156,34 @@ fn provisioned_dir() -> PathBuf {
 /// `.tg` marker). Best-effort — a missed write costs one extra idempotent
 /// re-provision.
 pub fn mark_provisioned(id: &str) {
-    let _ = std::fs::create_dir_all(provisioned_dir()); // best-effort: dir prep: a later write reports the real failure
-    let _ = std::fs::write(provisioned_dir().join(id), b"1"); // best-effort: cache write: a miss just costs a later re-probe
+    // best-effort: cache write: a miss just costs one idempotent re-provision
+    let _ = private_state_dir("provisioned").and_then(|dir| dir.write_owner_only_atomic(id, b"1"));
 }
 
 /// Whether sandbox `id` has the LOCAL provisioned marker — a cheap file stat,
 /// safe to call on the event loop (unlike the network remote-marker read).
+/// A marker found only at the legacy `thegn_dir()` location counts, and is
+/// promoted into the shared state dir (best-effort).
 pub fn is_provisioned_locally(id: &str) -> bool {
-    provisioned_dir().join(id).exists()
+    if provisioned_dir().join(id).exists() {
+        return true;
+    }
+    if legacy_provisioned_dir().join(id).exists() {
+        mark_provisioned(id);
+        return true;
+    }
+    false
 }
 
 /// Drop the local provisioned marker (sandbox destroyed/recycled) so a recreated
 /// bare VM under the same id isn't treated as provisioned.
+/// Removes both the shared-state marker and any legacy `thegn_dir()` one, so a
+/// stale legacy marker can't be re-promoted.
 pub fn clear_provisioned(id: &str) {
-    let _ = std::fs::remove_file(provisioned_dir().join(id)); // best-effort: cleanup: the target may already be gone; a failed removal never fails the caller
+    // best-effort: cleanup: the target may already be gone; a failed removal never fails the caller
+    let _ = thegn_core::fsperm::open_private_dir(&provisioned_dir())
+        .and_then(|dir| dir.remove_file(id));
+    let _ = std::fs::remove_file(legacy_provisioned_dir().join(id)); // best-effort: cleanup: the target may already be gone; a failed removal never fails the caller
 }
 
 /// The sandbox login's real `$HOME` (absolute), via one cheap exec. Falls back to
@@ -213,19 +271,44 @@ pub fn resolve(pc: &EnvProviderConfig, id: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use super::{
+        EnvProviderConfig, cache_home, cached_home, clear_provisioned, default_workdir,
+        extract_home, is_provisioned_locally, is_valid_home, legacy_cache_dir,
+        legacy_provisioned_dir, mark_provisioned, provisioned_dir, resolve, with_workdir_cd,
+    };
 
-    // These tests mutate the process-global `THEGN_DIR`. They go through
-    // `testenv::EnvVarGuard`, NOT a local mutex: a second mutex over the same
-    // variable serializes these tests against each other while excluding
-    // nothing that holds `testenv::ENV_LOCK` elsewhere in the crate — two
-    // mutexes over one resource. The guard also restores on panic.
+    // These tests mutate process-global env (HOME / THEGN_DIR / XDG_STATE_HOME)
+    // only through `testenv::IsolatedState`, which holds the crate-wide
+    // `testenv::ENV_LOCK` and restores every state key on drop (even on panic).
 
     fn pc(provider: &str, workdir: &str) -> EnvProviderConfig {
         EnvProviderConfig {
             provider: provider.into(),
             workdir: workdir.into(),
             ..Default::default()
+        }
+    }
+
+    fn provider_placement(id: &str) -> thegn_core::placement::Placement {
+        thegn_core::placement::Placement::Provider(thegn_core::placement::ProviderPlacement {
+            provider: "machine0".into(),
+            id: id.into(),
+            interactive_prefix: vec![],
+            control_prefix: vec![],
+            up_command: vec![],
+            down_command: vec![],
+        })
+    }
+
+    /// Re-point HOME + THEGN_DIR at `root` (a second "process" from another
+    /// profile shell) while keeping XDG_STATE_HOME. Only call while an
+    /// `IsolatedState` is alive: it holds ENV_LOCK and restores both on drop.
+    fn switch_home(root: &std::path::Path) {
+        // SAFETY: the caller's IsolatedState holds ENV_LOCK for the whole test and
+        // restores HOME/THEGN_DIR on drop.
+        unsafe {
+            std::env::set_var("HOME", root);
+            std::env::set_var("THEGN_DIR", root.join(".thegn"));
         }
     }
 
@@ -276,23 +359,9 @@ mod tests {
 
     #[test]
     fn with_workdir_cd_prefixes_provider_panes_only() {
-        use thegn_core::placement::{Placement, ProviderPlacement};
-        let state = crate::testenv::IsolatedState::new();
-        let tmp = state.thegn_dir();
-        let _ = std::fs::remove_dir_all(&tmp); // best-effort: cleanup: the target may already be gone; a failed removal never fails the caller
-        let provider = Placement::Provider(ProviderPlacement {
-            provider: "machine0".into(),
-            id: "tg-x-abc".into(),
-            interactive_prefix: vec![],
-            control_prefix: vec![],
-            up_command: vec![],
-            down_command: vec![],
-        });
-        // No cached home yet ⇒ cmd unchanged.
-        assert_eq!(
-            with_workdir_cd("shell", Some(&provider), "run".into()),
-            "run"
-        );
+        use thegn_core::placement::Placement;
+        let _state = crate::testenv::IsolatedState::new();
+        let provider = provider_placement("tg-x-abc");
         // Cached home ⇒ cd into <home>/workspace first.
         cache_home("tg-x-abc", "/home/nix");
         assert_eq!(
@@ -309,32 +378,110 @@ mod tests {
             "run"
         );
         assert_eq!(with_workdir_cd("shell", None, "run".into()), "run");
-        let _ = std::fs::remove_dir_all(&tmp); // best-effort: cleanup: the target may already be gone; a failed removal never fails the caller
+    }
+
+    #[test]
+    fn with_workdir_cd_without_cache_falls_back_to_remote_home_workspace() {
+        let _state = crate::testenv::IsolatedState::new();
+        let provider = provider_placement("tg-never-cached");
+        // `$HOME` stays literal: the provider's remote shell expands it.
+        assert_eq!(
+            with_workdir_cd("shell", Some(&provider), "run".into()),
+            "cd \"$HOME/workspace\" 2>/dev/null || cd /workspace 2>/dev/null; run"
+        );
+        // clean-shell is still untouched.
+        assert_eq!(
+            with_workdir_cd("clean-shell", Some(&provider), "run".into()),
+            "run"
+        );
     }
 
     #[test]
     fn provisioned_marker_roundtrips() {
         let state = crate::testenv::IsolatedState::new();
-        let tmp = state.thegn_dir();
-        let _ = std::fs::remove_dir_all(&tmp); // best-effort: cleanup: the target may already be gone; a failed removal never fails the caller
         let id = "thegn-tg-clever-falcon-rmuy88";
         assert!(!is_provisioned_locally(id), "absent before mark");
         mark_provisioned(id);
         assert!(is_provisioned_locally(id), "present after mark");
+        assert!(
+            provisioned_dir().starts_with(state.state_home()),
+            "marker lives under the XDG state home"
+        );
+        assert!(provisioned_dir().join(id).is_file());
         clear_provisioned(id);
         assert!(!is_provisioned_locally(id), "absent after clear");
         // Clearing a never-marked id is a no-op (no panic).
         clear_provisioned("never-marked");
-        let _ = std::fs::remove_dir_all(&tmp); // best-effort: cleanup: the target may already be gone; a failed removal never fails the caller
+    }
+
+    #[test]
+    fn markers_written_under_one_home_are_seen_from_another_home() {
+        let state = crate::testenv::IsolatedState::new();
+        let id = "thegn-tg-shared-sprite";
+        // "Process" A: the daemon under the real HOME provisions the sandbox.
+        mark_provisioned(id);
+        cache_home(id, "/home/sprite");
+        // "Process" B: a Claude profile shell with a different HOME/THEGN_DIR but
+        // the same instance state home.
+        let home_b = state.root().join("profile-b");
+        std::fs::create_dir_all(&home_b).expect("profile home");
+        switch_home(&home_b);
+        assert_eq!(thegn_core::util::thegn_dir(), home_b.join(".thegn"));
+        assert!(is_provisioned_locally(id), "marker visible across HOMEs");
+        assert_eq!(cached_home(id).as_deref(), Some("/home/sprite"));
+        assert_eq!(resolve(&pc("sprites", ""), id), "/home/sprite/workspace");
+        assert_eq!(
+            with_workdir_cd("shell", Some(&provider_placement(id)), "run".into()),
+            "cd /home/sprite/workspace 2>/dev/null; run"
+        );
+    }
+
+    #[test]
+    fn legacy_markers_are_honoured_and_promoted() {
+        let _state = crate::testenv::IsolatedState::new();
+        let id = "thegn-tg-legacy-box";
+        // An older build wrote both under thegn_dir().
+        std::fs::create_dir_all(legacy_provisioned_dir()).unwrap();
+        std::fs::write(legacy_provisioned_dir().join(id), b"1").unwrap();
+        std::fs::create_dir_all(legacy_cache_dir()).unwrap();
+        std::fs::write(legacy_cache_dir().join(id), "/home/nix\n").unwrap();
+        assert!(!provisioned_dir().join(id).exists());
+
+        assert!(is_provisioned_locally(id), "legacy marker counts");
+        assert!(
+            provisioned_dir().join(id).is_file(),
+            "legacy marker promoted"
+        );
+        assert_eq!(cached_home(id).as_deref(), Some("/home/nix"));
+        assert_eq!(
+            std::fs::read_to_string(super::cache_file(id)).unwrap(),
+            "/home/nix",
+            "legacy home promoted"
+        );
+        // A poisoned legacy home is neither returned nor promoted.
+        let bad = "thegn-tg-legacy-poisoned";
+        std::fs::write(legacy_cache_dir().join(bad), "/home/nix ControlSocket").unwrap();
+        assert_eq!(cached_home(bad), None);
+        assert!(!super::cache_file(bad).exists());
+    }
+
+    #[test]
+    fn clear_provisioned_removes_new_and_legacy_markers() {
+        let _state = crate::testenv::IsolatedState::new();
+        let id = "thegn-tg-both";
+        mark_provisioned(id);
+        std::fs::create_dir_all(legacy_provisioned_dir()).unwrap();
+        std::fs::write(legacy_provisioned_dir().join(id), b"1").unwrap();
+        clear_provisioned(id);
+        assert!(!provisioned_dir().join(id).exists());
+        assert!(!legacy_provisioned_dir().join(id).exists());
+        assert!(!is_provisioned_locally(id), "no legacy re-promotion");
     }
 
     #[test]
     fn cache_roundtrip_and_resolution() {
         // Isolate the state dir so the test never touches a live cache.
-        let state = crate::testenv::IsolatedState::new();
-        let tmp = state.thegn_dir();
-        let _ = std::fs::remove_dir_all(&tmp); // best-effort: cleanup: the target may already be gone; a failed removal never fails the caller
-
+        let _state = crate::testenv::IsolatedState::new();
         let id = "sandbox-abc";
         // Cold: no cache ⇒ the bare `/workspace` fallback.
         assert_eq!(resolve(&pc("machine0", ""), id), "/workspace");
@@ -345,7 +492,8 @@ mod tests {
         cache_home(id, "/home/nix");
         assert_eq!(cached_home(id).as_deref(), Some("/home/nix"));
         assert_eq!(resolve(&pc("machine0", ""), id), "/home/nix/workspace");
-
-        let _ = std::fs::remove_dir_all(&tmp); // best-effort: cleanup: the target may already be gone; a failed removal never fails the caller
+        // A re-probe overwrites the cached value.
+        cache_home(id, "/home/ubuntu");
+        assert_eq!(cached_home(id).as_deref(), Some("/home/ubuntu"));
     }
 }
