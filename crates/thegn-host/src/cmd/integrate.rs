@@ -40,6 +40,22 @@ fn short(oid: &str) -> &str {
     &oid[..oid.len().min(12)]
 }
 
+/// Classify the `rev-parse --verify --quiet refs/heads/<name>` read for a
+/// branch `--from` drops: `Some(tip)` when it exists, `None` when it is gone
+/// (empty output, or exit 1, which is how `--verify --quiet` reports a missing
+/// ref). Every other failure is returned, so the caller fails closed instead of
+/// reading "git could not answer" as "branch gone" and skipping the ancestry
+/// check.
+fn dropped_branch_tip(
+    read: Result<String, thegn_core::git_run::GitOutcome>,
+) -> Result<Option<String>, thegn_core::git_run::GitOutcome> {
+    match read {
+        Ok(tip) if !tip.is_empty() => Ok(Some(tip)),
+        Ok(_) | Err(thegn_core::git_run::GitOutcome::Exit { code: Some(1), .. }) => Ok(None),
+        Err(e) => Err(e),
+    }
+}
+
 pub(crate) fn integration_outcome(
     report: &integrate::FoldReport,
 ) -> Option<crate::cmd::session_track::IntegrationOutcome> {
@@ -162,14 +178,18 @@ pub fn run(cfg: &Config, args: &IntegrateArgs) -> Result<()> {
             .collect();
         let order = if let Some(from) = &args.from {
             let from_index = super::integrate_order::from_index(order, from)?;
-            let target_tip = thegn_core::util::git_out(
+            let target_tip = thegn_core::util::git_out_result(
                 &repo_root,
                 &["rev-parse", &format!("refs/heads/{target}")],
             )
-            .context("could not read the target tip")?;
+            .map_err(|e| anyhow::anyhow!("could not read the target tip: {e}"))?;
+            anyhow::ensure!(
+                !target_tip.is_empty(),
+                "could not read the target tip: empty"
+            );
             for raw_name in &order[..from_index] {
                 let name = raw_name.trim();
-                let Some(branch_tip) = thegn_core::util::git_out(
+                let read = thegn_core::util::git_out_result(
                     &repo_root,
                     &[
                         "rev-parse",
@@ -177,7 +197,15 @@ pub fn run(cfg: &Config, args: &IntegrateArgs) -> Result<()> {
                         "--quiet",
                         &format!("refs/heads/{name}"),
                     ],
-                ) else {
+                );
+                // Fail closed: only `--verify --quiet`'s exit 1 means "missing";
+                // a timeout or spawn failure must not skip the ancestry check.
+                let Some(branch_tip) = dropped_branch_tip(read).map_err(|e| {
+                    anyhow::anyhow!(
+                        "refusing --from {from}: could not read dropped branch {name}: {e}"
+                    )
+                })?
+                else {
                     outln!("  • {name} already folded (branch gone)");
                     continue;
                 };
@@ -598,5 +626,37 @@ mod truth_surface_tests {
         let error = cas_report.request_result().unwrap_err().to_string();
         assert!(error.contains("CAS retry budget exhausted"));
         assert!(!error.contains('('), "{error}");
+    }
+
+    #[test]
+    fn dropped_branch_tip_fails_closed_on_anything_but_missing() {
+        use thegn_core::git_run::GitOutcome;
+        assert_eq!(
+            dropped_branch_tip(Ok("abc123".into())).unwrap(),
+            Some("abc123".to_string())
+        );
+        assert_eq!(dropped_branch_tip(Ok(String::new())).unwrap(), None);
+        assert_eq!(
+            dropped_branch_tip(Err(GitOutcome::Exit {
+                code: Some(1),
+                stderr_tail: String::new(),
+            }))
+            .unwrap(),
+            None
+        );
+        assert!(matches!(
+            dropped_branch_tip(Err(GitOutcome::Exit {
+                code: Some(128),
+                stderr_tail: "fatal".into(),
+            })),
+            Err(GitOutcome::Exit {
+                code: Some(128),
+                ..
+            })
+        ));
+        assert!(matches!(
+            dropped_branch_tip(Err(GitOutcome::Timeout)),
+            Err(GitOutcome::Timeout)
+        ));
     }
 }
