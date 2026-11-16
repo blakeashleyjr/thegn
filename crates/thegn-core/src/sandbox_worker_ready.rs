@@ -338,20 +338,20 @@ mod tests {
             m("/git/common/refs/heads/tg", false),
             m("/git/common/logs/refs/heads/tg", false),
         ];
-        let facts = WorkerFacts {
+        let carved_facts = WorkerFacts {
             git_common_dir: Some(Path::new("/git/common")),
             ..facts(&carved, worktree)
         };
-        assert_eq!(classify_worker(&facts), WorkerReadiness::Ready);
+        assert_eq!(classify_worker(&carved_facts), WorkerReadiness::Ready);
 
         // The read-only fallback (no carve-outs) still holds the worker.
         let fallback = [m("/work/tree", false), m("/git/common", true)];
-        let facts = WorkerFacts {
+        let fallback_facts = WorkerFacts {
             git_common_dir: Some(Path::new("/git/common")),
             ..facts(&fallback, worktree)
         };
         assert_eq!(
-            classify_worker(&facts),
+            classify_worker(&fallback_facts),
             WorkerReadiness::CannotWriteGitMetadata
         );
     }
