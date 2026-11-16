@@ -4,6 +4,7 @@
 //! and a *data* mode. Selection layers worktree → workspace → repo `.thegn.*`
 //! → global `[sandbox] default_env` → the implicit `default`.
 
+use crate::agent::{ProvisionState, ProvisionStepView};
 use crate::egress_admit::EgressSteps;
 use crate::egress_admit::admit_egress;
 use anyhow::{Context, Result};
@@ -49,7 +50,8 @@ pub enum Action {
         #[command(flatten)]
         target: super::target::WorktreeTarget,
     },
-    /// Bring a worktree's environment up (k8s: spawn the pod and wait for Ready).
+    /// Bring a worktree's environment up (k8s: spawn the pod and wait for Ready;
+    /// provider: provision the sandbox headlessly, streaming each step).
     Up {
         #[command(flatten)]
         target: super::target::WorktreeTarget,
@@ -675,9 +677,12 @@ fn lifecycle(cfg: &Config, worktree: Option<String>, action: Lifecycle) -> Resul
     match action {
         Lifecycle::Up => {
             outln!("bringing up env {} ({})…", env.name, env.placement.label());
-            env.placement
-                .ensure()
-                .map_err(|e| anyhow::anyhow!("env up failed: {e}"))?;
+            let wt = super::resolve_worktree(worktree)
+                .to_string_lossy()
+                .into_owned();
+            bring_up(&env, &wt, |progress| {
+                crate::agent::provision_worktree(cfg, &wt, progress)
+            })?;
             sshfs(&env, true)?;
             outln!("env {} is up", env.name);
         }
@@ -691,6 +696,156 @@ fn lifecycle(cfg: &Config, worktree: Option<String>, action: Lifecycle) -> Resul
         }
     }
     Ok(())
+}
+
+/// The `env up` placement step. A **provider** env is provisioned in this
+/// process through the same `provision_worktree` the TUI loading screen runs —
+/// the only path that sets the sandbox up and writes the local provisioned
+/// marker the attach gate checks — so a provider worktree is usable headlessly.
+/// Idempotent: an already-provisioned sandbox returns quickly (auth refreshed).
+/// Every other placement keeps `Placement::ensure`.
+fn bring_up(
+    env: &thegn_core::env::Environment,
+    worktree: &str,
+    provision: impl FnOnce(&mut dyn FnMut(&[ProvisionStepView])) -> Result<bool>,
+) -> Result<()> {
+    if !env.placement.is_provider() {
+        return env
+            .placement
+            .ensure()
+            .map_err(|e| anyhow::anyhow!("env up failed: {e}"));
+    }
+    let provisioned = provision_reporting(provision)
+        .with_context(|| format!("env up failed: provisioning {worktree} (env {})", env.name))?;
+    anyhow::ensure!(
+        provisioned,
+        "env up failed: {worktree} no longer resolves to the provider env {}; nothing was provisioned",
+        env.name
+    );
+    Ok(())
+}
+
+/// Run `provision`, printing each step transition as one stderr line.
+fn provision_reporting(
+    provision: impl FnOnce(&mut dyn FnMut(&[ProvisionStepView])) -> Result<bool>,
+) -> Result<bool> {
+    let mut reporter = StepReporter::default();
+    let mut on_progress = |steps: &[ProvisionStepView]| {
+        for line in reporter.changed(steps) {
+            msg::info(&line);
+        }
+    };
+    provision(&mut on_progress)
+}
+
+/// Turns the loading screen's full step snapshots into one line per step state
+/// change (pending steps are silent).
+#[derive(Default)]
+struct StepReporter {
+    seen: Vec<(String, ProvisionState)>,
+}
+
+impl StepReporter {
+    fn changed(&mut self, steps: &[ProvisionStepView]) -> Vec<String> {
+        let mut lines = Vec::new();
+        for step in steps {
+            if step.state == ProvisionState::Pending {
+                continue;
+            }
+            let changed = match self.seen.iter_mut().find(|(label, _)| *label == step.label) {
+                Some((_, state)) if *state == step.state => false,
+                Some((_, state)) => {
+                    *state = step.state;
+                    true
+                }
+                None => {
+                    self.seen.push((step.label.clone(), step.state));
+                    true
+                }
+            };
+            if changed {
+                lines.push(step_line(step));
+            }
+        }
+        lines
+    }
+}
+
+fn step_line(step: &ProvisionStepView) -> String {
+    let state = match step.state {
+        ProvisionState::Pending => "pending",
+        ProvisionState::Active => "running",
+        ProvisionState::Done => "done",
+        ProvisionState::Failed => "FAILED",
+    };
+    let detail = step
+        .detail
+        .as_deref()
+        .map(str::trim)
+        .filter(|d| step.state == ProvisionState::Failed && !d.is_empty());
+    match detail {
+        Some(detail) => format!("provision: {} — {state}: {detail}", step.label),
+        None => format!("provision: {} — {state}", step.label),
+    }
+}
+
+/// Upper bound on a headless open's provisioning (each step is separately
+/// bounded by `provision_step_timeout`; this caps the whole run).
+const HEADLESS_PROVISION_DEADLINE: std::time::Duration = std::time::Duration::from_secs(60 * 60);
+
+/// Before a headless `session open`: when `worktree` resolves to a provider env
+/// whose sandbox is not provisioned on this host, provision it HERE (the CLI
+/// process, which has the user's PATH and provider credentials), streaming the
+/// steps to stderr. Without this the daemon's attach gate refuses forever —
+/// only the TUI loading screen ever provisions. A no-op for every other env and
+/// for an already-provisioned sandbox. Runs on a named worker thread, off the
+/// async runtime, bounded by [`HEADLESS_PROVISION_DEADLINE`]; past the deadline
+/// the worker is abandoned (it dies with the process) and the open fails.
+pub(crate) async fn provision_for_headless_open(cfg: &Config, worktree: String) -> Result<()> {
+    let cfg = cfg.clone();
+    tokio::task::spawn_blocking(move || {
+        provision_headless_blocking(cfg, worktree, HEADLESS_PROVISION_DEADLINE)
+    })
+    .await
+    .context("headless provisioning task failed")?
+}
+
+fn provision_headless_blocking(
+    cfg: Config,
+    worktree: String,
+    deadline: std::time::Duration,
+) -> Result<()> {
+    let Some(env_name) = crate::provision_gate::unprovisioned_provider_env(&cfg, &worktree)? else {
+        return Ok(());
+    };
+    msg::info(&format!(
+        "provider env {env_name} for {worktree} is not provisioned yet — provisioning before the headless open"
+    ));
+    let (tx, rx) = std::sync::mpsc::channel();
+    let wt = worktree.clone();
+    thegn_core::thread_name::try_spawn_named("thegn-hl-prov", move || {
+        let outcome =
+            provision_reporting(|progress| crate::agent::provision_worktree(&cfg, &wt, progress));
+        if tx.send(outcome).is_err() {
+            // The receiver is gone only after the deadline already refused the open.
+            tracing::debug!(target: "thegn::provider", worktree = %wt, "headless provision finished after its deadline");
+        }
+    })
+    .context("could not start the headless provisioning thread")?;
+    match rx.recv_timeout(deadline) {
+        Ok(outcome) => {
+            outcome.with_context(|| {
+                format!(
+                    "provisioning {worktree} (env {env_name}) failed; `thegn env up --worktree {worktree}` retries it"
+                )
+            })?;
+            Ok(())
+        }
+        Err(_) => anyhow::bail!(
+            "provisioning {worktree} (env {env_name}) did not finish within {} min; run `thegn env up --worktree {worktree}` and retry",
+            deadline.as_secs() / 60
+        ),
+    }
 }
 
 /// Project (or unproject) the worktree for the env's data mode. Delegates to the
@@ -1255,5 +1410,115 @@ mod selection_tests {
         let env = result.unwrap();
         assert_eq!(env.name, "default");
         assert!(env.placement.is_local());
+    }
+}
+
+#[cfg(test)]
+mod up_tests {
+    use super::*;
+    use thegn_core::placement::{Placement, ProviderPlacement};
+
+    fn provider_env() -> thegn_core::env::Environment {
+        thegn_core::env::Environment {
+            name: "sprites".into(),
+            placement: Placement::Provider(ProviderPlacement {
+                provider: "fake".into(),
+                id: "fake-sandbox".into(),
+                interactive_prefix: Vec::new(),
+                control_prefix: Vec::new(),
+                up_command: Vec::new(),
+                down_command: Vec::new(),
+            }),
+            sandbox: Default::default(),
+            data: thegn_core::config::DataMode::InEnv,
+            unresolved_selection: false,
+        }
+    }
+
+    fn step(label: &str, state: ProvisionState, detail: Option<&str>) -> ProvisionStepView {
+        ProvisionStepView {
+            label: label.into(),
+            state,
+            detail: detail.map(str::to_string),
+        }
+    }
+
+    #[test]
+    fn env_up_on_a_provider_env_runs_the_provision_path() {
+        let mut calls = 0;
+        bring_up(&provider_env(), "/wt/app", |progress| {
+            calls += 1;
+            progress(&[step("workspace", ProvisionState::Done, None)]);
+            Ok(true)
+        })
+        .expect("provider env up succeeds when provisioning does");
+        assert_eq!(calls, 1);
+    }
+
+    #[test]
+    fn env_up_surfaces_the_provision_error() {
+        let result = bring_up(&provider_env(), "/wt/app", |_| {
+            Err(anyhow::anyhow!("sprite create: 401 unauthorized"))
+        });
+        let error = format!("{:#}", result.expect_err("a failed provision fails env up"));
+        assert!(error.contains("env up failed"), "{error}");
+        assert!(error.contains("/wt/app"), "{error}");
+        assert!(error.contains("401 unauthorized"), "{error}");
+    }
+
+    #[test]
+    fn env_up_refuses_when_nothing_was_provisioned() {
+        let result = bring_up(&provider_env(), "/wt/app", |_| Ok(false));
+        let error = format!(
+            "{:#}",
+            result.expect_err("an un-provisioned provider env fails")
+        );
+        assert!(error.contains("nothing was provisioned"), "{error}");
+    }
+
+    #[test]
+    fn env_up_on_a_local_env_never_provisions() {
+        let _state = crate::testenv::IsolatedState::new();
+        let dir = tempfile::tempdir().unwrap();
+        let wt = dir.path().to_string_lossy().into_owned();
+        let env = resolve_for(&Config::default(), Some(wt.clone())).expect("local env");
+        assert!(env.placement.is_local());
+        bring_up(&env, &wt, |_| panic!("a local env must not provision"))
+            .expect("local env up is unchanged");
+    }
+
+    #[test]
+    fn step_reporter_prints_each_state_change_once() {
+        let mut reporter = StepReporter::default();
+        let first = reporter.changed(&[
+            step("workspace", ProvisionState::Active, None),
+            step("clone", ProvisionState::Pending, None),
+        ]);
+        assert_eq!(first, vec!["provision: workspace — running".to_string()]);
+        let again = reporter.changed(&[
+            step("workspace", ProvisionState::Active, Some("mkdir")),
+            step("clone", ProvisionState::Pending, None),
+        ]);
+        assert!(again.is_empty(), "{again:?}");
+        let next = reporter.changed(&[
+            step("workspace", ProvisionState::Done, None),
+            step("clone", ProvisionState::Failed, Some("git: auth failed")),
+        ]);
+        assert_eq!(
+            next,
+            vec![
+                "provision: workspace — done".to_string(),
+                "provision: clone — FAILED: git: auth failed".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn headless_open_skips_a_local_worktree() {
+        let _state = crate::testenv::IsolatedState::new();
+        let dir = tempfile::tempdir().unwrap();
+        let wt = dir.path().to_string_lossy().into_owned();
+        provision_headless_blocking(Config::default(), wt, std::time::Duration::from_secs(5))
+            .expect("a local worktree needs no provisioning");
     }
 }

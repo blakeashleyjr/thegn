@@ -3965,14 +3965,37 @@ fn provision_provider_repo(cfg: &Config, repo_root: &Path, loc: &GitLoc, branch:
             Err(e) => thegn_core::msg::warn(&format!("provider repo provision via bridge: {e}")),
         }
     }
-    match loc.sh_command(&script).output() {
+    let mut command = loc.sh_command(&script);
+    match command.output() {
         Ok(o) if o.status.success() => initialize_provider_submodules(cfg, repo_root, loc),
         Ok(o) => thegn_core::msg::warn(&format!(
             "provider repo provision failed ({}): {}",
             o.status,
             crate::provision_recover::stderr_gist(&String::from_utf8_lossy(&o.stderr))
         )),
-        Err(e) => thegn_core::msg::warn(&format!("provider repo provision spawn failed: {e}")),
+        Err(e) => thegn_core::msg::warn(&spawn_failure_message(
+            "provider repo provision",
+            command.get_program(),
+            &e,
+        )),
+    }
+}
+
+/// A spawn failure naming the program that could not be started: a bare
+/// `No such file or directory` from a daemon whose PATH lacks the provider CLI
+/// is otherwise undiagnosable.
+pub(crate) fn spawn_failure_message(
+    what: &str,
+    program: &std::ffi::OsStr,
+    error: &std::io::Error,
+) -> String {
+    let program = program.to_string_lossy();
+    if error.kind() == std::io::ErrorKind::NotFound {
+        format!(
+            "{what} spawn failed: `{program}` not found ({error}) — is it installed and on this process's PATH?"
+        )
+    } else {
+        format!("{what} spawn failed: could not run `{program}`: {error}")
     }
 }
 
