@@ -268,27 +268,50 @@ pub fn reaper_creation_time(
         .ok_or("provider creation time is missing or invalid")
 }
 
-/// Parse a list response (`[ {machine}, … ]`), refusing incomplete or
-/// conflicting inventories before keeping only thegn-managed machines
-/// (client-side metadata filter — the endpoint has no selector).
-pub fn parse_machine_list(v: &serde_json::Value) -> Result<Vec<FlyMachine>, &'static str> {
-    let rows = v.as_array().ok_or("machine inventory is malformed")?;
+/// Typed form of [`parse_machine_list`]: a non-array or malformed element is
+/// `Unknown`; a duplicate id is `Partial` with the managed machines parsed so
+/// far; otherwise `Complete` with only thegn-managed machines (client-side
+/// metadata filter — the endpoint has no selector).
+pub fn machine_inventory(v: &serde_json::Value) -> crate::vps::Inventory<FlyMachine> {
+    use crate::vps::{Inventory, PartialReason};
+    let Some(rows) = v.as_array() else {
+        return Inventory::Unknown(MALFORMED_INVENTORY.to_string());
+    };
     let mut ids = BTreeSet::new();
     let mut managed = Vec::new();
     for row in rows {
-        let id = row
-            .get("id")
-            .and_then(serde_json::Value::as_str)
-            .ok_or("machine inventory contains a malformed machine")?;
+        let Some(id) = row.get("id").and_then(serde_json::Value::as_str) else {
+            return Inventory::Unknown(MALFORMED_MACHINE.to_string());
+        };
         if !ids.insert(id) {
-            return Err("machine inventory contains a duplicate machine id");
+            return Inventory::Partial {
+                rows: managed,
+                reason: PartialReason::DuplicateId,
+            };
         }
-        let machine = parse_machine(row).ok_or("machine inventory contains a malformed machine")?;
+        let Some(machine) = parse_machine(row) else {
+            return Inventory::Unknown(MALFORMED_MACHINE.to_string());
+        };
         if machine.metadata.get(MANAGED_KEY).map(String::as_str) == Some(MANAGED_VAL) {
             managed.push(machine);
         }
     }
-    Ok(managed)
+    Inventory::Complete(managed)
+}
+
+const MALFORMED_INVENTORY: &str = "machine inventory is malformed";
+const MALFORMED_MACHINE: &str = "machine inventory contains a malformed machine";
+
+/// Parse a list response (`[ {machine}, … ]`), refusing incomplete or
+/// conflicting inventories before keeping only thegn-managed machines.
+pub fn parse_machine_list(v: &serde_json::Value) -> Result<Vec<FlyMachine>, &'static str> {
+    use crate::vps::Inventory;
+    match machine_inventory(v) {
+        Inventory::Complete(rows) => Ok(rows),
+        Inventory::Partial { .. } => Err("machine inventory contains a duplicate machine id"),
+        Inventory::Unknown(reason) if reason == MALFORMED_INVENTORY => Err(MALFORMED_INVENTORY),
+        Inventory::Unknown(_) => Err(MALFORMED_MACHINE),
+    }
 }
 
 /// Return the sole live thegn-managed machine in an app inventory.
@@ -553,6 +576,57 @@ mod tests {
             .map(|m| m.name)
             .collect();
         assert_eq!(names, vec!["mine"]);
+    }
+
+    #[test]
+    fn machine_inventory_complete_keeps_only_managed() {
+        let list = serde_json::json!([
+            { "id": "a", "name": "mine", "config": { "metadata": { "managed-by": "thegn" } } },
+            { "id": "b", "name": "other", "config": { "metadata": { "managed-by": "x" } } }
+        ]);
+        match machine_inventory(&list) {
+            crate::vps::Inventory::Complete(rows) => {
+                assert_eq!(rows.len(), 1);
+                assert_eq!(rows[0].name, "mine");
+            }
+            other => panic!("expected Complete, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn machine_inventory_non_array_is_unknown() {
+        match machine_inventory(&serde_json::json!({"error":"x"})) {
+            crate::vps::Inventory::Unknown(reason) => {
+                assert_eq!(reason, "machine inventory is malformed")
+            }
+            other => panic!("expected Unknown, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn machine_inventory_bad_element_is_unknown() {
+        let list = serde_json::json!([{ "name": "broken" }]);
+        match machine_inventory(&list) {
+            crate::vps::Inventory::Unknown(reason) => {
+                assert_eq!(reason, "machine inventory contains a malformed machine")
+            }
+            other => panic!("expected Unknown, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn machine_inventory_duplicate_id_is_partial() {
+        let list = serde_json::json!([
+            { "id": "a", "name": "mine", "config": { "metadata": { "managed-by": "thegn" } } },
+            { "id": "a", "name": "mine", "config": { "metadata": { "managed-by": "thegn" } } }
+        ]);
+        match machine_inventory(&list) {
+            crate::vps::Inventory::Partial { rows, reason } => {
+                assert_eq!(rows.len(), 1);
+                assert!(matches!(reason, crate::vps::PartialReason::DuplicateId));
+            }
+            other => panic!("expected Partial, got {other:?}"),
+        }
     }
 
     #[test]

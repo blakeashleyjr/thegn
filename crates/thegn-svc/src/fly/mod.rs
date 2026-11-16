@@ -394,6 +394,15 @@ impl FlyProvider {
         graphql::parse_allocated_ipv4(&self.graphql(&graphql::allocate_ipv4(app)).await?)
     }
 
+    /// Typed provider inventory: the Fly inventory is the local ledger; the API
+    /// is not listed. A misconfigured API base is `Unknown`; otherwise `Complete`.
+    pub async fn list_inventory(&self) -> crate::vps::Inventory<String> {
+        match self.spec.api_base() {
+            Ok(_) => crate::vps::Inventory::Complete(self.ledger_names()),
+            Err(error) => crate::vps::Inventory::Unknown(format!("{error:#}")),
+        }
+    }
+
     /// All thegn-managed Fly sandboxes this host created (ledger view).
     fn ledger_names(&self) -> Vec<String> {
         registry::list()
@@ -873,11 +882,7 @@ impl RemoteProvider for FlyProvider {
     }
 
     fn list<'a>(&'a self) -> BoxFuture<'a, Result<Vec<String>>> {
-        Box::pin(async move {
-            // Refuse a misconfigured base even though list is ledger-only.
-            self.spec.api_base()?;
-            Ok(self.ledger_names())
-        })
+        Box::pin(async move { self.list_inventory().await.into_complete() })
     }
 }
 
@@ -1172,6 +1177,31 @@ mod tests {
             "{error:#}"
         );
         drop(permits);
+    }
+
+    #[tokio::test]
+    async fn fly_list_inventory_is_unknown_on_a_bad_api_base() {
+        let _state = thegn_core::testenv::IsolatedState::new();
+        let provider = FlyProvider::new(FlySpec {
+            api_base: "http://fly-canary.invalid".into(),
+            ..spec()
+        });
+        match provider.list_inventory().await {
+            crate::vps::Inventory::Unknown(reason) => {
+                assert!(reason.contains("fly: api_base refused"), "{reason}")
+            }
+            other => panic!("expected Unknown, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn fly_list_inventory_is_complete_from_the_ledger() {
+        let _state = thegn_core::testenv::IsolatedState::new();
+        let provider = FlyProvider::new(spec());
+        match provider.list_inventory().await {
+            crate::vps::Inventory::Complete(rows) => assert_eq!(rows, provider.ledger_names()),
+            other => panic!("expected Complete, got {other:?}"),
+        }
     }
 
     #[tokio::test]
