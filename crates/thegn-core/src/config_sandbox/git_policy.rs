@@ -199,9 +199,11 @@ pub struct GitMountPlan {
     pub mkdirs: Vec<PathBuf>,
     /// The caller must also bind the worktree itself read-only.
     pub worktree_ro: bool,
-    /// The mode wants a git credential (`full`). Only `repo-token` /
-    /// `user-token` hand one over today (the host GitHub token, see
-    /// [`SandboxGitConfig::admits_git_token`]); other credentials hand none.
+    /// The mode wants a git credential (`full`). `repo-token` / `user-token`
+    /// hand over the host GitHub token (see
+    /// [`SandboxGitConfig::admits_git_token`]); `deploy-key` binds the
+    /// configured key read-only on local placements (see
+    /// [`SandboxGitConfig::wants_deploy_key`]); `none` and `github-app` hand none.
     pub credential_wanted: bool,
 }
 
@@ -360,14 +362,16 @@ pub fn validate(cfg: &SandboxGitConfig) -> Vec<String> {
                 cfg.credential
             ));
         }
-        if !matches!(
-            cfg.credential,
-            GitCredential::RepoToken | GitCredential::UserToken
-        ) {
-            out.push(
-                "sandbox.git.credential modes are not implemented yet; the sandbox gets no git credential"
+        match cfg.credential {
+            GitCredential::DeployKey if cfg.deploy_key.trim().is_empty() => out.push(
+                "sandbox.git.credential = \"deploy-key\" needs sandbox.git.deploy_key (a private key path); the sandbox gets no git credential"
                     .to_string(),
-            );
+            ),
+            GitCredential::GithubApp => out.push(
+                "sandbox.git.credential = \"github-app\" is not implemented yet; the sandbox gets no git credential"
+                    .to_string(),
+            ),
+            _ => {}
         }
     }
     for (key, list) in [("push_refs", &cfg.push_refs), ("deny_refs", &cfg.deny_refs)] {
@@ -378,6 +382,50 @@ pub fn validate(cfg: &SandboxGitConfig) -> Vec<String> {
         );
     }
     out
+}
+
+/// Fixed in-sandbox path a `credential = "deploy-key"` key is bound to on
+/// backends with their own mount namespace (bwrap, OCI).
+pub const DEPLOY_KEY_DEST: &str = "/run/thegn-deploy-key";
+
+/// What a deploy key file is on the host, read with `symlink_metadata` (never
+/// following a symlink). `mode` is `None` on platforms without mode bits.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DeployKeyFacts {
+    pub regular: bool,
+    pub symlink: bool,
+    pub owned_by_user: bool,
+    pub mode: Option<u32>,
+}
+
+/// Is a key with these facts safe to hand a sandbox? A regular file (not a
+/// symlink, not a directory) owned by the user with no group/world bits.
+/// `Err` carries the reason, worded for the launch warning.
+pub fn check_deploy_key(facts: Option<DeployKeyFacts>) -> Result<(), String> {
+    let Some(facts) = facts else {
+        return Err("the key file does not exist or cannot be read".to_string());
+    };
+    if facts.symlink {
+        return Err("the key path is a symlink (point deploy_key at the file itself)".to_string());
+    }
+    if !facts.regular {
+        return Err("the key path is not a regular file".to_string());
+    }
+    if !facts.owned_by_user {
+        return Err("the key file is not owned by the current user".to_string());
+    }
+    if facts.mode.is_some_and(|mode| mode & 0o077 != 0) {
+        return Err("the key file is group/world accessible (chmod 600 it)".to_string());
+    }
+    Ok(())
+}
+
+/// The `GIT_SSH_COMMAND` selecting the key at `dest` inside the sandbox.
+pub fn deploy_key_ssh_command(dest: &str) -> String {
+    format!(
+        "ssh -i {} -o IdentitiesOnly=yes",
+        crate::util::sh_quote(dest)
+    )
 }
 
 #[cfg(test)]
@@ -754,7 +802,7 @@ mod tests {
         });
         assert_eq!(warns.len(), 2, "{warns:?}");
         assert!(warns[0].contains("only used in mode = \"full\""));
-        assert!(warns[1].contains("not implemented yet"));
+        assert!(warns[1].contains("needs sandbox.git.deploy_key"));
         let warns = validate(&SandboxGitConfig {
             mode: SandboxGitMode::Full,
             credential: GitCredential::GithubApp,
@@ -763,6 +811,7 @@ mod tests {
             ..SandboxGitConfig::default()
         });
         assert_eq!(warns.len(), 3, "{warns:?}");
+        assert!(warns[0].contains("github-app") && warns[0].contains("not implemented yet"));
         assert!(warns[1].starts_with("sandbox.git.push_refs:"));
         assert!(warns[2].starts_with("sandbox.git.deny_refs:"));
         assert!(
@@ -773,6 +822,178 @@ mod tests {
             })
             .is_empty()
         );
+    }
+
+    #[test]
+    fn validate_deploy_key_table() {
+        // (mode, credential, deploy_key, expected warning substrings)
+        let cases: [(SandboxGitMode, GitCredential, &str, &[&str]); 6] = [
+            (
+                SandboxGitMode::Full,
+                GitCredential::DeployKey,
+                "",
+                &["needs sandbox.git.deploy_key"],
+            ),
+            (
+                SandboxGitMode::Full,
+                GitCredential::DeployKey,
+                "   ",
+                &["needs sandbox.git.deploy_key"],
+            ),
+            (
+                SandboxGitMode::Full,
+                GitCredential::DeployKey,
+                "~/.ssh/deploy",
+                &[],
+            ),
+            (SandboxGitMode::Full, GitCredential::DeployKey, "/k", &[]),
+            (
+                SandboxGitMode::PushLane,
+                GitCredential::DeployKey,
+                "/k",
+                &["only used in mode = \"full\""],
+            ),
+            (
+                SandboxGitMode::Full,
+                GitCredential::GithubApp,
+                "/k",
+                &["not implemented yet"],
+            ),
+        ];
+        for (mode, credential, key, want) in cases {
+            let warns = validate(&SandboxGitConfig {
+                mode,
+                credential,
+                deploy_key: key.to_string(),
+                ..SandboxGitConfig::default()
+            });
+            assert_eq!(
+                warns.len(),
+                want.len(),
+                "{mode} {credential} {key:?}: {warns:?}"
+            );
+            for (warn, needle) in warns.iter().zip(want.iter()) {
+                assert!(warn.contains(needle), "{warn}");
+            }
+            assert!(
+                !warns.iter().any(
+                    |w| credential == GitCredential::DeployKey && w.contains("not implemented")
+                ),
+                "{warns:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn deploy_key_file_checks() {
+        let good = DeployKeyFacts {
+            regular: true,
+            symlink: false,
+            owned_by_user: true,
+            mode: Some(0o600),
+        };
+        assert_eq!(check_deploy_key(Some(good)), Ok(()));
+        assert_eq!(
+            check_deploy_key(Some(DeployKeyFacts {
+                mode: Some(0o400),
+                ..good
+            })),
+            Ok(())
+        );
+        // No mode bits (non-unix): ownership + kind decide.
+        assert_eq!(
+            check_deploy_key(Some(DeployKeyFacts { mode: None, ..good })),
+            Ok(())
+        );
+        let cases = [
+            (None, "does not exist"),
+            (
+                Some(DeployKeyFacts {
+                    symlink: true,
+                    regular: false,
+                    ..good
+                }),
+                "symlink",
+            ),
+            (
+                Some(DeployKeyFacts {
+                    regular: false,
+                    ..good
+                }),
+                "not a regular file",
+            ),
+            (
+                Some(DeployKeyFacts {
+                    owned_by_user: false,
+                    ..good
+                }),
+                "not owned",
+            ),
+            (
+                Some(DeployKeyFacts {
+                    mode: Some(0o644),
+                    ..good
+                }),
+                "group/world",
+            ),
+            (
+                Some(DeployKeyFacts {
+                    mode: Some(0o640),
+                    ..good
+                }),
+                "group/world",
+            ),
+            (
+                Some(DeployKeyFacts {
+                    mode: Some(0o602),
+                    ..good
+                }),
+                "group/world",
+            ),
+        ];
+        for (facts, want) in cases {
+            let err = check_deploy_key(facts).expect_err(want);
+            assert!(err.contains(want), "{err}");
+        }
+    }
+
+    #[test]
+    fn deploy_key_ssh_command_quotes_the_path() {
+        assert_eq!(
+            deploy_key_ssh_command(DEPLOY_KEY_DEST),
+            "ssh -i /run/thegn-deploy-key -o IdentitiesOnly=yes"
+        );
+        assert_eq!(
+            deploy_key_ssh_command("/h/my key"),
+            "ssh -i '/h/my key' -o IdentitiesOnly=yes"
+        );
+    }
+
+    #[test]
+    fn deploy_key_wanted_and_path_expansion() {
+        let mut cfg = SandboxGitConfig {
+            mode: SandboxGitMode::Full,
+            credential: GitCredential::DeployKey,
+            ..SandboxGitConfig::default()
+        };
+        assert!(!cfg.wants_deploy_key());
+        assert_eq!(cfg.deploy_key_path(), None);
+        cfg.deploy_key = "/abs/key".into();
+        assert!(cfg.wants_deploy_key());
+        assert_eq!(cfg.deploy_key_path(), Some(PathBuf::from("/abs/key")));
+        cfg.deploy_key = "~/.ssh/deploy".into();
+        assert_eq!(
+            cfg.deploy_key_path(),
+            Some(crate::util::home().join(".ssh/deploy"))
+        );
+        // Deploy key never admits the host token families.
+        assert!(!cfg.admits_git_token());
+        assert!(!cfg.admits_env("GH_TOKEN"));
+        cfg.mode = SandboxGitMode::PushLane;
+        assert!(!cfg.wants_deploy_key());
+        cfg.mode = SandboxGitMode::Full;
+        cfg.credential = GitCredential::RepoToken;
+        assert!(!cfg.wants_deploy_key());
     }
 
     #[test]
@@ -858,7 +1079,10 @@ mod tests {
             credential: Some(GitCredential::UserToken),
             push_refs: Some(vec!["refs/heads/x/*".into()]),
             deny_refs: Some(Vec::new()),
+            deploy_key: Some("/k".into()),
         });
+        assert_eq!(all.deploy_key, "/k");
+        assert_eq!(merged.deploy_key, "");
         assert_eq!(all.transport, GitTransport::Clone);
         assert_eq!(all.credential, GitCredential::UserToken);
         assert_eq!(all.push_refs, ["refs/heads/x/*"]);
@@ -910,13 +1134,29 @@ mod tests {
         assert_eq!(cfg.sandbox.git.mode, SandboxGitMode::ReadOnly);
         assert_eq!(cfg.sandbox.git.transport, GitTransport::Bundle);
 
-        let minified = "sandbox={git={mode=\"push_lane\",transport=\"clone\",credential=\"deploy_key\",push_refs=[\"refs/heads/x/*\"],deny_refs=[]}}\n";
+        let minified = "sandbox={git={mode=\"push_lane\",transport=\"clone\",credential=\"deploy_key\",push_refs=[\"refs/heads/x/*\"],deny_refs=[],deploy_key=\"~/.ssh/d\"}}\n";
         let cfg: Config = toml::from_str(minified).expect("minified");
         assert_eq!(cfg.sandbox.git.mode, SandboxGitMode::PushLane);
         assert_eq!(cfg.sandbox.git.transport, GitTransport::Clone);
         assert_eq!(cfg.sandbox.git.credential, GitCredential::DeployKey);
         assert_eq!(cfg.sandbox.git.push_refs, ["refs/heads/x/*"]);
         assert!(cfg.sandbox.git.deny_refs.is_empty());
+        assert_eq!(cfg.sandbox.git.deploy_key, "~/.ssh/d");
+
+        let pretty_key = "[sandbox.git]\nmode = \"full\"\ncredential = \"deploy-key\"\ndeploy_key = \"/srv/keys/deploy\"\n";
+        let keyed: Config = toml::from_str(pretty_key).expect("pretty deploy key");
+        assert_eq!(keyed.sandbox.git.deploy_key, "/srv/keys/deploy");
+        assert!(keyed.sandbox.git.wants_deploy_key());
+        let overlay = "[env.ci.sandbox.git]\ndeploy_key = \"/k\"\n";
+        let env_cfg: Config = toml::from_str(overlay).expect("overlay deploy key");
+        assert_eq!(
+            env_cfg.env["ci"]
+                .sandbox
+                .git
+                .as_ref()
+                .and_then(|g| g.deploy_key.as_deref()),
+            Some("/k")
+        );
 
         // Serialize back to the canonical spellings and re-parse identically.
         let text = toml::to_string(&cfg.sandbox.git).expect("serialize");

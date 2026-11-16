@@ -1830,6 +1830,156 @@ fn git_policy_mounts(
     (mounts, warning)
 }
 
+/// THE-2021: what `credential = "deploy-key"` hands a sandbox.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum DeployKeyPlan {
+    /// The policy does not ask for a deploy key.
+    Off,
+    /// Bind `mount` (read-only, when the backend needs one) and set
+    /// `GIT_SSH_COMMAND` to `ssh_command`.
+    Grant {
+        mount: Option<Mount>,
+        ssh_command: String,
+    },
+    /// Asked for but withheld (fail closed); the reason is warned once.
+    Withheld(String),
+}
+
+/// Inputs to [`plan_deploy_key`] beyond the git policy itself.
+struct DeployKeyContext<'a> {
+    placement: &'a Placement,
+    backend: Backend,
+    file_access: FileAccess,
+    seal_home: Option<&'a str>,
+    mounts: &'a [Mount],
+    env: &'a [(String, String)],
+}
+
+/// Plan the deploy-key credential for a sandbox. Local placements only; the
+/// key must be a regular, user-owned, owner-only file (`probe` reports it
+/// without following a symlink). Every failure withholds the credential.
+fn plan_deploy_key(
+    git: &crate::config::SandboxGitConfig,
+    cx: &DeployKeyContext<'_>,
+    probe: &dyn Fn(&std::path::Path) -> Option<crate::config_sandbox::git_policy::DeployKeyFacts>,
+) -> DeployKeyPlan {
+    use crate::config::{GitCredential, SandboxGitMode};
+    use crate::config_sandbox::git_policy::{
+        DEPLOY_KEY_DEST, check_deploy_key, deploy_key_ssh_command,
+    };
+    if git.mode != SandboxGitMode::Full || git.credential != GitCredential::DeployKey {
+        return DeployKeyPlan::Off;
+    }
+    let withheld = |reason: String| {
+        DeployKeyPlan::Withheld(format!(
+            "deploy-key: {reason}; the sandbox gets no git credential"
+        ))
+    };
+    let Some(key) = git.deploy_key_path() else {
+        return withheld("sandbox.git.deploy_key is empty".to_string());
+    };
+    if !cx.placement.is_local() {
+        return withheld(
+            "deploy-key is local-only (remote placements are not supported)".to_string(),
+        );
+    }
+    if cx.env.iter().any(|(k, _)| k == "GIT_SSH_COMMAND") {
+        return DeployKeyPlan::Withheld(
+            "deploy-key: GIT_SSH_COMMAND from [sandbox] env_passthrough wins; the deploy key is not bound"
+                .to_string(),
+        );
+    }
+    let key_str = key.to_string_lossy().into_owned();
+    if let Some(reason) = crate::sandbox_mounts::systemd_path_refusal(&key_str) {
+        return withheld(format!("the key path {reason}"));
+    }
+    if let Err(reason) = check_deploy_key(probe(&key)) {
+        return withheld(reason);
+    }
+    // A key inside a writable mount could be rewritten (or swapped for a
+    // symlink to a directory) from inside a sandbox before the next launch.
+    // Real paths too: a symlinked parent can lead into a writable bind.
+    let real =
+        |path: &std::path::Path| std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+    let real_key = real(&key);
+    if cx.mounts.iter().filter(|m| !m.ro).any(|m| {
+        let host = std::path::Path::new(&m.host);
+        key.starts_with(host) || real_key.starts_with(real(host))
+    }) {
+        return withheld("the key lies inside a writable sandbox mount".to_string());
+    }
+    let key_mount = |dest: &str| Mount {
+        host: key_str.clone(),
+        dest: dest.to_string(),
+        ro: true,
+        cache: false,
+    };
+    if let Some(home) = cx.seal_home
+        && crate::sandbox_mounts::sealed_denies_mount(
+            &key_mount(DEPLOY_KEY_DEST),
+            std::path::Path::new(home),
+        )
+    {
+        return withheld("the key lies in the sealed tier's credential deny list".to_string());
+    }
+    // A fixed in-sandbox path, bound read-only after every other mount.
+    let fixed_dest = || {
+        let covered = cx
+            .mounts
+            .iter()
+            .any(|m| std::path::Path::new(DEPLOY_KEY_DEST).starts_with(&m.dest));
+        if covered {
+            withheld(format!("a [sandbox] mount covers {DEPLOY_KEY_DEST}"))
+        } else {
+            DeployKeyPlan::Grant {
+                mount: Some(key_mount(DEPLOY_KEY_DEST)),
+                ssh_command: deploy_key_ssh_command(DEPLOY_KEY_DEST),
+            }
+        }
+    };
+    match cx.backend.profile().family {
+        // `--dev-bind / /` already shows the host file at its own path.
+        BackendFamily::Bwrap if matches!(cx.file_access, FileAccess::All | FileAccess::Host) => {
+            DeployKeyPlan::Grant {
+                mount: None,
+                ssh_command: deploy_key_ssh_command(&key_str),
+            }
+        }
+        BackendFamily::Bwrap => fixed_dest(),
+        BackendFamily::Oci
+            if matches!(
+                cx.backend,
+                Backend::Podman | Backend::PodmanRootful | Backend::Docker
+            ) =>
+        {
+            fixed_dest()
+        }
+        // systemd shares the host mount tree: a path-preserving read-only
+        // mount keeps the key visible under a sealed `$HOME` tmpfs.
+        BackendFamily::Systemd => DeployKeyPlan::Grant {
+            mount: Some(key_mount(&key_str)),
+            ssh_command: deploy_key_ssh_command(&key_str),
+        },
+        _ => withheld(format!(
+            "not supported on the {} backend",
+            cx.backend.label()
+        )),
+    }
+}
+
+/// Host facts for a deploy key path, from `symlink_metadata` (no follow).
+fn deploy_key_facts(
+    path: &std::path::Path,
+) -> Option<crate::config_sandbox::git_policy::DeployKeyFacts> {
+    let meta = std::fs::symlink_metadata(path).ok()?;
+    Some(crate::config_sandbox::git_policy::DeployKeyFacts {
+        regular: meta.file_type().is_file(),
+        symlink: meta.file_type().is_symlink(),
+        owned_by_user: crate::fsperm::owned_by_current_user(&meta),
+        mode: crate::fsperm::mode_bits_from_metadata(&meta),
+    })
+}
+
 fn resolve_placed_with(
     cfg: &SandboxConfig,
     loc: &GitLoc,
@@ -2161,6 +2311,28 @@ fn resolve_placed_with(
                  (inject_devshell) still provides the devShell tools read-only.",
             );
         }
+    }
+
+    // THE-2021: `credential = "deploy-key"` binds the configured key
+    // read-only and points git's ssh at it. Host token families stay withheld.
+    match plan_deploy_key(
+        &cfg.git,
+        &DeployKeyContext {
+            placement: &placement,
+            backend,
+            file_access: cfg.file_access,
+            seal_home: seal_home.as_deref(),
+            mounts: &mounts,
+            env: &env,
+        },
+        &deploy_key_facts,
+    ) {
+        DeployKeyPlan::Off => {}
+        DeployKeyPlan::Grant { mount, ssh_command } => {
+            mounts.extend(mount);
+            env.push(("GIT_SSH_COMMAND".to_string(), ssh_command));
+        }
+        DeployKeyPlan::Withheld(reason) => warn_git_fallback_once(&loc.path(), &reason),
     }
 
     Some(SandboxSpec {
@@ -2816,7 +2988,8 @@ pub(crate) fn expected_policy(spec: &SandboxSpec) -> String {
 /// EQUAL the required one — an extra bind could be `~/.ssh` — apart from the
 /// `/nix` bind `oci_create_opts` adds itself for devenv, and only when the
 /// current spec would still add it (`nix_expected`): a container created with
-/// devenv on is recreated once devenv is off.
+/// devenv on is recreated once devenv is off; and `/dev/null`, the source of the
+/// runtime-dir socket masks (it exposes nothing).
 fn mounts_match(
     required: &std::collections::HashSet<&str>,
     active: &std::collections::HashSet<&str>,
@@ -2829,7 +3002,7 @@ fn mounts_match(
     !sealed
         || active
             .iter()
-            .all(|a| required.contains(a) || (nix_expected && *a == "/nix"))
+            .all(|a| required.contains(a) || (nix_expected && *a == "/nix") || *a == "/dev/null")
 }
 
 /// Judge `inspect` output in thegn's probe format: line 1 `RUNNING` (or empty),
@@ -4241,56 +4414,29 @@ fn backend_enter_argv_guarded_with_env(
                 // THE-2009: a bind exposing $XDG_RUNTIME_DIR also exposes the
                 // user bus, podman/docker and the systemd user manager, each a
                 // way to run code outside bwrap. Mask them after every bind.
-                if let Some(raw_runtime_dir) = env.runtime_dir.as_deref()
-                    && raw_runtime_dir != std::path::Path::new("/run/user")
-                {
-                    // Real paths, like the control guard: a symlinked or `..` mount source
-                    // (`/var/run` -> `/run`) exposes the runtime dir too.
-                    let runtime_dir = std::fs::canonicalize(raw_runtime_dir)
-                        .unwrap_or_else(|_| raw_runtime_dir.to_path_buf());
-                    let canonical_hosts: Vec<std::path::PathBuf> = mount_refs
-                        .iter()
-                        .map(|(host, _)| {
-                            std::fs::canonicalize(host).unwrap_or_else(|_| host.to_path_buf())
-                        })
-                        .collect();
-                    let canonical_refs: Vec<(&std::path::Path, &std::path::Path)> = canonical_hosts
-                        .iter()
-                        .zip(&mount_refs)
-                        .map(|(host, (_, dest))| (host.as_path(), *dest))
-                        .collect();
-                    if crate::sandbox_runtime_escape::mounts_expose(&runtime_dir, &canonical_refs) {
-                        let escapes = crate::sandbox_runtime_escape::host_escape_paths(
-                            &runtime_dir,
-                            &|path| {
-                                crate::sandbox_runtime_escape::kind_from_metadata(
-                                    std::fs::symlink_metadata(path).ok().as_ref(),
-                                )
-                            },
-                        );
-                        let mut explicit_dests: Vec<&std::path::Path> = spec
-                            .mounts
-                            .iter()
-                            .map(|mount| std::path::Path::new(&mount.dest))
-                            .collect();
-                        explicit_dests.push(&spec.worktree);
-                        for mask in crate::sandbox_runtime_escape::plan_escape_masks(
-                            &escapes,
-                            &canonical_refs,
-                            &explicit_dests,
-                        ) {
-                            match mask {
-                                crate::sandbox_runtime_escape::EscapeMask::Tmpfs(dest) => {
-                                    v.extend(["--tmpfs".into(), dest.display().to_string()]);
-                                }
-                                crate::sandbox_runtime_escape::EscapeMask::NullBind(dest) => {
-                                    v.extend([
-                                        "--ro-bind".into(),
-                                        "/dev/null".into(),
-                                        dest.display().to_string(),
-                                    ]);
-                                }
-                            }
+                // Real paths, like the control guard: a symlinked or `..` mount
+                // source (`/var/run` -> `/run`) exposes the runtime dir too.
+                let mut explicit_dests: Vec<&std::path::Path> = spec
+                    .mounts
+                    .iter()
+                    .map(|mount| std::path::Path::new(&mount.dest))
+                    .collect();
+                explicit_dests.push(&spec.worktree);
+                for mask in crate::sandbox_runtime_escape::host_runtime_escape_masks(
+                    env.runtime_dir.as_deref(),
+                    &mount_refs,
+                    &explicit_dests,
+                ) {
+                    match mask {
+                        crate::sandbox_runtime_escape::EscapeMask::Tmpfs(dest) => {
+                            v.extend(["--tmpfs".into(), dest.display().to_string()]);
+                        }
+                        crate::sandbox_runtime_escape::EscapeMask::NullBind(dest) => {
+                            v.extend([
+                                "--ro-bind".into(),
+                                "/dev/null".into(),
+                                dest.display().to_string(),
+                            ]);
                         }
                     }
                 }
@@ -5083,6 +5229,17 @@ fn oci_create_opts_with_remote_stdin_secrets(
     spec: &SandboxSpec,
     remote_stdin_secret_env: &[(&String, &String)],
 ) -> Result<Vec<String>, VolumeAdmissionError> {
+    let runtime_dir = systemd_runtime_dir(std::env::var_os("XDG_RUNTIME_DIR"));
+    oci_create_opts_in(spec, remote_stdin_secret_env, runtime_dir.as_deref())
+}
+
+/// [`oci_create_opts_with_remote_stdin_secrets`] with the host runtime dir
+/// injected (tests pass a fixture; production reads `$XDG_RUNTIME_DIR`).
+fn oci_create_opts_in(
+    spec: &SandboxSpec,
+    remote_stdin_secret_env: &[(&String, &String)],
+    runtime_dir: Option<&std::path::Path>,
+) -> Result<Vec<String>, VolumeAdmissionError> {
     admit_volumes(spec)?;
     let spec = &*sealed_view(spec);
     let mut v = Vec::new();
@@ -5201,6 +5358,12 @@ fn oci_create_opts_with_remote_stdin_secrets(
         let suffix = if m.ro { ":ro" } else { "" };
         v.extend(["-v".into(), format!("{}:{}{suffix}", m.host, m.dest)]);
     }
+    // THE-2009: a local bind exposing $XDG_RUNTIME_DIR also exposes the user
+    // bus and the podman/docker/systemd sockets. Mask them after the user binds,
+    // as bwrap does. Remote placements: the host paths are the remote's (and
+    // `config validate` warns). Other OCI runtimes are VMs whose shares cannot
+    // carry a host unix socket, and Apple rejects unknown flags.
+    v.extend(oci_runtime_escape_args(spec, runtime_dir));
     // When devenv lives in the Nix store, bind-mount /nix read-only so the
     // container can exec the resolved absolute path. Consistent with bwrap
     // which already does `--ro-bind /nix/store /nix/store`.
@@ -5305,6 +5468,38 @@ fn oci_create_opts_with_remote_stdin_secrets(
         );
     }
     Ok(v)
+}
+
+/// The local podman/docker args masking runtime-dir escapes exposed by
+/// `spec.mounts` (empty for remote placements and other OCI runtimes).
+fn oci_runtime_escape_args(
+    spec: &SandboxSpec,
+    runtime_dir: Option<&std::path::Path>,
+) -> Vec<String> {
+    if !spec.placement.is_local()
+        || !matches!(
+            spec.backend,
+            Backend::Podman | Backend::PodmanRootful | Backend::Docker
+        )
+    {
+        return Vec::new();
+    }
+    let mount_refs: Vec<(&std::path::Path, &std::path::Path)> = spec
+        .mounts
+        .iter()
+        .filter(|m| oci_emits_mount(m))
+        .map(|m| (std::path::Path::new(&m.host), std::path::Path::new(&m.dest)))
+        .collect();
+    let mut explicit_dests: Vec<&std::path::Path> =
+        mount_refs.iter().map(|(_, dest)| *dest).collect();
+    explicit_dests.push(&spec.worktree);
+    crate::sandbox_runtime_escape::oci_mask_args(
+        &crate::sandbox_runtime_escape::host_runtime_escape_masks(
+            runtime_dir,
+            &mount_refs,
+            &explicit_dests,
+        ),
+    )
 }
 
 /// When a VPN sidecar owns this worktree's network namespace (`sidecar`/`proxy`
