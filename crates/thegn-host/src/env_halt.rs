@@ -249,22 +249,34 @@ pub(crate) enum HaltClass {
 
 pub(crate) fn classify_halt(placement: &str, reason: &str) -> HaltClass {
     let placement = placement.to_ascii_lowercase();
-    if placement.starts_with("provider:") {
-        let r = reason.to_ascii_lowercase();
-        let has = |keys: &[&str]| keys.iter().any(|k| r.contains(k));
-        if has(&["insufficient_funds", "available: $", "balance"]) {
-            HaltClass::ProviderFunds
-        } else if has(&["token", "401", "403", "unauthorized", "forbidden"]) {
-            HaltClass::ProviderAuth
-        } else if has(&["never been provisioned", "provisioning"]) {
-            HaltClass::Unprovisioned
-        } else {
-            HaltClass::Remote
-        }
-    } else if placement.starts_with("ssh") || placement.starts_with("k8s") {
-        HaltClass::Remote
+    // `Placement::label()` shapes: `local`, `ssh:<host>`, `mosh:<host>`,
+    // `k8s:<pod>`, `<provider>:<id>`; some gates use a bare `provider`/`ssh`/`k8s`.
+    let scheme = placement
+        .split_once(':')
+        .map_or(placement.as_str(), |(scheme, _)| scheme);
+    if matches!(scheme, "ssh" | "mosh" | "k8s") {
+        return HaltClass::Remote;
+    }
+    let provider = scheme == "provider"
+        || (placement.contains(':')
+            && scheme != "local"
+            && scheme.len() > 1
+            && scheme
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_'));
+    if !provider {
+        return HaltClass::LocalRuntime;
+    }
+    let r = reason.to_ascii_lowercase();
+    let has = |keys: &[&str]| keys.iter().any(|k| r.contains(k));
+    if has(&["insufficient_funds", "available: $", "balance"]) {
+        HaltClass::ProviderFunds
+    } else if has(&["token", "401", "403", "unauthorized", "forbidden"]) {
+        HaltClass::ProviderAuth
+    } else if has(&["never been provisioned", "not provisioned", "provisioning"]) {
+        HaltClass::Unprovisioned
     } else {
-        HaltClass::LocalRuntime
+        HaltClass::Remote
     }
 }
 
@@ -330,6 +342,19 @@ mod tests {
             ("k8s", "refused", Remote),
             ("local", "no runtime", LocalRuntime),
             ("env box", "no runtime", LocalRuntime),
+            ("sprites:sb-1", "INSUFFICIENT_FUNDS", ProviderFunds),
+            ("fly:app-1", "HTTP 401", ProviderAuth),
+            ("machine0:m1", "timeout", Remote),
+            (
+                "provider",
+                "the sandbox is not provisioned yet",
+                Unprovisioned,
+            ),
+            ("ssh:box.example", "refused", Remote),
+            ("mosh:box.example", "refused", Remote),
+            ("k8s:ns/pod", "refused", Remote),
+            ("/home/u/wt", "x", LocalRuntime),
+            ("c:\\wt", "x", LocalRuntime),
         ];
         for (placement, reason, want) in cases {
             assert_eq!(
@@ -342,7 +367,7 @@ mod tests {
 
     #[test]
     fn provider_funds_halt_display_has_no_container_runtime() {
-        let text = halt("provider:sprites", "INSUFFICIENT_FUNDS", false).to_string();
+        let text = halt("sprites:sb-1", "INSUFFICIENT_FUNDS", false).to_string();
         assert!(!text.contains("container runtime"), "{text}");
         assert!(text.contains("top up the provider account"));
         assert!(!text.contains("backend = \"none\""));
