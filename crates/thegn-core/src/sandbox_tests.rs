@@ -1835,6 +1835,10 @@ fn user_bus_hardened_systemd_pane_hides_the_user_bus() {
         "InaccessiblePaths=-/run/user/42/bus",
         "InaccessiblePaths=-/run/user/42/systemd/private",
         "InaccessiblePaths=-/run/user/42/thegn",
+        "InaccessiblePaths=-/run/user/42/podman",
+        "InaccessiblePaths=-/run/user/42/docker",
+        "InaccessiblePaths=-/run/user/42/docker.sock",
+        "UnsetEnvironment=THEGN_CONTROL_SOCKET",
     ] {
         assert!(
             argv.windows(2)
@@ -1870,6 +1874,200 @@ fn user_bus_systemd_run_user_fallback_adds_no_bus_paths() {
                 || arg == "InaccessiblePaths=-/run/user/systemd"
         }),
         "fallback runtime is already inaccessible as a whole: {argv:?}"
+    );
+    assert!(
+        !argv.iter().any(|arg| arg.contains("/run/user/podman")),
+        "fallback runtime adds no per-entry container paths: {argv:?}"
+    );
+}
+
+/// A temp runtime dir holding a stand-in bus (plain file), `podman/` and the
+/// thegn control dir, plus a bwrap spec that binds the whole runtime dir.
+fn runtime_escape_fixture() -> (tempfile::TempDir, PathBuf, SandboxSpec) {
+    let temp = tempfile::tempdir_in("/tmp").unwrap();
+    let runtime = temp.path().join("rt");
+    std::fs::create_dir_all(runtime.join("podman")).unwrap();
+    std::fs::create_dir_all(runtime.join("thegn/abc")).unwrap();
+    std::fs::write(runtime.join("bus"), b"").unwrap();
+    let mut sandbox = spec(Backend::Bwrap);
+    sandbox.mounts.push(Mount {
+        host: runtime.display().to_string(),
+        dest: runtime.display().to_string(),
+        ro: false,
+        cache: false,
+    });
+    (temp, runtime, sandbox)
+}
+
+#[test]
+fn runtime_escape_bwrap_masks_bus_podman_and_unsets_the_control_socket() {
+    let (_temp, runtime, mut sandbox) = runtime_escape_fixture();
+    let control_dir = runtime.join("thegn");
+    let socket = control_dir.join("abc/daemon.sock");
+    sandbox
+        .env
+        .push(("THEGN_CONTROL_SOCKET".into(), socket.display().to_string()));
+    let argv = backend_enter_argv_with_env(
+        &sandbox,
+        "true",
+        SandboxArgvEnv {
+            resolver_dir: None,
+            runtime_dir: Some(runtime.clone()),
+            control_dirs: vec![control_dir],
+            protected_dirs: Vec::new(),
+        },
+    )
+    .unwrap();
+    let rt = runtime.display().to_string();
+    let bind = argv
+        .windows(3)
+        .position(|triple| triple == ["--bind", rt.as_str(), rt.as_str()])
+        .expect("runtime dir is bound");
+    let podman = format!("{rt}/podman");
+    let bus = format!("{rt}/bus");
+    let tmpfs = argv
+        .windows(2)
+        .position(|pair| pair == ["--tmpfs", podman.as_str()])
+        .expect("podman dir is masked with a tmpfs");
+    let null = argv
+        .windows(3)
+        .position(|triple| triple == ["--ro-bind", "/dev/null", bus.as_str()])
+        .expect("bus socket is masked with /dev/null");
+    let unset = argv
+        .windows(2)
+        .position(|pair| pair == ["--unsetenv", "THEGN_CONTROL_SOCKET"])
+        .expect("dangling control socket is unset");
+    let command = argv.iter().position(|arg| arg == "--").unwrap();
+    assert!(bind < tmpfs && bind < null && bind < unset, "{argv:?}");
+    assert!(tmpfs < command && null < command && unset < command);
+    assert!(
+        !argv[unset + 2..command].iter().any(|arg| arg == "--setenv"),
+        "unset follows every explicit setenv: {argv:?}"
+    );
+    assert!(
+        !argv.iter().any(|arg| *arg == format!("{rt}/systemd")),
+        "absent entries are not masked: {argv:?}"
+    );
+}
+
+#[test]
+fn runtime_escape_bwrap_unsets_the_control_socket_the_daemon_injects_later() {
+    let (_temp, runtime, sandbox) = runtime_escape_fixture();
+    let argv = backend_enter_argv_with_env(
+        &sandbox,
+        "true",
+        SandboxArgvEnv {
+            resolver_dir: None,
+            runtime_dir: Some(runtime.clone()),
+            control_dirs: vec![runtime.join("thegn")],
+            protected_dirs: Vec::new(),
+        },
+    )
+    .unwrap();
+    assert!(
+        argv.windows(2)
+            .any(|pair| pair == ["--unsetenv", "THEGN_CONTROL_SOCKET"]),
+        "the daemon-injected control socket is unset: {argv:?}"
+    );
+}
+
+#[test]
+fn runtime_escape_bwrap_sees_through_a_non_canonical_mount_source() {
+    let temp = tempfile::tempdir_in("/tmp").unwrap();
+    let runtime = temp.path().join("rt");
+    std::fs::create_dir_all(runtime.join("podman")).unwrap();
+    std::fs::create_dir_all(runtime.join("thegn/abc")).unwrap();
+    std::fs::write(runtime.join("bus"), b"").unwrap();
+    let mut sandbox = spec(Backend::Bwrap);
+    sandbox.mounts.push(Mount {
+        host: format!("{}/podman/..", runtime.display()),
+        dest: runtime.display().to_string(),
+        ro: false,
+        cache: false,
+    });
+    let argv = backend_enter_argv_with_env(
+        &sandbox,
+        "true",
+        SandboxArgvEnv {
+            runtime_dir: Some(runtime.clone()),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    let podman = format!("{}/podman", runtime.display());
+    let bus = format!("{}/bus", runtime.display());
+    assert!(
+        argv.windows(3)
+            .any(|triple| triple == ["--ro-bind", "/dev/null", bus.as_str()]),
+        "bus socket is masked through a `..` source: {argv:?}"
+    );
+    assert!(
+        argv.windows(2)
+            .any(|pair| pair == ["--tmpfs", podman.as_str()]),
+        "podman dir is masked through a `..` source: {argv:?}"
+    );
+}
+
+#[test]
+fn runtime_escape_bwrap_honours_an_explicit_podman_socket_mount() {
+    let (_temp, runtime, mut sandbox) = runtime_escape_fixture();
+    let socket = runtime.join("podman/podman.sock");
+    std::fs::write(&socket, b"").unwrap();
+    sandbox.mounts.push(Mount {
+        host: socket.display().to_string(),
+        dest: socket.display().to_string(),
+        ro: false,
+        cache: false,
+    });
+    let argv = backend_enter_argv_with_env(
+        &sandbox,
+        "true",
+        SandboxArgvEnv {
+            resolver_dir: None,
+            runtime_dir: Some(runtime.clone()),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    let podman = format!("{}/podman", runtime.display());
+    let bus = format!("{}/bus", runtime.display());
+    assert!(
+        !argv
+            .windows(2)
+            .any(|pair| pair == ["--tmpfs", podman.as_str()]),
+        "an explicit socket mount is honoured: {argv:?}"
+    );
+    assert!(
+        argv.windows(3)
+            .any(|triple| triple == ["--ro-bind", "/dev/null", bus.as_str()]),
+        "{argv:?}"
+    );
+}
+
+#[test]
+fn runtime_escape_bwrap_adds_nothing_without_a_runtime_dir_mount() {
+    let (_temp, runtime, _) = runtime_escape_fixture();
+    let sandbox = spec(Backend::Bwrap);
+    let argv = backend_enter_argv_with_env(
+        &sandbox,
+        "true",
+        SandboxArgvEnv {
+            resolver_dir: None,
+            runtime_dir: Some(runtime.clone()),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    let rt = runtime.display().to_string();
+    assert!(
+        !argv.iter().any(|arg| arg.starts_with(&rt)),
+        "no mask without an exposing bind: {argv:?}"
+    );
+    assert!(
+        !argv
+            .windows(2)
+            .any(|pair| pair == ["--unsetenv", "THEGN_CONTROL_SOCKET"]),
+        "{argv:?}"
     );
 }
 
