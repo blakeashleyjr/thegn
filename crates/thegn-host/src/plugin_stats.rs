@@ -16,6 +16,10 @@ pub(crate) struct PluginCounters {
     pub lost: u64,
     pub queue_drops: u64,
     pub coalesced: u64,
+    /// Scheduler ticks skipped because the previous one-shot run was busy.
+    pub sched_skipped: u64,
+    /// Scheduler ticks deferred because the global one-shot cap was full.
+    pub sched_overloaded: u64,
 }
 
 impl From<&PluginCounters> for thegn_core::plugin_status::PluginStatusRow {
@@ -36,8 +40,78 @@ impl From<&PluginCounters> for thegn_core::plugin_status::PluginStatusRow {
                 malformed: row.bridge.malformed,
                 closed_wakeups: row.bridge.closed_wakeups,
             },
+            sched_skipped: row.sched_skipped,
+            sched_overloaded: row.sched_overloaded,
         }
     }
+}
+
+/// Per-plugin cumulative scheduler counts: `(skipped, overloaded)`.
+type SchedMap = BTreeMap<String, (u64, u64)>;
+
+/// Scheduler tick refusals, written by the scheduler thread on a refused tick
+/// only and read at the UI's existing counter flush (no wake of its own).
+static SCHED: LazyLock<Mutex<SchedMap>> = LazyLock::new(|| Mutex::new(BTreeMap::new()));
+
+/// Record a schedule entry's cumulative refused-tick totals. A plugin not yet
+/// tracked is ignored once [`MAX_ROWS`] plugins are; the map never grows past
+/// the published row cap.
+pub(crate) fn record_sched(plugin: &str, skipped: u64, overloaded: u64) {
+    let mut sched = SCHED.lock().unwrap_or_else(|error| error.into_inner());
+    record_sched_into(&mut sched, plugin, skipped, overloaded);
+}
+
+fn record_sched_into(sched: &mut SchedMap, plugin: &str, skipped: u64, overloaded: u64) {
+    if let Some(entry) = sched.get_mut(plugin) {
+        *entry = (skipped, overloaded);
+    } else if sched.len() < MAX_ROWS {
+        sched.insert(plugin.to_owned(), (skipped, overloaded));
+    }
+}
+
+/// Drop scheduler counts for plugins no longer loaded.
+pub(crate) fn retain_sched(keep: impl Fn(&str) -> bool) {
+    SCHED
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .retain(|plugin, _| keep(plugin));
+}
+
+/// Overlay the scheduler's refused-tick counts onto the published rows. A
+/// plugin with nonzero counts gets a row; rows stay sorted by id and capped
+/// at [`MAX_ROWS`].
+pub(crate) fn merge_sched(rows: Vec<PluginCounters>) -> Vec<PluginCounters> {
+    let sched = SCHED.lock().unwrap_or_else(|error| error.into_inner());
+    merge_sched_from(rows, &sched)
+}
+
+fn merge_sched_from(rows: Vec<PluginCounters>, sched: &SchedMap) -> Vec<PluginCounters> {
+    let mut rows: BTreeMap<String, PluginCounters> = rows
+        .into_iter()
+        .map(|row| (row.plugin.clone(), row))
+        .collect();
+    for (plugin, &(skipped, overloaded)) in sched {
+        if skipped > 0 || overloaded > 0 {
+            let row = rows
+                .entry(plugin.clone())
+                .or_insert_with(|| PluginCounters {
+                    plugin: plugin.clone(),
+                    ..Default::default()
+                });
+            row.sched_skipped = skipped;
+            row.sched_overloaded = overloaded;
+        }
+    }
+    rows.into_values().take(MAX_ROWS).collect()
+}
+
+#[cfg(test)]
+pub(crate) fn sched_counts(plugin: &str) -> Option<(u64, u64)> {
+    SCHED
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .get(plugin)
+        .copied()
 }
 
 /// Overlay each live bridge's counters onto the published rows (one bridge
@@ -235,8 +309,9 @@ fn write_status_file(
 #[cfg(test)]
 mod tests {
     use super::{
-        MAX_ROWS, PluginCounters, Totals, merge_bridge, publish, snapshot, spawn_status_writer,
-        write_status_file,
+        MAX_ROWS, PluginCounters, SchedMap, Totals, merge_bridge, merge_sched, merge_sched_from,
+        publish, record_sched, record_sched_into, retain_sched, sched_counts, snapshot,
+        spawn_status_writer, write_status_file,
     };
     use std::collections::BTreeMap;
     use std::sync::Arc;
@@ -409,6 +484,8 @@ mod tests {
                 malformed: 11,
                 closed_wakeups: 12,
             },
+            sched_skipped: 13,
+            sched_overloaded: 14,
         };
         let status = PluginStatusRow::from(&counters);
         assert_eq!(status.plugin, "counter-test");
@@ -418,6 +495,8 @@ mod tests {
         assert_eq!(status.lost, 4);
         assert_eq!(status.queue_drops, 5);
         assert_eq!(status.coalesced, 6);
+        assert_eq!(status.sched_skipped, 13);
+        assert_eq!(status.sched_overloaded, 14);
         assert_eq!(
             status.bridge,
             BridgeCounts {
@@ -528,5 +607,85 @@ mod tests {
         std::fs::write(&state_file, b"not a directory").expect("create file state path");
         let result = write_status_file(&state_file, &[], 1, 2);
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn merge_sched_adds_rows_for_sched_only_plugins_sorted_and_capped() {
+        let rows = vec![PluginCounters {
+            plugin: "m".into(),
+            rejected: 1,
+            ..Default::default()
+        }];
+        let sched: SchedMap = BTreeMap::from([
+            ("a".to_owned(), (0, 0)),
+            ("b".to_owned(), (2, 0)),
+            ("m".to_owned(), (0, 3)),
+            ("z".to_owned(), (0, 1)),
+        ]);
+        let merged = merge_sched_from(rows, &sched);
+        assert_eq!(
+            merged
+                .iter()
+                .map(|row| row.plugin.as_str())
+                .collect::<Vec<_>>(),
+            ["b", "m", "z"]
+        );
+        assert_eq!(
+            (merged[0].sched_skipped, merged[0].sched_overloaded),
+            (2, 0)
+        );
+        assert_eq!(merged[1].rejected, 1);
+        assert_eq!(
+            (merged[1].sched_skipped, merged[1].sched_overloaded),
+            (0, 3)
+        );
+        assert_eq!(
+            (merged[2].sched_skipped, merged[2].sched_overloaded),
+            (0, 1)
+        );
+
+        let many: SchedMap = (0..(MAX_ROWS + 5))
+            .map(|index| (format!("plugin-{index:03}"), (1, 0)))
+            .collect();
+        let merged = merge_sched_from(Vec::new(), &many);
+        assert_eq!(merged.len(), MAX_ROWS);
+        assert_eq!(merged[0].plugin, "plugin-000");
+        assert_eq!(merged[MAX_ROWS - 1].plugin, "plugin-063");
+    }
+
+    #[test]
+    fn record_sched_past_the_key_cap_ignores_new_keys_but_updates_known_ones() {
+        let mut sched = SchedMap::new();
+        for index in 0..MAX_ROWS {
+            record_sched_into(&mut sched, &format!("plugin-{index:03}"), 1, 0);
+        }
+        record_sched_into(&mut sched, "late-plugin", 5, 5);
+        assert_eq!(sched.len(), MAX_ROWS);
+        assert!(!sched.contains_key("late-plugin"));
+        record_sched_into(&mut sched, "plugin-000", 4, 2);
+        assert_eq!(sched.get("plugin-000"), Some(&(4, 2)));
+        assert_eq!(sched.len(), MAX_ROWS);
+    }
+
+    #[test]
+    fn record_sched_publishes_through_merge_and_retain_prunes() {
+        let _guard = super::TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let plugin = format!("sched-global-{}", std::process::id());
+        record_sched(&plugin, 1, 0);
+        record_sched(&plugin, 2, 1);
+        assert_eq!(sched_counts(&plugin), Some((2, 1)));
+        let merged = merge_sched(Vec::new());
+        assert!(merged.iter().any(|row| row.plugin == plugin
+            && row.sched_skipped == 2
+            && row.sched_overloaded == 1));
+        retain_sched(|id| id != plugin);
+        assert_eq!(sched_counts(&plugin), None);
+        assert!(
+            !merge_sched(Vec::new())
+                .iter()
+                .any(|row| row.plugin == plugin)
+        );
     }
 }
