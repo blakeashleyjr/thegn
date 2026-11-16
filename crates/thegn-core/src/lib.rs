@@ -322,6 +322,7 @@ pub mod sandbox_policy_fp;
 pub mod sandbox_prefetch;
 pub mod sandbox_preflight;
 pub mod sandbox_runtime;
+pub mod sandbox_runtime_escape;
 pub mod sandbox_support;
 pub mod sandbox_tmp_hint;
 pub mod sandbox_truth;
