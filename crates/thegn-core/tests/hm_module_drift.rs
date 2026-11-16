@@ -1223,6 +1223,8 @@ fn hm_recording_media_and_monitor_process_keys_are_rendered_and_rest_disposition
         "media.poll_interval_secs",
         "media.players_priority",
         "media.volume_step",
+        "media.mpv.socket",
+        "media.mpd.socket",
         "monitor.proc_rows",
         "monitor.processes",
         "monitor.process_io",
@@ -1231,13 +1233,16 @@ fn hm_recording_media_and_monitor_process_keys_are_rendered_and_rest_disposition
     }
 
     let omissions: BTreeSet<&str> = OMITTED.iter().map(|(path, _)| *path).collect();
-    for table in ["recording", "media", "monitor"] {
+    for table in ["recording", "media", "media.mpv", "media.mpd", "monitor"] {
         let schema = schema_field(table);
         let properties = schema["properties"]
             .as_object()
             .unwrap_or_else(|| panic!("{table} schema properties"));
         for key in properties.keys() {
             let path = format!("{table}.{key}");
+            if matches!(path.as_str(), "media.mpv" | "media.mpd") {
+                continue; // nested tables: checked leaf by leaf via their own entries above
+            }
             assert!(
                 rendered.contains(&path) || omissions.contains(path.as_str()),
                 "{path} must be rendered or dispositioned by an exact ledger row"
