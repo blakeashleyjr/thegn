@@ -272,6 +272,18 @@ fn reap_unambiguous(
             inst.name
         ));
         if let Some(p) = crate::provider_factory::vps_provider_for(pc, &inst.name) {
+            // Fence: a concurrent create (another process) may have rewritten
+            // this record since the snapshot; never act on a stale view.
+            let fresh_unchanged = registry::list_checked()
+                .map(|fresh| ledger_unchanged(state, ledger_state_for(&fresh, &inst.name)))
+                .unwrap_or(false);
+            if !fresh_unchanged {
+                kept.keep(&inst.name, format!(
+                    "vps reaper: kept {}: the ledger record changed during this pass; next pass will retry; no deletion attempted",
+                    inst.name
+                ));
+                continue;
+            }
             if let Err(error) = crate::remote_enqueue_auth::revoke_for_sandbox(pc, &inst.name, None)
             {
                 kept.keep(&inst.name, format!(
@@ -303,7 +315,54 @@ fn reap_unambiguous(
     }
     // Only this successfully reconciled kind can retire absent ledger rows.
     let records = cleanup_candidates(view.records, kind, &ours_account);
+    let records = match registry::list_checked() {
+        Ok(fresh) => fenced_cleanup(records, &fresh),
+        Err(error) => {
+            tracing::debug!(
+                target: "thegn::lifecycle",
+                error = %format!("{error:#}"),
+                "vps reap: ledger unreadable before cleanup; retiring nothing this pass"
+            );
+            Vec::new()
+        }
+    };
     cleanup_ledger(&records, &live_anywhere, kept);
+}
+
+/// True only when the ledger entry is provably the same record (or still
+/// absent) between two reads. `VpsRecord` equality covers every field a
+/// create or finalize rewrites. An unreadable entry on either side is false.
+fn ledger_unchanged(before: LedgerState<'_>, after: LedgerState<'_>) -> bool {
+    match (before, after) {
+        (LedgerState::Absent, LedgerState::Absent) => true,
+        (LedgerState::Recorded(a), LedgerState::Recorded(b)) => a == b,
+        _ => false,
+    }
+}
+
+/// Keep only snapshot records whose fresh ledger state is unchanged; a changed
+/// record is skipped this pass (neither retired nor reported).
+fn fenced_cleanup(
+    snapshot: Vec<registry::VpsRecord>,
+    fresh: &registry::LedgerView,
+) -> Vec<registry::VpsRecord> {
+    snapshot
+        .into_iter()
+        .filter(|record| {
+            let unchanged = ledger_unchanged(
+                LedgerState::Recorded(record),
+                ledger_state_for(fresh, &record.name),
+            );
+            if !unchanged {
+                tracing::debug!(
+                    target: "thegn::lifecycle",
+                    name = %record.name,
+                    "vps reap: ledger record changed during the pass; not retiring"
+                );
+            }
+            unchanged
+        })
+        .collect()
 }
 
 pub(crate) fn record_account_matches(record: &registry::VpsRecord, ours: &str) -> bool {
@@ -655,6 +714,49 @@ mod tests {
             owner: String::new(),
             account: String::new(),
         }
+    }
+
+    #[test]
+    fn ledger_unchanged_matrix() {
+        let a = rec("n", "creating", 1);
+        let mut ready = a.clone();
+        ready.state = "ready".into();
+        let mut id = a.clone();
+        id.instance_id = "other".into();
+        let mut created = a.clone();
+        created.created_at = 2;
+        let mut account = a.clone();
+        account.account = "acct".into();
+        use LedgerState::{Absent, Recorded, Unreadable};
+        assert!(ledger_unchanged(Absent, Absent));
+        assert!(!ledger_unchanged(Absent, Recorded(&a)));
+        assert!(!ledger_unchanged(Recorded(&a), Absent));
+        assert!(ledger_unchanged(Recorded(&a), Recorded(&a.clone())));
+        for changed in [&ready, &id, &created, &account] {
+            assert!(!ledger_unchanged(Recorded(&a), Recorded(changed)));
+        }
+        assert!(!ledger_unchanged(Unreadable, Unreadable));
+        assert!(!ledger_unchanged(Unreadable, Absent));
+        assert!(!ledger_unchanged(Recorded(&a), Unreadable));
+    }
+
+    #[test]
+    fn fenced_cleanup_skips_changed_records_only() {
+        let stale = rec("stale", "ready", 1);
+        let swapped = rec("swapped", "ready", 1);
+        let mut now_new = swapped.clone();
+        now_new.instance_id = "new-id".into();
+        let fresh = registry::LedgerView {
+            records: vec![stale.clone(), now_new],
+            unreadable: vec![],
+        };
+        let kept = fenced_cleanup(vec![stale.clone(), swapped], &fresh);
+        assert_eq!(kept, vec![stale]);
+        let gone = registry::LedgerView {
+            records: vec![],
+            unreadable: vec![],
+        };
+        assert!(fenced_cleanup(vec![rec("x", "ready", 1)], &gone).is_empty());
     }
 
     #[test]

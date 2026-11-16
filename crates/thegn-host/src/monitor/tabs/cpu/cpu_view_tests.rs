@@ -954,7 +954,10 @@ fn frequency_profile_line_appends_hybrid_counts_only_for_mixed_parts() {
         ],
         80,
     );
-    assert!(mixed.contains(" hybrid 2P/1E"), "{mixed:?}");
+    assert!(
+        mixed.contains(" hybrid 2P 2000MHz / 1E 2000MHz"),
+        "{mixed:?}"
+    );
     let unknown = first(&[CoreClass::Unknown, CoreClass::Unknown], 80);
     assert!(!unknown.contains("hybrid"), "{unknown:?}");
     let single = first(&[CoreClass::Performance, CoreClass::Performance], 80);
@@ -967,6 +970,98 @@ fn frequency_hybrid_summary_is_clipped_at_narrow_widths() {
     for cols in 1..12 {
         let lines = freq_lines(&[CoreClass::Performance, CoreClass::Efficiency], cols, 4);
         assert_eq!(lines.len(), 4);
+    }
+}
+
+fn hybrid_part(curs: [Option<u64>; 5]) -> thegn_metrics::collect::model::cpu_freq::CpuFreqPart {
+    let classes = [
+        CoreClass::Performance,
+        CoreClass::Performance,
+        CoreClass::Efficiency,
+        CoreClass::Efficiency,
+        CoreClass::Efficiency,
+    ];
+    thegn_metrics::collect::model::cpu_freq::CpuFreqPart {
+        policies: classes
+            .iter()
+            .zip(curs)
+            .enumerate()
+            .map(|(n, (class, cur_khz))| CpuPolicy {
+                policy: n as u16,
+                cur_khz,
+                core_class: *class,
+                ..CpuPolicy::default()
+            })
+            .collect(),
+        ..Default::default()
+    }
+}
+
+fn paint_part_lines(
+    part: &thegn_metrics::collect::model::cpu_freq::CpuFreqPart,
+    cols: usize,
+) -> Vec<String> {
+    let rows = 14;
+    let mut grid = crate::monitor::kit::grid::CellGrid::new(cols, rows);
+    super::paint::paint_freq(&mut grid, Rect::full(cols, rows), part, Health::Ok);
+    (0..rows)
+        .map(|row| {
+            (0..cols)
+                .map(|col| grid.get(col, row).map_or(' ', |cell| cell.ch))
+                .collect::<String>()
+        })
+        .collect()
+}
+
+#[test]
+fn frequency_hybrid_summary_shows_class_means() {
+    let part = hybrid_part([
+        Some(4_000_000),
+        Some(4_200_000),
+        Some(2_000_000),
+        Some(2_200_000),
+        Some(2_400_000),
+    ]);
+    let line = paint_part_lines(&part, 80).remove(1);
+    assert!(line.contains("hybrid 2P 4100MHz / 3E 2200MHz"), "{line:?}");
+    let plain = paint_part_lines(&hybrid_part([Some(1_000_000); 5]), 80).remove(1);
+    assert!(
+        plain.contains("hybrid 2P 1000MHz / 3E 1000MHz"),
+        "{plain:?}"
+    );
+}
+
+#[test]
+fn frequency_non_hybrid_paints_no_hybrid_summary() {
+    let mut part = hybrid_part([Some(2_000_000); 5]);
+    for policy in &mut part.policies {
+        policy.core_class = CoreClass::Performance;
+    }
+    let line = paint_part_lines(&part, 80).remove(1);
+    assert!(!line.contains("hybrid"), "{line:?}");
+}
+
+#[test]
+fn frequency_hybrid_without_current_values_paints_missing_marks() {
+    let dash = caps::active_glyphs().emdash;
+    let line = paint_part_lines(&hybrid_part([None; 5]), 80).remove(1);
+    assert!(
+        line.contains(&format!("hybrid 2P {dash} / 3E {dash}")),
+        "{line:?}"
+    );
+}
+
+#[test]
+fn frequency_hybrid_summary_never_passes_panel_width() {
+    let part = hybrid_part([Some(4_000_000); 5]);
+    for cols in [20usize, 80] {
+        for line in paint_part_lines(&part, cols) {
+            assert!(line.chars().count() <= cols, "{cols}: {line:?}");
+        }
+        let line = paint_part_lines(&part, cols).remove(1);
+        if cols == 20 {
+            assert!(!line.contains("3E 4000MHz"), "{line:?}");
+        }
     }
 }
 
@@ -998,11 +1093,14 @@ fn itmt_lines(itmt: Option<bool>, cols: usize) -> Vec<String> {
 #[test]
 fn frequency_profile_line_shows_itmt_only_when_enabled() {
     let on = itmt_lines(Some(true), 80).remove(1);
-    assert!(on.contains(" hybrid 1P/1E itmt"), "{on:?}");
+    assert!(
+        on.contains(" hybrid 1P 2000MHz / 1E 2000MHz itmt"),
+        "{on:?}"
+    );
     let off = itmt_lines(Some(false), 80).remove(1);
     let none = itmt_lines(None, 80).remove(1);
     assert!(!off.contains("itmt") && !none.contains("itmt"));
-    assert!(off.contains(" hybrid 1P/1E"), "{off:?}");
+    assert!(off.contains(" hybrid 1P 2000MHz / 1E 2000MHz"), "{off:?}");
     assert_eq!(off, none);
 }
 
@@ -1010,5 +1108,34 @@ fn frequency_profile_line_shows_itmt_only_when_enabled() {
 fn frequency_itmt_suffix_is_clipped_at_narrow_widths() {
     for cols in 1..24 {
         assert_eq!(itmt_lines(Some(true), cols).len(), 6);
+    }
+}
+
+#[test]
+fn usage_panel_io_and_steal_rows_show_label_and_latest_percent() {
+    let frame = fixture_frame();
+    let mut model = CpuModel::default();
+    for _ in 0..8 {
+        model.absorb_frame(&frame);
+    }
+    for cols in [8usize, 20, 80] {
+        let rect = Rect::full(cols, 12);
+        let mut surface = Surface::new(cols + 4, 12);
+        super::paint::paint(&model, &mut surface, USAGE, rect);
+        let text = lines(&surface);
+        // graph rect starts at y + 2 with rows - 5 = 7 rows; io/st are its last two.
+        let (io, st) = (&text[2 + 5], &text[2 + 6]);
+        for row in [io, st] {
+            assert!(
+                row.chars().skip(cols).all(|c| c == ' '),
+                "row wrote past the panel at width {cols}: {row:?}"
+            );
+        }
+        if cols >= 20 {
+            assert!(io.contains("io"), "{io:?}");
+            assert!(st.contains("st"), "{st:?}");
+            assert!(io.contains('7') && io.contains('%'), "{io:?}");
+            assert!(st.contains("3%"), "{st:?}");
+        }
     }
 }

@@ -39,9 +39,10 @@ pub enum Stream {
     HeadOrFail { cap: usize },
     /// Piped and drained to EOF for the whole run; keep only the newest `cap` bytes. Never ends the run.
     Tail { cap: usize },
-    /// Piped and drained to EOF for the whole run; every stdout byte is handed, in order, to the
-    /// consumer passed to [`run_consuming`] on the calling thread. Nothing is retained
-    /// (`Capture::bytes` stays empty, `total` counts every byte). Never ends the run. On stderr it
+    /// Piped and drained to EOF for the whole run; every byte of this stream is handed, in order,
+    /// to the consumer passed to [`run_consuming_streams`] (or, for stdout only,
+    /// [`run_consuming`]) on the calling thread. Nothing is retained (`Capture::bytes` stays
+    /// empty, `total` counts every byte). Never ends the run. Under [`run_consuming`] stderr
     /// drains and drops.
     Consume,
 }
@@ -69,10 +70,16 @@ pub struct Limits {
     pub stderr: Stream,
     /// Cap across both Tail streams (older bytes of the larger tail trimmed first). None = no aggregate cap.
     pub aggregate_tail_cap: Option<usize>,
+    /// After this long with no byte read on any piped stream (Head/HeadOrFail/Tail/Consume),
+    /// terminate the group as for `timeout` (End::TimedOut with `Run::idle_expired`). The clock
+    /// starts at spawn (a child that never writes expires after this span), resets on every chunk
+    /// read, and stops once the leader exits (the quiesce/reader-grace phases keep their own
+    /// bounds). None = no idle bound.
+    pub idle_output: Option<Duration>,
 }
 impl Limits {
     /// No pipes: timeout = `timeout`, quiesce None, term_grace ZERO, kill_settle 250 ms,
-    /// reader_grace ZERO, stdout/stderr Null, aggregate None. Callers adjust with
+    /// reader_grace ZERO, stdout/stderr Null, aggregate None, idle_output None. Callers adjust with
     /// `Limits { field: v, ..Limits::silent(t) }` (never assign fields after construction).
     pub fn silent(timeout: Duration) -> Self {
         Self {
@@ -84,6 +91,7 @@ impl Limits {
             stdout: Stream::Null,
             stderr: Stream::Null,
             aggregate_tail_cap: None,
+            idle_output: None,
         }
     }
 }
@@ -188,6 +196,8 @@ pub struct Run {
     pub stdout: Capture,
     pub stderr: Capture,
     pub containment: Containment,
+    /// True when the run ended because `Limits::idle_output` elapsed; `end` is then End::TimedOut.
+    pub idle_expired: bool,
 }
 impl Run {
     /// End::LeaderExited and Leader::Reaped(s) with s.success().
@@ -288,13 +298,35 @@ pub fn run_consuming(
     cancel: &AtomicBool,
     consume: &mut dyn FnMut(&[u8]),
 ) -> Run {
+    run_consuming_streams(cmd, limits, cancel, &mut |which: Which, bytes: &[u8]| {
+        if which == Which::Stdout {
+            consume(bytes);
+        }
+    })
+}
+
+/// A consumer of [`Stream::Consume`] bytes, told which stream each chunk came from.
+pub type StreamConsumer<'a> = &'a mut dyn FnMut(Which, &[u8]);
+
+/// Like [`run_consuming`], but every [`Stream::Consume`] stream (stdout, stderr or both) hands
+/// its bytes to `consume(which, bytes)` on the calling thread, in order within each stream.
+/// Overrides stdin (always null; use [`run_with_input`] for a payload) and stdout/stderr (per
+/// `limits`); everything else (args, env, cwd) is the caller's. Blocking: call it from a worker
+/// thread, never the UI loop. Wall time <= timeout + term_grace + 2 * kill_settle + reader_grace
+/// + one BACKOFF_CAP.
+pub fn run_consuming_streams(
+    cmd: &mut Command,
+    limits: &Limits,
+    cancel: &AtomicBool,
+    consume: StreamConsumer<'_>,
+) -> Run {
     #[cfg(unix)]
     {
-        unix::run_consuming(cmd, limits, cancel, consume)
+        unix::run_consuming_streams(cmd, limits, cancel, consume)
     }
     #[cfg(not(unix))]
     {
-        fallback::run_consuming(cmd, limits, cancel, consume)
+        fallback::run_consuming_streams(cmd, limits, cancel, consume)
     }
 }
 

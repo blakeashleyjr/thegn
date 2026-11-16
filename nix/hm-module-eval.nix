@@ -164,6 +164,8 @@
           notificationsMergeQueueHoldDesktop = true;
           notificationsDndEnabled = true;
           notificationsSoundMute = true;
+          notificationsSoundMode = "chime";
+          notificationsSoundAlwaysKinds = ["agent_blocked"];
           notificationsSoundSuppressFocused = false;
           notificationsSoundVolume = 0.5;
           activityEnabled = false;
@@ -182,6 +184,7 @@
           recordingDir = "/tmp/thegn-hm/recordings";
           recordingMaxBytes = 1048576;
           mediaEnabled = true;
+          mediaBackend = "mpris";
           mediaDefaultAction = "next";
           mediaShowArt = false;
           mediaOverlayOnBadgeClick = false;

@@ -1184,7 +1184,7 @@ pub const WORKTREE_LIST_Z: [&str; 4] = ["worktree", "list", "--porcelain", "-z"]
 /// This uses `git worktree list --porcelain -z`, which requires Git 2.36 or
 /// later. Older Git versions fail closed for callers of this helper.
 pub fn worktree_branches(root: &Path) -> Option<Vec<(String, Option<String>)>> {
-    let porcelain = git_out_allow_empty(root, &WORKTREE_LIST_Z)?;
+    let porcelain = worktree_list_text(root)?;
     match parse_worktree_branches(&porcelain) {
         Some(branches) => Some(branches),
         None => {
@@ -1196,13 +1196,26 @@ pub fn worktree_branches(root: &Path) -> Option<Vec<(String, Option<String>)>> {
 
 /// Read and strictly parse detailed worktree records from Git.
 pub fn worktree_entries(root: &Path) -> Option<Vec<WorktreeEntry>> {
-    let porcelain = git_out_allow_empty(root, &WORKTREE_LIST_Z)?;
+    let porcelain = worktree_list_text(root)?;
     match parse_worktree_entries(&porcelain) {
         Some(entries) => Some(entries),
         None => {
             tracing::debug!(target: "thegn::git", "malformed git worktree list --porcelain -z output");
             None
         }
+    }
+}
+
+/// Byte-exact worktree listing: no trim, no lossy decode. A non-UTF-8 path
+/// fails closed (`None`) rather than becoming a U+FFFD path naming nothing.
+fn worktree_list_text(root: &Path) -> Option<String> {
+    match git_out_strict(root, &WORKTREE_LIST_Z) {
+        Ok(text) => Some(text),
+        Err(crate::git_run::GitTextError::InvalidUtf8) => {
+            tracing::debug!(target: "thegn::git", "non-UTF-8 git worktree list output");
+            None
+        }
+        Err(crate::git_run::GitTextError::Failed(_)) => None,
     }
 }
 
@@ -1731,6 +1744,43 @@ pub fn note_core_git_spawn() {
 /// exited non-zero, which is a different fact from an empty answer.
 pub fn git_out_allow_empty(dir: &Path, args: &[&str]) -> Option<String> {
     git_out_allow_empty_with_policy(dir, args, &bounded_git_read_policy())
+}
+
+/// Run `git -C <dir> <args...>` and return stdout bytes untouched (no trim, no
+/// decode). Empty stdout is `Ok(vec![])`; any other outcome is `Err`.
+pub fn git_out_raw(dir: &Path, args: &[&str]) -> Result<Vec<u8>, crate::git_run::GitOutcome> {
+    let cancel = AtomicBool::new(false);
+    match crate::git_run::git_run(dir, args, &bounded_git_read_policy(), &cancel) {
+        crate::git_run::GitOutcome::Ok(bytes) => Ok(bytes),
+        crate::git_run::GitOutcome::EmptyOk => Ok(Vec::new()),
+        other => {
+            tracing::debug!(
+                target: "thegn::git",
+                command = args.first().copied().unwrap_or("<missing>"),
+                outcome = git_outcome_class(&other),
+                "bounded git command failed"
+            );
+            Err(other)
+        }
+    }
+}
+
+/// Run `git -C <dir> <args...>` and decode stdout strictly as UTF-8.
+///
+/// For NUL-framed or byte-exact output; callers that want a trimmed single
+/// value trim it themselves.
+pub fn git_out_strict(dir: &Path, args: &[&str]) -> Result<String, crate::git_run::GitTextError> {
+    let cancel = AtomicBool::new(false);
+    let outcome = crate::git_run::git_run(dir, args, &bounded_git_read_policy(), &cancel);
+    if !outcome.is_success() {
+        tracing::debug!(
+            target: "thegn::git",
+            command = args.first().copied().unwrap_or("<missing>"),
+            outcome = git_outcome_class(&outcome),
+            "bounded git command failed"
+        );
+    }
+    outcome.into_text()
 }
 
 fn bounded_git_read_policy() -> crate::git_run::GitPolicy {
@@ -2374,6 +2424,7 @@ mod tests {
             group,
             leader,
             leader_exited_first: true,
+            idle_expired: false,
             stdout: thegn_proc::Capture {
                 bytes: b"abc".to_vec(),
                 total: 3,
@@ -3132,6 +3183,95 @@ mod tests {
         let plain = tempfile::tempdir().unwrap();
         assert_eq!(git_out(plain.path(), &["status", "--porcelain"]), None);
         assert_eq!(git_out_allow_empty(plain.path(), &["status"]), None);
+    }
+
+    #[test]
+    fn git_out_raw_and_strict_are_byte_exact() {
+        use crate::git_run::{GitOutcome, GitTextError};
+        let dir = bounded_git_fixture();
+        assert_eq!(
+            git_out_raw(dir.path(), &["status", "--porcelain"]).unwrap(),
+            Vec::<u8>::new()
+        );
+        let plain = tempfile::tempdir().unwrap();
+        assert!(matches!(
+            git_out_raw(plain.path(), &["status", "--porcelain"]),
+            Err(GitOutcome::Exit { .. })
+        ));
+        assert!(matches!(
+            git_out_strict(plain.path(), &["status", "--porcelain"]),
+            Err(GitTextError::Failed(GitOutcome::Exit { .. }))
+        ));
+        let run = |args: &[&str]| {
+            assert!(
+                git_cmd(dir.path())
+                    .args(["-c", "commit.gpgsign=false", "-c", "user.name=t"])
+                    .args(["-c", "user.email=t@example.invalid"])
+                    .args(args)
+                    .status()
+                    .unwrap()
+                    .success(),
+                "git {args:?}"
+            );
+        };
+        run(&["commit", "-q", "--allow-empty", "-m", "init"]);
+        let head = git_out_strict(dir.path(), &["rev-parse", "HEAD"]).unwrap();
+        assert!(head.ends_with('\n'), "strict output must stay untrimmed");
+        // git re-encodes a non-UTF-8 commit message to UTF-8, so store the byte in a blob
+        // (kept verbatim) and read it back with cat-file.
+        let blob = dir.path().join("blob.bin");
+        std::fs::write(&blob, b"bad \xff byte\n").unwrap();
+        let sha =
+            git_out_strict(dir.path(), &["hash-object", "-w", blob.to_str().unwrap()]).unwrap();
+        let sha = sha.trim();
+        assert!(matches!(
+            git_out_strict(dir.path(), &["cat-file", "blob", sha]),
+            Err(GitTextError::InvalidUtf8)
+        ));
+        assert_eq!(
+            git_out_raw(dir.path(), &["cat-file", "blob", sha]).unwrap(),
+            b"bad \xff byte\n".to_vec()
+        );
+    }
+
+    #[test]
+    fn worktree_entries_keeps_a_trailing_space_in_a_linked_path() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("repo");
+        std::fs::create_dir(&root).unwrap();
+        let linked = temp.path().join("wt trailing ");
+        let run = |args: &[&str]| {
+            git_cmd(&root)
+                .env("GIT_CONFIG_GLOBAL", "/dev/null")
+                .args(["-c", "user.name=t", "-c", "user.email=t@example.invalid"])
+                .args(["-c", "commit.gpgsign=false"])
+                .args(args)
+                .output()
+                .unwrap()
+        };
+        assert!(run(&["init", "-q", "-b", "main"]).status.success());
+        assert!(
+            run(&["commit", "-q", "--allow-empty", "-m", "init"])
+                .status
+                .success()
+        );
+        let linked_arg = linked.to_string_lossy().into_owned();
+        if !run(&["worktree", "add", "-q", "-b", "feat", &linked_arg])
+            .status
+            .success()
+        {
+            return;
+        }
+        let canonical = std::fs::canonicalize(&linked).unwrap();
+        let entries = worktree_entries(&root).unwrap();
+        assert_eq!(entries.len(), 2);
+        assert!(
+            entries
+                .iter()
+                .any(|e| e.path == canonical.to_string_lossy()
+                    && e.branch.as_deref() == Some("feat")),
+            "{entries:?}"
+        );
     }
 
     #[test]

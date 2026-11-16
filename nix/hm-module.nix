@@ -344,6 +344,8 @@ self: {
     notifications.agent_attention_inbox = cfg.notificationsAgentAttentionInbox;
     notifications.merge_queue_hold_desktop = cfg.notificationsMergeQueueHoldDesktop;
     notifications.dnd.enabled = cfg.notificationsDndEnabled;
+    notifications.sound.mode = cfg.notificationsSoundMode;
+    notifications.sound.always_kinds = cfg.notificationsSoundAlwaysKinds;
     notifications.sound.mute = cfg.notificationsSoundMute;
     notifications.sound.suppress_focused = cfg.notificationsSoundSuppressFocused;
     notifications.sound.volume = cfg.notificationsSoundVolume;
@@ -361,6 +363,7 @@ self: {
     recording.dir = cfg.recordingDir;
     recording.max_bytes = cfg.recordingMaxBytes;
     media.enabled = cfg.mediaEnabled;
+    media.backend = cfg.mediaBackend;
     media.default_action = cfg.mediaDefaultAction;
     media.show_art = cfg.mediaShowArt;
     media.overlay_on_badge_click = cfg.mediaOverlayOnBadgeClick;
@@ -1226,6 +1229,18 @@ in {
       description = "Enable do-not-disturb notification handling. Unset (null) = the binary's default.";
     };
 
+    notificationsSoundMode = lib.mkOption {
+      type = lib.types.nullOr (lib.types.enum ["off" "chime" "bell" "command"]);
+      default = null;
+      description = "Notification sound mode. `command` also needs `notifications.sound.command`, which is set in TOML. Unset (null) = the binary's default.";
+    };
+
+    notificationsSoundAlwaysKinds = lib.mkOption {
+      type = lib.types.nullOr (lib.types.listOf lib.types.str);
+      default = null;
+      description = "Notification kinds that always sound. Each entry must be a valid notification kind name; invalid entries are refused at load. Unset (null) = the binary's default.";
+    };
+
     notificationsSoundMute = lib.mkOption {
       type = lib.types.nullOr (lib.types.bool);
       default = null;
@@ -1347,6 +1362,12 @@ in {
       type = lib.types.nullOr (lib.types.bool);
       default = null;
       description = "Enable the media controls. Unset (null) = the binary's default.";
+    };
+
+    mediaBackend = lib.mkOption {
+      type = lib.types.nullOr (lib.types.enum ["auto" "none" "mpris" "mpv" "mpd" "smtc" "applescript"]);
+      default = null;
+      description = "Media backend (auto picks per OS). Unset (null) = the binary's default.";
     };
 
     mediaDefaultAction = lib.mkOption {
