@@ -832,6 +832,10 @@ pub fn list_at(dir: &Path) -> Result<Vec<AuthorizedKeyRecord>> {
 }
 
 #[cfg(test)]
+#[path = "managed_ssh_durability_tests.rs"]
+mod durability_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
