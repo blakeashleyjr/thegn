@@ -361,6 +361,75 @@ fn gh_issue_to_domain_with_host(
 /// `gh issue view --json labels` fetches one page of labels.
 const GH_LABEL_PAGE: usize = 100;
 
+/// Most labels the paginated follow-up keeps; more reads as incomplete.
+const GH_LABEL_FOLLOW_CAP: usize = 1000;
+
+/// gh's own repository placeholder, resolved from the git checkout it runs in.
+const GH_REPO_PLACEHOLDER: &str = "{owner}/{repo}";
+
+/// A full first page may be truncated, so only then is the paginated label
+/// follow-up worth its extra `gh api` call.
+fn labels_need_follow_up(count: usize) -> bool {
+    count >= GH_LABEL_PAGE
+}
+
+/// argv for the paginated label follow-up. A scoped repo is addressed
+/// explicitly (an enterprise `host/owner/repo` scope adds `--hostname`);
+/// without one, gh's `{owner}/{repo}` placeholder resolves against the
+/// anchored worktree `gh` runs in, the same repo `gh issue view` used.
+fn labels_follow_up_args(repo: Option<&str>, number: &str) -> Vec<String> {
+    let mut args = vec!["api".to_owned(), "--paginate".to_owned()];
+    let path_repo = match repo.map(|r| r.split('/').collect::<Vec<_>>()) {
+        Some(parts) => match parts.as_slice() {
+            [host, owner, name] => {
+                args.extend(["--hostname".to_owned(), (*host).to_owned()]);
+                format!("{owner}/{name}")
+            }
+            _ => parts.join("/"),
+        },
+        None => GH_REPO_PLACEHOLDER.to_owned(),
+    };
+    args.push(format!(
+        "repos/{path_repo}/issues/{number}/labels?per_page={GH_LABEL_PAGE}"
+    ));
+    args.extend(["--jq".to_owned(), ".[].name".to_owned()]);
+    args
+}
+
+/// Fold the follow-up's newline-separated names over the first page. Success
+/// replaces the list and reads as complete; more than `cap` names keeps the
+/// first `cap` as incomplete. A failed or empty follow-up keeps the first page
+/// as incomplete: labels are display data, so this never fails the read.
+fn merge_followed_labels(
+    first: Vec<String>,
+    followed: Result<String, IssueError>,
+    cap: usize,
+) -> (Vec<String>, bool) {
+    let text = match followed {
+        Ok(text) => text,
+        Err(error) => {
+            tracing::debug!(%error, "GitHub label follow-up failed; labels incomplete");
+            return (first, false);
+        }
+    };
+    let mut names = text
+        .lines()
+        .map(|line| line.trim_end_matches('\r'))
+        .filter(|line| !line.trim().is_empty())
+        .take(cap.saturating_add(1))
+        .map(str::to_owned)
+        .collect::<Vec<_>>();
+    if names.is_empty() {
+        tracing::debug!("GitHub label follow-up returned no labels; keeping the first page");
+        return (first, false);
+    }
+    if names.len() > cap {
+        names.truncate(cap);
+        return (names, false);
+    }
+    (names, true)
+}
+
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct GhIssueDetail {
@@ -391,8 +460,9 @@ fn parse_issue_detail(json: &str, expected_host: Option<&str>) -> Result<IssueDe
         comments,
         // gh preloads every comment page when the comments field is requested.
         comments_complete: true,
-        // gh fetches one page of 100 labels; a full page may be truncated.
-        labels_complete: label_count < GH_LABEL_PAGE,
+        // gh fetches one page of 100 labels; a full page may be truncated
+        // until `get_issue`'s paginated follow-up reads the rest.
+        labels_complete: !labels_need_follow_up(label_count),
     })
 }
 
@@ -490,7 +560,18 @@ impl IssueBackend for GitHubIssuesBackend {
                 args.extend(["--repo", repo]);
             }
             let json = self.gh(&args).await?;
-            parse_issue_detail(&json, expected_host.as_deref())
+            let mut detail = parse_issue_detail(&json, expected_host.as_deref())?;
+            // `resolve_scope(.., true)` guarantees a repo or an anchored dir,
+            // so an unscoped follow-up resolves `{owner}/{repo}` in that dir.
+            if labels_need_follow_up(detail.issue.labels.len()) {
+                let follow_args = labels_follow_up_args(repo, number);
+                let follow_argv = follow_args.iter().map(String::as_str).collect::<Vec<_>>();
+                let followed = self.gh(&follow_argv).await;
+                let first = std::mem::take(&mut detail.issue.labels);
+                (detail.issue.labels, detail.labels_complete) =
+                    merge_followed_labels(first, followed, GH_LABEL_FOLLOW_CAP);
+            }
+            Ok(detail)
         })
     }
 
@@ -759,6 +840,95 @@ mod tests {
             let d = parse_issue_detail(&text, Some("github.com")).unwrap();
             assert!(!d.labels_complete);
         }
+    }
+
+    #[test]
+    fn labels_need_follow_up_only_at_a_full_page() {
+        assert!(!labels_need_follow_up(0));
+        assert!(!labels_need_follow_up(99));
+        assert!(labels_need_follow_up(100));
+    }
+
+    #[test]
+    fn labels_follow_up_args_address_the_scope() {
+        assert_eq!(
+            labels_follow_up_args(Some("o/r"), "7"),
+            [
+                "api",
+                "--paginate",
+                "repos/o/r/issues/7/labels?per_page=100",
+                "--jq",
+                ".[].name"
+            ]
+        );
+        assert_eq!(
+            labels_follow_up_args(Some("ghe.example.com/o/r"), "7"),
+            [
+                "api",
+                "--paginate",
+                "--hostname",
+                "ghe.example.com",
+                "repos/o/r/issues/7/labels?per_page=100",
+                "--jq",
+                ".[].name"
+            ]
+        );
+        assert_eq!(
+            labels_follow_up_args(None, "7")[2],
+            "repos/{owner}/{repo}/issues/7/labels?per_page=100"
+        );
+    }
+
+    fn first_page() -> Vec<String> {
+        (0..GH_LABEL_PAGE).map(|i| format!("l{i}")).collect()
+    }
+
+    #[test]
+    fn merge_followed_labels_replaces_on_success() {
+        let followed = (0..150).map(|i| format!("l{i}\n")).collect::<String>();
+        let (labels, complete) = merge_followed_labels(first_page(), Ok(followed), 1000);
+        assert!(complete);
+        assert_eq!(labels.len(), 150);
+        assert_eq!(labels[149], "l149");
+    }
+
+    #[test]
+    fn merge_followed_labels_keeps_first_page_on_error() {
+        let (labels, complete) = merge_followed_labels(
+            first_page(),
+            Err(IssueError::Api("gh exited 1: boom".into())),
+            1000,
+        );
+        assert!(!complete);
+        assert_eq!(labels, first_page());
+
+        let (labels, complete) = merge_followed_labels(first_page(), Ok("\n".into()), 1000);
+        assert!(!complete);
+        assert_eq!(labels, first_page());
+    }
+
+    #[test]
+    fn merge_followed_labels_caps_at_1000() {
+        let exactly = (0..1000).map(|i| format!("l{i}\n")).collect::<String>();
+        let (labels, complete) = merge_followed_labels(first_page(), Ok(exactly), 1000);
+        assert!(complete);
+        assert_eq!(labels.len(), 1000);
+
+        let over = (0..1001).map(|i| format!("l{i}\n")).collect::<String>();
+        let (labels, complete) = merge_followed_labels(first_page(), Ok(over), 1000);
+        assert!(!complete);
+        assert_eq!(labels.len(), 1000);
+        assert_eq!(labels[999], "l999");
+    }
+
+    #[test]
+    fn merge_followed_labels_parses_a_blank_trailing_line() {
+        // gh --jq output: one name per line, ending in a newline and here a
+        // blank line too; CRLF endings and names with spaces survive intact.
+        let followed = "bug\ngood first issue\r\nui\n\n";
+        let (labels, complete) = merge_followed_labels(first_page(), Ok(followed.into()), 1000);
+        assert!(complete);
+        assert_eq!(labels, ["bug", "good first issue", "ui"]);
     }
 
     #[test]
