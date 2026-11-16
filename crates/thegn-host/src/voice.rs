@@ -688,67 +688,6 @@ fn capture_outcome(
     }
 }
 
-#[expect(
-    clippy::disallowed_methods,
-    reason = "the off-loop capture worker must reap its child after termination"
-)]
-fn terminate_capture_child(
-    mut child: std::process::Child,
-    group: crate::platform::GroupHandle,
-    on_reaped: &Arc<dyn Fn() + Send + Sync>,
-) -> bool {
-    group.kill();
-    if let Err(kill_error) = child.kill() {
-        match child.try_wait() {
-            Ok(Some(_)) => {}
-            Ok(None) => tracing::warn!(%kill_error, "voice capture child kill failed"),
-            Err(wait_error) => {
-                tracing::warn!(%kill_error, %wait_error, "voice capture child kill and wait failed")
-            }
-        }
-    }
-    let until = std::time::Instant::now() + Duration::from_millis(60);
-    loop {
-        match child.try_wait() {
-            Ok(Some(_)) if group.is_empty() => {
-                on_reaped();
-                return true;
-            }
-            Ok(Some(_)) if std::time::Instant::now() < until => {
-                group.kill();
-                thread::sleep(Duration::from_millis(2));
-            }
-            Ok(None) if std::time::Instant::now() < until => {
-                thread::sleep(Duration::from_millis(2))
-            }
-            Ok(Some(_)) | Ok(None) | Err(_) => break,
-        }
-    }
-    let reaped = Arc::clone(on_reaped);
-    let reaped_group = group.clone();
-    match thegn_core::thread_name::try_spawn_named("thegn-voice-rp", move || {
-        crate::platform::qos::set_self(crate::platform::qos::Qos::Background);
-        if let Err(error) = child.wait() {
-            tracing::warn!(%error, "voice capture reaper failed");
-        } else {
-            while !reaped_group.is_empty() {
-                reaped_group.kill();
-                thread::sleep(Duration::from_millis(2));
-            }
-            reaped();
-        }
-    }) {
-        Ok(_) => false,
-        Err(error) => {
-            // The thread could not accept reaper ownership; returning false
-            // becomes CaptureUnresolved, and dropping Child here is the
-            // explicitly degraded last resort rather than an unbounded wait.
-            tracing::error!(%error, "voice capture child could not be handed to reaper");
-            false
-        }
-    }
-}
-
 fn join_voice_workers(workers: Vec<thread::JoinHandle<()>>) -> bool {
     let until = std::time::Instant::now() + Duration::from_millis(60);
     while std::time::Instant::now() < until && !workers.iter().all(thread::JoinHandle::is_finished)
@@ -904,7 +843,6 @@ fn native_session(
     waker: &TerminalWaker,
 ) -> Result<(), String> {
     use crate::voice_worker::{Event, Request};
-    use std::io::BufReader;
     if !cfg!(feature = "voice-native") {
         return Err("native capture is not compiled; use a voice-native/voice-metal build or configure capture_command".into());
     }
@@ -927,122 +865,71 @@ fn native_session(
         executable.to_string_lossy().into_owned(),
         "--voice-worker".into(),
     ]);
+    let mut request = serde_json::to_vec(&Request {
+        cfg: cfg.clone(),
+        token,
+    })
+    .map_err(|_| "voice worker request failed")?;
+    request.push(b'\n');
     let mut command = Command::new(argv[0].as_str());
-    command
-        .args(&argv[1..])
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null());
-    let (mut child, group) =
-        crate::platform::spawn_grouped_best_effort(&mut command).map_err(|e| e.to_string())?;
-    let tx_reaped = tx.clone();
-    let wk_reaped = waker.clone();
-    let on_reaped: Arc<dyn Fn() + Send + Sync> = Arc::new(move || {
-        send_capture(
-            &tx_reaped,
-            &wk_reaped,
-            VoiceMessage::CaptureReaped { generation },
-        )
-    });
-    let mut output_reader = None;
-    let outcome = (|| {
-        let mut input = child.stdin.take().ok_or("voice worker input unavailable")?;
-        serde_json::to_writer(
-            &mut input,
-            &Request {
-                cfg: cfg.clone(),
-                token,
-            },
-        )
-        .map_err(|_| "voice worker request failed")?;
-        input
-            .write_all(b"\n")
-            .map_err(|_| "voice worker request interrupted")?;
-        let stdout = child
-            .stdout
-            .take()
-            .ok_or("voice worker output unavailable")?;
-        let (event_tx, event_rx) = mpsc::sync_channel(2);
-        output_reader = Some(
-            thegn_core::thread_name::try_spawn_named("thegn-voice-out", move || {
-                crate::platform::qos::set_self(crate::platform::qos::Qos::Utility);
-                let mut output = BufReader::new(stdout);
-                loop {
-                    let event = match read_worker_event(&mut output) {
-                        Ok(Some(event)) => Ok(event),
-                        Ok(None) => break,
-                        Err(error) => Err(error),
-                    };
-                    let failed = event.is_err();
-                    if event_tx.send(event).is_err() || failed {
-                        break;
+    command.args(&argv[1..]);
+    let worker = run_worker(
+        &mut command,
+        request,
+        stop_rx,
+        &cancel,
+        WorkerTimeouts {
+            run: cfg.max_duration() + cfg.request_timeout() + Duration::from_secs(10),
+            after_stop: cfg.request_timeout() + Duration::from_secs(1),
+        },
+    )?;
+    let mut result = worker.result;
+    for event in worker.events {
+        match event {
+            Event::Failed(_) => {}
+            Event::Captured(encoded) => {
+                use base64::Engine;
+                if cfg.kind != thegn_core::config::VoiceKind::Command {
+                    result = Err("unexpected capture from transcription worker".into());
+                } else {
+                    match base64::engine::general_purpose::STANDARD.decode(encoded) {
+                        Ok(wav) if wav.len() <= MAX_CAPTURE_BYTES => send_capture(
+                            tx,
+                            waker,
+                            VoiceMessage::CaptureComplete {
+                                pane_id,
+                                generation,
+                                wav,
+                            },
+                        ),
+                        _ => result = Err("invalid native capture payload".into()),
                     }
                 }
-            })
-            .map_err(|e| e.to_string())?,
-        );
-        let deadline = std::time::Instant::now()
-            + cfg.max_duration()
-            + cfg.request_timeout()
-            + Duration::from_secs(10);
-        let monitored = monitor_worker_events(
-            event_rx,
-            stop_rx,
-            &cancel,
-            &mut input,
-            deadline,
-            cfg.request_timeout() + Duration::from_secs(1),
-        );
-        let mut result = monitored.result;
-        for event in monitored.events {
-            match event {
-                Event::Failed(_) => {}
-                Event::Captured(encoded) => {
-                    use base64::Engine;
-                    if cfg.kind != thegn_core::config::VoiceKind::Command {
-                        result = Err("unexpected capture from transcription worker".into());
-                    } else {
-                        match base64::engine::general_purpose::STANDARD.decode(encoded) {
-                            Ok(wav) if wav.len() <= MAX_CAPTURE_BYTES => send_capture(
-                                tx,
-                                waker,
-                                VoiceMessage::CaptureComplete {
-                                    pane_id,
-                                    generation,
-                                    wav,
-                                },
-                            ),
-                            _ => result = Err("invalid native capture payload".into()),
-                        }
-                    }
-                }
-                Event::Timing {
-                    final_pass,
-                    decode_ms,
-                    audio_end_ms,
-                } => {
-                    tracing::info!(target: "thegn::voice", request_id, final_pass, decode_ms, audio_end_ms, "dictation timing");
-                }
-                event => send_capture(
-                    tx,
-                    waker,
-                    VoiceMessage::Session {
-                        pane_id,
-                        generation,
-                        request_id,
-                        event,
-                    },
-                ),
             }
+            Event::Timing {
+                final_pass,
+                decode_ms,
+                audio_end_ms,
+            } => {
+                tracing::info!(target: "thegn::voice", request_id, final_pass, decode_ms, audio_end_ms, "dictation timing");
+            }
+            event => send_capture(
+                tx,
+                waker,
+                VoiceMessage::Session {
+                    pane_id,
+                    generation,
+                    request_id,
+                    event,
+                },
+            ),
         }
-        drop(input);
-        result
-    })();
-    let reaped = terminate_capture_child(child, group, &on_reaped);
-    // Killing the worker closes stdout. Settle its reader with the same bounded
-    // join used by legacy capture, entirely away from the UI thread.
-    let readers_stopped = output_reader.is_none_or(|reader| join_voice_workers(vec![reader]));
-    if !reaped || !readers_stopped {
+    }
+    // `on_reaped`: the runner has returned, so the worker's fate is settled.
+    if worker.reaped {
+        send_capture(tx, waker, VoiceMessage::CaptureReaped { generation });
+    }
+    if worker.unresolved {
         send_capture(
             tx,
             waker,
@@ -1053,67 +940,221 @@ fn native_session(
             },
         );
     }
-    outcome
+    result
 }
 
-struct WorkerMonitorResult {
+/// Bounds of one voice worker run.
+struct WorkerTimeouts {
+    /// Whole-run deadline from spawn (`thegn_proc` group timeout).
+    run: Duration,
+    /// How long the worker may take to finish once `stop` was written.
+    after_stop: Duration,
+}
+
+/// What one supervised voice worker run produced.
+struct WorkerRun {
     result: Result<(), String>,
+    /// Every event read before the run was decided, in order.
+    events: Vec<crate::voice_worker::Event>,
+    /// The leader was reaped and the group was not left with survivors.
+    reaped: bool,
+    /// Shutdown could not be proven (survivors, or the leader wait failed).
+    unresolved: bool,
+}
+
+/// The first decision about a worker run wins: a terminal event, a protocol
+/// error, a cancel/stop outcome from the input thread, or a timeout.
+type WorkerVerdict = std::sync::OnceLock<Result<(), String>>;
+
+/// Record `result` (unless a verdict already exists) and end the run: the
+/// runner observes `cancel` and terminates the worker's process group.
+fn settle_worker(verdict: &WorkerVerdict, cancel: &AtomicBool, result: Result<(), String>) {
+    let _ = verdict.set(result); // first verdict wins; later ones are moot
+    cancel.store(true, Ordering::Release);
+}
+
+/// How often the input thread looks at the stop channel, the cancel flag and
+/// the end of the run before `stop` is sent (only while a capture runs).
+const WORKER_INPUT_POLL: Duration = Duration::from_millis(10);
+
+/// The worker's stdin side: writes the request line, forwards a `stop`, and
+/// enforces the post-stop deadline. Owns the pipe on `thegn-voice-in`.
+struct WorkerInput {
+    request: Vec<u8>,
+    stop_rx: Receiver<CaptureCommand>,
+    /// Disconnects once the runner has returned.
+    done_rx: Receiver<()>,
+    cancel: Arc<AtomicBool>,
+    verdict: Arc<WorkerVerdict>,
+    after_stop: Duration,
+}
+
+impl WorkerInput {
+    fn run(self, mut input: impl Write) {
+        if input.write_all(&self.request).is_err() {
+            settle_worker(
+                &self.verdict,
+                &self.cancel,
+                Err("voice worker request interrupted".into()),
+            );
+            return;
+        }
+        loop {
+            if self.cancel.load(Ordering::Acquire)
+                || !matches!(self.done_rx.try_recv(), Err(TryRecvError::Empty))
+            {
+                return;
+            }
+            match self.stop_rx.recv_timeout(WORKER_INPUT_POLL) {
+                Ok(CaptureCommand::Cancel) | Err(mpsc::RecvTimeoutError::Disconnected) => {
+                    settle_worker(&self.verdict, &self.cancel, Ok(()));
+                    return;
+                }
+                Ok(CaptureCommand::Stop) => break,
+                Err(mpsc::RecvTimeoutError::Timeout) => {}
+            }
+        }
+        if input.write_all(b"stop\n").is_err() {
+            settle_worker(
+                &self.verdict,
+                &self.cancel,
+                Err("voice worker stop failed".into()),
+            );
+            return;
+        }
+        if let Err(mpsc::RecvTimeoutError::Timeout) = self.done_rx.recv_timeout(self.after_stop) {
+            settle_worker(
+                &self.verdict,
+                &self.cancel,
+                Err("voice worker timed out".into()),
+            );
+        }
+    }
+}
+
+/// Run the voice worker `command` under `thegn_proc`: its own process group
+/// (fail closed: no group, no run), the request line and stop commands on a
+/// `thegn-voice-in` thread, stdout framed into events on this thread, and the
+/// group terminated and reaped once a terminal event, cancel or timeout
+/// decides the run. `Err` only when the worker could not be started.
+fn run_worker(
+    command: &mut Command,
+    request: Vec<u8>,
+    stop_rx: Receiver<CaptureCommand>,
+    cancel: &Arc<AtomicBool>,
+    timeouts: WorkerTimeouts,
+) -> Result<WorkerRun, String> {
+    let verdict = Arc::new(WorkerVerdict::new());
+    let (done_tx, done_rx) = mpsc::channel::<()>();
+    let mut input = Some(WorkerInput {
+        request,
+        stop_rx,
+        done_rx,
+        cancel: Arc::clone(cancel),
+        verdict: Arc::clone(&verdict),
+        after_stop: timeouts.after_stop,
+    });
+    let mut input_thread = None;
+    let mut events = WorkerEvents::default();
+    let run = thegn_proc::run_consuming_streams_with_stdin(
+        command,
+        &Limits {
+            stdout: Stream::Consume,
+            stderr: Stream::Null,
+            kill_settle: Duration::from_millis(200),
+            reader_grace: Duration::from_millis(100),
+            quiesce_after_leader: Some(Duration::ZERO),
+            ..Limits::silent(timeouts.run)
+        },
+        cancel,
+        &mut |stdin: std::process::ChildStdin| {
+            let Some(input) = input.take() else {
+                return;
+            };
+            match thegn_core::thread_name::try_spawn_named("thegn-voice-in", move || {
+                crate::platform::qos::set_self(crate::platform::qos::Qos::Utility);
+                input.run(stdin);
+            }) {
+                Ok(handle) => input_thread = Some(handle),
+                Err(error) => settle_worker(&verdict, cancel, Err(error.to_string())),
+            }
+        },
+        &mut |which: thegn_proc::Which, bytes: &[u8]| {
+            if which != thegn_proc::Which::Stdout
+                || verdict.get().is_some()
+                || cancel.load(Ordering::Acquire)
+            {
+                return;
+            }
+            if let Some(decided) = events.feed(bytes) {
+                settle_worker(&verdict, cancel, decided);
+            }
+        },
+    );
+    drop(done_tx);
+    if let Some(handle) = input_thread
+        && !join_voice_workers(vec![handle])
+    {
+        tracing::warn!("voice worker input thread did not settle");
+    }
+    let result = match (verdict.get(), &run.end) {
+        (_, End::Spawn(error)) => return Err(error.to_string()),
+        (Some(decided), _) => decided.clone(),
+        (None, End::Supervise(error)) => Err(format!("wait for voice worker: {error}")),
+        (None, _) if cancel.load(Ordering::Acquire) => Ok(()),
+        (None, End::LeaderExited | End::Cancelled) => events.eof(),
+        (None, End::TimedOut) => Err("voice worker timed out".into()),
+        (None, End::OutputLimit(_)) => Err("voice worker message exceeds protocol limit".into()),
+    };
+    let unresolved = run.group == GroupState::Survivors || matches!(run.end, End::Supervise(_));
+    Ok(WorkerRun {
+        result,
+        events: events.events,
+        reaped: matches!(run.leader, Leader::Reaped(_)) && run.group != GroupState::Survivors,
+        unresolved,
+    })
+}
+
+/// Frames the worker's stdout into protocol events and decides the run on
+/// the first terminal event (`Final`, `Captured`, `Failed`) or protocol error.
+#[derive(Default)]
+struct WorkerEvents {
+    /// Bytes of the line still being read.
+    pending: Vec<u8>,
     events: Vec<crate::voice_worker::Event>,
 }
 
-fn monitor_worker_events(
-    event_rx: Receiver<Result<crate::voice_worker::Event, String>>,
-    stop_rx: Receiver<CaptureCommand>,
-    cancel: &AtomicBool,
-    input: &mut impl std::io::Write,
-    mut deadline: std::time::Instant,
-    stop_timeout: Duration,
-) -> WorkerMonitorResult {
-    use crate::voice_worker::Event;
+impl WorkerEvents {
+    fn feed(&mut self, bytes: &[u8]) -> Option<Result<(), String>> {
+        use crate::voice_worker::Event;
+        let mut from = self.pending.len();
+        self.pending.extend_from_slice(bytes);
+        while let Some(offset) = self.pending[from..].iter().position(|byte| *byte == b'\n') {
+            let line: Vec<u8> = self.pending.drain(..=from + offset).collect();
+            from = 0;
+            let event = match read_worker_event(&mut line.as_slice()) {
+                Ok(Some(event)) => event,
+                Ok(None) => continue,
+                Err(error) => return Some(Err(error)),
+            };
+            let decided = terminal_worker_event(&event)
+                .or_else(|| matches!(event, Event::Captured(_)).then_some(Ok(())));
+            self.events.push(event);
+            if decided.is_some() {
+                return decided;
+            }
+        }
+        if self.pending.len() as u64 > crate::voice_worker::MAX_EVENT {
+            return Some(Err("voice worker message exceeds protocol limit".into()));
+        }
+        None
+    }
 
-    let mut stop_sent = false;
-    let mut events = Vec::new();
-    let result = loop {
-        if cancel.load(Ordering::Acquire) {
-            break Ok(());
-        }
-        match stop_rx.try_recv() {
-            Ok(CaptureCommand::Cancel) => break Ok(()),
-            Err(TryRecvError::Disconnected) if !stop_sent => break Ok(()),
-            Ok(CaptureCommand::Stop) if !stop_sent => {
-                if input.write_all(b"stop\n").is_err() {
-                    break Err("voice worker stop failed".into());
-                }
-                stop_sent = true;
-                deadline = std::time::Instant::now() + stop_timeout;
-            }
-            _ => {}
-        }
-        if std::time::Instant::now() >= deadline {
-            break Err("voice worker timed out".into());
-        }
-        match event_rx.recv_timeout(Duration::from_millis(10)) {
-            Ok(Ok(event)) => {
-                let terminal = matches!(
-                    &event,
-                    Event::Final(_) | Event::Failed(_) | Event::Captured(_)
-                );
-                events.push(event);
-                if let Some(Err(reason)) =
-                    terminal_worker_event(events.last().expect("just pushed event"))
-                {
-                    break Err(reason);
-                }
-                if terminal {
-                    break Ok(());
-                }
-            }
-            Ok(Err(reason)) => break Err(reason),
-            Err(mpsc::RecvTimeoutError::Disconnected) => break Err(worker_eof_before_final()),
-            Err(mpsc::RecvTimeoutError::Timeout) => {}
-        }
-    };
-    WorkerMonitorResult { result, events }
+    /// The worker's stdout ended without a terminal event. A trailing line
+    /// without its newline reports the framing error instead.
+    fn eof(&self) -> Result<(), String> {
+        read_worker_event(&mut self.pending.as_slice()).and(Err(worker_eof_before_final()))
+    }
 }
 
 #[cfg(test)]
@@ -1154,48 +1195,205 @@ mod tests {
     }
 
     #[test]
-    fn worker_monitor_maps_failed_eof_protocol_errors_and_final_events() {
+    fn worker_events_frame_split_lines_and_decide_on_terminal_events() {
         use crate::voice_worker::Event;
 
-        let run = |messages: Vec<Result<Event, String>>, close: bool| {
-            let (event_tx, event_rx) = mpsc::channel();
-            let (stop_tx, stop_rx) = mpsc::channel();
-            for message in messages {
-                event_tx.send(message).unwrap();
-            }
-            if close {
-                drop(event_tx);
-            }
-            let mut input = Vec::new();
-            let result = monitor_worker_events(
-                event_rx,
-                stop_rx,
-                &AtomicBool::new(false),
-                &mut input,
-                std::time::Instant::now() + Duration::from_secs(30),
-                Duration::from_secs(30),
-            );
-            drop(stop_tx);
-            result
-        };
+        let mut failed = WorkerEvents::default();
+        assert_eq!(
+            failed.feed(b"{\"Failed\":\"model unavailable\"}\n"),
+            Some(Err("model unavailable".into()))
+        );
 
-        let failed = run(vec![Ok(Event::Failed("model unavailable".into()))], false);
-        assert_eq!(failed.result.unwrap_err(), "model unavailable");
-
-        let eof = run(Vec::new(), true);
+        let eof = WorkerEvents::default();
         assert!(
-            eof.result
+            eof.eof()
                 .unwrap_err()
                 .contains("without a final transcript")
         );
 
-        let protocol_error = run(vec![Err("protocol limit".into())], false);
-        assert_eq!(protocol_error.result.unwrap_err(), "protocol limit");
+        let mut interrupted = WorkerEvents::default();
+        assert_eq!(interrupted.feed(b"{\"Partial\":"), None);
+        assert!(interrupted.eof().unwrap_err().contains("interrupted"));
 
-        let final_event = run(vec![Ok(Event::Final("recognized".into()))], false);
-        assert!(final_event.result.is_ok());
+        let mut oversized = WorkerEvents::default();
+        let chunk = vec![b'x'; 1024 * 1024];
+        let mut decided = None;
+        for _ in 0..=crate::voice_worker::MAX_EVENT / chunk.len() as u64 {
+            decided = oversized.feed(&chunk);
+            if decided.is_some() {
+                break;
+            }
+        }
+        assert!(decided.unwrap().unwrap_err().contains("protocol limit"));
+
+        let mut garbage = WorkerEvents::default();
+        assert_eq!(
+            garbage.feed(b"not json\n"),
+            Some(Err("invalid voice worker event".into()))
+        );
+
+        // A Partial then a Final split across chunks: in order, decided Ok.
+        let mut split = WorkerEvents::default();
+        assert_eq!(split.feed(b"{\"Partial\":\"he"), None);
+        assert_eq!(split.feed(b"l\"}\n{\"Fin"), None);
+        assert_eq!(
+            split.feed(b"al\":\"hello\"}\n{\"Partial\":\"x\"}\n"),
+            Some(Ok(()))
+        );
+        assert!(matches!(
+            split.events.as_slice(),
+            [Event::Partial(partial), Event::Final(text)] if partial == "hel" && text == "hello"
+        ));
+
+        let mut captured = WorkerEvents::default();
+        assert_eq!(
+            captured.feed(b"{\"Captured\":\"UklGRg==\"}\n"),
+            Some(Ok(()))
+        );
+    }
+
+    fn fake_worker(script: &str, arg: &std::path::Path) -> Command {
+        let mut command = Command::new("sh");
+        command.args(["-c", script, "sh"]).arg(arg);
+        command
+    }
+
+    #[test]
+    fn voice_worker_run_delivers_request_and_events_in_order_and_reaps() {
+        use crate::voice_worker::Event;
+        if !UNIX {
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let seen = dir.path().join("request");
+        let mut command = fake_worker(
+            r#"IFS= read -r req; printf '%s\n' "$req" >"$1"; printf '%s\n' '{"Partial":"hel"}' '{"Final":"hello"}'"#,
+            &seen,
+        );
+        let (stop_tx, stop_rx) = mpsc::channel();
+        let run = run_worker(
+            &mut command,
+            b"{\"probe\":1}\n".to_vec(),
+            stop_rx,
+            &Arc::new(AtomicBool::new(false)),
+            WorkerTimeouts {
+                run: Duration::from_secs(10),
+                after_stop: Duration::from_secs(10),
+            },
+        )
+        .unwrap();
+        drop(stop_tx);
+        assert_eq!(run.result, Ok(()));
+        assert!(matches!(
+            run.events.as_slice(),
+            [Event::Partial(partial), Event::Final(text)] if partial == "hel" && text == "hello"
+        ));
+        assert!(run.reaped, "the worker leader is reaped");
+        assert!(!run.unresolved);
+        assert_eq!(std::fs::read(&seen).unwrap(), b"{\"probe\":1}\n");
+    }
+
+    #[test]
+    fn voice_worker_stop_is_written_to_its_stdin() {
+        use crate::voice_worker::Event;
+        if !UNIX {
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let mut command = fake_worker(
+            r#"IFS= read -r req; IFS= read -r cmd; [ "$cmd" = stop ] && printf '%s\n' '{"Final":"stopped"}'; exec sleep 30"#,
+            dir.path(),
+        );
+        let (stop_tx, stop_rx) = mpsc::channel();
+        stop_tx.send(CaptureCommand::Stop).unwrap();
+        let started = std::time::Instant::now();
+        let run = run_worker(
+            &mut command,
+            b"{}\n".to_vec(),
+            stop_rx,
+            &Arc::new(AtomicBool::new(false)),
+            WorkerTimeouts {
+                run: Duration::from_secs(20),
+                after_stop: Duration::from_secs(10),
+            },
+        )
+        .unwrap();
+        drop(stop_tx);
+        assert_eq!(run.result, Ok(()));
+        assert!(matches!(run.events.as_slice(), [Event::Final(text)] if text == "stopped"));
+        assert!(run.reaped);
         assert!(
-            matches!(final_event.events.as_slice(), [Event::Final(text)] if text == "recognized")
+            started.elapsed() < Duration::from_secs(5),
+            "a terminal event ends the run without waiting for the worker"
+        );
+    }
+
+    #[test]
+    fn hanging_voice_worker_is_killed_at_the_deadline() {
+        if !UNIX {
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let mut command = fake_worker(r#"IFS= read -r req; exec sleep 30"#, dir.path());
+        let (stop_tx, stop_rx) = mpsc::channel();
+        let started = std::time::Instant::now();
+        let run = run_worker(
+            &mut command,
+            b"{}\n".to_vec(),
+            stop_rx,
+            &Arc::new(AtomicBool::new(false)),
+            WorkerTimeouts {
+                run: Duration::from_millis(300),
+                after_stop: Duration::from_secs(10),
+            },
+        )
+        .unwrap();
+        drop(stop_tx);
+        assert_eq!(run.result, Err("voice worker timed out".into()));
+        assert!(run.events.is_empty());
+        assert!(run.reaped, "the killed worker is reaped");
+        assert!(!run.unresolved);
+        assert!(started.elapsed() < Duration::from_secs(5));
+    }
+
+    #[test]
+    fn voice_worker_cancel_and_spawn_failure_end_the_run() {
+        if !UNIX {
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let mut command = fake_worker(r#"IFS= read -r req; exec sleep 30"#, dir.path());
+        let (stop_tx, stop_rx) = mpsc::channel();
+        stop_tx.send(CaptureCommand::Cancel).unwrap();
+        let run = run_worker(
+            &mut command,
+            b"{}\n".to_vec(),
+            stop_rx,
+            &Arc::new(AtomicBool::new(false)),
+            WorkerTimeouts {
+                run: Duration::from_secs(20),
+                after_stop: Duration::from_secs(10),
+            },
+        )
+        .unwrap();
+        drop(stop_tx);
+        assert_eq!(run.result, Ok(()), "a cancel is not a failure");
+        assert!(run.reaped);
+
+        let mut missing = Command::new(dir.path().join("no-such-voice-worker"));
+        let (_stop_tx, stop_rx) = mpsc::channel();
+        assert!(
+            run_worker(
+                &mut missing,
+                b"{}\n".to_vec(),
+                stop_rx,
+                &Arc::new(AtomicBool::new(false)),
+                WorkerTimeouts {
+                    run: Duration::from_secs(1),
+                    after_stop: Duration::from_secs(1),
+                },
+            )
+            .is_err()
         );
     }
 
