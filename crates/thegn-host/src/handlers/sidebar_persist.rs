@@ -15,6 +15,7 @@
 //! | `sidebar_mode`       | `SidebarMode::as_key()` | ToggleSidebar cycle            |
 //! | `sidebar_flat`       | `"1"` (absent=grouped) | toggle_flat (`g`)               |
 //! | `sidebar_focus_detail` | `FocusDetail::as_str()` (absent=`[ui]` config) | cycle_focus_detail (`i`) |
+//! | `other_open:<slug>`  | `"1"` open / `"0"` collapsed (absent=`[ui] sidebar_other_group_collapsed`) | toggle_collapse on the "Other" group |
 //!
 //! `<key>` is the row's stable identity: a workspace slug, `{slug}/{branch}`
 //! for worktrees, `{slug}/folder:{id}` for folders, `terminals/host:{key}` for
@@ -171,8 +172,32 @@ impl SidebarState {
                     thegn_core::config::FocusDetail::from_str_validated(&value).ok();
             } else if key == "sidebar_mode" {
                 self.mode = crate::layout::SidebarMode::from_key(&value);
+            } else if let Some(slug) = key.strip_prefix("other_open:") {
+                // Both values are real overrides of the config default, so
+                // neither is a tombstone; anything else is junk and is swept.
+                match value.as_str() {
+                    "1" => {
+                        self.view.other_open.insert(slug.to_string(), true);
+                    }
+                    "0" => {
+                        self.view.other_open.insert(slug.to_string(), false);
+                    }
+                    _ => {
+                        // best-effort: lazy sweep of an unreadable row
+                        let _ = db.del_ui_state(scope, &key);
+                    }
+                }
             }
         }
+    }
+
+    /// Record (and persist) whether a project's derived "Other" group is
+    /// open. Stored explicitly in both directions: the default it overrides
+    /// is `[ui] sidebar_other_group_collapsed`, which a config edit can flip,
+    /// so "absent" cannot stand for either state.
+    pub(crate) fn set_other_open(&mut self, slug: &str, open: bool) {
+        self.view.other_open.insert(slug.to_string(), open);
+        self.persist(&format!("other_open:{slug}"), if open { "1" } else { "0" });
     }
 
     /// The effective per-row detail mode: the runtime override (`i`) if the
@@ -299,6 +324,48 @@ mod tests {
         let mut sb2 = SidebarState::default();
         sb2.load(&db2, SIDEBAR_SCOPE);
         assert!(!sb2.view.flat);
+    }
+
+    /// The "Other" group's per-project open state round-trips through
+    /// `ui_state`: written by `set_other_open`, read back by `load`, with
+    /// junk values swept rather than misread.
+    #[test]
+    fn other_open_round_trips_through_ui_state() {
+        let _state = crate::testenv::IsolatedState::new();
+        let db = thegn_core::db::Db::open().unwrap();
+        drop(db);
+
+        let mut sidebar = SidebarState::default();
+        sidebar.set_other_open("app", true);
+        sidebar.set_other_open("lib", false);
+        assert_eq!(sidebar.view.other_open.get("app"), Some(&true));
+        let rows = read_sidebar_state_from_writer().unwrap();
+        assert!(
+            rows.iter()
+                .any(|(key, value)| key == "other_open:app" && value == "1")
+        );
+        assert!(
+            rows.iter()
+                .any(|(key, value)| key == "other_open:lib" && value == "0")
+        );
+
+        let db = thegn_core::db::Db::open_memory().unwrap();
+        for (key, value) in rows {
+            db.set_ui_state(SIDEBAR_SCOPE, &key, &value).unwrap();
+        }
+        db.set_ui_state(SIDEBAR_SCOPE, "other_open:junk", "maybe")
+            .unwrap();
+        let mut loaded = SidebarState::default();
+        loaded.load(&db, SIDEBAR_SCOPE);
+        assert_eq!(loaded.view.other_open.get("app"), Some(&true));
+        assert_eq!(loaded.view.other_open.get("lib"), Some(&false));
+        assert_eq!(loaded.view.other_open.get("junk"), None);
+        assert!(
+            !db.ui_state_in_scope(SIDEBAR_SCOPE)
+                .unwrap()
+                .iter()
+                .any(|(key, _)| key == "other_open:junk")
+        );
     }
 
     #[test]

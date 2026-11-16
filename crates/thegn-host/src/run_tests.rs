@@ -2328,6 +2328,7 @@ fn removing_workspace_drops_its_rows_without_a_hydration() {
         env_name: None,
         env_degraded: false,
         sandbox_profile: None,
+        external: false,
     }];
 
     // The synchronous prune the RemoveWorkspace handler performs (same code).

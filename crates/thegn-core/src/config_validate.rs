@@ -1698,9 +1698,12 @@ mod tests {
         // 102 → 105 (THE-2021): `[sandbox.git]` mode (SandboxGitMode),
         // transport (GitTransport) and credential (GitCredential) — the
         // sandbox git write policy.
+        // 105 → 106 (b139): `[ui] sidebar_external_worktrees`
+        // (ExternalWorktrees) — group/show/hide for worktrees thegn did not
+        // create.
         assert_eq!(
             defs.len(),
-            105,
+            106,
             "config_enum definitions in the Config schema changed; update the \
              pin (and the exclusion note) deliberately: {defs:?}"
         );

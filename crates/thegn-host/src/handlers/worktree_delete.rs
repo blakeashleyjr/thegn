@@ -440,7 +440,9 @@ pub(crate) fn hide_pending_deletes(
                 .find(|candidate| candidate.depth < depth)
             && matches!(
                 parent.kind,
-                crate::sidebar::RowKind::Folder | crate::sidebar::RowKind::PipelineLane
+                crate::sidebar::RowKind::Folder
+                    | crate::sidebar::RowKind::PipelineLane
+                    | crate::sidebar::RowKind::OtherGroup
             )
         {
             parent.child_count = parent.child_count.saturating_sub(1);
@@ -906,6 +908,7 @@ mod tests {
             env_name: None,
             env_degraded: false,
             sandbox_profile: None,
+            external: false,
         };
         assert_eq!(
             pending_delete_refusal("app/active", &session, &[], &pending),

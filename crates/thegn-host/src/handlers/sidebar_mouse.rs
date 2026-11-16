@@ -305,7 +305,9 @@ pub(crate) fn on_left_press(
     // the same `tab_target` the primary row carries, which is the whole of what
     // a mirror may do (no pin, mark, rename, close or delete reaches it).
     if hit.kind.is_collapsible() {
-        if double {
+        // The derived "Other" group has nothing to select FOR (no rename,
+        // file, pin or drag), so a single click folds it.
+        if double || hit.kind == RowKind::OtherGroup {
             return match sb.toggle_collapse(model, session) {
                 SidebarOutcome::Redraw => PressOut::Consumed,
                 out => PressOut::Outcome(out),
@@ -710,6 +712,8 @@ pub(crate) fn spot_for_hover(
                     .filter(|(_, r)| r.workspace_slug == *slug)
                     .fold(None, |acc, (_, r)| match r.kind {
                         RowKind::Folder => r.folder_id,
+                        // The "Other" group's rows belong to no folder.
+                        RowKind::OtherGroup => None,
                         RowKind::Worktree if r.depth < 2 => None,
                         _ => acc,
                     })
