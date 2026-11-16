@@ -169,7 +169,9 @@ fn resolve_worktree_from(arg: Option<String>, env_wt: Option<String>, cwd: &Path
         // An inherited `$THEGN_WORKTREE` from a *different* repo must not beat
         // the repo the user `cd`'d into (it names the pane's own checkout).
         (Some(top), Some(env)) => {
-            if top.starts_with(&env) || env.starts_with(&top) {
+            let canon = |p: &Path| p.canonicalize().unwrap_or_else(|_| p.to_path_buf());
+            let (top_c, env_c) = (canon(&top), canon(&env));
+            if top_c.starts_with(&env_c) || env_c.starts_with(&top_c) {
                 env
             } else {
                 top
