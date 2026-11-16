@@ -1659,9 +1659,12 @@ mod tests {
         // TLS-terminated, and tunnel-only control-plane deployments.
         // 101 → 102 (THE-2002): `[ui] sidebar_detail_when` (DetailWhen) —
         // whether the sidebar detail line needs sidebar focus.
+        // 102 → 105 (THE-2021): `[sandbox.git]` mode (SandboxGitMode),
+        // transport (GitTransport) and credential (GitCredential) — the
+        // sandbox git write policy.
         assert_eq!(
             defs.len(),
-            102,
+            105,
             "config_enum definitions in the Config schema changed; update the \
              pin (and the exclusion note) deliberately: {defs:?}"
         );
@@ -1703,6 +1706,9 @@ mod tests {
         has("issues.provider", "IssueProviderKind");
         has("ui.sidebar_focus_detail", "FocusDetail");
         has("ui.sidebar_detail_when", "DetailWhen");
+        has("sandbox.git.mode", "SandboxGitMode");
+        has("sandbox.git.transport", "GitTransport");
+        has("sandbox.git.credential", "GitCredential");
         // Maps via additionalProperties.
         has("env.*.provider.connect", "ProviderConnect");
         has("host.*.reach", "HostReach");
