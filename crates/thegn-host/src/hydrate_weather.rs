@@ -98,7 +98,7 @@ fn poll(
     // considered, so a cold launch paints from disk.
     let cached = db.as_ref().and_then(|db| read_cache(db, &key));
     if let Some(snap) = &cached {
-        deliver(tx, waker, snap.clone(), generation.as_ref());
+        deliver(tx, waker, snap.clone(), &key, generation.as_ref());
     }
 
     let offline = thegn_core::connectivity::current() == Connectivity::Offline;
@@ -140,7 +140,7 @@ fn poll(
             {
                 write_cache(db, &key, &snap);
             }
-            deliver(tx, waker, snap, generation.as_ref());
+            deliver(tx, waker, snap, &key, generation.as_ref());
         }
         Err(e) => {
             // Only a transport failure is evidence about the link: an `Api` or a
@@ -230,12 +230,13 @@ fn deliver(
     tx: &tokio_mpsc::UnboundedSender<RefreshKind>,
     waker: &TerminalWaker,
     snap: WeatherSnapshot,
+    key: &str,
     generation: Option<&crate::hydrate_schedule::ScheduleFence>,
 ) {
     if !crate::hydrate_schedule::generation_is_current(generation) {
         return;
     }
-    let result = RefreshKind::Weather(Box::new(snap));
+    let result = RefreshKind::Weather(Box::new(snap), key.to_owned());
     let result = generation.map_or(result.clone(), |(_, generation)| RefreshKind::Scheduled {
         generation: *generation,
         kind: Box::new(result),
@@ -250,6 +251,29 @@ fn deliver(
         // costs at most a deferred paint.
         tracing::debug!(target: "thegn::weather", error = %e, "waker pulse failed");
     }
+}
+
+/// Whether a live config reload moved weather to a different cache row
+/// (provider, location or resolved units) while weather stays active, so the
+/// shown reading belongs to the old place and one immediate poll is owed.
+pub(crate) fn reload_needs_poll(
+    old: &WeatherConfig,
+    new: &WeatherConfig,
+    locale: Option<&str>,
+) -> bool {
+    if !(old.is_active() && new.is_active()) {
+        return false;
+    }
+    live_key(old, locale) != live_key(new, locale)
+}
+
+/// The cache row (provider, location, resolved units) a config reads and writes.
+pub(crate) fn live_key(cfg: &WeatherConfig, locale: Option<&str>) -> String {
+    thegn_core::weather::cache_key(
+        cfg.provider.as_str(),
+        &cfg.location,
+        cfg.resolved_units(locale),
+    )
 }
 
 #[cfg(test)]

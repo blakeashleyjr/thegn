@@ -443,7 +443,10 @@ pub(crate) enum RefreshKind {
     WeatherPoll,
     /// A weather reading — from the cache (immediately, at launch) or from a
     /// successful fetch. Boxed to keep `RefreshKind` small.
-    Weather(Box<thegn_core::weather::WeatherSnapshot>),
+    /// The `String` is the cache key the poll ran for; the loop drops a reading
+    /// whose key no longer matches the live `[weather]` config (a poll in flight
+    /// across a reload, THE-2006).
+    Weather(Box<thegn_core::weather::WeatherSnapshot>, String),
     /// The host-wide transcript token rollup. A separate slot from [`Self::Usage`]
     /// because the scan behind it reads thousands of files: sending them
     /// together meant the windows waited on the rollup, which is the whole
