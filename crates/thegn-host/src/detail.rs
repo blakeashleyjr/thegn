@@ -678,8 +678,16 @@ impl DetailOverlay {
         }
         let cur = idx.iter().position(|&i| i == self.sel).unwrap_or(0) as i32;
         let next = (cur + delta).clamp(0, idx.len() as i32 - 1) as usize;
+        let parked = idx[next] == self.sel;
         self.sel = idx[next];
         self.sync_sections_sel();
+        // A Sections cursor already on its last row keeps scrolling the stack
+        // down, so sections below the cursor table (fleet totals, key hints)
+        // stay reachable. Moving up brings the cursor row back into view.
+        if parked && delta > 0 && self.sections_cursor().is_some() {
+            self.scroll = (self.scroll + delta.unsigned_abs() as usize).min(self.scroll_max());
+            return;
+        }
         self.scroll_to_sel();
     }
 
