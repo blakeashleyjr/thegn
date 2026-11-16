@@ -606,6 +606,11 @@ fn command_for_with(
         .map_err(|e| anyhow::anyhow!("{e}"))?;
 
     if !headless {
+        if !prompt.trim().is_empty() && crate::agent_run::uses_prompt_file(&eff.command) {
+            bail!(
+                "agent `{agent}` takes its task by {{prompt_file}}: launch it headless to hand it a prompt"
+            );
+        }
         let cmd =
             thegn_core::agent_task::with_model(&eff.command, &eff.harness, eff.model.as_deref())
                 .map_err(|e| anyhow::anyhow!("{e}"))?;
@@ -1816,6 +1821,20 @@ mod tests {
             "{:#}",
             command_for(&config, "filer", "do it", true, None, false, None)
                 .expect_err("no host to hold the prompt file")
+        );
+        assert!(message.contains("{prompt_file}"), "got {message}");
+    }
+
+    #[test]
+    fn interactive_prompt_to_a_prompt_file_template_is_refused() {
+        let mut config = cfg();
+        config
+            .agents
+            .push(named("filer", "filer-agent --prompt-file {prompt_file}"));
+        let message = format!(
+            "{:#}",
+            command_for(&config, "filer", "do it", false, None, false, None)
+                .expect_err("an interactive open cannot fill {prompt_file}")
         );
         assert!(message.contains("{prompt_file}"), "got {message}");
     }
