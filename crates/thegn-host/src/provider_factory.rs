@@ -169,6 +169,113 @@ pub(crate) fn provider_for_named_owned(
     })
 }
 
+/// Build an account-level provider for fleet INVENTORY reads only: no
+/// per-sandbox name, no managed ssh key (empty key path / pubkey placeholders)
+/// and no iroh injection. Never use the result to exec or create: those paths
+/// need [`provider_for_named`]. Unlike it, the error names the real cause and
+/// nothing is warned.
+pub(crate) fn provider_for_inventory(
+    pc: &thegn_core::config::EnvProviderConfig,
+) -> Result<Provider, String> {
+    use thegn_core::config::EnvProviderKind as K;
+    let no_key = std::path::PathBuf::new();
+    match K::of(&pc.provider) {
+        K::Sprites => {
+            let key = if pc.api_key_env.trim().is_empty() {
+                "SPRITES_TOKEN"
+            } else {
+                pc.api_key_env.trim()
+            };
+            let token = crate::secret::resolve_for(key, "provider:sprites")
+                .ok_or_else(|| format!("API token {key} could not be resolved"))?;
+            Ok(Provider::Sprites(
+                SpritesProvider::new(&pc.api_base, &token, "")
+                    .with_custody_accounts(managed_custody_accounts(pc)),
+            ))
+        }
+        K::Daytona => {
+            let key = pc.api_key_env.trim();
+            let token = crate::secret::resolve_for(key, "provider:daytona")
+                .ok_or_else(|| format!("API token {key} could not be resolved"))?;
+            Ok(Provider::Daytona(DaytonaProvider::new(
+                &pc.api_base,
+                &token,
+                &pc.template,
+            )))
+        }
+        K::Hetzner | K::DigitalOcean => {
+            let (kind, key_env, token) = vps_token(pc)?;
+            Ok(Provider::Vps(
+                thegn_svc::vps::VpsProvider::new(thegn_svc::vps::VpsSpec {
+                    kind,
+                    api_base: pc.api_base.clone(),
+                    token,
+                    name: String::new(),
+                    region: pc.region.clone(),
+                    size: pc.size.clone(),
+                    image: pc.template.clone(),
+                    max_instances: pc.max_instances,
+                    max_lifetime_secs: pc.max_lifetime_secs,
+                    key_path: no_key,
+                    pubkey: String::new(),
+                    skip_ready_wait: false,
+                })
+                .with_credential_ref(&key_env),
+            ))
+        }
+        K::Fly => {
+            let (key, token) = fly_token(pc)?;
+            Ok(Provider::Fly(
+                FlyProvider::new(FlySpec {
+                    api_base: pc.api_base.clone(),
+                    graphql_url: String::new(),
+                    token,
+                    org_slug: String::new(),
+                    name: String::new(),
+                    region: pc.region.clone(),
+                    size: pc.size.clone(),
+                    image: pc.template.clone(),
+                    max_instances: pc.max_instances,
+                    max_lifetime_secs: pc.max_lifetime_secs,
+                    key_path: no_key,
+                    pubkey: String::new(),
+                    iroh: None,
+                    skip_ready_wait: false,
+                })
+                .with_credential_ref(&key),
+            ))
+        }
+        K::Machine0 => {
+            let (_, api_key) = machine0_token(pc)?;
+            Ok(Provider::Machine0(
+                thegn_svc::machine0::Machine0Provider::new(thegn_svc::machine0::Machine0Spec {
+                    endpoint: pc.api_base.clone(),
+                    api_key,
+                    name: String::new(),
+                    image: pc.template.clone(),
+                    size: pc.size.clone(),
+                    size_req: thegn_svc::machine0::SizeReq {
+                        min_vcpu: pc.min_vcpu,
+                        min_ram_gb: pc.min_ram_gb,
+                        min_disk_gb: pc.min_disk_gb,
+                        gpu: pc.gpu,
+                        nvme: pc.nvme,
+                    },
+                    region: pc.region.clone(),
+                    provision_flake: pc.provision_flake.clone(),
+                    ssh_user: String::new(),
+                    key_path: no_key,
+                    pubkey: String::new(),
+                    max_instances: pc.max_instances,
+                    max_lifetime_secs: pc.max_lifetime_secs,
+                    skip_ready_wait: false,
+                }),
+            ))
+        }
+        K::Custom => Err("custom provider has no inventory API".to_string()),
+    }
+}
+
 /// Build a provider using an explicit managed keypair. Rotation uses this only
 /// after authorizing the replacement public key, to prove an actual connection
 /// with the replacement private key before retiring the old one.
@@ -225,21 +332,58 @@ pub(crate) fn machine0_provider_for(
     machine0_provider_for_with_key(pc, name, None)
 }
 
-fn machine0_provider_for_with_key(
-    pc: &thegn_core::config::EnvProviderConfig,
-    name: &str,
-    managed_key: Option<(std::path::PathBuf, String)>,
-) -> Option<thegn_svc::machine0::Machine0Provider> {
+/// Resolve the machine0 API key: `(env ref, secret)`; the error names the ref.
+fn machine0_token(pc: &thegn_core::config::EnvProviderConfig) -> Result<(String, String), String> {
     let key = if pc.api_key_env.trim().is_empty() {
         "MACHINE0_API_KEY"
     } else {
         pc.api_key_env.trim()
     };
-    let Some(api_key) = crate::secret::resolve_for(key, "provider:machine0") else {
-        thegn_core::msg::warn(&format!(
-            "machine0: API key {key} could not be resolved; cannot drive machine0"
-        ));
-        return None;
+    crate::secret::resolve_for(key, "provider:machine0")
+        .map(|token| (key.to_string(), token))
+        .ok_or_else(|| format!("API token {key} could not be resolved"))
+}
+
+/// Resolve the Fly API token: `(env ref, secret)`; the error names the ref.
+fn fly_token(pc: &thegn_core::config::EnvProviderConfig) -> Result<(String, String), String> {
+    let key = if pc.api_key_env.trim().is_empty() {
+        "FLY_API_TOKEN"
+    } else {
+        pc.api_key_env.trim()
+    };
+    crate::secret::resolve_for(key, "provider:fly")
+        .map(|token| (key.to_string(), token))
+        .ok_or_else(|| format!("API token {key} could not be resolved"))
+}
+
+/// Resolve a VPS-kind API token: `(kind, env ref, secret)`.
+fn vps_token(
+    pc: &thegn_core::config::EnvProviderConfig,
+) -> Result<(thegn_svc::vps::VpsKind, String, String), String> {
+    let kind = thegn_svc::vps::VpsKind::parse(&pc.provider)
+        .ok_or_else(|| format!("unknown provider kind {:?}", pc.provider))?;
+    let key_env = if pc.api_key_env.trim().is_empty() {
+        kind.token_env_default()
+    } else {
+        pc.api_key_env.trim()
+    };
+    let consumer = format!("provider:{}", pc.provider.trim());
+    crate::secret::resolve_for(key_env, &consumer)
+        .map(|token| (kind, key_env.to_string(), token))
+        .ok_or_else(|| format!("API token {key_env} could not be resolved"))
+}
+
+fn machine0_provider_for_with_key(
+    pc: &thegn_core::config::EnvProviderConfig,
+    name: &str,
+    managed_key: Option<(std::path::PathBuf, String)>,
+) -> Option<thegn_svc::machine0::Machine0Provider> {
+    let api_key = match machine0_token(pc) {
+        Ok((_, api_key)) => api_key,
+        Err(why) => {
+            thegn_core::msg::warn(&format!("machine0: {why}; cannot drive machine0"));
+            return None;
+        }
     };
     let (key_path, pubkey) = match managed_key
         .map(Ok)
@@ -294,16 +438,12 @@ fn fly_provider_for_with_key(
     name: &str,
     managed_key: Option<(std::path::PathBuf, String)>,
 ) -> Option<FlyProvider> {
-    let key = if pc.api_key_env.trim().is_empty() {
-        "FLY_API_TOKEN"
-    } else {
-        pc.api_key_env.trim()
-    };
-    let Some(token) = crate::secret::resolve_for(key, "provider:fly") else {
-        thegn_core::msg::warn(&format!(
-            "fly: API token {key} could not be resolved; cannot drive fly"
-        ));
-        return None;
+    let (key, token) = match fly_token(pc) {
+        Ok(t) => t,
+        Err(why) => {
+            thegn_core::msg::warn(&format!("fly: {why}; cannot drive fly"));
+            return None;
+        }
     };
     let (key_path, pubkey) = match managed_key
         .map(Ok)
@@ -341,7 +481,7 @@ fn fly_provider_for_with_key(
             iroh: crate::iroh_home::injection_for(name),
             skip_ready_wait: false,
         })
-        .with_credential_ref(key),
+        .with_credential_ref(&key),
     )
 }
 
@@ -361,19 +501,15 @@ fn vps_provider_for_with_key(
     name: &str,
     managed_key: Option<(std::path::PathBuf, String)>,
 ) -> Option<thegn_svc::vps::VpsProvider> {
-    let kind = thegn_svc::vps::VpsKind::parse(&pc.provider)?;
-    let key_env = if pc.api_key_env.trim().is_empty() {
-        kind.token_env_default()
-    } else {
-        pc.api_key_env.trim()
-    };
-    let consumer = format!("provider:{}", pc.provider.trim());
-    let Some(token) = crate::secret::resolve_for(key_env, &consumer) else {
-        thegn_core::msg::warn(&format!(
-            "{}: API token {key_env} could not be resolved; cannot drive {}",
-            pc.provider, pc.provider
-        ));
-        return None;
+    let (kind, key_env, token) = match vps_token(pc) {
+        Ok(t) => t,
+        Err(why) => {
+            thegn_core::msg::warn(&format!(
+                "{}: {why}; cannot drive {}",
+                pc.provider, pc.provider
+            ));
+            return None;
+        }
     };
     let (key_path, pubkey) = match managed_key
         .map(Ok)
@@ -403,7 +539,7 @@ fn vps_provider_for_with_key(
             pubkey,
             skip_ready_wait: false,
         })
-        .with_credential_ref(key_env),
+        .with_credential_ref(&key_env),
     )
 }
 
@@ -567,6 +703,41 @@ fn derived_owner(configured_id: &str, claimed: bool, worktree: &str) -> Option<S
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn inventory_provider_needs_only_a_token() {
+        let _state = thegn_core::testenv::IsolatedState::new();
+        let _env = thegn_core::testenv::EnvGuard::set(&[("TG_TEST_INV_TOKEN", "tok")]);
+        for kind in ["fly", "hetzner", "machine0"] {
+            let pc = thegn_core::config::EnvProviderConfig {
+                provider: kind.into(),
+                api_key_env: "TG_TEST_INV_TOKEN".into(),
+                ..Default::default()
+            };
+            assert!(provider_for_inventory(&pc).is_ok(), "{kind}");
+        }
+    }
+
+    #[test]
+    fn inventory_provider_error_names_the_cause() {
+        let _state = thegn_core::testenv::IsolatedState::new();
+        let pc = thegn_core::config::EnvProviderConfig {
+            provider: "fly".into(),
+            api_key_env: "TG_TEST_INV_NO_SUCH_TOKEN".into(),
+            ..Default::default()
+        };
+        let err = provider_for_inventory(&pc).err().expect("no token");
+        assert!(err.contains("TG_TEST_INV_NO_SUCH_TOKEN"), "{err}");
+        let pc = thegn_core::config::EnvProviderConfig {
+            provider: "nope".into(),
+            ..Default::default()
+        };
+        let err = provider_for_inventory(&pc).err().expect("unknown");
+        assert!(
+            err.contains("unknown provider kind") || err.contains("custom"),
+            "{err}"
+        );
+    }
 
     #[test]
     fn unknown_provider_and_missing_token_yield_none() {
