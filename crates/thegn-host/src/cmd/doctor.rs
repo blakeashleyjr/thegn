@@ -3309,6 +3309,70 @@ fn model_proxy_json(cfg: &Config) -> serde_json::Value {
     })
 }
 
+/// How far back the "provider reaper holds" section looks.
+const REAPER_HOLD_WINDOW_SECS: i64 = 7 * 24 * 60 * 60;
+/// Most rows the section prints.
+const REAPER_HOLD_MAX_ROWS: usize = 10;
+/// How many of the newest inbox rows are scanned for reaper notices.
+const REAPER_HOLD_SCAN: usize = 500;
+
+/// `(kind, age_secs, message)` for one recorded reaper hold.
+type ReaperHold = (String, i64, String);
+
+/// Pure selection: `resource_alert` rows whose `source_ref` is
+/// `reaper-kept:<kind>:<hash>`, newest first, at most 7 days old and 10 rows.
+fn reaper_holds_from(rows: &[thegn_core::notification::Notification], now: i64) -> Vec<ReaperHold> {
+    rows.iter()
+        .filter(|n| n.kind == thegn_core::notification::NotificationKind::ResourceAlert)
+        .filter_map(|n| {
+            let kind = n.source_ref.strip_prefix("reaper-kept:")?;
+            let kind = kind.split(':').next().unwrap_or(kind);
+            let age = now.saturating_sub(n.created_at_ms).max(0);
+            (age <= REAPER_HOLD_WINDOW_SECS).then(|| (kind.to_string(), age, n.message.clone()))
+        })
+        .take(REAPER_HOLD_MAX_ROWS)
+        .collect()
+}
+
+/// Human lines for the "Provider reaper holds" section.
+fn reaper_hold_lines(holds: &[ReaperHold]) -> Vec<String> {
+    let mut out = vec!["Provider reaper holds (last 7 days)".to_string()];
+    if holds.is_empty() {
+        out.push("  none recorded".to_string());
+    }
+    for (kind, age, message) in holds {
+        out.push(format!(
+            "  {kind:<10} {:>4} ago  {}",
+            thegn_core::util::age_secs(*age),
+            message.replace(['\n', '\r'], " ")
+        ));
+    }
+    out
+}
+
+/// Read recent reaper holds from the local inbox. No provider or network calls.
+fn reaper_holds() -> Vec<ReaperHold> {
+    use thegn_core::store::NotificationStore as _;
+    let Some(db) = doctor_db().ready() else {
+        return Vec::new();
+    };
+    let rows = db
+        .get_all_notifications(REAPER_HOLD_SCAN)
+        .unwrap_or_default();
+    reaper_holds_from(&rows, thegn_core::util::now())
+}
+
+fn reaper_holds_json(holds: &[ReaperHold]) -> serde_json::Value {
+    serde_json::Value::Array(
+        holds
+            .iter()
+            .map(|(kind, age, message)| {
+                serde_json::json!({ "kind": kind, "age_secs": age, "message": message })
+            })
+            .collect(),
+    )
+}
+
 pub fn run(
     cfg: &Config,
     json: bool,
@@ -3325,6 +3389,7 @@ pub fn run(
             super::batteries_doctor::json(&super::batteries_doctor::inspect_env());
         report["worktree_sandbox_pins"] = pins::json(&pins::collect(cfg).0);
         report["stage_worker"] = stage_worker_json(cfg);
+        report["reaper_holds"] = reaper_holds_json(&reaper_holds());
         outln!("{}", serde_json::to_string_pretty(&report)?);
         return Ok(());
     }
@@ -3528,6 +3593,11 @@ pub fn run(
 
     outln!("");
     devcontainer_report(cfg);
+
+    outln!("");
+    for line in reaper_hold_lines(&reaper_holds()) {
+        outln!("{line}");
+    }
 
     outln!("");
     preview_renderers_report();
@@ -5955,6 +6025,96 @@ mod pins;
 #[cfg(test)]
 mod tests {
     use super::*;
+    use thegn_core::notification::{Notification, NotificationKind};
+
+    fn row(kind: NotificationKind, source: &str, msg: &str, created: i64) -> Notification {
+        Notification {
+            id: 0,
+            kind,
+            source_ref: source.into(),
+            message: msg.into(),
+            created_at_ms: created,
+            read: false,
+            worktree_path: String::new(),
+        }
+    }
+
+    #[test]
+    fn reaper_holds_empty_prints_none_recorded() {
+        assert!(reaper_holds_from(&[], 1_000).is_empty());
+        let lines = reaper_hold_lines(&[]);
+        assert_eq!(lines[0], "Provider reaper holds (last 7 days)");
+        assert_eq!(lines[1], "  none recorded");
+        assert_eq!(reaper_holds_json(&[]), serde_json::json!([]));
+    }
+
+    #[test]
+    fn reaper_holds_lists_two_kinds_and_filters_old_and_unrelated_rows() {
+        let now = 10_000_000;
+        let rows = vec![
+            row(
+                NotificationKind::ResourceAlert,
+                "reaper-kept:fly:00aa",
+                "fly kept 2",
+                now - 120,
+            ),
+            row(
+                NotificationKind::ResourceAlert,
+                "reaper-kept:sprite:00bb",
+                "sprite kept 1",
+                now - 7200,
+            ),
+            row(
+                NotificationKind::ResourceAlert,
+                "reaper-kept:fly:00cc",
+                "too old",
+                now - 8 * 86_400,
+            ),
+            row(
+                NotificationKind::ResourceAlert,
+                "cpu:high",
+                "not a reaper row",
+                now - 5,
+            ),
+            row(
+                NotificationKind::Mentioned,
+                "reaper-kept:fly:00dd",
+                "wrong kind",
+                now - 5,
+            ),
+        ];
+        let holds = reaper_holds_from(&rows, now);
+        let expect: Vec<ReaperHold> = vec![
+            ("fly".into(), 120, "fly kept 2".into()),
+            ("sprite".into(), 7200, "sprite kept 1".into()),
+        ];
+        assert_eq!(holds, expect);
+        let lines = reaper_hold_lines(&holds);
+        assert_eq!(lines.len(), 3);
+        assert!(
+            lines[1].contains("fly")
+                && lines[1].contains("2m ago")
+                && lines[1].contains("fly kept 2")
+        );
+        assert!(lines[2].contains("sprite") && lines[2].contains("2h ago"));
+        assert_eq!(reaper_holds_json(&holds)[1]["kind"], "sprite");
+    }
+
+    #[test]
+    fn reaper_holds_caps_at_ten_rows() {
+        let now = 1_000_000;
+        let rows: Vec<Notification> = (0..15)
+            .map(|i| {
+                row(
+                    NotificationKind::ResourceAlert,
+                    "reaper-kept:fly:x",
+                    "m",
+                    now - i,
+                )
+            })
+            .collect();
+        assert_eq!(reaper_holds_from(&rows, now).len(), 10);
+    }
 
     #[test]
     fn doctor_json_credential_notes_match_shared_value_free_rows() {

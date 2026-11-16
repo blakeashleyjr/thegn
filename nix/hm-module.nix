@@ -552,6 +552,9 @@ self: {
     notifications.dnd.windows = cfg.notificationsDndWindows;
     notifications.desktop_min_urgency = cfg.notificationsDesktopMinUrgency;
     notifications.process_exit = cfg.notificationsProcessExit;
+    notifications.priority = cfg.notificationsPriority;
+    notifications.active_mode = cfg.notificationsActiveMode;
+    notifications.agent_error_signatures = cfg.notificationsAgentErrorSignatures;
     notifications.sound.mode = cfg.notificationsSoundMode;
     notifications.sound.always_kinds = cfg.notificationsSoundAlwaysKinds;
     notifications.sound.mute = cfg.notificationsSoundMute;
@@ -1492,6 +1495,25 @@ in {
       type = lib.types.nullOr (lib.types.enum ["info" "notice" "alert"]);
       default = null;
       description = "Lowest notification priority that still gets through do-not-disturb. Unset (null) = the binary's default.";
+    };
+
+    notificationsPriority = lib.mkOption {
+      type = lib.types.nullOr (lib.types.attrsOf (lib.types.enum ["info" "notice" "alert"]));
+      default = null;
+      example = lib.literalExpression ''{ agent_done = "alert"; }'';
+      description = "Per-kind attention priority overrides. Keys are notification kind names; unknown kinds are reported by `thegn config validate`. Unset (null) = the binary's default.";
+    };
+
+    notificationsActiveMode = lib.mkOption {
+      type = lib.types.nullOr lib.types.str;
+      default = null;
+      description = "Name of the active notification mode. The modes themselves are defined in TOML (`notifications.modes`); a name with no matching mode is reported by `thegn config validate`. Unset (null) = the binary's default.";
+    };
+
+    notificationsAgentErrorSignatures = lib.mkOption {
+      type = lib.types.nullOr (lib.types.listOf lib.types.str);
+      default = null;
+      description = "Substrings that mark an agent log line as an error. Empty entries are reported by `thegn config validate`. Unset (null) = the binary's default.";
     };
 
     notificationsSoundMode = lib.mkOption {
