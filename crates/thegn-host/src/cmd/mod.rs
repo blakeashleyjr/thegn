@@ -222,11 +222,11 @@ mod resolve_worktree_tests {
 
     fn git_repo(dir: &Path) {
         std::fs::create_dir_all(dir).unwrap();
-        let st = thegn_core::util::git_cmd(dir)
+        let out = thegn_core::util::git_cmd(dir)
             .args(["-c", "commit.gpgsign=false", "init", "-q"])
-            .status()
+            .output()
             .unwrap();
-        assert!(st.success());
+        assert!(out.status.success());
     }
 
     #[test]
