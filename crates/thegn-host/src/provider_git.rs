@@ -154,16 +154,59 @@ pub(crate) fn is_protected_branch(
     default_branch: Option<&str>,
     merge_target: &str,
 ) -> bool {
-    let target = merge_target.trim();
+    let branch = short_branch(branch);
+    let target = short_branch(merge_target);
     branch == "main"
-        || default_branch.is_some_and(|d| d != "HEAD" && d == branch)
+        || default_branch.is_some_and(|d| {
+            let d = short_branch(d);
+            d != "HEAD" && d == branch
+        })
         || (!target.is_empty() && target != "auto" && target == branch)
 }
 
+/// A branch name with surrounding whitespace and a leading `refs/heads/`
+/// removed, so `refs/heads/x` and `x` compare equal.
+fn short_branch(name: &str) -> &str {
+    let name = name.trim();
+    name.strip_prefix("refs/heads/").unwrap_or(name)
+}
+
+/// Gate a pull-back into `branch`. Fails closed when the default branch is
+/// unknown: a read failure, or the `HEAD` fallback
+/// [`thegn_core::worktree::default_branch_checked`] returns when neither
+/// `origin/HEAD` nor `main`/`master` exists. Pure.
+pub(crate) fn check_pull_target(
+    branch: &str,
+    default_branch: Result<&str, &str>,
+    merge_target: &str,
+) -> Result<(), String> {
+    let default_branch = match default_branch {
+        Ok(d) if short_branch(d) != "HEAD" && !short_branch(d).is_empty() => d,
+        Ok(_) => {
+            return Err(format!(
+                "refusing to pull sandbox commits into {branch}: the repository's default branch is unknown; set origin/HEAD (`git remote set-head origin --auto`) or `merge_queue.target_branch`"
+            ));
+        }
+        Err(error) => {
+            return Err(format!(
+                "refusing to pull sandbox commits into {branch}: the repository's default branch could not be read ({error}); set origin/HEAD (`git remote set-head origin --auto`) or `merge_queue.target_branch`"
+            ));
+        }
+    };
+    if is_protected_branch(branch, Some(default_branch), merge_target) {
+        return Err(format!(
+            "refusing to pull sandbox commits into {branch}: it is the repository's default branch or merge target, which a sandbox never writes; check out the lane branch first"
+        ));
+    }
+    Ok(())
+}
+
 /// The scratch ref a worktree's pull-back fetches into: the worktree's
-/// directory name reduced to `[A-Za-z0-9_-]` (so it is always a valid,
-/// single-component ref name).
+/// directory name reduced to `[A-Za-z0-9_-]` plus a short hash of the full
+/// worktree path (so it is always a valid, single-component ref name, and
+/// two worktrees sharing a directory name never share a scratch ref).
 pub(crate) fn pull_ref_for(worktree: &Path) -> String {
+    use sha2::{Digest, Sha256};
     let base = worktree
         .file_name()
         .map(|name| name.to_string_lossy().into_owned())
@@ -180,7 +223,9 @@ pub(crate) fn pull_ref_for(worktree: &Path) -> String {
         .collect();
     let key = mapped.trim_matches('-');
     let key = if key.is_empty() { "worktree" } else { key };
-    format!("{PULL_REF_PREFIX}{key}")
+    let digest = Sha256::digest(worktree.as_os_str().as_encoded_bytes());
+    let hash: String = digest[..4].iter().map(|b| format!("{b:02x}")).collect();
+    format!("{PULL_REF_PREFIX}{key}-{hash}")
 }
 
 /// Run a mutating git command in `dir`, failing with its stderr tail.
@@ -381,6 +426,10 @@ fn apply_pulled_bundle(
     git_write(
         worktree,
         [
+            OsStr::new("-c"),
+            OsStr::new("transfer.fsckObjects=true"),
+            OsStr::new("-c"),
+            OsStr::new("fetch.fsckObjects=true"),
             OsStr::new("fetch"),
             OsStr::new("--no-tags"),
             OsStr::new("-q"),
@@ -417,6 +466,26 @@ fn apply_pulled_bundle(
     );
     match &outcome {
         PullOutcome::FastForwarded { to, .. } => {
+            // The download took a while: re-read the checkout right before
+            // writing so a branch switch (or a commit) in the meantime
+            // aborts instead of fast-forwarding the wrong branch.
+            let current =
+                git_read(worktree, &["symbolic-ref", "--short", "-q", "HEAD"]).unwrap_or_default();
+            anyhow::ensure!(
+                current == branch,
+                "{} switched from {branch} to {} during the pull; the sandbox head is kept in {kept_ref}",
+                worktree.display(),
+                if current.is_empty() {
+                    "a detached HEAD"
+                } else {
+                    current.as_str()
+                }
+            );
+            let tip_now = branch_tip(worktree, branch)?;
+            anyhow::ensure!(
+                tip_now.eq_ignore_ascii_case(local_tip),
+                "{branch} moved from {local_tip} to {tip_now} during the pull; the sandbox head is kept in {kept_ref}"
+            );
             git_write(
                 worktree,
                 ["merge", "--ff-only", "-q", to.as_str()],
@@ -480,16 +549,18 @@ pub(crate) fn pull_back(
         .ok()
         .filter(|b| !b.is_empty())
         .ok_or_else(|| anyhow::anyhow!("{worktree} is not on a branch; nothing to pull into"))?;
-    let default_branch = thegn_core::worktree::default_branch_checked(wt).ok();
-    anyhow::ensure!(
-        default_branch.is_some()
-            && !is_protected_branch(
-                &branch,
-                default_branch.as_deref(),
-                &cfg.merge_queue.target_branch
-            ),
-        "refusing to pull sandbox commits into {branch}: it is (or may be) the repository's default branch or merge target, which a sandbox never writes; check out the lane branch in {worktree} first"
-    );
+    let default_branch = thegn_core::worktree::default_branch_checked(wt);
+    // The per-repo merge target (workspace overlay) as `thegn land` resolves
+    // it; the global value when the main checkout cannot be found.
+    let merge_target = crate::integrate::main_checkout(wt)
+        .map(|root| cfg.repo_merge_queue(&root).target_branch)
+        .unwrap_or_else(|| cfg.merge_queue.target_branch.clone());
+    check_pull_target(
+        &branch,
+        default_branch.as_deref().map_err(String::as_str),
+        &merge_target,
+    )
+    .map_err(anyhow::Error::msg)?;
     let local_tip = branch_tip(wt, &branch)?;
     let (provider, id, workdir) = provider_target(cfg, worktree, env_name)?;
 
@@ -582,8 +653,8 @@ fn download_and_apply(
 mod tests {
     use super::{
         MAX_SEED_BUNDLE_BYTES, PULL_REF_PREFIX, PullOutcome, PullReport, apply_pulled_bundle,
-        branch_tip, bundle_branch, classify_pull, is_protected_branch, no_exec_channel_message,
-        pull_ref_for, seed_cap_message,
+        branch_tip, bundle_branch, check_pull_target, classify_pull, is_protected_branch,
+        no_exec_channel_message, pull_ref_for, seed_cap_message,
     };
     use std::path::Path;
 
@@ -600,6 +671,28 @@ mod tests {
         ));
         assert!(!is_protected_branch("tg/lane", Some("main"), "auto"));
         assert!(!is_protected_branch("tg/lane", Some("HEAD"), ""));
+    }
+
+    #[test]
+    fn merge_target_comparison_ignores_refs_heads_prefix() {
+        assert!(is_protected_branch("x", Some("main"), "refs/heads/x"));
+        assert!(is_protected_branch("refs/heads/x", Some("main"), "x"));
+        assert!(is_protected_branch("dev", Some("refs/heads/dev"), "auto"));
+        assert!(!is_protected_branch("y", Some("main"), "refs/heads/x"));
+    }
+
+    #[test]
+    fn pull_target_check_fails_closed_on_unknown_default_branch() {
+        let unknown = check_pull_target("tg/lane", Ok("HEAD"), "auto").unwrap_err();
+        assert!(unknown.contains("default branch is unknown"), "{unknown}");
+        assert!(unknown.contains("origin/HEAD"), "{unknown}");
+        assert!(unknown.contains("merge_queue.target_branch"), "{unknown}");
+        let failed = check_pull_target("tg/lane", Err("boom"), "auto").unwrap_err();
+        assert!(failed.contains("boom"), "{failed}");
+        assert!(failed.contains("merge_queue.target_branch"), "{failed}");
+        assert!(check_pull_target("main", Ok("main"), "auto").is_err());
+        assert!(check_pull_target("x", Ok("main"), "refs/heads/x").is_err());
+        assert_eq!(check_pull_target("tg/lane", Ok("main"), "auto"), Ok(()));
     }
     const B: &str = "2222222222222222222222222222222222222222";
 
@@ -683,18 +776,31 @@ mod tests {
 
     #[test]
     fn pull_refs_are_single_safe_components() {
-        assert_eq!(
-            pull_ref_for(Path::new("/w/tg-b1.x lock")),
-            format!("{PULL_REF_PREFIX}tg-b1-x-lock")
-        );
-        assert_eq!(
-            pull_ref_for(Path::new("/w/..")),
-            format!("{PULL_REF_PREFIX}worktree")
-        );
-        assert_eq!(
-            pull_ref_for(Path::new("/")),
-            format!("{PULL_REF_PREFIX}worktree")
-        );
+        let key = |p: &str| {
+            pull_ref_for(Path::new(p))
+                .strip_prefix(PULL_REF_PREFIX)
+                .expect("prefixed")
+                .to_string()
+        };
+        for (path, base) in [
+            ("/w/tg-b1.x lock", "tg-b1-x-lock"),
+            ("/w/..", "worktree"),
+            ("/", "worktree"),
+        ] {
+            let k = key(path);
+            let (name, hash) = k.rsplit_once('-').expect("hash suffix");
+            assert_eq!(name, base, "{path}");
+            assert_eq!(hash.len(), 8, "{path}");
+            assert!(hash.chars().all(|c| c.is_ascii_hexdigit()), "{path}");
+            assert!(
+                k.chars()
+                    .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-'),
+                "{k}"
+            );
+        }
+        // Same directory name, different parents: distinct scratch refs.
+        assert_ne!(key("/a/lane"), key("/b/lane"));
+        assert_eq!(key("/a/lane"), key("/a/lane"));
     }
 
     #[expect(
