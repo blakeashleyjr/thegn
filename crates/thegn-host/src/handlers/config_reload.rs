@@ -5,14 +5,21 @@
 //!
 //! Extracted from the reload handler in `run.rs`. Every hook runs ON the loop
 //! inside the existing `WakeSource::Config` wake: it rebuilds models or queues
-//! work, never does I/O. The one off-loop job (a weather re-poll) is returned in
-//! [`ReloadOutcome::weather_poll`] for the caller to spawn, which keeps this
+//! work, never does I/O. Work that touches loop-owned workers or process-wide
+//! state (a weather re-poll, the refresh ticker's cadences, the push workers,
+//! the media watcher, the automation runtime, the panel width atomics) is
+//! returned in [`ReloadOutcome`] for the caller to apply, which keeps this
 //! module runtime-free and unit-testable.
+//!
+//! A capped or failed diff makes [`ReloadPlan::runs`] true for every hook, so
+//! every hook runs exactly as the old unconditional handler did.
 
 use crate::chrome::FrameModel;
 use crate::handlers::sidebar_persist::SidebarState;
+use std::sync::Arc;
 use thegn_core::config::reload_class::{ReloadHook, ReloadPlan};
-use thegn_core::config::{Config, FocusDetail, WeatherConfig};
+use thegn_core::config::{Config, FocusDetail, NotificationsConfig, WeatherConfig};
+use thegn_core::help::HelpRegistry;
 
 /// The loop state the extracted hooks touch.
 pub(crate) struct ReloadCtx<'a> {
@@ -25,6 +32,17 @@ pub(crate) struct ReloadCtx<'a> {
     pub(crate) new_cfg: &'a Config,
     /// The process locale (`CalendarDocs::env_locale`), read by the caller.
     pub(crate) locale: Option<String>,
+    /// The loop's help registry (embeds the effective keymap page).
+    pub(crate) help_registry: &'a mut Arc<HelpRegistry>,
+    /// The user's nudged panel width, which wins over `[panel] width`.
+    pub(crate) panel_cols_pref: Option<usize>,
+}
+
+/// `[panel] width` / `half_ratio` for `layout::set_panel_width_cfg`.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) struct PanelWidthCfg {
+    pub(crate) normal_cols: Option<usize>,
+    pub(crate) half_ratio: Option<f32>,
 }
 
 /// An off-loop weather poll the caller spawns
@@ -44,6 +62,98 @@ pub(crate) struct ReloadOutcome {
     pub(crate) bars_dirty: bool,
     /// Something visible changed: paint a frame.
     pub(crate) dirty: bool,
+    /// Re-arm the refresh ticker from the new config
+    /// (`ScheduleOwner::reconfigure`, a no-op when the cadences, i.e.
+    /// `ScheduleConfig::from_config`, did not move).
+    pub(crate) reschedule: bool,
+    /// Republish notification routing + rebuild the push workers
+    /// (`install_push_workers`) from this effective config.
+    pub(crate) notifications: Option<NotificationsConfig>,
+    /// Restart the media watcher and cancel in-flight album art.
+    pub(crate) restart_media: bool,
+    /// Reinstall the automation runtime (`automation_runtime::install`).
+    pub(crate) automations: bool,
+    /// Store the panel width config (`layout::set_panel_width_cfg`).
+    pub(crate) panel_width: Option<PanelWidthCfg>,
+}
+
+/// Every changed key in the plan, whatever its class.
+fn changed_keys(plan: &ReloadPlan) -> impl Iterator<Item = &str> {
+    plan.live
+        .values()
+        .flatten()
+        .chain(&plan.restart)
+        .chain(&plan.next_use)
+        .chain(&plan.unclassified)
+        .map(String::as_str)
+}
+
+/// The refresh ticker's cadences read `[bars]` clock/date formats, `[usage]`
+/// (Bars), `[calendar]` and `[weather]` as well as the Schedule rows.
+pub(crate) fn schedule_runs(plan: &ReloadPlan) -> bool {
+    [
+        ReloadHook::Schedule,
+        ReloadHook::Bars,
+        ReloadHook::Calendar,
+        ReloadHook::Weather,
+    ]
+    .into_iter()
+    .any(|hook| plan.runs(hook))
+}
+
+/// The panel reads `[panel]`, the keymap (keys cheatsheet) and the section
+/// gates `pr_queue.enabled` (Schedule), `media.enabled` (Media) and
+/// `usage.enabled` (Bars).
+pub(crate) fn panel_runs(plan: &ReloadPlan) -> bool {
+    [
+        ReloadHook::Panel,
+        ReloadHook::Keymap,
+        ReloadHook::Schedule,
+        ReloadHook::Media,
+        ReloadHook::Bars,
+    ]
+    .into_iter()
+    .any(|hook| plan.runs(hook))
+}
+
+/// The help registry embeds the effective keymap page.
+pub(crate) fn help_runs(plan: &ReloadPlan) -> bool {
+    plan.runs(ReloadHook::Help) || plan.runs(ReloadHook::Keymap)
+}
+
+/// The effective notification config folds the active profile's overlay
+/// (`Config::effective_notifications`), so a `profile` switch or a
+/// `profiles.<name>.notifications` edit re-routes too.
+pub(crate) fn notifications_runs(plan: &ReloadPlan) -> bool {
+    plan.runs(ReloadHook::Notifications)
+        || changed_keys(plan).any(|key| key == "profile" || key.starts_with("profiles."))
+}
+
+/// App tabs follow `[apps]`, the plugin specs (plugin tabs) and `[observe]`
+/// (`AppHost::reconcile` rebuilds the observe slot when it moved).
+pub(crate) fn app_host_runs(plan: &ReloadPlan) -> bool {
+    plan.runs(ReloadHook::AppHost)
+        || plan.runs(ReloadHook::Plugins)
+        || changed_keys(plan).any(|key| key == "observe" || key.starts_with("observe."))
+}
+
+/// The plugin host restarts when the plugin list changed. The plugin
+/// dispatcher also holds the whole config (`PluginsState::new`) for the
+/// operations it runs on a plugin's behalf, which read NextUse keys afresh,
+/// so a NextUse (or unclassified) edit restarts it too; a Live-only edit
+/// (theme, sidebar, bars, ...) no longer does.
+pub(crate) fn plugins_restart_runs(plan: &ReloadPlan) -> bool {
+    plan.runs(ReloadHook::Plugins) || !plan.next_use.is_empty() || !plan.unclassified.is_empty()
+}
+
+/// Is any push sink configured in this effective notification config? Feeds
+/// `FrameModel::notification_delivery_configured` (the Monitor delivery row).
+pub(crate) fn delivery_configured(notifications: &NotificationsConfig) -> bool {
+    notifications
+        .push
+        .effective_sinks()
+        .iter()
+        .any(thegn_core::config_push::PushSinkConfig::is_configured)
 }
 
 /// Run the extracted hooks whose keys changed.
@@ -53,8 +163,12 @@ pub(crate) fn apply(plan: &ReloadPlan, ctx: &mut ReloadCtx<'_>) -> ReloadOutcome
         sidebar(plan, ctx);
         out.dirty = true;
     }
-    // The accent lives in `[theme]` but is cached beside the bar configs.
-    if plan.runs(ReloadHook::Bars) || plan.runs(ReloadHook::Theme) {
+    // The accent lives in `[theme]` but is cached beside the bar configs; the
+    // clock/date formats are Schedule rows but render from the bar configs.
+    if plan.runs(ReloadHook::Bars)
+        || plan.runs(ReloadHook::Theme)
+        || plan.runs(ReloadHook::Schedule)
+    {
         bars(ctx);
         out.bars_dirty = true;
         out.dirty = true;
@@ -66,7 +180,63 @@ pub(crate) fn apply(plan: &ReloadPlan, ctx: &mut ReloadCtx<'_>) -> ReloadOutcome
         calendar(ctx);
         out.dirty = true;
     }
+    out.reschedule = schedule_runs(plan);
+    if notifications_runs(plan) {
+        notifications(ctx, &mut out);
+    }
+    if panel_runs(plan) {
+        panel(ctx, &mut out);
+    }
+    if help_runs(plan) {
+        help(ctx);
+        out.dirty = true;
+    }
+    if plan.runs(ReloadHook::Media) {
+        media(ctx, &mut out);
+    }
+    out.automations = plan.runs(ReloadHook::Automation);
     out
+}
+
+/// `[notifications]`: hand the effective config to the caller's push-worker
+/// rebuild and refresh the cached "a sink is configured" bit (read by the
+/// Monitor delivery row; computing it per frame cloned the whole config).
+fn notifications(ctx: &mut ReloadCtx<'_>, out: &mut ReloadOutcome) {
+    let effective = ctx.new_cfg.effective_notifications(None);
+    ctx.model.notification_delivery_configured = delivery_configured(&effective);
+    out.notifications = Some(effective);
+    out.dirty = true;
+}
+
+/// `[panel]`: section order/gates, the keys cheatsheet (follows the keymap)
+/// and the width config (the user's nudged width wins).
+fn panel(ctx: &mut ReloadCtx<'_>, out: &mut ReloadOutcome) {
+    let new = ctx.new_cfg;
+    ctx.panel_ui.apply_config(new);
+    ctx.panel_ui.docs.cfg_keys = crate::keyhint::cheatsheet_groups(new);
+    out.panel_width = Some(PanelWidthCfg {
+        normal_cols: ctx.panel_cols_pref.or(new.panel.width),
+        half_ratio: new.panel.half_ratio,
+    });
+    out.dirty = true;
+}
+
+/// The help registry embeds the effective keymap page: rebuild it and point
+/// the panel's help view at the new one.
+fn help(ctx: &mut ReloadCtx<'_>) {
+    *ctx.help_registry = Arc::new(crate::help::pages::registry_logged(ctx.new_cfg));
+    ctx.panel_ui.help.reg = Some(Arc::clone(ctx.help_registry));
+}
+
+/// `[media]`: the art toggle applies here; the watcher restart and the
+/// in-flight art cancel are the caller's (they own the watcher handle).
+fn media(ctx: &mut ReloadCtx<'_>, out: &mut ReloadOutcome) {
+    ctx.panel_ui
+        .media
+        .set_art_enabled(ctx.new_cfg.media.show_art);
+    ctx.panel_ui.media.cancel_art_request();
+    out.restart_media = true;
+    out.dirty = true;
 }
 
 /// Should a reload drop the `i` runtime override of
@@ -159,11 +329,17 @@ fn calendar(ctx: &mut ReloadCtx<'_>) {
 
 #[cfg(test)]
 mod tests {
-    use super::{ReloadCtx, WeatherPoll, apply, releases_focus_override};
+    use super::{
+        PanelWidthCfg, ReloadCtx, WeatherPoll, app_host_runs, apply, delivery_configured,
+        notifications_runs, plugins_restart_runs, releases_focus_override,
+    };
     use crate::chrome::FrameModel;
     use crate::handlers::sidebar_persist::SidebarState;
-    use thegn_core::config::reload_class::{ReloadHook, plan};
+    use crate::hydrate_schedule::ScheduleConfig;
+    use std::sync::Arc;
+    use thegn_core::config::reload_class::{ReloadHook, ReloadPlan, plan, plan_keys};
     use thegn_core::config::{Config, FocusDetail};
+    use thegn_core::help::HelpRegistry;
     use thegn_core::weather::{Sky, Units, WeatherSnapshot};
 
     fn cfg(toml_text: &str) -> Config {
@@ -194,6 +370,7 @@ mod tests {
         session: crate::session::Session,
         panel_ui: crate::panel::PanelUi,
         bar_detail: Option<crate::detail::DetailOverlay>,
+        help_registry: Arc<HelpRegistry>,
     }
 
     impl Fixture {
@@ -211,11 +388,15 @@ mod tests {
                 session: crate::session::Session::default(),
                 panel_ui: crate::panel::PanelUi::default(),
                 bar_detail: None,
+                help_registry: Arc::new(crate::help::pages::registry_logged(old)),
             }
         }
 
         fn reload(&mut self, old: &Config, new: &Config) -> super::ReloadOutcome {
-            let plan = plan(old, new);
+            self.apply_plan(&plan(old, new), new)
+        }
+
+        fn apply_plan(&mut self, plan: &ReloadPlan, new: &Config) -> super::ReloadOutcome {
             let mut ctx = ReloadCtx {
                 model: &mut self.model,
                 sb: &mut self.sb,
@@ -224,9 +405,208 @@ mod tests {
                 bar_detail: &mut self.bar_detail,
                 new_cfg: new,
                 locale: None,
+                help_registry: &mut self.help_registry,
+                panel_cols_pref: None,
             };
-            apply(&plan, &mut ctx)
+            apply(plan, &mut ctx)
         }
+    }
+
+    /// One applied-check per Live hook: the representative key's edit (old
+    /// config is the default) and an assertion that `apply` produced that
+    /// hook's effect. A hook whose effect is the caller's (the outcome
+    /// requests) is checked through the request it returns.
+    type Check = fn(&Fixture, &super::ReloadOutcome, &Config, &Config) -> bool;
+
+    #[test]
+    fn every_live_hook_applies_its_representative_key() {
+        let rows: &[(ReloadHook, &str, Check)] = &[
+            (
+                ReloadHook::Sidebar,
+                "[ui]\nsidebar_detail_fields = [\"stash\", \"branch\"]\n",
+                |fx, _, _, new| {
+                    fx.model.sidebar_display.detail_fields == new.ui.detail_entries_resolved()
+                },
+            ),
+            (
+                ReloadHook::Weather,
+                "[weather]\nenabled = true\nlocation = \"Reykjavik\"\n",
+                |fx, out, _, new| {
+                    fx.model.weather_cfg.location == "Reykjavik"
+                        && out.weather_poll.as_ref().map(|poll| &poll.cfg) == Some(&new.weather)
+                },
+            ),
+            (
+                ReloadHook::Theme,
+                "[theme]\naccent = \"#123456\"\n",
+                |fx, out, _, new| out.bars_dirty && fx.model.accent == new.accent_rgb(),
+            ),
+            (
+                ReloadHook::Bars,
+                "[usage]\nenabled = false\n",
+                |fx, out, old, new| {
+                    // `[usage]` re-arms its poll through the schedule too.
+                    out.bars_dirty
+                        && !fx.model.usage_cfg.enabled
+                        && out.reschedule
+                        && ScheduleConfig::from_config(old) != ScheduleConfig::from_config(new)
+                },
+            ),
+            (
+                ReloadHook::Calendar,
+                "[calendar]\nweek_start = \"sunday\"\n",
+                |fx, out, _, _| out.dirty && fx.panel_ui.docs.calendar.loaded.contains(&(2026, 11)),
+            ),
+            (
+                ReloadHook::Schedule,
+                "[ci]\npoll_interval_secs = 900\n",
+                |_, out, old, new| {
+                    out.reschedule
+                        && ScheduleConfig::from_config(old).ci_every_slots
+                            != ScheduleConfig::from_config(new).ci_every_slots
+                },
+            ),
+            (
+                ReloadHook::Schedule,
+                "[bars]\nclock_format = \"%H:%M:%S\"\n",
+                |fx, out, _, new| {
+                    out.bars_dirty
+                        && fx.model.bars.clock_format == new.bars.clock_format
+                        && out.reschedule
+                        && ScheduleConfig::from_config(new).clock_period_secs == 1
+                },
+            ),
+            (
+                ReloadHook::Notifications,
+                "[notifications.push]\ntopic = \"thegn-reload-test\"\n",
+                |fx, out, _, _| {
+                    fx.model.notification_delivery_configured
+                        && out.notifications.as_ref().is_some_and(delivery_configured)
+                },
+            ),
+            (
+                ReloadHook::Panel,
+                "[panel]\nsections = [\"pr\", \"changes\"]\n",
+                |fx, out, _, new| {
+                    fx.panel_ui.order == crate::panel::resolve_order(new)
+                        && fx.panel_ui.order.first() == Some(&crate::panel::Section::Pr)
+                        && out.panel_width
+                            == Some(PanelWidthCfg {
+                                normal_cols: new.panel.width,
+                                half_ratio: new.panel.half_ratio,
+                            })
+                },
+            ),
+            (
+                ReloadHook::Keymap,
+                "keymap_preset = \"vscode\"\n",
+                |fx, out, _, _| {
+                    // Help + cheatsheet follow the keymap: the panel points at
+                    // the rebuilt registry (the loop below checks it is new).
+                    out.panel_width.is_some()
+                        && fx
+                            .panel_ui
+                            .help
+                            .reg
+                            .as_ref()
+                            .is_some_and(|reg| Arc::ptr_eq(reg, &fx.help_registry))
+                },
+            ),
+            (
+                ReloadHook::Media,
+                "[media]\nshow_art = false\n",
+                |fx, out, _, _| out.restart_media && !fx.panel_ui.media.art_visible(),
+            ),
+            (
+                ReloadHook::Automation,
+                "[automations]\nenabled = true\n",
+                |_, out, _, _| out.automations,
+            ),
+        ];
+        for (hook, edit, check) in rows {
+            let old = Config::default();
+            let new = cfg(edit);
+            let plan = plan(&old, &new);
+            assert!(
+                plan.runs(*hook),
+                "{edit:?} must classify under {hook:?}: {plan:?}"
+            );
+            let mut fx = Fixture::new(&old);
+            fx.panel_ui.docs.calendar.loaded.insert((2026, 11));
+            let help_before = Arc::clone(&fx.help_registry);
+            let out = fx.apply_plan(&plan, &new);
+            assert!(
+                check(&fx, &out, &old, &new),
+                "{hook:?} did not apply {edit:?}: {out:?}"
+            );
+            assert_eq!(
+                !Arc::ptr_eq(&fx.help_registry, &help_before),
+                *hook == ReloadHook::Keymap,
+                "{hook:?}: the help registry rebuilds exactly for keymap edits"
+            );
+        }
+    }
+
+    #[test]
+    fn a_restart_only_edit_requests_no_hook_work() {
+        let old = Config::default();
+        let new = cfg("[daemon]\nenabled = false\n");
+        let mut fx = Fixture::new(&old);
+        let out = fx.reload(&old, &new);
+        assert!(!out.reschedule);
+        assert!(out.notifications.is_none());
+        assert!(!out.restart_media);
+        assert!(!out.automations);
+        assert!(out.panel_width.is_none());
+        assert!(!out.dirty);
+    }
+
+    #[test]
+    fn a_truncated_plan_runs_every_hook() {
+        let old = Config::default();
+        let new = Config::default();
+        let plan = plan_keys(vec![
+            thegn_core::config::reload_class::TRUNCATED.to_string(),
+        ]);
+        let mut fx = Fixture::new(&old);
+        let help_before = Arc::clone(&fx.help_registry);
+        let out = fx.apply_plan(&plan, &new);
+        assert!(out.reschedule);
+        assert!(out.notifications.is_some());
+        assert!(out.restart_media);
+        assert!(out.automations);
+        assert!(out.panel_width.is_some());
+        assert!(out.bars_dirty && out.dirty);
+        assert!(!Arc::ptr_eq(&fx.help_registry, &help_before));
+        assert!(app_host_runs(&plan));
+        assert!(plugins_restart_runs(&plan));
+    }
+
+    #[test]
+    fn gate_predicates() {
+        let keys = |list: &[&str]| plan_keys(list.iter().map(|k| k.to_string()).collect());
+        // Profile overlays fold into the effective notification config.
+        assert!(notifications_runs(&keys(&["profile"])));
+        assert!(notifications_runs(&keys(&[
+            "profiles.work.notifications.active_mode"
+        ])));
+        assert!(notifications_runs(&keys(&["notifications.active_mode"])));
+        assert!(!notifications_runs(&keys(&["theme.accent"])));
+        // App tabs follow apps, plugins and observe.
+        assert!(app_host_runs(&keys(&["apps.default_tab"])));
+        assert!(app_host_runs(&keys(&["plugins"])));
+        assert!(app_host_runs(&keys(&["observe.enabled"])));
+        assert!(!app_host_runs(&keys(&["theme.accent"])));
+        // The plugin host restarts for plugin specs and NextUse edits (its
+        // dispatcher holds the config), never for a Live-only edit.
+        assert!(plugins_restart_runs(&keys(&["plugins"])));
+        assert!(plugins_restart_runs(&keys(&["base_branch"])));
+        assert!(!plugins_restart_runs(&keys(&[
+            "theme.accent",
+            "ui.sidebar_width"
+        ])));
+        assert!(!plugins_restart_runs(&keys(&["daemon.enabled"])));
+        assert!(!delivery_configured(&Config::default().notifications));
     }
 
     #[test]
@@ -300,6 +680,8 @@ mod tests {
             bar_detail: &mut fx.bar_detail,
             new_cfg: &new,
             locale: None,
+            help_registry: &mut fx.help_registry,
+            panel_cols_pref: None,
         };
         assert!(plan.runs(ReloadHook::Calendar), "{plan:?}");
         let out = apply(&plan, &mut ctx);

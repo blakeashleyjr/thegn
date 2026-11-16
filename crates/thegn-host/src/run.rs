@@ -8220,7 +8220,10 @@ async fn event_loop<T: Terminal>(
     // Push delivery is one bounded worker per effective named sink. The
     // snapshot is shared with Monitor but carries counters only — never URLs,
     // tokens, or message payloads.
-    install_push_workers(&notify_state, current_config.effective_notifications(None));
+    let startup_notifications = current_config.effective_notifications(None);
+    model.notification_delivery_configured =
+        crate::handlers::config_reload::delivery_configured(&startup_notifications);
+    install_push_workers(&notify_state, startup_notifications);
     // Surface any unacknowledged crash report from a previous run (this process
     // OR the daemon — the crash dir is shared) as a notification naming the
     // report path, then acknowledge it so it never re-surfaces. Entirely
@@ -14265,23 +14268,34 @@ async fn event_loop<T: Terminal>(
                             "config reload: keys with no reload class"
                         );
                     }
+                    use crate::handlers::config_reload as reload_hooks;
                     // Reconcile app tabs by stable id. This is chrome state:
                     // the successful reload below forces a full relayout, and
                     // unchanged defaults preserve the user's current tab.
-                    // Unconditional: app tabs also follow plugin specs.
-                    app_host.reconcile(&new_cfg);
-                    let selected_app = app_host.active;
-                    let _ =
-                        ensure_app_loaded(&mut app_host, selected_app, &app_tx, &waker, &new_cfg)
-                            .await;
+                    // AppHost hook: `[apps]`, plugin specs (plugin tabs) and
+                    // `[observe]` (see `reload_hooks::app_host_runs`).
+                    if reload_hooks::app_host_runs(&plan) {
+                        app_host.reconcile(&new_cfg);
+                        let selected_app = app_host.active;
+                        let _ = ensure_app_loaded(
+                            &mut app_host,
+                            selected_app,
+                            &app_tx,
+                            &waker,
+                            &new_cfg,
+                        )
+                        .await;
+                    }
                     // Unconditional: the keymap carries the whole config
                     // (`keymap.config()`), so it must follow every reload.
                     keymap = rebuild_keymap(&new_cfg, &session);
-                    // Sidebar, bars/stats/usage/accent, weather and calendar
-                    // hooks (handlers/config_reload.rs), gated on the plan.
-                    let reload_outcome = crate::handlers::config_reload::apply(
+                    // Sidebar, bars/stats/usage/accent, weather, calendar,
+                    // refresh cadences, notifications, panel, help, media and
+                    // automation hooks (handlers/config_reload.rs), gated on
+                    // the plan; worker restarts come back as requests.
+                    let reload_outcome = reload_hooks::apply(
                         &plan,
-                        &mut crate::handlers::config_reload::ReloadCtx {
+                        &mut reload_hooks::ReloadCtx {
                             model: &mut model,
                             sb: &mut sb,
                             session: &session,
@@ -14289,8 +14303,13 @@ async fn event_loop<T: Terminal>(
                             bar_detail: &mut bar_detail,
                             new_cfg: &new_cfg,
                             locale: crate::calendar_docs::CalendarDocs::env_locale(),
+                            help_registry: &mut help_registry,
+                            panel_cols_pref,
                         },
                     );
+                    if let Some(width) = reload_outcome.panel_width {
+                        layout::set_panel_width_cfg(width.normal_cols, width.half_ratio);
+                    }
                     bars_dirty |= reload_outcome.bars_dirty;
                     // `reload_outcome.dirty` is implied: every reload ends in
                     // an unconditional `dirty = true` below.
@@ -14354,14 +14373,9 @@ async fn event_loop<T: Terminal>(
                     crate::snapshot::set_scrollback_lines(
                         new_cfg.session.scrollback_lines as usize,
                     );
-                    // Live `[panel] sections` reload: reorder/hide accordions;
-                    // the keys section's cheatsheet follows the new keymap.
-                    // Unconditional: the panel and cheatsheet read the keymap.
-                    panel_ui.apply_config(&new_cfg);
-                    layout::set_panel_width_cfg(
-                        panel_cols_pref.or(new_cfg.panel.width),
-                        new_cfg.panel.half_ratio,
-                    );
+                    // `[panel]` sections/width, the keys cheatsheet and the
+                    // help registry run in the panel/help hooks above
+                    // (`reload_hooks::panel_runs` / `help_runs`).
                     // Live `[ui] sidebar_width` / `sidebar_wide_ratio` reload.
                     // Only reaches the screen once the user's own nudged width
                     // is cleared — `sb.width` still wins while it is `Some`.
@@ -14370,11 +14384,6 @@ async fn event_loop<T: Terminal>(
                         new_cfg.ui.sidebar_wide_ratio,
                     );
                     sidebar_cols = sb.effective_cols(cols);
-                    panel_ui.docs.cfg_keys = crate::keyhint::cheatsheet_groups(&new_cfg);
-                    // The help registry embeds the effective keymap page.
-                    help_registry =
-                        std::sync::Arc::new(crate::help::pages::registry_logged(&new_cfg));
-                    panel_ui.help.reg = Some(help_registry.clone());
                     if plan.runs(ReloadHook::Voice) {
                         crate::handlers::voice::reconfigure(
                             &mut voice,
@@ -14405,12 +14414,17 @@ async fn event_loop<T: Terminal>(
                         });
                     }
                     current_config = new_cfg;
-                    // Rebuild only the effective hydration schedule. This is
-                    // intentionally after successful config admission; the
+                    // Schedule hook: re-arm only the effective hydration
+                    // schedule (a no-op when the cadences did not move). This
+                    // is intentionally after successful config admission; the
                     // Err path below therefore keeps the prior worker and
                     // generation untouched.
-                    schedule.reconfigure(&current_config);
-                    crate::automation_runtime::install(&current_config);
+                    if reload_outcome.reschedule {
+                        schedule.reconfigure(&current_config);
+                    }
+                    if reload_outcome.automations {
+                        crate::automation_runtime::install(&current_config);
+                    }
                     // Live `[model_proxy]` reload: supervisor stops, starts or restarts to match.
                     crate::model_proxy_daemon::spawn_supervisor(&current_config);
                     preview_supervisor.set_enabled(current_config.preview.enabled);
@@ -14424,54 +14438,56 @@ async fn event_loop<T: Terminal>(
                     model.preview = session
                         .active_group()
                         .and_then(|group| preview_supervisor.view(&group.path));
-                    panel_ui
-                        .media
-                        .set_art_enabled(current_config.media.show_art);
                     // Live resident-pool cap reload: applies on the next park.
                     workspace_pool.set_limit(current_config.session.resident_pool_limit);
-                    // Live notification-routing and push-worker reload: publish
-                    // the matching config/sender pair under one lock boundary.
-                    install_push_workers(
-                        &notify_state,
-                        current_config.effective_notifications(None),
-                    );
+                    // Notifications hook: publish the matching routing
+                    // config/sender pair under one lock boundary (the hook
+                    // already refreshed `notification_delivery_configured`).
+                    if let Some(notifications) = reload_outcome.notifications {
+                        install_push_workers(&notify_state, notifications);
+                    }
                     // Live replay/daemon toggle: newly spawned panes pick up the
                     // reloaded configs (existing panes keep their transport/ring).
                     crate::handlers::startup::install_pane_services(&mut panes, &current_config);
-                    // Live media toggle: (re)spawn or stop the watcher to match the
-                    // reloaded `[media]` config.
-                    restart_media_watch(
-                        &mut media_watch,
-                        media_effective_cfg(&current_config.media, &media_player_override),
-                        &media_generation,
-                        &media_tx,
-                        &waker,
-                    );
-                    crate::media_art::cancel_in_flight();
-                    panel_ui.media.cancel_art_request();
-                    // Live `[[plugins]]` reload: tear the running set down
-                    // (deactivate + kill) and start fresh from the reloaded
-                    // specs — the documented way to deliberately restart a
-                    // plugin (docs/help/plugins.md; there is no restart verb).
-                    if let Some(host) = plugins_host.take() {
-                        host.shutdown();
+                    // Media hook: (re)spawn or stop the watcher to match the
+                    // reloaded `[media]` config (the hook applied `show_art`).
+                    if reload_outcome.restart_media {
+                        restart_media_watch(
+                            &mut media_watch,
+                            media_effective_cfg(&current_config.media, &media_player_override),
+                            &media_generation,
+                            &media_tx,
+                            &waker,
+                        );
+                        crate::media_art::cancel_in_flight();
                     }
-                    plugins_state =
-                        crate::handlers::plugins::PluginsState::new(current_config.clone());
-                    model.plugin_segments.clear();
-                    let plugin_config_dir = thegn_core::config::Config::path()
-                        .parent()
-                        .map(std::path::Path::to_path_buf)
-                        .unwrap_or_default();
-                    let host = crate::plugins::spawn_plugins_host(
-                        resident_supervisor.clone(),
-                        current_config.plugins.clone(),
-                        plugin_config_dir,
-                        plugin_tx.clone(),
-                        waker.clone(),
-                    );
-                    plugin_rx.bind_host(host.generation());
-                    plugins_host = Some(host);
+                    // Plugins hook: tear the running set down (deactivate +
+                    // kill) and start fresh from the reloaded specs — the
+                    // documented way to deliberately restart a plugin
+                    // (docs/help/plugins.md; there is no restart verb). Also
+                    // on NextUse edits: the dispatcher holds the config (see
+                    // `reload_hooks::plugins_restart_runs`).
+                    if reload_hooks::plugins_restart_runs(&plan) {
+                        if let Some(host) = plugins_host.take() {
+                            host.shutdown();
+                        }
+                        plugins_state =
+                            crate::handlers::plugins::PluginsState::new(current_config.clone());
+                        model.plugin_segments.clear();
+                        let plugin_config_dir = thegn_core::config::Config::path()
+                            .parent()
+                            .map(std::path::Path::to_path_buf)
+                            .unwrap_or_default();
+                        let host = crate::plugins::spawn_plugins_host(
+                            resident_supervisor.clone(),
+                            current_config.plugins.clone(),
+                            plugin_config_dir,
+                            plugin_tx.clone(),
+                            waker.clone(),
+                        );
+                        plugin_rx.bind_host(host.generation());
+                        plugins_host = Some(host);
+                    }
                     need_relayout = true;
                 }
                 Err(e) => {
@@ -16124,12 +16140,8 @@ async fn event_loop<T: Terminal>(
             model.notify_dnd = notify_state.dnd_active();
             model.notify_mode = notify_state.active_mode();
             model.notification_delivery = notify_state.delivery_snapshot();
-            model.notification_delivery_configured = current_config
-                .effective_notifications(None)
-                .push
-                .effective_sinks()
-                .iter()
-                .any(thegn_core::config_push::PushSinkConfig::is_configured);
+            // `notification_delivery_configured` is config-derived: set at
+            // startup and by the reload's Notifications hook, not per frame.
             // Persistent chip: the focused pane is daemon-backed (survives quit).
             model.persistent_pane = panes
                 .table
