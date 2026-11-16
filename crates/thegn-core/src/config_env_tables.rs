@@ -380,10 +380,12 @@ impl EnvProviderConfig {
             // WSS-native providers (sprites) have no vendor CLI. The
             // control-plane READ path (chrome git/gh/fs reads + the persisted
             // worktree `GitLoc`) shells out through the thegn self-bridge,
-            // which runs the command over the provider's native exec API. Panes
-            // attach over that API directly (see `native_exec_for`), so this
-            // prefix drives only the reads — `envbuild` keeps the *interactive*
-            // prefix empty for these providers. Without it the location blob had
+            // which runs the command over the provider's native exec API. Native
+            // panes attach over that API directly (see `native_exec_for`);
+            // `envbuild` also uses this prefix as the *interactive* prefix
+            // (unless `exec = "cli"`), so a launch argv built from it (headless
+            // sessions, `sandbox-argv`) runs inside the sprite, never on the
+            // host. Without it the location blob had
             // an empty prefix, `GitLoc::from_db` fell back to Local, and every
             // read ran `git -C /workspace` on the HOST (no such dir) → blank
             // branch / ahead-behind / a stale panel.
