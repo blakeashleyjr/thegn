@@ -48,8 +48,10 @@ impl ReloadClass {
 
 /// Which reload swap group applies a live key. One id per swap group in the
 /// UI loop's reload handler; [`ReloadHook::None`] marks keys applied by the
-/// swaps that run on every reload (the `current_config` swap and the
-/// unconditional restarts such as plugins and media).
+/// swaps that run on every reload (the `current_config` swap and the cheap
+/// unconditional stores such as the scrollback cap and the resident-pool
+/// limit). The `config_reload_classes` gate keeps `Live` + `None` rows to an
+/// explicit allowlist.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum ReloadHook {
     Weather,
@@ -67,6 +69,14 @@ pub enum ReloadHook {
     AppHost,
     Layout,
     Caps,
+    /// The shared refresh ticker's cadences (`ScheduleConfig::from_config`).
+    Schedule,
+    /// Notification routing + push workers (`install_push_workers`).
+    Notifications,
+    /// The plugin host restart.
+    Plugins,
+    /// The media watcher restart + album-art toggle.
+    Media,
     None,
 }
 
@@ -89,6 +99,10 @@ impl ReloadHook {
             Self::AppHost => "apps",
             Self::Layout => "layout",
             Self::Caps => "terminal caps",
+            Self::Schedule => "refresh cadences",
+            Self::Notifications => "notifications",
+            Self::Plugins => "plugins",
+            Self::Media => "media",
             Self::None => "settings",
         }
     }
@@ -144,8 +158,9 @@ pub const RELOAD_CLASSES: &[(&str, ReloadClass, ReloadHook)] = &[
     ("presets", NextUse, H::None),
     ("actions", Live, H::Keymap),
     ("git_commands", Live, H::Keymap),
-    // Every reload tears the plugin set down and starts it from the new specs.
-    ("plugins", Live, H::None),
+    // A changed plugin list tears the plugin set down and starts it from the
+    // new specs (the plugin host restart in run.rs's reload handler).
+    ("plugins", Live, H::Plugins),
     ("forges", NextUse, H::None),
     // --- [ui] ---
     // Unlisted `[ui]` keys default to Restart (unsure they are re-read).
@@ -156,6 +171,10 @@ pub const RELOAD_CLASSES: &[(&str, ReloadClass, ReloadHook)] = &[
     ("ui.dismiss_overlay_on_click_outside", NextUse, H::None),
     // --- sub-tables ---
     ("git.*", NextUse, H::None),
+    // The auto-fetch cadence re-arms through `ScheduleConfig::from_config`
+    // (`auto_fetch_every_slots`) on reload.
+    ("git.auto_fetch", Live, H::Schedule),
+    ("git.auto_fetch_interval_secs", Live, H::Schedule),
     ("editor.*", NextUse, H::None),
     ("theme.*", Live, H::Theme),
     ("monitor.*", Restart, H::None),
@@ -164,11 +183,18 @@ pub const RELOAD_CLASSES: &[(&str, ReloadClass, ReloadHook)] = &[
     ("apps.*", Live, H::AppHost),
     ("observe.*", Restart, H::None),
     ("bars.*", Live, H::Bars),
+    // The clock tick period follows the formats (`clock_period_secs`: 1s when
+    // a format shows seconds); the Schedule hook also refreshes the bar
+    // configs, so the new format repaints.
+    ("bars.clock_format", Live, H::Schedule),
+    ("bars.date_format", Live, H::Schedule),
     ("calendar.*", Live, H::Calendar),
     ("weather.*", Live, H::Weather),
     ("pr.*", NextUse, H::None),
     ("issues.*", NextUse, H::None),
     ("ci.*", NextUse, H::None),
+    // `ci_every_slots` in `ScheduleConfig::from_config`.
+    ("ci.poll_interval_secs", Live, H::Schedule),
     ("watch.*", Restart, H::None),
     ("log.*", Restart, H::None),
     ("diagnostics.*", Restart, H::None),
@@ -179,14 +205,20 @@ pub const RELOAD_CLASSES: &[(&str, ReloadClass, ReloadHook)] = &[
     ("toolchain.*", NextUse, H::None),
     ("limits.*", Restart, H::None),
     ("disk.*", Restart, H::None),
+    // `disk_every_slots` in `ScheduleConfig::from_config`.
+    ("disk.scan_interval_secs", Live, H::Schedule),
     ("loc.*", NextUse, H::None),
+    // `loc_every_slots` in `ScheduleConfig::from_config`.
+    ("loc.enabled", Live, H::Schedule),
+    ("loc.scan_interval_secs", Live, H::Schedule),
     ("session.*", Restart, H::None),
     ("session.scrollback_lines", Live, H::None),
     ("session.resident_pool_limit", Live, H::None),
     ("activity.*", Restart, H::None),
     ("drawer.*", Restart, H::None),
-    // Notification routing and push workers are republished on every reload.
-    ("notifications.*", Live, H::None),
+    // Notification routing and push workers are republished by the
+    // Notifications hook (`install_push_workers`).
+    ("notifications.*", Live, H::Notifications),
     ("automations.*", Live, H::Automation),
     ("strip.*", Restart, H::None),
     ("panel.*", Live, H::Panel),
@@ -199,6 +231,10 @@ pub const RELOAD_CLASSES: &[(&str, ReloadClass, ReloadHook)] = &[
     ("serve.*", Restart, H::None),
     ("merge_queue.*", NextUse, H::None),
     ("pr_queue.*", NextUse, H::None),
+    // `prq_every_slots` in `ScheduleConfig::from_config` (the enabled flag also
+    // gates the panel's PR-queue section, which the panel hook re-resolves).
+    ("pr_queue.enabled", Live, H::Schedule),
+    ("pr_queue.poll_interval_secs", Live, H::Schedule),
     ("autopilot.*", Restart, H::None),
     ("pipeline.*", NextUse, H::None),
     ("skills.*", NextUse, H::None),
@@ -206,8 +242,9 @@ pub const RELOAD_CLASSES: &[(&str, ReloadClass, ReloadHook)] = &[
     ("replay.*", NextUse, H::None),
     ("recording.*", Restart, H::None),
     ("clipboard.*", NextUse, H::None),
-    // The media watcher is restarted on every reload.
-    ("media.*", Live, H::None),
+    // The Media hook restarts the watcher (`restart_media_watch`) and
+    // re-applies `show_art`.
+    ("media.*", Live, H::Media),
     ("voice.*", Live, H::Voice),
     ("usage.*", Live, H::Bars),
     // The model-proxy supervisor re-reads its section on every reload.
@@ -529,7 +566,57 @@ mod tests {
             Some((NextUse, H::None))
         );
         assert_eq!(class_for("sandbox.git.push"), Some((NextUse, H::None)));
-        assert_eq!(class_for("plugins"), Some((Live, H::None)));
+        assert_eq!(class_for("plugins"), Some((Live, H::Plugins)));
+    }
+
+    #[test]
+    fn cadence_and_restart_hooks_classify_live() {
+        for key in [
+            "bars.clock_format",
+            "bars.date_format",
+            "ci.poll_interval_secs",
+            "pr_queue.enabled",
+            "pr_queue.poll_interval_secs",
+            "git.auto_fetch",
+            "git.auto_fetch_interval_secs",
+            "disk.scan_interval_secs",
+            "loc.enabled",
+            "loc.scan_interval_secs",
+        ] {
+            assert_eq!(class_for(key), Some((Live, H::Schedule)), "{key}");
+        }
+        // Section defaults stay honest beside the cadence rows.
+        assert_eq!(class_for("bars.top_left"), Some((Live, H::Bars)));
+        assert_eq!(class_for("ci.ttl_secs"), Some((NextUse, H::None)));
+        assert_eq!(class_for("git.merge_guard"), Some((NextUse, H::None)));
+        assert_eq!(class_for("disk.anything"), Some((Restart, H::None)));
+        assert_eq!(class_for("loc.other"), Some((NextUse, H::None)));
+        assert_eq!(class_for("pr_queue.watch"), Some((NextUse, H::None)));
+        assert_eq!(class_for("calendar.week_start"), Some((Live, H::Calendar)));
+        assert_eq!(class_for("usage.enabled"), Some((Live, H::Bars)));
+        assert_eq!(
+            class_for("notifications.active_mode"),
+            Some((Live, H::Notifications))
+        );
+        assert_eq!(class_for("media.show_art"), Some((Live, H::Media)));
+        assert_eq!(class_for("media"), Some((Live, H::Media)));
+        assert_eq!(class_for("session.scrollback_lines"), Some((Live, H::None)));
+    }
+
+    #[test]
+    fn summary_names_the_new_hook_labels() {
+        let plan = plan_keys(vec![
+            "ci.poll_interval_secs".into(),
+            "notifications.active_mode".into(),
+            "plugins".into(),
+            "media.enabled".into(),
+        ]);
+        let text = summary(&plan).expect("something changed");
+        assert_eq!(
+            text,
+            "Config reloaded · live: media, notifications, plugins, refresh cadences"
+        );
+        assert_eq!(H::Schedule.label(), "refresh cadences");
     }
 
     #[test]
@@ -576,6 +663,10 @@ mod tests {
             H::AppHost,
             H::Layout,
             H::Caps,
+            H::Schedule,
+            H::Notifications,
+            H::Plugins,
+            H::Media,
             H::None,
         ] {
             assert!(!hook.label().is_empty());
