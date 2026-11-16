@@ -43,6 +43,19 @@ config_enum! {
 }
 
 config_enum! {
+    /// Where the sidebar puts a project's *external* worktrees — git worktrees
+    /// of a registered repo that thegn did not create (outside its checkout
+    /// layout, outside every `[project.<slug>] worktree_roots` entry, and not
+    /// filed into a folder). "group" folds them under one collapsible
+    /// "Other (N)" row per project; "show" lists them among the project's own
+    /// rows (the pre-group behaviour); "hide" omits them (and from the
+    /// project's counts). The active worktree is never hidden.
+    pub enum ExternalWorktrees: "external worktrees" {
+        Show = "show", Group = "group", Hide = "hide",
+    } default = Group;
+}
+
+config_enum! {
     /// Whether the detail line is available only while the sidebar is focused
     /// ("focused"), or remains available while another pane owns focus
     /// ("always").
@@ -214,17 +227,24 @@ impl DetailField {
         ]
     }
 
-    /// The default ordered fields. Optional metadata fields are deliberately
-    /// omitted so existing rows keep their established appearance.
-    pub const fn default_order() -> [Self; 14] {
+    /// The default ordered fields: every field except the two pipeline/live
+    /// ones (`stage`, `activity`), which stay opt-in. A field with nothing to
+    /// show renders nothing; narrow rows drop fields by the host's fixed
+    /// elision priority (optional metadata first), not by this order.
+    pub const fn default_order() -> [Self; 19] {
         [
             Self::Branch,
             Self::Commits,
             Self::Dirty,
             Self::BranchStat,
             Self::Pr,
+            Self::Ci,
+            Self::Issue,
+            Self::Author,
+            Self::Stash,
             Self::Subject,
             Self::Age,
+            Self::Upstream,
             Self::Env,
             Self::Sandbox,
             Self::Devcontainer,
@@ -341,6 +361,22 @@ pub struct UiConfig {
     /// Fraction of the window the sidebar's Wide expand (`e`) claims. Unset =
     /// 0.5. Clamped to 0.2–0.9 at apply time; never below the resting width.
     pub sidebar_wide_ratio: Option<f32>,
+    /// Where a project's external worktrees (git worktrees thegn did not
+    /// create) go: `group` under one collapsible "Other" row, `show` inline,
+    /// or `hide` (see [`ExternalWorktrees`]).
+    pub sidebar_external_worktrees: ExternalWorktrees,
+    /// Label of the derived group row that holds external worktrees; the row
+    /// reads `"{label} ({n})"`.
+    pub sidebar_other_group_label: String,
+    /// Whether the "Other" group starts collapsed. Expanding or collapsing it
+    /// is remembered per project.
+    pub sidebar_other_group_collapsed: bool,
+    /// Rows a sidebar group shows before a "show more" affordance; `0` = no
+    /// limit.
+    pub sidebar_group_row_limit: usize,
+    /// Per-group overrides of `sidebar_group_row_limit`, keyed by the folder
+    /// or group label (`{ Other = 5 }`); `0` = no limit for that group.
+    pub sidebar_group_row_limits: std::collections::BTreeMap<String, usize>,
 }
 
 impl Default for UiConfig {
@@ -381,6 +417,11 @@ impl Default for UiConfig {
             sidebar_icon_status: String::new(),
             sidebar_width: None,
             sidebar_wide_ratio: None,
+            sidebar_external_worktrees: ExternalWorktrees::default(),
+            sidebar_other_group_label: "Other".to_string(),
+            sidebar_other_group_collapsed: true,
+            sidebar_group_row_limit: 15,
+            sidebar_group_row_limits: std::collections::BTreeMap::new(),
         }
     }
 }
@@ -551,22 +592,7 @@ mod tests {
         assert_eq!(cfg.sidebar_behind_badge, "{n}b");
         assert_eq!(
             cfg.detail_fields_resolved(),
-            vec![
-                DetailField::Branch,
-                DetailField::Commits,
-                DetailField::Dirty,
-                DetailField::BranchStat,
-                DetailField::Pr,
-                DetailField::Subject,
-                DetailField::Age,
-                DetailField::Env,
-                DetailField::Sandbox,
-                DetailField::Devcontainer,
-                DetailField::Hibernated,
-                DetailField::Mq,
-                DetailField::Unread,
-                DetailField::Disk,
-            ]
+            DetailField::default_order().to_vec()
         );
         let cfg: UiConfig = toml::from_str(
             "sidebar_show_commits = false\nsidebar_show_behind_base = true\nsidebar_commit_badge = \"#{n}\"\nsidebar_behind_badge = \"{n}{n}\"\nsidebar_detail_fields = [\"age\", \"branch\"]",
@@ -605,16 +631,16 @@ mod tests {
         assert_eq!(DetailField::parse(" Branch "), Some(DetailField::Branch));
         assert_eq!(DetailField::parse("stash"), Some(DetailField::Stash));
         assert_eq!(DetailField::Stash.as_str(), "stash");
-        assert!(!DetailField::default_order().contains(&DetailField::Stash));
+        assert!(DetailField::default_order().contains(&DetailField::Stash));
         assert_eq!(DetailField::parse("ci"), Some(DetailField::Ci));
         assert_eq!(DetailField::Ci.as_str(), "ci");
         assert!(DetailField::valid_names().contains(&"ci"));
-        assert!(!DetailField::default_order().contains(&DetailField::Ci));
+        assert!(DetailField::default_order().contains(&DetailField::Ci));
         assert_eq!(DetailField::parse("issue"), Some(DetailField::Issue));
         assert_eq!(DetailField::parse(" Issue "), Some(DetailField::Issue));
         assert_eq!(DetailField::Issue.as_str(), "issue");
         assert_eq!(DetailField::valid_names().last(), Some(&"issue"));
-        assert!(!DetailField::default_order().contains(&DetailField::Issue));
+        assert!(DetailField::default_order().contains(&DetailField::Issue));
     }
 
     #[test]
@@ -706,5 +732,103 @@ mod tests {
         let cfg: UiConfig = toml::from_str("fullscreen_keep_masthead = false").unwrap();
         assert!(!cfg.fullscreen_keep_masthead);
         assert!(cfg.fullscreen_keep_statusbar);
+    }
+
+    /// The owner-chosen default (b139): every field but `stage` and
+    /// `activity`, in this exact order. Every entry must be a valid spelling.
+    #[test]
+    fn detail_default_order_is_the_nineteen_field_list() {
+        let names: Vec<&str> = DetailField::default_order()
+            .into_iter()
+            .map(DetailField::as_str)
+            .collect();
+        assert_eq!(
+            names,
+            [
+                "branch",
+                "commits",
+                "dirty",
+                "branch_stat",
+                "pr",
+                "ci",
+                "issue",
+                "author",
+                "stash",
+                "subject",
+                "age",
+                "upstream",
+                "env",
+                "sandbox",
+                "devcontainer",
+                "hibernated",
+                "mq",
+                "unread",
+                "disk",
+            ]
+        );
+        for name in &names {
+            assert!(DetailField::valid_names().contains(name), "{name}");
+        }
+        let opt_in: Vec<&str> = DetailField::valid_names()
+            .into_iter()
+            .filter(|n| !names.contains(n))
+            .collect();
+        assert_eq!(opt_in, ["stage", "activity"]);
+        assert_eq!(
+            UiConfig::default().sidebar_detail_fields,
+            names.iter().map(|n| n.to_string()).collect::<Vec<_>>()
+        );
+        // An explicit empty list still means "no fields".
+        let cfg: UiConfig = toml::from_str("sidebar_detail_fields = []").unwrap();
+        assert!(cfg.detail_fields_resolved().is_empty());
+    }
+
+    #[test]
+    fn external_worktree_keys_default_and_parse() {
+        let cfg = UiConfig::default();
+        assert_eq!(cfg.sidebar_external_worktrees, ExternalWorktrees::Group);
+        assert_eq!(cfg.sidebar_other_group_label, "Other");
+        assert!(cfg.sidebar_other_group_collapsed);
+        assert_eq!(cfg.sidebar_group_row_limit, 15);
+        assert!(cfg.sidebar_group_row_limits.is_empty());
+        // Defaults survive an empty table.
+        let cfg: UiConfig = toml::from_str("").unwrap();
+        assert_eq!(cfg.sidebar_external_worktrees, ExternalWorktrees::Group);
+        assert_eq!(cfg.sidebar_group_row_limit, 15);
+        for (raw, want) in [
+            ("show", ExternalWorktrees::Show),
+            ("group", ExternalWorktrees::Group),
+            ("hide", ExternalWorktrees::Hide),
+        ] {
+            assert_eq!(ExternalWorktrees::from_str_validated(raw).unwrap(), want);
+        }
+        assert!(ExternalWorktrees::from_str_validated("bogus").is_err());
+        let pretty = r#"
+sidebar_external_worktrees = "hide"
+sidebar_other_group_label = "Elsewhere"
+sidebar_other_group_collapsed = false
+sidebar_group_row_limit = 0
+
+[sidebar_group_row_limits]
+Other = 5
+"agents wip" = 0
+"#;
+        let minified = r#"sidebar_external_worktrees="hide"
+sidebar_other_group_label="Elsewhere"
+sidebar_other_group_collapsed=false
+sidebar_group_row_limit=0
+sidebar_group_row_limits={Other=5,"agents wip"=0}"#;
+        for src in [pretty, minified] {
+            let cfg: UiConfig = toml::from_str(src).unwrap();
+            assert_eq!(cfg.sidebar_external_worktrees, ExternalWorktrees::Hide);
+            assert_eq!(cfg.sidebar_other_group_label, "Elsewhere");
+            assert!(!cfg.sidebar_other_group_collapsed);
+            assert_eq!(cfg.sidebar_group_row_limit, 0);
+            assert_eq!(cfg.sidebar_group_row_limits.get("Other"), Some(&5));
+            assert_eq!(cfg.sidebar_group_row_limits.get("agents wip"), Some(&0));
+        }
+        // Unknown enum value degrades to the default with a warning.
+        let cfg: UiConfig = toml::from_str("sidebar_external_worktrees = \"zzz\"").unwrap();
+        assert_eq!(cfg.sidebar_external_worktrees, ExternalWorktrees::Group);
     }
 }
