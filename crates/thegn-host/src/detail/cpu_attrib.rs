@@ -43,10 +43,6 @@ fn sort_for(title: &str) -> Option<SortKey> {
 
 /// Whether `slot` holds the `cpu` or `mem` popup (the loop's
 /// sample-while-open gate).
-#[allow(
-    dead_code,
-    reason = "the loop's stats-publication gate (b140 lane 3 phase 2, run.rs)"
-)]
 pub(crate) fn is_open(slot: &Option<DetailOverlay>) -> bool {
     slot.as_ref()
         .is_some_and(|ov| sort_for(&ov.title).is_some())
@@ -205,10 +201,6 @@ pub(crate) fn sections_for(model: &FrameModel, title: &str) -> Option<Vec<Sectio
 /// `status_modal::refresh_open`: called from a drain that already happens (a
 /// fresh process publication), never from a timer. Returns `true` when it
 /// repainted.
-#[allow(
-    dead_code,
-    reason = "called on each process publication by the loop (b140 lane 3 phase 2, run.rs)"
-)]
 pub(crate) fn refresh_open(
     slot: &mut Option<DetailOverlay>,
     model: &FrameModel,
