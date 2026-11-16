@@ -402,7 +402,8 @@ pub(crate) fn provision_worktree_on_host(
                 StepKind::Checkpoint
                 | StepKind::HomeClosurePush(_)
                 | StepKind::LocalParity { .. }
-                | StepKind::SnapshotRestore { .. } => {
+                | StepKind::SnapshotRestore { .. }
+                | StepKind::BundleSeed { .. } => {
                     tracing::debug!(target: "thegn::host", step = %step.id, "skipped (provider-only)");
                     Ok(())
                 }
