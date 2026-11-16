@@ -238,6 +238,37 @@ fn observe_rows_cheap_in(
         .collect()
 }
 
+/// Where [`observe_rows`] reads one row's branch from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RowSource {
+    /// The host checkout at `row.worktree`.
+    Local,
+    /// Through the row's ssh / provider location.
+    Remote,
+}
+
+/// A provider row whose host path is an existing git checkout is read locally:
+/// for provider worktrees the local checkout is the branch's source of truth
+/// (the sandbox is a mirror; pull-back writes the local branch), and a remote
+/// read needs the vendor CLI (D14). Ssh rows, and provider rows with no local
+/// checkout, keep the remote read.
+fn row_source(row: &WorktreeRow, loc: &thegn_core::remote::GitLoc) -> RowSource {
+    match loc {
+        thegn_core::remote::GitLoc::Local(_) => RowSource::Local,
+        thegn_core::remote::GitLoc::Provider { .. } if has_local_checkout(&row.worktree) => {
+            RowSource::Local
+        }
+        thegn_core::remote::GitLoc::Provider { .. } | thegn_core::remote::GitLoc::Remote { .. } => {
+            RowSource::Remote
+        }
+    }
+}
+
+/// `path/.git` exists (a linked worktree's file or a clone's directory).
+fn has_local_checkout(path: &str) -> bool {
+    !path.is_empty() && Path::new(path).join(".git").exists()
+}
+
 /// Take one Git worktree-list snapshot per local repository and read remote
 /// rows per `remote`. For explicit commands / control calls, never the
 /// hydration tick (see [`observe_rows_cheap`]).
@@ -248,17 +279,56 @@ pub(crate) fn observe_rows(
 ) -> HashMap<String, BranchObservation> {
     let mut observations = HashMap::new();
     let mut local_by_root: HashMap<String, Vec<WorktreeRow>> = HashMap::new();
+    // Provider rows read from their host checkout; a checkout the repository's
+    // worktree list does not name (a standalone clone) is read directly.
+    let mut provider_local: Vec<String> = Vec::new();
     for row in rows {
         let loc = thegn_core::remote::GitLoc::from_db(&row.worktree, Some(&row.location));
-        if loc.is_remote() {
-            observations.insert(row.worktree.clone(), remote_observation(git, &loc, remote));
-        } else {
-            local_by_root
-                .entry(row.repo_root.clone())
-                .or_default()
-                .push(row.clone());
+        match row_source(row, &loc) {
+            RowSource::Remote => {
+                observations.insert(row.worktree.clone(), remote_observation(git, &loc, remote));
+            }
+            RowSource::Local => {
+                if loc.is_remote() {
+                    provider_local.push(row.worktree.clone());
+                }
+                local_by_root
+                    .entry(row.repo_root.clone())
+                    .or_default()
+                    .push(row.clone());
+            }
         }
     }
+    let observations = observe_local_roots(git, local_by_root, observations);
+    reread_provider_checkouts(git, &provider_local, observations)
+}
+
+/// Read each provider row's host checkout directly where the snapshot join
+/// left it unavailable.
+fn reread_provider_checkouts(
+    git: &(impl GitBackend + ?Sized),
+    provider_local: &[String],
+    mut observations: HashMap<String, BranchObservation>,
+) -> HashMap<String, BranchObservation> {
+    for worktree in provider_local {
+        if observations.get(worktree) == Some(&BranchObservation::Unavailable) {
+            let loc = thegn_core::remote::GitLoc::Local(PathBuf::from(worktree));
+            let observed = git
+                .current_branch(&loc)
+                .ok()
+                .map(|branch| from_branch_name(&branch))
+                .unwrap_or(BranchObservation::Unavailable);
+            observations.insert(worktree.clone(), observed);
+        }
+    }
+    observations
+}
+
+fn observe_local_roots(
+    git: &(impl GitBackend + ?Sized),
+    local_by_root: HashMap<String, Vec<WorktreeRow>>,
+    mut observations: HashMap<String, BranchObservation>,
+) -> HashMap<String, BranchObservation> {
     for (root, repo_rows) in local_by_root {
         if root.is_empty() {
             observations.extend(
@@ -477,6 +547,108 @@ mod tests {
         memo.clear();
         observe_rows_cheap_in(&memo, ttl, &rows, |_| None, &*gix, read);
         assert_eq!(reads.get(), 3);
+    }
+
+    fn provider_location() -> String {
+        thegn_core::remote::GitLoc::provider_db_string(
+            &["fly".into(), "ssh".into(), "--".into()],
+            "/workspace",
+        )
+    }
+
+    // Blocking git in a throwaway repo: the sanctioned off-loop test case.
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "test fixture: blocking git in a temp repo, never on the event loop"
+    )]
+    fn init_checkout(dir: &Path, branch: &str) {
+        let git = |args: &[&str]| {
+            let status = thegn_core::util::git_cmd(dir).args(args).status().unwrap();
+            assert!(status.success(), "git {:?} failed", args);
+        };
+        git(&["init", "-q", "-b", branch]);
+        git(&["config", "user.name", "Test"]);
+        git(&["config", "user.email", "test@example.invalid"]);
+        std::fs::write(dir.join("file"), "initial\n").unwrap();
+        git(&["add", "file"]);
+        git(&[
+            "-c",
+            "commit.gpgsign=false",
+            "commit",
+            "-q",
+            "-m",
+            "initial",
+        ]);
+    }
+
+    #[test]
+    fn provider_row_with_a_local_checkout_is_observed_locally() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let checkout = temp.path().join("wt");
+        std::fs::create_dir_all(&checkout).unwrap();
+        init_checkout(&checkout, "lane/feature");
+        let path = checkout.to_str().unwrap();
+        let mut provider = row(path, "registry");
+        provider.repo_root = path.into();
+        provider.location = provider_location();
+        let loc = thegn_core::remote::GitLoc::from_db(path, Some(&provider.location));
+        assert!(
+            loc.is_remote(),
+            "the fixture must carry a provider location"
+        );
+        assert_eq!(row_source(&provider, &loc), RowSource::Local);
+        let observed = observe_rows(
+            &thegn_svc::git::CliGit,
+            std::slice::from_ref(&provider),
+            RemoteRead::Live,
+        );
+        assert_eq!(
+            observed[path],
+            BranchObservation::Branch("lane/feature".into())
+        );
+        // A repo root whose worktree list does not name the checkout still
+        // reads the branch from the checkout itself.
+        provider.repo_root = "/definitely/not/a/repo".into();
+        let observed = observe_rows(
+            &thegn_svc::git::CliGit,
+            std::slice::from_ref(&provider),
+            RemoteRead::Live,
+        );
+        assert_eq!(
+            observed[path],
+            BranchObservation::Branch("lane/feature".into())
+        );
+    }
+
+    #[test]
+    fn provider_row_without_a_local_checkout_stays_remote() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let path = temp.path().join("not-a-checkout");
+        std::fs::create_dir_all(&path).unwrap();
+        let path = path.to_str().unwrap();
+        let mut provider = row(path, "registry");
+        provider.location = provider_location();
+        let loc = thegn_core::remote::GitLoc::from_db(path, Some(&provider.location));
+        assert_eq!(row_source(&provider, &loc), RowSource::Remote);
+        let mut missing = row("/definitely/not/on/disk", "registry");
+        missing.location = provider_location();
+        let loc = thegn_core::remote::GitLoc::from_db(&missing.worktree, Some(&missing.location));
+        assert_eq!(row_source(&missing, &loc), RowSource::Remote);
+    }
+
+    #[test]
+    fn ssh_row_stays_remote_even_with_a_local_checkout() {
+        let temp = tempfile::TempDir::new().unwrap();
+        std::fs::create_dir_all(temp.path().join(".git")).unwrap();
+        let path = temp.path().to_str().unwrap();
+        let mut ssh = row(path, "registry");
+        ssh.location =
+            thegn_core::remote::GitLoc::remote_db_string("nonexistent.invalid", 22, false, path);
+        let loc = thegn_core::remote::GitLoc::from_db(path, Some(&ssh.location));
+        assert_eq!(row_source(&ssh, &loc), RowSource::Remote);
+        let local = row(path, "registry");
+        let loc = thegn_core::remote::GitLoc::from_db(path, Some(&local.location));
+        assert_eq!(row_source(&local, &loc), RowSource::Local);
     }
 
     #[test]
