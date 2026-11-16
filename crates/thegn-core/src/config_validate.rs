@@ -385,8 +385,44 @@ pub fn validate_diagnostics_with_policy(
                     message,
                 }),
         );
+        diagnostics.extend(sandbox_git_warnings(&cfg).into_iter().map(|message| {
+            ValidationDiagnostic {
+                severity: ValidationSeverity::Warning,
+                message,
+            }
+        }));
     }
     diagnostics
+}
+
+/// THE-2021: `[sandbox.git]` policy warnings for the global table and every
+/// `[profiles.<n>.sandbox.git]` / `[env.<n>.sandbox.git]` overlay (each
+/// validated as merged onto the global table, labelled with its layer). An
+/// overlay repeats only warnings the global table does not already raise.
+fn sandbox_git_warnings(cfg: &Config) -> Vec<String> {
+    use crate::config_sandbox::git_policy::validate;
+    let global = validate(&cfg.sandbox.git);
+    let mut layers = Vec::new();
+    for (name, profile) in &cfg.profiles {
+        if let Some(git) = &profile.sandbox.git {
+            layers.push((format!("profiles.{name}."), cfg.sandbox.git.merged(git)));
+        }
+    }
+    for (name, env) in &cfg.env {
+        if let Some(git) = &env.sandbox.git {
+            layers.push((format!("env.{name}."), cfg.sandbox.git.merged(git)));
+        }
+    }
+    let mut out = global.clone();
+    for (prefix, git) in layers {
+        out.extend(
+            validate(&git)
+                .into_iter()
+                .filter(|message| !global.contains(message))
+                .map(|message| format!("{prefix}{message}")),
+        );
+    }
+    out
 }
 
 /// THE-2009: warn on sandbox mounts that expose `$XDG_RUNTIME_DIR` or make
@@ -2396,6 +2432,34 @@ template = "image:registry.example/dev:1"
             .filter(|d| d.severity == ValidationSeverity::Warning && d.message.contains(path))
             .map(|d| d.message)
             .collect()
+    }
+
+    #[test]
+    fn sandbox_git_policy_warnings_cover_global_and_env_overlays() {
+        let body = "[sandbox.git]\npush_refs = [\"refs/heads/m*\"]\n\n[env.box.sandbox.git]\ndeny_refs = [\"heads/main\"]\n";
+        let warnings = float_warnings_in(body, "sandbox.git.");
+        assert!(
+            warnings
+                .iter()
+                .any(|w| w.starts_with("sandbox.git.push_refs:")),
+            "{warnings:?}"
+        );
+        assert!(
+            warnings
+                .iter()
+                .any(|w| w.starts_with("env.box.sandbox.git.deny_refs:")),
+            "{warnings:?}"
+        );
+        // The overlay does not repeat the global table's own warning.
+        assert!(
+            !warnings
+                .iter()
+                .any(|w| w.starts_with("env.box.sandbox.git.push_refs:")),
+            "{warnings:?}"
+        );
+        assert!(
+            float_warnings_in("[sandbox.git]\nmode = \"commit-only\"\n", "sandbox.git.").is_empty()
+        );
     }
 
     #[test]
