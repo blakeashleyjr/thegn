@@ -343,7 +343,7 @@ mod tests {
     fn unknown_runtime_dir_falls_back_to_run_user_uid() {
         assert_eq!(warn("/run/user", None).len(), 1);
         assert_eq!(warn("/run/user/1000", None).len(), 1);
-        assert_eq!(warn("/", None).len(), 1);
+        assert_eq!(warn("/:ro", None).len(), 1);
         assert!(warn("/run/user/1000/gnupg", None).is_empty());
         assert!(warn("/run/user/abc", None).is_empty());
         assert!(warn("/srv", None).is_empty());

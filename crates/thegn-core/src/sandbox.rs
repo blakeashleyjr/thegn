@@ -3854,37 +3854,55 @@ fn backend_enter_argv_guarded_with_env(
                 // THE-2009: a bind exposing $XDG_RUNTIME_DIR also exposes the
                 // user bus, podman/docker and the systemd user manager, each a
                 // way to run code outside bwrap. Mask them after every bind.
-                if let Some(runtime_dir) = env.runtime_dir.as_deref()
-                    && runtime_dir != std::path::Path::new("/run/user")
-                    && crate::sandbox_runtime_escape::mounts_expose(runtime_dir, &mount_refs)
+                if let Some(raw_runtime_dir) = env.runtime_dir.as_deref()
+                    && raw_runtime_dir != std::path::Path::new("/run/user")
                 {
-                    let escapes =
-                        crate::sandbox_runtime_escape::host_escape_paths(runtime_dir, &|path| {
-                            crate::sandbox_runtime_escape::kind_from_metadata(
-                                std::fs::symlink_metadata(path).ok().as_ref(),
-                            )
-                        });
-                    let mut explicit_dests: Vec<&std::path::Path> = spec
-                        .mounts
+                    // Real paths, like the control guard: a symlinked or `..` mount source
+                    // (`/var/run` -> `/run`) exposes the runtime dir too.
+                    let runtime_dir = std::fs::canonicalize(raw_runtime_dir)
+                        .unwrap_or_else(|_| raw_runtime_dir.to_path_buf());
+                    let canonical_hosts: Vec<std::path::PathBuf> = mount_refs
                         .iter()
-                        .map(|mount| std::path::Path::new(&mount.dest))
+                        .map(|(host, _)| {
+                            std::fs::canonicalize(host).unwrap_or_else(|_| host.to_path_buf())
+                        })
                         .collect();
-                    explicit_dests.push(&spec.worktree);
-                    for mask in crate::sandbox_runtime_escape::plan_escape_masks(
-                        &escapes,
-                        &mount_refs,
-                        &explicit_dests,
-                    ) {
-                        match mask {
-                            crate::sandbox_runtime_escape::EscapeMask::Tmpfs(dest) => {
-                                v.extend(["--tmpfs".into(), dest.display().to_string()]);
-                            }
-                            crate::sandbox_runtime_escape::EscapeMask::NullBind(dest) => {
-                                v.extend([
-                                    "--ro-bind".into(),
-                                    "/dev/null".into(),
-                                    dest.display().to_string(),
-                                ]);
+                    let canonical_refs: Vec<(&std::path::Path, &std::path::Path)> = canonical_hosts
+                        .iter()
+                        .zip(&mount_refs)
+                        .map(|(host, (_, dest))| (host.as_path(), *dest))
+                        .collect();
+                    if crate::sandbox_runtime_escape::mounts_expose(&runtime_dir, &canonical_refs) {
+                        let escapes = crate::sandbox_runtime_escape::host_escape_paths(
+                            &runtime_dir,
+                            &|path| {
+                                crate::sandbox_runtime_escape::kind_from_metadata(
+                                    std::fs::symlink_metadata(path).ok().as_ref(),
+                                )
+                            },
+                        );
+                        let mut explicit_dests: Vec<&std::path::Path> = spec
+                            .mounts
+                            .iter()
+                            .map(|mount| std::path::Path::new(&mount.dest))
+                            .collect();
+                        explicit_dests.push(&spec.worktree);
+                        for mask in crate::sandbox_runtime_escape::plan_escape_masks(
+                            &escapes,
+                            &canonical_refs,
+                            &explicit_dests,
+                        ) {
+                            match mask {
+                                crate::sandbox_runtime_escape::EscapeMask::Tmpfs(dest) => {
+                                    v.extend(["--tmpfs".into(), dest.display().to_string()]);
+                                }
+                                crate::sandbox_runtime_escape::EscapeMask::NullBind(dest) => {
+                                    v.extend([
+                                        "--ro-bind".into(),
+                                        "/dev/null".into(),
+                                        dest.display().to_string(),
+                                    ]);
+                                }
                             }
                         }
                     }
@@ -3893,18 +3911,19 @@ fn backend_enter_argv_guarded_with_env(
                 // THE-2011: the daemon exports its control socket into every
                 // session, but the control dir is masked above, so the variable
                 // would dangle. Unset it (in-sandbox control is unsupported).
-                let launcher_socket = std::env::var_os("THEGN_CONTROL_SOCKET");
-                unset_control_socket = spec
-                    .env
-                    .iter()
-                    .filter(|(key, _)| key == "THEGN_CONTROL_SOCKET")
-                    .map(|(_, value)| std::path::Path::new(value.as_str()))
-                    .chain(launcher_socket.as_deref().map(std::path::Path::new))
-                    .any(|socket| {
-                        env.control_dirs
-                            .iter()
-                            .any(|control_dir| socket.starts_with(control_dir))
-                    });
+                // The daemon injects THEGN_CONTROL_SOCKET at spawn, after this argv is
+                // built, and its socket always lives in a control dir. Unset it unless an
+                // explicit spec.env value points outside every control dir.
+                unset_control_socket = !env.control_dirs.is_empty()
+                    && spec
+                        .env
+                        .iter()
+                        .filter(|(key, _)| key == "THEGN_CONTROL_SOCKET")
+                        .all(|(_, value)| {
+                            env.control_dirs.iter().any(|control_dir| {
+                                std::path::Path::new(value).starts_with(control_dir)
+                            })
+                        });
             }
             v.push("--unshare-pid".into());
             // `--die-with-parent` kills the sandbox (bwrap is PID 1 of the
