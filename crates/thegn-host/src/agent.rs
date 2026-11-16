@@ -259,12 +259,31 @@ impl std::fmt::Display for SandboxHalt {
                 self.env_name, self.placement, self.reason, fix
             );
         }
-        let allow = if self.ask {
-            "choose \"run on host\", set `backend = \"none\"`, disable sandboxing, or set `isolation_floor = \"off\"`; otherwise install/start a container runtime (`thegn doctor` shows which)"
+        use crate::env_halt::{HaltClass, classify_halt, remedy_text};
+        let class = classify_halt(&self.placement, &self.reason);
+        if class != HaltClass::LocalRuntime && !self.ask {
+            return write!(
+                f,
+                "environment '{}' ({}) could not be brought up: {} — thegn will not \
+                 silently fall back to the host. Fix the env, retry, or {}.",
+                self.env_name,
+                self.placement,
+                self.reason,
+                remedy_text(class, &self.env_name)
+            );
+        }
+        let allow = if class != HaltClass::LocalRuntime {
+            format!(
+                "choose \"run on host\", set `backend = \"none\"`, disable sandboxing, or set `isolation_floor = \"off\"`; otherwise {}",
+                remedy_text(class, &self.env_name)
+            )
+        } else if self.ask {
+            "choose \"run on host\", set `backend = \"none\"`, disable sandboxing, or set `isolation_floor = \"off\"`; otherwise install/start a container runtime (`thegn doctor` shows which)".to_string()
         } else {
             "explicitly select host execution (`backend = \"none\"`, disable sandboxing, \
              set `isolation_floor = \"off\"`, or choose \"run on host\"), \
              or install/start a container runtime (`thegn doctor` shows which)"
+                .to_string()
         };
         write!(
             f,
@@ -610,8 +629,9 @@ pub fn prepare_sandbox_env_with_selection(
             return Err(SandboxHalt {
                 env_name: env_name.clone(),
                 placement: format!("env {env_name}"),
-                reason: format!(
-                    "env '{env_name}' is not defined ([env.{env_name}] missing); its selection was dropped"
+                reason: crate::env_halt::unresolved_env_reason(
+                    &env_name,
+                    crate::env_halt::remote_features_clamped(),
                 ),
                 ask,
                 dormant: None,
