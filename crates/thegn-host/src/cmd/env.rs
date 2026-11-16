@@ -160,6 +160,13 @@ pub enum Action {
     Rm { name: String },
     /// Verify a provider env's token works by making a cheap `list()` API call.
     Test { name: String },
+    /// Fetch commits made inside a provider sandbox back into the worktree's
+    /// branch (fast-forward only). A diverged or locally-dirty result is kept in
+    /// `refs/thegn/pull/<worktree>` for you to merge.
+    Pull {
+        #[command(flatten)]
+        target: super::target::WorktreeTarget,
+    },
 }
 
 pub fn run(cfg: &Config, action: Action) -> Result<()> {
@@ -218,6 +225,7 @@ pub fn run(cfg: &Config, action: Action) -> Result<()> {
         }),
         Action::Rm { name } => remove(&name),
         Action::Test { name } => test(cfg, &name),
+        Action::Pull { target } => pull(cfg, target.get()),
     }
 }
 
@@ -903,6 +911,31 @@ fn forward(cfg: &Config, worktree: Option<String>, spec: &str) -> Result<()> {
         anyhow::bail!("port-forward exited with {status}");
     }
     Ok(())
+}
+
+/// Fetch the commits made inside the worktree's provider sandbox back into its
+/// branch (fast-forward only; see [`crate::provider_git::pull_back`]).
+fn pull(cfg: &Config, worktree: Option<String>) -> Result<()> {
+    let wt = super::resolve_worktree(worktree)
+        .to_string_lossy()
+        .into_owned();
+    let env = resolve_for(cfg, Some(wt.clone()))?;
+    match &env.placement {
+        thegn_core::placement::Placement::Local => {
+            outln!("nothing to pull: {} runs on this machine", env.name);
+            Ok(())
+        }
+        thegn_core::placement::Placement::Provider(_) => {
+            let report = crate::provider_git::pull_back(cfg, &wt, &env.name)?;
+            outln!("{}", report.summary());
+            Ok(())
+        }
+        other => anyhow::bail!(
+            "env pull works on provider sandboxes; {} is {}",
+            env.name,
+            other.label()
+        ),
+    }
 }
 
 /// Resolve the [`Environment`](thegn_core::env::Environment) for a worktree
