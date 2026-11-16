@@ -168,13 +168,103 @@ pub fn rotate(cfg: &Config, account: Option<&str>, dry_run: bool) -> Result<Rota
                 .and_then(|name| name.to_str())
                 .unwrap_or("managed key")
         );
-        rotate_scope(cfg, key_path, records)?;
+        rotate_scope(&ProviderRemote { cfg, key_path }, key_path, records)?;
     }
     Ok(RotationSummary {
         scopes: scopes.len(),
         instances,
         dry_run: false,
     })
+}
+
+/// Remote and key-generation side effects of one scope's rotation. Production
+/// resolves a provider per custody row; tests drive the whole transaction,
+/// including interruption and resume, against local stand-in machines.
+trait RotationRemote {
+    type Transport;
+
+    /// Resolve credentials and build a transport authenticating with `key`.
+    /// `label` names the transport in the unavailable-provider error.
+    fn connect(
+        &self,
+        record: &AuthorizedKeyRecord,
+        key: &Path,
+        public: &str,
+        label: &str,
+    ) -> Result<Self::Transport>;
+
+    /// Run `script` on the row's instance, failing on a non-zero exit.
+    fn run(
+        &self,
+        transport: &Self::Transport,
+        record: &AuthorizedKeyRecord,
+        script: &str,
+        operation: &str,
+    ) -> Result<()>;
+
+    /// Prove an actual remote command authenticates with the replacement key.
+    fn verify(&self, record: &AuthorizedKeyRecord, key: &Path, public: &str) -> Result<()>;
+
+    fn generate_keypair(&self, key: &Path) -> Result<()>;
+
+    /// Called after every durable rotation or recovery step. Production does
+    /// nothing; fault-injection tests stop the process here.
+    fn phase(&self, _name: &'static str) {}
+}
+
+struct ProviderRemote<'a> {
+    cfg: &'a Config,
+    /// Scope key that selects the configured provider account for each row.
+    key_path: &'a Path,
+}
+
+impl RotationRemote for ProviderRemote<'_> {
+    type Transport = thegn_svc::provider::Provider;
+
+    fn connect(
+        &self,
+        record: &AuthorizedKeyRecord,
+        key: &Path,
+        public: &str,
+        label: &str,
+    ) -> Result<Self::Transport> {
+        let pc = provider_config(self.cfg, record, self.key_path)?;
+        crate::provider_factory::provider_for_named_with_key(
+            pc,
+            &record.instance,
+            Some((key.to_path_buf(), public.trim().to_string())),
+        )
+        .ok_or_else(|| anyhow!("{} {label} is unavailable", record.provider))
+    }
+
+    fn run(
+        &self,
+        transport: &Self::Transport,
+        record: &AuthorizedKeyRecord,
+        script: &str,
+        operation: &str,
+    ) -> Result<()> {
+        run_checked(transport, &record.instance, script, operation)
+    }
+
+    fn verify(&self, record: &AuthorizedKeyRecord, key: &Path, public: &str) -> Result<()> {
+        if record.provider == "sprites" {
+            provider_config(self.cfg, record, self.key_path)?;
+            run_sprite_checked(record, key, "true", "verify replacement key")
+        } else {
+            let replacement = self.connect(record, key, public, "replacement-key provider")?;
+            run_checked(
+                &replacement,
+                &record.instance,
+                "true",
+                "verify replacement key",
+            )
+        }
+    }
+
+    fn generate_keypair(&self, key: &Path) -> Result<()> {
+        crate::agent::generate_managed_keypair_at(key, "thegn-managed-rotation")
+    }
 }
 
 fn sort_scope_rows(records: &mut [AuthorizedKeyRecord]) {
@@ -187,12 +277,16 @@ fn sort_scope_rows(records: &mut [AuthorizedKeyRecord]) {
     });
 }
 
-fn rotate_scope(cfg: &Config, key_path: &Path, records: &[AuthorizedKeyRecord]) -> Result<()> {
+fn rotate_scope<R: RotationRemote>(
+    remote: &R,
+    key_path: &Path,
+    records: &[AuthorizedKeyRecord],
+) -> Result<()> {
     let mut tracked = records.to_vec();
     let resumed_recovery = tracked
         .iter()
         .any(|record| record.rotation_recovery.is_some());
-    recover_pending(cfg, key_path, &mut tracked).with_context(|| {
+    recover_pending(remote, key_path, &mut tracked).with_context(|| {
         format!(
             "recover an interrupted managed SSH rotation for {}",
             key_path.display()
@@ -224,7 +318,7 @@ fn rotate_scope(cfg: &Config, key_path: &Path, records: &[AuthorizedKeyRecord]) 
     let old_key_id = key_id(&old_public)?;
     let staging = rotation_sibling(key_path, "next");
     let backup = rotation_sibling(key_path, "retiring");
-    crate::agent::generate_managed_keypair_at(&staging, "thegn-managed-rotation")?;
+    remote.generate_keypair(&staging)?;
     let staging_public_path = public_path(&staging);
     let new_public = std::fs::read_to_string(&staging_public_path).with_context(|| {
         format!(
@@ -253,31 +347,27 @@ fn rotate_scope(cfg: &Config, key_path: &Path, records: &[AuthorizedKeyRecord]) 
             &staging,
         ));
     }
+    remote.phase("plan-recorded");
 
     // Phase 1: old-key transport authorizes the replacement, then a separately
     // constructed provider proves an actual command with the replacement key.
     for index in 0..tracked.len() {
         let phase = (|| -> Result<()> {
             let record = &tracked[index];
-            let pc = provider_config(cfg, record, key_path)?;
-            let old = crate::provider_factory::provider_for_named_with_key(
-                pc,
-                &record.instance,
-                Some((key_path.to_path_buf(), old_public.trim().to_string())),
-            )
-            .ok_or_else(|| anyhow!("{} provider is unavailable", record.provider))?;
-            run_checked(
+            let old = remote.connect(record, key_path, &old_public, "provider")?;
+            remote.run(
                 &old,
-                &record.instance,
+                record,
                 &authorize_script(&new_public, &new_key_id)?,
                 "authorize replacement key",
             )?;
             Ok(())
         })();
         if let Err(error) = phase {
-            let cleanup = recover_pending(cfg, key_path, &mut tracked);
+            let cleanup = recover_pending(remote, key_path, &mut tracked);
             return Err(combine_recovery_error(error, cleanup, &staging));
         }
+        remote.phase("replacement-authorized");
         let mut recovery = tracked[index]
             .rotation_recovery
             .clone()
@@ -287,43 +377,20 @@ fn rotate_scope(cfg: &Config, key_path: &Path, records: &[AuthorizedKeyRecord]) 
             if error.downcast_ref::<CustodyChanged>().is_some() {
                 return Err(error.context("record replacement authorization"));
             }
-            let cleanup = recover_pending(cfg, key_path, &mut tracked);
+            let cleanup = recover_pending(remote, key_path, &mut tracked);
             return Err(combine_recovery_error(
                 error.context("record replacement authorization"),
                 cleanup,
                 &staging,
             ));
         }
+        remote.phase("authorization-recorded");
 
-        let proof = (|| -> Result<()> {
-            let record = &tracked[index];
-            let pc = provider_config(cfg, record, key_path)?;
-            if record.provider == "sprites" {
-                run_sprite_checked(record, &staging, "true", "verify replacement key")
-            } else {
-                let replacement = crate::provider_factory::provider_for_named_with_key(
-                    pc,
-                    &record.instance,
-                    Some((staging.clone(), new_public.trim().to_string())),
-                )
-                .ok_or_else(|| {
-                    anyhow!(
-                        "{} replacement-key provider is unavailable",
-                        record.provider
-                    )
-                })?;
-                run_checked(
-                    &replacement,
-                    &record.instance,
-                    "true",
-                    "verify replacement key",
-                )
-            }
-        })();
-        if let Err(error) = proof {
-            let cleanup = recover_pending(cfg, key_path, &mut tracked);
+        if let Err(error) = remote.verify(&tracked[index], &staging, &new_public) {
+            let cleanup = recover_pending(remote, key_path, &mut tracked);
             return Err(combine_recovery_error(error, cleanup, &staging));
         }
+        remote.phase("replacement-verified");
         let mut recovery = tracked[index]
             .rotation_recovery
             .clone()
@@ -333,13 +400,14 @@ fn rotate_scope(cfg: &Config, key_path: &Path, records: &[AuthorizedKeyRecord]) 
             if error.downcast_ref::<CustodyChanged>().is_some() {
                 return Err(error.context("record replacement verification"));
             }
-            let cleanup = recover_pending(cfg, key_path, &mut tracked);
+            let cleanup = recover_pending(remote, key_path, &mut tracked);
             return Err(combine_recovery_error(
                 error.context("record replacement verification"),
                 cleanup,
                 &staging,
             ));
         }
+        remote.phase("verification-recorded");
     }
 
     // Resolve credentials and construct every canonical-path replacement
@@ -348,24 +416,18 @@ fn rotate_scope(cfg: &Config, key_path: &Path, records: &[AuthorizedKeyRecord]) 
     let canonical_providers = tracked
         .iter()
         .map(|record| {
-            let pc = provider_config(cfg, record, key_path)?;
-            crate::provider_factory::provider_for_named_with_key(
-                pc,
-                &record.instance,
-                Some((key_path.to_path_buf(), new_public.trim().to_string())),
+            remote.connect(
+                record,
+                key_path,
+                &new_public,
+                "canonical replacement-key provider",
             )
-            .ok_or_else(|| {
-                anyhow!(
-                    "{} canonical replacement-key provider is unavailable",
-                    record.provider
-                )
-            })
         })
         .collect::<Result<Vec<_>>>();
     let canonical_providers = match canonical_providers {
         Ok(providers) => providers,
         Err(error) => {
-            let cleanup = recover_pending(cfg, key_path, &mut tracked);
+            let cleanup = recover_pending(remote, key_path, &mut tracked);
             return Err(combine_recovery_error(error, cleanup, &staging));
         }
     };
@@ -383,32 +445,34 @@ fn rotate_scope(cfg: &Config, key_path: &Path, records: &[AuthorizedKeyRecord]) 
             if error.downcast_ref::<CustodyChanged>().is_some() {
                 return Err(error.context("record old-key retirement boundary"));
             }
-            let cleanup = recover_pending(cfg, key_path, &mut tracked);
+            let cleanup = recover_pending(remote, key_path, &mut tracked);
             return Err(combine_recovery_error(
                 error.context("record old-key retirement boundary"),
                 cleanup,
                 &staging,
             ));
         }
+        remote.phase("retirement-recorded");
     }
 
     // Promote locally while retaining a rollback copy of the old pair. Remote
     // de-authorization below uses providers reconstructed against the canonical
     // path, so every future caller also sees the replacement immediately.
     if let Err(error) = promote_pair(key_path, &staging, &backup) {
-        let cleanup = recover_pending(cfg, key_path, &mut tracked);
+        let cleanup = recover_pending(remote, key_path, &mut tracked);
         return Err(combine_recovery_error(
             error.context("promote replacement managed SSH key"),
             cleanup,
             &staging,
         ));
     }
+    remote.phase("pair-promoted");
 
     let mut deauthorized = 0usize;
     for (record, replacement) in tracked.iter().zip(&canonical_providers) {
-        if let Err(error) = run_checked(
+        if let Err(error) = remote.run(
             replacement,
-            &record.instance,
+            record,
             &deauthorize_script(&old_key_id)?,
             "de-authorize old key",
         ) {
@@ -416,9 +480,9 @@ fn rotate_scope(cfg: &Config, key_path: &Path, records: &[AuthorizedKeyRecord]) 
             // records: append is idempotent and this maximizes the both-keys-live
             // safety invariant before restoring the old local pair.
             let restore_errors = attempt_all(tracked.len(), |index| {
-                run_checked(
+                remote.run(
                     &canonical_providers[index],
-                    &tracked[index].instance,
+                    &tracked[index],
                     &authorize_script(&old_public, &old_key_id)?,
                     "restore old key after partial failure",
                 )
@@ -433,7 +497,7 @@ fn rotate_scope(cfg: &Config, key_path: &Path, records: &[AuthorizedKeyRecord]) 
                         staging.display()
                     ));
                 }
-                let cleanup = recover_pending(cfg, key_path, &mut tracked);
+                let cleanup = recover_pending(remote, key_path, &mut tracked);
                 return Err(combine_recovery_error(
                     error.context(
                         "managed SSH rotation stopped; the old key was restored and the replacement was rolled back",
@@ -454,6 +518,7 @@ fn rotate_scope(cfg: &Config, key_path: &Path, records: &[AuthorizedKeyRecord]) 
             );
         }
         deauthorized += 1;
+        remote.phase("old-key-removed");
     }
 
     // Mark the all-remotes-retired boundary durably before clearing individual
@@ -471,13 +536,15 @@ fn rotate_scope(cfg: &Config, key_path: &Path, records: &[AuthorizedKeyRecord]) 
             if custody_changed {
                 break;
             }
+        } else {
+            remote.phase("retirement-completion-recorded");
         }
     }
     if let Some(error) = completion_errors.into_iter().next() {
         if error.downcast_ref::<CustodyChanged>().is_some() {
             return Err(error.context("record completed remote retirement boundary"));
         }
-        let cleanup = recover_pending(cfg, key_path, &mut tracked);
+        let cleanup = recover_pending(remote, key_path, &mut tracked);
         return Err(combine_recovery_error(
             error.context("record completed remote retirement boundary"),
             cleanup,
@@ -487,6 +554,7 @@ fn rotate_scope(cfg: &Config, key_path: &Path, records: &[AuthorizedKeyRecord]) 
 
     for record in &tracked {
         thegn_core::managed_ssh::record_rotation_completed(record, key_path, &new_public)?;
+        remote.phase("custody-completed");
     }
     // Custody now reflects the working canonical key even if deleting retired
     // local material fails. Surface that cleanup failure without lying about
@@ -598,8 +666,8 @@ fn clear_unstarted_recovery(records: &mut [AuthorizedKeyRecord], staging: &Path)
 /// Finish or roll back any auxiliary key recorded by an interrupted rotation.
 /// Fingerprints determine which side of local promotion completed; no secret or
 /// public-key body is stored in the ledger.
-fn recover_pending(
-    cfg: &Config,
+fn recover_pending<R: RotationRemote>(
+    remote: &R,
     key_path: &Path,
     records: &mut [AuthorizedKeyRecord],
 ) -> Result<()> {
@@ -664,6 +732,7 @@ fn recover_pending(
             records[index].key_fingerprint = recovery.key_fingerprint.clone();
             records[index].authorized_at = thegn_core::util::now();
             records[index].rotation_recovery = None;
+            remote.phase("recovery-completed-forward");
         }
         remove_pair(&recovery.key_path)?;
         if let Some(backup) = recovery.backup_key_path.as_deref() {
@@ -725,41 +794,60 @@ fn recover_pending(
     }) {
         for &index in &pending {
             let record = &records[index];
-            let pc = provider_config(cfg, record, key_path)?;
-            let auxiliary = crate::provider_factory::provider_for_named_with_key(
-                pc,
-                &record.instance,
-                Some((
-                    auxiliary_key_path.clone(),
-                    auxiliary_public.trim().to_string(),
-                )),
-            )
-            .ok_or_else(|| anyhow!("{} recovery provider is unavailable", record.provider))?;
-            run_checked(
+            let auxiliary = remote.connect(
+                record,
+                &auxiliary_key_path,
+                &auxiliary_public,
+                "recovery provider",
+            )?;
+            let restored = remote.run(
                 &auxiliary,
-                &record.instance,
+                record,
                 &authorize_script(&primary_public, &primary_key_id)?,
                 "restore primary key during rotation recovery",
-            )?;
+            );
+            if let Err(error) = restored {
+                // An interrupted earlier recovery may already have removed the
+                // auxiliary key here after restoring the primary, so the
+                // auxiliary can no longer authenticate. That state is safe only
+                // when the primary itself proves it is still authorized.
+                let primary = remote.connect(
+                    record,
+                    &primary_key_path,
+                    &primary_public,
+                    "recovery provider",
+                )?;
+                if let Err(probe_error) = remote.run(
+                    &primary,
+                    record,
+                    &authorized_probe_script(&primary_key_id),
+                    "probe primary key during rotation recovery",
+                ) {
+                    bail!(
+                        "{error:#}; the primary key is not provably authorized either: {probe_error:#}"
+                    );
+                }
+            }
+            remote.phase("recovery-primary-restored");
         }
     }
 
     for &index in &pending {
         let record = &records[index];
         ensure_unchanged(&thegn_core::managed_ssh::dir(), record)?;
-        let pc = provider_config(cfg, record, key_path)?;
-        let primary = crate::provider_factory::provider_for_named_with_key(
-            pc,
-            &record.instance,
-            Some((primary_key_path.clone(), primary_public.trim().to_string())),
-        )
-        .ok_or_else(|| anyhow!("{} recovery provider is unavailable", record.provider))?;
-        run_checked(
+        let primary = remote.connect(
+            record,
+            &primary_key_path,
+            &primary_public,
+            "recovery provider",
+        )?;
+        remote.run(
             &primary,
-            &record.instance,
+            record,
             &deauthorize_script(&auxiliary_key_id)?,
             "remove auxiliary key during rotation recovery",
         )?;
+        remote.phase("recovery-auxiliary-removed");
     }
 
     if restore_local {
@@ -768,9 +856,11 @@ fn recover_pending(
             .as_deref()
             .expect("promoted recovery has a retiring path");
         restore_pair(key_path, &recovery.key_path, backup)?;
+        remote.phase("recovery-local-restored");
     }
     for &index in &pending {
         clear_recovery(&mut records[index])?;
+        remote.phase("recovery-cleared");
     }
     remove_pair(&recovery.key_path)?;
     if let Some(backup) = recovery.backup_key_path.as_deref() {
@@ -1196,6 +1286,10 @@ fn remove_pair(private: &Path) -> Result<()> {
     }
     Ok(())
 }
+
+#[cfg(test)]
+#[path = "managed_ssh_rotation_fault_tests.rs"]
+mod fault_tests;
 
 #[cfg(test)]
 mod tests {
