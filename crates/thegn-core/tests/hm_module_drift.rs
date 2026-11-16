@@ -1402,7 +1402,7 @@ fn hm_usage_and_tailnet_keys_are_rendered_and_rest_dispositioned() {
                 continue;
             }
             assert!(
-                rendered.contains(&path) || omissions.contains(path.as_str()),
+                path_is_rendered(&path, &rendered) || omissions.contains(path.as_str()),
                 "{path} must be rendered or dispositioned by an exact ledger row"
             );
         }
