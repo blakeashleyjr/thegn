@@ -3860,3 +3860,19 @@ fn launch_spec_full_keeps_a_local_only_config_local_on_an_unrecognised_location(
         .is_ok()
     );
 }
+
+#[test]
+fn spawn_failure_message_names_the_missing_program() {
+    let missing = std::io::Error::from(std::io::ErrorKind::NotFound);
+    let text = spawn_failure_message(
+        "provider repo provision",
+        std::ffi::OsStr::new("sprite"),
+        &missing,
+    );
+    assert!(text.contains("`sprite` not found"), "{text}");
+    assert!(text.contains("PATH"), "{text}");
+
+    let denied = std::io::Error::from(std::io::ErrorKind::PermissionDenied);
+    let text = spawn_failure_message("x", std::ffi::OsStr::new("fly"), &denied);
+    assert!(text.contains("could not run `fly`"), "{text}");
+}
