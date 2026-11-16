@@ -579,6 +579,8 @@ self: {
     media.poll_interval_secs = cfg.mediaPollIntervalSecs;
     media.players_priority = cfg.mediaPlayersPriority;
     media.volume_step = cfg.mediaVolumeStep;
+    media.mpv.socket = cfg.mediaMpvSocket;
+    media.mpd.socket = cfg.mediaMpdSocket;
     monitor = {
       system = cfg.monitorSystem;
       gpu = cfg.monitorGpu;
@@ -1656,6 +1658,18 @@ in {
       type = lib.types.nullOr (lib.types.numbers.between 0 1);
       default = null;
       description = "Volume step (0.0 through 1.0) applied by the media volume actions. Unset (null) = the binary's default.";
+    };
+
+    mediaMpvSocket = lib.mkOption {
+      type = lib.types.nullOr lib.types.str;
+      default = null;
+      description = "mpv JSON-IPC socket path (the --input-ipc-server path; absolute, ~ is not expanded). Unset (null) = the binary's default (/tmp/mpvsocket).";
+    };
+
+    mediaMpdSocket = lib.mkOption {
+      type = lib.types.nullOr lib.types.str;
+      default = null;
+      description = "MPD address: host:port or an absolute unix-socket path (~ is not expanded). Unset (null) = the binary's default (127.0.0.1:6600; $MPD_HOST/$MPD_PORT apply then).";
     };
 
     monitorProcRows = lib.mkOption {
