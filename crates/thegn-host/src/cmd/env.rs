@@ -877,6 +877,7 @@ fn down_provider(
     };
     let mut revoke = || {
         crate::remote_enqueue_auth::revoke_for_sandbox(&provider_config, id, Some(wt))
+            .map(|_| ())
             .context("route-to-host credential revocation failed; sandbox left intact")
     };
     let mut destroy = || {
