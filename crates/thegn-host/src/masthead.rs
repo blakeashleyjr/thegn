@@ -25,10 +25,33 @@ use thegn_core::theme;
 /// breadcrumb), the committed right seg run (priority-fitted stats, with the
 /// focus pill applied), and the right-cluster item spans (`id`, x-offset within
 /// the cluster, width) for hit-testing / popup anchoring.
+///
+/// `chip_spans` and `sidebar_chip` are the left cluster's clickable units, as
+/// x-offsets within the left run (offset 0 = the masthead row's first cell).
+/// A chip dropped for width has no span.
 pub(crate) struct MastheadLayout {
     pub left: Vec<Seg>,
     pub right: Vec<Seg>,
     pub right_spans: Vec<(BarItemId, usize, usize)>,
+    /// `(app tab index, x offset, width)` for each placed app chip; the width
+    /// covers the pill only, not its trailing gap space.
+    #[cfg_attr(
+        not(test),
+        allow(
+            dead_code,
+            reason = "read by the hit-test fns b139 lane 10 phase 2 wires"
+        )
+    )]
+    pub chip_spans: Vec<(usize, usize, usize)>,
+    /// `(x offset, width)` of the hidden-sidebar chip, when shown.
+    #[cfg_attr(
+        not(test),
+        allow(
+            dead_code,
+            reason = "read by the hit-test fns b139 lane 10 phase 2 wires"
+        )
+    )]
+    pub sidebar_chip: Option<(usize, usize)>,
 }
 
 /// The brand logo segs for the current width's rung: `þ thegn v0.0.0` (full),
@@ -48,9 +71,38 @@ fn brand_segs(model: &FrameModel, brand_cols: usize) -> Vec<Seg> {
     v
 }
 
+/// The faint button pill behind an inactive app chip (and the hidden-sidebar
+/// chip): the dim text hue at ~10% over the panel, so a quiet chip still reads
+/// as something to click without competing with the active chip's focus pill.
+fn quiet_pill() -> ColorAttribute {
+    let dim = chrome::with_palette(|p| chrome::slot_rgb(p, S::Dim).to_string());
+    chrome::theme_color(&theme::blend_over(&dim, &chrome::panel_rgb(), 0.10))
+}
+
+/// The hidden-sidebar chip: present only when the sidebar is `Hidden`, so the
+/// masthead says where the sidebar went. The mode glyph alone on narrow rungs;
+/// glyph + "sidebar hidden" on the wide rung. Carries a trailing gap space like
+/// the app chips.
+fn sidebar_chip_unit(model: &FrameModel, wide: bool) -> Option<Vec<Seg>> {
+    if model.sidebar_mode != crate::layout::SidebarMode::Hidden {
+        return None;
+    }
+    let glyph = crate::caps::active_glyphs().sidebar_mode_hidden;
+    let text = if wide {
+        format!(" {glyph} sidebar hidden ")
+    } else {
+        format!(" {glyph} ")
+    };
+    Some(vec![
+        seg(Tok::Slot(S::Dim), text).bg(Tok::Attr(quiet_pill())),
+        seg(Tok::Slot(S::Text), " "),
+    ])
+}
+
 /// The app-tab chips as `(is_active, segs)` units in tab order. The active chip
 /// reads as a focus-tinted pill (matching the stats focus selection); the rest
-/// are quiet. Each unit carries a trailing gap space so chips don't butt.
+/// sit on a faint pill so they read as buttons. Each unit carries a trailing
+/// gap space so chips don't butt.
 fn app_chip_units(model: &FrameModel) -> Vec<(bool, Vec<Seg>)> {
     if model.app_tabs.is_empty() {
         return Vec::new();
@@ -60,6 +112,7 @@ fn app_chip_units(model: &FrameModel) -> Vec<(bool, Vec<Seg>)> {
         &chrome::panel_rgb(),
         0.28,
     ));
+    let quiet = quiet_pill();
     model
         .app_tabs
         .iter()
@@ -70,7 +123,7 @@ fn app_chip_units(model: &FrameModel) -> Vec<(bool, Vec<Seg>)> {
             let chip = if active {
                 seg(Tok::Slot(S::Focus), text).bg(Tok::Attr(pill)).bold()
             } else {
-                seg(Tok::Slot(S::Dim), text)
+                seg(Tok::Slot(S::Dim), text).bg(Tok::Attr(quiet))
             };
             (active, vec![chip, seg(Tok::Slot(S::Text), " ")])
         })
@@ -137,9 +190,12 @@ pub(crate) fn masthead_layout(
     let brand_cols = chrome::masthead_brand_cols(cols);
     let brand = brand_segs(model, brand_cols);
     let chips = app_chip_units(model);
+    let sidebar_chip = sidebar_chip_unit(model, brand_cols >= chrome::BRAND_FULL_COLS);
+    let sidebar_chip_w = sidebar_chip.as_deref().map(seg_width).unwrap_or(0);
 
-    // Reserve the left's protected core — leading pad + brand + the active chip
-    // — so the right cluster can never eat those cells.
+    // Reserve the left's protected core — leading pad + brand + the hidden-
+    // sidebar chip + the active chip — so the right cluster can never eat
+    // those cells.
     let active_chip_w = chips
         .iter()
         .find(|(a, _)| *a)
@@ -147,8 +203,8 @@ pub(crate) fn masthead_layout(
         .unwrap_or(0);
     // A quiet gap between the brand and the first chip so the highlighted pill
     // doesn't butt against the version — only when both are present.
-    let gap = usize::from(!brand.is_empty() && !chips.is_empty());
-    let protected = 1 + seg_width(&brand) + gap + active_chip_w;
+    let gap = usize::from(!brand.is_empty() && (!chips.is_empty() || sidebar_chip.is_some()));
+    let protected = 1 + seg_width(&brand) + gap + sidebar_chip_w + active_chip_w;
 
     // Priority-fit the stats into whatever remains (keep a 1-col gutter).
     let candidates = masthead_right_items(model);
@@ -180,16 +236,30 @@ pub(crate) fn masthead_layout(
     if gap == 1 {
         left.push(seg(Tok::Slot(S::Text), " "));
     }
+    // The hidden-sidebar chip leads the chips; like the active chip it is
+    // unconditional (its slot was held in `protected`). Its span excludes the
+    // trailing gap space.
+    let mut sidebar_span = None;
+    if let Some(unit) = sidebar_chip {
+        sidebar_span = Some((seg_width(&left), sidebar_chip_w.saturating_sub(1)));
+        left.extend(unit);
+    }
     // Chips in tab order: the active chip is unconditional (its slot was held in
     // `protected`); inactive chips join only while they fit, holding the active
     // chip's reserve until it lands so an earlier inactive can't crowd it out.
+    // Each placed chip records its span (pill only, not the trailing gap).
+    let mut chip_spans = Vec::new();
     let mut reserve = active_chip_w;
-    for (active, chip) in &chips {
+    for (idx, (active, chip)) in chips.iter().enumerate() {
         let w = seg_width(chip);
-        if *active {
-            left.extend(chip.clone());
+        let place = if *active {
             reserve = 0;
-        } else if seg_width(&left) + w + reserve <= left_budget {
+            true
+        } else {
+            seg_width(&left) + w + reserve <= left_budget
+        };
+        if place {
+            chip_spans.push((idx, seg_width(&left), w.saturating_sub(1)));
             left.extend(chip.clone());
         }
     }
@@ -222,6 +292,8 @@ pub(crate) fn masthead_layout(
         left,
         right,
         right_spans,
+        chip_spans,
+        sidebar_chip: sidebar_span,
     }
 }
 
@@ -255,4 +327,69 @@ pub fn masthead_item_spans(
             )
         })
         .collect()
+}
+
+/// The placed app chips' absolute `(app tab index, Rect)` spans for the given
+/// chrome layout, in tab order. Same layout call as [`chrome::draw_masthead`],
+/// so paint and hit-test never disagree; a chip dropped for width has no span.
+/// The left cluster is left-aligned by `Line::split`, so offsets are relative
+/// to the masthead row's first cell.
+#[cfg_attr(not(test), expect(dead_code, reason = "wired by b139 lane 10 phase 2"))]
+pub(crate) fn masthead_chip_spans(
+    model: &FrameModel,
+    layout: &crate::layout::ChromeLayout,
+) -> Vec<(usize, crate::compositor::Rect)> {
+    let rect = layout.masthead_stats_row();
+    if rect.rows == 0 || rect.cols == 0 {
+        return Vec::new();
+    }
+    let lay = masthead_layout(model, rect.cols, None);
+    lay.chip_spans
+        .into_iter()
+        .map(|(idx, off, w)| {
+            (
+                idx,
+                crate::compositor::Rect {
+                    x: rect.x + off,
+                    y: rect.y,
+                    cols: w,
+                    rows: 1,
+                },
+            )
+        })
+        .collect()
+}
+
+/// The hidden-sidebar chip's absolute span, when the sidebar is `Hidden` and
+/// the masthead row is visible. Mirrors [`masthead_chip_spans`].
+#[cfg_attr(not(test), expect(dead_code, reason = "wired by b139 lane 10 phase 2"))]
+pub(crate) fn masthead_sidebar_chip_span(
+    model: &FrameModel,
+    layout: &crate::layout::ChromeLayout,
+) -> Option<crate::compositor::Rect> {
+    let rect = layout.masthead_stats_row();
+    if rect.rows == 0 || rect.cols == 0 {
+        return None;
+    }
+    let (off, w) = masthead_layout(model, rect.cols, None).sidebar_chip?;
+    Some(crate::compositor::Rect {
+        x: rect.x + off,
+        y: rect.y,
+        cols: w,
+        rows: 1,
+    })
+}
+
+/// The app tab index whose chip span contains `(x, y)`, if any. Pure, so the
+/// click branch and tests share one hit rule.
+#[cfg_attr(not(test), expect(dead_code, reason = "wired by b139 lane 10 phase 2"))]
+pub(crate) fn chip_at(
+    spans: &[(usize, crate::compositor::Rect)],
+    x: usize,
+    y: usize,
+) -> Option<usize> {
+    spans
+        .iter()
+        .find(|(_, r)| r.contains(x, y))
+        .map(|(idx, _)| *idx)
 }
