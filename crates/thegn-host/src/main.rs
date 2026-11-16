@@ -1197,6 +1197,8 @@ fn run_main() -> anyhow::Result<()> {
     // terminal enters the alternate screen, so a refusal is a plain typed
     // error on the user's terminal and nothing authority-bearing has run.
     let admitted = admit_configuration(&cli, thegn_core::db::MigrationActor::Controller)?;
+    // `[sandbox.git]` protects an explicit merge target (see provider_git).
+    crate::provider_git::install_merge_target_lookup(admitted.config());
     let result = rt.block_on(run::main(cli, admitted));
     // Drain queued best-effort DB writes (yank registers, panel ui_state) before
     // exit. The writer is its own std thread, so it outlives the runtime and this
@@ -1420,6 +1422,9 @@ fn run_subcommand(cli: &Cli, command: Command) -> anyhow::Result<()> {
     // keyring itself, so install the process's single value-fetch chokepoint.
     thegn_svc::secret::install_resolver(crate::secret::resolve_ref_for);
     crate::git_handle::install(&cfg);
+    // Every verb that can resolve a sandbox (daemon, `session open`, `env`)
+    // protects an explicit `merge_queue.target_branch` under `[sandbox.git]`.
+    crate::provider_git::install_merge_target_lookup(&cfg);
     // Publish the resource policy for background jobs (the merge-queue fold
     // gate, the queues' agent handoffs). They are spawned deep in a call graph
     // that carries only `[merge_queue]` config, and they are the heaviest things
