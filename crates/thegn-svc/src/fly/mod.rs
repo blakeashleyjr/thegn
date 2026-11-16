@@ -403,6 +403,40 @@ impl FlyProvider {
         }
     }
 
+    /// Typed inventory for `thegn fleet`: one row per ledger sandbox, mapped
+    /// from its app's live managed machine. An app with no live managed machine
+    /// is omitted (the sandbox is gone); a failed or malformed read keeps an
+    /// id-only row and makes the report `Partial`.
+    pub async fn sandbox_inventory(&self) -> Result<crate::provider::InventoryReport> {
+        use crate::provider::{InventoryReport, SandboxInfo};
+        let base = self.spec.api_base()?;
+        let mut rows = Vec::new();
+        let mut failed = Vec::new();
+        for name in self.ledger_names() {
+            let read = self
+                .get_json(&machines::machines_url(&base, &app_name(&name)))
+                .await
+                .map_err(|error| format!("{error:#}"))
+                .and_then(|body| sandbox_info_from_machines(&name, &body));
+            match read {
+                Ok(Some(info)) => rows.push(info),
+                Ok(None) => {}
+                Err(reason) => {
+                    failed.push(format!("{name}: {reason}"));
+                    rows.push(SandboxInfo::id_only(name));
+                }
+            }
+        }
+        Ok(if failed.is_empty() {
+            InventoryReport::Complete(rows)
+        } else {
+            InventoryReport::Partial {
+                rows,
+                reason: failed.join("; "),
+            }
+        })
+    }
+
     /// All thegn-managed Fly sandboxes this host created (ledger view).
     fn ledger_names(&self) -> Vec<String> {
         registry::list()
@@ -916,6 +950,55 @@ impl ProviderFiles for FlyProvider {
     fn delete<'a>(&'a self, id: &'a str, path: &'a str) -> BoxFuture<'a, Result<()>> {
         Box::pin(async move { self.shim(id).await?.delete(path).await })
     }
+}
+
+/// The price-table size key for a Fly guest: `shared-cpu-<n>x:<mem>MB` or
+/// `performance-<n>x:<mem>MB` (Fly's own preset names plus memory).
+pub(crate) fn fly_size_key(cpu_kind: &str, cpus: u64, memory_mb: u64) -> String {
+    match cpu_kind {
+        "performance" => format!("performance-{cpus}x:{memory_mb}MB"),
+        _ => format!("shared-cpu-{cpus}x:{memory_mb}MB"),
+    }
+}
+
+/// Map an app's machine list (`GET /apps/<app>/machines`) to the sandbox's
+/// inventory row: the sole live thegn-managed machine's size, region, state
+/// and `created_at`. `Ok(None)` when no live managed machine exists.
+pub(crate) fn sandbox_info_from_machines(
+    sandbox: &str,
+    body: &serde_json::Value,
+) -> std::result::Result<Option<crate::provider::SandboxInfo>, String> {
+    let Some(machine) = machines::single_live_managed_machine(body)? else {
+        return Ok(None);
+    };
+    let raw = body
+        .as_array()
+        .and_then(|rows| {
+            rows.iter().find(|row| {
+                row.get("id").and_then(serde_json::Value::as_str) == Some(machine.id.as_str())
+            })
+        })
+        .ok_or_else(|| "machine inventory changed while reading".to_string())?;
+    let guest = raw.pointer("/config/guest");
+    let size = guest.and_then(|guest| {
+        let kind = guest.get("cpu_kind")?.as_str()?;
+        let cpus = guest.get("cpus")?.as_u64()?;
+        let memory = guest.get("memory_mb")?.as_u64()?;
+        Some(fly_size_key(kind, cpus, memory))
+    });
+    let created_at_ms = raw
+        .get("created_at")
+        .and_then(serde_json::Value::as_str)
+        .and_then(|value| chrono::DateTime::parse_from_rfc3339(value).ok())
+        .map(|value| value.timestamp_millis());
+    Ok(Some(crate::provider::SandboxInfo {
+        id: sandbox.to_string(),
+        name: Some(machine.id),
+        state: Some(machine.state).filter(|s| !s.is_empty()),
+        size,
+        region: machine.region,
+        created_at_ms,
+    }))
 }
 
 #[cfg(test)]
@@ -1576,5 +1659,69 @@ mod tests {
             .unwrap_err();
         assert!(error.to_string().contains("bound to a different worktree"));
         assert!(hits.lock().unwrap().is_empty(), "no Fly request is allowed");
+    }
+
+    const MACHINES_FIXTURE: &str = r#"[
+  {
+    "id": "e7843d4ae11e48",
+    "name": "tg-fly-1",
+    "state": "started",
+    "region": "iad",
+    "created_at": "2026-11-14T12:00:00Z",
+    "config": {
+      "guest": { "cpu_kind": "shared", "cpus": 2, "memory_mb": 512 },
+      "metadata": { "managed-by": "thegn" }
+    }
+  },
+  {
+    "id": "old",
+    "name": "tg-fly-1",
+    "state": "destroyed",
+    "config": { "metadata": { "managed-by": "thegn" } }
+  }
+]
+"#;
+
+    #[test]
+    fn fly_machine_maps_to_sandbox_info_pretty_and_minified() {
+        let pretty = MACHINES_FIXTURE;
+        let value: serde_json::Value = serde_json::from_str(pretty).unwrap();
+        let minified = serde_json::to_string(&value).unwrap();
+        assert!(!minified.contains('\n'));
+        for text in [pretty, minified.as_str()] {
+            let body: serde_json::Value = serde_json::from_str(text).unwrap();
+            let info = sandbox_info_from_machines("tg-fly-1", &body)
+                .unwrap()
+                .unwrap();
+            assert_eq!(info.id, "tg-fly-1");
+            assert_eq!(info.name.as_deref(), Some("e7843d4ae11e48"));
+            assert_eq!(info.state.as_deref(), Some("started"));
+            assert_eq!(info.size.as_deref(), Some("shared-cpu-2x:512MB"));
+            assert_eq!(info.region.as_deref(), Some("iad"));
+            assert_eq!(info.created_at_ms, Some(1_794_657_600_000));
+        }
+    }
+
+    #[test]
+    fn fly_inventory_mapping_edges() {
+        assert_eq!(
+            fly_size_key("performance", 1, 2048),
+            "performance-1x:2048MB"
+        );
+        assert_eq!(fly_size_key("shared", 1, 256), "shared-cpu-1x:256MB");
+        let empty = serde_json::json!([]);
+        assert_eq!(sandbox_info_from_machines("s", &empty).unwrap(), None);
+        let malformed = serde_json::json!({"not": "an array"});
+        assert!(sandbox_info_from_machines("s", &malformed).is_err());
+        let bare = serde_json::json!([{
+            "id": "m1",
+            "state": "stopped",
+            "config": { "metadata": { (machines::MANAGED_KEY): machines::MANAGED_VAL } }
+        }]);
+        let info = sandbox_info_from_machines("s", &bare).unwrap().unwrap();
+        assert_eq!(info.size, None);
+        assert_eq!(info.created_at_ms, None);
+        assert_eq!(info.region, None);
+        assert_eq!(info.state.as_deref(), Some("stopped"));
     }
 }

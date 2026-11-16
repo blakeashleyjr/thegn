@@ -608,6 +608,12 @@ pub enum Command {
         #[command(subcommand)]
         action: cmd::placement::Action,
     },
+    /// Every provider sandbox across the configured envs, joined to its
+    /// worktree (orphans and missing rows), with estimated spend.
+    Fleet {
+        #[command(subcommand)]
+        action: cmd::fleet::Action,
+    },
     /// Inspect and provision `[host.<name>]` machines (the once-per-host
     /// lifecycle behind fast remote OCI sandboxes).
     Host {
@@ -1270,6 +1276,7 @@ fn experimental_command(command: &Command) -> Option<(&'static str, thegn_core::
     Some(match command {
         Command::Host { .. } => ("host", Feature::Providers),
         Command::Placement { .. } => ("placement", Feature::Placement),
+        Command::Fleet { .. } => ("fleet", Feature::Providers),
         _ => return None,
     })
 }
@@ -1517,6 +1524,7 @@ fn run_subcommand(cli: &Cli, command: Command) -> anyhow::Result<()> {
         Command::Zone { action } => cmd::zone::run(&cfg, action),
         Command::Project { action } => cmd::project::run(&cfg, action),
         Command::Placement { action } => cmd::placement::run(&cfg, action),
+        Command::Fleet { action } => cmd::fleet::run(&cfg, action),
         Command::Host { action } => cmd::host::run(&cfg, action),
         Command::Sandbox { action } => cmd::sandbox::run(&cfg, action),
         Command::Debug { action } => cmd::debug::run(&cfg, action),
