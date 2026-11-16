@@ -838,7 +838,7 @@ fn add_with(
             && std::env::var("THEGN_REMOTE_ENV").as_deref() == Ok("1")
         {
             anyhow::bail!(
-                "route_to_host credential is missing: reprovision this environment after starting the secure host control endpoint; no local queue row was created"
+                "route_to_host credential is missing: the host had no live `thegn serve` endpoint with a tls-terminated or tunnel topology when this environment was opened, so none was installed. Start `thegn serve` on the host, then reopen this worktree to install the credential and retry; no local queue row was created"
             );
         }
     }
@@ -1619,6 +1619,7 @@ mod routing_tests {
             .unwrap_err()
             .to_string();
         assert!(error.contains("route_to_host credential is missing"));
+        assert!(error.contains("`thegn serve`") && error.contains("reopen this worktree"));
         assert!(error.contains("no local queue row was created"));
     }
 
