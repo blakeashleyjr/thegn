@@ -226,9 +226,9 @@ relative, symlinked, non-UTF-8, or overlapping roots are omitted. Agent config
 dirs (`CLAUDE_CONFIG_DIR` / `CODEX_HOME`, or the `~/.claude` / `~/.codex` defaults) are writable for
 every non-sealed pane, so an agent CLI you run by hand can persist its
 state instead of dying on a read-only filesystem. A carve-out whose path
-has a symlink in any component (including `$HOME` itself reached through a
-link) is skipped with a warning, never followed; the pane launches without
-it.
+has a symlink in any component below `$HOME` is skipped with a warning, never
+followed; the pane launches without it. `$HOME` itself may be reached through
+a system link (`/home -> /var/home`).
 
 > `~/.keychain` is carved writable for `standard` panes but **not** for
 > `sealed` ones: it holds scripts your host login shells later _source_,
