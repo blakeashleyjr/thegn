@@ -7,6 +7,27 @@ All notable changes to **thegn** are documented here. The format follows
 
 ## [Unreleased]
 
+### Added
+
+- Theme Builder gains an element view and a live palette picker. (THE-2023)
+- Clicking the masthead `cpu`/`mem` widget shows CPU and memory by project, worktree and pane. (THE-2025)
+- The MCP server gains `issues_update` and `issues_comment`. (THE-203)
+
+### Changed
+
+- Config reloads apply refresh cadences, notification routing, panel/help/media and automation changes through named hooks and say so; cadence keys no longer report "restart required". (THE-2024)
+- `thegn env down` pulls commits back first and refuses on a failed pull unless `--force`; `--stop` parks the sandbox instead of destroying it. (THE-2019, THE-2021)
+- Provider sessions pull their commits back automatically when the last session exits. (THE-2021)
+- `thegn env set` refuses a dev-only env against a stable daemon, and `thegn env show` reports the sandbox, location and git policy. (THE-2007, THE-2009)
+- The voice worker runs under thegn-proc supervision. (THE-729)
+- `thegn session list` prints `exited(<code>)` and `last:<state>` unless the final state was `done`; scripts that parse it should expect the extra fields. (THE-2012)
+- `thegn doctor` lists provider reaper holds, and notification priority/mode warnings and Home Manager options were added. (THE-530, THE-428)
+
+### Fixed
+
+- Pane output no longer re-parses a 64 KiB tail per chunk for preview port hints. (THE-2000)
+- A sandbox bind whose destination is a symlink (such as a HOME-swapped `~/.claude/projects`) no longer stops bwrap; sandboxed commits carry the host's git identity.
+
 ## [0.1.0-alpha.88] — 2026-11-16
 
 ### Added
