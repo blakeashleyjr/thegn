@@ -276,7 +276,7 @@ fn history_right_edge_tracks_the_newest_sample_and_holds_an_interior_gap() {
     let placed = board.placed(&view, area);
     let cpu = placed.iter().find(|panel| panel.id == super::CPU).unwrap();
     let sample_x = cpu.rect.x + cpu.rect.cols - 2;
-    let graph_y = cpu.rect.y + cpu.rect.rows - 2;
+    let graph_y = cpu.rect.y + cpu.rect.rows - 3;
     let mut surface = Surface::new(240, 60);
     caps::test_override::with_unicode(UnicodeLevel::Full, || {
         board.paint(&view, &mut surface, area, 0, &[])
@@ -622,9 +622,8 @@ fn scatter_legend_and_minicore_rows_appear_when_wide_and_are_omitted_when_narrow
     let model = two_container_model();
     let wide = paint_text(&model, 240, 80);
     assert!(wide.contains("cpu → · mem ↑"), "scatter legend: {wide}");
-    assert_eq!(
+    assert!(
         wide.matches("alpha-ct").count() >= 2 && wide.matches("bravo-ct").count() >= 2,
-        true,
         "minicore rows per container: {wide}"
     );
     let narrow = paint_text(&model, 60, 20);
