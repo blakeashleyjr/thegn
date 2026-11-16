@@ -47,6 +47,7 @@ pub const GROUPS: &[(&str, &[&str])] = &[
             "zone",
             "host",
             "placement",
+            "fleet",
             "sandbox",
             "debug",
             "mcp",
@@ -275,7 +276,7 @@ mod doc_drift {
 
     #[test]
     fn dev_channel_verbs_are_tagged_in_cli_md() {
-        for verb in ["host", "placement"] {
+        for verb in ["host", "placement", "fleet"] {
             let token = format!("`{verb}`");
             let row = CLI_DOC
                 .lines()
