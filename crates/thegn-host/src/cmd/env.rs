@@ -715,10 +715,14 @@ fn bring_up(
             .ensure()
             .map_err(|e| anyhow::anyhow!("env up failed: {e}"));
     }
+    env.placement
+        .ensure()
+        .map_err(|e| anyhow::anyhow!("env up failed: {e}"))?;
+    let ran_up_command = matches!(&env.placement, thegn_core::placement::Placement::Provider(p) if !p.up_command.is_empty());
     let provisioned = provision_reporting(provision)
         .with_context(|| format!("env up failed: provisioning {worktree} (env {})", env.name))?;
     anyhow::ensure!(
-        provisioned,
+        provisioned || ran_up_command,
         concat!(
             "env up failed: nothing was provisioned for {} (env {}): the provider could not ",
             "be driven (an unresolved API token, a managed ssh key failure, or no files API; ",
@@ -829,6 +833,7 @@ fn provision_headless_blocking(
     let (tx, rx) = std::sync::mpsc::channel();
     let wt = worktree.clone();
     thegn_core::thread_name::try_spawn_named("thegn-hl-prov", move || {
+        crate::platform::qos::set_self(crate::platform::qos::Qos::Interactive);
         let outcome =
             provision_reporting(|progress| crate::agent::provision_worktree(&cfg, &wt, progress));
         if tx.send(outcome).is_err() {
