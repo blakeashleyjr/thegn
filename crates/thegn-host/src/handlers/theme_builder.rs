@@ -61,6 +61,9 @@ pub(crate) fn key(
     }
 }
 
+/// Route one mouse event. Every event is forwarded, wheel ticks included:
+/// the reducer scrolls whichever list sits under the pointer (catalog,
+/// element view, palette picker), so no button is filtered here.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn mouse(
     builder: &mut ThemeBuilder,
