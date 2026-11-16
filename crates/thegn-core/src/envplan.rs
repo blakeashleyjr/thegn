@@ -506,6 +506,21 @@ pub struct PlanOpts {
     /// overrides). The default (`mode = "auto"`) keeps SynthNix; `mise`/`off`
     /// downgrade it (see [`plan`]).
     pub toolchain: crate::toolchain::ToolchainConfig,
+    /// Seed the sandbox repository from a host-side `git bundle` of the local
+    /// branch instead of cloning `origin` inside the sandbox (THE-2021): the
+    /// sandbox needs no network credential to get the code. `None` ⇒ the
+    /// in-sandbox clone (pool spares, and the `clone` transport). Emits a
+    /// host-executed [`StepKind::BundleSeed`] in place of the `clone` step.
+    pub bundle_seed: Option<BundleSeed>,
+}
+
+/// Where a [`StepKind::BundleSeed`] step reads the repository from on the host.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BundleSeed {
+    /// Host path of the local checkout (a git worktree) to bundle.
+    pub worktree: String,
+    /// Local branch to bundle and check out in the sandbox.
+    pub branch: String,
 }
 
 /// A Nix binary-cache substituter (and optional push) for fast devShells.
@@ -548,6 +563,7 @@ impl Default for PlanOpts {
             host_cache_key: None,
             host_cache_url: None,
             toolchain: crate::toolchain::ToolchainConfig::default(),
+            bundle_seed: None,
         }
     }
 }
@@ -605,6 +621,15 @@ pub enum StepKind {
         workdir: String,
         snapshot_id: String,
     },
+    /// Host-executed: seed the sandbox repository from a `git bundle` of the
+    /// local `branch` in `worktree` (uploaded over the provider files API and
+    /// cloned into `workdir`), in place of the in-sandbox origin clone. NOT
+    /// best-effort: without it the sandbox has no repository.
+    BundleSeed {
+        worktree: String,
+        workdir: String,
+        branch: String,
+    },
 }
 
 /// The compiled, backend-agnostic provisioning plan.
@@ -656,21 +681,38 @@ pub fn plan(req: &EnvRequirements, opts: &PlanOpts) -> EnvPlan {
     // via `passthrough_env_remote` — GH_TOKEN/GITHUB_TOKEN), configure git to use
     // it for HTTPS clone/push; a no-op without a token. Persisted in ~/.gitconfig
     // so it survives the checkpoint and works for later pushes from the shell.
-    if opts.origin.is_some() {
+    let seeded = opts.bundle_seed.as_ref();
+    if opts.origin.is_some() || seeded.is_some() {
         steps.push(ProvisionStep {
             id: "git_auth".into(),
             label: "Configure git credentials".into(),
             kind: StepKind::Exec(git_auth_script()),
         });
     }
-    // Clone the repo into the workdir (idempotent — skips if already a repo).
-    if let Some(origin) = opts.origin.as_deref() {
-        let clone = crate::remote::provision_repo_script(origin, opts.branch.as_deref());
-        steps.push(ProvisionStep {
-            id: "clone".into(),
-            label: "Clone repository".into(),
-            kind: StepKind::Exec(format!("cd {wd} && {clone}")),
-        });
+    // Seed the repo from a host-side bundle (no in-sandbox credential needed),
+    // or clone it into the workdir (idempotent — skips if already a repo).
+    let repo_step = match (seeded, opts.origin.as_deref()) {
+        (Some(seed), _) => Some(ProvisionStep {
+            id: "bundle_seed".into(),
+            label: "Seed repository (git bundle)".into(),
+            kind: StepKind::BundleSeed {
+                worktree: seed.worktree.clone(),
+                workdir: opts.workdir.clone(),
+                branch: seed.branch.clone(),
+            },
+        }),
+        (None, Some(origin)) => {
+            let clone = crate::remote::provision_repo_script(origin, opts.branch.as_deref());
+            Some(ProvisionStep {
+                id: "clone".into(),
+                label: "Clone repository".into(),
+                kind: StepKind::Exec(format!("cd {wd} && {clone}")),
+            })
+        }
+        (None, None) => None,
+    };
+    if let Some(repo_step) = repo_step {
+        steps.push(repo_step);
         // Bring the clone to full parity with the local worktree (unpushed
         // commits + uncommitted + untracked). Runs before the toolchain tier so
         // a locally-modified flake.lock / .envrc drives the devShell build. Only
@@ -2350,6 +2392,77 @@ mod tests {
         };
         assert_eq!(worktree, "/home/u/wt");
         assert_eq!(workdir, "/workspace");
+    }
+
+    #[test]
+    fn plan_bundle_seed_replaces_clone_after_git_auth() {
+        let opts = PlanOpts {
+            origin: Some("https://example.com/r.git".into()),
+            branch: Some("feat".into()),
+            local_parity: Some("/home/u/wt".into()),
+            bundle_seed: Some(BundleSeed {
+                worktree: "/home/u/wt".into(),
+                branch: "feat".into(),
+            }),
+            checkpoint: false,
+            ..Default::default()
+        };
+        let p = plan(&EnvRequirements::default(), &opts);
+        let ids: Vec<&str> = p.steps.iter().map(|s| s.id.as_str()).collect();
+        assert!(!ids.contains(&"clone"), "no in-sandbox clone: {ids:?}");
+        let auth = ids.iter().position(|i| *i == "git_auth").expect("git_auth");
+        let seed = ids
+            .iter()
+            .position(|i| *i == "bundle_seed")
+            .expect("bundle_seed step");
+        assert_eq!(seed, auth + 1, "seed right after git_auth: {ids:?}");
+        let parity = ids.iter().position(|i| *i == "local_parity").unwrap();
+        assert_eq!(parity, seed + 1, "parity follows the seed: {ids:?}");
+        let step = &p.steps[seed];
+        assert_eq!(step.label, "Seed repository (git bundle)");
+        let StepKind::BundleSeed {
+            worktree,
+            workdir,
+            branch,
+        } = &step.kind
+        else {
+            panic!("bundle_seed must be a BundleSeed step");
+        };
+        assert_eq!(worktree, "/home/u/wt");
+        assert_eq!(workdir, "/workspace");
+        assert_eq!(branch, "feat");
+    }
+
+    #[test]
+    fn plan_bundle_seed_without_origin_still_seeds() {
+        let opts = PlanOpts {
+            bundle_seed: Some(BundleSeed {
+                worktree: "/w".into(),
+                branch: "b".into(),
+            }),
+            snapshot_restore: Some("snap".into()),
+            checkpoint: false,
+            ..Default::default()
+        };
+        let p = plan(&EnvRequirements::default(), &opts);
+        let ids: Vec<&str> = p.steps.iter().map(|s| s.id.as_str()).collect();
+        assert!(ids.contains(&"git_auth"), "{ids:?}");
+        assert!(ids.contains(&"bundle_seed"), "{ids:?}");
+        assert!(ids.contains(&"snapshot_restore"), "{ids:?}");
+        assert!(!ids.contains(&"clone"), "{ids:?}");
+    }
+
+    #[test]
+    fn plan_without_bundle_seed_keeps_clone() {
+        let opts = PlanOpts {
+            origin: Some("https://example.com/r.git".into()),
+            checkpoint: false,
+            ..Default::default()
+        };
+        let p = plan(&EnvRequirements::default(), &opts);
+        let ids: Vec<&str> = p.steps.iter().map(|s| s.id.as_str()).collect();
+        assert!(ids.contains(&"clone"), "{ids:?}");
+        assert!(!ids.contains(&"bundle_seed"), "{ids:?}");
     }
 
     #[test]

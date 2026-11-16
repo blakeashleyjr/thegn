@@ -13,3 +13,4 @@ wizard.rs:new  Computes each host's effective profile default for the creation f
 worktree_lifecycle.rs:teardown_runtime  Teardown identifies the provider runtime and never starts a process.
 cmd/wt.rs:create_and_register  New worktree has no registered worktree pin yet; resolves its inherited default.
 cmd/doctor_pins.rs:collect  Doctor reports what an unpinned worktree would inherit; the stored pin is shown beside it, never launched.
+agent.rs:launch_spec_full  Reads only the resolved env name to provision the provider repo; a profile pin sets sandbox.profile, never the env name, and the launch itself already went through the merged-pin prepare_sandbox_env_with_selection.
