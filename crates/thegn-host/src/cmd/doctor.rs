@@ -1656,10 +1656,44 @@ fn mcp_proxy_report(cfg: &Config) {
     }
 }
 
-fn channel_report() {
+/// What the running daemon's channel means for this CLI (THE-2007): `daemon`
+/// is `None` when no daemon is running, `Some(None)` for a daemon that does
+/// not report its channel (older build), `Some(Some(ch))` otherwise.
+fn daemon_channel_line(cli: thegn_core::channel::Channel, daemon: Option<Option<&str>>) -> String {
+    use thegn_core::channel::Channel;
+    match daemon {
+        None => "not running".to_string(),
+        Some(None) => "unknown (older daemon)".to_string(),
+        Some(Some(ch)) if ch == cli.as_str() => format!("{ch} (matches)"),
+        Some(Some(ch)) if ch == Channel::Stable.as_str() && cli == Channel::Dev => {
+            format!("{ch} — MISMATCH: this CLI is dev; restart the daemon with THEGN_CHANNEL=dev")
+        }
+        Some(Some(ch)) => format!("{ch} (this CLI is {})", cli.as_str()),
+    }
+}
+
+/// Probe an already-running daemon for its channel: connect-only (never
+/// spawns), each request bounded by the scope-probe timeout.
+fn probe_daemon_channel(cfg: &Config) -> Option<Option<String>> {
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .ok()?;
+    rt.block_on(async {
+        let client = crate::daemon::client::connect_daemon(&cfg.daemon).await?;
+        Some(crate::daemon::client::daemon_channel(&client).await)
+    })
+}
+
+fn channel_report(cfg: &Config) {
     let channel = crate::channel_state::current();
     outln!("Release channel");
     outln!("  channel       {}", channel.as_str());
+    let daemon = probe_daemon_channel(cfg);
+    outln!(
+        "  daemon        {}",
+        daemon_channel_line(channel, daemon.as_ref().map(Option::as_deref))
+    );
     for f in thegn_core::channel::Feature::ALL {
         outln!(
             "  {:<13} {}",
@@ -2504,15 +2538,20 @@ fn daemon_health() -> (&'static str, Option<String>) {
         .map(|d| thegn_core::time_policy::saturating_i64(d.as_millis()))
         .unwrap_or(0);
     let ttl = thegn_svc::control::client::DAEMON_HEARTBEAT_TTL_MS;
-    let scope = thegn_core::util::xdg_state_home()
-        .join("thegn")
-        .to_string_lossy()
-        .into_owned();
-    // A live row (fresh heartbeat) in any scope means reachable; else a stale row
+    // A live row (fresh heartbeat) under any of this state dir's scope
+    // spellings (the hashed `state_scope_identity` daemons register under, then
+    // the pre-upgrade raw path) means reachable; else a stale row in any scope
     // means crashed/wedged; else none.
     let all = db.daemons().unwrap_or_default();
-    let live = db.live_daemons(&scope, now, ttl).unwrap_or_default();
-    if let Some(row) = live.first() {
+    let live = crate::daemon::scope_aliases()
+        .into_iter()
+        .find_map(|scope| {
+            db.live_daemons(&scope, now, ttl)
+                .unwrap_or_default()
+                .into_iter()
+                .next()
+        });
+    if let Some(row) = live {
         ("reachable", Some(row.version.clone()))
     } else if let Some(row) = all.iter().max_by_key(|r| r.heartbeat_at) {
         (
@@ -3334,7 +3373,7 @@ pub fn run(
             .map_or("(none)".to_string(), |path| path.display().to_string()),
     );
     outln!("");
-    channel_report();
+    channel_report(cfg);
     outln!("");
     core_deps_report();
     outln!("");
@@ -7739,6 +7778,60 @@ args = ["--verbose"]
                 .iter()
                 .map(|route| (route.id, route.status.as_str()))
                 .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn daemon_health_finds_a_daemon_registered_under_the_hashed_scope() {
+        use thegn_core::store::ControlStore as _;
+
+        let _state = thegn_core::testenv::IsolatedState::new();
+        let db = Db::open().expect("create isolated db");
+        let now = crate::daemon::now_ms();
+        db.put_daemon(&thegn_core::store::DaemonRow {
+            daemon_id: "doctor-hashed-scope".into(),
+            pid: 1,
+            scope: crate::daemon::scope_key(),
+            endpoint: "/nonexistent/sock".into(),
+            tcp_addr: None,
+            control_origin: None,
+            hostname: "h".into(),
+            version: "9.9.9-hashed".into(),
+            started_at: now,
+            heartbeat_at: now,
+        })
+        .expect("write daemon row");
+        drop(db);
+
+        assert_eq!(
+            daemon_health(),
+            ("reachable", Some("9.9.9-hashed".to_string()))
+        );
+    }
+
+    #[test]
+    fn daemon_channel_line_covers_every_daemon_state() {
+        use thegn_core::channel::Channel;
+        assert_eq!(daemon_channel_line(Channel::Dev, None), "not running");
+        assert_eq!(
+            daemon_channel_line(Channel::Dev, Some(None)),
+            "unknown (older daemon)"
+        );
+        assert_eq!(
+            daemon_channel_line(Channel::Dev, Some(Some("dev"))),
+            "dev (matches)"
+        );
+        assert_eq!(
+            daemon_channel_line(Channel::Stable, Some(Some("stable"))),
+            "stable (matches)"
+        );
+        assert_eq!(
+            daemon_channel_line(Channel::Dev, Some(Some("stable"))),
+            "stable — MISMATCH: this CLI is dev; restart the daemon with THEGN_CHANNEL=dev"
+        );
+        assert_eq!(
+            daemon_channel_line(Channel::Stable, Some(Some("dev"))),
+            "dev (this CLI is stable)"
         );
     }
 
