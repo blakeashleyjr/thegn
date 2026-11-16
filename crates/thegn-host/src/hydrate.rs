@@ -1424,6 +1424,9 @@ pub(crate) fn db_worktree_list_with_snapshot(
     let mut out = Vec::new();
     let mut ambient_cache = std::collections::HashMap::new();
     let mut git_cache = std::collections::HashMap::new();
+    // `[project.<slug>] worktree_roots`, tilde-expanded once per repo root.
+    let mut roots_cache: std::collections::HashMap<String, Vec<std::path::PathBuf>> =
+        std::collections::HashMap::new();
     let rows = match db.worktrees() {
         Ok(rows) => rows,
         Err(e) => {
@@ -1564,9 +1567,56 @@ pub(crate) fn db_worktree_list_with_snapshot(
             env_name: w.env_name.clone(),
             sandbox_profile,
             env_degraded,
+            external: w.location.is_empty()
+                && row_is_external(
+                    &w.repo_root,
+                    &w.worktree,
+                    w.folder_id,
+                    cfg,
+                    &mut roots_cache,
+                ),
         });
     }
     (out, branch_observations)
+}
+
+/// Whether a LOCAL registry row is an external worktree (see
+/// [`crate::sidebar::is_external`]): string and path-component comparison
+/// only, with the repo's `worktree_roots` expanded once per root. A remote
+/// row (set `location`) is thegn's own by construction and never asks.
+fn row_is_external(
+    repo_root: &str,
+    worktree: &str,
+    folder_id: Option<i64>,
+    cfg: &thegn_core::config::Config,
+    roots_cache: &mut std::collections::HashMap<String, Vec<std::path::PathBuf>>,
+) -> bool {
+    let root = std::path::Path::new(repo_root);
+    let roots = roots_cache.entry(repo_root.to_string()).or_insert_with(|| {
+        cfg.workspace_overlay(root)
+            .overlay()
+            .map(|overlay| {
+                overlay
+                    .worktree_roots
+                    .iter()
+                    .map(|r| r.trim())
+                    .filter(|r| !r.is_empty())
+                    .map(|r| std::path::PathBuf::from(thegn_core::util::expand_tilde(r)))
+                    .collect()
+            })
+            .unwrap_or_default()
+    });
+    let repo_dir_name = thegn_core::repo::repo_name_from_path(root);
+    crate::sidebar::is_external(
+        worktree,
+        folder_id,
+        &crate::sidebar::ExternalCheck {
+            root,
+            repo_dir_name: &repo_dir_name,
+            roots: roots.as_slice(),
+            cfg,
+        },
+    )
 }
 
 /// Spawn-free branch observation for the ambient (hydration / sweep) paths:

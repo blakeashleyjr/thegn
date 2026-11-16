@@ -331,8 +331,13 @@ fn sidebar_detail_field_defaults_match_example_and_module() {
         "dirty",
         "branch_stat",
         "pr",
+        "ci",
+        "issue",
+        "author",
+        "stash",
         "subject",
         "age",
+        "upstream",
         "env",
         "sandbox",
         "devcontainer",
@@ -841,6 +846,10 @@ fn hm_ui_enum_options_offer_only_canonical_spellings() {
         ("uiSidebarTerminalsSection", "ui.sidebar_terminals_section"),
         ("uiSidebarFocusDetail", "ui.sidebar_focus_detail"),
         ("uiSidebarDetailWhen", "ui.sidebar_detail_when"),
+        (
+            "uiSidebarExternalWorktrees",
+            "ui.sidebar_external_worktrees",
+        ),
     ];
     let enums = enum_lists(&module_src());
     for (option, path) in expected {
@@ -1610,6 +1619,7 @@ fn every_numeric_option_matches_its_destination_range() {
         ("watchPrIntervalSecs", "watch.pr_interval_secs"),
         ("port", "sandbox.remote.port"),
         ("themePanePadding", "theme.pane_padding"),
+        ("uiSidebarGroupRowLimit", "ui.sidebar_group_row_limit"),
         ("searchMaxResults", "search.max_results"),
         ("paletteContentMaxResults", "palette.content_max_results"),
         ("paletteFileMaxResults", "palette.file_max_results"),
@@ -2136,6 +2146,10 @@ fn every_nix_enum_matches_its_destination_enum() {
         ("uiSidebarTerminalsSection", "ui.sidebar_terminals_section"),
         ("uiSidebarFocusDetail", "ui.sidebar_focus_detail"),
         ("uiSidebarDetailWhen", "ui.sidebar_detail_when"),
+        (
+            "uiSidebarExternalWorktrees",
+            "ui.sidebar_external_worktrees",
+        ),
         ("searchStructural", "search.structural"),
         ("gitBackend", "git.backend"),
         ("gitStructuralDiff", "git.structural_diff"),
