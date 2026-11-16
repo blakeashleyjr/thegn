@@ -55,9 +55,33 @@ const MAX_ROW_TEXT_CELLS: usize = 48;
 pub(crate) struct RowValue {
     pub text: String,
     pub role: RowRole,
+    /// API 0.6 `ttl_secs`: the value is dropped at this instant (a one-shot
+    /// loop deadline via [`PluginsState::next_row_expiry`], never a cadence).
+    pub expires_at: Option<std::time::Instant>,
+    /// API 0.6 `until_scan`: the value is dropped on its worktree's next
+    /// changed glyph scan ([`emit_changed_scans`]).
+    pub until_scan: bool,
 }
 
-pub(crate) type RowFieldSnapshot = BTreeMap<(String, String), BTreeMap<String, RowValue>>;
+impl RowValue {
+    /// What the sidebar shows. Expiry metadata is not display, so refreshing a
+    /// TTL with identical text and role is not damage.
+    fn same_display(&self, other: &Self) -> bool {
+        self.text == other.text && self.role == other.role
+    }
+}
+
+/// One field's values, keyed by the worktree key the plugin sent.
+pub(crate) type RowFieldValues = BTreeMap<String, RowValue>;
+pub(crate) type RowFieldSnapshot = BTreeMap<(String, String), RowFieldValues>;
+
+fn same_display_values(old: &RowFieldValues, new: &RowFieldValues) -> bool {
+    old.len() == new.len()
+        && old
+            .iter()
+            .zip(new)
+            .all(|((old_key, old), (new_key, new))| old_key == new_key && old.same_display(new))
+}
 
 /// One live (or dead-but-remembered) plugin on the loop side.
 pub(crate) struct PluginEntry {
@@ -173,6 +197,68 @@ impl PluginsState {
                     .next_deadline()
             })
             .min()
+    }
+
+    /// The earliest TTL expiry across the row store. `None` when no stored
+    /// value carries a TTL, so idle stays a true block.
+    pub(crate) fn next_row_expiry(&self) -> Option<std::time::Instant> {
+        self.row_fields
+            .values()
+            .flat_map(BTreeMap::values)
+            .filter_map(|value| value.expires_at)
+            .min()
+    }
+
+    /// The single loop deadline the plugins contribute to the one timed poll
+    /// site: the earliest app request or row expiry. Equal to
+    /// [`Self::next_app_deadline`] when no row carries a TTL.
+    pub(crate) fn next_loop_deadline(&self) -> Option<std::time::Instant> {
+        match (self.next_app_deadline(), self.next_row_expiry()) {
+            (Some(app), Some(row)) => Some(app.min(row)),
+            (app, row) => app.or(row),
+        }
+    }
+
+    /// Remove every row value whose TTL is due at `now`. Returns true when
+    /// anything was removed (sidebar content damage).
+    pub(crate) fn expire_rows(&mut self, now: std::time::Instant) -> bool {
+        self.retain_row_values(|_, value| value.expires_at.is_none_or(|at| at > now))
+    }
+
+    /// Remove `until_scan` values keyed by any changed worktree's path or
+    /// branch (resolved by [`crate::plugin_row_sync::row_store_keys`], the
+    /// same keys the sidebar projection reads). Returns true when anything was
+    /// removed.
+    pub(crate) fn drop_until_scan(&mut self, changed: &[ScannedWorktree<'_>]) -> bool {
+        let keys: std::collections::BTreeSet<&str> = changed
+            .iter()
+            .flat_map(|(path, branch)| crate::plugin_row_sync::row_store_keys(path, *branch))
+            .flatten()
+            .collect();
+        if keys.is_empty() {
+            return false;
+        }
+        self.retain_row_values(|key, value| !(value.until_scan && keys.contains(key.as_str())))
+    }
+
+    /// Keep the row values `keep` accepts; a field left empty is removed, as
+    /// an empty push removes it.
+    fn retain_row_values(&mut self, mut keep: impl FnMut(&String, &RowValue) -> bool) -> bool {
+        let mut removed = false;
+        self.row_fields.retain(|_, values| {
+            let before = values.len();
+            values.retain(|key, value| keep(key, value));
+            removed |= values.len() != before;
+            !values.is_empty()
+        });
+        removed
+    }
+
+    fn has_until_scan_rows(&self) -> bool {
+        self.row_fields
+            .values()
+            .flat_map(BTreeMap::values)
+            .any(|value| value.until_scan)
     }
 
     pub(crate) fn app_tabs(&self) -> Vec<crate::apps::plugin::AppTabDescriptor> {
@@ -553,7 +639,7 @@ pub(crate) fn row_field_values(state: &PluginsState) -> RowFieldSnapshot {
 /// Host-originated `on_event` kind sent when a worktree's git glyph scan lands
 /// with a changed result. Delivered straight to the plugin writer, never via
 /// the daemon feed hub.
-pub(crate) const WORKTREE_SCANNED_EVENT: &str = "thegn.worktree_scanned";
+pub(crate) use thegn_core::plugin_api::WORKTREE_SCANNED_EVENT;
 
 /// One changed worktree: `(path, live branch or None for a detached HEAD)`.
 pub(crate) type ScannedWorktree<'a> = (&'a str, Option<&'a str>);
@@ -593,24 +679,45 @@ fn scan_recipient(entry: &PluginEntry) -> Option<&SessionWriter> {
     subscribed.then_some(writer)
 }
 
-/// Whether any plugin is eligible for `thegn.worktree_scanned`. Lets the
-/// model-swap path skip the glyph diff entirely when nobody listens.
+/// Whether a changed scan has anything to do: a plugin is eligible for
+/// `thegn.worktree_scanned`, or an `until_scan` row value is waiting to be
+/// dropped. Lets the model-swap path skip the glyph diff entirely otherwise.
 pub(crate) fn has_scan_subscriber(state: &PluginsState) -> bool {
-    state
-        .plugins
-        .values()
-        .any(|entry| scan_recipient(entry).is_some())
+    state.has_until_scan_rows()
+        || state
+            .plugins
+            .values()
+            .any(|entry| scan_recipient(entry).is_some())
 }
 
 /// Model-swap hook: diff the accepted hydration's glyphs against the
-/// on-screen model and notify eligible plugins of each changed worktree. The
-/// branch is the scan's live `HEAD` (`SidebarStatus::branches`, absent for a
-/// detached HEAD); the incoming model's rows are not rebuilt yet at this point.
-pub(crate) fn emit_changed_scans(state: &PluginsState, old: &FrameModel, new: &FrameModel) {
+/// on-screen model, drop `until_scan` row values of each changed worktree,
+/// then notify eligible plugins. The branch is the scan's live `HEAD`
+/// (`SidebarStatus::branches`, absent for a detached HEAD); the incoming
+/// model's rows are not rebuilt yet at this point. The swap re-projects the
+/// row store afterwards, so a drop needs no separate damage.
+pub(crate) fn emit_changed_scans(state: &mut PluginsState, old: &FrameModel, new: &FrameModel) {
     let pairs = changed_scans(old, new);
-    if !pairs.is_empty() {
-        emit_worktree_scanned(state, &pairs);
+    drop_then_emit_with(state, &pairs, notify_scanned);
+}
+
+/// Drop BEFORE sending, so a plugin's re-push in answer to the event lands
+/// after the drop and is never erased by it.
+fn drop_then_emit_with(
+    state: &mut PluginsState,
+    changed: &[ScannedWorktree<'_>],
+    send: impl FnMut(
+        &PluginsState,
+        &SessionWriter,
+        &str,
+        serde_json::Value,
+    ) -> Result<(), SessionFailure>,
+) {
+    if changed.is_empty() {
+        return;
     }
+    state.drop_until_scan(changed);
+    emit_worktree_scanned_with(state, changed, send);
 }
 
 /// The changed worktrees of a model swap with their live branch.
@@ -624,21 +731,32 @@ fn changed_scans<'a>(old: &FrameModel, new: &'a FrameModel) -> Vec<ScannedWorktr
         .collect()
 }
 
+/// The production sender: one coalesced `on_event` frame. Admission is a
+/// mutex push, safe on the loop.
+fn notify_scanned(
+    _: &PluginsState,
+    writer: &SessionWriter,
+    key: &str,
+    params: serde_json::Value,
+) -> Result<(), SessionFailure> {
+    writer.notify_coalesced(thegn_core::plugin_api::PluginCallback::OnEvent, key, params)
+}
+
 /// Send one coalesced `thegn.worktree_scanned` notification per eligible
 /// plugin per changed worktree. The coalescing key is per worktree, so at
 /// most one frame per (plugin, worktree) is pending and it carries the latest
 /// payload. A full or closed queue drops the event (debug log, no retry): the
-/// next changed scan self-heals. Admission is a mutex push, safe on the loop.
-pub(crate) fn emit_worktree_scanned(state: &PluginsState, changed: &[ScannedWorktree<'_>]) {
-    emit_worktree_scanned_with(state, changed, |writer, key, params| {
-        writer.notify_coalesced(thegn_core::plugin_api::PluginCallback::OnEvent, key, params)
-    });
-}
-
+/// next changed scan self-heals. `send` also sees the state, so tests can
+/// observe what the store held when each frame was queued.
 fn emit_worktree_scanned_with(
     state: &PluginsState,
     changed: &[ScannedWorktree<'_>],
-    mut send: impl FnMut(&SessionWriter, &str, serde_json::Value) -> Result<(), SessionFailure>,
+    mut send: impl FnMut(
+        &PluginsState,
+        &SessionWriter,
+        &str,
+        serde_json::Value,
+    ) -> Result<(), SessionFailure>,
 ) {
     if changed.is_empty() {
         return;
@@ -653,7 +771,7 @@ fn emit_worktree_scanned_with(
                 "kind": EventKind::Custom(WORKTREE_SCANNED_EVENT.into()),
                 "payload": { "path": path, "branch": branch },
             });
-            if let Err(error) = send(writer, &key, params) {
+            if let Err(error) = send(state, writer, &key, params) {
                 tracing::debug!(
                     target: "thegn::plugin",
                     plugin = %plugin,
@@ -1392,7 +1510,8 @@ fn apply_row_update(
     }
     let updates: Vec<RowUpdate> = serde_json::from_value(serde_json::Value::Array(rows.clone()))
         .map_err(|error| RpcError::new(RpcErrorCode::Invalid, format!("bad rows: {error}")))?;
-    let mut values = BTreeMap::new();
+    let now = std::time::Instant::now();
+    let mut values = RowFieldValues::new();
     for update in updates {
         if update.worktree.is_empty() || update.worktree.len() > MAX_ROW_WORKTREE_KEY_BYTES {
             return Err(RpcError::new(
@@ -1400,12 +1519,28 @@ fn apply_row_update(
                 format!("row worktree key must be 1..={MAX_ROW_WORKTREE_KEY_BYTES} bytes"),
             ));
         }
+        if let Some(ttl) = update.ttl_secs
+            && !(1..=thegn_core::plugin_api::MAX_ROW_TTL_SECS).contains(&ttl)
+        {
+            return Err(RpcError::new(
+                RpcErrorCode::Invalid,
+                format!(
+                    "row ttl_secs must be 1..={}",
+                    thegn_core::plugin_api::MAX_ROW_TTL_SECS
+                ),
+            ));
+        }
+        let expires_at = update
+            .ttl_secs
+            .map(|ttl| now + std::time::Duration::from_secs(u64::from(ttl)));
         if values
             .insert(
                 update.worktree.clone(),
                 RowValue {
                     text: sanitize_row_text(&update.text),
                     role: update.role,
+                    expires_at,
+                    until_scan: update.until_scan,
                 },
             )
             .is_some()
@@ -1479,16 +1614,16 @@ fn apply_row_update(
             format!("plugin exceeds {MAX_ROW_FIELDS_PER_PLUGIN} row fields"),
         ));
     }
+    // Damage compares display only: an identical re-push still stores the
+    // fresh expiry metadata (a TTL refresh) without repainting.
     let changed = state
         .row_fields
         .get(&key)
-        .map_or(!values.is_empty(), |old| old != &values);
-    if changed {
-        if values.is_empty() {
-            state.row_fields.remove(&key);
-        } else {
-            state.row_fields.insert(key, values);
-        }
+        .map_or(!values.is_empty(), |old| !same_display_values(old, &values));
+    if values.is_empty() {
+        state.row_fields.remove(&key);
+    } else {
+        state.row_fields.insert(key, values);
     }
     Ok(changed)
 }
@@ -3737,7 +3872,7 @@ mod tests {
     }
 
     fn emit_into(state: &PluginsState, queue: &mut KeyedQueue, changed: &[ScannedWorktree<'_>]) {
-        emit_worktree_scanned_with(state, changed, |_, key, params| queue.send(key, params));
+        emit_worktree_scanned_with(state, changed, |_, _, key, params| queue.send(key, params));
     }
 
     #[test]
@@ -3914,7 +4049,7 @@ mod tests {
             .iter()
             .map(|path| (path.as_str(), Some("main")))
             .collect::<Vec<ScannedWorktree<'_>>>();
-        emit_worktree_scanned(&state, &many_changed);
+        emit_worktree_scanned_with(&state, &many_changed, notify_scanned);
         stop_test_session(&runtime, &supervisor, session);
     }
 
@@ -4436,6 +4571,236 @@ mod tests {
             PluginDamage::SidebarContent
         );
         assert!(row_field_values(&state).is_empty());
+    }
+
+    fn row_params(rows: serde_json::Value) -> serde_json::Value {
+        serde_json::json!({"surface": "p/row", "rows": rows})
+    }
+
+    fn row_value<'s>(state: &'s PluginsState, key: &str) -> Option<&'s RowValue> {
+        state
+            .row_fields
+            .get(&(String::from("p"), String::from("ci")))
+            .and_then(|values| values.get(key))
+    }
+
+    #[test]
+    fn row_ttl_zero_and_out_of_range_are_rejected() {
+        let mut state = state_with(vec![row_spec("p", "ci")]);
+        let seed = row_params(serde_json::json!([
+            {"worktree": "main", "text": "kept", "role": "Good"}
+        ]));
+        assert_eq!(apply_row_update(&mut state, "p", &seed), Ok(true));
+        for ttl in [0, u64::from(thegn_core::plugin_api::MAX_ROW_TTL_SECS) + 1] {
+            let bad = row_params(serde_json::json!([
+                {"worktree": "main", "text": "new", "role": "Warn", "ttl_secs": ttl}
+            ]));
+            let error = apply_row_update(&mut state, "p", &bad).unwrap_err();
+            assert_eq!(error.code, RpcErrorCode::Invalid, "ttl_secs={ttl}");
+            assert!(error.message.contains("ttl_secs"), "{}", error.message);
+            assert_eq!(row_value(&state, "main").unwrap().text, "kept");
+        }
+        // The bounds themselves are accepted.
+        for ttl in [1, thegn_core::plugin_api::MAX_ROW_TTL_SECS] {
+            let ok = row_params(serde_json::json!([
+                {"worktree": "main", "text": format!("t{ttl}"), "role": "Warn", "ttl_secs": ttl}
+            ]));
+            assert_eq!(apply_row_update(&mut state, "p", &ok), Ok(true));
+        }
+    }
+
+    #[test]
+    fn row_ttl_expires_at_deadline_and_damages_sidebar() {
+        let mut state = state_with(vec![row_spec("p", "ci")]);
+        let before = std::time::Instant::now();
+        let rows = row_params(serde_json::json!([
+            {"worktree": "/wt/a", "text": "rebasing", "role": "Accent", "ttl_secs": 30},
+            {"worktree": "main", "text": "steady", "role": "Good"}
+        ]));
+        assert_eq!(apply_row_update(&mut state, "p", &rows), Ok(true));
+        let deadline = state
+            .next_row_expiry()
+            .expect("a TTL row arms one deadline");
+        assert!(deadline >= before + std::time::Duration::from_secs(30));
+        assert_eq!(
+            state.next_loop_deadline(),
+            Some(deadline),
+            "the row expiry folds into the single loop deadline"
+        );
+
+        assert!(
+            !state.expire_rows(deadline - std::time::Duration::from_millis(1)),
+            "nothing is due before the deadline"
+        );
+        assert!(row_value(&state, "/wt/a").is_some());
+
+        assert!(state.expire_rows(deadline), "due values are removed");
+        assert!(row_value(&state, "/wt/a").is_none());
+        assert_eq!(row_value(&state, "main").unwrap().text, "steady");
+        assert_eq!(state.next_row_expiry(), None, "no re-arm after expiry");
+        assert!(!state.expire_rows(deadline), "a second sweep is a no-op");
+
+        // A field whose last value expires is removed like an empty push.
+        let only = row_params(serde_json::json!([
+            {"worktree": "main", "text": "brief", "role": "Dim", "ttl_secs": 1}
+        ]));
+        assert_eq!(apply_row_update(&mut state, "p", &only), Ok(true));
+        let due = state.next_row_expiry().unwrap();
+        assert!(state.expire_rows(due));
+        assert!(row_field_values(&state).is_empty());
+    }
+
+    #[test]
+    fn row_ttl_refresh_with_identical_text_is_not_damage() {
+        let mut state = state_with(vec![row_spec("p", "ci")]);
+        let mut model = FrameModel::default();
+        let push = |ttl: u32| {
+            event(
+                "p",
+                1,
+                SessionEvent::Message(msg(
+                    "update",
+                    row_params(serde_json::json!([
+                        {"worktree": "/wt/a", "text": "syncing", "role": "Accent", "ttl_secs": ttl}
+                    ])),
+                )),
+            )
+        };
+        assert_eq!(
+            drain_one(&mut state, &mut model, push(5)),
+            PluginDamage::SidebarContent
+        );
+        let first = row_value(&state, "/wt/a").unwrap().expires_at.unwrap();
+        assert_eq!(
+            drain_one(&mut state, &mut model, push(600)),
+            PluginDamage::None,
+            "identical text and role: no repaint"
+        );
+        let refreshed = row_value(&state, "/wt/a").unwrap().expires_at.unwrap();
+        assert!(refreshed > first, "the fresh TTL is stored");
+        assert_eq!(state.next_row_expiry(), Some(refreshed));
+    }
+
+    #[test]
+    fn until_scan_row_dropped_on_changed_scan_keyed_by_path_or_branch() {
+        let mut state = state_with(vec![row_spec("p", "ci")]);
+        let rows = row_params(serde_json::json!([
+            {"worktree": "/wt/a", "text": "by-path", "role": "Warn", "until_scan": true},
+            {"worktree": "feat/b", "text": "by-branch", "role": "Warn", "until_scan": true},
+            {"worktree": "/wt/c", "text": "other", "role": "Warn", "until_scan": true},
+            {"worktree": "feat/d", "text": "persistent", "role": "Good"}
+        ]));
+        assert_eq!(apply_row_update(&mut state, "p", &rows), Ok(true));
+        assert!(
+            has_scan_subscriber(&state),
+            "a stored until_scan value makes a changed scan eligible without a subscriber"
+        );
+
+        // Plugin subscribed: the drop must precede the queued event.
+        let (runtime, supervisor, session) = test_session();
+        state.plugins.get_mut("p").unwrap().writer = Some(session.writer());
+        subscribe_scanned(&mut state, "p");
+        let mut sent = Vec::new();
+        drop_then_emit_with(
+            &mut state,
+            &[
+                ("/wt/a", Some("feat/a")),
+                ("/wt/b", Some("feat/b")),
+                ("/wt/d", Some("feat/d")),
+            ],
+            |seen, _, key, _| {
+                assert!(
+                    row_value(seen, "/wt/a").is_none() && row_value(seen, "feat/b").is_none(),
+                    "until_scan values are dropped before any event is queued"
+                );
+                sent.push(key.to_owned());
+                Ok(())
+            },
+        );
+        assert_eq!(sent.len(), 3, "every changed worktree is still announced");
+        assert!(row_value(&state, "/wt/a").is_none(), "dropped by path");
+        assert!(row_value(&state, "feat/b").is_none(), "dropped by branch");
+        assert_eq!(
+            row_value(&state, "/wt/c").unwrap().text,
+            "other",
+            "an unchanged worktree keeps its value"
+        );
+        assert_eq!(
+            row_value(&state, "feat/d").unwrap().text,
+            "persistent",
+            "a value without until_scan survives its scan"
+        );
+
+        // Not subscribed: the model-swap hook still drops the value.
+        state.plugins.get_mut("p").unwrap().writer = None;
+        let mut old = FrameModel::default();
+        let mut new = FrameModel::default();
+        old.sidebar_status
+            .git
+            .insert("/wt/c".into(), crate::sidebar::GitGlyphs::default());
+        new.sidebar_status.git.insert(
+            "/wt/c".into(),
+            crate::sidebar::GitGlyphs {
+                dirty: true,
+                ..Default::default()
+            },
+        );
+        assert!(has_scan_subscriber(&state));
+        emit_changed_scans(&mut state, &old, &new);
+        assert!(row_value(&state, "/wt/c").is_none());
+        assert!(
+            !has_scan_subscriber(&state),
+            "no until_scan value and no live subscriber left"
+        );
+        // An unchanged scan drops nothing.
+        let rows = row_params(serde_json::json!([
+            {"worktree": "/wt/c", "text": "again", "role": "Warn", "until_scan": true}
+        ]));
+        assert_eq!(apply_row_update(&mut state, "p", &rows), Ok(true));
+        emit_changed_scans(&mut state, &new, &new);
+        assert!(row_value(&state, "/wt/c").is_some());
+        stop_test_session(&runtime, &supervisor, session);
+    }
+
+    #[test]
+    fn next_row_expiry_is_none_without_ttl_rows() {
+        let mut state = state_with(vec![row_spec("p", "ci")]);
+        assert_eq!(state.next_row_expiry(), None);
+        let rows = row_params(serde_json::json!([
+            {"worktree": "main", "text": "ok", "role": "Good"},
+            {"worktree": "/wt/a", "text": "x", "role": "Warn", "until_scan": true}
+        ]));
+        assert_eq!(apply_row_update(&mut state, "p", &rows), Ok(true));
+        assert_eq!(
+            state.next_row_expiry(),
+            None,
+            "persistent and until_scan values arm no deadline"
+        );
+        assert!(!state.expire_rows(std::time::Instant::now()));
+    }
+
+    #[test]
+    fn next_loop_deadline_is_app_deadline_without_ttl_rows() {
+        let mut state = state_with(vec![row_spec("p", "ci")]);
+        assert_eq!(state.next_app_deadline(), None);
+        assert_eq!(
+            state.next_loop_deadline(),
+            None,
+            "idle stays a true block with no TTL rows"
+        );
+        assert_eq!(
+            crate::idle_poll::fold_deadline(
+                None,
+                state.next_loop_deadline(),
+                std::time::Instant::now()
+            ),
+            None
+        );
+        let rows = row_params(serde_json::json!([
+            {"worktree": "main", "text": "ok", "role": "Good"}
+        ]));
+        assert_eq!(apply_row_update(&mut state, "p", &rows), Ok(true));
+        assert_eq!(state.next_loop_deadline(), state.next_app_deadline());
     }
 
     #[test]

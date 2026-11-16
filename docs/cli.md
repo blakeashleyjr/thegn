@@ -8,14 +8,14 @@ rely on.
 
 Noun-verb namespaces mirror the domain model (repo → workspace → worktree):
 
-| Group         | Commands                                                                                                                                                                                                                                                                                                                                                                                                                                        | Channel                                                                |
-| ------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ---------------------------------------------------------------------- |
-| Workspace     | `wt list\|new\|rm\|diff\|disk\|clean` · `repo list\|recent\|provenance` · `program` — Manage programs (multi-repo groups — grouping only, no policy; alias: `project`; `list\|create\|rename\|rm\|assign`) · `open <repo>` · `map` · `land` · `integrate` · `merge` · `release prepare --bump <alpha\|beta\|rc\|patch>` · `search <pattern> [--regex\|--structural] [--replace <tpl> [--apply]]` — workspace find & replace (read/write scoped) | stable                                                                 |
-| Forge         | `pr` · `issue` · `dispatch` · `supervise` · `kaneo` · `ci` · `autopilot` — Opt-in issue-to-PR supervisor; `status` is read-only and never starts work                                                                                                                                                                                                                                                                                           | stable                                                                 |
-| Environments  | `env` · `zone` · `host` (dev) · `placement` (dev) · `sandbox` · `debug` · `mcp` · `plugin`                                                                                                                                                                                                                                                                                                                                                      | stable; `host` and `placement` are dev; `sandbox` remote parts are dev |
-| Session       | `session list\|open\|fork\|close\|send\|snapshot\|attach\|wait\|record` · `notify` · `automations` — Inspect trusted automation rules or dry-run an event fixture (`list\|test`) · `logs` · `share` · `forward` · `sandbox-argv` · `events` — Stream the daemon's filtered live event feed (`events tail`)                                                                                                                                      | stable                                                                 |
-| Control plane | `serve` · `session` · `attach` · `pair` · `api` · `proxy` — Model proxy: status/stats (read), start/stop (admin) (`status\|stats\|start\|stop`) · `agent`                                                                                                                                                                                                                                                                                       | stable                                                                 |
-| Meta          | `voice setup\|status\|model list\|model pull\|model rm` · `config` · `secret` — Credential broker: store/remove/list/migrate/audit secrets, rotate SSH keys (`set\|rm\|list\|migrate\|audit\|ssh rotate`) · `keys` — Inspect and check keybindings: `list`, `validate`, `hints` · `theme` · `skills` · `doctor` · `db` — Inspect or reclaim unused state database space (`vacuum`) · `setup` · `completions`                                    | stable; `voice` is dev                                                 |
+| Group         | Commands                                                                                                                                                                                                                                                                                                                                                                                                                                        | Channel                                                                         |
+| ------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------- |
+| Workspace     | `wt list\|new\|rm\|diff\|disk\|clean` · `repo list\|recent\|provenance` · `program` — Manage programs (multi-repo groups — grouping only, no policy; alias: `project`; `list\|create\|rename\|rm\|assign`) · `open <repo>` · `map` · `land` · `integrate` · `merge` · `release prepare --bump <alpha\|beta\|rc\|patch>` · `search <pattern> [--regex\|--structural] [--replace <tpl> [--apply]]` — workspace find & replace (read/write scoped) | stable                                                                          |
+| Forge         | `pr` · `issue` · `dispatch` · `supervise` · `kaneo` · `ci` · `autopilot` — Opt-in issue-to-PR supervisor; `status` is read-only and never starts work                                                                                                                                                                                                                                                                                           | stable                                                                          |
+| Environments  | `env` · `zone` · `host` (dev) · `placement` (dev) · `fleet` (dev) · `sandbox` · `debug` · `mcp` · `plugin`                                                                                                                                                                                                                                                                                                                                      | stable; `host`, `placement` and `fleet` are dev; `sandbox` remote parts are dev |
+| Session       | `session list\|open\|fork\|close\|send\|snapshot\|attach\|wait\|record` · `notify` · `automations` — Inspect trusted automation rules or dry-run an event fixture (`list\|test`) · `logs` · `share` · `forward` · `sandbox-argv` · `events` — Stream the daemon's filtered live event feed (`events tail`)                                                                                                                                      | stable                                                                          |
+| Control plane | `serve` · `session` · `attach` · `pair` · `api` · `proxy` — Model proxy: status/stats (read), start/stop (admin) (`status\|stats\|start\|stop`) · `agent`                                                                                                                                                                                                                                                                                       | stable                                                                          |
+| Meta          | `voice setup\|status\|model list\|model pull\|model rm` · `config` · `secret` — Credential broker: store/remove/list/migrate/audit secrets, rotate SSH keys (`set\|rm\|list\|migrate\|audit\|ssh rotate`) · `keys` — Inspect and check keybindings: `list`, `validate`, `hints` · `theme` · `skills` · `doctor` · `db` — Inspect or reclaim unused state database space (`vacuum`) · `setup` · `completions`                                    | stable; `voice` is dev                                                          |
 
 The gRPC control service also exposes `AgentSessions`, `SessionsRecord` and
 `WorktreesCreate`; their capability ids and request/response details are in the
@@ -26,7 +26,7 @@ their configuration and environment resolve in the local compositor.
 
 Stable verbs are available in every build. Dev verbs are available in the dev
 channel (`.#dev` flake output or `THEGN_CHANNEL=dev`); a stable build refuses
-`host` and `placement` with a message identifying each as a dev-channel feature
+`host`, `placement` and `fleet` with a message identifying each as a dev-channel feature
 and directing you to the dev build or `THEGN_CHANNEL=dev`. Experimental remote
 worktrees, cloud providers, placement, and voice stay off in stable even when
 configured. Observe dashboards and plugin app tabs are stable. The stable/dev
@@ -297,6 +297,7 @@ until its scope is granted.
 | `leases_list`               | `read`        | relay lease state per session                                          |
 | `me`                        | `read`        | the caller's pairing id, label, granted scopes                         |
 | `sessions_wait`             | `read`        | block until a session reaches a state (exited/idle/blocked/done/regex) |
+| `sessions_snapshot`         | `read`        | a live session's current emulator screen (`session`)                   |
 | `semantic_map`              | `read`        | ranked, budgeted repo map of a worktree's indexed entities             |
 | `semantic_blast_radius`     | `read`        | a worktree's blast-radius: changed entities, callers, untested, risk   |
 | `git_status`                | `read`        | list changed files in a worktree                                       |
@@ -312,7 +313,10 @@ until its scope is granted.
 | `sessions_open`             | `write`       | open a session — raw `argv`, or a configured agent by name             |
 | `sessions_kill`             | `write`       | kill a session's process (idempotent)                                  |
 | `sessions_resize`           | `write`       | resize a live session's PTY (`session`, `rows`, `cols`)                |
+| `sessions_split`            | `write`       | split a session: sibling pane (`session`, `dir`, `argv`, `cwd`, `env`) |
 | `worktrees_open`            | `write`       | focus a workspace in the running instance (`repo`, optional `branch`)  |
+| `dispatches_put`            | `write`       | append a roster row (`issue_id`, `worktree_path`, `agent_name`, ...)   |
+| `dispatches_set_status`     | `write`       | set a roster row's status (`id`, `status`, optional `lead` proof)      |
 | `sessions_input`            | `write` **+** | send raw terminal input/control characters to a live session           |
 
 The two `semantic_*` read tools (default `--scopes read`) answer from the
@@ -337,10 +341,10 @@ launch environment values are replaced by a size descriptor, never logged
 verbatim.
 
 Every tool in `tools/list` carries MCP `annotations`: the docs tools and the
-`read`-scope state tools are `readOnlyHint: true`; `sessions_kill`,
-`sessions_input` and `tools_run` are `destructiveHint: true`; `folders_assign`,
+`read`-scope state tools (including `sessions_snapshot`) are `readOnlyHint: true`; `sessions_kill`,
+`sessions_input`, `dispatches_set_status` and `tools_run` are `destructiveHint: true`; `folders_assign`,
 `editor_open`, `merge_add`, `notify_push`, `sessions_open`, `sessions_fork`,
-`sessions_resize` and `worktrees_open` are write tools marked `destructiveHint: false`. A new write tool is marked destructive until it is
+`sessions_resize`, `sessions_split`, `worktrees_open` and `dispatches_put` are write tools marked `destructiveHint: false`. A new write tool is marked destructive until it is
 reviewed. The hints help clients ask before acting; the scopes above are what
 thegn enforces.
 

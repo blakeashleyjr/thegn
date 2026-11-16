@@ -559,7 +559,9 @@ impl SidebarState {
             // that is the whole of what it can do: it is derived from the
             // roster, so renaming, filing, pinning or deleting one has nothing
             // to write to.
-            RowKind::PipelineGroup | RowKind::PipelineLane => {
+            // The derived "Other" group of external worktrees is the same: a
+            // view-side grouping with no folder row to rename or delete.
+            RowKind::PipelineGroup | RowKind::PipelineLane | RowKind::OtherGroup => {
                 entries.push(e(
                     "toggle",
                     "Collapse / expand",
@@ -574,7 +576,9 @@ impl SidebarState {
                     entries.push(e("open", "Open", Some(chord_of(Id::Activate))));
                 }
             }
-            RowKind::SectionHeading | RowKind::EmptyHint => {
+            // The "show more"/"show fewer" toggle does one thing (Enter,
+            // Space or a click); a menu would only repeat it.
+            RowKind::SectionHeading | RowKind::EmptyHint | RowKind::ShowMore => {
                 return None;
             }
         }
@@ -772,6 +776,9 @@ impl SidebarState {
                     if row.kind == crate::sidebar::RowKind::EmptyHint {
                         return SidebarOutcome::Synthetic(crate::keymap::Action::NewTerminal);
                     }
+                    if row.kind == crate::sidebar::RowKind::ShowMore {
+                        return self.toggle_show_more(model, session);
+                    }
                     if let Some(t) = row.tab_target.clone() {
                         return SidebarOutcome::Activate(t);
                     }
@@ -818,6 +825,11 @@ impl SidebarState {
                 // is a worktree or workspace. Collapse now lives solely on
                 // Enter/←/→ and the caret click, so headers can be selected too.
                 if let Some(row) = self.selected_row(model) {
+                    // Space on the "show more" row toggles it, like Enter:
+                    // it is not markable, and refusing would read as broken.
+                    if row.kind == crate::sidebar::RowKind::ShowMore {
+                        return self.toggle_show_more(model, session);
+                    }
                     if row.is_markable() {
                         let key = row.pin_key.clone();
                         if !self.marked.remove(&key) {
@@ -1070,6 +1082,15 @@ impl SidebarState {
         session: &crate::session::Session,
     ) -> SidebarOutcome {
         if let Some(row) = self.selected_row(model) {
+            // The derived "Other" group's open state is a per-project
+            // override of a config default, not a collapse key.
+            if row.kind == crate::sidebar::RowKind::OtherGroup {
+                let slug = row.workspace_slug.clone();
+                let open = row.collapsed;
+                self.set_other_open(&slug, open);
+                self.rebuild(model, session);
+                return SidebarOutcome::Redraw;
+            }
             // Per-kind collapse key: folders key on their `pin_key`
             // (`{slug}/folder:{id}`), everything else on `workspace_slug`.
             let slug = row.collapse_key().to_string();
@@ -1081,6 +1102,27 @@ impl SidebarState {
                 self.view.collapsed.insert(slug.clone());
                 self.persist(&format!("collapse:{slug}"), "1");
             }
+            self.rebuild(model, session);
+        }
+        SidebarOutcome::Redraw
+    }
+
+    /// Flip the cursor row's "show more" / "show fewer" toggle: expand or
+    /// re-truncate its group and persist the choice (`more_open:<group>`).
+    /// The rebuild re-seeks the cursor by `pin_key`, and the toggle row's key
+    /// is stable across both states, so the cursor stays on it.
+    pub(crate) fn toggle_show_more(
+        &mut self,
+        model: &mut FrameModel,
+        session: &crate::session::Session,
+    ) -> SidebarOutcome {
+        if let Some(group) = self
+            .selected_row(model)
+            .and_then(crate::sidebar::show_more_group)
+            .map(str::to_string)
+        {
+            let open = !self.view.more_open.contains(&group);
+            self.set_more_open(&group, open);
             self.rebuild(model, session);
         }
         SidebarOutcome::Redraw
@@ -1503,6 +1545,7 @@ mod tests {
                 env_name: None,
                 env_degraded: false,
                 sandbox_profile: None,
+                external: false,
             }],
             ..FrameModel::default()
         };
@@ -1738,6 +1781,7 @@ mod tests {
                     env_name: None,
                     env_degraded: false,
                     sandbox_profile: None,
+                    external: false,
                 })
                 .collect(),
             ..Default::default()
@@ -1948,5 +1992,87 @@ mod tests {
                 if target.worktree() == std::path::Path::new("/repos/app-feature")
                     && workspace_slug == "app"
         ));
+    }
+
+    /// The "show more" row toggles on Enter and on Space, `j` lands on it,
+    /// and the cursor stays on it across both toggles (the rebuild re-seeks
+    /// it by its stable `pin_key`). The toggle persists, so isolate
+    /// `XDG_STATE_HOME`.
+    #[test]
+    fn show_more_toggles_on_enter_and_space_and_keeps_the_cursor() {
+        use crate::session::{GroupKind, Session, WorktreeGroup};
+        let _state = crate::testenv::IsolatedState::new();
+        let worktrees = (0..21)
+            .map(|i| {
+                let kind = if i == 0 {
+                    GroupKind::Home
+                } else {
+                    GroupKind::Branch
+                };
+                WorktreeGroup::new(format!("app/b{i:02}"), kind, format!("/tmp/app-b{i:02}"))
+            })
+            .collect();
+        let session = Session {
+            id: "s1".into(),
+            worktrees,
+            active: 0,
+        };
+        let mut model = crate::hydrate::build_initial_model(&session, None);
+        model.sidebar_workspaces = vec![("app".into(), "app".into(), "repo".into(), String::new())];
+        let mut sb = SidebarState {
+            focused: true,
+            ..Default::default()
+        };
+        sb.view.display.group_row_limit = 15;
+        sb.rebuild(&mut model, &session);
+
+        let more_key = crate::sidebar::show_more_key("app");
+        let visible_kinds = |model: &FrameModel| -> Vec<crate::sidebar::RowKind> {
+            model
+                .sidebar_rows
+                .iter()
+                .filter(|r| r.visible)
+                .map(|r| r.kind)
+                .collect()
+        };
+        let more_idx = |model: &FrameModel| {
+            model
+                .sidebar_rows
+                .iter()
+                .filter(|r| r.visible)
+                .position(|r| r.pin_key == more_key)
+                .expect("the show-more row is visible")
+        };
+        let worktrees_shown = |model: &FrameModel| {
+            visible_kinds(model)
+                .iter()
+                .filter(|k| **k == crate::sidebar::RowKind::Worktree)
+                .count()
+        };
+        assert_eq!(worktrees_shown(&model), 15);
+
+        // `j` from the last shown entry lands on the toggle row.
+        let idx = more_idx(&model);
+        sb.cursor = idx - 1;
+        sb.handle_key(&KeyCode::Char('j'), Modifiers::NONE, &mut model, &session);
+        assert_eq!(sb.cursor, idx);
+
+        // Enter expands; the cursor follows the row to its new slot.
+        sb.handle_key(&KeyCode::Enter, Modifiers::NONE, &mut model, &session);
+        assert!(sb.view.more_open.contains("app"));
+        assert_eq!(worktrees_shown(&model), 21);
+        assert_eq!(sb.cursor, more_idx(&model), "cursor stays on the toggle");
+        assert!(
+            !sb.selected_row(&model).unwrap().collapsed,
+            "now reads `show fewer`"
+        );
+
+        // Space truncates again, and the cursor is still on the toggle.
+        sb.handle_key(&KeyCode::Char(' '), Modifiers::NONE, &mut model, &session);
+        assert!(!sb.view.more_open.contains("app"));
+        assert_eq!(worktrees_shown(&model), 15);
+        assert_eq!(sb.cursor, more_idx(&model));
+        assert!(sb.marked.is_empty(), "Space toggles, it does not mark");
+        assert!(sb.menu_for_cursor(&model, &session).is_none());
     }
 }

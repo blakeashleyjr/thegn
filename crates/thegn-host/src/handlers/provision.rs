@@ -2425,7 +2425,7 @@ mod tests {
         };
         assert_eq!(
             ordinary.to_string(),
-            "environment 'dev' (provider:sprites) could not be brought up: token missing — thegn will not silently fall back to the host. Fix the env, retry, choose \"run on host\", set `backend = \"none\"`, disable sandboxing, or set `isolation_floor = \"off\"`; otherwise install/start a container runtime (`thegn doctor` shows which) ([sandbox] or [env.dev]) to allow it."
+            "environment 'dev' (provider:sprites) could not be brought up: token missing — thegn will not silently fall back to the host. Fix the env, retry, choose \"run on host\", set `backend = \"none\"`, disable sandboxing, or set `isolation_floor = \"off\"`; otherwise check the provider token (`thegn env test dev`; `api_key_env` in [env.dev.provider]) ([sandbox] or [env.dev]) to allow it."
         );
     }
 }

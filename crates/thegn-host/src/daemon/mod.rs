@@ -92,12 +92,17 @@ fn scope_key_for(state_dir: &std::path::Path) -> String {
     thegn_core::config_daemon::state_scope_identity(state_dir)
 }
 
-fn scope_router(scope: String) -> axum::Router {
+/// The unix-only `GET /daemon/scope` route: the daemon's state scope plus the
+/// release channel it runs on (so a dev CLI can spot a stable daemon that
+/// strips dev-only config at load).
+fn scope_router(scope: String, channel: &str) -> axum::Router {
+    let channel = channel.to_owned();
     axum::Router::new().route(
         SCOPE_PATH,
         axum::routing::get(move || {
             let scope = scope.clone();
-            async move { axum::Json(serde_json::json!({ "scope": scope })) }
+            let channel = channel.clone();
+            async move { axum::Json(serde_json::json!({ "scope": scope, "channel": channel })) }
         }),
     )
 }
@@ -1563,7 +1568,10 @@ async fn run(
         server_label: format!("{} thegn {}", hostname(), env!("CARGO_PKG_VERSION")),
     };
     let app = thegn_svc::control::http::router(state)
-        .merge(scope_router(scope_key()))
+        .merge(scope_router(
+            scope_key(),
+            crate::channel_state::current().as_str(),
+        ))
         .merge(
             tonic::service::Routes::new(thegn_svc::control::grpc::ControlServer::new(local_grpc))
                 .into_axum_router(),
@@ -1944,7 +1952,10 @@ mod tests {
             axum::routing::get(|| async { axum::Json(serde_json::json!({ "ok": true })) }),
         );
         let app = match scope {
-            Some(scope) => app.merge(scope_router(scope)),
+            Some(scope) => app.merge(scope_router(
+                scope,
+                crate::channel_state::current().as_str(),
+            )),
             None => app,
         };
         if legacy {
@@ -2043,7 +2054,7 @@ mod tests {
         let socket = temp.path().join("daemon.sock");
         let listener =
             thegn_svc::ipc::IpcListener::Unix(tokio::net::UnixListener::bind(&socket).unwrap());
-        let app = scope_router("v1-aaa".into());
+        let app = scope_router("v1-aaa".into(), "dev");
         let server = tokio::spawn(async move {
             axum::serve(
                 listener,
@@ -2061,6 +2072,15 @@ mod tests {
         assert_eq!(
             client::check_daemon_scope(&client, &["v1-bbb".into()]).await,
             client::ScopeCheck::Mismatch("v1-aaa".into())
+        );
+        let raw = client
+            .call_raw("GET", SCOPE_PATH, None)
+            .await
+            .expect("scope route answers");
+        assert_eq!(raw["channel"], serde_json::json!("dev"));
+        assert_eq!(
+            client::daemon_channel(&client).await.as_deref(),
+            Some("dev")
         );
 
         server.abort();

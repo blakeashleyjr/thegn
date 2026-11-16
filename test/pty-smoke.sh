@@ -7,6 +7,8 @@ set -euo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=test/lib/pty.sh disable=SC1091
 source "$HERE/lib/pty.sh"
+# shellcheck source=test/lib/podman_pause.sh disable=SC1091
+source "$HERE/lib/podman_pause.sh"
 
 TG="${1:-$(cd "$HERE/.." && pwd)/target/debug/thegn}"
 TG="$(cd "$(dirname "$TG")" && pwd)/$(basename "$TG")"
@@ -33,6 +35,11 @@ TMP="$(mktemp -d)"
 # user cannot unlink, and cleanup must never decide the verdict.
 cleanup() {
   local rc=$?
+  local run_dir
+  # Reap before removal so an interrupted run also leaves no podman pause.
+  for run_dir in "$TMP"/*/run; do
+    [[ -d $run_dir ]] && podman_pause_reap "$run_dir"
+  done
   rm -rf "$TMP" 2>/dev/null || true
   exit "$rc"
 }
@@ -43,6 +50,10 @@ trap cleanup EXIT
 for var in "${!THEGN_@}"; do
   unset "$var"
 done
+# THE-870: with the default (enabled, auto) sandbox the startup orphan GC
+# probes `podman version`, which leaves a rootless `pause` process per private
+# XDG_RUNTIME_DIR. This harness never needs a container runtime.
+export THEGN_SANDBOX_BACKEND=none
 
 fail=0
 ok() { printf '  \033[32mok\033[0m   %s\n' "$1"; }
@@ -83,6 +94,15 @@ run_case() {
     bad "PTY launch exits non-zero or times out: $name (${cols}x${rows})"
     tail -80 "$log" || true
   fi
+
+  # THE-870: a launch must not leave a podman pause process behind.
+  local leaked
+  leaked="$(podman_pause_pids_for "$runtime" | wc -l)"
+  leaked="${leaked//[[:space:]]/}"
+  if [[ $leaked -ne 0 ]]; then
+    bad "PTY launch $name leaked $leaked podman pause process(es)"
+  fi
+  podman_pause_reap "$runtime"
 }
 
 echo "thegn PTY smoke test"

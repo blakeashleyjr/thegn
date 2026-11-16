@@ -451,6 +451,223 @@ fn masthead_item_spans_match_painted_right_cluster() {
     assert!(last.x + last.cols >= cols - 2);
 }
 
+/// The painted cells of the masthead row covered by `r`, as a string.
+fn masthead_cells(s: &Surface, r: Rect) -> String {
+    lines(s)[r.y].chars().skip(r.x).take(r.cols).collect()
+}
+
+fn chip_model(tabs: &[&str], active: usize) -> FrameModel {
+    FrameModel {
+        app_tabs: tabs.iter().map(|t| (*t).to_string()).collect(),
+        active_app: active,
+        ..Default::default()
+    }
+}
+
+#[test]
+fn masthead_chip_spans_match_painted_chips() {
+    let model = chip_model(&["work", "chat", "notes"], 1);
+    let chrome = layout::compute(160, 10, false, false);
+    let mut s = Surface::new(160, 10);
+    draw_masthead(&mut s, &chrome, &model);
+    let spans = crate::masthead::masthead_chip_spans(&model, &chrome);
+    assert_eq!(
+        spans.iter().map(|(i, _)| *i).collect::<Vec<_>>(),
+        vec![0, 1, 2],
+        "every chip fits at 160 cols, in tab order"
+    );
+    for (idx, r) in &spans {
+        assert_eq!(r.rows, 1);
+        assert_eq!(r.y, chrome.masthead_stats_row().y);
+        assert_eq!(
+            masthead_cells(&s, *r),
+            format!(" {} ", model.app_tabs[*idx]),
+            "span {idx} covers exactly its painted pill"
+        );
+    }
+    // Spans are disjoint and separated by the one-cell gap.
+    for w in spans.windows(2) {
+        assert_eq!(w[0].1.x + w[0].1.cols + 1, w[1].1.x);
+    }
+    // Inactive chips sit on the faint quiet pill (a button, not bare text);
+    // the active chip keeps its focus pill.
+    let dim = with_palette(|p| slot_rgb(p, S::Dim).to_string());
+    let quiet = theme_color(&theme::blend_over(&dim, &panel_rgb(), 0.10));
+    let focus = theme_color(&theme::blend_over(&focus_rgb(), &panel_rgb(), 0.28));
+    let cells = s.screen_cells();
+    let row = &cells[spans[0].1.y];
+    for (idx, r) in &spans {
+        let want = if *idx == model.active_app {
+            focus
+        } else {
+            quiet
+        };
+        for (x, cell) in row.iter().enumerate().skip(r.x).take(r.cols) {
+            assert_eq!(
+                cell.attrs().background(),
+                want,
+                "chip {idx} background at x={x}"
+            );
+        }
+    }
+}
+
+#[test]
+fn masthead_narrow_width_drops_inactive_chip_spans_but_keeps_active() {
+    let tabs = [
+        "work",
+        "chat",
+        "alpha-long-app-name",
+        "bravo-long-app-name",
+        "charlie-long-app-name",
+    ];
+    let model = chip_model(&tabs, 3);
+    let mut dropped_any = false;
+    for cols in [40usize, 60, 72, 96] {
+        let chrome = layout::compute(cols, 10, false, false);
+        let mut s = Surface::new(cols, 10);
+        draw_masthead(&mut s, &chrome, &model);
+        let spans = crate::masthead::masthead_chip_spans(&model, &chrome);
+        assert!(
+            spans.iter().any(|(i, _)| *i == 3),
+            "active chip always has a span at cols={cols}: {spans:?}"
+        );
+        for (idx, r) in &spans {
+            assert!(r.x + r.cols <= cols, "span inside the row at cols={cols}");
+            assert_eq!(masthead_cells(&s, *r), format!(" {} ", tabs[*idx]));
+        }
+        let row = &lines(&s)[0];
+        for (idx, tab) in tabs.iter().enumerate() {
+            if !spans.iter().any(|(i, _)| *i == idx) {
+                dropped_any = true;
+                assert!(
+                    !row.contains(&format!(" {tab} ")),
+                    "a dropped chip is not painted at cols={cols}: {row:?}"
+                );
+            }
+        }
+    }
+    assert!(dropped_any, "some width must drop an inactive chip");
+}
+
+#[test]
+fn chip_at_hits_misses_and_edges() {
+    let r = |x, cols| Rect {
+        x,
+        y: 0,
+        cols,
+        rows: 1,
+    };
+    let spans = [(0usize, r(2, 4)), (2usize, r(7, 3))];
+    assert_eq!(
+        crate::masthead::chip_at(&spans, 1, 0),
+        None,
+        "left of the first chip"
+    );
+    assert_eq!(
+        crate::masthead::chip_at(&spans, 2, 0),
+        Some(0),
+        "first cell"
+    );
+    assert_eq!(crate::masthead::chip_at(&spans, 5, 0), Some(0), "last cell");
+    assert_eq!(
+        crate::masthead::chip_at(&spans, 6, 0),
+        None,
+        "the gap between chips"
+    );
+    assert_eq!(
+        crate::masthead::chip_at(&spans, 7, 0),
+        Some(2),
+        "second chip's first cell"
+    );
+    assert_eq!(crate::masthead::chip_at(&spans, 9, 0), Some(2));
+    assert_eq!(
+        crate::masthead::chip_at(&spans, 10, 0),
+        None,
+        "one past the last chip"
+    );
+    assert_eq!(crate::masthead::chip_at(&spans, 3, 1), None, "wrong row");
+    assert_eq!(crate::masthead::chip_at(&[], 3, 0), None);
+}
+
+#[test]
+fn masthead_chip_hit_round_trips_through_chip_at() {
+    let model = chip_model(&["work", "chat", "notes"], 0);
+    let chrome = layout::compute(160, 10, false, false);
+    let spans = crate::masthead::masthead_chip_spans(&model, &chrome);
+    for (idx, r) in &spans {
+        assert_eq!(crate::masthead::chip_at(&spans, r.x, r.y), Some(*idx));
+        assert_eq!(
+            crate::masthead::chip_at(&spans, r.x + r.cols - 1, r.y),
+            Some(*idx)
+        );
+    }
+}
+
+#[test]
+fn masthead_sidebar_chip_appears_only_when_hidden() {
+    use crate::layout::SidebarMode;
+    let chrome = layout::compute(160, 10, false, false);
+    for mode in [SidebarMode::Full, SidebarMode::Rail] {
+        let model = FrameModel {
+            sidebar_mode: mode,
+            ..chip_model(&["work", "chat"], 0)
+        };
+        assert_eq!(
+            crate::masthead::masthead_sidebar_chip_span(&model, &chrome),
+            None,
+            "{mode:?}"
+        );
+        let mut s = Surface::new(160, 10);
+        draw_masthead(&mut s, &chrome, &model);
+        assert!(!lines(&s)[0].contains("sidebar hidden"), "{mode:?}");
+    }
+
+    let model = FrameModel {
+        sidebar_mode: SidebarMode::Hidden,
+        ..chip_model(&["work", "chat"], 0)
+    };
+    let glyph = crate::caps::active_glyphs().sidebar_mode_hidden;
+    let mut s = Surface::new(160, 10);
+    draw_masthead(&mut s, &chrome, &model);
+    let span =
+        crate::masthead::masthead_sidebar_chip_span(&model, &chrome).expect("hidden chip span");
+    assert_eq!(
+        masthead_cells(&s, span),
+        format!(" {glyph} sidebar hidden ")
+    );
+    // It leads the app chips and never overlaps them.
+    let chips = crate::masthead::masthead_chip_spans(&model, &chrome);
+    assert_eq!(chips.len(), 2);
+    assert_eq!(span.x + span.cols + 1, chips[0].1.x);
+    assert_eq!(crate::masthead::chip_at(&chips, span.x, span.y), None);
+
+    // Narrow rung: the glyph alone.
+    let narrow = layout::compute(70, 10, false, false);
+    let mut s = Surface::new(70, 10);
+    draw_masthead(&mut s, &narrow, &model);
+    let span = crate::masthead::masthead_sidebar_chip_span(&model, &narrow)
+        .expect("narrow hidden chip span");
+    assert_eq!(masthead_cells(&s, span), format!(" {glyph} "));
+    assert!(!lines(&s)[0].contains("sidebar hidden"));
+}
+
+#[test]
+fn masthead_sidebar_chip_renders_ascii_fallback() {
+    crate::caps::test_override::with_unicode(thegn_core::termcaps::UnicodeLevel::Ascii, || {
+        let model = FrameModel {
+            sidebar_mode: crate::layout::SidebarMode::Hidden,
+            ..chip_model(&["work"], 0)
+        };
+        let chrome = layout::compute(160, 10, false, false);
+        let mut s = Surface::new(160, 10);
+        draw_masthead(&mut s, &chrome, &model);
+        let span =
+            crate::masthead::masthead_sidebar_chip_span(&model, &chrome).expect("hidden chip span");
+        assert_eq!(masthead_cells(&s, span), " . sidebar hidden ");
+    });
+}
+
 #[test]
 fn workspace_slot_digits_skip_unswitchable_and_count_in_order() {
     let rect = Rect {
@@ -726,11 +943,16 @@ fn sidebar_rail_keeps_workspace_and_terminal_identity() {
     draw_sidebar(&mut s, rect, &model);
     let text = s.screen_chars_to_string();
     let lines: Vec<&str> = text.lines().collect();
-    assert!(lines[0].contains('a'), "workspace initial: {lines:?}");
-    assert!(lines[1].contains('f'), "worktree initial: {lines:?}");
-    assert!(lines[3].contains('z'), "terminal initial: {lines:?}");
+    // Row 0 is the rail-mode glyph; the rows start one row lower.
     assert!(
-        lines[4].trim().is_empty(),
+        lines[0].contains(crate::caps::active_glyphs().sidebar_mode_rail),
+        "rail mode glyph: {lines:?}"
+    );
+    assert!(lines[1].contains('a'), "workspace initial: {lines:?}");
+    assert!(lines[2].contains('f'), "worktree initial: {lines:?}");
+    assert!(lines[4].contains('z'), "terminal initial: {lines:?}");
+    assert!(
+        lines[5].trim().is_empty(),
         "EmptyHint renders nothing in rail: {lines:?}"
     );
 }

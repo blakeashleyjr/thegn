@@ -493,6 +493,10 @@ pub struct FrameModel {
     /// True when the sidebar is in its slim collapsed rail mode (activity dots
     /// + initials only); false renders the full panel.
     pub sidebar_rail: bool,
+    /// The sidebar's display mode (`Full` / `Rail` / `Hidden`). `sidebar_rail`
+    /// stays for its many readers; this adds the `Hidden` case the masthead's
+    /// hidden-sidebar chip needs. Defaults to `Full`.
+    pub sidebar_mode: crate::layout::SidebarMode,
     /// Resolved worktree-row display options (from `[ui]` config): which right-
     /// cluster fields show, the focused-detail policy, and icon overrides.
     pub sidebar_display: crate::sidebar_view::SidebarDisplay,

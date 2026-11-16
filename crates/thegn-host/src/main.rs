@@ -234,6 +234,7 @@ mod proc_workload;
 mod proc_workload_alloc;
 mod profile;
 mod provider_factory;
+mod provider_git;
 mod provider_workdir;
 mod provision_gate;
 mod provision_recover;
@@ -606,6 +607,12 @@ pub enum Command {
     Placement {
         #[command(subcommand)]
         action: cmd::placement::Action,
+    },
+    /// Every provider sandbox across the configured envs, joined to its
+    /// worktree (orphans and missing rows), with estimated spend.
+    Fleet {
+        #[command(subcommand)]
+        action: cmd::fleet::Action,
     },
     /// Inspect and provision `[host.<name>]` machines (the once-per-host
     /// lifecycle behind fast remote OCI sandboxes).
@@ -1196,6 +1203,8 @@ fn run_main() -> anyhow::Result<()> {
     // terminal enters the alternate screen, so a refusal is a plain typed
     // error on the user's terminal and nothing authority-bearing has run.
     let admitted = admit_configuration(&cli, thegn_core::db::MigrationActor::Controller)?;
+    // `[sandbox.git]` protects an explicit merge target (see provider_git).
+    crate::provider_git::install_merge_target_lookup(admitted.config());
     let result = rt.block_on(run::main(cli, admitted));
     // Drain queued best-effort DB writes (yank registers, panel ui_state) before
     // exit. The writer is its own std thread, so it outlives the runtime and this
@@ -1267,6 +1276,7 @@ fn experimental_command(command: &Command) -> Option<(&'static str, thegn_core::
     Some(match command {
         Command::Host { .. } => ("host", Feature::Providers),
         Command::Placement { .. } => ("placement", Feature::Placement),
+        Command::Fleet { .. } => ("fleet", Feature::Providers),
         _ => return None,
     })
 }
@@ -1419,6 +1429,9 @@ fn run_subcommand(cli: &Cli, command: Command) -> anyhow::Result<()> {
     // keyring itself, so install the process's single value-fetch chokepoint.
     thegn_svc::secret::install_resolver(crate::secret::resolve_ref_for);
     crate::git_handle::install(&cfg);
+    // Every verb that can resolve a sandbox (daemon, `session open`, `env`)
+    // protects an explicit `merge_queue.target_branch` under `[sandbox.git]`.
+    crate::provider_git::install_merge_target_lookup(&cfg);
     // Publish the resource policy for background jobs (the merge-queue fold
     // gate, the queues' agent handoffs). They are spawned deep in a call graph
     // that carries only `[merge_queue]` config, and they are the heaviest things
@@ -1511,6 +1524,7 @@ fn run_subcommand(cli: &Cli, command: Command) -> anyhow::Result<()> {
         Command::Zone { action } => cmd::zone::run(&cfg, action),
         Command::Project { action } => cmd::project::run(&cfg, action),
         Command::Placement { action } => cmd::placement::run(&cfg, action),
+        Command::Fleet { action } => cmd::fleet::run(&cfg, action),
         Command::Host { action } => cmd::host::run(&cfg, action),
         Command::Sandbox { action } => cmd::sandbox::run(&cfg, action),
         Command::Debug { action } => cmd::debug::run(&cfg, action),

@@ -7,6 +7,47 @@ All notable changes to **thegn** are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.1.0-alpha.88] — 2026-11-16
+
+### Added
+
+- Provider worktrees are seeded from a git bundle over the provider files API, with no GitHub credential in the VM; `thegn env pull` brings VM commits back into the lane branch. Pull-back refuses main, the default branch and the merge target, and fails closed when the default branch is unknown. (THE-2021)
+- `thegn fleet list` and `thegn fleet cost` show the provider inventory, orphans, hourly burn, accrued spend and projections. (THE-2020, THE-2015)
+- Config reloads report what applied live and what needs a restart, and every config key carries a reload class. (THE-2024)
+- A sidebar mode indicator: a header chip, a rail glyph, and a masthead chip while the sidebar is hidden. Clicking cycles full, rail and hidden.
+- Externally created worktrees go in a collapsed per-repo "Other" group. Long groups show 15 rows plus "show N more" (`sidebar_group_row_limit`, per-group `sidebar_group_row_limits`).
+- The MCP server gains `sessions_snapshot`, `sessions_split`, `dispatches_put` and `dispatches_set_status`. (THE-203)
+- Plugins can set transient row-field values with `ttl_secs` and `until_scan` (plugin API 0.6). (THE-2003)
+- Home Manager gains `stats.alerts`, `usage.alerts`, sound pack and chime paths, and `media.mpv.socket` / `media.mpd.socket`. (THE-428)
+- `thegn doctor` and the daemon report the daemon channel, and a stable daemon refuses dev-only envs. (THE-2007, THE-2017)
+- Landed-cleanup holds and changed reaper kept sets record a notification in the inbox. (THE-236, THE-530)
+- Config load warns on unknown notification enums and inverted alert thresholds. (THE-428)
+
+### Changed
+
+- Masthead app chips are clickable buttons, and a failed app shows why. (THE-2022)
+- The sidebar detail line shows more by default.
+- Task runs, voice capture and process helpers now supervise through the shared process supervisor, which detaches at leader exit and can hand the caller a live stdin pipe. (THE-729)
+- `ci.logs` uses one 90 second deadline, provider calls clip to the refresh deadline, the remote refresh prelude is cancellable, the run-detail drill has a 120 second wall and is cancelled on quit, and `ci.runs` listings are capped; dropped requests cancel their provider children. (THE-538)
+- Internal: typed git reads, strict git decoding on ssh/exec, a typed Fly machine inventory, and a refreshed host event ingress audit. (THE-368, THE-376, THE-383, THE-530, THE-661)
+
+### Fixed
+
+- Opening a provider worktree no longer shells out to the provider CLI, and provider worktrees are provisioned headlessly with git installed first. (THE-2014, THE-2005)
+- `thegn env down` destroys the provider sandbox and verifies it is gone before saying "down". `env set` away from a provider env resets the stored location, and `wt rm --delete-branch` works for provider worktrees with a local checkout. (THE-2019)
+- `ui.sidebar_detail_fields` applies on reload, and a weather provider, location or units change reloads live. (THE-2024, THE-2006)
+- Halt text names the stable-channel clamp and gives provider-specific remedies. (THE-2008, THE-2018)
+- `file:~/` secret refs use the account home, and `thegn wt ...` acts on the cwd's repo rather than an inherited `$THEGN_WORKTREE`. (THE-2016)
+- Sandboxes with backend `none` skip startup runtime probes, so they no longer leak paused podman containers. (THE-870)
+- Linear and GitHub issue reads follow label pages. (THE-323)
+- `integrate --from` fails closed when the branch read fails, and lifecycle refuses on a failed branch read. (THE-368)
+
+### Security
+
+- `[sandbox.git]` policy: bwrap sandboxes default to commit-only. The shared `.git` is read-only except the lane's refs, objects and worktree metadata; a top-level branch, the main checkout or an unknown merge target fall back to a read-only `.git` unless `mode = "full"`. (THE-2021, THE-2009)
+- `GH_TOKEN`/`GITHUB_TOKEN` (and GitLab/GitHub Enterprise tokens) are withheld from sandboxes and provider VMs by default; only `mode = "full"` with `credential = "repo-token"` or `"user-token"` passes them. (THE-2021)
+- Sandboxes mask runtime-directory escapes and the daemon's control socket. (THE-2009, THE-2011)
+
 ## [0.1.0-alpha.87] — 2026-11-15
 
 ### Added
@@ -3604,7 +3645,8 @@ launcher picker and the merge queue's `agent_command` hook remain — they run
 whatever commands you configure. Leftover `[llm_proxy]` config sections and
 `proxy_*` tables in existing state databases are ignored harmlessly.
 
-[Unreleased]: https://github.com/blakeashleyjr/thegn/compare/v0.1.0-alpha.87...HEAD
+[Unreleased]: https://github.com/blakeashleyjr/thegn/compare/v0.1.0-alpha.88...HEAD
+[0.1.0-alpha.88]: https://github.com/blakeashleyjr/thegn/compare/v0.1.0-alpha.87...v0.1.0-alpha.88
 [0.1.0-alpha.87]: https://github.com/blakeashleyjr/thegn/compare/v0.1.0-alpha.86...v0.1.0-alpha.87
 [0.1.0-alpha.86]: https://github.com/blakeashleyjr/thegn/compare/v0.1.0-alpha.85...v0.1.0-alpha.86
 [0.1.0-alpha.85]: https://github.com/blakeashleyjr/thegn/compare/v0.1.0-alpha.84...v0.1.0-alpha.85

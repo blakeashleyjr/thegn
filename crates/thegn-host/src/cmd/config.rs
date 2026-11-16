@@ -142,6 +142,10 @@ pub fn run(
                 shown_value(&key, &written_value),
                 path.display()
             );
+            // THE-2024: say whether a running thegn picks this up.
+            if let Some(note) = reload_note(&key) {
+                outln!("{note}");
+            }
             // The write is valid, but the file still carries pre-existing bad
             // values in other keys — surface them so they don't linger unnoticed
             // (they were already warn-defaulting on every load; not the fault of
@@ -435,6 +439,12 @@ fn path_is_secret(key: &str) -> bool {
         || thegn_core::redact::is_sensitive_path(&key.split('.').collect::<Vec<_>>())
 }
 
+/// What setting `key` means for a running thegn: applies live, after a
+/// restart, or at its next use. `None` for a key no reload class covers.
+fn reload_note(key: &str) -> Option<&'static str> {
+    thegn_core::config::reload_class::class_for(key).map(|(class, _)| class.describe())
+}
+
 /// A value for echoing back to the user, masked when `key` is secret-bearing.
 fn shown_value(key: &str, value: &str) -> String {
     if path_is_secret(key) {
@@ -614,6 +624,23 @@ fn validate(path: &Path, repo_context: Option<PathBuf>) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn set_reports_the_reload_class_of_the_key() {
+        assert_eq!(
+            reload_note("weather.location"),
+            Some("applies live in a running thegn")
+        );
+        assert_eq!(
+            reload_note("daemon.enabled"),
+            Some("takes effect after a restart")
+        );
+        assert_eq!(
+            reload_note("sandbox.backend"),
+            Some("used the next time it is needed")
+        );
+        assert_eq!(reload_note("no_such_section.key"), None);
+    }
 
     #[test]
     fn validate_accepts_advisories_without_rewriting_and_rejects_real_errors() {

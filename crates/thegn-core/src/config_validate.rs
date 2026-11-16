@@ -313,6 +313,15 @@ pub fn validate_diagnostics_with_policy(
                 message,
             }
         }));
+        diagnostics.extend(
+            enum_value_warnings(&cfg)
+                .into_iter()
+                .chain(alert_order_warnings(&cfg))
+                .map(|message| ValidationDiagnostic {
+                    severity: ValidationSeverity::Warning,
+                    message,
+                }),
+        );
         if cfg.voice.kind == crate::config::VoiceKind::Http
             && let Err(message) = cfg.voice.validate_credential_transport()
         {
@@ -343,6 +352,17 @@ pub fn validate_diagnostics_with_policy(
                 }
             }
         }
+        let runtime_dir = std::env::var_os("XDG_RUNTIME_DIR")
+            .filter(|value| !value.is_empty())
+            .map(std::path::PathBuf::from);
+        diagnostics.extend(
+            mount_exposure_warnings(&cfg, runtime_dir.as_deref(), &crate::util::home())
+                .into_iter()
+                .map(|message| ValidationDiagnostic {
+                    severity: ValidationSeverity::Warning,
+                    message,
+                }),
+        );
         if let Some(message) = cfg.sandbox.warm_direnv.deprecation_warning() {
             diagnostics.push(ValidationDiagnostic {
                 severity: ValidationSeverity::Warning,
@@ -365,8 +385,81 @@ pub fn validate_diagnostics_with_policy(
                     message,
                 }),
         );
+        diagnostics.extend(sandbox_git_warnings(&cfg).into_iter().map(|message| {
+            ValidationDiagnostic {
+                severity: ValidationSeverity::Warning,
+                message,
+            }
+        }));
     }
     diagnostics
+}
+
+/// THE-2021: `[sandbox.git]` policy warnings for the global table and every
+/// `[profiles.<n>.sandbox.git]` / `[env.<n>.sandbox.git]` overlay (each
+/// validated as merged onto the global table, labelled with its layer). An
+/// overlay repeats only warnings the global table does not already raise.
+fn sandbox_git_warnings(cfg: &Config) -> Vec<String> {
+    use crate::config_sandbox::git_policy::validate;
+    let global = validate(&cfg.sandbox.git);
+    let mut layers = Vec::new();
+    for (name, profile) in &cfg.profiles {
+        if let Some(git) = &profile.sandbox.git {
+            layers.push((format!("profiles.{name}."), cfg.sandbox.git.merged(git)));
+        }
+    }
+    for (name, env) in &cfg.env {
+        if let Some(git) = &env.sandbox.git {
+            layers.push((format!("env.{name}."), cfg.sandbox.git.merged(git)));
+        }
+    }
+    let mut out = global.clone();
+    for (prefix, git) in layers {
+        out.extend(
+            validate(&git)
+                .into_iter()
+                .filter(|message| !global.contains(message))
+                .map(|message| format!("{prefix}{message}")),
+        );
+    }
+    out
+}
+
+/// THE-2009: warn on sandbox mounts that expose `$XDG_RUNTIME_DIR` or make
+/// `~/.claude-profiles` writable, across every layer that declares mounts.
+/// The runtime dir and home are injected so tests never read the ambient env.
+fn mount_exposure_warnings(
+    cfg: &Config,
+    runtime_dir: Option<&std::path::Path>,
+    home: &std::path::Path,
+) -> Vec<String> {
+    let mut labelled: Vec<(String, String)> = Vec::new();
+    let mut add = |prefix: &str, mounts: &[String]| {
+        labelled.extend(
+            mounts
+                .iter()
+                .enumerate()
+                .map(|(index, mount)| (format!("{prefix}[{index}]"), mount.clone())),
+        );
+    };
+    add("sandbox.mounts", &cfg.sandbox.mounts);
+    for (name, profile) in &cfg.profiles {
+        if let Some(mounts) = &profile.sandbox.mounts {
+            add(&format!("profiles.{name}.sandbox.mounts"), mounts);
+        }
+    }
+    for (name, env) in &cfg.env {
+        if let Some(mounts) = &env.sandbox.mounts {
+            add(&format!("env.{name}.sandbox.mounts"), mounts);
+        }
+    }
+    for (slug, workspace) in &cfg.workspace {
+        add(
+            &format!("project.{slug}.sandbox_mounts"),
+            &workspace.sandbox_mounts,
+        );
+    }
+    crate::sandbox_runtime_escape::exposure_warnings(&labelled, runtime_dir, home)
 }
 
 fn validate_normalized(body: &str) -> Vec<String> {
@@ -675,6 +768,63 @@ fn list_value_warnings(cfg: &Config) -> Vec<String> {
         if id != "antigravity" && crate::account::provider(id).is_none() {
             warnings.push(format!(
                 "usage.providers[{i}] = {id:?} is not a known usage provider; it is ignored"
+            ));
+        }
+    }
+    warnings
+}
+
+/// Notification string settings whose unknown values silently fall back to a
+/// default. Warnings only; values are echoed with `{:?}`.
+fn enum_value_warnings(cfg: &Config) -> Vec<String> {
+    let mut warnings = Vec::new();
+    let exit = &cfg.notifications.process_exit;
+    if crate::event_bus::ProcessExitPolicy::parse_known(exit).is_none() {
+        warnings.push(format!(
+            "notifications.process_exit = {exit:?} is not one of off, failures, failures_and_tasks, all; the default is used"
+        ));
+    }
+    let urgency = &cfg.notifications.desktop_min_urgency;
+    if crate::event_bus::NotificationUrgency::parse_known(urgency).is_none() {
+        warnings.push(format!(
+            "notifications.desktop_min_urgency = {urgency:?} is not one of low, normal, critical; the default is used"
+        ));
+    }
+    warnings
+}
+
+/// Alert rules whose warn level can never fire before critical. Both levels
+/// must be enabled (> 0); equal values warn. Warnings only.
+fn alert_order_warnings(cfg: &Config) -> Vec<String> {
+    let a = &cfg.stats.alerts;
+    let above = [
+        ("cpu", &a.cpu),
+        ("mem", &a.mem),
+        ("swap", &a.swap),
+        ("gpu", &a.gpu),
+        ("temp", &a.temp),
+        ("load", &a.load),
+        ("reclaim", &a.reclaim),
+    ];
+    let below = [
+        ("disk_free", &a.disk_free),
+        ("battery", &a.battery),
+        ("disk_eta", &a.disk_eta),
+    ];
+    let mut warnings = Vec::new();
+    for (name, rule) in above {
+        if rule.warn > 0.0 && rule.critical > 0.0 && rule.warn >= rule.critical {
+            warnings.push(format!(
+                "stats.alerts.{name}: warn {} is not below critical {}; the warn level never fires first",
+                rule.warn, rule.critical
+            ));
+        }
+    }
+    for (name, rule) in below {
+        if rule.warn > 0.0 && rule.critical > 0.0 && rule.warn <= rule.critical {
+            warnings.push(format!(
+                "stats.alerts.{name}: warn {} is not above critical {}; the warn level never fires first",
+                rule.warn, rule.critical
             ));
         }
     }
@@ -1545,9 +1695,15 @@ mod tests {
         // TLS-terminated, and tunnel-only control-plane deployments.
         // 101 → 102 (THE-2002): `[ui] sidebar_detail_when` (DetailWhen) —
         // whether the sidebar detail line needs sidebar focus.
+        // 102 → 105 (THE-2021): `[sandbox.git]` mode (SandboxGitMode),
+        // transport (GitTransport) and credential (GitCredential) — the
+        // sandbox git write policy.
+        // 105 → 106 (b139): `[ui] sidebar_external_worktrees`
+        // (ExternalWorktrees) — group/show/hide for worktrees thegn did not
+        // create.
         assert_eq!(
             defs.len(),
-            102,
+            106,
             "config_enum definitions in the Config schema changed; update the \
              pin (and the exclusion note) deliberately: {defs:?}"
         );
@@ -1589,6 +1745,9 @@ mod tests {
         has("issues.provider", "IssueProviderKind");
         has("ui.sidebar_focus_detail", "FocusDetail");
         has("ui.sidebar_detail_when", "DetailWhen");
+        has("sandbox.git.mode", "SandboxGitMode");
+        has("sandbox.git.transport", "GitTransport");
+        has("sandbox.git.credential", "GitCredential");
         // Maps via additionalProperties.
         has("env.*.provider.connect", "ProviderConnect");
         has("host.*.reach", "HostReach");
@@ -1976,6 +2135,69 @@ template = "image:registry.example/dev:1"
     }
 
     #[test]
+    fn enum_value_warnings_flag_unknown_urgency_and_exit_policy() {
+        assert!(enum_value_warnings(&Config::default()).is_empty());
+        let mut cfg = Config::default();
+        cfg.notifications.process_exit = "ALL".into();
+        cfg.notifications.desktop_min_urgency = "CRITICAL".into();
+        assert!(enum_value_warnings(&cfg).is_empty());
+        cfg.notifications.process_exit = "sometimes".into();
+        cfg.notifications.desktop_min_urgency = "urgent".into();
+        let warnings = enum_value_warnings(&cfg);
+        assert_eq!(warnings.len(), 2);
+        assert!(warnings[0].contains("notifications.process_exit"));
+        assert!(warnings[1].contains("notifications.desktop_min_urgency"));
+    }
+
+    #[test]
+    fn alert_order_warnings_flag_inverted_pairs() {
+        assert!(alert_order_warnings(&Config::default()).is_empty());
+        let mut cfg = Config::default();
+        cfg.stats.alerts.cpu.warn = 90.0;
+        cfg.stats.alerts.cpu.critical = 80.0;
+        let warnings = alert_order_warnings(&cfg);
+        assert_eq!(warnings.len(), 1);
+        assert!(warnings[0].starts_with("stats.alerts.cpu:"));
+        let mut cfg = Config::default();
+        cfg.stats.alerts.battery.warn = 10.0;
+        cfg.stats.alerts.battery.critical = 20.0;
+        let warnings = alert_order_warnings(&cfg);
+        assert_eq!(warnings.len(), 1);
+        assert!(warnings[0].starts_with("stats.alerts.battery:"));
+        let mut cfg = Config::default();
+        cfg.stats.alerts.mem.warn = 70.0;
+        cfg.stats.alerts.mem.critical = 70.0;
+        assert_eq!(alert_order_warnings(&cfg).len(), 1);
+        let mut cfg = Config::default();
+        cfg.stats.alerts.cpu.warn = 0.0;
+        cfg.stats.alerts.cpu.critical = 80.0;
+        cfg.stats.alerts.battery.warn = 10.0;
+        cfg.stats.alerts.battery.critical = 0.0;
+        assert!(alert_order_warnings(&cfg).is_empty());
+    }
+
+    #[test]
+    fn enum_and_alert_warnings_are_ignorable_diagnostics() {
+        let body = "[notifications]\nprocess_exit = \"sometimes\"\n[stats.alerts.cpu]\nwarn = 90.0\ncritical = 80.0\n";
+        let diagnostics = validate_diagnostics(body);
+        let warnings: Vec<_> = diagnostics
+            .iter()
+            .filter(|d| d.severity == ValidationSeverity::Warning)
+            .collect();
+        assert!(warnings.iter().any(|d| d.message.contains("process_exit")));
+        assert!(
+            warnings
+                .iter()
+                .any(|d| d.message.contains("stats.alerts.cpu"))
+        );
+        assert!(
+            diagnostics
+                .iter()
+                .all(|d| d.severity != ValidationSeverity::Error)
+        );
+    }
+
+    #[test]
     fn list_value_warnings_flag_bad_dnd_windows_and_unknown_providers() {
         assert!(list_value_warnings(&Config::default()).is_empty());
         let good = list_config(
@@ -2216,6 +2438,34 @@ template = "image:registry.example/dev:1"
     }
 
     #[test]
+    fn sandbox_git_policy_warnings_cover_global_and_env_overlays() {
+        let body = "[sandbox.git]\npush_refs = [\"refs/heads/m*\"]\n\n[env.box.sandbox.git]\ndeny_refs = [\"heads/main\"]\n";
+        let warnings = float_warnings_in(body, "sandbox.git.");
+        assert!(
+            warnings
+                .iter()
+                .any(|w| w.starts_with("sandbox.git.push_refs:")),
+            "{warnings:?}"
+        );
+        assert!(
+            warnings
+                .iter()
+                .any(|w| w.starts_with("env.box.sandbox.git.deny_refs:")),
+            "{warnings:?}"
+        );
+        // The overlay does not repeat the global table's own warning.
+        assert!(
+            !warnings
+                .iter()
+                .any(|w| w.starts_with("env.box.sandbox.git.push_refs:")),
+            "{warnings:?}"
+        );
+        assert!(
+            float_warnings_in("[sandbox.git]\nmode = \"commit-only\"\n", "sandbox.git.").is_empty()
+        );
+    }
+
+    #[test]
     fn float_key_ranges_reach_validate_diagnostics_as_warnings_and_allow_crit_below_warn() {
         let body = "[media]\nvolume_step = 1.5\n";
         assert!(validate_str(body).is_empty(), "{:?}", validate_str(body));
@@ -2396,6 +2646,37 @@ sidebar_workspace_sort = "attention"
         );
         assert!(diagnostics[0].message.contains("relative"));
         assert!(validate_str(body).is_empty());
+    }
+
+    fn exposure_for(body: &str) -> Vec<String> {
+        let cfg: Config = toml::from_str(body).unwrap();
+        mount_exposure_warnings(
+            &cfg,
+            Some(std::path::Path::new("/run/user/1000")),
+            std::path::Path::new("/h"),
+        )
+    }
+
+    #[test]
+    fn env_mount_of_run_user_warns_about_runtime_dir_exposure() {
+        let warnings = exposure_for("[env.pipeline.sandbox]\nmounts = [\"/run/user\"]\n");
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
+        assert!(warnings[0].contains("env.pipeline.sandbox.mounts[0]"));
+        assert!(warnings[0].contains("exposes $XDG_RUNTIME_DIR"));
+    }
+
+    #[test]
+    fn mount_exposure_warnings_label_every_mount_layer() {
+        let body = "[sandbox]\nmounts = [\"/srv\", \"/run/user/1000\"]\n\
+                    [profiles.work.sandbox]\nmounts = [\"/h/.claude-profiles\"]\n\
+                    [project.repo]\nsandbox_mounts = [\"/run:ro\"]\n";
+        let warnings = exposure_for(body);
+        assert_eq!(warnings.len(), 3, "{warnings:?}");
+        assert!(warnings[0].contains("sandbox.mounts[1]"));
+        assert!(warnings[1].contains("profiles.work.sandbox.mounts[0]"));
+        assert!(warnings[1].contains("~/.claude-profiles"));
+        assert!(warnings[2].contains("project.repo.sandbox_mounts[0]"));
+        assert!(exposure_for("[sandbox]\nmounts = [\"/run/user/1000/gnupg\"]\n").is_empty());
     }
 
     #[test]

@@ -28,8 +28,6 @@
 #             local custody today; a remote-operator route is future work.
 
 calendar.ingest	mcp	MCP state tools land in the client-API phase
-dispatches.put	mcp	MCP state tools land in the client-API phase
-dispatches.set_status	mcp	MCP state tools land in the client-API phase
 git.commit	mcp	MCP state tools land in the client-API phase
 git.stage	mcp	MCP state tools land in the client-API phase
 issues.comment	mcp	MCP state tools land in the client-API phase
@@ -72,5 +70,3 @@ secret.set	http	control-API route deferred; CLI-only for now
 secret.ssh.rotate	grpc	control-API route deferred; CLI-only for now
 secret.ssh.rotate	http	control-API route deferred; CLI-only for now
 sessions.detach	mcp	MCP state tools land in the client-API phase
-sessions.snapshot	mcp	MCP state tools land in the client-API phase
-sessions.split	mcp	MCP state tools land in the client-API phase

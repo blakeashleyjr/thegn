@@ -138,3 +138,82 @@ fn weather_poll_uses_shared_runtime() {
     assert!(!source.contains("new_current_thread"));
     assert!(source.contains("thegn_svc::bg_runtime::block_on("));
 }
+
+fn at(location: &str) -> WeatherConfig {
+    WeatherConfig {
+        location: location.into(),
+        ..enabled()
+    }
+}
+
+#[test]
+fn live_key_tracks_location_and_ignores_case() {
+    assert_ne!(
+        live_key(&at("Oceanside"), None),
+        live_key(&at("Reykjavik"), None)
+    );
+    assert_eq!(
+        live_key(&at("Oceanside, CA"), None),
+        live_key(&at(" oceanside, ca"), None)
+    );
+}
+
+#[test]
+fn reload_needs_poll_on_location_change() {
+    assert!(reload_needs_poll(&at("Oceanside"), &at("Reykjavik"), None));
+}
+
+#[test]
+fn reload_needs_poll_on_provider_change() {
+    // Only `wttr_in` is active today, so a provider move to another active kind
+    // cannot be built; moving to an inert one is left to the ticker re-arm.
+    let none = WeatherConfig {
+        provider: WeatherProviderKind::None,
+        ..at("Oceanside")
+    };
+    assert!(!reload_needs_poll(&at("Oceanside"), &none, None));
+}
+
+#[test]
+fn reload_needs_poll_on_units_change() {
+    use thegn_core::config_weather::WeatherUnits;
+    let metric = WeatherConfig {
+        units: WeatherUnits::Metric,
+        ..at("Oceanside")
+    };
+    let imperial = WeatherConfig {
+        units: WeatherUnits::Imperial,
+        ..at("Oceanside")
+    };
+    assert!(reload_needs_poll(&metric, &imperial, None));
+}
+
+#[test]
+fn reload_does_not_poll_when_unchanged() {
+    let a = at("Oceanside");
+    assert!(!reload_needs_poll(&a, &a.clone(), None));
+    let slower = WeatherConfig {
+        refresh_interval_secs: 7200,
+        ..a.clone()
+    };
+    assert!(!reload_needs_poll(&a, &slower, None));
+}
+
+#[test]
+fn reload_does_not_poll_when_inactive() {
+    let off = WeatherConfig {
+        enabled: false,
+        ..at("Reykjavik")
+    };
+    assert!(!reload_needs_poll(&off, &at("Oceanside"), None));
+    assert!(!reload_needs_poll(&at("Oceanside"), &off, None));
+}
+
+#[test]
+fn reload_does_not_poll_on_case_or_whitespace_edit() {
+    assert!(!reload_needs_poll(
+        &at("Oceanside, CA"),
+        &at(" oceanside, ca"),
+        None
+    ));
+}

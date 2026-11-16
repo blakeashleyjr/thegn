@@ -1328,9 +1328,11 @@ pub(crate) mod bounded {
             (End::TimedOut, GroupState::Terminated | GroupState::Drained, Leader::Reaped(_)) => {
                 AgentRunOutcome::TimedOut
             }
-            (End::TimedOut, GroupState::Survivors | GroupState::Unknown, Leader::Reaped(_)) => {
-                AgentRunOutcome::Unsettled
-            }
+            (
+                End::TimedOut,
+                GroupState::Survivors | GroupState::Unknown | GroupState::Detached,
+                Leader::Reaped(_),
+            ) => AgentRunOutcome::Unsettled,
             (End::LeaderExited, _, Leader::Reaped(status)) => AgentRunOutcome::Exited(status),
             // Tail streams cannot trigger OutputLimit; treat it as infrastructure, never success.
             (End::OutputLimit(_), _, Leader::Reaped(_)) => AgentRunOutcome::Unsettled,
@@ -2141,7 +2143,7 @@ mod tests {
             .to_string_lossy()
             .into_owned();
         let db = thegn_core::db::Db::open().unwrap();
-        db.put_worktree("repo/wt", &worktree, &worktree, "feat", None, None)
+        db.put_worktree("repo/wt", &worktree, &worktree, "tg/feat", None, None)
             .unwrap();
         db.set_worktree_env(&worktree, "queuebox").unwrap();
         drop(db);
@@ -3179,7 +3181,9 @@ mod tests {
         let worktree = root.path().join("wt");
         let mut add_worktree = thegn_core::util::git_cmd(&repo);
         add_worktree.args(["worktree", "add", "-q"]);
-        add_worktree.arg(&worktree).args(["-b", "feat"]);
+        // A lane-namespace branch: `[sandbox.git]` carves commit paths out of
+        // the read-only common dir only for `<ns>/<name>` branches.
+        add_worktree.arg(&worktree).args(["-b", "tg/feat"]);
         assert!(run_git_control_command(&mut add_worktree).status.success());
         let common = std::fs::canonicalize(repo.join(".git")).unwrap();
         let config_worktree = common.join("worktrees/wt/config.worktree");
@@ -3417,7 +3421,9 @@ mod tests {
         }
         let spec = credential_free_spec_at(spec, None);
         let hook = fixture.common.join("hooks/post-checkout");
-        let writable = fixture.common.join("thegn-canary-rw");
+        // Under `[sandbox.git]` the common dir root is read-only; the object
+        // store is one of the commit carve-outs.
+        let writable = fixture.common.join("objects/thegn-canary-rw");
         let script = format!(
             "printf x > {}; printf ok > {}",
             thegn_core::util::sh_quote(&hook.to_string_lossy()),
@@ -3441,7 +3447,7 @@ mod tests {
         );
         assert!(
             writable.is_file(),
-            "positive control: common git dir remains writable"
+            "positive control: the git object store carve-out remains writable"
         );
         std::fs::remove_file(writable).unwrap();
     }
@@ -3557,11 +3563,11 @@ mod tests {
         assert_eq!(String::from_utf8_lossy(&tracked.stdout).trim(), "probe.txt");
 
         let mut branch = thegn_core::util::git_cmd(fixture.common.parent().unwrap());
-        branch.args(["rev-parse", "feat"]);
+        branch.args(["rev-parse", "tg/feat"]);
         let branch = run_git_control_command(&mut branch);
         assert!(
             branch.status.success(),
-            "git rev-parse feat failed: {branch:?}"
+            "git rev-parse tg/feat failed: {branch:?}"
         );
         let mut head = thegn_core::util::git_cmd(&fixture.worktree);
         head.args(["rev-parse", "HEAD"]);

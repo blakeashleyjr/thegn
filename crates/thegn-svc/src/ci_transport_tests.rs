@@ -175,6 +175,7 @@ fn transport_non_local_commands_never_export_a_token_and_use_the_remote_login_fo
         let github = GithubCi {
             remote: Some(github_remote.clone()),
             cancel: Arc::new(AtomicBool::new(false)),
+            deadline: None,
         };
         let cmd = github
             .command(&loc, &["run", "list"])

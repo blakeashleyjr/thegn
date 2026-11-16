@@ -62,7 +62,16 @@ warned about, but canonical writes and generated references emit only the
 project spellings. Tracker-owned `workspace_id`, `workspace_slug`, and
 `project_id` keys are unrelated and remain unchanged.
 
-The file is watched: edits apply live, no restart.
+The file is watched, and every key has a reload class. Most display
+settings apply live: the sidebar, theme, bars, weather, calendar, panel,
+keys, voice and LSP. Some keys are read afresh each time they are used,
+such as `[sandbox]`, `[env.*]`, `[project.*]`, `[git]` and the queues, so
+the next worktree, launch or queue run picks them up. A few are read only at
+launch, such as `[daemon]`, `[serve]`, `[mcp]` and `[network]`, and need a
+restart. After a save, the status line says what changed, for example
+`Config reloaded · live: sidebar, weather · restart required: daemon.enabled`.
+`thegn config set` prints the same class for the key it wrote. Where thegn
+cannot tell whether a running instance re-reads a key, it says restart.
 
 ## Highlights
 
@@ -600,7 +609,7 @@ Recording, media and the monitor process table are also exposed:
 `mediaDefaultAction`, `mediaOverlayOnBadgeClick`, `mediaSeekStepSecs`,
 `mediaSeekStepVideoSecs`, `mediaPollIntervalSecs`, `mediaPlayersPriority`,
 `monitorProcRows`, `monitorProcesses` and `monitorProcessIo`, plus
-`mediaVolumeStep` (0.0 through 1.0). The `mpv`/`mpd` backend tables are not exposed. This
+`mediaVolumeStep` (0.0 through 1.0). The `mpv`/`mpd` socket paths are exposed as `mediaMpvSocket` and `mediaMpdSocket`; `media.mpd.password` (a credential) is not exposed. This
 exposes the existing default-action setting only; it adds no action ids.
 
 The `[limits]` and `[diagnostics]` tables are exposed as `limitsTestCpuQuota`,

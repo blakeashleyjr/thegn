@@ -24,6 +24,8 @@ use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
+pub mod reload_class;
+
 /// Captured inputs used by pure configuration normalization.  Admission must
 /// never reopen HOME (or another ambient source) while it is composing a
 /// candidate; legacy effectful callers capture this once at their own edge.
@@ -2640,6 +2642,13 @@ pub struct WorkspaceConfig {
     /// the operator granted. See [`crate::control::resolve_serve_scopes`].
     #[serde(skip_serializing_if = "McpServeConfig::is_default")]
     pub mcp_serve: McpServeConfig,
+    /// Extra directories whose worktrees count as this project's own in the
+    /// sidebar (`[project.<slug>] worktree_roots = ["~/wt/app"]`; `~` is
+    /// expanded). A git worktree outside thegn's checkout layout and outside
+    /// every root here is "external" and follows `[ui]
+    /// sidebar_external_worktrees` (grouped under "Other" by default).
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub worktree_roots: Vec<String>,
 }
 
 /// A named **environment bundle** (`[bundle.<name>]`) — a composable unit of env
@@ -4012,7 +4021,9 @@ pub enum FileAccess {
     None,
 }
 
-pub use crate::config_sandbox::SandboxLimits;
+pub use crate::config_sandbox::{
+    GitCredential, GitTransport, SandboxGitConfig, SandboxGitMode, SandboxGitOverlay, SandboxLimits,
+};
 
 // The `[sandbox.vpn]` config family lives in the `config_vpn` sibling module
 // (kept flat); re-exported so `crate::config::*` paths are unchanged.
@@ -4511,6 +4522,10 @@ pub struct SandboxConfig {
     /// reproduced in every sandbox/remote (CLI tools, dotfiles, bring-your-own
     /// setup) so a sandbox feels like local. See [`HomeConfig`].
     pub home: HomeConfig,
+    /// `[sandbox.git]` — what a sandboxed pane may write in the git common
+    /// dir (refs, objects, hooks) and how commits come back. Policy types and
+    /// the pure mount planner live in [`crate::config_sandbox::git_policy`].
+    pub git: SandboxGitConfig,
 }
 
 impl Default for SandboxConfig {
@@ -4537,6 +4552,9 @@ impl Default for SandboxConfig {
             volume_owners: std::collections::BTreeMap::new(),
             env_passthrough: [
                 "SSH_AUTH_SOCK",
+                // Withheld unless `[sandbox.git]` mode = "full" with
+                // credential = "repo-token" | "user-token" (see
+                // `SandboxGitConfig::admits_git_token`).
                 "GH_TOKEN",
                 "GITHUB_TOKEN",
                 "ANTHROPIC_API_KEY",
@@ -4586,6 +4604,7 @@ impl Default for SandboxConfig {
             network_audit: false,
             vpn: VpnConfig::default(),
             home: HomeConfig::default(),
+            git: SandboxGitConfig::default(),
         }
     }
 }
@@ -4605,6 +4624,7 @@ impl SandboxConfig {
         self.env_passthrough
             .iter()
             .filter(|key| firewall.admits(key))
+            .filter(|key| self.git.admits_env(key))
             .filter_map(|k| std::env::var(k).ok().map(|v| (k.clone(), v)))
             .collect()
     }
@@ -4899,6 +4919,9 @@ pub struct SandboxOverlay {
     /// Per-env personal layer (`[env.<name>.sandbox.home]`). Field-merged into the
     /// global `[sandbox.home]` (present keys win, absent inherit). See [`HomeOverlay`].
     pub home: Option<HomeOverlay>,
+    /// Per-env/profile `[env.<name>.sandbox.git]`: field-merged into the global
+    /// `[sandbox.git]` (present keys win). Forbidden from a repo overlay.
+    pub git: Option<SandboxGitOverlay>,
 }
 
 #[derive(Debug, Clone, Default, Deserialize, Serialize, schemars::JsonSchema)]

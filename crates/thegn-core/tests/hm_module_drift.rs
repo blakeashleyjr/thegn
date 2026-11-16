@@ -40,10 +40,6 @@ const OMITTED: &[(&str, &str)] = &[
     ("forges", "forge connections are not exposed"),
     ("editor", "editor integration is not exposed"),
     (
-        "stats.alerts",
-        "threshold alerts are a nested table and are not exposed",
-    ),
-    (
         "stats.net_icons",
         "per-medium network glyph table is not exposed",
     ),
@@ -75,14 +71,6 @@ const OMITTED: &[(&str, &str)] = &[
         "path-valued shared target directory is deliberately opt-in and is not exposed",
     ),
     (
-        "notifications.desktop_min_urgency",
-        "string-typed urgency has no destination enum to pin and is not exposed",
-    ),
-    (
-        "notifications.process_exit",
-        "string-typed exit policy has no destination enum to pin and is not exposed",
-    ),
-    (
         "notifications.agent_error_signatures",
         "bounded validated signature list is not exposed",
     ),
@@ -91,14 +79,6 @@ const OMITTED: &[(&str, &str)] = &[
         "per-kind priority map is not exposed",
     ),
     ("notifications.rules", "routing rules are not exposed"),
-    (
-        "notifications.sound.pack",
-        "sound pack path is not exposed yet",
-    ),
-    (
-        "notifications.sound.chime_file",
-        "sound chime path is not exposed yet",
-    ),
     (
         "notifications.sound.command",
         "sound command is executable-bearing and is not exposed yet",
@@ -140,8 +120,7 @@ const OMITTED: &[(&str, &str)] = &[
     ("autopilot", "autopilot policy is not exposed"),
     ("pipeline", "pipeline definitions are not exposed"),
     ("skills", "skill configuration is not exposed"),
-    ("media.mpv", "mpv backend table is not exposed"),
-    ("media.mpd", "mpd backend table is not exposed"),
+    ("media.mpd.password", "credentials are not exposed"),
     ("voice", "voice input is not exposed"),
     (
         "usage.allow_network",
@@ -151,7 +130,6 @@ const OMITTED: &[(&str, &str)] = &[
         "usage.accounts",
         "usage account credentials and paths are not exposed",
     ),
-    ("usage.alerts", "usage alert policy is not exposed"),
     ("model_proxy", "model proxy is not exposed"),
     ("remote", "remote connection tuning is not exposed"),
     (
@@ -353,8 +331,13 @@ fn sidebar_detail_field_defaults_match_example_and_module() {
         "dirty",
         "branch_stat",
         "pr",
+        "ci",
+        "issue",
+        "author",
+        "stash",
         "subject",
         "age",
+        "upstream",
         "env",
         "sandbox",
         "devcontainer",
@@ -863,6 +846,10 @@ fn hm_ui_enum_options_offer_only_canonical_spellings() {
         ("uiSidebarTerminalsSection", "ui.sidebar_terminals_section"),
         ("uiSidebarFocusDetail", "ui.sidebar_focus_detail"),
         ("uiSidebarDetailWhen", "ui.sidebar_detail_when"),
+        (
+            "uiSidebarExternalWorktrees",
+            "ui.sidebar_external_worktrees",
+        ),
     ];
     let enums = enum_lists(&module_src());
     for (option, path) in expected {
@@ -1103,7 +1090,11 @@ fn hm_git_and_stats_families_are_rendered() {
                     "omitted schema key must exist: {path}"
                 );
             } else {
-                assert!(rendered.contains(&path), "Home Manager must render {path}");
+                assert!(
+                    rendered.contains(&path)
+                        || (path == "stats.alerts" && path_is_rendered(&path, &rendered)),
+                    "Home Manager must render {path}"
+                );
             }
         }
     }
@@ -1111,7 +1102,6 @@ fn hm_git_and_stats_families_are_rendered() {
         "git.backend",
         "git.structural_diff",
         "git.submodules",
-        "stats.alerts",
         "stats.net_icons",
     ] {
         assert!(schema_has_path(path), "omission must stay pinned: {path}");
@@ -1123,8 +1113,13 @@ fn hm_git_and_stats_families_are_rendered() {
         "stats.battery_warn",
         "stats.disk_free_warn",
         "stats.disk_free_critical",
+        "stats.alerts.enabled",
+        "stats.alerts.cpu.warn",
     ] {
-        assert!(rendered.contains(path), "Home Manager must render {path}");
+        assert!(
+            path_is_rendered(path, &rendered),
+            "Home Manager must render {path}"
+        );
     }
 }
 
@@ -1155,11 +1150,13 @@ fn hm_notifications_and_activity_families_are_rendered() {
     for path in [
         "notifications.desktop_min_urgency",
         "notifications.process_exit",
+    ] {
+        assert!(rendered.contains(path), "Home Manager must render {path}");
+    }
+    for path in [
         "notifications.agent_error_signatures",
         "notifications.priority",
         "notifications.rules",
-        "notifications.sound.pack",
-        "notifications.sound.chime_file",
         "notifications.sound.command",
         "notifications.sound.per_priority",
         "notifications.modes",
@@ -1182,6 +1179,8 @@ fn hm_notifications_dnd_and_sound_bools_are_rendered_and_rest_dispositioned() {
         "notifications.dnd.windows",
         "notifications.sound.min_priority",
         "notifications.sound.per_kind",
+        "notifications.sound.pack",
+        "notifications.sound.chime_file",
     ] {
         assert!(rendered.contains(path), "Home Manager must render {path}");
     }
@@ -1195,7 +1194,9 @@ fn hm_notifications_dnd_and_sound_bools_are_rendered_and_rest_dispositioned() {
         for key in properties.keys() {
             let path = format!("{table}.{key}");
             assert!(
-                rendered.contains(&path) || omissions.contains(path.as_str()),
+                rendered.contains(&path)
+                    || (path == "usage.alerts" && path_is_rendered(&path, &rendered))
+                    || omissions.contains(path.as_str()),
                 "{path} must be rendered or dispositioned by an exact ledger row"
             );
         }
@@ -1231,6 +1232,8 @@ fn hm_recording_media_and_monitor_process_keys_are_rendered_and_rest_disposition
         "media.poll_interval_secs",
         "media.players_priority",
         "media.volume_step",
+        "media.mpv.socket",
+        "media.mpd.socket",
         "monitor.proc_rows",
         "monitor.processes",
         "monitor.process_io",
@@ -1239,13 +1242,16 @@ fn hm_recording_media_and_monitor_process_keys_are_rendered_and_rest_disposition
     }
 
     let omissions: BTreeSet<&str> = OMITTED.iter().map(|(path, _)| *path).collect();
-    for table in ["recording", "media", "monitor"] {
+    for table in ["recording", "media", "media.mpv", "media.mpd", "monitor"] {
         let schema = schema_field(table);
         let properties = schema["properties"]
             .as_object()
             .unwrap_or_else(|| panic!("{table} schema properties"));
         for key in properties.keys() {
             let path = format!("{table}.{key}");
+            if matches!(path.as_str(), "media.mpv" | "media.mpd") {
+                continue; // nested tables: checked leaf by leaf via their own entries above
+            }
             assert!(
                 rendered.contains(&path) || omissions.contains(path.as_str()),
                 "{path} must be rendered or dispositioned by an exact ledger row"
@@ -1409,7 +1415,7 @@ fn hm_usage_and_tailnet_keys_are_rendered_and_rest_dispositioned() {
                 continue;
             }
             assert!(
-                rendered.contains(&path) || omissions.contains(path.as_str()),
+                path_is_rendered(&path, &rendered) || omissions.contains(path.as_str()),
                 "{path} must be rendered or dispositioned by an exact ledger row"
             );
         }
@@ -1613,6 +1619,7 @@ fn every_numeric_option_matches_its_destination_range() {
         ("watchPrIntervalSecs", "watch.pr_interval_secs"),
         ("port", "sandbox.remote.port"),
         ("themePanePadding", "theme.pane_padding"),
+        ("uiSidebarGroupRowLimit", "ui.sidebar_group_row_limit"),
         ("searchMaxResults", "search.max_results"),
         ("paletteContentMaxResults", "palette.content_max_results"),
         ("paletteFileMaxResults", "palette.file_max_results"),
@@ -2139,6 +2146,10 @@ fn every_nix_enum_matches_its_destination_enum() {
         ("uiSidebarTerminalsSection", "ui.sidebar_terminals_section"),
         ("uiSidebarFocusDetail", "ui.sidebar_focus_detail"),
         ("uiSidebarDetailWhen", "ui.sidebar_detail_when"),
+        (
+            "uiSidebarExternalWorktrees",
+            "ui.sidebar_external_worktrees",
+        ),
         ("searchStructural", "search.structural"),
         ("gitBackend", "git.backend"),
         ("gitStructuralDiff", "git.structural_diff"),
@@ -2207,4 +2218,73 @@ fn every_nix_enum_matches_its_destination_enum() {
                 .collect::<Vec<_>>()
         );
     }
+}
+
+/// Alert tables are rendered as one submodule attrset per table. Their leaf
+/// names are the TOML keys, so pin the whole set against the Rust schema, and
+/// pin that executable-bearing sound keys stay unexposed.
+#[test]
+fn hm_alert_submodules_cover_every_schema_leaf_and_default_to_null() {
+    let src = module_src();
+    let rendered = rendered_paths(&src);
+    for path in ["stats.alerts", "usage.alerts"] {
+        assert!(
+            path_is_rendered(path, &rendered),
+            "Home Manager must render {path}"
+        );
+    }
+    for (submodule, table) in [
+        ("statsAlertsSubmodule", "stats.alerts"),
+        ("usageAlertsSubmodule", "usage.alerts"),
+    ] {
+        let start = src
+            .find(&format!("  {submodule} ="))
+            .unwrap_or_else(|| panic!("{submodule} declaration"));
+        let end = start
+            + src[start..]
+                .find("\n  };\n")
+                .unwrap_or_else(|| panic!("{submodule} end"));
+        let block = &src[start..end];
+        let schema = schema_field(table);
+        let properties = schema["properties"]
+            .as_object()
+            .unwrap_or_else(|| panic!("{table} schema properties"));
+        for key in properties.keys() {
+            assert!(
+                block.contains(&format!("      {key} = lib.mkOption {{")),
+                "{submodule} must expose {table}.{key}"
+            );
+        }
+        let declared = block.matches("= lib.mkOption {").count();
+        assert_eq!(declared, properties.len(), "{submodule} option count");
+        assert_eq!(
+            block.matches("default = null;").count(),
+            declared,
+            "every {submodule} leaf must default to null"
+        );
+    }
+    let rule = schema_field("stats.alerts.cpu");
+    let rule_keys: BTreeSet<&str> = rule["properties"]
+        .as_object()
+        .expect("AlertRule properties")
+        .keys()
+        .map(String::as_str)
+        .collect();
+    assert_eq!(rule_keys, BTreeSet::from(["warn", "critical"]));
+    let rule_start = src
+        .find("  alertRuleSubmodule =")
+        .expect("alertRuleSubmodule declaration");
+    let rule_block = &src[rule_start..rule_start + 600];
+    assert!(rule_block.contains("      warn = lib.mkOption {"));
+    assert!(rule_block.contains("      critical = lib.mkOption {"));
+
+    let omissions: BTreeSet<&str> = OMITTED.iter().map(|(path, _)| *path).collect();
+    for path in [
+        "notifications.sound.command",
+        "notifications.sound.per_priority",
+    ] {
+        assert!(omissions.contains(path), "{path} must stay omitted");
+        assert!(!rendered.contains(path), "{path} must not be rendered");
+    }
+    assert!(src.contains("alertSecs = lib.types.nullOr lib.types.ints.u32;"));
 }

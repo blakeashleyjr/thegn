@@ -47,6 +47,19 @@ pub struct SidebarDisplay {
     /// (`[ui] sidebar_dividers`). Costs no layout rows — it replaced THE-64's
     /// blank separator row.
     pub dividers: bool,
+    /// Placement of external worktrees (`[ui] sidebar_external_worktrees`).
+    pub external_worktrees: thegn_core::config_ui::ExternalWorktrees,
+    /// Label of the derived "Other" group row (`[ui] sidebar_other_group_label`).
+    pub other_group_label: String,
+    /// Whether the "Other" group starts collapsed (`[ui]
+    /// sidebar_other_group_collapsed`) until the user toggles it.
+    pub other_group_collapsed: bool,
+    /// Entries a group shows before its "show more" row (`[ui]
+    /// sidebar_group_row_limit`); `0` = no limit.
+    pub group_row_limit: usize,
+    /// Per-group overrides keyed by group label (`[ui]
+    /// sidebar_group_row_limits`); `0` = no limit for that group.
+    pub group_row_limits: std::collections::BTreeMap<String, usize>,
 }
 
 impl Default for SidebarDisplay {
@@ -75,6 +88,13 @@ impl Default for SidebarDisplay {
             icon_behind: String::new(),
             icon_status: String::new(),
             dividers: true,
+            external_worktrees: thegn_core::config_ui::ExternalWorktrees::Group,
+            other_group_label: "Other".into(),
+            other_group_collapsed: true,
+            // Exception: unit-built models carry no row limit (config default
+            // 15), so fixtures with long groups keep every row.
+            group_row_limit: 0,
+            group_row_limits: std::collections::BTreeMap::new(),
         }
     }
 }
@@ -103,6 +123,15 @@ impl SidebarDisplay {
             icon_behind: ui.sidebar_icon_behind.clone(),
             icon_status: ui.sidebar_icon_status.clone(),
             dividers: ui.sidebar_dividers,
+            external_worktrees: ui.sidebar_external_worktrees,
+            // A blank label would leave a bare "(N)"; fall back to the default.
+            other_group_label: match ui.sidebar_other_group_label.trim() {
+                "" => "Other".into(),
+                label => label.to_string(),
+            },
+            other_group_collapsed: ui.sidebar_other_group_collapsed,
+            group_row_limit: ui.sidebar_group_row_limit,
+            group_row_limits: ui.sidebar_group_row_limits.clone(),
         }
     }
 
@@ -232,9 +261,16 @@ pub(crate) fn sort_chip(model: &FrameModel, rect: Rect) -> Option<(String, usize
     header_chips(model, rect).sort
 }
 
-/// The header row's two chips, each as its label and painted half-open x-range
-/// (`None` when there is no room for it). Painted as `layout  sort`,
+/// The header row's chips, each as its label and painted x-range (`None`
+/// when there is no room for it). Painted as `mode  layout  sort`,
 /// right-aligned.
+///
+/// - **mode** (`full·focus` / `full·always` / `full·never`; clicking cycles
+///   the sidebar full → rail → hidden, like `ToggleSidebar`) names the
+///   sidebar's mode and its detail-line state (the runtime
+///   `sidebar_display.focus_detail`, which carries the `i` override). It is
+///   the first thing to give way: the full word, then the one-cell mode
+///   glyph, then nothing.
 ///
 /// - **sort** (`live`, `manual`, …; clicking opens the `s` menu) exists
 ///   because nothing else on screen names the active sort: the mode lived only
@@ -245,8 +281,21 @@ pub(crate) fn sort_chip(model: &FrameModel, rect: Rect) -> Option<(String, usize
 ///   long list, no workspaces or folders, and nothing on screen saying why.
 #[derive(Debug, Default)]
 pub(crate) struct HeaderChips {
+    pub mode: Option<(String, usize, usize)>,
     pub layout: Option<(String, usize, usize)>,
     pub sort: Option<(String, usize, usize)>,
+}
+
+/// The mode chip's detail word for the runtime detail state: the detail line
+/// on the cursor row only (`focus`), on every row (`always`), or off
+/// (`never`).
+fn mode_detail_word(detail: thegn_core::config::FocusDetail) -> &'static str {
+    use thegn_core::config::FocusDetail;
+    match detail {
+        FocusDetail::Cursor => "focus",
+        FocusDetail::All => "always",
+        FocusDetail::Off => "never",
+    }
 }
 
 /// Columns between the layout chip and the sort chip. Two, because both chips
@@ -293,7 +342,7 @@ pub(crate) fn header_chips(model: &FrameModel, rect: Rect) -> HeaderChips {
     // the last thing on the row to go.
     let s_full = Some(sort_full.as_str());
     let s_bare = Some(sort_bare.as_str());
-    let candidates: [(Option<&str>, Option<&str>); 4] = if model.sidebar_flat {
+    let base: [(Option<&str>, Option<&str>); 4] = if model.sidebar_flat {
         [
             (Some(layout), s_full),
             (Some(layout), s_bare),
@@ -308,28 +357,53 @@ pub(crate) fn header_chips(model: &FrameModel, rect: Rect) -> HeaderChips {
             (None, None),
         ]
     };
+    // The mode chip goes first: its full word, then its one-cell glyph, both
+    // only beside the widest form of the other two chips.
+    let gl = crate::caps::active_glyphs();
+    let mode_full = format!(
+        "full{}{}",
+        gl.middot,
+        mode_detail_word(model.sidebar_display.focus_detail)
+    );
+    let (l0, s0) = base[0];
+    let candidates = [
+        (Some(mode_full.as_str()), l0, s0),
+        (Some(gl.sidebar_mode_full), l0, s0),
+    ]
+    .into_iter()
+    .chain(base.into_iter().map(|(l, s)| (None, l, s)));
     // One column of breathing room between the title and the chips.
     let budget = rect.cols.saturating_sub(HEADER_TITLE.width() + 1);
-    for (l, s) in candidates {
-        let lw = l.map_or(0, |l| l.width());
-        let sw = s.map_or(0, |s| s.width());
-        // A lone layout chip keeps the trailing space the sort label carries,
-        // so the word never touches the column edge.
-        let tail = match (l, s) {
-            (Some(_), Some(_)) => CHIP_GAP + sw,
-            (Some(_), None) => 1,
-            (None, _) => sw,
-        };
-        if lw + tail > budget {
+    for (m, l, s) in candidates {
+        let words = [m, l, s];
+        let present = words.iter().flatten().count();
+        // The sort label carries its own trailing space; without it, keep one
+        // column so the rightmost word never touches the column edge.
+        let tail = usize::from(present > 0 && s.is_none());
+        let total = words.iter().flatten().map(|w| w.width()).sum::<usize>()
+            + CHIP_GAP * present.saturating_sub(1)
+            + tail;
+        if total > budget {
             continue;
         }
         // Right-aligned against the FULL width: the header sits above
         // `list_y`, so the scrollbar gutter `build_sidebar` reserves for the
-        // rows does not narrow this row.
-        let end = rect.x + rect.cols;
+        // rows does not narrow this row. Placed right to left.
+        let mut x = rect.x + rect.cols - tail;
+        let mut spans: [Option<(String, usize, usize)>; 3] = [None, None, None];
+        for (slot, word) in spans.iter_mut().zip(words).rev() {
+            if let Some(w) = word {
+                let ww = w.width();
+                x -= ww;
+                *slot = Some((w.to_string(), x, ww));
+                x = x.saturating_sub(CHIP_GAP);
+            }
+        }
+        let [mode_span, layout_span, sort_span] = spans;
         return HeaderChips {
-            sort: s.map(|s| (s.to_string(), end - sw, sw)),
-            layout: l.map(|l| (l.to_string(), end - tail - lw, lw)),
+            mode: mode_span,
+            layout: layout_span,
+            sort: sort_span,
         };
     }
     HeaderChips::default()
@@ -393,6 +467,11 @@ pub fn draw_sidebar(surface: &mut Surface, rect: Rect, model: &FrameModel) {
                 col(S::Faint)
             };
             draw_text(surface, x, rect.y, &label, fg, col(S::Panel), cols);
+        }
+        // The sidebar mode, quiet like the grouped signpost: it names a
+        // state, and a click on it cycles full → rail → hidden.
+        if let Some((label, x, cols)) = chips.mode {
+            draw_text(surface, x, rect.y, &label, col(S::Dim), col(S::Panel), cols);
         }
     }
 
@@ -521,11 +600,29 @@ pub(crate) fn menu_rect(rect: Rect, frame: &SidebarFrame, menu: &RowMenu) -> Rec
     }
 }
 
+/// The column (from the rail's left edge) of the rail-mode glyph on row 0:
+/// the same column the rows' activity dots use.
+const RAIL_MODE_GLYPH_X: usize = 1;
+
 /// The slim collapsed rail: one row per visible row of EVERY kind
 /// (workspaces, folders, hosts, terminals, banners), an activity dot in
 /// its state color plus the first letter of the label. `model.sidebar_scroll`
 /// keeps the cursor in view.
 fn draw_sidebar_rail(surface: &mut Surface, rect: Rect, model: &FrameModel) {
+    // Row 0: the rail-mode glyph (`sidebar_geom_from` starts the rail's rows
+    // one row lower for it). A click there cycles the mode, like the full
+    // sidebar's header chip.
+    if rect.cols > RAIL_MODE_GLYPH_X {
+        draw_text(
+            surface,
+            rect.x + RAIL_MODE_GLYPH_X,
+            rect.y,
+            crate::caps::active_glyphs().sidebar_mode_rail,
+            col(S::Dim),
+            col(S::Panel),
+            1,
+        );
+    }
     let frame = build_sidebar(model, rect, model.sidebar_scroll);
     for p in &frame.rows {
         crate::seg::draw_lines(
@@ -718,9 +815,9 @@ fn sidebar_geom_from(
     use crate::sidebar::RowKind;
     let rail = model.sidebar_rail;
     // The full panel reserves a header + blank row at the top and a metrics
-    // section at the bottom; the rail uses the whole column.
+    // section at the bottom; the rail reserves only row 0, for its mode glyph.
     let (head_rows, metrics_rows) = if rail {
-        (0, 0)
+        (1, 0)
     } else {
         let m = if rect.rows > 10 && !model.metrics.targets.is_empty() {
             6.min(rect.rows.saturating_sub(4))
@@ -1458,7 +1555,7 @@ pub(crate) fn hit_rows(model: &FrameModel, rect: Rect) -> Vec<RowHit> {
                 // (`compose_row_lines` mirrors this), so the caret sits at a
                 // stable column regardless of focus.
                 RowKind::Workspace | RowKind::TerminalHost => Some(rect.x + 4),
-                RowKind::Folder | RowKind::PipelineGroup => Some(rect.x + 3),
+                RowKind::Folder | RowKind::PipelineGroup | RowKind::OtherGroup => Some(rect.x + 3),
                 // A lane sits one level in from its group's caret.
                 RowKind::PipelineLane => Some(rect.x + 5),
                 _ => None,
@@ -1855,6 +1952,15 @@ fn compose_row_lines(
             sp(3),
             seg(Tok::Slot(S::Faint), display_cell(&row.label)),
         ])],
+        // The row-limit toggle: indented at its group's child depth (under
+        // the entries it reveals) and in the focus colour so it reads as a
+        // control, not as one more entry.
+        RowKind::ShowMore => vec![Line::Segs(vec![
+            sp(1),
+            sp(3),
+            sp(usize::from(row.depth.saturating_sub(1)) * 2 + 2),
+            seg(Tok::Slot(S::Focus), show_more_text(row)),
+        ])],
         // A derived `Pipelines` group under a workspace: caret + name + how
         // many lanes it holds. It reads like a folder because it behaves like
         // one (collapse/expand), and is toned plain rather than bold so a
@@ -1906,6 +2012,18 @@ fn compose_row_lines(
             l.push(seg(tok, display_cell(&row.label)));
             vec![Line::Segs(l)]
         }
+        // The derived "Other" group of external worktrees: folder-shaped
+        // (caret + label + count) but toned one step quieter than a real
+        // folder and without the folder glyph — it is a holding area for
+        // worktrees another tool made, not something the user filed.
+        RowKind::OtherGroup => vec![Line::Segs(vec![
+            sp(1),
+            sp(2),
+            seg(Tok::Slot(S::Faint), caret(row.collapsed)),
+            sp(1),
+            seg(Tok::Slot(S::Dim), display_cell(&row.label)),
+            seg(Tok::Slot(S::Ghost), format!(" ({})", row.child_count)),
+        ])],
         RowKind::Folder => {
             // Label = bare folder name (rename/delete seed from it); the
             // filed-count decoration is render-only and rides one tier down,
@@ -2179,6 +2297,20 @@ fn compose_row_lines(
     }
 }
 
+/// The label of a [`crate::sidebar::RowKind::ShowMore`] row: `… show N more`
+/// while its group is truncated, `show fewer` while expanded.
+pub(crate) fn show_more_text(row: &crate::sidebar::SidebarRow) -> String {
+    if row.collapsed {
+        format!(
+            "{} show {} more",
+            crate::caps::active_glyphs().ellipsis,
+            row.child_count
+        )
+    } else {
+        "show fewer".to_string()
+    }
+}
+
 /// The slim-rail line for one row, fitted to the rail's ~4 cols. Worktrees and
 /// terminals keep their identity (activity dot + first letter); workspaces show
 /// a bold initial so repo boundaries stay legible; structural rows (folders,
@@ -2229,6 +2361,12 @@ fn compose_rail_line(row: &crate::sidebar::SidebarRow) -> crate::seg::Line {
         ]),
         // Hints carry no identity worth a rail row; render an empty line.
         RowKind::EmptyHint => Line::Blank,
+        // The row-limit toggle: an ellipsis in the focus colour (a click
+        // still flips it).
+        RowKind::ShowMore => Line::Segs(vec![
+            sp(1),
+            seg(Tok::Slot(S::Focus), crate::caps::active_glyphs().ellipsis),
+        ]),
         // Everything else (folder, host group, pipeline group) gets a dim
         // divider.
         _ => Line::Segs(vec![sp(1), seg(Tok::Slot(S::Faint), gl.box_h)]),
@@ -3516,6 +3654,37 @@ mod tests {
         let painted = text(&wt);
         assert!(painted.contains(gl.tree_corner), "{painted:?}");
         assert!(painted.contains("tg-the-74"), "{painted:?}");
+
+        // The derived "Other" group of external worktrees: caret + label +
+        // count, folder-shaped, no folder glyph.
+        let mut other = SidebarRow::base(RowKind::OtherGroup, 1, "Other", "app");
+        other.child_count = 4;
+        other.collapsed = true;
+        let painted = text(&other);
+        assert!(painted.contains(gl.caret_closed), "{painted:?}");
+        assert!(painted.contains("Other (4)"), "{painted:?}");
+        assert!(!painted.contains(gl.folder), "{painted:?}");
+    }
+
+    /// The external-worktree keys ride `from_ui`, which run.rs re-runs on every
+    /// config reload — so they apply live. A blank label falls back.
+    #[test]
+    fn from_ui_carries_the_external_worktree_keys() {
+        use thegn_core::config_ui::ExternalWorktrees;
+        let d = SidebarDisplay::from_ui(&thegn_core::config::UiConfig::default());
+        assert_eq!(d.external_worktrees, ExternalWorktrees::Group);
+        assert_eq!(d.other_group_label, "Other");
+        assert!(d.other_group_collapsed);
+        let ui = thegn_core::config::UiConfig {
+            sidebar_external_worktrees: ExternalWorktrees::Hide,
+            sidebar_other_group_label: "  ".into(),
+            sidebar_other_group_collapsed: false,
+            ..Default::default()
+        };
+        let d = SidebarDisplay::from_ui(&ui);
+        assert_eq!(d.external_worktrees, ExternalWorktrees::Hide);
+        assert_eq!(d.other_group_label, "Other");
+        assert!(!d.other_group_collapsed);
     }
 
     // ─── THE-70: honest quick-jump digits ──────────────────────────────────
@@ -4071,5 +4240,149 @@ mod tests {
             .map(|segment| segment.text)
             .collect::<String>();
         assert!(text.contains("#3"), "{text:?}");
+    }
+
+    /// The mode chip names the sidebar mode and the runtime detail state,
+    /// left of `layout`.
+    #[test]
+    fn mode_chip_names_the_detail_state_left_of_the_layout_chip() {
+        use thegn_core::config::FocusDetail;
+        use unicode_width::UnicodeWidthStr;
+        let dot = crate::caps::active_glyphs().middot;
+        for (detail, word) in [
+            (FocusDetail::Cursor, "focus"),
+            (FocusDetail::All, "always"),
+            (FocusDetail::Off, "never"),
+        ] {
+            let mut m = FrameModel::default();
+            m.sidebar_display.focus_detail = detail;
+            let chips = header_chips(&m, chip_rect(60));
+            let (label, mx, mcols) = chips.mode.expect("mode chip fits at 60 cols");
+            assert_eq!(label, format!("full{dot}{word}"));
+            assert_eq!(mcols, label.width());
+            let (_, lx, _) = chips.layout.expect("layout chip fits at 60 cols");
+            assert_eq!(mx + mcols + CHIP_GAP, lx, "painted left of `layout`");
+            assert!(mx > " WORKSPACES".len());
+        }
+    }
+
+    /// The mode chip is the first thing to give way: the full word, then its
+    /// one-cell glyph, before the layout or sort chips lose anything.
+    #[test]
+    fn mode_chip_drops_first_on_a_narrow_header() {
+        use thegn_core::config::FocusDetail;
+        use unicode_width::UnicodeWidthStr;
+        let mut m = FrameModel::default();
+        m.sidebar_display.focus_detail = FocusDetail::Off; // "full·never" = 10
+        let sort = m.sidebar_sort.as_str().width() + 1; // label + trailing space
+        // 11 + 1 + 10 + 2 + "grouped" (7) + 2 + sort
+        let full = 12 + 10 + 2 + 7 + 2 + sort;
+        let c = header_chips(&m, chip_rect(full));
+        assert_eq!(c.mode.unwrap().2, 10);
+        // One short: the glyph stands in for the word.
+        let c = header_chips(&m, chip_rect(full - 1));
+        let (glyph, _, gcols) = c.mode.expect("the glyph form still fits");
+        assert_eq!(glyph, crate::caps::active_glyphs().sidebar_mode_full);
+        assert_eq!(gcols, 1);
+        assert!(c.layout.is_some() && c.sort.is_some());
+        // 11 + 1 + 1 + 2 + 7 + 2 + sort: below that the chip is gone, while
+        // the layout and sort chips are still whole.
+        let glyph_tier = 12 + 1 + 2 + 7 + 2 + sort;
+        let c = header_chips(&m, chip_rect(glyph_tier - 1));
+        assert!(c.mode.is_none());
+        assert_eq!(c.layout.unwrap().0, "grouped");
+        assert!(c.sort.is_some());
+    }
+
+    #[test]
+    fn mode_chip_yields_the_header_row_to_the_rail_and_the_filter() {
+        for m in [
+            FrameModel {
+                sidebar_rail: true,
+                ..Default::default()
+            },
+            FrameModel {
+                sidebar_filter: "wt".into(),
+                ..Default::default()
+            },
+        ] {
+            assert!(header_chips(&m, chip_rect(60)).mode.is_none());
+        }
+    }
+
+    /// The rail's row 0 carries the rail-mode glyph in both glyph sets, and
+    /// its first entry is painted on row 1.
+    #[test]
+    fn rail_paints_the_mode_glyph_on_row_zero() {
+        use crate::sidebar::SidebarRow;
+        use thegn_core::termcaps::UnicodeLevel;
+        for level in [UnicodeLevel::Full, UnicodeLevel::Ascii] {
+            crate::caps::test_override::with_unicode(level, || {
+                let model = FrameModel {
+                    sidebar_rows: vec![SidebarRow::base(RowKind::Workspace, 0, "alpha", "alpha")],
+                    sidebar_rail: true,
+                    ..Default::default()
+                };
+                let rect = Rect {
+                    x: 0,
+                    y: 0,
+                    cols: 4,
+                    rows: 4,
+                };
+                let mut s = Surface::new(4, 4);
+                draw_sidebar(&mut s, rect, &model);
+                let text = s.screen_chars_to_string();
+                let lines: Vec<&str> = text.lines().collect();
+                let glyph = crate::caps::active_glyphs().sidebar_mode_rail;
+                assert!(lines[0].contains(glyph), "{level:?}: {lines:?}");
+                assert!(lines[1].contains('a'), "{level:?}: {lines:?}");
+                let frame = build_sidebar(&model, rect, 0);
+                assert_eq!(frame.rows[0].y, rect.y + 1);
+            });
+        }
+    }
+
+    /// The "show more" row paints in the focus colour at its child depth,
+    /// and the rail keeps a cell for it.
+    #[test]
+    fn show_more_row_reads_as_a_focus_toned_control() {
+        use crate::seg::{Line, Tok};
+        use crate::sidebar::SidebarRow;
+        let row = SidebarRow {
+            pin_key: crate::sidebar::show_more_key("alpha"),
+            collapsed: true,
+            child_count: 4,
+            ..SidebarRow::base(RowKind::ShowMore, 1, "", "alpha")
+        };
+        let model = FrameModel {
+            sidebar_rows: vec![
+                SidebarRow::base(RowKind::Workspace, 0, "alpha", "alpha"),
+                row.clone(),
+            ],
+            ..Default::default()
+        };
+        let frame = build_sidebar(
+            &model,
+            Rect {
+                x: 0,
+                y: 0,
+                cols: 30,
+                rows: 10,
+            },
+            0,
+        );
+        let placed = frame.rows.iter().find(|p| p.visible_index == 1).unwrap();
+        let Line::Segs(segs) = &placed.lines[0] else {
+            panic!("the show-more row is one plain line")
+        };
+        let label = segs.iter().find(|s| s.text.contains("show")).unwrap();
+        assert_eq!(label.fg, Tok::Slot(S::Focus));
+        assert!(label.text.ends_with("show 4 more"), "{:?}", label.text);
+        let lead: usize = segs
+            .iter()
+            .take_while(|s| !s.text.contains("show"))
+            .map(|s| crate::seg::seg_width(std::slice::from_ref(s)))
+            .sum();
+        assert_eq!(lead, 6, "aligned with a depth-1 row's label");
     }
 }

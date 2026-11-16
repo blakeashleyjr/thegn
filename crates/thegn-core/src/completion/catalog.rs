@@ -294,6 +294,8 @@ pub const CATALOG: &[Slot] = &[
     slot("env image-bake", "worktree_pos", SourceKind::Worktree),
     slot("env provision", "worktree", SourceKind::Worktree),
     slot("env provision", "worktree_pos", SourceKind::Worktree),
+    slot("env pull", "worktree", SourceKind::Worktree),
+    slot("env pull", "worktree_pos", SourceKind::Worktree),
     slot("env restore", "worktree", SourceKind::Worktree),
     slot("env restore", "worktree_pos", SourceKind::Worktree),
     slot("env set", "worktree", SourceKind::Worktree),
@@ -551,6 +553,7 @@ pub const CATALOG: &[Slot] = &[
     slot("env rm", "name", SourceKind::Env),
     slot("env set", "name", SourceKind::Env),
     slot("env test", "name", SourceKind::Env),
+    slot("fleet list", "env", SourceKind::Env),
     slot("wt new", "env", SourceKind::Env),
     // --- profile (`[profiles.<name>]`) -------------------------------------
     // A `global = true` arg: classified once at the root, and clap propagates
