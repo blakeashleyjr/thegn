@@ -9,10 +9,20 @@
 //!   worktree           ← sum of its panes
 //!     tab · program    ← the pane's process-tree total
 //!       proc (pid)     ← the heaviest sampled processes inside that pane
+//!     gate / agent     ← the worktree's named background scopes (cgroup v2)
 //! unattributed panes   ← panes whose owner row is gone (closed since the sample)
 //! thegn                ← UI + daemon
+//!   gate · <slug>      ← a named scope whose worktree has no pane here
+//!   thegn jobs (unnamed) ← the slice's anonymous `run-*.scope`s
 //! outside thegn        ← system total minus everything above, never negative
 //! ```
+//!
+//! Scope figures come from `thegn.slice`'s cgroups, while pane and thegn
+//! figures come from the process tree, and the two overlap (a capped pane runs
+//! inside a `run-*.scope`; a gate is usually a child of the UI). So the scope
+//! rows are a breakdown, not an addend: the thegn row stays UI + daemon, and
+//! "outside thegn" subtracts whichever of the process-tree sum and the scope sum
+//! is larger, counting a scope's processes once.
 //!
 //! CPU is percent of ONE core (a per-core sum, like `top`), so a busy pane can
 //! read above 100. Missing data stays `None` all the way to the screen (`—`),
@@ -22,6 +32,9 @@
 use std::cmp::Ordering;
 use std::collections::BTreeMap;
 
+pub use crate::sandbox_cpucap::ScopeKind;
+use crate::sandbox_cpucap::scope_slug;
+
 /// Most rows a tree renders, the "+N more" row included. Workspaces, worktrees
 /// and the thegn/outside tail are always kept; processes are trimmed first,
 /// then panes.
@@ -29,6 +42,13 @@ pub const MAX_ROWS: usize = 64;
 
 /// Default number of processes listed under each pane.
 pub const TOP_PER_PANE: usize = 3;
+
+/// Most named scopes listed under the thegn group (their worktree has no pane
+/// here); the rest fold into the unnamed row.
+pub const MAX_LOOSE_JOBS: usize = 8;
+
+/// Label of the row summing the slice's anonymous scopes.
+pub const UNNAMED_JOBS: &str = "thegn jobs (unnamed)";
 
 /// One CPU + resident-memory reading. CPU is percent of one core.
 #[derive(Debug, Clone, Copy, Default, PartialEq)]
@@ -66,6 +86,9 @@ pub struct PaneOwner {
     pub pane_id: u32,
     pub workspace: String,
     pub worktree: String,
+    /// The worktree's directory, when it has one (terminal groups do not).
+    /// Named scopes match a worktree by this path's basename slug.
+    pub worktree_path: Option<String>,
     pub tab: String,
     /// The launched program's short name (an agent, an editor, a shell).
     pub program: Option<String>,
@@ -107,6 +130,18 @@ pub struct SelfUsage {
     pub other: Usage,
 }
 
+/// One transient scope inside `thegn.slice`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ScopeUsage {
+    /// `None` for the anonymous `run-*.scope` sum.
+    pub kind: Option<ScopeKind>,
+    /// The worktree slug parsed from the unit name (`None` when unnamed).
+    pub worktree: Option<String>,
+    /// Percent of one core.
+    pub cpu_pct: Option<f32>,
+    pub rss: Option<u64>,
+}
+
 /// Everything [`build`] reads.
 #[derive(Debug, Clone, Copy)]
 pub struct AttribInputs<'a> {
@@ -120,6 +155,8 @@ pub struct AttribInputs<'a> {
     /// in bytes.
     pub system: Usage,
     pub cores: usize,
+    /// Per-scope usage inside `thegn.slice` (empty without cgroup v2).
+    pub scopes: &'a [ScopeUsage],
 }
 
 /// What the tree is ordered by (heaviest first at every level).
@@ -136,6 +173,8 @@ pub enum RowKind {
     Pane,
     Proc,
     Thegn,
+    /// A named background scope (gate/agent) or the unnamed scope sum.
+    Job,
     Outside,
     /// The "+N more" row standing in for trimmed processes/panes.
     More,
@@ -174,6 +213,36 @@ struct Group<'a, T> {
     name: &'a str,
     usage: Usage,
     children: Vec<T>,
+    /// Worktree groups: the slug named scopes are matched against.
+    slug: Option<String>,
+    /// Worktree groups: their named scopes, one per kind.
+    jobs: Vec<(ScopeKind, Usage)>,
+}
+
+/// Per-field larger of two readings; an unknown side contributes nothing.
+fn at_least(a: Usage, b: Usage) -> Usage {
+    let max_f = |x: Option<f32>, y: Option<f32>| match (x, y) {
+        (Some(x), Some(y)) => Some(x.max(y)),
+        (x, None) => x,
+        (None, y) => y,
+    };
+    let max_u = |x: Option<u64>, y: Option<u64>| match (x, y) {
+        (Some(x), Some(y)) => Some(x.max(y)),
+        (x, None) => x,
+        (None, y) => y,
+    };
+    Usage {
+        cpu_pct: max_f(a.cpu_pct, b.cpu_pct),
+        rss: max_u(a.rss, b.rss),
+    }
+}
+
+/// Merge `usage` into the entry for `key`, appending one if absent.
+fn merge_job<K: PartialEq>(jobs: &mut Vec<(K, Usage)>, key: K, usage: Usage) {
+    match jobs.iter_mut().find(|(k, _)| *k == key) {
+        Some((_, total)) => *total = total.plus(usage),
+        None => jobs.push((key, usage)),
+    }
 }
 
 fn sort_value(u: Usage, sort: SortKey) -> f64 {
@@ -240,6 +309,8 @@ pub fn build(inputs: &AttribInputs<'_>, sort: SortKey, top_per_pane: usize) -> A
                     name: &owner.workspace,
                     usage: Usage::default(),
                     children: Vec::new(),
+                    slug: None,
+                    jobs: Vec::new(),
                 });
                 workspaces.len() - 1
             }
@@ -253,6 +324,10 @@ pub fn build(inputs: &AttribInputs<'_>, sort: SortKey, top_per_pane: usize) -> A
                     name: &owner.worktree,
                     usage: Usage::default(),
                     children: Vec::new(),
+                    slug: Some(scope_slug(
+                        owner.worktree_path.as_deref().unwrap_or(&owner.worktree),
+                    )),
+                    jobs: Vec::new(),
                 });
                 ws.children.len() - 1
             }
@@ -261,6 +336,40 @@ pub fn build(inputs: &AttribInputs<'_>, sort: SortKey, top_per_pane: usize) -> A
         wt.usage = wt.usage.plus(usage);
         wt.children.push(PaneNode { owner, usage });
     }
+
+    // Named scopes join the worktree whose slug matches (and roll up into its
+    // sums); the rest list under thegn. Anonymous scopes sum into one row.
+    let mut scopes_sum: Option<Usage> = None;
+    let mut loose: Vec<((ScopeKind, &str), Usage)> = Vec::new();
+    let mut unnamed: Option<Usage> = None;
+    for scope in inputs.scopes {
+        let usage = Usage::new(scope.cpu_pct, scope.rss);
+        scopes_sum = Some(scopes_sum.unwrap_or_default().plus(usage));
+        let (Some(kind), Some(slug)) = (scope.kind, scope.worktree.as_deref()) else {
+            unnamed = Some(unnamed.unwrap_or_default().plus(usage));
+            continue;
+        };
+        let home = workspaces.iter_mut().find_map(|ws| {
+            let wt = ws
+                .children
+                .iter_mut()
+                .find(|wt| wt.slug.as_deref() == Some(slug))?;
+            Some((&mut ws.usage, wt))
+        });
+        match home {
+            Some((ws_usage, wt)) => {
+                *ws_usage = ws_usage.plus(usage);
+                wt.usage = wt.usage.plus(usage);
+                merge_job(&mut wt.jobs, kind, usage);
+            }
+            None => merge_job(&mut loose, (kind, slug), usage),
+        }
+    }
+    loose.sort_by(|a, b| by_weight(a.1, a.0.1, b.1, b.0.1, sort).then(a.0.0.cmp(&b.0.0)));
+    for (_, usage) in loose.drain(MAX_LOOSE_JOBS.min(loose.len())..) {
+        unnamed = Some(unnamed.unwrap_or_default().plus(usage));
+    }
+
     workspaces.sort_by(|a, b| by_weight(a.usage, a.name, b.usage, b.name, sort));
 
     let mut tree_rows: Vec<AttribRow> = Vec::new();
@@ -282,6 +391,11 @@ pub fn build(inputs: &AttribInputs<'_>, sort: SortKey, top_per_pane: usize) -> A
                 by_weight(a.usage, &a.owner.tab, b.usage, &b.owner.tab, sort)
                     .then_with(|| a.owner.pane_id.cmp(&b.owner.pane_id))
             });
+            wt.jobs
+                .sort_by(|a, b| by_weight(a.1, a.0.as_str(), b.1, b.0.as_str(), sort));
+            for (kind, usage) in &wt.jobs {
+                tree_rows.push(row(2, RowKind::Job, kind.as_str().to_string(), *usage));
+            }
             for pane in &wt.children {
                 tree_rows.push(row(2, RowKind::Pane, pane_label(pane.owner), pane.usage));
                 let mut procs: Vec<&TopProc> = inputs
@@ -329,7 +443,8 @@ pub fn build(inputs: &AttribInputs<'_>, sort: SortKey, top_per_pane: usize) -> A
         .values()
         .fold(Usage::default(), |acc, u| acc.plus(*u));
     let thegn = inputs.thegn.ui.plus(inputs.thegn.daemon);
-    let attributed = panes_sum.plus(thegn);
+    // Scopes overlap the process tree, so count whichever sum is larger.
+    let attributed = at_least(panes_sum.plus(thegn), scopes_sum.unwrap_or_default());
     let mut clamped = false;
     let outside = if partial {
         inputs.thegn.other
@@ -357,12 +472,23 @@ pub fn build(inputs: &AttribInputs<'_>, sort: SortKey, top_per_pane: usize) -> A
         }
     };
 
-    let tail = [
+    let mut tail = vec![
         row(0, RowKind::Thegn, "thegn".into(), thegn),
         row(1, RowKind::Thegn, "ui".into(), inputs.thegn.ui),
         row(1, RowKind::Thegn, "daemon".into(), inputs.thegn.daemon),
-        row(0, RowKind::Outside, "outside thegn".into(), outside),
     ];
+    for ((kind, slug), usage) in &loose {
+        tail.push(row(
+            1,
+            RowKind::Job,
+            format!("{} · {slug}", kind.as_str()),
+            *usage,
+        ));
+    }
+    if let Some(usage) = unnamed {
+        tail.push(row(1, RowKind::Job, UNNAMED_JOBS.into(), usage));
+    }
+    tail.push(row(0, RowKind::Outside, "outside thegn".into(), outside));
 
     let budget = MAX_ROWS.saturating_sub(tail.len());
     let mut rows = cap_rows(tree_rows, budget);
@@ -390,7 +516,7 @@ fn cap_rows(rows: Vec<AttribRow>, budget: usize) -> Vec<AttribRow> {
     }
     let mut excess = rows.len() - budget.saturating_sub(1);
     let mut keep = vec![true; rows.len()];
-    for kind in [RowKind::Proc, RowKind::Pane] {
+    for kind in [RowKind::Proc, RowKind::Job, RowKind::Pane] {
         for (i, r) in rows.iter().enumerate().rev() {
             if excess == 0 {
                 break;
@@ -421,8 +547,9 @@ fn cap_rows(rows: Vec<AttribRow>, budget: usize) -> Vec<AttribRow> {
 #[cfg(test)]
 mod tests {
     use super::{
-        AttribInputs, AttribRow, MAX_ROWS, Owner, PaneOwner, PaneUsage, RowKind, SelfUsage,
-        SortKey, TOP_PER_PANE, TopProc, Usage, build, pane_label,
+        AttribInputs, AttribRow, MAX_LOOSE_JOBS, MAX_ROWS, Owner, PaneOwner, PaneUsage, RowKind,
+        ScopeKind, ScopeUsage, SelfUsage, SortKey, TOP_PER_PANE, TopProc, UNNAMED_JOBS, Usage,
+        at_least, build, pane_label,
     };
 
     const EPS: f32 = 1e-4;
@@ -432,6 +559,7 @@ mod tests {
             pane_id: id,
             workspace: ws.into(),
             worktree: wt.into(),
+            worktree_path: Some(format!("/repos/{}", wt.replace('/', "-"))),
             tab: tab.into(),
             program: program.map(str::to_string),
         }
@@ -511,6 +639,7 @@ mod tests {
             // 25% of 8 cores = 200% of one core; 20_000 bytes used.
             system: Usage::new(Some(25.0), Some(20_000)),
             cores: 8,
+            scopes: &[],
         }
     }
 
@@ -750,6 +879,138 @@ mod tests {
         let count = |k: RowKind| tree.rows.iter().filter(|r| r.kind == k).count();
         assert_eq!(count(RowKind::Worktree), 5);
         assert_eq!(count(RowKind::Pane), MAX_ROWS - 1 - 5 - 1 - 4);
+    }
+
+    fn scope(kind: Option<ScopeKind>, slug: Option<&str>, cpu: f32, rss: u64) -> ScopeUsage {
+        ScopeUsage {
+            kind,
+            worktree: slug.map(str::to_string),
+            cpu_pct: Some(cpu),
+            rss: Some(rss),
+        }
+    }
+
+    #[test]
+    fn named_scopes_join_their_worktree_and_the_rest_list_under_thegn() {
+        let (owners, panes, procs) = fixture();
+        // fixture paths: /repos/alpha-main, /repos/alpha-feat, /repos/beta-main.
+        let scopes = [
+            scope(Some(ScopeKind::Gate), Some("alpha-feat"), 100.0, 1_000),
+            // Two agent scopes for one worktree merge into one row.
+            scope(Some(ScopeKind::Agent), Some("alpha-feat"), 10.0, 10),
+            scope(Some(ScopeKind::Agent), Some("alpha-feat"), 5.0, 5),
+            scope(Some(ScopeKind::Gate), Some("gone-tree"), 7.0, 70),
+            scope(None, None, 3.0, 30),
+        ];
+        let mut input = inputs(&owners, Some(panes.as_slice()), &procs);
+        input.scopes = &scopes;
+        let tree = build(&input, SortKey::Cpu, TOP_PER_PANE);
+        let feat = tree
+            .rows
+            .iter()
+            .position(|r| r.label == "alpha/feat")
+            .expect("feat row");
+        // Pane 3 (5%) + gate 100 + agents 15.
+        assert!(close(tree.rows[feat].cpu_pct, 120.0));
+        assert_eq!(tree.rows[feat].rss, Some(500 + 1_015));
+        let gate = &tree.rows[feat + 1];
+        assert_eq!(
+            (gate.depth, gate.kind, gate.label.as_str()),
+            (2, RowKind::Job, "gate")
+        );
+        assert!(close(gate.cpu_pct, 100.0));
+        let agent = &tree.rows[feat + 2];
+        assert_eq!(agent.label, "agent");
+        assert!(close(agent.cpu_pct, 15.0));
+        // The workspace rolls the jobs up too: 65 + 115.
+        assert!(close(find(&tree.rows, "alpha").cpu_pct, 180.0));
+        // Unmatched slug and the unnamed sum sit under thegn, which stays
+        // UI + daemon.
+        let loose = find(&tree.rows, "gate · gone-tree");
+        assert_eq!((loose.depth, loose.kind), (1, RowKind::Job));
+        let unnamed = find(&tree.rows, UNNAMED_JOBS);
+        assert!(close(unnamed.cpu_pct, 3.0));
+        assert!(close(find(&tree.rows, "thegn").cpu_pct, 6.0));
+        let thegn_at = tree.rows.iter().position(|r| r.label == "thegn").unwrap();
+        let outside_at = tree
+            .rows
+            .iter()
+            .position(|r| r.label == "outside thegn")
+            .unwrap();
+        assert!(
+            thegn_at
+                < tree
+                    .rows
+                    .iter()
+                    .position(|r| r.label == UNNAMED_JOBS)
+                    .unwrap()
+        );
+        assert_eq!(outside_at, tree.rows.len() - 1);
+        // Scopes (125%) are below the process-tree sum (191%), so outside is
+        // unchanged: they overlap, not add.
+        assert!(close(find(&tree.rows, "outside thegn").cpu_pct, 9.0));
+        assert!(!tree.clamped);
+    }
+
+    #[test]
+    fn scope_sum_above_the_process_tree_lowers_outside_and_clamps() {
+        let owners = [owner(1, "w", "w/a", "1", None)];
+        let panes = [pane(1, 10.0, 100)];
+        // A gate running outside thegn's process tree: 150% of one core.
+        let scopes = [scope(Some(ScopeKind::Gate), Some("w-a"), 150.0, 1_000)];
+        let mut input = inputs(&owners, Some(panes.as_slice()), &[]);
+        input.scopes = &scopes;
+        let tree = build(&input, SortKey::Cpu, 3);
+        // Total 200; max(10 + 6, 150) = 150 attributed.
+        assert!(close(find(&tree.rows, "outside thegn").cpu_pct, 50.0));
+        assert!(!tree.clamped);
+        let big = [scope(None, None, 900.0, 90_000)];
+        input.scopes = &big;
+        let tree = build(&input, SortKey::Cpu, 3);
+        assert!(tree.clamped);
+        let outside = find(&tree.rows, "outside thegn");
+        assert!(close(outside.cpu_pct, 0.0));
+        assert_eq!(outside.rss, Some(0));
+    }
+
+    #[test]
+    fn loose_jobs_are_bounded_and_overflow_into_unnamed() {
+        let scopes: Vec<ScopeUsage> = (0..MAX_LOOSE_JOBS + 3)
+            .map(|i| {
+                let slug = format!("s{i:02}");
+                scope(Some(ScopeKind::Agent), Some(slug.as_str()), 1.0, 1)
+            })
+            .collect();
+        let mut input = inputs(&[], Some(&[]), &[]);
+        input.scopes = &scopes;
+        let tree = build(&input, SortKey::Mem, 3);
+        let jobs = tree
+            .rows
+            .iter()
+            .filter(|r| r.kind == RowKind::Job && r.label.starts_with("agent · "))
+            .count();
+        assert_eq!(jobs, MAX_LOOSE_JOBS);
+        assert_eq!(find(&tree.rows, UNNAMED_JOBS).rss, Some(3));
+        // A worktree without a path matches on its display name's slug.
+        let mut bare = owner(1, "w", "w/plain", "1", None);
+        bare.worktree_path = None;
+        let owners = [bare];
+        let scopes = [scope(Some(ScopeKind::Gate), Some("plain"), 2.0, 2)];
+        let mut input = inputs(&owners, Some(&[]), &[]);
+        input.scopes = &scopes;
+        let tree = build(&input, SortKey::Cpu, 3);
+        let wt = tree.rows.iter().position(|r| r.label == "w/plain").unwrap();
+        assert_eq!(tree.rows[wt + 1].label, "gate");
+    }
+
+    #[test]
+    fn at_least_takes_the_larger_known_side() {
+        let a = Usage::new(Some(1.0), None);
+        let b = Usage::new(Some(3.0), Some(5));
+        assert_eq!(at_least(a, b), Usage::new(Some(3.0), Some(5)));
+        assert_eq!(at_least(b, Usage::default()), b);
+        assert_eq!(at_least(Usage::default(), a), a);
+        assert_eq!(at_least(Usage::new(Some(9.0), Some(9)), b).rss, Some(9));
     }
 
     #[test]
