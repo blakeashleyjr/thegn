@@ -2219,6 +2219,7 @@ fn db_wt(slug: &str, repo_path: &str) -> crate::sidebar::DbWorktree {
         env_name: None,
         env_degraded: false,
         sandbox_profile: None,
+        external: false,
     }
 }
 
@@ -3402,4 +3403,50 @@ fn unreadable_env_chips_keep_a_local_only_config() {
         )
         .is_none()
     );
+}
+
+/// Hydration classifies external worktrees from the repo root, thegn's
+/// checkout layout and the trusted `[project.<slug>] worktree_roots` (tilde
+/// expanded), with no I/O.
+#[test]
+fn row_is_external_honours_layout_and_worktree_roots() {
+    let mut cfg = thegn_core::config::Config {
+        worktrees_dir: "/wt".into(),
+        worktree_mode: thegn_core::config::WorktreeMode::Global,
+        ..Default::default()
+    };
+    let mut cache = std::collections::HashMap::new();
+    let mut ext = |path: &str, folder: Option<i64>, cfg: &thegn_core::config::Config| {
+        row_is_external("/src/app", path, folder, cfg, &mut cache)
+    };
+    assert!(!ext("/wt/app/feat--1", None, &cfg));
+    assert!(!ext("/src/app", None, &cfg));
+    assert!(ext("/agents/app/x", None, &cfg));
+    assert!(!ext("/agents/app/x", Some(1), &cfg));
+
+    // A bound project block's `worktree_roots` adopts the directory. The roots
+    // are cached per repo root, so classify with a fresh cache.
+    cfg.workspace.insert(
+        "app".into(),
+        thegn_core::config::WorkspaceConfig {
+            repo_path: Some("/src/app".into()),
+            worktree_roots: vec!["/agents".into(), "  ".into()],
+            ..Default::default()
+        },
+    );
+    let mut cache = std::collections::HashMap::new();
+    assert!(!row_is_external(
+        "/src/app",
+        "/agents/app/x",
+        None,
+        &cfg,
+        &mut cache
+    ));
+    assert!(row_is_external(
+        "/src/app",
+        "/agents2/x",
+        None,
+        &cfg,
+        &mut cache
+    ));
 }

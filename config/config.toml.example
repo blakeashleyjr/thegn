@@ -180,15 +180,17 @@ sidebar_show_commits = true
 sidebar_show_behind_base = false
 sidebar_commit_badge = "{n}c"
 sidebar_behind_badge = "{n}b"
-# Ordered detail fields: branch, commits, dirty, branch_stat, pr, subject, age,
-# env, sandbox, devcontainer, hibernated, mq, unread, disk. Opt-in names are
-# upstream, stage, activity, author, stash (repo-wide stash count, hidden at
-# zero), ci (latest cached CI run: pass/fail/run/pend, hidden while no run is
-# cached), and issue (the newest linked issue id, +N when more are linked;
-# read from the local link table, no fetch). Unknown entries warn and are
+# Ordered detail fields. The default is every field but stage and activity:
+# branch, commits, dirty, branch_stat, pr, ci (latest cached CI run:
+# pass/fail/run/pend, hidden while no run is cached), issue (the newest linked
+# issue id, +N when more are linked; read from the local link table, no fetch),
+# author (last commit's author), stash (repo-wide stash count, hidden at zero),
+# subject, age, upstream, env, sandbox, devcontainer, hibernated, mq, unread,
+# disk. Opt-in names are stage and activity. Narrow rows drop optional fields
+# first (see the sidebar help page for the exact elision order). Unknown entries warn and are
 # ignored; duplicates are ignored. Empty keeps only the branch fallback. Prefer
 # this list over the legacy toggles below.
-sidebar_detail_fields = ["branch", "commits", "dirty", "branch_stat", "pr", "subject", "age", "env", "sandbox", "devcontainer", "hibernated", "mq", "unread", "disk"]
+sidebar_detail_fields = ["branch", "commits", "dirty", "branch_stat", "pr", "ci", "issue", "author", "stash", "subject", "age", "upstream", "env", "sandbox", "devcontainer", "hibernated", "mq", "unread", "disk"]
 sidebar_detail_branch = true
 sidebar_detail_branch_stat = true
 sidebar_detail_pr = true
@@ -208,6 +210,20 @@ sidebar_icon_status = ""
 # Fraction of the window the Wide expand (`e`, sidebar focused) takes (clamped
 # 0.20–0.90; default 0.5). Never narrower than the resting width.
 # sidebar_wide_ratio = 0.5
+# External worktrees: git worktrees of a registered repo that thegn did not
+# create (outside its checkout layout and every [project.<slug>] worktree_roots
+# entry, and not filed into a folder). "group" folds them under one collapsible
+# "Other (N)" row per project (the default); "show" lists them among the
+# project's own rows; "hide" omits them. The active worktree is never hidden.
+sidebar_external_worktrees = "group"
+# Label of that group row, and whether it starts collapsed (toggling it is
+# remembered per project).
+sidebar_other_group_label = "Other"
+sidebar_other_group_collapsed = true
+# Rows a sidebar group shows before "show more"; 0 = no limit. Per-group
+# overrides are keyed by the folder or group label.
+sidebar_group_row_limit = 15
+# sidebar_group_row_limits = { Other = 5 }
 
 # Visual tuning. The focus accent recolors every thegn surface (plugins,
 # pickers, dashboard). `focus_border` frames whatever owns focus — the focused
@@ -1495,6 +1511,10 @@ command = "git diff"
 # as [sandbox] mounts below). These extend the global mounts; the global list is
 # the "all workspaces" scope, this is the "per workspace" scope:
 # sandbox_mounts = ["~/datasets:ro", "/opt/toolchain"]
+# Directories whose worktrees count as this project's own in the sidebar (`~`
+# is expanded). Worktrees outside thegn's layout and outside every root here
+# are "external" (see [ui] sidebar_external_worktrees):
+# worktree_roots = ["~/agent-worktrees", "~/wt/my-work-repo"]
 # Default env bundle for this workspace (see [bundle.*] below):
 # env_bundle = "work"
 # Bind this block to ONE checkout when two repos share a directory name (each
