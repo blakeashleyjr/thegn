@@ -147,6 +147,19 @@ pub(crate) fn classify_pull(
     }
 }
 
+/// Branches a sandbox pull-back never writes: `main`, the repository's
+/// default branch and the configured merge target.
+pub(crate) fn is_protected_branch(
+    branch: &str,
+    default_branch: Option<&str>,
+    merge_target: &str,
+) -> bool {
+    let target = merge_target.trim();
+    branch == "main"
+        || default_branch.is_some_and(|d| d != "HEAD" && d == branch)
+        || (!target.is_empty() && target != "auto" && target == branch)
+}
+
 /// The scratch ref a worktree's pull-back fetches into: the worktree's
 /// directory name reduced to `[A-Za-z0-9_-]` (so it is always a valid,
 /// single-component ref name).
@@ -467,6 +480,16 @@ pub(crate) fn pull_back(
         .ok()
         .filter(|b| !b.is_empty())
         .ok_or_else(|| anyhow::anyhow!("{worktree} is not on a branch; nothing to pull into"))?;
+    let default_branch = thegn_core::worktree::default_branch_checked(wt).ok();
+    anyhow::ensure!(
+        default_branch.is_some()
+            && !is_protected_branch(
+                &branch,
+                default_branch.as_deref(),
+                &cfg.merge_queue.target_branch
+            ),
+        "refusing to pull sandbox commits into {branch}: it is (or may be) the repository's default branch or merge target, which a sandbox never writes; check out the lane branch in {worktree} first"
+    );
     let local_tip = branch_tip(wt, &branch)?;
     let (provider, id, workdir) = provider_target(cfg, worktree, env_name)?;
 
@@ -559,12 +582,25 @@ fn download_and_apply(
 mod tests {
     use super::{
         MAX_SEED_BUNDLE_BYTES, PULL_REF_PREFIX, PullOutcome, PullReport, apply_pulled_bundle,
-        branch_tip, bundle_branch, classify_pull, no_exec_channel_message, pull_ref_for,
-        seed_cap_message,
+        branch_tip, bundle_branch, classify_pull, is_protected_branch, no_exec_channel_message,
+        pull_ref_for, seed_cap_message,
     };
     use std::path::Path;
 
     const A: &str = "1111111111111111111111111111111111111111";
+
+    #[test]
+    fn protected_branches_are_never_pull_targets() {
+        assert!(is_protected_branch("main", None, "auto"));
+        assert!(is_protected_branch("develop", Some("develop"), "auto"));
+        assert!(is_protected_branch(
+            "tg/b1-integration",
+            Some("main"),
+            "tg/b1-integration"
+        ));
+        assert!(!is_protected_branch("tg/lane", Some("main"), "auto"));
+        assert!(!is_protected_branch("tg/lane", Some("HEAD"), ""));
+    }
     const B: &str = "2222222222222222222222222222222222222222";
 
     #[test]
