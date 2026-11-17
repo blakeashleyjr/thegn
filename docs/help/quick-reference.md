@@ -84,6 +84,8 @@ with `git worktree add`.
 
 ## Where to go next
 
+For AI-usage totals from the shell, run `thegn usage [--json] [--tokens]` (see [[ai-usage]]).
+
 - [[keybindings]] — every key, with your rebinds
 - [[command-palette]] — find and run actions
 - [[terminal-and-panes]] — tabs, splits, and panes
