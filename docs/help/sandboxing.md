@@ -913,7 +913,12 @@ A provider env with no remote transport fails closed: it halts before
 provisioning instead of running the session on the host. Fly sessions run on
 the Fly machine over thegn's ssh bridge. Sprites headless sessions use native
 exec and start in the provisioned checkout; `interactive_command` is only used
-with `exec = "cli"`. The provider "provisioned" marker and cached sandbox home
+with `exec = "cli"`: with `exec = "auto"` or `"api"` the `exec_command` and
+`interactive_command` keys are ignored (`thegn doctor` warns), and a worktree
+whose saved transport prefix is stale is repaired on its next launch. Fly
+provisioning installs Nix even when running as root without sudo. A plain ssh
+host with `data = "in_env"` has the repo seeded at `env up` or session open into
+`$HOME/thegn-worktrees/<repo>/<worktree>`. The provider "provisioned" marker and cached sandbox home
 live in the state dir, so the CLI and daemon agree, and `.thegn-provisioned` is
 excluded from git in remote checkouts. Provisioning fails clearly when Nix is
 required but did not install, and interrupted Nix builds no longer leave the
@@ -956,8 +961,10 @@ provider ids at `env.<name>.provider.id` must be lowercase for Sprites,
 Hetzner, DigitalOcean, Fly and machine0; validation refuses uppercase ids.
 
 VPS and machine0 sandboxes pin their SSH host key on first contact with
-`accept-new` in a per-instance file under `~/.thegn/vps/known_hosts.d/` (or
-`$THEGN_DIR/vps/known_hosts.d/`). Thegn creates that directory with owner-only
+`accept-new` in a per-instance file under `$XDG_STATE_HOME/thegn/vps/known_hosts.d/`, moved once
+from `~/.thegn/vps` (the VPS and Fly machine ledger lives beside it).
+`thegn env show` warns about risky sandbox mounts such as the runtime dir or
+profile trees. Thegn creates that directory with owner-only
 permissions before managed SSH connections, refuses a symlinked or
 non-private directory, requires the same key on later connections, and
 removes the pin when it destroys a VPS or machine0 sandbox. Creating a machine0
