@@ -1846,6 +1846,27 @@ const WORKSPACE_LABEL_FLOOR: usize = 10;
 /// Compose the right-aligned cluster for a workspace header. Keeping the
 /// token width and the complete cluster width together lets `build_sidebar`
 /// copy the same geometry into the hit model without a second layout pass.
+/// The workspace header's zone chip (empty when unzoned).
+fn zone_chip(row: &crate::sidebar::SidebarRow) -> Vec<crate::seg::Seg> {
+    use crate::seg::{Tok, seg, sp};
+    use crate::sidebar::ZoneTag;
+    match &row.zone {
+        None => Vec::new(),
+        Some(ZoneTag::Unknown) => vec![sp(1), seg(Tok::Slot(S::Faint), "zone ?")],
+        Some(ZoneTag::Named { name, policy }) => {
+            let name = thegn_core::pipeline_report::display_clip(name, 16);
+            if *policy {
+                vec![sp(1), seg(Tok::Slot(S::Ghost), format!("zone {name}"))]
+            } else {
+                vec![
+                    sp(1),
+                    seg(Tok::Hue(theme::Hue::Amber), format!("zone {name} !")),
+                ]
+            }
+        }
+    }
+}
+
 fn workspace_right_cluster(
     row: &crate::sidebar::SidebarRow,
     pool: Option<(usize, usize)>,
@@ -1954,6 +1975,17 @@ fn compose_row_lines(
             l.push(seg(Tok::Slot(S::Accent), display_cell(&row.label)).bold());
             let (right, mq_width) = workspace_right_cluster(row, pool, content_cols);
             *mq_geometry = mq_width.map(|width| (width, crate::seg::seg_width(&right)));
+            // Zone chip: only when label + chip + right cluster all fit.
+            let chip = zone_chip(row);
+            if !chip.is_empty()
+                && crate::seg::seg_width(&l)
+                    + crate::seg::seg_width(&chip)
+                    + 1
+                    + crate::seg::seg_width(&right)
+                    <= content_cols
+            {
+                l.extend(chip);
+            }
             if right.is_empty() {
                 vec![Line::Segs(l)]
             } else {
@@ -4556,5 +4588,97 @@ mod tests {
             .map(|s| crate::seg::seg_width(std::slice::from_ref(s)))
             .sum();
         assert_eq!(lead, 6, "aligned with a depth-1 row's label");
+    }
+
+    fn zone_ws(zone: Option<crate::sidebar::ZoneTag>) -> crate::sidebar::SidebarRow {
+        let mut ws = crate::sidebar::SidebarRow::base(
+            crate::sidebar::RowKind::Workspace,
+            0,
+            "alpha",
+            "alpha",
+        );
+        ws.zone = zone;
+        ws
+    }
+
+    fn zone_segs(ws: &crate::sidebar::SidebarRow, cols: usize) -> Vec<crate::seg::Seg> {
+        let disp = SidebarDisplay::default();
+        let lines = compose_row_lines(
+            ws, None, None, false, false, true, None, None, cols, &mut None, &disp,
+        );
+        match lines.into_iter().next().unwrap() {
+            Line::Segs(s) => s,
+            Line::Split { l, .. } => l,
+            other => panic!("unexpected line {other:?}"),
+        }
+    }
+
+    fn joined(segs: &[crate::seg::Seg]) -> String {
+        segs.iter().map(|s| s.text.as_str()).collect()
+    }
+
+    #[test]
+    fn zone_chip_shows_named_zone_and_nothing_when_unzoned() {
+        use crate::sidebar::ZoneTag;
+        let named = zone_ws(Some(ZoneTag::Named {
+            name: "z1".into(),
+            policy: true,
+        }));
+        let segs = zone_segs(&named, 60);
+        assert!(joined(&segs).contains("zone z1"));
+        assert!(
+            segs.iter()
+                .any(|s| s.text == "zone z1" && s.fg == crate::seg::Tok::Slot(S::Ghost))
+        );
+        assert!(!joined(&zone_segs(&zone_ws(None), 60)).contains("zone"));
+    }
+
+    #[test]
+    fn zone_chip_unknown_and_unpoliced_states() {
+        use crate::sidebar::ZoneTag;
+        let unknown = zone_segs(&zone_ws(Some(ZoneTag::Unknown)), 60);
+        assert!(
+            unknown
+                .iter()
+                .any(|s| s.text == "zone ?" && s.fg == crate::seg::Tok::Slot(S::Faint))
+        );
+        let unpoliced = zone_segs(
+            &zone_ws(Some(ZoneTag::Named {
+                name: "z1".into(),
+                policy: false,
+            })),
+            60,
+        );
+        assert!(
+            unpoliced
+                .iter()
+                .any(|s| s.text == "zone z1 !" && s.fg == crate::seg::Tok::Hue(theme::Hue::Amber))
+        );
+    }
+
+    #[test]
+    fn zone_chip_name_is_escape_free_and_clipped() {
+        use crate::sidebar::ZoneTag;
+        let row = zone_ws(Some(ZoneTag::Named {
+            name: "a\x1b]52;c;ZQ==\x07bbbbbbbbbbbbbbbbbbbbbbbbbbbbbb".into(),
+            policy: true,
+        }));
+        let text = joined(&zone_segs(&row, 80));
+        assert!(!text.contains('\x1b') && !text.contains('\x07'));
+        let chip = text.split("zone ").nth(1).unwrap();
+        assert!(chip.chars().count() <= 16, "clipped: {chip:?}");
+    }
+
+    #[test]
+    fn zone_chip_drops_before_the_label_clips_when_narrow() {
+        use crate::sidebar::ZoneTag;
+        let row = zone_ws(Some(ZoneTag::Named {
+            name: "z1".into(),
+            policy: true,
+        }));
+        assert!(joined(&zone_segs(&row, 60)).contains("zone z1"));
+        let narrow = joined(&zone_segs(&row, 14));
+        assert!(!narrow.contains("zone"), "chip dropped: {narrow:?}");
+        assert!(narrow.contains("alpha"));
     }
 }
