@@ -1,12 +1,12 @@
 //! Keep the self-hosted CI runbook aligned with the workflow's executable
 //! triggers, runner selector, and opt-in jobs.
 
-use serde_yaml::Value;
+use serde_json::Value;
 
 const RUNNER_EXPRESSION: &str = "${{ fromJSON((github.event_name == 'workflow_dispatch' && github.repository == 'blakeashleyjr/thegn' && vars.CI_RUNS_ON) || '[\"ubuntu-latest\"]') }}";
 
 fn mapping_value<'a>(value: &'a Value, key: &str) -> Option<&'a Value> {
-    value.as_mapping()?.get(Value::String(key.to_string()))
+    value.as_object()?.get(key)
 }
 
 fn normalized(text: &str) -> String {
@@ -19,23 +19,21 @@ fn self_hosted_ci_runbook_matches_workflow_policy() {
     let workflow_path = root.join(".github/workflows/ci.yml");
     let workflow_text = std::fs::read_to_string(&workflow_path)
         .unwrap_or_else(|error| panic!("cannot read {}: {error}", workflow_path.display()));
-    let workflow: Value = serde_yaml::from_str(&workflow_text)
+    let workflow: Value = serde_saphyr::from_str(&workflow_text)
         .unwrap_or_else(|error| panic!("cannot parse {}: {error}", workflow_path.display()));
     let runbook_path = root.join("docs/self-hosted-ci.md");
     let runbook = std::fs::read_to_string(&runbook_path)
         .unwrap_or_else(|error| panic!("cannot read {}: {error}", runbook_path.display()));
     let runbook = normalized(&runbook);
 
-    // YAML 1.1 parsers may resolve the unquoted GitHub Actions key `on` as a
-    // boolean. Accept either representation while still inspecting parsed YAML.
-    let triggers =
-        mapping_value(&workflow, "on").or_else(|| workflow.as_mapping()?.get(Value::Bool(true)));
-    let triggers = triggers.expect("workflow must declare an `on` mapping");
+    // serde-saphyr is YAML 1.2: the unquoted GitHub Actions key `on` stays the
+    // string "on" (a YAML 1.1 parser would have resolved it to `true`).
+    let triggers = mapping_value(&workflow, "on").expect("workflow must declare an `on` mapping");
     let trigger_names: Vec<&str> = triggers
-        .as_mapping()
+        .as_object()
         .expect("workflow triggers must be a mapping")
         .keys()
-        .filter_map(Value::as_str)
+        .map(String::as_str)
         .collect();
     let dispatch_only = trigger_names.len() == 1 && trigger_names[0] == "workflow_dispatch";
     if dispatch_only {
@@ -81,14 +79,12 @@ fn self_hosted_ci_runbook_matches_workflow_policy() {
     );
 
     let jobs = mapping_value(&workflow, "jobs")
-        .and_then(Value::as_mapping)
+        .and_then(Value::as_object)
         .expect("workflow must declare jobs");
     let mut selected_linux_job = false;
     let mut optional_jobs = Vec::new();
     for (job_name, job) in jobs {
-        let Some(job_name) = job_name.as_str() else {
-            continue;
-        };
+        let job_name = job_name.as_str();
         if let Some(runs_on) = mapping_value(job, "runs-on").and_then(Value::as_str)
             && runs_on.contains("CI_RUNS_ON")
         {
@@ -179,4 +175,17 @@ fn self_hosted_ci_runbook_matches_workflow_policy() {
             "runbook omits required security posture: {security_claim}"
         );
     }
+}
+
+#[test]
+fn yaml_1_2_keeps_the_unquoted_on_key_a_string() {
+    let workflow: Value =
+        serde_saphyr::from_str("on:\n  workflow_dispatch: {}\njobs: {}\n").unwrap();
+    let root = workflow.as_object().unwrap();
+    assert!(
+        root.contains_key("on"),
+        "`on` must stay a string key: {root:?}"
+    );
+    assert!(!root.contains_key("true"));
+    assert!(mapping_value(&workflow, "on").is_some_and(Value::is_object));
 }
