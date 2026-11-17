@@ -239,8 +239,9 @@ pub(crate) enum EnvChoice {
     KeepNoPipeline,
 }
 
-/// Decide the env pin. `has_selection`: a DB worktree/workspace env or a repo
-/// overlay `env = "…"` binds the worktree (`[sandbox] default_env` does not).
+/// Decide the env pin. `has_selection`: a DB worktree/workspace env, a repo
+/// overlay `env = "…"`, or a stored provider location binds the worktree
+/// (`[sandbox] default_env` does not).
 /// Pure.
 pub(crate) fn env_choice(
     explicit: Option<&str>,
@@ -292,7 +293,10 @@ pub(crate) fn pin_env_for_run(
     };
     let repo_s = repo_root.to_string_lossy();
     let selected = db.effective_env_selection(wt, &repo_s)?.name;
-    let has_selection = selected.is_some() || !cfg.repo_env_name(repo_root).is_empty();
+    let provider_bound =
+        crate::provider_git::is_provider_location(wt, db.location_for(wt)?.as_deref());
+    let has_selection =
+        selected.is_some() || provider_bound || !cfg.repo_env_name(repo_root).is_empty();
     match env_choice(explicit, has_selection, cfg.env.contains_key(PIPELINE_ENV)) {
         EnvChoice::Keep => Ok(None),
         EnvChoice::KeepNoPipeline => {
@@ -308,10 +312,7 @@ pub(crate) fn pin_env_for_run(
                 ));
             }
             crate::cmd::wt::refuse_dev_env_on_stable_daemon(cfg, Some(&name))?;
-            let stored = db.location_for(wt)?;
-            if crate::provider_git::is_provider_location(wt, stored.as_deref())
-                && selected.as_deref() != Some(name.as_str())
-            {
+            if provider_bound && selected.as_deref() != Some(name.as_str()) {
                 anyhow::bail!(
                     "{wt} carries a provider location and agent run would pin it to env {name}; \
                      run `thegn env set {name} --worktree {wt}` first"
@@ -643,6 +644,15 @@ mod tests {
             pin_env_for_run(&cfg_with_envs(), &db, &wt, &root, Some("host")).expect_err("refused");
         assert!(format!("{err:#}").contains("thegn env set"), "{err:#}");
         assert_eq!(db.worktree_env(&wt).expect("read"), None, "no pin written");
+        assert_eq!(
+            pin_env_for_run(&cfg_with_envs(), &db, &wt, &root, None).expect("keep"),
+            None
+        );
+        assert_eq!(
+            db.worktree_env(&wt).expect("read"),
+            None,
+            "implicit pin skips a provider-bound worktree"
+        );
     }
 
     #[test]

@@ -280,8 +280,8 @@ thegn agent run --agent codex --worktree ~/wt/fix-login \
 - The environment: `--env <name>` pins the worktree to `[env.<name>]` first,
   like `env set` (a worktree carrying a provider location is refused; run
   `thegn env set` on it first). Without `--env`, a worktree that has no env
-  selection (no worktree or project `env set`, no repo `env = "…"`) is
-  pinned to `pipeline` when `[env.pipeline]` is defined; if it is not
+  selection (no worktree or project `env set`, no repo `env = "…"`) and no
+  provider location is pinned to `pipeline` when `[env.pipeline]` is defined; if it is not
   defined, the default resolution applies. A worktree that already selects
   an env keeps it. The pin is noted on stderr.
 - `--track <issue-id>` writes the plain dispatch row described above, so
