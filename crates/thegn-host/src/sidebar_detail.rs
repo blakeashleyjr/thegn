@@ -671,6 +671,8 @@ pub(crate) fn fit_fields(mut fields: Vec<Field>, budget: usize) -> Vec<Field> {
 }
 
 /// Compose a detail line using the caller's measured indentation and width.
+/// Test-only since the sidebar paints through [`compose_detail_line_guided`].
+#[cfg(test)]
 pub(crate) fn compose_detail_line_at(
     row: &SidebarRow,
     disp: &SidebarDisplay,
@@ -682,7 +684,7 @@ pub(crate) fn compose_detail_line_at(
     compose_detail_line_guided(row, disp, now_unix, vec![sp(indent)], indent, cols)
 }
 
-/// Like [`compose_detail_line_at`], but the line starts with `lead` (display
+/// Like `compose_detail_line_at`, but the line starts with `lead` (display
 /// width `lead_cols`), typically a tree guide, instead of plain spaces. When
 /// `lead_cols` exceeds half the column (the clamp `compose_detail_line_at`
 /// applies) the guide would misalign, so it falls back to a plain-space lead.
