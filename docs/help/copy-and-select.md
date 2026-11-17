@@ -40,7 +40,7 @@ When the terminal accepts the OSC 52 write, the status line reports that the
 copy was sent to the terminal clipboard.
 Copies thegn makes itself (the copy keys and drag-to-copy) report failed or
 abandoned OSC 52 writes the same way.
-The panel's Logs `y` and `Y` use the same system-clipboard and OSC 52 paths.
+The panel's Logs `y` and `Y` use the same system-clipboard and OSC 52 paths, as does the git Commits `y` (copy sha; see [[panel]]).
 
 Selections are anchored to their **content**, not the screen: scroll the
 viewport and the highlight stays on the lines you picked.
