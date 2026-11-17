@@ -803,12 +803,14 @@ fn vercel_lifetime_ceiling_is_reaped_so_not_warned() {
 
 fn vercel_cred_cfg(provider: &str, mode: crate::config::ModelCredentials) -> crate::config::Config {
     let mut cfg = crate::config::Config::default();
-    let mut env = crate::config::EnvConfig::default();
-    env.provider = crate::config::EnvProviderConfig {
-        provider: provider.into(),
-        team_id: "team_abc1".into(),
-        project_id: "prj_Xy9".into(),
-        model_credentials: mode,
+    let env = crate::config::EnvConfig {
+        provider: crate::config::EnvProviderConfig {
+            provider: provider.into(),
+            team_id: "team_abc1".into(),
+            project_id: "prj_Xy9".into(),
+            model_credentials: mode,
+            ..Default::default()
+        },
         ..Default::default()
     };
     cfg.env.insert("e".into(), env);

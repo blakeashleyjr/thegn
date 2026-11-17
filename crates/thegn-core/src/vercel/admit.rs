@@ -38,7 +38,8 @@ const MAX_DNS_NAME_BYTES: usize = 253;
 
 /// A lowercase DNS name with at least one dot: labels of `[a-z0-9-]`, 1..=63
 /// bytes, no leading/trailing hyphen, no empty label (so no leading, trailing
-/// or doubled dot), no wildcard, at most 253 bytes.
+/// or doubled dot), no wildcard, at most 253 bytes, and the last label starts
+/// with a letter (so no IP literal).
 pub fn valid_host_suffix(s: &str) -> bool {
     s.len() <= MAX_DNS_NAME_BYTES
         && s.contains('.')
@@ -51,6 +52,9 @@ pub fn valid_host_suffix(s: &str) -> bool {
                 && b.iter()
                     .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || *c == b'-')
         })
+        && s.rsplit('.')
+            .next()
+            .is_some_and(|tld| tld.as_bytes().first().is_some_and(u8::is_ascii_lowercase))
 }
 
 /// `s` is `vercel.app` or a name under it.
@@ -115,7 +119,7 @@ pub fn validate_env(pc: &crate::config::EnvProviderConfig) -> Result<(), AdmitEr
             return Err(err(
                 "interactive_host_suffixes",
                 "each entry must be a lowercase DNS name with a dot, no leading dot, \
-                 no wildcard, at most 253 bytes",
+                 no wildcard, no IP address, at most 253 bytes",
             ));
         }
         if under_untrusted_suffix(suffix) {
@@ -271,6 +275,9 @@ mod tests {
             "localhost",
             "Vercel.run",
             "-a.vercel.run",
+            "1.2.3.4",
+            "127.0.0.1",
+            "1.0x7f",
             "",
         ] {
             assert_eq!(
