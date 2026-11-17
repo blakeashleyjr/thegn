@@ -9,8 +9,8 @@ pub(crate) mod launch;
 pub(crate) mod mcp;
 pub(crate) mod skill;
 
-/// Whether the Lead is configured and available in this build. Stub: never.
-#[allow(dead_code, reason = "filled by b152 lane 2")]
-pub(crate) fn enabled(_cfg: &thegn_core::config::Config) -> bool {
-    false
+/// Whether the Lead is configured (`[lead]` present after the channel clamp).
+#[allow(dead_code, reason = "consumed by later b152 lanes")]
+pub(crate) fn enabled(cfg: &thegn_core::config::Config) -> bool {
+    cfg.lead.is_some()
 }

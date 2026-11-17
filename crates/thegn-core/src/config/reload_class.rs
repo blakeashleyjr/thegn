@@ -295,6 +295,7 @@ pub const RELOAD_CLASSES: &[(&str, ReloadClass, ReloadHook)] = &[
     // MCP servers/proxy are wired at launch (unsure: Restart).
     ("mcp_servers.*", Restart, H::None),
     ("mcp_proxy.*", Restart, H::None),
+    ("lead.*", Restart, H::None),
     ("mcp.*", Restart, H::None),
     ("secrets.*", NextUse, H::None),
     ("credentials.*", NextUse, H::None),
