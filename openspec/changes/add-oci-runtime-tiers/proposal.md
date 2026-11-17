@@ -16,9 +16,9 @@ it yields — reaching two isolation tiers above today's shared-kernel default
 Both gVisor and libkrun register as **OCI runtimes**, so this is a `--runtime
 <value>` flag on the existing Podman/Docker backend at container _create_. Every
 existing seam is reused: the worktree bind stays **path-preserving** (host-side
-git keeps working), egress stays **thegn-enforced** (our DNS filter runs on a
-container we own — unlike a remote provider), and detection/teardown/compose are
-untouched. When the requested runtime isn't installed (missing binary, or no
+git keeps working), egress reporting is **unchanged by the runtime** (`unmanaged`
+for allow/block lists, `offline` for `network = "none"`; see
+`fix-truth-in-reporting`), and detection/teardown/compose are untouched. When the requested runtime isn't installed (missing binary, or no
 `/dev/kvm` for `krun`), the sandbox **degrades to the daemon default with a
 visible warning** rather than failing the pane.
 

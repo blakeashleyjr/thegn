@@ -1643,6 +1643,12 @@ _An agent that changes the shell must be able to see the frame. The muse harness
 - [ ] 748. Resize-storm state under load — after a burst of resizes through the 40-column breakpoint (which auto-hides the panel) and back to 100x30, under CPU contention the panel sometimes stays hidden (the widen-reveal never fires) and once a chord arriving mid-relayout left the pane's bottom border drawn over the statusbar row at 120x36. Both seen only under load (`just e2e` while a build ran; 10/10 clean in isolation). Suspects: coalesced `Resized` events skipping the breakpoint transition the reveal keys on; relayout vs. chord ordering; and a burst of CSI-encoded chords (`CSI 27;mod;code~`) straddling a read boundary so termwiz splits a sequence into junk keys (the split-mouse-report residue filter exists for the same reason — chords dropped from the tail of a 17-chord burst under load). `17-error-resilience` and `18-glitch-hunt-resize` settle/pin state after the storm so the gate stays deterministic; drop that to reproduce
 - [x] 747. Muse flake pin bumped to the merged `feat/agent-session` line (`14842037`)
 
+### BA. Sandbox + remote programme
+
+_The multi-wave programme that makes sandbox and egress reporting truthful, adds the shared contracts and the launch admission handle, and builds the remote and provider seams on top (parent acceptance record THE-791). The plan, waves, freeze window, owner decisions and the hardware/accounts checklist are in `docs/superpowers/plans/2026-11-17-sandbox-remote-programme.md`; the lane rules are in CONTRIBUTING "Programme conventions (sandbox + remote, 2026-11)". Per-change detail lives in openspec (`fix-truth-in-reporting`, `add-sandbox-policy-engine`, `add-launch-admission`, `add-private-workspaces`, and the per-workstream changes listed in the plan); work items are tracked by id (`WS00`-`WS11`) in Linear._
+
+- [~] 761. Sandbox + remote programme (W0 contracts and openspec changes authored; W1 onwards pending) — see the programme record above; overlaps AC 365/372 and AJ 434 (egress truth, WS01), AB/AE (sandbox and provider seams)
+
 ### AI-free mode (audience-widener)
 
 - [~] 511. AI-free mode — run as a pure terminal workspace/worktree manager, no agents/proxy/LLM
