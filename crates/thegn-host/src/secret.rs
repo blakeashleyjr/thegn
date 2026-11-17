@@ -950,35 +950,73 @@ fn keyring_get(account: &str) -> Result<Option<String>, KeyringReadError> {
 /// The outcome of one keyring mutation (set or delete) run on the worker.
 type KeyringMutation = KeyringOutcome<Result<(), KeyringWriteError>>;
 
-/// `hold` (a clone of the caller's secrets lock) is moved into the worker job
-/// and dropped only after the keyring call returns, so the cross-process lock
-/// outlives a caller that gave up waiting. If the job never starts, dropping
-/// the job releases it.
+/// Run a held keyring mutation. The hold lives in a slot the job takes when it
+/// STARTS; on `NotStarted` (never ran, and never will: the worker skips
+/// ABANDONED jobs) the caller takes it back and drops it now, instead of
+/// leaving the cross-process lock in a queued job behind a hung operation.
+fn run_held_mutation(
+    worker: &KeyringWorker,
+    operation: &'static str,
+    timeout: std::time::Duration,
+    hold: Option<KeyringHold>,
+    op: impl FnOnce() -> Result<(), KeyringWriteError> + Send + 'static,
+) -> KeyringMutation {
+    let slot = std::sync::Arc::new(std::sync::Mutex::new(hold));
+    let job_slot = slot.clone();
+    let outcome = worker.run(operation, timeout, move || {
+        let hold = job_slot
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take();
+        let result = op();
+        drop(hold);
+        result
+    });
+    if matches!(outcome, KeyringOutcome::NotStarted(_)) {
+        drop(
+            slot.lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .take(),
+        );
+    }
+    outcome
+}
+
+/// `hold` (a clone of the caller's secrets lock) is taken by the worker job
+/// when it starts and dropped only after the keyring call returns, so the
+/// cross-process lock outlives a caller that gave up waiting. A job that never
+/// starts releases the hold as soon as the caller sees `NotStarted`.
 fn keyring_set(account: &str, token: &str, hold: Option<KeyringHold>) -> KeyringMutation {
     let account = account.to_string();
     let token = token.to_string();
-    run_keyring_op_with_timeout("set", KEYRING_PROBE_TIMEOUT, move || {
-        let result = keyring::Entry::new(KEYRING_SERVICE, &account)
-            .and_then(|entry| entry.set_password(&token))
-            .map_err(keyring_write_error);
-        drop(hold);
-        result
-    })
+    run_held_mutation(
+        keyring_worker(),
+        "set",
+        KEYRING_PROBE_TIMEOUT,
+        hold,
+        move || {
+            keyring::Entry::new(KEYRING_SERVICE, &account)
+                .and_then(|entry| entry.set_password(&token))
+                .map_err(keyring_write_error)
+        },
+    )
 }
 
 /// See [`keyring_set`] for the `hold` contract.
 fn keyring_del(account: &str, hold: Option<KeyringHold>) -> KeyringMutation {
     let account = account.to_string();
-    run_keyring_op_with_timeout("delete", KEYRING_PROBE_TIMEOUT, move || {
-        let result = match keyring::Entry::new(KEYRING_SERVICE, &account)
+    run_held_mutation(
+        keyring_worker(),
+        "delete",
+        KEYRING_PROBE_TIMEOUT,
+        hold,
+        move || match keyring::Entry::new(KEYRING_SERVICE, &account)
             .and_then(|entry| entry.delete_credential())
         {
             Ok(()) | Err(keyring::Error::NoEntry) => Ok(()),
             Err(error) => Err(keyring_write_error(error)),
-        };
-        drop(hold);
-        result
-    })
+        },
+    )
 }
 
 /// `$XDG_CONFIG_HOME/thegn/secrets/<name>.token` — alongside the config file,
@@ -2650,6 +2688,48 @@ mod tests {
             KeyringOutcome::Completed(true)
         ));
         assert_eq!(reached.load(std::sync::atomic::Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn not_started_held_mutation_releases_lock_while_worker_is_hung() {
+        let _wait = ShortLockWait::new();
+        let temp = private_temp();
+        let worker = std::sync::Arc::new(KeyringWorker::new());
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let blocked_worker = worker.clone();
+        let blocker = std::thread::spawn(move || {
+            blocked_worker.run("blocker", std::time::Duration::from_secs(5), move || {
+                started_tx.send(()).unwrap();
+                release_rx.recv().unwrap();
+                true
+            })
+        });
+        started_rx
+            .recv_timeout(std::time::Duration::from_secs(2))
+            .unwrap();
+
+        let lock = lock_secrets_in(temp.path()).unwrap();
+        let hold = lock.op_hold().unwrap();
+        drop(lock);
+        let outcome = run_held_mutation(
+            &worker,
+            "set",
+            std::time::Duration::from_millis(20),
+            Some(hold),
+            || Ok(()),
+        );
+        assert!(matches!(outcome, KeyringOutcome::NotStarted(_)));
+        // The worker is still hung on the blocker, yet the lock is free.
+        let relocked = lock_secrets_in(temp.path());
+        assert!(relocked.is_ok());
+        drop(relocked);
+
+        release_tx.send(()).unwrap();
+        assert!(matches!(
+            blocker.join().unwrap(),
+            KeyringOutcome::Completed(true)
+        ));
     }
 
     #[test]
