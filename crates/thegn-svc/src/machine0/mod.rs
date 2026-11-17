@@ -849,11 +849,11 @@ impl Machine0Provider {
             .await?
             .filter(|vm| !vm.id.is_empty())
             .ok_or_else(|| anyhow!("machine0: vm {name} vanished before provisioning"))?;
-        let root = thegn_core::util::thegn_dir();
         let vm_name = name.to_string();
-        let record = tokio::task::spawn_blocking(move || attest::load_in(&root, &vm_name))
-            .await
-            .context("machine0: attestation read worker failed")?;
+        let record =
+            tokio::task::spawn_blocking(move || attest::load_in(&attest::state_root(), &vm_name))
+                .await
+                .context("machine0: attestation read worker failed")?;
         if attest::attested(record.as_ref(), &vm.id, &plan.identity) {
             return Ok(());
         }
@@ -868,8 +868,11 @@ impl Machine0Provider {
                 Err(_) => 0,
             },
         };
-        let root = thegn_core::util::thegn_dir();
-        match tokio::task::spawn_blocking(move || attest::store_in(&root, &attestation)).await {
+        match tokio::task::spawn_blocking(move || {
+            attest::store_in(&attest::state_root(), &attestation)
+        })
+        .await
+        {
             Ok(Ok(())) => {}
             Ok(Err(error)) => {
                 tracing::warn!(%error, "machine0: provision succeeded but attestation could not be stored; next wake will re-provision")
@@ -1027,10 +1030,9 @@ impl Machine0Provider {
     }
 
     async fn retire_local_state(&self, name: &str) -> Result<()> {
-        let root = thegn_core::util::thegn_dir();
         let name = name.to_string();
         match tokio::task::spawn_blocking(move || {
-            retire_local_state_in(&root, &crate::vps::registry::dir(), &name)
+            retire_local_state_in(&attest::state_root(), &crate::vps::registry::dir(), &name)
         })
         .await
         {
