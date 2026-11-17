@@ -606,6 +606,9 @@ pub struct ViewState {
     /// (config, mirrored like `workspace_sort`). `NonEmpty` hides the banner
     /// and its hint until a terminal exists.
     pub terminals_section: thegn_core::config::TerminalsSection,
+    /// The Lead section shows only when `[lead]` is configured (mirrored from
+    /// `crate::lead::enabled` on startup/reload like `terminals_section`).
+    pub lead_enabled: bool,
     /// Flat cross-workspace layout (`g`): drop per-repo grouping and show one
     /// recency-ordered list of every worktree, each tagged with its repo.
     /// Persisted as the `sidebar_flat` ui_state key; independent of `sort`.
@@ -898,6 +901,49 @@ pub(crate) fn mq_chip(
     Some(mq.glyph(crate::caps::active_glyphs()))
 }
 
+/// Whether a registry row is the Lead's (rendered in its own section).
+fn is_lead_terminal(t: &thegn_core::models::TerminalRow) -> bool {
+    t.kind == crate::lead::group::LEAD_TERMINAL_KIND
+}
+
+/// The pinned `LEAD` section: a banner plus one row. The row is a plain
+/// terminal-target row, so the existing terminal activation ladder owns it.
+fn push_lead_section(
+    rows: &mut Vec<SidebarRow>,
+    session: &Session,
+    db_terminals: &[thegn_core::models::TerminalRow],
+) {
+    use crate::lead::group::LEAD_GROUP_NAME;
+    rows.push(SidebarRow::base(RowKind::SectionHeading, 0, "LEAD", "lead"));
+    let live = session
+        .worktrees
+        .iter()
+        .position(|w| w.name == LEAD_GROUP_NAME && w.kind == crate::session::GroupKind::Terminal);
+    let registered = crate::lead::group::lead_row(db_terminals).is_some();
+    let label = match live {
+        Some(i) => {
+            let n = session.worktrees[i].tabs.len();
+            format!("Lead ({n} {})", if n == 1 { "tab" } else { "tabs" })
+        }
+        None if registered => "Lead".to_string(),
+        None => "Lead \u{2014} Enter to start".to_string(),
+    };
+    let active = live.is_some_and(|i| i == session.active);
+    rows.push(SidebarRow {
+        tab_target: Some(match live {
+            Some(i) => RowTarget::Tab(i, session.worktrees[i].active_tab),
+            None => RowTarget::Workspace {
+                repo_path: "terminal".into(),
+                group: Some(LEAD_GROUP_NAME.into()),
+            },
+        }),
+        active,
+        worktree_path: Some(LEAD_GROUP_NAME.into()),
+        terminal_connection: Some(String::new()),
+        ..SidebarRow::base(RowKind::Terminal, 1, label, "lead/row")
+    });
+}
+
 /// Group `db_terminals` into host sections in sidebar **display order**:
 /// `local` first, then remote hosts by case-insensitive label. Each entry is
 /// `(collapse-key, display-label, is_local, terminals-in-order)`. The
@@ -910,7 +956,7 @@ pub fn terminal_hosts_ordered(
     let mut host_order: Vec<(String, String, bool)> = Vec::new();
     let mut groups: std::collections::HashMap<String, Vec<&thegn_core::models::TerminalRow>> =
         std::collections::HashMap::new();
-    for t in db_terminals {
+    for t in db_terminals.iter().filter(|t| !is_lead_terminal(t)) {
         let (key, label, local) = terminal_host(&t.connection_string, &t.kind);
         if !groups.contains_key(&key) {
             host_order.push((key.clone(), label, local));
@@ -950,6 +996,11 @@ pub fn build_rows(
 ) -> Vec<SidebarRow> {
     let activity = &status.activity;
     let mut rows = Vec::new();
+
+    // The Lead is pinned at the very top: outside workspace ordering/reorder.
+    if view.lead_enabled {
+        push_lead_section(&mut rows, session, db_terminals);
+    }
 
     // Every ordering key the computed sorts read, in one place: the live status
     // maps, or the frozen snapshot while the user is navigating the bar (see
@@ -1283,7 +1334,8 @@ pub fn build_rows(
     // (and its "New terminal…" entry point) never silently vanishes;
     // `[ui] sidebar_terminals_section = "nonempty"` opts into hiding the
     // whole section until a terminal exists.
-    let hide_terminals = db_terminals.is_empty()
+    let no_plain_terminals = db_terminals.iter().all(is_lead_terminal);
+    let hide_terminals = no_plain_terminals
         && view.terminals_section == thegn_core::config::TerminalsSection::NonEmpty;
     if !hide_terminals {
         rows.push(SidebarRow::base(
@@ -1296,7 +1348,7 @@ pub fn build_rows(
         // Genuinely-empty fallback (the startup reseed normally keeps a `local`
         // terminal, so this shows only when that couldn't run): a passive,
         // non-interactive hint pointing at the add flow.
-        if db_terminals.is_empty() {
+        if no_plain_terminals {
             rows.push(SidebarRow::base(
                 RowKind::EmptyHint,
                 1,
@@ -4080,6 +4132,45 @@ mod tests {
             .find(|r| r.kind == RowKind::Terminal)
             .expect("terminal row");
         assert_eq!(row.tab_target, Some(RowTarget::Tab(0, 1)));
+    }
+
+    #[test]
+    fn lead_section_present_iff_enabled_first_and_not_under_terminals() {
+        let s = session(vec![tab("app/home", "/wt/home")], 0);
+        let terms = vec![term("lead", "lead", ""), term("local", "local", "")];
+        let off = build_rows(
+            &s,
+            &[],
+            &ViewState::default(),
+            &no_activity(),
+            &[],
+            &[],
+            &terms,
+        );
+        assert!(!off.iter().any(|r| r.label == "LEAD"));
+        // The lead row never lists under TERMINALS, enabled or not.
+        assert!(
+            !off.iter()
+                .any(|r| r.kind == RowKind::Terminal && r.label == "lead")
+        );
+        let view = ViewState {
+            lead_enabled: true,
+            ..Default::default()
+        };
+        let on = build_rows(&s, &[], &view, &no_activity(), &[], &[], &terms);
+        assert_eq!(on[0].kind, RowKind::SectionHeading);
+        assert_eq!(on[0].label, "LEAD");
+        assert_eq!(on[1].kind, RowKind::Terminal);
+        assert!(on[1].label.starts_with("Lead"));
+        assert_eq!(
+            on.iter()
+                .filter(|r| r.kind == RowKind::Terminal && r.label == "lead")
+                .count(),
+            0
+        );
+        // Not yet registered: still shown, with the start hint.
+        let none = build_rows(&s, &[], &view, &no_activity(), &[], &[], &[]);
+        assert!(none[1].label.contains("Enter to start"));
     }
 
     #[test]
