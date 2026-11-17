@@ -114,6 +114,7 @@ fn classify_command(command: &Command) -> CommandIntent<'_> {
         | Command::Project { .. }
         | Command::Placement { .. }
         | Command::Fleet { .. }
+        | Command::Usage(..)
         | Command::Debug { .. }
         | Command::Mcp { .. }
         | Command::Agent { .. }
