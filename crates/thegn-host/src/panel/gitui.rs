@@ -1084,6 +1084,10 @@ pub enum GitMsg {
     OpenPrInBrowser,
     // stash
     StashPush,
+    /// Stash only the staged changes (`git stash push --staged`).
+    StashStaged,
+    /// Stash only the unstaged + untracked changes; the index survives.
+    StashUnstaged,
     StashApply,
     StashPop,
     StashDrop,
@@ -1138,6 +1142,9 @@ pub fn context_keys(view: GitView) -> Vec<CtxKey> {
             k("x", "commands", GitMsg::OpenMenu(MenuKind::CustomCommands)),
             k("z", "undo", GitMsg::Undo),
             k("Z", "redo", GitMsg::Redo),
+            // After `Z` so the help bar's visible prefix is unchanged.
+            k("S", "stash staged", GitMsg::StashStaged),
+            k("U", "stash unstaged", GitMsg::StashUnstaged),
             k("?", "keys", GitMsg::Cheatsheet),
         ],
         GitView::Branches => vec![
@@ -1775,6 +1782,42 @@ fn works_at_normal(msg: &GitMsg) -> bool {
     )
 }
 
+/// Why a partial stash has nothing to take, or `None` when it may proceed.
+///
+/// `Staged` refuses only when every row is untracked (a partially staged row
+/// hydrates as Unstaged); `Unstaged` needs an unstaged or untracked row
+/// (svc's unstaged stash includes untracked files). `All` always proceeds:
+/// git itself reports "no local changes".
+pub(crate) fn stash_preflight(
+    mode: crate::gitmut::StashMode,
+    changes: &[crate::panel::ChangeRow],
+) -> Option<&'static str> {
+    use crate::gitmut::StashMode;
+    use crate::panel::Stage;
+    match mode {
+        StashMode::All => None,
+        StashMode::Staged => changes
+            .iter()
+            .all(|c| c.stage == Stage::Untracked)
+            .then_some("nothing staged to stash"),
+        StashMode::Unstaged => (!changes
+            .iter()
+            .any(|c| matches!(c.stage, Stage::Unstaged | Stage::Untracked)))
+        .then_some("no unstaged changes to stash"),
+    }
+}
+
+/// The message prompt (before its `(empty = …)` default) for a stash push in
+/// `mode`.
+pub(crate) fn stash_prompt(mode: crate::gitmut::StashMode) -> &'static str {
+    use crate::gitmut::StashMode;
+    match mode {
+        StashMode::All => "stash message",
+        StashMode::Staged => "stash staged changes: message",
+        StashMode::Unstaged => "stash unstaged changes: message",
+    }
+}
+
 impl GitMsg {
     /// A short human name for the DWIM-widen status crumb
     /// ("widened for squash").
@@ -1803,6 +1846,8 @@ impl GitMsg {
             GitMsg::NewBranch => "new branch",
             GitMsg::CreateWorktree => "worktree",
             GitMsg::StashPush => "stash",
+            GitMsg::StashStaged => "stash staged",
+            GitMsg::StashUnstaged => "stash unstaged",
             GitMsg::StashApply => "apply stash",
             GitMsg::StashPop => "pop stash",
             GitMsg::StashDrop => "drop stash",
@@ -3481,5 +3526,76 @@ mod tests {
                 .iter()
                 .any(|c| c.chord == "/" && c.msg == GitMsg::FilterStart)
         );
+    }
+
+    #[test]
+    fn files_keys_offer_partial_stashes_after_redo() {
+        let keys = context_keys(GitView::Files);
+        let pos = |chord: &str| keys.iter().position(|c| c.chord == chord);
+        let (z, s, u, q) = (pos("Z"), pos("S"), pos("U"), pos("?"));
+        assert!(z.is_some() && s.is_some() && u.is_some() && q.is_some());
+        assert_eq!(s, z.map(|z| z + 1), "S sits right after Z");
+        assert_eq!(u, s.map(|s| s + 1), "U follows S");
+        assert_eq!(q, u.map(|u| u + 1), "? stays last");
+        let s = &keys[s.unwrap_or_default()];
+        assert_eq!((s.label, &s.msg), ("stash staged", &GitMsg::StashStaged));
+        let u = &keys[u.unwrap_or_default()];
+        assert_eq!(
+            (u.label, &u.msg),
+            ("stash unstaged", &GitMsg::StashUnstaged)
+        );
+        // The visible hint prefix keeps its leading keys.
+        let chords: Vec<&str> = keys.iter().map(|c| c.chord).collect();
+        assert_eq!(&chords[..3], ["space", "enter", "b"]);
+    }
+
+    #[test]
+    fn partial_stash_labels() {
+        assert_eq!(GitMsg::StashStaged.dwim_label(), "stash staged");
+        assert_eq!(GitMsg::StashUnstaged.dwim_label(), "stash unstaged");
+    }
+
+    #[test]
+    fn stash_preflight_needs_a_matching_row() {
+        use crate::gitmut::StashMode;
+        use crate::panel::Stage;
+        let staged = [change("a", Stage::Staged)];
+        let unstaged = [change("a", Stage::Unstaged)];
+        let untracked = [change("a", Stage::Untracked)];
+        let conflict = [change("a", Stage::Conflict)];
+        let cases: &[(StashMode, &[crate::panel::ChangeRow], Option<&str>)] = &[
+            (StashMode::Staged, &staged, None),
+            (StashMode::Staged, &unstaged, None),
+            (
+                StashMode::Staged,
+                &untracked,
+                Some("nothing staged to stash"),
+            ),
+            (StashMode::Staged, &[], Some("nothing staged to stash")),
+            (StashMode::Unstaged, &unstaged, None),
+            (StashMode::Unstaged, &untracked, None),
+            (
+                StashMode::Unstaged,
+                &staged,
+                Some("no unstaged changes to stash"),
+            ),
+            (
+                StashMode::Unstaged,
+                &conflict,
+                Some("no unstaged changes to stash"),
+            ),
+            (StashMode::All, &[], None),
+        ];
+        for (mode, changes, want) in cases {
+            assert_eq!(stash_preflight(*mode, changes), *want, "{mode:?}");
+        }
+    }
+
+    #[test]
+    fn stash_prompts_name_the_variant() {
+        use crate::gitmut::StashMode;
+        assert_eq!(stash_prompt(StashMode::All), "stash message");
+        assert!(stash_prompt(StashMode::Staged).starts_with("stash staged changes"));
+        assert!(stash_prompt(StashMode::Unstaged).starts_with("stash unstaged changes"));
     }
 }
