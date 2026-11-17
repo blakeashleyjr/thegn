@@ -714,7 +714,14 @@ fn config_validation_uses_the_same_grammar() {
 
 #[test]
 fn configured_provider_ids_must_be_lowercase_for_managed_kinds() {
-    for provider in ["sprites", "hetzner", "digitalocean", "fly", "machine0"] {
+    for provider in [
+        "sprites",
+        "hetzner",
+        "digitalocean",
+        "fly",
+        "machine0",
+        "vercel",
+    ] {
         let mut cfg = crate::config::Config::default();
         let mut env = crate::config::EnvConfig::default();
         env.provider.provider = provider.into();
@@ -782,4 +789,14 @@ fn base64_decoding_is_strict_and_canonical() {
         decode_base64(&encode(b"thegn")).as_deref(),
         Some(&b"thegn"[..])
     );
+}
+
+#[test]
+fn vercel_lifetime_ceiling_is_reaped_so_not_warned() {
+    let mut cfg = crate::config::Config::default();
+    let mut env = crate::config::EnvConfig::default();
+    env.provider.provider = "vercel".into();
+    env.provider.max_lifetime_secs = 3600;
+    cfg.env.insert("v".into(), env);
+    assert!(unenforced_lifetime_warnings(&cfg).is_empty());
 }

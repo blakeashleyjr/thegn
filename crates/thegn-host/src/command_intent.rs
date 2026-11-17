@@ -134,7 +134,8 @@ fn classify_command(command: &Command) -> CommandIntent<'_> {
         | Command::SpriteProxy { .. }
         | Command::VpsSsh { .. }
         | Command::Machine0Ssh { .. }
-        | Command::SpriteExec { .. } => Configured,
+        | Command::SpriteExec { .. }
+        | Command::VercelExec { .. } => Configured,
     }
 }
 

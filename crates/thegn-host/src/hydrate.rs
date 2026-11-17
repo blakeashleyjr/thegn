@@ -2944,6 +2944,7 @@ pub(crate) fn build_model(
     // + placement engine + hibernator (snapshot-then-destroy for idle VMs).
     crate::vps_reaper::tick(&app_cfg);
     crate::fly_reaper::tick(&app_cfg);
+    crate::vercel_reaper::tick(&app_cfg);
     crate::placement_flow::maintain_tick(&app_cfg);
     crate::hibernator::tick(session, &app_cfg);
     let loc_count = worktree_loc(db, &cwd, &app_cfg.loc);
