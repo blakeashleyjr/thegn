@@ -814,7 +814,7 @@ mod tests {
         let skills = skill_candidates();
         assert_eq!(
             skills.iter().map(|c| c.value.as_str()).collect::<Vec<_>>(),
-            ["mq", "pipeline", "supervise"]
+            ["lead", "mq", "pipeline", "supervise"]
         );
         assert!(skills.iter().all(|c| c.description.is_some()));
 
