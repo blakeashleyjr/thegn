@@ -54,10 +54,11 @@ These rules are deliberately weaker than config rules:
 
 - The id is always `lead:<name>`, where the name is 1 to 48 characters of
   `a-z`, `0-9`, `_` and `-`. A name that matches a config rule is refused.
-- The rule may only `notify.push` or `sessions.open`. A rule that uses
-  `merge.add` or `tools.run` is refused when it is written. It is also skipped
-  every time rules are evaluated, so a row written straight into the database
-  cannot escalate. Approval-gated escalation comes in a later release.
+- The rule may only use `notify.push`, `sessions.open` and `lead.wake`, plus
+  `pipeline.start` at autonomy `propose` (which raises an approval). A rule that
+  uses `merge.add`, `merge.drain`, `tools.run`, `merge` autonomy or any other
+  action is refused when it is written. It is also skipped every time rules are
+  evaluated, so a row written straight into the database cannot escalate.
 - `max_per_hour` and `max_action_per_hour` are capped at the config defaults.
 - Removing a rule and writing it again keeps its throttle state and audit
   history.
@@ -104,6 +105,8 @@ A rule with `when = "schedule_due"` sets exactly one of:
   evaluated in the host's local time zone. A local time that does not exist
   (spring forward) is skipped; an ambiguous one (fall back) fires once, at the
   earlier instant.
+  `@hourly`-style macros and `@reboot` are refused; with both day of month and
+  weekday restricted, either matching fires (Vixie); 0 and 7 are Sunday.
 - `every = "<n>s|m|h|d"`: between 60 seconds and 7 days, counted from when the
   producer starts.
 
@@ -120,8 +123,10 @@ armed schedule keeps the daemon from idling out.
 
 `when = "issue_matched"` fires when an issue from the tracker newly matches the
 rule's `if` fields (for example labels, state, assignee and title text; the
-issue title is the `message`). "Newly matches" means the issue was not matching
-on the previous refresh. A rule fires at most once per issue
+issue title is the `message`). It fires when an issue appears or changes status,
+labels, assignees or project while the rule exists; an unchanged issue never
+fires when a rule is added, the first refresh of a repo only records a baseline,
+and at most 50 events are produced per refresh. A rule fires at most once per issue
 (`once_per_key` is forced on). It only does work in the existing tracker
 refresh and only when an enabled `issue_matched` rule exists.
 
