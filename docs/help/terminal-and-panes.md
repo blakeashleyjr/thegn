@@ -152,6 +152,13 @@ entry can carry `preset = "<name>"` to open with that shape at creation, and
   from: press on the frame and move to **rearrange** — drop onto a pane to
   swap with it, onto an edge to anchor beside it. `Esc` abandons the drag and
   a release without motion never moves anything.
+- **Drag a file onto a pane** — press on a file in the panel's Files list and
+  drag it onto a terminal pane to type its repo-relative path at the prompt,
+  shell-quoted when needed (`a b'c.txt` becomes `'a b'\''c.txt'`). Nothing is
+  executed: the path is inserted like a paste, and you press `Enter` yourself.
+  A path holding control characters is refused, a plain click still just
+  selects the row, and a release anywhere other than a center pane (sidebar,
+  panel, drawer, an open popup) does nothing.
 
 ## Tools, scoped to the focused worktree
 
