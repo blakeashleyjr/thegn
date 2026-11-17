@@ -2798,9 +2798,19 @@ pub fn provision_provider_env_named(
     let (force_bundle, credential_free) =
         provision_credential_policy(thegn_core::config::EnvProviderKind::of(&pc.provider));
     if force_bundle {
+        // off-loop: provisioning entry (see the branch lookup below).
+        #[expect(clippy::disallowed_methods)]
+        let on_branch = thegn_core::util::git_cmd(Path::new(worktree))
+            .args(["rev-parse", "--abbrev-ref", "HEAD"])
+            .output()
+            .ok()
+            .filter(|o| o.status.success())
+            .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+            .is_some_and(|b| !b.is_empty() && b != "HEAD");
         credential_free_seed_precheck(
             name_override.is_some(),
             Path::new(worktree).join(".git").exists(),
+            on_branch,
         )?;
     }
     let id = match name_override {
@@ -2993,6 +3003,10 @@ pub fn provision_provider_env_named(
         .map(PathBuf::from)
         .unwrap_or_else(|_| PathBuf::from("/root"));
     let (dotfiles, mut home_store_roots) = resolve_personal_dotfiles(&host_home, &home, env_name);
+    if credential_free {
+        // No host closure reaches a credential-free sandbox, by any transport.
+        home_store_roots.clear();
+    }
     // Host-parity transport selection. With no hosted binary cache configured but
     // `connect = "ssh"`, push the host store straight into the sandbox over the WSS
     // ssh tunnel (the host *is* the cache — no signing key, no hosted cache), then
@@ -3449,6 +3463,7 @@ pub fn provision_provider_env_named(
     // captured in a reusable image/artifact. This is a fatal provisioning
     // boundary: route mode must not open a remote shell that could silently
     // enqueue into a sprite-local queue.
+    // A credential-free kind never holds a route-to-host bearer; `false` revokes and removes one.
     crate::remote_enqueue_auth::reconcile_provider_credential(
         cfg,
         &provider,
@@ -3456,7 +3471,7 @@ pub fn provision_provider_env_named(
         &id,
         &repo_root,
         worktree,
-        name_override.is_none(),
+        name_override.is_none() && !credential_free,
     )?;
 
     // Drop the marker (+ local mirror for the attach gate) so a later open skips it.
@@ -3824,12 +3839,22 @@ fn provision_credential_policy(kind: thegn_core::config::EnvProviderKind) -> (bo
 }
 
 /// Refuse a credential-free provision that cannot bundle-seed: a SPARE
-/// (`name_override`) or a worktree without a local git dir. There is no origin
-/// clone fallback.
-fn credential_free_seed_precheck(is_spare: bool, has_git_dir: bool) -> anyhow::Result<()> {
+/// (`name_override`), a worktree without a local git dir, or one not on a
+/// branch (detached HEAD). There is no origin clone fallback.
+fn credential_free_seed_precheck(
+    is_spare: bool,
+    has_git_dir: bool,
+    on_branch: bool,
+) -> anyhow::Result<()> {
     if is_spare || !has_git_dir {
         anyhow::bail!(
             "vercel: the repo can only reach the sandbox as a host bundle; this worktree has no local git dir"
+        );
+    }
+    if !on_branch {
+        anyhow::bail!(
+            "vercel: the repo can only reach the sandbox as a host bundle; this worktree has no \
+             checked-out branch to bundle"
         );
     }
     Ok(())
@@ -3886,9 +3911,15 @@ mod credential_policy_tests {
 
     #[test]
     fn seed_precheck_refuses_spares_and_missing_git_dir() {
-        assert!(credential_free_seed_precheck(false, true).is_ok());
-        for (spare, git) in [(true, true), (false, false), (true, false)] {
-            let err = credential_free_seed_precheck(spare, git).expect_err("refused");
+        assert!(credential_free_seed_precheck(false, true, true).is_ok());
+        for (spare, git, on_branch) in [
+            (true, true, true),
+            (false, false, true),
+            (true, false, true),
+            (false, true, false),
+            (true, true, false),
+        ] {
+            let err = credential_free_seed_precheck(spare, git, on_branch).expect_err("refused");
             assert!(
                 format!("{err}").contains("only reach the sandbox as a host bundle"),
                 "{err}"
@@ -4211,6 +4242,14 @@ fn provision_provider_repo(
     loc: &GitLoc,
     branch: Option<&str>,
 ) -> anyhow::Result<()> {
+    // Credential-free kinds (Vercel) get the repo only as a host bundle from
+    // provision_provider_env_named: never an in-sandbox origin clone, and never
+    // the host passthrough env.
+    if cfg.env.get(env_name).is_some_and(|e| {
+        thegn_core::config::EnvProviderKind::of(&e.provider.provider).credential_free()
+    }) {
+        return Ok(());
+    }
     let id = match crate::provider_factory::provider_sandbox_name_checked(cfg, worktree, env_name) {
         Ok(id) => id.filter(|id| !id.is_empty()),
         Err(error) => {
