@@ -359,8 +359,17 @@ impl EnvProviderConfig {
     /// `daytona` and `custom` have no built-in bridge: with no `exec_command`
     /// this is EMPTY, and `Placement::transport_refusal` halts the launch
     /// (never a host fallback).
+    ///
+    /// `exec_command` / `interactive_command` are vendor-CLI bridges. For
+    /// every kind except the WSS-native ones they win over the built-in
+    /// bridge; for sprites they apply ONLY with `exec = "cli"` — under
+    /// `auto`/`api` the native API (`sprite-exec`) is the transport and a
+    /// stale `exec_command` is ignored (THE-2054), so a host without the
+    /// vendor CLI still reaches the sandbox.
     pub fn control_command_template(&self) -> Vec<String> {
-        if !self.exec_command.is_empty() {
+        let wss_cli_only =
+            wss_native_provider_kind(&self.provider) && self.exec != ProviderExecMode::Cli;
+        if !self.exec_command.is_empty() && !wss_cli_only {
             return self.exec_command.clone();
         }
         let kind = EnvProviderKind::of(&self.provider);
@@ -916,6 +925,52 @@ mod tests {
             ..Default::default()
         };
         assert!(!e.is_default());
+    }
+
+    fn with_exec_command(provider: &str, exec: ProviderExecMode) -> EnvProviderConfig {
+        EnvProviderConfig {
+            provider: provider.into(),
+            exec,
+            exec_command: vec!["vendor".into(), "exec".into(), "{id}".into(), "--".into()],
+            ..Default::default()
+        }
+    }
+
+    fn vendor_argv() -> Vec<String> {
+        vec!["vendor".into(), "exec".into(), "{id}".into(), "--".into()]
+    }
+
+    fn assert_sprite_exec(tpl: &[String]) {
+        assert_eq!(tpl.len(), 4, "{tpl:?}");
+        assert_eq!(&tpl[1..], ["sprite-exec", "{id}", "--"], "{tpl:?}");
+    }
+
+    #[test]
+    fn sprites_auto_ignores_stale_exec_command() {
+        // THE-2054: a leftover vendor-CLI `exec_command` must not override the
+        // native API transport when `exec = "auto"`.
+        let tpl = with_exec_command("sprites", ProviderExecMode::Auto).control_command_template();
+        assert_sprite_exec(&tpl);
+    }
+
+    #[test]
+    fn sprites_api_ignores_exec_command() {
+        let tpl = with_exec_command("sprites", ProviderExecMode::Api).control_command_template();
+        assert_sprite_exec(&tpl);
+    }
+
+    #[test]
+    fn sprites_cli_uses_exec_command() {
+        let tpl = with_exec_command("sprites", ProviderExecMode::Cli).control_command_template();
+        assert_eq!(tpl, vendor_argv());
+    }
+
+    #[test]
+    fn non_wss_kinds_keep_exec_command_precedence() {
+        for kind in ["hetzner", "daytona"] {
+            let tpl = with_exec_command(kind, ProviderExecMode::Auto).control_command_template();
+            assert_eq!(tpl, vendor_argv(), "{kind}");
+        }
     }
 
     #[test]

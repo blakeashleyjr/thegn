@@ -888,6 +888,62 @@ pub(crate) fn rebind_resolved_location(
     fresh
 }
 
+/// The healed location blob for a stored provider `row` whose transport prefix
+/// no longer matches the env's `fresh_prefix` (THE-2054: a sprite row written
+/// under the vendor `sprite exec` CLI after the env moved to the native
+/// `sprite-exec` bridge). Keeps the row's in-sandbox path. `None` when the row
+/// is not a provider blob (local/ssh rows are never touched), the fresh prefix
+/// is empty (an unresolvable transport never clobbers a working row), or the
+/// prefixes already agree.
+pub(crate) fn healed_blob(row: &str, fresh_prefix: &[String]) -> Option<String> {
+    match thegn_core::remote::GitLoc::from_db("", Some(row)) {
+        thegn_core::remote::GitLoc::Provider {
+            control_prefix,
+            path,
+        } if !fresh_prefix.is_empty() && control_prefix != fresh_prefix => Some(
+            thegn_core::remote::GitLoc::provider_db_string(fresh_prefix, &path),
+        ),
+        _ => None,
+    }
+}
+
+/// Launch-time heal of a stale stored provider transport prefix: re-resolve
+/// the worktree's env and, when its provider control prefix differs from the
+/// stored row's, persist the fresh prefix (keeping the row's path) and return
+/// the rebuilt location. Only provider rows are considered and the new prefix
+/// comes from config, so this never widens transport. `None` = nothing to heal.
+pub(crate) fn heal_provider_prefix(
+    db: &thegn_core::db::Db,
+    cfg: &thegn_core::config::Config,
+    repo_root: &std::path::Path,
+    worktree: &str,
+    selected_env: Option<String>,
+) -> Option<thegn_core::remote::GitLoc> {
+    let row = db.location_for(worktree).ok().flatten()?;
+    let row_loc = thegn_core::remote::GitLoc::from_db(worktree, Some(&row));
+    if !matches!(row_loc, thegn_core::remote::GitLoc::Provider { .. }) {
+        return None;
+    }
+    let env = cfg.resolve_env(
+        repo_root,
+        &row_loc,
+        std::path::Path::new(worktree),
+        &thegn_core::sandbox_pin::EnvSelection {
+            name: selected_env,
+            profile: None,
+        },
+    );
+    let thegn_core::placement::Placement::Provider(p) = &env.placement else {
+        return None;
+    };
+    let new = healed_blob(&row, &p.control_prefix)?;
+    // best-effort: a failed write still launches over the fresh prefix; the
+    // next launch retries the heal.
+    let _ = db.set_worktree_location(worktree, &new);
+    tracing::info!(target: "thegn::lifecycle", %worktree, "healed stale provider transport prefix for {worktree}");
+    Some(thegn_core::remote::GitLoc::from_db(worktree, Some(&new)))
+}
+
 /// Destroy a spare sandbox and drop its ledger row only after provider success.
 pub fn destroy_spare(
     cfg: &thegn_core::config::Config,
@@ -993,6 +1049,150 @@ mod tests {
     use super::*;
     use std::sync::mpsc;
     use std::time::Duration;
+
+    fn argv(parts: &[&str]) -> Vec<String> {
+        parts.iter().map(|s| (*s).to_string()).collect()
+    }
+
+    #[test]
+    fn healed_blob_rewrites_only_stale_provider_prefixes() {
+        let stale = argv(&["sprite", "exec", "-s", "sb", "--"]);
+        let fresh = argv(&["/bin/thegn", "sprite-exec", "sb", "--"]);
+        let row = thegn_core::remote::GitLoc::provider_db_string(&stale, "/workspace/repo");
+
+        // Stale prefix → rewritten, path kept.
+        let healed = healed_blob(&row, &fresh).expect("stale prefix heals");
+        match thegn_core::remote::GitLoc::from_db("/wt", Some(&healed)) {
+            thegn_core::remote::GitLoc::Provider {
+                control_prefix,
+                path,
+            } => {
+                assert_eq!(control_prefix, fresh);
+                assert_eq!(path, "/workspace/repo");
+            }
+            other => panic!("provider loc expected, got {other:?}"),
+        }
+
+        // Equal prefix → nothing to do.
+        assert_eq!(healed_blob(&healed, &fresh), None);
+        // Empty fresh prefix never clobbers a working row.
+        assert_eq!(healed_blob(&row, &[]), None);
+        // ssh blobs are never touched (lane 3's ssh rows stay as written).
+        let ssh = thegn_core::remote::GitLoc::remote_db_string("host", 22, false, "/srv/wt");
+        assert_eq!(healed_blob(&ssh, &fresh), None);
+        // Non-blobs (local / garbage) → None.
+        assert_eq!(healed_blob("local", &fresh), None);
+        assert_eq!(healed_blob("", &fresh), None);
+        assert_eq!(healed_blob("not json", &fresh), None);
+    }
+
+    fn sprites_auto_cfg_with_stale_exec_command() -> thegn_core::config::Config {
+        use thegn_core::config::{EnvConfig, EnvProviderConfig, PlacementMode, ProviderExecMode};
+        let mut cfg = thegn_core::config::Config::default();
+        cfg.env.insert(
+            "sprites".into(),
+            EnvConfig {
+                placement: PlacementMode::Provider,
+                provider: EnvProviderConfig {
+                    provider: "sprites".into(),
+                    exec: ProviderExecMode::Auto,
+                    exec_command: argv(&["sprite", "exec", "-s", "{id}", "--"]),
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+        );
+        cfg
+    }
+
+    #[test]
+    fn heal_provider_prefix_rewrites_stale_sprite_cli_row() {
+        let _state = thegn_core::testenv::IsolatedState::new();
+        let repo = tempfile::tempdir().unwrap();
+        let repo_root = repo.path().to_string_lossy().into_owned();
+        let worktree = repo.path().join("wt-heal").to_string_lossy().into_owned();
+        let db = thegn_core::db::Db::open().unwrap();
+        let stale = thegn_core::remote::GitLoc::provider_db_string(
+            &argv(&["sprite", "exec", "-s", "sb-heal", "--"]),
+            "/workspace/wt-heal",
+        );
+        db.put_worktree(
+            "tab",
+            &repo_root,
+            &worktree,
+            "feat",
+            Some(stale.as_str()),
+            None,
+        )
+        .unwrap();
+        let cfg = sprites_auto_cfg_with_stale_exec_command();
+
+        let healed =
+            heal_provider_prefix(&db, &cfg, repo.path(), &worktree, Some("sprites".into()))
+                .expect("a stale sprite CLI row heals");
+
+        let stored = db.location_for(&worktree).unwrap().expect("row kept");
+        assert_ne!(stored, stale, "the row is rewritten");
+        let prefix_of = |loc: &thegn_core::remote::GitLoc| match loc {
+            thegn_core::remote::GitLoc::Provider { control_prefix, .. } => control_prefix.clone(),
+            other => panic!("provider loc expected, got {other:?}"),
+        };
+        let stored_loc = thegn_core::remote::GitLoc::from_db(&worktree, Some(&stored));
+        assert_eq!(
+            prefix_of(&stored_loc),
+            prefix_of(&healed),
+            "the returned loc carries the new row"
+        );
+        match healed {
+            thegn_core::remote::GitLoc::Provider {
+                control_prefix,
+                path,
+            } => {
+                assert_eq!(
+                    control_prefix.get(1).map(String::as_str),
+                    Some("sprite-exec"),
+                    "{control_prefix:?}"
+                );
+                assert_eq!(path, "/workspace/wt-heal", "the row's path is kept");
+            }
+            other => panic!("provider loc expected, got {other:?}"),
+        }
+        // Idempotent: a second launch finds nothing to heal.
+        assert!(
+            heal_provider_prefix(&db, &cfg, repo.path(), &worktree, Some("sprites".into()))
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn heal_provider_prefix_leaves_local_worktrees_alone() {
+        let _state = thegn_core::testenv::IsolatedState::new();
+        let repo = tempfile::tempdir().unwrap();
+        let repo_root = repo.path().to_string_lossy().into_owned();
+        let worktree = repo.path().join("wt-local").to_string_lossy().into_owned();
+        let db = thegn_core::db::Db::open().unwrap();
+        let cfg = sprites_auto_cfg_with_stale_exec_command();
+
+        // No row at all.
+        assert!(
+            heal_provider_prefix(&db, &cfg, repo.path(), &worktree, Some("sprites".into()))
+                .is_none()
+        );
+        assert_eq!(db.location_for(&worktree).unwrap(), None);
+
+        // A local row (no location) is never written.
+        db.put_worktree("tab", &repo_root, &worktree, "feat", None, None)
+            .unwrap();
+        assert!(
+            heal_provider_prefix(&db, &cfg, repo.path(), &worktree, Some("sprites".into()))
+                .is_none()
+        );
+        assert_eq!(
+            db.location_for(&worktree).unwrap(),
+            None,
+            "no write happens"
+        );
+    }
 
     #[test]
     fn claim_publish_decision_quarantines_any_failed_rebind() {
