@@ -15,7 +15,12 @@
 //! stage's configured agent), or the stage (the rule's `stage` param or the
 //! first configured stage). The launch is the normal daemon `sessions.open`
 //! agent path with no event-derived argv or env, behind the same fail-closed
-//! sandbox floor queue agents use.
+//! sandbox floor queue agents use, further restricted to a sealed sandbox
+//! that hides `$HOME` (autopilot's rule).
+//!
+//! A `pipeline.start` rule that creates a worktree runs your configured and
+//! trusted-repo create hooks (`PreCreate`/`PostCreate`), as a manual
+//! `thegn wt new` does.
 
 use std::path::Path;
 use std::sync::Arc;
@@ -142,7 +147,7 @@ pub(crate) async fn start(
         tokio::task::spawn_blocking(move || -> Result<(String, bool, Option<String>)> {
             let db = thegn_core::db::Db::open()?;
             let repo_root = registered_repo_root(&db, &repo)?;
-            let live = autopilot_owns(&db, &repo_root, &key)?;
+            let live = autopilot_owns(&db, &key)?;
             let linked = linked_worktree(&db, &repo_root, &lookup_issue)?;
             Ok((repo_root, live, linked))
         })
@@ -180,7 +185,10 @@ struct StartTarget {
 /// never the event's string; a non-git (`dir`) workspace is refused.
 fn registered_repo_root(db: &thegn_core::db::Db, repo: &str) -> Result<String> {
     use thegn_core::store::WorkspaceStore;
-    let canonical = std::fs::canonicalize(repo).ok();
+    let canonical = match std::fs::canonicalize(repo) {
+        Ok(path) => Some(path),
+        Err(_) => None,
+    };
     db.workspaces()?
         .into_iter()
         .filter(|w| w.kind == "repo")
@@ -194,17 +202,23 @@ fn registered_repo_root(db: &thegn_core::db::Db, repo: &str) -> Result<String> {
         })
 }
 
-/// Whether a non-terminal autopilot run holds this issue in this repo.
+/// Whether a non-terminal autopilot run holds this issue in any registered
+/// repo (the autopilot claim is global: `UNIQUE(provider, account, issue_id)`).
 fn autopilot_owns(
     db: &thegn_core::db::Db,
-    repo_root: &str,
     key: &thegn_core::autopilot::AutopilotIssueKey,
 ) -> Result<bool> {
-    use thegn_core::store::AutopilotStore;
-    Ok(db
-        .list_autopilot_runs(repo_root, 1_000)?
-        .iter()
-        .any(|run| autopilot_run_matches(run, key)))
+    use thegn_core::store::{AutopilotStore, WorkspaceStore};
+    for ws in db.workspaces()?.into_iter().filter(|w| w.kind == "repo") {
+        if db
+            .list_autopilot_runs(&ws.repo_path, 1_000)?
+            .iter()
+            .any(|run| autopilot_run_matches(run, key))
+        {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 fn autopilot_run_matches(
@@ -294,6 +308,10 @@ fn proposal_body(
 }
 
 /// The commit the configured base branch points at in `root`.
+#[expect(
+    clippy::disallowed_methods,
+    reason = "called only inside spawn_blocking (propose)"
+)]
 fn base_head_sha(cfg: &Config, root: &Path) -> Result<String> {
     let base = thegn_core::worktree::resolve_base_checked(root, cfg)
         .map_err(|e| anyhow::anyhow!("pipeline.start: cannot resolve the base branch: {e}"))?;
@@ -390,9 +408,21 @@ async fn start_stage(
     }
 
     let client = crate::automation_executor::client().await?;
-    let mut request = crate::cmd::session::StageOpenRequest::fresh(&stage, &issue_id, &worktree);
-    request.automation_origin = Some(origin);
-    let opened = crate::cmd::session::open_stage_dispatch(&cfg, &client, request).await?;
+    let dispatch_cfg = Arc::clone(&cfg);
+    let (d_stage, d_issue, d_wt) = (stage, issue_id, worktree);
+    let handle = tokio::runtime::Handle::current();
+    // `open_stage_dispatch` holds a `Db` borrow across awaits (`!Send`): drive
+    // it on a blocking thread so the executor future stays `Send`.
+    let opened = tokio::task::spawn_blocking(move || {
+        let mut request = crate::cmd::session::StageOpenRequest::fresh(&d_stage, &d_issue, &d_wt);
+        request.automation_origin = Some(origin);
+        handle.block_on(crate::cmd::session::open_stage_dispatch(
+            &dispatch_cfg,
+            &client,
+            request,
+        ))
+    })
+    .await??;
 
     let row_id = opened.row_id;
     let autonomy = action.autonomy.as_str();
@@ -434,7 +464,33 @@ fn floor_refusal(gate: crate::agent_run::AgentDispatch) -> Option<String> {
                            shared-kernel) for this repo/worktree (`[sandbox] profile`, or the \
                            worktree's isolation pin)";
     match gate {
-        AgentDispatch::Run(Some(_)) => None,
+        AgentDispatch::Run(Some(spec)) => {
+            if spec.seal_home.is_none() {
+                return Some(
+                    "pipeline.start refused: the worker's sandbox does not hide $HOME, and an \
+                     issue-driven worker runs untrusted tracker text (autopilot's sealed rule); \
+                     set `[sandbox] profile = \"sealed\"` for this repo or pin the worktree sealed"
+                        .to_owned(),
+                );
+            }
+            if let Some(miss) = thegn_core::sandbox_floor::home_gate(&spec) {
+                return Some(format!("pipeline.start refused: {miss}"));
+            }
+            if matches!(
+                spec.backend,
+                thegn_core::sandbox::Backend::Systemd
+                    | thegn_core::sandbox::Backend::Wsl
+                    | thegn_core::sandbox::Backend::WinAppContainer
+                    | thegn_core::sandbox::Backend::WinJobObject
+            ) {
+                return Some(format!(
+                    "pipeline.start refused: sandbox backend '{}' cannot provide sealed \
+                     filesystem isolation; {SETTING}",
+                    spec.backend.label()
+                ));
+            }
+            None
+        }
         AgentDispatch::Run(None) => Some(format!(
             "pipeline.start refused: the worker would run on the host with no sandbox; {SETTING}"
         )),
