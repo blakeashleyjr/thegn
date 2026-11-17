@@ -559,11 +559,13 @@ plugin-conformance:
     python3 test/plugin-apps.py --selftest
     python3 test/plugin-apps.py --binary target/debug/thegn || test $? -eq 77
 
-# The declared MSRV (`rust-version` in Cargo.toml) actually builds. `cargo-1.89`
+# The declared MSRV (`rust-version` in Cargo.toml) actually builds. `cargo-1.96`
 # is the flake's pinned MSRV toolchain (msrvRustToolchain) — bump both together.
+# When a lockfile bump raises a dependency's `rust-version` past this, raise it
+# here; `cargo-<ver>` must match.
 check-msrv:
-    @command -v cargo-1.89 >/dev/null 2>&1 || { echo "check-msrv: 'cargo-1.89' not found — run inside 'nix develop' (or 'direnv allow')"; exit 1; }
-    cargo-1.89 check --workspace --locked
+    @command -v cargo-1.96 >/dev/null 2>&1 || { echo "check-msrv: 'cargo-1.96' not found — run inside 'nix develop' (or 'direnv allow')"; exit 1; }
+    cargo-1.96 check --workspace --locked
 
 # --- local CI (act) -------------------------------------------------------
 # Run the GitHub Actions workflow (.github/workflows/ci.yml) locally in a
