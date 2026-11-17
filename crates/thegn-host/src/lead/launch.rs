@@ -46,33 +46,74 @@ struct LeadHost<'a> {
     state_home: PathBuf,
 }
 
+/// What a Lead launch is for: a tab's interactive TUI, or one bounded
+/// headless turn (`lead.wake` with no tab open). Both share every mount,
+/// mask and the fail-closed bwrap; only the command, the caller id and the
+/// process wrapper differ.
+pub(crate) enum LeadMode<'a> {
+    Interactive { group: &'a str, tab: usize },
+    Headless { prompt: &'a str },
+}
+
+/// The caller id (and token label) of a headless Lead turn. The wake path
+/// revokes this label's token once the turn ends.
+pub(crate) const HEADLESS_CALLER: &str = "lead:wake/0";
+
+/// A built Lead launch. A headless launch may own a prompt file under the
+/// notes dir, removed when this is dropped (after the run is reaped).
+pub(crate) struct LeadLaunch {
+    pub spec: crate::agent::LaunchSpec,
+    #[allow(
+        dead_code,
+        reason = "held for its drop: removes the prompt file after the reap"
+    )]
+    prompt_file: Option<WakePromptFile>,
+}
+
+impl LeadLaunch {
+    /// The prompt file the command reads, when the template uses
+    /// `{prompt_file}`.
+    #[allow(dead_code, reason = "read by tests; held for its drop")]
+    pub(crate) fn prompt_file(&self) -> Option<&Path> {
+        self.prompt_file.as_ref().map(|f| f.path.as_path())
+    }
+}
+
 /// The launch spec for Lead tab `tab` of `group`.
 pub(crate) fn launch_spec(
     cfg: &Config,
     group: &str,
     tab: usize,
 ) -> anyhow::Result<crate::agent::LaunchSpec> {
-    launch_spec_with(
-        cfg,
-        group,
-        tab,
-        &LeadHost {
-            bwrap_available: &lead_sandbox::bwrap_available,
-            repo_roots: &registered_repo_roots,
-            control_dirs: &control_dirs,
-            mcp: &crate::lead::mcp::prepare,
-            daemon_owned: crate::handlers::startup::daemon_active(cfg),
-            state_home: thegn_core::util::xdg_state_home(),
-        },
-    )
+    launch_spec_with(cfg, LeadMode::Interactive { group, tab }, &real_host(cfg))
+        .map(|launch| launch.spec)
+}
+
+/// The launch of one headless Lead turn carrying `prompt` (the `lead.wake`
+/// envelope): the harness's headless template, rendered with the same
+/// quoting and prompt-file transport `agent_run` uses (the prompt file lives
+/// under the notes dir), under the very same bwrap plan as a tab. Keep the
+/// returned value alive until the process is reaped: it owns the prompt file.
+pub(crate) fn headless_spec(cfg: &Config, prompt: &str) -> anyhow::Result<LeadLaunch> {
+    launch_spec_with(cfg, LeadMode::Headless { prompt }, &real_host(cfg))
+}
+
+fn real_host(cfg: &Config) -> LeadHost<'static> {
+    LeadHost {
+        bwrap_available: &lead_sandbox::bwrap_available,
+        repo_roots: &registered_repo_roots,
+        control_dirs: &control_dirs,
+        mcp: &crate::lead::mcp::prepare,
+        daemon_owned: crate::handlers::startup::daemon_active(cfg),
+        state_home: thegn_core::util::xdg_state_home(),
+    }
 }
 
 fn launch_spec_with(
     cfg: &Config,
-    group: &str,
-    tab: usize,
+    mode: LeadMode<'_>,
     host: &LeadHost<'_>,
-) -> anyhow::Result<crate::agent::LaunchSpec> {
+) -> anyhow::Result<LeadLaunch> {
     let Some(lead) = cfg.lead.as_ref() else {
         bail!("the Lead is not configured: add a [lead] section naming an [[agents]] entry");
     };
@@ -125,16 +166,31 @@ fn launch_spec_with(
         .with_context(|| format!("resolving the Lead notes dir {}", notes.display()))?;
 
     crate::lead::skill::seed(cfg, &notes)?;
-    let caller = format!("lead:{group}/{tab}");
-    let mcp = (host.mcp)(cfg, &notes, &caller)?;
+    let caller = match &mode {
+        LeadMode::Interactive { group, tab } => format!("lead:{group}/{tab}"),
+        LeadMode::Headless { .. } => HEADLESS_CALLER.to_string(),
+    };
 
     // The agent: its command (+ harness model flag), its secret-expanded env
     // overlay, then the MCP env, then the Lead's private harness home.
     let eff = thegn_core::agent_task::effective_agent(cfg, &lead.agent, None)
         .map_err(|e| anyhow::anyhow!("[lead] agent: {e}"))?;
-    let command = eff
-        .interactive_command()
-        .map_err(|e| anyhow::anyhow!("[lead] agent: {e}"))?;
+    let (command, prompt_file) = match &mode {
+        LeadMode::Interactive { .. } => (
+            eff.interactive_command()
+                .map_err(|e| anyhow::anyhow!("[lead] agent: {e}"))?,
+            None,
+        ),
+        LeadMode::Headless { prompt } => {
+            let template = eff
+                .headless_template()
+                .map_err(|e| anyhow::anyhow!("[lead] agent: {e}"))?;
+            render_headless(&template, prompt, &notes)?
+        }
+    };
+    // Mint last among the fallible steps that need no mount plan, so a
+    // refused render never leaves a live token behind.
+    let mcp = (host.mcp)(cfg, &notes, &caller)?;
     let mut env: Vec<(String, String)> = eff.expanded_env();
     env.extend(mcp.env.iter().cloned());
     env.push(("THEGN_CALLER".to_string(), caller));
@@ -155,19 +211,23 @@ fn launch_spec_with(
     // (a hook or MCP entry written there would run unsandboxed in the next
     // worker session). Pushed after the agent env so it overrides any
     // agent-env `CLAUDE_CONFIG_DIR`.
+    // A harness with no credential home spec (pi) still relocates its state
+    // through `lead_sandbox::private_home_env`; aider writes into its cwd,
+    // the notes dir.
     let mut writable = vec![notes.clone()];
     if let Some(h) = thegn_core::harness::harness(&eff.harness)
-        && let Some(spec) = h.home().filter(|s| !s.home_env.is_empty())
+        && let Some(home_env) = h
+            .home()
+            .map(|s| s.home_env)
+            .filter(|e| !e.is_empty())
+            .or_else(|| lead_sandbox::private_home_env(h.id()))
     {
         let rel = Path::new("thegn/lead-harness").join(h.id());
         let dir = thegn_core::fsperm::ensure_private_dir_beneath(&host.state_home, &rel)
             .context("creating the Lead's private harness home")?;
         let dir = std::fs::canonicalize(dir.path())
             .context("resolving the Lead's private harness home")?;
-        env.push((
-            spec.home_env.to_string(),
-            dir.to_string_lossy().into_owned(),
-        ));
+        env.push((home_env.to_string(), dir.to_string_lossy().into_owned()));
         writable.push(dir);
     }
     writable.dedup();
@@ -220,23 +280,112 @@ fn launch_spec_with(
         masked_files,
         readable,
         chdir: notes.clone(),
-        die_with_parent: !host.daemon_owned,
+        // A headless turn is a plain child of the blocking thread that waits
+        // on it for the whole run: it always dies with its parent.
+        die_with_parent: matches!(mode, LeadMode::Headless { .. }) || !host.daemon_owned,
     };
     lead_sandbox::validate(&plan, &guarded)
         .map_err(|why| anyhow::anyhow!("the Lead sandbox was refused: {why}"))?;
 
-    let argv = thegn_core::sandbox_cpucap::wrap_uncontained_pane_argv(lead_sandbox::bwrap_argv(
-        &plan, &inner,
-    ));
-    Ok(crate::agent::LaunchSpec {
-        argv,
-        cwd: Some(notes),
-        env,
-        backend: "bwrap".to_string(),
-        warnings: Vec::new(),
-        degraded: false,
-        remote: false,
+    let sandboxed = lead_sandbox::bwrap_argv(&plan, &inner);
+    let argv = match mode {
+        LeadMode::Interactive { .. } => {
+            thegn_core::sandbox_cpucap::wrap_uncontained_pane_argv(sandboxed)
+        }
+        LeadMode::Headless { .. } => thegn_core::sandbox_cpucap::wrap_background_argv_tagged(
+            sandboxed,
+            &thegn_core::sandbox_cpucap::ScopeTag {
+                kind: thegn_core::sandbox_cpucap::ScopeKind::Agent,
+                worktree: notes.to_string_lossy().into_owned(),
+            },
+        ),
+    };
+    Ok(LeadLaunch {
+        spec: crate::agent::LaunchSpec {
+            argv,
+            cwd: Some(notes),
+            env,
+            backend: "bwrap".to_string(),
+            warnings: Vec::new(),
+            degraded: false,
+            remote: false,
+        },
+        prompt_file,
     })
+}
+
+/// The notes-dir subdirectory holding headless prompt files.
+const WAKE_PROMPT_DIR: &str = ".wake";
+
+/// Render a headless template with `prompt` exactly as `agent_run` does:
+/// `{prompt}` is shell-quoted by `substitute_command`; a `{prompt_file}`
+/// template gets an owner-only file under the notes dir (inside the sandbox
+/// at the same path) instead. Bounded like a queued agent's command.
+fn render_headless(
+    template: &str,
+    prompt: &str,
+    notes: &Path,
+) -> anyhow::Result<(String, Option<WakePromptFile>)> {
+    crate::agent_run::check_agent_payload(prompt).map_err(anyhow::Error::msg)?;
+    let (vars, file) = if crate::agent_run::uses_prompt_file(template) {
+        let dir = thegn_core::fsperm::ensure_private_dir_beneath(notes, Path::new(WAKE_PROMPT_DIR))
+            .context("creating the Lead's prompt-file dir")?;
+        let file = WakePromptFile::write(dir, prompt)?;
+        let path = file
+            .path
+            .to_str()
+            .context("{prompt_file}: the prompt file path is not valid UTF-8")?
+            .to_string();
+        (
+            thegn_core::agent_task::TaskVars::new().set("prompt_file", path),
+            Some(file),
+        )
+    } else {
+        (thegn_core::agent_task::TaskVars::new(), None)
+    };
+    let command = thegn_core::agent_task::substitute_command(template, prompt, &vars)
+        .map_err(|e| anyhow::anyhow!("[lead] agent: headless template: {e}"))?;
+    if command.len() > crate::agent_run::MAX_RENDERED_COMMAND_BYTES {
+        bail!("[lead] agent: the headless Lead command exceeds the safe argument limit");
+    }
+    Ok((command, file))
+}
+
+/// An owner-only prompt file under the notes dir, removed on drop.
+struct WakePromptFile {
+    dir: thegn_core::fsperm::PrivateDir,
+    name: String,
+    path: PathBuf,
+}
+
+impl WakePromptFile {
+    fn write(dir: thegn_core::fsperm::PrivateDir, prompt: &str) -> anyhow::Result<Self> {
+        use std::io::Write as _;
+        static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or_default();
+        let seq = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let name = format!("prompt-{}-{nanos}-{seq}", std::process::id());
+        let mut file = dir
+            .create_owner_only_exclusive(&name)
+            .context("creating the Lead's prompt file")?;
+        let path = dir.path().join(&name);
+        let guard = Self { dir, name, path };
+        file.write_all(prompt.as_bytes())
+            .and_then(|()| file.flush())
+            .context("writing the Lead's prompt file")?;
+        Ok(guard)
+    }
+}
+
+impl Drop for WakePromptFile {
+    fn drop(&mut self) {
+        if let Err(error) = self.dir.remove_file(&self.name) {
+            tracing::debug!(%error, "unable to remove the Lead's prompt file");
+        }
+    }
 }
 
 /// A control dir to mask. Under `/tmp` it is already covered by the private
@@ -415,13 +564,32 @@ mod tests {
         repos: Vec<PathBuf>,
         control: Vec<PathBuf>,
     ) -> anyhow::Result<crate::agent::LaunchSpec> {
+        run_mode(
+            fx,
+            LeadMode::Interactive {
+                group: "lead",
+                tab: 0,
+            },
+            bwrap,
+            repos,
+            control,
+        )
+        .map(|launch| launch.spec)
+    }
+
+    fn run_mode(
+        fx: &Fixture,
+        mode: LeadMode<'_>,
+        bwrap: bool,
+        repos: Vec<PathBuf>,
+        control: Vec<PathBuf>,
+    ) -> anyhow::Result<LeadLaunch> {
         let available = move || bwrap;
         let roots = move || -> anyhow::Result<Vec<PathBuf>> { Ok(repos.clone()) };
         let dirs = move |_: &Config| control.clone();
         launch_spec_with(
             &fx.cfg,
-            "lead",
-            0,
+            mode,
             &LeadHost {
                 bwrap_available: &available,
                 repo_roots: &roots,
@@ -431,6 +599,151 @@ mod tests {
                 state_home: fx.root.join("state"),
             },
         )
+    }
+
+    fn headless(fx: &Fixture, prompt: &str, bwrap: bool) -> anyhow::Result<LeadLaunch> {
+        run_mode(fx, LeadMode::Headless { prompt }, bwrap, vec![], vec![])
+    }
+
+    fn set_agent(fx: &mut Fixture, toml_entry: &str) {
+        fx.cfg.agents = vec![toml::from_str(toml_entry).unwrap()];
+    }
+
+    /// The shell command bwrap runs (the last argv element).
+    fn inner_command(spec: &crate::agent::LaunchSpec) -> String {
+        spec.argv.last().cloned().unwrap_or_default()
+    }
+
+    #[test]
+    fn headless_spec_without_bwrap_bails_and_creates_nothing() {
+        let fx = fixture();
+        let err = headless(&fx, "hi", false).err().expect("refused");
+        assert_eq!(err.to_string(), NO_BWRAP);
+        assert!(!fx.root.join("notes").exists());
+    }
+
+    #[test]
+    fn headless_spec_without_lead_config_bails() {
+        let mut fx = fixture();
+        fx.cfg.lead = None;
+        let err = headless(&fx, "hi", true).err().expect("refused");
+        assert!(err.to_string().contains("[lead]"), "{err}");
+    }
+
+    #[test]
+    fn headless_spec_wraps_the_same_bwrap_plan_as_a_tab() {
+        let fx = fixture();
+        let sock_dir = fx.root.join("run-sock");
+        std::fs::create_dir_all(&sock_dir).unwrap();
+        let tab = run(&fx, true, vec![], vec![sock_dir.clone()]).unwrap();
+        let wake = run_mode(
+            &fx,
+            LeadMode::Headless { prompt: "go" },
+            true,
+            vec![],
+            vec![sock_dir.clone()],
+        )
+        .unwrap()
+        .spec;
+        let notes_s = fx.root.join("notes").display().to_string();
+        let sock_s = sock_dir.display().to_string();
+        assert_eq!(wake.backend, "bwrap");
+        assert!(has(&wake.argv, &["--ro-bind", "/", "/"]), "{:?}", wake.argv);
+        assert!(has(&wake.argv, &["--bind", &notes_s, &notes_s]));
+        assert!(has(&wake.argv, &["--tmpfs", &sock_s]));
+        assert!(has(&wake.argv, &["--chdir", &notes_s]));
+        assert!(
+            wake.argv.iter().any(|a| a == "--die-with-parent"),
+            "a headless turn dies with its waiting thread"
+        );
+        // Every mount, mask and unset of the tab is present in the wake argv.
+        let mounts = |argv: &[String]| -> Vec<String> {
+            let b = argv.iter().position(|a| a == "bwrap").unwrap();
+            let sep = argv.iter().position(|a| a == "--").unwrap();
+            argv[b + 1..sep]
+                .iter()
+                .filter(|a| *a != "--die-with-parent")
+                .cloned()
+                .collect()
+        };
+        assert_eq!(mounts(&tab.argv), mounts(&wake.argv));
+        assert!(
+            wake.env
+                .iter()
+                .any(|(k, v)| k == "THEGN_CALLER" && v == HEADLESS_CALLER)
+        );
+    }
+
+    #[test]
+    fn headless_spec_never_puts_the_prompt_in_argv_unquoted() {
+        let fx = fixture();
+        for prompt in [
+            "hi $(touch pwned) `id` ; rm -rf ~",
+            "it's '; touch pwned; echo '",
+            "line1\nline2 && reboot",
+        ] {
+            let launch = headless(&fx, prompt, true).unwrap();
+            let cmd = inner_command(&launch.spec);
+            let quoted = thegn_core::util::sh_quote(prompt);
+            assert!(cmd.contains(&quoted), "{cmd}");
+            // The only occurrence of the raw text is inside its quoting.
+            let without = cmd.replacen(&quoted, "", 1);
+            assert!(!without.contains("touch pwned"), "{cmd}");
+            assert!(!without.contains("reboot"), "{cmd}");
+            assert!(
+                launch
+                    .spec
+                    .argv
+                    .iter()
+                    .all(|a| !a.contains("pwned") || *a == cmd),
+                "the prompt reaches only the single inner shell command"
+            );
+        }
+    }
+
+    #[test]
+    fn headless_spec_carries_a_prompt_file_under_the_notes_dir() {
+        let mut fx = fixture();
+        set_agent(
+            &mut fx,
+            "name = \"lead-agent\"\ncommand = \"true {prompt_file}\"",
+        );
+        let launch = headless(&fx, "secret prompt", true).unwrap();
+        let file = launch.prompt_file().expect("prompt file").to_path_buf();
+        assert!(
+            file.starts_with(fx.root.join("notes")),
+            "{}",
+            file.display()
+        );
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), "secret prompt");
+        let cmd = inner_command(&launch.spec);
+        assert!(!cmd.contains("secret prompt"), "{cmd}");
+        assert!(cmd.contains(&thegn_core::util::sh_quote(&file.to_string_lossy())));
+        drop(launch);
+        assert!(!file.exists(), "the prompt file is removed with the launch");
+    }
+
+    #[test]
+    fn headless_spec_gives_pi_a_private_writable_home() {
+        let mut fx = fixture();
+        set_agent(&mut fx, "name = \"lead-agent\"\ncommand = \"pi\"");
+        let launch = headless(&fx, "hi", true).unwrap();
+        let home = fx.root.join("state/thegn/lead-harness/pi");
+        let home_s = home.display().to_string();
+        assert!(home.is_dir());
+        assert!(
+            launch
+                .spec
+                .env
+                .iter()
+                .any(|(k, v)| k == "PI_CODING_AGENT_DIR" && *v == home_s),
+            "{:?}",
+            launch.spec.env
+        );
+        assert!(has(&launch.spec.argv, &["--bind", &home_s, &home_s]));
+        // The interactive tab gets the same private home.
+        let tab = run(&fx, true, vec![], vec![]).unwrap();
+        assert!(has(&tab.argv, &["--bind", &home_s, &home_s]));
     }
 
     fn has(argv: &[String], needle: &[&str]) -> bool {
