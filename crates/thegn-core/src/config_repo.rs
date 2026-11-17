@@ -254,7 +254,7 @@ pub fn parse_overlay_value(body: &str, format: OverlayFormat) -> Result<serde_js
             serde_json::to_value(value).map_err(|e| e.to_string())
         }
         OverlayFormat::Yaml => {
-            serde_yaml::from_str::<serde_json::Value>(body).map_err(|e| e.to_string())
+            serde_saphyr::from_str::<serde_json::Value>(body).map_err(|e| e.to_string())
         }
         OverlayFormat::Json => serde_json::from_str(body).map_err(|e| e.to_string()),
     }
@@ -266,7 +266,7 @@ pub(crate) fn parse_repo_config(
 ) -> Result<RepoConfigFile, String> {
     match format {
         OverlayFormat::Toml => toml::from_str(body).map_err(|e| e.to_string()),
-        OverlayFormat::Yaml => serde_yaml::from_str(body).map_err(|e| e.to_string()),
+        OverlayFormat::Yaml => serde_saphyr::from_str(body).map_err(|e| e.to_string()),
         OverlayFormat::Json => serde_json::from_str(body).map_err(|e| e.to_string()),
     }
 }
@@ -437,6 +437,28 @@ mod tests {
                 "{format}: {body:?}"
             );
         }
+    }
+
+    #[test]
+    fn yaml_overlay_value_matches_its_toml_twin() {
+        let toml = "[sandbox]\nenabled = true\nlabel = \"dev\"\nports = [8080, 9090]\n\n[sandbox.nested]\ndepth = 2\n";
+        let yaml = "sandbox:\n  enabled: true\n  label: dev\n  ports: [8080, 9090]\n  nested:\n    depth: 2\n";
+        let from_toml = parse_overlay_value(toml, OverlayFormat::Toml).unwrap();
+        let from_yaml = parse_overlay_value(yaml, OverlayFormat::Yaml).unwrap();
+        assert_eq!(from_yaml, from_toml);
+        for (format, body) in VALID {
+            assert!(
+                parse_repo_config(body, *format).is_ok(),
+                "{format}: {body:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn yaml_overlay_duplicate_key_is_a_syntax_error() {
+        let body = "sandbox:\n  enabled: true\n  enabled: false\n";
+        assert!(parse_overlay_value(body, OverlayFormat::Yaml).is_err());
+        assert!(parse_repo_config(body, OverlayFormat::Yaml).is_err());
     }
 
     #[test]

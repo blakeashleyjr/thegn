@@ -985,20 +985,19 @@ pub fn compose_file_references(
     base_dir: &Path,
     yaml: &str,
 ) -> Result<Vec<ComposeReference>, String> {
-    let mut document = serde_yaml::from_str::<serde_yaml::Value>(yaml)
-        .map_err(|_| "is not a valid Compose file".to_string())?;
-    document
-        .apply_merge()
+    // serde-saphyr resolves anchors, aliases and `<<:` merge keys while parsing
+    // (with its default alias/size budgets on), so no separate merge pass.
+    let document = serde_saphyr::from_str::<serde_json::Value>(yaml)
         .map_err(|_| "is not a valid Compose file".to_string())?;
     let root = document
-        .as_mapping()
+        .as_object()
         .ok_or_else(|| "is not a valid Compose file".to_string())?;
     let mut references = Vec::new();
     if let Some(services) = mapping_value(root, "services")
-        && let Some(services) = services.as_mapping()
+        && let Some(services) = services.as_object()
     {
         for (_, service) in services {
-            let Some(service) = service.as_mapping() else {
+            let Some(service) = service.as_object() else {
                 continue;
             };
             if let Some(env_file) = mapping_value(service, "env_file") {
@@ -1008,7 +1007,7 @@ pub fn compose_file_references(
                 collect_build_files(config_dir, base_dir, build, &mut references)?;
             }
             if let Some(extends) = mapping_value(service, "extends")
-                && let Some(extends) = extends.as_mapping()
+                && let Some(extends) = extends.as_object()
                 && let Some(file) = mapping_value(extends, "file")
             {
                 let reference = file.as_str().ok_or_else(|| {
@@ -1037,25 +1036,28 @@ pub fn compose_file_references(
     Ok(references)
 }
 
-fn mapping_value<'a>(mapping: &'a serde_yaml::Mapping, key: &str) -> Option<&'a serde_yaml::Value> {
-    mapping.get(serde_yaml::Value::String(key.to_string()))
+fn mapping_value<'a>(
+    mapping: &'a serde_json::Map<String, serde_json::Value>,
+    key: &str,
+) -> Option<&'a serde_json::Value> {
+    mapping.get(key)
 }
 
 fn collect_env_files(
     config_dir: &Path,
     base_dir: &Path,
-    value: &serde_yaml::Value,
+    value: &serde_json::Value,
     references: &mut Vec<ComposeReference>,
 ) -> Result<(), String> {
     match value {
-        serde_yaml::Value::String(path) => references.push(resolve_compose_reference(
+        serde_json::Value::String(path) => references.push(resolve_compose_reference(
             config_dir,
             base_dir,
             path,
             ComposeReferenceKind::EnvFile,
             true,
         )?),
-        serde_yaml::Value::Sequence(paths) => {
+        serde_json::Value::Array(paths) => {
             for item in paths {
                 if let Some(path) = item.as_str() {
                     references.push(resolve_compose_reference(
@@ -1065,14 +1067,14 @@ fn collect_env_files(
                         ComposeReferenceKind::EnvFile,
                         true,
                     )?);
-                } else if let Some(item) = item.as_mapping() {
+                } else if let Some(item) = item.as_object() {
                     let path = mapping_value(item, "path")
-                        .and_then(serde_yaml::Value::as_str)
+                        .and_then(serde_json::Value::as_str)
                         .ok_or_else(|| {
                             "Compose reference `env_file.path` is not a string".to_string()
                         })?;
                     let required = mapping_value(item, "required")
-                        .and_then(serde_yaml::Value::as_bool)
+                        .and_then(serde_json::Value::as_bool)
                         .unwrap_or(true);
                     references.push(resolve_compose_reference(
                         config_dir,
@@ -1094,12 +1096,12 @@ fn collect_env_files(
 fn collect_build_files(
     config_dir: &Path,
     base_dir: &Path,
-    value: &serde_yaml::Value,
+    value: &serde_json::Value,
     references: &mut Vec<ComposeReference>,
 ) -> Result<(), String> {
     let (context, dockerfile, inline) = if let Some(context) = value.as_str() {
         (context, None, false)
-    } else if let Some(build) = value.as_mapping() {
+    } else if let Some(build) = value.as_object() {
         let context = match mapping_value(build, "context") {
             Some(context) => context
                 .as_str()
@@ -1143,18 +1145,18 @@ fn collect_build_files(
 fn collect_include(
     config_dir: &Path,
     base_dir: &Path,
-    value: &serde_yaml::Value,
+    value: &serde_json::Value,
     references: &mut Vec<ComposeReference>,
 ) -> Result<(), String> {
     match value {
-        serde_yaml::Value::String(path) => references.push(resolve_compose_reference(
+        serde_json::Value::String(path) => references.push(resolve_compose_reference(
             config_dir,
             base_dir,
             path,
             ComposeReferenceKind::Include,
             true,
         )?),
-        serde_yaml::Value::Sequence(items) => {
+        serde_json::Value::Array(items) => {
             for item in items {
                 if let Some(path) = item.as_str() {
                     references.push(resolve_compose_reference(
@@ -1164,12 +1166,12 @@ fn collect_include(
                         ComposeReferenceKind::Include,
                         true,
                     )?);
-                } else if let Some(item) = item.as_mapping() {
+                } else if let Some(item) = item.as_object() {
                     let paths = mapping_value(item, "path")
                         .ok_or_else(|| "Compose reference `include.path` is missing".to_string())?;
                     let paths = if let Some(path) = paths.as_str() {
                         vec![path]
-                    } else if let Some(paths) = paths.as_sequence() {
+                    } else if let Some(paths) = paths.as_array() {
                         paths
                             .iter()
                             .map(|path| {
@@ -2113,6 +2115,96 @@ include: ["inc.yml"]
                 },
             ]
         );
+    }
+
+    #[test]
+    fn compose_file_references_applies_merge_key_lists_and_local_overrides() {
+        let dir = tempfile::tempdir().unwrap();
+        let config_dir = dir.path().canonicalize().unwrap().join(".devcontainer");
+        std::fs::create_dir_all(&config_dir).unwrap();
+        let refs = compose_file_references(
+            &config_dir,
+            &config_dir,
+            r#"
+x-env: &env
+  env_file: base.env
+x-build: &build
+  build: {context: ".", dockerfile_inline: "FROM scratch"}
+services:
+  app:
+    <<: [*env, *build]
+  other:
+    <<: *env
+    env_file: local.env
+"#,
+        )
+        .unwrap();
+        assert_eq!(
+            refs,
+            vec![
+                ComposeReference {
+                    kind: ComposeReferenceKind::EnvFile,
+                    path: config_dir.join("base.env"),
+                    required: true,
+                },
+                ComposeReference {
+                    kind: ComposeReferenceKind::EnvFile,
+                    path: config_dir.join("local.env"),
+                    required: true,
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn compose_file_references_rejects_duplicate_keys() {
+        let dir = tempfile::tempdir().unwrap();
+        let config_dir = dir.path().canonicalize().unwrap().join(".devcontainer");
+        std::fs::create_dir_all(&config_dir).unwrap();
+        let error = compose_file_references(
+            &config_dir,
+            &config_dir,
+            "services:\n  app:\n    env_file: a.env\n    env_file: b.env\n",
+        )
+        .unwrap_err();
+        assert_eq!(error, "is not a valid Compose file");
+    }
+
+    #[test]
+    fn compose_file_references_numeric_mapping_keys_do_not_panic() {
+        let dir = tempfile::tempdir().unwrap();
+        let config_dir = dir.path().canonicalize().unwrap().join(".devcontainer");
+        std::fs::create_dir_all(&config_dir).unwrap();
+        // A numeric key either parses as the string "8080" or fails as an
+        // invalid Compose file; it must never panic.
+        match compose_file_references(
+            &config_dir,
+            &config_dir,
+            "x-ports:\n  8080: web\nservices:\n  app:\n    env_file: a.env\n",
+        ) {
+            Ok(refs) => assert_eq!(
+                refs,
+                vec![ComposeReference {
+                    kind: ComposeReferenceKind::EnvFile,
+                    path: config_dir.join("a.env"),
+                    required: true,
+                }]
+            ),
+            Err(error) => assert_eq!(error, "is not a valid Compose file"),
+        }
+        // The YAML layer itself: a numeric key becomes a string key or a clean error.
+        match serde_saphyr::from_str::<serde_json::Value>("8080: x\n") {
+            Ok(value) => assert_eq!(value.get("8080").and_then(|v| v.as_str()), Some("x")),
+            Err(error) => assert!(!error.to_string().is_empty()),
+        }
+        // Hostile input: a non-mapping root, an unterminated flow, a dangling alias.
+        for yaml in ["- a\n", "services: [\n", "services: *nope\n"] {
+            assert_eq!(
+                compose_file_references(&config_dir, &config_dir, yaml).unwrap_err(),
+                "is not a valid Compose file",
+                "{yaml:?}"
+            );
+        }
     }
 
     #[test]
