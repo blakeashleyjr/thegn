@@ -2571,6 +2571,61 @@
       "path": "/v1/tools/run"
     },
     {
+      "cap": "overview.get",
+      "method": "POST",
+      "path": "/v1/overview"
+    },
+    {
+      "cap": "notifications.list",
+      "method": "POST",
+      "path": "/v1/notifications/list"
+    },
+    {
+      "cap": "notifications.ack",
+      "method": "POST",
+      "path": "/v1/notifications/ack"
+    },
+    {
+      "cap": "automations.put",
+      "method": "POST",
+      "path": "/v1/automations/put"
+    },
+    {
+      "cap": "automations.rm",
+      "method": "POST",
+      "path": "/v1/automations/rm"
+    },
+    {
+      "cap": "automations.enable",
+      "method": "POST",
+      "path": "/v1/automations/enable"
+    },
+    {
+      "cap": "automations.runs",
+      "method": "POST",
+      "path": "/v1/automations/runs"
+    },
+    {
+      "cap": "approvals.list",
+      "method": "POST",
+      "path": "/v1/approvals/list"
+    },
+    {
+      "cap": "approvals.request",
+      "method": "POST",
+      "path": "/v1/approvals/request"
+    },
+    {
+      "cap": "approvals.resolve",
+      "method": "POST",
+      "path": "/v1/approvals/resolve"
+    },
+    {
+      "cap": "merge.drain",
+      "method": "POST",
+      "path": "/v1/merge/drain"
+    },
+    {
       "cap": "mcp_proxy.status",
       "method": "GET",
       "path": "/v1/mcp_proxy/status"
