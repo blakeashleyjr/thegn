@@ -7,8 +7,10 @@
 //! provisioner takes. The cycle (row states in `worktree_hibernations`):
 //!
 //! 1. `capturing` — intent row written, then the sandbox runs
-//!    `syncstate::capture_script` (bundle of unpushed commits + uncommitted
-//!    patch + untracked tar, with a size/sha trailer). The host downloads each
+//!    `syncstate::capture_script_staged` (bundle of unpushed commits +
+//!    uncommitted patch + untracked tar, with a size/sha trailer) into a
+//!    private, exclusive, random staging dir that is removed on every path —
+//!    no artifact ever touches a predictable `/tmp` path. The host downloads each
 //!    artifact, re-hashes it, sanity-checks the bundle, and writes everything
 //!    into the `[lifecycle.snapshot]` store — manifest last.
 //! 2. `destroying` — snapshot verified; the instance may now die. On destroy
@@ -50,8 +52,6 @@ const CAPTURE_TIMEOUT: Duration = Duration::from_secs(600);
 const READ_TIMEOUT: Duration = Duration::from_secs(300);
 /// After a failed cycle, leave the worktree alone this long before retrying.
 const FAILURE_BACKOFF: Duration = Duration::from_secs(30 * 60);
-/// Sandbox-side file stem for the capture artifacts (`/tmp/tg-hib.*`).
-const STEM: &str = "tg-hib";
 /// Age before a crashed-`capturing` row is discarded / a `destroying` row is
 /// re-driven by the healing sweep.
 const HEAL_AFTER_SECS: u64 = 10 * 60;
@@ -692,7 +692,7 @@ fn restore_into_sandbox(
     let cleanup = exec_capture(
         provider,
         id,
-        &format!("rm -rf -- {}", thegn_core::util::sh_quote(&dir)),
+        &staging_cleanup_script(&dir),
         Duration::from_secs(30),
     )
     .map(|_| ());
@@ -814,10 +814,49 @@ fn exec_capture(
     Ok(out)
 }
 
+/// The sandbox command that removes a per-operation staging dir (capture and
+/// restore alike). `--` plus sh-quoting keep a hostile dir name inert.
+fn staging_cleanup_script(dir: &str) -> String {
+    format!("rm -rf -- {}", thegn_core::util::sh_quote(dir))
+}
+
+/// Combine a capture outcome with its staging-dir cleanup. A cleanup failure
+/// after a successful publish is only logged (the snapshot is durable and the
+/// sandbox is about to be destroyed); after a failed capture it is chained
+/// into the error so the kept VM's leftover dir is visible.
+fn finish_capture<T>(
+    capture: anyhow::Result<T>,
+    cleanup: anyhow::Result<()>,
+    dir: &str,
+) -> anyhow::Result<T> {
+    match (capture, cleanup) {
+        (Ok(value), Ok(())) => Ok(value),
+        (Ok(value), Err(error)) => {
+            // best-effort: the snapshot is published and verified; a leftover
+            // private staging dir dies with the sandbox.
+            tracing::debug!(
+                target: "thegn::hibernate",
+                error = %format!("{error:#}"),
+                dir,
+                "could not clean capture staging directory"
+            );
+            Ok(value)
+        }
+        (Err(error), Ok(())) => Err(error),
+        (Err(error), Err(cleanup)) => Err(error.context(format!(
+            "could not clean capture staging directory {dir}: {cleanup:#}"
+        ))),
+    }
+}
+
 /// Capture the worktree's state from the sandbox into the snapshot store.
 /// Verifies sizes + sha256 across the transport hop and sanity-checks the git
 /// bundle before anything is trusted; the manifest is written last. Returns
 /// the published manifest.
+///
+/// Artifacts are staged in a fresh random dir created private and exclusive
+/// (`umask 077; mkdir`); a mkdir failure aborts before any capture runs, and
+/// the dir is removed afterwards on every path.
 fn capture_to_store(
     provider: &thegn_svc::provider::Provider,
     id: &str,
@@ -826,110 +865,123 @@ fn capture_to_store(
     store: &dyn SnapshotStore,
     snap_cfg: &SnapshotStoreConfig,
 ) -> anyhow::Result<SnapshotManifest> {
-    let out = exec_capture(
+    let dir = crate::parity::random_staging_dir()?;
+    exec_capture(
         provider,
         id,
-        &syncstate::capture_script(workdir, STEM),
-        CAPTURE_TIMEOUT,
-    )?;
-    let report = syncstate::parse_capture_output(&out)
-        .map_err(|e| anyhow::anyhow!("capture report: {e}"))?;
+        &syncstate::stage_dir_script(&dir),
+        Duration::from_secs(30),
+    )
+    .context("could not create a private capture staging directory")?;
 
-    // Enforce the artifact ceiling BEFORE downloading anything.
-    if let Some(max) = snap_cfg.max_artifact_bytes()
-        && let Some(a) = report.artifacts.iter().find(|a| a.bytes > max)
-    {
-        anyhow::bail!(
-            "artifact {} is {} MiB (max_artifact_mb = {}); not hibernating",
-            a.name,
-            a.bytes / (1024 * 1024),
-            snap_cfg.max_artifact_mb
-        );
-    }
+    let capture = (|| -> anyhow::Result<SnapshotManifest> {
+        let out = exec_capture(
+            provider,
+            id,
+            &syncstate::capture_script_staged(workdir, &dir),
+            CAPTURE_TIMEOUT,
+        )?;
+        let report = syncstate::parse_capture_output(&out)
+            .map_err(|e| anyhow::anyhow!("capture report: {e}"))?;
 
-    let created_at = thegn_core::util::now();
-    let head = report.head.as_deref();
-    // Artifacts land under one random generation before its manifest publishes.
-    let mut generation = [0_u8; 8];
-    getrandom::fill(&mut generation)
-        .map_err(|error| anyhow::anyhow!("generate snapshot generation: {error}"))?;
-    let generation = generation_hex(generation);
-    let id_probe = SnapshotManifest::new(head, &report.branch, created_at, Vec::new())
-        .with_generation(&generation);
-
-    let mut metas: Vec<ArtifactMeta> = Vec::new();
-    for a in &report.artifacts {
-        let path = syncstate::artifact_path(STEM, &a.name);
-        let data = block_on_provider(|| async {
-            tokio::time::timeout(READ_TIMEOUT, provider.read(id, &path))
-                .await
-                .unwrap_or_else(|_| Err(anyhow::anyhow!("download of {path} timed out")))
-        })?;
-        if data.len() as u64 != a.bytes {
+        // Enforce the artifact ceiling BEFORE downloading anything.
+        if let Some(max) = snap_cfg.max_artifact_bytes()
+            && let Some(a) = report.artifacts.iter().find(|a| a.bytes > max)
+        {
             anyhow::bail!(
-                "artifact {}: downloaded {} bytes, sandbox reported {}",
+                "artifact {} is {} MiB (max_artifact_mb = {}); not hibernating",
                 a.name,
-                data.len(),
-                a.bytes
+                a.bytes / (1024 * 1024),
+                snap_cfg.max_artifact_mb
             );
         }
-        let sha = hex_sha256(&data);
-        if !sha.eq_ignore_ascii_case(&a.sha256) {
-            anyhow::bail!("artifact {}: checksum mismatch across transport", a.name);
-        }
-        if a.name == "bundle" {
-            verify_bundle_shape(&data)?;
-        }
-        store.put(key, &id_probe.id, &a.name, &data)?;
-        metas.push(ArtifactMeta {
-            name: a.name.clone(),
-            bytes: a.bytes,
-            sha256: sha,
-        });
-    }
 
-    let manifest =
-        SnapshotManifest::new(head, &report.branch, created_at, metas).with_generation(&generation);
-    store.put_manifest(key, &manifest)?;
+        let created_at = thegn_core::util::now();
+        let head = report.head.as_deref();
+        // Artifacts land under one random generation before its manifest publishes.
+        let mut generation = [0_u8; 8];
+        getrandom::fill(&mut generation)
+            .map_err(|error| anyhow::anyhow!("generate snapshot generation: {error}"))?;
+        let generation = generation_hex(generation);
+        let id_probe = SnapshotManifest::new(head, &report.branch, created_at, Vec::new())
+            .with_generation(&generation);
 
-    if let Err(error) = verify_published(store, key, &manifest) {
-        if let Err(cleanup) = store.delete(key, &manifest.id) {
-            tracing::debug!(
-                target: "thegn::hibernate",
-                %cleanup,
-                id = %manifest.id,
-                "could not delete an unverified snapshot generation"
-            );
+        let mut metas: Vec<ArtifactMeta> = Vec::new();
+        for a in &report.artifacts {
+            let path = syncstate::staged_artifact_path(&dir, &a.name);
+            let data = block_on_provider(|| async {
+                tokio::time::timeout(READ_TIMEOUT, provider.read(id, &path))
+                    .await
+                    .unwrap_or_else(|_| Err(anyhow::anyhow!("download of {path} timed out")))
+            })?;
+            if data.len() as u64 != a.bytes {
+                anyhow::bail!(
+                    "artifact {}: downloaded {} bytes, sandbox reported {}",
+                    a.name,
+                    data.len(),
+                    a.bytes
+                );
+            }
+            let sha = hex_sha256(&data);
+            if !sha.eq_ignore_ascii_case(&a.sha256) {
+                anyhow::bail!("artifact {}: checksum mismatch across transport", a.name);
+            }
+            if a.name == "bundle" {
+                verify_bundle_shape(&data)?;
+            }
+            store.put(key, &id_probe.id, &a.name, &data)?;
+            metas.push(ArtifactMeta {
+                name: a.name.clone(),
+                bytes: a.bytes,
+                sha256: sha,
+            });
         }
-        return Err(error);
-    }
 
-    // Retention: prune older snapshots only after this one reads back intact.
-    match store.list(key) {
-        Ok(all) => {
-            for stale in retention_prune_keeping(&all, snap_cfg.keep_clamped(), &manifest.id) {
-                if stale == manifest.id {
-                    continue;
+        let manifest = SnapshotManifest::new(head, &report.branch, created_at, metas)
+            .with_generation(&generation);
+        store.put_manifest(key, &manifest)?;
+
+        if let Err(error) = verify_published(store, key, &manifest) {
+            if let Err(cleanup) = store.delete(key, &manifest.id) {
+                tracing::debug!(
+                    target: "thegn::hibernate",
+                    %cleanup,
+                    id = %manifest.id,
+                    "could not delete an unverified snapshot generation"
+                );
+            }
+            return Err(error);
+        }
+
+        // Retention: prune older snapshots only after this one reads back intact.
+        match store.list(key) {
+            Ok(all) => {
+                for stale in retention_prune_keeping(&all, snap_cfg.keep_clamped(), &manifest.id) {
+                    if stale == manifest.id {
+                        continue;
+                    }
+                    let _ = store.delete(key, &stale); // best-effort: GC only
                 }
-                let _ = store.delete(key, &stale); // best-effort: GC only
+            }
+            Err(error) => {
+                tracing::warn!(
+                    target: "thegn::hibernate",
+                    error = %format!("{error:#}"),
+                    "snapshot retention pruning skipped because the manifest list could not be read"
+                );
             }
         }
-        Err(error) => {
-            tracing::warn!(
-                target: "thegn::hibernate",
-                error = %format!("{error:#}"),
-                "snapshot retention pruning skipped because the manifest list could not be read"
-            );
-        }
-    }
-    // best-effort: the sandbox is about to be destroyed anyway.
-    let _ = exec_capture(
+        Ok(manifest)
+    })();
+
+    let cleanup = exec_capture(
         provider,
         id,
-        &format!("rm -f /tmp/{STEM}.bundle /tmp/{STEM}.patch /tmp/{STEM}.tar 2>/dev/null; true"),
+        &staging_cleanup_script(&dir),
         Duration::from_secs(30),
-    );
-    Ok(manifest)
+    )
+    .map(|_| ());
+    finish_capture(capture, cleanup, &dir)
 }
 
 fn hex_sha256(data: &[u8]) -> String {
@@ -1523,6 +1575,62 @@ mod tests {
         assert_ne!(first, second);
         assert!(first.starts_with("/tmp/tg-parity-"));
         assert!(second.starts_with("/tmp/tg-parity-"));
+    }
+
+    #[test]
+    fn capture_operations_use_distinct_private_staging_dirs() {
+        let first = crate::parity::random_staging_dir().unwrap();
+        let second = crate::parity::random_staging_dir().unwrap();
+        assert_ne!(first, second);
+        for dir in [&first, &second] {
+            assert!(dir.starts_with("/tmp/tg-parity-"));
+            assert_eq!(dir.len(), "/tmp/tg-parity-".len() + 32);
+            // The capture script stages only under the private dir and never
+            // falls back to the old predictable `/tmp/tg-hib.*` stem.
+            let script = syncstate::capture_script_staged("/wd", dir);
+            assert!(script.contains(&format!("{dir}/bundle")));
+            assert!(!script.contains("tg-hib"));
+            assert_eq!(
+                syncstate::stage_dir_script(dir),
+                format!("umask 077; mkdir -- {dir}")
+            );
+        }
+    }
+
+    #[test]
+    fn staging_cleanup_removes_exactly_the_generated_dir() {
+        let dir = crate::parity::random_staging_dir().unwrap();
+        // The generated name is all shell-safe chars, so sh_quote leaves it
+        // bare; anything else is single-quoted.
+        assert_eq!(staging_cleanup_script(&dir), format!("rm -rf -- {dir}"));
+        assert_eq!(
+            staging_cleanup_script("/tmp/a dir;rm -rf /"),
+            "rm -rf -- '/tmp/a dir;rm -rf /'"
+        );
+    }
+
+    #[test]
+    fn capture_cleanup_failure_is_logged_after_publish_and_chained_after_failure() {
+        let dir = "/tmp/tg-parity-x";
+        assert_eq!(finish_capture(Ok(7), Ok(()), dir).unwrap(), 7);
+        // A published snapshot survives a cleanup failure.
+        assert_eq!(
+            finish_capture(Ok(7), Err(anyhow::anyhow!("rm failed")), dir).unwrap(),
+            7
+        );
+        let plain =
+            finish_capture::<()>(Err(anyhow::anyhow!("capture broke")), Ok(()), dir).unwrap_err();
+        assert_eq!(format!("{plain:#}"), "capture broke");
+        let both = finish_capture::<()>(
+            Err(anyhow::anyhow!("capture broke")),
+            Err(anyhow::anyhow!("rm failed")),
+            dir,
+        )
+        .unwrap_err();
+        let text = format!("{both:#}");
+        assert!(text.contains("capture broke"), "{text}");
+        assert!(text.contains("rm failed"), "{text}");
+        assert!(text.contains(dir), "{text}");
     }
 
     #[test]
