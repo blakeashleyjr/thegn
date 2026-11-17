@@ -17,7 +17,9 @@ pub enum Action {
     /// Stream the daemon's live event feed until it disconnects.
     Tail {
         /// Comma-separated event kinds to receive. The greeting is always
-        /// delivered first; valid kinds are shown in the control schema.
+        /// delivered first; valid kinds are shown in the control schema. The
+        /// opt-in Lead kinds `notification`, `dispatch` and `automation_run`
+        /// are delivered only when named here.
         #[arg(long)]
         kinds: Option<String>,
         /// Only session-keyed events for this session.
@@ -143,6 +145,7 @@ pub(crate) fn format_frame(frame: &EventFrame, json: bool) -> Result<String> {
             code.map_or_else(|| "?".into(), |code| code.to_string())
         ),
         EventFrame::Lagged { missed } => format!("[lagged: missed {missed} frame(s)]"),
+        EventFrame::Notice { kind, json } => format!("{} {json}", kind.as_str()),
     })
 }
 
@@ -223,6 +226,17 @@ mod tests {
             format_frame(&EventFrame::Lagged { missed: 7 }, false).unwrap(),
             "[lagged: missed 7 frame(s)]"
         );
+        assert_eq!(
+            format_frame(
+                &EventFrame::Notice {
+                    kind: thegn_core::control_wire::NoticeKind::Notification,
+                    json: "{\"id\":3}".into(),
+                },
+                false
+            )
+            .unwrap(),
+            "notification {\"id\":3}"
+        );
     }
 
     #[test]
@@ -277,6 +291,10 @@ mod tests {
                 code: Some(0),
             },
             EventFrame::Lagged { missed: 1 },
+            EventFrame::Notice {
+                kind: thegn_core::control_wire::NoticeKind::Dispatch,
+                json: "{}".into(),
+            },
         ];
         for frame in frames {
             assert!(!format_frame(&frame, false).unwrap().is_empty());

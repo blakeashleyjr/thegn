@@ -250,6 +250,10 @@ pub fn frame_to_proto(frame: &EventFrame) -> proto::Event {
             code: *code,
         }),
         EventFrame::Lagged { missed } => Kind::Lagged(proto::Lagged { missed: *missed }),
+        EventFrame::Notice { kind, json } => Kind::Notice(proto::Notice {
+            kind: kind.as_str().to_string(),
+            json: json.clone(),
+        }),
     };
     proto::Event {
         seq: match frame {
@@ -1480,6 +1484,11 @@ mod tests {
                 code: x.code,
             },
             Kind::Lagged(l) => EventFrame::Lagged { missed: l.missed },
+            Kind::Notice(n) => EventFrame::Notice {
+                kind: thegn_core::control_wire::NoticeKind::parse(&n.kind)
+                    .unwrap_or(thegn_core::control_wire::NoticeKind::Notification),
+                json: n.json.clone(),
+            },
         }
     }
 
@@ -1527,6 +1536,10 @@ mod tests {
                 code: None,
             },
             EventFrame::Lagged { missed: 4 },
+            EventFrame::Notice {
+                kind: thegn_core::control_wire::NoticeKind::AutomationRun,
+                json: r#"{"rule":"r"}"#.into(),
+            },
         ];
         for f in frames {
             assert_eq!(proto_to_frame(&frame_to_proto(&f)), f, "{f:?}");

@@ -620,6 +620,10 @@ pub fn frame_json(frame: &EventFrame) -> Value {
             "session": session, "code": code,
         }),
         EventFrame::Lagged { missed } => json!({ "missed": missed }),
+        EventFrame::Notice { json: j, .. } => json!({
+            "event": serde_json::from_str::<Value>(j)
+                .unwrap_or_else(|_| Value::String(j.clone())),
+        }),
     };
     if let Value::Object(fields) = &mut value {
         fields.insert("kind".into(), Value::String(frame.kind().into()));
