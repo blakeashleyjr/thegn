@@ -485,7 +485,7 @@ fn reset_history() {
 mod tests {
     use super::{
         HEADING, History, MAX_SERIES, MEM_TITLE, SERIES_CAP, STALE, TITLE, build_sections, is_open,
-        record, refresh_open, reset_history, row_ids,
+        record, refresh_open, reset_history, row_acts, row_ids,
     };
     use crate::chrome::{BarItemId, FrameModel};
     use crate::compositor::Rect;
