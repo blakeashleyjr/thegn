@@ -76,6 +76,10 @@ pub struct McpProxyConfig {
     /// counts as a failure against the breaker.
     #[schemars(range(max = "crate::time_policy::MAX_DURATION_SECS"))]
     pub request_timeout_secs: u64,
+    /// Named profiles: servers listed in a profile are exposed ONLY by
+    /// `thegn mcp proxy --profile <name>`, never by the default proxy.
+    #[serde(skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub profiles: std::collections::BTreeMap<String, Vec<String>>,
 }
 
 impl Default for McpProxyConfig {
@@ -86,11 +90,31 @@ impl Default for McpProxyConfig {
             failure_threshold: 3,
             cooldown_secs: 30,
             request_timeout_secs: 30,
+            profiles: std::collections::BTreeMap::new(),
         }
     }
 }
 
 impl McpProxyConfig {
+    /// Config errors: every profile member must be a configured
+    /// `[mcp_servers.<name>]`.
+    pub fn validate(
+        &self,
+        servers: &std::collections::BTreeMap<String, McpServerConfig>,
+    ) -> Vec<String> {
+        let mut errs = Vec::new();
+        for (profile, members) in &self.profiles {
+            for name in members {
+                if !servers.contains_key(name) {
+                    errs.push(format!(
+                        "mcp_proxy.profiles.{profile} names unknown server {name:?}; declare [mcp_servers.{name}]"
+                    ));
+                }
+            }
+        }
+        errs
+    }
+
     /// The pure breaker tuning derived from this config.
     pub fn breaker_config(&self) -> crate::mcp::proxy::breaker::BreakerConfig {
         crate::mcp::proxy::breaker::BreakerConfig {

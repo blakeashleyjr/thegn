@@ -33,6 +33,7 @@ const fn feature_bit(feature: Feature) -> u8 {
         Feature::Placement => 1 << 3,
         Feature::Voice => 1 << 4,
         Feature::PluginApps => 1 << 5,
+        Feature::Lead => 1 << 6,
     }
 }
 
