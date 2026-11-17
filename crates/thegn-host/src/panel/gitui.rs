@@ -1065,6 +1065,8 @@ pub enum GitMsg {
     MoveDown,
     AmendStaged,
     CopyCommits,
+    /// Copy the selected commit sha(s) to the system clipboard (OSC 52).
+    CopySha,
     PasteCommits,
     EnterInteractive,
     MarkBase,
@@ -1174,6 +1176,7 @@ pub fn context_keys(view: GitView) -> Vec<CtxKey> {
             k("A", "amend staged", GitMsg::AmendStaged),
             // The internal cherry-pick clipboard, NOT the OS clipboard — the
             // bare "copy" label read as a sha yank.
+            k("y", "copy sha", GitMsg::CopySha),
             k("C", "copy (pick)", GitMsg::CopyCommits),
             k("V", "paste (pick)", GitMsg::PasteCommits),
             k("B", "mark base", GitMsg::MarkBase),
@@ -1785,6 +1788,7 @@ impl GitMsg {
             GitMsg::Revert => "revert",
             GitMsg::EnterInteractive => "interactive rebase",
             GitMsg::AmendStaged => "amend",
+            GitMsg::CopySha => "copy sha",
             GitMsg::CopyCommits => "copy (pick)",
             GitMsg::PasteCommits => "paste (pick)",
             GitMsg::MarkBase => "mark base",
@@ -2378,6 +2382,16 @@ mod tests {
             Some(GitMsg::CopyCommits)
         );
         assert_eq!(git_key(&KeyCode::Char('c'), none, &ui), None);
+        // y copies the sha(s) to the system clipboard.
+        assert_eq!(
+            git_key(&KeyCode::Char('y'), none, &ui),
+            Some(GitMsg::CopySha)
+        );
+        assert!(
+            context_keys(GitView::Commits)
+                .iter()
+                .any(|ck| ck.label == "copy sha" && ck.msg == GitMsg::CopySha)
+        );
         // s squashes; S falls through.
         assert_eq!(
             git_key(&KeyCode::Char('s'), none, &ui),
