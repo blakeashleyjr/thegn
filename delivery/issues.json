@@ -135,13 +135,6 @@
       ]
     },
     {
-      "issue": "THE-123",
-      "project": "Runtime Security & Host Architecture",
-      "changes": [
-        "resurrect-model-proxy"
-      ]
-    },
-    {
       "issue": "THE-125",
       "project": "Agent & Workflow Platform",
       "changes": [
