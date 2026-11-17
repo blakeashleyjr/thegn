@@ -232,3 +232,25 @@ HTTP API and `thegn api call`.
 `merge_drain` is gated like `merge_add`: the narrow `merge_add` grant belongs to
 worktree-bound route tokens, so an MCP caller needs `git`. Rules the Lead
 writes may only notify or open sessions.
+
+### The overview reply
+
+`overview.get` takes `{ "workspace": "<repo root>", "limit": 50 }`, both
+optional (`limit` defaults to 50, caps at 500, and bounds every section). The
+reply carries:
+
+- `worktrees`: each registered worktree with its attention `tier`
+  (`blocked`, `failure`, `waiting`, `ready`, `working`, `idle`), the `reason`,
+  `since` (epoch seconds) and `unread` count, most urgent first.
+- `roster`: active agent dispatches grouped by pipeline stage.
+- `merge_queue` and `pr_queue`: queued entries that have not landed.
+- `ci_failing`: worktrees whose latest cached CI run failed.
+- `approvals_pending`: approval requests nobody has answered.
+- `notifications`: unread total and a count per kind.
+- `calendar_today`: today's events in your home zone.
+- `partial`: one `"section: reason"` string per source that failed or is
+  approximate. A failing source never fails the call.
+
+The view is read from the database and caches only. Live state that exists
+only in the UI, such as which pane an agent has focused, is not visible, so
+activity is approximate and `partial` always says `activity: daemon-only view`.
