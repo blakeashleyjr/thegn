@@ -499,7 +499,10 @@ mod tests {
             panic!("seed third: {calls:?}")
         };
         assert!(seed.contains("TG-SEED-OK seeded"), "{seed}");
-        assert!(seed.contains("'/home/u/thegn-worktrees/r/w'"), "{seed}");
+        assert!(
+            seed.contains("git -C /home/u/thegn-worktrees/r/w "),
+            "{seed}"
+        );
         assert!(
             seed.contains(path.as_str()),
             "the seed reads the staged bundle"
