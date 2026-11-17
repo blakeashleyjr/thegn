@@ -1174,9 +1174,9 @@ pub fn context_keys(view: GitView) -> Vec<CtxKey> {
             k("i", "interactive", GitMsg::EnterInteractive),
             k("m", "rebase menu", GitMsg::OpenMenu(MenuKind::Rebase)),
             k("A", "amend staged", GitMsg::AmendStaged),
+            k("y", "copy sha", GitMsg::CopySha),
             // The internal cherry-pick clipboard, NOT the OS clipboard — the
             // bare "copy" label read as a sha yank.
-            k("y", "copy sha", GitMsg::CopySha),
             k("C", "copy (pick)", GitMsg::CopyCommits),
             k("V", "paste (pick)", GitMsg::PasteCommits),
             k("B", "mark base", GitMsg::MarkBase),
@@ -1771,7 +1771,7 @@ pub fn git_key(key: &KeyCode, mods: Modifiers, ui: &crate::panel::PanelUi) -> Op
 fn works_at_normal(msg: &GitMsg) -> bool {
     matches!(
         msg,
-        GitMsg::StageToggleFile | GitMsg::Commit | GitMsg::DiscardFile
+        GitMsg::StageToggleFile | GitMsg::Commit | GitMsg::DiscardFile | GitMsg::CopySha
     )
 }
 
