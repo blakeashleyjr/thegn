@@ -2357,7 +2357,7 @@ mod snapshot_text_tests {
 
 #[cfg(test)]
 mod session_line_tests {
-    use super::{exit_cause, session_line, sessions_json};
+    use super::{exit_cause, format_age, session_line, session_line_at, sessions_json};
     use thegn_svc::control::SessionInfo;
 
     /// The liveness token is the line's **second column** (immediately after
