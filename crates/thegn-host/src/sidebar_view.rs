@@ -1751,7 +1751,7 @@ fn tree_lead(depth: u8, is_last: bool) -> Vec<crate::seg::Seg> {
 }
 
 /// The lead of a worktree row's detail line: the same indent as the first
-/// line, with a ghost `│` under the row's own `├` (blank under `└`). Returns
+/// line, with a ghost tree pipe under the row's own tee connector (blank under a corner). Returns
 /// the segments and their display width (`4 + (depth-1)*2 + 4`).
 fn detail_tree_lead(depth: u8, is_last: bool) -> (Vec<crate::seg::Seg>, usize) {
     use crate::seg::{Tok, seg, sp};
@@ -4324,7 +4324,7 @@ mod tests {
         assert_eq!(lead[0].text, " ".repeat(4));
         assert_eq!(lead[1].text, format!("{} ", gl.tree_pipe));
         assert_eq!(lead[1].fg, crate::seg::Tok::Slot(S::Ghost2));
-        // Last child: blank under `└`.
+        // Last child: blank under the corner connector.
         let (lead, cols) = detail_tree_lead(1, true);
         assert_eq!(cols, 8);
         assert_eq!(lead[1].text, "  ");
@@ -4394,7 +4394,7 @@ mod tests {
             assert_eq!(fg, col(S::Ghost2), "row {idx}");
         }
         let (t, _) = guide_cell(&mut s, &frame, 3, 4);
-        assert_eq!(t.trim(), "", "last row is blank under `└`");
+        assert_eq!(t.trim(), "", "last row is blank under the corner connector");
     }
 
     #[test]
