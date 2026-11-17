@@ -396,6 +396,7 @@ pub fn session_url(
 ) -> Result<String, ApiParseError> {
     let base = checked_base(base)?;
     if session_id.is_empty()
+        || session_id.len() > 128
         || !session_id
             .bytes()
             .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
@@ -712,6 +713,8 @@ mod tests {
         assert!(sandbox_url(b, &bad_scope, "a").is_err());
         assert!(session_url(b, &scope(), "", "").is_err());
         assert!(session_url(b, &scope(), "a/b", "").is_err());
+        assert!(session_url(b, &scope(), &"a".repeat(128), "").is_ok());
+        assert!(session_url(b, &scope(), &"a".repeat(129), "").is_err());
         for t in ["cmd", "/a/../b", "/a?x", "/a#x", "/a b"] {
             assert!(session_url(b, &scope(), "s", t).is_err(), "{t}");
         }
