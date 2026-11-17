@@ -1177,6 +1177,7 @@ mod tests {
     #[test]
     fn prune_logs_limits_direct_regular_log_files_without_following_links() {
         let dir = tempfile::tempdir().unwrap();
+        thegn_core::fsperm::ensure_private_dir(dir.path()).unwrap();
         let slug = private_slug(dir.path(), "worktree-hash");
         std::fs::create_dir_all(slug.join("nested")).unwrap();
         for index in 0..21 {
@@ -1204,6 +1205,7 @@ mod tests {
     #[test]
     fn prune_logs_applies_total_byte_cap_oldest_first_across_slug_directories() {
         let dir = tempfile::tempdir().unwrap();
+        thegn_core::fsperm::ensure_private_dir(dir.path()).unwrap();
         let alpha = private_slug(dir.path(), "alpha");
         let beta = private_slug(dir.path(), "beta");
         let logs = [
@@ -1242,6 +1244,7 @@ mod tests {
     #[test]
     fn prune_logs_removes_only_slug_directories_emptied_by_this_pass() {
         let dir = tempfile::tempdir().unwrap();
+        thegn_core::fsperm::ensure_private_dir(dir.path()).unwrap();
         let emptied = private_slug(dir.path(), "emptied");
         let already_empty = private_slug(dir.path(), "already-empty");
         std::fs::write(emptied.join("old.log"), b"log").unwrap();
@@ -1346,6 +1349,7 @@ mod tests {
     #[test]
     fn prune_logs_never_removes_a_slug_that_still_has_entries() {
         let dir = tempfile::tempdir().unwrap();
+        thegn_core::fsperm::ensure_private_dir(dir.path()).unwrap();
         let slug = private_slug(dir.path(), "busy");
         std::fs::write(slug.join("old.log"), b"old").unwrap();
         set_mtime(&slug.join("old.log"), 1);
@@ -1358,10 +1362,13 @@ mod tests {
         assert!(slug.is_dir());
     }
 
-    #[cfg(unix)]
     #[test]
     fn prune_logs_skips_hard_linked_logs() {
+        if thegn_core::sandbox_backend::host_os() == thegn_core::sandbox_backend::HostOs::Windows {
+            return;
+        }
         let dir = tempfile::tempdir().unwrap();
+        thegn_core::fsperm::ensure_private_dir(dir.path()).unwrap();
         let slug = private_slug(dir.path(), "linked");
         std::fs::write(slug.join("old.log"), b"shared").unwrap();
         set_mtime(&slug.join("old.log"), 1);
@@ -1377,10 +1384,13 @@ mod tests {
         assert!(slug.is_dir());
     }
 
-    #[cfg(unix)]
     #[test]
     fn prune_logs_skips_a_group_writable_slug() {
+        if thegn_core::sandbox_backend::host_os() == thegn_core::sandbox_backend::HostOs::Windows {
+            return;
+        }
         let dir = tempfile::tempdir().unwrap();
+        thegn_core::fsperm::ensure_private_dir(dir.path()).unwrap();
         let slug = private_slug(dir.path(), "loose");
         std::fs::write(slug.join("old.log"), b"old").unwrap();
         set_mtime(&slug.join("old.log"), 1);
