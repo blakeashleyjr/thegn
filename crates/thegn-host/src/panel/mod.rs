@@ -794,6 +794,9 @@ pub struct PanelData {
     pub tests: Option<TestsLite>,
     /// Total tracked-file count for the files summary ("214 · 29.5k loc").
     pub file_count: Option<u64>,
+    /// State of the tracked-file listing: `Failed` must not look like a small
+    /// repository (the renderer shows an unavailable note).
+    pub files_load: crate::panel::gitui::DocLoad,
     /// All tracked files from `git ls-files` — populated while Files is open.
     /// The Files section renders this as a collapsible tree with changed-file
     /// highlights drawn from `changes`.
