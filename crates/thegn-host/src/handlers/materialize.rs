@@ -167,16 +167,23 @@ pub(crate) fn maybe_materialize(
             // synchronously in `terminal_launch_spec` on THIS thread and can
             // stall for seconds on a wedged runtime, so its resolve phases must
             // stream to the tab's splash instead of leaving the seed frozen.
-            let spec_result =
+            // The Lead group (THE-2187) launches its sandboxed agent instead
+            // of a shell, ignoring the connection, the sandbox choice and any
+            // host pin: it fails closed (no bwrap, no Lead), never a host shell.
+            let spec_result = if crate::lead::group::is_lead_group(&gname) {
+                observed(&|| crate::lead::launch::launch_spec(&cfg, &gname, ti))
+            } else {
                 observed(&|| crate::panes::terminal_launch_spec(&cfg, &conn, &sandbox))
-                    .map(|spec| {
-                        // Record what actually got entered, not what was picked:
-                        // `spec.backend` is argv-derived, so the chip can never
-                        // claim a container this shell is not in.
-                        crate::handlers::terminal::record_observed(&gname, &spec.backend);
-                        missing.iter().map(|id| (*id, spec.clone())).collect()
-                    })
-                    .map_err(spec_err);
+            };
+            let spec_result = spec_result
+                .map(|spec| {
+                    // Record what actually got entered, not what was picked:
+                    // `spec.backend` is argv-derived, so the chip can never
+                    // claim a container this shell is not in.
+                    crate::handlers::terminal::record_observed(&gname, &spec.backend);
+                    missing.iter().map(|id| (*id, spec.clone())).collect()
+                })
+                .map_err(spec_err);
             // Terminal groups host no agent sessions to attach.
             (
                 spec_result,
