@@ -924,6 +924,7 @@ mod tests {
             },
             history_tail: Vec::new(),
             last_state: thegn_core::attention::PaneAgentState::Idle,
+            last_output_unix_secs: None,
             attached: 0,
             rows: 24,
             cols: 80,

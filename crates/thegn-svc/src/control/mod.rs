@@ -162,6 +162,10 @@ pub struct SessionInfo {
     /// This is lineage metadata only; no launch recipe is included.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub forked_from: Option<String>,
+    /// Unix seconds when the session last produced PTY output. `None` when it
+    /// has produced none yet, or when the daemon predates this field.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_output_unix_secs: Option<i64>,
 }
 
 /// What to run when opening a fresh session.

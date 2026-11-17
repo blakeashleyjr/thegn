@@ -62,6 +62,8 @@ pub(crate) struct Tombstone {
     /// The agent state at the moment of death, for a fleet listing that wants
     /// to say "finished" rather than merely "gone".
     pub last_state: PaneAgentState,
+    /// Unix seconds of the session's last PTY output, if it produced any.
+    pub last_output_unix_secs: Option<i64>,
     /// Clients attached when the session exited. The transport-retry
     /// observer's scope gate (THE-86): an adopted pane or a human attach means
     /// someone was watching, and the pane path or the human owns the verdict —
@@ -95,6 +97,7 @@ impl Tombstone {
         );
         info.exited_at_ms = Some(self.exited_at_ms);
         info.exit_code = self.exit_code;
+        info.last_output_unix_secs = self.last_output_unix_secs;
         info.final_state = Some(super::session::state_str(self.last_state).to_string());
         // A corpse isn't actively recording, but the finalized `.cast` path is
         // still worth reporting so a reader can find the recording.
@@ -137,6 +140,7 @@ pub(crate) mod tests {
             },
             history_tail: vec!["one".into(), "two".into()],
             last_state: PaneAgentState::Done,
+            last_output_unix_secs: None,
             attached: 0,
             rows: 24,
             cols: 80,
