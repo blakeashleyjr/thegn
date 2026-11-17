@@ -259,7 +259,7 @@ mod tests {
             "approval:",
             "linear:THE-1:code@abcdef1",
             "approval:linear:THE-1:code",
-            "approval:linear:THE-1@abcdef1",
+            "approval:THE1@abcdef1",
             "approval:linear:THE-1:code@abc",
             "approval:linear:THE-1:code@zzzzzzz",
             "approval::code@abcdef1",
