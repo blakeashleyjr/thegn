@@ -298,10 +298,7 @@ pub enum ServerSelection {
     /// server EXCEPT those listed in any profile.
     Default { excluded: BTreeSet<String> },
     /// `thegn mcp proxy --profile <p>`: only that profile's servers.
-    Profile {
-        name: String,
-        members: BTreeSet<String>,
-    },
+    Profile { members: BTreeSet<String> },
 }
 
 impl ServerSelection {
@@ -323,7 +320,6 @@ impl ServerSelection {
         };
         match profiles.get(name) {
             Some(members) => Ok(Self::Profile {
-                name: name.to_string(),
                 members: members.iter().cloned().collect(),
             }),
             None => {

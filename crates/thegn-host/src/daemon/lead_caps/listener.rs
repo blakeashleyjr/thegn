@@ -30,6 +30,8 @@ pub(crate) fn spawn(
         !state.local_admin,
         "the Lead listener must never grant implicit local admin"
     );
+    let mut state = state;
+    state.require_approval = true; // a code redeemed via the Lead listener always parks for operator approval
     let bound = std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
         .and_then(|l| l.set_nonblocking(true).map(|()| l))
         .and_then(|l| l.local_addr().map(|addr| (l, addr)));
