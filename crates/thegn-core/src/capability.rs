@@ -465,6 +465,21 @@ pub const CATALOG: &[HostCapability] = &[
         SurfaceSet::of(&[Surface::Http, Surface::Cli, Surface::Mcp]),
         "Recent audited runs of an automation rule",
     ),
+    // --- automation kill switch (THE-2197) ------------------------------------
+    // Pausing is Write and Lead-allowed; resuming is Admin, so it is HTTP + CLI
+    // only (the `approvals.resolve` precedent): a Lead can stop, never restart.
+    cap(
+        "automations.pause",
+        Verb::AutomationsPause,
+        SurfaceSet::of(&[Surface::Http, Surface::Cli, Surface::Mcp]),
+        "Pause every automation rule (events are audited as paused)",
+    ),
+    cap(
+        "automations.resume",
+        Verb::AutomationsResume,
+        SurfaceSet::of(&[Surface::Http, Surface::Cli]),
+        "Resume paused automations (admin; never MCP or plugin)",
+    ),
     // --- approvals (THE-2172) -------------------------------------------------
     // Lead tool surface (THE-2172): gRPC and plugin projection queued; not
     // claimed, so no gap rows. Resolving is Admin, so it is HTTP + CLI only.
@@ -1813,6 +1828,38 @@ mod tests {
             crate::control::required_scope(lookup("merge.drain").unwrap().verb),
             crate::control::Scope::MergeAdd
         );
+    }
+
+    #[test]
+    fn automations_pause_is_write_on_mcp_and_resume_is_operator_only() {
+        // THE-2197: the kill switch. A Lead (MCP) can pause but never resume.
+        let pause = lookup("automations.pause").unwrap();
+        assert_eq!(
+            pause.surfaces,
+            SurfaceSet::of(&[Surface::Http, Surface::Cli, Surface::Mcp])
+        );
+        assert_eq!(
+            crate::control::required_scope(pause.verb),
+            crate::control::Scope::Write
+        );
+        let resume = lookup("automations.resume").unwrap();
+        assert_eq!(
+            resume.surfaces,
+            SurfaceSet::of(&[Surface::Http, Surface::Cli])
+        );
+        assert!(!resume.surfaces.contains(Surface::Mcp));
+        assert!(!resume.surfaces.contains(Surface::Plugin));
+        assert_eq!(
+            crate::control::required_scope(resume.verb),
+            crate::control::Scope::Admin
+        );
+        for c in [pause, resume] {
+            assert!(c.deprecated.is_none(), "{}", c.id);
+            assert!(c.stub.is_none(), "{}", c.id);
+            for s in Surface::ALL {
+                assert!(!is_gap(c.id.0, *s), "{}/{} is excused", c.id, s.as_str());
+            }
+        }
     }
 
     #[test]
