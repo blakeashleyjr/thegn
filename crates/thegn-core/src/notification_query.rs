@@ -54,7 +54,22 @@ pub fn filter(rows: Vec<Notification>, req: &NotificationsListRequest) -> Vec<No
         .filter(|n| req.since.is_none_or(|s| n.created_at_ms >= s))
         .filter(|n| req.worktree.as_deref().is_none_or(|w| n.worktree_path == w))
         .take(req.effective_limit())
+        .map(|mut n| {
+            n.message = clip_message(&n.message);
+            n
+        })
         .collect()
+}
+
+/// Maximum characters of a notification message returned by a list reply.
+pub const MAX_MESSAGE_CHARS: usize = 1000;
+
+/// Clip `s` to [`MAX_MESSAGE_CHARS`] characters at a char boundary.
+pub fn clip_message(s: &str) -> String {
+    match s.char_indices().nth(MAX_MESSAGE_CHARS) {
+        Some((i, _)) => s[..i].to_owned(),
+        None => s.to_owned(),
+    }
 }
 
 /// `notifications.ack` request; exactly one selector.
@@ -132,6 +147,17 @@ mod tests {
         assert_eq!(ids(&req(|r| r.since = Some(20))), vec![3, 2]);
         assert_eq!(ids(&req(|r| r.worktree = Some("/a".into()))), vec![3, 1]);
         assert_eq!(ids(&req(|r| r.limit = Some(1))), vec![3]);
+    }
+
+    #[test]
+    fn long_messages_are_clipped() {
+        let mut long = row(1, NotificationKind::AgentDone, false, 1, "/a");
+        long.message = "é".repeat(1500);
+        let mut short = row(2, NotificationKind::AgentDone, false, 2, "/a");
+        short.message = "hi".into();
+        let out = filter(vec![long, short], &NotificationsListRequest::default());
+        assert_eq!(out[0].message.chars().count(), 1000);
+        assert_eq!(out[1].message, "hi");
     }
 
     #[test]
