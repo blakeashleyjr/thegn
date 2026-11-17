@@ -447,6 +447,7 @@ message Event {
     Empty sessions = 8;
     SessionExit exit = 9;
     Lagged lagged = 10;
+    Notice notice = 11;
   }
 }
 
@@ -492,4 +493,10 @@ message SessionExit {
 
 message Lagged {
   uint64 missed = 1;
+}
+
+// Opt-in Lead feed notice (notification|dispatch|automation_run).
+message Notice {
+  string kind = 1;
+  string json = 2;
 }
