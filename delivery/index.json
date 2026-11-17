@@ -525,7 +525,8 @@
     },
     {
       "change": "add-workspace-zones",
-      "lifecycle": "active",
+      "lifecycle": "archived",
+      "archive_path": "openspec/changes/archive/2026-11-17-add-workspace-zones/",
       "disposition": "residual-split",
       "owners": [
         {
