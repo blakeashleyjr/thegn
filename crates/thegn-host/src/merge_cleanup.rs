@@ -877,6 +877,22 @@ fn registrations(root: &Path) -> Result<Vec<Registration>, Refusal> {
     Ok(rows)
 }
 
+/// Whether git's worktree registry lists `path`. `Err` means the registry
+/// could not be read, which callers must treat as "unknown", never "absent".
+pub(crate) fn path_is_registered(root: &Path, path: &Path) -> Result<bool, Refusal> {
+    let rows = registrations(root)?;
+    // The checkout is gone, so it cannot be canonicalised; canonicalise the
+    // parent so a symlinked prefix still compares equal to git's own spelling.
+    let canonical = path
+        .parent()
+        .and_then(|parent| std::fs::canonicalize(parent).ok())
+        .zip(path.file_name())
+        .map(|(parent, name)| parent.join(name));
+    Ok(rows
+        .iter()
+        .any(|row| row.path == path || canonical.as_deref() == Some(row.path.as_path())))
+}
+
 /// A private snapshot held only across the synchronous, claimed transaction.
 pub(crate) struct Verified {
     history: crate::canonical_history::CanonicalHistory,
