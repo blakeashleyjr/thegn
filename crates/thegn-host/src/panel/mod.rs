@@ -37,6 +37,24 @@ pub mod staging;
 use termwiz::input::{KeyCode, Modifiers};
 
 /// The four top-level panel tabs that group sections by concern.
+/// Freshness of the header's ahead/behind read.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum UpstreamRead {
+    #[default]
+    Fresh,
+    Stale,
+    Unavailable,
+}
+
+/// Zone membership shown in the panel header.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub enum ZoneChip {
+    #[default]
+    Unzoned,
+    Named(String),
+    Unknown,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum PanelTab {
     /// Git operations: Changes, Commits, Branches, Stash, Files.
@@ -731,6 +749,10 @@ pub struct PanelData {
     pub media: Option<thegn_core::media::MediaState>,
     /// Commits `(ahead, behind)` upstream; `None` without a tracking branch.
     pub ahead_behind: Option<(usize, usize)>,
+    /// Whether `ahead_behind` is a live read, last-known, or never readable.
+    pub upstream_read: UpstreamRead,
+    /// The worktree's zone membership for the header chip.
+    pub zone: ZoneChip,
     /// A merge/rebase/cherry-pick in progress (header zone).
     pub merge: Option<MergeBanner>,
     /// The merge/rebase probe failed during this hydration, so `merge` is last-known (or absent)
