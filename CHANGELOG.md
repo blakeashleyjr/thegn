@@ -7,6 +7,29 @@ All notable changes to **thegn** are documented here. The format follows
 
 ## [Unreleased]
 
+### Added
+
+- The perf rollup's `git_spawn_top` names the top (thread, git subcommand) pairs behind idle git spawns. (THE-1995)
+- `thegn session list` shows `output:<age>`, the time since the session last produced output. (THE-2010)
+
+### Changed
+
+- Agent-login sync no longer copies `mcp-needs-auth-cache.json` (THE-2051); it uploads the allowlisted files as one archive and skips the upload when nothing changed. (THE-2056)
+- The VPS/fly machine ledger and managed known_hosts live in `$XDG_STATE_HOME/thegn/vps`, moved once from `~/.thegn/vps`. (THE-2050)
+- A failed pane connect opens the database once. (THE-2001)
+- `thegn env test`/`deprovision` name the token reference and the paths tried when a provider token cannot be resolved; `thegn env show` warns about risky sandbox mounts (runtime dir, profile trees). (THE-2016, THE-2009)
+- Daemon launches pick up `[env.*]` and env-selection edits without a daemon restart; `[host.*]`, `[sandbox.profiles.*]` and other `[sandbox]`/`[daemon]` keys still need a restart. (THE-2024)
+- The VPS controller id and machine0 attestations live in `$XDG_STATE_HOME/thegn`, moved once from `~/.thegn`; a symlinked or foreign legacy id is refused, not replaced. (THE-2057)
+- Process-group cleanup reaps the leader and probes the group instead of scanning all of /proc. (THE-1996)
+
+### Fixed
+
+- Sprites envs with `exec = "auto"` or `"api"` ignore `exec_command`/`interactive_command` (used only with `exec = "cli"`); a worktree with a stale saved transport prefix is repaired on its next launch; `thegn doctor` warns when those keys are set but ignored. (THE-2054)
+- Fly provisioning installs Nix when running as root without sudo. (THE-2053)
+- Plain ssh hosts with `data = "in_env"` get the repo seeded at `env up` / session open into `$HOME/thegn-worktrees/<repo>/<worktree>`. (THE-2049)
+- `wt rm` no longer tries to checkpoint a sandbox it just destroyed. (THE-2055)
+- Nightly CI doc link, a flaky ipc test, and RustSec advisories: dependency bumps in Cargo.lock plus documented deny.toml ignores for advisories with no safe upgrade. (THE-1989)
+
 ## [0.1.0-alpha.90] — 2026-11-16
 
 ### Added
