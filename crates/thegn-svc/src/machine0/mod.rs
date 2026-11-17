@@ -475,7 +475,7 @@ impl Machine0Provider {
     }
 
     async fn await_created_vm(&self, name: &str) -> Result<Machine0Vm> {
-        after_vm_create(thegn_core::util::thegn_dir(), name.to_string(), async {
+        after_vm_create(crate::vps::registry::dir(), name.to_string(), async {
             if self.spec.skip_ready_wait {
                 return Ok(self.vm_by_name(name).await?.unwrap_or(Machine0Vm {
                     id: String::new(),
@@ -1029,19 +1029,23 @@ impl Machine0Provider {
     async fn retire_local_state(&self, name: &str) -> Result<()> {
         let root = thegn_core::util::thegn_dir();
         let name = name.to_string();
-        match tokio::task::spawn_blocking(move || retire_local_state_in(&root, &name)).await {
+        match tokio::task::spawn_blocking(move || {
+            retire_local_state_in(&root, &crate::vps::registry::dir(), &name)
+        })
+        .await
+        {
             Ok(result) => result,
             Err(error) => Err(error.into()),
         }
     }
 }
 
-fn retire_local_state_in(thegn_root: &Path, name: &str) -> Result<()> {
+fn retire_local_state_in(thegn_root: &Path, registry: &Path, name: &str) -> Result<()> {
     let attestation_result = attest::remove_in(thegn_root, name)
         .context("machine0: failed to remove the local provisioning attestation");
-    let pin_result = crate::vps::registry::remove_known_hosts_pin_at(&thegn_root.join("vps"), name)
+    let pin_result = crate::vps::registry::remove_known_hosts_pin_at(registry, name)
         .context("machine0: failed to remove the local known_hosts pin");
-    let pending_result = pending::remove_at(&thegn_root.join("vps"), name)
+    let pending_result = pending::remove_at(registry, name)
         .context("machine0: failed to remove the local pending create record");
 
     match attestation_result {
@@ -1054,12 +1058,12 @@ fn retire_local_state_in(thegn_root: &Path, name: &str) -> Result<()> {
 }
 
 async fn after_vm_create<T>(
-    thegn_root: PathBuf,
+    registry: PathBuf,
     name: String,
     ready: impl Future<Output = Result<T>>,
 ) -> Result<T> {
     tokio::task::spawn_blocking(move || {
-        crate::vps::registry::remove_known_hosts_pin_at(&thegn_root.join("vps"), &name)
+        crate::vps::registry::remove_known_hosts_pin_at(&registry, &name)
     })
     .await
     .context("machine0: stale known_hosts pin removal worker failed")?
@@ -2939,7 +2943,7 @@ mod tests {
         std::fs::write(known_hosts.join("dev"), b"dev key").unwrap();
         std::fs::write(known_hosts.join("other"), b"other key").unwrap();
 
-        retire_local_state_in(root.path(), "dev").unwrap();
+        retire_local_state_in(root.path(), &root.path().join("vps"), "dev").unwrap();
 
         assert!(attest::load_in(root.path(), "dev").is_none());
         assert!(!known_hosts.join("dev").exists());
@@ -2953,7 +2957,7 @@ mod tests {
         pending::record_at(&registry, "dev").unwrap();
         pending::record_at(&registry, "other").unwrap();
 
-        retire_local_state_in(root.path(), "dev").unwrap();
+        retire_local_state_in(root.path(), &root.path().join("vps"), "dev").unwrap();
 
         assert_eq!(
             pending::names_at(&registry).unwrap(),
@@ -3028,7 +3032,7 @@ mod tests {
         )
         .unwrap();
 
-        retire_local_state_in(root.path(), "dev").unwrap();
+        retire_local_state_in(root.path(), &root.path().join("vps"), "dev").unwrap();
 
         assert!(crate::vps::registry::read_at(&vps, "dev").is_some());
     }
@@ -3041,7 +3045,7 @@ mod tests {
         std::fs::write(known_hosts.join("dev"), b"stale key").unwrap();
 
         let ready_root = known_hosts.clone();
-        after_vm_create(root.path().to_path_buf(), "dev".to_string(), async move {
+        after_vm_create(root.path().join("vps"), "dev".to_string(), async move {
             assert!(
                 !ready_root.join("dev").exists(),
                 "the SSH readiness probe must not see the stale pin"
