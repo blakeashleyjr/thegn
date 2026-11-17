@@ -183,7 +183,9 @@ pub(crate) fn after_pick(
 
 /// The DB half of an assignment, run on the writer thread. The zone id is
 /// looked up by name here (never carried from the picker), so a zone deleted
-/// since the catalog was hydrated is refused instead of dangling. A repo with
+/// since the catalog was hydrated is refused instead of dangling. The lookup
+/// and the write run in one immediate transaction, so a concurrent CLI delete
+/// (and a recycled zone id) cannot slip in between them. A repo with
 /// no `workspaces` row gets one first (the CLI does the same), without
 /// renaming an existing row. Returns the alert text on failure.
 pub(crate) fn write_assignment(
@@ -198,24 +200,32 @@ pub(crate) fn write_assignment(
             .assign_workspace_zone(repo_path, None)
             .map_err(|error| format!("Could not remove {label} from its zone: {error}"));
     };
-    let zone_id = db
-        .list_zones()
-        .map_err(|error| format!("Could not read zones: {error}"))?
-        .into_iter()
-        .find(|row| row.name == zone)
-        .map(|row| row.zone_id)
-        .ok_or_else(|| format!("zone {zone} no longer exists"))?;
-    db.transaction_immediate(|db| {
-        let known = db
-            .workspaces()?
-            .iter()
-            .any(|row| row.repo_path == repo_path);
-        if !known {
-            db.put_workspace(repo_path, label, "repo")?;
-        }
-        db.assign_workspace_zone(repo_path, Some(zone_id))
-    })
-    .map_err(|error| format!("Could not assign {label} to zone {zone}: {error}"))
+    let assigned = db
+        .transaction_immediate(|db| {
+            let Some(zone_id) = db
+                .list_zones()?
+                .into_iter()
+                .find(|row| row.name == zone)
+                .map(|row| row.zone_id)
+            else {
+                return Ok(false);
+            };
+            let known = db
+                .workspaces()?
+                .iter()
+                .any(|row| row.repo_path == repo_path);
+            if !known {
+                db.put_workspace(repo_path, label, "repo")?;
+            }
+            db.assign_workspace_zone(repo_path, Some(zone_id))?;
+            Ok(true)
+        })
+        .map_err(|error| format!("Could not assign {label} to zone {zone}: {error}"))?;
+    if assigned {
+        Ok(())
+    } else {
+        Err(format!("zone {zone} no longer exists"))
+    }
 }
 
 /// The `zone-assign` confirm: queue the write, then a model refresh so the
