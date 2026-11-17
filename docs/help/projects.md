@@ -19,8 +19,11 @@ independent: a project may be in one zone _and_ one program at once, and a
 program may even span zones.
 
 The panel header shows the worktree's zone as `zone <name>` (nothing when the
-worktree is unzoned; a failed read shows `zone ?`). Assignment stays on the
-CLI: `thegn zone assign`.
+worktree is unzoned; a failed read shows `zone ?`). Sidebar workspace headers
+show the same chip (`!` marks a zone without a `[zone.<name>]` policy). Assign
+a workspace with the palette action **Assign workspace to zone…** or
+`thegn zone assign`; unassigning or moving zones confirms with cancel as the
+default. See [[panel]] and [[sidebar]].
 
 > **Not the tracker “project”.** `[issues] project_key` / `project_id` in your
 > config name a project in your issue tracker (GitHub/GitLab/Linear/…). That is

@@ -7,6 +7,31 @@ All notable changes to **thegn** are documented here. The format follows
 
 ## [Unreleased]
 
+### Added
+
+- The file preview shows the text of .docx documents (bounded, sanitized; tab-stop definitions are not rendered as tabs); other zip-based files still list their parts. (THE-135)
+- The system monitor's process filter accepts `pane:<id>`. (THE-2025)
+- The panel header shows the worktree's zone. (THE-139)
+- `y` in the git panel's Commits view copies the selected commit sha(s) to the system clipboard. (THE-787)
+- Sidebar workspace headers show their zone (`zone ?` when unreadable, `!` without a `[zone.<name>]` policy). (THE-139)
+- Palette action "Assign workspace to zone…"; unassigning or moving zones confirms with cancel as the default, and the zone is resolved inside the write transaction. (THE-139)
+- The fleet popup lists providers over their hourly budget, and worktree paths keep their tail. (THE-2020)
+- `/` search with `n`/`N` in the in-app diff viewer. (THE-787)
+- `thegn agent result --row|--session [--json]`. (THE-2005)
+
+### Changed
+
+- neo_frizbee moved to 0.11 (one copy in the build); chrono-tz stays at 0.9 under a reasoned pin. (THE-680)
+
+### Fixed
+
+- The panel header no longer shows stale ahead/behind counts as current; a stale count is dimmed and an unknown one shows `?`. (THE-375)
+
+### Security
+
+- Hibernation capture writes its artifacts into a private, randomly named staging directory and removes it afterwards, instead of fixed `/tmp/tg-hib.*` paths. (THE-446)
+- `thegn secret ssh rotate` removes rotation key pairs (base36 sibling ids) orphaned by an interrupted rotation, on the next rotation of that key. (THE-1993)
+
 ## [0.1.0-alpha.92] — 2026-11-17
 
 ### Added
