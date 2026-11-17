@@ -2114,10 +2114,25 @@ audit_retention_per_rule = 200 # newest audit rows retained per rule (1..10000)
 # enabled = true
 # when = "agent_needs_you" # notification | agent_needs_you | agent_finished |
 #                          # agent_failed | pr_checks | pr_review_requested |
-#                          # merge_landed | worktree_idle | disk_low
+#                          # merge_landed | worktree_idle | disk_low |
+#                          # schedule_due | issue_matched | session_exited |
+#                          # inbox_item (inbox_item has no producer yet)
 # debounce_secs = 60       # minimum seconds between plans for this rule (0..86400)
 # idle_secs = 300          # required only for worktree_idle (60..86400)
-# once_per_key = true      # fire once for the producer's stable event/entity key
+# schedule = "0 9 * * 1-5" # schedule_due only: 5-field cron in local time; exactly
+#                          #   one of schedule/every. Runs in the daemon; with
+#                          #   [daemon] enabled = false schedules are inert. No
+#                          #   catch-up: a missed slot is skipped, not replayed
+# every = "1h"             # schedule_due only: interval <n>s|m|h|d (60s..7d),
+#                          #   counted from daemon start
+# autonomy = "review"      # propose | review | merge (default review): how far an
+#                          #   unattended run may go. propose = raise an approval and
+#                          #   start nothing; review = start, a human lands; merge =
+#                          #   the pipeline may land. WARNING: a rule matching free
+#                          #   text (if.message_regex; for issue_matched that is the
+#                          #   issue title) is capped at review, with a warning
+# once_per_key = true      # fire once for the producer's stable event/entity key;
+#                          #   always on for issue_matched (one issue fires once)
 # max_per_hour = 30        # per-rule sliding-window bound (1..1000)
 # max_action_per_hour = 30 # action-wide bound shared by every rule using this cap
 #
@@ -2137,13 +2152,23 @@ audit_retention_per_rule = 200 # newest audit rows retained per rule (1..10000)
 # pr_checks_passed = true
 # pr_review_requested = false
 # pr_merged = false
+# Issue selectors match only issue_matched events (false on every other kind):
+# account = "work"         # tracker account, exact
+# project = "proj-id"      # one of the issue's project/sprint/milestone ids, exact
+# label = "automate"       # one of the issue's labels, case-insensitive
+# assignee = "me"          # "me" = assigned to the account's own user (provenance,
+#                          #   never a display name); otherwise an exact assignee
+# status = "todo"          # issue status, case-insensitive
 #
 # Action ids are typed strings validated against the v1 catalog set. Parameter
 # templates may use: {event_id}, {event_key}, {event_kind}, {event_time},
 # {workspace}, {repo}, {worktree}, {branch}, {agent_role}, {notification_kind}, {priority},
 # {source_ref}, {message}, {session_id}, {pr_checks_passed},
-# {pr_review_requested}, and {pr_merged}. Values are prose/data substitution,
-# never shell expansion. `agent` and tool `name` must be literal configured names.
+# {pr_review_requested}, {pr_merged}, {issue_id}, {issue_number}, {issue_url},
+# {issue_status}, {account}, and {exit_code}. The issue title is never a variable
+# of its own (it reaches rules only as {message}). Values are prose/data
+# substitution, never shell expansion. `agent`, `stage` and tool `name` must be
+# literal configured names.
 # [automations.rules.then]
 # cap = "notify.push"       # notify.push: body required; title/urgency optional
 # title = "Coder needs attention"
@@ -2157,6 +2182,14 @@ audit_retention_per_rule = 200 # newest audit rows retained per rule (1..10000)
 # cap = "merge.add"         # no parameters; worktree comes from the event
 # cap = "tools.run"         # name required; resolves trusted global/profile [[tools]]
 # name = "release-check"
+# cap = "merge.drain"       # no parameters; drains the event worktree's merge queue
+# cap = "pipeline.start"    # when = "issue_matched" only; stage/agent optional
+# stage = "code"            #   configured [[pipeline.stages]] name to start at
+# cap = "lead.wake"         # prompt required; wakes the Lead with the event attached.
+#                           #   The prompt may NOT use {message}: untrusted event text
+#                           #   reaches the Lead only inside the delimited event block
+# pipeline.start and lead.wake are rule-only actions: not catalog capabilities,
+# so nothing but a rule (no MCP tool, HTTP route or CLI verb) can invoke them.
 #
 # A named profile may refine the settings and replace the rule list:
 # [profiles.work.automations]
@@ -2171,6 +2204,9 @@ audit_retention_per_rule = 200 # newest audit rows retained per rule (1..10000)
 # when = "agent_needs_you"
 # debounce_secs = 60
 # idle_secs = 300
+# schedule = "0 9 * * 1-5"
+# every = "1h"
+# autonomy = "review"
 # once_per_key = true
 # max_per_hour = 30
 # max_action_per_hour = 30
@@ -2188,6 +2224,11 @@ audit_retention_per_rule = 200 # newest audit rows retained per rule (1..10000)
 # pr_checks_passed = true
 # pr_review_requested = false
 # pr_merged = false
+# account = "work"
+# project = "proj-id"
+# label = "automate"
+# assignee = "me"
+# status = "todo"
 # [profiles.work.automations.rules.then]
 # cap = "notify.push"
 # title = "Profile rule"
@@ -2196,6 +2237,7 @@ audit_retention_per_rule = 200 # newest audit rows retained per rule (1..10000)
 # agent = "claude"
 # prompt = "Handle {source_ref}: {message}"
 # name = "release-check"
+# stage = "code"
 
 # Aggregated notification bus. Events (PR state, agent done/failed, test
 # failures, log errors, worktree created) surface as sidebar badges + the

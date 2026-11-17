@@ -8,8 +8,10 @@ use serde::{Deserialize, Serialize};
 use crate::agent_task::validate_template;
 use crate::automation::{
     ActionTemplate, AutomationEventKind, AutomationPredicate, AutomationRule, EVENT_TEMPLATE_VARS,
-    SUPPORTED_ACTION_CAPS,
+    LEAD_WAKE_TEMPLATE_VARS, SUPPORTED_ACTION_CAPS,
 };
+use crate::automation_autonomy::{Autonomy, RuleOrigin, effective_autonomy, validate_autonomy};
+use crate::automation_schedule::parse_schedule;
 use crate::notification::{NotificationKind, Priority};
 
 const MAX_RULES: usize = 256;
@@ -138,6 +140,16 @@ pub struct AutomationRuleConfig {
     /// Required only for `when = "worktree_idle"`; independent of debounce.
     #[schemars(range(max = "crate::time_policy::MAX_DURATION_SECS"))]
     pub idle_secs: Option<u64>,
+    /// 5-field cron expression in the host's local time zone. Exactly one of
+    /// `schedule`/`every` is required for `when = "schedule_due"`, and neither
+    /// is valid for any other kind.
+    pub schedule: Option<String>,
+    /// Fixed interval `<n>s|m|h|d` (60 s to 7 d), counted from daemon start.
+    pub every: Option<String>,
+    /// `propose` | `review` | `merge` (default `review`). Policy may lower it:
+    /// a rule matching free text (`if.message_regex`) is capped at `review`.
+    pub autonomy: Option<String>,
+    /// Forced on for `when = "issue_matched"`: one issue fires a rule once.
     pub once_per_key: bool,
     #[serde(default = "default_max_per_hour")]
     pub max_per_hour: u16,
@@ -155,6 +167,9 @@ impl Default for AutomationRuleConfig {
             then: AutomationActionConfig::default(),
             debounce_secs: default_debounce_secs(),
             idle_secs: None,
+            schedule: None,
+            every: None,
+            autonomy: None,
             once_per_key: false,
             max_per_hour: default_max_per_hour(),
             max_action_per_hour: default_max_per_hour(),
@@ -178,6 +193,14 @@ pub struct AutomationPredicateConfig {
     pub pr_checks_passed: Option<bool>,
     pub pr_review_requested: Option<bool>,
     pub pr_merged: Option<bool>,
+    /// Issue selectors: valid on any rule, but they only ever match
+    /// `issue_matched` events (any other event carries no issue).
+    pub account: Option<String>,
+    pub project: Option<String>,
+    pub label: Option<String>,
+    /// `"me"` = assigned to the tracker account's own user (provenance).
+    pub assignee: Option<String>,
+    pub status: Option<String>,
 }
 
 /// `cap` is the only action discriminator. Explicit optional fields keep the
@@ -193,6 +216,8 @@ pub struct AutomationActionConfig {
     pub body: Option<String>,
     pub urgency: Option<String>,
     pub name: Option<String>,
+    /// `pipeline.start`: the configured `[[pipeline.stages]]` name to start at.
+    pub stage: Option<String>,
 }
 
 impl AutomationActionConfig {
@@ -204,6 +229,7 @@ impl AutomationActionConfig {
             ("body", &self.body),
             ("urgency", &self.urgency),
             ("name", &self.name),
+            ("stage", &self.stage),
         ]
         .into_iter()
         .filter_map(|(name, value)| value.clone().map(|value| (name.to_string(), value)))
@@ -338,6 +364,51 @@ fn validate_rule(rule: &AutomationRuleConfig, key: &str, errors: &mut Vec<String
         )),
         _ => {}
     }
+    match (event, rule.schedule.as_deref(), rule.every.as_deref()) {
+        (_, Some(_), Some(_)) => errors.push(format!(
+            "{key}.schedule: schedule and every are mutually exclusive"
+        )),
+        (Some(AutomationEventKind::ScheduleDue), None, None) => errors.push(format!(
+            "{key}.schedule: schedule_due requires schedule (cron) or every (interval)"
+        )),
+        (Some(AutomationEventKind::ScheduleDue), cron, every) => {
+            if let Err(reason) = parse_schedule(cron, every) {
+                let field = if cron.is_some() { "schedule" } else { "every" };
+                errors.push(format!("{key}.{field}: {reason}"));
+            }
+        }
+        (_, Some(_), None) => errors.push(format!(
+            "{key}.schedule: valid only when when = \"schedule_due\""
+        )),
+        (_, None, Some(_)) => errors.push(format!(
+            "{key}.every: valid only when when = \"schedule_due\""
+        )),
+        (_, None, None) => {}
+    }
+    if rule.then.cap.trim() == "pipeline.start"
+        && event.is_some_and(|kind| kind != AutomationEventKind::IssueMatched)
+    {
+        errors.push(format!(
+            "{key}.then.cap: pipeline.start needs an issue; use when = \"issue_matched\""
+        ));
+    }
+    if let Some(declared) = rule.autonomy.as_deref() {
+        match Autonomy::parse(declared.trim()) {
+            None => errors.push(format!(
+                "{key}.autonomy: unknown autonomy {declared:?}; expected propose, review, or merge"
+            )),
+            Some(level) => {
+                if let Err(reason) = validate_autonomy(
+                    level,
+                    &compile_predicate(&rule.predicate),
+                    rule.then.cap.trim(),
+                    RuleOrigin::Config,
+                ) {
+                    errors.push(format!("{key}.autonomy: {reason}"));
+                }
+            }
+        }
+    }
     bounded(
         errors,
         &format!("{key}.max_per_hour"),
@@ -398,6 +469,11 @@ fn validate_predicate(predicate: &AutomationPredicateConfig, key: &str, errors: 
         ("agent_role", &predicate.agent_role),
         ("source_prefix", &predicate.source_prefix),
         ("session_id", &predicate.session_id),
+        ("account", &predicate.account),
+        ("project", &predicate.project),
+        ("label", &predicate.label),
+        ("assignee", &predicate.assignee),
+        ("status", &predicate.status),
     ] {
         if value
             .as_ref()
@@ -450,6 +526,9 @@ fn validate_action(action: &AutomationActionConfig, key: &str, errors: &mut Vec<
         "merge.add" => (&[], &[]),
         "notify.push" => (&["title", "body", "urgency"], &["body"]),
         "tools.run" => (&["name"], &["name"]),
+        "merge.drain" => (&[], &[]),
+        "pipeline.start" => (&["stage", "agent"], &[]),
+        "lead.wake" => (&["prompt"], &["prompt"]),
         _ => unreachable!("cap checked above"),
     };
     for name in params.keys() {
@@ -472,16 +551,23 @@ fn validate_action(action: &AutomationActionConfig, key: &str, errors: &mut Vec<
             ));
             continue;
         }
-        if matches!(
-            (cap, name.as_str()),
-            ("sessions.open", "agent") | ("tools.run", "name")
-        ) {
-            if !valid_configured_name(value) {
-                errors.push(format!(
-                    "{key}.then.{name}: must be one configured name (letters, digits, `.`, `_`, `-`)"
-                ));
+        let checked = match (cap, name.as_str()) {
+            ("sessions.open", "agent")
+            | ("tools.run", "name")
+            | ("pipeline.start", "stage" | "agent") => {
+                if valid_configured_name(value) {
+                    Ok(())
+                } else {
+                    Err("must be one configured name (letters, digits, `.`, `_`, `-`)".to_string())
+                }
             }
-        } else if let Err(error) = validate_template(value, EVENT_TEMPLATE_VARS, false) {
+            // The Lead's prompt may not splice untrusted event text.
+            ("lead.wake", _) => validate_template(value, LEAD_WAKE_TEMPLATE_VARS, false)
+                .map_err(|error| error.to_string()),
+            _ => validate_template(value, EVENT_TEMPLATE_VARS, false)
+                .map_err(|error| error.to_string()),
+        };
+        if let Err(error) = checked {
             errors.push(format!("{key}.then.{name}: {error}"));
         }
     }
@@ -504,43 +590,71 @@ fn valid_configured_name(value: &str) -> bool {
 }
 
 fn compile_rule(rule: &AutomationRuleConfig) -> AutomationRule {
+    let event =
+        AutomationEventKind::parse(rule.when.trim()).expect("compiled_rules validates event kinds");
+    let predicate = compile_predicate(&rule.predicate);
+    let cap = rule.then.cap.trim().to_string();
+    let declared = rule
+        .autonomy
+        .as_deref()
+        .and_then(|value| Autonomy::parse(value.trim()))
+        .unwrap_or_default();
+    let (autonomy, warning) = effective_autonomy(declared, &predicate, &cap, RuleOrigin::Config);
+    if let Some(warning) = warning {
+        tracing::warn!(
+            target: "thegn::automation",
+            rule = rule.name.trim(),
+            declared = declared.as_str(),
+            effective = autonomy.as_str(),
+            "{warning}"
+        );
+    }
     AutomationRule {
         id: rule.name.trim().to_string(),
         enabled: rule.enabled,
-        event: AutomationEventKind::parse(rule.when.trim())
-            .expect("compiled_rules validates event kinds"),
-        predicate: AutomationPredicate {
-            workspace: rule.predicate.workspace.clone(),
-            repo: rule.predicate.repo.clone(),
-            worktree: rule.predicate.worktree.clone(),
-            branch: rule.predicate.branch.clone(),
-            agent_role: rule.predicate.agent_role.clone(),
-            notification_kind: rule
-                .predicate
-                .notification_kind
-                .as_deref()
-                .and_then(|value| {
-                    NotificationKind::ALL
-                        .into_iter()
-                        .find(|kind| kind.as_str() == value)
-                }),
-            min_priority: rule.predicate.priority.as_deref().and_then(Priority::parse),
-            source_prefix: rule.predicate.source_prefix.clone(),
-            message_regex: rule.predicate.message_regex.clone(),
-            session_id: rule.predicate.session_id.clone(),
-            pr_checks_passed: rule.predicate.pr_checks_passed,
-            pr_review_requested: rule.predicate.pr_review_requested,
-            pr_merged: rule.predicate.pr_merged,
-        },
+        event,
+        predicate,
         action: ActionTemplate {
-            cap: rule.then.cap.trim().to_string(),
+            cap,
             params: rule.then.params(),
         },
         debounce_secs: rule.debounce_secs,
         idle_secs: rule.idle_secs,
-        once_per_key: rule.once_per_key,
+        // One issue fires a rule once: the event key is the issue identity.
+        once_per_key: rule.once_per_key || event == AutomationEventKind::IssueMatched,
         max_per_hour: rule.max_per_hour,
         max_action_per_hour: rule.max_action_per_hour,
+        schedule: parse_schedule(rule.schedule.as_deref(), rule.every.as_deref())
+            .ok()
+            .flatten(),
+        autonomy,
+    }
+}
+
+fn compile_predicate(predicate: &AutomationPredicateConfig) -> AutomationPredicate {
+    AutomationPredicate {
+        workspace: predicate.workspace.clone(),
+        repo: predicate.repo.clone(),
+        worktree: predicate.worktree.clone(),
+        branch: predicate.branch.clone(),
+        agent_role: predicate.agent_role.clone(),
+        notification_kind: predicate.notification_kind.as_deref().and_then(|value| {
+            NotificationKind::ALL
+                .into_iter()
+                .find(|kind| kind.as_str() == value)
+        }),
+        min_priority: predicate.priority.as_deref().and_then(Priority::parse),
+        source_prefix: predicate.source_prefix.clone(),
+        message_regex: predicate.message_regex.clone(),
+        session_id: predicate.session_id.clone(),
+        pr_checks_passed: predicate.pr_checks_passed,
+        pr_review_requested: predicate.pr_review_requested,
+        pr_merged: predicate.pr_merged,
+        account: predicate.account.clone(),
+        project: predicate.project.clone(),
+        label: predicate.label.clone(),
+        assignee: predicate.assignee.clone(),
+        status: predicate.status.clone(),
     }
 }
 
@@ -729,5 +843,234 @@ urgency = "alert"
         }
         // Detection never changes effective trusted rules.
         assert_eq!(cfg.effective_automations().rules[0].name, "blocked-coder");
+    }
+
+    fn rule_with(when: &str, then: AutomationActionConfig) -> AutomationsConfig {
+        let mut cfg = valid();
+        cfg.rules[0].when = when.into();
+        cfg.rules[0].predicate = AutomationPredicateConfig::default();
+        cfg.rules[0].then = then;
+        cfg
+    }
+
+    fn notify() -> AutomationActionConfig {
+        AutomationActionConfig {
+            cap: "notify.push".into(),
+            body: Some("{event_kind}".into()),
+            ..AutomationActionConfig::default()
+        }
+    }
+
+    #[test]
+    fn schedule_and_every_are_exclusive_and_required_only_for_schedule_due() {
+        let mut both = rule_with("schedule_due", notify());
+        both.rules[0].schedule = Some("0 9 * * *".into());
+        both.rules[0].every = Some("1h".into());
+        assert!(both.validate().join("\n").contains("mutually exclusive"));
+
+        let missing = rule_with("schedule_due", notify());
+        assert!(
+            missing
+                .validate()
+                .join("\n")
+                .contains("schedule_due requires schedule")
+        );
+
+        let mut stray = rule_with("agent_finished", notify());
+        stray.rules[0].schedule = Some("0 9 * * *".into());
+        assert!(
+            stray
+                .validate()
+                .join("\n")
+                .contains(".schedule: valid only when")
+        );
+        stray.rules[0].schedule = None;
+        stray.rules[0].every = Some("1h".into());
+        assert!(
+            stray
+                .validate()
+                .join("\n")
+                .contains(".every: valid only when")
+        );
+    }
+
+    #[test]
+    fn pipeline_start_requires_issue_matched_and_compiles_once_per_key() {
+        let start = AutomationActionConfig {
+            cap: "pipeline.start".into(),
+            stage: Some("code".into()),
+            agent: Some("codex".into()),
+            ..AutomationActionConfig::default()
+        };
+        let refused = rule_with("agent_finished", start.clone());
+        assert!(
+            refused
+                .validate()
+                .join("\n")
+                .contains("pipeline.start needs an issue; use when = \"issue_matched\"")
+        );
+        let ok = rule_with("issue_matched", start.clone());
+        let rules = ok.compiled_rules().unwrap();
+        assert_eq!(rules[0].event, AutomationEventKind::IssueMatched);
+        assert!(rules[0].once_per_key, "one issue fires a rule once");
+        assert_eq!(rules[0].action.params["stage"], "code");
+
+        let mut templated = start;
+        templated.stage = Some("{message}".into());
+        assert!(
+            rule_with("issue_matched", templated)
+                .validate()
+                .join("\n")
+                .contains("stage: must be one configured name")
+        );
+    }
+
+    #[test]
+    fn lead_wake_prompt_may_not_reference_message() {
+        let wake = |prompt: &str| AutomationActionConfig {
+            cap: "lead.wake".into(),
+            prompt: Some(prompt.into()),
+            ..AutomationActionConfig::default()
+        };
+        let refused = rule_with("issue_matched", wake("triage {message}"));
+        assert!(refused.validate().join("\n").contains("then.prompt"));
+        assert!(
+            rule_with("issue_matched", wake("triage {issue_id} in {account}"))
+                .validate()
+                .is_empty()
+        );
+        let empty = rule_with(
+            "issue_matched",
+            AutomationActionConfig {
+                cap: "lead.wake".into(),
+                ..AutomationActionConfig::default()
+            },
+        );
+        assert!(
+            empty
+                .validate()
+                .join("\n")
+                .contains("prompt: required for lead.wake")
+        );
+    }
+
+    #[test]
+    fn merge_drain_takes_no_params() {
+        let drain = AutomationActionConfig {
+            cap: "merge.drain".into(),
+            ..AutomationActionConfig::default()
+        };
+        assert!(
+            rule_with("merge_landed", drain.clone())
+                .validate()
+                .is_empty()
+        );
+        let mut extra = drain;
+        extra.name = Some("x".into());
+        assert!(
+            rule_with("merge_landed", extra)
+                .validate()
+                .join("\n")
+                .contains("name: not valid for merge.drain")
+        );
+    }
+
+    #[test]
+    fn autonomy_must_parse_and_defaults_to_review() {
+        let mut cfg = valid();
+        cfg.rules[0].autonomy = Some("yolo".into());
+        assert!(
+            cfg.validate()
+                .join("\n")
+                .contains("unknown autonomy \"yolo\"")
+        );
+        cfg.rules[0].autonomy = Some("propose".into());
+        assert_eq!(cfg.compiled_rules().unwrap()[0].autonomy, Autonomy::Propose);
+        cfg.rules[0].autonomy = None;
+        assert_eq!(cfg.compiled_rules().unwrap()[0].autonomy, Autonomy::Review);
+    }
+
+    #[test]
+    fn issue_selectors_compile_onto_the_predicate() {
+        let mut cfg = valid();
+        cfg.rules[0].predicate.account = Some("work".into());
+        cfg.rules[0].predicate.project = Some("p1".into());
+        cfg.rules[0].predicate.label = Some("bug".into());
+        cfg.rules[0].predicate.assignee = Some("me".into());
+        cfg.rules[0].predicate.status = Some("todo".into());
+        let rule = &cfg.compiled_rules().unwrap()[0];
+        assert_eq!(rule.predicate.account.as_deref(), Some("work"));
+        assert_eq!(rule.predicate.project.as_deref(), Some("p1"));
+        assert_eq!(rule.predicate.label.as_deref(), Some("bug"));
+        assert_eq!(rule.predicate.assignee.as_deref(), Some("me"));
+        assert_eq!(rule.predicate.status.as_deref(), Some("todo"));
+        cfg.rules[0].predicate.label = Some("x".repeat(MAX_NAME_LEN + 1));
+        assert!(
+            cfg.validate()
+                .join("\n")
+                .contains("if.label: must be at most")
+        );
+    }
+
+    #[test]
+    fn new_rule_keys_parse_from_toml_and_strict_validate() {
+        let body = r#"
+[automations]
+enabled = true
+
+[[automations.rules]]
+name = "triage"
+when = "issue_matched"
+autonomy = "propose"
+
+[automations.rules.if]
+account = "work"
+project = "p1"
+label = "bug"
+assignee = "me"
+status = "todo"
+
+[automations.rules.then]
+cap = "pipeline.start"
+stage = "code"
+"#;
+        let cfg: crate::config::Config = toml::from_str(body).unwrap();
+        let rule = &cfg.automations.rules[0];
+        assert_eq!(rule.autonomy.as_deref(), Some("propose"));
+        assert_eq!(rule.then.stage.as_deref(), Some("code"));
+        assert_eq!(rule.predicate.assignee.as_deref(), Some("me"));
+        let errors = crate::config_validate::validate_str(body);
+        assert!(errors.is_empty(), "{errors:#?}");
+    }
+
+    #[test]
+    fn committed_fixtures_parse_and_session_exited_matches_a_notify_rule() {
+        use crate::automation::{AutomationEvent, EvaluationDecision, EvaluationState, evaluate};
+        let root =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../test/fixtures/automation");
+        for name in ["session_exited.json", "inbox_item.json"] {
+            let raw = std::fs::read_to_string(root.join(name)).unwrap();
+            let event: AutomationEvent = serde_json::from_str(&raw).unwrap();
+            event.validate_required_facts().unwrap();
+        }
+        let raw = std::fs::read_to_string(root.join("session_exited.json")).unwrap();
+        let event: AutomationEvent = serde_json::from_str(&raw).unwrap();
+        assert_eq!(event.kind, AutomationEventKind::SessionExited);
+        let cfg = rule_with(
+            "session_exited",
+            AutomationActionConfig {
+                cap: "notify.push".into(),
+                body: Some("{session_id} exited {exit_code}".into()),
+                ..AutomationActionConfig::default()
+            },
+        );
+        let rules = cfg.compiled_rules().unwrap();
+        let decisions = evaluate(&rules, &event, &EvaluationState::new(), event.occurred_at);
+        match decisions.as_slice() {
+            [EvaluationDecision::Planned(action)] => {
+                assert_eq!(action.params["body"], "daemon-session-1 exited 0");
+            }
+            other => panic!("expected one plan, got {other:?}"),
+        }
     }
 }

@@ -1548,6 +1548,9 @@ async fn run(
     // a human ran `dispatch reap`. Slow timer, blocking work off the runtime.
     pipeline_reaper::spawn(svc.clone());
     crate::automation_runtime::subscribe_daemon_events(svc.events.subscribe(), cfg);
+    // `schedule_due` producer (THE-2193): spawns nothing unless an enabled
+    // rule has a schedule.
+    crate::automation_schedule::spawn(cfg);
     // Lead tool surface (THE-2172): hand the event sender to the opt-in Notice
     // feed so automation runs can publish without a service handle.
     lead_caps::feed::install_global(svc.events.clone());
@@ -1929,7 +1932,12 @@ async fn idle_exit_loop(
         // LIVE sessions only. Tombstones deliberately do not count: a daemon
         // holding nothing but corpses has no work left, and letting them keep
         // it alive would defeat idle-exit for the whole tombstone TTL.
-        let busy = !svc.sessions.lock().await.is_empty();
+        // An armed schedule producer is work too: without it the default
+        // `idle_exit_secs` would reap the daemon and silently stop cron rules.
+        let busy = daemon_busy(
+            svc.sessions.lock().await.len(),
+            crate::automation_schedule::armed(),
+        );
         if busy {
             idle_since = None;
             continue;
@@ -1943,9 +1951,22 @@ async fn idle_exit_loop(
     }
 }
 
+/// The idle-exit predicate: live sessions or an armed automation schedule.
+fn daemon_busy(sessions: usize, schedule_armed: bool) -> bool {
+    sessions > 0 || schedule_armed
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn an_armed_schedule_keeps_an_otherwise_idle_daemon_busy() {
+        assert!(!daemon_busy(0, false));
+        assert!(daemon_busy(0, true));
+        assert!(daemon_busy(2, false));
+        assert!(daemon_busy(1, true));
+    }
 
     #[tokio::test]
     async fn daemon_shutdown_token_latches_before_graceful_shutdown_is_built() {
