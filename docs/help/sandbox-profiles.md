@@ -2,7 +2,7 @@
 id: sandbox-profiles
 title: Worktree isolation profiles
 parent: sandboxing
-actions: [sandbox-profile]
+actions: [sandbox-profile, zone-assign]
 ---
 
 # Worktree isolation profiles
@@ -41,6 +41,31 @@ and workspace configuration, global `[sandbox] profile`, then the built-in
 standard default. A repository `.thegn.toml` can only tighten its profile; a
 worktree pin is user-owned and takes precedence. Zone floors can raise the
 effective profile for locally resolved launches.
+
+## Zones
+
+A zone groups workspaces under one egress ceiling, sandbox floor and credential
+sub-vault. Zones only tighten: egress is intersected down and the sandbox floor
+only rises. Create zones with `thegn zone create <name>`.
+
+The command palette action **Assign workspace to zone…** (`zone-assign`) lists
+the zones for the active repository workspace. The current zone is marked
+`current`, and `(none)` appears only when the workspace is already in a zone.
+The picker shows at most 20 zones; for the rest, use `thegn zone assign`.
+
+Joining a zone from no zone can only narrow, so the confirm reads "Zone `<z>`'s
+egress ceiling, sandbox floor and credential sub-vault apply to new panes" and
+defaults to **confirm**. Removing a workspace from its zone, or moving it to
+another zone, may widen what new panes get. That confirm names the zone whose
+ceilings are removed or replaced, and its cursor starts on **cancel**, so Enter
+alone changes nothing. Picking the zone the workspace is already in only shows
+`already in zone <z>`.
+
+The change applies to new panes; open panes keep their current limits until
+restarted. A zone deleted after the picker opened is refused with
+`zone <z> no longer exists`. The home directory and plain-folder workspaces
+cannot join a zone. The CLI equivalent is `thegn zone assign <zone> [<repo>]`,
+with `none` to unassign.
 
 Standalone terminal tabs and the global `[sandbox] profile` setting are not
 worktree-scoped. The pin is stored in local thegn state, so it is not a security
