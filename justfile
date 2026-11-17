@@ -1326,6 +1326,11 @@ live level="info" size_mb="20" files="5":
 live-plan level="info" size_mb="20" files="5":
     python3 -B scripts/live.py --plan --level "$1" --size-mb "$2" --files "$3"
 
+# Live Vercel Sandbox run (spends money; plan-only without flags). Not in ci/smoke.
+[positional-arguments]
+vercel-live *args:
+    bash test/vercel-live.sh "$@"
+
 # Private launcher regression tests; no Cargo or live-state mutation.
 test-live:
     python3 -B test/live_test.py
