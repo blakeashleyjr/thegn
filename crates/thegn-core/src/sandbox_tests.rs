@@ -7128,6 +7128,7 @@ fn default_spec_is_inert() {
     assert!(!spec.daemon_persistent);
     assert!(spec.seal_home.is_none());
     assert!(spec.volume_owners.is_empty());
+    assert!(spec.egress.is_none(), "no egress plan until WS04-P2-08");
 }
 
 /// Every `SandboxSpec { … }` struct-literal body in `src` (function

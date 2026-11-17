@@ -572,6 +572,10 @@ pub struct SandboxSpec {
     pub seal_home: Option<String>,
     /// Named volumes bound to a devcontainer owner id; empty for every non-devcontainer launch.
     pub volume_owners: Vec<(String, String)>,
+    /// The launch's egress plan: the ONLY egress field on the spec (B11).
+    /// Added by WS00-P1-03 and always `None` until WS04-P2-08 sets it (and
+    /// fingerprints it, policy fingerprint v3, when it first does).
+    pub egress: Option<crate::egress::plan::EgressPlan>,
 }
 
 /// An inert spec for tests and struct-update syntax (WS00-P1-02; the spec's
@@ -621,6 +625,7 @@ impl Default for SandboxSpec {
             daemon_persistent: false,
             seal_home: None,
             volume_owners: Vec::new(),
+            egress: None,
         }
     }
 }
@@ -2476,6 +2481,8 @@ fn resolve_placed_with(
         // (the host's launch-spec builder) flips it on for daemon-backed panes.
         daemon_persistent: false,
         seal_home,
+        // WS00-P1-03 stub: no egress plan until WS04-P2-08 resolves one.
+        egress: None,
     })
 }
 
