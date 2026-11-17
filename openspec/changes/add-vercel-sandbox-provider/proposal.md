@@ -1,6 +1,6 @@
 # Add a Vercel Sandbox provider
 
-## Summary
+## Why
 
 Register `provider = "vercel"` as a remote sandbox kind. It follows the sprites
 shape (HTTP control plane, a thegn self-bridge for exec, no vendor CLI) with
@@ -11,7 +11,7 @@ Credentials never enter the VM: the repo goes in as a host-built git bundle,
 no git token is forwarded, and the agent-config, dotfiles, atuin and
 home-closure steps are stripped. Results come back through `thegn env pull`.
 
-## Approach
+## What Changes
 
 - A session has a hard timeout, so only a live `vercel-exec` bridge extends it.
   Nothing at idle, in the UI loop, or on a timer elsewhere.
@@ -22,5 +22,6 @@ home-closure steps are stripped. Results come back through `thegn env pull`.
 
 ## Impact
 
+- **Roadmap**: J (Remote access), new item 763 (highest existing item in tasks.md is 760; the release lane appends it). THE-2223 is the Linear issue.
 - THE-2223 (register the kind and spine stubs) and the batch 154 lanes.
 - Affected specs: `sandbox` (remote providers).

@@ -30,22 +30,37 @@ size = "2"
 
 - Terminal panes (an interactive PTY) and headless agent lanes.
 - The repo is copied in as a git bundle. Nothing is cloned inside the VM.
-- A stopped sandbox keeps its filesystem and resumes when you open a pane.
+- A stopped sandbox keeps its filesystem and resumes when you open a pane (resume behaviour is unverified).
 
 ## What does not
 
 - SSH, mosh and `connect = "ssh"`.
 - `host_cache` and reverse tunnels.
 - Checkpoints.
-- Model credentials: API keys, agent configs, dotfiles and git tokens are never
-  sent to the VM, so a model-backed agent has no key there.
+- Credentials: API keys, agent configs, dotfiles and git tokens are never sent
+  to the VM. No credential of any kind is sent into the sandbox, so a
+  model-backed agent cannot log in there yet; only scripted or non-model work
+  runs until the owner decides how to supply a model credential.
 
 If the interactive PTY is refused, panes fall back to a stream mode without
 resize or full-screen programs.
 
+## What a live run needs
+
+- A Vercel access token scoped to the team, kept as a keyring or 0600 file
+  SecretRef, never in config.
+- The team id.
+- The project id. Sandboxes bill to it; Hobby caps sessions at 45 minutes and
+  4 vCPU, so Pro is preferred.
+- An explicit spend authorization.
+
+## Unverified
+
+Not yet checked on a live account: whether the interactive PTY WebSocket works as implemented (hence the stream fallback), the sandbox-name and tag charsets, upload and output size limits, 429 behaviour, whether deleting a sandbox also removes its snapshots, whether Nix works in the image, and the token scopes required. The kind is experimental (`thegn doctor` says so).
+
 ## Cost
 
-Vercel bills usage. A stopped sandbox costs no compute. A session is created
+Vercel bills usage. A stopped sandbox costs no compute or memory, but its snapshot storage still bills (thegn does not estimate that or data transfer). A session is created
 with a 30 minute timeout and is extended only while a thegn bridge is running,
 never at idle. Cost shown in thegn is an upper-bound estimate.
 

@@ -40,4 +40,8 @@ the session and marks the ledger record `expired`; it deletes at ceiling plus
 ## Out of scope
 
 Checkpoints, snapshot storage cost, the Hosts panel, and a model credential for
-headless agents (owner decision queued).
+headless agents (owner decision queued). No model credential is sent, so headless model agents cannot log in.
+
+## Unverified
+
+Not yet checked on a live account: the interactive PTY WebSocket, the sandbox-name and tag charsets, upload and output size limits, 429 behaviour, whether deleting a sandbox removes its snapshots, whether Nix works in the image, and the token scopes required.
