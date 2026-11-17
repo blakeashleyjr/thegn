@@ -1293,7 +1293,7 @@ pub(crate) fn run_command_bounded(
     }
     #[cfg(not(unix))]
     {
-        let _ = (cmd, timeout_secs, cancel);
+        let (_cmd, _timeout_secs, _cancel) = (cmd, timeout_secs, cancel);
         Err(headless_unsupported().unwrap_or_else(|| "unsupported on this platform".into()))
     }
 }
