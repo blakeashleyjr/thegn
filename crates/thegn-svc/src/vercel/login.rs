@@ -418,7 +418,9 @@ async fn remove_login_with(ops: &dyn LoginOps, name: &str, handle: &LoginHandle)
 
 impl VercelProvider {
     /// Narrow egress, then upload `payloads` into a fresh tmpfs login dir.
-    /// Never resumes: a stopped sandbox is an error.
+    /// Never resumes: a stopped sandbox is an error. Refused unless this
+    /// provider was built from an env whose `model_credentials` is `upload`
+    /// (the bridge's own mode check is not the only gate).
     pub async fn ensure_login(
         &self,
         name: &str,
@@ -426,6 +428,10 @@ impl VercelProvider {
         egress_user_domains: &[String],
         install_agents: bool,
     ) -> Result<LoginHandle> {
+        ensure!(
+            self.spec.model_credentials == thegn_core::config::ModelCredentials::Upload,
+            "vercel: this env's model_credentials is not \"upload\"; no login is sent"
+        );
         let nonce = random_nonce()?;
         ensure_login_with(
             self,

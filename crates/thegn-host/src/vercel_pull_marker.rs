@@ -56,7 +56,6 @@ fn is_marked_in(anchor: &Path, sandbox: &str) -> bool {
 }
 
 /// Record that `sandbox` may hold commits not yet pulled back.
-#[allow(dead_code)] // called by the vercel-exec bridge (lane 4)
 pub(crate) fn mark(sandbox: &str) {
     if let Err(error) = mark_in(&thegn_core::util::xdg_state_home(), sandbox) {
         tracing::debug!(target: "thegn::vercel", %error, "pull marker write failed");

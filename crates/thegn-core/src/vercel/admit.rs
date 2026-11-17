@@ -57,8 +57,8 @@ pub fn valid_host_suffix(s: &str) -> bool {
             .is_some_and(|tld| tld.as_bytes().first().is_some_and(u8::is_ascii_lowercase))
 }
 
-/// `s` is `vercel.app` or a name under it.
-fn under_untrusted_suffix(s: &str) -> bool {
+/// `s` (lowercase, no trailing dot) is `vercel.app` or a name under it.
+pub(crate) fn under_untrusted_suffix(s: &str) -> bool {
     s == UNTRUSTED_SUFFIX
         || s.strip_suffix(UNTRUSTED_SUFFIX)
             .is_some_and(|rest| rest.ends_with('.'))
