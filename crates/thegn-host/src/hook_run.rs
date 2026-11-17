@@ -420,51 +420,29 @@ fn prune_logs_with(
     max_age_secs: u64,
     max_total_bytes: u64,
 ) {
-    let mut emptied_candidates = std::collections::HashSet::new();
-    let Ok(root_meta) = std::fs::symlink_metadata(root) else {
-        return;
+    // Every operation below is relative to a held directory handle: the root
+    // is opened without following a leaf symlink, each slug is opened
+    // `O_NOFOLLOW` beneath it, and unlinks are `unlinkat` on the pinned slug.
+    // A slug swapped for a symlink is skipped, never followed.
+    let root = match thegn_core::fsperm::open_private_dir(root) {
+        Ok(root) => root,
+        Err(error) => {
+            tracing::debug!(%error, "hook log root absent or not private; skipping prune");
+            return;
+        }
     };
-    if !root_meta.is_dir() || root_meta.file_type().is_symlink() {
-        return;
-    }
-    let Ok(slugs) = std::fs::read_dir(root) else {
-        return;
-    };
-    for slug in slugs.flatten() {
-        let path = slug.path();
-        let Ok(meta) = std::fs::symlink_metadata(&path) else {
+    let mut emptied_candidates = std::collections::BTreeSet::new();
+    for slug in slug_names(&root) {
+        let Some(slug_dir) = open_slug_dir(&root, &slug) else {
             continue;
         };
-        if !meta.is_dir() || meta.file_type().is_symlink() {
-            continue;
-        }
-        let Ok(entries) = std::fs::read_dir(&path) else {
-            continue;
-        };
-        let mut logs = Vec::new();
-        for entry in entries.flatten() {
-            let file_path = entry.path();
-            let Ok(file_meta) = std::fs::symlink_metadata(&file_path) else {
-                continue;
-            };
-            if !file_meta.is_file()
-                || file_meta.file_type().is_symlink()
-                || file_path.extension().is_none_or(|ext| ext != "log")
-            {
-                continue;
-            }
-            let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
-                continue;
-            };
-            let mtime_secs = match file_meta.modified() {
-                Ok(time) => match time.duration_since(std::time::UNIX_EPOCH) {
-                    Ok(age) => age.as_secs(),
-                    Err(_) => 0,
-                },
-                Err(_) => 0,
-            };
-            logs.push(thegn_core::disk_reclaim::HookLog { name, mtime_secs });
-        }
+        let logs = list_prunable_logs(&slug_dir)
+            .into_iter()
+            .map(|log| thegn_core::disk_reclaim::HookLog {
+                name: log.name,
+                mtime_secs: log.mtime_secs,
+            })
+            .collect::<Vec<_>>();
         let remove = thegn_core::disk_reclaim::plan_hook_log_prune(
             &logs,
             keep_newest,
@@ -472,11 +450,11 @@ fn prune_logs_with(
             now_secs.max(0) as u64,
         );
         for name in remove {
-            let file_path = path.join(name);
-            match std::fs::remove_file(&file_path) {
-                Ok(()) => {
-                    emptied_candidates.insert(path.clone());
+            match slug_dir.remove_file(&name) {
+                Ok(true) => {
+                    emptied_candidates.insert(slug.clone());
                 }
+                Ok(false) => {}
                 Err(error) => {
                     tracing::debug!(%error, "could not remove expired hook log");
                 }
@@ -484,99 +462,152 @@ fn prune_logs_with(
         }
     }
 
-    let retained = collect_direct_logs(root);
-    for path in plan_total_byte_prune(&retained, max_total_bytes) {
-        match std::fs::remove_file(&path) {
-            Ok(()) => {
-                if let Some(parent) = path.parent() {
-                    emptied_candidates.insert(parent.to_path_buf());
+    let retained = collect_direct_logs(&root);
+    // Group by slug so each slug is re-opened once through the root handle
+    // (never by a joined path) and its fd is closed before the next.
+    let mut over_cap = std::collections::BTreeMap::<String, Vec<String>>::new();
+    for (slug, name) in plan_total_byte_prune(&retained, max_total_bytes) {
+        over_cap.entry(slug).or_default().push(name);
+    }
+    for (slug, names) in over_cap {
+        let Some(slug_dir) = open_slug_dir(&root, &slug) else {
+            continue;
+        };
+        for name in names {
+            match slug_dir.remove_file(&name) {
+                Ok(true) => {
+                    emptied_candidates.insert(slug.clone());
                 }
-            }
-            Err(error) => {
-                tracing::debug!(%error, path = %path.display(), "could not remove hook log over total byte cap");
+                Ok(false) => {}
+                Err(error) => {
+                    tracing::debug!(%error, %slug, %name, "could not remove hook log over total byte cap");
+                }
             }
         }
     }
 
-    for path in emptied_candidates {
-        let Ok(meta) = std::fs::symlink_metadata(&path) else {
-            continue;
-        };
-        if !meta.is_dir() || meta.file_type().is_symlink() {
-            continue;
-        }
-        let is_empty = match std::fs::read_dir(&path) {
-            Ok(mut entries) => entries.next().is_none(),
-            Err(error) => {
-                tracing::debug!(%error, path = %path.display(), "could not inspect hook log directory");
-                continue;
-            }
-        };
-        if is_empty && let Err(error) = std::fs::remove_dir(&path) {
-            tracing::debug!(%error, path = %path.display(), "could not remove empty hook log directory");
+    for slug in emptied_candidates {
+        // `unlinkat(AT_REMOVEDIR)` only removes an empty directory and never
+        // follows a symlink; a non-empty slug reports false.
+        if let Err(error) = root.remove_empty_child_dir(&slug) {
+            tracing::debug!(%error, %slug, "could not remove empty hook log directory");
         }
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct RetainedHookLog {
-    path: PathBuf,
-    slug: std::ffi::OsString,
-    name: std::ffi::OsString,
+/// Open one slug directory beneath the pinned root. Missing, symlinked,
+/// non-directory or non-private slugs are skipped.
+fn open_slug_dir(
+    root: &thegn_core::fsperm::PrivateDir,
+    slug: &str,
+) -> Option<thegn_core::fsperm::PrivateDir> {
+    match root.open_child_nofollow(slug) {
+        Ok(slug_dir) => slug_dir,
+        Err(error) => {
+            tracing::debug!(%error, %slug, "skipping hook log directory");
+            None
+        }
+    }
+}
+
+/// UTF-8 entry names directly beneath the pinned root. Each is opened
+/// separately with [`open_slug_dir`], so only one slug fd is held at a time.
+fn slug_names(root: &thegn_core::fsperm::PrivateDir) -> Vec<String> {
+    match root.file_names() {
+        Ok(names) => names
+            .into_iter()
+            .filter_map(|name| name.into_string().ok())
+            .collect(),
+        Err(error) => {
+            tracing::debug!(%error, "could not list hook log root");
+            Vec::new()
+        }
+    }
+}
+
+/// One prunable log entry read through a pinned slug handle.
+struct PrunableLog {
+    name: String,
     mtime_secs: u64,
     bytes: u64,
 }
 
-fn collect_direct_logs(root: &Path) -> Vec<RetainedHookLog> {
-    let mut logs = Vec::new();
-    let Ok(slugs) = std::fs::read_dir(root) else {
-        return logs;
+/// Direct `.log` children of a pinned slug directory that are regular files
+/// with a single link. Symlinks, directories, special files and hard-linked
+/// files (another name elsewhere would keep the bytes alive) are skipped.
+fn list_prunable_logs(slug_dir: &thegn_core::fsperm::PrivateDir) -> Vec<PrunableLog> {
+    let names = match slug_dir.file_names() {
+        Ok(names) => names,
+        Err(error) => {
+            tracing::debug!(%error, "could not list hook log directory");
+            return Vec::new();
+        }
     };
-    for slug_entry in slugs.flatten() {
-        let slug_path = slug_entry.path();
-        let Ok(slug_meta) = std::fs::symlink_metadata(&slug_path) else {
+    let mut logs = Vec::new();
+    for name in names {
+        let Ok(name) = name.into_string() else {
             continue;
         };
-        if !slug_meta.is_dir() || slug_meta.file_type().is_symlink() {
+        if Path::new(&name).extension().is_none_or(|ext| ext != "log") {
             continue;
         }
-        let Ok(entries) = std::fs::read_dir(&slug_path) else {
+        let meta = match slug_dir.metadata_nofollow(&name) {
+            Ok(Some(meta)) => meta,
+            Ok(None) => continue,
+            Err(error) => {
+                tracing::debug!(%error, "could not stat hook log");
+                continue;
+            }
+        };
+        if !meta.is_file()
+            || meta.file_type().is_symlink()
+            || thegn_core::fsperm::extra_hard_links(&meta) > 0
+        {
+            continue;
+        }
+        let mtime_secs = meta
+            .modified()
+            .ok()
+            .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
+            .map_or(0, |age| age.as_secs());
+        logs.push(PrunableLog {
+            name,
+            mtime_secs,
+            bytes: meta.len(),
+        });
+    }
+    logs
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct RetainedHookLog {
+    slug: String,
+    name: String,
+    mtime_secs: u64,
+    bytes: u64,
+}
+
+fn collect_direct_logs(root: &thegn_core::fsperm::PrivateDir) -> Vec<RetainedHookLog> {
+    let mut logs = Vec::new();
+    for slug in slug_names(root) {
+        let Some(slug_dir) = open_slug_dir(root, &slug) else {
             continue;
         };
-        for entry in entries.flatten() {
-            let path = entry.path();
-            if path.extension().is_none_or(|ext| ext != "log") {
-                continue;
-            }
-            let Ok(meta) = std::fs::symlink_metadata(&path) else {
-                continue;
-            };
-            if !meta.is_file() || meta.file_type().is_symlink() {
-                continue;
-            }
-            let (Some(slug), Some(name)) = (slug_path.file_name(), path.file_name()) else {
-                continue;
-            };
-            let slug = slug.to_owned();
-            let name = name.to_owned();
-            let mtime_secs = meta
-                .modified()
-                .ok()
-                .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
-                .map_or(0, |age| age.as_secs());
+        for log in list_prunable_logs(&slug_dir) {
             logs.push(RetainedHookLog {
-                path,
-                slug,
-                name,
-                mtime_secs,
-                bytes: meta.len(),
+                slug: slug.clone(),
+                name: log.name,
+                mtime_secs: log.mtime_secs,
+                bytes: log.bytes,
             });
         }
     }
     logs
 }
 
-fn plan_total_byte_prune(logs: &[RetainedHookLog], max_total_bytes: u64) -> Vec<PathBuf> {
+/// Oldest-first `(slug, name)` pairs to remove until the retained total fits
+/// `max_total_bytes`. Pure: the caller unlinks through the pinned root.
+fn plan_total_byte_prune(logs: &[RetainedHookLog], max_total_bytes: u64) -> Vec<(String, String)> {
     let mut oldest_first = logs.to_vec();
     oldest_first.sort_by(|a, b| {
         a.mtime_secs
@@ -593,7 +624,7 @@ fn plan_total_byte_prune(logs: &[RetainedHookLog], max_total_bytes: u64) -> Vec<
             break;
         }
         total_bytes = total_bytes.saturating_sub(u128::from(log.bytes));
-        remove.push(log.path);
+        remove.push((log.slug, log.name));
     }
     remove
 }
@@ -1146,7 +1177,7 @@ mod tests {
     #[test]
     fn prune_logs_limits_direct_regular_log_files_without_following_links() {
         let dir = tempfile::tempdir().unwrap();
-        let slug = dir.path().join("worktree-hash");
+        let slug = private_slug(dir.path(), "worktree-hash");
         std::fs::create_dir_all(slug.join("nested")).unwrap();
         for index in 0..21 {
             std::fs::write(slug.join(format!("post_create-{index}.log")), b"log").unwrap();
@@ -1173,10 +1204,8 @@ mod tests {
     #[test]
     fn prune_logs_applies_total_byte_cap_oldest_first_across_slug_directories() {
         let dir = tempfile::tempdir().unwrap();
-        let alpha = dir.path().join("alpha");
-        let beta = dir.path().join("beta");
-        std::fs::create_dir_all(&alpha).unwrap();
-        std::fs::create_dir_all(&beta).unwrap();
+        let alpha = private_slug(dir.path(), "alpha");
+        let beta = private_slug(dir.path(), "beta");
         let logs = [
             (alpha.join("a.log"), 100),
             (beta.join("b.log"), 101),
@@ -1205,20 +1234,16 @@ mod tests {
                 path.display()
             );
         }
-        let total_bytes: u64 = collect_direct_logs(dir.path())
-            .iter()
-            .map(|log| log.bytes)
-            .sum();
+        let root = thegn_core::fsperm::open_private_dir(dir.path()).unwrap();
+        let total_bytes: u64 = collect_direct_logs(&root).iter().map(|log| log.bytes).sum();
         assert!(total_bytes <= 35);
     }
 
     #[test]
     fn prune_logs_removes_only_slug_directories_emptied_by_this_pass() {
         let dir = tempfile::tempdir().unwrap();
-        let emptied = dir.path().join("emptied");
-        let already_empty = dir.path().join("already-empty");
-        std::fs::create_dir_all(&emptied).unwrap();
-        std::fs::create_dir_all(&already_empty).unwrap();
+        let emptied = private_slug(dir.path(), "emptied");
+        let already_empty = private_slug(dir.path(), "already-empty");
         std::fs::write(emptied.join("old.log"), b"log").unwrap();
 
         prune_logs_with(dir.path(), 200, 20, 14 * 86_400, 0);
@@ -1229,34 +1254,141 @@ mod tests {
 
     #[test]
     fn total_byte_prune_breaks_mtime_ties_by_slug_then_name() {
+        let log = |slug: &str, name: &str| RetainedHookLog {
+            slug: slug.into(),
+            name: name.into(),
+            mtime_secs: 10,
+            bytes: 10,
+        };
         let logs = vec![
-            RetainedHookLog {
-                path: PathBuf::from("beta/z.log"),
-                slug: "beta".into(),
-                name: "z.log".into(),
-                mtime_secs: 10,
-                bytes: 10,
-            },
-            RetainedHookLog {
-                path: PathBuf::from("alpha/b.log"),
-                slug: "alpha".into(),
-                name: "b.log".into(),
-                mtime_secs: 10,
-                bytes: 10,
-            },
-            RetainedHookLog {
-                path: PathBuf::from("alpha/a.log"),
-                slug: "alpha".into(),
-                name: "a.log".into(),
-                mtime_secs: 10,
-                bytes: 10,
-            },
+            log("beta", "z.log"),
+            log("alpha", "b.log"),
+            log("alpha", "a.log"),
         ];
 
         assert_eq!(
             plan_total_byte_prune(&logs, 20),
-            vec![PathBuf::from("alpha/a.log")]
+            vec![("alpha".to_string(), "a.log".to_string())]
         );
+    }
+
+    /// A slug directory with owner-only mode, independent of the umask.
+    fn private_slug(root: &Path, name: &str) -> PathBuf {
+        let slug = root.join(name);
+        thegn_core::fsperm::ensure_private_dir(&slug).unwrap();
+        slug
+    }
+
+    fn set_mtime(path: &Path, secs: u64) {
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(path)
+            .unwrap()
+            .set_modified(std::time::UNIX_EPOCH + Duration::from_secs(secs))
+            .unwrap();
+    }
+
+    #[test]
+    fn prune_logs_does_not_follow_a_slug_swapped_for_a_symlink() {
+        let base = tempfile::tempdir().unwrap();
+        let root = private_slug(base.path(), "hooks");
+        let victim = private_slug(base.path(), "victim");
+        std::fs::write(victim.join("x.log"), b"victim bytes").unwrap();
+        set_mtime(&victim.join("x.log"), 1);
+        let link = root.join("swapped-slug");
+        if let Err(error) = thegn_core::fsperm::create_symlink(&victim, &link, true) {
+            tracing::debug!(%error, "skipping hook log prune symlink test");
+            return;
+        }
+
+        // Age cap and a zero total-byte cap both target `x.log` if followed.
+        prune_logs_with(&root, 1_000_000, 0, 1, 0);
+
+        assert_eq!(
+            std::fs::read(victim.join("x.log")).unwrap(),
+            b"victim bytes"
+        );
+        assert!(
+            std::fs::symlink_metadata(&link)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+    }
+
+    #[test]
+    fn prune_logs_is_a_no_op_when_the_root_is_a_symlink() {
+        let base = tempfile::tempdir().unwrap();
+        let real = private_slug(base.path(), "real");
+        let slug = private_slug(&real, "slug");
+        std::fs::write(slug.join("old.log"), b"old").unwrap();
+        set_mtime(&slug.join("old.log"), 1);
+        let link = base.path().join("hooks");
+        if let Err(error) = thegn_core::fsperm::create_symlink(&real, &link, true) {
+            tracing::debug!(%error, "skipping hook log prune root symlink test");
+            return;
+        }
+
+        prune_logs_with(&link, 1_000_000, 0, 1, 0);
+
+        assert!(slug.join("old.log").exists());
+        assert!(slug.is_dir());
+    }
+
+    #[test]
+    fn prune_logs_is_a_no_op_when_the_root_is_absent() {
+        let base = tempfile::tempdir().unwrap();
+        let root = base.path().join("missing");
+        prune_logs_with(&root, 1_000_000, 0, 1, 0);
+        assert!(!root.exists());
+    }
+
+    #[test]
+    fn prune_logs_never_removes_a_slug_that_still_has_entries() {
+        let dir = tempfile::tempdir().unwrap();
+        let slug = private_slug(dir.path(), "busy");
+        std::fs::write(slug.join("old.log"), b"old").unwrap();
+        set_mtime(&slug.join("old.log"), 1);
+        std::fs::write(slug.join("notes.txt"), b"keep").unwrap();
+
+        prune_logs_with(dir.path(), 1_000_000, 0, 1, 0);
+
+        assert!(!slug.join("old.log").exists());
+        assert!(slug.join("notes.txt").exists());
+        assert!(slug.is_dir());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn prune_logs_skips_hard_linked_logs() {
+        let dir = tempfile::tempdir().unwrap();
+        let slug = private_slug(dir.path(), "linked");
+        std::fs::write(slug.join("old.log"), b"shared").unwrap();
+        set_mtime(&slug.join("old.log"), 1);
+        let outside = tempfile::tempdir().unwrap();
+        std::fs::hard_link(slug.join("old.log"), outside.path().join("other")).unwrap();
+        std::fs::write(slug.join("single.log"), b"single").unwrap();
+        set_mtime(&slug.join("single.log"), 1);
+
+        prune_logs_with(dir.path(), 1_000_000, 0, 1, 0);
+
+        assert!(slug.join("old.log").exists());
+        assert!(!slug.join("single.log").exists());
+        assert!(slug.is_dir());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn prune_logs_skips_a_group_writable_slug() {
+        let dir = tempfile::tempdir().unwrap();
+        let slug = private_slug(dir.path(), "loose");
+        std::fs::write(slug.join("old.log"), b"old").unwrap();
+        set_mtime(&slug.join("old.log"), 1);
+        thegn_core::fsperm::set_mode_for_test(&slug, 0o777).unwrap();
+
+        prune_logs_with(dir.path(), 1_000_000, 0, 1, 0);
+
+        assert!(slug.join("old.log").exists());
     }
 
     #[test]
