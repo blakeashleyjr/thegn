@@ -22,6 +22,11 @@ actions: [pr-open, pr-create]
    is available; PR review shows the PR head diff, inline threads, outdated
    feedback, and top-level comments. Stale, loading, unsupported, and absent
    snapshots are labeled rather than attached to local lines.
+   In the modal's internal view, `/` searches: in the file list it matches file
+   paths, in an open file it matches diff lines (case-insensitive). `Enter`
+   commits and jumps to the first match, then `n`/`N` step to the next and
+   previous match with wrap; `Esc` clears the search before it collapses the
+   file. The structural view has no rows to search; press `t` first.
 4. Act from the panel's _pr_ section: `A` re-reads the PR before approving the
    head the panel shows, and GitHub records the approval against that head
    commit so a later push cannot receive it; if the PR moved since, nothing is
