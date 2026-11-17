@@ -9,7 +9,7 @@ fn dispatches_here(msg: &crate::panel::gitui::GitMsg, width: crate::layout::Pane
         || (width == crate::layout::PanelWidth::Normal
             && matches!(
                 msg,
-                GitMsg::StageToggleFile | GitMsg::Commit | GitMsg::DiscardFile
+                GitMsg::StageToggleFile | GitMsg::Commit | GitMsg::DiscardFile | GitMsg::CopySha
             ))
 }
 
