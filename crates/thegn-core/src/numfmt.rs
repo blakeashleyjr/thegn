@@ -137,29 +137,46 @@ impl NumFmt {
     }
 
     pub fn reading(&self, reading: Reading, unit: Unit, width: usize) -> String {
+        let mut out = String::new();
+        self.reading_into(&mut out, reading, unit, width);
+        out
+    }
+
+    /// [`NumFmt::fmt`] appending to a caller-provided scratch string.
+    pub fn fmt_into(&self, out: &mut String, value: f64, unit: Unit, width: usize) {
+        self.reading_into(out, Reading::Value(value), unit, width);
+    }
+
+    /// [`NumFmt::reading`] appending to a caller-provided scratch string, so
+    /// paint paths reuse one buffer instead of allocating the padded result.
+    /// Output is byte-identical to `reading`.
+    pub fn reading_into(&self, out: &mut String, reading: Reading, unit: Unit, width: usize) {
         if width == 0 {
-            return String::new();
+            return;
         }
         match reading {
-            Reading::Value(value) if !value.is_finite() => fit_mark(self.marks.unknown, width),
+            Reading::Value(value) if !value.is_finite() => {
+                push_fit_mark(out, self.marks.unknown, width);
+            }
             Reading::Value(value) if value.abs() < f64::MIN_POSITIVE => match self.zero {
-                ZeroStyle::Digit => fit(self.zero_value(unit), width),
-                ZeroStyle::Dot => fit_mark(self.marks.zero, width),
-                ZeroStyle::Blank => " ".repeat(width),
+                ZeroStyle::Digit => push_fit(out, self.zero_value(unit), width),
+                ZeroStyle::Dot => push_fit_mark(out, self.marks.zero, width),
+                ZeroStyle::Blank => push_spaces(out, width),
             },
             Reading::Value(value)
                 if matches!(unit, Unit::Duration | Unit::Age | Unit::TimePlus) && value < 0.0 =>
             {
-                fit_mark(self.marks.unknown, width)
+                push_fit_mark(out, self.marks.unknown, width);
             }
-            Reading::Value(value) => fit(
+            Reading::Value(value) => push_fit(
+                out,
                 &nonzero_or_overflow(self.format_value(value, unit, width), unit, width),
                 width,
             ),
-            Reading::Unknown => fit_mark(self.marks.unknown, width),
-            Reading::Warming => fit_mark(self.marks.warming, width),
-            Reading::Denied => fit_mark(self.marks.denied, width),
-            Reading::NotApplicable => " ".repeat(width),
+            Reading::Unknown => push_fit_mark(out, self.marks.unknown, width),
+            Reading::Warming => push_fit_mark(out, self.marks.warming, width),
+            Reading::Denied => push_fit_mark(out, self.marks.denied, width),
+            Reading::NotApplicable => push_spaces(out, width),
         }
     }
 
@@ -224,10 +241,41 @@ pub fn fmt(value: f64, unit: Unit, width: usize) -> String {
     NumFmt::default().fmt(value, unit, width)
 }
 
+fn push_spaces(out: &mut String, n: usize) {
+    out.extend(std::iter::repeat_n(' ', n));
+}
+
+/// Allocation-free twin of [`fit`].
+fn push_fit(out: &mut String, candidate: &str, width: usize) {
+    let used = cells(candidate);
+    if used > width {
+        out.extend(std::iter::repeat_n('#', width));
+        return;
+    }
+    push_spaces(out, width - used);
+    out.push_str(candidate);
+}
+
+/// Allocation-free twin of [`fit_mark`].
+fn push_fit_mark(out: &mut String, mark: &str, width: usize) {
+    let mut end = 0;
+    for (index, c) in mark.char_indices() {
+        let next_end = index + c.len_utf8();
+        if cells(&mark[..next_end]) > width {
+            break;
+        }
+        end = next_end;
+    }
+    let clipped = &mark[..end];
+    push_spaces(out, width - cells(clipped));
+    out.push_str(clipped);
+}
+
 fn cells(s: &str) -> usize {
     UnicodeWidthStr::width(s)
 }
 
+#[cfg(test)]
 fn fit(candidate: &str, width: usize) -> String {
     let used = cells(candidate);
     if used > width {
@@ -237,6 +285,7 @@ fn fit(candidate: &str, width: usize) -> String {
 }
 
 /// `pad` spaces followed by `text`, in one allocation.
+#[cfg(test)]
 fn pad_left(text: &str, pad: usize) -> String {
     let mut out = String::with_capacity(pad + text.len());
     for _ in 0..pad {
@@ -246,6 +295,7 @@ fn pad_left(text: &str, pad: usize) -> String {
     out
 }
 
+#[cfg(test)]
 fn fit_mark(mark: &str, width: usize) -> String {
     let mut end = 0;
     for (index, c) in mark.char_indices() {
@@ -934,6 +984,45 @@ mod tests {
                 .collect();
             values.extend(negatives);
             values
+        }
+
+        #[test]
+        fn reading_into_matches_reading_and_appends() {
+            let readings = [
+                Reading::Value(0.0),
+                Reading::Value(0.4),
+                Reading::Value(1234.5),
+                Reading::Value(-7.0),
+                Reading::Value(f64::NAN),
+                Reading::Value(9.9e12),
+                Reading::Unknown,
+                Reading::Warming,
+                Reading::Denied,
+                Reading::NotApplicable,
+            ];
+            let units = [
+                Unit::Percent,
+                Unit::Bytes,
+                Unit::Count,
+                Unit::Temp,
+                Unit::Duration,
+            ];
+            for zero in [ZeroStyle::Digit, ZeroStyle::Dot, ZeroStyle::Blank] {
+                let f = formatter(Marks::UNICODE, zero);
+                for reading in readings {
+                    for unit in units {
+                        for width in 0..=9 {
+                            let mut out = String::from("pre");
+                            f.reading_into(&mut out, reading, unit, width);
+                            assert_eq!(
+                                out,
+                                format!("pre{}", f.reading(reading, unit, width)),
+                                "{reading:?} {unit:?} {width}"
+                            );
+                        }
+                    }
+                }
+            }
         }
 
         #[test]

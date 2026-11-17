@@ -89,44 +89,30 @@ impl OverviewView<'_> {
                     .mem_total
                     .zip(model.mem_available)
                     .map(|(total, available)| total.saturating_sub(available))
-                    .map(format_bytes)
-                    .or_else(|| {
-                        model
-                            .stats
-                            .mem_gib
-                            .map(|v| format_bytes((f64::from(v.0) * 1_073_741_824.0) as u64))
-                    });
+                    .or_else(|| model.stats.mem_gib.map(|v| gib_bytes(v.0)));
+                out.lines[0].push_str("used  ");
                 if let Some(used) = used {
-                    write!(out.lines[0], "used  {used}").expect("write to String");
+                    write_bytes(&mut out.lines[0], used);
                 } else {
-                    write!(out.lines[0], "used  {}", absent()).expect("write to String");
+                    out.lines[0].push_str(absent());
                 }
                 if let Some(available) = model.mem_available {
-                    write!(out.lines[1], "available  {}", format_bytes(available))
-                        .expect("write to String");
+                    out.lines[1].push_str("available  ");
+                    write_bytes(&mut out.lines[1], available);
                 } else if let Some(free) = model.stats.mem_free_gib {
-                    write!(
-                        out.lines[1],
-                        "free  {}",
-                        format_bytes((f64::from(free) * 1_073_741_824.0) as u64)
-                    )
-                    .expect("write to String");
+                    out.lines[1].push_str("free  ");
+                    write_bytes(&mut out.lines[1], gib_bytes(free));
                 } else {
                     write!(out.lines[1], "available  {}", absent()).expect("write to String");
                 }
                 let swap = model
                     .swap_used
-                    .or_else(|| {
-                        model
-                            .stats
-                            .swap_gib
-                            .map(|v| (f64::from(v.0) * 1_073_741_824.0) as u64)
-                    })
-                    .map(format_bytes);
+                    .or_else(|| model.stats.swap_gib.map(|v| gib_bytes(v.0)));
+                out.lines[2].push_str("swap  ");
                 if let Some(swap) = swap {
-                    write!(out.lines[2], "swap  {swap}").expect("write to String");
+                    write_bytes(&mut out.lines[2], swap);
                 } else {
-                    write!(out.lines[2], "swap  {}", absent()).expect("write to String");
+                    out.lines[2].push_str(absent());
                 }
                 let health = model.health();
                 out.tone = match health.verdict {
@@ -176,12 +162,13 @@ impl OverviewView<'_> {
             5 => {
                 let hottest = model.hottest_c.or(model.stats.cpu_temp_c);
                 if let Some(value) = hottest {
-                    let formatted = kit::edge_fmt(NumFmt::default()).reading(
+                    out.lines[0].push_str("hottest  ");
+                    kit::edge_fmt(NumFmt::default()).reading_into(
+                        &mut out.lines[0],
                         Reading::Value(f64::from(value)),
                         Unit::Temp,
                         8,
                     );
-                    write!(out.lines[0], "hottest  {formatted}").expect("write to String");
                 } else {
                     write!(out.lines[0], "hottest  {}", absent()).expect("write to String");
                 }
@@ -277,7 +264,8 @@ fn write_pressure(
 fn write_rate(prefix: &str, rate: Option<u64>, out: &mut String) {
     out.push_str(prefix);
     if let Some(rate) = rate {
-        write!(out, "{}/s", format_bytes(rate)).expect("write to String");
+        write_bytes(out, rate);
+        out.push_str("/s");
     } else {
         out.push_str(absent());
     }
@@ -287,6 +275,15 @@ fn absent() -> &'static str {
     crate::caps::active_glyphs().emdash
 }
 
-fn format_bytes(value: u64) -> String {
-    kit::edge_fmt(NumFmt::default()).reading(Reading::Value(value as f64), Unit::Bytes, 10)
+fn gib_bytes(gib: impl Into<f64>) -> u64 {
+    (gib.into() * 1_073_741_824.0) as u64
+}
+
+fn write_bytes(out: &mut String, value: u64) {
+    kit::edge_fmt(NumFmt::default()).reading_into(
+        out,
+        Reading::Value(value as f64),
+        Unit::Bytes,
+        10,
+    );
 }

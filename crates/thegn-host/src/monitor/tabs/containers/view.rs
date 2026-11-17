@@ -13,7 +13,7 @@ use crate::{
     sections::Section,
     seg::StyleTok,
 };
-use std::sync::Arc;
+use std::{cell::RefCell, sync::Arc};
 use termwiz::surface::Surface;
 use thegn_core::{
     numfmt::{Marks, NumFmt, Reading, Unit, ZeroStyle},
@@ -772,23 +772,39 @@ impl ContainersView<'_> {
             .max()
             .unwrap_or(0)
             .max(1) as f32;
-        let points: Vec<(f32, f32)> = self
-            .model
-            .order
-            .iter()
-            .filter_map(|index| {
-                let slot = &self.model.slots[*index];
-                let cpu = slot.cpu? as f32;
-                let mem = slot.memory? as f32;
-                Some(((cpu / 100.0).clamp(0.0, 1.0), mem / mem_max))
-            })
-            .collect();
         let rows = total - 1;
         let top = area.y + area.rows - total;
-        let mut raster = thegn_core::viz_raster::CellBuf::new();
+        SCATTER_SCRATCH.with_borrow_mut(|scratch| {
+            self.paint_scatter_with(scratch, surface, area, (total, rows, top), mem_max);
+        });
+        total
+    }
+
+    fn paint_scatter_with(
+        &self,
+        scratch: &mut ScatterScratch,
+        surface: &mut Surface,
+        area: Rect,
+        (total, rows, top): (usize, usize, usize),
+        mem_max: f32,
+    ) {
+        let ScatterScratch {
+            points,
+            raster,
+            grid,
+            emitter,
+        } = scratch;
+        points.clear();
+        points.extend(self.model.order.iter().filter_map(|index| {
+            let slot = &self.model.slots[*index];
+            let cpu = slot.cpu? as f32;
+            let mem = slot.memory? as f32;
+            Some(((cpu / 100.0).clamp(0.0, 1.0), mem / mem_max))
+        }));
         raster.reset(area.cols, rows);
-        thegn_core::viz_raster::scatter(&points, graphs::table(), &mut raster);
-        let mut grid = CellGrid::new(area.cols, total);
+        thegn_core::viz_raster::scatter(points, graphs::table(), raster);
+        grid.resize(area.cols, total);
+        grid.clear();
         let mut view = grid.view(Rect::full(area.cols, total));
         view.put_str(0, 0, scatter_legend(), Default::default());
         for y in 0..rows {
@@ -810,8 +826,7 @@ impl ContainersView<'_> {
                 }
             }
         }
-        Emitter::default().emit(&grid, Rect::full(area.cols, total), surface, area.x, top);
-        total
+        emitter.emit(grid, Rect::full(area.cols, total), surface, area.x, top);
     }
 
     fn paint_history(&self, surface: &mut Surface, panel_id: PanelId, graph_area: Rect) {
@@ -1173,6 +1188,19 @@ fn paint_finite_spark_runs(values: &[f32], ramp: RampId, area: Rect, surface: &m
 }
 
 /// Rows (legend + plot) the scatter takes from `area`, or 0 when omitted.
+/// Reused scatter buffers so a paint does not allocate fresh ones.
+#[derive(Default)]
+struct ScatterScratch {
+    points: Vec<(f32, f32)>,
+    raster: thegn_core::viz_raster::CellBuf,
+    grid: CellGrid,
+    emitter: Emitter,
+}
+
+thread_local! {
+    static SCATTER_SCRATCH: RefCell<ScatterScratch> = RefCell::new(ScatterScratch::default());
+}
+
 fn scatter_rows(containers: usize, area: Rect) -> usize {
     if containers < 2 || area.cols < SCATTER_MIN.0 || area.rows < SCATTER_MIN.1 * 2 {
         return 0;
