@@ -5,8 +5,17 @@
 //! A de-authorization failure re-adds the old key everywhere before restoring
 //! the old local pair, preserving the invariant that partial failure leaves both
 //! keys usable instead of stranding any managed machine.
+//!
+//! A crash after the last custody row is cleaned but before the retired or
+//! auxiliary local pair is deleted leaves that pair on disk with no custody
+//! row. It is never authorized anywhere, and the next rotation of that key
+//! removes it: under the scope lease, once recovery has settled, every
+//! `<stem>.next-<id>` / `<stem>.retiring-<id>` file (and its `.pub`) that no
+//! custody row of any key names is deleted. The sweep is skipped when another
+//! managed key shares the same sibling namespace.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
+use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -139,6 +148,21 @@ pub fn rotate(cfg: &Config, account: Option<&str>, dry_run: bool) -> Result<Rota
                     .unwrap_or("managed key"),
                 records.len()
             );
+            let orphans = match plan_orphan_sweep(path, &all) {
+                Ok(Some(sweep)) => sweep.orphans.len(),
+                Ok(None) => 0,
+                Err(error) => {
+                    tracing::debug!(
+                        key = %path.display(),
+                        %error,
+                        "could not scan for orphaned rotation key files",
+                    );
+                    0
+                }
+            };
+            if orphans > 0 {
+                thegn_core::outln!("would remove {orphans} orphaned rotation key file(s)");
+            }
         }
         return Ok(RotationSummary {
             scopes: scopes.len(),
@@ -292,6 +316,9 @@ fn rotate_scope<R: RotationRemote>(
             key_path.display()
         )
     })?;
+    // Recovery has settled and no staging pair exists yet, so every sibling
+    // file no custody row names is a leftover of an earlier crash.
+    sweep_orphans_under_lease(key_path);
     if resumed_recovery {
         tracing::info!(
             target: "thegn::secret::audit",
@@ -585,9 +612,226 @@ fn rotation_sibling(key_path: &Path, label: &str) -> PathBuf {
             key_path.display(),
             std::process::id()
         ),
-        16,
+        SIBLING_ID_LEN,
     );
     key_path.with_extension(format!("{label}-{identity}"))
+}
+
+/// Length of the identity [`rotation_sibling`] appends. `short_hash` draws it
+/// from the lowercase base36 alphabet `[0-9a-z]`.
+const SIBLING_ID_LEN: usize = 16;
+
+/// Every label [`rotation_sibling`] is called with.
+const SIBLING_LABELS: [&str; 2] = ["next", "retiring"];
+
+/// Whether `name` is exactly a [`rotation_sibling`] name (or its `.pub`) for a
+/// key whose file stem is `stem`: `<stem>.(next|retiring)-[0-9a-z]{16}(.pub)?`.
+fn is_rotation_sibling_name(stem: &str, name: &str) -> bool {
+    let Some(rest) = name
+        .strip_prefix(stem)
+        .and_then(|rest| rest.strip_prefix('.'))
+    else {
+        return false;
+    };
+    let rest = rest.strip_suffix(".pub").unwrap_or(rest);
+    SIBLING_LABELS.iter().any(|label| {
+        rest.strip_prefix(label)
+            .and_then(|rest| rest.strip_prefix('-'))
+            .is_some_and(|id| {
+                id.len() == SIBLING_ID_LEN
+                    && id
+                        .bytes()
+                        .all(|byte| byte.is_ascii_digit() || byte.is_ascii_lowercase())
+            })
+    })
+}
+
+/// Every local key file a custody row of ANY key still names: each canonical
+/// pair and every recorded recovery's auxiliary and retiring pair.
+fn referenced_key_files(custody: &[AuthorizedKeyRecord]) -> BTreeSet<PathBuf> {
+    let mut referenced = BTreeSet::new();
+    let mut add_pair = |private: &Path| {
+        referenced.insert(private.to_path_buf());
+        referenced.insert(public_path(private));
+    };
+    for record in custody {
+        add_pair(&record.key_path);
+        if let Some(recovery) = &record.rotation_recovery {
+            add_pair(&recovery.key_path);
+            if let Some(backup) = &recovery.backup_key_path {
+                add_pair(backup);
+            }
+        }
+    }
+    referenced
+}
+
+fn same_dir(left: &Path, right: &Path) -> bool {
+    left == right
+        || matches!(
+            (std::fs::canonicalize(left), std::fs::canonicalize(right)),
+            (Ok(left), Ok(right)) if left == right
+        )
+}
+
+/// `with_extension` replaces a key's extension, so keys `a` and `a.x` in one
+/// directory both mint `a.next-*` siblings. Such a namespace is never swept:
+/// one key's leftovers cannot be told from the other's.
+fn shares_sibling_namespace(key_path: &Path, custody: &[AuthorizedKeyRecord]) -> bool {
+    let (Some(dir), Some(stem)) = (key_path.parent(), key_path.file_stem()) else {
+        return true;
+    };
+    custody
+        .iter()
+        .map(|record| record.key_path.as_path())
+        .filter(|other| *other != key_path)
+        .any(|other| {
+            other.file_stem() == Some(stem) && other.parent().is_some_and(|p| same_dir(p, dir))
+        })
+}
+
+/// The key's directory, held open so listing and removal stay anchored to
+/// the same inode. Managed key directories are owner-only.
+fn open_key_dir(key_path: &Path) -> std::io::Result<thegn_core::fsperm::PrivateDir> {
+    let parent = key_path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "managed key path has no parent directory",
+            )
+        })?;
+    thegn_core::fsperm::open_private_dir(parent)
+}
+
+/// Rotation siblings of `key_path` in `dir` that nothing references: names
+/// matching [`is_rotation_sibling_name`], not named by any `referenced` path
+/// (compared by file name, which is stricter than by full path), and — without
+/// following links — a regular file owned by the current user.
+fn orphan_siblings(
+    dir: &thegn_core::fsperm::PrivateDir,
+    key_path: &Path,
+    referenced: &BTreeSet<PathBuf>,
+) -> std::io::Result<Vec<PathBuf>> {
+    let Some(stem) = key_path.file_stem().and_then(OsStr::to_str) else {
+        return Ok(Vec::new());
+    };
+    let referenced_names = referenced
+        .iter()
+        .filter_map(|path| path.file_name())
+        .collect::<BTreeSet<&OsStr>>();
+    let mut orphans = Vec::new();
+    for name in dir.file_names()? {
+        let Some(name_str) = name.to_str() else {
+            continue;
+        };
+        if !is_rotation_sibling_name(stem, name_str) || referenced_names.contains(name.as_os_str())
+        {
+            continue;
+        }
+        let Some(metadata) = dir.metadata_nofollow(name_str)? else {
+            continue;
+        };
+        if !metadata.file_type().is_file() || !thegn_core::fsperm::owned_by_current_user(&metadata)
+        {
+            continue;
+        }
+        orphans.push(dir.path().join(&name));
+    }
+    orphans.sort();
+    Ok(orphans)
+}
+
+struct OrphanSweep {
+    dir: thegn_core::fsperm::PrivateDir,
+    orphans: Vec<PathBuf>,
+}
+
+/// The orphaned rotation files beside `key_path` given the complete custody
+/// inventory, or `None` when the sibling namespace is shared and must not be
+/// swept.
+fn plan_orphan_sweep(
+    key_path: &Path,
+    custody: &[AuthorizedKeyRecord],
+) -> std::io::Result<Option<OrphanSweep>> {
+    if shares_sibling_namespace(key_path, custody) {
+        tracing::debug!(
+            key = %key_path.display(),
+            "skip orphaned rotation key sweep: another managed key shares its sibling namespace",
+        );
+        return Ok(None);
+    }
+    let dir = open_key_dir(key_path)?;
+    let orphans = orphan_siblings(&dir, key_path, &referenced_key_files(custody))?;
+    Ok(Some(OrphanSweep { dir, orphans }))
+}
+
+/// Delete the orphaned rotation files beside `key_path` and return how many
+/// were removed. The caller holds the scope lease and has settled recovery.
+/// Every failure is logged, never returned: an orphan is never authorized, so
+/// leaving one behind must not fail the rotation of the live key.
+fn sweep_orphan_siblings(key_path: &Path, custody: &[AuthorizedKeyRecord]) -> usize {
+    let sweep = match plan_orphan_sweep(key_path, custody) {
+        Ok(Some(sweep)) => sweep,
+        Ok(None) => return 0,
+        Err(error) => {
+            // best-effort: a key directory that cannot be listed safely only
+            // keeps never-authorized leftovers; the rotation itself proceeds.
+            tracing::warn!(
+                key = %key_path.display(),
+                %error,
+                "could not scan for orphaned rotation key files",
+            );
+            return 0;
+        }
+    };
+    if sweep.orphans.is_empty() {
+        return 0;
+    }
+    let mut removed = 0usize;
+    for path in &sweep.orphans {
+        let Some(name) = path.file_name().and_then(OsStr::to_str) else {
+            continue;
+        };
+        match sweep.dir.remove_file(name) {
+            Ok(true) => removed += 1,
+            Ok(false) => {}
+            // best-effort: the file is never authorized; the next rotation
+            // retries the removal.
+            Err(error) => tracing::warn!(
+                path = %path.display(),
+                %error,
+                "could not remove orphaned rotation key file",
+            ),
+        }
+    }
+    tracing::info!(
+        target: "thegn::secret::audit",
+        consumer = "secret.ssh.rotate",
+        key = %key_path.display(),
+        count = removed,
+        outcome = "orphans-swept",
+        "orphaned managed SSH rotation key files removed",
+    );
+    removed
+}
+
+/// Re-read the complete custody inventory (ALL keys) and sweep `key_path`'s
+/// orphaned rotation siblings. Must run under the scope lease.
+fn sweep_orphans_under_lease(key_path: &Path) {
+    match thegn_core::managed_ssh::list() {
+        Ok(custody) => {
+            sweep_orphan_siblings(key_path, &custody);
+        }
+        // best-effort: without the complete inventory no sibling can be proven
+        // unreferenced, so nothing is deleted and the rotation proceeds.
+        Err(error) => tracing::warn!(
+            key = %key_path.display(),
+            error = %format!("{error:#}"),
+            "skip orphaned rotation key sweep: custody inventory unreadable",
+        ),
+    }
 }
 
 fn publish_if_unchanged_in(
@@ -2033,5 +2277,183 @@ mod tests {
             joined.contains("--expected-instance sprite-123"),
             "{joined}"
         );
+    }
+
+    const ID: &str = "0123456789abcdef";
+
+    /// A private key directory (tempdirs are owner-only) holding the
+    /// canonical managed pair `managed_ed25519{,.pub}`.
+    fn key_dir() -> (tempfile::TempDir, PathBuf) {
+        let temp = tempfile::tempdir().unwrap();
+        thegn_core::fsperm::restrict_dir_to_owner(temp.path()).unwrap();
+        let key = temp.path().join("managed_ed25519");
+        std::fs::write(&key, "private").unwrap();
+        std::fs::write(public_path(&key), "public").unwrap();
+        (temp, key)
+    }
+
+    fn custody_for(key: &Path, recovery: Option<RotationRecovery>) -> AuthorizedKeyRecord {
+        AuthorizedKeyRecord {
+            key_path: key.to_path_buf(),
+            ..custody_record("instance-a", recovery)
+        }
+    }
+
+    fn plant(path: &Path) {
+        std::fs::write(path, "leftover").unwrap();
+    }
+
+    #[test]
+    fn rotation_sibling_name_matcher_table() {
+        let stem = "managed_ed25519";
+        let accepted = [
+            format!("{stem}.next-{ID}"),
+            format!("{stem}.next-{ID}.pub"),
+            format!("{stem}.retiring-{ID}"),
+            format!("{stem}.retiring-{ID}.pub"),
+            // short_hash is base36: letters past `f` are in the alphabet.
+            format!("{stem}.next-zyxwvutsrq012345"),
+        ];
+        for name in &accepted {
+            assert!(is_rotation_sibling_name(stem, name), "must accept {name}");
+        }
+        let rejected = [
+            format!("{stem}.staging-{ID}"),
+            format!("{stem}.next-{}", &ID[..15]),
+            format!("{stem}.next-{ID}0"),
+            format!("{stem}.retiring-{}", ID.to_ascii_uppercase()),
+            format!("{stem}.next-0123456789abcde_"),
+            format!("other.next-{ID}"),
+            format!("x{stem}.next-{ID}"),
+            format!("{stem}next-{ID}"),
+            format!("{stem}.next{ID}"),
+            format!("{stem}.next-{ID}.pub.pub"),
+            format!("{stem}.next-{ID}.bak"),
+            stem.to_string(),
+            format!("{stem}.pub"),
+        ];
+        for name in &rejected {
+            assert!(!is_rotation_sibling_name(stem, name), "must reject {name}");
+        }
+        // The matcher accepts exactly what the rotation itself mints.
+        let key = Path::new("/keys/managed_ed25519");
+        for label in SIBLING_LABELS {
+            let sibling = rotation_sibling(key, label);
+            for path in [sibling.clone(), public_path(&sibling)] {
+                let name = path.file_name().unwrap().to_str().unwrap();
+                assert!(is_rotation_sibling_name(stem, name), "minted {name}");
+            }
+        }
+    }
+
+    #[test]
+    fn sweep_removes_only_unreferenced_regular_siblings() {
+        let (temp, key) = key_dir();
+        let orphan = temp.path().join(format!("managed_ed25519.retiring-{ID}"));
+        plant(&orphan);
+        plant(&public_path(&orphan));
+        // An in-flight recovery of another row still names this pair.
+        let auxiliary = temp.path().join("managed_ed25519.next-aaaaaaaaaaaaaaaa");
+        let backup = temp
+            .path()
+            .join("managed_ed25519.retiring-bbbbbbbbbbbbbbbb");
+        for path in [&auxiliary, &backup] {
+            plant(path);
+            plant(&public_path(path));
+        }
+        let unrelated = temp.path().join(format!("other.next-{ID}"));
+        plant(&unrelated);
+        let custody = [
+            custody_for(&key, None),
+            AuthorizedKeyRecord {
+                instance: "instance-b".to_string(),
+                ..custody_for(
+                    &key,
+                    Some(RotationRecovery {
+                        key_path: auxiliary.clone(),
+                        backup_key_path: Some(backup.clone()),
+                        ..recovery_marker("pending")
+                    }),
+                )
+            },
+        ];
+
+        let planned = plan_orphan_sweep(&key, &custody).unwrap().unwrap();
+        assert_eq!(planned.orphans, vec![orphan.clone(), public_path(&orphan)]);
+        assert!(orphan.exists(), "planning (the dry run) deletes nothing");
+        drop(planned);
+
+        assert_eq!(sweep_orphan_siblings(&key, &custody), 2);
+        assert!(!orphan.exists() && !public_path(&orphan).exists());
+        for path in [&key, &auxiliary, &backup] {
+            assert!(path.exists(), "{} must survive", path.display());
+            assert!(public_path(path).exists());
+        }
+        assert!(unrelated.exists(), "another stem is never swept");
+        assert_eq!(sweep_orphan_siblings(&key, &custody), 0);
+    }
+
+    #[test]
+    fn sweep_leaves_a_sibling_named_symlink_and_its_target() {
+        let (temp, key) = key_dir();
+        let outside = tempfile::tempdir().unwrap();
+        let target = outside.path().join("precious");
+        std::fs::write(&target, "keep me").unwrap();
+        let link = temp.path().join(format!("managed_ed25519.retiring-{ID}"));
+        if thegn_core::fsperm::create_symlink(&target, &link, false).is_err() {
+            return;
+        }
+        assert_eq!(sweep_orphan_siblings(&key, &[custody_for(&key, None)]), 0);
+        assert!(std::fs::symlink_metadata(&link).is_ok(), "link survives");
+        assert_eq!(std::fs::read_to_string(&target).unwrap(), "keep me");
+    }
+
+    #[test]
+    fn sweep_skips_keys_sharing_a_sibling_namespace() {
+        let (temp, key) = key_dir();
+        // `managed_ed25519.x` also mints `managed_ed25519.next-*` siblings.
+        let neighbour = temp.path().join("managed_ed25519.x");
+        let orphan = temp.path().join(format!("managed_ed25519.retiring-{ID}"));
+        plant(&orphan);
+        let custody = [custody_for(&key, None), custody_for(&neighbour, None)];
+        assert!(shares_sibling_namespace(&key, &custody));
+        assert!(shares_sibling_namespace(&neighbour, &custody));
+        assert!(plan_orphan_sweep(&key, &custody).unwrap().is_none());
+        assert_eq!(sweep_orphan_siblings(&key, &custody), 0);
+        assert_eq!(sweep_orphan_siblings(&neighbour, &custody), 0);
+        assert!(orphan.exists());
+
+        // The same stem in another directory is a different namespace.
+        let elsewhere = tempfile::tempdir().unwrap();
+        let custody = [
+            custody_for(&key, None),
+            custody_for(&elsewhere.path().join("managed_ed25519"), None),
+        ];
+        assert!(!shares_sibling_namespace(&key, &custody));
+        assert_eq!(sweep_orphan_siblings(&key, &custody), 1);
+        assert!(!orphan.exists());
+    }
+
+    #[test]
+    fn sweep_skips_a_non_regular_entry() {
+        let (temp, key) = key_dir();
+        let directory = temp.path().join(format!("managed_ed25519.next-{ID}"));
+        std::fs::create_dir(&directory).unwrap();
+        std::fs::write(directory.join("inner"), "x").unwrap();
+        assert_eq!(sweep_orphan_siblings(&key, &[custody_for(&key, None)]), 0);
+        assert!(directory.join("inner").exists());
+    }
+
+    #[test]
+    fn sweep_refuses_a_key_dir_that_is_not_owner_only() {
+        let (temp, key) = key_dir();
+        let orphan = temp.path().join(format!("managed_ed25519.retiring-{ID}"));
+        plant(&orphan);
+        if thegn_core::fsperm::set_mode_for_test(temp.path(), 0o755).is_err() {
+            return;
+        }
+        assert!(plan_orphan_sweep(&key, &[custody_for(&key, None)]).is_err());
+        assert_eq!(sweep_orphan_siblings(&key, &[custody_for(&key, None)]), 0);
+        assert!(orphan.exists());
     }
 }
