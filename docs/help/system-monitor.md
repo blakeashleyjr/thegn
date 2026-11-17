@@ -470,6 +470,8 @@ notification inbox; both are off by default.
 
 ## Configuration
 
+The masthead cpu/mem popup that jumps here is described in [[bars]].
+
 `[monitor]` sets the starting `default_window`, `default_style` and
 `default_scale`. They are only starting points — whatever you toggle is
 remembered per tab from then on.
