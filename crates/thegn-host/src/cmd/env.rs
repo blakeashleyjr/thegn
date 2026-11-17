@@ -372,9 +372,10 @@ fn deprovision(
                 .get(name)
                 .ok_or_else(|| anyhow::anyhow!("no [env.{name}] defined"))?;
             crate::provider_factory::provider_for_named(&envc.provider, name).ok_or_else(|| {
-                anyhow::anyhow!(
-                    "env '{name}' has no API provider or its token could not be resolved"
-                )
+                anyhow::anyhow!(crate::provider_factory::provider_unavailable_reason(
+                    &envc.provider,
+                    name
+                ))
             })?
         }
         None => api_provider(cfg, worktree.clone())?,
@@ -438,7 +439,10 @@ fn test(cfg: &Config, name: &str) -> Result<()> {
         .ok_or_else(|| anyhow::anyhow!("no [env.{name}] defined"))?;
     let provider =
         crate::provider_factory::provider_for_named(&envc.provider, name).ok_or_else(|| {
-            anyhow::anyhow!("env '{name}' has no API provider or its token could not be resolved")
+            anyhow::anyhow!(crate::provider_factory::provider_unavailable_reason(
+                &envc.provider,
+                name
+            ))
         })?;
     let n = crate::agent::block_on_provider(|| async { provider.list().await })
         .map_err(|e| anyhow::anyhow!("provider check failed: {e}"))?
@@ -769,6 +773,8 @@ fn lifecycle(cfg: &Config, worktree: Option<String>, action: Lifecycle) -> Resul
             bring_up(&env, &wt, |progress| {
                 crate::agent::provision_worktree(cfg, &wt, progress)
             })?;
+            crate::ssh_seed::seed_if_needed(cfg, &wt)
+                .with_context(|| format!("env up failed: seeding {wt} on env {}", env.name))?;
             sshfs(&env, true)?;
             outln!("env {} is up", env.name);
         }
@@ -1173,6 +1179,13 @@ fn provision_headless_blocking(
     worktree: String,
     deadline: std::time::Duration,
 ) -> Result<()> {
+    // An ssh `in_env` worktree is seeded onto its host before the open, so the
+    // headless session lands in the checkout (a no-op for every other env).
+    crate::ssh_seed::seed_if_needed(&cfg, &worktree).with_context(|| {
+        format!(
+            "seeding {worktree} onto its ssh host failed; `thegn env up --worktree {worktree}` retries it"
+        )
+    })?;
     let Some(env_name) = crate::provision_gate::unprovisioned_provider_env(&cfg, &worktree)? else {
         return Ok(());
     };
@@ -1438,7 +1451,23 @@ fn show(cfg: &Config, worktree: Option<String>) -> Result<()> {
         }
         _ => None,
     };
-    for line in show_lines(&env, &location, provisioned, &env.sandbox.git) {
+    let labelled: Vec<(String, String)> = env
+        .sandbox
+        .mounts
+        .iter()
+        .enumerate()
+        .map(|(i, spec)| (format!("sandbox.mounts[{i}]"), spec.clone()))
+        .collect();
+    let runtime_dir = std::env::var_os("XDG_RUNTIME_DIR")
+        .filter(|value| !value.is_empty())
+        .map(std::path::PathBuf::from);
+    let home = crate::platform::account_home().unwrap_or_else(thegn_core::util::home);
+    let warnings = thegn_core::sandbox_runtime_escape::exposure_warnings(
+        &labelled,
+        runtime_dir.as_deref(),
+        &home,
+    );
+    for line in show_lines(&env, &location, provisioned, &env.sandbox.git, &warnings) {
         outln!("{line}");
     }
     Ok(())
@@ -1472,12 +1501,14 @@ fn git_write_scope(mode: thegn_core::config::SandboxGitMode) -> &'static str {
 /// The `env show` lines after `isolation:` (THE-2007/THE-2009): the stored
 /// location, the recorded sandbox and whether this machine provisioned it
 /// (`provisioned` is `None` without a provider sandbox id), and the effective
-/// `[sandbox.git]` policy. Pure.
+/// `[sandbox.git]` policy, then one `warning:` line per mount exposure
+/// warning (THE-2009). Pure.
 fn show_lines(
     env: &thegn_core::env::Environment,
     location: &str,
     provisioned: Option<bool>,
     git: &thegn_core::config::SandboxGitConfig,
+    warnings: &[String],
 ) -> Vec<String> {
     let mut lines = vec![format!("location:  {location}")];
     if let thegn_core::placement::Placement::Provider(p) = &env.placement {
@@ -1495,6 +1526,7 @@ fn show_lines(
         git.mode, git.transport, git.credential
     ));
     lines.push(format!("           {}", git_write_scope(git.mode)));
+    lines.extend(warnings.iter().map(|w| format!("warning:   {w}")));
     lines
 }
 
@@ -2068,7 +2100,7 @@ mod up_tests {
         let git = SandboxGitConfig::default();
         let env = provider_env();
         assert_eq!(
-            show_lines(&env, "provider:…", Some(true), &git),
+            show_lines(&env, "provider:…", Some(true), &git, &[]),
             vec![
                 "location:  provider:…".to_string(),
                 "sandbox:   fake-sandbox (provisioned here)".to_string(),
@@ -2076,7 +2108,7 @@ mod up_tests {
                 "           commit-only: objects, this worktree's HEAD/index, refs/heads/<lane dir>/; main, tags, hooks and config are read-only".to_string(),
             ]
         );
-        let recorded = show_lines(&env, "local", Some(false), &git);
+        let recorded = show_lines(&env, "local", Some(false), &git, &[]);
         assert_eq!(
             recorded[1],
             "sandbox:   fake-sandbox (recorded, not provisioned on this machine)"
@@ -2086,7 +2118,7 @@ mod up_tests {
             p.id.clear();
         }
         assert_eq!(
-            show_lines(&no_id, "local", None, &git)[1],
+            show_lines(&no_id, "local", None, &git, &[])[1],
             "sandbox:   none"
         );
         let local = thegn_core::env::Environment {
@@ -2097,7 +2129,7 @@ mod up_tests {
             mode: SandboxGitMode::ReadOnly,
             ..SandboxGitConfig::default()
         };
-        let lines = show_lines(&local, "local", None, &read_only);
+        let lines = show_lines(&local, "local", None, &read_only, &[]);
         assert_eq!(lines.len(), 3, "no sandbox line off a provider: {lines:?}");
         assert_eq!(lines[0], "location:  local");
         assert!(
@@ -2105,6 +2137,30 @@ mod up_tests {
             "{lines:?}"
         );
         assert!(lines[2].contains("nothing to pull back"), "{lines:?}");
+    }
+
+    #[test]
+    fn show_lines_print_mount_exposure_warnings() {
+        let git = thegn_core::config::SandboxGitConfig::default();
+        let env = provider_env();
+        let labelled = vec![("sandbox.mounts[0]".to_string(), "/run/user".to_string())];
+        let warnings = thegn_core::sandbox_runtime_escape::exposure_warnings(
+            &labelled,
+            Some(std::path::Path::new("/run/user/1000")),
+            std::path::Path::new("/home/someone"),
+        );
+        assert!(!warnings.is_empty(), "/run/user exposes the runtime dir");
+        let plain = show_lines(&env, "local", Some(true), &git, &[]);
+        let warned = show_lines(&env, "local", Some(true), &git, &warnings);
+        assert_eq!(&warned[..plain.len()], &plain[..], "warnings come last");
+        assert_eq!(warned.len(), plain.len() + warnings.len());
+        for (line, warning) in warned[plain.len()..].iter().zip(&warnings) {
+            assert_eq!(line, &format!("warning:   {warning}"));
+        }
+        assert!(
+            warned.last().unwrap().contains("sandbox.mounts[0]"),
+            "{warned:?}"
+        );
     }
 
     #[test]

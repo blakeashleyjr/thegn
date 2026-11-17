@@ -72,7 +72,9 @@ interval, `git.auto_fetch` and its interval, `disk.scan_interval_secs`,
 PR refresh cadence, floored at 5 seconds; the rest of `[watch]` still needs
 a restart). The status line lists them as "refresh cadences". Some keys are read afresh each time they are used,
 such as `[sandbox]`, `[env.*]`, `[project.*]`, the rest of `[git]` and the
-queues, so the next worktree, launch or queue run picks them up. A few are
+queues, so the next worktree, launch or queue run picks them up. Daemon launches pick up `[env.*]` and
+env-selection edits without a restart; `[host.*]`, `[sandbox.profiles.*]` and
+the other `[sandbox]` and `[daemon]` keys still need one. A few are
 read only at launch, such as `[daemon]`, `[serve]`, `[mcp]` and `[network]`,
 and need a restart. After a save, the status line says what changed, for
 example

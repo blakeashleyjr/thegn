@@ -1191,6 +1191,7 @@ fn output_bounded_with_input_caps(
     use std::time::Duration;
 
     GIT_SPAWNS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    thegn_core::git_spawn_stats::record(args);
     let timeout = timeout.unwrap_or(GIT_OPT_OUT_CEILING);
 
     let cancel = std::sync::atomic::AtomicBool::new(false);

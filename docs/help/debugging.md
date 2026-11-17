@@ -178,6 +178,8 @@ rates, and up to 12 ranked lines show each thread's id, name, wake and CPU
 rates, current syscall, its file-descriptor target, and wait channel. On Linux,
 a background thread reads at most 256 entries from `/proc/self/task`; this
 bounded read burst runs once per rollup. Other platforms log an empty census.
+The rollup also carries `git_spawn_top`, the top (thread, git subcommand) pairs
+behind git spawns, to show what keeps an idle process spawning git.
 
 The live-only view is the **LOOP** overlay in System → Telemetry. Opening that
 section enables accounting and rolls it up at its live cadence; it is not a

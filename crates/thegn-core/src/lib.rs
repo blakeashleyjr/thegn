@@ -129,6 +129,7 @@ mod db_session_migration;
 mod db_trust;
 mod db_usage;
 mod db_vacuum;
+pub mod git_spawn_stats;
 pub use db_vacuum::{
     AUTO_CONVERT_MAX_LIVE_BYTES, AutoVacuum, ConvertOutcome, DbSpace, INCREMENTAL_PAGES_PER_ROUND,
     MaintenanceReport, MaintenanceStep, NOTIFICATION_READ_RETENTION_SECS, VacuumError,
