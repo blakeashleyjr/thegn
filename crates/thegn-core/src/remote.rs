@@ -1112,6 +1112,7 @@ impl GitLoc {
         cancel: &std::sync::atomic::AtomicBool,
     ) -> crate::git_run::GitOutcome {
         crate::util::note_core_git_spawn();
+        crate::git_spawn_stats::record(args);
         crate::git_run::run_command(&mut self.git_command_env(envs, args), policy, cancel)
     }
 
@@ -1123,6 +1124,7 @@ impl GitLoc {
         cancel: &std::sync::atomic::AtomicBool,
     ) -> crate::git_run::GitOutcome {
         crate::util::note_core_git_spawn();
+        crate::git_spawn_stats::record(args);
         crate::git_run::run_command(&mut self.git_command(args), policy, cancel)
     }
 
