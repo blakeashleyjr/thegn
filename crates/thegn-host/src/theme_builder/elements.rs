@@ -172,6 +172,29 @@ pub(super) enum ElementRow {
     Element(usize, usize),
 }
 
+/// The part of the workspace a group's colours land on; the builder keeps it
+/// lit while the rest of the screen dims.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum Spot {
+    Sidebar,
+    Masthead,
+    StatusBar,
+    Center,
+    Panel,
+}
+
+/// The region behind `ELEMENT_GROUPS[group]` (`None`: popups have no fixed home).
+pub(super) fn group_spot(group: usize) -> Option<Spot> {
+    match group {
+        0 | 5 => Some(Spot::Sidebar),
+        1 => Some(Spot::Masthead),
+        2 => Some(Spot::StatusBar),
+        3 => Some(Spot::Center),
+        4 | 6 => Some(Spot::Panel),
+        _ => None,
+    }
+}
+
 /// The visible rows given each group's collapsed flag (missing = expanded).
 pub(super) fn element_rows(collapsed: &[bool]) -> Vec<ElementRow> {
     let mut rows = Vec::new();
@@ -197,6 +220,28 @@ pub(super) fn row_role(row: ElementRow) -> Option<ColorRole> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn group_spot_table() {
+        use super::{ELEMENT_GROUPS, Spot, group_spot};
+        let names: Vec<_> = ELEMENT_GROUPS.iter().map(|(n, _)| *n).collect();
+        let want = [
+            ("Sidebar", Some(Spot::Sidebar)),
+            ("Tabs + Masthead", Some(Spot::Masthead)),
+            ("Status bar", Some(Spot::StatusBar)),
+            ("Panes", Some(Spot::Center)),
+            ("Diff", Some(Spot::Panel)),
+            ("Activity dots", Some(Spot::Sidebar)),
+            ("Git graph", Some(Spot::Panel)),
+            ("Popups + modals", None),
+        ];
+        assert_eq!(names.len(), want.len());
+        for (i, (name, spot)) in want.iter().enumerate() {
+            assert_eq!(names[i], *name);
+            assert_eq!(group_spot(i), *spot, "{name}");
+        }
+        assert_eq!(group_spot(99), None);
+    }
+
     use super::{ELEMENT_GROUPS, ElementRow, ROLES, element_rows, role_name, row_role};
 
     #[test]
