@@ -511,7 +511,7 @@ mod tests {
         for i in 0..z.len() {
             let mut c = z.clone();
             c[i] ^= 0xff;
-            let _ = zl(&c, 10);
+            drop(zl(&c, 10));
         }
     }
 
@@ -600,7 +600,7 @@ mod tests {
         assert!(tl(&[1u8; 100], 10, 1 << 20).is_err());
         let ok = tar_file("a", b"xyz");
         for n in 1..ok.len() {
-            let _ = tl(&ok[..n], 10, 1 << 20); // never panics
+            drop(tl(&ok[..n], 10, 1 << 20)); // never panics
         }
         let mut bad_size = tar_header("a", b"99999999999\0", b'0', "", "").to_vec();
         bad_size[124] = b'z';
