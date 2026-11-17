@@ -478,7 +478,7 @@ mod tests {
     use crate::telemetry::TelemetryHistory;
     use std::time::{Duration, Instant};
     use termwiz::input::{KeyCode, Modifiers};
-    use thegn_core::cpu_attrib::{PaneOwner, SortKey};
+    use thegn_core::cpu_attrib::{AttribRow, PaneOwner, RowKind, SortKey};
 
     #[test]
     fn row_ids_are_unique_for_equal_sibling_labels() {
