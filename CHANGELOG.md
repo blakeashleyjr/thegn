@@ -7,6 +7,8 @@ All notable changes to **thegn** are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.1.0-alpha.92] — 2026-11-17
+
 ### Added
 
 - The panel's current width shows as a clickable chip at the right of the tab row; clicking cycles the width like `e`.
@@ -3758,7 +3760,8 @@ launcher picker and the merge queue's `agent_command` hook remain — they run
 whatever commands you configure. Leftover `[llm_proxy]` config sections and
 `proxy_*` tables in existing state databases are ignored harmlessly.
 
-[Unreleased]: https://github.com/blakeashleyjr/thegn/compare/v0.1.0-alpha.91...HEAD
+[Unreleased]: https://github.com/blakeashleyjr/thegn/compare/v0.1.0-alpha.92...HEAD
+[0.1.0-alpha.92]: https://github.com/blakeashleyjr/thegn/compare/v0.1.0-alpha.91...v0.1.0-alpha.92
 [0.1.0-alpha.91]: https://github.com/blakeashleyjr/thegn/compare/v0.1.0-alpha.90...v0.1.0-alpha.91
 [0.1.0-alpha.90]: https://github.com/blakeashleyjr/thegn/compare/v0.1.0-alpha.89...v0.1.0-alpha.90
 [0.1.0-alpha.89]: https://github.com/blakeashleyjr/thegn/compare/v0.1.0-alpha.88...v0.1.0-alpha.89
