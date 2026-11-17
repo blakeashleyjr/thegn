@@ -7,7 +7,7 @@
 //! synchronous — the agent drives one request at a time over stdio — so the
 //! whole thing is `std::process` + threads, no tokio.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::time::Duration;
 
 use serde_json::{Value, json};
@@ -52,6 +52,17 @@ impl Hub {
     /// A withheld or unspawnable upstream degrades to "its tools absent" — the
     /// endpoint never fails to come up.
     pub fn build(cfg: &Config, ctx: &WorktreeContext) -> Hub {
+        Self::build_selected(
+            cfg,
+            ctx,
+            &ServerSelection::default_for(&cfg.mcp_proxy.profiles),
+        )
+    }
+
+    /// [`Hub::build`] restricted to `selection`: the default hub excludes every
+    /// profiled server, a `--profile` hub serves only that profile's servers.
+    /// Default-deny (`proxy.tools`) still applies inside either.
+    pub fn build_selected(cfg: &Config, ctx: &WorktreeContext, selection: &ServerSelection) -> Hub {
         let pcfg = &cfg.mcp_proxy;
         let breaker_cfg = pcfg.breaker_config();
         let timeout = Duration::from_secs(pcfg.request_timeout_secs.max(1));
@@ -60,6 +71,9 @@ impl Hub {
         let mut reports: Vec<UpstreamReport> = Vec::new();
 
         for (name, srv) in &cfg.mcp_servers {
+            if !selection.includes(name) {
+                continue; // another profile's server (or not in this profile).
+            }
             if !srv.is_proxy_exposed() {
                 continue; // default-deny: not opted in.
             }
@@ -277,6 +291,64 @@ impl Hub {
     }
 }
 
+/// Which configured servers one hub serves (`[mcp_proxy.profiles]`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ServerSelection {
+    /// The default hub (`thegn mcp proxy`, what every worker gets): every
+    /// server EXCEPT those listed in any profile.
+    Default { excluded: BTreeSet<String> },
+    /// `thegn mcp proxy --profile <p>`: only that profile's servers.
+    Profile {
+        name: String,
+        members: BTreeSet<String>,
+    },
+}
+
+impl ServerSelection {
+    /// The default selection: excludes every profiled server.
+    pub fn default_for(profiles: &BTreeMap<String, Vec<String>>) -> Self {
+        Self::Default {
+            excluded: profiles.values().flatten().cloned().collect(),
+        }
+    }
+
+    /// Resolve `--profile`; an unknown profile is an error (never a silent
+    /// fallback to the default hub).
+    pub fn resolve(
+        profiles: &BTreeMap<String, Vec<String>>,
+        profile: Option<&str>,
+    ) -> anyhow::Result<Self> {
+        let Some(name) = profile else {
+            return Ok(Self::default_for(profiles));
+        };
+        match profiles.get(name) {
+            Some(members) => Ok(Self::Profile {
+                name: name.to_string(),
+                members: members.iter().cloned().collect(),
+            }),
+            None => {
+                let known: Vec<&str> = profiles.keys().map(String::as_str).collect();
+                anyhow::bail!(
+                    "unknown MCP proxy profile {name:?}: declare [mcp_proxy.profiles] {name} = [...] (known: {})",
+                    if known.is_empty() {
+                        "none".to_string()
+                    } else {
+                        known.join(", ")
+                    }
+                )
+            }
+        }
+    }
+
+    /// Whether server `name` belongs to this hub.
+    pub fn includes(&self, name: &str) -> bool {
+        match self {
+            Self::Default { excluded } => !excluded.contains(name),
+            Self::Profile { members, .. } => members.contains(name),
+        }
+    }
+}
+
 /// The daemon-derivable effective instance set: the *global-scope* exposed
 /// upstreams (workspace/worktree-scoped upstreams are per-connection and cannot
 /// be derived without a shim's context). Used by the daemon's `mcp_proxy.status`
@@ -286,9 +358,10 @@ pub fn effective_global_instances(
 ) -> Vec<thegn_core::mcp::proxy::reconcile::InstanceSpec> {
     use thegn_core::mcp::config::ProxyScope;
     let ctx = WorktreeContext::default();
+    let selection = ServerSelection::default_for(&cfg.mcp_proxy.profiles);
     let mut out = Vec::new();
     for (name, srv) in &cfg.mcp_servers {
-        if !srv.is_proxy_exposed() {
+        if !selection.includes(name) || !srv.is_proxy_exposed() {
             continue;
         }
         if srv.exposure().scope != ProxyScope::Global {
@@ -307,4 +380,85 @@ pub fn now_ms() -> i64 {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| thegn_core::time_policy::saturating_i64(d.as_millis()))
         .unwrap_or(0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{ServerSelection, effective_global_instances};
+    use std::collections::BTreeMap;
+
+    fn profiles() -> BTreeMap<String, Vec<String>> {
+        BTreeMap::from([
+            ("lead".to_string(), vec!["todoist".to_string()]),
+            (
+                "ops".to_string(),
+                vec!["pager".to_string(), "todoist".to_string()],
+            ),
+        ])
+    }
+
+    #[test]
+    fn profile_selection_includes_only_its_servers() {
+        let sel = ServerSelection::resolve(&profiles(), Some("lead")).unwrap();
+        assert!(sel.includes("todoist"));
+        assert!(!sel.includes("pager"));
+        assert!(!sel.includes("github"));
+    }
+
+    #[test]
+    fn default_selection_excludes_every_profiled_server() {
+        let sel = ServerSelection::resolve(&profiles(), None).unwrap();
+        assert_eq!(sel, ServerSelection::default_for(&profiles()));
+        assert!(!sel.includes("todoist"));
+        assert!(!sel.includes("pager"));
+        assert!(sel.includes("github"));
+        // No profiles: the default hub keeps everything.
+        assert!(
+            ServerSelection::resolve(&BTreeMap::new(), None)
+                .unwrap()
+                .includes("todoist")
+        );
+    }
+
+    #[test]
+    fn unknown_profile_is_an_error() {
+        let err = ServerSelection::resolve(&profiles(), Some("nope")).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("unknown MCP proxy profile \"nope\""), "{msg}");
+        assert!(msg.contains("lead, ops"), "{msg}");
+        assert!(ServerSelection::resolve(&BTreeMap::new(), Some("lead")).is_err());
+    }
+
+    #[test]
+    fn profiled_servers_leave_the_default_global_set_and_default_deny_holds() {
+        let server = |tools: &[&str]| -> thegn_core::mcp::config::McpServerConfig {
+            serde_json::from_value(serde_json::json!({
+                "command": ["true"],
+                "proxy": { "tools": tools },
+            }))
+            .unwrap()
+        };
+        let mut cfg = thegn_core::config::Config::default();
+        cfg.mcp_servers.insert("todoist".into(), server(&["*"]));
+        cfg.mcp_servers.insert("github".into(), server(&["*"]));
+        cfg.mcp_servers.insert("hidden".into(), server(&[]));
+        cfg.mcp_proxy.profiles = BTreeMap::from([(
+            "lead".to_string(),
+            vec!["todoist".to_string(), "hidden".to_string()],
+        )]);
+        let names: Vec<String> = effective_global_instances(&cfg)
+            .into_iter()
+            .map(|s| s.upstream)
+            .collect();
+        assert_eq!(names, ["github"]);
+        // Inside the profile, default-deny still filters `hidden` (no tools).
+        let sel = ServerSelection::resolve(&cfg.mcp_proxy.profiles, Some("lead")).unwrap();
+        let exposed: Vec<&str> = cfg
+            .mcp_servers
+            .iter()
+            .filter(|(n, s)| sel.includes(n) && s.is_proxy_exposed())
+            .map(|(n, _)| n.as_str())
+            .collect();
+        assert_eq!(exposed, ["todoist"]);
+    }
 }
