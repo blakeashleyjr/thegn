@@ -62,12 +62,8 @@ fn le32(b: &[u8], at: usize) -> Option<u32> {
     Some(u32::from_le_bytes([s[0], s[1], s[2], s[3]]))
 }
 
-/// List a zip archive from its central directory.
-pub fn zip_listing<R: Read + Seek>(
-    r: &mut R,
-    file_len: u64,
-    max_entries: usize,
-) -> Result<Listing, String> {
+/// Read the zip central directory: `(directory bytes, declared entry count)`.
+fn zip_read_cd<R: Read + Seek>(r: &mut R, file_len: u64) -> Result<(Vec<u8>, u16), String> {
     if file_len < EOCD_MIN as u64 {
         return Err("not a zip archive: too short".into());
     }
@@ -112,7 +108,16 @@ pub fn zip_listing<R: Read + Seek>(
     let mut cd = vec![0u8; usize::try_from(cd_size).map_err(|_| "zip directory too large")?];
     r.read_exact(&mut cd)
         .map_err(|e| format!("zip read failed: {e}"))?;
+    Ok((cd, total_entries))
+}
 
+/// List a zip archive from its central directory.
+pub fn zip_listing<R: Read + Seek>(
+    r: &mut R,
+    file_len: u64,
+    max_entries: usize,
+) -> Result<Listing, String> {
+    let (cd, total_entries) = zip_read_cd(r, file_len)?;
     let mut listing = Listing {
         total_hint: Some(u64::from(total_entries)),
         ..Listing::default()
@@ -166,6 +171,104 @@ pub fn zip_listing<R: Read + Seek>(
         at = next;
     }
     Ok(listing)
+}
+
+/// Where one zip entry lives, from its central-directory record.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ZipEntryLoc {
+    pub method: u16,
+    pub flags: u16,
+    pub compressed: u64,
+    pub uncompressed: u64,
+    pub local_header_offset: u64,
+}
+
+/// Find the entry called `name` in a zip's central directory.
+pub fn zip_find_entry<R: Read + Seek>(
+    r: &mut R,
+    file_len: u64,
+    name: &str,
+) -> Result<Option<ZipEntryLoc>, String> {
+    const TRUNC: &str = "zip central directory truncated";
+    let (cd, total_entries) = zip_read_cd(r, file_len)?;
+    let mut at = 0usize;
+    for _ in 0..total_entries {
+        if le32(&cd, at) != Some(CDH_SIG) {
+            return Err("zip central directory corrupt".into());
+        }
+        let method = le16(&cd, at + 10).ok_or(TRUNC)?;
+        let flags = le16(&cd, at + 8).ok_or(TRUNC)?;
+        let compressed = le32(&cd, at + 20).ok_or(TRUNC)?;
+        let uncompressed = le32(&cd, at + 24).ok_or(TRUNC)?;
+        let nlen = usize::from(le16(&cd, at + 28).ok_or(TRUNC)?);
+        let xlen = usize::from(le16(&cd, at + 30).ok_or(TRUNC)?);
+        let clen = usize::from(le16(&cd, at + 32).ok_or(TRUNC)?);
+        let off = le32(&cd, at + 42).ok_or(TRUNC)?;
+        let name_start = at
+            .checked_add(CDH_FIXED)
+            .ok_or("zip central directory corrupt")?;
+        let name_end = name_start
+            .checked_add(nlen)
+            .ok_or("zip central directory corrupt")?;
+        let next = name_end
+            .checked_add(xlen)
+            .and_then(|v| v.checked_add(clen))
+            .ok_or("zip central directory corrupt")?;
+        let raw = cd.get(name_start..name_end).ok_or(TRUNC)?;
+        if next > cd.len() {
+            return Err(TRUNC.into());
+        }
+        if raw == name.as_bytes() {
+            if compressed == 0xFFFF_FFFF || uncompressed == 0xFFFF_FFFF || off == 0xFFFF_FFFF {
+                return Err("zip64 entry: not supported".into());
+            }
+            return Ok(Some(ZipEntryLoc {
+                method,
+                flags,
+                compressed: u64::from(compressed),
+                uncompressed: u64::from(uncompressed),
+                local_header_offset: u64::from(off),
+            }));
+        }
+        at = next;
+    }
+    Ok(None)
+}
+
+/// Absolute offset of an entry's data, after validating its local header.
+pub fn zip_entry_data_offset<R: Read + Seek>(
+    r: &mut R,
+    file_len: u64,
+    loc: &ZipEntryLoc,
+) -> Result<u64, String> {
+    let hdr_end = loc
+        .local_header_offset
+        .checked_add(30)
+        .ok_or("zip local header out of range")?;
+    if hdr_end > file_len {
+        return Err("zip local header out of range".into());
+    }
+    r.seek(SeekFrom::Start(loc.local_header_offset))
+        .map_err(|e| format!("zip seek failed: {e}"))?;
+    let mut h = [0u8; 30];
+    r.read_exact(&mut h)
+        .map_err(|e| format!("zip read failed: {e}"))?;
+    if le32(&h, 0) != Some(0x0403_4b50) {
+        return Err("zip local header corrupt".into());
+    }
+    let nlen = u64::from(le16(&h, 26).ok_or("zip local header truncated")?);
+    let xlen = u64::from(le16(&h, 28).ok_or("zip local header truncated")?);
+    let data = hdr_end
+        .checked_add(nlen)
+        .and_then(|v| v.checked_add(xlen))
+        .ok_or("zip local header out of range")?;
+    let data_end = data
+        .checked_add(loc.compressed)
+        .ok_or("zip entry out of range")?;
+    if data_end > file_len {
+        return Err("zip entry out of range".into());
+    }
+    Ok(data)
 }
 
 fn tar_str(b: &[u8]) -> String {
@@ -633,5 +736,86 @@ mod tests {
         assert_eq!(tar_size(b"\0"), Some(0));
         assert_eq!(tar_size(b"zz"), None);
         assert_eq!(tar_size(&[0xff; 12]), None);
+    }
+    /// One-entry zip with explicit method, flags and sizes.
+    fn zip_one(name: &str, method: u16, flags: u16, data: &[u8], local_off: u32) -> Vec<u8> {
+        let mut out = Vec::new();
+        out.extend_from_slice(b"PK\x03\x04");
+        out.extend_from_slice(&[0u8; 22]);
+        out.extend_from_slice(&(name.len() as u16).to_le_bytes());
+        out.extend_from_slice(&0u16.to_le_bytes());
+        out.extend_from_slice(name.as_bytes());
+        out.extend_from_slice(data);
+        let mut cd = Vec::new();
+        cd.extend_from_slice(&0x0201_4b50u32.to_le_bytes());
+        cd.extend_from_slice(&[0u8; 4]);
+        cd.extend_from_slice(&flags.to_le_bytes());
+        cd.extend_from_slice(&method.to_le_bytes());
+        cd.extend_from_slice(&[0u8; 8]);
+        cd.extend_from_slice(&(data.len() as u32).to_le_bytes());
+        cd.extend_from_slice(&(data.len() as u32).to_le_bytes());
+        cd.extend_from_slice(&(name.len() as u16).to_le_bytes());
+        cd.extend_from_slice(&[0u8; 14]);
+        cd.extend_from_slice(&local_off.to_le_bytes());
+        cd.extend_from_slice(name.as_bytes());
+        let cd_off = out.len() as u32;
+        out.extend_from_slice(&cd);
+        out.extend_from_slice(&0x0605_4b50u32.to_le_bytes());
+        out.extend_from_slice(&[0u8; 4]);
+        out.extend_from_slice(&1u16.to_le_bytes());
+        out.extend_from_slice(&1u16.to_le_bytes());
+        out.extend_from_slice(&(cd.len() as u32).to_le_bytes());
+        out.extend_from_slice(&cd_off.to_le_bytes());
+        out.extend_from_slice(&0u16.to_le_bytes());
+        out
+    }
+
+    #[test]
+    fn zip_find_entry_finds_and_locates_data() {
+        let z = zip_one("word/document.xml", 8, 1, b"abcde", 0);
+        let mut c = Cursor::new(&z[..]);
+        let loc = zip_find_entry(&mut c, z.len() as u64, "word/document.xml")
+            .unwrap()
+            .unwrap();
+        assert_eq!((loc.method, loc.flags, loc.compressed), (8, 1, 5));
+        assert_eq!(loc.uncompressed, 5);
+        let off = zip_entry_data_offset(&mut c, z.len() as u64, &loc).unwrap();
+        assert_eq!(&z[off as usize..off as usize + 5], b"abcde");
+        assert_eq!(
+            zip_find_entry(&mut c, z.len() as u64, "nope").unwrap(),
+            None
+        );
+    }
+
+    #[test]
+    fn zip_entry_offsets_out_of_range_are_errors() {
+        let z = zip_one("a", 0, 0, b"abc", 0xFFFF_FF00);
+        let mut c = Cursor::new(&z[..]);
+        let loc = zip_find_entry(&mut c, z.len() as u64, "a")
+            .unwrap()
+            .unwrap();
+        assert!(zip_entry_data_offset(&mut c, z.len() as u64, &loc).is_err());
+        let z = zip_one("a", 0, 0, b"abc", 3); // not a local header
+        let mut c = Cursor::new(&z[..]);
+        let loc = zip_find_entry(&mut c, z.len() as u64, "a")
+            .unwrap()
+            .unwrap();
+        assert!(zip_entry_data_offset(&mut c, z.len() as u64, &loc).is_err());
+        let mut loc = loc;
+        loc.local_header_offset = u64::MAX - 5;
+        assert!(zip_entry_data_offset(&mut c, z.len() as u64, &loc).is_err());
+        loc.local_header_offset = 0;
+        loc.compressed = u64::MAX;
+        assert!(zip_entry_data_offset(&mut c, z.len() as u64, &loc).is_err());
+    }
+
+    #[test]
+    fn zip_find_entry_corrupt_inputs_never_panic() {
+        let z = zip_one("a", 0, 0, b"abc", 0);
+        for n in 0..z.len() {
+            let mut c = Cursor::new(&z[..n]);
+            let _ = zip_find_entry(&mut c, n as u64, "a");
+        }
+        assert!(zip_find_entry(&mut Cursor::new(&b"x"[..]), 1, "a").is_err());
     }
 }
