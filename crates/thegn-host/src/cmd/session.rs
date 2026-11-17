@@ -393,7 +393,7 @@ fn unix_now_secs() -> i64 {
 pub(crate) fn session_line_at(s: &thegn_svc::control::SessionInfo, now: i64) -> String {
     let output = s
         .last_output_unix_secs
-        .map(|at| format!("  output:{}", format_age(now - at)))
+        .map(|at| format!("  output:{}", format_age(now.saturating_sub(at))))
         .unwrap_or_default();
     let cause = exit_cause(s)
         .map(|c| format!("  cause:{c}"))
