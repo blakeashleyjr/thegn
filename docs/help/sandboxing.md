@@ -909,6 +909,16 @@ On the dev channel, `max_lifetime_secs` is enforced by the Fly and VPS reapers
 machine0 and Sprites, do not enforce it; `thegn config validate` warns when it
 is set. Destroy those instances yourself or set the value to `0`.
 
+A provider env with no remote transport fails closed: it halts before
+provisioning instead of running the session on the host. Fly sessions run on
+the Fly machine over thegn's ssh bridge. Sprites headless sessions use native
+exec and start in the provisioned checkout; `interactive_command` is only used
+with `exec = "cli"`. The provider "provisioned" marker and cached sandbox home
+live in the state dir, so the CLI and daemon agree, and `.thegn-provisioned` is
+excluded from git in remote checkouts. Provisioning fails clearly when Nix is
+required but did not install, and interrupted Nix builds no longer leave the
+store broken.
+
 The Hetzner provider is experimental: its lifecycle has not been verified on a
 live account, and `thegn doctor` says so.
 

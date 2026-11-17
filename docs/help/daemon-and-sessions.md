@@ -211,7 +211,9 @@ unreapable, with `,done` appended for a finished worker (`exited(0,done)`);
 any other final state is a trailing `last:<state>` field. A
 supervisor greps a fixed column instead of parsing the whole line;
 `--live` filters to non-exited rows before serialization, so a `--live
---json` caller never re-filters.
+--json` caller never re-filters. A headless session on a provider sandbox that
+lost its remote exec connection (for example the sprite suspended) shows
+`cause:remote-exec-lost`; the session reattaches after a dropped connection.
 
 `session open --stage <name> --issue <id>` is the pipeline's one-call
 dispatch: it renders the stage's prompt template, inserts the roster row,
