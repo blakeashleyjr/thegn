@@ -422,6 +422,86 @@ pub fn session_url(
     ))
 }
 
+/// Built-in interactive-host suffixes (all Vercel-owned; never `vercel.app`).
+pub const DEFAULT_INTERACTIVE_HOST_SUFFIXES: &[&str] = &["vercel.run", "vercel.sh", "vercel.com"];
+
+/// Whether `host` may carry the interactive WebSocket: exact or dot-suffix
+/// match against `suffixes` (empty → the built-in defaults). IP literals and
+/// empty hosts are refused.
+pub fn interactive_host_allowed(host: &str, suffixes: &[String]) -> bool {
+    let h = host.trim().trim_end_matches('.').to_ascii_lowercase();
+    if h.is_empty() || h.parse::<std::net::IpAddr>().is_ok() || h.starts_with('[') {
+        return false;
+    }
+    let matches = |s: &str| {
+        let s = s.trim().to_ascii_lowercase();
+        !s.is_empty()
+            && (h == s
+                || h.strip_suffix(s.as_str())
+                    .is_some_and(|rest| rest.ends_with('.')))
+    };
+    if suffixes.is_empty() {
+        DEFAULT_INTERACTIVE_HOST_SUFFIXES.iter().any(|s| matches(s))
+    } else {
+        suffixes.iter().any(|s| matches(s))
+    }
+}
+
+/// Parse the current session's usage from a sandbox response. `Ok(None)` when
+/// there is no `session` object; optional fields may be absent.
+pub fn parse_session_usage(
+    v: &serde_json::Value,
+) -> Result<Option<crate::vercel::usage::SessionUsage>, ApiParseError> {
+    let Some(s) = v.get("session").filter(|s| s.is_object()) else {
+        return Ok(None);
+    };
+    Ok(Some(crate::vercel::usage::SessionUsage {
+        active_cpu_ms: s.get("activeCpuDurationMs").and_then(|x| x.as_u64()),
+        memory_mb: s.get("memory").and_then(|x| x.as_u64()),
+        vcpus: s
+            .get("vcpus")
+            .and_then(|x| x.as_u64())
+            .and_then(|n| u32::try_from(n).ok()),
+        started_at_ms: s.get("startedAt").and_then(|x| x.as_i64()),
+        stopped_at_ms: s.get("stoppedAt").and_then(|x| x.as_i64()),
+    }))
+}
+
+/// Cap on snapshots read from one response.
+pub const MAX_SNAPSHOTS: usize = 1_000;
+
+/// Parse a snapshots page: `snapshots[]` (capped at [`MAX_SNAPSHOTS`]) and
+/// `pagination.next`. Elements without an id are skipped.
+pub fn parse_snapshots(
+    v: &serde_json::Value,
+) -> Result<(Vec<crate::vercel::usage::SnapshotUsage>, Option<String>), ApiParseError> {
+    let arr = v
+        .get("snapshots")
+        .and_then(|x| x.as_array())
+        .ok_or_else(|| bad("vercel: snapshots page has no snapshots array"))?;
+    let items = arr
+        .iter()
+        .filter_map(|o| {
+            Some(crate::vercel::usage::SnapshotUsage {
+                id: str_of(o, "id")?,
+                size_bytes: o.get("sizeBytes").and_then(|x| x.as_u64()).unwrap_or(0),
+                expires_at_ms: o.get("expiresAt").and_then(|x| x.as_i64()),
+                status: str_of(o, "status").unwrap_or_default(),
+            })
+        })
+        .take(MAX_SNAPSHOTS)
+        .collect();
+    let next = v
+        .get("pagination")
+        .and_then(|p| p.get("next"))
+        .and_then(|n| match n {
+            serde_json::Value::String(s) if !s.is_empty() => Some(s.clone()),
+            serde_json::Value::Number(n) => Some(n.to_string()),
+            _ => None,
+        });
+    Ok((items, next))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -724,5 +804,65 @@ mod tests {
     fn errors_and_defaults() {
         assert_eq!(ApiParseError("x").to_string(), "x");
         assert_eq!(DEFAULT_API_BASE, "https://api.vercel.com");
+    }
+
+    #[test]
+    fn interactive_host_matching() {
+        let none: Vec<String> = vec![];
+        assert!(interactive_host_allowed("a.vercel.run", &none));
+        assert!(interactive_host_allowed("VERCEL.RUN", &none));
+        assert!(interactive_host_allowed("x.vercel.com.", &none));
+        assert!(!interactive_host_allowed("vercel.run.evil.com", &none));
+        assert!(!interactive_host_allowed("evilvercel.run", &none));
+        assert!(!interactive_host_allowed("a.vercel.app", &none));
+        assert!(!interactive_host_allowed("1.2.3.4", &none));
+        assert!(!interactive_host_allowed("::1", &none));
+        assert!(!interactive_host_allowed("[::1]", &none));
+        assert!(!interactive_host_allowed("", &none));
+        let custom = vec!["Example.org".to_string(), String::new()];
+        assert!(interactive_host_allowed("a.example.org", &custom));
+        assert!(!interactive_host_allowed("a.vercel.run", &custom));
+    }
+
+    #[test]
+    fn session_usage_parse() {
+        assert_eq!(parse_session_usage(&json!({})).unwrap(), None);
+        let u = parse_session_usage(&json!({"session": {
+            "activeCpuDurationMs": 5, "memory": 2048, "vcpus": 2,
+            "startedAt": 10, "stoppedAt": 20}}))
+        .unwrap()
+        .unwrap();
+        assert_eq!(u.active_cpu_ms, Some(5));
+        assert_eq!(u.memory_mb, Some(2048));
+        assert_eq!(u.vcpus, Some(2));
+        assert_eq!((u.started_at_ms, u.stopped_at_ms), (Some(10), Some(20)));
+        let e = parse_session_usage(&json!({"session": {}}))
+            .unwrap()
+            .unwrap();
+        assert_eq!(e, crate::vercel::usage::SessionUsage::default());
+    }
+
+    #[test]
+    fn snapshots_parse_and_cap() {
+        let (s, next) = parse_snapshots(&json!({
+            "snapshots": [
+                {"id": "a", "sizeBytes": 7, "status": "created", "expiresAt": 9},
+                {"sizeBytes": 1},
+                {"id": "b"}],
+            "pagination": {"next": "c1"}}))
+        .unwrap();
+        assert_eq!(s.len(), 2);
+        assert_eq!((s[0].size_bytes, s[0].status.as_str()), (7, "created"));
+        assert_eq!(s[1].status, "");
+        assert_eq!(next.as_deref(), Some("c1"));
+        assert!(parse_snapshots(&json!({})).is_err());
+        let many: Vec<_> = (0..1200).map(|i| json!({"id": format!("s{i}")})).collect();
+        let (s, next) =
+            parse_snapshots(&json!({"snapshots": many, "pagination": {"next": 5}})).unwrap();
+        assert_eq!(s.len(), MAX_SNAPSHOTS);
+        assert_eq!(next.as_deref(), Some("5"));
+        let (_, n) =
+            parse_snapshots(&json!({"snapshots": [], "pagination": {"next": ""}})).unwrap();
+        assert_eq!(n, None);
     }
 }
