@@ -291,7 +291,8 @@ mod tests {
 
     #[test]
     fn validate_request_bounds_every_field() {
-        let cases: Vec<Box<dyn Fn(&mut ApprovalRequest)>> = vec![
+        type Mutate = Box<dyn Fn(&mut ApprovalRequest)>;
+        let cases: Vec<Mutate> = vec![
             Box::new(|r| r.issue_id = String::new()),
             Box::new(|r| r.issue_id = "x".repeat(MAX_ISSUE_ID + 1)),
             Box::new(|r| r.issue_id = "linear:THE\n1".into()),
