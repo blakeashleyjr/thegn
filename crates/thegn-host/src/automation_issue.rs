@@ -62,7 +62,7 @@ pub(crate) fn emit_matched(
         tracing::info!(
             target: "thegn::automation",
             overflow,
-            "issue_matched candidates past the per-refresh cap wait for a later refresh"
+            "issue_matched candidates past the per-refresh cap are dropped"
         );
     }
     let now = thegn_core::util::now();

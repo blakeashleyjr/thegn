@@ -433,9 +433,10 @@ fn run_once(request: RefreshRequest) {
             .get_issue_cache(&repo_key, provider, &account)
             .ok()
             .flatten();
-        let had_cache = cached.is_some();
-        let old_issues: Vec<thegn_core::issue::Issue> = cached
-            .and_then(|(j, _)| IssueCacheEntry::parse(&j).map(|entry| entry.issues))
+        let parsed = cached.and_then(|(j, _)| IssueCacheEntry::parse(&j));
+        let had_cache = parsed.is_some();
+        let old_issues: Vec<thegn_core::issue::Issue> = parsed
+            .map(|entry| entry.issues)
             .unwrap_or_default()
             .into_iter()
             .filter(|issue| thegn_svc::issue::validate_issue_identity(issue).is_ok())
