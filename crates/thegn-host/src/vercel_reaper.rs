@@ -166,6 +166,20 @@ fn reap_unambiguous(pc: &EnvProviderConfig, kept: &mut crate::reaper_policy::Kep
         return;
     };
     let account = provider.account();
+    let controller_tag = match thegn_svc::vps::controller::controller_id() {
+        Ok(id) => policy::tags_for(&id, "", "")
+            .remove("thegn-controller")
+            .unwrap_or_default(),
+        Err(error) => {
+            for rec in &records {
+                kept.keep(&rec.name, format!(
+                    "vercel reaper: quarantined {}: controller id unavailable ({error:#}); no deletion attempted",
+                    rec.name
+                ));
+            }
+            return;
+        }
+    };
     let mut owners = LazyOwners::default();
     let live = LiveVercel {
         provider: &provider,
@@ -197,6 +211,7 @@ fn reap_unambiguous(pc: &EnvProviderConfig, kept: &mut crate::reaper_policy::Kep
             owner_alive,
             &live,
             &mut ledger,
+            &controller_tag,
         );
         match outcome {
             Outcome::Idle => {}
@@ -236,6 +251,18 @@ fn reap_unambiguous(pc: &EnvProviderConfig, kept: &mut crate::reaper_policy::Kep
                     }
                 };
             let ids: Vec<String> = rows.into_iter().map(|r| r.id).collect();
+            let invalid = ids
+                .iter()
+                .filter(|id| !thegn_core::vercel::admit::valid_sandbox_name(id))
+                .count();
+            if invalid > 0 {
+                kept.keep(
+                    KIND,
+                    format!(
+                        "vercel reaper: {invalid} listed sandbox name(s) failed validation; not shown"
+                    ),
+                );
+            }
             for name in orphans(&ids, &known) {
                 kept.keep(&name, orphan_message(&name));
             }
@@ -257,6 +284,7 @@ fn orphan_message(name: &str) -> String {
 fn orphans(ids: &[String], known: &HashSet<&str>) -> Vec<String> {
     let mut out: Vec<String> = ids
         .iter()
+        .filter(|id| thegn_core::vercel::admit::valid_sandbox_name(id))
         .filter(|id| !known.contains(id.as_str()))
         .cloned()
         .collect();
@@ -299,7 +327,9 @@ fn owner_alive(owner: &str, registered: Option<&HashSet<String>>) -> bool {
     if owner.is_empty() {
         return true;
     }
-    registered.is_none_or(|set| set.contains(owner))
+    registered
+        .filter(|set| !set.is_empty())
+        .is_none_or(|set| set.contains(owner))
 }
 
 fn account_quarantine(record: &registry::VpsRecord, ours: &Result<String>) -> Option<String> {
@@ -422,11 +452,12 @@ fn reconcile_record(
     owner_alive: bool,
     remote: &impl VercelRemote,
     ledger: &mut impl VercelLedger,
+    controller_tag: &str,
 ) -> Outcome {
     let name = rec.name.as_str();
     let kept = |why: String| Outcome::Kept(format!("vercel reaper: kept {name}: {why}"));
     if rec.state == "creating" {
-        return reconcile_creating(rec, now_secs, remote, ledger);
+        return reconcile_creating(rec, now_secs, remote, ledger, controller_tag);
     }
     let view = match remote.view(name) {
         Ok(Some(view)) => view,
@@ -458,6 +489,9 @@ fn reconcile_record(
         ReapAction::Keep => Outcome::Idle,
         ReapAction::Quarantine(reason) => kept(format!("{reason}; no action attempted")),
         ReapAction::Stop => {
+            if !proven_ours(&view, rec, controller_tag) {
+                return kept(NOT_OURS.into());
+            }
             if !ledger.unchanged(rec) {
                 return kept(
                     "the ledger record changed during this pass; next pass will retry; no action attempted"
@@ -480,6 +514,9 @@ fn reconcile_record(
             }
         }
         ReapAction::Delete => {
+            if !proven_ours(&view, rec, controller_tag) {
+                return kept(NOT_OURS.into());
+            }
             if !ledger.unchanged(rec) {
                 return kept(
                     "the ledger record changed during this pass; next pass will retry; no deletion attempted"
@@ -504,6 +541,7 @@ fn reconcile_creating(
     now_secs: i64,
     remote: &impl VercelRemote,
     ledger: &mut impl VercelLedger,
+    controller_tag: &str,
 ) -> Outcome {
     let name = rec.name.as_str();
     let kept = |why: String| Outcome::Kept(format!("vercel reaper: kept {name}: {why}"));
@@ -521,7 +559,16 @@ fn reconcile_creating(
         );
     }
     let present = match remote.view(name) {
-        Ok(view) => view.is_some(),
+        Ok(Some(v)) => {
+            let landed_after_intent = v
+                .created_at_ms
+                .is_some_and(|c| c >= rec.created_at.saturating_sub(300).saturating_mul(1000));
+            if !proven_ours(&v, rec, controller_tag) || !landed_after_intent {
+                return kept(NOT_OURS.into());
+            }
+            true
+        }
+        Ok(None) => false,
         Err(error) => {
             return kept(format!(
                 "stale create status unavailable ({error:#}); next pass will retry"
@@ -547,6 +594,20 @@ fn reconcile_creating(
         )),
     }
 }
+
+/// The remote sandbox carries this controller's tag (and the ledger owner's
+/// tag when one is recorded): the proof thegn created it.
+fn proven_ours(view: &SandboxView, rec: &registry::VpsRecord, controller_tag: &str) -> bool {
+    if controller_tag.is_empty()
+        || view.tags.get("thegn-controller").map(String::as_str) != Some(controller_tag)
+    {
+        return false;
+    }
+    rec.owner.is_empty()
+        || view.tags.get("thegn-owner") == policy::tags_for("", &rec.owner, "").get("thegn-owner")
+}
+
+const NOT_OURS: &str = "the Vercel sandbox does not carry this controller's ownership tags; not provably created by thegn; no action attempted";
 
 /// Fail-closed order: route-token revocation, remote delete (sandbox and its
 /// snapshots), then local retirement. Only a successful remote delete may
@@ -595,7 +656,7 @@ mod tests {
             vcpus: Some(2),
             region: None,
             created_at_ms,
-            tags: BTreeMap::new(),
+            tags: BTreeMap::from([("thegn-controller".to_string(), "ctl-1".to_string())]),
             cwd: None,
         }
     }
@@ -660,7 +721,7 @@ mod tests {
 
     fn run(rec: &registry::VpsRecord, fake: &Fake, owner_alive: bool) -> Outcome {
         let mut ledger = fake;
-        reconcile_record(rec, NOW, 600, owner_alive, fake, &mut ledger)
+        reconcile_record(rec, NOW, 600, owner_alive, fake, &mut ledger, "ctl-1")
     }
 
     #[test]
@@ -749,7 +810,10 @@ mod tests {
     fn a_stale_creating_record_is_deleted_then_dropped() {
         let mut rec = record("creating", "");
         rec.created_at = NOW - CREATING_STALE_SECS as i64 - 1;
-        let fake = Fake::new(Ok(Some(sandbox(SessionStatus::Pending, None))));
+        let fake = Fake::new(Ok(Some(sandbox(
+            SessionStatus::Pending,
+            Some((NOW - CREATING_STALE_SECS as i64 - 1) * 1000),
+        ))));
         assert_eq!(run(&rec, &fake, true), Outcome::Dropped);
         assert_eq!(fake.calls(), ["view", "revoke", "delete", "retire"]);
 
@@ -789,7 +853,7 @@ mod tests {
         // A stale create whose delete fails is kept, never dropped.
         let mut rec = record("creating", "");
         rec.created_at = 1;
-        let mut fake = Fake::new(Ok(Some(sandbox(SessionStatus::Running, None))));
+        let mut fake = Fake::new(Ok(Some(sandbox(SessionStatus::Running, Some(1000)))));
         fake.fail = Some("delete");
         assert!(matches!(run(&rec, &fake, true), Outcome::Kept(_)));
         assert!(!fake.calls().contains(&"retire"));
@@ -869,6 +933,7 @@ mod tests {
         // Legacy (empty) owner and an unreadable worktree set are alive.
         assert!(owner_alive("", Some(&set)));
         assert!(owner_alive(&b, None));
+        assert!(owner_alive(&b, Some(&HashSet::new())));
     }
 
     #[test]
@@ -899,8 +964,95 @@ mod tests {
             "tg-b".to_string(),
             "tg-c".to_string(),
             "broken".to_string(),
+            "Tg-\u{1b}[2J".to_string(),
         ];
         assert_eq!(orphans(&ids, &known), ["tg-b", "tg-c"]);
         assert!(orphan_message("tg-b").contains("not deleted automatically"));
+    }
+
+    fn ms(age: i64) -> Option<i64> {
+        Some((NOW - age) * 1000)
+    }
+
+    #[test]
+    fn look_alike_sandboxes_are_never_stopped_or_deleted() {
+        for alive in [true, false] {
+            let mut view = sandbox(SessionStatus::Running, Some((NOW - 700) * 1000));
+            view.tags
+                .insert("thegn-controller".to_string(), "other".to_string());
+            let fake = Fake::new(Ok(Some(view)));
+            let outcome = run(&record("ready", ""), &fake, alive);
+            assert!(matches!(outcome, Outcome::Kept(_)), "{alive}: {outcome:?}");
+            assert_eq!(fake.calls(), ["view"], "owner_alive={alive}");
+        }
+
+        let mut rec = record("creating", "");
+        rec.created_at = NOW - CREATING_STALE_SECS as i64 - 1;
+        let mut view = sandbox(SessionStatus::Running, Some(rec.created_at * 1000));
+        view.tags
+            .insert("thegn-controller".to_string(), "other".to_string());
+        let fake = Fake::new(Ok(Some(view)));
+        assert!(matches!(run(&rec, &fake, true), Outcome::Kept(_)));
+        assert_eq!(fake.calls(), ["view"]);
+
+        let fake = Fake::new(Ok(Some(sandbox(
+            SessionStatus::Running,
+            Some((rec.created_at - 301) * 1000),
+        ))));
+        assert!(matches!(run(&rec, &fake, true), Outcome::Kept(_)));
+        assert_eq!(fake.calls(), ["view"]);
+    }
+
+    #[test]
+    fn running_sandbox_at_the_ceiling_is_stopped_and_marked_expired() {
+        let fake = Fake::new(Ok(Some(sandbox(SessionStatus::Running, ms(600)))));
+        assert_eq!(run(&record("ready", ""), &fake, true), Outcome::Stopped);
+        assert_eq!(fake.calls(), ["view", "stop", "mark_expired"]);
+    }
+
+    #[test]
+    fn an_expired_record_is_stopped_without_remarking() {
+        let fake = Fake::new(Ok(Some(sandbox(SessionStatus::Running, ms(600)))));
+        assert_eq!(
+            run(&record(STATE_EXPIRED, ""), &fake, true),
+            Outcome::Stopped
+        );
+        assert_eq!(fake.calls(), ["view", "stop"]);
+    }
+
+    #[test]
+    fn a_failed_stop_keeps_the_record_unmarked() {
+        let mut fake = Fake::new(Ok(Some(sandbox(SessionStatus::Running, ms(600)))));
+        fake.fail = Some("stop");
+        assert!(matches!(
+            run(&record("ready", ""), &fake, true),
+            Outcome::Kept(_)
+        ));
+        assert_eq!(fake.calls(), ["view", "stop"]);
+    }
+
+    #[test]
+    fn a_stopped_sandbox_is_deleted_only_after_the_grace_period() {
+        use thegn_core::vercel::policy::DELETE_GRACE_SECS;
+        let fake = Fake::new(Ok(Some(sandbox(
+            SessionStatus::Stopped,
+            ms(600 + DELETE_GRACE_SECS as i64 - 1),
+        ))));
+        assert_eq!(run(&record("ready", ""), &fake, true), Outcome::Idle);
+        assert_eq!(fake.calls(), ["view"]);
+
+        let fake = Fake::new(Ok(Some(sandbox(
+            SessionStatus::Stopped,
+            ms(600 + DELETE_GRACE_SECS as i64),
+        ))));
+        assert_eq!(run(&record("ready", ""), &fake, true), Outcome::Deleted);
+        assert_eq!(fake.calls(), ["view", "revoke", "delete", "retire"]);
+    }
+
+    #[test]
+    fn a_sandbox_whose_owner_is_gone_is_deleted() {
+        let fake = Fake::new(Ok(Some(sandbox(SessionStatus::Running, ms(10)))));
+        assert_eq!(run(&record("ready", ""), &fake, false), Outcome::Deleted);
+        assert_eq!(fake.calls(), ["view", "revoke", "delete", "retire"]);
     }
 }
