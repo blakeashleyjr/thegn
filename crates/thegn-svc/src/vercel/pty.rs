@@ -320,7 +320,7 @@ mod tests {
         F: FnOnce(tokio_tungstenite::WebSocketStream<tokio::net::TcpStream>) -> Fut
             + Send
             + 'static,
-        Fut: std::future::Future<Output = ()> + Send,
+        Fut: std::future::Future<Output = ()> + Send + 'static,
     {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
             .await
