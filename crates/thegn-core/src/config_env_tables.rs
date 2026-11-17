@@ -320,6 +320,11 @@ impl EnvProviderConfig {
     /// on for commodity VPS (bills while it exists) and off for scale-to-zero
     /// providers (idle compute already ~free).
     pub fn hibernate_enabled(&self) -> bool {
+        // Vercel: no hibernation in b154. Its snapshot semantics differ, and the
+        // hibernator's background exec would resume a stopped sandbox.
+        if EnvProviderKind::of(&self.provider) == EnvProviderKind::Vercel {
+            return false;
+        }
         match self.hibernate {
             HibernateMode::On => true,
             HibernateMode::Off => false,
@@ -1153,6 +1158,12 @@ mod tests {
         assert!(!provider_env("vercel").hibernate_enabled());
         assert!(!wss_native_provider_kind("vercel"));
         assert!(!ssh_reached_provider_kind("vercel"));
+        let mut on = provider_env("vercel");
+        on.hibernate = HibernateMode::On;
+        assert!(
+            !on.hibernate_enabled(),
+            "explicit on never hibernates vercel"
+        );
     }
 
     #[test]
