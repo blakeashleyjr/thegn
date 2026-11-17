@@ -78,18 +78,10 @@ pub(crate) fn track_integration(
     let issue_id = format!("local:{label}");
     let (issue_id, canonical_worktree) =
         crate::cmd::dispatch::dispatch_identity(&issue_id, worktree)?;
-    let mut rows = db.list_dispatches()?;
-    rows.sort_by_key(|row| row.id);
-
-    let existing_plain = rows.iter().rev().find(|row| {
-        row.worktree_path == canonical_worktree
-            && row.stage.is_none()
-            && row.agent_name == agent_name
-    });
-    let active = rows
-        .iter()
-        .rev()
-        .find(|row| row.worktree_path == canonical_worktree && row.status.is_active());
+    let existing_plain =
+        db.latest_plain_dispatch_for_worktree_agent(&canonical_worktree, agent_name)?;
+    let active = db.latest_active_dispatch_for_worktree(&canonical_worktree)?;
+    let active = active.as_ref();
     if active.is_some_and(|row| row.agent_name != agent_name || row.stage.is_some()) {
         return Ok(());
     }
@@ -98,7 +90,10 @@ pub(crate) fn track_integration(
         IntegrationOutcome::Landed => AgentDispatchStatus::Done,
         IntegrationOutcome::RefusedGate => AgentDispatchStatus::Failed,
     };
-    if existing_plain.is_some_and(|row| !row.status.is_active() && row.status == target) {
+    if existing_plain
+        .as_ref()
+        .is_some_and(|row| !row.status.is_active() && row.status == target)
+    {
         return Ok(());
     }
 
@@ -127,6 +122,34 @@ pub(crate) fn track_integration(
     db.set_dispatch_status_checked(row_id, AgentDispatchStatus::Running, target, Some(label))
 }
 
+/// Fail closed when `issue_id` already has an active row, or when the active
+/// roster exceeds `limit` rows so a duplicate cannot be ruled out.
+fn refuse_active_issue(db: &Db, issue_id: &str, limit: usize) -> Result<()> {
+    const ACTIVE: [AgentDispatchStatus; 5] = [
+        AgentDispatchStatus::Queued,
+        AgentDispatchStatus::Spawning,
+        AgentDispatchStatus::Running,
+        AgentDispatchStatus::WaitingHuman,
+        AgentDispatchStatus::PrOpen,
+    ];
+    let (rows, truncated) = db.list_dispatches_with_status(&ACTIVE, limit)?;
+    if let Some(row) = rows
+        .iter()
+        .find(|row| thegn_core::pipeline_identity::same_issue(&row.issue_id, issue_id))
+    {
+        anyhow::bail!(
+            "issue {issue_id} already has an active dispatch row {}; finish, fail, or abandon it before tracking another plain session",
+            row.id
+        );
+    }
+    if truncated {
+        anyhow::bail!(
+            "more than {limit} active dispatch rows; refusing to track a plain session because a duplicate cannot be ruled out"
+        );
+    }
+    Ok(())
+}
+
 fn insert_and_start_with_status(
     db: &Db,
     issue_id: &str,
@@ -137,15 +160,7 @@ fn insert_and_start_with_status(
 ) -> Result<i64> {
     let (issue_id, worktree_path) =
         crate::cmd::dispatch::dispatch_identity(issue_id, worktree_path)?;
-    if let Some(row) = db.list_dispatches()?.into_iter().find(|row| {
-        row.status.is_active()
-            && thegn_core::pipeline_identity::same_issue(&row.issue_id, &issue_id)
-    }) {
-        anyhow::bail!(
-            "issue {issue_id} already has an active dispatch row {}; finish, fail, or abandon it before tracking another plain session",
-            row.id
-        );
-    }
+    refuse_active_issue(db, &issue_id, Db::ROSTER_ACTIVE_LIMIT)?;
     let row_id = db.put_dispatch_with_parent_check(track_row(
         &issue_id,
         &worktree_path,
@@ -556,5 +571,37 @@ mod tests {
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].status, AgentDispatchStatus::Failed);
         assert_eq!(rows[0].agent_name, "integrate");
+    }
+
+    #[test]
+    fn refuse_active_issue_fails_closed_when_the_active_roster_is_truncated() {
+        let state = crate::testenv::IsolatedState::new();
+        let (_repo_dir, worktree) = git_repo();
+        let db = db(&state);
+        let path = worktree.to_str().expect("utf8 worktree");
+        insert_and_start(&db, "linear:CAP-1", path, "coder", "s1").expect("row 1");
+        insert_and_start(&db, "linear:CAP-2", path, "coder", "s2").expect("row 2");
+        let error = super::refuse_active_issue(&db, "linear:CAP-3", 1)
+            .expect_err("truncated active roster must refuse");
+        assert!(format!("{error:#}").contains("more than 1 active dispatch rows"));
+        super::refuse_active_issue(&db, "linear:CAP-3", 2).expect("complete roster, no dup");
+    }
+
+    #[test]
+    fn track_integration_is_a_no_op_beside_an_active_staged_row() {
+        let state = crate::testenv::IsolatedState::new();
+        let (_repo_dir, worktree) = git_repo();
+        let db = db(&state);
+        let path = worktree.to_str().expect("utf8 worktree");
+        let (_, canonical) =
+            crate::cmd::dispatch::dispatch_identity("local:tracked", path).expect("identity");
+        let mut new = thegn_core::issue::NewDispatch::new("linear:STG-1", &canonical, "land");
+        new.stage = Some("code");
+        db.put_dispatch_with_parent_check(new).expect("staged row");
+        track_integration(&db, path, "tracked", "land", IntegrationOutcome::Landed)
+            .expect("no-op beside staged active row");
+        let rows = db.list_dispatches().expect("roster list");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].status, AgentDispatchStatus::Queued);
     }
 }
