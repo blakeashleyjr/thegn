@@ -10,10 +10,13 @@
 
 use anyhow::Result;
 use std::collections::VecDeque;
+use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 use thegn_core::config::Config;
-use thegn_core::outln;
+use thegn_core::db::Db;
 use thegn_core::pipeline_report::display_cell;
+use thegn_core::store::WorkspaceStore;
+use thegn_core::{msg, outln};
 use thegn_svc::control::client::{AttachControl, ControlClient};
 
 /// Bytes of session output `--wait` keeps (a ring: the oldest bytes drop).
@@ -27,6 +30,7 @@ pub(crate) const DEFAULT_TIMEOUT_SECS: u64 = 3600;
 pub(crate) struct RunArgs {
     pub agent: String,
     pub worktree: String,
+    pub env: Option<String>,
     pub brief_file: Option<String>,
     pub prompt: Option<String>,
     pub vars: Vec<String>,
@@ -221,6 +225,106 @@ pub(crate) fn output_tail(raw: &[u8]) -> String {
     tail_lines(&strip_ansi(raw), TAIL_LINES)
 }
 
+/// The env every `agent run` onto an unbound worktree is pinned to.
+pub(crate) const PIPELINE_ENV: &str = "pipeline";
+
+/// What `agent run` does with the worktree's env selection before the open.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum EnvChoice {
+    /// Pin the worktree to this env (a DB worktree selection, like `env set`).
+    Pin(String),
+    /// The worktree (or its workspace/repo) already selects an env: keep it.
+    Keep,
+    /// No selection and no `[env.pipeline]`: the default resolution applies.
+    KeepNoPipeline,
+}
+
+/// Decide the env pin. `has_selection`: a DB worktree/workspace env, a repo
+/// overlay `env = "…"`, or a stored provider location binds the worktree
+/// (`[sandbox] default_env` does not).
+/// Pure.
+pub(crate) fn env_choice(
+    explicit: Option<&str>,
+    has_selection: bool,
+    pipeline_defined: bool,
+) -> EnvChoice {
+    match explicit {
+        Some(name) => EnvChoice::Pin(name.to_string()),
+        None if has_selection => EnvChoice::Keep,
+        None if pipeline_defined => EnvChoice::Pin(PIPELINE_ENV.to_string()),
+        None => EnvChoice::KeepNoPipeline,
+    }
+}
+
+/// The repo root a worktree's workspace/overlay selection is keyed by.
+fn repo_root_of(db: &Db, wt: &str) -> PathBuf {
+    db.repo_root_for(wt)
+        .ok()
+        .flatten()
+        .filter(|s| !s.is_empty())
+        .map(PathBuf::from)
+        .or_else(|| thegn_core::repo::main_worktree(Path::new(wt)))
+        .unwrap_or_else(|| PathBuf::from(wt))
+}
+
+/// Apply the `agent run` env pin to `wt` in the real DB. Blocking (the
+/// stable-daemon probe builds its own runtime): call off the async runtime.
+fn pin_env_blocking(cfg: &Config, wt: &str, explicit: Option<&str>) -> Result<Option<String>> {
+    let db = Db::open()?;
+    let repo_root = repo_root_of(&db, wt);
+    pin_env_for_run(cfg, &db, wt, &repo_root, explicit)
+}
+
+/// Pin `wt`'s env for `agent run` per [`env_choice`]. Returns the env pinned
+/// by this run (`None` when the existing resolution is kept). Notes go to
+/// stderr; stdout belongs to `--json`. Never calls `cmd::env::set` (it prints
+/// to stdout and reconciles provider locations): a worktree carrying a
+/// provider location is refused instead of re-pinned under it.
+pub(crate) fn pin_env_for_run(
+    cfg: &Config,
+    db: &Db,
+    wt: &str,
+    repo_root: &Path,
+    explicit: Option<&str>,
+) -> Result<Option<String>> {
+    let explicit = match explicit.map(str::trim) {
+        Some("") => anyhow::bail!("--env needs an env name"),
+        other => other,
+    };
+    let repo_s = repo_root.to_string_lossy();
+    let selected = db.effective_env_selection(wt, &repo_s)?.name;
+    let provider_bound =
+        crate::provider_git::is_provider_location(wt, db.location_for(wt)?.as_deref());
+    let has_selection =
+        selected.is_some() || provider_bound || !cfg.repo_env_name(repo_root).is_empty();
+    match env_choice(explicit, has_selection, cfg.env.contains_key(PIPELINE_ENV)) {
+        EnvChoice::Keep => Ok(None),
+        EnvChoice::KeepNoPipeline => {
+            msg::info(&format!(
+                "agent run: [env.{PIPELINE_ENV}] is not defined, so {wt} keeps its default env resolution"
+            ));
+            Ok(None)
+        }
+        EnvChoice::Pin(name) => {
+            if name != "default" && !cfg.env.contains_key(&name) {
+                msg::warn(&format!(
+                    "environment {name:?} is not defined under [env.{name}]; it will resolve to the default until you add it"
+                ));
+            }
+            crate::cmd::wt::refuse_dev_env_on_stable_daemon(cfg, Some(&name))?;
+            if provider_bound && selected.as_deref() != Some(name.as_str()) {
+                anyhow::bail!(
+                    "{wt} carries a provider location and agent run would pin it to env {name}; \
+                     run `thegn env set {name} --worktree {wt}` first"
+                );
+            }
+            db.set_worktree_env(wt, &name)?;
+            msg::info(&format!("agent run: worktree {wt} → env {name}"));
+            Ok(Some(name))
+        }
+    }
+}
+
 /// Run `thegn agent run`.
 pub(crate) fn run(cfg: &Config, args: RunArgs) -> Result<()> {
     let rt = tokio::runtime::Runtime::new()?;
@@ -235,6 +339,7 @@ async fn run_async(cfg: &Config, args: RunArgs) -> Result<i32> {
     let RunArgs {
         agent,
         worktree,
+        env,
         brief_file,
         prompt,
         vars,
@@ -276,6 +381,15 @@ async fn run_async(cfg: &Config, args: RunArgs) -> Result<i32> {
     let wt = crate::cmd::resolve_worktree(Some(worktree.clone()))
         .to_string_lossy()
         .into_owned();
+    // Pin the env before provisioning, so provisioning and the open both see
+    // it. Off the runtime: the stable-daemon probe blocks on its own runtime.
+    let pinned = {
+        let cfg = cfg.clone();
+        let wt = wt.clone();
+        tokio::task::spawn_blocking(move || pin_env_blocking(&cfg, &wt, env.as_deref()))
+            .await
+            .map_err(|e| anyhow::anyhow!("agent run env pin task failed: {e}"))??
+    };
     crate::cmd::env::provision_for_headless_open(cfg, wt).await?;
     let started = Instant::now();
     let (info, row) = crate::cmd::session::open_plain(
@@ -297,7 +411,11 @@ async fn run_async(cfg: &Config, args: RunArgs) -> Result<i32> {
     .await?;
     if !wait {
         if json {
-            crate::cmd::emit_json(&serde_json::json!({ "session": info.id, "row": row }))?;
+            crate::cmd::emit_json(&serde_json::json!({
+                "session": info.id,
+                "row": row,
+                "env": pinned,
+            }))?;
         } else {
             outln!("{}", display_cell(&info.id));
             if let Some(row) = row {
@@ -314,6 +432,7 @@ async fn run_async(cfg: &Config, args: RunArgs) -> Result<i32> {
         crate::cmd::emit_json(&serde_json::json!({
             "session": info.id,
             "row": row,
+            "env": pinned,
             "status": status.label(),
             "exit_code": status.exit_code(),
             "output_tail": tail,
@@ -397,9 +516,144 @@ async fn observe_until_exit(
 #[cfg(test)]
 mod tests {
     use super::{
-        DEFAULT_TIMEOUT_SECS, TAIL_BYTES, TAIL_LINES, TailRing, WaitStatus, output_tail,
-        process_exit_code, strip_ansi, tail_lines,
+        DEFAULT_TIMEOUT_SECS, EnvChoice, PIPELINE_ENV, TAIL_BYTES, TAIL_LINES, TailRing,
+        WaitStatus, env_choice, output_tail, pin_env_for_run, process_exit_code, strip_ansi,
+        tail_lines,
     };
+    use thegn_core::config::Config;
+    use thegn_core::db::Db;
+    use thegn_core::store::WorkspaceStore;
+    use thegn_core::testenv::IsolatedState;
+
+    #[test]
+    fn env_choice_table() {
+        let pin = |n: &str| EnvChoice::Pin(n.to_string());
+        // (explicit, has_selection, pipeline_defined) -> choice
+        let cases = [
+            (Some("host"), false, false, pin("host")),
+            (Some("host"), false, true, pin("host")),
+            (Some("host"), true, false, pin("host")),
+            (Some("host"), true, true, pin("host")),
+            (None, true, true, EnvChoice::Keep),
+            (None, true, false, EnvChoice::Keep),
+            (None, false, true, pin(PIPELINE_ENV)),
+            (None, false, false, EnvChoice::KeepNoPipeline),
+        ];
+        for (explicit, has_selection, pipeline_defined, want) in cases {
+            assert_eq!(
+                env_choice(explicit, has_selection, pipeline_defined),
+                want,
+                "{explicit:?} {has_selection} {pipeline_defined}"
+            );
+        }
+        assert_eq!(PIPELINE_ENV, "pipeline");
+    }
+
+    fn cfg_with_envs() -> Config {
+        toml::from_str(
+            "[env.pipeline]\nplacement = \"local\"\n\n[env.host]\nplacement = \"local\"\n",
+        )
+        .expect("config parses")
+    }
+
+    /// A worktree dir (no repo overlay) and its repo root, both real paths.
+    fn worktree_fixture(state: &IsolatedState) -> (String, std::path::PathBuf) {
+        let root = state.root().join("repo");
+        let wt = state.root().join("wt");
+        std::fs::create_dir_all(&root).expect("repo dir");
+        std::fs::create_dir_all(&wt).expect("wt dir");
+        (wt.to_string_lossy().into_owned(), root)
+    }
+
+    #[test]
+    fn pin_env_pins_an_unbound_worktree_to_pipeline() {
+        let state = IsolatedState::new();
+        let (wt, root) = worktree_fixture(&state);
+        let db = Db::open_memory().expect("db");
+        let pinned = pin_env_for_run(&cfg_with_envs(), &db, &wt, &root, None).expect("pin");
+        assert_eq!(pinned.as_deref(), Some("pipeline"));
+        assert_eq!(
+            db.worktree_env(&wt).expect("read").as_deref(),
+            Some("pipeline")
+        );
+    }
+
+    #[test]
+    fn pin_env_explicit_env_wins_over_an_existing_selection() {
+        let state = IsolatedState::new();
+        let (wt, root) = worktree_fixture(&state);
+        let db = Db::open_memory().expect("db");
+        db.set_worktree_env(&wt, "pipeline").expect("bind");
+        let pinned = pin_env_for_run(&cfg_with_envs(), &db, &wt, &root, Some("host")).expect("pin");
+        assert_eq!(pinned.as_deref(), Some("host"));
+        assert_eq!(db.worktree_env(&wt).expect("read").as_deref(), Some("host"));
+    }
+
+    #[test]
+    fn pin_env_leaves_a_bound_worktree_untouched() {
+        let state = IsolatedState::new();
+        let (wt, root) = worktree_fixture(&state);
+        let db = Db::open_memory().expect("db");
+        db.set_worktree_env(&wt, "host").expect("bind");
+        assert_eq!(
+            pin_env_for_run(&cfg_with_envs(), &db, &wt, &root, None).expect("keep"),
+            None
+        );
+        assert_eq!(db.worktree_env(&wt).expect("read").as_deref(), Some("host"));
+        // A workspace-level selection binds it too.
+        let wt2_path = state.root().join("wt2");
+        std::fs::create_dir_all(&wt2_path).expect("wt2 dir");
+        let wt2 = wt2_path.to_string_lossy().into_owned();
+        db.put_workspace(&root.to_string_lossy(), "repo", "repo")
+            .expect("workspace");
+        db.set_workspace_env(&root.to_string_lossy(), "host")
+            .expect("bind workspace");
+        assert_eq!(
+            pin_env_for_run(&cfg_with_envs(), &db, &wt2, &root, None).expect("keep"),
+            None
+        );
+        assert_eq!(db.worktree_env(&wt2).expect("read"), None);
+    }
+
+    #[test]
+    fn pin_env_without_a_pipeline_env_keeps_the_default() {
+        let state = IsolatedState::new();
+        let (wt, root) = worktree_fixture(&state);
+        let db = Db::open_memory().expect("db");
+        assert_eq!(
+            pin_env_for_run(&Config::default(), &db, &wt, &root, None).expect("keep"),
+            None
+        );
+        assert_eq!(db.worktree_env(&wt).expect("read"), None);
+    }
+
+    #[test]
+    fn pin_env_refuses_an_empty_name_and_a_stale_provider_location() {
+        let state = IsolatedState::new();
+        let (wt, root) = worktree_fixture(&state);
+        let db = Db::open_memory().expect("db");
+        assert!(pin_env_for_run(&cfg_with_envs(), &db, &wt, &root, Some("  ")).is_err());
+        db.put_worktree("tab", &root.to_string_lossy(), &wt, "feat", None, None)
+            .expect("row");
+        db.set_worktree_location(
+            &wt,
+            r#"{"control_prefix":["sprite","exec"],"path":"/workspace"}"#,
+        )
+        .expect("location");
+        let err =
+            pin_env_for_run(&cfg_with_envs(), &db, &wt, &root, Some("host")).expect_err("refused");
+        assert!(format!("{err:#}").contains("thegn env set"), "{err:#}");
+        assert_eq!(db.worktree_env(&wt).expect("read"), None, "no pin written");
+        assert_eq!(
+            pin_env_for_run(&cfg_with_envs(), &db, &wt, &root, None).expect("keep"),
+            None
+        );
+        assert_eq!(
+            db.worktree_env(&wt).expect("read"),
+            None,
+            "implicit pin skips a provider-bound worktree"
+        );
+    }
 
     #[test]
     fn strip_ansi_table() {
@@ -521,6 +775,7 @@ mod tests {
         let crate::cmd::agent::Action::Run {
             agent,
             worktree,
+            env,
             brief_file,
             prompt,
             var,
@@ -534,6 +789,7 @@ mod tests {
         };
         assert_eq!(agent, "codex");
         assert_eq!(worktree, "/tmp/wt");
+        assert_eq!(env, None);
         assert_eq!(brief_file, None);
         assert_eq!(prompt.as_deref(), Some("fix it"));
         assert!(var.is_empty());
@@ -586,6 +842,28 @@ mod tests {
     }
 
     #[test]
+    fn agent_run_parses_env() {
+        let action = parse(&[
+            "thegn",
+            "agent",
+            "run",
+            "--env",
+            "x",
+            "--prompt",
+            "p",
+            "--agent",
+            "a",
+            "--worktree",
+            "w",
+        ])
+        .expect("parse");
+        let crate::cmd::agent::Action::Run { env, .. } = action else {
+            panic!("expected agent run");
+        };
+        assert_eq!(env.as_deref(), Some("x"));
+    }
+
+    #[test]
     fn agent_run_refuses_bad_flag_combinations() {
         let base = ["thegn", "agent", "run", "--agent", "a", "--worktree", "w"];
         let with = |extra: &[&str]| {
@@ -628,6 +906,7 @@ mod tests {
             "--wait",
             "--timeout",
             "--json",
+            "--env",
             "[default: 3600]",
             "left running",
         ] {
