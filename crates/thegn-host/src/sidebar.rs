@@ -247,6 +247,8 @@ pub struct PluginFieldValue {
 /// One row in the workspace tree.
 #[derive(Debug, Clone)]
 pub struct SidebarRow {
+    /// Zone chip for Workspace rows (`None` = unzoned or no repo path).
+    pub zone: Option<ZoneTag>,
     pub kind: RowKind,
     pub depth: u8,
     /// Bare label (no glyphs/connectors); e.g. repo display name, worktree base
@@ -366,6 +368,7 @@ impl SidebarRow {
         workspace_slug: impl Into<String>,
     ) -> Self {
         SidebarRow {
+            zone: None,
             kind,
             depth,
             label: label.into(),
@@ -449,12 +452,45 @@ impl SidebarRow {
     }
 }
 
+/// A workspace row's zone chip state.
+#[derive(Debug, Clone, PartialEq)]
+pub enum ZoneTag {
+    /// Member of zone `name`; `policy` is false when config has no
+    /// `[zone.<name>]` table for it.
+    Named { name: String, policy: bool },
+    /// The zone catalog could not be read.
+    Unknown,
+}
+
+/// Resolve a workspace's chip from the hydrated catalog.
+fn zone_tag(
+    zones: &crate::chrome::ZoneCatalog,
+    unpoliced: &std::collections::BTreeSet<String>,
+    repo_path: &str,
+) -> Option<ZoneTag> {
+    if repo_path.is_empty() {
+        return None;
+    }
+    if let Some(name) = zones.by_repo.get(repo_path) {
+        return Some(ZoneTag::Named {
+            name: name.clone(),
+            policy: !unpoliced.contains(name),
+        });
+    }
+    zones.read_failed.then_some(ZoneTag::Unknown)
+}
+
 /// Per-worktree status sourced from the (possibly slow) git/activity scan on
 /// the hydration thread, merged onto rows at build time. `git`/`agent` are
 /// keyed by worktree path; `activity` by tab name (matching the `activity`
 /// state machine's TSV keys).
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct SidebarStatus {
+    /// Zone catalog mirrored from `FrameModel.zone_catalog` by the hydrators
+    /// (`build_rows` runs on-loop without the model, so it reads it here).
+    pub zones: crate::chrome::ZoneCatalog,
+    /// Zone names that have no `[zone.<name>]` config policy (chip shows `!`).
+    pub zones_unpoliced: std::collections::BTreeSet<String>,
     pub git: std::collections::BTreeMap<String, GitGlyphs>,
     pub branch_meta: std::collections::BTreeMap<String, BranchMeta>,
     /// The worktree's LIVE `HEAD` branch, keyed by path — read by the same git
@@ -1057,6 +1093,7 @@ pub fn build_rows(
             // remove-workspace action can resolve its DB target without a
             // slug→path lookup. Empty for live fallbacks with no DB row yet.
             worktree_path: (!repo_path.is_empty()).then(|| repo_path.clone()),
+            zone: zone_tag(&status.zones, &status.zones_unpoliced, repo_path),
             pin_key: repo_slug.clone(),
             collapsed,
             dir: kind == "dir",

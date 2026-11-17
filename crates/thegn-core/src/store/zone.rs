@@ -50,6 +50,10 @@ pub trait ZoneStore {
     /// The zone a workspace belongs to (by repo path), or `None` if unzoned.
     fn zone_of_workspace(&self, repo_path: &str) -> Result<Option<ZoneRow>>;
 
+    /// Every zoned workspace as `(repo_path, zone name)`, ordered by repo path
+    /// (capped at 4096). A dangling `zone_id` yields no pair (reads unzoned).
+    fn workspace_zones(&self) -> Result<Vec<(String, String)>>;
+
     /// The zone a *worktree* belongs to: worktree → its `repo_path` → the
     /// workspace's zone. Falls back to treating the arg as a repo path (home-tab
     /// panes). `None` if unzoned or unknown.

@@ -557,6 +557,10 @@ pub struct FrameModel {
     /// Repo path -> non-empty workspace DB default environment. Hydrated off
     /// the UI loop and read by the wizard without opening the database.
     pub workspace_envs: std::collections::BTreeMap<String, String>,
+    /// Zone catalog (names + repo path -> zone name), hydrated off the UI loop
+    /// in the same pass as `workspace_envs`. Read by the sidebar workspace chip
+    /// (via `sidebar_status.zones`) and the zone palette flows.
+    pub zone_catalog: ZoneCatalog,
     /// Worktrees registered for workspaces NOT loaded in the session (their
     /// sidebar rows switch workspace on activate).
     pub sidebar_db_worktrees: Vec<crate::sidebar::DbWorktree>,
@@ -2929,3 +2933,40 @@ pub fn render_tab<'a>(
 #[cfg(test)]
 #[path = "chrome_tests.rs"]
 mod tests;
+
+/// Hydrated zone catalog: every zone name, plus which zone each zoned
+/// workspace (keyed by repo path) belongs to. `read_failed` is set when either
+/// DB read errored, so the UI can say "unknown" rather than "unzoned".
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct ZoneCatalog {
+    pub names: Vec<String>,
+    pub by_repo: std::collections::BTreeMap<String, String>,
+    pub read_failed: bool,
+}
+
+impl ZoneCatalog {
+    /// Read both halves from one DB handle (two indexed queries, off-loop).
+    pub fn read(db: &thegn_core::db::Db) -> Self {
+        use thegn_core::store::ZoneStore;
+        let names = db.list_zones();
+        let pairs = db.workspace_zones();
+        match (names, pairs) {
+            (Ok(names), Ok(pairs)) => Self {
+                names: names.into_iter().map(|z| z.name).take(64).collect(),
+                by_repo: pairs.into_iter().collect(),
+                read_failed: false,
+            },
+            (n, p) => {
+                tracing::debug!(
+                    names_err = ?n.err(),
+                    pairs_err = ?p.err(),
+                    "zone catalog read failed"
+                );
+                Self {
+                    read_failed: true,
+                    ..Self::default()
+                }
+            }
+        }
+    }
+}
