@@ -513,6 +513,14 @@ impl EnvProviderKind {
     pub fn credential_free(self) -> bool {
         matches!(self, Self::Vercel)
     }
+
+    /// Whether the automatic session-exit pull-back (THE-2021) may call this
+    /// provider. Off for Vercel: the pull would resume a sandbox that stopped
+    /// at its timeout and bill compute with nobody at the keyboard, so Vercel
+    /// pulls are left to an explicit `thegn env pull`.
+    pub fn exit_pull_back_enabled(self) -> bool {
+        !matches!(self, Self::Vercel)
+    }
 }
 
 /// Whether `name` names a commodity-VPS provider kind. See
@@ -1153,7 +1161,10 @@ mod tests {
             EnvProviderKind::Machine0,
         ] {
             assert!(!other.credential_free(), "{other:?}");
+            assert!(other.exit_pull_back_enabled(), "{other:?}");
         }
+        // Only an explicit `thegn env pull` may resume a stopped Vercel sandbox.
+        assert!(!k.exit_pull_back_enabled());
         // Scale-to-zero ⇒ hibernate stays off under auto.
         assert!(!provider_env("vercel").hibernate_enabled());
         assert!(!wss_native_provider_kind("vercel"));
