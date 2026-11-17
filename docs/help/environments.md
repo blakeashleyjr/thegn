@@ -4,6 +4,7 @@ title: Environments
 parent: sandboxing
 order: 5
 actions: [warm-pool-increment, warm-pool-decrement, toolchain-install]
+contexts: [panel:environments]
 ---
 
 # Environments
