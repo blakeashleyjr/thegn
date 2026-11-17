@@ -470,7 +470,7 @@ mod tests {
                 "--strict-mcp-config".to_string()
             ]
         );
-        assert_eq!(plan.readable, [dir.clone()]);
+        assert_eq!(plan.readable, std::slice::from_ref(&dir));
         crate::platform::test_assert_owner_only_permissions(&path, &dir);
         let doc: serde_json::Value =
             serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
