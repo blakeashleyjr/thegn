@@ -499,8 +499,9 @@ pub(crate) struct SpecDrainCtx<'a> {
 /// Eager provisioning (`[lifecycle] eager`): front-run the one-time
 /// provisioning (nix + devShell, minutes — and now host bring-up) for
 /// worktrees AHEAD of focus, in the background, so opening them is instant.
-/// Budget-safe: `provision_pending` only fires when the sandbox does NOT
-/// exist yet (a list() GET — never wakes an idle/provisioned one), and
+/// Budget-safe: `provision_check` only fires when the sandbox does NOT
+/// exist yet (a list() GET) or is bare; a parked Vercel sandbox is probed with
+/// a never-resuming GET and left alone, and
 /// `host_pending` is one DB read. Scope: active worktree only, or the whole
 /// session (workspace/all). Once per session per worktree. Background policy:
 /// a host needing install consent is DEFERRED, never prompted.
@@ -541,7 +542,9 @@ pub(crate) fn kick_eager(
         let ptx = provision_tx.clone();
         let hui = host_ui.clone();
         tokio::task::spawn_blocking(move || {
-            if crate::agent::provision_pending(&cfg, &wt)
+            // `Pending` only: a parked Vercel sandbox is never resumed from
+            // the background (only an explicit open buys its compute).
+            if crate::agent::provision_check(&cfg, &wt) == crate::agent::ProvisionCheck::Pending
                 || crate::host_flow::host_pending(&cfg, &wt)
             {
                 // Lock the loading screen up the moment we commit to

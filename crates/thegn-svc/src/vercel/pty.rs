@@ -143,19 +143,25 @@ fn connect_error(error: &tokio_tungstenite::tungstenite::Error) -> anyhow::Error
 }
 
 impl VercelProvider {
-    /// Open a PTY session over `/interactive`. Resumes a stopped sandbox. The
-    /// `session_id` watch carries the Vercel session id (informational:
-    /// Vercel has no reattach).
-    pub async fn open_exec(&self, name: &str, spec: &ExecSpec) -> Result<ExecSession> {
-        anyhow::ensure!(valid_sandbox_name(name), "vercel: invalid sandbox name");
-        let start = interactive_start_frame(
+    /// The `/interactive` start frame for `spec`, its env through the
+    /// provider allowlist.
+    pub(super) fn start_frame(&self, spec: &ExecSpec) -> Result<String> {
+        interactive_start_frame(
             &spec.argv,
             spec.cwd.as_deref(),
-            &spec.env,
+            &self.sandbox_env(&spec.env),
             spec.cols,
             spec.rows,
         )
-        .map_err(|e| anyhow!("vercel: interactive start frame: {e}"))?;
+        .map_err(|e| anyhow!("vercel: interactive start frame: {e}"))
+    }
+
+    /// Open a PTY session over `/interactive`. Resumes a stopped sandbox. The
+    /// `session_id` watch carries the Vercel session id (informational:
+    /// Vercel has no reattach). `spec.env` passes the provider allowlist.
+    pub async fn open_exec(&self, name: &str, spec: &ExecSpec) -> Result<ExecSession> {
+        anyhow::ensure!(valid_sandbox_name(name), "vercel: invalid sandbox name");
+        let start = self.start_frame(spec)?;
         let session = self.session_for(name, Wake::Allow).await?;
         let ticket = self.client.interactive(&session).await?;
         wait_healthy(&health_url(&ticket.url)?).await?;
