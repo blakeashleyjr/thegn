@@ -1259,6 +1259,45 @@ pub(crate) fn run_outcome(task: &AgentTaskRun<'_>) -> AgentRunVerdict {
     run_outcome_cancellable(task, &NEVER)
 }
 
+/// Run an already-built command (a headless Lead turn, `lead::wake`) through
+/// the bounded runner: its own group, the deadline, `cancel`, drained and
+/// fully reaped. `Ok(())` only on exit 0; anything else is the verdict as
+/// text. Refused off unix, where the bounded runner does not exist (callers
+/// check [`headless_unsupported`] first).
+pub(crate) fn run_command_bounded(
+    cmd: &mut std::process::Command,
+    timeout_secs: u64,
+    cancel: &std::sync::atomic::AtomicBool,
+) -> Result<(), String> {
+    #[cfg(unix)]
+    {
+        let run = bounded::run_bounded(cmd, bounded::effective_timeout(timeout_secs), cancel);
+        match bounded::verdict(&run.outcome, true) {
+            AgentRunVerdict::Exited(Some(0)) => Ok(()),
+            other => {
+                let tail = &run.stderr.bytes[run.stderr.bytes.len().saturating_sub(2048)..];
+                tracing::warn!(
+                    target: "thegn::agent",
+                    verdict = ?other,
+                    stderr_tail = %String::from_utf8_lossy(tail),
+                    "bounded command did not succeed"
+                );
+                Err(match other {
+                    AgentRunVerdict::Exited(Some(code)) => format!("exited {code}"),
+                    AgentRunVerdict::Exited(None) => "killed by a signal".into(),
+                    AgentRunVerdict::Interrupted(why) => format!("interrupted: {why}"),
+                    AgentRunVerdict::NotStarted(why) => format!("not started: {why}"),
+                })
+            }
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let (_cmd, _timeout_secs, _cancel) = (cmd, timeout_secs, cancel);
+        Err(headless_unsupported().unwrap_or_else(|| "unsupported on this platform".into()))
+    }
+}
+
 /// Bounded, drained, fully reaped execution of one agent process group (unix).
 ///
 /// `thegn_proc` owns process-group supervision, pipe polling, output retention,
