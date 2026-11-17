@@ -1682,7 +1682,8 @@ fn sections_cursor_enter_and_keys_fire_the_selected_row() {
     assert_eq!(
         ov.handle_key(&KeyCode::Enter, Modifiers::NONE),
         DetailOutcome::Act(DetailAction::OpenMonitor {
-            tab: crate::monitor::MonitorTab::Cpu
+            tab: crate::monitor::MonitorTab::Cpu,
+            filter: None,
         })
     );
     // `M` still expands from any row.
@@ -1690,7 +1691,8 @@ fn sections_cursor_enter_and_keys_fire_the_selected_row() {
     assert_eq!(
         ov.handle_key(&KeyCode::Char('M'), Modifiers::NONE),
         DetailOutcome::Act(DetailAction::OpenMonitor {
-            tab: crate::monitor::MonitorTab::Cpu
+            tab: crate::monitor::MonitorTab::Cpu,
+            filter: None,
         })
     );
 }

@@ -343,13 +343,32 @@ fn row_acts(owners: &[PaneOwner], rows: &[AttribRow]) -> Vec<RowActs> {
             }
             RowKind::Proc => Some(DetailAction::OpenMonitor {
                 tab: crate::monitor::MonitorTab::Procs,
+                filter: r.target.map(|pid| format!("pid:{pid}")),
             }),
             RowKind::Thegn | RowKind::Job | RowKind::Outside | RowKind::More => None,
+        };
+        // `p`: show this pane's / worktree's processes in the monitor. A
+        // worktree label with whitespace cannot be written as a `wt=` term.
+        let procs = |filter: String| {
+            (
+                'p',
+                DetailAction::OpenMonitor {
+                    tab: crate::monitor::MonitorTab::Procs,
+                    filter: Some(filter),
+                },
+            )
+        };
+        let keys = match (r.kind, r.target) {
+            (RowKind::Pane, Some(id)) => vec![procs(format!("pane:{id}"))],
+            (RowKind::Worktree, _) if !r.label.chars().any(char::is_whitespace) => {
+                vec![procs(format!("wt={}", r.label))]
+            }
+            _ => Vec::new(),
         };
         out.push(RowActs {
             id: format!("{:?}|{}|{}", r.kind, path.unwrap_or_default(), r.label),
             enter,
-            keys: Vec::new(),
+            keys,
         });
     }
     out
@@ -489,6 +508,7 @@ mod tests {
             cpu_pct: None,
             share_of_total: None,
             rss: None,
+            target: None,
         };
         let ids = row_ids(&[r("x"), r("x")]);
         assert_ne!(ids[0], ids[1]);
@@ -642,6 +662,30 @@ mod tests {
     }
 
     #[test]
+    fn p_is_withheld_on_a_worktree_label_with_whitespace() {
+        let row = |kind: RowKind, label: &str, target: Option<u32>| AttribRow {
+            depth: 1,
+            kind,
+            label: label.into(),
+            cpu_pct: None,
+            share_of_total: None,
+            rss: None,
+            target,
+        };
+        let acts = row_acts(
+            &[],
+            &[
+                row(RowKind::Worktree, "my tree", None),
+                row(RowKind::Worktree, "tree", None),
+                row(RowKind::Pane, "1 · sh", None),
+            ],
+        );
+        assert!(acts[0].keys.is_empty());
+        assert_eq!(acts[1].keys.len(), 1);
+        assert!(acts[2].keys.is_empty(), "a pane row without an id");
+    }
+
+    #[test]
     fn worktree_rows_focus_their_worktree_and_process_rows_open_the_monitor() {
         let (secs, acts) = build_sections(&model(), SortKey::Cpu);
         let lines = texts(&secs);
@@ -662,12 +706,32 @@ mod tests {
         assert_eq!(
             enter_of("node (11)|"),
             Some(DetailAction::OpenMonitor {
-                tab: crate::monitor::MonitorTab::Procs
+                tab: crate::monitor::MonitorTab::Procs,
+                filter: Some("pid:11".into()),
             })
         );
+        let keys_of = |prefix: &str| {
+            let i = lines
+                .iter()
+                .position(|l| l.starts_with(prefix))
+                .unwrap_or_else(|| panic!("{prefix} in {lines:?}"));
+            acts[i - 1].keys.clone()
+        };
+        let procs_of = |f: &str| {
+            vec![(
+                'p',
+                DetailAction::OpenMonitor {
+                    tab: crate::monitor::MonitorTab::Procs,
+                    filter: Some(f.into()),
+                },
+            )]
+        };
+        assert_eq!(keys_of("1 · claude|"), procs_of("pane:1"));
+        assert_eq!(keys_of("alpha/main|"), procs_of("wt=alpha/main"));
+        assert!(keys_of("alpha|").is_empty());
+        assert!(keys_of("node (11)|").is_empty());
         assert_eq!(enter_of("thegn|"), None);
         assert_eq!(enter_of("outside thegn|"), None);
-        assert!(acts.iter().all(|a| a.keys.is_empty()));
         // Identities are distinct, so a refresh can find the same row again.
         let ids: std::collections::BTreeSet<_> = acts.iter().map(|a| a.id.as_str()).collect();
         assert_eq!(ids.len(), acts.len());
@@ -698,7 +762,8 @@ mod tests {
         assert_eq!(
             ov.handle_key(&KeyCode::Char('M'), Modifiers::NONE),
             DetailOutcome::Act(DetailAction::OpenMonitor {
-                tab: crate::monitor::MonitorTab::Cpu
+                tab: crate::monitor::MonitorTab::Cpu,
+                filter: None,
             })
         );
     }

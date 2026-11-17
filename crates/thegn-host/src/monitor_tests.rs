@@ -1992,6 +1992,31 @@ fn process_table_survives_interleaved_hydration_and_samples() {
 }
 
 #[test]
+fn open_filtered_applies_the_filter_on_the_first_body() {
+    let h = TelemetryHistory::default();
+    let screen = Rect::full(100, 24);
+    let m = model_with_n_procs(5);
+    let ctx = ctx_at(&h, screen);
+    let ov = MonitorOverlay::open_filtered(
+        MonitorTab::Procs,
+        MonitorPrefs::default(),
+        &m,
+        &ctx,
+        "pid:1002".into(),
+    );
+    assert_eq!(ov.filter, "pid:1002");
+    assert_eq!(ov.proc_rows.len(), 1);
+    assert_eq!(ov.proc_rows[0].pid, 1002);
+    // Control characters are stripped and the length is capped.
+    let long = format!("a\x1b\n{}", "b".repeat(300));
+    let ov =
+        MonitorOverlay::open_filtered(MonitorTab::Procs, MonitorPrefs::default(), &m, &ctx, long);
+    assert_eq!(ov.filter.chars().count(), 128);
+    assert!(!ov.filter.chars().any(char::is_control));
+    assert!(ov.filter.starts_with("ab"));
+}
+
+#[test]
 fn passive_process_refresh_follows_identity_after_rank_changes() {
     let h = TelemetryHistory::default();
     let screen = Rect::full(100, 24);

@@ -197,8 +197,12 @@ pub enum DetailAction {
     /// intercepted by the loop, which owns the panel state).
     OpenMergeQueueSection,
     /// Expand this popup into the full system monitor at `tab`. Fired by `↵`
-    /// (or `M`) on a stat popup that has a matching tab.
-    OpenMonitor { tab: crate::monitor::MonitorTab },
+    /// (or `M`) on a stat popup that has a matching tab. `filter` pre-fills
+    /// the Processes filter (a popup row jumping to its processes).
+    OpenMonitor {
+        tab: crate::monitor::MonitorTab,
+        filter: Option<String>,
+    },
     /// A merge-queue action fired on a row of the unified surface's Merge-queue
     /// section, keyed by the row's explicit worktree `path` (not the panel
     /// cursor). Intercepted by the loop's Act arm — the fold/drive locals live
@@ -819,13 +823,15 @@ impl DetailOverlay {
                         // through to the popup's plain Enter (expand into the
                         // monitor, or close).
                         None if self.sections_cursor().is_some() => match self.monitor_tab {
-                            Some(tab) => DetailOutcome::Act(DetailAction::OpenMonitor { tab }),
+                            Some(tab) => {
+                                DetailOutcome::Act(DetailAction::OpenMonitor { tab, filter: None })
+                            }
                             None => DetailOutcome::Close,
                         },
                         None => DetailOutcome::Pending,
                     }
                 } else if let Some(tab) = self.monitor_tab {
-                    DetailOutcome::Act(DetailAction::OpenMonitor { tab })
+                    DetailOutcome::Act(DetailAction::OpenMonitor { tab, filter: None })
                 } else {
                     DetailOutcome::Close
                 }
@@ -835,6 +841,7 @@ impl DetailOverlay {
             KeyCode::Char('M') if self.monitor_tab.is_some() => {
                 DetailOutcome::Act(DetailAction::OpenMonitor {
                     tab: self.monitor_tab.expect("guarded above"),
+                    filter: None,
                 })
             }
             KeyCode::DownArrow | KeyCode::Char('j') => {
