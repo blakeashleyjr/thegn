@@ -167,11 +167,7 @@ pub fn document_xml_lines(
             (false, "w:tabs") => in_tabs = !self_closing,
             (true, "w:tabs") => in_tabs = false,
             (false, "w:tab") if !in_tabs => out.push_str("    "),
-            (false, "w:br" | "w:cr") => {
-                if !out.end_line() {
-                    break 'scan;
-                }
-            }
+            (false, "w:br" | "w:cr") if !out.end_line() => break 'scan,
             _ => {}
         }
     }
