@@ -1539,7 +1539,8 @@ mod tests {
 
     #[test]
     fn width_chip_uses_the_ascii_middot() {
-        use crate::caps::{UnicodeLevel, test_override};
+        use crate::caps::test_override;
+        use thegn_core::termcaps::UnicodeLevel;
         test_override::with_unicode(UnicodeLevel::Ascii, || {
             let ui = chip_ui(crate::layout::PanelWidth::Normal, Section::Changes);
             let text = chip_text(&ui, 40).expect("fits");
