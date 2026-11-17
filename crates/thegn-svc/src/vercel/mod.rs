@@ -132,10 +132,8 @@ trait Api: Send + Sync {
     fn snapshots_for<'a>(&'a self, name: &'a str) -> BoxFuture<'a, Result<Vec<String>>>;
     fn delete_snapshot<'a>(&'a self, id: &'a str) -> BoxFuture<'a, Result<()>>;
     /// The current session's usage (a GET; never resumes).
-    #[allow(dead_code)] // spine stub, filled by lane 5
     fn usage<'a>(&'a self, name: &'a str) -> BoxFuture<'a, Result<Option<SessionUsage>>>;
     /// The sandbox's snapshots with sizes and status.
-    #[allow(dead_code)] // spine stub, filled by lane 5
     fn snapshot_usage<'a>(&'a self, name: &'a str) -> BoxFuture<'a, Result<Vec<SnapshotUsage>>>;
 }
 

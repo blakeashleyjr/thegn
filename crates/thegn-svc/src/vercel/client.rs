@@ -26,7 +26,8 @@ use anyhow::{Result, anyhow, bail};
 use base64::Engine as _;
 use thegn_core::vercel::admit::{valid_project_id, valid_sandbox_name, valid_team_id};
 use thegn_core::vercel::api::{
-    LogLine, SandboxView, Scope, parse_list_page, parse_log_line, parse_sandbox,
+    LogLine, SandboxView, Scope, interactive_host_allowed, parse_list_page, parse_log_line,
+    parse_sandbox, parse_session_usage, parse_snapshots,
 };
 use thegn_core::vercel::token::{TokenKind, classify, oidc_refusal};
 use thegn_core::vercel::usage::{SessionUsage, SnapshotUsage};
@@ -54,10 +55,6 @@ pub const MAX_RETRY_AFTER_S: u64 = 20;
 
 /// Most snapshot-listing pages [`VercelClient::snapshot_usage`] reads.
 pub const SNAPSHOT_PAGE_CAP: usize = 20;
-
-/// The interactive ticket host pin when `interactive_host_suffixes` is empty:
-/// Vercel-owned names only (never `vercel.app`, which any user deploys to).
-pub const DEFAULT_INTERACTIVE_HOST_SUFFIXES: &[&str] = &["vercel.run", "vercel.sh", "vercel.com"];
 
 /// The refusal for a ticket on a host outside the pin (names no URL, query or
 /// ticket).
@@ -241,30 +238,6 @@ fn unix_now_s() -> i64 {
         .map_or(0, |d| i64::try_from(d.as_secs()).unwrap_or(i64::MAX))
 }
 
-/// Whether `host` (a DNS name) equals one of `suffixes` or ends in
-/// `.<suffix>`; an empty `suffixes` means [`DEFAULT_INTERACTIVE_HOST_SUFFIXES`].
-/// Case and a trailing dot are ignored; `vercel.app` never matches.
-pub fn interactive_host_allowed(host: &str, suffixes: &[String]) -> bool {
-    let host = host.trim_end_matches('.').to_ascii_lowercase();
-    if host.is_empty() || host == "vercel.app" || host.ends_with(".vercel.app") {
-        return false;
-    }
-    let hit = |suffix: &str| {
-        let suffix = suffix.trim_end_matches('.').to_ascii_lowercase();
-        !suffix.is_empty()
-            && suffix != "vercel.app"
-            && (host == suffix
-                || host
-                    .strip_suffix(suffix.as_str())
-                    .is_some_and(|rest| rest.ends_with('.')))
-    };
-    if suffixes.is_empty() {
-        DEFAULT_INTERACTIVE_HOST_SUFFIXES.iter().copied().any(hit)
-    } else {
-        suffixes.iter().map(String::as_str).any(hit)
-    }
-}
-
 pub struct VercelClient {
     base: url::Url,
     authority: String,
@@ -329,9 +302,7 @@ impl VercelClient {
             return Ok(None);
         };
         let v = response_json(resp, PROVIDER, p.op).await?;
-        parse_session_usage(&v)
-            .map(Some)
-            .map_err(|e| anyhow!("{PROVIDER}: {}: {e}", p.op))
+        parse_session_usage(&v).map_err(|e| anyhow!("{PROVIDER}: {}: {e}", p.op))
     }
 
     /// The snapshots of sandbox `name` with their sizes and status, paged
@@ -1078,82 +1049,6 @@ pub(super) fn checked_name(name: &str) -> Result<&str> {
     Ok(name)
 }
 
-/// The current session's usage from a `GET /v2/sandboxes/{name}` response
-/// (`{"sandbox": …, "session": …}` or bare). Fields are read from the session
-/// object when present, else from the sandbox; every field is optional.
-pub fn parse_session_usage(v: &serde_json::Value) -> Result<SessionUsage, &'static str> {
-    let sandbox = v.get("sandbox").filter(|s| s.is_object()).unwrap_or(v);
-    if !sandbox.is_object() {
-        return Err("response has no sandbox object");
-    }
-    let session = sandbox
-        .get("session")
-        .or_else(|| v.get("session"))
-        .filter(|s| s.is_object());
-    let field = |key: &str| {
-        session
-            .and_then(|s| s.get(key))
-            .filter(|x| !x.is_null())
-            .or_else(|| sandbox.get(key).filter(|x| !x.is_null()))
-    };
-    let vcpus = field("vcpus")
-        .or_else(|| sandbox.get("resources").and_then(|r| r.get("vcpus")))
-        .and_then(serde_json::Value::as_u64)
-        .and_then(|n| u32::try_from(n).ok());
-    let memory_mb = field("memory")
-        .or_else(|| sandbox.get("resources").and_then(|r| r.get("memory")))
-        .and_then(serde_json::Value::as_u64);
-    Ok(SessionUsage {
-        active_cpu_ms: field("activeCpuDurationMs").and_then(serde_json::Value::as_u64),
-        memory_mb,
-        vcpus,
-        started_at_ms: field("startedAt").and_then(serde_json::Value::as_i64),
-        stopped_at_ms: field("stoppedAt").and_then(serde_json::Value::as_i64),
-    })
-}
-
-/// One snapshot-listing page: the snapshots (entries with an invalid id are
-/// skipped) and the next cursor.
-pub fn parse_snapshots(
-    v: &serde_json::Value,
-) -> Result<(Vec<SnapshotUsage>, Option<String>), &'static str> {
-    let items = v
-        .get("snapshots")
-        .and_then(|s| s.as_array())
-        .ok_or("response has no snapshots array")?;
-    let snapshots = items
-        .iter()
-        .filter_map(|s| {
-            let id = s
-                .get("id")
-                .and_then(|id| id.as_str())
-                .filter(|id| valid_id(id))?;
-            Some(SnapshotUsage {
-                id: id.to_string(),
-                size_bytes: s
-                    .get("sizeBytes")
-                    .and_then(serde_json::Value::as_u64)
-                    .unwrap_or(0),
-                expires_at_ms: s.get("expiresAt").and_then(serde_json::Value::as_i64),
-                status: s
-                    .get("status")
-                    .and_then(|x| x.as_str())
-                    .unwrap_or("unknown")
-                    .to_string(),
-            })
-        })
-        .collect();
-    let next = v
-        .get("pagination")
-        .and_then(|p| p.get("next"))
-        .and_then(|n| match n {
-            serde_json::Value::String(s) if !s.is_empty() => Some(s.clone()),
-            serde_json::Value::Number(n) => Some(n.to_string()),
-            _ => None,
-        });
-    Ok((snapshots, next))
-}
-
 /// Session/command/snapshot ids: `[A-Za-z0-9_-]{1,128}`.
 fn valid_id(id: &str) -> bool {
     !id.is_empty()
@@ -1436,72 +1331,6 @@ mod tests {
         assert_eq!(parse_retry_after(None), RetryAfter::Unparsable);
         let none = reqwest::header::HeaderMap::new();
         assert_eq!(retry_after(&none), RetryAfter::Absent);
-    }
-
-    #[test]
-    fn interactive_host_pin_defaults_and_configured_suffixes() {
-        let none: Vec<String> = Vec::new();
-        for ok in [
-            "x.vercel.run",
-            "vercel.run",
-            "a.b.vercel.sh",
-            "X.Vercel.Com.",
-        ] {
-            assert!(interactive_host_allowed(ok, &none), "{ok}");
-        }
-        for bad in [
-            "evil.example",
-            "vercel.app",
-            "x.vercel.app",
-            "notvercel.run",
-            "vercel.run.evil.example",
-            "",
-        ] {
-            assert!(!interactive_host_allowed(bad, &none), "{bad}");
-        }
-        let custom = vec!["vx.example".to_string()];
-        assert!(interactive_host_allowed("a.vx.example", &custom));
-        assert!(interactive_host_allowed("vx.example", &custom));
-        assert!(!interactive_host_allowed("x.vercel.run", &custom));
-        assert!(!interactive_host_allowed("a.vx.example", &none));
-        assert!(!interactive_host_allowed(
-            "x.vercel.app",
-            &["vercel.app".to_string()]
-        ));
-    }
-
-    #[test]
-    fn session_usage_reads_session_then_sandbox_fields() {
-        let v = serde_json::json!({
-            "sandbox": {"name": "tg-a", "resources": {"vcpus": 2, "memory": 4096}},
-            "session": {"activeCpuDurationMs": 1500, "startedAt": 10, "stoppedAt": null}
-        });
-        let u = parse_session_usage(&v).expect("usage");
-        assert_eq!(u.active_cpu_ms, Some(1500));
-        assert_eq!(u.vcpus, Some(2));
-        assert_eq!(u.memory_mb, Some(4096));
-        assert_eq!(u.started_at_ms, Some(10));
-        assert_eq!(u.stopped_at_ms, None);
-        assert!(parse_session_usage(&serde_json::json!(null)).is_err());
-    }
-
-    #[test]
-    fn snapshots_page_skips_bad_ids_and_reads_the_cursor() {
-        let v = serde_json::json!({
-            "snapshots": [
-                {"id": "snap_1", "sizeBytes": 1024, "status": "created", "expiresAt": 5},
-                {"id": "bad/id", "sizeBytes": 1},
-                {"id": "snap_2"}
-            ],
-            "pagination": {"next": 17}
-        });
-        let (items, next) = parse_snapshots(&v).expect("page");
-        assert_eq!(items.len(), 2);
-        assert_eq!(items[0].size_bytes, 1024);
-        assert_eq!(items[0].expires_at_ms, Some(5));
-        assert_eq!(items[1].status, "unknown");
-        assert_eq!(next.as_deref(), Some("17"));
-        assert!(parse_snapshots(&serde_json::json!({})).is_err());
     }
 
     #[test]

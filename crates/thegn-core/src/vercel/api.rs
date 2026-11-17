@@ -425,20 +425,42 @@ pub fn session_url(
 /// Built-in interactive-host suffixes (all Vercel-owned; never `vercel.app`).
 pub const DEFAULT_INTERACTIVE_HOST_SUFFIXES: &[&str] = &["vercel.run", "vercel.sh", "vercel.com"];
 
-/// Whether `host` may carry the interactive WebSocket: exact or dot-suffix
-/// match against `suffixes` (empty → the built-in defaults). IP literals and
-/// empty hosts are refused.
+/// Lowercase `name` with at most one trailing dot removed, or `None` when it
+/// is empty or carries anything but `[A-Za-z0-9.-]` (so a port, userinfo,
+/// brackets, whitespace or a percent-escape never reaches the comparison).
+fn dns_name_lower(name: &str) -> Option<String> {
+    let name = name.strip_suffix('.').unwrap_or(name);
+    (!name.is_empty()
+        && name
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'.' || b == b'-'))
+    .then(|| name.to_ascii_lowercase())
+}
+
+/// Whether `host` may carry the interactive WebSocket. The single
+/// implementation of the ticket host pin (the svc client calls it after its
+/// own scheme/userinfo/IP admission of the ticket URL).
+///
+/// `host` must be a DNS name (IP literals, brackets, userinfo, ports and empty
+/// names are refused) that equals one of `suffixes` or ends in `"." + suffix`,
+/// case-insensitively, tolerating one trailing dot on either side. Empty
+/// `suffixes` means [`DEFAULT_INTERACTIVE_HOST_SUFFIXES`]. `vercel.app` and
+/// names under it are refused whatever `suffixes` says (anyone can deploy
+/// there).
 pub fn interactive_host_allowed(host: &str, suffixes: &[String]) -> bool {
-    let h = host.trim().trim_end_matches('.').to_ascii_lowercase();
-    if h.is_empty() || h.parse::<std::net::IpAddr>().is_ok() || h.starts_with('[') {
+    let Some(h) = dns_name_lower(host) else {
+        return false;
+    };
+    if h.parse::<std::net::IpAddr>().is_ok() || crate::vercel::admit::under_untrusted_suffix(&h) {
         return false;
     }
     let matches = |s: &str| {
-        let s = s.trim().to_ascii_lowercase();
-        !s.is_empty()
-            && (h == s
-                || h.strip_suffix(s.as_str())
-                    .is_some_and(|rest| rest.ends_with('.')))
+        dns_name_lower(s).is_some_and(|s| {
+            !crate::vercel::admit::under_untrusted_suffix(&s)
+                && (h == s
+                    || h.strip_suffix(s.as_str())
+                        .is_some_and(|rest| rest.ends_with('.')))
+        })
     };
     if suffixes.is_empty() {
         DEFAULT_INTERACTIVE_HOST_SUFFIXES.iter().any(|s| matches(s))
@@ -447,31 +469,65 @@ pub fn interactive_host_allowed(host: &str, suffixes: &[String]) -> bool {
     }
 }
 
-/// Parse the current session's usage from a sandbox response. `Ok(None)` when
-/// there is no `session` object; optional fields may be absent.
+/// Parse the current session's usage from a `GET /v2/sandboxes/{name}`
+/// response (`{"sandbox": …, "session": …}`, or a bare sandbox carrying its
+/// own `session`). `Ok(None)` when there is no `session` object. Each field is
+/// read from the session, falling back to the sandbox (and its `resources`
+/// for `vcpus`/`memory`); every field is optional. A non-object response is
+/// an error.
 pub fn parse_session_usage(
     v: &serde_json::Value,
 ) -> Result<Option<crate::vercel::usage::SessionUsage>, ApiParseError> {
-    let Some(s) = v.get("session").filter(|s| s.is_object()) else {
+    let sandbox = v.get("sandbox").filter(|s| s.is_object()).unwrap_or(v);
+    if !sandbox.is_object() {
+        return Err(bad("vercel: usage response has no sandbox object"));
+    }
+    let Some(session) = sandbox
+        .get("session")
+        .or_else(|| v.get("session"))
+        .filter(|s| s.is_object())
+    else {
         return Ok(None);
     };
+    let field = |key: &str| {
+        session
+            .get(key)
+            .filter(|x| !x.is_null())
+            .or_else(|| sandbox.get(key).filter(|x| !x.is_null()))
+    };
+    let resource = |key: &str| {
+        field(key).or_else(|| {
+            sandbox
+                .get("resources")
+                .and_then(|r| r.get(key))
+                .filter(|x| !x.is_null())
+        })
+    };
     Ok(Some(crate::vercel::usage::SessionUsage {
-        active_cpu_ms: s.get("activeCpuDurationMs").and_then(|x| x.as_u64()),
-        memory_mb: s.get("memory").and_then(|x| x.as_u64()),
-        vcpus: s
-            .get("vcpus")
+        active_cpu_ms: field("activeCpuDurationMs").and_then(|x| x.as_u64()),
+        memory_mb: resource("memory").and_then(|x| x.as_u64()),
+        vcpus: resource("vcpus")
             .and_then(|x| x.as_u64())
             .and_then(|n| u32::try_from(n).ok()),
-        started_at_ms: s.get("startedAt").and_then(|x| x.as_i64()),
-        stopped_at_ms: s.get("stoppedAt").and_then(|x| x.as_i64()),
+        started_at_ms: field("startedAt").and_then(|x| x.as_i64()),
+        stopped_at_ms: field("stoppedAt").and_then(|x| x.as_i64()),
     }))
+}
+
+/// Snapshot ids: `[A-Za-z0-9_-]{1,128}` (they become URL path segments).
+fn valid_snapshot_id(id: &str) -> bool {
+    !id.is_empty()
+        && id.len() <= 128
+        && id
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
 }
 
 /// Cap on snapshots read from one response.
 pub const MAX_SNAPSHOTS: usize = 1_000;
 
 /// Parse a snapshots page: `snapshots[]` (capped at [`MAX_SNAPSHOTS`]) and
-/// `pagination.next`. Elements without an id are skipped.
+/// `pagination.next`. Elements without a valid id are skipped.
 pub fn parse_snapshots(
     v: &serde_json::Value,
 ) -> Result<(Vec<crate::vercel::usage::SnapshotUsage>, Option<String>), ApiParseError> {
@@ -483,7 +539,7 @@ pub fn parse_snapshots(
         .iter()
         .filter_map(|o| {
             Some(crate::vercel::usage::SnapshotUsage {
-                id: str_of(o, "id")?,
+                id: str_of(o, "id").filter(|id| valid_snapshot_id(id))?,
                 size_bytes: o.get("sizeBytes").and_then(|x| x.as_u64()).unwrap_or(0),
                 expires_at_ms: o.get("expiresAt").and_then(|x| x.as_i64()),
                 status: str_of(o, "status").unwrap_or_default(),
@@ -819,9 +875,96 @@ mod tests {
         assert!(!interactive_host_allowed("::1", &none));
         assert!(!interactive_host_allowed("[::1]", &none));
         assert!(!interactive_host_allowed("", &none));
-        let custom = vec!["Example.org".to_string(), String::new()];
+        let custom = ["Example.org".to_string(), String::new()];
         assert!(interactive_host_allowed("a.example.org", &custom));
         assert!(!interactive_host_allowed("a.vercel.run", &custom));
+    }
+
+    /// Cases carried over from the svc client's former copy of the matcher,
+    /// plus the shapes a URL host must never take.
+    #[test]
+    fn interactive_host_refusals_and_suffix_forms() {
+        let none: Vec<String> = Vec::new();
+        for ok in [
+            "x.vercel.run",
+            "vercel.run",
+            "a.b.vercel.sh",
+            "X.Vercel.Com.",
+        ] {
+            assert!(interactive_host_allowed(ok, &none), "{ok}");
+        }
+        for bad in [
+            "evil.example",
+            "vercel.app",
+            "x.vercel.app",
+            "X.VERCEL.APP.",
+            "notvercel.run",
+            "vercel.run.evil.example",
+            "a.vercel.run..",
+            "user@a.vercel.run",
+            "a.vercel.run:443",
+            " a.vercel.run",
+            "a%2evercel.run",
+            "127.0.0.1",
+            "127.0.0.1.",
+        ] {
+            assert!(!interactive_host_allowed(bad, &none), "{bad}");
+        }
+        let custom = ["vx.example".to_string()];
+        assert!(interactive_host_allowed("a.vx.example", &custom));
+        assert!(interactive_host_allowed("vx.example", &custom));
+        assert!(!interactive_host_allowed("x.vercel.run", &custom));
+        assert!(!interactive_host_allowed("a.vx.example", &none));
+        // A configured `vercel.app` (or a name under it) never admits a host.
+        for s in ["vercel.app", "team.vercel.app"] {
+            let custom = [s.to_string()];
+            assert!(!interactive_host_allowed("x.vercel.app", &custom), "{s}");
+            assert!(
+                !interactive_host_allowed("a.team.vercel.app", &custom),
+                "{s}"
+            );
+        }
+        let dotted = ["vx.example.".to_string()];
+        assert!(interactive_host_allowed("a.vx.example", &dotted));
+    }
+
+    #[test]
+    fn session_usage_reads_session_then_sandbox_fields() {
+        let v = json!({
+            "sandbox": {"name": "tg-a", "resources": {"vcpus": 2, "memory": 4096}},
+            "session": {"activeCpuDurationMs": 1500, "startedAt": 10, "stoppedAt": null}
+        });
+        let u = parse_session_usage(&v).unwrap().expect("a session");
+        assert_eq!(u.active_cpu_ms, Some(1500));
+        assert_eq!(u.vcpus, Some(2));
+        assert_eq!(u.memory_mb, Some(4096));
+        assert_eq!(u.started_at_ms, Some(10));
+        assert_eq!(u.stopped_at_ms, None);
+        let nested = json!({"sandbox": {"vcpus": 4, "session": {"startedAt": 1}}});
+        let u = parse_session_usage(&nested).unwrap().expect("a session");
+        assert_eq!((u.vcpus, u.started_at_ms), (Some(4), Some(1)));
+        assert_eq!(
+            parse_session_usage(&json!({"sandbox": {"name": "tg-a"}})).unwrap(),
+            None
+        );
+        assert!(parse_session_usage(&json!(null)).is_err());
+        assert!(parse_session_usage(&json!([1])).is_err());
+    }
+
+    #[test]
+    fn snapshots_skip_invalid_ids() {
+        let (s, next) = parse_snapshots(&json!({
+            "snapshots": [
+                {"id": "snap_1", "sizeBytes": 1024},
+                {"id": "bad/id", "sizeBytes": 1},
+                {"id": "a?b"},
+                {"id": "x".repeat(129)},
+                {"id": "snap_2"}],
+            "pagination": {"next": 17}}))
+        .unwrap();
+        let ids: Vec<&str> = s.iter().map(|x| x.id.as_str()).collect();
+        assert_eq!(ids, ["snap_1", "snap_2"]);
+        assert_eq!(next.as_deref(), Some("17"));
     }
 
     #[test]

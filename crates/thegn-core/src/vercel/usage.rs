@@ -69,7 +69,7 @@ pub fn session_accrual(u: &SessionUsage, now_ms: i64, r: &Rates) -> Option<Accru
 pub fn snapshot_month_usd(s: &[SnapshotUsage], r: &Rates) -> f64 {
     let bytes: f64 = s
         .iter()
-        .filter(|x| x.status == "created")
+        .filter(|x| x.status.trim().eq_ignore_ascii_case("created"))
         .map(|x| x.size_bytes as f64)
         .sum();
     bytes / (1024.0 * 1024.0 * 1024.0) * r.snapshot_usd_per_gb_month

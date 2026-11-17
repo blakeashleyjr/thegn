@@ -602,6 +602,14 @@ fn run_tty(
     let (cols, rows) = pty_size(size.cols, size.rows);
 
     let rt = bridge_runtime()?;
+    let done = Arc::new(AtomicBool::new(false));
+    // With an upload planned, SIGTERM/SIGHUP are caught from before the first
+    // credential byte leaves, so the bridge always reaches the login removal
+    // below instead of dying with the dir still in the sandbox.
+    if upload.is_some() {
+        let _enter = rt.enter();
+        crate::platform::install_shutdown_signal(done.clone(), term.waker());
+    }
     // `model_credentials = "upload"`: resume, narrow egress, upload, BEFORE the
     // PTY opens. A failure is one line; the session still opens without it.
     let login =
@@ -653,12 +661,7 @@ fn run_tty(
         return Err(e);
     }
     let (tty_tx, tty_rx) = tokio::sync::mpsc::channel::<FromTty>(256);
-    let done = Arc::new(AtomicBool::new(false));
     let waker = term.waker();
-    if login.is_some() {
-        let _enter = rt.enter();
-        crate::platform::install_shutdown_signal(done.clone(), term.waker());
-    }
     let thread = {
         let done = done.clone();
         thegn_core::thread_name::spawn_named("thegn-vx-in", move || {
