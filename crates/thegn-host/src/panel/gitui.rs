@@ -1065,6 +1065,8 @@ pub enum GitMsg {
     MoveDown,
     AmendStaged,
     CopyCommits,
+    /// Copy the selected commit sha(s) to the system clipboard (OSC 52).
+    CopySha,
     PasteCommits,
     EnterInteractive,
     MarkBase,
@@ -1172,6 +1174,7 @@ pub fn context_keys(view: GitView) -> Vec<CtxKey> {
             k("i", "interactive", GitMsg::EnterInteractive),
             k("m", "rebase menu", GitMsg::OpenMenu(MenuKind::Rebase)),
             k("A", "amend staged", GitMsg::AmendStaged),
+            k("y", "copy sha", GitMsg::CopySha),
             // The internal cherry-pick clipboard, NOT the OS clipboard — the
             // bare "copy" label read as a sha yank.
             k("C", "copy (pick)", GitMsg::CopyCommits),
@@ -1768,7 +1771,7 @@ pub fn git_key(key: &KeyCode, mods: Modifiers, ui: &crate::panel::PanelUi) -> Op
 fn works_at_normal(msg: &GitMsg) -> bool {
     matches!(
         msg,
-        GitMsg::StageToggleFile | GitMsg::Commit | GitMsg::DiscardFile
+        GitMsg::StageToggleFile | GitMsg::Commit | GitMsg::DiscardFile | GitMsg::CopySha
     )
 }
 
@@ -1785,6 +1788,7 @@ impl GitMsg {
             GitMsg::Revert => "revert",
             GitMsg::EnterInteractive => "interactive rebase",
             GitMsg::AmendStaged => "amend",
+            GitMsg::CopySha => "copy sha",
             GitMsg::CopyCommits => "copy (pick)",
             GitMsg::PasteCommits => "paste (pick)",
             GitMsg::MarkBase => "mark base",
@@ -2378,6 +2382,16 @@ mod tests {
             Some(GitMsg::CopyCommits)
         );
         assert_eq!(git_key(&KeyCode::Char('c'), none, &ui), None);
+        // y copies the sha(s) to the system clipboard.
+        assert_eq!(
+            git_key(&KeyCode::Char('y'), none, &ui),
+            Some(GitMsg::CopySha)
+        );
+        assert!(
+            context_keys(GitView::Commits)
+                .iter()
+                .any(|ck| ck.label == "copy sha" && ck.msg == GitMsg::CopySha)
+        );
         // s squashes; S falls through.
         assert_eq!(
             git_key(&KeyCode::Char('s'), none, &ui),
