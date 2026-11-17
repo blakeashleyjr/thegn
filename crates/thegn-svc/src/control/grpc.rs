@@ -113,6 +113,23 @@ impl GrpcControl {
             grpc_audit(&ctx.pairing_id, &ctx.label, verb, AuditOutcome::NoScope);
             return Err(Status::from(e));
         }
+        // The Lead confinement: gRPC carries no request shape here, so the
+        // shape-checked verbs (`sessions.open`, `dispatches.put`) are refused
+        // for a Lead caller (fail closed); the Lead uses its HTTP listener.
+        if ctx.lead_confined
+            && let Err(refusal) = thegn_core::lead_confine::check(
+                verb,
+                &thegn_core::lead_confine::RequestShape::Opaque,
+            )
+        {
+            grpc_audit(
+                &ctx.pairing_id,
+                &ctx.label,
+                verb,
+                AuditOutcome::LeadConfined,
+            );
+            return Err(Status::permission_denied(refusal.to_string()));
+        }
         Ok(ctx)
     }
 

@@ -220,6 +220,7 @@ pub mod issue;
 pub mod issue_snapshot;
 pub mod keymap;
 pub mod layout_import;
+pub mod lead_confine;
 pub mod lead_sandbox;
 pub mod lifecycle;
 pub mod loc;
