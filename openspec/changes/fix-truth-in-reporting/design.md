@@ -15,6 +15,21 @@ and the network is direct by default. `sealed` is the hardened tier, and `sealed
 the workspace is the boundary tier on a shared kernel. No surface calls `standard` secure or isolated. The
 user's own interactive panes keep the `standard` default (owner decision 2026-11-05).
 
+## Vocabulary
+
+Terms this change uses follow the programme's single vocabulary (THE-791 alignment T1, T4 and T6):
+
+- **Launch classes.** `InteractiveOwner`, `Untrusted(kind)` and `HostTrust(kind)`. `standard` stays the
+  default for `InteractiveOwner`; the other two classes are defined by `add-launch-admission`.
+- **Workspace mode.** `workspace.mode` is `private-copy`, `git-worktree` or `live-mount`, specified by
+  `add-private-workspaces` (capability `private-workspaces`). "Private copy" below means that mode; no
+  "private clone" exists.
+- **Network names.** The presets are `offline`, `agent`, `development`, `custom` and `unrestricted`, plus
+  `direct` for `nat` and `host` networking (labelled "direct, unfiltered", interactive panes only). Only
+  `offline` has a datapath today; the endpoint presets need `Enforce` and are not reachable until the egress
+  proxy exists, so this change never reports one.
+- **Egress kinds.** `Enforce`, `Translate`, `PortPinned`, `Offline`, `Unmanaged`.
+
 ## Decisions
 
 ### Capabilities and `egress_for`
