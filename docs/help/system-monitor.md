@@ -281,9 +281,9 @@ and new/exited values unknown until their baselines are available.
 - `/` opens an incremental, space-separated AND filter (type to narrow,
   `Backspace` to edit, `Enter` to apply, `Esc` to clear). A bare word matches
   process name, PID, or owner. Field terms include `user:blake`, `wt:feat`,
-  `cpu>10`, `mem>1G`, `age<5m`, `pid:42`, and `owner:thegn`; `!term` negates
-  a term. `cpu`, `mem`, `age`, `pid`, and `owner` are the fields currently
-  applied. `user`, `wt`, `pane`, `ctr`, `s`, `io`, and `thr` are recognized but
+  `cpu>10`, `mem>1G`, `age<5m`, `pid:42`, `pane:3`, and `owner:thegn`; `!term` negates
+  a term. `cpu`, `mem`, `age`, `pid`, `pane`, and `owner` are the fields currently
+  applied. `user`, `wt`, `ctr`, `s`, `io`, and `thr` are recognized but
   currently ignored; ignored and malformed terms are listed in the header.
   `Esc` backs out of the filter first — it does not close the monitor while a
   filter is open.

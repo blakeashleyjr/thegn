@@ -52,6 +52,7 @@ enum Field {
     Threads,
     Pid,
     Owner,
+    Pane,
     Unavailable,
 }
 
@@ -134,7 +135,8 @@ impl Query {
             "thr" => Field::Threads,
             "pid" => Field::Pid,
             "owner" => Field::Owner,
-            "wt" | "pane" | "ctr" | "io" => Field::Unavailable,
+            "pane" => Field::Pane,
+            "wt" | "ctr" | "io" => Field::Unavailable,
             _ => {
                 self.invalid.push(InvalidTerm {
                     text: text.to_string(),
@@ -166,6 +168,10 @@ impl Query {
                 .parse::<u32>()
                 .ok()
                 .map(|n| Value::Number(f64::from(n))),
+            Field::Pane => raw_value
+                .parse::<u32>()
+                .ok()
+                .map(|n| Value::Number(f64::from(n))),
             Field::State | Field::Unavailable => None,
         };
         let Some(value) = value else {
@@ -183,7 +189,7 @@ impl Query {
             });
             return Term::Ignored;
         }
-        if field == Field::Owner && !matches!(op, Op::Contains | Op::Equal) {
+        if matches!(field, Field::Owner | Field::Pane) && !matches!(op, Op::Contains | Op::Equal) {
             self.invalid.push(InvalidTerm {
                 text: text.to_string(),
                 reason: "operator not supported for field",
@@ -320,6 +326,9 @@ fn matches_term(term: &Term, row: &impl QueryRow) -> Option<bool> {
             (Field::Threads, Value::Number(expected)) => row
                 .threads()
                 .map(|actual| compare(f64::from(actual), *expected, *op)),
+            (Field::Pane, Value::Number(expected)) => {
+                Some(row.owner_id().is_some_and(|id| f64::from(id) == *expected))
+            }
             (Field::Unavailable, _) => None,
             _ => Some(true),
         },
@@ -384,9 +393,14 @@ mod tests {
         user: Option<&'static str>,
         state: Option<char>,
         threads: Option<u32>,
+        pane: Option<u32>,
     }
 
     impl QueryRow for FakeRow {
+        fn owner_id(&self) -> Option<u32> {
+            self.pane
+        }
+
         fn name(&self) -> &str {
             self.name
         }
@@ -435,7 +449,28 @@ mod tests {
             user: Some("blake"),
             state: Some('D'),
             threads: Some(64),
+            pane: None,
         }
+    }
+
+    #[test]
+    fn pane_field_parses_and_matches() {
+        assert!(Query::parse("pane:3").invalid().is_empty());
+        assert_eq!(Query::parse("pane:x").invalid()[0].reason, "bad value");
+        assert_eq!(
+            Query::parse("pane>3").invalid()[0].reason,
+            "operator not supported for field"
+        );
+        let p3 = FakeRow {
+            pane: Some(3),
+            ..row()
+        };
+        assert!(Query::parse("pane:3").matches(&p3));
+        assert!(Query::parse("pane=3").matches(&p3));
+        assert!(!Query::parse("pane:4").matches(&p3));
+        assert!(!Query::parse("!pane:3").matches(&p3));
+        assert!(Query::parse("!pane:4").matches(&p3));
+        assert!(!Query::parse("pane:3").matches(&row()));
     }
 
     #[test]
