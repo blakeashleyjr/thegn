@@ -1054,7 +1054,8 @@ listener, as Lead-confined, whatever its scopes. A Lead-confined call:
   that is waiting on a question. The daemon records which sessions a
   Lead-confined `sessions.open` launched and allows input only into a live one
   of those; your own sessions, a finished session and an unknown id are
-  refused. The input must be plain text plus Enter, at most 16 KiB: escape
+  refused. Once you type into the worker yourself, the Lead can no longer type
+  into it. The input must be plain text plus Enter, at most 16 KiB: escape
   sequences (ESC, CSI, OSC, bracketed-paste markers) and control characters
   other than newline, carriage return and tab are refused. The record is kept
   in the daemon's memory, so after a daemon restart the Lead cannot type into
