@@ -11,7 +11,7 @@ use tokio::task;
 
 use termwiz::terminal::TerminalWaker;
 
-use crate::chrome::{FrameModel, LoadStep, StateDbAvailability};
+use crate::chrome::{FrameModel, LoadStep, StateDbAvailability, ZoneCatalog};
 use crate::glyph_types::GlyphRow;
 use crate::hydrate_tuning::{
     GlyphTtls, glyph_ttls, glyph_window, model_refresh_interval, observe_ref_generation,
@@ -2369,6 +2369,13 @@ pub(crate) fn build_initial_model(
                 .map(|(_, _, _, repo)| repo.as_str()),
         )
     });
+    let zone_catalog = db.map_or_else(ZoneCatalog::default, ZoneCatalog::read);
+    // Policy is unknown here (no config in this seed pass): leave
+    // `zones_unpoliced` empty so no `!` shows until the first full hydrate.
+    let sidebar_status = crate::sidebar::SidebarStatus {
+        zones: zone_catalog.clone(),
+        ..Default::default()
+    };
     // Seed the sidebar's dynamic (OSC) worktree titles from the DB so persisted
     // titles show on the very first frame — before any pane re-emits one. The
     // loop's live-title merge then refreshes them in place.
@@ -2381,6 +2388,8 @@ pub(crate) fn build_initial_model(
         active_tab,
         sidebar_workspaces,
         workspace_envs,
+        zone_catalog,
+        sidebar_status,
         sidebar_window_titles,
         active_container_name: thegn_core::sandbox::container_name_with_profile(
             &cwd.to_string_lossy(),
@@ -2891,6 +2900,7 @@ pub(crate) fn build_model(
             .iter()
             .map(|(_, _, _, repo)| repo.as_str()),
     );
+    let zone_catalog = ZoneCatalog::read(db);
     // Folders for every workspace shown in the sidebar (not just the active
     // tab's): the sidebar filters this list per-workspace by `repo_path`, so a
     // worktree filed into a folder stays visible whichever tab is active.
@@ -2921,6 +2931,14 @@ pub(crate) fn build_model(
         &app_cfg.lifecycle,
         &branch_observations,
     );
+    let mut sidebar_status = sidebar_status;
+    sidebar_status.zones = zone_catalog.clone();
+    sidebar_status.zones_unpoliced = zone_catalog
+        .by_repo
+        .values()
+        .filter(|name| !app_cfg.zone.contains_key(name.as_str()))
+        .cloned()
+        .collect();
     let sidebar_us = sidebar_t0.map(|t| t.elapsed().as_micros() as u64);
     // Self-throttled housekeeping (network/DB on own threads): VPS leak reaper
     // + placement engine + hibernator (snapshot-then-destroy for idle VMs).
@@ -3079,6 +3097,7 @@ pub(crate) fn build_model(
         active_tab,
         sidebar_workspaces,
         workspace_envs,
+        zone_catalog,
         sidebar_db_worktrees,
         sidebar_db_folders,
         sidebar_db_terminals,
