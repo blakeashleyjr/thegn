@@ -186,16 +186,15 @@ struct StartTarget {
 fn registered_repo_root(db: &thegn_core::db::Db, repo: &str) -> Result<String> {
     use thegn_core::store::WorkspaceStore;
     // best-effort: an unresolvable path simply matches no registered workspace.
-    let canonical: Option<std::path::PathBuf> =
-        std::fs::canonicalize(repo).map(Some).unwrap_or(None);
+    let canonical = std::fs::canonicalize(repo);
     db.workspaces()?
         .into_iter()
         .filter(|w| w.kind == "repo")
         .find(|w| {
             w.repo_path == repo
                 || canonical
-                    .as_deref()
-                    .is_some_and(|c| std::fs::canonicalize(&w.repo_path).is_ok_and(|p| p == c))
+                    .as_ref()
+                    .is_ok_and(|c| std::fs::canonicalize(&w.repo_path).is_ok_and(|p| &p == c))
         })
         .map(|w| w.repo_path)
         .ok_or_else(|| {
