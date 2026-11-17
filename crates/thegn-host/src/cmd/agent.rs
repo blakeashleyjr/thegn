@@ -43,11 +43,12 @@ pub enum Action {
         json: bool,
     },
     /// Spawn a headless agent into a worktree in one command: the brief is
-    /// resolved, the session opens headless and bound to the worktree (the
-    /// worktree's own env/sandbox), and with `--wait` the command blocks
-    /// until the agent exits and prints the ANSI-stripped tail of its output
-    /// (last 200 non-blank lines). Exit 0 when the agent exits 0, 1 on any
-    /// other exit code, 2 on `--timeout` (the session is left running).
+    /// resolved, the session opens headless and bound to the worktree (its
+    /// env/sandbox; an unbound worktree is first pinned to `pipeline`), and
+    /// with `--wait` the command blocks until the agent exits and prints the
+    /// ANSI-stripped tail of its output (last 200 non-blank lines). Exit 0
+    /// when the agent exits 0, 1 on any other exit code, 2 on `--timeout`
+    /// (the session is left running).
     Run {
         /// An `[[agents]]`/`[[tools]]` name, or a provider id (`claude`,
         /// `codex`) when no entry is named that.
@@ -56,6 +57,11 @@ pub enum Action {
         /// The worktree to launch into (path). The agent runs here.
         #[arg(long)]
         worktree: String,
+        /// Run in this `[env.<name>]` (pins the worktree like `env set`).
+        /// Without it, a worktree with no env selection is pinned to
+        /// `pipeline`.
+        #[arg(long, value_name = "ENV")]
+        env: Option<String>,
         /// Read the task from this file (a template when `--var` is given).
         #[arg(long, required_unless_present = "prompt", conflicts_with = "prompt")]
         brief_file: Option<String>,
@@ -89,8 +95,9 @@ pub enum Action {
             default_value_t = super::agent_spawn::DEFAULT_TIMEOUT_SECS
         )]
         timeout: u64,
-        /// Emit JSON: `{session, row}`, or with `--wait`
-        /// `{session, row, status, exit_code, output_tail, duration_ms}`.
+        /// Emit JSON: `{session, row, env}`, or with `--wait`
+        /// `{session, row, env, status, exit_code, output_tail, duration_ms}`
+        /// (`env` is the env pinned by this run, or null).
         #[arg(long)]
         json: bool,
     },
@@ -107,6 +114,7 @@ pub fn run(cfg: &Config, action: Action) -> Result<()> {
         Action::Run {
             agent,
             worktree,
+            env,
             brief_file,
             prompt,
             var,
@@ -119,6 +127,7 @@ pub fn run(cfg: &Config, action: Action) -> Result<()> {
             super::agent_spawn::RunArgs {
                 agent,
                 worktree,
+                env,
                 brief_file,
                 prompt,
                 vars: var,
