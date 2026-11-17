@@ -47,8 +47,7 @@ pub struct Accrual {
 /// response lacks the fields to price it.
 ///
 /// CPU = `active_cpu_ms / 3_600_000 × rate`; it is NOT multiplied by vCPUs
-/// (UNVERIFIED whether the API value is already per-vCPU). Memory is
-/// `memory_mb / 1024 × wall hours × rate`.
+/// (UNVERIFIED whether the API value is already per-vCPU). Memory is `memory_mb / 1024 × wall hours × rate`; the API's `memory` unit is UNVERIFIED (read as MB; live step).
 pub fn session_accrual(u: &SessionUsage, now_ms: i64, r: &Rates) -> Option<Accrual> {
     let start = u.started_at_ms?;
     let end = u.stopped_at_ms.unwrap_or(now_ms);

@@ -66,7 +66,7 @@ pub fn oidc_refusal(kind: TokenKind, now_s: i64) -> Option<String> {
     match kind {
         TokenKind::Access => None,
         TokenKind::Oidc { exp_s } => match exp_s {
-            Some(exp) if exp - now_s >= OIDC_MIN_REMAINING_S => None,
+            Some(exp) if exp.saturating_sub(now_s) >= OIDC_MIN_REMAINING_S => None,
             _ => Some(
                 "the Vercel OIDC token is expired or expiring; thegn does not refresh OIDC \
                  tokens; use a Vercel access token"
@@ -169,6 +169,7 @@ mod tests {
         assert!(oidc_refusal(k(Some(OIDC_MIN_REMAINING_S - 1)), 0).is_some());
         assert!(oidc_refusal(k(Some(-5)), 0).is_some());
         assert!(oidc_refusal(k(None), 0).is_some());
+        assert!(oidc_refusal(k(Some(i64::MIN)), 1).is_some());
     }
 
     #[test]
