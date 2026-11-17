@@ -2481,6 +2481,32 @@ pub(crate) fn verify_v110_schema(conn: &Connection) -> Result<()> {
     Ok(())
 }
 
+/// v111: automation_rules, Lead-authored automation rules stored with
+/// origin = lead (THE-2181). Additive; config rules never live here.
+pub(crate) fn migrate_v111(conn: &Connection) -> Result<()> {
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS automation_rules (
+           id TEXT PRIMARY KEY,
+           origin TEXT NOT NULL CHECK (origin = 'lead'),
+           body_json TEXT NOT NULL,
+           enabled INTEGER NOT NULL DEFAULT 1,
+           author TEXT NOT NULL DEFAULT '',
+           created_at INTEGER NOT NULL,
+           updated_at INTEGER NOT NULL
+         )",
+    )?;
+    Ok(())
+}
+
+pub(crate) fn verify_v111_schema(conn: &Connection) -> Result<()> {
+    conn.prepare(
+        "SELECT id, origin, body_json, enabled, author, created_at, updated_at \
+         FROM automation_rules LIMIT 0",
+    )
+    .map_err(|e| anyhow::anyhow!("schema v111 incomplete: automation_rules unusable ({e})"))?;
+    Ok(())
+}
+
 /// Verify the v69 identity ledger before the schema version is stamped. A
 /// missing column/table must never look like a completed migration.
 pub(crate) fn verify_v69_schema(conn: &Connection) -> Result<()> {
@@ -4640,7 +4666,7 @@ mod tests {
             .pragma_query_value(None, "user_version", |row| row.get(0))
             .unwrap();
         assert_eq!(version, crate::db::SCHEMA_VERSION);
-        assert_eq!(version, 110);
+        assert!(version >= 110);
         let conn = Connection::open_in_memory().unwrap();
         assert!(super::verify_v110_schema(&conn).is_err());
         conn.execute_batch(
@@ -4655,6 +4681,76 @@ mod tests {
         assert!(super::verify_v110_schema(&conn).is_err());
         super::migrate_v110(&conn).unwrap();
         super::verify_v110_schema(&conn).unwrap();
+    }
+
+    #[test]
+    fn v111_creates_automation_rules_idempotently_and_verifies() {
+        let fresh = Db::open_memory().unwrap();
+        super::verify_v111_schema(fresh.conn()).unwrap();
+        let version: i64 = fresh
+            .conn()
+            .pragma_query_value(None, "user_version", |row| row.get(0))
+            .unwrap();
+        assert_eq!(version, crate::db::SCHEMA_VERSION);
+        assert_eq!(version, 111);
+        let conn = Connection::open_in_memory().unwrap();
+        assert!(super::verify_v111_schema(&conn).is_err());
+        conn.execute_batch(
+            "CREATE TABLE existing_cache (id INTEGER PRIMARY KEY, value TEXT NOT NULL);
+             INSERT INTO existing_cache VALUES (1, 'kept');",
+        )
+        .unwrap();
+        super::migrate_v111(&conn).unwrap();
+        super::migrate_v111(&conn).unwrap();
+        super::verify_v111_schema(&conn).unwrap();
+        let kept: String = conn
+            .query_row("SELECT value FROM existing_cache WHERE id=1", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(kept, "kept", "v111 is additive");
+        // Only Lead-authored rows may live in the table.
+        assert!(
+            conn.execute(
+                "INSERT INTO automation_rules (id, origin, body_json, created_at, updated_at)
+                 VALUES ('x', 'config', '{}', 1, 1)",
+                [],
+            )
+            .is_err()
+        );
+        conn.execute(
+            "INSERT INTO automation_rules (id, origin, body_json, created_at, updated_at)
+             VALUES ('lead:x', 'lead', '{}', 1, 1)",
+            [],
+        )
+        .unwrap();
+        let (enabled, author): (i64, String) = conn
+            .query_row(
+                "SELECT enabled, author FROM automation_rules WHERE id='lead:x'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!((enabled, author.as_str()), (1, ""));
+    }
+
+    #[test]
+    fn v111_upgrades_a_real_v110_database() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("v110.db");
+        {
+            let db = Db::open_at(&path).unwrap();
+            db.conn()
+                .execute_batch("DROP TABLE automation_rules; PRAGMA user_version=110;")
+                .unwrap();
+        }
+        let upgraded = Db::open_at(&path).unwrap();
+        let version: i64 = upgraded
+            .conn()
+            .pragma_query_value(None, "user_version", |row| row.get(0))
+            .unwrap();
+        assert_eq!(version, crate::db::SCHEMA_VERSION);
+        super::verify_v111_schema(upgraded.conn()).unwrap();
     }
 
     #[test]
