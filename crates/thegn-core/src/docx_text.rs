@@ -131,6 +131,7 @@ pub fn document_xml_lines(
         truncated: false,
     };
     let mut in_t = false;
+    let mut in_tabs = false;
     let mut rest: &str = &text;
     'scan: while !rest.is_empty() {
         let Some(lt) = rest.find('<') else {
@@ -163,7 +164,9 @@ pub fn document_xml_lines(
                     break 'scan;
                 }
             }
-            (false, "w:tab") => out.push_str("    "),
+            (false, "w:tabs") => in_tabs = !self_closing,
+            (true, "w:tabs") => in_tabs = false,
+            (false, "w:tab") if !in_tabs => out.push_str("    "),
             (false, "w:br" | "w:cr") => {
                 if !out.end_line() {
                     break 'scan;
@@ -194,6 +197,12 @@ mod tests {
         let x = "<w:document><w:body><w:p><w:r><w:t>Hello</w:t></w:r><w:r><w:tab/><w:t>World</w:t></w:r></w:p>\
                  <w:p><w:r><w:t>a</w:t><w:br/><w:t>b</w:t><w:cr/><w:t>c</w:t></w:r></w:p><w:p></w:p></w:body></w:document>";
         assert_eq!(lines(x), ["Hello    World", "a", "b", "c", ""]);
+        assert_eq!(
+            lines(
+                "<w:p><w:pPr><w:tabs><w:tab w:val=\"left\" w:pos=\"720\"/></w:tabs></w:pPr><w:r><w:t>x</w:t></w:r></w:p>"
+            ),
+            ["x"]
+        );
     }
 
     #[test]
@@ -251,7 +260,9 @@ mod tests {
     fn every_prefix_of_a_document_is_safe() {
         let x = "<?xml version=\"1.0\"?><w:document><w:body><w:p><w:r><w:t xml:space=\"preserve\">caf\u{e9} &amp; &#x1F600; \u{1F600}</w:t></w:r><w:tab/></w:p></w:body></w:document>";
         for n in 0..=x.len() {
-            let _ = document_xml_lines(&x.as_bytes()[..n], 10, 20);
+            if let Ok(t) = document_xml_lines(&x.as_bytes()[..n], 10, 20) {
+                assert!(t.lines.len() <= 10);
+            }
         }
     }
 }
