@@ -25,11 +25,14 @@
 - [x] 2.1 Mouse-seam drag model: press-on-tree-row → drag, release-over-target →
       action (terminal path-insert vs markdown-link insert) — **unit tests** for
       the pure target-resolution + payload-formatting logic. (`src/dragdrop.rs`.)
-- [ ] 2.2 Wire the drag model into the existing TUI mouse event handling
-      (in-process panes only; TUI-limited). **Deferred** to a focused follow-up:
-      the pure model is complete + tested, but the panel-row-hit-test →
-      pane-target integration is a delicate `run.rs`/panel change that needs a
-      live TUI to verify. `dragdrop.rs` is `#![allow(dead_code)]` until wired.
+- [x] 2.2 Wire the drag model into the existing TUI mouse event handling
+      (in-process panes only; TUI-limited). Shipped b150: `run.rs` mouse loop
+      (`file_drag: Option<dragdrop::FileDrag>`, `dragdrop::pane_at`) with
+      shell-safe insertion via `dragdrop.rs` (`shell_quote`; tests
+      `terminal_drop_quotes_paths_with_spaces_and_quotes`,
+      `terminal_drop_refuses_control_characters`) and bracketed paste through
+      `pane_writer::build_paste_bytes`. Live TUI check and e2e coverage remain
+      open (see Validate).
 
 ## 3. Quick-Open two-pass ranking (M 777)
 
