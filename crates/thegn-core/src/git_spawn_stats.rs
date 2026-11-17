@@ -130,7 +130,7 @@ pub fn take_window() -> Vec<SpawnEntry> {
         .into_iter()
         .map(|s| (s.thread, s.sub, s.count))
         .collect();
-    out.sort_by(|a, b| b.2.cmp(&a.2));
+    out.sort_by_key(|e| std::cmp::Reverse(e.2));
     out
 }
 
@@ -235,7 +235,7 @@ mod tests {
             .into_iter()
             .map(|s| (s.thread, s.sub, s.count))
             .collect();
-        out.sort_by(|a, b| b.2.cmp(&a.2));
+        out.sort_by_key(|e| std::cmp::Reverse(e.2));
         let names: Vec<_> = out.iter().map(|e| e.1.as_str()).collect();
         assert_eq!(names, ["top", "b", "a", "c"]);
         assert_eq!(top_text(&out, 2), "t:top x3, t:b x2");
