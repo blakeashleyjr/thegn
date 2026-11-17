@@ -147,9 +147,132 @@ fn ensure_object_path<'a>(
         .ok_or_else(|| "settings container is not a JSON object".to_string())
 }
 
+// ── The Lead's private MCP config (THE-2188) ────────────────────────────────
+
+/// The Lead's `thegn mcp serve` entry key in its private `mcp.json`.
+pub const LEAD_SERVE_KEY: &str = "thegn";
+/// The Lead's `thegn mcp proxy --profile` hub entry key.
+pub const LEAD_HUB_KEY: &str = "thegn-lead-hub";
+
+/// What one Lead tab's private MCP config wires: the scoped `thegn mcp serve`
+/// (carrying the host-minted, scoped control token) and, when the profile names
+/// at least one server, the Lead's own `thegn mcp proxy --profile` hub.
+#[derive(Debug, Clone, Copy)]
+pub struct LeadEntries<'a> {
+    /// The thegn binary (`current_exe`).
+    pub command: &'a str,
+    /// The clamped scope csv (`"none"` when empty: docs tools only).
+    pub scopes_csv: &'a str,
+    /// `127.0.0.1:<port>` of the daemon's Lead listener.
+    pub control_addr: &'a str,
+    /// The scoped bearer token (the only secret in the file).
+    pub control_token: &'a str,
+    /// Audit-only caller label (`THEGN_CALLER`); never used for authorization.
+    pub caller: &'a str,
+    /// `[mcp_proxy.profiles]` entry for the hub; `None` = no hub entry.
+    pub hub_profile: Option<&'a str>,
+}
+
+/// Build the Lead's claude-shaped `{"mcpServers": {...}}` document.
+///
+/// Unlike [`proxy_entry`] (written into a user's agent settings, so never any
+/// `env`), this goes to a private owner-only file only the Lead's agent reads,
+/// and its single secret is the scoped Lead token on the `thegn` entry. The hub
+/// entry is argv only: upstream secrets still resolve at spawn in the hub.
+pub fn lead_entries(e: &LeadEntries<'_>) -> Value {
+    let scopes = if e.scopes_csv.is_empty() {
+        "none"
+    } else {
+        e.scopes_csv
+    };
+    let mut servers = Map::new();
+    servers.insert(
+        LEAD_SERVE_KEY.to_string(),
+        json!({
+            "command": e.command,
+            "args": ["mcp", "serve", "--scopes", scopes],
+            "env": {
+                "THEGN_CONTROL_ADDR": e.control_addr,
+                "THEGN_CONTROL_TOKEN": e.control_token,
+                "THEGN_CALLER": e.caller,
+            },
+            MARKER_KEY: true,
+        }),
+    );
+    if let Some(profile) = e.hub_profile {
+        servers.insert(
+            LEAD_HUB_KEY.to_string(),
+            json!({
+                "command": e.command,
+                "args": ["mcp", "proxy", "--profile", profile],
+                MARKER_KEY: true,
+            }),
+        );
+    }
+    json!({ "mcpServers": Value::Object(servers) })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn lead(hub: Option<&'static str>) -> Value {
+        lead_entries(&LeadEntries {
+            command: "/bin/thegn",
+            scopes_csv: "read,write",
+            control_addr: "127.0.0.1:4242",
+            control_token: "tgc_secret",
+            caller: "lead",
+            hub_profile: hub,
+        })
+    }
+
+    #[test]
+    fn lead_entries_shape_carries_only_the_scoped_token_env() {
+        let doc = lead(Some("lead"));
+        let servers = doc["mcpServers"].as_object().unwrap();
+        assert_eq!(servers.len(), 2);
+        let serve = &servers[LEAD_SERVE_KEY];
+        assert_eq!(serve["command"], "/bin/thegn");
+        assert_eq!(
+            serve["args"],
+            json!(["mcp", "serve", "--scopes", "read,write"])
+        );
+        let env = serve["env"].as_object().unwrap();
+        let mut keys: Vec<&str> = env.keys().map(String::as_str).collect();
+        keys.sort_unstable();
+        assert_eq!(
+            keys,
+            ["THEGN_CALLER", "THEGN_CONTROL_ADDR", "THEGN_CONTROL_TOKEN"]
+        );
+        assert_eq!(env["THEGN_CONTROL_TOKEN"], "tgc_secret");
+        // `sessions_input` is never opted into.
+        assert!(!serve["args"].to_string().contains("allow-session-input"));
+        let hub = &servers[LEAD_HUB_KEY];
+        assert_eq!(hub["args"], json!(["mcp", "proxy", "--profile", "lead"]));
+        assert!(hub.get("env").is_none(), "the hub entry is secret-free");
+        // The token appears exactly once in the whole document.
+        assert_eq!(doc.to_string().matches("tgc_secret").count(), 1);
+    }
+
+    #[test]
+    fn lead_entries_omits_the_hub_and_maps_empty_scopes_to_none() {
+        let doc = lead_entries(&LeadEntries {
+            command: "thegn",
+            scopes_csv: "",
+            control_addr: "127.0.0.1:1",
+            control_token: "t",
+            caller: "lead",
+            hub_profile: None,
+        });
+        let servers = doc["mcpServers"].as_object().unwrap();
+        assert_eq!(servers.len(), 1);
+        assert_eq!(
+            servers[LEAD_SERVE_KEY]["args"],
+            json!(["mcp", "serve", "--scopes", "none"])
+        );
+        assert!(lead(None)["mcpServers"].get(LEAD_HUB_KEY).is_none());
+    }
 
     fn entry() -> Value {
         proxy_entry("thegn")
