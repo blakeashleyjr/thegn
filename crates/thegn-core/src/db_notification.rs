@@ -855,6 +855,43 @@ impl Db {
         self.dispatches_with_status_ordered(statuses, limit, false)
     }
 
+    /// The newest plain (stage-less) dispatch for `worktree` by `agent`, read
+    /// through a scoped query instead of a whole-roster scan.
+    pub fn latest_plain_dispatch_for_worktree_agent(
+        &self,
+        worktree: &str,
+        agent: &str,
+    ) -> Result<Option<crate::issue::AgentDispatch>> {
+        let conn = self.conn();
+        let sql = format!(
+            "SELECT {DISPATCH_COLS} FROM agent_dispatches \
+             WHERE worktree_path = ?1 AND stage IS NULL AND agent_name = ?2 \
+             ORDER BY id DESC LIMIT 1"
+        );
+        Ok(conn
+            .query_row(&sql, params![worktree, agent], map_dispatch)
+            .optional()?)
+    }
+
+    /// The newest active dispatch (Queued, Spawning, Running, WaitingHuman or
+    /// PrOpen) for `worktree`. `AgentDispatchStatus::parse` has no legacy alias
+    /// that coerces to an active status, so the canonical strings are complete.
+    pub fn latest_active_dispatch_for_worktree(
+        &self,
+        worktree: &str,
+    ) -> Result<Option<crate::issue::AgentDispatch>> {
+        let conn = self.conn();
+        let sql = format!(
+            "SELECT {DISPATCH_COLS} FROM agent_dispatches \
+             WHERE worktree_path = ?1 \
+             AND status IN ('queued', 'spawning', 'running', 'waiting_human', 'pr_open') \
+             ORDER BY id DESC LIMIT 1"
+        );
+        Ok(conn
+            .query_row(&sql, params![worktree], map_dispatch)
+            .optional()?)
+    }
+
     /// List the newest rows matching the requested statuses, plus whether
     /// additional matches were omitted. The status index keeps this bounded
     /// query independent of terminal roster history.
@@ -1886,5 +1923,63 @@ mod tests {
             })
         );
         assert_eq!(dispatch_row_count(&db), Db::ROSTER_ACTIVE_LIMIT as i64);
+    }
+
+    #[test]
+    fn scoped_worktree_dispatch_queries_match_the_in_rust_roster_scan() {
+        use crate::issue::{AgentDispatchStatus as S, NewDispatch};
+        let db = Db::open_memory().unwrap();
+        let put = |wt: &'static str, agent: &'static str, stage: Option<&'static str>, st: S| {
+            let mut new = NewDispatch::new("linear:EQ-1", wt, agent);
+            new.stage = stage;
+            let id = db.put_agent_dispatch(new).unwrap();
+            db.update_dispatch_status(id, st).unwrap();
+            id
+        };
+        put("/wt/a", "land", None, S::Done);
+        put("/wt/a", "land", None, S::Failed);
+        put("/wt/a", "coder", None, S::Running);
+        put("/wt/a", "land", Some("code"), S::Running);
+        put("/wt/b", "land", None, S::Running);
+        put("/wt/a", "land", None, S::Done);
+        put("/wt/a", "coder", None, S::Merged);
+        for wt in ["/wt/a", "/wt/b", "/wt/none"] {
+            for agent in ["land", "coder", "other"] {
+                let mut rows = db.list_dispatches().unwrap();
+                rows.sort_by_key(|row| row.id);
+                let old = rows
+                    .iter()
+                    .rev()
+                    .find(|r| r.worktree_path == wt && r.stage.is_none() && r.agent_name == agent)
+                    .map(|r| r.id);
+                let new = db
+                    .latest_plain_dispatch_for_worktree_agent(wt, agent)
+                    .unwrap()
+                    .map(|r| r.id);
+                assert_eq!(new, old, "plain {wt} {agent}");
+            }
+            let mut rows = db.list_dispatches().unwrap();
+            rows.sort_by_key(|row| row.id);
+            let old = rows
+                .iter()
+                .rev()
+                .find(|r| r.worktree_path == wt && r.status.is_active())
+                .map(|r| r.id);
+            let new = db
+                .latest_active_dispatch_for_worktree(wt)
+                .unwrap()
+                .map(|r| r.id);
+            assert_eq!(new, old, "active {wt}");
+        }
+        let active = db
+            .latest_active_dispatch_for_worktree("/wt/a")
+            .unwrap()
+            .unwrap();
+        assert_eq!(active.stage.as_deref(), Some("code"));
+        assert!(
+            db.latest_active_dispatch_for_worktree("/wt/none")
+                .unwrap()
+                .is_none()
+        );
     }
 }
