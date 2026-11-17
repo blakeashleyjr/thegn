@@ -213,8 +213,9 @@ files), `?` shows that section's own key cheatsheet.
 
 The worktree's file tree; `/` filters it (directories stay while any
 descendant matches; Esc clears), `↵` previews a file inline, `o` pages
-it in bat, `O` opens your editor, `y` reveals it in yazi. An unknown binary
-previews as a hex dump of its first 4096 bytes. See
+it in bat, `O` opens your editor, `y` reveals it in yazi. A zip, jar, whl,
+tar or tar.gz previews as an entry listing; an unknown binary previews as a
+hex dump of its first 4096 bytes. See
 [[git-and-diffs]].
 
 {{keys:files}}
