@@ -1329,6 +1329,67 @@ mod tests {
         );
     }
 
+    fn synthetic_paths(n: usize) -> Vec<String> {
+        (0..n)
+            .map(|i| format!("/code/group{}/repo-{i:05}", i % 40))
+            .collect()
+    }
+
+    #[test]
+    fn printable_keystroke_and_render_stay_within_allocation_budget() {
+        // Generous starting ceiling (not yet pinned to observed x 1.1); the
+        // primary re-pins it from the printed counts.
+        const ALLOC_CEILING: u64 = 60_000;
+        let mut p = WorkspacePicker::new(synthetic_paths(2_000), HashSet::new());
+        let mut surface = Surface::new(120, 40);
+        let screen = Rect {
+            x: 0,
+            y: 0,
+            cols: 120,
+            rows: 40,
+        };
+        let (_, counts) = crate::proc_workload_alloc::measure(|| {
+            key(&mut p, KeyCode::Char('r'));
+            p.render(&mut surface, screen);
+        });
+        println!(
+            "picker keystroke+render (2000 entries, 120x40): allocs={} reallocs={} bytes={}",
+            counts.allocation_calls, counts.realloc_calls, counts.requested_bytes
+        );
+        assert!(
+            counts.allocation_calls < ALLOC_CEILING,
+            "keystroke+render allocated {} times; ceiling={ALLOC_CEILING}",
+            counts.allocation_calls
+        );
+    }
+
+    #[test]
+    fn match_cache_refreshes_on_query_edit_seed_refresh_and_db_seed() {
+        let mut p = picker(&["/code/alpha", "/code/beta"]);
+        assert_eq!(p.matches().len(), 2);
+        // Query edit narrows the cached list, backspace restores it.
+        type_str(&mut p, "beta");
+        let paths: Vec<&str> = p.matches().iter().map(|e| e.path.as_str()).collect();
+        assert_eq!(paths, vec!["/code/beta"]);
+        for _ in 0..4 {
+            key(&mut p, KeyCode::Backspace);
+        }
+        assert_eq!(p.matches().len(), 2);
+        // A seed refresh with a query active re-ranks against the new items.
+        type_str(&mut p, "gam");
+        assert!(p.matches().is_empty());
+        p.apply_db_seed(vec!["/code/gamma".into()], HashSet::new());
+        let paths: Vec<&str> = p.matches().iter().map(|e| e.path.as_str()).collect();
+        assert_eq!(paths, vec!["/code/gamma"]);
+        assert_eq!(p.matches.len(), p.match_scores.len());
+        // apply_db_result routes through the same refresh.
+        p.mark_db_pending("k".into(), 7);
+        assert!(p.apply_db_result("k", 7, vec!["/code/gambit".into()], HashSet::new()));
+        let paths: Vec<&str> = p.matches().iter().map(|e| e.path.as_str()).collect();
+        assert!(paths.contains(&"/code/gambit"), "{paths:?}");
+        assert!(paths.contains(&"/code/gamma"), "{paths:?}");
+    }
+
     #[test]
     fn empty_query_keeps_seed_frecency_order() {
         let p = picker(&["/code/zeta", "/code/alpha", "/code/mid"]);
