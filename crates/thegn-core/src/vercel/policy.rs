@@ -167,7 +167,9 @@ pub fn size_key(vcpus: u32) -> String {
     format!("{vcpus}vcpu")
 }
 
-/// Whether a session in `status` bills compute.
+/// Whether a session in `status` bills compute. An unrecognised status
+/// (`Unknown`) fails safe for spend: it counts as billing (possibly running),
+/// so the reaper stops it at the ceiling and the cost rows price it as running.
 pub fn is_billing(status: SessionStatus) -> bool {
     matches!(
         status,
@@ -175,6 +177,7 @@ pub fn is_billing(status: SessionStatus) -> bool {
             | SessionStatus::Running
             | SessionStatus::Stopping
             | SessionStatus::Snapshotting
+            | SessionStatus::Unknown
     )
 }
 
@@ -319,6 +322,7 @@ mod tests {
             SessionStatus::Running,
             SessionStatus::Stopping,
             SessionStatus::Snapshotting,
+            SessionStatus::Unknown,
         ] {
             assert!(is_billing(s));
         }
@@ -326,7 +330,6 @@ mod tests {
             SessionStatus::Stopped,
             SessionStatus::Failed,
             SessionStatus::Aborted,
-            SessionStatus::Unknown,
         ] {
             assert!(!is_billing(s));
         }
