@@ -30,6 +30,8 @@ pub struct NewAutomationRun {
     pub action_cap: String,
     pub action_summary: String,
     pub started_at: i64,
+    /// Effective autonomy of a planned action (schema v112); `None` for skips.
+    pub autonomy: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize)]
@@ -47,6 +49,9 @@ pub struct AutomationRunRow {
     pub error: Option<String>,
     pub started_at: i64,
     pub finished_at: Option<i64>,
+    /// Effective autonomy recorded at admission (schema v112); NULL on rows
+    /// written before v112 and on skips.
+    pub autonomy: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -74,6 +79,23 @@ pub trait AutomationStore {
         event: &AutomationEvent,
         now: i64,
     ) -> Result<Vec<AutomationAdmission>>;
+
+    /// The paused-runtime twin of [`Self::admit_automation_event`]: evaluate
+    /// purely against the persisted ledgers, persist NO state transition, and
+    /// audit every decision as a skip. A would-be planned action is recorded
+    /// as `paused`; a policy skip keeps its own reason. Returns the number of
+    /// audit rows written. Nothing is admitted, so nothing executes.
+    fn audit_paused_automation_event(
+        &self,
+        rules: &[AutomationRule],
+        event: &AutomationEvent,
+        now: i64,
+    ) -> Result<usize>;
+
+    /// Whether a run of `rule_id` started within the last six hours and has
+    /// not finished. The six-hour window is the crash guard: a row left
+    /// unfinished by a crashed process stops counting as live after it.
+    fn automation_run_in_flight(&self, rule_id: &str, now: i64) -> Result<bool>;
 
     /// Insert the pre-dispatch audit row and return its run id.
     fn start_automation_run(&self, run: &NewAutomationRun) -> Result<i64>;
