@@ -25,6 +25,11 @@ rail is a slim strip that keeps each row's activity dot and initial visible
 while reclaiming the columns; press `Alt-s` to grow it back into the full
 tree. `q` or `Esc` returns to the terminal.
 
+Workspace headers show the workspace's zone after its name (`zone work`).
+`zone ?` means the zone catalog could not be read; a trailing `!` (amber)
+means the zone has no `[zone.<name>]` policy in your config. The chip drops
+first when the header is too narrow, and the slim rail never shows it.
+
 While the sidebar is hidden, the masthead shows a `◌ sidebar hidden` chip
 (`◌` alone on a narrow terminal, `.` under ASCII glyphs) after the brand, so a
 hidden sidebar is never invisible. Clicking it cycles the sidebar back to the
