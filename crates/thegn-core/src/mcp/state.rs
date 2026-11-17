@@ -2926,6 +2926,30 @@ mod tests {
     }
 
     #[test]
+    fn b155_spine_caps_are_never_mcp_tools() {
+        // The phone's answer, the operator's halt and the profile env are
+        // HTTP + CLI only, on any scope.
+        let r = StateRouter::new(all_caps(), |_, _| Ok(json!(null)));
+        let entries = r.tool_entries();
+        for cap in [
+            "approvals.redeem",
+            "automations.halt",
+            "mcp_proxy.profile_env",
+        ] {
+            assert!(!MCP_STATE_CAPS.contains(&cap), "{cap}");
+            assert!(STATE_TOOLS.iter().all(|t| t.cap != cap), "{cap}");
+            let tool = cap.replace('.', "_");
+            assert!(r.call(&tool, &json!({})).is_none(), "{cap}");
+            assert!(
+                entries
+                    .iter()
+                    .all(|e| e["name"].as_str() != Some(tool.as_str())),
+                "{cap}"
+            );
+        }
+    }
+
+    #[test]
     fn automations_pause_is_an_mcp_tool_and_resume_never_is() {
         // THE-2197: the Lead may pull the kill switch but never release it.
         assert!(MCP_STATE_CAPS.contains(&"automations.pause"));

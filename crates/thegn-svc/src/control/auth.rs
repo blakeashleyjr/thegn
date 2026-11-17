@@ -171,6 +171,13 @@ pub fn verify(store: &dyn ControlStore, token: &str, now_ms: i64) -> Option<Auth
     })
 }
 
+/// The Lead token's sliding refresh (b155): when a Lead-confined token is
+/// used with less than half of `ttl_secs` left, move `expires_at` to
+/// `now + ttl`, capped at `created_at + 7 days`. Best-effort; writes at most
+/// once per half-TTL. Spine stub: b155 lane 7 fills it.
+#[allow(dead_code, reason = "filled by b155 lane 7")]
+pub fn slide_lead_expiry(_store: &dyn ControlStore, _ctx: &AuthCtx, _now_ms: i64, _ttl_secs: u64) {}
+
 /// Redeem a pairing code for a fresh control token (the unauthenticated
 /// `/v1/pair` flow). Verifies the code's secret hash, consumes it atomically,
 /// and mints a `kind = "token"` row inheriting the code's scope. The returned

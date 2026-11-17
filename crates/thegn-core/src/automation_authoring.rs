@@ -250,6 +250,19 @@ pub fn compile_lead_rows(
     (rules, invalid)
 }
 
+/// [`compile_lead_rows`] with the owner's arming approvals (6c): a row whose
+/// `(rule id, body digest)` is in `armed` compiles as
+/// [`crate::automation_autonomy::RuleOrigin::LeadApproved`]. Spine stub
+/// (b155 lane 1): b155 lane 4 fills it; until then nothing is armed.
+#[allow(dead_code, reason = "filled by b155 lane 4")]
+pub fn compile_lead_rows_armed(
+    rows: &[LeadRuleRow],
+    config_names: &[String],
+    _armed: &BTreeSet<(String, String)>,
+) -> (Vec<AutomationRule>, Vec<(String, Vec<String>)>) {
+    compile_lead_rows(rows, config_names)
+}
+
 /// Decode and re-validate one stored row. The allowlist still refuses; the
 /// autonomy is capped through the Lead policy instead (a hand-written
 /// `"autonomy":"merge"` row runs at `review`, a `pipeline.start` at `propose`).

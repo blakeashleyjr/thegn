@@ -158,6 +158,8 @@ fn observe_exit(obs: &Arc<Observer>, session: String, code: Option<i32>) {
             if let Err(e) = stamp_dispatch_exit(&svc, stamp_session.clone(), code).await {
                 tracing::warn!(target: "thegn::daemon", session = %stamp_session, "dispatch exit stamp: {e:#}");
             }
+            // b155: the row is stamped; the stage executor re-plans its lane.
+            super::stage_executor::kick_session(&stamp_session);
         });
         return;
     };
@@ -186,6 +188,7 @@ fn observe_exit(obs: &Arc<Observer>, session: String, code: Option<i32>) {
                         "dispatch exit stamp: {e:#}"
                     );
                 }
+                super::stage_executor::kick_session(&stamp_session);
             });
             return;
         }
@@ -206,6 +209,8 @@ fn observe_exit(obs: &Arc<Observer>, session: String, code: Option<i32>) {
                 "transport retry: {e:#}"
             );
         }
+        // b155: stamped (and retried or parked); the executor re-plans.
+        super::stage_executor::kick_session(&session);
         obs.pending
             .lock()
             .unwrap_or_else(|p| p.into_inner())

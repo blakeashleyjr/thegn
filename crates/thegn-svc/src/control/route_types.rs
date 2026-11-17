@@ -134,6 +134,10 @@ pub static ROUTE_TYPES: &[(&str, &str, &str)] = &[
     // Automation kill switch (THE-2197): no arguments.
     ("automations.pause", "{}", "{paused}"),
     ("automations.resume", "{}", "{paused}"),
+    // b155 Lead spine.
+    ("approvals.redeem", "{nonce, decision}", "{resolved}"),
+    ("automations.halt", "{keep_sessions}", "{paused, killed}"),
+    ("mcp_proxy.profile_env", "{profile}", "{env}"),
     (
         "mcp_proxy.status",
         "—",
