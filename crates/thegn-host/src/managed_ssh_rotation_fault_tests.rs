@@ -54,8 +54,9 @@ const FORWARD_PHASES: [&str; 2] = ["retirement-completion-recorded", "custody-co
 
 /// Crashes after the last ledger row is cleaned and before the retired or
 /// auxiliary local pair is deleted leave that pair on disk with no custody
-/// row. It is never authorized anywhere (asserted); deleting it is a known
-/// gap.
+/// row. It is never authorized anywhere (asserted before anything else runs),
+/// and the next uninterrupted rotation of the key deletes it (asserted by
+/// [`assert_next_rotation_sweeps_orphans`]).
 const ORPHAN_PAIR_PHASES: [&str; 3] = [
     "custody-completed",
     "recovery-cleared",
@@ -277,6 +278,8 @@ fn fixture() -> Option<Fixture> {
     let state = thegn_core::testenv::IsolatedState::new();
     let keys = state.root().join("keys");
     std::fs::create_dir_all(&keys).unwrap();
+    // Managed key directories are owner-only (`generate_managed_keypair_at`).
+    thegn_core::fsperm::restrict_dir_to_owner(&keys).unwrap();
     let key_path = keys.join("managed_ed25519");
     let homes = state.root().join("remotes");
     FakeRemote::new(&homes, Fault::None, 0)
@@ -437,6 +440,45 @@ fn assert_consistent(fixture: &Fixture, context: &str) -> (bool, Vec<String>) {
     (canonical_body != fixture.old_body, leftovers)
 }
 
+/// Only a crash in an [`ORPHAN_PAIR_PHASES`] boundary may leave local files
+/// behind, exactly one never-authorized pair (`assert_consistent` has already
+/// proven no instance authorizes it); the next uninterrupted rotation must
+/// then remove it. Returns whether an orphan was found and swept.
+fn assert_orphans_only_from_orphan_phases_then_swept(
+    fixture: &Fixture,
+    context: &str,
+    phases: &[&str],
+    leftovers: &[String],
+) -> bool {
+    assert_no_leftovers_unless_orphan_phase(context, phases, leftovers);
+    if leftovers.is_empty() {
+        return false;
+    }
+    assert_next_rotation_sweeps_orphans(fixture, context);
+    true
+}
+
+/// A second, uninterrupted `rotate` deletes every orphaned sibling and leaves
+/// the scope consistent on the newly rotated key.
+fn assert_next_rotation_sweeps_orphans(fixture: &Fixture, context: &str) {
+    let remote = FakeRemote::new(&fixture.homes, Fault::None, 150);
+    match run_rotation(&remote, &fixture.key_path) {
+        Run::Completed(result) => {
+            if let Err(error) = result {
+                panic!("{context}: the sweeping rotation failed: {error:#}");
+            }
+        }
+        Run::Crashed => unreachable!("no fault is armed for the sweeping rotation"),
+    }
+    let context = format!("{context}, then a sweeping rotation");
+    let (rotated, leftovers) = assert_consistent(fixture, &context);
+    assert!(rotated, "{context}: the sweeping rotation must rotate");
+    assert!(
+        leftovers.is_empty(),
+        "{context}: orphaned pair survived the next rotation: {leftovers:?}"
+    );
+}
+
 fn assert_no_leftovers_unless_orphan_phase(context: &str, phases: &[&str], leftovers: &[String]) {
     if leftovers.is_empty() {
         return;
@@ -478,6 +520,7 @@ fn uninterrupted_rotation_retires_the_old_key_everywhere() {
 #[test]
 fn a_crash_after_every_rotation_phase_resumes_to_exactly_one_authorized_key() {
     let mut seen = BTreeSet::new();
+    let mut swept = BTreeSet::new();
     for target in 1.. {
         let Some(fixture) = fixture() else {
             return;
@@ -501,17 +544,30 @@ fn a_crash_after_every_rotation_phase_resumes_to_exactly_one_authorized_key() {
             FORWARD_PHASES.contains(&phase.as_str()),
             "{context}: rolled the wrong way"
         );
-        assert_no_leftovers_unless_orphan_phase(&context, &[phase.as_str()], &leftovers);
+        if assert_orphans_only_from_orphan_phases_then_swept(
+            &fixture,
+            &context,
+            &[phase.as_str()],
+            &leftovers,
+        ) {
+            swept.insert(phase.clone());
+        }
         seen.insert(phase);
     }
     for phase in ROTATION_PHASES {
         assert!(seen.contains(phase), "phase {phase} was never interrupted");
     }
+    assert!(
+        swept.contains("custody-completed"),
+        "a crash after the last custody completion must orphan the retired pair, \
+         and the next rotation must sweep it; swept after {swept:?}"
+    );
 }
 
 #[test]
 fn a_crash_inside_the_recovery_of_a_crashed_rotation_still_settles() {
     let mut recovery_seen = BTreeSet::new();
+    let mut swept = BTreeSet::new();
     'rotation: for first in 1.. {
         for second in 1.. {
             let Some(fixture) = fixture() else {
@@ -526,11 +582,14 @@ fn a_crash_inside_the_recovery_of_a_crashed_rotation_still_settles() {
             if !recovery_pending() {
                 let context = format!("crash after {first_phase}");
                 let (_, leftovers) = assert_consistent(&fixture, &context);
-                assert_no_leftovers_unless_orphan_phase(
+                if assert_orphans_only_from_orphan_phases_then_swept(
+                    &fixture,
                     &context,
                     &[first_phase.as_str()],
                     &leftovers,
-                );
+                ) {
+                    swept.insert(first_phase.clone());
+                }
                 continue 'rotation;
             }
             let resume = FakeRemote::new(&fixture.homes, Fault::CrashAtPhase(second), 100);
@@ -549,11 +608,14 @@ fn a_crash_inside_the_recovery_of_a_crashed_rotation_still_settles() {
             );
             settle(&fixture);
             let (_, leftovers) = assert_consistent(&fixture, &context);
-            assert_no_leftovers_unless_orphan_phase(
+            if assert_orphans_only_from_orphan_phases_then_swept(
+                &fixture,
                 &context,
                 &[first_phase.as_str(), second_phase.as_str()],
                 &leftovers,
-            );
+            ) {
+                swept.insert(second_phase.clone());
+            }
             if !crashed_again {
                 continue 'rotation;
             }
@@ -564,6 +626,13 @@ fn a_crash_inside_the_recovery_of_a_crashed_rotation_still_settles() {
         assert!(
             recovery_seen.contains(phase),
             "recovery phase {phase} was never interrupted"
+        );
+    }
+    for phase in ["recovery-cleared", "recovery-completed-forward"] {
+        assert!(
+            swept.contains(phase),
+            "a recovery crash after the last {phase} must orphan a pair that the next \
+             rotation sweeps; swept after {swept:?}"
         );
     }
 }
