@@ -514,7 +514,7 @@ mod tests {
     fn type_errors_name_path_expected_and_actual_types() {
         for (format, body) in [
             (OverlayFormat::Toml, "[sandbox]\nenabled = \"yes\"\n"),
-            (OverlayFormat::Yaml, "sandbox:\n  enabled: yes\n"),
+            (OverlayFormat::Yaml, "sandbox:\n  enabled: \"yes\"\n"),
             (OverlayFormat::Json, r#"{"sandbox":{"enabled":"yes"}}"#),
         ] {
             let errors = validate_repo_overlay(body, format);
