@@ -58,6 +58,10 @@ pub struct EnvSpec {
     pub api_key_env: Option<String>,
     pub region: Option<String>,
     pub size: Option<String>,
+    /// Vercel team id (`team_…`); not a secret.
+    pub team_id: Option<String>,
+    /// Vercel project id (`prj_…`); not a secret.
+    pub project_id: Option<String>,
     pub template: Option<String>,
     pub max_instances: Option<i64>,
     pub max_lifetime_secs: Option<i64>,
@@ -369,6 +373,8 @@ pub fn upsert_env(config_path: &Path, spec: &EnvSpec) -> Result<()> {
             put_str(p, "api_key_env", &spec.api_key_env);
             put_str(p, "region", &spec.region);
             put_str(p, "size", &spec.size);
+            put_str(p, "team_id", &spec.team_id);
+            put_str(p, "project_id", &spec.project_id);
             put_str(p, "template", &spec.template);
             if let Some(n) = spec.max_instances {
                 p.insert("max_instances", value(n));

@@ -141,6 +141,12 @@ pub enum Action {
         region: Option<String>,
         #[arg(long)]
         size: Option<String>,
+        /// Vercel team id (`team_…`); vercel only.
+        #[arg(long)]
+        team_id: Option<String>,
+        /// Vercel project id (`prj_…`); vercel only.
+        #[arg(long)]
+        project_id: Option<String>,
         /// Image/snapshot template (e.g. `image:<ref>` for Fly, `snapshot:<id>` for VPS).
         #[arg(long)]
         template: Option<String>,
@@ -225,6 +231,8 @@ pub fn run(cfg: &Config, action: Action) -> Result<()> {
             provider,
             region,
             size,
+            team_id,
+            project_id,
             template,
             max_instances,
             max_lifetime,
@@ -239,6 +247,8 @@ pub fn run(cfg: &Config, action: Action) -> Result<()> {
             provider,
             region,
             size,
+            team_id,
+            project_id,
             template,
             max_instances,
             max_lifetime,
@@ -263,6 +273,8 @@ pub(crate) struct CreateArgs {
     pub provider: String,
     pub region: Option<String>,
     pub size: Option<String>,
+    pub team_id: Option<String>,
+    pub project_id: Option<String>,
     pub template: Option<String>,
     pub max_instances: Option<i64>,
     pub max_lifetime: Option<i64>,
@@ -283,12 +295,11 @@ pub(crate) fn create_env(a: CreateArgs) -> Result<()> {
     let placement = match kind.as_str() {
         "local" => "local",
         "ssh" => "ssh",
-        "fly" | "digitalocean" | "hetzner" | "vultr" | "daytona" | "sprites" | "machine0" => {
-            "provider"
-        }
+        "fly" | "digitalocean" | "hetzner" | "vultr" | "daytona" | "sprites" | "machine0"
+        | "vercel" => "provider",
         other => anyhow::bail!(
             "unknown --provider {other:?} \
-             (local|ssh|fly|digitalocean|hetzner|daytona|sprites|machine0)"
+             (local|ssh|fly|digitalocean|hetzner|daytona|sprites|machine0|vercel)"
         ),
     };
 
@@ -315,6 +326,8 @@ pub(crate) fn create_env(a: CreateArgs) -> Result<()> {
         api_key_env,
         region: a.region,
         size: a.size,
+        team_id: a.team_id,
+        project_id: a.project_id,
         template: a.template,
         max_instances: a.max_instances,
         max_lifetime_secs: a.max_lifetime,
@@ -552,13 +565,35 @@ fn api_provider(cfg: &Config, worktree: Option<String>) -> Result<thegn_svc::pro
                     anyhow::anyhow!("the machine0 API key env var {key:?} is not set")
                 })
         }
+        "vercel" => {
+            let id = match &env.placement {
+                thegn_core::placement::Placement::Provider(p) => p.id.clone(),
+                _ => String::new(),
+            };
+            crate::provider_factory::vercel_provider_for(pc, &id)
+                .map(Provider::Vercel)
+                .ok_or_else(|| vercel_token_error(pc))
+        }
         other => anyhow::bail!(
-            "API provisioning supports 'daytona', 'sprites', 'fly', 'machine0', and VPS kinds \
+            "API provisioning supports 'daytona', 'sprites', 'fly', 'machine0', 'vercel', and VPS kinds \
              (hetzner, digitalocean); env {} uses {:?}",
             env.name,
             other
         ),
     }
+}
+
+/// The error for an unbuildable Vercel provider: names the token REF (or the
+/// default var), never a value.
+fn vercel_token_error(pc: &thegn_core::config::EnvProviderConfig) -> anyhow::Error {
+    let key = if pc.api_key_env.trim().is_empty() {
+        "VERCEL_TOKEN"
+    } else {
+        pc.api_key_env.trim()
+    };
+    anyhow::anyhow!(
+        "the Vercel API token {key:?} could not be resolved (or team_id/project_id is invalid)"
+    )
 }
 
 /// Create a managed sandbox via the API provider and print its id. When the
@@ -1880,6 +1915,46 @@ mod egress_tests {
                 })
         );
         assert_eq!(steps.calls(), ["apply:sandbox-1", "destroy:sandbox-1"]);
+    }
+}
+
+#[cfg(test)]
+mod vercel_surface_tests {
+    use super::*;
+
+    #[test]
+    fn create_vercel_writes_ids_and_a_ref_not_a_value() {
+        let _state = crate::testenv::IsolatedState::new();
+        create_env(CreateArgs {
+            name: "vc".into(),
+            provider: "vercel".into(),
+            team_id: Some("team_abc".into()),
+            project_id: Some("prj_abc".into()),
+            token_env: Some("VERCEL_TOKEN".into()),
+            ..Default::default()
+        })
+        .expect("create");
+        let text = std::fs::read_to_string(Config::path()).unwrap();
+        assert!(text.contains("provider = \"vercel\""), "{text}");
+        assert!(text.contains("team_id = \"team_abc\""), "{text}");
+        assert!(text.contains("project_id = \"prj_abc\""), "{text}");
+        assert!(
+            text.contains("api_key_env = \"env:VERCEL_TOKEN\""),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn vercel_token_error_names_the_ref_never_a_value() {
+        let pc = thegn_core::config::EnvProviderConfig {
+            provider: "vercel".into(),
+            api_key_env: "env:MY_VERCEL_REF".into(),
+            ..Default::default()
+        };
+        let msg = vercel_token_error(&pc).to_string();
+        assert!(msg.contains("env:MY_VERCEL_REF"), "{msg}");
+        let default = vercel_token_error(&thegn_core::config::EnvProviderConfig::default());
+        assert!(default.to_string().contains("VERCEL_TOKEN"));
     }
 }
 
