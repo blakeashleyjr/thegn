@@ -16,14 +16,21 @@ static GLOBAL: OnceLock<EventsTx> = OnceLock::new();
 /// Install the process-global sender [`automation_run`] publishes on. Called
 /// once by the daemon at startup; never in the UI process.
 pub(crate) fn install_global(events: EventsTx) {
-    let _ = GLOBAL.set(events); // best-effort: a second install keeps the first sender
+    if GLOBAL.set(events).is_err() {
+        tracing::debug!(target: "thegn::lead", "feed sender already installed; keeping the first");
+    }
 }
 
 fn send(events: &EventsTx, kind: NoticeKind, json: serde_json::Value) {
-    let _ = events.send(Arc::new(EventFrame::Notice {
-        kind,
-        json: json.to_string(),
-    })); // best-effort: no subscriber
+    if events
+        .send(Arc::new(EventFrame::Notice {
+            kind,
+            json: json.to_string(),
+        }))
+        .is_err()
+    {
+        tracing::trace!(target: "thegn::lead", "notice dropped: no subscriber");
+    }
 }
 
 /// Publish a `notification` Notice for row `id` (details via `notifications.list`).
