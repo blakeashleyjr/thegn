@@ -2371,8 +2371,19 @@ impl Db {
     /// the row's history. Enforces THE-243's worker/CLI per-row quota in the
     /// same IMMEDIATE transaction as the insert.
     pub fn append_dispatch_note_record(&self, id: i64, text: &str) -> Result<DispatchNote> {
+        self.append_note_with_limits(id, text, util::now_ms(), NoteLimits::DEFAULT)
+    }
+
+    /// [`Self::append_dispatch_note_record`] with an explicit clock and limits
+    /// (the seam tests use to disable or step the per-minute rate ceiling).
+    fn append_note_with_limits(
+        &self,
+        id: i64,
+        text: &str,
+        now: i64,
+        limits: NoteLimits,
+    ) -> Result<DispatchNote> {
         let text = crate::pipeline_report::note_text(text).map_err(|e| anyhow::anyhow!("{e}"))?;
-        let now = util::now_ms();
         let conn = self.conn();
         conn.execute_batch("BEGIN IMMEDIATE")?;
         let result = (|| -> Result<DispatchNote> {
@@ -2399,6 +2410,7 @@ impl Db {
                     kind: NoteQuotaKind::Count,
                     notes,
                     bytes,
+                    retry_after_ms: 0,
                 }));
             }
             if bytes.saturating_add(new_len) > crate::pipeline_report::NOTE_MAX_BYTES_PER_ROW as u64
@@ -2408,6 +2420,27 @@ impl Db {
                     kind: NoteQuotaKind::Bytes,
                     notes,
                     bytes,
+                    retry_after_ms: 0,
+                }));
+            }
+            let (recent, oldest): (i64, Option<i64>) = conn.query_row(
+                "SELECT COUNT(*), MIN(created_at_ms) FROM agent_dispatch_notes \
+                 WHERE dispatch_id=?1 AND created_at_ms > ?2",
+                rusqlite::params![id, now.saturating_sub(NOTE_RATE_WINDOW_MS)],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )?;
+            let recent = usize::try_from(recent).unwrap_or(usize::MAX);
+            if recent >= limits.max_per_minute {
+                let retry_after_ms = oldest.map_or(0, |min| {
+                    u64::try_from(min.saturating_add(NOTE_RATE_WINDOW_MS).saturating_sub(now))
+                        .unwrap_or(0)
+                });
+                return Err(anyhow::Error::new(DispatchNoteQuotaExceeded {
+                    dispatch_id: id,
+                    kind: NoteQuotaKind::Rate,
+                    notes: recent,
+                    bytes,
+                    retry_after_ms,
                 }));
             }
             self.insert_dispatch_note(id, text, now)
@@ -2548,16 +2581,43 @@ pub struct DispatchNoteQuotaExceeded {
     pub kind: NoteQuotaKind,
     pub notes: usize,
     pub bytes: u64,
+    /// Milliseconds until a slot frees up (`Rate` only; 0 for Count/Bytes).
+    pub retry_after_ms: u64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum NoteQuotaKind {
     Count,
     Bytes,
+    Rate,
+}
+
+/// Width of the sliding window the per-row note write-rate ceiling uses.
+const NOTE_RATE_WINDOW_MS: i64 = 60_000;
+
+/// Tunable worker/CLI note limits (rate only; count/bytes are fixed consts).
+#[derive(Debug, Clone, Copy)]
+struct NoteLimits {
+    max_per_minute: usize,
+}
+
+impl NoteLimits {
+    const DEFAULT: Self = Self {
+        max_per_minute: crate::pipeline_report::NOTE_MAX_PER_MINUTE,
+    };
 }
 
 impl std::fmt::Display for DispatchNoteQuotaExceeded {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        if self.kind == NoteQuotaKind::Rate {
+            return write!(
+                f,
+                "dispatch {}: note rate limit reached ({} notes in the last minute); retry in {}s",
+                self.dispatch_id,
+                self.notes,
+                self.retry_after_ms.div_ceil(1000),
+            );
+        }
         write!(
             f,
             "dispatch {} note quota reached ({} notes, {} bytes; max {} notes / {} MiB): put a summary in `thegn dispatch report` instead",
@@ -5860,7 +5920,8 @@ mod tests {
         let (db, _dir) = temp_db();
         let id = put_row(&db, "linear:THE-243-count", "/wt/note-count");
         for _ in 0..crate::pipeline_report::NOTE_MAX_PER_ROW {
-            db.append_dispatch_note_record(id, "x").unwrap();
+            db.append_note_with_limits(id, "x", util::now_ms(), NO_RATE)
+                .unwrap();
         }
         let result = db.append_dispatch_note_record(id, "x");
         assert!(matches!(
@@ -5882,6 +5943,7 @@ mod tests {
             kind: NoteQuotaKind::Count,
             notes: crate::pipeline_report::NOTE_MAX_PER_ROW,
             bytes: 2_000,
+            retry_after_ms: 0,
         }
         .to_string();
         assert!(message.contains("thegn dispatch report"), "{message}");
@@ -5893,7 +5955,8 @@ mod tests {
         let id = put_row(&db, "linear:THE-243-bytes", "/wt/note-bytes");
         let note = "x".repeat(crate::pipeline_report::NOTE_MAX_CHARS);
         for _ in 0..512 {
-            db.append_dispatch_note_record(id, &note).unwrap();
+            db.append_note_with_limits(id, &note, util::now_ms(), NO_RATE)
+                .unwrap();
         }
         let bytes: i64 = db
             .conn()
@@ -5917,6 +5980,102 @@ mod tests {
         );
         assert_eq!(bytes, expected, "measured byte total before refusal");
         assert_eq!(db.dispatch_note_count(id, None).unwrap(), 512);
+    }
+
+    const NO_RATE: NoteLimits = NoteLimits {
+        max_per_minute: usize::MAX,
+    };
+
+    fn rate_quota(error: &anyhow::Error) -> Option<DispatchNoteQuotaExceeded> {
+        error
+            .downcast_ref::<DispatchNoteQuotaExceeded>()
+            .copied()
+            .filter(|q| q.kind == NoteQuotaKind::Rate)
+    }
+
+    #[test]
+    fn note_rate_trips_at_121_within_a_minute_not_at_120() {
+        let (db, _dir) = temp_db();
+        let id = put_row(&db, "linear:THE-243-rate", "/wt/note-rate");
+        let t0 = 1_000_000;
+        for i in 0..crate::pipeline_report::NOTE_MAX_PER_MINUTE {
+            db.append_note_with_limits(id, "x", t0 + i as i64, NoteLimits::DEFAULT)
+                .unwrap();
+        }
+        let err = db
+            .append_note_with_limits(id, "x", t0 + 1_000, NoteLimits::DEFAULT)
+            .unwrap_err();
+        let quota = rate_quota(&err).expect("rate refusal");
+        assert_eq!(quota.notes, crate::pipeline_report::NOTE_MAX_PER_MINUTE);
+        assert_eq!(
+            db.dispatch_note_count(id, None).unwrap(),
+            crate::pipeline_report::NOTE_MAX_PER_MINUTE
+        );
+        let msg = err.to_string();
+        assert!(msg.contains("note rate limit reached"), "{msg}");
+        assert!(msg.contains("retry in 59s"), "{msg}");
+    }
+
+    #[test]
+    fn note_rate_old_note_frees_a_slot_and_retry_after_is_exact() {
+        let (db, _dir) = temp_db();
+        let id = put_row(&db, "linear:THE-243-rate-step", "/wt/note-rate-step");
+        let t0 = 5_000_000;
+        let limits = NoteLimits { max_per_minute: 3 };
+        for i in 0..3 {
+            db.append_note_with_limits(id, "x", t0 + i * 10_000, limits)
+                .unwrap();
+        }
+        let now = t0 + 30_000;
+        let err = db
+            .append_note_with_limits(id, "x", now, limits)
+            .unwrap_err();
+        let quota = rate_quota(&err).expect("rate refusal");
+        assert_eq!(quota.retry_after_ms, 30_000);
+        // Oldest note is exactly 60s old at t0+60_000: it no longer counts.
+        db.append_note_with_limits(id, "x", t0 + 60_000, limits)
+            .unwrap();
+        // Window now holds t0+10k, t0+20k, t0+60k: full again until t0+70k.
+        let err = db
+            .append_note_with_limits(id, "x", t0 + 60_001, limits)
+            .unwrap_err();
+        assert_eq!(rate_quota(&err).unwrap().retry_after_ms, 9_999);
+    }
+
+    #[test]
+    fn note_rate_does_not_override_count_or_bytes_precedence() {
+        let (db, _dir) = temp_db();
+        let id = put_row(&db, "linear:THE-243-prec", "/wt/note-prec");
+        let now = util::now_ms();
+        let limits = NoteLimits { max_per_minute: 1 };
+        db.append_note_with_limits(id, "x", now, limits).unwrap();
+        db.conn()
+            .execute(
+                "WITH RECURSIVE seq(n) AS (VALUES(1) UNION ALL SELECT n + 1 FROM seq WHERE n < ?2) \
+                 INSERT INTO agent_dispatch_notes (dispatch_id, created_at_ms, text) \
+                 SELECT ?1, ?3, 'n' FROM seq",
+                rusqlite::params![id, crate::pipeline_report::NOTE_MAX_PER_ROW as i64, now],
+            )
+            .unwrap();
+        let err = db
+            .append_note_with_limits(id, "x", now, limits)
+            .unwrap_err();
+        let quota = err.downcast_ref::<DispatchNoteQuotaExceeded>().unwrap();
+        assert_eq!(quota.kind, NoteQuotaKind::Count);
+        assert_eq!(quota.retry_after_ms, 0);
+    }
+
+    #[test]
+    fn note_rate_audit_lane_is_exempt() {
+        let (db, _dir) = temp_db();
+        let id = put_row(&db, "linear:THE-243-audit-rate", "/wt/note-audit-rate");
+        for _ in 0..=crate::pipeline_report::NOTE_MAX_PER_MINUTE {
+            db.append_dispatch_note(id, "x").unwrap();
+        }
+        assert_eq!(
+            db.dispatch_note_count(id, None).unwrap(),
+            crate::pipeline_report::NOTE_MAX_PER_MINUTE + 1
+        );
     }
 
     #[test]
