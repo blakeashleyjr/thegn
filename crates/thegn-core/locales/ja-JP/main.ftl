@@ -184,6 +184,7 @@ action-voice-cancel = Voice: cancel recording/transcription
 action-notify-dnd-toggle = Notifications: Toggle do-not-disturb
 action-notify-mode-cycle = Notifications: Cycle routing mode
 action-attention-next = Jump to next attention
+action-jump-lead = Jump to the Lead
 action-mark-all-read = Notifications: Mark all as read
 action-fork-session = ライブセッションをフォーク
 action-theme-builder-open = テーマビルダーを開く
