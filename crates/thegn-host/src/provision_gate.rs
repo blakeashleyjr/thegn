@@ -276,7 +276,9 @@ pub(crate) fn try_claim_spare(cfg: &thegn_core::config::Config, worktree: &str) 
     // Claim ONLY when the worktree actually needs provisioning (its sandbox is
     // missing or bare): a provisioned worktree that re-materializes must not be
     // rebound to a fresh spare — that would orphan its live, stateful sandbox.
-    if !crate::agent::provision_pending(cfg, worktree) {
+    // A parked (stopped) Vercel sandbox is stateful and provisioned: never
+    // rebind it, and never resume it to look.
+    if crate::agent::provision_check(cfg, worktree) != crate::agent::ProvisionCheck::Pending {
         return false;
     }
     // off-loop: inside spawn_blocking

@@ -64,6 +64,19 @@ const ERROR_BODY_READ: usize = 8 * 1024;
 /// Buffered log lines between the reader task and its consumer.
 const LOG_CHANNEL_DEPTH: usize = 64;
 
+/// The hard overall deadline of [`VercelClient::wait_command`] in stream mode
+/// (the log stream has already ended, so the command is finishing).
+pub const WAIT_COMMAND_DEADLINE: Duration = Duration::from_secs(60);
+
+/// The per-request deadline of one `wait=true` poll.
+const WAIT_POLL_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// The pause between polls that came back without an exit code.
+const WAIT_POLL_INTERVAL: Duration = Duration::from_millis(500);
+
+/// The most polls one wait makes, whatever the deadline.
+const WAIT_MAX_POLLS: u32 = 120;
+
 /// The outcome of a session-timeout extension.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ExtendOutcome {
@@ -401,6 +414,62 @@ impl VercelClient {
         let (tx, rx) = tokio::sync::mpsc::channel(LOG_CHANNEL_DEPTH);
         let task = tokio::spawn(read_log_stream(resp, tx));
         Ok(LogStream { rx, task })
+    }
+
+    /// Wait for a command's exit code: `GET …/cmd/{id}?wait=true` until the
+    /// command reports `exitCode`. `Ok(None)` when `deadline` (a hard bound on
+    /// the whole wait, retries and backoff included) or [`WAIT_MAX_POLLS`]
+    /// runs out first. An exit code outside `i32` is
+    /// [`EXEC_EXIT_STATUS_UNKNOWN`]; a response naming another command is an
+    /// error.
+    pub async fn wait_command(
+        &self,
+        session: &str,
+        cmd: &str,
+        deadline: Duration,
+    ) -> Result<Option<i32>> {
+        let p = retried("wait for command");
+        let cmd = checked_id(cmd, "command")?;
+        let url = self.url(
+            &[
+                "v2",
+                "sandboxes",
+                "sessions",
+                checked_id(session, "session")?,
+                "cmd",
+                cmd,
+            ],
+            &[("wait", "true")],
+            true,
+        )?;
+        let until = tokio::time::Instant::now() + deadline;
+        let mut polls: u32 = 0;
+        loop {
+            let remaining = until.saturating_duration_since(tokio::time::Instant::now());
+            if remaining.is_zero() || polls >= WAIT_MAX_POLLS {
+                return Ok(None);
+            }
+            polls = polls.saturating_add(1);
+            let per_request = remaining.min(WAIT_POLL_TIMEOUT);
+            let polled = tokio::time::timeout(remaining, async {
+                let resp = self
+                    .send(p, || Ok(self.http.get(url.clone()).timeout(per_request)))
+                    .await?;
+                let resp = self.ok(resp, p.op, false).await?;
+                response_json(resp, PROVIDER, p.op).await
+            })
+            .await;
+            let v = match polled {
+                Ok(result) => result?,
+                Err(_elapsed) => return Ok(None),
+            };
+            let exit = command_exit(&v, cmd).map_err(|e| anyhow!("{PROVIDER}: {}: {e}", p.op))?;
+            if exit.is_some() {
+                return Ok(exit);
+            }
+            let left = until.saturating_duration_since(tokio::time::Instant::now());
+            tokio::time::sleep(WAIT_POLL_INTERVAL.min(left)).await;
+        }
     }
 
     /// Write `data` to a command's stdin; `close` ends it after the write.
@@ -766,6 +835,30 @@ async fn read_log_stream(mut resp: reqwest::Response, tx: tokio::sync::mpsc::Sen
     }
 }
 
+/// The exit code a get-command response reports (`{"command": {…}}` or bare):
+/// `None` while `exitCode` is absent or null. A response naming a different
+/// command is refused; a code outside `i32` is [`EXEC_EXIT_STATUS_UNKNOWN`].
+fn command_exit(v: &serde_json::Value, cmd: &str) -> Result<Option<i32>, &'static str> {
+    let c = v.get("command").filter(|c| c.is_object()).unwrap_or(v);
+    if !c.is_object() {
+        return Err("response has no command object");
+    }
+    if let Some(id) = c.get("id").and_then(|id| id.as_str())
+        && id != cmd
+    {
+        return Err("response names a different command");
+    }
+    match c.get("exitCode") {
+        None | Some(serde_json::Value::Null) => Ok(None),
+        Some(code) => {
+            let code = code.as_i64().ok_or("exitCode is not an integer")?;
+            Ok(Some(
+                i32::try_from(code).unwrap_or(EXEC_EXIT_STATUS_UNKNOWN),
+            ))
+        }
+    }
+}
+
 /// Drain (a bounded amount of) a response we are discarding so the connection
 /// can be reused; failures are irrelevant.
 async fn drain_quietly(mut resp: reqwest::Response) {
@@ -778,7 +871,9 @@ async fn drain_quietly(mut resp: reqwest::Response) {
     }
 }
 
-fn checked_name(name: &str) -> Result<&str> {
+/// A name the provider may address: refuses anything else before any request
+/// (the one check; the provider module uses it too).
+pub(super) fn checked_name(name: &str) -> Result<&str> {
     anyhow::ensure!(valid_sandbox_name(name), "{PROVIDER}: invalid sandbox name");
     Ok(name)
 }
@@ -1016,6 +1111,31 @@ mod tests {
         let mut t = TailBuffer::new(0);
         t.push(b"abc");
         assert!(t.into_vec().is_empty());
+    }
+
+    #[test]
+    fn command_exit_reads_wrapped_bare_null_and_out_of_range_codes() {
+        let v = |j: serde_json::Value| command_exit(&j, "cmd_1");
+        assert_eq!(
+            v(serde_json::json!({"command": {"id": "cmd_1", "exitCode": 2}})),
+            Ok(Some(2))
+        );
+        assert_eq!(
+            v(serde_json::json!({"id": "cmd_1", "exitCode": 0})),
+            Ok(Some(0))
+        );
+        assert_eq!(
+            v(serde_json::json!({"command": {"id": "cmd_1", "exitCode": null}})),
+            Ok(None)
+        );
+        assert_eq!(v(serde_json::json!({"command": {"id": "cmd_1"}})), Ok(None));
+        assert_eq!(
+            v(serde_json::json!({"command": {"exitCode": 9_000_000_000_i64}})),
+            Ok(Some(EXEC_EXIT_STATUS_UNKNOWN))
+        );
+        assert!(v(serde_json::json!({"command": {"id": "cmd_9", "exitCode": 0}})).is_err());
+        assert!(v(serde_json::json!({"command": {"id": "cmd_1", "exitCode": "0"}})).is_err());
+        assert!(v(serde_json::json!(null)).is_err());
     }
 
     #[test]

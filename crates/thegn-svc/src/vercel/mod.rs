@@ -27,11 +27,10 @@ use crate::provider::{
     SandboxInfo,
 };
 use crate::vps::registry;
+use client::checked_name;
 
 /// The ledger `provider` value and the account-fingerprint kind.
 const LEDGER_PROVIDER: &str = "vercel";
-/// Every thegn-created sandbox name starts with this (the list `namePrefix`).
-const NAME_PREFIX: &str = "tg-";
 /// The stable error text for a stopped sandbox under [`Wake::Never`]; the
 /// `vercel-exec` bridge maps it to exit 75.
 pub const STOPPED_TEXT: &str = "vercel sandbox stopped";
@@ -65,7 +64,6 @@ impl VercelToken {
     }
 
     /// The raw token, for the `Authorization` header only.
-    #[allow(dead_code)] // spine stub, filled by lane 3
     pub(crate) fn expose(&self) -> &str {
         self.0.as_str()
     }
@@ -232,15 +230,6 @@ fn admit_spec(spec: &VercelSpec) -> Result<()> {
     Ok(())
 }
 
-/// A name the provider may address: refuses anything else before any request.
-fn checked_name(name: &str) -> Result<&str> {
-    if admit::valid_sandbox_name(name) {
-        Ok(name)
-    } else {
-        Err(anyhow!("vercel: invalid sandbox name"))
-    }
-}
-
 /// The HTTP status a control-plane error carries, if it names one: a
 /// `reqwest` status in the chain, else a 3-digit code after `(`, `HTTP ` or
 /// `status ` in the rendered text (`… failed (422 Unprocessable Entity)`).
@@ -277,26 +266,43 @@ fn definite_create_rejection(err: &anyhow::Error) -> bool {
 }
 
 /// Env keys a sandbox command may receive: terminal identity and `THEGN_*`
-/// context, never anything credential-shaped. Everything else is dropped.
-pub(crate) fn env_key_allowed(key: &str) -> bool {
-    if matches!(key, "TERM" | "LANG" | "LC_ALL" | "COLORTERM") {
+/// context, never anything credential-shaped. Everything else is dropped. The
+/// one allowlist: every env map entering a sandbox (one-shot and detached
+/// commands, the PTY start frame, provisioning steps, and the `vercel-exec`
+/// bridge's host env) passes it.
+pub fn env_key_allowed(key: &str) -> bool {
+    if matches!(key, "TERM" | "LANG" | "LC_ALL" | "LC_CTYPE" | "COLORTERM") {
         return true;
     }
-    if !key.starts_with("THEGN_") {
+    // The command body's key shape (`[A-Z_][A-Z0-9_]*`): a key it would
+    // refuse is dropped here rather than failing the whole command.
+    if !key.starts_with("THEGN_")
+        || !key
+            .bytes()
+            .all(|b| b.is_ascii_uppercase() || b.is_ascii_digit() || b == b'_')
+    {
         return false;
     }
-    let upper = key.to_ascii_uppercase();
-    !["TOKEN", "SECRET", "KEY", "PASSWORD", "CREDENTIAL"]
+    !["TOKEN", "SECRET", "KEY", "PASSWORD", "CREDENTIAL", "AUTH"]
         .iter()
-        .any(|deny| upper.contains(deny))
+        .any(|deny| key.contains(deny))
 }
 
-/// The allowlisted subset of `env`; dropped keys are traced by name only.
-pub(crate) fn env_allowlisted(env: &[(String, String)]) -> Vec<(String, String)> {
+/// Whether `key` names the configured token ref (`VERCEL_TOKEN`, or the tail
+/// of a scheme-prefixed ref such as `env:MY_VAR`).
+fn names_token_ref(key: &str, token_ref: &str) -> bool {
+    let token_ref = token_ref.trim();
+    !token_ref.is_empty()
+        && (key == token_ref || token_ref.rsplit(':').next().is_some_and(|tail| tail == key))
+}
+
+/// The allowlisted subset of `env`, also dropping the configured Vercel token
+/// ref name (`token_ref`); dropped keys are traced by name only.
+pub(crate) fn env_allowlisted(env: &[(String, String)], token_ref: &str) -> Vec<(String, String)> {
     let mut kept = Vec::new();
     let mut dropped = Vec::new();
     for (key, value) in env {
-        if env_key_allowed(key) {
+        if env_key_allowed(key) && !names_token_ref(key, token_ref) {
             kept.push((key.clone(), value.clone()));
         } else {
             dropped.push(key.as_str());
@@ -316,26 +322,13 @@ fn now_ms() -> i64 {
         .unwrap_or(0)
 }
 
-/// The tag keys under which `tags_for` records the controller id.
-fn controller_tag_keys(controller: &str) -> Vec<String> {
-    policy::tags_for(controller, "", "")
-        .into_iter()
-        .filter(|(_, value)| value == controller)
-        .map(|(key, _)| key)
-        .collect()
-}
-
-/// Whether `view` carries this controller's ownership tag.
-fn is_ours(view: &SandboxView, controller: &str, keys: &[String]) -> bool {
-    if !view.name.starts_with(NAME_PREFIX) || controller.is_empty() {
-        return false;
-    }
-    if keys.is_empty() {
-        view.tags.values().any(|value| value == controller)
-    } else {
-        keys.iter()
-            .any(|key| view.tags.get(key).is_some_and(|value| value == controller))
-    }
+/// Whether `view` carries this controller's ownership tag, read through the
+/// same [`policy::tags_prove_ours`] the reaper uses (so the value compared is
+/// exactly what `create` wrote via [`policy::tags_for`]). The sandbox name is
+/// not part of the proof: env sandbox names are user templates
+/// (`{repo}-{worktree}-{hash}` by default), not a fixed prefix.
+fn is_ours(view: &SandboxView, controller: &str) -> bool {
+    admit::valid_sandbox_name(&view.name) && policy::tags_prove_ours(&view.tags, controller, "")
 }
 
 fn status_text(status: SessionStatus) -> String {
@@ -478,17 +471,17 @@ impl VercelProvider {
             .context("vercel: controller id worker failed")?
     }
 
-    /// Our tagged sandboxes from the paged `namePrefix = "tg-"` listing. A page
-    /// cap hit is `Partial`; a failed or looping listing is `Unknown`.
+    /// Our controller-tagged sandboxes from the paged project listing (no name
+    /// prefix: names are user templates). A page cap hit is `Partial`; a
+    /// failed or looping listing is `Unknown`.
     async fn listed(&self, controller: &str) -> crate::vps::Inventory<SandboxView> {
         use crate::vps::{Inventory, PartialReason};
-        let keys = controller_tag_keys(controller);
         let mut rows: Vec<SandboxView> = Vec::new();
         let mut seen = BTreeSet::new();
         let mut cursors = HashSet::new();
         let mut cursor: Option<String> = None;
         for _ in 0..MAX_LIST_PAGES {
-            let (page, next) = match self.api().list_page(cursor.as_deref(), NAME_PREFIX).await {
+            let (page, next) = match self.api().list_page(cursor.as_deref(), "").await {
                 Ok(page) => page,
                 Err(error) => {
                     return Inventory::Unknown(format!(
@@ -497,7 +490,7 @@ impl VercelProvider {
                 }
             };
             for view in page {
-                if !is_ours(&view, controller, &keys) {
+                if !is_ours(&view, controller) {
                     continue;
                 }
                 if !seen.insert(view.name.clone()) {
@@ -625,6 +618,30 @@ impl VercelProvider {
         self.session_for(name, Wake::Allow).await.map(|_| ())
     }
 
+    /// The session for an interactive open (PTY or stream). Unlike
+    /// `session_for(.., Wake::Allow)`, it never resumes a stopped sandbox past its
+    /// lifetime ceiling: an auto-respawned pane would otherwise buy a fresh session
+    /// at every timeout, unattended. File transfer (`thegn env pull`) still may.
+    pub(crate) async fn interactive_session(&self, name: &str) -> Result<String> {
+        checked_name(name)?;
+        if let Some(view) = self.api().get(name, false).await?
+            && !matches!(view.status, SessionStatus::Running | SessionStatus::Pending)
+        {
+            let cap_ms = i64::try_from(policy::max_lifetime_secs(self.spec.max_lifetime_secs))
+                .unwrap_or(i64::MAX)
+                .saturating_mul(1000);
+            if view
+                .created_at_ms
+                .is_some_and(|c| now_ms().saturating_sub(c) >= cap_ms)
+            {
+                bail!(
+                    "vercel: sandbox {name} is past its max_lifetime_secs ceiling and is not resumed for a terminal; `thegn env pull` to recover work, then destroy it or raise max_lifetime_secs"
+                );
+            }
+        }
+        self.session_for(name, Wake::Allow).await
+    }
+
     /// Stop the current session (compute to $0; the filesystem persists).
     /// Never resumes; an already stopped or missing sandbox is success.
     pub async fn stop_session(&self, name: &str) -> Result<()> {
@@ -697,6 +714,25 @@ impl VercelProvider {
         }
     }
 
+    /// The env map that may enter this provider's sandboxes: `env` through
+    /// [`env_allowlisted`] with this provider's token ref name.
+    pub(crate) fn sandbox_env(&self, env: &[(String, String)]) -> Vec<(String, String)> {
+        env_allowlisted(env, &self.spec.credential_ref)
+    }
+
+    /// A command body (one-shot when `wait`, else detached) with the env
+    /// allowlisted. Refuses before any request.
+    pub(crate) fn command_body(
+        &self,
+        argv: &[String],
+        cwd: Option<&str>,
+        env: &[(String, String)],
+        wait: bool,
+    ) -> Result<serde_json::Value> {
+        api::command_body(argv, cwd, &self.sandbox_env(env), wait)
+            .map_err(|e| anyhow!("vercel: command refused: {e}"))
+    }
+
     /// One-shot command: `(exit_code, output)`. The env is allowlisted.
     pub async fn run_exec(
         &self,
@@ -706,10 +742,8 @@ impl VercelProvider {
         env: &[(String, String)],
         wake: Wake,
     ) -> Result<(i32, String)> {
+        let body = self.command_body(argv, cwd, env, true)?;
         let session = self.session_for(name, wake).await?;
-        let env = env_allowlisted(env);
-        let body = api::command_body(argv, cwd, &env, true)
-            .map_err(|e| anyhow!("vercel: command refused: {e}"))?;
         let (code, out) = self.api().run_wait(&session, &body, EXEC_OUT_CAP).await?;
         Ok((code, String::from_utf8_lossy(&out).into_owned()))
     }
@@ -721,8 +755,7 @@ impl VercelProvider {
         match self.api().get(name, false).await? {
             Some(view) => {
                 let controller = self.controller().await?;
-                let keys = controller_tag_keys(&controller);
-                if !is_ours(&view, &controller, &keys) {
+                if !is_ours(&view, &controller) {
                     bail!(
                         "vercel: refusing to delete {name}: it does not carry this thegn controller's tag"
                     );
@@ -1093,7 +1126,7 @@ mod tests {
             max_instances: 2,
             max_lifetime_secs: 3600,
         })
-        .expect("spine stub constructs");
+        .expect("a valid spec constructs");
         assert_eq!(provider.spec.token.expose(), "");
         assert!(!format!("{:?}", provider.spec).contains("vcp_secret_value"));
         let owned = provider.with_owner("wt-1".into());

@@ -5,6 +5,7 @@ use std::collections::{BTreeMap, VecDeque};
 use std::sync::{Arc, Mutex};
 
 use super::*;
+use crate::provider::ExecSpec;
 
 /// One scripted control plane. Every call is recorded as `"<op> <arg>"`.
 #[derive(Default)]
@@ -21,6 +22,8 @@ struct FakeApi {
     endless: bool,
     delete_fails: bool,
     snapshots: Vec<String>,
+    /// Every create and run body sent, in order.
+    bodies: Mutex<Vec<serde_json::Value>>,
 }
 
 impl FakeApi {
@@ -41,9 +44,10 @@ impl FakeApi {
 }
 
 impl Api for FakeApi {
-    fn create<'a>(&'a self, _body: &'a serde_json::Value) -> BoxFuture<'a, Result<SandboxView>> {
+    fn create<'a>(&'a self, body: &'a serde_json::Value) -> BoxFuture<'a, Result<SandboxView>> {
         Box::pin(async move {
             self.record("create".into());
+            self.bodies.lock().unwrap().push(body.clone());
             match self.create.lock().unwrap().clone() {
                 Some(Ok(view)) => Ok(view),
                 Some(Err(text)) => Err(anyhow!(text)),
@@ -134,11 +138,12 @@ impl Api for FakeApi {
     fn run_wait<'a>(
         &'a self,
         session: &'a str,
-        _body: &'a serde_json::Value,
+        body: &'a serde_json::Value,
         _out_cap: usize,
     ) -> BoxFuture<'a, Result<(i32, Vec<u8>)>> {
         Box::pin(async move {
             self.record(format!("run {session}"));
+            self.bodies.lock().unwrap().push(body.clone());
             Ok((0, b"ok".to_vec()))
         })
     }
@@ -457,6 +462,34 @@ async fn wake_allow_resumes_a_stopped_sandbox() {
 }
 
 #[tokio::test]
+async fn interactive_open_never_resumes_past_the_lifetime_ceiling() {
+    let _state = thegn_core::testenv::IsolatedState::new();
+    let ledger = tempfile::tempdir().unwrap();
+
+    // (a) Created long ago: refused, never resumed.
+    let fake = Arc::new(FakeApi::default());
+    fake.gets
+        .lock()
+        .unwrap()
+        .push_back(Some(view(NAME, SessionStatus::Stopped, None)));
+    let p = provider(&fake, ledger.path(), 2);
+    let error = p.interactive_session(NAME).await.unwrap_err();
+    assert!(format!("{error:#}").contains("lifetime"), "{error:#}");
+    assert_eq!(fake.count("resume"), 0, "{:?}", fake.calls());
+
+    // (b) Created a minute ago: resumed as usual.
+    let fake = Arc::new(FakeApi::default());
+    fake.gets.lock().unwrap().push_back(Some(SandboxView {
+        created_at_ms: Some(now_ms() - 60_000),
+        ..view(NAME, SessionStatus::Stopped, None)
+    }));
+    *fake.resume.lock().unwrap() = Some(view(NAME, SessionStatus::Running, Some("sess_2")));
+    let p = provider(&fake, ledger.path(), 2);
+    assert_eq!(p.interactive_session(NAME).await.unwrap(), "sess_2");
+    assert_eq!(fake.count("resume"), 1);
+}
+
+#[tokio::test]
 async fn stop_session_never_resumes() {
     let _state = thegn_core::testenv::IsolatedState::new();
     let ledger = tempfile::tempdir().unwrap();
@@ -491,7 +524,10 @@ fn env_allowlist_drops_credentials() {
     .into_iter()
     .map(|(k, v)| (k.to_string(), v.to_string()))
     .collect();
-    let kept: Vec<String> = env_allowlisted(&env).into_iter().map(|(k, _)| k).collect();
+    let kept: Vec<String> = env_allowlisted(&env, "VERCEL_TOKEN")
+        .into_iter()
+        .map(|(k, _)| k)
+        .collect();
     assert_eq!(
         kept,
         ["TERM", "LANG", "LC_ALL", "COLORTERM", "THEGN_WORKTREE"]
@@ -580,4 +616,178 @@ fn create_rejection_classification() {
     assert!(!definite("create failed (429 Too Many Requests)"));
     assert!(!definite("create failed (503 Service Unavailable)"));
     assert!(!definite("connection reset by peer"));
+}
+
+/// A templated env sandbox name (`{repo}-{worktree}-{hash}`): no `tg-` prefix.
+const TEMPLATED: &str = "thegn-feature-x-a1b2c3";
+
+fn credential_env() -> Vec<(String, String)> {
+    [
+        ("GITHUB_TOKEN", "g"),
+        ("ANTHROPIC_API_KEY", "a"),
+        ("AWS_SECRET_ACCESS_KEY", "s"),
+        ("THEGN_SESSION_SECRET", "t"),
+        ("THEGN_ROUTE_AUTH", "r"),
+        ("VERCEL_TOKEN", "v"),
+        ("THEGN_VERCEL_REF", "ref-value"),
+        ("TERM", "xterm-256color"),
+        ("THEGN_WORKTREE", "wt"),
+    ]
+    .into_iter()
+    .map(|(k, v)| (k.to_string(), v.to_string()))
+    .collect()
+}
+
+fn env_keys(body: &serde_json::Value) -> Vec<String> {
+    body.get("env")
+        .and_then(|e| e.as_object())
+        .map(|m| m.keys().cloned().collect())
+        .unwrap_or_default()
+}
+
+#[tokio::test]
+async fn every_sandbox_env_path_drops_credentials_and_the_token_ref() {
+    let _state = thegn_core::testenv::IsolatedState::new();
+    let ledger = tempfile::tempdir().unwrap();
+    let fake = Arc::new(FakeApi::default());
+    fake.gets
+        .lock()
+        .unwrap()
+        .push_back(Some(view(NAME, SessionStatus::Running, Some("sess_e"))));
+    let mut custom = spec(2);
+    // A token ref that the THEGN_* allowlist alone would pass.
+    custom.credential_ref = "env:THEGN_VERCEL_REF".into();
+    let api: Arc<dyn Api> = fake.clone();
+    let p = VercelProvider::with_client_for_test(custom, api, ledger.path().to_path_buf())
+        .expect("test provider admits its spec");
+    let env = credential_env();
+    let want = ["TERM", "THEGN_WORKTREE"];
+
+    // The PTY start frame.
+    let spec = ExecSpec {
+        argv: vec!["sh".into()],
+        tty: true,
+        cols: 80,
+        rows: 24,
+        env: env.clone(),
+        cwd: None,
+    };
+    let frame: serde_json::Value =
+        serde_json::from_str(&p.start_frame(&spec).expect("start frame")).expect("json frame");
+    assert_eq!(env_keys(&frame), want, "pty start frame");
+
+    // The stream-mode (detached) command body.
+    let detached = p
+        .command_body(&spec.argv, None, &spec.env, false)
+        .expect("detached body");
+    assert_eq!(env_keys(&detached), want, "detached command");
+
+    // The one-shot command (capture reads and provisioning steps).
+    p.run_exec(NAME, &["true".to_string()], None, &env, Wake::Allow)
+        .await
+        .expect("run");
+    let sent = fake
+        .bodies
+        .lock()
+        .unwrap()
+        .last()
+        .cloned()
+        .expect("run body");
+    assert_eq!(env_keys(&sent), want, "one-shot command");
+    for body in [&frame, &detached, &sent] {
+        let text = body.to_string();
+        for leaked in [
+            "ref-value",
+            "\"v\"",
+            "GITHUB_TOKEN",
+            "API_KEY",
+            "SECRET",
+            "AUTH",
+        ] {
+            assert!(!text.contains(leaked), "{leaked} in {text}");
+        }
+    }
+}
+
+#[tokio::test]
+async fn created_tags_prove_ownership_to_destroy_and_the_reaper_check() {
+    let _state = thegn_core::testenv::IsolatedState::new();
+    let controller = crate::vps::controller::controller_id().unwrap();
+    let owner = "wt-owner-digest";
+    let ledger = tempfile::tempdir().unwrap();
+    let fake = Arc::new(FakeApi::default());
+    let mut templated = spec(2);
+    templated.name = TEMPLATED.into();
+    let api: Arc<dyn Api> = fake.clone();
+    let p = VercelProvider::with_client_for_test(templated, api, ledger.path().to_path_buf())
+        .expect("test provider admits its spec")
+        .with_owner(owner.into());
+    *fake.create.lock().unwrap() = Some(Ok(view(TEMPLATED, SessionStatus::Running, Some("s1"))));
+    p.create().await.expect("create");
+
+    // What Vercel stores is what the create body sent; read it back the way
+    // the client parses a sandbox.
+    let body = fake.bodies.lock().unwrap()[0].clone();
+    let echoed = api::parse_sandbox(&serde_json::json!({
+        "name": TEMPLATED,
+        "status": "running",
+        "currentSessionId": "s1",
+        "createdAt": 1_700_000_000_000_i64,
+        "tags": body["tags"].clone(),
+    }))
+    .expect("sandbox parses");
+
+    // The reaper's check: the sanitized controller tag it derives, plus the
+    // ledger owner the create recorded.
+    let record = registry::read_at(ledger.path(), TEMPLATED).expect("ready record");
+    let reaper_tag = policy::tags_for(&controller, "", "")
+        .remove(policy::CONTROLLER_TAG)
+        .unwrap_or_default();
+    assert!(policy::tags_prove_ours(
+        &echoed.tags,
+        &reaper_tag,
+        &record.owner
+    ));
+    assert!(!policy::tags_prove_ours(
+        &echoed.tags,
+        "someone-else",
+        &record.owner
+    ));
+
+    // Inventory lists it (no name prefix), and destroy deletes it.
+    fake.pages
+        .lock()
+        .unwrap()
+        .push_back((vec![echoed.clone()], None));
+    let InventoryReport::Complete(rows) = p.sandbox_inventory().await.unwrap() else {
+        panic!("one page and no cursor is complete");
+    };
+    assert_eq!(
+        rows.iter().map(|r| r.id.as_str()).collect::<Vec<_>>(),
+        [TEMPLATED]
+    );
+    fake.gets.lock().unwrap().push_back(Some(echoed));
+    p.destroy(TEMPLATED).await.expect("destroy recognises ours");
+    assert_eq!(fake.count("delete"), 1, "{:?}", fake.calls());
+    assert!(registry::read_at(ledger.path(), TEMPLATED).is_none());
+}
+
+#[tokio::test]
+async fn destroy_refuses_a_sandbox_tagged_for_another_controller() {
+    let _state = thegn_core::testenv::IsolatedState::new();
+    let ledger = tempfile::tempdir().unwrap();
+    let fake = Arc::new(FakeApi::default());
+    fake.gets
+        .lock()
+        .unwrap()
+        .push_back(Some(tagged(NAME, "another-controller")));
+    let error = provider(&fake, ledger.path(), 2)
+        .destroy(NAME)
+        .await
+        .unwrap_err();
+    assert!(
+        format!("{error:#}").contains("refusing to delete"),
+        "{error:#}"
+    );
+    assert_eq!(fake.count("delete"), 0);
 }

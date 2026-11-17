@@ -152,14 +152,35 @@ fn tag_value(s: &str) -> String {
         .collect()
 }
 
+/// The tag key carrying the sanitized controller id.
+pub const CONTROLLER_TAG: &str = "thegn-controller";
+/// The tag key carrying the sanitized ledger owner.
+pub const OWNER_TAG: &str = "thegn-owner";
+/// The tag key carrying the sanitized host label (informational only).
+pub const HOST_TAG: &str = "thegn-host";
+
 /// The ownership tags (keys `thegn-*`; values sanitized to `[a-z0-9-]`, at
 /// most 64 chars; the tag charset is UNVERIFIED so this stays conservative).
 pub fn tags_for(controller: &str, owner: &str, host_label: &str) -> BTreeMap<String, String> {
     BTreeMap::from([
-        ("thegn-controller".to_string(), tag_value(controller)),
-        ("thegn-owner".to_string(), tag_value(owner)),
-        ("thegn-host".to_string(), tag_value(host_label)),
+        (CONTROLLER_TAG.to_string(), tag_value(controller)),
+        (OWNER_TAG.to_string(), tag_value(owner)),
+        (HOST_TAG.to_string(), tag_value(host_label)),
     ])
+}
+
+/// The one ownership proof every stop/delete path reads (the reaper and the
+/// provider's delete): `tags` carry [`CONTROLLER_TAG`] equal to the sanitized
+/// `controller` exactly as [`tags_for`] wrote it, and, when `owner` is
+/// non-empty, [`OWNER_TAG`] equal to the sanitized `owner`. An empty
+/// controller proves nothing. Sanitizing is idempotent, so a caller may pass
+/// either the raw id or an already sanitized tag value.
+pub fn tags_prove_ours(tags: &BTreeMap<String, String>, controller: &str, owner: &str) -> bool {
+    let want = tag_value(controller);
+    if want.is_empty() || tags.get(CONTROLLER_TAG) != Some(&want) {
+        return false;
+    }
+    owner.is_empty() || tags.get(OWNER_TAG) == Some(&tag_value(owner))
 }
 
 /// The fleet_cost size key: `"<n>vcpu"`.
@@ -312,6 +333,21 @@ mod tests {
             v.bytes()
                 .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
         }));
+    }
+
+    #[test]
+    fn written_tags_prove_ownership_raw_or_sanitized() {
+        // A controller id that sanitizing changes: the proof must still match
+        // what `tags_for` wrote, whether the caller passes raw or sanitized.
+        let t = tags_for("Ctl_ABC", "wt/Owner", "host");
+        assert!(tags_prove_ours(&t, "Ctl_ABC", ""));
+        assert!(tags_prove_ours(&t, "ctl-abc", ""));
+        assert!(tags_prove_ours(&t, "Ctl_ABC", "wt/Owner"));
+        assert!(tags_prove_ours(&t, &t[CONTROLLER_TAG], &t[OWNER_TAG]));
+        assert!(!tags_prove_ours(&t, "other", ""));
+        assert!(!tags_prove_ours(&t, "Ctl_ABC", "wt/Other"));
+        assert!(!tags_prove_ours(&t, "", ""));
+        assert!(!tags_prove_ours(&BTreeMap::new(), "Ctl_ABC", ""));
     }
 
     #[test]
