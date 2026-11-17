@@ -817,3 +817,70 @@ fn env_allowlist_passes_only_tmpfs_login_paths() {
     )];
     assert!(env_allowlisted(&env, "env:CODEX_HOME").is_empty());
 }
+
+#[tokio::test]
+async fn usage_report_never_resumes_a_stopped_sandbox() {
+    let _state = thegn_core::testenv::IsolatedState::new();
+    let ledger = tempfile::tempdir().unwrap();
+    registry::write_at(ledger.path(), &ledger_record(NAME, "ready")).unwrap();
+    let fake = Arc::new(FakeApi::default());
+    fake.gets
+        .lock()
+        .unwrap()
+        .push_back(Some(view(NAME, SessionStatus::Stopped, None)));
+    let (rows, complete) = provider(&fake, ledger.path(), 2)
+        .usage_report()
+        .await
+        .expect("usage report");
+    assert!(complete, "{:?}", fake.calls());
+    assert_eq!(rows.len(), 1, "{rows:?}");
+    assert_eq!(rows[0].name, NAME);
+    assert_eq!(rows[0].status, "stopped");
+    assert_eq!(fake.count("resume"), 0, "{:?}", fake.calls());
+    assert_eq!(fake.count("get"), 1, "{:?}", fake.calls());
+    assert_eq!(fake.count("usage"), 1, "{:?}", fake.calls());
+    assert_eq!(fake.count("snapshot_usage"), 1, "{:?}", fake.calls());
+    for op in ["create", "delete", "stop", "extend", "run", "policy"] {
+        assert_eq!(fake.count(op), 0, "{op}: {:?}", fake.calls());
+    }
+}
+
+#[tokio::test]
+async fn usage_report_lists_tagged_sandboxes_without_a_get() {
+    let _state = thegn_core::testenv::IsolatedState::new();
+    let controller = crate::vps::controller::controller_id().unwrap();
+    let ledger = tempfile::tempdir().unwrap();
+    let fake = Arc::new(FakeApi::default());
+    fake.pages
+        .lock()
+        .unwrap()
+        .push_back((vec![tagged("tg-vercel-listed", &controller)], None));
+    let (rows, complete) = provider(&fake, ledger.path(), 2)
+        .usage_report()
+        .await
+        .expect("usage report");
+    assert!(complete);
+    assert_eq!(
+        rows.iter().map(|r| r.name.as_str()).collect::<Vec<_>>(),
+        ["tg-vercel-listed"]
+    );
+    assert_eq!(rows[0].status, "running");
+    assert_eq!(fake.count("get"), 0, "{:?}", fake.calls());
+    assert_eq!(fake.count("resume"), 0, "{:?}", fake.calls());
+}
+
+#[tokio::test]
+async fn usage_report_is_incomplete_on_a_partial_listing() {
+    let _state = thegn_core::testenv::IsolatedState::new();
+    let ledger = tempfile::tempdir().unwrap();
+    let fake = Arc::new(FakeApi {
+        endless: true,
+        ..FakeApi::default()
+    });
+    let (_rows, complete) = provider(&fake, ledger.path(), 2)
+        .usage_report()
+        .await
+        .expect("usage report");
+    assert!(!complete, "a page-cap listing is a gap");
+    assert_eq!(fake.count("resume"), 0);
+}
