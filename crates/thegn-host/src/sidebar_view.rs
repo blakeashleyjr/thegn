@@ -357,8 +357,9 @@ pub(crate) fn header_chips(model: &FrameModel, rect: Rect) -> HeaderChips {
             (None, None),
         ]
     };
-    // The mode chip goes first: its full word, then its one-cell glyph, both
-    // only beside the widest form of the other two chips.
+    // The mode chip goes first: its full word, then the bare `full`, both
+    // only beside the widest form of the other two chips. A word, never a
+    // glyph: a half-block filled its cell and read brighter than its peers.
     let gl = crate::caps::active_glyphs();
     let mode_full = format!(
         "full{}{}",
@@ -366,12 +367,9 @@ pub(crate) fn header_chips(model: &FrameModel, rect: Rect) -> HeaderChips {
         mode_detail_word(model.sidebar_display.focus_detail)
     );
     let (l0, s0) = base[0];
-    let candidates = [
-        (Some(mode_full.as_str()), l0, s0),
-        (Some(gl.sidebar_mode_full), l0, s0),
-    ]
-    .into_iter()
-    .chain(base.into_iter().map(|(l, s)| (None, l, s)));
+    let candidates = [(Some(mode_full.as_str()), l0, s0), (Some("full"), l0, s0)]
+        .into_iter()
+        .chain(base.into_iter().map(|(l, s)| (None, l, s)));
     // One column of breathing room between the title and the chips.
     let budget = rect.cols.saturating_sub(HEADER_TITLE.width() + 1);
     for (m, l, s) in candidates {
@@ -1752,6 +1750,24 @@ fn tree_lead(depth: u8, is_last: bool) -> Vec<crate::seg::Seg> {
     vec![sp(indent), seg(Tok::Slot(S::Ghost2), format!("{conn} "))]
 }
 
+/// The lead of a worktree row's detail line: the same indent as the first
+/// line, with a ghost `│` under the row's own `├` (blank under `└`). Returns
+/// the segments and their display width (`4 + (depth-1)*2 + 4`).
+fn detail_tree_lead(depth: u8, is_last: bool) -> (Vec<crate::seg::Seg>, usize) {
+    use crate::seg::{Tok, seg, sp};
+    let gl = crate::caps::active_glyphs();
+    let pad = 4 + (depth.saturating_sub(1) as usize) * 2;
+    let guide = if is_last {
+        "  ".to_string()
+    } else {
+        format!("{} ", gl.tree_pipe)
+    };
+    (
+        vec![sp(pad), seg(Tok::Slot(S::Ghost2), guide), sp(2)],
+        pad + 4,
+    )
+}
+
 /// The activity dot glyph (item 20): filled while active/waiting, hollow once
 /// read-but-stuck, `↻` while building; `None` = nothing. ASCII-safe glyph set.
 fn activity_dot_glyph(state: crate::sidebar::ActivityState) -> &'static str {
@@ -2282,13 +2298,17 @@ fn compose_row_lines(
                 }
             }];
             if show_detail
-                && let Some(detail) = crate::sidebar_detail::compose_detail_line_at(
-                    row,
-                    disp,
-                    crate::sidebar_detail::unix_now(),
-                    4 + (row.depth.saturating_sub(1) as usize) * 2 + 2 + 2,
-                    content_cols,
-                )
+                && let Some(detail) = {
+                    let (lead, lead_cols) = detail_tree_lead(row.depth, is_last);
+                    crate::sidebar_detail::compose_detail_line_guided(
+                        row,
+                        disp,
+                        crate::sidebar_detail::unix_now(),
+                        lead,
+                        lead_cols,
+                        content_cols,
+                    )
+                }
             {
                 lines.push(detail);
             }
@@ -4279,19 +4299,39 @@ mod tests {
         let full = 12 + 10 + 2 + 7 + 2 + sort;
         let c = header_chips(&m, chip_rect(full));
         assert_eq!(c.mode.unwrap().2, 10);
-        // One short: the glyph stands in for the word.
+        // One short: the bare word `full` stands in for `full·never`.
         let c = header_chips(&m, chip_rect(full - 1));
-        let (glyph, _, gcols) = c.mode.expect("the glyph form still fits");
-        assert_eq!(glyph, crate::caps::active_glyphs().sidebar_mode_full);
-        assert_eq!(gcols, 1);
+        let (word, _, wcols) = c.mode.expect("the bare word still fits");
+        assert_eq!(word, "full");
+        assert_eq!(wcols, 4);
         assert!(c.layout.is_some() && c.sort.is_some());
-        // 11 + 1 + 1 + 2 + 7 + 2 + sort: below that the chip is gone, while
+        // 11 + 1 + 4 + 2 + 7 + 2 + sort: below that the chip is gone, while
         // the layout and sort chips are still whole.
-        let glyph_tier = 12 + 1 + 2 + 7 + 2 + sort;
-        let c = header_chips(&m, chip_rect(glyph_tier - 1));
+        let word_tier = 12 + 4 + 2 + 7 + 2 + sort;
+        let c = header_chips(&m, chip_rect(word_tier - 1));
         assert!(c.mode.is_none());
         assert_eq!(c.layout.unwrap().0, "grouped");
         assert!(c.sort.is_some());
+    }
+
+    #[test]
+    fn detail_tree_lead_puts_the_guide_under_the_connector() {
+        let gl = crate::caps::active_glyphs();
+        // depth 1: 4 cols of gutter, the guide, 2 cols of pad.
+        let (lead, cols) = detail_tree_lead(1, false);
+        assert_eq!(cols, 8);
+        assert_eq!(lead.len(), 3);
+        assert_eq!(lead[0].text, " ".repeat(4));
+        assert_eq!(lead[1].text, format!("{} ", gl.tree_pipe));
+        assert_eq!(lead[1].fg, crate::seg::Tok::Slot(S::Ghost2));
+        // Last child: blank under `└`.
+        let (lead, cols) = detail_tree_lead(1, true);
+        assert_eq!(cols, 8);
+        assert_eq!(lead[1].text, "  ");
+        // Folder child: one more indent step.
+        let (lead, cols) = detail_tree_lead(2, false);
+        assert_eq!(cols, 10);
+        assert_eq!(lead[0].text, " ".repeat(6));
     }
 
     #[test]
