@@ -671,6 +671,8 @@ pub(crate) fn fit_fields(mut fields: Vec<Field>, budget: usize) -> Vec<Field> {
 }
 
 /// Compose a detail line using the caller's measured indentation and width.
+/// Test-only since the sidebar paints through [`compose_detail_line_guided`].
+#[cfg(test)]
 pub(crate) fn compose_detail_line_at(
     row: &SidebarRow,
     disp: &SidebarDisplay,
@@ -679,14 +681,35 @@ pub(crate) fn compose_detail_line_at(
     cols: usize,
 ) -> Option<Line> {
     let indent = indent.min(cols / 2);
+    compose_detail_line_guided(row, disp, now_unix, vec![sp(indent)], indent, cols)
+}
+
+/// Like `compose_detail_line_at`, but the line starts with `lead` (display
+/// width `lead_cols`), typically a tree guide, instead of plain spaces. When
+/// `lead_cols` exceeds half the column (the clamp `compose_detail_line_at`
+/// applies) the guide would misalign, so it falls back to a plain-space lead.
+pub(crate) fn compose_detail_line_guided(
+    row: &SidebarRow,
+    disp: &SidebarDisplay,
+    now_unix: i64,
+    lead: Vec<Seg>,
+    lead_cols: usize,
+    cols: usize,
+) -> Option<Line> {
+    let (lead, lead_cols) = if lead_cols > cols / 2 {
+        let clamped = cols / 2;
+        (vec![sp(clamped)], clamped)
+    } else {
+        (lead, lead_cols)
+    };
     let fields = fit_fields(
         detail_fields(row, disp, now_unix),
-        cols.saturating_sub(indent),
+        cols.saturating_sub(lead_cols),
     );
     if fields.is_empty() {
         return None;
     }
-    let mut segs = vec![sp(indent)];
+    let mut segs = lead;
     for (index, field) in fields.into_iter().enumerate() {
         if index > 0 {
             segs.push(sp(2));
@@ -1356,6 +1379,44 @@ mod tests {
             "{text:?}"
         );
         assert!(seg_width(&segs) <= 8);
+    }
+
+    #[test]
+    fn guided_detail_line_starts_with_the_lead_and_budgets_after_it() {
+        let mut row = row();
+        row.branch_meta.as_mut().unwrap().last_subject =
+            Some("a rather long commit subject line".into());
+        let display = SidebarDisplay {
+            detail_fields: vec![builtin(DetailField::Subject)],
+            ..SidebarDisplay::default()
+        };
+        let lead = vec![sp(4), seg(Tok::Slot(S::Ghost2), "| "), sp(2)];
+        let Some(Line::Segs(segs)) =
+            compose_detail_line_guided(&row, &display, 2_000, lead.clone(), 8, 24)
+        else {
+            panic!("guided detail line is a segment line")
+        };
+        assert_eq!(&segs[..3], &lead[..]);
+        assert!(seg_width(&segs) <= 24, "{segs:?}");
+        // The fields only get `cols - lead_cols`.
+        assert!(seg_width(&segs[3..]) <= 24 - 8, "{segs:?}");
+    }
+
+    #[test]
+    fn guided_detail_line_falls_back_to_spaces_when_the_clamp_bites() {
+        let row = row();
+        let display = SidebarDisplay {
+            detail_fields: vec![builtin(DetailField::Subject)],
+            ..SidebarDisplay::default()
+        };
+        let lead = vec![sp(4), seg(Tok::Slot(S::Ghost2), "| "), sp(2)];
+        let guided = compose_detail_line_guided(&row, &display, 2_000, lead, 8, 8);
+        let plain = compose_detail_line_at(&row, &display, 2_000, 8, 8);
+        let (Some(Line::Segs(g)), Some(Line::Segs(p))) = (guided, plain) else {
+            panic!("both variants render a segment line")
+        };
+        assert_eq!(g, p);
+        assert!(g.iter().all(|s| !s.text.contains('|')));
     }
 
     #[test]
