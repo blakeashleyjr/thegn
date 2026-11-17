@@ -105,7 +105,7 @@ pub struct AdmittedPluginSet {
 /// Clamp manifest intervals that are valid but below the scheduler floor.
 ///
 /// Values outside the manifest bounds are intentionally left alone so
-/// [`check_spec_fields`] still reports them as invalid.
+/// `check_spec_fields` still reports them as invalid.
 pub fn clamp_sub_floor_intervals(plugin: &mut LoadedPlugin) -> Vec<(String, u64)> {
     let mut clamped = Vec::new();
     for contribution in &mut plugin.spec.manifest.contributions {

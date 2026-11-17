@@ -2078,6 +2078,8 @@ mod tests {
             calls += 1;
             if calls == 1 {
                 old_ino = std::fs::symlink_metadata(&lock).unwrap().ino();
+                // keep the old inode allocated so the filesystem cannot hand its number to the reopened lock (THE-1989: flaked on GitHub runners)
+                std::fs::hard_link(&lock, dir.path().join("r.keep")).unwrap();
                 std::fs::remove_file(&lock).unwrap();
             }
         })
