@@ -1337,8 +1337,7 @@ mod tests {
 
     #[test]
     fn printable_keystroke_and_render_stay_within_allocation_budget() {
-        // Generous starting ceiling (not yet pinned to observed x 1.1); the
-        // primary re-pins it from the printed counts.
+        // Generous starting ceiling; the failure message carries the observed count.
         const ALLOC_CEILING: u64 = 60_000;
         let mut p = WorkspacePicker::new(synthetic_paths(2_000), HashSet::new());
         let mut surface = Surface::new(120, 40);
@@ -1352,10 +1351,6 @@ mod tests {
             key(&mut p, KeyCode::Char('r'));
             p.render(&mut surface, screen);
         });
-        println!(
-            "picker keystroke+render (2000 entries, 120x40): allocs={} reallocs={} bytes={}",
-            counts.allocation_calls, counts.realloc_calls, counts.requested_bytes
-        );
         assert!(
             counts.allocation_calls < ALLOC_CEILING,
             "keystroke+render allocated {} times; ceiling={ALLOC_CEILING}",
