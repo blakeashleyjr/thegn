@@ -311,15 +311,17 @@ mod revision_tests {
     use super::*;
     #[test]
     fn carry_monitor_state_keeps_pane_owners() {
-        let mut current = FrameModel::default();
-        current.pane_owners = std::sync::Arc::from(vec![thegn_core::cpu_attrib::PaneOwner {
-            pane_id: 7,
-            workspace: "w".into(),
-            worktree: "w/main".into(),
-            worktree_path: None,
-            tab: "1".into(),
-            program: None,
-        }]);
+        let mut current = FrameModel {
+            pane_owners: std::sync::Arc::from(vec![thegn_core::cpu_attrib::PaneOwner {
+                pane_id: 7,
+                workspace: "w".into(),
+                worktree: "w/main".into(),
+                worktree_path: None,
+                tab: "1".into(),
+                program: None,
+            }]),
+            ..Default::default()
+        };
         let mut next = FrameModel::default();
         next.carry_monitor_state_from(&mut current);
         assert_eq!(next.pane_owners.len(), 1);
