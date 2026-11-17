@@ -183,6 +183,7 @@ action-voice-cancel = Voice: cancel recording/transcription
 action-notify-dnd-toggle = Notifications: Toggle do-not-disturb
 action-notify-mode-cycle = Notifications: Cycle routing mode
 action-attention-next = Jump to next attention
+action-jump-lead = Jump to the Lead
 action-mark-all-read = Notifications: Mark all as read
 action-fork-session = Fork live session
 action-theme-builder-open = Open theme builder
