@@ -95,18 +95,21 @@ pub enum Feature {
     Voice,
     /// Resident plugin app tabs (`AppTab` contributions, plugin ids in `[apps]`).
     PluginApps,
+    /// The Lead meta agent (`[lead]`): a hosted agent CLI in a global tab.
+    Lead,
 }
 
 impl Feature {
     /// Every gated feature, for exhaustive iteration (e.g. the `doctor` table
     /// and the config clamp). Order is stable and display-friendly.
-    pub const ALL: [Feature; 6] = [
+    pub const ALL: [Feature; 7] = [
         Feature::Remote,
         Feature::Providers,
         Feature::Observe,
         Feature::Placement,
         Feature::Voice,
         Feature::PluginApps,
+        Feature::Lead,
     ];
 
     /// The feature's stable identifier (matches the docs / doctor output).
@@ -118,6 +121,7 @@ impl Feature {
             Feature::Placement => "placement",
             Feature::Voice => "voice",
             Feature::PluginApps => "plugin_apps",
+            Feature::Lead => "lead",
         }
     }
 
@@ -126,9 +130,11 @@ impl Feature {
     pub const fn stability(self) -> Stability {
         match self {
             // The confirmed experimental set for the pre-alpha.
-            Feature::Remote | Feature::Providers | Feature::Placement | Feature::Voice => {
-                Stability::Experimental
-            }
+            Feature::Remote
+            | Feature::Providers
+            | Feature::Placement
+            | Feature::Voice
+            | Feature::Lead => Stability::Experimental,
             Feature::Observe | Feature::PluginApps => Stability::Stable,
         }
     }
@@ -184,7 +190,9 @@ mod tests {
         // ALL must cover every variant so the clamp/doctor never miss one.
         // (Compile-time exhaustiveness is enforced by `stability`'s match; this
         // guards ALL against drift.)
-        assert_eq!(Feature::ALL.len(), 6);
+        assert_eq!(Feature::ALL.len(), 7);
+        assert_eq!(Feature::Lead.id(), "lead");
+        assert_eq!(Feature::Lead.stability(), Stability::Experimental);
         let mut ids: Vec<&str> = Feature::ALL.iter().map(|f| f.id()).collect();
         ids.sort_unstable();
         ids.dedup();
