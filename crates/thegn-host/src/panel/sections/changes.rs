@@ -1512,7 +1512,14 @@ mod tests {
                 view: GitView::Files,
                 query: q.into(),
                 editing: false,
-                map: Vec::new(),
+                map: crate::panel::gitui::fuzzy_filter(
+                    &data
+                        .changes
+                        .iter()
+                        .map(|c| c.path.clone())
+                        .collect::<Vec<String>>(),
+                    q,
+                ),
             });
         }
         let model = crate::chrome::FrameModel {
