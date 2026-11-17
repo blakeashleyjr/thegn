@@ -35,10 +35,12 @@ The other two states say which one you are in, too. In the full tree the
 `full·focus`, `full·always` or `full·never`, naming the full mode and where the
 row detail line shows (on the cursor row, on every row, or nowhere: the `i`
 toggle, else `[ui] sidebar_focus_detail`). It is the first thing on the header
-to give way in a narrow column: the word shrinks to the one-cell `▌` glyph
-(`[` under ASCII glyphs), then goes. The rail's top row shows the `▏` glyph
-(`|` under ASCII) above its entries. **Clicking** the chip or the rail glyph
-cycles the sidebar **full → rail → hidden**, exactly like `Ctrl-Alt-s`.
+to give way in a narrow column: the chip shrinks to the bare word `full`, then
+goes. On a two-line row the detail line continues the tree guide, a dim `│`
+under the row's own `├` (blank under the last `└`). The rail's top row shows
+the `▏` glyph (`|` under ASCII) above its entries. **Clicking** the chip or
+the rail glyph cycles the sidebar **full → rail → hidden**, exactly like
+`Ctrl-Alt-s`.
 
 ## Reading the tree
 
