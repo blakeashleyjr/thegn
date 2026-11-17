@@ -891,9 +891,17 @@ mod tests {
     fn follow_cursor_uses_source_index_under_filter() {
         let (mut ui, model) =
             filter_fixture("main", &["src/main.rs", "src/lib.rs", "docs/main.md"]);
-        ui.cursor = 1;
+        let map = crate::panel::gitui::display_map(
+            &ui.git,
+            crate::panel::gitui::GitView::Files,
+            &model.panel,
+        );
+        assert_eq!(map.len(), 2);
+        assert!(map.contains(&2));
+        let pos = map.iter().position(|&s| s == 2).unwrap();
+        ui.cursor = pos;
         assert_eq!(follow_change_cursor_target(&ui, &model), Some(Some(2)));
-        assert_eq!(source_index(&ui, &model, 1), Some(2));
+        assert_eq!(source_index(&ui, &model, pos), Some(2));
         // Already selected on the source index: no re-toggle.
         ui.chg_sel = Some(2);
         assert_eq!(follow_change_cursor_target(&ui, &model), None);
@@ -922,8 +930,16 @@ mod tests {
         let (mut ui, mut model) =
             filter_fixture("main", &["src/lib.rs", "src/main.rs", "docs/main.md"]);
         model.panel.changes[2].stage = crate::panel::Stage::Conflict;
-        ui.cursor = 1;
-        let src = source_index(&ui, &model, 1).unwrap();
+        let map = crate::panel::gitui::display_map(
+            &ui.git,
+            crate::panel::gitui::GitView::Files,
+            &model.panel,
+        );
+        assert_eq!(map.len(), 2);
+        assert!(map.contains(&2));
+        let pos = map.iter().position(|&s| s == 2).unwrap();
+        ui.cursor = pos;
+        let src = source_index(&ui, &model, pos).unwrap();
         assert_eq!(src, 2);
         assert_eq!(
             conflict_path_at(&model, src).as_deref(),
