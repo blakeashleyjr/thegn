@@ -122,7 +122,7 @@ and redo are refused; if recording fails after an operation, its result says
 ### files
 
 The worktree's file tree; `/` filters it (directories stay while any
-descendant matches; Esc clears), `↵` previews a file inline, `o` pages it
+descendant matches; Esc clears; at Half width the preview and `↵` follow the highlighted row), `S` stashes only staged changes and `U` only unstaged ones, `↵` previews a file inline, `o` pages it
 in bat, `O` opens your editor, `y` reveals it in yazi. A .docx shows its
 text (bounded, sanitized), falling back to its part listing with a note when
 the text cannot be read. A zip, jar, whl, tar, tgz or tar.gz (and other

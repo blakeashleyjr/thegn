@@ -7,6 +7,34 @@ All notable changes to **thegn** are documented here. The format follows
 
 ## [Unreleased]
 
+### Added
+
+- From the cpu/mem popup, Enter on a process opens the system monitor filtered to it, and `p` shows a worktree's or pane's processes; the monitor's process filter also applies `wt:` and `wt=` (`user`, `s` and `thr` are still not available). (THE-2025)
+- Drag a file from the Files panel onto a terminal pane to insert its quoted path; drops are refused while the center shows a splash or is dormant. (THE-135)
+- The theme builder's element view keeps the selected part of the workspace lit behind the dimmed modal. (THE-2023)
+- `thegn usage [--json] [--tokens]`. (THE-138)
+- `/` filters the git panel's Files view. (THE-787)
+- In the git panel's Files view, `S` stashes only staged changes (including partially staged files; it refuses only when nothing is staged) and `U` only unstaged changes. (THE-787)
+- `[metrics]` edits apply live: targets restart on save, with no thegn restart. (THE-2024)
+- `[monitor]` `window_ladder`, `default_window`, `default_style` and `default_scale` apply to the next monitor open after a save. (THE-2024)
+- Home Manager options for `[weather]` (except the API key) and `limits.test_nice`. (THE-428)
+
+### Changed
+
+- Building from source needs Rust 1.96 or newer; the declared minimum now matches the dependencies. (THE-1989)
+- Fewer allocations when painting the system monitor and when typing in the workspace picker. (THE-898, THE-367)
+
+### Fixed
+
+- A failed `git ls-files` shows "file list unavailable" instead of a tree of only the changed files. (THE-375)
+- The system-monitor help lists the right filter fields as ignored. (THE-2025)
+- With a `/` filter in the git Files view at Half width, the diff preview and Enter follow the highlighted row. (THE-2063)
+- A landed worktree whose checkout was already removed no longer leaves its merge-queue row behind; this applies to local worktrees only, and remote (ssh/provider) rows keep the existing refusal. (THE-236)
+
+### Security
+
+- Paths containing control characters are refused for drag insertion. (THE-135)
+
 ## [0.1.0-alpha.93] — 2026-11-17
 
 ### Added
