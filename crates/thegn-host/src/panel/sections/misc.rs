@@ -166,7 +166,6 @@ pub(super) fn files(ctx: &SectionCtx) -> Vec<PanelRow> {
     rows
 }
 
-/// Number of actionable Files rows without rendering or allocating the rows.
 /// The note shown when the tracked-file listing failed (no hit target).
 fn files_unavailable_note(data: &crate::panel::PanelData) -> Option<String> {
     match &data.files_load {
@@ -178,6 +177,7 @@ fn files_unavailable_note(data: &crate::panel::PanelData) -> Option<String> {
     }
 }
 
+/// Number of actionable Files rows without rendering or allocating the rows.
 pub(super) fn files_len(ctx: &SectionCtx) -> usize {
     if ctx.ui.file_preview.is_some() {
         return 0;
