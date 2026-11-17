@@ -225,6 +225,7 @@ pub mod issue_snapshot;
 pub mod keymap;
 pub mod layout_import;
 pub mod lead_confine;
+pub mod lead_input;
 pub mod lead_sandbox;
 pub mod lead_wake;
 pub mod lifecycle;

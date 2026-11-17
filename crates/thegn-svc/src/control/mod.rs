@@ -1176,6 +1176,27 @@ pub trait ControlApi: Send + Sync + 'static {
         bytes: Vec<u8>,
     ) -> BoxFuture<'a, ControlResult<()>>;
 
+    /// `sessions.input` for a Lead-confined caller ([`thegn_core::lead_confine`]).
+    /// The transport has already checked the bytes are plain text and Enter
+    /// ([`thegn_core::lead_input::check`]); the impl must also prove, before
+    /// writing a byte, that `session` is a live session a Lead opened (and
+    /// still the same session), auditing both outcomes with the caller's label
+    /// and the session id, never the text. The default refuses: an impl that
+    /// does not record who opened a session types nothing for the Lead.
+    fn send_input_confined<'a>(
+        &'a self,
+        session: &'a str,
+        _bytes: Vec<u8>,
+        _caller: LeadCaller,
+    ) -> BoxFuture<'a, ControlResult<()>> {
+        Box::pin(async move {
+            Err(ControlError::FailedPrecondition(format!(
+                "{}this daemon does not record who opened {session}",
+                thegn_core::lead_confine::REFUSAL_PREFIX
+            )))
+        })
+    }
+
     fn resize<'a>(
         &'a self,
         session: &'a str,
