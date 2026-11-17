@@ -290,11 +290,23 @@ fn schedule_cell(schedule: Option<&Schedule>) -> Option<String> {
 }
 
 fn list(cfg: &Config, json: bool) -> Result<()> {
+    use thegn_core::store::AutomationRuleStore;
     let effective = cfg.effective_automations();
     let compiled = effective
         .compiled_rules()
         .map_err(|errors| anyhow::anyhow!(errors.join("\n")))?;
     let db = thegn_core::db::Db::open().ok();
+    let names: Vec<String> = compiled.iter().map(|r| r.id.clone()).collect();
+    let lead_rules = db
+        .as_ref()
+        .map(|db| {
+            thegn_core::automation_authoring::compile_lead_rows(
+                &db.lead_rules().unwrap_or_default(),
+                &names,
+            )
+            .0
+        })
+        .unwrap_or_default();
     let daemon_available = db.as_ref().is_some_and(|db| {
         thegn_svc::control::client::discover(
             db,
@@ -313,7 +325,9 @@ fn list(cfg: &Config, json: bool) -> Result<()> {
         .is_some_and(|db| thegn_core::automation_control::paused(db));
     let rows: Vec<RuleRow> = compiled
         .into_iter()
-        .map(|rule| {
+        .map(|rule| (rule, false))
+        .chain(lead_rules.into_iter().map(|rule| (rule, true)))
+        .map(|(rule, is_lead)| {
             let recent_outcome = db
                 .as_ref()
                 .and_then(|db| db.automation_runs(Some(&rule.id), 1).ok())
@@ -323,7 +337,9 @@ fn list(cfg: &Config, json: bool) -> Result<()> {
             RuleRow {
                 name: rule.id,
                 enabled: rule.enabled,
-                trusted_layer: if cfg.active_profile().is_some() {
+                trusted_layer: if is_lead {
+                    "lead"
+                } else if cfg.active_profile().is_some() {
                     "global+profile"
                 } else {
                     "global"
@@ -331,7 +347,14 @@ fn list(cfg: &Config, json: bool) -> Result<()> {
                 event: rule.event.as_str().to_string(),
                 action: rule.action.cap.clone(),
                 schedule: schedule_cell(rule.schedule.as_ref()),
-                autonomy: autonomy_cell(declared.get(&name).map(String::as_str), rule.autonomy),
+                autonomy: autonomy_cell(
+                    if is_lead {
+                        None
+                    } else {
+                        declared.get(&name).map(String::as_str)
+                    },
+                    rule.autonomy,
+                ),
                 inert_reason: inert_reason(
                     effective.enabled,
                     rule.enabled,
