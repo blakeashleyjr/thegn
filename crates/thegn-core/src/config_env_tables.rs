@@ -21,6 +21,14 @@ config_enum! {
 }
 
 config_enum! {
+    /// Vercel only. What model credential reaches the sandbox; `none` sends
+    /// nothing. See docs/help/vercel-sandbox.md.
+    pub enum ModelCredentials: "model credentials" {
+        None = "none", Upload = "upload", Proxy = "proxy", Inject = "inject",
+    } default = None;
+}
+
+config_enum! {
     /// Which Nix installer the provisioner runs in a fresh sandbox:
     /// - `official` — the upstream `nixos.org/nix/install --no-daemon`
     ///   (single-user; the safe default + fallback).
@@ -264,6 +272,17 @@ pub struct EnvProviderConfig {
     pub team_id: String,
     /// Vercel only: the project id (`prj_…`). Not secrets.
     pub project_id: String,
+    /// Vercel only: which model credential reaches the sandbox (`none`, the
+    /// default, sends nothing; `upload` copies the claude/codex login into the
+    /// sandbox's tmpfs; `proxy`/`inject` are refused). Only the user's own
+    /// config table may set it.
+    #[serde(default)]
+    pub model_credentials: ModelCredentials,
+    /// Vercel only: host suffixes the interactive WebSocket ticket URL may
+    /// point at. Empty ⇒ the built-in `vercel.run`, `vercel.sh`, `vercel.com`.
+    /// `vercel.app` (and anything under it) is never accepted.
+    #[serde(default)]
+    pub interactive_host_suffixes: Vec<String>,
 }
 
 impl EnvProviderConfig {
@@ -305,6 +324,8 @@ impl EnvProviderConfig {
             && self.hibernate_idle_secs == 0
             && self.team_id.is_empty()
             && self.project_id.is_empty()
+            && self.model_credentials == ModelCredentials::None
+            && self.interactive_host_suffixes.is_empty()
     }
 
     /// Whether this env's provider is scale-to-zero (an idle sandbox self-suspends
@@ -858,6 +879,45 @@ impl Default for PoolConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn model_credentials_round_trips_and_defaults_to_none() {
+        use crate::seam::Kind;
+        assert_eq!(ModelCredentials::default(), ModelCredentials::None);
+        for mode in ModelCredentials::ALL {
+            assert_eq!(
+                ModelCredentials::from_str_validated(mode.as_str()),
+                Ok(*mode)
+            );
+            let pc: EnvProviderConfig =
+                toml::from_str(&format!("model_credentials = {:?}\n", mode.as_str())).unwrap();
+            assert_eq!(pc.model_credentials, *mode);
+            let back = toml::to_string(&pc).unwrap();
+            assert!(
+                back.contains(&format!("model_credentials = \"{}\"", mode.as_str())),
+                "{back}"
+            );
+        }
+        assert!(ModelCredentials::from_str_validated("key").is_err());
+        let pc: EnvProviderConfig = toml::from_str("").unwrap();
+        assert_eq!(pc.model_credentials, ModelCredentials::None);
+        assert!(pc.interactive_host_suffixes.is_empty());
+        assert!(pc.is_default());
+    }
+
+    #[test]
+    fn new_vercel_keys_make_the_provider_table_non_default() {
+        let creds = EnvProviderConfig {
+            model_credentials: ModelCredentials::Upload,
+            ..Default::default()
+        };
+        assert!(!creds.is_default());
+        let hosts = EnvProviderConfig {
+            interactive_host_suffixes: vec!["vercel.run".into()],
+            ..Default::default()
+        };
+        assert!(!hosts.is_default());
+    }
 
     fn provider_env(name: &str) -> EnvProviderConfig {
         EnvProviderConfig {

@@ -161,6 +161,18 @@ impl Api for FakeApi {
             Ok(())
         })
     }
+    fn usage<'a>(&'a self, name: &'a str) -> BoxFuture<'a, Result<Option<SessionUsage>>> {
+        Box::pin(async move {
+            self.record(format!("usage {name}"));
+            Ok(None)
+        })
+    }
+    fn snapshot_usage<'a>(&'a self, name: &'a str) -> BoxFuture<'a, Result<Vec<SnapshotUsage>>> {
+        Box::pin(async move {
+            self.record(format!("snapshot_usage {name}"));
+            Ok(vec![])
+        })
+    }
 }
 
 const NAME: &str = "tg-vercel-test";
@@ -180,6 +192,8 @@ fn spec(max_instances: u32) -> VercelSpec {
         region: None,
         max_instances,
         max_lifetime_secs: 0,
+        interactive_host_suffixes: Vec::new(),
+        model_credentials: thegn_core::config::ModelCredentials::None,
     }
 }
 

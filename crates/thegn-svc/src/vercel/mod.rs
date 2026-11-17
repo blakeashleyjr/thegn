@@ -8,8 +8,10 @@
 
 pub mod client;
 pub mod files;
+pub mod login;
 pub mod pty;
 pub mod stream;
+pub mod usage;
 
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::fmt;
@@ -20,6 +22,7 @@ use std::time::Duration;
 use anyhow::{Context, Result, anyhow, bail};
 use futures_util::future::BoxFuture;
 use thegn_core::vercel::api::{self, SandboxView, Scope, SessionStatus};
+use thegn_core::vercel::usage::{SessionUsage, SnapshotUsage};
 use thegn_core::vercel::{admit, policy};
 
 use crate::provider::{
@@ -91,6 +94,10 @@ pub struct VercelSpec {
     pub region: Option<String>,
     pub max_instances: u32,
     pub max_lifetime_secs: u64,
+    /// `[env.<name>.provider] interactive_host_suffixes` (empty ⇒ defaults).
+    pub interactive_host_suffixes: Vec<String>,
+    /// `[env.<name>.provider] model_credentials` (admitted: `none`/`upload`).
+    pub model_credentials: thegn_core::config::ModelCredentials,
 }
 
 /// The control-plane calls the provider makes. [`client::VercelClient`] is the
@@ -124,6 +131,12 @@ trait Api: Send + Sync {
     ) -> BoxFuture<'a, Result<(i32, Vec<u8>)>>;
     fn snapshots_for<'a>(&'a self, name: &'a str) -> BoxFuture<'a, Result<Vec<String>>>;
     fn delete_snapshot<'a>(&'a self, id: &'a str) -> BoxFuture<'a, Result<()>>;
+    /// The current session's usage (a GET; never resumes).
+    #[allow(dead_code)] // spine stub, filled by lane 5
+    fn usage<'a>(&'a self, name: &'a str) -> BoxFuture<'a, Result<Option<SessionUsage>>>;
+    /// The sandbox's snapshots with sizes and status.
+    #[allow(dead_code)] // spine stub, filled by lane 5
+    fn snapshot_usage<'a>(&'a self, name: &'a str) -> BoxFuture<'a, Result<Vec<SnapshotUsage>>>;
 }
 
 impl Api for client::VercelClient {
@@ -177,6 +190,12 @@ impl Api for client::VercelClient {
     }
     fn delete_snapshot<'a>(&'a self, id: &'a str) -> BoxFuture<'a, Result<()>> {
         Box::pin(client::VercelClient::delete_snapshot(self, id))
+    }
+    fn usage<'a>(&'a self, name: &'a str) -> BoxFuture<'a, Result<Option<SessionUsage>>> {
+        Box::pin(client::VercelClient::usage(self, name))
+    }
+    fn snapshot_usage<'a>(&'a self, name: &'a str) -> BoxFuture<'a, Result<Vec<SnapshotUsage>>> {
+        Box::pin(client::VercelClient::snapshot_usage(self, name))
     }
 }
 
@@ -389,7 +408,8 @@ impl VercelProvider {
         } else {
             spec.api_base.trim().to_string()
         };
-        let client = client::VercelClient::new(&base, token, spec.scope.clone())?;
+        let client = client::VercelClient::new(&base, token, spec.scope.clone())?
+            .with_interactive_hosts(spec.interactive_host_suffixes.clone());
         Ok(VercelProvider {
             spec,
             client,
@@ -1101,6 +1121,8 @@ mod tests {
             region: None,
             max_instances: 2,
             max_lifetime_secs: 3600,
+            interactive_host_suffixes: Vec::new(),
+            model_credentials: thegn_core::config::ModelCredentials::None,
         })
         .expect("a valid spec constructs");
         assert_eq!(provider.spec.token.expose(), "");

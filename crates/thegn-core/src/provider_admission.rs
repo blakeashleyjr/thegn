@@ -497,6 +497,19 @@ pub fn validate_config(cfg: &crate::config::Config) -> Vec<String> {
                 "env.{env_name}.provider.id: provider ids must be lowercase (provider names are case-insensitive DNS names, so an uppercase id would give one instance two local identities)"
             ));
         }
+        if provider != "vercel" {
+            if env.provider.model_credentials != crate::config::ModelCredentials::None {
+                errors.push(format!(
+                    "env.{env_name}.provider.model_credentials: {NON_VERCEL_MODEL_CREDENTIALS}"
+                ));
+            }
+            if !env.provider.interactive_host_suffixes.is_empty() {
+                errors.push(format!(
+                    "env.{env_name}.provider.interactive_host_suffixes: \
+                     interactive_host_suffixes applies only to provider = \"vercel\""
+                ));
+            }
+        }
         let result = match provider.as_str() {
             "fly" => validate_fly_config(
                 &env.provider.api_base,
@@ -528,6 +541,10 @@ pub fn validate_config(cfg: &crate::config::Config) -> Vec<String> {
     }
     errors
 }
+
+/// The refusal for `model_credentials` set on any provider but Vercel.
+pub const NON_VERCEL_MODEL_CREDENTIALS: &str = "model_credentials applies only to provider = \"vercel\"; \
+     other providers upload agent logins through [sandbox.home] agents";
 
 /// Warn when a configured lifetime ceiling has no scheduled destroy reaper.
 pub fn unenforced_lifetime_warnings(cfg: &crate::config::Config) -> Vec<String> {

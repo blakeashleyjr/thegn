@@ -4,5 +4,8 @@
 
 pub mod admit;
 pub mod api;
+pub mod creds;
 pub mod policy;
+pub mod token;
+pub mod usage;
 pub mod ustar;

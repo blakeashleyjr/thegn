@@ -1749,9 +1749,10 @@ mod tests {
         // 105 → 106 (b139): `[ui] sidebar_external_worktrees`
         // (ExternalWorktrees) — group/show/hide for worktrees thegn did not
         // create.
+        // 106 → 107: [env.<name>.provider] model_credentials (ModelCredentials), the Vercel credential mode (b156).
         assert_eq!(
             defs.len(),
-            106,
+            107,
             "config_enum definitions in the Config schema changed; update the \
              pin (and the exclusion note) deliberately: {defs:?}"
         );
