@@ -355,11 +355,21 @@ pub enum SessionAction {
 /// fixed column: `live`, or `exited(<code>)` — `exited(?)` when the child could
 /// not be reaped — with `,done` appended when the final state is `done`
 /// (`exited(0,done)`). Any other final state rides as a trailing `last:<state>`
-/// field, so the token grammar stays `live | exited(<code>|?)[,done]`. JSON
-/// output is unchanged. The wire has carried this data all along
-/// (`SessionInfo::exited_at_ms`); printing it is what makes the listing
-/// truthful about a worker that already finished.
+/// field, so the token grammar stays `live | exited(<code>|?)[,done]`. The wire
+/// has carried this data all along (`SessionInfo::exited_at_ms`); printing it is
+/// what makes the listing truthful about a worker that already finished.
+///
+/// Exit code 75 ([`crate::sprite_bridge::EXIT_REMOTE_LOST`]) additionally gains a
+/// trailing `cause:remote-exec-lost` field (same grammar as `last:<state>`): the
+/// remote exec stream was lost and could not be reattached, so the remote
+/// process did not survive (e.g. the sprite suspended). It is keyed on the code
+/// alone, regardless of placement — a local child exiting 75 (`EX_TEMPFAIL`)
+/// reads the same — and JSON gains `"cause": "remote-exec-lost"` only then
+/// (see [`exit_cause`]).
 pub(crate) fn session_line(s: &thegn_svc::control::SessionInfo) -> String {
+    let cause = exit_cause(s)
+        .map(|c| format!("  cause:{c}"))
+        .unwrap_or_default();
     let mut last = String::new();
     let state = match s.exited_at_ms {
         None => "live".to_string(),
@@ -387,7 +397,7 @@ pub(crate) fn session_line(s: &thegn_svc::control::SessionInfo) -> String {
         .map(|source| format!("  ← forked from {}", display_cell(source)))
         .unwrap_or_default();
     format!(
-        "{}  {}  {}x{}  {} client(s)  {}{}{}{}{}",
+        "{}  {}  {}x{}  {} client(s)  {}{}{}{}{}{}",
         display_cell(&s.id),
         state,
         s.cols,
@@ -400,8 +410,31 @@ pub(crate) fn session_line(s: &thegn_svc::control::SessionInfo) -> String {
             .unwrap_or_default(),
         lease,
         lineage,
-        last
+        last,
+        cause
     )
+}
+
+/// The `cause:` of an exited session, if its exit code carries one: code 75
+/// ([`crate::sprite_bridge::EXIT_REMOTE_LOST`]) ⇒ `remote-exec-lost`, regardless
+/// of placement. `None` while live or for any other code.
+pub(crate) fn exit_cause(s: &thegn_svc::control::SessionInfo) -> Option<&'static str> {
+    (s.exited_at_ms.is_some() && s.exit_code == Some(crate::sprite_bridge::EXIT_REMOTE_LOST))
+        .then_some("remote-exec-lost")
+}
+
+/// `session list --json`: each `SessionInfo` as-is, plus `"cause"` only on the
+/// rows [`exit_cause`] classifies.
+fn sessions_json(sessions: &[thegn_svc::control::SessionInfo]) -> Result<serde_json::Value> {
+    let mut rows = Vec::with_capacity(sessions.len());
+    for s in sessions {
+        let mut value = serde_json::to_value(s)?;
+        if let (Some(cause), Some(obj)) = (exit_cause(s), value.as_object_mut()) {
+            obj.insert("cause".into(), serde_json::Value::from(cause));
+        }
+        rows.push(value);
+    }
+    Ok(serde_json::Value::Array(rows))
 }
 
 /// Serde's pretty output uses raw newlines only for structural line breaks;
@@ -554,7 +587,7 @@ async fn run_async(cfg: &Config, action: SessionAction) -> Result<()> {
                 sessions.retain(|s| s.exited_at_ms.is_none());
             }
             if json {
-                outln!("{}", terminal_safe_pretty_json(&sessions)?);
+                outln!("{}", terminal_safe_pretty_json(&sessions_json(&sessions)?)?);
             } else if sessions.is_empty() {
                 outln!("no live sessions");
             } else {
@@ -586,7 +619,6 @@ async fn run_async(cfg: &Config, action: SessionAction) -> Result<()> {
             resume_work: resume_row,
             json,
         } => {
-            use thegn_svc::control::{AgentLaunch, OpenSpec};
             if lease.is_some() && resume_row.is_none() && (stage.is_none() || issue.is_none()) {
                 anyhow::bail!(
                     "--lease applies to a stage dispatch (--stage --issue) or --resume-work"
@@ -656,82 +688,27 @@ async fn run_async(cfg: &Config, action: SessionAction) -> Result<()> {
                 )
                 .await?;
             } else {
-                // A plain open (THE-57) — optionally with a stage layered over
-                // the agent: `--stage` without `--issue` applies that stage's
-                // `model`/`env`/`permissions` (THE-83) and defaults the agent
-                // to the stage's configured one. A promptless open stays an
-                // interactive launch.
-                let agent = match agent {
-                    Some(a) => a,
-                    None => {
-                        let name = stage
-                            .as_deref()
-                            .expect("clap requires --agent without --stage");
-                        cfg.pipeline
-                            .stage(name)
-                            .map(|s| s.agent.clone())
-                            .expect("open_preflight checked the stage exists")
-                    }
-                };
-                // Resolve the worktree to an absolute path (the agent launches
-                // here; the daemon resolves the sandbox/env from it).
-                let wt = crate::cmd::resolve_worktree(worktree)
-                    .to_string_lossy()
-                    .into_owned();
-                // The launch prompt is final here (a --brief-file brief is already
-                // read and rendered), so the private-/tmp warning sees what the
-                // agent will see (THE-1979).
+                // A plain open (THE-57) — the body is `open_plain`, shared with
+                // `thegn agent run` (THE-2005).
                 let launch_prompt =
                     resolved_open_prompt.expect("plain open prompt was resolved before connect");
-                crate::cmd::session_tmp_warn::warn_if_private_tmp(cfg, &wt, &launch_prompt);
-                let spec = OpenSpec {
-                    automation_origin: None,
-                    argv: Vec::new(),
-                    cwd: None,
-                    env: Vec::new(),
-                    rows: 24,
-                    cols: 80,
-                    worktree: Some(wt.clone()),
-                    agent: Some(AgentLaunch {
-                        agent: agent.clone(),
-                        prompt: launch_prompt,
-                        // A plain `--headless` forces headless; absent leaves the
-                        // default (headless exactly when a prompt was given).
-                        headless: headless.then_some(true),
-                        bind_worktree: bind,
-                        // No `--resume` on this CLI path: launch cold.
-                        resume: None,
-                        // A fresh launch never continues a dead session.
-                        continue_last: false,
-                        // `--stage` without `--issue` layers the stage's
-                        // model/env/permissions over the agent; None on a
-                        // plain open.
+                let (info, tracked_row) = open_plain(
+                    cfg,
+                    &client,
+                    PlainOpen {
+                        agent,
                         stage,
+                        worktree,
+                        prompt: launch_prompt,
+                        headless,
+                        bind,
+                        adopt,
+                        track: track.as_deref(),
                         permissions,
                         widen_permissions,
-                        fork: false,
-                        native_session_id: None,
-                    }),
-                    // Default false: a fan-out that spawns eight agents should not
-                    // yank eight panes into the user's session unasked. `--adopt`
-                    // is the opt-in the pipeline skill always passes.
-                    adopt,
-                    already_capped: false,
-                };
-                let info = client.open(&spec).await?;
-                let tracked_row = match track.as_deref() {
-                    Some(track_issue) => Some(
-                        crate::cmd::session_track::track_opened(
-                            &client,
-                            track_issue,
-                            &wt,
-                            &agent,
-                            &info.id,
-                        )
-                        .await?,
-                    ),
-                    None => None,
-                };
+                    },
+                )
+                .await?;
                 if json {
                     if let Some(row) = tracked_row {
                         let mut value = serde_json::to_value(&info)?;
@@ -1066,6 +1043,120 @@ pub(crate) fn policy_admission(cfg: &Config, agent: &str, stage: &str) -> Result
         .map_err(|why| anyhow::anyhow!("stage `{stage}` (agent `{agent}`) not dispatched: {why}"))
 }
 
+/// The inputs of one plain (non-stage-dispatch, non-resume) open — the
+/// `session open` fields `open_plain` consumes, as a struct so the call stays
+/// readable (and clippy's `too_many_arguments` stays quiet).
+pub(crate) struct PlainOpen<'a> {
+    /// `--agent`; `None` defaults to `stage`'s configured agent.
+    pub agent: Option<String>,
+    /// `--stage` without `--issue`: layers the stage's model/env/permissions.
+    pub stage: Option<String>,
+    /// `--worktree` (resolved to an absolute path here).
+    pub worktree: Option<String>,
+    /// The final launch prompt (a `--brief-file` brief already rendered).
+    pub prompt: String,
+    /// Force headless; `false` leaves the daemon default (headless exactly
+    /// when a prompt is given).
+    pub headless: bool,
+    pub bind: bool,
+    pub adopt: bool,
+    /// `--track <issue>`: write a dispatch row for the opened session.
+    pub track: Option<&'a str>,
+    pub permissions: Vec<String>,
+    pub widen_permissions: bool,
+}
+
+/// A plain open (THE-57) — optionally with a stage layered over the agent:
+/// `--stage` without `--issue` applies that stage's `model`/`env`/
+/// `permissions` (THE-83) and defaults the agent to the stage's configured
+/// one. A promptless open stays an interactive launch. Returns the opened
+/// session and, with `track`, the dispatch row written for it. Shared by
+/// `session open` and `agent run` (THE-2005); prints nothing itself beyond
+/// the private-/tmp warning, so each caller owns its output shape.
+pub(crate) async fn open_plain(
+    cfg: &Config,
+    client: &ControlClient,
+    open: PlainOpen<'_>,
+) -> Result<(thegn_svc::control::SessionInfo, Option<i64>)> {
+    use thegn_svc::control::{AgentLaunch, OpenSpec};
+    let PlainOpen {
+        agent,
+        stage,
+        worktree,
+        prompt: launch_prompt,
+        headless,
+        bind,
+        adopt,
+        track,
+        permissions,
+        widen_permissions,
+    } = open;
+    let agent = match agent {
+        Some(a) => a,
+        None => {
+            let name = stage
+                .as_deref()
+                .expect("clap requires --agent without --stage");
+            cfg.pipeline
+                .stage(name)
+                .map(|s| s.agent.clone())
+                .expect("open_preflight checked the stage exists")
+        }
+    };
+    // Resolve the worktree to an absolute path (the agent launches
+    // here; the daemon resolves the sandbox/env from it).
+    let wt = crate::cmd::resolve_worktree(worktree)
+        .to_string_lossy()
+        .into_owned();
+    // The launch prompt is final here (a --brief-file brief is already
+    // read and rendered), so the private-/tmp warning sees what the
+    // agent will see (THE-1979).
+    crate::cmd::session_tmp_warn::warn_if_private_tmp(cfg, &wt, &launch_prompt);
+    let spec = OpenSpec {
+        automation_origin: None,
+        argv: Vec::new(),
+        cwd: None,
+        env: Vec::new(),
+        rows: 24,
+        cols: 80,
+        worktree: Some(wt.clone()),
+        agent: Some(AgentLaunch {
+            agent: agent.clone(),
+            prompt: launch_prompt,
+            // A plain `--headless` forces headless; absent leaves the
+            // default (headless exactly when a prompt was given).
+            headless: headless.then_some(true),
+            bind_worktree: bind,
+            // No `--resume` on this CLI path: launch cold.
+            resume: None,
+            // A fresh launch never continues a dead session.
+            continue_last: false,
+            // `--stage` without `--issue` layers the stage's
+            // model/env/permissions over the agent; None on a
+            // plain open.
+            stage,
+            permissions,
+            widen_permissions,
+            fork: false,
+            native_session_id: None,
+        }),
+        // Default false: a fan-out that spawns eight agents should not
+        // yank eight panes into the user's session unasked. `--adopt`
+        // is the opt-in the pipeline skill always passes.
+        adopt,
+        already_capped: false,
+    };
+    let info = client.open(&spec).await?;
+    let tracked_row = match track {
+        Some(track_issue) => Some(
+            crate::cmd::session_track::track_opened(client, track_issue, &wt, &agent, &info.id)
+                .await?,
+        ),
+        None => None,
+    };
+    Ok((info, tracked_row))
+}
+
 /// The `session open` refusals that are answerable before `connect` — both are
 /// caller mistakes, not daemon problems:
 ///
@@ -1079,7 +1170,7 @@ pub(crate) fn policy_admission(cfg: &Config, agent: &str, stage: &str) -> Result
 /// `--resume-work` runs its own offline row checks in this same pre-`connect`
 /// slot — `resume_preflight`: unknown row, non-pipeline row, unknown stage —
 /// so its refusals are answerable without a daemon either.
-fn open_preflight(
+pub(crate) fn open_preflight(
     cfg: &Config,
     stage: Option<&str>,
     issue: Option<&str>,
@@ -2237,7 +2328,7 @@ mod snapshot_text_tests {
 
 #[cfg(test)]
 mod session_line_tests {
-    use super::session_line;
+    use super::{exit_cause, session_line, sessions_json};
     use thegn_svc::control::SessionInfo;
 
     /// The liveness token is the line's **second column** (immediately after
@@ -2307,6 +2398,45 @@ mod session_line_tests {
         assert!(!session_line(&info(Some(1), Some(0), Some("done"))).contains("last:"));
         assert!(!session_line(&info(Some(1), Some(0), Some(""))).contains("last:"));
         assert!(!session_line(&info(None, None, Some("idle"))).contains("last:"));
+    }
+
+    #[test]
+    fn exit_75_gains_a_remote_exec_lost_cause_field() {
+        let lost = info(Some(1), Some(75), None);
+        let line = session_line(&lost);
+        assert_eq!(token(&line), "exited(75)");
+        assert!(line.ends_with("  cause:remote-exec-lost"), "{line}");
+        assert_eq!(exit_cause(&lost), Some("remote-exec-lost"));
+        // Rides after a `last:` field, never inside the token.
+        let line = session_line(&info(Some(1), Some(75), Some("working")));
+        assert_eq!(token(&line), "exited(75)");
+        assert!(
+            line.ends_with("  last:working  cause:remote-exec-lost"),
+            "{line}"
+        );
+        // Code 1 and a clean `done` exit carry no cause.
+        let line = session_line(&info(Some(1), Some(1), None));
+        assert_eq!(token(&line), "exited(1)");
+        assert!(!line.contains("cause:"), "{line}");
+        let line = session_line(&info(Some(1), Some(0), Some("done")));
+        assert_eq!(token(&line), "exited(0,done)");
+        assert!(!line.contains("cause:"), "{line}");
+        // A live session never has a cause.
+        assert_eq!(exit_cause(&info(None, Some(75), None)), None);
+    }
+
+    #[test]
+    fn session_list_json_adds_cause_only_when_it_applies() {
+        let rows = sessions_json(&[
+            info(Some(1), Some(75), None),
+            info(Some(1), Some(1), None),
+            info(Some(1), Some(0), Some("done")),
+        ])
+        .unwrap();
+        assert_eq!(rows[0]["cause"], "remote-exec-lost");
+        assert_eq!(rows[0]["exit_code"], 75);
+        assert!(rows[1].get("cause").is_none());
+        assert!(rows[2].get("cause").is_none());
     }
 
     #[test]

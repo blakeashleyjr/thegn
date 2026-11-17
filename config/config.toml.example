@@ -3866,7 +3866,8 @@ open_on_detect = false # auto-open the browser (via `browser` above) when a new 
 # #                          #   cli  — always use the `*_command` CLI bridge below.
 # #                          # Native exec also persists its session id, so a restart
 # #                          # reattaches the live sprite session and replays scrollback.
-# # The CLI bridge (used for exec = "cli", and as the auto fallback). PTY-capable:
+# # The CLI bridge (used for exec = "cli", and as the auto fallback). PTY-capable.
+# `interactive_command` is used only with exec = "cli"; headless sessions never need the CLI:
 # exec_command = ["sprite", "exec", "-s", "{id}", "--"]
 # interactive_command = ["sprite", "exec", "-s", "{id}", "--tty", "--"]
 # up_command = ["sprite", "create", "{id}", "--skip-console"]
@@ -3890,7 +3891,7 @@ open_on_detect = false # auto-open the browser (via `browser` above) when a new 
 # #  • NATIVE EXEC — with `exec = "auto"` (default) the interactive pane attaches
 # #    over the Sprites WSS exec API directly (no `sprite` CLI), and reattaches its
 # #    live session (replaying scrollback) across restarts. Set `exec = "cli"` to
-# #    fall back to the `interactive_command` bridge.
+# #    use the `interactive_command` bridge (the only case it is used).
 # # FAILOVER — by default, if the sprite can't be brought up (bad/expired token,
 # #   API down, quota), the worktree's pane HALTS with a warning modal (the real
 # #   cause + a retry) rather than silently dropping to a host shell (see
@@ -4213,6 +4214,17 @@ enabled = false
 # "hetzner:cx33" = 0.0154     #   autoscaled hosts ("provider:size", fallback
 # "hetzner" = 0.008           #   "provider"); unpriced resources meter at $0
 #                             #   with a one-time warning
+# [placement.fleet_budget.fly] # hourly burn budget for one provider's sandboxes,
+#                             #   keyed by the env provider name (fly, sprites,
+#                             #   daytona, hetzner, digitalocean, machine0) and
+#                             #   compared to the `thegn fleet cost` estimate
+# warn_hourly = 0.0           #   USD/h at which the masthead fleet badge turns
+#                             #   amber and `fleet cost` prints a budget line
+#                             #   (0 = off)
+# max_hourly = 0.0            #   USD/h at which a NEW sandbox on this provider
+#                             #   is refused (resume/reuse never is; 0 = off).
+#                             #   With a cap set, provisioning reads the fleet
+#                             #   first and refuses if it cannot read it.
 # [placement.default_resources] # fallback ask when an env declares none
 # cpu = "1"                   #   cpu floor ("2", "0.5", "500m")
 # memory = "2g"               #   memory floor ("4g", "512m", bare = MiB)

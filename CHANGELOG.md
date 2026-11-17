@@ -7,6 +7,33 @@ All notable changes to **thegn** are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.1.0-alpha.90] — 2026-11-16
+
+### Added
+
+- The fleet popup gains row actions to stop or destroy a VM (with confirmation), and the cpu/mem popup can jump to a row's worktree or pane. (THE-2020, THE-2025)
+- `[placement.fleet_budget.<provider>]` sets `warn_hourly`/`max_hourly` caps; `thegn fleet cost` lists breaches, and new provider sandboxes are refused at the cap. (THE-2020)
+- `thegn agent run` opens a headless agent in a worktree, optionally waits for it, and prints its output tail. (THE-2005)
+
+### Changed
+
+- Route-to-host merge mode no longer blocks provisioning without `thegn serve`; the in-env `merge add` refuses with the fix instead. (THE-2037)
+- Agent-login sync uploads only an allowlist of config files, not telemetry or caches. (THE-2039)
+- The monitor containers tab shows minicore rows and a cpu/memory scatter. (THE-842)
+
+### Fixed
+
+- Security: a provider env with no remote transport (e.g. fly before this fix) no longer runs sessions on the host; it halts before provisioning. Fly sessions now run on the Fly machine over thegn's ssh bridge. (THE-2044)
+- Headless sessions on sprites no longer need the `sprite` CLI with `exec = "auto"`; `interactive_command` is used only with `exec = "cli"`. They start in the provisioned checkout, reattach after a dropped connection, and `session list` shows `cause:remote-exec-lost` when the sprite suspended. (THE-2041, THE-2042, THE-2047)
+- The provider "provisioned" marker and cached sandbox home live in the state dir, so CLI and daemon agree. (THE-2040)
+- `.thegn-provisioned` is excluded from git in remote checkouts (THE-2043); provisioning fails clearly when Nix is required but did not install, and the fly image installs xz (THE-2045); interrupted Nix builds no longer leave the store broken. (THE-2046)
+- `thegn fleet` lists fly and machine0 inventories and names the real cause when it cannot. (THE-2038)
+- `wt rm --delete-branch` works for remote worktrees and never blocks sandbox teardown. (THE-2048)
+- Daemon agent launches honour `{prompt_file}`, and agent payloads are capped at 1 MiB. (THE-1986)
+- The loading splash no longer reopens the database on every step. (THE-2001)
+- Quitting cancels a hung sshfs/rsync projection mount. (THE-251)
+- Disk reclaim prunes orphaned build artifacts and stale live-build dirs. (THE-1997)
+
 ## [0.1.0-alpha.89] — 2026-11-16
 
 ### Added
@@ -3678,7 +3705,8 @@ launcher picker and the merge queue's `agent_command` hook remain — they run
 whatever commands you configure. Leftover `[llm_proxy]` config sections and
 `proxy_*` tables in existing state databases are ignored harmlessly.
 
-[Unreleased]: https://github.com/blakeashleyjr/thegn/compare/v0.1.0-alpha.89...HEAD
+[Unreleased]: https://github.com/blakeashleyjr/thegn/compare/v0.1.0-alpha.90...HEAD
+[0.1.0-alpha.90]: https://github.com/blakeashleyjr/thegn/compare/v0.1.0-alpha.89...v0.1.0-alpha.90
 [0.1.0-alpha.89]: https://github.com/blakeashleyjr/thegn/compare/v0.1.0-alpha.88...v0.1.0-alpha.89
 [0.1.0-alpha.88]: https://github.com/blakeashleyjr/thegn/compare/v0.1.0-alpha.87...v0.1.0-alpha.88
 [0.1.0-alpha.87]: https://github.com/blakeashleyjr/thegn/compare/v0.1.0-alpha.86...v0.1.0-alpha.87

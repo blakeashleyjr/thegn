@@ -728,7 +728,7 @@ pub(crate) fn refresh_open(
     }
     let secs = build_sections(model, ctx);
     let content: usize = secs.iter().map(Section::height).sum();
-    ov.content = DetailContent::Sections(SectionsDetail { sections: secs });
+    ov.content = DetailContent::Sections(SectionsDetail::plain(secs));
     ov.rows = content.min(ctx.screen.rows.saturating_sub(3)).max(1);
     // The stack can shrink under the user (a session closed); keep the viewport
     // inside the new content rather than stranding it past the end.

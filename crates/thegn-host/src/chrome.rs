@@ -1680,10 +1680,11 @@ pub(crate) fn masthead_widget(id: &str, model: &FrameModel) -> Option<MastheadWi
 }
 
 /// The `fleet` widget's text and whether it warrants the amber tone (an orphan
-/// VM, or a recorded VM the provider no longer lists). `None` hides it.
+/// VM, a recorded VM the provider no longer lists, or a provider burn at a
+/// `[placement.fleet_budget]` limit). `None` hides it.
 pub(crate) fn fleet_widget(snap: &crate::fleet_read::FleetSnapshot) -> Option<(String, bool)> {
     let (view, cost) = (&snap.view, &snap.cost);
-    let warn = view.orphans > 0 || !view.missing.is_empty();
+    let warn = view.orphans > 0 || !view.missing.is_empty() || !cost.budget.is_empty();
     if view.rows.is_empty() && cost.total_hourly <= 0.0 && !warn {
         return None;
     }

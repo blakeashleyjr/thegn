@@ -392,6 +392,15 @@ pub fn validate_diagnostics_with_policy(
                 message,
             }
         }));
+        diagnostics.extend(
+            cfg.placement
+                .fleet_budget_warnings()
+                .into_iter()
+                .map(|message| ValidationDiagnostic {
+                    severity: ValidationSeverity::Warning,
+                    message,
+                }),
+        );
     }
     diagnostics
 }
@@ -659,6 +668,9 @@ pub(crate) fn typed_semantic_errors(cfg: &Config, mode: SemanticMode) -> Vec<Str
     batch!(cfg.model_proxy.validate());
     batch!(cfg.ci.validate());
     batch!(crate::provider_admission::validate_config(cfg));
+    // `[placement.fleet_budget]` is a free-form provider map: refuse a
+    // negative or non-finite limit (warnings ride `validate_diagnostics`).
+    batch!(cfg.placement.fleet_budget_errors());
     errs
 }
 

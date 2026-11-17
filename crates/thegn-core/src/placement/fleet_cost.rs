@@ -17,6 +17,8 @@
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 
+pub use crate::config_placement::FleetBudget;
+
 /// The date the bundled price table was last checked against the vendors'
 /// pricing pages.
 pub const PRICE_TABLE_DATE: &str = "2026-11-15";
@@ -387,6 +389,113 @@ pub struct FleetCost {
     pub projected_30d: f64,
     pub unpriced: usize,
     pub price_table_date: String,
+    /// `[placement.fleet_budget]` breaches, filled by [`apply_budgets`]
+    /// (empty until then, and when no budget is set or none is reached).
+    #[serde(default)]
+    pub budget: Vec<BudgetBreach>,
+}
+
+/// Which `[placement.fleet_budget.<provider>]` limit a burn reached.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BudgetLevel {
+    /// At or above `warn_hourly` (the badge turns amber).
+    Warn,
+    /// At or above `max_hourly` (new sandboxes are refused).
+    Max,
+}
+
+impl BudgetLevel {
+    pub fn label(self) -> &'static str {
+        match self {
+            BudgetLevel::Warn => "warn",
+            BudgetLevel::Max => "max",
+        }
+    }
+}
+
+/// One provider whose estimated hourly burn reached a budget limit. Only the
+/// highest level reached is reported per provider.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct BudgetBreach {
+    pub provider: String,
+    pub level: BudgetLevel,
+    /// The provider's estimated burn, USD/h.
+    pub hourly: f64,
+    /// The limit it reached, USD/h.
+    pub limit: f64,
+}
+
+/// Float slack for budget comparisons: a burn within this of a limit counts
+/// as reaching it (summed rates are not exact).
+pub const BUDGET_EPSILON: f64 = 1e-9;
+
+/// A limit is set when it is a finite, positive amount (`0` = off; negative or
+/// non-finite values are refused by `config validate` and ignored here).
+fn limit_set(limit: f64) -> bool {
+    limit.is_finite() && limit > 0.0
+}
+
+fn reaches(hourly: f64, limit: f64) -> bool {
+    limit_set(limit) && hourly + BUDGET_EPSILON >= limit
+}
+
+/// A provider's estimated burn (an unlisted or unpriced provider burns 0).
+fn provider_hourly(cost: &FleetCost, provider: &str) -> f64 {
+    cost.per_provider_hourly
+        .get(provider)
+        .copied()
+        .filter(|h| h.is_finite())
+        .unwrap_or(0.0)
+}
+
+/// Compare each provider's burn against its budget and record the breaches
+/// in [`FleetCost::budget`] (replacing any earlier result). Pure.
+pub fn apply_budgets(cost: &mut FleetCost, budgets: &BTreeMap<String, FleetBudget>) {
+    cost.budget = budgets
+        .iter()
+        .filter_map(|(provider, budget)| {
+            let hourly = provider_hourly(cost, provider);
+            let (level, limit) = if reaches(hourly, budget.max_hourly) {
+                (BudgetLevel::Max, budget.max_hourly)
+            } else if reaches(hourly, budget.warn_hourly) {
+                (BudgetLevel::Warn, budget.warn_hourly)
+            } else {
+                return None;
+            };
+            Some(BudgetBreach {
+                provider: provider.clone(),
+                level,
+                hourly,
+                limit,
+            })
+        })
+        .collect();
+}
+
+/// May a NEW sandbox be created on `provider`? `Err` when its `max_hourly` is
+/// set and the estimated burn is at or above it. Pure.
+pub fn admit_new(
+    cost: &FleetCost,
+    provider: &str,
+    budgets: &BTreeMap<String, FleetBudget>,
+) -> Result<(), String> {
+    let Some(max) = budgets
+        .get(provider)
+        .map(|b| b.max_hourly)
+        .filter(|m| limit_set(*m))
+    else {
+        return Ok(());
+    };
+    let hourly = provider_hourly(cost, provider);
+    if reaches(hourly, max) {
+        return Err(format!(
+            "{provider} burn ${hourly:.2}/h is at its max_hourly ${max:.2}/h \
+             ([placement.fleet_budget.{provider}]); stop or destroy a sandbox \
+             (`thegn fleet list`) or raise the cap"
+        ));
+    }
+    Ok(())
 }
 
 /// Price a [`FleetView`] at `now_ms`.
@@ -787,6 +896,7 @@ mod tests {
             "projected_30d",
             "unpriced",
             "price_table_date",
+            "budget",
         ] {
             assert!(json.get(key).is_some(), "{key}");
         }
@@ -811,5 +921,113 @@ mod tests {
             assert!(total == 0.0 && total.is_sign_positive(), "{total:?}");
         }
         assert_eq!(format!("{:.4}", cost.total_hourly), "0.0000");
+    }
+
+    fn burn(pairs: &[(&str, f64)]) -> FleetCost {
+        FleetCost {
+            per_provider_hourly: pairs.iter().map(|(p, h)| ((*p).to_string(), *h)).collect(),
+            ..FleetCost::default()
+        }
+    }
+
+    fn budgets(rows: &[(&str, f64, f64)]) -> BTreeMap<String, FleetBudget> {
+        rows.iter()
+            .map(|(p, warn_hourly, max_hourly)| {
+                (
+                    (*p).to_string(),
+                    FleetBudget {
+                        warn_hourly: *warn_hourly,
+                        max_hourly: *max_hourly,
+                    },
+                )
+            })
+            .collect()
+    }
+
+    /// (burn, warn, max) → expected (level, limit).
+    type BudgetCase = (f64, f64, f64, Option<(BudgetLevel, f64)>);
+
+    #[test]
+    fn apply_budgets_table() {
+        let cases: &[BudgetCase] = &[
+            (5.0, 0.0, 0.0, None),
+            (1.0, 2.0, 3.0, None),
+            (2.0, 2.0, 3.0, Some((BudgetLevel::Warn, 2.0))),
+            (2.0 - 1e-12, 2.0, 3.0, Some((BudgetLevel::Warn, 2.0))),
+            (2.0 - 1e-6, 2.0, 3.0, None),
+            (2.5, 2.0, 3.0, Some((BudgetLevel::Warn, 2.0))),
+            (3.0, 2.0, 3.0, Some((BudgetLevel::Max, 3.0))),
+            (0.1 + 0.2, 0.0, 0.3, Some((BudgetLevel::Max, 0.3))),
+            (9.0, 2.0, 0.0, Some((BudgetLevel::Warn, 2.0))),
+            (9.0, 0.0, 3.0, Some((BudgetLevel::Max, 3.0))),
+            (9.0, f64::NAN, -1.0, None),
+            (0.0, 0.0, 0.0, None),
+        ];
+        for (hourly, warn, max, want) in cases {
+            let mut cost = burn(&[("fly", *hourly)]);
+            apply_budgets(&mut cost, &budgets(&[("fly", *warn, *max)]));
+            let got = cost.budget.first().map(|b| (b.level, b.limit));
+            assert_eq!(got, *want, "burn {hourly} warn {warn} max {max}");
+            if let Some(b) = cost.budget.first() {
+                assert_eq!(b.provider, "fly");
+                assert!((b.hourly - hourly).abs() < 1e-9);
+            }
+        }
+    }
+
+    #[test]
+    fn apply_budgets_unpriced_or_absent_provider_burns_zero_and_replaces() {
+        let mut cost = burn(&[("fly", 4.0), ("digitalocean", f64::NAN)]);
+        apply_budgets(&mut cost, &BTreeMap::new());
+        assert!(cost.budget.is_empty(), "no budget ⇒ no breach");
+        apply_budgets(
+            &mut cost,
+            &budgets(&[
+                ("fly", 1.0, 0.0),
+                ("hetzner", 0.5, 1.0),
+                ("digitalocean", 0.5, 0.0),
+            ]),
+        );
+        assert_eq!(cost.budget.len(), 1, "{:?}", cost.budget);
+        assert_eq!(cost.budget[0].provider, "fly");
+        // A second application replaces, never appends.
+        apply_budgets(&mut cost, &budgets(&[("fly", 1.0, 0.0)]));
+        assert_eq!(cost.budget.len(), 1);
+        assert_eq!(BudgetLevel::Warn.label(), "warn");
+        assert_eq!(BudgetLevel::Max.label(), "max");
+        let json = serde_json::to_value(&cost.budget[0]).unwrap();
+        assert_eq!(json["level"], "warn");
+        assert_eq!(json["provider"], "fly");
+    }
+
+    #[test]
+    fn admit_new_table() {
+        let b = budgets(&[("fly", 1.0, 3.0), ("digitalocean", 1.0, 0.0)]);
+        // No budget for the provider at all.
+        assert_eq!(
+            admit_new(&burn(&[("hetzner", 99.0)]), "hetzner", &b),
+            Ok(())
+        );
+        // Warn-only budget never refuses.
+        assert_eq!(
+            admit_new(&burn(&[("digitalocean", 99.0)]), "digitalocean", &b),
+            Ok(())
+        );
+        // Under, unpriced/absent (0 burn), and just under beyond epsilon.
+        assert_eq!(admit_new(&burn(&[("fly", 2.0)]), "fly", &b), Ok(()));
+        assert_eq!(admit_new(&burn(&[]), "fly", &b), Ok(()));
+        assert_eq!(admit_new(&burn(&[("fly", f64::NAN)]), "fly", &b), Ok(()));
+        assert_eq!(admit_new(&burn(&[("fly", 3.0 - 1e-6)]), "fly", &b), Ok(()));
+        // At (within epsilon) and over.
+        for hourly in [3.0 - 1e-12, 3.0, 3.2] {
+            let err = admit_new(&burn(&[("fly", hourly)]), "fly", &b).unwrap_err();
+            assert!(err.starts_with("fly burn $"), "{err}");
+            assert!(err.contains("max_hourly $3.00/h"), "{err}");
+        }
+        assert!(
+            admit_new(&burn(&[("fly", 3.2)]), "fly", &b)
+                .unwrap_err()
+                .contains("$3.20/h")
+        );
     }
 }
