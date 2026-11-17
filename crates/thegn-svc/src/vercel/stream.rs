@@ -229,10 +229,10 @@ async fn terminate<O: StreamOps>(
         }
     })
     .await;
-    if ended.is_err() {
-        if let Err(e) = ops.kill(SIGKILL).await {
-            tracing::debug!(target: "thegn::provider", error = %e, "vercel stream SIGKILL failed");
-        }
+    if ended.is_err()
+        && let Err(e) = ops.kill(SIGKILL).await
+    {
+        tracing::debug!(target: "thegn::provider", error = %e, "vercel stream SIGKILL failed");
     }
 }
 
