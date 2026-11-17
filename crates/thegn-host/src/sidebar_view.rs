@@ -4334,6 +4334,138 @@ mod tests {
         assert_eq!(lead[0].text, " ".repeat(6));
     }
 
+    /// Three worktrees under one workspace with detail on: build, paint, and
+    /// return the surface plus the frame so tests read the detail lines.
+    fn guide_fixture(depths: &[u8]) -> (Surface, SidebarFrame) {
+        use crate::sidebar::SidebarRow;
+        let mut rows = vec![SidebarRow::base(RowKind::Workspace, 0, "ws", "ws")];
+        for (i, d) in depths.iter().enumerate() {
+            rows.push(SidebarRow::base(
+                RowKind::Worktree,
+                *d,
+                &format!("feat-{i}"),
+                "ws",
+            ));
+        }
+        let mut model = FrameModel {
+            sidebar_rows: rows,
+            ..FrameModel::default()
+        };
+        model.sidebar_display = SidebarDisplay {
+            focus_detail: thegn_core::config::FocusDetail::All,
+            detail_when: thegn_core::config::DetailWhen::Always,
+            detail_branch: true,
+            ..SidebarDisplay::default()
+        };
+        let rect = Rect {
+            x: 0,
+            y: 0,
+            cols: 40,
+            rows: 30,
+        };
+        let mut s = Surface::new(40, 30);
+        draw_sidebar(&mut s, rect, &model);
+        (s, build_sidebar(&model, rect, 0))
+    }
+
+    fn guide_cell(
+        s: &mut Surface,
+        frame: &SidebarFrame,
+        idx: usize,
+        x: usize,
+    ) -> (String, ColorAttribute) {
+        let p = frame
+            .rows
+            .iter()
+            .find(|p| p.visible_index == idx)
+            .expect("row painted");
+        assert!(p.height >= 2, "row {idx} must carry a detail line");
+        let cell = &s.screen_cells()[p.y + p.height - 1][x];
+        (cell.str().to_string(), cell.attrs().foreground())
+    }
+
+    #[test]
+    fn detail_line_continues_the_guide_under_each_connector() {
+        let (mut s, frame) = guide_fixture(&[1, 1, 1]);
+        let pipe = crate::caps::active_glyphs().tree_pipe;
+        for idx in [1, 2] {
+            let (t, fg) = guide_cell(&mut s, &frame, idx, 4);
+            assert_eq!(t, pipe, "row {idx}");
+            assert_eq!(fg, col(S::Ghost2), "row {idx}");
+        }
+        let (t, _) = guide_cell(&mut s, &frame, 3, 4);
+        assert_eq!(t.trim(), "", "last row is blank under `└`");
+    }
+
+    #[test]
+    fn detail_line_guide_is_a_pipe_under_the_ascii_glyph_set() {
+        use thegn_core::termcaps::UnicodeLevel;
+        crate::caps::test_override::with_unicode(UnicodeLevel::Ascii, || {
+            let (mut s, frame) = guide_fixture(&[1, 1, 1]);
+            let (t, _) = guide_cell(&mut s, &frame, 1, 4);
+            assert_eq!(t, "|");
+        });
+    }
+
+    #[test]
+    fn detail_line_guide_follows_a_depth_two_row() {
+        let (mut s, frame) = guide_fixture(&[1, 2, 2, 1]);
+        let pipe = crate::caps::active_glyphs().tree_pipe;
+        let (t, _) = guide_cell(&mut s, &frame, 2, 4 + 2);
+        assert_eq!(t, pipe);
+        let (t, _) = guide_cell(&mut s, &frame, 2, 4);
+        assert_eq!(t.trim(), "");
+    }
+
+    #[test]
+    fn cursor_bar_spans_both_lines_of_a_two_line_row() {
+        use crate::sidebar::SidebarRow;
+        let model = FrameModel {
+            sidebar_rows: vec![
+                SidebarRow::base(RowKind::Workspace, 0, "ws", "ws"),
+                SidebarRow::base(RowKind::Worktree, 1, "feat-0", "ws"),
+                SidebarRow::base(RowKind::Worktree, 1, "feat-1", "ws"),
+            ],
+            sidebar_selected: 1,
+            sidebar_display: SidebarDisplay {
+                focus_detail: thegn_core::config::FocusDetail::All,
+                detail_when: thegn_core::config::DetailWhen::Always,
+                detail_branch: true,
+                ..SidebarDisplay::default()
+            },
+            ..FrameModel::default()
+        };
+        let rect = Rect {
+            x: 0,
+            y: 0,
+            cols: 40,
+            rows: 30,
+        };
+        let mut s = Surface::new(40, 30);
+        draw_sidebar(&mut s, rect, &model);
+        let frame = build_sidebar(&model, rect, 0);
+        let p = frame.rows.iter().find(|p| p.visible_index == 1).unwrap();
+        assert!(p.cursor_bar && p.height - p.lead_gap >= 2);
+        let bar = crate::caps::active_glyphs().half_block_r;
+        for dy in p.lead_gap..p.height {
+            assert_eq!(s.screen_cells()[p.y + dy][0].str(), bar, "dy {dy}");
+        }
+    }
+
+    /// The mode chip paints in the dim slot, at the geometry `header_chips`
+    /// reports.
+    #[test]
+    fn mode_chip_paints_in_the_dim_slot() {
+        let model = FrameModel::default();
+        let rect = chip_rect(60);
+        let (label, x, _) = header_chips(&model, rect).mode.expect("fits at 60");
+        let mut s = Surface::new(60, 40);
+        draw_sidebar(&mut s, rect, &model);
+        let cell = &s.screen_cells()[rect.y][x];
+        assert_eq!(cell.str(), &label[..1]);
+        assert_eq!(cell.attrs().foreground(), col(S::Dim));
+    }
+
     #[test]
     fn mode_chip_yields_the_header_row_to_the_rail_and_the_filter() {
         for m in [
