@@ -1142,7 +1142,7 @@ pub const STATE_TOOLS: &[StateToolSpec] = &[
     },
     StateToolSpec {
         cap: "automations.put",
-        description: "Create or replace a Lead-authored automation rule. Lead rules may only notify or open sessions; config rules are read-only. Write-scoped (`--scopes write`); requires a running daemon.",
+        description: "Create or replace a Lead-authored automation rule. Lead rules may only notify, open a session, wake the Lead or propose a pipeline (pipeline.start at autonomy = \"propose\" only); they never merge, and config rules are read-only. Write-scoped (`--scopes write`); requires a running daemon.",
         args: &[ArgSpec {
             name: "rule",
             kind: ArgKind::Object,
