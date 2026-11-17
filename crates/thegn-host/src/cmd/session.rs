@@ -511,6 +511,18 @@ fn now_ms() -> i64 {
 /// and verify it answers. `Err` carries the user-facing no-daemon message.
 /// Shared with `thegn attach` (`cmd::attach`), the local interactive client.
 pub(crate) async fn connect(cfg: &Config) -> Result<ControlClient> {
+    // An env-provided address (the Lead's `thegn mcp serve`, THE-2188) is used
+    // as-is: no discovery, and never a fallback to the implicit-admin unix
+    // socket — the scoped bearer token is the whole grant.
+    if let Some(addr) = env_control_addr(&|k| std::env::var(k).ok()) {
+        let client = ControlClient::new(addr);
+        if client.health().await.is_err() {
+            anyhow::bail!(
+                "THEGN_CONTROL_ADDR is set but the daemon's Lead listener is unreachable (restart the daemon, then reopen the Lead)"
+            );
+        }
+        return Ok(client);
+    }
     let scopes = crate::daemon::scope_aliases();
     let addr = Db::open()
         .ok()
@@ -521,6 +533,17 @@ pub(crate) async fn connect(cfg: &Config) -> Result<ControlClient> {
         })
         .unwrap_or_else(|| ControlAddr::Unix(crate::daemon::socket_path(&cfg.daemon)));
     crate::daemon::client::verify_local_daemon(ControlClient::new(addr), &scopes).await
+}
+
+/// `THEGN_CONTROL_ADDR` + `THEGN_CONTROL_TOKEN`, both set and non-empty, name a
+/// bearer-token TCP control address that takes precedence over discovery.
+/// Either one alone is ignored (a lone `THEGN_CONTROL_TOKEN` is the sprite
+/// `route_to_host` pair's half, which `merge add` reads with its URL).
+fn env_control_addr(get: &dyn Fn(&str) -> Option<String>) -> Option<ControlAddr> {
+    let nonempty = |k: &str| get(k).filter(|v| !v.trim().is_empty());
+    let addr = nonempty("THEGN_CONTROL_ADDR")?;
+    let token = nonempty("THEGN_CONTROL_TOKEN")?;
+    Some(ControlAddr::Tcp { addr, token })
 }
 
 /// Run a session verb. Exit-code semantics: daemon absent ⇒ 1 with the clear
@@ -3678,5 +3701,49 @@ mod issue_snapshot_tests {
         assert!(snap.unwrap().contains("\"title\": \"hi\""));
         let (_, none) = resolve_lookup("linear:THE-1", false, false, Ok(issue("hi"))).unwrap();
         assert!(none.is_none());
+    }
+}
+
+#[cfg(test)]
+mod env_control_addr_tests {
+    use super::env_control_addr;
+    use thegn_svc::control::client::ControlAddr;
+
+    fn env<'a>(pairs: &'a [(&'a str, &'a str)]) -> impl Fn(&str) -> Option<String> + 'a {
+        move |k| {
+            pairs
+                .iter()
+                .find(|(n, _)| *n == k)
+                .map(|(_, v)| (*v).to_string())
+        }
+    }
+
+    #[test]
+    fn both_vars_select_a_tcp_bearer_address() {
+        let get = env(&[
+            ("THEGN_CONTROL_ADDR", "127.0.0.1:4242"),
+            ("THEGN_CONTROL_TOKEN", "tgc_x"),
+        ]);
+        match env_control_addr(&get) {
+            Some(ControlAddr::Tcp { addr, token }) => {
+                assert_eq!(addr, "127.0.0.1:4242");
+                assert_eq!(token, "tgc_x");
+            }
+            other => panic!("expected Tcp, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn either_var_alone_or_empty_falls_through_to_discovery() {
+        assert!(env_control_addr(&env(&[("THEGN_CONTROL_ADDR", "127.0.0.1:1")])).is_none());
+        assert!(env_control_addr(&env(&[("THEGN_CONTROL_TOKEN", "t")])).is_none());
+        assert!(
+            env_control_addr(&env(&[
+                ("THEGN_CONTROL_ADDR", " "),
+                ("THEGN_CONTROL_TOKEN", "t"),
+            ]))
+            .is_none()
+        );
+        assert!(env_control_addr(&env(&[])).is_none());
     }
 }
