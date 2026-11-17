@@ -145,6 +145,7 @@ fn iroh_token() -> String {
 fn create_list_destroy_with_ledger() {
     let tmp = tempfile::tempdir().unwrap();
     unsafe { std::env::set_var("THEGN_DIR", tmp.path()) };
+    unsafe { std::env::set_var("XDG_STATE_HOME", tmp.path().join("state")) };
     let (base, recorded) = start_mock();
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()

@@ -790,7 +790,6 @@ mod tests {
         assert!(!new.join("old.json").exists());
     }
 
-    #[cfg(unix)]
     #[test]
     fn promote_legacy_never_follows_or_moves_a_symlinked_legacy() {
         let tmp = tempfile::tempdir().unwrap();
@@ -798,7 +797,9 @@ mod tests {
         std::fs::create_dir(&target).unwrap();
         std::fs::write(target.join("rec.json"), b"{}").unwrap();
         let legacy = tmp.path().join("legacy");
-        std::os::unix::fs::symlink(&target, &legacy).unwrap();
+        if thegn_core::fsperm::create_symlink(&target, &legacy, true).is_err() {
+            return; // symlinks unavailable on this platform/account
+        }
         let new = tmp.path().join("state/thegn/vps");
 
         assert_eq!(promote_legacy(&legacy, &new), new);
