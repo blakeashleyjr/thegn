@@ -294,6 +294,22 @@ The Lead needs the daemon. If the daemon is off, or `[lead]` was added after
 the daemon started, opening the Lead fails with a hint to restart the daemon.
 Only claude is supported as the Lead's agent so far.
 
+### What the Lead may ask the daemon to do
+
+A Lead token is confined whatever its scopes. In short:
+
+- `sessions.open` launches only a configured agent, by name, in a registered
+  worktree whose launch resolves to a real sandbox. No raw `argv`, no `env`.
+- `sessions.input`, `sessions.attach`, `sessions.split`, `sessions.fork`,
+  `git.stage`, `git.commit`, `worktrees.open`, `worktrees.create`,
+  `editor.open`, `worktrees.sandbox_profile_set` and every admin or exec verb
+  are refused.
+- Reads, `sessions.kill`, the tracker, dispatches (without binding a session),
+  notifications, approvals requests, its own rules and the merge queue (with
+  `merge_add`) work as their scopes say.
+
+The full list is in [sandboxing](sandboxing.md#what-the-lead-may-ask-the-daemon-to-do).
+
 To debug the wiring, `thegn mcp wire --lead` writes `mcp.json` and prints its
 path without starting anything. Because it mints a new token, a Lead that is
 already running must be reopened. `thegn mcp wire --lead --remove` deletes the

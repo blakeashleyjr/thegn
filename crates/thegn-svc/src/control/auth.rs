@@ -22,6 +22,10 @@ pub struct AuthCtx {
     pub pairing_id: String,
     pub label: String,
     pub scopes: ScopeSet,
+    /// The caller is the Lead ([`thegn_core::lead_confine`]): set only at
+    /// authentication time, from the stored pairing label the host minted or
+    /// from the listener the request arrived on. No request field reaches it.
+    pub lead_confined: bool,
 }
 
 impl AuthCtx {
@@ -32,7 +36,16 @@ impl AuthCtx {
             pairing_id: "local".into(),
             label: "local unix-socket peer".into(),
             scopes: ScopeSet::parse("admin"),
+            lead_confined: false,
         }
+    }
+
+    /// Confine this caller when it arrived on the Lead listener. Only ever
+    /// tightens: a Lead-labelled token stays confined on any listener.
+    #[must_use]
+    pub fn on_listener(mut self, lead_listener: bool) -> Self {
+        self.lead_confined |= lead_listener;
+        self
     }
 
     /// Guard a verb: `Err(NoScope)` when the caller's grant doesn't satisfy it.
@@ -151,6 +164,7 @@ pub fn verify(store: &dyn ControlStore, token: &str, now_ms: i64) -> Option<Auth
         return None;
     }
     Some(AuthCtx {
+        lead_confined: thegn_core::lead_confine::is_lead_label(&row.label),
         pairing_id: row.pairing_id,
         label: row.label,
         scopes: ScopeSet::parse(&row.scope),
@@ -348,6 +362,31 @@ mod tests {
                 .unwrap()
                 .is_none()
         );
+    }
+
+    #[test]
+    fn lead_confinement_comes_from_the_stored_label_and_the_listener_only() {
+        let db = Db::open_memory().unwrap();
+        let verified = |label: &str| {
+            let m = mint(
+                TokenKind::Control,
+                ScopeSet::parse("read,write"),
+                label,
+                None,
+                None,
+                1_000,
+            );
+            db.put_pairing(&m.row).unwrap();
+            verify(&db, &m.token, 2_000).expect("live token verifies")
+        };
+        assert!(verified("lead").lead_confined);
+        assert!(verified("lead:g/0").lead_confined);
+        assert!(!verified("phone").lead_confined);
+        assert!(!verified("lead-phone").lead_confined);
+        // The listener only ever tightens.
+        assert!(verified("phone").on_listener(true).lead_confined);
+        assert!(verified("lead:g/0").on_listener(false).lead_confined);
+        assert!(!AuthCtx::local_admin().lead_confined);
     }
 
     #[test]

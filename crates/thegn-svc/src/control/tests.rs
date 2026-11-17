@@ -263,6 +263,22 @@ impl ControlApi for FakeApi {
             })
         })
     }
+    fn open_confined(
+        &self,
+        _spec: OpenSpec,
+        caller: super::LeadCaller,
+    ) -> BoxFuture<'_, ControlResult<SessionInfo>> {
+        self.record(&format!("open_confined:{}", caller.label));
+        Box::pin(async {
+            Ok(SessionInfo {
+                id: "s2".into(),
+                program: "coder".into(),
+                rows: 24,
+                cols: 80,
+                ..Default::default()
+            })
+        })
+    }
     fn open(&self, _spec: OpenSpec) -> BoxFuture<'_, ControlResult<SessionInfo>> {
         self.record("open");
         Box::pin(async {
@@ -580,6 +596,7 @@ fn rig(local_admin: bool) -> Rig {
         server_label: "test thegn".into(),
         cors_origins: Vec::new(),
         event_streams: Default::default(),
+        lead_listener: false,
     };
     Rig { api, state, db }
 }
@@ -2003,6 +2020,7 @@ async fn pairing_lifecycle_publishes_feed_frames() {
         server_label: "test thegn".into(),
         cors_origins: Vec::new(),
         event_streams: Default::default(),
+        lead_listener: false,
     };
     let code = auth::mint(
         TokenKind::PairingCode,
@@ -3260,4 +3278,248 @@ async fn sandbox_profile_set_shape_is_strict_and_clearing_is_explicit() {
         StatusCode::OK
     );
     assert_eq!(r.api.calls(), ["sandbox_profile_set:/w:None"]);
+}
+
+// --- Lead confinement (`thegn_core::lead_confine`) ------------------------------
+
+const LEAD_LABEL: &str = "lead:g/0";
+
+async fn post_json(
+    rig: &Rig,
+    path: &str,
+    bearer: &str,
+    body: serde_json::Value,
+) -> (StatusCode, serde_json::Value) {
+    let request = Request::builder()
+        .method("POST")
+        .uri(path)
+        .header("authorization", format!("Bearer {bearer}"))
+        .header("content-type", "application/json")
+        .header("x-thegn-caller", "user")
+        .body(Body::from(body.to_string()))
+        .unwrap();
+    let response = router(rig.state.clone()).oneshot(request).await.unwrap();
+    let status = response.status();
+    let bytes = response.into_body().collect().await.unwrap().to_bytes();
+    let value = serde_json::from_slice(&bytes).unwrap_or(serde_json::Value::Null);
+    (status, value)
+}
+
+fn refusal_text(body: &serde_json::Value) -> String {
+    body["error"].as_str().unwrap_or_default().to_string()
+}
+
+fn agent_open_body() -> serde_json::Value {
+    serde_json::json!({
+        "argv": [],
+        "rows": 24,
+        "cols": 80,
+        "worktree": "/w/feature",
+        "agent": { "agent": "coder", "prompt": "review the diff" },
+    })
+}
+
+/// A Lead token asking `sessions.open` for a raw argv (or an env override) is
+/// refused at the transport with a `lead_confined` audit record, and the API
+/// is never called.
+#[tokio::test]
+async fn lead_confined_raw_open_is_refused_audited_and_never_dispatched() {
+    let captured = audit_capture::Captured::default();
+    let _guard = tracing::subscriber::set_default(audit_capture::AuditSubscriber(captured.clone()));
+    let r = rig(false);
+    let lead = token_with_label(&r, "read,write", LEAD_LABEL.to_string());
+
+    let (status, body) = post_json(
+        &r,
+        "/v1/sessions",
+        &lead,
+        serde_json::json!({"argv": ["/bin/sh", "-c", "id"], "rows": 24, "cols": 80}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    assert!(
+        refusal_text(&body).starts_with(thegn_core::lead_confine::REFUSAL_PREFIX),
+        "{body}"
+    );
+
+    let mut with_env = agent_open_body();
+    with_env["env"] = serde_json::json!([["LD_PRELOAD", "/tmp/x.so"]]);
+    let (status, _) = post_json(&r, "/v1/sessions", &lead, with_env).await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+
+    assert!(r.api.calls().is_empty(), "{:?}", r.api.calls());
+    let recs = captured.records();
+    let refused = recs
+        .iter()
+        .filter(|m| {
+            m.get("capability").map(String::as_str) == Some("sessions.open")
+                && m.get("outcome").map(String::as_str) == Some("lead_confined")
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(refused.len(), 2, "{recs:?}");
+    assert_eq!(
+        refused[0].get("label").map(String::as_str),
+        Some(LEAD_LABEL)
+    );
+}
+
+/// Regression guard: a non-Lead Write token still opens a raw argv through
+/// the ordinary path.
+#[tokio::test]
+async fn a_normal_write_token_still_opens_a_raw_argv() {
+    let r = rig(false);
+    let write = token(&r, "read,write");
+    let (status, _) = post_json(
+        &r,
+        "/v1/sessions",
+        &write,
+        serde_json::json!({"argv": ["/bin/sh"], "rows": 24, "cols": 80}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(r.api.calls(), ["open"]);
+}
+
+/// A configured agent in a worktree passes the transport and is routed to the
+/// daemon's confined open (which proves registration and the sandbox), never
+/// the unconfined one.
+#[tokio::test]
+async fn a_lead_agent_open_goes_through_the_confined_path() {
+    let r = rig(false);
+    let lead = token_with_label(&r, "read,write", LEAD_LABEL.to_string());
+    let (status, _) = post_json(&r, "/v1/sessions", &lead, agent_open_body()).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(r.api.calls(), [format!("open_confined:{LEAD_LABEL}")]);
+}
+
+/// Nothing in the request can lift the confinement: body fields and a
+/// caller header are ignored; only the stored label and the listener count.
+#[tokio::test]
+async fn the_confinement_cannot_be_dropped_by_the_request_body() {
+    let r = rig(false);
+    let lead = token_with_label(&r, "read,write", LEAD_LABEL.to_string());
+    let (status, _) = post_json(
+        &r,
+        "/v1/sessions",
+        &lead,
+        serde_json::json!({
+            "argv": ["/bin/sh"],
+            "rows": 24,
+            "cols": 80,
+            "lead_confined": false,
+            "label": "phone",
+            "caller": "user",
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    // The bare `wire --lead` label is confined too.
+    let bare = token_with_label(&r, "read,write", "lead".to_string());
+    let (status, _) = post_json(
+        &r,
+        "/v1/sessions",
+        &bare,
+        serde_json::json!({"argv": ["/bin/sh"], "rows": 24, "cols": 80}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    assert!(r.api.calls().is_empty(), "{:?}", r.api.calls());
+}
+
+/// Every caller on the Lead listener is confined, whatever its token's label.
+#[tokio::test]
+async fn the_lead_listener_confines_any_token() {
+    let mut r = rig(false);
+    r.state.lead_listener = true;
+    let write = token(&r, "read,write");
+    let (status, _) = post_json(
+        &r,
+        "/v1/sessions",
+        &write,
+        serde_json::json!({"argv": ["/bin/sh"], "rows": 24, "cols": 80}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    assert!(r.api.calls().is_empty());
+}
+
+/// Input, split, fork, host git and the sandbox-profile pin are refused for a
+/// Lead caller even when its scopes would allow them; reads still work.
+#[tokio::test]
+async fn lead_refused_verbs_never_reach_the_api() {
+    let r = rig(false);
+    let lead = token_with_label(&r, "read,write,git", LEAD_LABEL.to_string());
+    for path in [
+        "/v1/sessions/s1/input",
+        "/v1/sessions/s1/split",
+        "/v1/sessions/s1/resize",
+        "/v1/git/commit",
+        "/v1/git/stage",
+        "/v1/worktrees/open",
+    ] {
+        assert_eq!(
+            call(&r, "POST", path, Some(&lead)).await,
+            StatusCode::FORBIDDEN,
+            "{path}"
+        );
+    }
+    let (status, _) = post_json(
+        &r,
+        "/v1/sessions/fork",
+        &lead,
+        serde_json::json!({"session": "s1"}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    assert!(r.api.calls().is_empty(), "{:?}", r.api.calls());
+    assert_eq!(
+        call(&r, "GET", "/v1/sessions", Some(&lead)).await,
+        StatusCode::OK
+    );
+}
+
+/// `dispatches.put` from the Lead may record a row but never bind a session.
+#[tokio::test]
+async fn lead_dispatch_put_may_not_bind_a_session() {
+    let r = rig(false);
+    let lead = token_with_label(&r, "read,write", LEAD_LABEL.to_string());
+    let row = serde_json::json!({
+        "issue_id": "THE-1",
+        "worktree_path": "/w/feature",
+        "agent_name": "coder",
+        "session_id": "s9",
+    });
+    let (status, _) = post_json(&r, "/v1/dispatches", &lead, row).await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    assert!(r.api.calls().is_empty());
+    let unbound = serde_json::json!({
+        "issue_id": "THE-1",
+        "worktree_path": "/w/feature",
+        "agent_name": "coder",
+    });
+    let (status, _) = post_json(&r, "/v1/dispatches", &lead, unbound).await;
+    assert_ne!(status, StatusCode::FORBIDDEN);
+    assert_eq!(r.api.calls(), ["dispatch_put:THE-1:/w/feature:coder:None"]);
+}
+
+/// An API impl that cannot prove a Lead worker's sandbox launches nothing.
+#[tokio::test]
+async fn the_default_confined_open_fails_closed() {
+    let api = PluginsStatusApi {
+        reply: super::PluginsStatusReply::default(),
+        calls: std::sync::atomic::AtomicUsize::new(0),
+    };
+    let caller = super::LeadCaller {
+        pairing_id: "p".into(),
+        label: LEAD_LABEL.into(),
+    };
+    let err = api
+        .open_confined(OpenSpec::default(), caller)
+        .await
+        .unwrap_err();
+    assert!(matches!(err, super::ControlError::FailedPrecondition(_)));
+    assert!(
+        err.to_string()
+            .contains(thegn_core::lead_confine::REFUSAL_PREFIX)
+    );
 }
