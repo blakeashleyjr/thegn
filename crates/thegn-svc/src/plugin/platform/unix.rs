@@ -359,7 +359,10 @@ impl Prepared {
             let fd = unsafe { libc::syscall(libc::SYS_pidfd_open, child.id(), 0) };
             if fd >= 0 {
                 let owned = unsafe { OwnedFd::from_raw_fd(fd as std::os::fd::RawFd) };
-                match tokio::io::unix::AsyncFd::new(owned) {
+                // SAFETY: `owned` is the pidfd just opened above; it moves into the
+                // AsyncFd and nothing else closes or replaces it.
+                match unsafe { tokio::io::unix::AsyncFd::register(owned) }.map_err(io::Error::from)
+                {
                     Ok(fd) => notice = ExitNotice::Pid(fd),
                     Err(error) => errors.push(format!("pidfd readiness setup: {error}")),
                 }
