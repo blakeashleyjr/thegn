@@ -215,6 +215,10 @@ supervisor greps a fixed column instead of parsing the whole line;
 lost its remote exec connection (for example the sprite suspended) shows
 `cause:remote-exec-lost`; the session reattaches after a dropped connection.
 
+When the daemon reports it, a trailing `output:<age>` field (`5s`, `3m`, `2h`,
+`1d`) says how long ago the session last produced PTY output — for exited
+rows too — and `--json` gains `last_output_unix_secs`. Old daemons omit it.
+
 `session open --stage <name> --issue <id>` is the pipeline's one-call
 dispatch: it renders the stage's prompt template, inserts the roster row,
 opens the session headless, and stamps the row with the session id and the
