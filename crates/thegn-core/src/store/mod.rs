@@ -30,6 +30,7 @@
 
 mod account;
 mod automation;
+mod automation_rule;
 mod autopilot;
 mod cache;
 mod calendar;
@@ -61,6 +62,7 @@ pub use account::AccountStore;
 pub use automation::{
     AutomationAdmission, AutomationRunRow, AutomationStateRow, AutomationStore, NewAutomationRun,
 };
+pub use automation_rule::{AutomationRuleStore, LeadRuleLimitReached, LeadRuleRow};
 pub use autopilot::{AutopilotStore, ClaimOutcome};
 pub use cache::CacheStore;
 pub use calendar::{

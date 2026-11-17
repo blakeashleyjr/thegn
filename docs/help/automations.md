@@ -39,3 +39,39 @@ Event enrichment matches the registered worktree by exact path, then by
 resolved filesystem identity, so a symlinked path or one with `.`/`..`
 components enriches the same way. If that alias matches worktrees in more than
 one repository, the repo, branch and workspace are left empty.
+
+## Rules written by the Lead
+
+The Lead can author its own automation rules through the `automations.put`,
+`automations.rm`, `automations.enable` and `automations.runs` verbs (also
+`thegn api call automations.put '{"rule":{…}}'`). The rule body is the same
+shape as an `[[automations.rules]]` table and goes through the same validator.
+Action parameters may also be nested as `then.params`. Unknown fields are
+refused rather than ignored.
+
+These rules are deliberately weaker than config rules:
+
+- The id is always `lead:<name>`, where the name is 1 to 48 characters of
+  `a-z`, `0-9`, `_` and `-`. A name that matches a config rule is refused.
+- The rule may only `notify.push` or `sessions.open`. A rule that uses
+  `merge.add` or `tools.run` is refused when it is written. It is also skipped
+  every time rules are evaluated, so a row written straight into the database
+  cannot escalate. Approval-gated escalation comes in a later release.
+- `max_per_hour` and `max_action_per_hour` are capped at the config defaults.
+- Removing a rule and writing it again keeps its throttle state and audit
+  history.
+- At most 500 Lead rules can be stored.
+
+Config rules stay read-only: `automations.rm` and `automations.enable` on a
+config rule name answer a conflict. `thegn api call automations.list` shows Lead
+rules after the config rules with the trusted layer `lead`, and the reply to
+`automations.put` says why a stored rule will not fire yet (`inert_reason`):
+
+- automations are disabled;
+- the runtime is not armed (no config rules and no `[lead]` section);
+- the rule is a `worktree_idle` rule (these arm in a later release);
+- the rule is disabled.
+
+`thegn api call automations.test` dry-runs a Lead rule by name. `thegn
+automations test` and `thegn automations list` read config only.
+`automations.runs` returns the newest audited runs, up to 200.

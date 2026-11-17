@@ -18,6 +18,7 @@ All notable changes to **thegn** are documented here. The format follows
 - `[metrics]` edits apply live: targets restart on save, with no thegn restart. (THE-2024)
 - `[monitor]` `window_ladder`, `default_window`, `default_style` and `default_scale` apply to the next monitor open after a save. (THE-2024)
 - Home Manager options for `[weather]` (except the API key) and `limits.test_nice`. (THE-428)
+- The Lead can write its own automation rules with `automations.put`, `automations.rm`, `automations.enable` and `automations.runs`. These rules may only notify or open a session; `merge.add` and `tools.run` are refused when the rule is written and again when it is evaluated. Config rules stay read-only. The local database migrates forward to schema version 111; restart the daemon after upgrading. (THE-2181)
 
 ### Changed
 
