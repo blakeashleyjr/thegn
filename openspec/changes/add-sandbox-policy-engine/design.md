@@ -1,84 +1,83 @@
 # Design
 
+## Two decision points
+
+1. **`tools.run`.** The catalog row `tools.run` (`capability::CATALOG`) is the one
+   door through which automations, MCP and the control API start a configured
+   tool. The policy is evaluated in the executor behind that row, before any
+   process is created.
+2. **Launch admission.** `sandbox_admission::admit_launch` (planned by WS02-P5-08;
+   today's type is `Admission` in `thegn-host/src/sandbox_admission.rs`) is the
+   handle every launch route passes through. The policy is evaluated before the
+   handle is minted, so a refused launch never reaches a spawn helper.
+
+Both points call the same pure function, so a tool started through `tools.run`
+and a pane launched by a route are judged by one rule set.
+
 ## The decision (pure, core)
 
-`policy::decide(op, cfg, ctx) -> PolicyDecision` where:
+`thegn-core` gains a substrate-free module (planned `op_policy.rs`):
 
-- `Operation { kind: Read | Write | Delete | Shell, path: Option<PathBuf>,
-command: Option<String> }`
-- `PolicyDecision { Allow, Deny { reason }, Ask { prompt } }`
-- `PolicyCtx { worktree_root: PathBuf }` — so rules can express "under the
-  worktree" relative to the active root.
+- `OpContext` carries only bounded facts: the tool name, the argv shape (program
+  and argument count and flags, not secret values), worktree-relative paths, the
+  resolved profile, the placement, and the `LaunchClass` (alignment T1).
+- `OpDecision` is `Allow`, `Deny { rule }` or `Ask { rule }`; a decision always
+  names the rule that produced it so a refusal can say why.
+- Evaluation: hard denies first; then the rules in order, first match wins; then
+  the configured default. A rule matches when every selector it carries matches.
 
-Evaluation: walk `cfg.rules` in order; a rule matches when every present selector
-matches (`ops` subset, `path` glob — evaluated relative to `worktree_root` for
-`under`/`outside` helpers, `command` regex). First match wins; its action is the
-decision. A rule marked `stop` short-circuits. No match → the configured
-`default` (recommended `ask` for writes/shell, `allow` for reads under the
-worktree). All pure and **unit-tested** to the 95% core gate.
+The function does no I/O. It is unit-tested to the core coverage gate.
 
-Built-in hard denies (always evaluated first, not overridable by user allow):
-writes/deletes to `.git/config`, `~/.ssh`, `~/.gnupg`, and the configured secret
-paths — mirrors the "shared .git/config is read-only in the sandbox" invariant
-already in the sandbox spec.
+## Hard denies
 
-## Config (thegn-core, config.rs)
+The hard denies are writes to git configuration, SSH and GPG material, and the
+canonical secret paths. They are **the same list the sandbox already enforces**
+(the sealed-home deny list and the git-config list), shared by reference rather
+than copied, so the two cannot drift. A user allow rule, a profile and a
+repository overlay cannot lift a hard deny.
 
-```toml
-[policy]
-default_read  = "allow"   # under the worktree
-default_write = "ask"
-default_shell = "ask"
+## Rules and trust
 
-[[policy.rules]]
-ops  = ["read"]
-path = "under:."          # worktree-relative
-action = "allow"
+- The rule table (planned `[[sandbox.policy]]`) is user config only.
+- A repository overlay (`.thegn.*`) may add `deny` rules and nothing else. It can
+  never allow, and it cannot turn a deny into an ask.
+- "Always allow" and "always deny" choices persist to a trusted user overlay file.
+  A persisted choice cannot widen an outer ceiling (the class default or the
+  sandbox floor); it is ignored where it would.
+- An empty policy, and an absent file, mean today's behaviour: every launch and
+  every `tools.run` call is decided exactly as before.
 
-[[policy.rules]]
-ops  = ["write", "delete"]
-path = "outside:."
-action = "deny"
+## `ask` by caller
 
-[[policy.rules]]
-ops  = ["shell"]
-command = "^(rm -rf /|curl .*\\| ?sh)"
-action = "deny"
-```
-
-`PolicyConfig` uses `serde(default)` (existing configs keep working; empty policy
-= today's behavior via the defaults). `PolicyAction` (`Allow|Deny|Ask`) uses
-`config_enum!`. Layerable per the standard precedence (global → profile →
-workspace → repo) following `effective_keybinds` / `repo_sandbox`.
-
-## Enforcement seam (host / bouncer)
-
-The bouncer's tool broker (`[llm_proxy].bouncer`) already services `fs/read`,
-`thegn/edit`+`write`, and `terminal/create` over unix-socket ACP with an
-approval step. Insert `policy::decide` **before** servicing each brokered op:
-
-- `Allow` → service it (no prompt).
-- `Deny` → refuse with the reason (maps to ACP `reject_once`), surfaced inline.
-- `Ask` → raise the **existing** ACP permission overlay (R 232). An
-  `allow_always` / `reject_always` choice appends a corresponding rule to a policy
-  overlay so the next identical op is decided without a prompt.
+- `InteractiveOwner` launches: `ask` resolves through the TUI status prompt.
+- Headless callers (automations, MCP, the control API, queue and CI launches):
+  `ask` is a typed refusal with the planned id `policy-ask-headless`. It never
+  blocks, because there is nobody to answer.
 
 ## Invariants
 
-- **Event loop**: `decide` is pure and cheap; it runs on the broker's off-loop
-  task, not the render loop. `Ask` raises the overlay via the existing
-  permission-request path (channel + `TerminalWaker`). No new timer.
-- **Render**: the permission overlay is existing chrome (a `Full`/overlay frame);
-  `Allow`/`Deny` decisions render nothing new. render_plan invariants unchanged.
-- **State**: no `user_version` bump. Persisted `always` choices append to config /
-  a policy overlay file, not a DB table.
-- **Additivity + safety floor**: the container/bouncer isolation is unchanged and
-  remains the hard boundary; policy only _narrows_ what a brokered op may do. An
-  empty `[policy]` reproduces today's behavior.
+- **Event loop.** `decide` is pure and cheap. It runs where the call is made
+  (the `tools.run` executor, the launch path), never on the render loop, and adds
+  no timer, thread or wake source. The status prompt for an interactive `ask`
+  uses the existing status path (channel plus waker).
+- **Render.** No new chrome beyond the existing status prompt; render-plan
+  invariants are unchanged.
+- **State.** No schema change and no `user_version` bump.
+- **Fail closed.** A refusal happens before any process exists. A policy that
+  cannot be read refuses the operation it would have governed rather than
+  allowing it.
+
+## Naming caveat
+
+`LaunchAdmission` and `admit_launch` are created by WS02-P5-08 (W3). Until then
+the live type is `Admission`; this design describes `admit_launch` as the planned
+seam, not as current behaviour.
 
 ## Alternatives considered
 
-- **Bake policy into seccomp/bwrap profiles** — too coarse and per-backend; the
-  broker seam is where thegn already mediates file/shell ops uniformly.
-- **Prompt on everything (status quo)** — high friction; the whole point is to
-  auto-allow the safe common case and reserve prompts for genuinely risky ops.
+- **Bake the policy into backend profiles.** Too coarse and per backend; the two
+  decision points above are where thegn already mediates every start uniformly.
+- **Prompt on everything.** High friction; the point is to auto-allow the safe
+  common case and reserve prompts for risky operations.
+- **Let repositories allow operations.** Rejected: a repository is the least
+  trusted author, so it may only tighten.
