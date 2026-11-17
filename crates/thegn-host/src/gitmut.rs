@@ -33,6 +33,31 @@ pub enum StageTarget {
     Staged,
 }
 
+/// What a stash push takes from the working tree.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum StashMode {
+    /// Everything, untracked included (`git stash push -u`).
+    #[default]
+    All,
+    /// Only the index (`git stash push --staged`, git >= 2.35; svc probes
+    /// the version and refuses older gits with a clear error).
+    Staged,
+    /// Only the unstaged and untracked changes; the index survives (svc's
+    /// temp-commit sequence under the mutation lock).
+    Unstaged,
+}
+
+impl StashMode {
+    /// The in-flight status label for a stash push in this mode.
+    pub fn label(self) -> &'static str {
+        match self {
+            StashMode::All => "stashing",
+            StashMode::Staged => "stashing staged",
+            StashMode::Unstaged => "stashing unstaged",
+        }
+    }
+}
+
 /// A git write, fully self-contained (diff text and selections are captured
 /// at dispatch time so the blocking thread never touches UI state).
 #[derive(Debug, Clone)]
@@ -184,6 +209,7 @@ pub enum GitOp {
     // stash
     StashPush {
         message: String,
+        mode: StashMode,
     },
     StashApply {
         sha: String,
@@ -295,7 +321,7 @@ impl GitOp {
             GitOp::Pull => "pulling",
             GitOp::Fetch => "fetching",
             GitOp::Nuke => "nuking working tree",
-            GitOp::StashPush { .. } => "stashing",
+            GitOp::StashPush { mode, .. } => mode.label(),
             GitOp::StashApply { .. } => "applying stash",
             GitOp::StashPop { .. } => "popping stash",
             GitOp::StashDrop { .. } => "dropping stash",
@@ -758,7 +784,13 @@ fn execute_at_with_db(
         GitOp::Pull => done(g.pull(loc)),
         GitOp::Fetch => done(g.fetch(loc)),
         GitOp::Nuke => done(g.nuke_working_tree(loc)),
-        GitOp::StashPush { message } => done(g.stash_push(loc, &message, true)),
+        // Every mode runs through svc's StashOps (its mutation lock and, for
+        // `--staged`, its git-version gate).
+        GitOp::StashPush { message, mode } => done(match mode {
+            StashMode::All => g.stash_push(loc, &message, true),
+            StashMode::Staged => g.stash_staged(loc, &message),
+            StashMode::Unstaged => g.stash_unstaged(loc, &message),
+        }),
         GitOp::StashApply { sha } => done(g.stash_apply(loc, &sha)),
         GitOp::StashPop { sha } => done(g.stash_pop(loc, &sha)),
         GitOp::StashDrop { sha } => done(g.stash_drop(loc, &sha)),
@@ -1443,6 +1475,93 @@ mod tests {
     }
 
     #[test]
+    fn stash_push_labels_name_the_mode() {
+        let label = |mode| {
+            GitOp::StashPush {
+                message: "m".into(),
+                mode,
+            }
+            .label()
+        };
+        assert_eq!(label(StashMode::All), "stashing");
+        assert_eq!(label(StashMode::Staged), "stashing staged");
+        assert_eq!(label(StashMode::Unstaged), "stashing unstaged");
+        assert_eq!(StashMode::default(), StashMode::All);
+    }
+
+    /// `a.txt` staged, `f.txt` modified but unstaged.
+    fn stash_fixture(tag: &str) -> std::path::PathBuf {
+        let dir = tmp_repo(tag);
+        std::fs::write(dir.join("a.txt"), "staged\n").unwrap();
+        git_out(&dir, &["add", "a.txt"]);
+        std::fs::write(dir.join("f.txt"), "unstaged\n").unwrap();
+        dir
+    }
+
+    #[test]
+    fn stash_push_unstaged_mode_keeps_the_index() {
+        let dir = stash_fixture("stash-unstaged");
+        let loc = GitLoc::Local(dir.clone());
+        let op = GitOp::StashPush {
+            message: "wip".into(),
+            mode: StashMode::Unstaged,
+        };
+        match execute(op, &loc, false) {
+            GitOpResult::Ok(_) => {}
+            other => panic!("{other:?}"),
+        }
+        assert_eq!(git_out(&dir, &["diff", "--cached", "--name-only"]), "a.txt");
+        assert_eq!(std::fs::read_to_string(dir.join("f.txt")).unwrap(), "one\n");
+        let patch = git_out(&dir, &["stash", "show", "-p", "stash@{0}"]);
+        assert!(patch.contains("f.txt"), "{patch}");
+        assert!(!patch.contains("a.txt"), "{patch}");
+        let _ = std::fs::remove_dir_all(&dir); // best-effort: cleanup: the target may already be gone; a failed removal never fails the caller
+    }
+
+    #[test]
+    fn stash_push_staged_mode_takes_only_the_index() {
+        let dir = stash_fixture("stash-staged");
+        let loc = GitLoc::Local(dir.clone());
+        let op = GitOp::StashPush {
+            message: "wip".into(),
+            mode: StashMode::Staged,
+        };
+        match execute(op, &loc, false) {
+            GitOpResult::Ok(_) => {
+                assert!(git_out(&dir, &["diff", "--cached", "--name-only"]).is_empty());
+                assert_eq!(
+                    std::fs::read_to_string(dir.join("f.txt")).unwrap(),
+                    "unstaged\n",
+                    "the unstaged change stays put"
+                );
+                let patch = git_out(&dir, &["stash", "show", "-p", "stash@{0}"]);
+                assert!(patch.contains("a.txt"), "{patch}");
+                assert!(!patch.contains("f.txt"), "{patch}");
+            }
+            // An old git: svc's version gate refuses with a clear error.
+            GitOpResult::Err(message) => assert!(message.contains("2.35"), "{message}"),
+            other => panic!("{other:?}"),
+        }
+        let _ = std::fs::remove_dir_all(&dir); // best-effort: cleanup: the target may already be gone; a failed removal never fails the caller
+    }
+
+    #[test]
+    fn stash_push_all_mode_takes_everything() {
+        let dir = stash_fixture("stash-all");
+        let loc = GitLoc::Local(dir.clone());
+        let op = GitOp::StashPush {
+            message: "wip".into(),
+            mode: StashMode::All,
+        };
+        match execute(op, &loc, false) {
+            GitOpResult::Ok(_) => {}
+            other => panic!("{other:?}"),
+        }
+        assert!(git_out(&dir, &["status", "--porcelain"]).is_empty());
+        let _ = std::fs::remove_dir_all(&dir); // best-effort: cleanup: the target may already be gone; a failed removal never fails the caller
+    }
+
+    #[test]
     fn labels_exist_for_every_op_shape() {
         assert_eq!(GitOp::StageAll.label(), "staging all");
         assert_eq!(
@@ -1466,12 +1585,14 @@ mod tests {
             }
             .touches_remote()
         );
-        assert!(
-            !GitOp::StashPush {
-                message: String::new()
-            }
-            .touches_remote()
-        );
+        for mode in [StashMode::All, StashMode::Staged, StashMode::Unstaged] {
+            let op = GitOp::StashPush {
+                message: String::new(),
+                mode,
+            };
+            assert!(!op.touches_remote(), "{mode:?}");
+            assert!(!op.rewrites_history(), "{mode:?}");
+        }
         assert!(GitOp::AmendHead.rewrites_history());
         assert!(
             !GitOp::Commit {
