@@ -90,10 +90,10 @@ pub fn run(cfg: &Config, id: &str, cmd: &[String]) -> Result<()> {
     let env = exec_env(|key| std::env::var(key).ok());
     if std::io::stdin().is_terminal() {
         let code = run_tty(Arc::new(provider), id, argv, env)?;
-        std::process::exit(code);
+        std::process::exit(host_exit_code(code));
     }
     let code = run_capture(&provider, id, &argv, &env)?;
-    std::process::exit(code);
+    std::process::exit(host_exit_code(code));
 }
 
 // ---------------------------------------------------------------------------
@@ -122,7 +122,18 @@ pub(crate) fn needs_resume(status: SessionStatus) -> bool {
     !matches!(status, SessionStatus::Running | SessionStatus::Pending)
 }
 
+/// A remote exit code as a host exit status: 0..=255 pass through; anything
+/// else (a negative or out-of-range value) is the unknown sentinel, never 0.
+pub(crate) fn host_exit_code(code: i32) -> i32 {
+    if (0..=255).contains(&code) {
+        code
+    } else {
+        thegn_svc::provider::EXEC_EXIT_STATUS_UNKNOWN
+    }
+}
+
 /// The keep-alive due calculation: the core policy's next extension.
+#[cfg(test)]
 pub(crate) fn keep_alive_due(
     now_ms: i64,
     expires_at_ms: i64,
@@ -645,6 +656,16 @@ mod tests {
         ] {
             assert!(needs_resume(status), "{status:?}");
         }
+    }
+
+    #[test]
+    fn host_exit_code_never_maps_out_of_range_to_success() {
+        use thegn_svc::provider::EXEC_EXIT_STATUS_UNKNOWN;
+        assert_eq!(host_exit_code(0), 0);
+        assert_eq!(host_exit_code(255), 255);
+        assert_eq!(host_exit_code(256), EXEC_EXIT_STATUS_UNKNOWN);
+        assert_eq!(host_exit_code(-1), EXEC_EXIT_STATUS_UNKNOWN);
+        assert_eq!(host_exit_code(i32::MIN), EXEC_EXIT_STATUS_UNKNOWN);
     }
 
     #[test]
