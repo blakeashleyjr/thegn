@@ -2,10 +2,13 @@
 //! the matched issue (THE-2193 / THE-2195, b153 lane 5).
 //!
 //! A rule-only action (`automation::RULE_ONLY_ACTIONS`). The effective
-//! autonomy rides on the planned action: `propose` raises an approval and
-//! starts nothing; `review`/`merge` start the first stage and record the
-//! ceiling on the dispatch row (`set_dispatch_autonomy`), which the stage
-//! executor enforces at land.
+//! autonomy rides on the planned action: `propose` stores an
+//! `automation_proposals` row and raises an approval bound to its digest
+//! (b155) and starts nothing; `review`/`merge` start the first stage and
+//! record the ceiling and the rule on the dispatch row
+//! (`set_dispatch_automation`), which budgets and the stage executor's land
+//! rule read. An approved proposal starts through the same [`start_stage`]
+//! at `review` (`automation_proposal::on_approved`).
 //!
 //! Trust boundary: the event's issue facts are tracker data. Only the issue
 //! id is used, and only after re-validation; it never chooses the repo (that
@@ -155,12 +158,28 @@ pub(crate) async fn start(
 
     match plan_start(action.autonomy, true, autopilot_live) {
         StartPlan::Refuse(reason) => anyhow::bail!("{reason}"),
-        StartPlan::Propose => propose(cfg, action, &repo_root, &issue_id, &stage).await,
+        StartPlan::Propose => {
+            propose(
+                cfg,
+                &action.rule_id,
+                ProposalTarget {
+                    repo_root: &repo_root,
+                    issue_id: &issue_id,
+                    provider: &facts.provider,
+                    account: &facts.account,
+                    stage: &stage,
+                },
+            )
+            .await
+        }
         StartPlan::Start => {
             start_stage(
                 cfg,
-                action,
-                origin,
+                StartAs {
+                    autonomy: action.autonomy,
+                    rule_id: action.rule_id.clone(),
+                    origin,
+                },
                 StartTarget {
                     repo_root,
                     issue_id,
@@ -174,16 +193,33 @@ pub(crate) async fn start(
 }
 
 /// The validated inputs of a `review`/`merge` start.
-struct StartTarget {
-    repo_root: String,
-    issue_id: String,
-    stage: String,
-    linked: Option<String>,
+pub(crate) struct StartTarget {
+    pub(crate) repo_root: String,
+    pub(crate) issue_id: String,
+    pub(crate) stage: String,
+    pub(crate) linked: Option<String>,
+}
+
+/// How a start is recorded: the autonomy ceiling and rule written on the
+/// dispatch row, and the automation origin the session carries.
+pub(crate) struct StartAs {
+    pub(crate) autonomy: Autonomy,
+    pub(crate) rule_id: String,
+    pub(crate) origin: thegn_svc::control::AutomationOrigin,
+}
+
+/// The validated inputs of a `propose`.
+struct ProposalTarget<'a> {
+    repo_root: &'a str,
+    issue_id: &'a str,
+    provider: &'a str,
+    account: &'a str,
+    stage: &'a str,
 }
 
 /// The registered workspace root `repo` names. The returned path is the DB's,
 /// never the event's string; a non-git (`dir`) workspace is refused.
-fn registered_repo_root(db: &thegn_core::db::Db, repo: &str) -> Result<String> {
+pub(crate) fn registered_repo_root(db: &thegn_core::db::Db, repo: &str) -> Result<String> {
     use thegn_core::store::WorkspaceStore;
     // best-effort: an unresolvable path simply matches no registered workspace.
     let canonical = std::fs::canonicalize(repo);
@@ -204,7 +240,7 @@ fn registered_repo_root(db: &thegn_core::db::Db, repo: &str) -> Result<String> {
 
 /// Whether a non-terminal autopilot run holds this issue in any registered
 /// repo (the autopilot claim is global: `UNIQUE(provider, account, issue_id)`).
-fn autopilot_owns(
+pub(crate) fn autopilot_owns(
     db: &thegn_core::db::Db,
     key: &thegn_core::autopilot::AutopilotIssueKey,
 ) -> Result<bool> {
@@ -233,7 +269,7 @@ fn autopilot_run_matches(
 
 /// A registered worktree of `repo_root` already linked to the issue (newest
 /// link first) that still exists on disk.
-fn linked_worktree(
+pub(crate) fn linked_worktree(
     db: &thegn_core::db::Db,
     repo_root: &str,
     issue_id: &str,
@@ -256,19 +292,57 @@ fn linked_worktree(
     Ok(None)
 }
 
-/// `propose`: resolve the base branch HEAD and raise an approval request.
-/// Creates no worktree and spawns nothing.
-async fn propose(
-    cfg: Arc<Config>,
-    action: &PlannedAction,
-    repo_root: &str,
-    issue_id: &str,
-    stage: &str,
-) -> Result<()> {
-    let root = repo_root.to_string();
-    let commit_sha =
+/// How long a proposal waits for the owner.
+pub(crate) const PROPOSAL_TTL_MS: i64 = 7 * 24 * 60 * 60 * 1000;
+
+/// The pending proposal row for a `propose` start (approval triple filled
+/// from its digest; `proposal_ids` reads only the trusted fields).
+fn proposal_row(
+    rule_id: &str,
+    t: &ProposalTarget<'_>,
+    base_sha: &str,
+    now_ms: i64,
+) -> thegn_core::db_approval_effects::ProposalRow {
+    let mut row = thegn_core::db_approval_effects::ProposalRow {
+        id: 0,
+        approval_issue: String::new(),
+        approval_stage: String::new(),
+        approval_sha: String::new(),
+        rule_id: rule_id.to_string(),
+        repo_root: t.repo_root.to_string(),
+        issue_id: t.issue_id.to_string(),
+        provider: t.provider.to_string(),
+        account: t.account.to_string(),
+        stage: t.stage.to_string(),
+        base_sha: base_sha.to_string(),
+        created_at_ms: now_ms,
+        expires_at_ms: now_ms.saturating_add(PROPOSAL_TTL_MS),
+        state: "pending".into(),
+    };
+    let (issue, stage, sha) = thegn_core::approval_digest::proposal_ids(&row);
+    row.approval_issue = issue;
+    row.approval_stage = stage;
+    row.approval_sha = sha;
+    row
+}
+
+/// `propose`: resolve the base branch HEAD, store the proposal, and raise an
+/// approval bound to its digest. Creates no worktree and spawns nothing.
+async fn propose(cfg: Arc<Config>, rule_id: &str, t: ProposalTarget<'_>) -> Result<()> {
+    let root = t.repo_root.to_string();
+    let base_sha =
         tokio::task::spawn_blocking(move || base_head_sha(&cfg, Path::new(&root))).await??;
-    let body = proposal_body(&action.rule_id, issue_id, stage, &commit_sha)?;
+    let row = proposal_row(rule_id, &t, &base_sha, thegn_core::util::now_ms());
+    let body = proposal_body(
+        rule_id,
+        &row.approval_issue,
+        &row.approval_stage,
+        &row.approval_sha,
+    )?;
+    tokio::task::spawn_blocking(move || -> Result<bool> {
+        thegn_core::db::Db::open()?.put_proposal(&row)
+    })
+    .await??;
     crate::automation_executor::client()
         .await?
         .call_raw("POST", "/v1/approvals/request", Some(body))
@@ -285,7 +359,10 @@ fn proposal_body(
     commit_sha: &str,
 ) -> Result<serde_json::Value> {
     use thegn_core::approval_request::{ApprovalRequest, MAX_REASON, validate_request};
-    let reason: String = format!("automation {rule_id} proposes starting {stage}")
+    let start = stage
+        .strip_prefix(thegn_core::approval_digest::PROPOSAL_STAGE_PREFIX)
+        .unwrap_or(stage);
+    let reason: String = format!("automation {rule_id} proposes starting {start}")
         .chars()
         .filter(|c| !c.is_control())
         .take(MAX_REASON)
@@ -335,13 +412,14 @@ fn is_hex_sha(s: &str) -> bool {
 }
 
 /// `review`/`merge`: the issue's worktree, the sandbox floor, the dispatch,
-/// then the recorded autonomy ceiling.
-async fn start_stage(
-    cfg: Arc<Config>,
-    action: &PlannedAction,
-    origin: thegn_svc::control::AutomationOrigin,
-    target: StartTarget,
-) -> Result<()> {
+/// then the recorded autonomy ceiling and rule. The one launch site for an
+/// automation-started lane (a rule, or an approved proposal at `review`).
+pub(crate) async fn start_stage(cfg: Arc<Config>, how: StartAs, target: StartTarget) -> Result<()> {
+    let StartAs {
+        autonomy,
+        rule_id,
+        origin,
+    } = how;
     let StartTarget {
         repo_root,
         issue_id,
@@ -425,10 +503,10 @@ async fn start_stage(
     .await??;
 
     let row_id = opened.row_id;
-    let autonomy = action.autonomy.as_str();
+    let autonomy = autonomy.as_str();
     let recorded = tokio::task::spawn_blocking(move || -> Result<bool> {
         use thegn_core::store::NotificationStore;
-        thegn_core::db::Db::open()?.set_dispatch_autonomy(row_id, autonomy)
+        thegn_core::db::Db::open()?.set_dispatch_automation(row_id, autonomy, &rule_id)
     })
     .await;
     // The dispatch row and its session exist; a failed ceiling write is
@@ -616,6 +694,44 @@ mod tests {
                 assert!(!err.contains(hostile), "error echoed the input: {err}");
             }
         }
+    }
+
+    #[test]
+    fn proposal_row_binds_the_approval_to_its_digest() {
+        let t = ProposalTarget {
+            repo_root: "/repo",
+            issue_id: "linear:THE-7",
+            provider: "linear",
+            account: "work",
+            stage: "plan",
+        };
+        let row = proposal_row("triage", &t, &"c".repeat(40), 1_000);
+        assert_eq!(row.approval_issue, "linear:THE-7");
+        assert_eq!(row.approval_stage, "start.plan");
+        assert_eq!(
+            (
+                row.approval_issue.clone(),
+                row.approval_stage.clone(),
+                row.approval_sha.clone()
+            ),
+            thegn_core::approval_digest::proposal_ids(&row)
+        );
+        assert_eq!(row.state, "pending");
+        assert_eq!(row.expires_at_ms, 1_000 + PROPOSAL_TTL_MS);
+        // The request built from it passes the daemon's own validation.
+        let body = proposal_body(
+            "triage",
+            &row.approval_issue,
+            &row.approval_stage,
+            &row.approval_sha,
+        )
+        .unwrap();
+        assert_eq!(body["stage"], "start.plan");
+        assert_eq!(body["commit_sha"], row.approval_sha.as_str());
+        assert_eq!(body["reason"], "automation triage proposes starting plan");
+        // A different base commit is a different approval.
+        let other = proposal_row("triage", &t, &"d".repeat(40), 1_000);
+        assert_ne!(other.approval_sha, row.approval_sha);
     }
 
     #[test]
