@@ -1124,6 +1124,9 @@ fn nix_install_script(
     }
     // Readiness wait (sudo + DNS + real egress) shared by both installers; the
     // sprite user has passwordless sudo and the installer creates /nix via sudo.
+    // When we run as root with no sudo (fly), `prep_nix_root` creates `/nix`
+    // (root-owned, 0755) itself, so the installer skips its own `sudo mkdir`
+    // (THE-2053). It acts only when uid is 0 and `/nix` is missing.
     // `claim_egress`: DNS alone is a FALSE ready-signal on a cold Fly microVM — the
     // local resolver answers `getent` seconds before outbound TCP/TLS to the CDN is
     // actually up, so the install fires into a dead network and `curl -fsSL` (silent)
@@ -1192,11 +1195,14 @@ fn nix_install_script(
         "claim_store() {{ if [ \"$(id -u)\" != 0 ] && [ -d /nix/var/nix/db ] && [ \"$(stat -c %u /nix/var/nix/db 2>/dev/null)\" != \"$(id -u)\" ] && [ ! -S /nix/var/nix/daemon-socket/socket ] && command -v sudo >/dev/null 2>&1 && sudo -n true 2>/dev/null; then sudo chown -R \"$(id -u):$(id -g)\" /nix 2>/dev/null || true; fi; }}; \
          ensure_tools() {{ miss=; for t in xz tar curl; do command -v \"$t\" >/dev/null 2>&1 || miss=\"$miss $t\"; done; [ -z \"$miss\" ] && return 0; echo \"nix: installing missing prerequisites:$miss\"; if command -v sudo >/dev/null 2>&1 && sudo -n true 2>/dev/null; then S='sudo -n'; else S=; fi; if command -v apt-get >/dev/null 2>&1; then $S apt-get update -y && $S apt-get install -y xz-utils tar curl ca-certificates; elif command -v apk >/dev/null 2>&1; then $S apk add --no-cache xz tar curl ca-certificates; elif command -v dnf >/dev/null 2>&1; then $S dnf install -y xz tar curl ca-certificates; elif command -v yum >/dev/null 2>&1; then $S yum install -y xz tar curl ca-certificates; fi; miss=; for t in xz tar curl; do command -v \"$t\" >/dev/null 2>&1 || miss=\"$miss $t\"; done; [ -z \"$miss\" ] && return 0; echo \"nix: prerequisites still missing:$miss (no usable package manager or no root/sudo)\"; return 1; }}; \
          do_install() {{ {install}; [ -r \"$HOME/.nix-profile/etc/profile.d/nix.sh\" ] && . \"$HOME/.nix-profile/etc/profile.d/nix.sh\" 2>/dev/null || true; [ -r /nix/var/nix/profiles/default/etc/profile.d/nix-daemon.sh ] && . /nix/var/nix/profiles/default/etc/profile.d/nix-daemon.sh 2>/dev/null || true; export PATH=\"$HOME/.nix-profile/bin:/nix/var/nix/profiles/default/bin:$PATH\"; claim_store; command -v nix >/dev/null 2>&1; }}; \
+         prep_nix_root() {{ [ -e /nix ] && return 0; [ \"$(id -u)\" = 0 ] || return 0; mkdir -m 0755 /nix && chown 0:0 /nix; }}; \
          export HOME=${{HOME:-/root}}; \
+         export USER=${{USER:-$(id -un 2>/dev/null || echo root)}}; \
          claim_store; \
          if command -v nix >/dev/null 2>&1 && {{ [ \"$(stat -c %u /nix/var/nix/db 2>/dev/null)\" = \"$(id -u)\" ] || [ -S /nix/var/nix/daemon-socket/socket ] || [ \"$(id -u)\" = 0 ]; }}; then exit 0; fi; \
          {wait}; \
          ensure_tools || true; \
+         prep_nix_root || true; \
          i=1; while :; do do_install && break; [ $i -ge 3 ] && break; echo \"nix: install attempt $i failed; retrying in 5s\"; i=$((i+1)); sleep 5; done; \
          mkdir -p \"$HOME/.config/nix\"; \
          printf '{conf}' > \"$HOME/.config/nix/nix.conf\"; \
@@ -1579,6 +1585,10 @@ pub fn agent_config_paths(agent: &str) -> (Vec<String>, Vec<String>) {
 /// uploaded even when the full config tree walk runs out of time. This is an
 /// explicit allowlist (not a blocklist) so it stays correct regardless of how
 /// large the rest of the agent config directory gets.
+///
+/// It lists only credentials and settings. Caches (e.g. Claude's
+/// `mcp-needs-auth-cache.json`) are not needed to authenticate, so they are
+/// left to the best-effort tree walk.
 pub fn agent_auth_critical_files(agent: &str) -> Vec<String> {
     match agent.trim() {
         "claude" | "claude-code" => vec![
@@ -1586,7 +1596,6 @@ pub fn agent_auth_critical_files(agent: &str) -> Vec<String> {
             ".claude/.credentials.json".into(),
             ".claude/settings.json".into(),
             ".claude/settings.local.json".into(),
-            ".config/claude/mcp-needs-auth-cache.json".into(),
         ],
         "codex" => vec![
             ".codex/config.json".into(),
@@ -3492,6 +3501,55 @@ mod tests {
         let post = s.find("prerequisites still missing").unwrap();
         let yum = s.find("yum install -y xz tar curl").unwrap();
         assert!(yum < post, "re-check runs after the install attempt");
+    }
+
+    #[test]
+    fn nix_install_preps_nix_root_when_root_without_sudo() {
+        // THE-2053: as root with no sudo (fly), thegn creates `/nix` itself so
+        // the installer skips its `sudo mkdir`; USER is exported for the installer.
+        use crate::config::NixInstaller;
+        for installer in [NixInstaller::Official, NixInstaller::Determinate] {
+            let s = nix_install_script(installer, None, None, None, None);
+            assert!(s.contains("prep_nix_root() {"), "{s}");
+            assert!(
+                s.contains(
+                    "prep_nix_root() { [ -e /nix ] && return 0; [ \"$(id -u)\" = 0 ] || return 0; mkdir -m 0755 /nix && chown 0:0 /nix; }"
+                ),
+                "acts only when uid 0 and /nix missing: {s}"
+            );
+            assert!(s.contains("mkdir -m 0755 /nix"), "{s}");
+            assert!(
+                s.contains("export USER=${USER:-$(id -un 2>/dev/null || echo root)};"),
+                "{s}"
+            );
+            let ensure = s.find("ensure_tools || true;").unwrap();
+            let prep = s.find("prep_nix_root || true;").unwrap();
+            let loop_start = s.find("while :; do do_install").unwrap();
+            assert!(ensure < prep, "prep runs after ensure_tools");
+            assert!(prep < loop_start, "prep runs before the install loop");
+            // USER is exported before anything runs the installer.
+            assert!(s.find("export USER=").unwrap() < loop_start);
+        }
+        // The existing installer selection still holds.
+        let off = nix_install_script(NixInstaller::Official, None, None, None, None);
+        assert!(off.contains("nixos.org/nix/install"));
+        assert!(!off.contains("determinate.systems"));
+        let det = nix_install_script(NixInstaller::Determinate, None, None, None, None);
+        assert!(det.contains("install.determinate.systems"));
+        assert!(det.contains("nixos.org/nix/install"));
+    }
+
+    #[test]
+    fn claude_auth_critical_files_are_credentials_and_settings_only() {
+        // THE-2051: the MCP auth cache is not needed to authenticate.
+        let files = agent_auth_critical_files("claude");
+        assert!(files.iter().any(|f| f == ".claude/.credentials.json"));
+        assert!(files.iter().any(|f| f == ".claude.json"));
+        assert!(
+            !files.iter().any(|f| f.contains("mcp-needs-auth-cache")),
+            "{files:?}"
+        );
+        assert_eq!(files, agent_auth_critical_files("claude-code"));
     }
 
     #[test]
