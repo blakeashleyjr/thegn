@@ -1,0 +1,24 @@
+# Tasks
+
+## 1. Spine
+
+- [ ] 1.1 Register `EnvProviderKind::Vercel`, `Provider::Vercel`, factory, stubs (THE-2223)
+
+## 2. Control plane and bridge
+
+- [ ] 2.1 Control-plane client with redacted token
+- [ ] 2.2 `thegn vercel-exec` bridge: capture, TTY, stream fallback, keep-alive
+
+## 3. Credential-free transfer
+
+- [ ] 3.1 Credential-free provisioning: bundle seed, stripped steps, applier refusal
+
+## 4. Ledger, caps and reaper
+
+- [ ] 4.1 Ledger, account fingerprint, `max_instances`
+- [ ] 4.2 Reaper: stop at ceiling, delete after grace, doctor listing
+
+## 5. Surface and docs
+
+- [ ] 5.1 `thegn env pull` support and admission refusals (host_cache, ssh connect)
+- [ ] 5.2 Help page, provider-impl checklist, config example
