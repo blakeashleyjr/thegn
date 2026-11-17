@@ -143,6 +143,24 @@ transcript directory. The per-account percentages above come from the providers
 themselves and _are_ per-account accurate; the token totals are a separate,
 coarser number and are labelled as such.
 
+## From the command line
+
+`thegn usage [--json] [--tokens]` prints the same per-account snapshot the
+overlay shows, without the UI. The default is an aligned table: provider,
+account, plan, state, the busiest window's `used %`, and its reset countdown
+(an unavailable account shows its note instead). It gathers exactly as the UI
+does, so `[usage] enabled` and `[usage] allow_network` apply; there is no
+separate live-fetch flag.
+
+`--tokens` appends the host-wide token totals, with `(floor: N transcripts
+skipped)` when the transcript cap was hit and the totals are a lower bound.
+`--json` emits one document with `generated_ms`, `enabled`, `accounts[]`
+(`provider`, `account`, `plan`, `state`, `note`, `email`, `org`, `home`,
+`windows[]` of `label` / `used_pct` / `resets_at`) and `tokens`. With
+`[usage] enabled = false` the command prints
+`usage tracking is off ([usage] enabled = false)` (JSON: `enabled: false`,
+empty `accounts`) and exits 0.
+
 ## Model-proxy spend
 
 The model proxy is a separate binary, `tgproxy`. The alpha release tarball and
