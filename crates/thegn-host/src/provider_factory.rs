@@ -320,6 +320,52 @@ pub(crate) fn provider_for_named_with_key(
     }
 }
 
+/// The exact token ref string [`provider_for_named_with_key`] resolves for
+/// `pc`: the trimmed `api_key_env`, else the kind's default. Daytona has no
+/// default there, so an empty `api_key_env` yields `Some("")`. `None` for kinds
+/// that need no token (custom, or an unknown kind).
+pub(crate) fn token_ref(pc: &thegn_core::config::EnvProviderConfig) -> Option<String> {
+    use thegn_core::config::EnvProviderKind as K;
+    let configured = pc.api_key_env.trim();
+    let default = match K::of(&pc.provider) {
+        K::Sprites => "SPRITES_TOKEN",
+        K::Daytona => "",
+        K::Hetzner | K::DigitalOcean => {
+            thegn_svc::vps::VpsKind::parse(&pc.provider)?.token_env_default()
+        }
+        K::Fly => "FLY_API_TOKEN",
+        K::Machine0 => "MACHINE0_API_KEY",
+        K::Custom => return None,
+    };
+    Some(
+        if configured.is_empty() {
+            default
+        } else {
+            configured
+        }
+        .to_string(),
+    )
+}
+
+/// Why [`provider_for_named`] returned `None` for env `name`, for a CLI error.
+/// When the token ref does not resolve, the message names the ref and the
+/// paths/variables tried (THE-2016); never a secret value.
+pub(crate) fn provider_unavailable_reason(
+    pc: &thegn_core::config::EnvProviderConfig,
+    name: &str,
+) -> String {
+    match token_ref(pc) {
+        Some(r) if r.is_empty() => format!(
+            "env '{name}': no API token reference configured (set api_key_env in [env.{name}.provider])"
+        ),
+        Some(r) if crate::secret::resolve_for(&r, "explain").is_none() => format!(
+            "env '{name}': API token {r} could not be resolved: {}",
+            crate::secret::explain_unresolved(&r)
+        ),
+        _ => format!("env '{name}' has no API provider or its token could not be resolved"),
+    }
+}
+
 /// Build the [`Machine0Provider`](thegn_svc::machine0::Machine0Provider) for a
 /// `provider = "machine0"` env config. `None` when the api key can't be resolved
 /// or the managed keypair can't be produced. Shared by the launch path.
@@ -735,6 +781,88 @@ mod tests {
         assert!(
             err.contains("unknown provider kind") || err.contains("custom"),
             "{err}"
+        );
+    }
+
+    #[test]
+    fn token_ref_matches_each_factory_arm() {
+        let pc = |provider: &str, key: &str| thegn_core::config::EnvProviderConfig {
+            provider: provider.into(),
+            api_key_env: key.into(),
+            ..Default::default()
+        };
+        assert_eq!(
+            token_ref(&pc("sprites", "")).as_deref(),
+            Some("SPRITES_TOKEN")
+        );
+        assert_eq!(
+            token_ref(&pc("sprites", "  file:~/.secrets/sprites  ")).as_deref(),
+            Some("file:~/.secrets/sprites")
+        );
+        assert_eq!(token_ref(&pc("daytona", "")).as_deref(), Some(""));
+        assert_eq!(
+            token_ref(&pc("daytona", "DT_KEY")).as_deref(),
+            Some("DT_KEY")
+        );
+        assert_eq!(token_ref(&pc("fly", "")).as_deref(), Some("FLY_API_TOKEN"));
+        assert_eq!(
+            token_ref(&pc("machine0", "")).as_deref(),
+            Some("MACHINE0_API_KEY")
+        );
+        assert_eq!(
+            token_ref(&pc("hetzner", "")).as_deref(),
+            Some(thegn_svc::vps::VpsKind::Hetzner.token_env_default())
+        );
+        assert_eq!(
+            token_ref(&pc("digitalocean", "")).as_deref(),
+            Some(thegn_svc::vps::VpsKind::DigitalOcean.token_env_default())
+        );
+        assert_eq!(token_ref(&pc("custom", "")), None);
+        assert_eq!(token_ref(&pc("custom", "IGNORED")), None);
+    }
+
+    #[test]
+    fn provider_unavailable_reason_names_the_ref_and_paths() {
+        let state = crate::testenv::IsolatedState::new();
+        let pc = thegn_core::config::EnvProviderConfig {
+            provider: "sprites".into(),
+            api_key_env: "file:~/.secrets/tg-b145-none".into(),
+            ..Default::default()
+        };
+        let reason = provider_unavailable_reason(&pc, "sprites");
+        let expanded = state.root().join(".secrets/tg-b145-none");
+        assert!(
+            reason.starts_with(
+                "env 'sprites': API token file:~/.secrets/tg-b145-none could not be resolved: token file not found (tried "
+            ),
+            "{reason}"
+        );
+        assert!(reason.contains(&*expanded.to_string_lossy()), "{reason}");
+
+        let env = thegn_core::config::EnvProviderConfig {
+            provider: "fly".into(),
+            api_key_env: "TG_B145_NO_SUCH_FLY_TOKEN".into(),
+            ..Default::default()
+        };
+        assert_eq!(
+            provider_unavailable_reason(&env, "f"),
+            "env 'f': API token TG_B145_NO_SUCH_FLY_TOKEN could not be resolved: environment variable TG_B145_NO_SUCH_FLY_TOKEN is not set in this process"
+        );
+        let daytona = thegn_core::config::EnvProviderConfig {
+            provider: "daytona".into(),
+            ..Default::default()
+        };
+        assert!(
+            provider_unavailable_reason(&daytona, "d")
+                .contains("no API token reference configured"),
+        );
+        let custom = thegn_core::config::EnvProviderConfig {
+            provider: "custom".into(),
+            ..Default::default()
+        };
+        assert_eq!(
+            provider_unavailable_reason(&custom, "c"),
+            "env 'c' has no API provider or its token could not be resolved"
         );
     }
 
