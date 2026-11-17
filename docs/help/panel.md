@@ -177,6 +177,10 @@ custom patch; `W` diffs the selection against the mark. `E` edits
 width cycle. `B` marks the rebase base for `i` and `r`; see
 [[git-and-diffs]] for the base-mark behavior.
 
+`y` copies the selected commit sha(s) (full, one per line for a `v` range) to
+the system clipboard via OSC 52; the terminal must allow clipboard writes. `C`
+stays the internal cherry-pick clipboard, pasted with `V`.
+
 {{keys:commits}}
 
 See [[git-and-diffs]].
