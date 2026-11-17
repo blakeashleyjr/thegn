@@ -1,5 +1,7 @@
-//! File-based VPS instance registry under `$XDG_STATE/thegn/vps/` — one JSON
-//! file per instance name. This is the **leak-safety ledger**: a record is
+//! File-based VPS instance registry under `$XDG_STATE_HOME/thegn/vps/` — one
+//! JSON file per instance name, plus the per-instance `known_hosts.d/` pins
+//! and machine0 pending records. A ledger left at the legacy `~/.thegn/vps`
+//! is promoted there on first use (see [`dir`]). This is the **leak-safety ledger**: a record is
 //! written (state `creating`) *before* the create POST and finalized (state
 //! `ready`, instance id + IP) after, so a crash between the two leaves an
 //! intent record the reaper can reconcile against the provider's live list. It
@@ -149,12 +151,87 @@ pub fn is_bake_name(name: &str) -> bool {
     })
 }
 
-/// The registry directory (created on demand).
-pub fn dir() -> PathBuf {
+/// The canonical registry location: `$XDG_STATE_HOME/thegn/vps` (THE-2050).
+/// Machine state, not user config, so it lives beside the DB rather than under
+/// `~/.thegn`, which a profile HOME can shadow.
+pub fn state_dir() -> PathBuf {
+    thegn_core::util::xdg_state_home().join("thegn/vps")
+}
+
+/// The pre-THE-2050 location (`~/.thegn/vps`), promoted by [`dir`].
+fn legacy_dir() -> PathBuf {
     thegn_core::util::thegn_dir().join("vps")
 }
 
-/// The per-instance known_hosts file for the ssh transport: fresh VPSes mean
+/// The registry directory (created on demand by the writers):
+/// `$XDG_STATE_HOME/thegn/vps`, see [`state_dir`].
+///
+/// A ledger still at the legacy `~/.thegn/vps` is moved there by one atomic
+/// rename the first time this is called (records, `known_hosts.d` pins and
+/// machine0 pending records travel together). A symlinked or foreign legacy
+/// directory is never followed or moved. If the rename fails for any reason but
+/// a lost race (e.g. EXDEV across filesystems) the legacy directory keeps
+/// serving, with one warning per process. Not cached: the check is two stats
+/// and the environment differs per test.
+pub fn dir() -> PathBuf {
+    let new = state_dir();
+    #[cfg(test)]
+    {
+        // A test that forgot `IsolatedState` must never move the developer's
+        // real ledger: resolve the path but skip the promotion.
+        let ambient = thegn_core::testenv::ambient_state_roots();
+        if thegn_core::testenv::is_real_state_path(&new, &thegn_core::util::home(), ambient) {
+            return new;
+        }
+    }
+    promote_legacy(&legacy_dir(), &new)
+}
+
+static PROMOTE_WARNED: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+
+/// Choose the registry root, moving `legacy` to `new` when only the legacy
+/// directory exists and it is a real directory owned by the current user.
+fn promote_legacy(legacy: &Path, new: &Path) -> PathBuf {
+    if std::fs::symlink_metadata(new).is_ok() {
+        return new.to_path_buf();
+    }
+    let movable = std::fs::symlink_metadata(legacy).is_ok_and(|metadata| {
+        !metadata.file_type().is_symlink()
+            && metadata.is_dir()
+            && thegn_core::fsperm::owned_by_current_user(&metadata)
+    });
+    if !movable {
+        return new.to_path_buf();
+    }
+    let result = match new.parent() {
+        Some(parent) if std::fs::symlink_metadata(parent).is_err() => {
+            thegn_core::fsperm::ensure_private_dir(parent)
+        }
+        _ => Ok(()),
+    }
+    .and_then(|()| std::fs::rename(legacy, new));
+    match result {
+        Ok(()) => new.to_path_buf(),
+        // Another process promoted it first.
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => new.to_path_buf(),
+        Err(error) => {
+            if PROMOTE_WARNED.set(()).is_ok() {
+                tracing::warn!(
+                    target: "thegn::vps",
+                    %error,
+                    legacy = %legacy.display(),
+                    new = %new.display(),
+                    "cannot move the VPS ledger to the state directory; still using the legacy location"
+                );
+            }
+            legacy.to_path_buf()
+        }
+    }
+}
+
+/// The per-instance known_hosts file for the ssh transport, under
+/// `$XDG_STATE_HOME/thegn/vps/known_hosts.d/` (see [`dir`] for the legacy
+/// promotion): fresh VPSes mean
 /// fresh host keys, so each sandbox gets its own file (`accept-new` pins the
 /// first key) instead of polluting the global known_hosts. Invalid names are
 /// refused; there is no shared fallback pin. Removed on destroy.
@@ -672,6 +749,100 @@ mod tests {
             owner: String::new(),
             account: String::new(),
         }
+    }
+
+    #[test]
+    fn dir_promotes_the_legacy_ledger_into_the_state_dir() {
+        let _state = thegn_core::testenv::IsolatedState::new();
+        let legacy = legacy_dir();
+        write_at(&legacy, &rec("tg-moved", "ready")).unwrap();
+        let pins = ensure_known_hosts_dir_at(&legacy).unwrap();
+        std::fs::write(pins.join("x"), b"pin").unwrap();
+
+        let chosen = dir();
+
+        assert_eq!(chosen, state_dir());
+        assert!(chosen.starts_with(thegn_core::util::xdg_state_home()));
+        assert!(
+            std::fs::symlink_metadata(&legacy).is_err(),
+            "legacy dir is gone"
+        );
+        assert_eq!(read("tg-moved").unwrap().state, "ready");
+        assert_eq!(
+            std::fs::read(state_dir().join("known_hosts.d").join("x")).unwrap(),
+            b"pin"
+        );
+        // Idempotent once promoted.
+        assert_eq!(dir(), state_dir());
+    }
+
+    #[test]
+    fn promote_legacy_prefers_an_existing_new_dir_and_leaves_legacy_alone() {
+        let tmp = tempfile::tempdir().unwrap();
+        let legacy = tmp.path().join("legacy");
+        let new = tmp.path().join("state/thegn/vps");
+        std::fs::create_dir_all(&legacy).unwrap();
+        std::fs::write(legacy.join("old.json"), b"{}").unwrap();
+        std::fs::create_dir_all(&new).unwrap();
+
+        assert_eq!(promote_legacy(&legacy, &new), new);
+        assert_eq!(std::fs::read(legacy.join("old.json")).unwrap(), b"{}");
+        assert!(!new.join("old.json").exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn promote_legacy_never_follows_or_moves_a_symlinked_legacy() {
+        let tmp = tempfile::tempdir().unwrap();
+        let target = tmp.path().join("elsewhere");
+        std::fs::create_dir(&target).unwrap();
+        std::fs::write(target.join("rec.json"), b"{}").unwrap();
+        let legacy = tmp.path().join("legacy");
+        std::os::unix::fs::symlink(&target, &legacy).unwrap();
+        let new = tmp.path().join("state/thegn/vps");
+
+        assert_eq!(promote_legacy(&legacy, &new), new);
+        assert!(
+            std::fs::symlink_metadata(&legacy)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+        assert!(target.join("rec.json").exists());
+        assert!(
+            std::fs::symlink_metadata(&new).is_err(),
+            "nothing was moved"
+        );
+    }
+
+    #[test]
+    fn promote_legacy_falls_back_to_legacy_when_the_rename_fails() {
+        let tmp = tempfile::tempdir().unwrap();
+        let legacy = tmp.path().join("legacy");
+        std::fs::create_dir(&legacy).unwrap();
+        std::fs::write(legacy.join("rec.json"), b"{}").unwrap();
+        let blocker = tmp.path().join("not-a-dir");
+        std::fs::write(&blocker, b"").unwrap();
+        let new = blocker.join("vps");
+
+        assert_eq!(promote_legacy(&legacy, &new), legacy);
+        assert!(legacy.join("rec.json").exists());
+    }
+
+    #[test]
+    fn promote_legacy_without_legacy_returns_new_without_creating_it() {
+        let tmp = tempfile::tempdir().unwrap();
+        let new = tmp.path().join("state/thegn/vps");
+        assert_eq!(promote_legacy(&tmp.path().join("absent"), &new), new);
+        assert!(std::fs::symlink_metadata(&new).is_err());
+    }
+
+    #[test]
+    fn known_hosts_path_lives_under_the_state_dir() {
+        let _state = thegn_core::testenv::IsolatedState::new();
+        let path = known_hosts_path("box").unwrap();
+        assert!(path.starts_with(state_dir()), "{}", path.display());
+        assert_eq!(path, state_dir().join("known_hosts.d").join("box"));
     }
 
     #[test]
