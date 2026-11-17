@@ -794,7 +794,14 @@ fn remove_landed_with_config_unaudited(
     // retire it; the branch is never touched here. A checkout that still
     // exists, or is still registered (even if its directory is missing), keeps
     // the normal path, and an unreadable registry is "unknown", not "gone".
-    if !Path::new(worktree).exists()
+    let row_is_local = (expected_queue.location.is_empty() || expected_queue.location == "local")
+        && match db.worktree_record(worktree) {
+            Ok(None) => true,
+            Ok(Some(row)) => row.location.is_empty() || row.location == "local",
+            Err(_) => false, // unknown is never "gone"
+        };
+    if row_is_local
+        && !Path::new(worktree).exists()
         && matches!(
             cleanup::path_is_registered(repo_root, Path::new(worktree)),
             Ok(false)
@@ -2053,6 +2060,32 @@ mod tests {
                     ..
                 }
             ),
+            "{outcome:?}"
+        );
+        assert_eq!(db.list_merge_queue().unwrap(), rows_before, "row kept");
+        let _ = std::fs::remove_dir_all(&root); // best-effort: cleanup: the target may already be gone; a failed removal never fails the caller
+    }
+
+    /// A remote (ssh/provider) row's path never exists on this host and is
+    /// never in the local registry; it must not be mistaken for a gone
+    /// checkout and silently retired.
+    #[test]
+    fn gone_remote_checkout_is_never_retired() {
+        let _isolation = TestIsolation::new();
+        let db = Db::open_memory().unwrap();
+        let (root, feat) = repo_with_feat(&db, "crash-f");
+        let feat_s = feat.to_string_lossy().to_string();
+        db.set_worktree_location(&feat_s, r#"{"host":"build"}"#)
+            .unwrap();
+        let commit = record_private_land(&db, &root, &feat_s, "feat");
+        git(
+            &root,
+            &["worktree", "remove", "--force", feat.to_str().unwrap()],
+        );
+        let rows_before = db.list_merge_queue().unwrap();
+        let outcome = remove_landed(&db, &root, &feat_s, "feat", "main", Some(&commit), true);
+        assert!(
+            !matches!(outcome, CleanupOutcome::Removed { .. }),
             "{outcome:?}"
         );
         assert_eq!(db.list_merge_queue().unwrap(), rows_before, "row kept");
