@@ -4343,7 +4343,7 @@ mod tests {
             rows.push(SidebarRow::base(
                 RowKind::Worktree,
                 *d,
-                &format!("feat-{i}"),
+                format!("feat-{i}"),
                 "ws",
             ));
         }
