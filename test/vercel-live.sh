@@ -107,6 +107,8 @@ esac
 TMP="$(mktemp -d)"
 export XDG_STATE_HOME="$TMP/state" XDG_CONFIG_HOME="$TMP/config"
 mkdir -p "$XDG_STATE_HOME" "$XDG_CONFIG_HOME/thegn" "$TMP/repo"
+mkdir -m 700 "$TMP/run"
+export XDG_RUNTIME_DIR="$TMP/run"
 REPO="$TMP/repo"
 SANDBOX_NAME="(unknown)"
 CREATED=0
@@ -129,7 +131,7 @@ teardown() {
     local out
     out="$("$THEGN_BIN" fleet list --json 2>&1)"
     echo "$out" | head -40
-    if echo "$out" | grep -Eq '"(vercel|rows|sandboxes)"[^]]*\[[^]]'; then
+    if echo "$out" | grep -Eq '"id": *"'; then
       echo "TEARDOWN INCOMPLETE: sandbox may still exist; clean up manually: $SANDBOX_NAME (team $team_id, project $project_id)" >&2
       rc=1
     fi
@@ -198,6 +200,7 @@ step 3 "provision sandbox (env up)" in_repo "$THEGN_BIN" env up
 sandbox_name_from_fleet
 echo "sandbox: $SANDBOX_NAME"
 step 4 "capture-mode command runs in the sandbox" in_repo "$THEGN_BIN" env show
+echo "   run in ANOTHER terminal: XDG_STATE_HOME='$XDG_STATE_HOME' XDG_CONFIG_HOME='$XDG_CONFIG_HOME' XDG_RUNTIME_DIR='$XDG_RUNTIME_DIR' THEGN_CHANNEL=dev $THEGN_BIN  (open $REPO)"
 echo "== step 5: open an interactive terminal pane for this worktree now (manual)"
 echo "   (a pane open runs the vercel-exec TTY bridge; then close it)"
 step 5 "interactive terminal opened (operator confirms)" ask "pane opened and closed cleanly? "
@@ -215,7 +218,5 @@ step 7 "env pull fast-forwards the lane branch" in_repo "$THEGN_BIN" env pull
 step 8 "stop then resume" bash -c "cd '$REPO' && '$THEGN_BIN' env down --stop && '$THEGN_BIN' env up"
 step 8b "tmpfs login dir is gone after stop/resume" ask "/dev/shm/thegn-login-* absent after resume? "
 step 9 "env down destroys the sandbox" in_repo "$THEGN_BIN" env down
-CREATED=0
 step 10 "reap: dry-run then apply finds nothing left" bash -c "'$THEGN_BIN' env reap --provider vercel && '$THEGN_BIN' env reap --provider vercel --apply --yes"
-CREATED=1 # final fleet-list zero-row check runs in teardown
 echo "ALL STEPS PASS"
