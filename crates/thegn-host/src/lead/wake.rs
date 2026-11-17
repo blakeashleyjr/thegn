@@ -5,8 +5,9 @@
 //!
 //! Delivery:
 //! - an open Lead tab (the newest live daemon session whose cwd is the
-//!   canonical notes dir and which belongs to no worktree) gets the envelope
-//!   as one bracketed paste plus Enter;
+//!   canonical notes dir, whose worktree is none or that same dir, and whose
+//!   process argv carries a Lead MCP config under the Lead control dir) gets
+//!   the envelope as one bracketed paste plus Enter;
 //! - otherwise one bounded headless turn runs under the very same bwrap plan
 //!   as a tab (`lead::launch::headless_spec`), single-flight, and its
 //!   `lead:wake/0` token is revoked once it ends, whatever the outcome.
@@ -69,9 +70,25 @@ pub(crate) async fn run(
 
     let client = crate::automation_executor::client().await?;
     if let Some(notes) = notes.as_deref().and_then(|n| n.to_str()) {
-        let rows: Vec<thegn_core::lead_wake::SessionRow> = client
-            .sessions()
-            .await?
+        let marker = crate::lead::mcp::control_dir_in(&thegn_core::util::xdg_state_home())?
+            .path()
+            .join("mcp-lead_")
+            .to_string_lossy()
+            .into_owned();
+        let sessions = client.sessions().await?;
+        let sessions = tokio::task::spawn_blocking(move || {
+            sessions
+                .into_iter()
+                .filter(|s| {
+                    s.pid
+                        .and_then(crate::platform::proc::cmdline)
+                        .is_some_and(|argv| argv.iter().any(|a| a.contains(&marker)))
+                })
+                .collect::<Vec<_>>()
+        })
+        .await
+        .context("checking the Lead tab process")?;
+        let rows: Vec<thegn_core::lead_wake::SessionRow> = sessions
             .into_iter()
             .map(|s| {
                 let live = s.exited_at_ms.is_none();
@@ -95,7 +112,10 @@ pub(crate) async fn run(
     let _cancel_on_drop = CancelOnDrop(cancel.clone());
     tokio::task::spawn_blocking(move || {
         let _flight = flight;
-        let turn = headless_turn(&cfg, &text, timeout_secs, &cancel);
+        let turn = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            headless_turn(&cfg, &text, timeout_secs, &cancel)
+        }))
+        .unwrap_or_else(|_| Err(anyhow::anyhow!("the headless Lead turn panicked")));
         // Whatever happened (a refused launch may already have minted), the
         // turn's token dies with it.
         let revoked = crate::lead::mcp::revoke_lead_caller(crate::lead::launch::HEADLESS_CALLER);

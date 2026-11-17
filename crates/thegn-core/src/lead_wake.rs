@@ -247,8 +247,9 @@ pub fn pty_bytes(text: &str) -> Vec<u8> {
 pub type SessionRow = (String, Option<String>, Option<String>, bool, i64);
 
 /// The open Lead tab to wake: the newest live session whose cwd is the Lead's
-/// canonical notes dir and which belongs to no worktree. `None` means no tab
-/// is open (the host runs a headless turn instead).
+/// canonical notes dir and whose worktree, if any, is that same dir (a
+/// compositor pane reports its cwd as its worktree). `None` means no tab is
+/// open (the host runs a headless turn instead).
 pub fn pick_lead_session(sessions: &[SessionRow], notes_dir: &str) -> Option<String> {
     let want = trim_slash(notes_dir);
     if want.is_empty() {
@@ -257,7 +258,9 @@ pub fn pick_lead_session(sessions: &[SessionRow], notes_dir: &str) -> Option<Str
     sessions
         .iter()
         .filter(|(_, cwd, worktree, live, _)| {
-            *live && worktree.is_none() && cwd.as_deref().map(trim_slash) == Some(want)
+            *live
+                && worktree.as_deref().is_none_or(|w| trim_slash(w) == want)
+                && cwd.as_deref().map(trim_slash) == Some(want)
         })
         .max_by_key(|(id, .., created)| (*created, id.clone()))
         .map(|(id, ..)| id.clone())
@@ -418,11 +421,12 @@ mod tests {
                 20,
             ),
             row("dead", Some(notes), None, false, 30),
+            row("tabwt", Some(notes), Some(notes), true, 25),
             row("wt", Some(notes), Some("/repo/wt"), true, 40),
             row("other", Some("/home/u/code"), None, true, 50),
             row("nocwd", None, None, true, 60),
         ];
-        assert_eq!(pick_lead_session(&rows, notes).as_deref(), Some("new"));
+        assert_eq!(pick_lead_session(&rows, notes).as_deref(), Some("tabwt"));
         assert_eq!(pick_lead_session(&rows, "/nowhere"), None);
         assert_eq!(pick_lead_session(&rows, ""), None);
         assert_eq!(pick_lead_session(&[], notes), None);
