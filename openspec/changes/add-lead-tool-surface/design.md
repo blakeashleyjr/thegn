@@ -29,3 +29,5 @@ are read-only: rm and enable answer Conflict.
 
 `THEGN_CALLER` is sanitized to `[A-Za-z0-9._:/@-]`, at most 64 bytes, otherwise
 `invalid`. It is audit-only.
+
+Schema: v110 to v111 (automation rules), owned by the automations lane.

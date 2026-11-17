@@ -35,8 +35,9 @@ selectors agree:
   (at least one pipeline stage is configured).
 - `when` contains the current phase: `create`, `startup`, or `explicit`.
 
-The shipped registry contains `lead`, `mq`, `pipeline`, and `supervise`; their gates
-remain `always`, `merge_queue`, `pipeline`, and `always`. `lead` is the operating
+The shipped registry contains `lead`, `mq`, `pipeline`, and `supervise`; gates:
+lead `always`, mq `merge_queue`, pipeline `pipeline`, supervise `always`. `lead`
+seeds only on explicit seeding and into the Lead's notes dir. `lead` is the operating
 notes for the Lead tab (tools: `overview_get`, `dispatches_put`, `sessions_open`,
 `approvals_request`, `merge_drain`, `automations_put`). Use `[skills].exclude` to
 withhold a name from every harness.

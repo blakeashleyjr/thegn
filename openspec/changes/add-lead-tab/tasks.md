@@ -5,3 +5,4 @@
 - [ ] 1.3 Fail-closed bwrap launch masking daemon socket and run dirs.
 - [ ] 1.4 Scoped loopback MCP listener with a minted pairing token.
 - [ ] 1.5 Seed the Lead skill into the notes dir idempotently.
+- [ ] 1.6 Unit tests for the new core logic (95% gate)

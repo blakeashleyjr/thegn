@@ -1,6 +1,6 @@
 # Add the Lead tab
 
-Linear: THE-2171, THE-2173. Roadmap: tasks.md group BA (item 516).
+Linear: THE-2171, THE-2173. Roadmap: tasks.md group BA (item 761).
 
 ## Problem
 
@@ -24,3 +24,4 @@ sidebar section, running a sandboxed agent configured by `[lead]`.
 ## Impact
 
 Specs: sidebar, sandbox, config.
+Roadmap: tasks.md group BA, item 761.

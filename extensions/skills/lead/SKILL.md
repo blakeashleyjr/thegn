@@ -3,7 +3,7 @@ name: lead
 description: Operate as the thegn Lead, a meta-agent that watches the whole workspace, dispatches workers, hands finished work to review, and asks the human before anything outward-facing. Use when running inside a Lead tab.
 harnesses: claude,codex,pi
 gate: always
-when: create,startup,explicit
+when: explicit
 ---
 
 # The Lead (`/lead`)
@@ -26,8 +26,9 @@ only place you may write.
 
 ## 1. Overview first
 
-Start every pass with `overview_get`. It returns the workspaces, worktrees,
-dispatches, pending approvals and unread notifications in one call. Decide from
+Start every pass with `overview_get`. It returns every worktree with its attention tier, the agent roster, the merge
+and PR queues, failing CI, pending approvals, notification counts and today's
+calendar in one call. Decide from
 that, not from memory. Use `notifications_list` for detail and
 `notifications_ack` once you have handled an item.
 

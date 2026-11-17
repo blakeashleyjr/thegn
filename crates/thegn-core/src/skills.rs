@@ -1195,15 +1195,21 @@ mod tests {
         assert_eq!(registry.get("pipeline").unwrap().gate, SkillGate::Pipeline);
         assert_eq!(registry.get("supervise").unwrap().gate, SkillGate::Always);
         assert_eq!(registry.get("lead").unwrap().gate, SkillGate::Always);
+        assert_eq!(
+            registry.get("lead").unwrap().when,
+            BTreeSet::from([SeedPhase::Explicit])
+        );
         for (_, skill) in registry.iter() {
             assert_eq!(
                 skill.harnesses,
                 BTreeSet::from(["claude".into(), "codex".into(), "pi".into()])
             );
-            assert_eq!(
-                skill.when,
-                BTreeSet::from([SeedPhase::Create, SeedPhase::Startup, SeedPhase::Explicit])
-            );
+            if skill.name != "lead" {
+                assert_eq!(
+                    skill.when,
+                    BTreeSet::from([SeedPhase::Create, SeedPhase::Startup, SeedPhase::Explicit])
+                );
+            }
             let source = EMBEDDED_MANIFEST
                 .iter()
                 .find(|entry| entry.name == skill.name)
