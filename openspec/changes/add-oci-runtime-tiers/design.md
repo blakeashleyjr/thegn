@@ -11,9 +11,9 @@ thegn-owned:
 
 - the worktree bind stays **path-preserving** (`-v /wt:/wt`), so host-side git
   and the compositor read the same tree — the load-bearing sandbox invariant;
-- egress stays **`EgressKind::Enforce`** (our DNS filter / tgproxy run against a
-  container we control), unlike a managed provider where policy is only
-  _translated_.
+- egress reporting is **unchanged by the runtime**: `unmanaged` for allow/block
+  lists and `offline` for `network = "none"`, exactly as for the default runtime
+  (see `fix-truth-in-reporting`, which owns the egress vocabulary).
 
 A local-VMM provider (Firecracker/cloud-hypervisor as `Provider::LocalVm`) would
 add CoW-fork / snapshot / suspend-resume by reusing the machine0 provider seam,

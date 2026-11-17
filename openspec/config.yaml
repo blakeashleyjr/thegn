@@ -40,6 +40,15 @@ context: |
   help page, provider, capability or plugin verb must name the gate it
   satisfies (docs/extending/ lists them). Changes are spec-driven: specs in
   openspec/specs/ describe current behaviour; deltas live in the change.
+
+  Programme rules (sandbox + remote, 2026-11; CONTRIBUTING.md has the full
+  text): a change is synced and archived at the end of the wave that completes
+  it, before another change that MODIFIES the same requirement is opened, and
+  MODIFIED blocks are rebased on the current spec at archive time; a MODIFIED or
+  REMOVED delta cannot target another unarchived change, so amend that change in
+  place. A change never writes a literal SQLite schema version: its migration
+  task is `migrate_vNEXT` / `verify_vNEXT_schema`, the integrator assigns the
+  number at fold, and a wave bumps the schema at most once.
 rules:
   proposal:
     - Link the corresponding tasks.md roadmap item(s) by group letter + number in the Impact section.

@@ -152,6 +152,83 @@ Roadmap and specs: `tasks.md` is the roadmap index; behavior specs live in
 `just openspec-setup`). Every config key is documented in
 [`config/config.toml.example`](config/config.toml.example).
 
+## Programme conventions (sandbox + remote, 2026-11)
+
+The sandbox + remote programme is many parallel lanes landing in waves (W0
+contracts, W1 truth fixes, W2 seam freeze, and so on). The rules below keep
+those lanes from defining the same type, flag, directory or convention twice.
+The programme record is
+[`docs/superpowers/plans/2026-11-17-sandbox-remote-programme.md`](docs/superpowers/plans/2026-11-17-sandbox-remote-programme.md),
+which also holds the hardware and accounts checklist. THE-791 (owner decision
+2026-10-13) is its parent acceptance record.
+
+- **Schema (B2).** Items write `migrate_vNEXT` and `verify_vNEXT_schema`;
+  they never write a literal `SCHEMA_VERSION`. The integrator assigns the
+  number when the batch folds. At most one bump per wave: if a wave's migration
+  would land before its first consumer, the consumer item creates it and the
+  next item of the same wave appends to the same `migrate_vN` function before
+  the fold. Each migration item carries the daemon-restart release note.
+- **openspec (B6).** Archive a change at the end of the wave that completes it,
+  before the next change that MODIFIES the same requirement is opened. Rebase
+  MODIFIED blocks on the current spec at archive time. Keep one change per
+  capability requirement in flight at a time. A MODIFIED or REMOVED delta cannot
+  target another change that is still unarchived; amend that change in place.
+- **Freeze (B7, lead ruling L3).** The frozen files are
+  `crates/thegn-core/src/sandbox*.rs`, `capabilities.rs`, `sandbox_matrix.rs`,
+  `sandbox_backend.rs`, `sandbox_truth.rs` and `sandbox_support.rs`. The window
+  is active only between WS02-P1-02b and WS02-P2-08. Inside the window no lane
+  outside WS02 has a diff that touches a path matching
+  `crates/thegn-core/src/sandbox*.rs`, whether it edits an existing file or adds
+  a new one. New modules created during W2 by other lanes take names outside the
+  glob (`confine_plan.rs`, `seatbelt_*.rs`, `win_sandbox*.rs`, `launch_kind.rs`;
+  the THE-791 modules `launch_class.rs`, `admission.rs` and `workspace_mode.rs`
+  are also outside it). The check is mechanical:
+  `git diff --name-only <base>.. -- 'crates/thegn-core/src/sandbox*.rs'` is empty
+  for every non-WS02 lane merged inside the window. Tickets cite symbols, not
+  line numbers, for the frozen files; moves carry `git diff --color-moved`
+  evidence.
+- **Features (B3).** `Feature` variants are added only by WS00-P1-01. Items use
+  their variant and never add one, and no item states an `ALL` length.
+- **Recipes (B4).** Recipes live only under
+  `config/recipes/{sandbox,provider,connector}/`, never a top-level `recipes/`.
+  See [`config/recipes/README.md`](config/recipes/README.md).
+- **CI (B9).** There is no new pull-request job for sandbox tests. Suites that
+  need user namespaces, bwrap, systemd user units or podman go into the
+  `test/userns-e2e.d/` registry (run by `just sandbox-userns-e2e`, a step of the
+  dispatch/nightly `security-e2e` job) or into `sandbox-e2e-full`. Wall-clock
+  numbers are advisory and never fail a gate. New binaries and crates keep
+  `just check-cross` green and join the per-crate ratchet scans (platform-cfg,
+  spawn-ownership, thread-name).
+- **Packaging (B45).** Every new binary names its artifact owner item and the
+  channels it ships in (tarball, flake, Windows zip, remote).
+- **Spikes and on-device checks (B8).** No item whose design rests on an
+  unverified external fact merges before its spike's decision record. A spike
+  is a `P0`-phase item or carries an `s` suffix (for example `WS05-P0-06`,
+  `WS04-P3-11s`); the dependent item lists it as a dependency. A check that needs a device (a Mac, a Windows VM, a
+  vendor account) is recorded in the PR with the host and date.
+- **tasks.md linkage.** `tasks.md` stays the roadmap index. The programme has
+  one group row pointing at the programme record; each openspec change cites
+  the group letter and item number in its proposal's Impact section, and each
+  work item's id (for example `WS01-P1-02`) appears as a task in its change.
+- **Config and catalog checklist (B10).** Every item that adds a config key,
+  action or control op ticks these in its Ratchets line:
+
+  ```text
+  config-reference / help ratchet
+  config_example test
+  test/env-overlay-ratchet.txt  (pin with a reason or a knob; secrets pinned OUT of the overlay)
+  hm_module_drift disposition   (rendered or OMITTED)
+  marked_definition_count_is_pinned  (each new config_enum!)
+  capability::CATALOG row + required_scope + cli_control_caps()  (every control/daemon op)
+  real Surface values: Http | Grpc | Cli | Mcp | Plugin
+  help claim and prose in the same lane as a new ACTION_SPECS id
+  ```
+
+To add a suite to the userns registry, drop an executable
+`test/userns-e2e.d/NN-name.sh` that exits 0 (pass), 77 (skip, after printing the
+reason) or anything else (fail). With `THEGN_REQUIRE_SECURITY_TESTS=1` a skip
+fails the run.
+
 ## macOS notes
 
 - **Any terminal works.** `thegn` / `tg-tui` run in whatever terminal you

@@ -16,7 +16,7 @@
 
 - [x] 3.1 Thread `oci_runtime` through `Capabilities::{derive,from_parts}`
 - [x] 3.2 `isolation_for`: `runsc → UserspaceKernel`, `krun → GuestKernel` (OCI only)
-- [x] 3.3 Unit tests: mapping + egress stays Enforce + projection stays Bind
+- [x] 3.3 Unit tests: mapping + egress reporting is unchanged by the runtime (see `fix-truth-in-reporting`) + projection stays Bind
 
 ## 4. Detection + doctor
 
