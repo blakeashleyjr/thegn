@@ -14,13 +14,10 @@ use thegn_core::vercel::admit::valid_sandbox_name;
 use thegn_core::vercel::api::{WsControl, interactive_start_frame, parse_ws_control, resize_frame};
 
 use super::{VercelProvider, Wake};
-use crate::provider::{EXEC_EXIT_STATUS_UNKNOWN, ExecControl, ExecFrame, ExecSession, ExecSpec};
+use crate::provider::{
+    EXEC_EXIT_STATUS_UNKNOWN, ExecControl, ExecFrame, ExecSession, ExecSpec, exec_ws_config,
+};
 
-// Copied from provider.rs (`exec_ws_config` and its limits) so this lane does
-// not edit the shared provider module.
-const WS_MAX_MESSAGE_SIZE: usize = 16 << 20;
-const WS_MAX_FRAME_SIZE: usize = 4 << 20;
-const WS_MAX_WRITE_BUFFER_SIZE: usize = 8 << 20;
 /// Largest output item queued at once (provider.rs `EXEC_DATA_CHUNK`).
 pub(super) const DATA_CHUNK: usize = 32 << 10;
 /// Item capacity of the output channel (provider.rs `EXEC_CHANNEL_CAPACITY`).
@@ -36,16 +33,10 @@ const HEALTH_ATTEMPT_TIMEOUT: Duration = Duration::from_secs(5);
 /// The WebSocket handshake deadline.
 const WS_CONNECT_TIMEOUT: Duration = Duration::from_secs(20);
 
-fn ws_config() -> tokio_tungstenite::tungstenite::protocol::WebSocketConfig {
-    tokio_tungstenite::tungstenite::protocol::WebSocketConfig::default()
-        .max_message_size(Some(WS_MAX_MESSAGE_SIZE))
-        .max_frame_size(Some(WS_MAX_FRAME_SIZE))
-        .max_write_buffer_size(WS_MAX_WRITE_BUFFER_SIZE)
-}
-
 /// `http(s)://<host[:port]>/health` for the ticket URL (`ws`→`http`,
 /// `wss`→`https`). The query (which may carry a token) and the path are
-/// dropped.
+/// dropped. Built from the admitted ticket URL only, so `/health` goes to the
+/// same pinned Vercel host as the socket.
 pub(super) fn health_url(ticket: &url::Url) -> Result<url::Url> {
     let scheme = match ticket.scheme() {
         "wss" | "https" => "https",
@@ -176,7 +167,7 @@ impl VercelProvider {
                 .map_err(|_| anyhow!("vercel: bad interactive request"))?;
             match tokio::time::timeout(
                 WS_CONNECT_TIMEOUT,
-                tokio_tungstenite::connect_async_with_config(req, Some(ws_config()), false),
+                tokio_tungstenite::connect_async_with_config(req, Some(exec_ws_config()), false),
             )
             .await
             {

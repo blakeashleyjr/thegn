@@ -127,9 +127,13 @@ impl Mock {
     }
 
     fn client(&self) -> VercelClient {
+        self.client_with_token(TOKEN)
+    }
+
+    fn client_with_token(&self, token: &str) -> VercelClient {
         VercelClient::new(
             &self.base,
-            VercelToken::new(TOKEN.into()),
+            VercelToken::new(token.into()),
             Scope {
                 team_id: TEAM.into(),
                 project_id: PROJECT.into(),
@@ -144,20 +148,25 @@ impl Mock {
 
     /// The custody property, for every recorded request and every error.
     fn assert_custody(&self, errors: &[&anyhow::Error]) {
+        self.assert_custody_of(TOKEN, errors);
+    }
+
+    /// [`Mock::assert_custody`] for a client built with `token`.
+    fn assert_custody_of(&self, token: &str, errors: &[&anyhow::Error]) {
         for r in self.requests() {
-            assert!(!r.target.contains(TOKEN), "token in target: {}", r.target);
+            assert!(!r.target.contains(token), "token in target: {}", r.target);
             assert!(
-                !String::from_utf8_lossy(&r.body).contains(TOKEN),
+                !String::from_utf8_lossy(&r.body).contains(token),
                 "token in body of {} {}",
                 r.method,
                 r.path()
             );
             for (name, value) in &r.headers {
                 if name != "authorization" {
-                    assert!(!value.contains(TOKEN), "token in header {name}");
+                    assert!(!value.contains(token), "token in header {name}");
                 }
             }
-            assert_eq!(r.header("authorization"), format!("Bearer {TOKEN}"));
+            assert_eq!(r.header("authorization"), format!("Bearer {token}"));
             assert!(
                 r.header("user-agent").starts_with("thegn/"),
                 "user-agent: {}",
@@ -167,7 +176,7 @@ impl Mock {
         }
         for e in errors {
             for shown in [format!("{e}"), format!("{e:#}"), format!("{e:?}")] {
-                assert!(!shown.contains(TOKEN), "token in error: {shown}");
+                assert!(!shown.contains(token), "token in error: {shown}");
                 assert!(!shown.contains(&self.base), "url in error: {shown}");
                 assert!(!shown.contains("teamId="), "query in error: {shown}");
             }
@@ -1034,4 +1043,400 @@ fn wait_command_errors_are_scrubbed_and_ids_are_checked_before_the_wire() {
         "an invalid id never reaches the wire"
     );
     mock.assert_custody(&[&bad]);
+}
+
+// --- b156: host pin, OIDC, 429, delete, usage (THE-2233) -------------------------
+
+/// A mock answering `/interactive` with a ticket whose URL is chosen by the
+/// session id in the path.
+fn ticket_mock() -> Mock {
+    Mock::start(|r| {
+        let url = match r.path() {
+            "/v2/sandboxes/sessions/sess_run/interactive" => "wss://x.vercel.run/pty?ticket=1",
+            "/v2/sandboxes/sessions/sess_evil/interactive" => "wss://evil.example/pty?ticket=1",
+            "/v2/sandboxes/sessions/sess_app/interactive" => "wss://vercel.app/pty?ticket=1",
+            "/v2/sandboxes/sessions/sess_appsub/interactive" => "wss://x.vercel.app/pty?ticket=1",
+            "/v2/sandboxes/sessions/sess_ip/interactive" => "wss://203.0.113.7/pty?ticket=1",
+            "/v2/sandboxes/sessions/sess_vx/interactive" => "wss://a.vx.example/pty?ticket=1",
+            _ => "wss://unrouted.example/pty",
+        };
+        Reply::json(
+            "200 OK",
+            serde_json::json!({"url": url, "token": "tkt_secret_456"}),
+        )
+    })
+}
+
+fn assert_host_refusal(err: &anyhow::Error) {
+    for shown in [format!("{err}"), format!("{err:#}"), format!("{err:?}")] {
+        assert!(
+            !shown.contains("tkt_secret_456"),
+            "ticket in error: {shown}"
+        );
+        assert!(!shown.contains("ticket=1"), "query in error: {shown}");
+        assert!(!shown.contains("evil.example"), "url in error: {shown}");
+    }
+}
+
+#[test]
+fn interactive_ticket_host_is_pinned_to_vercel_suffixes() {
+    let mock = ticket_mock();
+    let rt = rt();
+    let client = mock.client();
+    let ticket = rt
+        .block_on(client.interactive("sess_run"))
+        .expect("vercel.run is a default suffix");
+    assert_eq!(ticket.url.host_str(), Some("x.vercel.run"));
+
+    let mut errs = Vec::new();
+    for session in ["sess_evil", "sess_app", "sess_appsub", "sess_ip", "sess_vx"] {
+        let err = rt.block_on(client.interactive(session)).unwrap_err();
+        assert_host_refusal(&err);
+        errs.push(err);
+    }
+    // The non-IP refusals carry the pin text and the key to set.
+    for err in [&errs[0], &errs[1], &errs[2], &errs[4]] {
+        let shown = format!("{err:#}");
+        assert!(
+            shown.contains(
+                "vercel: interactive url host is not an allowed Vercel host \
+                 (set env.<name>.provider.interactive_host_suffixes)"
+            ),
+            "{shown}"
+        );
+    }
+
+    // A configured suffix replaces the defaults.
+    let pinned = mock
+        .client()
+        .with_interactive_hosts(vec!["vx.example".to_string()]);
+    let ticket = rt
+        .block_on(pinned.interactive("sess_vx"))
+        .expect("configured suffix");
+    assert_eq!(ticket.url.host_str(), Some("a.vx.example"));
+    let err = rt.block_on(pinned.interactive("sess_run")).unwrap_err();
+    assert_host_refusal(&err);
+    errs.push(err);
+
+    let refs: Vec<&anyhow::Error> = errs.iter().collect();
+    mock.assert_custody(&refs);
+}
+
+/// An unsigned JWT-shaped token whose payload carries `exp` (what an OIDC
+/// token looks like to the local classifier). The whole string is the
+/// sentinel.
+fn oidc_token(exp_s: i64) -> String {
+    use base64::Engine as _;
+    let enc = |v: serde_json::Value| {
+        base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(v.to_string().as_bytes())
+    };
+    format!(
+        "{}.{}.c2lnX3NlbnRpbmVs",
+        enc(serde_json::json!({"alg": "RS256", "typ": "JWT", "kid": "sentinel"})),
+        enc(serde_json::json!({
+            "iss": "https://oidc.vercel.com/team-sentinel",
+            "aud": "https://vercel.com/team-sentinel",
+            "sub": "owner:team-sentinel:project:prj:environment:development",
+            "exp": exp_s,
+        })),
+    )
+}
+
+fn now_s() -> i64 {
+    i64::try_from(
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs(),
+    )
+    .unwrap()
+}
+
+#[test]
+fn an_oidc_token_near_expiry_makes_no_request_and_is_never_echoed() {
+    let mock = Mock::start(|_| Reply::json("200 OK", sandbox_json("tg-a")));
+    let rt = rt();
+    let near = oidc_token(now_s() + 60);
+    let client = mock.client_with_token(&near);
+    let errs = [
+        rt.block_on(client.get("tg-a", false)).unwrap_err(),
+        rt.block_on(client.delete("tg-a")).unwrap_err(),
+        rt.block_on(client.interactive("sess_1")).unwrap_err(),
+    ];
+    assert!(
+        mock.requests().is_empty(),
+        "an expiring OIDC token sent a request"
+    );
+    for err in &errs {
+        let shown = format!("{err:#}");
+        assert!(shown.contains("OIDC"), "{shown}");
+        assert!(shown.contains("access token"), "{shown}");
+    }
+    let refs: Vec<&anyhow::Error> = errs.iter().collect();
+    mock.assert_custody_of(&near, &refs);
+    // The JWT's parts never surface either.
+    for err in &errs {
+        let shown = format!("{err:?}");
+        for part in near.split('.') {
+            assert!(!shown.contains(part), "token part in error: {shown}");
+        }
+    }
+
+    let far = oidc_token(now_s() + 2 * 60 * 60);
+    let got = rt
+        .block_on(mock.client_with_token(&far).get("tg-a", false))
+        .expect("an OIDC token with 2h left goes through");
+    assert!(got.is_some());
+    assert_eq!(mock.requests().len(), 1);
+    mock.assert_custody_of(&far, &[]);
+}
+
+#[test]
+fn an_access_token_is_unaffected_by_the_oidc_rule() {
+    let mock = Mock::start(|_| Reply::json("200 OK", sandbox_json("tg-a")));
+    let got = rt()
+        .block_on(mock.client().get("tg-a", false))
+        .expect("access token");
+    assert!(got.is_some());
+    assert_eq!(mock.requests().len(), 1);
+    mock.assert_custody(&[]);
+}
+
+fn rate_limited(retry_after: &str) -> Reply {
+    let mut reply = Reply::json(
+        "429 Too Many Requests",
+        serde_json::json!({"error": {"code": "rate_limited"}}),
+    );
+    reply.headers.push(("Retry-After", retry_after.to_string()));
+    reply
+}
+
+#[test]
+fn a_429_with_a_short_retry_after_is_waited_out() {
+    let hits = Arc::new(AtomicUsize::new(0));
+    let seen = hits.clone();
+    let mock = Mock::start(move |_| {
+        if seen.fetch_add(1, Ordering::SeqCst) == 0 {
+            rate_limited("1")
+        } else {
+            Reply::json("200 OK", sandbox_json("tg-a"))
+        }
+    });
+    let started = std::time::Instant::now();
+    let got = rt()
+        .block_on(mock.client().get("tg-a", false))
+        .expect("retried after Retry-After");
+    assert!(got.is_some());
+    assert_eq!(hits.load(Ordering::SeqCst), 2);
+    assert!(
+        started.elapsed() >= Duration::from_millis(900),
+        "Retry-After: 1 was not honoured ({:?})",
+        started.elapsed()
+    );
+    mock.assert_custody(&[]);
+}
+
+#[test]
+fn a_429_with_a_long_or_unparsable_retry_after_fails_with_the_wait() {
+    let mock = Mock::start(|r| {
+        if r.path().ends_with("tg-long") {
+            rate_limited("120")
+        } else {
+            rate_limited("Wed, 21 Oct 2015 07:28:00 GMT")
+        }
+    });
+    let rt = rt();
+    let long = rt
+        .block_on(mock.client().get("tg-long", false))
+        .unwrap_err();
+    assert!(
+        format!("{long:#}").contains("rate limited by Vercel; retry after 120s"),
+        "{long:#}"
+    );
+    assert_eq!(mock.requests().len(), 1, "a 120 s wait must not be retried");
+    let date = rt
+        .block_on(mock.client().get("tg-date", false))
+        .unwrap_err();
+    assert!(
+        format!("{date:#}").contains("rate limited by Vercel"),
+        "{date:#}"
+    );
+    assert!(!format!("{date:#}").contains("2015"), "{date:#}");
+    assert_eq!(
+        mock.requests().len(),
+        2,
+        "an unparsable wait must not be retried"
+    );
+    mock.assert_custody(&[&long, &date]);
+}
+
+#[test]
+fn a_429_on_create_or_run_is_not_retried() {
+    let mock = Mock::start(|_| rate_limited("1"));
+    let rt = rt();
+    let create = rt
+        .block_on(mock.client().create(&serde_json::json!({"name": "tg-a"})))
+        .unwrap_err();
+    assert!(
+        format!("{create:#}").contains("rate limited by Vercel; retry after 1s"),
+        "{create:#}"
+    );
+    assert_eq!(mock.requests().len(), 1);
+    let run = rt
+        .block_on(
+            mock.client()
+                .run_wait("sess_1", &serde_json::json!({"command": "true"}), 64),
+        )
+        .unwrap_err();
+    assert!(
+        format!("{run:#}").contains("rate limited by Vercel"),
+        "{run:#}"
+    );
+    assert_eq!(mock.requests().len(), 2);
+    mock.assert_custody(&[&create, &run]);
+}
+
+#[test]
+fn stdin_retries_a_429_like_the_sdk() {
+    let hits = Arc::new(AtomicUsize::new(0));
+    let seen = hits.clone();
+    let mock = Mock::start(move |_| {
+        if seen.fetch_add(1, Ordering::SeqCst) < 2 {
+            rate_limited("0")
+        } else {
+            Reply::json("200 OK", serde_json::json!({}))
+        }
+    });
+    rt().block_on(mock.client().stdin("sess_1", "cmd_1", b"hi", false))
+        .expect("stdin retried through two 429s");
+    assert_eq!(hits.load(Ordering::SeqCst), 3);
+    mock.assert_custody(&[]);
+}
+
+#[test]
+fn delete_asks_for_orphan_snapshot_cleanup() {
+    let mock = Mock::start(|_| Reply::json("200 OK", serde_json::json!({})));
+    rt().block_on(mock.client().delete("tg-a")).expect("delete");
+    let reqs = mock.requests();
+    assert_eq!(reqs.len(), 1);
+    assert_eq!(reqs[0].method, "DELETE");
+    assert_eq!(reqs[0].path(), "/v2/sandboxes/tg-a");
+    assert_eq!(
+        reqs[0]
+            .query()
+            .get("deleteOrphanSnapshots")
+            .map(String::as_str),
+        Some("true")
+    );
+    mock.assert_custody(&[]);
+}
+
+#[test]
+fn usage_reads_the_current_session_without_resuming() {
+    let mock = Mock::start(|r| match r.path() {
+        "/v2/sandboxes/tg-a" => Reply::json(
+            "200 OK",
+            serde_json::json!({
+                "sandbox": {
+                    "name": "tg-a",
+                    "status": "stopped",
+                    "resources": {"vcpus": 2},
+                    "memory": 4096
+                },
+                "session": {
+                    "id": "sess_1",
+                    "activeCpuDurationMs": 90_000,
+                    "startedAt": 1_700_000_000_000_i64,
+                    "stoppedAt": 1_700_000_360_000_i64
+                }
+            }),
+        ),
+        _ => not_found(),
+    });
+    let rt = rt();
+    let usage = rt
+        .block_on(mock.client().usage("tg-a"))
+        .expect("usage")
+        .expect("exists");
+    assert_eq!(usage.active_cpu_ms, Some(90_000));
+    assert_eq!(usage.memory_mb, Some(4096));
+    assert_eq!(usage.vcpus, Some(2));
+    assert_eq!(usage.started_at_ms, Some(1_700_000_000_000));
+    assert_eq!(usage.stopped_at_ms, Some(1_700_000_360_000));
+    assert!(
+        rt.block_on(mock.client().usage("tg-gone"))
+            .expect("404")
+            .is_none()
+    );
+    let reqs = mock.requests();
+    assert_eq!(reqs[0].method, "GET");
+    assert!(
+        !reqs[0].query().contains_key("resume"),
+        "usage must not resume"
+    );
+    assert_eq!(
+        reqs[0].query().get("projectId").map(String::as_str),
+        Some(PROJECT)
+    );
+    mock.assert_custody(&[]);
+}
+
+#[test]
+fn snapshot_usage_pages_and_stops_at_the_cap() {
+    // Every page names a fresh next cursor, so only the cap ends the walk.
+    let mock = Mock::start(|r| {
+        let page: u64 = r
+            .query()
+            .get("cursor")
+            .and_then(|c| c.parse().ok())
+            .unwrap_or(0);
+        Reply::json(
+            "200 OK",
+            serde_json::json!({
+                "snapshots": [{
+                    "id": format!("snap_{page}"),
+                    "sizeBytes": 1_000_000,
+                    "status": "created"
+                }],
+                "pagination": {"next": page + 1}
+            }),
+        )
+    });
+    let snaps = rt()
+        .block_on(mock.client().snapshot_usage("tg-a"))
+        .expect("snapshots");
+    assert_eq!(snaps.len(), 20);
+    assert_eq!(snaps[0].id, "snap_0");
+    assert_eq!(snaps[19].id, "snap_19");
+    assert!(snaps.iter().all(|s| s.size_bytes == 1_000_000));
+    let reqs = mock.requests();
+    assert_eq!(reqs.len(), 20, "the page cap bounds the walk");
+    assert_eq!(reqs[0].path(), "/v2/sandboxes/snapshots");
+    assert_eq!(
+        reqs[0].query().get("name").map(String::as_str),
+        Some("tg-a")
+    );
+    assert!(!reqs[0].query().contains_key("cursor"));
+    assert_eq!(reqs[1].query().get("cursor").map(String::as_str), Some("1"));
+    mock.assert_custody(&[]);
+}
+
+#[test]
+fn snapshot_usage_stops_on_the_last_page() {
+    let mock = Mock::start(|_| {
+        Reply::json(
+            "200 OK",
+            serde_json::json!({
+                "snapshots": [{"id": "snap_1", "sizeBytes": 42, "status": "created"}],
+                "pagination": {"next": null}
+            }),
+        )
+    });
+    let snaps = rt()
+        .block_on(mock.client().snapshot_usage("tg-a"))
+        .expect("snapshots");
+    assert_eq!(snaps.len(), 1);
+    assert_eq!(snaps[0].size_bytes, 42);
+    assert_eq!(mock.requests().len(), 1);
+    mock.assert_custody(&[]);
 }
