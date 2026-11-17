@@ -298,7 +298,7 @@ fn resolve_inner(
     // The one call that does everything: sandbox preparation, bundle/identity
     // env, credential directories, build-cache mounts, the CPU cap, and the
     // `worktrees.agent` record.
-    let spec = crate::agent::launch_spec_full(
+    let mut spec = crate::agent::launch_spec_full(
         cfg,
         &worktree,
         branch.as_deref(),
@@ -315,6 +315,11 @@ fn resolve_inner(
             ..LaunchExtras::default()
         },
     )?;
+    // The audit-only caller label (THE-2184): daemon-launched agents say who
+    // they are to `thegn mcp serve`. Never an authorization input.
+    let (key, value) = caller_env(agent);
+    spec.env.retain(|(existing, _)| existing != &key);
+    spec.env.push((key, value));
     // The launch is committed: the daemon-owned session outlives this call, so
     // the prompt file stays until the age sweep in `prompt_file_dir` removes it.
     // Any refusal above dropped the still-armed file instead.
@@ -333,6 +338,16 @@ fn resolve_inner(
     }
 
     Ok(spec)
+}
+
+/// `THEGN_CALLER=agent:<name>` for a daemon-launched agent, sanitized
+/// ([`thegn_core::mcp::caller::sanitize`]): an audit label, self-asserted,
+/// never an authorization input.
+fn caller_env(agent: &str) -> (String, String) {
+    (
+        thegn_core::mcp::caller::CALLER_ENV.to_string(),
+        thegn_core::mcp::caller::sanitize(&format!("agent:{agent}")),
+    )
 }
 
 fn check_launch_command(cmd: &str) -> Result<()> {
@@ -1177,6 +1192,18 @@ mod tests {
             fork: false,
             native_session_id: Some("caller-supplied".into()),
         }
+    }
+
+    #[test]
+    fn daemon_launched_agents_carry_a_sanitized_caller_label() {
+        assert_eq!(
+            super::caller_env("pipeline-coder"),
+            (
+                "THEGN_CALLER".to_string(),
+                "agent:pipeline-coder".to_string()
+            )
+        );
+        assert_eq!(super::caller_env("bad name;rm").1, "invalid");
     }
 
     #[test]
