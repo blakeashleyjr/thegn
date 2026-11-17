@@ -7,17 +7,21 @@
 //!
 //! Local→remote ("local parity", provision-time) captures on the host and
 //! replays in the sandbox; remote→durable ("hibernate", reverse capture)
-//! captures IN the sandbox via [`capture_script`], whose output is parsed with
-//! [`parse_capture_output`] so the host can verify sizes/checksums before it
-//! trusts the download. Everything here is pure string work — no I/O — so it
-//! sits in core under the coverage gate.
+//! captures IN the sandbox via [`capture_script_staged`], whose output is parsed
+//! with [`parse_capture_output`] so the host can verify sizes/checksums before
+//! it trusts the download. Capture artifacts never touch a predictable path:
+//! both directions stage them in a per-operation directory the caller creates
+//! private (`umask 077`) and exclusive (`mkdir` fails if it already exists) via
+//! [`stage_dir_script`], and removes on every path. Everything here is pure
+//! string work — no I/O — so it sits in core under the coverage gate.
 
 use crate::snapshot_meta::ArtifactMeta;
 use crate::util::sh_quote;
 use sha2::{Digest, Sha256};
 
 /// The artifact short-names, in capture/replay order. These are the `<name>`
-/// in `/tmp/<stem>.<name>` on the sandbox side and the `TG-ART <name> …`
+/// in `<staging dir>/<name>` (or the legacy `/tmp/<stem>.<name>`) on the
+/// sandbox side and the `TG-ART <name> …`
 /// trailer lines a capture emits.
 pub const ARTIFACT_NAMES: [&str; 3] = ["bundle", "patch", "tar"];
 
@@ -46,7 +50,7 @@ pub struct CaptureArtifact {
     pub sha256: String,
 }
 
-/// Parsed result of running [`capture_script`] in a sandbox worktree.
+/// Parsed result of running [`capture_script_staged`] in a sandbox worktree.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CaptureReport {
     /// `HEAD` at capture time; `None` for an unborn branch (no commits yet).
@@ -129,7 +133,9 @@ impl std::fmt::Display for ReplayStage {
 }
 
 /// Build the sh script that captures the artifact triple INSIDE a sandbox
-/// worktree into `/tmp/<stem>.*` and prints a machine-readable trailer:
+/// worktree into the per-operation staging directory `dir` (`<dir>/bundle`,
+/// `<dir>/patch`, `<dir>/tar`, plus the transient `<dir>/list`) and prints a
+/// machine-readable trailer:
 ///
 /// ```text
 /// TG-HEAD <sha|none>
@@ -137,27 +143,30 @@ impl std::fmt::Display for ReplayStage {
 /// TG-ART <name> <bytes> <sha256>     (one line per non-empty artifact)
 /// ```
 ///
-/// Every stage is independently guarded and non-fatal; the trailer only
-/// reports artifacts that exist and are non-empty, so a partial capture is
-/// visible (not silently trusted) on the host side.
-pub fn capture_script(workdir: &str, stem: &str) -> String {
+/// The script never creates `dir`: the caller first runs
+/// [`stage_dir_script`] (private, exclusive `mkdir`) and fails closed when that
+/// fails, so no artifact ever touches a predictable or pre-planted path.
+/// Every capture stage is independently guarded and non-fatal; the trailer
+/// only reports artifacts that exist and are non-empty, so a partial capture
+/// is visible (not silently trusted) on the host side.
+pub fn capture_script_staged(workdir: &str, dir: &str) -> String {
     let wd = sh_quote(workdir);
-    let bundle = artifact_path(stem, "bundle");
-    let patch = artifact_path(stem, "patch");
-    let tar = artifact_path(stem, "tar");
-    let list = format!("/tmp/{stem}.list");
+    let bundle = sh_quote(&staged_artifact_path(dir, "bundle"));
+    let patch = sh_quote(&staged_artifact_path(dir, "patch"));
+    let tar = sh_quote(&staged_artifact_path(dir, "tar"));
+    let list = sh_quote(&staged_artifact_path(dir, "list"));
+    let qdir = sh_quote(dir);
     format!(
         "cd {wd} || exit 1; \
-         rm -f {bundle} {patch} {tar} {list} 2>/dev/null; \
          git bundle create {bundle} HEAD --not --remotes >/dev/null 2>&1 || true; \
          git diff HEAD --binary > {patch} 2>/dev/null || true; \
          git ls-files --others --exclude-standard -z > {list} 2>/dev/null || true; \
          if [ -s {list} ]; then tar -C {wd} --null -T {list} -czf {tar} 2>/dev/null || true; fi; \
-         rm -f {list} 2>/dev/null; \
+         rm -f -- {list} 2>/dev/null; \
          echo \"TG-HEAD $(git rev-parse HEAD 2>/dev/null || echo none)\"; \
          echo \"TG-BRANCH $(git rev-parse --abbrev-ref HEAD 2>/dev/null || echo HEAD)\"; \
          for n in bundle patch tar; do \
-           p=/tmp/{stem}.$n; \
+           p={qdir}/$n; \
            if [ -s \"$p\" ]; then \
              echo \"TG-ART $n $(wc -c < \"$p\" | tr -d ' ') $(sha256sum \"$p\" | cut -d' ' -f1)\"; \
            fi; \
@@ -165,7 +174,7 @@ pub fn capture_script(workdir: &str, stem: &str) -> String {
     )
 }
 
-/// Parse the trailer printed by [`capture_script`]. Tolerates arbitrary noise
+/// Parse the trailer printed by [`capture_script_staged`]. Tolerates arbitrary noise
 /// before/between the `TG-*` lines (git chatter), but every `TG-ART` line must
 /// be well-formed — a malformed report is an error, never a silent skip: the
 /// caller is about to destroy the VM on the strength of this report.
@@ -612,19 +621,111 @@ mod tests {
     }
 
     #[test]
-    fn capture_script_stages_are_guarded_and_trailer_is_emitted() {
+    fn staged_capture_script_stages_are_guarded_and_trailer_is_emitted() {
         // sh_quote passes safe paths through bare and quotes the rest.
-        let s = capture_script("/work/tree", "tg-snap");
+        let s = capture_script_staged("/work/tree", "/tmp/tg-parity-op");
         assert!(s.starts_with("cd /work/tree || exit 1;"));
-        assert!(s.contains("git bundle create /tmp/tg-snap.bundle HEAD --not --remotes"));
-        assert!(s.contains("git diff HEAD --binary > /tmp/tg-snap.patch"));
-        assert!(s.contains("git ls-files --others --exclude-standard -z"));
-        assert!(s.contains("tar -C /work/tree --null -T /tmp/tg-snap.list -czf /tmp/tg-snap.tar"));
+        assert!(s.contains("git bundle create /tmp/tg-parity-op/bundle HEAD --not --remotes"));
+        assert!(s.contains("git diff HEAD --binary > /tmp/tg-parity-op/patch"));
+        assert!(s.contains("git ls-files --others --exclude-standard -z > /tmp/tg-parity-op/list"));
+        assert!(s.contains(
+            "tar -C /work/tree --null -T /tmp/tg-parity-op/list -czf /tmp/tg-parity-op/tar"
+        ));
+        assert!(s.contains("rm -f -- /tmp/tg-parity-op/list"));
         assert!(s.contains("TG-HEAD"));
         assert!(s.contains("TG-BRANCH"));
         assert!(s.contains("sha256sum"));
-        let odd = capture_script("/work/my tree", "tg-snap");
+        // The trailer loop reads the artifacts back out of the staging dir.
+        assert!(s.contains("for n in bundle patch tar; do p=/tmp/tg-parity-op/$n;"));
+        // No predictable shared-/tmp path remains, and the script never creates
+        // (or pre-deletes) the staging dir itself: the caller's exclusive mkdir
+        // owns that.
+        assert!(!s.contains("tg-hib"));
+        assert!(!s.contains("/tmp/tg-parity-op."));
+        assert!(!s.contains("mkdir"));
+        assert!(!s.contains("rm -rf"));
+        let odd = capture_script_staged("/work/my tree", "/tmp/tg-parity-op");
         assert!(odd.starts_with("cd '/work/my tree' || exit 1;"));
+    }
+
+    #[test]
+    fn staged_capture_script_quotes_every_staged_path() {
+        let s = capture_script_staged("/wd", "/tmp/stage dir");
+        for name in ["bundle", "patch", "tar", "list"] {
+            assert!(
+                s.contains(&format!("'/tmp/stage dir/{name}'")),
+                "{name} unquoted in: {s}"
+            );
+        }
+        assert!(s.contains("p='/tmp/stage dir'/$n;"), "{s}");
+        // Every occurrence of the dir is inside a quoted word.
+        assert_eq!(
+            s.matches("/tmp/stage dir").count(),
+            s.matches("'/tmp/stage dir").count()
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn staged_capture_script_runs_and_its_trailer_parses() {
+        use std::process::Command;
+
+        let repo = tempfile::tempdir().unwrap();
+        let run_git = |args: &[&str]| {
+            crate::util::git_cmd(repo.path())
+                .arg("-c")
+                .arg("commit.gpgsign=false")
+                .env("GIT_CONFIG_GLOBAL", "/dev/null")
+                .args(args)
+                .output()
+                .unwrap()
+        };
+        assert!(run_git(&["init", "-q"]).status.success());
+        assert!(
+            run_git(&["config", "user.name", "Capture Test"])
+                .status
+                .success()
+        );
+        assert!(
+            run_git(&["config", "user.email", "capture@example.invalid"])
+                .status
+                .success()
+        );
+        std::fs::write(repo.path().join("tracked.txt"), "one\n").unwrap();
+        assert!(run_git(&["add", "tracked.txt"]).status.success());
+        assert!(run_git(&["commit", "-q", "-m", "initial"]).status.success());
+        let head = String::from_utf8(run_git(&["rev-parse", "HEAD"]).stdout).unwrap();
+        std::fs::write(repo.path().join("tracked.txt"), "two\n").unwrap();
+        std::fs::write(repo.path().join("untracked.txt"), "new\n").unwrap();
+
+        let parent = tempfile::tempdir().unwrap();
+        let dir = parent.path().join("stage dir");
+        let dir = dir.to_str().unwrap();
+        let sh = |script: &str| {
+            Command::new("sh")
+                .arg("-c")
+                .arg(script)
+                .env("GIT_CONFIG_GLOBAL", "/dev/null")
+                .env("GIT_CONFIG_NOSYSTEM", "1")
+                .output()
+                .unwrap()
+        };
+        assert!(sh(&stage_dir_script(dir)).status.success());
+        // The staging mkdir is exclusive: a second attempt fails closed.
+        assert!(!sh(&stage_dir_script(dir)).status.success());
+
+        let out = sh(&capture_script_staged(repo.path().to_str().unwrap(), dir));
+        assert!(out.status.success(), "{out:?}");
+        let report = parse_capture_output(&String::from_utf8_lossy(&out.stdout)).unwrap();
+        assert_eq!(report.head.as_deref(), Some(head.trim()));
+        for name in ARTIFACT_NAMES {
+            let artifact = report.artifact(name).unwrap_or_else(|| panic!("{name}"));
+            let data = std::fs::read(staged_artifact_path(dir, name)).unwrap();
+            assert_eq!(artifact.bytes, data.len() as u64, "{name}");
+            assert_eq!(artifact.sha256, format!("{:x}", Sha256::digest(&data)));
+        }
+        // The transient untracked list is removed after the tar stage.
+        assert!(!std::path::Path::new(&staged_artifact_path(dir, "list")).exists());
     }
 
     #[test]
