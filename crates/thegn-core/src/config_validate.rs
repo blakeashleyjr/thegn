@@ -638,6 +638,10 @@ pub(crate) fn typed_semantic_errors(cfg: &Config, mode: SemanticMode) -> Vec<Str
     // bounded; otherwise an empty substring would match every line.
     batch!(cfg.notifications.validate());
     batch!(cfg.automations.validate());
+    if let Some(lead) = &cfg.lead {
+        batch!(lead.validate(&cfg.agents));
+    }
+    batch!(cfg.mcp_proxy.validate(&cfg.mcp_servers));
     for (name, profile) in &cfg.profiles {
         if profile.automations.is_empty() {
             continue;
