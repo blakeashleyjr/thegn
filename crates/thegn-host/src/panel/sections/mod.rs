@@ -673,6 +673,9 @@ pub fn summary(section: Section, model: &crate::chrome::FrameModel) -> Vec<Seg> 
                 .loc
                 .as_ref()
                 .map(|r| compact_count(r.total_code as u64));
+            if matches!(data.files_load, crate::panel::gitui::DocLoad::Failed(_)) {
+                return vec![seg(g(), "? files")];
+            }
             match (data.file_count, loc) {
                 (Some(n), Some(loc)) => vec![seg(g(), format!("{n} · {loc} loc"))],
                 (None, Some(loc)) => vec![seg(g(), format!("{loc} loc"))],
