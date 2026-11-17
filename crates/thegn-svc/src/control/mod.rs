@@ -211,6 +211,39 @@ pub struct OpenSpec {
     pub automation_origin: Option<AutomationOrigin>,
 }
 
+/// The authenticated Lead caller behind a [`ControlApi::open_confined`] call,
+/// for the audit record. Built by the transport from the verified token,
+/// never from the request.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LeadCaller {
+    /// The token's public id.
+    pub pairing_id: String,
+    /// The pairing label (`lead` / `lead:<group>/<tab>`).
+    pub label: String,
+}
+
+/// The parts of an [`OpenSpec`] the Lead confinement
+/// ([`thegn_core::lead_confine::check`]) inspects. Shared by the HTTP
+/// transport and the daemon's own re-check, so both judge the same fields.
+pub fn lead_open_shape(spec: &OpenSpec) -> thegn_core::lead_confine::OpenShape<'_> {
+    use thegn_core::lead_confine::{AgentShape, OpenShape};
+    OpenShape {
+        argv_len: spec.argv.len(),
+        env_len: spec.env.len(),
+        cwd: spec.cwd.as_deref(),
+        worktree: spec.worktree.as_deref(),
+        agent: spec.agent.as_ref().map(|a| AgentShape {
+            name: a.agent.as_str(),
+            prompt_len: a.prompt.len(),
+            widen_permissions: a.widen_permissions,
+            fork: a.fork,
+            native_session_id: a.native_session_id.is_some(),
+        }),
+        already_capped: spec.already_capped,
+        automation_origin: spec.automation_origin.is_some(),
+    }
+}
+
 /// Largest PTY row count the daemon accepts: an upper bound on any PTY
 /// geometry the daemon accepts; the emulator allocates rows x cols cells.
 pub const MAX_PTY_ROWS: u16 = 1000;
@@ -1086,6 +1119,26 @@ pub trait ControlApi: Send + Sync + 'static {
 
     /// Open a fresh session (a PTY running `spec.argv`).
     fn open(&self, spec: OpenSpec) -> BoxFuture<'_, ControlResult<SessionInfo>>;
+
+    /// Open a session for a Lead-confined caller ([`thegn_core::lead_confine`]).
+    /// The transport has already checked the request's shape (a configured
+    /// agent by name, no argv/env); the impl must also refuse a worktree that
+    /// is not registered and a launch that does not resolve to a contained
+    /// sandbox backend ([`thegn_core::lead_confine::check_resolved_open`]),
+    /// auditing the refusal. The default refuses: an impl that cannot prove
+    /// both launches nothing for the Lead.
+    fn open_confined(
+        &self,
+        _spec: OpenSpec,
+        _caller: LeadCaller,
+    ) -> BoxFuture<'_, ControlResult<SessionInfo>> {
+        Box::pin(async {
+            Err(ControlError::FailedPrecondition(format!(
+                "{}this daemon cannot verify a Lead worker's sandbox",
+                thegn_core::lead_confine::REFUSAL_PREFIX
+            )))
+        })
+    }
 
     /// Fork a live daemon or recorded harness session. The default keeps
     /// transport-only adapters honest until they implement the spawn owner.

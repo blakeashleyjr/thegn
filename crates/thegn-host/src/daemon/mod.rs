@@ -1566,6 +1566,7 @@ async fn run(
         // CORS is applied here (the allowlist rides the TCP listener below).
         cors_origins: Vec::new(),
         event_streams: Default::default(),
+        lead_listener: false,
     };
     let local_grpc = thegn_svc::control::grpc::GrpcControl {
         api: svc.clone(),
@@ -1621,6 +1622,7 @@ async fn run(
             // validation).
             cors_origins: cfg.serve.cors_origins.clone(),
             event_streams: Default::default(),
+            lead_listener: false,
         };
         let grpc = thegn_svc::control::grpc::GrpcControl {
             api: svc.clone(),
@@ -1700,6 +1702,7 @@ async fn run(
         server_label: format!("{} thegn {}", hostname(), env!("CARGO_PKG_VERSION")),
         cors_origins: Vec::new(),
         event_streams: Default::default(),
+        lead_listener: false,
     };
     lead_caps::listener::spawn(cfg, lead_state);
 

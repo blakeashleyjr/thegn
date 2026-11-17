@@ -28,6 +28,7 @@ use std::sync::{Arc, Mutex};
 use thegn_core::control::{ScopeSet, TokenKind, Verb, required_scope};
 use thegn_core::control_audit::{AuditOutcome, AuditRecord, is_audited};
 use thegn_core::control_wire::{EventFrame, FeedFilter, Hello, PROTO_VERSION, PairingState};
+use thegn_core::lead_confine::RequestShape;
 use thegn_core::store::ControlStore;
 
 use super::auth::{self, AuthCtx};
@@ -58,6 +59,11 @@ pub struct ControlState {
     pub cors_origins: Vec<String>,
     /// Per-listener WebSocket event-stream admission and lifecycle counters.
     pub event_streams: EventStreamMetrics,
+    /// This is the Lead's dedicated listener: every caller on it is
+    /// Lead-confined ([`thegn_core::lead_confine`]), whatever its token's
+    /// label. Set by the daemon when it builds that listener, never by a
+    /// request.
+    pub lead_listener: bool,
 }
 
 /// Test-visible lifecycle counters shared by clones of one control listener.
@@ -340,6 +346,23 @@ pub(super) fn authed_target(
     verb: Verb,
     target: &str,
 ) -> Result<AuthCtx, Response> {
+    authed_shaped(state, headers, verb, target, &RequestShape::Opaque)
+}
+
+/// [`authed_target`] for the verbs whose Lead confinement depends on the
+/// request body (`sessions.open`, `dispatches.put`): the handler describes the
+/// parsed body as a [`RequestShape`]. Every authenticated route reaches the
+/// Lead check through here, so a Lead-confined caller ([`AuthCtx::lead_confined`])
+/// is held to [`thegn_core::lead_confine::check`] on every verb; any other
+/// caller is untouched.
+#[allow(clippy::result_large_err)]
+pub(super) fn authed_shaped(
+    state: &ControlState,
+    headers: &HeaderMap,
+    verb: Verb,
+    target: &str,
+    shape: &RequestShape<'_>,
+) -> Result<AuthCtx, Response> {
     let ctx = if auth::implicit_local_admin(
         state.local_admin,
         state.daemon_euid,
@@ -357,7 +380,7 @@ pub(super) fn authed_target(
         };
         let store = state.store.lock().expect("control store lock");
         match auth::verify(&*store, &token, now_ms()) {
-            Some(ctx) => ctx,
+            Some(ctx) => ctx.on_listener(state.lead_listener),
             None => {
                 drop(store);
                 audit_anon(verb, target, AuditOutcome::Unauthorized);
@@ -393,6 +416,16 @@ pub(super) fn authed_target(
             "route-to-host token is not authorized for this worktree",
         ));
     }
+    if ctx.lead_confined
+        && let Err(refusal) = thegn_core::lead_confine::check(verb, shape)
+    {
+        audit(&ctx, verb, target, AuditOutcome::LeadConfined);
+        return Err(error_json(
+            StatusCode::FORBIDDEN,
+            ControlErrorCode::NoScope,
+            &refusal.to_string(),
+        ));
+    }
     // A mutating call that authorized: record its attribution. (The action's
     // own errors surface in the handler's response; this record proves who was
     // allowed to invoke what, against which resource.)
@@ -414,6 +447,14 @@ pub(super) fn bad_request(message: &str) -> Response {
 /// Emit one audit record for an authenticated caller.
 fn audit(ctx: &AuthCtx, verb: Verb, target: &str, outcome: AuditOutcome) {
     emit_audit(&ctx.pairing_id, &ctx.label, verb, target, outcome);
+}
+
+/// Audit a Lead-confinement refusal decided after authentication (the
+/// daemon's registered-worktree and sandbox checks on `sessions.open`, and
+/// Lead-authored automation rules), on the same `thegn::control::audit` path
+/// the transports use.
+pub fn audit_lead_refusal(pairing_id: &str, label: &str, verb: Verb, target: &str) {
+    emit_audit(pairing_id, label, verb, target, AuditOutcome::LeadConfined);
 }
 
 /// Emit an audit record for a rejected request with no resolvable caller (no
@@ -836,15 +877,28 @@ pub(super) async fn open_session(
     headers: HeaderMap,
     body: axum::Json<OpenSpec>,
 ) -> Response {
-    if let Err(r) = authed_target(
+    let ctx = match authed_shaped(
         &state,
         &headers,
         Verb::OpenSession,
         body.worktree.as_deref().unwrap_or_default(),
+        &RequestShape::Open(super::lead_open_shape(&body)),
     ) {
-        return r;
-    }
-    match state.api.open(body.0).await {
+        Ok(ctx) => ctx,
+        Err(r) => return r,
+    };
+    let opened = if ctx.lead_confined {
+        // The shape passed; the daemon still proves the worktree is
+        // registered and the launch sandboxed (and audits a refusal).
+        let caller = super::LeadCaller {
+            pairing_id: ctx.pairing_id,
+            label: ctx.label,
+        };
+        state.api.open_confined(body.0, caller).await
+    } else {
+        state.api.open(body.0).await
+    };
+    match opened {
         Ok(info) => axum::Json(info).into_response(),
         Err(e) => e.into_response(),
     }
@@ -1454,7 +1508,10 @@ pub(super) async fn dispatch_put(
     headers: HeaderMap,
     body: axum::Json<super::DispatchPutReq>,
 ) -> Response {
-    if let Err(r) = authed(&state, &headers, Verb::DispatchesPut) {
+    let shape = RequestShape::DispatchPut {
+        session_id: body.session_id.is_some(),
+    };
+    if let Err(r) = authed_shaped(&state, &headers, Verb::DispatchesPut, "", &shape) {
         return r;
     }
     match state.api.dispatch_put(body.0).await {
