@@ -406,20 +406,28 @@ fn stage_dir(
     id: &str,
     exec_env: &[(String, String)],
 ) -> anyhow::Result<String> {
-    let dir = crate::parity::random_staging_dir()?;
-    let (code, out) = sandbox_sh(provider, id, &syncstate::stage_dir_script(&dir), exec_env)
-        .with_context(|| format!("create staging directory {dir} in the sandbox"))?;
-    anyhow::ensure!(
-        code == 0,
-        "staging directory {dir} could not be created privately (exit {code}): {}",
-        crate::provision_recover::stderr_gist(&out)
-    );
-    Ok(dir)
+    stage_dir_with(&ProviderSeed {
+        provider,
+        id,
+        exec_env,
+    })
 }
 
 fn remove_stage_dir(provider: &Provider, id: &str, dir: &str, exec_env: &[(String, String)]) {
+    remove_stage_dir_with(
+        &ProviderSeed {
+            provider,
+            id,
+            exec_env,
+        },
+        dir,
+    );
+}
+
+/// Remove a staging directory through `t`; a failure is logged, not raised.
+fn remove_stage_dir_with(t: &dyn SeedTransport, dir: &str) {
     let script = format!("rm -rf -- {}", thegn_core::util::sh_quote(dir));
-    match sandbox_sh(provider, id, &script, exec_env) {
+    match t.sh(&script) {
         Ok((0, _)) => {}
         Ok((code, out)) => tracing::warn!(
             target: "thegn::git_audit",
@@ -437,6 +445,54 @@ fn remove_stage_dir(provider: &Provider, id: &str, dir: &str, exec_env: &[(Strin
     }
 }
 
+/// How the bundle seed reaches the remote side: run a `/bin/sh` script there
+/// (stderr folded into the output) and write a file there. Implemented by a
+/// managed provider ([`ProviderSeed`]) and by a plain ssh host
+/// (`crate::ssh_seed::SshSeed`), so both seed through one code path.
+pub(crate) trait SeedTransport {
+    /// Run `script` remotely; returns `(exit code, combined output)`.
+    fn sh(&self, script: &str) -> anyhow::Result<(i32, String)>;
+    /// Write `bytes` to the remote `path` (its directory is the staging dir).
+    fn write(&self, path: &str, bytes: &[u8]) -> anyhow::Result<()>;
+    /// A short name for the remote side, for error messages.
+    fn label(&self) -> String;
+}
+
+/// [`SeedTransport`] over a managed provider's exec + files API.
+pub(crate) struct ProviderSeed<'a> {
+    pub(crate) provider: &'a Provider,
+    pub(crate) id: &'a str,
+    pub(crate) exec_env: &'a [(String, String)],
+}
+
+impl SeedTransport for ProviderSeed<'_> {
+    fn sh(&self, script: &str) -> anyhow::Result<(i32, String)> {
+        sandbox_sh(self.provider, self.id, script, self.exec_env)
+    }
+
+    fn write(&self, path: &str, bytes: &[u8]) -> anyhow::Result<()> {
+        block_on_provider(|| async { self.provider.write(self.id, path, bytes).await })
+    }
+
+    fn label(&self) -> String {
+        "the sandbox".to_string()
+    }
+}
+
+/// Create a private staging directory through `t`; returns its path.
+fn stage_dir_with(t: &dyn SeedTransport) -> anyhow::Result<String> {
+    let dir = crate::parity::random_staging_dir()?;
+    let (code, out) = t
+        .sh(&syncstate::stage_dir_script(&dir))
+        .with_context(|| format!("create staging directory {dir} in {}", t.label()))?;
+    anyhow::ensure!(
+        code == 0,
+        "staging directory {dir} could not be created privately (exit {code}): {}",
+        crate::provision_recover::stderr_gist(&out)
+    );
+    Ok(dir)
+}
+
 /// Seed the sandbox repository at `workdir` from a bundle of the local
 /// `branch` in `worktree` (the plan's `bundle_seed` step). NOT best-effort:
 /// any failure fails the step, since without it the sandbox has no repository.
@@ -448,6 +504,24 @@ pub(crate) fn seed_from_bundle(
     workdir: &str,
     branch: &str,
     exec_env: &[(String, String)],
+) -> anyhow::Result<()> {
+    let t = ProviderSeed {
+        provider,
+        id,
+        exec_env,
+    };
+    seed_from_bundle_with(&t, worktree, workdir, branch)
+}
+
+/// [`seed_from_bundle`] over any [`SeedTransport`]: bundle the local branch,
+/// stage it remotely, run [`syncstate::bundle_seed_script`] and fail on
+/// anything but a clean exit (the `TG-SEED-ERROR:` marker names the step).
+// off-loop: provisioning path — reached only via spawn_blocking / the pool thread / CLI.
+pub(crate) fn seed_from_bundle_with(
+    t: &dyn SeedTransport,
+    worktree: &str,
+    workdir: &str,
+    branch: &str,
 ) -> anyhow::Result<()> {
     let wt = Path::new(worktree);
     check_branch_name(wt, branch)?;
@@ -463,13 +537,14 @@ pub(crate) fn seed_from_bundle(
     }
     let bytes = std::fs::read(&bundle).with_context(|| format!("read {}", bundle.display()))?;
 
-    let dir = stage_dir(provider, id, exec_env)?;
+    let dir = stage_dir_with(t)?;
     let staged = syncstate::staged_artifact_path(&dir, "seed.bundle");
-    block_on_provider(|| async { provider.write(id, &staged, &bytes).await })
+    t.write(&staged, &bytes)
         .with_context(|| format!("upload the repository bundle to {staged}"))?;
     let script = syncstate::bundle_seed_script(workdir, &staged, branch, &tip);
-    let (code, out) = sandbox_sh(provider, id, &script, exec_env)
-        .context("seed the sandbox repository from the bundle")?;
+    let (code, out) = t
+        .sh(&script)
+        .with_context(|| format!("seed the {} repository from the bundle", t.label()))?;
     if code != 0 {
         let marker = out
             .lines()

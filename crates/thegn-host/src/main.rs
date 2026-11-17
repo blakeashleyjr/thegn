@@ -298,6 +298,7 @@ mod snapshot_slot;
 #[cfg(test)]
 mod spawn_ratchet_tests;
 mod sprite_bridge;
+mod ssh_seed;
 mod ssh_shim;
 mod stage_prompt;
 mod stage_worker_hold;
