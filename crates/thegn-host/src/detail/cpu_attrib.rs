@@ -237,11 +237,20 @@ fn record(h: &mut History, ids_vals: &[(String, Option<f32>)], now: Instant) {
 /// different parents stay distinct.
 fn row_ids(rows: &[AttribRow]) -> Vec<String> {
     let mut path: Vec<&str> = Vec::new();
+    let mut seen: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
     rows.iter()
         .map(|r| {
             path.truncate(usize::from(r.depth));
             path.push(&r.label);
-            path.join("\u{1f}")
+            let id = path.join("\u{1f}");
+            let n = seen.entry(id.clone()).or_insert(0);
+            let out = if *n == 0 {
+                id
+            } else {
+                format!("{id}\u{1f}#{n}")
+            };
+            *n += 1;
+            out
         })
         .collect()
 }
@@ -470,6 +479,20 @@ mod tests {
     use std::time::{Duration, Instant};
     use termwiz::input::{KeyCode, Modifiers};
     use thegn_core::cpu_attrib::{PaneOwner, SortKey};
+
+    #[test]
+    fn row_ids_are_unique_for_equal_sibling_labels() {
+        let r = |l: &str| AttribRow {
+            depth: 0,
+            kind: RowKind::Workspace,
+            label: l.into(),
+            cpu_pct: None,
+            share_of_total: None,
+            rss: None,
+        };
+        let ids = row_ids(&[r("x"), r("x")]);
+        assert_ne!(ids[0], ids[1]);
+    }
 
     fn model() -> FrameModel {
         let owner = |id: u32, ws: &str, wt: &str| PaneOwner {
@@ -835,6 +858,7 @@ mod tests {
         assert!(!trend_of(&slot, "alpha|").is_empty());
         assert!(!trend_of(&slot, "alpha|").is_ascii());
         crate::caps::test_override::with_unicode(thegn_core::termcaps::UnicodeLevel::Ascii, || {
+            assert!(refresh_open(&mut slot, &model(), &ctx));
             let t = trend_of(&slot, "alpha|");
             assert!(!t.is_empty() && t.is_ascii(), "{t:?}");
         });
