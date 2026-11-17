@@ -897,7 +897,7 @@ pub(crate) fn read_open_regular_capped(file: std::fs::File, cap: u64) -> Result<
 /// Resolve a caller path (allowing a final symlink), then open the resolved
 /// path without following a final symlink. Validate the opened handle too.
 /// Nonblocking open prevents a path swapped to a FIFO from parking the caller.
-fn open_regular_nonblocking(path: &Path) -> Result<std::fs::File, String> {
+pub(crate) fn open_regular_nonblocking(path: &Path) -> Result<std::fs::File, String> {
     let canonical = path
         .canonicalize()
         .map_err(|e| format!("read failed: {e}"))?;
