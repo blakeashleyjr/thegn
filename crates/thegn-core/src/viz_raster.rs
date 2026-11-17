@@ -889,6 +889,24 @@ mod tests {
     }
 
     #[test]
+    fn scatter_reused_buffer_matches_fresh() {
+        let sets: [&[(f32, f32)]; 3] = [&[(0.0, 0.0), (1.0, 1.0), (0.5, 0.5)], &[(0.2, 0.9)], &[]];
+        let mut reused = CellBuf::new();
+        for table in [&RasterTable::FULL, &RasterTable::ASCII] {
+            for points in sets {
+                for (w, h) in [(8, 3), (5, 2), (8, 3)] {
+                    reused.reset(w, h);
+                    scatter(points, table, &mut reused);
+                    let mut fresh = CellBuf::new();
+                    fresh.reset(w, h);
+                    scatter(points, table, &mut fresh);
+                    assert_eq!(reused, fresh);
+                }
+            }
+        }
+    }
+
+    #[test]
     fn scatter_braille_golden_and_corners() {
         let mut b = CellBuf::new();
         b.reset(2, 1);
