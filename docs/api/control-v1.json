@@ -1813,6 +1813,14 @@
         "id": {
           "type": "string"
         },
+        "last_output_unix_secs": {
+          "description": "Unix seconds when the session last produced PTY output. `None` when it has produced none yet, or when the daemon predates this field.",
+          "format": "int64",
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
         "lease_expires_at": {
           "description": "Set while a relay lease is keeping this detached session warm.",
           "format": "int64",
