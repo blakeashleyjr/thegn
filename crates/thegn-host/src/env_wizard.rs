@@ -38,6 +38,13 @@ const KINDS: &[&str] = &[
     "vercel",
 ];
 
+/// Read-only note shown for the vercel kind. The wizard never writes
+/// `model_credentials`; the user sets it in their own config.
+const VERCEL_MODEL_CREDENTIALS_NOTE: [&str; 2] = [
+    "model credentials: none (nothing is sent).",
+    "To change: config model_credentials; F1 vercel-sandbox",
+];
+
 /// Probe keyring availability on a detached thread, returning the shared
 /// tri-state the wizard reads (0 = probing, 1 = available, 2 = unavailable).
 /// The probe is a synchronous D-Bus round-trip that can stall for ~25s on a
@@ -325,7 +332,7 @@ impl EnvWizard {
             title: "new environment".to_string(),
             badge: Some(" env ".into()),
             cols: 60,
-            rows: fields.len() + 2,
+            rows: fields.len() + 2 + if self.kind() == "vercel" { 2 } else { 0 },
             anchor: Anchor::Center,
             ..LayerSpec::default()
         };
@@ -349,6 +356,18 @@ impl EnvWizard {
                 _ => self.text_row(*f, focused),
             };
             seg::draw_line(surface, inner.x, y, inner.cols, &line, panel);
+        }
+        if self.kind() == "vercel" {
+            for (i, text) in VERCEL_MODEL_CREDENTIALS_NOTE.iter().enumerate() {
+                seg::draw_line(
+                    surface,
+                    inner.x,
+                    inner.y + fields.len() + i,
+                    inner.cols,
+                    &Line::segs(vec![seg(Tok::Slot(S::Faint), (*text).to_string())]),
+                    panel,
+                );
+            }
         }
         // Footer: token-storage hint (cloud kinds) + key legend.
         let store_hint = if self.is_cloud() {
@@ -547,5 +566,24 @@ mod tests {
             v <= 2,
             "keyring tri-state is one of probing/available/unavailable"
         );
+    }
+
+    #[test]
+    fn vercel_note_is_read_only_and_never_writes_model_credentials() {
+        let mut w = EnvWizard::with_kind(&Config::default(), "vercel");
+        assert_eq!(w.kind(), "vercel");
+        assert!(VERCEL_MODEL_CREDENTIALS_NOTE[0].starts_with("model credentials: none"));
+        w.focus = Field::Name;
+        typ(&mut w, "vx");
+        w.focus = Field::TeamId;
+        typ(&mut w, "team_abc");
+        w.focus = Field::ProjectId;
+        typ(&mut w, "prj_abc");
+        match w.submit() {
+            Outcome::Submit(args) => {
+                assert!(!format!("{args:?}").contains("model_credentials"));
+            }
+            _ => panic!("expected submit"),
+        }
     }
 }

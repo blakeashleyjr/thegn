@@ -3752,6 +3752,8 @@ pub(crate) fn build_panel(
     let (environments, environments_error) = crate::env_ui::env_panel(app_cfg, || {
         db.effective_env_checked(&cwd.to_string_lossy(), &scope_repo_root.to_string_lossy())
     });
+    let mut environments = environments;
+    crate::env_ui::mark_unpulled(&mut environments, app_cfg, &cwd.to_string_lossy());
     panel.environments = environments;
     panel.environments_error = environments_error;
     let toolchain_root = thegn_core::repo::main_worktree(cwd).unwrap_or_else(|| cwd.to_path_buf());
