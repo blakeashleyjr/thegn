@@ -10,7 +10,7 @@
 # SHRINK-ONLY. Enforced by crates/thegn-core/tests/env_overlay_coverage.rs;
 # regenerate with `just ratchet-update` (THEGN_RATCHET_UPDATE=1).
 
-# lead.*, mcp_proxy.profiles — Lead is configured per machine; no CI job flips it.
+# lead.* — Lead is configured per machine; no CI job flips it.
 # autopilot.* — issue pickup is a trusted file/workspace policy, not a
 # launcher/environment switch; enabling it can run commands and make forge
 # writes, so every key stays file-only.
@@ -235,7 +235,6 @@ mcp_proxy.cooldown_secs
 mcp_proxy.enabled
 mcp_proxy.failure_threshold
 mcp_proxy.health_interval_secs
-mcp_proxy.profiles
 mcp_proxy.request_timeout_secs
 media.backend
 media.default_action
