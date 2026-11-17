@@ -133,6 +133,8 @@ pub(crate) struct LiveMeta {
     /// Current harness-error bit, included in the authoritative session-list
     /// snapshot used by reconnecting compositor bridges.
     pub error_active: bool,
+    /// Unix seconds of the last PTY output (stored on the existing output path).
+    pub last_output_unix_secs: Option<i64>,
 }
 
 /// The static identity of a session, fixed at open.
@@ -168,6 +170,7 @@ impl SessionMeta {
             final_state: None,
             recording: live.recording.clone(),
             forked_from: self.forked_from.clone(),
+            last_output_unix_secs: live.last_output_unix_secs,
         }
     }
 }
@@ -673,6 +676,7 @@ impl SessionActor {
         // Output is the busy signal. Fold it now rather than waiting for the
         // tick, so a `Probe` between chunks sees `working` immediately.
         self.activity.note_output(unix_now_secs());
+        record_last_output(&self.live, now_unix_secs_i64());
         self.observe_activity();
         self.check_matchers(self.history.total_pushed() - pushed_before);
 
@@ -1353,6 +1357,7 @@ impl SessionActor {
                 .map(str::to_string)
                 .collect(),
             last_state: self.state(),
+            last_output_unix_secs: self.live.lock().ok().and_then(|l| l.last_output_unix_secs),
             // Who was watching at death — the retry observer's scope gate.
             attached,
             rows,
@@ -1360,6 +1365,18 @@ impl SessionActor {
             recording: self.record_last_path.clone(),
         }
     }
+}
+
+/// Stamp the last-output time into the shared listing row. A plain store under
+/// an already-existing mutex: no timer, no wake source.
+fn record_last_output(live: &Mutex<LiveMeta>, at: i64) {
+    if let Ok(mut live) = live.lock() {
+        live.last_output_unix_secs = Some(at);
+    }
+}
+
+fn now_unix_secs_i64() -> i64 {
+    now_ms() / 1000
 }
 
 /// Sleep until `at`, or forever when there is nothing to wait for.
@@ -3410,5 +3427,12 @@ mod tests {
             .expect("release blocked writer after actor exit");
         await_zero(&inflight, "recording inflight bytes").await;
         await_zero(&slots, "recording worker slots").await;
+    }
+    #[test]
+    fn record_last_output_stamps_the_listing_row() {
+        let live = Mutex::new(LiveMeta::default());
+        assert_eq!(live.lock().unwrap().last_output_unix_secs, None);
+        record_last_output(&live, 1234);
+        assert_eq!(live.lock().unwrap().last_output_unix_secs, Some(1234));
     }
 }
