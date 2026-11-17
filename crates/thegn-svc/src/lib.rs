@@ -45,6 +45,7 @@ pub mod share;
 pub mod snapshot;
 #[cfg(test)]
 mod spawn_ratchet_tests;
+pub mod state_promote;
 pub mod usage;
 pub mod voice;
 pub mod voice_http;
