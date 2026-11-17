@@ -383,7 +383,7 @@ pub(super) fn authed_target(
         audit(&ctx, verb, target, AuditOutcome::NoScope);
         return Err(e.into_response());
     }
-    if matches!(verb, Verb::MergeAdd)
+    if matches!(verb, Verb::MergeAdd | Verb::MergeDrain)
         && !thegn_core::control::route_to_host_token_allows_worktree(ctx.scopes, &ctx.label, target)
     {
         audit(&ctx, verb, target, AuditOutcome::NoScope);
