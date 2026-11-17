@@ -10,6 +10,8 @@ use crate::seg::{Line, Seg, seg, sp};
 
 use crate::seg::seg_width;
 
+use crate::panel::gitui::GitView;
+
 use super::{
     ChangeRow, PanelHit, PanelRow, PanelUi, Section, SectionCtx, Stage, d, diff_count_label,
     diffstat, f, g, g2, hint_row, hue, split_bar, t,
@@ -86,15 +88,31 @@ fn list(ctx: &SectionCtx) -> Vec<PanelRow> {
     // is live we split the two with a labeled `◇ N incoming from <onto>` divider,
     // and collapse the (often huge) incoming block until the section is expanded
     // (`e`) — so the user's own edits aren't buried under the merge dump.
+    if let Some(fr) = super::filter_row(ui, GitView::Files, data.changes.len()) {
+        rows.push(fr);
+    }
+    // A live non-empty filter renders flat in `display_map` order (no incoming
+    // collapse) so display and dispatch agree; rows keep their SOURCE index.
+    let filtering = ui
+        .git
+        .filter
+        .as_ref()
+        .is_some_and(|f| f.view == GitView::Files && !f.query.is_empty());
+    let order = super::filtered_indices(ui, GitView::Files, data.changes.len(), |i| {
+        data.changes[i].path.clone()
+    });
     let mut incoming_header_done = false;
-    for (i, c) in data.changes.iter().enumerate() {
-        if c.incoming && !incoming_header_done {
-            rows.push(incoming_divider(data, deep, ctx.cols));
-            incoming_header_done = true;
-        }
-        // Collapsed: the divider already summarizes the incoming files.
-        if c.incoming && !deep {
-            continue;
+    for i in order {
+        let c = &data.changes[i];
+        if !filtering {
+            if c.incoming && !incoming_header_done {
+                rows.push(incoming_divider(data, deep, ctx.cols));
+                incoming_header_done = true;
+            }
+            // Collapsed: the divider already summarizes the incoming files.
+            if c.incoming && !deep {
+                continue;
+            }
         }
         let on = ui.chg_sel == Some(i);
         rows.push(change_row(c, i, on, deep, ctx.cols));
@@ -1458,5 +1476,117 @@ mod tests {
         let rendered = flat(&hunk_preview(&chg("src/a.rs", false, 1), &ui, false, 44));
         assert!(rendered.contains("@@ -1 +1 @@"), "rendered: {rendered}");
         assert!(!rendered.contains("unavailable"), "rendered: {rendered}");
+    }
+
+    fn filter_chg(path: &str, incoming: bool) -> ChangeRow {
+        let name = path.rsplit('/').next().unwrap_or(path).to_string();
+        ChangeRow {
+            status: "M".into(),
+            stage: Stage::Unstaged,
+            dir: path[..path.len() - name.len()].into(),
+            name,
+            path: path.into(),
+            added: 1,
+            deleted: 0,
+            count: thegn_svc::git::DiffCount::Exact(1),
+            submodule: None,
+            incoming,
+        }
+    }
+
+    fn filter_render(
+        changes: Vec<ChangeRow>,
+        query: Option<&str>,
+    ) -> (Vec<PanelRow>, PanelUi, crate::panel::PanelData) {
+        let data = crate::panel::PanelData {
+            changes,
+            ..Default::default()
+        };
+        let mut ui = PanelUi {
+            open: Section::Changes,
+            width: crate::layout::PanelWidth::Normal,
+            ..Default::default()
+        };
+        if let Some(q) = query {
+            ui.git.filter = Some(crate::panel::gitui::ListFilter {
+                view: GitView::Files,
+                query: q.into(),
+                editing: false,
+                map: crate::panel::gitui::fuzzy_filter(
+                    &data
+                        .changes
+                        .iter()
+                        .map(|c| c.path.clone())
+                        .collect::<Vec<String>>(),
+                    q,
+                ),
+            });
+        }
+        let model = crate::chrome::FrameModel {
+            panel: data.clone(),
+            ..Default::default()
+        };
+        let rows = content(&SectionCtx {
+            model: &model,
+            ui: &ui,
+            cols: 60,
+            rows: 30,
+        });
+        (rows, ui, data)
+    }
+
+    fn three() -> Vec<ChangeRow> {
+        vec![
+            filter_chg("src/main.rs", false),
+            filter_chg("src/lib.rs", false),
+            filter_chg("docs/main.md", false),
+        ]
+    }
+
+    #[test]
+    fn files_filter_renders_only_matches_in_display_map_order() {
+        let (rows, ui, data) = filter_render(three(), Some("main"));
+        let map = crate::panel::gitui::display_map(&ui.git, GitView::Files, &data);
+        assert_eq!(map.len(), 2);
+        let hits: Vec<usize> = rows
+            .iter()
+            .filter_map(|r| match r.hit {
+                Some(PanelHit::Row(Section::Changes, i)) => Some(i),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            hits, map,
+            "row hits are the source indices in display order"
+        );
+        let out = flat(&rows);
+        assert!(!out.contains("lib.rs"), "{out}");
+        assert!(out.contains("2/3"), "filter row drawn: {out}");
+    }
+
+    #[test]
+    fn files_without_filter_keeps_every_row_and_no_filter_row() {
+        let (rows, _, _) = filter_render(three(), None);
+        let hits: Vec<usize> = rows
+            .iter()
+            .filter_map(|r| match r.hit {
+                Some(PanelHit::Row(Section::Changes, i)) => Some(i),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(hits, vec![0, 1, 2]);
+        assert!(!flat(&rows).contains('\u{276f}'));
+    }
+
+    #[test]
+    fn files_incoming_collapse_applies_without_filter_only() {
+        let changes = vec![
+            filter_chg("my_edit.rs", false),
+            filter_chg("from_main_a.rs", true),
+        ];
+        let (rows, _, _) = filter_render(changes.clone(), None);
+        assert!(!flat(&rows).contains("from_main_a.rs"));
+        let (rows, _, _) = filter_render(changes, Some("from_main"));
+        assert!(flat(&rows).contains("from_main_a.rs"));
     }
 }
