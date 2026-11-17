@@ -675,6 +675,11 @@ pub const EMBEDDED_MANIFEST: &[EmbeddedManifestEntry] = &[
         origin: "extensions/skills/supervise/SKILL.md",
         document: include_str!("../../../extensions/skills/supervise/SKILL.md"),
     },
+    EmbeddedManifestEntry {
+        name: "lead",
+        origin: "extensions/skills/lead/SKILL.md",
+        document: include_str!("../../../extensions/skills/lead/SKILL.md"),
+    },
 ];
 
 /// One surveyed target file, relative to a harness's project skill root.
@@ -1184,11 +1189,12 @@ mod tests {
     fn embedded_manifest_is_valid_deterministic_and_excludes_tui_check() {
         let registry = SkillRegistry::embedded().unwrap();
         let names: Vec<&str> = registry.iter().map(|(name, _)| name).collect();
-        assert_eq!(names, vec!["mq", "pipeline", "supervise"]);
+        assert_eq!(names, vec!["lead", "mq", "pipeline", "supervise"]);
         assert!(!registry.skills.contains_key("tui-check"));
         assert_eq!(registry.get("mq").unwrap().gate, SkillGate::MergeQueue);
         assert_eq!(registry.get("pipeline").unwrap().gate, SkillGate::Pipeline);
         assert_eq!(registry.get("supervise").unwrap().gate, SkillGate::Always);
+        assert_eq!(registry.get("lead").unwrap().gate, SkillGate::Always);
         for (_, skill) in registry.iter() {
             assert_eq!(
                 skill.harnesses,
