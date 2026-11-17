@@ -9,7 +9,7 @@
   `.claude.json` of `{"hasCompletedOnboarding":true}` (UNVERIFIED). codex:
   `auth.json`. Nothing else.
 - **Placement.** `/dev/shm/thegn-login-<nonce>/<agent>/`, 0700 dirs, 0600
-  files, verified with `stat`; refuse if not tmpfs. No disk fallback.
+  files, verified with `stat`; refuse if not tmpfs. No disk fallback. Memory only (UNVERIFIED snapshot exclusion).
 - **Egress first.** Narrow to model hosts (UNVERIFIED) plus the env's allow
   domains before writing any byte; failure means no upload.
 - **Hostile-process paragraph.** A process in the sandbox can read the files
