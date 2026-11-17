@@ -32,6 +32,18 @@ ignore = [
   # enabled by release and Nix builds. A proc-macro with no runtime surface and
   # no safe upgrade. Drop when the netlink crates move off paste.
   "RUSTSEC-2024-0436", # paste unmaintained (via iroh → netlink-packet-core)
+  # libsqlite3-sys 0.38.2 bundles the vulnerable C SQLite; the fix (>=0.39.0)
+  # needs rusqlite 0.40's ^0.38.1 pin lifted, i.e. a rusqlite major/minor bump
+  # in thegn-core's Cargo.toml. Drop after bumping rusqlite.
+  "RUSTSEC-2026-0459", # libsqlite3-sys bundled SQLite CVE (blocked on rusqlite bump)
+  # unsafe-libyaml is unmaintained with no replacement upgrade path; reached
+  # transitively via serde_yaml-style dependents. Drop when they move off it.
+  "RUSTSEC-2024-0449", # unsafe-libyaml unmaintained (transitive)
+  # zbus 5 stack (zbus_names/zvariant/zvariant_derive) flagged unmaintained
+  # with no safe upgrade; notice only. Drop when zbus moves to the successor.
+  "RUSTSEC-2026-0370", # zvariant unmaintained
+  "RUSTSEC-2026-0371", # zbus_names unmaintained
+  "RUSTSEC-2026-0372", # zvariant_derive unmaintained
 ]
 
 [licenses]
