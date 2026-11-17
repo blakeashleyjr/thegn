@@ -36,9 +36,10 @@
 - [ ] 3.1 `usage.snapshot` capability row (Read): Verb + `required_scope` arm +
       `cap(...)` + `ControlApi` method + HTTP route; gRPC mirror or recorded
       `SURFACE_GAPS` entry; catalog ratchet tests green.
-- [ ] 3.2 `thegn usage [--json] [--tokens]`: plain aligned table default, full
+- [x] 3.2 `thegn usage [--json] [--tokens]`: plain aligned table default, full
       payload JSON via the one-emitter convention; gather runs via
-      `thegn_svc::usage::gather` (no live fetch flag).
+      `thegn_svc::usage::gather` (no live fetch flag). Done in
+      `crates/thegn-host/src/cmd/usage.rs` (b150).
 - [ ] 3.3 MCP: the snapshot tool lists under read scope on the write-tools
       branch's gating.
 

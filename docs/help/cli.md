@@ -28,7 +28,7 @@ worktree):
 | Environments  | `env` · `zone` · `host` · `placement` · `fleet` · `debug` · `mcp` · `plugin`                                                                  |
 | Session       | `session list\|open\|snapshot\|attach\|wait` · `notify` · `logs` · `share` · `forward`                                                        |
 | Control plane | `serve` · `session` · `events` · `attach` · `pair` · `api`                                                                                    |
-| Meta          | `config` · `keys` · `theme` · `doctor` · `db` · `setup` · `completions`                                                                       |
+| Meta          | `config` · `keys` · `theme` · `doctor` · `usage [--json] [--tokens]` · `db` · `setup` · `completions`                                         |
 
 Global flags everywhere: `--config`, `--log-level`, `--set key=value`
 (repeatable), and `--profile <name>`.
