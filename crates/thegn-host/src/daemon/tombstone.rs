@@ -92,6 +92,7 @@ impl Tombstone {
                 attached: 0,
                 recording: None,
                 error_active: false,
+                last_output_unix_secs: None,
             },
             None,
         );
