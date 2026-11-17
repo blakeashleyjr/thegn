@@ -30,6 +30,32 @@ unchanged, and the manifest differs only by that table. Cargo registry
 bookkeeping, the package's independent lockfile, original unnormalized manifest
 and release tooling are omitted.
 
-Remove the patch when an upstream release provides non-panicking destructor
-cleanup and passes the hangup/unwind regression tests. Do not replace it with
-`catch_unwind` or intentionally leaked terminal handles in application code.
+## Ownership decision (THE-681)
+
+**Decision:** keep termwiz vendored. thegn owns this copy deliberately.
+
+Upstream evidence (checked 2026-11-16): the wezterm git repository has termwiz
+commits through 2026-09-12 (ClearLine, winapi to windows-sys, and a
+`mismatched_lifetime_syntaxes` fix on 2026-09-06), while crates.io is still at
+0.23.3 (2025-03-20). Upstream is active but unpublished.
+
+Exit/upgrade condition (replaces "remove when upstream fixes"):
+
+- Re-evaluate at the first crates.io termwiz release after 0.23.3.
+- Then diff upstream's destructor cleanup against this patch, and drop the
+  `[lints.rust]` table if the lint fix is included.
+- If a termwiz bug needs a fix beyond the destructor patch before then, fork
+  properly: add a changelog section to this file listing each patch with its
+  THE issue and test.
+
+Do not replace the patch with `catch_unwind` or intentionally leaked terminal
+handles in application code.
+
+Alternatives considered:
+
+- **alacritty_terminal** is a different layer (an emulator grid, versus
+  termwiz's outer-terminal Surface/input), so it is not a drop-in replacement
+  for termwiz's roles.
+- **portable-pty** is explicitly deferred. Its surface is about 8 files
+  (`pane_pty.rs`, `pane.rs`, `daemon/session.rs`, `platform/*`) and it has no
+  local patch. Re-evaluate it together with termwiz.
