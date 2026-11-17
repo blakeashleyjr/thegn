@@ -35,6 +35,7 @@ All notable changes to **thegn** are documented here. The format follows
 ### Security
 
 - Paths containing control characters are refused for drag insertion. (THE-135)
+- The Lead can no longer run arbitrary commands through the daemon. A Lead token may open only a configured agent in a registered worktree whose launch is sandboxed, and may not type into, split or fork sessions, run host git, or change a sandbox profile; Lead-authored rules that open a session are held to the same rule. Refusals are audited as `lead_confined`. (THE-2187)
 
 ## [0.1.0-alpha.93] — 2026-11-17
 

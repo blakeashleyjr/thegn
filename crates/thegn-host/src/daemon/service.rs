@@ -21,9 +21,9 @@ use thegn_core::graveyard::Graveyard;
 use thegn_core::store::{ControlStore, IntentStore, LeaseRow, NotificationStore};
 use thegn_svc::control::{
     AttachKind, AttachReply, ControlApi, ControlError, ControlResult, DispatchPage, ForkSpec,
-    GitFileStatus, IssueListGap, IssueListing, OpenSpec, PreviewFetchReply, PreviewFetchRequest,
-    RecordSpec, RecordStatus, SessionActivityEvent, SessionInfo, ToolRunRequest, WaitCondition,
-    WaitOutcome, check_pty_size,
+    GitFileStatus, IssueListGap, IssueListing, LeadCaller, OpenSpec, PreviewFetchReply,
+    PreviewFetchRequest, RecordSpec, RecordStatus, SessionActivityEvent, SessionInfo,
+    ToolRunRequest, WaitCondition, WaitOutcome, check_pty_size,
 };
 use thegn_svc::git::{CliGit, GitBackend};
 
@@ -1292,48 +1292,112 @@ fn merge_issue_accounts(
     })
 }
 
-impl ControlApi for DaemonService {
-    fn list_sessions(&self) -> BoxFuture<'_, ControlResult<Vec<SessionInfo>>> {
-        Box::pin(async move {
-            let daemon_id = self.daemon_id.clone();
-            let leases: Vec<LeaseRow> = self
-                .with_db(move |db| db.leases(&daemon_id))
-                .await
-                .unwrap_or_default();
-            let sessions = self.sessions.lock().await;
-            let mut out: Vec<SessionInfo> = sessions
-                .values()
-                .map(|e| {
-                    let lease = leases
-                        .iter()
-                        .find(|l| l.session_id == e.meta.id && l.kind == "relay")
-                        .and_then(|l| l.expires_at);
-                    let live = e.live.lock().expect("live meta lock");
-                    e.meta.info(&live, lease)
-                })
-                .collect();
-            drop(sessions);
-            // Recently-finished sessions belong in the roster too: a supervisor
-            // asking "which of my workers are done?" must not have to race the
-            // moment of exit. They carry `exited_at_ms`, so a caller that wants
-            // only live sessions filters on it (the split lookup below does).
-            let now = now_ms();
-            let mut tombs = self.tombs.lock().await;
-            tombs.sweep(now);
-            out.extend(tombs.iter(now).map(|(_, t)| t.info()));
-            drop(tombs);
-            out.sort_by_key(|s| s.created_at_ms);
-            Ok(out)
+/// A Lead-authored automation rule's open (`automation_origin.rule_id` is a
+/// `lead:` id) is confined like a direct Lead call. A non-Lead caller naming
+/// such a rule id only confines itself, the safe direction; a Lead transport
+/// call carrying an origin was already refused at the transport.
+fn lead_rule_caller(spec: &OpenSpec) -> Option<LeadCaller> {
+    let origin = spec.automation_origin.as_ref()?;
+    thegn_core::lead_confine::is_lead_rule_id(&origin.rule_id).then(|| LeadCaller {
+        pairing_id: format!("automation-run:{}", origin.run_id),
+        label: origin.rule_id.clone(),
+    })
+}
+
+/// Audit a daemon-side Lead refusal and turn it into the caller's error.
+fn lead_refusal(
+    caller: &LeadCaller,
+    worktree: &str,
+    refusal: &thegn_core::lead_confine::ConfineRefusal,
+) -> ControlError {
+    thegn_svc::control::http::audit_lead_refusal(
+        &caller.pairing_id,
+        &caller.label,
+        thegn_core::control::Verb::OpenSession,
+        worktree,
+    );
+    ControlError::FailedPrecondition(refusal.to_string())
+}
+
+/// The post-resolution half of the Lead `sessions.open` rule: the launch the
+/// daemon resolved must sit behind a contained sandbox backend. `backend` is
+/// `None` when nothing resolved through the agent path (a raw argv), which a
+/// confined open never may be.
+fn lead_open_postcheck(
+    spec: &OpenSpec,
+    backend: Option<&str>,
+    caller: &LeadCaller,
+) -> ControlResult<()> {
+    use thegn_core::lead_confine::{ConfineRefusal, ResolvedOpen, check_resolved_open};
+    let worktree = super::agent_open::spec_worktree(spec).unwrap_or_default();
+    let Some(backend) = backend else {
+        return Err(lead_refusal(caller, &worktree, &ConfineRefusal::NoAgent));
+    };
+    check_resolved_open(&ResolvedOpen {
+        worktree: &worktree,
+        registered: true,
+        backend: Some(backend),
+    })
+    .map_err(|refusal| lead_refusal(caller, &worktree, &refusal))
+}
+
+impl DaemonService {
+    /// The pre-launch half of the Lead `sessions.open` rule: the request shape
+    /// again (the automation path never crossed a transport check), then the
+    /// worktree must be registered. Runs before any side effect.
+    async fn lead_open_precheck(&self, spec: &OpenSpec, caller: &LeadCaller) -> ControlResult<()> {
+        use thegn_core::lead_confine::{RequestShape, ResolvedOpen, check, check_resolved_open};
+        let worktree = super::agent_open::spec_worktree(spec).unwrap_or_default();
+        let mut shape = thegn_svc::control::lead_open_shape(spec);
+        // A rule's ancestry is set by the daemon's own executor; a Lead
+        // transport call carrying one was refused before reaching here.
+        shape.automation_origin = false;
+        if let Err(refusal) = check(
+            thegn_core::control::Verb::OpenSession,
+            &RequestShape::Open(shape),
+        ) {
+            return Err(lead_refusal(caller, &worktree, &refusal));
+        }
+        let requested = worktree.clone();
+        let registered = self
+            .with_db(move |db| {
+                use thegn_core::store::WorkspaceStore;
+                let rows = db.worktrees()?;
+                Ok(registered_worktree_matches(&rows, &requested, |path| {
+                    std::fs::canonicalize(path).unwrap_or_else(|_| std::path::PathBuf::from(path))
+                }))
+            })
+            .await?;
+        check_resolved_open(&ResolvedOpen {
+            worktree: &worktree,
+            registered,
+            backend: None,
         })
+        .map_err(|refusal| lead_refusal(caller, &worktree, &refusal))
     }
 
-    fn open(&self, spec: OpenSpec) -> BoxFuture<'_, ControlResult<SessionInfo>> {
+    /// `sessions.open`, for every caller. `caller` is set for a Lead-confined
+    /// transport call ([`ControlApi::open_confined`]); a Lead-authored
+    /// automation rule's open is confined the same way, keyed off its
+    /// `lead:` rule id ([`thegn_core::lead_confine::is_lead_rule_id`]).
+    fn open_with(
+        &self,
+        spec: OpenSpec,
+        caller: Option<LeadCaller>,
+    ) -> BoxFuture<'_, ControlResult<SessionInfo>> {
         Box::pin(async move {
             // Refuse an oversized geometry before any fence or registry work:
             // the emulator allocates rows x cols cells.
             check_pty_size(spec.rows, spec.cols)?;
             if !self.accepting.load(std::sync::atomic::Ordering::Acquire) {
                 return Err(ControlError::Conflict("daemon is shutting down".into()));
+            }
+            // The Lead confinement (`thegn_core::lead_confine`): a Lead
+            // transport call, or a Lead-authored rule firing. Checked before
+            // any fence, registry or launch work.
+            let confine = caller.or_else(|| lead_rule_caller(&spec));
+            if let Some(caller) = &confine {
+                self.lead_open_precheck(&spec, caller).await?;
             }
             // Hold the same per-worktree gate a migration owns exclusively.
             // Keep it through registry insertion: an open is therefore either
@@ -1446,6 +1510,12 @@ impl ControlApi for DaemonService {
                     None,
                 ),
             };
+            // A Lead worker must actually have entered a sandbox: judged on
+            // the resolved launch (its argv-reconciled backend), never on the
+            // configured intent. Nothing has been spawned yet.
+            if let Some(caller) = &confine {
+                lead_open_postcheck(&spec, resolved.as_ref().map(|r| r.backend.as_str()), caller)?;
+            }
 
             // The resolved argv is already sandbox-wrapped AND CPU-capped by
             // `enter_argv`; a raw caller's argv is capped here, unless it says
@@ -1642,6 +1712,54 @@ impl ControlApi for DaemonService {
             }
             Ok(info)
         })
+    }
+}
+
+impl ControlApi for DaemonService {
+    fn list_sessions(&self) -> BoxFuture<'_, ControlResult<Vec<SessionInfo>>> {
+        Box::pin(async move {
+            let daemon_id = self.daemon_id.clone();
+            let leases: Vec<LeaseRow> = self
+                .with_db(move |db| db.leases(&daemon_id))
+                .await
+                .unwrap_or_default();
+            let sessions = self.sessions.lock().await;
+            let mut out: Vec<SessionInfo> = sessions
+                .values()
+                .map(|e| {
+                    let lease = leases
+                        .iter()
+                        .find(|l| l.session_id == e.meta.id && l.kind == "relay")
+                        .and_then(|l| l.expires_at);
+                    let live = e.live.lock().expect("live meta lock");
+                    e.meta.info(&live, lease)
+                })
+                .collect();
+            drop(sessions);
+            // Recently-finished sessions belong in the roster too: a supervisor
+            // asking "which of my workers are done?" must not have to race the
+            // moment of exit. They carry `exited_at_ms`, so a caller that wants
+            // only live sessions filters on it (the split lookup below does).
+            let now = now_ms();
+            let mut tombs = self.tombs.lock().await;
+            tombs.sweep(now);
+            out.extend(tombs.iter(now).map(|(_, t)| t.info()));
+            drop(tombs);
+            out.sort_by_key(|s| s.created_at_ms);
+            Ok(out)
+        })
+    }
+
+    fn open(&self, spec: OpenSpec) -> BoxFuture<'_, ControlResult<SessionInfo>> {
+        self.open_with(spec, None)
+    }
+
+    fn open_confined(
+        &self,
+        spec: OpenSpec,
+        caller: LeadCaller,
+    ) -> BoxFuture<'_, ControlResult<SessionInfo>> {
+        self.open_with(spec, Some(caller))
     }
 
     fn fork(&self, spec: ForkSpec) -> BoxFuture<'_, ControlResult<SessionInfo>> {
@@ -4204,6 +4322,113 @@ mod tests {
         svc
     }
 
+    fn lead_caller() -> LeadCaller {
+        LeadCaller {
+            pairing_id: "p1".into(),
+            label: "lead:g/0".into(),
+        }
+    }
+
+    fn lead_agent_spec(worktree: &str) -> OpenSpec {
+        OpenSpec {
+            rows: 24,
+            cols: 80,
+            worktree: Some(worktree.into()),
+            agent: Some(thegn_svc::control::AgentLaunch {
+                agent: "coder".into(),
+                prompt: "review".into(),
+                headless: None,
+                bind_worktree: false,
+                resume: None,
+                continue_last: false,
+                stage: None,
+                permissions: Vec::new(),
+                widen_permissions: false,
+                fork: false,
+                native_session_id: None,
+            }),
+            ..OpenSpec::default()
+        }
+    }
+
+    fn expect_lead_refusal(result: ControlResult<SessionInfo>, needle: &str) {
+        match result {
+            Err(ControlError::FailedPrecondition(m)) => {
+                assert!(
+                    m.starts_with(thegn_core::lead_confine::REFUSAL_PREFIX) && m.contains(needle),
+                    "{m}"
+                );
+            }
+            other => panic!("expected a Lead refusal, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn lead_confined_open_refuses_an_unregistered_worktree_before_any_launch() {
+        let (svc, _rx) = service(0);
+        expect_lead_refusal(
+            svc.open_confined(lead_agent_spec("/not/registered"), lead_caller())
+                .await,
+            "/not/registered",
+        );
+        assert!(svc.list_sessions().await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn lead_confined_open_rechecks_the_shape_in_the_daemon() {
+        let (svc, _rx) = service(0);
+        let mut raw = lead_agent_spec("/w");
+        raw.argv = vec!["/bin/sh".into()];
+        expect_lead_refusal(svc.open_confined(raw, lead_caller()).await, "raw argv");
+        let mut env = lead_agent_spec("/w");
+        env.env = vec![("K".into(), "V".into())];
+        expect_lead_refusal(svc.open_confined(env, lead_caller()).await, "env");
+        assert!(svc.list_sessions().await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn lead_authored_rule_opens_are_confined_on_the_plain_path() {
+        let (svc, _rx) = service(0);
+        let mut spec = lead_agent_spec("/not/registered");
+        spec.automation_origin = Some(thegn_svc::control::AutomationOrigin {
+            root_event_id: "e1".into(),
+            rule_id: "lead:nightly".into(),
+            run_id: "7".into(),
+        });
+        expect_lead_refusal(svc.open(spec).await, "/not/registered");
+        assert!(svc.list_sessions().await.unwrap().is_empty());
+    }
+
+    #[test]
+    fn lead_rule_caller_keys_off_the_lead_rule_prefix_only() {
+        let mut spec = lead_agent_spec("/w");
+        assert!(lead_rule_caller(&spec).is_none());
+        spec.automation_origin = Some(thegn_svc::control::AutomationOrigin {
+            root_event_id: "e1".into(),
+            rule_id: "nightly".into(),
+            run_id: "7".into(),
+        });
+        assert!(lead_rule_caller(&spec).is_none());
+        if let Some(origin) = spec.automation_origin.as_mut() {
+            origin.rule_id = "lead:nightly".into();
+        }
+        let caller = lead_rule_caller(&spec).expect("a Lead rule is confined");
+        assert_eq!(caller.label, "lead:nightly");
+    }
+
+    #[test]
+    fn lead_postcheck_refuses_an_unsandboxed_resolution_naming_the_worktree() {
+        let spec = lead_agent_spec("/w/feature");
+        match lead_open_postcheck(&spec, Some("host"), &lead_caller()) {
+            Err(ControlError::FailedPrecondition(m)) => {
+                assert!(m.contains("/w/feature") && m.contains("`host`"), "{m}");
+            }
+            other => panic!("expected a refusal, got {other:?}"),
+        }
+        assert!(lead_open_postcheck(&spec, None, &lead_caller()).is_err());
+        assert!(lead_open_postcheck(&spec, Some("bwrap"), &lead_caller()).is_ok());
+    }
+
     fn assert_uniform_miss(e: &ControlError, shown: &str) {
         match e {
             ControlError::NotFound(m) => {
@@ -6106,6 +6331,7 @@ mod tests {
                 server_label: "test thegn".into(),
                 cors_origins: Vec::new(),
                 event_streams: Default::default(),
+                lead_listener: false,
             };
             let app = thegn_svc::control::http::router(state);
             let server = tokio::spawn(async move { axum::serve(listener, app).await });
@@ -7565,6 +7791,7 @@ mod tests {
             server_label: "test thegn".into(),
             cors_origins: Vec::new(),
             event_streams: Default::default(),
+            lead_listener: false,
         }
     }
 
@@ -8641,6 +8868,7 @@ mod tests {
             server_label: "test thegn".into(),
             cors_origins: Vec::new(),
             event_streams: Default::default(),
+            lead_listener: false,
         };
         let app = thegn_svc::control::http::router(state);
         let server = tokio::spawn(async move {
@@ -8770,6 +8998,7 @@ mod tests {
             server_label: "test thegn".into(),
             cors_origins: Vec::new(),
             event_streams: Default::default(),
+            lead_listener: false,
         };
         let app = thegn_svc::control::http::router(state);
         let server = tokio::spawn(

@@ -1036,6 +1036,33 @@ thegn refuses to open the Lead when:
 
 `[lead] account` is refused for now.
 
+### What the Lead may ask the daemon to do
+
+The sandbox alone is not the boundary: the daemon runs outside it. So the
+daemon treats every call made with a Lead token, or arriving on the Lead's
+listener, as Lead-confined, whatever its scopes. A Lead-confined call:
+
+- **May open a session** only by naming a configured `[[agents]]` entry (or a
+  pipeline stage of one) in a registered worktree. The daemon resolves the
+  launch the usual way and refuses it unless the worker really runs in a
+  sandbox (bwrap, podman, docker, smolmachines or apple). A worktree that
+  resolves to `host` (or `systemd`, which only caps resources) is refused with
+  a message naming the worktree and its backend. A raw `argv`, an `env`
+  override, a `cwd` outside the worktree, `widen_permissions`, a fork and
+  prompts over 64 KiB are refused.
+- **May not** type into a session (`sessions.input`), attach, resize, split or
+  fork one, run host git (`git.stage`, `git.commit`), open a worktree or an
+  editor, write files from outside the sandbox (`search.replace`,
+  `skills.seed`), run tools or presets, or change a worktree's sandbox profile.
+- **May** read everything a read token can, kill sessions, record a session,
+  create worktrees, file folders, work the tracker, the dispatch roster
+  (without binding a session), notifications, approvals requests, its own
+  automation rules, and the merge queue when `[lead] scopes` grants it.
+
+A Lead-authored automation rule that opens a session is held to the same
+rule when it fires. Every refusal is logged on `thegn::control::audit` with
+the outcome `lead_confined` and the Lead's label.
+
 ## Inspecting
 
 The panel's **system → sandbox** section shows the live state for the
