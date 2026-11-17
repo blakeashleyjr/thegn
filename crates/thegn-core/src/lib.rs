@@ -292,6 +292,7 @@ pub mod provider_admission;
 pub mod proxy;
 pub mod pull_progress;
 pub mod rebase_todo;
+pub mod recipe_header;
 #[cfg(test)]
 mod spawn_ratchet_tests;
 // The canonical secret-redaction seam: one sensitive-key predicate + JSON
