@@ -319,6 +319,8 @@ pub enum Action {
     /// blocked on input, failures, finished-awaiting-review), most urgent
     /// first, wrapping. Works in any sidebar sort mode.
     JumpAttention,
+    /// Jump to the Lead (the meta-agent terminal group), creating it on first use.
+    JumpLead,
     /// Mark everything read: all stored notifications read + every live
     /// "Needs you" signal acknowledged (quieted). The full "clear the nag"
     /// gesture; also available as `a` / `Shift+R` inside either popup.
@@ -707,6 +709,7 @@ impl Action {
             Action::NotifyDndToggle => "notify-dnd-toggle",
             Action::NotifyModeCycle => "notify-mode-cycle",
             Action::JumpAttention => "attention-next",
+            Action::JumpLead => "jump-lead",
             Action::MarkAllRead => "mark-all-read",
             Action::Quit => "quit",
             Action::Detach => "detach",
@@ -866,6 +869,7 @@ impl Action {
             "notify-dnd-toggle" | "dnd" | "dnd-toggle" => Action::NotifyDndToggle,
             "notify-mode-cycle" | "notify-mode" => Action::NotifyModeCycle,
             "attention-next" | "jump-attention" => Action::JumpAttention,
+            "jump-lead" | "lead" => Action::JumpLead,
             "mark-all-read" | "notify-mark-all-read" => Action::MarkAllRead,
             // `summon-pin-N` / `pin-N` → SummonPin(N) (1..=9);
             // `summon-project-N` / `project-N` → SummonWorkspace(N) (1..=9);
@@ -1685,6 +1689,7 @@ pub fn default_keymap() -> KeyMap {
     map.insert_all("Ctrl Alt m", Action::NotifyModeCycle)
         .unwrap();
     map.insert_all("Alt a", Action::JumpAttention).unwrap();
+    map.insert_all("Alt i", Action::JumpLead).unwrap();
     map.insert_all("Alt Shift R", Action::MarkAllRead).unwrap();
 
     // Vim-normal mode: one-key navigation plus leader-like Space sequences.
@@ -2473,6 +2478,24 @@ mod tests {
                 "{id} ships without a default chord"
             );
         }
+    }
+
+    #[test]
+    fn jump_lead_round_trips_and_binds_alt_i() {
+        assert_eq!(Action::JumpLead.key(), "jump-lead");
+        assert_eq!(Action::from_key("jump-lead"), Some(Action::JumpLead));
+        assert_eq!(Action::from_key("lead"), Some(Action::JumpLead));
+        let spec = action_spec("jump-lead").expect("spec registered");
+        assert!(spec.palette);
+        assert_eq!(spec.default_chords, &["Alt i"]);
+        let mut map = default_keymap();
+        assert_eq!(
+            map.dispatch(
+                Mode::Normal,
+                Key::modified(KeyCode::Char('i'), Modifiers::ALT)
+            ),
+            MatchResult::Matched(Action::JumpLead)
+        );
     }
 
     #[test]
