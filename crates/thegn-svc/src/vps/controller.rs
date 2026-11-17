@@ -120,11 +120,43 @@ pub fn controller_id_in(root: &Path) -> Result<String, ControllerIdError> {
     }
 }
 
-/// Load the controller id for provider creation from this thegn root.
+/// Choose the file `controller_id` reads: the state-root `new` when it exists or
+/// the promotion moved `legacy` there, else `legacy`.
+///
+/// Fails closed: when `new` is still absent but something sits at `legacy` (a
+/// symlink, a foreign file, or a rename that failed), the legacy path is used so
+/// [`controller_id_in`] either reads that id or refuses. A fresh id is never
+/// minted while a legacy id exists (a minted id would orphan every machine
+/// labelled with the old one).
+fn resolve_controller_id_path(legacy: &Path, new: &Path) -> std::path::PathBuf {
+    let chosen = crate::state_promote::promote(legacy, new, "controller id");
+    if chosen.as_path() == new
+        && std::fs::symlink_metadata(new).is_err()
+        && std::fs::symlink_metadata(legacy).is_ok()
+    {
+        return legacy.to_path_buf();
+    }
+    chosen
+}
+
+/// Load the controller id for provider creation: `$XDG_STATE_HOME/thegn/controller-id`
+/// (THE-2057), promoted once from the pre-THE-2057 `~/.thegn/controller-id`.
 pub fn controller_id() -> anyhow::Result<String> {
-    let root = thegn_core::util::thegn_dir();
-    let path = root.join(CONTROLLER_ID_FILE);
-    controller_id_in(&root).with_context(|| {
+    let new = crate::state_promote::state_root().join(CONTROLLER_ID_FILE);
+    let legacy = thegn_core::util::thegn_dir().join(CONTROLLER_ID_FILE);
+    let path = resolve_controller_id_path(&legacy, &new);
+    let root = path
+        .parent()
+        .context("vps: controller id path has no parent; refusing to create")?;
+    if path == new && std::fs::symlink_metadata(root).is_err() {
+        thegn_core::fsperm::ensure_private_dir(root).with_context(|| {
+            format!(
+                "vps: cannot create the state directory {}; refusing to create",
+                root.display()
+            )
+        })?;
+    }
+    controller_id_in(root).with_context(|| {
         format!(
             "vps: cannot load the controller id at {}; refusing to create",
             path.display()
@@ -239,6 +271,82 @@ mod tests {
                 b"0123456789abcdef0123456789abcdef\n"
             );
         }
+    }
+
+    #[test]
+    fn controller_id_keeps_the_legacy_id_and_moves_it_to_the_state_root() {
+        let state = thegn_core::testenv::IsolatedState::new();
+        let legacy_root = state.thegn_dir();
+        let legacy_id = controller_id_in(&legacy_root).unwrap();
+        let legacy = legacy_root.join(CONTROLLER_ID_FILE);
+        let new = crate::state_promote::state_root().join(CONTROLLER_ID_FILE);
+
+        let id = controller_id().unwrap();
+
+        assert_eq!(id, legacy_id, "the legacy id is kept, not re-minted");
+        assert!(std::fs::symlink_metadata(&legacy).is_err(), "legacy gone");
+        assert_eq!(
+            std::fs::read(&new).unwrap(),
+            format!("{legacy_id}\n").as_bytes()
+        );
+        assert!(new.starts_with(state.state_home()));
+        assert_eq!(controller_id().unwrap(), legacy_id, "stable once promoted");
+    }
+
+    #[test]
+    fn controller_id_mints_under_the_state_root_owner_only() {
+        let state = thegn_core::testenv::IsolatedState::new();
+        let id = controller_id().unwrap();
+        assert!(is_controller_id(&id));
+        let new = state.state_home().join("thegn").join(CONTROLLER_ID_FILE);
+        let mode = thegn_core::fsperm::mode_bits(&new).unwrap();
+        assert!(mode.is_none_or(|bits| bits == 0o600));
+        let root_mode = thegn_core::fsperm::mode_bits(new.parent().unwrap()).unwrap();
+        assert!(root_mode.is_none_or(|bits| bits == 0o700));
+        assert!(
+            std::fs::symlink_metadata(state.thegn_dir().join(CONTROLLER_ID_FILE)).is_err(),
+            "nothing written at the legacy location"
+        );
+        assert_eq!(controller_id().unwrap(), id);
+    }
+
+    #[test]
+    fn controller_id_refuses_rather_than_minting_over_a_symlinked_legacy() {
+        let state = thegn_core::testenv::IsolatedState::new();
+        let legacy_root = state.thegn_dir();
+        std::fs::create_dir_all(&legacy_root).unwrap();
+        let target = state.root().join("target-id");
+        std::fs::write(&target, b"0123456789abcdef0123456789abcdef\n").unwrap();
+        let legacy = legacy_root.join(CONTROLLER_ID_FILE);
+        if thegn_core::fsperm::create_symlink(&target, &legacy, false).is_err() {
+            return; // symlinks unavailable on this platform/account
+        }
+
+        assert!(controller_id().is_err(), "no fresh id beside a legacy one");
+        assert!(
+            std::fs::symlink_metadata(crate::state_promote::state_root().join(CONTROLLER_ID_FILE))
+                .is_err(),
+            "nothing minted under the state root"
+        );
+        assert_eq!(
+            std::fs::read(&target).unwrap(),
+            b"0123456789abcdef0123456789abcdef\n"
+        );
+    }
+
+    #[test]
+    fn controller_id_path_falls_back_to_the_legacy_root_when_the_move_fails() {
+        let tmp = tempfile::tempdir().unwrap();
+        let legacy_root = tmp.path().join("legacy");
+        let legacy_id = controller_id_in(&legacy_root).unwrap();
+        let blocker = tmp.path().join("not-a-dir");
+        std::fs::write(&blocker, b"").unwrap();
+        let new = blocker.join(CONTROLLER_ID_FILE);
+
+        let path = resolve_controller_id_path(&legacy_root.join(CONTROLLER_ID_FILE), &new);
+
+        assert_eq!(path, legacy_root.join(CONTROLLER_ID_FILE));
+        assert_eq!(controller_id_in(path.parent().unwrap()).unwrap(), legacy_id);
     }
 
     #[test]
