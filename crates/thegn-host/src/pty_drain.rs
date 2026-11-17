@@ -63,11 +63,16 @@ fn report_pane_connect_failure(cfg: &thegn_core::config::Config, wt: &str, known
     if wt.is_empty() || known_local {
         return;
     }
-    let loc = thegn_core::remote::GitLoc::for_worktree(Path::new(wt));
-    // One DB handle for both reads (each `Db::open` re-runs pragmas). This path
+    // One DB handle for every read (each `Db::open` re-runs pragmas). This path
     // is order-dependent — the health mark below must land before the respawn's
     // `env_halt_reason` check — so it stays synchronous, but need not open twice.
     let db = thegn_core::db::Db::open().ok(); // best-effort: cache: the git fallback resolves the repo root; the health mark is lost to the DB only
+    let loc = thegn_core::remote::GitLoc::from_db(
+        wt,
+        db.as_ref()
+            .and_then(|d| d.location_for(wt).ok().flatten())
+            .as_deref(),
+    );
     let repo_root: PathBuf = db
         .as_ref()
         .and_then(|db| db.repo_root_for(wt).ok().flatten())
@@ -1847,6 +1852,15 @@ mod tests {
                 "active={is_active_group}, placement={placement_kind:?}, force_host={force_host}"
             );
         }
+    }
+
+    #[test]
+    fn report_pane_connect_failure_opens_the_database_once() {
+        let _state = thegn_core::testenv::IsolatedState::new();
+        let cfg = thegn_core::config::Config::default();
+        let before = thegn_core::db_open_stats::total_opens();
+        report_pane_connect_failure(&cfg, "/fixture/wt", false);
+        assert_eq!(thegn_core::db_open_stats::total_opens() - before, 1);
     }
 
     #[test]
