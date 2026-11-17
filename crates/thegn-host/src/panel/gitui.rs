@@ -1132,10 +1132,9 @@ pub fn context_keys(view: GitView) -> Vec<CtxKey> {
             k("a", "stage all", GitMsg::StageAll),
             k("s", "stash", GitMsg::StashPush),
             k("D", "reset menu", GitMsg::ResetMenu),
-            // (`v` range and `/` filter are NOT offered here: no Files action
-            // consumes a range selection, and `list_labels` has no Files arm
-            // so the filter always answered "not available in this view" —
-            // both were advertised no-ops.)
+            k("/", "filter", GitMsg::FilterStart),
+            // (`v` range is NOT offered here: no Files action consumes a
+            // range selection.)
             k("x", "commands", GitMsg::OpenMenu(MenuKind::CustomCommands)),
             k("z", "undo", GitMsg::Undo),
             k("Z", "redo", GitMsg::Redo),
@@ -1296,6 +1295,7 @@ pub fn flow_hint(flow: &GitFlow) -> Option<(&'static str, &'static str)> {
 /// filter return labels; the rest filter as identity.
 pub fn list_labels(view: GitView, data: &crate::panel::PanelData) -> Option<Vec<String>> {
     match view {
+        GitView::Files => Some(data.changes.iter().map(|c| c.path.clone()).collect()),
         GitView::Commits => Some(
             data.commits
                 .iter()
@@ -3459,5 +3459,34 @@ mod tests {
         git.focus = GitView::CommitFiles;
         git.commit_files.clear();
         assert_eq!(git.drag_autoscroll_target(3, DragOverflow::Below(2)), 0);
+    }
+
+    #[test]
+    fn files_list_labels_are_the_change_paths_and_filter_key_is_offered() {
+        let data = crate::panel::PanelData {
+            changes: vec![crate::panel::ChangeRow {
+                status: "M".into(),
+                stage: crate::panel::Stage::Unstaged,
+                dir: "src/".into(),
+                name: "a.rs".into(),
+                path: "src/a.rs".into(),
+                added: 0,
+                deleted: 0,
+                count: thegn_svc::git::DiffCount::Exact(0),
+                submodule: None,
+                incoming: false,
+            }],
+            ..Default::default()
+        };
+        // gitfull's label closure is `data.changes[i].path.clone()`.
+        let want: Vec<String> = (0..data.changes.len())
+            .map(|i| data.changes[i].path.clone())
+            .collect();
+        assert_eq!(list_labels(GitView::Files, &data), Some(want));
+        assert!(
+            context_keys(GitView::Files)
+                .iter()
+                .any(|c| c.chord == "/" && c.msg == GitMsg::FilterStart)
+        );
     }
 }

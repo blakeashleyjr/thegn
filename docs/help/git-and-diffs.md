@@ -29,7 +29,8 @@ and a merge can show `incoming files unavailable`.
 Binary and mode-only changes say so instead of showing hunks. `↵` on a file
 opens line-level staging at every width; at Normal width it widens to Half,
 and Esc retracts that drill. At Half, the inline preview follows the cursor.
-`space` stages, and `e` cycles panel width. Untracked files preview as all
+`space` stages, `/` filters the file list (stage and discard act on the
+highlighted match), and `e` cycles panel width. Untracked files preview as all
 additions and are intent-added (`add -N`) only on the first stage. In staging,
 line discard is refused in the STAGED pane (unstage with `space`) and on an
 untracked file (`d` on its Changes row deletes the file).
