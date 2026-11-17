@@ -17606,7 +17606,11 @@ async fn event_loop<T: Terminal>(
                         let blocked = bar_detail.is_some()
                             || app_host.active_tile_mut().is_some()
                             || !crate::caret::no_popup_covers()
-                            || crate::caret::covered_at(mx, my);
+                            || crate::caret::covered_at(mx, my)
+                            || center_dormant
+                            || crate::chrome::center_shows_splash(&frames, &model, |id| {
+                                panes.table.contains_key(&id)
+                            });
                         let hit = if blocked {
                             None
                         } else {
