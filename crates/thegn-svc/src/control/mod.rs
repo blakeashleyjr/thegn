@@ -31,6 +31,7 @@ pub mod client;
 pub mod grpc;
 pub mod http;
 pub mod http_ci;
+pub mod http_lead;
 pub mod route_docs;
 pub mod route_types;
 pub mod routes;
@@ -1325,6 +1326,99 @@ pub trait ControlApi: Send + Sync + 'static {
 
     fn tools_run(&self, _request: ToolRunRequest) -> BoxFuture<'_, ControlResult<SessionInfo>> {
         Box::pin(async { Err(ControlError::Unimplemented("tools.run")) })
+    }
+
+    // --- Lead tool surface (THE-2172) ---
+    // JSON in, JSON out: each verb's typed DTOs live in its owning thegn-core
+    // module, so the trait, the routes and MCP stay independent of behaviour.
+    // Defaulted to `Unimplemented`; the daemon overrides each.
+
+    /// The cross-workspace Lead overview (`overview.get`).
+    fn overview_get(
+        &self,
+        _req: serde_json::Value,
+    ) -> BoxFuture<'_, ControlResult<serde_json::Value>> {
+        Box::pin(async { Err(ControlError::Unimplemented("overview.get")) })
+    }
+
+    /// Filtered notification listing (`notifications.list`).
+    fn notifications_list(
+        &self,
+        _req: serde_json::Value,
+    ) -> BoxFuture<'_, ControlResult<serde_json::Value>> {
+        Box::pin(async { Err(ControlError::Unimplemented("notifications.list")) })
+    }
+
+    /// Acknowledge notifications (`notifications.ack`).
+    fn notifications_ack(
+        &self,
+        _req: serde_json::Value,
+    ) -> BoxFuture<'_, ControlResult<serde_json::Value>> {
+        Box::pin(async { Err(ControlError::Unimplemented("notifications.ack")) })
+    }
+
+    /// Create or replace a Lead-authored automation rule (`automations.put`).
+    fn automations_put(
+        &self,
+        _req: serde_json::Value,
+    ) -> BoxFuture<'_, ControlResult<serde_json::Value>> {
+        Box::pin(async { Err(ControlError::Unimplemented("automations.put")) })
+    }
+
+    /// Remove a Lead-authored automation rule (`automations.rm`).
+    fn automations_rm(
+        &self,
+        _req: serde_json::Value,
+    ) -> BoxFuture<'_, ControlResult<serde_json::Value>> {
+        Box::pin(async { Err(ControlError::Unimplemented("automations.rm")) })
+    }
+
+    /// Enable or disable a Lead-authored automation rule (`automations.enable`).
+    fn automations_enable(
+        &self,
+        _req: serde_json::Value,
+    ) -> BoxFuture<'_, ControlResult<serde_json::Value>> {
+        Box::pin(async { Err(ControlError::Unimplemented("automations.enable")) })
+    }
+
+    /// Recent audited automation runs (`automations.runs`).
+    fn automations_runs(
+        &self,
+        _req: serde_json::Value,
+    ) -> BoxFuture<'_, ControlResult<serde_json::Value>> {
+        Box::pin(async { Err(ControlError::Unimplemented("automations.runs")) })
+    }
+
+    /// Approval history and pending requests (`approvals.list`).
+    fn approvals_list(
+        &self,
+        _req: serde_json::Value,
+    ) -> BoxFuture<'_, ControlResult<serde_json::Value>> {
+        Box::pin(async { Err(ControlError::Unimplemented("approvals.list")) })
+    }
+
+    /// Ask a human to approve a pipeline stage (`approvals.request`).
+    fn approvals_request(
+        &self,
+        _req: serde_json::Value,
+    ) -> BoxFuture<'_, ControlResult<serde_json::Value>> {
+        Box::pin(async { Err(ControlError::Unimplemented("approvals.request")) })
+    }
+
+    /// Grant or deny a pending approval (`approvals.resolve`, Admin).
+    fn approvals_resolve(
+        &self,
+        _req: serde_json::Value,
+    ) -> BoxFuture<'_, ControlResult<serde_json::Value>> {
+        Box::pin(async { Err(ControlError::Unimplemented("approvals.resolve")) })
+    }
+
+    /// Start the merge-queue drain for a worktree's repo (`merge.drain`).
+    fn merge_drain(
+        &self,
+        _req: serde_json::Value,
+    ) -> BoxFuture<'_, ControlResult<serde_json::Value>> {
+        Box::pin(async { Err(ControlError::Unimplemented("merge.drain")) })
     }
 
     // --- agent orchestration (THE-57) ---------------------------------------

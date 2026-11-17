@@ -2290,6 +2290,120 @@ async fn automation_and_tool_verbs_have_catalog_routes_and_exact_scopes() {
     );
 }
 
+#[tokio::test]
+async fn lead_verbs_have_catalog_routes_and_exact_scopes() {
+    use thegn_core::control::{Scope, required_scope};
+    // THE-2172: every Lead verb is a POST route, an API_CALLS row and one
+    // catalog row, at exactly the batch's scope.
+    let lead = [
+        ("overview.get", "/v1/overview", Scope::Read),
+        ("notifications.list", "/v1/notifications/list", Scope::Read),
+        ("notifications.ack", "/v1/notifications/ack", Scope::Write),
+        ("automations.put", "/v1/automations/put", Scope::Write),
+        ("automations.rm", "/v1/automations/rm", Scope::Write),
+        ("automations.enable", "/v1/automations/enable", Scope::Write),
+        ("automations.runs", "/v1/automations/runs", Scope::Read),
+        ("approvals.list", "/v1/approvals/list", Scope::Read),
+        ("approvals.request", "/v1/approvals/request", Scope::Write),
+        ("approvals.resolve", "/v1/approvals/resolve", Scope::Admin),
+        ("merge.drain", "/v1/merge/drain", Scope::MergeAdd),
+    ];
+    for (capability, path, scope) in lead {
+        assert!(
+            super::routes::ROUTES
+                .iter()
+                .any(|route| route.path == path && route.caps == [capability]),
+            "missing route for {capability}"
+        );
+        assert!(
+            super::routes::API_CALLS.contains(&(capability, "POST", path)),
+            "missing POST API_CALLS row for {capability}"
+        );
+        let entry = thegn_core::capability::lookup(capability)
+            .unwrap_or_else(|| panic!("missing capability catalog row for {capability}"));
+        assert_eq!(required_scope(entry.verb), scope, "{capability}");
+    }
+    assert_eq!(
+        required_scope(
+            thegn_core::capability::lookup("approvals.resolve")
+                .unwrap()
+                .verb
+        ),
+        Scope::Admin
+    );
+
+    let r = rig(false);
+    let read = token(&r, "read");
+    let write = token(&r, "write");
+    let git = token(&r, "git");
+    let merge_add = token(&r, "merge_add");
+    let admin = token(&r, "admin");
+    let confined = token_with_label(
+        &r,
+        "read,merge_add",
+        RouteToHostTokenBinding {
+            owner: "provider/account/sandbox-a".into(),
+            worktree: "/w".into(),
+        }
+        .label(),
+    );
+    let post = |path: &'static str, bearer: String, body: &'static str| {
+        let state = r.state.clone();
+        async move {
+            let request = Request::builder()
+                .method("POST")
+                .uri(path)
+                .header("authorization", format!("Bearer {bearer}"))
+                .header("content-type", "application/json")
+                .body(Body::from(body))
+                .unwrap();
+            router(state).oneshot(request).await.unwrap().status()
+        }
+    };
+    // The fake leaves every Lead method at its `Unimplemented` default, so an
+    // authorized call answers 501 and a refused one 403.
+    let authorized = StatusCode::NOT_IMPLEMENTED;
+    assert_eq!(post("/v1/overview", read.clone(), "{}").await, authorized);
+    assert_eq!(
+        post("/v1/notifications/ack", read.clone(), r#"{"all":true}"#).await,
+        StatusCode::FORBIDDEN
+    );
+    assert_eq!(
+        post("/v1/notifications/ack", write.clone(), r#"{"all":true}"#).await,
+        authorized
+    );
+    // Granting is Admin: a write token is refused, admin passes.
+    assert_eq!(
+        post("/v1/approvals/resolve", write.clone(), "{}").await,
+        StatusCode::FORBIDDEN
+    );
+    assert_eq!(post("/v1/approvals/resolve", admin, "{}").await, authorized);
+    // A non-object body is a 400 once authorized.
+    assert_eq!(
+        post("/v1/approvals/list", read.clone(), "[]").await,
+        StatusCode::BAD_REQUEST
+    );
+    // merge.drain: an unbound caller needs git; a naked merge_add grant fails.
+    assert_eq!(
+        post("/v1/merge/drain", git, r#"{"worktree":"/w"}"#).await,
+        authorized
+    );
+    assert_eq!(
+        post("/v1/merge/drain", merge_add, r#"{"worktree":"/w"}"#).await,
+        StatusCode::FORBIDDEN
+    );
+    // A worktree-confined route-to-host token never reaches a Lead verb, not
+    // even the cross-worktree reads its `read` grant would otherwise allow.
+    assert_eq!(
+        post("/v1/merge/drain", confined.clone(), r#"{"worktree":"/w"}"#).await,
+        StatusCode::PRECONDITION_FAILED
+    );
+    assert_eq!(
+        post("/v1/overview", confined, "{}").await,
+        StatusCode::PRECONDITION_FAILED
+    );
+}
+
 /// The new wire types survive a serde round-trip, and `PushedNote`'s optional
 /// fields default when absent (the minimal `{"title": …}` push is valid).
 #[test]
