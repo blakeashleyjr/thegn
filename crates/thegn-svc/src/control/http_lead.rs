@@ -26,7 +26,7 @@ use super::http::{ControlState, RequestAuth, authed_target, bad_request};
 use super::{ControlApi, ControlError, ControlResult};
 
 /// One Lead verb's trait method, as a plain function pointer (non-capturing
-/// closures coerce to it), so one helper serves all eleven routes.
+/// closures coerce to it), so one helper serves every Lead route.
 type LeadCall = for<'a> fn(&'a dyn ControlApi, Value) -> BoxFuture<'a, ControlResult<Value>>;
 
 /// The audit / authorization target for a Lead body: `worktree` when present,
@@ -105,6 +105,9 @@ lead_handlers!(
     (approvals_request, ApprovalsRequest, approvals_request),
     (approvals_resolve, ApprovalsResolve, approvals_resolve),
     (merge_drain, MergeDrain, merge_drain),
+    // THE-2197 kill switch: pause is Write; resume is Admin (operator only).
+    (automations_pause, AutomationsPause, automations_pause),
+    (automations_resume, AutomationsResume, automations_resume),
 );
 
 #[cfg(test)]

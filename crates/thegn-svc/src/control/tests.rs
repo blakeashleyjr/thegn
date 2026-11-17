@@ -2422,6 +2422,72 @@ async fn lead_verbs_have_catalog_routes_and_exact_scopes() {
     );
 }
 
+/// THE-2197: pause is Write, resume is Admin, and a Lead token is refused
+/// resume even when it somehow holds admin scope.
+#[tokio::test]
+async fn automations_pause_is_write_and_resume_refuses_write_and_lead_tokens() {
+    use thegn_core::control::{Scope, required_scope};
+    for (capability, path, scope) in [
+        ("automations.pause", "/v1/automations/pause", Scope::Write),
+        ("automations.resume", "/v1/automations/resume", Scope::Admin),
+    ] {
+        assert!(
+            super::routes::ROUTES
+                .iter()
+                .any(|route| route.path == path && route.caps == [capability]),
+            "missing route for {capability}"
+        );
+        assert!(
+            super::routes::API_CALLS.contains(&(capability, "POST", path)),
+            "missing POST API_CALLS row for {capability}"
+        );
+        let entry = thegn_core::capability::lookup(capability).unwrap();
+        assert_eq!(required_scope(entry.verb), scope, "{capability}");
+    }
+
+    let r = rig(false);
+    let read = token(&r, "read");
+    let write = token(&r, "write");
+    let admin = token(&r, "admin");
+    let lead = token_with_label(&r, "read,write,admin", LEAD_LABEL.to_string());
+    // The fake leaves both methods at `Unimplemented`: authorized = 501.
+    let authorized = StatusCode::NOT_IMPLEMENTED;
+    let pause = "/v1/automations/pause";
+    let resume = "/v1/automations/resume";
+    let empty = serde_json::json!({});
+    assert_eq!(
+        post_json(&r, pause, &read, empty.clone()).await.0,
+        StatusCode::FORBIDDEN
+    );
+    assert_eq!(
+        post_json(&r, pause, &write, empty.clone()).await.0,
+        authorized
+    );
+    assert_eq!(
+        post_json(&r, pause, &lead, empty.clone()).await.0,
+        authorized
+    );
+    assert_eq!(
+        post_json(&r, resume, &write, empty.clone()).await.0,
+        StatusCode::FORBIDDEN
+    );
+    assert_eq!(
+        post_json(&r, resume, &admin, empty.clone()).await.0,
+        authorized
+    );
+    let (status, body) = post_json(&r, resume, &lead, empty).await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    let text = refusal_text(&body);
+    assert!(
+        text.starts_with(thegn_core::lead_confine::REFUSAL_PREFIX),
+        "{body}"
+    );
+    assert!(
+        text.contains("only the operator resumes automations"),
+        "{body}"
+    );
+}
+
 /// The new wire types survive a serde round-trip, and `PushedNote`'s optional
 /// fields default when absent (the minimal `{"title": …}` push is valid).
 #[test]
