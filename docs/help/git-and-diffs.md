@@ -40,6 +40,13 @@ reported. An empty stash message becomes `WIP on <branch>`. A commit with
 nothing staged is refused before the message box; partially staged changes
 and merge states are allowed.
 
+Three stash keys sit in changes. `s` stashes everything, untracked files
+included. `S` stashes only the staged changes, which needs git 2.35 or newer;
+an older git refuses with a clear error. `U` stashes only the unstaged and
+untracked changes and leaves the index as it was. `S` with nothing staged
+reports `nothing staged to stash`, and `U` with nothing unstaged reports
+`no unstaged changes to stash`; neither opens the message box.
+
 For long-running `process` filters such as Git LFS, diffs reuse one filter per
 worktree and command, with at most 8 in total; a filter idle for 2 minutes is
 closed at the next diff. If a filter cannot run, the diff falls back to Git's
