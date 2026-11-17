@@ -28,6 +28,26 @@ this is why:
 | `placement` | the multi-host placement engine                                            | `[placement]`                                   |
 | `voice`     | command-backed voice mode                                                  | `[voice]`                                       |
 
+### Sandbox and remote programme features (not yet implemented)
+
+These nine features are reserved for the sandbox and remote programme. They
+are experimental, so they are dev-only, and each one reads "experimental, not
+yet implemented" in `thegn doctor` until the work that owns it lands. No config
+key turns them on yet; listing them now keeps the feature set stable while the
+programme is built.
+
+| Feature            | Covers                                                                   | Config              |
+| ------------------ | ------------------------------------------------------------------------ | ------------------- |
+| `sandbox_backends` | config-defined, shipped and recipe sandbox backends; live fork           | not yet implemented |
+| `linux_confine`    | the Landlock + seccomp confinement helper on bwrap, systemd and Landlock | not yet implemented |
+| `egress_proxy`     | `network = "allowlist"`, presets, approvals, brokering, external proxies | not yet implemented |
+| `seatbelt`         | the macOS Seatbelt backend                                               | not yet implemented |
+| `win_isolation`    | the Windows MXC isolation backend                                        | not yet implemented |
+| `plugin_backends`  | sandbox backends supplied by plugins                                     | not yet implemented |
+| `agent_presets`    | per-agent presets applied at launch                                      | not yet implemented |
+| `private_copy`     | private-copy workspaces (`workspace.mode = "private-copy"`)              | not yet implemented |
+| `escalation`       | in-pane escalation requests                                              | not yet implemented |
+
 On the stable channel, SSH and provider `[env.*]` environments are removed
 when the config loads. If a worktree's `[sandbox] default_env` or selection
 names one, its pane halts by default with a hint to set `THEGN_CHANNEL=dev`;
