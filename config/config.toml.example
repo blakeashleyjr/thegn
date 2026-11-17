@@ -1406,6 +1406,7 @@ command = "aider --model sonnet"
 # failure_threshold   = 3           # consecutive failures before the breaker opens
 # cooldown_secs       = 30          # open→half-open probe delay
 # request_timeout_secs = 30         # per-call timeout counted against the breaker
+# profiles = { lead = ["notes"] }   # named profiles: members are exposed ONLY by `thegn mcp proxy --profile <name>`
 #
 # `keyring:` secret refs: an upstream env value `API_KEY = "keyring:<name>"`
 # resolves from the OS keyring at spawn (agents never see it). Manage entries
@@ -4876,6 +4877,17 @@ poll_interval_secs = 3
 # socket = "127.0.0.1:6600"    # host:port, or an absolute path to MPD's unix socket.
                                # $MPD_HOST / $MPD_PORT override when left at default.
 # password = "file:~/.config/thegn/secrets/media-mpd.token" # keyring:, env:, file: refs; bare literals remain supported but are warned/migratable
+
+# ── Experimental Lead meta agent ([lead]) ───────────────────────────────────
+# A hosted agent CLI in a global tab that drives thegn through a scoped MCP
+# surface. Absent = no Lead. Dev channel only; stable clamps it off.
+# [lead]
+# agent = "claude"                  # required: an [[agents]] entry name
+# account = "work"                  # account id whose credentials the Lead uses (unset = the agent's own env)
+# scopes = ["read", "write"]        # MCP scopes, clamped by [mcp.serve]; admin and exec are refused
+# mcp_profile = "lead"              # [mcp_proxy.profiles] entry exposing the Lead's own MCP servers
+# skill = "lead"                    # skill seeded into the notes dir
+# notes_dir = "~/.local/state/thegn/lead"  # the Lead's only writable directory (default $XDG_STATE_HOME/thegn/lead)
 
 # ── Experimental voice mode ─────────────────────────────────────────────────
 # Alt v records/stops; Esc cancels. Final text is pasted without submission.

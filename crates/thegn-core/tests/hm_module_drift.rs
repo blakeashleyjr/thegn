@@ -106,6 +106,7 @@ const OMITTED: &[(&str, &str)] = &[
     ("skills", "skill configuration is not exposed"),
     ("media.mpd.password", "credentials are not exposed"),
     ("voice", "voice input is not exposed"),
+    ("lead", "Lead meta agent is experimental and not exposed"),
     (
         "usage.allow_network",
         "network opt-in awaits an owner decision",
