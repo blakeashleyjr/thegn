@@ -185,10 +185,8 @@ struct StartTarget {
 /// never the event's string; a non-git (`dir`) workspace is refused.
 fn registered_repo_root(db: &thegn_core::db::Db, repo: &str) -> Result<String> {
     use thegn_core::store::WorkspaceStore;
-    let canonical = match std::fs::canonicalize(repo) {
-        Ok(path) => Some(path),
-        Err(_) => None,
-    };
+    // best-effort: an unresolvable path simply matches no registered workspace.
+    let canonical = std::fs::canonicalize(repo).ok();
     db.workspaces()?
         .into_iter()
         .filter(|w| w.kind == "repo")
