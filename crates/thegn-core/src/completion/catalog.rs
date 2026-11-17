@@ -452,6 +452,9 @@ pub const CATALOG: &[Slot] = &[
         "prompt",
         SourceKind::Reserved(Reserved::Freeform),
     ),
+    // `agent result`: a dispatch row number and a session id, both free-form.
+    slot("agent result", "row", SourceKind::Structural),
+    slot("agent result", "session", SourceKind::Structural),
     slot("session fork", "worktree", SourceKind::Worktree),
     slot("session move", "worktree", SourceKind::Worktree),
     slot("share start", "worktree", SourceKind::Worktree),
@@ -1063,6 +1066,18 @@ mod tests {
             source("prompt"),
             Some(SourceKind::Reserved(Reserved::Freeform))
         );
+    }
+
+    #[test]
+    fn agent_result_value_slots_have_their_completion_sources() {
+        for arg in ["row", "session"] {
+            assert_eq!(
+                lookup("agent result", arg).map(|slot| slot.source),
+                Some(SourceKind::Structural),
+                "{arg}"
+            );
+        }
+        assert_eq!(lookup("agent result", "json"), None);
     }
 
     #[test]
