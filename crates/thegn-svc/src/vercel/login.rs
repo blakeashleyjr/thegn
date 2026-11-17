@@ -193,7 +193,8 @@ fn agent_subdir(agent: &str, dir: &str) -> Result<String> {
 }
 
 /// The planned upload: `(subdir, payload)` per agent, refusing an unsupported
-/// agent, an empty payload, or two agents sharing one subdir.
+/// agent or an empty payload; a second agent on an already-planned subdir is
+/// skipped.
 fn upload_plan<'p>(
     payloads: &'p [LoginPayload],
     dir: &str,
@@ -208,10 +209,10 @@ fn upload_plan<'p>(
             payload.agent
         );
         let sub = agent_subdir(&payload.agent, dir)?;
-        ensure!(
-            seen.insert(sub.clone()),
-            "vercel: two agents share the {sub} login dir"
-        );
+        // Two agents on one subdir read the same host home: upload it once.
+        if !seen.insert(sub.clone()) {
+            continue;
+        }
         out.push((sub, payload));
     }
     Ok(out)
@@ -604,6 +605,31 @@ mod tests {
             at += 512 + size.div_ceil(512) * 512;
         }
         out
+    }
+
+    #[test]
+    fn claude_and_claude_code_upload_one_claude_dir() {
+        let payload = |agent: &str| {
+            LoginPayload::new(
+                agent,
+                vec![(".credentials.json".into(), b"{\"t\":1}".to_vec())],
+            )
+            .unwrap()
+        };
+        let payloads = [payload("claude"), payload("claude-code")];
+        let plan = upload_plan(&payloads, DIR).expect("duplicate subdir is skipped");
+        assert_eq!(plan.len(), 1);
+        assert_eq!(plan[0].0, "claude");
+        let tar = login_tar(&plan).unwrap();
+        let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+        std::io::Write::write_all(&mut encoder, &tar).unwrap();
+        let entries = tar_entries(&encoder.finish().unwrap());
+        let claude: Vec<_> = entries
+            .iter()
+            .filter(|(path, _)| path.starts_with("claude/"))
+            .collect();
+        assert_eq!(claude.len(), 1, "{entries:?}");
+        assert_eq!(claude[0].0, "claude/.credentials.json");
     }
 
     #[tokio::test]

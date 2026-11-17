@@ -86,11 +86,17 @@ pub fn run(cfg: &Config, id: &str, cmd: &[String]) -> Result<()> {
             note(&line);
         }
         let resolved = resolved.and_then(|name| cfg.env.get(&name).map(|e| (name, e)));
-        let provider = resolved
+        // Upload only through the resolved env's OWN provider: a fallback
+        // provider is another account (team, project, token).
+        let own = resolved
             .as_ref()
-            .and_then(|(_, envc)| crate::provider_factory::vercel_provider_for(&envc.provider, id))
-            .map_or_else(|| first_vercel_provider(cfg, id), Ok)?;
-        let upload = resolved.and_then(|(_, envc)| upload_plan(cfg, envc));
+            .and_then(|(_, envc)| crate::provider_factory::vercel_provider_for(&envc.provider, id));
+        let upload = if own.is_some() {
+            resolved.and_then(|(_, envc)| upload_plan(cfg, envc))
+        } else {
+            None
+        };
+        let provider = own.map_or_else(|| first_vercel_provider(cfg, id), Ok)?;
         let code = run_tty(Arc::new(provider), id, argv, env, upload)?;
         std::process::exit(host_exit_code(code));
     }
@@ -197,7 +203,7 @@ fn upload_plan(cfg: &Config, envc: &EnvConfig) -> Option<UploadPlan> {
         .clone()
         .unwrap_or_else(|| cfg.sandbox.network_allow.clone());
     Some(UploadPlan {
-        install_agents: !agents.is_empty(),
+        install_agents: false, // the TTY open never installs; provisioning sets its own policy
         agents,
         user_domains,
     })
@@ -649,6 +655,10 @@ fn run_tty(
     let (tty_tx, tty_rx) = tokio::sync::mpsc::channel::<FromTty>(256);
     let done = Arc::new(AtomicBool::new(false));
     let waker = term.waker();
+    if login.is_some() {
+        let _enter = rt.enter();
+        crate::platform::install_shutdown_signal(done.clone(), term.waker());
+    }
     let thread = {
         let done = done.clone();
         thegn_core::thread_name::spawn_named("thegn-vx-in", move || {
@@ -1040,5 +1050,6 @@ mod tests {
         envc.sandbox.network_allow = Some(names(&["example.com"]));
         let plan = upload_plan(&cfg, &envc).expect("upload plans");
         assert_eq!(plan.user_domains, names(&["example.com"]));
+        assert!(!plan.install_agents);
     }
 }
