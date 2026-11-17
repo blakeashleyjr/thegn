@@ -136,11 +136,12 @@ pub fn run(cfg: &Config, action: Action) -> Result<()> {
 // --- fact gathering ---------------------------------------------------------
 
 /// One lane's facts plus the row they were gathered from, so the printers can
-/// name the issue and worktree without a second lookup.
-struct Lane {
-    row: AgentDispatch,
-    facts: LaneFacts,
-    approval: ApprovalState,
+/// name the issue and worktree without a second lookup. Shared with the
+/// daemon stage executor (b155), which plans one issue at a time.
+pub(crate) struct Lane {
+    pub(crate) row: AgentDispatch,
+    pub(crate) facts: LaneFacts,
+    pub(crate) approval: ApprovalState,
 }
 
 type GatheredRows = (Vec<AgentDispatch>, BTreeMap<i64, Vec<String>>, bool);
@@ -418,6 +419,14 @@ fn git_read_was_absent(error: &thegn_core::git_run::GitTextError) -> bool {
             ..
         })
     )
+}
+
+/// The lanes of one tracker issue (any spelling), active rows plus the newest
+/// done window: exactly `supervise plan --issue <issue>` without `--all`. The
+/// daemon stage executor's gatherer, so the executor and the audit surface can
+/// never plan from different facts.
+pub(crate) fn gather_lane(cfg: &Config, db: &Db, issue: &str) -> Result<Vec<Lane>> {
+    gather(cfg, db, Some(issue), false, RosterPage::default())
 }
 
 // --- plan -------------------------------------------------------------------
@@ -892,6 +901,53 @@ mod tests {
             vec![matched]
         );
         assert!(!lanes.iter().any(|lane| lane.row.id == other));
+    }
+
+    #[test]
+    fn gather_lane_matches_gather_for_one_issue() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Db::open_at(&dir.path().join("sup.db")).unwrap();
+        let worktree_path = dir.path().display().to_string();
+        let running = insert_issue_row(
+            &db,
+            "linear:THE-407",
+            &worktree_path,
+            AgentDispatchStatus::Running,
+        );
+        let done = insert_issue_row(&db, "THE-407", &worktree_path, AgentDispatchStatus::Done);
+        insert_issue_row(
+            &db,
+            "linear:THE-408",
+            &worktree_path,
+            AgentDispatchStatus::Running,
+        );
+        // A closed row is outside the non-`--all` view in both gatherers.
+        insert_issue_row(
+            &db,
+            "linear:THE-407",
+            &worktree_path,
+            AgentDispatchStatus::Abandoned,
+        );
+
+        let cfg = Config::default();
+        let via_gather = gather(
+            &cfg,
+            &db,
+            Some("linear:THE-407"),
+            false,
+            RosterPage::default(),
+        )
+        .unwrap();
+        let via_lane = gather_lane(&cfg, &db, "linear:THE-407").unwrap();
+        let ids = |lanes: &[Lane]| lanes.iter().map(|lane| lane.row.id).collect::<Vec<_>>();
+        assert_eq!(ids(&via_lane), ids(&via_gather));
+        let mut sorted = ids(&via_lane);
+        sorted.sort_unstable();
+        assert_eq!(sorted, vec![running, done]);
+        for (a, b) in via_lane.iter().zip(&via_gather) {
+            assert_eq!(a.facts, b.facts);
+            assert_eq!(a.approval, b.approval);
+        }
     }
 
     #[test]

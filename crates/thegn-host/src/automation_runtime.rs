@@ -46,7 +46,7 @@ pub(crate) fn rule_has_live_session(rule_id: &str) -> bool {
     })
 }
 
-fn session_origin(session: &str) -> Option<thegn_core::automation::AutomationOrigin> {
+pub(crate) fn session_origin(session: &str) -> Option<thegn_core::automation::AutomationOrigin> {
     SESSION_ORIGINS
         .get_or_init(Default::default)
         .lock()
