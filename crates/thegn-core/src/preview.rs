@@ -35,6 +35,8 @@ pub enum PreviewRoute {
     Mermaid,
     /// A PDF document (rasterized to the graphics route, text as fallback).
     Pdf,
+    /// A zip/tar archive shown as an entry listing (`archive_list`).
+    Archive,
     /// Not previewable (binary with no recognized type).
     Unknown,
 }
@@ -54,6 +56,18 @@ fn looks_binary(head: &[u8]) -> bool {
     head.contains(&0)
 }
 
+/// `name.tar.gz`: the stem of a `.gz` path itself ends in `.tar`.
+fn is_tar_gz(path: &Path) -> bool {
+    path.file_stem()
+        .and_then(|s| s.to_str())
+        .is_some_and(|s| s.to_ascii_lowercase().ends_with(".tar"))
+}
+
+/// Sniff a zip local-file header (`PK\x03\x04`) or a tar `ustar` magic.
+fn looks_like_archive(head: &[u8]) -> bool {
+    head.starts_with(b"PK\x03\x04") || head.get(257..262) == Some(b"ustar".as_slice())
+}
+
 /// Map a previewed file to its [`PreviewRoute`].
 ///
 /// `head` is a prefix of the file's bytes (may be empty when unavailable); it is
@@ -64,6 +78,8 @@ pub fn route_for(path: &Path, head: &[u8]) -> PreviewRoute {
         Some("ipynb") => PreviewRoute::Jupyter,
         Some("mmd" | "mermaid") => PreviewRoute::Mermaid,
         Some("pdf") => PreviewRoute::Pdf,
+        Some("zip" | "jar" | "whl" | "tar" | "tgz") => PreviewRoute::Archive,
+        Some("gz") if is_tar_gz(path) => PreviewRoute::Archive,
         Some("png" | "jpg" | "jpeg" | "gif" | "webp" | "bmp" | "ico" | "avif") => {
             PreviewRoute::Image
         }
@@ -75,7 +91,9 @@ pub fn route_for(path: &Path, head: &[u8]) -> PreviewRoute {
         ) => PreviewRoute::Text,
         // No / unrecognized extension: fall back on a content sniff.
         _ => {
-            if head.is_empty() || !looks_binary(head) {
+            if looks_like_archive(head) {
+                PreviewRoute::Archive
+            } else if head.is_empty() || !looks_binary(head) {
                 PreviewRoute::Text
             } else {
                 PreviewRoute::Unknown
@@ -842,6 +860,25 @@ pub fn validate_preview_redirect(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn route_for_archive_table() {
+        use std::path::Path;
+        let r = |n: &str, h: &[u8]| super::route_for(Path::new(n), h);
+        for n in ["a.zip", "a.JAR", "a.whl", "a.tar", "a.tgz", "a.tar.gz"] {
+            assert_eq!(r(n, b""), super::PreviewRoute::Archive, "{n}");
+        }
+        assert_ne!(r("a.gz", b""), super::PreviewRoute::Archive);
+        assert_eq!(
+            r("doc.docx", b"PK\x03\x04\0\0"),
+            super::PreviewRoute::Archive
+        );
+        let mut tar = vec![0u8; 1024];
+        tar[257..262].copy_from_slice(b"ustar");
+        assert_eq!(r("noext", &tar), super::PreviewRoute::Archive);
+        assert_eq!(r("noext", b"\0\x01\x02"), super::PreviewRoute::Unknown);
+        assert_eq!(r("noext", b"hello"), super::PreviewRoute::Text);
+    }
+
     use super::*;
 
     #[test]
