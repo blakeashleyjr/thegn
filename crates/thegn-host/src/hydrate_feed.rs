@@ -164,6 +164,16 @@ pub(crate) fn populate_notifications(
             .collect();
         let (notifications, hidden_read) = cap_inbox(notifications, INBOX_READ_ROWS);
         panel.notifications_hidden_read = hidden_read;
+        panel.approval_descriptions = notifications
+            .iter()
+            .filter(|n| crate::panel::sections::notifications::is_approval(n))
+            .filter_map(|n| {
+                let (issue, stage, sha) =
+                    thegn_core::approval_request::parse_source_ref(&n.source_ref)?;
+                let text = crate::daemon::approval_effects::describe(db, &issue, &stage, &sha);
+                Some((n.source_ref.clone(), text))
+            })
+            .collect();
         panel.notifications = notifications;
     }
 }
