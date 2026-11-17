@@ -152,6 +152,24 @@ pub(crate) fn activate_row_target(
                         let Some((tx, waker)) = terminal_restore else {
                             return Activation::Failed;
                         };
+                        // The Lead may not be registered yet ("Enter to start"):
+                        // record its launch choice so the materialize worker
+                        // spawns it, and queue the registry row off-thread.
+                        if crate::lead::group::is_lead_group(&name) {
+                            let choice = crate::lead::group::lead_choice();
+                            crate::handlers::terminal::remember_choice(
+                                &choice.name,
+                                &choice.connection,
+                                &choice.sandbox,
+                            );
+                            tokio::task::spawn_blocking(move || {
+                                let _ = thegn_core::db::Db::open()
+                                    .map_err(|e| e.to_string())
+                                    .and_then(|db| {
+                                        crate::handlers::terminal::write_terminal_row(&db, &choice)
+                                    }); // best-effort: registry row; the live choice already drives the spawn
+                            });
+                        }
                         crate::handlers::terminal::request_restore(
                             session.id.clone(),
                             name.clone(),

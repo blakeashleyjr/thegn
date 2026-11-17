@@ -407,7 +407,18 @@ impl TerminalWizard {
         }
     }
 
+    /// The refusal shown when the resolved name is the Lead's reserved one.
+    pub const RESERVED_NAME_MESSAGE: &'static str =
+        "'lead' is reserved for the Lead \u{2014} pick another name";
+
+    fn name_is_reserved(&self) -> bool {
+        crate::lead::group::is_lead_group(&self.resolved_name())
+    }
+
     fn submit(&self) -> Outcome {
+        if self.name_is_reserved() {
+            return Outcome::Pending;
+        }
         let connection = self.effective_connection();
         let local = connection.is_empty();
         Outcome::Submit(TerminalChoice {
@@ -559,7 +570,11 @@ impl TerminalWizard {
             inner.cols,
             &Line::segs(vec![seg(
                 Tok::Slot(S::Faint),
-                format!("↑↓ move · ←→ change · {enter_verb} · esc cancel"),
+                if self.name_is_reserved() {
+                    Self::RESERVED_NAME_MESSAGE.to_string()
+                } else {
+                    format!("↑↓ move · ←→ change · {enter_verb} · esc cancel")
+                },
             )]),
             panel,
         );
@@ -713,6 +728,15 @@ mod tests {
             Outcome::Submit(c) => assert_eq!(c.connection, "ssh dev@builder"),
             other => panic!("expected submit, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn reserved_lead_name_is_refused_on_submit() {
+        let mut w = wiz();
+        w.name = "lead".into();
+        w.name_edited = true;
+        assert!(w.name_is_reserved());
+        assert_eq!(w.submit(), Outcome::Pending);
     }
 
     #[test]
