@@ -1,7 +1,7 @@
 //! The `/interactive` WebSocket PTY for a Vercel sandbox (in-process callers:
 //! the `vercel-exec` bridge). Native panes stay off: `exec_api` is false.
 //!
-//! Flow: resolve the session (resuming under [`Wake::Allow`]), mint the
+//! Flow: resolve the session (resuming under [`super::Wake::Allow`]), mint the
 //! `/interactive` ticket, wait for the sandbox's `/health`, connect the socket
 //! with the ticket token in the query, send the start frame, then pump frames
 //! in a driver task. The ticket token never reaches a log or an error string:
@@ -13,7 +13,7 @@ use anyhow::{Result, anyhow};
 use thegn_core::vercel::admit::valid_sandbox_name;
 use thegn_core::vercel::api::{WsControl, interactive_start_frame, parse_ws_control, resize_frame};
 
-use super::{VercelProvider, Wake};
+use super::VercelProvider;
 use crate::provider::{EXEC_EXIT_STATUS_UNKNOWN, ExecControl, ExecFrame, ExecSession, ExecSpec};
 
 // Copied from provider.rs (`exec_ws_config` and its limits) so this lane does
@@ -99,7 +99,7 @@ pub(super) fn health_backoff(attempt: u32, jitter_ms: u64) -> Duration {
 fn jitter_ms() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| u64::from(d.subsec_nanos() / 1_000_000))
+        .map(|d| u64::from(d.subsec_millis()))
         .unwrap_or(0)
 }
 
@@ -143,20 +143,26 @@ fn connect_error(error: &tokio_tungstenite::tungstenite::Error) -> anyhow::Error
 }
 
 impl VercelProvider {
-    /// Open a PTY session over `/interactive`. Resumes a stopped sandbox. The
-    /// `session_id` watch carries the Vercel session id (informational:
-    /// Vercel has no reattach).
-    pub async fn open_exec(&self, name: &str, spec: &ExecSpec) -> Result<ExecSession> {
-        anyhow::ensure!(valid_sandbox_name(name), "vercel: invalid sandbox name");
-        let start = interactive_start_frame(
+    /// The `/interactive` start frame for `spec`, its env through the
+    /// provider allowlist.
+    pub(super) fn start_frame(&self, spec: &ExecSpec) -> Result<String> {
+        interactive_start_frame(
             &spec.argv,
             spec.cwd.as_deref(),
-            &spec.env,
+            &self.sandbox_env(&spec.env),
             spec.cols,
             spec.rows,
         )
-        .map_err(|e| anyhow!("vercel: interactive start frame: {e}"))?;
-        let session = self.session_for(name, Wake::Allow).await?;
+        .map_err(|e| anyhow!("vercel: interactive start frame: {e}"))
+    }
+
+    /// Open a PTY session over `/interactive`. Resumes a stopped sandbox. The
+    /// `session_id` watch carries the Vercel session id (informational:
+    /// Vercel has no reattach). `spec.env` passes the provider allowlist.
+    pub async fn open_exec(&self, name: &str, spec: &ExecSpec) -> Result<ExecSession> {
+        anyhow::ensure!(valid_sandbox_name(name), "vercel: invalid sandbox name");
+        let start = self.start_frame(spec)?;
+        let session = self.interactive_session(name).await?;
         let ticket = self.client.interactive(&session).await?;
         wait_healthy(&health_url(&ticket.url)?).await?;
         let url = zeroize::Zeroizing::new(
