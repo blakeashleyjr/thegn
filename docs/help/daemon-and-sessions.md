@@ -276,13 +276,20 @@ thegn agent run --agent codex --worktree ~/wt/fix-login \
   is refused before the daemon is contacted, as are the `session open`
   preflight refusals (for example a malformed `--track` id).
 - The session opens headless and bound to the worktree, through the same path
-  as a plain `session open`. It runs in whatever environment and sandbox the
-  worktree is bound to; it is not adopted into a pane.
+  as a plain `session open`. It is not adopted into a pane.
+- The environment: `--env <name>` pins the worktree to `[env.<name>]` first,
+  like `env set` (a worktree carrying a provider location is refused; run
+  `thegn env set` on it first). Without `--env`, a worktree that has no env
+  selection (no worktree or project `env set`, no repo `env = "…"`) is
+  pinned to `pipeline` when `[env.pipeline]` is defined; if it is not
+  defined, the default resolution applies. A worktree that already selects
+  an env keeps it. The pin is noted on stderr.
 - `--track <issue-id>` writes the plain dispatch row described above, so
   `dispatch list` and the sidebar see the run. It is optional: ad-hoc runs
   have no issue.
 - Without `--wait`, the command prints the session id (and
-  `dispatch <row> tracked`) and returns; `--json` prints `{session, row}`.
+  `dispatch <row> tracked`) and returns; `--json` prints `{session, row, env}`,
+  where `env` is the env this run pinned, or `null`.
 - With `--wait`, it attaches as an observer and keeps the last 256 KiB of
   output until the session exits. It then prints the tail with escape
   sequences and carriage returns removed: the last 200 non-blank lines. The
@@ -290,7 +297,7 @@ thegn agent run --agent codex --worktree ~/wt/fix-login \
   when `--timeout <secs>` (default 3600) elapses first. On a timeout the
   session is **left running**; the message names it so you can
   `session wait` on it again or `session close` it. `--json` prints
-  `{session, row, status, exit_code, output_tail, duration_ms}`, where
+  `{session, row, env, status, exit_code, output_tail, duration_ms}`, where
   `status` is `exited` or `timeout`.
 
 ## Serving thin clients
