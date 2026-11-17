@@ -608,7 +608,8 @@ fn submodule_loc(
 mod tests {
     use super::{
         FrameModel, MAX_ACTIVE_PREVIEW_JOBS, PreviewOwners, PreviewStats, PreviewTarget,
-        follow_change_cursor_target, preview_key, selected_preview_target,
+        conflict_path_at, files_filter_live, follow_change_cursor_target, preview_key,
+        selected_preview_target, source_index,
     };
 
     #[test]
