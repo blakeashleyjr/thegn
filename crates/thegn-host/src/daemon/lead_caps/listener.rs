@@ -1,8 +1,9 @@
 //! The Lead's dedicated loopback control listener (THE-2171, THE-2188): bearer
 //! tokens only (`local_admin = false`), started only when `[lead]` is
 //! configured. With `[lead]` absent nothing runs: no listener, thread, timer or
-//! spawn. With it present, only a blocking loopback `accept` exists (not a wake
-//! source) until a Lead connects.
+//! spawn. With it present, a one-shot startup revoke of every older Lead token
+//! runs, then only a blocking loopback `accept` exists (not a wake source)
+//! until a Lead connects.
 //!
 //! The bound address is published to `$XDG_STATE_HOME/thegn/lead-control/
 //! control-addr.json` (owner-only), where `lead::mcp::prepare` reads it when it
@@ -52,19 +53,37 @@ pub(crate) fn spawn(
             return;
         }
     };
-    if let Err(error) =
-        crate::lead::mcp::write_control_addr(&thegn_core::util::xdg_state_home(), addr)
-    {
-        tracing::warn!(target: "thegn::daemon", error = %format!("{error:#}"), "Lead listener: publish address failed");
-        return;
-    }
     let app = thegn_svc::control::http::router(state);
     tokio::spawn(async move {
+        // No Lead tab can be open against THIS listener yet: it bound a fresh
+        // port, and the address is published only below. Every older Lead
+        // token is therefore stale (its tab was wired to the previous
+        // address and re-mints on its next spawn), so revoke them all before
+        // publishing, off the runtime's worker (a blocking DB write).
+        match tokio::task::spawn_blocking(crate::lead::mcp::revoke_stale_lead_tokens).await {
+            Ok(Ok(revoked)) => {
+                tracing::debug!(target: "thegn::daemon", revoked, "Lead listener: revoked stale Lead tokens");
+            }
+            // best-effort: a failed startup revoke leaves stale tokens that
+            // no listener address points at; each tab's next mint revokes its own.
+            Ok(Err(error)) => {
+                tracing::warn!(target: "thegn::daemon", error = %format!("{error:#}"), "Lead listener: stale token revoke failed");
+            }
+            Err(error) => {
+                tracing::warn!(target: "thegn::daemon", %error, "Lead listener: stale token revoke panicked");
+            }
+        }
+        if let Err(error) =
+            crate::lead::mcp::write_control_addr(&thegn_core::util::xdg_state_home(), addr)
+        {
+            tracing::warn!(target: "thegn::daemon", error = %format!("{error:#}"), "Lead listener: publish address failed");
+            return;
+        }
+        tracing::info!(target: "thegn::daemon", %addr, "Lead control listener (bearer tokens only)");
         if let Err(error) = axum::serve(listener, app).await {
             tracing::warn!(target: "thegn::daemon", %error, "Lead control listener exited");
         }
     });
-    tracing::info!(target: "thegn::daemon", %addr, "Lead control listener (bearer tokens only)");
 }
 
 #[cfg(test)]

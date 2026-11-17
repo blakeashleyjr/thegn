@@ -125,7 +125,7 @@ fn launch_spec_with(
         .with_context(|| format!("resolving the Lead notes dir {}", notes.display()))?;
 
     crate::lead::skill::seed(cfg, &notes)?;
-    let caller = format!("lead:{group}/{tab}");
+    let caller = crate::lead::mcp::tab_caller(group, tab);
     let mcp = (host.mcp)(cfg, &notes, &caller)?;
 
     // The agent: its command (+ harness model flag), its secret-expanded env

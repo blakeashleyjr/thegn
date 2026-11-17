@@ -30,6 +30,10 @@ pub(crate) fn close_pane(cx: &mut CloseCtx<'_>) {
         .active_tab()
         .map(|t| t.center.pane_ids().len())
         .unwrap_or(0);
+    // A Lead tab's token is per TAB (every pane of the tab was spawned from
+    // the same launch spec, `lead:<group>/<tab>`), and this path never closes
+    // a tab's last pane, so a pane close never revokes: the tab's other panes
+    // still use the token. `close_tab` revokes.
     if pane_count <= 1 {
         cx.model.status = "Only one pane — use Close tab to close the tab".into();
     } else {
@@ -109,6 +113,9 @@ pub(crate) fn close_tab(
             }
             if let Some((name, path, gi, ti)) = target {
                 tab_state.on_tab_closed(&name, gi, ti);
+                if crate::lead::group::is_lead_group(&name) {
+                    revoke_lead_tab_off_loop(cx.lifecycle_cfg, &name, ti);
+                }
                 if !path.is_empty()
                     && cx
                         .session
@@ -156,5 +163,30 @@ pub(crate) fn close_smart(
         false
     } else {
         close_tab(cx, tab_state)
+    }
+}
+
+/// Revoke a closed Lead tab's control token (and every label the close
+/// shifted, see `lead::mcp::invalidated_by_close`) and remove its
+/// `mcp-<tab>.json`, OFF the loop: the DB write and the unlink run on the
+/// bounded background pool, never here.
+fn revoke_lead_tab_off_loop(cfg: &thegn_core::config::Config, group: &str, tab: usize) {
+    let caller = crate::lead::mcp::tab_caller(group, tab);
+    let cfg = cfg.clone();
+    let admission = crate::sched::spawn_bg(move || {
+        match crate::lead::mcp::revoke_tab_token(&cfg, &caller) {
+            Ok(revoked) => {
+                tracing::debug!(target: "thegn::lead", %caller, revoked, "revoked closed Lead tab token");
+            }
+            // best-effort: a failed revoke leaves the token live until the
+            // listener's next start (or the tab index's next mint) revokes it;
+            // the close itself must not fail on it.
+            Err(error) => {
+                tracing::warn!(target: "thegn::lead", %caller, error = %format!("{error:#}"), "revoking a closed Lead tab token failed");
+            }
+        }
+    });
+    if admission != crate::sched::Admission::Admitted {
+        tracing::warn!(target: "thegn::lead", group, tab, ?admission, "Lead tab token revoke not scheduled");
     }
 }
