@@ -7,6 +7,8 @@ All notable changes to **thegn** are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.1.0-alpha.91] — 2026-11-16
+
 ### Added
 
 - The perf rollup's `git_spawn_top` names the top (thread, git subcommand) pairs behind idle git spawns. (THE-1995)
@@ -3728,7 +3730,8 @@ launcher picker and the merge queue's `agent_command` hook remain — they run
 whatever commands you configure. Leftover `[llm_proxy]` config sections and
 `proxy_*` tables in existing state databases are ignored harmlessly.
 
-[Unreleased]: https://github.com/blakeashleyjr/thegn/compare/v0.1.0-alpha.90...HEAD
+[Unreleased]: https://github.com/blakeashleyjr/thegn/compare/v0.1.0-alpha.91...HEAD
+[0.1.0-alpha.91]: https://github.com/blakeashleyjr/thegn/compare/v0.1.0-alpha.90...v0.1.0-alpha.91
 [0.1.0-alpha.90]: https://github.com/blakeashleyjr/thegn/compare/v0.1.0-alpha.89...v0.1.0-alpha.90
 [0.1.0-alpha.89]: https://github.com/blakeashleyjr/thegn/compare/v0.1.0-alpha.88...v0.1.0-alpha.89
 [0.1.0-alpha.88]: https://github.com/blakeashleyjr/thegn/compare/v0.1.0-alpha.87...v0.1.0-alpha.88
