@@ -217,6 +217,7 @@ pub mod iroh_wire;
 pub mod issue;
 pub mod issue_snapshot;
 pub mod keymap;
+pub mod launch_kind;
 pub mod layout_import;
 pub mod lifecycle;
 pub mod loc;
