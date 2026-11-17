@@ -78,7 +78,10 @@ worktree's recorded VM is no longer listed by its provider. Clicking it opens
 the **fleet** popup: each VM's provider and env, id, state, size, `$/h`,
 accrued cost, worktree (or `ORPHAN`) and age, then the totals (per-provider
 hourly, today, month to date, and the next 24 h / 30 d at the current burn),
-and any env that could not be read. Every amount is an estimate, not a bill.
+and any env that could not be read. When a `[placement.fleet_budget.*]`
+limit is reached, a `budget` section at the top lists each provider's burn
+against its limit (amber at `warn_hourly`, red at `max_hourly`, where new
+sandboxes are refused). Long worktree paths show their tail. Every amount is an estimate, not a bill.
 
 In the popup, `↑`/`↓` (or `j`/`k`) select a VM. On a VM bound to a worktree,
 `s` stops it and `d` destroys it, each after a confirmation. Stop parks the VM
