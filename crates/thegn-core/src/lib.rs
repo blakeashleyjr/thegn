@@ -21,6 +21,7 @@ pub mod agent_task;
 pub mod aggregate;
 pub mod ansi_cells;
 pub mod archive_list;
+pub mod argv_template;
 pub mod asciicast;
 pub mod attention;
 pub mod automation;
