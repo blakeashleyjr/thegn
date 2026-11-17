@@ -319,7 +319,10 @@ async fn run(source: FeedSource, mut rx: mpsc::UnboundedReceiver<Cmd>, shared: A
 fn is_pane_or_hello(frame: &EventFrame) -> bool {
     matches!(
         frame,
-        EventFrame::Hello(_) | EventFrame::PaneSnapshot { .. } | EventFrame::PaneDelta { .. }
+        EventFrame::Hello(_)
+            | EventFrame::PaneSnapshot { .. }
+            | EventFrame::PaneDelta { .. }
+            | EventFrame::Notice { .. }
     )
 }
 
