@@ -3947,6 +3947,9 @@ fn provider_cache_report(cfg: &Config) {
                 "               exec = \"cli\" but the `sprite` CLI is MISSING from PATH — install it, or use exec = \"auto\" (native exec, no CLI)"
             );
         }
+        if let Some(warning) = ignored_cli_bridge(p) {
+            outln!("               {warning}");
+        }
         if p.host_cache {
             match &bridge {
                 Some(pth) => outln!("               host_cache: on (bridge {})", pth.display()),
@@ -3980,6 +3983,22 @@ fn sprite_cli_required(pc: &thegn_core::config::EnvProviderConfig) -> bool {
         EnvProviderKind::of(pc.provider.trim()),
         EnvProviderKind::Sprites
     ) && matches!(pc.exec, thegn_core::config::ProviderExecMode::Cli)
+}
+
+/// THE-2054: a sprites env on `exec = "auto"`/`"api"` that still carries a
+/// vendor-CLI `exec_command` / `interactive_command`. Those keys are bridges for
+/// `exec = "cli"` only and are ignored otherwise; say so rather than let a stale
+/// key look load-bearing.
+fn ignored_cli_bridge(pc: &thegn_core::config::EnvProviderConfig) -> Option<&'static str> {
+    let sprites = matches!(
+        EnvProviderKind::of(pc.provider.trim()),
+        EnvProviderKind::Sprites
+    );
+    let bridge_set = !pc.exec_command.is_empty() || !pc.interactive_command.is_empty();
+    (sprites && !matches!(pc.exec, thegn_core::config::ProviderExecMode::Cli) && bridge_set)
+        .then_some(
+            "exec_command / interactive_command are set but ignored (exec = \"auto\"/\"api\" uses the native API and `thegn sprite-exec`); remove them or set exec = \"cli\"",
+        )
 }
 
 fn provider_cache_lifecycle_note(provider: &str) -> Option<&'static str> {
@@ -6062,6 +6081,43 @@ mod tests {
             provider: "sprites".into(),
             ..Default::default()
         }));
+    }
+
+    #[test]
+    fn ignored_cli_bridge_flags_only_non_cli_sprites_with_a_bridge_set() {
+        use thegn_core::config::{EnvProviderConfig, ProviderExecMode};
+        let cli = vec!["sprite".to_string(), "exec".into(), "{id}".into()];
+        let pc = |provider: &str, exec: ProviderExecMode, exec_cmd: bool, interactive: bool| {
+            EnvProviderConfig {
+                provider: provider.into(),
+                exec,
+                exec_command: if exec_cmd { cli.clone() } else { Vec::new() },
+                interactive_command: if interactive { cli.clone() } else { Vec::new() },
+                ..Default::default()
+            }
+        };
+        // Flagged: sprites on auto/api with either bridge key set.
+        for exec in [ProviderExecMode::Auto, ProviderExecMode::Api] {
+            assert!(ignored_cli_bridge(&pc("sprites", exec, true, false)).is_some());
+            assert!(ignored_cli_bridge(&pc("sprites", exec, false, true)).is_some());
+            assert!(ignored_cli_bridge(&pc(" sprites ", exec, true, true)).is_some());
+            // Nothing set → nothing to warn about.
+            assert!(ignored_cli_bridge(&pc("sprites", exec, false, false)).is_none());
+        }
+        // `exec = "cli"` actually uses the keys.
+        assert!(ignored_cli_bridge(&pc("sprites", ProviderExecMode::Cli, true, true)).is_none());
+        // Other kinds: exec_command wins, never ignored.
+        for kind in ["hetzner", "daytona", "fly", "machine0", ""] {
+            assert!(
+                ignored_cli_bridge(&pc(kind, ProviderExecMode::Auto, true, true)).is_none(),
+                "{kind}"
+            );
+        }
+        let msg = ignored_cli_bridge(&pc("sprites", ProviderExecMode::Auto, true, false)).unwrap();
+        assert!(
+            msg.contains("set but ignored") && msg.contains("exec = \"cli\""),
+            "{msg}"
+        );
     }
 
     fn row(kind: NotificationKind, source: &str, msg: &str, created: i64) -> Notification {
