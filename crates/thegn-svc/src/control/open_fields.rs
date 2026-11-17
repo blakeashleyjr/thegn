@@ -35,6 +35,15 @@
 //! in `OpenSpec::security_fields`, echoes its name from the daemon's open
 //! handler, and adds the test `older_daemon_<field>_refused`: `env_scrub`
 //! (WS02-P4-15), `egress_lease` (WS04-P2-09), `shell` (WS09-P5-05).
+//!
+//! Known bypasses of rule 2 today (harmless while no security field exists;
+//! the first owner above to add a field must close both before it ships):
+//!
+//! - `thegn api call sessions.open` goes through
+//!   [`ControlClient::call_raw`](super::client::ControlClient::call_raw), which
+//!   POSTs `/v1/sessions` directly and never runs [`check_honoured`].
+//! - The gRPC `SessionInfo` (`proto/thegn/control/v1/control.proto`) has no
+//!   `honoured` field, so a gRPC open reply cannot carry the echo at all.
 
 /// A security-relevant `OpenSpec` extension, named by its `OpenSpec` field.
 /// Stub (WS00-P1-11): no such field exists on `OpenSpec` yet.
