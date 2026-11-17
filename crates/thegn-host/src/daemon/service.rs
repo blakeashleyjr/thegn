@@ -62,7 +62,8 @@ pub(crate) struct SessionEntry {
     /// `sessions.input` is allowed on. It lives on the live entry, so it
     /// ends with the session: a tombstone carries none, and an id reused by
     /// a later launch gets a fresh entry with none. In memory only: lost on
-    /// a daemon restart, which fails closed (the Lead is refused).
+    /// a daemon restart, which fails closed (the Lead is refused). Cleared by
+    /// the first non-Lead `sessions.input` (the user took the session over).
     pub lead_opener: Option<String>,
 }
 
@@ -1907,6 +1908,13 @@ impl ControlApi for DaemonService {
         bytes: Vec<u8>,
     ) -> BoxFuture<'a, ControlResult<()>> {
         Box::pin(async move {
+            // A non-Lead input (the user typing in an adopted pane, or any other
+            // caller) takes the session over: the Lead may no longer type into it.
+            if let Some(entry) = self.sessions.lock().await.get_mut(session)
+                && entry.lead_opener.take().is_some()
+            {
+                tracing::info!(target: "thegn::daemon", session, "non-Lead input: Lead input to this session is now refused");
+            }
             let tx = self.live_tx(session).await?;
             tx.send(SessionMsg::Stdin(bytes))
                 .await
@@ -4703,6 +4711,21 @@ mod tests {
             .expect("a non-Lead caller is unaffected");
         settle().await;
         assert_eq!(*written.lock().unwrap(), b"\x1b[A\x03".to_vec());
+    }
+
+    #[tokio::test]
+    async fn user_input_ends_the_leads_input_right() {
+        let (svc, _rx) = service(0);
+        let written = insert_input_probe(&svc, "w4").await;
+        svc.mark_lead_opened("w4", "lead:g/0").await;
+        svc.send_input("w4", b"x".to_vec()).await.unwrap();
+        expect_input_refusal(
+            svc.send_input_confined("w4", b"hi".to_vec(), lead_caller())
+                .await,
+            "opened itself",
+        );
+        settle().await;
+        assert_eq!(*written.lock().unwrap(), b"x".to_vec());
     }
 
     #[tokio::test]
