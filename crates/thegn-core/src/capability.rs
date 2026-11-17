@@ -501,6 +501,29 @@ pub const CATALOG: &[HostCapability] = &[
         SurfaceSet::of(&[Surface::Http, Surface::Cli]),
         "Grant or deny a pending pipeline approval (admin; never MCP or plugin)",
     ),
+    // b155 (6a): the phone's answer. Write, HTTP + CLI only, never MCP; the
+    // Lead is refused in lead_confine.
+    cap(
+        "approvals.redeem",
+        Verb::ApprovalsRedeem,
+        SurfaceSet::of(&[Surface::Http, Surface::Cli]),
+        "Answer an approval with a single-use push nonce (phone; never MCP or plugin)",
+    ),
+    // b155 (6f): the operator's kill switch. Admin, HTTP + CLI only.
+    cap(
+        "automations.halt",
+        Verb::AutomationsHalt,
+        SurfaceSet::of(&[Surface::Http, Surface::Cli]),
+        "Kill automation-started and Lead-opened sessions (admin; never MCP or plugin)",
+    ),
+    // b155 (THE-2222): a profile's server env, for `thegn mcp proxy --profile`
+    // inside the Lead sandbox. Read, HTTP + CLI only, never MCP.
+    cap(
+        "mcp_proxy.profile_env",
+        Verb::McpProxyProfileEnv,
+        SurfaceSet::of(&[Surface::Http, Surface::Cli]),
+        "Resolved env of an MCP proxy profile (Lead token for its own profile, or admin)",
+    ),
     // --- lead (THE-2171) ------------------------------------------------------
     // Lead tool surface (THE-2172): gRPC and plugin projection queued; not
     // claimed, so no gap rows.
@@ -1828,6 +1851,30 @@ mod tests {
             crate::control::required_scope(lookup("merge.drain").unwrap().verb),
             crate::control::Scope::MergeAdd
         );
+    }
+
+    #[test]
+    fn b155_spine_caps_are_http_cli_only_with_pinned_scopes() {
+        use crate::control::{Scope, required_scope};
+        for (cap, scope) in [
+            ("approvals.redeem", Scope::Write),
+            ("automations.halt", Scope::Admin),
+            ("mcp_proxy.profile_env", Scope::Read),
+        ] {
+            let c = lookup(cap).unwrap_or_else(|| panic!("{cap} has a catalog row"));
+            assert_eq!(
+                c.surfaces,
+                SurfaceSet::of(&[Surface::Http, Surface::Cli]),
+                "{cap}"
+            );
+            assert!(!c.surfaces.contains(Surface::Mcp), "{cap}");
+            assert!(!c.surfaces.contains(Surface::Plugin), "{cap}");
+            assert_eq!(required_scope(c.verb), scope, "{cap}");
+            assert!(c.deprecated.is_none() && c.stub.is_none(), "{cap}");
+            for s in Surface::ALL {
+                assert!(!is_gap(c.id.0, *s), "{cap}/{} is excused", s.as_str());
+            }
+        }
     }
 
     #[test]

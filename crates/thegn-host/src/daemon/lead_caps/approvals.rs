@@ -83,19 +83,52 @@ pub(crate) async fn list(svc: &DaemonService, req: serde_json::Value) -> JsonRes
 pub(crate) async fn request(svc: &DaemonService, req: serde_json::Value) -> JsonResult {
     let request: ApprovalRequest = decode(req)?;
     approval_request::validate_request(&request).map_err(ControlError::InvalidArgument)?;
-    let (requested, id) = svc.with_db(move |db| request_in(db, &request)).await?;
+    let stored = request.clone();
+    let (requested, id) = svc.with_db(move |db| request_in(db, &stored)).await?;
     if requested {
         super::feed::notification(&svc.events, id);
     }
+    after_request(svc, &request, requested).await;
     encode(&json!({ "requested": requested, "notification_id": id }))
 }
+
+/// Raise an approval from inside the daemon (the stage executor's land ask,
+/// a proposal, a rule arming, an outward call; b155). Validates, records the
+/// request once, publishes it, then runs [`after_request`]. Returns
+/// `(inserted, notification id)`.
+#[allow(dead_code, reason = "called by b155 lanes 2, 3 and 4")]
+pub(crate) async fn raise(
+    svc: &DaemonService,
+    req: ApprovalRequest,
+) -> anyhow::Result<(bool, i64)> {
+    approval_request::validate_request(&req).map_err(anyhow::Error::msg)?;
+    let stored = req.clone();
+    let (inserted, id) = svc
+        .with_db(move |db| request_in(db, &stored))
+        .await
+        .map_err(|error| anyhow::anyhow!("{error}"))?;
+    if inserted {
+        super::feed::notification(&svc.events, id);
+    }
+    after_request(svc, &req, inserted).await;
+    Ok((inserted, id))
+}
+
+/// What happens after a request is recorded (the phone push with its
+/// single-use nonce, 6a). Spine stub: b155 lane 6 fills it.
+#[allow(dead_code, reason = "filled by b155 lane 6")]
+pub(crate) async fn after_request(_svc: &DaemonService, _req: &ApprovalRequest, _inserted: bool) {}
 
 /// Answer `approvals.resolve` (Admin; HTTP and CLI only, never MCP).
 pub(crate) async fn resolve(svc: &DaemonService, req: serde_json::Value) -> JsonResult {
     let request: ApprovalResolve = decode(req)?;
     approval_request::validate_resolve(&request).map_err(ControlError::InvalidArgument)?;
-    svc.with_db(move |db| resolve_in(db, &request, thegn_core::util::now_ms()))
+    let stored = request.clone();
+    svc.with_db(move |db| resolve_in(db, &stored, thegn_core::util::now_ms()))
         .await?;
+    // b155: the decision is recorded; its effect (arm, start, kick) runs off
+    // the request path.
+    crate::daemon::approval_effects::spawn_on_resolved(request);
     encode(&json!({ "resolved": true }))
 }
 

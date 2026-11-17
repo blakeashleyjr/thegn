@@ -15,6 +15,7 @@
 
 pub(crate) mod agent_error_cache;
 pub(crate) mod agent_open;
+pub(crate) mod approval_effects;
 pub(crate) mod calendar_api;
 pub(crate) mod client;
 pub(crate) mod control_publish;
@@ -28,6 +29,8 @@ mod pty_diagnostics;
 pub(crate) mod record;
 pub(crate) mod service;
 pub(crate) mod session;
+pub(crate) mod stage_executor;
+pub(crate) mod stage_land;
 pub(crate) mod stage_launch;
 pub(crate) mod tombstone;
 
@@ -1223,6 +1226,12 @@ fn registry_control_origin(
     transport.advertised_origin(actual_bind_port)
 }
 
+/// `[lead] token_ttl_secs` for a listener's sliding Lead-token refresh; `0`
+/// (no slide) without a configured Lead.
+fn lead_token_ttl_secs(cfg: &Config) -> u64 {
+    cfg.lead.as_ref().map_or(0, |lead| lead.token_ttl_secs)
+}
+
 /// Entry point for the hidden `thegn daemon` subcommand: builds the runtime
 /// and serves until shutdown. Exits 0 immediately if another daemon already
 /// owns the socket.
@@ -1551,6 +1560,11 @@ async fn run(
     // `schedule_due` producer (THE-2193): spawns nothing unless an enabled
     // rule has a schedule.
     crate::automation_schedule::spawn(cfg);
+    // The stage executor (b155): event-driven; `install` returns at once with
+    // the supervisor off or no `[[pipeline.stages]]` (idle invariant).
+    crate::daemon::stage_executor::install(svc.clone(), Arc::new(cfg.clone()));
+    // Answered approvals fire their effects through this handle (b155).
+    approval_effects::install(&svc);
     // Lead tool surface (THE-2172): hand the event sender to the opt-in Notice
     // feed so automation runs can publish without a service handle.
     lead_caps::feed::install_global(svc.events.clone());
@@ -1567,6 +1581,7 @@ async fn run(
         cors_origins: Vec::new(),
         event_streams: Default::default(),
         lead_listener: false,
+        lead_token_ttl_secs: lead_token_ttl_secs(cfg),
     };
     let local_grpc = thegn_svc::control::grpc::GrpcControl {
         api: svc.clone(),
@@ -1615,7 +1630,11 @@ async fn run(
             store: db.clone() as Arc<Mutex<dyn ControlStore + Send>>,
             local_admin: false,
             daemon_euid: None,
-            require_approval: cfg.serve.require_approval,
+            // With `[lead]` configured every code redeemed here parks for
+            // operator approval: a pairing code the Lead read out of a pane
+            // snapshot must not mint a working token (the snapshot
+            // pairing-code hole, b155).
+            require_approval: cfg.serve.require_approval || cfg.lead.is_some(),
             server_label: format!("{} thegn {}", hostname(), env!("CARGO_PKG_VERSION")),
             // Browser-hosted thin clients opt in per `[serve] cors_origins`
             // (empty = no cross-origin access; a wildcard is refused at config
@@ -1623,6 +1642,7 @@ async fn run(
             cors_origins: cfg.serve.cors_origins.clone(),
             event_streams: Default::default(),
             lead_listener: false,
+            lead_token_ttl_secs: lead_token_ttl_secs(cfg),
         };
         let grpc = thegn_svc::control::grpc::GrpcControl {
             api: svc.clone(),
@@ -1703,6 +1723,7 @@ async fn run(
         cors_origins: Vec::new(),
         event_streams: Default::default(),
         lead_listener: false,
+        lead_token_ttl_secs: lead_token_ttl_secs(cfg),
     };
     lead_caps::listener::spawn(cfg, lead_state);
 

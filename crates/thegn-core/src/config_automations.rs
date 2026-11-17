@@ -28,6 +28,14 @@ fn default_max_concurrent() -> usize {
     2
 }
 
+fn default_max_concurrent_lanes() -> u32 {
+    2
+}
+
+fn default_max_spawns_per_day() -> u32 {
+    12
+}
+
 fn default_queue_capacity() -> usize {
     64
 }
@@ -55,6 +63,15 @@ pub struct AutomationsConfig {
     pub enabled: bool,
     #[serde(default = "default_max_concurrent")]
     pub max_concurrent: usize,
+    /// Most automation-started lanes active at once (distinct issues with an
+    /// active dispatch row carrying an `automation_rule`). `0` = none (6e).
+    #[serde(default = "default_max_concurrent_lanes")]
+    #[schemars(range(max = 64))]
+    pub max_concurrent_lanes: u32,
+    /// Most automation spawns in a rolling 24 h window. `0` = none (6e).
+    #[serde(default = "default_max_spawns_per_day")]
+    #[schemars(range(max = 1000))]
+    pub max_spawns_per_day: u32,
     #[serde(default = "default_queue_capacity")]
     pub queue_capacity: usize,
     #[serde(default = "default_action_timeout_secs")]
@@ -70,6 +87,8 @@ impl Default for AutomationsConfig {
         Self {
             enabled: false,
             max_concurrent: default_max_concurrent(),
+            max_concurrent_lanes: default_max_concurrent_lanes(),
+            max_spawns_per_day: default_max_spawns_per_day(),
             queue_capacity: default_queue_capacity(),
             action_timeout_secs: default_action_timeout_secs(),
             audit_retention_per_rule: default_audit_retention_per_rule(),
@@ -85,6 +104,10 @@ impl Default for AutomationsConfig {
 pub struct AutomationsOverlay {
     pub enabled: Option<bool>,
     pub max_concurrent: Option<usize>,
+    #[schemars(range(max = 64))]
+    pub max_concurrent_lanes: Option<u32>,
+    #[schemars(range(max = 1000))]
+    pub max_spawns_per_day: Option<u32>,
     pub queue_capacity: Option<usize>,
     #[schemars(range(max = "crate::time_policy::MAX_DURATION_SECS"))]
     pub action_timeout_secs: Option<u64>,
@@ -96,6 +119,8 @@ impl AutomationsOverlay {
     pub fn is_empty(&self) -> bool {
         self.enabled.is_none()
             && self.max_concurrent.is_none()
+            && self.max_concurrent_lanes.is_none()
+            && self.max_spawns_per_day.is_none()
             && self.queue_capacity.is_none()
             && self.action_timeout_secs.is_none()
             && self.audit_retention_per_rule.is_none()
@@ -108,6 +133,12 @@ impl AutomationsOverlay {
         }
         if let Some(value) = self.max_concurrent {
             base.max_concurrent = value;
+        }
+        if let Some(value) = self.max_concurrent_lanes {
+            base.max_concurrent_lanes = value;
+        }
+        if let Some(value) = self.max_spawns_per_day {
+            base.max_spawns_per_day = value;
         }
         if let Some(value) = self.queue_capacity {
             base.queue_capacity = value;
@@ -247,6 +278,20 @@ impl AutomationsConfig {
             self.max_concurrent,
             1,
             16,
+        );
+        bounded(
+            &mut errors,
+            "automations.max_concurrent_lanes",
+            self.max_concurrent_lanes,
+            0,
+            64,
+        );
+        bounded(
+            &mut errors,
+            "automations.max_spawns_per_day",
+            self.max_spawns_per_day,
+            0,
+            1_000,
         );
         bounded(
             &mut errors,
@@ -728,6 +773,42 @@ urgency = "alert"
         assert_eq!(cfg.automations.rules[0].then.cap, "notify.push");
         let errors = crate::config_validate::validate_str(body);
         assert!(errors.is_empty(), "{errors:#?}");
+    }
+
+    #[test]
+    fn budget_defaults_ranges_and_overlay() {
+        let cfg = AutomationsConfig::default();
+        assert_eq!((cfg.max_concurrent_lanes, cfg.max_spawns_per_day), (2, 12));
+        let parsed: AutomationsConfig = toml::from_str("enabled = true").unwrap();
+        assert_eq!(
+            (parsed.max_concurrent_lanes, parsed.max_spawns_per_day),
+            (2, 12)
+        );
+        let mut zero = valid();
+        zero.max_concurrent_lanes = 0;
+        zero.max_spawns_per_day = 0;
+        assert!(
+            zero.validate().is_empty(),
+            "0 means automation spawns nothing"
+        );
+        let mut over = valid();
+        over.max_concurrent_lanes = 65;
+        over.max_spawns_per_day = 1_001;
+        let errors = over.validate().join("\n");
+        assert!(errors.contains("automations.max_concurrent_lanes"));
+        assert!(errors.contains("automations.max_spawns_per_day"));
+        let mut base = valid();
+        let overlay = AutomationsOverlay {
+            max_concurrent_lanes: Some(5),
+            max_spawns_per_day: Some(40),
+            ..AutomationsOverlay::default()
+        };
+        assert!(!overlay.is_empty());
+        overlay.apply(&mut base);
+        assert_eq!(
+            (base.max_concurrent_lanes, base.max_spawns_per_day),
+            (5, 40)
+        );
     }
 
     #[test]

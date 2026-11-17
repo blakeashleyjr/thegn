@@ -33,6 +33,15 @@ pub fn paused(store: &dyn WorkspaceStore) -> bool {
     }
 }
 
+/// `automations.halt` (Admin; HTTP + CLI; b155 6f): kill every live
+/// automation-started or Lead-opened session unless `keep_sessions`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct HaltRequest {
+    #[serde(default)]
+    pub keep_sessions: bool,
+}
+
 /// Set or clear the pause flag.
 pub fn set_paused(store: &dyn WorkspaceStore, paused: bool) -> Result<()> {
     if paused {
@@ -45,6 +54,15 @@ pub fn set_paused(store: &dyn WorkspaceStore, paused: bool) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn halt_body_is_strict_and_defaults_to_killing() {
+        let empty: HaltRequest = serde_json::from_str("{}").unwrap();
+        assert!(!empty.keep_sessions);
+        let keep: HaltRequest = serde_json::from_str(r#"{"keep_sessions":true}"#).unwrap();
+        assert!(keep.keep_sessions);
+        assert!(serde_json::from_str::<HaltRequest>(r#"{"all":true}"#).is_err());
+    }
 
     #[test]
     fn pause_flag_round_trips_and_defaults_off() {

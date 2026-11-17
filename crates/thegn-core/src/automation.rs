@@ -550,6 +550,9 @@ pub enum SkipReason {
     /// The rule's previous run is still live (a session it opened, or an
     /// unfinished audit row inside the crash window).
     PreviousRunLive,
+    /// An automation budget (`[automations] max_concurrent_lanes` /
+    /// `max_spawns_per_day`) refused the spawn (6e).
+    Budget,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

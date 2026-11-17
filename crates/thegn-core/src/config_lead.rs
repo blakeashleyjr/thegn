@@ -5,7 +5,26 @@ use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
 
+use crate::config::config_enum;
 use crate::control::{Scope, ScopeSet};
+
+config_enum! {
+    /// How the Lead's sandbox reaches the network (THE-2220). "isolated" runs
+    /// it in its own network namespace through `pasta` (outbound internet,
+    /// no host loopback or abstract sockets; only the Lead listener port is
+    /// forwarded); without `pasta` the Lead refuses to start. "host" shares
+    /// the host network namespace and logs a warning on every launch.
+    pub enum LeadNetwork: "lead network" {
+        Isolated = "isolated", Host = "host",
+    } default = Isolated;
+}
+
+/// Default Lead token lifetime: 12 hours.
+pub const DEFAULT_TOKEN_TTL_SECS: u64 = 43_200;
+/// Shortest Lead token lifetime: 5 minutes.
+pub const MIN_TOKEN_TTL_SECS: u64 = 300;
+/// Longest Lead token lifetime (also the sliding-refresh cap): 7 days.
+pub const MAX_TOKEN_TTL_SECS: u64 = 604_800;
 
 /// `[lead]` — the Lead meta agent: a hosted agent CLI in a global tab.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize, schemars::JsonSchema)]
@@ -27,6 +46,17 @@ pub struct LeadConfig {
     /// The Lead's only writable directory. Default `$XDG_STATE_HOME/thegn/lead`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub notes_dir: Option<PathBuf>,
+    /// Network namespace for the Lead sandbox. Default `isolated`.
+    pub network: LeadNetwork,
+    /// Lead control-token lifetime in seconds (300..=604800, default 43200).
+    /// A token in use slides forward once less than half remains, capped at
+    /// seven days from minting.
+    #[schemars(range(min = 300, max = 604_800))]
+    pub token_ttl_secs: u64,
+    /// Outward caps (`issues.comment`, `issues.update`) the Lead may call
+    /// without a per-call owner approval. Default empty: every outward call
+    /// asks first.
+    pub outward_allow: Vec<String>,
 }
 
 impl Default for LeadConfig {
@@ -38,6 +68,9 @@ impl Default for LeadConfig {
             mcp_profile: "lead".into(),
             skill: "lead".into(),
             notes_dir: None,
+            network: LeadNetwork::default(),
+            token_ttl_secs: DEFAULT_TOKEN_TTL_SECS,
+            outward_allow: Vec::new(),
         }
     }
 }
@@ -80,6 +113,20 @@ impl LeadConfig {
                 "[lead] skill {:?} must be non-empty and use only [a-z0-9_-]",
                 self.skill
             ));
+        }
+        if !(MIN_TOKEN_TTL_SECS..=MAX_TOKEN_TTL_SECS).contains(&self.token_ttl_secs) {
+            errs.push(format!(
+                "[lead] token_ttl_secs must be between {MIN_TOKEN_TTL_SECS} and {MAX_TOKEN_TTL_SECS} (got {})",
+                self.token_ttl_secs
+            ));
+        }
+        for cap in &self.outward_allow {
+            if !crate::outward_gate::OUTWARD_CAPS.contains(&cap.as_str()) {
+                errs.push(format!(
+                    "[lead] outward_allow: {cap:?} is not an outward cap (expected one of {})",
+                    crate::outward_gate::OUTWARD_CAPS.join(", ")
+                ));
+            }
         }
         if let Some(dir) = &self.notes_dir {
             let expanded = crate::util::expand_tilde(&dir.to_string_lossy());
@@ -139,6 +186,51 @@ mod tests {
         assert_eq!(d.skill, "lead");
         assert!(d.account.is_none() && d.notes_dir.is_none());
         assert!(d.notes_dir_resolved().ends_with("thegn/lead"));
+        assert_eq!(d.network, LeadNetwork::Isolated);
+        assert_eq!(d.token_ttl_secs, 43_200);
+        assert!(d.outward_allow.is_empty());
+    }
+
+    #[test]
+    fn network_parses_and_unknown_is_refused() {
+        let c: LeadConfig = toml::from_str("agent = \"claude\"\nnetwork = \"host\"").unwrap();
+        assert_eq!(c.network, LeadNetwork::Host);
+        assert_eq!(LeadNetwork::Isolated.as_str(), "isolated");
+        assert!(toml::from_str::<LeadConfig>("network = \"bridge\"").is_err());
+    }
+
+    #[test]
+    fn token_ttl_range() {
+        for ok_ttl in [300, 43_200, 604_800] {
+            let c = LeadConfig {
+                token_ttl_secs: ok_ttl,
+                ..ok()
+            };
+            assert!(c.validate(&agents()).is_empty(), "{ok_ttl}");
+        }
+        for bad in [0, 299, 604_801] {
+            let c = LeadConfig {
+                token_ttl_secs: bad,
+                ..ok()
+            };
+            assert!(c.validate(&agents())[0].contains("token_ttl_secs"), "{bad}");
+        }
+    }
+
+    #[test]
+    fn outward_allow_accepts_only_outward_caps() {
+        let c = LeadConfig {
+            outward_allow: vec!["issues.comment".into(), "issues.update".into()],
+            ..ok()
+        };
+        assert!(c.validate(&agents()).is_empty());
+        let c = LeadConfig {
+            outward_allow: vec!["sessions.open".into()],
+            ..ok()
+        };
+        let errs = c.validate(&agents());
+        assert_eq!(errs.len(), 1);
+        assert!(errs[0].contains("outward_allow"));
     }
 
     #[test]

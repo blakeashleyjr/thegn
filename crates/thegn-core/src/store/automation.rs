@@ -117,4 +117,10 @@ pub trait AutomationStore {
 
     /// Keep at most `retain_per_rule` newest rows for each stable rule id.
     fn prune_automation_runs(&self, retain_per_rule: usize) -> Result<usize>;
+
+    /// What the automation budgets (6e) count right now. `now_ms` is unix
+    /// milliseconds; `automation_runs.started_at` is unix SECONDS, so the
+    /// 24 h window is converted for that table.
+    fn automation_budget_usage(&self, now_ms: i64)
+    -> Result<crate::automation_budget::BudgetUsage>;
 }
