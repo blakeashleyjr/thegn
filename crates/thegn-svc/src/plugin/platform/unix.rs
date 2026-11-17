@@ -13,7 +13,6 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::signal::unix::{Signal, SignalKind, signal};
 use tokio::time::Instant;
 
-#[cfg(target_os = "linux")]
 const MAX_TRACKED_DESCENDANTS: usize = 4096;
 #[cfg(target_os = "linux")]
 const MAX_DESCENDANT_DEPTH: usize = 64;
@@ -22,6 +21,10 @@ const MAX_DESCENDANT_DEPTH: usize = 64;
 thread_local! {
     static PROC_READS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     static GLOBAL_PROC_SCANS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    /// Test-only `/proc` root for [`linux_descendants_subtree_only`], so a run
+    /// can simulate a failed root walk or a helper orphaned between walks.
+    static SUBTREE_PROC_ROOT: std::cell::RefCell<Option<std::path::PathBuf>> =
+        const { std::cell::RefCell::new(None) };
 }
 
 #[cfg(target_os = "linux")]
@@ -127,6 +130,25 @@ fn linux_descendants_subtree(
     proc_root: &Path,
     root: libc::pid_t,
 ) -> Result<Vec<(libc::pid_t, u64)>, ()> {
+    let (descendants, capped) = linux_descendants_subtree_walk(proc_root, root)?;
+    if capped {
+        tracing::warn!(
+            target: "thegn::plugin",
+            limit = MAX_TRACKED_DESCENDANTS,
+            "plugin descendant snapshot reached its process limit"
+        );
+    }
+    Ok(descendants)
+}
+
+/// Walk `/proc/<pid>/task/*/children` from `root`. The flag reports whether
+/// the walk stopped at [`MAX_TRACKED_DESCENDANTS`]; callers decide whether
+/// (and how often) that deserves a warning.
+#[cfg(target_os = "linux")]
+fn linux_descendants_subtree_walk(
+    proc_root: &Path,
+    root: libc::pid_t,
+) -> Result<(Vec<(libc::pid_t, u64)>, bool), ()> {
     let mut descendants = Vec::new();
     let mut pending = VecDeque::from([(root, 0_usize)]);
     let mut visited = std::collections::BTreeSet::from([root]);
@@ -188,14 +210,7 @@ fn linux_descendants_subtree(
             break;
         }
     }
-    if capped {
-        tracing::warn!(
-            target: "thegn::plugin",
-            limit = MAX_TRACKED_DESCENDANTS,
-            "plugin descendant snapshot reached its process limit"
-        );
-    }
-    Ok(descendants)
+    Ok((descendants, capped))
 }
 
 #[cfg(not(target_os = "linux"))]
@@ -203,26 +218,134 @@ pub(crate) fn linux_descendants(_root: libc::pid_t) -> Vec<(libc::pid_t, u64)> {
     Vec::new()
 }
 
+/// Cheap periodic descendant refresh for a live one-shot plugin run: the
+/// `/proc/<pid>/task/*/children` subtree walk from `root` ONLY.
+///
+/// Unlike [`linux_descendants`], a failed root walk returns an empty list and
+/// NEVER falls back to the full `/proc` scan: this runs every few tens of
+/// milliseconds while a plugin is alive, and a full `/proc` walk per poll is
+/// exactly the cost THE-1996 removed. The walk's own cap is silent here;
+/// [`merge_tracked`] warns once when the tracked set fills.
 #[cfg(target_os = "linux")]
-pub(crate) fn kill_tracked(pids: &[(libc::pid_t, u64)]) {
+pub(crate) fn linux_descendants_subtree_only(root: libc::pid_t) -> Vec<(libc::pid_t, u64)> {
+    #[cfg(test)]
+    {
+        if let Some(proc_root) = SUBTREE_PROC_ROOT.with(|cell| cell.borrow().clone()) {
+            return linux_descendants_subtree_only_in(&proc_root, root);
+        }
+    }
+    linux_descendants_subtree_only_in(Path::new("/proc"), root)
+}
+
+#[cfg(target_os = "linux")]
+fn linux_descendants_subtree_only_in(
+    proc_root: &Path,
+    root: libc::pid_t,
+) -> Vec<(libc::pid_t, u64)> {
+    linux_descendants_subtree_walk(proc_root, root)
+        .map(|(descendants, _capped)| descendants)
+        .unwrap_or_default()
+}
+
+#[cfg(not(target_os = "linux"))]
+pub(crate) fn linux_descendants_subtree_only(_root: libc::pid_t) -> Vec<(libc::pid_t, u64)> {
+    Vec::new()
+}
+
+/// Run `f` with [`linux_descendants_subtree_only`] reading `proc_root`
+/// instead of `/proc` on this thread (the supervising thread of a plugin run).
+#[cfg(all(test, target_os = "linux"))]
+pub(crate) fn with_subtree_proc_root_for_test<R>(proc_root: &Path, f: impl FnOnce() -> R) -> R {
+    struct Restore(Option<std::path::PathBuf>);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            let previous = self.0.take();
+            SUBTREE_PROC_ROOT.with(|cell| *cell.borrow_mut() = previous);
+        }
+    }
+    let previous =
+        SUBTREE_PROC_ROOT.with(|cell| cell.borrow_mut().replace(proc_root.to_path_buf()));
+    let _restore = Restore(previous);
+    f()
+}
+
+#[cfg(all(test, not(target_os = "linux")))]
+pub(crate) fn with_subtree_proc_root_for_test<R>(
+    _proc_root: &std::path::Path,
+    f: impl FnOnce() -> R,
+) -> R {
+    f()
+}
+
+/// Full `/proc` scans performed on this thread (Linux tests only).
+#[cfg(all(test, target_os = "linux"))]
+pub(crate) fn global_proc_scans_for_test() -> usize {
+    GLOBAL_PROC_SCANS.with(std::cell::Cell::get)
+}
+
+/// Merge a fresh descendant snapshot into the run's tracked set, deduplicated
+/// by `(pid, start_time)` and capped at [`MAX_TRACKED_DESCENDANTS`]. The set
+/// only grows during a run, so the cap warning fires once: on the merge that
+/// fills it.
+pub(crate) fn merge_tracked(into: &mut Vec<(libc::pid_t, u64)>, fresh: Vec<(libc::pid_t, u64)>) {
+    if fresh.is_empty() {
+        return;
+    }
+    let was_full = into.len() >= MAX_TRACKED_DESCENDANTS;
+    let mut seen = into
+        .iter()
+        .copied()
+        .collect::<std::collections::HashSet<_>>();
+    for entry in fresh {
+        if into.len() >= MAX_TRACKED_DESCENDANTS {
+            break;
+        }
+        if seen.insert(entry) {
+            into.push(entry);
+        }
+    }
+    if !was_full && into.len() >= MAX_TRACKED_DESCENDANTS {
+        tracing::warn!(
+            target: "thegn::plugin",
+            limit = MAX_TRACKED_DESCENDANTS,
+            "plugin tracked-descendant set reached its process limit"
+        );
+    }
+}
+
+#[cfg(target_os = "linux")]
+/// SIGKILL every tracked descendant whose current start time still matches
+/// the snapshot (the pid-reuse guard), returning how many were signalled.
+pub(crate) fn kill_tracked(pids: &[(libc::pid_t, u64)]) -> usize {
+    let mut signalled = 0;
     for &(pid, start_time) in pids {
         let stat_path = format!("/proc/{pid}/stat");
         let Ok(stat) = proc_read_to_string(Path::new(&stat_path)) else {
             continue;
         };
-        if proc_stat_ppid_start(&stat).is_some_and(|(_, current_start)| current_start == start_time)
-            && unsafe { libc::kill(pid, libc::SIGKILL) } < 0
+        if !proc_stat_ppid_start(&stat)
+            .is_some_and(|(_, current_start)| current_start == start_time)
         {
+            continue;
+        }
+        // SAFETY: plain signal syscall on a pid whose start time was just
+        // re-verified against the tracked snapshot.
+        if unsafe { libc::kill(pid, libc::SIGKILL) } < 0 {
             let error = io::Error::last_os_error();
             if error.raw_os_error() != Some(libc::ESRCH) {
                 tracing::debug!(target: "thegn::plugin", pid, %error, "tracked plugin descendant kill failed");
             }
+        } else {
+            signalled += 1;
         }
     }
+    signalled
 }
 
 #[cfg(not(target_os = "linux"))]
-pub(crate) fn kill_tracked(_pids: &[(libc::pid_t, u64)]) {}
+pub(crate) fn kill_tracked(_pids: &[(libc::pid_t, u64)]) -> usize {
+    0
+}
 
 pub(crate) fn platform_is_executable_file(metadata: &std::fs::Metadata) -> bool {
     use std::os::unix::fs::PermissionsExt;
@@ -723,6 +846,84 @@ mod tests {
 
         assert_eq!(linux_descendants_in(root.path(), leader), vec![(602, 21)]);
         GLOBAL_PROC_SCANS.with(|scans| assert_eq!(scans.get(), 1));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_descendants_subtree_only_never_falls_back_to_full_scan() {
+        let root = tempfile::tempdir().unwrap();
+        // Root walk fails (no `children` file): the periodic refresh must give
+        // up empty-handed instead of scanning all of /proc.
+        let leader = 611;
+        let task = root
+            .path()
+            .join(leader.to_string())
+            .join("task")
+            .join(leader.to_string());
+        fs::create_dir_all(&task).unwrap();
+        fs::write(
+            root.path().join(leader.to_string()).join("stat"),
+            fake_proc_stat(leader, 1, 20),
+        )
+        .unwrap();
+        fake_proc_process(root.path(), 612, &fake_proc_stat(612, leader, 21), "");
+        GLOBAL_PROC_SCANS.with(|scans| scans.set(0));
+
+        assert!(linux_descendants_subtree_only_in(root.path(), leader).is_empty());
+        // A missing root entirely is the same failure.
+        assert!(linux_descendants_subtree_only_in(root.path(), 99_999).is_empty());
+        GLOBAL_PROC_SCANS.with(|scans| assert_eq!(scans.get(), 0));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_descendants_subtree_only_walks_the_subtree() {
+        let root = tempfile::tempdir().unwrap();
+        let leader = 621;
+        fake_proc_process(root.path(), leader, &fake_proc_stat(leader, 1, 10), "622");
+        fake_proc_process(root.path(), 622, &fake_proc_stat(622, leader, 11), "623");
+        fake_proc_process(root.path(), 623, &fake_proc_stat(623, 622, 12), "");
+        GLOBAL_PROC_SCANS.with(|scans| scans.set(0));
+
+        assert_eq!(
+            linux_descendants_subtree_only_in(root.path(), leader),
+            vec![(622, 11), (623, 12)]
+        );
+        assert_eq!(
+            with_subtree_proc_root_for_test(root.path(), || linux_descendants_subtree_only(leader)),
+            vec![(622, 11), (623, 12)]
+        );
+        GLOBAL_PROC_SCANS.with(|scans| assert_eq!(scans.get(), 0));
+    }
+
+    #[test]
+    fn merge_tracked_dedupes_by_pid_and_start_time() {
+        let mut tracked = vec![(10, 100)];
+        merge_tracked(
+            &mut tracked,
+            vec![(10, 100), (10, 101), (11, 110), (11, 110), (10, 100)],
+        );
+        // Same pid with a different start time is a different process.
+        assert_eq!(tracked, vec![(10, 100), (10, 101), (11, 110)]);
+        merge_tracked(&mut tracked, Vec::new());
+        assert_eq!(tracked, vec![(10, 100), (10, 101), (11, 110)]);
+    }
+
+    #[test]
+    fn merge_tracked_caps_at_the_descendant_limit() {
+        let mut tracked = (0..(MAX_TRACKED_DESCENDANTS as libc::pid_t - 1))
+            .map(|pid| (pid, 1))
+            .collect::<Vec<_>>();
+        let first_new = MAX_TRACKED_DESCENDANTS as libc::pid_t;
+        merge_tracked(
+            &mut tracked,
+            vec![(first_new, 1), (first_new + 1, 1), (first_new + 2, 1)],
+        );
+        assert_eq!(tracked.len(), MAX_TRACKED_DESCENDANTS);
+        assert_eq!(tracked.last(), Some(&(first_new, 1)));
+        merge_tracked(&mut tracked, vec![(first_new + 3, 1)]);
+        assert_eq!(tracked.len(), MAX_TRACKED_DESCENDANTS);
+        assert!(!tracked.contains(&(first_new + 3, 1)));
     }
 
     #[cfg(target_os = "linux")]

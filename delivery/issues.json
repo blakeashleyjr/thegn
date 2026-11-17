@@ -137,9 +137,8 @@
     {
       "issue": "THE-123",
       "project": "Runtime Security & Host Architecture",
-      "changes": [
-        "resurrect-model-proxy"
-      ]
+      "changes": [],
+      "no_spec_rationale": "Proxy restoration delivered and archived as resurrect-model-proxy (2026-11-16). Remaining work is blocked by THE-180 (live reload) and THE-151 (attribution/budget scopes) and has no proposal yet."
     },
     {
       "issue": "THE-125",

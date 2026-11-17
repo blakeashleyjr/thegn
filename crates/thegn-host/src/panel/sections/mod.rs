@@ -1006,6 +1006,41 @@ fn compact_count(n: u64) -> String {
 
 // ---- content dispatch -------------------------------------------------------
 
+/// Whether a section's builder branches on `ctx.deep()` / `ctx.full()` — i.e.
+/// has a richer view one `e` keypress away. Exhaustive on purpose: a new
+/// section must decide.
+pub(crate) fn has_deep_view(section: Section) -> bool {
+    match section {
+        Section::Changes
+        | Section::Commits
+        | Section::Branches
+        | Section::Stash
+        | Section::Pr
+        | Section::Ci
+        | Section::MergeQueue
+        | Section::Files
+        | Section::Problems
+        | Section::Jobs
+        | Section::Tests
+        | Section::Symbols
+        | Section::Sandbox
+        | Section::Hosts
+        | Section::Environments
+        | Section::Share
+        | Section::Forward
+        | Section::Telemetry
+        | Section::Keys
+        | Section::Mine
+        | Section::Across
+        | Section::Issues
+        | Section::Notifications
+        | Section::Logs
+        | Section::Media
+        | Section::Usage => true,
+        Section::PrQueue | Section::Help => false,
+    }
+}
+
 /// A section's content rows for the current view.
 pub fn content(section: Section, ctx: &SectionCtx) -> Vec<PanelRow> {
     if let Some(reason) = ctx.ui.off_reason(section) {
@@ -1254,6 +1289,15 @@ mod spec {
     use crate::chrome::FrameModel;
     use crate::layout::PanelWidth;
     use crate::panel::docs::{GitDocs, PanelDocs};
+
+    #[test]
+    fn has_deep_view_marks_sections_with_richer_views() {
+        assert!(has_deep_view(Section::Changes));
+        assert!(has_deep_view(Section::Commits));
+        assert!(has_deep_view(Section::Usage));
+        assert!(!has_deep_view(Section::Help));
+        assert!(!has_deep_view(Section::PrQueue));
+    }
 
     fn model() -> FrameModel {
         let mut m = FrameModel::default();

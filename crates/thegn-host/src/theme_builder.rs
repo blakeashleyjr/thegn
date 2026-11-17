@@ -1233,16 +1233,18 @@ impl ThemeBuilder {
                 .catalog
                 .cols
                 .saturating_sub(strip + usize::from(strip > 0));
+            // Marker + space take 2 cols and one col separates the kind, so the
+            // kind stays visible however long the name is.
+            let name = seg::clip_end(&item.name, name_cols.saturating_sub(kind.len() + 3));
             seg::draw_line(
                 surface,
                 inner.x,
                 y,
                 name_cols,
-                &Line::segs(vec![
-                    seg(fg, format!("{marker} {}", item.name)),
-                    sp(1),
-                    seg(Tok::Slot(S::Ghost), kind),
-                ]),
+                &Line::Split {
+                    l: vec![seg(fg, format!("{marker} {name}"))],
+                    r: vec![seg(Tok::Slot(S::Ghost), kind)],
+                },
                 bg,
             );
             if strip > 0 {
@@ -1852,6 +1854,38 @@ mod tests {
         let mut surface = Surface::new(80, 24);
         b.render(&mut surface, Rect::full(80, 24));
         assert!(surface.screen_chars_to_string().contains("contrast"));
+    }
+
+    #[test]
+    fn catalog_row_keeps_kind_visible_for_long_names() {
+        let mut cfg = thegn_core::config::Config::default();
+        let long = "a-very-long-user-theme-name-30".to_string();
+        assert_eq!(long.chars().count(), 30);
+        let users = vec![UserTheme::from_palette(long.clone(), &cfg.palette())];
+        cfg.theme.preset = long.clone();
+        let b = ThemeBuilder::open(&cfg, &users);
+        let mut surface = Surface::new(80, 24);
+        b.render(&mut surface, Rect::full(80, 24));
+        let text = surface.screen_chars_to_string();
+        let row = text
+            .lines()
+            .find(|l| l.contains("a-very-long"))
+            .expect("long theme row rendered");
+        assert!(!row.contains(&long), "name should be clipped: {row:?}");
+        assert!(row.contains("… user"), "ellipsis then kind: {row:?}");
+    }
+
+    #[test]
+    fn catalog_row_short_name_is_unclipped() {
+        let b = builder();
+        let mut surface = Surface::new(80, 24);
+        b.render(&mut surface, Rect::full(80, 24));
+        let text = surface.screen_chars_to_string();
+        let name = &b.catalog[0].name;
+        let row = text.lines().find(|l| l.contains(name.as_str())).unwrap();
+        assert!(row.contains("builtin"), "{row:?}");
+        let after = &row[row.find(name.as_str()).unwrap() + name.len()..];
+        assert!(after.trim_start().starts_with("builtin"), "{row:?}");
     }
 
     #[test]
