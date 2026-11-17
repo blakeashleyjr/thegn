@@ -84,6 +84,13 @@ pub struct DiffView {
     review: Option<thegn_core::review::PrReviewSnapshot>,
     review_status: Option<String>,
     source: DiffSource,
+    search: Option<SearchState>,
+}
+
+/// An in-viewer `/` search: the query and whether it is still being typed.
+struct SearchState {
+    query: String,
+    editing: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -112,6 +119,7 @@ impl DiffView {
             show_structural: want_structural,
             structural_scroll: std::cell::Cell::new(0),
             source: DiffSource::Worktree,
+            search: None,
         }
     }
 
@@ -228,6 +236,71 @@ impl DiffView {
             .unwrap_or_default()
     }
 
+    /// Row indices matching the committed/edited query (empty without one).
+    fn search_matches(&self) -> Vec<usize> {
+        let Some(search) = self.search.as_ref().filter(|s| !s.query.is_empty()) else {
+            return Vec::new();
+        };
+        let q = search.query.to_lowercase();
+        let Some(diff) = self.active_diff() else {
+            return Vec::new();
+        };
+        match self.open_file {
+            None => diff
+                .files
+                .iter()
+                .enumerate()
+                .filter(|(_, f)| f.path.to_lowercase().contains(&q))
+                .map(|(i, _)| i)
+                .collect(),
+            Some(i) => {
+                let Some(file) = diff.files.get(i).filter(|f| !f.is_submodule) else {
+                    return Vec::new();
+                };
+                if self.source == DiffSource::PrReview {
+                    expanded_file_rows(file, self.anchored_review().as_ref(), false)
+                        .iter()
+                        .enumerate()
+                        .filter(|(_, row)| {
+                            matches!(row, ReviewRow::Diff(l) if l.text.to_lowercase().contains(&q))
+                        })
+                        .map(|(ri, _)| ri)
+                        .collect()
+                } else {
+                    self.open_file_lines(i)
+                        .iter()
+                        .enumerate()
+                        .filter(|(_, l)| l.text.to_lowercase().contains(&q))
+                        .map(|(li, _)| li)
+                        .collect()
+                }
+            }
+        }
+    }
+
+    /// Move `sel` to the next (`forward`) or previous match, wrapping; with
+    /// `include_current` a match at `sel` counts. No matches: leave `sel`.
+    fn step_match(&mut self, forward: bool, include_current: bool) {
+        let m = self.search_matches();
+        if m.is_empty() {
+            return;
+        }
+        let sel = self.sel;
+        let next = if forward {
+            m.iter()
+                .copied()
+                .find(|&i| if include_current { i >= sel } else { i > sel })
+                .unwrap_or(m[0])
+        } else {
+            m.iter()
+                .rev()
+                .copied()
+                .find(|&i| i < sel)
+                .unwrap_or(m[m.len() - 1])
+        };
+        self.sel = next;
+    }
+
     fn move_sel(&mut self, delta: isize) {
         let n = self.row_count();
         if n == 0 {
@@ -309,6 +382,33 @@ impl DiffView {
         if mods.contains(Modifiers::CTRL) && matches!(key, KeyCode::Char('c' | 'C' | 'g' | 'G')) {
             return DiffViewOutcome::Close;
         }
+        if self.search.as_ref().is_some_and(|s| s.editing) {
+            match key {
+                KeyCode::Char(c)
+                    if !mods.intersects(Modifiers::CTRL | Modifiers::ALT) && !c.is_control() =>
+                {
+                    if let Some(s) = self.search.as_mut()
+                        && s.query.chars().count() < 128
+                    {
+                        s.query.push(*c);
+                    }
+                }
+                KeyCode::Backspace => {
+                    if let Some(s) = self.search.as_mut() {
+                        s.query.pop();
+                    }
+                }
+                KeyCode::Enter => {
+                    if let Some(s) = self.search.as_mut() {
+                        s.editing = false;
+                    }
+                    self.step_match(true, true);
+                }
+                KeyCode::Escape => self.search = None,
+                _ => {}
+            }
+            return DiffViewOutcome::Pending;
+        }
         // `t` toggles between the structural (difftastic) render and the internal
         // unified view — live only when a structural render actually loaded.
         if matches!(key, KeyCode::Char('t' | 'T')) && matches!(self.structural, Some(Ok(_))) {
@@ -334,6 +434,9 @@ impl DiffView {
         // The structural pane is a flat scrollable blob: movement scrolls it, and
         // there is no file to open.
         if self.structural_active() {
+            if matches!(key, KeyCode::Char('/')) {
+                return DiffViewOutcome::Status("search: switch to the internal view (t)".into());
+            }
             return match key {
                 KeyCode::Char('q') | KeyCode::Escape => DiffViewOutcome::Close,
                 KeyCode::Char('j') | KeyCode::DownArrow => self.scroll_structural(1),
@@ -349,7 +452,21 @@ impl DiffView {
         }
         match key {
             KeyCode::Char('q') => DiffViewOutcome::Close,
+            KeyCode::Char('/') => {
+                self.search = Some(SearchState {
+                    query: String::new(),
+                    editing: true,
+                });
+                DiffViewOutcome::Pending
+            }
+            KeyCode::Char(c @ ('n' | 'N')) if self.search.is_some() => {
+                self.step_match(*c == 'n', false);
+                DiffViewOutcome::Pending
+            }
             KeyCode::Escape => {
+                if self.search.take().is_some() {
+                    return DiffViewOutcome::Pending;
+                }
                 // In an expanded file, Esc collapses back to the file list first.
                 if self.open_file.take().is_some() {
                     self.sel = 0;
@@ -494,6 +611,19 @@ impl DiffView {
     }
 
     fn footer(&self) -> Line {
+        if let Some(search) = &self.search {
+            if search.editing {
+                return Line::segs(vec![seg(Tok::Slot(S::Dim), format!("/{}_", search.query))]);
+            }
+            let m = self.search_matches();
+            let text = if m.is_empty() {
+                format!("/{} no match", search.query)
+            } else {
+                let pos = m.iter().position(|&i| i >= self.sel).unwrap_or(0);
+                format!("/{} {}/{}", search.query, pos + 1, m.len())
+            };
+            return Line::segs(vec![seg(Tok::Slot(S::Dim), text)]);
+        }
         // Offer the toggle only when a structural render actually loaded.
         let toggle = matches!(self.structural, Some(Ok(_)));
         let glyphs = crate::caps::active_glyphs();
@@ -515,6 +645,7 @@ impl DiffView {
                 format!("{movement} move"),
                 "e IDE".into(),
                 "Left back".into(),
+                "/ search".into(),
                 "q/esc close".into(),
             ]
             .join(&separator)
@@ -530,6 +661,7 @@ impl DiffView {
             if toggle {
                 actions.push("t structural".into());
             }
+            actions.push("/ search".into());
             actions.push("q/esc close".into());
             actions.join(&separator)
         };
@@ -551,6 +683,20 @@ impl DiffView {
     }
 
     fn body_lines(&self, cols: usize) -> Vec<(Line, bool)> {
+        let hits: Vec<usize> = self.search_matches();
+        let query = self
+            .search
+            .as_ref()
+            .filter(|_| !hits.is_empty())
+            .map(|s| s.query.clone())
+            .unwrap_or_default();
+        let hl = |line: Line, row: usize| -> Line {
+            if !query.is_empty() && hits.contains(&row) {
+                emphasise_line(line, &query)
+            } else {
+                line
+            }
+        };
         let mut out = vec![(Line::Blank, false)];
         // A structural failure shows the internal view under a one-line notice.
         if let Some(Err(notice)) = &self.structural {
@@ -611,21 +757,24 @@ impl DiffView {
                         } else {
                             let (adds, dels) = file_stat(f);
                             out.push((
-                                Line::split(
-                                    vec![
-                                        seg(Tok::Slot(S::Faint), sel_marker(selected)),
-                                        seg(Tok::Slot(S::Text), f.path.clone()),
-                                    ],
-                                    vec![
-                                        seg(
-                                            Tok::Hue(thegn_core::theme::Hue::Green),
-                                            format!("+{adds} "),
-                                        ),
-                                        seg(
-                                            Tok::Hue(thegn_core::theme::Hue::Red),
-                                            format!("-{dels}"),
-                                        ),
-                                    ],
+                                hl(
+                                    Line::split(
+                                        vec![
+                                            seg(Tok::Slot(S::Faint), sel_marker(selected)),
+                                            seg(Tok::Slot(S::Text), f.path.clone()),
+                                        ],
+                                        vec![
+                                            seg(
+                                                Tok::Hue(thegn_core::theme::Hue::Green),
+                                                format!("+{adds} "),
+                                            ),
+                                            seg(
+                                                Tok::Hue(thegn_core::theme::Hue::Red),
+                                                format!("-{dels}"),
+                                            ),
+                                        ],
+                                    ),
+                                    i,
                                 ),
                                 selected,
                             ));
@@ -648,9 +797,11 @@ impl DiffView {
                                 .enumerate()
                             {
                                 let selected = ri == self.sel;
-                                out.extend(crate::review_rows::render_review_row(
-                                    &row, selected, cols,
-                                ));
+                                out.extend(
+                                    crate::review_rows::render_review_row(&row, selected, cols)
+                                        .into_iter()
+                                        .map(|(l, s)| (hl(l, ri), s)),
+                                );
                             }
                         } else if f.is_submodule {
                             let selected = self.sel == 0;
@@ -667,11 +818,15 @@ impl DiffView {
                                 ));
                                 for line in &hunk.lines {
                                     let selected = line_index == self.sel;
-                                    out.extend(crate::review_rows::render_review_row(
-                                        &ReviewRow::Diff(line.clone()),
-                                        selected,
-                                        cols,
-                                    ));
+                                    out.extend(
+                                        crate::review_rows::render_review_row(
+                                            &ReviewRow::Diff(line.clone()),
+                                            selected,
+                                            cols,
+                                        )
+                                        .into_iter()
+                                        .map(|(l, s)| (hl(l, line_index), s)),
+                                    );
                                     line_index += 1;
                                 }
                             }
@@ -701,6 +856,57 @@ impl DiffView {
         }
         out
     }
+}
+
+/// Bold the case-insensitive occurrences of `query` inside a line's segs
+/// (left cluster of a split row). Lines it cannot split safely pass through.
+fn emphasise_line(line: Line, query: &str) -> Line {
+    match line {
+        Line::Segs(segs) => Line::Segs(emphasise_segs(segs, query)),
+        Line::Split { l, r } => Line::Split {
+            l: emphasise_segs(l, query),
+            r,
+        },
+        other => other,
+    }
+}
+
+fn emphasise_segs(segs: Vec<crate::seg::Seg>, query: &str) -> Vec<crate::seg::Seg> {
+    let q = query.to_lowercase();
+    if q.is_empty() {
+        return segs;
+    }
+    let mut out = Vec::with_capacity(segs.len());
+    for s in segs {
+        let lower = s.text.to_lowercase();
+        let found = (lower.len() == s.text.len())
+            .then(|| lower.find(&q))
+            .flatten()
+            .filter(|&a| {
+                let b = a + q.len();
+                s.text.is_char_boundary(a) && s.text.is_char_boundary(b)
+            });
+        let Some(a) = found else {
+            out.push(s);
+            continue;
+        };
+        let b = a + q.len();
+        if a > 0 {
+            let mut before = s.clone();
+            before.text = s.text[..a].to_string();
+            out.push(before);
+        }
+        let mut mid = s.clone();
+        mid.text = s.text[a..b].to_string();
+        mid.bold = true;
+        out.push(mid);
+        if b < s.text.len() {
+            let mut after = s.clone();
+            after.text = s.text[b..].to_string();
+            out.push(after);
+        }
+    }
+    out
 }
 
 fn ide_outcome_for_review_row(row: &ReviewRow, file_path: Option<&str>) -> DiffViewOutcome {
