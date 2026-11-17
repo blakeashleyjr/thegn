@@ -27,6 +27,7 @@ this is why:
 | `providers` | cloud execution (Fly / DO / VPS / Machine0 / Daytona) and the managed pool | `[host.*]`, `[env.*]` provider envs             |
 | `placement` | the multi-host placement engine                                            | `[placement]`                                   |
 | `voice`     | command-backed voice mode                                                  | `[voice]`                                       |
+| `lead`      | the Lead meta agent: a hosted agent CLI in a global tab                    | `[lead]`                                        |
 
 On the stable channel, SSH and provider `[env.*]` environments are removed
 when the config loads. If a worktree's `[sandbox] default_env` or selection
