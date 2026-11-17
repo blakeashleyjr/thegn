@@ -3450,3 +3450,28 @@ fn row_is_external_honours_layout_and_worktree_roots() {
         &mut cache
     ));
 }
+
+#[test]
+fn files_load_from_table() {
+    use crate::panel::gitui::DocLoad;
+    let reason = "git ls-files exited 128".to_string();
+    assert_eq!(files_load_from(None), DocLoad::Pending);
+    assert_eq!(files_load_from(Some(Ok(()))), DocLoad::Ready);
+    assert_eq!(
+        files_load_from(Some(Err(&reason))),
+        DocLoad::Failed(reason.clone())
+    );
+}
+
+#[test]
+fn ls_files_errors_are_single_line_and_capped() {
+    assert_eq!(
+        ls_files_exit_error(Some(128), b""),
+        "git ls-files exited 128"
+    );
+    assert_eq!(
+        ls_files_exit_error(Some(128), b"fatal: bad index\nsecond"),
+        "git ls-files exited 128: fatal: bad index"
+    );
+    assert!(ls_files_spawn_error(&"x".repeat(500)).len() < 150);
+}
