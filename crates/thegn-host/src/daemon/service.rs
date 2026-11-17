@@ -1363,9 +1363,7 @@ impl DaemonService {
             .with_db(move |db| {
                 use thegn_core::store::WorkspaceStore;
                 let rows = db.worktrees()?;
-                Ok(registered_worktree_matches(&rows, &requested, |path| {
-                    std::fs::canonicalize(path).unwrap_or_else(|_| std::path::PathBuf::from(path))
-                }))
+                Ok(rows.iter().any(|row| row.worktree == requested))
             })
             .await?;
         check_resolved_open(&ResolvedOpen {

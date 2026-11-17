@@ -165,7 +165,6 @@ pub fn rule(verb: Verb) -> Rule {
         | Verb::AutomationsEnable
         | Verb::ApprovalsRequest
         | Verb::MergeClear
-        | Verb::WorktreeCreate
         | Verb::FolderAssign
         | Verb::MergeAdd
         | Verb::MergeDrain => Rule::Allow,
@@ -178,7 +177,7 @@ pub fn rule(verb: Verb) -> Rule {
         Verb::SendInput => Rule::Refuse(NO_INPUT),
         Verb::Attach | Verb::Detach | Verb::Resize => Rule::Refuse(NO_ATTACH),
         Verb::OpenWorktree | Verb::OpenEditor => Rule::Refuse(NO_HOST_UI),
-        Verb::GitStage | Verb::GitCommit => Rule::Refuse(NO_HOST_GIT),
+        Verb::GitStage | Verb::GitCommit | Verb::WorktreeCreate => Rule::Refuse(NO_HOST_GIT),
         Verb::SearchReplace | Verb::SkillsSeed | Verb::ProjectNewFeature => {
             Rule::Refuse(NO_HOST_WRITE)
         }
@@ -517,7 +516,7 @@ mod tests {
         (Verb::DispatchesReport, Allow),
         (Verb::DispatchesNote, Allow),
         (Verb::DispatchesStatus, Allow),
-        (Verb::WorktreeCreate, Allow),
+        (Verb::WorktreeCreate, Refuse),
         (Verb::FolderAssign, Allow),
         (Verb::WorktreeSandboxProfile, Allow),
         (Verb::WorktreeSandboxProfileSet, Refuse),

@@ -301,11 +301,12 @@ A Lead token is confined whatever its scopes. In short:
 - `sessions.open` launches only a configured agent, by name, in a registered
   worktree whose launch resolves to a real sandbox. No raw `argv`, no `env`.
 - `sessions.input`, `sessions.attach`, `sessions.split`, `sessions.fork`,
-  `git.stage`, `git.commit`, `worktrees.open`, `editor.open`,
-  `worktrees.sandbox_profile_set` and every admin or exec verb are refused.
-- Reads, `sessions.kill`, `worktrees.create`, the tracker, dispatches (without
-  binding a session), notifications, approvals requests, its own rules and the
-  merge queue (with `merge_add`) work as their scopes say.
+  `git.stage`, `git.commit`, `worktrees.open`, `worktrees.create`,
+  `editor.open`, `worktrees.sandbox_profile_set` and every admin or exec verb
+  are refused.
+- Reads, `sessions.kill`, the tracker, dispatches (without binding a session),
+  notifications, approvals requests, its own rules and the merge queue (with
+  `merge_add`) work as their scopes say.
 
 The full list is in [sandboxing](sandboxing.md#what-the-lead-may-ask-the-daemon-to-do).
 

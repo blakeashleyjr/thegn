@@ -1051,11 +1051,12 @@ listener, as Lead-confined, whatever its scopes. A Lead-confined call:
   override, a `cwd` outside the worktree, `widen_permissions`, a fork and
   prompts over 64 KiB are refused.
 - **May not** type into a session (`sessions.input`), attach, resize, split or
-  fork one, run host git (`git.stage`, `git.commit`), open a worktree or an
-  editor, write files from outside the sandbox (`search.replace`,
+  fork one, run host git (`git.stage`, `git.commit`), create a worktree
+  (`worktrees.create`, which runs git on a caller-named repo), open a worktree
+  or an editor, write files from outside the sandbox (`search.replace`,
   `skills.seed`), run tools or presets, or change a worktree's sandbox profile.
 - **May** read everything a read token can, kill sessions, record a session,
-  create worktrees, file folders, work the tracker, the dispatch roster
+  file folders, work the tracker, the dispatch roster
   (without binding a session), notifications, approvals requests, its own
   automation rules, and the merge queue when `[lead] scopes` grants it.
 
