@@ -20,6 +20,7 @@ pub fn y_gutter(grid: &mut CellGrid, rect: Rect, max: f64, unit: Unit, fmt: NumF
     let fmt = super::edge_fmt(fmt);
     let mut taken = [usize::MAX; 3];
     let mut count = 0usize;
+    let mut label = String::with_capacity(label_width);
     for (index, (row, value)) in values.into_iter().enumerate() {
         if index == 1 && v.rect().rows <= 2 {
             continue;
@@ -29,7 +30,8 @@ pub fn y_gutter(grid: &mut CellGrid, rect: Rect, max: f64, unit: Unit, fmt: NumF
         }
         taken[count] = row;
         count += 1;
-        let label = fmt.fmt(value, unit, label_width);
+        label.clear();
+        fmt.fmt_into(&mut label, value, unit, label_width);
         v.put_str(0, row, &label, CellStyle::default());
         if width > 0 {
             v.put(
