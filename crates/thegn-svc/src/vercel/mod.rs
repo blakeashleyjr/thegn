@@ -618,6 +618,30 @@ impl VercelProvider {
         self.session_for(name, Wake::Allow).await.map(|_| ())
     }
 
+    /// The session for an interactive open (PTY or stream). Unlike
+    /// `session_for(.., Wake::Allow)`, it never resumes a stopped sandbox past its
+    /// lifetime ceiling: an auto-respawned pane would otherwise buy a fresh session
+    /// at every timeout, unattended. File transfer (`thegn env pull`) still may.
+    pub(crate) async fn interactive_session(&self, name: &str) -> Result<String> {
+        checked_name(name)?;
+        if let Some(view) = self.api().get(name, false).await?
+            && !matches!(view.status, SessionStatus::Running | SessionStatus::Pending)
+        {
+            let cap_ms = i64::try_from(policy::max_lifetime_secs(self.spec.max_lifetime_secs))
+                .unwrap_or(i64::MAX)
+                .saturating_mul(1000);
+            if view
+                .created_at_ms
+                .is_some_and(|c| now_ms().saturating_sub(c) >= cap_ms)
+            {
+                bail!(
+                    "vercel: sandbox {name} is past its max_lifetime_secs ceiling and is not resumed for a terminal; `thegn env pull` to recover work, then destroy it or raise max_lifetime_secs"
+                );
+            }
+        }
+        self.session_for(name, Wake::Allow).await
+    }
+
     /// Stop the current session (compute to $0; the filesystem persists).
     /// Never resumes; an already stopped or missing sandbox is success.
     pub async fn stop_session(&self, name: &str) -> Result<()> {
