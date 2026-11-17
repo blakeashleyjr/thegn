@@ -16925,7 +16925,7 @@ async fn event_loop<T: Terminal>(
                 v.render(&mut scratch, screen);
             }
             if let Some(builder) = &theme_builder {
-                crate::handlers::theme_builder::render(builder, &mut scratch, screen);
+                crate::handlers::theme_builder::render(builder, &mut scratch, screen, &chrome);
             }
             if let Some(h) = help_overlay.as_mut() {
                 h.render(&mut scratch, screen);
