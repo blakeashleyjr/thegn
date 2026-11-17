@@ -1187,7 +1187,6 @@ fn paint_finite_spark_runs(values: &[f32], ramp: RampId, area: Rect, surface: &m
     }
 }
 
-/// Rows (legend + plot) the scatter takes from `area`, or 0 when omitted.
 /// Reused scatter buffers so a paint does not allocate fresh ones.
 #[derive(Default)]
 struct ScatterScratch {
@@ -1201,6 +1200,7 @@ thread_local! {
     static SCATTER_SCRATCH: RefCell<ScatterScratch> = RefCell::new(ScatterScratch::default());
 }
 
+/// Rows (legend + plot) the scatter takes from `area`, or 0 when omitted.
 fn scatter_rows(containers: usize, area: Rect) -> usize {
     if containers < 2 || area.cols < SCATTER_MIN.0 || area.rows < SCATTER_MIN.1 * 2 {
         return 0;

@@ -851,7 +851,9 @@ mod tests {
 
     mod equivalence {
         use super::super::{bytes, cells, fit, fit_mark, scaled};
+        use super::formatter;
         use crate::numfmt::Marks;
+        use crate::numfmt::{Reading, Unit, ZeroStyle};
 
         fn reference_fit(candidate: String, width: usize) -> String {
             let used = cells(&candidate);
