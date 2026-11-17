@@ -276,7 +276,7 @@ fn not_found() -> Reply {
 #[test]
 fn create_get_list_encode_method_path_scope_and_auth() {
     let mock = Mock::start(|r| match (r.method.as_str(), r.path()) {
-        ("POST", "/v2/sandboxes") => Reply::json("200 OK", sandbox_json("tg-a")),
+        ("POST", "/v3/sandboxes") => Reply::json("200 OK", sandbox_json("tg-a")),
         ("GET", "/v2/sandboxes/tg-a") => Reply::json("200 OK", sandbox_json("tg-a")),
         ("GET", "/v2/sandboxes/tg-gone") => not_found(),
         ("GET", "/v2/sandboxes") => Reply::json(
@@ -312,7 +312,7 @@ fn create_get_list_encode_method_path_scope_and_auth() {
     assert_eq!(reqs.len(), 5);
     // create: POST, projectId travels in the body, JSON content type.
     assert_eq!(reqs[0].method, "POST");
-    assert_eq!(reqs[0].path(), "/v2/sandboxes");
+    assert_eq!(reqs[0].path(), "/v3/sandboxes");
     assert!(
         reqs[0]
             .header("content-type")
@@ -336,7 +336,7 @@ fn create_get_list_encode_method_path_scope_and_auth() {
     assert_eq!(reqs[4].path(), "/v2/sandboxes");
     assert_eq!(q.get("project").map(String::as_str), Some(PROJECT));
     assert_eq!(q.get("namePrefix").map(String::as_str), Some("tg-"));
-    assert_eq!(q.get("until").map(String::as_str), Some("1699"));
+    assert_eq!(q.get("cursor").map(String::as_str), Some("1699"));
     mock.assert_custody(&[]);
 }
 
@@ -491,7 +491,7 @@ fn invalid_names_and_ids_never_reach_the_wire() {
     let mock = Mock::start(|_| Reply::json("200 OK", serde_json::json!({})));
     let client = mock.client();
     let rt = rt();
-    let errs = vec![
+    let errs = [
         rt.block_on(client.get("../etc", false)).unwrap_err(),
         rt.block_on(client.delete("Bad Name")).unwrap_err(),
         rt.block_on(client.stop("sess/../x")).unwrap_err(),
@@ -708,11 +708,9 @@ fn stdin_and_kill_encode_their_requests() {
         reqs[0].path(),
         "/v2/sandboxes/sessions/sess_1/cmd/cmd_1/stdin"
     );
-    assert_eq!(reqs[0].body, b"hello\n");
-    assert_eq!(
-        reqs[0].query().get("close").map(String::as_str),
-        Some("true")
-    );
+    assert_eq!(reqs[0].json()["data"], serde_json::json!("aGVsbG8K"));
+    assert_eq!(reqs[0].json()["close"], serde_json::json!(true));
+    assert!(!reqs[0].query().contains_key("close"));
     assert_eq!(
         reqs[1].path(),
         "/v2/sandboxes/sessions/sess_1/cmd/cmd_1/kill"
@@ -889,6 +887,27 @@ fn snapshots_for_lists_ids_scoped_by_name() {
         reqs[0].query().get("name").map(String::as_str),
         Some("tg-a")
     );
+    assert_eq!(
+        reqs[0].query().get("project").map(String::as_str),
+        Some(PROJECT)
+    );
+    mock.assert_custody(&[]);
+}
+
+#[test]
+fn set_network_policy_patches_the_sandbox() {
+    let mock = Mock::start(|_| Reply::json("200 OK", serde_json::json!({})));
+    let policy = serde_json::json!({"allow": ["example.com"]});
+    rt().block_on(mock.client().set_network_policy("tg-a", &policy))
+        .expect("set network policy");
+    let reqs = mock.requests();
+    assert_eq!(reqs[0].method, "PATCH");
+    assert_eq!(reqs[0].path(), "/v2/sandboxes/tg-a");
+    assert_eq!(
+        reqs[0].query().get("projectId").map(String::as_str),
+        Some(PROJECT)
+    );
+    assert_eq!(reqs[0].json()["networkPolicy"], policy);
     mock.assert_custody(&[]);
 }
 

@@ -23,6 +23,7 @@ use std::fmt;
 use std::time::Duration;
 
 use anyhow::{Result, anyhow, bail};
+use base64::Engine as _;
 use thegn_core::vercel::admit::{valid_project_id, valid_sandbox_name, valid_team_id};
 use thegn_core::vercel::api::{
     LogLine, SandboxView, Scope, parse_list_page, parse_log_line, parse_sandbox,
@@ -197,7 +198,7 @@ impl VercelClient {
 
     pub async fn create(&self, body: &serde_json::Value) -> Result<SandboxView> {
         let p = retried("create sandbox");
-        let url = self.url(&["v2", "sandboxes"], &[], false)?;
+        let url = self.url(&["v3", "sandboxes"], &[], false)?;
         let body = self.json_body(body, p.op)?;
         let resp = self
             .send(p, || Ok(self.http.post(url.clone()).json(&body)))
@@ -234,7 +235,7 @@ impl VercelClient {
             extra.push(("namePrefix", name_prefix));
         }
         if let Some(cursor) = cursor.filter(|c| !c.is_empty()) {
-            extra.push(("until", cursor));
+            extra.push(("cursor", cursor));
         }
         let url = self.url(&["v2", "sandboxes"], &extra, false)?;
         let resp = self.send(p, || Ok(self.http.get(url.clone()))).await?;
@@ -279,14 +280,10 @@ impl VercelClient {
 
     pub async fn set_network_policy(&self, name: &str, body: &serde_json::Value) -> Result<()> {
         let p = policy("set network policy");
-        let url = self.url(
-            &["v2", "sandboxes", checked_name(name)?, "network-policy"],
-            &[],
-            true,
-        )?;
-        let body = self.json_body(body, p.op)?;
+        let url = self.url(&["v2", "sandboxes", checked_name(name)?], &[], true)?;
+        let body = self.json_body(&serde_json::json!({ "networkPolicy": body }), p.op)?;
         let resp = self
-            .send(p, || Ok(self.http.post(url.clone()).json(&body)))
+            .send(p, || Ok(self.http.patch(url.clone()).json(&body)))
             .await?;
         self.ok(resp, p.op, false).await.map(drop)
     }
@@ -409,21 +406,13 @@ impl VercelClient {
     /// Write `data` to a command's stdin; `close` ends it after the write.
     pub async fn stdin(&self, session: &str, cmd: &str, data: &[u8], close: bool) -> Result<()> {
         let p = policy("write command stdin");
-        let extra: &[(&str, &str)] = if close { &[("close", "true")] } else { &[] };
-        let url = self.session_url_q(
-            session,
-            &["cmd", checked_id(cmd, "command")?, "stdin"],
-            extra,
-        )?;
-        let data = data.to_vec();
+        let url = self.session_url(session, &["cmd", checked_id(cmd, "command")?, "stdin"])?;
+        let body = serde_json::json!({
+            "data": base64::engine::general_purpose::STANDARD.encode(data),
+            "close": close,
+        });
         let resp = self
-            .send(p, || {
-                Ok(self
-                    .http
-                    .post(url.clone())
-                    .header(reqwest::header::CONTENT_TYPE, "application/octet-stream")
-                    .body(data.clone()))
-            })
+            .send(p, || Ok(self.http.post(url.clone()).json(&body)))
             .await?;
         self.ok(resp, p.op, false).await.map(drop)
     }
@@ -564,10 +553,11 @@ impl VercelClient {
     /// Snapshot ids recorded for sandbox `name`.
     pub async fn snapshots_for(&self, name: &str) -> Result<Vec<String>> {
         let p = retried("list snapshots");
+        let name = checked_name(name)?;
         let url = self.url(
             &["v2", "sandboxes", "snapshots"],
-            &[("name", checked_name(name)?)],
-            true,
+            &[("project", self.scope.project_id.as_str()), ("name", name)],
+            false,
         )?;
         let resp = self.send(p, || Ok(self.http.get(url.clone()))).await?;
         let resp = self.ok(resp, p.op, false).await?;
@@ -631,15 +621,6 @@ impl VercelClient {
     }
 
     fn session_url(&self, session: &str, tail: &[&str]) -> Result<url::Url> {
-        self.session_url_q(session, tail, &[])
-    }
-
-    fn session_url_q(
-        &self,
-        session: &str,
-        tail: &[&str],
-        extra: &[(&str, &str)],
-    ) -> Result<url::Url> {
         let mut segments = vec![
             "v2",
             "sandboxes",
@@ -647,7 +628,7 @@ impl VercelClient {
             checked_id(session, "session")?,
         ];
         segments.extend_from_slice(tail);
-        self.url(&segments, extra, true)
+        self.url(&segments, &[], true)
     }
 
     /// Clone a caller's JSON body, refusing one that carries the token.
