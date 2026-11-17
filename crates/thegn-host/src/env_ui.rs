@@ -350,6 +350,7 @@ fn spawn_pull(
     });
 }
 
+#[expect(clippy::disallowed_methods)]
 fn run_pull_child(worktree: &str) -> Result<(), String> {
     let exe = std::env::current_exe().map_err(|e| format!("pull failed: {e}"))?;
     let out = std::process::Command::new(exe)

@@ -42,7 +42,7 @@ const KINDS: &[&str] = &[
 /// `model_credentials`; the user sets it in their own config.
 const VERCEL_MODEL_CREDENTIALS_NOTE: [&str; 2] = [
     "model credentials: none (nothing is sent).",
-    "To change it, set env.<name>.provider.model_credentials in config; see `F1 vercel-sandbox`",
+    "To change: config model_credentials; F1 vercel-sandbox",
 ];
 
 /// Probe keyring availability on a detached thread, returning the shared
