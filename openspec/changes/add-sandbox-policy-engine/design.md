@@ -11,6 +11,9 @@
    handle every launch route passes through. The policy is evaluated before the
    handle is minted, so a refused launch never reaches a spawn helper.
 
+The admission handle, the launch classes and the refusal table are specified by `add-launch-admission`;
+this change only adds a rule evaluation in front of them.
+
 Both points call the same pure function, so a tool started through `tools.run`
 and a pane launched by a route are judged by one rule set.
 
