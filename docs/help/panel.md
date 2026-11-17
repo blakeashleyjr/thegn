@@ -220,7 +220,9 @@ descendant matches; Esc clears), `↵` previews a file inline, `o` pages
 it in bat, `O` opens your editor, `y` reveals it in yazi. A .docx shows its
 text (bounded, sanitized; tab-stop definitions are not rendered as tabs). A
 zip, jar, whl, tar or tar.gz previews as an entry listing; an unknown binary previews as a
-hex dump of its first 4096 bytes. See
+hex dump of its first 4096 bytes. If `git ls-files` fails, the section says the
+file list is unavailable (with the reason) and shows only the changed files,
+rather than presenting a short tree as the whole repository. See
 [[git-and-diffs]].
 
 {{keys:files}}
