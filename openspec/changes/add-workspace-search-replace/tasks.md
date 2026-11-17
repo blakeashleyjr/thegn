@@ -68,15 +68,19 @@
 
 ## 8. Preview routes
 
-- [ ] 8.1 `.docx` extracted-text route (off-loop parse, text route render).
-      DEFERRED — needs new zip/xml deps; the viewer seam it extends
-      (`add-viewers-and-quick-open`) is still in flight.
-- [ ] 8.2 Archive listing route (`.zip`/`.tar*`, bounded entries). DEFERRED (as 8.1).
-- [ ] 8.3 Unknown-binary → hex-view fallback. DEFERRED (as 8.1).
+- [x] 8.1 `.docx` extracted-text route (off-loop parse, text route render).
+      Shipped b148: `thegn-core/src/docx_text.rs` (8 unit tests), routed in
+      `thegn-host/src/preview_pane.rs` (`document_xml_lines`).
+- [x] 8.2 Archive listing route (`.zip`/`.tar*`, bounded entries). Shipped
+      b147: `thegn-core/src/archive_list.rs` (13 unit tests), routed in
+      `preview_pane.rs`.
+- [x] 8.3 Unknown-binary → hex-view fallback. Shipped b36:
+      `preview_pane.rs` `read_hex_preview` / `hex_dump_lines` (test
+      `hex_dump_formats_offset_hex_and_ascii`).
 
 ## 9. Validation
 
-- [ ] 9.1 e2e spec for the overlay (record baselines). DEFERRED — the e2e
+- [ ] 9.1 e2e spec for the overlay (record baselines). OPEN (THE-135 archives after this) — DEFERRED — the e2e
       baselines are stale repo-wide (see CLAUDE.md); not re-recorded here.
 - [x] 9.2 Scoped tests green (`cargo nextest run -p thegn-core` /
       `-p thegn-host`). `/opsx:sync` + full `just ci` remain a pre-PR step.
