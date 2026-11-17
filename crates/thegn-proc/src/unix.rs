@@ -25,11 +25,22 @@ use std::path::{Path, PathBuf};
 struct Guard {
     pid: libc::pid_t,
     active: bool,
+    /// The leader's status once [`own_group_live`] reaped it early (THE-1996). From then on its
+    /// pid no longer pins the pgid, so destructive signals go through [`signal_group`].
+    reaped: Option<Leader>,
 }
 
 impl Drop for Guard {
     fn drop(&mut self) {
         if !self.active {
+            return;
+        }
+        if self.reaped.is_some() {
+            // The leader is already reaped: never waitpid (the pid may be someone else's now) and
+            // kill only on a fresh /proc confirmation that the group is still ours.
+            if group_confirmed_after_reap(self.pid) {
+                send_group_signal(self.pid, Signal::SIGKILL);
+            }
             return;
         }
         let pgid = Pid::from_raw(self.pid);
@@ -367,8 +378,70 @@ fn group_live_with_scan(proc_root: &Path, pid: libc::pid_t, scan: &mut LivenessS
 }
 
 #[cfg(target_os = "linux")]
+fn proc_stat_live_in_session_group(
+    stat: &str,
+    pid: libc::pid_t,
+    session: libc::pid_t,
+) -> Option<bool> {
+    let (_, rest) = stat.rsplit_once(')')?;
+    let mut fields = rest.split_whitespace();
+    let state = *fields.next()?.as_bytes().first()?;
+    let _ppid = fields.next()?;
+    let pgrp: libc::pid_t = fields.next()?.parse().ok()?;
+    let member_session: libc::pid_t = fields.next()?.parse().ok()?;
+    Some(state != b'Z' && state != b'X' && pgrp == pid && member_session == session)
+}
+
+/// Fresh (uncached) `/proc` walk for a live process in group `pid` and session `session`.
+#[cfg(target_os = "linux")]
+fn group_confirmed_in(proc_root: &Path, pid: libc::pid_t, session: libc::pid_t) -> bool {
+    #[cfg(test)]
+    GLOBAL_PROC_SCANS.with(|scans| scans.set(scans.get().saturating_add(1)));
+    let Ok(entries) = proc_read_dir(proc_root) else {
+        return false;
+    };
+    entries.flatten().any(|entry| {
+        let numeric = entry
+            .file_name()
+            .to_str()
+            .is_some_and(|name| name.parse::<libc::pid_t>().is_ok());
+        numeric
+            && proc_read_to_string(&entry.path().join("stat")).is_ok_and(|stat| {
+                proc_stat_live_in_session_group(&stat, pid, session) == Some(true)
+            })
+    })
+}
+
+/// The identity check a destructive signal needs once the leader has been reaped early.
+///
+/// While the leader is alive or an unreaped zombie its pid pins the pgid, so `killpg` cannot
+/// reach a recycled group. After the reap that pin is gone; a post-reap `killpg(pgid, 0)` only
+/// answers "keep waiting?". Before SIGTERM/SIGKILL we therefore re-establish, immediately before
+/// signalling, that a live process still carries this pgid inside our own session (the spawned
+/// group never leaves it: `setsid` would take a member out of the group too). This is the rare
+/// survivors path; the common empty-group path never gets here.
+#[cfg(target_os = "linux")]
+fn group_confirmed_after_reap(pid: libc::pid_t) -> bool {
+    // SAFETY: getsid(0) only queries the calling process's own session id.
+    let session = unsafe { libc::getsid(0) };
+    session >= 0 && group_confirmed_in(Path::new("/proc"), pid, session)
+}
+
+/// Non-Linux never reaps the leader early (see [`own_group_live`]); refuse rather than signal an
+/// unpinned pgid should that ever change.
+#[cfg(not(target_os = "linux"))]
+fn group_confirmed_after_reap(_pid: libc::pid_t) -> bool {
+    false
+}
+
+#[cfg(target_os = "linux")]
 /// Return whether the process group has a live member using the cached `/proc`
 /// liveness scan used by the supervisor.
+///
+/// This is the fallback for a group whose leader the caller cannot reap (it is not the caller's
+/// child, e.g. a detached survivor group): its leader may be a zombie that keeps `killpg(pgid, 0)`
+/// succeeding, so emptiness needs the global `/proc` walk. A run's own group uses the cheaper
+/// reap-then-probe in [`own_group_live`].
 pub fn group_has_live_members(pgid: u32) -> bool {
     let mut scan = LivenessScan::default();
     group_live_with_scan(Path::new("/proc"), pgid as libc::pid_t, &mut scan)
@@ -397,6 +470,56 @@ fn group_exists(pid: libc::pid_t) -> bool {
         Ok(()) => true,
         Err(Errno::ESRCH) => false,
         Err(_) => true,
+    }
+}
+
+fn wait_leader(child: &mut Child) -> Leader {
+    match child.wait() {
+        Ok(status) => Leader::Reaped(status),
+        Err(error) => Leader::ReapFailed(error),
+    }
+}
+
+/// Whether the run's own process group still has a live member (THE-1996: reap-then-killpg).
+///
+/// - Leader alive: the group is live; no `/proc` read.
+/// - Leader exited: reap it now (its status is kept in `guard.reaped` and returned by
+///   [`reap_after`] unchanged), then probe at once with `killpg(pgid, 0)`: `ESRCH` proves the group
+///   empty, success means members remain. An unreaped zombie leader would keep that probe
+///   succeeding, which is what forced the old global `/proc` walk.
+/// - Accepted risk: once the group drains, its pgid could in principle be recycled before the
+///   next probe. A post-reap probe therefore only answers "keep waiting?"; destructive signals go
+///   through [`signal_group`], which re-confirms the group first.
+/// - Reaping impossible (`waitid`/`waitpid` fails, i.e. the leader is not our waitable child): the
+///   cached global `/proc` scan answers instead, as it does for [`group_has_live_members`].
+///
+/// Non-Linux keeps the leader pinned and `killpg(pgid, 0)` alone (no `/proc` to confirm a
+/// destructive signal against after a reap).
+fn own_group_live(
+    guard: &mut Guard,
+    #[cfg_attr(not(target_os = "linux"), allow(unused_variables))] child: &mut Child,
+    #[cfg_attr(not(target_os = "linux"), allow(unused_variables))] liveness: &mut LivenessScan,
+) -> bool {
+    #[cfg(not(target_os = "linux"))]
+    {
+        group_live(guard.pid)
+    }
+    #[cfg(target_os = "linux")]
+    {
+        if guard.reaped.is_none() {
+            match leader_exited(guard.pid) {
+                Ok(false) => return true,
+                Ok(true) => guard.reaped = Some(wait_leader(child)),
+                Err(_not_waitable) => {
+                    return group_live_with_scan(Path::new("/proc"), guard.pid, liveness);
+                }
+            }
+        }
+        if matches!(guard.reaped, Some(Leader::ReapFailed(_))) {
+            // The reap failed, so the leader may still be a pinned zombie: only the scan can tell.
+            return group_live_with_scan(Path::new("/proc"), guard.pid, liveness);
+        }
+        group_exists(guard.pid)
     }
 }
 
@@ -508,21 +631,19 @@ fn nap(pipes: &mut Pipes<'_>, backoff: Duration) -> io::Result<()> {
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 fn wait_empty(
-    pid: libc::pid_t,
+    guard: &mut Guard,
+    child: &mut Child,
     deadline: Instant,
     pipes: &mut Pipes<'_>,
     out: &mut Accumulator,
     err: &mut Accumulator,
     backoff: &mut Duration,
-    #[cfg_attr(not(target_os = "linux"), allow(unused_variables))] liveness: &mut LivenessScan,
+    liveness: &mut LivenessScan,
 ) -> io::Result<bool> {
     loop {
-        #[cfg(target_os = "linux")]
-        let group_is_live = group_live_with_scan(Path::new("/proc"), pid, liveness);
-        #[cfg(not(target_os = "linux"))]
-        let group_is_live = group_live(pid);
-        if !group_is_live {
+        if !own_group_live(guard, child, liveness) {
             return Ok(true);
         }
         if Instant::now() >= deadline {
@@ -545,12 +666,28 @@ fn send_group_signal(pid: libc::pid_t, signal: Signal) {
     }
 }
 
+/// Send a destructive signal to the run's group. While the leader is unreaped its pid pins the
+/// pgid (the pre-THE-1996 identity guarantee, kept). Once [`own_group_live`] has reaped it, the
+/// signal is sent only after [`group_confirmed_after_reap`] re-confirms the group, never on the
+/// strength of a post-reap `killpg(pgid, 0)` alone.
+fn signal_group(guard: &Guard, signal: Signal) {
+    if guard.reaped.is_some() && !group_confirmed_after_reap(guard.pid) {
+        return;
+    }
+    send_group_signal(guard.pid, signal);
+}
+
 fn reap_after(
     child: &mut Child,
-    pid: libc::pid_t,
+    guard: &mut Guard,
     kill_settle: Duration,
     signalled: bool,
 ) -> Leader {
+    if let Some(leader) = guard.reaped.take() {
+        // Reaped early by `own_group_live`: this is the leader's own status, unchanged.
+        return leader;
+    }
+    let pid = guard.pid;
     if !signalled {
         return match child.try_wait() {
             Ok(Some(status)) => Leader::Reaped(status),
@@ -561,12 +698,7 @@ fn reap_after(
     let deadline = Instant::now() + kill_settle;
     loop {
         match leader_exited(pid) {
-            Ok(true) => {
-                return match child.wait() {
-                    Ok(status) => Leader::Reaped(status),
-                    Err(error) => Leader::ReapFailed(error),
-                };
-            }
+            Ok(true) => return wait_leader(child),
             Ok(false) if Instant::now() < deadline => std::thread::sleep(POLL_INTERVAL),
             Ok(false) => return detach(child),
             Err(error) => return Leader::ReapFailed(error),
@@ -679,7 +811,11 @@ fn run_inner(
         }
     };
     let pid = child.id() as libc::pid_t;
-    let mut guard = Guard { pid, active: true };
+    let mut guard = Guard {
+        pid,
+        active: true,
+        reaped: None,
+    };
     let stdout = child.stdout.take().map(|pipe| {
         let fd = pipe.into_raw_fd();
         // SAFETY: ownership of this raw descriptor is transferred from ChildStdout to File.
@@ -803,12 +939,7 @@ fn run_inner(
                         Ok(None) => {}
                         Err(_error) => {}
                     }
-                    #[cfg(target_os = "linux")]
-                    let group_is_live =
-                        group_live_with_scan(Path::new("/proc"), pid, &mut liveness);
-                    #[cfg(not(target_os = "linux"))]
-                    let group_is_live = group_live(pid);
-                    if !group_is_live {
+                    if !own_group_live(&mut guard, &mut child, &mut liveness) {
                         break End::LeaderExited;
                     }
                     if out.capture.total.saturating_add(err.capture.total) > before {
@@ -858,9 +989,10 @@ fn run_inner(
     if !matches!(end, End::LeaderExited | End::Supervise(_)) {
         signalled = true;
         if limits.term_grace > Duration::ZERO {
-            send_group_signal(pid, Signal::SIGTERM);
+            signal_group(&guard, Signal::SIGTERM);
             match wait_empty(
-                pid,
+                &mut guard,
+                &mut child,
                 Instant::now() + limits.term_grace,
                 &mut pipes,
                 &mut out,
@@ -874,9 +1006,10 @@ fn run_inner(
             }
         }
         if group != GroupState::Terminated {
-            send_group_signal(pid, Signal::SIGKILL);
+            signal_group(&guard, Signal::SIGKILL);
             group = match wait_empty(
-                pid,
+                &mut guard,
+                &mut child,
                 Instant::now() + limits.kill_settle,
                 &mut pipes,
                 &mut out,
@@ -890,10 +1023,7 @@ fn run_inner(
             };
         }
     } else if matches!(&end, End::LeaderExited) {
-        #[cfg(target_os = "linux")]
-        let group_is_live = group_live_with_scan(Path::new("/proc"), pid, &mut liveness);
-        #[cfg(not(target_os = "linux"))]
-        let group_is_live = group_live(pid);
+        let group_is_live = own_group_live(&mut guard, &mut child, &mut liveness);
         group = match (group_is_live, limits.leader_exit) {
             (false, _) => GroupState::Drained,
             // Detach: never signal the members the leader left behind.
@@ -903,9 +1033,10 @@ fn run_inner(
         if group == GroupState::Terminated {
             signalled = true;
             if limits.term_grace > Duration::ZERO {
-                send_group_signal(pid, Signal::SIGTERM);
+                signal_group(&guard, Signal::SIGTERM);
                 match wait_empty(
-                    pid,
+                    &mut guard,
+                    &mut child,
                     Instant::now() + limits.term_grace,
                     &mut pipes,
                     &mut out,
@@ -917,9 +1048,10 @@ fn run_inner(
                     Err(_error) => {}
                 }
             }
-            send_group_signal(pid, Signal::SIGKILL);
+            signal_group(&guard, Signal::SIGKILL);
             match wait_empty(
-                pid,
+                &mut guard,
+                &mut child,
                 Instant::now() + limits.kill_settle,
                 &mut pipes,
                 &mut out,
@@ -935,7 +1067,7 @@ fn run_inner(
     }
     let leader = reap_after(
         &mut child,
-        pid,
+        &mut guard,
         limits.kill_settle,
         signalled || leader_first,
     );
@@ -1176,53 +1308,178 @@ mod tests {
         assert!(started.elapsed() < Duration::from_secs(3));
     }
 
+    /// A member that blocks until the test creates `release` (bounded by the test's deadlines).
+    #[cfg(target_os = "linux")]
+    fn lingering_member_script(
+        dir: &Scripts,
+        pid_file: &Path,
+        release: &Path,
+        code: i32,
+    ) -> PathBuf {
+        dir.write(
+            "linger.sh",
+            &format!(
+                "echo $$ > '{}'\n(while [ ! -e '{}' ]; do sleep 0.02; done) >/dev/null 2>&1 &\nexit {code}\n",
+                pid_file.display(),
+                release.display()
+            ),
+        )
+    }
+
+    #[cfg(target_os = "linux")]
     #[test]
-    fn leader_stays_a_zombie_until_its_group_drains() {
-        if !Path::new("/proc/self/stat").exists() {
-            return;
-        }
+    fn reap_then_probe_tracks_a_lingering_member_and_keeps_the_exit_code() {
         let dir = Scripts::new();
         let pid_file = dir.path().join("leader.pid");
-        let script = dir.write(
-            "zombie.sh",
-            &format!("echo $$ > '{}'; sleep 1 & exit 0\n", pid_file.display()),
-        );
-        let configured = Limits {
-            quiesce_after_leader: Some(Duration::from_secs(2)),
-            ..limits(Duration::from_secs(3))
+        let release = dir.path().join("release");
+        let script = lingering_member_script(&dir, &pid_file, &release, 7);
+        let mut cmd = command(&script);
+        cmd.process_group(0);
+        let mut child = cmd.spawn().unwrap();
+        let pid = child.id() as libc::pid_t;
+        let mut guard = Guard {
+            pid,
+            active: true,
+            reaped: None,
         };
-        let script_for_thread = script.clone();
-        let runner = thread::spawn(move || {
-            run(
-                &mut command(&script_for_thread),
-                &configured,
-                &AtomicBool::new(false),
-            )
-        });
-        let deadline = Instant::now() + Duration::from_secs(1);
+        let mut liveness = LivenessScan::default();
+        GLOBAL_PROC_SCANS.with(|scans| scans.set(0));
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while guard.reaped.is_none() {
+            assert!(
+                own_group_live(&mut guard, &mut child, &mut liveness),
+                "the lingering member keeps the group live across the reap"
+            );
+            assert!(Instant::now() < deadline, "the leader was never reaped");
+            thread::sleep(Duration::from_millis(10));
+        }
+        assert!(
+            own_group_live(&mut guard, &mut child, &mut liveness),
+            "post-reap probe must report the lingering member"
+        );
+        fs::write(&release, "").unwrap();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while own_group_live(&mut guard, &mut child, &mut liveness) {
+            assert!(Instant::now() < deadline, "the group never drained");
+            thread::sleep(Duration::from_millis(10));
+        }
+        GLOBAL_PROC_SCANS.with(|scans| assert_eq!(scans.get(), 0, "reap-then-probe scanned /proc"));
+        match guard.reaped.take() {
+            Some(Leader::Reaped(status)) => assert_eq!(status.code(), Some(7)),
+            other => panic!("leader status lost: {other:?}"),
+        }
+        guard.disarm();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn leader_is_reaped_while_its_group_drains_and_keeps_its_exit_code() {
+        let dir = Scripts::new();
+        let pid_file = dir.path().join("leader.pid");
+        let release = dir.path().join("release");
+        let script = lingering_member_script(&dir, &pid_file, &release, 5);
+        let configured = Limits {
+            quiesce_after_leader: Some(Duration::from_secs(20)),
+            ..limits(Duration::from_secs(30))
+        };
+        let runner =
+            thread::spawn(move || run(&mut command(&script), &configured, &AtomicBool::new(false)));
+        let deadline = Instant::now() + Duration::from_secs(10);
         let pid = loop {
-            if let Ok(value) = fs::read_to_string(&pid_file) {
-                break value.trim().parse::<u32>().unwrap();
+            if let Ok(value) = fs::read_to_string(&pid_file)
+                && let Ok(pid) = value.trim().parse::<u32>()
+            {
+                break pid;
             }
             assert!(Instant::now() < deadline, "leader pid was not written");
             thread::sleep(Duration::from_millis(10));
         };
         let stat_path = PathBuf::from(format!("/proc/{pid}/stat"));
-        let zombie_deadline = Instant::now() + Duration::from_secs(1);
-        loop {
-            let stat = fs::read_to_string(&stat_path).unwrap();
-            if stat.rsplit_once(") ").unwrap().1.starts_with('Z') {
-                break;
-            }
+        while stat_path.exists() {
             assert!(
-                Instant::now() < zombie_deadline,
-                "leader was not pinned as a zombie"
+                Instant::now() < deadline,
+                "the exited leader was not reaped while its group lingered"
             );
             thread::sleep(Duration::from_millis(10));
         }
+        assert!(
+            !runner.is_finished(),
+            "the run must keep waiting for the lingering member"
+        );
+        fs::write(&release, "").unwrap();
         let result = runner.join().unwrap();
+        assert!(matches!(&result.end, End::LeaderExited), "{:?}", result.end);
         assert_eq!(result.group, GroupState::Drained);
-        assert!(!stat_path.exists());
+        assert!(result.leader_exited_first);
+        assert!(
+            matches!(&result.leader, Leader::Reaped(status) if status.code() == Some(5)),
+            "{:?}",
+            result.leader
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn empty_group_after_leader_exit_reads_no_proc() {
+        let mut cmd = Command::new("sh");
+        cmd.args(["-c", "exit 3"]);
+        PROC_READS.with(|reads| reads.set(0));
+        GLOBAL_PROC_SCANS.with(|scans| scans.set(0));
+        let result = run(
+            &mut cmd,
+            &limits(Duration::from_secs(10)),
+            &AtomicBool::new(false),
+        );
+        assert!(matches!(&result.end, End::LeaderExited), "{:?}", result.end);
+        assert_eq!(result.group, GroupState::Drained);
+        assert!(
+            matches!(&result.leader, Leader::Reaped(status) if status.code() == Some(3)),
+            "{:?}",
+            result.leader
+        );
+        PROC_READS.with(|reads| assert_eq!(reads.get(), 0, "empty group read /proc"));
+        GLOBAL_PROC_SCANS.with(|scans| assert_eq!(scans.get(), 0, "empty group scanned /proc"));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn not_our_child_group_falls_back_to_the_proc_scan() {
+        let dir = Scripts::new();
+        let pid_file = dir.path().join("leader.pid");
+        let release = dir.path().join("release");
+        let script = lingering_member_script(&dir, &pid_file, &release, 0);
+        let mut cmd = command(&script);
+        cmd.process_group(0);
+        let mut child = cmd.spawn().unwrap();
+        let pgid = child.id();
+        // The leader is reaped here, outside the supervisor: the lingering member is not our child.
+        child.wait().unwrap();
+        GLOBAL_PROC_SCANS.with(|scans| scans.set(0));
+        let live = group_has_live_members(pgid);
+        GLOBAL_PROC_SCANS
+            .with(|scans| assert!(scans.get() >= 1, "the fallback did not scan /proc"));
+        fs::write(&release, "").unwrap();
+        assert!(live, "the lingering member must be found by the scan");
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while group_has_live_members(pgid) {
+            assert!(Instant::now() < deadline, "the group never drained");
+            thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn post_reap_confirmation_requires_a_live_member_in_our_session() {
+        let root = tempfile::tempdir().unwrap();
+        let pid = 400;
+        fake_proc_process(root.path(), 401, &fake_proc_stat(401, 'S', pid), "");
+        fake_proc_process(root.path(), 402, &fake_proc_stat(402, 'S', 999), "");
+        assert!(group_confirmed_in(root.path(), pid, 0));
+        assert!(!group_confirmed_in(root.path(), pid, 9), "foreign session");
+        assert!(!group_confirmed_in(root.path(), 500, 0), "no member");
+        let zombies = tempfile::tempdir().unwrap();
+        fake_proc_process(zombies.path(), 401, &fake_proc_stat(401, 'Z', pid), "");
+        assert!(!group_confirmed_in(zombies.path(), pid, 0), "zombie member");
     }
 
     #[test]
