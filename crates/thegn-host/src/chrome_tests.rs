@@ -4062,3 +4062,112 @@ fn fleet_sheds_after_weather_and_before_uptime() {
     let no_fleet = fit_stats_cluster(&parts, cluster_width(&parts, &no_weather) - 1);
     assert_eq!(names(&no_fleet), ["cpu", "uptime"]);
 }
+
+fn width_chip_rect() -> Rect {
+    Rect {
+        x: 5,
+        y: 3,
+        cols: 60,
+        rows: 40,
+    }
+}
+
+#[test]
+fn panel_width_chip_click_expands_and_tab_click_stays_a_tab() {
+    use crate::panel::{PanelHit, PanelTab, PanelUi, Section};
+
+    let rect = width_chip_rect();
+    let model = panel_model();
+    let ui = PanelUi {
+        open: Section::Changes,
+        tab: PanelTab::Git,
+        ..Default::default()
+    };
+    let frame =
+        crate::panel::frame::build_panel(&model, &ui, rect.cols, rect.rows, model.panel_focused);
+    let chip = frame
+        .col_hits
+        .iter()
+        .find(|c| c.row == 0)
+        .expect("the tab row carries the width chip");
+    for x in [chip.cols.start, chip.cols.end - 1] {
+        assert_eq!(
+            panel_hit_at(&model, &ui, rect, rect.x + x, rect.y),
+            Some(PanelHit::Expand)
+        );
+        assert_eq!(panel_tab_hit(&model, &ui, rect, rect.x + x, rect.y), None);
+    }
+    let (tab_cols, tab) = frame.tab_spans[1].clone();
+    let x = rect.x + tab_cols.start;
+    assert_eq!(panel_hit_at(&model, &ui, rect, x, rect.y), None);
+    assert_eq!(panel_tab_hit(&model, &ui, rect, x, rect.y), Some(tab));
+}
+
+#[test]
+fn panel_width_chip_click_works_at_full_non_git() {
+    use crate::layout::PanelWidth;
+    use crate::panel::{PanelHit, PanelTab, PanelUi, Section};
+
+    let rect = width_chip_rect();
+    let model = panel_model();
+    let ui = PanelUi {
+        width: PanelWidth::Full,
+        open: Section::Logs,
+        tab: PanelTab::System,
+        ..Default::default()
+    };
+    let frame =
+        crate::panel::frame::build_panel(&model, &ui, rect.cols, rect.rows, model.panel_focused);
+    let chip = frame
+        .col_hits
+        .iter()
+        .find(|c| c.row == 0)
+        .expect("the Full tab row carries the width chip");
+    assert_eq!(
+        panel_hit_at(&model, &ui, rect, rect.x + chip.cols.start, rect.y),
+        Some(PanelHit::Expand)
+    );
+    let x = rect.x + frame.tab_spans[0].0.start;
+    assert_eq!(panel_hit_at(&model, &ui, rect, x, rect.y), None);
+    assert_eq!(
+        panel_tab_hit(&model, &ui, rect, x, rect.y),
+        Some(frame.tab_spans[0].1)
+    );
+}
+
+#[test]
+fn panel_width_word_click_works_on_the_git_full_help_row() {
+    use crate::layout::PanelWidth;
+    use crate::panel::{PanelHit, PanelTab, PanelUi, Section};
+
+    let rect = Rect {
+        x: 2,
+        y: 1,
+        cols: 120,
+        rows: 40,
+    };
+    let model = panel_model();
+    let ui = PanelUi {
+        width: PanelWidth::Full,
+        open: Section::Changes,
+        tab: PanelTab::Git,
+        ..Default::default()
+    };
+    let frame =
+        crate::panel::frame::build_panel(&model, &ui, rect.cols, rect.rows, model.panel_focused);
+    let chip = frame
+        .col_hits
+        .iter()
+        .find(|c| c.hit == PanelHit::Expand)
+        .expect("the help row carries the width word");
+    assert_eq!(
+        panel_hit_at(
+            &model,
+            &ui,
+            rect,
+            rect.x + chip.cols.start,
+            rect.y + chip.row
+        ),
+        Some(PanelHit::Expand)
+    );
+}
