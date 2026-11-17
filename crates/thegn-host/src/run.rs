@@ -25454,7 +25454,7 @@ async fn event_loop<T: Terminal>(
                         // — the accordion claims Enter before this match, so
                         // an Enter alternative here could never fire.
                         (Section::Environments, key)
-                            if matches!(key, KeyCode::Char('t' | 'x' | 'n')) =>
+                            if matches!(key, KeyCode::Char('t' | 'x' | 'n' | 'p')) =>
                         {
                             let wt = session
                                 .active_group()

@@ -786,6 +786,95 @@ fn preview_renderers_json() -> serde_json::Value {
     })
 }
 
+/// One vercel env's doctor row. `token` is the resolved token, held in memory
+/// only to classify its shape; nothing derived from its text is returned.
+fn vercel_row(
+    name: &str,
+    pc: &thegn_core::config::EnvProviderConfig,
+    token: Option<&str>,
+    now_s: i64,
+) -> serde_json::Value {
+    let disclosure = thegn_core::vercel::creds::disclosure(pc.model_credentials);
+    let token_kind = token.map(|t| {
+        thegn_core::vercel::token::describe(thegn_core::vercel::token::classify(t), now_s)
+    });
+    serde_json::json!({
+        "env": name,
+        "model_credentials": disclosure.mode,
+        "leaves_machine": disclosure.leaves_machine,
+        "token_kind": token_kind,
+    })
+}
+
+fn vercel_rows(cfg: &Config) -> Vec<serde_json::Value> {
+    let now_s = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0);
+    cfg.env
+        .iter()
+        .filter(|(_, e)| {
+            e.placement == thegn_core::config::PlacementMode::Provider
+                && e.provider.provider.trim() == "vercel"
+        })
+        .map(|(name, e)| {
+            let key = crate::env_ui::effective_token_env(&e.provider);
+            let token = (!key.is_empty())
+                .then(|| crate::secret::resolve(&key))
+                .flatten();
+            vercel_row(name, &e.provider, token.as_deref(), now_s)
+        })
+        .collect()
+}
+
+/// `vercel` doctor object: per-env rows + the count of unpulled-result markers.
+fn vercel_json(cfg: &Config) -> serde_json::Value {
+    let rows = vercel_rows(cfg);
+    let unpulled = if rows.is_empty() {
+        0
+    } else {
+        crate::vercel_pull_marker::count()
+    };
+    serde_json::json!({ "envs": rows, "unpulled": unpulled })
+}
+
+/// Text lines for the vercel section; empty when no vercel env is configured.
+fn vercel_lines(report: &serde_json::Value) -> Vec<String> {
+    let rows = report["envs"].as_array().cloned().unwrap_or_default();
+    if rows.is_empty() {
+        return Vec::new();
+    }
+    let mut lines = vec!["Vercel sandbox".to_string()];
+    for row in &rows {
+        let name = row["env"].as_str().unwrap_or("?");
+        lines.push(format!(
+            "  {name}: model credentials {} (leaves machine: {})",
+            row["model_credentials"].as_str().unwrap_or("?"),
+            row["leaves_machine"].as_str().unwrap_or("?"),
+        ));
+        lines.push(format!(
+            "  {name}: token kind {}",
+            row["token_kind"].as_str().unwrap_or("no token resolved"),
+        ));
+    }
+    lines.push(format!(
+        "  results not pulled: {}",
+        report["unpulled"].as_u64().unwrap_or(0)
+    ));
+    lines
+}
+
+fn vercel_report(cfg: &Config) {
+    let lines = vercel_lines(&vercel_json(cfg));
+    if lines.is_empty() {
+        return;
+    }
+    outln!("");
+    for line in lines {
+        outln!("{line}");
+    }
+}
+
 fn preview_renderers_report() {
     let report = preview_renderers_json();
     outln!("Document preview renderers");
@@ -2912,6 +3001,7 @@ fn doctor_json_with_health_and_overrides_and_legacy(
         "toolchain": toolchain_json(cfg),
         "devcontainer": devcontainer_json(cfg),
         "preview_renderers": preview_renderers_json(),
+        "vercel": vercel_json(cfg),
         "remote_sandbox": remote_sandbox_json(cfg),
         "provider_cache": provider_cache_json(cfg),
         "warm_pool": warm_pool_json(cfg),
@@ -3601,6 +3691,8 @@ pub fn run(
 
     outln!("");
     preview_renderers_report();
+
+    vercel_report(cfg);
 
     outln!("");
     hosts_report(cfg);
@@ -8428,5 +8520,37 @@ args = ["--verbose"]
             "the live WAL must remain present and nonempty while the writer DB is open"
         );
         drop(db);
+    }
+
+    #[test]
+    fn vercel_doctor_rows_never_carry_token_text_and_json_matches_text() {
+        use thegn_core::config::{EnvProviderConfig, ModelCredentials};
+        // A JWT-shaped (OIDC) fixture token.
+        let token = "eyJhbGciOiJSUzI1NiJ9.eyJleHAiOjQxMDI0NDQ4MDB9.c2lnLXNlY3JldC1ib2R5";
+        let pc = EnvProviderConfig {
+            provider: "vercel".into(),
+            model_credentials: ModelCredentials::Upload,
+            ..Default::default()
+        };
+        let row = vercel_row("vx", &pc, Some(token), 1_700_000_000);
+        assert_eq!(row["model_credentials"], "upload");
+        assert!(row["leaves_machine"].is_string());
+        assert!(row["token_kind"].is_string());
+        let report = serde_json::json!({ "envs": [row], "unpulled": 2 });
+        let rendered = format!("{report}\n{}", vercel_lines(&report).join("\n"));
+        assert!(!rendered.contains(token));
+        assert!(!rendered.contains("c2lnLXNlY3JldC1ib2R5"));
+        assert!(rendered.contains("model credentials upload"));
+        assert!(rendered.contains("results not pulled: 2"));
+        // No token resolved: reported as such, still no failure.
+        let none = vercel_row("vx", &pc, None, 0);
+        assert!(none["token_kind"].is_null());
+    }
+
+    #[test]
+    fn vercel_doctor_section_is_silent_without_a_vercel_env() {
+        let report = vercel_json(&Config::default());
+        assert_eq!(report["unpulled"], 0);
+        assert!(vercel_lines(&report).is_empty());
     }
 }

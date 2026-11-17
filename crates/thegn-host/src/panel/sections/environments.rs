@@ -135,6 +135,9 @@ pub(super) fn content(ctx: &SectionCtx) -> Vec<PanelRow> {
                     Some(false) => line.push(seg(hue(Hue::Red), " token ✗")),
                     None => {}
                 }
+                if env.unpulled {
+                    line.push(seg(hue(Hue::Red), "  results not pulled"));
+                }
                 (line, Some(i))
             })
             .collect();
@@ -169,7 +172,8 @@ pub(super) fn content(ctx: &SectionCtx) -> Vec<PanelRow> {
             ctx.rows.saturating_sub(rows.len() + 1),
         ));
         rows.push(environment_hints(
-            envs.get(cursor),
+            envs,
+            cursor,
             ctx.model.panel.environments_error.is_some(),
         ));
         if let Some(toolchain) = &ctx.model.panel.toolchain {
@@ -205,8 +209,12 @@ pub(super) fn content(ctx: &SectionCtx) -> Vec<PanelRow> {
             Some(false) => seg(hue(Hue::Red), "token ✗".to_string()),
             None => seg(g(), String::new()),
         };
+        let mut right = vec![right];
+        if e.unpulled {
+            right.insert(0, seg(hue(Hue::Red), "results not pulled  ".to_string()));
+        }
         rows.push(
-            PanelRow::plain(Line::split(left, vec![right]))
+            PanelRow::plain(Line::split(left, right))
                 .with_hit(PanelHit::Row(Section::Environments, i)),
         );
         if ctx.deep() && i == ctx.ui.cursor {
@@ -214,7 +222,8 @@ pub(super) fn content(ctx: &SectionCtx) -> Vec<PanelRow> {
         }
     }
     rows.push(environment_hints(
-        envs.get(ctx.ui.cursor),
+        envs,
+        ctx.ui.cursor,
         ctx.model.panel.environments_error.is_some(),
     ));
     if let Some(toolchain) = &ctx.model.panel.toolchain {
@@ -226,7 +235,8 @@ pub(super) fn content(ctx: &SectionCtx) -> Vec<PanelRow> {
     rows
 }
 
-fn environment_hints(selected: Option<&EnvSnapshot>, unreadable: bool) -> PanelRow {
+fn environment_hints(envs: &[EnvSnapshot], cursor: usize, unreadable: bool) -> PanelRow {
+    let selected = envs.get(cursor);
     let enter_hint = if unreadable {
         "bind unavailable"
     } else {
@@ -237,6 +247,9 @@ fn environment_hints(selected: Option<&EnvSnapshot>, unreadable: bool) -> PanelR
     let mut hints = vec![("enter", enter_hint)];
     if selected.is_some_and(|env| env.placement == "provider") {
         hints.push(("t", "test"));
+    }
+    if crate::env_ui::pull_available(envs, cursor) {
+        hints.push(("p", "pull"));
     }
     hints.extend([("x", "remove"), ("n", "new…")]);
     hint_row(&hints)
@@ -275,6 +288,7 @@ mod tests {
                         size: String::new(),
                         bound: false,
                         token: None,
+                        unpulled: false,
                         detail: Vec::new(),
                     },
                     EnvSnapshot {
@@ -285,6 +299,7 @@ mod tests {
                         size: String::new(),
                         bound: true,
                         token: Some(false),
+                        unpulled: false,
                         detail: Vec::new(),
                     },
                 ],
@@ -329,6 +344,7 @@ mod tests {
             size: String::new(),
             bound: false,
             token: None,
+            unpulled: false,
             detail: vec![
                 ("placement".into(), "ssh".into()),
                 ("target".into(), target.into()),
@@ -493,6 +509,38 @@ mod tests {
             if row_text(row).contains("data") {
                 assert!(row.hit.is_none());
             }
+        }
+    }
+
+    #[test]
+    fn unpulled_vercel_row_shows_marker_and_pull_hint_only_when_marked() {
+        let mut marked = env("vx", "vercel team");
+        marked.kind = "vercel".into();
+        marked.placement = "provider".into();
+        marked.bound = true;
+        marked.unpulled = true;
+        let mut clean = marked.clone();
+        clean.unpulled = false;
+        for (envs, expect) in [(vec![marked], true), (vec![clean], false)] {
+            let model = frame(envs);
+            let ui = PanelUi {
+                open: Section::Environments,
+                width: PanelWidth::Normal,
+                ..Default::default()
+            };
+            let ctx = SectionCtx {
+                model: &model,
+                ui: &ui,
+                cols: 100,
+                rows: 20,
+            };
+            let text: String = content(&ctx)
+                .iter()
+                .map(row_text)
+                .collect::<Vec<_>>()
+                .join("\n");
+            assert_eq!(text.contains("results not pulled"), expect, "{text}");
+            assert_eq!(text.contains("pull"), expect, "{text}");
         }
     }
 }
