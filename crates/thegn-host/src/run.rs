@@ -7425,6 +7425,7 @@ async fn event_loop<T: Terminal>(
     let mut sb = SidebarState::default();
     sb.view.workspace_sort = keymap.config().ui.sidebar_workspace_sort;
     sb.view.terminals_section = keymap.config().ui.sidebar_terminals_section;
+    sb.view.lead_enabled = crate::lead::enabled(keymap.config());
     sb.freeze_sort = keymap.config().ui.sidebar_freeze_sort;
     sb.view.display = crate::sidebar_view::SidebarDisplay::from_ui(&keymap.config().ui);
     let mut panel_ui = crate::panel::PanelUi::default();
@@ -28824,6 +28825,32 @@ async fn event_loop<T: Terminal>(
                                         } else {
                                             "Nothing needs you right now".into()
                                         };
+                                    }
+                                }
+                            }
+                            Action::JumpLead => {
+                                match crate::lead::group::jump(
+                                    keymap.config(),
+                                    &mut session,
+                                    &mut panes,
+                                    &mut model.status,
+                                    &model.sidebar_db_terminals,
+                                    &pending_db_tx,
+                                    &waker,
+                                ) {
+                                    crate::lead::group::JumpOutcome::Handled => {}
+                                    crate::lead::group::JumpOutcome::Activate(t) => {
+                                        let (hydrate, _pending) = activate_row!(t);
+                                        sb.focus_active_row(&mut model);
+                                        if hydrate {
+                                            kick_model_hydration!();
+                                        }
+                                    }
+                                    crate::lead::group::JumpOutcome::Created => {
+                                        focus.zone = crate::focus::Zone::Center;
+                                        refresh_tab_model(&mut model, &session, &mut sb);
+                                        persist_session_layout(&mut session, &panes);
+                                        need_relayout = true;
                                     }
                                 }
                             }
