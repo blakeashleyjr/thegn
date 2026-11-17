@@ -367,6 +367,34 @@ pub enum SessionAction {
 /// reads the same — and JSON gains `"cause": "remote-exec-lost"` only then
 /// (see [`exit_cause`]).
 pub(crate) fn session_line(s: &thegn_svc::control::SessionInfo) -> String {
+    session_line_at(s, unix_now_secs())
+}
+
+/// Compact age: `5s`, `3m`, `2h`, `1d` (floor; negative skew clamps to `0s`).
+pub(crate) fn format_age(secs: i64) -> String {
+    let n = secs.max(0);
+    match n {
+        0..=59 => format!("{n}s"),
+        60..=3599 => format!("{}m", n / 60),
+        3600..=86399 => format!("{}h", n / 3600),
+        _ => format!("{}d", n / 86400),
+    }
+}
+
+fn unix_now_secs() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| i64::try_from(d.as_secs()).unwrap_or(i64::MAX))
+}
+
+/// [`session_line`] with an injected clock. A trailing `output:<age>` field is
+/// appended only when the daemon reported `last_output_unix_secs` (named
+/// `output:` because `last:<state>` already means the final agent state).
+pub(crate) fn session_line_at(s: &thegn_svc::control::SessionInfo, now: i64) -> String {
+    let output = s
+        .last_output_unix_secs
+        .map(|at| format!("  output:{}", format_age(now.saturating_sub(at))))
+        .unwrap_or_default();
     let cause = exit_cause(s)
         .map(|c| format!("  cause:{c}"))
         .unwrap_or_default();
@@ -397,7 +425,7 @@ pub(crate) fn session_line(s: &thegn_svc::control::SessionInfo) -> String {
         .map(|source| format!("  ← forked from {}", display_cell(source)))
         .unwrap_or_default();
     format!(
-        "{}  {}  {}x{}  {} client(s)  {}{}{}{}{}{}",
+        "{}  {}  {}x{}  {} client(s)  {}{}{}{}{}{}{}",
         display_cell(&s.id),
         state,
         s.cols,
@@ -411,7 +439,8 @@ pub(crate) fn session_line(s: &thegn_svc::control::SessionInfo) -> String {
         lease,
         lineage,
         last,
-        cause
+        cause,
+        output
     )
 }
 
@@ -2349,6 +2378,48 @@ mod session_line_tests {
             final_state: final_state.map(str::to_string),
             ..Default::default()
         }
+    }
+
+    #[test]
+    fn age_formatter_table() {
+        for (secs, want) in [
+            (-5, "0s"),
+            (0, "0s"),
+            (5, "5s"),
+            (59, "59s"),
+            (60, "1m"),
+            (179, "2m"),
+            (3599, "59m"),
+            (3600, "1h"),
+            (7300, "2h"),
+            (86399, "23h"),
+            (86400, "1d"),
+            (200_000, "2d"),
+        ] {
+            assert_eq!(format_age(secs), want, "{secs}");
+        }
+    }
+
+    #[test]
+    fn output_age_is_appended_only_when_present() {
+        let mut i = info(None, None, None);
+        let bare = session_line_at(&i, 1000);
+        assert!(!bare.contains("output:"));
+        i.last_output_unix_secs = Some(988);
+        assert_eq!(session_line_at(&i, 1000), format!("{bare}  output:12s"));
+        let mut done = info(Some(1), Some(0), Some("done"));
+        done.last_output_unix_secs = Some(0);
+        assert!(session_line_at(&done, 7200).ends_with("  output:2h"));
+    }
+
+    #[test]
+    fn json_carries_last_output_only_when_present() {
+        let mut i = info(None, None, None);
+        let v = sessions_json(std::slice::from_ref(&i)).unwrap();
+        assert!(v[0].get("last_output_unix_secs").is_none());
+        i.last_output_unix_secs = Some(42);
+        let v = sessions_json(&[i]).unwrap();
+        assert_eq!(v[0]["last_output_unix_secs"], 42);
     }
 
     #[test]
