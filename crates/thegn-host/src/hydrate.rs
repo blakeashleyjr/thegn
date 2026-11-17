@@ -3544,8 +3544,12 @@ pub(crate) fn build_panel(
     // is `/workspace` for every provider worktree of an env, so keying by it
     // shares one last-known row across siblings (worktree B's failed read
     // would fall back to A's branch + ahead/behind).
-    let (branch, ahead_behind, merge_info) =
-        crate::panel_header_cache::merge_header(&cache_key, branch, ahead_behind, merge_info);
+    let crate::panel_header_cache::HeaderMerge {
+        branch,
+        ahead_behind,
+        upstream: upstream_read,
+        merge: merge_info,
+    } = crate::panel_header_cache::merge_header(&cache_key, branch, ahead_behind, merge_info);
     let lists = crate::panel_header_cache::merge_lists(&cache_key, status, log, incoming);
     let mut panel = crate::panel::PanelData {
         branch,
@@ -3724,6 +3728,13 @@ pub(crate) fn build_panel(
 
     // Header zone: upstream divergence + merge-in-progress banner.
     panel.ahead_behind = ahead_behind;
+    panel.upstream_read = upstream_read;
+    // One indexed read; Err is surfaced as `zone ?`, never as "unzoned".
+    panel.zone = match thegn_core::store::ZoneStore::zone_of_worktree(db, &cwd.to_string_lossy()) {
+        Ok(Some(z)) => crate::panel::ZoneChip::Named(z.name),
+        Ok(None) => crate::panel::ZoneChip::Unzoned,
+        Err(_) => crate::panel::ZoneChip::Unknown,
+    };
     let unresolved = thegn_svc::git::conflict_count(&lists.status);
     // Host-path key (never `loc.path()` — see `worktree_cache_key`): two
     // provider worktrees sharing `/workspace` cross-contaminated each other's
