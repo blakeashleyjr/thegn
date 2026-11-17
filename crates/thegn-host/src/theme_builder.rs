@@ -1235,10 +1235,7 @@ impl ThemeBuilder {
                 .saturating_sub(strip + usize::from(strip > 0));
             // Marker + space take 2 cols and one col separates the kind, so the
             // kind stays visible however long the name is.
-            let name = seg::clip_end(
-                &item.name,
-                name_cols.saturating_sub(UnicodeWidthStr::width(kind) + 3),
-            );
+            let name = seg::clip_end(&item.name, name_cols.saturating_sub(kind.len() + 3));
             seg::draw_line(
                 surface,
                 inner.x,
@@ -1887,7 +1884,8 @@ mod tests {
         let name = &b.catalog[0].name;
         let row = text.lines().find(|l| l.contains(name.as_str())).unwrap();
         assert!(row.contains("builtin"), "{row:?}");
-        assert!(!row.contains('…'), "{row:?}");
+        let after = &row[row.find(name.as_str()).unwrap() + name.len()..];
+        assert!(after.trim_start().starts_with("builtin"), "{row:?}");
     }
 
     #[test]
