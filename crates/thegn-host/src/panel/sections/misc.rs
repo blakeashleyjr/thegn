@@ -29,6 +29,12 @@ pub(super) fn files(ctx: &SectionCtx) -> Vec<PanelRow> {
         &data.dir_changes
     };
     let mut rows: Vec<PanelRow> = Vec::new();
+    if let Some(note) = files_unavailable_note(data) {
+        rows.push(PanelRow::plain(Line::segs(vec![seg(
+            hue(Hue::Amber),
+            note,
+        )])));
+    }
 
     // Source: the tree hydration pre-built off-loop when available; fall back
     // to a changes-only tree (while the first hydration is still in flight).
@@ -161,6 +167,17 @@ pub(super) fn files(ctx: &SectionCtx) -> Vec<PanelRow> {
 }
 
 /// Number of actionable Files rows without rendering or allocating the rows.
+/// The note shown when the tracked-file listing failed (no hit target).
+fn files_unavailable_note(data: &crate::panel::PanelData) -> Option<String> {
+    match &data.files_load {
+        crate::panel::gitui::DocLoad::Failed(reason) => Some(format!(
+            "file list unavailable: {}; showing changed files",
+            display_cell(reason)
+        )),
+        _ => None,
+    }
+}
+
 pub(super) fn files_len(ctx: &SectionCtx) -> usize {
     if ctx.ui.file_preview.is_some() {
         return 0;
@@ -1758,5 +1775,70 @@ mod tests {
         );
         assert!(rendered.contains("boom"));
         assert!(!rendered.chars().any(char::is_control));
+    }
+
+    fn files_model(load: crate::panel::gitui::DocLoad) -> FrameModel {
+        let mut model = FrameModel::default();
+        model.panel.files_load = load;
+        model.panel.changes = vec![crate::panel::ChangeRow {
+            status: "M".into(),
+            dir: "src/".into(),
+            name: "a.rs".into(),
+            path: "src/a.rs".into(),
+            ..Default::default()
+        }];
+        model
+    }
+
+    #[test]
+    fn failed_file_list_shows_note_and_keeps_fallback_rows() {
+        let ui = PanelUi {
+            open: Section::Files,
+            ..PanelUi::default()
+        };
+        let ready = files_model(crate::panel::gitui::DocLoad::Ready);
+        let ctx = SectionCtx {
+            model: &ready,
+            ui: &ui,
+            cols: 100,
+            rows: 30,
+        };
+        let ready_len = files_len(&ctx);
+        assert!(!text(&files(&ctx)).contains("file list unavailable"));
+
+        let failed = files_model(crate::panel::gitui::DocLoad::Failed(
+            "git ls-files exited 128".into(),
+        ));
+        let ctx = SectionCtx {
+            model: &failed,
+            ui: &ui,
+            cols: 100,
+            rows: 30,
+        };
+        let rows = files(&ctx);
+        let rendered = text(&rows);
+        assert!(
+            rendered
+                .contains("file list unavailable: git ls-files exited 128; showing changed files"),
+            "{rendered}"
+        );
+        assert!(rendered.contains("a.rs"));
+        assert!(rows[0].hit.is_none(), "note row has no hit");
+        assert_eq!(files_len(&ctx), ready_len);
+    }
+
+    #[test]
+    fn failed_file_list_without_changes_still_shows_note() {
+        let mut model = files_model(crate::panel::gitui::DocLoad::Failed("boom".into()));
+        model.panel.changes.clear();
+        let ui = PanelUi::default();
+        let ctx = SectionCtx {
+            model: &model,
+            ui: &ui,
+            cols: 100,
+            rows: 30,
+        };
+        assert!(text(&files(&ctx)).contains("file list unavailable: boom"));
+        assert_eq!(files_len(&ctx), 0);
     }
 }
