@@ -3845,6 +3845,8 @@ enum GitAfter {
     /// conflict-file resolution — the user resolves markers, saves, then
     /// stages the file normally).
     OpenEditor(String),
+    /// Write this text to the system clipboard (OSC 52) from the loop body.
+    Clipboard(String),
 }
 
 struct TerminalLaunchDone {
@@ -4777,6 +4779,23 @@ fn handle_git_msg(
                     GitOp::Revert { sha: c.sha },
                 );
             }
+        }
+        GitMsg::CopySha => {
+            let shas: Vec<String> = gitui::selected_sources(&panel_ui.git, &model.panel)
+                .into_iter()
+                .filter_map(|i| model.panel.commits.get(i).map(|c| c.sha.clone()))
+                .collect();
+            panel_ui.git.sel_anchor = None;
+            if shas.is_empty() {
+                model.status = "no commit selected".into();
+                return GitAfter::None;
+            }
+            model.status = if shas.len() == 1 {
+                format!("Copied {}", &shas[0][..shas[0].len().min(7)])
+            } else {
+                format!("Copied {} shas", shas.len())
+            };
+            return GitAfter::Clipboard(shas.join("\n"));
         }
         GitMsg::CopyCommits => {
             let shas: Vec<String> = gitui::selected_sources(&panel_ui.git, &model.panel)
@@ -18671,28 +18690,41 @@ async fn event_loop<T: Terminal>(
                                                 confirm_op: &mut pending_confirm_op,
                                                 custom_cmds: &mut custom_menu_cmds,
                                             };
-                                            if let GitAfter::OpenEditor(path) = handle_git_msg(
+                                            match handle_git_msg(
                                                 GitMsg::Drill,
                                                 &mut panel_ui,
                                                 &mut model,
                                                 &wires,
                                                 &mut ov,
                                             ) {
-                                                let cwd = active_cwd(&session);
-                                                if open_editor(
-                                                    &mut session,
-                                                    &mut panes,
-                                                    keymap.config(),
-                                                    &path,
-                                                    None,
-                                                    cwd.as_deref(),
-                                                    chrome.center,
-                                                    None,
-                                                ) {
-                                                    focus.zone = crate::focus::Zone::Center;
+                                                GitAfter::OpenEditor(path) => {
+                                                    let cwd = active_cwd(&session);
+                                                    if open_editor(
+                                                        &mut session,
+                                                        &mut panes,
+                                                        keymap.config(),
+                                                        &path,
+                                                        None,
+                                                        cwd.as_deref(),
+                                                        chrome.center,
+                                                        None,
+                                                    ) {
+                                                        focus.zone = crate::focus::Zone::Center;
+                                                    }
+                                                    refresh_tab_model(
+                                                        &mut model, &session, &mut sb,
+                                                    );
+                                                    need_relayout = true;
                                                 }
-                                                refresh_tab_model(&mut model, &session, &mut sb);
-                                                need_relayout = true;
+                                                GitAfter::Clipboard(text) => {
+                                                    pending_clipboard_oob.offer(
+                                                        crate::copymode::osc52(&text),
+                                                        |bytes| {
+                                                            writer.try_submit_host_clipboard(bytes)
+                                                        },
+                                                    );
+                                                }
+                                                _ => {}
                                             }
                                             if widen_for_drill(&mut panel_ui) {
                                                 need_relayout = true;
@@ -21006,6 +21038,12 @@ async fn event_loop<T: Terminal>(
                                 }
                                 // Both arms spawn a command tab: the editor arm
                                 // just derives its command from the path first.
+                                GitAfter::Clipboard(text) => {
+                                    pending_clipboard_oob
+                                        .offer(crate::copymode::osc52(&text), |bytes| {
+                                            writer.try_submit_host_clipboard(bytes)
+                                        });
+                                }
                                 GitAfter::OpenEditor(path) => {
                                     let cwd = active_cwd(&session);
                                     if open_editor(
@@ -21083,6 +21121,12 @@ async fn event_loop<T: Terminal>(
                                     GitAfter::NewWorktree => {
                                         forced_palette_action =
                                             Some(crate::keymap::Action::NewWorktree);
+                                    }
+                                    GitAfter::Clipboard(text) => {
+                                        pending_clipboard_oob
+                                            .offer(crate::copymode::osc52(&text), |bytes| {
+                                                writer.try_submit_host_clipboard(bytes)
+                                            });
                                     }
                                     GitAfter::OpenEditor(path) => {
                                         let cwd = active_cwd(&session);
@@ -22560,6 +22604,11 @@ async fn event_loop<T: Terminal>(
                                 &waker,
                                 &mut model.status,
                             );
+                        }
+                        GitAfter::Clipboard(text) => {
+                            pending_clipboard_oob.offer(crate::copymode::osc52(&text), |bytes| {
+                                writer.try_submit_host_clipboard(bytes)
+                            });
                         }
                         GitAfter::OpenEditor(path) => {
                             let cwd = active_cwd(&session);
