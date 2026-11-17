@@ -2696,40 +2696,43 @@ impl ControlApi for DaemonService {
         note: thegn_svc::control::PushedNote,
     ) -> BoxFuture<'_, ControlResult<i64>> {
         Box::pin(async move {
-            self.with_db(move |db| {
-                let kind = if note.automation_origin.is_some() {
-                    "automation"
-                } else {
-                    match note.urgency.as_deref() {
-                        Some("alert") | Some("critical") => "agent_attention",
-                        _ => "agent_done",
-                    }
-                };
-                let source = note.source.as_deref().unwrap_or("api");
-                let message = if note.body.is_empty() {
-                    note.title.clone()
-                } else {
-                    format!("{} — {}", note.title, note.body)
-                };
-                crate::automation_events::emit_with_facts(
-                    db,
-                    kind,
-                    source,
-                    &message,
-                    "",
-                    crate::automation_events::EventFacts {
-                        origin: note.automation_origin.map(|origin| {
-                            thegn_core::automation::AutomationOrigin {
-                                root_event_id: origin.root_event_id,
-                                rule_id: origin.rule_id,
-                                run_id: origin.run_id,
-                            }
-                        }),
-                        ..Default::default()
-                    },
-                )
-            })
-            .await
+            let id = self
+                .with_db(move |db| {
+                    let kind = if note.automation_origin.is_some() {
+                        "automation"
+                    } else {
+                        match note.urgency.as_deref() {
+                            Some("alert") | Some("critical") => "agent_attention",
+                            _ => "agent_done",
+                        }
+                    };
+                    let source = note.source.as_deref().unwrap_or("api");
+                    let message = if note.body.is_empty() {
+                        note.title.clone()
+                    } else {
+                        format!("{} — {}", note.title, note.body)
+                    };
+                    crate::automation_events::emit_with_facts(
+                        db,
+                        kind,
+                        source,
+                        &message,
+                        "",
+                        crate::automation_events::EventFacts {
+                            origin: note.automation_origin.map(|origin| {
+                                thegn_core::automation::AutomationOrigin {
+                                    root_event_id: origin.root_event_id,
+                                    rule_id: origin.rule_id,
+                                    run_id: origin.run_id,
+                                }
+                            }),
+                            ..Default::default()
+                        },
+                    )
+                })
+                .await?;
+            super::lead_caps::feed::notification(&self.events, id);
+            Ok(id)
         })
     }
 
@@ -2743,32 +2746,35 @@ impl ControlApi for DaemonService {
                 .compiled_rules()
                 .map_err(|errors| ControlError::Conflict(errors.join("\n")))?;
             let profile = cfg.active_profile().is_some();
-            self.with_db(move |db| {
-                use thegn_core::store::AutomationStore;
-                Ok(rules
-                    .into_iter()
-                    .map(|rule| thegn_svc::control::AutomationRuleInfo {
-                        recent_outcome: db
-                            .automation_runs(Some(&rule.id), 1)
-                            .ok()
-                            .and_then(|rows| rows.into_iter().next())
-                            .map(|row| row.outcome),
-                        name: rule.id,
-                        enabled: rule.enabled,
-                        trusted_layer: if profile { "global+profile" } else { "global" }.into(),
-                        event: rule.event.as_str().into(),
-                        action: rule.action.cap,
-                        inert_reason: if !effective.enabled {
-                            Some("automations disabled".into())
-                        } else if !rule.enabled {
-                            Some("rule disabled".into())
-                        } else {
-                            None
-                        },
-                    })
-                    .collect())
-            })
-            .await
+            let mut rows = self
+                .with_db(move |db| {
+                    use thegn_core::store::AutomationStore;
+                    Ok(rules
+                        .into_iter()
+                        .map(|rule| thegn_svc::control::AutomationRuleInfo {
+                            recent_outcome: db
+                                .automation_runs(Some(&rule.id), 1)
+                                .ok()
+                                .and_then(|rows| rows.into_iter().next())
+                                .map(|row| row.outcome),
+                            name: rule.id,
+                            enabled: rule.enabled,
+                            trusted_layer: if profile { "global+profile" } else { "global" }.into(),
+                            event: rule.event.as_str().into(),
+                            action: rule.action.cap,
+                            inert_reason: if !effective.enabled {
+                                Some("automations disabled".into())
+                            } else if !rule.enabled {
+                                Some("rule disabled".into())
+                            } else {
+                                None
+                            },
+                        })
+                        .collect::<Vec<_>>())
+                })
+                .await?;
+            rows.extend(super::lead_caps::automations::list_lead_rules(self).await?);
+            Ok(rows)
         })
     }
 
@@ -2789,12 +2795,14 @@ impl ControlApi for DaemonService {
                 .effective_automations()
                 .compiled_rules()
                 .map_err(|errors| ControlError::Conflict(errors.join("\n")))?;
-            let rule = rules
-                .into_iter()
-                .find(|rule| rule.id == request.rule)
-                .ok_or_else(|| {
-                    ControlError::NotFound(format!("automation rule {}", request.rule))
-                })?;
+            let rule = match rules.into_iter().find(|rule| rule.id == request.rule) {
+                Some(rule) => rule,
+                None => super::lead_caps::automations::find_rule(self, &request.rule)
+                    .await?
+                    .ok_or_else(|| {
+                        ControlError::NotFound(format!("automation rule {}", request.rule))
+                    })?,
+            };
             let decisions = thegn_core::automation::evaluate(
                 std::slice::from_ref(&rule),
                 &event,
@@ -2842,6 +2850,85 @@ impl ControlApi for DaemonService {
             })
             .await
         })
+    }
+
+    // --- Lead tool surface (THE-2172): behaviour lives in daemon/lead_caps ---
+
+    fn overview_get(
+        &self,
+        req: serde_json::Value,
+    ) -> BoxFuture<'_, ControlResult<serde_json::Value>> {
+        Box::pin(super::lead_caps::overview::get(self, req))
+    }
+
+    fn notifications_list(
+        &self,
+        req: serde_json::Value,
+    ) -> BoxFuture<'_, ControlResult<serde_json::Value>> {
+        Box::pin(super::lead_caps::notifications::list(self, req))
+    }
+
+    fn notifications_ack(
+        &self,
+        req: serde_json::Value,
+    ) -> BoxFuture<'_, ControlResult<serde_json::Value>> {
+        Box::pin(super::lead_caps::notifications::ack(self, req))
+    }
+
+    fn automations_put(
+        &self,
+        req: serde_json::Value,
+    ) -> BoxFuture<'_, ControlResult<serde_json::Value>> {
+        Box::pin(super::lead_caps::automations::put(self, req))
+    }
+
+    fn automations_rm(
+        &self,
+        req: serde_json::Value,
+    ) -> BoxFuture<'_, ControlResult<serde_json::Value>> {
+        Box::pin(super::lead_caps::automations::rm(self, req))
+    }
+
+    fn automations_enable(
+        &self,
+        req: serde_json::Value,
+    ) -> BoxFuture<'_, ControlResult<serde_json::Value>> {
+        Box::pin(super::lead_caps::automations::enable(self, req))
+    }
+
+    fn automations_runs(
+        &self,
+        req: serde_json::Value,
+    ) -> BoxFuture<'_, ControlResult<serde_json::Value>> {
+        Box::pin(super::lead_caps::automations::runs(self, req))
+    }
+
+    fn approvals_list(
+        &self,
+        req: serde_json::Value,
+    ) -> BoxFuture<'_, ControlResult<serde_json::Value>> {
+        Box::pin(super::lead_caps::approvals::list(self, req))
+    }
+
+    fn approvals_request(
+        &self,
+        req: serde_json::Value,
+    ) -> BoxFuture<'_, ControlResult<serde_json::Value>> {
+        Box::pin(super::lead_caps::approvals::request(self, req))
+    }
+
+    fn approvals_resolve(
+        &self,
+        req: serde_json::Value,
+    ) -> BoxFuture<'_, ControlResult<serde_json::Value>> {
+        Box::pin(super::lead_caps::approvals::resolve(self, req))
+    }
+
+    fn merge_drain(
+        &self,
+        req: serde_json::Value,
+    ) -> BoxFuture<'_, ControlResult<serde_json::Value>> {
+        Box::pin(super::lead_caps::merge_drain::drain(self, req))
     }
 
     fn lease_status(&self) -> BoxFuture<'_, ControlResult<Vec<LeaseRow>>> {
@@ -3050,44 +3137,47 @@ impl ControlApi for DaemonService {
                 }
             };
             let stage_order = self.config.pipeline.stage_names();
-            self.with_db(move |db| {
-                use thegn_core::store::NotificationStore;
-                if let Some(parent_id) = req.parent_id
-                    && let Some(parent) = db.get_dispatch(parent_id)?
-                    && let Err(conflict) = thegn_core::db::check_parent_stage(
-                        &stage_order,
-                        parent.stage.as_deref(),
-                        req.stage.as_deref(),
-                    )
-                {
-                    return Err(anyhow::Error::new(thegn_core::db::ParentDispatchConflict {
-                        parent_id,
-                        reason: conflict.reason,
-                    }));
-                }
-                let id = db.put_dispatch_with_parent_check_led(
-                    thegn_core::issue::NewDispatch {
-                        issue_id: &issue_id,
-                        worktree_path: &worktree_path,
-                        agent_name: &req.agent_name,
-                        stage: req.stage.as_deref(),
-                        parent_id: req.parent_id,
-                        session_id: req.session_id.as_deref(),
-                        artifact_path: req.artifact_path.as_deref(),
-                        chunk_path: None,
-                    },
-                    req.lead
-                        .as_ref()
-                        .map_or(thegn_core::db::LeadProof::Unbound, |lead| lead.proof()),
-                )?;
-                db.get_dispatch(id)?
-                    .ok_or_else(|| anyhow::anyhow!("dispatch {id} vanished after insert"))
-            })
-            .await
-            .map_err(|error| match error {
-                ControlError::Internal(error) => map_dispatch_put_error(error),
-                other => other,
-            })
+            let dispatch = self
+                .with_db(move |db| {
+                    use thegn_core::store::NotificationStore;
+                    if let Some(parent_id) = req.parent_id
+                        && let Some(parent) = db.get_dispatch(parent_id)?
+                        && let Err(conflict) = thegn_core::db::check_parent_stage(
+                            &stage_order,
+                            parent.stage.as_deref(),
+                            req.stage.as_deref(),
+                        )
+                    {
+                        return Err(anyhow::Error::new(thegn_core::db::ParentDispatchConflict {
+                            parent_id,
+                            reason: conflict.reason,
+                        }));
+                    }
+                    let id = db.put_dispatch_with_parent_check_led(
+                        thegn_core::issue::NewDispatch {
+                            issue_id: &issue_id,
+                            worktree_path: &worktree_path,
+                            agent_name: &req.agent_name,
+                            stage: req.stage.as_deref(),
+                            parent_id: req.parent_id,
+                            session_id: req.session_id.as_deref(),
+                            artifact_path: req.artifact_path.as_deref(),
+                            chunk_path: None,
+                        },
+                        req.lead
+                            .as_ref()
+                            .map_or(thegn_core::db::LeadProof::Unbound, |lead| lead.proof()),
+                    )?;
+                    db.get_dispatch(id)?
+                        .ok_or_else(|| anyhow::anyhow!("dispatch {id} vanished after insert"))
+                })
+                .await
+                .map_err(|error| match error {
+                    ControlError::Internal(error) => map_dispatch_put_error(error),
+                    other => other,
+                })?;
+            super::lead_caps::feed::dispatch_status(&self.events, dispatch.id);
+            Ok(dispatch)
         })
     }
 
@@ -3104,7 +3194,9 @@ impl ControlApi for DaemonService {
             .map_err(|error| match error {
                 ControlError::Internal(error) => map_dispatch_status_error(error),
                 other => other,
-            })
+            })?;
+            super::lead_caps::feed::dispatch_status(&self.events, id);
+            Ok(())
         })
     }
 
@@ -3120,7 +3212,9 @@ impl ControlApi for DaemonService {
                 .map_err(|error| match error {
                     ControlError::Internal(error) => map_dispatch_status_error(error),
                     other => other,
-                })
+                })?;
+            super::lead_caps::feed::dispatch_status(&self.events, id);
+            Ok(())
         })
     }
 
