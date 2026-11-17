@@ -11,15 +11,40 @@ pub mod files;
 pub mod pty;
 pub mod stream;
 
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::fmt;
-use std::sync::Mutex;
+use std::path::PathBuf;
+use std::sync::{LazyLock, Mutex};
+use std::time::Duration;
 
-use anyhow::{Result, anyhow};
+use anyhow::{Context, Result, anyhow, bail};
 use futures_util::future::BoxFuture;
-use thegn_core::vercel::api::{SandboxView, Scope};
+use thegn_core::vercel::api::{self, SandboxView, Scope, SessionStatus};
+use thegn_core::vercel::{admit, policy};
 
-use crate::provider::{InventoryReport, PolicyRule, ProviderEgress, RemoteProvider, SandboxHandle};
+use crate::provider::{
+    ExecKind, InventoryReport, PolicyRule, ProviderEgress, RemoteProvider, SandboxHandle,
+    SandboxInfo,
+};
+use crate::vps::registry;
+
+/// The ledger `provider` value and the account-fingerprint kind.
+const LEDGER_PROVIDER: &str = "vercel";
+/// Every thegn-created sandbox name starts with this (the list `namePrefix`).
+const NAME_PREFIX: &str = "tg-";
+/// The stable error text for a stopped sandbox under [`Wake::Never`]; the
+/// `vercel-exec` bridge maps it to exit 75.
+pub const STOPPED_TEXT: &str = "vercel sandbox stopped";
+/// The most list pages one inventory read follows; a hit is `Partial`.
+const MAX_LIST_PAGES: usize = 50;
+/// How long a resume (or a pending session) may take to reach `running`.
+const RESUME_BUDGET: Duration = Duration::from_secs(120);
+/// The status poll interval while waiting for `running`.
+const POLL_INTERVAL: Duration = Duration::from_secs(2);
+/// The captured-output cap of a one-shot command.
+const EXEC_OUT_CAP: usize = 4 << 20;
+/// The legal vCPU counts.
+const LEGAL_VCPUS: [u32; 6] = [1, 2, 4, 8, 16, 32];
 
 /// Whether a call may resume a stopped sandbox (which buys compute).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -70,23 +95,301 @@ pub struct VercelSpec {
     pub max_lifetime_secs: u64,
 }
 
-fn not_built() -> anyhow::Error {
-    anyhow!("vercel: not implemented in this lane")
+/// The control-plane calls the provider makes. [`client::VercelClient`] is the
+/// production implementation; unit tests substitute an in-memory fake.
+trait Api: Send + Sync {
+    fn create<'a>(&'a self, body: &'a serde_json::Value) -> BoxFuture<'a, Result<SandboxView>>;
+    fn get<'a>(&'a self, name: &'a str, resume: bool)
+    -> BoxFuture<'a, Result<Option<SandboxView>>>;
+    fn list_page<'a>(
+        &'a self,
+        cursor: Option<&'a str>,
+        name_prefix: &'a str,
+    ) -> BoxFuture<'a, Result<(Vec<SandboxView>, Option<String>)>>;
+    fn delete<'a>(&'a self, name: &'a str) -> BoxFuture<'a, Result<()>>;
+    fn stop<'a>(&'a self, session: &'a str) -> BoxFuture<'a, Result<()>>;
+    fn extend<'a>(
+        &'a self,
+        session: &'a str,
+        ms: u64,
+    ) -> BoxFuture<'a, Result<client::ExtendOutcome>>;
+    fn set_network_policy<'a>(
+        &'a self,
+        name: &'a str,
+        body: &'a serde_json::Value,
+    ) -> BoxFuture<'a, Result<()>>;
+    fn run_wait<'a>(
+        &'a self,
+        session: &'a str,
+        body: &'a serde_json::Value,
+        out_cap: usize,
+    ) -> BoxFuture<'a, Result<(i32, Vec<u8>)>>;
+    fn snapshots_for<'a>(&'a self, name: &'a str) -> BoxFuture<'a, Result<Vec<String>>>;
+    fn delete_snapshot<'a>(&'a self, id: &'a str) -> BoxFuture<'a, Result<()>>;
+}
+
+impl Api for client::VercelClient {
+    fn create<'a>(&'a self, body: &'a serde_json::Value) -> BoxFuture<'a, Result<SandboxView>> {
+        Box::pin(client::VercelClient::create(self, body))
+    }
+    fn get<'a>(
+        &'a self,
+        name: &'a str,
+        resume: bool,
+    ) -> BoxFuture<'a, Result<Option<SandboxView>>> {
+        Box::pin(client::VercelClient::get(self, name, resume))
+    }
+    fn list_page<'a>(
+        &'a self,
+        cursor: Option<&'a str>,
+        name_prefix: &'a str,
+    ) -> BoxFuture<'a, Result<(Vec<SandboxView>, Option<String>)>> {
+        Box::pin(client::VercelClient::list_page(self, cursor, name_prefix))
+    }
+    fn delete<'a>(&'a self, name: &'a str) -> BoxFuture<'a, Result<()>> {
+        Box::pin(client::VercelClient::delete(self, name))
+    }
+    fn stop<'a>(&'a self, session: &'a str) -> BoxFuture<'a, Result<()>> {
+        Box::pin(client::VercelClient::stop(self, session))
+    }
+    fn extend<'a>(
+        &'a self,
+        session: &'a str,
+        ms: u64,
+    ) -> BoxFuture<'a, Result<client::ExtendOutcome>> {
+        Box::pin(client::VercelClient::extend(self, session, ms))
+    }
+    fn set_network_policy<'a>(
+        &'a self,
+        name: &'a str,
+        body: &'a serde_json::Value,
+    ) -> BoxFuture<'a, Result<()>> {
+        Box::pin(client::VercelClient::set_network_policy(self, name, body))
+    }
+    fn run_wait<'a>(
+        &'a self,
+        session: &'a str,
+        body: &'a serde_json::Value,
+        out_cap: usize,
+    ) -> BoxFuture<'a, Result<(i32, Vec<u8>)>> {
+        Box::pin(client::VercelClient::run_wait(self, session, body, out_cap))
+    }
+    fn snapshots_for<'a>(&'a self, name: &'a str) -> BoxFuture<'a, Result<Vec<String>>> {
+        Box::pin(client::VercelClient::snapshots_for(self, name))
+    }
+    fn delete_snapshot<'a>(&'a self, id: &'a str) -> BoxFuture<'a, Result<()>> {
+        Box::pin(client::VercelClient::delete_snapshot(self, id))
+    }
+}
+
+/// Serializes vercel creates in this process, so two concurrent creates
+/// cannot both pass the remote hard-cap count before either reserves.
+static CREATE_LOCK: LazyLock<tokio::sync::Mutex<()>> =
+    LazyLock::new(|| tokio::sync::Mutex::new(()));
+
+/// Sandboxes already warned about reaching the plan's extension ceiling (one
+/// `warn` per process per sandbox).
+static CEILING_WARNED: LazyLock<Mutex<HashSet<String>>> =
+    LazyLock::new(|| Mutex::new(HashSet::new()));
+
+/// Removes a freshly reserved intent unless creation reached the POST (the
+/// `_at` twin of `registry::IntentGuard`, bound to this provider's ledger dir).
+struct IntentGuard {
+    dir: PathBuf,
+    name: String,
+    armed: bool,
+}
+
+impl IntentGuard {
+    fn preserve(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for IntentGuard {
+    fn drop(&mut self) {
+        if self.armed {
+            registry::remove_at(&self.dir, &self.name);
+        }
+    }
+}
+
+/// The admission `VercelProvider::new` runs: scope ids, the sandbox name (when
+/// set) and the vCPU count. Errors carry a field and a fixed reason only.
+fn admit_spec(spec: &VercelSpec) -> Result<()> {
+    if !admit::valid_team_id(spec.scope.team_id.trim()) {
+        bail!("vercel: provider.team_id must look like team_<alphanumeric>");
+    }
+    if !admit::valid_project_id(spec.scope.project_id.trim()) {
+        bail!("vercel: provider.project_id must look like prj_<alphanumeric>");
+    }
+    if !spec.name.is_empty() && !admit::valid_sandbox_name(&spec.name) {
+        bail!("vercel: the sandbox name is not a valid vercel sandbox name");
+    }
+    if !LEGAL_VCPUS.contains(&spec.vcpus) {
+        bail!("vercel: provider.size must be one of 1, 2, 4, 8, 16 or 32 vCPUs");
+    }
+    Ok(())
+}
+
+/// A name the provider may address: refuses anything else before any request.
+fn checked_name(name: &str) -> Result<&str> {
+    if admit::valid_sandbox_name(name) {
+        Ok(name)
+    } else {
+        Err(anyhow!("vercel: invalid sandbox name"))
+    }
+}
+
+/// The HTTP status a control-plane error carries, if it names one: a
+/// `reqwest` status in the chain, else a 3-digit code after `(`, `HTTP ` or
+/// `status ` in the rendered text (`… failed (422 Unprocessable Entity)`).
+fn error_status(err: &anyhow::Error) -> Option<u16> {
+    for cause in err.chain() {
+        if let Some(status) = cause
+            .downcast_ref::<reqwest::Error>()
+            .and_then(reqwest::Error::status)
+        {
+            return Some(status.as_u16());
+        }
+    }
+    let text = format!("{err:#}");
+    for marker in ["HTTP ", "(", "status "] {
+        let mut rest = text.as_str();
+        while let Some(at) = rest.find(marker) {
+            rest = &rest[at + marker.len()..];
+            let digits: String = rest.chars().take_while(char::is_ascii_digit).collect();
+            if digits.len() == 3 {
+                return Result::ok(digits.parse());
+            }
+        }
+    }
+    None
+}
+
+/// A definite client-side rejection of a create: the request was refused, so
+/// no resource exists. 408/429 are transient (the create may still land) and
+/// 409 means a sandbox with this name already exists (perhaps ours), so none of
+/// those count.
+fn definite_create_rejection(err: &anyhow::Error) -> bool {
+    error_status(err)
+        .is_some_and(|code| (400..500).contains(&code) && ![408, 409, 429].contains(&code))
+}
+
+/// Env keys a sandbox command may receive: terminal identity and `THEGN_*`
+/// context, never anything credential-shaped. Everything else is dropped.
+pub(crate) fn env_key_allowed(key: &str) -> bool {
+    if matches!(key, "TERM" | "LANG" | "LC_ALL" | "COLORTERM") {
+        return true;
+    }
+    if !key.starts_with("THEGN_") {
+        return false;
+    }
+    let upper = key.to_ascii_uppercase();
+    !["TOKEN", "SECRET", "KEY", "PASSWORD", "CREDENTIAL"]
+        .iter()
+        .any(|deny| upper.contains(deny))
+}
+
+/// The allowlisted subset of `env`; dropped keys are traced by name only.
+pub(crate) fn env_allowlisted(env: &[(String, String)]) -> Vec<(String, String)> {
+    let mut kept = Vec::new();
+    let mut dropped = Vec::new();
+    for (key, value) in env {
+        if env_key_allowed(key) {
+            kept.push((key.clone(), value.clone()));
+        } else {
+            dropped.push(key.as_str());
+        }
+    }
+    if !dropped.is_empty() {
+        tracing::debug!(keys = ?dropped, "vercel: dropped env keys outside the allowlist");
+    }
+    kept
+}
+
+fn now_ms() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()
+        .and_then(|d| i64::try_from(d.as_millis()).ok())
+        .unwrap_or(0)
+}
+
+/// The tag keys under which `tags_for` records the controller id.
+fn controller_tag_keys(controller: &str) -> Vec<String> {
+    policy::tags_for(controller, "", "")
+        .into_iter()
+        .filter(|(_, value)| value == controller)
+        .map(|(key, _)| key)
+        .collect()
+}
+
+/// Whether `view` carries this controller's ownership tag.
+fn is_ours(view: &SandboxView, controller: &str, keys: &[String]) -> bool {
+    if !view.name.starts_with(NAME_PREFIX) || controller.is_empty() {
+        return false;
+    }
+    if keys.is_empty() {
+        view.tags.values().any(|value| value == controller)
+    } else {
+        keys.iter()
+            .any(|key| view.tags.get(key).is_some_and(|value| value == controller))
+    }
+}
+
+fn status_text(status: SessionStatus) -> String {
+    format!("{status:?}").to_ascii_lowercase()
+}
+
+/// The fleet row for one listed sandbox. Every network number is checked.
+fn sandbox_info(view: &SandboxView) -> SandboxInfo {
+    SandboxInfo {
+        id: view.name.clone(),
+        name: Some(view.name.clone()),
+        state: Some(status_text(view.status)),
+        size: view
+            .vcpus
+            .filter(|vcpus| LEGAL_VCPUS.contains(vcpus))
+            .map(policy::size_key),
+        region: view.region.clone(),
+        created_at_ms: view.created_at_ms.filter(|ms| *ms > 0),
+    }
+}
+
+/// The ledger `created_at` (unix seconds) from a provider `createdAt` in ms.
+fn created_at_secs(created_at_ms: Option<i64>) -> i64 {
+    created_at_ms
+        .filter(|ms| *ms > 0)
+        .and_then(|ms| ms.checked_div(1000))
+        .filter(|secs| *secs > 0)
+        .unwrap_or_else(thegn_core::util::now)
 }
 
 /// The Vercel provider. The token lives only in `client`; `spec.token` is
 /// emptied at construction.
-#[allow(dead_code)] // spine stub, filled by lane 4
 pub struct VercelProvider {
     spec: VercelSpec,
     client: client::VercelClient,
     owner: Option<String>,
     /// name -> current session id (in-process cache only).
     sessions: Mutex<HashMap<String, String>>,
+    /// name -> (session id, estimated expiry in unix ms). Sessions this process
+    /// did not start are estimated as already due, so the bridge extends early
+    /// rather than late (the lifetime ceiling still bounds every extension).
+    expiry: Mutex<HashMap<String, (String, i64)>>,
+    /// name -> the network rules last applied by this process.
+    policies: Mutex<HashMap<String, Vec<PolicyRule>>>,
+    /// The ledger directory (`None` ⇒ `registry::dir()`).
+    ledger_dir: Option<PathBuf>,
+    poll: Duration,
+    #[cfg(test)]
+    fake: Option<std::sync::Arc<dyn Api>>,
 }
 
 impl VercelProvider {
     pub fn new(mut spec: VercelSpec) -> Result<Self> {
+        admit_spec(&spec)?;
         let token = std::mem::replace(&mut spec.token, VercelToken::new(String::new()));
         let base = if spec.api_base.trim().is_empty() {
             thegn_core::vercel::api::DEFAULT_API_BASE.to_string()
@@ -99,7 +402,40 @@ impl VercelProvider {
             client,
             owner: None,
             sessions: Mutex::new(HashMap::new()),
+            expiry: Mutex::new(HashMap::new()),
+            policies: Mutex::new(HashMap::new()),
+            ledger_dir: None,
+            poll: POLL_INTERVAL,
+            #[cfg(test)]
+            fake: None,
         })
+    }
+
+    /// A provider driving `fake` instead of the HTTP client, with its ledger
+    /// at `ledger_dir`.
+    #[cfg(test)]
+    fn with_client_for_test(
+        spec: VercelSpec,
+        fake: std::sync::Arc<dyn Api>,
+        ledger_dir: PathBuf,
+    ) -> Result<Self> {
+        let mut provider = Self::new(spec)?;
+        provider.fake = Some(fake);
+        provider.ledger_dir = Some(ledger_dir);
+        provider.poll = Duration::from_millis(1);
+        Ok(provider)
+    }
+
+    fn api(&self) -> &dyn Api {
+        #[cfg(test)]
+        if let Some(fake) = self.fake.as_deref() {
+            return fake;
+        }
+        &self.client
+    }
+
+    fn ledger_dir(&self) -> PathBuf {
+        self.ledger_dir.clone().unwrap_or_else(registry::dir)
     }
 
     pub fn with_owner(mut self, owner: String) -> Self {
@@ -111,93 +447,622 @@ impl VercelProvider {
         self.owner.as_deref()
     }
 
-    /// Value-free account fingerprint for the ledger. Spine stub, filled by
-    /// lane 4.
-    pub fn account(&self) -> Result<String> {
-        Err(not_built())
+    fn api_base(&self) -> &str {
+        let base = self.spec.api_base.trim();
+        if base.is_empty() {
+            thegn_core::vercel::api::DEFAULT_API_BASE
+        } else {
+            base
+        }
     }
 
-    /// `thegn fleet` inventory. Never creates or resumes. Spine stub, filled
-    /// by lane 4.
+    /// Value-free account fingerprint for the ledger: the API authority, team
+    /// and project, and the credential ref name (never the token).
+    pub fn account(&self) -> Result<String> {
+        let authority = crate::provider::authority_key(self.api_base())?;
+        let scope = format!(
+            "{authority}/{}/{}",
+            self.spec.scope.team_id.trim(),
+            self.spec.scope.project_id.trim()
+        );
+        Ok(registry::account_fingerprint(
+            LEDGER_PROVIDER,
+            &scope,
+            &self.spec.credential_ref,
+        ))
+    }
+
+    async fn controller(&self) -> Result<String> {
+        tokio::task::spawn_blocking(crate::vps::controller::controller_id)
+            .await
+            .context("vercel: controller id worker failed")?
+    }
+
+    /// Our tagged sandboxes from the paged `namePrefix = "tg-"` listing. A page
+    /// cap hit is `Partial`; a failed or looping listing is `Unknown`.
+    async fn listed(&self, controller: &str) -> crate::vps::Inventory<SandboxView> {
+        use crate::vps::{Inventory, PartialReason};
+        let keys = controller_tag_keys(controller);
+        let mut rows: Vec<SandboxView> = Vec::new();
+        let mut seen = BTreeSet::new();
+        let mut cursors = HashSet::new();
+        let mut cursor: Option<String> = None;
+        for _ in 0..MAX_LIST_PAGES {
+            let (page, next) = match self.api().list_page(cursor.as_deref(), NAME_PREFIX).await {
+                Ok(page) => page,
+                Err(error) => {
+                    return Inventory::Unknown(format!(
+                        "vercel: sandbox listing failed: {error:#}"
+                    ));
+                }
+            };
+            for view in page {
+                if !is_ours(&view, controller, &keys) {
+                    continue;
+                }
+                if !seen.insert(view.name.clone()) {
+                    return Inventory::Partial {
+                        rows,
+                        reason: PartialReason::DuplicateId,
+                    };
+                }
+                rows.push(view);
+            }
+            match next {
+                None => return Inventory::Complete(rows),
+                Some(next) => {
+                    if !cursors.insert(next.clone()) {
+                        return Inventory::Unknown(
+                            "vercel: sandbox listing repeated a cursor".into(),
+                        );
+                    }
+                    cursor = Some(next);
+                }
+            }
+        }
+        Inventory::Partial {
+            rows,
+            reason: PartialReason::PageCap,
+        }
+    }
+
+    /// Our sandbox names (the `list()` view).
+    pub async fn list_inventory(&self) -> crate::vps::Inventory<String> {
+        let controller = match self.controller().await {
+            Ok(controller) => controller,
+            Err(error) => return crate::vps::Inventory::Unknown(format!("{error:#}")),
+        };
+        self.listed(&controller).await.map_rows(|view| view.name)
+    }
+
+    /// `thegn fleet` inventory. Never creates or resumes.
     pub async fn sandbox_inventory(&self) -> Result<InventoryReport> {
-        Err(not_built())
+        let controller = self.controller().await?;
+        let listed = self.listed(&controller).await;
+        InventoryReport::from_inventory(listed.map_rows(|view| sandbox_info(&view)))
+    }
+
+    fn remember_session(&self, name: &str, session: &str, started_here: bool) {
+        self.sessions
+            .lock()
+            .unwrap()
+            .insert(name.to_string(), session.to_string());
+        let mut expiry = self.expiry.lock().unwrap();
+        let fresh = expiry.get(name).is_none_or(|(known, _)| known != session);
+        if started_here || fresh {
+            // A session this process did not start is treated as already due.
+            let est = if started_here {
+                now_ms().saturating_add(policy::INITIAL_TIMEOUT_MS as i64)
+            } else {
+                now_ms()
+            };
+            expiry.insert(name.to_string(), (session.to_string(), est));
+        }
+    }
+
+    fn forget_session(&self, name: &str) {
+        self.sessions.lock().unwrap().remove(name);
+        self.expiry.lock().unwrap().remove(name);
     }
 
     /// The current session id for `name`, resuming only under
-    /// [`Wake::Allow`]. Spine stub, filled by lane 4.
-    pub async fn session_for(&self, _name: &str, _wake: Wake) -> Result<String> {
-        Err(not_built())
+    /// [`Wake::Allow`]. A pending session is waited for (it is already
+    /// billing); a stopped one under [`Wake::Never`] is [`STOPPED_TEXT`].
+    pub async fn session_for(&self, name: &str, wake: Wake) -> Result<String> {
+        checked_name(name)?;
+        let deadline = tokio::time::Instant::now() + RESUME_BUDGET;
+        let mut resumed = false;
+        loop {
+            let view = self
+                .api()
+                .get(name, false)
+                .await?
+                .ok_or_else(|| anyhow!("vercel: sandbox {name} not found"))?;
+            match view.status {
+                SessionStatus::Running => {
+                    if let Some(session) = view.session_id.as_deref() {
+                        self.remember_session(name, session, resumed);
+                        return Ok(session.to_string());
+                    }
+                }
+                SessionStatus::Pending => {}
+                SessionStatus::Stopped | SessionStatus::Failed | SessionStatus::Aborted => {
+                    if wake == Wake::Never {
+                        self.forget_session(name);
+                        bail!(STOPPED_TEXT);
+                    }
+                    if !resumed {
+                        resumed = true;
+                        self.forget_session(name);
+                        let view =
+                            self.api().get(name, true).await?.ok_or_else(|| {
+                                anyhow!("vercel: sandbox {name} not found on resume")
+                            })?;
+                        if view.status == SessionStatus::Running
+                            && let Some(session) = view.session_id.as_deref()
+                        {
+                            self.remember_session(name, session, true);
+                            return Ok(session.to_string());
+                        }
+                    }
+                }
+                SessionStatus::Stopping | SessionStatus::Snapshotting | SessionStatus::Unknown => {
+                    if wake == Wake::Never {
+                        self.forget_session(name);
+                        bail!(STOPPED_TEXT);
+                    }
+                }
+            }
+            if tokio::time::Instant::now() >= deadline {
+                bail!("vercel: sandbox {name} did not reach running within 120s");
+            }
+            tokio::time::sleep(self.poll).await;
+        }
     }
 
-    /// Resume a stopped sandbox. Spine stub, filled by lane 4.
-    pub async fn resume(&self, _name: &str) -> Result<()> {
-        Err(not_built())
+    /// Resume a stopped sandbox.
+    pub async fn resume(&self, name: &str) -> Result<()> {
+        self.session_for(name, Wake::Allow).await.map(|_| ())
     }
 
     /// Stop the current session (compute to $0; the filesystem persists).
-    /// Spine stub, filled by lane 4.
-    pub async fn stop_session(&self, _name: &str) -> Result<()> {
-        Err(not_built())
+    /// Never resumes; an already stopped or missing sandbox is success.
+    pub async fn stop_session(&self, name: &str) -> Result<()> {
+        checked_name(name)?;
+        let Some(view) = self.api().get(name, false).await? else {
+            self.forget_session(name);
+            return Ok(());
+        };
+        if matches!(view.status, SessionStatus::Running | SessionStatus::Pending)
+            && let Some(session) = view.session_id.as_deref()
+        {
+            self.api().stop(session).await?;
+        }
+        self.forget_session(name);
+        Ok(())
     }
 
-    /// Extend the session timeout when due (bridge-only). Spine stub, filled
-    /// by lane 4.
-    pub async fn extend_if_due(&self, _name: &str) -> Result<Option<u64>> {
-        Err(not_built())
+    /// Extend the session timeout when due (bridge-only). `Some(ms)` is the
+    /// extension made; `None` = not due, not running, unbounded by a known
+    /// creation time, or at the plan ceiling (warned once per sandbox).
+    pub async fn extend_if_due(&self, name: &str) -> Result<Option<u64>> {
+        checked_name(name)?;
+        if CEILING_WARNED.lock().unwrap().contains(name) {
+            return Ok(None);
+        }
+        let Some(view) = self.api().get(name, false).await? else {
+            return Ok(None);
+        };
+        let (SessionStatus::Running, Some(session)) = (view.status, view.session_id.as_deref())
+        else {
+            return Ok(None);
+        };
+        // Without a creation time the lifetime ceiling cannot bound us.
+        let Some(created_at_ms) = view.created_at_ms.filter(|ms| *ms > 0) else {
+            return Ok(None);
+        };
+        self.remember_session(name, session, false);
+        let est = self
+            .expiry
+            .lock()
+            .unwrap()
+            .get(name)
+            .map(|(_, est)| *est)
+            .unwrap_or_else(now_ms);
+        let Some(ms) = policy::next_extension(
+            now_ms(),
+            est,
+            created_at_ms,
+            policy::max_lifetime_secs(self.spec.max_lifetime_secs),
+        ) else {
+            return Ok(None);
+        };
+        match self.api().extend(session, ms).await? {
+            client::ExtendOutcome::Extended => {
+                if let Some((_, est)) = self.expiry.lock().unwrap().get_mut(name) {
+                    let step = i64::try_from(ms).unwrap_or(i64::MAX);
+                    *est = est.saturating_add(step);
+                }
+                Ok(Some(ms))
+            }
+            client::ExtendOutcome::AtCeiling => {
+                if CEILING_WARNED.lock().unwrap().insert(name.to_string()) {
+                    tracing::warn!(
+                        sandbox = %name,
+                        "vercel: session timeout is at the plan ceiling; no further extensions"
+                    );
+                }
+                Ok(None)
+            }
+        }
     }
 
-    /// One-shot command: `(exit_code, output)`. Spine stub, filled by lane 4.
+    /// One-shot command: `(exit_code, output)`. The env is allowlisted.
     pub async fn run_exec(
         &self,
-        _name: &str,
-        _argv: &[String],
-        _cwd: Option<&str>,
-        _env: &[(String, String)],
-        _wake: Wake,
+        name: &str,
+        argv: &[String],
+        cwd: Option<&str>,
+        env: &[(String, String)],
+        wake: Wake,
     ) -> Result<(i32, String)> {
-        Err(not_built())
+        let session = self.session_for(name, wake).await?;
+        let env = env_allowlisted(env);
+        let body = api::command_body(argv, cwd, &env, true)
+            .map_err(|e| anyhow!("vercel: command refused: {e}"))?;
+        let (code, out) = self.api().run_wait(&session, &body, EXEC_OUT_CAP).await?;
+        Ok((code, String::from_utf8_lossy(&out).into_owned()))
     }
 
-    /// Delete the sandbox and its snapshots. Spine stub, filled by lane 4.
-    pub async fn delete_with_snapshots(&self, _name: &str) -> Result<()> {
-        Err(not_built())
+    /// Delete the sandbox, then every snapshot of it (404-tolerant). Never
+    /// checkpoints first.
+    pub async fn delete_with_snapshots(&self, name: &str) -> Result<()> {
+        checked_name(name)?;
+        match self.api().get(name, false).await? {
+            Some(view) => {
+                let controller = self.controller().await?;
+                let keys = controller_tag_keys(&controller);
+                if !is_ours(&view, &controller, &keys) {
+                    bail!(
+                        "vercel: refusing to delete {name}: it does not carry this thegn controller's tag"
+                    );
+                }
+                self.api().delete(name).await?;
+            }
+            None => {
+                // Already gone: only clear snapshots of a name our ledger holds.
+                let dir = self.ledger_dir();
+                let owned = name.to_string();
+                let recorded = tokio::task::spawn_blocking(move || registry::read_at(&dir, &owned))
+                    .await
+                    .context("vercel: ledger worker failed")?
+                    .is_some_and(|r| r.provider == LEDGER_PROVIDER);
+                if !recorded {
+                    self.forget_session(name);
+                    return Ok(());
+                }
+            }
+        }
+        self.forget_session(name);
+        self.policies.lock().unwrap().remove(name);
+        let snapshots = self.api().snapshots_for(name).await?;
+        let mut failed = 0usize;
+        for id in &snapshots {
+            if let Err(error) = self.api().delete_snapshot(id).await {
+                failed = failed.saturating_add(1);
+                tracing::warn!(sandbox = %name, "vercel: snapshot delete failed: {error:#}");
+            }
+        }
+        if failed > 0 {
+            bail!(
+                "vercel: {failed} of {} snapshots of {name} could not be deleted",
+                snapshots.len()
+            );
+        }
+        Ok(())
     }
 
-    /// The reaper's read of one sandbox (never resumes). Spine stub, filled by
-    /// lane 4.
-    pub async fn reaper_view(&self, _name: &str) -> Result<Option<SandboxView>> {
-        Err(not_built())
+    /// The reaper's read of one sandbox (never resumes).
+    pub async fn reaper_view(&self, name: &str) -> Result<Option<SandboxView>> {
+        checked_name(name)?;
+        self.api().get(name, false).await
+    }
+
+    /// Ledger names of vercel records counting against this account.
+    async fn ledger_vercel_names(&self, account: &str) -> Result<Vec<String>> {
+        let dir = self.ledger_dir();
+        let account = account.to_string();
+        tokio::task::spawn_blocking(move || {
+            registry::list_at(&dir)
+                .into_iter()
+                .filter(|r| r.provider == LEDGER_PROVIDER)
+                .filter(|r| r.account.is_empty() || account.is_empty() || r.account == account)
+                .map(|r| r.name)
+                .collect::<Vec<String>>()
+        })
+        .await
+        .context("vercel: ledger worker failed")
+    }
+
+    async fn remove_record(&self, name: &str) {
+        let dir = self.ledger_dir();
+        let name = name.to_string();
+        if tokio::task::spawn_blocking(move || registry::remove_at(&dir, &name))
+            .await
+            .is_err()
+        {
+            tracing::debug!(
+                "vercel: ledger remove worker failed; the reaper reconciles the stale record"
+            );
+        }
+    }
+
+    fn at_cap(occupied: usize, cap: usize) -> anyhow::Error {
+        anyhow!(
+            "vercel: {occupied} managed sandboxes already exist (max_instances = {cap}); \
+             destroy one or raise `[env.<name>.provider] max_instances`"
+        )
     }
 }
 
 impl RemoteProvider for VercelProvider {
     fn create<'a>(&'a self) -> BoxFuture<'a, Result<SandboxHandle>> {
-        Box::pin(async move { Err(not_built()) })
+        Box::pin(async move {
+            let name = checked_name(&self.spec.name)?.to_string();
+            // 1. Controller id (refuses before any request when unreadable).
+            let controller = self.controller().await?;
+            // 2. The plan and its body, rendered before any ledger write.
+            let owner = self.owner.clone().unwrap_or_default();
+            let plan = policy::CreatePlan {
+                name: name.clone(),
+                vcpus: self.spec.vcpus,
+                image: self.spec.image.clone(),
+                region: self.spec.region.clone(),
+                timeout_ms: policy::INITIAL_TIMEOUT_MS,
+                tags: policy::tags_for(&controller, &owner, &crate::vps::host_label()),
+                egress: Vec::new(),
+            };
+            let body = api::create_body(&self.spec.scope, &plan);
+            if !body.is_object() {
+                bail!("vercel: could not render the create body");
+            }
+            let account = self.account()?;
+            let cap = policy::max_instances(self.spec.max_instances) as usize;
+
+            let create_lock = CREATE_LOCK.lock().await;
+            // The process-global hard cap: the ledger first (no request at
+            // all when it is already full), then the union with the
+            // controller-tagged sandboxes Vercel lists, which also sees
+            // sandboxes another host created.
+            let ledger = self.ledger_vercel_names(&account).await?;
+            if ledger.len() >= cap {
+                return Err(Self::at_cap(ledger.len(), cap));
+            }
+            let remote = match self.listed(&controller).await {
+                crate::vps::Inventory::Complete(rows) => rows,
+                crate::vps::Inventory::Partial { reason, .. } => {
+                    bail!(
+                        "vercel: cannot count existing sandboxes ({}); refusing to create",
+                        reason.message()
+                    );
+                }
+                crate::vps::Inventory::Unknown(reason) => {
+                    bail!("vercel: cannot count existing sandboxes ({reason}); refusing to create");
+                }
+            };
+            let occupied: BTreeSet<String> = ledger
+                .into_iter()
+                .chain(remote.into_iter().map(|view| view.name))
+                .collect();
+            if occupied.len() >= cap {
+                return Err(Self::at_cap(occupied.len(), cap));
+            }
+
+            // 3. Reserve capacity and publish the intent.
+            let dir = self.ledger_dir();
+            let intent = registry::VpsRecord {
+                name: name.clone(),
+                provider: LEDGER_PROVIDER.into(),
+                state: "creating".into(),
+                instance_id: String::new(),
+                ip: String::new(),
+                created_at: thegn_core::util::now(),
+                owner: owner.clone(),
+                account: account.clone(),
+            };
+            let reserve_dir = dir.clone();
+            let reserve_result = tokio::task::spawn_blocking(move || {
+                registry::reserve_at(
+                    &reserve_dir,
+                    &intent,
+                    cap,
+                    registry::ReserveScope::Provider(LEDGER_PROVIDER),
+                )
+            })
+            .await
+            .context("vercel: reservation worker failed")?;
+            match reserve_result {
+                Ok(()) => {}
+                Err(registry::ReserveError::AtCap { occupied, cap }) => {
+                    return Err(Self::at_cap(occupied, cap));
+                }
+                Err(error @ registry::ReserveError::OwnedByOther { .. }) => {
+                    return Err(anyhow!(error));
+                }
+                Err(error @ registry::ReserveError::OtherAccount { .. }) => {
+                    return Err(anyhow!(error));
+                }
+                Err(registry::ReserveError::Store(error)) => {
+                    return Err(error
+                        .context("vercel: could not reserve ledger capacity; refusing to create"));
+                }
+            }
+            let mut guard = IntentGuard {
+                dir: dir.clone(),
+                name: name.clone(),
+                armed: true,
+            };
+            drop(create_lock);
+
+            // 4. The POST. From here the intent survives unless the create was
+            // definitively refused or a cleanup DELETE landed.
+            guard.preserve();
+            let created = match self.api().create(&body).await {
+                Ok(view) => view,
+                Err(error) if error_status(&error) == Some(409) => {
+                    // The name already exists (perhaps ours from an earlier
+                    // attempt, perhaps another host's): never delete it, and
+                    // keep the intent so the reaper can reconcile it.
+                    return Err(error.context("vercel: a sandbox with this name already exists"));
+                }
+                Err(error) if definite_create_rejection(&error) => {
+                    self.remove_record(&name).await;
+                    return Err(error.context("vercel: create refused"));
+                }
+                Err(error) => {
+                    self.cleanup_after_failed_create(&name).await;
+                    return Err(error.context("vercel: create failed"));
+                }
+            };
+
+            // 5. Record the ready sandbox.
+            let ready = registry::VpsRecord {
+                name: name.clone(),
+                provider: LEDGER_PROVIDER.into(),
+                state: "ready".into(),
+                instance_id: name.clone(),
+                ip: String::new(),
+                created_at: created_at_secs(created.created_at_ms),
+                owner,
+                account,
+            };
+            let write_dir = dir.clone();
+            let written =
+                tokio::task::spawn_blocking(move || registry::write_at(&write_dir, &ready))
+                    .await
+                    .context("vercel: ledger worker failed")
+                    .and_then(|r| r);
+            if let Err(error) = written {
+                self.cleanup_after_failed_create(&name).await;
+                return Err(error.context("vercel: could not record the created sandbox"));
+            }
+            if created.status == SessionStatus::Running
+                && let Some(session) = created.session_id.as_deref()
+            {
+                self.remember_session(&name, session, true);
+            }
+
+            // 6. The handle rides the `vercel-exec` self-bridge.
+            Ok(SandboxHandle {
+                id: name.clone(),
+                exec: ExecKind::Command(vec![
+                    thegn_core::util::self_exe_str(),
+                    "vercel-exec".into(),
+                    name,
+                    "--".into(),
+                ]),
+            })
+        })
     }
 
-    fn destroy<'a>(&'a self, _id: &'a str) -> BoxFuture<'a, Result<()>> {
-        Box::pin(async move { Err(not_built()) })
+    fn destroy<'a>(&'a self, id: &'a str) -> BoxFuture<'a, Result<()>> {
+        Box::pin(async move {
+            checked_name(id)?;
+            self.delete_with_snapshots(id).await?;
+            self.remove_record(id).await;
+            Ok(())
+        })
     }
 
     fn list<'a>(&'a self) -> BoxFuture<'a, Result<Vec<String>>> {
-        Box::pin(async move { Err(not_built()) })
+        Box::pin(async move { self.list_inventory().await.into_complete() })
+    }
+}
+
+impl VercelProvider {
+    /// After a create POST that may have taken effect: best-effort delete,
+    /// clearing the intent only when the delete landed. A failed delete keeps
+    /// the record so the reaper and `destroy` can reconcile the leak.
+    async fn cleanup_after_failed_create(&self, name: &str) {
+        match self.delete_with_snapshots(name).await {
+            Ok(()) => self.remove_record(name).await,
+            Err(error) => tracing::warn!(
+                sandbox = %name,
+                "vercel: create failed and cleanup DELETE failed; intent record kept for \
+                 reconciliation: {error:#}"
+            ),
+        }
     }
 }
 
 impl ProviderEgress for VercelProvider {
     fn set_network_policy<'a>(
         &'a self,
-        _id: &'a str,
-        _allow: &'a [String],
-        _block: &'a [String],
+        id: &'a str,
+        allow: &'a [String],
+        block: &'a [String],
     ) -> BoxFuture<'a, Result<()>> {
-        Box::pin(async move { Err(not_built()) })
+        Box::pin(async move {
+            checked_name(id)?;
+            let rules = crate::provider::rules_from(allow, block).map_err(|e| anyhow!("{e}"))?;
+            let domains: Vec<String> = rules
+                .iter()
+                .filter(|r| r.action == "allow")
+                .map(|r| r.domain.clone())
+                .collect();
+            // Vercel's user-defined policy is an allow list (empty ⇒ allow
+            // all; anything unlisted is denied, so blocks are implied). A
+            // block-only policy cannot be expressed, and an allow list emptied
+            // by blocks would fail open: both are refused.
+            if domains.is_empty() && !rules.is_empty() {
+                bail!(
+                    "vercel: egress supports allow lists only; refusing a policy with no allowed \
+                     domain"
+                );
+            }
+            let covered = rules
+                .iter()
+                .filter(|r| r.action == "deny" && r.domain != "*")
+                .any(|d| {
+                    domains.iter().any(|a| {
+                        a == "*"
+                            || a.strip_prefix("*.").is_some_and(|s| {
+                                d.domain == s || d.domain.ends_with(&format!(".{s}"))
+                            })
+                    })
+                });
+            if covered {
+                bail!(
+                    "vercel: egress cannot block a domain inside an allowed wildcard; narrow the \
+                     allow list"
+                );
+            }
+            let body = api::network_policy_body(&domains);
+            self.api().set_network_policy(id, &body).await?;
+            self.policies.lock().unwrap().insert(id.to_string(), rules);
+            Ok(())
+        })
     }
 
-    fn get_network_policy<'a>(&'a self, _id: &'a str) -> BoxFuture<'a, Result<Vec<PolicyRule>>> {
-        Box::pin(async move { Err(not_built()) })
+    fn get_network_policy<'a>(&'a self, id: &'a str) -> BoxFuture<'a, Result<Vec<PolicyRule>>> {
+        Box::pin(async move {
+            checked_name(id)?;
+            // Vercel's readback is sanitized, so only what this process
+            // applied is known.
+            self.policies
+                .lock()
+                .unwrap()
+                .get(id)
+                .cloned()
+                .ok_or_else(|| {
+                    anyhow!("vercel: no network policy applied by this process for {id}")
+                })
+        })
     }
 }
+
+#[cfg(test)]
+mod provider_tests;
 
 #[cfg(test)]
 mod tests {
