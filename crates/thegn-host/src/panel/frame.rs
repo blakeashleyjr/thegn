@@ -329,10 +329,62 @@ fn indent(line: Line) -> Line {
     }
 }
 
-/// One-row tab bar: `git  work  system  help` with the active tab accented.
-/// Every tab `Tab`/`Shift-Tab` can cycle onto is rendered — an invisible tab
-/// made the 4th press look like a dead keystroke.
-fn tab_bar_row(ui: &PanelUi, focused: bool) -> (PanelRow, Vec<(std::ops::Range<usize>, PanelTab)>) {
+/// The width-chip text candidates for the panel's current width, widest
+/// first: `(word, hint)` where `hint` appends the `e more` affordance.
+fn chip_candidates(ui: &PanelUi) -> Vec<(&'static str, bool)> {
+    use crate::layout::PanelWidth;
+    match ui.width {
+        PanelWidth::Normal if sections::has_deep_view(ui.open) => vec![
+            ("normal", true),
+            ("norm", true),
+            ("normal", false),
+            ("norm", false),
+        ],
+        PanelWidth::Normal => vec![("normal", false), ("norm", false)],
+        PanelWidth::Half => vec![("half", false)],
+        PanelWidth::Full => vec![("full", false)],
+    }
+}
+
+/// The right-aligned panel-width chip: the current width word (with an
+/// `e more` hint at Normal when the open section has a richer view). Returns
+/// the segments and their display width for the widest candidate that fits
+/// `free_cols` with a 2-cell gap and a 1-cell right pad, else `None`. Pure.
+pub(super) fn width_chip(ui: &PanelUi, free_cols: usize) -> Option<(Vec<Seg>, usize)> {
+    use crate::layout::PanelWidth;
+    let dot = crate::caps::active_glyphs().middot;
+    for (word, hint) in chip_candidates(ui) {
+        let word_tok = if ui.width == PanelWidth::Normal {
+            Tok::Slot(S::Ghost2)
+        } else {
+            Tok::Slot(S::Accent)
+        };
+        let mut segs = vec![seg(word_tok, word)];
+        if hint {
+            segs.push(seg(Tok::Slot(S::Ghost3), format!(" {dot} ")));
+            segs.push(seg(Tok::Slot(S::Dim), "e"));
+            segs.push(seg(Tok::Slot(S::Ghost2), " more"));
+        }
+        let w = crate::seg::seg_width(&segs);
+        if w + 3 <= free_cols {
+            return Some((segs, w));
+        }
+    }
+    None
+}
+
+/// The tab row, its tab spans, and the optional width-chip click target.
+type TabBar = (
+    PanelRow,
+    Vec<(std::ops::Range<usize>, PanelTab)>,
+    Option<ColHit>,
+);
+
+/// One-row tab bar: `git  work  system  help` with the active tab accented,
+/// and the width chip right-aligned when it fits (its [`ColHit`] on row 0
+/// resolves to `Expand`). Every tab `Tab`/`Shift-Tab` can cycle onto is
+/// rendered — an invisible tab made the 4th press look like a dead keystroke.
+fn tab_bar_row(ui: &PanelUi, focused: bool, cols: usize) -> TabBar {
     use crate::seg::{seg, sp};
     let tabs = [
         PanelTab::Git,
@@ -365,7 +417,23 @@ fn tab_bar_row(ui: &PanelUi, focused: bool) -> (PanelRow, Vec<(std::ops::Range<u
         spans.push((col..col + label.len(), tab));
         col += label.len();
     }
-    (PanelRow::plain(crate::seg::Line::Segs(segs)), spans)
+    let mut chip_hit = None;
+    if let Some((chip, w)) = width_chip(ui, cols.saturating_sub(col)) {
+        let x = cols.saturating_sub(1 + w);
+        segs.push(sp(x.saturating_sub(col)));
+        segs.extend(chip);
+        segs.push(sp(1));
+        chip_hit = Some(ColHit {
+            row: 0,
+            cols: x..x + w,
+            hit: PanelHit::Expand,
+        });
+    }
+    (
+        PanelRow::plain(crate::seg::Line::Segs(segs)),
+        spans,
+        chip_hit,
+    )
 }
 
 /// The content geometry handed to section builders: the panel width minus
@@ -428,7 +496,7 @@ pub fn build_panel(
     }
 
     // Reserve 1 row for the tab bar at the top; account for it in the budget.
-    let (tab_row, tab_spans) = tab_bar_row(ui, focused);
+    let (tab_row, tab_spans, chip_hit) = tab_bar_row(ui, focused, cols);
     let rows_for_body = rows.saturating_sub(1);
 
     let header = with_flow_chips(
@@ -555,7 +623,7 @@ pub fn build_panel(
     PanelFrame {
         rows: out,
         rail: Vec::new(),
-        col_hits: Vec::new(),
+        col_hits: chip_hit.into_iter().collect(),
         col_zone: None,
         tab_spans,
     }
@@ -633,7 +701,7 @@ fn build_full(
     focused: bool,
 ) -> PanelFrame {
     // Reserve 1 row for the tab bar.
-    let (tab_row, tab_spans) = tab_bar_row(ui, focused);
+    let (tab_row, tab_spans, chip_hit) = tab_bar_row(ui, focused, cols);
     let rows_for_body = rows.saturating_sub(1);
 
     let header = with_flow_chips(
@@ -727,7 +795,7 @@ fn build_full(
     PanelFrame {
         rows: out,
         rail: spans,
-        col_hits: Vec::new(),
+        col_hits: chip_hit.into_iter().collect(),
         col_zone: None,
         tab_spans,
     }
@@ -1426,5 +1494,86 @@ mod tests {
             !l.iter()
                 .any(|item| matches!(item.fg, Tok::Hue(Hue::Red | Hue::Amber)))
         );
+    }
+
+    fn chip_ui(width: crate::layout::PanelWidth, open: Section) -> PanelUi {
+        PanelUi {
+            width,
+            open,
+            ..Default::default()
+        }
+    }
+
+    fn chip_text(ui: &PanelUi, free: usize) -> Option<String> {
+        width_chip(ui, free).map(|(segs, w)| {
+            let t: String = segs.iter().map(|s| s.text.clone()).collect();
+            assert_eq!(w, crate::seg::seg_width(&segs));
+            t
+        })
+    }
+
+    #[test]
+    fn width_chip_picks_the_widest_fitting_candidate() {
+        use crate::layout::PanelWidth::{Full, Half, Normal};
+        let dot = crate::caps::active_glyphs().middot;
+        let deep = chip_ui(Normal, Section::Changes);
+        let want = |s: &str| Some(s.replace('·', dot));
+        // "normal · e more" is 15 wide; +3 for gap and pad.
+        assert_eq!(chip_text(&deep, 18), want("normal · e more"));
+        assert_eq!(chip_text(&deep, 17), want("norm · e more"));
+        assert_eq!(chip_text(&deep, 12), want("normal"));
+        assert_eq!(chip_text(&deep, 8), want("norm"));
+        assert_eq!(chip_text(&deep, 6), None);
+        assert_eq!(chip_text(&deep, 0), None);
+        let flat = chip_ui(Normal, Section::Help);
+        assert_eq!(chip_text(&flat, 100), want("normal"));
+        assert_eq!(chip_text(&flat, 8), want("norm"));
+        assert_eq!(chip_text(&flat, 6), None);
+        assert_eq!(
+            chip_text(&chip_ui(Half, Section::Changes), 100),
+            want("half")
+        );
+        assert_eq!(chip_text(&chip_ui(Full, Section::Help), 100), want("full"));
+        assert_eq!(chip_text(&chip_ui(Half, Section::Changes), 6), None);
+    }
+
+    #[test]
+    fn width_chip_uses_the_ascii_middot() {
+        use crate::caps::test_override;
+        use thegn_core::termcaps::UnicodeLevel;
+        test_override::with_unicode(UnicodeLevel::Ascii, || {
+            let ui = chip_ui(crate::layout::PanelWidth::Normal, Section::Changes);
+            let text = chip_text(&ui, 40).expect("fits");
+            assert!(text.contains(crate::caps::active_glyphs().middot), "{text}");
+            assert!(text.is_ascii(), "{text}");
+        });
+    }
+
+    #[test]
+    fn build_panel_tab_row_carries_the_chip_and_its_hit() {
+        use crate::layout::PanelWidth::{Half, Normal};
+        let model = model_with(PanelData::default());
+        let dot = crate::caps::active_glyphs().middot;
+        let ui = chip_ui(Normal, Section::Changes);
+        let frame = build_panel(&model, &ui, 44, 50, true);
+        let row0 = text_of(&frame.rows[0].line);
+        assert!(
+            row0.trim_end().ends_with(&format!("normal {dot} e more")),
+            "{row0:?}"
+        );
+        let hits: Vec<_> = frame.col_hits.iter().filter(|c| c.row == 0).collect();
+        assert_eq!(hits.len(), 1, "{:?}", frame.col_hits);
+        assert_eq!(hits[0].hit, PanelHit::Expand);
+        assert_eq!(hits[0].cols.end, 43);
+        assert_eq!(hits[0].cols.len(), "normal e more".len() + 2);
+        assert!(frame.rows[0].hit.is_none());
+
+        let half = build_panel(&model, &chip_ui(Half, Section::Changes), 44, 50, true);
+        assert!(text_of(&half.rows[0].line).trim_end().ends_with("half"));
+
+        let flat = build_panel(&model, &chip_ui(Normal, Section::Help), 44, 50, true);
+        let t = text_of(&flat.rows[0].line);
+        assert!(t.trim_end().ends_with("normal"), "{t:?}");
+        assert!(!t.contains("more"), "{t:?}");
     }
 }
