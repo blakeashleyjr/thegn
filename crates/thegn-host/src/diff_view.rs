@@ -1361,4 +1361,171 @@ mod tests {
         assert!(rendered.contains("first body"));
         assert!(rendered.contains("second body"));
     }
+
+    fn loaded() -> DiffView {
+        let mut v = DiffView::with_structural("t".into(), 1, false);
+        v.apply_data(DiffViewData {
+            generation: 1,
+            diff: Some(sample()),
+            structural: None,
+            review: None,
+            review_status: None,
+        });
+        v
+    }
+
+    fn type_str(v: &mut DiffView, s: &str) {
+        for c in s.chars() {
+            v.handle_key(&KeyCode::Char(c), Modifiers::NONE);
+        }
+    }
+
+    fn footer_text(v: &DiffView) -> String {
+        match v.footer() {
+            Line::Segs(segs) => segs.iter().map(|s| s.text.clone()).collect(),
+            other => panic!("unexpected footer {other:?}"),
+        }
+    }
+
+    #[test]
+    fn search_edit_commit_cancel_state_machine() {
+        let mut v = loaded();
+        v.handle_key(&KeyCode::Char('/'), Modifiers::NONE);
+        assert!(v.search.as_ref().unwrap().editing);
+        // `q` is typed into the query, not a close.
+        let out = v.handle_key(&KeyCode::Char('q'), Modifiers::NONE);
+        assert_eq!(out, DiffViewOutcome::Pending);
+        assert_eq!(v.search.as_ref().unwrap().query, "q");
+        v.handle_key(&KeyCode::Backspace, Modifiers::NONE);
+        assert_eq!(v.search.as_ref().unwrap().query, "");
+        // Esc cancels and clears.
+        v.handle_key(&KeyCode::Escape, Modifiers::NONE);
+        assert!(v.search.is_none());
+        // Enter commits.
+        v.handle_key(&KeyCode::Char('/'), Modifiers::NONE);
+        type_str(&mut v, "b.rs");
+        v.handle_key(&KeyCode::Enter, Modifiers::NONE);
+        assert!(!v.search.as_ref().unwrap().editing);
+        assert_eq!(v.sel, 1);
+    }
+
+    #[test]
+    fn file_list_matches_path_case_insensitively() {
+        let mut v = loaded();
+        v.handle_key(&KeyCode::Char('/'), Modifiers::NONE);
+        type_str(&mut v, "B.RS");
+        assert_eq!(v.search_matches(), vec![1]);
+    }
+
+    #[test]
+    fn open_file_matches_diff_lines_and_n_wraps() {
+        let mut v = loaded();
+        v.handle_key(&KeyCode::Enter, Modifiers::NONE);
+        v.handle_key(&KeyCode::Char('/'), Modifiers::NONE);
+        type_str(&mut v, "c");
+        v.handle_key(&KeyCode::Enter, Modifiers::NONE);
+        // " ctx" is row 0; "+new" has no `c`.
+        assert_eq!(v.search_matches(), vec![0]);
+        v.handle_key(&KeyCode::Char('j'), Modifiers::NONE);
+        v.handle_key(&KeyCode::Char('n'), Modifiers::NONE);
+        assert_eq!(v.sel, 0, "n wraps to the first match");
+        v.handle_key(&KeyCode::Char('N'), Modifiers::NONE);
+        assert_eq!(v.sel, 0, "N wraps back onto the only match");
+    }
+
+    #[test]
+    fn n_and_big_n_cycle_with_wrap() {
+        let mut v = loaded();
+        v.handle_key(&KeyCode::Char('/'), Modifiers::NONE);
+        type_str(&mut v, ".rs");
+        v.handle_key(&KeyCode::Enter, Modifiers::NONE);
+        assert_eq!(v.sel, 0);
+        v.handle_key(&KeyCode::Char('n'), Modifiers::NONE);
+        assert_eq!(v.sel, 1);
+        v.handle_key(&KeyCode::Char('n'), Modifiers::NONE);
+        assert_eq!(v.sel, 0);
+        v.handle_key(&KeyCode::Char('N'), Modifiers::NONE);
+        assert_eq!(v.sel, 1);
+    }
+
+    #[test]
+    fn no_match_keeps_selection() {
+        let mut v = loaded();
+        v.handle_key(&KeyCode::Char('j'), Modifiers::NONE);
+        v.handle_key(&KeyCode::Char('/'), Modifiers::NONE);
+        type_str(&mut v, "zzz");
+        v.handle_key(&KeyCode::Enter, Modifiers::NONE);
+        assert_eq!(v.sel, 1);
+        v.handle_key(&KeyCode::Char('n'), Modifiers::NONE);
+        assert_eq!(v.sel, 1);
+        assert!(footer_text(&v).starts_with("/zzz no match"));
+    }
+
+    #[test]
+    fn structural_pane_refuses_search_with_status() {
+        let mut v = DiffView::with_structural("t".into(), 1, true);
+        v.apply_data(DiffViewData {
+            generation: 1,
+            diff: Some(sample()),
+            structural: Some(Ok(vec![])),
+            review: None,
+            review_status: None,
+        });
+        assert!(v.structural_active());
+        assert_eq!(
+            v.handle_key(&KeyCode::Char('/'), Modifiers::NONE),
+            DiffViewOutcome::Status("search: switch to the internal view (t)".into())
+        );
+        assert!(v.search.is_none());
+    }
+
+    #[test]
+    fn esc_clears_search_before_collapsing_file() {
+        let mut v = loaded();
+        v.handle_key(&KeyCode::Enter, Modifiers::NONE);
+        v.handle_key(&KeyCode::Char('/'), Modifiers::NONE);
+        type_str(&mut v, "new");
+        v.handle_key(&KeyCode::Enter, Modifiers::NONE);
+        assert_eq!(
+            v.handle_key(&KeyCode::Escape, Modifiers::NONE),
+            DiffViewOutcome::Pending
+        );
+        assert!(v.search.is_none());
+        assert_eq!(v.open_file, Some(0), "file still open");
+        v.handle_key(&KeyCode::Escape, Modifiers::NONE);
+        assert_eq!(v.open_file, None);
+    }
+
+    #[test]
+    fn footer_text_in_each_search_state() {
+        let mut v = loaded();
+        assert!(footer_text(&v).contains("/ search"));
+        v.handle_key(&KeyCode::Char('/'), Modifiers::NONE);
+        type_str(&mut v, "rs");
+        assert_eq!(footer_text(&v), "/rs_");
+        v.handle_key(&KeyCode::Enter, Modifiers::NONE);
+        assert!(footer_text(&v).starts_with("/rs 1/2"));
+        v.handle_key(&KeyCode::Char('n'), Modifiers::NONE);
+        assert!(footer_text(&v).starts_with("/rs 2/2"));
+    }
+
+    #[test]
+    fn search_query_is_capped() {
+        let mut v = loaded();
+        v.handle_key(&KeyCode::Char('/'), Modifiers::NONE);
+        type_str(&mut v, &"x".repeat(200));
+        assert_eq!(v.search.as_ref().unwrap().query.chars().count(), 128);
+    }
+
+    #[test]
+    fn emphasis_splits_matching_span() {
+        let l = emphasise_line(
+            Line::segs(vec![seg(Tok::Slot(S::Text), "foo.RS bar")]),
+            "rs",
+        );
+        let Line::Segs(segs) = l else { panic!() };
+        let texts: Vec<_> = segs.iter().map(|s| s.text.as_str()).collect();
+        assert_eq!(texts, vec!["foo.", "RS", " bar"]);
+        assert!(segs[1].bold && !segs[0].bold);
+    }
 }
