@@ -202,6 +202,7 @@ fn route_and_render(
                 })
             },
         ),
+        PreviewRoute::Archive => (read_archive_listing(abs, cancel), None),
         PreviewRoute::Unknown => (read_hex_preview(abs), None),
     }
 }
@@ -271,6 +272,106 @@ fn read_text(abs: &std::path::Path) -> Result<Vec<String>, String> {
         ));
     }
     prepare_preview(&bytes)
+}
+
+/// Scan cap for the (decompressed) tar stream.
+const ARCHIVE_SCAN_BYTES: u64 = 64 * 1024 * 1024;
+
+/// List a zip / tar / tar.gz for the preview pane. Bounded and sanitized; any
+/// parse error falls back to the hex dump with a one-line note on top.
+fn read_archive_listing(
+    abs: &std::path::Path,
+    cancel: &std::sync::atomic::AtomicBool,
+) -> Result<Vec<String>, String> {
+    use thegn_core::archive_list::{self as al, EntryKind};
+    let max_entries = PREVIEW_MAX_LINES.saturating_sub(3);
+    let file = crate::rasterize::open_regular_nonblocking(abs)
+        .map_err(|e| format!("cannot preview file: {e}"))?;
+    let meta = file
+        .metadata()
+        .map_err(|e| format!("cannot preview file: {e}"))?;
+    if !meta.is_file() {
+        return Err("cannot preview file: not a regular file".into());
+    }
+    let lower = abs
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    let gz = lower.ends_with(".gz") || lower.ends_with(".tgz");
+    let is_tar = gz || lower.ends_with(".tar");
+    let mut file = file;
+    let (label, result) = if is_tar {
+        let r: Result<al::Listing, String> = if gz {
+            let mut dec = flate2::read::MultiGzDecoder::new(file);
+            al::tar_listing(&mut dec, max_entries, ARCHIVE_SCAN_BYTES, cancel)
+        } else {
+            al::tar_listing(&mut file, max_entries, ARCHIVE_SCAN_BYTES, cancel)
+        };
+        ("tar archive", r)
+    } else {
+        let sniffed_tar = {
+            use std::io::{Read, Seek, SeekFrom};
+            let mut probe = [0u8; 512];
+            let n = file.read(&mut probe).unwrap_or(0);
+            // best-effort: a failed rewind surfaces as a parse error below.
+            let _ = file.seek(SeekFrom::Start(0));
+            n >= 262 && &probe[257..262] == b"ustar"
+        };
+        if sniffed_tar {
+            (
+                "tar archive",
+                al::tar_listing(&mut file, max_entries, ARCHIVE_SCAN_BYTES, cancel),
+            )
+        } else {
+            (
+                "zip archive",
+                al::zip_listing(&mut file, meta.len(), max_entries),
+            )
+        }
+    };
+    let listing = match result {
+        Ok(l) => l,
+        Err(why) => {
+            let mut lines = vec![bounded_line(&format!(
+                "(archive listing unavailable: {})",
+                thegn_core::msg::terminal_safe(&why)
+            ))];
+            lines.extend(read_hex_preview(abs)?);
+            return Ok(lines);
+        }
+    };
+    let mut lines: Vec<String> = Vec::new();
+    let mut retained = 0usize;
+    let mut byte_capped = false;
+    for e in &listing.entries {
+        let size = e.size.map(|s| s.to_string()).unwrap_or_default();
+        let name = thegn_core::msg::terminal_safe(&e.name);
+        let text = match &e.kind {
+            EntryKind::Symlink(t) => {
+                format!(
+                    "{size:>10}  {name} -> {}",
+                    thegn_core::msg::terminal_safe(t)
+                )
+            }
+            _ if e.encrypted => format!("{size:>10}  {name} (encrypted)"),
+            _ => format!("{size:>10}  {name}"),
+        };
+        let line = bounded_line(&text.replace('\n', " "));
+        if retained.saturating_add(line.len()) > PREVIEW_MAX_TOTAL_BYTES {
+            byte_capped = true;
+            break;
+        }
+        retained += line.len();
+        lines.push(line);
+    }
+    let count = listing.total_hint.unwrap_or(listing.entries.len() as u64);
+    let mut header = format!("{label}, {count} entries");
+    if listing.truncated.is_some() || byte_capped {
+        header.push_str(", listing truncated");
+    }
+    lines.splice(0..0, [header, String::new()]);
+    Ok(lines)
 }
 
 fn read_hex_preview(abs: &std::path::Path) -> Result<Vec<String>, String> {
@@ -660,5 +761,83 @@ mod tests {
         crate::platform::test_symlink(&target, &link).unwrap();
 
         assert_eq!(read_bytes(&link).unwrap(), b"workspace instructions");
+    }
+
+    fn zip_fixture(name: &str) -> Vec<u8> {
+        let mut out = b"PK\x03\x04".to_vec();
+        out.extend_from_slice(&[0u8; 26]);
+        out.extend_from_slice(name.as_bytes());
+        let mut cd = Vec::new();
+        cd.extend_from_slice(&0x0201_4b50u32.to_le_bytes());
+        cd.extend_from_slice(&[0u8; 24]);
+        cd[24..28].copy_from_slice(&7u32.to_le_bytes());
+        cd.extend_from_slice(&(name.len() as u16).to_le_bytes());
+        cd.extend_from_slice(&[0u8; 16]);
+        cd.extend_from_slice(name.as_bytes());
+        let off = out.len() as u32;
+        out.extend_from_slice(&cd);
+        out.extend_from_slice(&0x0605_4b50u32.to_le_bytes());
+        out.extend_from_slice(&[0, 0, 0, 0, 1, 0, 1, 0]);
+        out.extend_from_slice(&(cd.len() as u32).to_le_bytes());
+        out.extend_from_slice(&off.to_le_bytes());
+        out.extend_from_slice(&[0, 0]);
+        out
+    }
+
+    fn tar_fixture(name: &str) -> Vec<u8> {
+        let mut b = [0u8; 512];
+        b[..name.len()].copy_from_slice(name.as_bytes());
+        b[124..136].copy_from_slice(b"00000000003\0");
+        b[156] = b'0';
+        b[148..156].fill(b' ');
+        let sum: u32 = b.iter().map(|x| u32::from(*x)).sum();
+        b[148..156].copy_from_slice(format!("{sum:06o}\0 ").as_bytes());
+        let mut v = b.to_vec();
+        v.extend_from_slice(b"abc");
+        v.resize(1024, 0);
+        v.extend_from_slice(&[0u8; 1024]);
+        v
+    }
+
+    fn no_cancel() -> std::sync::atomic::AtomicBool {
+        std::sync::atomic::AtomicBool::new(false)
+    }
+
+    #[test]
+    fn read_archive_listing_lists_zip_and_sanitizes_names() {
+        let dir = tempfile::tempdir().unwrap();
+        let f = dir.path().join("a.zip");
+        std::fs::write(&f, zip_fixture("evil\x1b[31m.txt")).unwrap();
+        let lines = read_archive_listing(&f, &no_cancel()).unwrap();
+        assert_eq!(lines[0], "zip archive, 1 entries");
+        assert_eq!(lines[1], "");
+        assert!(lines[2].contains("evil"), "{lines:?}");
+        assert!(lines.iter().all(|l| !l.contains('\x1b')), "{lines:?}");
+    }
+
+    #[test]
+    fn read_archive_listing_lists_tgz() {
+        use std::io::Write;
+        let dir = tempfile::tempdir().unwrap();
+        let f = dir.path().join("a.tar.gz");
+        let mut enc = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::fast());
+        enc.write_all(&tar_fixture("hello.txt")).unwrap();
+        std::fs::write(&f, enc.finish().unwrap()).unwrap();
+        let lines = read_archive_listing(&f, &no_cancel()).unwrap();
+        assert_eq!(lines[0], "tar archive, 1 entries");
+        assert_eq!(lines[2], "         3  hello.txt");
+    }
+
+    #[test]
+    fn read_archive_listing_corrupt_zip_falls_back_to_hex_with_note() {
+        let dir = tempfile::tempdir().unwrap();
+        let f = dir.path().join("bad.zip");
+        std::fs::write(&f, b"PK\x03\x04 not really a zip archive at all").unwrap();
+        let lines = read_archive_listing(&f, &no_cancel()).unwrap();
+        assert!(
+            lines[0].starts_with("(archive listing unavailable"),
+            "{lines:?}"
+        );
+        assert!(lines[1].starts_with("binary file: first"), "{lines:?}");
     }
 }
