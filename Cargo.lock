@@ -2031,7 +2031,7 @@ dependencies = [
  "libc",
  "memchr",
  "memmap2",
- "neo_frizbee 0.11.0",
+ "neo_frizbee",
  "notify 9.0.0-rc.4",
  "parking_lot",
  "pathdiff",
@@ -3425,7 +3425,7 @@ dependencies = [
 
 [[package]]
 name = "gtui-app"
-version = "0.1.0-alpha.92"
+version = "0.1.0-alpha.93"
 dependencies = [
  "chrono",
  "gtui-core",
@@ -3434,7 +3434,7 @@ dependencies = [
 
 [[package]]
 name = "gtui-core"
-version = "0.1.0-alpha.92"
+version = "0.1.0-alpha.93"
 dependencies = [
  "chrono",
  "serde",
@@ -3444,7 +3444,7 @@ dependencies = [
 
 [[package]]
 name = "gtui-embed"
-version = "0.1.0-alpha.92"
+version = "0.1.0-alpha.93"
 dependencies = [
  "chrono",
  "gtui-app",
@@ -3459,7 +3459,7 @@ dependencies = [
 
 [[package]]
 name = "gtui-query"
-version = "0.1.0-alpha.92"
+version = "0.1.0-alpha.93"
 dependencies = [
  "chrono",
  "gtui-core",
@@ -3473,7 +3473,7 @@ dependencies = [
 
 [[package]]
 name = "gtui-render"
-version = "0.1.0-alpha.92"
+version = "0.1.0-alpha.93"
 dependencies = [
  "criterion",
  "gtui-core",
@@ -5151,16 +5151,6 @@ dependencies = [
 
 [[package]]
 name = "neo_frizbee"
-version = "0.10.4"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "12af02496d6e51f324af42ffbd1ed31eb275d4aedd17b18b2cb4542f103f86cb"
-dependencies = [
- "itertools 0.14.0",
- "raw-cpuid",
-]
-
-[[package]]
-name = "neo_frizbee"
 version = "0.11.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7a2f6120a8da26bea3587731072111062c5d8c51ca3a3a75a716bd8b735d5882"
@@ -6745,15 +6735,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "raw-cpuid"
-version = "11.6.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "498cd0dc59d73224351ee52a95fee0f1a617a2eae0e7d9d720cc622c73a54186"
-dependencies = [
- "bitflags 2.13.1",
-]
-
-[[package]]
 name = "rayon"
 version = "1.12.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -8039,7 +8020,7 @@ dependencies = [
 
 [[package]]
 name = "thegn-core"
-version = "0.1.0-alpha.92"
+version = "0.1.0-alpha.93"
 dependencies = [
  "anyhow",
  "chrono",
@@ -8052,7 +8033,7 @@ dependencies = [
  "ignore",
  "libc",
  "log",
- "neo_frizbee 0.10.4",
+ "neo_frizbee",
  "nix 0.31.3",
  "once_cell",
  "regex",
@@ -8090,7 +8071,7 @@ dependencies = [
 
 [[package]]
 name = "thegn-host"
-version = "0.1.0-alpha.92"
+version = "0.1.0-alpha.93"
 dependencies = [
  "alacritty_terminal",
  "anyhow",
@@ -8111,7 +8092,7 @@ dependencies = [
  "image",
  "keyring",
  "libc",
- "neo_frizbee 0.10.4",
+ "neo_frizbee",
  "nix 0.31.3",
  "notify 9.0.0-rc.4",
  "portable-pty",
@@ -8153,7 +8134,7 @@ dependencies = [
 
 [[package]]
 name = "thegn-media"
-version = "0.1.0-alpha.92"
+version = "0.1.0-alpha.93"
 dependencies = [
  "futures",
  "libc",
@@ -8170,7 +8151,7 @@ dependencies = [
 
 [[package]]
 name = "thegn-metrics"
-version = "0.1.0-alpha.92"
+version = "0.1.0-alpha.93"
 dependencies = [
  "core-foundation 0.9.4",
  "libc",
@@ -8209,7 +8190,7 @@ dependencies = [
 
 [[package]]
 name = "thegn-proc"
-version = "0.1.0-alpha.92"
+version = "0.1.0-alpha.93"
 dependencies = [
  "libc",
  "nix 0.31.3",
@@ -8218,7 +8199,7 @@ dependencies = [
 
 [[package]]
 name = "thegn-proxy"
-version = "0.1.0-alpha.92"
+version = "0.1.0-alpha.93"
 dependencies = [
  "anyhow",
  "axum",
@@ -8237,7 +8218,7 @@ dependencies = [
 
 [[package]]
 name = "thegn-svc"
-version = "0.1.0-alpha.92"
+version = "0.1.0-alpha.93"
 dependencies = [
  "anyhow",
  "axum",
@@ -8281,7 +8262,7 @@ dependencies = [
 
 [[package]]
 name = "thegn-voice"
-version = "0.1.0-alpha.92"
+version = "0.1.0-alpha.93"
 dependencies = [
  "anyhow",
  "cpal",

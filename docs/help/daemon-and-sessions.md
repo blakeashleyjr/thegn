@@ -300,6 +300,23 @@ thegn agent run --agent codex --worktree ~/wt/fix-login \
   `{session, row, env, status, exit_code, output_tail, duration_ms}`, where
   `status` is `exited` or `timeout`.
 
+### Reading a run you did not wait for
+
+Without `--wait`, `agent run` returns the session id and (with `--track`) the
+dispatch row. Two commands finish the job later:
+
+- `thegn dispatch wait --row <row>` **blocks** until the run exits.
+- `thegn agent result --row <row>` (or `--session <id>`) **reports now**: it
+  never waits. It prints the ANSI-stripped output tail, then
+  `[agent result: session <id> <status> <code>]`. `status` is `running`,
+  `exited` (with its exit code) or `unknown` (the daemon does not list the
+  session). `--json` prints
+  `{row, session, status, exit_code, output_tail, tail_note}`; `output_tail`
+  is `null` with a `tail_note` when no output could be read.
+  Exit codes: 0 when the agent exited 0, 1 for another exit code, 3 while it
+  is still running, 2 when the session is unknown or no daemon answers
+  (retryable). `--row` and `--session` are mutually exclusive; give one.
+
 ## Serving thin clients
 
 ### Watching the event feed

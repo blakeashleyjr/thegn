@@ -177,6 +177,10 @@ custom patch; `W` diffs the selection against the mark. `E` edits
 width cycle. `B` marks the rebase base for `i` and `r`; see
 [[git-and-diffs]] for the base-mark behavior.
 
+`y` copies the selected commit sha(s) (full, one per line for a `v` range) to
+the system clipboard via OSC 52; the terminal must allow clipboard writes. `C`
+stays the internal cherry-pick clipboard, pasted with `V`.
+
 {{keys:commits}}
 
 See [[git-and-diffs]].
@@ -213,8 +217,9 @@ files), `?` shows that section's own key cheatsheet.
 
 The worktree's file tree; `/` filters it (directories stay while any
 descendant matches; Esc clears), `↵` previews a file inline, `o` pages
-it in bat, `O` opens your editor, `y` reveals it in yazi. A zip, jar, whl,
-tar or tar.gz previews as an entry listing; an unknown binary previews as a
+it in bat, `O` opens your editor, `y` reveals it in yazi. A .docx shows its
+text (bounded, sanitized; tab-stop definitions are not rendered as tabs). A
+zip, jar, whl, tar or tar.gz previews as an entry listing; an unknown binary previews as a
 hex dump of its first 4096 bytes. See
 [[git-and-diffs]].
 

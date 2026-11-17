@@ -261,6 +261,20 @@ longer reachable. The removed closure also includes `jsonwebtoken`, `p256`,
 `p384`, and `simple_asn1`. These counts are measured from the resolved lockfile,
 not the original 31-package estimate.
 
+### THE-680 delta (2026-11-17)
+
+`neo_frizbee` moved from `0.10` to `0.11`, the line `fff-search`
+`=0.10.6-nightly.611dd87` already pulled, so the lock now holds one copy instead
+of two (`0.10.4` dropped). `raw-cpuid` 11.6.0 was reached only through
+`neo_frizbee` 0.10.4 and left with it: the lock goes from 941 to 939 packages,
+and `neo_frizbee` leaves `test/dup-crates-ratchet.txt`. The call sites
+(`match_list`, `Config::default()`) needed no change; 0.11's default
+`CaseMatching::Ignore` keeps the earlier case-insensitive matching, and the
+scoring defaults are unchanged. `chrono-tz` stays at 0.9: `tera` 1.20 (tokei's
+build-dependency) requires 0.9, so 0.10 would add a second tz database rather
+than remove one. Still open under THE-680: the `gix`, `tonic` and `tree-sitter`
+majors.
+
 8. **Collapse the `zbus` duplication.** Align `secret-service`/`keyring` onto
    zbus 5, or gate media control. −33 crates for the full removal; the dedup
    alone is worth it.

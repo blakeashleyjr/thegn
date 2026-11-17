@@ -228,9 +228,8 @@
     {
       "issue": "THE-139",
       "project": "Workspace Product & Observability",
-      "changes": [
-        "add-workspace-zones"
-      ]
+      "changes": [],
+      "no_spec_rationale": "Zone UI delivered in b149 (sidebar chip, palette assign); core archived 2026-11-17."
     },
     {
       "issue": "THE-140",

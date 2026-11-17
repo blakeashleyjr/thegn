@@ -345,6 +345,7 @@ mod workspace_switch_prep;
 mod worktree_admission;
 mod worktree_lifecycle;
 mod worktree_snapshot;
+mod zone_ui;
 
 use clap::{Parser, Subcommand};
 use std::path::PathBuf;
