@@ -1,34 +1,39 @@
 # Tasks
 
-## 1. Core config (thegn-core)
+Implemented by WS02-P5-12 (W4); nothing below is started.
 
-- [ ] 1.1 `PolicyConfig` (`default_read`/`default_write`/`default_shell` +
-      `rules: Vec<PolicyRule>`, all `serde(default)`); `PolicyAction`
-      (`Allow|Deny|Ask`) via `config_enum!`; layer via `effective_policy(repo_root)`
-      (global → profile → workspace → repo) — **unit tests**: defaults parse, empty
-      policy = permissive-under-worktree default, precedence + every-field apply.
+## 1. Core policy (thegn-core)
 
-## 2. Core decision (thegn-core)
+- [ ] 1.1 `op_policy.rs`: `OpContext`, `OpDecision`, ordered first-match
+      evaluation over tool name, argv shape, worktree-relative paths, profile,
+      placement and `LaunchClass` — **unit tests**: each selector, first match
+      wins, default fall-through, empty policy is a no-op.
+- [ ] 1.2 Hard denies shared with the sandbox deny list (sealed-home deny list
+      and git-config list), evaluated first — **unit tests**: a user allow rule
+      cannot lift a hard deny.
+- [ ] 1.3 `[[sandbox.policy]]` rules in user config; the rule action enum via
+      `config_enum!`; a repository overlay may add `deny` only — **unit tests**:
+      `repo_overlay_cannot_allow`, `hard_deny_survives_repo_overlay`.
 
-- [ ] 2.1 `policy.rs`: `Operation`, `PolicyDecision`, `PolicyCtx`, `decide()` with
-      ordered first-match, `under:`/`outside:` worktree-relative globs, command
-      regex, `stop` — **unit tests**: each selector, allow/deny/ask actions,
-      default fall-through, `stop` short-circuit.
-- [ ] 2.2 Built-in hard denies (`.git/config`, `~/.ssh`, `~/.gnupg`, secret paths)
-      evaluated first and non-overridable — **unit tests**: user `allow` cannot
-      override a hard deny.
+## 2. Decision points (thegn-host)
 
-## 3. Enforcement seam (thegn-host / bouncer)
+- [ ] 2.1 Evaluate the policy in the `tools.run` executor before spawn —
+      **test**: `denied_tool_run_refused_before_spawn` (names the rule).
+- [ ] 2.2 Evaluate the policy before `sandbox_admission::admit_launch` mints a
+      handle — **test**: `denied_launch_refused_before_spawn`.
+- [ ] 2.3 `ask`: TUI status prompt for `InteractiveOwner`; typed refusal
+      `policy-ask-headless` for headless callers — **tests**:
+      `ask_headless_is_typed_refusal`, `empty_policy_is_noop`.
+- [ ] 2.4 Persist always-choices to the trusted user overlay; ignore a choice
+      that would widen an outer ceiling.
 
-- [ ] 3.1 Call `policy::decide` before the bouncer services each brokered
-      `fs`/`edit`/`write`/`terminal` op: `Allow` services silently, `Deny` refuses
-      with reason (ACP `reject_once`), `Ask` raises the existing permission overlay.
-- [ ] 3.2 Persist `allow_always`/`reject_always` overlay choices as appended policy
-      rules so the next identical op is decided without a prompt.
+## 3. Docs, ratchets and validation
 
-## 4. Docs + validate
-
-- [ ] 4.1 Document `[policy]` (defaults, rule selectors/actions, `under:`/`outside:`,
-      hard denies) in `config/config.toml.example`.
-- [ ] 4.2 Run `just ci` (fmt-check + lint + build + test + coverage ≥95% core +
-      smoke + nix-build + `openspec validate --all --strict`).
+- [ ] 3.1 Document `[[sandbox.policy]]` in `config/config.toml.example` and the
+      "Operation policy" section of `docs/help/sandbox-backends.md`.
+- [ ] 3.2 Ratchets: config-reference and help, `config_example`, env-overlay pin
+      (table, file-only), `hm_module_drift` (`OMITTED`),
+      `marked_definition_count_is_pinned` (rule action enum), repo clamp
+      (accumulate, deny only).
+- [ ] 3.3 Run `just ci` (includes `openspec validate --all --strict`) once, when
+      the implementation is complete.
