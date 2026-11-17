@@ -111,6 +111,10 @@ const LIVE_WITHOUT_HOOK: &[(&str, &str)] = &[
         "model_proxy.*",
         "the model-proxy supervisor re-reads its section on every reload (spawn_supervisor)",
     ),
+    (
+        "monitor.processes",
+        "read from `current_config` on every tick: run.rs `wants_process_scan` call sites",
+    ),
 ];
 
 #[test]

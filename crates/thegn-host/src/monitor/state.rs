@@ -67,21 +67,42 @@ impl MonitorPrefs {
     /// on top from the DB.
     pub fn from_config(cfg: &thegn_core::config::MonitorConfig) -> MonitorPrefs {
         let ladder = WindowLadder::parse(&cfg.window_ladder);
-        // Snap the configured default onto the ladder, so `[`/`]` always start
-        // from a rung they can walk rather than from a value between two.
-        let window = Window::from_key(&cfg.default_window)
-            .map(|w| ladder.nearest(w))
-            .unwrap_or_else(|| ladder.nearest(Window::DEFAULT));
-        let base = TabPrefs {
-            style: GraphStyle::from_key(&cfg.default_style).unwrap_or_default(),
-            scale: ScaleMode::from_key(&cfg.default_scale).unwrap_or_default(),
-            window,
-        };
+        let base = config_base(cfg, &ladder);
         MonitorPrefs {
             per_tab: [base; MonitorTab::ALL.len()],
             ladder,
             ..Default::default()
         }
+    }
+
+    /// Re-apply an edited `[monitor]` section (the config-reload Monitor hook).
+    ///
+    /// The ladder follows `new`. A tab whose style, scale or window still
+    /// equals the OLD config's default follows the new default; a value the
+    /// user picked (a key press, or a DB-persisted pref) is kept. Every window
+    /// then re-snaps onto the new ladder, so `[`/`]` start from a rung. Pure:
+    /// nothing is persisted here.
+    pub fn reapply_config(
+        &mut self,
+        old: &thegn_core::config::MonitorConfig,
+        new: &thegn_core::config::MonitorConfig,
+    ) {
+        let old_base = config_base(old, &WindowLadder::parse(&old.window_ladder));
+        let ladder = WindowLadder::parse(&new.window_ladder);
+        let new_base = config_base(new, &ladder);
+        for tab in &mut self.per_tab {
+            if tab.style == old_base.style {
+                tab.style = new_base.style;
+            }
+            if tab.scale == old_base.scale {
+                tab.scale = new_base.scale;
+            }
+            if tab.window == old_base.window {
+                tab.window = new_base.window;
+            }
+            tab.window = ladder.nearest(tab.window);
+        }
+        self.ladder = ladder;
     }
 
     #[allow(dead_code)] // first readers are the Phase-2 tab lanes (THE-836 F6c)
@@ -207,6 +228,20 @@ impl MonitorPrefs {
             );
         }
         out
+    }
+}
+
+/// The per-tab defaults `[monitor]` seeds, with the configured window snapped
+/// onto `ladder` so `[`/`]` always start from a rung they can walk rather than
+/// from a value between two.
+fn config_base(cfg: &thegn_core::config::MonitorConfig, ladder: &WindowLadder) -> TabPrefs {
+    let window = Window::from_key(&cfg.default_window)
+        .map(|w| ladder.nearest(w))
+        .unwrap_or_else(|| ladder.nearest(Window::DEFAULT));
+    TabPrefs {
+        style: GraphStyle::from_key(&cfg.default_style).unwrap_or_default(),
+        scale: ScaleMode::from_key(&cfg.default_scale).unwrap_or_default(),
+        window,
     }
 }
 
@@ -399,6 +434,100 @@ mod tests {
         assert_eq!(p.tab(MonitorTab::Cpu).window, Window::from_secs(600));
         p.widen(MonitorTab::Cpu);
         assert_eq!(p.tab(MonitorTab::Cpu).window, Window::from_secs(3600));
+    }
+
+    fn mcfg(
+        ladder: &[&str],
+        window: &str,
+        style: &str,
+        scale: &str,
+    ) -> thegn_core::config::MonitorConfig {
+        let base = thegn_core::config::MonitorConfig::default();
+        thegn_core::config::MonitorConfig {
+            window_ladder: if ladder.is_empty() {
+                base.window_ladder.clone()
+            } else {
+                ladder.iter().map(|s| (*s).to_string()).collect()
+            },
+            default_window: window.into(),
+            default_style: style.into(),
+            default_scale: scale.into(),
+            ..base
+        }
+    }
+
+    #[test]
+    fn reapply_config_follows_unchanged_defaults_and_keeps_user_choices() {
+        let old = mcfg(&[], "1m", "area", "window");
+        let new = mcfg(&[], "1m", "line", "log");
+        let mut p = MonitorPrefs::from_config(&old);
+        // The user picked a style on CPU and a scale on Memory.
+        p.tab_mut(MonitorTab::Cpu).style = GraphStyle::Spark;
+        p.tab_mut(MonitorTab::Memory).scale = ScaleMode::Fixed;
+        p.last_tab = MonitorTab::Disk;
+        p.reapply_config(&old, &new);
+        // Kept: the user-changed values.
+        assert_eq!(p.tab(MonitorTab::Cpu).style, GraphStyle::Spark);
+        assert_eq!(p.tab(MonitorTab::Memory).scale, ScaleMode::Fixed);
+        // Followed: the unchanged defaults.
+        assert_eq!(p.tab(MonitorTab::Cpu).scale, ScaleMode::Log);
+        assert_eq!(p.tab(MonitorTab::Memory).style, GraphStyle::Line);
+        assert_eq!(p.tab(MonitorTab::Network).style, GraphStyle::Line);
+        assert_eq!(p.tab(MonitorTab::Network).scale, ScaleMode::Log);
+        // Cross-tab prefs are untouched.
+        assert_eq!(p.last_tab, MonitorTab::Disk);
+    }
+
+    #[test]
+    fn reapply_config_moves_an_unchanged_default_window() {
+        let old = mcfg(&["1m", "10m", "1h"], "1m", "area", "window");
+        let new = mcfg(&["1m", "10m", "1h"], "10m", "area", "window");
+        let mut p = MonitorPrefs::from_config(&old);
+        p.tab_mut(MonitorTab::Cpu).window = Window::from_secs(3600);
+        p.reapply_config(&old, &new);
+        assert_eq!(p.tab(MonitorTab::Cpu).window, Window::from_secs(3600));
+        assert_eq!(p.tab(MonitorTab::Memory).window, Window::from_secs(600));
+    }
+
+    #[test]
+    fn reapply_config_snaps_windows_onto_a_shrunk_ladder() {
+        let old = mcfg(&["1m", "10m", "1h", "12h"], "1m", "area", "window");
+        let new = mcfg(&["1m", "1h"], "1m", "area", "window");
+        let mut p = MonitorPrefs::from_config(&old);
+        // A user-chosen 12h rung no longer exists: snap to the nearest rung.
+        p.tab_mut(MonitorTab::Cpu).window = Window::from_secs(43_200);
+        p.reapply_config(&old, &new);
+        let cpu = p.tab(MonitorTab::Cpu).window;
+        assert!(p.ladder().contains(cpu), "{cpu} is off-ladder");
+        assert_eq!(cpu, Window::from_secs(3600));
+        assert!(!p.ladder().contains(Window::from_secs(600)));
+        for t in MonitorTab::ALL {
+            assert!(p.ladder().contains(p.tab(t).window), "{t:?}");
+        }
+    }
+
+    #[test]
+    fn reapply_config_with_an_empty_ladder_falls_back_to_the_default() {
+        let old = mcfg(&["1m", "1h"], "1m", "area", "window");
+        let mut new = mcfg(&[], "1m", "area", "window");
+        new.window_ladder = Vec::new();
+        let mut p = MonitorPrefs::from_config(&old);
+        p.reapply_config(&old, &new);
+        assert_eq!(p.ladder(), &WindowLadder::default_ladder());
+        assert!(p.ladder().windows().len() > 1, "keys must stay usable");
+        for t in MonitorTab::ALL {
+            assert!(p.ladder().contains(p.tab(t).window), "{t:?}");
+        }
+    }
+
+    #[test]
+    fn reapply_config_with_no_change_is_a_no_op() {
+        let cfg = mcfg(&[], "1m", "line", "log");
+        let mut p = MonitorPrefs::from_config(&cfg);
+        p.tab_mut(MonitorTab::Cpu).style = GraphStyle::Spark;
+        let before = p.clone();
+        p.reapply_config(&cfg, &cfg);
+        assert_eq!(p, before);
     }
 
     #[test]
