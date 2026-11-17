@@ -1,0 +1,40 @@
+---
+id: sandbox-network
+title: Sandbox network
+parent: sandboxing
+order: 4
+---
+
+# Sandbox network
+
+Part of [[sandboxing]]. The network mode and the allow and block lists.
+
+## Network
+
+By default a `standard` sandbox keeps networking so fetch, clone, build,
+and debuggers work; `sealed` removes it entirely. `[sandbox]` also
+carries DNS-name allow/block rules for the middle ground. These rules are not
+an egress boundary; `network = "none"` is the only enforced deny, and `*` in
+`network_block` means offline — see [[config-reference]].
+Standalone sandboxed terminals also warn when DNS-name rules apply, because
+those rules are not an egress boundary.
+
+`[sandbox.vpn]` can put the sandbox on an overlay network (tailscale,
+headscale, wireguard, openvpn, netbird, zerotier). The `mode` decides how:
+`sidecar` (default, best isolation — a companion container owns the
+netns), `proxy` (userspace SOCKS/HTTP; **not** a containment boundary, but
+the only honest option for bwrap/systemd), `in_container`, or `netns`.
+`on_error` decides what happens when the tunnel will not come up: `fail`
+refuses to launch, `warn` launches anyway, `offline` forces
+`network=none` so nothing leaks onto the host network.
+
+A running VPN sidecar is reused only when its tunnel configuration matches.
+Otherwise the result follows `on_error`: `fail` refuses launch, `warn`
+continues without the VPN, and `offline` forces `network=none`. The sidecar
+stays running. Stop this worktree's sandbox (close the worktree, or remove both
+the worktree container and sidecar) so both are recreated with the new
+configuration. An unlabelled sidecar from before this check counts as changed.
+
+Separately, `[network]` auto-detects when the machine is offline and
+pauses remote refreshes rather than hammering unreachable endpoints;
+local caches are served stale and it restores on the next success.
