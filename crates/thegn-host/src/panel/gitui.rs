@@ -1784,7 +1784,8 @@ fn works_at_normal(msg: &GitMsg) -> bool {
 
 /// Why a partial stash has nothing to take, or `None` when it may proceed.
 ///
-/// `Staged` needs a staged row; `Unstaged` needs an unstaged or untracked row
+/// `Staged` refuses only when every row is untracked (a partially staged row
+/// hydrates as Unstaged); `Unstaged` needs an unstaged or untracked row
 /// (svc's unstaged stash includes untracked files). `All` always proceeds:
 /// git itself reports "no local changes".
 pub(crate) fn stash_preflight(
@@ -1795,9 +1796,10 @@ pub(crate) fn stash_preflight(
     use crate::panel::Stage;
     match mode {
         StashMode::All => None,
-        StashMode::Staged => {
-            (!changes.iter().any(|c| c.stage == Stage::Staged)).then_some("nothing staged to stash")
-        }
+        StashMode::Staged => changes
+            .iter()
+            .all(|c| c.stage == Stage::Untracked)
+            .then_some("nothing staged to stash"),
         StashMode::Unstaged => (!changes
             .iter()
             .any(|c| matches!(c.stage, Stage::Unstaged | Stage::Untracked)))
@@ -3570,9 +3572,10 @@ mod tests {
         let conflict = [change("a", Stage::Conflict)];
         let cases: &[(StashMode, &[crate::panel::ChangeRow], Option<&str>)] = &[
             (StashMode::Staged, &staged, None),
+            (StashMode::Staged, &unstaged, None),
             (
                 StashMode::Staged,
-                &unstaged,
+                &untracked,
                 Some("nothing staged to stash"),
             ),
             (StashMode::Staged, &[], Some("nothing staged to stash")),

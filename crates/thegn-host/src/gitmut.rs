@@ -1489,17 +1489,6 @@ mod tests {
         assert_eq!(StashMode::default(), StashMode::All);
     }
 
-    // test code: fixture reads, never on the event loop.
-    #[expect(clippy::disallowed_methods)]
-    fn git_out(dir: &std::path::Path, args: &[&str]) -> String {
-        let out = thegn_core::util::git_cmd(dir)
-            .args(args)
-            .output()
-            .expect("git runs");
-        assert!(out.status.success(), "git {args:?}");
-        String::from_utf8_lossy(&out.stdout).into_owned()
-    }
-
     /// `a.txt` staged, `f.txt` modified but unstaged.
     fn stash_fixture(tag: &str) -> std::path::PathBuf {
         let dir = tmp_repo(tag);
@@ -1521,10 +1510,7 @@ mod tests {
             GitOpResult::Ok(_) => {}
             other => panic!("{other:?}"),
         }
-        assert_eq!(
-            git_out(&dir, &["diff", "--cached", "--name-only"]),
-            "a.txt\n"
-        );
+        assert_eq!(git_out(&dir, &["diff", "--cached", "--name-only"]), "a.txt");
         assert_eq!(std::fs::read_to_string(dir.join("f.txt")).unwrap(), "one\n");
         let patch = git_out(&dir, &["stash", "show", "-p", "stash@{0}"]);
         assert!(patch.contains("f.txt"), "{patch}");
