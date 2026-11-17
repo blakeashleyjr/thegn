@@ -2480,6 +2480,10 @@ mod tests {
     }
 
     #[test]
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "test drives the archive extract script in a real shell"
+    )]
     fn archive_extract_script_extracts_and_removes_the_stage() {
         if !std::path::Path::new("/bin/sh").exists() {
             return;
