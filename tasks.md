@@ -1650,3 +1650,7 @@ _An agent that changes the shell must be able to see the frame. The muse harness
 - [ ] 513. Compile-out AI components — feature flag for a lean binary without proxy/agent/MCP layers
 - [~] 514. Graceful degradation — AI panels, dots, cost widgets simply absent; nothing else breaks
 - [x] 515. No-AI privacy posture — zero outbound model traffic, smaller attack surface, fully local
+
+### BA. The Lead meta-agent (b152)
+
+- [ ] 761. The Lead — a sandboxed agent tab with a scoped tool surface (overview, notifications, automations, approvals, merge drain) that watches the workspace and drives workers (THE-2171)
