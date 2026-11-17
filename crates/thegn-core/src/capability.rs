@@ -354,6 +354,14 @@ pub const CATALOG: &[HostCapability] = &[
         SurfaceSet::ALL,
         "Clear the merge queue for a worktree's repo",
     ),
+    // Lead tool surface (THE-2172): gRPC and plugin projection queued; not
+    // claimed, so no gap rows.
+    cap(
+        "merge.drain",
+        Verb::MergeDrain,
+        SurfaceSet::of(&[Surface::Http, Surface::Cli, Surface::Mcp]),
+        "Start the merge-queue drain for a worktree's repo",
+    ),
     cap(
         "pr.status",
         Verb::PrStatus,
@@ -397,6 +405,20 @@ pub const CATALOG: &[HostCapability] = &[
         SurfaceSet::ALL,
         "Push a notification into the tray",
     ),
+    // Lead tool surface (THE-2172): gRPC and plugin projection queued; not
+    // claimed, so no gap rows.
+    cap(
+        "notifications.list",
+        Verb::NotificationsList,
+        SurfaceSet::of(&[Surface::Http, Surface::Cli, Surface::Mcp]),
+        "List notifications filtered by kind, unread state, age and worktree",
+    ),
+    cap(
+        "notifications.ack",
+        Verb::NotificationsAck,
+        SurfaceSet::of(&[Surface::Http, Surface::Cli, Surface::Mcp]),
+        "Acknowledge one notification, a worktree's, or all of them",
+    ),
     // --- trusted automation -------------------------------------------------
     cap(
         "automations.list",
@@ -415,6 +437,63 @@ pub const CATALOG: &[HostCapability] = &[
         Verb::ToolsRun,
         SurfaceSet::ALL,
         "Run one trusted configured tool by name in a worktree",
+    ),
+    // --- lead-authored automations (THE-2172) ---------------------------------
+    // Lead tool surface (THE-2172): gRPC and plugin projection queued; not
+    // claimed, so no gap rows. Config rules stay read-only through these.
+    cap(
+        "automations.put",
+        Verb::AutomationsPut,
+        SurfaceSet::of(&[Surface::Http, Surface::Cli, Surface::Mcp]),
+        "Create or replace a Lead-authored automation rule",
+    ),
+    cap(
+        "automations.rm",
+        Verb::AutomationsRm,
+        SurfaceSet::of(&[Surface::Http, Surface::Cli, Surface::Mcp]),
+        "Remove a Lead-authored automation rule",
+    ),
+    cap(
+        "automations.enable",
+        Verb::AutomationsEnable,
+        SurfaceSet::of(&[Surface::Http, Surface::Cli, Surface::Mcp]),
+        "Enable or disable a Lead-authored automation rule",
+    ),
+    cap(
+        "automations.runs",
+        Verb::AutomationsRuns,
+        SurfaceSet::of(&[Surface::Http, Surface::Cli, Surface::Mcp]),
+        "Recent audited runs of an automation rule",
+    ),
+    // --- approvals (THE-2172) -------------------------------------------------
+    // Lead tool surface (THE-2172): gRPC and plugin projection queued; not
+    // claimed, so no gap rows. Resolving is Admin, so it is HTTP + CLI only.
+    cap(
+        "approvals.list",
+        Verb::ApprovalsList,
+        SurfaceSet::of(&[Surface::Http, Surface::Cli, Surface::Mcp]),
+        "Approval history and pending approval requests",
+    ),
+    cap(
+        "approvals.request",
+        Verb::ApprovalsRequest,
+        SurfaceSet::of(&[Surface::Http, Surface::Cli, Surface::Mcp]),
+        "Ask a human to approve a pipeline stage (never grants)",
+    ),
+    cap(
+        "approvals.resolve",
+        Verb::ApprovalsResolve,
+        SurfaceSet::of(&[Surface::Http, Surface::Cli]),
+        "Grant or deny a pending pipeline approval (admin; never MCP or plugin)",
+    ),
+    // --- lead (THE-2171) ------------------------------------------------------
+    // Lead tool surface (THE-2172): gRPC and plugin projection queued; not
+    // claimed, so no gap rows.
+    cap(
+        "overview.get",
+        Verb::OverviewGet,
+        SurfaceSet::of(&[Surface::Http, Surface::Cli, Surface::Mcp]),
+        "One-call cross-workspace overview: worktrees, agents, queues, attention",
     ),
     // --- agents --------------------------------------------------------------
     cap(
@@ -1690,6 +1769,50 @@ mod tests {
             assert!(c.deprecated.is_none(), "{}", c.id);
             assert!(c.stub.is_none(), "{}", c.id);
         }
+    }
+
+    #[test]
+    fn lead_rows_claim_http_cli_mcp_and_resolve_is_operator_only() {
+        // THE-2172: eleven Lead rows. gRPC and plugin are queued, not claimed,
+        // so none of them is a SURFACE_GAPS excuse.
+        let lead = [
+            "overview.get",
+            "notifications.list",
+            "notifications.ack",
+            "automations.put",
+            "automations.rm",
+            "automations.enable",
+            "automations.runs",
+            "approvals.list",
+            "approvals.request",
+            "approvals.resolve",
+            "merge.drain",
+        ];
+        assert_eq!(lead.len(), 11);
+        let rows: Vec<&HostCapability> =
+            CATALOG.iter().filter(|c| lead.contains(&c.id.0)).collect();
+        assert_eq!(rows.len(), lead.len(), "one row per Lead capability");
+        for c in rows {
+            let expected = if c.id.0 == "approvals.resolve" {
+                SurfaceSet::of(&[Surface::Http, Surface::Cli])
+            } else {
+                SurfaceSet::of(&[Surface::Http, Surface::Cli, Surface::Mcp])
+            };
+            assert_eq!(c.surfaces, expected, "{}", c.id);
+            assert!(c.deprecated.is_none(), "{}", c.id);
+            assert!(c.stub.is_none(), "{}", c.id);
+            for s in Surface::ALL {
+                assert!(!is_gap(c.id.0, *s), "{}/{} is excused", c.id, s.as_str());
+            }
+        }
+        assert_eq!(
+            crate::control::required_scope(lookup("approvals.resolve").unwrap().verb),
+            crate::control::Scope::Admin
+        );
+        assert_eq!(
+            crate::control::required_scope(lookup("merge.drain").unwrap().verb),
+            crate::control::Scope::MergeAdd
+        );
     }
 
     #[test]
