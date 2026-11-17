@@ -83,6 +83,64 @@ pub(crate) struct ChangesActivateCtx<'a> {
     pub hydration_gen: u64,
 }
 
+/// True while a non-empty Files filter is live (the Changes list then renders
+/// flat in `display_map` order and `panel_ui.cursor` is in display space).
+fn files_filter_live(panel_ui: &crate::panel::PanelUi) -> bool {
+    panel_ui
+        .git
+        .filter
+        .as_ref()
+        .is_some_and(|f| f.view == crate::panel::gitui::GitView::Files && !f.query.is_empty())
+}
+
+/// Map a panel cursor to a SOURCE index into `model.panel.changes`. Under a
+/// live filter the cursor is a display position; otherwise it is the index.
+fn source_index(
+    panel_ui: &crate::panel::PanelUi,
+    model: &FrameModel,
+    cursor: usize,
+) -> Option<usize> {
+    if files_filter_live(panel_ui) {
+        crate::panel::gitui::display_map(
+            &panel_ui.git,
+            crate::panel::gitui::GitView::Files,
+            &model.panel,
+        )
+        .get(cursor)
+        .copied()
+    } else {
+        Some(cursor)
+    }
+}
+
+/// Path of the non-submodule conflict row at SOURCE index `src`, if it is one.
+fn conflict_path_at(model: &FrameModel, src: usize) -> Option<String> {
+    model
+        .panel
+        .changes
+        .get(src)
+        .filter(|c| c.stage == crate::panel::Stage::Conflict && c.submodule.is_none())
+        .map(|c| c.path.clone())
+}
+
+fn open_conflict(ctx: &mut ChangesActivateCtx<'_>, path: &str) {
+    let cwd = crate::run::active_cwd(ctx.session);
+    if crate::panel_util::open_editor(
+        ctx.session,
+        ctx.panes,
+        ctx.cfg,
+        path,
+        None,
+        cwd.as_deref(),
+        ctx.center,
+        None,
+    ) {
+        ctx.focus.zone = Zone::Center;
+    }
+    crate::run::refresh_tab_model(ctx.model, ctx.session, ctx.sb);
+    *ctx.need_relayout = true;
+}
+
 /// Activate the cursor row of the changes section on Enter. Dispatches by row:
 /// a **conflict** file opens in the editor for resolution; an **entity** row in
 /// the expanded semantic breakdown (`cursor > changes.len()`) drills into its
@@ -90,38 +148,53 @@ pub(crate) struct ChangesActivateCtx<'a> {
 /// breakdown and widens a resting panel so it's readable; any other **file** row
 /// toggles its summary preview. A plain file row is reserved for the git
 /// staging drill dispatched by the row-mode key handler.
-pub(crate) fn select_changes_row(ctx: ChangesActivateCtx<'_>) {
+pub(crate) fn select_changes_row(mut ctx: ChangesActivateCtx<'_>) {
     let cursor = ctx.panel_ui.cursor;
     // Boundaries in the VISIBLE cursor space (collapsed merge-incoming rows
     // are not file rows here) — see `visible_change_files`.
     let deep = ctx.panel_ui.width != crate::layout::PanelWidth::Normal;
     let n = crate::panel::visible_change_files(&ctx.model.panel, deep);
 
-    let is_conflict = cursor < n
-        && ctx
+    let filtering = files_filter_live(ctx.panel_ui);
+    if filtering {
+        // Footer and entity rows are not rendered under a filter.
+        let Some(src) = source_index(ctx.panel_ui, ctx.model, cursor) else {
+            return;
+        };
+        if let Some(path) = conflict_path_at(ctx.model, src) {
+            open_conflict(&mut ctx, &path);
+            return;
+        }
+        if ctx
             .model
             .panel
             .changes
-            .get(cursor)
-            .is_some_and(|c| c.stage == crate::panel::Stage::Conflict && c.submodule.is_none());
-    if is_conflict {
-        if let Some(path) = ctx.model.panel.changes.get(cursor).map(|c| c.path.clone()) {
-            let cwd = crate::run::active_cwd(ctx.session);
-            if crate::panel_util::open_editor(
-                ctx.session,
-                ctx.panes,
-                ctx.cfg,
-                &path,
-                None,
-                cwd.as_deref(),
-                ctx.center,
-                None,
-            ) {
-                ctx.focus.zone = Zone::Center;
-            }
-            crate::run::refresh_tab_model(ctx.model, ctx.session, ctx.sb);
-            *ctx.need_relayout = true;
+            .get(src)
+            .is_some_and(|row| row.submodule.is_none())
+        {
+            return;
         }
+        let total = ctx.model.panel.changes.len();
+        toggle_change_selection(
+            src,
+            total,
+            ctx.panel_ui,
+            ctx.model,
+            ctx.session,
+            ctx.hunk_inflight,
+            ctx.hunk_tx,
+            ctx.submodule_inflight,
+            ctx.submodule_tx,
+            ctx.waker,
+            ctx.hydration_gen,
+        );
+        return;
+    }
+
+    if cursor < n
+        && let Some(path) = conflict_path_at(ctx.model, cursor)
+    {
+        open_conflict(&mut ctx, &path);
         return;
     }
 
@@ -197,7 +270,11 @@ pub(crate) fn follow_change_cursor(
         Some(None) => panel_ui.chg_sel = None,
         Some(Some(cursor)) => toggle_change_selection(
             cursor,
-            crate::panel::visible_change_files(&model.panel, true),
+            if files_filter_live(panel_ui) {
+                model.panel.changes.len()
+            } else {
+                crate::panel::visible_change_files(&model.panel, true)
+            },
             panel_ui,
             model,
             session,
@@ -225,9 +302,21 @@ fn follow_change_cursor_target(
     if panel_ui.width != crate::layout::PanelWidth::Half || !panel_ui.row_mode {
         return None;
     }
-    let visible = crate::panel::visible_change_files(&model.panel, true);
-    (panel_ui.cursor < visible && panel_ui.chg_sel != Some(panel_ui.cursor))
-        .then_some(Some(panel_ui.cursor))
+    let bound = if files_filter_live(panel_ui) {
+        crate::panel::gitui::display_map(
+            &panel_ui.git,
+            crate::panel::gitui::GitView::Files,
+            &model.panel,
+        )
+        .len()
+    } else {
+        crate::panel::visible_change_files(&model.panel, true)
+    };
+    if panel_ui.cursor >= bound {
+        return None;
+    }
+    let target = source_index(panel_ui, model, panel_ui.cursor)?;
+    (panel_ui.chg_sel != Some(target)).then_some(Some(target))
 }
 
 /// Activate row `i` of the changes section.
@@ -773,5 +862,85 @@ mod tests {
         assert_eq!(follow_change_cursor_target(&ui, &model), None);
         ui.width = crate::layout::PanelWidth::Normal;
         assert_eq!(follow_change_cursor_target(&ui, &model), Some(None));
+    }
+
+    fn filter_fixture(query: &str, paths: &[&str]) -> (crate::panel::PanelUi, FrameModel) {
+        let mut model = FrameModel::default();
+        for p in paths {
+            model.panel.changes.push(crate::panel::ChangeRow {
+                path: (*p).into(),
+                ..Default::default()
+            });
+        }
+        let mut ui = crate::panel::PanelUi {
+            open: crate::panel::Section::Changes,
+            width: crate::layout::PanelWidth::Half,
+            row_mode: true,
+            ..Default::default()
+        };
+        ui.git.filter = Some(crate::panel::gitui::ListFilter {
+            view: crate::panel::gitui::GitView::Files,
+            query: query.into(),
+            editing: false,
+            map: Vec::new(),
+        });
+        (ui, model)
+    }
+
+    #[test]
+    fn follow_cursor_uses_source_index_under_filter() {
+        let (mut ui, model) =
+            filter_fixture("main", &["src/main.rs", "src/lib.rs", "docs/main.md"]);
+        ui.cursor = 1;
+        assert_eq!(follow_change_cursor_target(&ui, &model), Some(Some(2)));
+        assert_eq!(source_index(&ui, &model, 1), Some(2));
+        // Already selected on the source index: no re-toggle.
+        ui.chg_sel = Some(2);
+        assert_eq!(follow_change_cursor_target(&ui, &model), None);
+    }
+
+    #[test]
+    fn follow_cursor_past_filtered_length_selects_nothing() {
+        let (mut ui, model) =
+            filter_fixture("main", &["src/main.rs", "src/lib.rs", "docs/main.md"]);
+        ui.cursor = 2;
+        assert_eq!(follow_change_cursor_target(&ui, &model), None);
+        assert_eq!(source_index(&ui, &model, 2), None);
+    }
+
+    #[test]
+    fn follow_cursor_without_filter_is_unchanged() {
+        let (mut ui, model) = filter_fixture("", &["a.rs", "b.rs", "c.rs"]);
+        assert!(!files_filter_live(&ui));
+        ui.cursor = 1;
+        assert_eq!(follow_change_cursor_target(&ui, &model), Some(Some(1)));
+        assert_eq!(source_index(&ui, &model, 1), Some(1));
+    }
+
+    #[test]
+    fn filtered_conflict_row_resolves_to_its_path() {
+        let (mut ui, mut model) =
+            filter_fixture("main", &["src/lib.rs", "src/main.rs", "docs/main.md"]);
+        model.panel.changes[2].stage = crate::panel::Stage::Conflict;
+        ui.cursor = 1;
+        let src = source_index(&ui, &model, 1).unwrap();
+        assert_eq!(src, 2);
+        assert_eq!(
+            conflict_path_at(&model, src).as_deref(),
+            Some("docs/main.md")
+        );
+        assert_eq!(conflict_path_at(&model, 1), None);
+    }
+
+    #[test]
+    fn filtered_incoming_row_beyond_visible_is_selectable_target() {
+        // Many rows; the matching one sits past any collapsed-incoming bound.
+        let mut paths: Vec<String> = (0..5).map(|i| format!("f{i}.rs")).collect();
+        paths.push("zzz_target.rs".into());
+        let refs: Vec<&str> = paths.iter().map(String::as_str).collect();
+        let (mut ui, mut model) = filter_fixture("zzz_target", &refs);
+        model.panel.changes[5].incoming = true;
+        ui.cursor = 0;
+        assert_eq!(follow_change_cursor_target(&ui, &model), Some(Some(5)));
     }
 }
