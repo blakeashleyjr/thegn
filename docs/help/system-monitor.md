@@ -365,6 +365,10 @@ processes are trimmed first, then panes, behind a "+N more" row; workspaces
 and worktrees always show. Like the Processes tab, sampling happens only while
 the popup is open.
 
+While the popup is open each row also shows a short CPU trend (the last
+few samples, up to 8 cells). A row needs two samples before its trend
+appears, and reopening the popup after a pause starts the trends fresh.
+
 `↑`/`↓` (or `j`/`k`) move a cursor through the tree. `↵` on a workspace,
 worktree or pane row jumps to that worktree (a workspace jumps to its heaviest
 worktree). `↵` on a process row opens the monitor's Processes tab, where kill
