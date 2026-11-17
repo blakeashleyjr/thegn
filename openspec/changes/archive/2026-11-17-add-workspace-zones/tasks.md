@@ -33,10 +33,11 @@
 ## 5. UX
 
 - [x] 5.1 CLI `thegn zone list|create|rm [--force]|assign <zone> [repo]`.
-- [ ] 5.2 Palette actions + sidebar zone chip + detail zone status (deferred; CLI
-      covers management).
+- [x] 5.2 Palette actions + sidebar zone chip + detail zone status — split to
+      THE-139 (sidebar chip and palette; the detail zone status lands in b148
+      lane 4). CLI covers management.
 
 ## 6. Docs + validate
 
 - [x] 6.1 `config.toml.example`: `[zone.<name>]` + `[bundle.<n>] zone`.
-- [ ] 6.2 `openspec validate --all --strict` green.
+- [x] 6.2 `openspec validate --all --strict` green — superseded by the batch gate.

@@ -228,9 +228,8 @@
     {
       "issue": "THE-139",
       "project": "Workspace Product & Observability",
-      "changes": [
-        "add-workspace-zones"
-      ]
+      "changes": [],
+      "no_spec_rationale": "Zone security/config core delivered and archived as add-workspace-zones (2026-11-17). Remaining work is the sidebar zone chip and palette actions (the detail zone status lands in b148 lane 4); no proposal yet."
     },
     {
       "issue": "THE-140",
