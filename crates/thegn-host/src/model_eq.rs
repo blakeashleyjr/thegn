@@ -113,6 +113,7 @@ impl FrameModel {
             && self.active_tab == other.active_tab
             && self.sidebar_workspaces == other.sidebar_workspaces
             && self.workspace_envs == other.workspace_envs
+            && self.zone_catalog == other.zone_catalog
             && self.sidebar_db_worktrees == other.sidebar_db_worktrees
             && self.sidebar_db_folders == other.sidebar_db_folders
             && self.sidebar_db_terminals == other.sidebar_db_terminals
@@ -226,6 +227,20 @@ mod tests {
         let mut loc_changed = base.clone();
         loc_changed.loc = Some(thegn_core::loc::LocReport::total_only(42));
         assert!(!base.hydration_eq(&loc_changed), "loc change must repaint");
+    }
+
+    #[test]
+    fn hydration_eq_detects_zone_catalog_change() {
+        let base = FrameModel::default();
+        let mut changed = base.clone();
+        changed.zone_catalog.read_failed = true;
+        assert!(!base.hydration_eq(&changed));
+        let mut changed = base.clone();
+        changed
+            .zone_catalog
+            .by_repo
+            .insert("/repo".into(), "z1".into());
+        assert!(!base.hydration_eq(&changed), "zone change must repaint");
     }
 
     #[test]
