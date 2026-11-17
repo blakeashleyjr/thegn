@@ -42,6 +42,8 @@ name: ci
 # coverage smoke sandbox-e2e-dns sandbox-e2e-db term-check nix-build — and
 # `just ci-local` adds e2e. Stages NOT in the routine gate:
 #  - security-e2e (GitHub-hosted only; required mode fails on missing prerequisites).
+#    Its second step runs the user-namespace suite registry
+#    (`just sandbox-userns-e2e`, test/userns-e2e.d/); dispatch/nightly only.
 #  - sandbox-e2e-full (Tier-2 podman suites): not part of `just ci` either;
 #    the Tier-1 dns/db tests (no container runtime needed) DO run here.
 #  - macos: the aarch64-darwin build + unit tests. Opt-in per run (`extras:
@@ -313,6 +315,7 @@ jobs:
         with:
           nix-token: ${{ secrets.NIX_GITHUB_TOKEN }}
       - run: nix develop --command just security-e2e
+      - run: nix develop --command env THEGN_REQUIRE_SECURITY_TESTS=1 just sandbox-userns-e2e
   nix-build:
     # heavy: dispatch + nightly only; never on a pull request (see the header)
     if: |-

@@ -1073,6 +1073,13 @@ security-e2e:
     THEGN_REQUIRE_SECURITY_TESTS=1 cargo nextest run -p thegn-host --test security_e2e --test stage_worker_commit_e2e
     THEGN_REQUIRE_SECURITY_TESTS=1 cargo nextest run -p thegn-core --test sandbox_sealed_home -E 'test(real_bwrap_sealed_) | test(user_gnupg_mount_never_reaches_a_sealed_argv)'
 
+# Registry of user-namespace / confinement suites (test/userns-e2e.d/*.sh); each
+# exits 0 (pass), 77 (skip) or another status (fail). Dispatch/nightly only: a
+# step of the `security-e2e` CI job, never a pull-request gate. Set
+# THEGN_REQUIRE_SECURITY_TESTS=1 to make a skip fail.
+sandbox-userns-e2e:
+    ./test/userns-e2e.sh
+
 # Same, but against the built Nix package (verifies the wrapper + injected deps).
 smoke-pkg:
     ./test/smoke.sh "$(nix build .#default --no-link --print-out-paths)/bin/thegn"
