@@ -188,7 +188,7 @@ pub fn overlay_declares_lsp(body: &str, format: &str) -> bool {
             .parse::<toml::Value>()
             .ok()
             .is_some_and(|v| v.get("lsp").is_some()),
-        "yaml" | "yml" => serde_yaml::from_str::<serde_yaml::Value>(body)
+        "yaml" | "yml" => serde_saphyr::from_str::<serde_json::Value>(body)
             .ok()
             .is_some_and(|v| v.get("lsp").is_some()),
         "json" => serde_json::from_str::<serde_json::Value>(body)
@@ -325,6 +325,18 @@ mod tests {
             "json"
         ));
         assert!(!overlay_declares_lsp("{\"sandbox\": {}}", "json"));
+        // Nested YAML maps (and the `.yml` spelling) still find the table.
+        assert!(overlay_declares_lsp(
+            "lsp:\n  servers:\n    rust:\n      command: rust-analyzer\n      env: {RUST_LOG: info}\n",
+            "yml"
+        ));
+        assert!(!overlay_declares_lsp(
+            "sandbox:\n  lsp_like:\n    lsp: true\n",
+            "yaml"
+        ));
+        // Malformed YAML (and a duplicate key) ⇒ false, no panic.
+        assert!(!overlay_declares_lsp("lsp: [\n", "yaml"));
+        assert!(!overlay_declares_lsp("lsp: {}\nlsp: {}\n", "yaml"));
         // Malformed input and unknown format ⇒ false, no panic.
         assert!(!overlay_declares_lsp("!!! not toml", "toml"));
         assert!(!overlay_declares_lsp("anything", "ini"));
