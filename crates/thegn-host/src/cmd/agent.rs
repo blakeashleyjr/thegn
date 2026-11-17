@@ -15,6 +15,9 @@
 //! `run` spawns a headless agent into a worktree in one command and, with
 //! `--wait`, blocks until it exits and prints its output tail (THE-2005; the
 //! logic lives in [`super::agent_spawn`]).
+//!
+//! `result` is the read-only companion for a run started without `--wait`: it
+//! reports the session's status and an output tail without waiting for exit.
 
 use anyhow::Result;
 use std::collections::HashSet;
@@ -101,6 +104,25 @@ pub enum Action {
         #[arg(long)]
         json: bool,
     },
+    /// Report on an agent session without waiting: its status (`running`,
+    /// `exited`, `unknown`) and the output tail, by dispatch row or session
+    /// id. Exit 0 when the agent exited 0, 1 on another exit code, 3 while it
+    /// is still running, 2 when the session is unknown or no daemon answers.
+    /// `thegn dispatch wait --row` blocks instead.
+    #[command(group(
+        clap::ArgGroup::new("target").required(true).multiple(false).args(["row", "session"])
+    ))]
+    Result {
+        /// The dispatch row whose session to report on.
+        #[arg(long, conflicts_with = "session")]
+        row: Option<i64>,
+        /// The session id to report on.
+        #[arg(long, conflicts_with = "row")]
+        session: Option<String>,
+        /// Emit JSON `{row, session, status, exit_code, output_tail, tail_note}`.
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 pub fn run(cfg: &Config, action: Action) -> Result<()> {
@@ -137,6 +159,9 @@ pub fn run(cfg: &Config, action: Action) -> Result<()> {
                 json,
             },
         ),
+        Action::Result { row, session, json } => {
+            super::agent_spawn::result(cfg, super::agent_spawn::ResultArgs { row, session, json })
+        }
     }
 }
 
