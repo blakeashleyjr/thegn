@@ -74,7 +74,7 @@ fn publish_for_socket_at(socket: &Path, state_dir: &Path, sink: &mut dyn Publish
 
 /// The control sockets this process must publish for `dcfg`: the resolved endpoint and, when it is a relocated
 /// sibling of the predictable `/tmp` fallback, the predictable one too (a pane must not reach either).
-fn control_socket_candidates(dcfg: &thegn_core::config::DaemonConfig) -> Vec<PathBuf> {
+pub(crate) fn control_socket_candidates(dcfg: &thegn_core::config::DaemonConfig) -> Vec<PathBuf> {
     let state_dir = thegn_core::util::xdg_state_home().join("thegn");
     control_socket_candidates_from(
         super::socket_path(dcfg),
