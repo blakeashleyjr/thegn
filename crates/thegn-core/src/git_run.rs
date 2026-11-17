@@ -384,7 +384,9 @@ mod tests {
         crate::git_spawn_stats::reset_for_test();
         let dir = repo();
         let before = util::core_git_spawn_count();
-        let _ = git_run(
+        // The outcome is irrelevant (the fixture has no commits); only the
+        // recorded spawn is under test.
+        let _outcome = git_run(
             dir.path(),
             &["rev-parse", "HEAD"],
             &policy(),
