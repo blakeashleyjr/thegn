@@ -11,14 +11,18 @@ use thegn_core::theme_user::UserTheme;
 
 use crate::chrome::S;
 use crate::compositor::Rect;
-use crate::layer::{Anchor, LayerSpec, box_rect, open_layer};
+use crate::layer::{Anchor, LayerSpec, box_rect, dim_rect, open_layer};
+use crate::layout::ChromeLayout;
 use crate::seg::{self, Line, Seg, Tok, seg, sp};
 use crate::theme_store::ThemeOverrides;
 
 mod elements;
 mod picker;
 
-use elements::{ColorRole, ELEMENT_GROUPS, ElementRow, ROLES, element_rows, role_name, row_role};
+use elements::{
+    ColorRole, ELEMENT_GROUPS, ElementRow, ROLES, Spot, element_rows, group_spot, role_name,
+    row_role,
+};
 use picker::{GridLine, Move, PickerSection, PickerState};
 
 const CATALOG_COLS: usize = 27;
@@ -1012,6 +1016,57 @@ fn is_hex_input(character: char) -> bool {
     character == '#' || character.is_ascii_hexdigit()
 }
 
+/// The on-screen rects a spot keeps lit (empty when its region is absent).
+fn spot_rects(spot: Spot, chrome: &ChromeLayout) -> Vec<Rect> {
+    let rects: Vec<Rect> = match spot {
+        Spot::Sidebar => chrome.sidebar.into_iter().collect(),
+        Spot::Masthead => vec![chrome.masthead, chrome.center_tabs],
+        Spot::StatusBar => vec![chrome.statusbar],
+        Spot::Center => vec![chrome.center],
+        Spot::Panel => chrome.panel.into_iter().collect(),
+    };
+    rects
+        .into_iter()
+        .filter(|r| r.cols > 0 && r.rows > 0)
+        .collect()
+}
+
+/// `piece` minus `lit`: at most four non-overlapping rects.
+fn subtract_rect(piece: Rect, lit: Rect, out: &mut Vec<Rect>) {
+    let x0 = lit.x.max(piece.x);
+    let y0 = lit.y.max(piece.y);
+    let x1 = (lit.x + lit.cols).min(piece.x + piece.cols);
+    let y1 = (lit.y + lit.rows).min(piece.y + piece.rows);
+    if x0 >= x1 || y0 >= y1 {
+        out.push(piece);
+        return;
+    }
+    let mut push = |x: usize, y: usize, cols: usize, rows: usize| {
+        if cols > 0 && rows > 0 {
+            out.push(Rect { x, y, cols, rows });
+        }
+    };
+    push(piece.x, piece.y, piece.cols, y0 - piece.y); // above
+    push(piece.x, y1, piece.cols, piece.y + piece.rows - y1); // below
+    push(piece.x, y0, x0 - piece.x, y1 - y0); // left
+    push(x1, y0, piece.x + piece.cols - x1, y1 - y0); // right
+}
+
+/// The screen minus the lit rects, as non-overlapping rects (at most four per
+/// lit rect).
+fn spotlight_dims(screen: Rect, lit: &[Rect]) -> Vec<Rect> {
+    let mut pieces = vec![screen];
+    for &l in lit {
+        let mut next = Vec::with_capacity(pieces.len() + 3);
+        for p in pieces {
+            subtract_rect(p, l, &mut next);
+        }
+        pieces = next;
+    }
+    pieces.retain(|r| r.cols > 0 && r.rows > 0);
+    pieces
+}
+
 fn layer_spec() -> LayerSpec {
     LayerSpec {
         title: "theme builder".into(),
@@ -1180,8 +1235,31 @@ fn role_contrast(
 }
 
 impl ThemeBuilder {
-    pub(crate) fn render(&self, surface: &mut Surface, screen: Rect) {
-        let Some(inner) = open_layer(surface, screen, &layer_spec()) else {
+    /// The workspace region the focused element group paints, if any.
+    fn spot(&self) -> Option<Spot> {
+        if self.view != EditorView::Elements || self.picker.is_some() {
+            return None;
+        }
+        match element_rows(&self.collapsed).get(self.elem_cursor)? {
+            ElementRow::Group(g) | ElementRow::Element(g, _) => group_spot(*g),
+        }
+    }
+
+    pub(crate) fn render(&self, surface: &mut Surface, screen: Rect, chrome: &ChromeLayout) {
+        let mut spec = layer_spec();
+        let mut absent = None;
+        if let Some(spot) = self.spot() {
+            let lit = spot_rects(spot, chrome);
+            if lit.is_empty() {
+                absent = self.spot_group_name();
+            } else {
+                for r in spotlight_dims(screen, &lit) {
+                    dim_rect(surface, r);
+                }
+                spec.dim = false;
+            }
+        }
+        let Some(inner) = open_layer(surface, screen, &spec) else {
             return;
         };
         let panel = Tok::Slot(S::Panel);
@@ -1330,6 +1408,21 @@ impl ThemeBuilder {
                 );
             }
         }
+        if let Some(group) = absent
+            && layout.preview.rows > 0
+        {
+            seg::draw_line(
+                surface,
+                layout.preview.x,
+                layout.preview.y + layout.preview.rows - 1,
+                layout.preview.cols,
+                &Line::segs(vec![seg(
+                    Tok::Slot(S::Dim),
+                    format!("{group} is not on screen"),
+                )]),
+                panel,
+            );
+        }
         if let Some((mode, value)) = &self.input {
             let label = match mode {
                 InputMode::SaveName => "save as name",
@@ -1360,6 +1453,15 @@ impl ThemeBuilder {
                     &Line::segs(vec![seg(Tok::Hue(Hue::Red), status.clone())]),
                     panel,
                 );
+            }
+        }
+    }
+
+    /// Name of the group under the element cursor (for the not-on-screen note).
+    fn spot_group_name(&self) -> Option<&'static str> {
+        match element_rows(&self.collapsed).get(self.elem_cursor)? {
+            ElementRow::Group(g) | ElementRow::Element(g, _) => {
+                ELEMENT_GROUPS.get(*g).map(|(name, _)| *name)
             }
         }
     }
@@ -1687,6 +1789,148 @@ fn render_preview(surface: &mut Surface, preview: Rect, panel: Tok, highlight: O
 mod tests {
     use super::*;
 
+    fn test_chrome(cols: usize, rows: usize) -> ChromeLayout {
+        crate::layout::compute(cols, rows, true, true)
+    }
+
+    fn area(rects: &[Rect]) -> usize {
+        rects.iter().map(|r| r.cols * r.rows).sum()
+    }
+
+    fn overlaps(a: Rect, b: Rect) -> bool {
+        a.x < b.x + b.cols && b.x < a.x + a.cols && a.y < b.y + b.rows && b.y < a.y + a.rows
+    }
+
+    fn assert_exact_cover(screen: Rect, lit: &[Rect], dims: &[Rect]) {
+        for (i, a) in dims.iter().enumerate() {
+            for b in &dims[i + 1..] {
+                assert!(!overlaps(*a, *b), "{a:?} overlaps {b:?}");
+            }
+            for l in lit {
+                assert!(!overlaps(*a, *l), "{a:?} overlaps lit {l:?}");
+            }
+        }
+        let mut lit_area = 0;
+        for y in 0..screen.rows {
+            for x in 0..screen.cols {
+                if lit.iter().any(|l| l.contains(x, y)) {
+                    lit_area += 1;
+                }
+            }
+        }
+        assert_eq!(area(dims) + lit_area, screen.cols * screen.rows);
+    }
+
+    #[test]
+    fn spotlight_dims_cover_screen_exactly() {
+        let screen = Rect::full(40, 20);
+        let mid = Rect {
+            x: 5,
+            y: 3,
+            cols: 10,
+            rows: 6,
+        };
+        let dims = spotlight_dims(screen, &[mid]);
+        assert!(dims.len() <= 4);
+        assert_exact_cover(screen, &[mid], &dims);
+        let edge = Rect {
+            x: 0,
+            y: 0,
+            cols: 8,
+            rows: 20,
+        };
+        let dims = spotlight_dims(screen, &[edge]);
+        assert_eq!(dims.len(), 1);
+        assert_exact_cover(screen, &[edge], &dims);
+        assert!(spotlight_dims(screen, &[screen]).is_empty());
+        let top = Rect {
+            x: 0,
+            y: 0,
+            cols: 40,
+            rows: 1,
+        };
+        let tabs = Rect {
+            x: 10,
+            y: 2,
+            cols: 20,
+            rows: 1,
+        };
+        let dims = spotlight_dims(screen, &[top, tabs]);
+        assert_exact_cover(screen, &[top, tabs], &dims);
+    }
+
+    #[test]
+    fn spot_is_none_in_tokens_picker_and_apply() {
+        let mut b = builder();
+        assert_eq!(b.view, EditorView::Tokens);
+        assert_eq!(b.spot(), None);
+        b.view = EditorView::Elements;
+        b.elem_cursor = 0;
+        assert_eq!(b.spot(), Some(Spot::Sidebar));
+        b.elem_cursor = element_rows(&b.collapsed).len();
+        assert_eq!(b.spot(), None);
+        b.elem_cursor = 0;
+        b.open_picker(ColorRole::Text);
+        assert_eq!(b.spot(), None);
+    }
+
+    fn cell_fg(surface: &mut Surface, x: usize, y: usize) -> termwiz::color::ColorAttribute {
+        surface.screen_cells()[y][x].attrs().foreground()
+    }
+
+    #[test]
+    fn spotlight_keeps_sidebar_lit_and_dims_the_rest() {
+        let (cols, rows) = (140, 40);
+        let chrome = test_chrome(cols, rows);
+        let screen = Rect::full(cols, rows);
+        let side = chrome.sidebar.expect("sidebar");
+        let mut b = builder();
+        b.view = EditorView::Elements;
+        b.elem_cursor = 0;
+        let seed = |s: &mut Surface| {
+            s.add_change(termwiz::surface::Change::Attribute(
+                termwiz::cell::AttributeChange::Foreground(
+                    termwiz::color::ColorAttribute::TrueColorWithDefaultFallback(
+                        termwiz::color::SrgbaTuple(0.9, 0.2, 0.2, 1.0),
+                    ),
+                ),
+            ));
+            for y in 0..rows {
+                s.add_change(termwiz::surface::Change::CursorPosition {
+                    x: termwiz::surface::Position::Absolute(0),
+                    y: termwiz::surface::Position::Absolute(y),
+                });
+                s.add_change("x".repeat(cols));
+            }
+        };
+        let mut lit = Surface::new(cols, rows);
+        seed(&mut lit);
+        let original = cell_fg(&mut lit, side.x, side.y);
+        b.render(&mut lit, screen, &chrome);
+        assert_eq!(cell_fg(&mut lit, side.x, side.y), original);
+        let mut dimmed = Surface::new(cols, rows);
+        seed(&mut dimmed);
+        dim_rect(&mut dimmed, screen);
+        let (cx, cy) = (chrome.center.x, chrome.statusbar.y);
+        assert_eq!(cell_fg(&mut lit, cx, cy), cell_fg(&mut dimmed, cx, cy));
+        assert_ne!(cell_fg(&mut lit, cx, cy), original);
+    }
+
+    #[test]
+    fn absent_region_shows_the_note() {
+        let chrome = crate::layout::compute(140, 40, false, true);
+        let mut b = builder();
+        b.view = EditorView::Elements;
+        b.elem_cursor = 0;
+        let mut surface = Surface::new(140, 40);
+        b.render(&mut surface, Rect::full(140, 40), &chrome);
+        assert!(
+            surface
+                .screen_chars_to_string()
+                .contains("Sidebar is not on screen")
+        );
+    }
+
     fn builder() -> ThemeBuilder {
         ThemeBuilder::open(&thegn_core::config::Config::default(), &[])
     }
@@ -1733,7 +1977,7 @@ mod tests {
     fn small_render_is_safe_and_apply_is_an_explicit_action() {
         let b = builder();
         let mut surface = Surface::new(80, 24);
-        b.render(&mut surface, Rect::full(80, 24));
+        b.render(&mut surface, Rect::full(80, 24), &test_chrome(80, 24));
         let mut b = builder();
         b.focus = ACTION_ROW;
         assert!(matches!(
@@ -1823,7 +2067,7 @@ mod tests {
             .position(|(r, _)| *r == ColorRole::Text)
             .unwrap();
         let mut surface = Surface::new(106, 30);
-        b.render(&mut surface, Rect::full(106, 30));
+        b.render(&mut surface, Rect::full(106, 30), &test_chrome(106, 30));
         let text = surface.screen_chars_to_string();
         assert!(text.contains("highlighted: "), "{text}");
         let underlined = surface
@@ -1852,7 +2096,7 @@ mod tests {
     fn render_keeps_contrast_feedback_visible_at_eighty_columns() {
         let b = builder();
         let mut surface = Surface::new(80, 24);
-        b.render(&mut surface, Rect::full(80, 24));
+        b.render(&mut surface, Rect::full(80, 24), &test_chrome(80, 24));
         assert!(surface.screen_chars_to_string().contains("contrast"));
     }
 
@@ -1865,7 +2109,7 @@ mod tests {
         cfg.theme.preset = long.clone();
         let b = ThemeBuilder::open(&cfg, &users);
         let mut surface = Surface::new(80, 24);
-        b.render(&mut surface, Rect::full(80, 24));
+        b.render(&mut surface, Rect::full(80, 24), &test_chrome(80, 24));
         let text = surface.screen_chars_to_string();
         let row = text
             .lines()
@@ -1879,7 +2123,7 @@ mod tests {
     fn catalog_row_short_name_is_unclipped() {
         let b = builder();
         let mut surface = Surface::new(80, 24);
-        b.render(&mut surface, Rect::full(80, 24));
+        b.render(&mut surface, Rect::full(80, 24), &test_chrome(80, 24));
         let text = surface.screen_chars_to_string();
         let name = &b.catalog[0].name;
         let row = text.lines().find(|l| l.contains(name.as_str())).unwrap();
@@ -1897,7 +2141,7 @@ mod tests {
         cfg.theme.preset = "user-29".into();
         let b = ThemeBuilder::open(&cfg, &users);
         let mut surface = Surface::new(80, 24);
-        b.render(&mut surface, Rect::full(80, 24));
+        b.render(&mut surface, Rect::full(80, 24), &test_chrome(80, 24));
         assert!(surface.screen_chars_to_string().contains("user-29"));
     }
 
@@ -2428,7 +2672,7 @@ mod tests {
         /// return the screen text.
         fn render_inside(&self, screen: Rect, outer: Rect) -> String {
             let mut surface = Surface::new(screen.cols, screen.rows);
-            self.render(&mut surface, screen);
+            self.render(&mut surface, screen, &test_chrome(screen.cols, screen.rows));
             for (y, row) in surface.screen_cells().iter().enumerate() {
                 for (x, cell) in row.iter().enumerate() {
                     if !outer.contains(x, y) {
