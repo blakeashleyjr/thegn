@@ -16,8 +16,10 @@ use thegn_core::approval_request::{
 use thegn_core::db::Db;
 use thegn_core::notification::{Notification, NotificationKind};
 use thegn_core::pipeline_approval::{Approval, state_for};
+use thegn_core::push_approval;
 use thegn_core::store::NotificationStore;
 use thegn_svc::control::ControlError;
+use thegn_svc::push::{PushMessage, PushProvider};
 
 /// The notification kind every request row carries.
 const KIND: &str = "agent_attention";
@@ -114,10 +116,75 @@ pub(crate) async fn raise(
     Ok((inserted, id))
 }
 
-/// What happens after a request is recorded (the phone push with its
-/// single-use nonce, 6a). Spine stub: b155 lane 6 fills it.
-#[allow(dead_code, reason = "filled by b155 lane 6")]
-pub(crate) async fn after_request(_svc: &DaemonService, _req: &ApprovalRequest, _inserted: bool) {}
+/// How long a pushed nonce can redeem its approval.
+const PUSH_NONCE_TTL_MS: i64 = 24 * 60 * 60 * 1_000;
+/// The push title every approval push carries.
+const PUSH_TITLE: &str = "thegn approval";
+
+/// What happens after a request is recorded (6a): when the row is new and
+/// `[notifications.push]` is configured, mint a 128-bit single-use nonce,
+/// store its hash bound to the request triple for 24 h, and push the TRUSTED
+/// description (never the request's `reason`) plus the reply line. Best-effort
+/// throughout: the request itself is already recorded.
+pub(crate) async fn after_request(svc: &DaemonService, req: &ApprovalRequest, inserted: bool) {
+    if !inserted {
+        return;
+    }
+    let Some(provider) = thegn_svc::push::provider_for(&svc.config.notifications.push) else {
+        return;
+    };
+    let mut bytes = [0u8; push_approval::NONCE_BYTES];
+    if let Err(error) = getrandom::fill(&mut bytes) {
+        tracing::warn!(target: "thegn::approval", %error, "approval push skipped: no OS randomness");
+        return;
+    }
+    let nonce = push_approval::nonce_from_bytes(&bytes);
+    let hash = push_approval::nonce_hash(&nonce);
+    let (issue, stage, sha) = (
+        req.issue_id.clone(),
+        req.stage.clone(),
+        req.commit_sha.clone(),
+    );
+    let stored = svc
+        .with_db(move |db| {
+            let now = thegn_core::util::now_ms();
+            db.put_push_nonce(
+                &hash,
+                &issue,
+                &stage,
+                &sha,
+                now,
+                now.saturating_add(PUSH_NONCE_TTL_MS),
+            )?;
+            Ok(crate::daemon::approval_effects::describe(
+                db, &issue, &stage, &sha,
+            ))
+        })
+        .await;
+    let description = match stored {
+        Ok(description) => description,
+        Err(error) => {
+            tracing::warn!(target: "thegn::approval", %error, "approval push skipped: nonce not stored");
+            return;
+        }
+    };
+    let msg = PushMessage {
+        title: PUSH_TITLE.into(),
+        body: push_approval::push_body(&description, &nonce),
+        priority: thegn_core::notification::Priority::Alert,
+        tags: vec!["approval".into()],
+    };
+    // best-effort: a failed push leaves the request answerable in the panel/CLI.
+    if let Err(error) = provider.publish(&msg).await {
+        tracing::warn!(
+            target: "thegn::approval",
+            issue = %req.issue_id,
+            stage = %req.stage,
+            %error,
+            "approval push failed"
+        );
+    }
+}
 
 /// Answer `approvals.resolve` (Admin; HTTP and CLI only, never MCP).
 pub(crate) async fn resolve(svc: &DaemonService, req: serde_json::Value) -> JsonResult {
@@ -163,7 +230,7 @@ fn request_in(db: &Db, request: &ApprovalRequest) -> anyhow::Result<(bool, i64)>
 }
 
 /// Apply a human decision and retire every unread request row for it.
-fn resolve_in(db: &Db, request: &ApprovalResolve, now_ms: i64) -> anyhow::Result<()> {
+pub(super) fn resolve_in(db: &Db, request: &ApprovalResolve, now_ms: i64) -> anyhow::Result<()> {
     match request.decision {
         Decision::Approve => db.grant_approval(&Approval {
             issue_id: request.issue_id.clone(),
