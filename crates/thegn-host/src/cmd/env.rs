@@ -769,6 +769,8 @@ fn lifecycle(cfg: &Config, worktree: Option<String>, action: Lifecycle) -> Resul
             bring_up(&env, &wt, |progress| {
                 crate::agent::provision_worktree(cfg, &wt, progress)
             })?;
+            crate::ssh_seed::seed_if_needed(cfg, &wt)
+                .with_context(|| format!("env up failed: seeding {wt} on env {}", env.name))?;
             sshfs(&env, true)?;
             outln!("env {} is up", env.name);
         }
@@ -1173,6 +1175,13 @@ fn provision_headless_blocking(
     worktree: String,
     deadline: std::time::Duration,
 ) -> Result<()> {
+    // An ssh `in_env` worktree is seeded onto its host before the open, so the
+    // headless session lands in the checkout (a no-op for every other env).
+    crate::ssh_seed::seed_if_needed(&cfg, &worktree).with_context(|| {
+        format!(
+            "seeding {worktree} onto its ssh host failed; `thegn env up --worktree {worktree}` retries it"
+        )
+    })?;
     let Some(env_name) = crate::provision_gate::unprovisioned_provider_env(&cfg, &worktree)? else {
         return Ok(());
     };
