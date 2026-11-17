@@ -37,9 +37,10 @@ row detail line shows (on the cursor row, on every row, or nowhere: the `i`
 toggle, else `[ui] sidebar_focus_detail`). It is the first thing on the header
 to give way in a narrow column: the chip shrinks to the bare word `full`, then
 goes. On a two-line row the detail line continues the tree guide, a dim `│`
-under the row's own `├` (blank under the last `└`). The rail's top row shows the `▏` glyph
-(`|` under ASCII) above its entries. **Clicking** the chip or the rail glyph
-cycles the sidebar **full → rail → hidden**, exactly like `Ctrl-Alt-s`.
+under the row's own `├` (blank under the last `└`). The rail's top row shows
+the `▏` glyph (`|` under ASCII) above its entries. **Clicking** the chip or
+the rail glyph cycles the sidebar **full → rail → hidden**, exactly like
+`Ctrl-Alt-s`.
 
 ## Reading the tree
 
