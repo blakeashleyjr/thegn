@@ -124,6 +124,15 @@ pub const ACTION_SPECS: &[ActionSpec] = &[
         keywords: &["sandbox", "isolation", "sealed", "standard", "profile"],
     },
     ActionSpec {
+        id: "zone-assign",
+        label: "Assign workspace to zone…",
+        message_key: "action-zone-assign",
+        hint: "zone assign",
+        default_chords: &[],
+        palette: true,
+        keywords: &["zone", "firewall", "assign", "unassign", "credentials"],
+    },
+    ActionSpec {
         id: "toolchain-install",
         label: "Install worktree toolchain",
         message_key: "action-toolchain-install",
