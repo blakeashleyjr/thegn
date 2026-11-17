@@ -4114,18 +4114,18 @@ fn provider_cache_json_with(
             });
         }
         let mut entry = serde_json::json!({
-                "provider": p.provider.trim(),
-                "live_verified": !kind.live_unverified(),
-                "devshell": env_devshell(cfg, e),
-                "binary_cache_url": p.binary_cache_url.trim(),
-                "host_cache": p.host_cache,
-                "bridge_present": bridge_present,
-                "host_cache_effective": p.host_cache && bridge_present,
-                "signer": report.signer,
-                "signer_state": report.signer_state,
-                "scope": report.scope,
-                "require_sigs": report.require_sigs,
-                "require_sigs_explicit": report.require_sigs_explicit,
+            "provider": p.provider.trim(),
+            "live_verified": !kind.live_unverified(),
+            "devshell": env_devshell(cfg, e),
+            "binary_cache_url": p.binary_cache_url.trim(),
+            "host_cache": p.host_cache,
+            "bridge_present": bridge_present,
+            "host_cache_effective": p.host_cache && bridge_present,
+            "signer": report.signer,
+            "signer_state": report.signer_state,
+            "scope": report.scope,
+            "require_sigs": report.require_sigs,
+            "require_sigs_explicit": report.require_sigs_explicit,
         });
         if !vercel.is_null() {
             entry["vercel"] = vercel;
@@ -6243,8 +6243,10 @@ mod tests {
     fn vercel_json_reports_unresolved_then_resolved_token() {
         let _state = crate::testenv::IsolatedState::new();
         let mut cfg = Config::default();
-        let mut env = thegn_core::config::EnvConfig::default();
-        env.provider = vercel_pc("env:THEGN_TEST_DOCTOR_VERCEL_TOKEN");
+        let env = thegn_core::config::EnvConfig {
+            provider: vercel_pc("env:THEGN_TEST_DOCTOR_VERCEL_TOKEN"),
+            ..Default::default()
+        };
         cfg.env.insert("vc".into(), env);
         let v = provider_cache_json_with(&cfg, None);
         assert_eq!(v["vc"]["vercel"]["team_id_set"], true);
@@ -6255,14 +6257,17 @@ mod tests {
         // SAFETY: test-only env mutation under IsolatedState.
         unsafe { std::env::set_var("THEGN_TEST_DOCTOR_VERCEL_TOKEN", "x") };
         // Different ref string so the 60s presence memo cannot mask the change.
-        let mut env = thegn_core::config::EnvConfig::default();
-        env.provider = vercel_pc("env:THEGN_TEST_DOCTOR_VERCEL_TOKEN2");
+        let env = thegn_core::config::EnvConfig {
+            provider: vercel_pc("env:THEGN_TEST_DOCTOR_VERCEL_TOKEN2"),
+            ..Default::default()
+        };
         // SAFETY: as above.
         unsafe { std::env::set_var("THEGN_TEST_DOCTOR_VERCEL_TOKEN2", "x") };
         cfg.env.insert("vc".into(), env);
         let v = provider_cache_json_with(&cfg, None);
         assert_eq!(v["vc"]["vercel"]["token_resolves"], true);
         assert!(!v.to_string().contains("\"x\""));
+        // SAFETY: as above.
         unsafe {
             std::env::remove_var("THEGN_TEST_DOCTOR_VERCEL_TOKEN");
             std::env::remove_var("THEGN_TEST_DOCTOR_VERCEL_TOKEN2");
