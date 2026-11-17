@@ -20,6 +20,7 @@ pub mod agent_error;
 pub mod agent_task;
 pub mod aggregate;
 pub mod ansi_cells;
+pub mod archive_list;
 pub mod asciicast;
 pub mod attention;
 pub mod automation;
