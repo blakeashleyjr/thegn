@@ -1142,6 +1142,11 @@ impl Config {
                     self.observe.enabled = false;
                     was
                 }
+                Feature::Lead => {
+                    let was = self.lead.is_some();
+                    self.lead = None;
+                    was
+                }
                 Feature::PluginApps => {
                     let default_was_plugin = self.apps.default_tab.trim().starts_with("plugin:");
                     if default_was_plugin {

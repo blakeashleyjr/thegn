@@ -3398,6 +3398,7 @@ fn clamp_to_channel_neutralises_experimental_in_stable() {
     cfg.sandbox.remote.host = "box.example".into();
     cfg.host.insert("gpu".into(), Default::default());
     cfg.voice.enabled = true;
+    cfg.lead = Some(crate::config_lead::LeadConfig::default());
 
     let clamped = cfg.clamp_to_channel(Channel::Stable);
 
@@ -3406,8 +3407,10 @@ fn clamp_to_channel_neutralises_experimental_in_stable() {
     assert!(cfg.sandbox.remote.host.is_empty());
     assert!(cfg.host.is_empty());
     assert!(!cfg.voice.enabled);
+    assert!(cfg.lead.is_none());
+    assert!(clamped.contains(&Feature::Lead));
     // Every gated feature reports as clamped.
-    assert_eq!(clamped.len(), 4);
+    assert_eq!(clamped.len(), 5);
     assert!(!clamped.contains(&Feature::Observe));
     assert!(!clamped.contains(&Feature::PluginApps));
 
