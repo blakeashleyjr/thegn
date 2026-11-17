@@ -145,6 +145,8 @@ const NOTIFICATIONS: &[SectionKey] = &[
     k(' ', "space", "expand"),
     // `x`, not `r` — the old hint advertised a key that did nothing. Labels
     // match the section body's own hint row: `x` marks read, `d` DELETES.
+    k('y', "y", "approve"),
+    k('n', "n", "reject"),
     k('x', "x", "read"),
     k('d', "d", "delete"),
     // `a` and `g` are handled here but were never advertised. `a` is the only
@@ -955,5 +957,13 @@ mod tests {
             additions.is_empty() && stale.is_empty(),
             "panel key reachability debt changed. New violations: {additions:?}; stale entries (delete them): {stale:?}. Move the section key off the claimed chord, or drop the hint."
         );
+    }
+
+    #[test]
+    fn notifications_hints_advertise_approve_and_reject() {
+        let keys: Vec<(Option<char>, &str)> =
+            NOTIFICATIONS.iter().map(|k| (k.key, k.label)).collect();
+        assert!(keys.contains(&(Some('y'), "approve")));
+        assert!(keys.contains(&(Some('n'), "reject")));
     }
 }

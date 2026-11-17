@@ -78,6 +78,16 @@ durable inbox row. Notification text can include branch names, issue titles,
 and log fragments, so route chat sinks with care. `thegn doctor` performs an
 offline configuration/request-shape probe and never posts a test message.
 
+## Approvals
+
+Approval requests raised by agents and automations are pinned at the top of the
+Notifications section in an Approvals group. Each row shows the description the
+daemon computed from its own records, never the text the requester wrote, and
+reads "unverified request" when the daemon cannot vouch for it. Press `y` to
+approve or `n` to reject the highlighted request; each asks you to press the key
+again to confirm. Answering needs the daemon running, otherwise the status line
+says "approvals need the daemon".
+
 ## Sound effects
 
 The `[notifications.sound]` table controls the audible notification channel.

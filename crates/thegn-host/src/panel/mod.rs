@@ -860,6 +860,9 @@ pub struct PanelData {
     pub alert_notifications: usize,
     /// Full notification list: every unread row plus the newest 50 read rows.
     pub notifications: Vec<thegn_core::notification::Notification>,
+    /// Trusted descriptions of approval-request rows, keyed by source ref —
+    /// resolved off-loop with the inbox (`approval_effects::describe`).
+    pub approval_descriptions: std::collections::BTreeMap<String, String>,
     /// Last committed notification-write epoch observed before inbox hydration.
     pub notifications_epoch: u64,
     /// Loop-owned optimistic changes not yet covered by a hydrated DB snapshot.
