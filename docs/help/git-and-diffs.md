@@ -122,8 +122,10 @@ and redo are refused; if recording fails after an operation, its result says
 
 The worktree's file tree; `/` filters it (directories stay while any
 descendant matches; Esc clears), `↵` previews a file inline, `o` pages it
-in bat, `O` opens your editor, `y` reveals it in yazi. A zip, jar, whl, tar,
-tgz or tar.gz (and zip-based files such as docx) previews as an entry listing
+in bat, `O` opens your editor, `y` reveals it in yazi. A .docx shows its
+text (bounded, sanitized), falling back to its part listing with a note when
+the text cannot be read. A zip, jar, whl, tar, tgz or tar.gz (and other
+zip-based files such as xlsx, pptx and odt) previews as an entry listing
 (bounded, names sanitized); other unknown binaries preview as a hex dump of
 their first 4096 bytes.
 The local files list uses NUL-separated Git output, so names containing
