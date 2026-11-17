@@ -113,6 +113,9 @@ pub(crate) fn exec_env(get: impl Fn(&str) -> Option<String>) -> Vec<(String, Str
             env.push(((*key).to_string(), value));
         }
     }
+    // The provider's one allowlist is the authority (the provider applies it
+    // again, with the token ref name, on every path into the sandbox).
+    env.retain(|(key, _)| thegn_svc::vercel::env_key_allowed(key));
     env
 }
 
@@ -615,6 +618,22 @@ mod tests {
         );
         for key in ENV_ALLOWLIST {
             assert!(!key.starts_with("VERCEL"), "{key}");
+        }
+    }
+
+    #[test]
+    fn bridge_allowlist_agrees_with_the_provider_allowlist() {
+        for key in ENV_ALLOWLIST.iter().copied().chain(["TERM"]) {
+            assert!(thegn_svc::vercel::env_key_allowed(key), "{key}");
+        }
+        for key in [
+            "VERCEL_TOKEN",
+            "GITHUB_TOKEN",
+            "OPENAI_API_KEY",
+            "AWS_SECRET_ACCESS_KEY",
+            "THEGN_API_TOKEN",
+        ] {
+            assert!(!thegn_svc::vercel::env_key_allowed(key), "{key}");
         }
     }
 
