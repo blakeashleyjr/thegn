@@ -27,7 +27,7 @@ use anyhow::{Context as _, Result, anyhow};
 use termwiz::caps::{Capabilities, ProbeHints};
 use termwiz::input::InputEvent;
 use termwiz::terminal::{Terminal, new_terminal};
-use thegn_core::config::{Config, EnvProviderKind};
+use thegn_core::config::{Config, EnvConfig, EnvProviderKind, ModelCredentials};
 use thegn_core::vercel::api::SessionStatus;
 use thegn_svc::provider::{ExecControl, ExecFrame, ExecSession, ExecSpec};
 use thegn_svc::vercel::{VercelProvider, Wake};
@@ -59,6 +59,9 @@ const EXIT_LOCAL_CLOSED: i32 = 1;
 /// How long to wait for the remote exit after a local close.
 const LOCAL_CLOSE_GRACE: Duration = Duration::from_secs(5);
 
+/// The bound on removing this bridge's login dir at TTY exit.
+const REMOVE_LOGIN_TIMEOUT: Duration = Duration::from_secs(10);
+
 /// Run `cmd` inside Vercel sandbox `id`. Empty `cmd` is a login shell.
 pub fn run(cfg: &Config, id: &str, cmd: &[String]) -> Result<()> {
     anyhow::ensure!(
@@ -74,26 +77,185 @@ pub fn run(cfg: &Config, id: &str, cmd: &[String]) -> Result<()> {
     } else {
         cmd.to_vec()
     };
-    let provider = cfg
-        .env
+    let env = exec_env(|key| std::env::var(key).ok());
+    if std::io::stdin().is_terminal() {
+        // TTY only: resolve the env this sandbox belongs to (ledger owner ->
+        // its bound env, else the only vercel env) for its provider and mode.
+        let (resolved, warning) = resolve_env(cfg, id);
+        if let Some(line) = warning {
+            note(&line);
+        }
+        let resolved = resolved.and_then(|name| cfg.env.get(&name).map(|e| (name, e)));
+        // Upload only through the resolved env's OWN provider: a fallback
+        // provider is another account (team, project, token).
+        let own = resolved
+            .as_ref()
+            .and_then(|(_, envc)| crate::provider_factory::vercel_provider_for(&envc.provider, id));
+        let upload = if own.is_some() {
+            resolved.and_then(|(_, envc)| upload_plan(cfg, envc))
+        } else {
+            None
+        };
+        let provider = own.map_or_else(|| first_vercel_provider(cfg, id), Ok)?;
+        let code = run_tty(Arc::new(provider), id, argv, env, upload)?;
+        std::process::exit(host_exit_code(code));
+    }
+    let provider = first_vercel_provider(cfg, id)?;
+    let code = run_capture(&provider, id, &argv, &env)?;
+    std::process::exit(host_exit_code(code));
+}
+
+/// The first `provider = "vercel"` env with a resolvable token (capture mode's
+/// pick, and the TTY fallback when the env cannot be resolved).
+fn first_vercel_provider(cfg: &Config, id: &str) -> Result<VercelProvider> {
+    cfg.env
         .values()
-        .filter(|envc| {
-            matches!(
-                EnvProviderKind::of(&envc.provider.provider),
-                EnvProviderKind::Vercel
-            )
-        })
+        .filter(|envc| is_vercel(envc))
         .find_map(|envc| crate::provider_factory::vercel_provider_for(&envc.provider, id))
         .ok_or_else(|| {
             anyhow!("vercel-exec: no `provider = \"vercel\"` env with a resolvable token")
-        })?;
-    let env = exec_env(|key| std::env::var(key).ok());
-    if std::io::stdin().is_terminal() {
-        let code = run_tty(Arc::new(provider), id, argv, env)?;
-        std::process::exit(host_exit_code(code));
+        })
+}
+
+fn is_vercel(envc: &EnvConfig) -> bool {
+    matches!(
+        EnvProviderKind::of(&envc.provider.provider),
+        EnvProviderKind::Vercel
+    )
+}
+
+/// One line on stderr (the bridge's only user-facing channel besides the PTY).
+fn note(line: &str) {
+    let mut err = std::io::stderr();
+    if writeln!(err, "{line}").is_err() {
+        tracing::debug!(target: "thegn::provider", "vercel-exec: stderr gone");
     }
-    let code = run_capture(&provider, id, &argv, &env)?;
-    std::process::exit(host_exit_code(code));
+}
+
+/// The env for sandbox `id`, plus a warning line when none can be picked.
+fn resolve_env(cfg: &Config, id: &str) -> (Option<String>, Option<String>) {
+    let vercel: Vec<String> = cfg
+        .env
+        .iter()
+        .filter(|(_, envc)| is_vercel(envc))
+        .map(|(name, _)| name.clone())
+        .collect();
+    let owner_env = if vercel.len() > 1 {
+        ledger_owner_env(id)
+    } else {
+        None
+    };
+    let any_upload = cfg
+        .env
+        .values()
+        .any(|envc| is_vercel(envc) && envc.provider.model_credentials == ModelCredentials::Upload);
+    match pick_env(owner_env.as_deref(), &vercel) {
+        Some(name) => (Some(name), None),
+        None if !any_upload => (None, None),
+        None => (
+            None,
+            Some(
+                "model login not uploaded: cannot tell which vercel env owns this sandbox; \
+                 continuing without it"
+                    .to_string(),
+            ),
+        ),
+    }
+}
+
+/// The bound env of the worktree that owns sandbox `id` in the ledger. Any
+/// failed read is `None` (the caller then falls back).
+fn ledger_owner_env(id: &str) -> Option<String> {
+    use thegn_core::store::WorkspaceStore as _;
+    let record = thegn_svc::vps::registry::read(id)?;
+    if record.owner.is_empty() {
+        return None;
+    }
+    let db = thegn_core::db::Db::open_read_only_current().ok()??;
+    let rows = db.worktrees().ok()?;
+    let row = rows.iter().find(|w| {
+        !w.worktree.is_empty()
+            && thegn_svc::vps::registry::worktree_owner(w.worktree.as_bytes()) == record.owner
+    })?;
+    db.effective_env(&row.worktree, &row.repo_root)
+}
+
+/// What a TTY open uploads under `model_credentials = "upload"`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct UploadPlan {
+    pub agents: Vec<String>,
+    pub user_domains: Vec<String>,
+    pub install_agents: bool,
+}
+
+/// The upload plan for `envc`, or `None` unless its mode is `upload`.
+fn upload_plan(cfg: &Config, envc: &EnvConfig) -> Option<UploadPlan> {
+    if envc.provider.model_credentials != ModelCredentials::Upload {
+        return None;
+    }
+    let overlay = envc.sandbox.home.as_ref().and_then(|h| h.agents.as_deref());
+    let agents = upload_agents(overlay, &cfg.sandbox.home.agents, || {
+        crate::agent::provisioned_agent_kinds(cfg)
+    });
+    let user_domains = envc
+        .sandbox
+        .network_allow
+        .clone()
+        .unwrap_or_else(|| cfg.sandbox.network_allow.clone());
+    Some(UploadPlan {
+        install_agents: false, // the TTY open never installs; provisioning sets its own policy
+        agents,
+        user_domains,
+    })
+}
+
+/// Read the host logins, resume, then narrow egress and upload. The sandbox
+/// is resumed here (the TTY open would resume it anyway).
+async fn upload_login(
+    provider: &VercelProvider,
+    id: &str,
+    plan: &UploadPlan,
+) -> Result<thegn_svc::vercel::login::LoginHandle> {
+    let (payloads, skipped) = crate::vercel_login::read_host_logins(&plan.agents);
+    for line in &skipped {
+        tracing::debug!(target: "thegn::provider", skipped = %line, "vercel login agent skipped");
+    }
+    if payloads.is_empty() {
+        let why = if skipped.is_empty() {
+            "no claude or codex agent is configured".to_string()
+        } else {
+            skipped.join("; ")
+        };
+        anyhow::bail!("{why}");
+    }
+    provider.resume(id).await?;
+    provider
+        .ensure_login(id, &payloads, &plan.user_domains, plan.install_agents)
+        .await
+}
+
+/// Remove this bridge's login dir, bounded by [`REMOVE_LOGIN_TIMEOUT`].
+fn remove_login_bounded(
+    rt: &tokio::runtime::Runtime,
+    provider: &VercelProvider,
+    id: &str,
+    login: Option<&thegn_svc::vercel::login::LoginHandle>,
+) {
+    if let Some(handle) = login {
+        let removed = rt.block_on(async {
+            tokio::time::timeout(REMOVE_LOGIN_TIMEOUT, provider.remove_login(id, handle)).await
+        });
+        // best-effort: the dir is tmpfs and dies with the session anyway.
+        match removed {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => {
+                tracing::debug!(target: "thegn::provider", error = %e, "vercel login dir removal failed");
+            }
+            Err(_) => {
+                tracing::debug!(target: "thegn::provider", "vercel login dir removal timed out");
+            }
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -116,6 +278,46 @@ pub(crate) fn exec_env(get: impl Fn(&str) -> Option<String>) -> Vec<(String, Str
     // The provider's one allowlist is the authority (the provider applies it
     // again, with the token ref name, on every path into the sandbox).
     env.retain(|(key, _)| thegn_svc::vercel::env_key_allowed(key));
+    env
+}
+
+/// The env to use: the ledger owner's bound env when it is a vercel env,
+/// else the only vercel env, else `None` (ambiguous: upload is skipped).
+pub(crate) fn pick_env(owner_env: Option<&str>, vercel_envs: &[String]) -> Option<String> {
+    if let Some(owner) = owner_env
+        && vercel_envs.iter().any(|name| name == owner)
+    {
+        return Some(owner.to_string());
+    }
+    match vercel_envs {
+        [only] => Some(only.clone()),
+        _ => None,
+    }
+}
+
+/// `[env.<name>.sandbox.home] agents`, else `[sandbox.home] agents`, else the
+/// `[[agents]]` picker kinds.
+pub(crate) fn upload_agents(
+    overlay: Option<&[String]>,
+    global: &[String],
+    picker: impl FnOnce() -> Vec<String>,
+) -> Vec<String> {
+    match overlay {
+        Some(agents) if !agents.is_empty() => agents.to_vec(),
+        _ if !global.is_empty() => global.to_vec(),
+        _ => picker(),
+    }
+}
+
+/// The exec env plus the login env pairs, only when an upload was planned.
+pub(crate) fn with_login_env(
+    mut env: Vec<(String, String)>,
+    planned: bool,
+    login: Option<&thegn_svc::vercel::login::LoginHandle>,
+) -> Vec<(String, String)> {
+    if planned && let Some(handle) = login {
+        env.extend(handle.env.iter().cloned());
+    }
     env
 }
 
@@ -389,6 +591,7 @@ fn run_tty(
     id: &str,
     argv: Vec<String>,
     env: Vec<(String, String)>,
+    upload: Option<UploadPlan>,
 ) -> Result<i32> {
     let hints = ProbeHints::new_from_env()
         .mouse_reporting(Some(false))
@@ -397,26 +600,45 @@ fn run_tty(
     let mut term = new_terminal(caps).context("open terminal")?;
     let size = term.get_screen_size().context("screen size")?;
     let (cols, rows) = pty_size(size.cols, size.rows);
+
+    let rt = bridge_runtime()?;
+    // `model_credentials = "upload"`: resume, narrow egress, upload, BEFORE the
+    // PTY opens. A failure is one line; the session still opens without it.
+    let login =
+        upload.as_ref().and_then(
+            |plan| match rt.block_on(upload_login(&provider, id, plan)) {
+                Ok(handle) => Some(handle),
+                Err(e) => {
+                    let reason = format!("{e:#}").replace(['\n', '\r'], " ");
+                    note(&format!(
+                        "model login not uploaded: {reason}; continuing without it"
+                    ));
+                    None
+                }
+            },
+        );
     let spec = ExecSpec {
         argv,
         tty: true,
         cols,
         rows,
-        env,
+        env: with_login_env(env, upload.is_some(), login.as_ref()),
         cwd: None,
     };
 
-    let rt = bridge_runtime()?;
     // Open BEFORE raw mode so an open failure never leaves the tty altered.
     let (session, mode) = match rt.block_on(provider.open_exec(id, &spec)) {
         Ok(session) => (session, Mode::Pty),
         Err(e) => {
             tracing::debug!(target: "thegn::provider", error = %e, "vercel /interactive unavailable");
-            let session = rt.block_on(Arc::clone(&provider).open_stream(id, &spec))?;
-            let mut err = std::io::stderr();
-            if writeln!(err, "{STREAM_NOTICE}").is_err() {
-                tracing::debug!(target: "thegn::provider", "vercel-exec: stderr gone");
-            }
+            let session = match rt.block_on(Arc::clone(&provider).open_stream(id, &spec)) {
+                Ok(session) => session,
+                Err(e) => {
+                    remove_login_bounded(&rt, &provider, id, login.as_ref());
+                    return Err(e);
+                }
+            };
+            note(STREAM_NOTICE);
             (session, Mode::Stream)
         }
     };
@@ -425,10 +647,18 @@ fn run_tty(
     let mut keep = KeepAlive::start(Arc::clone(&provider), id.to_string(), rt.handle().clone());
 
     // On error `keep` drops here, which stops and joins it.
-    term.set_raw_mode().context("raw mode")?;
+    if let Err(e) = term.set_raw_mode().context("raw mode") {
+        keep.stop();
+        remove_login_bounded(&rt, &provider, id, login.as_ref());
+        return Err(e);
+    }
     let (tty_tx, tty_rx) = tokio::sync::mpsc::channel::<FromTty>(256);
     let done = Arc::new(AtomicBool::new(false));
     let waker = term.waker();
+    if login.is_some() {
+        let _enter = rt.enter();
+        crate::platform::install_shutdown_signal(done.clone(), term.waker());
+    }
     let thread = {
         let done = done.clone();
         thegn_core::thread_name::spawn_named("thegn-vx-in", move || {
@@ -443,9 +673,12 @@ fn run_tty(
     };
 
     let outcome = rt.block_on(drive(session, tty_rx, mode));
-    // Restore the tty first, then stop the keep-alive, then report.
+    // Restore the tty first, then stop the keep-alive, then clean up, then report.
     tty.stop();
     keep.stop();
+    remove_login_bounded(&rt, &provider, id, login.as_ref());
+    // The session may have left commits in the sandbox: flag them for pull.
+    crate::vercel_pull_marker::mark(id);
     Ok(match outcome {
         Some(code) => code,
         None => {
@@ -755,5 +988,68 @@ mod tests {
         assert!(cr);
         assert_eq!(stream_output(b"\ny", &mut cr), b"\ny".to_vec());
         assert!(!cr);
+    }
+
+    fn names(list: &[&str]) -> Vec<String> {
+        list.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn env_pick_prefers_the_ledger_owner_then_a_single_env() {
+        let two = names(&["vx-a", "vx-b"]);
+        // The ledger owner's bound env wins when it is a vercel env.
+        assert_eq!(pick_env(Some("vx-b"), &two).as_deref(), Some("vx-b"));
+        // An owner env that is not a vercel env is ignored.
+        assert_eq!(pick_env(Some("local"), &two), None);
+        // Exactly one vercel env: that one, whatever the owner said.
+        let one = names(&["vx-a"]);
+        assert_eq!(pick_env(None, &one).as_deref(), Some("vx-a"));
+        assert_eq!(pick_env(Some("local"), &one).as_deref(), Some("vx-a"));
+        // Ambiguous: skip (no first-env pick).
+        assert_eq!(pick_env(None, &two), None);
+        assert_eq!(pick_env(None, &[]), None);
+    }
+
+    #[test]
+    fn upload_agents_prefer_the_env_overlay_then_global_then_picker() {
+        let overlay = names(&["codex"]);
+        let global = names(&["claude"]);
+        let picker = || names(&["pi"]);
+        assert_eq!(
+            upload_agents(Some(overlay.as_slice()), &global, picker),
+            overlay
+        );
+        assert_eq!(upload_agents(None, &global, picker), global);
+        assert_eq!(upload_agents(Some(&[][..]), &[], picker), names(&["pi"]));
+    }
+
+    #[test]
+    fn mode_none_adds_no_login_env() {
+        let base = vec![("TERM".to_string(), "xterm".to_string())];
+        let handle = thegn_svc::vercel::login::LoginHandle {
+            dir: "/dev/shm/thegn-login-0123456789abcdef".into(),
+            env: vec![(
+                "CODEX_HOME".into(),
+                "/dev/shm/thegn-login-0123456789abcdef/codex".into(),
+            )],
+        };
+        assert_eq!(with_login_env(base.clone(), false, Some(&handle)), base);
+        assert_eq!(with_login_env(base.clone(), true, None), base);
+        let with = with_login_env(base.clone(), true, Some(&handle));
+        assert_eq!(with.len(), 2);
+        assert_eq!(with[1].0, "CODEX_HOME");
+    }
+
+    #[test]
+    fn upload_plan_is_none_unless_the_mode_is_upload() {
+        let cfg = Config::default();
+        let mut envc = EnvConfig::default();
+        envc.provider.provider = "vercel".into();
+        assert_eq!(upload_plan(&cfg, &envc), None);
+        envc.provider.model_credentials = ModelCredentials::Upload;
+        envc.sandbox.network_allow = Some(names(&["example.com"]));
+        let plan = upload_plan(&cfg, &envc).expect("upload plans");
+        assert_eq!(plan.user_domains, names(&["example.com"]));
+        assert!(!plan.install_agents);
     }
 }

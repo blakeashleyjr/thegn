@@ -316,12 +316,17 @@ fn names_token_ref(key: &str, token_ref: &str) -> bool {
 }
 
 /// The allowlisted subset of `env`, also dropping the configured Vercel token
-/// ref name (`token_ref`); dropped keys are traced by name only.
+/// ref name (`token_ref`); dropped keys are traced by name only. The one
+/// exception: `CLAUDE_CONFIG_DIR`/`CODEX_HOME` pass when the value is a path
+/// under `/dev/shm/thegn-login-` (the `upload` login dir; a path, not a
+/// secret).
 pub(crate) fn env_allowlisted(env: &[(String, String)], token_ref: &str) -> Vec<(String, String)> {
     let mut kept = Vec::new();
     let mut dropped = Vec::new();
     for (key, value) in env {
-        if env_key_allowed(key) && !names_token_ref(key, token_ref) {
+        if (env_key_allowed(key) || login::login_env_allowed(key, value))
+            && !names_token_ref(key, token_ref)
+        {
             kept.push((key.clone(), value.clone()));
         } else {
             dropped.push(key.as_str());
