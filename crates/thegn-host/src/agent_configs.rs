@@ -214,6 +214,52 @@ pub(crate) fn collect_agent_config_files(dir: &Path) -> Vec<(std::path::PathBuf,
     out
 }
 
+/// [`collect_agent_config_files`] filtered through [`phase2_allowed`]; returns
+/// `(allowed, total_walked)`.
+fn collect_allowed_agent_files(
+    agent: &str,
+    dir: &Path,
+) -> (Vec<(std::path::PathBuf, String, bool)>, usize) {
+    let all = collect_agent_config_files(dir);
+    let total = all.len();
+    let kept = all
+        .into_iter()
+        .filter(|(_, rel, _)| phase2_allowed(agent, rel))
+        .collect();
+    (kept, total)
+}
+
+/// Phase 2 allowlist: is `rel` (relative to the agent's config dir) a file the
+/// login sync should carry? Known agents get a positive allowlist of top-level
+/// entries (settings, instructions, skills, hooks…) so telemetry, transcripts
+/// and runtime state never ship; unknown agents keep the blocklist-only
+/// behaviour ([`AGENT_STATE_SKIP_DIRS`] still applies on top in the walk).
+fn phase2_allowed(agent: &str, rel: &str) -> bool {
+    let rel = rel.trim_start_matches("./");
+    let mut parts = rel.split('/');
+    let top = parts.next().unwrap_or("");
+    let nested = rel.contains('/');
+    match agent.trim() {
+        "claude" | "claude-code" => match top {
+            "settings.json" | "settings.local.json" | "CLAUDE.md" | "keybindings.json" => !nested,
+            "skills" | "agents" | "commands" | "hooks" | "output-styles" => nested,
+            "plugins" => nested && !parts.any(|p| p == "cache" || p == "repos"),
+            t => !nested && t.starts_with("statusline"),
+        },
+        "codex" => match top {
+            "auth.json" | "config.toml" | "config.json" | "AGENTS.md" => !nested,
+            "prompts" => nested,
+            _ => false,
+        },
+        "pi" => match top {
+            "settings.json" => !nested,
+            "agent" => nested,
+            _ => false,
+        },
+        _ => true,
+    }
+}
+
 /// Upload just the auth-critical files (Phase 1) for `agents` into the sandbox
 /// `$HOME` at `base`, preserving the executable bit. Returns `(ok, failed)`.
 /// Small (~5 tiny files per agent) + best-effort — the shared core of the
@@ -482,7 +528,16 @@ pub(crate) fn upload_agent_configs(
             if !src.is_dir() {
                 continue;
             }
-            for (abs, rel, exec) in collect_agent_config_files(&src) {
+            let (collected, walked) = collect_allowed_agent_files(agent, &src);
+            tracing::info!(
+                target: "thegn::startup",
+                agent = %agent,
+                dir = %d,
+                allowlisted = collected.len(),
+                total = walked,
+                "agent-config phase 2: allowlisted vs total files"
+            );
+            for (abs, rel, exec) in collected {
                 let host_rel = format!("{d}/{rel}");
                 if already_uploaded.contains(&host_rel) {
                     continue;
@@ -1137,6 +1192,93 @@ pub(crate) fn upload_atuin_creds(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn touch(root: &Path, rel: &str) {
+        let p = root.join(rel);
+        std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+        std::fs::write(p, b"x").unwrap();
+    }
+
+    fn allowed_rels(agent: &str, root: &Path) -> Vec<String> {
+        let mut v: Vec<String> = collect_allowed_agent_files(agent, root)
+            .0
+            .into_iter()
+            .map(|(_, r, _)| r)
+            .collect();
+        v.sort();
+        v
+    }
+
+    #[test]
+    fn phase2_claude_allowlist_collects_only_config() {
+        let _state = crate::testenv::IsolatedState::with_env(&[]);
+        let root = std::env::temp_dir().join(format!("tg-allow-claude-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root); // best-effort: scratch dir may not exist
+        for f in [
+            "telemetry/e.json",
+            "cache/x.bin",
+            "mcp-needs-auth-cache.json",
+            "projects/p/a.jsonl",
+            "state/mcp-discover-verdicts.json",
+            "skills/x/SKILL.md",
+            "hooks/a.sh",
+            "settings.json",
+            "CLAUDE.md",
+            "plugins/cache/z.json",
+            "statusline-command.sh",
+        ] {
+            touch(&root, f);
+        }
+        let got = allowed_rels("claude", &root);
+        // `plugins/` stays excluded by AGENT_STATE_SKIP_DIRS (second filter).
+        assert_eq!(
+            got,
+            vec![
+                "CLAUDE.md",
+                "hooks/a.sh",
+                "settings.json",
+                "skills/x/SKILL.md",
+                "statusline-command.sh"
+            ]
+        );
+        let _ = std::fs::remove_dir_all(&root); // best-effort: cleanup
+    }
+
+    #[test]
+    fn phase2_codex_pi_and_unknown_tables() {
+        assert!(phase2_allowed("codex", "config.toml"));
+        assert!(phase2_allowed("codex", "prompts/a.md"));
+        assert!(phase2_allowed("codex", "AGENTS.md"));
+        assert!(phase2_allowed("codex", "auth.json"));
+        assert!(!phase2_allowed("codex", "sessions/a.jsonl"));
+        assert!(!phase2_allowed("codex", "log/x"));
+        assert!(phase2_allowed("pi", "agent/skills/a/SKILL.md"));
+        assert!(phase2_allowed("pi", "settings.json"));
+        assert!(!phase2_allowed("pi", "history/x"));
+        assert!(!phase2_allowed("pi", "telemetry.json"));
+        assert!(phase2_allowed("claude", "plugins/a/b.json"));
+        assert!(!phase2_allowed("claude", "plugins/cache/b.json"));
+        assert!(!phase2_allowed("claude", "plugins/a/repos/b.json"));
+        assert!(!phase2_allowed("claude", "telemetry/a"));
+    }
+
+    #[test]
+    fn phase2_unknown_agent_unchanged() {
+        let root = std::env::temp_dir().join(format!("tg-allow-unk-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root); // best-effort: scratch dir may not exist
+        for f in ["conf.toml", "telemetry/e.json", "cache/x"] {
+            touch(&root, f);
+        }
+        let allowed = allowed_rels("hermes", &root);
+        let mut plain: Vec<String> = collect_agent_config_files(&root)
+            .into_iter()
+            .map(|(_, r, _)| r)
+            .collect();
+        plain.sort();
+        assert_eq!(allowed, plain);
+        assert!(allowed.contains(&"telemetry/e.json".to_string()));
+        let _ = std::fs::remove_dir_all(&root); // best-effort: cleanup
+    }
 
     #[test]
     fn account_exports_use_distinct_lossless_home_components() {
