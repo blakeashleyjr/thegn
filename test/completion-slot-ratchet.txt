@@ -41,11 +41,13 @@ doctor bundle	out
 env create	max_instances
 env create	max_lifetime
 env create	name
+env create	project_id
 env create	provider
 env create	region
 env create	sandbox
 env create	size
 env create	ssh_host
+env create	team_id
 env create	template
 env create	token
 env create	token_env
