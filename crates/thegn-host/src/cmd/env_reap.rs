@@ -167,17 +167,7 @@ pub fn run(cfg: &Config, provider: &str, apply: bool, yes: bool, json: bool) -> 
     } else {
         None
     };
-    let mut ask = |prompt: &str| -> Option<String> {
-        if !std::io::IsTerminal::is_terminal(&std::io::stdin()) {
-            return None;
-        }
-        eprint!("{prompt}: ");
-        use std::io::{BufRead, Write};
-        let _ = std::io::stderr().flush(); // best-effort: flush: display-only
-        let mut line = String::new();
-        std::io::stdin().lock().read_line(&mut line).ok()?;
-        Some(line)
-    };
+    let mut ask = |prompt: &str| tty_prompt(prompt);
     let report = reap(
         &envs,
         Opts { apply, yes },
@@ -202,6 +192,20 @@ pub fn run(cfg: &Config, provider: &str, apply: bool, yes: bool, json: bool) -> 
         );
     }
     Ok(())
+}
+
+/// The typed confirmation; `None` when stdin is not a terminal (piped or absent).
+#[allow(clippy::disallowed_macros)] // a raw interactive prompt, not a log line
+fn tty_prompt(prompt: &str) -> Option<String> {
+    use std::io::{BufRead, IsTerminal, Write};
+    if !std::io::stdin().is_terminal() {
+        return None;
+    }
+    eprint!("{prompt}: ");
+    std::io::stderr().flush().ok()?;
+    let mut line = String::new();
+    std::io::stdin().lock().read_line(&mut line).ok()?;
+    Some(line)
 }
 
 /// The reap pass (testable core: no stdout, no tty, no config).
